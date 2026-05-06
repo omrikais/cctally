@@ -26,6 +26,7 @@ mkdir -p .githooks bin
 cp "$REPO_ROOT/.mirror-allowlist" .
 cp "$REPO_ROOT/.githooks/_match.py" .githooks/
 cp "$REPO_ROOT/.githooks/_public_trailer.py" .githooks/
+cp "$REPO_ROOT/.githooks/_skip_chain_metrics.py" .githooks/
 # The mirror tool resolves _REPO_ROOT via __file__.parent.parent at
 # import time. Copy it INTO the scratch private's bin/ and run from
 # there so it walks the scratch private repo (not cctally-dev itself).

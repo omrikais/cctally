@@ -51,12 +51,12 @@ CCTALLY_INFRA_MSG_EOF
 git -c tag.gpgsign=false tag mirror-cursor HEAD
 
 # cwd remains $work/private/ for scenario-specific bash that follows.
-echo "mixed" > README.md
-echo "# mixed" >> .githooks/_match.py
-git add README.md .githooks/_match.py
+mkdir -p docs
+echo "a" > docs/a.md
+git add docs/a.md
 git commit --no-verify -q -F - <<'CCTALLY_MSG_EOF'
-fix: mixed bag
+feat: add doc
 
 --- public ---
-docs: refresh
+feat: add doc
 CCTALLY_MSG_EOF

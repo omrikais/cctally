@@ -51,12 +51,33 @@ CCTALLY_INFRA_MSG_EOF
 git -c tag.gpgsign=false tag mirror-cursor HEAD
 
 # cwd remains $work/private/ for scenario-specific bash that follows.
-echo "mixed" > README.md
-echo "# mixed" >> .githooks/_match.py
-git add README.md .githooks/_match.py
-git commit --no-verify -q -F - <<'CCTALLY_MSG_EOF'
-fix: mixed bag
+mkdir -p docs
+echo "skip1" > docs/s1.md
+git add docs/s1.md
+git commit --no-verify -q -F - <<'CCTALLY_SKIP1_MSG_EOF'
+chore: skip 1
+
+Public-Skip: true
+CCTALLY_SKIP1_MSG_EOF
+echo "skip2" > docs/s2.md
+git add docs/s2.md
+git commit --no-verify -q -F - <<'CCTALLY_SKIP2_MSG_EOF'
+chore: skip 2
+
+Public-Skip: true
+CCTALLY_SKIP2_MSG_EOF
+echo "skip3" > docs/s3.md
+git add docs/s3.md
+git commit --no-verify -q -F - <<'CCTALLY_SKIP3_MSG_EOF'
+chore: skip 3
+
+Public-Skip: true
+CCTALLY_SKIP3_MSG_EOF
+echo "pub" > docs/p.md
+git add docs/p.md
+git commit --no-verify -q -F - <<'CCTALLY_PUB_MSG_EOF'
+docs: condense
 
 --- public ---
-docs: refresh
-CCTALLY_MSG_EOF
+docs: condense
+CCTALLY_PUB_MSG_EOF

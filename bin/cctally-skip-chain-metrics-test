@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Pytest harness wrapper for .githooks/test_skip_chain_metrics.py.
+#
+# Why a shell wrapper: bin/cctally-test-all globs bin/cctally-*-test
+# and runs each one in parallel; pytest test files outside that glob
+# are never invoked by the aggregator (and thus not by CI). This
+# wrapper invokes pytest, captures its summary, and emits the
+# canonical `passed: N   failed: M` line that the aggregator's
+# awk parser reads (two spaces between fields).
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+TEST_FILE="$REPO_ROOT/.githooks/test_skip_chain_metrics.py"
+
+if [ ! -f "$TEST_FILE" ]; then
+    echo "FAIL: $TEST_FILE not found" >&2
+    echo "passed: 0   failed: 1"
+    exit 1
+fi
+
+# Guard: if pytest itself can't run (e.g. not installed), fail loudly
+# rather than emit a `passed: 0   failed: 0` line that the aggregator
+# would mistake for "harness ran, all green."
+if ! python3 -m pytest --version >/dev/null 2>&1; then
+    echo "FAIL: python3 -m pytest unavailable" >&2
+    echo "passed: 0   failed: 1"
+    exit 1
+fi
+
+# Run pytest with a quiet, summary-friendly output.
+out=$(python3 -m pytest "$TEST_FILE" --tb=short --no-header -rN -q 2>&1)
+ec=$?
+
+# Pytest's last line under -q matches: "N passed [, N failed] in T.TTs"
+# or "N failed, N passed in T.TTs". Parse with grep-then-sed.
+summary_line=$(echo "$out" | tail -3 | grep -E "passed|failed|error" | tail -1)
+passed=$(echo "$summary_line" | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+" | head -1)
+failed=$(echo "$summary_line" | grep -oE "[0-9]+ (failed|error)" | grep -oE "[0-9]+" | head -1)
+passed=${passed:-0}
+failed=${failed:-0}
+
+if [ "$ec" != "0" ] || [ "$failed" != "0" ]; then
+    # Surface pytest output on failure.
+    echo "$out"
+fi
+
+echo "----"
+echo "passed: $passed   failed: $failed"
+[ "$failed" -eq 0 ] && [ "$ec" -eq 0 ]

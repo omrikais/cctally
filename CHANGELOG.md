@@ -6,6 +6,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `bin/cctally-mirror-public --accept-skip-mismatch` flag — overrides
+  the refuse gate when accumulated public-skip diffs significantly
+  exceed the current publish commit's diff (long-skip-chain plus
+  fix/chore-typed publish subject). Default behavior gains an
+  `⚠ ACCUMULATED-DIFF MISMATCH` block surfacing warn-severity findings
+  (max-ratio greater than 3× plus non-feat subject) and a hard refuse
+  on the chain-greater-than-15 plus max-ratio-greater-than-5× case;
+  the flag is the documented escape hatch for refuse situations the
+  operator has reviewed and accepted.
 - SQLite migration framework for `stats.db` and `cache.db` — per-DB
   registry populated via `@stats_migration` / `@cache_migration`
   decorators with contiguous `NNN_descriptive_name` ordering enforced

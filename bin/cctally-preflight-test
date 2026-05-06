@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Pytest harness wrapper for
+# .claude/skills/publish-public-mirror/scripts/test_preflight.py.
+#
+# Same shape as bin/cctally-skip-chain-metrics-test. The two wrappers
+# duplicate a few lines for clarity; if a third pytest harness lands,
+# extract bin/_lib-pytest-harness.sh.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+TEST_FILE="$REPO_ROOT/.claude/skills/publish-public-mirror/scripts/test_preflight.py"
+
+if [ ! -f "$TEST_FILE" ]; then
+    echo "FAIL: $TEST_FILE not found" >&2
+    echo "passed: 0   failed: 1"
+    exit 1
+fi
+
+# Guard: if pytest itself can't run (e.g. not installed), fail loudly
+# rather than emit a `passed: 0   failed: 0` line that the aggregator
+# would mistake for "harness ran, all green."
+if ! python3 -m pytest --version >/dev/null 2>&1; then
+    echo "FAIL: python3 -m pytest unavailable" >&2
+    echo "passed: 0   failed: 1"
+    exit 1
+fi
+
+out=$(python3 -m pytest "$TEST_FILE" --tb=short --no-header -rN -q 2>&1)
+ec=$?
+
+summary_line=$(echo "$out" | tail -3 | grep -E "passed|failed|error" | tail -1)
+passed=$(echo "$summary_line" | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+" | head -1)
+failed=$(echo "$summary_line" | grep -oE "[0-9]+ (failed|error)" | grep -oE "[0-9]+" | head -1)
+passed=${passed:-0}
+failed=${failed:-0}
+
+if [ "$ec" != "0" ] || [ "$failed" != "0" ]; then
+    echo "$out"
+fi
+
+echo "----"
+echo "passed: $passed   failed: $failed"
+[ "$failed" -eq 0 ] && [ "$ec" -eq 0 ]

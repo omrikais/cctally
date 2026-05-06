@@ -89,6 +89,7 @@ mkdir -p .githooks bin
 cp "$REPO_ROOT/.mirror-allowlist" .
 cp "$REPO_ROOT/.githooks/_match.py" .githooks/
 cp "$REPO_ROOT/.githooks/_public_trailer.py" .githooks/
+cp "$REPO_ROOT/.githooks/_skip_chain_metrics.py" .githooks/
 # The mirror tool resolves _REPO_ROOT via __file__.parent.parent at
 # import time. Copy it INTO the scratch private's bin/ and run from
 # there so it walks the scratch private repo (not cctally-dev itself).
@@ -1080,6 +1081,145 @@ SCENARIOS.append((
     '  echo "ASSERT_FAIL: public v1.0.0 tag itself is signed"; exit 2;\n'
     'fi\n'
     'echo "ASSERT_OK"\n',
+))
+
+
+# ---------------------------------------------------------------------------
+# Skip-chain accumulated-diff guards (issue #23, scenarios 23–26).
+#
+# Verifies the ⚠ ACCUMULATED-DIFF MISMATCH block + refuse gate added to
+# cmd_mirror in Task 5. Pairs with the .githooks/_skip_chain_metrics
+# helper module (Layer 1 + Layer 2) and preflight.py's envelope flags.
+# ---------------------------------------------------------------------------
+
+
+# 23. skip-chain-clean: 1 publish, 0 skips → no ⚠ block, exit 0.
+SCENARIOS.append((
+    "skip-chain-clean",
+    'mkdir -p docs\n'
+    'echo "a" > docs/a.md\n'
+    'git add docs/a.md\n'
+    + _commit_msg_heredoc(
+        "feat: add doc\n"
+        "\n"
+        "--- public ---\n"
+        "feat: add doc\n"
+    ),
+    # Tight substring: pins the publish-commit subject in the plan
+    # line. "mirror plan:" alone would also pass on warn/refuse runs
+    # (they print the same banner before the ⚠ block); "feat: add doc"
+    # is the publish subject for THIS scenario only — warn uses
+    # "docs: condense", refuse uses "fix: thing".
+    0, "feat: add doc", "",
+    "feat: add doc\n",
+    None,
+))
+
+
+# 24. skip-chain-warn: 3 skips + 1 docs publish (chain triggers warn but
+# not refuse) → ⚠ WARN block in stdout, exit 0 (operator proceeds).
+SCENARIOS.append((
+    "skip-chain-warn",
+    'mkdir -p docs\n'
+    'echo "skip1" > docs/s1.md\n'
+    'git add docs/s1.md\n'
+    + _commit_msg_heredoc(
+        "chore: skip 1\n\nPublic-Skip: true\n",
+        sentinel="CCTALLY_SKIP1_MSG_EOF",
+    )
+    + 'echo "skip2" > docs/s2.md\n'
+      'git add docs/s2.md\n'
+    + _commit_msg_heredoc(
+        "chore: skip 2\n\nPublic-Skip: true\n",
+        sentinel="CCTALLY_SKIP2_MSG_EOF",
+    )
+    + 'echo "skip3" > docs/s3.md\n'
+      'git add docs/s3.md\n'
+    + _commit_msg_heredoc(
+        "chore: skip 3\n\nPublic-Skip: true\n",
+        sentinel="CCTALLY_SKIP3_MSG_EOF",
+    )
+    + 'echo "pub" > docs/p.md\n'
+      'git add docs/p.md\n'
+    + _commit_msg_heredoc(
+        "docs: condense\n"
+        "\n"
+        "--- public ---\n"
+        "docs: condense\n",
+        sentinel="CCTALLY_PUB_MSG_EOF",
+    ),
+    # Tight substring: pins the WARN-verdict line specifically.
+    # "ACCUMULATED-DIFF MISMATCH" alone passes on both warn AND refuse
+    # runs (same block header). "Consider bundling." appears only in
+    # _render_skip_chain_warning's warn branch — refuse renders
+    # "REFUSE (chain>15 + max-ratio>5× + fix/chore subject)." and
+    # "→ To proceed: author a feat:/docs(changelog): bundling commit"
+    # instead.
+    0, "Consider bundling.", "",
+    None,  # public message check skipped — multiple paths get bundled
+    None,
+))
+
+
+# 25. skip-chain-refuse: 16 skips + 1 fix publish → ⚠ REFUSE block,
+# exit 1, "refusing to apply" on stderr.
+SCENARIOS.append((
+    "skip-chain-refuse",
+    'mkdir -p docs\n'
+    + ''.join(
+        f'echo "skip{i}" > docs/s{i}.md\n'
+        f'git add docs/s{i}.md\n'
+        + _commit_msg_heredoc(
+            f"chore: skip {i}\n\nPublic-Skip: true\n",
+            sentinel=f"CCTALLY_SKIP_{i}_MSG_EOF",
+        )
+        for i in range(1, 17)
+    )
+    + 'echo "pub" > docs/p.md\n'
+      'git add docs/p.md\n'
+    + _commit_msg_heredoc(
+        "fix: thing\n"
+        "\n"
+        "--- public ---\n"
+        "fix: thing\n",
+        sentinel="CCTALLY_PUB_MSG_EOF",
+    ),
+    1, "ACCUMULATED-DIFF MISMATCH", "refusing to apply",
+    None,
+    None,
+))
+
+
+# 26. skip-chain-refuse-with-override: same setup as -refuse, but run.sh
+# passes --accept-skip-mismatch → ⚠ REFUSE block STILL renders (operator
+# sees what they're overriding) but exit 0; golden-public-msg.txt proves
+# the publish landed.
+SCENARIOS.append((
+    "skip-chain-refuse-with-override",
+    'mkdir -p docs\n'
+    + ''.join(
+        f'echo "skip{i}" > docs/s{i}.md\n'
+        f'git add docs/s{i}.md\n'
+        + _commit_msg_heredoc(
+            f"chore: skip {i}\n\nPublic-Skip: true\n",
+            sentinel=f"CCTALLY_SKIP_{i}_MSG_EOF",
+        )
+        for i in range(1, 17)
+    )
+    + 'echo "pub" > docs/p.md\n'
+      'git add docs/p.md\n'
+    + _commit_msg_heredoc(
+        "fix: thing\n"
+        "\n"
+        "--- public ---\n"
+        "fix: thing\n",
+        sentinel="CCTALLY_PUB_MSG_EOF",
+    ),
+    0, "ACCUMULATED-DIFF MISMATCH", "",
+    "fix: thing\n",  # override worked → publish landed
+    # run.sh: invoke with --accept-skip-mismatch (mirrors bootstrap-* run.sh shape)
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes '
+    '--accept-skip-mismatch\n',
 ))
 
 

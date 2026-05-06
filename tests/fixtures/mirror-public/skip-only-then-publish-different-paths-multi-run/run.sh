@@ -1,12 +1,14 @@
 #!/bin/bash
 set -uo pipefail
-PRIVATE_HEAD_A=$(git rev-parse HEAD)
 CURSOR_BEFORE=$(git rev-parse refs/tags/mirror-cursor)
 python3 bin/cctally-mirror-public --public-clone ../public --yes
 rc=$?
 if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: run1 exit=$rc"; exit "$rc"; fi
 CURSOR_AFTER1=$(git rev-parse refs/tags/mirror-cursor)
-[ "$CURSOR_BEFORE" = "$CURSOR_AFTER1" ] || { echo "ASSERT_FAIL: cursor advanced after skip-only run "\"(was=$CURSOR_BEFORE now=$CURSOR_AFTER1)"; exit 2; }
+if [ "$CURSOR_BEFORE" != "$CURSOR_AFTER1" ]; then
+  echo "ASSERT_FAIL: cursor advanced after skip-only run was=$CURSOR_BEFORE now=$CURSOR_AFTER1"
+  exit 2
+fi
 echo "published content v1" > docs/published.md
 git add docs/published.md
 git commit --no-verify -q -F - <<'CCTALLY_MSG_EOF_B'
