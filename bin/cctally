@@ -8745,14 +8745,40 @@ def open_db() -> sqlite3.Connection:
         # window. Without this re-invocation those duplicates persist
         # forever — the marker says it ran. Handler owns its own
         # BEGIN/COMMIT and is idempotent (no groups → no-op).
+        #
+        # Honor `db skip` here as well: if the operator marked 003 as
+        # skipped (e.g., poison pill on their machine), we must NOT
+        # back-door run the handler. Duplicates introduced by the
+        # backfill will persist until they `db unskip` — which is the
+        # explicit choice the skip records. Failure path mirrors the
+        # dispatcher's contract: route through _log_migration_error so
+        # the next interactive command renders the banner, and clear
+        # the log entry on success so the banner auto-dismisses.
         if inserted > 0:
-            for _m in _STATS_MIGRATIONS:
-                if _m.name == "003_merge_5h_block_duplicates_v1":
-                    try:
-                        _m.handler(conn)
-                    except Exception as exc:
-                        eprint(f"[5h-dedup post-backfill] failed: {exc}")
-                    break
+            target_name = "003_merge_5h_block_duplicates_v1"
+            try:
+                skipped = {
+                    row[0] for row in conn.execute(
+                        "SELECT name FROM schema_migrations_skipped"
+                    ).fetchall()
+                }
+            except sqlite3.OperationalError:
+                skipped = set()
+            if target_name not in skipped:
+                for _m in _STATS_MIGRATIONS:
+                    if _m.name == target_name:
+                        qualified = f"stats.db:{target_name}"
+                        try:
+                            _m.handler(conn)
+                            _clear_migration_error_log_entries(qualified)
+                        except Exception as exc:
+                            _log_migration_error(
+                                name=qualified,
+                                exc=exc,
+                                tb=traceback.format_exc(),
+                            )
+                            eprint(f"[migration {qualified}] failed: {exc}")
+                        break
 
     conn.commit()
     return conn
@@ -10805,6 +10831,19 @@ def _run_pending_migrations(
             db_label, db_version=cur_version, max_known=len(registry),
         )
     if cur_version == len(registry):
+        # When the registry is currently empty (today's cache.db case),
+        # still leave the schema_migrations table behind so a later
+        # transition to len(registry) >= 1 can distinguish populated
+        # DBs from fresh installs. Without this, the fast-path returns
+        # before any DDL, so the future first-cache-migration walk
+        # finds no schema_migrations table, treats the populated DB as
+        # fresh, and stamps the new migration applied without invoking
+        # its handler.
+        if len(registry) == 0:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
         return  # fast path
 
     # Track whether schema_migrations existed before this open so we can

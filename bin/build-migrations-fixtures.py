@@ -9,6 +9,7 @@ bin/cctally-migrations-test:
   - 09-cache-db-and-stats-db/  — both DBs in distinct mid-states
   - 10-legacy-marker-recognized-by-db-status/  — stats has unprefixed (pre-framework) markers
   - 11-five-hour-dedup-after-backfill/  — stats has jitter-forked snapshot keys, no five_hour_blocks
+  - 12-skipped-dedup-not-rerun-after-backfill/  — like 11, but 003 is in schema_migrations_skipped
 """
 
 from __future__ import annotations
@@ -232,6 +233,89 @@ def build_11_five_hour_dedup_after_backfill(scenario_dir: Path) -> None:
     conn.close()
 
 
+def build_12_skipped_dedup_not_rerun(scenario_dir: Path) -> None:
+    """Same forked-snapshot topology as scenario 11, but the operator has
+    marked 003_merge_5h_block_duplicates_v1 as skipped via `cctally db
+    skip`. Validates that open_db()'s post-backfill rerun honors the
+    skip and does NOT back-door run the handler. Expected post-state:
+    five_hour_blocks count == 2 (forked rows kept un-merged), and
+    schema_migrations_skipped still carries 003 (operator's choice
+    intact).
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    stats = scenario_dir / "input.stats.db"
+    if stats.exists():
+        stats.unlink()
+    conn = sqlite3.connect(stats)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "CREATE TABLE schema_migrations "
+        "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+    )
+    # Mirror cmd_db_skip's table shape (created lazily by that command).
+    conn.execute(
+        "CREATE TABLE schema_migrations_skipped ("
+        "name TEXT PRIMARY KEY, "
+        "skipped_at_utc TEXT NOT NULL, "
+        "reason TEXT)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE weekly_usage_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            captured_at_utc TEXT NOT NULL,
+            week_start_date TEXT NOT NULL,
+            week_end_date TEXT NOT NULL,
+            week_start_at TEXT,
+            week_end_at TEXT,
+            weekly_percent REAL NOT NULL,
+            page_url TEXT,
+            source TEXT NOT NULL DEFAULT 'userscript',
+            payload_json TEXT NOT NULL,
+            five_hour_percent REAL,
+            five_hour_resets_at TEXT,
+            five_hour_window_key INTEGER
+        )
+        """
+    )
+    rows = [
+        ("2024-10-26T22:00:00+00:00", "2024-10-21", "2024-10-27",
+         "2024-10-21T00:00:00+00:00", "2024-10-28T00:00:00+00:00",
+         12.0, "{}", 50.0, "2024-10-27T01:13:20+00:00", 1730000000),
+        ("2024-10-26T22:05:00+00:00", "2024-10-21", "2024-10-27",
+         "2024-10-21T00:00:00+00:00", "2024-10-28T00:00:00+00:00",
+         13.0, "{}", 60.0, "2024-10-27T01:23:20+00:00", 1730000600),
+    ]
+    conn.executemany(
+        "INSERT INTO weekly_usage_snapshots ("
+        "captured_at_utc, week_start_date, week_end_date, "
+        "week_start_at, week_end_at, weekly_percent, payload_json, "
+        "five_hour_percent, five_hour_resets_at, five_hour_window_key"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    # Mark 001+002 applied (same as scenario 11), and seed the skip
+    # marker for 003. The dispatcher will honor the skip and advance
+    # user_version when all migrations are applied OR skipped — so the
+    # post-backfill rerun is the only path that could back-door the
+    # handler. This scenario verifies it doesn't.
+    conn.execute(
+        "INSERT INTO schema_migrations VALUES ('001_five_hour_block_models_backfill_v1', ?)",
+        (TS_001_APPLIED,),
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations VALUES ('002_five_hour_block_projects_backfill_v1', ?)",
+        (TS_002_APPLIED,),
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations_skipped VALUES "
+        "('003_merge_5h_block_duplicates_v1', ?, ?)",
+        (TS_003_APPLIED, "harness skip"),
+    )
+    conn.commit()
+    conn.close()
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -242,6 +326,9 @@ def main() -> int:
     build_10_legacy_markers(FIXTURES_ROOT / "10-legacy-marker-recognized-by-db-status")
     build_11_five_hour_dedup_after_backfill(
         FIXTURES_ROOT / "11-five-hour-dedup-after-backfill"
+    )
+    build_12_skipped_dedup_not_rerun(
+        FIXTURES_ROOT / "12-skipped-dedup-not-rerun-after-backfill"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

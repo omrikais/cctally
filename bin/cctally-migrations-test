@@ -560,6 +560,32 @@ scenario_11_five_hour_dedup_after_backfill () {
     scenario_assert_golden "$scenario_dir" "$actual"
 }
 
+# 12-skipped-dedup-not-rerun-after-backfill: same forked-snapshot topology
+# as scenario 11, but the operator pre-skipped 003 via schema_migrations_skipped.
+# `report --weeks 1` triggers open_db() → dispatcher honors the skip →
+# _backfill_five_hour_blocks creates 2 forked parents → post-backfill
+# rerun MUST honor the skip (not back-door run the handler). Asserts
+# five_hour_blocks count == 2 (forks kept) and the skipped row stays put.
+scenario_12_skipped_dedup_not_rerun () {
+    local scenario_dir="$HARNESS_FIXTURES_DIR/12-skipped-dedup-not-rerun-after-backfill"
+    scenario_setup "$scenario_dir"
+    scenario_run_cctally report --weeks 1 >/dev/null 2>&1 || true
+
+    local block_count
+    block_count="$(sqlite3 "$HARNESS_HOME/.local/share/cctally/stats.db" \
+        "SELECT COUNT(*) FROM five_hour_blocks" 2>/dev/null || echo "ERROR")"
+
+    local actual
+    actual="$(printf '%s\n' \
+        "## five_hour_blocks count" \
+        "$block_count" \
+        "## state" \
+        "$(scenario_dump_state stats.db)" \
+        "## log" \
+        "$(scenario_dump_log)")"
+    scenario_assert_golden "$scenario_dir" "$actual"
+}
+
 # ── Main ────────────────────────────────────────────────────────────────
 
 main () {
@@ -577,6 +603,7 @@ main () {
     scenario_09_both_dbs             && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
     scenario_10_legacy_marker_recognized       && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
     scenario_11_five_hour_dedup_after_backfill && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
+    scenario_12_skipped_dedup_not_rerun        && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
 
     echo
     echo "passed: $pass_count   failed: $fail_count"
