@@ -1,0 +1,123 @@
+{
+  "days": [
+    {
+      "inputTokens": 20000,
+      "outputTokens": 2000,
+      "cacheCreationTokens": 5000,
+      "cacheReadTokens": 120000,
+      "totalTokens": 147000,
+      "cost": 0.24125,
+      "cacheHitPercent": 82.76,
+      "savedUsd": 0.54,
+      "wastedUsd": 0.00625,
+      "netUsd": 0.53375,
+      "anomaly": {
+        "triggered": false,
+        "reasons": []
+      },
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 20000,
+          "outputTokens": 2000,
+          "cacheCreationTokens": 5000,
+          "cacheReadTokens": 120000,
+          "cacheHitPercent": 82.76,
+          "cost": 0.24125,
+          "savedUsd": 0.54,
+          "wastedUsd": 0.00625,
+          "netUsd": 0.53375
+        }
+      ],
+      "date": "2026-04-09",
+      "models": [
+        "claude-opus-4-7"
+      ],
+      "totalCost": 0.24125
+    },
+    {
+      "inputTokens": 20000,
+      "outputTokens": 2000,
+      "cacheCreationTokens": 5000,
+      "cacheReadTokens": 120000,
+      "totalTokens": 147000,
+      "cost": 0.24125,
+      "cacheHitPercent": 82.76,
+      "savedUsd": 0.54,
+      "wastedUsd": 0.00625,
+      "netUsd": 0.53375,
+      "anomaly": {
+        "triggered": false,
+        "reasons": []
+      },
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 20000,
+          "outputTokens": 2000,
+          "cacheCreationTokens": 5000,
+          "cacheReadTokens": 120000,
+          "cacheHitPercent": 82.76,
+          "cost": 0.24125,
+          "savedUsd": 0.54,
+          "wastedUsd": 0.00625,
+          "netUsd": 0.53375
+        }
+      ],
+      "date": "2026-04-12",
+      "models": [
+        "claude-opus-4-7"
+      ],
+      "totalCost": 0.24125
+    },
+    {
+      "inputTokens": 20000,
+      "outputTokens": 2000,
+      "cacheCreationTokens": 5000,
+      "cacheReadTokens": 120000,
+      "totalTokens": 147000,
+      "cost": 0.24125,
+      "cacheHitPercent": 82.76,
+      "savedUsd": 0.54,
+      "wastedUsd": 0.00625,
+      "netUsd": 0.53375,
+      "anomaly": {
+        "triggered": false,
+        "reasons": []
+      },
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 20000,
+          "outputTokens": 2000,
+          "cacheCreationTokens": 5000,
+          "cacheReadTokens": 120000,
+          "cacheHitPercent": 82.76,
+          "cost": 0.24125,
+          "savedUsd": 0.54,
+          "wastedUsd": 0.00625,
+          "netUsd": 0.53375
+        }
+      ],
+      "date": "2026-04-15",
+      "models": [
+        "claude-opus-4-7"
+      ],
+      "totalCost": 0.24125
+    }
+  ],
+  "totals": {
+    "inputTokens": 60000,
+    "outputTokens": 6000,
+    "cacheCreationTokens": 15000,
+    "cacheReadTokens": 360000,
+    "totalTokens": 441000,
+    "cost": 0.72375,
+    "cacheHitPercent": 82.76,
+    "savedUsd": 1.62,
+    "wastedUsd": 0.01875,
+    "netUsd": 1.60125,
+    "totalCost": 0.72375
+  },
+  "generatedAt": "2026-04-15T12:00:00Z"
+}

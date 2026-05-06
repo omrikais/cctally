@@ -1,0 +1,16 @@
+{
+  "otherKey": 42,
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/some/user/hook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

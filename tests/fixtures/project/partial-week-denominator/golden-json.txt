@@ -1,0 +1,29 @@
+{
+  "rangeStart": "2026-04-14",
+  "rangeEnd": "2026-04-14",
+  "weeksInRange": 1,
+  "groupMode": "git-root",
+  "totals": {
+    "costUsd": 7.5,
+    "usedPercent": 50.0,
+    "weeklyAttributionAvailable": true
+  },
+  "projects": [
+    {
+      "displayKey": "alpha",
+      "projectPath": "/fake/repos/alpha",
+      "gitRoot": null,
+      "sessions": 1,
+      "firstSeen": "2026-04-14T10:00:00Z",
+      "lastSeen": "2026-04-14T10:00:00Z",
+      "inputTokens": 1000000,
+      "outputTokens": 100000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 7.5,
+      "attributedUsedPercent": 25.0,
+      "costPerPercent": 0.3
+    }
+  ],
+  "warnings": []
+}

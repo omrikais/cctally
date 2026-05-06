@@ -1,0 +1,29 @@
+{
+  "rangeStart": "2026-04-06",
+  "rangeEnd": "2026-04-15",
+  "weeksInRange": 2,
+  "groupMode": "git-root",
+  "totals": {
+    "costUsd": 6.0,
+    "usedPercent": 80.0,
+    "weeklyAttributionAvailable": true
+  },
+  "projects": [
+    {
+      "displayKey": "span",
+      "projectPath": "/fake/repos/span",
+      "gitRoot": null,
+      "sessions": 4,
+      "firstSeen": "2026-04-08T10:00:00Z",
+      "lastSeen": "2026-04-15T14:00:00Z",
+      "inputTokens": 800000,
+      "outputTokens": 80000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 6.0,
+      "attributedUsedPercent": 80.0,
+      "costPerPercent": 0.075
+    }
+  ],
+  "warnings": []
+}

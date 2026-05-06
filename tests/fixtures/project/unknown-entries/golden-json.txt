@@ -1,0 +1,47 @@
+Warning: 2 entries lacked project_path — run `cache-sync` to backfill.
+{
+  "rangeStart": "2026-04-13",
+  "rangeEnd": "2026-04-15",
+  "weeksInRange": 1,
+  "groupMode": "git-root",
+  "totals": {
+    "costUsd": 11.25,
+    "usedPercent": 30.0,
+    "weeklyAttributionAvailable": true
+  },
+  "projects": [
+    {
+      "displayKey": "real",
+      "projectPath": "/fake/repos/real",
+      "gitRoot": null,
+      "sessions": 3,
+      "firstSeen": "2026-04-15T09:00:00Z",
+      "lastSeen": "2026-04-15T11:00:00Z",
+      "inputTokens": 900000,
+      "outputTokens": 90000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 6.75,
+      "attributedUsedPercent": 18.0,
+      "costPerPercent": 0.375
+    },
+    {
+      "displayKey": "(unknown)",
+      "projectPath": "(unknown)",
+      "gitRoot": null,
+      "sessions": 2,
+      "firstSeen": "2026-04-15T12:00:00Z",
+      "lastSeen": "2026-04-15T13:00:00Z",
+      "inputTokens": 600000,
+      "outputTokens": 60000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 4.5,
+      "attributedUsedPercent": 12.0,
+      "costPerPercent": 0.375
+    }
+  ],
+  "warnings": [
+    "2 entries lacked project_path \u2014 run `cache-sync` to backfill."
+  ]
+}

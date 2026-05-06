@@ -1,0 +1,10 @@
+# Runtime artifacts spawned when bin/cctally-alerts-test runs
+# under HOME=<scratch>/<scenario>. The committed per-scenario
+# tree is:
+#   <scenario>/input.env
+#   <scenario>/.gitignore
+#   <scenario>/.local/share/cctally/{stats,cache}.db
+#   <scenario>/.local/share/cctally/config.json (some scenarios)
+*.db-wal
+*.db-shm
+*.log

@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Fixture-based validation harness for `forecast`.
+#
+# Walks tests/fixtures/forecast/*/input.env, runs three output
+# modes (default terminal, --json, --status-line) via the shared run_mode
+# helper (bin/_lib-fixture-harness.sh), and diffs each against the
+# corresponding golden file. Exits 0 on all-pass, 1 on any diff.
+#
+# Uses CCTALLY_AS_OF (via the shared lib's TZ=Etc/UTC env block) rather
+# than the production `--as-of` flag. cmd_forecast honors the env var as
+# of Phase 5 Task 0 (_resolve_forecast_now falls through to
+# _command_as_of()).
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+HARNESS_SUBCOMMAND="forecast"
+HARNESS_FIXTURES_DIR="$REPO_ROOT/tests/fixtures/forecast"
+HARNESS_BIN="$REPO_ROOT/bin/cctally"
+FIXTURES_DIR="$HARNESS_FIXTURES_DIR"  # legacy name used by the inline reconcile block below
+BIN="$HARNESS_BIN"                     # same
+
+# Per-run scratch dir for the regenerated fixture DBs and any test-process
+# SQLite writes. Keeps the in-tree fixture .db files byte-stable across
+# harness runs (the builder is host-deterministic but produces different
+# bytes on different hosts/sqlite versions). HARNESS_FAKE_HOME_BASE
+# redirects FAKE_HOME in _lib-fixture-harness.sh; input.env / golden-*.txt
+# are still read from the in-tree HARNESS_FIXTURES_DIR.
+SCRATCH_DIR=$(mktemp -d -t cctally-forecast-fixtures-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR"
+
+# Regenerate seeded fixture DBs into the scratch dir so goldens always
+# check against reproducible state without dirtying the tree.
+"$REPO_ROOT/bin/build-forecast-fixtures.py" --out "$SCRATCH_DIR" >/dev/null || {
+    echo "FAIL: build-forecast-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+# shellcheck disable=SC1091
+. "$REPO_ROOT/bin/_lib-fixture-harness.sh"
+
+pass_count=0
+fail_count=0
+
+for dir in "$HARNESS_FIXTURES_DIR"/*/; do
+    name=$(basename "$dir")
+    run_mode "$name" "terminal"    ""              "terminal"
+    run_mode "$name" "json"        "--json"        "json"
+    run_mode "$name" "status-line" "--status-line" "status-line"
+done
+
+# ─── Reconciliation: forecast vs weekly ────────────────────────────────
+# For each fixture (excluding already-capped / fresh-week-day1 where
+# single-row edge cases make weekly output unreliable), verify:
+#   forecast --json .current.weekly_percent == weekly --json ...last row
+#   forecast --json .current.spent_usd      == weekly --json ...last row
+# Field names (top-level `weekly` array, `usedPct`/`totalCost`/`weekStartAt`)
+# verified against the Task 1 baseline capture.
+#
+# This block is at module scope (outside run_mode), so it uses plain
+# assignments instead of the plan's `local` declarations — `local` would
+# be a syntax error here.
+RECONCILE_FIXTURES="midweek-safe midweek-approaching projected-cap zero-prior-weeks stable-sparse-current date-only-current-week mixed-boundary-current-week"
+for name in $RECONCILE_FIXTURES; do
+    dir="$FIXTURES_DIR/$name"          # for reading input.env (still in-tree)
+    FAKE_HOME="$SCRATCH_DIR/$name"     # for HOME during forecast/weekly invocations (scratch)
+    AS_OF=""
+    # shellcheck disable=SC1091
+    . "$dir/input.env"
+    [ -n "$AS_OF" ] || continue
+    forecast_json=$(HOME="$FAKE_HOME" NO_COLOR=1 TZ=UTC \
+        "$BIN" forecast --json --as-of "$AS_OF" 2>/dev/null)
+    week_start=$(echo "$forecast_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['week']['start_at'])")
+    f_pct=$(echo "$forecast_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['current']['weekly_percent'])")
+    f_cost=$(echo "$forecast_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['current']['spent_usd'])")
+    # `weekly --until` takes YYYY-MM-DD; strip the time suffix from AS_OF.
+    as_of_date="${AS_OF%T*}"
+    week_start_date="${week_start%T*}"
+    weekly_json=$(HOME="$FAKE_HOME" NO_COLOR=1 TZ=UTC \
+        "$BIN" weekly --since "$week_start_date" --until "$as_of_date" --json 2>/dev/null)
+    w_pct=$(echo "$weekly_json" | python3 -c "
+import json,sys
+data = json.load(sys.stdin).get('weekly') or []
+target = '$week_start_date'
+for row in data:
+    if row.get('weekStartAt', '').startswith(target):
+        print(row.get('usedPct', ''))
+        break
+else:
+    print('')")
+    w_cost=$(echo "$weekly_json" | python3 -c "
+import json,sys
+data = json.load(sys.stdin).get('weekly') or []
+target = '$week_start_date'
+for row in data:
+    if row.get('weekStartAt', '').startswith(target):
+        print(row.get('totalCost', ''))
+        break
+else:
+    print('')")
+    if [ "$f_pct" != "$w_pct" ]; then
+        echo "RECONCILE FAIL $name: forecast.current.weekly_percent=$f_pct  weekly=$w_pct"
+        fail_count=$((fail_count + 1))
+    fi
+    if [ "$f_cost" != "$w_cost" ]; then
+        echo "RECONCILE FAIL $name: forecast.current.spent_usd=$f_cost  weekly=$w_cost"
+        fail_count=$((fail_count + 1))
+    fi
+done
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

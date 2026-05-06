@@ -1,0 +1,56 @@
+{
+  "alerts": [],
+  "alerts_settings": {
+    "enabled": false,
+    "five_hour_thresholds": [
+      90,
+      95
+    ],
+    "weekly_thresholds": [
+      90,
+      95
+    ]
+  },
+  "blocks": {
+    "rows": []
+  },
+  "current_week": null,
+  "daily": {
+    "peak": null,
+    "quantile_thresholds": [],
+    "rows": []
+  },
+  "display": {
+    "offset_label": "UTC",
+    "offset_seconds": 0,
+    "resolved_tz": "Etc/UTC",
+    "tz": "local"
+  },
+  "envelope_version": 2,
+  "forecast": null,
+  "generated_at": "__NOW__",
+  "header": {
+    "dollar_per_pct": null,
+    "five_hour_pct": null,
+    "forecast_pct": null,
+    "forecast_verdict": null,
+    "used_pct": null,
+    "vs_last_week_delta": null,
+    "week_label": null
+  },
+  "last_sync_at": null,
+  "last_sync_error": null,
+  "monthly": {
+    "rows": []
+  },
+  "sessions": {
+    "rows": [],
+    "sort_key": "started_desc",
+    "total": 0
+  },
+  "sync_age_s": null,
+  "trend": null,
+  "weekly": {
+    "rows": []
+  }
+}

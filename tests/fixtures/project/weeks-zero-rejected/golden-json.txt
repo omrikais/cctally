@@ -1,0 +1,1 @@
+Error: --weeks must be >= 1

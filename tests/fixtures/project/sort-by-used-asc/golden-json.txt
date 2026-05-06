@@ -1,0 +1,44 @@
+{
+  "rangeStart": "2026-04-13",
+  "rangeEnd": "2026-04-15",
+  "weeksInRange": 1,
+  "groupMode": "git-root",
+  "totals": {
+    "costUsd": 9.0,
+    "usedPercent": 50.0,
+    "weeklyAttributionAvailable": true
+  },
+  "projects": [
+    {
+      "displayKey": "beta-small",
+      "projectPath": "/fake/repos/beta-small",
+      "gitRoot": null,
+      "sessions": 1,
+      "firstSeen": "2026-04-15T13:00:00Z",
+      "lastSeen": "2026-04-15T13:00:00Z",
+      "inputTokens": 200000,
+      "outputTokens": 20000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 1.5,
+      "attributedUsedPercent": 8.3333,
+      "costPerPercent": 0.18
+    },
+    {
+      "displayKey": "alpha-big",
+      "projectPath": "/fake/repos/alpha-big",
+      "gitRoot": null,
+      "sessions": 1,
+      "firstSeen": "2026-04-15T12:00:00Z",
+      "lastSeen": "2026-04-15T12:00:00Z",
+      "inputTokens": 1000000,
+      "outputTokens": 100000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 7.5,
+      "attributedUsedPercent": 41.6667,
+      "costPerPercent": 0.18
+    }
+  ],
+  "warnings": []
+}

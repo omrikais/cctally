@@ -1,0 +1,1 @@
+diff: cannot resolve week token 'this-week': no subscription-week anchor available (run record-usage first)

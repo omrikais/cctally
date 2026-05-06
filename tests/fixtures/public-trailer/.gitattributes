@@ -1,0 +1,10 @@
+# Parser fixtures must be byte-stable across platforms.
+# `crlf-line-endings/input.txt` deliberately ships with CRLF so the
+# parser's normalization (CRLF -> LF) is exercised; without `-text`,
+# git would normalize CRLF -> LF on `add`/checkout and the fixture
+# would no longer cover that case.
+crlf-line-endings/input.txt -text
+
+# Goldens are tab/space-sensitive and one-line JSON; treat as plain text
+# but disable any cross-platform line-ending guessing for safety.
+*/golden-parse.txt -text

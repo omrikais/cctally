@@ -1,0 +1,1841 @@
+#!/usr/bin/env bash
+# Regression harness for five_hour_blocks + five_hour_milestones tables.
+#
+# Each scenario gets its own scratch HOME under a shared mktemp -d so the
+# in-tree fixture tree stays byte-stable. We don't run a fixture builder —
+# scenarios drive `cctally record-usage` directly with controlled args.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN="$REPO_ROOT/bin/cctally"
+
+pass_count=0
+fail_count=0
+
+SCRATCH_DIR=$(mktemp -d -t cctally-five-hour-blocks-XXXXXX)
+
+cleanup_on_exit () {
+    local rc=$?
+    if [ "$fail_count" -eq 0 ] && [ $rc -eq 0 ]; then
+        rm -rf "$SCRATCH_DIR"
+    else
+        printf 'Scratch dir preserved for debugging: %s\n' "$SCRATCH_DIR" >&2
+    fi
+}
+trap cleanup_on_exit EXIT
+
+report () {
+    local scenario="$1"; local status="$2"; local detail="${3-}"
+    if [ "$status" = PASS ]; then
+        printf 'PASS %s\n' "$scenario"
+        pass_count=$((pass_count + 1))
+    else
+        printf 'FAIL %s%s\n' "$scenario" "${detail:+: $detail}"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+assert_eq () {
+    local got="$1"; local want="$2"; local label="$3"
+    if [ "$got" != "$want" ]; then
+        _err="${_err:+$_err; }$label expected=$want got=$got"
+    fi
+}
+
+begin_scenario () {
+    local name="$1"
+    _err=""
+    home="$SCRATCH_DIR/$name"
+    mkdir -p "$home"
+}
+
+finish_scenario () {
+    local name="$1"
+    if [ -z "$_err" ]; then
+        report "$name" PASS
+    else
+        report "$name" FAIL "$_err"
+    fi
+}
+
+# Run `cctally record-usage` in an isolated HOME, suppressing output.
+record_usage () {
+    local home="$1"; shift
+    HOME="$home" TZ=Etc/UTC "$BIN" record-usage "$@" \
+        >>"$home/cctally-stdout.log" 2>>"$home/cctally-stderr.log"
+}
+
+# Run any cctally subcommand in an isolated HOME (used to trigger open_db()
+# without writing snapshot data).
+run_cctally () {
+    local home="$1"; shift
+    HOME="$home" TZ=Etc/UTC "$BIN" "$@" \
+        >>"$home/cctally-stdout.log" 2>>"$home/cctally-stderr.log"
+}
+
+# SQLite query helper — reads from $home/.local/share/cctally/stats.db.
+sql () {
+    local home="$1"; local q="$2"
+    sqlite3 "$home/.local/share/cctally/stats.db" "$q"
+}
+
+# Seed cache.db.session_entries + session_files directly via sqlite3.
+# Used by scenarios that need actual entries to exercise per-model /
+# per-project bucketing in _compute_block_totals.
+#
+# Args: $home $timestamp_utc $model $input_tok $output_tok $cache_create_tok
+#       $cache_read_tok $source_path $project_path_or_NULL
+# Notes:
+#   - source_path lives outside ~/.claude/projects/ so sync_cache won't
+#     try to re-ingest it.
+#   - session_files.project_path passes 'NULL' as the literal arg to
+#     leave it as SQL NULL (for the '(unknown)' sentinel scenario).
+#   - cache.db is created lazily on first cctally call — caller must
+#     run a cctally command (e.g. `run_cctally "$home" cache-sync`) first
+#     so the table exists.
+seed_session_entry () {
+    local home="$1"
+    local ts="$2"      # timestamp_utc, e.g. 2025-04-30T13:00:00+00:00
+    local model="$3"
+    local in_tok="$4"
+    local out_tok="$5"
+    local cc_tok="$6"
+    local cr_tok="$7"
+    local source_path="$8"
+    local project_path="$9"   # use 'NULL' for SQL NULL
+
+    local cache_db="$home/.local/share/cctally/cache.db"
+    local proj_clause
+    if [ "$project_path" = "NULL" ]; then
+        proj_clause="NULL"
+    else
+        proj_clause="'$project_path'"
+    fi
+
+    # Each scenario uses unique line_offsets per source_path. msg_id must
+    # be globally unique across all seed calls, otherwise the
+    # UNIQUE(msg_id, req_id) index silently drops duplicates. Include
+    # source_path (which scenarios already make unique per call) in the
+    # derivation, AND a per-process counter to bullet-proof against the
+    # rare case where a single scenario seeds two entries from the same
+    # (ts, model, in_tok, source_path) tuple.
+    SEED_COUNTER=$((${SEED_COUNTER:-0} + 1))
+    local msg_id="msg_${SEED_COUNTER}_$(echo "${ts}_${model}_${in_tok}_${source_path}" | tr -dc 'A-Za-z0-9_' | head -c 32)"
+
+    sqlite3 "$cache_db" <<EOF
+INSERT INTO session_files (path, size_bytes, mtime_ns, last_byte_offset,
+                           last_ingested_at, session_id, project_path)
+VALUES ('$source_path', 0, 0, 0, '$ts', NULL, $proj_clause)
+ON CONFLICT(path) DO UPDATE SET project_path = $proj_clause;
+
+INSERT OR IGNORE INTO session_entries
+    (source_path, line_offset, timestamp_utc, model,
+     msg_id, req_id,
+     input_tokens, output_tokens, cache_create_tokens, cache_read_tokens)
+VALUES
+    ('$source_path',
+     (SELECT COALESCE(MAX(line_offset), -1) + 1 FROM session_entries WHERE source_path = '$source_path'),
+     '$ts', '$model',
+     '$msg_id', NULL,
+     $in_tok, $out_tok, $cc_tok, $cr_tok);
+EOF
+}
+
+# A 600-aligned base epoch for 5h-block scenarios.
+# 1746014400 = 2025-04-30T12:00:00Z (canonical, %600==0).
+BASE=1746014400
+# A 7d resets_at sufficiently far in the future so weekly_percent monotonic
+# guards don't interfere across scenarios. Must be > now_utc so scenario G's
+# mid-week reset detection (prior_end_dt > now_utc gate) actually fires.
+# 2100000000 = 2036-07-18 (well into the future, won't go stale soon).
+RESETS_7D=2100000000
+
+# ─── Scenario A: schema migration creates both tables ─────────────────
+{
+    begin_scenario A_schema_exists
+
+    # Trigger open_db() with no data. `weekly` is a cheap stats-DB-touching
+    # subcommand that opens stats.db (and thus runs the schema migration)
+    # even when no JSONL data exists; it just prints "No Claude usage found."
+    # (cache-sync only opens cache.db, so it would NOT run open_db().)
+    run_cctally "$home" weekly
+
+    # Both tables must exist with the expected column counts.
+    blocks_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('five_hour_blocks');")
+    milestones_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('five_hour_milestones');")
+    assert_eq "$blocks_cols"     "18" "five_hour_blocks column count"
+    # 14 = 13 base columns + `alerted_at TEXT` added by the threshold-actions
+    # T1 migration.
+    assert_eq "$milestones_cols" "14" "five_hour_milestones column count"
+
+    # Spot-check a few critical columns by name.
+    has_window_key=$(sql "$home" "SELECT name FROM pragma_table_info('five_hour_blocks') WHERE name='five_hour_window_key';")
+    has_crossed=$(sql "$home"    "SELECT name FROM pragma_table_info('five_hour_blocks') WHERE name='crossed_seven_day_reset';")
+    has_threshold=$(sql "$home"  "SELECT name FROM pragma_table_info('five_hour_milestones') WHERE name='percent_threshold';")
+    assert_eq "$has_window_key" "five_hour_window_key" "blocks.five_hour_window_key column"
+    assert_eq "$has_crossed"    "crossed_seven_day_reset" "blocks.crossed_seven_day_reset column"
+    assert_eq "$has_threshold"  "percent_threshold" "milestones.percent_threshold column"
+
+    # UNIQUE constraints surface as auto-generated indexes named
+    # sqlite_autoindex_<table>_N (with sql=NULL — they're implicit), so
+    # match by name prefix rather than SQL text.
+    blocks_unique=$(sql "$home" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='five_hour_blocks' AND name LIKE 'sqlite_autoindex_%';")
+    milestones_unique=$(sql "$home" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='five_hour_milestones' AND name LIKE 'sqlite_autoindex_%';")
+    [ "$blocks_unique" -ge 1 ] || _err="${_err:+$_err; }five_hour_blocks missing UNIQUE index (got $blocks_unique)"
+    [ "$milestones_unique" -ge 1 ] || _err="${_err:+$_err; }five_hour_milestones missing UNIQUE index (got $milestones_unique)"
+
+    finish_scenario A_schema_exists
+}
+
+# ─── Scenario B: first observation creates a five_hour_blocks row ────
+{
+    begin_scenario B_block_first_insert
+
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    row_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$row_count" "1" "row count after first record-usage"
+
+    window_key=$(sql "$home" "SELECT five_hour_window_key FROM five_hour_blocks LIMIT 1;")
+    final_pct=$(sql "$home" "SELECT final_five_hour_percent FROM five_hour_blocks LIMIT 1;")
+    is_closed=$(sql "$home" "SELECT is_closed FROM five_hour_blocks LIMIT 1;")
+    pct_start_7d=$(sql "$home" "SELECT seven_day_pct_at_block_start FROM five_hour_blocks LIMIT 1;")
+    pct_end_7d=$(sql "$home" "SELECT seven_day_pct_at_block_end FROM five_hour_blocks LIMIT 1;")
+    crossed=$(sql "$home" "SELECT crossed_seven_day_reset FROM five_hour_blocks LIMIT 1;")
+
+    assert_eq "$window_key" "$BASE" "window_key (canonical-floored)"
+    assert_eq "$final_pct"  "10.0"  "final_five_hour_percent"
+    # is_closed=1 here because:
+    # (a) BASE = 2025-04-30T12:00Z is historical relative to test wall-clock,
+    # (b) on the first record-usage call against a fresh DB, insert_usage_snapshot
+    #     inserts the snapshot, then maybe_update_five_hour_block reopens the DB
+    #     and the backfill gate fires (snapshots present, blocks empty),
+    # (c) the backfill's is_closed = (resets_at < now) rule (spec §4.1 step 7)
+    #     marks BASE-anchored blocks closed.
+    # Real fresh installs have current BASE → is_closed=0; this is a
+    # harness artifact of using historical BASE for determinism.
+    assert_eq "$is_closed"  "1"     "is_closed"
+    assert_eq "$pct_start_7d" "25.0" "seven_day_pct_at_block_start"
+    assert_eq "$pct_end_7d"   "25.0" "seven_day_pct_at_block_end"
+    assert_eq "$crossed"    "0"     "crossed_seven_day_reset"
+
+    # Totals are zero when no session_entries seed the harness's cache.db.
+    # Locks the implicit "_compute_block_totals returns zeros for an empty
+    # cache" behavior every other scenario relies on.
+    cost_usd=$(sql "$home" "SELECT total_cost_usd FROM five_hour_blocks LIMIT 1;")
+    in_tok=$(sql "$home"  "SELECT total_input_tokens FROM five_hour_blocks LIMIT 1;")
+    out_tok=$(sql "$home" "SELECT total_output_tokens FROM five_hour_blocks LIMIT 1;")
+    cc_tok=$(sql "$home"  "SELECT total_cache_create_tokens FROM five_hour_blocks LIMIT 1;")
+    cr_tok=$(sql "$home"  "SELECT total_cache_read_tokens FROM five_hour_blocks LIMIT 1;")
+    assert_eq "$cost_usd" "0.0" "total_cost_usd zero on empty session_entries"
+    assert_eq "$in_tok"   "0"   "total_input_tokens zero"
+    assert_eq "$out_tok"  "0"   "total_output_tokens zero"
+    assert_eq "$cc_tok"   "0"   "total_cache_create_tokens zero"
+    assert_eq "$cr_tok"   "0"   "total_cache_read_tokens zero"
+
+    finish_scenario B_block_first_insert
+}
+
+# ─── Scenario C: subsequent tick within same window updates same row ─
+{
+    begin_scenario C_block_update_in_window
+
+    # First tick.
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    # Second tick: same window (BASE+3 collapses to same canonical key);
+    # bump --percent (else dedup at lines ~13316-13322 swallows row 2).
+    record_usage "$home" \
+        --percent 26 --resets-at "$RESETS_7D" \
+        --five-hour-percent 15 --five-hour-resets-at "$((BASE + 3))"
+
+    row_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$row_count" "1" "row count still 1 (same window)"
+
+    final_pct=$(sql "$home" "SELECT final_five_hour_percent FROM five_hour_blocks LIMIT 1;")
+    pct_end_7d=$(sql "$home" "SELECT seven_day_pct_at_block_end FROM five_hour_blocks LIMIT 1;")
+    assert_eq "$final_pct"  "15.0" "final_five_hour_percent updated"
+    assert_eq "$pct_end_7d" "26.0" "seven_day_pct_at_block_end updated"
+
+    # Block-start fields are immutable.
+    pct_start_7d=$(sql "$home" "SELECT seven_day_pct_at_block_start FROM five_hour_blocks LIMIT 1;")
+    assert_eq "$pct_start_7d" "25.0" "seven_day_pct_at_block_start immutable"
+
+    finish_scenario C_block_update_in_window
+}
+
+# ─── Scenario D: new window closes the strictly-older block ──────────
+{
+    begin_scenario D_close_older_block
+
+    # First window (BASE).
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    # Second window 5h later. 18000 s = 5h, well past the 600 s jitter
+    # bucket, so this collapses to a strictly-greater canonical key.
+    NEW_BASE=$((BASE + 18000))
+    record_usage "$home" \
+        --percent 27 --resets-at "$RESETS_7D" \
+        --five-hour-percent 5 --five-hour-resets-at "$NEW_BASE"
+
+    row_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$row_count" "2" "row count now 2 (two windows)"
+
+    old_closed=$(sql "$home" "SELECT is_closed FROM five_hour_blocks WHERE five_hour_window_key = $BASE;")
+    new_closed=$(sql "$home" "SELECT is_closed FROM five_hour_blocks WHERE five_hour_window_key = $NEW_BASE;")
+    assert_eq "$old_closed" "1" "older block closed"
+    assert_eq "$new_closed" "0" "newer block still open"
+
+    finish_scenario D_close_older_block
+}
+
+# ─── Scenario E: first observation at 47% records ONE milestone (47),
+#                NOT 1..47 (Write-once milestones gotcha) ──────────────
+{
+    begin_scenario E_first_observation_no_synth
+
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 47 --five-hour-resets-at "$BASE"
+
+    milestone_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_milestones;")
+    assert_eq "$milestone_count" "1" "milestone count on first observation at 47%"
+
+    threshold=$(sql "$home" "SELECT percent_threshold FROM five_hour_milestones LIMIT 1;")
+    assert_eq "$threshold" "47" "threshold value"
+
+    seven_day=$(sql "$home" "SELECT seven_day_pct_at_crossing FROM five_hour_milestones LIMIT 1;")
+    assert_eq "$seven_day" "25.0" "seven_day_pct_at_crossing"
+
+    marginal_is_null=$(sql "$home" "SELECT marginal_cost_usd IS NULL FROM five_hour_milestones LIMIT 1;")
+    assert_eq "$marginal_is_null" "1" "marginal_cost_usd NULL on first crossing of block"
+
+    finish_scenario E_first_observation_no_synth
+}
+
+# ─── Scenario F: tick at 50% after prior 47% records 48, 49, 50 ──────
+{
+    begin_scenario F_subsequent_crossings
+
+    # First tick at 47%: one milestone (47).
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 47 --five-hour-resets-at "$BASE"
+
+    # Second tick at 50% (vary --percent to dodge dedup).
+    record_usage "$home" \
+        --percent 26 --resets-at "$RESETS_7D" \
+        --five-hour-percent 50 --five-hour-resets-at "$BASE"
+
+    milestone_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_milestones;")
+    assert_eq "$milestone_count" "4" "milestone count after second tick (47, 48, 49, 50)"
+
+    thresholds=$(sql "$home" "SELECT GROUP_CONCAT(percent_threshold, ',') FROM (SELECT percent_threshold FROM five_hour_milestones ORDER BY percent_threshold);")
+    assert_eq "$thresholds" "47,48,49,50" "threshold sequence"
+
+    # marginal_cost_usd is NULL on:
+    #   - 47 (first crossing of block, max_existing was None at insert time)
+    #   - 49 and 50 (non-start_threshold milestones in tick 2's multi-crossing fire;
+    #     only the first new milestone (48) gets the recompute-delta — same as
+    #     maybe_record_milestone's 7d behavior, per spec §3.2 step 8 and the
+    #     [Write-once milestones] convention).
+    null_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_milestones WHERE marginal_cost_usd IS NULL;")
+    assert_eq "$null_count" "3" "three milestones have NULL marginal (47 first-of-block, plus 49+50 non-start_threshold)"
+
+    # And exactly one milestone (48 = start_threshold of tick 2's fire) has a non-NULL marginal.
+    nonnull_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_milestones WHERE marginal_cost_usd IS NOT NULL;")
+    assert_eq "$nonnull_count" "1" "exactly one milestone has non-NULL marginal (48 = start_threshold of tick 2)"
+
+    # All milestones in this scenario share the same canonical window_key.
+    distinct_keys=$(sql "$home" "SELECT COUNT(DISTINCT five_hour_window_key) FROM five_hour_milestones;")
+    assert_eq "$distinct_keys" "1" "all milestones in same window_key"
+
+    # block_id FK should match the rollup row's id.
+    fk_match=$(sql "$home" "SELECT (SELECT COUNT(*) FROM five_hour_milestones) = (SELECT COUNT(*) FROM five_hour_milestones m JOIN five_hour_blocks b ON m.block_id = b.id);")
+    assert_eq "$fk_match" "1" "block_id FK references valid block row"
+
+    finish_scenario F_subsequent_crossings
+}
+
+# ─── Scenario G: mid-week reset flags the spanning block ─────────────
+# When weekly_percent drops sharply against a still-future declared
+# week_end, cmd_record_usage records a week_reset_events row AND we
+# expect the affected five_hour_block to flip crossed_seven_day_reset=1.
+{
+    begin_scenario G_cross_reset_flag
+
+    # First tick: high weekly_percent (50%), declared week_end far
+    # in the future (RESETS_7D), 5h-% at 10. Establishes the open block.
+    record_usage "$home" \
+        --percent 50 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    # Second tick: SAME 5h window (BASE+3 collapses), but a NEW
+    # week_end (RESETS_7D + 7 days) AND weekly_percent collapses to 5%
+    # (drop > _RESET_PCT_DROP_THRESHOLD). cmd_record_usage's existing
+    # reset-detection block fires and inserts week_reset_events; the
+    # new helper must flag this block.
+    NEW_RESETS_7D=$((RESETS_7D + 604800))
+    record_usage "$home" \
+        --percent 5 --resets-at "$NEW_RESETS_7D" \
+        --five-hour-percent 12 --five-hour-resets-at "$((BASE + 3))"
+
+    # Sanity: the reset event was recorded.
+    reset_count=$(sql "$home" "SELECT COUNT(*) FROM week_reset_events;")
+    assert_eq "$reset_count" "1" "week_reset_events row inserted"
+
+    # The block's flag must be set.
+    crossed=$(sql "$home" "SELECT crossed_seven_day_reset FROM five_hour_blocks WHERE five_hour_window_key = $BASE;")
+    assert_eq "$crossed" "1" "crossed_seven_day_reset on spanning block"
+
+    finish_scenario G_cross_reset_flag
+}
+
+# ─── Scenario H: historical backfill reconstructs five_hour_blocks ───
+{
+    begin_scenario H_backfill
+
+    # Seed 3 distinct windows via live record-usage (which creates blocks
+    # and milestones along the way).
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+    record_usage "$home" \
+        --percent 26 --resets-at "$RESETS_7D" \
+        --five-hour-percent 15 --five-hour-resets-at "$((BASE + 18000))"
+    record_usage "$home" \
+        --percent 27 --resets-at "$RESETS_7D" \
+        --five-hour-percent 20 --five-hour-resets-at "$((BASE + 36000))"
+
+    # Sanity: 3 blocks present.
+    pre=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$pre" "3" "block count after live record-usage"
+
+    # Wipe the rollup table to simulate "feature-just-shipped" state where
+    # snapshots pre-exist but five_hour_blocks is empty. (Simulates the
+    # one-time migration on an upgraded install.)
+    sql "$home" "DELETE FROM five_hour_blocks; DELETE FROM five_hour_milestones;"
+
+    post_wipe=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$post_wipe" "0" "blocks empty after wipe"
+
+    # Trigger open_db() — the backfill gate should fire (table empty +
+    # snapshots with non-NULL five_hour_window_key + five_hour_percent).
+    # Use `weekly` (the cheapest stats-DB-touching subcommand) — `cache-sync
+    # --rebuild` only opens cache.db, not stats.db, so it would NOT run
+    # open_db() and the gate wouldn't fire. Same pattern as scenario A.
+    run_cctally "$home" weekly
+
+    post_backfill=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$post_backfill" "3" "blocks reconstructed by backfill"
+
+    # All historical blocks should be closed (their resets_at is in the
+    # past relative to BASE = 2025-04-30 vs. wall-clock during testing).
+    closed_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks WHERE is_closed = 1;")
+    assert_eq "$closed_count" "3" "all backfilled blocks marked closed"
+
+    # Per spec §4.3, milestones are NOT backfilled.
+    milestone_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_milestones;")
+    assert_eq "$milestone_count" "0" "milestones NOT backfilled (forward-only)"
+
+    finish_scenario H_backfill
+}
+
+# ─── Scenario I: no 5h anchor → bail-out gate skips the rollup ──────
+# Spec §3.2 / "five_hour_blocks is API-anchored only" gotcha: a record-usage
+# call without --five-hour-percent (or without a 5h resets_at) lands in the
+# bail-out at the top of maybe_update_five_hour_block. No row should be
+# created. Pins this branch so a future refactor can't silently drop it.
+{
+    begin_scenario I_no_5h_anchor_skips
+
+    record_usage "$home" --percent 25 --resets-at "$RESETS_7D"
+
+    row_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$row_count" "0" "no rollup row when 5h anchor absent"
+
+    # Sanity: the snapshot itself was inserted (bail-out only guards the
+    # 5h-block helper, not the upstream insert).
+    snapshot_count=$(sql "$home" "SELECT COUNT(*) FROM weekly_usage_snapshots;")
+    assert_eq "$snapshot_count" "1" "snapshot insert still happened"
+
+    finish_scenario I_no_5h_anchor_skips
+}
+
+# ─── Scenario J: cache.db unavailable → helper still populates ──────
+# get_entries catches (sqlite3.DatabaseError, OSError) from open_cache_db
+# and falls back to direct JSONL parse. Replacing cache.db with a directory
+# forces the open to fail on every record-usage call. The 5h-block helper
+# must still create its row (with totals=0, since no JSONL is seeded).
+{
+    begin_scenario J_cache_db_unavailable
+
+    # Pre-create the cctally data dir, then create cache.db AS a directory
+    # so sqlite3.connect() can never open it as a database file.
+    mkdir -p "$home/.local/share/cctally/cache.db"
+
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    row_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$row_count" "1" "block row populated despite cache.db unavailable"
+
+    cost_usd=$(sql "$home" "SELECT total_cost_usd FROM five_hour_blocks LIMIT 1;")
+    assert_eq "$cost_usd" "0.0" "totals are zero on JSONL-fallback empty result"
+
+    final_pct=$(sql "$home" "SELECT final_five_hour_percent FROM five_hour_blocks LIMIT 1;")
+    assert_eq "$final_pct" "10.0" "block fields populated from snapshot, not cache"
+
+    finish_scenario J_cache_db_unavailable
+}
+
+# ─── Scenario K1: per-(block, model|project) schema migration ─────────
+{
+    begin_scenario K1_breakdowns_schema_exists
+
+    # Trigger open_db() with no data.
+    run_cctally "$home" weekly
+
+    # All three new tables must exist.
+    models_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('five_hour_block_models');")
+    projects_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('five_hour_block_projects');")
+    migrations_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('schema_migrations');")
+    assert_eq "$models_cols"     "10" "five_hour_block_models column count"
+    assert_eq "$projects_cols"   "10" "five_hour_block_projects column count"
+    assert_eq "$migrations_cols" "2"  "schema_migrations column count"
+
+    # Spot-check a few critical columns.
+    has_model=$(sql "$home" "SELECT name FROM pragma_table_info('five_hour_block_models') WHERE name='model';")
+    has_proj=$(sql "$home"  "SELECT name FROM pragma_table_info('five_hour_block_projects') WHERE name='project_path';")
+    has_entry_count_m=$(sql "$home" "SELECT name FROM pragma_table_info('five_hour_block_models') WHERE name='entry_count';")
+    has_entry_count_p=$(sql "$home" "SELECT name FROM pragma_table_info('five_hour_block_projects') WHERE name='entry_count';")
+    has_migrations_name=$(sql "$home" "SELECT name FROM pragma_table_info('schema_migrations') WHERE name='name';")
+    assert_eq "$has_model"           "model"        "five_hour_block_models.model column"
+    assert_eq "$has_proj"            "project_path" "five_hour_block_projects.project_path column"
+    assert_eq "$has_entry_count_m"   "entry_count"  "five_hour_block_models.entry_count column"
+    assert_eq "$has_entry_count_p"   "entry_count"  "five_hour_block_projects.entry_count column"
+    assert_eq "$has_migrations_name" "name"         "schema_migrations.name column"
+
+    # UNIQUE constraints surface as auto-generated indexes (sqlite_autoindex_<table>_N).
+    models_unique=$(sql "$home" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='five_hour_block_models' AND name LIKE 'sqlite_autoindex_%';")
+    projects_unique=$(sql "$home" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='five_hour_block_projects' AND name LIKE 'sqlite_autoindex_%';")
+    [ "$models_unique" -ge 1 ]   || _err="${_err:+$_err; }five_hour_block_models missing UNIQUE index (got $models_unique)"
+    [ "$projects_unique" -ge 1 ] || _err="${_err:+$_err; }five_hour_block_projects missing UNIQUE index (got $projects_unique)"
+
+    # Named indexes.
+    has_models_block_idx=$(sql "$home" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_five_hour_block_models_block';")
+    has_models_window_idx=$(sql "$home" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_five_hour_block_models_window';")
+    has_projects_block_idx=$(sql "$home" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_five_hour_block_projects_block';")
+    has_projects_window_idx=$(sql "$home" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_five_hour_block_projects_window';")
+    assert_eq "$has_models_block_idx"    "1" "idx_five_hour_block_models_block exists"
+    assert_eq "$has_models_window_idx"   "1" "idx_five_hour_block_models_window exists"
+    assert_eq "$has_projects_block_idx"  "1" "idx_five_hour_block_projects_block exists"
+    assert_eq "$has_projects_window_idx" "1" "idx_five_hour_block_projects_window exists"
+
+    finish_scenario K1_breakdowns_schema_exists
+}
+
+# ─── Scenario K: multi-model breakdown ────────────────────────────────
+# Two sonnet entries + one opus entry inside one 5h block. Assert
+# five_hour_block_models has 2 rows; entry_count == (2, 1); reconcile
+# SUM(child.cost) == parent.total within 1e-9.
+{
+    begin_scenario K_multi_model_breakdown
+
+    # Bootstrap: run any cctally command to materialize cache.db.
+    run_cctally "$home" cache-sync
+
+    # Seed 3 entries inside the [BASE, BASE+5h] window.
+    # 2025-04-30T13:00:00Z = epoch 1746018000 (BASE + 1h).
+    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+        "claude-sonnet-4-6" 1000 100 0 0 \
+        "/tmp/seeded/k/sonnet1.jsonl" "/repo/k"
+    seed_session_entry "$home" "2025-04-30T13:30:00+00:00" \
+        "claude-sonnet-4-6" 2000 200 0 0 \
+        "/tmp/seeded/k/sonnet2.jsonl" "/repo/k"
+    seed_session_entry "$home" "2025-04-30T14:00:00+00:00" \
+        "claude-opus-4-7" 500 50 0 0 \
+        "/tmp/seeded/k/opus1.jsonl" "/repo/k"
+
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    # Two model rows, both for the same block_id.
+    model_rows=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_models;")
+    assert_eq "$model_rows" "2" "five_hour_block_models row count"
+
+    sonnet_count=$(sql "$home" "SELECT entry_count FROM five_hour_block_models WHERE model='claude-sonnet-4-6';")
+    opus_count=$(sql "$home" "SELECT entry_count FROM five_hour_block_models WHERE model='claude-opus-4-7';")
+    assert_eq "$sonnet_count" "2" "sonnet entry_count"
+    assert_eq "$opus_count"   "1" "opus entry_count"
+
+    # Reconcile: SUM(child.cost) == parent.total ± 1e-9.
+    diff=$(sql "$home" "SELECT ABS((SELECT SUM(cost_usd) FROM five_hour_block_models) - (SELECT total_cost_usd FROM five_hour_blocks)) < 1e-9;")
+    assert_eq "$diff" "1" "models cost reconciles to parent total within 1e-9"
+
+    # Reconcile tokens (exact equality on integer arithmetic).
+    in_tok_diff=$(sql "$home" "SELECT (SELECT SUM(input_tokens) FROM five_hour_block_models) - (SELECT total_input_tokens FROM five_hour_blocks);")
+    assert_eq "$in_tok_diff" "0" "models input_tokens reconciles exactly"
+
+    finish_scenario K_multi_model_breakdown
+}
+
+# ─── Scenario L: multi-project breakdown ──────────────────────────────
+{
+    begin_scenario L_multi_project_breakdown
+
+    run_cctally "$home" cache-sync
+
+    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+        "claude-sonnet-4-6" 1000 100 0 0 \
+        "/tmp/seeded/l/a1.jsonl" "/repo/A"
+    seed_session_entry "$home" "2025-04-30T13:15:00+00:00" \
+        "claude-sonnet-4-6" 1000 100 0 0 \
+        "/tmp/seeded/l/a2.jsonl" "/repo/A"
+    seed_session_entry "$home" "2025-04-30T13:30:00+00:00" \
+        "claude-sonnet-4-6" 1000 100 0 0 \
+        "/tmp/seeded/l/b1.jsonl" "/repo/B"
+    seed_session_entry "$home" "2025-04-30T13:45:00+00:00" \
+        "claude-sonnet-4-6" 1000 100 0 0 \
+        "/tmp/seeded/l/b2.jsonl" "/repo/B"
+
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    project_rows=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects;")
+    assert_eq "$project_rows" "2" "five_hour_block_projects row count"
+
+    a_count=$(sql "$home" "SELECT entry_count FROM five_hour_block_projects WHERE project_path='/repo/A';")
+    b_count=$(sql "$home" "SELECT entry_count FROM five_hour_block_projects WHERE project_path='/repo/B';")
+    assert_eq "$a_count" "2" "/repo/A entry_count"
+    assert_eq "$b_count" "2" "/repo/B entry_count"
+
+    diff=$(sql "$home" "SELECT ABS((SELECT SUM(cost_usd) FROM five_hour_block_projects) - (SELECT total_cost_usd FROM five_hour_blocks)) < 1e-9;")
+    assert_eq "$diff" "1" "projects cost reconciles to parent total within 1e-9"
+
+    finish_scenario L_multi_project_breakdown
+}
+
+# ─── Scenario M: NULL project_path → '(unknown)' sentinel ─────────────
+# Tests that NULL session_files.project_path collapses into the sentinel
+# bucket (so SUM(child.cost) == parent.total invariant holds).
+{
+    begin_scenario M_unknown_project_sentinel
+
+    run_cctally "$home" cache-sync
+
+    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+        "claude-sonnet-4-6" 1000 100 0 0 \
+        "/tmp/seeded/m/orphan1.jsonl" "NULL"
+    seed_session_entry "$home" "2025-04-30T13:30:00+00:00" \
+        "claude-sonnet-4-6" 1000 100 0 0 \
+        "/tmp/seeded/m/orphan2.jsonl" "NULL"
+
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    project_rows=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects;")
+    assert_eq "$project_rows" "1" "five_hour_block_projects row count"
+
+    sentinel_count=$(sql "$home" "SELECT entry_count FROM five_hour_block_projects WHERE project_path='(unknown)';")
+    assert_eq "$sentinel_count" "2" "'(unknown)' sentinel entry_count"
+
+    diff=$(sql "$home" "SELECT ABS((SELECT SUM(cost_usd) FROM five_hour_block_projects) - (SELECT total_cost_usd FROM five_hour_blocks)) < 1e-9;")
+    assert_eq "$diff" "1" "sentinel cost reconciles to parent total"
+
+    finish_scenario M_unknown_project_sentinel
+}
+
+# ─── Scenario N: replace-all drains '(unknown)' bucket ────────────────
+# Tick 1 with NULL project_path → '(unknown)' bucket. Tick 2: backfill
+# session_files.project_path to '/repo/X'; rerun record-usage. Assert
+# the '(unknown)' row is gone and replaced by '/repo/X'.
+{
+    begin_scenario N_replace_all_drains_unknown
+
+    run_cctally "$home" cache-sync
+
+    # Tick 1: seed with NULL project_path.
+    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+        "claude-sonnet-4-6" 1000 100 0 0 \
+        "/tmp/seeded/n/file.jsonl" "NULL"
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    tick1_rows=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects;")
+    tick1_path=$(sql "$home" "SELECT project_path FROM five_hour_block_projects LIMIT 1;")
+    assert_eq "$tick1_rows" "1"          "tick1: one project row"
+    assert_eq "$tick1_path" "(unknown)"  "tick1: '(unknown)' sentinel"
+
+    # Tick 2: backfill the project_path on session_files (simulating
+    # sync_cache catching up).
+    sqlite3 "$home/.local/share/cctally/cache.db" \
+        "UPDATE session_files SET project_path='/repo/X' WHERE path='/tmp/seeded/n/file.jsonl';"
+
+    record_usage "$home" \
+        --percent 26 --resets-at "$RESETS_7D" \
+        --five-hour-percent 11 --five-hour-resets-at "$BASE"
+
+    tick2_rows=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects;")
+    tick2_path=$(sql "$home" "SELECT project_path FROM five_hour_block_projects LIMIT 1;")
+    tick2_unknown=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects WHERE project_path='(unknown)';")
+    assert_eq "$tick2_rows"    "1"        "tick2: still one project row (replace-all)"
+    assert_eq "$tick2_path"    "/repo/X"  "tick2: '/repo/X' replaces '(unknown)'"
+    assert_eq "$tick2_unknown" "0"        "tick2: zero '(unknown)' rows after drain"
+
+    finish_scenario N_replace_all_drains_unknown
+}
+
+# ─── Scenario P: fresh-install backfill populates parent + both children ──
+# Bootstrap the new schema, manually seed weekly_usage_snapshots +
+# session_entries for 2 historical 5h windows, then DELETE everything
+# and re-run open_db() to fire the parent backfill (which now also writes
+# children). Verify the schema_migrations rows are inserted.
+{
+    begin_scenario P_fresh_install_backfill
+
+    # Bootstrap: run any cctally command to materialize stats.db + cache.db.
+    run_cctally "$home" weekly
+
+    # Seed 2 5h windows worth of weekly_usage_snapshots + session_entries.
+    # Each window's `five_hour_window_key` MUST match its
+    # `five_hour_resets_at` after canonical 10-min flooring (epoch math).
+    #   Window 1: resets_at='2025-04-30T12:00Z' (= BASE); block_start='07:00Z'
+    #   Window 2: resets_at='2025-04-30T17:00Z' (= BASE+5h); block_start='12:00Z'
+    # NOTE: not using `local` — this scenario block is at top-level scope,
+    # not inside a function. Plain assignment works.
+    W2_KEY=$((BASE + 5 * 3600))   # 17:00Z = window 2's resets_at + canonical key
+
+    # Each snapshot insert: required-NOT-NULL columns the parent backfill reads.
+    # captured_at_utc must fall WITHIN the window (between block_start and
+    # resets_at) so observation timestamps make sense.
+    sqlite3 "$home/.local/share/cctally/stats.db" <<EOF
+INSERT INTO weekly_usage_snapshots
+    (week_start_date, week_end_date, captured_at_utc, weekly_percent,
+     payload_json,
+     five_hour_resets_at, five_hour_window_key, five_hour_percent)
+VALUES
+    -- Window 1: 07:00-12:00Z observations.
+    ('2025-04-28', '2025-05-05', '2025-04-30T08:00:00+00:00', 5.0,  '{}', '2025-04-30T12:00:00+00:00', $BASE,   10.0),
+    ('2025-04-28', '2025-05-05', '2025-04-30T11:00:00+00:00', 8.0,  '{}', '2025-04-30T12:00:00+00:00', $BASE,   20.0),
+    -- Window 2: 12:00-17:00Z observations.
+    ('2025-04-28', '2025-05-05', '2025-04-30T13:00:00+00:00', 10.0, '{}', '2025-04-30T17:00:00+00:00', $W2_KEY,  5.0),
+    ('2025-04-28', '2025-05-05', '2025-04-30T15:00:00+00:00', 12.0, '{}', '2025-04-30T17:00:00+00:00', $W2_KEY, 15.0);
+EOF
+
+    # Seed session_entries within each window's [block_start, last_observed].
+    # Window 1 spans 07:00-11:00Z (last_observed); window 2 spans 12:00-15:00Z.
+    seed_session_entry "$home" "2025-04-30T08:00:00+00:00" \
+        "claude-sonnet-4-6" 1000 100 0 0 \
+        "/tmp/seeded/p/w1a.jsonl" "/repo/P"
+    seed_session_entry "$home" "2025-04-30T10:00:00+00:00" \
+        "claude-opus-4-7" 500 50 0 0 \
+        "/tmp/seeded/p/w1b.jsonl" "/repo/P"
+    seed_session_entry "$home" "2025-04-30T13:30:00+00:00" \
+        "claude-sonnet-4-6" 800 80 0 0 \
+        "/tmp/seeded/p/w2a.jsonl" "/repo/P"
+
+    # Roll back to pre-migration state: delete parent + children + markers.
+    sqlite3 "$home/.local/share/cctally/stats.db" <<EOF
+DELETE FROM five_hour_blocks;
+DELETE FROM five_hour_block_models;
+DELETE FROM five_hour_block_projects;
+DELETE FROM five_hour_milestones;
+DELETE FROM schema_migrations;
+EOF
+
+    # Trigger open_db() — should re-fire the parent backfill, which now writes
+    # children + schema_migrations rows.
+    run_cctally "$home" weekly
+
+    # Parent populated: 2 windows.
+    parent_rows=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$parent_rows" "2" "parent: 2 backfilled blocks"
+
+    # Children: 2 windows × 2 models (sonnet+opus for w1, sonnet for w2) = 3 rows.
+    models_rows=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_models;")
+    assert_eq "$models_rows" "3" "models: 3 backfilled rows (2 from w1, 1 from w2)"
+
+    # Children: 1 project across both windows = 2 rows.
+    projects_rows=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects;")
+    assert_eq "$projects_rows" "2" "projects: 2 backfilled rows (one per window)"
+
+    # schema_migrations markers present.
+    has_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_models_backfill_v1';")
+    has_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_projects_backfill_v1';")
+    assert_eq "$has_models_mig"   "1" "schema_migrations: models marker present"
+    assert_eq "$has_projects_mig" "1" "schema_migrations: projects marker present"
+
+    # Reconcile per window.
+    diff=$(sql "$home" "SELECT MAX(ABS(IFNULL(child.s, 0) - parent.total_cost_usd)) < 1e-9 FROM five_hour_blocks parent LEFT JOIN (SELECT five_hour_window_key, SUM(cost_usd) AS s FROM five_hour_block_models GROUP BY five_hour_window_key) child ON parent.five_hour_window_key = child.five_hour_window_key;")
+    assert_eq "$diff" "1" "fresh-install backfill: models reconcile per window within 1e-9"
+
+    finish_scenario P_fresh_install_backfill
+}
+
+# ─── Scenario Q: upgrade-user backfill (parent populated, children empty) ──
+{
+    begin_scenario Q_upgrade_user_backfill
+
+    run_cctally "$home" weekly
+
+    # Drive record-usage so parent + children populate naturally.
+    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+        "claude-sonnet-4-6" 1000 100 0 0 \
+        "/tmp/seeded/q/file.jsonl" "/repo/Q"
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    # Sanity: parent + children populated, markers set.
+    parent_rows=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$parent_rows" "1" "pre: 1 parent row"
+
+    # Roll back to upgrade-user state: drop children + markers; keep parent.
+    sqlite3 "$home/.local/share/cctally/stats.db" <<EOF
+DELETE FROM five_hour_block_models;
+DELETE FROM five_hour_block_projects;
+DELETE FROM schema_migrations;
+EOF
+
+    pre_models=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_models;")
+    pre_projects=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects;")
+    assert_eq "$pre_models"   "0" "pre: zero models rows"
+    assert_eq "$pre_projects" "0" "pre: zero projects rows"
+
+    # Trigger open_db() again — both upgrade gates should fire.
+    run_cctally "$home" weekly
+
+    post_models=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_models;")
+    post_projects=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects;")
+    assert_eq "$post_models"   "1" "post: 1 model row"
+    assert_eq "$post_projects" "1" "post: 1 project row"
+
+    has_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_models_backfill_v1';")
+    has_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_projects_backfill_v1';")
+    assert_eq "$has_models_mig"   "1" "post: models migration marker"
+    assert_eq "$has_projects_mig" "1" "post: projects migration marker"
+
+    # Reconcile per window: SUM(child.cost_usd) == parent.total_cost_usd within 1e-9.
+    diff_m=$(sql "$home" "SELECT MAX(ABS(IFNULL(child.s, 0) - parent.total_cost_usd)) < 1e-9 FROM five_hour_blocks parent LEFT JOIN (SELECT five_hour_window_key, SUM(cost_usd) AS s FROM five_hour_block_models GROUP BY five_hour_window_key) child ON parent.five_hour_window_key = child.five_hour_window_key;")
+    assert_eq "$diff_m" "1" "upgrade backfill: models reconcile per window within 1e-9"
+    diff_p=$(sql "$home" "SELECT MAX(ABS(IFNULL(child.s, 0) - parent.total_cost_usd)) < 1e-9 FROM five_hour_blocks parent LEFT JOIN (SELECT five_hour_window_key, SUM(cost_usd) AS s FROM five_hour_block_projects GROUP BY five_hour_window_key) child ON parent.five_hour_window_key = child.five_hour_window_key;")
+    assert_eq "$diff_p" "1" "upgrade backfill: projects reconcile per window within 1e-9"
+
+    finish_scenario Q_upgrade_user_backfill
+}
+
+# ─── Scenario Q2: empty-row backfill still closes the gate ────────────
+# Regression for [P1] finding 2 from the spec review: a real user
+# whose parent blocks have empty session_entries (API/web-only) would
+# otherwise re-fire the gate every open_db().
+{
+    begin_scenario Q2_upgrade_gate_does_not_re_fire_on_empty
+
+    # Drive record-usage with NO seeded session_entries → parent populates
+    # but children write zero rows.
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    pre_parent=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    pre_models=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_models;")
+    pre_projects=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects;")
+    assert_eq "$pre_parent"   "1" "pre: 1 parent row"
+    assert_eq "$pre_models"   "0" "pre: zero models rows (empty session_entries)"
+    assert_eq "$pre_projects" "0" "pre: zero projects rows"
+
+    # Roll back markers + drop children (children already empty).
+    sqlite3 "$home/.local/share/cctally/stats.db" \
+        "DELETE FROM schema_migrations;"
+
+    # Trigger open_db() again — gate should fire and re-mark migrations done
+    # despite writing zero rows.
+    run_cctally "$home" weekly
+
+    has_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_models_backfill_v1';")
+    has_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_projects_backfill_v1';")
+    assert_eq "$has_models_mig"   "1" "post: models marker set despite zero rows"
+    assert_eq "$has_projects_mig" "1" "post: projects marker set despite zero rows"
+
+    # Now run open_db() AGAIN — gate must NOT re-fire (marker present).
+    # We can't easily prove "no execution," but we can prove the marker count
+    # stays at exactly 1 row each (no duplicate inserts; INSERT OR IGNORE
+    # would silently no-op anyway — main assertion is no crash + still 1 each).
+    run_cctally "$home" weekly
+    final_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_models_backfill_v1';")
+    final_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_projects_backfill_v1';")
+    assert_eq "$final_models_mig"   "1" "second open_db: models marker still 1 row"
+    assert_eq "$final_projects_mig" "1" "second open_db: projects marker still 1 row"
+
+    finish_scenario Q2_upgrade_gate_does_not_re_fire_on_empty
+}
+
+# ─── Scenario O: full reconcile invariant across both children ────────
+# Multi-model + multi-project seed (3 models × 2 projects = 6 entry classes).
+# Assert all four token-column reconciles (exact integer equality) AND the
+# cost reconcile (within 1e-9) for BOTH children.
+{
+    begin_scenario O_reconcile_invariant
+
+    run_cctally "$home" cache-sync
+
+    # 6 entries: 3 models × 2 projects.
+    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+        "claude-sonnet-4-6" 1000 100 200 50 \
+        "/tmp/seeded/o/s_a.jsonl" "/repo/A"
+    seed_session_entry "$home" "2025-04-30T13:10:00+00:00" \
+        "claude-opus-4-7" 800 80 0 0 \
+        "/tmp/seeded/o/o_a.jsonl" "/repo/A"
+    seed_session_entry "$home" "2025-04-30T13:20:00+00:00" \
+        "claude-haiku-4-5-20251001" 500 50 0 0 \
+        "/tmp/seeded/o/h_a.jsonl" "/repo/A"
+    seed_session_entry "$home" "2025-04-30T13:30:00+00:00" \
+        "claude-sonnet-4-6" 1500 150 300 75 \
+        "/tmp/seeded/o/s_b.jsonl" "/repo/B"
+    seed_session_entry "$home" "2025-04-30T13:40:00+00:00" \
+        "claude-opus-4-7" 600 60 0 0 \
+        "/tmp/seeded/o/o_b.jsonl" "/repo/B"
+    seed_session_entry "$home" "2025-04-30T13:50:00+00:00" \
+        "claude-haiku-4-5-20251001" 400 40 0 0 \
+        "/tmp/seeded/o/h_b.jsonl" "/repo/B"
+
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    # Models child: 3 rows; Projects child: 2 rows.
+    models_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_models;")
+    projects_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects;")
+    assert_eq "$models_count"   "3" "3 model rows"
+    assert_eq "$projects_count" "2" "2 project rows"
+
+    # Token reconcile (4 columns × 2 children = 8 invariants). Exact equality.
+    for col in input_tokens output_tokens cache_create_tokens cache_read_tokens; do
+        m_diff=$(sql "$home" "SELECT (SELECT SUM($col) FROM five_hour_block_models) - (SELECT total_$col FROM five_hour_blocks);")
+        p_diff=$(sql "$home" "SELECT (SELECT SUM($col) FROM five_hour_block_projects) - (SELECT total_$col FROM five_hour_blocks);")
+        assert_eq "$m_diff" "0" "models $col reconciles exactly"
+        assert_eq "$p_diff" "0" "projects $col reconciles exactly"
+    done
+
+    # Cost reconcile (1 column × 2 children = 2 invariants). Within 1e-9.
+    m_cost_ok=$(sql "$home" "SELECT ABS((SELECT SUM(cost_usd) FROM five_hour_block_models) - (SELECT total_cost_usd FROM five_hour_blocks)) < 1e-9;")
+    p_cost_ok=$(sql "$home" "SELECT ABS((SELECT SUM(cost_usd) FROM five_hour_block_projects) - (SELECT total_cost_usd FROM five_hour_blocks)) < 1e-9;")
+    assert_eq "$m_cost_ok" "1" "models cost reconciles within 1e-9"
+    assert_eq "$p_cost_ok" "1" "projects cost reconciles within 1e-9"
+
+    # entry_count cross-children consistency: SUM same in both tables.
+    m_count=$(sql "$home" "SELECT SUM(entry_count) FROM five_hour_block_models;")
+    p_count=$(sql "$home" "SELECT SUM(entry_count) FROM five_hour_block_projects;")
+    assert_eq "$m_count" "$p_count" "entry_count cross-children consistency"
+    assert_eq "$m_count" "6"        "entry_count totals 6"
+
+    finish_scenario O_reconcile_invariant
+}
+
+# ─── Scenario R: cache.db unavailable → zero child rows + reconcile ────
+# Symmetric with existing scenario J. With no JSONL files in HOME and
+# cache.db replaced by a directory, both the cache-backed and JSONL
+# fallback paths yield zero entries. Children should have ZERO rows
+# (not "rows with cost_usd = 0" — there's no key to write under).
+# Reconcile holds via COALESCE(SUM(child.cost_usd), 0) == parent.total == 0.
+{
+    begin_scenario R_cache_db_unavailable_breakdowns
+
+    # Pre-create cache.db AS a directory so sqlite3.connect() can never
+    # open it as a database file.
+    mkdir -p "$home/.local/share/cctally/cache.db"
+
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    parent_rows=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    models_rows=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_models;")
+    projects_rows=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects;")
+    assert_eq "$parent_rows"   "1" "parent row populated despite cache.db unavailable"
+    assert_eq "$models_rows"   "0" "models: zero rows (no entries → no keys)"
+    assert_eq "$projects_rows" "0" "projects: zero rows (no entries → no keys)"
+
+    # Reconcile via COALESCE(SUM, 0).
+    parent_total=$(sql "$home" "SELECT total_cost_usd FROM five_hour_blocks LIMIT 1;")
+    m_total=$(sql "$home"      "SELECT COALESCE(SUM(cost_usd), 0) FROM five_hour_block_models;")
+    p_total=$(sql "$home"      "SELECT COALESCE(SUM(cost_usd), 0) FROM five_hour_block_projects;")
+    assert_eq "$parent_total" "0.0" "parent total_cost_usd is zero"
+    assert_eq "$m_total"      "0"   "models COALESCE(SUM, 0) == 0"
+    assert_eq "$p_total"      "0"   "projects COALESCE(SUM, 0) == 0"
+
+    finish_scenario R_cache_db_unavailable_breakdowns
+}
+
+# ─── Scenario S: upgrade backfill ingests JSONL when cache is empty ───
+# Regression for the P2 finding: skip_sync=True in the upgrade helpers
+# made an empty/stale cache.db permanent — the gate would close on zero
+# children even though JSONL existed on disk. With skip_sync=False the
+# helpers re-ingest first.
+{
+    begin_scenario S_upgrade_backfill_ingests_jsonl_when_cache_empty
+
+    # Bootstrap cache.db schema so seed_session_entry can write into it.
+    run_cctally "$home" weekly
+
+    # Live writes populate parent + children + markers via seed-into-cache.
+    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+        "claude-sonnet-4-6" 1000 100 0 0 \
+        "/tmp/seeded/s/dummy.jsonl" "/repo/S"
+    record_usage "$home" \
+        --percent 25 --resets-at "$RESETS_7D" \
+        --five-hour-percent 10 --five-hour-resets-at "$BASE"
+
+    pre_parent=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    pre_models=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_models;")
+    pre_projects=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects;")
+    assert_eq "$pre_parent"   "1" "pre: 1 parent row"
+    assert_eq "$pre_models"   "1" "pre: 1 models row from live writes"
+    assert_eq "$pre_projects" "1" "pre: 1 projects row from live writes"
+
+    # Simulate "upgrade state with empty cache": wipe cache.db rows, wipe
+    # child tables + migration markers; keep parent rows.
+    sqlite3 "$home/.local/share/cctally/cache.db" <<EOF
+DELETE FROM session_entries;
+DELETE FROM session_files;
+EOF
+    sqlite3 "$home/.local/share/cctally/stats.db" <<EOF
+DELETE FROM five_hour_block_models;
+DELETE FROM five_hour_block_projects;
+DELETE FROM schema_migrations;
+EOF
+
+    empty_cache_entries=$(sqlite3 "$home/.local/share/cctally/cache.db" \
+        "SELECT COUNT(*) FROM session_entries;")
+    assert_eq "$empty_cache_entries" "0" "pre: cache.db wiped"
+
+    # Write a real JSONL under ~/.claude/projects/<slug>/ so sync_cache
+    # discovers it. cwd field drives session_files.project_path; usage
+    # values match the original seed so the re-ingested cost equals the
+    # parent's stored total_cost_usd.
+    proj_dir="$home/.claude/projects/-repo-S"
+    mkdir -p "$proj_dir"
+    cat > "$proj_dir/sess.jsonl" <<'EOF'
+{"type":"assistant","timestamp":"2025-04-30T13:00:00.000Z","sessionId":"s-test-1","cwd":"/repo/S","message":{"id":"msg_s_1","model":"claude-sonnet-4-6","usage":{"input_tokens":1000,"output_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+EOF
+
+    # Trigger open_db() → upgrade gates fire → with skip_sync=False the
+    # helpers run sync_cache(), which ingests the JSONL we just wrote.
+    run_cctally "$home" weekly
+
+    post_models=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_models;")
+    post_projects=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_projects;")
+    assert_eq "$post_models"   "1" "post: models re-populated from JSONL"
+    assert_eq "$post_projects" "1" "post: projects re-populated from JSONL"
+
+    has_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_models_backfill_v1';")
+    has_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_projects_backfill_v1';")
+    assert_eq "$has_models_mig"   "1" "post: models marker set"
+    assert_eq "$has_projects_mig" "1" "post: projects marker set"
+
+    # Project bucket should resolve to the JSONL's cwd, NOT '(unknown)'.
+    proj_key=$(sql "$home" "SELECT project_path FROM five_hour_block_projects LIMIT 1;")
+    assert_eq "$proj_key" "/repo/S" "S: project_path bucket from JSONL cwd"
+
+    diff_m=$(sql "$home" "SELECT MAX(ABS(IFNULL(child.s, 0) - parent.total_cost_usd)) < 1e-9 FROM five_hour_blocks parent LEFT JOIN (SELECT five_hour_window_key, SUM(cost_usd) AS s FROM five_hour_block_models GROUP BY five_hour_window_key) child ON parent.five_hour_window_key = child.five_hour_window_key;")
+    diff_p=$(sql "$home" "SELECT MAX(ABS(IFNULL(child.s, 0) - parent.total_cost_usd)) < 1e-9 FROM five_hour_blocks parent LEFT JOIN (SELECT five_hour_window_key, SUM(cost_usd) AS s FROM five_hour_block_projects GROUP BY five_hour_window_key) child ON parent.five_hour_window_key = child.five_hour_window_key;")
+    assert_eq "$diff_m" "1" "S: models reconcile after JSONL re-ingest within 1e-9"
+    assert_eq "$diff_p" "1" "S: projects reconcile after JSONL re-ingest within 1e-9"
+
+    finish_scenario S_upgrade_backfill_ingests_jsonl_when_cache_empty
+}
+
+# ─── Render harness scenarios ─────────────────────────────────────────
+# The scenarios above exercise the schema/state-machine paths via direct
+# SQL inspection. The scenarios below exercise the human-readable
+# rendering paths of `five-hour-blocks` (list) and `five-hour-breakdown`
+# (per-block detail). JSON branches are covered by Task 2/3 pytest tests.
+
+# ─── Scenario fhb-list-rendering: list with normal + crossed-reset ─────
+fhb_list_rendering () {
+    local name="fhb-list-rendering"
+    begin_scenario "$name"
+
+    # Trigger DB creation. `weekly` opens stats.db and runs schema migrations
+    # (cache-sync only touches cache.db).
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    # Insert two blocks: one normal, one crossed-reset.
+    sql "$home" "
+INSERT INTO five_hour_blocks (
+    five_hour_window_key, five_hour_resets_at, block_start_at,
+    first_observed_at_utc, last_observed_at_utc,
+    final_five_hour_percent, total_cost_usd,
+    seven_day_pct_at_block_start, seven_day_pct_at_block_end,
+    crossed_seven_day_reset, is_closed,
+    created_at_utc, last_updated_at_utc
+) VALUES
+  (1777545000, '2026-04-30T10:30:00+00:00', '2026-04-30T05:30:00+00:00',
+   '2026-04-30T05:30:00+00:00', '2026-04-30T10:30:00+00:00',
+   50.0, 12.34, 60.0, 65.0, 0, 1,
+   '2026-04-30T05:30:00+00:00', '2026-04-30T10:30:00+00:00'),
+  (1777563000, '2026-04-30T15:30:00+00:00', '2026-04-30T10:30:00+00:00',
+   '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00',
+   80.0, 50.00, 5.0, 30.0, 1, 1,
+   '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00');
+"
+    local out
+    out=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-blocks 2>&1)
+
+    # Assert key strings present.
+    case "$out" in
+        *"2026-04-30 10:30 UTC"*) ;;
+        *) _err="${_err:+$_err; }list missing block-start row" ;;
+    esac
+    case "$out" in
+        *"⚡"*) ;;
+        *) _err="${_err:+$_err; }list missing crossed-reset glyph" ;;
+    esac
+    case "$out" in
+        *"+5.0"*) ;;
+        *) _err="${_err:+$_err; }list missing positive delta" ;;
+    esac
+    case "$out" in
+        *"2 blocks"*) ;;
+        *) _err="${_err:+$_err; }list missing footer count" ;;
+    esac
+
+    finish_scenario "$name"
+}
+fhb_list_rendering
+
+# ─── Scenario fhb-breakdown-default-current: default selector picks active ──
+fhb_breakdown_default_current () {
+    local name="fhb-breakdown-default-current"
+    begin_scenario "$name"
+
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    sql "$home" "
+INSERT INTO five_hour_blocks (
+    five_hour_window_key, five_hour_resets_at, block_start_at,
+    first_observed_at_utc, last_observed_at_utc,
+    final_five_hour_percent, total_cost_usd,
+    seven_day_pct_at_block_start, seven_day_pct_at_block_end,
+    crossed_seven_day_reset, is_closed,
+    created_at_utc, last_updated_at_utc
+) VALUES (1777563000, '2026-04-30T15:30:00+00:00', '2026-04-30T10:30:00+00:00',
+          '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00',
+          42.0, 35.40, 60.0, 64.2, 0, 1,
+          '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00');
+
+INSERT INTO five_hour_milestones (
+    block_id, five_hour_window_key, percent_threshold,
+    captured_at_utc, usage_snapshot_id,
+    block_cost_usd, marginal_cost_usd, seven_day_pct_at_crossing
+) VALUES
+  (1, 1777563000, 1, '2026-04-30T10:42:00+00:00', 0,  5.67, NULL, 60.5),
+  (1, 1777563000, 2, '2026-04-30T11:01:00+00:00', 0, 12.30, 6.63, 61.4);
+"
+
+    local out
+    out=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-breakdown 2>&1)
+
+    case "$out" in
+        *"Block: 2026-04-30 10:30 UTC"*) ;;
+        *) _err="${_err:+$_err; }default missing header" ;;
+    esac
+    case "$out" in
+        *"5h%: 42.0%"*) ;;
+        *) _err="${_err:+$_err; }default missing 5h pct" ;;
+    esac
+    case "$out" in
+        *"Δ +4.2pp"*) ;;
+        *) _err="${_err:+$_err; }default missing delta" ;;
+    esac
+
+    finish_scenario "$name"
+}
+fhb_breakdown_default_current
+
+# ─── Scenario fhb-breakdown-active-elapsed-pinned: CCTALLY_AS_OF anchors elapsed
+# Regression for cctally:14732-14740 leaking real wall-clock into the
+# `(active, Xh YYm elapsed)` header. With the block_start_at pinned at
+# 10:30Z and CCTALLY_AS_OF set to 12:45Z, the rendered header MUST show
+# `2h 15m elapsed` regardless of when the harness fires.
+fhb_breakdown_active_elapsed_pinned () {
+    local name="fhb-breakdown-active-elapsed-pinned"
+    begin_scenario "$name"
+
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    # An open block: is_closed=0, with a matching weekly_usage_snapshots
+    # row whose five_hour_window_key equals the block's window so
+    # `_latest_seven_day_and_window` reports the block's key as the
+    # latest -> `is_active = True` in cmd_five_hour_breakdown.
+    sql "$home" "
+INSERT INTO weekly_usage_snapshots (
+    captured_at_utc, week_start_date, week_end_date,
+    week_start_at, week_end_at, weekly_percent, source, payload_json,
+    five_hour_percent, five_hour_resets_at, five_hour_window_key
+) VALUES (
+    '2026-04-30T12:45:00+00:00', '2026-04-27', '2026-05-04',
+    '2026-04-27T00:00:00+00:00', '2026-05-04T00:00:00+00:00',
+    42.0, 'fixture', '{}', 42.0,
+    '2026-04-30T15:30:00+00:00', 1777563000
+);
+
+INSERT INTO five_hour_blocks (
+    five_hour_window_key, five_hour_resets_at, block_start_at,
+    first_observed_at_utc, last_observed_at_utc,
+    final_five_hour_percent, total_cost_usd,
+    seven_day_pct_at_block_start, seven_day_pct_at_block_end,
+    crossed_seven_day_reset, is_closed,
+    created_at_utc, last_updated_at_utc
+) VALUES (1777563000, '2026-04-30T15:30:00+00:00', '2026-04-30T10:30:00+00:00',
+          '2026-04-30T10:30:00+00:00', '2026-04-30T12:45:00+00:00',
+          42.0, 35.40, 60.0, 64.2, 0, 0,
+          '2026-04-30T10:30:00+00:00', '2026-04-30T12:45:00+00:00');
+"
+
+    # Pin the as-of clock at 12:45Z. Block start = 10:30Z. Elapsed = 2h 15m.
+    local out
+    out=$(CCTALLY_AS_OF=2026-04-30T12:45:00Z HOME="$home" TZ=Etc/UTC \
+              "$BIN" five-hour-breakdown 2>&1)
+
+    case "$out" in
+        *"(active, 2h 15m elapsed)"*) ;;
+        *) _err="${_err:+$_err; }active-elapsed not pinned to as-of" ;;
+    esac
+
+    finish_scenario "$name"
+}
+fhb_breakdown_active_elapsed_pinned
+
+# ─── Scenario fhb-breakdown-by-start: explicit --block-start picks block ───
+fhb_breakdown_by_start () {
+    local name="fhb-breakdown-by-start"
+    begin_scenario "$name"
+
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    sql "$home" "
+INSERT INTO five_hour_blocks (
+    five_hour_window_key, five_hour_resets_at, block_start_at,
+    first_observed_at_utc, last_observed_at_utc,
+    final_five_hour_percent, total_cost_usd,
+    crossed_seven_day_reset, is_closed,
+    created_at_utc, last_updated_at_utc
+) VALUES
+  (1777545000, '2026-04-30T10:30:00+00:00', '2026-04-30T05:30:00+00:00',
+   '2026-04-30T05:30:00+00:00', '2026-04-30T10:30:00+00:00',
+   30.0, 8.00, 0, 1,
+   '2026-04-30T05:30:00+00:00', '2026-04-30T10:30:00+00:00'),
+  (1777563000, '2026-04-30T15:30:00+00:00', '2026-04-30T10:30:00+00:00',
+   '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00',
+   42.0, 35.40, 0, 1,
+   '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00');
+"
+    # Pick the EARLIER block (5:30Z) explicitly.
+    local out
+    out=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-breakdown \
+                 --block-start 2026-04-30T05:30 2>&1)
+
+    case "$out" in
+        *"2026-04-30 05:30 UTC"*) ;;
+        *) _err="${_err:+$_err; }by-start picked wrong block" ;;
+    esac
+
+    finish_scenario "$name"
+}
+fhb_breakdown_by_start
+
+# ─── Scenario fhb-breakdown-by-ago: --ago 1 picks previous block ──────
+fhb_breakdown_by_ago () {
+    local name="fhb-breakdown-by-ago"
+    begin_scenario "$name"
+
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    sql "$home" "
+INSERT INTO five_hour_blocks (
+    five_hour_window_key, five_hour_resets_at, block_start_at,
+    first_observed_at_utc, last_observed_at_utc,
+    final_five_hour_percent, total_cost_usd,
+    crossed_seven_day_reset, is_closed,
+    created_at_utc, last_updated_at_utc
+) VALUES
+  (1777545000, '2026-04-30T10:30:00+00:00', '2026-04-30T05:30:00+00:00',
+   '2026-04-30T05:30:00+00:00', '2026-04-30T10:30:00+00:00',
+   30.0, 8.00, 0, 1,
+   '2026-04-30T05:30:00+00:00', '2026-04-30T10:30:00+00:00'),
+  (1777563000, '2026-04-30T15:30:00+00:00', '2026-04-30T10:30:00+00:00',
+   '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00',
+   42.0, 35.40, 0, 1,
+   '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00');
+"
+    # --ago 1 picks the 5:30Z block.
+    local out
+    out=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-breakdown --ago 1 2>&1)
+
+    case "$out" in
+        *"2026-04-30 05:30 UTC"*) ;;
+        *) _err="${_err:+$_err; }--ago 1 picked wrong block" ;;
+    esac
+
+    finish_scenario "$name"
+}
+fhb_breakdown_by_ago
+
+# ─── Scenario fhb-breakdown-empty-block: 5h% < 1% emits "No milestones" ───
+fhb_breakdown_empty_block () {
+    local name="fhb-breakdown-empty-block"
+    begin_scenario "$name"
+
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    # Block with 0.3% — no milestones.
+    sql "$home" "
+INSERT INTO five_hour_blocks (
+    five_hour_window_key, five_hour_resets_at, block_start_at,
+    first_observed_at_utc, last_observed_at_utc,
+    final_five_hour_percent, total_cost_usd,
+    crossed_seven_day_reset, is_closed,
+    created_at_utc, last_updated_at_utc
+) VALUES (1777563000, '2026-04-30T15:30:00+00:00', '2026-04-30T10:30:00+00:00',
+          '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00',
+          0.3, 0.50, 0, 1,
+          '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00');
+"
+    local out
+    out=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-breakdown 2>&1)
+
+    case "$out" in
+        *"No milestones recorded"*) ;;
+        *) _err="${_err:+$_err; }empty block missing footer text" ;;
+    esac
+
+    finish_scenario "$name"
+}
+fhb_breakdown_empty_block
+
+# ─── Scenario fhb-breakdown-crossed-reset: ⚡ suffix + suppressed delta ─
+fhb_breakdown_crossed_reset () {
+    local name="fhb-breakdown-crossed-reset"
+    begin_scenario "$name"
+
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    sql "$home" "
+INSERT INTO five_hour_blocks (
+    five_hour_window_key, five_hour_resets_at, block_start_at,
+    first_observed_at_utc, last_observed_at_utc,
+    final_five_hour_percent, total_cost_usd,
+    seven_day_pct_at_block_start, seven_day_pct_at_block_end,
+    crossed_seven_day_reset, is_closed,
+    created_at_utc, last_updated_at_utc
+) VALUES (1777563000, '2026-04-30T15:30:00+00:00', '2026-04-30T10:30:00+00:00',
+          '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00',
+          50.0, 30.00, 95.0, 5.0, 1, 1,
+          '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00');
+
+INSERT INTO five_hour_milestones (
+    block_id, five_hour_window_key, percent_threshold,
+    captured_at_utc, usage_snapshot_id,
+    block_cost_usd, marginal_cost_usd, seven_day_pct_at_crossing
+) VALUES (1, 1777563000, 1, '2026-04-30T11:00:00+00:00', 0, 6.00, NULL, 95.5);
+"
+    local out
+    out=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-breakdown 2>&1)
+
+    case "$out" in
+        *"⚡ crossed weekly reset"*) ;;
+        *) _err="${_err:+$_err; }crossed-reset missing suffix" ;;
+    esac
+    # When crossed_seven_day_reset=1 the delta is suppressed: the renderer
+    # emits a bare em-dash in parens "(—)" instead of "(Δ +Xpp)".
+    case "$out" in
+        *"(—)"*) ;;
+        *) _err="${_err:+$_err; }crossed-reset delta not suppressed" ;;
+    esac
+
+    finish_scenario "$name"
+}
+fhb_breakdown_crossed_reset
+
+# ─── Scenario fhb-invalid-tz: --tz typo exits 2 with a clear stderr ─
+# Regression for the silent-fallback bug where `_format_block_start`
+# rendered UTC digits with the user's invalid suffix appended verbatim
+# (e.g. `2026-04-30 14:00 America/New_Yorkk`). The unified `_argparse_tz`
+# `type=` callable refuses the bad value up front via argparse's standard
+# error-and-exit-2 path.
+fhb_invalid_tz () {
+    local name="fhb-invalid-tz"
+    begin_scenario "$name"
+
+    # No DB seeding required — the gate fires before open_db().
+    local out rc
+    out=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-blocks --tz America/New_Yorkk 2>&1)
+    rc=$?
+
+    assert_eq "$rc" "2" "five-hour-blocks invalid-tz exit"
+    case "$out" in
+        *"argument --tz: invalid timezone 'America/New_Yorkk' -- expected 'local', 'utc', or an IANA name"*) ;;
+        *) _err="${_err:+$_err; }five-hour-blocks invalid-tz stderr message" ;;
+    esac
+
+    out=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-breakdown --tz Not/A/Zone 2>&1)
+    rc=$?
+    assert_eq "$rc" "2" "five-hour-breakdown invalid-tz exit"
+    case "$out" in
+        *"argument --tz: invalid timezone 'Not/A/Zone' -- expected 'local', 'utc', or an IANA name"*) ;;
+        *) _err="${_err:+$_err; }five-hour-breakdown invalid-tz stderr message" ;;
+    esac
+
+    finish_scenario "$name"
+}
+fhb_invalid_tz
+
+# ─── Scenario fhb-dedup-migration: merge_5h_block_duplicates_v1 ───────
+# Regression for the F5/duplicate-block fix. Anthropic's status line
+# reported `rate_limits.5h.resets_at` jittered by 1 s across a 600-second
+# floor boundary (`09:49:59` ↔ `09:50:00`), and an earlier bug in the
+# prior-anchor lookup let the second value fork into a NEW
+# five_hour_window_key (e.g. ids 61 + 69 in the user's prod DB pointing
+# at the same physical 5h window). The one-shot migration in
+# `_migration_merge_5h_block_duplicates_v1` heals existing forked rows
+# on the next open_db() call.
+#
+# Seeds two rows whose five_hour_resets_at differ by 1 second across
+# the 09:50:00 boundary (BOUND_NEAR=09:49:59, BOUND_PAST=09:50:00),
+# triggers any cctally subcommand (which calls open_db() → the
+# migration), then asserts the rows collapsed to a single canonical
+# parent and the migration marker is recorded.
+fhb_dedup_migration () {
+    local name="fhb-dedup-migration"
+    begin_scenario "$name"
+
+    # Open the DB by running a no-op subcommand (creates schema +
+    # populates schema_migrations marker as if migration already ran on
+    # an empty table — we DELETE that marker right after so the
+    # follow-up subcommand re-fires the migration on the seeded data).
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+    sql "$home" "DELETE FROM schema_migrations WHERE name = 'merge_5h_block_duplicates_v1';"
+
+    # Seed two parent rows representing the same physical 5h window
+    # but stored under distinct (forked) window keys. Mirrors the
+    # production incident: id=61 stored 1777629000 (09:50:00 floored)
+    # and id=69 stored 1777628400 (09:40:00 from the 09:49:59 sample).
+    sql "$home" "
+INSERT INTO five_hour_blocks (
+    id, five_hour_window_key, five_hour_resets_at, block_start_at,
+    first_observed_at_utc, last_observed_at_utc,
+    final_five_hour_percent, total_cost_usd,
+    seven_day_pct_at_block_start, seven_day_pct_at_block_end,
+    crossed_seven_day_reset, is_closed,
+    created_at_utc, last_updated_at_utc
+) VALUES
+  (61, 1777629000, '2026-04-30T09:50:00+00:00', '2026-04-30T04:50:00+00:00',
+   '2026-04-30T04:50:00+00:00', '2026-04-30T08:00:00+00:00',
+   4.0, 1.20, 70.0, 71.0, 0, 0,
+   '2026-04-30T04:50:00+00:00', '2026-04-30T08:00:00+00:00'),
+  (69, 1777628400, '2026-04-30T09:49:59+00:00', '2026-04-30T08:30:00+00:00',
+   '2026-04-30T08:30:00+00:00', '2026-04-30T09:30:00+00:00',
+   19.0, 4.50, 71.0, 72.0, 0, 0,
+   '2026-04-30T08:30:00+00:00', '2026-04-30T09:30:00+00:00');
+
+INSERT INTO weekly_usage_snapshots (
+    captured_at_utc, weekly_percent,
+    week_start_date, week_end_date, payload_json,
+    five_hour_percent, five_hour_resets_at, five_hour_window_key
+) VALUES
+  ('2026-04-30T08:00:00+00:00', 71.0,
+   '2026-04-28', '2026-05-05', '{}',
+   4.0, '2026-04-30T09:50:00+00:00', 1777629000),
+  ('2026-04-30T09:30:00+00:00', 72.0,
+   '2026-04-28', '2026-05-05', '{}',
+   19.0, '2026-04-30T09:49:59+00:00', 1777628400);
+"
+
+    pre_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$pre_count" "2" "pre-migration block count"
+
+    # Trigger open_db() again to fire the migration. `weekly` opens
+    # stats.db without writing any 5h-block rows.
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    post_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$post_count" "1" "post-migration block count (merged to canonical)"
+
+    # Canonical = earliest first_observed_at_utc → id 61 wins.
+    canonical_id=$(sql "$home" "SELECT id FROM five_hour_blocks;")
+    assert_eq "$canonical_id" "61" "canonical block id"
+
+    # Both snapshots' five_hour_window_key now point to the canonical key
+    # (1777629000), so the latest-snapshot lookup resolves cleanly.
+    distinct_snap_keys=$(sql "$home" \
+        "SELECT COUNT(DISTINCT five_hour_window_key) FROM weekly_usage_snapshots;")
+    assert_eq "$distinct_snap_keys" "1" "snapshot keys collapsed"
+    snap_key=$(sql "$home" \
+        "SELECT DISTINCT five_hour_window_key FROM weekly_usage_snapshots;")
+    assert_eq "$snap_key" "1777629000" "snapshot keys point at canonical"
+
+    # Migration marker is set so the next open_db() doesn't re-run.
+    marker=$(sql "$home" \
+        "SELECT name FROM schema_migrations WHERE name = 'merge_5h_block_duplicates_v1';")
+    assert_eq "$marker" "merge_5h_block_duplicates_v1" "migration marker recorded"
+
+    # Group-wide merge: canonical (id=61) inherits the latest-observed
+    # row's aggregates (id=69's last_observed='09:30', final_pct=19.0,
+    # seven_day_pct_at_block_end=72.0, total_cost=4.50). Without the
+    # merge, closed/historical duplicate groups would freeze canonical
+    # at the earliest-observation slice forever (no future tick fires).
+    last_observed=$(sql "$home" \
+        "SELECT last_observed_at_utc FROM five_hour_blocks WHERE id = 61;")
+    assert_eq "$last_observed" "2026-04-30T09:30:00+00:00" \
+        "canonical merged last_observed_at_utc"
+    final_pct=$(sql "$home" \
+        "SELECT final_five_hour_percent FROM five_hour_blocks WHERE id = 61;")
+    assert_eq "$final_pct" "19.0" "canonical merged final_five_hour_percent"
+    p_end=$(sql "$home" \
+        "SELECT seven_day_pct_at_block_end FROM five_hour_blocks WHERE id = 61;")
+    assert_eq "$p_end" "72.0" "canonical merged seven_day_pct_at_block_end"
+    cost=$(sql "$home" \
+        "SELECT total_cost_usd FROM five_hour_blocks WHERE id = 61;")
+    assert_eq "$cost" "4.5" "canonical merged total_cost_usd"
+
+    # Idempotency: running open_db() again is a no-op.
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+    post_count2=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$post_count2" "1" "second open_db() leaves canonical row alone"
+
+    finish_scenario "$name"
+}
+fhb_dedup_migration
+
+# ─── Scenario fhb-dedup-milestone-collision: UNIQUE collision regression ──
+# Regression for the milestone-rekey ordering bug. When canonical and a
+# dropped block both hold a milestone for the SAME percent_threshold and
+# the dropped row's milestone is the EARLIER keeper, the migration must
+# DELETE non-keepers before UPDATEing keepers — otherwise the keeper
+# UPDATE collides with canonical's still-present non-keeper milestone on
+# UNIQUE(five_hour_window_key, percent_threshold), rolling the migration
+# back forever.
+fhb_dedup_milestone_collision () {
+    local name="fhb-dedup-milestone-collision"
+    begin_scenario "$name"
+
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+    sql "$home" "DELETE FROM schema_migrations WHERE name = 'merge_5h_block_duplicates_v1';"
+
+    # Two parent rows for the same physical 5h window + a milestone on
+    # threshold=10 in EACH. Canonical (id=61) milestone captured at
+    # 08:30; dropped (id=69) milestone captured at 08:00 — earlier ⇒
+    # the dropped row's milestone wins the per-threshold dedup and gets
+    # rekeyed onto canonical. The DELETE-first ordering keeps the
+    # UNIQUE(five_hour_window_key, percent_threshold) constraint
+    # satisfied throughout.
+    sql "$home" "
+INSERT INTO five_hour_blocks (
+    id, five_hour_window_key, five_hour_resets_at, block_start_at,
+    first_observed_at_utc, last_observed_at_utc,
+    final_five_hour_percent, total_cost_usd,
+    seven_day_pct_at_block_start, seven_day_pct_at_block_end,
+    crossed_seven_day_reset, is_closed,
+    created_at_utc, last_updated_at_utc
+) VALUES
+  (61, 1777629000, '2026-04-30T09:50:00+00:00', '2026-04-30T04:50:00+00:00',
+   '2026-04-30T04:50:00+00:00', '2026-04-30T08:30:00+00:00',
+   10.0, 1.20, 70.0, 71.0, 0, 0,
+   '2026-04-30T04:50:00+00:00', '2026-04-30T08:30:00+00:00'),
+  (69, 1777628400, '2026-04-30T09:49:59+00:00', '2026-04-30T08:30:00+00:00',
+   '2026-04-30T08:30:00+00:00', '2026-04-30T09:30:00+00:00',
+   12.0, 4.50, 71.0, 72.0, 0, 0,
+   '2026-04-30T08:30:00+00:00', '2026-04-30T09:30:00+00:00');
+
+INSERT INTO weekly_usage_snapshots (
+    id, captured_at_utc, weekly_percent,
+    week_start_date, week_end_date, payload_json,
+    five_hour_percent, five_hour_resets_at, five_hour_window_key
+) VALUES
+  (101, '2026-04-30T08:30:00+00:00', 71.0,
+   '2026-04-28', '2026-05-05', '{}',
+   10.0, '2026-04-30T09:50:00+00:00', 1777629000),
+  (102, '2026-04-30T08:00:00+00:00', 70.5,
+   '2026-04-28', '2026-05-05', '{}',
+   10.0, '2026-04-30T09:49:59+00:00', 1777628400);
+
+INSERT INTO five_hour_milestones (
+    block_id, five_hour_window_key, percent_threshold, captured_at_utc,
+    usage_snapshot_id
+) VALUES
+  (61, 1777629000, 10, '2026-04-30T08:30:00+00:00', 101),
+  (69, 1777628400, 10, '2026-04-30T08:00:00+00:00', 102);
+"
+
+    # Trigger the migration.
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    # Migration must complete (marker present) — failure mode would be
+    # a rollback leaving the marker absent and the duplicates intact.
+    marker=$(sql "$home" \
+        "SELECT name FROM schema_migrations WHERE name = 'merge_5h_block_duplicates_v1';")
+    assert_eq "$marker" "merge_5h_block_duplicates_v1" \
+        "migration marker recorded (no rollback)"
+
+    post_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$post_count" "1" "blocks collapsed to canonical"
+
+    # Exactly one milestone survives per threshold, FK'd to canonical.
+    ms_count=$(sql "$home" \
+        "SELECT COUNT(*) FROM five_hour_milestones WHERE percent_threshold = 10;")
+    assert_eq "$ms_count" "1" "single milestone per threshold survives"
+    ms_block=$(sql "$home" \
+        "SELECT block_id FROM five_hour_milestones WHERE percent_threshold = 10;")
+    assert_eq "$ms_block" "61" "surviving milestone FK'd to canonical"
+    ms_key=$(sql "$home" \
+        "SELECT five_hour_window_key FROM five_hour_milestones WHERE percent_threshold = 10;")
+    assert_eq "$ms_key" "1777629000" "surviving milestone keyed to canonical"
+    # Earlier captured_at wins (write-once milestone semantics).
+    ms_captured=$(sql "$home" \
+        "SELECT captured_at_utc FROM five_hour_milestones WHERE percent_threshold = 10;")
+    assert_eq "$ms_captured" "2026-04-30T08:00:00+00:00" \
+        "earliest captured_at wins per-threshold dedup"
+
+    finish_scenario "$name"
+}
+fhb_dedup_milestone_collision
+
+# ─── Scenario fhb-banner-shown: migration error banner UX ──────────────
+# Regression for the G1 fix. Pre-seeds a migration-errors.log entry under
+# the fixture HOME, then asserts:
+#   1. Non-JSON command renders the banner on STDOUT (first line).
+#   2. --json command renders the banner on STDERR and keeps STDOUT a
+#      parseable JSON document.
+# The banner format anchors on the "⚠ cctally: migration `<name>` failed"
+# substring so a future copy edit doesn't silently break the assertion.
+fhb_banner_shown () {
+    local name="fhb-banner-shown"
+    begin_scenario "$name"
+
+    # Pre-seed sentinel log under the fixture HOME (no migration ran).
+    local log_dir="$home/.local/share/cctally/logs"
+    mkdir -p "$log_dir"
+    local log_path="$log_dir/migration-errors.log"
+    printf '[2026-04-30T12:00:00Z] merge_5h_block_duplicates_v1\n  seeded test failure\n  Traceback line 1\n  Traceback line 2\n\n' > "$log_path"
+
+    # 1. Non-JSON: banner on STDOUT, normal output follows.
+    HOME="$home" TZ=Etc/UTC "$BIN" five-hour-blocks \
+        > "$home/text-stdout.log" 2> "$home/text-stderr.log" || true
+    local first_line
+    first_line=$(head -n 1 "$home/text-stdout.log")
+    case "$first_line" in
+        "⚠ cctally: migration \`merge_5h_block_duplicates_v1\` failed"*)
+            ;;  # ok
+        *)
+            _err="${_err:+$_err; }non-json banner missing on stdout (got: $first_line)" ;;
+    esac
+    # Stderr should NOT carry the banner in non-json mode.
+    if grep -q '⚠ cctally: migration' "$home/text-stderr.log"; then
+        _err="${_err:+$_err; }non-json banner leaked to stderr"
+    fi
+
+    # 2. JSON: banner on STDERR, JSON parses cleanly from STDOUT.
+    HOME="$home" TZ=Etc/UTC "$BIN" five-hour-blocks --json \
+        > "$home/json-stdout.log" 2> "$home/json-stderr.log" || true
+    if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" \
+            "$home/json-stdout.log" 2>/dev/null; then
+        _err="${_err:+$_err; }json mode stdout is not parseable JSON"
+    fi
+    if ! grep -q '⚠ cctally: migration `merge_5h_block_duplicates_v1` failed' \
+            "$home/json-stderr.log"; then
+        _err="${_err:+$_err; }json mode banner missing on stderr"
+    fi
+
+    finish_scenario "$name"
+}
+fhb_banner_shown
+
+# ─── Scenario fhb-banner-autoclear: auto-clear on migration success ────
+# Regression for the G1(c) auto-clear behavior. Seeds the same kind of
+# duplicate blocks as fhb-dedup-migration so the merge migration runs to
+# success, AND seeds a sentinel log entry tagged with that migration's
+# name. After the run the log file should be unlinked (last entry was
+# the migration that just succeeded). Prevents stale banners persisting
+# after a transient migration failure self-heals on the next open.
+fhb_banner_autoclear () {
+    local name="fhb-banner-autoclear"
+    begin_scenario "$name"
+
+    # Open the DB to create schema (also drops the pre-fired marker so the
+    # migration runs again on the seeded data — same trick as
+    # fhb-dedup-migration uses).
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+    sql "$home" "DELETE FROM schema_migrations WHERE name = 'merge_5h_block_duplicates_v1';"
+
+    # Seed two duplicate parent blocks (boundary-jitter fork).
+    sql "$home" "
+INSERT INTO five_hour_blocks (
+    id, five_hour_window_key, five_hour_resets_at, block_start_at,
+    first_observed_at_utc, last_observed_at_utc,
+    final_five_hour_percent, total_cost_usd,
+    seven_day_pct_at_block_start, seven_day_pct_at_block_end,
+    crossed_seven_day_reset, is_closed,
+    created_at_utc, last_updated_at_utc
+) VALUES
+  (61, 1777629000, '2026-04-30T09:50:00+00:00', '2026-04-30T04:50:00+00:00',
+   '2026-04-30T04:50:00+00:00', '2026-04-30T08:00:00+00:00',
+   4.0, 1.20, 70.0, 71.0, 0, 0,
+   '2026-04-30T04:50:00+00:00', '2026-04-30T08:00:00+00:00'),
+  (69, 1777628400, '2026-04-30T09:49:59+00:00', '2026-04-30T08:30:00+00:00',
+   '2026-04-30T08:30:00+00:00', '2026-04-30T09:30:00+00:00',
+   19.0, 4.50, 71.0, 72.0, 0, 0,
+   '2026-04-30T08:30:00+00:00', '2026-04-30T09:30:00+00:00');
+"
+
+    # Seed a sentinel log entry whose name matches the migration.
+    local log_dir="$home/.local/share/cctally/logs"
+    mkdir -p "$log_dir"
+    local log_path="$log_dir/migration-errors.log"
+    printf '[2026-04-30T11:59:00Z] merge_5h_block_duplicates_v1\n  prior failure - to be cleared\n  fake traceback\n\n' > "$log_path"
+
+    # Trigger open_db() — migration runs successfully and auto-clears.
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    # Confirm migration succeeded (canonical row remains).
+    post_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
+    assert_eq "$post_count" "1" "post-migration block count (autoclear scenario)"
+
+    # Auto-clear: the log file should be unlinked because the last entry
+    # was tagged with the migration that just succeeded.
+    if [ -e "$log_path" ]; then
+        local remaining
+        remaining=$(cat "$log_path")
+        _err="${_err:+$_err; }migration-errors.log not unlinked after success (contents: $remaining)"
+    fi
+
+    finish_scenario "$name"
+}
+fhb_banner_autoclear
+
+# ─── Scenario fhb-banner-diff-json-routing: diff --json keeps stdout clean ────
+# Regression for a P1 bug: `diff` declares --json with dest="emit_json"
+# (not the default dest="json"), so the banner-routing fallback to
+# getattr(args, "json", False) was returning False and the banner was
+# being printed to STDOUT — corrupting the JSON envelope. The fix
+# introduces _args_emit_json() which checks BOTH dest names.
+#
+# Uses a date-range diff (`last-7d prev-7d`) so we don't depend on the
+# subscription-week anchor (no record-usage seed needed); the banner-
+# routing logic runs the same way regardless of the diff body.
+fhb_banner_diff_json_routing () {
+    local name="fhb-banner-diff-json-routing"
+    begin_scenario "$name"
+
+    # Pre-seed the migration-errors.log so the banner has something to render.
+    local log_dir="$home/.local/share/cctally/logs"
+    mkdir -p "$log_dir"
+    local log_path="$log_dir/migration-errors.log"
+    printf '[2026-04-30T12:00:00Z] merge_5h_block_duplicates_v1\n  seeded test failure\n  Traceback line 1\n  Traceback line 2\n\n' > "$log_path"
+
+    # Run `diff --json` with a non-week range (no anchor needed).
+    HOME="$home" TZ=Etc/UTC "$BIN" diff --a last-7d --b prev-7d --json \
+        > "$home/diff-json-stdout.log" 2> "$home/diff-json-stderr.log" || true
+
+    # STDOUT must be parseable JSON — the banner must not have leaked into it.
+    if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" \
+            "$home/diff-json-stdout.log" 2>/dev/null; then
+        _err="${_err:+$_err; }diff --json stdout is not parseable JSON (banner likely leaked)"
+    fi
+
+    # STDOUT must NOT contain the banner substring.
+    if grep -q '⚠ cctally: migration' "$home/diff-json-stdout.log"; then
+        _err="${_err:+$_err; }banner leaked to diff --json stdout"
+    fi
+
+    # Banner MUST appear on STDERR.
+    if ! grep -q '⚠ cctally: migration `merge_5h_block_duplicates_v1` failed' \
+            "$home/diff-json-stderr.log"; then
+        _err="${_err:+$_err; }diff --json banner missing on stderr"
+    fi
+
+    finish_scenario "$name"
+}
+fhb_banner_diff_json_routing
+
+# ─── Scenario fhb-banner-status-line-suppressed: forecast --status-line clean ──
+# Regression for a P1 bug: `forecast --status-line` is consumed via
+# `$(cctally forecast --status-line --no-sync 2>/dev/null)` for shell
+# prompt embedding (see forecast docstring). Both stdout and stderr are
+# unsafe surfaces — stdout is shell-substituted into the user's prompt,
+# stderr is discarded. The banner must be suppressed entirely.
+#
+# Seeds a current-week weekly_usage_snapshots row so forecast has data
+# to render (otherwise --status-line emits an empty silent segment and
+# the test can't distinguish "banner suppressed" from "nothing happened").
+fhb_banner_status_line_suppressed () {
+    local name="fhb-banner-status-line-suppressed"
+    begin_scenario "$name"
+
+    # Bootstrap schema.
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    # Seed a current-week snapshot so _load_forecast_inputs returns non-None.
+    sql "$home" "
+INSERT INTO weekly_usage_snapshots (
+    captured_at_utc, week_start_date, week_end_date,
+    week_start_at, week_end_at, weekly_percent, source, payload_json,
+    five_hour_percent, five_hour_resets_at, five_hour_window_key
+) VALUES (
+    '2026-04-30T12:45:00+00:00', '2026-04-27', '2026-05-04',
+    '2026-04-27T00:00:00+00:00', '2026-05-04T00:00:00+00:00',
+    42.0, 'fixture', '{}', 42.0,
+    '2026-04-30T15:30:00+00:00', 1777563000
+);
+"
+
+    # Pre-seed the migration-errors.log.
+    local log_dir="$home/.local/share/cctally/logs"
+    mkdir -p "$log_dir"
+    local log_path="$log_dir/migration-errors.log"
+    printf '[2026-04-30T12:00:00Z] merge_5h_block_duplicates_v1\n  seeded test failure\n  Traceback line 1\n  Traceback line 2\n\n' > "$log_path"
+
+    # Pin "now" so forecast renders deterministically.
+    CCTALLY_AS_OF=2026-04-30T12:45:00Z HOME="$home" TZ=Etc/UTC \
+        "$BIN" forecast --status-line --no-sync \
+        > "$home/sl-stdout.log" 2> "$home/sl-stderr.log" || true
+
+    # STDOUT must NOT contain the banner — it's shell-substituted into the
+    # user's prompt and would corrupt the rendered prompt.
+    if grep -q '⚠ cctally: migration' "$home/sl-stdout.log"; then
+        _err="${_err:+$_err; }banner leaked to status-line stdout (would corrupt user's shell prompt)"
+    fi
+
+    # STDOUT must be at most one line (status-line contract).
+    local line_count
+    line_count=$(wc -l < "$home/sl-stdout.log" | tr -d ' ')
+    if [ "$line_count" -gt 1 ]; then
+        _err="${_err:+$_err; }status-line stdout has $line_count lines (expected 0 or 1)"
+    fi
+
+    # STDERR must NOT contain the banner — `2>/dev/null` discards it
+    # anyway and we want zero noise from this code path.
+    if grep -q '⚠ cctally: migration' "$home/sl-stderr.log"; then
+        _err="${_err:+$_err; }banner leaked to status-line stderr (status-line discards stderr — surfacing here is misleading)"
+    fi
+
+    finish_scenario "$name"
+}
+fhb_banner_status_line_suppressed
+
+echo
+echo "passed: $pass_count   failed: $fail_count"
+exit $fail_count

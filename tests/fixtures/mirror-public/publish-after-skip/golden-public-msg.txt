@@ -1,0 +1,3 @@
+docs: add notes
+
+First public version of the notes file.

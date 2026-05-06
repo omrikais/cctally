@@ -1,0 +1,120 @@
+{
+  "alerts": [],
+  "alerts_settings": {
+    "enabled": false,
+    "five_hour_thresholds": [
+      90,
+      95
+    ],
+    "weekly_thresholds": [
+      90,
+      95
+    ]
+  },
+  "blocks": {
+    "rows": [
+      {
+        "anchor": "recorded",
+        "cost_usd": 4.21,
+        "end_at": "2026-04-26T19:00:00+00:00",
+        "is_active": true,
+        "label": "14:00 Apr 26",
+        "models": [
+          {
+            "chip": "opus",
+            "cost_pct": 78.0,
+            "cost_usd": 3.28,
+            "display": "opus-4-5",
+            "model": "claude-opus-4-5-20251101"
+          }
+        ],
+        "start_at": "2026-04-26T14:00:00+00:00"
+      }
+    ]
+  },
+  "current_week": null,
+  "daily": {
+    "peak": {
+      "cost_usd": 8.4,
+      "date": "2026-04-26"
+    },
+    "quantile_thresholds": [
+      8.4,
+      8.4,
+      8.4,
+      8.4,
+      8.4
+    ],
+    "rows": [
+      {
+        "cache_creation_tokens": 1200000,
+        "cache_hit_pct": 87.3,
+        "cache_read_tokens": 8300000,
+        "cost_usd": 8.4,
+        "date": "2026-04-26",
+        "input_tokens": 412000,
+        "intensity_bucket": 1,
+        "is_today": true,
+        "label": "04-26",
+        "models": [
+          {
+            "chip": "opus",
+            "cost_pct": 62.0,
+            "cost_usd": 5.2,
+            "display": "opus-4-5",
+            "model": "claude-opus-4-5-20251101"
+          }
+        ],
+        "output_tokens": 38400,
+        "total_tokens": 9950400
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-25",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-25",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      }
+    ]
+  },
+  "display": {
+    "offset_label": "UTC",
+    "offset_seconds": 0,
+    "resolved_tz": "Etc/UTC",
+    "tz": "local"
+  },
+  "envelope_version": 2,
+  "forecast": null,
+  "generated_at": "2026-04-26T12:00:00Z",
+  "header": {
+    "dollar_per_pct": null,
+    "five_hour_pct": null,
+    "forecast_pct": null,
+    "forecast_verdict": null,
+    "used_pct": null,
+    "vs_last_week_delta": null,
+    "week_label": null
+  },
+  "last_sync_at": null,
+  "last_sync_error": null,
+  "monthly": {
+    "rows": []
+  },
+  "sessions": {
+    "rows": [],
+    "sort_key": "started_desc",
+    "total": 0
+  },
+  "sync_age_s": null,
+  "trend": null,
+  "weekly": {
+    "rows": []
+  }
+}

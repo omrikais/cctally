@@ -1,0 +1,41 @@
+{
+  "sessions": [
+    {
+      "sessionId": "rcc-resumed-session-uuid",
+      "projectPath": "/fake/repos/after-cd",
+      "sourcePaths": [
+        "/fake/jsonl/rcc-original.jsonl",
+        "/fake/jsonl/rcc-resumed.jsonl"
+      ],
+      "firstActivity": "2026-04-14T06:00:00+00:00",
+      "lastActivity": "2026-04-15T10:00:00+00:00",
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "inputTokens": 750000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 75000,
+      "totalTokens": 825000,
+      "totalCost": 5.625,
+      "modelBreakdowns": [
+        {
+          "model": "claude-opus-4-7",
+          "inputTokens": 750000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "outputTokens": 75000,
+          "cost": 5.625
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "inputTokens": 750000,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 0,
+    "outputTokens": 75000,
+    "totalTokens": 825000,
+    "totalCost": 5.625
+  }
+}

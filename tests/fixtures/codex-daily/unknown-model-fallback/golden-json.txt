@@ -1,0 +1,32 @@
+[codex] unknown model, using gpt-5 fallback pricing (isFallback=true): gpt-hypothetical-99
+{
+  "daily": [
+    {
+      "date": "Apr 15, 2026",
+      "inputTokens": 15000,
+      "cachedInputTokens": 1000,
+      "outputTokens": 5000,
+      "reasoningOutputTokens": 0,
+      "totalTokens": 20000,
+      "costUSD": 0.067625,
+      "models": {
+        "gpt-hypothetical-99": {
+          "inputTokens": 15000,
+          "cachedInputTokens": 1000,
+          "outputTokens": 5000,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 20000,
+          "isFallback": true
+        }
+      }
+    }
+  ],
+  "totals": {
+    "inputTokens": 15000,
+    "cachedInputTokens": 1000,
+    "outputTokens": 5000,
+    "reasoningOutputTokens": 0,
+    "totalTokens": 20000,
+    "costUSD": 0.067625
+  }
+}

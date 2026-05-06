@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Thin wrapper for `cctally tui`.
+DIR=$(cd "$(dirname "$0")" && pwd)
+exec "$DIR/cctally" tui "$@"

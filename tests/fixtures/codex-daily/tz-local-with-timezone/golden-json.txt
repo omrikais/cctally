@@ -1,0 +1,31 @@
+{
+  "daily": [
+    {
+      "date": "Apr 15, 2026",
+      "inputTokens": 5000,
+      "cachedInputTokens": 1000,
+      "outputTokens": 1500,
+      "reasoningOutputTokens": 0,
+      "totalTokens": 6500,
+      "costUSD": 0.020125,
+      "models": {
+        "gpt-5-codex": {
+          "inputTokens": 5000,
+          "cachedInputTokens": 1000,
+          "outputTokens": 1500,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 6500,
+          "isFallback": false
+        }
+      }
+    }
+  ],
+  "totals": {
+    "inputTokens": 5000,
+    "cachedInputTokens": 1000,
+    "outputTokens": 1500,
+    "reasoningOutputTokens": 0,
+    "totalTokens": 6500,
+    "costUSD": 0.020125
+  }
+}

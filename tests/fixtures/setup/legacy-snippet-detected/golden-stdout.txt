@@ -1,0 +1,18 @@
+✓ Detected Claude Code at /FAKE/.claude
+✓ Symlinks at /FAKE/.local/bin/: 11/11 (N newly created)
+✓ Wrote 3 hook entries to /FAKE/.claude/settings.json
+⚠ No Claude OAuth token detected.
+  Run `claude` once to authenticate. After that, the next assistant
+  message in any Claude Code session will start collecting data
+  automatically — no need to re-run `cctally setup`.
+⚠ Found legacy status-line snippet at /FAKE/.claude/statusline-command.sh:3
+  No need for it anymore — hooks now handle this. It's harmless to
+  leave (data is funneled correctly either way), but you can remove
+  it whenever you want. We won't touch the file.
+✓ Synced session cache (N new entries)
+
+cctally is ready (with 2 warning(s) above). Try:
+  cctally daily              # last 30 days
+  cctally dashboard          # live web dashboard
+  cctally tui                # terminal dashboard
+  cctally setup --status     # verify install state

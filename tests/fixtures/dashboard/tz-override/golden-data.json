@@ -1,0 +1,174 @@
+{
+  "alerts": [],
+  "alerts_settings": {
+    "enabled": false,
+    "five_hour_thresholds": [
+      90,
+      95
+    ],
+    "weekly_thresholds": [
+      90,
+      95
+    ]
+  },
+  "blocks": {
+    "rows": [
+      {
+        "anchor": "recorded",
+        "cost_usd": 0.48,
+        "end_at": "2026-04-20T15:00:00+00:00",
+        "is_active": true,
+        "label": "10:00 Apr 20 UTC",
+        "models": [
+          {
+            "chip": "sonnet",
+            "cost_pct": 100.0,
+            "cost_usd": 0.48,
+            "display": "sonnet-4-6",
+            "model": "claude-sonnet-4-6"
+          }
+        ],
+        "start_at": "2026-04-20T10:00:00+00:00"
+      }
+    ]
+  },
+  "current_week": {
+    "dollar_per_pct": 0.0,
+    "five_hour_block": null,
+    "five_hour_pct": 22.0,
+    "five_hour_resets_in_sec": 0,
+    "freshness": {
+      "age_seconds": 0,
+      "captured_at": "2026-04-20T12:00:00Z",
+      "label": "__LABEL__"
+    },
+    "last_snapshot_age_sec": 0,
+    "milestones": [],
+    "reset_at_utc": "2026-04-20T14:00:00Z",
+    "reset_in_sec": 0,
+    "spent_usd": 0.0,
+    "used_pct": 12.0
+  },
+  "daily": {
+    "peak": null,
+    "quantile_thresholds": [],
+    "rows": []
+  },
+  "display": {
+    "offset_label": "UTC",
+    "offset_seconds": 0,
+    "pinned": true,
+    "resolved_tz": "Etc/UTC",
+    "tz": "utc"
+  },
+  "envelope_version": 2,
+  "forecast": {
+    "budget_100_per_day_usd": 0.0,
+    "budget_90_per_day_usd": 0.0,
+    "confidence": "low",
+    "confidence_score": 2,
+    "explain": {
+      "budget": [
+        {
+          "dollars_per_day": 0.0,
+          "pct_headroom": 88.0,
+          "percent_per_day": 1056.0,
+          "target_percent": 100
+        },
+        {
+          "dollars_per_day": 0.0,
+          "pct_headroom": 78.0,
+          "percent_per_day": 936.0,
+          "target_percent": 90
+        }
+      ],
+      "current": {
+        "five_hour_percent": 22.0,
+        "latest_snapshot_at": "2026-04-20T12:00:00Z",
+        "snapshot_count": 1,
+        "spent_usd": 0.0,
+        "weekly_percent": 12.0
+      },
+      "forecast": {
+        "already_capped": false,
+        "cap_at": null,
+        "confidence": "low",
+        "final_percent_high": 12.145,
+        "final_percent_low": 12.145,
+        "low_confidence_reasons": [
+          "snapshots<3",
+          "no_sample_ge_24h"
+        ],
+        "projected_cap": false
+      },
+      "meta": {
+        "generated_at": "2026-04-20T12:00:00Z",
+        "tool_version": "forecast-v1"
+      },
+      "rates": {
+        "dollars_per_percent": 0.0,
+        "dollars_per_percent_source": "this_week",
+        "recent_24h_pct_per_hour": null,
+        "week_average_pct_per_hour": 0.072289
+      },
+      "week": {
+        "elapsed_fraction": 0.9881,
+        "elapsed_hours": 166.0,
+        "end_at": "2026-04-20T14:00:00Z",
+        "remaining_days": 0.083,
+        "remaining_hours": 2.0,
+        "start_at": "2026-04-13T14:00:00Z"
+      }
+    },
+    "recent_24h_projection_pct": null,
+    "verdict": "ok",
+    "week_avg_projection_pct": 12.144578313253012
+  },
+  "generated_at": "__NOW__",
+  "header": {
+    "dollar_per_pct": 0.0,
+    "five_hour_pct": 22.0,
+    "forecast_pct": 12.144578313253012,
+    "forecast_verdict": "ok",
+    "used_pct": 12.0,
+    "vs_last_week_delta": null,
+    "week_label": "Apr 13\u2013Apr 20"
+  },
+  "last_sync_at": null,
+  "last_sync_error": null,
+  "monthly": {
+    "rows": []
+  },
+  "sessions": {
+    "rows": [],
+    "sort_key": "started_desc",
+    "total": 0
+  },
+  "sync_age_s": null,
+  "trend": {
+    "history": [
+      {
+        "delta": null,
+        "dollar_per_pct": null,
+        "is_current": true,
+        "label": "Apr 13",
+        "used_pct": 12.0
+      }
+    ],
+    "spark_heights": [
+      1
+    ],
+    "weeks": [
+      {
+        "delta": null,
+        "dollar_per_pct": null,
+        "is_current": true,
+        "label": "Apr 13",
+        "used_pct": 12.0
+      }
+    ]
+  },
+  "weekly": {
+    "rows": []
+  }
+}

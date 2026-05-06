@@ -1,0 +1,1 @@
+diff: window A is 7.0 days, window B is 14.0 days; pass --allow-mismatch to compare anyway with per-day normalization

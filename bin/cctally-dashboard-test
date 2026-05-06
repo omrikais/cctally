@@ -1,0 +1,591 @@
+#!/usr/bin/env bash
+# Golden-file harness for the `dashboard` subcommand.
+#
+# For each fixture scenario (ok / warn / over / no-data):
+#   - Rebuilds the fixture cache.db / stats.db (via build-dashboard-fixtures).
+#   - Starts the server on an ephemeral port (--port 0) with --no-sync
+#     --no-browser, pinned to CCTALLY_AS_OF and HOME=<scenario>.
+#   - HTTP smokes / and every asset referenced from dashboard.html
+#     (discovered at runtime so React's hashed /static/assets/index-*.js
+#     + /static/assets/index-*.css bundles are picked up without the
+#     harness needing to know the hashes). Also smokes /static/icons.svg
+#     (referenced from the JS bundle via SVG <use>, not the HTML). All
+#     must return 200.
+#   - Fetches /api/data, normalizes wall-clock fields to sentinels, and
+#     diffs against tests/fixtures/dashboard/<scenario>/golden-data.json.
+#   - Reads the first SSE event from /api/events and confirms the
+#     `event: update` envelope shape.
+#   - For non-empty scenarios (FIXED_SESSION_ID set in input.env):
+#     fetches /api/session/<fixed-id>, normalizes, and diffs against
+#     golden-session.json (first run writes the golden).
+#   - Kills the server.
+#
+# First-run writes each scenario's golden; steady-state is a byte-stable diff.
+# Exits non-zero if any scenario fails. A trap ensures stray server PIDs die
+# on harness exit / Ctrl-C.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN="$REPO_ROOT/bin/cctally"
+FIX_DIR="$REPO_ROOT/tests/fixtures/dashboard"
+
+# Per-run scratch root. Each scenario gets <SCRATCH_ROOT>/<name>/.local/...
+# as its HOME; the in-tree fixture dir is treated as a read-only template
+# (committed cache.db / stats.db are copied in once per scenario). Without
+# this, the dashboard server writes back to the in-tree stats.db during
+# normal startup paths (e.g. AUTOINCREMENT bumps on INSERT-OR-IGNORE
+# duplicates in `week_reset_events`), dirtying the worktree.
+SCRATCH_ROOT=$(mktemp -d -t cctally-dashboard-test.XXXXXX)
+
+pass_count=0
+fail_count=0
+
+# Track PIDs we launch so the EXIT trap can clean up even on Ctrl-C / abort.
+declare -a BG_PIDS=()
+cleanup () {
+    for p in "${BG_PIDS[@]:-}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${BG_PIDS[@]:-}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+    rm -rf "$SCRATCH_ROOT"
+}
+trap cleanup EXIT INT TERM
+
+echo ">> rebuilding fixtures"
+"$REPO_ROOT/bin/build-dashboard-fixtures.py" >/dev/null || {
+    echo "FAIL: build-dashboard-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+# Normalize the wall-clock-sensitive fields in an /api/data envelope so
+# re-runs are byte-stable. Stdin: raw JSON. Stdout: normalized JSON
+# (sorted keys, 2-space indent).
+#
+# Uses `python3 -c` (not a heredoc on stdin) because this function is
+# called inside a pipeline — the pipe supplies stdin, not a heredoc.
+normalize_json () {
+    python3 -c '
+import json, sys
+env = json.load(sys.stdin)
+env["generated_at"] = "__NOW__"
+# last_sync_at is always None in the envelope today, but normalize
+# defensively so future changes do not leak wall clock into goldens.
+env["last_sync_at"] = "__SYNC_AT__" if env.get("last_sync_at") else None
+if env.get("sync_age_s") is not None:
+    env["sync_age_s"] = 0
+cw = env.get("current_week")
+if cw:
+    for k in ("last_snapshot_age_sec", "five_hour_resets_in_sec", "reset_in_sec"):
+        if cw.get(k) is not None:
+            cw[k] = 0
+    fresh = cw.get("freshness")
+    if fresh:
+        # age_seconds + label drift with wall clock vs the fixture-pinned
+        # captured_at (which stays deterministic). Normalize to sentinels.
+        if fresh.get("age_seconds") is not None:
+            fresh["age_seconds"] = 0
+        if fresh.get("label") is not None:
+            fresh["label"] = "__LABEL__"
+print(json.dumps(env, indent=2, sort_keys=True))
+'
+}
+
+# Normalize the /api/session/:id envelope. CCTALLY_AS_OF pins the
+# current clock (so nothing should actually leak wall time here), but
+# defend against future field additions the same way normalize_json
+# does. Sorted keys / 2-space indent match golden-data.json.
+normalize_session_json () {
+    python3 -c '
+import json, sys
+env = json.load(sys.stdin)
+# started_utc / last_activity_utc are derived from session_entries
+# timestamps (fixture-pinned), not wall clock. Leave them alone — the
+# fixture seeds determine them deterministically.
+print(json.dumps(env, indent=2, sort_keys=True))
+'
+}
+
+run_scenario () {
+    local name="$1"
+    local dir="$FIX_DIR/$name"
+    local golden="$dir/golden-data.json"
+    local log="$dir/.harness.log"
+
+    if [ ! -f "$dir/input.env" ]; then
+        echo "FAIL $name: no input.env at $dir/input.env"
+        fail_count=$((fail_count + 1))
+        return
+    fi
+
+    # Pull AS_OF without sourcing input.env (keeps harness state clean).
+    local as_of
+    as_of=$(grep '^AS_OF=' "$dir/input.env" | head -1 | cut -d= -f2-)
+    if [ -z "$as_of" ]; then
+        echo "FAIL $name: input.env missing AS_OF"
+        fail_count=$((fail_count + 1))
+        return
+    fi
+
+    # FIXED_SESSION_ID is present for non-empty scenarios (ok/warn/over);
+    # absent for no-data which has nothing to seed. Harness gates the
+    # /api/session/:id golden-diff on presence.
+    local fixed_sid=""
+    fixed_sid=$(grep '^FIXED_SESSION_ID=' "$dir/input.env" | head -1 | cut -d= -f2-)
+
+    # F3: optional EXTRA_FLAGS appended verbatim to the cctally dashboard
+    # invocation (e.g. "--tz utc" for the tz-override scenario). Word-
+    # split via shell so multiple flags work.
+    local extra_flags=""
+    extra_flags=$(grep '^EXTRA_FLAGS=' "$dir/input.env" | head -1 | cut -d= -f2-)
+
+    # F3 follow-up: optional BLOCK_START_AT seeds a recorded 5h block
+    # whose start_at the harness probes via GET /api/block/<value> to
+    # exercise the override-tz threading in `_handle_get_block_detail`.
+    # Currently set only by the tz-override scenario.
+    local block_start_at=""
+    block_start_at=$(grep '^BLOCK_START_AT=' "$dir/input.env" | head -1 | cut -d= -f2-)
+
+    # Clone the in-tree fixture's .local tree into per-scenario scratch
+    # space and use that as HOME. The dashboard server's startup path
+    # mutates stats.db (e.g. INSERT-OR-IGNORE on `week_reset_events`
+    # advances the AUTOINCREMENT counter even when no row is added), so
+    # pointing HOME at $dir would dirty the committed fixture.
+    local scratch_home="$SCRATCH_ROOT/$name"
+    mkdir -p "$scratch_home"
+    cp -R "$dir/.local" "$scratch_home/"
+    # shellcheck disable=SC2086
+    CCTALLY_AS_OF="$as_of" HOME="$scratch_home" TZ=Etc/UTC \
+        "$BIN" dashboard --port 0 --no-browser --no-sync \
+        --sync-interval 9999 --host 127.0.0.1 $extra_flags >"$log" 2>&1 &
+    local pid=$!
+    BG_PIDS+=("$pid")
+
+    # Wait up to ~15s for the banner line to appear. With --host 127.0.0.1
+    # (loopback), the banner emits "dashboard: serving http://localhost:PORT/
+    # — Ctrl-C to stop" (Task 2 normalizes loopback → localhost in the
+    # printed URL). Match either spelling so this harness keeps working
+    # regardless of which alias is used. Ceiling raised from 5s to 15s for
+    # cold CI runners where bin/cctally's import + socket bind under
+    # parallel-harness load can exceed the old window.
+    local port=""
+    local tries=0
+    while [ $tries -lt 150 ]; do
+        if [ -s "$log" ]; then
+            port=$(grep -Eo 'http://(127\.0\.0\.1|localhost):[0-9]+' "$log" | head -1 | sed 's#.*:##')
+            if [ -n "$port" ]; then
+                break
+            fi
+        fi
+        # Bail early if the server crashed before printing the banner.
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+
+    if [ -z "$port" ]; then
+        echo "FAIL $name: could not discover port (log: $log)"
+        sed 's/^/    /' "$log" || true
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        fail_count=$((fail_count + 1))
+        return
+    fi
+
+    local base="http://127.0.0.1:$port"
+    local ok=1
+
+    # Root must serve dashboard.html.
+    local root_code
+    root_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$base/")
+    if [ "$root_code" != "200" ]; then
+        echo "FAIL $name: GET / returned $root_code"
+        ok=0
+    fi
+
+    # Discover every local asset referenced from the served HTML so the
+    # harness tracks the Vite-emitted hashed filenames automatically.
+    # Matches <script src="/static/..."> and <link href="/static/...">.
+    # /static/icons.svg is loaded from the JS bundle (SVG <use href>),
+    # not the HTML, so include it unconditionally.
+    local html asset_paths
+    html=$(curl -s --max-time 5 "$base/")
+    asset_paths=$(printf '%s' "$html" \
+        | grep -Eo '(src|href)="/static/[^"]+"' \
+        | sed -E 's/^(src|href)="//; s/"$//' \
+        | sort -u)
+    asset_paths="$asset_paths
+/static/icons.svg"
+    # Belt-and-braces: fail loudly if the HTML parse surfaced nothing at
+    # all — a future regression that ships an empty HTML shell should
+    # trip the harness instead of passing a trivially-empty check.
+    if ! printf '%s\n' "$asset_paths" | grep -q '\.js$'; then
+        echo "FAIL $name: dashboard.html referenced no JS assets; got:"
+        printf '%s\n' "$asset_paths" | sed 's/^/    /'
+        ok=0
+    fi
+    while IFS= read -r path; do
+        [ -z "$path" ] && continue
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$base$path")
+        if [ "$code" != "200" ]; then
+            echo "FAIL $name: GET $path returned $code"
+            ok=0
+        fi
+    done <<< "$asset_paths"
+
+    # /api/data: fetch + normalize + diff (or write golden on first run).
+    local raw actual
+    raw=$(curl -s --max-time 5 "$base/api/data")
+    if [ -z "$raw" ]; then
+        echo "FAIL $name: /api/data returned empty body"
+        ok=0
+    else
+        actual=$(printf '%s' "$raw" | normalize_json)
+        if [ $? -ne 0 ] || [ -z "$actual" ]; then
+            echo "FAIL $name: /api/data JSON could not be normalized"
+            ok=0
+        elif [ ! -f "$golden" ]; then
+            printf '%s\n' "$actual" > "$golden"
+            echo "WROTE $name golden: $golden"
+        else
+            if ! diff -u "$golden" <(printf '%s\n' "$actual") >&2; then
+                echo "FAIL $name: /api/data diverged from golden"
+                ok=0
+            fi
+        fi
+    fi
+
+    # /api/events: grab the first update frame. --max-time keeps the
+    # connection from blocking forever on an idle server; the header
+    # flush + first publish should land well under 3s.
+    local sse_body
+    sse_body=$(curl -sN --max-time 3 "$base/api/events" 2>/dev/null | head -c 32768 || true)
+    if ! grep -q 'event: update' <<<"$sse_body"; then
+        echo "FAIL $name: /api/events did not emit an update frame"
+        ok=0
+    fi
+
+    # POST /api/sync (v2): valid Origin → 204, bogus → 403, missing → 403.
+    local sync_code
+    sync_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        -X POST -H "Origin: http://127.0.0.1:$port" "$base/api/sync")
+    if [ "$sync_code" != "204" ]; then
+        echo "FAIL $name: POST /api/sync (valid Origin) returned $sync_code (expected 204)"
+        ok=0
+    fi
+    sync_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        -X POST -H "Origin: http://evil.example" "$base/api/sync")
+    if [ "$sync_code" != "403" ]; then
+        echo "FAIL $name: POST /api/sync (bogus Origin) returned $sync_code (expected 403)"
+        ok=0
+    fi
+    sync_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        -X POST "$base/api/sync")
+    if [ "$sync_code" != "403" ]; then
+        echo "FAIL $name: POST /api/sync (missing Origin) returned $sync_code (expected 403)"
+        ok=0
+    fi
+
+    # F3: when --tz is pinned at startup, POST /api/settings must refuse
+    # with 409 so the persisted preference can't drift mid-session.
+    # Without --tz, leave settings writable (the UI's normal write path).
+    if echo "$extra_flags" | grep -q -- "--tz"; then
+        local settings_code
+        settings_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+            -X POST -H "Origin: http://127.0.0.1:$port" \
+            -H "Content-Type: application/json" \
+            -d '{"display":{"tz":"local"}}' "$base/api/settings")
+        if [ "$settings_code" != "409" ]; then
+            echo "FAIL $name: POST /api/settings under --tz pin returned $settings_code (expected 409)"
+            ok=0
+        fi
+    fi
+
+    # GET /api/session/:id (Task 3.2): fetch the fixture-seeded session,
+    # normalize, diff against golden-session.json (or write on first
+    # run). Skipped for no-data since there's no session to seed.
+    if [ -n "$fixed_sid" ]; then
+        local session_golden="$dir/golden-session.json"
+        local sess_raw sess_actual
+        sess_raw=$(curl -s --max-time 5 "$base/api/session/$fixed_sid")
+        if [ -z "$sess_raw" ]; then
+            echo "FAIL $name: /api/session/$fixed_sid returned empty body"
+            ok=0
+        else
+            sess_actual=$(printf '%s' "$sess_raw" | normalize_session_json)
+            if [ $? -ne 0 ] || [ -z "$sess_actual" ]; then
+                echo "FAIL $name: /api/session JSON could not be normalized"
+                ok=0
+            elif [ ! -f "$session_golden" ]; then
+                printf '%s\n' "$sess_actual" > "$session_golden"
+                echo "WROTE $name session golden: $session_golden"
+            else
+                if ! diff -u "$session_golden" <(printf '%s\n' "$sess_actual") >&2; then
+                    echo "FAIL $name: /api/session diverged from golden"
+                    ok=0
+                fi
+            fi
+        fi
+    fi
+
+    # GET /api/block/<start_at>: when a fixture seeds BLOCK_START_AT,
+    # probe the block-detail endpoint and assert the localized `label`
+    # field reflects the dashboard's effective display tz (i.e. the
+    # --tz override beats the persisted config). The tz-override
+    # scenario is currently the only fixture that exercises this --
+    # its persisted config is `display.tz: "Asia/Tokyo"` (UTC+9) and
+    # the server is launched with `--tz utc`, so a UTC start_at of
+    # "10:00 Apr 20" must NOT render as "19:00 Apr 20" (Tokyo).
+    if [ -n "$block_start_at" ]; then
+        local block_url block_raw block_label
+        # Path-encode the `+` so curl forwards it intact (urllib.parse.unquote
+        # in `_handle_get_block_detail` decodes %2B back to `+`).
+        block_url="$base/api/block/$(printf '%s' "$block_start_at" | sed 's/+/%2B/g')"
+        block_raw=$(curl -s --max-time 5 "$block_url")
+        if [ -z "$block_raw" ]; then
+            echo "FAIL $name: GET /api/block/$block_start_at returned empty body"
+            ok=0
+        else
+            block_label=$(printf '%s' "$block_raw" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+label = data.get("label")
+if not isinstance(label, str):
+    sys.exit("missing label field")
+print(label)
+')
+            if [ -z "$block_label" ]; then
+                echo "FAIL $name: GET /api/block missing or non-string label (raw: $block_raw)"
+                ok=0
+            elif [ "$block_label" != "10:00 Apr 20 UTC" ]; then
+                echo "FAIL $name: GET /api/block label='$block_label' (expected '10:00 Apr 20 UTC' under --tz utc)"
+                ok=0
+            fi
+            # Defense in depth: verify the persisted-Tokyo rendering
+            # ("19:00 Apr 20") is NOT what came back. Catches a future
+            # regression where the override-resolve path silently falls
+            # back to the persisted config.
+            if printf '%s' "$block_label" | grep -q "19:00"; then
+                echo "FAIL $name: GET /api/block label='$block_label' suggests Tokyo zone leaked through (--tz utc override should win)"
+                ok=0
+            fi
+        fi
+    fi
+
+    # /api/session/:id negative + URL-encoding smokes (Task 3.3). Runs
+    # on every scenario — including no-data, where only the bogus-id
+    # 404 check is meaningful (no fixture session exists to collide
+    # with any encoded variant).
+    local sess_code
+    sess_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        "$base/api/session/bogus-id-does-not-exist")
+    if [ "$sess_code" != "404" ]; then
+        echo "FAIL $name: GET /api/session/bogus returned $sess_code (expected 404)"
+        ok=0
+    fi
+
+    # URL-encoded round-trip: `%66` decodes to `f`. The probe decodes to
+    # `fixture-url-encoded-probe`, which no scenario seeds, so the
+    # server should 404. A 200 would only occur if a fixture happened
+    # to use exactly that id after decoding (we accept either outcome
+    # — this check is for decode fidelity, not matching).
+    sess_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        "$base/api/session/%66ixture-url-encoded-probe")
+    if [ "$sess_code" != "404" ] && [ "$sess_code" != "200" ]; then
+        echo "FAIL $name: GET /api/session/<encoded> returned $sess_code (expected 404 or 200)"
+        ok=0
+    fi
+
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$log"
+
+    if [ "$ok" = "1" ]; then
+        echo "PASS $name"
+        pass_count=$((pass_count + 1))
+    else
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+run_scenario ok
+run_scenario warn
+run_scenario over
+run_scenario reset-week
+run_scenario no-data
+run_scenario utc-tz
+run_scenario tz-override
+
+# Local assert helper used only by the banner scenarios below — kept
+# here (rather than at file top) so the existing scenario flow that
+# uses inline ok=0 idioms isn't disturbed.
+assert_contains () {
+    local label="$1" needle="$2" haystack="$3"
+    if printf '%s' "$haystack" | grep -qF "$needle"; then
+        echo "PASS $label"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $label (missing $needle)"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# Wait for a backgrounded `cctally dashboard` to print its full startup
+# banner (sentinel: "Ctrl-C to stop", which appears at the END of every
+# banner shape — single-line loopback and multi-line all-interfaces),
+# then kill it. Polls 100×0.1s for a 10s ceiling so cold CI runners
+# (where 26K-line bin/cctally takes longer to import + bind a socket)
+# don't false-fail on a fixed `sleep 0.5`.
+wait_for_banner_then_kill () {
+    local out="$1" pid="$2"
+    for _ in $(seq 1 100); do
+        if grep -q "Ctrl-C to stop" "$out" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+# Banner scenarios (Task 2). Each launches the dashboard against an
+# ephemeral port + immediate kill; we only care about the startup
+# banner text. All use the `no-data` scenario as a HOME stand-in to
+# avoid bringing up the cache-sync path unnecessarily.
+banner_scratch="$SCRATCH_ROOT/banner"
+mkdir -p "$banner_scratch"
+# Seed a minimal HOME tree so cctally finds STATIC_DIR via the symlink
+# the install path uses; the in-tree static/ is what matters here.
+cp -R "$FIX_DIR/no-data/.local" "$banner_scratch/" 2>/dev/null || true
+
+# 1) default (no --host) -> binds 127.0.0.1 -> loopback single-line banner
+# using "localhost" as the printed alias. (Default flipped from LAN to
+# loopback for public-release safety.)
+HOME="$banner_scratch" TZ=Etc/UTC \
+    "$BIN" dashboard --port 0 --no-sync --no-browser \
+    >"$banner_scratch/banner.txt" 2>&1 &
+banner_pid=$!
+BG_PIDS+=("$banner_pid")
+wait_for_banner_then_kill "$banner_scratch/banner.txt" "$banner_pid"
+
+assert_contains "banner default loopback: single-line localhost" \
+    "serving http://localhost:" "$(cat "$banner_scratch/banner.txt")"
+
+# 2) --host 0.0.0.0 -> binds all interfaces -> all-interfaces banner with
+# both localhost and (forced) LAN URLs. Explicit LAN opt-in.
+HOME="$banner_scratch" TZ=Etc/UTC CCTALLY_TEST_LAN_IP=192.0.2.42 \
+    "$BIN" dashboard --port 0 --no-sync --no-browser --host 0.0.0.0 \
+    >"$banner_scratch/banner-lan.txt" 2>&1 &
+banner_pid=$!
+BG_PIDS+=("$banner_pid")
+wait_for_banner_then_kill "$banner_scratch/banner-lan.txt" "$banner_pid"
+
+content=$(cat "$banner_scratch/banner-lan.txt")
+assert_contains "banner explicit LAN: all-interfaces line" \
+    "serving on all interfaces" "$content"
+assert_contains "banner explicit LAN: localhost line" \
+    "http://localhost:" "$content"
+assert_contains "banner explicit LAN: LAN line" \
+    "http://192.0.2.42:" "$content"
+
+# 3) --host 0.0.0.0 with LAN-IP suppressed -> all-interfaces banner emits
+# localhost line but omits the LAN line entirely (no "(LAN)" trailing tag).
+HOME="$banner_scratch" TZ=Etc/UTC CCTALLY_TEST_LAN_IP=__SUPPRESS__ \
+    "$BIN" dashboard --port 0 --no-sync --no-browser --host 0.0.0.0 \
+    >"$banner_scratch/banner-noLan.txt" 2>&1 &
+banner_pid=$!
+BG_PIDS+=("$banner_pid")
+wait_for_banner_then_kill "$banner_scratch/banner-noLan.txt" "$banner_pid"
+
+content=$(cat "$banner_scratch/banner-noLan.txt")
+assert_contains "banner LAN-suppressed: localhost line present" \
+    "http://localhost:" "$content"
+if printf '%s' "$content" | grep -q "(LAN)"; then
+    echo "FAIL banner LAN-suppressed: LAN line should be omitted"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS banner LAN-suppressed: LAN line omitted"
+    pass_count=$((pass_count + 1))
+fi
+
+# Config-only bind resolution (post-flip coverage): with no `--host` flag
+# passed, `dashboard.bind` in config.json must drive the actual bind.
+# Two scenarios — `lan` and `loopback` — to prove the resolver honors
+# both stored values when the flag is absent. Each uses its own scratch
+# HOME so the config.json overrides don't bleed into prior banner tests.
+
+# 4) config dashboard.bind=lan, no --host -> binds 0.0.0.0 -> all-interfaces banner.
+banner_lan_scratch="$SCRATCH_ROOT/banner-config-lan"
+mkdir -p "$banner_lan_scratch"
+cp -R "$FIX_DIR/no-data/.local" "$banner_lan_scratch/" 2>/dev/null || true
+cat > "$banner_lan_scratch/.local/share/cctally/config.json" <<'JSON'
+{"dashboard": {"bind": "lan"}}
+JSON
+HOME="$banner_lan_scratch" TZ=Etc/UTC CCTALLY_TEST_LAN_IP=192.0.2.42 \
+    "$BIN" dashboard --port 0 --no-sync --no-browser \
+    >"$banner_lan_scratch/banner.txt" 2>&1 &
+banner_pid=$!
+BG_PIDS+=("$banner_pid")
+wait_for_banner_then_kill "$banner_lan_scratch/banner.txt" "$banner_pid"
+
+content=$(cat "$banner_lan_scratch/banner.txt")
+assert_contains "banner config-bind-lan: all-interfaces line" \
+    "serving on all interfaces" "$content"
+assert_contains "banner config-bind-lan: localhost line" \
+    "http://localhost:" "$content"
+assert_contains "banner config-bind-lan: LAN line" \
+    "http://192.0.2.42:" "$content"
+
+# 5) config dashboard.bind=loopback, no --host -> binds 127.0.0.1 -> single-line
+# loopback banner using "localhost" as the printed alias.
+banner_lo_scratch="$SCRATCH_ROOT/banner-config-loopback"
+mkdir -p "$banner_lo_scratch"
+cp -R "$FIX_DIR/no-data/.local" "$banner_lo_scratch/" 2>/dev/null || true
+cat > "$banner_lo_scratch/.local/share/cctally/config.json" <<'JSON'
+{"dashboard": {"bind": "loopback"}}
+JSON
+HOME="$banner_lo_scratch" TZ=Etc/UTC \
+    "$BIN" dashboard --port 0 --no-sync --no-browser \
+    >"$banner_lo_scratch/banner.txt" 2>&1 &
+banner_pid=$!
+BG_PIDS+=("$banner_pid")
+wait_for_banner_then_kill "$banner_lo_scratch/banner.txt" "$banner_pid"
+
+content=$(cat "$banner_lo_scratch/banner.txt")
+assert_contains "banner config-bind-loopback: single-line localhost" \
+    "serving http://localhost:" "$content"
+# Defense in depth: the all-interfaces banner shape must NOT appear when
+# the resolver picked loopback — a regression that silently fell back to
+# LAN on `bind=loopback` would slip through assert_contains alone.
+if printf '%s' "$content" | grep -q "serving on all interfaces"; then
+    echo "FAIL banner config-bind-loopback: all-interfaces line should be absent"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS banner config-bind-loopback: all-interfaces line absent"
+    pass_count=$((pass_count + 1))
+fi
+
+# Sanity: every committed golden-data.json must carry a fully-populated
+# `display` block — `tz`, `resolved_tz`, `offset_label`, `offset_seconds`.
+# Without a non-golden assertion, a regression that drops one of these
+# fields would only trip the harness if the byte-stable diff catches it,
+# which a careless re-baseline could mask. This loop fails the harness
+# even if the goldens were updated to drop the field.
+for golden in "$FIX_DIR"/*/golden-data.json; do
+    name=$(basename "$(dirname "$golden")")
+    for field in tz resolved_tz offset_label offset_seconds; do
+        if ! jq -e ".display | has(\"$field\")" "$golden" >/dev/null 2>&1; then
+            echo "FAIL $name: golden-data.json missing .display.$field"
+            fail_count=$((fail_count + 1))
+        fi
+    done
+done
+
+echo
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" = "0" ]

@@ -1,0 +1,405 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-04-25T19:30:00Z",
+  "subcommand": "diff",
+  "windows": {
+    "a": {
+      "label": "this-week",
+      "kind": "week",
+      "start_at": "2026-04-18T19:30:00Z",
+      "end_at": "2026-04-25T19:30:00Z",
+      "length_days": 7.0,
+      "week_aligned": true,
+      "full_weeks_count": 1,
+      "used_pct_mode": "exact"
+    },
+    "b": {
+      "label": "last-week",
+      "kind": "week",
+      "start_at": "2026-04-11T19:30:00Z",
+      "end_at": "2026-04-18T19:30:00Z",
+      "length_days": 7.0,
+      "week_aligned": true,
+      "full_weeks_count": 1,
+      "used_pct_mode": "exact"
+    }
+  },
+  "mismatched_length": false,
+  "normalization": "none",
+  "options": {
+    "allow_mismatch": false,
+    "show_all": false,
+    "min_delta_usd": 0.1,
+    "min_delta_pct": 1.0,
+    "user_override_threshold": false,
+    "sort": "delta",
+    "top": null,
+    "sections_requested": [
+      "overall",
+      "models",
+      "projects",
+      "cache"
+    ],
+    "sync_run": false
+  },
+  "sections": [
+    {
+      "name": "overall",
+      "scope": "all",
+      "rows": [
+        {
+          "key": "overall:overall",
+          "label": "Overall",
+          "status": "changed",
+          "a": {
+            "cost_usd": 9.404,
+            "tokens_input": 1400000,
+            "tokens_output": 140000,
+            "tokens_cache_read": 280000,
+            "tokens_cache_write": 0,
+            "cache_hit_pct": 16.667,
+            "used_pct": 55.0
+          },
+          "b": {
+            "cost_usd": 4.864,
+            "tokens_input": 1600000,
+            "tokens_output": 160000,
+            "tokens_cache_read": 320000,
+            "tokens_cache_write": 0,
+            "cache_hit_pct": 16.667,
+            "used_pct": 35.0
+          },
+          "delta": {
+            "cost_usd": -4.54,
+            "cost_usd_pct": -48.277,
+            "tokens_input": 200000,
+            "tokens_input_pct": 14.286,
+            "tokens_output": 20000,
+            "tokens_output_pct": 14.286,
+            "tokens_cache_read": 40000,
+            "tokens_cache_read_pct": 14.286,
+            "tokens_cache_write": 0,
+            "tokens_cache_write_pct": null,
+            "cache_hit_pct_pp": 0.0,
+            "used_pct_pp": -20.0
+          },
+          "sort_key": 4.54
+        }
+      ],
+      "hidden_count": 0,
+      "columns": [
+        {
+          "field": "cost_usd",
+          "header": "Cost",
+          "format": "usd",
+          "show_in_overall": true
+        },
+        {
+          "field": "used_pct",
+          "header": "Used %",
+          "format": "pct",
+          "show_in_overall": true
+        },
+        {
+          "field": "cache_hit_pct",
+          "header": "Cache %",
+          "format": "pct",
+          "show_in_overall": true
+        },
+        {
+          "field": "tokens_input",
+          "header": "Tokens",
+          "format": "tokens",
+          "show_in_overall": true
+        }
+      ]
+    },
+    {
+      "name": "models",
+      "scope": "all",
+      "rows": [
+        {
+          "key": "models:claude-sonnet-4-5",
+          "label": "claude-sonnet-4-5",
+          "status": "dropped",
+          "a": {
+            "cost_usd": 5.604,
+            "tokens_input": 900000,
+            "tokens_output": 90000,
+            "tokens_cache_read": 180000,
+            "tokens_cache_write": 0,
+            "cache_hit_pct": 16.667,
+            "used_pct": null
+          },
+          "b": null,
+          "delta": {
+            "cost_usd": -5.604,
+            "cost_usd_pct": null,
+            "tokens_input": -900000,
+            "tokens_input_pct": null,
+            "tokens_output": -90000,
+            "tokens_output_pct": null,
+            "tokens_cache_read": -180000,
+            "tokens_cache_read_pct": null,
+            "tokens_cache_write": 0,
+            "tokens_cache_write_pct": null,
+            "cache_hit_pct_pp": null,
+            "used_pct_pp": null
+          },
+          "sort_key": 5.604
+        },
+        {
+          "key": "models:claude-haiku-4-5",
+          "label": "claude-haiku-4-5",
+          "status": "new",
+          "a": null,
+          "b": {
+            "cost_usd": 1.824,
+            "tokens_input": 1200000,
+            "tokens_output": 120000,
+            "tokens_cache_read": 240000,
+            "tokens_cache_write": 0,
+            "cache_hit_pct": 16.667,
+            "used_pct": null
+          },
+          "delta": {
+            "cost_usd": 1.824,
+            "cost_usd_pct": null,
+            "tokens_input": 1200000,
+            "tokens_input_pct": null,
+            "tokens_output": 120000,
+            "tokens_output_pct": null,
+            "tokens_cache_read": 240000,
+            "tokens_cache_read_pct": null,
+            "tokens_cache_write": 0,
+            "tokens_cache_write_pct": null,
+            "cache_hit_pct_pp": null,
+            "used_pct_pp": null
+          },
+          "sort_key": 1.8239999999999998
+        },
+        {
+          "key": "models:claude-opus-4-7",
+          "label": "claude-opus-4-7",
+          "status": "changed",
+          "a": {
+            "cost_usd": 3.8,
+            "tokens_input": 500000,
+            "tokens_output": 50000,
+            "tokens_cache_read": 100000,
+            "tokens_cache_write": 0,
+            "cache_hit_pct": 16.667,
+            "used_pct": null
+          },
+          "b": {
+            "cost_usd": 3.04,
+            "tokens_input": 400000,
+            "tokens_output": 40000,
+            "tokens_cache_read": 80000,
+            "tokens_cache_write": 0,
+            "cache_hit_pct": 16.667,
+            "used_pct": null
+          },
+          "delta": {
+            "cost_usd": -0.76,
+            "cost_usd_pct": -20.0,
+            "tokens_input": -100000,
+            "tokens_input_pct": -20.0,
+            "tokens_output": -10000,
+            "tokens_output_pct": -20.0,
+            "tokens_cache_read": -20000,
+            "tokens_cache_read_pct": -20.0,
+            "tokens_cache_write": 0,
+            "tokens_cache_write_pct": null,
+            "cache_hit_pct_pp": 0.0,
+            "used_pct_pp": null
+          },
+          "sort_key": 0.7599999999999998
+        }
+      ],
+      "hidden_count": 0,
+      "columns": [
+        {
+          "field": "cost_usd",
+          "header": "Cost",
+          "format": "usd",
+          "show_in_overall": false
+        },
+        {
+          "field": "cache_hit_pct",
+          "header": "Cache %",
+          "format": "pct",
+          "show_in_overall": false
+        },
+        {
+          "field": "tokens_input",
+          "header": "Tokens",
+          "format": "tokens",
+          "show_in_overall": false
+        }
+      ]
+    },
+    {
+      "name": "projects",
+      "scope": "all",
+      "rows": [
+        {
+          "key": "projects:alpha",
+          "label": "alpha",
+          "status": "changed",
+          "a": {
+            "cost_usd": 9.404,
+            "tokens_input": 1400000,
+            "tokens_output": 140000,
+            "tokens_cache_read": 280000,
+            "tokens_cache_write": 0,
+            "cache_hit_pct": 16.667,
+            "used_pct": null
+          },
+          "b": {
+            "cost_usd": 4.864,
+            "tokens_input": 1600000,
+            "tokens_output": 160000,
+            "tokens_cache_read": 320000,
+            "tokens_cache_write": 0,
+            "cache_hit_pct": 16.667,
+            "used_pct": null
+          },
+          "delta": {
+            "cost_usd": -4.54,
+            "cost_usd_pct": -48.277,
+            "tokens_input": 200000,
+            "tokens_input_pct": 14.286,
+            "tokens_output": 20000,
+            "tokens_output_pct": 14.286,
+            "tokens_cache_read": 40000,
+            "tokens_cache_read_pct": 14.286,
+            "tokens_cache_write": 0,
+            "tokens_cache_write_pct": null,
+            "cache_hit_pct_pp": 0.0,
+            "used_pct_pp": null
+          },
+          "sort_key": 4.54
+        }
+      ],
+      "hidden_count": 0,
+      "columns": [
+        {
+          "field": "cost_usd",
+          "header": "Cost",
+          "format": "usd",
+          "show_in_overall": false
+        },
+        {
+          "field": "cache_hit_pct",
+          "header": "Cache %",
+          "format": "pct",
+          "show_in_overall": false
+        },
+        {
+          "field": "tokens_input",
+          "header": "Tokens",
+          "format": "tokens",
+          "show_in_overall": false
+        }
+      ]
+    },
+    {
+      "name": "cache",
+      "scope": "cache-active-entries",
+      "rows": [
+        {
+          "key": "cache:claude",
+          "label": "cache:claude",
+          "status": "changed",
+          "a": {
+            "cost_usd": 9.404,
+            "tokens_input": 1400000,
+            "tokens_output": null,
+            "tokens_cache_read": 280000,
+            "tokens_cache_write": 0,
+            "cache_hit_pct": 16.667,
+            "used_pct": null
+          },
+          "b": {
+            "cost_usd": 4.864,
+            "tokens_input": 1600000,
+            "tokens_output": null,
+            "tokens_cache_read": 320000,
+            "tokens_cache_write": 0,
+            "cache_hit_pct": 16.667,
+            "used_pct": null
+          },
+          "delta": {
+            "cost_usd": -4.54,
+            "cost_usd_pct": -48.277,
+            "tokens_input": 200000,
+            "tokens_input_pct": 14.286,
+            "tokens_output": null,
+            "tokens_output_pct": null,
+            "tokens_cache_read": 40000,
+            "tokens_cache_read_pct": 14.286,
+            "tokens_cache_write": 0,
+            "tokens_cache_write_pct": null,
+            "cache_hit_pct_pp": 0.0,
+            "used_pct_pp": null
+          },
+          "sort_key": 4.54
+        },
+        {
+          "key": "cache:overall",
+          "label": "cache:overall",
+          "status": "changed",
+          "a": {
+            "cost_usd": 9.404,
+            "tokens_input": 1400000,
+            "tokens_output": null,
+            "tokens_cache_read": 280000,
+            "tokens_cache_write": 0,
+            "cache_hit_pct": 16.667,
+            "used_pct": null
+          },
+          "b": {
+            "cost_usd": 4.864,
+            "tokens_input": 1600000,
+            "tokens_output": null,
+            "tokens_cache_read": 320000,
+            "tokens_cache_write": 0,
+            "cache_hit_pct": 16.667,
+            "used_pct": null
+          },
+          "delta": {
+            "cost_usd": -4.54,
+            "cost_usd_pct": -48.277,
+            "tokens_input": 200000,
+            "tokens_input_pct": 14.286,
+            "tokens_output": null,
+            "tokens_output_pct": null,
+            "tokens_cache_read": 40000,
+            "tokens_cache_read_pct": 14.286,
+            "tokens_cache_write": 0,
+            "tokens_cache_write_pct": null,
+            "cache_hit_pct_pp": 0.0,
+            "used_pct_pp": null
+          },
+          "sort_key": 4.54
+        }
+      ],
+      "hidden_count": 0,
+      "columns": [
+        {
+          "field": "cost_usd",
+          "header": "Cost",
+          "format": "usd",
+          "show_in_overall": false
+        },
+        {
+          "field": "cache_hit_pct",
+          "header": "Cache %",
+          "format": "pct",
+          "show_in_overall": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+{"error": "E_BOTH", "detail": "Found both --- public --- and Public-Skip: true. Pick one."}

@@ -1,0 +1,560 @@
+#!/usr/bin/env bash
+# Regression harness for the 5h-window canonicalization fix.
+#
+# Bug class: Anthropic's `rate_limits.5h.resets_at` arrives with
+# seconds-level capture jitter. Two prior incidents (commit
+# 1466d5f's HWM-5h file + commit a2f96f2's DB monotonic clamp)
+# treated the same physical 5h window as multiple distinct windows,
+# blowing away monotonic state. The fix routes both call sites
+# through `_canonical_5h_window_key` (epoch-int) /
+# `_floor_to_ten_minutes` (datetime-typed), which floor at a shared
+# `_FIVE_HOUR_JITTER_FLOOR_SECONDS = 600` granularity.
+#
+# Scenarios:
+#   A — same-window-jitter (HWM file)        : delta=3 s; HWM file
+#                                              sticks at higher value;
+#                                              both calls reduce to
+#                                              same canonical key.
+#   B — same-window-jitter (DB clamp)        : delta=3 s + varied
+#                                              --percent (else dedup
+#                                              swallows row 2); both
+#                                              rows share window_key;
+#                                              row 2's 5h % is clamped
+#                                              up to row 1's value.
+#   C — window-transition                    : delta=18000 s; rows have
+#                                              distinct window_keys;
+#                                              clamp does NOT carry
+#                                              across windows.
+#   D — boundary-edge                        : delta=599 from a 600-
+#                                              aligned base reduces to
+#                                              same key; delta=600
+#                                              reduces to next key.
+#   E — cross-helper consistency             : for many epochs,
+#                                              _canonical_5h_window_key
+#                                              and
+#                                              int(_floor_to_ten_minutes
+#                                              (...).timestamp()) agree.
+#   F — migration-resumability               : insert a row, NULL out its
+#                                              five_hour_window_key, run
+#                                              another cctally subcommand
+#                                              to trigger open_db(); the
+#                                              NULL is backfilled.
+#   G — boundary-straddle (HWM file)         : two samples 1 s apart that
+#                                              straddle a 600-second
+#                                              floor-bucket boundary
+#                                              (1746014999 → floor
+#                                              1746014400; 1746015000 →
+#                                              floor 1746015000). Anchor
+#                                              logic must collapse both
+#                                              to the first-seen key so
+#                                              the HWM file does not
+#                                              regress (spec invariant
+#                                              #3, Δ ≤ 599 → same window).
+#   H — boundary-straddle (DB clamp)         : same straddle epochs +
+#                                              varied --percent + lower
+#                                              5h % on row 2; both rows
+#                                              must share window_key
+#                                              (1746014400) and row 2's
+#                                              five_hour_percent must be
+#                                              clamped up to row 1's
+#                                              value.
+#
+# Pattern (HARNESS_FAKE_HOME_BASE-style): each scenario gets its own
+# scratch HOME under a shared mktemp -d so the in-tree fixture tree
+# stays byte-stable. We don't run a builder — these scenarios drive
+# `cctally record-usage` directly with controlled args.
+#
+# Diagnostics: every cctally invocation appends stdout/stderr to
+# per-scenario log files under the scratch home (cctally-stdout.log,
+# cctally-stderr.log). On any FAIL (or on any non-zero exit) the trap
+# preserves the scratch dir so the logs are available for inspection;
+# on full PASS the dir is cleaned up. This keeps a clean tree on the
+# happy path while still giving a future debugger something to read
+# when a regression hits.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN="$REPO_ROOT/bin/cctally"
+
+# Initialize tallies BEFORE installing the EXIT trap so cleanup_on_exit
+# can reference fail_count even on early failures.
+pass_count=0
+fail_count=0
+
+SCRATCH_DIR=$(mktemp -d -t cctally-5h-canonical-XXXXXX)
+
+cleanup_on_exit () {
+    local rc=$?
+    if [ "$fail_count" -eq 0 ] && [ $rc -eq 0 ]; then
+        rm -rf "$SCRATCH_DIR"
+    else
+        printf 'Scratch dir preserved for debugging: %s\n' "$SCRATCH_DIR" >&2
+    fi
+}
+trap cleanup_on_exit EXIT
+
+# Echo a per-scenario PASS/FAIL line and tally.
+report () {
+    local scenario="$1"; local status="$2"; local detail="${3-}"
+    if [ "$status" = PASS ]; then
+        printf 'PASS %s\n' "$scenario"
+        pass_count=$((pass_count + 1))
+    else
+        printf 'FAIL %s%s\n' "$scenario" "${detail:+: $detail}"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# Bash 3.2-safe assertion. Sets a per-scenario _err flag on failure
+# (callers test the flag and emit a single FAIL line with a useful
+# detail string).
+assert_eq () {
+    local got="$1"; local want="$2"; local label="$3"
+    if [ "$got" != "$want" ]; then
+        _err="${_err:+$_err; }$label expected=$want got=$got"
+    fi
+}
+
+# Begin a scenario: clear the per-scenario `_err` flag, set up the
+# scratch HOME for this scenario, and create it. Sets the parent-
+# shell globals `_err` (cleared) and `home` (path to scratch dir).
+# Each scenario block (curly-braced, NOT subshell-parenthesized) calls
+# this so the variable mutations propagate back.
+begin_scenario () {
+    local name="$1"
+    _err=""
+    home="$SCRATCH_DIR/$name"
+    mkdir -p "$home"
+}
+
+# End a scenario: emit PASS or FAIL based on `_err`. Centralizes the
+# success/failure gate so individual scenarios don't have to nest
+# `if [ -z "$_err" ]; then report PASS; else report FAIL "$_err"; fi`
+# at every exit point.
+finish_scenario () {
+    local name="$1"
+    if [ -z "$_err" ]; then
+        report "$name" PASS
+    else
+        report "$name" FAIL "$_err"
+    fi
+}
+
+# Run a `cctally record-usage` invocation in an isolated HOME.
+# Stdout and stderr are appended to per-home log files so a future
+# debugger can inspect what cctally said when a regression hits.
+record_usage () {
+    local home="$1"; shift
+    HOME="$home" TZ=Etc/UTC "$BIN" record-usage "$@" \
+        >>"$home/cctally-stdout.log" 2>>"$home/cctally-stderr.log"
+}
+
+# SQLite query helper — reads from $home/.local/share/cctally/stats.db.
+sql () {
+    local home="$1"; local q="$2"
+    sqlite3 "$home/.local/share/cctally/stats.db" "$q"
+}
+
+# A 600-aligned base epoch. 1746014400 = 2025-04-30T12:00:00Z.
+# 1746014400 % 600 == 0, so it is its own canonical key.
+BASE=1746014400
+
+# ─── Scenario A: same-window-jitter, HWM file ─────────────────────────
+{
+    begin_scenario A
+
+    # Call 1: 5h_pct=57, resets=BASE.
+    record_usage "$home" \
+        --percent 30 --resets-at 1700000000 \
+        --five-hour-percent 57 --five-hour-resets-at "$BASE"
+
+    # Call 2: 5h_pct=56 (LOWER), resets=BASE+3 (3 s jitter, same bucket).
+    # We bump --percent to bypass the dedup at lines ~12990–13006 that
+    # swallows the second row when both weekly_percent and
+    # five_hour_percent equal the most recent row.
+    record_usage "$home" \
+        --percent 31 --resets-at 1700000000 \
+        --five-hour-percent 56 --five-hour-resets-at "$((BASE + 3))"
+
+    hwm_file="$home/.local/share/cctally/hwm-5h"
+    if [ ! -f "$hwm_file" ]; then
+        _err="hwm-5h file was not written"
+    else
+        line=$(cat "$hwm_file")
+        # parts5[0] = canonical key for both inputs (BASE, since
+        # BASE % 600 == 0 and (BASE+3) % 600 == 3 → floor still BASE).
+        # parts5[1] = 57.0 (the higher of the two recorded percents).
+        stored_key=$(printf '%s\n' "$line" | awk '{print $1}')
+        stored_pct=$(printf '%s\n' "$line" | awk '{print $2}')
+        assert_eq "$stored_key" "$BASE" "stored_key"
+        assert_eq "$stored_pct" "57.0"  "stored_pct"
+    fi
+
+    finish_scenario A
+}
+
+# ─── Scenario B: same-window-jitter, DB clamp ─────────────────────────
+{
+    begin_scenario B
+
+    # Call 1: weekly=30, 5h=57, resets=BASE.
+    record_usage "$home" \
+        --percent 30 --resets-at 1700000000 \
+        --five-hour-percent 57 --five-hour-resets-at "$BASE"
+
+    # Call 2: weekly=31 (varied to bypass dedup), 5h=56 (LOWER),
+    # resets=BASE+3 (same canonical bucket).
+    record_usage "$home" \
+        --percent 31 --resets-at 1700000000 \
+        --five-hour-percent 56 --five-hour-resets-at "$((BASE + 3))"
+
+    # Two rows in weekly_usage_snapshots.
+    row_count=$(sql "$home" "SELECT COUNT(*) FROM weekly_usage_snapshots;")
+    assert_eq "$row_count" "2" "row_count"
+
+    # Both rows share the same five_hour_window_key (= BASE).
+    distinct_keys=$(sql "$home" \
+        "SELECT COUNT(DISTINCT five_hour_window_key) FROM weekly_usage_snapshots;")
+    assert_eq "$distinct_keys" "1" "distinct_keys"
+
+    common_key=$(sql "$home" \
+        "SELECT DISTINCT five_hour_window_key FROM weekly_usage_snapshots;")
+    assert_eq "$common_key" "$BASE" "common_key"
+
+    # Row 2's five_hour_percent is clamped UP to row 1's value (57.0),
+    # not the API-supplied 56.0.
+    row2_5h=$(sql "$home" \
+        "SELECT five_hour_percent FROM weekly_usage_snapshots ORDER BY id LIMIT 1 OFFSET 1;")
+    assert_eq "$row2_5h" "57.0" "row2_five_hour_percent"
+
+    finish_scenario B
+}
+
+# ─── Scenario C: window-transition ────────────────────────────────────
+{
+    begin_scenario C
+
+    NEXT=$((BASE + 18000))   # +5h, next physical window
+
+    # Call 1: 5h=57 in BASE window.
+    record_usage "$home" \
+        --percent 30 --resets-at 1700000000 \
+        --five-hour-percent 57 --five-hour-resets-at "$BASE"
+
+    # Call 2: 5h=10 (much lower) in NEXT window.
+    record_usage "$home" \
+        --percent 31 --resets-at 1700000000 \
+        --five-hour-percent 10 --five-hour-resets-at "$NEXT"
+
+    # Two distinct window keys.
+    distinct_keys=$(sql "$home" \
+        "SELECT COUNT(DISTINCT five_hour_window_key) FROM weekly_usage_snapshots;")
+    assert_eq "$distinct_keys" "2" "distinct_keys"
+
+    # Row 2's five_hour_percent is the raw 10.0 — clamp does NOT carry
+    # across windows.
+    row2_5h=$(sql "$home" \
+        "SELECT five_hour_percent FROM weekly_usage_snapshots ORDER BY id LIMIT 1 OFFSET 1;")
+    assert_eq "$row2_5h" "10.0" "row2_five_hour_percent"
+
+    row2_key=$(sql "$home" \
+        "SELECT five_hour_window_key FROM weekly_usage_snapshots ORDER BY id LIMIT 1 OFFSET 1;")
+    assert_eq "$row2_key" "$NEXT" "row2_window_key"
+
+    finish_scenario C
+}
+
+# ─── Scenario D: boundary-edge (599 vs 600) ───────────────────────────
+# Pure-Python check via cctally's own helper. We import the module and
+# exercise _canonical_5h_window_key on a 600-aligned base.
+{
+    begin_scenario D
+
+    out=$(REPO_ROOT_RESOLVED="$REPO_ROOT" TZ=Etc/UTC python3 - <<'PY'
+import importlib.util, os, pathlib
+
+import sys as _sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader(
+    "cctally_mod",
+    str(pathlib.Path(os.environ["REPO_ROOT_RESOLVED"]) / "bin" / "cctally"),
+)
+spec = importlib.util.spec_from_loader("cctally_mod", loader)
+mod = importlib.util.module_from_spec(spec)
+# @dataclass needs the module registered in sys.modules before exec_module
+# so cls.__module__ resolves correctly during class construction.
+_sys.modules["cctally_mod"] = mod
+loader.exec_module(mod)
+
+BASE = 1746014400
+assert BASE % 600 == 0, "BASE must be 600-aligned for this test"
+canon = mod._canonical_5h_window_key
+
+print("D599_a", canon(BASE))
+print("D599_b", canon(BASE + 599))
+print("D600_c", canon(BASE + 600))
+PY
+)
+
+    a=$(printf '%s\n' "$out" | awk '/^D599_a/{print $2}')
+    b=$(printf '%s\n' "$out" | awk '/^D599_b/{print $2}')
+    c=$(printf '%s\n' "$out" | awk '/^D600_c/{print $2}')
+
+    assert_eq "$a" "$BASE" "delta599_a"
+    assert_eq "$b" "$BASE" "delta599_b_same_bucket"
+    assert_eq "$c" "$((BASE + 600))" "delta600_c_next_bucket"
+
+    finish_scenario D
+}
+
+# ─── Scenario E: cross-helper consistency ─────────────────────────────
+# For a varied set of epochs (aligned, mid-bucket, near-edge, real
+# Anthropic-flavored), assert
+#   _canonical_5h_window_key(e) == int(_floor_to_ten_minutes(
+#                                   datetime.fromtimestamp(e, UTC)
+#                               ).timestamp())
+{
+    begin_scenario E
+
+    out=$(REPO_ROOT_RESOLVED="$REPO_ROOT" TZ=Etc/UTC python3 - <<'PY'
+import datetime as dt, importlib.util, os, pathlib
+
+import sys as _sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader(
+    "cctally_mod",
+    str(pathlib.Path(os.environ["REPO_ROOT_RESOLVED"]) / "bin" / "cctally"),
+)
+spec = importlib.util.spec_from_loader("cctally_mod", loader)
+mod = importlib.util.module_from_spec(spec)
+# @dataclass needs the module registered in sys.modules before exec_module
+# so cls.__module__ resolves correctly during class construction.
+_sys.modules["cctally_mod"] = mod
+loader.exec_module(mod)
+
+UTC = dt.timezone.utc
+test_epochs = [
+    1746014400,  # 600-aligned (2025-04-30T12:00:00Z); real-Anthropic flavor
+    1746014403,  #   +3s         mid-bucket near floor
+    1746014999,  #   +599s       still same bucket
+    1746015000,  #   +600s       next bucket
+    1746014401,  #   +1s         mid-bucket
+    1700000000,  #              random non-aligned
+    1700000599,  #              edge of bucket
+    1700000600,  #              start of next bucket
+    1234560000,  #              older epoch, 600-aligned
+    1234560601,  #              just past next bucket
+    1746000000,  #              another 600-aligned reference
+    9876543210,  #              far-future arbitrary
+]
+
+failures = []
+for e in test_epochs:
+    d = dt.datetime.fromtimestamp(e, UTC)
+    canon = mod._canonical_5h_window_key(e)
+    floored = int(mod._floor_to_ten_minutes(d).timestamp())
+    if canon != floored:
+        failures.append((e, canon, floored))
+
+if failures:
+    for f in failures:
+        print("FAIL", *f)
+else:
+    print("OK", len(test_epochs))
+PY
+)
+    if ! printf '%s\n' "$out" | grep -q '^OK '; then
+        # Compose detail from any "FAIL" lines.
+        _err=$(printf '%s\n' "$out" | tr '\n' '; ')
+    fi
+
+    finish_scenario E
+}
+
+# ─── Scenario F: migration-resumability ───────────────────────────────
+# Insert a row, NULL out five_hour_window_key, then trigger open_db()
+# via any cctally subcommand. The resumable backfill in commit 5ac662a
+# should re-fill the NULL.
+{
+    begin_scenario F
+
+    record_usage "$home" \
+        --percent 30 --resets-at 1700000000 \
+        --five-hour-percent 57 --five-hour-resets-at "$BASE"
+
+    pre_count=$(sql "$home" \
+        "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE five_hour_window_key IS NOT NULL;")
+    assert_eq "$pre_count" "1" "pre_count_non_null"
+
+    sql "$home" "UPDATE weekly_usage_snapshots SET five_hour_window_key = NULL;" >/dev/null
+
+    null_count=$(sql "$home" \
+        "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE five_hour_window_key IS NULL;")
+    assert_eq "$null_count" "1" "null_count_after_clear"
+
+    # Trigger open_db() via a no-op subcommand. `weekly --json` is
+    # cheap and doesn't write to weekly_usage_snapshots. May exit
+    # non-zero on empty data; that's fine here — we only need open_db()
+    # to fire and the resumable-backfill path to run.
+    HOME="$home" TZ=Etc/UTC "$BIN" weekly --json \
+        >>"$home/cctally-stdout.log" 2>>"$home/cctally-stderr.log" || true
+
+    post_null=$(sql "$home" \
+        "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE five_hour_window_key IS NULL;")
+    assert_eq "$post_null" "0" "post_null_count"
+
+    post_key=$(sql "$home" \
+        "SELECT five_hour_window_key FROM weekly_usage_snapshots LIMIT 1;")
+    assert_eq "$post_key" "$BASE" "backfilled_key"
+
+    finish_scenario F
+}
+
+# ─── Scenario G: boundary-straddle, HWM file ─────────────────────────
+# Two samples 1 second apart straddling a 600-second floor-bucket
+# boundary. Pure-floor would store key=1746014400 for sample 1 and
+# key=1746015000 for sample 2; the prior-anchor canonicalizer must
+# collapse them to the first-seen key (1746014400) so the HWM file
+# does not regress when sample 2 reports a lower percent.
+{
+    begin_scenario G
+
+    BOUND_NEAR=1746014999    # 2025-04-30T12:09:59Z; floor → 1746014400
+    BOUND_PAST=1746015000    # 2025-04-30T12:10:00Z; floor → 1746015000
+
+    # Call 1: 5h_pct=57, resets=BOUND_NEAR. Stores row with
+    # five_hour_window_key=1746014400.
+    record_usage "$home" \
+        --percent 30 --resets-at 1700000000 \
+        --five-hour-percent 57 --five-hour-resets-at "$BOUND_NEAR"
+
+    # Call 2: 5h_pct=56 (LOWER), resets=BOUND_PAST (1 s later, across
+    # the 600-second boundary). Anchor logic must reuse 1746014400.
+    record_usage "$home" \
+        --percent 31 --resets-at 1700000000 \
+        --five-hour-percent 56 --five-hour-resets-at "$BOUND_PAST"
+
+    hwm_file="$home/.local/share/cctally/hwm-5h"
+    if [ ! -f "$hwm_file" ]; then
+        _err="hwm-5h file was not written"
+    else
+        line=$(cat "$hwm_file")
+        stored_key=$(printf '%s\n' "$line" | awk '{print $1}')
+        stored_pct=$(printf '%s\n' "$line" | awk '{print $2}')
+        # Both calls collapse to the first-seen anchor key.
+        assert_eq "$stored_key" "1746014400" "stored_key_first_seen_anchor"
+        # Sample 1's 57.0 wins (higher); sample 2's lower 56.0 must not
+        # overwrite (the equality match against str(five_resets_key)
+        # picks up existing_hwm5=57.0 and the >= guard suppresses write).
+        assert_eq "$stored_pct" "57.0" "stored_pct_no_regression"
+    fi
+
+    finish_scenario G
+}
+
+# ─── Scenario H: boundary-straddle, DB clamp ─────────────────────────
+# Mirror of G for the DB layer. Both rows must end up with the same
+# five_hour_window_key (1746014400) and row 2's five_hour_percent must
+# be clamped up to row 1's higher value.
+{
+    begin_scenario H
+
+    BOUND_NEAR=1746014999
+    BOUND_PAST=1746015000
+
+    # Call 1: weekly=30, 5h=57, resets=BOUND_NEAR.
+    record_usage "$home" \
+        --percent 30 --resets-at 1700000000 \
+        --five-hour-percent 57 --five-hour-resets-at "$BOUND_NEAR"
+
+    # Call 2: weekly=31 (varied to bypass dedup), 5h=56 (LOWER),
+    # resets=BOUND_PAST. Anchor logic must keep both rows in the same
+    # window_key bucket so the clamp can fire.
+    record_usage "$home" \
+        --percent 31 --resets-at 1700000000 \
+        --five-hour-percent 56 --five-hour-resets-at "$BOUND_PAST"
+
+    row_count=$(sql "$home" "SELECT COUNT(*) FROM weekly_usage_snapshots;")
+    assert_eq "$row_count" "2" "row_count"
+
+    distinct_keys=$(sql "$home" \
+        "SELECT COUNT(DISTINCT five_hour_window_key) FROM weekly_usage_snapshots;")
+    assert_eq "$distinct_keys" "1" "distinct_keys_boundary_straddle"
+
+    common_key=$(sql "$home" \
+        "SELECT DISTINCT five_hour_window_key FROM weekly_usage_snapshots;")
+    assert_eq "$common_key" "1746014400" "common_key_first_seen_anchor"
+
+    row2_5h=$(sql "$home" \
+        "SELECT five_hour_percent FROM weekly_usage_snapshots ORDER BY id LIMIT 1 OFFSET 1;")
+    assert_eq "$row2_5h" "57.0" "row2_clamp_across_boundary"
+
+    finish_scenario H
+}
+
+# ─── Scenario I: interleaved-anchor (F4 fix) ──────────────────────────
+# Regression for the F4 fix: the prior-anchor lookup must not be
+# fooled by an out-of-order older snapshot. Sequence:
+#
+#   call 1 — fresh sample at BOUND_NEAR (window A; floors to 1746014400)
+#   call 2 — older-window glitch sample at OLD (window B; ~5h earlier)
+#   call 3 — fresh sample at BOUND_PAST (1 s past bucket boundary; same
+#            physical window as call 1)
+#
+# Pre-fix, call 3's prior-anchor lookup returned call 2's row (B) and
+# the |epoch - prior| > 600 distance check then forked a NEW window
+# key for what was actually still window A. The blocks-table-first
+# anchor lookup (Tier 1) collapses call 3 onto window A's existing
+# block row instead.
+{
+    begin_scenario I
+
+    BOUND_NEAR=1746014999    # 2026-04-30T12:09:59Z; floors to 1746014400
+    BOUND_PAST=1746015000    # 2026-04-30T12:10:00Z; floors to 1746015000
+    OLD=1745996400           # 2026-04-30T07:00:00Z; ~5h earlier (different window)
+
+    # Call 1: 5h_pct=20 in window A (1746014400). Materializes a row in
+    # five_hour_blocks via maybe_update_five_hour_block.
+    record_usage "$home" \
+        --percent 30 --resets-at 1700000000 \
+        --five-hour-percent 20 --five-hour-resets-at "$BOUND_NEAR"
+
+    # Call 2: 5h_pct=85 with an OLD resets_at (different physical
+    # window). Pre-fix, this snapshot would become the prior-anchor for
+    # call 3.
+    record_usage "$home" \
+        --percent 31 --resets-at 1700000000 \
+        --five-hour-percent 85 --five-hour-resets-at "$OLD"
+
+    # Call 3: 5h_pct=21, resets=BOUND_PAST (1 s past the boundary,
+    # SAME physical window as call 1). Tier 1 anchor lookup hits call
+    # 1's block row (within ±1800s) and reuses key 1746014400.
+    record_usage "$home" \
+        --percent 32 --resets-at 1700000000 \
+        --five-hour-percent 21 --five-hour-resets-at "$BOUND_PAST"
+
+    # The latest snapshot must collapse to window A's key, not fork.
+    latest_key=$(sql "$home" \
+        "SELECT five_hour_window_key FROM weekly_usage_snapshots ORDER BY id DESC LIMIT 1;")
+    assert_eq "$latest_key" "1746014400" "latest_snapshot_window_key_after_interleave"
+
+    # Exactly two distinct windows in five_hour_blocks: A (1746014400)
+    # and B (whatever OLD floored to). Without the fix, a third would
+    # appear from the boundary-straddle fork.
+    distinct_blocks=$(sql "$home" \
+        "SELECT COUNT(DISTINCT five_hour_window_key) FROM five_hour_blocks;")
+    assert_eq "$distinct_blocks" "2" "block_keys_no_fork"
+
+    # Window A's block exists with key 1746014400 (verifies Tier 1
+    # actually wrote a row there, not that the test silently merged).
+    has_a=$(sql "$home" \
+        "SELECT five_hour_window_key FROM five_hour_blocks WHERE five_hour_window_key = 1746014400;")
+    assert_eq "$has_a" "1746014400" "window_a_block_present"
+
+    finish_scenario I
+}
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

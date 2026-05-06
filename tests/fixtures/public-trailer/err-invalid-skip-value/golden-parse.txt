@@ -1,0 +1,1 @@
+{"error": "E_INVALID_SKIP_VALUE", "detail": "Public-Skip: only 'true' is accepted; got 'false'"}

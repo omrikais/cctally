@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# Harness for the alert content builders and osascript dispatch helper
+# (threshold-actions Task 3).
+#
+# Validates:
+#   - _alert_text_weekly / _alert_text_five_hour return (title, subtitle, body)
+#     tuples whose datetime renders flow through format_display_dt.
+#   - _dispatch_alert_notification returns "queued" on successful Popen and
+#     "spawn_error: <ExcType>: <msg>" when the factory raises.
+#   - alerts.log holds exactly one line per dispatch attempt (no
+#     contradictory dual-line writes — Codex P1#2 fix).
+#
+# Run in-process via SourceFileLoader so we can drive a temp HOME for
+# alerts.log resolution before module import. The cctally module computes
+# APP_DIR = Path.home() / ".local/share/cctally" at import time, so a
+# fresh HOME is sufficient — no separate CCTALLY_HOME env var is needed.
+
+set -uo pipefail
+
+cd "$(dirname "$0")/.."
+
+pass_count=0
+fail_count=0
+
+assert_eq() {
+    local label="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "PASS: $label"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: $label"
+        echo "  expected: $expected"
+        echo "  actual:   $actual"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+assert_contains() {
+    local label="$1" needle="$2" haystack="$3"
+    case "$haystack" in
+        *"$needle"*)
+            echo "PASS: $label"
+            pass_count=$((pass_count + 1))
+            ;;
+        *)
+            echo "FAIL: $label"
+            echo "  expected to contain: $needle"
+            echo "  actual: $haystack"
+            fail_count=$((fail_count + 1))
+            ;;
+    esac
+}
+
+# All checks happen inside a single Python heredoc; the script prints
+# "MARKER:<label>:<value>" lines that the bash side reads back.
+out=$(TZ=Etc/UTC python3 - <<'PY' 2>&1
+import os, sys, tempfile, importlib.util, importlib.machinery, pathlib
+
+# Set HOME *before* loading cctally so APP_DIR (computed at import time)
+# resolves under the scratch dir.
+tmp = tempfile.mkdtemp(prefix="cctally-alerts-dispatch-")
+os.environ["HOME"] = tmp
+
+loader = importlib.machinery.SourceFileLoader('cctally', 'bin/cctally')
+spec = importlib.util.spec_from_loader('cctally', loader)
+m = importlib.util.module_from_spec(spec)
+sys.modules['cctally'] = m
+loader.exec_module(m)
+
+def emit(label, value):
+    print(f"MARKER:{label}:{value}")
+
+# ---------------------------------------------------------------- weekly text
+weekly_payload = {
+    "axis": "weekly",
+    "threshold": 90,
+    "crossed_at": "2026-04-29T14:32:11Z",
+    "context": {
+        "week_start_date": "2026-04-27",
+        "cumulative_cost_usd": 47.32,
+        "dollars_per_percent": 0.53,
+    },
+}
+title, subtitle, body = m._alert_text_weekly(weekly_payload, tz=None)
+emit("weekly.title", title)
+emit("weekly.subtitle", subtitle)
+emit("weekly.body", body)
+
+# Regression: weekly subtitle's `week_start_date` is a CALENDAR DAY,
+# not a clock instant. Tagging it as UTC-midnight and routing through
+# format_display_dt(..., tz) used to shift the rendered weekday/day for
+# non-UTC display tz (e.g. PDT shifted "Sun, Apr 26" instead of the
+# canonical "Mon, Apr 27" since 2026-04-27 is a Monday). Verify the
+# rendered weekday/day matches the unshifted calendar value across
+# both tz=None and a west-of-UTC zone.
+try:
+    from zoneinfo import ZoneInfo as _ZI
+    pdt = _ZI("America/Los_Angeles")
+except Exception:
+    pdt = None
+_, subtitle_utc, _ = m._alert_text_weekly(weekly_payload, tz=None)
+emit("weekly.subtitle.utc", subtitle_utc)
+if pdt is not None:
+    _, subtitle_pdt, _ = m._alert_text_weekly(weekly_payload, tz=pdt)
+    emit("weekly.subtitle.pdt", subtitle_pdt)
+else:
+    emit("weekly.subtitle.pdt", subtitle_utc)
+
+# ---------------------------------------------------------------- 5h text
+fh_payload = {
+    "axis": "five_hour",
+    "threshold": 95,
+    "crossed_at": "2026-04-29T19:32:11Z",
+    "context": {
+        "five_hour_window_key": 1714419000,
+        "block_start_at": "2026-04-29T14:32:00Z",
+        "block_cost_usd": 3.87,
+        "primary_model": "claude-sonnet-4-6",
+    },
+}
+title, subtitle, body = m._alert_text_five_hour(fh_payload, tz=None)
+emit("fh.title", title)
+emit("fh.subtitle", subtitle)
+emit("fh.body", body)
+
+# ---------------------------------------------------------------- dispatch
+class FakePopen:
+    def __init__(self, cmd, **kw):
+        self.cmd = cmd
+        self.kw = kw
+
+class RaisingPopen:
+    def __init__(self, cmd, **kw):
+        raise FileNotFoundError("no osascript")
+
+status_ok = m._dispatch_alert_notification(weekly_payload, popen_factory=FakePopen, mode="real")
+emit("dispatch.queued.status", status_ok)
+
+status_err = m._dispatch_alert_notification(weekly_payload, popen_factory=RaisingPopen, mode="real")
+emit("dispatch.spawn_error.status", status_err)
+
+# ---------------------------------------------------------------- log
+log_path = pathlib.Path(tmp) / ".local" / "share" / "cctally" / "logs" / "alerts.log"
+emit("log.exists", "yes" if log_path.exists() else "no")
+if log_path.exists():
+    lines = log_path.read_text().splitlines()
+    emit("log.line_count", str(len(lines)))
+    emit("log.line0", lines[0] if len(lines) > 0 else "")
+    emit("log.line1", lines[1] if len(lines) > 1 else "")
+PY
+)
+ec=$?
+
+if [ $ec -ne 0 ]; then
+    echo "FAIL: python harness exited non-zero ($ec)"
+    echo "$out"
+    fail_count=$((fail_count + 1))
+fi
+
+# Helper: extract a marker value (everything after the second colon, verbatim).
+get_marker() {
+    local label="$1"
+    # Use python to avoid awk's field-rebuild OFS quirk on values containing ':'.
+    echo "$out" | python3 -c "
+import sys
+prefix = 'MARKER:$label:'
+for line in sys.stdin.read().splitlines():
+    if line.startswith(prefix):
+        print(line[len(prefix):])
+        break
+"
+}
+
+weekly_title=$(get_marker "weekly.title")
+weekly_subtitle=$(get_marker "weekly.subtitle")
+weekly_body=$(get_marker "weekly.body")
+
+assert_contains "weekly title contains 90" "90" "$weekly_title"
+assert_contains "weekly title contains Weekly" "Weekly" "$weekly_title"
+case "$weekly_subtitle" in
+    *"Apr 27"*|*"2026-04-27"*)
+        echo "PASS: weekly subtitle contains Apr 27 or 2026-04-27"
+        pass_count=$((pass_count + 1))
+        ;;
+    *)
+        echo "FAIL: weekly subtitle missing date marker (Apr 27 / 2026-04-27)"
+        echo "  actual: $weekly_subtitle"
+        fail_count=$((fail_count + 1))
+        ;;
+esac
+assert_contains "weekly body contains \$47.32" "\$47.32" "$weekly_body"
+assert_contains "weekly body contains \$0.53" "\$0.53" "$weekly_body"
+
+# Calendar-day stability: 2026-04-27 is a Monday. Subtitle MUST render
+# "Mon, Apr 27" under both UTC and a west-of-UTC display tz; the prior
+# UTC-tag-then-format_display_dt pattern shifted to "Sun, Apr 26" for
+# America/Los_Angeles.
+weekly_subtitle_utc=$(get_marker "weekly.subtitle.utc")
+weekly_subtitle_pdt=$(get_marker "weekly.subtitle.pdt")
+assert_contains "weekly subtitle (UTC tz) contains 'Mon, Apr 27'" \
+    "Mon, Apr 27" "$weekly_subtitle_utc"
+assert_contains "weekly subtitle (PDT tz) contains 'Mon, Apr 27' (no UTC-shift)" \
+    "Mon, Apr 27" "$weekly_subtitle_pdt"
+
+fh_title=$(get_marker "fh.title")
+fh_body=$(get_marker "fh.body")
+assert_contains "5h title contains 95" "95" "$fh_title"
+fh_title_lower=$(echo "$fh_title" | tr '[:upper:]' '[:lower:]')
+assert_contains "5h title contains 5h-block (case-insensitive)" "5h-block" "$fh_title_lower"
+assert_contains "5h body contains \$3.87" "\$3.87" "$fh_body"
+assert_contains "5h body contains claude-sonnet-4-6" "claude-sonnet-4-6" "$fh_body"
+
+dispatch_ok=$(get_marker "dispatch.queued.status")
+dispatch_err=$(get_marker "dispatch.spawn_error.status")
+assert_eq "dispatch.queued returns 'queued'" "queued" "$dispatch_ok"
+case "$dispatch_err" in
+    "spawn_error: FileNotFoundError"*)
+        echo "PASS: dispatch.spawn_error returns 'spawn_error: FileNotFoundError: ...'"
+        pass_count=$((pass_count + 1))
+        ;;
+    *)
+        echo "FAIL: dispatch.spawn_error wrong prefix"
+        echo "  actual: $dispatch_err"
+        fail_count=$((fail_count + 1))
+        ;;
+esac
+
+log_exists=$(get_marker "log.exists")
+log_count=$(get_marker "log.line_count")
+log_line0=$(get_marker "log.line0")
+log_line1=$(get_marker "log.line1")
+
+assert_eq "alerts.log exists" "yes" "$log_exists"
+assert_eq "alerts.log has exactly 2 lines" "2" "$log_count"
+assert_contains "alerts.log line 1 contains 'queued'" "queued" "$log_line0"
+assert_contains "alerts.log line 2 contains 'spawn_error'" "spawn_error" "$log_line1"
+# Reinforce the Codex P1#2 invariant: line 1 must NOT also carry 'spawn_error'
+case "$log_line0" in
+    *"spawn_error"*)
+        echo "FAIL: alerts.log line 1 contradicts itself ('queued' AND 'spawn_error' on same line)"
+        fail_count=$((fail_count + 1))
+        ;;
+    *)
+        echo "PASS: alerts.log line 1 has single terminal status (no contradiction)"
+        pass_count=$((pass_count + 1))
+        ;;
+esac
+
+# ---------------------------------------------------------------- alerts test CLI
+# Drives the actual CLI (subprocess) under a fresh HOME so APP_DIR resolves
+# under the scratch dir. Asserts the mode=test discriminator separates this
+# log line from real-alert dispatches.
+TMP_CLI=$(mktemp -d -t cctally-alerts-cli-XXXXXX)
+HOME="$TMP_CLI" bin/cctally alerts test --axis weekly --threshold 90 >/dev/null 2>&1
+cli_ec=$?
+if [ $cli_ec -eq 0 ] || [ $cli_ec -eq 1 ] || [ $cli_ec -eq 3 ]; then
+    echo "PASS: alerts test CLI exited with documented status ($cli_ec)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: alerts test CLI exited with unexpected status $cli_ec"
+    fail_count=$((fail_count + 1))
+fi
+
+cli_log="$TMP_CLI/.local/share/cctally/logs/alerts.log"
+if [ -f "$cli_log" ]; then
+    echo "PASS: alerts test CLI wrote alerts.log"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: alerts test CLI did not write alerts.log at $cli_log"
+    fail_count=$((fail_count + 1))
+fi
+
+if [ -f "$cli_log" ] && grep -q $'\ttest\t' "$cli_log"; then
+    echo "PASS: alerts test CLI log contains mode=test"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: alerts test CLI log missing mode=test tab-delimited field"
+    [ -f "$cli_log" ] && echo "  contents:" && cat "$cli_log"
+    fail_count=$((fail_count + 1))
+fi
+
+if [ -f "$cli_log" ] && grep -q $'\treal\t' "$cli_log"; then
+    echo "FAIL: alerts test CLI log contains mode=real (should be mode=test only)"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: alerts test CLI log does NOT contain mode=real"
+    pass_count=$((pass_count + 1))
+fi
+
+rm -rf "$TMP_CLI"
+
+echo
+echo "passed: $pass_count   failed: $fail_count"
+[ $fail_count -eq 0 ]

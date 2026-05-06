@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin wrapper: `cctally-project` → `cctally project`.
+# Mirrors `cctally-forecast` / `cctally-dollar-per-percent` pattern.
+set -euo pipefail
+exec "$(dirname "$0")/cctally" project "$@"

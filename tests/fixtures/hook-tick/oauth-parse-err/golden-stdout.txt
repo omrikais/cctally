@@ -1,0 +1,12 @@
+[cache] migrated codex cache — re-ingesting
+[1/4] Local sync (sync_cache)
+      → ingested 0 new entries
+[2/4] Throttle check
+      → throttle file: /FAKE/.local/share/cctally/hook-tick.last-fetch
+      → mtime: Ks ago
+      → threshold: 30s → fetch
+[3/4] OAuth refresh
+      → status: err(parse)
+[4/4] Log written → /FAKE/.local/share/cctally/logs/hook-tick.log
+
+Done in N ms.

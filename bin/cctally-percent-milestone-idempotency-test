@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# Idempotency harness for `insert_percent_milestone`.
+#
+# Verifies that two calls with the same (week_start_date, percent_threshold)
+# pair are race-safe under concurrent record-usage instances:
+#   - first call returns rowcount 1 (genuinely new crossing)
+#   - second call returns rowcount 0 (UNIQUE collision, silently ignored)
+#   - exactly one row remains in `percent_milestones`
+#   - no `sqlite3.IntegrityError` is raised
+#
+# Aligns the weekly-milestone insert with the 5h-milestone INSERT OR IGNORE
+# pattern (`five_hour_milestones` already uses this approach). Codex review
+# P1#1 (spec §3.1, plan Task 0).
+#
+# Pattern: pure-Python via dynamic-import of bin/cctally; uses HARNESS_FAKE_HOME
+# scratch dir for isolation (matches the rest of the harness suite — see
+# CLAUDE.md "Harness scratch-dir pattern"). DB is `$HOME/.local/share/cctally/
+# stats.db`, freshly created by `open_db()` because APP_DIR is keyed off
+# `pathlib.Path.home()` at module import time.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+pass_count=0
+fail_count=0
+
+assert_eq () {
+    local label="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "PASS $label"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $label"
+        printf '  expected: %s\n  actual:   %s\n' "$expected" "$actual"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# Fresh HOME so APP_DIR (= $HOME/.local/share/cctally) is empty and
+# stats.db is created from scratch by open_db().
+SCRATCH="$(mktemp -d -t cctally-pms-idempotency.XXXXXX)"
+trap 'rm -rf "$SCRATCH"' EXIT
+
+out=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$SCRATCH" TZ=Etc/UTC python3 - <<'PY'
+import importlib.util
+import os
+import pathlib
+import sys
+import traceback
+
+from importlib.machinery import SourceFileLoader
+
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
+spec = importlib.util.spec_from_loader("cctally_mod", loader)
+mod = importlib.util.module_from_spec(spec)
+# @dataclass needs the module registered in sys.modules before exec_module
+# so cls.__module__ resolves correctly during class construction.
+sys.modules["cctally_mod"] = mod
+loader.exec_module(mod)
+
+# Sanity: APP_DIR must point inside our scratch HOME (else open_db would
+# touch the dev's real ~/.local/share/cctally/stats.db).
+assert str(mod.APP_DIR).startswith(os.environ["HOME"]), (
+    f"APP_DIR {mod.APP_DIR} did not land under HOME={os.environ['HOME']!r}; "
+    "harness isolation broken"
+)
+
+mod.APP_DIR.mkdir(parents=True, exist_ok=True)
+
+conn = mod.open_db()
+try:
+    captured_at = mod.now_utc_iso()
+    cur = conn.execute(
+        "INSERT INTO weekly_usage_snapshots "
+        "(captured_at_utc, week_start_date, week_end_date, "
+        " week_start_at, week_end_at, weekly_percent, payload_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (captured_at, "2026-04-27", "2026-05-03", None, None, 90.0, "{}"),
+    )
+    usage_id = int(cur.lastrowid)
+    cur = conn.execute(
+        "INSERT INTO weekly_cost_snapshots "
+        "(captured_at_utc, week_start_date, week_end_date, "
+        " week_start_at, week_end_at, cost_usd) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (captured_at, "2026-04-27", "2026-05-03", None, None, 47.32),
+    )
+    cost_id = int(cur.lastrowid)
+    conn.commit()
+
+    try:
+        n1 = mod.insert_percent_milestone(
+            conn,
+            "2026-04-27",
+            "2026-05-03",
+            None,
+            None,
+            90,
+            47.32,
+            None,
+            usage_id,
+            cost_id,
+            None,
+        )
+    except Exception:
+        print("first_insert_raised")
+        traceback.print_exc()
+        raise SystemExit(1)
+
+    try:
+        n2 = mod.insert_percent_milestone(
+            conn,
+            "2026-04-27",
+            "2026-05-03",
+            None,
+            None,
+            90,
+            47.32,
+            None,
+            usage_id,
+            cost_id,
+            None,
+        )
+    except Exception:
+        # Pre-refactor: plain INSERT raises IntegrityError on duplicate.
+        # Print the marker the bash side asserts on, then exit non-zero so
+        # the harness FAILs in TDD-red.
+        print("duplicate_raised_integrity_error")
+        traceback.print_exc()
+        raise SystemExit(1)
+
+    count = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM percent_milestones "
+            "WHERE week_start_date='2026-04-27' AND percent_threshold=90"
+        ).fetchone()[0]
+    )
+
+    print(f"n1={n1}")
+    print(f"n2={n2}")
+    print(f"count={count}")
+finally:
+    conn.close()
+PY
+)
+ec=$?
+
+if [ $ec -ne 0 ]; then
+    echo "FAIL python harness exited with $ec"
+    printf '%s\n' "$out"
+    fail_count=$((fail_count + 1))
+    echo "passed: $pass_count   failed: $fail_count"
+    exit 1
+fi
+
+n1=$(printf '%s\n' "$out" | awk -F= '/^n1=/{print $2}')
+n2=$(printf '%s\n' "$out" | awk -F= '/^n2=/{print $2}')
+count=$(printf '%s\n' "$out" | awk -F= '/^count=/{print $2}')
+
+assert_eq "first insert rowcount" "1" "$n1"
+assert_eq "duplicate insert rowcount" "0" "$n2"
+assert_eq "row count after duplicate" "1" "$count"
+
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

@@ -1,0 +1,1 @@
+setup: settings.json at /FAKE/.claude/settings.json is not valid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1). Fix it and re-run.

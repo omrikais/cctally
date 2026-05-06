@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin wrapper: `cctally-forecast` → `cctally forecast`.
+# Mirrors `cctally-dollar-per-percent` / `cctally-sync-week` pattern.
+set -euo pipefail
+exec "$(dirname "$0")/cctally" forecast "$@"

@@ -1,0 +1,1 @@
+{"error": "E_BLANK_SUBJECT", "detail": "`--- public ---` followed by a blank line; subject must be on the line immediately after the delimiter."}

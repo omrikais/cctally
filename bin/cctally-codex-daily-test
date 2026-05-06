@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Fixture-based validation harness for `cctally codex-daily`.
+#
+# Rebuilds Codex fixtures, then walks each fixture dir under
+# tests/fixtures/codex-daily/ and runs each output mode through the
+# shared run_mode helper (bin/_lib-fixture-harness.sh). Modes:
+#   * terminal    — default (per-fixture FLAGS in input.env still apply, e.g.
+#                   --breakdown)
+#   * json        — --json (layered on top of per-fixture FLAGS)
+# Exits 0 on all-pass, non-zero on any diff/missing golden.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+HARNESS_SUBCOMMAND="codex-daily"
+HARNESS_FIXTURES_DIR="$REPO_ROOT/tests/fixtures/codex-daily"
+HARNESS_BIN="$REPO_ROOT/bin/cctally"
+
+# Per-run scratch dir for the regenerated fixture DBs and any test-process
+# SQLite writes. Keeps the in-tree fixture .db files byte-stable across
+# harness runs (the builder is host-deterministic but produces different
+# bytes on different hosts/sqlite versions). The shared Codex builder
+# writes four sub-trees (codex-{daily,monthly,weekly,session}/) under
+# $SCRATCH_DIR; HARNESS_FAKE_HOME_BASE points at the codex-daily/ subtree
+# so _lib-fixture-harness.sh resolves FAKE_HOME=$SCRATCH_DIR/codex-daily/<scenario>.
+# input.env / golden-*.txt are still read from the in-tree HARNESS_FIXTURES_DIR.
+SCRATCH_DIR=$(mktemp -d -t cctally-codex-daily-fixtures-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR/codex-daily"
+
+# Shared Codex builder regenerates fixtures for all four command trees,
+# writing into the scratch dir so the in-tree fixtures stay clean.
+"$REPO_ROOT/bin/build-codex-fixtures.py" --out "$SCRATCH_DIR" >/dev/null || {
+    echo "FAIL: build-codex-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+# shellcheck disable=SC1091
+. "$REPO_ROOT/bin/_lib-fixture-harness.sh"
+
+pass_count=0
+fail_count=0
+
+for dir in "$HARNESS_FIXTURES_DIR"/*/; do
+    name=$(basename "$dir")
+    run_mode "$name" "terminal" ""       "terminal"
+    run_mode "$name" "json"     "--json" "json"
+done
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

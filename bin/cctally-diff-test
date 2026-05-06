@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Fixture-based validation harness for `cctally diff`.
+#
+# Rebuilds fixtures, then walks each fixture dir under
+# tests/fixtures/diff/ and runs each output mode through the
+# shared run_mode helper (bin/_lib-fixture-harness.sh). Modes:
+#   * terminal — default (no extra flags)
+#   * json     — --json
+#
+# Why CCTALLY_AS_OF instead of --as-of: the `diff` subcommand does not
+# accept an --as-of CLI flag. cmd_diff reads CCTALLY_AS_OF internally via
+# _command_as_of(). The shared lib injects CCTALLY_AS_OF from each
+# fixture's input.env.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+HARNESS_SUBCOMMAND="diff"
+HARNESS_FIXTURES_DIR="$REPO_ROOT/tests/fixtures/diff"
+HARNESS_BIN="$REPO_ROOT/bin/cctally"
+
+# Per-run scratch dir for the regenerated fixture DBs and any test-process
+# SQLite writes. Keeps the in-tree fixture .db files byte-stable across
+# harness runs (the builder is host-deterministic but produces different
+# bytes on different hosts/sqlite versions, and one scenario's diff run
+# also writes to stats.db). HARNESS_FAKE_HOME_BASE redirects FAKE_HOME in
+# _lib-fixture-harness.sh; input.env / golden-*.txt are still read from
+# the in-tree HARNESS_FIXTURES_DIR.
+SCRATCH_DIR=$(mktemp -d -t cctally-diff-fixtures-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR"
+
+# Regenerate seeded fixture DBs into the scratch dir so goldens always
+# check against reproducible state without dirtying the tree.
+"$REPO_ROOT/bin/build-diff-fixtures.py" --out "$SCRATCH_DIR" >/dev/null || {
+    echo "FAIL: build-diff-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+# shellcheck disable=SC1091
+. "$REPO_ROOT/bin/_lib-fixture-harness.sh"
+
+pass_count=0
+fail_count=0
+
+for dir in "$HARNESS_FIXTURES_DIR"/*/; do
+    name=$(basename "$dir")
+    run_mode "$name" "terminal" ""       "terminal"
+    run_mode "$name" "json"     "--json" "json"
+done
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

@@ -1,0 +1,124 @@
+{
+  "sessions": [
+    {
+      "sessionId": "mso-session-alpha",
+      "projectPath": "/fake/repos/alpha",
+      "sourcePaths": [
+        "/fake/jsonl/mso-session-alpha.jsonl"
+      ],
+      "firstActivity": "2026-04-11T12:00:00+00:00",
+      "lastActivity": "2026-04-11T18:00:00+00:00",
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "inputTokens": 150000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 15000,
+      "totalTokens": 165000,
+      "totalCost": 1.125,
+      "modelBreakdowns": [
+        {
+          "model": "claude-opus-4-7",
+          "inputTokens": 150000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "outputTokens": 15000,
+          "cost": 1.125
+        }
+      ]
+    },
+    {
+      "sessionId": "mso-session-bravo",
+      "projectPath": "/fake/repos/bravo",
+      "sourcePaths": [
+        "/fake/jsonl/mso-session-bravo.jsonl"
+      ],
+      "firstActivity": "2026-04-12T14:00:00+00:00",
+      "lastActivity": "2026-04-13T00:00:00+00:00",
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "inputTokens": 280000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 28000,
+      "totalTokens": 308000,
+      "totalCost": 2.1,
+      "modelBreakdowns": [
+        {
+          "model": "claude-opus-4-7",
+          "inputTokens": 280000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "outputTokens": 28000,
+          "cost": 2.1
+        }
+      ]
+    },
+    {
+      "sessionId": "mso-session-gamma",
+      "projectPath": "/fake/repos/gamma",
+      "sourcePaths": [
+        "/fake/jsonl/mso-session-gamma.jsonl"
+      ],
+      "firstActivity": "2026-04-14T00:00:00+00:00",
+      "lastActivity": "2026-04-14T12:00:00+00:00",
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "inputTokens": 420000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 42000,
+      "totalTokens": 462000,
+      "totalCost": 3.1500000000000004,
+      "modelBreakdowns": [
+        {
+          "model": "claude-opus-4-7",
+          "inputTokens": 420000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "outputTokens": 42000,
+          "cost": 3.1500000000000004
+        }
+      ]
+    },
+    {
+      "sessionId": "mso-session-delta",
+      "projectPath": "/fake/repos/delta",
+      "sourcePaths": [
+        "/fake/jsonl/mso-session-delta.jsonl"
+      ],
+      "firstActivity": "2026-04-15T00:00:00+00:00",
+      "lastActivity": "2026-04-15T08:00:00+00:00",
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "inputTokens": 560000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 56000,
+      "totalTokens": 616000,
+      "totalCost": 4.2,
+      "modelBreakdowns": [
+        {
+          "model": "claude-opus-4-7",
+          "inputTokens": 560000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "outputTokens": 56000,
+          "cost": 4.2
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "inputTokens": 1410000,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 0,
+    "outputTokens": 141000,
+    "totalTokens": 1551000,
+    "totalCost": 10.575
+  }
+}

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Fixture-based harness for the commit-msg hook subcommand.
+#
+# Each scenario sets up a tiny git repo in a scratch dir, stages files,
+# writes a commit message, then runs:
+#   python3 .githooks/_public_trailer.py hook --message-file <msg.txt>
+# from inside the repo. Pins exit code (golden-exit.txt) and a stderr
+# substring (golden-stderr-substr.txt — the E_* code).
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+FIXTURES_DIR="$REPO_ROOT/tests/fixtures/public-trailer-hook"
+PARSER="$REPO_ROOT/.githooks/_public_trailer.py"
+
+SCRATCH_DIR=$(mktemp -d -t cctally-public-trailer-hook-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+
+"$REPO_ROOT/bin/build-public-trailer-hook-fixtures.py" --out "$SCRATCH_DIR/built" >/dev/null || {
+    echo "FAIL: build-public-trailer-hook-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+pass_count=0
+fail_count=0
+
+for dir in "$FIXTURES_DIR"/*/; do
+    name=$(basename "$dir")
+    expected_exit=$(cat "$dir/golden-exit.txt" | tr -d '\n')
+    expected_stderr=$(cat "$dir/golden-stderr-substr.txt" | tr -d '\n')
+
+    work="$SCRATCH_DIR/run/$name"
+    mkdir -p "$work"
+    cp "$SCRATCH_DIR/built/$name/setup.sh" "$work/setup.sh"
+
+    pushd "$work" >/dev/null
+    bash setup.sh "$REPO_ROOT" >/dev/null 2>&1 || {
+        echo "FAIL [$name]: setup.sh exited non-zero"
+        fail_count=$((fail_count + 1))
+        popd >/dev/null
+        continue
+    }
+
+    actual_stderr=$(cd repo && python3 "$PARSER" hook --message-file ../msg.txt 2>&1 1>/dev/null)
+    actual_exit=$?
+
+    popd >/dev/null
+
+    pass=true
+    if [ "$actual_exit" != "$expected_exit" ]; then
+        pass=false
+    fi
+    if [ -n "$expected_stderr" ] && ! echo "$actual_stderr" | grep -q "$expected_stderr"; then
+        pass=false
+    fi
+
+    if $pass; then
+        echo "PASS [$name]"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL [$name]: exit=$actual_exit (expected $expected_exit), stderr substring '$expected_stderr' not found"
+        echo "  actual stderr:"
+        echo "$actual_stderr" | sed 's/^/    /'
+        fail_count=$((fail_count + 1))
+    fi
+done
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

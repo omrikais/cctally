@@ -1,0 +1,126 @@
+{
+  "daily": [
+    {
+      "date": "Mar 31, 2026",
+      "inputTokens": 12000,
+      "cachedInputTokens": 0,
+      "outputTokens": 4000,
+      "reasoningOutputTokens": 0,
+      "totalTokens": 16000,
+      "costUSD": 0.055,
+      "models": {
+        "gpt-5-codex": {
+          "inputTokens": 12000,
+          "cachedInputTokens": 0,
+          "outputTokens": 4000,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 16000,
+          "isFallback": false
+        }
+      }
+    },
+    {
+      "date": "Apr 02, 2026",
+      "inputTokens": 8000,
+      "cachedInputTokens": 2000,
+      "outputTokens": 3000,
+      "reasoningOutputTokens": 500,
+      "totalTokens": 11000,
+      "costUSD": 0.05285,
+      "models": {
+        "gpt-5.2-codex": {
+          "inputTokens": 8000,
+          "cachedInputTokens": 2000,
+          "outputTokens": 3000,
+          "reasoningOutputTokens": 500,
+          "totalTokens": 11000,
+          "isFallback": false
+        }
+      }
+    },
+    {
+      "date": "Apr 07, 2026",
+      "inputTokens": 20000,
+      "cachedInputTokens": 5000,
+      "outputTokens": 6000,
+      "reasoningOutputTokens": 0,
+      "totalTokens": 26000,
+      "costUSD": 0.079375,
+      "models": {
+        "gpt-5-codex": {
+          "inputTokens": 20000,
+          "cachedInputTokens": 5000,
+          "outputTokens": 6000,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 26000,
+          "isFallback": false
+        }
+      }
+    },
+    {
+      "date": "Apr 10, 2026",
+      "inputTokens": 15000,
+      "cachedInputTokens": 0,
+      "outputTokens": 5000,
+      "reasoningOutputTokens": 800,
+      "totalTokens": 20000,
+      "costUSD": 0.06875,
+      "models": {
+        "gpt-5-codex": {
+          "inputTokens": 15000,
+          "cachedInputTokens": 0,
+          "outputTokens": 5000,
+          "reasoningOutputTokens": 800,
+          "totalTokens": 20000,
+          "isFallback": false
+        }
+      }
+    },
+    {
+      "date": "Apr 13, 2026",
+      "inputTokens": 10000,
+      "cachedInputTokens": 3000,
+      "outputTokens": 4000,
+      "reasoningOutputTokens": 600,
+      "totalTokens": 14000,
+      "costUSD": 0.068775,
+      "models": {
+        "gpt-5.2-codex": {
+          "inputTokens": 10000,
+          "cachedInputTokens": 3000,
+          "outputTokens": 4000,
+          "reasoningOutputTokens": 600,
+          "totalTokens": 14000,
+          "isFallback": false
+        }
+      }
+    },
+    {
+      "date": "Apr 15, 2026",
+      "inputTokens": 5000,
+      "cachedInputTokens": 0,
+      "outputTokens": 2000,
+      "reasoningOutputTokens": 0,
+      "totalTokens": 7000,
+      "costUSD": 0.03675,
+      "models": {
+        "gpt-5.2-codex": {
+          "inputTokens": 5000,
+          "cachedInputTokens": 0,
+          "outputTokens": 2000,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 7000,
+          "isFallback": false
+        }
+      }
+    }
+  ],
+  "totals": {
+    "inputTokens": 70000,
+    "cachedInputTokens": 10000,
+    "outputTokens": 24000,
+    "reasoningOutputTokens": 1900,
+    "totalTokens": 94000,
+    "costUSD": 0.3615
+  }
+}

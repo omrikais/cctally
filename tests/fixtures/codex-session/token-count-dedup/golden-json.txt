@@ -1,0 +1,34 @@
+{
+  "sessions": [
+    {
+      "sessionId": "proj-dedup-s/rollout-dd-s-001",
+      "lastActivity": "2026-04-15T10:06:00.000Z",
+      "sessionFile": "rollout-dd-s-001",
+      "directory": "proj-dedup-s",
+      "inputTokens": 5000,
+      "cachedInputTokens": 1000,
+      "outputTokens": 2000,
+      "reasoningOutputTokens": 300,
+      "totalTokens": 7000,
+      "costUSD": 0.025125,
+      "models": {
+        "gpt-5-codex": {
+          "inputTokens": 5000,
+          "cachedInputTokens": 1000,
+          "outputTokens": 2000,
+          "reasoningOutputTokens": 300,
+          "totalTokens": 7000,
+          "isFallback": false
+        }
+      }
+    }
+  ],
+  "totals": {
+    "inputTokens": 5000,
+    "cachedInputTokens": 1000,
+    "outputTokens": 2000,
+    "reasoningOutputTokens": 300,
+    "totalTokens": 7000,
+    "costUSD": 0.025125
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "days": [
+    {
+      "inputTokens": 30000,
+      "outputTokens": 3000,
+      "cacheCreationTokens": 1400000,
+      "cacheReadTokens": 7000,
+      "totalTokens": 1440000,
+      "cost": 8.9785,
+      "cacheHitPercent": 0.49,
+      "savedUsd": 0.0315,
+      "wastedUsd": 1.75,
+      "netUsd": -1.7185,
+      "anomaly": {
+        "triggered": true,
+        "reasons": [
+          "net_negative"
+        ]
+      },
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 30000,
+          "outputTokens": 3000,
+          "cacheCreationTokens": 1400000,
+          "cacheReadTokens": 7000,
+          "cacheHitPercent": 0.49,
+          "cost": 8.9785,
+          "savedUsd": 0.0315,
+          "wastedUsd": 1.75,
+          "netUsd": -1.7185
+        }
+      ],
+      "date": "2026-04-15",
+      "models": [
+        "claude-opus-4-7"
+      ],
+      "totalCost": 8.9785
+    }
+  ],
+  "totals": {
+    "inputTokens": 30000,
+    "outputTokens": 3000,
+    "cacheCreationTokens": 1400000,
+    "cacheReadTokens": 7000,
+    "totalTokens": 1440000,
+    "cost": 8.9785,
+    "cacheHitPercent": 0.49,
+    "savedUsd": 0.0315,
+    "wastedUsd": 1.75,
+    "netUsd": -1.7185,
+    "totalCost": 8.9785
+  },
+  "generatedAt": "2026-04-15T12:00:00Z"
+}

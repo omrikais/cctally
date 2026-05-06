@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  test-linux:
+    # Gate all jobs to the dev repo so the mirrored workflow self-skips on
+    # the public clone. Both repos receive the same ci.yml via the mirror,
+    # but only one repo runs CI — duplicate runs on the public side were
+    # both wasteful (test-linux) and broken (test-macos / dashboard-build-
+    # stability target a self-hosted runner registered to the dev repo only).
+    if: github.repository == 'omrikais/cctally-dev'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Python test deps
+        run: python -m pip install --upgrade pip pytest rich
+
+      - name: Run cctally test suite
+        run: bin/cctally-test-all
+
+  test-macos:
+    # Self-hosted runners must NOT execute fork-PR code on the maintainer's
+    # machine (a public-mirror exposure once the repo goes public — fork
+    # contributors could run arbitrary build/test scripts on the host).
+    # Push to main is the maintainer's own commits; PRs from any source
+    # land on hosted ubuntu (test-linux above), which stays the gating
+    # signal. Loosen later (e.g. allow same-repo PRs) only with deliberate
+    # vetting.
+    if: github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
+    runs-on: [self-hosted, macOS, cctally]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run cctally test suite
+        env:
+          # Pin Python to brew's 3.13 by prepending its libexec/bin (where
+          # python3 -> python3.13 symlinks live) so the runner's PATH —
+          # which may include pyenv shims pointing at older system Python —
+          # doesn't shadow it. Also drop the runner's tool-cache entries
+          # that some Actions toolchains inject ahead of brew.
+          PATH: /opt/homebrew/opt/python@3.13/libexec/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+          # Cap the parallel-harness fan-out below the Mac Studio's core
+          # count. cctally-test-all defaults to nproc (10 cores here), and
+          # at jobs=10 several harnesses spawn enough child cctally
+          # processes that `dashboard` fixture servers can't print their
+          # port within the harness's wait window. Four leaves headroom
+          # for the maintainer's other workloads on the same machine.
+          CCTALLY_TEST_JOBS: "4"
+        run: |
+          set -e
+          python3 --version
+          # Brew's Python is PEP 668 "externally managed" — `pip install`
+          # against the system interpreter is refused. Build a per-job venv
+          # so test deps stay isolated from the runner's host Python. The
+          # venv is activated for the whole step so bin/cctally's
+          # `#!/usr/bin/env python3` shebang resolves to the venv interpreter
+          # too (rich + pytest then importable).
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python3 -m pip install --upgrade pip pytest rich
+          bin/cctally-test-all
+
+  dashboard-build-stability:
+    # Same self-hosted-on-public-PR exposure as test-macos above. Push-only
+    # gating keeps fork PRs off the maintainer's machine; the byte-stable
+    # rebuild check still runs on every push to main.
+    if: github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
+    runs-on: [self-hosted, macOS, cctally]  # committed bytes were generated on macOS; native bindings vary by OS
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node (per .nvmrc)
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: dashboard/web/.nvmrc
+          cache: npm
+          cache-dependency-path: dashboard/web/package-lock.json
+
+      - name: Install dashboard deps
+        working-directory: dashboard/web
+        run: npm ci
+
+      - name: Build dashboard
+        working-directory: dashboard/web
+        run: npm run build
+
+      - name: Verify dashboard/static/ is byte-stable
+        run: git diff --exit-code dashboard/static/

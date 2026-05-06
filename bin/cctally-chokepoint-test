@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# Validates the format_display_dt / display_tz_label / get_display_tz_pref
+# chokepoint helpers in bin/cctally directly (no fixture-DB-driven
+# subcommand). Each case runs an inline `python3 -c` invocation that loads
+# the helpers via exec() into a synthetic module, calls them, and prints
+# the result; the result is diffed against a fixture golden.
+#
+# Why exec(): bin/cctally is a single-file script (not an importable
+# module). Setting __name__ to a non-"__main__" value makes the
+# `if __name__ == "__main__":` block at the bottom a no-op, so the
+# argparse entry point doesn't fire on load. Plain exec() of the script
+# tripped a Python 3.14 dataclass introspection path that resolves
+# cls.__module__ via sys.modules; we work around that by registering a
+# shim ModuleType under the chosen name BEFORE the exec.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="$REPO_ROOT/bin/cctally"
+FIXTURES="$REPO_ROOT/tests/fixtures/chokepoint"
+
+pass_count=0
+fail_count=0
+
+run_case () {
+    local label="$1" script="$2" golden_path="$3"
+    local actual expected
+    if [ ! -f "$golden_path" ]; then
+        echo "MISSING GOLDEN $label ($golden_path)"
+        fail_count=$((fail_count + 1))
+        return
+    fi
+    actual=$(TZ=Etc/UTC python3 -c "$script" 2>&1)
+    expected=$(cat "$golden_path")
+    if [ "$actual" = "$expected" ]; then
+        echo "PASS $label"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $label"
+        diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") | sed 's/^/  /'
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# Common preamble that loads chokepoint helpers from bin/cctally. Used by
+# every case. Note: TZ=Etc/UTC is set in the parent run_case shell so the
+# host-local zone resolves to UTC byte-stably (per project gotcha — never
+# bare TZ=UTC; always IANA-style TZ=Etc/UTC).
+PREAMBLE='
+import sys, types, datetime as dt
+from zoneinfo import ZoneInfo
+# Register a shim module so dataclass introspection (cls.__module__ ->
+# sys.modules[name].__dict__) succeeds during exec.
+_mod_name = "__cctally_chokepoint_helpers__"
+_mod = types.ModuleType(_mod_name)
+_mod.__file__ = "'"$BIN"'"
+sys.modules[_mod_name] = _mod
+_mod.__dict__["__name__"] = _mod_name  # ensure non-"__main__" so the
+                                       # argparse entry block is skipped
+with open("'"$BIN"'") as _f:
+    _src = _f.read()
+exec(compile(_src, "'"$BIN"'", "exec"), _mod.__dict__)
+format_display_dt = _mod.__dict__["format_display_dt"]
+display_tz_label = _mod.__dict__["display_tz_label"]
+get_display_tz_pref = _mod.__dict__["get_display_tz_pref"]
+'
+
+# ----------------------------------------------------------------------
+# Cases
+# ----------------------------------------------------------------------
+
+# Case 1: tz=None resolves to host-local. Harness pins TZ=Etc/UTC so the
+# resolved local zone is byte-stable as "UTC".
+run_case "01 local-utc-host" "$PREAMBLE
+v = dt.datetime(2026, 5, 2, 12, 0, tzinfo=dt.timezone.utc)
+print(format_display_dt(v, None, fmt='%Y-%m-%d %H:%M', suffix=True))
+" "$FIXTURES/01-local-utc-host/golden.txt"
+
+# Case 2: tz=Etc/UTC explicit. Same instant; output should match Case 1
+# but via the explicit-IANA path rather than the bare-astimezone() path.
+run_case "02 utc-explicit" "$PREAMBLE
+v = dt.datetime(2026, 5, 2, 12, 0, tzinfo=dt.timezone.utc)
+print(format_display_dt(v, ZoneInfo('Etc/UTC'), fmt='%Y-%m-%d %H:%M', suffix=True))
+" "$FIXTURES/02-utc-explicit/golden.txt"
+
+# Case 3a: America/New_York winter (EST, UTC-5).
+run_case "03a ny-winter-est" "$PREAMBLE
+# 2026-01-15T17:00Z is 12:00 EST.
+v = dt.datetime(2026, 1, 15, 17, 0, tzinfo=dt.timezone.utc)
+print(format_display_dt(v, ZoneInfo('America/New_York'), fmt='%Y-%m-%d %H:%M', suffix=True))
+" "$FIXTURES/03a-ny-est/golden.txt"
+
+# Case 3b: America/New_York summer (EDT, UTC-4).
+run_case "03b ny-summer-edt" "$PREAMBLE
+# 2026-07-15T17:00Z is 13:00 EDT.
+v = dt.datetime(2026, 7, 15, 17, 0, tzinfo=dt.timezone.utc)
+print(format_display_dt(v, ZoneInfo('America/New_York'), fmt='%Y-%m-%d %H:%M', suffix=True))
+" "$FIXTURES/03b-ny-edt/golden.txt"
+
+# Case 4: Asia/Kolkata. tzname() is 'IST' — 3 chars, alphanumeric,
+# satisfies display_tz_label's alpha-prefer rule. Existing label
+# contract; the original draft of the plan expected '+05:30' which was
+# wrong (corrected during design review).
+run_case "04 kolkata-ist" "$PREAMBLE
+v = dt.datetime(2026, 5, 2, 12, 0, tzinfo=dt.timezone.utc)
+print(format_display_dt(v, ZoneInfo('Asia/Kolkata'), fmt='%Y-%m-%d %H:%M', suffix=True))
+" "$FIXTURES/04-kolkata-ist/golden.txt"
+
+# Case 5: Pacific/Chatham. tzname() is the numeric form '+12:45'/'+13:45'
+# (depends on whether the instant is in NZDT or NZST). The exact value
+# is host-zoneinfo-dependent; the golden was captured live on the
+# implementor's host. This case asserts display_tz_label doesn't crash
+# on a non-alpha tzname() and emits the numeric form.
+run_case "05 chatham-numeric" "$PREAMBLE
+v = dt.datetime(2026, 7, 15, 12, 0, tzinfo=dt.timezone.utc)
+print(format_display_dt(v, ZoneInfo('Pacific/Chatham'), fmt='%Y-%m-%d %H:%M', suffix=True))
+" "$FIXTURES/05-chatham-numeric/golden.txt"
+
+# Case 6a: NY DST spring-forward 2026-03-08 — one hour BEFORE the
+# 02:00 EST -> 03:00 EDT gap. 06:30Z = 01:30 EST.
+run_case "06a ny-spring-before-gap" "$PREAMBLE
+v = dt.datetime(2026, 3, 8, 6, 30, tzinfo=dt.timezone.utc)
+print(format_display_dt(v, ZoneInfo('America/New_York'), fmt='%H:%M', suffix=True))
+" "$FIXTURES/06a-ny-spring-before/golden.txt"
+
+# Case 6b: NY DST spring-forward — first half-hour AFTER the gap. The
+# wall-clock time 02:30 does not exist on this date; 07:30Z = 03:30 EDT.
+run_case "06b ny-spring-after-gap" "$PREAMBLE
+v = dt.datetime(2026, 3, 8, 7, 30, tzinfo=dt.timezone.utc)
+print(format_display_dt(v, ZoneInfo('America/New_York'), fmt='%H:%M', suffix=True))
+" "$FIXTURES/06b-ny-spring-after/golden.txt"
+
+# Case 7a: NY DST fall-back 2026-11-01 — first 1:30 AM (still EDT,
+# before the EDT -> EST clock turn-back). 05:30Z = 01:30 EDT.
+run_case "07a ny-fall-first-130" "$PREAMBLE
+v = dt.datetime(2026, 11, 1, 5, 30, tzinfo=dt.timezone.utc)
+print(format_display_dt(v, ZoneInfo('America/New_York'), fmt='%H:%M', suffix=True))
+" "$FIXTURES/07a-ny-fall-first/golden.txt"
+
+# Case 7b: NY DST fall-back — second 1:30 AM (now EST, after fall-back).
+# 06:30Z = 01:30 EST.
+run_case "07b ny-fall-second-130" "$PREAMBLE
+v = dt.datetime(2026, 11, 1, 6, 30, tzinfo=dt.timezone.utc)
+print(format_display_dt(v, ZoneInfo('America/New_York'), fmt='%H:%M', suffix=True))
+" "$FIXTURES/07b-ny-fall-second/golden.txt"
+
+# Case 8: invalid IANA in config. get_display_tz_pref must:
+#   1. return DISPLAY_TZ_DEFAULT ("local")
+#   2. emit one stderr warning the FIRST time
+#   3. emit zero warnings on subsequent calls in the same process
+# (relies on the module-level _DISPLAY_TZ_BAD_CONFIG_WARNED flag, which
+# persists for the lifetime of the python subprocess).
+run_case "08 bad-config-warn-once" "$PREAMBLE
+import io, contextlib
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf):
+    out1 = get_display_tz_pref({'display': {'tz': 'Mars/Olympus'}})
+    out2 = get_display_tz_pref({'display': {'tz': 'Mars/Olympus'}})
+warn_lines = [ln for ln in buf.getvalue().splitlines() if 'Mars/Olympus' in ln]
+print(out1)
+print(out2)
+print(f'WARN_COUNT={len(warn_lines)}')
+" "$FIXTURES/08-bad-config-warn-once/golden.txt"
+
+# ----------------------------------------------------------------------
+# Summary line — format must match cctally-test-all's grep ('^passed:').
+# ----------------------------------------------------------------------
+echo
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

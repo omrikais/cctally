@@ -1,0 +1,32 @@
+Warning: 2 entries lacked session_files session_id — run `cache-sync` to backfill.
+{
+  "rangeStart": "2026-04-13",
+  "rangeEnd": "2026-04-15",
+  "weeksInRange": 1,
+  "groupMode": "git-root",
+  "totals": {
+    "costUsd": 4.5,
+    "usedPercent": 30.0,
+    "weeklyAttributionAvailable": true
+  },
+  "projects": [
+    {
+      "displayKey": "zeta",
+      "projectPath": "/fake/repos/zeta",
+      "gitRoot": null,
+      "sessions": 2,
+      "firstSeen": "2026-04-15T12:00:00Z",
+      "lastSeen": "2026-04-15T13:00:00Z",
+      "inputTokens": 600000,
+      "outputTokens": 60000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 4.5,
+      "attributedUsedPercent": 30.0,
+      "costPerPercent": 0.15
+    }
+  ],
+  "warnings": [
+    "2 entries lacked session_files session_id \u2014 run `cache-sync` to backfill."
+  ]
+}

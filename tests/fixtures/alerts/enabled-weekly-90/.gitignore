@@ -1,0 +1,7 @@
+# Spawned by HOME=<scenario> at harness invocation time.
+*.db-wal
+*.db-shm
+*.lock
+.local/share/cctally/logs/
+.local/share/cctally/cache.db*.lock
+.local/share/cctally/stats.db*.lock
