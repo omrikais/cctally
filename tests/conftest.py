@@ -5,6 +5,9 @@ package) into a throwaway namespace so tests can exercise its
 internals without running the CLI.
 """
 import pathlib
+import types
+
+import pytest
 
 
 def _script_path() -> pathlib.Path:
@@ -48,3 +51,14 @@ def redirect_paths(ns, monkeypatch, tmp_path):
     monkeypatch.setitem(ns, "CONFIG_LOCK_PATH", share / "config.json.lock")
     monkeypatch.setitem(ns, "LOG_DIR", share / "logs")
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
+
+
+@pytest.fixture(scope="session")
+def cctally_module():
+    """Expose bin/cctally as an attribute-accessible namespace.
+
+    Wraps load_script()'s dict in a SimpleNamespace so unit tests can
+    write `cctally_module.add_column_if_missing(...)` instead of dict
+    indexing. Reuses the cached compiled code object so this is cheap.
+    """
+    return types.SimpleNamespace(**load_script())

@@ -1,0 +1,33 @@
+## stdout
+stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 4 known (1 skipped)
+  ✓ 001_five_hour_block_models_backfill_v1         applied <REDACTED>
+  ✓ 002_five_hour_block_projects_backfill_v1       applied <REDACTED>
+  ✓ 003_merge_5h_block_duplicates_v1               applied <REDACTED>
+  ~ 004_test_failure_injection                     skipped <REDACTED>
+                                                Reason: harness skip
+
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 1 known
+  · 001_test_cache_migration                       pending
+## stderr
+
+## exit
+0
+## state
+stats.db:
+  user_version: 0
+  schema_migrations:
+    001_five_hour_block_models_backfill_v1
+    002_five_hour_block_projects_backfill_v1
+    003_merge_5h_block_duplicates_v1
+  schema_migrations_skipped:
+    004_test_failure_injection
+## log
+[<REDACTED>] stats.db:004_test_failure_injection
+  test failure injected
+  Traceback (most recent call last):
+    File "<CCTALLY_BIN>", line <N>, in _run_pending_migrations
+      m.handler(conn)
+      ~~~~~~~~~^^^^^^
+    File "<CCTALLY_BIN>", line <N>, in _test_migration_failure_injection
+      raise RuntimeError("test failure injected")
+  RuntimeError: test failure injected

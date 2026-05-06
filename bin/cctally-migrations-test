@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+# bin/cctally-migrations-test — golden-file harness for the migration framework.
+#
+# Spec: docs/superpowers/specs/2026-05-06-migration-framework-design.md §6.
+# Pattern: every scenario's bash function (a) copies any input DBs into a
+# scratch HOME, (b) runs cctally with CCTALLY_MIGRATION_TEST_MODE=1, (c)
+# captures stdout+stderr+exit code into actual.txt, (d) appends post-run
+# state captured via sqlite3, (e) diffs against expected.txt.
+#
+# Determinism notes:
+#   - $HARNESS_FAKE_HOME_BASE is a per-run mktemp -d scratch dir; absolute
+#     paths leaked through cctally output (e.g. `db status` "(<path>)")
+#     are redacted to <SCRATCH>/<scenario>/<rel> before diffing.
+#   - migration-errors.log timestamps `[YYYY-MM-DDTHH:MM:SSZ]` redacted
+#     to `[<REDACTED>]`.
+#   - TZ=Etc/UTC pins the resolver path; per the project gotcha
+#     "TZ=Etc/UTC, never TZ=UTC" — bare `UTC` falls back to host zone.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HARNESS_BIN="$REPO_ROOT/bin/cctally"
+HARNESS_FIXTURES_DIR="$REPO_ROOT/tests/fixtures/migrations"
+
+# Per-run scratch dir. Each scenario's HOME is $SCRATCH_DIR/<scenario>.
+SCRATCH_DIR="$(mktemp -d -t cctally-migrations-XXXXXX)"
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR"
+
+# ── Scenario primitives ────────────────────────────────────────────────
+
+# scenario_setup <scenario_dir>
+#  - Creates $HARNESS_HOME at $HARNESS_FAKE_HOME_BASE/<scenario>.
+#  - Copies <scenario>/input.stats.db and input.cache.db (if present)
+#    into $HARNESS_HOME/.local/share/cctally/.
+scenario_setup () {
+    local scenario_dir="$1"
+    local scenario_name
+    scenario_name="$(basename "$scenario_dir")"
+    HARNESS_HOME="${HARNESS_FAKE_HOME_BASE}/${scenario_name}"
+    rm -rf "$HARNESS_HOME"
+    mkdir -p "$HARNESS_HOME/.local/share/cctally/logs"
+    if [ -f "$scenario_dir/input.stats.db" ]; then
+        cp "$scenario_dir/input.stats.db" "$HARNESS_HOME/.local/share/cctally/stats.db"
+    fi
+    if [ -f "$scenario_dir/input.cache.db" ]; then
+        cp "$scenario_dir/input.cache.db" "$HARNESS_HOME/.local/share/cctally/cache.db"
+    fi
+}
+
+# scenario_run_cctally <args...>
+#  - Runs cctally with the scratch HOME, captures stdout+stderr+exit code
+#    into shell variables _stdout, _stderr, _exit.
+scenario_run_cctally () {
+    local _ec=0
+    local out_file="$HARNESS_HOME/_stdout"
+    local err_file="$HARNESS_HOME/_stderr"
+    HOME="$HARNESS_HOME" \
+        TZ=Etc/UTC \
+        HARNESS_FAKE_HOME_BASE="$HARNESS_FAKE_HOME_BASE" \
+        CCTALLY_MIGRATION_TEST_MODE=1 \
+        NO_COLOR=1 \
+        "$HARNESS_BIN" "$@" >"$out_file" 2>"$err_file" || _ec=$?
+    _stdout="$(cat "$out_file")"
+    _stderr="$(cat "$err_file")"
+    _exit="$_ec"
+    rm -f "$out_file" "$err_file"
+}
+
+# scenario_redact <text>
+#  - Replaces the scratch-dir absolute prefix with a stable token so
+#    path strings in `db status` output are byte-stable across runs.
+#  - Replaces ISO-8601 UTC timestamps (with optional surrounding `[]`)
+#    with `<REDACTED>` so banner output and `db status` applied/skipped
+#    rows stamped at runtime stay byte-stable.
+#  - Note: fixture-injected timestamps (e.g. 2026-04-30T12:00:00Z baked
+#    into pre-applied schema_migrations rows) are also redacted by this
+#    rule; that is intended — the stable signal is the row's status,
+#    not the seeded ts value.
+#    Echoes redacted text on stdout.
+scenario_redact () {
+    local text="$1"
+    # Strip $HARNESS_FAKE_HOME_BASE/<scenario>/.local/share/cctally/ prefix
+    # to a fixed `<HOME>/.local/share/cctally/` token. Works for any
+    # scenario name because we replace the host-specific scratch root.
+    printf '%s' "$text" | sed -E \
+        -e "s|${HARNESS_FAKE_HOME_BASE//|/\\|}/[^/]+/\\.local/share/cctally/|<HOME>/.local/share/cctally/|g" \
+        -e 's/\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\]/[<REDACTED>]/g' \
+        -e 's/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z/<REDACTED>/g'
+}
+
+# scenario_dump_state <db_label>
+#  - Dumps PRAGMA user_version + schema_migrations + schema_migrations_skipped
+#    of <stats.db|cache.db> with deterministic ordering. Output to stdout.
+scenario_dump_state () {
+    local db_label="$1"
+    local db_path
+    case "$db_label" in
+        stats.db) db_path="$HARNESS_HOME/.local/share/cctally/stats.db" ;;
+        cache.db) db_path="$HARNESS_HOME/.local/share/cctally/cache.db" ;;
+        *) echo "unknown db_label: $db_label" >&2; return 2 ;;
+    esac
+    if [ ! -f "$db_path" ]; then
+        echo "$db_label: <missing>"
+        return 0
+    fi
+    echo "$db_label:"
+    local uv
+    uv="$(sqlite3 "$db_path" 'PRAGMA user_version' 2>/dev/null || echo NA)"
+    echo "  user_version: $uv"
+    echo "  schema_migrations:"
+    sqlite3 "$db_path" \
+        "SELECT '    ' || name FROM schema_migrations ORDER BY name" \
+        2>/dev/null || echo "    <table missing>"
+    echo "  schema_migrations_skipped:"
+    sqlite3 "$db_path" \
+        "SELECT '    ' || name FROM schema_migrations_skipped ORDER BY name" \
+        2>/dev/null || echo "    <table missing>"
+}
+
+# scenario_dump_log
+#  - Dumps migration-errors.log with several volatile fields redacted:
+#    * ISO timestamps -> <REDACTED>
+#    * Absolute path to bin/cctally -> <CCTALLY_BIN> (CI runs under a
+#      different checkout root than the developer's machine)
+#    * Traceback line numbers -> line <N> (so cosmetic edits to
+#      bin/cctally don't shift goldens)
+scenario_dump_log () {
+    local log_path="$HARNESS_HOME/.local/share/cctally/logs/migration-errors.log"
+    if [ ! -f "$log_path" ]; then
+        echo "<no migration-errors.log>"
+        return 0
+    fi
+    # Escape regex meta-chars in the bin path before substitution.
+    local bin_pat="${HARNESS_BIN//./\\.}"
+    sed -E \
+        -e 's/\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\]/[<REDACTED>]/g' \
+        -e "s|${bin_pat}|<CCTALLY_BIN>|g" \
+        -e 's/line [0-9]+,/line <N>,/g' \
+        "$log_path"
+}
+
+# scenario_assert_golden <scenario_dir> <actual_text>
+#  - Writes actual.txt next to expected.txt; diffs.
+scenario_assert_golden () {
+    local scenario_dir="$1"
+    local actual_text="$2"
+    local actual_path="$scenario_dir/actual.txt"
+    printf '%s\n' "$actual_text" > "$actual_path"
+    if ! diff -u "$scenario_dir/expected.txt" "$actual_path" >/dev/null 2>&1; then
+        echo "FAIL: $(basename "$scenario_dir")"
+        diff -u "$scenario_dir/expected.txt" "$actual_path" | head -200
+        return 1
+    fi
+    rm -f "$actual_path"
+    echo "PASS: $(basename "$scenario_dir")"
+    return 0
+}
+
+# ── Scenario implementations ───────────────────────────────────────────
+
+# 01-fresh-install: empty HOME, `db status` is read-only — both DBs absent
+# pre-call, and `db status` synthesizes "all pending" from registry without
+# creating either DB file. Asserts dispatcher untouched, no log written.
+scenario_01_fresh_install () {
+    local scenario_dir="$HARNESS_FIXTURES_DIR/01-fresh-install"
+    scenario_setup "$scenario_dir"
+    scenario_run_cctally db status
+
+    local stdout_redacted stderr_redacted
+    stdout_redacted="$(scenario_redact "$_stdout")"
+    stderr_redacted="$(scenario_redact "$_stderr")"
+
+    local actual
+    actual="$(printf '%s\n' \
+        "## stdout" \
+        "$stdout_redacted" \
+        "## stderr" \
+        "$stderr_redacted" \
+        "## exit" \
+        "$_exit" \
+        "## state" \
+        "$(scenario_dump_state stats.db)" \
+        "$(scenario_dump_state cache.db)" \
+        "## log" \
+        "$(scenario_dump_log)")"
+    scenario_assert_golden "$scenario_dir" "$actual"
+}
+
+# 02-upgrade-with-some-applied: stats.db has 001+002 markers; cache.db is
+# fresh. First `report --weeks 1` triggers the dispatcher walk via
+# open_db(); 003 + 004 (test injection, no trigger seeded) apply cleanly,
+# user_version advances to 4. cache.db's open path is NOT exercised by
+# `report` (which only opens stats.db) — its 1 cache migration stays
+# pending, surfaced by the post-walk `db status` capture. `db status` is
+# a raw-sqlite3 read that does NOT trigger another walk, so its output
+# reflects the post-`report` state.
+scenario_02_upgrade () {
+    local scenario_dir="$HARNESS_FIXTURES_DIR/02-upgrade-with-some-applied"
+    scenario_setup "$scenario_dir"
+    # Trigger dispatcher walk via open_db()-using command; discard noise.
+    scenario_run_cctally report --weeks 1 >/dev/null 2>&1 || true
+    # Capture post-walk state via the read-only `db status`.
+    scenario_run_cctally db status
+
+    local stdout_redacted stderr_redacted
+    stdout_redacted="$(scenario_redact "$_stdout")"
+    stderr_redacted="$(scenario_redact "$_stderr")"
+
+    local actual
+    actual="$(printf '%s\n' \
+        "## stdout" \
+        "$stdout_redacted" \
+        "## stderr" \
+        "$stderr_redacted" \
+        "## exit" \
+        "$_exit" \
+        "## state" \
+        "$(scenario_dump_state stats.db)" \
+        "$(scenario_dump_state cache.db)" \
+        "## log" \
+        "$(scenario_dump_log)")"
+    scenario_assert_golden "$scenario_dir" "$actual"
+}
+
+# 03-migration-raises-banner-renders: fixture seeds 001-003 markers AND a
+# non-empty `test_failure_trigger` table. `report --weeks 1` triggers the
+# dispatcher walk; 004_test_failure_injection raises RuntimeError, the
+# dispatcher logs the failure, and the report command surfaces a banner
+# on stdout (report is NOT in _BANNER_SUPPRESSED_COMMANDS).
+scenario_03_failure () {
+    local scenario_dir="$HARNESS_FIXTURES_DIR/03-migration-raises-banner-renders"
+    scenario_setup "$scenario_dir"
+    scenario_run_cctally report --weeks 1 || true
+
+    local stdout_redacted stderr_redacted
+    stdout_redacted="$(scenario_redact "$_stdout")"
+    stderr_redacted="$(scenario_redact "$_stderr")"
+
+    local actual
+    actual="$(printf '%s\n' \
+        "## stdout" \
+        "$stdout_redacted" \
+        "## stderr" \
+        "$stderr_redacted" \
+        "## exit" \
+        "$_exit" \
+        "## state" \
+        "$(scenario_dump_state stats.db)" \
+        "## log" \
+        "$(scenario_dump_log)")"
+    scenario_assert_golden "$scenario_dir" "$actual"
+}
+
+# 04-retry-after-failure: reuse 03's fixture (test_failure_trigger seeded).
+# First run hits the failure; the harness then drops the trigger row from
+# the LIVE stats.db (mirrors the operator pattern of fixing the underlying
+# data after diagnosing the migration error). Second run succeeds, the
+# dispatcher's success path calls _clear_migration_error_log_entries, and
+# the log file is removed when its last entry clears.
+scenario_04_retry_after_failure () {
+    local scenario_dir="$HARNESS_FIXTURES_DIR/04-retry-after-failure"
+    # Stage 03's fixture as this scenario's input under
+    # $HARNESS_FAKE_HOME_BASE/_inputs/<name>, NOT directly at
+    # $HARNESS_FAKE_HOME_BASE/<name>: the latter collides with
+    # scenario_setup's HARNESS_HOME path which `rm -rf`s before the
+    # copy step, deleting the input under us.
+    local intermediate="${HARNESS_FAKE_HOME_BASE}/_inputs/04-retry-after-failure"
+    rm -rf "$intermediate"
+    mkdir -p "$(dirname "$intermediate")"
+    cp -r "$HARNESS_FIXTURES_DIR/03-migration-raises-banner-renders" "$intermediate"
+    scenario_setup "$intermediate"
+    # First run: 004 raises; failure logged.
+    scenario_run_cctally report --weeks 1 >/dev/null 2>&1 || true
+    # Operator step: remove the trigger row.
+    sqlite3 "$HARNESS_HOME/.local/share/cctally/stats.db" \
+        "DELETE FROM test_failure_trigger"
+    # Second run: 004 succeeds; success-path clears the log entry.
+    scenario_run_cctally report --weeks 1 >/dev/null 2>&1 || true
+    # Capture post-state via db status.
+    scenario_run_cctally db status
+
+    local stdout_redacted stderr_redacted
+    stdout_redacted="$(scenario_redact "$_stdout")"
+    stderr_redacted="$(scenario_redact "$_stderr")"
+
+    local actual
+    actual="$(printf '%s\n' \
+        "## stdout" \
+        "$stdout_redacted" \
+        "## stderr" \
+        "$stderr_redacted" \
+        "## exit" \
+        "$_exit" \
+        "## state" \
+        "$(scenario_dump_state stats.db)" \
+        "## log" \
+        "$(scenario_dump_log)")"
+    scenario_assert_golden "$scenario_dir" "$actual"
+}
+
+# 05-skip-stops-rerun: trigger initial failure, then `db skip` the offender.
+# Subsequent `db status` shows the migration as `~ skipped` and (since
+# every migration is now applied OR skipped) user_version advances to
+# len(registry) on the next dispatcher walk. The skip writes through raw
+# sqlite3 — no second open_db() walk is needed for the skipped row to
+# stick — but the user_version advance happens on the next open. We
+# capture only the post-skip `db status` (read-only) here; the
+# user_version-advance via fast-path is exercised by scenario 06.
+scenario_05_skip_stops_rerun () {
+    local scenario_dir="$HARNESS_FIXTURES_DIR/05-skip-stops-rerun"
+    # Stage 03's fixture under _inputs/ to avoid scenario_setup's
+    # HARNESS_HOME path (see scenario_04 comment).
+    local intermediate="${HARNESS_FAKE_HOME_BASE}/_inputs/05-skip-stops-rerun"
+    rm -rf "$intermediate"
+    mkdir -p "$(dirname "$intermediate")"
+    cp -r "$HARNESS_FIXTURES_DIR/03-migration-raises-banner-renders" "$intermediate"
+    scenario_setup "$intermediate"
+    # Trigger initial failure.
+    scenario_run_cctally report --weeks 1 >/dev/null 2>&1 || true
+    # Skip the failing migration (raw-sqlite3 path; doesn't trigger walk).
+    scenario_run_cctally db skip 004_test_failure_injection \
+        --reason "harness skip" >/dev/null 2>&1 || true
+    # Capture post-skip state via db status.
+    scenario_run_cctally db status
+
+    local stdout_redacted stderr_redacted
+    stdout_redacted="$(scenario_redact "$_stdout")"
+    stderr_redacted="$(scenario_redact "$_stderr")"
+
+    local actual
+    actual="$(printf '%s\n' \
+        "## stdout" \
+        "$stdout_redacted" \
+        "## stderr" \
+        "$stderr_redacted" \
+        "## exit" \
+        "$_exit" \
+        "## state" \
+        "$(scenario_dump_state stats.db)" \
+        "## log" \
+        "$(scenario_dump_log)")"
+    scenario_assert_golden "$scenario_dir" "$actual"
+}
+
+# 06-unskip-reruns: after `db skip` then `db unskip`, `db unskip` writes
+# `PRAGMA user_version = 0` (Codex P1 #1) so the dispatcher's fast path
+# can't short-circuit the now-pending migration. We pre-drop the failure
+# trigger so the rerun can succeed; the second `report --weeks 1` triggers
+# the walk, 004 applies cleanly, user_version returns to len(registry).
+scenario_06_unskip_reruns () {
+    local scenario_dir="$HARNESS_FIXTURES_DIR/06-unskip-reruns"
+    # Stage 03's fixture under _inputs/ to avoid scenario_setup's
+    # HARNESS_HOME path (see scenario_04 comment).
+    local intermediate="${HARNESS_FAKE_HOME_BASE}/_inputs/06-unskip-reruns"
+    rm -rf "$intermediate"
+    mkdir -p "$(dirname "$intermediate")"
+    cp -r "$HARNESS_FIXTURES_DIR/03-migration-raises-banner-renders" "$intermediate"
+    scenario_setup "$intermediate"
+    # Skip without first triggering the failure — same end state on the
+    # skipped row, fewer log artifacts to redact.
+    scenario_run_cctally db skip 004_test_failure_injection \
+        --reason "preview skip" >/dev/null 2>&1 || true
+    # Drop the trigger so the post-unskip rerun succeeds.
+    sqlite3 "$HARNESS_HOME/.local/share/cctally/stats.db" \
+        "DELETE FROM test_failure_trigger"
+    # Unskip — invalidates user_version fast-path.
+    scenario_run_cctally db unskip 004_test_failure_injection \
+        >/dev/null 2>&1 || true
+    # Trigger walk; 004 applies.
+    scenario_run_cctally report --weeks 1 >/dev/null 2>&1 || true
+    scenario_run_cctally db status
+
+    local stdout_redacted stderr_redacted
+    stdout_redacted="$(scenario_redact "$_stdout")"
+    stderr_redacted="$(scenario_redact "$_stderr")"
+
+    local actual
+    actual="$(printf '%s\n' \
+        "## stdout" \
+        "$stdout_redacted" \
+        "## stderr" \
+        "$stderr_redacted" \
+        "## exit" \
+        "$_exit" \
+        "## state" \
+        "$(scenario_dump_state stats.db)" \
+        "## log" \
+        "$(scenario_dump_log)")"
+    scenario_assert_golden "$scenario_dir" "$actual"
+}
+
+# 07-downgrade-detected-exit-2: stats.db has PRAGMA user_version=99 (built
+# by build-migrations-fixtures.py); any open through the dispatcher raises
+# DowngradeDetected and exits non-zero. `report --weeks 1` is a read path
+# that triggers open_db().
+scenario_07_downgrade () {
+    local scenario_dir="$HARNESS_FIXTURES_DIR/07-downgrade-detected-exit-2"
+    scenario_setup "$scenario_dir"
+    scenario_run_cctally report --weeks 1 || true
+
+    local stdout_redacted stderr_redacted
+    stdout_redacted="$(scenario_redact "$_stdout")"
+    stderr_redacted="$(scenario_redact "$_stderr")"
+
+    local actual
+    actual="$(printf '%s\n' \
+        "## stdout" \
+        "$stdout_redacted" \
+        "## stderr" \
+        "$stderr_redacted" \
+        "## exit" \
+        "$_exit")"
+    scenario_assert_golden "$scenario_dir" "$actual"
+}
+
+# 08-banner-clears-on-success: trigger the failure (banner armed via the
+# log file existing), then drop the trigger and re-run — the dispatcher's
+# success path on 004 calls _clear_migration_error_log_entries, which
+# unlinks the file when its last entry clears. The post-success
+# `db status` capture confirms `<no migration-errors.log>`.
+scenario_08_banner_clears () {
+    local scenario_dir="$HARNESS_FIXTURES_DIR/08-banner-clears-on-success"
+    # Stage 03's fixture under _inputs/ to avoid scenario_setup's
+    # HARNESS_HOME path (see scenario_04 comment).
+    local intermediate="${HARNESS_FAKE_HOME_BASE}/_inputs/08-banner-clears-on-success"
+    rm -rf "$intermediate"
+    mkdir -p "$(dirname "$intermediate")"
+    cp -r "$HARNESS_FIXTURES_DIR/03-migration-raises-banner-renders" "$intermediate"
+    scenario_setup "$intermediate"
+    # Trigger initial failure.
+    scenario_run_cctally report --weeks 1 >/dev/null 2>&1 || true
+    # Sanity check: log non-empty after failure.
+    if [ ! -s "$HARNESS_HOME/.local/share/cctally/logs/migration-errors.log" ]; then
+        echo "scenario_08: expected non-empty migration-errors.log after failure"
+        return 1
+    fi
+    # Drop the trigger and rerun — success path auto-clears the log entry.
+    sqlite3 "$HARNESS_HOME/.local/share/cctally/stats.db" \
+        "DELETE FROM test_failure_trigger"
+    scenario_run_cctally report --weeks 1 >/dev/null 2>&1 || true
+    # Capture post-success state via db status.
+    scenario_run_cctally db status
+
+    local stdout_redacted stderr_redacted
+    stdout_redacted="$(scenario_redact "$_stdout")"
+    stderr_redacted="$(scenario_redact "$_stderr")"
+
+    local actual
+    actual="$(printf '%s\n' \
+        "## stdout" \
+        "$stdout_redacted" \
+        "## stderr" \
+        "$stderr_redacted" \
+        "## exit" \
+        "$_exit" \
+        "## state" \
+        "$(scenario_dump_state stats.db)" \
+        "## log" \
+        "$(scenario_dump_log)")"
+    scenario_assert_golden "$scenario_dir" "$actual"
+}
+
+# 09-cache-db-and-stats-db: end-to-end exercise of both DB walks. Stats.db
+# starts with 001/002/003 markers seeded but PRAGMA user_version=0; cache.db
+# starts empty. We trigger the stats.db walk via `report --weeks 1` (004
+# applies cleanly because no test_failure_trigger row is seeded), then
+# trigger the cache.db walk via `cache-sync --source claude` so the
+# 001_test_cache_migration registers and stamps user_version=1. The post-
+# walk `db status` capture confirms both DBs reach the all-applied state.
+scenario_09_both_dbs () {
+    local scenario_dir="$HARNESS_FIXTURES_DIR/09-cache-db-and-stats-db"
+    scenario_setup "$scenario_dir"
+    # Trigger dispatcher walk on stats.db.
+    scenario_run_cctally report --weeks 1 >/dev/null 2>&1 || true
+    # Trigger dispatcher walk on cache.db.
+    scenario_run_cctally cache-sync --source claude >/dev/null 2>&1 || true
+    # Capture post-state via db status.
+    scenario_run_cctally db status
+
+    local stdout_redacted stderr_redacted
+    stdout_redacted="$(scenario_redact "$_stdout")"
+    stderr_redacted="$(scenario_redact "$_stderr")"
+
+    local actual
+    actual="$(printf '%s\n' \
+        "## stdout" \
+        "$stdout_redacted" \
+        "## stderr" \
+        "$stderr_redacted" \
+        "## exit" \
+        "$_exit" \
+        "## state" \
+        "$(scenario_dump_state stats.db)" \
+        "$(scenario_dump_state cache.db)" \
+        "## log" \
+        "$(scenario_dump_log)")"
+    scenario_assert_golden "$scenario_dir" "$actual"
+}
+
+# 10-legacy-marker-recognized-by-db-status: stats.db carries pre-framework
+# unprefixed marker rows (`merge_5h_block_duplicates_v1` etc.). `db status`
+# bypasses open_db() by design, so without the legacy alias path it would
+# report all three migrations as `· pending` even though they're applied.
+# Test asserts the alias path treats legacy rows as applied without
+# mutating the DB (no bootstrap rename until a real open_db() runs).
+scenario_10_legacy_marker_recognized () {
+    local scenario_dir="$HARNESS_FIXTURES_DIR/10-legacy-marker-recognized-by-db-status"
+    scenario_setup "$scenario_dir"
+    scenario_run_cctally db status
+
+    local stdout_redacted stderr_redacted
+    stdout_redacted="$(scenario_redact "$_stdout")"
+    stderr_redacted="$(scenario_redact "$_stderr")"
+
+    local actual
+    actual="$(printf '%s\n' \
+        "## stdout" \
+        "$stdout_redacted" \
+        "## stderr" \
+        "$stderr_redacted" \
+        "## exit" \
+        "$_exit" \
+        "## state" \
+        "$(scenario_dump_state stats.db)" \
+        "## log" \
+        "$(scenario_dump_log)")"
+    scenario_assert_golden "$scenario_dir" "$actual"
+}
+
+# 11-five-hour-dedup-after-backfill: stats.db has two weekly_usage_snapshots
+# with jitter-forked five_hour_window_key values (one canonical bucket
+# apart, well within the 1800s dedup grouping window) and an empty
+# five_hour_blocks. Without the post-backfill dedup re-run, open_db()
+# would: dispatcher walks 003 against empty parent table → no-op + marker
+# stamped → backfill creates 2 forked parent rows that the marker now
+# prevents from ever being merged. With the fix, the explicit handler
+# re-invocation merges them to a single canonical row. Test asserts
+# `SELECT COUNT(*) FROM five_hour_blocks` == 1.
+scenario_11_five_hour_dedup_after_backfill () {
+    local scenario_dir="$HARNESS_FIXTURES_DIR/11-five-hour-dedup-after-backfill"
+    scenario_setup "$scenario_dir"
+    # report --weeks 1 triggers open_db(), which runs the dispatcher,
+    # then _backfill_five_hour_blocks, then the post-backfill dedup
+    # re-invocation. Discard report's output — we care about post-state.
+    scenario_run_cctally report --weeks 1 >/dev/null 2>&1 || true
+
+    local block_count
+    block_count="$(sqlite3 "$HARNESS_HOME/.local/share/cctally/stats.db" \
+        "SELECT COUNT(*) FROM five_hour_blocks" 2>/dev/null || echo "ERROR")"
+
+    local actual
+    actual="$(printf '%s\n' \
+        "## five_hour_blocks count" \
+        "$block_count" \
+        "## state" \
+        "$(scenario_dump_state stats.db)" \
+        "## log" \
+        "$(scenario_dump_log)")"
+    scenario_assert_golden "$scenario_dir" "$actual"
+}
+
+# ── Main ────────────────────────────────────────────────────────────────
+
+main () {
+    local pass_count=0
+    local fail_count=0
+
+    scenario_01_fresh_install        && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
+    scenario_02_upgrade              && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
+    scenario_03_failure              && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
+    scenario_04_retry_after_failure  && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
+    scenario_05_skip_stops_rerun     && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
+    scenario_06_unskip_reruns        && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
+    scenario_07_downgrade            && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
+    scenario_08_banner_clears        && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
+    scenario_09_both_dbs             && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
+    scenario_10_legacy_marker_recognized       && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
+    scenario_11_five_hour_dedup_after_backfill && pass_count=$((pass_count + 1)) || fail_count=$((fail_count + 1))
+
+    echo
+    echo "passed: $pass_count   failed: $fail_count"
+    [ "$fail_count" -eq 0 ]
+}
+
+main "$@"

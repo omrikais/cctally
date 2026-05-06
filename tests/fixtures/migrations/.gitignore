@@ -1,0 +1,4 @@
+*.db-wal
+*.db-shm
+logs/
+actual.txt

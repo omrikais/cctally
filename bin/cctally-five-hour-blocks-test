@@ -748,12 +748,17 @@ EOF
         "/tmp/seeded/p/w2a.jsonl" "/repo/P"
 
     # Roll back to pre-migration state: delete parent + children + markers.
+    # Reset user_version too — under the framework, the dispatcher fast-paths
+    # when PRAGMA user_version == len(registry), so DELETE'ing rows alone
+    # would not re-fire the migrations (rows back to zero, but version still
+    # at 3 from the initial fresh-install stamp).
     sqlite3 "$home/.local/share/cctally/stats.db" <<EOF
 DELETE FROM five_hour_blocks;
 DELETE FROM five_hour_block_models;
 DELETE FROM five_hour_block_projects;
 DELETE FROM five_hour_milestones;
 DELETE FROM schema_migrations;
+PRAGMA user_version = 0;
 EOF
 
     # Trigger open_db() — should re-fire the parent backfill, which now writes
@@ -773,8 +778,8 @@ EOF
     assert_eq "$projects_rows" "2" "projects: 2 backfilled rows (one per window)"
 
     # schema_migrations markers present.
-    has_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_models_backfill_v1';")
-    has_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_projects_backfill_v1';")
+    has_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='001_five_hour_block_models_backfill_v1';")
+    has_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='002_five_hour_block_projects_backfill_v1';")
     assert_eq "$has_models_mig"   "1" "schema_migrations: models marker present"
     assert_eq "$has_projects_mig" "1" "schema_migrations: projects marker present"
 
@@ -804,10 +809,12 @@ EOF
     assert_eq "$parent_rows" "1" "pre: 1 parent row"
 
     # Roll back to upgrade-user state: drop children + markers; keep parent.
+    # Reset user_version (see scenario P comment for rationale).
     sqlite3 "$home/.local/share/cctally/stats.db" <<EOF
 DELETE FROM five_hour_block_models;
 DELETE FROM five_hour_block_projects;
 DELETE FROM schema_migrations;
+PRAGMA user_version = 0;
 EOF
 
     pre_models=$(sql "$home" "SELECT COUNT(*) FROM five_hour_block_models;")
@@ -823,8 +830,8 @@ EOF
     assert_eq "$post_models"   "1" "post: 1 model row"
     assert_eq "$post_projects" "1" "post: 1 project row"
 
-    has_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_models_backfill_v1';")
-    has_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_projects_backfill_v1';")
+    has_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='001_five_hour_block_models_backfill_v1';")
+    has_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='002_five_hour_block_projects_backfill_v1';")
     assert_eq "$has_models_mig"   "1" "post: models migration marker"
     assert_eq "$has_projects_mig" "1" "post: projects migration marker"
 
@@ -858,15 +865,18 @@ EOF
     assert_eq "$pre_projects" "0" "pre: zero projects rows"
 
     # Roll back markers + drop children (children already empty).
-    sqlite3 "$home/.local/share/cctally/stats.db" \
-        "DELETE FROM schema_migrations;"
+    # Reset user_version (see scenario P comment for rationale).
+    sqlite3 "$home/.local/share/cctally/stats.db" <<EOF
+DELETE FROM schema_migrations;
+PRAGMA user_version = 0;
+EOF
 
     # Trigger open_db() again — gate should fire and re-mark migrations done
     # despite writing zero rows.
     run_cctally "$home" weekly
 
-    has_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_models_backfill_v1';")
-    has_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_projects_backfill_v1';")
+    has_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='001_five_hour_block_models_backfill_v1';")
+    has_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='002_five_hour_block_projects_backfill_v1';")
     assert_eq "$has_models_mig"   "1" "post: models marker set despite zero rows"
     assert_eq "$has_projects_mig" "1" "post: projects marker set despite zero rows"
 
@@ -875,8 +885,8 @@ EOF
     # stays at exactly 1 row each (no duplicate inserts; INSERT OR IGNORE
     # would silently no-op anyway — main assertion is no crash + still 1 each).
     run_cctally "$home" weekly
-    final_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_models_backfill_v1';")
-    final_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_projects_backfill_v1';")
+    final_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='001_five_hour_block_models_backfill_v1';")
+    final_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='002_five_hour_block_projects_backfill_v1';")
     assert_eq "$final_models_mig"   "1" "second open_db: models marker still 1 row"
     assert_eq "$final_projects_mig" "1" "second open_db: projects marker still 1 row"
 
@@ -1012,10 +1022,12 @@ EOF
 DELETE FROM session_entries;
 DELETE FROM session_files;
 EOF
+    # Reset user_version too (see scenario P comment for rationale).
     sqlite3 "$home/.local/share/cctally/stats.db" <<EOF
 DELETE FROM five_hour_block_models;
 DELETE FROM five_hour_block_projects;
 DELETE FROM schema_migrations;
+PRAGMA user_version = 0;
 EOF
 
     empty_cache_entries=$(sqlite3 "$home/.local/share/cctally/cache.db" \
@@ -1041,8 +1053,8 @@ EOF
     assert_eq "$post_models"   "1" "post: models re-populated from JSONL"
     assert_eq "$post_projects" "1" "post: projects re-populated from JSONL"
 
-    has_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_models_backfill_v1';")
-    has_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='five_hour_block_projects_backfill_v1';")
+    has_models_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='001_five_hour_block_models_backfill_v1';")
+    has_projects_mig=$(sql "$home" "SELECT COUNT(*) FROM schema_migrations WHERE name='002_five_hour_block_projects_backfill_v1';")
     assert_eq "$has_models_mig"   "1" "post: models marker set"
     assert_eq "$has_projects_mig" "1" "post: projects marker set"
 
@@ -1428,7 +1440,14 @@ fhb_dedup_migration () {
     # an empty table — we DELETE that marker right after so the
     # follow-up subcommand re-fires the migration on the seeded data).
     run_cctally "$home" weekly >/dev/null 2>&1 || true
-    sql "$home" "DELETE FROM schema_migrations WHERE name = 'merge_5h_block_duplicates_v1';"
+    # Reset user_version to 2 so the dispatcher re-runs migration #3 only
+    # (under the framework, fast-path triggers on user_version == registry-len;
+    # DELETE'ing the marker alone leaves user_version=3 and the migration
+    # never re-fires).
+    sqlite3 "$home/.local/share/cctally/stats.db" <<EOF
+DELETE FROM schema_migrations WHERE name = '003_merge_5h_block_duplicates_v1';
+PRAGMA user_version = 2;
+EOF
 
     # Seed two parent rows representing the same physical 5h window
     # but stored under distinct (forked) window keys. Mirrors the
@@ -1490,8 +1509,8 @@ INSERT INTO weekly_usage_snapshots (
 
     # Migration marker is set so the next open_db() doesn't re-run.
     marker=$(sql "$home" \
-        "SELECT name FROM schema_migrations WHERE name = 'merge_5h_block_duplicates_v1';")
-    assert_eq "$marker" "merge_5h_block_duplicates_v1" "migration marker recorded"
+        "SELECT name FROM schema_migrations WHERE name = '003_merge_5h_block_duplicates_v1';")
+    assert_eq "$marker" "003_merge_5h_block_duplicates_v1" "migration marker recorded"
 
     # Group-wide merge: canonical (id=61) inherits the latest-observed
     # row's aggregates (id=69's last_observed='09:30', final_pct=19.0,
@@ -1534,7 +1553,12 @@ fhb_dedup_milestone_collision () {
     begin_scenario "$name"
 
     run_cctally "$home" weekly >/dev/null 2>&1 || true
-    sql "$home" "DELETE FROM schema_migrations WHERE name = 'merge_5h_block_duplicates_v1';"
+    # Reset user_version to 2 so the dispatcher re-runs migration #3 only
+    # (see fhb-dedup-migration comment for rationale).
+    sqlite3 "$home/.local/share/cctally/stats.db" <<EOF
+DELETE FROM schema_migrations WHERE name = '003_merge_5h_block_duplicates_v1';
+PRAGMA user_version = 2;
+EOF
 
     # Two parent rows for the same physical 5h window + a milestone on
     # threshold=10 in EACH. Canonical (id=61) milestone captured at
@@ -1587,8 +1611,8 @@ INSERT INTO five_hour_milestones (
     # Migration must complete (marker present) — failure mode would be
     # a rollback leaving the marker absent and the duplicates intact.
     marker=$(sql "$home" \
-        "SELECT name FROM schema_migrations WHERE name = 'merge_5h_block_duplicates_v1';")
-    assert_eq "$marker" "merge_5h_block_duplicates_v1" \
+        "SELECT name FROM schema_migrations WHERE name = '003_merge_5h_block_duplicates_v1';")
+    assert_eq "$marker" "003_merge_5h_block_duplicates_v1" \
         "migration marker recorded (no rollback)"
 
     post_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
@@ -1626,11 +1650,21 @@ fhb_banner_shown () {
     local name="fhb-banner-shown"
     begin_scenario "$name"
 
-    # Pre-seed sentinel log under the fixture HOME (no migration ran).
+    # Bootstrap the DB so the dispatcher stamps user_version = 3 and the
+    # second open is a fast-path no-op (otherwise the dispatcher would run
+    # migration handlers, succeed on the no-data path, and the post-handler
+    # _clear_migration_error_log_entries(qualified_name) would silently
+    # unlink the seeded log entry).
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    # Pre-seed sentinel log under the fixture HOME (no migration ran). The
+    # name uses a unique sentinel string that doesn't match any registered
+    # migration's qualified name — that way even if a migration handler
+    # were to run, the success-side log clear wouldn't drop this entry.
     local log_dir="$home/.local/share/cctally/logs"
     mkdir -p "$log_dir"
     local log_path="$log_dir/migration-errors.log"
-    printf '[2026-04-30T12:00:00Z] merge_5h_block_duplicates_v1\n  seeded test failure\n  Traceback line 1\n  Traceback line 2\n\n' > "$log_path"
+    printf '[2026-04-30T12:00:00Z] stats.db:099_test_banner_sentinel\n  seeded test failure\n  Traceback line 1\n  Traceback line 2\n\n' > "$log_path"
 
     # 1. Non-JSON: banner on STDOUT, normal output follows.
     HOME="$home" TZ=Etc/UTC "$BIN" five-hour-blocks \
@@ -1638,7 +1672,7 @@ fhb_banner_shown () {
     local first_line
     first_line=$(head -n 1 "$home/text-stdout.log")
     case "$first_line" in
-        "⚠ cctally: migration \`merge_5h_block_duplicates_v1\` failed"*)
+        "⚠ cctally: migration \`stats.db:099_test_banner_sentinel\` failed"*)
             ;;  # ok
         *)
             _err="${_err:+$_err; }non-json banner missing on stdout (got: $first_line)" ;;
@@ -1655,7 +1689,7 @@ fhb_banner_shown () {
             "$home/json-stdout.log" 2>/dev/null; then
         _err="${_err:+$_err; }json mode stdout is not parseable JSON"
     fi
-    if ! grep -q '⚠ cctally: migration `merge_5h_block_duplicates_v1` failed' \
+    if ! grep -q '⚠ cctally: migration `stats.db:099_test_banner_sentinel` failed' \
             "$home/json-stderr.log"; then
         _err="${_err:+$_err; }json mode banner missing on stderr"
     fi
@@ -1677,9 +1711,13 @@ fhb_banner_autoclear () {
 
     # Open the DB to create schema (also drops the pre-fired marker so the
     # migration runs again on the seeded data — same trick as
-    # fhb-dedup-migration uses).
+    # fhb-dedup-migration uses). Reset user_version to 2 so migration #3
+    # re-fires (see fhb-dedup-migration comment for rationale).
     run_cctally "$home" weekly >/dev/null 2>&1 || true
-    sql "$home" "DELETE FROM schema_migrations WHERE name = 'merge_5h_block_duplicates_v1';"
+    sqlite3 "$home/.local/share/cctally/stats.db" <<EOF
+DELETE FROM schema_migrations WHERE name = '003_merge_5h_block_duplicates_v1';
+PRAGMA user_version = 2;
+EOF
 
     # Seed two duplicate parent blocks (boundary-jitter fork).
     sql "$home" "
@@ -1705,7 +1743,9 @@ INSERT INTO five_hour_blocks (
     local log_dir="$home/.local/share/cctally/logs"
     mkdir -p "$log_dir"
     local log_path="$log_dir/migration-errors.log"
-    printf '[2026-04-30T11:59:00Z] merge_5h_block_duplicates_v1\n  prior failure - to be cleared\n  fake traceback\n\n' > "$log_path"
+    # Use the framework-qualified name so the dispatcher's success-side
+    # _clear_migration_error_log_entries(qualified_name) matches and unlinks.
+    printf '[2026-04-30T11:59:00Z] stats.db:003_merge_5h_block_duplicates_v1\n  prior failure - to be cleared\n  fake traceback\n\n' > "$log_path"
 
     # Trigger open_db() — migration runs successfully and auto-clears.
     run_cctally "$home" weekly >/dev/null 2>&1 || true
@@ -1744,7 +1784,8 @@ fhb_banner_diff_json_routing () {
     local log_dir="$home/.local/share/cctally/logs"
     mkdir -p "$log_dir"
     local log_path="$log_dir/migration-errors.log"
-    printf '[2026-04-30T12:00:00Z] merge_5h_block_duplicates_v1\n  seeded test failure\n  Traceback line 1\n  Traceback line 2\n\n' > "$log_path"
+    # Use the framework-qualified name so bootstrap doesn't clear the entry.
+    printf '[2026-04-30T12:00:00Z] stats.db:003_merge_5h_block_duplicates_v1\n  seeded test failure\n  Traceback line 1\n  Traceback line 2\n\n' > "$log_path"
 
     # Run `diff --json` with a non-week range (no anchor needed).
     HOME="$home" TZ=Etc/UTC "$BIN" diff --a last-7d --b prev-7d --json \
@@ -1762,7 +1803,7 @@ fhb_banner_diff_json_routing () {
     fi
 
     # Banner MUST appear on STDERR.
-    if ! grep -q '⚠ cctally: migration `merge_5h_block_duplicates_v1` failed' \
+    if ! grep -q '⚠ cctally: migration `stats.db:003_merge_5h_block_duplicates_v1` failed' \
             "$home/diff-json-stderr.log"; then
         _err="${_err:+$_err; }diff --json banner missing on stderr"
     fi
@@ -1806,7 +1847,8 @@ INSERT INTO weekly_usage_snapshots (
     local log_dir="$home/.local/share/cctally/logs"
     mkdir -p "$log_dir"
     local log_path="$log_dir/migration-errors.log"
-    printf '[2026-04-30T12:00:00Z] merge_5h_block_duplicates_v1\n  seeded test failure\n  Traceback line 1\n  Traceback line 2\n\n' > "$log_path"
+    # Use the framework-qualified name so bootstrap doesn't clear the entry.
+    printf '[2026-04-30T12:00:00Z] stats.db:003_merge_5h_block_duplicates_v1\n  seeded test failure\n  Traceback line 1\n  Traceback line 2\n\n' > "$log_path"
 
     # Pin "now" so forecast renders deterministically.
     CCTALLY_AS_OF=2026-04-30T12:45:00Z HOME="$home" TZ=Etc/UTC \

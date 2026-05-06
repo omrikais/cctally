@@ -1,0 +1,18 @@
+## stdout
+stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 4 known
+  · 001_five_hour_block_models_backfill_v1         pending
+  · 002_five_hour_block_projects_backfill_v1       pending
+  · 003_merge_5h_block_duplicates_v1               pending
+  · 004_test_failure_injection                     pending
+
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 1 known
+  · 001_test_cache_migration                       pending
+## stderr
+
+## exit
+0
+## state
+stats.db: <missing>
+cache.db: <missing>
+## log
+<no migration-errors.log>

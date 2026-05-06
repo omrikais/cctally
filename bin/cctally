@@ -8347,6 +8347,46 @@ def _normalize_week_boundary_dt(value: dt.datetime) -> dt.datetime:
     return normalized
 
 
+_MIGRATION_IDENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def add_column_if_missing(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    decl: str,
+) -> bool:
+    """Add a column iff it doesn't already exist. Returns True if added.
+
+    Idempotent guard for column-shape evolution; NOT a migration. Use this
+    when the new column is nullable / has a sensible default and there is
+    no data backfill required (or the backfill is a separate
+    @stats_migration / @cache_migration). For data-shape changes (backfill,
+    dedup, rename), write a real registered migration instead — see
+    _STATS_MIGRATIONS / _CACHE_MIGRATIONS in this file.
+
+    f-string SQL is safe because `table` and `column` come from in-script
+    literals only; the regex check rejects names that don't match
+    ^[a-zA-Z_][a-zA-Z0-9_]*$ as belt-and-suspenders against future misuse.
+    """
+    if not _MIGRATION_IDENT_RE.match(table):
+        raise ValueError(f"invalid identifier (table): {table!r}")
+    if not _MIGRATION_IDENT_RE.match(column):
+        raise ValueError(f"invalid identifier (column): {column!r}")
+    # PRAGMA table_info column 1 is `name`. Index by position (r[1]) so
+    # the helper works whether the caller's connection set
+    # row_factory=sqlite3.Row (open_db) or left it as the default tuple
+    # factory (open_cache_db).
+    cols = {
+        str(r[1])
+        for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column in cols:
+        return False
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    return True
+
+
 def open_db() -> sqlite3.Connection:
     ensure_dirs()
     conn = sqlite3.connect(DB_PATH)
@@ -8400,18 +8440,10 @@ def open_db() -> sqlite3.Connection:
         """
     )
 
-    usage_cols = {
-        str(r["name"])
-        for r in conn.execute("PRAGMA table_info(weekly_usage_snapshots)").fetchall()
-    }
-    if "week_start_at" not in usage_cols:
-        conn.execute("ALTER TABLE weekly_usage_snapshots ADD COLUMN week_start_at TEXT")
-    if "week_end_at" not in usage_cols:
-        conn.execute("ALTER TABLE weekly_usage_snapshots ADD COLUMN week_end_at TEXT")
-    if "five_hour_percent" not in usage_cols:
-        conn.execute("ALTER TABLE weekly_usage_snapshots ADD COLUMN five_hour_percent REAL")
-    if "five_hour_resets_at" not in usage_cols:
-        conn.execute("ALTER TABLE weekly_usage_snapshots ADD COLUMN five_hour_resets_at TEXT")
+    add_column_if_missing(conn, "weekly_usage_snapshots", "week_start_at", "TEXT")
+    add_column_if_missing(conn, "weekly_usage_snapshots", "week_end_at", "TEXT")
+    add_column_if_missing(conn, "weekly_usage_snapshots", "five_hour_percent", "REAL")
+    add_column_if_missing(conn, "weekly_usage_snapshots", "five_hour_resets_at", "TEXT")
     # five_hour_window_key — canonical (10-min-floored epoch) key for
     # jitter-tolerant equality. Anthropic's status-line API jitters
     # rate_limits.5h.resets_at by ~seconds within the same physical 5h
@@ -8423,14 +8455,10 @@ def open_db() -> sqlite3.Connection:
     # state on the next open_db() call (`five_hour_resets_at IS NOT NULL
     # AND five_hour_window_key IS NULL`) and completes the backfill, so
     # the original Bug B can't silently re-emerge for half-migrated rows.
-    needs_5h_key_backfill = False
-    if "five_hour_window_key" not in usage_cols:
-        conn.execute(
-            "ALTER TABLE weekly_usage_snapshots "
-            "ADD COLUMN five_hour_window_key INTEGER"
-        )
-        needs_5h_key_backfill = True
-    elif conn.execute(
+    needs_5h_key_backfill = add_column_if_missing(
+        conn, "weekly_usage_snapshots", "five_hour_window_key", "INTEGER"
+    )
+    if not needs_5h_key_backfill and conn.execute(
         "SELECT 1 FROM weekly_usage_snapshots "
         "WHERE five_hour_resets_at IS NOT NULL "
         "  AND five_hour_window_key IS NULL "
@@ -8463,18 +8491,10 @@ def open_db() -> sqlite3.Connection:
         )
         conn.commit()
 
-    cost_cols = {
-        str(r["name"])
-        for r in conn.execute("PRAGMA table_info(weekly_cost_snapshots)").fetchall()
-    }
-    if "week_start_at" not in cost_cols:
-        conn.execute("ALTER TABLE weekly_cost_snapshots ADD COLUMN week_start_at TEXT")
-    if "week_end_at" not in cost_cols:
-        conn.execute("ALTER TABLE weekly_cost_snapshots ADD COLUMN week_end_at TEXT")
-    if "range_start_iso" not in cost_cols:
-        conn.execute("ALTER TABLE weekly_cost_snapshots ADD COLUMN range_start_iso TEXT")
-    if "range_end_iso" not in cost_cols:
-        conn.execute("ALTER TABLE weekly_cost_snapshots ADD COLUMN range_end_iso TEXT")
+    add_column_if_missing(conn, "weekly_cost_snapshots", "week_start_at", "TEXT")
+    add_column_if_missing(conn, "weekly_cost_snapshots", "week_end_at", "TEXT")
+    add_column_if_missing(conn, "weekly_cost_snapshots", "range_start_iso", "TEXT")
+    add_column_if_missing(conn, "weekly_cost_snapshots", "range_end_iso", "TEXT")
 
     conn.execute(
         """
@@ -8508,12 +8528,7 @@ def open_db() -> sqlite3.Connection:
         """
     )
 
-    milestone_cols = {
-        str(r["name"])
-        for r in conn.execute("PRAGMA table_info(percent_milestones)").fetchall()
-    }
-    if "five_hour_percent_at_crossing" not in milestone_cols:
-        conn.execute("ALTER TABLE percent_milestones ADD COLUMN five_hour_percent_at_crossing REAL")
+    add_column_if_missing(conn, "percent_milestones", "five_hour_percent_at_crossing", "REAL")
 
     # alerted_at: populated by the alert-dispatch path when a milestone-INSERT
     # row's threshold matches the user's configured alerts.weekly_thresholds /
@@ -8523,12 +8538,7 @@ def open_db() -> sqlite3.Connection:
     # best-effort and write-once forward-only). The matching ALTER for
     # `five_hour_milestones` lives right after that table's CREATE block
     # below, since the table doesn't exist yet at this point in `open_db()`.
-    milestone_cols = {
-        str(r["name"])
-        for r in conn.execute("PRAGMA table_info(percent_milestones)").fetchall()
-    }
-    if "alerted_at" not in milestone_cols:
-        conn.execute("ALTER TABLE percent_milestones ADD COLUMN alerted_at TEXT")
+    add_column_if_missing(conn, "percent_milestones", "alerted_at", "TEXT")
 
     # Mid-week reset events: when Anthropic advances `rate_limits.seven_day.
     # resets_at` before the previously-declared reset actually fires (i.e.,
@@ -8619,24 +8629,7 @@ def open_db() -> sqlite3.Connection:
     # matches the user's configured `alerts.five_hour_thresholds`. NULL =
     # "alerts disabled at moment of crossing OR threshold not configured"
     # — never "delivery failed".
-    fhb_cols = {
-        str(r["name"])
-        for r in conn.execute("PRAGMA table_info(five_hour_milestones)").fetchall()
-    }
-    if "alerted_at" not in fhb_cols:
-        conn.execute("ALTER TABLE five_hour_milestones ADD COLUMN alerted_at TEXT")
-
-    # ── schema_migrations (durable migration-completion marker) ──
-    # Future migrations gate on rows in this table rather than empty-row
-    # sentinels, so empty-row backfills correctly close their gates.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-            name             TEXT PRIMARY KEY,
-            applied_at_utc   TEXT NOT NULL
-        )
-        """
-    )
+    add_column_if_missing(conn, "five_hour_milestones", "alerted_at", "TEXT")
 
     # ── five_hour_block_models (per-(block, model) rollup-child) ──
     # MUST be created BEFORE the parent-backfill gate below, because
@@ -8708,9 +8701,29 @@ def open_db() -> sqlite3.Connection:
         """
     )
 
+    # Migration framework dispatcher. Replaces the prior inline gate stack
+    # (has_blocks + _migration_done) with the framework's _run_pending_-
+    # migrations entry point. See spec §2.3, §5.2 + the migration handlers
+    # decorated with @stats_migration further down in this file.
+    #
+    # MUST run BEFORE any DDL or write that touches `schema_migrations`
+    # (Codex P1 #1 fix on c3625ee + e7fdcc8): the dispatcher's fresh-install
+    # detection snapshots `schema_migrations`'s existence in sqlite_master
+    # BEFORE its own CREATE TABLE IF NOT EXISTS. Pre-creating the table
+    # earlier in open_db() (or letting `_backfill_five_hour_blocks` insert
+    # markers first) flips that snapshot to True on a brand-new DB and
+    # dead-codes the stamp-only fast path. The dispatcher is now the sole
+    # creator of `schema_migrations` + `schema_migrations_skipped`.
+    _run_pending_migrations(
+        conn, registry=_STATS_MIGRATIONS, db_label="stats.db",
+    )
+
     # One-time historical backfill of five_hour_blocks (rollup only;
     # milestones are forward-only per spec §4.3 / [Write-once milestones]).
     # Idempotent via UNIQUE(five_hour_window_key) + INSERT OR IGNORE.
+    # Runs AFTER the dispatcher so `schema_migrations` exists for the
+    # marker INSERTs inside the backfill body, and so any fresh-install
+    # stamp-only path the dispatcher took above is already committed.
     existing = conn.execute(
         "SELECT 1 FROM five_hour_blocks LIMIT 1"
     ).fetchone()
@@ -8721,42 +8734,25 @@ def open_db() -> sqlite3.Connection:
         "LIMIT 1"
     ).fetchone()
     if not existing and has_snapshots:
-        _backfill_five_hour_blocks(conn)
-
-    # ── Upgrade-user backfill gates: fire when the schema_migrations row is
-    # missing AND five_hour_blocks is non-empty. Empty-row backfills (a parent
-    # block whose session_entries are empty — real for API/web-only users)
-    # MUST still close the gate, so each helper inserts its schema_migrations
-    # row inside its own transaction regardless of child-row count. Per spec
-    # §4.2, gates check schema_migrations row presence (not empty-row
-    # sentinels) so they don't re-fire forever on empty-children states.
-    has_blocks = conn.execute(
-        "SELECT 1 FROM five_hour_blocks LIMIT 1"
-    ).fetchone() is not None
-
-    def _migration_done(name: str) -> bool:
-        return conn.execute(
-            "SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1",
-            (name,),
-        ).fetchone() is not None
-
-    if has_blocks and not _migration_done(
-        "five_hour_block_models_backfill_v1",
-    ):
-        _backfill_five_hour_block_models(conn)
-    if has_blocks and not _migration_done(
-        "five_hour_block_projects_backfill_v1",
-    ):
-        _backfill_five_hour_block_projects(conn)
-
-    # One-shot dedup migration: collapse boundary-jitter forks (two parent
-    # rows for the same physical 5h window). Idempotent via the
-    # schema_migrations marker; safe to run on tables with no duplicates
-    # (no-op fast path when every group has size 1).
-    if has_blocks and not _migration_done(
-        "merge_5h_block_duplicates_v1",
-    ):
-        _migration_merge_5h_block_duplicates_v1(conn)
+        inserted = _backfill_five_hour_blocks(conn)
+        # Re-run the 5h dedup migration AFTER backfill creates parents.
+        # The dispatcher above ran while five_hour_blocks was empty, so
+        # the dedup handler no-op'd and stamped its marker. Snapshot
+        # keys can carry jitter beyond the 600s canonical floor (the
+        # 003_* migration handles up to 1800s grouping), so the
+        # backfill's `DISTINCT five_hour_window_key` over those keys
+        # can produce duplicate parent rows for one physical 5h
+        # window. Without this re-invocation those duplicates persist
+        # forever — the marker says it ran. Handler owns its own
+        # BEGIN/COMMIT and is idempotent (no groups → no-op).
+        if inserted > 0:
+            for _m in _STATS_MIGRATIONS:
+                if _m.name == "003_merge_5h_block_duplicates_v1":
+                    try:
+                        _m.handler(conn)
+                    except Exception as exc:
+                        eprint(f"[5h-dedup post-backfill] failed: {exc}")
+                    break
 
     conn.commit()
     return conn
@@ -8851,14 +8847,8 @@ def open_cache_db() -> sqlite3.Connection:
     # Inline migration: add session_id / project_path columns to session_files
     # if they're missing. These were added for A2 `session` subcommand metadata;
     # populated lazily in sync_cache() / _ensure_session_files_row().
-    session_files_cols = {
-        str(r[1])
-        for r in conn.execute("PRAGMA table_info(session_files)").fetchall()
-    }
-    if "session_id" not in session_files_cols:
-        conn.execute("ALTER TABLE session_files ADD COLUMN session_id TEXT")
-    if "project_path" not in session_files_cols:
-        conn.execute("ALTER TABLE session_files ADD COLUMN project_path TEXT")
+    add_column_if_missing(conn, "session_files", "session_id", "TEXT")
+    add_column_if_missing(conn, "session_files", "project_path", "TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
         "ON session_files(session_id)"
@@ -8869,19 +8859,20 @@ def open_cache_db() -> sqlite3.Connection:
     # Codex cache so the duplicate-counted rows produced by the previous
     # iterator are reingested cleanly by sync_codex_cache(). The cache is
     # fully re-derivable from ~/.codex/sessions/*.jsonl so this is safe.
-    codex_files_cols = {
-        str(r[1])
-        for r in conn.execute("PRAGMA table_info(codex_session_files)").fetchall()
-    }
-    if "last_total_tokens" not in codex_files_cols:
-        conn.execute(
-            "ALTER TABLE codex_session_files ADD COLUMN last_total_tokens INTEGER"
-        )
+    if add_column_if_missing(conn, "codex_session_files", "last_total_tokens", "INTEGER"):
         conn.execute("DELETE FROM codex_session_entries")
         conn.execute("DELETE FROM codex_session_files")
         conn.commit()
         eprint("[cache] migrated codex cache — re-ingesting")
 
+    # Migration framework dispatcher for cache.db. The registry is empty in
+    # v1 — this is preparatory wiring that activates when the next cache.db
+    # migration ships. With an empty registry the dispatcher hits the
+    # fast-path or fresh-install branch and returns immediately. See spec
+    # §2.5, §3.3 + the @cache_migration decorator further down in this file.
+    _run_pending_migrations(
+        conn, registry=_CACHE_MIGRATIONS, db_label="cache.db",
+    )
     return conn
 
 
@@ -10401,15 +10392,22 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
         conn.close()
 
 
-def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> None:
+def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> int:
     """One-shot historical backfill of five_hour_blocks from existing
     weekly_usage_snapshots data. Idempotent via UNIQUE(five_hour_window_key)
     + INSERT OR IGNORE. Per spec §4.3, five_hour_milestones is NEVER
     backfilled (write-once gotcha).
 
-    Failures during backfill log to stderr and rollback; gate fires
-    again on next open_db() so partial state is recoverable.
+    Returns the count of newly-inserted parent rows (sum of INSERT OR IGNORE
+    rowcounts). Caller uses this to decide whether to re-run the
+    003_merge_5h_block_duplicates_v1 handler post-backfill — the dispatcher
+    walks the registry BEFORE this backfill, so a fresh run against an
+    empty five_hour_blocks no-ops the dedup migration even when the
+    snapshot keys we're about to insert are jitter-forked. On failure,
+    rolls back and returns 0; gate fires again on next open_db() so
+    partial state is recoverable.
     """
+    inserted = 0
     try:
         # Iterate distinct windows that have BOTH a canonical key AND a
         # 5h percent. The percent guard is critical: MAX(five_hour_percent)
@@ -10496,7 +10494,7 @@ def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> None:
                     block_start_dt, last_obs_dt, skip_sync=True,
                 )
 
-                conn.execute(
+                cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO five_hour_blocks (
                       five_hour_window_key,
@@ -10539,6 +10537,7 @@ def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> None:
                         now_iso,
                     ),
                 )
+                inserted += cur.rowcount or 0
 
                 # ── Write per-(block, model) and per-(block, project) child
                 # rows for this window. INSERT OR IGNORE handles partial-fail
@@ -10613,8 +10612,8 @@ def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> None:
                 VALUES (?, ?)
                 """,
                 [
-                    ("five_hour_block_models_backfill_v1",   now_iso),
-                    ("five_hour_block_projects_backfill_v1", now_iso),
+                    ("001_five_hour_block_models_backfill_v1",   now_iso),
+                    ("002_five_hour_block_projects_backfill_v1", now_iso),
                 ],
             )
             conn.commit()
@@ -10623,13 +10622,295 @@ def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> None:
             raise
     except Exception as exc:
         eprint(f"[5h-block backfill] failed: {exc}")
+        return 0
+    return inserted
 
 
+# ────────────────────────────────────────────────────────────────────────
+# Migration framework primitives
+# ────────────────────────────────────────────────────────────────────────
+# Spec: docs/superpowers/specs/2026-05-06-migration-framework-design.md
+#
+# Two per-DB registries populated by @stats_migration / @cache_migration
+# decorators. The decorators enforce contiguous NNN_ numbering at
+# registration time — gap or duplicate is a RuntimeError on script load.
+# Dispatcher wiring is added in a later task; these primitives are dormant
+# until then.
+
+_MIGRATION_NAME_RE = re.compile(r"^\d{3}_[a-z0-9_]+$")
+
+
+@dataclass(frozen=True)
+class Migration:
+    """A single registered migration.
+
+    seq:     1-based; equals position in the registry at registration time.
+    name:    "NNN_descriptive_name", written into schema_migrations.
+    handler: callable(conn) that owns its own BEGIN/COMMIT/ROLLBACK.
+    """
+    seq: int
+    name: str
+    handler: Callable[[sqlite3.Connection], None]
+
+
+_STATS_MIGRATIONS: list[Migration] = []
+_CACHE_MIGRATIONS: list[Migration] = []
+
+
+class DowngradeDetected(Exception):
+    """Raised by the dispatcher when PRAGMA user_version > len(registry).
+
+    Means the DB was last touched by a newer cctally that has since been
+    downgraded. The framework refuses to open because newer migrations
+    may have written shapes the older code can't read.
+    """
+
+    def __init__(self, db_label: str, db_version: int, max_known: int):
+        self.db_label = db_label
+        self.db_version = db_version
+        self.max_known = max_known
+        super().__init__(
+            f"{db_label} is at version {db_version} but this cctally "
+            f"only knows up to {max_known}."
+        )
+
+
+def _make_migration_decorator(registry: list[Migration], db_label: str, name: str):
+    """Internal helper — builds the @stats_migration / @cache_migration decorators.
+
+    Enforces three invariants at registration time. Checks run in this
+    order so the developer sees the most actionable message first:
+      1. Name matches ^\\d{3}_[a-z0-9_]+$ (well-formed) — typos beat
+         contiguity errors.
+      2. Name is unique within this registry — re-registration of an
+         existing migration is a copy-paste bug, not a numbering bug.
+      3. Numeric prefix matches len(registry) + 1 exactly (contiguity)
+         — final defense against gaps / out-of-order edits.
+    Failure of any → RuntimeError at script load (not silently mis-applied).
+    """
+    def deco(fn):
+        if not _MIGRATION_NAME_RE.match(name):
+            raise RuntimeError(
+                f"{db_label} migration name '{name}' is invalid; "
+                f"must match {_MIGRATION_NAME_RE.pattern}"
+            )
+        if any(m.name == name for m in registry):
+            raise RuntimeError(
+                f"{db_label} migration '{name}' duplicated"
+            )
+        seq = len(registry) + 1
+        prefix = f"{seq:03d}_"
+        if not name.startswith(prefix):
+            raise RuntimeError(
+                f"{db_label} migration #{seq} must be named '{prefix}…' "
+                f"but got '{name}'"
+            )
+        registry.append(Migration(seq=seq, name=name, handler=fn))
+        return fn
+    return deco
+
+
+def stats_migration(name: str):
+    """Register a stats.db migration. Use as @stats_migration("NNN_descriptive_name")."""
+    return _make_migration_decorator(_STATS_MIGRATIONS, "stats.db", name)
+
+
+def cache_migration(name: str):
+    """Register a cache.db migration. Use as @cache_migration("NNN_descriptive_name")."""
+    return _make_migration_decorator(_CACHE_MIGRATIONS, "cache.db", name)
+
+
+# Pre-framework migration markers were stored under unprefixed names;
+# the dispatcher's bootstrap rename rewrites them to NNN_ form on the
+# first open_db() that runs the framework. Raw-sqlite3 db commands
+# (cmd_db_status, cmd_db_skip) bypass open_db() by design and so don't
+# benefit from that rename — they consult this map to recognize legacy
+# rows as already-applied without mutating the DB.
+_LEGACY_MARKER_ALIASES_BY_DB: dict[str, dict[str, str]] = {
+    "stats.db": {
+        "five_hour_block_models_backfill_v1":   "001_five_hour_block_models_backfill_v1",
+        "five_hour_block_projects_backfill_v1": "002_five_hour_block_projects_backfill_v1",
+        "merge_5h_block_duplicates_v1":         "003_merge_5h_block_duplicates_v1",
+    },
+    # cache.db has no pre-framework markers.
+    "cache.db": {},
+}
+
+
+def _bootstrap_rename_legacy_markers(conn: sqlite3.Connection, db_label: str) -> None:
+    """One-shot, idempotent: rename pre-framework marker rows to NNN_ form.
+
+    Caller (the dispatcher, added in a later task) owns the BEGIN/COMMIT
+    envelope; this fn just executes the DML inside the active transaction.
+    Hardcoded against the three known stats.db markers — no-op everywhere
+    else, including cache.db (which has no pre-framework markers).
+
+    Also clears any pre-framework failure-log entries referencing the
+    legacy unprefixed name, so a residual banner stops rendering once the
+    rename succeeds. Without this clear, the dispatcher's success-side
+    _clear_migration_error_log_entries(qualified_name) would match
+    nothing and the legacy banner would persist forever (Codex P2 #5).
+
+    Idempotent on subsequent opens: the UPDATEs find nothing to rename
+    and the log clears find nothing to drop.
+    """
+    aliases = _LEGACY_MARKER_ALIASES_BY_DB.get(db_label, {})
+    if not aliases:
+        return
+    for old, new in aliases.items():
+        conn.execute(
+            "UPDATE schema_migrations SET name = ? WHERE name = ?",
+            (new, old),
+        )
+        _clear_migration_error_log_entries(old)
+
+
+def _run_pending_migrations(
+    conn: sqlite3.Connection,
+    *,
+    registry: list[Migration],
+    db_label: str,
+) -> None:
+    """Apply pending migrations from ``registry`` against ``conn``.
+
+    Spec: docs/superpowers/specs/2026-05-06-migration-framework-design.md
+          §2.3 (full pseudocode), §3.1 (failure semantics).
+
+    Behavior:
+      - PRAGMA user_version > len(registry)  → raise DowngradeDetected.
+      - PRAGMA user_version == len(registry) → fast-path return.
+      - Bootstrap rename runs in its own BEGIN/COMMIT (Codex P1 #2 fix):
+        closes the implicit transaction Python's sqlite3 module would
+        auto-open on the UPDATE statements, so subsequent handler
+        ``conn.execute("BEGIN")`` calls start cleanly.
+      - Fresh install (schema_migrations just CREATE'd, zero rows
+        post-bootstrap) → stamp every migration applied without invoking
+        handlers.
+      - Per migration: handler raises ``Exception`` → log + BREAK
+        (Codex P1 #3 — the FIRST failure halts the registry walk so
+        later migrations never see partial-prior state). ``BaseException``
+        propagates uncaught (Codex P1 #4 — KeyboardInterrupt / SystemExit
+        must not be swallowed).
+      - Tuple-safe SELECTs (Codex P2 #7) — works against connections
+        with or without ``row_factory = Row``; cache.db deliberately
+        leaves the default tuple row factory.
+      - PRAGMA user_version advances ONLY when every migration is
+        applied OR skipped post-loop. A failure in the middle of the
+        registry leaves user_version unchanged so the next open re-tries
+        from the failed entry.
+    """
+    cur_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if cur_version > len(registry):
+        raise DowngradeDetected(
+            db_label, db_version=cur_version, max_known=len(registry),
+        )
+    if cur_version == len(registry):
+        return  # fast path
+
+    # Track whether schema_migrations existed before this open so we can
+    # detect the fresh-install path. After bootstrap, even a "first time
+    # opened with framework code" DB might have rows from the legacy
+    # rename — those count as already-applied, NOT as a fresh install.
+    schema_migrations_existed = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    ).fetchone() is not None
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            name           TEXT PRIMARY KEY,
+            applied_at_utc TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations_skipped (
+            name           TEXT PRIMARY KEY,
+            skipped_at_utc TEXT NOT NULL,
+            reason         TEXT
+        )
+        """
+    )
+
+    # Bootstrap rename in its own commit envelope (Codex P1 #2 fix).
+    # Closes the implicit transaction Python's sqlite3 module would
+    # auto-open on the UPDATE statements, so subsequent handler
+    # conn.execute("BEGIN") starts cleanly.
+    try:
+        conn.execute("BEGIN")
+        _bootstrap_rename_legacy_markers(conn, db_label)
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        _log_migration_error(
+            name=f"{db_label}:_bootstrap_rename_legacy_markers",
+            exc=exc,
+            tb=traceback.format_exc(),
+        )
+        eprint(
+            f"[migration {db_label}:_bootstrap_rename_legacy_markers] "
+            f"failed: {exc}"
+        )
+        return  # do not walk the registry this open
+
+    # Tuple-safe SELECTs — cache.db connection does not set row_factory.
+    applied = {
+        row[0] for row in conn.execute("SELECT name FROM schema_migrations").fetchall()
+    }
+    skipped = {
+        row[0] for row in conn.execute("SELECT name FROM schema_migrations_skipped").fetchall()
+    }
+
+    # Fresh install: schema_migrations was just CREATE'd this open AND
+    # has zero rows post-bootstrap. (If bootstrap renamed pre-existing
+    # rows, those rows now appear in `applied`; not a fresh install.)
+    fresh_install = (not schema_migrations_existed) and len(applied) == 0
+
+    now_iso = now_utc_iso()
+    for m in registry:
+        if m.name in applied or m.name in skipped:
+            continue
+        if fresh_install:
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
+                (m.name, now_iso),
+            )
+            applied.add(m.name)
+            continue
+        qualified_name = f"{db_label}:{m.name}"
+        try:
+            m.handler(conn)
+            _clear_migration_error_log_entries(qualified_name)
+            applied.add(m.name)
+        except Exception as exc:
+            _log_migration_error(
+                name=qualified_name,
+                exc=exc,
+                tb=traceback.format_exc(),
+            )
+            eprint(f"[migration {qualified_name}] failed: {exc}")
+            break  # stop on first failure (Codex P1 #3)
+
+    if fresh_install:
+        conn.commit()  # commit fresh-install stamps so they're durable
+
+    # Advance user_version only when every migration is applied OR skipped.
+    if all((m.name in applied or m.name in skipped) for m in registry):
+        conn.execute(f"PRAGMA user_version = {len(registry)}")
+        conn.commit()
+
+
+@stats_migration("001_five_hour_block_models_backfill_v1")
 def _backfill_five_hour_block_models(conn: sqlite3.Connection) -> None:
     """Upgrade-user backfill of five_hour_block_models.
 
     Fires when schema_migrations has no row for
-    'five_hour_block_models_backfill_v1' AND five_hour_blocks is non-empty.
+    '001_five_hour_block_models_backfill_v1' AND five_hour_blocks is
+    non-empty.
 
     Iterates parent rows, re-walks session_entries per block via
     _compute_block_totals(..., skip_sync=False), and INSERT OR IGNORE's
@@ -10650,85 +10931,95 @@ def _backfill_five_hour_block_models(conn: sqlite3.Connection) -> None:
     users with API/web-only blocks) yields zero child rows but MUST
     still close the gate (regression scenario Q2).
     """
+    # Empty-table fast path: with no parent five_hour_blocks rows, this
+    # backfill has nothing to do. We still must close the gate so the
+    # dispatcher sees us as applied. INSERT OR IGNORE the marker and
+    # return (replaces the prior `has_blocks` outer gate from the
+    # pre-framework era).
+    if not conn.execute("SELECT 1 FROM five_hour_blocks LIMIT 1").fetchone():
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
+            ("001_five_hour_block_models_backfill_v1", now_utc_iso()),
+        )
+        conn.commit()
+        return
+    now_iso = now_utc_iso()
+    conn.execute("BEGIN")
     try:
-        now_iso = now_utc_iso()
-        conn.execute("BEGIN")
-        try:
-            # Defensive: clean up any orphans from a prior parent rebuild.
-            conn.execute(
-                "DELETE FROM five_hour_block_models "
-                "WHERE block_id NOT IN (SELECT id FROM five_hour_blocks)"
-            )
+        # Defensive: clean up any orphans from a prior parent rebuild.
+        conn.execute(
+            "DELETE FROM five_hour_block_models "
+            "WHERE block_id NOT IN (SELECT id FROM five_hour_blocks)"
+        )
 
-            rows = conn.execute(
-                "SELECT id, five_hour_window_key, block_start_at, "
-                "       last_observed_at_utc "
-                "  FROM five_hour_blocks"
-            ).fetchall()
-            for row in rows:
-                block_start_dt = parse_iso_datetime(
-                    row["block_start_at"],
-                    "five_hour_blocks.block_start_at",
-                )
-                last_obs_dt = parse_iso_datetime(
-                    row["last_observed_at_utc"],
-                    "five_hour_blocks.last_observed_at_utc",
-                )
-                # skip_sync=False: ingest JSONL deltas before walking
-                # entries. If the user's cache.db is empty/stale at the
-                # moment open_db() fires this gate (e.g., cache.db deleted,
-                # stats.db imported from another machine), querying the
-                # cache as-is would return zero entries and we'd close the
-                # gate forever with empty children. sync_cache(conn)
-                # operates on cache.db only — it does NOT call open_db(),
-                # so there is no recursion risk.
-                totals = _compute_block_totals(
-                    block_start_dt, last_obs_dt, skip_sync=False,
-                )
-                if totals.get("by_model"):
-                    conn.executemany(
-                        """
-                        INSERT OR IGNORE INTO five_hour_block_models (
-                          block_id, five_hour_window_key, model,
-                          input_tokens, output_tokens,
-                          cache_create_tokens, cache_read_tokens,
-                          cost_usd, entry_count
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        [
-                            (
-                                int(row["id"]),
-                                int(row["five_hour_window_key"]),
-                                model,
-                                b["input_tokens"],
-                                b["output_tokens"],
-                                b["cache_create_tokens"],
-                                b["cache_read_tokens"],
-                                b["cost_usd"],
-                                b["entry_count"],
-                            )
-                            for model, b in totals["by_model"].items()
-                        ],
+        rows = conn.execute(
+            "SELECT id, five_hour_window_key, block_start_at, "
+            "       last_observed_at_utc "
+            "  FROM five_hour_blocks"
+        ).fetchall()
+        for row in rows:
+            block_start_dt = parse_iso_datetime(
+                row["block_start_at"],
+                "five_hour_blocks.block_start_at",
+            )
+            last_obs_dt = parse_iso_datetime(
+                row["last_observed_at_utc"],
+                "five_hour_blocks.last_observed_at_utc",
+            )
+            # skip_sync=False: ingest JSONL deltas before walking
+            # entries. If the user's cache.db is empty/stale at the
+            # moment open_db() fires this gate (e.g., cache.db deleted,
+            # stats.db imported from another machine), querying the
+            # cache as-is would return zero entries and we'd close the
+            # gate forever with empty children. sync_cache(conn)
+            # operates on cache.db only — it does NOT call open_db(),
+            # so there is no recursion risk.
+            totals = _compute_block_totals(
+                block_start_dt, last_obs_dt, skip_sync=False,
+            )
+            if totals.get("by_model"):
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO five_hour_block_models (
+                      block_id, five_hour_window_key, model,
+                      input_tokens, output_tokens,
+                      cache_create_tokens, cache_read_tokens,
+                      cost_usd, entry_count
                     )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            int(row["id"]),
+                            int(row["five_hour_window_key"]),
+                            model,
+                            b["input_tokens"],
+                            b["output_tokens"],
+                            b["cache_create_tokens"],
+                            b["cache_read_tokens"],
+                            b["cost_usd"],
+                            b["entry_count"],
+                        )
+                        for model, b in totals["by_model"].items()
+                    ],
+                )
 
-            # Mark migration done — closes the gate even when zero rows
-            # were written (empty session_entries / API-only blocks).
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc)
-                VALUES (?, ?)
-                """,
-                ("five_hour_block_models_backfill_v1", now_iso),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    except Exception as exc:
-        eprint(f"[5h-block models backfill] failed: {exc}")
+        # Mark migration done — closes the gate even when zero rows
+        # were written (empty session_entries / API-only blocks).
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc)
+            VALUES (?, ?)
+            """,
+            ("001_five_hour_block_models_backfill_v1", now_iso),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
+@stats_migration("002_five_hour_block_projects_backfill_v1")
 def _backfill_five_hour_block_projects(conn: sqlite3.Connection) -> None:
     """Upgrade-user backfill of five_hour_block_projects.
 
@@ -10738,77 +11029,86 @@ def _backfill_five_hour_block_projects(conn: sqlite3.Connection) -> None:
     Marker insert fires regardless of child-row count so the gate
     closes for empty-row backfills too.
     """
+    # Empty-table fast path: with no parent five_hour_blocks rows, this
+    # backfill has nothing to do. We still must close the gate so the
+    # dispatcher sees us as applied. INSERT OR IGNORE the marker and
+    # return (replaces the prior `has_blocks` outer gate from the
+    # pre-framework era).
+    if not conn.execute("SELECT 1 FROM five_hour_blocks LIMIT 1").fetchone():
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
+            ("002_five_hour_block_projects_backfill_v1", now_utc_iso()),
+        )
+        conn.commit()
+        return
+    now_iso = now_utc_iso()
+    conn.execute("BEGIN")
     try:
-        now_iso = now_utc_iso()
-        conn.execute("BEGIN")
-        try:
-            conn.execute(
-                "DELETE FROM five_hour_block_projects "
-                "WHERE block_id NOT IN (SELECT id FROM five_hour_blocks)"
-            )
+        conn.execute(
+            "DELETE FROM five_hour_block_projects "
+            "WHERE block_id NOT IN (SELECT id FROM five_hour_blocks)"
+        )
 
-            rows = conn.execute(
-                "SELECT id, five_hour_window_key, block_start_at, "
-                "       last_observed_at_utc "
-                "  FROM five_hour_blocks"
-            ).fetchall()
-            for row in rows:
-                block_start_dt = parse_iso_datetime(
-                    row["block_start_at"],
-                    "five_hour_blocks.block_start_at",
-                )
-                last_obs_dt = parse_iso_datetime(
-                    row["last_observed_at_utc"],
-                    "five_hour_blocks.last_observed_at_utc",
-                )
-                # See _backfill_five_hour_block_models for the same
-                # skip_sync=False rationale: ingest JSONL deltas first so
-                # an empty/stale cache.db doesn't permanently close the
-                # gate with zero rows. sync_cache only touches cache.db,
-                # so there is no open_db() recursion risk.
-                totals = _compute_block_totals(
-                    block_start_dt, last_obs_dt, skip_sync=False,
-                )
-                if totals.get("by_project"):
-                    conn.executemany(
-                        """
-                        INSERT OR IGNORE INTO five_hour_block_projects (
-                          block_id, five_hour_window_key, project_path,
-                          input_tokens, output_tokens,
-                          cache_create_tokens, cache_read_tokens,
-                          cost_usd, entry_count
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        [
-                            (
-                                int(row["id"]),
-                                int(row["five_hour_window_key"]),
-                                project_path,
-                                b["input_tokens"],
-                                b["output_tokens"],
-                                b["cache_create_tokens"],
-                                b["cache_read_tokens"],
-                                b["cost_usd"],
-                                b["entry_count"],
-                            )
-                            for project_path, b in totals["by_project"].items()
-                        ],
+        rows = conn.execute(
+            "SELECT id, five_hour_window_key, block_start_at, "
+            "       last_observed_at_utc "
+            "  FROM five_hour_blocks"
+        ).fetchall()
+        for row in rows:
+            block_start_dt = parse_iso_datetime(
+                row["block_start_at"],
+                "five_hour_blocks.block_start_at",
+            )
+            last_obs_dt = parse_iso_datetime(
+                row["last_observed_at_utc"],
+                "five_hour_blocks.last_observed_at_utc",
+            )
+            # See _backfill_five_hour_block_models for the same
+            # skip_sync=False rationale: ingest JSONL deltas first so
+            # an empty/stale cache.db doesn't permanently close the
+            # gate with zero rows. sync_cache only touches cache.db,
+            # so there is no open_db() recursion risk.
+            totals = _compute_block_totals(
+                block_start_dt, last_obs_dt, skip_sync=False,
+            )
+            if totals.get("by_project"):
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO five_hour_block_projects (
+                      block_id, five_hour_window_key, project_path,
+                      input_tokens, output_tokens,
+                      cache_create_tokens, cache_read_tokens,
+                      cost_usd, entry_count
                     )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            int(row["id"]),
+                            int(row["five_hour_window_key"]),
+                            project_path,
+                            b["input_tokens"],
+                            b["output_tokens"],
+                            b["cache_create_tokens"],
+                            b["cache_read_tokens"],
+                            b["cost_usd"],
+                            b["entry_count"],
+                        )
+                        for project_path, b in totals["by_project"].items()
+                    ],
+                )
 
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc)
-                VALUES (?, ?)
-                """,
-                ("five_hour_block_projects_backfill_v1", now_iso),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    except Exception as exc:
-        eprint(f"[5h-block projects backfill] failed: {exc}")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc)
+            VALUES (?, ?)
+            """,
+            ("002_five_hour_block_projects_backfill_v1", now_iso),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _log_migration_error(*, name: str, exc: BaseException, tb: str) -> None:
@@ -10925,6 +11225,8 @@ _BANNER_SUPPRESSED_COMMANDS = frozenset({
     "cache-sync",      # background; bulk operation, no banner needed
     "refresh-usage",   # background; OAuth fetch + record-usage chain
     "tui",             # rich Live mode takes over the screen; banner would be clobbered
+    "db",              # `db status` shows failure state in its own output;
+                       # `db skip` / `db unskip` are mid-fix — banner would be redundant.
     # Note: `setup` carve-out handled separately (only suppressed w/o --status).
     # Note: `dashboard` carve-out handled separately (banner printed in cmd_dashboard).
 })
@@ -11007,6 +11309,7 @@ def _print_migration_error_banner_if_needed(args) -> None:
     print(banner_msg, file=sys.stderr if json_mode else sys.stdout)
 
 
+@stats_migration("003_merge_5h_block_duplicates_v1")
 def _migration_merge_5h_block_duplicates_v1(conn: sqlite3.Connection) -> None:
     """One-shot migration: merge ``five_hour_blocks`` rows that represent
     the same physical 5h window but have different ``five_hour_window_key``
@@ -11059,291 +11362,332 @@ def _migration_merge_5h_block_duplicates_v1(conn: sqlite3.Connection) -> None:
     SQLite cascade — see CLAUDE.md), so all FK rewrites are explicit
     ``UPDATE``s here.
     """
-    if conn.execute(
-        "SELECT 1 FROM schema_migrations WHERE name = ?",
-        ("merge_5h_block_duplicates_v1",),
-    ).fetchone():
-        return
+    conn.execute("BEGIN")
     try:
-        conn.execute("BEGIN")
-        try:
-            blocks = conn.execute(
-                """
-                SELECT id, five_hour_window_key, five_hour_resets_at,
-                       first_observed_at_utc, last_observed_at_utc,
-                       final_five_hour_percent,
-                       seven_day_pct_at_block_end,
-                       crossed_seven_day_reset, is_closed,
-                       total_input_tokens, total_output_tokens,
-                       total_cache_create_tokens, total_cache_read_tokens,
-                       total_cost_usd
-                  FROM five_hour_blocks
-                 ORDER BY five_hour_resets_at ASC
-                """
-            ).fetchall()
+        blocks = conn.execute(
+            """
+            SELECT id, five_hour_window_key, five_hour_resets_at,
+                   first_observed_at_utc, last_observed_at_utc,
+                   final_five_hour_percent,
+                   seven_day_pct_at_block_end,
+                   crossed_seven_day_reset, is_closed,
+                   total_input_tokens, total_output_tokens,
+                   total_cache_create_tokens, total_cache_read_tokens,
+                   total_cost_usd
+              FROM five_hour_blocks
+             ORDER BY five_hour_resets_at ASC
+            """
+        ).fetchall()
 
-            # Convert resets_at to epoch for distance math. A row whose
-            # five_hour_resets_at fails to parse is left alone in its own
-            # singleton group (defensive — should not happen on data
-            # written by record-usage, but better to skip than raise).
-            rows: list[tuple[int, dict]] = []
-            for b in blocks:
-                try:
-                    ep = int(parse_iso_datetime(
-                        b["five_hour_resets_at"],
-                        "five_hour_blocks.five_hour_resets_at",
-                    ).timestamp())
-                except (ValueError, TypeError):
-                    continue
-                rows.append((ep, dict(b)))
+        # Convert resets_at to epoch for distance math. A row whose
+        # five_hour_resets_at fails to parse is left alone in its own
+        # singleton group (defensive — should not happen on data
+        # written by record-usage, but better to skip than raise).
+        rows: list[tuple[int, dict]] = []
+        for b in blocks:
+            try:
+                ep = int(parse_iso_datetime(
+                    b["five_hour_resets_at"],
+                    "five_hour_blocks.five_hour_resets_at",
+                ).timestamp())
+            except (ValueError, TypeError):
+                continue
+            rows.append((ep, dict(b)))
 
-            # Defensive: SQL ORDER BY is lex-ordered. For the columns we
-            # read today (consistently +00:00 form), lex == chronological.
-            # Re-sort by parsed epoch in Python so a future code path
-            # accidentally writing `Z` form into five_hour_resets_at can't
-            # mis-group across format boundaries.
-            rows.sort(key=lambda r: r[0])
+        # Defensive: SQL ORDER BY is lex-ordered. For the columns we
+        # read today (consistently +00:00 form), lex == chronological.
+        # Re-sort by parsed epoch in Python so a future code path
+        # accidentally writing `Z` form into five_hour_resets_at can't
+        # mis-group across format boundaries.
+        rows.sort(key=lambda r: r[0])
 
-            # Greedy-group by proximity to the group's anchor epoch.
-            groups: list[list[tuple[int, dict]]] = []
-            cur_group: list[tuple[int, dict]] = []
-            cur_anchor: int | None = None
-            for ep, row in rows:
-                if (
-                    cur_anchor is None
-                    or (ep - cur_anchor) <= _FIVE_HOUR_JITTER_FLOOR_SECONDS * 3
-                ):
-                    cur_group.append((ep, row))
-                    if cur_anchor is None:
-                        cur_anchor = ep
-                else:
-                    groups.append(cur_group)
-                    cur_group = [(ep, row)]
+        # Greedy-group by proximity to the group's anchor epoch.
+        groups: list[list[tuple[int, dict]]] = []
+        cur_group: list[tuple[int, dict]] = []
+        cur_anchor: int | None = None
+        for ep, row in rows:
+            if (
+                cur_anchor is None
+                or (ep - cur_anchor) <= _FIVE_HOUR_JITTER_FLOOR_SECONDS * 3
+            ):
+                cur_group.append((ep, row))
+                if cur_anchor is None:
                     cur_anchor = ep
-            if cur_group:
+            else:
                 groups.append(cur_group)
+                cur_group = [(ep, row)]
+                cur_anchor = ep
+        if cur_group:
+            groups.append(cur_group)
 
-            for group in groups:
-                if len(group) < 2:
-                    continue
+        for group in groups:
+            if len(group) < 2:
+                continue
 
-                # Canonical wins by earliest first_observed_at_utc — same
-                # write-once precedence as the live upsert path.
-                # NULL first_observed_at_utc shouldn't happen post-schema-
-                # NOT-NULL, but defensive against legacy rows; NULL rows
-                # lose canonical-pick tiebreak (sort LAST via True>False).
-                # Empty-string fallback in the second tuple element keeps
-                # SQLite NULLs comparable; a NULL row only becomes
-                # canonical if EVERY row in the group is NULL.
-                group_sorted = sorted(
-                    group,
-                    key=lambda g: (
-                        g[1]["first_observed_at_utc"] is None,
-                        g[1]["first_observed_at_utc"] or "",
-                    ),
-                )
-                canonical = group_sorted[0][1]
-                dropped = [g[1] for g in group_sorted[1:]]
-                dropped_keys = [d["five_hour_window_key"] for d in dropped]
-                dropped_ids = [d["id"] for d in dropped]
+            # Canonical wins by earliest first_observed_at_utc — same
+            # write-once precedence as the live upsert path.
+            # NULL first_observed_at_utc shouldn't happen post-schema-
+            # NOT-NULL, but defensive against legacy rows; NULL rows
+            # lose canonical-pick tiebreak (sort LAST via True>False).
+            # Empty-string fallback in the second tuple element keeps
+            # SQLite NULLs comparable; a NULL row only becomes
+            # canonical if EVERY row in the group is NULL.
+            group_sorted = sorted(
+                group,
+                key=lambda g: (
+                    g[1]["first_observed_at_utc"] is None,
+                    g[1]["first_observed_at_utc"] or "",
+                ),
+            )
+            canonical = group_sorted[0][1]
+            dropped = [g[1] for g in group_sorted[1:]]
+            dropped_keys = [d["five_hour_window_key"] for d in dropped]
+            dropped_ids = [d["id"] for d in dropped]
 
-                # (b) Re-key snapshots so latest-snapshot lookup returns
-                # the canonical key.
-                placeholders_keys = ",".join("?" * len(dropped_keys))
-                conn.execute(
-                    f"UPDATE weekly_usage_snapshots "
-                    f"   SET five_hour_window_key = ? "
-                    f" WHERE five_hour_window_key IN ({placeholders_keys})",
-                    [canonical["five_hour_window_key"], *dropped_keys],
-                )
+            # (b) Re-key snapshots so latest-snapshot lookup returns
+            # the canonical key.
+            placeholders_keys = ",".join("?" * len(dropped_keys))
+            conn.execute(
+                f"UPDATE weekly_usage_snapshots "
+                f"   SET five_hour_window_key = ? "
+                f" WHERE five_hour_window_key IN ({placeholders_keys})",
+                [canonical["five_hour_window_key"], *dropped_keys],
+            )
 
-                # (c) Milestones: per-threshold dedup, keep earliest
-                # captured_at_utc, re-FK keepers to canonical.
-                ms_id_placeholders = ",".join(
-                    "?" * (len(dropped_ids) + 1)
-                )
-                all_milestones = conn.execute(
-                    f"SELECT id, percent_threshold, captured_at_utc "
-                    f"  FROM five_hour_milestones "
-                    f" WHERE block_id IN ({ms_id_placeholders})",
-                    [canonical["id"], *dropped_ids],
-                ).fetchall()
-                by_threshold: dict[int, dict] = {}
-                for m in all_milestones:
-                    t = m["percent_threshold"]
-                    md = dict(m)
-                    if (
-                        t not in by_threshold
-                        or md["captured_at_utc"]
-                        < by_threshold[t]["captured_at_utc"]
-                    ):
-                        by_threshold[t] = md
-                keep_ids = {m["id"] for m in by_threshold.values()}
-                # DELETE non-keepers BEFORE rekeying keepers. Otherwise, when
-                # both canonical and a dropped block hold a milestone for the
-                # same percent_threshold and the dropped row's milestone is
-                # the earlier keeper, UPDATEing it to the canonical key
-                # collides with canonical's still-present non-keeper on
-                # UNIQUE(five_hour_window_key, percent_threshold), rolling
-                # back the migration. After this DELETE the only milestones
-                # referencing dropped_keys are the keepers themselves
-                # (one per threshold), so the UPDATE loop below is collision-
-                # free.
-                non_keep_ids = [
-                    m["id"] for m in all_milestones if m["id"] not in keep_ids
-                ]
-                if non_keep_ids:
-                    nk_placeholders = ",".join("?" * len(non_keep_ids))
-                    conn.execute(
-                        f"DELETE FROM five_hour_milestones "
-                        f" WHERE id IN ({nk_placeholders})",
-                        non_keep_ids,
-                    )
-                for m in by_threshold.values():
-                    conn.execute(
-                        "UPDATE five_hour_milestones "
-                        "   SET block_id = ?, "
-                        "       five_hour_window_key = ? "
-                        " WHERE id = ?",
-                        (
-                            canonical["id"],
-                            canonical["five_hour_window_key"],
-                            m["id"],
-                        ),
-                    )
-
-                # (d) Children rollup tables — delete dropped rows'
-                # children. Recompute on next record-usage tick repopulates
-                # canonical's rows.
-                for tbl in (
-                    "five_hour_block_models",
-                    "five_hour_block_projects",
+            # (c) Milestones: per-threshold dedup, keep earliest
+            # captured_at_utc, re-FK keepers to canonical.
+            ms_id_placeholders = ",".join(
+                "?" * (len(dropped_ids) + 1)
+            )
+            all_milestones = conn.execute(
+                f"SELECT id, percent_threshold, captured_at_utc "
+                f"  FROM five_hour_milestones "
+                f" WHERE block_id IN ({ms_id_placeholders})",
+                [canonical["id"], *dropped_ids],
+            ).fetchall()
+            by_threshold: dict[int, dict] = {}
+            for m in all_milestones:
+                t = m["percent_threshold"]
+                md = dict(m)
+                if (
+                    t not in by_threshold
+                    or md["captured_at_utc"]
+                    < by_threshold[t]["captured_at_utc"]
                 ):
-                    conn.execute(
-                        f"DELETE FROM {tbl} "
-                        f" WHERE five_hour_window_key IN ({placeholders_keys})",
-                        dropped_keys,
-                    )
-
-                # (e) Merge group-wide aggregates into canonical BEFORE
-                # deleting the dropped rows. Each duplicate row received
-                # record-usage ticks for the slice of the 5h window during
-                # which its specific (jittered) five_hour_window_key was
-                # current — so their last_observed_at_utc / final_pct /
-                # totals are complementary, not redundant. For closed /
-                # historical blocks no future tick will fire, so without
-                # this merge the canonical row would be permanently
-                # frozen at the earliest-observation slice. Reads no
-                # external state (still no cache.db open) — all values
-                # come from rows we already SELECT'd above.
-                #
-                # Rules:
-                #   - last_observed_at_utc → group MAX (lexicographic on
-                #     canonical UTC-Z form == chronological).
-                #   - final_five_hour_percent / seven_day_pct_at_block_end
-                #     → values from the group row whose
-                #     last_observed_at_utc is MAX (preserves the
-                #     latest-observation snapshot rather than blindly
-                #     taking MAX(percent), which could pick a glitched
-                #     spike from a non-latest row).
-                #   - crossed_seven_day_reset / is_closed → group MAX
-                #     (any row flagged ⇒ canonical flagged).
-                #   - total_*_tokens / total_cost_usd → group MAX.
-                #     _compute_block_totals always recomputes over
-                #     [block_start_at, captured_at_utc], so the row with
-                #     the latest captured_at has the strict-superset
-                #     totals; MAX picks that row's values without needing
-                #     to track which row "wins".
-                group_rows = [g[1] for g in group_sorted]
-                latest = max(
-                    group_rows,
-                    key=lambda r: r["last_observed_at_utc"] or "",
-                )
-                merged_crossed = max(
-                    int(r["crossed_seven_day_reset"] or 0)
-                    for r in group_rows
-                )
-                merged_is_closed = max(
-                    int(r["is_closed"] or 0) for r in group_rows
-                )
-                merged_in = max(
-                    int(r["total_input_tokens"] or 0) for r in group_rows
-                )
-                merged_out = max(
-                    int(r["total_output_tokens"] or 0) for r in group_rows
-                )
-                merged_cc = max(
-                    int(r["total_cache_create_tokens"] or 0)
-                    for r in group_rows
-                )
-                merged_cr = max(
-                    int(r["total_cache_read_tokens"] or 0)
-                    for r in group_rows
-                )
-                merged_cost = max(
-                    float(r["total_cost_usd"] or 0.0) for r in group_rows
-                )
+                    by_threshold[t] = md
+            keep_ids = {m["id"] for m in by_threshold.values()}
+            # DELETE non-keepers BEFORE rekeying keepers. Otherwise, when
+            # both canonical and a dropped block hold a milestone for the
+            # same percent_threshold and the dropped row's milestone is
+            # the earlier keeper, UPDATEing it to the canonical key
+            # collides with canonical's still-present non-keeper on
+            # UNIQUE(five_hour_window_key, percent_threshold), rolling
+            # back the migration. After this DELETE the only milestones
+            # referencing dropped_keys are the keepers themselves
+            # (one per threshold), so the UPDATE loop below is collision-
+            # free.
+            non_keep_ids = [
+                m["id"] for m in all_milestones if m["id"] not in keep_ids
+            ]
+            if non_keep_ids:
+                nk_placeholders = ",".join("?" * len(non_keep_ids))
                 conn.execute(
-                    """
-                    UPDATE five_hour_blocks
-                       SET last_observed_at_utc       = ?,
-                           final_five_hour_percent    = ?,
-                           seven_day_pct_at_block_end = ?,
-                           crossed_seven_day_reset    = ?,
-                           is_closed                  = ?,
-                           total_input_tokens         = ?,
-                           total_output_tokens        = ?,
-                           total_cache_create_tokens  = ?,
-                           total_cache_read_tokens    = ?,
-                           total_cost_usd             = ?,
-                           last_updated_at_utc        = ?
-                     WHERE id = ?
-                    """,
+                    f"DELETE FROM five_hour_milestones "
+                    f" WHERE id IN ({nk_placeholders})",
+                    non_keep_ids,
+                )
+            for m in by_threshold.values():
+                conn.execute(
+                    "UPDATE five_hour_milestones "
+                    "   SET block_id = ?, "
+                    "       five_hour_window_key = ? "
+                    " WHERE id = ?",
                     (
-                        latest["last_observed_at_utc"],
-                        latest["final_five_hour_percent"],
-                        latest["seven_day_pct_at_block_end"],
-                        merged_crossed,
-                        merged_is_closed,
-                        merged_in,
-                        merged_out,
-                        merged_cc,
-                        merged_cr,
-                        merged_cost,
-                        now_utc_iso(),
                         canonical["id"],
+                        canonical["five_hour_window_key"],
+                        m["id"],
                     ),
                 )
 
-                # (f) Delete dropped parent block rows.
-                id_placeholders = ",".join("?" * len(dropped_ids))
+            # (d) Children rollup tables — delete dropped rows'
+            # children. Recompute on next record-usage tick repopulates
+            # canonical's rows.
+            for tbl in (
+                "five_hour_block_models",
+                "five_hour_block_projects",
+            ):
                 conn.execute(
-                    f"DELETE FROM five_hour_blocks "
-                    f" WHERE id IN ({id_placeholders})",
-                    dropped_ids,
+                    f"DELETE FROM {tbl} "
+                    f" WHERE five_hour_window_key IN ({placeholders_keys})",
+                    dropped_keys,
                 )
 
+            # (e) Merge group-wide aggregates into canonical BEFORE
+            # deleting the dropped rows. Each duplicate row received
+            # record-usage ticks for the slice of the 5h window during
+            # which its specific (jittered) five_hour_window_key was
+            # current — so their last_observed_at_utc / final_pct /
+            # totals are complementary, not redundant. For closed /
+            # historical blocks no future tick will fire, so without
+            # this merge the canonical row would be permanently
+            # frozen at the earliest-observation slice. Reads no
+            # external state (still no cache.db open) — all values
+            # come from rows we already SELECT'd above.
+            #
+            # Rules:
+            #   - last_observed_at_utc → group MAX (lexicographic on
+            #     canonical UTC-Z form == chronological).
+            #   - final_five_hour_percent / seven_day_pct_at_block_end
+            #     → values from the group row whose
+            #     last_observed_at_utc is MAX (preserves the
+            #     latest-observation snapshot rather than blindly
+            #     taking MAX(percent), which could pick a glitched
+            #     spike from a non-latest row).
+            #   - crossed_seven_day_reset / is_closed → group MAX
+            #     (any row flagged ⇒ canonical flagged).
+            #   - total_*_tokens / total_cost_usd → group MAX.
+            #     _compute_block_totals always recomputes over
+            #     [block_start_at, captured_at_utc], so the row with
+            #     the latest captured_at has the strict-superset
+            #     totals; MAX picks that row's values without needing
+            #     to track which row "wins".
+            group_rows = [g[1] for g in group_sorted]
+            latest = max(
+                group_rows,
+                key=lambda r: r["last_observed_at_utc"] or "",
+            )
+            merged_crossed = max(
+                int(r["crossed_seven_day_reset"] or 0)
+                for r in group_rows
+            )
+            merged_is_closed = max(
+                int(r["is_closed"] or 0) for r in group_rows
+            )
+            merged_in = max(
+                int(r["total_input_tokens"] or 0) for r in group_rows
+            )
+            merged_out = max(
+                int(r["total_output_tokens"] or 0) for r in group_rows
+            )
+            merged_cc = max(
+                int(r["total_cache_create_tokens"] or 0)
+                for r in group_rows
+            )
+            merged_cr = max(
+                int(r["total_cache_read_tokens"] or 0)
+                for r in group_rows
+            )
+            merged_cost = max(
+                float(r["total_cost_usd"] or 0.0) for r in group_rows
+            )
             conn.execute(
                 """
-                INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc)
-                VALUES (?, ?)
+                UPDATE five_hour_blocks
+                   SET last_observed_at_utc       = ?,
+                       final_five_hour_percent    = ?,
+                       seven_day_pct_at_block_end = ?,
+                       crossed_seven_day_reset    = ?,
+                       is_closed                  = ?,
+                       total_input_tokens         = ?,
+                       total_output_tokens        = ?,
+                       total_cache_create_tokens  = ?,
+                       total_cache_read_tokens    = ?,
+                       total_cost_usd             = ?,
+                       last_updated_at_utc        = ?
+                 WHERE id = ?
                 """,
-                ("merge_5h_block_duplicates_v1", now_utc_iso()),
+                (
+                    latest["last_observed_at_utc"],
+                    latest["final_five_hour_percent"],
+                    latest["seven_day_pct_at_block_end"],
+                    merged_crossed,
+                    merged_is_closed,
+                    merged_in,
+                    merged_out,
+                    merged_cc,
+                    merged_cr,
+                    merged_cost,
+                    now_utc_iso(),
+                    canonical["id"],
+                ),
+            )
+
+            # (f) Delete dropped parent block rows.
+            id_placeholders = ",".join("?" * len(dropped_ids))
+            conn.execute(
+                f"DELETE FROM five_hour_blocks "
+                f" WHERE id IN ({id_placeholders})",
+                dropped_ids,
+            )
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc)
+            VALUES (?, ?)
+            """,
+            ("003_merge_5h_block_duplicates_v1", now_utc_iso()),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Test-only migrations — registered ONLY when CCTALLY_MIGRATION_TEST_MODE=1
+# AND HARNESS_FAKE_HOME_BASE points at a fixture home. Production runs
+# never register these. Numbering is dynamic so the test migrations
+# always slot at len(registry)+1 — future-proof against the next real
+# migration colliding on the prefix (Codex P2 #8).
+# ──────────────────────────────────────────────────────────────────────
+if os.environ.get("CCTALLY_MIGRATION_TEST_MODE") == "1":
+    if not os.environ.get("HARNESS_FAKE_HOME_BASE"):
+        eprint(
+            "cctally: CCTALLY_MIGRATION_TEST_MODE=1 set but "
+            "HARNESS_FAKE_HOME_BASE is empty; refusing to register "
+            "test-only migrations against a non-fixture home."
+        )
+        sys.exit(2)
+
+    _stats_test_seq = len(_STATS_MIGRATIONS) + 1
+    _stats_test_name = f"{_stats_test_seq:03d}_test_failure_injection"
+
+    @stats_migration(_stats_test_name)
+    def _test_migration_failure_injection(conn):
+        """Test-only migration: raises RuntimeError when test_failure_trigger
+        table is non-empty; otherwise inserts the marker and succeeds."""
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='test_failure_trigger'"
+        ).fetchone() and conn.execute(
+            "SELECT 1 FROM test_failure_trigger LIMIT 1"
+        ).fetchone():
+            raise RuntimeError("test failure injected")
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
+                (_stats_test_name, now_utc_iso()),
             )
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-        # Migration succeeded — auto-clear any prior error log entries for
-        # this migration so the banner stops appearing on subsequent runs.
-        _clear_migration_error_log_entries("merge_5h_block_duplicates_v1")
-    except Exception as exc:
-        eprint(f"[5h-block dedup migration] failed: {exc}")
-        _log_migration_error(
-            name="merge_5h_block_duplicates_v1",
-            exc=exc,
-            tb=traceback.format_exc(),
-        )
+
+    _cache_test_seq = len(_CACHE_MIGRATIONS) + 1
+    _cache_test_name = f"{_cache_test_seq:03d}_test_cache_migration"
+
+    @cache_migration(_cache_test_name)
+    def _test_cache_migration(conn):
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
+                (_cache_test_name, now_utc_iso()),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def _parse_payload_json(raw_json: Any) -> dict[str, Any]:
@@ -19570,6 +19914,353 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return _setup_install(args)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# `cctally db` subcommand surface (migration framework).
+# Spec: docs/superpowers/specs/2026-05-06-migration-framework-design.md
+#       §4.1 (qualified-name routing), §4.2 (status), §4.3 (skip),
+#       §4.4 (unskip), §4.5 (JSON shape).
+# ──────────────────────────────────────────────────────────────────────
+
+
+def cmd_db_status(args: argparse.Namespace) -> int:
+    """Render migration status across both DBs.
+
+    Spec: docs/superpowers/specs/2026-05-06-migration-framework-design.md §4.2.
+    Glyphs: ✓ applied, ✗ failed, · pending, ~ skipped.
+    """
+    payload = {
+        "schema_version": 1,
+        "databases": {
+            "stats.db": _db_status_for(DB_PATH, _STATS_MIGRATIONS, "stats.db"),
+            "cache.db": _db_status_for(CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db"),
+        },
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    for db_label in ("stats.db", "cache.db"):
+        info = payload["databases"][db_label]
+        skipped_count = sum(1 for m in info["migrations"] if m["status"] == "skipped")
+        suffix = f" ({skipped_count} skipped)" if skipped_count else ""
+        print(
+            f"{db_label} ({info['path']})  "
+            f"version {info['user_version']} / {info['registry_size']} known{suffix}"
+        )
+        for m in info["migrations"]:
+            line = _db_status_format_row(m)
+            print(line)
+        print()  # blank line between DBs
+    return 0
+
+
+def _db_status_for(
+    db_path: pathlib.Path, registry: list[Migration], db_label: str,
+) -> dict:
+    """Build per-DB status dict.
+
+    Tolerates missing tables: cache.db never opened by the framework
+    (registry empty in v1) won't have schema_migrations /
+    schema_migrations_skipped, so each lookup is wrapped in a try /
+    except sqlite3.OperationalError.
+    """
+    if not db_path.exists():
+        return {
+            "path": str(db_path),
+            "user_version": 0,
+            "registry_size": len(registry),
+            "migrations": [
+                {"seq": m.seq, "name": m.name, "status": "pending"}
+                for m in registry
+            ],
+        }
+    conn = sqlite3.connect(db_path)
+    try:
+        user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        # Tolerate missing tables (e.g., cache.db never opened by framework).
+        # Alias legacy unprefixed names to their NNN_ equivalents so a
+        # `db status` that runs before any open_db()-via-bootstrap rename
+        # still reports legacy-marker DBs as applied, not pending.
+        aliases = _LEGACY_MARKER_ALIASES_BY_DB.get(db_label, {})
+        applied_rows: dict[str, str] = {}
+        try:
+            for row in conn.execute(
+                "SELECT name, applied_at_utc FROM schema_migrations"
+            ).fetchall():
+                applied_rows[aliases.get(row[0], row[0])] = row[1]
+        except sqlite3.OperationalError:
+            pass
+        skipped_rows: dict[str, tuple[str, str | None]] = {}
+        try:
+            for row in conn.execute(
+                "SELECT name, skipped_at_utc, reason FROM schema_migrations_skipped"
+            ).fetchall():
+                skipped_rows[row[0]] = (row[1], row[2])
+        except sqlite3.OperationalError:
+            pass
+    finally:
+        conn.close()
+
+    failed_names = _db_status_failed_names_from_log(db_label)
+    migrations_out: list[dict] = []
+    for m in registry:
+        if m.name in skipped_rows:
+            ts, reason = skipped_rows[m.name]
+            migrations_out.append({
+                "seq": m.seq, "name": m.name,
+                "status": "skipped",
+                "skipped_at": ts,
+                "reason": reason,
+            })
+        elif m.name in applied_rows:
+            migrations_out.append({
+                "seq": m.seq, "name": m.name,
+                "status": "applied",
+                "applied_at": applied_rows[m.name],
+            })
+        elif m.name in failed_names:
+            migrations_out.append({
+                "seq": m.seq, "name": m.name,
+                "status": "failed",
+                "last_failure_at": failed_names[m.name],
+                "log_path": str(MIGRATION_ERROR_LOG_PATH),
+            })
+        else:
+            migrations_out.append({
+                "seq": m.seq, "name": m.name,
+                "status": "pending",
+            })
+    return {
+        "path": str(db_path),
+        "user_version": user_version,
+        "registry_size": len(registry),
+        "migrations": migrations_out,
+    }
+
+
+def _db_status_failed_names_from_log(db_label: str) -> dict[str, str]:
+    """Parse migration-errors.log for the most-recent failure per qualified name.
+
+    Returns {migration_name (unqualified): last_failure_iso}. Names whose
+    log entries lack the db_label prefix (pre-framework legacy entries)
+    are NOT included for cache.db; for stats.db, legacy names like
+    `merge_5h_block_duplicates_v1` are bootstrap-renamed at next open
+    (via Task 4) so they don't accumulate post-PR.
+    """
+    if not MIGRATION_ERROR_LOG_PATH.exists():
+        return {}
+    out: dict[str, str] = {}
+    try:
+        content = MIGRATION_ERROR_LOG_PATH.read_text()
+    except Exception:
+        return {}
+    blocks = [b for b in content.split("\n\n") if b.strip()]
+    for block in blocks:
+        first_line = block.splitlines()[0] if block.splitlines() else ""
+        if not first_line.startswith("[") or "] " not in first_line:
+            continue
+        ts_part, _, name_part = first_line[1:].partition("] ")
+        ts = ts_part.strip()
+        qualified = name_part.strip()
+        if ":" not in qualified:
+            continue
+        prefix, _, name = qualified.partition(":")
+        if prefix != db_label:
+            continue
+        out[name] = ts  # later block overrides earlier — most-recent wins
+    return out
+
+
+def _db_status_format_row(m: dict) -> str:
+    name = m["name"]
+    status = m["status"]
+    if status == "applied":
+        return f"  ✓ {name:<46} applied {m['applied_at']}"
+    if status == "skipped":
+        line = f"  ~ {name:<46} skipped {m['skipped_at']}"
+        if m.get("reason"):
+            line += f"\n                                                Reason: {m['reason']}"
+        return line
+    if status == "failed":
+        return (
+            f"  ✗ {name:<46} FAILED last at {m['last_failure_at']}\n"
+            f"                                                See {m['log_path']}"
+        )
+    return f"  · {name:<46} pending"
+
+
+def _db_resolve_migration_name(name_arg: str) -> tuple[str, str, list[Migration]]:
+    """Resolve a name argument to (db_label, unqualified_name, registry).
+
+    Spec §4.1 routing:
+      - "stats.db:NNN_…" → stats registry only.
+      - "cache.db:NNN_…" → cache registry only.
+      - "NNN_…" (bare)  → both; ambiguous if matches both, exit 2.
+
+    Raises:
+      LookupError: name not found in any registry (caller exits 1).
+      RuntimeError: ambiguous bare name (caller exits 2).
+    """
+    if name_arg.startswith("stats.db:"):
+        unq = name_arg[len("stats.db:"):]
+        if any(m.name == unq for m in _STATS_MIGRATIONS):
+            return "stats.db", unq, _STATS_MIGRATIONS
+        raise LookupError(name_arg)
+    if name_arg.startswith("cache.db:"):
+        unq = name_arg[len("cache.db:"):]
+        if any(m.name == unq for m in _CACHE_MIGRATIONS):
+            return "cache.db", unq, _CACHE_MIGRATIONS
+        raise LookupError(name_arg)
+    in_stats = any(m.name == name_arg for m in _STATS_MIGRATIONS)
+    in_cache = any(m.name == name_arg for m in _CACHE_MIGRATIONS)
+    if in_stats and in_cache:
+        raise RuntimeError(name_arg)
+    if in_stats:
+        return "stats.db", name_arg, _STATS_MIGRATIONS
+    if in_cache:
+        return "cache.db", name_arg, _CACHE_MIGRATIONS
+    raise LookupError(name_arg)
+
+
+def _db_path_for_label(db_label: str) -> pathlib.Path:
+    if db_label == "stats.db":
+        return DB_PATH
+    if db_label == "cache.db":
+        return CACHE_DB_PATH
+    raise ValueError(f"unknown db_label: {db_label}")
+
+
+def cmd_db_skip(args: argparse.Namespace) -> int:
+    """Mark a migration as skipped.
+
+    Spec §4.3. Bypasses ``open_db()`` (raw ``sqlite3.connect``) so the
+    pending migration cannot be triggered en route to recording the
+    skip — that defeats the entire point.
+    """
+    name_arg = args.name
+    try:
+        db_label, name, _ = _db_resolve_migration_name(name_arg)
+    except RuntimeError:
+        eprint(
+            f"cctally: ambiguous migration name '{name_arg}'; "
+            f"qualify as 'stats.db:{name_arg}' or 'cache.db:{name_arg}'"
+        )
+        return 2
+    except LookupError:
+        eprint(f"cctally: unknown migration '{name_arg}'.")
+        return 1
+
+    path = _db_path_for_label(db_label)
+    # Ensure the parent dir exists — fresh-install HOME may not have
+    # ~/.local/share/cctally/ yet, and sqlite3.connect() does NOT
+    # create parent directories (only the DB file itself).
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations_skipped (
+                name           TEXT PRIMARY KEY,
+                skipped_at_utc TEXT NOT NULL,
+                reason         TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+        )
+        # Reject if already applied. Also check the legacy unprefixed
+        # alias: pre-framework DBs may store the marker under e.g.
+        # `merge_5h_block_duplicates_v1` until the next open_db()
+        # bootstrap rename. Without this, `db skip 003_…` succeeds
+        # against an already-applied legacy-marker DB and leaves the
+        # row in BOTH schema_migrations (post-rename) AND
+        # schema_migrations_skipped — inconsistent state.
+        applied_check_names = [name]
+        for legacy, new in _LEGACY_MARKER_ALIASES_BY_DB.get(db_label, {}).items():
+            if new == name:
+                applied_check_names.append(legacy)
+        placeholders = ",".join("?" * len(applied_check_names))
+        if conn.execute(
+            f"SELECT 1 FROM schema_migrations WHERE name IN ({placeholders})",
+            applied_check_names,
+        ).fetchone():
+            eprint(f"cctally: {name} is already applied; nothing to skip.")
+            return 1
+        # Reject if already skipped.
+        if conn.execute(
+            "SELECT 1 FROM schema_migrations_skipped WHERE name = ?", (name,)
+        ).fetchone():
+            eprint(f"cctally: {name} is already skipped.")
+            return 1
+        conn.execute(
+            "INSERT INTO schema_migrations_skipped "
+            "(name, skipped_at_utc, reason) VALUES (?, ?, ?)",
+            (name, now_utc_iso(), args.reason),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"Skipped: {name}")
+    return 0
+
+
+def cmd_db_unskip(args: argparse.Namespace) -> int:
+    """Remove a skip mark.
+
+    Spec §4.4. After deleting the row, writes ``PRAGMA user_version = 0``
+    to invalidate the dispatcher's fast path (Codex P1 #1) — without
+    this, the unskipped migration would silently never run because
+    ``cur_version == len(registry)`` short-circuits on the next open.
+
+    Bypasses ``open_db()`` so the migration about to be unskipped can
+    actually run on the next legitimate open, not from inside this
+    handler.
+    """
+    name_arg = args.name
+    try:
+        db_label, name, _ = _db_resolve_migration_name(name_arg)
+    except RuntimeError:
+        eprint(
+            f"cctally: ambiguous migration name '{name_arg}'; "
+            f"qualify as 'stats.db:{name_arg}' or 'cache.db:{name_arg}'"
+        )
+        return 2
+    except LookupError:
+        eprint(f"cctally: unknown migration '{name_arg}'.")
+        return 1
+
+    path = _db_path_for_label(db_label)
+    # If the DB file doesn't even exist, the migration cannot have been
+    # skipped. Avoid creating an empty stats.db / cache.db just to print
+    # the no-op message (sqlite3.connect would create the file
+    # otherwise — leaving stale empty DBs around for fresh-install
+    # users who poke at unskip).
+    if not path.exists():
+        print(f"cctally: {name} is not skipped; nothing to do.")
+        return 0
+    conn = sqlite3.connect(path)
+    try:
+        try:
+            cur = conn.execute(
+                "DELETE FROM schema_migrations_skipped WHERE name = ?", (name,)
+            )
+        except sqlite3.OperationalError:
+            # Table doesn't exist → nothing was ever skipped.
+            print(f"cctally: {name} is not skipped; nothing to do.")
+            return 0
+        if cur.rowcount == 0:
+            print(f"cctally: {name} is not skipped; nothing to do.")
+            return 0
+        # Invalidate the fast path so the dispatcher re-walks (Codex P1 #1).
+        conn.execute("PRAGMA user_version = 0")
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"Unskipped: {name} (will run on next open).")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="cctally",
@@ -20943,6 +21634,74 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true",
                     help="Emit machine-readable output")
     sp.set_defaults(func=cmd_setup)
+
+    # ---- db (migration framework — spec §4) ----
+    db_parser = sub.add_parser(
+        "db",
+        help="Migration / DB management (status, skip, unskip)",
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Inspect and manage cctally's SQLite migration state.
+
+            Subcommands:
+              status   List migrations + applied/pending/failed/skipped
+                       state across stats.db and cache.db. Glyphs:
+                         ✓ applied   ✗ failed   · pending   ~ skipped
+              skip     Mark a migration as skipped (manual poison-pill
+                       escape — bypass an offending migration).
+              unskip   Remove a skip mark; the migration runs on next
+                       open.
+
+            Migration names accept either bare ("003_…") or qualified
+            ("stats.db:003_…" / "cache.db:003_…") forms. Bare names are
+            rejected with exit 2 if the same NNN_… exists in both
+            registries.
+
+            Examples:
+              cctally db status
+              cctally db status --json
+              cctally db skip 003_merge_5h_block_duplicates_v1 --reason "perf hot"
+              cctally db unskip stats.db:003_merge_5h_block_duplicates_v1
+            """
+        ),
+    )
+    db_sub = db_parser.add_subparsers(dest="db_action", required=True)
+
+    db_status = db_sub.add_parser(
+        "status",
+        help="List migrations + applied/pending/failed/skipped state",
+    )
+    db_status.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON to stdout",
+    )
+    db_status.set_defaults(func=cmd_db_status)
+
+    db_skip = db_sub.add_parser(
+        "skip",
+        help="Mark a migration as skipped",
+    )
+    db_skip.add_argument(
+        "name",
+        help="Migration name (NNN_… or stats.db:NNN_… / cache.db:NNN_…)",
+    )
+    db_skip.add_argument(
+        "--reason",
+        help="Free-text reason (shown in db status)",
+    )
+    db_skip.set_defaults(func=cmd_db_skip)
+
+    db_unskip = db_sub.add_parser(
+        "unskip",
+        help="Remove a skip mark; migration runs on next open",
+    )
+    db_unskip.add_argument(
+        "name",
+        help="Migration name (NNN_… or qualified)",
+    )
+    db_unskip.set_defaults(func=cmd_db_unskip)
 
     # ---- hook-tick (internal — hidden from --help, see onboarding spec §3) ----
     ht = sub.add_parser(
@@ -27296,6 +28055,9 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.func(args))
     except KeyboardInterrupt:
         return 130
+    except DowngradeDetected as exc:
+        eprint(f"cctally: {exc}")
+        return 2
     except Exception as exc:  # pragma: no cover
         eprint(f"Error: {exc}")
         return 1
