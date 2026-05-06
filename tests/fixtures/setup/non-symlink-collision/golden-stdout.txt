@@ -1,0 +1,1 @@
+setup: symlink cctally failed: non-symlink file at /FAKE/.local/bin/cctally — remove manually then re-run

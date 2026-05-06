@@ -1,0 +1,7 @@
+fix: thing
+
+--- public ---
+docs: refresh
+
+More detail here.
+Second para.

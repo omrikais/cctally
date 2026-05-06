@@ -1,0 +1,29 @@
+{
+  "rangeStart": "2026-04-13",
+  "rangeEnd": "2026-04-15",
+  "weeksInRange": 1,
+  "groupMode": "git-root",
+  "totals": {
+    "costUsd": 3.0,
+    "usedPercent": 70.0,
+    "weeklyAttributionAvailable": true
+  },
+  "projects": [
+    {
+      "displayKey": "tzv",
+      "projectPath": "/fake/repos/tzv",
+      "gitRoot": null,
+      "sessions": 1,
+      "firstSeen": "2026-04-15T12:00:00Z",
+      "lastSeen": "2026-04-15T12:00:00Z",
+      "inputTokens": 400000,
+      "outputTokens": 40000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 3.0,
+      "attributedUsedPercent": 70.0,
+      "costPerPercent": 0.0429
+    }
+  ],
+  "warnings": []
+}

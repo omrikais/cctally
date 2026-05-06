@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+# Validates the `cctally config` subcommand.
+# Each test runs against a fresh HOME so config.json starts empty.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="$REPO_ROOT/bin/cctally"
+
+pass_count=0
+fail_count=0
+
+assert_eq () {
+    local label="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "PASS $label"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $label"
+        printf '  expected: %s\n  actual:   %s\n' "$expected" "$actual"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+assert_contains () {
+    local label="$1" needle="$2" haystack="$3"
+    if printf '%s' "$haystack" | grep -qF "$needle"; then
+        echo "PASS $label"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $label (missing $needle)"
+        printf '  haystack: %s\n' "$haystack"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+with_home () {
+    # Run cctally with a fresh HOME and stable TZ. Echoes a unique HOME path.
+    local h
+    h=$(mktemp -d)
+    HOME="$h" TZ=Etc/UTC "$BIN" "$@"
+    rm -rf "$h"
+}
+
+# 1. get default
+out=$(with_home config get display.tz)
+assert_eq "get default" "display.tz=local" "$out"
+
+# 2. set valid IANA
+home=$(mktemp -d)
+HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz America/New_York >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get display.tz)
+assert_eq "get after set IANA" "display.tz=America/New_York" "$out"
+
+# 3. set local / utc keywords
+HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz utc >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get display.tz)
+assert_eq "get after set utc" "display.tz=utc" "$out"
+HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz local >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get display.tz)
+assert_eq "get after set local" "display.tz=local" "$out"
+
+# 4. invalid IANA -> exit 2
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz Mars/Olympus 2>&1 >/dev/null)
+ec=$?
+assert_eq "invalid IANA exit" "2" "$ec"
+assert_contains "invalid IANA stderr" "Mars/Olympus" "$err"
+
+# 5. unknown key -> exit 2
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set theme.dark true 2>&1 >/dev/null)
+ec=$?
+assert_eq "unknown key set exit" "2" "$ec"
+assert_contains "unknown key stderr" "theme.dark" "$err"
+
+# 6. unset existing
+HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz America/New_York >/dev/null
+HOME="$home" TZ=Etc/UTC "$BIN" config unset display.tz >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get display.tz)
+assert_eq "get after unset" "display.tz=local" "$out"
+
+# 7. unset missing -> idempotent
+HOME="$home" TZ=Etc/UTC "$BIN" config unset display.tz >/dev/null
+ec=$?
+assert_eq "unset missing exit" "0" "$ec"
+
+# 8. JSON form
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get --json display.tz)
+assert_contains "json get" "\"tz\": \"local\"" "$out"
+
+# 9. Hand-edited bad value -> warn-once + fall back, doesn't crash
+mkdir -p "$home/.local/share/cctally"
+cat > "$home/.local/share/cctally/config.json" <<JSON
+{"collector": {"host": "127.0.0.1", "port": 17321, "token": "x", "week_start": "monday"},
+ "display": {"tz": "Mars/Olympus"}}
+JSON
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get display.tz 2>&1)
+assert_contains "bad-config falls back" "display.tz=local" "$out"
+assert_contains "bad-config warns" "warning" "$out"
+
+rm -rf "$home"
+
+# 10. Concurrent set (2 writers): both writes succeed; final value is one of them.
+# Loops 30 times to exercise the race window — pre-fix this failed ~25% of runs
+# (issue #17). With config_writer_lock + atomic save_config, must be 30/30.
+runs10=30
+fail10=0
+for run in $(seq 1 "$runs10"); do
+    home=$(mktemp -d)
+    ( HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz America/New_York >/dev/null ) &
+    ( HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz Asia/Jerusalem >/dev/null ) &
+    wait
+    final=$(HOME="$home" TZ=Etc/UTC "$BIN" config get display.tz)
+    case "$final" in
+        display.tz=America/New_York|display.tz=Asia/Jerusalem) :;;
+        *) fail10=$((fail10 + 1)); echo "  run $run: $final" ;;
+    esac
+    rm -rf "$home"
+done
+if [ "$fail10" -eq 0 ]; then
+    echo "PASS concurrent set last-write-wins (2 writers, $runs10 runs)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL concurrent set last-write-wins: $fail10 / $runs10"
+    fail_count=$((fail_count + 1))
+fi
+
+# 11. Concurrent set (5 writers): all five fire simultaneously; final value
+# must be one of the five candidates. Defends against a future regression
+# that survives the 2-writer test but fails under heavier contention.
+runs11=20
+fail11=0
+candidates="America/New_York Asia/Jerusalem Europe/London Australia/Sydney America/Los_Angeles"
+for run in $(seq 1 "$runs11"); do
+    home=$(mktemp -d)
+    for tz in $candidates; do
+        ( HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz "$tz" >/dev/null ) &
+    done
+    wait
+    final=$(HOME="$home" TZ=Etc/UTC "$BIN" config get display.tz)
+    matched=0
+    for tz in $candidates; do
+        if [ "$final" = "display.tz=$tz" ]; then matched=1; break; fi
+    done
+    if [ "$matched" -eq 0 ]; then
+        fail11=$((fail11 + 1))
+        echo "  run $run: $final"
+    fi
+    rm -rf "$home"
+done
+if [ "$fail11" -eq 0 ]; then
+    echo "PASS concurrent set last-write-wins (5 writers, $runs11 runs)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL concurrent set 5 writers: $fail11 / $runs11"
+    fail_count=$((fail_count + 1))
+fi
+
+# 12. Corrupt config.json: load_config emits warning + falls back to defaults
+# WITHOUT silently re-saving over the corrupt bytes. Per-fix: the legitimate
+# next save_config call (under config_writer_lock) is what overwrites — a
+# bare `cctally config get` MUST NOT silently re-default and lose the prior
+# state.
+home=$(mktemp -d)
+mkdir -p "$home/.local/share/cctally"
+# Truncated/garbled JSON (mimics the byte-interleave artifact that caused
+# the original race; trailing stray brace makes it unparseable).
+cat > "$home/.local/share/cctally/config.json" <<'JSON'
+{
+  "collector": {"host": "127.0.0.1", "port": 17321, "token": "x", "week_start": "monday"},
+  "display": {
+    "tz": "America/New_York"
+  }
+}
+}
+JSON
+# Snapshot bytes BEFORE the get to detect any silent re-save.
+before=$(wc -c < "$home/.local/share/cctally/config.json")
+combined=$(HOME="$home" TZ=Etc/UTC "$BIN" config get display.tz 2>&1)
+ec=$?
+after=$(wc -c < "$home/.local/share/cctally/config.json")
+assert_eq "corrupt-config exit" "0" "$ec"
+assert_contains "corrupt-config warns" "warning" "$combined"
+assert_contains "corrupt-config falls back" "display.tz=local" "$combined"
+assert_eq "corrupt-config not silently re-saved" "$before" "$after"
+rm -rf "$home"
+
+# 13. _get_alerts_config returns canonical defaults on empty config
+out=$(python3 - <<'PY' 2>&1
+import sys, importlib.util, importlib.machinery
+loader = importlib.machinery.SourceFileLoader('cctally', 'bin/cctally')
+spec = importlib.util.spec_from_loader('cctally', loader)
+m = importlib.util.module_from_spec(spec)
+sys.modules['cctally'] = m
+loader.exec_module(m)
+got = m._get_alerts_config({})
+expected = {'enabled': False, 'weekly_thresholds': [90, 95], 'five_hour_thresholds': [90, 95]}
+if got != expected:
+    print(f"MISMATCH got={got!r} expected={expected!r}")
+    sys.exit(1)
+print("OK defaults")
+PY
+)
+ec=$?
+assert_eq "alerts defaults exit" "0" "$ec"
+assert_contains "alerts defaults output" "OK defaults" "$out"
+
+# 14. _get_alerts_config rejects non-strictly-increasing weekly_thresholds
+out=$(python3 - <<'PY' 2>&1
+import sys, importlib.util, importlib.machinery
+loader = importlib.machinery.SourceFileLoader('cctally', 'bin/cctally')
+spec = importlib.util.spec_from_loader('cctally', loader)
+m = importlib.util.module_from_spec(spec)
+sys.modules['cctally'] = m
+loader.exec_module(m)
+try:
+    m._get_alerts_config({'alerts': {'weekly_thresholds': [95, 90]}})
+    print("UNEXPECTED no raise")
+    sys.exit(1)
+except m._AlertsConfigError as e:
+    msg = str(e)
+    if 'increasing' not in msg:
+        print(f"MISMATCH msg={msg!r}")
+        sys.exit(1)
+    print("OK reject non-increasing")
+PY
+)
+ec=$?
+assert_eq "alerts non-increasing exit" "0" "$ec"
+assert_contains "alerts non-increasing output" "OK reject non-increasing" "$out"
+
+# 15. _normalize_alerts_enabled_value accepts canonical forms
+out=$(python3 - <<'PY' 2>&1
+import sys, importlib.util, importlib.machinery
+loader = importlib.machinery.SourceFileLoader('cctally', 'bin/cctally')
+spec = importlib.util.spec_from_loader('cctally', loader)
+m = importlib.util.module_from_spec(spec)
+sys.modules['cctally'] = m
+loader.exec_module(m)
+for raw in ('true', 'TRUE', 'yes', '1', 'on'):
+    if m._normalize_alerts_enabled_value(raw) is not True:
+        print(f"FAIL truthy: {raw}")
+        sys.exit(1)
+for raw in ('false', 'no', '0', 'off'):
+    if m._normalize_alerts_enabled_value(raw) is not False:
+        print(f"FAIL falsy: {raw}")
+        sys.exit(1)
+try:
+    m._normalize_alerts_enabled_value('maybe')
+    print("UNEXPECTED accepted maybe")
+    sys.exit(1)
+except ValueError:
+    pass
+print("OK bool normalize")
+PY
+)
+ec=$?
+assert_eq "alerts bool normalize exit" "0" "$ec"
+assert_contains "alerts bool normalize output" "OK bool normalize" "$out"
+
+# 16. cctally config set alerts.enabled yes round-trips via JSON get
+home=$(mktemp -d)
+HOME="$home" TZ=Etc/UTC "$BIN" config set alerts.enabled yes >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get alerts.enabled --json)
+assert_contains "alerts.enabled JSON round-trip" "\"enabled\": true" "$out"
+# Also confirm plain-text form
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get alerts.enabled)
+assert_eq "alerts.enabled plain round-trip" "alerts.enabled=true" "$out"
+# Round-trip false
+HOME="$home" TZ=Etc/UTC "$BIN" config set alerts.enabled no >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get alerts.enabled --json)
+assert_contains "alerts.enabled JSON round-trip false" "\"enabled\": false" "$out"
+# Invalid bool string -> exit 2
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set alerts.enabled maybe 2>&1 >/dev/null)
+ec=$?
+assert_eq "alerts.enabled invalid exit" "2" "$ec"
+assert_contains "alerts.enabled invalid stderr" "maybe" "$err"
+rm -rf "$home"
+
+# 17. alerts.enabled unset: set true → unset → get returns canonical default (false).
+# Pre-fix _cmd_config_unset only branched on display.tz; alerts.enabled fell
+# through to `return 2` silently and the persisted true was never cleared.
+home=$(mktemp -d)
+HOME="$home" TZ=Etc/UTC "$BIN" config set alerts.enabled true >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get alerts.enabled)
+assert_eq "alerts.enabled set before unset" "alerts.enabled=true" "$out"
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config unset alerts.enabled 2>&1 >/dev/null)
+ec=$?
+assert_eq "alerts.enabled unset exit" "0" "$ec"
+assert_eq "alerts.enabled unset no stderr" "" "$err"
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get alerts.enabled)
+assert_eq "alerts.enabled after unset returns canonical default" "alerts.enabled=false" "$out"
+
+# 18. Idempotent unset: re-running on already-unset config still exits 0,
+# silently. The display.tz branch follows the same idempotent contract.
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config unset alerts.enabled 2>&1 >/dev/null)
+ec=$?
+assert_eq "alerts.enabled idempotent unset exit" "0" "$ec"
+assert_eq "alerts.enabled idempotent unset no stderr" "" "$err"
+rm -rf "$home"
+
+# 19. alerts.enabled unset preserves co-existing alerts.* keys (e.g. user-customized
+# thresholds). Hand-write a config with both `enabled` and `weekly_thresholds`,
+# unset only `enabled`, and verify the threshold list survives.
+home=$(mktemp -d)
+mkdir -p "$home/.local/share/cctally"
+cat > "$home/.local/share/cctally/config.json" <<'JSON'
+{
+  "alerts": {
+    "enabled": true,
+    "weekly_thresholds": [80, 90, 95]
+  }
+}
+JSON
+HOME="$home" TZ=Etc/UTC "$BIN" config unset alerts.enabled >/dev/null
+ec=$?
+assert_eq "alerts.enabled unset (with co-keys) exit" "0" "$ec"
+# Inspect the persisted file directly: weekly_thresholds list intact, enabled gone.
+persisted=$(cat "$home/.local/share/cctally/config.json")
+assert_contains "alerts.enabled unset preserves weekly_thresholds" "weekly_thresholds" "$persisted"
+if printf '%s' "$persisted" | grep -q '"enabled"'; then
+    echo "FAIL alerts.enabled unset removes the enabled key (still present in $persisted)"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS alerts.enabled unset removes the enabled key"
+    pass_count=$((pass_count + 1))
+fi
+rm -rf "$home"
+
+# 20. Concurrent unset (2 writers): both exit 0, file remains valid JSON.
+# Mirrors test 10's display.tz race — same writer-lock, same atomic save.
+runs20=20
+fail20=0
+for run in $(seq 1 "$runs20"); do
+    home=$(mktemp -d)
+    HOME="$home" TZ=Etc/UTC "$BIN" config set alerts.enabled true >/dev/null
+    ( HOME="$home" TZ=Etc/UTC "$BIN" config unset alerts.enabled >/dev/null ) &
+    ( HOME="$home" TZ=Etc/UTC "$BIN" config unset alerts.enabled >/dev/null ) &
+    wait
+    final=$(HOME="$home" TZ=Etc/UTC "$BIN" config get alerts.enabled 2>&1)
+    case "$final" in
+        alerts.enabled=false) :;;
+        *) fail20=$((fail20 + 1)); echo "  run $run: $final" ;;
+    esac
+    # Validate the file is still parseable JSON.
+    if [ -f "$home/.local/share/cctally/config.json" ]; then
+        if ! python3 -c "import json,sys; json.load(open('$home/.local/share/cctally/config.json'))" 2>/dev/null; then
+            fail20=$((fail20 + 1))
+            echo "  run $run: config.json not valid JSON"
+        fi
+    fi
+    rm -rf "$home"
+done
+if [ "$fail20" -eq 0 ]; then
+    echo "PASS concurrent unset (2 writers, $runs20 runs)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL concurrent unset: $fail20 / $runs20"
+    fail_count=$((fail_count + 1))
+fi
+
+# 21. Malformed stored alerts block: `cctally config set alerts.enabled <v>`
+# must surface a controlled rc=2 / "alerts must be an object" error rather
+# than crash with an uncaught ValueError from `dict("bad")`. Pre-fix bug:
+# the dict() copy ran before _get_alerts_config could classify the failure,
+# locking the user out of the documented recovery toggle. Also asserts
+# config.json is left untouched on the error path (no partial write).
+home=$(mktemp -d)
+mkdir -p "$home/.local/share/cctally"
+cat > "$home/.local/share/cctally/config.json" <<'JSON'
+{"alerts": "bad"}
+JSON
+before21=$(cat "$home/.local/share/cctally/config.json")
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set alerts.enabled true 2>&1 >/dev/null)
+ec=$?
+after21=$(cat "$home/.local/share/cctally/config.json")
+assert_eq "malformed alerts block exit"   "2" "$ec"
+assert_contains "malformed alerts block stderr" "alerts must be an object" "$err"
+assert_eq "malformed alerts block no partial write" "$before21" "$after21"
+rm -rf "$home"
+
+# 22-29. dashboard.bind round-trips
+home=$(mktemp -d)
+
+# default unset
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get dashboard.bind 2>&1)
+assert_eq "dashboard.bind get default" "dashboard.bind=loopback" "$out"
+
+# semantic alias: lan
+HOME="$home" TZ=Etc/UTC "$BIN" config set dashboard.bind lan >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get dashboard.bind)
+assert_eq "dashboard.bind set lan" "dashboard.bind=lan" "$out"
+
+# semantic alias: loopback
+HOME="$home" TZ=Etc/UTC "$BIN" config set dashboard.bind loopback >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get dashboard.bind)
+assert_eq "dashboard.bind set loopback" "dashboard.bind=loopback" "$out"
+
+# literal IPv4
+HOME="$home" TZ=Etc/UTC "$BIN" config set dashboard.bind 192.168.1.42 >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get dashboard.bind)
+assert_eq "dashboard.bind set IPv4" "dashboard.bind=192.168.1.42" "$out"
+
+# literal IPv6
+HOME="$home" TZ=Etc/UTC "$BIN" config set dashboard.bind ::1 >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get dashboard.bind)
+assert_eq "dashboard.bind set IPv6" "dashboard.bind=::1" "$out"
+
+# invalid empty string
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set dashboard.bind "" 2>&1 >/dev/null)
+ec=$?
+assert_eq "dashboard.bind empty exit" "2" "$ec"
+assert_contains "dashboard.bind empty stderr" "dashboard.bind" "$err"
+
+# invalid non-string-looking ('not a host')
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set dashboard.bind "not a host" 2>&1 >/dev/null)
+ec=$?
+assert_eq "dashboard.bind whitespace exit" "2" "$ec"
+
+# unset returns to default
+HOME="$home" TZ=Etc/UTC "$BIN" config unset dashboard.bind >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get dashboard.bind)
+assert_eq "dashboard.bind unset default" "dashboard.bind=loopback" "$out"
+
+rm -rf "$home"
+
+# 30-33. dashboard.bind whitespace + bracketed IPv6 rejections
+home=$(mktemp -d)
+
+# embedded tab → exit 2
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set dashboard.bind $'foo\tbar' 2>&1 >/dev/null)
+ec=$?
+assert_eq "dashboard.bind embedded tab exit" "2" "$ec"
+
+# embedded newline → exit 2
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set dashboard.bind $'foo\nbar' 2>&1 >/dev/null)
+ec=$?
+assert_eq "dashboard.bind embedded newline exit" "2" "$ec"
+
+# bracketed IPv6 → exit 2
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set dashboard.bind "[::1]" 2>&1 >/dev/null)
+ec=$?
+assert_eq "dashboard.bind bracketed IPv6 exit" "2" "$ec"
+assert_contains "dashboard.bind bracketed IPv6 stderr" "::1" "$err"
+
+# bare ::1 still passes (positive control)
+HOME="$home" TZ=Etc/UTC "$BIN" config set dashboard.bind "::1" >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get dashboard.bind)
+assert_eq "dashboard.bind bare ::1 still passes" "dashboard.bind=::1" "$out"
+
+rm -rf "$home"
+
+echo
+echo "passed: $pass_count   failed: $fail_count"
+[ $fail_count -eq 0 ]

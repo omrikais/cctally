@@ -1,0 +1,58 @@
+{
+  "monthly": [
+    {
+      "month": "Mar 2026",
+      "inputTokens": 12000,
+      "cachedInputTokens": 0,
+      "outputTokens": 4000,
+      "reasoningOutputTokens": 0,
+      "totalTokens": 16000,
+      "costUSD": 0.055,
+      "models": {
+        "gpt-5-codex": {
+          "inputTokens": 12000,
+          "cachedInputTokens": 0,
+          "outputTokens": 4000,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 16000,
+          "isFallback": false
+        }
+      }
+    },
+    {
+      "month": "Apr 2026",
+      "inputTokens": 58000,
+      "cachedInputTokens": 10000,
+      "outputTokens": 20000,
+      "reasoningOutputTokens": 1900,
+      "totalTokens": 78000,
+      "costUSD": 0.30650000000000005,
+      "models": {
+        "gpt-5.2-codex": {
+          "inputTokens": 23000,
+          "cachedInputTokens": 5000,
+          "outputTokens": 9000,
+          "reasoningOutputTokens": 1100,
+          "totalTokens": 32000,
+          "isFallback": false
+        },
+        "gpt-5-codex": {
+          "inputTokens": 35000,
+          "cachedInputTokens": 5000,
+          "outputTokens": 11000,
+          "reasoningOutputTokens": 800,
+          "totalTokens": 46000,
+          "isFallback": false
+        }
+      }
+    }
+  ],
+  "totals": {
+    "inputTokens": 70000,
+    "cachedInputTokens": 10000,
+    "outputTokens": 24000,
+    "reasoningOutputTokens": 1900,
+    "totalTokens": 94000,
+    "costUSD": 0.36150000000000004
+  }
+}

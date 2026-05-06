@@ -1,0 +1,1 @@
+{"error": "E_DUPLICATE_DELIMITER", "detail": "Multiple `--- public ---` lines (at indices [2, 4])."}

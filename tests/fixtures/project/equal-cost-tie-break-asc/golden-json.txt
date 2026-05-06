@@ -1,0 +1,44 @@
+{
+  "rangeStart": "2026-04-13",
+  "rangeEnd": "2026-04-15",
+  "weeksInRange": 1,
+  "groupMode": "git-root",
+  "totals": {
+    "costUsd": 7.5,
+    "usedPercent": 50.0,
+    "weeklyAttributionAvailable": true
+  },
+  "projects": [
+    {
+      "displayKey": "apple",
+      "projectPath": "/fake/repos/apple",
+      "gitRoot": null,
+      "sessions": 1,
+      "firstSeen": "2026-04-15T12:00:00Z",
+      "lastSeen": "2026-04-15T12:00:00Z",
+      "inputTokens": 500000,
+      "outputTokens": 50000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 3.75,
+      "attributedUsedPercent": 25.0,
+      "costPerPercent": 0.15
+    },
+    {
+      "displayKey": "banana",
+      "projectPath": "/fake/repos/banana",
+      "gitRoot": null,
+      "sessions": 1,
+      "firstSeen": "2026-04-15T13:00:00Z",
+      "lastSeen": "2026-04-15T13:00:00Z",
+      "inputTokens": 500000,
+      "outputTokens": 50000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 3.75,
+      "attributedUsedPercent": 25.0,
+      "costPerPercent": 0.15
+    }
+  ],
+  "warnings": []
+}

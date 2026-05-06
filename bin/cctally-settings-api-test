@@ -1,0 +1,478 @@
+#!/usr/bin/env bash
+# Validates POST /api/settings on the dashboard subcommand.
+#
+# Each case starts the server with --no-sync --no-browser against a
+# fresh HOME so config writes / reads stay isolated. The server
+# binds to 127.0.0.1:18910 (configurable via PORT env). Cleanup
+# trap kills any stray PIDs on exit / Ctrl-C.
+#
+# Cases:
+#   1. Round-trip valid IANA (Asia/Jerusalem) -> 200, persisted
+#   2. Keyword "local" -> 200, resolves to a concrete IANA name
+#   3. Keyword "utc" -> 200, resolves to Etc/UTC
+#   4. Malformed JSON -> 400
+#   5. Invalid IANA -> 400 with field marker
+#   6. Origin mismatch -> 403
+#   7. GET method -> 405 with Allow: POST (only POST is wired,
+#      RFC 9110 §15.5.6 + spec §error-matrix mandate 405 not 404)
+#   8. F2 immediate SSE broadcast: POST should publish a fresh
+#      envelope on the SSE stream within ~1 second, even under
+#      --no-sync where no periodic tick would otherwise fire.
+#   9. (T7 alerts) POST /api/settings with {alerts:{enabled:true}}
+#      -> 200, response body["alerts"]["enabled"] is true; persisted.
+#  10. (T7 alerts) POST /api/settings combined save:
+#      {display:{tz:"utc"}, alerts:{enabled:false}} -> 200; both
+#      blocks visible in response and on disk.
+#  11. (T7 alerts) POST /api/settings with alerts.enabled = "yes"
+#      (string) -> 400 with error message (must be JSON bool).
+#  12. (T7 alerts) POST /api/settings with unknown top-level key
+#      (e.g. "foo") -> 400 with "unknown settings key: foo".
+#  13. (T7 alerts) POST /api/alerts/test {axis:"weekly",threshold:90}
+#      -> 200, body has alert + dispatch keys; dispatch is
+#      "queued" or starts with "spawn_error:".
+#  14. (T7 alerts) POST /api/alerts/test bad axis -> 400.
+#  15. (T7 alerts) POST /api/alerts/test missing Origin -> 403.
+#  16. Malformed stored alerts block (e.g. config.json hand-edit left
+#      "alerts": "bad") -> POST /api/settings returns 400 with
+#      "alerts must be an object" and does NOT partial-write.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN="$REPO_ROOT/bin/cctally"
+# Each case binds an ephemeral port (--port 0) and parses the actual
+# port from the "serving …" banner. Avoids EADDRINUSE flakes between
+# rapid case-to-case restarts (TIME_WAIT after kill, or stale daemon
+# leftovers from prior failed runs).
+PORT=""
+base=""
+
+pass_count=0
+fail_count=0
+
+declare -a BG_PIDS=()
+declare -a SCRATCH_HOMES=()
+cleanup () {
+    for p in "${BG_PIDS[@]:-}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${BG_PIDS[@]:-}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+    for h in "${SCRATCH_HOMES[@]:-}"; do
+        [ -n "$h" ] && rm -rf "$h"
+    done
+}
+trap cleanup EXIT INT TERM
+
+assert_eq () {
+    local label="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "PASS $label"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $label"
+        printf '  expected: %s\n  actual:   %s\n' "$expected" "$actual"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+assert_contains () {
+    local label="$1" needle="$2" haystack="$3"
+    if printf '%s' "$haystack" | grep -qF "$needle"; then
+        echo "PASS $label"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $label (missing $needle)"
+        printf '  haystack: %s\n' "$haystack"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# Start a fresh dashboard against a per-case HOME on an ephemeral
+# port. Mutates GLOBALS: HOME_DIR, PORT, base, BG_PIDS, SCRATCH_HOMES.
+# Returns 0 on success, 1 on failure (server dies / no banner).
+#
+# Implementation note: cannot run inside `$(...)` because subshell
+# global mutations don't propagate up. Caller invokes as plain
+# `start_server` and reads HOME_DIR / base from the parent shell.
+start_server () {
+    HOME_DIR=$(mktemp -d)
+    SCRATCH_HOMES+=("$HOME_DIR")
+    local log="$HOME_DIR/dash.log"
+    HOME="$HOME_DIR" TZ=Etc/UTC \
+        "$BIN" dashboard --no-sync --no-browser \
+        --port 0 --host 127.0.0.1 \
+        --sync-interval 9999 \
+        > "$log" 2>&1 &
+    local pid=$!
+    BG_PIDS+=("$pid")
+
+    local tries=0
+    # 15s ceiling (raised from 5s) so cold CI runners under
+    # parallel-harness load have headroom before this returns "did not
+    # print banner". Mirrors the fixture-test wait in cctally-dashboard-test.
+    while [ $tries -lt 150 ]; do
+        local p
+        # Task 2: with --host 127.0.0.1, the banner now emits "localhost"
+        # (loopback alias normalization). Match either spelling so this
+        # harness keeps working regardless of which alias appears.
+        p=$(grep -Eo 'http://(127\.0\.0\.1|localhost):[0-9]+' "$log" 2>/dev/null \
+            | head -1 | sed 's#.*:##')
+        if [ -n "$p" ]; then
+            PORT="$p"
+            base="http://127.0.0.1:$PORT"
+            return 0
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "FAIL: server died before banner; log:" >&2
+            cat "$log" >&2 || true
+            return 1
+        fi
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    echo "FAIL: server did not print banner; log:" >&2
+    cat "$log" >&2 || true
+    return 1
+}
+
+# Stop the most recently started server (last entry of BG_PIDS).
+# Bash 3.x compatible (macOS ships /bin/bash 3.2): no negative-index
+# subscripts, no `${arr[-1]}` -- index via array length.
+stop_server () {
+    local n pid idx
+    n=${#BG_PIDS[@]}
+    if [ "$n" -eq 0 ]; then
+        return 0
+    fi
+    idx=$((n - 1))
+    pid="${BG_PIDS[$idx]}"
+    [ -z "$pid" ] && return 0
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    # Brief settle so the next case's bind doesn't EADDRINUSE on
+    # rapid case-to-case restart (TIME_WAIT after kill).
+    sleep 0.5
+}
+
+# Helper: one POST, captures both body and HTTP code in stdout
+# (body first, sentinel "@HTTP@", code on its own line). Avoids
+# duplicate POSTs that would each trigger a synchronous broadcast.
+post_settings () {
+    local origin_url="$1" data="$2"
+    curl -s -X POST "$base/api/settings" \
+        -H "Origin: $origin_url" \
+        -H "Content-Type: application/json" \
+        -w '\n@HTTP@\n%{http_code}\n' \
+        -d "$data"
+}
+
+split_post_response () {
+    # Read raw response (with @HTTP@ sentinel) on stdin, split into
+    # body (printed first) and code (printed second). Caller uses
+    # mapfile / read pairs.
+    local raw="$1"
+    body="${raw%@HTTP@*}"
+    body="${body%$'\n'}"
+    body="${body%$'\n'}"
+    code=$(printf '%s' "$raw" | tail -1)
+}
+
+# --- Case 1: round-trip valid IANA -------------------------------------------
+start_server || { echo "skipping (server failed)"; exit 1; }
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"display":{"tz":"Asia/Jerusalem"}}')
+split_post_response "$raw"
+assert_eq "200 valid IANA"  "200" "$code"
+assert_contains "200 valid IANA resolved_tz"  '"resolved_tz": "Asia/Jerusalem"' "$body"
+assert_contains "200 valid IANA tz"           '"tz": "Asia/Jerusalem"' "$body"
+assert_contains "200 valid IANA persisted"    '"tz": "Asia/Jerusalem"' \
+    "$(cat "$HOME_DIR/.local/share/cctally/config.json")"
+stop_server
+
+# --- Case 2: keyword "local" -------------------------------------------------
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"display":{"tz":"local"}}')
+split_post_response "$raw"
+assert_eq "200 local code" "200" "$code"
+# Under TZ=Etc/UTC the host IANA resolves to Etc/UTC.
+assert_contains "200 local tz pref"      '"tz": "local"' "$body"
+assert_contains "200 local resolved_tz"  '"resolved_tz": "Etc/UTC"' "$body"
+stop_server
+
+# --- Case 3: keyword "utc" ---------------------------------------------------
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"display":{"tz":"utc"}}')
+split_post_response "$raw"
+assert_eq "200 utc code" "200" "$code"
+assert_contains "200 utc tz pref"      '"tz": "utc"' "$body"
+assert_contains "200 utc resolved_tz"  '"resolved_tz": "Etc/UTC"' "$body"
+stop_server
+
+# --- Case 4: malformed JSON --------------------------------------------------
+start_server || exit 1
+raw=$(curl -s -X POST "$base/api/settings" \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    -H "Content-Type: application/json" \
+    -w '\n@HTTP@\n%{http_code}\n' \
+    --data-binary 'not json {{')
+split_post_response "$raw"
+assert_eq "400 malformed json" "400" "$code"
+stop_server
+
+# --- Case 5: invalid IANA ----------------------------------------------------
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"display":{"tz":"Mars/Olympus"}}')
+split_post_response "$raw"
+assert_eq "400 invalid IANA" "400" "$code"
+assert_contains "400 invalid IANA field" '"field": "display.tz"' "$body"
+assert_contains "400 invalid IANA name"  'Mars/Olympus' "$body"
+stop_server
+
+# --- Case 6: Origin mismatch -------------------------------------------------
+start_server || exit 1
+raw=$(post_settings "http://evil.example" '{"display":{"tz":"utc"}}')
+split_post_response "$raw"
+assert_eq "403 cross-origin" "403" "$code"
+stop_server
+
+# --- Case 7: non-POST methods --------------------------------------------------
+# Spec §error-matrix + RFC 9110 §15.5.6: any non-POST request to
+# /api/settings must return 405 Method Not Allowed with `Allow: POST`.
+# We verify both GET (the common browser foot-gun) and DELETE (covers
+# the BaseHTTPRequestHandler default-501 escape hatch we override).
+start_server || exit 1
+
+# GET
+code=$(curl -s -o /dev/null -w "%{http_code}" "$base/api/settings")
+assert_eq "405 GET not allowed" "405" "$code"
+allow_hdr=$(curl -s -D - -o /dev/null "$base/api/settings" \
+    | tr -d '\r' | awk -F': ' 'tolower($1)=="allow" {print $2}')
+assert_eq "405 GET Allow: POST" "POST" "$allow_hdr"
+
+# DELETE (BaseHTTPRequestHandler default would be 501; we override)
+code=$(curl -s -o /dev/null -X DELETE -w "%{http_code}" "$base/api/settings")
+assert_eq "405 DELETE not allowed" "405" "$code"
+
+stop_server
+
+# --- Case 8: F2 immediate SSE broadcast --------------------------------------
+# Subscribe to /api/events in the background, capture the first frame
+# (initial seed sent on subscribe), then POST /api/settings and read
+# the next frame within ~1.2s. Under --no-sync, the only way a fresh
+# frame arrives is the synchronous broadcast triggered by the POST,
+# so seeing TWO frames within the window proves the F2 path.
+start_server || exit 1
+sse_log=$(mktemp)
+( curl -sN --max-time 3 "$base/api/events" > "$sse_log" ) &
+sse_pid=$!
+BG_PIDS+=("$sse_pid")
+# Wait for the seed frame to land.
+seed_tries=0
+while [ $seed_tries -lt 20 ]; do
+    if grep -qc 'event: update' "$sse_log" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+    seed_tries=$((seed_tries + 1))
+done
+seed_count=$( { grep -c 'event: update' "$sse_log" 2>/dev/null || true; } | head -1)
+seed_count="${seed_count:-0}"
+# POST a settings change to trigger the synchronous broadcast.
+curl -s -X POST "$base/api/settings" \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    -d '{"display":{"tz":"Asia/Jerusalem"}}' > /dev/null
+# Wait up to ~1.5s for the second frame.
+post_tries=0
+final_count=$seed_count
+while [ $post_tries -lt 15 ]; do
+    final_count=$( { grep -c 'event: update' "$sse_log" 2>/dev/null || true; } | head -1)
+    final_count="${final_count:-0}"
+    if [ "$final_count" -gt "$seed_count" ]; then
+        break
+    fi
+    sleep 0.1
+    post_tries=$((post_tries + 1))
+done
+if [ "$final_count" -gt "$seed_count" ]; then
+    echo "PASS F2 immediate SSE broadcast"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL F2 immediate SSE broadcast: seed=$seed_count final=$final_count"
+    fail_count=$((fail_count + 1))
+fi
+# Confirm at least one of the broadcast frames carries the new resolved_tz.
+if grep -q '"resolved_tz": "Asia/Jerusalem"' "$sse_log" 2>/dev/null; then
+    echo "PASS F2 SSE frame contains new resolved_tz"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL F2 SSE frame missing new resolved_tz"
+    fail_count=$((fail_count + 1))
+fi
+rm -f "$sse_log"
+stop_server
+
+# --- Case 9 (T7): alerts-only save ------------------------------------------
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"alerts":{"enabled":true}}')
+split_post_response "$raw"
+assert_eq        "200 alerts-only code"          "200" "$code"
+assert_contains  "200 alerts-only enabled=true"  '"enabled": true' "$body"
+# Persisted on disk under the per-case HOME.
+cfg_path="$HOME_DIR/.local/share/cctally/config.json"
+assert_contains  "200 alerts-only persisted"     '"enabled": true' "$(cat "$cfg_path")"
+# Display block must NOT appear in the response when only alerts was sent.
+if printf '%s' "$body" | grep -q '"display"'; then
+    echo "FAIL 200 alerts-only: response contains unexpected display block"
+    printf '  body: %s\n' "$body"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS 200 alerts-only no display block in response"
+    pass_count=$((pass_count + 1))
+fi
+stop_server
+
+# --- Case 10 (T7): combined display + alerts save ---------------------------
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" \
+    '{"display":{"tz":"utc"},"alerts":{"enabled":false}}')
+split_post_response "$raw"
+assert_eq        "200 combined code"             "200" "$code"
+assert_contains  "200 combined display tz"       '"tz": "utc"' "$body"
+assert_contains  "200 combined alerts enabled"   '"enabled": false' "$body"
+# Both blocks landed atomically on disk.
+cfg_path="$HOME_DIR/.local/share/cctally/config.json"
+assert_contains  "200 combined display persisted" '"tz": "utc"' "$(cat "$cfg_path")"
+assert_contains  "200 combined alerts persisted"  '"enabled": false' "$(cat "$cfg_path")"
+stop_server
+
+# --- Case 11 (T7): alerts.enabled string -> 400 -----------------------------
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"alerts":{"enabled":"yes"}}')
+split_post_response "$raw"
+assert_eq        "400 alerts.enabled string"    "400" "$code"
+assert_contains  "400 alerts.enabled error key"  '"error"' "$body"
+# Verify the no-partial-write contract: nothing should have been persisted.
+cfg_path="$HOME_DIR/.local/share/cctally/config.json"
+if [ -f "$cfg_path" ] && grep -q '"alerts"' "$cfg_path"; then
+    echo "FAIL 400 alerts.enabled bad value: alerts block leaked into config"
+    printf '  config: %s\n' "$(cat "$cfg_path")"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS 400 alerts.enabled bad value: no partial write"
+    pass_count=$((pass_count + 1))
+fi
+stop_server
+
+# --- Case 12 (T7): unknown top-level key -> 400 -----------------------------
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"foo":{"bar":1}}')
+split_post_response "$raw"
+assert_eq        "400 unknown key code"          "400" "$code"
+assert_contains  "400 unknown key message"       'unknown settings key: foo' "$body"
+stop_server
+
+# --- Case 13 (T7): /api/alerts/test happy path ------------------------------
+# osascript may or may not be present on the host. Both outcomes are 200;
+# the dispatch field carries "queued" or "spawn_error: ...".
+start_server || exit 1
+raw=$(curl -s -X POST "$base/api/alerts/test" \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    -H "Content-Type: application/json" \
+    -w '\n@HTTP@\n%{http_code}\n' \
+    -d '{"axis":"weekly","threshold":90}')
+split_post_response "$raw"
+assert_eq        "200 alerts/test code"          "200" "$code"
+assert_contains  "200 alerts/test alert key"     '"alert"' "$body"
+assert_contains  "200 alerts/test dispatch key"  '"dispatch"' "$body"
+# `dispatch` value must be "queued" or start with "spawn_error:".
+dispatch_val=$(printf '%s' "$body" \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("dispatch",""))')
+case "$dispatch_val" in
+    queued|spawn_error:*)
+        echo "PASS 200 alerts/test dispatch shape ($dispatch_val)"
+        pass_count=$((pass_count + 1))
+        ;;
+    *)
+        echo "FAIL 200 alerts/test dispatch shape: '$dispatch_val'"
+        fail_count=$((fail_count + 1))
+        ;;
+esac
+# Verify the alert payload carries axis + threshold so consumers can
+# render it. (Full schema covered by alerts-dispatch-test; this is a
+# smoke check at the HTTP layer.)
+assert_contains  "200 alerts/test payload axis"      '"axis": "weekly"' "$body"
+assert_contains  "200 alerts/test payload threshold" '"threshold": 90' "$body"
+
+# 5h axis variant uses underscore (JSON convention; CLI uses hyphen).
+raw=$(curl -s -X POST "$base/api/alerts/test" \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    -H "Content-Type: application/json" \
+    -w '\n@HTTP@\n%{http_code}\n' \
+    -d '{"axis":"five_hour","threshold":75}')
+split_post_response "$raw"
+assert_eq        "200 alerts/test five_hour code"     "200" "$code"
+assert_contains  "200 alerts/test five_hour axis"     '"axis": "five_hour"' "$body"
+stop_server
+
+# --- Case 14 (T7): /api/alerts/test invalid axis -> 400 ---------------------
+start_server || exit 1
+raw=$(curl -s -X POST "$base/api/alerts/test" \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    -H "Content-Type: application/json" \
+    -w '\n@HTTP@\n%{http_code}\n' \
+    -d '{"axis":"daily","threshold":50}')
+split_post_response "$raw"
+assert_eq        "400 alerts/test bad axis"      "400" "$code"
+assert_contains  "400 alerts/test bad axis err"  '"error"' "$body"
+
+# Out-of-range threshold also rejected with 400.
+raw=$(curl -s -X POST "$base/api/alerts/test" \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    -H "Content-Type: application/json" \
+    -w '\n@HTTP@\n%{http_code}\n' \
+    -d '{"axis":"weekly","threshold":0}')
+split_post_response "$raw"
+assert_eq        "400 alerts/test threshold OOR" "400" "$code"
+stop_server
+
+# --- Case 15 (T7): /api/alerts/test cross-origin -> 403 ---------------------
+start_server || exit 1
+code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "$base/api/alerts/test" \
+    -H "Origin: http://evil.example" \
+    -H "Content-Type: application/json" \
+    -d '{"axis":"weekly","threshold":90}')
+assert_eq        "403 alerts/test cross-origin" "403" "$code"
+# Missing Origin must also 403 (mirrors /api/sync + /api/settings).
+code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "$base/api/alerts/test" \
+    -H "Content-Type: application/json" \
+    -d '{"axis":"weekly","threshold":90}')
+assert_eq        "403 alerts/test missing Origin" "403" "$code"
+stop_server
+
+# --- Case 16: malformed stored alerts block -> 400 --------------------------
+# Pre-seed a non-dict alerts block to simulate a hand-edit that left
+# config.json in a recoverable-but-invalid state. Pre-fix, the handler
+# crashed in `dict("bad")` (ValueError) before reaching the
+# _AlertsConfigError → 400 mapping, surfacing as a 500 to the Settings UI.
+# The fix returns the documented 400 + actionable error message.
+start_server || exit 1
+mkdir -p "$HOME_DIR/.local/share/cctally"
+cat > "$HOME_DIR/.local/share/cctally/config.json" <<'JSON'
+{"alerts": "bad"}
+JSON
+before16=$(cat "$HOME_DIR/.local/share/cctally/config.json")
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"alerts":{"enabled":true}}')
+split_post_response "$raw"
+assert_eq        "400 malformed stored alerts code" "400" "$code"
+assert_contains  "400 malformed stored alerts msg"  'alerts must be an object' "$body"
+# No partial write: config.json must remain exactly as it was.
+after16=$(cat "$HOME_DIR/.local/share/cctally/config.json")
+assert_eq        "400 malformed stored alerts no partial write" "$before16" "$after16"
+stop_server
+
+echo
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

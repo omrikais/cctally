@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Fixture-based validation harness for the trailer parser.
+#
+# Walks tests/fixtures/public-trailer/*/input.txt, runs
+#   `python3 .githooks/_public_trailer.py parse --message-file <input.txt>`
+# capturing stdout, and diffs against golden-parse.txt. Exits 0 on
+# all-pass, 1 on any diff. Builder is invoked first to refresh fixtures.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+FIXTURES_DIR="$REPO_ROOT/tests/fixtures/public-trailer"
+PARSER="$REPO_ROOT/.githooks/_public_trailer.py"
+
+SCRATCH_DIR=$(mktemp -d -t cctally-public-trailer-fixtures-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+
+"$REPO_ROOT/bin/build-public-trailer-fixtures.py" --out "$SCRATCH_DIR" >/dev/null || {
+    echo "FAIL: build-public-trailer-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+pass_count=0
+fail_count=0
+
+for dir in "$FIXTURES_DIR"/*/; do
+    name=$(basename "$dir")
+    input="$SCRATCH_DIR/$name/input.txt"
+    golden="$dir/golden-parse.txt"
+
+    if [ ! -f "$input" ]; then
+        echo "FAIL [$name]: scratch input.txt missing — builder regression?"
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+    if [ ! -f "$golden" ]; then
+        echo "FAIL [$name]: in-tree golden-parse.txt missing — regenerate via builder + commit"
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+
+    actual=$(python3 "$PARSER" parse --message-file "$input" 2>/dev/null || true)
+    expected=$(cat "$golden")
+
+    if [ "$actual" = "$expected" ]; then
+        echo "PASS [$name]"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL [$name]:"
+        diff <(echo "$expected") <(echo "$actual") || true
+        fail_count=$((fail_count + 1))
+    fi
+done
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

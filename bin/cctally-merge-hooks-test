@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Integration test for the merge-commit carve-out in .githooks/pre-commit
+# and .githooks/commit-msg.
+#
+# Both hooks short-circuit (exit 0) when MERGE_HEAD is present, because a
+# merge commit by definition combines everything from both parents and is
+# necessarily mixed. The mirror script handles merges via
+# `_merge_has_evil_public_content` at replay time, not at commit time.
+#
+# This harness builds a scratch repo, mounts the live hooks, sets up a
+# realistic merge that bundles public + private + unmatched files, then
+# directly invokes each hook in the merge state and asserts exit 0.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+SCRATCH_DIR=$(mktemp -d -t cctally-merge-hooks-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+
+pass_count=0
+fail_count=0
+
+assert_exit() {
+    local name=$1 expected=$2 actual=$3 stderr=$4
+    if [ "$actual" = "$expected" ]; then
+        echo "PASS [$name]"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL [$name]: expected exit=$expected, got $actual"
+        if [ -n "$stderr" ]; then
+            echo "  stderr:"
+            printf '    %s\n' "$stderr"
+        fi
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+setup_repo() {
+    local repo=$1
+    mkdir -p "$repo"
+    cd "$repo"
+    git init -q --initial-branch=main 2>/dev/null || git init -q
+    git config user.email "test@example.com"
+    git config user.name "Test"
+    git config commit.gpgsign false
+    git config tag.gpgsign false
+
+    mkdir -p .githooks bin
+    cp "$REPO_ROOT/.mirror-allowlist" .
+    cp "$REPO_ROOT/.githooks/_match.py" .githooks/
+    cp "$REPO_ROOT/.githooks/_public_trailer.py" .githooks/
+    cp "$REPO_ROOT/.githooks/pre-commit" .githooks/
+    cp "$REPO_ROOT/.githooks/commit-msg" .githooks/
+    chmod +x .githooks/pre-commit .githooks/commit-msg
+    git config core.hooksPath .githooks
+
+    echo "base" > README.md
+    git add README.md
+    git commit --no-verify -q -m "init"
+
+    git checkout -q -b feat/x
+    mkdir -p docs
+    echo "public-content" > docs/published.md
+    echo "private-content" > bin/cctally-mirror-public
+    git add docs/published.md bin/cctally-mirror-public
+    git commit --no-verify -q -F - <<'CCTALLY_FEAT_MSG'
+feat: add public + private content
+
+--- public ---
+docs: ship published.md
+CCTALLY_FEAT_MSG
+    git checkout -q main
+}
+
+# ---------- Test 1: pre-commit short-circuits during merge ----------
+work1="$SCRATCH_DIR/test1"
+setup_repo "$work1"
+cd "$work1"
+git merge --no-ff --no-commit feat/x >/dev/null 2>&1
+stderr=$(.githooks/pre-commit 2>&1 1>/dev/null)
+rc=$?
+assert_exit "pre-commit-skips-merge" "0" "$rc" "$stderr"
+git merge --abort 2>/dev/null || true
+
+# ---------- Test 2: commit-msg short-circuits during merge ----------
+work2="$SCRATCH_DIR/test2"
+setup_repo "$work2"
+cd "$work2"
+git merge --no-ff --no-commit feat/x >/dev/null 2>&1
+# Synthesize a merge-style message file with no trailer.
+echo "Merge branch 'feat/x'" > .git/COMMIT_EDITMSG_TEST
+stderr=$(.githooks/commit-msg .git/COMMIT_EDITMSG_TEST 2>&1 1>/dev/null)
+rc=$?
+assert_exit "commit-msg-skips-merge" "0" "$rc" "$stderr"
+git merge --abort 2>/dev/null || true
+
+# ---------- Test 3: pre-commit STILL rejects mixed non-merge commits ----------
+work3="$SCRATCH_DIR/test3"
+setup_repo "$work3"
+cd "$work3"
+echo "edited" >> README.md
+mkdir -p bin
+echo "private-content" > bin/cctally-mirror-public
+git add README.md bin/cctally-mirror-public
+stderr=$(.githooks/pre-commit 2>&1 1>/dev/null)
+rc=$?
+# Expect exit 1: README.md is public, bin/cctally-mirror-public is private.
+assert_exit "pre-commit-still-rejects-mixed-non-merge" "1" "$rc" ""
+
+# ---------- Test 4: commit-msg STILL rejects public commit lacking trailer ----------
+work4="$SCRATCH_DIR/test4"
+setup_repo "$work4"
+cd "$work4"
+echo "edit" >> README.md
+git add README.md
+echo "fix: edit readme" > .git/COMMIT_EDITMSG_TEST
+stderr=$(.githooks/commit-msg .git/COMMIT_EDITMSG_TEST 2>&1 1>/dev/null)
+rc=$?
+# Expect exit 1: README.md is public-classified and message has no trailer.
+assert_exit "commit-msg-still-rejects-trailerless-public" "1" "$rc" ""
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

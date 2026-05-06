@@ -1,0 +1,49 @@
+{
+  "sessions": [
+    {
+      "sessionId": "sssf-baseline-session-uuid",
+      "projectPath": "/fake/repos/baseline",
+      "sourcePaths": [
+        "/fake/jsonl/sssf-session.jsonl"
+      ],
+      "firstActivity": "2026-04-15T02:00:00+00:00",
+      "lastActivity": "2026-04-15T10:00:00+00:00",
+      "modelsUsed": [
+        "claude-opus-4-7",
+        "claude-sonnet-4-6"
+      ],
+      "inputTokens": 700000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 50000,
+      "outputTokens": 70000,
+      "totalTokens": 770000,
+      "totalCost": 4.9750000000000005,
+      "modelBreakdowns": [
+        {
+          "model": "claude-opus-4-7",
+          "inputTokens": 600000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 50000,
+          "outputTokens": 60000,
+          "cost": 4.525
+        },
+        {
+          "model": "claude-sonnet-4-6",
+          "inputTokens": 100000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "outputTokens": 10000,
+          "cost": 0.44999999999999996
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "inputTokens": 700000,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 50000,
+    "outputTokens": 70000,
+    "totalTokens": 770000,
+    "totalCost": 4.9750000000000005
+  }
+}

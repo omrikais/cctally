@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Thin wrapper: `cctally-alerts` → `cctally alerts`.
+# Mirrors the per-subcommand wrapper pattern (`cctally-forecast`,
+# `cctally-project`, etc.).
+set -euo pipefail
+exec "$(dirname "$0")/cctally" alerts "$@"

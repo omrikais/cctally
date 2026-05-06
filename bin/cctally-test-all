@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Aggregate golden-file harness runner.
+#
+# Phase 1 — parallel: per-command harnesses run concurrently. Each one
+# uses its own mktemp -d scratch dir (the harness scratch-dir pattern
+# documented in CLAUDE.md), so they're concurrent-safe.
+# Phase 2 — serial: reconcile-test runs last, after all other harnesses
+# have finished, so any cross-harness fixture state is settled.
+# Continues on per-harness failure to give maximum coverage in the
+# summary. Exits non-zero iff any harness had any failure.
+#
+# Concurrency cap: CCTALLY_TEST_JOBS env var, defaulting to the host's
+# CPU count. Use CCTALLY_TEST_JOBS=1 to force serial behavior (e.g. for
+# debugging a flaky harness or constrained CI).
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+default_jobs() {
+    local n
+    n=$(sysctl -n hw.ncpu 2>/dev/null) || n=$(nproc 2>/dev/null) || n=4
+    echo "$n"
+}
+JOBS=${CCTALLY_TEST_JOBS:-$(default_jobs)}
+
+# Phase 2: must run after parallel_harnesses (reads cross-harness state).
+final_harnesses=(reconcile)
+
+# Phase 1: parallel-safe harnesses, glob-discovered.
+# Glob over bin/cctally-*-test and strip the `cctally-` prefix and `-test`
+# suffix. Any harness present on disk (other than this aggregator and the
+# Phase 2 finals) is run in Phase 1. Default shell glob ordering is
+# alphabetical, so output stays deterministic.
+#
+# Why glob instead of a hardcoded list: the same file content needs to
+# work in both the private repo (which has cctally-mirror-public-test)
+# and the public mirror (which doesn't, since the mirror-public tooling
+# is private-only). A glob picks up exactly what's present in each clone.
+parallel_harnesses=()
+final_set=" ${final_harnesses[*]} "
+for path in "$REPO_ROOT"/bin/cctally-*-test; do
+    [ -x "$path" ] || continue
+    base=$(basename "$path")
+    [ "$base" = "cctally-test-all" ] && continue
+    # Strip leading `cctally-` and trailing `-test`.
+    name=${base#cctally-}
+    name=${name%-test}
+    # Skip Phase 2 entries — they're added at the tail.
+    case "$final_set" in *" $name "*) continue ;; esac
+    parallel_harnesses+=("$name")
+done
+all_harnesses=("${parallel_harnesses[@]}" "${final_harnesses[@]}")
+
+LOGDIR=$(mktemp -d -t cctally-test-all.XXXXXX)
+trap 'rm -rf "$LOGDIR"' EXIT
+
+run_one() {
+    local h=$1
+    "$REPO_ROOT/bin/cctally-${h}-test" > "$LOGDIR/${h}.log" 2>&1 || true
+}
+export -f run_one
+export REPO_ROOT LOGDIR
+
+# Phase 1: parallel via xargs -P. Each invocation forks one bash to run a
+# single harness; -I {} substitutes the harness name as the argv.
+printf '%s\n' "${parallel_harnesses[@]}" \
+    | xargs -P "$JOBS" -I {} bash -c 'run_one "$@"' _ {}
+
+# Phase 2: serial.
+for h in "${final_harnesses[@]}"; do
+    run_one "$h"
+done
+
+# Aggregate in original harness order so output stays deterministic
+# regardless of which harness finished first under parallelism.
+total_pass=0
+total_fail=0
+declare -a rows
+
+for h in "${all_harnesses[@]}"; do
+    log="$LOGDIR/${h}.log"
+    summary=$(grep '^passed:' "$log" | tail -1)
+    if [ -z "$summary" ]; then
+        # Harness crashed before summary; flag loudly.
+        rows+=("$(printf '%5s/%s   %s  (NO SUMMARY — see log)' '?' '?' "$h")")
+        total_fail=$((total_fail + 1))
+        echo "---- $h output (crashed) ----" >&2
+        cat "$log" >&2
+        continue
+    fi
+    p=$(echo "$summary" | awk '{print $2}')
+    f=$(echo "$summary" | awk '{print $4}')
+    total_pass=$((total_pass + p))
+    total_fail=$((total_fail + f))
+    rows+=("$(printf '%5s/%s   %s' "$p" "$f" "$h")")
+    if [ "$f" -ne 0 ]; then
+        echo "---- $h FAIL details ----" >&2
+        # Print up to 200 lines of context after each FAIL marker so the
+        # harness's diff output (emitted immediately after the FAIL line
+        # via `diff -u | head -200`) survives into stderr — without this,
+        # CI logs show only the FAIL header and the actual unexpected
+        # output is lost. Resets `lines` on each new marker so multiple
+        # failures in one harness all surface their diffs.
+        awk '
+            /^(FAIL|MISSING GOLDEN|RECONCILE FAIL)/ { flag = 1; lines = 200 }
+            flag && lines > 0                       { print; lines-- }
+            flag && lines == 0                      { flag = 0 }
+        ' "$log" >&2 || true
+    fi
+done
+
+# Phase 3: pytest tests/ (skipped if pytest unavailable). Runs after the
+# golden-file harnesses so any cross-harness state is settled before the
+# Python suite executes.
+pytest_status="SKIPPED"
+if python3 -m pytest --version >/dev/null 2>&1; then
+    pytest_log="$LOGDIR/pytest.log"
+    if (cd "$REPO_ROOT" && python3 -m pytest tests/ -q) > "$pytest_log" 2>&1; then
+        pytest_status="PASS"
+    else
+        pytest_status="FAIL"
+        total_fail=$((total_fail + 1))
+        echo "---- pytest FAIL details ----" >&2
+        cat "$pytest_log" >&2
+    fi
+fi
+
+echo "----"
+for row in "${rows[@]}"; do echo "$row"; done
+printf '%5s   %s\n' "$pytest_status" "pytest"
+echo "Total: passed=$total_pass   failed=$total_fail   pytest=$pytest_status   (jobs=$JOBS)"
+[ "$total_fail" -eq 0 ]

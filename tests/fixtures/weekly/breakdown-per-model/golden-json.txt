@@ -1,0 +1,58 @@
+{
+  "weekly": [
+    {
+      "week": "2026-04-13",
+      "displayWeek": "2026-04-13",
+      "weekStartAt": "2026-04-13T00:00:00Z",
+      "weekEndAt": "2026-04-20T00:00:00Z",
+      "weekSource": "snapshot",
+      "inputTokens": 1400000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 140000,
+      "totalTokens": 1540000,
+      "totalCost": 8.1,
+      "usedPct": 50.0,
+      "dollarsPerPercent": 0.162,
+      "modelsUsed": [
+        "claude-opus-4-7",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 800000,
+          "outputTokens": 80000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 6.0
+        },
+        {
+          "modelName": "claude-sonnet-4-6",
+          "inputTokens": 400000,
+          "outputTokens": 40000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 1.7999999999999998
+        },
+        {
+          "modelName": "claude-haiku-4-5",
+          "inputTokens": 200000,
+          "outputTokens": 20000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 0.3
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "inputTokens": 1400000,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 0,
+    "outputTokens": 140000,
+    "totalTokens": 1540000,
+    "totalCost": 8.1
+  }
+}

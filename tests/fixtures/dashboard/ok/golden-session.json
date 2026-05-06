@@ -1,0 +1,37 @@
+{
+  "cache_creation_tokens": 0,
+  "cache_hit_pct": 0.0,
+  "cache_read_tokens": 0,
+  "cost_per_model": [
+    {
+      "cost_usd": 1.26,
+      "model": "claude-sonnet-4-6"
+    },
+    {
+      "cost_usd": 1.05,
+      "model": "claude-opus-4-7"
+    }
+  ],
+  "cost_total_usd": 2.31,
+  "duration_min": 40,
+  "input_tokens": 360000,
+  "last_activity_utc": "2026-04-16T10:40:00Z",
+  "models": [
+    {
+      "name": "claude-sonnet-4-6",
+      "role": "primary"
+    },
+    {
+      "name": "claude-opus-4-7",
+      "role": "secondary"
+    }
+  ],
+  "output_tokens": 54000,
+  "project_label": "fixture-demo",
+  "project_path": "/fake/repos/fixture-demo",
+  "session_id": "fixture-ok-session-0000000000000000",
+  "source_paths": [
+    "/fake/jsonl/fixture-ok-session-0000000000000000.jsonl"
+  ],
+  "started_utc": "2026-04-16T10:00:00Z"
+}

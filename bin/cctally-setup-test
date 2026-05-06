@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# Fixture harness for `cctally setup`.
+#
+# Pattern: scratch HOME per scenario, run `cctally setup` (or a variant
+# from cmd.txt), diff the resulting stdout/stderr against
+# golden-stdout.txt, and (when goldens are present) diff the produced
+# settings.json and ~/.local/bin/ symlink listing.
+#
+# OAuth / keychain stubbing: macOS `security` lookup would otherwise
+# return the developer's real Claude Code token. We shadow `security`
+# with a stub at $fake/.fake-bin/security that exits non-zero, and
+# prepend that dir to PATH. With no $HOME/.claude/.credentials.json
+# either, `_resolve_oauth_token` returns None deterministically.
+#
+# Symlink listing: `ls -la` differs across BSD/GNU and is locale/TZ
+# sensitive. We render the listing via a Python one-liner that emits
+# only the stable bits (name + symlink target), normalize the repo-root
+# path to /REPO, and diff that. macOS-only listings are NOT used.
+#
+# Per-scenario input.env knobs (all optional):
+#   INCLUDE_LOCAL_BIN=1   prepend $fake/.local/bin to PATH (so
+#                         _setup_path_includes_local_bin returns True)
+
+set -uo pipefail
+
+HARNESS_BIN="$(cd "$(dirname "$0")" && pwd)/cctally"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+FIXTURES_DIR="$REPO_ROOT/tests/fixtures/setup"
+pass_count=0
+fail_count=0
+
+# Cross-platform, locale-stable listing of ~/.local/bin/ contents.
+# Emits one line per entry: "<name> -> <target>" for symlinks,
+# "<name> [file]" for regular files, "<name> [dir]" otherwise.
+list_local_bin () {
+    local dir="$1"
+    python3 -c '
+import os, sys
+d = sys.argv[1]
+if not os.path.isdir(d):
+    sys.exit(0)
+rows = []
+for name in sorted(os.listdir(d)):
+    p = os.path.join(d, name)
+    if os.path.islink(p):
+        rows.append(f"{name} -> {os.readlink(p)}")
+    elif os.path.isfile(p):
+        rows.append(f"{name} [file]")
+    elif os.path.isdir(p):
+        rows.append(f"{name} [dir]")
+    else:
+        rows.append(f"{name} [other]")
+print("\n".join(rows))
+' "$dir"
+}
+
+run_scenario () {
+    local name="$1"
+    local dir="$FIXTURES_DIR/$name"
+    [ -d "$dir" ] || return 0
+    [ -f "$dir/cmd.txt" ] || { echo "SKIP $name: no cmd.txt"; return 0; }
+
+    local fake; fake=$(mktemp -d)
+    if [ -d "$dir/input" ]; then
+        cp -R "$dir/input/." "$fake/"
+    fi
+    mkdir -p "$fake/.claude" "$fake/.local/bin" "$fake/.fake-bin"
+    cat > "$fake/.fake-bin/security" <<'STUB'
+#!/bin/sh
+# cctally-setup-test: shadow real `security` so the keychain check
+# returns no token deterministically.
+exit 1
+STUB
+    chmod +x "$fake/.fake-bin/security"
+
+    # Per-scenario knobs.
+    local INCLUDE_LOCAL_BIN=""
+    if [ -f "$dir/input.env" ]; then
+        # shellcheck disable=SC1091
+        . "$dir/input.env"
+    fi
+    local path_pre=""
+    if [ "$INCLUDE_LOCAL_BIN" = "1" ]; then
+        path_pre="$fake/.local/bin:"
+    fi
+
+    # Template-expand /REPO -> actual REPO_ROOT in any copied input
+    # files (settings.json variants reference symlink targets that we
+    # can't hardcode at fixture-creation time).
+    if [ -d "$fake/.claude" ]; then
+        find "$fake/.claude" -type f -name '*.json' 2>/dev/null \
+            | while read -r f; do
+                python3 -c "import sys; p=sys.argv[1]; r=sys.argv[2]; \
+import pathlib; t=pathlib.Path(p).read_text(); \
+pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
+            done
+    fi
+
+    # The cctally shebang is `/usr/bin/env python3`; we want the harness's
+    # ambient `python3` (tied to the test runner / Python 3.11+ on CI),
+    # not the macOS system python3 in /usr/bin (3.9, below cctally's floor).
+    local py3_dir; py3_dir=$(dirname "$(command -v python3)")
+
+    # Pre-run hook: if pre-cmd.txt exists, run it once to materialize
+    # post-install state (symlinks, etc.) that we can't ship in git.
+    if [ -f "$dir/pre-cmd.txt" ]; then
+        local pre; pre=$(cat "$dir/pre-cmd.txt")
+        # shellcheck disable=SC2086
+        HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh \
+            PATH="${path_pre}$fake/.fake-bin:${py3_dir}:/usr/bin:/bin" \
+            "$HARNESS_BIN" $pre >/dev/null 2>&1 || true
+    fi
+
+    local cmd; cmd=$(cat "$dir/cmd.txt")
+    local raw
+    # shellcheck disable=SC2086
+    raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh \
+          PATH="${path_pre}$fake/.fake-bin:${py3_dir}:/usr/bin:/bin" \
+          "$HARNESS_BIN" $cmd 2>&1; echo "EXIT=$?")
+    local rc=${raw##*EXIT=}
+    rc=${rc%$'\n'}
+    local out=${raw%EXIT=*}
+
+    # Normalize: paths, sizes (KB/MB/GB), entry counts, fetch ages.
+    # Strip transient cache migration banner — fires once per fresh
+    # data dir; goldens shouldn't depend on it.
+    local norm
+    norm=$(printf '%s' "$out" \
+        | grep -v '^\[cache\] migrated' \
+        | sed -E \
+            -e "s|$fake|/FAKE|g" \
+            -e "s|$REPO_ROOT|/REPO|g" \
+            -e 's/\(([0-9]+) newly created\)/(N newly created)/g' \
+            -e 's/[0-9]+\.[0-9]+ (B|KB|MB|GB|TB)/SIZE/g' \
+            -e 's/\(([0-9]+) new entries\)/(N new entries)/g' \
+            -e 's/Last fetch     [0-9]+s ago/Last fetch     Ns ago/g')
+
+    local fail_local=0
+
+    if [ -f "$dir/golden-stdout.txt" ]; then
+        if ! diff -u "$dir/golden-stdout.txt" <(printf '%s' "$norm") >/dev/null; then
+            fail_local=1
+            diff -u "$dir/golden-stdout.txt" <(printf '%s' "$norm") | head -60
+        fi
+    else
+        # Missing goldens are FAILURES, not auto-blessed. The test-all
+        # aggregator greps for `^MISSING GOLDEN` to surface failures —
+        # auto-writing here would silently sail through CI.
+        echo "MISSING GOLDEN setup/$name/golden-stdout.txt"
+        fail_local=1
+    fi
+
+    if [ -f "$dir/golden-exit.txt" ]; then
+        local expected_rc; expected_rc=$(cat "$dir/golden-exit.txt")
+        if [ "$rc" != "$expected_rc" ]; then
+            echo "exit mismatch for $name: got $rc want $expected_rc"
+            fail_local=1
+        fi
+    else
+        echo "MISSING GOLDEN setup/$name/golden-exit.txt"
+        fail_local=1
+    fi
+
+    if [ -f "$dir/golden-settings.json" ]; then
+        if [ -f "$fake/.claude/settings.json" ]; then
+            local actual_settings
+            actual_settings=$(sed "s|$REPO_ROOT|/REPO|g" "$fake/.claude/settings.json")
+            if ! diff -u "$dir/golden-settings.json" <(printf '%s\n' "$actual_settings") >/dev/null; then
+                diff -u "$dir/golden-settings.json" <(printf '%s\n' "$actual_settings") | head -50
+                fail_local=1
+            fi
+        else
+            echo "settings.json missing; expected golden present ($name)"
+            fail_local=1
+        fi
+    fi
+
+    if [ -f "$dir/golden-symlinks.txt" ]; then
+        local listing; listing=$(list_local_bin "$fake/.local/bin")
+        local norm_listing; norm_listing=$(printf '%s' "$listing" | sed -E "s|$REPO_ROOT|/REPO|g")
+        if ! diff -u "$dir/golden-symlinks.txt" <(printf '%s\n' "$norm_listing") >/dev/null; then
+            diff -u "$dir/golden-symlinks.txt" <(printf '%s\n' "$norm_listing") | head -50
+            fail_local=1
+        fi
+    fi
+
+    # Scenario-specific post-run checks (e.g. data dir absence after purge).
+    if [ -f "$dir/post-check.sh" ]; then
+        if ! bash "$dir/post-check.sh" "$fake" "$REPO_ROOT" >/dev/null 2>&1; then
+            echo "post-check.sh failed for $name"
+            bash "$dir/post-check.sh" "$fake" "$REPO_ROOT" | head -20
+            fail_local=1
+        fi
+    fi
+
+    if [ "$fail_local" = 0 ]; then
+        echo "PASS $name"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $name"
+        fail_count=$((fail_count + 1))
+    fi
+    rm -rf "$fake"
+}
+
+for d in "$FIXTURES_DIR"/*/; do
+    [ -d "$d" ] || continue
+    run_scenario "$(basename "$d")"
+done
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

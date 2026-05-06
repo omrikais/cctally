@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+# Fixture-based golden harness for the threshold-actions alert pipeline.
+#
+# Walks 10 seeded fixture sub-trees under
+# tests/fixtures/alerts/, copies each into a per-run scratch
+# HOME (so the in-tree fixture DBs stay byte-stable across runs), drives
+# `cctally record-usage` against the scratch HOME with the fixture's
+# CCTALLY_AS_OF + per-scenario env vars, then runs structural assertions
+# against the resulting DB / alerts.log state.
+#
+# Why structural assertions instead of stdout-golden text-diff:
+# `record-usage` is mostly silent on the happy path; the assertions are
+# all structural (alerted_at IS NULL / NOT NULL, milestone-row counts,
+# alerts.log line counts, stderr warnings). Text-golden would require
+# a read-only "alerts list" CLI that doesn't exist (and would shift the
+# determinism burden onto wall-clock-bearing render strings). The
+# structural form mirrors `bin/cctally-percent-milestone-idempotency-test`
+# and `bin/cctally-alerts-dispatch-test` (Task 3 unit harness).
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="$REPO_ROOT/bin/cctally"
+FIXTURES_DIR="$REPO_ROOT/tests/fixtures/alerts"
+
+# Honor HARNESS_FAKE_HOME_BASE as an opt-in override so a developer can
+# inspect post-run state (parallel to the sibling harness convention
+# documented in CLAUDE.md "Harness scratch-dir pattern"). When the
+# override is supplied, the scratch dir is NOT cleaned up on exit.
+SCRATCH_BASE="${HARNESS_FAKE_HOME_BASE:-$(mktemp -d -t cctally-alerts-fixtures.XXXXXX)}"
+if [ -z "${HARNESS_FAKE_HOME_BASE:-}" ]; then
+    trap 'rm -rf "$SCRATCH_BASE"' EXIT
+fi
+
+# Regenerate fixtures into scratch (in-tree fixtures stay byte-stable —
+# matches the forecast / project / diff / dashboard scratch-dir pattern
+# called out in CLAUDE.md "Harness scratch-dir pattern").
+"$REPO_ROOT/bin/build-alerts-fixtures.py" --out "$SCRATCH_BASE" >/dev/null || {
+    echo "FAIL: build-alerts-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+pass_count=0
+fail_count=0
+
+assert_eq () {
+    local label="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "PASS $label"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $label"
+        printf '  expected: %s\n  actual:   %s\n' "$expected" "$actual"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+assert_contains () {
+    local label="$1" needle="$2" haystack="$3"
+    case "$haystack" in
+        *"$needle"*)
+            echo "PASS $label"
+            pass_count=$((pass_count + 1))
+            ;;
+        *)
+            echo "FAIL $label"
+            printf '  expected to contain: %s\n  actual:              %s\n' \
+                "$needle" "$haystack"
+            fail_count=$((fail_count + 1))
+            ;;
+    esac
+}
+
+# Run record-usage against $1 (scenario name). Sources input.env first.
+# All EXTRA_ENV_<NAME> entries from input.env are exported verbatim so
+# scenarios like osascript-missing can flip CCTALLY_TEST_POPEN_FACTORY.
+# Returns the exit code of the record-usage call via $RU_EC.
+run_record_usage () {
+    local name="$1"
+    local home="$SCRATCH_BASE/$name"
+    local input_env="$home/input.env"
+
+    # Locally declare every input.env field so a missing key in one
+    # scenario can't leak from a previous run_record_usage call.
+    local AS_OF=""
+    local PERCENT=""
+    local RESETS_AT=""
+    local FIVE_HOUR_PERCENT=""
+    local FIVE_HOUR_RESETS_AT=""
+    local NEW_RESETS_AT=""
+
+    if [ ! -f "$input_env" ]; then
+        echo "FAIL $name: missing input.env"
+        fail_count=$((fail_count + 1))
+        RU_EC=99
+        return
+    fi
+
+    # shellcheck disable=SC1090
+    . "$input_env"
+
+    if [ -z "$AS_OF" ] || [ -z "$PERCENT" ] || [ -z "$RESETS_AT" ]; then
+        echo "FAIL $name: input.env missing AS_OF/PERCENT/RESETS_AT"
+        fail_count=$((fail_count + 1))
+        RU_EC=99
+        return
+    fi
+
+    # mid-week-reset overrides resets-at with the post-shift value.
+    if [ -n "$NEW_RESETS_AT" ]; then
+        RESETS_AT="$NEW_RESETS_AT"
+    fi
+
+    # Build extra-env exports. EXTRA_ENV_X=value lines were exported
+    # via `.` above — re-derive the EXTRA_ENV_* names by re-reading
+    # the file (sourcing already exported them, but we need to know
+    # which to forward to the subprocess explicitly so the rest of
+    # the parent env stays untouched).
+    local extra_env_names
+    extra_env_names=$(grep -oE '^EXTRA_ENV_[A-Z_][A-Z_0-9]*' "$input_env" || true)
+
+    local extra_env_args=()
+    for ev_name in $extra_env_names; do
+        local target="${ev_name#EXTRA_ENV_}"
+        # Look up the already-sourced value.
+        local val
+        val="$(eval "printf '%s' \"\$$ev_name\"")"
+        extra_env_args+=("$target=$val")
+    done
+
+    local fh_args=()
+    if [ -n "$FIVE_HOUR_PERCENT" ] && [ -n "$FIVE_HOUR_RESETS_AT" ]; then
+        fh_args=(--five-hour-percent "$FIVE_HOUR_PERCENT"
+                 --five-hour-resets-at "$FIVE_HOUR_RESETS_AT")
+    fi
+
+    HOME="$home" TZ=Etc/UTC NO_COLOR=1 CCTALLY_AS_OF="$AS_OF" \
+        env "${extra_env_args[@]}" \
+        "$BIN" record-usage \
+            --percent "$PERCENT" --resets-at "$RESETS_AT" \
+            "${fh_args[@]}" \
+        >"$home/.ru.stdout" 2>"$home/.ru.stderr"
+    RU_EC=$?
+}
+
+# Inspect the post-run DB and alerts.log via Python. Prints one line per
+# fact in the form `<key>=<value>`. Caller asserts on the values.
+inspect_state () {
+    local name="$1"
+    local home="$SCRATCH_BASE/$name"
+    local stats="$home/.local/share/cctally/stats.db"
+    local cache="$home/.local/share/cctally/cache.db"
+    local log="$home/.local/share/cctally/logs/alerts.log"
+
+    HOME="$home" STATS_DB="$stats" CACHE_DB="$cache" LOG_PATH="$log" \
+        python3 - <<'PY'
+import os, sqlite3, pathlib
+stats = os.environ["STATS_DB"]
+log_path = pathlib.Path(os.environ["LOG_PATH"])
+
+with sqlite3.connect(stats) as conn:
+    conn.row_factory = sqlite3.Row
+    pm_total = conn.execute(
+        "SELECT COUNT(*) FROM percent_milestones"
+    ).fetchone()[0]
+    pm_armed = conn.execute(
+        "SELECT COUNT(*) FROM percent_milestones WHERE alerted_at IS NOT NULL"
+    ).fetchone()[0]
+    fhm_total = conn.execute(
+        "SELECT COUNT(*) FROM five_hour_milestones"
+    ).fetchone()[0]
+    fhm_armed = conn.execute(
+        "SELECT COUNT(*) FROM five_hour_milestones WHERE alerted_at IS NOT NULL"
+    ).fetchone()[0]
+    armed_pcts = ",".join(
+        str(int(r["percent_threshold"]))
+        for r in conn.execute(
+            "SELECT percent_threshold FROM percent_milestones "
+            "WHERE alerted_at IS NOT NULL ORDER BY percent_threshold ASC"
+        )
+    )
+    armed_5h_pcts = ",".join(
+        str(int(r["percent_threshold"]))
+        for r in conn.execute(
+            "SELECT percent_threshold FROM five_hour_milestones "
+            "WHERE alerted_at IS NOT NULL ORDER BY percent_threshold ASC"
+        )
+    )
+    pinned = conn.execute(
+        "SELECT alerted_at FROM percent_milestones WHERE percent_threshold = 90"
+    ).fetchone()
+    pinned_str = pinned["alerted_at"] if pinned else ""
+
+print(f"pm_total={pm_total}")
+print(f"pm_armed={pm_armed}")
+print(f"fhm_total={fhm_total}")
+print(f"fhm_armed={fhm_armed}")
+print(f"armed_pcts={armed_pcts}")
+print(f"armed_5h_pcts={armed_5h_pcts}")
+print(f"pinned_alerted_at_90={pinned_str}")
+
+if log_path.exists():
+    lines = log_path.read_text().splitlines()
+    print(f"log_lines={len(lines)}")
+    for i, ln in enumerate(lines):
+        # Tab-delimited: ts, axis, threshold, window_key, mode, status
+        # Print just the (axis, threshold, mode, status_kind) tuple so
+        # the bash side can assert without dealing with timestamps.
+        parts = ln.split("\t")
+        if len(parts) >= 6:
+            axis, thr, mode, status = parts[1], parts[2], parts[4], parts[5]
+            status_kind = "queued" if status == "queued" else (
+                "spawn_error" if status.startswith("spawn_error") else "other"
+            )
+            print(f"log_{i}={axis}|{thr}|{mode}|{status_kind}")
+else:
+    print("log_lines=0")
+PY
+}
+
+# Read a key=value line by key from inspect_state output.
+# Use Python rather than awk to avoid OFS-rebuild artifacts (the
+# `$1=""; sub(/^=/,"")` pattern leaves a leading space because awk
+# rejoins fields with OFS=" "). Same approach as
+# bin/cctally-alerts-dispatch-test.
+get_state () {
+    local key="$1"
+    printf '%s\n' "$STATE_OUT" | python3 -c "
+import sys
+prefix = '$key='
+for line in sys.stdin.read().splitlines():
+    if line.startswith(prefix):
+        print(line[len(prefix):])
+        break
+"
+}
+
+# Source the scenario's input.env into a sub-shell to extract specific keys
+# without polluting the harness env.
+read_env_var () {
+    local name="$1" key="$2"
+    grep "^$key=" "$SCRATCH_BASE/$name/input.env" 2>/dev/null \
+        | head -1 | cut -d= -f2-
+}
+
+# ─── Scenario 1: disabled ────────────────────────────────────────────
+run_record_usage disabled
+assert_eq "disabled: record-usage exit 0" "0" "$RU_EC"
+STATE_OUT="$(inspect_state disabled)"
+assert_eq "disabled: pm_armed (no rows armed under enabled=false)" "0" "$(get_state pm_armed)"
+assert_eq "disabled: fhm_armed (no rows armed under enabled=false)" "0" "$(get_state fhm_armed)"
+assert_eq "disabled: log_lines (no dispatch under enabled=false)" "0" "$(get_state log_lines)"
+
+# ─── Scenario 2: enabled-no-crossing ─────────────────────────────────
+run_record_usage enabled-no-crossing
+assert_eq "enabled-no-crossing: record-usage exit 0" "0" "$RU_EC"
+STATE_OUT="$(inspect_state enabled-no-crossing)"
+# 89% < 90% threshold; no NEW alert even though pre-seeded 88% milestone exists.
+assert_eq "enabled-no-crossing: pm_armed remains 0" "0" "$(get_state pm_armed)"
+assert_eq "enabled-no-crossing: log_lines remains 0" "0" "$(get_state log_lines)"
+
+# ─── Scenario 3: enabled-weekly-90 ───────────────────────────────────
+# Asserts the real popup-dispatch path writes a `mode=real|queued` log
+# entry — which only happens when osascript spawns successfully. On
+# non-Darwin runners the Popen call fails (no `osascript` binary) and
+# the log mode flips to `spawn_error`, breaking the assertion. Gate on
+# uname so Linux CI keeps every other scenario green.
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "SKIP enabled-weekly-90: requires macOS osascript"
+else
+    run_record_usage enabled-weekly-90
+    assert_eq "enabled-weekly-90: record-usage exit 0" "0" "$RU_EC"
+    STATE_OUT="$(inspect_state enabled-weekly-90)"
+    # 91% crosses 90% (and 89, 88 — only 90 is a configured threshold).
+    assert_eq "enabled-weekly-90: armed_pcts == '90'" "90" "$(get_state armed_pcts)"
+    assert_eq "enabled-weekly-90: log_lines == 1" "1" "$(get_state log_lines)"
+    assert_contains "enabled-weekly-90: log line 0 carries weekly|90|real|queued" \
+        "weekly|90|real|queued" "$(get_state log_0)"
+fi
+
+# ─── Scenario 4: enabled-five-hour-95 ────────────────────────────────
+run_record_usage enabled-five-hour-95
+assert_eq "enabled-five-hour-95: record-usage exit 0" "0" "$RU_EC"
+STATE_OUT="$(inspect_state enabled-five-hour-95)"
+# 5h crosses from 80% pre-seed → 96% live; threshold 95 fires.
+# 5h-axis dispatches BOTH crossings 90 AND 95 (multi-jump), so we expect
+# armed_5h_pcts == "90,95".
+assert_eq "enabled-five-hour-95: armed_5h_pcts == '90,95'" "90,95" \
+    "$(get_state armed_5h_pcts)"
+# Weekly axis didn't cross any threshold (89%); pm_armed should be 0.
+assert_eq "enabled-five-hour-95: pm_armed == 0" "0" "$(get_state pm_armed)"
+assert_eq "enabled-five-hour-95: log_lines == 2" "2" "$(get_state log_lines)"
+
+# ─── Scenario 5: multi-threshold-jump ────────────────────────────────
+# Same osascript-dependent rationale as scenario 3 (enabled-weekly-90).
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "SKIP multi-threshold-jump: requires macOS osascript"
+else
+    run_record_usage multi-threshold-jump
+    assert_eq "multi-threshold-jump: record-usage exit 0" "0" "$RU_EC"
+    STATE_OUT="$(inspect_state multi-threshold-jump)"
+    # 87 → 96 jump: rows 88..96 INSERTed; only 90 and 95 in thresholds → both armed.
+    assert_eq "multi-threshold-jump: armed_pcts == '90,95'" "90,95" "$(get_state armed_pcts)"
+    assert_eq "multi-threshold-jump: log_lines == 2" "2" "$(get_state log_lines)"
+    assert_contains "multi-threshold-jump: log 0 = weekly|90|real|queued" \
+        "weekly|90|real|queued" "$(get_state log_0)"
+    assert_contains "multi-threshold-jump: log 1 = weekly|95|real|queued" \
+        "weekly|95|real|queued" "$(get_state log_1)"
+fi
+
+# ─── Scenario 6: disabled-then-enabled ───────────────────────────────
+run_record_usage disabled-then-enabled
+assert_eq "disabled-then-enabled: record-usage exit 0" "0" "$RU_EC"
+STATE_OUT="$(inspect_state disabled-then-enabled)"
+# Pre-seeded 90 milestone (alerted_at NULL) MUST NOT be retroactively armed
+# even though alerts.enabled=true at the live tick. cmd_record_usage's
+# inserted==1 gate skips dispatch when the INSERT OR IGNORE was a no-op.
+assert_eq "disabled-then-enabled: pm_armed == 0 (no retroactive arm)" \
+    "0" "$(get_state pm_armed)"
+assert_eq "disabled-then-enabled: log_lines == 0" "0" "$(get_state log_lines)"
+
+# ─── Scenario 7: mid-week-reset ──────────────────────────────────────
+run_record_usage mid-week-reset
+assert_eq "mid-week-reset: record-usage exit 0" "0" "$RU_EC"
+STATE_OUT="$(inspect_state mid-week-reset)"
+# Post-reset crossing of 90 in the SHIFTED window. Note: with NEW_RESETS_AT
+# (post-shift), cmd_record_usage derives a DIFFERENT week_start_date than
+# the pre-reset baseline. The new week's milestone INSERTs land under that
+# new week_start_date, so the alert WILL fire. The CLAUDE.md gotcha is
+# that earlier-week milestone tables remain keyed on their original date.
+assert_eq "mid-week-reset: pm_armed == 1 (90 fires in new window)" \
+    "1" "$(get_state pm_armed)"
+assert_eq "mid-week-reset: armed_pcts == '90'" "90" "$(get_state armed_pcts)"
+
+# ─── Scenario 8: concurrent-record-usage ─────────────────────────────
+PRE_ARMED_FROM_ENV="$(read_env_var concurrent-record-usage PRE_ARMED_ALERTED_AT)"
+run_record_usage concurrent-record-usage
+assert_eq "concurrent-record-usage: record-usage exit 0" "0" "$RU_EC"
+STATE_OUT="$(inspect_state concurrent-record-usage)"
+# The 90 milestone was pre-armed by "the first racer". The second tick's
+# INSERT OR IGNORE returns rowcount=0 (UNIQUE collision) → dispatch path
+# skipped → alerted_at value preserved exactly.
+assert_eq "concurrent-record-usage: pm_armed == 1 (write-once)" \
+    "1" "$(get_state pm_armed)"
+assert_eq "concurrent-record-usage: alerted_at preserved unchanged" \
+    "$PRE_ARMED_FROM_ENV" "$(get_state pinned_alerted_at_90)"
+assert_eq "concurrent-record-usage: no second log line" \
+    "0" "$(get_state log_lines)"
+
+# ─── Scenario 9: unknown-config-key ──────────────────────────────────
+run_record_usage unknown-config-key
+assert_eq "unknown-config-key: record-usage exit 0 (warn-and-ignore)" \
+    "0" "$RU_EC"
+# Stderr must contain ONE warning about the unknown key. Other stderr
+# (e.g. 'milestone error') is acceptable as long as the warning is
+# present and exit was 0.
+stderr_content="$(cat "$SCRATCH_BASE/unknown-config-key/.ru.stderr")"
+assert_contains "unknown-config-key: stderr warns about unknown_key" \
+    "unknown alerts config key: unknown_key" "$stderr_content"
+STATE_OUT="$(inspect_state unknown-config-key)"
+# 91% crossing should still arm the 90 milestone (warn is non-fatal).
+assert_eq "unknown-config-key: 90 milestone armed (warn is non-fatal)" \
+    "90" "$(get_state armed_pcts)"
+
+# ─── Scenario 10: osascript-missing ──────────────────────────────────
+run_record_usage osascript-missing
+# Spawn-error MUST NOT fail the parent record-usage call. Per spec §9
+# row 1: log spawn_error, swallow, record-usage continues.
+assert_eq "osascript-missing: record-usage exit 0 (spawn-error swallowed)" \
+    "0" "$RU_EC"
+STATE_OUT="$(inspect_state osascript-missing)"
+# Milestone INSERT must be committed even when osascript Popen fails
+# (set-then-dispatch invariant — alerted_at is set BEFORE Popen).
+assert_eq "osascript-missing: 90 milestone armed (set-then-dispatch)" \
+    "90" "$(get_state armed_pcts)"
+assert_eq "osascript-missing: log_lines == 1" "1" "$(get_state log_lines)"
+assert_contains "osascript-missing: log line carries spawn_error status" \
+    "spawn_error" "$(get_state log_0)"
+
+# ─── Sanity: in-tree fixtures stay clean ─────────────────────────────
+# Verify every per-scenario .gitignore covers ALL the spawned WAL/SHM/log
+# files (CLAUDE.md fixture-scoped convention; subagent must not silently
+# regress this). We assert exact-line matches (`grep -qxF`) for each of
+# the six canonical patterns rather than just one, so a future regression
+# that drops *.db-shm / *.lock / logs/ etc. fails loudly.
+required_gitignore_patterns=(
+    '*.db-wal'
+    '*.db-shm'
+    '*.lock'
+    '.local/share/cctally/logs/'
+    '.local/share/cctally/cache.db*.lock'
+    '.local/share/cctally/stats.db*.lock'
+)
+for scenario in disabled enabled-no-crossing enabled-weekly-90 enabled-five-hour-95 \
+                multi-threshold-jump disabled-then-enabled mid-week-reset \
+                concurrent-record-usage unknown-config-key osascript-missing; do
+    gi="$FIXTURES_DIR/$scenario/.gitignore"
+    if [ ! -f "$gi" ]; then
+        echo "FAIL $scenario: .gitignore missing at $gi"
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+    for pattern in "${required_gitignore_patterns[@]}"; do
+        if ! grep -qxF "$pattern" "$gi"; then
+            echo "FAIL $scenario: .gitignore missing pattern '$pattern'"
+            fail_count=$((fail_count + 1))
+        else
+            pass_count=$((pass_count + 1))
+            echo "PASS $scenario: .gitignore covers '$pattern'"
+        fi
+    done
+done
+
+echo
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

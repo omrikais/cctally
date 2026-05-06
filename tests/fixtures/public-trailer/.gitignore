@@ -1,0 +1,5 @@
+# Builder writes input.txt / golden-parse.txt directly; nothing else
+# should land here. Catch any *.tmp or *.bak that an editor might drop.
+*.tmp
+*.bak
+*.swp

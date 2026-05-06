@@ -1,0 +1,36 @@
+{
+  "header": {
+    "week_label": "Apr 25–May 02",
+    "used_pct": 5.0,
+    "five_hour_pct": 12.0,
+    "dollar_per_pct": 14.50,
+    "forecast_pct": null,
+    "forecast_verdict": "ok",
+    "vs_last_week_delta": null
+  },
+  "current_week": {
+    "used_pct": 5.0,
+    "five_hour_pct": 12.0,
+    "five_hour_resets_in_sec": 12000,
+    "spent_usd": 72.50,
+    "dollar_per_pct": 14.50,
+    "reset_at_utc": "2026-05-02T05:00:00Z",
+    "reset_in_sec": 144000,
+    "last_snapshot_age_sec": 8,
+    "freshness": null,
+    "milestones": [],
+    "five_hour_block": {
+      "block_start_at": "2026-04-30T19:30:00+00:00",
+      "seven_day_pct_at_block_start": 95.0,
+      "seven_day_pct_delta_pp": null,
+      "crossed_seven_day_reset": true
+    }
+  },
+  "forecast": null,
+  "trend": { "weeks": [], "history": [] },
+  "weekly":  { "rows": [] },
+  "monthly": { "rows": [] },
+  "blocks":  { "rows": [] },
+  "daily":   { "rows": [] },
+  "sessions":{ "rows": [], "summary": null }
+}

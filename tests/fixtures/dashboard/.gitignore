@@ -1,0 +1,14 @@
+# Runtime artifacts generated when the harness runs under HOME=<scenario>.
+# The committed per-scenario tree is:
+#   <scenario>/input.env
+#   <scenario>/.local/share/cctally/stats.db
+#   <scenario>/.local/share/cctally/cache.db
+# Anything else SQLite or the CLI writes during a run is ignored so the
+# working tree stays clean after `build-dashboard-fixtures.py` and any
+# subsequent harness invocation.
+*.db-wal
+*.db-shm
+*.log
+.local/share/cctally/config.json
+.local/share/cctally/logs/
+.local/share/cctally/cache.db*.lock

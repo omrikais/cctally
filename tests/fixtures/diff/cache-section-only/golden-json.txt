@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-04-25T19:30:00Z",
+  "subcommand": "diff",
+  "windows": {
+    "a": {
+      "label": "this-week",
+      "kind": "week",
+      "start_at": "2026-04-18T19:30:00Z",
+      "end_at": "2026-04-25T19:30:00Z",
+      "length_days": 7.0,
+      "week_aligned": true,
+      "full_weeks_count": 1,
+      "used_pct_mode": "exact"
+    },
+    "b": {
+      "label": "last-week",
+      "kind": "week",
+      "start_at": "2026-04-11T19:30:00Z",
+      "end_at": "2026-04-18T19:30:00Z",
+      "length_days": 7.0,
+      "week_aligned": true,
+      "full_weeks_count": 1,
+      "used_pct_mode": "exact"
+    }
+  },
+  "mismatched_length": false,
+  "normalization": "none",
+  "options": {
+    "allow_mismatch": false,
+    "show_all": false,
+    "min_delta_usd": 0.1,
+    "min_delta_pct": 1.0,
+    "user_override_threshold": false,
+    "sort": "delta",
+    "top": null,
+    "sections_requested": [
+      "cache"
+    ],
+    "sync_run": false
+  },
+  "sections": [
+    {
+      "name": "cache",
+      "scope": "cache-active-entries",
+      "rows": [
+        {
+          "key": "cache:claude",
+          "label": "cache:claude",
+          "status": "changed",
+          "a": {
+            "cost_usd": 7.1875,
+            "tokens_input": 800000,
+            "tokens_output": null,
+            "tokens_cache_read": 500000,
+            "tokens_cache_write": 150000,
+            "cache_hit_pct": 38.462,
+            "used_pct": null
+          },
+          "b": {
+            "cost_usd": 4.8775,
+            "tokens_input": 600000,
+            "tokens_output": null,
+            "tokens_cache_read": 130000,
+            "tokens_cache_write": 50000,
+            "cache_hit_pct": 17.808,
+            "used_pct": null
+          },
+          "delta": {
+            "cost_usd": -2.31,
+            "cost_usd_pct": -32.139,
+            "tokens_input": -200000,
+            "tokens_input_pct": -25.0,
+            "tokens_output": null,
+            "tokens_output_pct": null,
+            "tokens_cache_read": -370000,
+            "tokens_cache_read_pct": -74.0,
+            "tokens_cache_write": -100000,
+            "tokens_cache_write_pct": -66.667,
+            "cache_hit_pct_pp": -20.653,
+            "used_pct_pp": null
+          },
+          "sort_key": 2.3100000000000005
+        },
+        {
+          "key": "cache:overall",
+          "label": "cache:overall",
+          "status": "changed",
+          "a": {
+            "cost_usd": 7.1875,
+            "tokens_input": 800000,
+            "tokens_output": null,
+            "tokens_cache_read": 500000,
+            "tokens_cache_write": 150000,
+            "cache_hit_pct": 38.462,
+            "used_pct": null
+          },
+          "b": {
+            "cost_usd": 4.8775,
+            "tokens_input": 600000,
+            "tokens_output": null,
+            "tokens_cache_read": 130000,
+            "tokens_cache_write": 50000,
+            "cache_hit_pct": 17.808,
+            "used_pct": null
+          },
+          "delta": {
+            "cost_usd": -2.31,
+            "cost_usd_pct": -32.139,
+            "tokens_input": -200000,
+            "tokens_input_pct": -25.0,
+            "tokens_output": null,
+            "tokens_output_pct": null,
+            "tokens_cache_read": -370000,
+            "tokens_cache_read_pct": -74.0,
+            "tokens_cache_write": -100000,
+            "tokens_cache_write_pct": -66.667,
+            "cache_hit_pct_pp": -20.653,
+            "used_pct_pp": null
+          },
+          "sort_key": 2.3100000000000005
+        }
+      ],
+      "hidden_count": 0,
+      "columns": [
+        {
+          "field": "cost_usd",
+          "header": "Cost",
+          "format": "usd",
+          "show_in_overall": false
+        },
+        {
+          "field": "cache_hit_pct",
+          "header": "Cache %",
+          "format": "pct",
+          "show_in_overall": false
+        }
+      ]
+    }
+  ]
+}

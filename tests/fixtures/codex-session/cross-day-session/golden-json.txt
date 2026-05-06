@@ -1,0 +1,56 @@
+{
+  "sessions": [
+    {
+      "sessionId": "proj-short/rollout-short-x",
+      "lastActivity": "2026-04-13T18:00:00.000Z",
+      "sessionFile": "rollout-short-x",
+      "directory": "proj-short",
+      "inputTokens": 5000,
+      "cachedInputTokens": 0,
+      "outputTokens": 2000,
+      "reasoningOutputTokens": 0,
+      "totalTokens": 7000,
+      "costUSD": 0.026250000000000002,
+      "models": {
+        "gpt-5-codex": {
+          "inputTokens": 5000,
+          "cachedInputTokens": 0,
+          "outputTokens": 2000,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 7000,
+          "isFallback": false
+        }
+      }
+    },
+    {
+      "sessionId": "proj-cross/rollout-cross-y",
+      "lastActivity": "2026-04-15T02:30:00.000Z",
+      "sessionFile": "rollout-cross-y",
+      "directory": "proj-cross",
+      "inputTokens": 26000,
+      "cachedInputTokens": 3500,
+      "outputTokens": 9500,
+      "reasoningOutputTokens": 900,
+      "totalTokens": 35500,
+      "costUSD": 0.1235625,
+      "models": {
+        "gpt-5-codex": {
+          "inputTokens": 26000,
+          "cachedInputTokens": 3500,
+          "outputTokens": 9500,
+          "reasoningOutputTokens": 900,
+          "totalTokens": 35500,
+          "isFallback": false
+        }
+      }
+    }
+  ],
+  "totals": {
+    "inputTokens": 31000,
+    "cachedInputTokens": 3500,
+    "outputTokens": 11500,
+    "reasoningOutputTokens": 900,
+    "totalTokens": 42500,
+    "costUSD": 0.14981250000000002
+  }
+}

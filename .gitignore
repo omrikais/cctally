@@ -1,0 +1,36 @@
+.DS_Store
+*.log
+.idea/
+__pycache__/
+.worktrees/
+# Ignore everything in .claude/ EXCEPT the project-scoped skills tree
+# (which is tracked so skill definitions survive fresh clones / propagate
+# to CI). Use `.claude/*` rather than `.claude/` so git still traverses
+# into the directory; a bare `.claude/` would prevent the re-include.
+# __pycache__ and .DS_Store stay ignored via the top-of-file rules.
+.claude/*
+!.claude/skills/
+# Re-include fixture scaffolding under setup test fixtures (gitignore '.claude/' matches anywhere)
+!tests/fixtures/setup/*/input/.claude/
+!tests/fixtures/setup/*/input/.claude/**
+
+# Fixture runtime artifacts — cache.db and stats.db ARE committed per-fixture
+# (see git ls-files tests/fixtures/forecast/*/.local/...), but the
+# lock file, config, logs, and SQLite WAL/SHM sidecars regenerate on every
+# harness run.
+cache.db*.lock
+cache.db-wal
+cache.db-shm
+stats.db-wal
+stats.db-shm
+tests/fixtures/*/*/.local/share/ccusage-subscription/config.json
+tests/fixtures/*/*/.local/share/ccusage-subscription/logs/
+tests/fixtures/*/*/.local/share/cctally/config.json
+tests/fixtures/*/*/.local/share/cctally/logs/
+
+# token-count-dedup scenarios intentionally leave cache.db empty-at-rest;
+# sync_codex_cache() populates it from the committed JSONL on every harness
+# run (that's the whole point of the scenario — exercise the dedup code
+# path). Treat cache.db here as a runtime artifact, not a committed golden.
+tests/fixtures/codex-daily/token-count-dedup/.local/share/ccusage-subscription/cache.db
+tests/fixtures/codex-session/token-count-dedup/.local/share/ccusage-subscription/cache.db

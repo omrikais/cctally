@@ -1,0 +1,13 @@
+{
+  "rangeStart": "2026-04-16",
+  "rangeEnd": "2026-04-16",
+  "weeksInRange": 0,
+  "groupMode": "git-root",
+  "totals": {
+    "costUsd": 0,
+    "usedPercent": null,
+    "weeklyAttributionAvailable": true
+  },
+  "projects": [],
+  "warnings": []
+}

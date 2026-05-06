@@ -1,0 +1,57 @@
+{
+  "sessions": [
+    {
+      "inputTokens": 90000,
+      "outputTokens": 9000,
+      "cacheCreationTokens": 18000,
+      "cacheReadTokens": 450000,
+      "totalTokens": 567000,
+      "cost": 1.0125,
+      "cacheHitPercent": 80.65,
+      "savedUsd": 2.025,
+      "wastedUsd": 0.0225,
+      "netUsd": 2.0025,
+      "anomaly": {
+        "triggered": false,
+        "reasons": []
+      },
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 90000,
+          "outputTokens": 9000,
+          "cacheCreationTokens": 18000,
+          "cacheReadTokens": 450000,
+          "cacheHitPercent": 80.65,
+          "cost": 1.0125,
+          "savedUsd": 2.025,
+          "wastedUsd": 0.0225,
+          "netUsd": 2.0025
+        }
+      ],
+      "sessionId": "bsmr-resumed-session-uuid",
+      "projectPath": "/fake/repos/merged",
+      "lastActivity": "2026-04-15T10:00:00+00:00",
+      "sourcePaths": [
+        "/fake/jsonl/bsmr-original.jsonl",
+        "/fake/jsonl/bsmr-resumed.jsonl"
+      ],
+      "models": [
+        "claude-opus-4-7"
+      ]
+    }
+  ],
+  "totals": {
+    "inputTokens": 90000,
+    "outputTokens": 9000,
+    "cacheCreationTokens": 18000,
+    "cacheReadTokens": 450000,
+    "totalTokens": 567000,
+    "cost": 1.0125,
+    "cacheHitPercent": 80.65,
+    "savedUsd": 2.025,
+    "wastedUsd": 0.0225,
+    "netUsd": 2.0025
+  },
+  "generatedAt": "2026-04-15T12:00:00Z"
+}

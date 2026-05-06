@@ -1,0 +1,51 @@
+{
+  "rangeStart": "2026-04-13",
+  "rangeEnd": "2026-04-15",
+  "weeksInRange": 1,
+  "groupMode": "git-root",
+  "totals": {
+    "costUsd": 6.9,
+    "usedPercent": 60.0,
+    "weeklyAttributionAvailable": true
+  },
+  "projects": [
+    {
+      "displayKey": "gamma",
+      "projectPath": "/fake/repos/gamma",
+      "gitRoot": null,
+      "sessions": 1,
+      "firstSeen": "2026-04-15T09:00:00Z",
+      "lastSeen": "2026-04-15T10:00:00Z",
+      "inputTokens": 1000000,
+      "outputTokens": 100000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 6.9,
+      "attributedUsedPercent": 60.0,
+      "costPerPercent": 0.115,
+      "models": [
+        {
+          "model": "claude-opus-4-7",
+          "firstSeen": "2026-04-15T09:00:00Z",
+          "lastSeen": "2026-04-15T09:00:00Z",
+          "inputTokens": 800000,
+          "outputTokens": 80000,
+          "cacheWriteTokens": 0,
+          "cacheReadTokens": 0,
+          "costUsd": 6.0
+        },
+        {
+          "model": "claude-sonnet-4-6",
+          "firstSeen": "2026-04-15T10:00:00Z",
+          "lastSeen": "2026-04-15T10:00:00Z",
+          "inputTokens": 200000,
+          "outputTokens": 20000,
+          "cacheWriteTokens": 0,
+          "cacheReadTokens": 0,
+          "costUsd": 0.9
+        }
+      ]
+    }
+  ],
+  "warnings": []
+}

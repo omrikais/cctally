@@ -1,0 +1,44 @@
+{
+  "rangeStart": "2026-04-13",
+  "rangeEnd": "2026-04-15",
+  "weeksInRange": 1,
+  "groupMode": "full-path",
+  "totals": {
+    "costUsd": 6.0,
+    "usedPercent": 40.0,
+    "weeklyAttributionAvailable": true
+  },
+  "projects": [
+    {
+      "displayKey": "/fake/forks/delta",
+      "projectPath": "/fake/forks/delta",
+      "gitRoot": null,
+      "sessions": 1,
+      "firstSeen": "2026-04-15T13:00:00Z",
+      "lastSeen": "2026-04-15T13:00:00Z",
+      "inputTokens": 400000,
+      "outputTokens": 40000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 3.0,
+      "attributedUsedPercent": 20.0,
+      "costPerPercent": 0.15
+    },
+    {
+      "displayKey": "/fake/repos/delta",
+      "projectPath": "/fake/repos/delta",
+      "gitRoot": null,
+      "sessions": 1,
+      "firstSeen": "2026-04-15T12:00:00Z",
+      "lastSeen": "2026-04-15T12:00:00Z",
+      "inputTokens": 400000,
+      "outputTokens": 40000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 3.0,
+      "attributedUsedPercent": 20.0,
+      "costPerPercent": 0.15
+    }
+  ],
+  "warnings": []
+}

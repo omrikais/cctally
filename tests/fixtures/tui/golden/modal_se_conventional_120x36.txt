@@ -1,0 +1,33 @@
+════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+ Week Apr 14–Apr 21 │ Used 67.3% (5h 12%) │ $/1% $0.42 │ Fcst 91% WARN │ ● synced —                                     
+════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+               ╔═════════════════════ Session · 14:38:02 UTC (subscription-stats) ══════════════════════╗               
+               ║                                                                                        ║               
+               ║   Session ID     7f3a2b89-4c1e-49a1-a000-000000000001                                  ║               
+               ║   Started        2026-04-20 14:38:02 UTC                                               ║               
+               ║   Last activity  2026-04-20 15:20:41 UTC                                               ║               
+               ║   Duration       42m                                                                   ║               
+               ║   Project        subscription-stats                                                    ║               
+               ║     cwd          /home/user/projects/subscription-stats                                ║               
+               ║   Source files   1 (no resumes across files)                                           ║               
+               ║                                                                                        ║               
+               ║   Models                                                                               ║               
+               ║     sonnet-4.5      primary                                                            ║               
+               ║                                                                                        ║               
+               ║   Tokens                                                                               ║               
+               ║     Input             12,847                                                           ║               
+               ║     Cache create       8,251                                                           ║               
+               ║     Cache read       142,038   87% cache hit                                           ║               
+               ║     Output            18,492                                                           ║               
+               ║                                                                                        ║               
+               ║   Cost                                                                                 ║               
+               ║     sonnet-4.5    $1.84                                                                ║               
+               ║     ─────────────────────                                                              ║               
+               ║     Total          $1.84                                                               ║               
+               ║                                                                                        ║               
+               ║                                                                                        ║               
+               ║                                                                                        ║               
+               ║                                                                                        ║               
+               ╚═══════════════════════════════════════ Esc back ═══════════════════════════════════════╝               
+════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+ Tab focus  ↑↓ scroll  r refresh  s sort  f filter  / search  Enter open  v variant  ? help  q quit                     

@@ -1,0 +1,2750 @@
+:root {
+  --bg: #0a0b10;
+  --panel-bg: #0d0f16;
+  --panel-bg-2: #11131c;
+  --border-soft: rgba(255,255,255,0.06);
+  --text: #d9dde5;
+  --text-dim: #8b92a3;
+  --text-faint: #5a6070;
+  --accent-green: #3ddc84;
+  --accent-purple: #c084fc;
+  --accent-pink: #ec4899;
+  --accent-magenta: #d946ef;
+  --accent-amber: #fbbf24;
+  --accent-red: #ef4444;
+  --accent-orange: #fb923c;
+  --accent-blue: #60a5fa;
+  --accent-cyan: #22d3ee;
+  --accent-indigo: #818cf8;
+  --chip-sonnet: #1f6d3a;
+  --chip-opus:   #6d28d9;
+  --chip-haiku:  #1d4ed8;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+               "DejaVu Sans Mono", monospace;
+  /* Effective sticky-topbar height. Used as the scroll-margin-top floor
+     so panel headers don't slide under the bar when scrollIntoView() or
+     a hash-jump targets them. Mobile bumps this in the @media block. */
+  --topbar-h: 64px;
+}
+
+/* Apply to every panel so scroll anchoring lands the title below the
+   sticky topbar instead of underneath it. */
+.panel { scroll-margin-top: var(--topbar-h); }
+
+html, body {
+  margin: 0; padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+body { padding: 16px; box-sizing: border-box; }
+* { box-sizing: border-box; }
+
+/* Utility — referenced from dashboard.html for secondary / parenthetical text. */
+.mute { color: var(--text-dim); }
+
+/* -------- Header bar -------- */
+.topbar {
+  border: 1px solid var(--accent-blue);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  padding: 12px 18px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 24px;
+  margin-bottom: 16px;
+}
+.topbar .stat { display: flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--text-dim); white-space: nowrap; }
+.topbar .stat .k { color: var(--text-dim); }
+.topbar .stat .v { color: var(--text); font-weight: 600; }
+.topbar .stat .hi-green { color: var(--accent-green); font-weight: 700; font-size: 15px; }
+.topbar .stat .hi-cyan { color: var(--accent-cyan); font-weight: 700; font-size: 15px; }
+.topbar .stat .hi-amber { color: var(--accent-amber); font-weight: 700; font-size: 15px; }
+.pill-warn {
+  background: var(--accent-amber); color: #1a1400; font-weight: 800;
+  padding: 2px 10px; border-radius: 4px; font-size: 12px; letter-spacing: 0.5px;
+  font-family: var(--font-mono);
+}
+
+/* Header icon sizing (topbar + footer share the generic .icon class). */
+.topbar .icon { width: 16px; height: 16px; }
+
+/* Action icon trio inside .topbar. The wrapper itself stays visible at
+   every viewport so the SyncChip cluster (.topbar-sync) keeps its
+   right-floated position; only the new ⚙/? icon buttons are hidden on
+   desktop, where the s/?/r keymap covers them. The mobile @media block
+   reveals the icon buttons. */
+.topbar-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.topbar-actions > .topbar-icon-btn { display: none; }
+
+/* -------- Grid of panels -------- */
+.grid {
+  display: grid;
+  /* minmax(0, 1fr) instead of plain 1fr: a child's min-content (e.g. a
+     wide, non-wrapping label) otherwise inflates one column on resize,
+     leaving the other narrower than half. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto; /* fourth row added for Blocks/Daily */
+  gap: 16px;
+  margin-bottom: 16px;
+}
+@media (max-width: 1100px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* -------- Panel: header line + flex column so foot sticks to bottom -------- */
+.panel {
+  border: 1px solid var(--border-soft);
+  background:
+    radial-gradient(120% 120% at 0% 0%, rgba(255,255,255,0.025) 0%, transparent 60%),
+    linear-gradient(180deg, var(--panel-bg) 0%, var(--panel-bg-2) 100%);
+  border-radius: 8px;
+  padding: 16px 22px 14px;
+  display: flex;
+  flex-direction: column;
+  min-height: 320px;
+  /* Pair with `.grid { grid-template-columns: minmax(0, 1fr) ... }`:
+     without min-width:0 the panel inherits its content's min-content
+     and inflates the grid column past its allotted width. */
+  min-width: 0;
+  transition: box-shadow 120ms ease;
+}
+.panel.accent-green  { border-color: var(--accent-green);  --accent-line: rgba(61,220,132,0.28);  --accent-glow: rgba(61,220,132,0.06); }
+.panel.accent-purple { border-color: var(--accent-purple); --accent-line: rgba(192,132,252,0.30); --accent-glow: rgba(192,132,252,0.06); }
+.panel.accent-amber  { border-color: var(--accent-amber);  --accent-line: rgba(251,191,36,0.26);  --accent-glow: rgba(251,191,36,0.06); }
+.panel.accent-orange { border-color: var(--accent-orange); --accent-line: rgba(251,146,60,0.28);  --accent-glow: rgba(251,146,60,0.06); }
+.panel.accent-cyan   { border-color: var(--accent-cyan);   --accent-line: rgba(34,211,238,0.32);  --accent-glow: rgba(34,211,238,0.06); --pill-bg: rgba(34,211,238,0.18); }
+.panel.accent-pink   { border-color: var(--accent-pink);   --accent-line: rgba(236,72,153,0.32);  --accent-glow: rgba(236,72,153,0.06); --pill-bg: rgba(236,72,153,0.18); }
+.panel.accent-blue   { border-color: var(--accent-blue);   --accent-line: rgba(96,165,250,0.30);  --accent-glow: rgba(96,165,250,0.06);  --pill-bg: rgba(96,165,250,0.18); }
+.panel.accent-indigo { border-color: var(--accent-indigo); --accent-line: rgba(129,140,248,0.30); --accent-glow: rgba(129,140,248,0.06); --pill-bg: rgba(129,140,248,0.18); }
+
+.panel:hover {
+  box-shadow: inset 0 0 28px var(--accent-glow);
+  cursor: pointer;
+}
+
+.panel-header {
+  display: flex; align-items: center; gap: 10px;
+  padding-bottom: 10px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--accent-line);
+}
+.panel-header .icon { width: 18px; height: 18px; }
+.panel-header h3 {
+  margin: 0; font-size: 15px; font-weight: 700;
+  letter-spacing: 0.2px;
+  font-family: var(--font-mono);
+}
+.panel-header h3 .sub { color: var(--text-dim); font-weight: 500; margin-left: 6px; }
+
+.panel-body { flex: 1 1 auto; }
+
+.panel-foot {
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--accent-line);
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+/* -------- Current Week panel -------- */
+.cw-body { display: grid; grid-template-columns: 1.2fr 1fr; gap: 20px; }
+@media (max-width: 1100px) { .cw-body { grid-template-columns: 1fr; } }
+
+.cw-big .label { font-size: 14px; color: var(--text); margin-bottom: 4px; font-weight: 600; }
+.cw-big .num {
+  font-family: var(--font-mono);
+  font-size: 72px; font-weight: 800; line-height: 1.05;
+  color: var(--accent-green); letter-spacing: -2px;
+  margin-bottom: 18px;
+}
+.progress { display: flex; gap: 2px; height: 16px; margin-bottom: 6px; }
+.progress .cell { flex: 1 1 auto; background: #1a1f2b; border-radius: 1px; }
+.progress .cell.on { background: var(--accent-green); }
+.progress-scale { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-faint); }
+
+.cw-left { display: flex; flex-direction: column; gap: 16px; justify-content: flex-start; }
+/* Magnitude-based delta colors for the 5-hour kv sub-line.
+   The generic `.cw-kv .sub` dim rule below would otherwise win on source
+   order over plain (0,2,0) classes, so these target the 5-hour row at
+   (0,3,0) specificity to beat it without `!important`. The `text-dim`
+   fallback (for null delta or no fhb) is left to inherit from the
+   generic .cw-kv .sub rule. */
+.cw-kv.kv-five-hour .sub.delta-low      { color: var(--accent-green); }
+.cw-kv.kv-five-hour .sub.delta-moderate { color: var(--accent-cyan); }
+.cw-kv.kv-five-hour .sub.delta-elevated { color: var(--accent-amber); }
+.cw-kv.kv-five-hour .sub.delta-high     { color: var(--accent-red); }
+
+.cw-right {
+  display: flex; flex-direction: column; gap: 18px;
+  border-left: 1px solid var(--border-soft);
+  padding-left: 20px;
+}
+@media (max-width: 1100px) {
+  .cw-right { border-left: none; padding-left: 0; border-top: 1px solid var(--border-soft); padding-top: 16px; }
+}
+.cw-kv { display: flex; align-items: flex-start; gap: 10px; }
+.cw-kv .icon { width: 18px; height: 18px; color: var(--accent-cyan); flex-shrink: 0; margin-top: 2px; }
+.cw-kv.kv-spent .icon { color: var(--accent-magenta); }
+.cw-kv.kv-reset .icon { color: var(--accent-amber); }
+.cw-kv .body { flex: 1; }
+.cw-kv .row1 { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.cw-kv .row1 .k { color: var(--text); font-weight: 600; }
+.cw-kv .row1 .v { font-weight: 800; font-size: 18px; }
+.cw-kv .row1 .v.cyan { color: var(--accent-cyan); }
+.cw-kv .row1 .v.magenta { color: var(--accent-magenta); }
+.cw-kv .row1 .v.amber { color: var(--accent-amber); font-size: 15px; }
+.cw-kv .sub { color: var(--text-dim); font-size: 13px; margin-top: 2px; }
+.cw-kv .sub .magenta { color: var(--accent-magenta); }
+
+.panel-foot.cw-foot { display: flex; align-items: center; gap: 8px; }
+.panel-foot.cw-foot .icon { width: 14px; height: 14px; color: var(--accent-cyan); }
+
+/* -------- Forecast panel (tight) -------- */
+.warn-banner {
+  background: var(--accent-amber);
+  color: #1a1400;
+  padding: 10px 14px;
+  border-radius: 6px;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  font-size: 18px; font-weight: 800;
+  letter-spacing: 1px;
+  margin-bottom: 10px;
+  background-image: radial-gradient(rgba(0,0,0,0.18) 1px, transparent 1px);
+  background-size: 6px 6px;
+  font-family: var(--font-mono);
+}
+/* Verdict-driven color (set by JS: "warn-banner good|warn|over"). The
+   base rule above is the amber "warn" look; `.warn` is redeclared for
+   clarity so the cascade ordering is explicit. */
+.warn-banner.good { background-color: var(--accent-green); color: #0b2a16; }
+.warn-banner.warn { background-color: var(--accent-amber); color: #1a1400; }
+.warn-banner.over { background-color: var(--accent-red);   color: #ffe7e7; }
+.fc-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 6px 0;
+}
+.fc-row .left { display: flex; align-items: center; gap: 10px; color: var(--text); font-weight: 500; font-size: 13.5px; }
+.fc-row .left .icon-box {
+  width: 30px; height: 30px; border-radius: 6px;
+  background: rgba(255,255,255,0.02);
+  display: flex; align-items: center; justify-content: center;
+}
+.fc-row .right { text-align: right; font-weight: 700; font-size: 14px; color: var(--text); }
+.fc-row .right .num { font-size: 18px; font-weight: 800; margin-right: 6px; }
+.fc-row .right .at { color: var(--accent-blue); font-weight: 500; }
+.fc-row.fc-wkavg .icon-box .icon { color: var(--accent-blue); }
+.fc-row.fc-wkavg .right .num { color: var(--accent-green); }
+.fc-row.fc-24h .icon-box .icon { color: var(--accent-red); }
+.fc-row.fc-24h .right .num { color: var(--accent-red); }
+.fc-row.fc-budget-100 .icon-box .icon { color: var(--accent-green); }
+.fc-row.fc-budget-100 .right .num { color: var(--accent-green); }
+.fc-row.fc-budget-90  .icon-box .icon { color: var(--accent-green); }
+.fc-row.fc-budget-90  .right .num { color: var(--accent-green); }
+.fc-row .right .per { color: var(--text-dim); font-weight: 500; font-size: 12.5px; }
+
+.fc-divider { border-top: 1px solid var(--border-soft); margin: 6px 0; }
+
+.panel-foot.fc-conf {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  font-size: 13.5px;
+}
+.panel-foot.fc-conf .lbl { display: flex; align-items: center; gap: 8px; color: var(--text-dim); }
+.panel-foot.fc-conf .lbl .icon { color: var(--accent-pink); width: 14px; height: 14px; }
+.panel-foot.fc-conf .lbl .val { color: var(--accent-pink); font-weight: 700; margin-left: 4px; }
+.panel-foot.fc-conf .dots { display: flex; gap: 4px; }
+.panel-foot.fc-conf .dots .d { width: 14px; height: 8px; border-radius: 1px; background: #262a35; }
+.panel-foot.fc-conf .dots .d.on { background: var(--accent-purple); }
+
+/* -------- Trend panel -------- */
+.trend-table { width: 100%; border-collapse: collapse; font-size: 13px; font-family: var(--font-mono); }
+.trend-table thead th {
+  text-align: left; font-weight: 700;
+  padding: 4px 10px 8px 0; border-bottom: 1px solid var(--border-soft);
+}
+.trend-table thead th.num { text-align: right; }
+.trend-table thead th.c-week    { color: var(--text); }
+.trend-table thead th.c-used    { color: var(--accent-green); }
+.trend-table thead th.c-dollar  { color: var(--accent-purple); }
+.trend-table thead th.c-delta   { color: var(--accent-amber); }
+.trend-table tbody td { padding: 5px 10px 5px 0; }
+.trend-table tbody td.num { text-align: right; }
+.trend-table tbody tr.current td {
+  background: rgba(34,211,238,0.06);
+  color: var(--accent-cyan);
+  border-top: 1px solid rgba(34,211,238,0.25);
+  border-bottom: 1px solid rgba(34,211,238,0.25);
+}
+.trend-table tbody td.dollar { color: var(--accent-purple); }
+.trend-table tbody td.delta-pos { color: var(--accent-red); }
+.trend-table tbody td.delta-neg { color: var(--accent-green); }
+.trend-spark-title { margin-top: 18px; color: var(--accent-cyan); font-weight: 700; }
+.trend-spark {
+  display: grid; grid-template-columns: repeat(9, 1fr); gap: 6px;
+  align-items: end; height: 72px; margin: 10px 0 6px;
+}
+.trend-spark .bar { background: var(--accent-purple); border-radius: 2px; }
+.trend-spark-legend {
+  display: flex; align-items: center; gap: 10px;
+  color: var(--text-dim); font-size: 12px; font-family: var(--font-mono);
+}
+.trend-spark-legend .line {
+  flex: 1; height: 1px;
+  background-image: linear-gradient(to right, currentColor 50%, transparent 50%);
+  background-size: 6px 1px;
+  color: var(--text-dim);
+}
+
+/* -------- Sessions panel -------- */
+.sort-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 4px 12px; border-radius: 6px;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg-2);
+  font-size: 12.5px; color: var(--text-dim);
+  cursor: pointer;
+  font-family: var(--font-mono);
+}
+.sort-pill:hover { border-color: var(--accent-orange); color: var(--text); }
+.sort-pill .icon { width: 12px; height: 12px; }
+
+.sess-table { width: 100%; border-collapse: collapse; font-size: 13px; font-family: var(--font-mono); }
+.sess-table thead th {
+  text-align: left; color: var(--accent-amber); font-weight: 700;
+  padding: 4px 10px 8px 0;
+}
+.sess-table thead th.num { text-align: right; }
+.sess-table tbody td { padding: 5px 10px 5px 0; white-space: nowrap; }
+.sess-table tbody td.num { text-align: right; }
+.sess-table tbody td.started { color: var(--accent-cyan); }
+.sess-table tbody td.project { color: var(--accent-blue); }
+.sess-table tbody td.cost-low  { color: var(--accent-green); }
+.sess-table tbody td.cost-mid  { color: var(--accent-amber); }
+.sess-table tbody td.cost-high { color: var(--accent-red); }
+.sess-table tbody td.cost-xs   { color: var(--accent-green); }
+
+.chip {
+  display: inline-block; padding: 1px 8px; border-radius: 4px;
+  font-size: 12px; font-weight: 700;
+  font-family: var(--font-mono);
+}
+.chip.sonnet { background: var(--chip-sonnet); color: #b6f7cc; }
+.chip.opus   { background: var(--chip-opus);   color: #e0cfff; }
+.chip.haiku  { background: var(--chip-haiku);  color: #cfdcff; }
+/* Freshness chips on the Current Week panel header (spec §3.4).
+   `fresh` renders no chip — these classes only appear for `aging` / `stale`. */
+.chip.chip-aging {
+  background: rgba(148, 163, 184, 0.18);
+  color: #cbd5e1;
+  border: 1px solid rgba(148, 163, 184, 0.32);
+}
+.chip.chip-stale {
+  background: rgba(251, 191, 36, 0.18);
+  color: var(--accent-amber);
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  font-weight: 800;
+}
+
+/* -------- Footer -------- */
+.footer {
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  border-radius: 6px;
+  padding: 10px 18px;
+  display: flex; gap: 24px;
+  color: var(--text-dim); font-size: 13px;
+  flex-wrap: wrap;
+}
+.kb { display: inline-flex; align-items: center; gap: 8px; }
+.kb kbd {
+  background: var(--panel-bg-2);
+  border: 1px solid var(--border-soft);
+  padding: 1px 8px; border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 12px; color: var(--text);
+}
+.kb kbd.accent-green { color: var(--accent-green); border-color: var(--accent-green); }
+.kb kbd.accent-purple{ color: var(--accent-purple); border-color: var(--accent-purple); }
+.kb kbd.accent-amber { color: var(--accent-amber); border-color: var(--accent-amber); }
+.kb kbd.accent-red   { color: var(--accent-red); border-color: var(--accent-red); }
+.kb kbd.mute         { color: var(--text-faint); border-color: var(--border-soft); }
+
+/* ===== Help overlay (not in mockup — functional addition) ===== */
+#help-overlay[hidden] { display: none; }
+#help-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(10, 11, 16, 0.82);
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--font-mono);
+}
+#help-overlay .help-card {
+  background: var(--panel-bg);
+  border: 1px solid var(--accent-blue);
+  border-radius: 8px;
+  padding: 24px 28px;
+  min-width: 320px;
+  color: var(--text);
+}
+#help-overlay .help-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin: 0 0 12px;
+}
+#help-overlay .help-card h2 {
+  margin: 0; color: var(--accent-blue); font-size: 15px;
+}
+#help-overlay .help-card table { border-collapse: collapse; }
+#help-overlay .help-card td { padding: 4px 12px 4px 0; vertical-align: top; }
+#help-overlay .help-card td kbd,
+#help-overlay .help-card .help-gesture-list kbd {
+  background: var(--panel-bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 3px;
+  padding: 1px 8px;
+}
+#help-overlay .help-card .meta {
+  margin-top: 16px; color: var(--text-dim); font-size: 12px;
+}
+
+/* ==== Modals (v2) ==== */
+#modal-root {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+}
+#modal-root[hidden] { display: none; }
+.modal-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+}
+.modal-card {
+  position: relative; z-index: 1;
+  /* Use `width` (not just max-width) so every modal renders at the same
+     target size regardless of its content width. Falls back to 92vw on
+     narrow viewports so it never exceeds the screen. */
+  width: min(720px, 92vw); max-height: 85vh;
+  overflow: hidden; display: flex; flex-direction: column;
+  background: var(--panel-bg);
+  border: 2px solid var(--accent-green);
+  border-radius: 8px;
+  font-family: inherit;
+}
+.modal-card.accent-purple { border-color: var(--accent-purple); }
+.modal-card.accent-amber  { border-color: var(--accent-amber); }
+.modal-card.accent-orange { border-color: var(--accent-orange); }
+.modal-card.accent-cyan   { border-color: var(--accent-cyan); }
+.modal-card.accent-pink   { border-color: var(--accent-pink); }
+.modal-card.accent-indigo { border-color: var(--accent-indigo); }
+/* Decorative drag-handle — shown only at the mobile breakpoint. */
+.modal-handle { display: none; }
+.modal-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 12px 18px; border-bottom: 1px solid var(--border-soft);
+}
+.modal-header h2 { margin: 0; font-size: 18px; font-weight: 500; }
+.modal-close {
+  background: none; border: none; color: inherit;
+  font-size: 24px; line-height: 1; cursor: pointer; padding: 4px 8px;
+}
+.modal-close:hover { color: var(--accent-red); }
+.modal-body {
+  overflow: auto; padding: 16px 18px;
+  /* Reserve scrollbar gutter unconditionally so the first-render width
+     does not differ from post-paint width. Without this, the Forecast
+     range-bar's pill-position measurement can shift by a few percent
+     between the initial render and the next SSE tick once the scrollbar
+     materializes. */
+  scrollbar-gutter: stable;
+}
+.empty-state { color: var(--text-dim); padding: 18px; text-align: center; }
+
+/* =========================================================================
+   Shared modal primitives — touched by mcw-, mfc-, mtr-, msess- prefixed
+   classes. Do not use a literal star-slash inside this comment: it closes
+   the CSS comment early and leaks the remaining text as a malformed
+   selector, which makes the parser drop the following .m-hero rule block.
+   ========================================================================= */
+
+/* Hero grid — 2- or 3-col KV layout. Used by Session, FC, Trend. */
+.m-hero {
+  display: grid; gap: 14px 24px; padding-bottom: 14px;
+}
+.m-hero.cols-2 { grid-template-columns: repeat(2, 1fr); }
+.m-hero.cols-3 { grid-template-columns: repeat(3, 1fr); }
+.m-hero.cols-4 { grid-template-columns: repeat(4, 1fr); }
+
+/* KV cell — icon + stacked (.v big numeral, .lbl uppercase, .sub optional). */
+.m-kv { display: flex; gap: 10px; align-items: flex-start; }
+.m-kv .icon { width: 20px; height: 20px; flex-shrink: 0; margin-top: 3px; }
+.m-kv .v {
+  font-size: 22px; font-weight: 700; letter-spacing: -0.01em; line-height: 1.15;
+}
+.m-kv .lbl {
+  color: var(--text-dim); font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 0.05em; margin-top: 2px; font-weight: 500;
+}
+.m-kv .sub { color: var(--text-dim); font-size: 11px; margin-top: 2px; }
+
+/* Section header — icon + uppercase label colored via .sec-<accent>. */
+.m-sec {
+  display: flex; align-items: center; gap: 8px;
+  margin: 18px 0 10px;
+  font-size: 11.5px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.m-sec .icon { width: 15px; height: 15px; flex-shrink: 0; }
+
+/* Section accents */
+.m-sec.sec-tok   { color: var(--accent-green); }    /* Session tokens */
+.m-sec.sec-mod   { color: var(--accent-purple); }   /* Session models */
+.m-sec.sec-costm { color: var(--accent-magenta); }  /* Session cost-by-model */
+.m-sec.sec-src   { color: var(--accent-blue); }     /* Session source files */
+.m-sec.sec-prog  { color: var(--accent-green); }    /* CW progress */
+.m-sec.sec-ms    { color: var(--accent-purple); }   /* CW milestones / Trend table */
+.m-sec.sec-range { color: var(--accent-amber); }    /* FC range */
+.m-sec.sec-rates { color: var(--accent-cyan); }     /* FC rates */
+.m-sec.sec-bud   { color: var(--accent-magenta); }  /* FC budgets */
+.m-sec.sec-wk    { color: var(--accent-green); }    /* FC week */
+.m-sec.sec-spark { color: var(--accent-amber); }    /* Trend sparkline */
+.m-sec.sec-tbl   { color: var(--accent-purple); }   /* Trend table */
+.m-sec.sec-burn  { color: var(--accent-amber); }    /* Block burn rate / projection */
+
+/* Pill — padding + radius base; color via .accent-<name>. */
+.m-pill {
+  padding: 3px 10px; border-radius: 12px;
+  font-size: 11.5px; font-weight: 600;
+  border: 1px solid transparent;
+}
+.m-pill.accent-green   { background: rgba(61,220,132,0.14);  color: var(--accent-green);   border-color: rgba(61,220,132,0.30); }
+.m-pill.accent-amber   { background: rgba(251,191,36,0.15);  color: var(--accent-amber);   border-color: rgba(251,191,36,0.35); }
+.m-pill.accent-cyan    { background: rgba(34,211,238,0.14);  color: var(--accent-cyan);    border-color: rgba(34,211,238,0.30); }
+.m-pill.accent-magenta { background: rgba(217,70,239,0.14);  color: var(--accent-magenta); border-color: rgba(217,70,239,0.30); }
+.m-pill.accent-purple  { background: rgba(192,132,252,0.18); color: var(--accent-purple);  border-color: rgba(192,132,252,0.35); }
+.m-pill.accent-blue    { background: rgba(96,165,250,0.14);  color: var(--accent-blue);    border-color: rgba(96,165,250,0.30); }
+.m-pill.accent-red     { background: rgba(239,68,68,0.14);   color: var(--accent-red);     border-color: rgba(239,68,68,0.30); }
+
+/* Chipstrip — horizontal flex row of pills / chips. */
+.m-chipstrip {
+  display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px;
+}
+
+/* Polished history-style table — used by CW milestones + Trend weekly detail. */
+.m-histable {
+  width: 100%; border-collapse: collapse; font-size: 12.5px;
+}
+.m-histable th, .m-histable td { padding: 5px 10px; text-align: left; }
+.m-histable th {
+  color: var(--text-dim); font-weight: 400;
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--border-soft);
+}
+.m-histable td.num, .m-histable th.num {
+  text-align: right; font-variant-numeric: tabular-nums;
+}
+.m-histable tbody tr:nth-child(even) { background: rgba(255,255,255,0.015); }
+.m-histable tr.cur {
+  background: rgba(251,191,36,0.08);
+}
+.m-histable tr.cur td:first-child {
+  border-left: 2px solid var(--accent-amber);
+}
+
+/* =========================================================================
+   Current Week modal (.mcw-*)
+   Spec §3
+   ========================================================================= */
+
+.mcw-herobar { padding: 4px 0 6px; }
+.mcw-bignum {
+  font-family: var(--font-mono); font-size: 46px; font-weight: 800;
+  color: var(--accent-green); letter-spacing: -2px; line-height: 1;
+}
+.mcw-bignum .unit {
+  font-size: 22px; color: var(--text-dim); font-weight: 500;
+  letter-spacing: 0; margin-left: 4px;
+}
+
+.mcw-pbar-wrap { margin-top: 12px; }
+.mcw-pbar {
+  position: relative; height: 22px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border-soft); border-radius: 4px;
+  overflow: visible;
+}
+.mcw-pbar .fill {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  background: linear-gradient(90deg, var(--accent-green), #5ef0a4);
+  border-radius: 3px 0 0 3px;
+}
+.mcw-pbar .ticks .tick {
+  position: absolute; top: -4px; bottom: -4px; width: 2px;
+  background: rgba(192,132,252,0.65);
+}
+.mcw-pbar .ticks .tick::after {
+  content: attr(data-p); position: absolute; top: -14px; left: 50%;
+  transform: translateX(-50%); font-size: 9px;
+  color: var(--accent-purple); font-weight: 600;
+}
+.mcw-pbar .marker {
+  position: absolute; top: -5px; bottom: -5px; width: 3px;
+  background: var(--accent-green);
+  box-shadow: 0 0 6px rgba(61,220,132,0.7);
+}
+.mcw-pscale {
+  display: flex; justify-content: space-between; margin-top: 8px;
+  font-size: 10px; color: var(--text-dim);
+}
+
+.mcw-mini {
+  display: flex; gap: 18px; margin-top: 16px; flex-wrap: wrap;
+  font-size: 12px; color: var(--text-dim);
+}
+.mcw-mini .s .k { text-transform: uppercase; font-size: 10px; letter-spacing: 0.05em; }
+.mcw-mini .s .v { font-weight: 700; font-size: 14px; margin-left: 6px; color: var(--text); }
+.mcw-mini .s .v.v-magenta { color: var(--accent-magenta); }
+.mcw-mini .s .v.v-cyan    { color: var(--accent-cyan); }
+
+.mcw-mshead { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.mcw-ms-sub { color: var(--text-dim); font-size: 11px; }
+
+#mcw-table .pct-cell {
+  display: inline-block; min-width: 26px; text-align: center;
+  padding: 1px 4px; font-family: var(--font-mono); font-size: 11px;
+}
+#mcw-table .m-marginal { color: var(--accent-amber); font-family: var(--font-mono); }
+#mcw-table .m-fh       { color: var(--accent-blue);  font-size: 11px; font-family: var(--font-mono); }
+#mcw-table td.d        { color: var(--text-dim); font-family: var(--font-mono); font-size: 11px; }
+
+/* =========================================================================
+   Forecast modal (.mfc-*)
+   Spec §4
+   ========================================================================= */
+
+/* Hero KV accent colors */
+.m-kv.kv-wa .icon  { color: var(--accent-blue);  }
+.m-kv.kv-r24 .icon { color: var(--accent-amber); }
+.m-kv.kv-wa .v     { color: var(--accent-blue);  }
+.m-kv.kv-r24 .v    { color: var(--accent-amber); }
+
+/* Range bar wrapper — accommodates pills above + boundary labels below */
+.mfc-rangewrap {
+  position: relative;
+  padding: 52px 0 32px;
+}
+
+/* Track (zones, range band, chevs live inside this) */
+.mfc-rangetrack {
+  position: relative; height: 16px; border-radius: 6px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--border-soft);
+  box-shadow: inset 0 1px 0 rgba(0,0,0,0.45);
+  overflow: visible;
+}
+
+/* Three semantic zone backgrounds. Visible range is 0-110% real,
+   so 90% real maps to 81.82% CSS (90/110*100), 100% real → 90.91% CSS. */
+.mfc-zone {
+  position: absolute; top: 0; bottom: 0; pointer-events: none;
+}
+.mfc-zone.safe { left: 0;       width: 81.82%; background: rgba(61,220,132,0.10); border-radius: 5px 0 0 5px; }
+.mfc-zone.warn { left: 81.82%;  width: 9.09%;  background: rgba(251,191,36,0.20); }
+.mfc-zone.over { left: 90.91%;  right: 0;      background: rgba(239,68,68,0.25);  border-radius: 0 5px 5px 0; }
+
+/* Zone-boundary dividers + labels under the track */
+.mfc-bound { position: absolute; top: -3px; bottom: -3px; width: 1px; pointer-events: none; }
+.mfc-bound.b90  { left: 81.82%; background: rgba(251,191,36,0.55); }
+.mfc-bound.b100 { left: 90.91%; background: rgba(239,68,68,0.65); }
+.mfc-bound .lbl {
+  position: absolute; top: calc(100% + 6px); left: 50%;
+  transform: translateX(-50%);
+  font-size: 9.5px; font-weight: 700; font-family: var(--font-mono);
+  white-space: nowrap;
+}
+.mfc-bound.b90  .lbl { color: var(--accent-amber); }
+.mfc-bound.b100 .lbl { color: var(--accent-red); }
+
+/* Range band (gradient strip on top of track between the two chevs) */
+.mfc-rangeband {
+  position: absolute; top: 4px; height: 8px;
+  background: linear-gradient(90deg, var(--accent-blue), var(--accent-amber));
+  border-radius: 2px; opacity: 0.85; pointer-events: none;
+}
+
+/* Chevron markers — positioned at TRUE pin positions on the track.
+   `transition: left` smooths small position shifts between SSE ticks
+   so the bar never snaps when live projections drift slightly. */
+.mfc-chev {
+  position: absolute; top: -10px;
+  transform: translateX(-50%);
+  width: 0; height: 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-top: 10px solid;
+  filter: drop-shadow(0 1px 1px rgba(0,0,0,0.55));
+  pointer-events: none;
+  transition: left 0.25s ease-out;
+}
+.mfc-chev.wa  { color: var(--accent-blue); }
+.mfc-chev.r24 { color: var(--accent-amber); }
+
+/* Pills container — overlays the wrap at the pill row height */
+.mfc-pills {
+  position: absolute; top: 10px; left: 0; width: 100%;
+  height: 18px;
+  pointer-events: none;
+}
+.mfc-pill {
+  position: absolute; top: 0;
+  transform: translateX(-50%);
+  padding: 2px 8px; border-radius: 10px;
+  font-size: 10.5px; font-weight: 700; font-family: var(--font-mono);
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.35);
+  transition: left 0.25s ease-out;
+}
+.mfc-pill.wa  { background: rgba(96,165,250,0.22); border: 1px solid rgba(96,165,250,0.60); color: var(--accent-blue);  }
+.mfc-pill.r24 { background: rgba(251,191,36,0.22); border: 1px solid rgba(251,191,36,0.65); color: var(--accent-amber); }
+
+/* Leader curves from each pill-bottom to its chev-top.
+   viewBox 100x18: x is a percent-equivalent; non-scaling-stroke preserves 1.5px stroke. */
+.mfc-leaders {
+  position: absolute; top: 28px; left: 0; width: 100%; height: 18px;
+  pointer-events: none; overflow: visible;
+}
+.mfc-leaders path {
+  fill: none; stroke-width: 1.5;
+  stroke-linecap: round; stroke-linejoin: round;
+  opacity: 0.80;
+}
+.mfc-leaders path.wa  { stroke: var(--accent-blue);  }
+.mfc-leaders path.r24 { stroke: var(--accent-amber); }
+
+/* KV-row grids (Rates / Budgets). The single-column variant is used by
+   the Budgets section where each row's value (e.g. "$1347.14 / day") is
+   wide enough to collide with its label when split across two columns. */
+.mfc-kvgrid {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 24px;
+}
+.mfc-kvgrid.mfc-kvgrid-single {
+  grid-template-columns: 1fr;
+}
+.mfc-krow {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 6px 0; border-bottom: 1px dotted var(--border-soft);
+  font-size: 12.5px;
+}
+.mfc-krow .l { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.mfc-krow .v { font-weight: 700; font-family: var(--font-mono); }
+.mfc-krow .v.v-amber   { color: var(--accent-amber); }
+.mfc-krow .v.v-cyan    { color: var(--accent-cyan); }
+.mfc-krow .v.v-magenta { color: var(--accent-magenta); }
+.mfc-krow .v.v-green   { color: var(--accent-green); }
+.mfc-krow .v.v-blue    { color: var(--accent-blue); }
+
+/* =========================================================================
+   Trend modal (.mtr-*)
+   Spec §5
+   ========================================================================= */
+
+/* Hero KV accent colors */
+.m-kv.kv-cur .icon, .m-kv.kv-cur .v { color: var(--accent-cyan); }
+.m-kv.kv-med .icon, .m-kv.kv-med .v { color: var(--accent-blue); }
+.m-kv.kv-delta.delta-down .icon,
+.m-kv.kv-delta.delta-down .v { color: var(--accent-green); }
+.m-kv.kv-delta.delta-up .icon,
+.m-kv.kv-delta.delta-up .v { color: var(--accent-red); }
+.m-kv.kv-delta.delta-flat .icon,
+.m-kv.kv-delta.delta-flat .v { color: var(--text-dim); }
+
+/* Section header inline legend */
+.m-sec .mtr-legend {
+  margin-left: auto; display: flex; gap: 10px; align-items: center;
+  font-size: 10px; text-transform: none; letter-spacing: 0;
+  color: var(--text-dim); font-weight: 500;
+}
+.m-sec .mtr-legend .sw {
+  display: inline-block; width: 18px; height: 2px; border-radius: 1px;
+  vertical-align: middle; margin-right: 4px;
+}
+.m-sec .mtr-legend .sw.sw-dpp  { background: var(--accent-amber); height: 2.2px; }
+.m-sec .mtr-legend .sw.sw-used { background: var(--text-dim);     opacity: .7; }
+.m-sec .mtr-legend.legend-no-used .sw-used,
+.m-sec .mtr-legend.legend-no-used .sw-used + .sw-lbl { display: none; }
+
+/* Sparkline */
+.mtr-sparkhero { padding: 6px 0 4px; }
+.mtr-sparkhero svg { display: block; width: 100%; height: 140px; }
+.mtr-sparkaxis {
+  display: flex; justify-content: space-between;
+  font-size: 10px; color: var(--text-dim);
+  margin-top: 4px; padding: 0 6px;
+}
+
+/* SVG-scoped classes */
+.mtr-trendline     { fill: none; stroke: var(--accent-amber); stroke-width: 2.2; }
+.mtr-trendline-dim { fill: none; stroke: var(--text-dim);     stroke-width: 1.4; opacity: .55; }
+.mtr-trenddot      { fill: var(--accent-amber); }
+.mtr-trenddot.cur  { fill: var(--accent-cyan); stroke: var(--bg); stroke-width: 2; }
+.mtr-axis          { stroke: var(--border-soft); stroke-width: 1; }
+.mtr-hl            { stroke: rgba(192,132,252,0.35); stroke-dasharray: 2 3; stroke-width: 1; }
+.mtr-ylabel        { fill: var(--text-dim); font-family: var(--font-mono); font-size: 10px; }
+.mtr-medlabel      { fill: var(--accent-purple); font-family: var(--font-mono); font-size: 10px; }
+.mtr-curlabel      { fill: var(--accent-cyan); font-family: var(--font-mono); font-size: 10px; font-weight: 700; }
+
+/* Weekly detail table head */
+.mtr-tbl-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.mtr-tbl-sub  { color: var(--text-dim); font-size: 11px; }
+
+/* History-table cell colors on top of .m-histable */
+#mtr-table .wlab           { color: var(--text); }
+#mtr-table tr.cur .wlab    { color: var(--accent-amber); font-weight: 700; }
+#mtr-table .usedpct        { color: var(--accent-green); font-family: var(--font-mono); }
+#mtr-table .dpp            { color: var(--accent-cyan);  font-family: var(--font-mono); }
+#mtr-table .delta.up       { color: var(--accent-red);   font-family: var(--font-mono); }
+#mtr-table .delta.down     { color: var(--accent-green); font-family: var(--font-mono); }
+#mtr-table .delta.flat     { color: var(--text-dim);     font-family: var(--font-mono); }
+
+/* Sessions modal — aggregated detail view (no per-entry table: the
+   `/api/session/:id` envelope surfaces 15 summary keys only). The
+   redesigned layout lives in the `.msess-*` block below. */
+.modal-loading { padding: 40px; text-align: center; color: var(--text-dim); }
+.modal-error { padding: 18px; color: var(--accent-red); }
+
+/* ==== Sessions modal v3 (redesigned) ==== */
+
+/* Session-ID badge */
+.msess-badge {
+  font-family: var(--font-mono);
+  background: rgba(192, 132, 252, 0.15);
+  color: #e0cfff;
+  border: 1px solid rgba(192, 132, 252, 0.35);
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-size: 12.5px;
+}
+
+/* Hero KV grid — base rules live on .m-hero / .m-kv (shared primitives). */
+.m-kv.kv-cost .icon { color: var(--accent-magenta); }
+.m-kv.kv-dur  .icon { color: var(--accent-amber); }
+.m-kv.kv-proj .icon { color: var(--accent-blue); }
+.m-kv.kv-cost .v { color: var(--accent-magenta); }
+.m-kv.kv-dur  .v { color: var(--accent-amber); }
+.m-kv.kv-proj .v {
+  color: var(--accent-blue); font-size: 16px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: block; max-width: 100%;
+}
+
+/* Timestamps */
+.msess-ts {
+  display: flex; align-items: center; gap: 22px;
+  padding: 10px 0; font-size: 12px; font-family: var(--font-mono);
+  color: var(--text-dim);
+  border-top: 1px dotted var(--border-soft);
+  border-bottom: 1px dotted var(--border-soft);
+}
+.msess-ts .icon { width: 14px; height: 14px; color: var(--accent-cyan); flex-shrink: 0; }
+.msess-ts .k {
+  text-transform: uppercase; font-size: 10.5px; letter-spacing: 0.05em;
+  margin-right: 6px; color: var(--text-dim);
+}
+.msess-ts .v { color: var(--accent-cyan); }
+
+/* Section headers — base rules live on .m-sec (shared primitive); accents
+   (.sec-tok / .sec-mod / .sec-costm / .sec-src) also live on .m-sec. */
+
+/* Tokens tiles */
+.msess-tok-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+.msess-tok-tile {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px; padding: 10px 12px;
+}
+.msess-tok-tile .lbl {
+  color: var(--text-dim); font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 0.05em; margin-bottom: 4px;
+}
+.msess-tok-tile .n {
+  font-family: var(--font-mono); font-size: 15px; font-variant-numeric: tabular-nums;
+}
+.msess-tok-tile.cache-hit .n { color: var(--accent-green); }
+.msess-tok-tile.cache-hit .bar {
+  height: 4px; background: rgba(61, 220, 132, 0.18); border-radius: 2px;
+  margin-top: 6px; overflow: hidden;
+}
+.msess-tok-tile.cache-hit .bar .fill { height: 100%; background: var(--accent-green); }
+
+/* Models chips — reuses panel .chip.opus|sonnet|haiku. Layout comes from
+   the shared .m-chipstrip primitive. No per-modal rules needed. */
+
+/* Cost by model */
+.msess-costm { margin-top: 4px; }
+.msess-costm .bar {
+  display: flex; height: 22px; border-radius: 4px; overflow: hidden;
+  background: var(--border-soft);
+}
+.msess-costm .bar .seg { height: 100%; }
+.msess-costm .bar .seg.opus   { background: var(--chip-opus); }
+.msess-costm .bar .seg.sonnet { background: var(--chip-sonnet); }
+.msess-costm .bar .seg.haiku  { background: var(--chip-haiku); }
+.msess-costm .legend {
+  display: flex; flex-wrap: wrap; gap: 14px 20px;
+  margin-top: 10px; font-size: 12px;
+}
+.msess-costm .legend .lg { display: flex; align-items: center; gap: 8px; }
+.msess-costm .legend .sw { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.msess-costm .legend .sw.opus   { background: var(--chip-opus); }
+.msess-costm .legend .sw.sonnet { background: var(--chip-sonnet); }
+.msess-costm .legend .sw.haiku  { background: var(--chip-haiku); }
+.msess-costm .legend .name { color: var(--text); }
+.msess-costm .legend .v { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.msess-costm .legend .pct { color: var(--text-dim); font-size: 11px; margin-left: 2px; }
+
+/* Source files */
+.msess-src .src-head {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 12px; margin-bottom: 6px; color: var(--text);
+}
+.msess-src .count-pill {
+  background: rgba(96, 165, 250, 0.18); color: var(--accent-blue);
+  padding: 1px 8px; border-radius: 10px; font-size: 11px;
+  font-family: var(--font-mono); font-weight: 600;
+}
+.msess-src .sub { color: var(--text-dim); font-size: 11.5px; }
+.msess-src .sub .dot { color: var(--border-soft); padding: 0 2px; }
+.msess-src .sub .subcount { color: var(--accent-amber); }
+.msess-src .primary-path {
+  font-family: var(--font-mono); font-size: 11.5px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.02);
+  padding: 6px 10px; border-radius: 4px;
+  border-left: 2px solid var(--accent-blue);
+  word-break: break-all;
+}
+.msess-src .src-empty-primary {
+  font-family: var(--font-mono); font-size: 11.5px;
+  color: var(--text-dim); padding: 6px 10px;
+}
+.msess-src details.subagents { margin-top: 10px; }
+.msess-src details.subagents summary {
+  cursor: pointer; color: var(--accent-blue); font-size: 12px;
+  padding: 4px 0; font-weight: 500; list-style: none;
+}
+.msess-src details.subagents summary::-webkit-details-marker { display: none; }
+.msess-src details.subagents summary::marker { display: none; }
+.msess-src details.subagents summary::before {
+  content: '▸'; display: inline-block; width: 14px; color: var(--text-dim);
+}
+.msess-src details.subagents[open] summary::before { content: '▾'; }
+.msess-src details.subagents .paths {
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+  list-style: none; padding-left: 16px; margin: 6px 0 0;
+}
+.msess-src details.subagents .paths li { padding: 1px 0; word-break: break-all; }
+
+/* Block modal — burn / projection rows */
+.mblock-burn { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.mblock-burn .row {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 8px 12px;
+  background: var(--panel-bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+}
+.mblock-burn .row .k {
+  color: var(--text-dim); font-size: 11px; min-width: 100px;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.mblock-burn .row .v       { color: var(--text); font-weight: 700; }
+.mblock-burn .row .v.amber { color: var(--accent-amber); }
+.mblock-burn .row .v.cyan  { color: var(--accent-cyan); }
+.mblock-burn .row .dim     { color: var(--text-faint); font-size: 11px; }
+.mblock-burn .row .sep     { color: var(--text-faint); }
+
+/* Block modal — timeline wrapper (gives the SVG breathing room) */
+.mblock-timeline {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 10px;
+  margin: 12px 0;
+}
+
+/* ----- Sessions panel controls (filter + sort, Phase 7) ----- */
+.sessions-ctrls {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.ctrl-btn {
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: inherit;
+  font-family: inherit;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ctrl-btn:hover { background: rgba(255,255,255,0.04); }
+.ctrl-btn.as-chip { padding: 2px 8px; }
+.ctrl-btn .chip { font-size: 11px; color: var(--accent-orange); }
+.ctrl-btn .chip-x { margin-left: 6px; color: var(--text-dim); }
+.ctrl-input {
+  background: transparent;
+  border: 1px solid var(--accent-orange);
+  color: inherit;
+  padding: 3px 6px;
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 4px;
+  min-width: 180px;
+}
+/* Replace the default outline with a same-hue inset glow so the focused
+   state is visually distinct from the always-orange border. Dropping
+   outline without a replacement would make keyboard focus invisible. */
+.ctrl-input:focus { outline: none; box-shadow: 0 0 0 2px rgba(251,146,60,0.35); }
+
+/* ----- Sessions search (Phase 8) ----- */
+.search-container {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.match-count {
+  font-size: 11px;
+  color: var(--text-dim);
+  min-width: 60px;
+  text-align: center;
+  font-family: var(--font-mono);
+}
+mark {
+  background: rgba(251, 191, 36, 0.22);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+mark.current {
+  background: var(--accent-amber);
+  color: #000;
+}
+
+/* Rows that contain a search-match get a soft highlight so the `/` +
+   n/N navigation is visible without replacing the cell-level <mark>
+   wrappers the legacy dashboard used. The subtle amber wash makes the
+   row stand out without overpowering the cost-class column colors. */
+.session-row.search-match {
+  background: rgba(251, 191, 36, 0.08);
+  box-shadow: inset 2px 0 0 var(--accent-amber);
+}
+
+/* ----- Sessions click-through (Phase 9) ----- */
+/* Pointer cursor only on rows with a real session id — rows missing
+   an id (shouldn't happen with a healthy envelope, but guards against
+   cache-catching-up edge cases) stay visually passive. */
+.session-row[data-session-id] { cursor: pointer; }
+.session-row:hover { background: rgba(255,255,255,0.03); }
+/* Scope the clickable cursor to panel chips only; the Sessions modal
+   reuses the .model-chip class for its own (non-interactive) chips. */
+#sess-rows .model-chip { cursor: pointer; }
+#sess-rows .model-chip:hover { filter: brightness(1.2); }
+#sess-rows .model-chip:focus-visible {
+  outline: 2px solid var(--accent-orange);
+  outline-offset: 1px;
+}
+
+/* ----- Panel Tab focus (Phase 10) ----- */
+/* Suppress the default focus outline but keep the panel focusable.
+   `:focus-visible` restores a visible ring only for keyboard-driven
+   focus, so mouse clicks on the panel don't show an orphan outline.
+   Each accent shares its border color with the ring for visual
+   continuity. */
+.panel:focus { outline: none; }
+.panel:focus-visible {
+  /* 4px offset keeps the focus ring clearly separated from the 1px
+     panel border (same hue), so keyboard users see a distinct ring
+     instead of a marginally thicker accent. */
+  outline-offset: 4px;
+}
+.panel.accent-green:focus-visible  { outline: 2px solid var(--accent-green); }
+.panel.accent-purple:focus-visible { outline: 2px solid var(--accent-purple); }
+.panel.accent-amber:focus-visible  { outline: 2px solid var(--accent-amber); }
+.panel.accent-orange:focus-visible { outline: 2px solid var(--accent-orange); }
+.panel.accent-cyan:focus-visible   { outline: 2px solid var(--accent-cyan); }
+.panel.accent-pink:focus-visible   { outline: 2px solid var(--accent-pink); }
+.panel.accent-blue:focus-visible   { outline: 2px solid var(--accent-blue); }
+.panel.accent-indigo:focus-visible { outline: 2px solid var(--accent-indigo); }
+
+/* ----- Sync chip status text (Phase 11) ----- */
+/* SyncChip renders a span; the parent .topbar-sync <button> is the click
+   target. Cursor inherits from the wrapper button. Hover stays on the
+   chip text so only the "synced Xs ago" line tints, not the surrounding
+   icon. */
+.sync-chip {
+  color: inherit;
+  font: inherit;
+  padding: 0 6px;
+}
+.topbar-sync:hover .sync-chip { color: var(--accent-purple); }
+
+/* Wrapper-button chrome reset on desktop so the new <button> looks the
+   same as the previous <div> wrapper — borderless, no background, no
+   default user-agent button padding. The mobile @media block re-adds
+   the chip-style border + bg for the 44×44 tap target. */
+.topbar-sync {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+.topbar-sync:focus-visible {
+  outline: 2px solid var(--accent-purple);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+.sync-chip.syncing { animation: sync-pulse 1s infinite; }
+/* Error floor: sync.js adds .sync-error for ~3s after POST /api/sync
+   fails so render.js / the 1-second tick won't silently repaint over
+   "sync failed" within a second. Red stands out against the default
+   mute color of the steady-state chip. */
+.sync-chip.sync-error { color: var(--accent-red); }
+/* Success flash: sync.js adds .sync-success for 1.2s after a clean
+   POST /api/sync. The chip text reads "✓ updated" in green so the
+   user sees an affirmative milestone (otherwise "synced 0s ago" is
+   visually identical to the prior "synced Xs ago"). */
+.sync-chip.sync-success { color: var(--accent-green); }
+@keyframes sync-pulse { 0%, 100% { opacity: 0.6 } 50% { opacity: 1 } }
+
+/* ----- Refresh icon: state-driven animations ----- */
+/* The .topbar-sync wrapper button contains the refresh <svg> + the
+   <SyncChip> span. Mobile hides the chip (visually-hidden), so the
+   icon is the user's only visual feedback channel on small screens.
+   Drive icon state off the chip's class via :has().
+   Browser support: Chrome 105+, Safari 15.4+, Firefox 121+.
+
+   Color is delivered via `transition: color` rather than @keyframes
+   because Safari iOS doesn't reliably re-resolve `currentColor` on
+   <use>-referenced SVG symbols when the host's color animates via
+   keyframes — the @keyframes runs and the SVG element's computed
+   color updates, but the path inside the referenced symbol stays at
+   the pre-animation color. Direct color + transition triggers a
+   normal style recalculation that the symbol picks up. */
+.topbar-sync .icon {
+  color: var(--accent-cyan);
+  /* Both Chromium and Safari animate currentColor through <use> when
+     the change is via transition, even though Safari is buggy on
+     keyframe-based color animations. */
+  transition: color 1s ease-out;
+}
+.topbar-sync:has(.sync-chip.syncing) .icon {
+  animation: cctally-icon-spin 1.2s linear infinite;
+}
+.topbar-sync:has(.sync-chip.sync-success) .icon {
+  /* Snap to green; transition: 0s on activation so the user sees
+     the flash crisply. The fade back to cyan happens automatically
+     when React removes the .sync-success class 1.2s later — the
+     base rule's `transition: color 1s` takes over. */
+  color: var(--accent-green);
+  transition: color 0s;
+}
+.topbar-sync:has(.sync-chip.sync-error) .icon {
+  /* Same idiom for error: snap red, fade back over 1s when the 3s
+     error-floor expires. */
+  color: var(--accent-red);
+  transition: color 0s;
+}
+@keyframes cctally-icon-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  /* Spin → opacity pulse (matches the chip's existing reduced-motion
+     pattern). Color transitions are intentionally preserved — color
+     is informational, not vestibular motion. */
+  .topbar-sync:has(.sync-chip.syncing) .icon {
+    animation: sync-pulse 1s infinite;
+  }
+}
+
+/* ----- Footer buttons (Phase 11) ----- */
+/* .kb-btn mirrors the .kb span visually; only hover + focus-visible
+   indicate interactivity. Inherits font / color so the <kbd> children
+   keep their accent coloring. */
+.kb-btn {
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.kb-btn:hover { filter: brightness(1.3); }
+.kb-btn:focus-visible {
+  outline: 2px solid var(--accent-purple);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* ----- Settings overlay (Phase 12) ----- */
+/* Full-viewport positioning; reuses .modal-backdrop from the modal
+   shell. When `hidden`, the root's display goes back to none so it
+   doesn't trap mouse events. */
+#settings-root {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#settings-root[hidden] { display: none; }
+#settings-root .modal-card {
+  position: relative;
+  z-index: 1;
+  min-width: 360px;
+  max-width: 560px;
+}
+.settings-fs {
+  border: 1px solid var(--border-soft);
+  margin: 0 0 12px;
+  padding: 10px 14px;
+}
+.settings-fs legend {
+  color: var(--text-dim);
+  font-size: 11px;
+  padding: 0 6px;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.settings-fs label {
+  display: block;
+  padding: 3px 0;
+  cursor: pointer;
+}
+.settings-fs input[type="text"],
+.settings-fs input[type="number"] {
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  color: inherit;
+  padding: 4px 8px;
+  font: inherit;
+  border-radius: 4px;
+  width: 180px;
+}
+.settings-fs input[type="text"]:focus,
+.settings-fs input[type="number"]:focus {
+  outline: none;
+  border-color: var(--accent-orange);
+  box-shadow: 0 0 0 2px rgba(251, 146, 60, 0.25);
+}
+.system-info {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+}
+.settings-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+}
+.settings-btn {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-soft);
+  color: inherit;
+  padding: 6px 14px;
+  cursor: pointer;
+  font: inherit;
+  border-radius: 4px;
+}
+.settings-btn:hover { border-color: var(--accent-orange); }
+.settings-btn:focus-visible {
+  outline: 2px solid var(--accent-orange);
+  outline-offset: 2px;
+}
+#settings-save { border-color: var(--accent-orange); }
+
+/* ----- Toast (Phase 13) ----- */
+/* Used by quit.js when window.close() is blocked on user-opened tabs.
+   Also reusable by any future transient notification. z-index 200 so
+   it floats above modal-root / settings-root (both at 100). */
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--panel-bg);
+  border: 1px solid var(--accent-amber);
+  padding: 8px 14px;
+  font-size: 12px;
+  border-radius: 4px;
+  z-index: 200;
+  color: var(--text);
+  font-family: var(--font-mono);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+/* -------- Recent Sessions panel: collapsed state -------- */
+/* When collapsed, cap max-height so the row neighbour ($/1% Trend)
+   determines the row's natural height. Body scrolls internally. */
+.panel.sessions-collapsed {
+  max-height: 480px;
+}
+.panel.sessions-collapsed .panel-body {
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+/* Sticky table header inside the scrollable body so column labels
+   stay visible while rows scroll. */
+.panel.sessions-collapsed .sess-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-bg);
+  z-index: 1;
+}
+
+/* -------- Panel collapse-toggle button -------- */
+.panel-collapse-toggle {
+  background: none;
+  border: none;
+  padding: 4px;
+  color: var(--text-dim);
+  cursor: pointer;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+}
+.panel-collapse-toggle:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+}
+.panel-collapse-toggle:focus-visible {
+  outline: 2px solid var(--accent-orange);
+  outline-offset: 2px;
+}
+.panel-collapse-toggle .icon {
+  width: 16px;
+  height: 16px;
+}
+
+/* Weekly / Monthly panels — "[NOW]" pill on the topmost (current) row. */
+.pill-current {
+  display: inline-block; margin-left: 6px; font-size: 9px;
+  padding: 1px 6px; border-radius: 999px;
+  background: var(--pill-bg);
+  color: inherit;
+  letter-spacing: 0.5px; text-transform: uppercase; font-weight: 700;
+}
+
+/* Weekly / Monthly panels — Δ-vs-prior chip (panel rows + modal big line). */
+.delta {
+  font-size: 11px; padding: 1px 6px; border-radius: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.delta.up   { background: rgba(239,68,68,0.14);  color: var(--accent-red); }
+.delta.down { background: rgba(61,220,132,0.14); color: var(--accent-green); }
+.delta.flat { color: var(--text-faint); background: transparent; }
+
+/* Weekly / Monthly panels — stacked-bar model split (panel rows: 9px;
+   modal detail card override below: 14px). */
+.model-stack {
+  display: flex; height: 9px; border-radius: 999px;
+  overflow: hidden; margin-top: 6px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+  background: rgba(255,255,255,0.04);
+}
+.model-stack > span {
+  display: block; height: 100%;
+  /* First-paint animation only — segments mount with width:0 and the
+     panel component flips to the target width via useLayoutEffect after
+     one frame. Subsequent SSE updates re-render with the target width
+     directly (no animation), driven by a "labels-seen" Set ref in the
+     panel component. Spec §4.4. */
+  transition: width 280ms cubic-bezier(0.2,0.8,0.2,1);
+}
+.model-stack > span.opus    { background: var(--chip-opus); }
+.model-stack > span.sonnet  { background: var(--chip-sonnet); }
+.model-stack > span.haiku   { background: var(--chip-haiku); }
+.model-stack > span.other   { background: var(--text-faint); }
+
+/* Weekly / Monthly panel-foot — single line "<n>w total · $324.18" with
+   the dim label, faint dot separator, and bright tabular-nums total.
+   Spec §2.5. */
+.panel-foot.period-foot .sep { color: var(--text-faint); margin: 0 4px; }
+.panel-foot.period-foot .total {
+  color: var(--text); font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Per-period row layout. */
+.period { padding: 8px 0; }
+.period + .period { border-top: 1px solid rgba(255,255,255,0.04); }
+.period .meta {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.period .meta .label { color: var(--text); }
+.period .meta .right { display: flex; align-items: baseline; gap: 8px; }
+.period .meta .cost { color: var(--text); font-weight: 600; }
+
+/* Weekly / Monthly modals — detail card (selected period) + history table. */
+.detail-card {
+  background: var(--panel-bg-2); border-radius: 8px; padding: 14px 16px;
+  border: 1px solid rgba(255,255,255,0.08); margin-bottom: 14px;
+}
+.detail-card.accent-cyan   { border-color: rgba(34,211,238,0.18); }
+.detail-card.accent-pink   { border-color: rgba(236,72,153,0.18); }
+.detail-card.accent-indigo { border-color: rgba(129,140,248,0.18); }
+.detail-card .head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+.detail-card .head .big { font-size: 17px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.detail-card .window { color: var(--text-faint); font-size: 11px; margin-bottom: 12px; }
+.detail-card .model-stack { height: 14px; margin: 6px 0 10px; }
+.detail-card .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.detail-card .chip {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px; color: #fff;
+  font-variant-numeric: tabular-nums;
+}
+.detail-card .chip.opus    { background: var(--chip-opus); }
+.detail-card .chip.sonnet  { background: var(--chip-sonnet); }
+.detail-card .chip.haiku   { background: var(--chip-haiku); }
+.detail-card .chip.other   { background: var(--text-faint); color: var(--text); }
+
+.tokens-row {
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
+  margin-top: 12px; padding-top: 10px;
+  border-top: 1px solid rgba(255,255,255,0.05);
+}
+.tokens-row .t { font-size: 11px; }
+.tokens-row .t .k {
+  color: var(--text-dim); display: block;
+  text-transform: uppercase; letter-spacing: 0.4px; font-size: 9px;
+  margin-bottom: 2px;
+}
+.tokens-row .t .v { color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* Mirror `.tokens-row`'s 5-column grid so Used % / $/1% sit under
+   Input / Output respectively, instead of left-packed via flex. */
+.detail-card .stats2 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-top: 8px; }
+.detail-card .stats2 .s { font-size: 12px; }
+.detail-card .stats2 .k { color: var(--text-dim); margin-right: 6px; }
+.detail-card .stats2 .v { color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.history-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.history-table thead th {
+  font-weight: 600; color: var(--text-dim); text-align: left;
+  padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.10);
+  position: sticky; top: 0; background: var(--panel-bg);
+}
+.history-table tbody td {
+  padding: 6px 8px; font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.history-table tbody td.num { text-align: right; }
+.history-table tbody tr:hover td { background: rgba(255,255,255,0.02); cursor: pointer; }
+.history-table tbody tr.selected td { background: var(--panel-bg-2); }
+.history-table.accent-cyan tbody tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent-cyan); }
+.history-table.accent-pink tbody tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent-pink); }
+.history-table tbody td.delta-up   { color: var(--accent-red); }
+.history-table tbody td.delta-down { color: var(--accent-green); }
+
+/* Models cell: chip family tokens, deduped, top-3 + overflow. Reuses the
+   global `.chip.opus|sonnet|haiku` palette so colors match the rest of
+   the dashboard. */
+.history-table .models-chips { display: inline-flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.history-table .models-chips .chip { font-size: 11px; padding: 0 6px; }
+.history-table .models-chips-more { color: var(--text-faint); font-size: 11px; }
+
+/* Empty-panel helper, mirrors Trend's faint placeholder line. */
+.panel-empty {
+  text-align: center; color: var(--text-faint); font-size: 12px; padding: 24px 0;
+}
+
+/* -------- Blocks panel (fuel gauge) -------- */
+.panel.blocks-collapsed { max-height: 480px; }
+.panel.blocks-collapsed .panel-body { overflow-y: auto; overflow-x: hidden; }
+
+.blocks-row {
+  padding: 8px 0;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.05);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 80ms;
+}
+.blocks-row:last-child { border-bottom: 0; }
+.blocks-row:hover {
+  background: rgba(96,165,250,0.06);
+}
+.blocks-row:focus-visible {
+  background: rgba(96,165,250,0.06);
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--accent-blue);
+}
+
+.blocks-row .meta {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 6px;
+}
+.blocks-row .label { color: var(--text); font-weight: 600; }
+.blocks-row .label .anchor-marker { color: var(--text-dim); margin-right: 2px; font-weight: 400; }
+.blocks-row .cost { color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.blocks-row .gauge-track {
+  height: 14px; background: rgba(255, 255, 255, 0.04);
+  border-radius: 4px; overflow: hidden;
+}
+.blocks-row .gauge-fill {
+  display: flex; height: 100%;
+  transition: width 280ms ease-out;
+}
+.blocks-row .gauge-fill > span { display: block; height: 100%; }
+.blocks-row .gauge-fill .seg-opus   { background: var(--accent-purple); }
+.blocks-row .gauge-fill .seg-sonnet { background: var(--accent-blue); }
+.blocks-row .gauge-fill .seg-haiku  { background: var(--accent-green); }
+.blocks-row .gauge-fill .seg-other  { background: var(--text-dim); }
+
+.blocks-row .pill-active {
+  display: inline-block; margin-left: 6px; padding: 1px 6px;
+  background: var(--pill-bg); color: var(--accent-amber);
+  border-radius: 999px; font-size: 10px; font-weight: 700; letter-spacing: 0.4px;
+}
+
+/* -------- Daily panel (calendar heatmap) -------- */
+.panel.daily-collapsed { max-height: 520px; }
+.panel.daily-collapsed .panel-body { overflow-y: auto; overflow-x: hidden; }
+
+.daily-legend {
+  display: flex; align-items: center; gap: 10px; font-size: 11px;
+  color: var(--text-dim); margin-bottom: 14px;
+  text-transform: uppercase; letter-spacing: 0.6px;
+}
+.daily-legend .scale { display: flex; gap: 3px; }
+.daily-legend .scale span {
+  width: 16px; height: 10px; border-radius: 3px; display: block;
+}
+.daily-legend .scale .h0 { background: rgba(255, 255, 255, 0.05); }
+.daily-legend .scale .h1 { background: rgba(96,165,250,0.10); }
+.daily-legend .scale .h2 { background: rgba(96,165,250,0.22); }
+.daily-legend .scale .h3 { background: rgba(192,132,252,0.32); }
+.daily-legend .scale .h4 { background: rgba(236,72,153,0.40); }
+.daily-legend .scale .h5 { background: rgba(251,191,36,0.50); }
+
+.daily-cal-grid {
+  display: grid;
+  grid-template-columns: minmax(72px, auto) repeat(7, minmax(0, 1fr));
+  /* Lock every grid row to the same height so cells stay uniform regardless
+     of which prices in that row are 5-char ($XX.XX) vs 6-char ($XXX.XX) —
+     aspect-ratio + align-items: stretch otherwise lets rows of all-short
+     prices collapse smaller than rows containing any 3-digit price. */
+  grid-auto-rows: 64px;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.daily-week-label {
+  display: flex; flex-direction: column; justify-content: center;
+  padding-right: 8px;
+  border-right: 1px solid var(--border-soft);
+  min-width: 0;
+}
+.daily-week-label .wk {
+  color: var(--text); font-weight: 700; font-size: 12px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.5px;
+  line-height: 1.1;
+}
+.daily-week-label .rng {
+  color: var(--text-dim); font-size: 10.5px;
+  font-family: var(--font-mono);
+  margin-top: 3px;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.daily-cell {
+  border-radius: 8px;
+  display: flex; flex-direction: column;
+  align-items: stretch; justify-content: space-between;
+  font-size: 10px; color: var(--text-dim);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  overflow: hidden;
+  padding: 6px 9px 7px;
+  min-width: 0;
+  position: relative;
+  /* Uniform top-left sheen across all cells (Section 2 §"sheen"). */
+  background-image: radial-gradient(120% 120% at 0% 0%, rgba(255,255,255,0.07) 0%, transparent 55%);
+}
+.daily-cell .d {
+  color: var(--text-dim); font-weight: 500; font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  line-height: 1;
+  letter-spacing: 0.4px;
+  align-self: flex-start;
+}
+.daily-cell .c {
+  font-size: 16px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.3px;
+  align-self: center;
+  margin-bottom: 2px;
+}
+.daily-cell.is-today { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+
+/* Bucket fills are layered UNDER the sheen via background-color so the
+   gradient highlight rides on top of every bucket cleanly. */
+.daily-cell.h0 { background-color: rgba(255, 255, 255, 0.02); color: rgba(255, 255, 255, 0.30); }
+.daily-cell.h0 .d { color: rgba(255, 255, 255, 0.40); }
+.daily-cell.h0 .c { color: rgba(255, 255, 255, 0.35); font-weight: 600; }
+.daily-cell.h1 { background-color: rgba(96,165,250,0.18); }
+.daily-cell.h2 { background-color: rgba(129,140,248,0.30); }
+.daily-cell.h3 { background-color: rgba(192,132,252,0.38); }
+.daily-cell.h4 { background-color: rgba(236,72,153,0.42); }
+.daily-cell.h5 { background-color: rgba(251,146,60,0.55); border-color: rgba(251,146,60,0.55); }
+.daily-cell.h5 .c { color: #fff7e8; }
+.daily-cell.h5 .d { color: rgba(255,255,255,0.85); }
+
+@keyframes daily-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.daily-cell.first-mount {
+  animation: daily-fade-in 280ms ease-out both;
+  animation-delay: var(--daily-stagger, 0ms);
+}
+
+.daily-month-continues {
+  display: flex; align-items: center; justify-content: center;
+  gap: 12px;
+  color: var(--text-faint);
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  text-transform: lowercase;
+  font-family: var(--font-mono);
+  min-width: 0;
+}
+.daily-month-continues::before,
+.daily-month-continues::after {
+  content: '';
+  flex: 1 1 auto;
+  border-top: 1px dashed rgba(255, 255, 255, 0.10);
+  min-width: 12px;
+}
+
+.daily-foot {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--accent-line);
+}
+.daily-foot-col {
+  display: flex; align-items: center; gap: 14px;
+  min-width: 0;
+}
+.daily-foot-icon {
+  width: 28px; height: 28px;
+  flex-shrink: 0;
+}
+.daily-foot-icon.icon-total { color: var(--accent-indigo); }
+.daily-foot-icon.icon-peak  { color: var(--accent-amber); }
+.daily-foot-text {
+  display: flex; flex-direction: column;
+  min-width: 0;
+}
+.daily-foot-text .lbl {
+  color: var(--text-dim);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  margin-bottom: 2px;
+}
+.daily-foot-text .val {
+  color: var(--text);
+  font-weight: 800;
+  font-size: 18px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.3px;
+  display: flex; align-items: baseline; gap: 8px;
+}
+.daily-foot-text .val .d {
+  color: var(--text);
+  font-weight: 700;
+  font-size: 14px;
+}
+.daily-foot-text .val .a {
+  color: var(--accent-amber);
+  font-weight: 800;
+  font-size: 18px;
+}
+
+/* ============================================================
+ * Daily modal — bars + cache-hit tile (v2.3)
+ * ============================================================ */
+
+.daily-modal-bars {
+  background: rgba(99, 102, 241, 0.04);
+  border: 1px solid rgba(99, 102, 241, 0.12);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.daily-modal-bars-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.daily-modal-bars-head .hint {
+  color: var(--text-dim);
+  font-size: 10px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.daily-modal-bars-grid {
+  display: grid;
+  grid-template-columns: repeat(30, minmax(6px, 1fr));
+  gap: 3px;
+  align-items: end;
+  height: 96px;
+}
+
+.daily-modal-bars-grid .bar {
+  background: linear-gradient(to top,
+              color-mix(in srgb, var(--accent-indigo) 70%, transparent),
+              color-mix(in srgb, var(--accent-indigo) 90%, transparent));
+  border-radius: 3px 3px 0 0;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  transition: filter 0.15s, transform 0.15s;
+  min-width: 6px;
+}
+
+.daily-modal-bars-grid .bar:hover {
+  filter: brightness(1.25);
+  transform: translateY(-1px);
+}
+
+.daily-modal-bars-grid .bar:focus-visible {
+  outline: 2px solid var(--accent-amber);
+  outline-offset: 2px;
+}
+
+.daily-modal-bars-grid .bar.zero {
+  background: rgba(255, 255, 255, 0.06);
+  cursor: default;
+}
+
+.daily-modal-bars-grid .bar.zero:hover {
+  transform: none;
+  filter: none;
+}
+
+.daily-modal-bars-grid .bar.sel {
+  background: linear-gradient(to top, #f59e0b, #fbbf24);
+  box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.35);
+}
+
+.daily-modal-bars-grid .bar.today {
+  outline: 1px dashed rgba(251, 191, 36, 0.45);
+  outline-offset: 1px;
+}
+
+.daily-modal-bars-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 8px;
+  font-size: 10px;
+  color: var(--text-dim, #6f7a8b);
+}
+
+/* Cache-hit tile inside PeriodDetailCard's tokens-row.
+ * Reuses the existing .t / .k / .v structure; adds the .cache flavor
+ * with an inline progress bar. */
+.detail-card .tokens-row .t.cache .v {
+  color: #fbbf24;
+}
+
+.detail-card .tokens-row .t.cache .bar {
+  margin-top: 6px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.detail-card .tokens-row .t.cache .bar .fill {
+  height: 100%;
+  background: linear-gradient(90deg, #f59e0b, #fbbf24);
+  border-radius: 2px;
+}
+
+/* Daily panel cells/footer became <button> in v2.3 to handle clicks.
+ * Strip default browser button chrome so they look identical to the
+ * pre-v2.3 <div>-based cells. */
+.daily-cell {
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+
+.daily-cell:focus-visible {
+  outline: 2px solid var(--accent-amber);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+.daily-foot-peak {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+
+.daily-foot-peak:hover {
+  filter: brightness(1.08);
+}
+
+.daily-foot-peak:focus-visible {
+  outline: 2px solid var(--accent-amber);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* -------- Card reordering -------- */
+
+/* PanelHost is a wrapper around each .panel; it must NOT introduce extra
+   spacing because the .grid `gap` already controls layout. dnd-kit's
+   useSortable manages the inline transform/transition for both the dragged
+   card (follows the pointer) and the siblings (FLIP-animate to new slots). */
+.panel-host {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  /* min-width:0 mirrors the existing .panel rule so the host doesn't inflate
+     the grid column when its content has a wide non-wrapping label. */
+  min-width: 0;
+  outline: none;
+  /* No touch-action override here. On desktop, mouse drags don't race with
+     browser pan, so the default is fine. On touch devices, the dedicated
+     `.panel-grip` child carries `touch-action: none` and is the only zone
+     where dnd-kit's long-press activation can win against a page-pan; the
+     rest of the panel scrolls the page normally. */
+}
+.panel-host > .panel {
+  /* Stretch the panel to fill the host so all cards in a row are equal height. */
+  flex: 1 1 auto;
+}
+
+/* While dragging, lift the card visually. dnd-kit applies the translate
+   transform inline via setNodeRef; this rule only adds the z-index lift
+   and grabbing cursor. */
+.panel-host.is-dragging {
+  z-index: 10;
+  cursor: grabbing;
+}
+.panel-host.is-dragging > .panel {
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+  transition: box-shadow 120ms ease;
+}
+
+/* Hover affordance: faint "hold to rearrange" hint, shown only on hover of the
+   host (no pointer-events so it doesn't block clicks). */
+.panel-grip-hint {
+  position: absolute;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 100ms ease;
+  color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  z-index: 2;
+  bottom: 6px;
+  right: 14px;
+  font-size: 9px;
+  font-style: italic;
+}
+.panel-host:hover .panel-grip-hint {
+  opacity: 0.55;
+}
+.panel-host:hover,
+.panel-host:hover > .panel {
+  cursor: grab;
+}
+.panel-host.is-dragging:hover,
+.panel-host.is-dragging:hover > .panel {
+  cursor: grabbing;
+}
+
+/* Touch-only drag handle, rendered inside each panel's .panel-header next
+   to the chevron (or as the rightmost header element when no chevron is
+   present). Visible only on devices with a coarse pointer. dnd-kit
+   listeners stay on .panel-host; this element exists purely to provide a
+   `touch-action: none` zone so the browser doesn't preempt the long-press
+   as a page-pan on iOS. The pointerdown bubbles up to the panel-host
+   listener and starts the drag; long-press anywhere else lets the page
+   scroll normally. Bare like the chevron — no background, no border. */
+.panel-grip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 4px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  letter-spacing: -1px;
+  color: var(--text-dim);
+  border-radius: 4px;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  cursor: grab;
+}
+.panel-host.is-dragging .panel-grip {
+  cursor: grabbing;
+}
+/* When grip is a direct child of the header (panels with no right-group),
+   push it to the right edge so it lines up where the chevron would be. */
+.panel-header > .panel-grip {
+  margin-left: auto;
+}
+@media (pointer: fine) {
+  .panel-grip { display: none; }
+}
+
+/* Layout fieldset in Settings */
+.settings-fs.layout-fs .settings-btn {
+  margin-top: 6px;
+}
+
+/* Onboarding toast */
+.onboarding-toast {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  background: var(--panel-bg);
+  border: 1px solid var(--accent-indigo, #818cf8);
+  border-radius: 6px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  max-width: 320px;
+  z-index: 1000;
+}
+.onboarding-toast-msg { flex: 1; line-height: 1.35; }
+.onboarding-toast-dismiss {
+  background: transparent;
+  border: 0;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.onboarding-toast-dismiss:hover { color: var(--text); }
+
+/* Reduced motion: skip the box-shadow transition; FLIP and drop-settle
+   animations are gated JS-side. */
+@media (prefers-reduced-motion: reduce) {
+  .panel-host.is-dragging > .panel {
+    transition: none;
+  }
+}
+
+/* ---- Sortable table headers (TrendPanel + SessionsPanel) ---- */
+.th-sortable {
+  cursor: pointer;
+  user-select: none;
+  position: relative;
+}
+.th-sortable:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: -2px;
+}
+.th-sort-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.th-caret {
+  display: inline-block;
+  min-width: 0.7em;
+  font-size: 0.85em;
+}
+.th-sortable.is-sorted .th-label {
+  color: var(--th-accent, var(--accent-cyan));
+  font-weight: 700;
+}
+.th-sortable.is-sorted .th-caret {
+  color: var(--th-accent, var(--accent-cyan));
+}
+
+/* ---- Settings overlay hint paragraph ---- */
+.settings-hint {
+  color: var(--text-dim, #8a8a8a);
+  font-size: 12px;
+  margin: 4px 0 0 0;
+}
+
+/* -------- Alerts panel: collapsed state -------- */
+.panel.alerts-collapsed { max-height: 360px; }
+.panel.alerts-collapsed .panel-body { overflow-y: auto; overflow-x: hidden; }
+
+/* -------- Alert toast (rich variant) -------- */
+.toast.toast--alert {
+  border-radius: 8px;
+  padding: 14px 16px;
+  width: 360px;
+  cursor: pointer;
+  background: linear-gradient(180deg, var(--panel-bg) 0%, var(--panel-bg-2) 100%);
+}
+.toast--severity-amber { border: 1px solid var(--accent-amber); box-shadow: inset 0 0 28px rgba(251,191,36,0.06), 0 8px 24px rgba(0,0,0,0.5); }
+.toast--severity-red   { border: 1px solid var(--accent-red);   box-shadow: inset 0 0 28px rgba(239,68,68,0.07),  0 8px 24px rgba(0,0,0,0.5); }
+.toast--alert-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.toast--alert-threshold { font-weight: 800; font-size: 22px; letter-spacing: -0.5px; font-family: var(--font-mono); }
+.toast--severity-amber .toast--alert-threshold { color: var(--accent-amber); }
+.toast--severity-red   .toast--alert-threshold { color: var(--accent-red); }
+.toast--alert-dismiss-hint { color: var(--text-faint); font-size: 11px; margin-left: auto; }
+.toast--alert-title { color: var(--text); font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+.toast--alert-sub   { color: var(--text-dim); font-size: 12px; margin-bottom: 6px; }
+.toast--alert-body  { color: var(--text); font-size: 13px; }
+.toast--alert-body .num { font-weight: 700; color: var(--accent-amber); }
+.toast--severity-red .toast--alert-body .num { color: var(--accent-red); }
+
+/* -------- Axis chips (purple weekly / cyan five_hour) -------- */
+.chip { font-size: 10px; font-weight: 800; letter-spacing: 1px; padding: 2px 7px; border-radius: 3px; font-family: var(--font-mono); }
+.chip--weekly    { background: rgba(192,132,252,0.16); color: var(--accent-purple); }
+.chip--five_hour { background: rgba(34,211,238,0.16);  color: var(--accent-cyan); }
+
+/* -------- Alert row inside the panel -------- */
+.alert-row { display: flex; align-items: baseline; gap: 14px; padding: 8px 0; border-bottom: 1px solid var(--border-soft); }
+.alert-row:last-child { border-bottom: none; }
+.alert-threshold { font-size: 18px; font-weight: 800; letter-spacing: -0.5px; font-family: var(--font-mono); width: 50px; text-align: right; }
+.alert-threshold.amber { color: var(--accent-amber); }
+.alert-threshold.red   { color: var(--accent-red); }
+.alert-when { color: var(--text-dim); font-size: 12px; flex: 1; }
+.alerts-empty { color: var(--text-faint); text-align: center; padding: 32px 0; font-size: 13px; }
+
+/* =========================================================================
+   Mobile (max-width: 640px) — phone-class viewports.
+   Single shared breakpoint with src/lib/breakpoints.ts (MOBILE_BREAKPOINT_PX).
+   All rules here are additive: layered on top of the existing 1100px tablet
+   collapse and the desktop defaults. Source order ensures these rules win.
+   ========================================================================= */
+@media (max-width: 640px) {
+
+  /* Foundation -------------------------------------------------------- */
+
+  /* iOS Safari's collapsing URL bar makes 100vh too tall on first paint.
+     Use 100dvh so a sheet doesn't get clipped at the bottom. Browsers
+     without dvh fall through to vh via cascade. */
+  :root {
+    --mobile-vh: 100dvh;
+  }
+
+  body { padding: 8px; }
+
+  /* Honor the device safe-area inset on the page edges so the topbar
+     and footer don't tuck under the notch / dynamic-island hardware. */
+  body {
+    padding-left: max(8px, env(safe-area-inset-left));
+    padding-right: max(8px, env(safe-area-inset-right));
+  }
+
+  /* iOS auto-zooms when the user taps an <input> with computed font-size
+     < 16px. Bump every interactive text field to 16px on phones to
+     suppress the zoom. Includes the Sessions filter/search inputs and
+     every Settings field. */
+  input, textarea, select {
+    font-size: 16px;
+  }
+
+  /* Tap-target floor: anything the user taps must be at least 44×44 px
+     (Apple HIG). Inner glyphs scale independently. The sub-rules below
+     target the specific selectors that today render below 44px. */
+  .icon { /* leave the SVG glyph at its natural size; wrappers grow */ }
+
+  /* Footer — keyboard shortcuts irrelevant on touch; the actions
+     migrate to header icon buttons. */
+  .footer { display: none; }
+
+  /* Header — two-row sticky, safe-area aware. Row 1 is the week label
+     + action icons (right-aligned via flex); row 2 is the primary
+     stats. Secondary stats (data-mobile-keep="secondary") are hidden.
+     The trio of action buttons (.topbar-actions) is desktop-hidden by
+     default; here it's revealed and sized for thumb taps. */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    padding: 6px 10px;
+    margin-bottom: 8px;
+    /* Safe-area inset on top so the row 1 doesn't hide under the
+       notch / dynamic island. */
+    padding-top: max(6px, env(safe-area-inset-top));
+  }
+  .topbar .stat[data-mobile-keep="secondary"] { display: none; }
+  /* Force the documented two-row layout: row 1 = Week + actions,
+     row 2 = primary stats. `order` overrides DOM source order so
+     .topbar-actions (last in DOM) lands beside Week; the ::after
+     pseudo with flex-basis:100% inserts a hard wrap point so the
+     break is independent of stat-cell widths. */
+  /* `flex: 0 1 auto` so the week stat doesn't grow into the actions
+     trio's row 1 territory (it would otherwise force actions to wrap
+     to its own row). With a compact action trio (~140px) and a
+     content-sized week stat (~134px), both fit on row 1 down to 320. */
+  .topbar .stat[data-stat="week"]            { order: 1; flex: 0 1 auto; min-width: 0; }
+  .topbar-actions                            { order: 2; }
+  .topbar::after {
+    content: "";
+    flex-basis: 100%;
+    height: 0;
+    order: 3;
+  }
+  .topbar .stat[data-stat="used"]            { order: 4; }
+  .topbar .stat[data-stat="dollar-per-pct"]  { order: 5; }
+  .topbar .stat[data-stat="forecast"]        { order: 6; }
+  /* Let the week label render its full text ("May 02-May 09"); the
+     parent stat has `flex: 0 1 auto` so it shrinks if it ever
+     conflicts with the action trio's row 1 budget. Ellipsis remains
+     as a fallback for genuinely-overflowing labels. */
+  .topbar .stat[data-stat="week"] .v {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* The calendar icon already conveys "week"; drop the redundant
+     "Week" word so the stat shrinks enough to share row 1 with the
+     action trio at 320 viewport. */
+  .topbar .stat[data-stat="week"] .k { display: none; }
+  /* The 5h sub-stat is nested inside .stat[data-stat="used"]; hide via
+     the inner data-mobile-keep="secondary" descendant. */
+  .topbar .stat .mute[data-mobile-keep="secondary"] { display: none; }
+  /* Pill stays inline next to forecast; just shrink the spacing. */
+  .topbar .pill-warn { font-size: 10px; padding: 1px 6px; }
+
+  /* Icon buttons revealed on phones. Wrapper-level layout (flex,
+     margin-left: auto, etc.) is set unconditionally at desktop scope. */
+  .topbar-actions > .topbar-icon-btn { display: inline-flex; }
+  .topbar-icon-btn {
+    width: 44px; height: 44px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--panel-bg-2);
+    border: 1px solid var(--border-soft);
+    border-radius: 6px;
+    color: inherit;
+    cursor: pointer;
+    padding: 0;
+  }
+  .topbar-icon-btn .icon { width: 20px; height: 20px; }
+  .topbar-icon-btn:active { background: var(--panel-bg); }
+  /* Sync wrapper is now the click target (button); on phones we
+     collapse the chip text so the trio (gear + help + sync) shrinks
+     from ~250px to ~140px and Week + actions fit on one row instead
+     of wrapping into a third row. The icon alone reads "sync"; the
+     freshness pill on the Current Week panel still surfaces age. */
+  .topbar-sync {
+    width: 44px; min-width: 44px;
+    height: 44px; min-height: 44px;
+    padding: 0;
+    justify-content: center;
+    border: 1px solid var(--border-soft);
+    border-radius: 6px;
+    background: var(--panel-bg-2);
+  }
+  .topbar-sync .icon { width: 20px; height: 20px; flex-shrink: 0; }
+  /* Visually hide the chip on mobile but keep it in the accessibility
+     tree so aria-live announcements ("✓ updated", "⚠ sync failed")
+     reach screen readers. Sighted mobile users see the icon-only
+     feedback (spin / color flash). Standard sr-only pattern. */
+  .topbar-sync .sync-chip {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  /* Modal → full-screen bottom sheet. Slides up; uses 100dvh so iOS
+     Safari's collapsing URL bar doesn't clip the bottom on first
+     paint. Backdrop tap and Esc still dismiss (Modal.tsx wires those
+     in). The handle div above the title is decorative — no swipe
+     gesture. */
+  #modal-root {
+    align-items: flex-end;       /* pin sheet to bottom; leaves a top strip */
+    justify-content: stretch;
+  }
+  .modal-backdrop {
+    background: rgba(0, 0, 0, 0.7);
+  }
+  .modal-card {
+    width: 100% !important;     /* override the desktop min(720px,92vw) */
+    /* Trim 32px so the backdrop has a tappable strip at the top —
+       the documented "tap backdrop to close" gesture relies on it.
+       On notched iPhones (viewport-fit=cover) safe-area-inset-top is
+       44-59px; max() expands the strip past the notch so the sticky
+       modal-header isn't occluded by the status bar / Dynamic Island. */
+    max-height: calc(100dvh - max(32px, env(safe-area-inset-top)));
+    height: calc(100dvh - max(32px, env(safe-area-inset-top)));
+    border-radius: 14px 14px 0 0;
+    border-width: 1px;
+    border-bottom: none;
+    /* Slide-up animation. Reduced-motion users get instant. */
+    animation: cctally-sheet-up 180ms ease-out;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  @keyframes cctally-sheet-up {
+    from { transform: translateY(100%); }
+    to   { transform: translateY(0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .modal-card { animation: none; }
+  }
+  .modal-handle {
+    width: 36px; height: 4px;
+    background: var(--text-faint);
+    border-radius: 2px;
+    margin: 8px auto 4px;
+    flex-shrink: 0;
+  }
+  .modal-header {
+    padding: 8px 14px 10px;
+    /* Sticky so the title stays visible while the body scrolls. */
+    position: sticky;
+    top: 0;
+    background: var(--panel-bg);
+    z-index: 1;
+  }
+  .modal-header h2 { font-size: 17px; font-weight: 600; }
+  .modal-close {
+    width: 44px; height: 44px;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 22px;
+  }
+  .modal-body {
+    padding: 12px 14px;
+    /* Reserve scrollbar gutter is overkill on phones (no visible
+       scrollbar by default); release the gutter to gain a few px. */
+    scrollbar-gutter: auto;
+  }
+
+  /* Modal multi-column tables (Weekly / Monthly via PeriodTable;
+     Trend via the trend table; Daily via daily breakdown). The desktop
+     <table> renders a row per period; on mobile we let the row become
+     a flex container via CSS so columns stack. The label cell and the
+     cost cell stay; the rest collapse. */
+  .history-table { width: 100%; }
+  .history-table thead { display: none; }
+  .history-table tbody, .history-table tr {
+    display: block;
+    width: 100%;
+  }
+  .history-table tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 8px;
+    padding: 8px 4px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .history-table tr.selected {
+    background: rgba(255, 255, 255, 0.025);
+    border-left: 2px solid currentColor;
+    padding-left: 8px;
+  }
+  .history-table tbody td { padding: 0; border: none; }
+  .history-table td:first-child {
+    flex: 1 1 auto; min-width: 0;
+    font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* Models cell (chips) wraps under the label. */
+  .history-table td:nth-child(2) {
+    flex: 1 1 100%;
+    order: 3;
+    margin-top: 2px;
+  }
+  /* Cost — third column (weekly + monthly + trend). */
+  .history-table td.num:nth-child(3) {
+    flex: 0 0 auto;
+    font-weight: 700;
+    margin-left: auto;
+    order: 2;
+  }
+  /* Used % (weekly only — column 4) and $/1% (weekly only — column 5)
+     drop from the row body; PeriodDetailCard above the table covers
+     them. Scoped to weekly so monthly's Δ (its 4th child) keeps showing. */
+  .history-table--weekly td.num:nth-child(4),
+  .history-table--weekly td.num:nth-child(5) {
+    display: none;
+  }
+  /* Δ — last column. Render under the cost on the right. */
+  .history-table td.num:last-child {
+    flex: 0 0 auto;
+    order: 4;
+    margin-left: auto;
+    font-size: 12px;
+  }
+
+  /* PeriodDetailCard — single-column on phones. The card already
+     renders a flex / grid layout sized for the desktop side panel;
+     here we let everything stack. */
+  .detail-card .head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+  .detail-card .stats2,
+  .detail-card .tokens-row {
+    grid-template-columns: 1fr 1fr;
+  }
+  .detail-card .chips { flex-wrap: wrap; }
+
+  /* Hero KV grids inside Block / Session / Forecast / CurrentWeek /
+     RecentAlerts modals — collapse to one column at this width. */
+  .m-hero.cols-2,
+  .m-hero.cols-3,
+  .m-hero.cols-4 {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  /* TrendModal table (.m-histable#mtr-table) — 4 cols (Week, Used %,
+     $/1%, Δ $/1%). 2-line dense rows: top = label + Δ; bottom =
+     Used % · $/1%. */
+  .m-histable#mtr-table { width: 100%; }
+  .m-histable#mtr-table thead { display: none; }
+  .m-histable#mtr-table tbody,
+  .m-histable#mtr-table tr {
+    display: block; width: 100%;
+  }
+  .m-histable#mtr-table tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 8px;
+    padding: 8px 4px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .m-histable#mtr-table td { padding: 0; border: none; }
+  .m-histable#mtr-table td:nth-child(1) {       /* Week label */
+    order: 1;
+    flex: 1 1 auto; min-width: 0;
+    font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .m-histable#mtr-table td:nth-child(4) {       /* Δ $/1% */
+    order: 2;
+    flex: 0 0 auto;
+    margin-left: auto;
+    font-weight: 700;
+  }
+  .m-histable#mtr-table td:nth-child(2) {       /* Used % */
+    order: 3;
+    flex: 1 1 50%;
+    color: var(--text-dim); font-size: 12px;
+  }
+  .m-histable#mtr-table td:nth-child(3) {       /* $/1% */
+    order: 4;
+    flex: 1 1 50%;
+    color: var(--text-dim); font-size: 12px;
+  }
+
+  /* CurrentWeekModal table (.m-histable#mcw-table) — 5 cols (%,
+     Crossed, Cumulative $, Marginal $, 5h %). 3-line dense rows:
+     row 1 = % + Cumulative $; row 2 = Crossed datetime; row 3 =
+     Marginal · 5h. (Crossed gets its own row via flex-basis:100%
+     because it's the longest text cell.) */
+  .m-histable#mcw-table { width: 100%; }
+  .m-histable#mcw-table thead { display: none; }
+  .m-histable#mcw-table tbody,
+  .m-histable#mcw-table tr {
+    display: block; width: 100%;
+  }
+  .m-histable#mcw-table tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 8px;
+    padding: 8px 4px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .m-histable#mcw-table td { padding: 0; border: none; }
+  .m-histable#mcw-table td:nth-child(1) {       /* % milestone */
+    order: 1;
+    flex: 0 0 auto;
+    font-weight: 600;
+  }
+  .m-histable#mcw-table td:nth-child(3) {       /* Cumulative $ */
+    order: 2;
+    flex: 1 1 auto;
+    margin-left: auto;
+    text-align: right;
+    font-weight: 700;
+  }
+  .m-histable#mcw-table td:nth-child(2),       /* Crossed datetime */
+  .m-histable#mcw-table td:nth-child(4),       /* Marginal $ */
+  .m-histable#mcw-table td:nth-child(5) {       /* 5h % */
+    order: 3;
+    flex: 0 0 auto;
+    color: var(--text-dim); font-size: 12px;
+  }
+  .m-histable#mcw-table td:nth-child(4)::after {
+    content: " · ";
+    color: var(--text-faint);
+  }
+  /* Force second row by giving the first dim-cell a flex-basis floor
+     that pushes it past the first row. */
+  .m-histable#mcw-table td:nth-child(2) {
+    flex-basis: 100%;
+    margin-top: 2px;
+  }
+
+  /* RecentAlertsModal table (.alerts-table) — 5 cols (%, Axis, Cost,
+     Context, Alerted). 3-line dense rows: top = % + chip + cost;
+     middle = Context; bottom = Alerted-at. */
+  .alerts-table { width: 100%; }
+  .alerts-table thead { display: none; }
+  .alerts-table tbody,
+  .alerts-table tr {
+    display: block; width: 100%;
+  }
+  .alerts-table tr.alert-modal-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 8px;
+    padding: 8px 4px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .alerts-table td { padding: 0; border: none; }
+  .alerts-table td:nth-child(1) {                /* % threshold */
+    order: 1;
+    flex: 0 0 auto;
+    font-weight: 700;
+  }
+  .alerts-table td:nth-child(2) {                /* Axis chip */
+    order: 2;
+    flex: 0 0 auto;
+  }
+  .alerts-table td:nth-child(3) {                /* Cost */
+    order: 3;
+    flex: 1 1 auto;
+    margin-left: auto;
+    text-align: right;
+    font-weight: 700;
+  }
+  .alerts-table td:nth-child(4) {                /* Context — full row 2 */
+    order: 4;
+    flex: 1 1 100%;
+    color: var(--text-dim); font-size: 12px;
+    margin-top: 2px;
+  }
+  .alerts-table td:nth-child(5) {                /* Alerted-at */
+    order: 5;
+    flex: 1 1 100%;
+    color: var(--text-faint); font-size: 11px;
+  }
+
+  /* Sessions panel — Q1=B layout. The SessionsControls component is
+     hoisted out of .panel-header on mobile (TSX branch on useIsMobile)
+     and rendered as a sibling of .panel-header. Style it as a second
+     header strip: search input full-width, funnel + sort as 36px
+     trailing icons, drag handle stays in row 1 with the title.
+     Selector is id-prefixed (specificity 1,1,0) so the rule beats any
+     `#root .sessions-ctrls` chain elsewhere — matches the recurring
+     id-selector specificity floor pattern in this codebase. */
+  #panel-sessions > .sessions-ctrls {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px 8px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  #panel-sessions > .sessions-ctrls .search-container {
+    display: flex;
+    flex: 1 1 auto;
+    min-width: 0;
+    gap: 4px;
+    align-items: stretch;
+    min-height: 36px;
+  }
+  #panel-sessions > .sessions-ctrls .search-container .ctrl-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
+  }
+  #panel-sessions > .sessions-ctrls .search-container .ctrl-btn {
+    width: 32px; min-width: 32px;
+    height: 36px; min-height: 36px;
+    padding: 0;
+  }
+  #panel-sessions > .sessions-ctrls > .ctrl-btn {
+    flex: 0 0 auto;
+    width: 36px; min-width: 36px;
+    height: 36px; min-height: 36px;
+    padding: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  /* Sort pill is icon-only on mobile — drop the verbose
+     "sort: started desc" label so the trailing button stays 36×36. */
+  #panel-sessions > .sessions-ctrls #sort-pill .label { display: none; }
+
+  /* Sessions table → dense two-line rows. The 5-column table
+     (Started / Dur / Model / Project / Cost) collapses to:
+       row 1: project (left, ellipsis) + cost (right, accent color)
+       row 2: started · dur · model-chip (dim)
+     SortableHeader is hidden on mobile — the SET_SORT cycle pill in
+     .sessions-ctrls is the sole sort control. Match-highlight class
+     stays applied at the <tr> level.
+
+     Implementation note: uses the flex-wrap-with-explicit-order
+     pattern from Task 6's #mtr-table / #mcw-table rather than the
+     plan's grid-area approach — grid would have stacked the three
+     meta cells (started, dur, chip) instead of flowing them inline.
+  */
+  .sess-table { width: 100%; }
+  .sess-table thead { display: none; }
+  .sess-table tbody, .sess-table tr { display: block; width: 100%; }
+  .sess-table tr.session-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 10px;
+    row-gap: 2px;
+    padding: 8px 6px;
+    border-bottom: 1px solid var(--border-soft);
+    cursor: pointer;
+  }
+  .sess-table tbody td { padding: 0; border: none; white-space: normal; }
+  /* row 1 left = project (col 4) */
+  .sess-table td.project {
+    order: 1;
+    flex: 1 1 auto; min-width: 0;
+    font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* row 1 right = cost (col 5) */
+  .sess-table td.num {
+    order: 2;
+    flex: 0 0 auto;
+    margin-left: auto;
+    font-weight: 700;
+    text-align: right;
+  }
+  /* row 2 = started · dur · chip — flows inline via flex-wrap.
+     `tbody` qualifier ties desktop's .sess-table tbody td.started
+     accent-cyan rule on specificity (0,2,2); source order then wins. */
+  .sess-table tbody td.started {
+    order: 3;
+    flex: 0 0 auto;
+    margin-top: 2px;
+    color: var(--text-dim); font-size: 12px;
+  }
+  .sess-table td:nth-child(2) { /* duration */
+    order: 4;
+    flex: 0 0 auto;
+    color: var(--text-dim); font-size: 12px;
+  }
+  .sess-table td:nth-child(3) { /* model chip cell */
+    order: 5;
+    flex: 0 0 auto;
+    display: inline-flex; align-items: center;
+  }
+  .sess-table td.started::after,
+  .sess-table td:nth-child(2)::after {
+    content: " · ";
+    color: var(--text-faint);
+  }
+  /* Search-match highlight stays — uses the existing class. */
+  .sess-table tr.session-row.search-match {
+    background: rgba(34, 211, 238, 0.07);
+  }
+
+  /* Daily heatmap — drop the W-column on mobile so the 7 day cells
+     can claim the freed ~80 px and fit ceiling-int costs (rendered by
+     DailyPanel.tsx via useIsMobile()). The .daily-week-label is the
+     leftmost grid item per chunk; display:none removes it from
+     grid auto-placement, and the new 7-col template lets each chunk's
+     7 cells fill exactly one row. .daily-month-continues' inline
+     `gridColumn: span (7 - chunk.length)` still aligns under the new
+     template since spans are relative to the row, not the desktop's
+     1+7 layout. */
+  .daily-cal-grid {
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+  }
+  .daily-week-label { display: none; }
+
+  /* Help overlay — full-screen on phones (matches the modal sheet
+     pattern). Gesture rows are large enough to be tapped (no functional
+     tap on them today, but matches future intent and improves
+     readability). */
+  #help-overlay { padding: 0; align-items: flex-end; }
+  #help-overlay .help-card {
+    width: 100%; min-width: 0;
+    /* Trim 32px so the dim backdrop above the sheet stays tappable
+       (HelpOverlay.tsx wires backdrop click → close). Matches the
+       modal sheet pattern. */
+    max-height: calc(100dvh - 32px);
+    height: calc(100dvh - 32px);
+    border-radius: 14px 14px 0 0;
+    padding: 16px 14px;
+    padding-top: max(16px, env(safe-area-inset-top));
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+    overflow-y: auto;
+  }
+  #help-overlay .help-gesture-list {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 14px;
+  }
+  #help-overlay .help-gesture-list li {
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border-soft);
+    font-size: 14px;
+  }
+  #help-overlay .help-keyboard-disclosure summary {
+    padding: 10px 0;
+    cursor: pointer;
+    color: var(--accent-blue);
+    font-size: 13px;
+  }
+  #help-overlay .help-keyboard-disclosure[open] summary { color: var(--text); }
+
+  /* SettingsOverlay — collapse fieldsets to one column and pin the
+     Save / Reset / Cancel action row to the sheet bottom so it
+     remains tappable on a long settings list. The overlay reuses the
+     .modal-card sheet chrome from Task 5 (full-screen, slide-up,
+     dvh, safe-area). */
+  /* `<fieldset>` is display:block, which already stretches to the
+     sheet width and stacks its children vertically. The single
+     load-bearing property here is min-width:0, which prevents
+     ellipsis-truncating descendants from pushing the parent past
+     the viewport when the layout collapses to one column. The
+     !important on width matches the desktop pattern from Task 5
+     where .modal-card { width: 100% !important } overrides
+     min(720px, 92vw). */
+  /* Override the desktop #settings-root .modal-card { min-width: 360px }
+     so the sheet fits sub-360 px viewports (iPhone SE 1st gen + similar
+     legacy hardware). Specificity 0,1,2 ties the desktop rule and source
+     order resolves in favor of this mobile block. */
+  #settings-root .modal-card { min-width: 0; }
+  .modal-card .settings-fs {
+    width: 100% !important;
+    min-width: 0;
+  }
+  .modal-card .settings-actions {
+    position: sticky;
+    bottom: 0;
+    background: var(--panel-bg);
+    border-top: 1px solid var(--border-soft);
+    padding: 10px 14px;
+    margin: 14px -14px -12px;
+    /* Honor bottom safe-area so the sticky row clears home-indicator
+       hardware on iOS. */
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+    /* Ensure the buttons inside also stretch on stack-up. */
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .modal-card .settings-btn {
+    min-height: 44px;
+    flex: 1 1 auto;
+  }
+
+  /* Drag-to-reorder hover hint is meaningless on touch — the toast +
+     help overlay carry the same copy. */
+  .panel-grip-hint { display: none !important; }
+
+  /* Generic tap-target floor for the small interactive elements that
+     escape the per-component rules above. Selectors restricted to
+     classes that actually exist in this codebase. */
+  .chip, kbd { min-height: 24px; padding: 2px 8px; }
+  .model-chip { min-height: 28px; padding: 4px 10px; }
+  .ctrl-btn, .panel-collapse-toggle {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  /* Mobile two-row topbar measures ~80px tall + 8px page padding +
+     8px topbar margin-bottom + a few px headroom. */
+  :root { --topbar-h: 104px; }
+
+  /* Settings sheet — match the bottom-sheet pattern used by Help and
+     panel modals. Without this override `#settings-root` stays
+     `align-items: center` (its desktop default) and the sheet floats
+     mid-viewport with strips on top + bottom; flex-end pulls it to the
+     bottom edge so the 32px backdrop strip sits above the card and the
+     dismiss gesture matches every other modal surface. */
+  #settings-root { align-items: flex-end; }
+
+  /* Crossed-milestone numeric labels above the progress bar collide on
+     narrow viewports because each is positioned at the same fixed pixel
+     offset above its tick. The dots/ticks themselves stay visible, the
+     0/25/50/75/100% axis below the bar remains, and the milestone table
+     beneath enumerates each crossing in full — so dropping the labels
+     loses no information on mobile. */
+  .mcw-pbar .ticks .tick::after { content: none; }
+
+  /* Model chips repeat once per Sessions row and once per modal-list
+     row. Their visual height is 28px so each row reads compact, but the
+     tap target falls below the 44px floor. A `::before` pseudo expands
+     the hit area invisibly to ≥44px tall without growing the chip
+     itself or any surrounding row. The chip already has color
+     backgrounds and clickable styling, but no `position: relative` —
+     declared here so the pseudo anchors correctly. */
+  .chip.model-chip { position: relative; }
+  .chip.model-chip::before {
+    content: "";
+    position: absolute;
+    inset: -8px 0;
+  }
+}

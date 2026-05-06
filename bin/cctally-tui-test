@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Fixture-based validation harness for `tui` renderer.
+#
+# Rebuilds goldens to /tmp (NOT committed), diffs against
+# tests/fixtures/tui/golden/*.txt. Fails on any diff.
+
+set -uo pipefail
+
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+FIX="$REPO/tests/fixtures/tui"
+GOLDEN="$FIX/golden"
+BIN="$REPO/bin/cctally"
+
+COMBOS=(
+    "warn conventional 120x36"
+    "warn conventional 100x30"
+    "warn expressive   120x36"
+    "warn expressive   100x30"
+    "ok   conventional 120x36"
+    "over conventional 120x36"
+    # v2 additions
+    "filter_subscr conventional 120x36"
+    "filter_empty  conventional 120x36"
+    "sort_cost     conventional 120x36"
+    "search_opus   conventional 120x36"
+    "modal_cw      conventional 120x36"
+    "modal_fc      conventional 120x36"
+    "modal_tr      conventional 120x36"
+    "modal_tr      conventional 100x30"
+    "modal_se      conventional 120x36"
+    "modal_se      expressive   120x36"
+    # Phase C / Task C6 — freshness chip on stale current_week
+    "warn_stale    conventional 120x36"
+    # F4 regression: explicit IANA --tz must localize session-row times
+    # (the legacy renderer rendered raw UTC for any non-"local" token).
+    "iana_tz       conventional 120x36 --tz America/New_York"
+)
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+fail=0
+pass=0
+for combo in "${COMBOS[@]}"; do
+    state=$(echo "$combo" | awk '{print $1}')
+    variant=$(echo "$combo" | awk '{print $2}')
+    size=$(echo "$combo" | awk '{print $3}')
+    extra=$(echo "$combo" | awk '{$1=""; $2=""; $3=""; sub(/^ +/,""); print}')
+    mod="$FIX/snapshot_${state}.py"
+    want="$GOLDEN/${state}_${variant}_${size}.txt"
+    got="$TMP/${state}_${variant}_${size}.txt"
+    # shellcheck disable=SC2086
+    NO_COLOR=1 TZ=Etc/UTC "$BIN" tui --render-once \
+        --snapshot-module "$mod" \
+        --variant "$variant" \
+        --force-size "$size" \
+        --no-color $extra > "$got"
+    if ! diff -u "$want" "$got" >/dev/null; then
+        echo "FAIL $state/$variant/$size"
+        diff -u "$want" "$got" | head -40
+        fail=$((fail+1))
+    else
+        pass=$((pass+1))
+    fi
+done
+
+echo "----"
+echo "passed: $pass   failed: $fail"
+[ "$fail" -eq 0 ]

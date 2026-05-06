@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# Fixture harness for `cctally hook-tick`.
+#
+# Pattern: scratch HOME per scenario, run hook-tick with deterministic
+# flags, diff the resulting --explain output against golden-stdout.txt.
+#
+# Why this exists: hook-tick is a hot-path entry point fired on every
+# Claude Code event. Regressions in throttle behavior, OAuth status
+# mapping, or stdin-event parsing are easy to overlook because the
+# subcommand never fails loudly in normal mode. Fixtures pin the
+# observable --explain decision-tree output across all the interesting
+# branches so future edits surface diffs.
+#
+# Cross-platform mtime: BSD touch (macOS) does not accept `-d "@<unix>"`,
+# so we use a Python one-liner via `os.utime` to backdate the throttle
+# file. Works identically on macOS and Linux.
+set -uo pipefail
+
+HARNESS_BIN="$(cd "$(dirname "$0")" && pwd)/cctally"
+FIXTURES_DIR="$(cd "$(dirname "$0")/.." && pwd)/tests/fixtures/hook-tick"
+pass_count=0
+fail_count=0
+
+run_scenario () {
+    local name="$1"
+    local dir="$FIXTURES_DIR/$name"
+    [ -d "$dir" ] || { echo "SKIP $name: no fixture dir"; return 0; }
+    [ -f "$dir/input.env" ] || { echo "SKIP $name: no input.env"; return 0; }
+    [ -f "$dir/golden-stdout.txt" ] || { echo "SKIP $name: no golden"; return 0; }
+
+    local STDIN_JSON="" THROTTLE_AGE_S="" THROTTLE_SECONDS="30" MOCK_OAUTH=""
+    # shellcheck disable=SC1091
+    . "$dir/input.env"
+
+    local fake; fake=$(mktemp -d)
+    mkdir -p "$fake/.claude" "$fake/.local/share/cctally"
+
+    if [ -n "$THROTTLE_AGE_S" ]; then
+        local f="$fake/.local/share/cctally/hook-tick.last-fetch"
+        : > "$f"
+        local mtime_unix=$(($(date +%s) - THROTTLE_AGE_S))
+        # Cross-platform mtime set (BSD touch lacks @<unix> syntax).
+        python3 -c "import os, sys; t = int(sys.argv[2]); os.utime(sys.argv[1], (t, t))" \
+            "$f" "$mtime_unix"
+    fi
+
+    # Build flag array (avoids word-split / quoting hazards with JSON payload).
+    local extra=()
+    if [ -n "$MOCK_OAUTH" ]; then
+        extra+=("--mock-oauth-response" "$MOCK_OAUTH")
+    fi
+
+    local out raw rc
+    # `${extra[@]+"${extra[@]}"}` keeps this safe under `set -u` when the
+    # array is empty (bash 3.2 quirk on stock macOS shells).
+    raw=$(printf '%s' "$STDIN_JSON" | HOME="$fake" TZ=Etc/UTC \
+        "$HARNESS_BIN" hook-tick --explain --throttle-seconds "$THROTTLE_SECONDS" \
+        ${extra[@]+"${extra[@]}"} 2>&1; echo "EXIT=$?")
+    rc=${raw##*EXIT=}
+    rc=${rc%$'\n'}
+    out=${raw%EXIT=*}
+    # Normalize timing-dependent fields for golden comparison. The
+    # `throttled(age=Ns)` value is captured during the lock-protected
+    # throttle decision and can drift by ~1s if the local sync took
+    # longer than expected; collapse it to a stable token.
+    local norm
+    norm=$(printf '%s' "$out" | sed -E \
+        -e 's/Done in [0-9]+ ms/Done in N ms/' \
+        -e 's/mtime: [0-9]+s ago/mtime: Ks ago/' \
+        -e 's/throttled\(age=[0-9]+s\)/throttled(age=Ks)/' \
+        -e "s|$fake|/FAKE|g")
+
+    local fail_local=0
+    if ! diff -u "$dir/golden-stdout.txt" <(printf '%s\n' "$norm") > /dev/null; then
+        diff -u "$dir/golden-stdout.txt" <(printf '%s\n' "$norm") | head -40
+        fail_local=1
+    fi
+
+    # Optional exit-code golden. When present, the run's actual exit
+    # code is compared against it — used by scenarios that exercise the
+    # spec §3 exit-code mapping (2 / 3 / 4 / 5).
+    if [ -f "$dir/golden-exit.txt" ]; then
+        local expected_rc; expected_rc=$(cat "$dir/golden-exit.txt")
+        if [ "$rc" != "$expected_rc" ]; then
+            echo "exit mismatch for $name: got $rc want $expected_rc"
+            fail_local=1
+        fi
+    fi
+
+    # Optional log-line assertion. When present, every line in
+    # golden-log-contains.txt must be findable as a substring in the
+    # hook-tick log — used to pin oauth=... status fields that don't
+    # appear in --explain stdout (or to corroborate them).
+    if [ -f "$dir/golden-log-contains.txt" ]; then
+        local log_file="$fake/.local/share/cctally/logs/hook-tick.log"
+        if [ ! -s "$log_file" ]; then
+            echo "log file empty/missing for $name: $log_file"
+            fail_local=1
+        else
+            while IFS= read -r needle; do
+                [ -z "$needle" ] && continue
+                if ! grep -qF -- "$needle" "$log_file"; then
+                    echo "log missing expected token for $name: $needle"
+                    fail_local=1
+                fi
+            done < "$dir/golden-log-contains.txt"
+        fi
+    fi
+
+    if [ "$fail_local" = 0 ]; then
+        echo "PASS $name"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $name"
+        fail_count=$((fail_count + 1))
+    fi
+    rm -rf "$fake"
+}
+
+for d in "$FIXTURES_DIR"/*/; do
+    [ -d "$d" ] || continue
+    run_scenario "$(basename "$d")"
+done
+
+# ---------------------------------------------------------------------
+# Real-shell + async test — guards against the POSIX stdin-redirect-on-&
+# bug. CC invokes hooks via /bin/sh -c '<command>'; if our settings.json
+# command had a trailing `&`, POSIX async-list semantics redirect the
+# child's stdin to /dev/null in non-interactive shells, blanking the
+# hook event payload. cctally hook-tick now forks internally AFTER
+# reading stdin, so the parent shell returns quickly while still writing
+# the log line in the background child.
+#
+# We confirm the log line lands with the expected event/session, then
+# trust the existing fixture suite for the rest.
+# ---------------------------------------------------------------------
+shell_test_fake=$(mktemp -d)
+mkdir -p "$shell_test_fake/.claude" "$shell_test_fake/.local/share/cctally"
+printf '{"hook_event_name":"PostToolBatch","session_id":"shellasynctest"}' \
+    | HOME="$shell_test_fake" TZ=Etc/UTC /bin/sh -c "$HARNESS_BIN hook-tick --no-oauth"
+log_file="$shell_test_fake/.local/share/cctally/logs/hook-tick.log"
+# hook-tick forks; poll up to ~2s for the child to write the log line.
+# Replaces a fixed `sleep 0.5` that flaked on slow runners.
+for _ in $(seq 1 20); do
+    if [ -s "$log_file" ]; then break; fi
+    sleep 0.1
+done
+if [ -s "$log_file" ] && grep -q "event=PostToolBatch" "$log_file" && grep -q "session=shellasy" "$log_file"; then
+    echo "PASS shell-async-stdin"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL shell-async-stdin"
+    echo "  log file: $log_file"
+    [ -f "$log_file" ] && head -5 "$log_file"
+    fail_count=$((fail_count + 1))
+fi
+rm -rf "$shell_test_fake"
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

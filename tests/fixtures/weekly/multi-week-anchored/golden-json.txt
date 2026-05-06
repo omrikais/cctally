@@ -1,0 +1,96 @@
+{
+  "weekly": [
+    {
+      "week": "2026-03-30",
+      "displayWeek": "2026-03-30",
+      "weekStartAt": "2026-03-30T00:00:00Z",
+      "weekEndAt": "2026-04-06T00:00:00Z",
+      "weekSource": "snapshot",
+      "inputTokens": 200000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 20000,
+      "totalTokens": 220000,
+      "totalCost": 1.5,
+      "usedPct": 40.0,
+      "dollarsPerPercent": 0.0375,
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 200000,
+          "outputTokens": 20000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 1.5
+        }
+      ]
+    },
+    {
+      "week": "2026-04-06",
+      "displayWeek": "2026-04-06",
+      "weekStartAt": "2026-04-06T00:00:00Z",
+      "weekEndAt": "2026-04-13T00:00:00Z",
+      "weekSource": "snapshot",
+      "inputTokens": 600000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 60000,
+      "totalTokens": 660000,
+      "totalCost": 4.5,
+      "usedPct": 75.0,
+      "dollarsPerPercent": 0.06,
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 600000,
+          "outputTokens": 60000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 4.5
+        }
+      ]
+    },
+    {
+      "week": "2026-04-13",
+      "displayWeek": "2026-04-13",
+      "weekStartAt": "2026-04-13T00:00:00Z",
+      "weekEndAt": "2026-04-20T00:00:00Z",
+      "weekSource": "snapshot",
+      "inputTokens": 100000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 10000,
+      "totalTokens": 110000,
+      "totalCost": 0.75,
+      "usedPct": 20.0,
+      "dollarsPerPercent": 0.0375,
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 100000,
+          "outputTokens": 10000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 0.75
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "inputTokens": 900000,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 0,
+    "outputTokens": 90000,
+    "totalTokens": 990000,
+    "totalCost": 6.75
+  }
+}

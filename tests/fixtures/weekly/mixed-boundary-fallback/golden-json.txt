@@ -1,0 +1,68 @@
+{
+  "weekly": [
+    {
+      "week": "2026-04-06",
+      "displayWeek": "2026-04-06",
+      "weekStartAt": "2026-04-06T00:00:00+00:00",
+      "weekEndAt": "2026-04-13T00:00:00+00:00",
+      "weekSource": "extrapolated",
+      "inputTokens": 300000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 30000,
+      "totalTokens": 330000,
+      "totalCost": 2.25,
+      "usedPct": 60.0,
+      "dollarsPerPercent": 0.0375,
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 300000,
+          "outputTokens": 30000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 2.25
+        }
+      ]
+    },
+    {
+      "week": "2026-04-13",
+      "displayWeek": "2026-04-13",
+      "weekStartAt": "2026-04-13T00:00:00Z",
+      "weekEndAt": "2026-04-20T00:00:00Z",
+      "weekSource": "snapshot",
+      "inputTokens": 300000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 30000,
+      "totalTokens": 330000,
+      "totalCost": 2.25,
+      "usedPct": 20.0,
+      "dollarsPerPercent": 0.1125,
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 300000,
+          "outputTokens": 30000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 2.25
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "inputTokens": 600000,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 0,
+    "outputTokens": 60000,
+    "totalTokens": 660000,
+    "totalCost": 4.5
+  }
+}

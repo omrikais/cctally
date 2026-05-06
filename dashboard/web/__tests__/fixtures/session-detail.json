@@ -1,0 +1,26 @@
+{
+  "session_id": "session-0000-0000-0000-0000-000000000000",
+  "started_utc": "2026-04-22T10:00:00Z",
+  "last_activity_utc": "2026-04-22T10:15:00Z",
+  "duration_min": 15,
+  "cost_total_usd": 1.23,
+  "project_label": "project-00",
+  "project_path": "/Users/me/repos/project-00",
+  "input_tokens": 12345,
+  "output_tokens": 6789,
+  "cache_creation_tokens": 1024,
+  "cache_read_tokens": 512,
+  "cache_hit_pct": 42.5,
+  "models": [
+    { "name": "claude-opus-4-5" },
+    { "name": "claude-haiku-4-5" }
+  ],
+  "cost_per_model": [
+    { "model": "claude-opus-4-5", "cost_usd": 0.95 },
+    { "model": "claude-haiku-4-5", "cost_usd": 0.28 }
+  ],
+  "source_paths": [
+    "/Users/me/repos/project-00/session-0000-0000-0000-0000-000000000000.jsonl",
+    "/Users/me/repos/project-00/subagents/agent-xyz.jsonl"
+  ]
+}

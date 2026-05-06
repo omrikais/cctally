@@ -1,0 +1,6 @@
+fix: thing
+
+--- public ---
+docs: x
+--- public ---
+docs: y

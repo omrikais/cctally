@@ -1,0 +1,77 @@
+{
+  "weekly": [
+    {
+      "week": "Mar 30, 2026",
+      "inputTokens": 20000,
+      "cachedInputTokens": 2000,
+      "outputTokens": 7000,
+      "reasoningOutputTokens": 500,
+      "totalTokens": 27000,
+      "costUSD": 0.10785,
+      "models": {
+        "gpt-5-codex": {
+          "inputTokens": 12000,
+          "cachedInputTokens": 0,
+          "outputTokens": 4000,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 16000,
+          "isFallback": false
+        },
+        "gpt-5.2-codex": {
+          "inputTokens": 8000,
+          "cachedInputTokens": 2000,
+          "outputTokens": 3000,
+          "reasoningOutputTokens": 500,
+          "totalTokens": 11000,
+          "isFallback": false
+        }
+      }
+    },
+    {
+      "week": "Apr 06, 2026",
+      "inputTokens": 35000,
+      "cachedInputTokens": 5000,
+      "outputTokens": 11000,
+      "reasoningOutputTokens": 800,
+      "totalTokens": 46000,
+      "costUSD": 0.148125,
+      "models": {
+        "gpt-5-codex": {
+          "inputTokens": 35000,
+          "cachedInputTokens": 5000,
+          "outputTokens": 11000,
+          "reasoningOutputTokens": 800,
+          "totalTokens": 46000,
+          "isFallback": false
+        }
+      }
+    },
+    {
+      "week": "Apr 13, 2026",
+      "inputTokens": 15000,
+      "cachedInputTokens": 3000,
+      "outputTokens": 6000,
+      "reasoningOutputTokens": 600,
+      "totalTokens": 21000,
+      "costUSD": 0.10552500000000001,
+      "models": {
+        "gpt-5.2-codex": {
+          "inputTokens": 15000,
+          "cachedInputTokens": 3000,
+          "outputTokens": 6000,
+          "reasoningOutputTokens": 600,
+          "totalTokens": 21000,
+          "isFallback": false
+        }
+      }
+    }
+  ],
+  "totals": {
+    "inputTokens": 70000,
+    "cachedInputTokens": 10000,
+    "outputTokens": 24000,
+    "reasoningOutputTokens": 1900,
+    "totalTokens": 94000,
+    "costUSD": 0.36150000000000004
+  }
+}
