@@ -101,3 +101,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   caller's CWD for these checks while later phases wrote to the cctally
   repo, allowing a clean `main` elsewhere to satisfy preflight against
   the wrong upstream.
+
+## [1.0.0] - 2026-05-06
+
+### Added
+- Initial public release of cctally (mirror bootstrap).
