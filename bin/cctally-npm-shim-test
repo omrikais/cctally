@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Fixture-based harness for bin/cctally-npm-shim.js.
+#
+# Each scenario lives at tests/fixtures/npm-shim/<name>/ with:
+#   golden-exit.txt           : single integer (required).
+#   golden-stdout-substr.txt  : substring assertion (required, may be empty).
+#   golden-stderr-substr.txt  : substring assertion (required, may be empty).
+#   env.sh                    : optional. Sourced before the run; can set
+#                               PLATFORM_OVERRIDE, FAKE_PYTHON_EXIT,
+#                               CCTALLY_PYTHON, REMOVE_SCRIPT, NO_PYTHON.
+#   args.txt                  : optional. Single line of argv passed to the shim.
+#
+# A scratch dir per scenario contains:
+#   bin/cctally-npm-shim.js   : copy of the real shim under test.
+#   bin/cctally               : marker file (just touched) — only its
+#                               existence is observed, except when
+#                               REMOVE_SCRIPT=1 is set.
+#   PATH/python3              : fake python3 that echoes argv and exits
+#                               with $FAKE_PYTHON_EXIT (default 0).
+#                               Suppressed when NO_PYTHON=1.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SHIM_PATH="$REPO_ROOT/bin/cctally-npm-shim.js"
+FIXTURES_DIR="$REPO_ROOT/tests/fixtures/npm-shim"
+
+if [ ! -x "$SHIM_PATH" ]; then
+    echo "FAIL: shim not found or not executable: $SHIM_PATH" >&2
+    exit 1
+fi
+
+NODE_BIN=$(command -v node 2>/dev/null || true)
+if [ -z "$NODE_BIN" ]; then
+    echo "FAIL: node not found on PATH; install Node.js to run this harness" >&2
+    exit 1
+fi
+NODE_DIR=$(dirname "$NODE_BIN")
+
+SCRATCH_DIR=$(mktemp -d -t cctally-npm-shim-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+
+pass_count=0
+fail_count=0
+
+shopt -s nullglob
+scenario_dirs=( "$FIXTURES_DIR"/*/ )
+shopt -u nullglob
+
+for dir in "${scenario_dirs[@]}"; do
+    name=$(basename "$dir")
+    expected_exit=$(cat "$dir/golden-exit.txt" | tr -d '\n')
+    expected_stdout=$(cat "$dir/golden-stdout-substr.txt")
+    expected_stderr=$(cat "$dir/golden-stderr-substr.txt")
+
+    work="$SCRATCH_DIR/$name"
+    mkdir -p "$work/bin" "$work/PATH"
+
+    cp "$SHIM_PATH" "$work/bin/cctally-npm-shim.js"
+    chmod +x "$work/bin/cctally-npm-shim.js"
+    : > "$work/bin/cctally"
+
+    PLATFORM_OVERRIDE=""
+    FAKE_PYTHON_EXIT=0
+    NO_PYTHON=0
+    REMOVE_SCRIPT=0
+    CCTALLY_PYTHON=""
+    if [ -f "$dir/env.sh" ]; then
+        # shellcheck disable=SC1090
+        . "$dir/env.sh"
+    fi
+
+    if [ "$REMOVE_SCRIPT" = "1" ]; then
+        rm -f "$work/bin/cctally"
+    fi
+
+    if [ "$NO_PYTHON" != "1" ]; then
+        cat > "$work/PATH/python3" <<EOF
+#!/usr/bin/env bash
+echo "fake-python: \$@"
+exit $FAKE_PYTHON_EXIT
+EOF
+        chmod +x "$work/PATH/python3"
+    fi
+
+    args=()
+    if [ -f "$dir/args.txt" ]; then
+        # shellcheck disable=SC2207
+        args=( $(cat "$dir/args.txt") )
+    fi
+
+    stdout_file="$work/_stdout.txt"
+    stderr_file="$work/_stderr.txt"
+    # NODE_DIR is appended to PATH so `node` resolves from the host install
+    # (e.g. /opt/homebrew/bin on macOS). $work/PATH comes first so the fake
+    # python3 still wins lookup.
+    env -i \
+        HOME="$HOME" \
+        PATH="$work/PATH:/usr/bin:/bin:$NODE_DIR" \
+        ${CCTALLY_PYTHON:+CCTALLY_PYTHON="$CCTALLY_PYTHON"} \
+        ${PLATFORM_OVERRIDE:+CCTALLY_NPM_SHIM_TEST_PLATFORM="$PLATFORM_OVERRIDE"} \
+        node "$work/bin/cctally-npm-shim.js" "${args[@]}" \
+        > "$stdout_file" 2> "$stderr_file"
+    actual_exit=$?
+
+    actual_stdout=$(cat "$stdout_file")
+    actual_stderr=$(cat "$stderr_file")
+
+    fail=0
+    msg=""
+    if [ "$actual_exit" != "$expected_exit" ]; then
+        fail=1; msg="exit ${actual_exit} != ${expected_exit}"
+    fi
+    if [ -n "$expected_stdout" ] && ! grep -qF "$expected_stdout" <<<"$actual_stdout"; then
+        fail=1; msg="${msg:+$msg; }stdout missing '$expected_stdout'"
+    fi
+    if [ -n "$expected_stderr" ] && ! grep -qF "$expected_stderr" <<<"$actual_stderr"; then
+        fail=1; msg="${msg:+$msg; }stderr missing '$expected_stderr'"
+    fi
+
+    if [ "$fail" = "1" ]; then
+        echo "FAIL [$name]: $msg"
+        echo "  stdout:"; sed 's/^/    /' "$stdout_file"
+        echo "  stderr:"; sed 's/^/    /' "$stderr_file"
+        fail_count=$((fail_count + 1))
+    else
+        pass_count=$((pass_count + 1))
+    fi
+done
+
+printf 'passed: %d   failed: %d\n' "$pass_count" "$fail_count"
+[ "$fail_count" = "0" ]

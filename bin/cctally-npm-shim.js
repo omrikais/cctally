@@ -5,7 +5,8 @@ const { spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
-if (process.platform === 'win32') {
+const platform = process.env.CCTALLY_NPM_SHIM_TEST_PLATFORM || process.platform;
+if (platform === 'win32') {
   console.error('cctally: Windows is not supported. Use macOS or Linux.');
   process.exit(1);
 }

@@ -1,0 +1,1 @@
+CCTALLY_PYTHON=/bin/echo
