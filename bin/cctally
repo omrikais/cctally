@@ -542,6 +542,18 @@ def _release_phase_stamp_done(version: str) -> tuple[bool, str | None]:
             file=sys.stderr,
         )
         sys.exit(2)
+    # Belt-and-suspenders: package.json's version must also be stamped
+    # (Phase 1 co-stamp invariant). When package.json doesn't exist
+    # (legacy fixtures, source clones pre-Task-1), skip silently —
+    # the CHANGELOG header check above is still authoritative.
+    pj_path = _package_json_path()
+    if pj_path.exists():
+        try:
+            pj = json.loads(pj_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return (False, None)
+        if pj.get("version") != version:
+            return (False, None)
     return (True, head_sha)
 
 

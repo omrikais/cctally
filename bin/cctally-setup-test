@@ -101,6 +101,36 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
     # not the macOS system python3 in /usr/bin (3.9, below cctally's floor).
     local py3_dir; py3_dir=$(dirname "$(command -v python3)")
 
+    # Per-scenario scratch repo: when `presetup.sh` exists, copy the
+    # repo's `bin/` into `$fake/repo-scratch/bin/` and let the scenario
+    # mutate it before the main `cctally` invocation. This lets a
+    # scenario simulate layouts where files alongside the script differ
+    # from the live checkout — e.g. removing `bin/cctally-npm-shim.js`
+    # to exercise the source-clone / brew install fallback in
+    # `_setup_resolve_symlink_source`. The launcher swaps from
+    # `$HARNESS_BIN` (live `bin/cctally`) to the scratch copy so
+    # `_setup_resolve_repo_root` (derived from `__file__`) lands inside
+    # the scratch.
+    local launcher="$HARNESS_BIN"
+    local repo_scratch=""
+    if [ -f "$dir/presetup.sh" ]; then
+        repo_scratch="$fake/repo-scratch"
+        mkdir -p "$repo_scratch/bin"
+        # cp -R preserves symlink targets and the +x bit; both matter:
+        # the scratch must be a self-sufficient checkout for `bin/cctally`
+        # to run, and bash wrappers / shim file need their exec bit.
+        cp -R "$REPO_ROOT/bin/." "$repo_scratch/bin/"
+        REPO_SCRATCH="$repo_scratch" bash "$dir/presetup.sh"
+        launcher="$repo_scratch/bin/cctally"
+        # `_setup_resolve_repo_root` calls `pathlib.Path(__file__).resolve()`;
+        # on macOS that resolves `/var/folders/...` to `/private/var/...`.
+        # Use the realpath form for sed substitution so symlink targets
+        # (which the kernel records using the resolved root) normalize
+        # cleanly to /REPO. We keep the unresolved form too so any
+        # output that didn't go through `realpath` still substitutes.
+        repo_scratch="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$repo_scratch")"
+    fi
+
     # Pre-run hook: if pre-cmd.txt exists, run it once to materialize
     # post-install state (symlinks, etc.) that we can't ship in git.
     if [ -f "$dir/pre-cmd.txt" ]; then
@@ -108,7 +138,7 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
         # shellcheck disable=SC2086
         HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh \
             PATH="${path_pre}$fake/.fake-bin:${py3_dir}:/usr/bin:/bin" \
-            "$HARNESS_BIN" $pre >/dev/null 2>&1 || true
+            "$launcher" $pre >/dev/null 2>&1 || true
     fi
 
     local cmd; cmd=$(cat "$dir/cmd.txt")
@@ -116,7 +146,7 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
     # shellcheck disable=SC2086
     raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh \
           PATH="${path_pre}$fake/.fake-bin:${py3_dir}:/usr/bin:/bin" \
-          "$HARNESS_BIN" $cmd 2>&1; echo "EXIT=$?")
+          "$launcher" $cmd 2>&1; echo "EXIT=$?")
     local rc=${raw##*EXIT=}
     rc=${rc%$'\n'}
     local out=${raw%EXIT=*}
@@ -124,10 +154,18 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
     # Normalize: paths, sizes (KB/MB/GB), entry counts, fetch ages.
     # Strip transient cache migration banner — fires once per fresh
     # data dir; goldens shouldn't depend on it.
+    # Order matters: when a scenario uses a scratch repo, $repo_scratch
+    # is a subpath of $fake; substituting $repo_scratch → /REPO must
+    # happen FIRST so the parent $fake → /FAKE rule doesn't shadow it.
+    local scratch_sed=""
+    if [ -n "$repo_scratch" ]; then
+        scratch_sed="-e s|$repo_scratch|/REPO|g"
+    fi
     local norm
     norm=$(printf '%s' "$out" \
         | grep -v '^\[cache\] migrated' \
         | sed -E \
+            $scratch_sed \
             -e "s|$fake|/FAKE|g" \
             -e "s|$REPO_ROOT|/REPO|g" \
             -e 's/\(([0-9]+) newly created\)/(N newly created)/g' \
@@ -164,7 +202,11 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
     if [ -f "$dir/golden-settings.json" ]; then
         if [ -f "$fake/.claude/settings.json" ]; then
             local actual_settings
-            actual_settings=$(sed "s|$REPO_ROOT|/REPO|g" "$fake/.claude/settings.json")
+            if [ -n "$repo_scratch" ]; then
+                actual_settings=$(sed -e "s|$repo_scratch|/REPO|g" -e "s|$REPO_ROOT|/REPO|g" "$fake/.claude/settings.json")
+            else
+                actual_settings=$(sed "s|$REPO_ROOT|/REPO|g" "$fake/.claude/settings.json")
+            fi
             if ! diff -u "$dir/golden-settings.json" <(printf '%s\n' "$actual_settings") >/dev/null; then
                 diff -u "$dir/golden-settings.json" <(printf '%s\n' "$actual_settings") | head -50
                 fail_local=1
@@ -177,7 +219,12 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
 
     if [ -f "$dir/golden-symlinks.txt" ]; then
         local listing; listing=$(list_local_bin "$fake/.local/bin")
-        local norm_listing; norm_listing=$(printf '%s' "$listing" | sed -E "s|$REPO_ROOT|/REPO|g")
+        local norm_listing
+        if [ -n "$repo_scratch" ]; then
+            norm_listing=$(printf '%s' "$listing" | sed -E -e "s|$repo_scratch|/REPO|g" -e "s|$REPO_ROOT|/REPO|g")
+        else
+            norm_listing=$(printf '%s' "$listing" | sed -E "s|$REPO_ROOT|/REPO|g")
+        fi
         if ! diff -u "$dir/golden-symlinks.txt" <(printf '%s\n' "$norm_listing") >/dev/null; then
             diff -u "$dir/golden-symlinks.txt" <(printf '%s\n' "$norm_listing") | head -50
             fail_local=1
