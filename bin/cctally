@@ -539,7 +539,13 @@ def _release_run_phase_stamp(
         or dt.datetime.now(dt.timezone.utc).date().isoformat()
     )
     old_text = CHANGELOG_PATH.read_text(encoding="utf-8")
-    new_text, body = _release_stamp_changelog(old_text, version, today)
+    try:
+        new_text, body = _release_stamp_changelog(old_text, version, today)
+    except ValueError as e:
+        # Mirror the dry-run path's contract: refuse with exit 2 when
+        # `[Unreleased]` is empty (spec §3 step 4 / §11.4 row 9).
+        print(f"release: {e}", file=sys.stderr)
+        sys.exit(2)
 
     # Subsection counts — read from the OLD parse (before the stamp moved
     # bullets out of [Unreleased]); private-body diagnostics only.
@@ -951,7 +957,9 @@ def _release_run_phase_mirror(
         sys.exit(3)
 
     # Step 3a — replay private commits onto the public clone.
-    rc = subprocess.call([str(mirror_tool), "--yes", str(public_clone)])
+    rc = subprocess.call(
+        [str(mirror_tool), "--yes", "--public-clone", str(public_clone)]
+    )
     if rc != 0:
         print(
             f"release: mirror replay (3a) failed (exit {rc}); "

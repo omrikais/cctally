@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Fixture-based harness for `cctally release` (cmd_release).
+#
+# Each scenario under tests/fixtures/release/<name>/ exists as:
+#   - setup.sh                  : builds an isolated git layout under
+#                                 $work/ (private working clone +
+#                                 private.git bare + public working
+#                                 clone + public.git bare); seeds
+#                                 CHANGELOG.md per-scenario.
+#   - run.sh                    : invokes `cctally release ...` from
+#                                 inside private/ and writes deterministic
+#                                 artifacts to $work/_artifacts/ for the
+#                                 harness to compare against goldens.
+#   - golden-exit.txt           : single integer; required.
+#   - golden-stdout-substr.txt  : required, may be empty.
+#   - golden-stderr-substr.txt  : required, may be empty.
+#   - golden-changelog.md       : optional — exact post-release CHANGELOG.md.
+#   - golden-commit-msg.txt     : optional — `git log -1 --format=%B` of the
+#                                 stamp commit, with `<SHA7>` placeholders.
+#   - golden-tag-annotation.txt : optional — release-tag annotation body.
+#
+# Pattern: builder regenerates setup.sh + run.sh into a scratch tree.
+# Harness copies them per-scenario into $work/, runs setup.sh, then
+# `(cd private && bash ../run.sh "$REPO_ROOT")`. The release script
+# resolves CHANGELOG_PATH via __file__.parent.parent inside private/,
+# so it reads/writes the scratch CHANGELOG.md (NOT cctally-dev's own).
+#
+# The summary line MUST end with `passed: N   failed: M` (two spaces) so
+# the cctally-test-all aggregator's awk parser picks up the counts.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+FIXTURES_DIR="$REPO_ROOT/tests/fixtures/release"
+
+SCRATCH_DIR=$(mktemp -d -t cctally-release-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+
+# Regenerate fixtures into a scratch built/ tree so the harness always
+# picks up the latest builder output without dirtying the in-tree goldens.
+"$REPO_ROOT/bin/build-release-fixtures.py" --out "$SCRATCH_DIR/built" >/dev/null || {
+    echo "FAIL: build-release-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+pass_count=0
+fail_count=0
+
+for dir in "$FIXTURES_DIR"/*/; do
+    name=$(basename "$dir")
+    expected_exit=$(cat "$dir/golden-exit.txt" | tr -d '\n')
+    expected_stdout=$(cat "$dir/golden-stdout-substr.txt" | tr -d '\n')
+    expected_stderr=$(cat "$dir/golden-stderr-substr.txt" | tr -d '\n')
+
+    work="$SCRATCH_DIR/run/$name"
+    mkdir -p "$work"
+    cp "$SCRATCH_DIR/built/$name/setup.sh" "$work/setup.sh"
+    cp "$SCRATCH_DIR/built/$name/run.sh" "$work/run.sh"
+
+    setup_log="$work/_setup.log"
+    if ! (cd "$work" && bash setup.sh "$REPO_ROOT") >"$setup_log" 2>&1; then
+        echo "FAIL [$name]: setup.sh exited non-zero"
+        echo "  setup output:"
+        sed 's/^/    /' "$setup_log"
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+
+    # Run from inside private/. The release script's __file__ is
+    # $work/private/bin/cctally; CHANGELOG_PATH thus resolves to
+    # $work/private/CHANGELOG.md.
+    run_log="$work/_run.log"
+    (cd "$work/private" && bash ../run.sh "$REPO_ROOT") >"$run_log" 2>&1
+    actual_exit=$?
+
+    # Normalize artifacts (run.sh wrote them under $work/_artifacts/).
+    artifact_dir="$work/_artifacts"
+    actual_stdout=""
+    actual_stderr=""
+    if [ -f "$artifact_dir/stdout.txt" ]; then
+        actual_stdout=$(cat "$artifact_dir/stdout.txt")
+    fi
+    if [ -f "$artifact_dir/stderr.txt" ]; then
+        actual_stderr=$(cat "$artifact_dir/stderr.txt")
+    fi
+    if [ -f "$artifact_dir/exit.txt" ]; then
+        # run.sh wrote the inner-process exit code (the release script's
+        # exit code) to exit.txt. Use that for the comparison so the
+        # harness sees the actual cctally release exit, not the wrapper's
+        # bash exit (which can differ if run.sh has its own assertions
+        # before exiting).
+        actual_exit=$(cat "$artifact_dir/exit.txt" | tr -d '\n')
+    fi
+
+    pass=true
+    fail_reasons=()
+
+    if [ "$actual_exit" != "$expected_exit" ]; then
+        pass=false
+        fail_reasons+=("exit=$actual_exit (expected $expected_exit)")
+    fi
+
+    if [ -n "$expected_stdout" ] && ! grep -qF -- "$expected_stdout" "$artifact_dir/stdout.txt" 2>/dev/null; then
+        pass=false
+        fail_reasons+=("stdout substring '$expected_stdout' not found")
+    fi
+
+    if [ -n "$expected_stderr" ] && ! grep -qF -- "$expected_stderr" "$artifact_dir/stderr.txt" 2>/dev/null; then
+        pass=false
+        fail_reasons+=("stderr substring '$expected_stderr' not found")
+    fi
+
+    # Optional byte-exact CHANGELOG check.
+    cl_golden="$dir/golden-changelog.md"
+    if [ -f "$cl_golden" ] && [ -f "$artifact_dir/changelog.md" ]; then
+        if ! diff -u "$cl_golden" "$artifact_dir/changelog.md" >/dev/null; then
+            pass=false
+            fail_reasons+=("changelog mismatch")
+        fi
+    fi
+
+    # Optional byte-exact commit-msg check (with <SHA7> normalization
+    # already applied by run.sh).
+    cm_golden="$dir/golden-commit-msg.txt"
+    if [ -f "$cm_golden" ] && [ -f "$artifact_dir/commit-msg.txt" ]; then
+        if ! diff -u "$cm_golden" "$artifact_dir/commit-msg.txt" >/dev/null; then
+            pass=false
+            fail_reasons+=("commit-msg mismatch")
+        fi
+    fi
+
+    # Optional tag-annotation check.
+    ta_golden="$dir/golden-tag-annotation.txt"
+    if [ -f "$ta_golden" ] && [ -f "$artifact_dir/tag-annotation.txt" ]; then
+        if ! diff -u "$ta_golden" "$artifact_dir/tag-annotation.txt" >/dev/null; then
+            pass=false
+            fail_reasons+=("tag-annotation mismatch")
+        fi
+    fi
+
+    if $pass; then
+        echo "PASS [$name]"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL [$name]: ${fail_reasons[*]}"
+        echo "  actual exit:   $actual_exit"
+        echo "  actual stdout:"
+        sed 's/^/    /' "$artifact_dir/stdout.txt" 2>/dev/null || echo "    (missing)"
+        echo "  actual stderr:"
+        sed 's/^/    /' "$artifact_dir/stderr.txt" 2>/dev/null || echo "    (missing)"
+        # On diff failures, surface the actual vs golden for the
+        # mismatching artifact so the failure message is actionable.
+        for reason in "${fail_reasons[@]}"; do
+            case "$reason" in
+                "changelog mismatch")
+                    echo "  changelog diff (golden vs actual):"
+                    diff -u "$cl_golden" "$artifact_dir/changelog.md" 2>/dev/null \
+                        | head -60 | sed 's/^/    /'
+                    ;;
+                "commit-msg mismatch")
+                    echo "  commit-msg diff (golden vs actual):"
+                    diff -u "$cm_golden" "$artifact_dir/commit-msg.txt" 2>/dev/null \
+                        | head -60 | sed 's/^/    /'
+                    ;;
+                "tag-annotation mismatch")
+                    echo "  tag-annotation diff (golden vs actual):"
+                    diff -u "$ta_golden" "$artifact_dir/tag-annotation.txt" 2>/dev/null \
+                        | head -60 | sed 's/^/    /'
+                    ;;
+            esac
+        done
+        fail_count=$((fail_count + 1))
+    fi
+done
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

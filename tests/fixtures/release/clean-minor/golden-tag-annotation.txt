@@ -1,0 +1,9 @@
+v0.2.0
+
+### Added
+- New feature A
+- New feature B
+
+### Fixed
+- Bug X
+
