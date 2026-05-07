@@ -87,3 +87,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `--- public ---` block on a clean merge previously flushed the
   accumulated chain in metrics (while the mirror kept accumulating),
   letting a later `fix:` publish bypass the warn/refuse guard.
+- `cctally release --resume` now detects an existing Phase-1 stamp
+  even when the resume runs on a different UTC date than the original
+  stamp. Previously the done-signal compared `## [version] - <today>`
+  against the CHANGELOG's recorded date, so a next-day resume would
+  miss the stamp and re-attempt Phase 1 on an empty `[Unreleased]`,
+  blocking the documented idempotent-resume contract.
+- `cctally release` preflight git probes (branch, clean-tree, fetch,
+  ahead/behind, tag-clobber) and Phase-2 tag-existence probe now run
+  with `cwd=` anchored to the cctally repo. Invocations from outside
+  the checkout (e.g., the `cctally-release` symlink in `~/.local/bin/`
+  with the operator's shell in another git repo) previously read the
+  caller's CWD for these checks while later phases wrote to the cctally
+  repo, allowing a clean `main` elsewhere to satisfy preflight against
+  the wrong upstream.

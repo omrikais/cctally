@@ -1,4 +1,4 @@
-Would symlink 11 files to /FAKE/.local/bin/ (0 already correct, 11 new)
+Would symlink 12 files to /FAKE/.local/bin/ (0 already correct, 12 new)
 Would add 3 hook entries to /FAKE/.claude/settings.json:
   hooks.PostToolBatch[*] += { matcher: "*", command: "/REPO/bin/cctally hook-tick" }
   hooks.Stop[*] += { matcher: "", command: "/REPO/bin/cctally hook-tick" }

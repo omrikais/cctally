@@ -1,3 +1,3 @@
 Removed 3 hook entries from /FAKE/.claude/settings.json
-Removed 11 symlinks from /FAKE/.local/bin/
+Removed 12 symlinks from /FAKE/.local/bin/
 Note: usage history kept at /FAKE/.local/share/cctally/ (SIZE). Use --purge to remove.

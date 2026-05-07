@@ -324,7 +324,9 @@ def _release_preflight_branch(allow_branch: str | None) -> None:
     (a dry-run on the wrong branch would mislead).
     """
     branch = subprocess.check_output(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        text=True,
+        cwd=str(CHANGELOG_PATH.parent),
     ).strip()
     expected = allow_branch if allow_branch else "main"
     if branch != expected:
@@ -344,7 +346,11 @@ def _release_preflight_branch(allow_branch: str | None) -> None:
 
 def _release_preflight_clean_tree() -> None:
     """Refuse if working tree is dirty (spec §10.1 step 3)."""
-    out = subprocess.check_output(["git", "status", "--porcelain"], text=True)
+    out = subprocess.check_output(
+        ["git", "status", "--porcelain"],
+        text=True,
+        cwd=str(CHANGELOG_PATH.parent),
+    )
     if out.strip():
         print("release: working tree dirty; commit or stash first", file=sys.stderr)
         sys.exit(2)
@@ -357,25 +363,36 @@ def _release_preflight_up_to_date(remote: str) -> None:
     with --resume after fixing connectivity.
     """
     branch = subprocess.check_output(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        text=True,
+        cwd=str(CHANGELOG_PATH.parent),
     ).strip()
     try:
         subprocess.check_call(
             ["git", "fetch", "--quiet", remote, branch],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            cwd=str(CHANGELOG_PATH.parent),
         )
     except subprocess.CalledProcessError:
         # Network failure — proceed; operator can re-run with --resume.
         return
-    local = subprocess.check_output(["git", "rev-parse", branch], text=True).strip()
+    local = subprocess.check_output(
+        ["git", "rev-parse", branch],
+        text=True,
+        cwd=str(CHANGELOG_PATH.parent),
+    ).strip()
     remote_sha = subprocess.check_output(
-        ["git", "rev-parse", f"{remote}/{branch}"], text=True
+        ["git", "rev-parse", f"{remote}/{branch}"],
+        text=True,
+        cwd=str(CHANGELOG_PATH.parent),
     ).strip()
     if local == remote_sha:
         return
     base = subprocess.check_output(
-        ["git", "merge-base", local, remote_sha], text=True
+        ["git", "merge-base", local, remote_sha],
+        text=True,
+        cwd=str(CHANGELOG_PATH.parent),
     ).strip()
     if base == remote_sha:
         return  # local is strictly ahead — fine.
@@ -390,7 +407,11 @@ def _release_preflight_tag_clobber(version: str, remote: str) -> None:
     """Refuse if vX.Y.Z tag already exists locally or on remote (spec §10.1 step 5)."""
     tag = f"v{version}"
     local_tags = (
-        subprocess.check_output(["git", "tag", "-l", tag], text=True)
+        subprocess.check_output(
+            ["git", "tag", "-l", tag],
+            text=True,
+            cwd=str(CHANGELOG_PATH.parent),
+        )
         .strip()
         .splitlines()
     )
@@ -405,6 +426,7 @@ def _release_preflight_tag_clobber(version: str, remote: str) -> None:
             ["git", "ls-remote", "--tags", remote, f"refs/tags/{tag}"],
             text=True,
             stderr=subprocess.DEVNULL,
+            cwd=str(CHANGELOG_PATH.parent),
         ).strip()
         if out:
             print(
@@ -420,26 +442,23 @@ def _release_preflight_tag_clobber(version: str, remote: str) -> None:
 
 def _release_phase_stamp_done(version: str) -> tuple[bool, str | None]:
     """Phase-1 read-only signal: returns (True, head_sha) when CHANGELOG.md
-    on disk AND HEAD's tree both contain the `## [version] - <today>` header
-    AND HEAD's commit subject is exactly `chore(release): vX.Y.Z`.
+    on disk AND HEAD's tree both contain a `## [version] - YYYY-MM-DD` header
+    line AND HEAD's commit subject is exactly `chore(release): vX.Y.Z`.
 
-    Date defaults to today UTC, overridable via CCTALLY_RELEASE_DATE_UTC for
-    deterministic fixtures. Returns (False, None) on any miss (file gone,
-    header absent, HEAD blob lacks the header). When the header IS present
-    on HEAD but HEAD's subject is not the stamp subject — meaning an
-    unrelated commit landed on top of the stamp — exits 2 with a diagnostic
-    rather than tagging the wrong SHA. Read-only — never mutates.
+    Date is read from the existing CHANGELOG, NOT recomputed from "today" —
+    `--resume` after UTC midnight rollover must still detect a stamp written
+    yesterday. Returns (False, None) on any miss (file gone, header absent,
+    HEAD blob lacks the header). When the header IS present on HEAD but
+    HEAD's subject is not the stamp subject — meaning an unrelated commit
+    landed on top of the stamp — exits 2 with a diagnostic rather than
+    tagging the wrong SHA. Read-only — never mutates.
     """
-    today = (
-        os.environ.get("CCTALLY_RELEASE_DATE_UTC")
-        or dt.datetime.now(dt.timezone.utc).date().isoformat()
-    )
-    expected_header = f"## [{version}] - {today}"
+    expected_prefix = f"## [{version}] - "
     try:
         text = CHANGELOG_PATH.read_text(encoding="utf-8")
     except FileNotFoundError:
         return (False, None)
-    if expected_header not in text:
+    if not any(line.startswith(expected_prefix) for line in text.splitlines()):
         return (False, None)
     head_sha = subprocess.check_output(
         ["git", "rev-parse", "HEAD"],
@@ -455,7 +474,7 @@ def _release_phase_stamp_done(version: str) -> tuple[bool, str | None]:
         )
     except subprocess.CalledProcessError:
         return (False, None)
-    if expected_header not in blob:
+    if not any(line.startswith(expected_prefix) for line in blob.splitlines()):
         return (False, None)
     # HEAD's blob carries the stamp; verify HEAD itself IS the stamp commit.
     # An unrelated commit landed on top of the stamp would still satisfy the
@@ -648,7 +667,11 @@ def _release_phase_tag_done(version: str, remote: str) -> bool:
     """
     tag = f"v{version}"
     local = (
-        subprocess.check_output(["git", "tag", "-l", tag], text=True)
+        subprocess.check_output(
+            ["git", "tag", "-l", tag],
+            text=True,
+            cwd=str(CHANGELOG_PATH.parent),
+        )
         .strip()
         .splitlines()
     )
@@ -659,6 +682,7 @@ def _release_phase_tag_done(version: str, remote: str) -> bool:
             ["git", "ls-remote", "--tags", remote, f"refs/tags/{tag}"],
             text=True,
             stderr=subprocess.DEVNULL,
+            cwd=str(CHANGELOG_PATH.parent),
         ).strip()
         return bool(out)
     except subprocess.CalledProcessError:
@@ -1364,7 +1388,9 @@ def _release_dry_run(
     )
     print()
     branch = subprocess.check_output(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        text=True,
+        cwd=str(CHANGELOG_PATH.parent),
     ).strip()
     print(f"Branch:        {branch}")
     print(f"Remote:        {args.remote}")
