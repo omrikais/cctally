@@ -763,6 +763,7 @@ class TestResume:
             allow_branch=None,
             remote="origin",
             public_clone=None,
+            skip_npm=False,
         )
 
     def _stub_preflight_and_version(self, monkeypatch, version="1.0.0"):
@@ -881,6 +882,11 @@ class TestResume:
         )
         monkeypatch.setattr(
             cctally,
+            "_release_run_phase_npm",
+            lambda *a, **kw: called.append("npm") or 0,
+        )
+        monkeypatch.setattr(
+            cctally,
             "_release_extract_body_from_changelog",
             lambda v: "### Added\n- Foo",
         )
@@ -889,7 +895,7 @@ class TestResume:
         assert rc == 0
         # Phase loop ran (each helper short-circuits internally based on
         # its own signal — the stubs simulate "do the work").
-        assert called == ["stamp", "tag", "mirror", "gh"]
+        assert called == ["stamp", "tag", "mirror", "gh", "npm"]
         out = capsys.readouterr().out
         # Non-already-done resume: prints the published-line, NOT
         # `already published`.

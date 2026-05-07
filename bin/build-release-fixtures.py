@@ -51,9 +51,9 @@ Scenario architecture (Task 12):
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import subprocess
-import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -148,6 +148,44 @@ esac
 exit 0
 CCTALLY_FAKE_GH_EOF
 chmod +x "$work/fake-bin/gh"
+
+# Fake `npm` binary: pre-empts the host's real `npm` (which may be
+# installed and authenticated on dev machines, in which case Phase 5
+# would attempt a real publish). Default behavior simulates "npm not
+# authenticated" — `whoami` exits 1, which routes Phase 5 down its
+# auth-fallback branch and returns 0. Batch 6 scenarios that exercise
+# the actual publish flow override this by writing their own
+# `npm-mock-state.json` and pointing NPM_MOCK_STATE_FILE at it.
+cat > "$work/fake-bin/npm" <<'CCTALLY_FAKE_NPM_EOF'
+#!/usr/bin/env bash
+# Argv recording (one line per invocation).
+LOG="${NPM_MOCK_LOG_FILE:-$work/npm-invocations.log}"
+printf '%s\n' "$*" >> "$LOG" 2>/dev/null || true
+
+# Optional: read responses from a state file (used by Batch 6 scenarios).
+STATE="${NPM_MOCK_STATE_FILE:-}"
+if [ -n "$STATE" ] && [ -f "$STATE" ]; then
+  SUB="${1:-}"
+  case "$SUB" in
+    whoami)  KEY=whoami ;;
+    view)    KEY=view ;;
+    publish) KEY=publish ;;
+    *) echo "fake-npm: unknown subcommand: $SUB" >&2; exit 1 ;;
+  esac
+  EXIT=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get(sys.argv[2],{}).get('exit',0))" "$STATE" "$KEY" 2>/dev/null || echo 0)
+  STDOUT=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get(sys.argv[2],{}).get('stdout',''))" "$STATE" "$KEY" 2>/dev/null || echo "")
+  if [ -n "$STDOUT" ]; then printf '%s\n' "$STDOUT"; fi
+  exit "$EXIT"
+fi
+
+# Default: simulate "not authenticated" so Phase 5 hits the auth
+# fallback and returns 0.
+case "${1:-}" in
+  whoami) exit 1 ;;
+  *)      exit 0 ;;
+esac
+CCTALLY_FAKE_NPM_EOF
+chmod +x "$work/fake-bin/npm"
 
 # Public bare + working clone. Init bare first; clone or wire origin so
 # the public/ working dir's `origin` points at public.git/.
@@ -364,6 +402,14 @@ _CAPTURE_ARTIFACTS = (
     'if [ -f "$work/gh-argv.log" ]; then\n'
     '  cp "$work/gh-argv.log" "$work/_artifacts/gh-argv.log"\n'
     'fi\n'
+    # Capture npm invocations log if it exists (Phase 5 scenarios). Always
+    # emit the artifact even when empty so the harness can byte-compare
+    # against a golden of "" (the --skip-npm scenario).
+    'if [ -f "$work/npm-invocations.log" ]; then\n'
+    '  cp "$work/npm-invocations.log" "$work/_artifacts/npm-invocations.log"\n'
+    'else\n'
+    '  : > "$work/_artifacts/npm-invocations.log"\n'
+    'fi\n'
 )
 
 
@@ -496,55 +542,56 @@ def _run_commit_msg_hook(release_args: str) -> str:
 # ---------------------------------------------------------------------------
 # Mock infrastructure for npm + brew tap (Batch 5 / Task 20).
 #
-# Used by Batch 6 (Phase 5 npm-publish scenarios) and Batches 7–8 (Phase 6
-# brew helpers + scenarios). These helpers emit:
+# Used by Batch 6 (Phase 5 npm-publish scenarios — see
+# `_seed_npm_mock_state` and `_run_release_with_npm` below) and Batches 7–8
+# (Phase 6 brew helpers + scenarios — `_emit_fake_brew_tap` below).
 #
-#   _emit_fake_npm        : a fake `npm` shell script that consumes canned
-#                            JSON responses from a per-scenario state file
-#                            and logs every invocation to a per-scenario
-#                            log file. Goldens can assert on the log shape.
-#   _emit_fake_brew_tap   : a bare repo + working clone serving as a
-#                            stand-in for the homebrew-cctally tap remote.
-#
-# The shell-side analogs (fixture_init_fake_npm_path, fixture_seed_package_json)
-# live in bin/_lib-fixture-harness.sh — duplication is intentional, since
-# setup.sh runs at scenario-execution time, not builder time.
+# The fake npm itself lives in the SCAFFOLD's `fake-bin/npm` block —
+# Batch 6 scenarios just write a per-scenario `npm-mock-state.json`
+# and export `NPM_MOCK_STATE_FILE`; the scaffold's fake-npm reads
+# canned responses from there and logs every invocation to
+# `npm-invocations.log` for golden comparison.
 # ---------------------------------------------------------------------------
 
 
-def _emit_fake_npm(scratch_path_dir: pathlib.Path) -> None:
-    """Write a fake `npm` shell script under `scratch_path_dir/npm`.
+def _seed_npm_mock_state(state: dict) -> str:
+    """Bash snippet (run with cwd=$work/private) that writes
+    `$work/npm-mock-state.json` with the given canned responses.
 
-    Reads canned responses from `<scratch>/npm-mock-state.json`:
-        {
-          "whoami": {"exit": 0, "stdout": "fake-user"},
-          "view":   {"exit": 0, "stdout": "\"https://registry.npmjs.org/cctally/-/cctally-1.0.1.tgz\""},
-          "publish":{"exit": 0, "stdout": "+ cctally@1.0.1"}
-        }
-    Logs every invocation to `<scratch>/npm-invocations.log` (one line:
-    "<subcmd> <args...>") so goldens can assert on call shape.
+    The scaffold's fake-npm reads NPM_MOCK_STATE_FILE if set; the matching
+    `_run_release_with_npm` helper exports that env var pointing at this
+    file. Each top-level key (`whoami` / `view` / `publish`) maps to
+    `{"exit": int, "stdout": str}`.
     """
-    scratch_path_dir.mkdir(parents=True, exist_ok=True)
-    npm = scratch_path_dir / "npm"
-    npm.write_text(textwrap.dedent("""\
-        #!/usr/bin/env bash
-        set -uo pipefail
-        STATE="${NPM_MOCK_STATE_FILE:-$(dirname "$0")/../npm-mock-state.json}"
-        LOG="${NPM_MOCK_LOG_FILE:-$(dirname "$0")/../npm-invocations.log}"
-        printf '%s\\n' "$*" >> "$LOG"
-        SUB="$1"; shift || true
-        case "$SUB" in
-          whoami)  KEY=whoami ;;
-          view)    KEY=view   ;;
-          publish) KEY=publish ;;
-          *)       echo "fake-npm: unknown subcommand: $SUB" >&2; exit 1 ;;
-        esac
-        EXIT=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get(sys.argv[2],{}).get('exit',0))" "$STATE" "$KEY")
-        STDOUT=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get(sys.argv[2],{}).get('stdout',''))" "$STATE" "$KEY")
-        if [ -n "$STDOUT" ]; then printf '%s\\n' "$STDOUT"; fi
-        exit "$EXIT"
-    """))
-    npm.chmod(0o755)
+    body = json.dumps(state, indent=2)
+    return (
+        "cat > \"$work/npm-mock-state.json\" <<'CCTALLY_NPM_STATE_EOF'\n"
+        f"{body}\n"
+        "CCTALLY_NPM_STATE_EOF\n"
+    )
+
+
+def _run_release_with_npm(release_args: str) -> str:
+    """run.sh body for Phase 5 scenarios. Same as `_run_release` but also:
+      - Truncates `$work/npm-invocations.log` (so the fake-npm's append-log
+        is empty before the run).
+      - Exports `NPM_MOCK_STATE_FILE=$work/npm-mock-state.json` so the
+        scaffold's fake-npm reads canned responses from the per-scenario
+        state file (seeded by `_seed_npm_mock_state` in extra_setup).
+      - Exports `NPM_MOCK_LOG_FILE=$work/npm-invocations.log` for clarity
+        (the fake-npm defaults to that path anyway).
+    """
+    return _RUN_HEADER + (
+        ': > "$work/npm-invocations.log"\n'
+        'export NPM_MOCK_STATE_FILE="$work/npm-mock-state.json"\n'
+        'export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"\n'
+        f'python3 bin/cctally release {release_args} '
+        f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
+        f'rc=$?\n'
+        f'echo "$rc" > "$work/_artifacts/exit.txt"\n'
+        + _CAPTURE_ARTIFACTS
+        + 'exit "$rc"\n'
+    )
 
 
 def _emit_fake_brew_tap(work: pathlib.Path) -> pathlib.Path:
@@ -587,7 +634,7 @@ def _add(**kwargs) -> None:
     goldens to None when missing."""
     kwargs.setdefault("extra_setup", "")
     for key in ("changelog", "commit_msg", "tag_annotation",
-                "body_equal", "gh_argv", "package_json"):
+                "body_equal", "gh_argv", "package_json", "npm_invocations"):
         kwargs.setdefault(key, None)
     SCENARIOS.append(kwargs)
 
@@ -1470,6 +1517,159 @@ _add(
 )
 
 
+# ===========================================================================
+# Group 7 — Phase 5 (npm publish).
+#
+# The scaffold's fake-npm defaults to "whoami exits 1" (auth-fallback).
+# These scenarios override that by writing a per-scenario
+# `npm-mock-state.json` and exporting `NPM_MOCK_STATE_FILE` from run.sh.
+# Goldens pin the exact `npm <subcmd> <args>` invocations recorded by
+# the fake-npm so a regression in Phase 5's call shape fails fast.
+# ===========================================================================
+
+# 27. phase5-publish-stable: stable release with `--tag latest`. Full
+# happy path: view → whoami → publish → view (post-publish probe).
+_add(
+    name="phase5-publish-stable",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=_seed_npm_mock_state({
+        "whoami":  {"exit": 0, "stdout": "fake-user"},
+        "view":    {"exit": 1, "stdout": ""},
+        "publish": {"exit": 0, "stdout": "+ cctally@0.1.1"},
+    }),
+    run=_run_release_with_npm("patch"),
+    expected_exit=0,
+    stdout_substr="phase 5: npm publish (tag=latest)",
+    stderr_substr="",
+    npm_invocations=(
+        "view cctally@0.1.1 dist.tarball --json\n"
+        "whoami\n"
+        "publish --tag latest\n"
+        "view cctally@0.1.1 dist.tarball --json\n"
+    ),
+)
+
+
+# 28. phase5-publish-prerelease: prerelease release with `--tag next`.
+# `release prerelease --bump patch` from 0.1.0 → 0.1.1-rc.1.
+_add(
+    name="phase5-publish-prerelease",
+    seed_changelog=_changelog(
+        unreleased_subsections=[
+            ("Added", ["- Prerelease demo entry"]),
+        ],
+        prior_releases=[
+            ("0.1.0", "2026-01-01",
+                [("Added", ["- Initial public release of cctally"])]),
+        ],
+    ),
+    bootstrap_public=True,
+    extra_setup=_seed_npm_mock_state({
+        "whoami":  {"exit": 0, "stdout": "fake-user"},
+        "view":    {"exit": 1, "stdout": ""},
+        "publish": {"exit": 0, "stdout": "+ cctally@0.1.1-rc.1"},
+    }),
+    run=_run_release_with_npm("prerelease --bump patch"),
+    expected_exit=0,
+    stdout_substr="phase 5: npm publish (tag=next)",
+    stderr_substr="",
+    npm_invocations=(
+        "view cctally@0.1.1-rc.1 dist.tarball --json\n"
+        "whoami\n"
+        "publish --tag next\n"
+        "view cctally@0.1.1-rc.1 dist.tarball --json\n"
+    ),
+)
+
+
+# 29. phase5-already-published: `npm view` returns a registry URL on the
+# first probe → `_release_phase_npm_done` returns True → short-circuit
+# (no whoami, no publish, no second view).
+_add(
+    name="phase5-already-published",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=_seed_npm_mock_state({
+        "whoami":  {"exit": 0, "stdout": "fake-user"},
+        "view":    {"exit": 0,
+                    "stdout":
+                    '"https://registry.npmjs.org/cctally/-/cctally-0.1.1.tgz"'},
+        "publish": {"exit": 0, "stdout": "+ cctally@0.1.1"},
+    }),
+    run=_run_release_with_npm("patch"),
+    expected_exit=0,
+    stdout_substr="already on npm — skipping",
+    stderr_substr="",
+    npm_invocations=(
+        "view cctally@0.1.1 dist.tarball --json\n"
+    ),
+)
+
+
+# 30. phase5-no-auth: `npm whoami` exits 1 → auth fallback (stderr message,
+# returns 0). No publish call, no post-publish view.
+_add(
+    name="phase5-no-auth",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=_seed_npm_mock_state({
+        "whoami":  {"exit": 1, "stdout": ""},
+        "view":    {"exit": 1, "stdout": ""},
+        "publish": {"exit": 0, "stdout": ""},
+    }),
+    run=_run_release_with_npm("patch"),
+    expected_exit=0,
+    stdout_substr="phase 5: npm publish",
+    stderr_substr="npm not authenticated",
+    npm_invocations=(
+        "view cctally@0.1.1 dist.tarball --json\n"
+        "whoami\n"
+    ),
+)
+
+
+# 31. phase5-publish-fails: `npm publish` exits 1 → cmd_release returns 3.
+# No post-publish view (publish failure short-circuits).
+_add(
+    name="phase5-publish-fails",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=_seed_npm_mock_state({
+        "whoami":  {"exit": 0, "stdout": "fake-user"},
+        "view":    {"exit": 1, "stdout": ""},
+        "publish": {"exit": 1, "stdout": ""},
+    }),
+    run=_run_release_with_npm("patch"),
+    expected_exit=3,
+    stdout_substr="",
+    stderr_substr="",
+    npm_invocations=(
+        "view cctally@0.1.1 dist.tarball --json\n"
+        "whoami\n"
+        "publish --tag latest\n"
+    ),
+)
+
+
+# 32. phase5-skip-flag: `--skip-npm` short-circuits Phase 5 entirely.
+# No npm calls of any kind; release returns 0. We don't seed an
+# npm-mock-state file — the binary should never be invoked at all.
+# Empty `golden-npm-invocations.txt` would catch any stray call:
+# the scaffold's default fake-npm behavior writes to the log on
+# every invocation regardless of state-file presence.
+_add(
+    name="phase5-skip-flag",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    run=_run_release_with_npm("patch --skip-npm"),
+    expected_exit=0,
+    stdout_substr="phase 5: npm skipped (--skip-npm)",
+    stderr_substr="",
+    npm_invocations="",
+)
+
+
 # ---------------------------------------------------------------------------
 # Build.
 # ---------------------------------------------------------------------------
@@ -1516,6 +1716,7 @@ def build(out_root: Path) -> None:
             ("body_equal", "golden-body-equal.txt"),
             ("gh_argv", "golden-gh-argv.txt"),
             ("package_json", "golden-package-json.json"),
+            ("npm_invocations", "golden-npm-invocations.txt"),
         ):
             p = d / fname
             value = sc.get(key)

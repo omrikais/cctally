@@ -37,4 +37,9 @@ fi
 if [ -f "$work/gh-argv.log" ]; then
   cp "$work/gh-argv.log" "$work/_artifacts/gh-argv.log"
 fi
+if [ -f "$work/npm-invocations.log" ]; then
+  cp "$work/npm-invocations.log" "$work/_artifacts/npm-invocations.log"
+else
+  : > "$work/_artifacts/npm-invocations.log"
+fi
 exit "$rc"

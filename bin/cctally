@@ -987,6 +987,59 @@ def _release_discover_public_clone(args: argparse.Namespace) -> pathlib.Path:
     sys.exit(2)
 
 
+def _release_discover_brew_clone(
+    args: argparse.Namespace,
+) -> pathlib.Path | None:
+    """Resolve the brew tap clone path. Returns ``None`` if unconfigured.
+
+    Priority chain (mirrors :func:`_release_discover_public_clone`):
+      1. ``--brew-clone <path>`` flag.
+      2. ``git config --get release.brewClone``.
+      3. ``$APP_DIR/release-brew-clone-path`` plain-text marker file.
+
+    Unlike :func:`_release_discover_public_clone` (which exits 2 when
+    none of the sources resolve), this returns ``None`` — Phase 6 is a
+    graceful skip, not a hard refusal, since release channels are
+    added incrementally and not every operator has a brew tap clone
+    on hand.
+    """
+    if getattr(args, "brew_clone", None):
+        return pathlib.Path(args.brew_clone).expanduser()
+
+    cfg = subprocess.run(
+        ["git", "config", "--get", "release.brewClone"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if cfg.returncode == 0 and cfg.stdout.strip():
+        return pathlib.Path(cfg.stdout.strip()).expanduser()
+
+    marker = APP_DIR / "release-brew-clone-path"
+    if marker.exists():
+        path_str = marker.read_text(encoding="utf-8").strip()
+        if path_str:
+            return pathlib.Path(path_str).expanduser()
+
+    return None
+
+
+def _release_phase_brew_done(
+    version: str, brew_clone: pathlib.Path
+) -> bool:
+    """Phase 6 done iff ``Formula/cctally.rb`` already references ``vX.Y.Z``.
+
+    The render carries ``/v<version>.tar.gz`` in the ``url`` line — that
+    substring is the version fingerprint. Returns ``False`` when the
+    formula file is missing, so first-cut renders run the phase.
+    """
+    formula = brew_clone / "Formula" / "cctally.rb"
+    if not formula.exists():
+        return False
+    text = formula.read_text(encoding="utf-8")
+    return f"/v{version}.tar.gz" in text
+
+
 def _release_phase_mirror_done(
     version: str, public_clone: pathlib.Path
 ) -> bool:

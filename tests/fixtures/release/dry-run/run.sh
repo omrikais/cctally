@@ -36,6 +36,11 @@ fi
 if [ -f "$work/gh-argv.log" ]; then
   cp "$work/gh-argv.log" "$work/_artifacts/gh-argv.log"
 fi
+if [ -f "$work/npm-invocations.log" ]; then
+  cp "$work/npm-invocations.log" "$work/_artifacts/npm-invocations.log"
+else
+  : > "$work/_artifacts/npm-invocations.log"
+fi
 tag_count=$(git tag -l | grep -E '^v[0-9]' | wc -l | tr -d " ")
 if [ "$tag_count" != "0" ]; then
   echo "ASSERT_FAIL: dry-run created tags ($tag_count)" >&2

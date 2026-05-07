@@ -59,6 +59,46 @@ exit 0
 CCTALLY_FAKE_GH_EOF
 chmod +x "$work/fake-bin/gh"
 
+# Fake `npm` binary: pre-empts the host's real `npm` (which may be
+# installed and authenticated on dev machines, in which case Phase 5
+# would attempt a real publish). Default behavior simulates "npm not
+# authenticated" — `whoami` exits 1, which routes Phase 5 down its
+# auth-fallback branch and returns 0. Batch 6 scenarios that exercise
+# the actual publish flow override this by writing their own
+# `npm-mock-state.json` and pointing NPM_MOCK_STATE_FILE at it.
+cat > "$work/fake-bin/npm" <<'CCTALLY_FAKE_NPM_EOF'
+#!/usr/bin/env bash
+# Argv recording (one line per invocation).
+LOG="${NPM_MOCK_LOG_FILE:-$work/npm-invocations.log}"
+printf '%s
+' "$*" >> "$LOG" 2>/dev/null || true
+
+# Optional: read responses from a state file (used by Batch 6 scenarios).
+STATE="${NPM_MOCK_STATE_FILE:-}"
+if [ -n "$STATE" ] && [ -f "$STATE" ]; then
+  SUB="${1:-}"
+  case "$SUB" in
+    whoami)  KEY=whoami ;;
+    view)    KEY=view ;;
+    publish) KEY=publish ;;
+    *) echo "fake-npm: unknown subcommand: $SUB" >&2; exit 1 ;;
+  esac
+  EXIT=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get(sys.argv[2],{}).get('exit',0))" "$STATE" "$KEY" 2>/dev/null || echo 0)
+  STDOUT=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get(sys.argv[2],{}).get('stdout',''))" "$STATE" "$KEY" 2>/dev/null || echo "")
+  if [ -n "$STDOUT" ]; then printf '%s
+' "$STDOUT"; fi
+  exit "$EXIT"
+fi
+
+# Default: simulate "not authenticated" so Phase 5 hits the auth
+# fallback and returns 0.
+case "${1:-}" in
+  whoami) exit 1 ;;
+  *)      exit 0 ;;
+esac
+CCTALLY_FAKE_NPM_EOF
+chmod +x "$work/fake-bin/npm"
+
 # Public bare + working clone. Init bare first; clone or wire origin so
 # the public/ working dir's `origin` points at public.git/.
 git init -q --bare --initial-branch=main "$work/public.git" 2>/dev/null \
