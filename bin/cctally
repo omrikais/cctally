@@ -639,14 +639,18 @@ def _release_run_phase_stamp(
     )
 
     # Co-stamp package.json (npm channel; Phase 5 reads this version field).
-    # Guarded by `.exists()` so fixture replays for old scenarios pre-dating
-    # the npm channel still pass — they have no package.json to stamp.
-    if PACKAGE_JSON_PATH.exists():
-        pj_old = PACKAGE_JSON_PATH.read_text(encoding="utf-8")
+    # Resolve relative to CHANGELOG_PATH.parent (the repo being stamped) so
+    # tests that monkeypatch CHANGELOG_PATH to a temp repo automatically
+    # see the correct (absent) package.json there. Guarded by `.exists()`
+    # so fixture replays for old scenarios pre-dating the npm channel
+    # still pass — they have no package.json to stamp.
+    package_json_path = CHANGELOG_PATH.parent / "package.json"
+    if package_json_path.exists():
+        pj_old = package_json_path.read_text(encoding="utf-8")
         pj_new = _release_stamp_package_json(pj_old, version)
-        PACKAGE_JSON_PATH.write_text(pj_new, encoding="utf-8")
+        package_json_path.write_text(pj_new, encoding="utf-8")
         subprocess.check_call(
-            ["git", "add", PACKAGE_JSON_PATH.name],
+            ["git", "add", package_json_path.name],
             cwd=str(CHANGELOG_PATH.parent),
         )
 
@@ -664,7 +668,7 @@ def _release_run_phase_stamp(
     )
     expected_staged = (
         ["CHANGELOG.md", "package.json"]
-        if PACKAGE_JSON_PATH.exists()
+        if package_json_path.exists()
         else ["CHANGELOG.md"]
     )
     if staged != expected_staged:
