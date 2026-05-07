@@ -182,6 +182,22 @@ def _release_read_latest_release_version() -> tuple[str, str] | None:
     return (m.group(1), m.group(2))
 
 
+def _release_brew_archive_url(version: str) -> str:
+    """Return the GitHub auto-archive URL for a version tag.
+
+    Honors hidden env hook ``CCTALLY_RELEASE_BREW_ARCHIVE_URL`` for
+    fixture tests (the value is used verbatim; ``{version}`` placeholder
+    is substituted if present). Mirrors the ``CCTALLY_RELEASE_DATE_UTC``
+    and ``CCTALLY_AS_OF`` precedents — env-only, not in --help.
+    """
+    override = os.environ.get("CCTALLY_RELEASE_BREW_ARCHIVE_URL")
+    if override:
+        return override.replace("{version}", version)
+    return (
+        f"https://github.com/{PUBLIC_REPO}/archive/refs/tags/v{version}.tar.gz"
+    )
+
+
 def _release_parse_changelog(text: str) -> dict:
     """Parse CHANGELOG.md into {preamble, sections[]}.
 

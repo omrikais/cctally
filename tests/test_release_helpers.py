@@ -333,8 +333,9 @@ class TestPreflight:
         cctally._release_preflight_branch(allow_branch=None)
         cctally._release_preflight_clean_tree()
 
-    def test_preflight_wrong_branch_refuses(self, temp_git_repo):
+    def test_preflight_wrong_branch_refuses(self, temp_git_repo, monkeypatch):
         """On a feature branch with no --allow-branch override, exit 2."""
+        monkeypatch.setattr(cctally, "CHANGELOG_PATH", temp_git_repo / "CHANGELOG.md")
         subprocess.run(
             ["git", "checkout", "-q", "-b", "feature/foo"],
             check=True, cwd=temp_git_repo,
@@ -343,8 +344,9 @@ class TestPreflight:
             cctally._release_preflight_branch(allow_branch=None)
         assert e.value.code == 2
 
-    def test_preflight_allow_branch(self, temp_git_repo):
+    def test_preflight_allow_branch(self, temp_git_repo, monkeypatch):
         """--allow-branch matching the current branch lets the preflight pass."""
+        monkeypatch.setattr(cctally, "CHANGELOG_PATH", temp_git_repo / "CHANGELOG.md")
         subprocess.run(
             ["git", "checkout", "-q", "-b", "feature/foo"],
             check=True, cwd=temp_git_repo,
@@ -352,8 +354,9 @@ class TestPreflight:
         # No raise.
         cctally._release_preflight_branch(allow_branch="feature/foo")
 
-    def test_preflight_dirty_tree_refuses(self, temp_git_repo):
+    def test_preflight_dirty_tree_refuses(self, temp_git_repo, monkeypatch):
         """Untracked file in working tree: clean-tree preflight exits 2."""
+        monkeypatch.setattr(cctally, "CHANGELOG_PATH", temp_git_repo / "CHANGELOG.md")
         (temp_git_repo / "dirty.txt").write_text("x")
         with pytest.raises(SystemExit) as e:
             cctally._release_preflight_clean_tree()
