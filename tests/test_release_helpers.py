@@ -310,6 +310,11 @@ def temp_git_repo(tmp_path, monkeypatch):
     subprocess.run(["git", "config", "core.hooksPath", "/dev/null"], check=True, cwd=repo)
     subprocess.run(["git", "config", "user.email", "test@test"], check=True, cwd=repo)
     subprocess.run(["git", "config", "user.name", "Test"], check=True, cwd=repo)
+    # Disable any signing inherited from host global config so fixture
+    # commits + tags are deterministic regardless of the operator's
+    # `commit.gpgsign` / `tag.gpgsign` / `gpg.format` settings.
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], check=True, cwd=repo)
+    subprocess.run(["git", "config", "tag.gpgsign", "false"], check=True, cwd=repo)
     (repo / "CHANGELOG.md").write_text(
         "# Changelog\n\n## [Unreleased]\n\n### Added\n- Foo\n"
     )
@@ -404,3 +409,122 @@ class TestPhaseStamp:
             ).strip()
         )
         assert commit_count_after == commit_count_before
+
+
+class TestPhaseTag:
+    """Phase 2 — `_release_run_phase_tag` writes an annotated tag and pushes
+    commit + tag with `--follow-tags`. Idempotent (spec §5.1)."""
+
+    def _setup_with_stamp(self, repo, monkeypatch):
+        """Build a bare upstream, push main, run Phase 1. Returns upstream path."""
+        monkeypatch.setattr(cctally, "CHANGELOG_PATH", repo / "CHANGELOG.md")
+        monkeypatch.setenv("CCTALLY_RELEASE_DATE_UTC", "2026-05-07")
+        upstream = repo.parent / "upstream.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(upstream)], check=True
+        )
+        subprocess.run(
+            ["git", "remote", "add", "origin", str(upstream)],
+            check=True, cwd=repo,
+        )
+        subprocess.run(
+            ["git", "push", "-q", "origin", "main"], check=True, cwd=repo
+        )
+        cctally._release_run_phase_stamp(
+            "1.0.0", "origin", "cctally release minor", "minor"
+        )
+        return upstream
+
+    def test_tag_creates_annotated_tag(self, temp_git_repo, monkeypatch):
+        """Annotated tag landed locally and on remote; tag object is `tag`,
+        not a lightweight `commit`."""
+        upstream = self._setup_with_stamp(temp_git_repo, monkeypatch)
+        cctally._release_run_phase_tag("1.0.0", "origin")
+        out = subprocess.check_output(
+            ["git", "tag", "-l", "v1.0.0"], text=True, cwd=temp_git_repo,
+        ).strip()
+        assert out == "v1.0.0"
+        out = subprocess.check_output(
+            ["git", "ls-remote", "--tags", str(upstream), "refs/tags/v1.0.0"],
+            text=True,
+        ).strip()
+        assert "v1.0.0" in out
+        kind = subprocess.check_output(
+            ["git", "cat-file", "-t", "v1.0.0"],
+            text=True, cwd=temp_git_repo,
+        ).strip()
+        assert kind == "tag"
+
+    def test_tag_idempotent(self, temp_git_repo, monkeypatch):
+        """Second invocation no-ops: same local + remote state, no exception."""
+        self._setup_with_stamp(temp_git_repo, monkeypatch)
+        cctally._release_run_phase_tag("1.0.0", "origin")
+        # Second run is a no-op (signal-done short-circuit).
+        cctally._release_run_phase_tag("1.0.0", "origin")
+        out = subprocess.check_output(
+            ["git", "tag", "-l", "v1.0.0"], text=True, cwd=temp_git_repo,
+        ).strip()
+        assert out == "v1.0.0"
+
+    def test_body_canonical_three_sources_invariant(
+        self, temp_git_repo, monkeypatch
+    ):
+        """Spec §7.4: the canonical body string from Phase 1's commit
+        public-block MUST equal Phase 2's tag annotation body byte-for-byte.
+
+        We extract:
+          - commit body = `git log -1 --format=%B` minus the prefix up to
+            and including `--- public ---\\nchore(release): vX.Y.Z\\n\\n`,
+            stripping the trailing newline (the build_stamp_message wraps
+            the canonical body with one trailing `\\n`).
+          - tag body = `git cat-file tag` minus the headers + tag-name
+            line, stripping the trailing newline (the annotation file
+            also wraps the canonical body with one trailing `\\n`).
+        Both should equal `_release_canonical_body(...)` from the section
+        re-parsed from CHANGELOG.md.
+        """
+        self._setup_with_stamp(temp_git_repo, monkeypatch)
+        cctally._release_run_phase_tag("1.0.0", "origin")
+
+        # Source 0: the canonical body, recomputed from CHANGELOG.
+        text = (temp_git_repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        parsed = cctally._release_parse_changelog(text)
+        section = next(
+            s for s in parsed["sections"]
+            if s["heading"].lstrip().startswith("## [1.0.0]")
+        )
+        canonical = cctally._release_canonical_body(section)
+
+        # Source 1: commit message public block.
+        commit_msg = subprocess.check_output(
+            ["git", "log", "-1", "--format=%B"],
+            text=True, cwd=temp_git_repo,
+        )
+        delim = "--- public ---\nchore(release): v1.0.0\n\n"
+        assert delim in commit_msg
+        commit_body = commit_msg.split(delim, 1)[1]
+        # The build_stamp_message wraps the body with one trailing "\n".
+        # `git log` adds its own trailing "\n" too, so strip both.
+        commit_body = commit_body.rstrip("\n")
+
+        # Source 2: tag annotation body.
+        tag_obj = subprocess.check_output(
+            ["git", "cat-file", "tag", "v1.0.0"],
+            text=True, cwd=temp_git_repo,
+        )
+        # `git cat-file tag` output: headers, blank line, then the message.
+        # Message is: "v1.0.0\n\n<body>\n" (per Phase 2's annotation file).
+        _headers, _, message = tag_obj.partition("\n\n")
+        # Strip PGP signature block if present (defensive — fixture tags
+        # are unsigned so this is a no-op, but documents the contract).
+        pgp_marker = "-----BEGIN PGP SIGNATURE-----"
+        if pgp_marker in message:
+            message = message.split(pgp_marker, 1)[0].rstrip("\n")
+        # Drop the leading "v1.0.0\n\n"; strip trailing "\n".
+        first_line, _, tag_body = message.partition("\n\n")
+        assert first_line == "v1.0.0"
+        tag_body = tag_body.rstrip("\n")
+
+        assert commit_body == canonical
+        assert tag_body == canonical
+        assert commit_body == tag_body
