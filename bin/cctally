@@ -83,6 +83,7 @@ SETUP_HOOK_EVENTS = ("PostToolBatch", "Stop", "SubagentStop")
 # === Release automation (issue #24) ===
 
 CHANGELOG_PATH = pathlib.Path(__file__).resolve().parent.parent / "CHANGELOG.md"
+PACKAGE_JSON_PATH = pathlib.Path(__file__).resolve().parent.parent / "package.json"
 
 # Public mirror repo identity (the GitHub `<owner>/<repo>` slug). Used by
 # Phase 3 (mirror push), Phase 4 (`gh release create` / view), and the
@@ -331,6 +332,26 @@ def _release_stamp_changelog(text: str, version: str, today_utc: str) -> tuple[s
             out_parts.append("")
     new_text = "\n".join(out_parts).rstrip() + "\n"
     return (new_text, body)
+
+
+def _release_stamp_package_json(text: str, version: str) -> str:
+    """Rewrite package.json's `version` field to `version`.
+
+    Idempotent: stamping the same version twice yields byte-identical
+    output. Preserves two-space indent + trailing newline. Raises
+    ValueError if the file is malformed JSON or has no `version` field.
+    """
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"package.json: malformed JSON ({exc.msg})") from exc
+    if "version" not in data:
+        raise ValueError("package.json: missing 'version' field")
+    data["version"] = version
+    out = json.dumps(data, indent=2, ensure_ascii=False)
+    if not out.endswith("\n"):
+        out += "\n"
+    return out
 
 
 def _release_preflight_branch(allow_branch: str | None) -> None:

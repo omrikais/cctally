@@ -2,13 +2,17 @@
 # Fixture-based harness for bin/cctally-npm-shim.js.
 #
 # Each scenario lives at tests/fixtures/npm-shim/<name>/ with:
-#   golden-exit.txt           : single integer (required).
-#   golden-stdout-substr.txt  : substring assertion (required, may be empty).
-#   golden-stderr-substr.txt  : substring assertion (required, may be empty).
-#   env.sh                    : optional. Sourced before the run; can set
-#                               PLATFORM_OVERRIDE, FAKE_PYTHON_EXIT,
-#                               CCTALLY_PYTHON, REMOVE_SCRIPT, NO_PYTHON.
-#   args.txt                  : optional. Single line of argv passed to the shim.
+#   golden-exit.txt               : single integer (required).
+#   golden-stdout-substr.txt      : substring assertion (required, may be empty).
+#   golden-stderr-substr.txt      : substring assertion (required, may be empty).
+#   golden-stdout-not-substr.txt  : optional. If non-empty, stdout MUST NOT
+#                                   contain this substring.
+#   golden-stderr-not-substr.txt  : optional. If non-empty, stderr MUST NOT
+#                                   contain this substring.
+#   env.sh                        : optional. Sourced before the run; can set
+#                                   PLATFORM_OVERRIDE, FAKE_PYTHON_EXIT,
+#                                   CCTALLY_PYTHON, REMOVE_SCRIPT, NO_PYTHON.
+#   args.txt                      : optional. Single line of argv passed to the shim.
 #
 # A scratch dir per scenario contains:
 #   bin/cctally-npm-shim.js   : copy of the real shim under test.
@@ -35,7 +39,6 @@ if [ -z "$NODE_BIN" ]; then
     echo "FAIL: node not found on PATH; install Node.js to run this harness" >&2
     exit 1
 fi
-NODE_DIR=$(dirname "$NODE_BIN")
 
 SCRATCH_DIR=$(mktemp -d -t cctally-npm-shim-XXXXXX)
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
@@ -52,6 +55,14 @@ for dir in "${scenario_dirs[@]}"; do
     expected_exit=$(cat "$dir/golden-exit.txt" | tr -d '\n')
     expected_stdout=$(cat "$dir/golden-stdout-substr.txt")
     expected_stderr=$(cat "$dir/golden-stderr-substr.txt")
+    expected_not_stdout=""
+    expected_not_stderr=""
+    if [ -f "$dir/golden-stdout-not-substr.txt" ]; then
+        expected_not_stdout=$(cat "$dir/golden-stdout-not-substr.txt")
+    fi
+    if [ -f "$dir/golden-stderr-not-substr.txt" ]; then
+        expected_not_stderr=$(cat "$dir/golden-stderr-not-substr.txt")
+    fi
 
     work="$SCRATCH_DIR/$name"
     mkdir -p "$work/bin" "$work/PATH"
@@ -91,15 +102,32 @@ EOF
 
     stdout_file="$work/_stdout.txt"
     stderr_file="$work/_stderr.txt"
-    # NODE_DIR is appended to PATH so `node` resolves from the host install
-    # (e.g. /opt/homebrew/bin on macOS). $work/PATH comes first so the fake
-    # python3 still wins lookup.
+    # We invoke node by absolute path ($NODE_BIN) instead of putting its
+    # directory on PATH. Two reasons:
+    #   1. The shim's python3 lookup walks PATH; if NODE_DIR happened to
+    #      contain a python3 (e.g. /opt/homebrew/bin on macOS), the
+    #      NO_PYTHON=1 scenario would silently satisfy the lookup with
+    #      that python3 instead of exercising the ENOENT branch.
+    #   2. /usr/bin and /bin are kept on PATH only for the harness's
+    #      shell-internal needs (none today, but a future scenario knob
+    #      may want them); python3 resolution comes from $work/PATH or
+    #      fails to find python3 entirely.
+    #
+    # When NO_PYTHON=1 we deliberately exclude /usr/bin and /bin from the
+    # child PATH so the system python3 (/usr/bin/python3 on macOS)
+    # doesn't satisfy the shim's lookup and short-circuit the ENOENT
+    # branch we want to exercise.
+    if [ "$NO_PYTHON" = "1" ]; then
+        child_path="$work/PATH"
+    else
+        child_path="$work/PATH:/usr/bin:/bin"
+    fi
     env -i \
         HOME="$HOME" \
-        PATH="$work/PATH:/usr/bin:/bin:$NODE_DIR" \
+        PATH="$child_path" \
         ${CCTALLY_PYTHON:+CCTALLY_PYTHON="$CCTALLY_PYTHON"} \
         ${PLATFORM_OVERRIDE:+CCTALLY_NPM_SHIM_TEST_PLATFORM="$PLATFORM_OVERRIDE"} \
-        node "$work/bin/cctally-npm-shim.js" "${args[@]}" \
+        "$NODE_BIN" "$work/bin/cctally-npm-shim.js" "${args[@]}" \
         > "$stdout_file" 2> "$stderr_file"
     actual_exit=$?
 
@@ -114,8 +142,14 @@ EOF
     if [ -n "$expected_stdout" ] && ! grep -qF "$expected_stdout" <<<"$actual_stdout"; then
         fail=1; msg="${msg:+$msg; }stdout missing '$expected_stdout'"
     fi
+    if [ -n "$expected_not_stdout" ] && grep -qF "$expected_not_stdout" <<<"$actual_stdout"; then
+        fail=1; msg="${msg:+$msg; }stdout unexpectedly contains '$expected_not_stdout'"
+    fi
     if [ -n "$expected_stderr" ] && ! grep -qF "$expected_stderr" <<<"$actual_stderr"; then
         fail=1; msg="${msg:+$msg; }stderr missing '$expected_stderr'"
+    fi
+    if [ -n "$expected_not_stderr" ] && grep -qF "$expected_not_stderr" <<<"$actual_stderr"; then
+        fail=1; msg="${msg:+$msg; }stderr unexpectedly contains '$expected_not_stderr'"
     fi
 
     if [ "$fail" = "1" ]; then
