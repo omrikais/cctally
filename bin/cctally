@@ -638,6 +638,18 @@ def _release_run_phase_stamp(
         cwd=str(CHANGELOG_PATH.parent),
     )
 
+    # Co-stamp package.json (npm channel; Phase 5 reads this version field).
+    # Guarded by `.exists()` so fixture replays for old scenarios pre-dating
+    # the npm channel still pass — they have no package.json to stamp.
+    if PACKAGE_JSON_PATH.exists():
+        pj_old = PACKAGE_JSON_PATH.read_text(encoding="utf-8")
+        pj_new = _release_stamp_package_json(pj_old, version)
+        PACKAGE_JSON_PATH.write_text(pj_new, encoding="utf-8")
+        subprocess.check_call(
+            ["git", "add", PACKAGE_JSON_PATH.name],
+            cwd=str(CHANGELOG_PATH.parent),
+        )
+
     # Trailer staging guard: refuse if anything else is staged. Defensive
     # — preflight should have caught a dirty index, but operators can race
     # `git add` between preflight and stamp.
@@ -650,15 +662,21 @@ def _release_run_phase_stamp(
         .strip()
         .splitlines()
     )
-    if staged != ["CHANGELOG.md"]:
+    expected_staged = (
+        ["CHANGELOG.md", "package.json"]
+        if PACKAGE_JSON_PATH.exists()
+        else ["CHANGELOG.md"]
+    )
+    if staged != expected_staged:
         print(
-            "release: stamp aborted; expected only CHANGELOG.md staged, "
+            f"release: stamp aborted; expected only {expected_staged} staged, "
             f"got {staged}",
             file=sys.stderr,
         )
+        recover_paths = " ".join(expected_staged)
         print(
             "release: to recover, run `git reset HEAD` and "
-            "`git checkout -- CHANGELOG.md`",
+            f"`git checkout -- {recover_paths}`",
             file=sys.stderr,
         )
         sys.exit(3)
