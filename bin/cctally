@@ -23601,6 +23601,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip Phase 5 (npm publish). Idempotent: re-running --resume without it picks the channel back up.",
     )
+    p_release.add_argument(
+        "--brew-clone",
+        default=None,
+        help="Override brew tap discovery (default: git config 'release.brewClone' or marker file)",
+    )
+    p_release.add_argument(
+        "--skip-brew",
+        action="store_true",
+        help="Skip Phase 6 (brew formula bump). Idempotent: re-running --resume without it picks the channel back up.",
+    )
     p_release.set_defaults(func=cmd_release)
 
     # ---- hook-tick (internal — hidden from --help, see onboarding spec §3) ----
