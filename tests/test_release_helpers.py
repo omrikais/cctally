@@ -239,3 +239,55 @@ class TestStampChangelog:
         # All preserved
         assert "- New" in new_text
         assert "- Old" in new_text
+
+
+class TestStampChangelogIdempotency:
+    def test_double_stamp_preserves_blank_line_count(self):
+        text = """# Changelog
+
+## [Unreleased]
+
+### Added
+- First entry
+"""
+        once, _ = cctally._release_stamp_changelog(text, "1.0.0", "2026-05-07")
+        # Re-prime [Unreleased] for a second stamp
+        text2 = once.replace(
+            "## [Unreleased]\n",
+            "## [Unreleased]\n\n### Fixed\n- F1\n",
+            1,
+        )
+        twice, _ = cctally._release_stamp_changelog(text2, "1.1.0", "2026-05-08")
+        # Count blank lines between preamble line "# Changelog" and the first "## [...]"
+        # Should be exactly one blank line (matching the original input convention).
+        idx_h = twice.index("# Changelog\n")
+        idx_first_section = twice.index("\n## [")  # first section heading
+        gap = twice[idx_h + len("# Changelog\n"):idx_first_section + 1]  # +1 to include the leading \n of the heading line
+        # Strip the leading newline of the heading line; the slice between is the inter-block whitespace.
+        # Expect exactly one blank line: the gap should be exactly "\n" (one newline = one blank line between content lines)
+        assert gap == "\n", f"expected single blank line between preamble and first section, got {gap!r}"
+
+    def test_real_changelog_round_trip_blank_line_stable(self):
+        """Stamp twice on a synthetic CHANGELOG matching the project's structure; assert no monotonic drift."""
+        text = """# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com).
+
+## [Unreleased]
+
+### Added
+- A
+"""
+        n1, _ = cctally._release_stamp_changelog(text, "1.0.0", "2026-05-07")
+        n2_prime = n1.replace("## [Unreleased]\n", "## [Unreleased]\n\n### Added\n- B\n", 1)
+        n2, _ = cctally._release_stamp_changelog(n2_prime, "1.1.0", "2026-05-08")
+        # The number of newlines BEFORE the FIRST section heading should be the same in n1 and n2
+        # (i.e., no monotonic drift across stamps)
+        def newlines_before_first_section(s):
+            idx = s.index("\n## [")
+            # Count consecutive trailing \n in s[:idx+1]
+            return len(s[:idx + 1]) - len(s[:idx + 1].rstrip("\n"))
+        assert newlines_before_first_section(n1) == newlines_before_first_section(n2), \
+            f"blank-line drift: stamp 1 had {newlines_before_first_section(n1)} newlines, stamp 2 had {newlines_before_first_section(n2)}"

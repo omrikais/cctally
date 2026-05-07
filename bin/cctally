@@ -177,10 +177,11 @@ def _release_read_latest_release_version() -> tuple[str, str] | None:
 def _release_parse_changelog(text: str) -> dict:
     """Parse CHANGELOG.md into {preamble, sections[]}.
 
-    Each section: {heading, subsections[], raw_body_after_heading}
+    Each section: {heading, subsections[]}
     Each subsection: {heading, bullets[]}
     Bullets preserve continuation lines (multi-line bullet blocks stay intact).
-    Code-fenced blocks suppress heading detection.
+    Bullet markers recognized: "- " and "* " only (not "+ ").
+    Code-fenced blocks suppress heading detection; fences recognized: ``` only (not ~~~).
     """
     lines = text.splitlines(keepends=False)
     preamble: list[str] = []
@@ -291,8 +292,12 @@ def _release_stamp_changelog(text: str, version: str, today_utc: str) -> tuple[s
     # Insert new section after Unreleased
     sections.insert(1, new_section)
 
-    # Serialize
-    out_parts = [parsed["preamble"], ""]
+    # Serialize. rstrip trailing newlines from preamble so re-stamping is
+    # idempotent on the preamble→first-section gap: splitlines() leaves a
+    # trailing empty-string element when the preamble ends in a blank line,
+    # which combined with the explicit "" separator below would add one
+    # extra blank line on every round-trip.
+    out_parts = [parsed["preamble"].rstrip("\n"), ""]
     for sec in sections:
         out_parts.append(sec["heading"])
         out_parts.append("")
