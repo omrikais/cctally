@@ -173,6 +173,136 @@ def _release_read_latest_release_version() -> tuple[str, str] | None:
         return None
     return (m.group(1), m.group(2))
 
+
+def _release_parse_changelog(text: str) -> dict:
+    """Parse CHANGELOG.md into {preamble, sections[]}.
+
+    Each section: {heading, subsections[], raw_body_after_heading}
+    Each subsection: {heading, bullets[]}
+    Bullets preserve continuation lines (multi-line bullet blocks stay intact).
+    Code-fenced blocks suppress heading detection.
+    """
+    lines = text.splitlines(keepends=False)
+    preamble: list[str] = []
+    sections: list[dict] = []
+    cur_section: dict | None = None
+    cur_subsection: dict | None = None
+    cur_bullet_lines: list[str] = []
+    in_fence = False
+
+    def _flush_bullet():
+        nonlocal cur_bullet_lines
+        if cur_bullet_lines and cur_subsection is not None:
+            cur_subsection["bullets"].append("\n".join(cur_bullet_lines))
+            cur_bullet_lines = []
+
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            cur_bullet_lines.append(line) if cur_bullet_lines else None
+            continue
+
+        if not in_fence and line.startswith("## "):
+            _flush_bullet()
+            cur_subsection = None
+            cur_section = {"heading": line, "subsections": []}
+            sections.append(cur_section)
+            continue
+
+        if not in_fence and line.startswith("### ") and cur_section is not None:
+            _flush_bullet()
+            cur_subsection = {"heading": line, "bullets": []}
+            cur_section["subsections"].append(cur_subsection)
+            continue
+
+        if cur_section is None:
+            preamble.append(line)
+            continue
+
+        # Bullet detection: "- " or "* " at start of line (not in fence)
+        if not in_fence and (line.startswith("- ") or line.startswith("* ")):
+            _flush_bullet()
+            cur_bullet_lines = [line]
+            continue
+
+        # Continuation of current bullet (indented or empty within block)
+        if cur_bullet_lines and (line.startswith("  ") or line.startswith("\t") or in_fence):
+            cur_bullet_lines.append(line)
+            continue
+
+        # Blank line ends the current bullet
+        if line.strip() == "":
+            _flush_bullet()
+            continue
+
+    _flush_bullet()
+    return {"preamble": "\n".join(preamble), "sections": sections}
+
+
+def _release_canonical_body(section: dict) -> str:
+    """Serialize a parsed section's subsections + bullets to canonical body string.
+
+    Used identically by:
+      - public block of stamp commit
+      - tag annotation body
+      - GH Release --notes-file content
+
+    Format (spec §6.4): subsection headers + bullets, blank line between
+    subsections, no trailing newline.
+    """
+    blocks: list[str] = []
+    for sub in section["subsections"]:
+        if not sub["bullets"]:
+            continue
+        block_lines = [sub["heading"], *sub["bullets"]]
+        blocks.append("\n".join(block_lines))
+    return "\n\n".join(blocks)
+
+
+def _release_stamp_changelog(text: str, version: str, today_utc: str) -> tuple[str, str]:
+    """Stamp [Unreleased] entries into a new [version] section.
+
+    Returns (new_changelog_text, canonical_body_string).
+    Raises ValueError on empty [Unreleased].
+    """
+    parsed = _release_parse_changelog(text)
+    sections = parsed["sections"]
+    if not sections or sections[0]["heading"].strip() != "## [Unreleased]":
+        raise ValueError("CHANGELOG.md must start with '## [Unreleased]' section")
+    unreleased = sections[0]
+    non_empty = [s for s in unreleased["subsections"] if s["bullets"]]
+    if not non_empty:
+        raise ValueError("[Unreleased] is empty; nothing to release")
+
+    # Build new section as a parsed-section-shaped dict for canonical body extraction
+    new_section = {
+        "heading": f"## [{version}] - {today_utc}",
+        "subsections": [
+            {"heading": s["heading"], "bullets": list(s["bullets"])}
+            for s in non_empty
+        ],
+    }
+    body = _release_canonical_body(new_section)
+
+    # Reset Unreleased: drop subsections, keep only heading
+    unreleased["subsections"] = []
+
+    # Insert new section after Unreleased
+    sections.insert(1, new_section)
+
+    # Serialize
+    out_parts = [parsed["preamble"], ""]
+    for sec in sections:
+        out_parts.append(sec["heading"])
+        out_parts.append("")
+        for sub in sec["subsections"]:
+            out_parts.append(sub["heading"])
+            out_parts.extend(sub["bullets"])
+            out_parts.append("")
+    new_text = "\n".join(out_parts).rstrip() + "\n"
+    return (new_text, body)
+
 # Files to scan when detecting the legacy status-line snippet (Section 5).
 LEGACY_STATUSLINE_PATHS = (
     pathlib.Path.home() / ".claude" / "statusline-command.sh",
