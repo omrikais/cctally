@@ -1552,6 +1552,19 @@ def cmd_release(args: argparse.Namespace) -> int:
     if rc != 0:
         return rc
 
+    # Phase 5 — npm publish (auth-fallback returns 0 to keep the release
+    # "published" from phases 1-4's perspective). `--skip-npm` is the
+    # operator escape hatch for ad-hoc cuts; idempotent — re-running
+    # `--resume` without it picks Phase 5 back up.
+    if args.skip_npm:
+        print("phase 5: npm skipped (--skip-npm)")
+    else:
+        is_prerelease = "-" in next_v
+        dist_tag = "next" if is_prerelease else "latest"
+        rc = _release_run_phase_npm(next_v, public_clone, dist_tag=dist_tag)
+        if rc != 0:
+            return rc
+
     print(f"\nrelease v{next_v} published")
     return 0
 
