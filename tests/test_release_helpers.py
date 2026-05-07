@@ -2,6 +2,7 @@
 import argparse
 import importlib.machinery
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -674,3 +675,67 @@ class TestPhaseMirrorDoneSignal:
         # No `git remote add origin` — `git remote get-url origin` will
         # exit non-zero, which the helper traps as "not done."
         assert cctally._release_phase_mirror_done("1.0.0", public) is False
+
+
+class TestPhaseGh:
+    """Phase 4 — `_release_run_phase_gh` issues `gh release create` with
+    an auth-fallback path that returns 0 (don't fail the whole release;
+    spec §9.2). Fake `gh` is PATH-injected and records argv to a logfile
+    so we can assert on the exact command shape."""
+
+    def _make_fake_gh(self, tmp_path, exit_code=0, status_exit=0):
+        """Create a PATH-injected fake `gh` that records argv to a logfile.
+
+        `auth status` and `api ...` calls return `status_exit` (controls
+        the auth probe outcome). Anything else (i.e. `release create` and
+        `release view`) returns `exit_code`. Returning the bin dir + log
+        path lets the caller monkeypatch PATH and read argv.
+        """
+        bin_dir = tmp_path / "fake-bin"
+        bin_dir.mkdir()
+        log = tmp_path / "gh-argv.log"
+        script = bin_dir / "gh"
+        script.write_text(
+            f"""#!/usr/bin/env bash
+echo "$@" >> {log}
+if [[ "$1" == "auth" && "$2" == "status" ]]; then exit {status_exit}; fi
+if [[ "$1" == "api" ]]; then exit {status_exit}; fi
+if [[ "$1" == "release" && "$2" == "view" ]]; then exit 1; fi
+exit {exit_code}
+"""
+        )
+        script.chmod(0o755)
+        return bin_dir, log
+
+    def test_gh_happy_path(self, tmp_path, monkeypatch):
+        """Auth probe passes, `gh release create` returns 0 → helper
+        returns 0 and invokes `release create v1.0.0 --repo
+        omrikais/cctally` with a notes file."""
+        bin_dir, log = self._make_fake_gh(tmp_path)
+        monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+        rc = cctally._release_run_phase_gh("1.0.0", body="### Added\n- Foo")
+        assert rc == 0
+        argv_log = log.read_text()
+        assert "release create v1.0.0" in argv_log
+        assert "--repo omrikais/cctally" in argv_log
+
+    def test_gh_auth_fallback(self, tmp_path, monkeypatch, capsys):
+        """Auth probe fails (gh auth status / gh api both non-zero) →
+        helper returns 0 (don't fail) and prints a copy-pasteable
+        `gh release create` command for the operator."""
+        bin_dir, log = self._make_fake_gh(tmp_path, status_exit=1)
+        monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+        rc = cctally._release_run_phase_gh("1.0.0", body="### Added\n- Foo")
+        assert rc == 0  # Don't fail the whole release.
+        out = capsys.readouterr().out
+        assert "skipped" in out.lower() or "manual" in out.lower()
+        assert "gh release create v1.0.0" in out
+
+    def test_gh_prerelease_flag(self, tmp_path, monkeypatch):
+        """A version containing `-` (e.g. `1.0.0-rc.1`) emits
+        `--prerelease` to `gh release create`."""
+        bin_dir, log = self._make_fake_gh(tmp_path)
+        monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+        cctally._release_run_phase_gh("1.0.0-rc.1", body="### Added\n- X")
+        argv_log = log.read_text()
+        assert "--prerelease" in argv_log

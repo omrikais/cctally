@@ -39,6 +39,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import tempfile
 import textwrap
 import time
 import traceback
@@ -994,6 +995,169 @@ def _release_run_phase_mirror(
     print(f"release: mirror ✓ (v{version} propagated)")
 
 
+def _release_phase_gh_done(version: str) -> bool:
+    """Phase-4 read-only signal: ``gh release view vX.Y.Z`` returns 0.
+
+    Read-only — issues a `gh release view` against the public repo and
+    treats exit 0 as "release exists." Suppresses stderr/stdout because
+    the call is purely a probe; the operator-visible state is recorded
+    in ``_release_run_phase_gh``'s own logging. A never-authed operator
+    sees this return False (gh exits non-zero on auth error), the helper
+    falls through to its own auth probe, and the fallback path prints a
+    copy-pasteable command — same UX whether the release simply doesn't
+    exist yet or whether gh can't see it.
+    """
+    rc = subprocess.call(
+        ["gh", "release", "view", f"v{version}", "--repo", "omrikais/cctally"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return rc == 0
+
+
+def _release_print_gh_fallback(version: str, body: str) -> None:
+    """Print a copy-pasteable ``gh release create`` command (spec §9.2).
+
+    Used when the auth probe fails. Body is embedded via a
+    ``<(cat <<'EOF' ... EOF)`` heredoc so the operator can paste the
+    block directly into a shell with no escaping. Returning the operator
+    to a known-good state means ``release v{version} published except
+    GH Release; phase 4 awaits manual completion`` — phases 1-3 already
+    landed, so the release IS published from the public mirror's
+    perspective; only the GitHub Releases UI surface is incomplete.
+    """
+    prerelease = " --prerelease" if "-" in version else ""
+    print(f"release: gh release ⚠ skipped (no auth for omrikais/cctally)")
+    print()
+    print("Run this manually to publish the GitHub Release:")
+    print()
+    print(f"  gh release create v{version} \\")
+    print(f"    --repo omrikais/cctally \\")
+    print(f"    --title v{version} \\")
+    print(f"    --notes-file <(cat <<'EOF'")
+    print(body)
+    print("EOF")
+    print(f"){prerelease}")
+    print()
+    print(
+        "(or after running 'gh auth login', re-run "
+        "'cctally release --resume' to complete this phase.)"
+    )
+    print()
+    print(
+        f"release v{version} published except GH Release; "
+        "phase 4 awaits manual completion"
+    )
+
+
+def _release_run_phase_gh(version: str, body: str) -> int:
+    """Phase 4 — ``gh release create`` with auth fallback (spec §9.2).
+
+    Returns:
+      - ``0`` on successful publish OR auth-fallback (don't fail the
+        whole release on missing gh auth — phases 1-3 already succeeded;
+        Phase 4 is polish).
+      - ``3`` on hard failure of ``gh release create`` after auth was
+        confirmed OK (network glitch, server-side rejection, etc.); the
+        operator can address it then re-run ``cctally release --resume``.
+
+    Idempotent: ``_release_phase_gh_done`` short-circuits when the
+    release already exists. The body is passed in (not re-fetched here);
+    the caller is responsible for extracting it from CHANGELOG so the
+    body-canonical-three-sources invariant (spec §7.4) is preserved
+    across phases 1, 2, and 4.
+
+    Auth-mismatch semantics (spec §9.3): if ``gh release view`` finds
+    an existing release whose body differs from the current CHANGELOG
+    section, treat the existing as authoritative — no ``gh release
+    edit`` rewrite. Body divergence after the fact is a separate
+    concern that warrants explicit operator action.
+    """
+    if _release_phase_gh_done(version):
+        url = f"https://github.com/omrikais/cctally/releases/tag/v{version}"
+        print(f"release: gh release ✓ (already published — {url})")
+        return 0
+
+    print("release: gh release")
+
+    # Auth probe — both must succeed for the operator to be able to
+    # write to the public repo.
+    auth_status_ok = (
+        subprocess.call(
+            ["gh", "auth", "status", "--hostname", "github.com"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        == 0
+    )
+    repo_access_ok = (
+        subprocess.call(
+            ["gh", "api", "repos/omrikais/cctally"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        == 0
+    )
+    if not (auth_status_ok and repo_access_ok):
+        _release_print_gh_fallback(version, body)
+        return 0
+
+    # Happy path. Notes go through a tmpfile to dodge shell escaping.
+    notes_file = pathlib.Path(tempfile.gettempdir()) / (
+        f"release-notes-v{version}-{os.getpid()}.md"
+    )
+    notes_file.write_text(body, encoding="utf-8")
+    try:
+        cmd = [
+            "gh", "release", "create", f"v{version}",
+            "--repo", "omrikais/cctally",
+            "--title", f"v{version}",
+            "--notes-file", str(notes_file),
+        ]
+        if "-" in version:
+            cmd.append("--prerelease")
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            print(
+                f"release: gh release create failed (exit {rc}); "
+                "--resume to retry",
+                file=sys.stderr,
+            )
+            return 3
+    finally:
+        notes_file.unlink(missing_ok=True)
+
+    url = f"https://github.com/omrikais/cctally/releases/tag/v{version}"
+    print(f"release: gh release ✓ ({url})")
+    return 0
+
+
+def _release_extract_body_from_changelog(version: str) -> str:
+    """Re-read the canonical body for ``version`` from CHANGELOG.md.
+
+    Same parse + canonicalize path as Phases 1 and 2 (spec §7.4 — the
+    body-canonical-three-sources invariant). Refuses with exit 3 if
+    the section isn't found; ``--resume`` is the recovery once the
+    operator re-stamps.
+    """
+    text = CHANGELOG_PATH.read_text(encoding="utf-8")
+    parsed = _release_parse_changelog(text)
+    section = next(
+        (
+            s for s in parsed["sections"]
+            if s["heading"].startswith(f"## [{version}]")
+        ),
+        None,
+    )
+    if section is None:
+        print(
+            f"release: cannot find [{version}] section in CHANGELOG.md",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+    return _release_canonical_body(section)
+
+
 def cmd_release(args: argparse.Namespace) -> int:
     """Issue #24 — release automation entry point.
 
@@ -1075,8 +1239,13 @@ def cmd_release(args: argparse.Namespace) -> int:
     # Phase 3 — mirror push (replay → push branch → push tag).
     public_clone = _release_discover_public_clone(args)
     _release_run_phase_mirror(next_v, public_clone, args.remote)
-    # Phase 4 stub — landed in Task 9.
-    print("release: phase 4 stub")
+    # Phase 4 — gh release create (auth-fallback returns 0 to keep the
+    # release "published" from phases 1-3's perspective; spec §9.2).
+    body = _release_extract_body_from_changelog(next_v)
+    rc = _release_run_phase_gh(next_v, body)
+    if rc != 0:
+        return rc
+    print(f"\nrelease v{next_v} published")
     return 0
 
 
