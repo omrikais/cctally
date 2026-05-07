@@ -394,7 +394,9 @@ def _release_preflight_tag_clobber(version: str, remote: str) -> None:
         sys.exit(2)
     try:
         out = subprocess.check_output(
-            ["git", "ls-remote", "--tags", remote, f"refs/tags/{tag}"], text=True
+            ["git", "ls-remote", "--tags", remote, f"refs/tags/{tag}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
         ).strip()
         if out:
             print(
@@ -484,7 +486,12 @@ def cmd_release(args: argparse.Namespace) -> int:
 def _release_dry_run(
     args: argparse.Namespace, current_v: str | None, next_v: str
 ) -> int:
-    """Print what the release would do; mutate nothing (spec §10.2)."""
+    """Print what the release would do; mutate nothing (spec §10.2).
+
+    Returns 0 on a clean dry-run; 2 if the stamp itself would refuse
+    (missing CHANGELOG or empty [Unreleased]). Refusal paths print a
+    `(would refuse: ...)` line before returning so the operator sees why.
+    """
     today = (
         os.environ.get("CCTALLY_RELEASE_DATE_UTC")
         or dt.datetime.now(dt.timezone.utc).date().isoformat()
@@ -577,7 +584,6 @@ LEGACY_STATUSLINE_PATHS = (
     pathlib.Path.home() / ".claude" / "scripts" / "statusline.sh",
 )
 LEGACY_STATUSLINE_NEEDLE = "cctally record-usage"
-__version__ = "1.0.0"
 
 DB_PATH = APP_DIR / "stats.db"
 CACHE_DB_PATH = APP_DIR / "cache.db"
@@ -20820,6 +20826,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--version",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="Print cctally version (from CHANGELOG.md latest release header) and exit",
     )
     sub = p.add_subparsers(
