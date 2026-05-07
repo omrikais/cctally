@@ -1223,6 +1223,44 @@ SCENARIOS.append((
 ))
 
 
+# 27. skip-chain-refuse-dry-run: same setup as -refuse, but run.sh adds
+# --dry-run → ⚠ REFUSE block renders, but exit 0 (no enforcement).
+# Pins the spec §6.4 + commit f5bc2ad ordering: dry-run short-circuits
+# BEFORE the refuse gate so preflight's `_run_mirror_dry_run` probe
+# doesn't add `dry_run_failed` alongside `long_skip_chain_with_fix_subject`
+# for the same root cause. Regression for the "two red_flags, one root
+# cause" UX bug.
+SCENARIOS.append((
+    "skip-chain-refuse-dry-run",
+    'mkdir -p docs\n'
+    + ''.join(
+        f'echo "skip{i}" > docs/s{i}.md\n'
+        f'git add docs/s{i}.md\n'
+        + _commit_msg_heredoc(
+            f"chore: skip {i}\n\nPublic-Skip: true\n",
+            sentinel=f"CCTALLY_SKIP_{i}_MSG_EOF",
+        )
+        for i in range(1, 17)
+    )
+    + 'echo "pub" > docs/p.md\n'
+      'git add docs/p.md\n'
+    + _commit_msg_heredoc(
+        "fix: thing\n"
+        "\n"
+        "--- public ---\n"
+        "fix: thing\n",
+        sentinel="CCTALLY_PUB_MSG_EOF",
+    ),
+    0, "ACCUMULATED-DIFF MISMATCH", "",
+    None,  # no public commit landed — dry-run is non-mutating
+    # run.sh: invoke with --dry-run on a refuse-condition repo. The ⚠
+    # block still renders to stdout (substring check above), but the
+    # refuse gate must NOT fire (exit 0). Without --accept-skip-mismatch.
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes '
+    '--dry-run\n',
+))
+
+
 def build(out_root: Path) -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     for (

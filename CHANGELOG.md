@@ -80,3 +80,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer the recommended path but **remains fully supported** as an opt-in
   alternative documented in `docs/commands/record-usage.md`.
 - `docs/installation.md` rewritten around `cctally setup`.
+
+### Fixed
+- Skip-chain metrics now preserve the chain across clean `--no-ff`
+  merges, matching the mirror's auto-skip-clean-merges behavior. A
+  `--- public ---` block on a clean merge previously flushed the
+  accumulated chain in metrics (while the mirror kept accumulating),
+  letting a later `fix:` publish bypass the warn/refuse guard.
