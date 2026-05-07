@@ -29,6 +29,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
@@ -1038,6 +1039,29 @@ def _release_phase_brew_done(
         return False
     text = formula.read_text(encoding="utf-8")
     return f"/v{version}.tar.gz" in text
+
+
+def _release_compute_brew_sha256(version: str) -> str:
+    """Download the GH archive tarball for ``version`` and return sha256.
+
+    URL is resolved through :func:`_release_brew_archive_url` (Task 0),
+    which honors the ``CCTALLY_RELEASE_BREW_ARCHIVE_URL`` env hook for
+    fixture tests. Mirrors the ``CCTALLY_RELEASE_DATE_UTC`` precedent —
+    env-only, not surfaced in --help.
+
+    The 30-second timeout is sized for the GH auto-archive endpoint —
+    its initial response can lag a few seconds while the tarball is
+    materialized server-side. Failures bubble up as ``urllib.error``
+    or ``socket.timeout`` to the caller (Phase 6), where they surface
+    as a non-zero return that ``--resume`` can retry.
+    """
+    url = _release_brew_archive_url(version)
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "cctally-release"}
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = resp.read()
+    return hashlib.sha256(data).hexdigest()
 
 
 def _release_phase_mirror_done(
