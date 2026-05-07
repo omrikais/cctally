@@ -892,3 +892,72 @@ class TestResume:
         # `already published`.
         assert "already published" not in out
         assert "release v1.0.0 published" in out
+
+    def test_resume_already_published_with_missing_clone_short_circuits(
+        self, monkeypatch, capsys
+    ):
+        """Spec §5.5 — fully-published-but-clone-missing path. The operator's
+        public-clone configuration is gone (laptop restored from backup,
+        marker deleted, git config unset, no flag), but the gh release
+        already exists. `--resume` must trust the gh release as proof of
+        phase 3 completion and exit 0 with `already published`, NOT exit
+        2 from the discovery helper.
+        """
+        self._stub_preflight_and_version(monkeypatch)
+        # Stamp + tag + gh: done. Discovery raises SystemExit(2).
+        monkeypatch.setattr(
+            cctally, "_release_phase_stamp_done", lambda v: (True, "abc1234")
+        )
+        monkeypatch.setattr(
+            cctally, "_release_phase_tag_done", lambda v, r: True
+        )
+
+        def _raise_exit(*a, **kw):
+            raise SystemExit(2)
+
+        monkeypatch.setattr(
+            cctally, "_release_discover_public_clone", _raise_exit
+        )
+        # Tripwire: mirror_done helper must NOT be reached (we trust gh).
+        called: list[str] = []
+        monkeypatch.setattr(
+            cctally,
+            "_release_phase_mirror_done",
+            lambda v, c: called.append("mirror_done") or True,
+        )
+        monkeypatch.setattr(cctally, "_release_phase_gh_done", lambda v: True)
+        # Tripwire: phase runners must NOT be called either.
+        monkeypatch.setattr(
+            cctally,
+            "_release_run_phase_stamp",
+            lambda *a, **kw: called.append("stamp") or "deadbeef",
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_run_phase_tag",
+            lambda *a, **kw: called.append("tag"),
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_run_phase_mirror",
+            lambda *a, **kw: called.append("mirror"),
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_run_phase_gh",
+            lambda *a, **kw: called.append("gh") or 0,
+        )
+
+        rc = cctally.cmd_release(self._make_resume_args())
+        captured = capsys.readouterr()
+        assert rc == 0
+        # mirror_done helper short-circuited under SystemExit, phase
+        # runners untouched.
+        assert called == [], (
+            f"unexpected calls on already-done resume w/ missing clone: {called}"
+        )
+        assert "release v1.0.0 already published" in captured.out
+        # Operator-visible diagnostic surfaced on stderr explaining the
+        # trust-gh fallback path.
+        assert "public clone not discoverable" in captured.err
+        assert "trusting gh release existence" in captured.err

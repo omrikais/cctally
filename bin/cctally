@@ -84,6 +84,12 @@ SETUP_HOOK_EVENTS = ("PostToolBatch", "Stop", "SubagentStop")
 
 CHANGELOG_PATH = pathlib.Path(__file__).resolve().parent.parent / "CHANGELOG.md"
 
+# Public mirror repo identity (the GitHub `<owner>/<repo>` slug). Used by
+# Phase 3 (mirror push), Phase 4 (`gh release create` / view), and the
+# fallback printout. Distinct from `.mirror-allowlist`, which classifies
+# paths by visibility — this is the publish target.
+PUBLIC_REPO = "omrikais/cctally"
+
 _SEMVER_NUM = r'(?:0|[1-9]\d*)'
 RELEASE_HEADER_RE = re.compile(
     rf'^## \[({_SEMVER_NUM}\.{_SEMVER_NUM}\.{_SEMVER_NUM}'
@@ -1008,7 +1014,7 @@ def _release_phase_gh_done(version: str) -> bool:
     exist yet or whether gh can't see it.
     """
     rc = subprocess.call(
-        ["gh", "release", "view", f"v{version}", "--repo", "omrikais/cctally"],
+        ["gh", "release", "view", f"v{version}", "--repo", PUBLIC_REPO],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -1018,26 +1024,53 @@ def _release_phase_gh_done(version: str) -> bool:
 def _release_print_gh_fallback(version: str, body: str) -> None:
     """Print a copy-pasteable ``gh release create`` command (spec §9.2).
 
-    Used when the auth probe fails. Body is embedded via a
-    ``<(cat <<'EOF' ... EOF)`` heredoc so the operator can paste the
-    block directly into a shell with no escaping. Returning the operator
-    to a known-good state means ``release v{version} published except
-    GH Release; phase 4 awaits manual completion`` — phases 1-3 already
-    landed, so the release IS published from the public mirror's
-    perspective; only the GitHub Releases UI surface is incomplete.
+    Used when the auth probe fails. Prints two commands: first writes the
+    notes body to ``/tmp/release-notes-vX.Y.Z.md`` via heredoc, then
+    invokes ``gh release create --notes-file <that path>``. Splitting the
+    body off into a tmpfile (vs. the original ``<(cat <<'EOF' ... EOF)``
+    process-substitution heredoc) keeps the operator from having to escape
+    backticks / dollar signs and makes diffing the notes easy if the
+    paste doesn't take.
+
+    The heredoc terminator is randomized per invocation
+    (``CCTALLY_EOF_<pid>``) so a body that happens to contain a bare
+    ``EOF`` line — common in CHANGELOG entries that quote shell snippets
+    — does NOT prematurely terminate the heredoc. If the operator's body
+    somehow contains a line matching the randomized terminator exactly,
+    they need to either edit the body or pick a different terminator
+    before pasting; we surface that constraint in the printout.
+
+    Returning the operator to a known-good state means ``release
+    v{version} published except GH Release; phase 4 awaits manual
+    completion`` — phases 1-3 already landed, so the release IS published
+    from the public mirror's perspective; only the GitHub Releases UI
+    surface is incomplete.
     """
-    prerelease = " --prerelease" if "-" in version else ""
-    print(f"release: gh release ⚠ skipped (no auth for omrikais/cctally)")
+    is_prerelease = "-" in version
+    terminator = f"CCTALLY_EOF_{os.getpid()}"
+    notes_path = f"/tmp/release-notes-v{version}.md"
+    print(f"release: gh release ⚠ skipped (no auth for {PUBLIC_REPO})")
     print()
     print("Run this manually to publish the GitHub Release:")
     print()
-    print(f"  gh release create v{version} \\")
-    print(f"    --repo omrikais/cctally \\")
-    print(f"    --title v{version} \\")
-    print(f"    --notes-file <(cat <<'EOF'")
+    print(f"  cat > {notes_path} <<'{terminator}'")
     print(body)
-    print("EOF")
-    print(f"){prerelease}")
+    print(f"  {terminator}")
+    print()
+    print(f"  gh release create v{version} \\")
+    print(f"    --repo {PUBLIC_REPO} \\")
+    print(f"    --title v{version} \\")
+    if is_prerelease:
+        print(f"    --notes-file {notes_path} \\")
+        print("    --prerelease")
+    else:
+        print(f"    --notes-file {notes_path}")
+    print()
+    print(
+        f"(If your CHANGELOG body contains a line that exactly matches the "
+        f"terminator '{terminator}', edit the body or change the terminator "
+        "before pasting.)"
+    )
     print()
     print(
         "(or after running 'gh auth login', re-run "
@@ -1074,7 +1107,7 @@ def _release_run_phase_gh(version: str, body: str) -> int:
     concern that warrants explicit operator action.
     """
     if _release_phase_gh_done(version):
-        url = f"https://github.com/omrikais/cctally/releases/tag/v{version}"
+        url = f"https://github.com/{PUBLIC_REPO}/releases/tag/v{version}"
         print(f"release: gh release ✓ (already published — {url})")
         return 0
 
@@ -1092,7 +1125,7 @@ def _release_run_phase_gh(version: str, body: str) -> int:
     )
     repo_access_ok = (
         subprocess.call(
-            ["gh", "api", "repos/omrikais/cctally"],
+            ["gh", "api", f"repos/{PUBLIC_REPO}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -1110,7 +1143,7 @@ def _release_run_phase_gh(version: str, body: str) -> int:
     try:
         cmd = [
             "gh", "release", "create", f"v{version}",
-            "--repo", "omrikais/cctally",
+            "--repo", PUBLIC_REPO,
             "--title", f"v{version}",
             "--notes-file", str(notes_file),
         ]
@@ -1127,7 +1160,7 @@ def _release_run_phase_gh(version: str, body: str) -> int:
     finally:
         notes_file.unlink(missing_ok=True)
 
-    url = f"https://github.com/omrikais/cctally/releases/tag/v{version}"
+    url = f"https://github.com/{PUBLIC_REPO}/releases/tag/v{version}"
     print(f"release: gh release ✓ ({url})")
     return 0
 
@@ -1227,19 +1260,42 @@ def cmd_release(args: argparse.Namespace) -> int:
     # `--resume`: if all four phase signals report done, exit 0
     # immediately with `already published` — don't call any phase
     # helper. The mirror signal needs the public clone path resolved
-    # first, but the discovery helper already exits 2 if no clone is
-    # configured (which is the right error UX even on a fully-done
-    # release: nothing to verify against). `--no-publish` resume
-    # skips the phase-3 / phase-4 portion of the gate.
+    # first; if the operator's local clone is gone (laptop restored
+    # from backup, marker deleted, etc.) but the gh release exists,
+    # we trust the gh release as proof that phase 3 must have
+    # succeeded earlier — phase 4 is the LAST phase, so its presence
+    # implies phase 3 landed. That's the only path where we accept a
+    # `mirror_done = True` without a successful probe. Partial-publish
+    # cases (`gh_done=False`) skip the discovery probe entirely and
+    # fall through to the phase loop, where discovery will surface
+    # exit 2 with the right error UX. `--no-publish` resume skips the
+    # phase-3 / phase-4 portion of the gate.
     if args.resume:
         stamp_done, _ = _release_phase_stamp_done(next_v)
         tag_done = _release_phase_tag_done(next_v, args.remote)
         if args.no_publish:
             all_done = stamp_done and tag_done
         else:
-            public_clone = _release_discover_public_clone(args)
-            mirror_done = _release_phase_mirror_done(next_v, public_clone)
             gh_done = _release_phase_gh_done(next_v)
+            if gh_done:
+                # gh release exists — phase 4 is the last phase, so
+                # phase 3 MUST have landed. Probe mirror as best-effort:
+                # success confirms; discovery failure trusts gh.
+                try:
+                    public_clone = _release_discover_public_clone(args)
+                    mirror_done = _release_phase_mirror_done(
+                        next_v, public_clone
+                    )
+                except SystemExit:
+                    print(
+                        f"release v{next_v}: public clone not discoverable "
+                        "for mirror probe; trusting gh release existence "
+                        "as proof of phase 3 completion",
+                        file=sys.stderr,
+                    )
+                    mirror_done = True
+            else:
+                mirror_done = False
             all_done = stamp_done and tag_done and mirror_done and gh_done
         if all_done:
             print(f"release v{next_v} already published")
@@ -1361,7 +1417,7 @@ def _release_dry_run(
     else:
         prerelease_flag = " --prerelease" if "-" in next_v else ""
         print("Would invoke:")
-        print(f"  gh release create v{next_v} --repo omrikais/cctally \\")
+        print(f"  gh release create v{next_v} --repo {PUBLIC_REPO} \\")
         print(
             f"    --title v{next_v} --notes-file <body>{prerelease_flag}"
         )
