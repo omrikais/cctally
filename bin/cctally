@@ -800,7 +800,7 @@ def _release_discover_public_clone(args: argparse.Namespace) -> pathlib.Path:
 
     Priority chain (highest first):
       1. ``--public-clone <path>`` flag.
-      2. ``git config --get release.public_clone``.
+      2. ``git config --get release.publicClone``.
       3. ``$APP_DIR/release-public-clone-path`` plain-text marker file.
 
     Each source is silently skipped when missing (unset config key, no
@@ -857,9 +857,11 @@ def _release_discover_public_clone(args: argparse.Namespace) -> pathlib.Path:
         if path.exists():
             return path.resolve()
 
+    marker_path = APP_DIR / "release-public-clone-path"
     print(
         "release: cannot discover public clone path; pass --public-clone "
-        "<path> or set 'release.publicClone' in git config",
+        "<path>, set 'release.publicClone' in git config, or write the "
+        f"path to {marker_path}",
         file=sys.stderr,
     )
     sys.exit(2)
@@ -1147,10 +1149,8 @@ def _release_dry_run(
     else:
         print("Would invoke (3 sub-steps):")
         print("  bin/cctally-mirror-public --yes <public-clone>")
-        print(f"  git -C <public-clone> push {args.remote} main")
-        print(
-            f"  git -C <public-clone> push {args.remote} refs/tags/v{next_v}"
-        )
+        print("  git -C <public-clone> push origin <current-branch>")
+        print(f"  git -C <public-clone> push origin refs/tags/v{next_v}")
     print()
     # Phase 4 — GitHub Release plan.
     print("Phase 4 — GitHub Release")
