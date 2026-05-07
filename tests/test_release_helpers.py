@@ -1,4 +1,5 @@
 """Tests for bin/cctally release-automation helpers (issue #24)."""
+import argparse
 import importlib.machinery
 import importlib.util
 import subprocess
@@ -595,3 +596,81 @@ class TestResumeSafety:
             text=True,
         ).strip()
         assert "v1.0.0" in out
+
+
+class TestPublicCloneDiscovery:
+    """Spec §9.1 — Public-clone path discovery: --public-clone > git config
+    > marker file. Each source silently skipped when missing; refuses
+    with exit 2 only when ALL three sources are absent."""
+
+    def test_flag_wins(self, temp_git_repo, tmp_path):
+        """--public-clone <path> is the highest priority source."""
+        public = tmp_path / "pub"
+        public.mkdir()
+        subprocess.run(["git", "init", "-q", str(public)], check=True)
+        args = argparse.Namespace(public_clone=str(public))
+        result = cctally._release_discover_public_clone(args)
+        assert result.resolve() == public.resolve()
+
+    def test_git_config_fallback(self, temp_git_repo, tmp_path):
+        """No flag → falls back to `git config release.publicClone`.
+
+        The key is camelCase (git 2.46+ rejects underscore-bearing
+        keys at write time). Lookup is case-insensitive on the
+        trailing variable.
+        """
+        public = tmp_path / "pub"
+        public.mkdir()
+        subprocess.run(["git", "init", "-q", str(public)], check=True)
+        subprocess.run(
+            ["git", "config", "release.publicClone", str(public)],
+            check=True, cwd=temp_git_repo,
+        )
+        args = argparse.Namespace(public_clone=None)
+        result = cctally._release_discover_public_clone(args)
+        assert result.resolve() == public.resolve()
+
+    def test_marker_file_fallback(
+        self, temp_git_repo, tmp_path, monkeypatch
+    ):
+        """No flag, no git-config key → falls back to APP_DIR marker file."""
+        public = tmp_path / "pub"
+        public.mkdir()
+        subprocess.run(["git", "init", "-q", str(public)], check=True)
+        marker_dir = tmp_path / "share-cctally"
+        marker_dir.mkdir()
+        marker = marker_dir / "release-public-clone-path"
+        marker.write_text(str(public) + "\n")
+        monkeypatch.setattr(cctally, "APP_DIR", marker_dir)
+        args = argparse.Namespace(public_clone=None)
+        result = cctally._release_discover_public_clone(args)
+        assert result.resolve() == public.resolve()
+
+    def test_no_discovery_refuses(
+        self, temp_git_repo, tmp_path, monkeypatch
+    ):
+        """All three sources absent → exit 2 with discovery-hint message."""
+        marker_dir = tmp_path / "share-cctally"
+        marker_dir.mkdir()
+        monkeypatch.setattr(cctally, "APP_DIR", marker_dir)
+        args = argparse.Namespace(public_clone=None)
+        with pytest.raises(SystemExit) as e:
+            cctally._release_discover_public_clone(args)
+        assert e.value.code == 2
+
+
+class TestPhaseMirrorDoneSignal:
+    """Spec §9.1 — `_release_phase_mirror_done` is read-only; returns
+    False on any subprocess failure (no origin remote, network glitch).
+    Non-error fall-through is what lets the caller idempotently re-run
+    the three sub-steps after a partial Phase 3 failure."""
+
+    def test_returns_false_when_no_origin_remote(self, tmp_path):
+        """A git repo without an `origin` remote can't have the tag on
+        public origin → done-signal is False (not raise)."""
+        public = tmp_path / "pub"
+        public.mkdir()
+        subprocess.run(["git", "init", "-q", str(public)], check=True)
+        # No `git remote add origin` — `git remote get-url origin` will
+        # exit non-zero, which the helper traps as "not done."
+        assert cctally._release_phase_mirror_done("1.0.0", public) is False
