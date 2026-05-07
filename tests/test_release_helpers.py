@@ -739,3 +739,156 @@ exit {exit_code}
         cctally._release_run_phase_gh("1.0.0-rc.1", body="### Added\n- X")
         argv_log = log.read_text()
         assert "--prerelease" in argv_log
+
+
+class TestResume:
+    """Spec §5.2/§5.5 — `cmd_release --resume` short-circuit. When all four
+    phase signals report done, exit 0 with `already published` and DO NOT
+    invoke any phase helper. When any signal is incomplete, fall through to
+    the phase loop. Harness coverage (Task 11+) does end-to-end; these
+    unit tests pin the short-circuit gate behavior in isolation."""
+
+    def _make_resume_args(self):
+        """Build a minimal argparse.Namespace for `cctally release --resume`."""
+        return argparse.Namespace(
+            kind=None,
+            resume=True,
+            bump=None,
+            prerelease_id=None,
+            no_publish=False,
+            dry_run=False,
+            allow_branch=None,
+            remote="origin",
+            public_clone=None,
+        )
+
+    def _stub_preflight_and_version(self, monkeypatch, version="1.0.0"):
+        """Monkeypatch preflights + version reader to no-ops. The short-
+        circuit gate runs after these, so they have to pass for the gate
+        to be exercised but their internals don't matter for the test."""
+        monkeypatch.setattr(
+            cctally, "_release_preflight_branch", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            cctally, "_release_preflight_clean_tree", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            cctally, "_release_preflight_up_to_date", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_read_latest_release_version",
+            lambda: (version, "2026-05-07"),
+        )
+
+    def test_resume_after_complete_already_published(
+        self, monkeypatch, capsys
+    ):
+        """All 4 phase signals report done → cmd_release exits 0 with the
+        `already published` message and NEVER calls a phase runner."""
+        self._stub_preflight_and_version(monkeypatch)
+        # All four signals: done.
+        monkeypatch.setattr(
+            cctally, "_release_phase_stamp_done", lambda v: (True, "abc1234")
+        )
+        monkeypatch.setattr(
+            cctally, "_release_phase_tag_done", lambda v, r: True
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_discover_public_clone",
+            lambda args: Path("/tmp/fake-public-clone"),
+        )
+        monkeypatch.setattr(
+            cctally, "_release_phase_mirror_done", lambda v, c: True
+        )
+        monkeypatch.setattr(cctally, "_release_phase_gh_done", lambda v: True)
+        # Tripwire: phase runners must NOT be called.
+        called: list[str] = []
+        monkeypatch.setattr(
+            cctally,
+            "_release_run_phase_stamp",
+            lambda *a, **kw: called.append("stamp") or "deadbeef",
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_run_phase_tag",
+            lambda *a, **kw: called.append("tag"),
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_run_phase_mirror",
+            lambda *a, **kw: called.append("mirror"),
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_run_phase_gh",
+            lambda *a, **kw: called.append("gh") or 0,
+        )
+
+        rc = cctally.cmd_release(self._make_resume_args())
+        assert rc == 0
+        assert called == [], f"phase runners called on already-done resume: {called}"
+        out = capsys.readouterr().out
+        assert "release v1.0.0 already published" in out
+
+    def test_resume_after_stamp_only(self, monkeypatch, capsys):
+        """Stamp landed but later phases incomplete → short-circuit must
+        NOT fire; cmd_release falls through to the phase loop. We stub
+        every phase runner to a counter so we can verify the loop ran
+        without exercising real git/gh state."""
+        self._stub_preflight_and_version(monkeypatch)
+        # Only stamp signal-done; tag/mirror/gh are not.
+        monkeypatch.setattr(
+            cctally, "_release_phase_stamp_done", lambda v: (True, "abc1234")
+        )
+        monkeypatch.setattr(
+            cctally, "_release_phase_tag_done", lambda v, r: False
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_discover_public_clone",
+            lambda args: Path("/tmp/fake-public-clone"),
+        )
+        monkeypatch.setattr(
+            cctally, "_release_phase_mirror_done", lambda v, c: False
+        )
+        monkeypatch.setattr(cctally, "_release_phase_gh_done", lambda v: False)
+        # Stub all four phase runners + body extractor.
+        called: list[str] = []
+        monkeypatch.setattr(
+            cctally,
+            "_release_run_phase_stamp",
+            lambda *a, **kw: called.append("stamp") or "deadbeef",
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_run_phase_tag",
+            lambda *a, **kw: called.append("tag"),
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_run_phase_mirror",
+            lambda *a, **kw: called.append("mirror"),
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_run_phase_gh",
+            lambda *a, **kw: called.append("gh") or 0,
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_extract_body_from_changelog",
+            lambda v: "### Added\n- Foo",
+        )
+
+        rc = cctally.cmd_release(self._make_resume_args())
+        assert rc == 0
+        # Phase loop ran (each helper short-circuits internally based on
+        # its own signal — the stubs simulate "do the work").
+        assert called == ["stamp", "tag", "mirror", "gh"]
+        out = capsys.readouterr().out
+        # Non-already-done resume: prints the published-line, NOT
+        # `already published`.
+        assert "already published" not in out
+        assert "release v1.0.0 published" in out

@@ -1223,28 +1223,60 @@ def cmd_release(args: argparse.Namespace) -> int:
     if args.dry_run:
         return _release_dry_run(args, current_v, next_v)
 
-    # Real flow — phases land progressively across Tasks 5–9.
+    # Resume-already-complete short-circuit (spec §5.5). Only when
+    # `--resume`: if all four phase signals report done, exit 0
+    # immediately with `already published` — don't call any phase
+    # helper. The mirror signal needs the public clone path resolved
+    # first, but the discovery helper already exits 2 if no clone is
+    # configured (which is the right error UX even on a fully-done
+    # release: nothing to verify against). `--no-publish` resume
+    # skips the phase-3 / phase-4 portion of the gate.
+    if args.resume:
+        stamp_done, _ = _release_phase_stamp_done(next_v)
+        tag_done = _release_phase_tag_done(next_v, args.remote)
+        if args.no_publish:
+            all_done = stamp_done and tag_done
+        else:
+            public_clone = _release_discover_public_clone(args)
+            mirror_done = _release_phase_mirror_done(next_v, public_clone)
+            gh_done = _release_phase_gh_done(next_v)
+            all_done = stamp_done and tag_done and mirror_done and gh_done
+        if all_done:
+            print(f"release v{next_v} already published")
+            return 0
+
+    # Real flow — phase-table style. Each helper carries its own
+    # signal-done check + short-circuit (spec §5.1), so cmd_release
+    # is just an ordered call sequence with no per-phase branching.
     invocation = f"cctally release {args.kind or '--resume'}"
     bump_kind = args.kind or "resume"
+
+    # Phase 1 — stamp.
     stamp_sha = _release_run_phase_stamp(
         next_v, args.remote, invocation, bump_kind
     )
+
+    # Phase 2 — tag.
     _release_run_phase_tag(next_v, args.remote, stamp_sha)
+
     if args.no_publish:
         print(
             f"release v{next_v} stamped + tagged; "
             "--no-publish set; phases 3-4 skipped"
         )
         return 0
+
     # Phase 3 — mirror push (replay → push branch → push tag).
     public_clone = _release_discover_public_clone(args)
     _release_run_phase_mirror(next_v, public_clone, args.remote)
+
     # Phase 4 — gh release create (auth-fallback returns 0 to keep the
     # release "published" from phases 1-3's perspective; spec §9.2).
     body = _release_extract_body_from_changelog(next_v)
     rc = _release_run_phase_gh(next_v, body)
     if rc != 0:
         return rc
+
     print(f"\nrelease v{next_v} published")
     return 0
 
