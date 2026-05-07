@@ -97,6 +97,17 @@ def _package_json_path() -> pathlib.Path:
     """
     return CHANGELOG_PATH.parent / "package.json"
 
+
+def _homebrew_template_path() -> pathlib.Path:
+    """Resolve the Homebrew formula template's path under the repo root.
+
+    Indirected through CHANGELOG_PATH for the same reason as
+    :func:`_package_json_path`: Phase 6 fixture tests monkeypatch
+    CHANGELOG_PATH to redirect into a fixture repo, and the template
+    must follow without a separate monkeypatch surface.
+    """
+    return CHANGELOG_PATH.parent / "homebrew" / "cctally.rb.template"
+
 # Public mirror repo identity (the GitHub `<owner>/<repo>` slug). Used by
 # Phase 3 (mirror push), Phase 4 (`gh release create` / view), and the
 # fallback printout. Distinct from `.mirror-allowlist`, which classifies
@@ -1458,6 +1469,108 @@ def _release_run_phase_npm(
             f"in 30s.",
             file=sys.stderr,
         )
+    return 0
+
+
+def _release_run_phase_brew(
+    version: str,
+    brew_clone: pathlib.Path | None,
+) -> int:
+    """Phase 6 — render ``Formula/cctally.rb`` and push to the brew tap.
+
+    Idempotent. Pre-releases are skipped at the cmd_release call site —
+    this function never runs for them.
+
+    Phase semantics:
+      - ``brew_clone is None`` — graceful skip (no error). Operator can
+        opt in later by setting ``release.brewClone`` in git config.
+      - Done-signal short-circuit — prints "already at vX.Y.Z" and
+        returns 0 when ``Formula/cctally.rb`` already references this
+        version (idempotency under ``--resume``).
+      - Dirty working tree — refuses with exit 2 and points the operator
+        at ``--resume``.
+      - Push failure — auth-fallback parity with Phases 4 and 5: prints
+        the exact recovery command and returns 0. Phases 1-5 already
+        succeeded, the release IS published from the user's
+        perspective; the brew tap is the third channel and treated as
+        polish.
+
+    Returns:
+      - ``0`` on success, graceful skip, idempotent short-circuit, OR
+        push fallback.
+      - ``2`` on dirty-working-tree refusal.
+    """
+    print("phase 6: brew formula bump")
+    if brew_clone is None:
+        print(
+            "  brew tap clone not configured. Set with:\n"
+            "    git config release.brewClone /path/to/homebrew-cctally\n"
+            "  Skipping phase 6 (no error).",
+            file=sys.stderr,
+        )
+        return 0
+    if _release_phase_brew_done(version, brew_clone):
+        print(f"  Formula/cctally.rb already at v{version} — skipping.")
+        return 0
+
+    # Refuse on dirty working tree — we're about to write the formula
+    # and commit; mixing operator-staged work into our commit is a
+    # footgun. Resume after the operator resolves.
+    status = subprocess.run(
+        ["git", "-C", str(brew_clone), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if status.stdout.strip():
+        print(
+            f"  brew clone has uncommitted changes:\n{status.stdout}\n"
+            "  Resolve and re-run `cctally release --resume`.",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"  computing sha256 of v{version} archive…")
+    sha = _release_compute_brew_sha256(version)
+
+    template = _homebrew_template_path().read_text(encoding="utf-8")
+    rendered = (
+        template
+        .replace("<<VERSION>>", version)
+        .replace("<<SHA256>>", sha)
+    )
+    formula_path = brew_clone / "Formula" / "cctally.rb"
+    formula_path.parent.mkdir(parents=True, exist_ok=True)
+    formula_path.write_text(rendered, encoding="utf-8")
+
+    subprocess.run(
+        ["git", "-C", str(brew_clone), "add", "Formula/cctally.rb"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(brew_clone), "commit", "-m",
+         f"chore(formula): cctally {version}"],
+        check=True,
+    )
+    # Tag is best-effort — re-running after a partial publish should
+    # not fail just because the tag already exists locally.
+    subprocess.run(
+        ["git", "-C", str(brew_clone), "tag", f"v{version}"],
+        check=False,
+    )
+    push = subprocess.run(
+        ["git", "-C", str(brew_clone), "push", "origin", "HEAD",
+         "--follow-tags"],
+        check=False,
+    )
+    if push.returncode != 0:
+        print(
+            f"\n  push failed. Manual recovery:\n"
+            f"    git -C {brew_clone} push origin HEAD --follow-tags\n",
+            file=sys.stderr,
+        )
+        return 0  # auth-fallback semantics; mirrors Phase 5.
+
     return 0
 
 
