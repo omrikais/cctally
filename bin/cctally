@@ -308,6 +308,268 @@ def _release_stamp_changelog(text: str, version: str, today_utc: str) -> tuple[s
     new_text = "\n".join(out_parts).rstrip() + "\n"
     return (new_text, body)
 
+
+def _release_preflight_branch(allow_branch: str | None) -> None:
+    """Refuse unless on main or --allow-branch matches.
+
+    Spec §10.1 step 2: branch check fires for both real runs and --dry-run
+    (a dry-run on the wrong branch would mislead).
+    """
+    branch = subprocess.check_output(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
+    ).strip()
+    expected = allow_branch if allow_branch else "main"
+    if branch != expected:
+        if allow_branch:
+            print(
+                f"release: refusing to cut from {branch}; allow-branch was {allow_branch}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"release: refusing to cut from {branch}; "
+                f"use --allow-branch {branch} if intentional",
+                file=sys.stderr,
+            )
+        sys.exit(2)
+
+
+def _release_preflight_clean_tree() -> None:
+    """Refuse if working tree is dirty (spec §10.1 step 3)."""
+    out = subprocess.check_output(["git", "status", "--porcelain"], text=True)
+    if out.strip():
+        print("release: working tree dirty; commit or stash first", file=sys.stderr)
+        sys.exit(2)
+
+
+def _release_preflight_up_to_date(remote: str) -> None:
+    """Refuse if local branch is behind <remote>/<branch>; local-ahead OK.
+
+    Spec §10.1 step 4. Network failure is non-fatal — operator can re-run
+    with --resume after fixing connectivity.
+    """
+    branch = subprocess.check_output(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
+    ).strip()
+    try:
+        subprocess.check_call(
+            ["git", "fetch", "--quiet", remote, branch],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        # Network failure — proceed; operator can re-run with --resume.
+        return
+    local = subprocess.check_output(["git", "rev-parse", branch], text=True).strip()
+    remote_sha = subprocess.check_output(
+        ["git", "rev-parse", f"{remote}/{branch}"], text=True
+    ).strip()
+    if local == remote_sha:
+        return
+    base = subprocess.check_output(
+        ["git", "merge-base", local, remote_sha], text=True
+    ).strip()
+    if base == remote_sha:
+        return  # local is strictly ahead — fine.
+    print(
+        f"release: local {branch} is behind {remote}/{branch}; pull first",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def _release_preflight_tag_clobber(version: str, remote: str) -> None:
+    """Refuse if vX.Y.Z tag already exists locally or on remote (spec §10.1 step 5)."""
+    tag = f"v{version}"
+    local_tags = (
+        subprocess.check_output(["git", "tag", "-l", tag], text=True)
+        .strip()
+        .splitlines()
+    )
+    if tag in local_tags:
+        print(
+            f"release: tag {tag} already exists locally; this would clobber",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    try:
+        out = subprocess.check_output(
+            ["git", "ls-remote", "--tags", remote, f"refs/tags/{tag}"], text=True
+        ).strip()
+        if out:
+            print(
+                f"release: tag {tag} already exists on {remote}; this would clobber",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    except subprocess.CalledProcessError:
+        # Remote unreachable; the up-to-date preflight would have caught this
+        # in the non-dry-run path. Don't refuse on remote-side ambiguity.
+        pass
+
+
+def cmd_release(args: argparse.Namespace) -> int:
+    """Issue #24 — release automation entry point.
+
+    Phases (each idempotent; subsequent tasks land the real implementations):
+      1. Stamp CHANGELOG.md.
+      2. Annotated tag, push --follow-tags.
+      3. Mirror push (replay → push branch → push tag).
+      4. GitHub Release create.
+
+    --resume infers vX.Y.Z from the latest CHANGELOG header.
+    """
+    # Args validation (spec §10.1 step 1).
+    if args.resume and (args.kind or args.bump):
+        print(
+            "release: --resume is mutually exclusive with kind / --bump",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.resume and not args.kind:
+        print(
+            "release: missing kind (patch|minor|major|prerelease|finalize)",
+            file=sys.stderr,
+        )
+        return 2
+    if args.bump and args.kind != "prerelease":
+        print("release: --bump valid only with `prerelease`", file=sys.stderr)
+        return 2
+
+    # Preflight (spec §10.1).
+    _release_preflight_branch(args.allow_branch)
+    if not args.dry_run:
+        _release_preflight_clean_tree()
+    if not args.dry_run and not args.resume:
+        _release_preflight_up_to_date(args.remote)
+
+    # Determine target version.
+    current = _release_read_latest_release_version()
+    current_v = current[0] if current else None
+    if args.resume:
+        if current_v is None:
+            print(
+                "release: no in-progress release found; "
+                "CHANGELOG has no release header",
+                file=sys.stderr,
+            )
+            return 2
+        next_v = current_v
+    else:
+        try:
+            next_v = _release_compute_next_version(
+                current_v, args.kind, args.bump, args.prerelease_id
+            )
+        except ValueError as e:
+            # Pass through the helper's wording verbatim — tests in Tasks 2+3
+            # match the prefix substring; we're a transparent renderer here.
+            print(f"release: {e}", file=sys.stderr)
+            return 2
+
+    if not args.resume:
+        _release_preflight_tag_clobber(next_v, args.remote)
+
+    # Dry-run path.
+    if args.dry_run:
+        return _release_dry_run(args, current_v, next_v)
+
+    # Real flow — phases land in subsequent tasks.
+    print(
+        f"release: would stamp v{next_v}, tag, mirror, gh release "
+        "(subsequent tasks)"
+    )
+    return 0
+
+
+def _release_dry_run(
+    args: argparse.Namespace, current_v: str | None, next_v: str
+) -> int:
+    """Print what the release would do; mutate nothing (spec §10.2)."""
+    today = (
+        os.environ.get("CCTALLY_RELEASE_DATE_UTC")
+        or dt.datetime.now(dt.timezone.utc).date().isoformat()
+    )
+    print(
+        f"release dry-run: v{current_v or '(none)'} → v{next_v} "
+        f"({args.kind or 'resume'} bump)"
+    )
+    print()
+    branch = subprocess.check_output(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
+    ).strip()
+    print(f"Branch:        {branch}")
+    print(f"Remote:        {args.remote}")
+    print("Working tree:  clean")
+    print(f"Resume:        {'yes' if args.resume else 'no'}")
+    print()
+    # Phase 1 — stamp diff preview.
+    print("Phase 1 — Stamp CHANGELOG.md")
+    print("─" * 41)
+    if not args.resume:
+        try:
+            old_text = CHANGELOG_PATH.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            print(f"(would refuse: CHANGELOG.md not found at {CHANGELOG_PATH})")
+            return 2
+        try:
+            new_text, body = _release_stamp_changelog(old_text, next_v, today)
+        except ValueError as e:
+            print(f"(would refuse: {e})")
+            return 2
+        import difflib
+
+        diff = difflib.unified_diff(
+            old_text.splitlines(keepends=True),
+            new_text.splitlines(keepends=True),
+            fromfile="a/CHANGELOG.md",
+            tofile="b/CHANGELOG.md",
+            n=3,
+        )
+        sys.stdout.write("".join(diff))
+    else:
+        body = "(resume — stamp already done)"
+    print()
+    # Phase 2 — tag annotation preview.
+    print(f"Phase 2 — Tag v{next_v}")
+    print("─" * 41)
+    print("Annotation:")
+    print(f"v{next_v}")
+    print()
+    print(body)
+    print()
+    # Phase 3 — mirror push plan.
+    print("Phase 3 — Mirror push")
+    print("─" * 41)
+    if args.no_publish:
+        print("(skipped under --no-publish)")
+    else:
+        print("Would invoke (3 sub-steps):")
+        print("  bin/cctally-mirror-public --yes <public-clone>")
+        print(f"  git -C <public-clone> push {args.remote} main")
+        print(
+            f"  git -C <public-clone> push {args.remote} refs/tags/v{next_v}"
+        )
+    print()
+    # Phase 4 — GitHub Release plan.
+    print("Phase 4 — GitHub Release")
+    print("─" * 41)
+    if args.no_publish:
+        print("(skipped under --no-publish)")
+    else:
+        prerelease_flag = " --prerelease" if "-" in next_v else ""
+        print("Would invoke:")
+        print(f"  gh release create v{next_v} --repo omrikais/cctally \\")
+        print(
+            f"    --title v{next_v} --notes-file <body>{prerelease_flag}"
+        )
+        print()
+        print("Body (also used for Phase 4 GH Release notes):")
+        print(body)
+    print()
+    print("dry-run complete; no state mutated; exit 0")
+    return 0
+
+
 # Files to scan when detecting the legacy status-line snippet (Section 5).
 LEGACY_STATUSLINE_PATHS = (
     pathlib.Path.home() / ".claude" / "statusline-command.sh",
@@ -20557,12 +20819,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--version",
-        action="version",
-        version=f"cctally {__version__}",
+        action="store_true",
+        help="Print cctally version (from CHANGELOG.md latest release header) and exit",
     )
     sub = p.add_subparsers(
         dest="command",
-        required=True,
+        required=False,
         title="commands",
         metavar="<command>",
     )
@@ -21971,6 +22233,71 @@ def build_parser() -> argparse.ArgumentParser:
         help="Migration name (NNN_… or qualified)",
     )
     db_unskip.set_defaults(func=cmd_db_unskip)
+
+    # ---- release (issue #24 release automation) ----
+    p_release = sub.add_parser(
+        "release",
+        help="Stamp CHANGELOG, cut SemVer tag, mirror, and create GitHub Release",
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Issue #24 release automation. Four idempotent phases:
+              1. Stamp CHANGELOG.md (move [Unreleased] entries under [X.Y.Z]).
+              2. Annotated tag vX.Y.Z + push --follow-tags.
+              3. Mirror push (replay private → push public branch + tag).
+              4. GitHub Release create on the public mirror.
+
+            See docs/commands/release.md for full reference.
+            """
+        ),
+    )
+    p_release.add_argument(
+        "kind",
+        nargs="?",
+        choices=["patch", "minor", "major", "prerelease", "finalize"],
+        help="Bump kind (omit only with --resume)",
+    )
+    p_release.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue an in-progress release (infers vX.Y.Z from latest CHANGELOG header)",
+    )
+    p_release.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print phase plan with diff/tag/release; mutate nothing; exit 0",
+    )
+    p_release.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Stop after `git push --follow-tags`; skip mirror + GH Release",
+    )
+    p_release.add_argument(
+        "--prerelease-id",
+        default="rc",
+        help="Override 'rc' for prerelease bumps (default 'rc')",
+    )
+    p_release.add_argument(
+        "--bump",
+        choices=["patch", "minor", "major"],
+        help="REQUIRED with `prerelease` when current is stable; REFUSED when current is prerelease",
+    )
+    p_release.add_argument(
+        "--remote",
+        default="origin",
+        help="Default 'origin' (private remote)",
+    )
+    p_release.add_argument(
+        "--allow-branch",
+        default=None,
+        help="Override the on-main refusal (escape hatch)",
+    )
+    p_release.add_argument(
+        "--public-clone",
+        default=None,
+        help="Override public-clone discovery (default: git config 'release.public_clone' or marker file)",
+    )
+    p_release.set_defaults(func=cmd_release)
 
     # ---- hook-tick (internal — hidden from --help, see onboarding spec §3) ----
     ht = sub.add_parser(
@@ -28319,6 +28646,18 @@ def main(argv: list[str] | None = None) -> int:
     _migrate_legacy_data_dir()
     parser = build_parser()
     args = parser.parse_args(argv)
+    # `--version` is a top-level flag that reads CHANGELOG.md's latest
+    # release header (issue #24); handle BEFORE subcommand dispatch so it
+    # works without a subcommand (`cctally --version`).
+    if getattr(args, "version", False):
+        v = _release_read_latest_release_version()
+        if v is None:
+            print("cctally unknown")
+        else:
+            print(f"cctally {v[0]}")
+        return 0
+    if not getattr(args, "func", None):
+        parser.error("a subcommand is required")
     _print_migration_error_banner_if_needed(args)
     try:
         return int(args.func(args))

@@ -1,6 +1,7 @@
 """Tests for bin/cctally release-automation helpers (issue #24)."""
 import importlib.machinery
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -291,3 +292,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
             return len(s[:idx + 1]) - len(s[:idx + 1].rstrip("\n"))
         assert newlines_before_first_section(n1) == newlines_before_first_section(n2), \
             f"blank-line drift: stamp 1 had {newlines_before_first_section(n1)} newlines, stamp 2 had {newlines_before_first_section(n2)}"
+
+
+@pytest.fixture
+def temp_git_repo(tmp_path, monkeypatch):
+    """Create a tmp git repo with one commit on `main`.
+
+    `core.hooksPath=/dev/null` skips this repo's pre-commit / commit-msg
+    hooks (we don't want the project's commit hooks running on a fixture
+    repo with synthetic content). `user.email`/`user.name` configured so
+    `git commit` works regardless of the host's global git identity.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+    subprocess.run(["git", "init", "-q", "-b", "main"], check=True, cwd=repo)
+    subprocess.run(["git", "config", "core.hooksPath", "/dev/null"], check=True, cwd=repo)
+    subprocess.run(["git", "config", "user.email", "test@test"], check=True, cwd=repo)
+    subprocess.run(["git", "config", "user.name", "Test"], check=True, cwd=repo)
+    (repo / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n- Foo\n"
+    )
+    subprocess.run(["git", "add", "."], check=True, cwd=repo)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], check=True, cwd=repo)
+    return repo
+
+
+class TestPreflight:
+    def test_preflight_clean_main(self, temp_git_repo, monkeypatch):
+        """Clean tree on main: branch + clean-tree preflights pass silently."""
+        monkeypatch.setattr(cctally, "CHANGELOG_PATH", temp_git_repo / "CHANGELOG.md")
+        # Run preflights directly — expect no exception.
+        cctally._release_preflight_branch(allow_branch=None)
+        cctally._release_preflight_clean_tree()
+
+    def test_preflight_wrong_branch_refuses(self, temp_git_repo):
+        """On a feature branch with no --allow-branch override, exit 2."""
+        subprocess.run(
+            ["git", "checkout", "-q", "-b", "feature/foo"],
+            check=True, cwd=temp_git_repo,
+        )
+        with pytest.raises(SystemExit) as e:
+            cctally._release_preflight_branch(allow_branch=None)
+        assert e.value.code == 2
+
+    def test_preflight_allow_branch(self, temp_git_repo):
+        """--allow-branch matching the current branch lets the preflight pass."""
+        subprocess.run(
+            ["git", "checkout", "-q", "-b", "feature/foo"],
+            check=True, cwd=temp_git_repo,
+        )
+        # No raise.
+        cctally._release_preflight_branch(allow_branch="feature/foo")
+
+    def test_preflight_dirty_tree_refuses(self, temp_git_repo):
+        """Untracked file in working tree: clean-tree preflight exits 2."""
+        (temp_git_repo / "dirty.txt").write_text("x")
+        with pytest.raises(SystemExit) as e:
+            cctally._release_preflight_clean_tree()
+        assert e.value.code == 2
