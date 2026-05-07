@@ -20493,13 +20493,29 @@ class _SetupSymlinkResult:
     detail: str = ""
 
 
+def _setup_resolve_symlink_source(repo_root: pathlib.Path, name: str) -> pathlib.Path:
+    """Resolve the symlink target for a given PATH-name.
+
+    For `cctally`, prefer `bin/cctally-npm-shim.js` when present (lets
+    the shim consult `CCTALLY_PYTHON` before invoking python3 — npm
+    install layout). Falls back to `bin/cctally` (the Python script)
+    when the shim is absent (source clones / brew install layout).
+    All other names map directly to `bin/<name>`.
+    """
+    if name == "cctally":
+        shim = repo_root / "bin" / "cctally-npm-shim.js"
+        if shim.exists():
+            return shim
+    return repo_root / "bin" / name
+
+
 def _setup_create_symlinks(
     repo_root: pathlib.Path, dst_dir: pathlib.Path, *, names: tuple[str, ...] = SETUP_SYMLINK_NAMES
 ) -> list[_SetupSymlinkResult]:
     dst_dir.mkdir(parents=True, exist_ok=True)
     results: list[_SetupSymlinkResult] = []
     for name in names:
-        src = repo_root / "bin" / name
+        src = _setup_resolve_symlink_source(repo_root, name)
         dst = dst_dir / name
         if not src.exists():
             results.append(_SetupSymlinkResult(name, "failed", f"source not found: {src}"))
@@ -20657,7 +20673,7 @@ def _setup_status(args: argparse.Namespace) -> int:
     sym_state = []
     for name in SETUP_SYMLINK_NAMES:
         dst = dst_dir / name
-        src = repo_root / "bin" / name
+        src = _setup_resolve_symlink_source(repo_root, name)
         if dst.is_symlink() and pathlib.Path(os.readlink(dst)) == src:
             sym_state.append((name, "ok"))
         elif dst.exists():
@@ -20768,7 +20784,7 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
                 target = pathlib.Path(os.readlink(dst))
             except OSError:
                 target = None
-            expected = repo_root / "bin" / name
+            expected = _setup_resolve_symlink_source(repo_root, name)
             if target == expected:
                 try:
                     dst.unlink()
@@ -20870,7 +20886,7 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
     sym_results = []
     for name in SETUP_SYMLINK_NAMES:
         dst = dst_dir / name
-        src = repo_root / "bin" / name
+        src = _setup_resolve_symlink_source(repo_root, name)
         if dst.is_symlink() and pathlib.Path(os.readlink(dst)) == src:
             sym_results.append((name, "already"))
         elif dst.exists() and not dst.is_symlink():
