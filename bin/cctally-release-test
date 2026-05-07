@@ -50,6 +50,11 @@ fail_count=0
 
 for dir in "$FIXTURES_DIR"/*/; do
     name=$(basename "$dir")
+    # Skip underscore-prefixed dirs (e.g. `_assets/` for shared
+    # tarball/binary fixtures consumed by Phase 5/6 scenarios).
+    case "$name" in
+        _*) continue ;;
+    esac
     expected_exit=$(cat "$dir/golden-exit.txt" | tr -d '\n')
     expected_stdout=$(cat "$dir/golden-stdout-substr.txt" | tr -d '\n')
     expected_stderr=$(cat "$dir/golden-stderr-substr.txt" | tr -d '\n')

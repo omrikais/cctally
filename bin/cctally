@@ -1136,6 +1136,35 @@ def _release_phase_gh_done(version: str) -> bool:
     return rc == 0
 
 
+def _release_phase_npm_done(version: str) -> bool:
+    """True iff ``cctally@<version>`` is already published on npm.
+
+    Probes via ``npm view cctally@<v> dist.tarball --json``. Returns
+    True when the command succeeds AND stdout is a JSON-quoted
+    registry.npmjs.org URL. False on any other condition (timeout,
+    npm not on PATH, version absent, etc.). Used as the idempotency
+    short-circuit for Phase 5 (parity with ``_release_phase_gh_done``).
+    """
+    try:
+        result = subprocess.run(
+            ["npm", "view", f"cctally@{version}", "dist.tarball", "--json"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    if result.returncode != 0:
+        return False
+    out = result.stdout.strip()
+    return (
+        out.startswith('"')
+        and out.endswith('"')
+        and "registry.npmjs.org" in out
+    )
+
+
 def _release_print_gh_fallback(version: str, body: str) -> None:
     """Print a copy-pasteable ``gh release create`` command (spec §9.2).
 

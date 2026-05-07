@@ -51,6 +51,9 @@ Scenario architecture (Task 12):
 from __future__ import annotations
 
 import argparse
+import pathlib
+import subprocess
+import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -488,6 +491,88 @@ def _run_commit_msg_hook(release_args: str) -> str:
         + _CAPTURE_ARTIFACTS
         + 'exit "$rc"\n'
     )
+
+
+# ---------------------------------------------------------------------------
+# Mock infrastructure for npm + brew tap (Batch 5 / Task 20).
+#
+# Used by Batch 6 (Phase 5 npm-publish scenarios) and Batches 7–8 (Phase 6
+# brew helpers + scenarios). These helpers emit:
+#
+#   _emit_fake_npm        : a fake `npm` shell script that consumes canned
+#                            JSON responses from a per-scenario state file
+#                            and logs every invocation to a per-scenario
+#                            log file. Goldens can assert on the log shape.
+#   _emit_fake_brew_tap   : a bare repo + working clone serving as a
+#                            stand-in for the homebrew-cctally tap remote.
+#
+# The shell-side analogs (fixture_init_fake_npm_path, fixture_seed_package_json)
+# live in bin/_lib-fixture-harness.sh — duplication is intentional, since
+# setup.sh runs at scenario-execution time, not builder time.
+# ---------------------------------------------------------------------------
+
+
+def _emit_fake_npm(scratch_path_dir: pathlib.Path) -> None:
+    """Write a fake `npm` shell script under `scratch_path_dir/npm`.
+
+    Reads canned responses from `<scratch>/npm-mock-state.json`:
+        {
+          "whoami": {"exit": 0, "stdout": "fake-user"},
+          "view":   {"exit": 0, "stdout": "\"https://registry.npmjs.org/cctally/-/cctally-1.0.1.tgz\""},
+          "publish":{"exit": 0, "stdout": "+ cctally@1.0.1"}
+        }
+    Logs every invocation to `<scratch>/npm-invocations.log` (one line:
+    "<subcmd> <args...>") so goldens can assert on call shape.
+    """
+    scratch_path_dir.mkdir(parents=True, exist_ok=True)
+    npm = scratch_path_dir / "npm"
+    npm.write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        set -uo pipefail
+        STATE="${NPM_MOCK_STATE_FILE:-$(dirname "$0")/../npm-mock-state.json}"
+        LOG="${NPM_MOCK_LOG_FILE:-$(dirname "$0")/../npm-invocations.log}"
+        printf '%s\\n' "$*" >> "$LOG"
+        SUB="$1"; shift || true
+        case "$SUB" in
+          whoami)  KEY=whoami ;;
+          view)    KEY=view   ;;
+          publish) KEY=publish ;;
+          *)       echo "fake-npm: unknown subcommand: $SUB" >&2; exit 1 ;;
+        esac
+        EXIT=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get(sys.argv[2],{}).get('exit',0))" "$STATE" "$KEY")
+        STDOUT=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get(sys.argv[2],{}).get('stdout',''))" "$STATE" "$KEY")
+        if [ -n "$STDOUT" ]; then printf '%s\\n' "$STDOUT"; fi
+        exit "$EXIT"
+    """))
+    npm.chmod(0o755)
+
+
+def _emit_fake_brew_tap(work: pathlib.Path) -> pathlib.Path:
+    """Initialize a bare repo + working clone under `work/` to serve
+    as a fake brew tap remote.
+
+    Returns the working-clone path. The bare repo is at
+    `<work>/homebrew-cctally.git`; the clone is at `<work>/homebrew-cctally/`.
+    Caller is responsible for setting `release.brewClone` git config on
+    the cctally-dev fake-repo.
+    """
+    bare = work / "homebrew-cctally.git"
+    clone = work / "homebrew-cctally"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+    subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True)
+    (clone / "Formula").mkdir()
+    (clone / "README.md").write_text("Tap for github.com/omrikais/cctally.\n")
+    subprocess.run(["git", "-C", str(clone), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(clone), "-c", "user.email=fake@test.local",
+         "-c", "user.name=Fake", "commit", "-q", "-m", "init"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(clone), "push", "-q", "origin", "HEAD"],
+        check=True,
+    )
+    return clone
 
 
 # ---------------------------------------------------------------------------
