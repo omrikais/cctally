@@ -1742,6 +1742,13 @@ def cmd_release(args: argparse.Namespace) -> int:
     if rc != 0:
         return rc
 
+    # Compute channel-publishing variables once. `is_prerelease` gates
+    # both Phase 5's npm dist-tag and Phase 6's run/skip decision; the
+    # `-` test holds because SemVer prereleases always carry a hyphen
+    # (e.g. `1.2.0-rc.1`). Done up-front so each phase reads cleanly.
+    is_prerelease = "-" in next_v
+    dist_tag = "next" if is_prerelease else "latest"
+
     # Phase 5 — npm publish (auth-fallback returns 0 to keep the release
     # "published" from phases 1-4's perspective). `--skip-npm` is the
     # operator escape hatch for ad-hoc cuts; idempotent — re-running
@@ -1749,9 +1756,20 @@ def cmd_release(args: argparse.Namespace) -> int:
     if args.skip_npm:
         print("phase 5: npm skipped (--skip-npm)")
     else:
-        is_prerelease = "-" in next_v
-        dist_tag = "next" if is_prerelease else "latest"
         rc = _release_run_phase_npm(next_v, public_clone, dist_tag=dist_tag)
+        if rc != 0:
+            return rc
+
+    # Phase 6 — brew formula bump (graceful skip when `release.brewClone`
+    # is unconfigured; pre-releases skipped categorically — Homebrew
+    # users track stable versions only). `--skip-brew` is the operator
+    # escape hatch; idempotent under `--resume`.
+    if args.skip_brew or is_prerelease:
+        suffix = " (pre-release)" if is_prerelease else ""
+        print(f"phase 6: brew skipped{suffix}")
+    else:
+        brew_clone = _release_discover_brew_clone(args)
+        rc = _release_run_phase_brew(next_v, brew_clone)
         if rc != 0:
             return rc
 

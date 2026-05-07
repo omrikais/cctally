@@ -764,6 +764,8 @@ class TestResume:
             remote="origin",
             public_clone=None,
             skip_npm=False,
+            brew_clone=None,
+            skip_brew=False,
         )
 
     def _stub_preflight_and_version(self, monkeypatch, version="1.0.0"):
