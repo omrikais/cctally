@@ -351,3 +351,56 @@ class TestPreflight:
         with pytest.raises(SystemExit) as e:
             cctally._release_preflight_clean_tree()
         assert e.value.code == 2
+
+
+class TestPhaseStamp:
+    """Phase 1 — `_release_run_phase_stamp` wires CHANGELOG rewrite + commit
+    behind an idempotent done-signal (spec §5.1)."""
+
+    def test_stamp_commit_signal_done_after_run(
+        self, temp_git_repo, monkeypatch
+    ):
+        """First run: rewrites CHANGELOG, lands a `chore(release): vX.Y.Z`
+        commit, returns the new HEAD sha; signal-done flips True."""
+        monkeypatch.setattr(cctally, "CHANGELOG_PATH", temp_git_repo / "CHANGELOG.md")
+        monkeypatch.setenv("CCTALLY_RELEASE_DATE_UTC", "2026-05-07")
+        sha = cctally._release_run_phase_stamp(
+            "1.0.0", remote="origin", invocation="cctally release minor"
+        )
+        text = (temp_git_repo / "CHANGELOG.md").read_text()
+        assert "## [1.0.0] - 2026-05-07" in text
+        log = subprocess.check_output(
+            ["git", "log", "-1", "--format=%H %s"],
+            text=True, cwd=temp_git_repo,
+        ).strip()
+        assert sha in log
+        assert "chore(release): v1.0.0" in log
+        # Signal-done now reports True with the same SHA.
+        done, sig_sha = cctally._release_phase_stamp_done("1.0.0")
+        assert done is True
+        assert sig_sha == sha
+
+    def test_stamp_idempotent(self, temp_git_repo, monkeypatch):
+        """Second invocation short-circuits: same SHA, no new commit."""
+        monkeypatch.setattr(cctally, "CHANGELOG_PATH", temp_git_repo / "CHANGELOG.md")
+        monkeypatch.setenv("CCTALLY_RELEASE_DATE_UTC", "2026-05-07")
+        sha1 = cctally._release_run_phase_stamp(
+            "1.0.0", remote="origin", invocation="cctally release minor"
+        )
+        commit_count_before = int(
+            subprocess.check_output(
+                ["git", "rev-list", "--count", "HEAD"],
+                text=True, cwd=temp_git_repo,
+            ).strip()
+        )
+        sha2 = cctally._release_run_phase_stamp(
+            "1.0.0", remote="origin", invocation="cctally release minor"
+        )
+        assert sha1 == sha2
+        commit_count_after = int(
+            subprocess.check_output(
+                ["git", "rev-list", "--count", "HEAD"],
+                text=True, cwd=temp_git_repo,
+            ).strip()
+        )
+        assert commit_count_after == commit_count_before

@@ -410,6 +410,178 @@ def _release_preflight_tag_clobber(version: str, remote: str) -> None:
         pass
 
 
+def _release_phase_stamp_done(version: str) -> tuple[bool, str | None]:
+    """Phase-1 read-only signal: returns (True, head_sha) when CHANGELOG.md
+    on disk AND HEAD's tree both contain the `## [version] - <today>` header.
+
+    Date defaults to today UTC, overridable via CCTALLY_RELEASE_DATE_UTC for
+    deterministic fixtures. Returns (False, None) on any miss (file gone,
+    header absent, HEAD blob lacks the header). Read-only — never mutates.
+    """
+    today = (
+        os.environ.get("CCTALLY_RELEASE_DATE_UTC")
+        or dt.datetime.now(dt.timezone.utc).date().isoformat()
+    )
+    expected_header = f"## [{version}] - {today}"
+    try:
+        text = CHANGELOG_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return (False, None)
+    if expected_header not in text:
+        return (False, None)
+    head_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    try:
+        blob = subprocess.check_output(
+            ["git", "show", "HEAD:CHANGELOG.md"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        return (False, None)
+    if expected_header in blob:
+        return (True, head_sha)
+    return (False, None)
+
+
+def _release_build_stamp_message(
+    version: str,
+    body: str,
+    invocation: str,
+    prior_head: str,
+    bump_kind: str,
+    subsection_counts: dict[str, int],
+) -> str:
+    """Build the full stamp commit message: private body + `--- public ---`
+    block + canonical body (spec §7.1).
+
+    Subject is identical on both surfaces (`chore(release): vX.Y.Z`); the
+    public body is the canonical CHANGELOG section body byte-for-byte.
+    """
+    counts_str = ", ".join(
+        f"{name} ({n})" for name, n in subsection_counts.items() if n > 0
+    ) or "(none)"
+    total = sum(subsection_counts.values())
+    private_body = (
+        f"chore(release): v{version}\n"
+        f"\n"
+        f"Stamp release v{version} over {total} [Unreleased] entries.\n"
+        f"\n"
+        f"Run by `{invocation}` from main at {prior_head[:7]}.\n"
+        f"Bump kind: {bump_kind}.\n"
+        f"Subsections stamped: {counts_str}.\n"
+    )
+    public_block = f"--- public ---\nchore(release): v{version}\n\n{body}\n"
+    return private_body + "\n" + public_block
+
+
+def _release_run_phase_stamp(
+    version: str,
+    remote: str,
+    invocation: str,
+    bump_kind: str = "(unspecified)",
+) -> str:
+    """Phase 1 — stamp `[Unreleased]` into a `[X.Y.Z]` section and commit.
+
+    Idempotent: if `_release_phase_stamp_done(version)` reports done,
+    short-circuits with the existing HEAD SHA. Otherwise rewrites
+    CHANGELOG.md atomically (`os.replace`), stages it, verifies the
+    staging cache contains exactly `CHANGELOG.md` (defends against
+    operator-prestaged content slipping into the release commit), then
+    invokes `git commit -F <msgfile> --cleanup=verbatim` so the
+    `### Added` / `### Fixed` headings survive (default cleanup strips
+    `#`-prefixed lines as comments). Returns the new commit SHA.
+    """
+    done, head_sha = _release_phase_stamp_done(version)
+    if done:
+        print(
+            f"release: stamp ✓ (already done — commit {head_sha[:7]})"
+        )
+        return head_sha
+
+    print(f"release: stamp v{version}")
+    today = (
+        os.environ.get("CCTALLY_RELEASE_DATE_UTC")
+        or dt.datetime.now(dt.timezone.utc).date().isoformat()
+    )
+    old_text = CHANGELOG_PATH.read_text(encoding="utf-8")
+    new_text, body = _release_stamp_changelog(old_text, version, today)
+
+    # Subsection counts — read from the OLD parse (before the stamp moved
+    # bullets out of [Unreleased]); private-body diagnostics only.
+    parsed = _release_parse_changelog(old_text)
+    counts: dict[str, int] = {}
+    if parsed["sections"]:
+        for sub in parsed["sections"][0]["subsections"]:
+            if sub["bullets"]:
+                heading = sub["heading"].replace("###", "").strip()
+                counts[heading] = len(sub["bullets"])
+
+    prior_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+
+    # Atomic write: write to .tmp.<pid> sibling, then os.replace().
+    tmp = CHANGELOG_PATH.with_suffix(f".md.tmp.{os.getpid()}")
+    tmp.write_text(new_text, encoding="utf-8")
+    os.replace(tmp, CHANGELOG_PATH)
+
+    # Stage CHANGELOG.md only (`cwd` so the relative path resolves).
+    subprocess.check_call(
+        ["git", "add", CHANGELOG_PATH.name],
+        cwd=str(CHANGELOG_PATH.parent),
+    )
+
+    # Trailer staging guard: refuse if anything else is staged. Defensive
+    # — preflight should have caught a dirty index, but operators can race
+    # `git add` between preflight and stamp.
+    staged = (
+        subprocess.check_output(
+            ["git", "diff", "--cached", "--name-only"],
+            text=True,
+            cwd=str(CHANGELOG_PATH.parent),
+        )
+        .strip()
+        .splitlines()
+    )
+    if staged != ["CHANGELOG.md"]:
+        print(
+            "release: stamp aborted; expected only CHANGELOG.md staged, "
+            f"got {staged}",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+
+    msg = _release_build_stamp_message(
+        version, body, invocation, prior_head, bump_kind, counts
+    )
+    msg_file = CHANGELOG_PATH.parent / f".release-msg.{os.getpid()}.txt"
+    msg_file.write_text(msg, encoding="utf-8")
+    try:
+        subprocess.check_call(
+            [
+                "git",
+                "commit",
+                "-F",
+                str(msg_file),
+                "--cleanup=verbatim",
+            ],
+            cwd=str(CHANGELOG_PATH.parent),
+        )
+    finally:
+        try:
+            msg_file.unlink()
+        except FileNotFoundError:
+            pass
+
+    new_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    print(f"release: stamp ✓ (commit {new_sha[:7]})")
+    return new_sha
+
+
 def cmd_release(args: argparse.Namespace) -> int:
     """Issue #24 — release automation entry point.
 
@@ -475,11 +647,12 @@ def cmd_release(args: argparse.Namespace) -> int:
     if args.dry_run:
         return _release_dry_run(args, current_v, next_v)
 
-    # Real flow — phases land in subsequent tasks.
-    print(
-        f"release: would stamp v{next_v}, tag, mirror, gh release "
-        "(subsequent tasks)"
-    )
+    # Real flow — phases land progressively across Tasks 5–9.
+    invocation = f"cctally release {args.kind or '--resume'}"
+    bump_kind = args.kind or "resume"
+    _release_run_phase_stamp(next_v, args.remote, invocation, bump_kind)
+    # Phase 2 stub for now — landed in Task 6.
+    print(f"release: phase 2 stub — would tag v{next_v}")
     return 0
 
 
