@@ -27,6 +27,7 @@ python3 bin/cctally release prerelease --no-publish > "$work/_artifacts/stdout.t
 rc=$?
 echo "$rc" > "$work/_artifacts/exit.txt"
 cp CHANGELOG.md "$work/_artifacts/changelog.md" 2>/dev/null || true
+cp package.json "$work/_artifacts/package.json" 2>/dev/null || true
 git log -1 --format=%B 2>/dev/null | sed -E "s/[0-9a-f]{7,40}/<SHA7>/g" > "$work/_artifacts/commit-msg.txt" || true
 tag_name=$(git tag --points-at HEAD 2>/dev/null | grep -E '^v[0-9]' | head -n1)
 if [ -n "$tag_name" ]; then

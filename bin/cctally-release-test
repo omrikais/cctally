@@ -18,6 +18,8 @@
 #   - golden-commit-msg.txt     : optional — `git log -1 --format=%B` of the
 #                                 stamp commit, with `<SHA7>` placeholders.
 #   - golden-tag-annotation.txt : optional — release-tag annotation body.
+#   - golden-package-json.json  : optional — exact post-stamp package.json
+#                                 contents (Task 15: Phase 1 co-stamp).
 #
 # Pattern: builder regenerates setup.sh + run.sh into a scratch tree.
 # Harness copies them per-scenario into $work/, runs setup.sh, then
@@ -138,6 +140,16 @@ for dir in "$FIXTURES_DIR"/*/; do
         fi
     fi
 
+    # Optional byte-exact package.json check (post-stamp). Phase 1
+    # co-stamps package.json; this golden pins the exact stamped bytes.
+    pj_golden="$dir/golden-package-json.json"
+    if [ -f "$pj_golden" ] && [ -f "$artifact_dir/package.json" ]; then
+        if ! diff -u "$pj_golden" "$artifact_dir/package.json" >/dev/null; then
+            pass=false
+            fail_reasons+=("package-json mismatch")
+        fi
+    fi
+
     # Optional body-canonical-three-sources check. The run.sh writes
     # `body-equal.txt` containing "1" or "0"; the golden pins "1" so a
     # silent shape change in any of the three body sources fails fast.
@@ -193,6 +205,11 @@ for dir in "$FIXTURES_DIR"/*/; do
                 "tag-annotation mismatch")
                     echo "  tag-annotation diff (golden vs actual):"
                     diff -u "$ta_golden" "$artifact_dir/tag-annotation.txt" 2>/dev/null \
+                        | head -60 | sed 's/^/    /'
+                    ;;
+                "package-json mismatch")
+                    echo "  package.json diff (golden vs actual):"
+                    diff -u "$pj_golden" "$artifact_dir/package.json" 2>/dev/null \
                         | head -60 | sed 's/^/    /'
                     ;;
                 "body-equal mismatch")

@@ -83,7 +83,18 @@ SETUP_HOOK_EVENTS = ("PostToolBatch", "Stop", "SubagentStop")
 # === Release automation (issue #24) ===
 
 CHANGELOG_PATH = pathlib.Path(__file__).resolve().parent.parent / "CHANGELOG.md"
-PACKAGE_JSON_PATH = pathlib.Path(__file__).resolve().parent.parent / "package.json"
+
+
+def _package_json_path() -> pathlib.Path:
+    """Resolve package.json's path next to CHANGELOG.md.
+
+    Indirected through CHANGELOG_PATH so that tests monkeypatching
+    CHANGELOG_PATH (to redirect into a fixture repo) also redirect
+    package.json — Phase 1 co-stamp and any read-side caller (e.g.
+    the Phase 1 done-check) stay in lockstep without a separate
+    monkeypatch surface.
+    """
+    return CHANGELOG_PATH.parent / "package.json"
 
 # Public mirror repo identity (the GitHub `<owner>/<repo>` slug). Used by
 # Phase 3 (mirror push), Phase 4 (`gh release create` / view), and the
@@ -639,18 +650,19 @@ def _release_run_phase_stamp(
     )
 
     # Co-stamp package.json (npm channel; Phase 5 reads this version field).
-    # Resolve relative to CHANGELOG_PATH.parent (the repo being stamped) so
-    # tests that monkeypatch CHANGELOG_PATH to a temp repo automatically
-    # see the correct (absent) package.json there. Guarded by `.exists()`
-    # so fixture replays for old scenarios pre-dating the npm channel
-    # still pass — they have no package.json to stamp.
-    package_json_path = CHANGELOG_PATH.parent / "package.json"
-    if package_json_path.exists():
-        pj_old = package_json_path.read_text(encoding="utf-8")
+    # Path resolved via _package_json_path() (which derives from
+    # CHANGELOG_PATH) so tests monkeypatching CHANGELOG_PATH to a temp
+    # repo automatically see the correct (absent) package.json there.
+    # Guarded by `.exists()` so fixture replays for old scenarios
+    # pre-dating the npm channel still pass — they have no package.json
+    # to stamp.
+    pj_path = _package_json_path()
+    if pj_path.exists():
+        pj_old = pj_path.read_text(encoding="utf-8")
         pj_new = _release_stamp_package_json(pj_old, version)
-        package_json_path.write_text(pj_new, encoding="utf-8")
+        pj_path.write_text(pj_new, encoding="utf-8")
         subprocess.check_call(
-            ["git", "add", package_json_path.name],
+            ["git", "add", pj_path.name],
             cwd=str(CHANGELOG_PATH.parent),
         )
 
@@ -668,7 +680,7 @@ def _release_run_phase_stamp(
     )
     expected_staged = (
         ["CHANGELOG.md", "package.json"]
-        if package_json_path.exists()
+        if pj_path.exists()
         else ["CHANGELOG.md"]
     )
     if staged != expected_staged:

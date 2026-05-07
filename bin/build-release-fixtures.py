@@ -343,6 +343,10 @@ mkdir -p "$work/_artifacts"
 _CAPTURE_ARTIFACTS = (
     # Capture CHANGELOG (always — even on refusal).
     'cp CHANGELOG.md "$work/_artifacts/changelog.md" 2>/dev/null || true\n'
+    # Capture package.json (only when the scenario seeded one; harmless
+    # `|| true` so old scenarios without package.json don't fail). Used
+    # by the harness's optional golden-package-json.json byte-check.
+    'cp package.json "$work/_artifacts/package.json" 2>/dev/null || true\n'
     # Stamp commit message — strip SHAs so the golden is byte-stable.
     'git log -1 --format=%B 2>/dev/null '
     '| sed -E "s/[0-9a-f]{7,40}/<SHA7>/g" '
@@ -498,7 +502,7 @@ def _add(**kwargs) -> None:
     goldens to None when missing."""
     kwargs.setdefault("extra_setup", "")
     for key in ("changelog", "commit_msg", "tag_annotation",
-                "body_equal", "gh_argv"):
+                "body_equal", "gh_argv", "package_json"):
         kwargs.setdefault(key, None)
     SCENARIOS.append(kwargs)
 
@@ -659,6 +663,67 @@ _add(
         "### Changed\n"
         "- Breaking: API rewrite\n"
         "\n"
+    ),
+)
+
+
+# 3b. stamp-package-json-and-changelog: seed a sentinel package.json
+# alongside CHANGELOG, run `release patch`, verify Phase 1 co-stamps both
+# files in the same commit. Pins both post-stamp goldens byte-exactly.
+#
+# package.json is committed via extra_setup AFTER the seed commit (so the
+# release-time clean-tree preflight passes) and pushed so up-to-date check
+# passes. The release run then re-stamps `version: "0.0.0-managed-by-release"`
+# to `0.1.1` and stages it in the same commit as CHANGELOG.md.
+_add(
+    name="stamp-package-json-and-changelog",
+    seed_changelog=_changelog(
+        unreleased_subsections=[
+            ("Added", ["- Brand new feature"]),
+        ],
+        prior_releases=[
+            ("0.1.0", "2026-01-01",
+                [("Added", ["- Initial public release of cctally"])]),
+        ],
+    ),
+    extra_setup=(
+        # Seed package.json with the sentinel version. The release script
+        # rewrites this `version` field during Phase 1.
+        "cat > package.json <<'CCTALLY_PJSON_EOF'\n"
+        "{\n"
+        '  "name": "cctally",\n'
+        '  "version": "0.0.0-managed-by-release",\n'
+        '  "description": "test"\n'
+        "}\n"
+        "CCTALLY_PJSON_EOF\n"
+        # Commit + push so the release preflight (clean tree, up-to-date
+        # with origin) passes.
+        "git add package.json\n"
+        "git commit --no-verify -q -F - <<'CCTALLY_PJSON_MSG_EOF'\n"
+        "chore: seed package.json\n"
+        "\n"
+        "Public-Skip: true\n"
+        "CCTALLY_PJSON_MSG_EOF\n"
+        "git push -q origin main\n"
+    ),
+    run=_run_release("patch --no-publish"),
+    expected_exit=0,
+    stdout_substr="release: stamp ✓",
+    stderr_substr="",
+    changelog=_changelog(
+        unreleased_subsections=None,
+        prior_releases=[
+            ("0.1.1", "2026-05-07", [("Added", ["- Brand new feature"])]),
+            ("0.1.0", "2026-01-01",
+                [("Added", ["- Initial public release of cctally"])]),
+        ],
+    ),
+    package_json=(
+        "{\n"
+        '  "name": "cctally",\n'
+        '  "version": "0.1.1",\n'
+        '  "description": "test"\n'
+        "}\n"
     ),
 )
 
@@ -1365,6 +1430,7 @@ def build(out_root: Path) -> None:
             ("tag_annotation", "golden-tag-annotation.txt"),
             ("body_equal", "golden-body-equal.txt"),
             ("gh_argv", "golden-gh-argv.txt"),
+            ("package_json", "golden-package-json.json"),
         ):
             p = d / fname
             value = sc.get(key)
