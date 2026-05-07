@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Wrapper that forwards to `cctally release`.
+exec "$(dirname "$0")/cctally" release "$@"

@@ -71,6 +71,7 @@ SETUP_SYMLINK_NAMES = (
     "cctally-forecast",
     "cctally-project",
     "cctally-refresh-usage",
+    "cctally-release",
     "cctally-sync-week",
     "cctally-tui",
 )
