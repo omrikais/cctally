@@ -27,8 +27,8 @@ cctally release --dry-run <kind> [flags]
 
 ## Bump kinds
 
-Picks the next version off `_release_read_latest_release_version()`
-(latest `## [X.Y.Z] - YYYY-MM-DD` header in `CHANGELOG.md`):
+Picks the next version by reading the latest `## [X.Y.Z] - YYYY-MM-DD`
+header from `CHANGELOG.md`:
 
 | Kind         | From            | To                                               |
 |--------------|-----------------|--------------------------------------------------|
@@ -71,14 +71,19 @@ canonical CHANGELOG body), and commit with `--cleanup=verbatim` so the
 `### Added` / `### Fixed` headings survive.
 
 Refuses with exit 2 if `[Unreleased]` is empty or `CHANGELOG.md` is
-missing. Idempotent: `_release_phase_stamp_done` returns true when
-`HEAD`'s `CHANGELOG.md` blob already carries the `## [version] -
-<today>` header AND `HEAD`'s subject is exactly `chore(release):
-vX.Y.Z`.
+missing. Idempotent: the stamp-done signal is true when `HEAD`'s
+`CHANGELOG.md` blob already carries the `## [version] - <today>` header
+AND `HEAD`'s subject is exactly `chore(release): vX.Y.Z`.
 
 **Resume safety:** if the header is on disk but `HEAD`'s subject is
-different (an unrelated commit landed on top), the helper exits 2 with a
-diagnostic rather than tagging the wrong SHA.
+different (an unrelated commit landed on top), the resume guard exits 2
+with a diagnostic rather than tagging the wrong SHA.
+
+**Skip-chain exemption:** `chore(release): vX.Y.Z` and `feat(release):
+vX.Y.Z[-id.N]` subjects are unconditionally exempt from the public-mirror
+skip-chain refuse gate (release-voice subjects are themselves the signal
+of intentional bundling), so `--accept-skip-mismatch` is never needed
+for normal release commits.
 
 ### Phase 2 — Annotated tag + push
 
@@ -95,8 +100,8 @@ suspenders explicit `git push <remote> refs/tags/v<version>` because
 
 ### Phase 3 — Mirror push
 
-Three sub-steps from the public clone (resolved via
-`_release_discover_public_clone`):
+Three sub-steps from the public clone (resolved via public-clone
+discovery):
 
 1. `bin/cctally-mirror-public --yes --public-clone <path>` — replay
    private commits onto the local public clone.
@@ -146,8 +151,7 @@ checks are read-only network/git ops.
 
 ## Public-clone discovery
 
-`_release_discover_public_clone` resolves the path in this priority
-order:
+The public-clone path is resolved in this priority order:
 
 1. `--public-clone <path>` flag.
 2. `git config --get release.publicClone` (camelCase — git 2.46+
@@ -202,7 +206,7 @@ cctally release minor --public-clone /tmp/cctally-mirror-clone
 | Code | Meaning |
 |---|---|
 | `0` | Success (or auth-fallback path in phase 4 — phases 1-3 published, phase 4 awaits manual completion). |
-| `1` | Argparse error or unhandled internal exception. |
+| `1` | Unhandled internal exception (rare; report as a bug if it fires). |
 | `2` | Refusal — wrong branch, dirty tree, behind remote, tag already exists, empty `[Unreleased]`, missing public-clone discovery, HEAD-not-stamp-commit on resume, mutually exclusive flags. |
 | `3` | Mid-publish failure — staging guard tripped, mirror replay/push failed, hard `gh release create` failure after auth was confirmed OK. Re-run with `--resume`. |
 
@@ -236,7 +240,7 @@ The body string carried by:
 - the annotated tag's body;
 - the GitHub Release notes body;
 
-is **byte-identical** — produced by `_release_canonical_body()` on the
+is **byte-identical** — produced by the canonical-body helper on the
 same parsed `CHANGELOG.md` section. Phases 2 and 4 re-parse from disk
 rather than threading the string through, so the canonical body is
 re-derivable from `CHANGELOG.md` at any point.
@@ -250,13 +254,11 @@ the web UI) do NOT propagate back. To re-stamp from CHANGELOG truth
 after a manual divergence, edit `CHANGELOG.md` and re-run with
 `--resume` to regenerate the body from the parsed section.
 
-## Notes & gotchas
+## Notes
 
-- **CHANGELOG-as-truth.** `cctally --version` reads the latest `## [X.Y.Z] - YYYY-MM-DD` header from `CHANGELOG.md`. Manual edits to that header silently change the runtime version reported by `cctally --version`.
-- **`--cleanup=verbatim` is required** on both the stamp commit and the annotated tag. Default cleanup deletes `#`-prefixed lines as comment lines, eating every `### Added` / `### Fixed` heading.
-- **Stamping is byte-stable across runs** — `_release_stamp_changelog` rstrip-trailing-newlines the preamble before re-serializing so re-stamping the same input is a no-op.
-- **Empty `[Unreleased]` refuses** with exit 2 (`[Unreleased] is empty; nothing to release`). Add at least one bullet before retrying.
-- **Public mirror `--accept-skip-mismatch`** is NOT needed for normal release commits — `chore(release): vX.Y.Z` and `feat(release): vX.Y.Z[-id.N]` subjects are exempt from the skip-chain refuse gate by design (release-voice subjects ARE the signal of intentional bundling).
+- **Stamping is byte-stable across runs** — the CHANGELOG stamper
+  rstrip-trailing-newlines the preamble before re-serializing, so
+  re-stamping the same input produces a no-op diff.
 
 ## See also
 
