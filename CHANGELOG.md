@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-07
+
 ### Added
 - `bin/cctally-mirror-public --accept-skip-mismatch` flag — overrides
   the refuse gate when accumulated public-skip diffs significantly
