@@ -416,7 +416,8 @@ class TestPhaseTag:
     commit + tag with `--follow-tags`. Idempotent (spec §5.1)."""
 
     def _setup_with_stamp(self, repo, monkeypatch):
-        """Build a bare upstream, push main, run Phase 1. Returns upstream path."""
+        """Build a bare upstream, push main, run Phase 1. Returns
+        (upstream_path, stamp_sha)."""
         monkeypatch.setattr(cctally, "CHANGELOG_PATH", repo / "CHANGELOG.md")
         monkeypatch.setenv("CCTALLY_RELEASE_DATE_UTC", "2026-05-07")
         upstream = repo.parent / "upstream.git"
@@ -430,16 +431,16 @@ class TestPhaseTag:
         subprocess.run(
             ["git", "push", "-q", "origin", "main"], check=True, cwd=repo
         )
-        cctally._release_run_phase_stamp(
+        stamp_sha = cctally._release_run_phase_stamp(
             "1.0.0", "origin", "cctally release minor", "minor"
         )
-        return upstream
+        return upstream, stamp_sha
 
     def test_tag_creates_annotated_tag(self, temp_git_repo, monkeypatch):
         """Annotated tag landed locally and on remote; tag object is `tag`,
         not a lightweight `commit`."""
-        upstream = self._setup_with_stamp(temp_git_repo, monkeypatch)
-        cctally._release_run_phase_tag("1.0.0", "origin")
+        upstream, stamp_sha = self._setup_with_stamp(temp_git_repo, monkeypatch)
+        cctally._release_run_phase_tag("1.0.0", "origin", stamp_sha)
         out = subprocess.check_output(
             ["git", "tag", "-l", "v1.0.0"], text=True, cwd=temp_git_repo,
         ).strip()
@@ -457,10 +458,10 @@ class TestPhaseTag:
 
     def test_tag_idempotent(self, temp_git_repo, monkeypatch):
         """Second invocation no-ops: same local + remote state, no exception."""
-        self._setup_with_stamp(temp_git_repo, monkeypatch)
-        cctally._release_run_phase_tag("1.0.0", "origin")
+        _, stamp_sha = self._setup_with_stamp(temp_git_repo, monkeypatch)
+        cctally._release_run_phase_tag("1.0.0", "origin", stamp_sha)
         # Second run is a no-op (signal-done short-circuit).
-        cctally._release_run_phase_tag("1.0.0", "origin")
+        cctally._release_run_phase_tag("1.0.0", "origin", stamp_sha)
         out = subprocess.check_output(
             ["git", "tag", "-l", "v1.0.0"], text=True, cwd=temp_git_repo,
         ).strip()
@@ -483,8 +484,8 @@ class TestPhaseTag:
         Both should equal `_release_canonical_body(...)` from the section
         re-parsed from CHANGELOG.md.
         """
-        self._setup_with_stamp(temp_git_repo, monkeypatch)
-        cctally._release_run_phase_tag("1.0.0", "origin")
+        _, stamp_sha = self._setup_with_stamp(temp_git_repo, monkeypatch)
+        cctally._release_run_phase_tag("1.0.0", "origin", stamp_sha)
 
         # Source 0: the canonical body, recomputed from CHANGELOG.
         text = (temp_git_repo / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -528,3 +529,69 @@ class TestPhaseTag:
         assert commit_body == canonical
         assert tag_body == canonical
         assert commit_body == tag_body
+
+
+class TestResumeSafety:
+    """Issue #24 — `--resume` correctness gaps surfaced in code review."""
+
+    def test_resume_refuses_when_head_is_not_stamp_commit(
+        self, temp_git_repo, monkeypatch
+    ):
+        """Done-signal must refuse if HEAD's CHANGELOG carries the stamp
+        but HEAD's subject is not `chore(release): vX.Y.Z` — meaning an
+        unrelated commit landed on top. Tagging that SHA would mis-tag."""
+        monkeypatch.setattr(cctally, "CHANGELOG_PATH", temp_git_repo / "CHANGELOG.md")
+        monkeypatch.setenv("CCTALLY_RELEASE_DATE_UTC", "2026-05-07")
+        # Stamp succeeds.
+        cctally._release_run_phase_stamp(
+            "1.0.0", "origin", "cctally release minor", "minor"
+        )
+        # Operator lands an unrelated commit on top.
+        (temp_git_repo / "README.md").write_text("oops")
+        subprocess.run(
+            ["git", "add", "."], check=True, cwd=temp_git_repo
+        )
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "oops on top"],
+            check=True, cwd=temp_git_repo,
+        )
+        # Done-signal must refuse with exit 2 (NOT silently return done).
+        with pytest.raises(SystemExit) as e:
+            cctally._release_phase_stamp_done("1.0.0")
+        assert e.value.code == 2
+
+    def test_tag_push_local_exists_remote_missing(
+        self, temp_git_repo, monkeypatch
+    ):
+        """Resume scenario: tag created locally on a prior run but the push
+        failed; operator pushed `main` manually. Re-running Phase 2 must
+        skip `git tag` (already exists) and push the tag explicitly."""
+        # Reuse TestPhaseTag's setup helper.
+        tag_test = TestPhaseTag()
+        upstream, stamp_sha = tag_test._setup_with_stamp(
+            temp_git_repo, monkeypatch
+        )
+        # Simulate: tag created locally but never pushed.
+        subprocess.check_call(
+            [
+                "git", "tag", "-a", "v1.0.0",
+                "-m", "v1.0.0\n\n### Added\n- Foo\n",
+                stamp_sha,
+            ],
+            cwd=temp_git_repo,
+        )
+        # Operator manually pushed main (without the tag).
+        subprocess.check_call(
+            ["git", "push", "-q", "origin", "main"],
+            cwd=temp_git_repo,
+        )
+        # phase-tag-done returns False (remote tag missing).
+        assert not cctally._release_phase_tag_done("1.0.0", "origin")
+        # Re-run must succeed: skip `git tag`, push the tag explicitly.
+        cctally._release_run_phase_tag("1.0.0", "origin", stamp_sha)
+        # Remote should now have the tag.
+        out = subprocess.check_output(
+            ["git", "ls-remote", "--tags", str(upstream), "refs/tags/v1.0.0"],
+            text=True,
+        ).strip()
+        assert "v1.0.0" in out

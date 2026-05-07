@@ -412,11 +412,15 @@ def _release_preflight_tag_clobber(version: str, remote: str) -> None:
 
 def _release_phase_stamp_done(version: str) -> tuple[bool, str | None]:
     """Phase-1 read-only signal: returns (True, head_sha) when CHANGELOG.md
-    on disk AND HEAD's tree both contain the `## [version] - <today>` header.
+    on disk AND HEAD's tree both contain the `## [version] - <today>` header
+    AND HEAD's commit subject is exactly `chore(release): vX.Y.Z`.
 
     Date defaults to today UTC, overridable via CCTALLY_RELEASE_DATE_UTC for
     deterministic fixtures. Returns (False, None) on any miss (file gone,
-    header absent, HEAD blob lacks the header). Read-only — never mutates.
+    header absent, HEAD blob lacks the header). When the header IS present
+    on HEAD but HEAD's subject is not the stamp subject — meaning an
+    unrelated commit landed on top of the stamp — exits 2 with a diagnostic
+    rather than tagging the wrong SHA. Read-only — never mutates.
     """
     today = (
         os.environ.get("CCTALLY_RELEASE_DATE_UTC")
@@ -430,19 +434,40 @@ def _release_phase_stamp_done(version: str) -> tuple[bool, str | None]:
     if expected_header not in text:
         return (False, None)
     head_sha = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], text=True
+        ["git", "rev-parse", "HEAD"],
+        text=True,
+        cwd=str(CHANGELOG_PATH.parent),
     ).strip()
     try:
         blob = subprocess.check_output(
             ["git", "show", "HEAD:CHANGELOG.md"],
             text=True,
             stderr=subprocess.DEVNULL,
+            cwd=str(CHANGELOG_PATH.parent),
         )
     except subprocess.CalledProcessError:
         return (False, None)
-    if expected_header in blob:
-        return (True, head_sha)
-    return (False, None)
+    if expected_header not in blob:
+        return (False, None)
+    # HEAD's blob carries the stamp; verify HEAD itself IS the stamp commit.
+    # An unrelated commit landed on top of the stamp would still satisfy the
+    # blob check (CHANGELOG.md unchanged on top), but tagging that SHA would
+    # mis-tag the release. Refuse with a clear diagnostic instead.
+    head_subject = subprocess.check_output(
+        ["git", "log", "-1", "--format=%s", "HEAD"],
+        text=True,
+        cwd=str(CHANGELOG_PATH.parent),
+    ).strip()
+    expected_subject = f"chore(release): v{version}"
+    if head_subject != expected_subject:
+        print(
+            f"release: HEAD is not the stamp commit (subject: {head_subject!r}); "
+            f"--resume cannot continue. Either checkout the stamp commit or "
+            f"revert the on-top commits.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return (True, head_sha)
 
 
 def _release_build_stamp_message(
@@ -519,13 +544,23 @@ def _release_run_phase_stamp(
                 counts[heading] = len(sub["bullets"])
 
     prior_head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], text=True
+        ["git", "rev-parse", "HEAD"],
+        text=True,
+        cwd=str(CHANGELOG_PATH.parent),
     ).strip()
 
-    # Atomic write: write to .tmp.<pid> sibling, then os.replace().
+    # Atomic write: write to .tmp.<pid> sibling, then os.replace(). Wrapped
+    # in try/finally so a failure between write_text and os.replace doesn't
+    # leak a stray .tmp.<pid> file next to CHANGELOG.md.
     tmp = CHANGELOG_PATH.with_suffix(f".md.tmp.{os.getpid()}")
-    tmp.write_text(new_text, encoding="utf-8")
-    os.replace(tmp, CHANGELOG_PATH)
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        os.replace(tmp, CHANGELOG_PATH)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
     # Stage CHANGELOG.md only (`cwd` so the relative path resolves).
     subprocess.check_call(
@@ -549,6 +584,11 @@ def _release_run_phase_stamp(
         print(
             "release: stamp aborted; expected only CHANGELOG.md staged, "
             f"got {staged}",
+            file=sys.stderr,
+        )
+        print(
+            "release: to recover, run `git reset HEAD` and "
+            "`git checkout -- CHANGELOG.md`",
             file=sys.stderr,
         )
         sys.exit(3)
@@ -576,7 +616,9 @@ def _release_run_phase_stamp(
             pass
 
     new_sha = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], text=True
+        ["git", "rev-parse", "HEAD"],
+        text=True,
+        cwd=str(CHANGELOG_PATH.parent),
     ).strip()
     print(f"release: stamp ✓ (commit {new_sha[:7]})")
     return new_sha
@@ -609,8 +651,13 @@ def _release_phase_tag_done(version: str, remote: str) -> bool:
         return False
 
 
-def _release_run_phase_tag(version: str, remote: str) -> None:
+def _release_run_phase_tag(version: str, remote: str, stamp_sha: str) -> None:
     """Phase 2 — write annotated tag `vX.Y.Z` and push commit + tag.
+
+    `stamp_sha` is the SHA returned by Phase 1; tagging is pinned to that
+    SHA rather than re-reading HEAD, so an unrelated commit landing on top
+    between phases never causes a mis-tag (defense in depth — the done-
+    signal in `_release_phase_stamp_done` already refuses that scenario).
 
     Idempotent: short-circuits when `_release_phase_tag_done`. The
     body is re-parsed from CHANGELOG.md and run through
@@ -618,6 +665,13 @@ def _release_run_phase_tag(version: str, remote: str) -> None:
     Phase 1's commit-message public block (body-canonical-three-sources
     invariant, spec §7.4 — same string flows into Phase 4's GH Release
     notes).
+
+    Resume scenarios:
+    - Local tag missing, remote tag missing: create + push as normal.
+    - Local tag exists, remote tag missing (push failed last run, or
+      operator pushed `main` manually): skip `git tag` (would conflict
+      with the existing local tag) and push only the tag explicitly.
+    - Both present: short-circuited by `_release_phase_tag_done` above.
 
     Signing: use `-s` only when both `user.signingkey` is set AND
     `tag.gpgsign` is `true`; otherwise `-a` (annotated, unsigned).
@@ -630,7 +684,10 @@ def _release_run_phase_tag(version: str, remote: str) -> None:
     `--cleanup=verbatim` is required: default cleanup strips
     `#`-prefixed lines, eating every `### Added` / `### Fixed`
     heading. Push uses `--follow-tags` to ship commit + tag in one
-    operation.
+    operation, plus an explicit `refs/tags/...:refs/tags/...` push as
+    belt-and-suspenders: `--follow-tags` skips tags whose target commit
+    is already on the remote (the resume-after-manual-push case), so
+    the explicit push is what guarantees the tag actually lands.
     """
     if _release_phase_tag_done(version, remote):
         print(
@@ -641,72 +698,81 @@ def _release_run_phase_tag(version: str, remote: str) -> None:
     print(f"release: tag v{version}")
     tag = f"v{version}"
 
-    # Body — re-parse CHANGELOG so the annotation reuses the canonical
-    # body string (matches the public block of Phase 1's commit byte for
-    # byte; same string flows into Phase 4's GH Release notes).
-    text = CHANGELOG_PATH.read_text(encoding="utf-8")
-    parsed = _release_parse_changelog(text)
-    target_section = next(
-        (
-            s
-            for s in parsed["sections"]
-            if s["heading"].lstrip().startswith(f"## [{version}]")
-        ),
-        None,
-    )
-    if target_section is None:
-        print(
-            f"release: cannot find [{version}] section in CHANGELOG.md",
-            file=sys.stderr,
-        )
-        sys.exit(3)
-    body = _release_canonical_body(target_section)
-
-    annotation = f"{tag}\n\n{body}\n"
-    msg_file = CHANGELOG_PATH.parent / f".release-tag-msg.{os.getpid()}.txt"
-    msg_file.write_text(annotation, encoding="utf-8")
-    try:
-        signing_key = subprocess.run(
-            ["git", "config", "--get", "user.signingkey"],
-            capture_output=True,
+    # Resume-aware: if the local tag already exists from a prior run, skip
+    # `git tag` (would fail with "tag already exists") and push only.
+    local_tags = (
+        subprocess.check_output(
+            ["git", "tag", "-l", tag],
             text=True,
             cwd=str(CHANGELOG_PATH.parent),
-        ).stdout.strip()
-        tag_gpgsign = (
-            subprocess.run(
-                ["git", "config", "--get", "tag.gpgsign"],
+        )
+        .strip()
+        .splitlines()
+    )
+    if tag in local_tags:
+        print(f"release: tag {tag} exists locally; pushing tag only")
+    else:
+        # Body — re-parse CHANGELOG so the annotation reuses the canonical
+        # body string (matches the public block of Phase 1's commit byte
+        # for byte; same string flows into Phase 4's GH Release notes).
+        text = CHANGELOG_PATH.read_text(encoding="utf-8")
+        parsed = _release_parse_changelog(text)
+        target_section = next(
+            (
+                s
+                for s in parsed["sections"]
+                if s["heading"].lstrip().startswith(f"## [{version}]")
+            ),
+            None,
+        )
+        if target_section is None:
+            print(
+                f"release: cannot find [{version}] section in CHANGELOG.md",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        body = _release_canonical_body(target_section)
+
+        annotation = f"{tag}\n\n{body}\n"
+        msg_file = CHANGELOG_PATH.parent / f".release-tag-msg.{os.getpid()}.txt"
+        try:
+            msg_file.write_text(annotation, encoding="utf-8")
+            signing_key = subprocess.run(
+                ["git", "config", "--get", "user.signingkey"],
                 capture_output=True,
                 text=True,
                 cwd=str(CHANGELOG_PATH.parent),
+            ).stdout.strip()
+            tag_gpgsign = (
+                subprocess.run(
+                    ["git", "config", "--get", "tag.gpgsign"],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(CHANGELOG_PATH.parent),
+                )
+                .stdout.strip()
+                .lower()
+                == "true"
             )
-            .stdout.strip()
-            .lower()
-            == "true"
-        )
-        sign_flag = "-s" if (signing_key and tag_gpgsign) else "-a"
-        stamp_sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            text=True,
-            cwd=str(CHANGELOG_PATH.parent),
-        ).strip()
-        subprocess.check_call(
-            [
-                "git",
-                "tag",
-                sign_flag,
-                "-F",
-                str(msg_file),
-                "--cleanup=verbatim",
-                tag,
-                stamp_sha,
-            ],
-            cwd=str(CHANGELOG_PATH.parent),
-        )
-    finally:
-        try:
-            msg_file.unlink()
-        except FileNotFoundError:
-            pass
+            sign_flag = "-s" if (signing_key and tag_gpgsign) else "-a"
+            subprocess.check_call(
+                [
+                    "git",
+                    "tag",
+                    sign_flag,
+                    "-F",
+                    str(msg_file),
+                    "--cleanup=verbatim",
+                    tag,
+                    stamp_sha,
+                ],
+                cwd=str(CHANGELOG_PATH.parent),
+            )
+        finally:
+            try:
+                msg_file.unlink()
+            except FileNotFoundError:
+                pass
 
     branch = subprocess.check_output(
         ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -715,6 +781,14 @@ def _release_run_phase_tag(version: str, remote: str) -> None:
     ).strip()
     subprocess.check_call(
         ["git", "push", remote, branch, "--follow-tags"],
+        cwd=str(CHANGELOG_PATH.parent),
+    )
+    # Belt-and-suspenders: --follow-tags skips tags whose target is already
+    # on the remote (e.g., resume after operator pushed `main` manually).
+    # Explicit refs-spec always pushes the tag; no-op when both are already
+    # on remote (true resume-after-success).
+    subprocess.check_call(
+        ["git", "push", remote, f"refs/tags/{tag}:refs/tags/{tag}"],
         cwd=str(CHANGELOG_PATH.parent),
     )
     print(f"release: tag ✓ (annotated, pushed to {remote})")
@@ -788,8 +862,10 @@ def cmd_release(args: argparse.Namespace) -> int:
     # Real flow — phases land progressively across Tasks 5–9.
     invocation = f"cctally release {args.kind or '--resume'}"
     bump_kind = args.kind or "resume"
-    _release_run_phase_stamp(next_v, args.remote, invocation, bump_kind)
-    _release_run_phase_tag(next_v, args.remote)
+    stamp_sha = _release_run_phase_stamp(
+        next_v, args.remote, invocation, bump_kind
+    )
+    _release_run_phase_tag(next_v, args.remote, stamp_sha)
     if args.no_publish:
         print(
             f"release v{next_v} stamped + tagged; "
