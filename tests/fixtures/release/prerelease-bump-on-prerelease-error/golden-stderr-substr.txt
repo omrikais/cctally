@@ -1,0 +1,1 @@
+--bump invalid when current version is a prerelease

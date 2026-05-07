@@ -3,6 +3,9 @@ set -uo pipefail
 work="$(pwd)/.."
 REPO_ROOT="$1"
 
+# Suppress .pyc generation (parity with setup.sh).
+export PYTHONDONTWRITEBYTECODE=1
+
 # Determinism: pin author/committer + release date.
 export GIT_AUTHOR_NAME="Test"
 export GIT_AUTHOR_EMAIL="test@example.com"
@@ -15,6 +18,7 @@ export CCTALLY_RELEASE_DATE_UTC="2026-05-07"
 # Fake `gh` recording: prepend the scaffold's fake-bin to PATH.
 export PATH="$work/fake-bin:$PATH"
 export GH_ARGV_LOG="$work/gh-argv.log"
+export GH_NOTES_DEST="$work/_artifacts/gh-notes.txt"
 
 # Per-scenario artifact dir; the harness reads files under it for the
 # golden-* comparisons.
@@ -24,8 +28,11 @@ rc=$?
 echo "$rc" > "$work/_artifacts/exit.txt"
 cp CHANGELOG.md "$work/_artifacts/changelog.md" 2>/dev/null || true
 git log -1 --format=%B 2>/dev/null | sed -E "s/[0-9a-f]{7,40}/<SHA7>/g" > "$work/_artifacts/commit-msg.txt" || true
-tag_name=$(git tag --points-at HEAD | grep -E '^v[0-9]' | head -n1)
+tag_name=$(git tag --points-at HEAD 2>/dev/null | grep -E '^v[0-9]' | head -n1)
 if [ -n "$tag_name" ]; then
   git tag -l --format="%(contents)" "$tag_name" > "$work/_artifacts/tag-annotation.txt"
+fi
+if [ -f "$work/gh-argv.log" ]; then
+  cp "$work/gh-argv.log" "$work/_artifacts/gh-argv.log"
 fi
 exit "$rc"

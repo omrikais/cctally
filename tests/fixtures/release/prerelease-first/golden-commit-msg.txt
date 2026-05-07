@@ -1,0 +1,14 @@
+chore(release): v1.1.0-rc.1
+
+Stamp release v1.1.0-rc.1 over 1 [Unreleased] entries.
+
+Run by `cctally release prerelease` from main at <SHA7>.
+Bump kind: prerelease.
+Subsections stamped: Added (1).
+
+--- public ---
+chore(release): v1.1.0-rc.1
+
+### Added
+- New thing for the next minor
+

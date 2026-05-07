@@ -45,6 +45,12 @@ One page per subcommand. Pages follow a consistent shape:
 | `codex-weekly` | [codex-weekly.md](codex-weekly.md) |
 | `codex-session` | [codex-session.md](codex-session.md) |
 
+## Releases
+
+| Command | Page |
+| --- | --- |
+| `release` | [release.md](release.md) — stamp CHANGELOG, cut SemVer tag, propagate to public mirror, create GitHub Release |
+
 ## Wrappers
 
 The bash wrappers in `bin/` exist for muscle-memory shortcuts:

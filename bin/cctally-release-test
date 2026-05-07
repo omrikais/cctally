@@ -138,6 +138,34 @@ for dir in "$FIXTURES_DIR"/*/; do
         fi
     fi
 
+    # Optional body-canonical-three-sources check. The run.sh writes
+    # `body-equal.txt` containing "1" or "0"; the golden pins "1" so a
+    # silent shape change in any of the three body sources fails fast.
+    be_golden="$dir/golden-body-equal.txt"
+    if [ -f "$be_golden" ] && [ -f "$artifact_dir/body-equal.txt" ]; then
+        if ! diff -u "$be_golden" "$artifact_dir/body-equal.txt" >/dev/null; then
+            pass=false
+            fail_reasons+=("body-equal mismatch")
+        fi
+    fi
+
+    # Optional gh-argv check (for gh phase scenarios). The run.sh
+    # captures `gh-argv.log` from $work/gh-argv.log; the golden pins
+    # the exact recorded sequence with paths/PIDs normalized.
+    ga_golden="$dir/golden-gh-argv.txt"
+    if [ -f "$ga_golden" ] && [ -f "$artifact_dir/gh-argv.log" ]; then
+        # Normalize paths under the harness scratch tree so the golden is
+        # byte-stable across runs (mktemp paths differ; PIDs differ).
+        sed -E \
+            -e "s|/.+/cctally-release-[A-Za-z0-9]+/run/[^/]+|<WORK>|g" \
+            -e "s|/tmp/release-notes-v[0-9.-]+(-[0-9]+)?\.md|<NOTES>|g" \
+            "$artifact_dir/gh-argv.log" > "$artifact_dir/gh-argv.normalized.txt"
+        if ! diff -u "$ga_golden" "$artifact_dir/gh-argv.normalized.txt" >/dev/null; then
+            pass=false
+            fail_reasons+=("gh-argv mismatch")
+        fi
+    fi
+
     if $pass; then
         echo "PASS [$name]"
         pass_count=$((pass_count + 1))
@@ -165,6 +193,22 @@ for dir in "$FIXTURES_DIR"/*/; do
                 "tag-annotation mismatch")
                     echo "  tag-annotation diff (golden vs actual):"
                     diff -u "$ta_golden" "$artifact_dir/tag-annotation.txt" 2>/dev/null \
+                        | head -60 | sed 's/^/    /'
+                    ;;
+                "body-equal mismatch")
+                    echo "  body-equal diff (golden vs actual):"
+                    diff -u "$be_golden" "$artifact_dir/body-equal.txt" 2>/dev/null \
+                        | head -10 | sed 's/^/    /'
+                    echo "  body-from-commit:"
+                    sed 's/^/    /' "$artifact_dir/body-from-commit.txt" 2>/dev/null | head -20
+                    echo "  body-from-tag:"
+                    sed 's/^/    /' "$artifact_dir/body-from-tag.txt" 2>/dev/null | head -20
+                    echo "  body-from-gh:"
+                    sed 's/^/    /' "$artifact_dir/body-from-gh.txt" 2>/dev/null | head -20
+                    ;;
+                "gh-argv mismatch")
+                    echo "  gh-argv diff (golden vs actual):"
+                    diff -u "$ga_golden" "$artifact_dir/gh-argv.normalized.txt" 2>/dev/null \
                         | head -60 | sed 's/^/    /'
                     ;;
             esac
