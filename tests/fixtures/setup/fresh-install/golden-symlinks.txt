@@ -1,4 +1,4 @@
-cctally -> /REPO/bin/cctally-npm-shim.js
+cctally -> /REPO/bin/cctally
 cctally-alerts -> /REPO/bin/cctally-alerts
 cctally-dashboard -> /REPO/bin/cctally-dashboard
 cctally-dollar-per-percent -> /REPO/bin/cctally-dollar-per-percent

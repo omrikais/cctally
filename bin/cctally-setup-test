@@ -104,13 +104,15 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
     # Per-scenario scratch repo: when `presetup.sh` exists, copy the
     # repo's `bin/` into `$fake/repo-scratch/bin/` and let the scenario
     # mutate it before the main `cctally` invocation. This lets a
-    # scenario simulate layouts where files alongside the script differ
-    # from the live checkout — e.g. removing `bin/cctally-npm-shim.js`
-    # to exercise the source-clone / brew install fallback in
-    # `_setup_resolve_symlink_source`. The launcher swaps from
+    # scenario simulate layouts where the script's resolved location
+    # differs from the live source checkout — e.g. reshaping the tree
+    # into a `node_modules/cctally/` layout to exercise the npm-only
+    # gate in `_setup_resolve_symlink_source`, or removing
+    # `bin/cctally-npm-shim.js` from that npm layout to exercise the
+    # inner shim-missing fallback. The launcher swaps from
     # `$HARNESS_BIN` (live `bin/cctally`) to the scratch copy so
-    # `_setup_resolve_repo_root` (derived from `__file__`) lands inside
-    # the scratch.
+    # `_setup_resolve_repo_root` (derived from `__file__.resolve()`)
+    # lands inside the scratch.
     local launcher="$HARNESS_BIN"
     local repo_scratch=""
     if [ -f "$dir/presetup.sh" ]; then

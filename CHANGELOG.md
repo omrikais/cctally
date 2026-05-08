@@ -17,6 +17,31 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   outage workarounds. Pre-releases publish to npm under `--tag next`;
   brew skips pre-releases.
 
+### Fixed
+- `cctally release` Phase 6 done-check is now remote-authoritative.
+  Previously checked only the local brew-clone working tree, so a
+  failed `git push` could leave the formula committed locally while
+  the tap remote stayed unchanged — `--resume` would then short-circuit
+  and report the release as published even though `brew install` could
+  not see it. Done-check now runs `git ls-remote --tags origin
+  refs/tags/v<version>` against the tap origin (mirrors Phase 3's
+  `_release_phase_mirror_done` pattern). Resume after a push failure
+  detects the local-but-not-remote state and goes straight to a
+  re-push without re-rendering or re-committing.
+- `cctally release` Phase 6 now pushes the tag via explicit
+  `refs/tags/v<version>:refs/tags/v<version>` refspec alongside
+  `git push --follow-tags`. The tag created in Phase 6 is lightweight,
+  and `--follow-tags` only pushes annotated tags, so the tap remote
+  never received the version tag in any prior release. Belt-and-
+  suspenders parity with Phase 2.
+- `cctally setup` no longer symlinks `~/.local/bin/cctally` to the
+  Node shim during a source-clone install. Resolver previously selected
+  `bin/cctally-npm-shim.js` whenever the file was present; since the
+  shim is checked into the source tree, source clones (documented as
+  Python-only) on a host without Node would have a broken `cctally`
+  on PATH. Selection now requires `repo_root` to live under a
+  `node_modules/` directory — the canonical npm install layout.
+
 ## [1.1.0] - 2026-05-07
 
 ### Added

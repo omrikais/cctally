@@ -1039,17 +1039,41 @@ def _release_discover_brew_clone(
 def _release_phase_brew_done(
     version: str, brew_clone: pathlib.Path
 ) -> bool:
-    """Phase 6 done iff ``Formula/cctally.rb`` already references ``vX.Y.Z``.
+    """Phase 6 done iff the brew tap **remote** carries ``vX.Y.Z``.
 
-    The render carries ``/v<version>.tar.gz`` in the ``url`` line — that
-    substring is the version fingerprint. Returns ``False`` when the
-    formula file is missing, so first-cut renders run the phase.
+    Local-only signal would let a failed ``git push`` masquerade as a
+    completed phase: the formula commit lives in the local clone but
+    ``brew install`` resolves against the tap remote, so a later
+    ``--resume`` must retry the push. Mirrors the
+    :func:`_release_phase_mirror_done` pattern (Phase 3).
+
+    Two-step check: cheap local-file sniff first (skips network when
+    the phase clearly hasn't run), then ``git ls-remote`` against the
+    tap origin for ``refs/tags/v<version>``. Phase 6 tags v<version>
+    and pushes via ``--follow-tags``, so the tag landing on origin is
+    a reliable proxy for "the tap remote saw this release."
+
+    Returns ``False`` on any subprocess failure (no origin configured,
+    network glitch); the caller proceeds to run the phase, whose own
+    push step is independently idempotent.
     """
     formula = brew_clone / "Formula" / "cctally.rb"
     if not formula.exists():
         return False
-    text = formula.read_text(encoding="utf-8")
-    return f"/v{version}.tar.gz" in text
+    if f"/v{version}.tar.gz" not in formula.read_text(encoding="utf-8"):
+        return False
+    try:
+        origin = subprocess.check_output(
+            ["git", "-C", str(brew_clone), "remote", "get-url", "origin"],
+            text=True,
+        ).strip()
+        out = subprocess.check_output(
+            ["git", "ls-remote", "--tags", origin, f"refs/tags/v{version}"],
+            text=True,
+        ).strip()
+        return bool(out)
+    except subprocess.CalledProcessError:
+        return False
 
 
 def _release_compute_brew_sha256(version: str) -> str:
@@ -1510,7 +1534,7 @@ def _release_run_phase_brew(
         )
         return 0
     if _release_phase_brew_done(version, brew_clone):
-        print(f"  Formula/cctally.rb already at v{version} — skipping.")
+        print(f"  Formula/cctally.rb already at v{version} on tap — skipping.")
         return 0
 
     # Refuse on dirty working tree — we're about to write the formula
@@ -1530,43 +1554,74 @@ def _release_run_phase_brew(
         )
         return 2
 
-    print(f"  computing sha256 of v{version} archive…")
-    sha = _release_compute_brew_sha256(version)
-
-    template = _homebrew_template_path().read_text(encoding="utf-8")
-    rendered = (
-        template
-        .replace("<<VERSION>>", version)
-        .replace("<<SHA256>>", sha)
-    )
     formula_path = brew_clone / "Formula" / "cctally.rb"
-    formula_path.parent.mkdir(parents=True, exist_ok=True)
-    formula_path.write_text(rendered, encoding="utf-8")
+    local_at_version = (
+        formula_path.exists()
+        and f"/v{version}.tar.gz"
+        in formula_path.read_text(encoding="utf-8")
+    )
 
-    subprocess.run(
-        ["git", "-C", str(brew_clone), "add", "Formula/cctally.rb"],
-        check=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(brew_clone), "commit", "-m",
-         f"chore(formula): cctally {version}"],
-        check=True,
-    )
+    if local_at_version:
+        # Resume after a push failure (the done-check verifies remote
+        # tag, so we only reach here when the local commit is in place
+        # but the tap origin hasn't seen it). Skip render + commit; go
+        # straight to (re)tag + push. Re-rendering would no-op the
+        # commit (`git commit` exits 1 with nothing to commit), so
+        # short-circuiting is also what keeps the function tidy.
+        print(
+            f"  local formula already at v{version}; re-pushing to tap…"
+        )
+    else:
+        print(f"  computing sha256 of v{version} archive…")
+        sha = _release_compute_brew_sha256(version)
+
+        template = _homebrew_template_path().read_text(encoding="utf-8")
+        rendered = (
+            template
+            .replace("<<VERSION>>", version)
+            .replace("<<SHA256>>", sha)
+        )
+        formula_path.parent.mkdir(parents=True, exist_ok=True)
+        formula_path.write_text(rendered, encoding="utf-8")
+
+        subprocess.run(
+            ["git", "-C", str(brew_clone), "add", "Formula/cctally.rb"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(brew_clone), "commit", "-m",
+             f"chore(formula): cctally {version}"],
+            check=True,
+        )
     # Tag is best-effort — re-running after a partial publish should
     # not fail just because the tag already exists locally.
     subprocess.run(
         ["git", "-C", str(brew_clone), "tag", f"v{version}"],
         check=False,
     )
-    push = subprocess.run(
+    branch_push = subprocess.run(
         ["git", "-C", str(brew_clone), "push", "origin", "HEAD",
          "--follow-tags"],
         check=False,
     )
-    if push.returncode != 0:
+    # Belt-and-suspenders tag push, mirroring Phase 2 — `--follow-tags`
+    # only pushes ANNOTATED tags, and Phase 6 creates a lightweight one
+    # (no `-a`/`-m`). Without this explicit refspec push, the tap remote
+    # never sees the tag, the remote-authoritative done-check stays
+    # False forever, and `--resume` would loop. Tag-only push uses
+    # explicit `src:dst` so it works regardless of `--follow-tags`
+    # semantics or whether the branch push needed updates.
+    tag_push = subprocess.run(
+        ["git", "-C", str(brew_clone), "push", "origin",
+         f"refs/tags/v{version}:refs/tags/v{version}"],
+        check=False,
+    )
+    if branch_push.returncode != 0 or tag_push.returncode != 0:
         print(
             f"\n  push failed. Manual recovery:\n"
-            f"    git -C {brew_clone} push origin HEAD --follow-tags\n",
+            f"    git -C {brew_clone} push origin HEAD --follow-tags\n"
+            f"    git -C {brew_clone} push origin "
+            f"refs/tags/v{version}:refs/tags/v{version}\n",
             file=sys.stderr,
         )
         return 0  # auth-fallback semantics; mirrors Phase 5.
@@ -20883,13 +20938,20 @@ class _SetupSymlinkResult:
 def _setup_resolve_symlink_source(repo_root: pathlib.Path, name: str) -> pathlib.Path:
     """Resolve the symlink target for a given PATH-name.
 
-    For `cctally`, prefer `bin/cctally-npm-shim.js` when present (lets
-    the shim consult `CCTALLY_PYTHON` before invoking python3 — npm
-    install layout). Falls back to `bin/cctally` (the Python script)
-    when the shim is absent (source clones / brew install layout).
-    All other names map directly to `bin/<name>`.
+    For `cctally`, prefer `bin/cctally-npm-shim.js` ONLY when the
+    package layout indicates an npm install — i.e. ``repo_root`` sits
+    somewhere under a ``node_modules/`` directory (npm global at
+    ``<prefix>/lib/node_modules/cctally/``, npm local at
+    ``<project>/node_modules/cctally/``, plus pnpm/yarn variants that
+    all keep the segment). The shim is committed to the source tree so
+    the npm-publish layout doesn't need a build step, but file presence
+    alone is not a reliable channel signal: source clones and brew
+    installs ship the shim too, and Node is not a runtime dependency
+    of either path. Falling back to ``bin/cctally`` (the Python script)
+    in those cases keeps source/brew installs Python-only as
+    documented. All other names map directly to ``bin/<name>``.
     """
-    if name == "cctally":
+    if name == "cctally" and "node_modules" in repo_root.parts:
         shim = repo_root / "bin" / "cctally-npm-shim.js"
         if shim.exists():
             return shim

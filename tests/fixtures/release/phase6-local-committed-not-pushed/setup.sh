@@ -232,7 +232,4 @@ end
 CCTALLY_CUR_FORMULA_EOF
 (cd "$work/homebrew-cctally" && \
   git add . && \
-  git commit -q -m "seed v0.1.1" && \
-  git tag v0.1.1 && \
-  git push -q origin HEAD && \
-  git push -q origin refs/tags/v0.1.1:refs/tags/v0.1.1)
+  git commit -q -m "seed v0.1.1 (local-only)")

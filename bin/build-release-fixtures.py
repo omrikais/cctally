@@ -1845,9 +1845,13 @@ _add(
 )
 
 
-# 35. phase6-already-bumped: tap clone already at v0.1.1 → Phase 6
-# short-circuits via `_release_phase_brew_done`. No render, no commit,
-# no push; stdout reports "already at v0.1.1 — skipping".
+# 35. phase6-already-bumped: tap remote already carries v0.1.1 (commit
+# AND tag) → Phase 6 short-circuits via `_release_phase_brew_done`. The
+# done-check is remote-authoritative (an unpushed local commit no longer
+# masquerades as "done"), so the seed pushes both the commit and the
+# `v0.1.1` tag onto the bare origin. No render, no commit, no push from
+# the Phase 6 invocation itself; stdout reports
+# "already at v0.1.1 on tap — skipping".
 _add(
     name="phase6-already-bumped",
     seed_changelog=_PATCH_SEED,
@@ -1865,11 +1869,46 @@ _add(
         + '(cd "$work/homebrew-cctally" && \\\n'
         + '  git add . && \\\n'
         + '  git commit -q -m "seed v0.1.1" && \\\n'
-        + '  git push -q origin HEAD)\n'
+        + '  git tag v0.1.1 && \\\n'
+        + '  git push -q origin HEAD && \\\n'
+        + '  git push -q origin '
+        + 'refs/tags/v0.1.1:refs/tags/v0.1.1)\n'
     ),
     run=_run_release_with_brew("patch"),
     expected_exit=0,
-    stdout_substr="already at v0.1.1 — skipping",
+    stdout_substr="already at v0.1.1 on tap — skipping",
+    stderr_substr="",
+)
+
+
+# 35b. phase6-local-committed-not-pushed: tap clone has the formula
+# commit at v0.1.1 locally, but the bare origin was never updated (the
+# previous run's `git push` failed). The remote-authoritative done-check
+# returns False, Phase 6 detects `local_at_version` is True, skips
+# render/commit, and runs the (re)tag + push path. Distinguishing
+# stdout: "local formula already at v0.1.1; re-pushing to tap…".
+_add(
+    name="phase6-local-committed-not-pushed",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+        + 'cat > "$work/homebrew-cctally/Formula/cctally.rb" <<\'CCTALLY_CUR_FORMULA_EOF\'\n'
+        + 'class Cctally < Formula\n'
+        + '  url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.1.tar.gz"\n'
+        + '  sha256 "abc"\n'
+        + 'end\n'
+        + 'CCTALLY_CUR_FORMULA_EOF\n'
+        # Commit only — no tag, no push. Mirrors the post-state of a
+        # Phase 6 run that committed locally then `git push` failed.
+        + '(cd "$work/homebrew-cctally" && \\\n'
+        + '  git add . && \\\n'
+        + '  git commit -q -m "seed v0.1.1 (local-only)")\n'
+    ),
+    run=_run_release_with_brew("patch"),
+    expected_exit=0,
+    stdout_substr="local formula already at v0.1.1; re-pushing to tap",
     stderr_substr="",
 )
 
