@@ -1516,8 +1516,8 @@ def _release_run_phase_npm(
                 f"    https://github.com/{PUBLIC_REPO}/actions\n"
                 f"  Re-run `cctally release --resume` once the workflow "
                 f"completes, or for emergency manual publish:\n"
-                f"    cd {public_clone} && npm publish --provenance "
-                f"--access public --tag {dist_tag}\n",
+                f"    cd {public_clone} && npm publish --access public "
+                f"--tag {dist_tag}\n",
                 file=sys.stderr,
             )
             return 0

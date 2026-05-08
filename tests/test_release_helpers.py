@@ -1044,7 +1044,7 @@ class TestReleasePhase5Polling:
         captured = capsys.readouterr()
         assert "timed out after" in captured.err
         assert f"github.com/{cctally.PUBLIC_REPO}/actions" in captured.err
-        assert "npm publish --provenance --access public --tag latest" in captured.err
+        assert "npm publish --access public --tag latest" in captured.err
 
     def test_poll_timing_env_overrides(self, monkeypatch):
         # Defaults when env is absent.
