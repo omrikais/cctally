@@ -1039,19 +1039,27 @@ def _release_discover_brew_clone(
 def _release_phase_brew_done(
     version: str, brew_clone: pathlib.Path
 ) -> bool:
-    """Phase 6 done iff the brew tap **remote** carries ``vX.Y.Z``.
+    """Phase 6 done iff the brew tap **remote** serves the ``vX.Y.Z``
+    formula on its default branch AND carries the ``v<version>`` tag.
 
-    Local-only signal would let a failed ``git push`` masquerade as a
-    completed phase: the formula commit lives in the local clone but
-    ``brew install`` resolves against the tap remote, so a later
-    ``--resume`` must retry the push. Mirrors the
-    :func:`_release_phase_mirror_done` pattern (Phase 3).
+    Tag presence alone is not enough — ``brew install`` reads the
+    formula from the tap's default branch, NOT from the tag, so a
+    half-failed push (tag landed, branch did not) would still serve
+    the prior formula to users. Mirrors the
+    :func:`_release_phase_mirror_done` pattern (Phase 3) and adds a
+    branch-tip check on top.
 
-    Two-step check: cheap local-file sniff first (skips network when
-    the phase clearly hasn't run), then ``git ls-remote`` against the
-    tap origin for ``refs/tags/v<version>``. Phase 6 tags v<version>
-    and pushes via ``--follow-tags``, so the tag landing on origin is
-    a reliable proxy for "the tap remote saw this release."
+    Three-step check (each gates the next):
+
+      1. Local-file sniff — cheap pre-check; skip the network when
+         the formula isn't even staged locally.
+      2. ``git ls-remote --tags origin refs/tags/v<version>`` — tag
+         must be on the remote.
+      3. ``git ls-remote origin refs/heads/<branch>`` SHA == local
+         clone's ``HEAD`` SHA — the local formula commit must be the
+         remote default-branch tip. After a successful Phase 6 push,
+         these match; after a half-failed push (branch fail, tag
+         succeed), they diverge.
 
     Returns ``False`` on any subprocess failure (no origin configured,
     network glitch); the caller proceeds to run the phase, whose own
@@ -1067,11 +1075,28 @@ def _release_phase_brew_done(
             ["git", "-C", str(brew_clone), "remote", "get-url", "origin"],
             text=True,
         ).strip()
-        out = subprocess.check_output(
+        tag_out = subprocess.check_output(
             ["git", "ls-remote", "--tags", origin, f"refs/tags/v{version}"],
             text=True,
         ).strip()
-        return bool(out)
+        if not tag_out:
+            return False
+        local_head = subprocess.check_output(
+            ["git", "-C", str(brew_clone), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        branch = subprocess.check_output(
+            ["git", "-C", str(brew_clone), "rev-parse", "--abbrev-ref", "HEAD"],
+            text=True,
+        ).strip()
+        head_out = subprocess.check_output(
+            ["git", "ls-remote", origin, f"refs/heads/{branch}"],
+            text=True,
+        ).strip()
+        # ls-remote line format: "<sha>\trefs/heads/<branch>"; empty
+        # output means the remote has no such branch (fresh tap).
+        remote_head = head_out.split("\t", 1)[0] if head_out else ""
+        return remote_head == local_head
     except subprocess.CalledProcessError:
         return False
 
@@ -1599,28 +1624,24 @@ def _release_run_phase_brew(
         ["git", "-C", str(brew_clone), "tag", f"v{version}"],
         check=False,
     )
-    branch_push = subprocess.run(
-        ["git", "-C", str(brew_clone), "push", "origin", "HEAD",
-         "--follow-tags"],
+    # Single ATOMIC push of branch + tag in one transaction — the
+    # remote either accepts both refs or neither (server-side atomic
+    # push, `--atomic`). Avoids the half-failed-push asymmetry that a
+    # split branch-push + tag-push pair admits: a tag landing without
+    # the branch landing would leave `brew install` serving the OLD
+    # formula off the tap's default branch even though the remote
+    # carries the new tag. Tag refspec is explicit (`src:dst`) because
+    # `--follow-tags` skips lightweight tags and Phase 6's tag is
+    # lightweight (no `-a`/`-m`).
+    push = subprocess.run(
+        ["git", "-C", str(brew_clone), "push", "--atomic", "origin",
+         "HEAD", f"refs/tags/v{version}:refs/tags/v{version}"],
         check=False,
     )
-    # Belt-and-suspenders tag push, mirroring Phase 2 — `--follow-tags`
-    # only pushes ANNOTATED tags, and Phase 6 creates a lightweight one
-    # (no `-a`/`-m`). Without this explicit refspec push, the tap remote
-    # never sees the tag, the remote-authoritative done-check stays
-    # False forever, and `--resume` would loop. Tag-only push uses
-    # explicit `src:dst` so it works regardless of `--follow-tags`
-    # semantics or whether the branch push needed updates.
-    tag_push = subprocess.run(
-        ["git", "-C", str(brew_clone), "push", "origin",
-         f"refs/tags/v{version}:refs/tags/v{version}"],
-        check=False,
-    )
-    if branch_push.returncode != 0 or tag_push.returncode != 0:
+    if push.returncode != 0:
         print(
             f"\n  push failed. Manual recovery:\n"
-            f"    git -C {brew_clone} push origin HEAD --follow-tags\n"
-            f"    git -C {brew_clone} push origin "
+            f"    git -C {brew_clone} push --atomic origin HEAD "
             f"refs/tags/v{version}:refs/tags/v{version}\n",
             file=sys.stderr,
         )
@@ -19305,7 +19326,10 @@ def _is_cctally_hook_command(cmd: str) -> bool:
     and bare names both match. The discriminator is the LAST TWO tokens
     after stripping any trailing `&` and surrounding whitespace:
 
-      tokens[-2] = a path whose basename is "cctally"
+      tokens[-2] = a path whose basename is "cctally" or
+                   "cctally-npm-shim.js" (npm install layout — the hook
+                   command points at the Node shim so ``CCTALLY_PYTHON``
+                   propagates from the user's shell env into hook fires)
       tokens[-1] = "hook-tick"
 
     Examples that match:
@@ -19313,6 +19337,7 @@ def _is_cctally_hook_command(cmd: str) -> bool:
         "cctally hook-tick &"
         "/Users/me/.local/bin/cctally hook-tick &"
         "'/Users/My Name/.local/bin/cctally' hook-tick &"
+        "/usr/local/lib/node_modules/cctally/bin/cctally-npm-shim.js hook-tick"
     """
     import shlex
     if not isinstance(cmd, str) or not cmd.strip():
@@ -19333,7 +19358,9 @@ def _is_cctally_hook_command(cmd: str) -> bool:
     prev = tokens[-2]
     if last != "hook-tick":
         return False
-    return pathlib.PurePosixPath(prev).name == "cctally"
+    return pathlib.PurePosixPath(prev).name in (
+        "cctally", "cctally-npm-shim.js",
+    )
 
 
 class SetupError(RuntimeError):
@@ -20958,6 +20985,24 @@ def _setup_resolve_symlink_source(repo_root: pathlib.Path, name: str) -> pathlib
     return repo_root / "bin" / name
 
 
+def _setup_resolve_hook_target(repo_root: pathlib.Path) -> pathlib.Path:
+    """Resolve the absolute path that goes into Claude Code hook entries.
+
+    Single chokepoint shared by ``_setup_install``, ``_setup_dry_run``
+    (text + JSON envelopes), and any other site that emits a hook
+    command. Routes through :func:`_setup_resolve_symlink_source` so
+    npm-layout installs point hooks at the Node shim instead of the
+    Python script directly — without this, the shim's
+    ``CCTALLY_PYTHON`` honoring works for interactive ``cctally`` calls
+    but every hook fire bypasses it via ``/usr/bin/env python3`` and
+    silently fails when the user's ``python3`` doesn't meet the version
+    floor. The returned path is fully resolved (symlinks followed) so
+    the recorded hook entry survives later filesystem rearrangements
+    of the source clone or the npm install root.
+    """
+    return _setup_resolve_symlink_source(repo_root, "cctally").resolve()
+
+
 def _setup_create_symlinks(
     repo_root: pathlib.Path, dst_dir: pathlib.Path, *, names: tuple[str, ...] = SETUP_SYMLINK_NAMES
 ) -> list[_SetupSymlinkResult]:
@@ -21355,7 +21400,7 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
         out.append("  Remove them manually then re-run.")
 
     out.append(f"Would add {len(SETUP_HOOK_EVENTS)} hook entries to {CLAUDE_SETTINGS_PATH}:")
-    abs_path = str((repo_root / "bin" / "cctally").resolve())
+    abs_path = str(_setup_resolve_hook_target(repo_root))
     import shlex
     quoted = shlex.quote(abs_path)
     for ev in SETUP_HOOK_EVENTS:
@@ -21423,7 +21468,7 @@ def _setup_install(args: argparse.Namespace) -> int:
 
     repo_root = _setup_resolve_repo_root()
     dst_dir = _setup_local_bin_dir()
-    abs_path = str((repo_root / "bin" / "cctally").resolve())
+    abs_path = str(_setup_resolve_hook_target(repo_root))
 
     # Validate settings.json BEFORE creating symlinks so a malformed
     # settings file leaves the filesystem untouched (spec §2.2 — exit

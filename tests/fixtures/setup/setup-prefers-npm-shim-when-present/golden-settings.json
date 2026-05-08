@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/REPO/node_modules/cctally/bin/cctally hook-tick"
+            "command": "/REPO/node_modules/cctally/bin/cctally-npm-shim.js hook-tick"
           }
         ]
       }
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/REPO/node_modules/cctally/bin/cctally hook-tick"
+            "command": "/REPO/node_modules/cctally/bin/cctally-npm-shim.js hook-tick"
           }
         ]
       }
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/REPO/node_modules/cctally/bin/cctally hook-tick"
+            "command": "/REPO/node_modules/cctally/bin/cctally-npm-shim.js hook-tick"
           }
         ]
       }

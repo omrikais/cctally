@@ -1913,6 +1913,48 @@ _add(
 )
 
 
+# 35c. phase6-tag-pushed-branch-not: tap remote carries v0.1.1 tag but
+# default branch still serves the OLD formula — the post-state of a
+# manually-recovered partial publish where the operator force-pushed
+# the tag without pushing the branch. Exercises the branch-tip leg of
+# `_release_phase_brew_done`: tag check passes, but local HEAD's SHA
+# diverges from the remote default branch's SHA so the done-signal
+# returns False. Phase 6 then re-runs and the atomic push lands both
+# refs on the remote. Distinguishing stdout: same
+# "local formula already at v0.1.1; re-pushing to tap…" path as 35b
+# (the branch-tip mismatch is detected by the done-check, not the
+# `local_at_version` short-circuit).
+_add(
+    name="phase6-tag-pushed-branch-not",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+        + 'cat > "$work/homebrew-cctally/Formula/cctally.rb" <<\'CCTALLY_CUR_FORMULA_EOF\'\n'
+        + 'class Cctally < Formula\n'
+        + '  url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.1.tar.gz"\n'
+        + '  sha256 "abc"\n'
+        + 'end\n'
+        + 'CCTALLY_CUR_FORMULA_EOF\n'
+        # Commit + tag locally, then push ONLY the tag. The branch
+        # head on the bare remote still points at the tap's seed
+        # commit; brew install would still serve the OLD formula
+        # despite the tag landing.
+        + '(cd "$work/homebrew-cctally" && \\\n'
+        + '  git add . && \\\n'
+        + '  git commit -q -m "seed v0.1.1 (tag-only)" && \\\n'
+        + '  git tag v0.1.1 && \\\n'
+        + '  git push -q origin '
+        + 'refs/tags/v0.1.1:refs/tags/v0.1.1)\n'
+    ),
+    run=_run_release_with_brew("patch"),
+    expected_exit=0,
+    stdout_substr="local formula already at v0.1.1; re-pushing to tap",
+    stderr_substr="",
+)
+
+
 # 36. phase6-no-clone-configured: no `release.brewClone` git config →
 # `_release_discover_brew_clone` returns None → Phase 6 prints the
 # bootstrap hint to stderr and returns 0 (graceful skip; release still

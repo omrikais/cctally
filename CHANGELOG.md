@@ -18,22 +18,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   brew skips pre-releases.
 
 ### Fixed
-- `cctally release` Phase 6 done-check is now remote-authoritative.
-  Previously checked only the local brew-clone working tree, so a
-  failed `git push` could leave the formula committed locally while
-  the tap remote stayed unchanged — `--resume` would then short-circuit
-  and report the release as published even though `brew install` could
-  not see it. Done-check now runs `git ls-remote --tags origin
-  refs/tags/v<version>` against the tap origin (mirrors Phase 3's
-  `_release_phase_mirror_done` pattern). Resume after a push failure
-  detects the local-but-not-remote state and goes straight to a
-  re-push without re-rendering or re-committing.
-- `cctally release` Phase 6 now pushes the tag via explicit
-  `refs/tags/v<version>:refs/tags/v<version>` refspec alongside
-  `git push --follow-tags`. The tag created in Phase 6 is lightweight,
-  and `--follow-tags` only pushes annotated tags, so the tap remote
-  never received the version tag in any prior release. Belt-and-
-  suspenders parity with Phase 2.
+- `cctally release` Phase 6 done-check is now remote-authoritative
+  AND verifies the tap default-branch tip. Done-check runs three
+  predicates: the local formula contains `/v<version>.tar.gz`, the
+  tap origin carries `refs/tags/v<version>`, and the local clone's
+  HEAD SHA equals the remote default-branch SHA. Without the
+  branch-tip leg, a half-failed push (tag landed, branch did not)
+  could mark Phase 6 done while `brew install` — which reads the
+  formula from the default branch, not from the tag — still served
+  the prior version. Resume after any push failure detects the
+  local-but-not-remote state and re-pushes without re-rendering or
+  re-committing.
+- `cctally release` Phase 6 push is now atomic: a single
+  `git push --atomic origin HEAD refs/tags/v<version>:refs/tags/v<version>`
+  replaces the previous separate branch + tag pushes. Both refs land
+  or neither, eliminating the half-failed-push asymmetry at the
+  source. Lightweight tag (no `-a`/`-m`) still works because the tag
+  refspec is explicit.
+- `cctally setup` hook commands now route through the same
+  channel-aware resolver used for the `cctally` symlink, so npm
+  installs get the Node shim path in `~/.claude/settings.json`
+  instead of the Python script directly. Without this, npm users who
+  set `CCTALLY_PYTHON` (because system `python3` is below 3.13) had
+  working interactive `cctally` invocations but every Claude Code
+  hook fire bypassed `CCTALLY_PYTHON` via the script's
+  `/usr/bin/env python3` shebang and silently failed. brew installs
+  are unaffected (formula pins `python@3.13`).
 - `cctally setup` no longer symlinks `~/.local/bin/cctally` to the
   Node shim during a source-clone install. Resolver previously selected
   `bin/cctally-npm-shim.js` whenever the file was present; since the
