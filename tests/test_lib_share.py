@@ -649,3 +649,15 @@ def test_render_md_escapes_html_chars_in_revealed_project():
     out = _lib_share._render_md(snap, branding=True)
     assert "<script>" not in out
     assert "evil&lt;script&gt;" in out
+
+
+def test_render_md_notes_become_blockquotes():
+    """Notes render as Markdown blockquote lines."""
+    base = _make_minimal_snapshot()
+    snap = _lib_share.ShareSnapshot(
+        **{**base.__dict__,
+           "notes": ("LOW CONF: thin data", "5h reset crossed week")},
+    )
+    out = _lib_share._render_md(snap, branding=True)
+    assert "> LOW CONF: thin data" in out
+    assert "> 5h reset crossed week" in out

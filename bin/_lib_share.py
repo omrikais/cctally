@@ -104,6 +104,13 @@ class BarChart:
 
 @dataclass(frozen=True)
 class HorizontalBarChart:
+    """Horizontal bar chart with top-N cap.
+
+    Contract: each point's `y_value` is treated as a non-negative magnitude.
+    Negative `y_value` would produce visually-misleading negative-width
+    rendering (silently zero in most SVG renderers); kernel-internal
+    callers must pre-filter or coerce.
+    """
     points: tuple[ChartPoint, ...]
     x_label: str
     cap: int | None = None
@@ -320,6 +327,9 @@ _PADDING_BOTTOM = 30  # x-tick labels
 _PADDING_TOP = 10
 _PADDING_RIGHT = 10
 
+_HBAR_LABEL_GUTTER = 120.0   # left gutter for project labels (anonymized fits; long revealed labels may overflow)
+_HBAR_RIGHT_PAD = 10.0       # right-side breathing room for value labels
+
 
 def _chart_inner_box(
     x: float, y: float, width: float, height: float,
@@ -348,17 +358,24 @@ def _scale_y(
     return y_max, f
 
 
+def _render_chart_no_data(palette: Mapping[str, str], *,
+                          x: float, y: float, width: float, height: float) -> str:
+    """Render the canonical '(no data)' placeholder for an empty chart."""
+    return svg_group([
+        svg_text(x + width / 2, y + height / 2, "(no data)",
+                 font_size=12, fill=palette["muted"], anchor="middle"),
+    ])
+
+
 # --- Chart renderers ---
 
+# Line chart.
 def _render_line_chart_svg(chart: LineChart, *, palette: dict,
                            x: float, y: float, width: float, height: float) -> str:
     ix, iy, iw, ih = _chart_inner_box(x, y, width, height)
     pts = chart.points
     if not pts:
-        return svg_group([
-            svg_text(x + width / 2, y + height / 2, "(no data)",
-                     font_size=12, fill=palette["muted"], anchor="middle"),
-        ])
+        return _render_chart_no_data(palette, x=x, y=y, width=width, height=height)
 
     y_values = [p.y_value for p in pts] + [r[0] for r in chart.reference_lines]
     _, scale_y = _scale_y(y_values, ih)
@@ -416,15 +433,13 @@ def _render_line_chart_svg(chart: LineChart, *, palette: dict,
     return svg_group(elements)
 
 
+# Bar chart (vertical).
 def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
                           x: float, y: float, width: float, height: float) -> str:
     ix, iy, iw, ih = _chart_inner_box(x, y, width, height)
     pts = chart.points
     if not pts:
-        return svg_group([
-            svg_text(x + width / 2, y + height / 2, "(no data)",
-                     font_size=12, fill=palette["muted"], anchor="middle"),
-        ])
+        return _render_chart_no_data(palette, x=x, y=y, width=width, height=height)
 
     n = len(pts)
     bar_gap = 4.0
@@ -456,21 +471,19 @@ def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
     return svg_group(elements)
 
 
+# Horizontal bar chart (top-N with cap).
 def _render_hbar_chart_svg(chart: HorizontalBarChart, *, palette: dict,
                            x: float, y: float, width: float, height: float) -> str:
     pts = chart.points
     if chart.cap is not None:
         pts = pts[:chart.cap]
     if not pts:
-        return svg_group([
-            svg_text(x + width / 2, y + height / 2, "(no data)",
-                     font_size=12, fill=palette["muted"], anchor="middle"),
-        ])
+        return _render_chart_no_data(palette, x=x, y=y, width=width, height=height)
 
-    label_w = 120.0  # left gutter for project labels
+    label_w = _HBAR_LABEL_GUTTER
     ix = x + label_w
     iy = y + 6
-    iw = width - label_w - 10
+    iw = width - label_w - _HBAR_RIGHT_PAD
     ih = height - 12
 
     n = len(pts)
@@ -478,7 +491,7 @@ def _render_hbar_chart_svg(chart: HorizontalBarChart, *, palette: dict,
     bar_h = max(8.0, row_h * 0.7)
     bar_gap = (row_h - bar_h) / 2
 
-    x_max = max(p.y_value for p in pts) if pts else 1.0
+    x_max = max(p.y_value for p in pts)
     if x_max <= 0:
         x_max = 1.0
 
