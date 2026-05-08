@@ -205,3 +205,47 @@ PALETTE_DARK = {
     "table_row_alt": "#1f2937",
     "footer_link": "#60a5fa",
 }
+
+
+# --- Format renderers (stubs; full impl in later tasks) ---
+
+def _render_md(snap: ShareSnapshot, *, branding: bool) -> str:
+    # Minimal stub — Task 22 fills this out with table + chrome.
+    lines = [f"# {_md_escape(snap.title)}"]
+    return "\n".join(lines) + "\n"
+
+
+def _render_svg(snap: ShareSnapshot, *, palette: dict, branding: bool, include_chrome: bool = True) -> str:
+    # Minimal stub — Task 11 fills this out with chart + chrome.
+    return f'<svg xmlns="http://www.w3.org/2000/svg"><!-- {_xml_escape(snap.title)} --></svg>'
+
+
+def _render_html(snap: ShareSnapshot, *, palette: dict, branding: bool) -> str:
+    # Minimal stub — Task 12 fills this out with HTML chrome around chart-only SVG.
+    return f"<!DOCTYPE html><html><body><h1>{_xml_escape(snap.title)}</h1></body></html>"
+
+
+# --- Public dispatch ---
+
+def render(snap: ShareSnapshot, *, format: str, theme: str, branding: bool) -> str:
+    """Render a snapshot to the requested format.
+
+    Pure function: no I/O, no DB, no filesystem, no locks. Caller is
+    responsible for emitting the result (stdout/file/clipboard/open).
+    """
+    if format == "md":
+        return _render_md(snap, branding=branding)
+
+    if theme == "light":
+        palette = PALETTE_LIGHT
+    elif theme == "dark":
+        palette = PALETTE_DARK
+    else:
+        raise ValueError(f"unknown theme: {theme!r}")
+
+    if format == "svg":
+        return _render_svg(snap, palette=palette, branding=branding, include_chrome=True)
+    if format == "html":
+        return _render_html(snap, palette=palette, branding=branding)
+
+    raise ValueError(f"unknown format: {format!r}")

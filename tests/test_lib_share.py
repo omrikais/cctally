@@ -122,3 +122,20 @@ def test_palettes_have_required_keys():
     assert set(_lib_share.PALETTE_DARK.keys()) >= required_keys
     # Palettes must differ on at least the bg color.
     assert _lib_share.PALETTE_LIGHT["bg"] != _lib_share.PALETTE_DARK["bg"]
+
+
+def test_render_dispatches_md():
+    snap = _make_minimal_snapshot()
+    out = _lib_share.render(snap, format="md", theme="light", branding=True)
+    assert isinstance(out, str)
+    assert snap.title in out
+
+
+def test_render_unknown_format_raises():
+    snap = _make_minimal_snapshot()
+    try:
+        _lib_share.render(snap, format="pdf", theme="light", branding=True)
+    except ValueError as e:
+        assert "format" in str(e).lower()
+        return
+    raise AssertionError("expected ValueError on unknown format")
