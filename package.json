@@ -42,10 +42,18 @@
   "keywords": [
     "claude",
     "claude-code",
+    "ccusage",
+    "anthropic",
     "usage",
+    "usage-tracker",
     "cost",
+    "cost-tracking",
     "tracker",
+    "tui",
     "dashboard",
-    "cli"
+    "cli",
+    "codex",
+    "llm",
+    "ai-tools"
   ]
 }

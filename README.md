@@ -9,6 +9,13 @@
   <strong>Track Claude Code subscription usage as a weekly $-per-1% trend. Local web dashboard, terminal UI, forecasts, and threshold alerts.</strong>
 </p>
 
+<p align="center">
+  <a href="https://www.npmjs.com/package/cctally"><img src="https://img.shields.io/npm/v/cctally.svg" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/cctally"><img src="https://img.shields.io/npm/dm/cctally.svg" alt="npm downloads"></a>
+  <a href="https://github.com/omrikais/cctally/blob/main/LICENSE"><img src="https://img.shields.io/github/license/omrikais/cctally.svg" alt="Apache-2.0 license"></a>
+  <a href="https://github.com/omrikais/cctally/stargazers"><img src="https://img.shields.io/github/stars/omrikais/cctally.svg" alt="GitHub stars"></a>
+</p>
+
 If you're using `ccusage` to watch Claude Code spend, `cctally` covers the same ground and adds the parts you reach for next: a live web dashboard, a forecast that tells you whether you're going to cap this week, threshold alerts when you cross a percent, and a persistent week-over-week trend of cost per percent of quota. All local, no account, no telemetry.
 
 <p align="center">
