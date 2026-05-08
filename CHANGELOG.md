@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-05-08
+
 ### Added
 - npm distribution channel — `npm install -g cctally` lands the
   Python script and dashboard assets via a thin Node shim. `package.json`

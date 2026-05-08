@@ -1,0 +1,51 @@
+{
+  "name": "cctally",
+  "version": "1.2.0",
+  "description": "Track Claude Code subscription usage as a weekly $-per-1% trend. Local web dashboard, terminal UI, forecasts, and threshold alerts.",
+  "homepage": "https://github.com/omrikais/cctally",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/omrikais/cctally.git"
+  },
+  "bugs": "https://github.com/omrikais/cctally/issues",
+  "license": "Apache-2.0",
+  "author": "Omri Kaisari",
+  "bin": {
+    "cctally": "./bin/cctally-npm-shim.js"
+  },
+  "files": [
+    "bin/cctally",
+    "bin/cctally-alerts",
+    "bin/cctally-dashboard",
+    "bin/cctally-dollar-per-percent",
+    "bin/cctally-five-hour-blocks",
+    "bin/cctally-five-hour-breakdown",
+    "bin/cctally-forecast",
+    "bin/cctally-npm-shim.js",
+    "bin/cctally-project",
+    "bin/cctally-refresh-usage",
+    "bin/cctally-release",
+    "bin/cctally-sync-week",
+    "bin/cctally-tui",
+    "dashboard/static/**",
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "usage",
+    "cost",
+    "tracker",
+    "dashboard",
+    "cli"
+  ]
+}
