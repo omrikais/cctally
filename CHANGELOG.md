@@ -5,8 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Changed
+## [1.3.0] - 2026-05-08
 
+### Changed
 - `release` Phase 5 now publishes to npm via a GitHub Actions OIDC trusted-publisher workflow in the public repo, with `npm publish --provenance` for supply-chain attestation. The release script no longer invokes `npm publish` locally — it polls `npm view` until the workflow lands the version. Eliminates the prior failure mode where passkey-based npm 2FA would block `npm publish` from a non-interactive subprocess.
 
 ## [1.2.0] - 2026-05-08
