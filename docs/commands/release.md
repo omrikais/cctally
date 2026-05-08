@@ -1,11 +1,11 @@
 # `cctally release`
 
 Stamp `CHANGELOG.md`, cut a SemVer tag, propagate the commit + tag to the
-public mirror, and create a GitHub Release. Four idempotent phases run in
-sequence; any failure can be recovered via `--resume`. The same body
-string flows through the stamp commit's public block, the tag annotation,
-and the GitHub Release notes — single-source from the canonical
-CHANGELOG section.
+public mirror, create a GitHub Release, publish to npm, and bump the
+Homebrew tap formula. Six idempotent phases run in sequence; any failure
+can be recovered via `--resume`. The same body string flows through the
+stamp commit's public block, the tag annotation, and the GitHub Release
+notes — single-source from the canonical CHANGELOG section.
 
 ## Synopsis
 
@@ -50,7 +50,9 @@ minor --prerelease-id beta` produces `1.1.0-beta.1`).
 | `kind` (positional)  | required    | One of `patch`, `minor`, `major`, `prerelease`, `finalize`. Omit only with `--resume`.                               |
 | `--resume`           | off         | Continue an in-progress release; infers `vX.Y.Z` from the latest CHANGELOG header. Mutually exclusive with `kind` / `--bump`. |
 | `--dry-run`          | off         | Print the phase plan + unified CHANGELOG diff + tag annotation + mirror plan + gh plan; mutate nothing. Exits 0 on a clean dry-run, 2 if the stamp itself would refuse. |
-| `--no-publish`       | off         | Run phases 1 + 2 only (stamp + tag + push); skip phase 3 (mirror) and phase 4 (gh release).                          |
+| `--no-publish`       | off         | Run phases 1 + 2 only (stamp + tag + push); skip phases 3–6 (mirror, gh release, npm, brew).                         |
+| `--skip-npm`         | off         | Skip Phase 5 (npm publish). Idempotency-safe; resume picks the channel back up.                                      |
+| `--skip-brew`        | off         | Skip Phase 6 (brew formula bump). Idempotency-safe.                                                                  |
 | `--bump {patch,minor,major}` | none | REQUIRED with `prerelease` when current is stable; REFUSED when current is already a prerelease.                     |
 | `--prerelease-id ID` | `rc`        | Override the default prerelease identifier (e.g. `beta`, `alpha`).                                                   |
 | `--remote NAME`      | `origin`    | Private remote name (used for `git push`, tag push, fetch).                                                          |
@@ -59,7 +61,7 @@ minor --prerelease-id beta` produces `1.1.0-beta.1`).
 
 ## Phases
 
-Four ordered, individually idempotent phases:
+Six ordered, individually idempotent phases:
 
 ### Phase 1 — Stamp CHANGELOG.md
 
@@ -128,10 +130,50 @@ a bare `EOF` line doesn't prematurely close the heredoc) and returns 0.
 Phases 1–3 already succeeded; the release IS published from the public
 mirror's perspective. Skipped under `--no-publish`.
 
+### Phase 5 — npm publish
+
+Publishes the `cctally` package to npmjs.org from the public clone. Idempotent: short-circuits when `npm view cctally@<v> dist.tarball` already returns the registry URL.
+
+**Auth fallback:** when `npm whoami` exits nonzero, the phase prints `cd <public-clone> && npm publish --tag <tag>` to stderr and returns 0 — the release stays "published" from phases 1-4's perspective; the operator runs the printed command after `npm login`.
+
+**Dist-tag rule:** stable releases publish under `--tag latest`; pre-releases (versions with `-rc.N` etc.) publish under `--tag next`. So `npm install cctally` always returns the latest stable, and `npm install cctally@next` pulls the bleeding edge.
+
+**Skip:** `--skip-npm` skips the phase entirely. Idempotency-safe — re-running `--resume` without the flag picks the channel back up.
+
+### Phase 6 — brew formula bump
+
+Renders `homebrew/cctally.rb.template` (in cctally-dev) into `Formula/cctally.rb` in the `omrikais/homebrew-cctally` tap repo, with `<<VERSION>>` and `<<SHA256>>` substituted (sha256 computed by downloading `https://github.com/omrikais/cctally/archive/refs/tags/v<v>.tar.gz`). Commits, tags, pushes.
+
+**Tap discovery chain** (highest priority first):
+1. `--brew-clone <path>` flag.
+2. `git config --get release.brewClone`.
+3. `~/.local/share/cctally/release-brew-clone-path` marker file.
+
+When all three sources are absent, the phase prints a bootstrap hint and returns 0 (graceful skip — channels are opt-in).
+
+**Pre-releases skip the phase entirely.** Brew formulas don't have a clean pre-release channel without extending into casks; users wanting pre-releases install via `npm install cctally@next` or run from source.
+
+**Skip:** `--skip-brew` skips the phase entirely. Idempotency-safe.
+
+## Bootstrapping the brew tap (one-time)
+
+Phase 6 pushes formula updates to a tap repo you own. Set it up once:
+
+```bash
+gh repo create omrikais/homebrew-cctally --public --description "Homebrew tap for cctally"
+git clone https://github.com/omrikais/homebrew-cctally.git ~/repos/homebrew-cctally
+cd ~/repos/homebrew-cctally
+mkdir Formula
+# (Phase 6 will create Formula/cctally.rb on first run)
+git config --global release.brewClone ~/repos/homebrew-cctally
+```
+
+After this, `cctally release patch` will publish the formula automatically.
+
 ## `--resume`
 
 `--resume` infers the target version from the latest CHANGELOG header
-and walks the four phases, short-circuiting any whose done-signal is
+and walks the six phases, short-circuiting any whose done-signal is
 true:
 
 - **Phase 1 done:** `CHANGELOG.md` has the header AND `HEAD`'s subject
@@ -142,8 +184,13 @@ true:
   (read-only `git ls-remote --tags`).
 - **Phase 4 done:** `gh release view vX.Y.Z --repo omrikais/cctally`
   returns 0.
+- **Phase 5 done:** `npm view cctally@<v> dist.tarball` returns the
+  registry URL (or `--skip-npm` was passed).
+- **Phase 6 done:** the brew tap's `Formula/cctally.rb` already carries
+  `version "X.Y.Z"`, the tap is at the matching tag, or `--skip-brew`
+  was passed (and the version is not a pre-release).
 
-If all four signals are true, exits 0 immediately with `release vX.Y.Z
+If all six signals are true, exits 0 immediately with `release vX.Y.Z
 already published`.
 
 `--resume` is mutually exclusive with `kind` / `--bump`. The phase-done
