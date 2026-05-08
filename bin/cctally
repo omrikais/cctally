@@ -24065,6 +24065,103 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # ============================================================
+# ==== Shareable reports: destination + emit ====            =
+# ============================================================
+# Translate parsed argparse args + a rendered string into actual delivery
+# (stdout / file / clipboard / open). These helpers live here, NOT in
+# `_lib_share.py`, so the kernel module stays I/O-pure (Section 5.8 of the
+# shareable-reports spec).
+
+
+def _share_resolve_download_dir() -> pathlib.Path:
+    """XDG -> ~/Downloads -> ~ fallback (Section 4.2)."""
+    xdg = os.environ.get("XDG_DOWNLOAD_DIR")
+    if xdg:
+        p = pathlib.Path(xdg).expanduser()
+        if p.exists():
+            return p
+    downloads = pathlib.Path.home() / "Downloads"
+    if downloads.exists():
+        return downloads
+    return pathlib.Path.home()
+
+
+def _share_unique_path(base: pathlib.Path) -> pathlib.Path:
+    """Auto-collision counter — base.html -> base-2.html -> base-3.html -> ... cap 99."""
+    if not base.exists():
+        return base
+    stem = base.stem
+    suffix = base.suffix
+    parent = base.parent
+    for n in range(2, 100):
+        candidate = parent / f"{stem}-{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise SystemExit(
+        f"cctally: too many same-day collisions in {parent}; use --output <path>"
+    )
+
+
+def _resolve_destination(
+    args, *, cmd: str, generated_at_utc_date: str
+) -> tuple[str, pathlib.Path | None]:
+    """Translate argparse args into (kind, value).
+
+    kind: "stdout" | "file" | "clipboard"
+    value: pathlib.Path for "file"; None for "stdout" / "clipboard".
+    """
+    fmt = args.format
+    if getattr(args, "copy", False):
+        if fmt != "md":
+            raise SystemExit("cctally: --copy is only valid with --format md")
+        return ("clipboard", None)
+
+    output = getattr(args, "output", None)
+    if output == "-":
+        return ("stdout", None)
+    if output:
+        return ("file", pathlib.Path(output).expanduser())
+
+    if fmt == "md":
+        return ("stdout", None)
+    # html/svg default -> ~/Downloads/cctally-<cmd>-<utcdate>.<ext>
+    base = _share_resolve_download_dir() / f"cctally-{cmd}-{generated_at_utc_date}.{fmt}"
+    return ("file", _share_unique_path(base))
+
+
+def _emit(content: str, *, kind: str, value, fmt: str) -> None:
+    """Deliver rendered content to stdout/file/clipboard."""
+    if kind == "stdout":
+        sys.stdout.write(content)
+        if not content.endswith("\n"):
+            sys.stdout.write("\n")
+        return
+
+    if kind == "file":
+        path = pathlib.Path(value)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        sys.stderr.write(f"Wrote {path}\n")
+        return
+
+    if kind == "clipboard":
+        for cmd_args in (
+            ["pbcopy"],
+            ["xclip", "-sel", "clip"],
+            ["clip.exe"],
+        ):
+            tool = cmd_args[0]
+            if shutil.which(tool):
+                proc = subprocess.run(cmd_args, input=content, text=True, check=False)
+                if proc.returncode == 0:
+                    sys.stderr.write(f"Copied to clipboard via {tool}\n")
+                    return
+        raise SystemExit("cctally: --copy requires pbcopy, xclip, or clip on PATH")
+
+    raise ValueError(f"unknown destination kind: {kind!r}")
+
+
+# ============================================================
 # ==== TUI ====                                              =
 # ============================================================
 # Live dashboard subcommand. Lazy rich import keeps the rest of the

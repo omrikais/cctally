@@ -1,7 +1,9 @@
 """Layer A unit tests for bin/_lib_share.py."""
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
+import os
 import pathlib
 import sys
 from datetime import datetime, timezone
@@ -16,6 +18,25 @@ _lib_share = importlib.util.module_from_spec(_spec)
 # during class processing, which fails if the module isn't registered yet.
 sys.modules["_lib_share"] = _lib_share
 _spec.loader.exec_module(_lib_share)
+
+# Load bin/cctally as a module for testing destination/emit helpers. The
+# script has no .py extension, so we supply an explicit SourceFileLoader
+# (otherwise spec_from_file_location returns None for unrecognized suffixes).
+# The module guards CLI entry behind `if __name__ == "__main__":`, so
+# exec_module doesn't trigger argparse parsing. The CCTALLY_TEST_IMPORT env
+# var is defensive for any future restructure that might run argparse at
+# module import time.
+os.environ.setdefault("CCTALLY_TEST_IMPORT", "1")
+_CCTALLY_PATH = _REPO_ROOT / "bin" / "cctally"
+_cctally_loader = importlib.machinery.SourceFileLoader(
+    "_cctally_for_tests", str(_CCTALLY_PATH)
+)
+_cctally_spec = importlib.util.spec_from_loader(
+    "_cctally_for_tests", _cctally_loader
+)
+_cctally = importlib.util.module_from_spec(_cctally_spec)
+sys.modules["_cctally_for_tests"] = _cctally
+_cctally_loader.exec_module(_cctally)
 
 # Re-export for terse test bodies.
 ShareSnapshot = _lib_share.ShareSnapshot
@@ -885,3 +906,81 @@ def test_scrub_anonymizes_chart_only_project_label():
     for fmt in ("md", "svg", "html"):
         out = _lib_share.render(scrubbed, format=fmt, theme="light", branding=True)
         assert "acme-secret-project" not in out, f"chart-only token leaked into {fmt}"
+
+
+# ============================================================
+# Destination + emit helpers (live in bin/cctally, not _lib_share).
+# ============================================================
+
+
+def test_resolve_destination_md_default_stdout():
+    args = type("A", (), {"format": "md", "output": None, "copy": False,
+                          "open_after_write": False})()
+    kind, value = _cctally._resolve_destination(args, cmd="daily",
+                                                generated_at_utc_date="2026-05-09")
+    assert kind == "stdout"
+    assert value is None
+
+
+def test_resolve_destination_md_copy():
+    args = type("A", (), {"format": "md", "output": None, "copy": True,
+                          "open_after_write": False})()
+    kind, value = _cctally._resolve_destination(args, cmd="daily",
+                                                generated_at_utc_date="2026-05-09")
+    assert kind == "clipboard"
+    assert value is None
+
+
+def test_resolve_destination_html_default_downloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DOWNLOAD_DIR", str(tmp_path))
+    args = type("A", (), {"format": "html", "output": None, "copy": False,
+                          "open_after_write": False})()
+    kind, value = _cctally._resolve_destination(args, cmd="daily",
+                                                generated_at_utc_date="2026-05-09")
+    assert kind == "file"
+    assert str(value).startswith(str(tmp_path))
+    assert "cctally-daily-2026-05-09.html" in str(value)
+
+
+def test_resolve_destination_html_collision_appends_counter(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DOWNLOAD_DIR", str(tmp_path))
+    # Pre-create the would-be path.
+    (tmp_path / "cctally-daily-2026-05-09.html").write_text("x")
+    args = type("A", (), {"format": "html", "output": None, "copy": False,
+                          "open_after_write": False})()
+    kind, value = _cctally._resolve_destination(args, cmd="daily",
+                                                generated_at_utc_date="2026-05-09")
+    assert "cctally-daily-2026-05-09-2.html" in str(value)
+
+
+def test_resolve_destination_html_explicit_output(tmp_path):
+    target = tmp_path / "myreport.html"
+    args = type("A", (), {"format": "html", "output": str(target), "copy": False,
+                          "open_after_write": False})()
+    kind, value = _cctally._resolve_destination(args, cmd="daily",
+                                                generated_at_utc_date="2026-05-09")
+    assert kind == "file"
+    assert str(value) == str(target)
+
+
+def test_resolve_destination_explicit_dash_means_stdout():
+    args = type("A", (), {"format": "html", "output": "-", "copy": False,
+                          "open_after_write": False})()
+    kind, value = _cctally._resolve_destination(args, cmd="daily",
+                                                generated_at_utc_date="2026-05-09")
+    assert kind == "stdout"
+    assert value is None
+
+
+def test_emit_stdout_writes_content(capsys):
+    _cctally._emit("hello\n", kind="stdout", value=None, fmt="md")
+    captured = capsys.readouterr()
+    assert captured.out == "hello\n"
+
+
+def test_emit_file_writes_path_and_logs_to_stderr(tmp_path, capsys):
+    target = tmp_path / "out.html"
+    _cctally._emit("<html>", kind="file", value=str(target), fmt="html")
+    assert target.read_text() == "<html>"
+    captured = capsys.readouterr()
+    assert str(target) in captured.err
