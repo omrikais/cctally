@@ -629,6 +629,40 @@ def _run_release_with_brew(release_args: str) -> str:
     )
 
 
+def _run_release_with_npm_and_brew(release_args: str) -> str:
+    """run.sh body for scenarios that exercise BOTH Phase 5 (with
+    canned npm responses, requires `_seed_npm_mock_state` in
+    extra_setup) AND Phase 6 (with the fake brew archive URL).
+    Used by Batch 9's resume scenarios where the resume run needs
+    Phase 5 to publish (or short-circuit on a "view returns URL"
+    state) AND Phase 6 to run.
+
+    Differs from `_run_release_with_brew` only in that it exports
+    `NPM_MOCK_STATE_FILE` so the fake-npm reads canned responses
+    instead of auth-fallbacking.
+    """
+    return _RUN_HEADER + (
+        ': > "$work/npm-invocations.log"\n'
+        'export NPM_MOCK_STATE_FILE="$work/npm-mock-state.json"\n'
+        'export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"\n'
+        '# Phase 6: point the brew archive URL at the in-tree fake archive\n'
+        '# so sha256 is deterministic across runs.\n'
+        'export CCTALLY_RELEASE_BREW_ARCHIVE_URL='
+        '"file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz"\n'
+        f'python3 bin/cctally release {release_args} '
+        f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
+        f'rc=$?\n'
+        f'echo "$rc" > "$work/_artifacts/exit.txt"\n'
+        + _CAPTURE_ARTIFACTS
+        + '# Phase 6: capture the rendered formula (when produced) for golden\n'
+        + '# substring checks. `|| true` keeps scenarios that never write\n'
+        + '# the formula (skip / refusal / pre-release) from failing here.\n'
+        + 'cp "$work/homebrew-cctally/Formula/cctally.rb" '
+        + '"$work/_artifacts/formula.rb" 2>/dev/null || true\n'
+        + 'exit "$rc"\n'
+    )
+
+
 def _seed_fake_brew_tap() -> str:
     """Bash snippet (run with cwd=$work/private) that initializes the
     fake brew tap layout under `$work/`:
@@ -1927,6 +1961,207 @@ _add(
     expected_exit=0,
     stdout_substr="phase 6: brew formula bump",
     stderr_substr="push failed. Manual recovery",
+)
+
+
+# ===========================================================================
+# Group 9 — multi-channel resume scenarios (Batch 9 / Task 43).
+#
+# These exercise the `--resume` gate (Task 42) at three different
+# completion states across all six phases. Every resume scenario shares
+# the same shape: setup pre-runs `cctally release patch [...]` with
+# selected `--skip-*` flags so phases 1-N land, then swaps the fake
+# binaries into their "phase done" responses, then run.sh issues a
+# `cctally release --resume` whose behavior depends on which phases
+# the gate sees as done.
+# ---------------------------------------------------------------------------
+# Shared swap snippets:
+#   * `_FAKE_GH_DONE_SWAP` — replaces the fake-gh script in place with
+#     one that returns 0 on `release view` (i.e. "release already
+#     exists" so `_release_phase_gh_done` reports True).
+#   * `_NPM_MOCK_VIEW_RETURNS_URL` — npm-mock-state.json with `view`
+#     returning the registry URL (so `_release_phase_npm_done` reports
+#     True). `whoami` and `publish` stay at success defaults so a
+#     re-publish would still work if the gate misfired.
+# ===========================================================================
+
+_FAKE_GH_DONE_SWAP = (
+    "cat > \"$work/fake-bin/gh\" <<'CCTALLY_FAKE_GH_DONE_EOF'\n"
+    '#!/usr/bin/env bash\n'
+    'echo "$@" >> "${GH_ARGV_LOG:-/dev/null}"\n'
+    'case "$1" in\n'
+    '  auth) exit 0 ;;\n'
+    '  api)  exit 0 ;;\n'
+    '  release)\n'
+    '    case "$2" in\n'
+    '      view) exit 0 ;;\n'
+    '      *) exit 0 ;;\n'
+    '    esac\n'
+    '    ;;\n'
+    'esac\n'
+    'exit 0\n'
+    'CCTALLY_FAKE_GH_DONE_EOF\n'
+    'chmod +x "$work/fake-bin/gh"\n'
+)
+
+
+_NPM_MOCK_VIEW_RETURNS_URL = _seed_npm_mock_state({
+    "whoami":  {"exit": 0, "stdout": "fake-user"},
+    "view":    {"exit": 0,
+                "stdout":
+                '"https://registry.npmjs.org/cctally/-/cctally-0.1.1.tgz"'},
+    "publish": {"exit": 0, "stdout": "+ cctally@0.1.1"},
+})
+
+
+# 40. resume-after-phase4: pre-run lands phases 1-4 only (via
+# `--skip-npm --skip-brew`); the resume run sees stamp/tag/mirror/gh
+# done but npm + brew pending → gate falls through; phase loop
+# short-circuits 1-4 and runs Phases 5 + 6. npm-mock state seeded for
+# the resume run so phase 5 publishes; brew tap seeded so phase 6
+# bumps the formula to v0.1.1.
+_add(
+    name="resume-after-phase4",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        # Brew tap + template MUST exist before the pre-run (cmd_release
+        # discovers the brew clone even when --skip-brew is set, since
+        # discovery happens before the skip check in the gate). Even
+        # without that, having them in place keeps the run.sh resume
+        # invocation deterministic.
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+        # Pre-run: phases 1-4 only.
+        + 'CCTALLY_RELEASE_DATE_UTC=2026-05-07 '
+        + 'GIT_AUTHOR_DATE="2026-05-07T00:00:00+0000" '
+        + 'GIT_COMMITTER_DATE="2026-05-07T00:00:00+0000" '
+        + 'PATH="$work/fake-bin:$PATH" '
+        + 'GH_ARGV_LOG="$work/gh-argv.log.partial" '
+        + 'GH_NOTES_DEST="$work/gh-notes.partial.txt" '
+        + 'CCTALLY_RELEASE_BREW_ARCHIVE_URL='
+        + '"file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz" '
+        + 'python3 bin/cctally release patch --skip-npm --skip-brew '
+        + '> "$work/_partial.stdout" 2> "$work/_partial.stderr"\n'
+        # Swap fake-gh so `release view` returns 0 (gh_done=True).
+        + _FAKE_GH_DONE_SWAP
+        # Seed npm-mock-state for the resume run: view returns nothing
+        # (npm_done=False so Phase 5 publishes), whoami=0, publish=0.
+        + _seed_npm_mock_state({
+            "whoami":  {"exit": 0, "stdout": "fake-user"},
+            "view":    {"exit": 1, "stdout": ""},
+            "publish": {"exit": 0, "stdout": "+ cctally@0.1.1"},
+        })
+    ),
+    run=_run_release_with_npm_and_brew("--resume"),
+    expected_exit=0,
+    stdout_substr="phase 5: npm publish",
+    stderr_substr="",
+    formula_substr=(
+        'url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.1.tar.gz"\n'
+        '  sha256 "eba438f24089aa3c950d53d2759a8e058d3da86c52685028610556e2f1ad7a56"\n'
+    ),
+)
+
+
+# 41. resume-after-phase5: pre-run lands phases 1-5 (via `--skip-brew`);
+# the resume run sees stamp/tag/mirror/gh/npm done but brew pending →
+# gate falls through; phase loop short-circuits 1-5 (Phase 5 hits
+# `_release_phase_npm_done` true) and runs Phase 6 only. Verifies the
+# brew formula gets rendered on a single-phase resume.
+_add(
+    name="resume-after-phase5",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        # Brew tap + template (Phase 6 needs both at run.sh time).
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+        # npm-mock-state for the pre-run: view=1 (so phase 5 publishes),
+        # whoami=0, publish=0. The post-publish view check still returns
+        # 1 in this state, so cmd_release prints a registry-lag warning
+        # to stderr; that's OK for the pre-run setup, the resume run
+        # uses a different state file (swapped in below).
+        + _seed_npm_mock_state({
+            "whoami":  {"exit": 0, "stdout": "fake-user"},
+            "view":    {"exit": 1, "stdout": ""},
+            "publish": {"exit": 0, "stdout": "+ cctally@0.1.1"},
+        })
+        # Pre-run: phases 1-5 (skip phase 6 only).
+        + 'CCTALLY_RELEASE_DATE_UTC=2026-05-07 '
+        + 'GIT_AUTHOR_DATE="2026-05-07T00:00:00+0000" '
+        + 'GIT_COMMITTER_DATE="2026-05-07T00:00:00+0000" '
+        + 'PATH="$work/fake-bin:$PATH" '
+        + 'GH_ARGV_LOG="$work/gh-argv.log.partial" '
+        + 'GH_NOTES_DEST="$work/gh-notes.partial.txt" '
+        + 'NPM_MOCK_STATE_FILE="$work/npm-mock-state.json" '
+        + 'NPM_MOCK_LOG_FILE="$work/npm-invocations.log.partial" '
+        + 'CCTALLY_RELEASE_BREW_ARCHIVE_URL='
+        + '"file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz" '
+        + 'python3 bin/cctally release patch --skip-brew '
+        + '> "$work/_partial.stdout" 2> "$work/_partial.stderr"\n'
+        # Swap fake-gh so `release view` returns 0 (gh_done=True for
+        # the resume run).
+        + _FAKE_GH_DONE_SWAP
+        # Swap npm-mock-state so `view` returns the registry URL
+        # (npm_done=True for the resume run; Phase 5 short-circuits
+        # via `_release_phase_npm_done`).
+        + _NPM_MOCK_VIEW_RETURNS_URL
+    ),
+    run=_run_release_with_npm_and_brew("--resume"),
+    expected_exit=0,
+    stdout_substr="phase 6: brew formula bump",
+    stderr_substr="",
+    formula_substr=(
+        'url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.1.tar.gz"\n'
+        '  sha256 "eba438f24089aa3c950d53d2759a8e058d3da86c52685028610556e2f1ad7a56"\n'
+    ),
+)
+
+
+# 42. resume-all-done: all six phases complete. Pre-run runs the full
+# `cctally release patch`; setup then swaps every fake into its
+# "phase done" state so the resume gate sees stamp/tag/mirror/gh/npm/brew
+# all True and short-circuits with `already published` — phase runners
+# stay untouched.
+_add(
+    name="resume-all-done",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+        # Pre-run: full release. npm-mock state allows publish; the
+        # post-publish view check warns (view=1) but rc stays 0.
+        + _seed_npm_mock_state({
+            "whoami":  {"exit": 0, "stdout": "fake-user"},
+            "view":    {"exit": 1, "stdout": ""},
+            "publish": {"exit": 0, "stdout": "+ cctally@0.1.1"},
+        })
+        + 'CCTALLY_RELEASE_DATE_UTC=2026-05-07 '
+        + 'GIT_AUTHOR_DATE="2026-05-07T00:00:00+0000" '
+        + 'GIT_COMMITTER_DATE="2026-05-07T00:00:00+0000" '
+        + 'PATH="$work/fake-bin:$PATH" '
+        + 'GH_ARGV_LOG="$work/gh-argv.log.partial" '
+        + 'GH_NOTES_DEST="$work/gh-notes.partial.txt" '
+        + 'NPM_MOCK_STATE_FILE="$work/npm-mock-state.json" '
+        + 'NPM_MOCK_LOG_FILE="$work/npm-invocations.log.partial" '
+        + 'CCTALLY_RELEASE_BREW_ARCHIVE_URL='
+        + '"file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz" '
+        + 'python3 bin/cctally release patch '
+        + '> "$work/_partial.stdout" 2> "$work/_partial.stderr"\n'
+        # Swap fake-gh + npm-mock-state into "phase done" responses so
+        # the resume gate sees gh_done + npm_done True. Brew tap clone
+        # already carries Formula/cctally.rb at v0.1.1 (Phase 6 of the
+        # pre-run rendered it), so `_release_phase_brew_done` reports
+        # True with no extra setup needed.
+        + _FAKE_GH_DONE_SWAP
+        + _NPM_MOCK_VIEW_RETURNS_URL
+    ),
+    run=_run_release_with_npm_and_brew("--resume"),
+    expected_exit=0,
+    stdout_substr="release v0.1.1 already published",
+    stderr_substr="",
 )
 
 

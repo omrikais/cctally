@@ -1748,7 +1748,7 @@ def cmd_release(args: argparse.Namespace) -> int:
     if args.no_publish:
         print(
             f"release v{next_v} stamped + tagged; "
-            "--no-publish set; phases 3-4 skipped"
+            "--no-publish set; phases 3-6 skipped"
         )
         return 0
 
@@ -1887,6 +1887,35 @@ def _release_dry_run(
         print()
         print("Body (also used for Phase 4 GH Release notes):")
         print(body)
+    print()
+    # Phase 5 — npm publish plan.
+    print("Phase 5 — npm publish")
+    print("─" * 41)
+    if args.no_publish or getattr(args, "skip_npm", False):
+        reason = "--no-publish" if args.no_publish else "--skip-npm"
+        print(f"(skipped under {reason})")
+    else:
+        dist_tag = "next" if "-" in next_v else "latest"
+        print(
+            f"Would publish: cctally@{next_v} to npmjs.org "
+            f"with --tag {dist_tag}"
+        )
+    print()
+    # Phase 6 — brew formula bump plan.
+    print("Phase 6 — brew formula bump")
+    print("─" * 41)
+    if args.no_publish or getattr(args, "skip_brew", False):
+        reason = "--no-publish" if args.no_publish else "--skip-brew"
+        print(f"(skipped under {reason})")
+    elif "-" in next_v:
+        print(f"(skipped: pre-release v{next_v})")
+    else:
+        print(f"Would bump: Formula/cctally.rb in <brew-clone> to v{next_v}")
+        print(
+            f"  url:    https://github.com/{PUBLIC_REPO}/archive/"
+            f"refs/tags/v{next_v}.tar.gz"
+        )
+        print("  sha256: <would compute by downloading at run time>")
     print()
     print("dry-run complete; no state mutated; exit 0")
     return 0
@@ -23608,7 +23637,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_release.add_argument(
         "--no-publish",
         action="store_true",
-        help="Stop after `git push --follow-tags`; skip mirror + GH Release",
+        help="Stop after Phase 2 (tag); skip Phases 3-6 (mirror, gh release, npm, brew)",
     )
     p_release.add_argument(
         "--prerelease-id",
