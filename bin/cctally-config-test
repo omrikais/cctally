@@ -23,15 +23,29 @@ assert_eq () {
 }
 
 assert_contains () {
+    # Pure-bash glob substring match (no `printf | grep` pipe). The pipeline
+    # form intermittently failed on hosted-ubuntu CI even when the printed
+    # haystack contained the needle byte-for-byte (issue #22). Bash `case`
+    # quotes the needle, so glob specials inside it are literal; only the
+    # outer `*` are wildcards.
     local label="$1" needle="$2" haystack="$3"
-    if printf '%s' "$haystack" | grep -qF "$needle"; then
-        echo "PASS $label"
-        pass_count=$((pass_count + 1))
-    else
-        echo "FAIL $label (missing $needle)"
-        printf '  haystack: %s\n' "$haystack"
-        fail_count=$((fail_count + 1))
-    fi
+    case "$haystack" in
+        *"$needle"*)
+            echo "PASS $label"
+            pass_count=$((pass_count + 1))
+            ;;
+        *)
+            echo "FAIL $label (missing $needle)"
+            printf '  haystack: %s\n' "$haystack"
+            printf '  haystack length: %d (string-len)\n' "${#haystack}"
+            printf '  needle length:   %d (string-len)\n' "${#needle}"
+            printf '  haystack bytes (od -An -c):\n'
+            printf '%s' "$haystack" | od -An -c | sed 's/^/    /'
+            printf '  needle bytes (od -An -c):\n'
+            printf '%s' "$needle" | od -An -c | sed 's/^/    /'
+            fail_count=$((fail_count + 1))
+            ;;
+    esac
 }
 
 with_home () {

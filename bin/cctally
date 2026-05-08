@@ -1623,8 +1623,40 @@ def _release_run_phase_brew(
         )
     # Tag is best-effort — re-running after a partial publish should
     # not fail just because the tag already exists locally.
+    #
+    # Annotated form with `-m` (issue #25): plain `git tag <name>` is
+    # silently upgraded to `git tag -s <name>` under operator-global
+    # `tag.gpgsign=true` and demands a message via editor. The release
+    # script has no editor stdin, so git aborts with `fatal: no tag
+    # message?` — the atomic push refspec then fails with "src refspec
+    # does not match any" because the local tag was never created, and
+    # the auth-fallback branch below silently swallows the failure as
+    # exit 0. Mirrors Phase 2's signing detection (signing_key +
+    # tag.gpgsign → -s, else fall back), with one defensive divergence:
+    # the fallback uses --no-sign (not bare -a) so the tag still lands
+    # under tag.gpgsign=true without a usable signing key configured.
+    # Brew install reads the formula off the tap's default branch, not
+    # the tag, so signing the tap tag is operationally moot — it exists
+    # for history bookkeeping and atomic-push transport.
+    signing_key = subprocess.run(
+        ["git", "-C", str(brew_clone), "config", "--get", "user.signingkey"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tag_gpgsign = (
+        subprocess.run(
+            ["git", "-C", str(brew_clone), "config", "--get", "tag.gpgsign"],
+            capture_output=True,
+            text=True,
+        )
+        .stdout.strip()
+        .lower()
+        == "true"
+    )
+    sign_flag = "-s" if (signing_key and tag_gpgsign) else "--no-sign"
     subprocess.run(
-        ["git", "-C", str(brew_clone), "tag", f"v{version}"],
+        ["git", "-C", str(brew_clone), "tag", sign_flag, "-a", "-m",
+         f"cctally v{version}", f"v{version}"],
         check=False,
     )
     # Single ATOMIC push of branch + tag in one transaction — the
@@ -1633,17 +1665,24 @@ def _release_run_phase_brew(
     # split branch-push + tag-push pair admits: a tag landing without
     # the branch landing would leave `brew install` serving the OLD
     # formula off the tap's default branch even though the remote
-    # carries the new tag. Tag refspec is explicit (`src:dst`) because
-    # `--follow-tags` skips lightweight tags and Phase 6's tag is
-    # lightweight (no `-a`/`-m`).
+    # carries the new tag. Tag refspec is explicit (`src:dst`) for
+    # atomic-push semantics — `--atomic` requires named refs, not the
+    # implicit `--follow-tags` path.
     push = subprocess.run(
         ["git", "-C", str(brew_clone), "push", "--atomic", "origin",
          "HEAD", f"refs/tags/v{version}:refs/tags/v{version}"],
         check=False,
     )
     if push.returncode != 0:
+        # If the local tag isn't there (e.g., the operator hit the
+        # tag.gpgsign edge case from issue #25 even with the fix), the
+        # plain push refspec fails. Surface a tag-create fallback in
+        # the hint so copy-paste recovery is self-contained.
         print(
             f"\n  push failed. Manual recovery:\n"
+            f"    # If local tag v{version} is missing (e.g., gpgsign issue):\n"
+            f"    git -C {brew_clone} tag --no-sign -a -m \"cctally v{version}\" v{version}\n"
+            f"    # Then push:\n"
             f"    git -C {brew_clone} push --atomic origin HEAD "
             f"refs/tags/v{version}:refs/tags/v{version}\n",
             file=sys.stderr,

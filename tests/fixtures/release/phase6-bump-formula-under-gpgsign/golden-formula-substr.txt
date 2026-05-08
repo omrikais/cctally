@@ -1,0 +1,2 @@
+url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "eba438f24089aa3c950d53d2759a8e058d3da86c52685028610556e2f1ad7a56"

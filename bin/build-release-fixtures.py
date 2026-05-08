@@ -672,6 +672,47 @@ def _run_release_with_brew(release_args: str) -> str:
     )
 
 
+def _run_release_with_brew_verify_tag(release_args: str, version: str) -> str:
+    """Same as `_run_release_with_brew` but adds a bare-remote tag
+    verification at the end. Phase 6 returns 0 via the auth-fallback
+    branch even when the atomic push silently fails (e.g., the local
+    `git tag` aborted under `tag.gpgsign=true`, leaving the refspec
+    unresolved). Standard exit/stdout/stderr checks can't distinguish
+    "Phase 6 succeeded" from "Phase 6 failed silently and returned 0",
+    so this helper post-checks that `refs/tags/v<version>` actually
+    landed on the bare tap remote — if it didn't, the captured exit
+    code is mutated to 1, surfacing the silent failure to the harness.
+
+    Used by `phase6-bump-formula-under-gpgsign` (issue #25 regression).
+    """
+    return _RUN_HEADER + (
+        ': > "$work/npm-invocations.log"\n'
+        'export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"\n'
+        f'python3 bin/cctally release {release_args} '
+        f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
+        f'rc=$?\n'
+        f'echo "$rc" > "$work/_artifacts/exit.txt"\n'
+        + _CAPTURE_ARTIFACTS
+        + '# Phase 6: capture the rendered formula (when produced) for golden\n'
+        + '# substring checks. `|| true` keeps scenarios that never write\n'
+        + '# the formula (skip / refusal / pre-release) from failing here.\n'
+        + 'cp "$work/homebrew-cctally/Formula/cctally.rb" '
+        + '"$work/_artifacts/formula.rb" 2>/dev/null || true\n'
+        + '# Phase 6 (issue #25 regression): verify the tag actually\n'
+        + '# landed on the BARE tap remote. Phase 6 returns 0 via\n'
+        + '# auth-fallback even when the atomic push silently fails;\n'
+        + '# the bare-remote check is what catches the regression.\n'
+        + 'if [ "$rc" = "0" ] && [ -d "$work/homebrew-cctally.git" ]; then\n'
+        + f'    if ! git -C "$work/homebrew-cctally.git" rev-parse --verify "refs/tags/{version}" >/dev/null 2>&1; then\n'
+        + f'        printf \'PHASE6 VERIFY: {version} tag missing on bare remote (issue #25 regression)\\n\' >> "$work/_artifacts/stderr.txt"\n'
+        + '        echo "1" > "$work/_artifacts/exit.txt"\n'
+        + '        rc=1\n'
+        + '    fi\n'
+        + 'fi\n'
+        + 'exit "$rc"\n'
+    )
+
+
 def _run_release_with_npm_and_brew(release_args: str) -> str:
     """run.sh body for scenarios that exercise BOTH Phase 5 (with
     canned npm responses, requires `_seed_npm_mock_state` in
@@ -1832,6 +1873,57 @@ _add(
         + '  git push -q origin HEAD)\n'
     ),
     run=_run_release_with_brew("patch"),
+    expected_exit=0,
+    stdout_substr="phase 6: brew formula bump",
+    stderr_substr="",
+    formula_substr=(
+        'url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.1.tar.gz"\n'
+        '  sha256 "eba438f24089aa3c950d53d2759a8e058d3da86c52685028610556e2f1ad7a56"\n'
+    ),
+)
+
+
+# 34b. phase6-bump-formula-under-gpgsign: same shape as phase6-bump-formula
+# but the brew tap clone has `tag.gpgsign=true` set LOCAL. Issue #25
+# regression — pre-fix Phase 6 ran plain `git tag v<version>` which git
+# silently upgrades to `git tag -s v<version>` under tag.gpgsign=true,
+# demanding a message via editor (none supplied via stdin) and aborting
+# with `fatal: no tag message?`. The atomic push refspec then fails
+# because the local tag was never created, but the auth-fallback branch
+# returns 0 and the bug looks like success unless we check the bare
+# remote. The custom run.sh helper does that bare-remote check; pre-fix
+# this scenario fails the harness on exit-code mismatch.
+#
+# Harness env exports `GIT_CONFIG_GLOBAL=/dev/null` so we set the
+# trigger LOCAL on the brew clone (after the seed commit, otherwise the
+# seed itself would hit the same gpg-no-key path).
+_add(
+    name="phase6-bump-formula-under-gpgsign",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+        # Pre-seed an old v1.0.0 formula in the tap clone so Phase 6
+        # exercises the bump (overwrite) path.
+        + 'cat > "$work/homebrew-cctally/Formula/cctally.rb" <<\'CCTALLY_OLD_FORMULA_EOF\'\n'
+        + 'class Cctally < Formula\n'
+        + '  url "https://github.com/omrikais/cctally/archive/refs/tags/v1.0.0.tar.gz"\n'
+        + '  sha256 "old"\n'
+        + 'end\n'
+        + 'CCTALLY_OLD_FORMULA_EOF\n'
+        + '(cd "$work/homebrew-cctally" && \\\n'
+        + '  git add . && \\\n'
+        + '  git commit -q -m "seed v1.0.0" && \\\n'
+        + '  git push -q origin HEAD)\n'
+        # Issue #25 trigger: turn on tag.gpgsign LOCAL on the tap clone
+        # AFTER the seed commit lands (the seed used commit, not tag,
+        # so it isn't affected by tag.gpgsign). The harness env already
+        # has no signing key configured, so plain `git tag <name>` will
+        # fail with "fatal: no tag message?" pre-fix.
+        + 'git -C "$work/homebrew-cctally" config tag.gpgsign true\n'
+    ),
+    run=_run_release_with_brew_verify_tag("patch", "v0.1.1"),
     expected_exit=0,
     stdout_substr="phase 6: brew formula bump",
     stderr_substr="",
