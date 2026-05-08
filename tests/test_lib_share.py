@@ -212,3 +212,49 @@ def test_serialize_attrs_skips_none():
 def test_serialize_attrs_handles_strings_and_numbers():
     out = _lib_share._serialize_attrs({"text-anchor": "middle", "font-size": 12})
     assert out == 'font-size="12.0" text-anchor="middle"'
+
+
+def test_svg_rect():
+    out = _lib_share.svg_rect(10, 20, 100, 50, fill="red")
+    assert out == '<rect fill="red" height="50.0" width="100.0" x="10.0" y="20.0"/>'
+
+
+def test_svg_text_with_anchor_and_weight():
+    out = _lib_share.svg_text(50, 100, "Hello",
+                              font_size=14, fill="#1a1a1a",
+                              anchor="middle", weight="bold")
+    assert out == (
+        '<text fill="#1a1a1a" font-size="14.0" font-weight="bold" '
+        'text-anchor="middle" x="50.0" y="100.0">Hello</text>'
+    )
+
+
+def test_svg_text_escapes_content():
+    out = _lib_share.svg_text(0, 0, "<script>", font_size=10, fill="#000")
+    assert "&lt;script&gt;" in out
+    assert "<script>" not in out
+
+
+def test_svg_line():
+    out = _lib_share.svg_line(0, 0, 100, 100, stroke="#000", width=2)
+    assert out == '<line stroke="#000" stroke-width="2.0" x1="0.0" x2="100.0" y1="0.0" y2="100.0"/>'
+
+
+def test_svg_polyline():
+    out = _lib_share.svg_polyline([(0.0, 0.0), (10.0, 20.0), (30.0, 5.0)],
+                                  stroke="#2563eb", width=2.0)
+    assert 'points="0.0,0.0 10.0,20.0 30.0,5.0"' in out
+    assert 'fill="none"' in out
+
+
+def test_svg_path():
+    out = _lib_share.svg_path("M0 0 L10 10", stroke="#000")
+    assert 'd="M0 0 L10 10"' in out
+
+
+def test_svg_group_wraps_children():
+    children = ['<rect x="0" y="0"/>', '<text x="0" y="0">x</text>']
+    out = _lib_share.svg_group(children, transform="translate(5,5)")
+    assert out.startswith('<g transform="translate(5,5)">')
+    assert out.endswith("</g>")
+    assert children[0] in out and children[1] in out

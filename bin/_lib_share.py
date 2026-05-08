@@ -248,6 +248,55 @@ def _serialize_attrs(attrs: dict) -> str:
     return " ".join(parts)
 
 
+def svg_rect(x: float, y: float, w: float, h: float, *,
+             fill: str, stroke: str | None = None) -> str:
+    return f'<rect {_serialize_attrs({"x": x, "y": y, "width": w, "height": h, "fill": fill, "stroke": stroke})}/>'
+
+
+def svg_text(x: float, y: float, text: str, *,
+             font_size: float, fill: str,
+             anchor: str = "start", weight: str = "normal") -> str:
+    attrs = {
+        "x": x,
+        "y": y,
+        "font-size": font_size,
+        "fill": fill,
+        "text-anchor": anchor,
+    }
+    if weight != "normal":
+        attrs["font-weight"] = weight
+    return f'<text {_serialize_attrs(attrs)}>{_xml_escape(text)}</text>'
+
+
+def svg_line(x1: float, y1: float, x2: float, y2: float, *,
+             stroke: str, width: float = 1) -> str:
+    return f'<line {_serialize_attrs({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "stroke": stroke, "stroke-width": width})}/>'
+
+
+def svg_polyline(points: list[tuple[float, float]], *, stroke: str,
+                 width: float = 2, fill: str = "none") -> str:
+    pts_str = " ".join(f"{_fmt_num(x)},{_fmt_num(y)}" for x, y in points)
+    return f'<polyline {_serialize_attrs({"points": pts_str, "stroke": stroke, "stroke-width": width, "fill": fill})}/>'
+
+
+def svg_path(d: str, *, stroke: str | None = None,
+             fill: str | None = None) -> str:
+    attrs: dict = {"d": d}
+    if stroke is not None:
+        attrs["stroke"] = stroke
+    if fill is not None:
+        attrs["fill"] = fill
+    return f'<path {_serialize_attrs(attrs)}/>'
+
+
+def svg_group(children: list, *, transform: str | None = None) -> str:
+    attrs: dict = {}
+    if transform is not None:
+        attrs["transform"] = transform
+    open_tag = f'<g {_serialize_attrs(attrs)}>' if attrs else "<g>"
+    return open_tag + "".join(children) + "</g>"
+
+
 # --- Format renderers (stubs; full impl in later tasks) ---
 
 def _render_md(snap: ShareSnapshot, *, branding: bool) -> str:
