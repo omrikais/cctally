@@ -139,3 +139,39 @@ def test_render_unknown_format_raises():
         assert "format" in str(e).lower()
         return
     raise AssertionError("expected ValueError on unknown format")
+
+
+def test_render_dispatches_svg():
+    snap = _make_minimal_snapshot()
+    out = _lib_share.render(snap, format="svg", theme="light", branding=True)
+    assert isinstance(out, str)
+    assert "<svg" in out
+    # Title escaped into the SVG comment by the stub.
+    assert _lib_share._xml_escape(snap.title) in out
+
+
+def test_render_dispatches_html():
+    snap = _make_minimal_snapshot()
+    out = _lib_share.render(snap, format="html", theme="dark", branding=True)
+    assert isinstance(out, str)
+    assert "<!DOCTYPE html" in out
+    assert _lib_share._xml_escape(snap.title) in out
+
+
+def test_render_unknown_theme_raises():
+    snap = _make_minimal_snapshot()
+    try:
+        _lib_share.render(snap, format="svg", theme="solarized", branding=True)
+    except ValueError as e:
+        assert "theme" in str(e).lower()
+        return
+    raise AssertionError("expected ValueError on unknown theme")
+
+
+def test_md_escape_backslash_does_not_double_escape():
+    # A literal backslash becomes \\ — single pass, no doubling.
+    assert _lib_share._md_escape("a\\b") == "a\\\\b"
+    # Backslash followed by a markdown-format char: each escapes once.
+    assert _lib_share._md_escape("a\\*b") == "a\\\\\\*b"
+    # An already-escaped sequence in the input still escapes byte-for-byte.
+    assert _lib_share._md_escape("\\|") == "\\\\\\|"

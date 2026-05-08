@@ -7,9 +7,9 @@ Spec: docs/superpowers/specs/2026-05-08-shareable-reports-design.md
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Union
 
 
 # --- Cell tagged union ---
@@ -40,8 +40,7 @@ class ProjectCell:
     """Anonymization chokepoint — scrubber rewrites the `label` field."""
     label: str
 
-# Pre-3.10 fallback: typing.Union; mypy treats this identically to `|`.
-Cell = Union[TextCell, MoneyCell, PercentCell, DateCell, DeltaCell, ProjectCell]
+Cell = TextCell | MoneyCell | PercentCell | DateCell | DeltaCell | ProjectCell
 
 
 # --- Table primitives ---
@@ -56,7 +55,7 @@ class ColumnSpec:
 
 @dataclass(frozen=True)
 class Row:
-    cells: dict
+    cells: Mapping[str, "Cell"]
 
 
 @dataclass(frozen=True)
@@ -80,48 +79,57 @@ class ChartPoint:
     x_label: str
     x_value: float
     y_value: float
-    project_label: Optional[str] = None
-    series_key: Optional[str] = None
+    project_label: str | None = None
+    series_key: str | None = None
 
 
 @dataclass(frozen=True)
 class LineChart:
-    points: tuple
+    points: tuple[ChartPoint, ...]
     y_label: str
-    reference_lines: tuple = ()
-    multi_series: Optional[dict] = None
+    reference_lines: tuple[float, ...] = ()
+    multi_series: Mapping[str, tuple[ChartPoint, ...]] | None = None
 
 
 @dataclass(frozen=True)
 class BarChart:
-    points: tuple
+    points: tuple[ChartPoint, ...]
     y_label: str
-    stacks: Optional[dict] = None
+    stacks: Mapping[str, tuple[ChartPoint, ...]] | None = None
 
 
 @dataclass(frozen=True)
 class HorizontalBarChart:
-    points: tuple
+    points: tuple[ChartPoint, ...]
     x_label: str
-    cap: Optional[int] = None
+    cap: int | None = None
 
 
-ChartSpec = Union[LineChart, BarChart, HorizontalBarChart]
+ChartSpec = LineChart | BarChart | HorizontalBarChart
 
 
 # --- Top-level snapshot ---
+#
+# Contract: ShareSnapshot and all nested dataclasses are nominally frozen.
+# `frozen=True` blocks attribute rebinding (snap.cmd = ...) but cannot prevent
+# mutation of the inner dict held by Row.cells or the inner tuple/dict held by
+# chart fields. The scrubber and renderers MUST treat snapshots as read-only;
+# the parameterized Mapping/tuple annotations exist to make a typechecker
+# reject mutation attempts (e.g., dict assignment, list.append). Phase 4's
+# scrubber returns a NEW snapshot rather than rewriting in place — see spec
+# §5.3 (anonymization chokepoint) and Codex finding M6.
 
 @dataclass(frozen=True)
 class ShareSnapshot:
     cmd: str
     title: str
-    subtitle: Optional[str]
+    subtitle: str | None
     period: PeriodSpec
-    columns: tuple
-    rows: tuple
-    chart: Optional[ChartSpec]
-    totals: tuple
-    notes: tuple
+    columns: tuple[ColumnSpec, ...]
+    rows: tuple[Row, ...]
+    chart: ChartSpec | None
+    totals: tuple[Totalled, ...]
+    notes: tuple[str, ...]
     generated_at: datetime
     version: str
 
@@ -160,8 +168,8 @@ def _md_escape(s: str) -> str:
 
     Markdown surfaces (GitHub, Slack, most renderers) interpret raw HTML inline,
     so a revealed project name like 'Project<script>' would inject without
-    HTML-char escaping. Backslash is escaped first so subsequent escapes don't
-    double-escape.
+    HTML-char escaping. Backslash is in _MD_FMT_CHARS so a literal `\\` becomes
+    `\\\\` — single-pass dispatch, each char checked independently.
     """
     out = []
     for ch in s:
