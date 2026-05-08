@@ -22600,6 +22600,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit machine-readable JSON output.",
     )
     pr.add_argument(
+        "--reveal-projects",
+        action="store_true",
+        dest="reveal_projects",
+        help="In --format output, show real project basenames instead of "
+             "the default project-1, project-2, ... anonymization.",
+    )
+    pr.add_argument(
         "--detail",
         action="store_true",
         help="Include per-percent cost milestones for the current week.",
@@ -22638,6 +22645,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fc.add_argument("--json", action="store_true",
                     help="Emit machine-readable JSON; suppresses terminal render.")
+    fc.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
+                    help="In --format output, show real project basenames instead of "
+                         "the default project-1, project-2, ... anonymization.")
     fc.add_argument("--status-line", action="store_true", dest="status_line",
                     help="Emit one-line compact string for status-line injection.")
     fc.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
@@ -23229,6 +23239,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit camelCase JSON (schemaVersion 1).",
     )
     fhb.add_argument(
+        "--reveal-projects",
+        action="store_true",
+        dest="reveal_projects",
+        help="In --format output, show real project basenames instead of "
+             "the default project-1, project-2, ... anonymization.",
+    )
+    fhb.add_argument(
         "--no-color",
         action="store_true",
         help="Disable ANSI color output (currently a no-op — table is plain text).",
@@ -23306,6 +23323,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output JSON matching upstream ccusage daily format.",
     )
     dy.add_argument(
+        "--reveal-projects",
+        action="store_true",
+        dest="reveal_projects",
+        help="In --format output, show real project basenames instead of "
+             "the default project-1, project-2, ... anonymization.",
+    )
+    dy.add_argument(
         "--tz", default=None, type=_argparse_tz, metavar="TZ",
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
@@ -23357,6 +23381,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output JSON matching upstream ccusage monthly format.",
     )
     mo.add_argument(
+        "--reveal-projects",
+        action="store_true",
+        dest="reveal_projects",
+        help="In --format output, show real project basenames instead of "
+             "the default project-1, project-2, ... anonymization.",
+    )
+    mo.add_argument(
         "--tz", default=None, type=_argparse_tz, metavar="TZ",
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
@@ -23391,6 +23422,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Sort direction by week (default: asc).")
     we.add_argument("--json", action="store_true", dest="json",
                     help="Output JSON.")
+    we.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
+                    help="In --format output, show real project basenames instead of "
+                         "the default project-1, project-2, ... anonymization.")
     we.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
                     help="Display timezone: local, utc, or IANA name. "
                          "Overrides config display.tz for this call.")
@@ -23591,6 +23625,9 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Bucket by resolved git-root (default) or raw project_path.")
     p_project.add_argument("--json", action="store_true", dest="json",
                            help="Emit JSON instead of table.")
+    p_project.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
+                           help="In --format output, show real project basenames instead of "
+                                "the default project-1, project-2, ... anonymization.")
     p_project.add_argument("--no-color", action="store_true", dest="no_color",
                            help="Disable ANSI color.")
     p_project.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
@@ -23658,6 +23695,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Sort direction by last activity (default: asc — earliest first).")
     se.add_argument("--json", action="store_true", dest="json",
                     help="Output JSON.")
+    se.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
+                    help="In --format output, show real project basenames instead of "
+                         "the default project-1, project-2, ... anonymization.")
     se.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
                     help="Display timezone: local, utc, or IANA name. "
                          "Overrides config display.tz for this call.")
