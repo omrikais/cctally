@@ -5,6 +5,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- npm distribution channel — `npm install -g cctally` lands the
+  Python script and dashboard assets via a thin Node shim. `package.json`
+  at the public-repo root, version stamped by Phase 1 alongside CHANGELOG.md.
+- Homebrew distribution channel — `brew install omrikais/cctally/cctally`
+  via a separate `omrikais/homebrew-cctally` tap. Formula
+  `depends_on "python@3.13"` and pins cctally's shebang to that keg.
+- `cctally release` Phase 5 (npm publish) and Phase 6 (brew formula bump),
+  idempotent and resume-aware. `--skip-npm` / `--skip-brew` flags for
+  outage workarounds. Pre-releases publish to npm under `--tag next`;
+  brew skips pre-releases.
+
 ## [1.1.0] - 2026-05-07
 
 ### Added
