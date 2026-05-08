@@ -191,3 +191,24 @@ def test_fmt_num_one_decimal():
 
 def test_fmt_num_handles_float_not_int_specially():
     assert _lib_share._fmt_num(0.05) == "0.1"  # 1-decimal rounding
+
+
+def test_serialize_attrs_lexical_order():
+    out = _lib_share._serialize_attrs({"x": 1, "fill": "red", "y": 2, "id": "skip-me"})
+    # Lexical: fill, id, x, y
+    assert out == 'fill="red" id="skip-me" x="1.0" y="2.0"'
+
+
+def test_serialize_attrs_escapes_attr_values():
+    out = _lib_share._serialize_attrs({"data-label": 'Project<script>"evil"'})
+    assert "<" not in out and ">" not in out and "&lt;" in out
+
+
+def test_serialize_attrs_skips_none():
+    out = _lib_share._serialize_attrs({"fill": "red", "stroke": None})
+    assert out == 'fill="red"'
+
+
+def test_serialize_attrs_handles_strings_and_numbers():
+    out = _lib_share._serialize_attrs({"text-anchor": "middle", "font-size": 12})
+    assert out == 'font-size="12.0" text-anchor="middle"'

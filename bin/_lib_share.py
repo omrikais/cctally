@@ -229,6 +229,25 @@ def _fmt_num(n: float) -> str:
     return out
 
 
+def _serialize_attrs(attrs: dict) -> str:
+    """Serialize SVG/HTML attributes in lexical key order with escaped values.
+
+    Numbers go through _fmt_num; strings through _attr_escape. None values
+    skipped (lets primitives accept optional attributes uniformly).
+    """
+    parts = []
+    for key in sorted(attrs):
+        value = attrs[key]
+        if value is None:
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            rendered = _fmt_num(value)
+        else:
+            rendered = _attr_escape(str(value))
+        parts.append(f'{key}="{rendered}"')
+    return " ".join(parts)
+
+
 # --- Format renderers (stubs; full impl in later tasks) ---
 
 def _render_md(snap: ShareSnapshot, *, branding: bool) -> str:
