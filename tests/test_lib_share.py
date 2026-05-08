@@ -175,3 +175,19 @@ def test_md_escape_backslash_does_not_double_escape():
     assert _lib_share._md_escape("a\\*b") == "a\\\\\\*b"
     # An already-escaped sequence in the input still escapes byte-for-byte.
     assert _lib_share._md_escape("\\|") == "\\\\\\|"
+
+
+def test_fmt_num_one_decimal():
+    assert _lib_share._fmt_num(0) == "0.0"
+    assert _lib_share._fmt_num(1) == "1.0"
+    assert _lib_share._fmt_num(1.234) == "1.2"
+    # Python's f"{x:.1f}" uses round-half-to-even (banker's rounding) on IEEE-754:
+    # 1.25 has exact binary representation, ties to even → "1.2".
+    assert _lib_share._fmt_num(1.25) == "1.2"
+    assert _lib_share._fmt_num(-0.0) == "0.0"   # no negative-zero
+    assert _lib_share._fmt_num(1e6) == "1000000.0"   # no scientific notation
+    assert _lib_share._fmt_num(1e-9) == "0.0"        # tiny → 0.0, not 1e-09
+
+
+def test_fmt_num_handles_float_not_int_specially():
+    assert _lib_share._fmt_num(0.05) == "0.1"  # 1-decimal rounding

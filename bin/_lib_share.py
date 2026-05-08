@@ -215,6 +215,20 @@ PALETTE_DARK = {
 }
 
 
+# --- SVG primitives ---
+
+def _fmt_num(n: float) -> str:
+    """Format float with one decimal place, no scientific notation, no -0.0.
+
+    Byte-stability invariant — every coordinate / value in SVG output
+    routes through this so goldens are stable.
+    """
+    out = f"{float(n):.1f}"
+    if out == "-0.0":
+        return "0.0"
+    return out
+
+
 # --- Format renderers (stubs; full impl in later tasks) ---
 
 def _render_md(snap: ShareSnapshot, *, branding: bool) -> str:
