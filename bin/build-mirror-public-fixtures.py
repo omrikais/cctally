@@ -1261,6 +1261,83 @@ SCENARIOS.append((
 ))
 
 
+# Commit-time allowlist regression. The bug: the mirror tool used to
+# classify each commit's paths under HEAD's `.mirror-allowlist`, while
+# the commit-msg hook (`.githooks/_public_trailer.py`) classified under
+# the allowlist that lived in the commit's tree at the time. A commit
+# that added a NOT-YET-ALLOWLISTED file followed by a later commit
+# adding that file to the allowlist was accepted by the hook (correct)
+# but rejected by the mirror tool with "touches public files but has
+# no trailer." This scenario drives that exact sequence; the fix makes
+# the mirror tool also use commit-time allowlist semantics, so the run
+# succeeds end-to-end.
+#
+# Sequence inside the scenario:
+#   S1 (private/unmatched): overwrite `.mirror-allowlist` to a minimal
+#       version that doesn't match `extras/widget.txt`. The allowlist
+#       file itself is unmatched in any sane allowlist (it never lists
+#       itself), so this commit is private-only — no trailer needed.
+#   S2 (the bug case): add `extras/widget.txt`. Under S2's tree's
+#       allowlist (the minimal one), the file is unmatched. Pre-fix:
+#       reclassified under HEAD's allowlist (which after S3 matches
+#       `extras/**`) → flagged as public, mirror refuses.
+#       Post-fix: classified under S2's tree → unmatched → silently
+#       skipped, no trailer required.
+#   S3 (private/unmatched): grow the allowlist to include `extras/**`.
+#       Touches `.mirror-allowlist` only — still unmatched.
+#
+# Expected: exit 0, no public commit lands, stdout shows the cursor
+# advances. None of S1/S2/S3 needs a `--- public ---` block.
+SCENARIOS.append((
+    "commit-time-allowlist-no-retroactive-flag",
+    # S1: overwrite .mirror-allowlist with a minimal version that does
+    # NOT match `extras/**`. cwd is $work/private/. We use a heredoc
+    # WITHOUT command substitution so the contents land verbatim.
+    'cat > .mirror-allowlist <<\'CCTALLY_ALLOWLIST_S1_EOF\'\n'
+    '# minimal allowlist for the regression scenario\n'
+    'README.md\n'
+    'CCTALLY_ALLOWLIST_S1_EOF\n'
+    'git add .mirror-allowlist\n'
+    + _commit_msg_heredoc(
+        "chore: trim allowlist to minimal\n",
+        sentinel="CCTALLY_S1_EOF",
+    )
+    # S2: add extras/widget.txt — at S2's tree, the allowlist does NOT
+    # match it. Pre-fix this would be reclassified as public under
+    # HEAD's (S3's) allowlist and refused; post-fix it stays unmatched.
+    + 'mkdir -p extras\n'
+      'echo "widget" > extras/widget.txt\n'
+      'git add extras/widget.txt\n'
+    + _commit_msg_heredoc(
+        "feat(extras): add widget\n"
+        "\n"
+        "The file is unmatched against `.mirror-allowlist` at this\n"
+        "commit's tree; a follow-up commit promotes the path. Ordering\n"
+        "is deliberate; no public-mirror trailer needed.\n",
+        sentinel="CCTALLY_S2_EOF",
+    )
+    # S3: extend allowlist to match extras/**. Only touches the
+    # allowlist file itself (still unmatched).
+    + 'cat > .mirror-allowlist <<\'CCTALLY_ALLOWLIST_S3_EOF\'\n'
+      '# minimal allowlist for the regression scenario\n'
+      'README.md\n'
+      'extras/**\n'
+      'CCTALLY_ALLOWLIST_S3_EOF\n'
+      'git add .mirror-allowlist\n'
+    + _commit_msg_heredoc(
+        "chore: promote extras/** to public\n",
+        sentinel="CCTALLY_S3_EOF",
+    ),
+    # Expected: exit 0, advancing the cursor with no public commit
+    # produced (S1/S2/S3 are all private/unmatched). The "(no public
+    # commits to produce; advancing cursor only)" line is the stdout
+    # signature of a private-only walk.
+    0, "advancing cursor only", "",
+    None,  # no public-HEAD message check (no publish happened)
+    None,
+))
+
+
 def build(out_root: Path) -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     for (
