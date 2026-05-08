@@ -7,35 +7,18 @@ on:
     types: [opened, synchronize, reopened]
 
 jobs:
-  test-linux:
-    # Gate all jobs to the dev repo so the mirrored workflow self-skips on
-    # the public clone. Both repos receive the same ci.yml via the mirror,
-    # but only one repo runs CI — duplicate runs on the public side were
-    # both wasteful (test-linux) and broken (test-macos / dashboard-build-
-    # stability target a self-hosted runner registered to the dev repo only).
-    if: github.repository == 'omrikais/cctally-dev'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python 3.13
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Install Python test deps
-        run: python -m pip install --upgrade pip pytest rich
-
-      - name: Run cctally test suite
-        run: bin/cctally-test-all
+  # test-linux (hosted ubuntu) was disabled to save GH Actions minutes —
+  # the self-hosted macOS runner covers push-to-main validation. Trade-off:
+  # PRs no longer have a CI gating signal (test-macos / dashboard-build-
+  # stability are push-only for fork-PR safety). Re-enable if PR gating
+  # becomes load-bearing again.
 
   test-macos:
     # Self-hosted runners must NOT execute fork-PR code on the maintainer's
     # machine (a public-mirror exposure once the repo goes public — fork
     # contributors could run arbitrary build/test scripts on the host).
-    # Push to main is the maintainer's own commits; PRs from any source
-    # land on hosted ubuntu (test-linux above), which stays the gating
-    # signal. Loosen later (e.g. allow same-repo PRs) only with deliberate
+    # Push to main is the maintainer's own commits, so it's safe to run
+    # there. Loosen later (e.g. allow same-repo PRs) only with deliberate
     # vetting.
     if: github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
     runs-on: [self-hosted, macOS, cctally]
