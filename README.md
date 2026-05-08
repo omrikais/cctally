@@ -33,7 +33,7 @@ npm install -g cctally
 cctally setup
 ```
 
-The npm package is a thin Node shim around the bundled Python script — no postinstall, no native build. Set `CCTALLY_PYTHON=/path/to/python3` if `python3` isn't on your PATH.
+Needs Python 3. If `cctally setup` fails with "python3 not found", install it with `brew install python` (macOS) and try again.
 
 ### From source
 
