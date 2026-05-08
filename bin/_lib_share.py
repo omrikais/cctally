@@ -8,7 +8,7 @@ Spec: docs/superpowers/specs/2026-05-08-shareable-reports-design.md
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -321,7 +321,9 @@ _PADDING_TOP = 10
 _PADDING_RIGHT = 10
 
 
-def _chart_inner_box(x, y, width, height):
+def _chart_inner_box(
+    x: float, y: float, width: float, height: float,
+) -> tuple[float, float, float, float]:
     """Compute (ix, iy, iw, ih) — the inner plot area inside chart padding."""
     ix = x + _PADDING_LEFT
     iy = y + _PADDING_TOP
@@ -330,14 +332,16 @@ def _chart_inner_box(x, y, width, height):
     return ix, iy, iw, ih
 
 
-def _scale_y(values, ih):
+def _scale_y(
+    values: list[float], ih: float,
+) -> tuple[float, Callable[[float], float]]:
     """Return y_max and a scale function f(value) -> y-pixel (top-down)."""
     if not values:
         return 1.0, lambda v: 0.0
     y_max = max(values)
     y_min = min(0.0, min(values))
     span = y_max - y_min if (y_max - y_min) > 1e-9 else 1.0
-    def f(v):
+    def f(v: float) -> float:
         # Higher value → smaller y (SVG y axis is top-down).
         norm = (v - y_min) / span
         return ih - (norm * ih)
@@ -415,7 +419,8 @@ def _render_line_chart_svg(chart: LineChart, *, palette: dict,
 # --- SVG chrome helpers ---
 
 def _format_generated_at_iso(dt: datetime) -> str:
-    """ISO 8601 with trailing Z, no microseconds."""
+    """ISO 8601, no microseconds. UTC datetimes use trailing 'Z' instead of '+00:00';
+    non-UTC datetimes keep their offset-suffix form (no Z substitution applies)."""
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
@@ -466,6 +471,11 @@ _SVG_HEADER_H = 60
 _SVG_CHART_H = 220
 _SVG_FOOTER_H = 30
 _SVG_PADDING = 20
+# Composition-level offset from the footer band's top edge to the text baseline.
+# (Inside _render_svg_header, the raw `y + 18` / `y + 36` literals are font-metric
+# baseline offsets for the 18pt title and 12pt subtitle — they live at the chrome
+# helper site, not at the composition site.)
+_SVG_FOOTER_BASELINE = 18
 
 
 def _render_svg(snap: ShareSnapshot, *, palette: dict,
@@ -511,7 +521,7 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
         pieces.append(_render_svg_footer(
             snap, palette=palette,
             x=_SVG_PADDING,
-            y=_SVG_PADDING + _SVG_HEADER_H + _SVG_CHART_H + 18,
+            y=_SVG_PADDING + _SVG_HEADER_H + _SVG_CHART_H + _SVG_FOOTER_BASELINE,
             width=_SVG_WIDTH,
             branding=branding,
         ))
@@ -535,16 +545,25 @@ def _render_cell_text(cell: Cell) -> str:
     if isinstance(cell, TextCell):
         return cell.text
     if isinstance(cell, MoneyCell):
-        return f"${cell.usd:,.2f}"
+        # Sign goes outside the currency symbol: "-$12.34", not "$-12.34".
+        sign = "-" if cell.usd < 0 else ""
+        return f"{sign}${abs(cell.usd):,.2f}"
     if isinstance(cell, PercentCell):
         return f"{cell.pct:.1f}%"
     if isinstance(cell, DateCell):
         return cell.when.strftime("%Y-%m-%d")
     if isinstance(cell, DeltaCell):
-        sign = "+" if cell.value >= 0 else ""
+        # Zero is conventionally treated as non-negative for deltas (renders "+0.0%").
+        if cell.value > 0:
+            sign = "+"
+        elif cell.value < 0:
+            sign = "-"
+        else:
+            sign = "+"
         if cell.unit == "%":
-            return f"{sign}{cell.value:.1f}%"
-        return f"{sign}${cell.value:,.2f}"
+            return f"{sign}{abs(cell.value):.1f}%"
+        # Sign goes outside the currency symbol for $-deltas too: "-$1.50".
+        return f"{sign}${abs(cell.value):,.2f}"
     if isinstance(cell, ProjectCell):
         return cell.label
     raise TypeError(f"unknown cell type: {type(cell).__name__}")
@@ -614,7 +633,7 @@ def _render_html(snap: ShareSnapshot, *, palette: dict, branding: bool) -> str:
     )
     return (
         f'<!DOCTYPE html>'
-        f'<html><head><meta charset="utf-8"><title>{_xml_escape(snap.title)}</title></head>'
+        f'<html lang="en"><head><meta charset="utf-8"><title>{_xml_escape(snap.title)}</title></head>'
         f'<body style="background:{palette["bg"]};font-family:system-ui,-apple-system,sans-serif;padding:20px;max-width:680px;margin:auto">'
         f'{body}'
         f'</body></html>'

@@ -311,6 +311,11 @@ def test_line_chart_renders_chart_only_svg_byte_stable():
     for match in re.findall(r'\d+\.\d+', out):
         assert match.count(".") == 1
         assert len(match.split(".")[1]) == 1
+    # Defense-in-depth: regex above silently passes 'e+10', so explicitly check
+    # for scientific-notation patterns (digit + e + sign + digit).
+    # Use regex to avoid false positives on attribute names like 'text-anchor'.
+    assert not re.search(r'\de[+-]\d', out), \
+        f"scientific notation leaked into SVG output: {out!r}"
     # No randomness — repeatable.
     out2 = _lib_share._render_line_chart_svg(
         chart, palette=_lib_share.PALETTE_LIGHT, x=20, y=20, width=560, height=180,
@@ -452,3 +457,60 @@ def test_render_html_escapes_revealed_project_in_table():
     out = _lib_share._render_html(snap, palette=_lib_share.PALETTE_LIGHT, branding=True)
     assert "<script>" not in out
     assert "evil&lt;script&gt;" in out
+
+
+def test_render_cell_text_dispatches_all_types():
+    """Direct dispatch coverage for every Cell subtype."""
+    from datetime import datetime, timezone
+
+    # Text passthrough.
+    assert _lib_share._render_cell_text(TextCell("hi")) == "hi"
+
+    # Money: positive, negative, large.
+    assert _lib_share._render_cell_text(MoneyCell(123.45)) == "$123.45"
+    assert _lib_share._render_cell_text(MoneyCell(-12.34)) == "-$12.34"
+    assert _lib_share._render_cell_text(MoneyCell(1234567.89)) == "$1,234,567.89"
+
+    # Percent: 1 decimal.
+    assert _lib_share._render_cell_text(PercentCell(12.345)) == "12.3%"
+
+    # Date: ISO date.
+    assert _lib_share._render_cell_text(
+        DateCell(datetime(2026, 5, 9, tzinfo=timezone.utc))
+    ) == "2026-05-09"
+
+    # Delta percent: +/- sign + 1 decimal + %.
+    assert _lib_share._render_cell_text(DeltaCell(1.5, "%")) == "+1.5%"
+    assert _lib_share._render_cell_text(DeltaCell(-1.5, "%")) == "-1.5%"
+    assert _lib_share._render_cell_text(DeltaCell(0.0, "%")) == "+0.0%"  # zero treated as non-negative
+
+    # Delta dollar: +/- sign + currency + 2 decimals.
+    assert _lib_share._render_cell_text(DeltaCell(1.5, "$")) == "+$1.50"
+    assert _lib_share._render_cell_text(DeltaCell(-1.5, "$")) == "-$1.50"
+
+    # Project label passthrough.
+    assert _lib_share._render_cell_text(ProjectCell("/path/to/project")) == "/path/to/project"
+
+
+def test_render_cell_text_unknown_type_raises():
+    class FakeCell:
+        pass
+    try:
+        _lib_share._render_cell_text(FakeCell())
+    except TypeError as e:
+        assert "FakeCell" in str(e) or "unknown" in str(e).lower()
+        return
+    raise AssertionError("expected TypeError on unknown cell type")
+
+
+def test_render_svg_dark_palette_uses_dark_bg():
+    """SVG output with dark theme must use the dark palette's bg color, not light."""
+    snap = _make_minimal_snapshot()
+    out_dark = _lib_share._render_svg(
+        snap, palette=_lib_share.PALETTE_DARK,
+        branding=True, include_chrome=True,
+    )
+    assert _lib_share.PALETTE_DARK["bg"] in out_dark
+    assert _lib_share.PALETTE_LIGHT["bg"] not in out_dark
+    # Dark-palette fg color also present (used by header).
+    assert _lib_share.PALETTE_DARK["fg"] in out_dark
