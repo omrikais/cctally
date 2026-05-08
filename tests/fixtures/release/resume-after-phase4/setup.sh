@@ -73,7 +73,10 @@ LOG="${NPM_MOCK_LOG_FILE:-$work/npm-invocations.log}"
 printf '%s
 ' "$*" >> "$LOG" 2>/dev/null || true
 
-# Optional: read responses from a state file (used by Batch 6 scenarios).
+# Optional: read responses from a state file (used by Phase 5/6 scenarios).
+# Backwards-compat: "exit": <int> works as before. New: "exit": [a, b, c]
+# returns a on call 1, b on call 2, c on calls 3+. Counter file persists
+# at $STATE.counter.<key> across invocations within one scenario.
 STATE="${NPM_MOCK_STATE_FILE:-}"
 if [ -n "$STATE" ] && [ -f "$STATE" ]; then
   SUB="${1:-}"
@@ -83,8 +86,29 @@ if [ -n "$STATE" ] && [ -f "$STATE" ]; then
     publish) KEY=publish ;;
     *) echo "fake-npm: unknown subcommand: $SUB" >&2; exit 1 ;;
   esac
-  EXIT=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get(sys.argv[2],{}).get('exit',0))" "$STATE" "$KEY" 2>/dev/null || echo 0)
-  STDOUT=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get(sys.argv[2],{}).get('stdout',''))" "$STATE" "$KEY" 2>/dev/null || echo "")
+  COUNTER_FILE="${STATE}.counter.${KEY}"
+  IDX=$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)
+  EXIT=$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+e = d.get(sys.argv[2], {}).get("exit", 0)
+i = int(sys.argv[3])
+if isinstance(e, list):
+    print(e[min(i, len(e) - 1)] if e else 0)
+else:
+    print(e)
+' "$STATE" "$KEY" "$IDX" 2>/dev/null || echo 0)
+  STDOUT=$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+s = d.get(sys.argv[2], {}).get("stdout", "")
+i = int(sys.argv[3])
+if isinstance(s, list):
+    print(s[min(i, len(s) - 1)] if s else "")
+else:
+    print(s)
+' "$STATE" "$KEY" "$IDX" 2>/dev/null || echo "")
+  echo "$((IDX + 1))" > "$COUNTER_FILE"
   if [ -n "$STDOUT" ]; then printf '%s
 ' "$STDOUT"; fi
   exit "$EXIT"
@@ -224,7 +248,7 @@ chore: seed brew formula template
 Public-Skip: true
 CCTALLY_BREW_TPL_EOF
 git push -q origin main
-CCTALLY_RELEASE_DATE_UTC=2026-05-07 GIT_AUTHOR_DATE="2026-05-07T00:00:00+0000" GIT_COMMITTER_DATE="2026-05-07T00:00:00+0000" PATH="$work/fake-bin:$PATH" GH_ARGV_LOG="$work/gh-argv.log.partial" GH_NOTES_DEST="$work/gh-notes.partial.txt" CCTALLY_RELEASE_BREW_ARCHIVE_URL="file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz" python3 bin/cctally release patch --skip-npm --skip-brew > "$work/_partial.stdout" 2> "$work/_partial.stderr"
+CCTALLY_RELEASE_DATE_UTC=2026-05-07 GIT_AUTHOR_DATE="2026-05-07T00:00:00+0000" GIT_COMMITTER_DATE="2026-05-07T00:00:00+0000" PATH="$work/fake-bin:$PATH" GH_ARGV_LOG="$work/gh-argv.log.partial" GH_NOTES_DEST="$work/gh-notes.partial.txt" python3 bin/cctally release patch --skip-npm --skip-brew > "$work/_partial.stdout" 2> "$work/_partial.stderr"
 cat > "$work/fake-bin/gh" <<'CCTALLY_FAKE_GH_DONE_EOF'
 #!/usr/bin/env bash
 echo "$@" >> "${GH_ARGV_LOG:-/dev/null}"

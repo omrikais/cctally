@@ -26,9 +26,6 @@ mkdir -p "$work/_artifacts"
 : > "$work/npm-invocations.log"
 export NPM_MOCK_STATE_FILE="$work/npm-mock-state.json"
 export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"
-# Phase 6: point the brew archive URL at the in-tree fake archive
-# so sha256 is deterministic across runs.
-export CCTALLY_RELEASE_BREW_ARCHIVE_URL="file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz"
 python3 bin/cctally release --resume > "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"
 rc=$?
 echo "$rc" > "$work/_artifacts/exit.txt"

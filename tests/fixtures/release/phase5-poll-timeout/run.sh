@@ -26,6 +26,8 @@ mkdir -p "$work/_artifacts"
 : > "$work/npm-invocations.log"
 export NPM_MOCK_STATE_FILE="$work/npm-mock-state.json"
 export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"
+export CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S=1
+export CCTALLY_RELEASE_NPM_POLL_INTERVAL_S=0.1
 python3 bin/cctally release patch > "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"
 rc=$?
 echo "$rc" > "$work/_artifacts/exit.txt"

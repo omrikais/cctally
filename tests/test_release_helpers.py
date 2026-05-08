@@ -996,3 +996,72 @@ class TestResume:
         # trust-gh fallback path.
         assert "public clone not discoverable" in captured.err
         assert "trusting gh release existence" in captured.err
+
+
+class TestReleasePhase5Polling:
+    """Phase 5 (await-npm-via-GHA) polling behavior."""
+
+    def test_already_on_registry_short_circuits(self, monkeypatch, capsys):
+        monkeypatch.setattr(cctally, "_release_phase_npm_done", lambda v: True)
+        rc = cctally._release_run_phase_npm(
+            "0.1.1", Path("/tmp/x"), dist_tag="latest"
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "already on npm — skipping" in out
+
+    def test_polls_until_published(self, monkeypatch, capsys):
+        responses = iter([False, False, True])
+        calls = []
+
+        def _done(v):
+            calls.append(v)
+            return next(responses)
+
+        monkeypatch.setattr(cctally, "_release_phase_npm_done", _done)
+        monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S", "10")
+        monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_INTERVAL_S", "0.01")
+
+        rc = cctally._release_run_phase_npm(
+            "0.1.1", Path("/tmp/x"), dist_tag="latest"
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "on npm registry ✓" in out
+        assert len(calls) == 3  # pre-loop + 2 loop iterations
+
+    def test_poll_timeout_returns_0_with_actions_url(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(cctally, "_release_phase_npm_done", lambda v: False)
+        monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S", "0.05")
+        monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_INTERVAL_S", "0.01")
+
+        rc = cctally._release_run_phase_npm(
+            "0.1.1", Path("/tmp/x"), dist_tag="latest"
+        )
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "timed out after" in captured.err
+        assert f"github.com/{cctally.PUBLIC_REPO}/actions" in captured.err
+        assert "npm publish --provenance --access public --tag latest" in captured.err
+
+    def test_poll_timing_env_overrides(self, monkeypatch):
+        # Defaults when env is absent.
+        monkeypatch.delenv("CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S", raising=False)
+        monkeypatch.delenv("CCTALLY_RELEASE_NPM_POLL_INTERVAL_S", raising=False)
+        timeout, interval = cctally._release_npm_poll_timing()
+        assert timeout == 300.0
+        assert interval == 10.0
+
+        # Honored when set.
+        monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S", "42")
+        monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_INTERVAL_S", "1.5")
+        timeout, interval = cctally._release_npm_poll_timing()
+        assert timeout == 42.0
+        assert interval == 1.5
+
+        # Non-numeric falls back to defaults.
+        monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S", "not-a-number")
+        timeout, _ = cctally._release_npm_poll_timing()
+        assert timeout == 300.0

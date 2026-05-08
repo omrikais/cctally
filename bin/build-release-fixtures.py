@@ -160,7 +160,10 @@ cat > "$work/fake-bin/npm" <<'CCTALLY_FAKE_NPM_EOF'
 LOG="${NPM_MOCK_LOG_FILE:-$work/npm-invocations.log}"
 printf '%s\n' "$*" >> "$LOG" 2>/dev/null || true
 
-# Optional: read responses from a state file (used by Batch 6 scenarios).
+# Optional: read responses from a state file (used by Phase 5/6 scenarios).
+# Backwards-compat: "exit": <int> works as before. New: "exit": [a, b, c]
+# returns a on call 1, b on call 2, c on calls 3+. Counter file persists
+# at $STATE.counter.<key> across invocations within one scenario.
 STATE="${NPM_MOCK_STATE_FILE:-}"
 if [ -n "$STATE" ] && [ -f "$STATE" ]; then
   SUB="${1:-}"
@@ -170,8 +173,29 @@ if [ -n "$STATE" ] && [ -f "$STATE" ]; then
     publish) KEY=publish ;;
     *) echo "fake-npm: unknown subcommand: $SUB" >&2; exit 1 ;;
   esac
-  EXIT=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get(sys.argv[2],{}).get('exit',0))" "$STATE" "$KEY" 2>/dev/null || echo 0)
-  STDOUT=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get(sys.argv[2],{}).get('stdout',''))" "$STATE" "$KEY" 2>/dev/null || echo "")
+  COUNTER_FILE="${STATE}.counter.${KEY}"
+  IDX=$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)
+  EXIT=$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+e = d.get(sys.argv[2], {}).get("exit", 0)
+i = int(sys.argv[3])
+if isinstance(e, list):
+    print(e[min(i, len(e) - 1)] if e else 0)
+else:
+    print(e)
+' "$STATE" "$KEY" "$IDX" 2>/dev/null || echo 0)
+  STDOUT=$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+s = d.get(sys.argv[2], {}).get("stdout", "")
+i = int(sys.argv[3])
+if isinstance(s, list):
+    print(s[min(i, len(s) - 1)] if s else "")
+else:
+    print(s)
+' "$STATE" "$KEY" "$IDX" 2>/dev/null || echo "")
+  echo "$((IDX + 1))" > "$COUNTER_FILE"
   if [ -n "$STDOUT" ]; then printf '%s\n' "$STDOUT"; fi
   exit "$EXIT"
 fi
@@ -592,16 +616,39 @@ def _run_release_with_npm(release_args: str) -> str:
     )
 
 
+def _run_release_with_npm_env(release_args: str, env_lines: list[str]) -> str:
+    """Same as `_run_release_with_npm`, plus extra `export …` lines exported
+    before the cctally invocation. Used by Phase 5 polling scenarios that
+    set CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S / _INTERVAL_S for fixture
+    determinism.
+    """
+    env_block = "".join(f"{line}\n" for line in env_lines)
+    return _RUN_HEADER + (
+        ': > "$work/npm-invocations.log"\n'
+        'export NPM_MOCK_STATE_FILE="$work/npm-mock-state.json"\n'
+        'export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"\n'
+        + env_block
+        + f'python3 bin/cctally release {release_args} '
+        + f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
+        + 'rc=$?\n'
+        + 'echo "$rc" > "$work/_artifacts/exit.txt"\n'
+        + _CAPTURE_ARTIFACTS
+        + 'exit "$rc"\n'
+    )
+
+
 def _run_release_with_brew(release_args: str) -> str:
     """run.sh body for Phase 6 scenarios. Same as `_run_release_with_npm`
     (which already provides the fake-npm + npm-state plumbing for the
     Phase 5 leg that runs inline) plus:
-      - Exports `CCTALLY_RELEASE_BREW_ARCHIVE_URL=file://...fake-archive...`
-        so `_release_compute_brew_sha256` reads the on-disk fake archive
-        instead of hitting GitHub. Yields the deterministic sha256
-        recorded in goldens (`eba438f24089aa3c950d53d2759a8e058d3da86c52685028610556e2f1ad7a56`).
       - Captures the post-run rendered formula (if any) at
         `$work/_artifacts/formula.rb` for golden-formula-substr checks.
+
+    `CCTALLY_RELEASE_BREW_ARCHIVE_URL` is exported by the
+    `bin/cctally-release-test` harness (issue #29) and inherited here, so
+    `_release_compute_brew_sha256` reads the on-disk fake archive instead
+    of hitting GitHub — yielding the deterministic sha256 recorded in
+    goldens (`eba438f24089aa3c950d53d2759a8e058d3da86c52685028610556e2f1ad7a56`).
 
     Phase 5's npm leg defaults to auth-fallback (the scaffold's fake-npm
     `whoami` exits 1 when no NPM_MOCK_STATE_FILE is set). Phase 5
@@ -611,10 +658,6 @@ def _run_release_with_brew(release_args: str) -> str:
     return _RUN_HEADER + (
         ': > "$work/npm-invocations.log"\n'
         'export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"\n'
-        '# Phase 6: point the brew archive URL at the in-tree fake archive\n'
-        '# so sha256 is deterministic across runs.\n'
-        'export CCTALLY_RELEASE_BREW_ARCHIVE_URL='
-        '"file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz"\n'
         f'python3 bin/cctally release {release_args} '
         f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
         f'rc=$?\n'
@@ -632,7 +675,8 @@ def _run_release_with_brew(release_args: str) -> str:
 def _run_release_with_npm_and_brew(release_args: str) -> str:
     """run.sh body for scenarios that exercise BOTH Phase 5 (with
     canned npm responses, requires `_seed_npm_mock_state` in
-    extra_setup) AND Phase 6 (with the fake brew archive URL).
+    extra_setup) AND Phase 6 (which inherits the harness-exported
+    `CCTALLY_RELEASE_BREW_ARCHIVE_URL` — see issue #29).
     Used by Batch 9's resume scenarios where the resume run needs
     Phase 5 to publish (or short-circuit on a "view returns URL"
     state) AND Phase 6 to run.
@@ -645,10 +689,6 @@ def _run_release_with_npm_and_brew(release_args: str) -> str:
         ': > "$work/npm-invocations.log"\n'
         'export NPM_MOCK_STATE_FILE="$work/npm-mock-state.json"\n'
         'export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"\n'
-        '# Phase 6: point the brew archive URL at the in-tree fake archive\n'
-        '# so sha256 is deterministic across runs.\n'
-        'export CCTALLY_RELEASE_BREW_ARCHIVE_URL='
-        '"file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz"\n'
         f'python3 bin/cctally release {release_args} '
         f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
         f'rc=$?\n'
@@ -1632,65 +1672,9 @@ _add(
 # the fake-npm so a regression in Phase 5's call shape fails fast.
 # ===========================================================================
 
-# 27. phase5-publish-stable: stable release with `--tag latest`. Full
-# happy path: view → whoami → publish → view (post-publish probe).
-_add(
-    name="phase5-publish-stable",
-    seed_changelog=_PATCH_SEED,
-    bootstrap_public=True,
-    extra_setup=_seed_npm_mock_state({
-        "whoami":  {"exit": 0, "stdout": "fake-user"},
-        "view":    {"exit": 1, "stdout": ""},
-        "publish": {"exit": 0, "stdout": "+ cctally@0.1.1"},
-    }),
-    run=_run_release_with_npm("patch"),
-    expected_exit=0,
-    stdout_substr="phase 5: npm publish (tag=latest)",
-    stderr_substr="",
-    npm_invocations=(
-        "view cctally@0.1.1 dist.tarball --json\n"
-        "whoami\n"
-        "publish --tag latest\n"
-        "view cctally@0.1.1 dist.tarball --json\n"
-    ),
-)
-
-
-# 28. phase5-publish-prerelease: prerelease release with `--tag next`.
-# `release prerelease --bump patch` from 0.1.0 → 0.1.1-rc.1.
-_add(
-    name="phase5-publish-prerelease",
-    seed_changelog=_changelog(
-        unreleased_subsections=[
-            ("Added", ["- Prerelease demo entry"]),
-        ],
-        prior_releases=[
-            ("0.1.0", "2026-01-01",
-                [("Added", ["- Initial public release of cctally"])]),
-        ],
-    ),
-    bootstrap_public=True,
-    extra_setup=_seed_npm_mock_state({
-        "whoami":  {"exit": 0, "stdout": "fake-user"},
-        "view":    {"exit": 1, "stdout": ""},
-        "publish": {"exit": 0, "stdout": "+ cctally@0.1.1-rc.1"},
-    }),
-    run=_run_release_with_npm("prerelease --bump patch"),
-    expected_exit=0,
-    stdout_substr="phase 5: npm publish (tag=next)",
-    stderr_substr="",
-    npm_invocations=(
-        "view cctally@0.1.1-rc.1 dist.tarball --json\n"
-        "whoami\n"
-        "publish --tag next\n"
-        "view cctally@0.1.1-rc.1 dist.tarball --json\n"
-    ),
-)
-
-
-# 29. phase5-already-published: `npm view` returns a registry URL on the
+# 27. phase5-already-published: `npm view` returns a registry URL on the
 # first probe → `_release_phase_npm_done` returns True → short-circuit
-# (no whoami, no publish, no second view).
+# pre-loop (no further view calls).
 _add(
     name="phase5-already-published",
     seed_changelog=_PATCH_SEED,
@@ -1712,52 +1696,65 @@ _add(
 )
 
 
-# 30. phase5-no-auth: `npm whoami` exits 1 → auth fallback (stderr message,
-# returns 0). No publish call, no post-publish view.
+# 28. phase5-poll-timeout: GHA workflow (simulated by the fake-npm) never
+# publishes — `npm view` always exits 1. Phase 5 polls until timeout, prints
+# the workflow Actions URL and emergency manual-publish copy-paste on
+# stderr, returns 0. Verifies env-hook timing plumbing end-to-end.
 _add(
-    name="phase5-no-auth",
+    name="phase5-poll-timeout",
     seed_changelog=_PATCH_SEED,
     bootstrap_public=True,
     extra_setup=_seed_npm_mock_state({
-        "whoami":  {"exit": 1, "stdout": ""},
-        "view":    {"exit": 1, "stdout": ""},
-        "publish": {"exit": 0, "stdout": ""},
+        "view": {"exit": 1, "stdout": ""},
     }),
-    run=_run_release_with_npm("patch"),
-    expected_exit=0,
-    stdout_substr="phase 5: npm publish",
-    stderr_substr="npm not authenticated",
-    npm_invocations=(
-        "view cctally@0.1.1 dist.tarball --json\n"
-        "whoami\n"
+    run=_run_release_with_npm_env(
+        "patch",
+        [
+            "export CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S=1",
+            "export CCTALLY_RELEASE_NPM_POLL_INTERVAL_S=0.1",
+        ],
     ),
+    expected_exit=0,
+    stdout_substr="phase 5: await npm publish via GHA",
+    stderr_substr="timed out after",
 )
 
 
-# 31. phase5-publish-fails: `npm publish` exits 1 → cmd_release returns 3.
-# No post-publish view (publish failure short-circuits).
+# 29. phase5-poll-success: fake-npm view returns exit 1 on call 1 (pre-loop
+# short-circuit fails), exit 0 on call 2 (loop's first iteration succeeds).
+# Verifies the poll loop progresses past the first iteration and that
+# Phase 6 runs after Phase 5 succeeds.
 _add(
-    name="phase5-publish-fails",
+    name="phase5-poll-success",
     seed_changelog=_PATCH_SEED,
     bootstrap_public=True,
     extra_setup=_seed_npm_mock_state({
-        "whoami":  {"exit": 0, "stdout": "fake-user"},
-        "view":    {"exit": 1, "stdout": ""},
-        "publish": {"exit": 1, "stdout": ""},
+        "view": {
+            "exit": [1, 0],
+            "stdout": [
+                "",
+                '"https://registry.npmjs.org/cctally/-/cctally-0.1.1.tgz"',
+            ],
+        },
     }),
-    run=_run_release_with_npm("patch"),
-    expected_exit=3,
-    stdout_substr="",
+    run=_run_release_with_npm_env(
+        "patch",
+        [
+            "export CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S=10",
+            "export CCTALLY_RELEASE_NPM_POLL_INTERVAL_S=0.05",
+        ],
+    ),
+    expected_exit=0,
+    stdout_substr="on npm registry ✓",
     stderr_substr="",
     npm_invocations=(
         "view cctally@0.1.1 dist.tarball --json\n"
-        "whoami\n"
-        "publish --tag latest\n"
+        "view cctally@0.1.1 dist.tarball --json\n"
     ),
 )
 
 
-# 32. phase5-skip-flag: `--skip-npm` short-circuits Phase 5 entirely.
+# 30. phase5-skip-flag: `--skip-npm` short-circuits Phase 5 entirely.
 # No npm calls of any kind; release returns 0. We don't seed an
 # npm-mock-state file — the binary should never be invoked at all.
 # Empty `golden-npm-invocations.txt` would catch any stray call:
@@ -2120,8 +2117,6 @@ _add(
         + 'PATH="$work/fake-bin:$PATH" '
         + 'GH_ARGV_LOG="$work/gh-argv.log.partial" '
         + 'GH_NOTES_DEST="$work/gh-notes.partial.txt" '
-        + 'CCTALLY_RELEASE_BREW_ARCHIVE_URL='
-        + '"file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz" '
         + 'python3 bin/cctally release patch --skip-npm --skip-brew '
         + '> "$work/_partial.stdout" 2> "$work/_partial.stderr"\n'
         # Swap fake-gh so `release view` returns 0 (gh_done=True).
@@ -2136,7 +2131,7 @@ _add(
     ),
     run=_run_release_with_npm_and_brew("--resume"),
     expected_exit=0,
-    stdout_substr="phase 5: npm publish",
+    stdout_substr="phase 5: await npm publish via GHA",
     stderr_substr="",
     formula_substr=(
         'url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.1.tar.gz"\n'
@@ -2177,8 +2172,6 @@ _add(
         + 'GH_NOTES_DEST="$work/gh-notes.partial.txt" '
         + 'NPM_MOCK_STATE_FILE="$work/npm-mock-state.json" '
         + 'NPM_MOCK_LOG_FILE="$work/npm-invocations.log.partial" '
-        + 'CCTALLY_RELEASE_BREW_ARCHIVE_URL='
-        + '"file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz" '
         + 'python3 bin/cctally release patch --skip-brew '
         + '> "$work/_partial.stdout" 2> "$work/_partial.stderr"\n'
         # Swap fake-gh so `release view` returns 0 (gh_done=True for
@@ -2227,8 +2220,6 @@ _add(
         + 'GH_NOTES_DEST="$work/gh-notes.partial.txt" '
         + 'NPM_MOCK_STATE_FILE="$work/npm-mock-state.json" '
         + 'NPM_MOCK_LOG_FILE="$work/npm-invocations.log.partial" '
-        + 'CCTALLY_RELEASE_BREW_ARCHIVE_URL='
-        + '"file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz" '
         + 'python3 bin/cctally release patch '
         + '> "$work/_partial.stdout" 2> "$work/_partial.stderr"\n'
         # Swap fake-gh + npm-mock-state into "phase done" responses so

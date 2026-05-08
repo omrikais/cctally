@@ -35,6 +35,43 @@ set -uo pipefail
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FIXTURES_DIR="$REPO_ROOT/tests/fixtures/release"
 
+# Default the Phase 6 brew-archive override for every scenario (issue #29).
+# Phase 6 (`_release_compute_brew_sha256`) downloads the GitHub auto-archive
+# unless `CCTALLY_RELEASE_BREW_ARCHIVE_URL` is set, and the synthetic v0.1.1
+# tag doesn't exist on the public mirror — workstations that resolve the URL
+# get HTTP 404, the self-hosted runner happens not to. Exporting here makes
+# the harness the single source of truth; setup.sh + run.sh inherit it via
+# normal shell env propagation. Scenarios that explicitly want the
+# un-overridden path (none today) can `unset` it in their own scaffold.
+export CCTALLY_RELEASE_BREW_ARCHIVE_URL="file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz"
+
+# Isolate from host git config (issue #29 — same robustness goal as the
+# brew-archive override). Without this, host-level config like
+# `release.brewClone` leaks into scenarios via global ~/.gitconfig and
+# tricks Phase 6's discovery into entering the formula-render path on
+# scenarios that don't seed a fake brew tap. The self-hosted runner
+# happened to lack this config, so CI was green while workstations that
+# do `release.brewClone = …` for their real homebrew clone failed
+# locally. /dev/null is the documented git-supported sentinel for
+# "skip this config layer." Applies to every git invocation issued by
+# setup.sh, run.sh, and the cctally release subprocess they fork.
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+
+# Default Phase 5's npm-poll timing for every scenario. Phase 5 polls
+# `npm view cctally@<v>` (production: 5-min timeout while a public-repo
+# OIDC GHA workflow publishes). The fake-npm in fixtures returns exit 0
+# with empty stdout for `view` by default, which `_release_phase_npm_done`
+# treats as "not yet published" — without an override, every happy-path
+# fixture would burn the full 300s timeout. Override globally to ~2s so
+# scenarios that don't explicitly mock view-as-success still bail fast
+# (returning 0 from Phase 5, matching their existing expected_exit=0).
+# Per-fixture overrides via `_run_release_with_npm_env` (e.g.
+# phase5-poll-timeout=1, phase5-poll-success=10) take precedence because
+# they re-export inside run.sh after this harness-level export.
+export CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S="${CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S:-2}"
+export CCTALLY_RELEASE_NPM_POLL_INTERVAL_S="${CCTALLY_RELEASE_NPM_POLL_INTERVAL_S:-0.1}"
+
 SCRATCH_DIR=$(mktemp -d -t cctally-release-XXXXXX)
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
 

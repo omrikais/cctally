@@ -133,9 +133,11 @@ mirror's perspective. Skipped under `--no-publish`.
 
 ### Phase 5 — npm publish
 
-Publishes the `cctally` package to npmjs.org from the public clone. Idempotent: short-circuits when `npm view cctally@<v> dist.tarball` already returns the registry URL.
+The `cctally` package is published to npmjs.org by a GitHub Actions workflow in the public repo (`omrikais/cctally/.github/workflows/release-npm.yml`), triggered by the tag push that landed in Phase 3. The workflow uses npm's OIDC trusted-publisher mechanism — no NPM_TOKEN secret, no operator 2FA round-trip.
 
-**Auth fallback:** when `npm whoami` exits nonzero, the phase prints `cd <public-clone> && npm publish --tag <tag>` to stderr and returns 0 — the release stays "published" from phases 1-4's perspective; the operator runs the printed command after `npm login`.
+Phase 5 in `cctally release` is observation-only: it polls `npm view cctally@<v>` every 10 seconds for up to 5 minutes (typical end-to-end is 30–90s including queue + registry propagation). On success: prints `cctally@<v> on npm registry ✓` and continues to Phase 6. On timeout: prints the workflow's Actions URL and an emergency copy-paste for manual publish, then returns 0 — `cctally release --resume` re-checks the registry once the workflow completes.
+
+Idempotent: short-circuits when `npm view cctally@<v> dist.tarball` already returns the registry URL on entry (e.g., when `--resume`-ing past a phase that already succeeded).
 
 **Dist-tag rule:** stable releases publish under `--tag latest`; pre-releases (versions with `-rc.N` etc.) publish under `--tag next`. So `npm install cctally` always returns the latest stable, and `npm install cctally@next` pulls the bleeding edge.
 
@@ -256,7 +258,7 @@ cctally release minor --public-clone /tmp/cctally-mirror-clone
 
 | Code | Meaning |
 |---|---|
-| `0` | Success (or auth-fallback path in phases 4-6 — phases 1-3 published; phase 4 awaits manual `gh release create`, phase 5 awaits manual `npm publish`, phase 6 awaits manual `git push` on the tap). |
+| `0` | Success (or fallback path in phases 4-6 — phases 1-3 published; phase 4 awaits manual `gh release create`; phase 5 poll timed out (workflow still running or failed; check `https://github.com/omrikais/cctally/actions`); phase 6 awaits manual `git push` on the tap). |
 | `1` | Unhandled internal exception (rare; report as a bug if it fires). |
 | `2` | Refusal — wrong branch, dirty tree, behind remote, tag already exists, empty `[Unreleased]`, missing public-clone discovery, HEAD-not-stamp-commit on resume, mutually exclusive flags. |
 | `3` | Mid-publish failure — staging guard tripped, mirror replay/push failed, hard `gh release create` failure after auth was confirmed OK. Re-run with `--resume`. |

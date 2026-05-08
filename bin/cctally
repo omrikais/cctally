@@ -1446,79 +1446,82 @@ def _release_run_phase_gh(version: str, body: str) -> int:
     return 0
 
 
+_RELEASE_NPM_POLL_TIMEOUT_S_DEFAULT = 300.0
+_RELEASE_NPM_POLL_INTERVAL_S_DEFAULT = 10.0
+
+
+def _release_npm_poll_timing() -> tuple[float, float]:
+    """Return (timeout_s, interval_s) honoring env-hook overrides.
+
+    Hidden env hooks (mirrors ``CCTALLY_RELEASE_DATE_UTC``):
+      - CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S
+      - CCTALLY_RELEASE_NPM_POLL_INTERVAL_S
+    Used by the harness (and pytest) to make Phase 5 fixtures deterministic.
+    Not in --help.
+    """
+    def _f(name: str, default: float) -> float:
+        try:
+            return float(os.environ[name])
+        except (KeyError, ValueError):
+            return default
+    return (
+        _f("CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S", _RELEASE_NPM_POLL_TIMEOUT_S_DEFAULT),
+        _f("CCTALLY_RELEASE_NPM_POLL_INTERVAL_S", _RELEASE_NPM_POLL_INTERVAL_S_DEFAULT),
+    )
+
+
 def _release_run_phase_npm(
     version: str,
     public_clone: pathlib.Path,
     *,
     dist_tag: str,
 ) -> int:
-    """Phase 5 — publish to npm from the public clone.
+    """Phase 5 — wait for the public-repo GHA workflow to publish ``cctally@<v>``.
 
-    ``dist_tag`` is ``"latest"`` for stable releases, ``"next"`` for
-    prereleases. Idempotent: short-circuits when
-    ``_release_phase_npm_done`` reports the version is already on npm.
+    Phase 3 pushes ``v<version>`` to ``omrikais/cctally``; the workflow at
+    ``.github/workflows/release-npm.yml`` fires on tag-push and runs
+    ``npm publish --provenance`` via OIDC trusted publisher (no NPM_TOKEN,
+    no operator 2FA round-trip — fixes the passkey-in-subprocess failure
+    mode where npm 2FA blocks ``npm publish`` from a non-interactive
+    subprocess).
 
-    Auth-fallback parity with Phase 4: when ``npm whoami`` exits
-    nonzero (or npm isn't on PATH at all), prints a copy-pasteable
-    command to publish manually and returns 0 — phases 1-4 already
-    succeeded, the release IS published to GitHub from the user's
-    perspective; npm is the third channel and treated as polish.
+    Phase 5 here is observation-only: poll ``npm view cctally@<v>`` until
+    it appears, with timeout. ``cctally`` never invokes ``npm publish``
+    locally anymore — Trusted Publisher binds the right to publish to the
+    public-repo workflow, not to the operator's `npm login` token.
 
-    Returns:
-      - ``0`` on successful publish, idempotent short-circuit, OR
-        auth-fallback.
-      - ``3`` on hard failure of ``npm publish`` after auth was
-        confirmed OK; ``--resume`` retries.
+    Returns ``0`` on observed success OR poll-timeout (soft-success: phases
+    1-4 landed; the workflow is either succeeding or visibly failing on
+    github.com; ``--resume`` re-checks the registry).
+
+    Timing overridable via ``CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S`` and
+    ``CCTALLY_RELEASE_NPM_POLL_INTERVAL_S`` env vars.
     """
-    print(f"phase 5: npm publish (tag={dist_tag})")
+    print(f"phase 5: await npm publish via GHA (tag={dist_tag})")
     if _release_phase_npm_done(version):
         print(f"  cctally@{version} already on npm — skipping.")
         return 0
 
-    # Auth probe. Wrap in try/except so missing npm-on-PATH falls
-    # cleanly into the auth-fallback branch (existing release-test
-    # scenarios run without npm on PATH and depend on this not crashing).
-    try:
-        auth = subprocess.run(
-            ["npm", "whoami"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=15,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        print(
-            f"\n  npm not on PATH or unresponsive. After installing npm and "
-            f"`npm login`, run:\n"
-            f"    cd {public_clone} && npm publish --tag {dist_tag}\n",
-            file=sys.stderr,
-        )
-        return 0
-    if auth.returncode != 0:
-        print(
-            f"\n  npm not authenticated. After `npm login`, run:\n"
-            f"    cd {public_clone} && npm publish --tag {dist_tag}\n",
-            file=sys.stderr,
-        )
-        return 0
-
-    pub = subprocess.run(
-        ["npm", "publish", "--tag", dist_tag],
-        cwd=str(public_clone),
-        check=False,
-    )
-    if pub.returncode != 0:
-        return 3
-
-    if not _release_phase_npm_done(version):
-        print(
-            f"  warning: `npm publish` returned 0 but `npm view "
-            f"cctally@{version}` doesn't see the version yet. Registry "
-            f"propagation lag is normal; check `npm view cctally version` "
-            f"in 30s.",
-            file=sys.stderr,
-        )
-    return 0
+    timeout_s, interval_s = _release_npm_poll_timing()
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if _release_phase_npm_done(version):
+            print(f"  cctally@{version} on npm registry ✓")
+            return 0
+        if time.monotonic() >= deadline:
+            print(
+                f"\n  timed out after {timeout_s:.0f}s waiting for "
+                f"cctally@{version} on npm. The GHA workflow may still be "
+                f"running or have failed — check:\n"
+                f"    https://github.com/{PUBLIC_REPO}/actions\n"
+                f"  Re-run `cctally release --resume` once the workflow "
+                f"completes, or for emergency manual publish:\n"
+                f"    cd {public_clone} && npm publish --provenance "
+                f"--access public --tag {dist_tag}\n",
+                file=sys.stderr,
+            )
+            return 0
+        time.sleep(interval_s)
 
 
 def _release_run_phase_brew(
@@ -1538,8 +1541,8 @@ def _release_run_phase_brew(
         version (idempotency under ``--resume``).
       - Dirty working tree — refuses with exit 2 and points the operator
         at ``--resume``.
-      - Push failure — auth-fallback parity with Phases 4 and 5: prints
-        the exact recovery command and returns 0. Phases 1-5 already
+      - Push failure — auth-fallback parity with Phase 4: prints the
+        exact recovery command and returns 0. Phases 1-5 already
         succeeded, the release IS published from the user's
         perspective; the brew tap is the third channel and treated as
         polish.
@@ -1645,7 +1648,7 @@ def _release_run_phase_brew(
             f"refs/tags/v{version}:refs/tags/v{version}\n",
             file=sys.stderr,
         )
-        return 0  # auth-fallback semantics; mirrors Phase 5.
+        return 0  # auth-fallback semantics; parity with Phase 4.
 
     return 0
 
@@ -1846,10 +1849,12 @@ def cmd_release(args: argparse.Namespace) -> int:
     is_prerelease = "-" in next_v
     dist_tag = "next" if is_prerelease else "latest"
 
-    # Phase 5 — npm publish (auth-fallback returns 0 to keep the release
-    # "published" from phases 1-4's perspective). `--skip-npm` is the
-    # operator escape hatch for ad-hoc cuts; idempotent — re-running
-    # `--resume` without it picks Phase 5 back up.
+    # Phase 5 — await npm publish via the public-repo GHA workflow
+    # (release-npm.yml), which fires on the tag pushed in Phase 3. Phase 5
+    # here is observation-only (poll `npm view` with timeout); poll-timeout
+    # returns 0 — the workflow runs independently on github.com, and
+    # `--resume` re-checks the registry. `--skip-npm` is the operator
+    # escape hatch for ad-hoc cuts.
     if args.skip_npm:
         print("phase 5: npm skipped (--skip-npm)")
     else:
@@ -1973,8 +1978,8 @@ def _release_dry_run(
     else:
         dist_tag = "next" if "-" in next_v else "latest"
         print(
-            f"Would publish: cctally@{next_v} to npmjs.org "
-            f"with --tag {dist_tag}"
+            f"Would await: cctally@{next_v} on npmjs.org via GHA workflow "
+            f"(release-npm.yml in public repo; tag={dist_tag})"
         )
     print()
     # Phase 6 — brew formula bump plan.

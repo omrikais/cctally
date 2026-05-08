@@ -1,0 +1,42 @@
+name: npm publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify package.json version matches tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg_version=$(node -p "require('./package.json').version")
+          if [ "$tag" != "$pkg_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $pkg_version"
+            exit 1
+          fi
+
+      - name: Derive dist-tag
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            echo "dist=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "dist=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: npm publish
+        run: npm publish --provenance --access public --tag '${{ steps.tag.outputs.dist }}'
