@@ -58,6 +58,7 @@ minor --prerelease-id beta` produces `1.1.0-beta.1`).
 | `--remote NAME`      | `origin`    | Private remote name (used for `git push`, tag push, fetch).                                                          |
 | `--allow-branch NAME`| `main` only | Escape hatch — permit cutting from a non-`main` branch (e.g. `--allow-branch hotfix/1.0.x`).                         |
 | `--public-clone PATH`| see below   | Override public-clone discovery (defaults to `git config release.publicClone` then the marker file).                 |
+| `--brew-clone PATH`  | see below   | Override brew tap discovery (defaults to `git config release.brewClone` then the marker file).                       |
 
 ## Phases
 
@@ -144,6 +145,8 @@ Publishes the `cctally` package to npmjs.org from the public clone. Idempotent: 
 
 Renders `homebrew/cctally.rb.template` (in cctally-dev) into `Formula/cctally.rb` in the `omrikais/homebrew-cctally` tap repo, with `<<VERSION>>` and `<<SHA256>>` substituted (sha256 computed by downloading `https://github.com/omrikais/cctally/archive/refs/tags/v<v>.tar.gz`). Commits, tags, pushes.
 
+**Auth fallback:** when `git push` exits nonzero (no write access to the tap remote), the phase prints `git -C <brew-clone> push origin HEAD --follow-tags` to stderr and returns 0 — the formula commit is local; the operator runs the printed command after fixing tap auth.
+
 **Tap discovery chain** (highest priority first):
 1. `--brew-clone <path>` flag.
 2. `git config --get release.brewClone`.
@@ -186,9 +189,10 @@ true:
   returns 0.
 - **Phase 5 done:** `npm view cctally@<v> dist.tarball` returns the
   registry URL (or `--skip-npm` was passed).
-- **Phase 6 done:** the brew tap's `Formula/cctally.rb` already carries
-  `version "X.Y.Z"`, the tap is at the matching tag, or `--skip-brew`
-  was passed (and the version is not a pre-release).
+- **Phase 6 done:** the brew tap's `Formula/cctally.rb` already
+  references `v<version>.tar.gz` in its archive URL — OR `--skip-brew`
+  was passed, OR the version is a pre-release (Phase 6 skips
+  pre-releases entirely).
 
 If all six signals are true, exits 0 immediately with `release vX.Y.Z
 already published`.
@@ -252,7 +256,7 @@ cctally release minor --public-clone /tmp/cctally-mirror-clone
 
 | Code | Meaning |
 |---|---|
-| `0` | Success (or auth-fallback path in phase 4 — phases 1-3 published, phase 4 awaits manual completion). |
+| `0` | Success (or auth-fallback path in phases 4-6 — phases 1-3 published; phase 4 awaits manual `gh release create`, phase 5 awaits manual `npm publish`, phase 6 awaits manual `git push` on the tap). |
 | `1` | Unhandled internal exception (rare; report as a bug if it fires). |
 | `2` | Refusal — wrong branch, dirty tree, behind remote, tag already exists, empty `[Unreleased]`, missing public-clone discovery, HEAD-not-stamp-commit on resume, mutually exclusive flags. |
 | `3` | Mid-publish failure — staging guard tripped, mirror replay/push failed, hard `gh release create` failure after auth was confirmed OK. Re-run with `--resume`. |
