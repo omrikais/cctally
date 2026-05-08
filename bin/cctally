@@ -19288,14 +19288,17 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         # Self-heal: a prior record-usage invocation may have inserted
         # the snapshot but been killed (CC self-update, machine sleep,
         # OOM) before maybe_record_milestone / maybe_update_five_hour_block
-        # could run. Both helpers are idempotent (max-existing check +
-        # INSERT OR IGNORE / replace-all rollups) so re-running on the
-        # latest snapshot is cheap on healthy ticks (~1 SELECT each)
-        # and recovers the missed rows on a previously-killed tick.
-        # Without this, a kill window between snapshot insert and
-        # milestone insert silently drops the milestone forever, since
-        # subsequent unchanged ticks short-circuit here. Regression:
-        # bin/cctally-record-usage-selfheal-test.
+        # could run. Pre-probe both surfaces with cheap indexed SELECTs
+        # and only invoke the helpers when a row is actually missing or
+        # stale. Steady-state cost: ~3 SELECTs (max_milestone, latest
+        # snapshot, block last_observed); ZERO JSONL re-ingest on healthy
+        # ticks. The helpers themselves are idempotent under
+        # concurrent record-usage instances (INSERT OR IGNORE for
+        # percent_milestones; SQLite write-lock serialization for the
+        # 5h upsert). Without the pre-probe, every dedup tick would
+        # trigger sync_cache + a window walk + replace-all rollups via
+        # maybe_update_five_hour_block's unconditional _compute_block_totals
+        # call. Regression: bin/cctally-record-usage-selfheal-test.
         try:
             heal_conn = open_db()
             try:
@@ -19305,18 +19308,65 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                     "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
                     (week_start_date,),
                 ).fetchone()
+                if latest_row is None:
+                    return 0
+
+                # Probe 1: do we owe a percent milestone? Snap up before
+                # floor (status-line API returns 0.N*100 which can fall
+                # one ULP short of N — same convention as
+                # maybe_record_milestone).
+                latest_floor = math.floor(
+                    float(latest_row["weekly_percent"]) + 1e-9
+                )
+                need_milestone_heal = False
+                if latest_floor >= 1:
+                    max_existing = heal_conn.execute(
+                        "SELECT MAX(percent_threshold) AS m "
+                        "FROM percent_milestones "
+                        "WHERE week_start_date = ?",
+                        (week_start_date,),
+                    ).fetchone()
+                    if max_existing is None or max_existing["m"] is None:
+                        need_milestone_heal = True
+                    elif int(max_existing["m"]) < latest_floor:
+                        need_milestone_heal = True
+
+                # Probe 2: do we owe a 5h-block update? Either no row
+                # for this canonical window, or the existing row's
+                # last_observed_at_utc is stale relative to the latest
+                # snapshot's captured_at_utc (the kill landed between
+                # insert_usage_snapshot and maybe_update_five_hour_block).
+                need_5h_heal = False
+                window_key = latest_row["five_hour_window_key"]
+                if window_key is not None:
+                    block_row = heal_conn.execute(
+                        "SELECT last_observed_at_utc "
+                        "FROM five_hour_blocks "
+                        "WHERE five_hour_window_key = ?",
+                        (int(window_key),),
+                    ).fetchone()
+                    if block_row is None:
+                        need_5h_heal = True
+                    elif (
+                        block_row["last_observed_at_utc"]
+                        < latest_row["captured_at_utc"]
+                    ):
+                        need_5h_heal = True
             finally:
                 heal_conn.close()
-            if latest_row is not None:
+
+            if need_milestone_heal or need_5h_heal:
                 latest_saved = _saved_dict_from_usage_row(latest_row)
-                try:
-                    maybe_record_milestone(latest_saved)
-                except Exception as exc:
-                    eprint(f"[milestone] self-heal error: {exc}")
-                try:
-                    maybe_update_five_hour_block(latest_saved)
-                except Exception as exc:
-                    eprint(f"[5h-block] self-heal error: {exc}")
+                if need_milestone_heal:
+                    try:
+                        maybe_record_milestone(latest_saved)
+                    except Exception as exc:
+                        eprint(f"[milestone] self-heal error: {exc}")
+                if need_5h_heal:
+                    try:
+                        maybe_update_five_hour_block(latest_saved)
+                    except Exception as exc:
+                        eprint(f"[5h-block] self-heal error: {exc}")
         except Exception as exc:
             eprint(f"[record-usage] self-heal lookup failed: {exc}")
         return 0
@@ -20517,8 +20567,12 @@ def _saved_dict_from_usage_row(row: sqlite3.Row) -> dict[str, Any]:
     milestone insert (e.g. CC self-update kill window, 2026-05-08).
 
     Field omissions match ``insert_usage_snapshot``: keys whose values
-    would be ``None``/empty are not emitted, so downstream ``saved.get(...)``
+    would be ``None`` are not emitted, so downstream ``saved.get(...)``
     callers see the same shape they'd see on a fresh insert.
+
+    Note: ``resetText`` and ``pageUrl`` from ``insert_usage_snapshot``'s
+    output dict are intentionally omitted — neither has any downstream
+    ``saved``-dict consumer in this codebase.
     """
     out: dict[str, Any] = {
         "id": int(row["id"]),
@@ -20527,13 +20581,13 @@ def _saved_dict_from_usage_row(row: sqlite3.Row) -> dict[str, Any]:
         "weekEndDate": row["week_end_date"],
         "weeklyPercent": float(row["weekly_percent"]),
     }
-    if row["week_start_at"]:
+    if row["week_start_at"] is not None:
         out["weekStartAt"] = row["week_start_at"]
-    if row["week_end_at"]:
+    if row["week_end_at"] is not None:
         out["weekEndAt"] = row["week_end_at"]
     if row["five_hour_percent"] is not None:
         out["fiveHourPercent"] = float(row["five_hour_percent"])
-    if row["five_hour_resets_at"]:
+    if row["five_hour_resets_at"] is not None:
         out["fiveHourResetsAt"] = row["five_hour_resets_at"]
     if row["five_hour_window_key"] is not None:
         out["fiveHourWindowKey"] = int(row["five_hour_window_key"])

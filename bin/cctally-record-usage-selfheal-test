@@ -75,7 +75,7 @@ mod.APP_DIR.mkdir(parents=True, exist_ok=True)
 WEEK_END_EPOCH = int(dt.datetime(2026, 5, 9, 0, 0, 0, tzinfo=dt.timezone.utc).timestamp())
 FIVE_H_END_EPOCH = int(dt.datetime(2026, 5, 9, 1, 0, 0, tzinfo=dt.timezone.utc).timestamp())
 
-def call_record(weekly_pct: float, five_hour_pct: float = 5.0) -> int:
+def call_record(weekly_pct: float, five_hour_pct: float = 0.0) -> int:
     ns = argparse.Namespace(
         percent=weekly_pct,
         resets_at=WEEK_END_EPOCH,
@@ -85,8 +85,10 @@ def call_record(weekly_pct: float, five_hour_pct: float = 5.0) -> int:
     )
     return mod.cmd_record_usage(ns)
 
-# Tick 1: 80% — clean path, milestone 80 + 5h block both written.
-rc1 = call_record(80.0)
+# Tick 1: weekly=80%, five_hour=0% — clean path. Milestone 80 written;
+# 5h block row created (the upsert runs whenever fiveHourPercent is not
+# None, even at 0.0); but NO 5h milestone (current_floor < 1).
+rc1 = call_record(80.0, 0.0)
 
 conn = mod.open_db()
 try:
@@ -108,13 +110,26 @@ print(f"snap1_pct={snap1['weekly_percent']}")
 print(f"milestone_80_after_tick1={m80}")
 print(f"blocks_after_tick1={blocks_after_tick1}")
 
-# Tick 2: 81% — simulate killed run by inserting the snapshot directly,
-# bypassing maybe_record_milestone and maybe_update_five_hour_block.
-# This replicates the real-world kill window (CC self-update on 2026-05-08).
+# Tick 2: weekly=81%, five_hour=1% — simulate killed run by inserting
+# the snapshot directly, bypassing maybe_record_milestone and
+# maybe_update_five_hour_block. Replicates the real-world kill window
+# (CC self-update on 2026-05-08). Both surfaces are now genuinely owed
+# a heal: percent_milestone 81 missing AND five_hour_milestone 1
+# missing AND the block's last_observed_at_utc is stale.
+#
+# Pin capturedAt 60s later than tick 1 so the block's last_observed_at_utc
+# (set by tick 1's maybe_update_five_hour_block call) is strictly older
+# than tick 2's snapshot — mirroring the real-world cadence (~30s status-
+# line ticks). Without the explicit offset, now_utc_iso() rounds to
+# seconds and tick 1 / tick 2 collide in the same second, masking the
+# probe-2 staleness check.
+later = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=60)).replace(
+    microsecond=0
+).isoformat().replace("+00:00", "Z")
 saved = mod.insert_usage_snapshot(
     {
         "source": "statusline",
-        "capturedAt": mod.now_utc_iso(),
+        "capturedAt": later,
         "weeklyPercent": 81.0,
         "weekStartDate": "2026-05-02",
         "weekEndDate": "2026-05-09",
@@ -124,7 +139,7 @@ saved = mod.insert_usage_snapshot(
         "weekEndAt": dt.datetime.fromtimestamp(
             WEEK_END_EPOCH, tz=dt.timezone.utc
         ).isoformat(timespec="seconds"),
-        "fiveHourPercent": 5.0,
+        "fiveHourPercent": 1.0,
         "fiveHourResetsAt": dt.datetime.fromtimestamp(
             FIVE_H_END_EPOCH, tz=dt.timezone.utc
         ).isoformat(timespec="seconds"),
@@ -138,14 +153,21 @@ try:
     m81_before_heal = conn.execute(
         "SELECT COUNT(*) AS n FROM percent_milestones WHERE percent_threshold=81"
     ).fetchone()["n"]
+    fhm1_before_heal = conn.execute(
+        "SELECT COUNT(*) AS n FROM five_hour_milestones WHERE percent_threshold=1"
+    ).fetchone()["n"]
 finally:
     conn.close()
 print(f"milestone_81_before_heal={m81_before_heal}")
+print(f"five_hour_milestone_1_before_heal={fhm1_before_heal}")
 
-# Tick 3: another 81% — dedup short-circuit. PRE-FIX: returns 0 with
-# milestone_81 still missing. POST-FIX: self-heal triggers, milestone
-# 81 materializes.
-rc3 = call_record(81.0)
+# Tick 3: weekly=81%, five_hour=1% — dedup short-circuit. PRE-FIX:
+# returns 0 with milestone_81 AND five_hour_milestone 1 still missing.
+# POST-FIX (round 1): self-heal triggers both helpers; round 2's
+# pre-probe layer detects the missing percent milestone (probe 1) and
+# the stale block last_observed_at_utc (probe 2), and materializes
+# both milestones.
+rc3 = call_record(81.0, 1.0)
 
 conn = mod.open_db()
 try:
@@ -154,6 +176,9 @@ try:
     ).fetchone()["n"]
     blocks_after_heal = conn.execute(
         "SELECT COUNT(*) AS n FROM five_hour_blocks"
+    ).fetchone()["n"]
+    fhm1_after_heal = conn.execute(
+        "SELECT COUNT(*) AS n FROM five_hour_milestones WHERE percent_threshold=1"
     ).fetchone()["n"]
     snap_count = conn.execute(
         "SELECT COUNT(*) AS n FROM weekly_usage_snapshots"
@@ -164,6 +189,7 @@ finally:
 print(f"rc3={rc3}")
 print(f"milestone_81_after_heal={m81_after_heal}")
 print(f"blocks_after_heal={blocks_after_heal}")
+print(f"five_hour_milestone_1_after_heal={fhm1_after_heal}")
 print(f"snap_count={snap_count}")
 PY
 )
@@ -180,17 +206,21 @@ fi
 rc1=$(printf '%s\n' "$out" | awk -F= '/^rc1=/{print $2}')
 m80=$(printf '%s\n' "$out" | awk -F= '/^milestone_80_after_tick1=/{print $2}')
 m81b=$(printf '%s\n' "$out" | awk -F= '/^milestone_81_before_heal=/{print $2}')
+fhm1b=$(printf '%s\n' "$out" | awk -F= '/^five_hour_milestone_1_before_heal=/{print $2}')
 rc3=$(printf '%s\n' "$out" | awk -F= '/^rc3=/{print $2}')
 m81a=$(printf '%s\n' "$out" | awk -F= '/^milestone_81_after_heal=/{print $2}')
 blocks_after_heal=$(printf '%s\n' "$out" | awk -F= '/^blocks_after_heal=/{print $2}')
+fhm1a=$(printf '%s\n' "$out" | awk -F= '/^five_hour_milestone_1_after_heal=/{print $2}')
 snap_count=$(printf '%s\n' "$out" | awk -F= '/^snap_count=/{print $2}')
 
 assert_eq "tick1 record-usage exit code" "0" "$rc1"
 assert_eq "milestone 80 after clean tick" "1" "$m80"
 assert_eq "milestone 81 missing after killed-run sim" "0" "$m81b"
+assert_eq "five_hour_milestone 1 missing after killed-run sim" "0" "$fhm1b"
 assert_eq "dedup tick exit code" "0" "$rc3"
 assert_eq "milestone 81 self-healed by dedup tick" "1" "$m81a"
 assert_eq "five_hour_blocks self-healed" "1" "$blocks_after_heal"
+assert_eq "five_hour_milestone 1 self-healed" "1" "$fhm1a"
 assert_eq "snapshot count unchanged by dedup tick" "2" "$snap_count"
 
 echo "passed: $pass_count   failed: $fail_count"
