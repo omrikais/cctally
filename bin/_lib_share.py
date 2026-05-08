@@ -172,3 +172,36 @@ def _md_escape(s: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+# --- Palettes ---
+
+PALETTE_LIGHT = {
+    "bg": "#ffffff",
+    "fg": "#1a1a1a",
+    "muted": "#6b7280",
+    "grid": "#e5e7eb",
+    "axis": "#9ca3af",
+    "series_primary": "#2563eb",     # blue-600
+    "series_secondary": "#9333ea",   # purple-600
+    "ref_warn": "#d97706",           # amber-600
+    "ref_alarm": "#dc2626",          # red-600
+    "table_header_bg": "#f3f4f6",
+    "table_row_alt": "#f9fafb",
+    "footer_link": "#2563eb",
+}
+
+PALETTE_DARK = {
+    "bg": "#0b0f17",
+    "fg": "#e5e7eb",
+    "muted": "#9ca3af",
+    "grid": "#1f2937",
+    "axis": "#4b5563",
+    "series_primary": "#60a5fa",     # blue-400
+    "series_secondary": "#c084fc",   # purple-400
+    "ref_warn": "#fbbf24",           # amber-400
+    "ref_alarm": "#f87171",          # red-400
+    "table_header_bg": "#111827",
+    "table_row_alt": "#1f2937",
+    "footer_link": "#60a5fa",
+}

@@ -108,3 +108,17 @@ def test_md_escape_covers_html_and_md_chars():
     assert _lib_share._md_escape("a]b") == "a\\]b"
     # Adversarial: HTML+md combo.
     assert _lib_share._md_escape("evil<img onerror=x>") == "evil&lt;img onerror=x&gt;"
+
+
+def test_palettes_have_required_keys():
+    """Both palettes must define every color slot used by SVG/HTML chrome and charts."""
+    required_keys = {
+        "bg", "fg", "muted", "grid", "axis",
+        "series_primary", "series_secondary",
+        "ref_warn", "ref_alarm",
+        "table_header_bg", "table_row_alt", "footer_link",
+    }
+    assert set(_lib_share.PALETTE_LIGHT.keys()) >= required_keys
+    assert set(_lib_share.PALETTE_DARK.keys()) >= required_keys
+    # Palettes must differ on at least the bg color.
+    assert _lib_share.PALETTE_LIGHT["bg"] != _lib_share.PALETTE_DARK["bg"]
