@@ -204,7 +204,9 @@ if [ $ec -ne 0 ]; then
 fi
 
 rc1=$(printf '%s\n' "$out" | awk -F= '/^rc1=/{print $2}')
+snap1_pct=$(printf '%s\n' "$out" | awk -F= '/^snap1_pct=/{print $2}')
 m80=$(printf '%s\n' "$out" | awk -F= '/^milestone_80_after_tick1=/{print $2}')
+blocks_after_tick1=$(printf '%s\n' "$out" | awk -F= '/^blocks_after_tick1=/{print $2}')
 m81b=$(printf '%s\n' "$out" | awk -F= '/^milestone_81_before_heal=/{print $2}')
 fhm1b=$(printf '%s\n' "$out" | awk -F= '/^five_hour_milestone_1_before_heal=/{print $2}')
 rc3=$(printf '%s\n' "$out" | awk -F= '/^rc3=/{print $2}')
@@ -214,7 +216,9 @@ fhm1a=$(printf '%s\n' "$out" | awk -F= '/^five_hour_milestone_1_after_heal=/{pri
 snap_count=$(printf '%s\n' "$out" | awk -F= '/^snap_count=/{print $2}')
 
 assert_eq "tick1 record-usage exit code" "0" "$rc1"
+assert_eq "tick1 weekly_percent" "80.0" "$snap1_pct"
 assert_eq "milestone 80 after clean tick" "1" "$m80"
+assert_eq "5h block created at tick 1 even with five_hour=0%" "1" "$blocks_after_tick1"
 assert_eq "milestone 81 missing after killed-run sim" "0" "$m81b"
 assert_eq "five_hour_milestone 1 missing after killed-run sim" "0" "$fhm1b"
 assert_eq "dedup tick exit code" "0" "$rc3"

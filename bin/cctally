@@ -19290,9 +19290,9 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         # OOM) before maybe_record_milestone / maybe_update_five_hour_block
         # could run. Pre-probe both surfaces with cheap indexed SELECTs
         # and only invoke the helpers when a row is actually missing or
-        # stale. Steady-state cost: ~3 SELECTs (max_milestone, latest
-        # snapshot, block last_observed); ZERO JSONL re-ingest on healthy
-        # ticks. The helpers themselves are idempotent under
+        # stale. Steady-state cost: 1-3 SELECTs (latest snapshot always;
+        # +max_milestone if floor>=1; +block last_observed if window_key
+        # is set); ZERO JSONL re-ingest on healthy ticks. The helpers themselves are idempotent under
         # concurrent record-usage instances (INSERT OR IGNORE for
         # percent_milestones; SQLite write-lock serialization for the
         # 5h upsert). Without the pre-probe, every dedup tick would
@@ -20570,9 +20570,12 @@ def _saved_dict_from_usage_row(row: sqlite3.Row) -> dict[str, Any]:
     would be ``None`` are not emitted, so downstream ``saved.get(...)``
     callers see the same shape they'd see on a fresh insert.
 
-    Note: ``resetText`` and ``pageUrl`` from ``insert_usage_snapshot``'s
-    output dict are intentionally omitted — neither has any downstream
-    ``saved``-dict consumer in this codebase.
+    Note: ``resetText`` (the only userscript-payload-only key
+    ``insert_usage_snapshot`` re-emits in its output dict) is
+    intentionally omitted — no downstream ``saved``-dict consumer in
+    this codebase reads it. ``pageUrl`` is a column on
+    ``weekly_usage_snapshots`` but is never propagated into the output
+    dict either path.
     """
     out: dict[str, Any] = {
         "id": int(row["id"]),
