@@ -25,14 +25,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   that added a path before a later commit promoted it to public — even
   when the author followed the documented "add file → then add to
   allowlist" sequencing and the hook accepted both commits. Authors saw
-  green at commit time and red at release time. The fix re-reads
-  `.mirror-allowlist` via `git show <sha>:.mirror-allowlist` per commit
-  in the validation pass, the merge-content guard, the apply pass for
-  merges, and the tag-fingerprint pass; commits predating the allowlist
-  file's introduction classify as if the allowlist were empty (every
-  path unmatched), matching the hook's behavior. The skip-chain metric
-  callback intentionally keeps using HEAD's allowlist since it computes
-  one ratio over a union of paths from many commits.
+  green at commit time and red at release time. The fix evaluates each
+  commit against the allowlist that lived at that commit's tree,
+  matching the commit-msg hook.
 - `cctally release` Phase 6 done-check is now remote-authoritative
   AND verifies the tap default-branch tip. Done-check runs three
   predicates: the local formula contains `/v<version>.tar.gz`, the
