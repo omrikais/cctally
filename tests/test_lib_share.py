@@ -193,6 +193,17 @@ def test_fmt_num_handles_float_not_int_specially():
     assert _lib_share._fmt_num(0.05) == "0.1"  # 1-decimal rounding
 
 
+def test_fmt_num_rejects_non_finite():
+    import math
+    for bad in (float("nan"), float("inf"), -float("inf")):
+        try:
+            _lib_share._fmt_num(bad)
+        except ValueError as e:
+            assert "finite" in str(e).lower()
+            continue
+        raise AssertionError(f"_fmt_num({bad!r}) should have raised ValueError")
+
+
 def test_serialize_attrs_lexical_order():
     out = _lib_share._serialize_attrs({"x": 1, "fill": "red", "y": 2, "id": "skip-me"})
     # Lexical: fill, id, x, y
@@ -233,6 +244,18 @@ def test_svg_text_escapes_content():
     out = _lib_share.svg_text(0, 0, "<script>", font_size=10, fill="#000")
     assert "&lt;script&gt;" in out
     assert "<script>" not in out
+
+
+def test_svg_text_falsy_weight_omits_attr():
+    # Empty-string weight must not emit font-weight=""
+    out_empty = _lib_share.svg_text(0, 0, "x", font_size=10, fill="#000", weight="")
+    assert "font-weight" not in out_empty
+    # Default "normal" weight: same behavior, no attribute.
+    out_normal = _lib_share.svg_text(0, 0, "x", font_size=10, fill="#000")
+    assert "font-weight" not in out_normal
+    # Non-default explicit weight still emits.
+    out_bold = _lib_share.svg_text(0, 0, "x", font_size=10, fill="#000", weight="bold")
+    assert 'font-weight="bold"' in out_bold
 
 
 def test_svg_line():

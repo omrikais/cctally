@@ -7,6 +7,7 @@ Spec: docs/superpowers/specs/2026-05-08-shareable-reports-design.md
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -221,15 +222,19 @@ def _fmt_num(n: float) -> str:
     """Format float with one decimal place, no scientific notation, no -0.0.
 
     Byte-stability invariant — every coordinate / value in SVG output
-    routes through this so goldens are stable.
+    routes through this so goldens are stable. Rejects non-finite inputs
+    (NaN/inf) loudly so chart-layer divide-by-zero or bad-data bugs surface
+    at the value site rather than rendering silently as a blank chart.
     """
+    if not math.isfinite(n):
+        raise ValueError(f"_fmt_num requires finite input, got {n!r}")
     out = f"{float(n):.1f}"
     if out == "-0.0":
         return "0.0"
     return out
 
 
-def _serialize_attrs(attrs: dict) -> str:
+def _serialize_attrs(attrs: Mapping[str, object]) -> str:
     """Serialize SVG/HTML attributes in lexical key order with escaped values.
 
     Numbers go through _fmt_num; strings through _attr_escape. None values
@@ -263,7 +268,7 @@ def svg_text(x: float, y: float, text: str, *,
         "fill": fill,
         "text-anchor": anchor,
     }
-    if weight != "normal":
+    if weight and weight != "normal":
         attrs["font-weight"] = weight
     return f'<text {_serialize_attrs(attrs)}>{_xml_escape(text)}</text>'
 
@@ -281,7 +286,15 @@ def svg_polyline(points: list[tuple[float, float]], *, stroke: str,
 
 def svg_path(d: str, *, stroke: str | None = None,
              fill: str | None = None) -> str:
-    attrs: dict = {"d": d}
+    """SVG path element — `d` is the only opaque attribute in the kernel.
+
+    Byte-stability caveat: callers building `d` from coordinates MUST format
+    each numeric value through `_fmt_num` before stringification, e.g.,
+    `f"M{_fmt_num(x0)} {_fmt_num(y0)} L{_fmt_num(x1)} {_fmt_num(y1)}"`. The
+    `d` minilanguage is opaque to `_serialize_attrs`, so a stray `f"{x:.6f}"`
+    would diverge goldens silently.
+    """
+    attrs: dict[str, object] = {"d": d}
     if stroke is not None:
         attrs["stroke"] = stroke
     if fill is not None:
