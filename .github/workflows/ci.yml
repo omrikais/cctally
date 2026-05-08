@@ -3,8 +3,17 @@ name: CI
 on:
   push:
     branches: [main]
+    # Skip docs-only pushes — every job here is code/test focused, and
+    # CHANGELOG / README / CLAUDE.md / docs/**/*.md churn doesn't change
+    # any test outcome. `paths-ignore` evaluates per push: if EVERY
+    # changed file matches, the workflow is skipped; a mixed code+docs
+    # push still runs.
+    paths-ignore:
+      - '**/*.md'
   pull_request:
     types: [opened, synchronize, reopened]
+    paths-ignore:
+      - '**/*.md'
 
 jobs:
   # test-linux (hosted ubuntu) was disabled to save GH Actions minutes —
