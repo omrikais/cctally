@@ -1,5 +1,43 @@
 # Installation
 
+## Distribution channels
+
+cctally ships through three channels. They land identical functionality; pick the one that matches your environment.
+
+### Homebrew tap
+
+```bash
+brew install omrikais/cctally/cctally
+```
+
+The formula installs `python@3.13` if it's not already present and pins cctally's shebang to that keg, so the tool keeps working even if your system Python changes. Symlinks `cctally` and the user-facing wrappers (`cctally-tui`, `cctally-dashboard`, `cctally-forecast`, …) into `/opt/homebrew/bin/` (Apple Silicon) or `/usr/local/bin/` (Intel/Linuxbrew).
+
+After `brew install`, run `cctally setup` once to register Claude Code hooks and bootstrap the local SQLite cache.
+
+### npm
+
+```bash
+npm install -g cctally
+```
+
+The package bundles `bin/cctally` (the Python script) and the dashboard static assets. The `cctally` command on PATH is a ~30-line Node shim that resolves `python3` and `exec`s the bundled script. **Windows is not supported** — use WSL or a native Linux/macOS environment.
+
+If you have a custom Python install, set `CCTALLY_PYTHON`:
+
+```bash
+export CCTALLY_PYTHON=/opt/homebrew/bin/python3.13
+```
+
+### From source
+
+```bash
+git clone https://github.com/omrikais/cctally
+cd cctally
+./bin/cctally setup
+```
+
+Useful when you want to run unreleased commits or iterate on contributions. `setup` symlinks `bin/cctally*` into `~/.local/bin/`.
+
 ## Migrating from the status-line snippet
 
 If you already wired `cctally record-usage` into `~/.claude/statusline-command.sh`,
