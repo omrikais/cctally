@@ -124,3 +124,51 @@ class ShareSnapshot:
     notes: tuple
     generated_at: datetime
     version: str
+
+
+# --- Escape helpers ---
+
+_XML_ESCAPE_TABLE = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+}
+
+
+def _xml_escape(s: str) -> str:
+    """Escape `&`, `<`, `>`, `"`, `'`. For SVG <text> content and HTML body text."""
+    out = []
+    for ch in s:
+        out.append(_XML_ESCAPE_TABLE.get(ch, ch))
+    return "".join(out)
+
+
+def _attr_escape(s: str) -> str:
+    """Escape XML chars + collapse newlines to space. For SVG/HTML attribute values."""
+    s = s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    return _xml_escape(s)
+
+
+_MD_HTML_TABLE = {"&": "&amp;", "<": "&lt;", ">": "&gt;"}
+_MD_FMT_CHARS = ("\\", "|", "*", "_", "`", "[", "]")
+
+
+def _md_escape(s: str) -> str:
+    """Escape markdown formatting chars + HTML chars.
+
+    Markdown surfaces (GitHub, Slack, most renderers) interpret raw HTML inline,
+    so a revealed project name like 'Project<script>' would inject without
+    HTML-char escaping. Backslash is escaped first so subsequent escapes don't
+    double-escape.
+    """
+    out = []
+    for ch in s:
+        if ch in _MD_HTML_TABLE:
+            out.append(_MD_HTML_TABLE[ch])
+        elif ch in _MD_FMT_CHARS:
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)

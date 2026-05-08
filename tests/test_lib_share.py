@@ -75,3 +75,36 @@ def test_snapshot_constructs_and_is_frozen():
     except dataclasses.FrozenInstanceError:
         return
     raise AssertionError("ShareSnapshot must be frozen")
+
+
+def test_xml_escape_handles_all_xml_chars():
+    assert _lib_share._xml_escape("a&b") == "a&amp;b"
+    assert _lib_share._xml_escape("a<b") == "a&lt;b"
+    assert _lib_share._xml_escape("a>b") == "a&gt;b"
+    assert _lib_share._xml_escape('a"b') == "a&quot;b"
+    assert _lib_share._xml_escape("a'b") == "a&#39;b"
+    assert _lib_share._xml_escape("plain") == "plain"
+    # Adversarial.
+    assert _lib_share._xml_escape("Project<script>") == "Project&lt;script&gt;"
+
+
+def test_attr_escape_normalizes_newlines():
+    # Same as xml plus newline normalization.
+    assert _lib_share._attr_escape("a\nb") == "a b"
+    assert _lib_share._attr_escape("a&\nb") == "a&amp; b"
+
+
+def test_md_escape_covers_html_and_md_chars():
+    # HTML chars (Codex finding M8): markdown surfaces interpret raw HTML.
+    assert _lib_share._md_escape("a<b") == "a&lt;b"
+    assert _lib_share._md_escape("a>b") == "a&gt;b"
+    assert _lib_share._md_escape("a&b") == "a&amp;b"
+    # Markdown formatting chars.
+    assert _lib_share._md_escape("a|b") == "a\\|b"
+    assert _lib_share._md_escape("a*b") == "a\\*b"
+    assert _lib_share._md_escape("a_b") == "a\\_b"
+    assert _lib_share._md_escape("a`b") == "a\\`b"
+    assert _lib_share._md_escape("a[b") == "a\\[b"
+    assert _lib_share._md_escape("a]b") == "a\\]b"
+    # Adversarial: HTML+md combo.
+    assert _lib_share._md_escape("evil<img onerror=x>") == "evil&lt;img onerror=x&gt;"
