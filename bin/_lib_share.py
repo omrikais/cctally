@@ -459,9 +459,73 @@ def _render_md(snap: ShareSnapshot, *, branding: bool) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _render_svg(snap: ShareSnapshot, *, palette: dict, branding: bool, include_chrome: bool = True) -> str:
-    # Minimal stub — Task 11 fills this out with chart + chrome.
-    return f'<svg xmlns="http://www.w3.org/2000/svg"><!-- {_xml_escape(snap.title)} --></svg>'
+# --- SVG composition ---
+
+_SVG_WIDTH = 600
+_SVG_HEADER_H = 60
+_SVG_CHART_H = 220
+_SVG_FOOTER_H = 30
+_SVG_PADDING = 20
+
+
+def _render_svg(snap: ShareSnapshot, *, palette: dict,
+                branding: bool, include_chrome: bool = True) -> str:
+    """Render snapshot to SVG.
+
+    include_chrome=True → standalone SVG with title/subtitle/timestamp/footer.
+    include_chrome=False → chart-only (HTML wrapper consumes this).
+    """
+    if include_chrome:
+        height = _SVG_HEADER_H + _SVG_CHART_H + _SVG_FOOTER_H + (_SVG_PADDING * 2)
+    else:
+        height = _SVG_CHART_H + (_SVG_PADDING * 2)
+
+    pieces = []
+
+    if include_chrome:
+        pieces.append(_render_svg_header(
+            snap, palette=palette,
+            x=_SVG_PADDING, y=_SVG_PADDING, width=_SVG_WIDTH,
+        ))
+
+    # Chart.
+    chart_y = _SVG_PADDING + (_SVG_HEADER_H if include_chrome else 0)
+    if snap.chart is not None:
+        if isinstance(snap.chart, LineChart):
+            pieces.append(_render_line_chart_svg(
+                snap.chart, palette=palette,
+                x=_SVG_PADDING, y=chart_y, width=_SVG_WIDTH, height=_SVG_CHART_H,
+            ))
+        elif isinstance(snap.chart, BarChart):
+            pieces.append(_render_bar_chart_svg(
+                snap.chart, palette=palette,
+                x=_SVG_PADDING, y=chart_y, width=_SVG_WIDTH, height=_SVG_CHART_H,
+            ))
+        elif isinstance(snap.chart, HorizontalBarChart):
+            pieces.append(_render_hbar_chart_svg(
+                snap.chart, palette=palette,
+                x=_SVG_PADDING, y=chart_y, width=_SVG_WIDTH, height=_SVG_CHART_H,
+            ))
+
+    if include_chrome:
+        pieces.append(_render_svg_footer(
+            snap, palette=palette,
+            x=_SVG_PADDING,
+            y=_SVG_PADDING + _SVG_HEADER_H + _SVG_CHART_H + 18,
+            width=_SVG_WIDTH,
+            branding=branding,
+        ))
+
+    total_w = _SVG_WIDTH + (_SVG_PADDING * 2)
+    bg_rect = svg_rect(0, 0, total_w, height, fill=palette["bg"])
+    inner = bg_rect + "".join(pieces)
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'viewBox="0 0 {_fmt_num(total_w)} {_fmt_num(height)}" '
+        f'width="{_fmt_num(total_w)}" height="{_fmt_num(height)}">'
+        f'{inner}'
+        f'</svg>'
+    )
 
 
 def _render_html(snap: ShareSnapshot, *, palette: dict, branding: bool) -> str:
