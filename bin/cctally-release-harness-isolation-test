@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Regression for issue #28 (and the #29 fix that closed the leak).
+#
+# Verifies bin/cctally-release-test prevents the operator's host git
+# config (GLOBAL or SYSTEM) from leaking `release.brewClone` into
+# spawned `cctally release` invocations. Without isolation, the
+# `phase6-no-clone-configured` scenario writes a
+# `chore(formula): cctally <v>` commit into whatever path
+# `release.brewClone` resolves to — which, on the operator's
+# workstation, is the real homebrew-cctally tap clone.
+#
+# The mechanism: phase6-no-clone-configured intentionally seeds NO
+# local `release.brewClone` config, so `_release_discover_brew_clone`
+# falls through to global git config. If the harness fails to neutralize
+# the host's global gitconfig (`GIT_CONFIG_GLOBAL=/dev/null`) or system
+# gitconfig (`GIT_CONFIG_NOSYSTEM=1`), the spawned `cctally release`
+# resolves the host's `release.brewClone` and writes commits there.
+#
+# Test setup creates a sentinel brew tap clone with one bootstrap
+# commit, then runs the harness against a hostile env that points
+# `release.brewClone` (in BOTH the global and system layers) at the
+# sentinel. Post-run, the sentinel HEAD must be unchanged.
+#
+# The summary line MUST end with `passed: N   failed: M` (two spaces)
+# so the cctally-test-all aggregator's awk parser picks up the counts.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SCRATCH_DIR=$(mktemp -d -t cctally-release-iso-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+
+# Sentinel: a fake "real" brew tap clone the test asserts is NEVER
+# written to. One bootstrap commit so a HEAD comparison is meaningful.
+SENTINEL="$SCRATCH_DIR/sentinel-tap"
+git init -q "$SENTINEL"
+(
+    cd "$SENTINEL"
+    git config user.email "sentinel@test.local"
+    git config user.name "Sentinel"
+    git config commit.gpgsign false
+    mkdir -p Formula
+    echo "sentinel" > Formula/sentinel.txt
+    git add .
+    git commit -q --no-verify -m "sentinel: bootstrap"
+)
+INITIAL_HEAD=$(git -C "$SENTINEL" rev-parse HEAD)
+
+# Fake HOME with a hostile global ~/.gitconfig that points
+# release.brewClone at the sentinel — simulates the operator's
+# workstation. Also write a system-tier gitconfig and point
+# GIT_CONFIG_SYSTEM at it: covers the second leak layer that
+# GIT_CONFIG_NOSYSTEM=1 protects against.
+FAKE_HOME="$SCRATCH_DIR/home"
+mkdir -p "$FAKE_HOME"
+cat > "$FAKE_HOME/.gitconfig" <<EOF
+[user]
+	email = isolation@test.local
+	name = Isolation Test
+[commit]
+	gpgsign = false
+[tag]
+	gpgsign = false
+[release]
+	brewClone = $SENTINEL
+EOF
+
+cat > "$FAKE_HOME/system.gitconfig" <<EOF
+[release]
+	brewClone = $SENTINEL
+EOF
+
+# Run the release-test harness filtered to the single leak-prone
+# scenario. The harness MUST succeed (its own GIT_CONFIG_GLOBAL=/dev/null
+# + GIT_CONFIG_NOSYSTEM=1 exports neutralize ours) AND MUST NOT have
+# touched the sentinel.
+log="$SCRATCH_DIR/release-test.log"
+HOME="$FAKE_HOME" \
+    GIT_CONFIG_SYSTEM="$FAKE_HOME/system.gitconfig" \
+    CCTALLY_RELEASE_TEST_SCENARIO="phase6-no-clone-configured" \
+    "$REPO_ROOT/bin/cctally-release-test" >"$log" 2>&1
+test_exit=$?
+
+FINAL_HEAD=$(git -C "$SENTINEL" rev-parse HEAD)
+
+failed=0
+if [ "$INITIAL_HEAD" != "$FINAL_HEAD" ]; then
+    echo "FAIL: release-test harness leaked into sentinel brew tap clone"
+    echo "       initial HEAD: $INITIAL_HEAD"
+    echo "       final HEAD:   $FINAL_HEAD"
+    git -C "$SENTINEL" log --oneline "$INITIAL_HEAD..$FINAL_HEAD" \
+        | sed 's/^/         /'
+    failed=1
+fi
+
+if [ "$test_exit" -ne 0 ]; then
+    echo "FAIL: bin/cctally-release-test exit $test_exit (output below)"
+    sed 's/^/    /' "$log"
+    failed=1
+fi
+
+if [ "$failed" -eq 0 ]; then
+    echo "PASS: release-test harness isolated from host release.brewClone"
+    echo "passed: 1   failed: 0"
+    exit 0
+fi
+echo "passed: 0   failed: 1"
+exit 1

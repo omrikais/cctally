@@ -34,3 +34,11 @@ tests/fixtures/*/*/.local/share/cctally/logs/
 # path). Treat cache.db here as a runtime artifact, not a committed golden.
 tests/fixtures/codex-daily/token-count-dedup/.local/share/ccusage-subscription/cache.db
 tests/fixtures/codex-session/token-count-dedup/.local/share/ccusage-subscription/cache.db
+
+# === npm root install pollution ===
+# `package.json` at the repo root is the npm-publish sentinel; npm's natural
+# workflow puts `node_modules/` and `package-lock.json` next to it on any
+# `npm install <pkg>` from root. Anchor to root so dashboard/web's legitimate
+# Vite/React deps (handled by dashboard/web/.gitignore) stay untouched.
+/node_modules
+/package-lock.json

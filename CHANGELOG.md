@@ -5,6 +5,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Root `.gitignore` now anchors `/node_modules` and `/package-lock.json`,
+  preventing `npm install` next to the repo-root `package.json` (the
+  npm-publish sentinel) from leaving the working tree dirty and blocking
+  `cctally release`. `dashboard/web/node_modules` and the tracked
+  `dashboard/web/package-lock.json` are unaffected by the anchored entries.
+
 ## [1.3.0] - 2026-05-08
 
 ### Changed

@@ -92,6 +92,13 @@ for dir in "$FIXTURES_DIR"/*/; do
     case "$name" in
         _*) continue ;;
     esac
+    # Optional single-scenario filter. Used by
+    # bin/cctally-release-harness-isolation-test to exercise just one
+    # leak-prone scenario without paying the full-suite cost.
+    if [ -n "${CCTALLY_RELEASE_TEST_SCENARIO:-}" ] \
+       && [ "$name" != "${CCTALLY_RELEASE_TEST_SCENARIO}" ]; then
+        continue
+    fi
     expected_exit=$(cat "$dir/golden-exit.txt" | tr -d '\n')
     expected_stdout=$(cat "$dir/golden-stdout-substr.txt" | tr -d '\n')
     expected_stderr=$(cat "$dir/golden-stderr-substr.txt" | tr -d '\n')
