@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# Regression harness for the dedup self-heal in cmd_record_usage.
+#
+# Reproduces the 2026-05-08 CC-self-update kill-window race:
+#   - snapshot at N% inserted, milestone N recorded normally
+#   - snapshot at (N+1)% inserted, but the in-flight record-usage call
+#     is killed before maybe_record_milestone / maybe_update_five_hour_block
+#     get a chance to run (simulated by inserting the snapshot directly
+#     and skipping the maybe-* calls)
+#   - subsequent record-usage call observes the same (N+1)% and hits
+#     the dedup short-circuit
+#   - PRE-FIX: dedup returns immediately, milestone (N+1) and
+#     five_hour_blocks row stay missing forever
+#   - POST-FIX: dedup runs the self-heal, calls maybe_record_milestone
+#     and maybe_update_five_hour_block on the latest existing snapshot,
+#     and milestone (N+1) + the 5h block both materialize
+#
+# Pattern: dynamic-import of bin/cctally (matches
+# bin/cctally-percent-milestone-idempotency-test). HARNESS_FAKE_HOME
+# scratch dir keeps it isolated from real ~/.local/share/cctally.
+#
+# Asserts:
+#   - exactly one percent_milestones row at threshold N+1 after dedup tick
+#   - exactly one five_hour_blocks row for the simulated 5h window after dedup tick
+#   - the dedup tick itself exited 0 (no error path taken)
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+pass_count=0
+fail_count=0
+
+assert_eq () {
+    local label="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "PASS $label"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $label"
+        printf '  expected: %s\n  actual:   %s\n' "$expected" "$actual"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+SCRATCH="$(mktemp -d -t cctally-selfheal.XXXXXX)"
+trap 'rm -rf "$SCRATCH"' EXIT
+
+out=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$SCRATCH" TZ=Etc/UTC python3 - <<'PY'
+import importlib.util
+import os
+import pathlib
+import sys
+import argparse
+import datetime as dt
+
+from importlib.machinery import SourceFileLoader
+
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
+spec = importlib.util.spec_from_loader("cctally_mod", loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules["cctally_mod"] = mod
+loader.exec_module(mod)
+
+assert str(mod.APP_DIR).startswith(os.environ["HOME"]), (
+    f"APP_DIR {mod.APP_DIR} did not land under HOME={os.environ['HOME']!r}; "
+    "harness isolation broken"
+)
+mod.APP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Pin reset epochs so the test is deterministic.
+# week:    2026-05-02 00:00:00 UTC -> 2026-05-09 00:00:00 UTC
+# 5h:      2026-05-08 20:00:00 UTC -> 2026-05-09 01:00:00 UTC
+WEEK_END_EPOCH = int(dt.datetime(2026, 5, 9, 0, 0, 0, tzinfo=dt.timezone.utc).timestamp())
+FIVE_H_END_EPOCH = int(dt.datetime(2026, 5, 9, 1, 0, 0, tzinfo=dt.timezone.utc).timestamp())
+
+def call_record(weekly_pct: float, five_hour_pct: float = 5.0) -> int:
+    ns = argparse.Namespace(
+        percent=weekly_pct,
+        resets_at=WEEK_END_EPOCH,
+        five_hour_percent=five_hour_pct,
+        five_hour_resets_at=FIVE_H_END_EPOCH,
+        week_start_name=None,
+    )
+    return mod.cmd_record_usage(ns)
+
+# Tick 1: 80% — clean path, milestone 80 + 5h block both written.
+rc1 = call_record(80.0)
+
+conn = mod.open_db()
+try:
+    snap1 = conn.execute(
+        "SELECT id, weekly_percent FROM weekly_usage_snapshots "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    m80 = conn.execute(
+        "SELECT COUNT(*) AS n FROM percent_milestones WHERE percent_threshold=80"
+    ).fetchone()["n"]
+    blocks_after_tick1 = conn.execute(
+        "SELECT COUNT(*) AS n FROM five_hour_blocks"
+    ).fetchone()["n"]
+finally:
+    conn.close()
+
+print(f"rc1={rc1}")
+print(f"snap1_pct={snap1['weekly_percent']}")
+print(f"milestone_80_after_tick1={m80}")
+print(f"blocks_after_tick1={blocks_after_tick1}")
+
+# Tick 2: 81% — simulate killed run by inserting the snapshot directly,
+# bypassing maybe_record_milestone and maybe_update_five_hour_block.
+# This replicates the real-world kill window (CC self-update on 2026-05-08).
+saved = mod.insert_usage_snapshot(
+    {
+        "source": "statusline",
+        "capturedAt": mod.now_utc_iso(),
+        "weeklyPercent": 81.0,
+        "weekStartDate": "2026-05-02",
+        "weekEndDate": "2026-05-09",
+        "weekStartAt": dt.datetime.fromtimestamp(
+            WEEK_END_EPOCH - 7 * 86400, tz=dt.timezone.utc
+        ).isoformat(timespec="seconds"),
+        "weekEndAt": dt.datetime.fromtimestamp(
+            WEEK_END_EPOCH, tz=dt.timezone.utc
+        ).isoformat(timespec="seconds"),
+        "fiveHourPercent": 5.0,
+        "fiveHourResetsAt": dt.datetime.fromtimestamp(
+            FIVE_H_END_EPOCH, tz=dt.timezone.utc
+        ).isoformat(timespec="seconds"),
+        "fiveHourWindowKey": mod._canonical_5h_window_key(FIVE_H_END_EPOCH),
+    },
+    "monday",
+)
+
+conn = mod.open_db()
+try:
+    m81_before_heal = conn.execute(
+        "SELECT COUNT(*) AS n FROM percent_milestones WHERE percent_threshold=81"
+    ).fetchone()["n"]
+finally:
+    conn.close()
+print(f"milestone_81_before_heal={m81_before_heal}")
+
+# Tick 3: another 81% — dedup short-circuit. PRE-FIX: returns 0 with
+# milestone_81 still missing. POST-FIX: self-heal triggers, milestone
+# 81 materializes.
+rc3 = call_record(81.0)
+
+conn = mod.open_db()
+try:
+    m81_after_heal = conn.execute(
+        "SELECT COUNT(*) AS n FROM percent_milestones WHERE percent_threshold=81"
+    ).fetchone()["n"]
+    blocks_after_heal = conn.execute(
+        "SELECT COUNT(*) AS n FROM five_hour_blocks"
+    ).fetchone()["n"]
+    snap_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM weekly_usage_snapshots"
+    ).fetchone()["n"]
+finally:
+    conn.close()
+
+print(f"rc3={rc3}")
+print(f"milestone_81_after_heal={m81_after_heal}")
+print(f"blocks_after_heal={blocks_after_heal}")
+print(f"snap_count={snap_count}")
+PY
+)
+ec=$?
+
+if [ $ec -ne 0 ]; then
+    echo "FAIL python harness exited with $ec"
+    printf '%s\n' "$out"
+    fail_count=$((fail_count + 1))
+    echo "passed: $pass_count   failed: $fail_count"
+    exit 1
+fi
+
+rc1=$(printf '%s\n' "$out" | awk -F= '/^rc1=/{print $2}')
+m80=$(printf '%s\n' "$out" | awk -F= '/^milestone_80_after_tick1=/{print $2}')
+m81b=$(printf '%s\n' "$out" | awk -F= '/^milestone_81_before_heal=/{print $2}')
+rc3=$(printf '%s\n' "$out" | awk -F= '/^rc3=/{print $2}')
+m81a=$(printf '%s\n' "$out" | awk -F= '/^milestone_81_after_heal=/{print $2}')
+blocks_after_heal=$(printf '%s\n' "$out" | awk -F= '/^blocks_after_heal=/{print $2}')
+snap_count=$(printf '%s\n' "$out" | awk -F= '/^snap_count=/{print $2}')
+
+assert_eq "tick1 record-usage exit code" "0" "$rc1"
+assert_eq "milestone 80 after clean tick" "1" "$m80"
+assert_eq "milestone 81 missing after killed-run sim" "0" "$m81b"
+assert_eq "dedup tick exit code" "0" "$rc3"
+assert_eq "milestone 81 self-healed by dedup tick" "1" "$m81a"
+assert_eq "five_hour_blocks self-healed" "1" "$blocks_after_heal"
+assert_eq "snapshot count unchanged by dedup tick" "2" "$snap_count"
+
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

@@ -19285,6 +19285,40 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         conn.close()
 
     if not should_insert:
+        # Self-heal: a prior record-usage invocation may have inserted
+        # the snapshot but been killed (CC self-update, machine sleep,
+        # OOM) before maybe_record_milestone / maybe_update_five_hour_block
+        # could run. Both helpers are idempotent (max-existing check +
+        # INSERT OR IGNORE / replace-all rollups) so re-running on the
+        # latest snapshot is cheap on healthy ticks (~1 SELECT each)
+        # and recovers the missed rows on a previously-killed tick.
+        # Without this, a kill window between snapshot insert and
+        # milestone insert silently drops the milestone forever, since
+        # subsequent unchanged ticks short-circuit here. Regression:
+        # bin/cctally-record-usage-selfheal-test.
+        try:
+            heal_conn = open_db()
+            try:
+                latest_row = heal_conn.execute(
+                    "SELECT * FROM weekly_usage_snapshots "
+                    "WHERE week_start_date = ? "
+                    "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+                    (week_start_date,),
+                ).fetchone()
+            finally:
+                heal_conn.close()
+            if latest_row is not None:
+                latest_saved = _saved_dict_from_usage_row(latest_row)
+                try:
+                    maybe_record_milestone(latest_saved)
+                except Exception as exc:
+                    eprint(f"[milestone] self-heal error: {exc}")
+                try:
+                    maybe_update_five_hour_block(latest_saved)
+                except Exception as exc:
+                    eprint(f"[5h-block] self-heal error: {exc}")
+        except Exception as exc:
+            eprint(f"[record-usage] self-heal lookup failed: {exc}")
         return 0
 
     payload = {
@@ -20473,6 +20507,37 @@ def insert_usage_snapshot(payload: dict[str, Any], week_start_name: str) -> dict
         out["fiveHourWindowKey"] = five_hour_window_key
     return out
 
+
+def _saved_dict_from_usage_row(row: sqlite3.Row) -> dict[str, Any]:
+    """Mirror ``insert_usage_snapshot``'s output dict from an existing
+    weekly_usage_snapshots row. Used by ``cmd_record_usage``'s dedup
+    self-heal path so ``maybe_record_milestone`` and
+    ``maybe_update_five_hour_block`` can re-run on the latest snapshot
+    when an earlier invocation was killed between snapshot insert and
+    milestone insert (e.g. CC self-update kill window, 2026-05-08).
+
+    Field omissions match ``insert_usage_snapshot``: keys whose values
+    would be ``None``/empty are not emitted, so downstream ``saved.get(...)``
+    callers see the same shape they'd see on a fresh insert.
+    """
+    out: dict[str, Any] = {
+        "id": int(row["id"]),
+        "capturedAt": row["captured_at_utc"],
+        "weekStartDate": row["week_start_date"],
+        "weekEndDate": row["week_end_date"],
+        "weeklyPercent": float(row["weekly_percent"]),
+    }
+    if row["week_start_at"]:
+        out["weekStartAt"] = row["week_start_at"]
+    if row["week_end_at"]:
+        out["weekEndAt"] = row["week_end_at"]
+    if row["five_hour_percent"] is not None:
+        out["fiveHourPercent"] = float(row["five_hour_percent"])
+    if row["five_hour_resets_at"]:
+        out["fiveHourResetsAt"] = row["five_hour_resets_at"]
+    if row["five_hour_window_key"] is not None:
+        out["fiveHourWindowKey"] = int(row["five_hour_window_key"])
+    return out
 
 
 def _resolve_cache_report_window(
