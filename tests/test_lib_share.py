@@ -844,3 +844,44 @@ def test_anonymized_output_contains_zero_original_tokens():
     for fmt in ("md", "svg", "html"):
         out = _lib_share.render(scrubbed, format=fmt, theme="light", branding=True)
         assert "client-foo-internal" not in out, f"original token leaked into {fmt}"
+
+
+def test_scrub_anonymizes_chart_only_project_label():
+    """Chart-only labels (not present in any row) must still be anonymized.
+
+    Locks the chart-fallback gather path against accidental removal — the
+    main canary test (`test_anonymized_output_contains_zero_original_tokens`)
+    has matching row+chart entries, so a regression that drops chart-walk
+    in `_collect_project_costs` would not surface there.
+    """
+    chart = _lib_share.HorizontalBarChart(
+        points=(
+            _lib_share.ChartPoint(
+                x_label="acme-secret-project",
+                x_value=0,
+                y_value=42.0,
+                project_label="acme-secret-project",
+            ),
+        ),
+        x_label="$",
+    )
+    snap = _lib_share.ShareSnapshot(
+        cmd="project", title="t", subtitle=None,
+        period=_lib_share.PeriodSpec(
+            start=datetime.now(timezone.utc),
+            end=datetime.now(timezone.utc),
+            display_tz="UTC", label="x",
+        ),
+        columns=(),
+        rows=(),  # NO ROWS — only chart-point label.
+        chart=chart, totals=(), notes=(),
+        generated_at=datetime.now(timezone.utc), version="1.0.0",
+    )
+    scrubbed = _lib_share._scrub(snap, reveal_projects=False)
+    # Both project_label AND x_label must be rewritten.
+    assert scrubbed.chart.points[0].project_label == "project-1"
+    assert scrubbed.chart.points[0].x_label == "project-1"
+    # And the original token must not survive into ANY render output.
+    for fmt in ("md", "svg", "html"):
+        out = _lib_share.render(scrubbed, format=fmt, theme="light", branding=True)
+        assert "acme-secret-project" not in out, f"chart-only token leaked into {fmt}"

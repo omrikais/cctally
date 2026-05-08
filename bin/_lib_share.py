@@ -578,24 +578,27 @@ def _collect_project_costs(snap: ShareSnapshot) -> dict[str, float]:
             if isinstance(cell, ProjectCell):
                 proj_label = cell.label
             elif isinstance(cell, MoneyCell):
-                money = cell.usd
+                money += cell.usd
         if proj_label is not None:
             costs[proj_label] = costs.get(proj_label, 0.0) + money
 
     if snap.chart is not None:
         chart_pts: list[ChartPoint] = []
-        if isinstance(snap.chart, (LineChart, BarChart)):
+        if isinstance(snap.chart, LineChart):
             chart_pts = list(snap.chart.points)
-            # Multi-series / stacks: union additional points.
-            extras = (
-                getattr(snap.chart, "multi_series", None)
-                or getattr(snap.chart, "stacks", None)
-            )
-            if extras:
-                for series in extras.values():
+            if snap.chart.multi_series:
+                for series in snap.chart.multi_series.values():
+                    chart_pts.extend(series)
+        elif isinstance(snap.chart, BarChart):
+            chart_pts = list(snap.chart.points)
+            if snap.chart.stacks:
+                for series in snap.chart.stacks.values():
                     chart_pts.extend(series)
         elif isinstance(snap.chart, HorizontalBarChart):
             chart_pts = list(snap.chart.points)
+        # Chart-only fallback: tiebreaker only — `y_value` is dollars for project
+        # bar charts but may be a ratio for trend charts. Affects sort order of
+        # project-N labels, not anonymization correctness.
         for p in chart_pts:
             if p.project_label and p.project_label not in costs:
                 costs[p.project_label] = p.y_value
@@ -644,17 +647,24 @@ def _apply_anon_mapping(
     new_chart: ChartSpec | None = snap.chart
     if snap.chart is not None:
         def _rewrite_pt(p: ChartPoint) -> ChartPoint:
-            new_label = (
-                mapping.get(p.project_label, p.project_label)
-                if p.project_label else None
-            )
-            new_x = (
-                mapping[p.x_label]
-                if (p.project_label
+            if p.project_label:
+                # Fail-safe: any label not in mapping (e.g., from drift between
+                # _collect and _apply, or a future code path that adds chart
+                # points after gather) is mapped to "(unknown)" rather than
+                # passed through. Privacy invariant: never leak a non-anonymized
+                # label, even if the gather pass missed it.
+                new_label = mapping.get(p.project_label, "(unknown)")
+            else:
+                new_label = None
+            # x_label rewrite stays guarded — only anonymize if x_label is the
+            # project axis AND the label is in mapping (preserves non-project
+            # x_label values like time labels).
+            if (p.project_label
                     and p.x_label == p.project_label
-                    and p.x_label in mapping)
-                else p.x_label
-            )
+                    and p.x_label in mapping):
+                new_x = mapping[p.x_label]
+            else:
+                new_x = p.x_label
             return ChartPoint(
                 x_label=new_x,
                 x_value=p.x_value,
@@ -691,6 +701,8 @@ def _apply_anon_mapping(
                 cap=snap.chart.cap,
             )
 
+    # When ShareSnapshot grows a new field, add it to this constructor — the
+    # scrubber must thread every field through to preserve frozen semantics.
     return ShareSnapshot(
         cmd=snap.cmd,
         title=snap.title,
