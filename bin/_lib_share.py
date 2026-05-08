@@ -456,6 +456,48 @@ def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
     return svg_group(elements)
 
 
+def _render_hbar_chart_svg(chart: HorizontalBarChart, *, palette: dict,
+                           x: float, y: float, width: float, height: float) -> str:
+    pts = chart.points
+    if chart.cap is not None:
+        pts = pts[:chart.cap]
+    if not pts:
+        return svg_group([
+            svg_text(x + width / 2, y + height / 2, "(no data)",
+                     font_size=12, fill=palette["muted"], anchor="middle"),
+        ])
+
+    label_w = 120.0  # left gutter for project labels
+    ix = x + label_w
+    iy = y + 6
+    iw = width - label_w - 10
+    ih = height - 12
+
+    n = len(pts)
+    row_h = ih / n
+    bar_h = max(8.0, row_h * 0.7)
+    bar_gap = (row_h - bar_h) / 2
+
+    x_max = max(p.y_value for p in pts) if pts else 1.0
+    if x_max <= 0:
+        x_max = 1.0
+
+    elements = []
+    for i, p in enumerate(pts):
+        ry = iy + i * row_h + bar_gap
+        bw = (p.y_value / x_max) * iw
+        elements.append(svg_rect(ix, ry, bw, bar_h, fill=palette["series_primary"]))
+        # Label gutter (right-aligned to ix - 4).
+        elements.append(svg_text(ix - 4, ry + bar_h / 2 + 3, p.x_label,
+                                 font_size=11, fill=palette["fg"], anchor="end"))
+        # Value label at end of bar.
+        elements.append(svg_text(ix + bw + 4, ry + bar_h / 2 + 3,
+                                 f"${p.y_value:,.2f}",
+                                 font_size=10, fill=palette["muted"], anchor="start"))
+
+    return svg_group(elements)
+
+
 # --- SVG chrome helpers ---
 
 def _format_generated_at_iso(dt: datetime) -> str:

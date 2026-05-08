@@ -548,3 +548,47 @@ def test_bar_chart_handles_empty():
         x=0, y=0, width=400, height=200,
     )
     assert "(no data)" in out
+
+
+def test_hbar_chart_renders():
+    chart = _lib_share.HorizontalBarChart(
+        points=(
+            _lib_share.ChartPoint(x_label="project-1", x_value=0, y_value=120.0,
+                                  project_label="project-1"),
+            _lib_share.ChartPoint(x_label="project-2", x_value=1, y_value=80.0,
+                                  project_label="project-2"),
+        ),
+        x_label="$",
+    )
+    out = _lib_share._render_hbar_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT,
+        x=20, y=20, width=560, height=120,
+    )
+    assert out.count("<rect") == 2
+    assert "project-1" in out and "project-2" in out
+    # Byte-stable.
+    out2 = _lib_share._render_hbar_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT,
+        x=20, y=20, width=560, height=120,
+    )
+    assert out == out2
+
+
+def test_hbar_chart_respects_cap():
+    chart = _lib_share.HorizontalBarChart(
+        points=tuple(
+            _lib_share.ChartPoint(x_label=f"p{i}", x_value=i, y_value=100.0 - i,
+                                  project_label=f"p{i}")
+            for i in range(20)
+        ),
+        x_label="$",
+        cap=12,
+    )
+    out = _lib_share._render_hbar_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT,
+        x=0, y=0, width=560, height=400,
+    )
+    # Only top 12 bars rendered.
+    assert out.count("<rect") == 12
+    assert "p0" in out and "p11" in out
+    assert "p12" not in out
