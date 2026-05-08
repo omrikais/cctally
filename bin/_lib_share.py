@@ -88,7 +88,10 @@ class ChartPoint:
 class LineChart:
     points: tuple[ChartPoint, ...]
     y_label: str
-    reference_lines: tuple[float, ...] = ()
+    # Each reference line is (value, label, severity) where severity is "warn"|"alarm".
+    # Renderer unpacks the 3-tuple; bare-float form (Implementor 1's tightening) was
+    # incorrect — restored to the consumer-driven shape per Implementor Bundle 3.
+    reference_lines: tuple[tuple[float, str, str], ...] = ()
     multi_series: Mapping[str, tuple[ChartPoint, ...]] | None = None
 
 
@@ -308,6 +311,105 @@ def svg_group(children: list, *, transform: str | None = None) -> str:
         attrs["transform"] = transform
     open_tag = f'<g {_serialize_attrs(attrs)}>' if attrs else "<g>"
     return open_tag + "".join(children) + "</g>"
+
+
+# --- Chart layout helpers ---
+
+_PADDING_LEFT = 50    # axis labels
+_PADDING_BOTTOM = 30  # x-tick labels
+_PADDING_TOP = 10
+_PADDING_RIGHT = 10
+
+
+def _chart_inner_box(x, y, width, height):
+    """Compute (ix, iy, iw, ih) — the inner plot area inside chart padding."""
+    ix = x + _PADDING_LEFT
+    iy = y + _PADDING_TOP
+    iw = width - _PADDING_LEFT - _PADDING_RIGHT
+    ih = height - _PADDING_TOP - _PADDING_BOTTOM
+    return ix, iy, iw, ih
+
+
+def _scale_y(values, ih):
+    """Return y_max and a scale function f(value) -> y-pixel (top-down)."""
+    if not values:
+        return 1.0, lambda v: 0.0
+    y_max = max(values)
+    y_min = min(0.0, min(values))
+    span = y_max - y_min if (y_max - y_min) > 1e-9 else 1.0
+    def f(v):
+        # Higher value → smaller y (SVG y axis is top-down).
+        norm = (v - y_min) / span
+        return ih - (norm * ih)
+    return y_max, f
+
+
+# --- Chart renderers ---
+
+def _render_line_chart_svg(chart: LineChart, *, palette: dict,
+                           x: float, y: float, width: float, height: float) -> str:
+    ix, iy, iw, ih = _chart_inner_box(x, y, width, height)
+    pts = chart.points
+    if not pts:
+        return svg_group([
+            svg_text(x + width / 2, y + height / 2, "(no data)",
+                     font_size=12, fill=palette["muted"], anchor="middle"),
+        ])
+
+    y_values = [p.y_value for p in pts] + [r[0] for r in chart.reference_lines]
+    _, scale_y = _scale_y(y_values, ih)
+
+    n = len(pts)
+    if n == 1:
+        x_step = 0.0
+    else:
+        x_step = iw / (n - 1)
+
+    # Axes.
+    elements = []
+    elements.append(svg_line(ix, iy + ih, ix + iw, iy + ih,
+                             stroke=palette["axis"], width=1))
+    elements.append(svg_line(ix, iy, ix, iy + ih,
+                             stroke=palette["axis"], width=1))
+
+    # Reference lines.
+    for (ref_value, ref_label, severity) in chart.reference_lines:
+        ref_color = palette["ref_warn"] if severity == "warn" else palette["ref_alarm"]
+        ry = iy + scale_y(ref_value)
+        elements.append(svg_line(ix, ry, ix + iw, ry, stroke=ref_color, width=1))
+        elements.append(svg_text(ix + iw - 4, ry - 3, ref_label,
+                                 font_size=10, fill=ref_color, anchor="end"))
+
+    # Series polyline (primary series).
+    poly_pts = [(ix + i * x_step, iy + scale_y(p.y_value)) for i, p in enumerate(pts)]
+    elements.append(svg_polyline(poly_pts, stroke=palette["series_primary"], width=2))
+
+    # Optional multi-series (forecast actual + projected).
+    if chart.multi_series:
+        for series_key, series_pts in sorted(chart.multi_series.items()):
+            series_color = palette["series_secondary"]
+            spoly = [(ix + i * x_step, iy + scale_y(p.y_value)) for i, p in enumerate(series_pts)]
+            # Dashed for "projected" — simple stroke-dasharray.
+            attrs = {
+                "points": " ".join(f"{_fmt_num(px)},{_fmt_num(py)}" for px, py in spoly),
+                "stroke": series_color,
+                "stroke-width": 2,
+                "stroke-dasharray": "4 3",
+                "fill": "none",
+            }
+            elements.append(f'<polyline {_serialize_attrs(attrs)}/>')
+
+    # X-tick labels (every point).
+    for i, p in enumerate(pts):
+        tx = ix + i * x_step
+        elements.append(svg_text(tx, iy + ih + 14, p.x_label,
+                                 font_size=10, fill=palette["muted"], anchor="middle"))
+
+    # Y-axis label.
+    elements.append(svg_text(ix - 10, iy + ih / 2, chart.y_label,
+                             font_size=10, fill=palette["muted"], anchor="end"))
+
+    return svg_group(elements)
 
 
 # --- Format renderers (stubs; full impl in later tasks) ---

@@ -281,3 +281,55 @@ def test_svg_group_wraps_children():
     assert out.startswith('<g transform="translate(5,5)">')
     assert out.endswith("</g>")
     assert children[0] in out and children[1] in out
+
+
+def test_line_chart_renders_chart_only_svg_byte_stable():
+    """LineChart with 4 points renders to a stable SVG fragment."""
+    chart = _lib_share.LineChart(
+        points=(
+            _lib_share.ChartPoint(x_label="Apr 11", x_value=0, y_value=2.5),
+            _lib_share.ChartPoint(x_label="Apr 18", x_value=1, y_value=3.0),
+            _lib_share.ChartPoint(x_label="Apr 25", x_value=2, y_value=2.8),
+            _lib_share.ChartPoint(x_label="May 2",  x_value=3, y_value=3.4),
+        ),
+        y_label="$ / %",
+    )
+    out = _lib_share._render_line_chart_svg(
+        chart,
+        palette=_lib_share.PALETTE_LIGHT,
+        x=20, y=20, width=560, height=180,
+    )
+    # Must start/end with <g> wrapper.
+    assert out.startswith("<g")
+    assert out.endswith("</g>")
+    # Must include polyline for series.
+    assert "<polyline" in out
+    # Must include axis lines.
+    assert "<line" in out
+    # All numbers one-decimal.
+    import re
+    for match in re.findall(r'\d+\.\d+', out):
+        assert match.count(".") == 1
+        assert len(match.split(".")[1]) == 1
+    # No randomness — repeatable.
+    out2 = _lib_share._render_line_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT, x=20, y=20, width=560, height=180,
+    )
+    assert out == out2
+
+
+def test_line_chart_with_reference_lines():
+    chart = _lib_share.LineChart(
+        points=(
+            _lib_share.ChartPoint(x_label="Mon", x_value=0, y_value=20.0),
+            _lib_share.ChartPoint(x_label="Tue", x_value=1, y_value=45.0),
+        ),
+        y_label="cumulative %",
+        reference_lines=((90.0, "90%", "warn"), (100.0, "100%", "alarm")),
+    )
+    out = _lib_share._render_line_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT, x=0, y=0, width=400, height=200,
+    )
+    # Both reference lines render with their palette colors.
+    assert _lib_share.PALETTE_LIGHT["ref_warn"] in out
+    assert _lib_share.PALETTE_LIGHT["ref_alarm"] in out
