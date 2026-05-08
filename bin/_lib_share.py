@@ -622,6 +622,108 @@ def _build_anon_mapping(project_costs: dict[str, float]) -> dict[str, str]:
     return mapping
 
 
+def _apply_anon_mapping(
+    snap: ShareSnapshot, mapping: dict[str, str],
+) -> ShareSnapshot:
+    """Return a new ShareSnapshot with project labels replaced everywhere.
+
+    Walks: (a) every Row.cells dict — replaces ProjectCell.label;
+    (b) ChartPoint.project_label AND .x_label (when x_label == project_label,
+    i.e. project-axis charts) on chart.points + multi_series + stacks.
+    """
+    new_rows: list[Row] = []
+    for row in snap.rows:
+        new_cells: dict[str, Cell] = {}
+        for key, cell in row.cells.items():
+            if isinstance(cell, ProjectCell) and cell.label in mapping:
+                new_cells[key] = ProjectCell(mapping[cell.label])
+            else:
+                new_cells[key] = cell
+        new_rows.append(Row(cells=new_cells))
+
+    new_chart: ChartSpec | None = snap.chart
+    if snap.chart is not None:
+        def _rewrite_pt(p: ChartPoint) -> ChartPoint:
+            new_label = (
+                mapping.get(p.project_label, p.project_label)
+                if p.project_label else None
+            )
+            new_x = (
+                mapping[p.x_label]
+                if (p.project_label
+                    and p.x_label == p.project_label
+                    and p.x_label in mapping)
+                else p.x_label
+            )
+            return ChartPoint(
+                x_label=new_x,
+                x_value=p.x_value,
+                y_value=p.y_value,
+                project_label=new_label,
+                series_key=p.series_key,
+            )
+
+        if isinstance(snap.chart, LineChart):
+            new_chart = LineChart(
+                points=tuple(_rewrite_pt(p) for p in snap.chart.points),
+                y_label=snap.chart.y_label,
+                reference_lines=snap.chart.reference_lines,
+                multi_series=(
+                    {k: tuple(_rewrite_pt(p) for p in v)
+                     for k, v in snap.chart.multi_series.items()}
+                    if snap.chart.multi_series else None
+                ),
+            )
+        elif isinstance(snap.chart, BarChart):
+            new_chart = BarChart(
+                points=tuple(_rewrite_pt(p) for p in snap.chart.points),
+                y_label=snap.chart.y_label,
+                stacks=(
+                    {k: tuple(_rewrite_pt(p) for p in v)
+                     for k, v in snap.chart.stacks.items()}
+                    if snap.chart.stacks else None
+                ),
+            )
+        elif isinstance(snap.chart, HorizontalBarChart):
+            new_chart = HorizontalBarChart(
+                points=tuple(_rewrite_pt(p) for p in snap.chart.points),
+                x_label=snap.chart.x_label,
+                cap=snap.chart.cap,
+            )
+
+    return ShareSnapshot(
+        cmd=snap.cmd,
+        title=snap.title,
+        subtitle=snap.subtitle,
+        period=snap.period,
+        columns=snap.columns,
+        rows=tuple(new_rows),
+        chart=new_chart,
+        totals=snap.totals,
+        notes=snap.notes,
+        generated_at=snap.generated_at,
+        version=snap.version,
+    )
+
+
+def _scrub(snap: ShareSnapshot, *, reveal_projects: bool) -> ShareSnapshot:
+    """Anonymize project labels unless reveal_projects is True.
+
+    When reveal_projects is True, returns the SAME instance (identity preserved
+    so callers can rely on `out is snap`). When False, returns a NEW snapshot
+    with ProjectCell labels and ChartPoint project/x labels rewritten via
+    `_build_anon_mapping`. If no project labels are present in the snapshot,
+    also returns the original instance.
+    """
+    if reveal_projects:
+        return snap
+    project_costs = _collect_project_costs(snap)
+    if not project_costs:
+        return snap
+    mapping = _build_anon_mapping(project_costs)
+    return _apply_anon_mapping(snap, mapping)
+
+
 # --- Format renderers ---
 
 def _render_md(snap: ShareSnapshot, *, branding: bool) -> str:

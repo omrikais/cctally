@@ -718,3 +718,129 @@ def test_build_anon_mapping_stable_for_ties():
     # Lex order on tie: alpha -> project-1, beta -> project-2.
     assert mapping["alpha"] == "project-1"
     assert mapping["beta"] == "project-2"
+
+
+# --- Task 16: _scrub + _apply_anon_mapping ---
+
+
+def test_scrub_replaces_project_cell_labels():
+    snap = _lib_share.ShareSnapshot(
+        cmd="project", title="t", subtitle=None,
+        period=_lib_share.PeriodSpec(
+            start=datetime.now(timezone.utc), end=datetime.now(timezone.utc),
+            display_tz="UTC", label="x",
+        ),
+        columns=(
+            _lib_share.ColumnSpec(key="project", label="Project", align="left"),
+            _lib_share.ColumnSpec(key="cost", label="$ Cost", align="right"),
+        ),
+        rows=(
+            _lib_share.Row(cells={
+                "project": _lib_share.ProjectCell("client-foo-internal"),
+                "cost": _lib_share.MoneyCell(120.0),
+            }),
+            _lib_share.Row(cells={
+                "project": _lib_share.ProjectCell("acme-cloud"),
+                "cost": _lib_share.MoneyCell(50.0),
+            }),
+        ),
+        chart=None, totals=(), notes=(),
+        generated_at=datetime.now(timezone.utc), version="1.0.0",
+    )
+    scrubbed = _lib_share._scrub(snap, reveal_projects=False)
+    labels_after = [r.cells["project"].label for r in scrubbed.rows]
+    assert labels_after == ["project-1", "project-2"]
+    # Original snapshot untouched (frozen + new instance returned).
+    assert [r.cells["project"].label for r in snap.rows] == [
+        "client-foo-internal", "acme-cloud",
+    ]
+
+
+def test_scrub_reveal_projects_is_noop():
+    snap = _lib_share.ShareSnapshot(
+        cmd="project", title="t", subtitle=None,
+        period=_lib_share.PeriodSpec(
+            start=datetime.now(timezone.utc), end=datetime.now(timezone.utc),
+            display_tz="UTC", label="x",
+        ),
+        columns=(_lib_share.ColumnSpec(key="project", label="Project", align="left"),),
+        rows=(_lib_share.Row(cells={"project": _lib_share.ProjectCell("real-name")}),),
+        chart=None, totals=(), notes=(),
+        generated_at=datetime.now(timezone.utc), version="1.0.0",
+    )
+    out = _lib_share._scrub(snap, reveal_projects=True)
+    assert out is snap
+
+
+def test_scrub_replaces_chart_point_project_label():
+    chart = _lib_share.HorizontalBarChart(
+        points=(
+            _lib_share.ChartPoint(x_label="alpha", x_value=0, y_value=120.0,
+                                  project_label="alpha"),
+            _lib_share.ChartPoint(x_label="beta", x_value=1, y_value=50.0,
+                                  project_label="beta"),
+        ),
+        x_label="$",
+    )
+    snap = _lib_share.ShareSnapshot(
+        cmd="project", title="t", subtitle=None,
+        period=_lib_share.PeriodSpec(
+            start=datetime.now(timezone.utc), end=datetime.now(timezone.utc),
+            display_tz="UTC", label="x",
+        ),
+        columns=(),
+        rows=(
+            _lib_share.Row(cells={
+                "project": _lib_share.ProjectCell("alpha"),
+                "cost": _lib_share.MoneyCell(120.0),
+            }),
+            _lib_share.Row(cells={
+                "project": _lib_share.ProjectCell("beta"),
+                "cost": _lib_share.MoneyCell(50.0),
+            }),
+        ),
+        chart=chart, totals=(), notes=(),
+        generated_at=datetime.now(timezone.utc), version="1.0.0",
+    )
+    scrubbed = _lib_share._scrub(snap, reveal_projects=False)
+    chart_labels = [p.project_label for p in scrubbed.chart.points]
+    chart_x_labels = [p.x_label for p in scrubbed.chart.points]
+    assert chart_labels == ["project-1", "project-2"]
+    # x_label also rewritten (used as visible axis label).
+    assert chart_x_labels == ["project-1", "project-2"]
+
+
+def test_anonymized_output_contains_zero_original_tokens():
+    """Section 8.4 invariant: anonymized output contains no original project basename."""
+    snap = _lib_share.ShareSnapshot(
+        cmd="project", title="Per-project", subtitle="x",
+        period=_lib_share.PeriodSpec(
+            start=datetime.now(timezone.utc), end=datetime.now(timezone.utc),
+            display_tz="UTC", label="x",
+        ),
+        columns=(
+            _lib_share.ColumnSpec(key="project", label="Project", align="left"),
+            _lib_share.ColumnSpec(key="cost", label="$ Cost", align="right"),
+        ),
+        rows=(
+            _lib_share.Row(cells={
+                "project": _lib_share.ProjectCell("client-foo-internal"),
+                "cost": _lib_share.MoneyCell(120.0),
+            }),
+        ),
+        chart=_lib_share.HorizontalBarChart(
+            points=(
+                _lib_share.ChartPoint(
+                    x_label="client-foo-internal", x_value=0,
+                    y_value=120.0, project_label="client-foo-internal",
+                ),
+            ),
+            x_label="$",
+        ),
+        totals=(), notes=(),
+        generated_at=datetime(2026, 5, 9, 12, tzinfo=timezone.utc), version="1.4.0",
+    )
+    scrubbed = _lib_share._scrub(snap, reveal_projects=False)
+    for fmt in ("md", "svg", "html"):
+        out = _lib_share.render(scrubbed, format=fmt, theme="light", branding=True)
+        assert "client-foo-internal" not in out, f"original token leaked into {fmt}"
