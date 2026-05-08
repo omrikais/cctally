@@ -6,6 +6,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- `record-usage`: self-heal `percent_milestones` and `five_hour_blocks` rows
+  that were silently dropped when an earlier invocation was killed between
+  snapshot insert and milestone insert (e.g. Claude Code self-update kill
+  window). On a dedup'd tick, re-runs the idempotent milestone helpers
+  against the latest snapshot — recovering missed rows at the next
+  status-line tick instead of waiting for the percent to advance.
 - Root `.gitignore` now anchors `/node_modules` and `/package-lock.json`,
   preventing `npm install` next to the repo-root `package.json` (the
   npm-publish sentinel) from leaving the working tree dirty and blocking
