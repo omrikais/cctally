@@ -416,6 +416,46 @@ def _render_line_chart_svg(chart: LineChart, *, palette: dict,
     return svg_group(elements)
 
 
+def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
+                          x: float, y: float, width: float, height: float) -> str:
+    ix, iy, iw, ih = _chart_inner_box(x, y, width, height)
+    pts = chart.points
+    if not pts:
+        return svg_group([
+            svg_text(x + width / 2, y + height / 2, "(no data)",
+                     font_size=12, fill=palette["muted"], anchor="middle"),
+        ])
+
+    n = len(pts)
+    bar_gap = 4.0
+    total_gap = bar_gap * (n - 1) if n > 1 else 0.0
+    bar_w = max(2.0, (iw - total_gap) / n)
+
+    y_values = [p.y_value for p in pts]
+    _, scale_y = _scale_y(y_values, ih)
+
+    elements = []
+    elements.append(svg_line(ix, iy + ih, ix + iw, iy + ih,
+                             stroke=palette["axis"], width=1))
+    elements.append(svg_line(ix, iy, ix, iy + ih,
+                             stroke=palette["axis"], width=1))
+
+    for i, p in enumerate(pts):
+        bx = ix + i * (bar_w + bar_gap)
+        by = iy + scale_y(p.y_value)
+        bh = (iy + ih) - by
+        elements.append(svg_rect(bx, by, bar_w, bh, fill=palette["series_primary"]))
+        # X-tick label centered under bar.
+        tx = bx + bar_w / 2
+        elements.append(svg_text(tx, iy + ih + 14, p.x_label,
+                                 font_size=10, fill=palette["muted"], anchor="middle"))
+
+    elements.append(svg_text(ix - 10, iy + ih / 2, chart.y_label,
+                             font_size=10, fill=palette["muted"], anchor="end"))
+
+    return svg_group(elements)
+
+
 # --- SVG chrome helpers ---
 
 def _format_generated_at_iso(dt: datetime) -> str:

@@ -514,3 +514,37 @@ def test_render_svg_dark_palette_uses_dark_bg():
     assert _lib_share.PALETTE_LIGHT["bg"] not in out_dark
     # Dark-palette fg color also present (used by header).
     assert _lib_share.PALETTE_DARK["fg"] in out_dark
+
+
+def test_bar_chart_renders():
+    chart = _lib_share.BarChart(
+        points=(
+            _lib_share.ChartPoint(x_label="Mon", x_value=0, y_value=12.5),
+            _lib_share.ChartPoint(x_label="Tue", x_value=1, y_value=18.0),
+            _lib_share.ChartPoint(x_label="Wed", x_value=2, y_value=8.0),
+        ),
+        y_label="$",
+    )
+    out = _lib_share._render_bar_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT,
+        x=20, y=20, width=560, height=180,
+    )
+    # Three <rect> bars.
+    assert out.count("<rect") == 3
+    # Y-label and x-tick labels present.
+    assert "Mon" in out and "Tue" in out and "Wed" in out
+    # Byte-stable.
+    out2 = _lib_share._render_bar_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT,
+        x=20, y=20, width=560, height=180,
+    )
+    assert out == out2
+
+
+def test_bar_chart_handles_empty():
+    chart = _lib_share.BarChart(points=(), y_label="$")
+    out = _lib_share._render_bar_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT,
+        x=0, y=0, width=400, height=200,
+    )
+    assert "(no data)" in out
