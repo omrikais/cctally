@@ -15,9 +15,27 @@ If you're using `ccusage` to watch Claude Code spend, `cctally` covers the same 
   <img src="docs/img/dashboard-desktop.png" alt="cctally dashboard, desktop view" width="900">
 </p>
 
-## Quick Start
+## Installation
 
 **Requirements:** Python 3.13+, macOS or Linux, Claude Code installed and run at least once.
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew install omrikais/cctally/cctally
+cctally setup
+```
+
+### npm
+
+```bash
+npm install -g cctally
+cctally setup
+```
+
+The npm package is a thin Node shim around the bundled Python script — no postinstall, no native build. Set `CCTALLY_PYTHON=/path/to/python3` if `python3` isn't on your PATH.
+
+### From source
 
 ```bash
 git clone https://github.com/omrikais/cctally
@@ -25,7 +43,7 @@ cd cctally
 ./bin/cctally setup
 ```
 
-`cctally setup` symlinks the binaries into `~/.local/bin/`, adds three additive hooks to `~/.claude/settings.json` (never overwrites existing entries), and bootstraps the local SQLite cache. If `~/.local/bin/` isn't on your PATH, the script prints the line to add.
+`cctally setup` (any channel) symlinks the binaries into `~/.local/bin/`, adds three additive hooks to `~/.claude/settings.json` (never overwrites existing entries), and bootstraps the local SQLite cache. If `~/.local/bin/` isn't on your PATH, the script prints the line to add.
 
 ```bash
 cctally setup --status     # verify hooks + symlinks
@@ -120,10 +138,6 @@ For status-line integration, alerts, and configuration, see [docs/installation.m
 - [Architecture](docs/architecture.md): data flow, caches, week boundaries.
 - [Runtime data](docs/runtime-data.md): what lives in `~/.local/share/cctally/`.
 - [Command reference](docs/commands/): one page per subcommand.
-
-## Version
-
-Current release: `v1.0.0`.
 
 ## License
 
