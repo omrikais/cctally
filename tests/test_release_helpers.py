@@ -809,6 +809,18 @@ class TestResume:
             cctally, "_release_phase_mirror_done", lambda v, c: True
         )
         monkeypatch.setattr(cctally, "_release_phase_gh_done", lambda v: True)
+        # Phases 5 + 6 also done — gate now spans all six phases.
+        monkeypatch.setattr(
+            cctally, "_release_phase_npm_done", lambda v: True
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_discover_brew_clone",
+            lambda args: Path("/tmp/fake-brew-clone"),
+        )
+        monkeypatch.setattr(
+            cctally, "_release_phase_brew_done", lambda v, c: True
+        )
         # Tripwire: phase runners must NOT be called.
         called: list[str] = []
         monkeypatch.setattr(
@@ -937,6 +949,18 @@ class TestResume:
             lambda v, c: called.append("mirror_done") or True,
         )
         monkeypatch.setattr(cctally, "_release_phase_gh_done", lambda v: True)
+        # Phases 5 + 6 also done — gate now spans all six phases.
+        monkeypatch.setattr(
+            cctally, "_release_phase_npm_done", lambda v: True
+        )
+        monkeypatch.setattr(
+            cctally,
+            "_release_discover_brew_clone",
+            lambda args: Path("/tmp/fake-brew-clone"),
+        )
+        monkeypatch.setattr(
+            cctally, "_release_phase_brew_done", lambda v, c: True
+        )
         # Tripwire: phase runners must NOT be called either.
         monkeypatch.setattr(
             cctally,

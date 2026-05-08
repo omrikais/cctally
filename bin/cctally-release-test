@@ -194,6 +194,24 @@ for dir in "$FIXTURES_DIR"/*/; do
         fi
     fi
 
+    # Optional rendered-formula substring check (Phase 6 scenarios).
+    # The run.sh captures `formula.rb` from the brew tap clone after the
+    # release. Golden is a substring (multi-line OK) — covers the
+    # `url "..."` + `sha256 "..."` lines without pinning the entire
+    # template render.
+    fs_golden="$dir/golden-formula-substr.txt"
+    if [ -f "$fs_golden" ]; then
+        actual_formula=""
+        if [ -f "$artifact_dir/formula.rb" ]; then
+            actual_formula=$(cat "$artifact_dir/formula.rb")
+        fi
+        expected_formula=$(cat "$fs_golden")
+        if ! grep -qF -- "$expected_formula" <<<"$actual_formula"; then
+            pass=false
+            fail_reasons+=("formula-substr mismatch")
+        fi
+    fi
+
     if $pass; then
         echo "PASS [$name]"
         pass_count=$((pass_count + 1))
@@ -248,6 +266,13 @@ for dir in "$FIXTURES_DIR"/*/; do
                     echo "  npm-invocations diff (golden vs actual):"
                     diff -u "$ni_golden" "$artifact_dir/npm-invocations.log" 2>/dev/null \
                         | head -60 | sed 's/^/    /'
+                    ;;
+                "formula-substr mismatch")
+                    echo "  expected substring not found in formula.rb"
+                    echo "  expected:"
+                    sed 's/^/    /' "$fs_golden" 2>/dev/null | head -20
+                    echo "  actual formula.rb:"
+                    sed 's/^/    /' "$artifact_dir/formula.rb" 2>/dev/null | head -40
                     ;;
             esac
         done

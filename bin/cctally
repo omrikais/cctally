@@ -1705,7 +1705,28 @@ def cmd_release(args: argparse.Namespace) -> int:
                     mirror_done = True
             else:
                 mirror_done = False
-            all_done = stamp_done and tag_done and mirror_done and gh_done
+            # Phases 5 + 6: include npm and brew in the all-done
+            # computation so a fully-shipped multi-channel release
+            # short-circuits with `already published`. `--skip-npm` /
+            # `--skip-brew` operator-escape-hatches count as "done"
+            # for gate purposes — if the operator opted out, the
+            # channel is not pending. Pre-releases skip Phase 6
+            # categorically (Homebrew tracks stable only), so
+            # `is_prerelease` collapses brew_done to True.
+            npm_done = args.skip_npm or _release_phase_npm_done(next_v)
+            is_prerelease = "-" in next_v
+            if args.skip_brew or is_prerelease:
+                brew_done = True
+            else:
+                brew_clone = _release_discover_brew_clone(args)
+                brew_done = (
+                    brew_clone is not None
+                    and _release_phase_brew_done(next_v, brew_clone)
+                )
+            all_done = (
+                stamp_done and tag_done and mirror_done and gh_done
+                and npm_done and brew_done
+            )
         if all_done:
             print(f"release v{next_v} already published")
             return 0

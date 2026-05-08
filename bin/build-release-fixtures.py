@@ -52,8 +52,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import pathlib
-import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -544,7 +542,7 @@ def _run_commit_msg_hook(release_args: str) -> str:
 #
 # Used by Batch 6 (Phase 5 npm-publish scenarios — see
 # `_seed_npm_mock_state` and `_run_release_with_npm` below) and Batches 7–8
-# (Phase 6 brew helpers + scenarios — `_emit_fake_brew_tap` below).
+# (Phase 6 brew helpers + scenarios — `_seed_fake_brew_tap` below).
 #
 # The fake npm itself lives in the SCAFFOLD's `fake-bin/npm` block —
 # Batch 6 scenarios just write a per-scenario `npm-mock-state.json`
@@ -594,32 +592,104 @@ def _run_release_with_npm(release_args: str) -> str:
     )
 
 
-def _emit_fake_brew_tap(work: pathlib.Path) -> pathlib.Path:
-    """Initialize a bare repo + working clone under `work/` to serve
-    as a fake brew tap remote.
+def _run_release_with_brew(release_args: str) -> str:
+    """run.sh body for Phase 6 scenarios. Same as `_run_release_with_npm`
+    (which already provides the fake-npm + npm-state plumbing for the
+    Phase 5 leg that runs inline) plus:
+      - Exports `CCTALLY_RELEASE_BREW_ARCHIVE_URL=file://...fake-archive...`
+        so `_release_compute_brew_sha256` reads the on-disk fake archive
+        instead of hitting GitHub. Yields the deterministic sha256
+        recorded in goldens (`eba438f24089aa3c950d53d2759a8e058d3da86c52685028610556e2f1ad7a56`).
+      - Captures the post-run rendered formula (if any) at
+        `$work/_artifacts/formula.rb` for golden-formula-substr checks.
 
-    Returns the working-clone path. The bare repo is at
-    `<work>/homebrew-cctally.git`; the clone is at `<work>/homebrew-cctally/`.
-    Caller is responsible for setting `release.brewClone` git config on
-    the cctally-dev fake-repo.
+    Phase 5's npm leg defaults to auth-fallback (the scaffold's fake-npm
+    `whoami` exits 1 when no NPM_MOCK_STATE_FILE is set). Phase 5
+    still runs but auth-falls-back silently, returning 0; Phase 6 then
+    runs unimpeded.
     """
-    bare = work / "homebrew-cctally.git"
-    clone = work / "homebrew-cctally"
-    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
-    subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True)
-    (clone / "Formula").mkdir()
-    (clone / "README.md").write_text("Tap for github.com/omrikais/cctally.\n")
-    subprocess.run(["git", "-C", str(clone), "add", "."], check=True)
-    subprocess.run(
-        ["git", "-C", str(clone), "-c", "user.email=fake@test.local",
-         "-c", "user.name=Fake", "commit", "-q", "-m", "init"],
-        check=True,
+    return _RUN_HEADER + (
+        ': > "$work/npm-invocations.log"\n'
+        'export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"\n'
+        '# Phase 6: point the brew archive URL at the in-tree fake archive\n'
+        '# so sha256 is deterministic across runs.\n'
+        'export CCTALLY_RELEASE_BREW_ARCHIVE_URL='
+        '"file://$REPO_ROOT/tests/fixtures/release/_assets/fake-archive-v1.0.1.tar.gz"\n'
+        f'python3 bin/cctally release {release_args} '
+        f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
+        f'rc=$?\n'
+        f'echo "$rc" > "$work/_artifacts/exit.txt"\n'
+        + _CAPTURE_ARTIFACTS
+        + '# Phase 6: capture the rendered formula (when produced) for golden\n'
+        + '# substring checks. `|| true` keeps scenarios that never write\n'
+        + '# the formula (skip / refusal / pre-release) from failing here.\n'
+        + 'cp "$work/homebrew-cctally/Formula/cctally.rb" '
+        + '"$work/_artifacts/formula.rb" 2>/dev/null || true\n'
+        + 'exit "$rc"\n'
     )
-    subprocess.run(
-        ["git", "-C", str(clone), "push", "-q", "origin", "HEAD"],
-        check=True,
+
+
+def _seed_fake_brew_tap() -> str:
+    """Bash snippet (run with cwd=$work/private) that initializes the
+    fake brew tap layout under `$work/`:
+
+      - `$work/homebrew-cctally.git/` — bare repo (acts as the tap remote).
+      - `$work/homebrew-cctally/`     — working clone whose `origin` is
+        the bare repo above.
+
+    Also wires `release.brewClone` on the private clone so
+    `_release_discover_brew_clone` resolves to the working clone.
+
+    Emitted as a bash snippet runnable inside fixture setup.sh scripts
+    (the release harness emits self-contained bash; build-time vs
+    run-time are decoupled).
+    """
+    return (
+        '# Phase 6: fake brew tap layout (bare remote + working clone +\n'
+        '# `release.brewClone` config so discovery resolves to the clone).\n'
+        'git init --bare -q "$work/homebrew-cctally.git"\n'
+        'git clone -q "$work/homebrew-cctally.git" "$work/homebrew-cctally"\n'
+        'mkdir -p "$work/homebrew-cctally/Formula"\n'
+        'cd "$work/homebrew-cctally"\n'
+        'git config user.email "fake@test.local"\n'
+        'git config user.name "Fake"\n'
+        'git config commit.gpgsign false\n'
+        'git config tag.gpgsign false\n'
+        'printf "Tap for github.com/omrikais/cctally.\\n" > README.md\n'
+        'git add .\n'
+        'git commit -q -m init\n'
+        'git push -q origin HEAD\n'
+        'cd "$work/private"\n'
+        'git config release.brewClone "$work/homebrew-cctally"\n'
     )
-    return clone
+
+
+def _seed_brew_template() -> str:
+    """Bash snippet (run with cwd=$work/private) that copies the
+    in-tree `homebrew/cctally.rb.template` into the fake-repo's
+    `homebrew/` directory and commits it.
+
+    `_homebrew_template_path()` resolves the template via
+    `CHANGELOG_PATH.parent / "homebrew" / "cctally.rb.template"`, so the
+    file MUST live under the fake-repo's `private/homebrew/` for Phase 6
+    to pick it up. Uses `--no-verify` to skip the commit-msg trailer
+    classifier (the template path is private-classified; the seed commit
+    has no `--- public ---` block by design).
+    """
+    return (
+        '# Phase 6: seed homebrew/cctally.rb.template into the private\n'
+        '# fake-repo so `_homebrew_template_path()` (CHANGELOG_PATH.parent\n'
+        '# / "homebrew" / "cctally.rb.template") resolves at run time.\n'
+        'mkdir -p homebrew\n'
+        'cp "$REPO_ROOT/homebrew/cctally.rb.template" homebrew/\n'
+        'git add homebrew/cctally.rb.template\n'
+        "git commit --no-verify -q -F - <<'CCTALLY_BREW_TPL_EOF'\n"
+        'chore: seed brew formula template\n'
+        '\n'
+        'Public-Skip: true\n'
+        'CCTALLY_BREW_TPL_EOF\n'
+        'git push -q origin main\n'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +704,8 @@ def _add(**kwargs) -> None:
     goldens to None when missing."""
     kwargs.setdefault("extra_setup", "")
     for key in ("changelog", "commit_msg", "tag_annotation",
-                "body_equal", "gh_argv", "package_json", "npm_invocations"):
+                "body_equal", "gh_argv", "package_json", "npm_invocations",
+                "formula_substr"):
         kwargs.setdefault(key, None)
     SCENARIOS.append(kwargs)
 
@@ -1670,6 +1741,195 @@ _add(
 )
 
 
+# ===========================================================================
+# Group 8 — Phase 6 (brew formula bump).
+#
+# All Phase 6 scenarios use the fake brew tap layout (`_seed_fake_brew_tap`)
+# and the in-tree fake archive (`tests/fixtures/release/_assets/
+# fake-archive-v1.0.1.tar.gz`, sha256 `eba438f2…d7a56`) routed through
+# `CCTALLY_RELEASE_BREW_ARCHIVE_URL` so the rendered formula's `sha256`
+# is deterministic across runs.
+#
+# Phase 5 still runs in the call path; the scaffold's default fake-npm
+# returns `whoami` exit 1, so Phase 5 auth-falls-back silently and lets
+# Phase 6 run unimpeded.
+# ===========================================================================
+
+# 33. phase6-fresh-formula: tap clone has no Formula/cctally.rb yet.
+# Phase 6 renders the template, commits, tags v0.1.1, pushes. Golden
+# pins the URL line + the fake-archive sha256 in the rendered formula.
+_add(
+    name="phase6-fresh-formula",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+    ),
+    run=_run_release_with_brew("patch"),
+    expected_exit=0,
+    stdout_substr="phase 6: brew formula bump",
+    stderr_substr="",
+    formula_substr=(
+        'url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.1.tar.gz"\n'
+        '  sha256 "eba438f24089aa3c950d53d2759a8e058d3da86c52685028610556e2f1ad7a56"\n'
+    ),
+)
+
+
+# 34. phase6-bump-formula: tap clone already has a v1.0.0 formula. Phase 6
+# rewrites it to v0.1.1 — the version-fingerprint check looks for
+# `/v<version>.tar.gz`, so v1.0.0 → v0.1.1 triggers the full render path.
+_add(
+    name="phase6-bump-formula",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+        # Pre-seed an old v1.0.0 formula in the tap clone so Phase 6
+        # exercises the bump (overwrite) path.
+        + 'cat > "$work/homebrew-cctally/Formula/cctally.rb" <<\'CCTALLY_OLD_FORMULA_EOF\'\n'
+        + 'class Cctally < Formula\n'
+        + '  url "https://github.com/omrikais/cctally/archive/refs/tags/v1.0.0.tar.gz"\n'
+        + '  sha256 "old"\n'
+        + 'end\n'
+        + 'CCTALLY_OLD_FORMULA_EOF\n'
+        + '(cd "$work/homebrew-cctally" && \\\n'
+        + '  git add . && \\\n'
+        + '  git commit -q -m "seed v1.0.0" && \\\n'
+        + '  git push -q origin HEAD)\n'
+    ),
+    run=_run_release_with_brew("patch"),
+    expected_exit=0,
+    stdout_substr="phase 6: brew formula bump",
+    stderr_substr="",
+    formula_substr=(
+        'url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.1.tar.gz"\n'
+        '  sha256 "eba438f24089aa3c950d53d2759a8e058d3da86c52685028610556e2f1ad7a56"\n'
+    ),
+)
+
+
+# 35. phase6-already-bumped: tap clone already at v0.1.1 → Phase 6
+# short-circuits via `_release_phase_brew_done`. No render, no commit,
+# no push; stdout reports "already at v0.1.1 — skipping".
+_add(
+    name="phase6-already-bumped",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+        # Pre-seed the formula already at v0.1.1 so the done-signal fires.
+        + 'cat > "$work/homebrew-cctally/Formula/cctally.rb" <<\'CCTALLY_CUR_FORMULA_EOF\'\n'
+        + 'class Cctally < Formula\n'
+        + '  url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.1.tar.gz"\n'
+        + '  sha256 "abc"\n'
+        + 'end\n'
+        + 'CCTALLY_CUR_FORMULA_EOF\n'
+        + '(cd "$work/homebrew-cctally" && \\\n'
+        + '  git add . && \\\n'
+        + '  git commit -q -m "seed v0.1.1" && \\\n'
+        + '  git push -q origin HEAD)\n'
+    ),
+    run=_run_release_with_brew("patch"),
+    expected_exit=0,
+    stdout_substr="already at v0.1.1 — skipping",
+    stderr_substr="",
+)
+
+
+# 36. phase6-no-clone-configured: no `release.brewClone` git config →
+# `_release_discover_brew_clone` returns None → Phase 6 prints the
+# bootstrap hint to stderr and returns 0 (graceful skip; release still
+# succeeds for the user — brew is opt-in polish).
+_add(
+    name="phase6-no-clone-configured",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    # No `_seed_fake_brew_tap()` call → no `release.brewClone` config →
+    # discovery falls through all three sources and returns None.
+    run=_run_release_with_brew("patch"),
+    expected_exit=0,
+    stdout_substr="phase 6: brew formula bump",
+    stderr_substr="brew tap clone not configured",
+)
+
+
+# 37. phase6-prerelease-skip: `release prerelease --bump patch` →
+# `0.1.0` → `0.1.1-rc.1`. The orchestrator's Phase 6 gate
+# (`if args.skip_brew or is_prerelease`) skips the phase categorically;
+# `_release_run_phase_brew` is never invoked. Verifies the
+# version-derived skip message.
+_add(
+    name="phase6-prerelease-skip",
+    seed_changelog=_changelog(
+        unreleased_subsections=[
+            ("Added", ["- Prerelease demo entry"]),
+        ],
+        prior_releases=[
+            ("0.1.0", "2026-01-01",
+                [("Added", ["- Initial public release of cctally"])]),
+        ],
+    ),
+    bootstrap_public=True,
+    extra_setup=(
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+    ),
+    run=_run_release_with_brew("prerelease --bump patch"),
+    expected_exit=0,
+    stdout_substr="phase 6: brew skipped (pre-release)",
+    stderr_substr="",
+)
+
+
+# 38. phase6-dirty-clone: tap clone has an uncommitted file → Phase 6
+# refuses with exit 2. Verifies the dirty-tree guard fires before any
+# render or commit lands.
+_add(
+    name="phase6-dirty-clone",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+        # Drop an uncommitted file into the tap working clone (don't
+        # `git add` — that's the point: dirty index/worktree).
+        + 'echo dirty > "$work/homebrew-cctally/dirty.txt"\n'
+    ),
+    run=_run_release_with_brew("patch"),
+    expected_exit=2,
+    stdout_substr="",
+    stderr_substr="brew clone has uncommitted changes",
+)
+
+
+# 39. phase6-push-fails: bare remote is moved away mid-flight → `git push`
+# inside Phase 6 fails → auth-fallback path prints the manual-recovery
+# command and returns 0 (mirrors Phase 5's auth-fallback semantics).
+_add(
+    name="phase6-push-fails",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+        # Move the bare repo aside so the tap clone's `origin` push fails
+        # outright. `mv` is cleaner than chmod tricks (works regardless of
+        # umask / fs perms) — the next push errors with "repository not
+        # found" / "not a git repository", which Phase 6's auth-fallback
+        # handles uniformly.
+        + 'mv "$work/homebrew-cctally.git" "$work/homebrew-cctally.broken"\n'
+    ),
+    run=_run_release_with_brew("patch"),
+    expected_exit=0,
+    stdout_substr="phase 6: brew formula bump",
+    stderr_substr="push failed. Manual recovery",
+)
+
+
 # ---------------------------------------------------------------------------
 # Build.
 # ---------------------------------------------------------------------------
@@ -1717,6 +1977,7 @@ def build(out_root: Path) -> None:
             ("gh_argv", "golden-gh-argv.txt"),
             ("package_json", "golden-package-json.json"),
             ("npm_invocations", "golden-npm-invocations.txt"),
+            ("formula_substr", "golden-formula-substr.txt"),
         ):
             p = d / fname
             value = sc.get(key)
