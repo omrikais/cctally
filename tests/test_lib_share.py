@@ -661,3 +661,60 @@ def test_render_md_notes_become_blockquotes():
     out = _lib_share._render_md(snap, branding=True)
     assert "> LOW CONF: thin data" in out
     assert "> 5h reset crossed week" in out
+
+
+# --- Task 15: anonymization mapping ---
+
+
+def test_collect_project_costs_from_rows():
+    """Walk Row.cells; pair ProjectCell with sibling MoneyCell in same row."""
+    rows = (
+        _lib_share.Row(cells={
+            "project": _lib_share.ProjectCell("alpha"),
+            "cost": _lib_share.MoneyCell(50.0),
+        }),
+        _lib_share.Row(cells={
+            "project": _lib_share.ProjectCell("beta"),
+            "cost": _lib_share.MoneyCell(120.0),
+        }),
+        _lib_share.Row(cells={
+            "project": _lib_share.ProjectCell("(unknown)"),
+            "cost": _lib_share.MoneyCell(10.0),
+        }),
+    )
+    snap = _lib_share.ShareSnapshot(
+        cmd="project", title="t", subtitle=None,
+        period=_lib_share.PeriodSpec(
+            start=datetime.now(timezone.utc), end=datetime.now(timezone.utc),
+            display_tz="UTC", label="x",
+        ),
+        columns=(
+            _lib_share.ColumnSpec(key="project", label="Project", align="left"),
+            _lib_share.ColumnSpec(key="cost", label="$ Cost", align="right"),
+        ),
+        rows=rows,
+        chart=None, totals=(), notes=(),
+        generated_at=datetime.now(timezone.utc), version="1.0.0",
+    )
+    costs = _lib_share._collect_project_costs(snap)
+    assert costs == {"alpha": 50.0, "beta": 120.0, "(unknown)": 10.0}
+
+
+def test_build_anon_mapping_descending_by_cost():
+    costs = {"alpha": 50.0, "beta": 120.0, "(unknown)": 10.0, "gamma": 80.0}
+    mapping = _lib_share._build_anon_mapping(costs)
+    # beta (120) -> project-1, gamma (80) -> project-2, alpha (50) -> project-3.
+    assert mapping["beta"] == "project-1"
+    assert mapping["gamma"] == "project-2"
+    assert mapping["alpha"] == "project-3"
+    # (unknown) is never numbered.
+    assert mapping["(unknown)"] == "(unknown)"
+
+
+def test_build_anon_mapping_stable_for_ties():
+    """Equal costs sort by name (stable)."""
+    costs = {"alpha": 100.0, "beta": 100.0}
+    mapping = _lib_share._build_anon_mapping(costs)
+    # Lex order on tie: alpha -> project-1, beta -> project-2.
+    assert mapping["alpha"] == "project-1"
+    assert mapping["beta"] == "project-2"

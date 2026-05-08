@@ -551,6 +551,77 @@ def _render_svg_footer(snap: ShareSnapshot, *, palette: dict,
     ])
 
 
+# --- Scrubber ---
+#
+# Anonymization chokepoint (spec Section 5.3 / 7 / 8.4). Operates on a
+# ShareSnapshot before any renderer runs; returns a new snapshot with project
+# labels rewritten everywhere they appear in the rendered output (ProjectCell
+# in rows, ChartPoint.project_label / .x_label in chart points + multi-series
+# + stacks). The Section 8.4 invariant — anonymized output contains zero
+# original tokens across md/svg/html — is the canary; if any new project-
+# label site is introduced in the data model later, both `_collect_project_
+# costs` (gather) and `_apply_anon_mapping` (rewrite) must be extended.
+
+
+def _collect_project_costs(snap: ShareSnapshot) -> dict[str, float]:
+    """Walk rows: for each row containing a ProjectCell, sum MoneyCell values
+    in the same row under the project label.
+
+    Charts also contribute via ChartPoint.project_label + y_value (when y_value
+    is in $). For consistency we union both sources; rows take precedence on
+    duplicates."""
+    costs: dict[str, float] = {}
+    for row in snap.rows:
+        proj_label: str | None = None
+        money = 0.0
+        for cell in row.cells.values():
+            if isinstance(cell, ProjectCell):
+                proj_label = cell.label
+            elif isinstance(cell, MoneyCell):
+                money = cell.usd
+        if proj_label is not None:
+            costs[proj_label] = costs.get(proj_label, 0.0) + money
+
+    if snap.chart is not None:
+        chart_pts: list[ChartPoint] = []
+        if isinstance(snap.chart, (LineChart, BarChart)):
+            chart_pts = list(snap.chart.points)
+            # Multi-series / stacks: union additional points.
+            extras = (
+                getattr(snap.chart, "multi_series", None)
+                or getattr(snap.chart, "stacks", None)
+            )
+            if extras:
+                for series in extras.values():
+                    chart_pts.extend(series)
+        elif isinstance(snap.chart, HorizontalBarChart):
+            chart_pts = list(snap.chart.points)
+        for p in chart_pts:
+            if p.project_label and p.project_label not in costs:
+                costs[p.project_label] = p.y_value
+
+    return costs
+
+
+def _build_anon_mapping(project_costs: dict[str, float]) -> dict[str, str]:
+    """Sort labels by descending cost (lex tie-break); assign project-1, project-2, ...
+
+    "(unknown)" is never numbered — keeps its literal label.
+    """
+    items = [
+        (label, cost)
+        for label, cost in project_costs.items()
+        if label != "(unknown)"
+    ]
+    items.sort(key=lambda kv: (-kv[1], kv[0]))
+    mapping: dict[str, str] = {
+        label: f"project-{i + 1}" for i, (label, _cost) in enumerate(items)
+    }
+    if "(unknown)" in project_costs:
+        mapping["(unknown)"] = "(unknown)"
+    return mapping
+
+
 # --- Format renderers ---
 
 def _render_md(snap: ShareSnapshot, *, branding: bool) -> str:
