@@ -143,7 +143,7 @@ Publishes the `cctally` package to npmjs.org from the public clone. Idempotent: 
 
 ### Phase 6 — brew formula bump
 
-Renders `homebrew/cctally.rb.template` (in cctally-dev) into `Formula/cctally.rb` in the `omrikais/homebrew-cctally` tap repo, with `<<VERSION>>` and `<<SHA256>>` substituted (sha256 computed by downloading `https://github.com/omrikais/cctally/archive/refs/tags/v<v>.tar.gz`). Commits, tags, pushes.
+Renders the brew formula template into `Formula/cctally.rb` in the `omrikais/homebrew-cctally` tap repo, with `<<VERSION>>` and `<<SHA256>>` substituted (sha256 computed by downloading `https://github.com/omrikais/cctally/archive/refs/tags/v<v>.tar.gz`). Commits, tags, pushes.
 
 **Auth fallback:** when `git push` exits nonzero (no write access to the tap remote), the phase prints `git -C <brew-clone> push origin HEAD --follow-tags` to stderr and returns 0 — the formula commit is local; the operator runs the printed command after fixing tap auth.
 
