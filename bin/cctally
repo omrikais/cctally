@@ -83,7 +83,17 @@ SETUP_HOOK_EVENTS = ("PostToolBatch", "Stop", "SubagentStop")
 
 # === Release automation (issue #24) ===
 
-CHANGELOG_PATH = pathlib.Path(__file__).resolve().parent.parent / "CHANGELOG.md"
+_CHANGELOG_OVERRIDE = os.environ.get("CCTALLY_TEST_CHANGELOG_PATH")
+if _CHANGELOG_OVERRIDE:
+    # Fixture-stability hook for `bin/cctally-share-test` — points
+    # `_share_resolve_version()` (and the broader release machinery) at a
+    # per-scenario CHANGELOG so version stamping in goldens stays
+    # deterministic regardless of the in-tree CHANGELOG state. Mirrors the
+    # `CCTALLY_AS_OF` env-only precedent: not in --help, no docstring
+    # surface; consumed exclusively by harness wrappers.
+    CHANGELOG_PATH = pathlib.Path(_CHANGELOG_OVERRIDE)
+else:
+    CHANGELOG_PATH = pathlib.Path(__file__).resolve().parent.parent / "CHANGELOG.md"
 
 
 def _package_json_path() -> pathlib.Path:

@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Fixture-based golden-file harness for the shareable-reports feature.
+#
+# Walks tests/fixtures/share/<scenario>/, runs `bin/cctally <cmd>
+# --format <fmt> [--theme <theme>] [extra]`, and diffs the captured
+# output against `<scenario>/output.<fmt>.golden`.
+#
+# Per scenario, the harness:
+#   1. Copies fixture cache.db / stats.db into a per-scenario scratch
+#      HOME ($SCRATCH_ROOT/<scenario>/fakehome/.local/share/cctally/).
+#      A virgin runner (`gotcha_fresh_ci_iceberg`) has no
+#      ~/.local/share/cctally; we mkdir -p before the cp.
+#   2. Sets CCTALLY_AS_OF (deterministic `_share_now_utc`),
+#      CCTALLY_TEST_CHANGELOG_PATH (deterministic `_share_resolve_version`),
+#      and TZ=Etc/UTC (NOT bare TZ=UTC — `_local_tz_name()` gates on
+#      IANA "/" and falls back to host zone otherwise).
+#   3. Runs `bin/cctally` against the per-scenario HOME, captures
+#      stdout to `output.<fmt>` in scratch.
+#   4. Diffs against the golden — emits [NEW] on first run (golden
+#      regenerated in-tree), [OK] on subsequent matching runs, [FAIL]
+#      on any divergence.
+#
+# Plan-bash bug fixes baked in here vs the literal plan text:
+#   - `extra=""` reset at the TOP of each loop iteration (not per case
+#     arm). Without this, `extra="--reveal-projects"` from
+#     project-md-reveal leaked into five-hour-blocks-md / session-md.
+#   - Single SCRATCH_ROOT + single trap covering ALL scenarios. A
+#     trap-per-iteration replaces the prior trap each lap, so only the
+#     LAST scenario's scratch dir gets cleaned up.
+#
+# Summary line `passed: N   failed: M` matches the format
+# `bin/cctally-test-all` parses (awk '$1==passed:'); the aggregator
+# auto-discovers any executable bin/cctally-*-test, so no edits to the
+# runner are required.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+FIXTURES_DIR="$REPO_ROOT/tests/fixtures/share"
+BIN="$REPO_ROOT/bin/cctally"
+
+# Pinned `now` for `_share_now_utc()`. Late enough to cover all
+# fixture rows (latest entry: 2026-05-07T13:00:00Z).
+export CCTALLY_AS_OF="${CCTALLY_AS_OF:-2026-05-09T12:00:00Z}"
+# IANA-style TZ — bare "UTC" loses the / sentinel and falls back to
+# host-local in `_local_tz_name()`, leaking non-determinism.
+export TZ=Etc/UTC
+
+# Single scratch root for the entire run. One trap, one cleanup point.
+SCRATCH_ROOT="$(mktemp -d -t cctally-share-fixtures-XXXXXX)"
+trap 'rm -rf "$SCRATCH_ROOT"' EXIT
+
+# Always rebuild fixtures on harness start so a manual edit to
+# `_fixture_builders.py` is reflected on the next test run without an
+# explicit regen step. Cheap (~12 scenarios × 2 SQLite files each).
+python3 "$REPO_ROOT/bin/build-share-fixtures.py" >/dev/null
+
+pass_count=0
+fail_count=0
+
+for scenario_dir in "$FIXTURES_DIR"/*/; do
+    # Reset extra at TOP of every loop iteration so per-scenario flags
+    # don't leak forward. Each `case` arm sets its own value (or leaves
+    # it empty by reassigning).
+    extra=""
+    scenario="$(basename "$scenario_dir")"
+
+    case "$scenario" in
+        report-md)             cmd="report";           fmt="md";   theme="light" ;;
+        report-svg-light)      cmd="report";           fmt="svg";  theme="light" ;;
+        report-svg-dark)       cmd="report";           fmt="svg";  theme="dark" ;;
+        daily-md)              cmd="daily";            fmt="md";   theme="light" ;;
+        monthly-md)            cmd="monthly";          fmt="md";   theme="light" ;;
+        weekly-md)             cmd="weekly";           fmt="md";   theme="light" ;;
+        weekly-html)           cmd="weekly";           fmt="html"; theme="light" ;;
+        forecast-md)           cmd="forecast";         fmt="md";   theme="light"; extra="--no-sync" ;;
+        project-md-anon)       cmd="project";          fmt="md";   theme="light" ;;
+        project-md-reveal)     cmd="project";          fmt="md";   theme="light"; extra="--reveal-projects" ;;
+        five-hour-blocks-md)   cmd="five-hour-blocks"; fmt="md";   theme="light" ;;
+        session-md)            cmd="session";          fmt="md";   theme="light" ;;
+        *)
+            echo "FAIL $scenario: unknown scenario (no case arm)"
+            fail_count=$((fail_count + 1))
+            continue
+            ;;
+    esac
+
+    scratch="$SCRATCH_ROOT/$scenario"
+    mkdir -p "$scratch"
+
+    # Per-scenario fake HOME. mkdir -p the share dir BEFORE the cp —
+    # virgin runners (`gotcha_fresh_ci_iceberg`) have no
+    # ~/.local/share/cctally and the cp would fail.
+    fake_home="$scratch/fakehome"
+    mkdir -p "$fake_home/.local/share/cctally"
+    cp "$scenario_dir/cache.db" "$fake_home/.local/share/cctally/cache.db"
+    cp "$scenario_dir/stats.db" "$fake_home/.local/share/cctally/stats.db"
+
+    # Per-scenario CHANGELOG so `_share_resolve_version()` returns the
+    # fixture-pinned 9.9.9 stamp regardless of the in-tree CHANGELOG.
+    changelog_path="$scenario_dir/CHANGELOG.md"
+
+    out_file="$scratch/output.$fmt"
+    stderr_log="$scratch/stderr.log"
+
+    # shellcheck disable=SC2086  # $extra is intentionally word-split.
+    if ! HOME="$fake_home" \
+            CCTALLY_TEST_CHANGELOG_PATH="$changelog_path" \
+            python3 "$BIN" "$cmd" --format "$fmt" --theme "$theme" \
+                $extra --output "$out_file" \
+                >/dev/null 2>"$stderr_log"; then
+        echo "FAIL $scenario: cctally exited non-zero"
+        sed 's/^/    /' "$stderr_log"
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+
+    golden="$scenario_dir/output.$fmt.golden"
+    if [[ ! -f "$golden" ]]; then
+        echo "[NEW] $scenario: regenerating golden $golden"
+        cp "$out_file" "$golden"
+        # Treat regeneration as a pass — the next run validates the
+        # locked-in golden.
+        pass_count=$((pass_count + 1))
+        continue
+    fi
+
+    if ! diff -u "$golden" "$out_file" >/dev/null; then
+        echo "FAIL $scenario: output differs from golden"
+        diff -u "$golden" "$out_file" | head -200
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS $scenario"
+        pass_count=$((pass_count + 1))
+    fi
+done
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]
