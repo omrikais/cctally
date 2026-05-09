@@ -11,6 +11,13 @@ permissions:
 
 jobs:
   publish:
+    # The workflow file is mirrored to the public repo (omrikais/cctally),
+    # which has the npm OIDC trusted-publisher relationship. The same tag
+    # push in the private mirror source (omrikais/cctally-dev) would also
+    # trigger this workflow, but the private repo has no trusted-publisher
+    # binding — `npm publish` would 404 with a noisy failure notification
+    # on every release. Gate the job so it no-ops on the private repo.
+    if: github.repository == 'omrikais/cctally'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
