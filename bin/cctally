@@ -16940,6 +16940,51 @@ def cmd_session(args: argparse.Namespace) -> int:
 
     entries = get_claude_session_entries(range_start, range_end)
     sessions = _aggregate_claude_sessions(entries)
+
+    # Shareable-reports gate: --format short-circuits the JSON / table
+    # dispatch via `_share_render_and_emit`. The mutex in
+    # `_add_share_args` keeps `--format` and `--json` from coexisting.
+    # Privacy invariant (Section 8.4 / 5.3): the wrapper runs `_lib_share._scrub`
+    # before rendering, so default output anonymizes project labels to
+    # `project-1` / `project-2` / ...; `--reveal-projects` opts back in.
+    # The builder populates `ProjectCell.label` / `ChartPoint.project_label`
+    # / `ChartPoint.x_label` with REAL basenames; the wrapper-level scrubber
+    # is the single chokepoint that rewrites them.
+    if getattr(args, "format", None):
+        # --top-n validation. Spec convention (Implementor 6 fix-loop):
+        # invalid flag combinations exit 2; the soft-warn upper threshold
+        # (>50) writes to stderr but proceeds.
+        top_n = getattr(args, "top_n", None)
+        if top_n is not None:
+            if top_n < 1:
+                print(
+                    "cctally: --top-n must be >= 1",
+                    file=sys.stderr,
+                )
+                return 2
+            if top_n > 50:
+                sys.stderr.write(
+                    f"cctally: --top-n {top_n} will likely produce an "
+                    "unreadable chart (consider 15 or fewer)\n"
+                )
+        # Note: --breakdown is a no-op under --format (snapshot focuses
+        # on the headline per-session usage table + HBar chart; per-model
+        # sub-rows aren't in the share spec scope). Same convention as
+        # cmd_daily / cmd_project.
+        display_tz_str = _share_display_tz_label(tz)
+        snap = _build_session_snapshot(
+            sessions,
+            period_start=range_start,
+            period_end=range_end,
+            display_tz=display_tz_str,
+            version=_share_resolve_version(),
+            theme=args.theme,
+            reveal_projects=args.reveal_projects,
+            top_n=top_n,
+        )
+        _share_render_and_emit(snap, args)
+        return 0
+
     # Aggregator returns descending by last_activity; --order asc reverses.
     if args.order == "asc":
         sessions = list(reversed(sessions))
@@ -24082,6 +24127,11 @@ def build_parser() -> argparse.ArgumentParser:
     se.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
                     help="In --format output, show real project basenames instead of "
                          "the default project-1, project-2, ... anonymization.")
+    se.add_argument("--top-n", type=int, default=None, dest="top_n",
+                    metavar="N",
+                    help="In --format output, truncate to the top-N sessions by cost. "
+                         "Must be >= 1; values above 50 emit a readability warning. "
+                         "No-op without --format.")
     se.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
                     help="Display timezone: local, utc, or IANA name. "
                          "Overrides config display.tz for this call.")
@@ -25611,6 +25661,200 @@ def _build_five_hour_blocks_snapshot(
     ])
     return _lib_share.ShareSnapshot(
         cmd="five-hour-blocks",
+        title=title,
+        subtitle=subtitle,
+        period=_lib_share.PeriodSpec(
+            start=period_start, end=period_end,
+            display_tz=display_tz, label=period_label,
+        ),
+        columns=columns, rows=tuple(snap_rows),
+        chart=chart, totals=totals, notes=notes,
+        generated_at=_share_now_utc(), version=version,
+    )
+
+
+def _session_disambiguate_labels(
+    sessions: list["ClaudeSessionUsage"],
+) -> dict[int, str]:
+    """Return ``{session_index: disambiguated_label}`` for sessions whose
+    bare ``project_path`` basename collides with another session's.
+
+    Session-specific sibling of ``_project_disambiguate_labels`` (which
+    operates over project rollup rows whose `key` is a ``ProjectKey``).
+    Sessions carry only a `project_path` string — we derive the
+    basename, count collisions, and append a parent-dir suffix
+    ``" (parent)"`` to colliding rows so the post-scrub anonymization
+    still produces unique anonymous labels (otherwise two `app/`
+    sessions under different parents collapse to a single
+    ``project-N``, breaking both privacy uniqueness and the chart's
+    visual rank meaning).
+
+    Sessions without collisions are absent from the returned dict;
+    callers fall back to the bare basename.
+    """
+    basenames: list[str] = []
+    for s in sessions:
+        path = s.project_path or ""
+        basenames.append(os.path.basename(path) or path or "(unknown)")
+    counts: dict[str, int] = {}
+    for bn in basenames:
+        counts[bn] = counts.get(bn, 0) + 1
+    augmented: dict[int, str] = {}
+    for idx, s in enumerate(sessions):
+        bn = basenames[idx]
+        if counts[bn] > 1:
+            path = s.project_path or ""
+            parent = os.path.basename(os.path.dirname(path)) or "/"
+            augmented[idx] = f"{bn} ({parent})"
+    return augmented
+
+
+def _build_session_snapshot(
+    sessions: list["ClaudeSessionUsage"],
+    *,
+    period_start: dt.datetime,
+    period_end: dt.datetime,
+    display_tz: str,
+    version: str,
+    theme: str,
+    reveal_projects: bool,
+    top_n: int | None,
+) -> "ShareSnapshot":
+    """Build a ShareSnapshot for `cctally session`.
+
+    `sessions` is the in-memory `ClaudeSessionUsage` list produced by
+    `_aggregate_claude_sessions` inside `cmd_session`. Each session has:
+    `session_id` (UUID), `project_path` (filesystem path), `cost_usd`,
+    `last_activity` (`dt.datetime`), `models` (first-seen-order
+    `list[str]`), and the token aggregates.
+
+    Privacy invariant (Section 8.4 / Section 5.3): the builder populates
+    `ProjectCell.label`, `ChartPoint.project_label`, and
+    `ChartPoint.x_label` with the REAL `project_path` basename. The
+    `_share_render_and_emit` wrapper runs `_lib_share._scrub` BEFORE
+    rendering — that's the single chokepoint that rewrites every
+    project label to `project-1` / `project-2` / ... unless
+    `--reveal-projects` is passed.
+
+    Deviations from the plan sketch (which assumed dict rows with keys
+    `session_id` / `started_at` / `project_path` / `cost_usd` /
+    `models`):
+
+    - Sessions are `ClaudeSessionUsage` dataclasses; we read fields by
+      attribute. `last_activity` is the canonical timestamp (no
+      `started_at` field — sessions span a window via
+      `first_activity` → `last_activity`).
+    - The `project_path` column's basename can collide across two
+      different parent dirs. We use the session-specific
+      `_session_disambiguate_labels` helper (sibling of
+      `_project_disambiguate_labels`, which expects `ProjectKey` rows
+      not present on session data) to suffix `" (parent)"` on
+      collisions before the scrubber runs.
+
+    Caller MUST pass `sessions` already sorted in the desired order;
+    the builder re-sorts internally by descending cost so the chart's
+    HBar bars rank consistently with the anonymization-mapping
+    (`_build_anon_mapping` also sorts by descending cost) — keeping
+    `project-1` aligned with the highest-cost bar in the chart even
+    when the user asked for `--order asc`.
+
+    `top_n`, when set (must be `>= 1`; caller validates), truncates
+    BOTH the table rows and the chart points to the top-N by cost.
+    The title shifts to `"Top N sessions"` whenever `top_n` actually
+    truncated (so users know rows were dropped). When more rows exist
+    than the chart cap (15) but `top_n` is None or `>= len(sessions)`,
+    the table includes all rows while the chart shows the top 15 by
+    cost (a note clarifies).
+
+    `theme` and `reveal_projects` flow into the subtitle directly so
+    the builder owns the canonical subtitle shape — no post-build
+    re-stamp at the gate site.
+    """
+    _lib_share = _share_load_lib()
+    columns = (
+        _lib_share.ColumnSpec(key="session", label="Session", align="left"),
+        _lib_share.ColumnSpec(key="project", label="Project", align="left"),
+        _lib_share.ColumnSpec(key="cost", label="$ Cost", align="right",
+                              emphasis=True),
+        _lib_share.ColumnSpec(key="last_activity", label="Last Activity",
+                              align="left"),
+    )
+    # Sort by descending cost so the snapshot's chart-order matches the
+    # `_build_anon_mapping` sort key (also descending cost).
+    sorted_sessions = sorted(
+        sessions, key=lambda s: -float(getattr(s, "cost_usd", 0.0) or 0.0)
+    )
+    # Apply --top-n truncation (caller validated >= 1). Truncation status
+    # gates the title shape below.
+    truncated = (
+        top_n is not None and top_n < len(sorted_sessions)
+    )
+    if top_n is not None:
+        sorted_sessions = sorted_sessions[:top_n]
+    # Basename-collision disambiguation: session-specific sibling of
+    # `_project_disambiguate_labels`. Without this, two `app/` sessions
+    # under different parents collapse to a single `project-N` after
+    # scrub — losing both privacy uniqueness and chart rank meaning.
+    augmented = _session_disambiguate_labels(sorted_sessions)
+    snap_rows: list = []
+    chart_pts: list = []
+    for idx, s in enumerate(sorted_sessions):
+        bare_label = (
+            os.path.basename(s.project_path or "")
+            or s.project_path
+            or "(unknown)"
+        )
+        proj_label = augmented.get(idx, bare_label)
+        cost_usd = float(getattr(s, "cost_usd", 0.0) or 0.0)
+        sid_short = (s.session_id[:8] if s.session_id else "—") or "—"
+        last_local = s.last_activity.astimezone()
+        last_str = last_local.strftime("%Y-%m-%d %H:%M")
+        snap_rows.append(_lib_share.Row(cells={
+            "session": _lib_share.TextCell(sid_short),
+            "project": _lib_share.ProjectCell(proj_label),
+            "cost": _lib_share.MoneyCell(cost_usd),
+            "last_activity": _lib_share.TextCell(last_str),
+        }))
+        chart_pts.append(_lib_share.ChartPoint(
+            x_label=proj_label,
+            x_value=cost_usd,
+            y_value=cost_usd,
+            project_label=proj_label,
+        ))
+    chart = (
+        _lib_share.HorizontalBarChart(
+            points=tuple(chart_pts), x_label="$", cap=15,
+        )
+        if chart_pts else None
+    )
+    notes: tuple[str, ...] = ()
+    if chart is not None and len(chart_pts) > 15:
+        notes = (
+            f"Showing top 15 in chart; table includes all {len(chart_pts)}.",
+        )
+    sum_cost = sum(p.y_value for p in chart_pts)
+    totals = (
+        _lib_share.Totalled(label="Sum", value=f"${sum_cost:,.2f}"),
+        _lib_share.Totalled(label="Sessions", value=str(len(chart_pts))),
+    )
+    if sorted_sessions:
+        if truncated:
+            title = f"Top {len(snap_rows)} sessions"
+        else:
+            title = (
+                f"Sessions — {period_start.strftime('%b %d')} → "
+                f"{period_end.strftime('%b %d')}"
+            )
+    else:
+        title = "Sessions — no data"
+    period_label = _share_period_label(period_start, period_end, display_tz)
+    subtitle = " · ".join([
+        period_label,
+        theme,
+        "real projects" if reveal_projects else "projects anonymized",
+    ])
+    return _lib_share.ShareSnapshot(
+        cmd="session",
         title=title,
         subtitle=subtitle,
         period=_lib_share.PeriodSpec(
