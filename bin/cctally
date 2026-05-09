@@ -24127,11 +24127,11 @@ def build_parser() -> argparse.ArgumentParser:
     se.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
                     help="In --format output, show real project basenames instead of "
                          "the default project-1, project-2, ... anonymization.")
-    se.add_argument("--top-n", type=int, default=None, dest="top_n",
+    se.add_argument("--top-n", type=int, default=15, dest="top_n",
                     metavar="N",
-                    help="In --format output, truncate to the top-N sessions by cost. "
+                    help="In --format output, cap rows to top N by cost (default: 15). "
                          "Must be >= 1; values above 50 emit a readability warning. "
-                         "No-op without --format.")
+                         "Has no effect on terminal/JSON output.")
     se.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
                     help="Display timezone: local, utc, or IANA name. "
                          "Overrides config display.tz for this call.")
@@ -25632,12 +25632,14 @@ def _build_five_hour_blocks_snapshot(
         if chart_pts else None
     )
     sum_cost = sum(p.y_value for p in chart_pts)
+    avg_cost = (sum_cost / len(chart_pts)) if chart_pts else 0.0
     crossed_count = sum(
         1 for r in chrono_rows if bool(r.get("crossed_seven_day_reset"))
     )
     totals_list = [
         _lib_share.Totalled(label="Sum", value=f"${sum_cost:,.2f}"),
         _lib_share.Totalled(label="Blocks", value=str(len(chart_pts))),
+        _lib_share.Totalled(label="Avg / block", value=f"${avg_cost:,.2f}"),
     ]
     if crossed_count:
         totals_list.append(_lib_share.Totalled(
@@ -25778,6 +25780,7 @@ def _build_session_snapshot(
                               emphasis=True),
         _lib_share.ColumnSpec(key="last_activity", label="Last Activity",
                               align="left"),
+        _lib_share.ColumnSpec(key="models", label="Models", align="left"),
     )
     # Sort by descending cost so the snapshot's chart-order matches the
     # `_build_anon_mapping` sort key (also descending cost).
@@ -25809,11 +25812,13 @@ def _build_session_snapshot(
         sid_short = (s.session_id[:8] if s.session_id else "—") or "—"
         last_local = s.last_activity.astimezone()
         last_str = last_local.strftime("%Y-%m-%d %H:%M")
+        models_text = ", ".join(s.models) if s.models else "—"
         snap_rows.append(_lib_share.Row(cells={
             "session": _lib_share.TextCell(sid_short),
             "project": _lib_share.ProjectCell(proj_label),
             "cost": _lib_share.MoneyCell(cost_usd),
             "last_activity": _lib_share.TextCell(last_str),
+            "models": _lib_share.TextCell(models_text),
         }))
         chart_pts.append(_lib_share.ChartPoint(
             x_label=proj_label,
