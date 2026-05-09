@@ -216,6 +216,43 @@ def _release_read_latest_release_version() -> tuple[str, str] | None:
     return (m.group(1), m.group(2))
 
 
+_FORMULA_VERSION_RE = re.compile(
+    rf'/v({_SEMVER_NUM}\.{_SEMVER_NUM}\.{_SEMVER_NUM}'
+    rf'(?:-[a-zA-Z][a-zA-Z0-9-]*\.{_SEMVER_NUM})?)\.tar\.gz'
+)
+
+
+def _release_extract_formula_version(text: str) -> str | None:
+    """Extract the SemVer string from a homebrew formula's archive URL.
+
+    Returns the matched version (e.g. `"1.3.0"`, `"1.0.0-rc.1"`) or
+    ``None`` if no `/vX.Y.Z[.tar.gz]` substring is found. Used by Phase 6's
+    monotonic-version gate (issue #30) — the gate refuses to write a lower
+    version on top of a higher one. A formula that does not match is
+    treated as unversioned (gate allows the write).
+    """
+    m = _FORMULA_VERSION_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _release_semver_sort_key(
+    parsed: tuple[int, int, int, str | None, int | None],
+) -> tuple:
+    """Total-order sort key for `_release_parse_semver` output.
+
+    SemVer §11.4: a stable release has higher precedence than a pre-release
+    of the same MAJOR.MINOR.PATCH. Naive tuple comparison breaks because
+    Python rejects ``None < str`` at runtime. The key returned here makes
+    stable releases sort *after* their pre-releases by inverting the
+    "has-prerelease" axis: stable → ``(maj, min, pat, 1, "", 0)``,
+    pre-release → ``(maj, min, pat, 0, id, n)``.
+    """
+    maj, min_, pat, pre_id, pre_n = parsed
+    if pre_id is None:
+        return (maj, min_, pat, 1, "", 0)
+    return (maj, min_, pat, 0, pre_id, pre_n)
+
+
 def _release_brew_archive_url(version: str) -> str:
     """Return the GitHub auto-archive URL for a version tag.
 
@@ -1537,6 +1574,7 @@ def _release_run_phase_npm(
 def _release_run_phase_brew(
     version: str,
     brew_clone: pathlib.Path | None,
+    allow_downgrade: bool = False,
 ) -> int:
     """Phase 6 — render ``Formula/cctally.rb`` and push to the brew tap.
 
@@ -1551,6 +1589,13 @@ def _release_run_phase_brew(
         version (idempotency under ``--resume``).
       - Dirty working tree — refuses with exit 2 and points the operator
         at ``--resume``.
+      - **Monotonic-version gate (issue #30).** Refuses with exit 2 when
+        the existing on-disk formula's URL pins a *higher* SemVer than
+        ``version``. Catches the f02b2f1 regression class — operator
+        runs Phase 6 from a stale CHANGELOG / fixture leak / accidental
+        old branch and would otherwise silently write a lower version
+        over a higher one. Override via ``allow_downgrade=True``
+        (operator-driven, for genuine yank/revert cases).
       - Push failure — auth-fallback parity with Phase 4: prints the
         exact recovery command and returns 0. Phases 1-5 already
         succeeded, the release IS published from the user's
@@ -1560,7 +1605,7 @@ def _release_run_phase_brew(
     Returns:
       - ``0`` on success, graceful skip, idempotent short-circuit, OR
         push fallback.
-      - ``2`` on dirty-working-tree refusal.
+      - ``2`` on dirty-working-tree refusal OR downgrade-gate refusal.
     """
     print("phase 6: brew formula bump")
     if brew_clone is None:
@@ -1610,6 +1655,57 @@ def _release_run_phase_brew(
             f"  local formula already at v{version}; re-pushing to tap…"
         )
     else:
+        # Monotonic-version gate (issue #30). The brew tap regressed
+        # from v1.3.0 → v1.0.0 twice in one day via this code path; the
+        # equality fingerprint above (`local_at_version`) is False on a
+        # downgrade, so without this gate we'd silently overwrite a
+        # higher version. Compare the existing formula's URL-pinned
+        # SemVer against `version` (SemVer-aware so prereleases sort
+        # below their stable counterpart per §11.4); refuse with exit 2
+        # when the on-disk version is strictly higher. Unparseable
+        # formulas are treated as unversioned and allowed through.
+        if formula_path.exists():
+            existing_text = formula_path.read_text(encoding="utf-8")
+            existing_v = _release_extract_formula_version(existing_text)
+            if existing_v is not None:
+                try:
+                    existing_key = _release_semver_sort_key(
+                        _release_parse_semver(existing_v)
+                    )
+                    target_key = _release_semver_sort_key(
+                        _release_parse_semver(version)
+                    )
+                except ValueError:
+                    existing_key = target_key = None
+                if (
+                    existing_key is not None
+                    and target_key is not None
+                    and existing_key > target_key
+                    and not allow_downgrade
+                ):
+                    print(
+                        f"  refuse: existing formula pins v{existing_v}, "
+                        f"target is v{version} (downgrade).\n"
+                        "  Common causes: stale CHANGELOG.md in this clone, "
+                        "fixture leak into a real `release.brewClone`, or an "
+                        "accidental old branch.\n"
+                        "  Verify intent, then re-run with "
+                        "`--allow-formula-downgrade` to override "
+                        "(yank / revert cases). See issue #30.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if (
+                    existing_key is not None
+                    and target_key is not None
+                    and existing_key > target_key
+                    and allow_downgrade
+                ):
+                    print(
+                        f"  WARNING: writing v{version} over existing v{existing_v} "
+                        "(--allow-formula-downgrade); intentional yank?",
+                        file=sys.stderr,
+                    )
         print(f"  computing sha256 of v{version} archive…")
         sha = _release_compute_brew_sha256(version)
 
@@ -1920,7 +2016,11 @@ def cmd_release(args: argparse.Namespace) -> int:
         print(f"phase 6: brew skipped{suffix}")
     else:
         brew_clone = _release_discover_brew_clone(args)
-        rc = _release_run_phase_brew(next_v, brew_clone)
+        rc = _release_run_phase_brew(
+            next_v,
+            brew_clone,
+            allow_downgrade=args.allow_formula_downgrade,
+        )
         if rc != 0:
             return rc
 
@@ -25302,6 +25402,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-brew",
         action="store_true",
         help="Skip Phase 6 (brew formula bump). Idempotent: re-running --resume without it picks the channel back up.",
+    )
+    p_release.add_argument(
+        "--allow-formula-downgrade",
+        action="store_true",
+        help="Override Phase 6's monotonic-version gate (issue #30). Use only for intentional yank/revert cases — Phase 6 normally refuses to write a formula whose URL pins a lower SemVer than the on-disk formula.",
     )
     p_release.set_defaults(func=cmd_release)
 

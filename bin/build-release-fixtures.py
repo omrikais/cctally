@@ -1849,9 +1849,11 @@ _add(
 )
 
 
-# 34. phase6-bump-formula: tap clone already has a v1.0.0 formula. Phase 6
+# 34. phase6-bump-formula: tap clone already has a v0.1.0 formula. Phase 6
 # rewrites it to v0.1.1 — the version-fingerprint check looks for
-# `/v<version>.tar.gz`, so v1.0.0 → v0.1.1 triggers the full render path.
+# `/v<version>.tar.gz`, so v0.1.0 → v0.1.1 triggers the full render path.
+# (The pre-seed version must be < the target so issue #30's monotonic
+# gate allows the write — it refuses any downgrade by default.)
 _add(
     name="phase6-bump-formula",
     seed_changelog=_PATCH_SEED,
@@ -1859,17 +1861,17 @@ _add(
     extra_setup=(
         _seed_fake_brew_tap()
         + _seed_brew_template()
-        # Pre-seed an old v1.0.0 formula in the tap clone so Phase 6
+        # Pre-seed an older v0.1.0 formula in the tap clone so Phase 6
         # exercises the bump (overwrite) path.
         + 'cat > "$work/homebrew-cctally/Formula/cctally.rb" <<\'CCTALLY_OLD_FORMULA_EOF\'\n'
         + 'class Cctally < Formula\n'
-        + '  url "https://github.com/omrikais/cctally/archive/refs/tags/v1.0.0.tar.gz"\n'
+        + '  url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.0.tar.gz"\n'
         + '  sha256 "old"\n'
         + 'end\n'
         + 'CCTALLY_OLD_FORMULA_EOF\n'
         + '(cd "$work/homebrew-cctally" && \\\n'
         + '  git add . && \\\n'
-        + '  git commit -q -m "seed v1.0.0" && \\\n'
+        + '  git commit -q -m "seed v0.1.0" && \\\n'
         + '  git push -q origin HEAD)\n'
     ),
     run=_run_release_with_brew("patch"),
@@ -1904,17 +1906,18 @@ _add(
     extra_setup=(
         _seed_fake_brew_tap()
         + _seed_brew_template()
-        # Pre-seed an old v1.0.0 formula in the tap clone so Phase 6
-        # exercises the bump (overwrite) path.
+        # Pre-seed an older v0.1.0 formula in the tap clone so Phase 6
+        # exercises the bump (overwrite) path. (Older than the v0.1.1
+        # target so issue #30's monotonic gate allows the write.)
         + 'cat > "$work/homebrew-cctally/Formula/cctally.rb" <<\'CCTALLY_OLD_FORMULA_EOF\'\n'
         + 'class Cctally < Formula\n'
-        + '  url "https://github.com/omrikais/cctally/archive/refs/tags/v1.0.0.tar.gz"\n'
+        + '  url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.0.tar.gz"\n'
         + '  sha256 "old"\n'
         + 'end\n'
         + 'CCTALLY_OLD_FORMULA_EOF\n'
         + '(cd "$work/homebrew-cctally" && \\\n'
         + '  git add . && \\\n'
-        + '  git commit -q -m "seed v1.0.0" && \\\n'
+        + '  git commit -q -m "seed v0.1.0" && \\\n'
         + '  git push -q origin HEAD)\n'
         # Issue #25 trigger: turn on tag.gpgsign LOCAL on the tap clone
         # AFTER the seed commit lands (the seed used commit, not tag,
@@ -2041,6 +2044,86 @@ _add(
     expected_exit=0,
     stdout_substr="local formula already at v0.1.1; re-pushing to tap",
     stderr_substr="",
+)
+
+
+# 35d. phase6-refuse-downgrade (issue #30): tap clone has a v2.0.0 formula
+# already committed + pushed. Operator runs `cctally release patch` from
+# a CHANGELOG seeded at v0.1.0 — Phase 6's target is v0.1.1, which is
+# strictly lower than the on-disk v2.0.0. The monotonic-version gate
+# refuses with exit 2 and a stderr explanation pointing at issue #30.
+# This is the regression class that bit the brew tap twice in one day:
+# without the gate, Phase 6 silently overwrites the higher v2.0.0 with
+# the lower v0.1.1 and pushes it. Phases 1-5 already shipped before we
+# reach Phase 6 (parity with the dirty-tree refusal), so the formula on
+# disk in the tap clone remains untouched at v2.0.0.
+_add(
+    name="phase6-refuse-downgrade",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+        # Pre-seed the formula at a HIGHER version (v2.0.0) so the
+        # patch bump (v0.1.0 → v0.1.1) is a strict downgrade against
+        # what's on the tap.
+        + 'cat > "$work/homebrew-cctally/Formula/cctally.rb" <<\'CCTALLY_HIGH_FORMULA_EOF\'\n'
+        + 'class Cctally < Formula\n'
+        + '  url "https://github.com/omrikais/cctally/archive/refs/tags/v2.0.0.tar.gz"\n'
+        + '  sha256 "high"\n'
+        + 'end\n'
+        + 'CCTALLY_HIGH_FORMULA_EOF\n'
+        + '(cd "$work/homebrew-cctally" && \\\n'
+        + '  git add . && \\\n'
+        + '  git commit -q -m "seed v2.0.0" && \\\n'
+        + '  git push -q origin HEAD)\n'
+    ),
+    run=_run_release_with_brew("patch"),
+    expected_exit=2,
+    stdout_substr="phase 6: brew formula bump",
+    stderr_substr="refuse: existing formula pins v2.0.0",
+    # Gate fires before render — formula on disk must still be v2.0.0.
+    formula_substr=(
+        'url "https://github.com/omrikais/cctally/archive/refs/tags/v2.0.0.tar.gz"\n'
+        '  sha256 "high"\n'
+    ),
+)
+
+
+# 35e. phase6-allow-downgrade-with-flag (issue #30): same setup as 35d,
+# but the operator passes `--allow-formula-downgrade` (intentional
+# yank/revert case). Phase 6 prints a loud WARNING to stderr but
+# proceeds with the render + commit + push; the formula ends up at the
+# lower v0.1.1.
+_add(
+    name="phase6-allow-downgrade-with-flag",
+    seed_changelog=_PATCH_SEED,
+    bootstrap_public=True,
+    extra_setup=(
+        _seed_fake_brew_tap()
+        + _seed_brew_template()
+        + 'cat > "$work/homebrew-cctally/Formula/cctally.rb" <<\'CCTALLY_HIGH_FORMULA_EOF\'\n'
+        + 'class Cctally < Formula\n'
+        + '  url "https://github.com/omrikais/cctally/archive/refs/tags/v2.0.0.tar.gz"\n'
+        + '  sha256 "high"\n'
+        + 'end\n'
+        + 'CCTALLY_HIGH_FORMULA_EOF\n'
+        + '(cd "$work/homebrew-cctally" && \\\n'
+        + '  git add . && \\\n'
+        + '  git commit -q -m "seed v2.0.0" && \\\n'
+        + '  git push -q origin HEAD)\n'
+    ),
+    run=_run_release_with_brew("patch --allow-formula-downgrade"),
+    expected_exit=0,
+    stdout_substr="phase 6: brew formula bump",
+    stderr_substr=(
+        "WARNING: writing v0.1.1 over existing v2.0.0 "
+        "(--allow-formula-downgrade)"
+    ),
+    formula_substr=(
+        'url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.1.tar.gz"\n'
+        '  sha256 "eba438f24089aa3c950d53d2759a8e058d3da86c52685028610556e2f1ad7a56"\n'
+    ),
 )
 
 

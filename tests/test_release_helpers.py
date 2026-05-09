@@ -766,6 +766,7 @@ class TestResume:
             skip_npm=False,
             brew_clone=None,
             skip_brew=False,
+            allow_formula_downgrade=False,
         )
 
     def _stub_preflight_and_version(self, monkeypatch, version="1.0.0"):

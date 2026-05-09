@@ -1,0 +1,2 @@
+url "https://github.com/omrikais/cctally/archive/refs/tags/v2.0.0.tar.gz"
+  sha256 "high"

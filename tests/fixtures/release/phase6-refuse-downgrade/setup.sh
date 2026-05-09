@@ -248,13 +248,13 @@ chore: seed brew formula template
 Public-Skip: true
 CCTALLY_BREW_TPL_EOF
 git push -q origin main
-cat > "$work/homebrew-cctally/Formula/cctally.rb" <<'CCTALLY_OLD_FORMULA_EOF'
+cat > "$work/homebrew-cctally/Formula/cctally.rb" <<'CCTALLY_HIGH_FORMULA_EOF'
 class Cctally < Formula
-  url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "old"
+  url "https://github.com/omrikais/cctally/archive/refs/tags/v2.0.0.tar.gz"
+  sha256 "high"
 end
-CCTALLY_OLD_FORMULA_EOF
+CCTALLY_HIGH_FORMULA_EOF
 (cd "$work/homebrew-cctally" && \
   git add . && \
-  git commit -q -m "seed v0.1.0" && \
+  git commit -q -m "seed v2.0.0" && \
   git push -q origin HEAD)

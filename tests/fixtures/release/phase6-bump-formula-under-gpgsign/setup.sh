@@ -250,12 +250,12 @@ CCTALLY_BREW_TPL_EOF
 git push -q origin main
 cat > "$work/homebrew-cctally/Formula/cctally.rb" <<'CCTALLY_OLD_FORMULA_EOF'
 class Cctally < Formula
-  url "https://github.com/omrikais/cctally/archive/refs/tags/v1.0.0.tar.gz"
+  url "https://github.com/omrikais/cctally/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "old"
 end
 CCTALLY_OLD_FORMULA_EOF
 (cd "$work/homebrew-cctally" && \
   git add . && \
-  git commit -q -m "seed v1.0.0" && \
+  git commit -q -m "seed v0.1.0" && \
   git push -q origin HEAD)
 git -C "$work/homebrew-cctally" config tag.gpgsign true
