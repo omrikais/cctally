@@ -22442,27 +22442,38 @@ def _argparse_has_arg(parser, option_string: str) -> bool:
 def _add_share_args(parser, *, has_status_line: bool = False) -> None:
     """Attach shareable-reports flags + format/json mutex to a subparser.
 
-    Idempotent — call exactly once per subparser; later calls fail with argparse
-    "conflicting option string" if accidentally double-invoked.
+    Idempotent — call exactly once per subparser. Caller MUST remove any
+    pre-existing ``--json`` (and ``--status-line`` for forecast) from the
+    subparser before invoking this helper, so the mutex group owns those
+    flags. Raises ``RuntimeError`` on contract violation — surfaces at
+    parser-build time (i.e., on every CLI invocation, including ``--help``)
+    instead of at the user invocation that hits the unguarded
+    ``--format --json`` combo. The prior shape silently skipped re-adding,
+    leaving the mutex unenforced for any future 9th share-enabled subparser
+    whose existing ``--json`` was accidentally left in place.
     """
+    if _argparse_has_arg(parser, "--json"):
+        raise RuntimeError(
+            f"_add_share_args: parser {parser.prog!r} already has --json; "
+            "remove it before calling _add_share_args so mutex applies"
+        )
+    if has_status_line and _argparse_has_arg(parser, "--status-line"):
+        raise RuntimeError(
+            f"_add_share_args: parser {parser.prog!r} already has --status-line; "
+            "remove it before calling _add_share_args(has_status_line=True)"
+        )
     output_group = parser.add_mutually_exclusive_group()
     output_group.add_argument(
         "--format", choices=("md", "html", "svg"),
         help="Render output as shareable markdown, self-contained HTML, or SVG. "
              "Default destination: md->stdout, html/svg->~/Downloads file.")
-    # Re-bind --json into the same group so it's mutex with --format. Callers
-    # are expected to have removed any prior freestanding --json on this
-    # subparser; if one slips through we skip re-adding (mutex would still be
-    # enforced at runtime by validation in the cmd_* wrapper).
-    if not _argparse_has_arg(parser, "--json"):
-        output_group.add_argument(
-            "--json", action="store_true",
-            help="Emit machine-readable JSON; suppresses terminal render.")
+    output_group.add_argument(
+        "--json", action="store_true",
+        help="Emit machine-readable JSON; suppresses terminal render.")
     if has_status_line:
-        if not _argparse_has_arg(parser, "--status-line"):
-            output_group.add_argument(
-                "--status-line", action="store_true", dest="status_line",
-                help="Emit one-line compact string for status-line injection.")
+        output_group.add_argument(
+            "--status-line", action="store_true", dest="status_line",
+            help="Emit one-line compact string for status-line injection.")
 
     parser.add_argument(
         "--theme", choices=("light", "dark"), default="light",
@@ -24073,8 +24084,18 @@ def build_parser() -> argparse.ArgumentParser:
 # shareable-reports spec).
 
 
+# Module-level latch for the home-dir fallback hint. Spec Section 4.2 calls
+# for a one-shot stderr suggestion when share output lands in $HOME because
+# both XDG_DOWNLOAD_DIR and ~/Downloads were absent. Latched here (process
+# scope) so a user running, e.g., a `cctally daily --format html` followed
+# by `cctally weekly --format html` in the same shell sees the hint exactly
+# once. Tests reset by reaching into the module globals if needed.
+_DOWNLOADS_HOME_HINT_EMITTED = False
+
+
 def _share_resolve_download_dir() -> pathlib.Path:
     """XDG -> ~/Downloads -> ~ fallback (Section 4.2)."""
+    global _DOWNLOADS_HOME_HINT_EMITTED
     xdg = os.environ.get("XDG_DOWNLOAD_DIR")
     if xdg:
         p = pathlib.Path(xdg).expanduser()
@@ -24083,11 +24104,22 @@ def _share_resolve_download_dir() -> pathlib.Path:
     downloads = pathlib.Path.home() / "Downloads"
     if downloads.exists():
         return downloads
+    if not _DOWNLOADS_HOME_HINT_EMITTED:
+        sys.stderr.write(
+            "cctally: writing share output to home dir; "
+            "pass --output <path> to choose a destination\n"
+        )
+        _DOWNLOADS_HOME_HINT_EMITTED = True
     return pathlib.Path.home()
 
 
 def _share_unique_path(base: pathlib.Path) -> pathlib.Path:
-    """Auto-collision counter — base.html -> base-2.html -> base-3.html -> ... cap 99."""
+    """Auto-collision counter — base.html -> base-2.html -> base-3.html -> ... cap 99.
+
+    Exhaustion (>99 same-day collisions) exits 3 per spec Section 4.4. Prior
+    code raised ``SystemExit("…")`` which yields exit 1 — broke the spec's
+    distinct-exit-code contract for collision exhaustion vs. generic errors.
+    """
     if not base.exists():
         return base
     stem = base.stem
@@ -24097,9 +24129,11 @@ def _share_unique_path(base: pathlib.Path) -> pathlib.Path:
         candidate = parent / f"{stem}-{n}{suffix}"
         if not candidate.exists():
             return candidate
-    raise SystemExit(
-        f"cctally: too many same-day collisions in {parent}; use --output <path>"
+    print(
+        f"cctally: too many same-day collisions in {parent}; use --output <path>",
+        file=sys.stderr,
     )
+    sys.exit(3)
 
 
 def _resolve_destination(
@@ -24109,11 +24143,27 @@ def _resolve_destination(
 
     kind: "stdout" | "file" | "clipboard"
     value: pathlib.Path for "file"; None for "stdout" / "clipboard".
+
+    Exit-code contract (spec Section 4.4):
+      - exit 2 on invalid flag combinations (--copy on non-md;
+        --copy + --output; --copy with no clipboard tool; --open + md).
+      - exit 3 on collision exhaustion (delegated to _share_unique_path).
     """
     fmt = args.format
+    if getattr(args, "copy", False) and getattr(args, "output", None) is not None:
+        # Mutex: a clipboard destination by definition has no path. Spec
+        # Section 4.4 line 132 calls this out explicitly. Prior code silently
+        # let --copy override --output, which surprised users who expected
+        # the file to land alongside the clipboard write.
+        print(
+            "cctally: --copy is mutually exclusive with --output",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     if getattr(args, "copy", False):
         if fmt != "md":
-            raise SystemExit("cctally: --copy is only valid with --format md")
+            print("cctally: --copy is only valid with --format md", file=sys.stderr)
+            sys.exit(2)
         return ("clipboard", None)
 
     output = getattr(args, "output", None)
@@ -24129,7 +24179,7 @@ def _resolve_destination(
     return ("file", _share_unique_path(base))
 
 
-def _emit(content: str, *, kind: str, value, fmt: str) -> None:
+def _emit(content: str, *, kind: str, value: pathlib.Path | str | None) -> None:
     """Deliver rendered content to stdout/file/clipboard."""
     if kind == "stdout":
         sys.stdout.write(content)
@@ -24145,6 +24195,11 @@ def _emit(content: str, *, kind: str, value, fmt: str) -> None:
         return
 
     if kind == "clipboard":
+        # Track tools that were found-but-failed separately from "no tool on
+        # PATH" so the error message accurately describes what went wrong.
+        # The prior shape ("requires pbcopy/xclip/clip on PATH") was
+        # misleading when e.g. pbcopy was present but exited non-zero.
+        tried = []
         for cmd_args in (
             ["pbcopy"],
             ["xclip", "-sel", "clip"],
@@ -24156,7 +24211,18 @@ def _emit(content: str, *, kind: str, value, fmt: str) -> None:
                 if proc.returncode == 0:
                     sys.stderr.write(f"Copied to clipboard via {tool}\n")
                     return
-        raise SystemExit("cctally: --copy requires pbcopy, xclip, or clip on PATH")
+                tried.append(f"{tool} (exit {proc.returncode})")
+        if tried:
+            print(
+                f"cctally: clipboard tool failed: {', '.join(tried)}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        print(
+            "cctally: --copy requires pbcopy, xclip, or clip on PATH",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     raise ValueError(f"unknown destination kind: {kind!r}")
 
@@ -24168,7 +24234,24 @@ def _share_render_and_emit(snap, args) -> None:
     cost. The kernel module stays I/O-pure; this wrapper does all the
     side-effecting glue (destination resolution, file writes, clipboard,
     post-write `--open` launch).
+
+    Caller contract: ``args.format`` MUST be set ("md", "html", or "svg").
+    The wrapper raises ValueError if called without it — surfaces the
+    contract failure at the chokepoint instead of producing junk filenames
+    like ``cctally-daily-<date>.None``.
     """
+    if args.format is None:
+        raise ValueError("_share_render_and_emit called without args.format")
+    if args.open_after_write and args.format == "md":
+        # Spec Section 4.4: --open is only meaningful for html/svg writes.
+        # Reject explicitly with exit 2 instead of silently no-opping (which
+        # the prior implementation did because the open-after-write branch
+        # gates on ``kind == "file"``, and md routes to stdout by default).
+        print(
+            "cctally: --open is only valid with --format html or --format svg",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     # Reuse a cached `_lib_share` if a prior call (or the test harness) has
     # already loaded it; loading a fresh copy creates a second module object
     # and `isinstance` checks against ShareSnapshot cells would compare across
@@ -24193,7 +24276,7 @@ def _share_render_and_emit(snap, args) -> None:
 
     utc_date = snap.generated_at.astimezone(dt.timezone.utc).strftime("%Y-%m-%d")
     kind, value = _resolve_destination(args, cmd=snap.cmd, generated_at_utc_date=utc_date)
-    _emit(rendered, kind=kind, value=value, fmt=args.format)
+    _emit(rendered, kind=kind, value=value)
 
     if args.open_after_write and kind == "file":
         _share_open_file(pathlib.Path(value))

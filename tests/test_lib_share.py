@@ -973,14 +973,14 @@ def test_resolve_destination_explicit_dash_means_stdout():
 
 
 def test_emit_stdout_writes_content(capsys):
-    _cctally._emit("hello\n", kind="stdout", value=None, fmt="md")
+    _cctally._emit("hello\n", kind="stdout", value=None)
     captured = capsys.readouterr()
     assert captured.out == "hello\n"
 
 
 def test_emit_file_writes_path_and_logs_to_stderr(tmp_path, capsys):
     target = tmp_path / "out.html"
-    _cctally._emit("<html>", kind="file", value=str(target), fmt="html")
+    _cctally._emit("<html>", kind="file", value=str(target))
     assert target.read_text() == "<html>"
     captured = capsys.readouterr()
     assert str(target) in captured.err
@@ -1013,3 +1013,53 @@ def test_share_render_and_emit_html_writes_file(tmp_path, monkeypatch, capsys):
     assert len(files) == 1
     content = files[0].read_text()
     assert snap.title in content
+
+
+def test_share_render_and_emit_scrubs_project_labels(tmp_path, monkeypatch, capsys):
+    """Privacy regression: wrapper-level scrub must fire when reveal_projects=False.
+
+    Bypass-scrub regressions (e.g., refactoring _share_render_and_emit and
+    accidentally dropping the _scrub call) would not surface in the existing
+    md/html-routing tests because the minimal snapshot has no project cells.
+    Any future refactor that drops or short-circuits the scrub step must fail
+    here — original project name leaks into stdout.
+    """
+    snap = ShareSnapshot(
+        cmd="project",
+        title="Per-project",
+        subtitle=None,
+        period=PeriodSpec(
+            start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 5, 9, tzinfo=timezone.utc),
+            display_tz="UTC",
+            label="May 1 -> May 9 (UTC)",
+        ),
+        columns=(
+            ColumnSpec(key="project", label="Project", align="left"),
+            ColumnSpec(key="cost", label="$ Cost", align="right"),
+        ),
+        rows=(
+            Row(cells={
+                "project": ProjectCell("acme-secret-project"),
+                "cost": MoneyCell(120.0),
+            }),
+        ),
+        chart=None,
+        totals=(),
+        notes=(),
+        generated_at=datetime(2026, 5, 9, 12, tzinfo=timezone.utc),
+        version="1.4.0",
+    )
+    args = type("A", (), {
+        "format": "md", "theme": "light", "no_branding": False,
+        "reveal_projects": False,  # The chokepoint MUST scrub.
+        "output": None, "copy": False, "open_after_write": False,
+    })()
+    _cctally._share_render_and_emit(snap, args)
+    captured = capsys.readouterr()
+    assert "acme-secret-project" not in captured.out, (
+        "wrapper bypassed _scrub: original project name leaked to output"
+    )
+    assert "project-1" in captured.out, (
+        "wrapper rendered without scrub-replacement label"
+    )
