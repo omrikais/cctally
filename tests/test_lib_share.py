@@ -1437,6 +1437,170 @@ def test_share_validate_args_accepts_open_with_file_output():
     _cctally._share_validate_args(args)
 
 
+def test_report_builder_renders_none_metrics_as_em_dash():
+    """Missing weeklyPercent / weeklyCostUSD / dollarsPerPercent must render
+    as TextCell("—") in the share table — parity with terminal's em-dash
+    convention. Coercing None to 0.0 conflates missing data with genuine zero.
+    """
+    rows = [
+        # Week with all metrics present.
+        {"weekStartDate": "2026-04-13", "weeklyPercent": 65.2,
+         "weeklyCostUSD": 35.40, "dollarsPerPercent": 0.54},
+        # Week with NO usage snapshot — all metrics None.
+        {"weekStartDate": "2026-04-20", "weeklyPercent": None,
+         "weeklyCostUSD": None, "dollarsPerPercent": None},
+        # Week with cost recorded but no usage snapshot — used_pct/dpp None.
+        {"weekStartDate": "2026-04-27", "weeklyPercent": None,
+         "weeklyCostUSD": 12.50, "dollarsPerPercent": None},
+    ]
+    snap = _cctally._build_report_snapshot(
+        rows,
+        period_start=datetime(2026, 4, 13, tzinfo=timezone.utc),
+        period_end=datetime(2026, 5, 4, tzinfo=timezone.utc),
+        display_tz="UTC",
+        version="9.9.9",
+        theme="light",
+        reveal_projects=False,
+    )
+    assert len(snap.rows) == 3
+    # Row 0: all metrics present.
+    r0 = snap.rows[0]
+    assert isinstance(r0.cells["used"], _lib_share.PercentCell)
+    assert isinstance(r0.cells["cost"], _lib_share.MoneyCell)
+    assert isinstance(r0.cells["dpp"], _lib_share.MoneyCell)
+    # Row 1: all None → em-dash on every metric column.
+    r1 = snap.rows[1]
+    for col in ("used", "cost", "dpp"):
+        assert isinstance(r1.cells[col], _lib_share.TextCell), col
+        assert r1.cells[col].text == "—"
+    # Row 2: cost present, others None.
+    r2 = snap.rows[2]
+    assert isinstance(r2.cells["cost"], _lib_share.MoneyCell)
+    assert isinstance(r2.cells["used"], _lib_share.TextCell)
+    assert isinstance(r2.cells["dpp"], _lib_share.TextCell)
+
+
+def test_report_builder_skips_none_dpp_from_chart_and_avg():
+    """Chart points with None dpp must be skipped, not rendered as 0.
+
+    Otherwise the line chart drops to 0 at that point (visually misleading)
+    and the avg_dpp is divided by an inflated count. Verify both: chart
+    has the correct number of points AND the Avg total averages over only
+    present samples.
+    """
+    rows = [
+        {"weekStartDate": f"2026-04-{day:02d}",
+         "weeklyPercent": 50.0, "weeklyCostUSD": 10.0, "dollarsPerPercent": 0.20}
+        for day in (6, 13, 20, 27)
+    ]
+    # Inject a None-dpp week in the middle.
+    rows[2]["dollarsPerPercent"] = None
+    rows[2]["weeklyCostUSD"] = None
+    rows[2]["weeklyPercent"] = None
+    snap = _cctally._build_report_snapshot(
+        rows,
+        period_start=datetime(2026, 4, 6, tzinfo=timezone.utc),
+        period_end=datetime(2026, 5, 4, tzinfo=timezone.utc),
+        display_tz="UTC", version="9.9.9", theme="light",
+        reveal_projects=False,
+    )
+    # Chart has 3 points (skipped the None middle row).
+    assert snap.chart is not None
+    assert len(snap.chart.points) == 3
+    # Avg label: "Avg $/%" totalled over the 3 present samples = 0.20.
+    avg = next(t for t in snap.totals if t.label == "Avg $/%")
+    assert avg.value == "$0.20"
+
+
+def test_weekly_builder_renders_none_used_pct_as_em_dash():
+    """Weekly --breakdown share table must em-dash missing overlay used_pct.
+
+    `BucketUsage.cost_usd` is genuinely 0 when there are no entries (not
+    missing), so cost cells stay MoneyCell. Only the overlay-provided
+    `used_pct` carries the missing-vs-zero distinction.
+    """
+    BucketUsage = _cctally.BucketUsage
+    buckets = [
+        BucketUsage(
+            bucket="2026-04-13", input_tokens=0, output_tokens=0,
+            cache_creation_tokens=0, cache_read_tokens=0, total_tokens=0,
+            cost_usd=10.0, models=["m"], model_breakdowns=[],
+        ),
+        BucketUsage(
+            bucket="2026-04-20", input_tokens=0, output_tokens=0,
+            cache_creation_tokens=0, cache_read_tokens=0, total_tokens=0,
+            cost_usd=12.0, models=["m"], model_breakdowns=[],
+        ),
+    ]
+    overlay = [(50.0, 0.20), (None, None)]  # second week missing snapshot
+    snap = _cctally._build_weekly_snapshot(
+        buckets, overlay,
+        period_start=datetime(2026, 4, 13, tzinfo=timezone.utc),
+        period_end=datetime(2026, 4, 27, tzinfo=timezone.utc),
+        display_tz="UTC", version="9.9.9", theme="light",
+        reveal_projects=False, breakdown_model=False,
+    )
+    assert isinstance(snap.rows[0].cells["used"], _lib_share.PercentCell)
+    assert isinstance(snap.rows[1].cells["used"], _lib_share.TextCell)
+    assert snap.rows[1].cells["used"].text == "—"
+    # Cost cell stays MoneyCell (0 cost is real, not missing).
+    assert isinstance(snap.rows[1].cells["cost"], _lib_share.MoneyCell)
+
+
+def test_project_builder_renders_none_attributed_pct_as_em_dash():
+    """Project share table must em-dash missing attributed_pct."""
+    ProjectKey = _cctally.ProjectKey
+    rows = [
+        {"key": ProjectKey(display_key="alpha", bucket_path="/x/alpha", git_root=None),
+         "cost_usd": 0.05, "attributed_pct": 12.5, "sessions": {"s1"}},
+        {"key": ProjectKey(display_key="beta", bucket_path="/x/beta", git_root=None),
+         "cost_usd": 0.03, "attributed_pct": None, "sessions": {"s2"}},
+    ]
+    snap = _cctally._build_project_snapshot(
+        rows,
+        period_start=datetime(2026, 5, 4, tzinfo=timezone.utc),
+        period_end=datetime(2026, 5, 11, tzinfo=timezone.utc),
+        display_tz="UTC", version="9.9.9", theme="light", reveal_projects=True,
+    )
+    # Cost-desc default: alpha first, beta second.
+    assert isinstance(snap.rows[0].cells["used"], _lib_share.PercentCell)
+    assert isinstance(snap.rows[1].cells["used"], _lib_share.TextCell)
+    assert snap.rows[1].cells["used"].text == "—"
+
+
+def test_project_builder_preserves_caller_order_for_table():
+    """`_build_project_snapshot` must not re-sort the table rows.
+
+    Regression: prior version sorted-by-cost-desc internally, ignoring
+    `--sort name` / `--order asc` from the caller. Chart points stay
+    cost-sorted (anonymization rank stability) — verified separately.
+    """
+    ProjectKey = _cctally.ProjectKey
+    # Caller order: alphabetical asc (alpha, beta, gamma) — does NOT match
+    # cost-desc order (gamma=$5, beta=$3, alpha=$1).
+    rows = [
+        {"key": ProjectKey(display_key="alpha", bucket_path="/x/alpha", git_root=None),
+         "cost_usd": 1.0, "attributed_pct": 10.0, "sessions": {"s1"}},
+        {"key": ProjectKey(display_key="beta", bucket_path="/x/beta", git_root=None),
+         "cost_usd": 3.0, "attributed_pct": 30.0, "sessions": {"s2"}},
+        {"key": ProjectKey(display_key="gamma", bucket_path="/x/gamma", git_root=None),
+         "cost_usd": 5.0, "attributed_pct": 50.0, "sessions": {"s3"}},
+    ]
+    snap = _cctally._build_project_snapshot(
+        rows,
+        period_start=datetime(2026, 5, 4, tzinfo=timezone.utc),
+        period_end=datetime(2026, 5, 11, tzinfo=timezone.utc),
+        display_tz="UTC", version="9.9.9", theme="light", reveal_projects=True,
+    )
+    # Table rows preserve caller (alphabetical asc) order.
+    table_labels = [r.cells["project"].label for r in snap.rows]
+    assert table_labels == ["alpha", "beta", "gamma"]
+    # Chart points are cost-desc (gamma > beta > alpha) — anonymization
+    # rank invariant. project_label is REAL pre-scrub.
+    chart_labels = [p.project_label for p in snap.chart.points]
+    assert chart_labels == ["gamma", "beta", "alpha"]
+
+
 def test_copy_falls_back_when_no_clipboard_tool(monkeypatch):
     """If no pbcopy/xclip/clip on PATH, --copy must error clearly.
 

@@ -18314,11 +18314,14 @@ def cmd_report(args: argparse.Namespace) -> int:
                 # Anchor the period_label on the current subscription
                 # week so the artifact's subtitle is meaningful (the
                 # week the report WOULD describe if data existed).
-                # internal fallback: host-local intentional
-                local_tz = dt.datetime.now().astimezone().tzinfo
-                ws_d, we_d = compute_week_bounds(
-                    dt.datetime.now().astimezone(tz), week_start_name
-                )
+                # `_command_as_of()` honors CCTALLY_AS_OF — keeps the
+                # period_label coherent with `generated_at` (which goes
+                # through `_share_now_utc` from the same env hook) so
+                # fixture goldens don't drift when the harness host's
+                # wall-clock day rolls past CCTALLY_AS_OF.
+                now_local = _command_as_of().astimezone(tz)
+                local_tz = now_local.tzinfo
+                ws_d, we_d = compute_week_bounds(now_local, week_start_name)
                 ws_dt = dt.datetime.combine(
                     ws_d, dt.time.min, tzinfo=local_tz
                 )
@@ -24918,20 +24921,38 @@ def _build_report_snapshot(
                 week_label = wsd
         else:
             week_label = "—"
-        used_pct = r.get("weeklyPercent") or 0.0
-        cost_usd = r.get("weeklyCostUSD") or 0.0
-        dpp = r.get("dollarsPerPercent") or 0.0
+        # Preserve None vs 0.0 distinction (parity with terminal/JSON).
+        # Terminal _render_weekly_table renders missing values as "—";
+        # share artifact follows the same convention. Coercing None to
+        # 0.0 would render `$0.00` / `0.0%` — indistinguishable from a
+        # genuine zero, and would skew the avg / chart.
+        used_pct_raw = r.get("weeklyPercent")
+        cost_raw = r.get("weeklyCostUSD")
+        dpp_raw = r.get("dollarsPerPercent")
         snap_rows.append(_lib_share.Row(cells={
             "week": _lib_share.TextCell(week_label),
-            "used": _lib_share.PercentCell(float(used_pct)),
-            "cost": _lib_share.MoneyCell(float(cost_usd)),
-            "dpp":  _lib_share.MoneyCell(float(dpp)),
+            "used": (
+                _lib_share.PercentCell(float(used_pct_raw))
+                if used_pct_raw is not None else _lib_share.TextCell("—")
+            ),
+            "cost": (
+                _lib_share.MoneyCell(float(cost_raw))
+                if cost_raw is not None else _lib_share.TextCell("—")
+            ),
+            "dpp": (
+                _lib_share.MoneyCell(float(dpp_raw))
+                if dpp_raw is not None else _lib_share.TextCell("—")
+            ),
         }))
-        chart_pts.append(_lib_share.ChartPoint(
-            x_label=week_label,
-            x_value=float(i),
-            y_value=float(dpp),
-        ))
+        # Skip chart points for weeks with no $/% sample — the polyline
+        # connects across the gap rather than dropping to 0, which would
+        # misrepresent missing data as a crash to zero.
+        if dpp_raw is not None:
+            chart_pts.append(_lib_share.ChartPoint(
+                x_label=week_label,
+                x_value=float(i),
+                y_value=float(dpp_raw),
+            ))
     chart = (
         _lib_share.LineChart(points=tuple(chart_pts), y_label="$ / %")
         if len(chart_pts) >= 3 else None
@@ -25292,10 +25313,21 @@ def _build_weekly_snapshot(
             week_label = "—"
         cost_usd = float(getattr(r, "cost_usd", 0.0) or 0.0)
         total_tokens = int(getattr(r, "total_tokens", 0) or 0)
-        used_pct = overlay[i][0] if i < len(overlay) and overlay[i][0] is not None else 0.0
+        # `used_pct` is None when the week lacks a `weekly_usage_snapshots`
+        # row — render as em-dash to match terminal `_render_weekly_table`.
+        # Coercing to 0.0 would conflate "no snapshot recorded" with "0%
+        # used," same divergence the report builder fixes. cost_usd from
+        # session_entries is genuinely 0 when there are no entries (not
+        # missing data) so that path keeps MoneyCell(0.0).
+        used_pct_raw = (
+            overlay[i][0] if i < len(overlay) else None
+        )
         cells = {
             "week": _lib_share.TextCell(week_label),
-            "used": _lib_share.PercentCell(float(used_pct)),
+            "used": (
+                _lib_share.PercentCell(float(used_pct_raw))
+                if used_pct_raw is not None else _lib_share.TextCell("—")
+            ),
             "cost": _lib_share.MoneyCell(cost_usd),
             "tokens": _lib_share.TextCell(f"{total_tokens:,}"),
         }
@@ -25555,21 +25587,24 @@ def _build_project_snapshot(
       project label comes from `key.display_key`. The plan's `project`
       key does not exist on the actual `cmd_project` data shape.
     - `attributed_pct` may be `None` for projects whose contributing
-      weeks all lacked a `weekly_usage_snapshots` row; we render `0.0%`
-      in that case so the column stays aligned (matching the JSON path's
-      `null -> 0` rendering convention in the table renderer).
+      weeks all lacked a `weekly_usage_snapshots` row; the table renders
+      that as em-dash (parity with terminal `_render_project_table`).
     - Sessions is a `set`; the cell carries its `len(...)` as text.
 
     `HorizontalBarChart.cap=12` matches the plan; when more than 12
     projects exist, a note clarifies that the table includes all rows
     while the chart shows only the top 12 by cost.
 
-    Caller MUST pass `rows` already sorted in the desired order (cmd_project
-    honors `--sort` / `--order` upstream). The builder re-sorts internally
-    by descending cost so the chart's HBar bars rank consistently with the
-    anonymization-mapping (`_build_anon_mapping` also sorts by descending
-    cost) — keeping `project-1` aligned with the highest-cost bar in the
-    chart even when the user asked for `--sort name`.
+    Caller MUST pass `rows` already sorted in the desired order
+    (cmd_project honors `--sort` / `--order` upstream). The builder
+    preserves caller order for the table — terminal / JSON / share
+    artifacts all show the same row ordering. Internally the builder
+    ALSO computes a descending-cost copy that drives the HBar chart
+    and the basename-disambiguation rank (both must match
+    `_build_anon_mapping`'s descending-cost sort so `project-1` stays
+    glued to the highest-cost bar regardless of `--sort`). Anonymization
+    is row-identity based (`id(r)` → augmented label), not position
+    based, so the table sees the same disambiguated label as the chart.
 
     `theme` and `reveal_projects` flow into the subtitle directly so the
     builder owns the canonical subtitle shape — no post-build re-stamp
@@ -25583,39 +25618,63 @@ def _build_project_snapshot(
         _lib_share.ColumnSpec(key="used", label="% Used", align="right"),
         _lib_share.ColumnSpec(key="sessions", label="Sessions", align="right"),
     )
-    # Sort by descending cost so the snapshot's chart-order matches the
-    # `_build_anon_mapping` sort key (also descending cost). This keeps
-    # `project-1` glued to the highest-cost bar regardless of the user's
-    # `--sort` choice for the table.
-    sorted_rows = sorted(
+    # Two orderings — same rows, different consumers:
+    #
+    # * `rows` (caller order) drives the table. `cmd_project` upstream
+    #   has already applied `--sort` / `--order`, so the share artifact's
+    #   table matches terminal / JSON output for any of `--sort cost`,
+    #   `--sort name`, `--sort sessions` × `--order asc|desc`.
+    #
+    # * `cost_sorted_rows` (descending cost) drives the HBar chart and
+    #   the basename-disambiguation rank — both must align with
+    #   `_build_anon_mapping`'s descending-cost sort so `project-1` stays
+    #   glued to the highest-cost bar regardless of `--sort` choice.
+    cost_sorted_rows = sorted(
         rows, key=lambda r: -float(r.get("cost_usd") or 0.0)
     )
     # Basename-collision disambiguation: mirrors `_render_project_table`'s
-    # terminal logic. Keyed on post-sort indices so callers can look up by
-    # enumerate(sorted_rows). Without this, two `app` projects under
+    # terminal logic. Computed on cost_sorted_rows; mapped back to row
+    # identity so the caller-ordered table picks up the same augmented
+    # label as the chart (anonymization is row-identity based, not
+    # position based). Without disambiguation, two `app` projects under
     # different parent dirs collapse to ONE anonymous `project-N` after
     # scrub — losing both privacy uniqueness and chart rank meaning.
-    augmented = _project_disambiguate_labels(sorted_rows)
+    augmented_by_index = _project_disambiguate_labels(cost_sorted_rows)
+    augmented_by_row_id: dict[int, str] = {
+        id(cost_sorted_rows[idx]): label
+        for idx, label in augmented_by_index.items()
+    }
+
+    def _proj_label_for(r: dict) -> str:
+        bare = getattr(r.get("key"), "display_key", None) or "(unknown)"
+        return augmented_by_row_id.get(id(r), bare)
+
+    # Table rows in CALLER order (--sort / --order parity).
     snap_rows: list = []
-    chart_pts: list = []
-    for idx, r in enumerate(sorted_rows):
-        key = r.get("key")
-        bare_label = (
-            getattr(key, "display_key", None)
-            or "(unknown)"
-        )
-        proj_label = augmented.get(idx, bare_label)
+    for r in rows:
+        proj_label = _proj_label_for(r)
         cost = float(r.get("cost_usd") or 0.0)
         attr_pct = r.get("attributed_pct")
-        used_pct = float(attr_pct) if attr_pct is not None else 0.0
         sessions = r.get("sessions")
         sessions_count = len(sessions) if sessions is not None else 0
         snap_rows.append(_lib_share.Row(cells={
             "project": _lib_share.ProjectCell(proj_label),
             "cost": _lib_share.MoneyCell(cost),
-            "used": _lib_share.PercentCell(used_pct),
+            # Preserve None vs 0.0 — terminal renders missing as em-dash.
+            # Coercing None -> 0.0 would conflate "no usage snapshot for
+            # any week this project touched" with "0% attributed."
+            "used": (
+                _lib_share.PercentCell(float(attr_pct))
+                if attr_pct is not None else _lib_share.TextCell("—")
+            ),
             "sessions": _lib_share.TextCell(str(sessions_count)),
         }))
+
+    # Chart points in COST-SORTED order (HBar shows top-N by cost).
+    chart_pts: list = []
+    for r in cost_sorted_rows:
+        proj_label = _proj_label_for(r)
+        cost = float(r.get("cost_usd") or 0.0)
         chart_pts.append(_lib_share.ChartPoint(
             x_label=proj_label,
             x_value=cost,
@@ -25638,7 +25697,7 @@ def _build_project_snapshot(
         _lib_share.Totalled(label="Sum", value=f"${sum_cost:,.2f}"),
         _lib_share.Totalled(label="Projects", value=str(len(chart_pts))),
     )
-    if sorted_rows:
+    if rows:
         title = (
             f"Per-project usage — {period_start.strftime('%b %d')} → "
             f"{period_end.strftime('%b %d')}"
