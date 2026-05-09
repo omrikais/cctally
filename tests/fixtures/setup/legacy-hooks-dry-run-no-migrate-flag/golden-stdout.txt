@@ -1,0 +1,9 @@
+Would symlink 12 files to /FAKE/.local/bin/ (0 already correct, 12 new)
+Would add 3 hook entries to /FAKE/.claude/settings.json:
+  hooks.PostToolBatch[*] += { matcher: "*", command: "/REPO/bin/cctally hook-tick" }
+  hooks.Stop[*] += { matcher: "", command: "/REPO/bin/cctally hook-tick" }
+  hooks.SubagentStop[*] += { matcher: "", command: "/REPO/bin/cctally hook-tick" }
+Would not modify ~/.claude/statusline-command.sh
+Would not delete any data
+
+Re-run without --dry-run to apply.

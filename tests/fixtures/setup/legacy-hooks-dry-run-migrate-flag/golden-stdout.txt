@@ -3,7 +3,6 @@ Would add 3 hook entries to /FAKE/.claude/settings.json:
   hooks.PostToolBatch[*] += { matcher: "*", command: "/REPO/bin/cctally hook-tick" }
   hooks.Stop[*] += { matcher: "", command: "/REPO/bin/cctally hook-tick" }
   hooks.SubagentStop[*] += { matcher: "", command: "/REPO/bin/cctally hook-tick" }
-Would prompt for migration; pass --migrate-legacy-hooks to preview the migration plan.
 Would migrate legacy bespoke hooks:
   Would remove 3 entries from settings.json:
     hooks.Stop          ← python3 ~/.claude/hooks/record-usage-stop.py

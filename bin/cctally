@@ -22473,7 +22473,26 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
             f"  hooks.{ev}[*] += {{ matcher: {matcher}, "
             f"command: \"{quoted} hook-tick\" }}"
         )
-    if detection["detected"]:
+    # Spec §2 mode×flag matrix — three distinct dry-run rendering paths
+    # when legacy is detected:
+    #   --dry-run --no-migrate-legacy-hooks → migration block omitted entirely
+    #   --dry-run --migrate-legacy-hooks (or --yes) → full migration plan
+    #   --dry-run (no migrate flag) → full plan prefixed with the
+    #       "would prompt; pass --migrate-legacy-hooks…" note
+    # `--yes` is treated as equivalent to `--migrate-legacy-hooks` to
+    # match `_setup_decide_legacy_migration` (bin/cctally:22094-22101).
+    no_migrate_flag = bool(getattr(args, "no_migrate_legacy_hooks", False))
+    migrate_flag = bool(getattr(args, "migrate_legacy_hooks", False))
+    yes_flag = bool(getattr(args, "yes", False))
+    show_full_migration_plan = migrate_flag or yes_flag
+    show_migration_block = detection["detected"] and not no_migrate_flag
+    if show_migration_block:
+        if not show_full_migration_plan:
+            # No-flag dry-run: prefix the block with the would-prompt note.
+            out.append(
+                "Would prompt for migration; pass --migrate-legacy-hooks to "
+                "preview the migration plan."
+            )
         out.append("Would migrate legacy bespoke hooks:")
         if detection["settings_entries"]:
             out.append(
@@ -22496,6 +22515,21 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
     out.append("Re-run without --dry-run to apply.")
 
     if getattr(args, "json", False):
+        # Decision label mirrors `_setup_decide_legacy_migration`'s output:
+        # `migrate` (full plan / explicit opt-in or --yes), `skip`
+        # (--no-migrate-legacy-hooks), or `prompt` (no flag — install would
+        # prompt the user). When no legacy is detected the label is
+        # `not_detected` so consumers can distinguish "no-op" from
+        # "explicit skip."
+        if not detection["detected"]:
+            decision = "not_detected"
+        elif no_migrate_flag:
+            decision = "skip"
+        elif show_full_migration_plan:
+            decision = "migrate"
+        else:
+            decision = "prompt"
+        legacy_path = _setup_detect_legacy_snippet()
         envelope = {
             "schema_version": 1,
             "mode": "dry-run",
@@ -22517,13 +22551,38 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
                 ],
                 "settings_path": str(CLAUDE_SETTINGS_PATH),
             },
+            # Sibling parity with `_setup_status` and `_setup_install`
+            # JSON envelopes (`legacy.bespoke_hooks` shape). Lets the same
+            # consumer query bespoke-hook state from any of the three
+            # commands uniformly.
+            "legacy": {
+                "statusline_snippet": str(legacy_path[0]) if legacy_path else None,
+                "bespoke_hooks": {
+                    "detected": detection["detected"],
+                    "settings_entries": detection["settings_entries"],
+                    "files": detection["files"],
+                },
+            },
+            # Flag-aware preview block. `decision` records what the
+            # install path would do; `would_remove_entries` /
+            # `would_move_files` are the rendered plan (empty when
+            # decision == "skip" or "not_detected").
             "migration_preview": {
                 "detected": detection["detected"],
-                "would_remove_entries": [
-                    {"event": e["event"], "command": e["command"]}
-                    for e in detection["settings_entries"]
-                ],
-                "would_move_files": list(detection["files"]),
+                "decision": decision,
+                "would_remove_entries": (
+                    []
+                    if decision in ("skip", "not_detected")
+                    else [
+                        {"event": e["event"], "command": e["command"]}
+                        for e in detection["settings_entries"]
+                    ]
+                ),
+                "would_move_files": (
+                    []
+                    if decision in ("skip", "not_detected")
+                    else list(detection["files"])
+                ),
             },
             "exit_code": 0,
         }

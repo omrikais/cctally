@@ -1,0 +1,1 @@
+setup --dry-run --no-migrate-legacy-hooks
