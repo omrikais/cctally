@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "mode": "install",
+  "result": "warn",
+  "symlinks": {
+    "created": 12,
+    "already": 0,
+    "replaced": 0,
+    "total": 12,
+    "destination": "/FAKE/.local/bin"
+  },
+  "hooks": {
+    "events_added": [
+      "PostToolBatch",
+      "Stop",
+      "SubagentStop"
+    ],
+    "settings_path": "/FAKE/.claude/settings.json"
+  },
+  "auth": {
+    "oauth_token_present": false
+  },
+  "path_includes_local_bin": true,
+  "legacy": {
+    "statusline_snippet_path": null,
+    "bespoke_hooks": {
+      "detected": true,
+      "settings_entries": [
+        {
+          "event": "Stop",
+          "command": "python3 ~/.claude/hooks/record-usage-stop.py"
+        },
+        {
+          "event": "SubagentStart",
+          "command": "python3 ~/.claude/hooks/usage-poller-start.py"
+        },
+        {
+          "event": "SubagentStop",
+          "command": "python3 ~/.claude/hooks/usage-poller-stop.py"
+        }
+      ],
+      "files": [
+        "~/.claude/hooks/record-usage-stop.py",
+        "~/.claude/hooks/usage-poller-start.py",
+        "~/.claude/hooks/usage-poller-stop.py",
+        "~/.claude/hooks/usage-poller.py"
+      ]
+    }
+  },
+  "migration": {
+    "performed": false,
+    "reason": "no_migrate_flag"
+  },
+  "bootstrap": {
+    "session_cache_rows": 0,
+    "oauth_status": null
+  },
+  "warnings_count": 2,
+  "exit_code": 0
+}

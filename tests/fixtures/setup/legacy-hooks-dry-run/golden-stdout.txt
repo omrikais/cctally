@@ -1,0 +1,17 @@
+Would symlink 12 files to /FAKE/.local/bin/ (0 already correct, 12 new)
+Would add 3 hook entries to /FAKE/.claude/settings.json:
+  hooks.PostToolBatch[*] += { matcher: "*", command: "/REPO/bin/cctally hook-tick" }
+  hooks.Stop[*] += { matcher: "", command: "/REPO/bin/cctally hook-tick" }
+  hooks.SubagentStop[*] += { matcher: "", command: "/REPO/bin/cctally hook-tick" }
+Would migrate legacy bespoke hooks:
+  Would remove 3 entries from settings.json:
+    hooks.Stop          ← python3 ~/.claude/hooks/record-usage-stop.py
+    hooks.SubagentStart ← python3 ~/.claude/hooks/usage-poller-start.py
+    hooks.SubagentStop  ← python3 ~/.claude/hooks/usage-poller-stop.py
+  Would move 4 files to ~/.claude/cctally-legacy-hook-backup-<UTC ts>/:
+    record-usage-stop.py, usage-poller-start.py, usage-poller-stop.py, usage-poller.py
+  Would attempt cleanup of /tmp/claude-usage-poller.{pid,count}
+Would not modify ~/.claude/statusline-command.sh
+Would not delete any data
+
+Re-run without --dry-run to apply.

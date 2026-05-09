@@ -45,6 +45,18 @@ you don't have to do anything; it keeps working. To switch to the new
 hook-based path, run `cctally setup`. The legacy snippet will be detected
 and you'll be told it's safe to remove (we don't touch your file).
 
+## Migrating from an earlier install pattern
+
+If you previously wired cctally into Claude Code via hand-installed scripts
+under `~/.claude/hooks/` (e.g. `record-usage-stop.py`,
+`usage-poller-{start,stop}.py`, `usage-poller.py`), `cctally setup` will
+detect them and offer to migrate: unwire the matching settings.json
+entries, move the files to a timestamped backup directory under
+`~/.claude/`, and best-effort stop any active background daemon. See
+[Migrating from a prior install pattern](commands/setup.md#migrating-from-a-prior-install-pattern)
+for the details and the new `--migrate-legacy-hooks` /
+`--no-migrate-legacy-hooks` flags.
+
 ## Requirements
 
 - Python 3.13+ (stdlib only, no `pip install` needed).

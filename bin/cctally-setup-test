@@ -145,10 +145,27 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
 
     local cmd; cmd=$(cat "$dir/cmd.txt")
     local raw
-    # shellcheck disable=SC2086
-    raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh \
-          PATH="${path_pre}$fake/.fake-bin:${py3_dir}:/usr/bin:/bin" \
-          "$launcher" $cmd 2>&1; echo "EXIT=$?")
+    # Forward CCTALLY_AS_OF (when set, e.g. by an `input.env` file or the
+    # ambient shell) so scenarios that exercise wall-clock-derived names
+    # (e.g. the timestamped `cctally-legacy-hook-backup-<UTC ts>/` dir)
+    # can produce deterministic goldens. The `${VAR:-}` form keeps every
+    # existing scenario unaffected when the var is unset.
+    if [ -f "$dir/stdin.txt" ]; then
+        # Optional sibling `stdin.txt`: feeds its bytes verbatim to the
+        # CLI's stdin, enabling fixture coverage of TTY-prompt paths
+        # (e.g. legacy-hook migration `[Y/n]`). Absent file = no
+        # behavior change — backward-compatible for every existing
+        # scenario.
+        # shellcheck disable=SC2086
+        raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_AS_OF="${CCTALLY_AS_OF:-}" \
+              PATH="${path_pre}$fake/.fake-bin:${py3_dir}:/usr/bin:/bin" \
+              "$launcher" $cmd < "$dir/stdin.txt" 2>&1; echo "EXIT=$?")
+    else
+        # shellcheck disable=SC2086
+        raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_AS_OF="${CCTALLY_AS_OF:-}" \
+              PATH="${path_pre}$fake/.fake-bin:${py3_dir}:/usr/bin:/bin" \
+              "$launcher" $cmd 2>&1; echo "EXIT=$?")
+    fi
     local rc=${raw##*EXIT=}
     rc=${rc%$'\n'}
     local out=${raw%EXIT=*}
@@ -173,7 +190,8 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
             -e 's/\(([0-9]+) newly created\)/(N newly created)/g' \
             -e 's/[0-9]+\.[0-9]+ (B|KB|MB|GB|TB)/SIZE/g' \
             -e 's/\(([0-9]+) new entries\)/(N new entries)/g' \
-            -e 's/Last fetch     [0-9]+s ago/Last fetch     Ns ago/g')
+            -e 's/Last fetch     [0-9]+s ago/Last fetch     Ns ago/g' \
+            -e 's/cctally-legacy-hook-backup-[0-9]{8}-[0-9]{6}/cctally-legacy-hook-backup-TIMESTAMP/g')
 
     local fail_local=0
 
@@ -205,9 +223,9 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
         if [ -f "$fake/.claude/settings.json" ]; then
             local actual_settings
             if [ -n "$repo_scratch" ]; then
-                actual_settings=$(sed -e "s|$repo_scratch|/REPO|g" -e "s|$REPO_ROOT|/REPO|g" "$fake/.claude/settings.json")
+                actual_settings=$(sed -E -e "s|$repo_scratch|/REPO|g" -e "s|$REPO_ROOT|/REPO|g" -e 's|cctally-legacy-hook-backup-[0-9]{8}-[0-9]{6}|cctally-legacy-hook-backup-TIMESTAMP|g' "$fake/.claude/settings.json")
             else
-                actual_settings=$(sed "s|$REPO_ROOT|/REPO|g" "$fake/.claude/settings.json")
+                actual_settings=$(sed -E -e "s|$REPO_ROOT|/REPO|g" -e 's|cctally-legacy-hook-backup-[0-9]{8}-[0-9]{6}|cctally-legacy-hook-backup-TIMESTAMP|g' "$fake/.claude/settings.json")
             fi
             if ! diff -u "$dir/golden-settings.json" <(printf '%s\n' "$actual_settings") >/dev/null; then
                 diff -u "$dir/golden-settings.json" <(printf '%s\n' "$actual_settings") | head -50

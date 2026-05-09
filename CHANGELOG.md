@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `cctally setup` auto-detects hooks from prior install patterns under `~/.claude/hooks/` (`record-usage-stop.py`, `usage-poller-{start,stop}.py`, `usage-poller.py`) and offers to migrate them: unwires the matching `settings.json` entries, moves the `.py` files to a timestamped `~/.claude/cctally-legacy-hook-backup-<UTC ts>/` directory (reversible — files moved, not deleted), and best-effort stops any currently-running background daemon those hooks spawned. New flags `--migrate-legacy-hooks` / `--no-migrate-legacy-hooks` for non-interactive control (install-mode only; rejected with exit 2 against `--status` / `--uninstall`). `setup --status` reports the migration state in both text and JSON (`legacy.bespoke_hooks`); `setup --dry-run --migrate-legacy-hooks` previews without touching disk.
+
 ## [1.4.0] - 2026-05-09
 
 ### Added

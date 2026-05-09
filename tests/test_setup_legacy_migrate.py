@@ -514,3 +514,226 @@ class TestLegacyPromptDecision:
         # Only the final "invalid responses 3 times" warning — no per-attempt text.
         assert "Please answer y or n." not in captured.err
         assert "skipping migration" in captured.err
+
+
+def _e2e_install_args(**overrides):
+    """Default Namespace for `cmd_setup` install-mode entry; per-test overrides."""
+    base = dict(
+        status=False,
+        uninstall=False,
+        dry_run=False,
+        purge=False,
+        yes=False,
+        json=True,
+        migrate_legacy_hooks=False,
+        no_migrate_legacy_hooks=False,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def _e2e_seed_legacy_state(home: pathlib.Path) -> None:
+    """Build the on-disk pre-state required for a legacy-hook migration.
+
+    Drops the four canonical .py files into ``~/.claude/hooks/`` and writes a
+    settings.json that wires all three event entries. Mirrors the bash harness
+    fixture for ``legacy-hooks-flag-migrate`` so the in-process e2e exercises
+    the same shape of state production hits.
+    """
+    hooks_dir = home / ".claude" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "record-usage-stop.py",
+        "usage-poller-start.py",
+        "usage-poller-stop.py",
+        "usage-poller.py",
+    ):
+        (hooks_dir / name).write_text(
+            "#!/usr/bin/env python3\nimport sys; sys.exit(0)\n"
+        )
+    (home / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "Stop": [{
+                "matcher": "*",
+                "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/record-usage-stop.py"}],
+            }],
+            "SubagentStart": [{
+                "matcher": "*",
+                "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/usage-poller-start.py"}],
+            }],
+            "SubagentStop": [{
+                "matcher": "*",
+                "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/usage-poller-stop.py"}],
+            }],
+        },
+    }))
+    (home / ".local" / "bin").mkdir(parents=True, exist_ok=True)
+
+
+def _e2e_pin_paths(ns, monkeypatch, home: pathlib.Path) -> None:
+    """Redirect every module-level path constant the install path touches.
+
+    `redirect_paths` from conftest covers APP_DIR / cache / config / log paths.
+    The legacy-migration code path also reads ``CLAUDE_SETTINGS_PATH``
+    (module-level constant captured at script load), the canonical legacy
+    hooks directory, and the active-poller sentinel files — those need
+    explicit pinning since `monkeypatch.setenv("HOME", ...)` doesn't
+    rebind constants that already evaluated `pathlib.Path.home()`.
+
+    Subtlety: ``_load_claude_settings`` / ``_write_claude_settings_atomic``
+    / ``_backup_claude_settings`` capture ``CLAUDE_SETTINGS_PATH`` as a
+    default-arg at function-def time, so monkeypatching the constant alone
+    isn't enough — the call sites in ``_setup_install`` invoke them with
+    no args and hit the captured default. We replace the three callables
+    with pinned-path closures so every settings I/O lands in the fake HOME.
+
+    OAuth resolution is stubbed to None so the bootstrap path doesn't try
+    to hit the real keychain or talk to Anthropic during the test.
+    """
+    from conftest import redirect_paths
+    redirect_paths(ns, monkeypatch, home)
+    pinned_settings_path = home / ".claude" / "settings.json"
+    # Re-pin Claude-side constants that conftest's redirect_paths leaves alone
+    # (they belong to the install path, not the data layer).
+    monkeypatch.setitem(ns, "CLAUDE_SETTINGS_PATH", pinned_settings_path)
+    monkeypatch.setitem(ns, "_LEGACY_BESPOKE_HOOKS_DIR", home / ".claude" / "hooks")
+    # Replace the three settings-I/O helpers with pinned-path closures so
+    # the captured-default-arg pitfall doesn't leak the maintainer's real
+    # ~/.claude/settings.json into the test.
+    real_load = ns["_load_claude_settings"]
+    real_write = ns["_write_claude_settings_atomic"]
+    real_backup = ns["_backup_claude_settings"]
+    monkeypatch.setitem(
+        ns, "_load_claude_settings",
+        lambda path=pinned_settings_path: real_load(path),
+    )
+    monkeypatch.setitem(
+        ns, "_write_claude_settings_atomic",
+        lambda settings, path=pinned_settings_path: real_write(settings, path),
+    )
+    monkeypatch.setitem(
+        ns, "_backup_claude_settings",
+        lambda path=pinned_settings_path: real_backup(path),
+    )
+    # Stub OAuth so _setup_oauth_token_present returns False (no keychain
+    # reach + no real credentials file) — and the OAuth refresh branch in
+    # _setup_install is short-circuited via `if oauth:`.
+    monkeypatch.setitem(ns, "_resolve_oauth_token", lambda *a, **k: None)
+
+
+class TestLegacyMigrationE2EActivePoller:
+    """End-to-end install-mode invocation of the migration through `cmd_setup`.
+
+    Plan deviation note: the original Task 16 sketch invoked ``cctally`` as a
+    subprocess. That doesn't work because the migration helpers read
+    module-level ``pathlib.Path`` constants (``_LEGACY_POLLER_PID_FILE``,
+    ``_LEGACY_POLLER_COUNT_FILE``, ``CLAUDE_SETTINGS_PATH``) that are bound
+    at import time and have no env-var override. Subprocess invocation
+    would target ``/tmp/claude-usage-poller.pid`` and the maintainer's real
+    ``~/.claude/`` — non-isolated and unsafe. We instead drive ``cmd_setup``
+    in-process via the ``ns`` namespace fixture (same pattern Implementor 1-3
+    used) and ``monkeypatch.setitem`` the constants. This covers every
+    public surface of the e2e contract — JSON envelope shape, kill outcome,
+    PID-signaled field — short of process-boundary isolation, which the
+    bash harness already gives us through scratch HOMEs.
+    """
+
+    def test_setup_kills_active_poller(self, ns, tmp_path, monkeypatch):
+        """Spawn a real child, write its PID to the (test-isolated) sentinel,
+        run ``cctally setup --migrate-legacy-hooks --json``, and assert the
+        migration envelope reports ``sigterm-took`` (or ``sigkill-took`` on
+        the rare slow-reap path) and the process actually died via signal.
+        """
+        home = tmp_path / "home"
+        _e2e_seed_legacy_state(home)
+        _e2e_pin_paths(ns, monkeypatch, home)
+
+        proc = subprocess.Popen(["sleep", "30"])
+        # Reaper thread mirrors TestLegacyStopActivePoller.test_sigterm_kills_test_process —
+        # in production the daemon's parent is launchd; in pytest the proc is
+        # a direct child and the kernel pins its PID slot in zombie state
+        # without an active waiter, which would tip the helper into sigkill-took.
+        reaper = threading.Thread(target=proc.wait, daemon=True)
+        reaper.start()
+        try:
+            pid_file = tmp_path / "claude-usage-poller.pid"
+            count_file = tmp_path / "claude-usage-poller.count"
+            pid_file.write_text(str(proc.pid))
+            monkeypatch.setitem(ns, "_LEGACY_POLLER_PID_FILE", pid_file)
+            monkeypatch.setitem(ns, "_LEGACY_POLLER_COUNT_FILE", count_file)
+
+            buf = io.StringIO()
+            monkeypatch.setattr(sys, "stdout", buf)
+            rc = ns["cmd_setup"](_e2e_install_args(migrate_legacy_hooks=True))
+            output = buf.getvalue()
+            monkeypatch.setattr(sys, "stdout", sys.__stdout__)
+
+            assert rc == 0, f"setup exited {rc}; stdout: {output[:2000]}"
+            envelope = json.loads(output)
+            mig = envelope["migration"]
+            assert mig["performed"] is True
+            assert mig["active_poller_kill_outcome"] in {"sigterm-took", "sigkill-took"}
+            # pid_signaled is recorded when we attempted a signal (per spec §3
+            # and Implementor 4's round-2 fix).
+            assert mig["active_poller_pid_signaled"] == proc.pid
+            assert mig["settings_entries_removed"] == 3
+            # backup_dir was created and populated.
+            assert mig["backup_dir"] is not None
+            assert pathlib.Path(mig["backup_dir"]).exists()
+            # tmp sentinel was unlinked.
+            assert str(pid_file) in mig["tmp_files_unlinked"]
+            # And the process actually died via signal.
+            reaper.join(timeout=2)
+            assert proc.returncode in (-signal.SIGTERM, -signal.SIGKILL), (
+                f"expected SIGTERM/SIGKILL exit, got {proc.returncode}"
+            )
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
+
+    def test_setup_with_stale_pid_no_signal(self, ns, tmp_path, monkeypatch):
+        """Write a stale PID into the sentinel: the helper detects via
+        ``os.kill(pid, 0)`` that no process is alive at that PID, returns
+        ``stale-pid``, and the JSON envelope reflects ``pid_signaled: null``
+        (no signal was attempted). Mirrors the unit-level
+        ``TestLegacyStopActivePoller.test_stale_pid`` path but driven through
+        the install-mode entry point.
+        """
+        home = tmp_path / "home"
+        _e2e_seed_legacy_state(home)
+        _e2e_pin_paths(ns, monkeypatch, home)
+
+        # Recycle-PID: spawn-and-wait so the kernel releases the PID before
+        # we write it to the sentinel. (The aliveness probe is sub-ms after
+        # spawn, so flake risk on PID re-allocation is negligible.)
+        p = subprocess.Popen(["true"])
+        p.wait()
+        pid_file = tmp_path / "claude-usage-poller.pid"
+        count_file = tmp_path / "claude-usage-poller.count"
+        pid_file.write_text(str(p.pid))
+        monkeypatch.setitem(ns, "_LEGACY_POLLER_PID_FILE", pid_file)
+        monkeypatch.setitem(ns, "_LEGACY_POLLER_COUNT_FILE", count_file)
+
+        buf = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", buf)
+        rc = ns["cmd_setup"](_e2e_install_args(migrate_legacy_hooks=True))
+        output = buf.getvalue()
+        monkeypatch.setattr(sys, "stdout", sys.__stdout__)
+
+        assert rc == 0, f"setup exited {rc}; stdout: {output[:2000]}"
+        envelope = json.loads(output)
+        mig = envelope["migration"]
+        assert mig["performed"] is True
+        assert mig["active_poller_kill_outcome"] == "stale-pid"
+        # No signal attempted → null PID per Implementor 4's round-2 fix.
+        assert mig["active_poller_pid_signaled"] is None
+        # Sentinel unlinked even though no signal was sent.
+        assert str(pid_file) in mig["tmp_files_unlinked"]
+
+
+# Note: the argparse mutex (``--migrate-legacy-hooks`` +
+# ``--no-migrate-legacy-hooks``) is already covered end-to-end by
+# ``TestSetupArgparseMutex.test_mutex_rejects_both_migrate_flags`` above
+# (subprocess invocation, exit 2, stderr matches argparse's mutex
+# message). No new test added — keeping this one source of truth.

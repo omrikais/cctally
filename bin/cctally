@@ -22223,6 +22223,7 @@ def _setup_status(args: argparse.Namespace) -> int:
     throttle_age = _hook_tick_throttle_age_seconds()
     activity = _setup_recent_log_stats()
     legacy = _setup_detect_legacy_snippet()
+    bespoke = _setup_detect_legacy_bespoke_hooks(settings)
     data_bytes = _setup_data_dir_size_bytes()
 
     if getattr(args, "json", False):
@@ -22241,7 +22242,14 @@ def _setup_status(args: argparse.Namespace) -> int:
                 ),
             },
             "activity_24h": activity,
-            "legacy": {"statusline_snippet": str(legacy[0]) if legacy else None},
+            "legacy": {
+                "statusline_snippet": str(legacy[0]) if legacy else None,
+                "bespoke_hooks": {
+                    "detected": bespoke["detected"],
+                    "settings_entries": bespoke["settings_entries"],
+                    "files": bespoke["files"],
+                },
+            },
             "data": {"path": str(APP_DIR), "size_bytes": data_bytes},
         }
         print(json.dumps(envelope, indent=2))
@@ -22279,6 +22287,15 @@ def _setup_status(args: argparse.Namespace) -> int:
         out.append("  status-line snippet  not detected                     ✓")
     else:
         out.append(f"  status-line snippet  detected at {legacy[0]}:{legacy[1][0]}  ⚠")
+    if not bespoke["detected"]:
+        out.append("  bespoke hooks        not detected                     ✓")
+    else:
+        n_entries = len(bespoke["settings_entries"])
+        n_files = len(bespoke["files"])
+        out.append(
+            f"  bespoke hooks        detected ({n_entries} entries, {n_files} files)    ⚠"
+        )
+        out.append("                       run `cctally setup --migrate-legacy-hooks` to migrate")
     out.append("Data")
     out.append(f"  {APP_DIR}/    {_setup_format_bytes(data_bytes)}")
     _setup_emit_text(out)
@@ -22414,6 +22431,16 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
 def _setup_dry_run(args: argparse.Namespace) -> int:
     repo_root = _setup_resolve_repo_root()
     dst_dir = _setup_local_bin_dir()
+    try:
+        settings = _load_claude_settings()
+    except SetupError as exc:
+        # Malformed settings.json — preview still proceeds; legacy detection
+        # against an empty dict simply yields detected=False for entries (files
+        # detection is independent of settings). Mirror _setup_status's pattern
+        # so the user sees the same condition that would fail _setup_install.
+        eprint(f"setup: warning: {exc}")
+        settings = {}
+    detection = _setup_detect_legacy_bespoke_hooks(settings)
     sym_results = []
     for name in SETUP_SYMLINK_NAMES:
         dst = dst_dir / name
@@ -22446,6 +22473,23 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
             f"  hooks.{ev}[*] += {{ matcher: {matcher}, "
             f"command: \"{quoted} hook-tick\" }}"
         )
+    if detection["detected"]:
+        out.append("Would migrate legacy bespoke hooks:")
+        if detection["settings_entries"]:
+            out.append(
+                f"  Would remove {len(detection['settings_entries'])} "
+                f"entries from settings.json:"
+            )
+            for e in detection["settings_entries"]:
+                out.append(f"    hooks.{e['event']:13s} ← {e['command']}")
+        files_present = [f.split('/')[-1] for f in detection["files"]]
+        if files_present:
+            out.append(
+                f"  Would move {len(files_present)} files to "
+                f"~/.claude/cctally-legacy-hook-backup-<UTC ts>/:"
+            )
+            out.append(f"    {', '.join(files_present)}")
+        out.append("  Would attempt cleanup of /tmp/claude-usage-poller.{pid,count}")
     out.append("Would not modify ~/.claude/statusline-command.sh")
     out.append("Would not delete any data")
     out.append("")
@@ -22472,6 +22516,14 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
                     for ev in SETUP_HOOK_EVENTS
                 ],
                 "settings_path": str(CLAUDE_SETTINGS_PATH),
+            },
+            "migration_preview": {
+                "detected": detection["detected"],
+                "would_remove_entries": [
+                    {"event": e["event"], "command": e["command"]}
+                    for e in detection["settings_entries"]
+                ],
+                "would_move_files": list(detection["files"]),
             },
             "exit_code": 0,
         }
@@ -22629,7 +22681,6 @@ def _setup_install(args: argparse.Namespace) -> int:
     except OSError as exc:
         eprint(f"setup: failed to write {CLAUDE_SETTINGS_PATH}: {exc}")
         return 2
-    out.append(f"✓ Wrote {len(SETUP_HOOK_EVENTS)} hook entries to {CLAUDE_SETTINGS_PATH}")
 
     # ── Post-write migration apply (spec §2 steps 6a, 6b) ──
     # Settings.json is now durable. File moves, poller stop, and tmp
@@ -22668,6 +22719,12 @@ def _setup_install(args: argparse.Namespace) -> int:
             except (OSError, ValueError):
                 pass
         kill_outcome = _legacy_stop_active_poller()
+        # Per spec §3 (`active_poller_pid_signaled` semantics): record the
+        # PID only when we actually attempted to deliver a signal. Stale-PID
+        # and no-pid-file outcomes are read-only paths, so the JSON envelope
+        # should reflect "no signal sent" with a null PID.
+        if kill_outcome not in {"sigterm-took", "sigkill-took", "permission-denied"}:
+            pid_signaled = None
         migration_summary["active_poller_pid_signaled"] = pid_signaled
         migration_summary["active_poller_kill_outcome"] = kill_outcome
         migration_summary["tmp_files_unlinked"] = _legacy_cleanup_tmp_sentinels()
@@ -22676,7 +22733,13 @@ def _setup_install(args: argparse.Namespace) -> int:
             f"✓ Migrated {migration_summary['settings_entries_removed']} legacy hook entries "
             f"→ moved {len(moved)} files to {backup_dir}/"
         )
-    elif decision == "skip" and reason in {"user_declined", "no_migrate_flag"}:
+
+    # The "✓ Wrote …" line follows any migrate-summary line so the
+    # narrative reads "we did the migration, then wrote the new entries"
+    # — matches the spec's success-path sample (Section 2).
+    out.append(f"✓ Wrote {len(SETUP_HOOK_EVENTS)} hook entries to {CLAUDE_SETTINGS_PATH}")
+
+    if decision == "skip" and reason in {"user_declined", "no_migrate_flag"}:
         files_str = "{record-usage-stop,usage-poller{,-start,-stop}}.py"
         out.append(
             f"⚠ Legacy bespoke hooks detected (predate `cctally setup`; failing "
@@ -22741,6 +22804,11 @@ def _setup_install(args: argparse.Namespace) -> int:
             warnings += 1
 
     out.append("")
+    if warnings:
+        out.append(f"cctally is ready (with {warnings} warning(s) above).")
+    else:
+        out.append("cctally is ready.")
+    out.append("")
     # Settings.json was modified — CC caches it at session start. The
     # warning fires unconditionally because `_setup_install` always
     # rewrites settings.json (legacy migration, fresh install, repair).
@@ -22748,14 +22816,11 @@ def _setup_install(args: argparse.Namespace) -> int:
     out.append("  open sessions. New sessions launched after this point pick them up")
     out.append("  automatically. (settings.json is cached at session start.)")
     out.append("")
-    if warnings:
-        out.append(f"cctally is ready (with {warnings} warning(s) above). Try:")
-    else:
-        out.append("cctally is ready. Try:")
-    out.append("  cctally daily              # last 30 days")
-    out.append("  cctally dashboard          # live web dashboard")
-    out.append("  cctally tui                # terminal dashboard")
-    out.append("  cctally setup --status     # verify install state")
+    out.append("  Try:")
+    out.append("    cctally daily              # last 30 days")
+    out.append("    cctally dashboard          # live web dashboard")
+    out.append("    cctally tui                # terminal dashboard")
+    out.append("    cctally setup --status     # verify install state")
 
     if getattr(args, "json", False):
         envelope = {

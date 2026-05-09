@@ -17,6 +17,8 @@ Install cctally into Claude Code. Symlinks user-facing binaries into
 
 - `--yes` / `-y` — skip confirmations
 - `--json` — emit machine-readable output
+- `--migrate-legacy-hooks` — auto-accept the legacy-hook migration prompt (install-mode only)
+- `--no-migrate-legacy-hooks` — auto-decline the legacy-hook migration prompt (install-mode only)
 
 ## Hook events installed
 
@@ -42,6 +44,35 @@ Both bare and absolute paths match; quoted paths (with spaces) match too.
 | 1 | Hard prerequisite failure |
 | 2 | Partial: symlinks created but settings.json write failed |
 | 3 | User declined a confirmation under non-`--yes` mode |
+
+## Migrating from a prior install pattern
+
+If your machine has hooks from an earlier install pattern — hand-installed
+Python scripts under `~/.claude/hooks/` (`record-usage-stop.py`,
+`usage-poller-start.py`, `usage-poller-stop.py`, `usage-poller.py`) plus
+their `Stop` / `SubagentStart` / `SubagentStop` entries in
+`~/.claude/settings.json` — `cctally setup` will detect them and offer to
+migrate. The migration:
+
+- Unwires the matching entries from `~/.claude/settings.json`.
+- Moves the `.py` files to `~/.claude/cctally-legacy-hook-backup-<UTC ts>/`
+  (reversible — files are moved, not deleted).
+- Best-effort stops any currently-active background daemon spawned by
+  those hooks (so you don't have to wait out its multi-hour timer or
+  reboot for the new wiring to fully take effect).
+
+By default `cctally setup` prompts on a TTY. Pass `--migrate-legacy-hooks`
+to auto-accept (useful for non-interactive setups; also implied by
+`--yes`), or `--no-migrate-legacy-hooks` to skip without prompting. Both
+flags are install-mode only — they're rejected with exit code 2 if
+combined with `--status` or `--uninstall`. Under `--json` or a
+non-interactive stdin, the prompt is skipped silently and the migration
+runs only when one of the two flags is set explicitly.
+
+`cctally setup --status` reports the current legacy-hook state in both
+text (under "Legacy bespoke hooks") and `--json` (under
+`legacy.bespoke_hooks`). `cctally setup --dry-run --migrate-legacy-hooks`
+previews the migration without touching disk.
 
 ## See also
 

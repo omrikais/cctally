@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "install": {
+    "symlinks_present": 0,
+    "symlinks_total": 12,
+    "path_includes": true
+  },
+  "hooks": {
+    "PostToolBatch": 0,
+    "Stop": 0,
+    "SubagentStop": 0
+  },
+  "auth": {
+    "oauth_token_present": false,
+    "last_fetch_age_s": null
+  },
+  "activity_24h": {
+    "fires": 0,
+    "by_event": {},
+    "oauth_ok": 0,
+    "throttled": 0,
+    "errors": 0,
+    "last_fire_ago_s": null
+  },
+  "legacy": {
+    "statusline_snippet": null,
+    "bespoke_hooks": {
+      "detected": true,
+      "settings_entries": [
+        {
+          "event": "Stop",
+          "command": "python3 ~/.claude/hooks/record-usage-stop.py"
+        },
+        {
+          "event": "SubagentStart",
+          "command": "python3 ~/.claude/hooks/usage-poller-start.py"
+        },
+        {
+          "event": "SubagentStop",
+          "command": "python3 ~/.claude/hooks/usage-poller-stop.py"
+        }
+      ],
+      "files": [
+        "~/.claude/hooks/record-usage-stop.py",
+        "~/.claude/hooks/usage-poller-start.py",
+        "~/.claude/hooks/usage-poller-stop.py",
+        "~/.claude/hooks/usage-poller.py"
+      ]
+    }
+  },
+  "data": {
+    "path": "/FAKE/.local/share/cctally",
+    "size_bytes": 0
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "hooks": {
+    "Stop":         [{"matcher": "*", "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/record-usage-stop.py"}]}],
+    "SubagentStop": [{"matcher": "*", "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/usage-poller-stop.py"}]}]
+  }
+}

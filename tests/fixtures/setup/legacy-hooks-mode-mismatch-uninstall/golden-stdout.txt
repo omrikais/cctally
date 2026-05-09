@@ -1,0 +1,1 @@
+setup: --no-migrate-legacy-hooks is install-mode only

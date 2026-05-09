@@ -1,0 +1,21 @@
+✓ Detected Claude Code at /FAKE/.claude
+✓ Symlinks at /FAKE/.local/bin/: 12/12 (N newly created)
+✓ Migrated 0 legacy hook entries → moved 4 files to /FAKE/.claude/cctally-legacy-hook-backup-TIMESTAMP/
+✓ Wrote 3 hook entries to /FAKE/.claude/settings.json
+⚠ No Claude OAuth token detected.
+  Run `claude` once to authenticate. After that, the next assistant
+  message in any Claude Code session will start collecting data
+  automatically — no need to re-run `cctally setup`.
+✓ Synced session cache (N new entries)
+
+cctally is ready (with 1 warning(s) above).
+
+⚠ Restart Claude Code for the new hooks to take effect in any currently
+  open sessions. New sessions launched after this point pick them up
+  automatically. (settings.json is cached at session start.)
+
+  Try:
+    cctally daily              # last 30 days
+    cctally dashboard          # live web dashboard
+    cctally tui                # terminal dashboard
+    cctally setup --status     # verify install state

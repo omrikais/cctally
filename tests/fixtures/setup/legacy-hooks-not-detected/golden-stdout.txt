@@ -1,0 +1,20 @@
+Install
+  Symlinks       0/12 present at /FAKE/.local/bin/  ✗
+  PATH includes  yes                                   ✓
+Hooks (/FAKE/.claude/settings.json)
+  PostToolBatch  missing                  ✗
+  Stop           missing                  ✗
+  SubagentStop   missing                  ✗
+Auth
+  OAuth token    missing                              ⚠
+  Last fetch     never
+Hook activity (last 24h)
+  Fires          0  (PostToolBatch 0, Stop 0, SubagentStop 0)
+  OAuth          0 (0 throttled)
+  Errors         0
+  Last fire      none
+Legacy
+  status-line snippet  not detected                     ✓
+  bespoke hooks        not detected                     ✓
+Data
+  /FAKE/.local/share/cctally/    0 B

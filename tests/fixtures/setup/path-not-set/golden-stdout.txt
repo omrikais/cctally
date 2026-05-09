@@ -11,8 +11,14 @@
   automatically — no need to re-run `cctally setup`.
 ✓ Synced session cache (N new entries)
 
-cctally is ready (with 2 warning(s) above). Try:
-  cctally daily              # last 30 days
-  cctally dashboard          # live web dashboard
-  cctally tui                # terminal dashboard
-  cctally setup --status     # verify install state
+cctally is ready (with 2 warning(s) above).
+
+⚠ Restart Claude Code for the new hooks to take effect in any currently
+  open sessions. New sessions launched after this point pick them up
+  automatically. (settings.json is cached at session start.)
+
+  Try:
+    cctally daily              # last 30 days
+    cctally dashboard          # live web dashboard
+    cctally tui                # terminal dashboard
+    cctally setup --status     # verify install state
