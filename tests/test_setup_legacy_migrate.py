@@ -305,14 +305,22 @@ class TestLegacyStopActivePoller:
         (after the start hook double-forks), so the kernel reaps it
         promptly on SIGTERM and the helper's `os.kill(pid, 0)` probe
         flips to ProcessLookupError quickly. In this test, the spawned
-        ``sleep`` is a direct child of the pytest process — without an
-        active waiter the kernel keeps the PID slot pinned in zombie
+        Python script is a direct child of the pytest process — without
+        an active waiter the kernel keeps the PID slot pinned in zombie
         state, and the probe keeps returning success past the 250 ms
         grace window (`sigkill-took` instead of `sigterm-took`). We
         pre-arm a reaper thread so as soon as SIGTERM exits the child
         the OS can release the PID, matching production behavior.
+
+        Also: the helper's cmdline-ownership check requires the live
+        process's argv to contain ``usage-poller.py``. We materialize a
+        real script with that filename and exec it so the ``ps`` probe
+        sees a matching cmdline — closely mirroring the production
+        daemon launched via ``python3 ~/.claude/hooks/usage-poller.py``.
         """
-        proc = subprocess.Popen(["sleep", "30"])
+        poller_script = tmp_path / "usage-poller.py"
+        poller_script.write_text("import time\ntime.sleep(30)\n")
+        proc = subprocess.Popen([sys.executable, str(poller_script)])
         reaper = threading.Thread(target=proc.wait, daemon=True)
         reaper.start()
         try:
@@ -336,6 +344,31 @@ class TestLegacyStopActivePoller:
         pid_file.write_text("not-a-number\n")
         monkeypatch.setitem(ns, "_LEGACY_POLLER_PID_FILE", pid_file)
         assert ns["_legacy_stop_active_poller"]() == "stale-pid"
+
+    def test_alive_pid_owned_by_unrelated_process_yields_stale_pid(
+        self, ns, monkeypatch, tmp_path,
+    ):
+        """A live PID whose cmdline doesn't reference usage-poller.py must
+        not be signaled. /tmp PID files outlive the daemon on uncleanly
+        exit, and macOS PIDs cycle in a narrow space — without an
+        ownership check, the migration could SIGKILL an unrelated user
+        process. We spawn a long-lived ``sleep`` (cmdline contains
+        ``sleep``, not ``usage-poller.py``), point the PID file at it,
+        and assert the helper returns ``stale-pid`` AND the process is
+        still alive afterward."""
+        proc = subprocess.Popen(["sleep", "30"])
+        try:
+            pid_file = tmp_path / "poller.pid"
+            pid_file.write_text(str(proc.pid))
+            monkeypatch.setitem(ns, "_LEGACY_POLLER_PID_FILE", pid_file)
+            outcome = ns["_legacy_stop_active_poller"]()
+            assert outcome == "stale-pid"
+            # Critical: the unrelated process must NOT have been signaled.
+            # poll() is None ↔ still running; non-None ↔ exited.
+            assert proc.poll() is None
+        finally:
+            proc.kill()
+            proc.wait(timeout=2)
 
 
 class TestLegacyCleanupTmpSentinels:
@@ -648,7 +681,13 @@ class TestLegacyMigrationE2EActivePoller:
         _e2e_seed_legacy_state(home)
         _e2e_pin_paths(ns, monkeypatch, home)
 
-        proc = subprocess.Popen(["sleep", "30"])
+        # Spawn a real Python child whose cmdline contains
+        # ``usage-poller.py`` so the helper's cmdline-ownership probe
+        # accepts it as the legacy daemon (mirrors the production
+        # ``python3 ~/.claude/hooks/usage-poller.py`` invocation).
+        poller_script = tmp_path / "usage-poller.py"
+        poller_script.write_text("import time\ntime.sleep(30)\n")
+        proc = subprocess.Popen([sys.executable, str(poller_script)])
         # Reaper thread mirrors TestLegacyStopActivePoller.test_sigterm_kills_test_process —
         # in production the daemon's parent is launchd; in pytest the proc is
         # a direct child and the kernel pins its PID slot in zombie state
@@ -730,6 +769,50 @@ class TestLegacyMigrationE2EActivePoller:
         assert mig["active_poller_pid_signaled"] is None
         # Sentinel unlinked even though no signal was sent.
         assert str(pid_file) in mig["tmp_files_unlinked"]
+
+
+class TestLegacyMigrationE2EBackupDirFail:
+    """If the migration backup dir can't be created (parent unwriteable,
+    name collision with a regular file, ENOSPC), `_setup_install` must
+    fail fast with exit 1 BEFORE mutating settings.json. The reverse
+    order would leave a half-applied migration: legacy entries unwired
+    in settings.json, but ``~/.claude/hooks/*.py`` files never moved —
+    a Python traceback to the user with no clean recovery story.
+    """
+
+    def test_mkdir_failure_aborts_before_settings_write(
+        self, ns, tmp_path, monkeypatch,
+    ):
+        home = tmp_path / "home"
+        _e2e_seed_legacy_state(home)
+        _e2e_pin_paths(ns, monkeypatch, home)
+
+        def _raise(*a, **kw):
+            raise OSError("simulated mkdir failure")
+        monkeypatch.setitem(ns, "_legacy_resolve_backup_dir", _raise)
+
+        # Capture pre-call state to prove no mutation on the failure path.
+        settings_path = home / ".claude" / "settings.json"
+        pre_settings = settings_path.read_text()
+        hooks_dir = home / ".claude" / "hooks"
+        pre_files = sorted(p.name for p in hooks_dir.iterdir())
+
+        buf = io.StringIO()
+        err_buf = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", buf)
+        monkeypatch.setattr(sys, "stderr", err_buf)
+        rc = ns["cmd_setup"](_e2e_install_args(migrate_legacy_hooks=True))
+        monkeypatch.setattr(sys, "stdout", sys.__stdout__)
+        monkeypatch.setattr(sys, "stderr", sys.__stderr__)
+
+        # Fail fast: exit 1, with the failure surfaced on stderr.
+        assert rc == 1, f"expected exit 1, got {rc}"
+        assert "simulated mkdir failure" in err_buf.getvalue()
+        # Settings.json untouched — legacy entries still present, no cctally
+        # entries added, no half-applied state.
+        assert settings_path.read_text() == pre_settings
+        # .py files still in their canonical location.
+        assert sorted(p.name for p in hooks_dir.iterdir()) == pre_files
 
 
 # Note: the argparse mutex (``--migrate-legacy-hooks`` +

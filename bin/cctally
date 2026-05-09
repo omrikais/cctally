@@ -21945,8 +21945,10 @@ def _legacy_stop_active_poller() -> str:
 
     Returns one of:
       "no-pid-file"       — no /tmp/claude-usage-poller.pid present
-      "stale-pid"         — PID file exists but the PID isn't a live process
-                            (also returned on parse failure)
+      "stale-pid"         — PID file exists but the PID isn't a live
+                            process, parse failed, OR the live PID's
+                            cmdline doesn't reference usage-poller.py
+                            (collapsed: don't signal an unrelated process)
       "sigterm-took"      — SIGTERM landed and the process exited within
                             the grace window
       "sigkill-took"      — SIGTERM did not stop it; SIGKILL landed
@@ -21977,7 +21979,25 @@ def _legacy_stop_active_poller() -> str:
     except OSError:
         return "stale-pid"
 
-    # Process is alive. SIGTERM, then poll for exit within the grace.
+    # Ownership probe: the PID file is at a predictable /tmp path that
+    # outlives the daemon on uncleanly exit, and macOS PIDs cycle in a
+    # narrow space — verify the live process is actually our legacy
+    # poller before signaling. ps's `-o command=` emits the full cmdline
+    # with no header on both macOS BSD ps and Linux util-linux ps.
+    try:
+        probe = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # Can't verify → don't signal. Treat as stale: a corrupted /tmp
+        # sentinel is functionally equivalent to a missing process here.
+        return "stale-pid"
+    if probe.returncode != 0 or "usage-poller.py" not in probe.stdout:
+        return "stale-pid"
+
+    # Process is alive AND owned by the legacy poller. SIGTERM, then poll
+    # for exit within the grace.
     try:
         os.kill(pid, _signal.SIGTERM)
     except ProcessLookupError:
@@ -22687,7 +22707,19 @@ def _setup_install(args: argparse.Namespace) -> int:
         "reason": reason or "not_detected",
     }
 
+    backup_dir: pathlib.Path | None = None
     if decision == "migrate":
+        # Resolve the backup dir BEFORE mutating settings.json so a
+        # mkdir failure (parent unwriteable, name collision with a
+        # regular file, ENOSPC, …) doesn't leave the on-disk settings
+        # in a half-applied state — legacy entries gone but .py files
+        # never moved. Pre-resolving also pins the timestamp shared
+        # between the dir name and JSON envelope.
+        try:
+            backup_dir = _legacy_resolve_backup_dir()
+        except OSError as exc:
+            eprint(f"setup: cannot create migration backup dir: {exc}")
+            return 1
         # Unwire BEFORE the merge so the same atomic write removes legacy
         # entries and adds cctally entries (spec §2 step 6).
         settings, n_unwired = _settings_merge_unwire_legacy(settings)
@@ -22747,7 +22779,9 @@ def _setup_install(args: argparse.Namespace) -> int:
     # do NOT roll back the on-disk settings.json. Per spec §2 exit-code
     # table, partial-move failures are uniformly exit-0-with-warning.
     if decision == "migrate":
-        backup_dir = _legacy_resolve_backup_dir()
+        # `backup_dir` was resolved early (pre-write) so the mkdir
+        # failure path can fail fast with no settings.json mutation.
+        assert backup_dir is not None
         # Snapshot what we expected to move BEFORE the move so we can
         # detect partial failure cleanly (post-loop, src files are gone).
         expected_to_move = [
