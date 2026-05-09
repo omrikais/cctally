@@ -14264,6 +14264,28 @@ def cmd_daily(args: argparse.Namespace) -> int:
     # Aggregate by display-tz date (Q5/F6: day boundary follows display.tz).
     days = _aggregate_daily(all_entries, mode="auto", tz=tz)
 
+    # Shareable-reports gate: --format short-circuits the JSON / table
+    # dispatch via `_share_render_and_emit`. The mutex in
+    # `_add_share_args` keeps `--format` and `--json` from coexisting.
+    # Gate runs BEFORE the `--order desc` reversal so the BarChart bars
+    # render chronologically regardless of `--order`; tabular row order
+    # is irrelevant here because the snapshot is what gets rendered.
+    if getattr(args, "format", None):
+        display_tz_str = _share_display_tz_label(tz)
+        snap = _build_daily_snapshot(
+            days,
+            period_start=range_start,
+            period_end=range_end,
+            display_tz=display_tz_str,
+            version=_share_resolve_version(),
+        )
+        snap = _replace_dataclass(snap, subtitle=" - ".join([
+            snap.period.label, args.theme,
+            "real projects" if args.reveal_projects else "projects anonymized",
+        ]))
+        _share_render_and_emit(snap, args)
+        return 0
+
     # Apply sort order.
     if args.order == "desc":
         days = list(reversed(days))
@@ -24448,6 +24470,107 @@ def _build_report_snapshot(
         cmd="report",
         title=title,
         subtitle=" - ".join(subtitle_parts),
+        period=_lib_share.PeriodSpec(
+            start=period_start, end=period_end,
+            display_tz=display_tz, label=period_label,
+        ),
+        columns=columns, rows=tuple(snap_rows),
+        chart=chart, totals=totals, notes=(),
+        generated_at=_share_now_utc(), version=version,
+    )
+
+
+def _build_daily_snapshot(
+    rows,
+    *,
+    period_start: dt.datetime,
+    period_end: dt.datetime,
+    display_tz: str,
+    version: str,
+):
+    """Build a ShareSnapshot for `cctally daily`.
+
+    `rows` is the in-memory `BucketUsage` list produced by `_aggregate_daily`
+    inside `cmd_daily`. Each bucket has: `bucket` (YYYY-MM-DD date string),
+    `cost_usd`, `model_breakdowns` (list[dict] sorted by cost desc; first
+    entry is the top model).
+
+    Deviations from the plan sketch (which assumed dict rows with keys
+    `date` / `cost_usd` / `pct_of_week` / `top_model`):
+
+    - Rows are `BucketUsage` dataclasses; we read fields by attribute.
+    - Daily has no native `% of week` column — daily is range-scoped, not
+      week-scoped. We render `% of period` (this row's cost / total range
+      cost) so the column carries meaningful info; the `pct_week` key
+      survives in the column spec for plan-shape parity.
+    - `top_model` is the first entry of `model_breakdowns` (sorted by cost
+      desc per upstream ccusage parity); empty -> "—".
+
+    Caller MUST pass `rows` in chronological order so the BarChart bars
+    line up left-to-right with time. `_aggregate_daily` already returns
+    asc; the gate site re-sorts after `args.order == "desc"` was applied.
+    """
+    _lib_share = _share_load_lib()
+    columns = (
+        _lib_share.ColumnSpec(key="date", label="Date", align="left"),
+        _lib_share.ColumnSpec(key="cost", label="$ Cost", align="right",
+                              emphasis=True),
+        _lib_share.ColumnSpec(key="pct_week", label="% of Period",
+                              align="right"),
+        _lib_share.ColumnSpec(key="top_model", label="Top Model",
+                              align="left"),
+    )
+    total_cost = 0.0
+    for r in rows:
+        total_cost += float(getattr(r, "cost_usd", 0.0) or 0.0)
+
+    snap_rows: list = []
+    chart_pts: list = []
+    for i, r in enumerate(rows):
+        bucket = getattr(r, "bucket", None)
+        if isinstance(bucket, dt.date):
+            date_str = bucket.strftime("%b %d")
+        elif isinstance(bucket, str) and bucket:
+            try:
+                date_str = dt.date.fromisoformat(bucket).strftime("%b %d")
+            except ValueError:
+                date_str = bucket
+        else:
+            date_str = "—"
+        cost_usd = float(getattr(r, "cost_usd", 0.0) or 0.0)
+        breakdowns = getattr(r, "model_breakdowns", None) or []
+        top_model = (breakdowns[0].get("modelName") if breakdowns else None) or "—"
+        pct_of_period = (cost_usd / total_cost * 100.0) if total_cost > 0 else 0.0
+        snap_rows.append(_lib_share.Row(cells={
+            "date": _lib_share.TextCell(date_str),
+            "cost": _lib_share.MoneyCell(cost_usd),
+            "pct_week": _lib_share.PercentCell(pct_of_period),
+            "top_model": _lib_share.TextCell(top_model),
+        }))
+        chart_pts.append(_lib_share.ChartPoint(
+            x_label=date_str,
+            x_value=float(i),
+            y_value=cost_usd,
+        ))
+    chart = (
+        _lib_share.BarChart(points=tuple(chart_pts), y_label="$")
+        if chart_pts else None
+    )
+    avg_cost = (total_cost / len(chart_pts)) if chart_pts else 0.0
+    totals = (
+        _lib_share.Totalled(label="Sum", value=f"${total_cost:,.2f}"),
+        _lib_share.Totalled(label="Days", value=str(len(chart_pts))),
+        _lib_share.Totalled(label="Avg / day", value=f"${avg_cost:,.2f}"),
+    )
+    title = (
+        f"Daily usage - {period_start.strftime('%b %d')} -> "
+        f"{period_end.strftime('%b %d')}"
+    )
+    period_label = _share_period_label(period_start, period_end, display_tz)
+    return _lib_share.ShareSnapshot(
+        cmd="daily",
+        title=title,
+        subtitle=" - ".join([period_label, "light", "projects anonymized"]),
         period=_lib_share.PeriodSpec(
             start=period_start, end=period_end,
             display_tz=display_tz, label=period_label,
