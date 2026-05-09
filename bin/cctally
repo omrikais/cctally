@@ -8229,6 +8229,41 @@ def _render_claude_session_table(
     return "\n".join(out)
 
 
+def _project_disambiguate_labels(rows: list[dict]) -> dict[int, str]:
+    """Return ``{row_index: disambiguated_label}`` for project rows whose
+    bare ``display_key`` collides with another row's basename.
+
+    When two projects share a basename (e.g., two ``app`` directories under
+    different parents), suffix the colliding rows with the parent-directory
+    segment ("(work)" / "(personal)") so they remain visually and
+    semantically distinct. Prefer ``key.git_root`` as the disambiguation
+    source when present; fall back to ``key.bucket_path`` for no-git rows.
+
+    Used by:
+      - ``_render_project_table`` (terminal table render).
+      - ``_build_project_snapshot`` (share artifact table + chart) — without
+        this, two same-basename projects collapse to a single anonymous
+        ``project-N`` after scrub, losing rank meaning AND uniqueness.
+
+    Rows that do not collide are absent from the returned dict; callers
+    fall back to ``key.display_key`` for those.
+    """
+    display_counts: dict[str, int] = {}
+    for r in rows:
+        dk = r["key"].display_key
+        display_counts[dk] = display_counts.get(dk, 0) + 1
+    augmented: dict[int, str] = {}
+    for idx, r in enumerate(rows):
+        if display_counts[r["key"].display_key] > 1:
+            source_path = r["key"].git_root or r["key"].bucket_path
+            if source_path:
+                parent = (
+                    os.path.basename(os.path.dirname(source_path)) or "/"
+                )
+                augmented[idx] = f"{r['key'].display_key} ({parent})"
+    return augmented
+
+
 def _render_project_table(
     rows: list[dict],
     *,
@@ -8287,22 +8322,11 @@ def _render_project_table(
         ampm = "a.m." if local.hour < 12 else "p.m."
         return f"{local.year}-{local.month:02d}-{local.day:02d}\n{hour_12}:{local.minute:02d}\n{ampm}"
 
-    # Basename-collision disambiguation: if two rows share a display_key,
-    # suffix with the parent directory segment so the user can tell them
-    # apart. Prefer the git_root as the disambiguation source when present;
-    # fall back to bucket_path for no-git rows (whose displays also collide
-    # on basename even though they each carry a `(no-git)` marker).
-    display_counts: dict[str, int] = {}
-    for r in rows:
-        dk = r["key"].display_key
-        display_counts[dk] = display_counts.get(dk, 0) + 1
-    augmented: dict[int, str] = {}
-    for idx, r in enumerate(rows):
-        if display_counts[r["key"].display_key] > 1:
-            source_path = r["key"].git_root or r["key"].bucket_path
-            if source_path:
-                parent = os.path.basename(os.path.dirname(source_path)) or "/"
-                augmented[idx] = f"{r['key'].display_key} ({parent})"
+    # Basename-collision disambiguation: hoisted to a module-level helper
+    # so the share-snapshot builder can reuse the same logic (without it,
+    # two same-basename projects collapse to a single anonymous `project-N`
+    # after scrub, breaking both privacy uniqueness AND chart rank meaning).
+    augmented = _project_disambiguate_labels(rows)
 
     def _project_cell(idx: int, r: dict) -> tuple[str, Any]:
         """Return (plain_text, color_fn_or_None) for the Project cell.
@@ -18492,12 +18516,34 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             # Shareable-reports empty-data path: emit a "no data" snapshot
             # rather than a free-form text message so consumers of the share
             # output (md / html / svg) get a uniformly-shaped artifact.
+            #
+            # Compute the real subscription-week boundaries from config
+            # rather than collapsing to a 0-duration `now → now` window —
+            # the period_label in the artifact's subtitle is meaningful
+            # (the week the forecast WOULD describe if data existed).
+            # Lift the `dt.date` boundaries from `compute_week_bounds`
+            # to tz-aware datetimes anchored on local midnight so the
+            # PeriodSpec stays consistent with sibling builders.
             tz = getattr(args, "_resolved_tz", None)
             display_tz_str = _share_display_tz_label(tz)
-            week_anchor = now_utc
+            week_start_name = get_week_start_name(
+                config, getattr(args, "week_start_name", None)
+            )
+            ws_date, we_date = compute_week_bounds(now_utc, week_start_name)
+            # internal fallback: host-local intentional
+            local_tz = dt.datetime.now().astimezone().tzinfo
+            week_start_dt = dt.datetime.combine(
+                ws_date, dt.time.min, tzinfo=local_tz
+            )
+            week_end_dt = dt.datetime.combine(
+                we_date + dt.timedelta(days=1), dt.time.min, tzinfo=local_tz
+            )
+            # Pass `low_conf=False` + explicit notes: the issue is "no data
+            # recorded yet," not "thin data." LOW CONF would mislead the
+            # reader into thinking a projection ran with sparse samples.
             snap = _build_forecast_snapshot(
-                week_start=week_anchor,
-                week_end=week_anchor,
+                week_start=week_start_dt,
+                week_end=week_end_dt,
                 display_tz=display_tz_str,
                 version=_share_resolve_version(),
                 theme=args.theme,
@@ -18510,7 +18556,11 @@ def cmd_forecast(args: argparse.Namespace) -> int:
                 days_remaining=0.0,
                 dollars_per_percent=0.0,
                 dollars_per_percent_source="this_week",
-                low_conf=True,
+                low_conf=False,
+                notes=(
+                    "No snapshots recorded for this week yet — run "
+                    "cctally record-usage to populate.",
+                ),
             )
             _share_render_and_emit(snap, args)
             return 0
@@ -18562,9 +18612,12 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         # (week_end, projected_high). The high-end matches the terminal
         # render's "may cap" warning so the chart and table tell the same
         # story. When `already_capped` is true the ray collapses to a flat
-        # line at p_now (no further extrapolation).
+        # horizontal line at p_now from (now → week_end) — visually
+        # signals "you are pinned at the cap; no further growth expected"
+        # instead of the visually-empty (no-projection) chart that was
+        # confusable with "no projection computed."
         projected_series: list[tuple[str, float, float]] = []
-        if not output.already_capped and i.remaining_hours > 0:
+        if i.remaining_hours > 0:
             tz_render = getattr(args, "_resolved_tz", None)
             now_label = format_display_dt(
                 i.now_utc, tz_render, fmt="%a %H:%M", suffix=False,
@@ -18574,10 +18627,21 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             )
             now_x = (i.now_utc - i.week_start_at).total_seconds() / 3600.0
             end_x = (i.week_end_at - i.week_start_at).total_seconds() / 3600.0
-            projected_series.append((now_label, now_x, float(i.p_now)))
-            projected_series.append(
-                (end_label, end_x, float(output.final_percent_high))
-            )
+            if output.already_capped:
+                # Flat ray: y stays at p_now across the remaining window.
+                projected_series.append(
+                    (now_label, now_x, float(i.p_now))
+                )
+                projected_series.append(
+                    (end_label, end_x, float(i.p_now))
+                )
+            else:
+                projected_series.append(
+                    (now_label, now_x, float(i.p_now))
+                )
+                projected_series.append(
+                    (end_label, end_x, float(output.final_percent_high))
+                )
         display_tz_str = _share_display_tz_label(
             getattr(args, "_resolved_tz", None)
         )
@@ -25079,6 +25143,7 @@ def _build_forecast_snapshot(
     dollars_per_percent: float,
     dollars_per_percent_source: str,
     low_conf: bool,
+    notes: tuple[str, ...] = (),
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally forecast`.
 
@@ -25118,6 +25183,12 @@ def _build_forecast_snapshot(
     `theme` and `reveal_projects` flow into the subtitle directly so the
     builder owns the canonical subtitle shape — no post-build re-stamp
     at the gate site.
+
+    `notes`, when non-empty, overrides the auto-emitted "LOW CONF — data
+    thin" note. The empty-data fast-path passes a clearer "no snapshots
+    recorded" note so the artifact says what's actually wrong; the
+    confidence-thin terminal path passes nothing and falls back to the
+    auto LOW CONF banner.
     """
     _lib_share = _share_load_lib()
     actual_pts = tuple(
@@ -25149,6 +25220,8 @@ def _build_forecast_snapshot(
     # Render the projected band as "low-high%" so a single PercentCell
     # carries the two-rate forecast spread. When the rates collapse to a
     # single value (no recent-24h sample), low == high.
+    # 0.05 threshold: below .1f display precision — tighter spreads would
+    # render as identical decimals, so collapse to a single value.
     if abs(projected_high_pct - projected_low_pct) < 0.05:
         projected_text = f"{projected_high_pct:.1f}%"
     else:
@@ -25174,15 +25247,20 @@ def _build_forecast_snapshot(
             "value": _lib_share.MoneyCell(float(dollars_per_percent)),
         }),
     )
-    notes = ("LOW CONF — data thin",) if low_conf else ()
+    # Caller-provided `notes` (e.g., empty-data path's clearer message)
+    # take precedence over the auto LOW CONF banner. Sibling builders
+    # don't expose this knob; forecast does because its empty-state and
+    # thin-confidence states need different copy.
+    final_notes = notes if notes else (
+        ("LOW CONF — data thin",) if low_conf else ()
+    )
     if actual_pts:
         title = f"Forecast — week of {week_start.strftime('%b %d')}"
     else:
         title = "Forecast — no data"
-    period_label = (
-        f"{week_start.strftime('%b %d')} → "
-        f"{week_end.strftime('%b %d')} ({display_tz})"
-    )
+    # Reuse the shared period-label helper so forecast's subtitle period
+    # format matches sibling builders (cmd_daily / cmd_project / etc.).
+    period_label = _share_period_label(week_start, week_end, display_tz)
     subtitle = " · ".join([
         period_label,
         theme,
@@ -25197,7 +25275,7 @@ def _build_forecast_snapshot(
             display_tz=display_tz, label=period_label,
         ),
         columns=columns, rows=snap_rows,
-        chart=chart, totals=(), notes=notes,
+        chart=chart, totals=(), notes=final_notes,
         generated_at=_share_now_utc(), version=version,
     )
 
@@ -25274,14 +25352,21 @@ def _build_project_snapshot(
     sorted_rows = sorted(
         rows, key=lambda r: -float(r.get("cost_usd") or 0.0)
     )
+    # Basename-collision disambiguation: mirrors `_render_project_table`'s
+    # terminal logic. Keyed on post-sort indices so callers can look up by
+    # enumerate(sorted_rows). Without this, two `app` projects under
+    # different parent dirs collapse to ONE anonymous `project-N` after
+    # scrub — losing both privacy uniqueness and chart rank meaning.
+    augmented = _project_disambiguate_labels(sorted_rows)
     snap_rows: list = []
     chart_pts: list = []
-    for r in sorted_rows:
+    for idx, r in enumerate(sorted_rows):
         key = r.get("key")
-        proj_label = (
+        bare_label = (
             getattr(key, "display_key", None)
             or "(unknown)"
         )
+        proj_label = augmented.get(idx, bare_label)
         cost = float(r.get("cost_usd") or 0.0)
         attr_pct = r.get("attributed_pct")
         used_pct = float(attr_pct) if attr_pct is not None else 0.0
