@@ -69,7 +69,9 @@ for scenario_dir in "$FIXTURES_DIR"/*/; do
         report-md)             cmd="report";           fmt="md";   theme="light" ;;
         report-svg-light)      cmd="report";           fmt="svg";  theme="light" ;;
         report-svg-dark)       cmd="report";           fmt="svg";  theme="dark" ;;
+        report-empty-html)     cmd="report";           fmt="html"; theme="light" ;;
         daily-md)              cmd="daily";            fmt="md";   theme="light" ;;
+        daily-md-desc)         cmd="daily";            fmt="md";   theme="light"; extra="--order desc" ;;
         monthly-md)            cmd="monthly";          fmt="md";   theme="light" ;;
         weekly-md)             cmd="weekly";           fmt="md";   theme="light" ;;
         weekly-html)           cmd="weekly";           fmt="html"; theme="light" ;;

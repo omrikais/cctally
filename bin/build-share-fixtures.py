@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build deterministic SQLite fixtures + CHANGELOG fixture for cctally-share-test.
 
-Output layout (14 scenarios):
+Output layout (16 scenarios):
   tests/fixtures/share/<scenario>/
     cache.db
     stats.db
@@ -9,10 +9,10 @@ Output layout (14 scenarios):
     .gitignore (covers *.db-wal, *.db-shm)
 
 Scenarios cover the share-enabled subcommands across formats:
-  report-md, report-svg-light, report-svg-dark,
-  daily-md, monthly-md, weekly-md, weekly-html, weekly-svg-breakdown,
-  forecast-md, forecast-svg, project-md-anon, project-md-reveal,
-  five-hour-blocks-md, session-md.
+  report-md, report-svg-light, report-svg-dark, report-empty-html,
+  daily-md, daily-md-desc, monthly-md, weekly-md, weekly-html,
+  weekly-svg-breakdown, forecast-md, forecast-svg,
+  project-md-anon, project-md-reveal, five-hour-blocks-md, session-md.
 
 The fixtures share one synthetic dataset:
   - 4 weeks of weekly_usage_snapshots / weekly_cost_snapshots ending 2026-05-04.
@@ -52,7 +52,16 @@ SCENARIOS: tuple[str, ...] = (
     "report-md",
     "report-svg-light",
     "report-svg-dark",
+    # Empty-data coverage: report --format html with no weekly_usage_snapshots
+    # rows must emit a uniform "no data" artifact, not the terminal
+    # "No data yet..." sentence. Uses an EMPTY stats.db (see
+    # _EMPTY_STATS_SCENARIOS below).
+    "report-empty-html",
     "daily-md",
+    # --order desc coverage: daily --order desc --format md must produce a
+    # descending table while the chart bars stay chronological. Same data
+    # shape as daily-md; only the harness arg differs.
+    "daily-md-desc",
     "monthly-md",
     "weekly-md",
     "weekly-html",
@@ -70,6 +79,13 @@ SCENARIOS: tuple[str, ...] = (
     "five-hour-blocks-md",
     "session-md",
 )
+
+# Scenarios that need a stats.db with no weekly_usage_snapshots /
+# weekly_cost_snapshots / five_hour_blocks rows. Used to exercise
+# empty-data branches (e.g. cmd_report's no-weeks --format path).
+_EMPTY_STATS_SCENARIOS: frozenset[str] = frozenset({
+    "report-empty-html",
+})
 
 # Synthetic 4-week trend ending 2026-05-04 (Monday). Tuples are
 # (week_start_date, weekly_percent, cost_usd).
@@ -103,7 +119,7 @@ SESSION_FILES: tuple[tuple[str, str | None, str | None], ...] = (
 )
 
 
-def _seed_stats_db(path: pathlib.Path) -> None:
+def _seed_stats_db(path: pathlib.Path, *, empty: bool = False) -> None:
     """Stats.db: weekly_usage_snapshots + weekly_cost_snapshots + one
     five_hour_blocks row.
 
@@ -115,8 +131,13 @@ def _seed_stats_db(path: pathlib.Path) -> None:
     `cmd_five_hour_blocks --format md` renders; without it, the share
     snapshot would be empty. Plan didn't cover this — added here per
     Implementor 10's findings on the actual data shape.
+
+    When ``empty=True`` the schema is created but no rows are seeded —
+    used by ``report-empty-html`` to exercise the no-weeks share path.
     """
     create_stats_db(path)
+    if empty:
+        return
     with sqlite3.connect(path) as conn:
         for ws, used_pct, cost in WEEKS:
             # Compute week_end_date 7 days later — required NOT NULL on both tables.
@@ -244,7 +265,8 @@ def main() -> int:
     for scenario in SCENARIOS:
         scen_dir = FIXTURE_ROOT / scenario
         scen_dir.mkdir(parents=True, exist_ok=True)
-        _seed_stats_db(scen_dir / "stats.db")
+        empty_stats = scenario in _EMPTY_STATS_SCENARIOS
+        _seed_stats_db(scen_dir / "stats.db", empty=empty_stats)
         _seed_cache_db(scen_dir / "cache.db")
         _write_changelog(scen_dir / "CHANGELOG.md")
         _write_gitignore(scen_dir)

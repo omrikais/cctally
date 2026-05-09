@@ -1371,6 +1371,72 @@ def test_share_validate_args_rejects_open_without_format():
     raise AssertionError("expected SystemExit when --open passed without --format")
 
 
+def test_share_validate_args_rejects_copy_with_output():
+    """--copy + --output is a destination mutex; must reject early."""
+    import argparse
+    args = argparse.Namespace(
+        format="md", output="/tmp/x.md", copy=True, open_after_write=False,
+    )
+    try:
+        _cctally._share_validate_args(args)
+    except SystemExit as e:
+        assert e.code == 2
+        return
+    raise AssertionError("expected SystemExit on --copy + --output mutex")
+
+
+def test_share_validate_args_rejects_copy_with_non_md():
+    """--copy clipboard write is only meaningful for md format."""
+    import argparse
+    args = argparse.Namespace(
+        format="svg", output=None, copy=True, open_after_write=False,
+    )
+    try:
+        _cctally._share_validate_args(args)
+    except SystemExit as e:
+        assert e.code == 2
+        return
+    raise AssertionError("expected SystemExit on --copy + --format svg")
+
+
+def test_share_validate_args_rejects_open_with_md():
+    """--open is only meaningful for html/svg writes (md routes to stdout)."""
+    import argparse
+    args = argparse.Namespace(
+        format="md", output=None, copy=False, open_after_write=True,
+    )
+    try:
+        _cctally._share_validate_args(args)
+    except SystemExit as e:
+        assert e.code == 2
+        return
+    raise AssertionError("expected SystemExit on --open + --format md")
+
+
+def test_share_validate_args_rejects_open_with_stdout_output():
+    """--open --output - is a silent no-op pre-fix; now an explicit exit 2."""
+    import argparse
+    args = argparse.Namespace(
+        format="html", output="-", copy=False, open_after_write=True,
+    )
+    try:
+        _cctally._share_validate_args(args)
+    except SystemExit as e:
+        assert e.code == 2
+        return
+    raise AssertionError("expected SystemExit on --open + --output -")
+
+
+def test_share_validate_args_accepts_open_with_file_output():
+    """--open with a real file path (html/svg) is the happy path."""
+    import argparse
+    args = argparse.Namespace(
+        format="html", output="/tmp/report.html", copy=False, open_after_write=True,
+    )
+    # Must not raise / exit.
+    _cctally._share_validate_args(args)
+
+
 def test_copy_falls_back_when_no_clipboard_tool(monkeypatch):
     """If no pbcopy/xclip/clip on PATH, --copy must error clearly.
 

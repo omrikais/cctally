@@ -14303,8 +14303,11 @@ def cmd_daily(args: argparse.Namespace) -> int:
     # dispatch via `_share_render_and_emit`. The mutex in
     # `_add_share_args` keeps `--format` and `--json` from coexisting.
     # Gate runs BEFORE the `--order desc` reversal so the BarChart bars
-    # render chronologically regardless of `--order`; tabular row order
-    # is irrelevant here because the snapshot is what gets rendered.
+    # render chronologically regardless of `--order`. Table rows in the
+    # rendered artifact, however, must respect `--order desc` (parity
+    # with terminal / JSON output) — handled by reversing snap.rows
+    # post-build below; the chart points stay chronological because
+    # they were built from ascending `days`.
     if getattr(args, "format", None):
         # Note: --breakdown is a no-op under --format (snapshot focuses on
         # the headline daily-cost trend; per-model sub-rows aren't in the
@@ -14320,6 +14323,8 @@ def cmd_daily(args: argparse.Namespace) -> int:
             theme=args.theme,
             reveal_projects=args.reveal_projects,
         )
+        if args.order == "desc":
+            snap = dataclasses.replace(snap, rows=tuple(reversed(snap.rows)))
         _share_render_and_emit(snap, args)
         return 0
 
@@ -14364,8 +14369,9 @@ def cmd_monthly(args: argparse.Namespace) -> int:
     # dispatch via `_share_render_and_emit`. The mutex in
     # `_add_share_args` keeps `--format` and `--json` from coexisting.
     # Gate runs BEFORE the `--order desc` reversal so the BarChart bars
-    # render chronologically regardless of `--order`; tabular row order
-    # is irrelevant here because the snapshot is what gets rendered.
+    # render chronologically regardless of `--order`. Table rows in the
+    # rendered artifact respect `--order desc` (parity with terminal /
+    # JSON) via post-build snap.rows reversal; chart stays chronological.
     if getattr(args, "format", None):
         # Note: --breakdown is a no-op under --format (snapshot focuses on
         # the headline monthly-cost trend; per-model sub-rows aren't in the
@@ -14380,6 +14386,8 @@ def cmd_monthly(args: argparse.Namespace) -> int:
             theme=args.theme,
             reveal_projects=args.reveal_projects,
         )
+        if args.order == "desc":
+            snap = dataclasses.replace(snap, rows=tuple(reversed(snap.rows)))
         _share_render_and_emit(snap, args)
         return 0
 
@@ -14483,10 +14491,12 @@ def cmd_weekly(args: argparse.Namespace) -> int:
     # dispatch via `_share_render_and_emit`. The mutex in
     # `_add_share_args` keeps `--format` and `--json` from coexisting.
     # Gate runs BEFORE the `--order desc` reversal so the BarChart bars
-    # render chronologically regardless of `--order`. `--breakdown` is
-    # honored: when set, the snapshot adds per-model columns + stacked
-    # bar series (vs. cmd_daily / cmd_monthly where --breakdown is a
-    # no-op under --format).
+    # render chronologically regardless of `--order`. Table rows in the
+    # rendered artifact respect `--order desc` (parity with terminal /
+    # JSON) via post-build snap.rows reversal. `--breakdown` is honored:
+    # when set, the snapshot adds per-model columns + stacked bar series
+    # (vs. cmd_daily / cmd_monthly where --breakdown is a no-op under
+    # --format).
     if getattr(args, "format", None):
         display_tz_str = _share_display_tz_label(args._resolved_tz)
         snap = _build_weekly_snapshot(
@@ -14499,6 +14509,8 @@ def cmd_weekly(args: argparse.Namespace) -> int:
             reveal_projects=args.reveal_projects,
             breakdown_model=bool(getattr(args, "breakdown", False)),
         )
+        if args.order == "desc":
+            snap = dataclasses.replace(snap, rows=tuple(reversed(snap.rows)))
         _share_render_and_emit(snap, args)
         return 0
 
@@ -18293,6 +18305,37 @@ def cmd_report(args: argparse.Namespace) -> int:
 
         weeks = get_recent_weeks(conn, max(1, args.weeks))
         if not weeks:
+            # Format-aware empty path mirrors cmd_forecast:18578-18629 — a
+            # fresh install requesting `report --format html` should emit a
+            # uniformly-shaped artifact, not a free-form "No data yet"
+            # sentence the share consumer can't parse.
+            if getattr(args, "format", None):
+                display_tz_str = _share_display_tz_label(tz)
+                # Anchor the period_label on the current subscription
+                # week so the artifact's subtitle is meaningful (the
+                # week the report WOULD describe if data existed).
+                # internal fallback: host-local intentional
+                local_tz = dt.datetime.now().astimezone().tzinfo
+                ws_d, we_d = compute_week_bounds(
+                    dt.datetime.now().astimezone(tz), week_start_name
+                )
+                ws_dt = dt.datetime.combine(
+                    ws_d, dt.time.min, tzinfo=local_tz
+                )
+                we_dt = dt.datetime.combine(
+                    we_d + dt.timedelta(days=1), dt.time.min, tzinfo=local_tz
+                )
+                snap = _build_report_snapshot(
+                    [],
+                    period_start=ws_dt,
+                    period_end=we_dt,
+                    display_tz=display_tz_str,
+                    version=_share_resolve_version(),
+                    theme=args.theme,
+                    reveal_projects=args.reveal_projects,
+                )
+                _share_render_and_emit(snap, args)
+                return 0
             if args.json:
                 print(json.dumps({"current": None, "trend": []}, indent=2))
             else:
@@ -22910,30 +22953,74 @@ def _add_share_args(parser, *, has_status_line: bool = False) -> None:
 
 
 def _share_validate_args(args) -> None:
-    """Reject share-side-effect flags supplied without ``--format``.
+    """Reject share flag combinations BEFORE any DB / sync / render work.
 
-    ``--output``, ``--copy``, and ``--open`` are no-ops outside the share
-    pipeline — silent dropping trains users to assume the file was
-    written. Exit 2 with a stderr message naming the offending flag so
-    the failure is loud and scriptable. Idempotent; safe to call from
-    every share-enabled subcommand before the ``--format`` gate.
+    Two layers of validation:
+
+    1. Share-only flags (``--output``, ``--copy``, ``--open``) require
+       ``--format``. Silent dropping trains users to assume the file
+       was written.
+
+    2. Destination-shape combinations (``--copy`` + ``--output``,
+       ``--copy`` + non-md, ``--open`` + md, ``--open`` + ``--output -``).
+       These were previously caught only inside ``_resolve_destination``
+       / ``_share_render_and_emit`` — i.e. AFTER ``--sync-current`` had
+       already mutated the DB and the snapshot had been built. Surfacing
+       them at validation time means an exit-2 flag-shape error never
+       triggers side effects.
+
+    Exit 2 with a stderr message naming the offending combo so the
+    failure is loud and scriptable. Idempotent; safe to call from every
+    share-enabled subcommand before the ``--format`` gate. Existing
+    late checks in ``_resolve_destination`` / ``_share_render_and_emit``
+    are kept as defense-in-depth for any future caller that bypasses
+    this helper.
     """
-    if getattr(args, "format", None):
-        return
-    offenders = []
-    if getattr(args, "output", None):
-        offenders.append("--output")
-    if getattr(args, "copy", False):
-        offenders.append("--copy")
-    if getattr(args, "open_after_write", False):
-        offenders.append("--open")
-    if not offenders:
-        return
-    verb = "requires" if len(offenders) == 1 else "require"
-    sys.stderr.write(
-        f"cctally: {', '.join(offenders)} {verb} --format\n"
-    )
-    sys.exit(2)
+    if not getattr(args, "format", None):
+        offenders = []
+        if getattr(args, "output", None):
+            offenders.append("--output")
+        if getattr(args, "copy", False):
+            offenders.append("--copy")
+        if getattr(args, "open_after_write", False):
+            offenders.append("--open")
+        if not offenders:
+            return
+        verb = "requires" if len(offenders) == 1 else "require"
+        sys.stderr.write(
+            f"cctally: {', '.join(offenders)} {verb} --format\n"
+        )
+        sys.exit(2)
+
+    # --format is set — validate destination-shape combos.
+    fmt = args.format
+    copy = getattr(args, "copy", False)
+    output = getattr(args, "output", None)
+    open_after_write = getattr(args, "open_after_write", False)
+
+    if copy and output is not None:
+        # Mutex: a clipboard destination by definition has no path.
+        sys.stderr.write(
+            "cctally: --copy is mutually exclusive with --output\n"
+        )
+        sys.exit(2)
+    if copy and fmt != "md":
+        sys.stderr.write(
+            "cctally: --copy is only valid with --format md\n"
+        )
+        sys.exit(2)
+    if open_after_write and fmt == "md":
+        sys.stderr.write(
+            "cctally: --open is only valid with --format html or --format svg\n"
+        )
+        sys.exit(2)
+    if open_after_write and output == "-":
+        # Open-after-write to stdout has no file to launch — was a silent
+        # no-op pre-fix; now an explicit exit 2 so users notice.
+        sys.stderr.write(
+            "cctally: --open is incompatible with --output - (no file to open)\n"
+        )
+        sys.exit(2)
 
 
 def build_parser() -> argparse.ArgumentParser:
