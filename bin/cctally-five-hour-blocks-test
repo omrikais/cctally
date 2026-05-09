@@ -66,6 +66,15 @@ record_usage () {
         >>"$home/cctally-stdout.log" 2>>"$home/cctally-stderr.log"
 }
 
+# Variant of record_usage that lets the caller override TZ. Used by
+# scenarios that exercise the host-local-tz path through
+# parse_iso_datetime (e.g. block_start_at stored with a non-UTC offset).
+record_usage_tz () {
+    local home="$1"; local tz="$2"; shift 2
+    HOME="$home" TZ="$tz" "$BIN" record-usage "$@" \
+        >>"$home/cctally-stdout.log" 2>>"$home/cctally-stderr.log"
+}
+
 # Run any cctally subcommand in an isolated HOME (used to trigger open_db()
 # without writing snapshot data).
 run_cctally () {
@@ -437,6 +446,46 @@ RESETS_7D=2100000000
     assert_eq "$crossed" "1" "crossed_seven_day_reset on naturally-spanning block"
 
     finish_scenario T_cross_reset_flag_natural_boundary
+}
+
+# ─── Scenario T2: cross-flag with non-UTC display tz (host-local) ────
+# parse_iso_datetime returns ``parsed.astimezone()`` (line 9433), so on
+# a non-UTC host ``block_start_at`` is stored with the host's offset
+# (e.g. ``+03:00``) while ``weekly_usage_snapshots.week_start_at`` is
+# ``+00:00`` and ``last_observed_at_utc`` is ``Z``. A lex BETWEEN /
+# string compare across these silently mis-orders moments and the
+# cross-flag stays at 0 even when the block straddles a natural
+# boundary. The cross-flag predicate must normalize via ``unixepoch()``.
+{
+    begin_scenario T2_cross_reset_flag_tz_mismatch
+
+    record_usage_tz "$home" "Asia/Jerusalem" \
+        --percent 94 --resets-at "$BASE" \
+        --five-hour-percent 90 --five-hour-resets-at "$BASE"
+
+    NATURAL_NEW_RESETS=$((BASE + 604800))
+    record_usage_tz "$home" "Asia/Jerusalem" \
+        --percent 0 --resets-at "$NATURAL_NEW_RESETS" \
+        --five-hour-percent 92 --five-hour-resets-at "$((BASE + 5))"
+
+    # Sanity: block_start_at landed with a non-UTC offset (the bug
+    # surface). Without this the test would silently pass even if the
+    # production path were quietly normalizing to UTC.
+    block_offset=$(sql "$home" "SELECT block_start_at FROM five_hour_blocks WHERE five_hour_window_key = $BASE;" | grep -oE '[+-][0-9][0-9]:[0-9][0-9]$|Z$')
+    [ "$block_offset" != "+00:00" ] && [ "$block_offset" != "Z" ] || \
+        _err="${_err:+$_err; }block_start_at expected non-UTC offset, got '$block_offset'"
+
+    # Sanity: NO week_reset_events row (mid-week gate cannot fire on a
+    # past prior_end).
+    reset_count=$(sql "$home" "SELECT COUNT(*) FROM week_reset_events;")
+    assert_eq "$reset_count" "0" "no week_reset_events for natural boundary (tz-mismatch case)"
+
+    # The block's flag must be set despite the tz mismatch in the
+    # stored timestamps — predicate is unixepoch()-normalized.
+    crossed=$(sql "$home" "SELECT crossed_seven_day_reset FROM five_hour_blocks WHERE five_hour_window_key = $BASE;")
+    assert_eq "$crossed" "1" "crossed_seven_day_reset on tz-mismatched naturally-spanning block"
+
+    finish_scenario T2_cross_reset_flag_tz_mismatch
 }
 
 # ─── Scenario H: historical backfill reconstructs five_hour_blocks ───

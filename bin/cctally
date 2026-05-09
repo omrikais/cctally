@@ -12376,6 +12376,17 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
             # not flagged.  Symmetric with the historical-backfill
             # predicate (§4.2 step 5). Idempotent (only flips 0 → 1).
             #
+            # Comparisons go through ``unixepoch()`` rather than a raw
+            # lex BETWEEN: ``parse_iso_datetime`` returns host-local
+            # tz-aware datetimes (line 9433: ``return parsed.astimezone()``),
+            # so ``block_start_at`` is stored with the host's display
+            # offset (e.g. ``+03:00``) while ``week_start_at`` is
+            # ``+00:00`` and ``last_observed_at_utc`` is ``Z``. A lex
+            # compare across mixed offsets silently mis-orders moments
+            # for non-UTC hosts; ``unixepoch()`` normalizes all three
+            # to seconds-since-epoch and is correct regardless of
+            # offset suffix.
+            #
             # Why the JOIN rather than a per-tick param: an earlier
             # design passed mid_week_reset_at only on the tick that
             # cmd_record_usage's INSERT OR IGNORE actually inserted
@@ -12392,15 +12403,17 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                    AND (
                      EXISTS (
                        SELECT 1 FROM week_reset_events e
-                        WHERE e.effective_reset_at_utc
-                              BETWEEN five_hour_blocks.block_start_at
-                                  AND five_hour_blocks.last_observed_at_utc
+                        WHERE unixepoch(e.effective_reset_at_utc)
+                              BETWEEN unixepoch(five_hour_blocks.block_start_at)
+                                  AND unixepoch(five_hour_blocks.last_observed_at_utc)
                      )
                      OR EXISTS (
                        SELECT 1 FROM weekly_usage_snapshots ws
                         WHERE ws.week_start_at IS NOT NULL
-                          AND ws.week_start_at >  five_hour_blocks.block_start_at
-                          AND ws.week_start_at <= five_hour_blocks.last_observed_at_utc
+                          AND unixepoch(ws.week_start_at)
+                              >  unixepoch(five_hour_blocks.block_start_at)
+                          AND unixepoch(ws.week_start_at)
+                              <= unixepoch(five_hour_blocks.last_observed_at_utc)
                      )
                    )
                 """,
@@ -12517,11 +12530,15 @@ def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> int:
                 #       boundaries (no event row for these).
                 # Strict ``>`` on the lower bound for (b) so a block whose
                 # block_start_at coincides with a week boundary is not flagged.
+                # ``unixepoch()`` normalizes the comparison across mixed tz
+                # suffixes (block_start_at is host-local; week_start_at /
+                # effective_reset_at_utc are ``+00:00``); see the live-path
+                # comment for rationale.
                 cross_row = conn.execute(
                     """
                     SELECT 1 FROM week_reset_events
-                     WHERE effective_reset_at_utc >= ?
-                       AND effective_reset_at_utc <= ?
+                     WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?)
+                       AND unixepoch(effective_reset_at_utc) <= unixepoch(?)
                      LIMIT 1
                     """,
                     (block_start_at, last_obs),
@@ -12531,8 +12548,8 @@ def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> int:
                         """
                         SELECT 1 FROM weekly_usage_snapshots
                          WHERE week_start_at IS NOT NULL
-                           AND week_start_at >  ?
-                           AND week_start_at <= ?
+                           AND unixepoch(week_start_at) >  unixepoch(?)
+                           AND unixepoch(week_start_at) <= unixepoch(?)
                          LIMIT 1
                         """,
                         (block_start_at, last_obs),
