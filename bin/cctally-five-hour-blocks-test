@@ -398,6 +398,47 @@ RESETS_7D=2100000000
     finish_scenario G_cross_reset_flag
 }
 
+# ─── Scenario T: NATURAL weekly boundary flags the spanning block ────
+# When the weekly window resets naturally (prior week_end_at <= now_utc),
+# cmd_record_usage does NOT write a week_reset_events row — that table is
+# only populated for Anthropic-shifted MID-week resets where prior_end_dt
+# was still in the future. The 5h block can still span the natural
+# boundary, and the cross-flag must flip via the
+# weekly_usage_snapshots.week_start_at fallback predicate so the
+# dashboard renders "⚡ reset" instead of a misleading "Δ −94pp" delta.
+{
+    begin_scenario T_cross_reset_flag_natural_boundary
+
+    # First tick: high weekly_percent (94%), declared week_end at BASE
+    # (well in the past relative to wall-clock now — 2025-04-30 12:00 UTC).
+    # 5h-% at 90. Establishes the open block.
+    record_usage "$home" \
+        --percent 94 --resets-at "$BASE" \
+        --five-hour-percent 90 --five-hour-resets-at "$BASE"
+
+    # Second tick: SAME 5h window (BASE+5 collapses), but a NEW
+    # week_end one week later (BASE + 7d). weekly_percent collapses
+    # to 0. cmd_record_usage's mid-week-reset gate (prior_end_dt >
+    # now_utc) fails because the prior week_end is far in the past;
+    # therefore NO week_reset_events row is written. The block must
+    # still flip via the natural-boundary predicate.
+    NATURAL_NEW_RESETS=$((BASE + 604800))
+    record_usage "$home" \
+        --percent 0 --resets-at "$NATURAL_NEW_RESETS" \
+        --five-hour-percent 92 --five-hour-resets-at "$((BASE + 5))"
+
+    # Sanity: NO week_reset_events row was written.
+    reset_count=$(sql "$home" "SELECT COUNT(*) FROM week_reset_events;")
+    assert_eq "$reset_count" "0" "no week_reset_events for natural boundary"
+
+    # The block's flag must still be set (via the natural-boundary
+    # fallback predicate against weekly_usage_snapshots.week_start_at).
+    crossed=$(sql "$home" "SELECT crossed_seven_day_reset FROM five_hour_blocks WHERE five_hour_window_key = $BASE;")
+    assert_eq "$crossed" "1" "crossed_seven_day_reset on naturally-spanning block"
+
+    finish_scenario T_cross_reset_flag_natural_boundary
+}
+
 # ─── Scenario H: historical backfill reconstructs five_hour_blocks ───
 {
     begin_scenario H_backfill

@@ -12356,12 +12356,25 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                             )
                             pending_alerts.append(payload)
 
-            # ── Mid-week reset cross-flag (opportunistic, JOIN-based) ──
-            # Self-healing sweep against week_reset_events: every tick,
-            # flag any open block whose [block_start_at,
-            # last_observed_at_utc] interval contains a recorded reset
-            # moment. Symmetric with the historical-backfill predicate
-            # (§4.2 step 5). Idempotent (only flips 0 → 1).
+            # ── Reset-crossing cross-flag (opportunistic, JOIN-based) ──
+            # Self-healing sweep: every tick, flag any open block whose
+            # [block_start_at, last_observed_at_utc] interval crosses a
+            # weekly reset, from either of two sources:
+            #   (a) week_reset_events — Anthropic-shifted MID-week resets
+            #       (prior week_end_at was still in the future at detect
+            #       time; see cmd_record_usage's reset-event detection).
+            #   (b) weekly_usage_snapshots.week_start_at — NATURAL weekly
+            #       boundaries. These never get a week_reset_events row
+            #       (mid-week detection requires the prior end to be in
+            #       the future), so source (a) silently misses blocks
+            #       that span a routine week reset. Without this clause
+            #       the dashboard's "Δ pp this block" delta is computed
+            #       against the pre-reset 7d% (~94%) versus post-reset
+            #       (~0%) and renders as a misleading −94pp drop.
+            # Predicate (b) uses strict ``>`` on the lower bound so a
+            # block that starts EXACTLY at the boundary (post-reset) is
+            # not flagged.  Symmetric with the historical-backfill
+            # predicate (§4.2 step 5). Idempotent (only flips 0 → 1).
             #
             # Why the JOIN rather than a per-tick param: an earlier
             # design passed mid_week_reset_at only on the tick that
@@ -12376,13 +12389,19 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                 UPDATE five_hour_blocks
                    SET crossed_seven_day_reset = 1
                  WHERE crossed_seven_day_reset = 0
-                   AND id IN (
-                     SELECT b.id
-                       FROM five_hour_blocks b
-                       JOIN week_reset_events e
-                         ON e.effective_reset_at_utc
-                            BETWEEN b.block_start_at
-                                AND b.last_observed_at_utc
+                   AND (
+                     EXISTS (
+                       SELECT 1 FROM week_reset_events e
+                        WHERE e.effective_reset_at_utc
+                              BETWEEN five_hour_blocks.block_start_at
+                                  AND five_hour_blocks.last_observed_at_utc
+                     )
+                     OR EXISTS (
+                       SELECT 1 FROM weekly_usage_snapshots ws
+                        WHERE ws.week_start_at IS NOT NULL
+                          AND ws.week_start_at >  five_hour_blocks.block_start_at
+                          AND ws.week_start_at <= five_hour_blocks.last_observed_at_utc
+                     )
                    )
                 """,
             )
@@ -12492,7 +12511,12 @@ def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> int:
                 last_obs_dt = parse_iso_datetime(last_obs, "last_obs backfill")
 
                 # Cross-reset detection (interval predicate, symmetric with
-                # the live path's UPDATE in T4).
+                # the live path's UPDATE in T4). Two sources:
+                #   (a) week_reset_events — Anthropic-shifted mid-week resets.
+                #   (b) weekly_usage_snapshots.week_start_at — natural week
+                #       boundaries (no event row for these).
+                # Strict ``>`` on the lower bound for (b) so a block whose
+                # block_start_at coincides with a week boundary is not flagged.
                 cross_row = conn.execute(
                     """
                     SELECT 1 FROM week_reset_events
@@ -12502,6 +12526,17 @@ def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> int:
                     """,
                     (block_start_at, last_obs),
                 ).fetchone()
+                if cross_row is None:
+                    cross_row = conn.execute(
+                        """
+                        SELECT 1 FROM weekly_usage_snapshots
+                         WHERE week_start_at IS NOT NULL
+                           AND week_start_at >  ?
+                           AND week_start_at <= ?
+                         LIMIT 1
+                        """,
+                        (block_start_at, last_obs),
+                    ).fetchone()
                 crossed = 1 if cross_row is not None else 0
 
                 # is_closed: 1 if the canonical reset moment is already past.
