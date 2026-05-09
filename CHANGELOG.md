@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-05-09
+
 ### Added
 - Shareable reports — all 8 reporting subcommands (`report`, `daily`,
   `monthly`, `weekly`, `forecast`, `project`, `five-hour-blocks`, `session`)
