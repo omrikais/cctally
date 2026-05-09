@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Fixture-based harness for bin/cctally-npm-postinstall.js.
+#
+# Each scenario lives at tests/fixtures/npm-postinstall/<name>/ with:
+#   golden-exit.txt               : single integer (required).
+#   golden-stdout-substr.txt      : substring assertion (required, may be empty).
+#   golden-stdout-not-substr.txt  : optional. If non-empty, stdout MUST NOT
+#                                   contain this substring.
+#   env.sh                        : optional. Sourced before the run; can set
+#                                   NPM_CONFIG_GLOBAL, QUIET.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SCRIPT_PATH="$REPO_ROOT/bin/cctally-npm-postinstall.js"
+FIXTURES_DIR="$REPO_ROOT/tests/fixtures/npm-postinstall"
+
+if [ ! -f "$SCRIPT_PATH" ]; then
+    echo "FAIL: postinstall script not found: $SCRIPT_PATH" >&2
+    exit 1
+fi
+
+NODE_BIN=$(command -v node 2>/dev/null || true)
+if [ -z "$NODE_BIN" ]; then
+    echo "FAIL: node not found on PATH; install Node.js to run this harness" >&2
+    exit 1
+fi
+
+SCRATCH_DIR=$(mktemp -d -t cctally-npm-postinstall-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+
+pass_count=0
+fail_count=0
+
+shopt -s nullglob
+scenario_dirs=( "$FIXTURES_DIR"/*/ )
+shopt -u nullglob
+
+for dir in "${scenario_dirs[@]}"; do
+    name=$(basename "$dir")
+    expected_exit=$(cat "$dir/golden-exit.txt" | tr -d '\n')
+    expected_stdout=$(cat "$dir/golden-stdout-substr.txt")
+    expected_not_stdout=""
+    if [ -f "$dir/golden-stdout-not-substr.txt" ]; then
+        expected_not_stdout=$(cat "$dir/golden-stdout-not-substr.txt")
+    fi
+
+    work="$SCRATCH_DIR/$name"
+    mkdir -p "$work"
+
+    NPM_CONFIG_GLOBAL=""
+    QUIET=""
+    if [ -f "$dir/env.sh" ]; then
+        # shellcheck disable=SC1090
+        . "$dir/env.sh"
+    fi
+
+    stdout_file="$work/_stdout.txt"
+    stderr_file="$work/_stderr.txt"
+    env -i \
+        HOME="$HOME" \
+        PATH="/usr/bin:/bin" \
+        ${NPM_CONFIG_GLOBAL:+npm_config_global="$NPM_CONFIG_GLOBAL"} \
+        ${QUIET:+CCTALLY_NPM_POSTINSTALL_QUIET="$QUIET"} \
+        "$NODE_BIN" "$SCRIPT_PATH" \
+        > "$stdout_file" 2> "$stderr_file"
+    actual_exit=$?
+
+    actual_stdout=$(cat "$stdout_file")
+
+    fail=0
+    msg=""
+    if [ "$actual_exit" != "$expected_exit" ]; then
+        fail=1; msg="exit ${actual_exit} != ${expected_exit}"
+    fi
+    if [ -n "$expected_stdout" ] && ! grep -qF "$expected_stdout" <<<"$actual_stdout"; then
+        fail=1; msg="${msg:+$msg; }stdout missing '$expected_stdout'"
+    fi
+    if [ -n "$expected_not_stdout" ] && grep -qF "$expected_not_stdout" <<<"$actual_stdout"; then
+        fail=1; msg="${msg:+$msg; }stdout unexpectedly contains '$expected_not_stdout'"
+    fi
+
+    if [ "$fail" = "1" ]; then
+        echo "FAIL [$name]: $msg"
+        echo "  stdout:"; sed 's/^/    /' "$stdout_file"
+        echo "  stderr:"; sed 's/^/    /' "$stderr_file"
+        fail_count=$((fail_count + 1))
+    else
+        pass_count=$((pass_count + 1))
+    fi
+done
+
+printf 'passed: %d   failed: %d\n' "$pass_count" "$fail_count"
+[ "$fail_count" = "0" ]

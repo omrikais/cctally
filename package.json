@@ -13,6 +13,9 @@
   "bin": {
     "cctally": "./bin/cctally-npm-shim.js"
   },
+  "scripts": {
+    "postinstall": "node ./bin/cctally-npm-postinstall.js"
+  },
   "files": [
     "bin/cctally",
     "bin/cctally-alerts",
@@ -21,6 +24,7 @@
     "bin/cctally-five-hour-blocks",
     "bin/cctally-five-hour-breakdown",
     "bin/cctally-forecast",
+    "bin/cctally-npm-postinstall.js",
     "bin/cctally-npm-shim.js",
     "bin/cctally-project",
     "bin/cctally-refresh-usage",
