@@ -18222,6 +18222,36 @@ def cmd_report(args: argparse.Namespace) -> int:
                 for m in milestone_rows
             ]
 
+        # Shareable-reports gate: --format short-circuits the terminal/JSON
+        # paths. The mutex in `_add_share_args` guarantees --format and
+        # --json are not both set, so checking --format first is unambiguous.
+        # Snapshot rows are reversed to ascending chronological order so
+        # the line chart trends left->right with time (`get_recent_weeks`
+        # returns newest-first; `trend` mirrors that order).
+        if getattr(args, "format", None):
+            ordered_trend = list(reversed(trend))
+            if ordered_trend:
+                first_wsd = ordered_trend[0].get("weekStartDate")
+                last_wed = ordered_trend[-1].get("weekEndDate") or ordered_trend[-1].get("weekStartDate")
+                period_start = _share_parse_date_to_dt(first_wsd, tz)
+                period_end = _share_parse_date_to_dt(last_wed, tz)
+            else:
+                period_start = period_end = _share_now_utc()
+            display_tz_str = _share_display_tz_label(tz)
+            snap = _build_report_snapshot(
+                ordered_trend,
+                period_start=period_start,
+                period_end=period_end,
+                display_tz=display_tz_str,
+                version=_share_resolve_version(),
+            )
+            snap = _replace_dataclass(snap, subtitle=" - ".join([
+                snap.period.label, args.theme,
+                "real projects" if args.reveal_projects else "projects anonymized",
+            ]))
+            _share_render_and_emit(snap, args)
+            return 0
+
         if args.json:
             print(json.dumps(output, indent=2))
             return 0
@@ -24227,6 +24257,207 @@ def _emit(content: str, *, kind: str, value: pathlib.Path | str | None) -> None:
     raise ValueError(f"unknown destination kind: {kind!r}")
 
 
+def _share_load_lib():
+    """Lazy-load `_lib_share` with sys.modules caching.
+
+    Single-load semantics keep ShareSnapshot / MoneyCell / etc. class
+    identities stable across kernel imports: the test harness pre-registers
+    `_lib_share` in `sys.modules`, the wrapper imports it via this helper,
+    and snapshot builders import it via this helper — all paths must see
+    the SAME module object so `isinstance` checks on snapshot cells compare
+    across one class identity, not many. This is the chokepoint for the
+    duplicate-class-identity bug surfaced under the test harness in
+    Implementor 6's fix-loop.
+
+    Registers in sys.modules BEFORE exec_module: Python 3.14's `dataclass`
+    decorator looks up `cls.__module__` in `sys.modules` for `KW_ONLY` type
+    checks, and an absent entry would re-trigger the dual-load path under
+    some import orders.
+    """
+    cached = sys.modules.get("_lib_share")
+    if cached is not None:
+        return cached
+    import importlib.util as _ilu
+    _lib_share_path = pathlib.Path(__file__).resolve().parent / "_lib_share.py"
+    _spec = _ilu.spec_from_file_location("_lib_share", _lib_share_path)
+    _mod = _ilu.module_from_spec(_spec)
+    sys.modules["_lib_share"] = _mod
+    _spec.loader.exec_module(_mod)
+    return _mod
+
+
+def _share_now_utc() -> dt.datetime:
+    """`generated_at` source — honors CCTALLY_AS_OF env hook for fixture stability.
+
+    Mirrors the existing `CCTALLY_AS_OF` precedent used by `project` /
+    `forecast` for deterministic fixture goldens. ISO-8601 with offset or
+    `Z`; falls back to wall-clock UTC when unset.
+    """
+    override = os.environ.get("CCTALLY_AS_OF")
+    if override:
+        parsed = dt.datetime.fromisoformat(override.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _share_resolve_version() -> str:
+    """Source from CHANGELOG via the existing release helper. Empty string if unset.
+
+    `_release_read_latest_release_version` returns `(version, date) | None`;
+    the snapshot's `version` field carries the version string only.
+    """
+    info = _release_read_latest_release_version()
+    return info[0] if info else ""
+
+
+def _replace_dataclass(obj, **changes):
+    """`dataclasses.replace` shim used by share-snapshot post-build mutation.
+
+    Snapshots are frozen dataclasses; the gate sites build the snapshot via
+    a kernel-shaped builder, then re-stamp `subtitle` with runtime args
+    (theme, anonymization). This helper is the one place the bin file calls
+    `dataclasses.replace` on share snapshots — keeps the import surface
+    explicit.
+    """
+    return dataclasses.replace(obj, **changes)
+
+
+def _share_period_label(
+    period_start: dt.datetime,
+    period_end: dt.datetime,
+    display_tz_label: str,
+) -> str:
+    """Render the canonical "<start> -> <end> (<tz>)" period label.
+
+    Used by both the report and daily snapshot builders so the period label
+    format stays consistent across share-enabled subcommands.
+    """
+    return (
+        f"{period_start.strftime('%b %d')} -> "
+        f"{period_end.strftime('%b %d')} ({display_tz_label})"
+    )
+
+
+def _share_parse_date_to_dt(value, tz: "ZoneInfo | None") -> dt.datetime:
+    """Coerce a `YYYY-MM-DD` string or `dt.date` into a tz-aware datetime.
+
+    Used by the share gate sites to lift week-boundary date strings
+    (`weekStartDate`, `weekEndDate`) into the tz-aware datetimes that
+    `PeriodSpec` expects. None / empty / unparseable -> current UTC; the
+    caller already gated on a non-empty trend before reaching this path,
+    so the fallback is purely defensive against missing-data corner cases.
+    """
+    if value is None:
+        return _share_now_utc()
+    if isinstance(value, dt.datetime):
+        return value if value.tzinfo else value.replace(tzinfo=tz or dt.timezone.utc)
+    if isinstance(value, dt.date):
+        d = value
+    else:
+        try:
+            d = dt.date.fromisoformat(str(value))
+        except ValueError:
+            return _share_now_utc()
+    midnight = dt.datetime(d.year, d.month, d.day)
+    return midnight.replace(tzinfo=tz or dt.timezone.utc)
+
+
+def _share_display_tz_label(tz: "ZoneInfo | None") -> str:
+    """Render a stable display-tz string for `PeriodSpec.display_tz`.
+
+    `resolve_display_tz` returns `None` for "local" (caller does bare
+    astimezone); the share snapshot needs a non-None string. Map None ->
+    "local" and use ZoneInfo.key otherwise.
+    """
+    return tz.key if tz is not None else "local"
+
+
+def _build_report_snapshot(
+    rows: list[dict[str, Any]],
+    *,
+    period_start: dt.datetime,
+    period_end: dt.datetime,
+    display_tz: str,
+    version: str,
+):
+    """Build a ShareSnapshot for `cctally report`.
+
+    `rows` is the in-memory `trend` list produced by `cmd_report` — a list
+    of dicts keyed in the existing JSON-shape camelCase
+    (`weekStartDate`, `weeklyPercent`, `weeklyCostUSD`, `dollarsPerPercent`).
+    The plan's snake_case keys (`week_start_date`, `used_pct`, `cost_usd`,
+    `dollar_per_pct`) are NOT the actual `cmd_report` data shape — see
+    Implementor 7 commit body for the deviation.
+
+    Caller MUST pass `rows` in chronological order (oldest first) so the
+    chart line trends left->right with time. `cmd_report`'s native `trend`
+    is newest-first; the gate site reverses before calling.
+    """
+    _lib_share = _share_load_lib()
+    columns = (
+        _lib_share.ColumnSpec(key="week", label="Week", align="left"),
+        _lib_share.ColumnSpec(key="used", label="% Used", align="right"),
+        _lib_share.ColumnSpec(key="cost", label="$ Cost", align="right"),
+        _lib_share.ColumnSpec(key="dpp", label="$ / %", align="right",
+                              emphasis=True),
+    )
+    snap_rows: list = []
+    chart_pts: list = []
+    for i, r in enumerate(rows):
+        wsd = r.get("weekStartDate")
+        if isinstance(wsd, dt.date):
+            week_label = wsd.strftime("%b %d")
+        elif isinstance(wsd, str) and wsd:
+            try:
+                week_label = dt.date.fromisoformat(wsd).strftime("%b %d")
+            except ValueError:
+                week_label = wsd
+        else:
+            week_label = "—"
+        used_pct = r.get("weeklyPercent") or 0.0
+        cost_usd = r.get("weeklyCostUSD") or 0.0
+        dpp = r.get("dollarsPerPercent") or 0.0
+        snap_rows.append(_lib_share.Row(cells={
+            "week": _lib_share.TextCell(week_label),
+            "used": _lib_share.PercentCell(float(used_pct)),
+            "cost": _lib_share.MoneyCell(float(cost_usd)),
+            "dpp":  _lib_share.MoneyCell(float(dpp)),
+        }))
+        chart_pts.append(_lib_share.ChartPoint(
+            x_label=week_label,
+            x_value=float(i),
+            y_value=float(dpp),
+        ))
+    chart = (
+        _lib_share.LineChart(points=tuple(chart_pts), y_label="$ / %")
+        if len(chart_pts) >= 3 else None
+    )
+    avg_dpp = (
+        sum(p.y_value for p in chart_pts) / len(chart_pts)
+        if chart_pts else 0.0
+    )
+    totals = (
+        _lib_share.Totalled(label="Avg $/%", value=f"${avg_dpp:,.2f}"),
+    )
+    title = f"Weekly $ / % trend - last {len(rows)} weeks"
+    period_label = _share_period_label(period_start, period_end, display_tz)
+    subtitle_parts = [period_label, "light", "projects anonymized"]
+    return _lib_share.ShareSnapshot(
+        cmd="report",
+        title=title,
+        subtitle=" - ".join(subtitle_parts),
+        period=_lib_share.PeriodSpec(
+            start=period_start, end=period_end,
+            display_tz=display_tz, label=period_label,
+        ),
+        columns=columns, rows=tuple(snap_rows),
+        chart=chart, totals=totals, notes=(),
+        generated_at=_share_now_utc(), version=version,
+    )
+
+
 def _share_render_and_emit(snap, args) -> None:
     """End-to-end: scrub -> render -> emit -> optional open.
 
@@ -24252,19 +24483,10 @@ def _share_render_and_emit(snap, args) -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    # Reuse a cached `_lib_share` if a prior call (or the test harness) has
-    # already loaded it; loading a fresh copy creates a second module object
-    # and `isinstance` checks against ShareSnapshot cells would compare across
-    # distinct class identities. Single-load semantics also save the disk hit
-    # on repeat invocations.
-    _lib_share = sys.modules.get("_lib_share")
-    if _lib_share is None:
-        import importlib.util as _ilu
-        _lib_share_path = pathlib.Path(__file__).resolve().parent / "_lib_share.py"
-        _spec = _ilu.spec_from_file_location("_lib_share", _lib_share_path)
-        _lib_share = _ilu.module_from_spec(_spec)
-        sys.modules["_lib_share"] = _lib_share
-        _spec.loader.exec_module(_lib_share)
+    # Routed through `_share_load_lib` so wrapper / builders / test harness
+    # share one cached module object — see helper docstring for the
+    # class-identity invariant this enforces.
+    _lib_share = _share_load_lib()
 
     scrubbed = _lib_share._scrub(snap, reveal_projects=args.reveal_projects)
     rendered = _lib_share.render(
