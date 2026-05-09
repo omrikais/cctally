@@ -14324,6 +14324,29 @@ def cmd_monthly(args: argparse.Namespace) -> int:
 
     months = _aggregate_monthly(all_entries, mode="auto", tz=tz)
 
+    # Shareable-reports gate: --format short-circuits the JSON / table
+    # dispatch via `_share_render_and_emit`. The mutex in
+    # `_add_share_args` keeps `--format` and `--json` from coexisting.
+    # Gate runs BEFORE the `--order desc` reversal so the BarChart bars
+    # render chronologically regardless of `--order`; tabular row order
+    # is irrelevant here because the snapshot is what gets rendered.
+    if getattr(args, "format", None):
+        # Note: --breakdown is a no-op under --format (snapshot focuses on
+        # the headline monthly-cost trend; per-model sub-rows aren't in the
+        # share spec scope). Same convention as cmd_daily / cmd_report.
+        display_tz_str = _share_display_tz_label(tz)
+        snap = _build_monthly_snapshot(
+            months,
+            period_start=range_start,
+            period_end=range_end,
+            display_tz=display_tz_str,
+            version=_share_resolve_version(),
+            theme=args.theme,
+            reveal_projects=args.reveal_projects,
+        )
+        _share_render_and_emit(snap, args)
+        return 0
+
     if args.order == "desc":
         months = list(reversed(months))
 
@@ -24595,6 +24618,117 @@ def _build_daily_snapshot(
     ])
     return _lib_share.ShareSnapshot(
         cmd="daily",
+        title=title,
+        subtitle=subtitle,
+        period=_lib_share.PeriodSpec(
+            start=period_start, end=period_end,
+            display_tz=display_tz, label=period_label,
+        ),
+        columns=columns, rows=tuple(snap_rows),
+        chart=chart, totals=totals, notes=(),
+        generated_at=_share_now_utc(), version=version,
+    )
+
+
+def _build_monthly_snapshot(
+    rows: list["BucketUsage"],
+    *,
+    period_start: dt.datetime,
+    period_end: dt.datetime,
+    display_tz: str,
+    version: str,
+    theme: str,
+    reveal_projects: bool,
+) -> "ShareSnapshot":
+    """Build a ShareSnapshot for `cctally monthly`.
+
+    `rows` is the in-memory `BucketUsage` list produced by `_aggregate_monthly`
+    inside `cmd_monthly`. Each bucket has: `bucket` (YYYY-MM string),
+    `cost_usd`, and `model_breakdowns` (list[dict] sorted by cost desc).
+
+    Deviations from the plan sketch (which assumed dict rows with keys
+    `month` / `cost_usd` / `sessions`):
+
+    - Rows are `BucketUsage` dataclasses; we read fields by attribute.
+    - The plan's `Sessions` column has no source in the underlying data
+      (`BucketUsage` carries no session count and `_aggregate_monthly`
+      never computes one). Substituted with a `Tokens` column carrying
+      total tokens — meaningful info already on the dataclass.
+    - `Δ vs prior` is computed on `cost_usd` between consecutive ASC-sorted
+      months, matching the plan's intent.
+
+    Caller MUST pass `rows` in chronological order so the BarChart bars line
+    up left-to-right with time. `_aggregate_monthly` already returns asc;
+    the gate site fires before the `--order desc` reversal in `cmd_monthly`.
+
+    `theme` and `reveal_projects` flow into the subtitle directly so the
+    builder owns the canonical subtitle shape — no post-build re-stamp at
+    the gate site.
+    """
+    _lib_share = _share_load_lib()
+    columns = (
+        _lib_share.ColumnSpec(key="month", label="Month", align="left"),
+        _lib_share.ColumnSpec(key="cost", label="$ Cost", align="right",
+                              emphasis=True),
+        _lib_share.ColumnSpec(key="tokens", label="Tokens", align="right"),
+        _lib_share.ColumnSpec(key="delta", label="Δ vs prior", align="right"),
+    )
+    snap_rows: list = []
+    chart_pts: list = []
+    prev_cost: float | None = None
+    for i, r in enumerate(rows):
+        # `BucketUsage.bucket` is typed `str` ("YYYY-MM"); guard against
+        # empty / unparseable but skip the dead `dt.date` branch.
+        bucket = getattr(r, "bucket", None)
+        month_str = bucket if isinstance(bucket, str) and bucket else "—"
+        cost_usd = float(getattr(r, "cost_usd", 0.0) or 0.0)
+        total_tokens = int(getattr(r, "total_tokens", 0) or 0)
+        if prev_cost is not None and prev_cost > 0:
+            delta_pct = (cost_usd - prev_cost) / prev_cost * 100.0
+            delta_cell = _lib_share.DeltaCell(value=delta_pct, unit="%")
+        else:
+            delta_cell = _lib_share.TextCell("—")
+        snap_rows.append(_lib_share.Row(cells={
+            "month": _lib_share.TextCell(month_str),
+            "cost": _lib_share.MoneyCell(cost_usd),
+            "tokens": _lib_share.TextCell(f"{total_tokens:,}"),
+            "delta": delta_cell,
+        }))
+        chart_pts.append(_lib_share.ChartPoint(
+            x_label=month_str,
+            x_value=float(i),
+            y_value=cost_usd,
+        ))
+        prev_cost = cost_usd
+    chart = (
+        _lib_share.BarChart(points=tuple(chart_pts), y_label="$")
+        if chart_pts else None
+    )
+    sum_cost = sum(p.y_value for p in chart_pts)
+    avg_cost = (sum_cost / len(chart_pts)) if chart_pts else 0.0
+    totals = (
+        _lib_share.Totalled(label="Sum", value=f"${sum_cost:,.2f}"),
+        _lib_share.Totalled(label="Months", value=str(len(chart_pts))),
+        _lib_share.Totalled(label="Avg / month", value=f"${avg_cost:,.2f}"),
+    )
+    if rows:
+        title = (
+            f"Monthly usage — {period_start.strftime('%Y-%m')} → "
+            f"{period_end.strftime('%Y-%m')}"
+        )
+    else:
+        title = "Monthly usage — no data"
+    period_label = (
+        f"{period_start.strftime('%Y-%m')} → "
+        f"{period_end.strftime('%Y-%m')} ({display_tz})"
+    )
+    subtitle = " · ".join([
+        period_label,
+        theme,
+        "real projects" if reveal_projects else "projects anonymized",
+    ])
+    return _lib_share.ShareSnapshot(
+        cmd="monthly",
         title=title,
         subtitle=subtitle,
         period=_lib_share.PeriodSpec(
