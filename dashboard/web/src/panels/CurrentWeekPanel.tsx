@@ -142,15 +142,11 @@ export function CurrentWeekPanel() {
                   <span className="v cyan">{fmt.pct1(cw?.five_hour_pct)}</span>
                 </div>
                 {fhb ? (
-                  fhb.crossed_seven_day_reset ? (
-                    <div className="sub cw-delta-row delta-elevated">⚡ reset</div>
-                  ) : (
-                    <div
-                      className={`sub cw-delta-row ${fiveHourDeltaCls(fhb.seven_day_pct_delta_pp)}`}
-                    >
-                      Δ {fmt.pp(fhb.seven_day_pct_delta_pp)} this block
-                    </div>
-                  )
+                  <div
+                    className={`sub cw-delta-row ${fiveHourDeltaCls(fhb.seven_day_pct_delta_pp)}`}
+                  >
+                    {fhb.crossed_seven_day_reset ? '⚡ ' : ''}Δ {fmt.pp(fhb.seven_day_pct_delta_pp)} this block
+                  </div>
                 ) : (
                   <div className="sub">
                     resets in <span>{fmt.hhmm(cw?.five_hour_resets_in_sec)}</span>

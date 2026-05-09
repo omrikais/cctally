@@ -39,17 +39,35 @@ def ctx(tmp_path, monkeypatch):
     conn.close()
 
 
-def _seed_snapshot(conn: sqlite3.Connection, *, used_pct: float, key: int, captured: str):
+def _seed_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    used_pct: float,
+    key: int,
+    captured: str,
+    week_start_date: str = "2026-04-25",
+    week_end_date: str = "2026-05-02",
+    week_start_at: "str | None" = None,
+):
     # Schema: weekly_usage_snapshots has weekly_percent (not used_pct) and
     # requires payload_json NOT NULL (see open_db at bin/cctally:7341).
+    # ``week_start_at`` (TEXT, nullable) was added later via
+    # ``add_column_if_missing``; tests that exercise the post-reset
+    # delta lookup MUST set it because the helper uses
+    # ``snap.week_start_at`` to scope the post-reset snapshot lookup.
     conn.execute(
         """
         INSERT INTO weekly_usage_snapshots (
             week_start_date, week_end_date, captured_at_utc,
+            week_start_at,
             weekly_percent, five_hour_window_key, payload_json
-        ) VALUES (?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        ("2026-04-25", "2026-05-02", captured, used_pct, key, "{}"),
+        (
+            week_start_date, week_end_date, captured,
+            week_start_at,
+            used_pct, key, "{}",
+        ),
     )
     conn.commit()
 
@@ -126,19 +144,50 @@ def test_block_window_mismatch_returns_none(ctx):
     assert fhb is None
 
 
-def test_crossed_reset_suppresses_delta(ctx):
+def test_crossed_reset_uses_post_reset_anchor(ctx):
+    """Crossed-reset block: delta is recomputed from the first post-reset
+    snapshot in the block, NOT suppressed (NOT None). This lets the panel
+    surface "⚡ Δ +Xpp this block" — informative — instead of "⚡ reset"
+    (which hid the actually useful number)."""
     ns, conn = ctx
+    # Block straddles the natural boundary at ``2026-04-30T10:45``.
     _seed_block(conn, key=1777595400, start_iso="2026-04-30T10:30:00+00:00",
                 p_start=95.0, p_end=5.0, crossed=1)
-    _seed_snapshot(conn, used_pct=5.0, key=1777595400,
-                   captured="2026-04-30T11:00:00+00:00")
+    # Pre-reset snapshot (still in OLD week — different week_start_at).
+    _seed_snapshot(
+        conn, used_pct=95.0, key=1777595400,
+        captured="2026-04-30T10:40:00+00:00",
+        week_start_date="2026-04-23", week_end_date="2026-04-30",
+        week_start_at="2026-04-23T05:00:00+00:00",
+    )
+    # First post-reset snapshot — drops to 0%, NEW week_start_at.
+    _seed_snapshot(
+        conn, used_pct=0.0, key=1777595400,
+        captured="2026-04-30T10:50:00+00:00",
+        week_start_date="2026-04-30", week_end_date="2026-05-07",
+        week_start_at="2026-04-30T05:00:00+00:00",
+    )
+    # Latest snapshot (also post-reset) — current 7d% = 5%.
+    _seed_snapshot(
+        conn, used_pct=5.0, key=1777595400,
+        captured="2026-04-30T11:00:00+00:00",
+        week_start_date="2026-04-30", week_end_date="2026-05-07",
+        week_start_at="2026-04-30T05:00:00+00:00",
+    )
 
     fhb = ns["_select_current_block_for_envelope"](
         conn, current_used_pct=5.0, now_utc=_PINNED_NOW,
     )
     assert fhb is not None
     assert fhb["crossed_seven_day_reset"] is True
-    assert fhb["seven_day_pct_delta_pp"] is None
+    # Pre-reset block-start anchor stays in the envelope so consumers
+    # still know the original block start; the React panel reads the
+    # delta only.
+    assert fhb["seven_day_pct_at_block_start"] == 95.0
+    # Delta is computed against the FIRST post-reset snapshot's
+    # weekly_percent (0.0), NOT the pre-reset block-start anchor:
+    # 5.0 - 0.0 = 5.0pp.
+    assert fhb["seven_day_pct_delta_pp"] == pytest.approx(5.0, abs=1e-9)
 
 
 def test_now_utc_filter_excludes_future_snapshot(ctx):

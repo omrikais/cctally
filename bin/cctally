@@ -28648,13 +28648,22 @@ def _select_current_block_for_envelope(
     envelope convention (``current_week`` is snake_case; CLI ``--json`` is
     camelCase — separate conventions, see CLAUDE.md).
 
-    Delta is suppressed (``None``) when ``crossed_seven_day_reset == 1`` OR
-    when ``seven_day_pct_at_block_start IS NULL`` OR when
-    ``current_used_pct`` is None.
+    Delta semantics:
+      - Non-crossed block: ``current_used_pct - seven_day_pct_at_block_start``
+        (the natural "how much 7d% has changed during this 5h block" read).
+      - Crossed block (``crossed_seven_day_reset == 1``): the block straddles
+        a weekly reset, so the natural delta would be dominated by the
+        reset itself (e.g. −94pp) rather than the user's actual burn-rate.
+        Compute the POST-RESET delta instead — ``current_used_pct -
+        weekly_percent_at_first_post_reset_snapshot_in_block``. The React
+        panel prefixes this delta with ``⚡`` to show the reset crossing
+        without hiding the informative number.
+      - ``None`` only when ``current_used_pct`` is unknown OR the
+        block-start anchor is missing AND no post-reset anchor was found.
     """
     snap = conn.execute(
         """
-        SELECT five_hour_window_key
+        SELECT five_hour_window_key, week_start_at
           FROM weekly_usage_snapshots
          WHERE captured_at_utc <= ?
          ORDER BY captured_at_utc DESC, id DESC
@@ -28667,7 +28676,8 @@ def _select_current_block_for_envelope(
 
     block = conn.execute(
         """
-        SELECT block_start_at, seven_day_pct_at_block_start,
+        SELECT block_start_at, last_observed_at_utc,
+               seven_day_pct_at_block_start,
                crossed_seven_day_reset
           FROM five_hour_blocks
          WHERE five_hour_window_key = ?
@@ -28681,9 +28691,39 @@ def _select_current_block_for_envelope(
 
     crossed = bool(block["crossed_seven_day_reset"])
     p_start = block["seven_day_pct_at_block_start"]
+
+    # When the block crossed a weekly reset, recompute the delta against
+    # the first post-reset snapshot inside the block instead of the
+    # pre-reset block-start anchor. Use ``unixepoch()`` because
+    # ``block_start_at`` is host-local-tz (``+03:00``) while
+    # ``captured_at_utc`` is canonical UTC-Z; lex compares mis-order
+    # mixed-offset moments. ``snap.week_start_at`` is the latest
+    # (post-reset) week's anchor, so equality on that column scopes
+    # the lookup to the current weekly window.
+    p_anchor = p_start
+    if crossed and snap["week_start_at"] is not None:
+        post = conn.execute(
+            """
+            SELECT weekly_percent
+              FROM weekly_usage_snapshots
+             WHERE week_start_at = ?
+               AND unixepoch(captured_at_utc) >= unixepoch(?)
+               AND unixepoch(captured_at_utc) <= unixepoch(?)
+             ORDER BY captured_at_utc ASC, id ASC
+             LIMIT 1
+            """,
+            (
+                snap["week_start_at"],
+                block["block_start_at"],
+                _iso_z(now_utc),
+            ),
+        ).fetchone()
+        if post is not None and post["weekly_percent"] is not None:
+            p_anchor = float(post["weekly_percent"])
+
     delta = (
-        None if (crossed or p_start is None or current_used_pct is None)
-        else round(current_used_pct - p_start, 9)
+        None if (p_anchor is None or current_used_pct is None)
+        else round(current_used_pct - p_anchor, 9)
     )
     return {
         "block_start_at":               block["block_start_at"],

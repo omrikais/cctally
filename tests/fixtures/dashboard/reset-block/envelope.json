@@ -22,7 +22,7 @@
     "five_hour_block": {
       "block_start_at": "2026-04-30T19:30:00+00:00",
       "seven_day_pct_at_block_start": 95.0,
-      "seven_day_pct_delta_pp": null,
+      "seven_day_pct_delta_pp": 5.0,
       "crossed_seven_day_reset": true
     }
   },
