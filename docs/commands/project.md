@@ -91,3 +91,8 @@ Terminal output is a ccusage-style ANSI table matching the shape of
 - `daily` / `weekly` / `monthly` — rollup by time bucket
 - `report` — weekly $/1% trend with retrospective snapshot cost
 - `forecast` — will I cap this week?
+
+
+## Shareable output
+
+`cctally project` accepts `--format {md,html,svg}` and related flags for shareable artifacts. See [share.md](share.md) for the full flag reference.

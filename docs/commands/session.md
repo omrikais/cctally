@@ -62,3 +62,8 @@ full list of files.
 
 - [`codex-session`](codex-session.md) — Codex equivalent (same column layout)
 - [Architecture · cache.db](../architecture.md#the-session-entry-cache-cachedb)
+
+
+## Shareable output
+
+`cctally session` accepts `--format {md,html,svg}` and related flags for shareable artifacts. See [share.md](share.md) for the full flag reference.

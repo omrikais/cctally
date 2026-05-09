@@ -47,3 +47,8 @@ cctally daily --order desc
 - [`monthly`](monthly.md), [`weekly`](weekly.md) — coarser buckets, same data
 - [`blocks`](blocks.md) — finer buckets (5-hour windows)
 - [`session`](session.md) — group by `sessionId` instead of by date
+
+
+## Shareable output
+
+`cctally daily` accepts `--format {md,html,svg}` and related flags for shareable artifacts. See [share.md](share.md) for the full flag reference.

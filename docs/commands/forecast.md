@@ -72,3 +72,8 @@ cctally forecast --json | jq '.forecast'
 cctally forecast --status-line --no-sync
 cctally forecast --targets 100,95,85
 ```
+
+
+## Shareable output
+
+`cctally forecast` accepts `--format {md,html,svg}` and related flags for shareable artifacts. See [share.md](share.md) for the full flag reference.

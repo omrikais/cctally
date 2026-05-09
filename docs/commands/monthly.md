@@ -43,3 +43,8 @@ cctally monthly --order desc
 
 - [`daily`](daily.md), [`weekly`](weekly.md) — finer buckets
 - [`codex-monthly`](codex-monthly.md) — Codex equivalent
+
+
+## Shareable output
+
+`cctally monthly` accepts `--format {md,html,svg}` and related flags for shareable artifacts. See [share.md](share.md) for the full flag reference.

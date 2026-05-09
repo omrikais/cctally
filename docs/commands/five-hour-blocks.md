@@ -116,3 +116,8 @@ The sentinel `"projectPath": "(unknown)"` covers entries with NULL
 - [`blocks`](blocks.md) — upstream-parity drop-in including heuristic windows
 - [`five-hour-breakdown`](five-hour-breakdown.md) — per-percent milestones inside one block
 - [`record-usage`](record-usage.md) — populates `five_hour_blocks` each tick
+
+
+## Shareable output
+
+`cctally five-hour-blocks` accepts `--format {md,html,svg}` and related flags for shareable artifacts. See [share.md](share.md) for the full flag reference.

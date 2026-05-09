@@ -65,3 +65,8 @@ cctally weekly --order desc
 - [`daily`](daily.md), [`monthly`](monthly.md) — calendar-aligned buckets
 - [`report`](report.md) — same `$/1%` metric, snapshot-based instead of recomputed
 - [Architecture · week boundaries](../architecture.md#week-boundaries)
+
+
+## Shareable output
+
+`cctally weekly` accepts `--format {md,html,svg}` and related flags for shareable artifacts. See [share.md](share.md) for the full flag reference.

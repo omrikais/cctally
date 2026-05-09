@@ -64,3 +64,8 @@ shortcut — it's exactly `report --sync-current "$@"`.
 - [`record-usage`](record-usage.md) — produces the usage half of the join
 - [`percent-breakdown`](percent-breakdown.md) — same milestones `--detail` shows
 - [`cctally-dollar-per-percent`](../../bin/cctally-dollar-per-percent) — wrapper
+
+
+## Shareable output
+
+`cctally report` accepts `--format {md,html,svg}` and related flags for shareable artifacts. See [share.md](share.md) for the full flag reference.
