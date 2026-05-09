@@ -5,7 +5,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Shareable reports — all 8 reporting subcommands (`report`, `daily`,
+  `monthly`, `weekly`, `forecast`, `project`, `five-hour-blocks`, `session`)
+  now accept `--format md|html|svg` to emit shareable artifacts to a
+  filename like `cctally-<cmd>-<utcdate>.<ext>`. Flags: `--theme light|dark`,
+  `--no-branding`, `--reveal-projects` (project labels are anonymized to
+  `project-N` by default), `--output <path>` / `--output -` for stdout,
+  `--copy` (markdown only), `--open` (html/svg only). `session --format`
+  also accepts `--top-n N` to cap the chart's project breakdown.
+  See `docs/commands/share.md` and the per-command "Shareable output"
+  sections.
+
 ### Fixed
+- Dashboard 5-hour row now shows the post-reset delta (`⚡ Δ +Xpp this
+  block`) when a 5h block spans a weekly reset, instead of suppressing
+  the number behind a `⚡ reset` line. The cross-reset flag now detects
+  natural weekly boundaries from `weekly_usage_snapshots.week_start_at`
+  in addition to Anthropic-shifted mid-week resets, and all interval
+  comparisons normalize through `unixepoch()` so the flag flips
+  correctly on non-UTC hosts (the prior lex-compare silently failed
+  for `+03:00` and other non-zero offsets, leaving the panel showing
+  a misleading `Δ −94pp this block`).
 - `record-usage`: self-heal `percent_milestones` and `five_hour_blocks` rows
   that were silently dropped when an earlier invocation was killed between
   snapshot insert and milestone insert (e.g. Claude Code self-update kill
