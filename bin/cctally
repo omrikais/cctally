@@ -20137,6 +20137,59 @@ def _settings_merge_uninstall(settings: dict) -> tuple[dict, int]:
     return settings, removed
 
 
+def _settings_merge_unwire_legacy(settings: dict) -> tuple[dict, int]:
+    """Remove legacy-bespoke hook entries from ``settings`` in place.
+
+    Mirrors _settings_merge_uninstall's structure but matches against
+    the legacy command set rather than the cctally one. Returns
+    (mutated_settings, removed_count). Empty event lists are dropped.
+    Trailing '&' is stripped before tokenizing so legacy installs that
+    background the daemon-start hook still match.
+    """
+    import shlex as _shlex
+    canonical = {(ev, tuple(_shlex.split(cmd))) for ev, cmd in _LEGACY_BESPOKE_COMMANDS}
+    canonical_raw = {(ev, cmd) for ev, cmd in _LEGACY_BESPOKE_COMMANDS}
+    hooks_root = settings.get("hooks")
+    if not isinstance(hooks_root, dict):
+        return settings, 0
+    removed = 0
+    for ev in [k for k in hooks_root.keys()]:  # snapshot keys; we may del
+        lst = hooks_root.get(ev)
+        if not isinstance(lst, list):
+            continue
+        new_list: list = []
+        for grp in lst:
+            if not isinstance(grp, dict):
+                new_list.append(grp)
+                continue
+            inner = grp.get("hooks", [])
+            if not isinstance(inner, list):
+                new_list.append(grp)
+                continue
+            kept_inner = []
+            for h in inner:
+                cmd = h.get("command", "") if isinstance(h, dict) else ""
+                stripped = cmd.strip().rstrip("&").strip() if isinstance(cmd, str) else ""
+                try:
+                    tokens = tuple(_shlex.split(stripped))
+                except ValueError:
+                    kept_inner.append(h)
+                    continue
+                if (ev, tokens) in canonical or (ev, stripped) in canonical_raw:
+                    removed += 1
+                    continue
+                kept_inner.append(h)
+            if kept_inner:
+                grp["hooks"] = kept_inner
+                new_list.append(grp)
+            # else: matcher group's only entry was ours → drop the group
+        if new_list:
+            hooks_root[ev] = new_list
+        else:
+            del hooks_root[ev]
+    return settings, removed
+
+
 def _hook_tick_log_line(line: str) -> None:
     """Append one line to hook-tick.log; create dir if missing.
 
@@ -21731,6 +21784,25 @@ def _setup_shell_rc_hint() -> str:
     return "your shell rc"
 
 
+# Legacy bespoke hook set — see docs/superpowers/specs/2026-05-09-auto-migrate-legacy-hooks-design.md
+_LEGACY_BESPOKE_HOOKS_DIR = pathlib.Path.home() / ".claude" / "hooks"
+_LEGACY_BESPOKE_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("Stop",          "python3 ~/.claude/hooks/record-usage-stop.py"),
+    ("SubagentStart", "python3 ~/.claude/hooks/usage-poller-start.py"),
+    ("SubagentStop",  "python3 ~/.claude/hooks/usage-poller-stop.py"),
+)
+_LEGACY_BESPOKE_FILENAMES: tuple[str, ...] = (
+    "record-usage-stop.py",
+    "usage-poller-start.py",
+    "usage-poller-stop.py",
+    "usage-poller.py",
+)
+_LEGACY_POLLER_PID_FILE = pathlib.Path("/tmp/claude-usage-poller.pid")
+_LEGACY_POLLER_COUNT_FILE = pathlib.Path("/tmp/claude-usage-poller.count")
+_LEGACY_BACKUP_DIR_PREFIX = "cctally-legacy-hook-backup-"
+_LEGACY_POLLER_SIGTERM_GRACE_S = 0.250
+
+
 def _setup_detect_legacy_snippet() -> tuple[pathlib.Path, list[int]] | None:
     """Return (path, [line_numbers]) of the first file containing the snippet, or None."""
     for path in LEGACY_STATUSLINE_PATHS:
@@ -21744,6 +21816,294 @@ def _setup_detect_legacy_snippet() -> tuple[pathlib.Path, list[int]] | None:
         if hits:
             return (path, hits)
     return None
+
+
+def _setup_detect_legacy_bespoke_hooks(settings: dict) -> dict:
+    """Detect legacy bespoke hook state per spec Section 1.
+
+    Detection fires when ANY of the 3 canonical settings.json command
+    strings matches an installed entry, OR ANY of the 4 canonical
+    .py files exists at its canonical path under _LEGACY_BESPOKE_HOOKS_DIR.
+
+    Returns a dict with keys:
+      detected: bool
+      settings_entries: list of {"event": str, "command": str}
+      files: list of str (rendered with ~/.claude/hooks/ prefix)
+    """
+    import shlex as _shlex
+    canonical_cmds = {(ev, cmd) for ev, cmd in _LEGACY_BESPOKE_COMMANDS}
+    canonical_tokens = {(ev, tuple(_shlex.split(cmd))) for ev, cmd in _LEGACY_BESPOKE_COMMANDS}
+
+    found_entries: list[dict] = []
+    hooks_root = settings.get("hooks", {}) if isinstance(settings, dict) else {}
+    if isinstance(hooks_root, dict):
+        for event, lst in hooks_root.items():
+            if not isinstance(lst, list):
+                continue
+            matched_for_this_event = False
+            for grp in lst:
+                if matched_for_this_event:
+                    break  # already recorded one row for this event; don't double-count
+                if not isinstance(grp, dict):
+                    continue
+                inner = grp.get("hooks", [])
+                if not isinstance(inner, list):
+                    # Mirrors the unwire helper's defensive guard: malformed
+                    # `hooks` value (None / int / dict) must not crash iteration.
+                    continue
+                for h in inner:
+                    if not isinstance(h, dict):
+                        continue
+                    raw = h.get("command", "")
+                    if not isinstance(raw, str):
+                        continue
+                    stripped = raw.strip().rstrip("&").strip()
+                    try:
+                        tokens = tuple(_shlex.split(stripped))
+                    except ValueError:
+                        continue
+                    if (event, tokens) in canonical_tokens or (event, stripped) in canonical_cmds:
+                        # Record the canonical (clean) form for stable JSON output,
+                        # not the user's possibly-decorated raw command.
+                        clean_cmd = next(
+                            cmd for ev, cmd in _LEGACY_BESPOKE_COMMANDS if ev == event
+                        )
+                        found_entries.append({"event": event, "command": clean_cmd})
+                        matched_for_this_event = True
+                        break  # one entry per matcher group is enough
+
+    found_files: list[str] = []
+    for name in _LEGACY_BESPOKE_FILENAMES:
+        p = _LEGACY_BESPOKE_HOOKS_DIR / name
+        if p.exists():
+            # Render with the ~ prefix the spec uses for stable JSON.
+            found_files.append(f"~/.claude/hooks/{name}")
+
+    return {
+        "detected": bool(found_entries) or bool(found_files),
+        "settings_entries": found_entries,
+        "files": found_files,
+    }
+
+
+def _legacy_resolve_backup_dir() -> pathlib.Path:
+    """Return ~/.claude/cctally-legacy-hook-backup-<UTC YYYYMMDD-HHMMSS>/.
+
+    Honors CCTALLY_AS_OF for fixture stability via _command_as_of(). Created
+    on demand. Idempotent within the same wall-second (mkdir(exist_ok=True)).
+
+    See spec Section 1 ("What gets touched on accept" → step 2) and
+    Section 2 ("Sequence position", step 6a). Backup dir is timestamped
+    so a re-run never overwrites a prior migration's snapshot.
+    """
+    now = _command_as_of()
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    base = pathlib.Path.home() / ".claude" / f"{_LEGACY_BACKUP_DIR_PREFIX}{stamp}"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _legacy_move_files_to_backup(backup_dir: pathlib.Path) -> list[pathlib.Path]:
+    """Move present canonical .py files from `_LEGACY_BESPOKE_HOOKS_DIR` into backup_dir.
+
+    Each canonical filename is moved only if present at its canonical path;
+    missing files are silent no-ops (per spec Section 1: "Missing files are
+    silent no-ops in the move loop"). Returns the list of destination paths
+    actually written, in canonical (`_LEGACY_BESPOKE_FILENAMES`) order.
+
+    Uses `shutil.move` (canonical Python idiom): same-filesystem renames
+    go through `os.rename`, cross-device moves fall through to
+    `copy2 + unlink` atomically — and a failure on the unlink leg raises
+    `OSError` instead of silently leaving a duplicate at both src and dst
+    (which the prior hand-rolled try/except/inner-try did).
+    """
+    moved: list[pathlib.Path] = []
+    for name in _LEGACY_BESPOKE_FILENAMES:
+        src = _LEGACY_BESPOKE_HOOKS_DIR / name
+        if not src.exists():
+            continue
+        dst = backup_dir / name
+        try:
+            shutil.move(str(src), str(dst))
+        except OSError:
+            # Best-effort: a failed move is silent; spec Section 1 step 2
+            # treats the move loop's failures as no-ops (the daemon-stop
+            # follow-up handles user-facing damage control).
+            continue
+        moved.append(dst)
+    return moved
+
+
+def _legacy_stop_active_poller() -> str:
+    """Best-effort SIGTERM (then SIGKILL) the bespoke daemon if alive.
+
+    Per spec Section 1 step 3: read /tmp/claude-usage-poller.pid, send
+    SIGTERM, wait `_LEGACY_POLLER_SIGTERM_GRACE_S`, send SIGKILL if still
+    alive. All steps are best-effort and silent on failure — the daemon
+    may already be dead, the PID may be stale, the rlimits may forbid
+    signaling, or the file may simply be absent.
+
+    Returns one of:
+      "no-pid-file"       — no /tmp/claude-usage-poller.pid present
+      "stale-pid"         — PID file exists but the PID isn't a live process
+                            (also returned on parse failure)
+      "sigterm-took"      — SIGTERM landed and the process exited within
+                            the grace window
+      "sigkill-took"      — SIGTERM did not stop it; SIGKILL landed
+      "permission-denied" — kernel refused to signal the PID (EPERM)
+    """
+    import signal as _signal
+
+    if not _LEGACY_POLLER_PID_FILE.exists():
+        return "no-pid-file"
+    try:
+        raw = _LEGACY_POLLER_PID_FILE.read_text(encoding="utf-8", errors="replace").strip()
+        pid = int(raw)
+    except (OSError, ValueError):
+        # Unreadable or non-numeric content → treat as stale (a corrupted
+        # PID file is functionally indistinguishable from a stale one;
+        # the cleanup helper will unlink it next).
+        return "stale-pid"
+
+    # Aliveness probe: signal 0 doesn't deliver but does the permission
+    # + existence check. ProcessLookupError → stale; PermissionError →
+    # we'd fail the actual signal too, surface that distinctly.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "stale-pid"
+    except PermissionError:
+        return "permission-denied"
+    except OSError:
+        return "stale-pid"
+
+    # Process is alive. SIGTERM, then poll for exit within the grace.
+    try:
+        os.kill(pid, _signal.SIGTERM)
+    except ProcessLookupError:
+        # Race: process exited between probe and signal — treat as success.
+        return "sigterm-took"
+    except PermissionError:
+        return "permission-denied"
+    except OSError:
+        # Residual OSError after ProcessLookupError/PermissionError are caught
+        # specifically — exotic kernel refusal (ENOMEM during signal queueing,
+        # LSM denial, etc.). Map to permission-denied: spec contract forbids
+        # raising, and "we couldn't deliver the signal" is the closest existing
+        # outcome.
+        return "permission-denied"
+
+    deadline = time.monotonic() + _LEGACY_POLLER_SIGTERM_GRACE_S
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "sigterm-took"
+        except OSError:
+            return "sigterm-took"
+        time.sleep(0.01)
+
+    # Still alive after grace → SIGKILL fallback.
+    try:
+        os.kill(pid, _signal.SIGKILL)
+    except ProcessLookupError:
+        # Exited just at the grace boundary — count as SIGTERM-took.
+        return "sigterm-took"
+    except PermissionError:
+        return "permission-denied"
+    except OSError:
+        # Same residual-OSError category as the SIGTERM site above.
+        return "permission-denied"
+    return "sigkill-took"
+
+
+def _legacy_cleanup_tmp_sentinels() -> list[str]:
+    """Unlink the bespoke poller's PID + count files. Best-effort; missing
+    files are silent no-ops (FileNotFoundError) and so are unwritable
+    parents (OSError). Returns the paths actually unlinked, as strings,
+    in canonical (pid, count) order.
+
+    Per spec Section 1 step 3 and Section 2 step 6b — runs after the
+    SIGTERM/SIGKILL helper so a successful daemon stop also clears the
+    sentinels it left on /tmp.
+    """
+    unlinked: list[str] = []
+    for p in (_LEGACY_POLLER_PID_FILE, _LEGACY_POLLER_COUNT_FILE):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+        unlinked.append(str(p))
+    return unlinked
+
+
+def _setup_read_legacy_prompt_input(stream, reprompt: str | None = None) -> bool:
+    """Read a y/N answer from `stream` per spec Section 2 prompt rules.
+
+    Empty input (just Enter) → True (the documented default).
+    'y'/'yes' (any case) → True.
+    'n'/'no' (any case) → False.
+    EOF before any character → False (decline; explicitly NOT default-Y, so
+    non-TTY callers can't auto-accept via inherited stdin closure).
+    Anything else → re-prompt up to 3 times, then False with a stderr warning.
+
+    `reprompt`: optional text to emit to stderr before each attempt AFTER the
+    first (the caller already printed the original prompt body before calling
+    us). When None (test default), no reprompt is emitted — useful for unit
+    tests that drive `stream` from io.StringIO.
+    """
+    yes_words = {"y", "yes"}
+    no_words = {"n", "no"}
+    for attempt in range(3):
+        if attempt > 0 and reprompt is not None:
+            eprint(reprompt)
+        line = stream.readline()
+        if line == "":
+            return False  # EOF → decline
+        token = line.strip().lower()  # whitespace-only counts as "just Enter" → default-Y
+        if token == "":
+            return True
+        if token in yes_words:
+            return True
+        if token in no_words:
+            return False
+    eprint("setup: invalid responses 3 times; skipping migration")
+    return False
+
+
+def _setup_legacy_decide_action(args, detected: bool, stdin_isatty: bool) -> tuple[str, str | None]:
+    """Decide migration action without performing prompt I/O.
+
+    Returns (decision, reason) where decision is one of:
+      - "migrate" — proceed with migration
+      - "skip" — do not migrate; reason is one of "not_detected" /
+        "no_migrate_flag" / "user_declined". This helper never returns
+        "user_declined"; that reason is set by the caller after a
+        "prompt" decision yields a No answer from
+        _setup_read_legacy_prompt_input.
+      - "prompt" — caller must read user input via the prompt helper.
+
+    Spec Section 2 prompt rules: detection short-circuits, explicit flags
+    are decisive, --yes implies migrate, --json or non-TTY without a flag
+    skips silently (the JSON envelope and unattended runs both need a
+    no-blocking-input contract). When none of those hold, the caller is
+    in interactive install with detected hooks → prompt.
+    """
+    if not detected:
+        return ("skip", "not_detected")
+    if getattr(args, "no_migrate_legacy_hooks", False):
+        return ("skip", "no_migrate_flag")
+    if getattr(args, "migrate_legacy_hooks", False):
+        return ("migrate", None)
+    if getattr(args, "yes", False):
+        return ("migrate", None)
+    if not stdin_isatty:
+        return ("skip", "no_migrate_flag")
+    if getattr(args, "json", False):
+        return ("skip", "no_migrate_flag")
+    return ("prompt", None)
 
 
 def _setup_oauth_token_present() -> bool:
@@ -22127,6 +22487,37 @@ def _setup_emit_text(lines: list[str]) -> None:
         print(ln)
 
 
+def _setup_render_legacy_prompt(detection: dict) -> str:
+    """Return the multi-line prompt body per spec Section 2.
+
+    Renders the ⚠ header, one row per detected (event → file) settings
+    entry, an optional daemon-source line for usage-poller.py, the
+    explanation of the silent failure mode, and the [Y/n] question.
+    Caller is expected to print the body once and then dispatch to
+    `_setup_read_legacy_prompt_input` for the actual answer.
+    """
+    lines = ["⚠ Detected legacy bespoke hooks (predate `cctally setup`):"]
+    by_event = {e["event"]: e["command"] for e in detection["settings_entries"]}
+    for ev in ("Stop", "SubagentStart", "SubagentStop"):
+        cmd = by_event.get(ev, "")
+        if cmd:
+            file_part = cmd.replace("python3 ", "")
+            lines.append(f"    {file_part:38s}  →  hooks.{ev}")
+    if any("usage-poller.py" in f for f in detection["files"]):
+        lines.append("    ~/.claude/hooks/usage-poller.py            (daemon spawned by usage-poller-start.py)")
+    lines += [
+        "",
+        "  Their delegate binary isn't on PATH on this system — every fire has",
+        "  been silently failing.",
+        "",
+        "  Migrate now? Will unwire the settings.json entries and move the .py files",
+        "  to ~/.claude/cctally-legacy-hook-backup-<UTC ts>/. Reversible.",
+        "",
+        "  Migrate? [Y/n]",
+    ]
+    return "\n".join(lines)
+
+
 def _setup_install(args: argparse.Namespace) -> int:
     """Install path. Returns exit code per Section 2 of spec."""
     out: list[str] = []
@@ -22157,6 +22548,48 @@ def _setup_install(args: argparse.Namespace) -> int:
     except SetupError as exc:
         eprint(f"setup: {exc}")
         return 1
+
+    # ── Legacy bespoke hook detection + migration decision (spec §1, §2) ──
+    # Detection is read-only on the in-memory settings dict; decision is
+    # pure (no I/O); the prompt fires only when the decision helper
+    # returns "prompt" (TTY + no flag + not --json). All three must run
+    # BEFORE `_settings_merge_install` so the unwire+add land in the same
+    # atomic write at sequence position 6.
+    detection = _setup_detect_legacy_bespoke_hooks(settings)
+    decision, reason = _setup_legacy_decide_action(
+        args,
+        detected=detection["detected"],
+        stdin_isatty=sys.stdin.isatty(),
+    )
+    if decision == "prompt":
+        print(_setup_render_legacy_prompt(detection))
+        accepted = _setup_read_legacy_prompt_input(
+            sys.stdin,
+            reprompt="Please answer y or n. Migrate? [Y/n]",
+        )
+        decision = "migrate" if accepted else "skip"
+        if not accepted:
+            reason = "user_declined"
+
+    migration_summary: dict = {
+        "performed": False,
+        "reason": reason or "not_detected",
+    }
+
+    if decision == "migrate":
+        # Unwire BEFORE the merge so the same atomic write removes legacy
+        # entries and adds cctally entries (spec §2 step 6).
+        settings, n_unwired = _settings_merge_unwire_legacy(settings)
+        migration_summary = {
+            "performed": True,
+            "settings_entries_removed": n_unwired,
+            "files_moved": 0,
+            "backup_dir": None,
+            "active_poller_pid_signaled": None,
+            "active_poller_kill_outcome": None,
+            "tmp_files_unlinked": [],
+        }
+
     try:
         _settings_merge_install(settings, abs_path)
     except SetupError as exc:
@@ -22197,6 +22630,61 @@ def _setup_install(args: argparse.Namespace) -> int:
         eprint(f"setup: failed to write {CLAUDE_SETTINGS_PATH}: {exc}")
         return 2
     out.append(f"✓ Wrote {len(SETUP_HOOK_EVENTS)} hook entries to {CLAUDE_SETTINGS_PATH}")
+
+    # ── Post-write migration apply (spec §2 steps 6a, 6b) ──
+    # Settings.json is now durable. File moves, poller stop, and tmp
+    # cleanup are best-effort and may emit a partial-move warning, but
+    # do NOT roll back the on-disk settings.json. Per spec §2 exit-code
+    # table, partial-move failures are uniformly exit-0-with-warning.
+    if decision == "migrate":
+        backup_dir = _legacy_resolve_backup_dir()
+        # Snapshot what we expected to move BEFORE the move so we can
+        # detect partial failure cleanly (post-loop, src files are gone).
+        expected_to_move = [
+            n for n in _LEGACY_BESPOKE_FILENAMES
+            if (_LEGACY_BESPOKE_HOOKS_DIR / n).exists()
+        ]
+        moved = _legacy_move_files_to_backup(backup_dir)
+        migration_summary["files_moved"] = len(moved)
+        migration_summary["backup_dir"] = str(backup_dir)
+        if len(moved) < len(expected_to_move):
+            orphans = sorted(set(expected_to_move) - {p.name for p in moved})
+            out.append(
+                f"⚠ Partial file move: {len(moved)} of {len(expected_to_move)} expected "
+                f"files moved. Orphans: {', '.join(orphans)}"
+            )
+            warnings += 1
+
+        # Active-poller stop + tmp-sentinel cleanup (best-effort, silent
+        # on failure per spec §2 step 6b). Capture the pre-stop PID for
+        # the JSON envelope since the helper itself returns only the
+        # outcome string.
+        pid_signaled: int | None = None
+        if _LEGACY_POLLER_PID_FILE.exists():
+            try:
+                pid_signaled = int(
+                    _LEGACY_POLLER_PID_FILE.read_text(encoding="utf-8", errors="replace").strip()
+                )
+            except (OSError, ValueError):
+                pass
+        kill_outcome = _legacy_stop_active_poller()
+        migration_summary["active_poller_pid_signaled"] = pid_signaled
+        migration_summary["active_poller_kill_outcome"] = kill_outcome
+        migration_summary["tmp_files_unlinked"] = _legacy_cleanup_tmp_sentinels()
+
+        out.append(
+            f"✓ Migrated {migration_summary['settings_entries_removed']} legacy hook entries "
+            f"→ moved {len(moved)} files to {backup_dir}/"
+        )
+    elif decision == "skip" and reason in {"user_declined", "no_migrate_flag"}:
+        files_str = "{record-usage-stop,usage-poller{,-start,-stop}}.py"
+        out.append(
+            f"⚠ Legacy bespoke hooks detected (predate `cctally setup`; failing "
+            f"silently on this system). Skipped at your request. Re-run "
+            f"`cctally setup --migrate-legacy-hooks` later, or remove them yourself. "
+            f"The four `.py` files are at ~/.claude/hooks/{files_str}."
+        )
+        warnings += 1
 
     oauth = _setup_oauth_token_present()
     if oauth:
@@ -22253,6 +22741,13 @@ def _setup_install(args: argparse.Namespace) -> int:
             warnings += 1
 
     out.append("")
+    # Settings.json was modified — CC caches it at session start. The
+    # warning fires unconditionally because `_setup_install` always
+    # rewrites settings.json (legacy migration, fresh install, repair).
+    out.append("⚠ Restart Claude Code for the new hooks to take effect in any currently")
+    out.append("  open sessions. New sessions launched after this point pick them up")
+    out.append("  automatically. (settings.json is cached at session start.)")
+    out.append("")
     if warnings:
         out.append(f"cctally is ready (with {warnings} warning(s) above). Try:")
     else:
@@ -22284,7 +22779,13 @@ def _setup_install(args: argparse.Namespace) -> int:
             "path_includes_local_bin": _setup_path_includes_local_bin(),
             "legacy": {
                 "statusline_snippet_path": str(legacy[0]) if legacy else None,
+                "bespoke_hooks": {
+                    "detected": detection["detected"],
+                    "settings_entries": detection["settings_entries"],
+                    "files": detection["files"],
+                },
             },
+            "migration": migration_summary,
             "bootstrap": {
                 "session_cache_rows": bootstrap_rows,
                 "oauth_status": bootstrap_oauth_status,
@@ -22586,6 +23087,19 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
+    # Migration flags are install-mode-only. Reject combinations with
+    # --status or --uninstall (per spec Section 2 mode×flag matrix). The
+    # mutex group on the parser already prevents both flags being set
+    # together; here we guard the mode-axis pairing that argparse can't
+    # express in a single mutex group.
+    mig_flag = (
+        "--migrate-legacy-hooks" if getattr(args, "migrate_legacy_hooks", False)
+        else "--no-migrate-legacy-hooks" if getattr(args, "no_migrate_legacy_hooks", False)
+        else None
+    )
+    if mig_flag and (getattr(args, "status", False) or getattr(args, "uninstall", False)):
+        eprint(f"setup: {mig_flag} is install-mode only")
+        return 2
     if getattr(args, "uninstall", False):
         return _setup_uninstall(args)
     if getattr(args, "status", False):
@@ -24472,6 +24986,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip confirmations")
     sp.add_argument("--json", action="store_true",
                     help="Emit machine-readable output")
+    # Legacy bespoke-hook migration flags (install-mode only — see cmd_setup
+    # post-parse validation). Spec Section 2 mode×flag matrix.
+    mig_group = sp.add_mutually_exclusive_group()
+    mig_group.add_argument(
+        "--migrate-legacy-hooks", action="store_true", dest="migrate_legacy_hooks",
+        help="Auto-accept the legacy-bespoke-hook migration prompt (install only).",
+    )
+    mig_group.add_argument(
+        "--no-migrate-legacy-hooks", action="store_true", dest="no_migrate_legacy_hooks",
+        help="Auto-skip the legacy-bespoke-hook migration prompt (install only).",
+    )
     sp.set_defaults(func=cmd_setup)
 
     # ---- db (migration framework — spec §4) ----
