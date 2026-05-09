@@ -16981,6 +16981,7 @@ def cmd_session(args: argparse.Namespace) -> int:
             theme=args.theme,
             reveal_projects=args.reveal_projects,
             top_n=top_n,
+            tz=tz,
         )
         _share_render_and_emit(snap, args)
         return 0
@@ -19214,13 +19215,6 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
                 d["seven_day_pct_at_block_end"] = latest_7d
             block_dicts.append(d)
 
-        # Optional breakdown.
-        if args.breakdown:
-            for bd in block_dicts:
-                bd["__breakdown_rows"] = _load_breakdown(
-                    conn, bd["id"], args.breakdown,
-                )
-
         # Shareable-reports gate: --format short-circuits the JSON / table
         # dispatch via `_share_render_and_emit`. The mutex in
         # `_add_share_args` keeps `--format` and `--json` from coexisting.
@@ -19229,12 +19223,16 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
         # share spec scope). Cross-reset blocks render with `▲` x-axis
         # markers in the BarChart and `⚡` glyphs in the table cell —
         # both signals route to the share renderer's UTF-8-safe paths.
+        # Gate runs BEFORE the optional `_load_breakdown` loop so a
+        # 50-block --format invocation doesn't pay 50 wasted SQLite
+        # queries the snapshot would discard.
         if getattr(args, "format", None):
             display_tz_str = _share_display_tz_label(args._resolved_tz)
             # Period bounds: prefer the user's --since/--until filter
             # window; fall back to oldest/newest block timestamps when no
             # filter was applied so the period label reflects what the
             # snapshot actually covers.
+            # block_dicts is DESC-ordered: [-1] is oldest, [0] is newest.
             if since_iso:
                 period_start = _share_parse_date_to_dt(
                     since_iso, args._resolved_tz,
@@ -19267,9 +19265,17 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
                 version=_share_resolve_version(),
                 theme=args.theme,
                 reveal_projects=args.reveal_projects,
+                tz=args._resolved_tz,
             )
             _share_render_and_emit(snap, args)
             return 0
+
+        # Optional breakdown.
+        if args.breakdown:
+            for bd in block_dicts:
+                bd["__breakdown_rows"] = _load_breakdown(
+                    conn, bd["id"], args.breakdown,
+                )
 
         if args.json:
             print(json.dumps(
@@ -25536,6 +25542,7 @@ def _build_five_hour_blocks_snapshot(
     version: str,
     theme: str,
     reveal_projects: bool,
+    tz: "ZoneInfo | None",
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally five-hour-blocks`.
 
@@ -25602,13 +25609,21 @@ def _build_five_hour_blocks_snapshot(
     chart_pts: list = []
     for i, r in enumerate(chrono_rows):
         block_iso = r.get("block_start_at") or ""
-        # Compact UTC label keeps SVG x-axis readable; full ISO would
-        # render too wide and overlap adjacent bars.
+        # Compact label respecting --tz; previously hard-coded to UTC
+        # (parsed.strftime renders the wall-clock IN the parsed tz, and
+        # `parsed` is tz-aware UTC after fromisoformat). UTC-vs-display_tz
+        # is orthogonal to the SVG x-axis width budget — both render at
+        # the same character count. Route through `format_display_dt`
+        # with suffix=False to satisfy the chokepoint rule while keeping
+        # the bar label compact (the subtitle's period_label already
+        # carries the active tz).
         try:
             parsed = dt.datetime.fromisoformat(
                 block_iso.replace("Z", "+00:00")
             )
-            block_lbl = parsed.strftime("%b %d %H:%M")
+            block_lbl = format_display_dt(
+                parsed, tz, fmt="%b %d %H:%M", suffix=False,
+            )
         except (ValueError, AttributeError):
             block_lbl = str(block_iso)
         cost_usd = float(r.get("total_cost_usd") or 0.0)
@@ -25704,7 +25719,12 @@ def _session_disambiguate_labels(
     augmented: dict[int, str] = {}
     for idx, s in enumerate(sessions):
         bn = basenames[idx]
-        if counts[bn] > 1:
+        # Skip suffixing the literal "(unknown)" bare label even on
+        # collision: `_build_anon_mapping` literal-passthrough-protects
+        # exact "(unknown)" only — a suffixed form like "(unknown) (/)"
+        # would be mapped to a regular `project-N` slot, losing the
+        # (unknown) semantic in the anonymized output.
+        if counts[bn] > 1 and bn != "(unknown)":
             path = s.project_path or ""
             parent = os.path.basename(os.path.dirname(path)) or "/"
             augmented[idx] = f"{bn} ({parent})"
@@ -25721,6 +25741,7 @@ def _build_session_snapshot(
     theme: str,
     reveal_projects: bool,
     top_n: int | None,
+    tz: "ZoneInfo | None",
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally session`.
 
@@ -25810,8 +25831,14 @@ def _build_session_snapshot(
         proj_label = augmented.get(idx, bare_label)
         cost_usd = float(getattr(s, "cost_usd", 0.0) or 0.0)
         sid_short = (s.session_id[:8] if s.session_id else "—") or "—"
-        last_local = s.last_activity.astimezone()
-        last_str = last_local.strftime("%Y-%m-%d %H:%M")
+        # Datetime chokepoint rule: route human-displayed timestamps
+        # through `format_display_dt` so `--tz` is honored (was
+        # `.astimezone()` which used host-local regardless of `--tz`).
+        # `suffix=False` keeps the cell width tight — the subtitle's
+        # period_label already carries the active tz.
+        last_str = format_display_dt(
+            s.last_activity, tz, fmt="%Y-%m-%d %H:%M", suffix=False,
+        )
         models_text = ", ".join(s.models) if s.models else "—"
         snap_rows.append(_lib_share.Row(cells={
             "session": _lib_share.TextCell(sid_short),
