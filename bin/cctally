@@ -14281,6 +14281,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
 
 def cmd_daily(args: argparse.Namespace) -> int:
     """Show usage report grouped by display-timezone date."""
+    _share_validate_args(args)
     config = load_config()
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
@@ -14343,6 +14344,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
 
 def cmd_monthly(args: argparse.Namespace) -> int:
     """Show usage report grouped by display-timezone calendar month."""
+    _share_validate_args(args)
     config = load_config()
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
@@ -14400,6 +14402,7 @@ def cmd_monthly(args: argparse.Namespace) -> int:
 
 def cmd_weekly(args: argparse.Namespace) -> int:
     """Show Claude usage grouped by subscription week."""
+    _share_validate_args(args)
     config = load_config()
     args._resolved_tz = resolve_display_tz(args, config)
 
@@ -14967,6 +14970,7 @@ def _project_sort_key(row: dict, sort_by: str, order: str):
 
 def cmd_project(args: argparse.Namespace) -> int:
     """Roll entries up by project (git-root) with per-project usage attribution."""
+    _share_validate_args(args)
     config = load_config()
     args._resolved_tz = resolve_display_tz(args, config)
 
@@ -16937,6 +16941,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
 def cmd_session(args: argparse.Namespace) -> int:
     """Show Claude usage grouped by sessionId (merges resumed-across-files sessions)."""
+    _share_validate_args(args)
     config = load_config()
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
@@ -18240,6 +18245,7 @@ def _render_forecast_terminal(out: "ForecastOutput", args, color: bool) -> str:
 
 
 def cmd_report(args: argparse.Namespace) -> int:
+    _share_validate_args(args)
     if args.sync_current:
         sync_ns = argparse.Namespace(
             week_start=None,
@@ -18543,6 +18549,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
     """Project current-week usage to reset boundary. Emit terminal report,
     JSON, or status-line one-liner. See docs/commands/forecast.md.
     """
+    _share_validate_args(args)
     if args.json and args.status_line:
         print("forecast: --json and --status-line are mutually exclusive",
               file=sys.stderr)
@@ -19149,6 +19156,7 @@ def _render_five_hour_blocks_table(
 
 def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
     """List API-anchored 5h blocks with rollup totals + 7d-drift columns."""
+    _share_validate_args(args)
     config = load_config()
     args._resolved_tz = resolve_display_tz(args, config)
     # Pin "now" once (CCTALLY_AS_OF for fixture-pinned harnesses; mirrors
@@ -22899,6 +22907,33 @@ def _add_share_args(parser, *, has_status_line: bool = False) -> None:
         "--open", action="store_true", dest="open_after_write",
         help="After writing --format html/svg to a file, open it in the default app. "
              "Rejected for md.")
+
+
+def _share_validate_args(args) -> None:
+    """Reject share-side-effect flags supplied without ``--format``.
+
+    ``--output``, ``--copy``, and ``--open`` are no-ops outside the share
+    pipeline — silent dropping trains users to assume the file was
+    written. Exit 2 with a stderr message naming the offending flag so
+    the failure is loud and scriptable. Idempotent; safe to call from
+    every share-enabled subcommand before the ``--format`` gate.
+    """
+    if getattr(args, "format", None):
+        return
+    offenders = []
+    if getattr(args, "output", None):
+        offenders.append("--output")
+    if getattr(args, "copy", False):
+        offenders.append("--copy")
+    if getattr(args, "open_after_write", False):
+        offenders.append("--open")
+    if not offenders:
+        return
+    verb = "requires" if len(offenders) == 1 else "require"
+    sys.stderr.write(
+        f"cctally: {', '.join(offenders)} {verb} --format\n"
+    )
+    sys.exit(2)
 
 
 def build_parser() -> argparse.ArgumentParser:

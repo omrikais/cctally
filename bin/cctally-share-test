@@ -73,7 +73,9 @@ for scenario_dir in "$FIXTURES_DIR"/*/; do
         monthly-md)            cmd="monthly";          fmt="md";   theme="light" ;;
         weekly-md)             cmd="weekly";           fmt="md";   theme="light" ;;
         weekly-html)           cmd="weekly";           fmt="html"; theme="light" ;;
+        weekly-svg-breakdown)  cmd="weekly";           fmt="svg";  theme="light"; extra="--breakdown" ;;
         forecast-md)           cmd="forecast";         fmt="md";   theme="light"; extra="--no-sync" ;;
+        forecast-svg)          cmd="forecast";         fmt="svg";  theme="light"; extra="--no-sync" ;;
         project-md-anon)       cmd="project";          fmt="md";   theme="light" ;;
         project-md-reveal)     cmd="project";          fmt="md";   theme="light"; extra="--reveal-projects" ;;
         five-hour-blocks-md)   cmd="five-hour-blocks"; fmt="md";   theme="light" ;;

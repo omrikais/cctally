@@ -136,6 +136,7 @@ def test_palettes_have_required_keys():
     required_keys = {
         "bg", "fg", "muted", "grid", "axis",
         "series_primary", "series_secondary",
+        "series_palette",
         "ref_warn", "ref_alarm",
         "table_header_bg", "table_row_alt", "footer_link",
     }
@@ -143,6 +144,9 @@ def test_palettes_have_required_keys():
     assert set(_lib_share.PALETTE_DARK.keys()) >= required_keys
     # Palettes must differ on at least the bg color.
     assert _lib_share.PALETTE_LIGHT["bg"] != _lib_share.PALETTE_DARK["bg"]
+    # series_palette must be non-empty so stack-color cycling can't divide-by-zero.
+    assert len(_lib_share.PALETTE_LIGHT["series_palette"]) > 0
+    assert len(_lib_share.PALETTE_DARK["series_palette"]) > 0
 
 
 def test_render_dispatches_md():
@@ -1162,6 +1166,209 @@ def test_open_for_md_rejects_with_exit_2():
         assert e.code == 2
         return
     raise AssertionError("expected SystemExit(2) for --open + --format md")
+
+
+def test_line_chart_multi_series_scales_by_x_value():
+    """Projected ray (multi_series) must land at its true x-coordinate, not at enumerate index.
+
+    Regression for the review finding "Scale line charts by x_value": prior
+    to the fix the renderer used `enumerate(...)` for both primary and
+    multi_series, pinning a 2-point projected ray to the left edge of the
+    chart even when its x-values landed at the right edge.
+    """
+    # Primary: one early sample. Projected: 2 points spanning to the right edge.
+    primary = (
+        ChartPoint(x_label="early", x_value=10.0, y_value=20.0),
+    )
+    projected = (
+        ChartPoint(x_label="now", x_value=130.0, y_value=20.0),
+        ChartPoint(x_label="end", x_value=168.0, y_value=60.0),
+    )
+    chart = LineChart(
+        points=primary,
+        y_label="%",
+        multi_series={"projected": projected},
+    )
+    out = _lib_share._render_line_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT,
+        x=0, y=0, width=200, height=100,
+    )
+    # Inner box: ix = 50, iw = 200 - 50 - 10 = 140. Domain [10, 168],
+    # span = 158. Primary point at x_value=10 → ix + 0 = 50.0.
+    # Projected end at x_value=168 → ix + iw = 190.0. Right-edge anchor
+    # is the regression-proof: under the old enumerate-index renderer it
+    # would have been ix + x_step (left of mid).
+    import re
+    polylines = re.findall(r'points="([^"]+)"', out)
+    assert len(polylines) >= 2  # primary + projected
+    # Projected ray's last point must be at the right edge (190.0).
+    proj_pts = polylines[-1]
+    last_point_x = float(proj_pts.split()[-1].split(",")[0])
+    assert abs(last_point_x - 190.0) < 1e-6, \
+        f"projected ray last x={last_point_x}, expected ~190.0"
+
+
+def test_line_chart_y_domain_includes_multi_series():
+    """Multi_series y-values that exceed primary max must not clip past inner box top.
+
+    Regression for the review finding: prior y_values list excluded
+    multi_series, so a projected high above the actual-sample max would
+    render at iy (clipped to top) rather than at its scaled position.
+    """
+    # Primary max y = 20. Projected high = 90 (well above primary max).
+    chart = LineChart(
+        points=(
+            ChartPoint(x_label="a", x_value=0.0, y_value=10.0),
+            ChartPoint(x_label="b", x_value=1.0, y_value=20.0),
+        ),
+        y_label="%",
+        multi_series={"projected": (
+            ChartPoint(x_label="now", x_value=1.0, y_value=20.0),
+            ChartPoint(x_label="end", x_value=2.0, y_value=90.0),
+        )},
+    )
+    out = _lib_share._render_line_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT,
+        x=0, y=0, width=200, height=100,
+    )
+    # Inner box height ih = 100 - 10 - 30 = 60, iy = 10.
+    # _scale_y over [0, 90] (min(0, primary+projected min) → max=90) maps:
+    #   y=20 → 60 - 60*(20/90) ≈ 46.67  (primary max)
+    #   y=90 → 0                         (projected max, at top)
+    # Projected end y in SVG = iy + 0 = 10.0 (top of inner box). The
+    # primary-only y-domain [0, 20] would have placed it at y < 10 (above
+    # iy) — i.e. visually clipped.
+    import re
+    polylines = re.findall(r'points="([^"]+)"', out)
+    assert len(polylines) >= 2
+    proj_pts = polylines[-1].split()
+    last_y = float(proj_pts[-1].split(",")[1])
+    # Allow tiny float drift; key invariant is "not clipped above iy=10".
+    assert last_y >= 10.0 - 1e-6, \
+        f"projected high y={last_y} clipped above iy=10 (multi_series excluded from y-domain)"
+
+
+def test_bar_chart_renders_stacks_when_present():
+    """BarChart.stacks must render as cumulative segments, not be silently ignored.
+
+    Regression for the review finding: weekly --breakdown populates
+    `BarChart.stacks` but the renderer previously read only
+    `chart.points`, producing an unstacked chart.
+    """
+    chart = BarChart(
+        points=(
+            ChartPoint(x_label="W1", x_value=0.0, y_value=30.0),
+            ChartPoint(x_label="W2", x_value=1.0, y_value=50.0),
+        ),
+        y_label="$",
+        stacks={
+            "model-a": (
+                ChartPoint(x_label="W1", x_value=0.0, y_value=10.0),
+                ChartPoint(x_label="W2", x_value=1.0, y_value=20.0),
+            ),
+            "model-b": (
+                ChartPoint(x_label="W1", x_value=0.0, y_value=20.0),
+                ChartPoint(x_label="W2", x_value=1.0, y_value=30.0),
+            ),
+        },
+    )
+    out = _lib_share._render_bar_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT,
+        x=0, y=0, width=400, height=200,
+    )
+    palette = _lib_share.PALETTE_LIGHT["series_palette"]
+    # Both stack colors must appear (segments rendered).
+    assert palette[0] in out
+    assert palette[1] in out
+    # Legend must include both model labels.
+    assert "model-a" in out
+    assert "model-b" in out
+    # Sorted-key ordering: "model-a" gets palette[0], "model-b" gets palette[1].
+    # Legend rows are stacked vertically with row height 12 starting at iy+4;
+    # earlier sorted key sits above later sorted key.
+    a_idx = out.index("model-a")
+    b_idx = out.index("model-b")
+    assert a_idx < b_idx, "expected sorted-key ordering in legend"
+
+
+def test_bar_chart_unstacked_path_unchanged_when_no_stacks():
+    """BarChart with stacks=None still renders the unstacked path."""
+    chart = BarChart(
+        points=(
+            ChartPoint(x_label="W1", x_value=0.0, y_value=30.0),
+            ChartPoint(x_label="W2", x_value=1.0, y_value=50.0),
+        ),
+        y_label="$",
+    )
+    out = _lib_share._render_bar_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT,
+        x=0, y=0, width=400, height=200,
+    )
+    # Unstacked path uses series_primary (single color); palette[2..5] must NOT appear.
+    palette = _lib_share.PALETTE_LIGHT["series_palette"]
+    assert _lib_share.PALETTE_LIGHT["series_primary"] in out
+    # Tertiary stack colors aren't on the unstacked path.
+    assert palette[2] not in out
+    assert palette[3] not in out
+
+
+def test_share_validate_args_passes_with_format():
+    """_share_validate_args is a no-op when --format is set."""
+    import argparse
+    args = argparse.Namespace(
+        format="md", output=None, copy=False, open_after_write=False,
+    )
+    # Must not raise / not exit.
+    _cctally._share_validate_args(args)
+
+
+def test_share_validate_args_passes_with_no_share_flags():
+    """_share_validate_args is a no-op when no share flags are set."""
+    import argparse
+    args = argparse.Namespace(
+        format=None, output=None, copy=False, open_after_write=False,
+    )
+    _cctally._share_validate_args(args)
+
+
+def test_share_validate_args_rejects_output_without_format():
+    """--output without --format must exit 2 with a stderr message."""
+    import argparse
+    args = argparse.Namespace(
+        format=None, output="/tmp/x.md", copy=False, open_after_write=False,
+    )
+    try:
+        _cctally._share_validate_args(args)
+    except SystemExit as e:
+        assert e.code == 2
+        return
+    raise AssertionError("expected SystemExit when --output passed without --format")
+
+
+def test_share_validate_args_rejects_copy_without_format():
+    import argparse
+    args = argparse.Namespace(
+        format=None, output=None, copy=True, open_after_write=False,
+    )
+    try:
+        _cctally._share_validate_args(args)
+    except SystemExit as e:
+        assert e.code == 2
+        return
+    raise AssertionError("expected SystemExit when --copy passed without --format")
+
+
+def test_share_validate_args_rejects_open_without_format():
+    import argparse
+    args = argparse.Namespace(
+        format=None, output=None, copy=False, open_after_write=True,
+    )
+    try:
+        _cctally._share_validate_args(args)
+    except SystemExit as e:
+        assert e.code == 2
+        return
+    raise AssertionError("expected SystemExit when --open passed without --format")
 
 
 def test_copy_falls_back_when_no_clipboard_tool(monkeypatch):

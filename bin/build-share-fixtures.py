@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build deterministic SQLite fixtures + CHANGELOG fixture for cctally-share-test.
 
-Output layout (12 scenarios):
+Output layout (14 scenarios):
   tests/fixtures/share/<scenario>/
     cache.db
     stats.db
@@ -10,8 +10,8 @@ Output layout (12 scenarios):
 
 Scenarios cover the share-enabled subcommands across formats:
   report-md, report-svg-light, report-svg-dark,
-  daily-md, monthly-md, weekly-md, weekly-html,
-  forecast-md, project-md-anon, project-md-reveal,
+  daily-md, monthly-md, weekly-md, weekly-html, weekly-svg-breakdown,
+  forecast-md, forecast-svg, project-md-anon, project-md-reveal,
   five-hour-blocks-md, session-md.
 
 The fixtures share one synthetic dataset:
@@ -56,7 +56,15 @@ SCENARIOS: tuple[str, ...] = (
     "monthly-md",
     "weekly-md",
     "weekly-html",
+    # Stacked-bar coverage: weekly --breakdown --format svg exercises the
+    # `BarChart.stacks` rendering path. The non-breakdown weekly-md /
+    # weekly-html scenarios stay on the unstacked path.
+    "weekly-svg-breakdown",
     "forecast-md",
+    # multi_series x-domain coverage: forecast --format svg renders the
+    # actual-vs-projected ray with x_value-based scaling. The forecast-md
+    # case stays markdown-only (no chart in md output).
+    "forecast-svg",
     "project-md-anon",
     "project-md-reveal",
     "five-hour-blocks-md",

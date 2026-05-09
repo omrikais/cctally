@@ -203,6 +203,17 @@ PALETTE_LIGHT = {
     "axis": "#9ca3af",
     "series_primary": "#2563eb",     # blue-600
     "series_secondary": "#9333ea",   # purple-600
+    # Cycled for stacked-bar segments by sorted-key index. Six entries cover
+    # typical model counts (4-6); overflow wraps. Palette ordering is part
+    # of the byte-stable contract — adding/reordering is a goldens churn.
+    "series_palette": (
+        "#2563eb",  # blue-600
+        "#9333ea",  # purple-600
+        "#059669",  # emerald-600
+        "#d97706",  # amber-600
+        "#dc2626",  # red-600
+        "#0891b2",  # cyan-600
+    ),
     "ref_warn": "#d97706",           # amber-600
     "ref_alarm": "#dc2626",          # red-600
     "table_header_bg": "#f3f4f6",
@@ -218,6 +229,14 @@ PALETTE_DARK = {
     "axis": "#4b5563",
     "series_primary": "#60a5fa",     # blue-400
     "series_secondary": "#c084fc",   # purple-400
+    "series_palette": (
+        "#60a5fa",  # blue-400
+        "#c084fc",  # purple-400
+        "#34d399",  # emerald-400
+        "#fbbf24",  # amber-400
+        "#f87171",  # red-400
+        "#22d3ee",  # cyan-400
+    ),
     "ref_warn": "#fbbf24",           # amber-400
     "ref_alarm": "#f87171",          # red-400
     "table_header_bg": "#111827",
@@ -377,14 +396,34 @@ def _render_line_chart_svg(chart: LineChart, *, palette: dict,
     if not pts:
         return _render_chart_no_data(palette, x=x, y=y, width=width, height=height)
 
-    y_values = [p.y_value for p in pts] + [r[0] for r in chart.reference_lines]
+    # Y-domain spans primary + multi_series + reference_lines so projected
+    # values that exceed the actual-sample max don't clip past the inner box.
+    y_values = [p.y_value for p in pts]
+    if chart.multi_series:
+        for series_pts in chart.multi_series.values():
+            y_values.extend(p.y_value for p in series_pts)
+    y_values.extend(r[0] for r in chart.reference_lines)
     _, scale_y = _scale_y(y_values, ih)
 
-    n = len(pts)
-    if n == 1:
-        x_step = 0.0
+    # X-domain spans primary + multi_series so a projected ray that extends
+    # past the latest actual sample (e.g. forecast `now` -> `week_end`) lands
+    # at its true x position rather than getting pinned to enumerate-index.
+    # When primary uses sequential `x_value=float(i)` (e.g. report trend),
+    # this collapses to the prior `iw / (n-1)` spacing.
+    x_values = [p.x_value for p in pts]
+    if chart.multi_series:
+        for series_pts in chart.multi_series.values():
+            x_values.extend(p.x_value for p in series_pts)
+    x_min = min(x_values)
+    x_max = max(x_values)
+    x_span = x_max - x_min
+    if x_span <= 1e-9:
+        # Degenerate: single point or zero-width domain — anchor at left edge.
+        def scale_x(_v: float) -> float:
+            return 0.0
     else:
-        x_step = iw / (n - 1)
+        def scale_x(v: float) -> float:
+            return iw * (v - x_min) / x_span
 
     # Axes.
     elements = []
@@ -402,14 +441,14 @@ def _render_line_chart_svg(chart: LineChart, *, palette: dict,
                                  font_size=10, fill=ref_color, anchor="end"))
 
     # Series polyline (primary series).
-    poly_pts = [(ix + i * x_step, iy + scale_y(p.y_value)) for i, p in enumerate(pts)]
+    poly_pts = [(ix + scale_x(p.x_value), iy + scale_y(p.y_value)) for p in pts]
     elements.append(svg_polyline(poly_pts, stroke=palette["series_primary"], width=2))
 
     # Optional multi-series (forecast actual + projected).
     if chart.multi_series:
         for series_key, series_pts in sorted(chart.multi_series.items()):
             series_color = palette["series_secondary"]
-            spoly = [(ix + i * x_step, iy + scale_y(p.y_value)) for i, p in enumerate(series_pts)]
+            spoly = [(ix + scale_x(p.x_value), iy + scale_y(p.y_value)) for p in series_pts]
             # Dashed for "projected" — simple stroke-dasharray.
             attrs = {
                 "points": " ".join(f"{_fmt_num(px)},{_fmt_num(py)}" for px, py in spoly),
@@ -420,9 +459,9 @@ def _render_line_chart_svg(chart: LineChart, *, palette: dict,
             }
             elements.append(f'<polyline {_serialize_attrs(attrs)}/>')
 
-    # X-tick labels (every point).
-    for i, p in enumerate(pts):
-        tx = ix + i * x_step
+    # X-tick labels (one per primary sample, positioned by x_value).
+    for p in pts:
+        tx = ix + scale_x(p.x_value)
         elements.append(svg_text(tx, iy + ih + 14, p.x_label,
                                  font_size=10, fill=palette["muted"], anchor="middle"))
 
@@ -446,7 +485,24 @@ def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
     total_gap = bar_gap * (n - 1) if n > 1 else 0.0
     bar_w = max(2.0, (iw - total_gap) / n)
 
-    y_values = [p.y_value for p in pts]
+    has_stacks = bool(chart.stacks)
+    # Sorted keys give deterministic stack ordering; matches the
+    # `sorted(all_model_keys)` ordering builders use for table columns,
+    # so legend swatch -> table column line up by position.
+    series_keys = sorted(chart.stacks.keys()) if has_stacks else []
+
+    if has_stacks:
+        per_bar_totals: list[float] = []
+        for i in range(n):
+            total = 0.0
+            for k in series_keys:
+                sp = chart.stacks[k]
+                if i < len(sp):
+                    total += sp[i].y_value
+            per_bar_totals.append(total)
+        y_values = per_bar_totals
+    else:
+        y_values = [p.y_value for p in pts]
     _, scale_y = _scale_y(y_values, ih)
 
     elements = []
@@ -455,15 +511,56 @@ def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
     elements.append(svg_line(ix, iy, ix, iy + ih,
                              stroke=palette["axis"], width=1))
 
+    series_palette = palette["series_palette"]
+
     for i, p in enumerate(pts):
         bx = ix + i * (bar_w + bar_gap)
-        by = iy + scale_y(p.y_value)
-        bh = (iy + ih) - by
-        elements.append(svg_rect(bx, by, bar_w, bh, fill=palette["series_primary"]))
+        if has_stacks:
+            # Cumulative bottom-up segments. Skip zero/negative segments so
+            # they don't emit a degenerate rect (and don't shift the next
+            # segment's baseline incorrectly).
+            y_running = 0.0
+            for k_idx, k in enumerate(series_keys):
+                sp = chart.stacks[k]
+                seg_v = sp[i].y_value if i < len(sp) else 0.0
+                if seg_v <= 0:
+                    continue
+                seg_top_y = iy + scale_y(y_running + seg_v)
+                seg_bot_y = iy + scale_y(y_running)
+                seg_h = seg_bot_y - seg_top_y
+                color = series_palette[k_idx % len(series_palette)]
+                elements.append(svg_rect(bx, seg_top_y, bar_w, seg_h, fill=color))
+                y_running += seg_v
+        else:
+            by = iy + scale_y(p.y_value)
+            bh = (iy + ih) - by
+            elements.append(svg_rect(bx, by, bar_w, bh, fill=palette["series_primary"]))
         # X-tick label centered under bar.
         tx = bx + bar_w / 2
         elements.append(svg_text(tx, iy + ih + 14, p.x_label,
                                  font_size=10, fill=palette["muted"], anchor="middle"))
+
+    # Legend (top-right of inner box, only when stacks are present).
+    # SVG is the only artifact where the table doesn't double as a key, so
+    # the legend matters most for `--format svg` output. Placed inside the
+    # inner box so total chart dimensions stay byte-stable.
+    if has_stacks:
+        legend_swatch_w = 8.0
+        legend_swatch_h = 8.0
+        legend_row_h = 12.0
+        legend_col_w = 160.0
+        legend_left = ix + iw - legend_col_w
+        for k_idx, k in enumerate(series_keys):
+            row_y = iy + 4 + k_idx * legend_row_h
+            color = series_palette[k_idx % len(series_palette)]
+            elements.append(svg_rect(
+                legend_left, row_y, legend_swatch_w, legend_swatch_h,
+                fill=color,
+            ))
+            elements.append(svg_text(
+                legend_left + legend_swatch_w + 4, row_y + 8, k,
+                font_size=10, fill=palette["fg"], anchor="start",
+            ))
 
     elements.append(svg_text(ix - 10, iy + ih / 2, chart.y_label,
                              font_size=10, fill=palette["muted"], anchor="end"))
