@@ -984,3 +984,32 @@ def test_emit_file_writes_path_and_logs_to_stderr(tmp_path, capsys):
     assert target.read_text() == "<html>"
     captured = capsys.readouterr()
     assert str(target) in captured.err
+
+
+# ============================================================
+# _share_render_and_emit wrapper (lazy-imports _lib_share, runs scrub
+# -> render -> resolve_destination -> emit -> optional open).
+# ============================================================
+
+
+def test_share_render_and_emit_routes_md_to_stdout(capsys):
+    snap = _make_minimal_snapshot()
+    args = type("A", (), {"format": "md", "theme": "light", "no_branding": False,
+                          "reveal_projects": False, "output": None, "copy": False,
+                          "open_after_write": False})()
+    _cctally._share_render_and_emit(snap, args)
+    captured = capsys.readouterr()
+    assert snap.title in captured.out
+
+
+def test_share_render_and_emit_html_writes_file(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("XDG_DOWNLOAD_DIR", str(tmp_path))
+    snap = _make_minimal_snapshot()
+    args = type("A", (), {"format": "html", "theme": "light", "no_branding": False,
+                          "reveal_projects": False, "output": None, "copy": False,
+                          "open_after_write": False})()
+    _cctally._share_render_and_emit(snap, args)
+    files = list(tmp_path.glob("cctally-*.html"))
+    assert len(files) == 1
+    content = files[0].read_text()
+    assert snap.title in content

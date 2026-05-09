@@ -24161,6 +24161,56 @@ def _emit(content: str, *, kind: str, value, fmt: str) -> None:
     raise ValueError(f"unknown destination kind: {kind!r}")
 
 
+def _share_render_and_emit(snap, args) -> None:
+    """End-to-end: scrub -> render -> emit -> optional open.
+
+    Lazy-imports `_lib_share` so non-share invocations don't pay the import
+    cost. The kernel module stays I/O-pure; this wrapper does all the
+    side-effecting glue (destination resolution, file writes, clipboard,
+    post-write `--open` launch).
+    """
+    # Reuse a cached `_lib_share` if a prior call (or the test harness) has
+    # already loaded it; loading a fresh copy creates a second module object
+    # and `isinstance` checks against ShareSnapshot cells would compare across
+    # distinct class identities. Single-load semantics also save the disk hit
+    # on repeat invocations.
+    _lib_share = sys.modules.get("_lib_share")
+    if _lib_share is None:
+        import importlib.util as _ilu
+        _lib_share_path = pathlib.Path(__file__).resolve().parent / "_lib_share.py"
+        _spec = _ilu.spec_from_file_location("_lib_share", _lib_share_path)
+        _lib_share = _ilu.module_from_spec(_spec)
+        sys.modules["_lib_share"] = _lib_share
+        _spec.loader.exec_module(_lib_share)
+
+    scrubbed = _lib_share._scrub(snap, reveal_projects=args.reveal_projects)
+    rendered = _lib_share.render(
+        scrubbed,
+        format=args.format,
+        theme=args.theme,
+        branding=not args.no_branding,
+    )
+
+    utc_date = snap.generated_at.astimezone(dt.timezone.utc).strftime("%Y-%m-%d")
+    kind, value = _resolve_destination(args, cmd=snap.cmd, generated_at_utc_date=utc_date)
+    _emit(rendered, kind=kind, value=value, fmt=args.format)
+
+    if args.open_after_write and kind == "file":
+        _share_open_file(pathlib.Path(value))
+
+
+def _share_open_file(path: pathlib.Path) -> None:
+    """Run `open` (macOS) / `xdg-open` (Linux). Silent fail if launcher missing."""
+    for launcher in ("open", "xdg-open"):
+        if shutil.which(launcher):
+            subprocess.Popen(
+                [launcher, str(path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return
+    sys.stderr.write("cctally: --open requires `open` or `xdg-open` on PATH; skipped\n")
+
+
 # ============================================================
 # ==== TUI ====                                              =
 # ============================================================
