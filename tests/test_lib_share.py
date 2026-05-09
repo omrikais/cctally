@@ -1118,3 +1118,67 @@ def test_html_chrome_appears_exactly_once_with_branding():
     # Title appears once in <h1> and once in <title>; no extra duplication.
     assert out.count("<h1") == 1
     assert out.count("<footer") == 1
+
+
+# ============================================================
+# Task 30 — Argparse + emit edge-case tests
+#
+# argparse's mutex group covers --format x --json x --status-line. But
+# --copy x --format html and --open x --format md are runtime-only checks
+# inside _resolve_destination / _share_render_and_emit, plus the
+# clipboard-tool-missing error path inside _emit. These tests pin down
+# the runtime-mutex contract that argparse can't enforce.
+# ============================================================
+
+
+def test_copy_rejected_for_html_format():
+    args = type("A", (), {"format": "html", "output": None, "copy": True,
+                          "open_after_write": False})()
+    try:
+        _cctally._resolve_destination(args, cmd="daily",
+                                      generated_at_utc_date="2026-05-09")
+    except SystemExit as e:
+        assert e.code == 2
+        return
+    raise AssertionError("expected SystemExit")
+
+
+def test_open_for_md_rejects_with_exit_2():
+    """`--open + --format md` is rejected at the wrapper (Section 4.4).
+
+    Test-spec adjustment vs. plan: Implementor 6's fix-loop turned this
+    from a silent no-op into an explicit SystemExit(2) (md routes to
+    stdout; --open is meaningless without a file destination). The plan
+    was authored under the prior "silently skipped" semantics; this test
+    asserts the new hard-reject behavior at bin/cctally:25917-25926.
+    """
+    snap = _make_minimal_snapshot()
+    args = type("A", (), {"format": "md", "theme": "light", "no_branding": False,
+                          "reveal_projects": False, "output": None, "copy": False,
+                          "open_after_write": True})()
+    try:
+        _cctally._share_render_and_emit(snap, args)
+    except SystemExit as e:
+        assert e.code == 2
+        return
+    raise AssertionError("expected SystemExit(2) for --open + --format md")
+
+
+def test_copy_falls_back_when_no_clipboard_tool(monkeypatch):
+    """If no pbcopy/xclip/clip on PATH, --copy must error clearly.
+
+    Test-spec adjustment vs. plan: Implementor 6's fix-loop dropped the
+    unused `fmt` parameter from `_emit`; the plan's call site passed
+    `fmt="md"`, which would now TypeError. Current `_emit` signature is
+    `_emit(content, *, kind, value)` (bin/cctally:24582).
+    """
+    monkeypatch.setenv("PATH", "/nonexistent")
+    try:
+        _cctally._emit("hello", kind="clipboard", value=None)
+    except SystemExit as e:
+        # _emit prints "cctally: --copy requires pbcopy, xclip, or clip
+        # on PATH" to stderr and sys.exit(2). The exit code is the
+        # stable contract; the message text is captured in stderr.
+        assert e.code == 2
+        return
+    raise AssertionError("expected SystemExit when no clipboard tool present")
