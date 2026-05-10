@@ -16068,7 +16068,9 @@ def cmd_daily(args: argparse.Namespace) -> int:
     args._resolved_tz = tz
 
     range = _parse_cli_date_range(
-        args, tz_name=(tz.key if tz is not None else None)
+        args,
+        tz_name=(tz.key if tz is not None else None),
+        now_utc=_command_as_of(),
     )
     if isinstance(range, int):
         return range
@@ -16136,7 +16138,9 @@ def cmd_monthly(args: argparse.Namespace) -> int:
     args._resolved_tz = tz
 
     range = _parse_cli_date_range(
-        args, tz_name=(tz.key if tz is not None else None)
+        args,
+        tz_name=(tz.key if tz is not None else None),
+        now_utc=_command_as_of(),
     )
     if isinstance(range, int):
         return range
@@ -18765,7 +18769,9 @@ def cmd_session(args: argparse.Namespace) -> int:
     args._resolved_tz = tz
 
     range = _parse_cli_date_range(
-        args, tz_name=(tz.key if tz is not None else None)
+        args,
+        tz_name=(tz.key if tz is not None else None),
+        now_utc=_command_as_of(),
     )
     if isinstance(range, int):
         return range
