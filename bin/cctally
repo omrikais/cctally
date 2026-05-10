@@ -10477,7 +10477,10 @@ def cmd_update(args) -> int:
     skip_arg = getattr(args, "skip", None)
     remind_arg = getattr(args, "remind_later", None)
     check_arg = getattr(args, "check", False)
-    version_arg = getattr(args, "version", None)
+    # NOTE: `args.install_version`, not `args.version` — the subparser's
+    # `--version X.Y.Z` is `dest="install_version"` to avoid colliding
+    # with the top-level `--version` flag handled in `main()`.
+    version_arg = getattr(args, "install_version", None)
     modes = sum(bool(x) for x in [
         check_arg,
         skip_arg is not None,
@@ -26614,10 +26617,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Defer reminders by N days (default: 7)",
     )
-    # `--version` here is local to the update subparser; argparse subparser
-    # scoping keeps it separate from the top-level `cctally --version`.
+    # `--version` here is local to the update subparser. The subparser's
+    # value is bound to `args.install_version` (NOT `args.version`) to
+    # avoid a namespace collision with the top-level `--version`
+    # (store_true) flag handled in `main()` before subcommand dispatch:
+    # if both used `dest="version"`, `cctally update --version 1.2.3`
+    # would set `args.version="1.2.3"`, which `main()`'s truthy check
+    # would treat as "global --version requested" and short-circuit to
+    # print the version banner before `cmd_update` ever ran.
     sub_update.add_argument(
-        "--version", metavar="X.Y.Z", default=None,
+        "--version", metavar="X.Y.Z", default=None, dest="install_version",
         help="Install a specific version (npm only; brew has no versioned formulae)",
     )
     sub_update.add_argument(

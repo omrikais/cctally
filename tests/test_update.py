@@ -966,7 +966,7 @@ class TestUpdateCmdDispatch:
             check=False,
             skip="1.7.2",
             remind_later=None,
-            version=None,
+            install_version=None,
             dry_run=False,
             force=False,
         )
@@ -989,7 +989,7 @@ class TestUpdateCmdDispatch:
             check=False,
             skip=ns["SKIP_USE_STATE_LATEST"],
             remind_later=None,
-            version=None,
+            install_version=None,
             dry_run=False,
             force=False,
         )
@@ -1004,7 +1004,7 @@ class TestUpdateCmdDispatch:
             check=False,
             skip=ns["SKIP_USE_STATE_LATEST"],
             remind_later=None,
-            version=None,
+            install_version=None,
             dry_run=False,
             force=False,
         )
@@ -1025,7 +1025,7 @@ class TestUpdateCmdDispatch:
             check=False,
             skip=None,
             remind_later=14,
-            version=None,
+            install_version=None,
             dry_run=False,
             force=False,
         )
@@ -1045,7 +1045,7 @@ class TestUpdateCmdDispatch:
             check=False,
             skip=None,
             remind_later=0,
-            version=None,
+            install_version=None,
             dry_run=False,
             force=False,
         )
@@ -1061,7 +1061,7 @@ class TestUpdateCmdDispatch:
             check=True,
             skip="1.0.0",
             remind_later=None,
-            version=None,
+            install_version=None,
             dry_run=False,
             force=False,
         )
@@ -1088,7 +1088,7 @@ class TestUpdateCmdDispatch:
             check=True,
             skip=None,
             remind_later=None,
-            version=None,
+            install_version=None,
             dry_run=False,
             force=False,
             json=True,
@@ -1122,7 +1122,7 @@ class TestUpdateCmdDispatch:
             check=True,
             skip=None,
             remind_later=None,
-            version=None,
+            install_version=None,
             dry_run=False,
             force=False,
             json=True,
@@ -1145,7 +1145,7 @@ class TestUpdateCmdDispatch:
             check=False,
             skip=None,
             remind_later=None,
-            version="1.7.2",
+            install_version="1.7.2",
             dry_run=False,
             force=False,
         )
@@ -1167,9 +1167,122 @@ class TestUpdateCmdDispatch:
             check=False,
             skip=None,
             remind_later=None,
-            version="not-a-semver",
+            install_version="not-a-semver",
             dry_run=False,
             force=False,
         )
         rc = ns["cmd_update"](args)
         assert rc == 2
+
+
+# ============================================================
+# End-to-end argparse coverage (subprocess-driven).
+#
+# The dispatch tests above call `cmd_update(args)` with hand-built
+# `argparse.Namespace` objects, which deliberately bypass argparse so
+# the dispatcher's branch coverage is fast and isolated. That's the
+# right shape for unit tests but it has a known blind spot: any bug
+# that sits between the argv string list and the Namespace cannot
+# manifest. The shadow-bug between the global `--version` (top-level
+# `store_true`) and the subparser `update --version <X.Y.Z>` is exactly
+# that class — argparse populated the same attribute name from two
+# arguments, and the `cctally update --version 1.2.3` invocation
+# silently printed the version banner and exited 0 instead of routing
+# to `cmd_update`.
+#
+# The fix renames the subparser arg's `dest` to `install_version`. The
+# tests below fork a fresh interpreter and drive `bin/cctally`
+# end-to-end so a future regression that re-collides the dest is
+# caught at the argparse layer, not at the (now-shielded) Namespace
+# layer.
+# ============================================================
+
+
+_BIN_CCTALLY = pathlib.Path(__file__).resolve().parent.parent / "bin" / "cctally"
+
+
+def _run_cctally(args: list[str], tmp_path: pathlib.Path) -> subprocess.CompletedProcess:
+    """Fork a fresh interpreter on bin/cctally with HOME pinned to tmp_path."""
+    env = {**os.environ, "HOME": str(tmp_path)}
+    return subprocess.run(
+        [sys.executable, str(_BIN_CCTALLY), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+class TestUpdateArgparseCoverage:
+    """End-to-end argparse coverage for `cctally update --version`.
+
+    These tests exist specifically to catch the global `--version`
+    vs. subparser `update --version` namespace collision; they fork a
+    real interpreter so argparse runs for real (the dispatch tests
+    above hand-build a Namespace and bypass argparse entirely).
+    """
+
+    def test_global_version_still_works_via_argparse(self, tmp_path):
+        """`cctally --version` (no subcommand) prints the banner, exit 0."""
+        cp = _run_cctally(["--version"], tmp_path)
+        assert cp.returncode == 0, (
+            f"stdout={cp.stdout!r} stderr={cp.stderr!r}"
+        )
+        # Banner shape: `cctally <version>` (or `cctally unknown` if
+        # CHANGELOG.md has no release header in the test repo, which
+        # is not the case here).
+        assert cp.stdout.startswith("cctally "), (
+            f"expected version banner, got stdout={cp.stdout!r}"
+        )
+
+    def test_update_version_routes_to_install_mode_via_argparse(self, tmp_path):
+        """`cctally update --version 1.2.3` reaches `cmd_update`, NOT the global banner.
+
+        The Task 5 install path is still a stub (NotImplementedError),
+        so the subprocess will exit non-zero with a Python traceback
+        on stderr. What we're proving here is negative: the subprocess
+        did NOT short-circuit to the global `--version` banner.
+        """
+        cp = _run_cctally(["update", "--version", "1.2.3"], tmp_path)
+        # The exact failure mode depends on install-method detection
+        # for the running interpreter (npm/brew/unknown) and on Task 5
+        # being unimplemented; the negative invariant is what matters.
+        assert cp.returncode != 0, (
+            f"expected non-zero exit (install path not implemented), "
+            f"got rc=0 stdout={cp.stdout!r} stderr={cp.stderr!r}"
+        )
+        # Negative assertion: the global `--version` banner did NOT print.
+        # If the collision regresses, stdout would be `cctally <ver>\n`
+        # and rc would be 0.
+        assert "cctally " not in cp.stdout or "\n" in cp.stdout.rstrip("\n"), (
+            f"global --version banner leaked: stdout={cp.stdout!r}"
+        )
+        # Stronger: the stdout must NOT match the bare-banner shape
+        # (single line `cctally X.Y.Z\n`).
+        stripped = cp.stdout.strip()
+        assert not (
+            stripped.startswith("cctally ")
+            and "\n" not in stripped
+            and len(stripped.split()) == 2
+        ), (
+            f"global --version short-circuit fired: stdout={cp.stdout!r}"
+        )
+
+    def test_update_check_version_mutex_via_argparse(self, tmp_path):
+        """`cctally update --check --version 1.2.3` → mutex error exit 2.
+
+        `--version` is install-mode only (per `cmd_update` line ~10493).
+        Reaching that mutex check requires `cmd_update` to actually
+        run, which only happens if the global `--version` shadow
+        does NOT short-circuit first.
+        """
+        cp = _run_cctally(
+            ["update", "--check", "--version", "1.2.3"], tmp_path
+        )
+        assert cp.returncode == 2, (
+            f"expected exit 2 (mutex), got rc={cp.returncode} "
+            f"stdout={cp.stdout!r} stderr={cp.stderr!r}"
+        )
+        assert "install-mode only" in cp.stderr, (
+            f"expected mutex message on stderr, got stderr={cp.stderr!r}"
+        )
