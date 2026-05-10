@@ -16335,7 +16335,9 @@ def cmd_codex_daily(args: argparse.Namespace) -> int:
     # (because resolve_display_tz returns None for canonical "local").
     tz_name = _resolve_codex_tz_name(args, config)
     force_compact = bool(getattr(args, "compact", False))
-    range = _parse_cli_date_range(args, tz_name=tz_name)
+    range = _parse_cli_date_range(
+        args, tz_name=tz_name, now_utc=_command_as_of(),
+    )
     if isinstance(range, int):
         return range
     range_start, range_end = range
@@ -16385,7 +16387,9 @@ def cmd_codex_monthly(args: argparse.Namespace) -> int:
     # F2 fix: see cmd_codex_daily.
     tz_name = _resolve_codex_tz_name(args, config)
     force_compact = bool(getattr(args, "compact", False))
-    range = _parse_cli_date_range(args, tz_name=tz_name)
+    range = _parse_cli_date_range(
+        args, tz_name=tz_name, now_utc=_command_as_of(),
+    )
     if isinstance(range, int):
         return range
     range_start, range_end = range
@@ -16493,7 +16497,9 @@ def cmd_codex_session(args: argparse.Namespace) -> int:
     # F2 fix: see cmd_codex_daily.
     tz_name = _resolve_codex_tz_name(args, config)
     force_compact = bool(getattr(args, "compact", False))
-    range = _parse_cli_date_range(args, tz_name=tz_name)
+    range = _parse_cli_date_range(
+        args, tz_name=tz_name, now_utc=_command_as_of(),
+    )
     if isinstance(range, int):
         return range
     range_start, range_end = range
@@ -16831,7 +16837,7 @@ def cmd_project(args: argparse.Namespace) -> int:
 
     # Resolve [since_dt, until_dt] in UTC.
     if args.since or args.until:
-        parsed = _parse_cli_date_range(args)
+        parsed = _parse_cli_date_range(args, now_utc=now)
         if isinstance(parsed, int):
             return parsed
         since_dt, until_dt = parsed
