@@ -31,6 +31,7 @@
     "bin/cctally-release",
     "bin/cctally-sync-week",
     "bin/cctally-tui",
+    "bin/cctally-update",
     "dashboard/static/**",
     "CHANGELOG.md",
     "LICENSE",

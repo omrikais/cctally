@@ -1,5 +1,5 @@
 ✓ Detected Claude Code at /FAKE/.claude
-✓ Symlinks at /FAKE/.local/bin/: 12/12 (N newly created)
+✓ Symlinks at /FAKE/.local/bin/: 13/13 (N newly created)
 ✓ Migrated 0 legacy hook entries → moved 4 files to /FAKE/.claude/cctally-legacy-hook-backup-TIMESTAMP/
 ✓ Wrote 3 hook entries to /FAKE/.claude/settings.json
 ⚠ No Claude OAuth token detected.

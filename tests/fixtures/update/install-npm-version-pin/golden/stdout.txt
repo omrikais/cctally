@@ -1,0 +1,2 @@
+added 1 package in 0.5s
+npm install args: install -g cctally@1.6.4

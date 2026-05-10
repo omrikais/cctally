@@ -1,5 +1,5 @@
 ✓ Detected Claude Code at /FAKE/.claude
-✓ Symlinks at /FAKE/.local/bin/: 12/12 (N newly created)
+✓ Symlinks at /FAKE/.local/bin/: 13/13 (N newly created)
 ✓ Wrote 3 hook entries to /FAKE/.claude/settings.json
 ⚠ No Claude OAuth token detected.
   Run `claude` once to authenticate. After that, the next assistant

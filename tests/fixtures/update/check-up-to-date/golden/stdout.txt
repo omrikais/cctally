@@ -1,0 +1,7 @@
+Current   1.4.0
+Latest    1.4.0
+Method    npm  (auto-detected)
+Will run  npm install -g cctally@latest
+Notes     https://github.com/omrikais/cctally/releases/tag/v1.4.0
+
+You're up to date.

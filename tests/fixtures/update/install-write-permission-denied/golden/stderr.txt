@@ -1,0 +1,3 @@
+cctally update: npm prefix '__REALPATH__/bin' is not writable.
+Run with sudo: sudo npm install -g cctally@latest
+Or relocate: npm config set prefix ~/.npm-global

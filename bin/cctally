@@ -79,6 +79,7 @@ SETUP_SYMLINK_NAMES = (
     "cctally-release",
     "cctally-sync-week",
     "cctally-tui",
+    "cctally-update",
 )
 
 # Hook events we register entries for (Section 1 of spec).
@@ -35259,7 +35260,17 @@ def _post_command_update_hooks(command: str | None, args) -> None:
     Both paths are wrapped in their own try/except by the caller so a
     failure here can't break the parent command. Reading state /
     suppress / config is itself best-effort: a corrupt JSON file would
-    raise, but the outer caller swallows it."""
+    raise, but the outer caller swallows it.
+
+    Skip-after-uninstall: ``setup --uninstall`` (with or without
+    ``--purge``) deletes ~/.local/bin/ symlinks and may wipe APP_DIR.
+    Running ``load_config()`` afterwards would recreate APP_DIR via its
+    ``ensure_dirs()`` first-run path, leaving a stub config.json behind
+    and breaking the post-purge "data dir gone" invariant. Skip the
+    hook entirely for that command — the banner is moot post-uninstall
+    anyway."""
+    if command == "setup" and getattr(args, "uninstall", False):
+        return
     config = load_config()
     state = _load_update_state()
     suppress = _load_update_suppress()

@@ -1,0 +1,17 @@
+{
+  "_schema": 1,
+  "current_version": "1.4.0",
+  "latest_version": "1.4.0",
+  "available": false,
+  "method": "unknown",
+  "update_command": "",
+  "release_notes_url": null,
+  "check_status": "ok",
+  "check_error": null,
+  "checked_at_utc": "2026-05-10T12:00:00+00:00",
+  "suppress": {
+    "skipped": [],
+    "remind_after_utc": null
+  },
+  "prerelease_note": null
+}

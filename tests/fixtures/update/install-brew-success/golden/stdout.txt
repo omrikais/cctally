@@ -1,0 +1,3 @@
+Updated 0 taps.
+==> Upgrading cctally
+==> Pouring cctally--1.7.2.bottle.tar.gz

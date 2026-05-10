@@ -1,0 +1,2 @@
+cctally update: Install method is 'unknown' — automatic update unavailable.
+If you installed from source: cd <your cctally repo> && git pull && bin/symlink

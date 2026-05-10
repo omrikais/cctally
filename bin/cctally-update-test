@@ -1,0 +1,629 @@
+#!/usr/bin/env bash
+# Golden-file harness for the `cctally update` subcommand (spec §7).
+#
+# Each scenario lives at tests/fixtures/update/<name>/ and provides:
+#   args.txt            single line of `cctally` args (e.g. "update --check")
+#   scenario.sh         optional, sourced before run; sets per-scenario env
+#                       vars consumed by the brew/npm shims and by Python
+#                       (e.g. BREW_UPDATE_EXIT, CCTALLY_TEST_UPDATE_NPM_URL,
+#                       INSTALL_METHOD=brew|npm|unknown).
+#   pre/.local/share/cctally/    optional pre-existing state files
+#                                (update-state.json, update-suppress.json,
+#                                update.lock, update-check.last-fetch)
+#   registry/npm.json            optional file:// fixture for npm registry
+#   registry/brew-formula.rb     optional file:// fixture for brew formula
+#   golden/stdout.txt            byte-stable stdout
+#   golden/stderr.txt            byte-stable stderr (mtime/PID redacted)
+#   golden/exit_code.txt         single line of expected exit code
+#   post/.local/share/cctally/   optional post-state diffs (update-state.json,
+#                                update-suppress.json)
+#
+# `<scratch>` per scenario is a fresh `mktemp -d`; HOME points there. The
+# real bin/cctally is *hardlinked* into <scratch>/realpath/<install-tree>
+# so `os.path.realpath(sys.argv[0])` lands inside that tree (a symlink
+# would resolve through to the in-tree path). PATH is prepended with
+# <scratch>/bin which contains brew/npm shims that read env vars
+# (BREW_UPDATE_EXIT, NPM_INSTALL_EXIT, NPM_PREFIX_OVERRIDE, etc.).
+#
+# Network calls are diverted via the production-supplied env-var hooks
+# CCTALLY_TEST_UPDATE_{NPM,BREW}_URL set to file:// URLs pointing into
+# the scenario's registry/ directory.
+#
+# Time fixed via CCTALLY_AS_OF (existing hidden env hook in bin/cctally).
+#
+# Parallelization via xargs -P "$JOBS"; cap with CCTALLY_TEST_JOBS
+# (default = host CPU count). Per-scenario stdout/stderr is buffered to
+# <scratch>/_output.log and flushed in lexicographic order so log
+# output stays coherent under parallelism.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="$REPO_ROOT/bin/cctally"
+FIX_DIR="$REPO_ROOT/tests/fixtures/update"
+
+default_jobs() {
+    local n
+    n=$(sysctl -n hw.ncpu 2>/dev/null) || n=$(nproc 2>/dev/null) || n=4
+    echo "$n"
+}
+JOBS=${CCTALLY_TEST_JOBS:-$(default_jobs)}
+
+SCRATCH_ROOT=$(mktemp -d -t cctally-update-test.XXXXXX)
+# rm -rf can't traverse 0555 dirs (NPM_BIN_CHMOD scenario). chmod the
+# tree writable first; ignore failures (some symlink targets may resist).
+cleanup_scratch () {
+    [ -d "$SCRATCH_ROOT" ] || return 0
+    chmod -R u+w "$SCRATCH_ROOT" 2>/dev/null || true
+    rm -rf "$SCRATCH_ROOT" 2>/dev/null || true
+}
+trap cleanup_scratch EXIT INT TERM
+
+# Discover every scenario directory under FIX_DIR (any subdir with an
+# args.txt). Sorted lexicographically for deterministic output ordering.
+mapfile -t SCENARIOS < <(
+    for d in "$FIX_DIR"/*/; do
+        [ -f "${d}args.txt" ] || continue
+        basename "${d%/}"
+    done | sort
+)
+
+if [ "${#SCENARIOS[@]}" -eq 0 ]; then
+    echo "FAIL: no scenarios found under $FIX_DIR" >&2
+    echo "passed: 0   failed: 1"
+    exit 1
+fi
+
+# Render a JSON file through Python's `sort_keys=True, indent=2` so the
+# update-state.json / update-suppress.json post-diffs match cctally's
+# atomic write format exactly. Stdin: raw JSON. Stdout: normalized.
+normalize_json () {
+    python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+print(json.dumps(data, indent=2, sort_keys=True))
+'
+}
+
+# Normalize wall-clock-sensitive fields in update-state.json so post
+# diffs are byte-stable regardless of wall time. checked_at_utc is
+# pinned to AS_OF when set, but install.detected_at_utc may be
+# populated by tier-C of npm prefix resolution at run time even when
+# the test seeds CCTALLY_AS_OF; redact volatile fields to sentinels.
+redact_state () {
+    python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+# Redact only fields that are written by code paths the test does NOT
+# exercise deterministically. checked_at_utc is set by _do_update_check
+# via _now_utc() -> CCTALLY_AS_OF, so it stays stable.
+#
+# install.detected_at_utc is set by _persist_npm_prefix_to_state via
+# _now_utc() too, so AS_OF pins it.
+#
+# Therefore — no redaction needed. But keep this hook in case future
+# fields drift. Output is sort_keys to match _save_update_state.
+print(json.dumps(data, indent=2, sort_keys=True))
+'
+}
+
+# Phase 1 worker. Returns 0 PASS / 1 FAIL. Runs inside a per-scenario
+# mktemp -d work dir; emits all stdout/stderr to <scratch>/_output.log
+# via the run_scenario wrapper, and writes its verdict to _result.txt.
+_run_scenario_inner () {
+    local name="$1"
+    local fix="$FIX_DIR/$name"
+    local scratch="$SCRATCH_ROOT/$name"
+    mkdir -p "$scratch"
+    # macOS: /var/folders/... is a symlink to /private/var/folders/...,
+    # and `realpath(sys.argv[0])` resolves through it. The npm-prefix
+    # detection check (`real == nm_root or real.startswith(nm_root +
+    # os.sep)`) needs nm_root to be the resolved form, so canonicalize
+    # the scratch root too.
+    scratch=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$scratch")
+
+    # ----- args.txt: required, single non-empty line of cctally argv.
+    if [ ! -f "$fix/args.txt" ]; then
+        echo "FAIL $name: args.txt missing"
+        return 1
+    fi
+    local args_line
+    args_line=$(grep -v '^#' "$fix/args.txt" | grep -v '^$' | head -1)
+    if [ -z "$args_line" ]; then
+        echo "FAIL $name: args.txt is empty"
+        return 1
+    fi
+
+    # ----- Default scenario env (overridable via scenario.sh).
+    local INSTALL_METHOD="${INSTALL_METHOD:-npm}"   # default: npm install
+    local AS_OF="${AS_OF:-2026-05-10T12:00:00+00:00}"
+    local CCTALLY_VERSION="${CCTALLY_VERSION:-1.4.0}"  # mirrors CHANGELOG head
+    # Inputs that scenario.sh may override:
+    local NPM_PREFIX_VERSION="${NPM_PREFIX_VERSION:-1.4.0}"
+    local BREW_VERSION_DIR="${BREW_VERSION_DIR:-1.4.0}"
+    local CCTALLY_AS_OF="$AS_OF"
+    local PRE_TZ="Etc/UTC"
+    # File-fixture URL hooks (per-scenario scenario.sh may override or
+    # unset to fall through to the default registry).
+    local CCTALLY_TEST_UPDATE_NPM_URL=""
+    local CCTALLY_TEST_UPDATE_BREW_URL=""
+    # Shim behaviour env vars (consumed by bin/brew + bin/npm shims).
+    local BREW_UPDATE_EXIT="${BREW_UPDATE_EXIT:-0}"
+    local BREW_UPGRADE_EXIT="${BREW_UPGRADE_EXIT:-0}"
+    local NPM_INSTALL_EXIT="${NPM_INSTALL_EXIT:-0}"
+    local NPM_PREFIX_EXIT="${NPM_PREFIX_EXIT:-0}"
+    local NPM_PREFIX_STDOUT=""
+    # If scenario sets NPM_BIN_CHMOD to a value (e.g. 0555), the npm prefix
+    # bin/ directory gets chmod'd before the run (preflight write-perm test).
+    local NPM_BIN_CHMOD=""
+    # If scenario sets FAKE_LOCK_PID, we pre-write update.lock with that PID.
+    local FAKE_LOCK_PID=""
+    # If TTY_SIM=1, run via `script` so stderr.isatty() returns True.
+    local TTY_SIM="${TTY_SIM:-0}"
+    # Optional: capture only stderr (banner tests) — when set, stdout from
+    # the wrapped command is discarded so banner-only goldens stay tight.
+    local STDOUT_DISCARD="${STDOUT_DISCARD:-0}"
+
+    # ----- scenario.sh override hook.
+    if [ -f "$fix/scenario.sh" ]; then
+        # shellcheck disable=SC1091
+        . "$fix/scenario.sh"
+    fi
+
+    # ----- Build the realpath layout.
+    # method=brew → <scratch>/realpath/Cellar/cctally/<ver>/bin/cctally
+    # method=npm  → <scratch>/realpath/npm-prefix/lib/node_modules/cctally/bin/cctally
+    # method=unknown → <scratch>/realpath/random/cctally
+    local realpath_dir target_cctally npm_prefix_dir=""
+    case "$INSTALL_METHOD" in
+        brew)
+            realpath_dir="$scratch/realpath/Cellar/cctally/$BREW_VERSION_DIR/bin"
+            ;;
+        npm)
+            npm_prefix_dir="$scratch/realpath/npm-prefix"
+            realpath_dir="$npm_prefix_dir/lib/node_modules/cctally/bin"
+            ;;
+        unknown)
+            realpath_dir="$scratch/realpath/random/cctally/bin"
+            ;;
+        *)
+            echo "FAIL $name: unknown INSTALL_METHOD=$INSTALL_METHOD"
+            return 1
+            ;;
+    esac
+    mkdir -p "$realpath_dir"
+    target_cctally="$realpath_dir/cctally"
+    # Copy (NOT symlink) — symlinks would resolve through to the repo's
+    # bin/cctally so the realpath substring check would miss. Hardlink
+    # would also be fine within the same volume but TMPDIR may sit on a
+    # different filesystem (macOS /private/var/folders is APFS volume,
+    # the repo may live on /Volumes/<name>) — copy is the simple win.
+    cp "$BIN" "$target_cctally"
+    chmod +x "$target_cctally"
+
+    # The user-facing $PATH cctally lives at <scratch>/bin/cctally and
+    # symlinks to the realpath copy. This mirrors what brew/npm install
+    # would produce: a $PATH symlink pointing at the install tree.
+    mkdir -p "$scratch/bin"
+    ln -s "$target_cctally" "$scratch/bin/cctally"
+
+    # ----- Build PATH-shimmed brew/npm.
+    # If the fixture committed bin/{brew,npm} shims, copy them in;
+    # otherwise generate the canonical shims (env-driven) on the fly.
+    if [ -d "$fix/bin" ]; then
+        for shim in "$fix"/bin/*; do
+            [ -f "$shim" ] || continue
+            cp "$shim" "$scratch/bin/$(basename "$shim")"
+            chmod +x "$scratch/bin/$(basename "$shim")"
+        done
+    fi
+    # Always provide canonical shims if not already present (write-only
+    # if the fixture didn't commit one).
+    if [ ! -f "$scratch/bin/brew" ]; then
+        cat > "$scratch/bin/brew" <<'BREWSHIM'
+#!/usr/bin/env bash
+# Bash brew shim: env-driven returncode + canned stdout/stderr.
+# BREW_UPDATE_EXIT / BREW_UPGRADE_EXIT control rc per subcommand.
+case "${1:-}" in
+    update)
+        echo "Updated 0 taps."
+        exit "${BREW_UPDATE_EXIT:-0}"
+        ;;
+    upgrade)
+        if [ "${BREW_UPGRADE_EXIT:-0}" -ne 0 ]; then
+            echo "Error: cctally upgrade failed" >&2
+            exit "${BREW_UPGRADE_EXIT:-0}"
+        fi
+        echo "==> Upgrading cctally"
+        echo "==> Pouring cctally--$(echo ${BREW_FORMULA_VERSION:-1.7.2}).bottle.tar.gz"
+        exit 0
+        ;;
+    *)
+        echo "brew shim: unrecognized subcommand: $*" >&2
+        exit 99
+        ;;
+esac
+BREWSHIM
+        chmod +x "$scratch/bin/brew"
+    fi
+    if [ ! -f "$scratch/bin/npm" ]; then
+        cat > "$scratch/bin/npm" <<'NPMSHIM'
+#!/usr/bin/env bash
+# Bash npm shim: env-driven for both `npm prefix -g` (resolves install
+# tree under detection) and `npm install -g cctally@<v>`.
+case "${1:-}" in
+    prefix)
+        # `npm prefix -g`
+        if [ "${NPM_PREFIX_EXIT:-0}" -ne 0 ]; then
+            echo "npm error: prefix failed" >&2
+            exit "${NPM_PREFIX_EXIT:-0}"
+        fi
+        if [ -n "${NPM_PREFIX_STDOUT:-}" ]; then
+            echo "${NPM_PREFIX_STDOUT}"
+        else
+            echo "${NPM_PREFIX_OVERRIDE:-/tmp/no-npm-prefix-set}"
+        fi
+        exit 0
+        ;;
+    install)
+        if [ "${NPM_INSTALL_EXIT:-0}" -ne 0 ]; then
+            echo "npm ERR! install failed" >&2
+            exit "${NPM_INSTALL_EXIT:-0}"
+        fi
+        echo "added 1 package in 0.5s"
+        # Echo args for golden-stable verification of the resolve form.
+        echo "npm install args: $*"
+        exit 0
+        ;;
+    *)
+        echo "npm shim: unrecognized subcommand: $*" >&2
+        exit 99
+        ;;
+esac
+NPMSHIM
+        chmod +x "$scratch/bin/npm"
+    fi
+
+    # ----- Pre-populate <scratch>/.local/share/cctally/.
+    mkdir -p "$scratch/.local/share/cctally"
+    if [ -d "$fix/pre/.local/share/cctally" ]; then
+        cp -R "$fix/pre/.local/share/cctally/." "$scratch/.local/share/cctally/"
+    fi
+
+    # ----- Always create <prefix>/bin so the npm preflight write-check
+    # passes by default. Scenarios that want it to fail set NPM_BIN_CHMOD.
+    if [ "$INSTALL_METHOD" = "npm" ]; then
+        mkdir -p "$npm_prefix_dir/bin"
+        if [ -n "$NPM_BIN_CHMOD" ]; then
+            chmod "$NPM_BIN_CHMOD" "$npm_prefix_dir/bin"
+        fi
+    fi
+
+    # ----- Optionally pre-create update.lock with a fake PID.
+    # cctally's lock-acquire path triggers the live-PID check ONLY
+    # when an actual flock holder collides (BlockingIOError on
+    # LOCK_NB). For the live-PID scenario we spawn a bg python that
+    # holds flock indefinitely; for the stale-PID scenario we just
+    # write the body (no flock holder) and rely on the second
+    # LOCK_NB attempt succeeding inside the reclaim path.
+    local flock_holder_pid=""
+    if [ -n "$FAKE_LOCK_PID" ]; then
+        local lock_path="$scratch/.local/share/cctally/update.lock"
+        cat > "$lock_path" <<LOCKBODY
+PID=$FAKE_LOCK_PID
+STARTED_AT_UTC=$AS_OF
+COMMAND=cctally update
+LOCKBODY
+        if [ "${FAKE_LOCK_LIVE:-0}" = "1" ]; then
+            # Background python holds LOCK_EX flock for 30 s. cctally's
+            # first LOCK_NB attempt will BlockingIOError; the body's PID
+            # is alive (the holder's own pid), so cctally raises
+            # UpdateInProgressError. Sleep duration covers slow CI cold
+            # starts; the harness kills it explicitly afterwards.
+            python3 -c "
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+sys.stdout.write('READY\n'); sys.stdout.flush()
+time.sleep(30)
+" "$lock_path" >"$scratch/_lockholder.out" 2>"$scratch/_lockholder.err" &
+            flock_holder_pid=$!
+            local waited=0
+            while [ "$waited" -lt 50 ] && ! grep -q "^READY$" "$scratch/_lockholder.out" 2>/dev/null; do
+                sleep 0.1
+                waited=$((waited + 1))
+            done
+            cat > "$lock_path" <<LOCKBODY
+PID=$flock_holder_pid
+STARTED_AT_UTC=$AS_OF
+COMMAND=cctally update
+LOCKBODY
+        fi
+    fi
+
+    # ----- Resolve the file:// URLs if scenario didn't explicitly set them.
+    if [ -z "$CCTALLY_TEST_UPDATE_NPM_URL" ] && [ -f "$fix/registry/npm.json" ]; then
+        CCTALLY_TEST_UPDATE_NPM_URL="file://$fix/registry/npm.json"
+    fi
+    if [ -z "$CCTALLY_TEST_UPDATE_BREW_URL" ] && [ -f "$fix/registry/brew-formula.rb" ]; then
+        CCTALLY_TEST_UPDATE_BREW_URL="file://$fix/registry/brew-formula.rb"
+    fi
+
+    # Tier-A short-circuit for `_resolve_npm_prefix`: setting
+    # npm_config_prefix tells cctally where the npm install tree lives
+    # without going through the npm shim. Required because the shim's
+    # `npm prefix -g` path is exercised by detection only when the env
+    # var is not set; fixtures default to having it set so detection is
+    # deterministic regardless of host npm.
+    local npm_config_prefix=""
+    if [ "$INSTALL_METHOD" = "npm" ]; then
+        npm_config_prefix="$npm_prefix_dir"
+    fi
+
+    # ----- Materialize a deterministic CHANGELOG.md so
+    # _release_read_latest_release_version() returns CCTALLY_VERSION.
+    # cctally honors CCTALLY_TEST_CHANGELOG_PATH (the documented test
+    # override at bin/cctally:86); without it the realpath cellar-tree
+    # cctally would have no CHANGELOG.md beside it and current_version
+    # would fall through to "unknown".
+    local changelog_path="$scratch/CHANGELOG.md"
+    {
+        echo "# Changelog"
+        echo
+        echo "## [Unreleased]"
+        echo
+        echo "## [$CCTALLY_VERSION] - 2026-05-09"
+        echo
+        echo "### Added"
+        echo "- pinned harness version"
+    } > "$changelog_path"
+
+    # ----- Run.
+    # Build env-prefix for env vars that vary per scenario.
+    local actual_stdout actual_stderr actual_rc
+    local out_file="$scratch/_stdout.txt"
+    local err_file="$scratch/_stderr.txt"
+
+    # shellcheck disable=SC2086
+    set +u
+    if [ "$TTY_SIM" = "1" ]; then
+        # Banner predicate gates on sys.stderr.isatty(). Wrap via BSD
+        # `script` to allocate a PTY (interleaves stdout+stderr but
+        # banner-only goldens already drop stdout via STDOUT_DISCARD).
+        # The leading ^D and trailing CR characters from the PTY are
+        # redacted out below.
+        script -q /dev/null \
+            env \
+            HOME="$scratch" \
+            TZ="$PRE_TZ" \
+            PATH="$scratch/bin:$PATH" \
+            CCTALLY_AS_OF="$CCTALLY_AS_OF" \
+            CCTALLY_TEST_CHANGELOG_PATH="$changelog_path" \
+            CCTALLY_TEST_UPDATE_NPM_URL="$CCTALLY_TEST_UPDATE_NPM_URL" \
+            CCTALLY_TEST_UPDATE_BREW_URL="$CCTALLY_TEST_UPDATE_BREW_URL" \
+            BREW_UPDATE_EXIT="$BREW_UPDATE_EXIT" \
+            BREW_UPGRADE_EXIT="$BREW_UPGRADE_EXIT" \
+            BREW_FORMULA_VERSION="${BREW_FORMULA_VERSION:-}" \
+            NPM_INSTALL_EXIT="$NPM_INSTALL_EXIT" \
+            NPM_PREFIX_EXIT="$NPM_PREFIX_EXIT" \
+            NPM_PREFIX_STDOUT="$NPM_PREFIX_STDOUT" \
+            NPM_PREFIX_OVERRIDE="${NPM_PREFIX_OVERRIDE:-}" \
+            npm_config_prefix="$npm_config_prefix" \
+            python3 "$scratch/bin/cctally" $args_line >"$err_file" 2>&1
+        actual_rc=$?
+        # Strip the leading ^D added by BSD `script -q` and any \r CRs
+        # that the PTY appends to each line.
+        actual_stdout=""
+        actual_stderr=$(sed -e 's/^\x04//' -e 's/\r$//' "$err_file")
+    else
+        HOME="$scratch" \
+        TZ="$PRE_TZ" \
+        PATH="$scratch/bin:$PATH" \
+        CCTALLY_AS_OF="$CCTALLY_AS_OF" \
+        CCTALLY_TEST_CHANGELOG_PATH="$changelog_path" \
+        CCTALLY_TEST_UPDATE_NPM_URL="$CCTALLY_TEST_UPDATE_NPM_URL" \
+        CCTALLY_TEST_UPDATE_BREW_URL="$CCTALLY_TEST_UPDATE_BREW_URL" \
+        BREW_UPDATE_EXIT="$BREW_UPDATE_EXIT" \
+        BREW_UPGRADE_EXIT="$BREW_UPGRADE_EXIT" \
+        BREW_FORMULA_VERSION="${BREW_FORMULA_VERSION:-}" \
+        NPM_INSTALL_EXIT="$NPM_INSTALL_EXIT" \
+        NPM_PREFIX_EXIT="$NPM_PREFIX_EXIT" \
+        NPM_PREFIX_STDOUT="$NPM_PREFIX_STDOUT" \
+        NPM_PREFIX_OVERRIDE="${NPM_PREFIX_OVERRIDE:-}" \
+        npm_config_prefix="$npm_config_prefix" \
+        python3 "$scratch/bin/cctally" $args_line >"$out_file" 2>"$err_file"
+        actual_rc=$?
+        actual_stdout=$(cat "$out_file")
+        actual_stderr=$(cat "$err_file")
+    fi
+    set -u
+    if [ -n "$flock_holder_pid" ]; then
+        kill "$flock_holder_pid" 2>/dev/null || true
+        wait "$flock_holder_pid" 2>/dev/null || true
+    fi
+    if [ "$STDOUT_DISCARD" = "1" ]; then
+        # Banner-only mode: drop stdout entirely.
+        actual_stdout=""
+    fi
+
+    # Banner-mode normalization: when BANNER_CHECK is set, don't try to
+    # golden the entire stderr (which under TTY_SIM=1 contains the
+    # daily/etc. ANSI-rich command output). Instead, distill stderr to
+    # one of two sentinel strings — "BANNER:<exact-line>" if the
+    # update-banner pattern is present, "NO_BANNER" otherwise. The
+    # golden file then only pins the contract under test (banner
+    # appeared / didn't appear / appeared with the expected version).
+    if [ "${BANNER_CHECK:-0}" = "1" ]; then
+        local banner_line
+        banner_line=$(printf '%s\n' "$actual_stderr" \
+            | grep -E '^\^?D?↑ cctally [0-9]+\.[0-9]+\.[0-9]+' \
+            | sed -e 's/^\x04//' -e 's/\r$//' \
+            | head -1)
+        if [ -n "$banner_line" ]; then
+            actual_stderr="BANNER:$banner_line"
+        else
+            actual_stderr="NO_BANNER"
+        fi
+        actual_stdout=""
+    fi
+
+    # ----- Redact scratch-specific paths + PIDs from output before diffing.
+    # Replace the scratch root, HOME, and any explicit PID references
+    # ("(PID 12345)") with sentinels so goldens are byte-stable.
+    redact_paths () {
+        sed -E \
+            -e "s|$scratch/realpath/[^/[:space:]\"']*|__REALPATH__|g" \
+            -e "s|$scratch|__HOME__|g" \
+            -e "s|/private/var/folders/[^[:space:]\"']*/cctally-update-test\.[A-Za-z0-9]*|__SCRATCH__|g" \
+            -e "s|/var/folders/[^[:space:]\"']*/cctally-update-test\.[A-Za-z0-9]*|__SCRATCH__|g" \
+            -e "s/\(PID [0-9]+\)/(PID __PID__)/g" \
+            -e 's/PID=[0-9]+/PID=__PID__/g'
+    }
+
+    actual_stdout_redacted=$(printf '%s' "$actual_stdout" | redact_paths)
+    actual_stderr_redacted=$(printf '%s' "$actual_stderr" | redact_paths)
+
+    # ----- Diff against goldens.
+    local ok=1
+    local g_stdout="$fix/golden/stdout.txt"
+    local g_stderr="$fix/golden/stderr.txt"
+    local g_rc="$fix/golden/exit_code.txt"
+
+    mkdir -p "$fix/golden"
+
+    # First-run bootstrap: when CCTALLY_UPDATE_TEST_REGEN=1 OR any
+    # golden file is missing, write the actual outputs as the golden
+    # baseline and emit WROTE markers. Steady-state behaviour is
+    # byte-stable diff (--regen always overwrites; missing file
+    # bootstraps without overriding hand-curated goldens).
+    local regen="${CCTALLY_UPDATE_TEST_REGEN:-0}"
+
+    # exit code
+    if [ ! -f "$g_rc" ] || [ "$regen" = "1" ]; then
+        printf '%s\n' "$actual_rc" > "$g_rc"
+        echo "WROTE $name golden/exit_code.txt: $actual_rc"
+    fi
+    local expected_rc
+    expected_rc=$(cat "$g_rc" | tr -d '\n ')
+    if [ "$actual_rc" != "$expected_rc" ]; then
+        echo "FAIL $name: exit_code expected=$expected_rc actual=$actual_rc"
+        echo "  stderr was:"
+        printf '%s\n' "$actual_stderr_redacted" | sed 's/^/    /' | head -40
+        ok=0
+    fi
+
+    # stdout
+    if [ ! -f "$g_stdout" ] || [ "$regen" = "1" ]; then
+        printf '%s\n' "$actual_stdout_redacted" > "$g_stdout"
+        echo "WROTE $name golden/stdout.txt"
+    fi
+    if ! diff -u <(printf '%s\n' "$actual_stdout_redacted") "$g_stdout" >/dev/null 2>&1; then
+        echo "FAIL $name: stdout diverged"
+        diff -u "$g_stdout" <(printf '%s\n' "$actual_stdout_redacted") | head -200
+        ok=0
+    fi
+
+    # stderr
+    if [ ! -f "$g_stderr" ] || [ "$regen" = "1" ]; then
+        printf '%s\n' "$actual_stderr_redacted" > "$g_stderr"
+        echo "WROTE $name golden/stderr.txt"
+    fi
+    if ! diff -u <(printf '%s\n' "$actual_stderr_redacted") "$g_stderr" >/dev/null 2>&1; then
+        echo "FAIL $name: stderr diverged"
+        diff -u "$g_stderr" <(printf '%s\n' "$actual_stderr_redacted") | head -200
+        ok=0
+    fi
+
+    # post/.local/share/cctally — optional state file diffs.
+    if [ -d "$fix/post/.local/share/cctally" ]; then
+        for golden in "$fix"/post/.local/share/cctally/*; do
+            [ -f "$golden" ] || continue
+            local rel base actual
+            base=$(basename "$golden")
+            actual="$scratch/.local/share/cctally/$base"
+            if [ ! -f "$actual" ]; then
+                echo "FAIL $name: post/$base expected to exist but doesn't"
+                ok=0
+                continue
+            fi
+            # For JSON files, normalize via sort_keys to compare against
+            # the golden's canonical form. Plain-text files do byte diff.
+            case "$base" in
+                *.json)
+                    local actual_norm golden_norm
+                    actual_norm=$(redact_paths < "$actual" | normalize_json 2>/dev/null) || {
+                        echo "FAIL $name: post/$base actual not valid JSON"
+                        ok=0
+                        continue
+                    }
+                    golden_norm=$(normalize_json < "$golden" 2>/dev/null) || {
+                        echo "FAIL $name: post/$base golden not valid JSON"
+                        ok=0
+                        continue
+                    }
+                    if ! diff -u <(printf '%s' "$actual_norm") <(printf '%s' "$golden_norm") >/dev/null 2>&1; then
+                        echo "FAIL $name: post/$base diverged"
+                        diff -u <(printf '%s' "$golden_norm") <(printf '%s' "$actual_norm") | head -100
+                        ok=0
+                    fi
+                    ;;
+                *)
+                    if ! diff -u "$golden" "$actual" >/dev/null 2>&1; then
+                        echo "FAIL $name: post/$base diverged"
+                        diff -u "$golden" "$actual" | head -100
+                        ok=0
+                    fi
+                    ;;
+            esac
+        done
+    fi
+
+    if [ "$ok" = "1" ]; then
+        echo "PASS $name"
+        return 0
+    fi
+    return 1
+}
+
+# Wrapper: redirect inner output to per-scenario log + result file.
+run_scenario () {
+    local name="$1"
+    local work="$SCRATCH_ROOT/$name"
+    mkdir -p "$work"
+    local out="$work/_output.log"
+    local result="$work/_result.txt"
+    if _run_scenario_inner "$name" > "$out" 2>&1; then
+        echo "PASS" > "$result"
+    else
+        echo "FAIL" > "$result"
+    fi
+}
+
+export -f _run_scenario_inner run_scenario normalize_json redact_state
+export REPO_ROOT BIN FIX_DIR SCRATCH_ROOT
+
+# Dispatch in parallel. Buffered output flushed in scenario order.
+printf '%s\n' "${SCENARIOS[@]}" \
+    | xargs -n1 -P "$JOBS" -I{} \
+        bash -c 'set -uo pipefail; run_scenario "$@"' _ {}
+
+pass_count=0
+fail_count=0
+for name in "${SCENARIOS[@]}"; do
+    if [ -f "$SCRATCH_ROOT/$name/_output.log" ]; then
+        cat "$SCRATCH_ROOT/$name/_output.log"
+    fi
+    if [ -f "$SCRATCH_ROOT/$name/_result.txt" ] \
+       && [ "$(cat "$SCRATCH_ROOT/$name/_result.txt")" = "PASS" ]; then
+        pass_count=$((pass_count + 1))
+    else
+        if [ ! -f "$SCRATCH_ROOT/$name/_result.txt" ]; then
+            echo "FAIL $name: worker crashed before writing result"
+        fi
+        fail_count=$((fail_count + 1))
+    fi
+done
+
+echo
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

@@ -1,0 +1,8 @@
+# Runtime artifacts under <scenario>/.local/share/cctally/ are unexpected
+# — the bin/cctally-update-test harness runs every scenario inside a
+# per-run mktemp -d scratch root, so the in-tree fixture trees stay
+# byte-stable. The patterns below scope ONLY to the per-scenario top-
+# level <scenario>/.local/ tree (NOT the committed pre/.local/ trees,
+# which seed the scratch HOME and may contain identically-named files
+# like update-check.last-fetch).
+*/.local/

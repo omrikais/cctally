@@ -1,0 +1,8 @@
+{
+  "_schema": 1,
+  "remind_after": {
+    "until_utc": "2026-05-17T12:00:00+00:00",
+    "version": "1.7.2"
+  },
+  "skipped_versions": []
+}

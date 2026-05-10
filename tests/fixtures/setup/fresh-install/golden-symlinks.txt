@@ -10,3 +10,4 @@ cctally-refresh-usage -> /REPO/bin/cctally-refresh-usage
 cctally-release -> /REPO/bin/cctally-release
 cctally-sync-week -> /REPO/bin/cctally-sync-week
 cctally-tui -> /REPO/bin/cctally-tui
+cctally-update -> /REPO/bin/cctally-update

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "install": {
     "symlinks_present": 0,
-    "symlinks_total": 12,
+    "symlinks_total": 13,
     "path_includes": true
   },
   "hooks": {

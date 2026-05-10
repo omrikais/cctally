@@ -1,0 +1,4 @@
+cctally update: Pinned-version install is not supported on Homebrew (no versioned formulae).
+To install a specific version manually:
+  brew uninstall cctally
+  brew install https://github.com/omrikais/cctally/releases/download/v1.6.4/cctally-1.6.4.tar.gz
