@@ -38,6 +38,22 @@ export interface Envelope {
   // a separate GET /api/settings; matches the Python envelope's
   // `alerts_settings` block emitted by snapshot_to_envelope.
   alerts_settings: AlertsSettingsEnvelope;
+  // update-subcommand mirror — `{state, suppress}` shape matches GET
+  // /api/update/status's payload so coerceUpdateState/Suppress consume
+  // both the bootstrap fetch and live SSE ticks uniformly. Optional so
+  // a Python without this mirror (older snapshot path or test fixtures
+  // built before the field landed) doesn't break the type contract.
+  update?: UpdateEnvelope;
+}
+
+export interface UpdateEnvelope {
+  // Both fields hold the raw on-disk shape — see _load_update_state /
+  // _load_update_suppress in bin/cctally. The client coerces (via
+  // coerceUpdateState/Suppress) before storing. Either may be null /
+  // {_error: "..."} when the underlying file is missing or invalid;
+  // the coercer returns a defensive null-state slice in that case.
+  state: unknown;
+  suppress: unknown;
 }
 
 // ---- Threshold-actions alerts (T5/T8) --------------------------------

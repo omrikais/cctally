@@ -50,6 +50,7 @@
   },
   "sync_age_s": null,
   "trend": null,
+  "update": "__UPDATE_BLOCK__",
   "weekly": {
     "rows": []
   }

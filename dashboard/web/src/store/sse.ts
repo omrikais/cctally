@@ -1,5 +1,6 @@
 import type { Envelope } from '../types/envelope';
 import { dispatch, updateSnapshot, resetSnapshotOrdering } from './store';
+import { coerceUpdateState, coerceUpdateSuppress } from './update';
 
 let es: EventSource | null = null;
 let disconnected = false;
@@ -47,15 +48,19 @@ export function startSSE(cb: SSECallbacks = {}): void {
   // Initial one-shot snapshot.
   // async/await (vs .then chain) keeps the microtask depth shallow enough
   // that tests awaiting two microticks observe the bootstrap applied.
-  // ingestAlerts is gated on updateSnapshot's accept/reject return so a
-  // late-arriving bootstrap (older generated_at than an SSE update that
-  // already landed) can't replace fresh state.alerts / state.alertsConfig
-  // or pollute state.seenAlertIds with stale ids.
+  // ingestAlerts / ingestUpdate are gated on updateSnapshot's accept/reject
+  // return so a late-arriving bootstrap (older generated_at than an SSE
+  // update that already landed) can't replace fresh state.alerts /
+  // state.alertsConfig / state.update or pollute state.seenAlertIds with
+  // stale ids.
   (async () => {
     try {
       const r = await fetch('/api/data');
       const snap = (await r.json()) as Envelope;
-      if (updateSnapshot(snap)) ingestAlerts(snap);
+      if (updateSnapshot(snap)) {
+        ingestAlerts(snap);
+        ingestUpdate(snap);
+      }
       cb.onConnect?.();
     } catch (err) {
       console.error('initial snapshot failed:', err);
@@ -66,7 +71,10 @@ export function startSSE(cb: SSECallbacks = {}): void {
   es.addEventListener('update', (ev: MessageEvent) => {
     try {
       const snap = JSON.parse(ev.data) as Envelope;
-      if (updateSnapshot(snap)) ingestAlerts(snap);
+      if (updateSnapshot(snap)) {
+        ingestAlerts(snap);
+        ingestUpdate(snap);
+      }
       if (disconnected) {
         disconnected = false;
         emitStatus();
@@ -115,6 +123,19 @@ function ingestAlerts(snap: Envelope): void {
     isFirstTick,
   });
   isFirstTick = false;
+}
+
+// Mirror of the envelope's `update` block (added alongside
+// `alerts_settings`). Pre-mirror Python builds omit the field entirely;
+// in that case we leave the slice untouched — the boot-time
+// `refreshUpdateState()` fallback in main.tsx still seeds initial state
+// against /api/update/status. Once Python emits the field, every tick
+// repaints the badge with no extra fetch.
+function ingestUpdate(snap: Envelope): void {
+  if (!snap.update) return;
+  const suppress = coerceUpdateSuppress(snap.update.suppress);
+  const state = coerceUpdateState(snap.update.state, suppress);
+  dispatch({ type: 'SET_UPDATE_STATE', state, suppress });
 }
 
 export function closeSSE(): void {

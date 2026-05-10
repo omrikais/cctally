@@ -9409,6 +9409,67 @@ def _normalize_alerts_enabled_value(raw: str) -> bool:
     )
 
 
+# Range bound mirrors `docs/commands/update.md`: 1 hour minimum, 720 hours
+# (= 30 days) maximum. Out-of-range returns ValueError so callers in both
+# the CLI (`_cmd_config_set`) and the dashboard (`_handle_post_settings`)
+# can map to their own exit-code / HTTP-status semantics.
+_UPDATE_CHECK_TTL_HOURS_MIN = 1
+_UPDATE_CHECK_TTL_HOURS_MAX = 720
+
+
+def _normalize_update_check_enabled_value(raw: str) -> bool:
+    """Normalize the CLI string for update.check.enabled. Reuses the
+    alerts.enabled string vocabulary so users don't have to remember a
+    second set of valid words.
+    """
+    try:
+        return _normalize_alerts_enabled_value(raw)
+    except ValueError:
+        # Re-raise with the right key name in the message so the user
+        # sees `update.check.enabled` not `alerts.enabled`.
+        raise ValueError(
+            f"invalid boolean value for update.check.enabled: {raw!r} "
+            "(expected true|false|yes|no|1|0|on|off)"
+        )
+
+
+def _validate_update_check_ttl_hours_value(raw) -> int:
+    """Validate update.check.ttl_hours (int hours). Accepts an int or a
+    string of digits; rejects bools (Python ``True`` is an int subclass
+    so callers pre-validating JSON shapes must NOT pass a bool through
+    here). Range bound: ``[_UPDATE_CHECK_TTL_HOURS_MIN, _MAX]``.
+    """
+    if isinstance(raw, bool):
+        raise ValueError(
+            "invalid value for update.check.ttl_hours: "
+            f"{raw!r} (expected integer in "
+            f"[{_UPDATE_CHECK_TTL_HOURS_MIN}, {_UPDATE_CHECK_TTL_HOURS_MAX}])"
+        )
+    if isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, str):
+        s = raw.strip()
+        try:
+            n = int(s, 10)
+        except ValueError:
+            raise ValueError(
+                f"invalid integer for update.check.ttl_hours: {raw!r}"
+            )
+    else:
+        raise ValueError(
+            "invalid value for update.check.ttl_hours: "
+            f"{raw!r} (expected integer in "
+            f"[{_UPDATE_CHECK_TTL_HOURS_MIN}, {_UPDATE_CHECK_TTL_HOURS_MAX}])"
+        )
+    if n < _UPDATE_CHECK_TTL_HOURS_MIN or n > _UPDATE_CHECK_TTL_HOURS_MAX:
+        raise ValueError(
+            "update.check.ttl_hours out of range: "
+            f"{n} (must be in [{_UPDATE_CHECK_TTL_HOURS_MIN}, "
+            f"{_UPDATE_CHECK_TTL_HOURS_MAX}])"
+        )
+    return n
+
+
 _CONFIG_CORRUPT_WARNED = False  # one-shot warn flag for load_config
 _ALERTS_BAD_CONFIG_WARNED = False  # one-shot warn flag for malformed alerts block
 
@@ -24651,7 +24712,13 @@ def _setup_install(args: argparse.Namespace) -> int:
     return 0
 
 
-ALLOWED_CONFIG_KEYS = ("display.tz", "alerts.enabled", "dashboard.bind")
+ALLOWED_CONFIG_KEYS = (
+    "display.tz",
+    "alerts.enabled",
+    "dashboard.bind",
+    "update.check.enabled",
+    "update.check.ttl_hours",
+)
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -24705,6 +24772,26 @@ def _config_known_value(config: dict, key: str) -> "object":
             # Hand-edited junk: surface the default rather than the bad value;
             # `cmd_dashboard` warns at server-start when it hits the same path.
             return "loopback"
+    if key in ("update.check.enabled", "update.check.ttl_hours"):
+        # Defaults mirror `_is_update_check_due` (True / 24 hours).
+        # Hand-edited junk surfaces as the default — matches dashboard.bind.
+        update_block = (
+            config.get("update") if isinstance(config, dict) else None
+        )
+        if not isinstance(update_block, dict):
+            update_block = {}
+        check_block = update_block.get("check")
+        if not isinstance(check_block, dict):
+            check_block = {}
+        if key == "update.check.enabled":
+            stored = check_block.get("enabled", True)
+            return bool(stored) if isinstance(stored, bool) else True
+        # update.check.ttl_hours
+        stored = check_block.get("ttl_hours", UPDATE_DEFAULT_TTL_HOURS)
+        try:
+            return _validate_update_check_ttl_hours_value(stored)
+        except ValueError:
+            return UPDATE_DEFAULT_TTL_HOURS
     return None
 
 
@@ -24831,6 +24918,53 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         else:
             print(f"dashboard.bind={canonical}")
         return 0
+    if key in ("update.check.enabled", "update.check.ttl_hours"):
+        # Validate first; rejection short-circuits before lock acquisition.
+        if key == "update.check.enabled":
+            try:
+                normalized: object = _normalize_update_check_enabled_value(raw)
+            except ValueError as exc:
+                print(f"cctally: {exc}", file=sys.stderr)
+                return 2
+            inner_key = "enabled"
+        else:
+            try:
+                normalized = _validate_update_check_ttl_hours_value(raw)
+            except ValueError as exc:
+                print(f"cctally: {exc}", file=sys.stderr)
+                return 2
+            inner_key = "ttl_hours"
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing_update = config.get("update")
+            if existing_update is not None and not isinstance(existing_update, dict):
+                print(
+                    "cctally: update config error: update must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            update_block = dict(existing_update or {})
+            existing_check = update_block.get("check")
+            if existing_check is not None and not isinstance(existing_check, dict):
+                print(
+                    "cctally: update config error: update.check must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            check_block = dict(existing_check or {})
+            check_block[inner_key] = normalized
+            update_block["check"] = check_block
+            config["update"] = update_block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(json.dumps({"update": {"check": {inner_key: normalized}}}, indent=2))
+        else:
+            if isinstance(normalized, bool):
+                rendered = "true" if normalized else "false"
+            else:
+                rendered = str(normalized)
+            print(f"{key}={rendered}")
+        return 0
     return 2  # unreachable given the gate above
 
 
@@ -24880,6 +25014,26 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                 if not block:
                     config.pop("dashboard", None)
                 save_config(config)
+            # idempotent: silent on missing key
+        return 0
+    if key in ("update.check.enabled", "update.check.ttl_hours"):
+        # Mirror the dashboard.bind branch: drop the leaf, then prune
+        # empty `check` and empty `update` so config.json stays tidy.
+        inner_key = (
+            "enabled" if key == "update.check.enabled" else "ttl_hours"
+        )
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            update_block = config.get("update")
+            if isinstance(update_block, dict):
+                check_block = update_block.get("check")
+                if isinstance(check_block, dict) and inner_key in check_block:
+                    del check_block[inner_key]
+                    if not check_block:
+                        del update_block["check"]
+                    if not update_block:
+                        config.pop("update", None)
+                    save_config(config)
             # idempotent: silent on missing key
         return 0
     return 2  # unreachable given the gate above
@@ -31584,6 +31738,35 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         "five_hour_thresholds": list(_alerts_cfg["five_hour_thresholds"]),
     }
 
+    # Mirror update-state.json + update-suppress.json into the envelope
+    # so the dashboard's amber "Update available" badge repaints from
+    # the SSE channel rather than requiring a /api/update/status fetch
+    # per check. Without this mirror, a long-open dashboard tab never
+    # learns that the dashboard's `_DashboardUpdateCheckThread` wrote
+    # a fresher latest_version (24h-TTL by default) — the badge stayed
+    # hidden until manual reload. Same precedent as `alerts_settings`:
+    # cheap atomic-rename reads on the snapshot hot path. Failures
+    # produce a `null` block so a missing/corrupt state file doesn't
+    # 500 the entire envelope; the client falls back to the defensive
+    # null-state shape `coerceUpdateState` already understands.
+    try:
+        _update_state_envelope = _load_update_state()
+    except UpdateError:
+        # _load_update_state() raises on truly malformed JSON. Surface
+        # an _error sentinel so the client renders "no update info" the
+        # same way it does for unreachable /api/update/status.
+        _update_state_envelope = {"_error": "update-state.json invalid"}
+    except Exception:
+        _update_state_envelope = {"_error": "update-state.json read failed"}
+    try:
+        _update_suppress_envelope = _load_update_suppress()
+    except Exception:
+        _update_suppress_envelope = {"skipped_versions": [], "remind_after": None}
+    update_envelope = {
+        "state":    _update_state_envelope,
+        "suppress": _update_suppress_envelope,
+    }
+
     return {
         "envelope_version": 2,
         "generated_at":     _iso_z(snap.generated_at),
@@ -31713,6 +31896,13 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # threshold-actions T5: see prelude above for rationale.
         "alerts":           alerts_array,
         "alerts_settings":  alerts_settings,
+
+        # update-subcommand SSE mirror (see comment above the
+        # `_load_update_state()` block). Shape matches GET
+        # /api/update/status's payload (`{state, suppress}`) so the
+        # dashboard client's existing coerceUpdateState/Suppress logic
+        # consumes both surfaces uniformly.
+        "update":           update_envelope,
     }
 
 
@@ -32007,10 +32197,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     def _handle_post_settings(self) -> None:
         """Persist a settings update and trigger an immediate SSE broadcast.
 
-        Body shape (T7 extension): ``{"display"?: {"tz": "..."}, "alerts"?: {...}}``
-        — both top-level keys are optional; either may be sent alone or
-        both together (combined save). Unknown top-level keys are
-        rejected with 400.
+        Body shape: ``{"display"?: {"tz": "..."}, "alerts"?: {...},
+        "update"?: {"check"?: {"enabled"?: bool, "ttl_hours"?: int}}}``
+        — every top-level key is optional; any subset may be sent
+        together (combined save). Unknown top-level keys are rejected
+        with 400.
 
         Per-block validation:
           * ``display.tz`` — "local", "utc", or a valid IANA zone (via
@@ -32019,11 +32210,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             JSON boolean (string "yes"/"true" rejected, per spec). Merged
             block is validated via ``_get_alerts_config(merged)``;
             ``_AlertsConfigError`` → 400.
+          * ``update.check.enabled`` — JSON bool; 400 on type mismatch.
+          * ``update.check.ttl_hours`` — JSON int (NOT string), in
+            ``[1, 720]``; 400 on out-of-range or non-int. Bool is rejected
+            (Python ``True`` is an int subclass, so a permissive check
+            would silently accept ``true`` for a numeric field).
 
-        Atomic merged write: if BOTH blocks validate, the merged config
-        is persisted in a single ``save_config`` call inside the
-        ``config_writer_lock``. If validation fails for one block (or
-        both), nothing is persisted — no partial commits.
+        Atomic merged write: if all touched blocks validate, the merged
+        config is persisted in a single ``save_config`` call inside the
+        ``config_writer_lock``. If any block fails validation, nothing
+        is persisted — no partial commits.
 
         Security: Origin must match the request's Host header (Host-header
         parity; see ``_check_origin_csrf``). Missing Origin → 403.
@@ -32070,7 +32266,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             return
 
         # Reject unknown top-level keys (forward-compat hygiene).
-        allowed_top_keys = {"display", "alerts"}
+        allowed_top_keys = {"display", "alerts", "update"}
         for k in payload.keys():
             if k not in allowed_top_keys:
                 self._respond_json(
@@ -32079,10 +32275,17 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 return
 
         # Body must touch at least one known block.
-        if "display" not in payload and "alerts" not in payload:
+        if (
+            "display" not in payload
+            and "alerts" not in payload
+            and "update" not in payload
+        ):
             self._respond_json(
                 400,
-                {"error": "body must contain at least one of: display, alerts"},
+                {"error": (
+                    "body must contain at least one of: "
+                    "display, alerts, update"
+                )},
             )
             return
 
@@ -32137,6 +32340,66 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+        # Pre-validate update shape. Only `update.check.{enabled,ttl_hours}`
+        # is settable today; any other key under `update` or `update.check`
+        # is rejected so adding e.g. `update.banner.*` later is forward
+        # compatible. `enabled` must be a JSON bool; `ttl_hours` an int
+        # (bools rejected — see _validate_update_check_ttl_hours_value).
+        update_check_validated: "dict | None" = None
+        if "update" in payload:
+            update_in = payload["update"]
+            if not isinstance(update_in, dict):
+                self._respond_json(
+                    400, {"error": "update must be an object"}
+                )
+                return
+            for inner in update_in.keys():
+                if inner != "check":
+                    self._respond_json(
+                        400,
+                        {"error": f"unknown update settings key: {inner}",
+                         "field": f"update.{inner}"},
+                    )
+                    return
+            check_in = update_in.get("check", {})
+            if not isinstance(check_in, dict):
+                self._respond_json(
+                    400,
+                    {"error": "update.check must be an object",
+                     "field": "update.check"},
+                )
+                return
+            for leaf in check_in.keys():
+                if leaf not in ("enabled", "ttl_hours"):
+                    self._respond_json(
+                        400,
+                        {"error": f"unknown update.check key: {leaf}",
+                         "field": f"update.check.{leaf}"},
+                    )
+                    return
+            update_check_validated = {}
+            if "enabled" in check_in:
+                if not isinstance(check_in["enabled"], bool):
+                    self._respond_json(
+                        400,
+                        {"error": "update.check.enabled must be a JSON boolean",
+                         "field": "update.check.enabled"},
+                    )
+                    return
+                update_check_validated["enabled"] = check_in["enabled"]
+            if "ttl_hours" in check_in:
+                try:
+                    update_check_validated["ttl_hours"] = (
+                        _validate_update_check_ttl_hours_value(check_in["ttl_hours"])
+                    )
+                except ValueError as exc:
+                    self._respond_json(
+                        400,
+                        {"error": str(exc),
+                         "field": "update.check.ttl_hours"},
+                    )
+                    return
+
         # Acquire config_writer_lock so a concurrent `cctally config set`
         # in another shell can't interleave its write between our load
         # and save (issue #17). Lock is process-cross via fcntl.flock,
@@ -32185,6 +32448,34 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     self._respond_json(400, {"error": str(exc)})
                     return
 
+            if update_check_validated is not None:
+                # Same hand-edited-junk guard as alerts: a non-dict
+                # `update` or `update.check` block in config.json should
+                # surface as a recoverable 400, not a 500.
+                existing_update = merged.get("update")
+                if existing_update is not None and not isinstance(
+                    existing_update, dict
+                ):
+                    self._respond_json(
+                        400, {"error": "update must be an object",
+                              "field": "update"}
+                    )
+                    return
+                merged_update = dict(existing_update or {})
+                existing_check = merged_update.get("check")
+                if existing_check is not None and not isinstance(
+                    existing_check, dict
+                ):
+                    self._respond_json(
+                        400, {"error": "update.check must be an object",
+                              "field": "update.check"}
+                    )
+                    return
+                merged_check = dict(existing_check or {})
+                merged_check.update(update_check_validated)
+                merged_update["check"] = merged_check
+                merged["update"] = merged_update
+
             save_config(merged)
 
         # Build the response: subset of touched blocks.
@@ -32195,6 +32486,19 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             )
         if "alerts" in payload:
             out["alerts"] = _get_alerts_config(merged)
+        if update_check_validated is not None:
+            # Echo the full merged check block (cooked defaults included)
+            # so the SettingsOverlay can repaint without a follow-up GET.
+            out["update"] = {
+                "check": {
+                    "enabled": _config_known_value(
+                        merged, "update.check.enabled"
+                    ),
+                    "ttl_hours": _config_known_value(
+                        merged, "update.check.ttl_hours"
+                    ),
+                }
+            }
         out["saved_at"] = (
             dt.datetime.now(dt.timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%SZ")

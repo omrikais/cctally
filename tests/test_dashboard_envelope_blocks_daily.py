@@ -15,13 +15,34 @@ def _pin_tz_etc_utc(monkeypatch):
     `display` block (offset_label / offset_seconds / resolved_tz) matches
     the golden regardless of host timezone. Per CLAUDE.md: use Etc/UTC,
     never bare UTC, because _local_tz_name() falls back to host-local for
-    non-IANA strings."""
+    non-IANA strings.
+
+    Also pin the envelope's update-mirror block to a deterministic shape:
+    the production loaders read ~/.local/share/cctally/update-state.json
+    (real path), which on a developer machine carries live wall-clock
+    state. Patching here keeps the full-envelope golden stable."""
     monkeypatch.setenv("TZ", "Etc/UTC")
     import time as _time
     _time.tzset()
 
 
+def _pin_update_envelope_loaders(ns):
+    """Replace ``_load_update_state`` / ``_load_update_suppress`` in the
+    per-test namespace with deterministic stubs. Production reads from
+    ~/.local/share/cctally/update-state.json (live wall-clock state on
+    a developer machine), which would leak into the full-envelope
+    golden assertion otherwise. Each ``load_script()`` returns a fresh
+    namespace, so the override has to be done per test rather than via
+    a module-scoped autouse fixture."""
+    ns["_load_update_state"] = lambda: None
+    ns["_load_update_suppress"] = lambda: {
+        "skipped_versions": [],
+        "remind_after": None,
+    }
+
+
 def _make_snapshot(ns):
+    _pin_update_envelope_loaders(ns)
     DataSnapshot = ns["DataSnapshot"]
     BlocksPanelRow = ns["BlocksPanelRow"]
     DailyPanelRow = ns["DailyPanelRow"]

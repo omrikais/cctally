@@ -916,6 +916,7 @@
       }
     ]
   },
+  "update": "__UPDATE_BLOCK__",
   "weekly": {
     "rows": [
       {

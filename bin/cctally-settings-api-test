@@ -452,7 +452,104 @@ code=$(curl -s -o /dev/null -w "%{http_code}" \
 assert_eq        "403 alerts/test missing Origin" "403" "$code"
 stop_server
 
-# --- Case 16: malformed stored alerts block -> 400 --------------------------
+# --- Case 16a-h: update.check.{enabled,ttl_hours} -----------------
+# update-check config keys are documented in docs/commands/update.md.
+# Cases cover: round-trip valid, invalid type, out-of-range, unknown
+# inner key, malformed stored block, combined save.
+
+# 16a: valid round-trip — boolean + int.
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" \
+    '{"update":{"check":{"enabled":false,"ttl_hours":168}}}')
+split_post_response "$raw"
+assert_eq       "200 update set code"         "200" "$code"
+assert_contains "200 update echo enabled"     '"enabled": false' "$body"
+assert_contains "200 update echo ttl_hours"   '"ttl_hours": 168' "$body"
+# Persistence: read config.json directly.
+persisted=$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+print(json.dumps(d.get("update", {}).get("check", {}), sort_keys=True))
+' "$HOME_DIR/.local/share/cctally/config.json")
+assert_eq       "200 update persisted check block" \
+    '{"enabled": false, "ttl_hours": 168}' "$persisted"
+stop_server
+
+# 16b: invalid bool type (string) -> 400.
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" \
+    '{"update":{"check":{"enabled":"yes"}}}')
+split_post_response "$raw"
+assert_eq       "400 update.check.enabled type code" "400" "$code"
+assert_contains "400 update.check.enabled type msg"  "must be a JSON boolean" "$body"
+stop_server
+
+# 16c: ttl_hours out-of-range -> 400.
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" \
+    '{"update":{"check":{"ttl_hours":0}}}')
+split_post_response "$raw"
+assert_eq       "400 ttl_hours OOR code"       "400" "$code"
+assert_contains "400 ttl_hours OOR msg"        "out of range" "$body"
+stop_server
+
+# 16d: ttl_hours bool rejected (Python True is int subclass; lax accept
+# would silently store `true` as the TTL).
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" \
+    '{"update":{"check":{"ttl_hours":true}}}')
+split_post_response "$raw"
+assert_eq       "400 ttl_hours bool code"      "400" "$code"
+assert_contains "400 ttl_hours bool msg"       "expected integer" "$body"
+stop_server
+
+# 16e: unknown leaf under update.check -> 400.
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" \
+    '{"update":{"check":{"banana":1}}}')
+split_post_response "$raw"
+assert_eq       "400 unknown update.check leaf code" "400" "$code"
+assert_contains "400 unknown update.check leaf msg"  "unknown update.check key: banana" "$body"
+stop_server
+
+# 16f: unknown sub-key under update -> 400.
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" \
+    '{"update":{"banner":{"enabled":true}}}')
+split_post_response "$raw"
+assert_eq       "400 unknown update sub-key code" "400" "$code"
+assert_contains "400 unknown update sub-key msg"  "unknown update settings key: banner" "$body"
+stop_server
+
+# 16g: malformed stored update block -> 400, no partial write.
+start_server || exit 1
+mkdir -p "$HOME_DIR/.local/share/cctally"
+cat > "$HOME_DIR/.local/share/cctally/config.json" <<'JSON'
+{"update": "bad"}
+JSON
+before=$(cat "$HOME_DIR/.local/share/cctally/config.json")
+raw=$(post_settings "http://127.0.0.1:$PORT" \
+    '{"update":{"check":{"enabled":true}}}')
+split_post_response "$raw"
+assert_eq       "400 malformed stored update code" "400" "$code"
+assert_contains "400 malformed stored update msg"  "update must be an object" "$body"
+after=$(cat "$HOME_DIR/.local/share/cctally/config.json")
+assert_eq       "400 malformed stored update no partial write" "$before" "$after"
+stop_server
+
+# 16h: combined save (display + alerts + update) all in one body.
+start_server || exit 1
+raw=$(post_settings "http://127.0.0.1:$PORT" \
+    '{"display":{"tz":"Etc/UTC"},"alerts":{"enabled":true},"update":{"check":{"enabled":false,"ttl_hours":48}}}')
+split_post_response "$raw"
+assert_eq       "200 combined save code"          "200" "$code"
+assert_contains "200 combined save display"       '"resolved_tz"' "$body"
+assert_contains "200 combined save alerts"        '"enabled": true' "$body"
+assert_contains "200 combined save update"        '"ttl_hours": 48' "$body"
+stop_server
+
+# --- Case 17: malformed stored alerts block -> 400 --------------------------
 # Pre-seed a non-dict alerts block to simulate a hand-edit that left
 # config.json in a recoverable-but-invalid state. Pre-fix, the handler
 # crashed in `dict("bad")` (ValueError) before reaching the

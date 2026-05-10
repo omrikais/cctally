@@ -568,6 +568,105 @@ assert_eq "dashboard.bind bare ::1 still passes" "dashboard.bind=::1" "$out"
 
 rm -rf "$home"
 
+# 34-49. update.check.{enabled,ttl_hours} round-trips. Mirror the
+# alerts.enabled / dashboard.bind branches: get default → set → get →
+# unset → get default. Also exercise the validators (out-of-range
+# ttl_hours, non-bool enabled, malformed stored block).
+home=$(mktemp -d)
+
+# defaults match `_is_update_check_due` (true / 24).
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.check.enabled 2>&1)
+assert_eq "update.check.enabled get default" "update.check.enabled=true" "$out"
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.check.ttl_hours 2>&1)
+assert_eq "update.check.ttl_hours get default" "update.check.ttl_hours=24" "$out"
+
+# enabled round-trip via plain string.
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.enabled false >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.check.enabled)
+assert_eq "update.check.enabled set false" "update.check.enabled=false" "$out"
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.enabled true >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.check.enabled)
+assert_eq "update.check.enabled set true" "update.check.enabled=true" "$out"
+
+# ttl_hours round-trip.
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.ttl_hours 168 >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.check.ttl_hours)
+assert_eq "update.check.ttl_hours set 168" "update.check.ttl_hours=168" "$out"
+
+# ttl_hours boundary values.
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.ttl_hours 1 >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.check.ttl_hours)
+assert_eq "update.check.ttl_hours set 1 (low boundary)" "update.check.ttl_hours=1" "$out"
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.ttl_hours 720 >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.check.ttl_hours)
+assert_eq "update.check.ttl_hours set 720 (high boundary)" "update.check.ttl_hours=720" "$out"
+
+# ttl_hours out-of-range rejections.
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.ttl_hours 0 2>&1 >/dev/null)
+ec=$?
+assert_eq "update.check.ttl_hours zero exit" "2" "$ec"
+assert_contains "update.check.ttl_hours zero stderr" "out of range" "$err"
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.ttl_hours 721 2>&1 >/dev/null)
+ec=$?
+assert_eq "update.check.ttl_hours 721 exit" "2" "$ec"
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.ttl_hours nope 2>&1 >/dev/null)
+ec=$?
+assert_eq "update.check.ttl_hours non-int exit" "2" "$ec"
+assert_contains "update.check.ttl_hours non-int stderr" "invalid integer" "$err"
+
+# enabled invalid value.
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.enabled maybe 2>&1 >/dev/null)
+ec=$?
+assert_eq "update.check.enabled invalid exit" "2" "$ec"
+assert_contains "update.check.enabled invalid stderr" "update.check.enabled" "$err"
+
+# unset preserves siblings.
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.enabled false >/dev/null
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.ttl_hours 168 >/dev/null
+HOME="$home" TZ=Etc/UTC "$BIN" config unset update.check.enabled >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.check.enabled)
+assert_eq "update.check.enabled unset returns default" "update.check.enabled=true" "$out"
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.check.ttl_hours)
+assert_eq "update.check.ttl_hours preserved across enabled-unset" "update.check.ttl_hours=168" "$out"
+
+# unset both → empty update block on disk (no `update` key in config.json).
+HOME="$home" TZ=Etc/UTC "$BIN" config unset update.check.ttl_hours >/dev/null
+remaining=$(python3 -c 'import json,sys; d=json.loads(open(sys.argv[1]).read()); print("update" in d)' "$home/.local/share/cctally/config.json")
+assert_eq "update.check.ttl_hours unset removes update block" "False" "$remaining"
+
+# Idempotent unset on an empty store (no error, no stderr).
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config unset update.check.enabled 2>&1 >/dev/null)
+ec=$?
+assert_eq "update.check.enabled idempotent unset exit" "0" "$ec"
+assert_eq "update.check.enabled idempotent unset no stderr" "" "$err"
+
+# Malformed stored update block: `set` must surface a controlled rc=2 +
+# "update must be an object" / "update.check must be an object" rather
+# than crash. No partial write.
+cat > "$home/.local/share/cctally/config.json" <<'JSON'
+{"update": "bad"}
+JSON
+before=$(cat "$home/.local/share/cctally/config.json")
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.enabled true 2>&1 >/dev/null)
+ec=$?
+after=$(cat "$home/.local/share/cctally/config.json")
+assert_eq "malformed update block exit" "2" "$ec"
+assert_contains "malformed update block stderr" "update must be an object" "$err"
+assert_eq "malformed update block no partial write" "$before" "$after"
+
+cat > "$home/.local/share/cctally/config.json" <<'JSON'
+{"update": {"check": "bad"}}
+JSON
+before=$(cat "$home/.local/share/cctally/config.json")
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.enabled true 2>&1 >/dev/null)
+ec=$?
+after=$(cat "$home/.local/share/cctally/config.json")
+assert_eq "malformed update.check block exit" "2" "$ec"
+assert_contains "malformed update.check block stderr" "update.check must be an object" "$err"
+assert_eq "malformed update.check block no partial write" "$before" "$after"
+
+rm -rf "$home"
+
 echo
 echo "passed: $pass_count   failed: $fail_count"
 [ $fail_count -eq 0 ]

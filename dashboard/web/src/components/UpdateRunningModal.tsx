@@ -96,17 +96,24 @@ export function UpdateRunningModal() {
         },
       });
       // Terminal events drive the status machine.
+      //
+      // `exit` is a STEP boundary, not a terminal worker signal. Brew's
+      // two-step flow (`brew update` → `brew upgrade cctally`) emits an
+      // `exit rc=0 step="brew update"` BEFORE step 2 starts, and an
+      // earlier version of this branch flipped to success on that first
+      // zero exit — masking failures from `brew upgrade cctally`. The
+      // canonical success transition is `execvp` (handled below); only
+      // a non-zero exit short-circuits to `failed`.
       if (type === 'exit') {
         const rc = typeof payload.rc === 'number' ? payload.rc : -1;
-        if (rc === 0) {
-          dispatch({ type: 'SET_UPDATE_STATUS', status: 'success' });
-        } else {
+        if (rc !== 0) {
           dispatch({
             type: 'SET_UPDATE_STATUS',
             status: 'failed',
             errorMessage: `subprocess exited with rc=${rc}`,
           });
         }
+        // rc===0 is a step boundary; success transition awaits execvp.
       } else if (type === 'execvp') {
         // Server is about to replace itself in place. Flip to success
         // and let the existing /api/events reconnect logic re-establish

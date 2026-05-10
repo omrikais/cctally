@@ -114,6 +114,13 @@
   },
   "sync_age_s": null,
   "trend": null,
+  "update": {
+    "state": null,
+    "suppress": {
+      "remind_after": null,
+      "skipped_versions": []
+    }
+  },
   "weekly": {
     "rows": []
   }

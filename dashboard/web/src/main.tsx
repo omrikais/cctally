@@ -18,6 +18,13 @@ startSSE();
 // header badge can render on first paint when an update is available.
 // Errors swallowed — a failing endpoint just leaves the slice null and
 // the badge hidden until the next refresh.
+//
+// Steady-state refresh is SSE-driven: each envelope tick mirrors
+// `update-state.json` / `update-suppress.json` (see `ingestUpdate` in
+// store/sse.ts), so background dashboard update-checks repaint the
+// badge live without polling. This boot call still exists as a
+// belt-and-suspenders for the SSE-not-yet-connected window so first
+// paint isn't bottlenecked on the first tick.
 refreshUpdateState();
 
 // Install the global keydown listener and the always-on bindings.

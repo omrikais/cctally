@@ -109,6 +109,17 @@ if cw:
             fresh["age_seconds"] = 0
         if fresh.get("label") is not None:
             fresh["label"] = "__LABEL__"
+# update-subcommand SSE mirror: the `_DashboardUpdateCheckThread` runs
+# concurrently with the HTTP fetch (a fresh HOME has no throttle
+# marker so the thread fires once at boot), so the presence/absence
+# of update-state.json is a race with the test client. Beyond that,
+# `install.realpath` is the absolute path to bin/cctally — varies per
+# checkout. Normalize the entire block to a sentinel so the test
+# verifies the SSE mirror is wired (key present) without asserting
+# on timing-variable contents. Field-level normalization would be
+# brittle as new keys land.
+if "update" in env:
+    env["update"] = "__UPDATE_BLOCK__"
 print(json.dumps(env, indent=2, sort_keys=True))
 '
 }
