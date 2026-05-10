@@ -24847,10 +24847,18 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
         pairs.append((key, v if v is not None else ""))
 
     if getattr(args, "emit_json", False):
-        out: "dict[str, dict]" = {}
+        # Walk every dot-delimited segment so keys deeper than two
+        # segments (e.g. `update.check.enabled`) nest correctly. The
+        # earlier `partition` form collapsed three-segment keys into
+        # a flat tail (`{"update": {"check.enabled": ...}}`) and
+        # diverged from `config set --json` / on-disk shape.
+        out: "dict[str, object]" = {}
         for k, v in pairs:
-            head, _, tail = k.partition(".")
-            out.setdefault(head, {})[tail] = v
+            segments = k.split(".")
+            node: dict = out
+            for seg in segments[:-1]:
+                node = node.setdefault(seg, {})
+            node[segments[-1]] = v
         print(json.dumps(out, indent=2))
     else:
         for k, v in pairs:

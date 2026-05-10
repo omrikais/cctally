@@ -665,6 +665,30 @@ assert_eq "malformed update.check block exit" "2" "$ec"
 assert_contains "malformed update.check block stderr" "update.check must be an object" "$err"
 assert_eq "malformed update.check block no partial write" "$before" "$after"
 
+# `config get --json` must emit fully nested dicts for three-segment
+# keys (matches `config set --json` shape + on-disk config.json
+# structure). The earlier `str.partition(".")` form flattened to
+# `{"update": {"check.enabled": ...}}`; the walk-segments form
+# produces `{"update": {"check": {"enabled": ...}}}`.
+rm -f "$home/.local/share/cctally/config.json"
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.enabled false >/dev/null
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.ttl_hours 168 >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.check.enabled --json)
+shape=$(printf "%s" "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(d.get("update", {}).get("check", {}).get("enabled"))
+')
+assert_eq "update.check.enabled --json nested shape" "False" "$shape"
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get --json)
+shape=$(printf "%s" "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+check = d.get("update", {}).get("check", {})
+print(str(check.get("enabled")) + "," + str(check.get("ttl_hours")))
+')
+assert_eq "update.check.* --json (get-all) nested shape" "False,168" "$shape"
+
 rm -rf "$home"
 
 echo
