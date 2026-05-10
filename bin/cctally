@@ -9846,13 +9846,20 @@ def _acquire_update_lock() -> int:
 
 
 def _release_update_lock(fd: int) -> None:
-    """Drop the flock, close the fd, and unlink update.lock.
+    """Drop the flock and close the fd. The lock file persists.
 
     Defensive on every step: a double-release (or a release after the
-    fd has been closed by an earlier error path) must not raise. The
-    final ``unlink`` swallows ``FileNotFoundError`` so a peer who
-    already reclaimed and unlinked our stale lock doesn't poison this
-    finally clause.
+    fd has been closed by an earlier error path) must not raise.
+
+    The file at ``UPDATE_LOCK_PATH`` is deliberately NOT unlinked.
+    ``flock`` locks the inode behind the fd, not the path: unlinking
+    after release lets a peer that ``O_CREAT``ed a new inode at the
+    same path hold a "lock" on a different inode from a peer that
+    still references the old one — concurrent updates. Leaving the
+    file in place pins all acquires to a single inode; the kernel's
+    flock state is the sole synchronization primitive. ``_acquire_..``
+    handles the persistent-file case (O_CREAT + ftruncate + rewrite
+    on every acquire).
     """
     try:
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -9861,10 +9868,6 @@ def _release_update_lock(fd: int) -> None:
     try:
         os.close(fd)
     except OSError:
-        pass
-    try:
-        UPDATE_LOCK_PATH.unlink()
-    except FileNotFoundError:
         pass
 
 
@@ -10208,10 +10211,12 @@ def _do_update_check() -> None:
             state["latest_version"] = latest
             state["source"] = "github-formula"
         else:
-            # Unknown install method — no remote check; still mark "ok"
-            # so the predicate doesn't keep retrying a fundamentally
-            # un-checkable install (manual-fallback bucket per §2.4).
-            state["check_status"] = "ok"
+            # Unknown install method — no remote check possible
+            # (manual-fallback bucket per §2.4). Surface "unavailable"
+            # so `--check` doesn't lie about being current; the banner
+            # predicate stays suppressed via `lat == cur` (setdefault
+            # above) or `lat is None`.
+            state["check_status"] = "unavailable"
             _save_update_state(state)
             return
         # Success: build the public-mirror release tag URL.
@@ -10415,15 +10420,16 @@ def _format_update_check_human(
         status_value = status + (f" ({err})" if err else "")
         lines.append(f"{'Status':<10}{status_value}")
     lines.append("")
-    if cooked_available:
-        if method in ("npm", "brew"):
-            lines.append("Run `cctally update` to install.")
-        else:
-            lines.append(
-                "Automatic update unavailable for this install. Visit "
-                f"{url or 'https://github.com/' + PUBLIC_REPO + '/releases'} "
-                "to install manually."
-            )
+    if method == "unknown":
+        # No remote check is possible for source / dev installs; render
+        # the manual fallback rather than the "you're up to date" lie.
+        lines.append(
+            "Automatic update unavailable for this install. Visit "
+            f"{url or 'https://github.com/' + PUBLIC_REPO + '/releases'} "
+            "to install manually."
+        )
+    elif cooked_available:
+        lines.append("Run `cctally update` to install.")
     else:
         lines.append("You're up to date.")
     note = _prerelease_note(cur)

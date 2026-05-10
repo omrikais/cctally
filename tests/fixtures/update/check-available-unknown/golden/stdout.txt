@@ -1,5 +1,6 @@
 Current   1.4.0
 Latest    1.4.0
 Method    unknown  (auto-detected)
+Status    unavailable
 
-You're up to date.
+Automatic update unavailable for this install. Visit https://github.com/omrikais/cctally/releases to install manually.

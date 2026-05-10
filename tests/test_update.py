@@ -246,10 +246,22 @@ class TestUpdateLock:
         finally:
             ns["_release_update_lock"](fd)
 
-    def test_release_unlinks_file(self, ns, update_paths):
+    def test_release_drops_lock_but_leaves_file(self, ns, update_paths):
+        # The file persists after release on purpose: flock locks the
+        # inode, not the path, and unlinking lets a peer create a new
+        # inode at the same path while another holds the old one —
+        # concurrent updates. See `_release_update_lock` docstring.
         fd = ns["_acquire_update_lock"]()
         ns["_release_update_lock"](fd)
-        assert not ns["UPDATE_LOCK_PATH"].exists()
+        assert ns["UPDATE_LOCK_PATH"].exists()
+        # A subsequent acquire on the persistent file still works
+        # (ftruncate + rewrite rebinds the body to the new owner).
+        fd2 = ns["_acquire_update_lock"]()
+        try:
+            body = ns["UPDATE_LOCK_PATH"].read_text(encoding="utf-8")
+            assert f"PID={os.getpid()}" in body
+        finally:
+            ns["_release_update_lock"](fd2)
 
 
 class TestUpdateLog:

@@ -6,7 +6,7 @@
   "method": "unknown",
   "update_command": "",
   "release_notes_url": null,
-  "check_status": "ok",
+  "check_status": "unavailable",
   "check_error": null,
   "checked_at_utc": "2026-05-10T12:00:00+00:00",
   "suppress": {
