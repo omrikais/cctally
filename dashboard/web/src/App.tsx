@@ -6,6 +6,7 @@ import { SettingsOverlay } from './components/SettingsOverlay';
 import { Toast } from './components/Toast';
 import { PanelHost } from './components/PanelHost';
 import { PanelGridDnd } from './components/PanelGridDnd';
+import { UpdateModal } from './components/UpdateModal';
 import { ModalRoot } from './modals/ModalRoot';
 import { getState, subscribeStore } from './store/store';
 
@@ -33,6 +34,7 @@ export function App() {
       <HelpOverlay />
       <SettingsOverlay />
       <ModalRoot />
+      <UpdateModal />
       <Toast />
     </>
   );

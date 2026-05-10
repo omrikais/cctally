@@ -19,8 +19,102 @@ const PREFS_KEY = 'ccusage.dashboard.prefs';
 const FILTER_KEY = 'ccusage.dashboard.filter';
 const LEGACY_SORT_KEY = 'ccusage.dashboard.sort'; // retired — migrated on first load
 
-export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'weekly' | 'monthly' | 'block' | 'daily' | 'alerts';
+export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'weekly' | 'monthly' | 'block' | 'daily' | 'alerts' | 'update';
 export type InputMode = null | 'filter' | 'search';
+
+// ---------- Update subcommand (spec §6) ----------
+//
+// `UpdateState` mirrors the on-disk `update-state.json` written by the
+// Python `_do_update_check()`. The dashboard endpoint /api/update/status
+// returns the raw state + suppress shape (single source of truth on
+// disk). The frontend cooks `available` itself from the same predicate
+// the Python `_format_update_check_json` uses (semver_gt && !skipped &&
+// !in_remind_window) so the badge shows iff the user has not opted out.
+//
+// `UpdateRunStatus` is the run-time machine: idle → running → success |
+// failed. The success state is special: the server execvp's the dashboard
+// process, the SSE channel drops, and the existing /api/events reconnect
+// logic re-establishes against the new server. The success modal shows
+// a spinner + "Restarting…" and auto-closes when refreshState() returns
+// `current_version === latest_version`.
+//
+// `UpdateStreamEvent` matches the SSE event payloads emitted by the
+// Python `UpdateWorker.stream(run_id)` generator. The server uses
+// `error_event` (not `error`) to avoid clashing with EventSource's
+// connection-error semantics — the frontend treats `error_event` as a
+// terminal failure event identical to a non-zero `exit`.
+export type UpdateMethod = 'brew' | 'npm' | 'unknown';
+export type UpdateRunStatus = 'idle' | 'running' | 'success' | 'failed';
+export type UpdateCheckStatus =
+  | 'ok'
+  | 'rate_limited'
+  | 'fetch_failed'
+  | 'parse_failed'
+  | 'unavailable';
+
+export interface UpdateState {
+  current_version: string | null;
+  latest_version: string | null;
+  available: boolean;
+  method: UpdateMethod;
+  update_command: string | null;
+  release_notes_url: string | null;
+  check_status: UpdateCheckStatus | null;
+  checked_at_utc: string | null;
+  prerelease_note: string | null;
+}
+
+export interface UpdateRemindAfter {
+  version: string;
+  until_utc: string;
+}
+
+export interface UpdateSuppress {
+  skipped_versions: string[];
+  remind_after: UpdateRemindAfter | null;
+}
+
+export interface UpdateStreamEvent {
+  // Mirrors the Python UpdateWorker event types. `done` and `execvp`
+  // are terminal; `error_event` is a terminal failure. `step` events
+  // render as section headers in the stream viewer; stdout/stderr line
+  // by line.
+  type: 'stdout' | 'stderr' | 'step' | 'exit' | 'execvp' | 'error_event' | 'done' | 'heartbeat';
+  data?: string;
+  name?: string;
+  rc?: number;
+  step?: string;
+  message?: string;
+  ts?: number;
+}
+
+export interface UpdateSlice {
+  state: UpdateState | null;
+  suppress: UpdateSuppress;
+  modalOpen: boolean;
+  runId: string | null;
+  status: UpdateRunStatus;
+  stream: UpdateStreamEvent[];
+  errorMessage: string | null;
+  startedAt: number | null;
+}
+
+function defaultUpdateSlice(): UpdateSlice {
+  return {
+    state: null,
+    suppress: { skipped_versions: [], remind_after: null },
+    modalOpen: false,
+    runId: null,
+    status: 'idle',
+    stream: [],
+    errorMessage: null,
+    startedAt: null,
+  };
+}
+
+// The `available` cooking predicate + semver comparison live in
+// `store/update.ts` so the action helpers (refreshState, skip, remind)
+// share one source of truth. Tests import from update.ts directly.
 
 export type SessionSortKey =
   | 'started desc'
@@ -141,6 +235,15 @@ export interface UIState {
   // or discarded on Esc / pointer-cancel / window-resize
   // (CLEAR_DRAG_PREVIEW). Never persisted to localStorage directly.
   dragPreviewOrder: PanelId[] | null;
+  // Update subcommand (spec §6). The slice carries both the persisted
+  // shape (state + suppress, refreshed via /api/update/status) and the
+  // live runtime machine (status, runId, stream, startedAt, errorMessage)
+  // for the in-progress upgrade. `modalOpen` is intentionally part of
+  // this slice rather than `openModal` so the run state survives the
+  // success state's execvp + reconnect: the modal stays mounted with
+  // status='success' and auto-closes when refreshState() returns
+  // `current_version === latest_version`.
+  update: UpdateSlice;
 }
 
 function defaultPrefs(): Prefs {
@@ -218,6 +321,7 @@ function loadInitial(): UIState {
     alertsConfig: defaultAlertsConfig(),
     alertToastQueue: [],
     dragPreviewOrder: null,
+    update: defaultUpdateSlice(),
   };
 }
 
@@ -336,7 +440,34 @@ export type Action =
       isFirstTick: boolean;
     }
   | { type: 'SET_TABLE_SORT'; table: 'trend' | 'sessions'; override: SortOverride | null }
-  | { type: 'CLEAR_TABLE_SORTS' };
+  | { type: 'CLEAR_TABLE_SORTS' }
+  // ---------- Update subcommand actions (spec §6) ----------
+  // OPEN_UPDATE_MODAL / CLOSE_UPDATE_MODAL: badge click + Esc / X.
+  //   Only sets modalOpen; does NOT reset status/stream so closing a
+  //   running-state modal and reopening shows the same in-progress run.
+  // SET_UPDATE_STATE: replace state from /api/update/status. The
+  //   `available` boolean is cooked client-side from current/latest +
+  //   suppress (mirrors Python `_format_update_check_json`). Server
+  //   returns raw state + suppress; the cooking lives in store.ts so
+  //   tests can pin the predicate without spinning a server.
+  // SET_UPDATE_STATUS: state-machine transition (idle → running →
+  //   success | failed). errorMessage is set on failed transitions
+  //   only.
+  // SET_UPDATE_RUN_ID: track the run_id returned by POST /api/update so
+  //   the SSE stream URL can be built (/api/update/stream/<run_id>).
+  // APPEND_UPDATE_STREAM: push one SSE event onto state.update.stream.
+  //   The stream viewer auto-scrolls; the success/failed modals read
+  //   the stream tail for the diagnostic preview.
+  // RESET_UPDATE_RUN: drop runtime fields back to idle defaults
+  //   without touching state/suppress. Called by Retry (after a
+  //   failed run) before issuing a fresh POST /api/update.
+  | { type: 'OPEN_UPDATE_MODAL' }
+  | { type: 'CLOSE_UPDATE_MODAL' }
+  | { type: 'SET_UPDATE_STATE'; state: UpdateState | null; suppress: UpdateSuppress }
+  | { type: 'SET_UPDATE_STATUS'; status: UpdateRunStatus; errorMessage?: string | null }
+  | { type: 'SET_UPDATE_RUN_ID'; runId: string | null; startedAt?: number | null }
+  | { type: 'APPEND_UPDATE_STREAM'; event: UpdateStreamEvent }
+  | { type: 'RESET_UPDATE_RUN' };
 
 export function dispatch(action: Action): void {
   switch (action.type) {
@@ -608,6 +739,74 @@ export function dispatch(action: Action): void {
       state = { ...next, ..._recomputeSearch(next) };
       break;
     }
+    case 'OPEN_UPDATE_MODAL':
+      state = { ...state, update: { ...state.update, modalOpen: true } };
+      break;
+    case 'CLOSE_UPDATE_MODAL':
+      // Closing while running is non-aborting (server keeps installing
+      // and execvp's regardless of whether anyone is watching). The
+      // modalOpen flag flips false but status/stream/runId persist so a
+      // re-open finds the in-flight run.
+      state = { ...state, update: { ...state.update, modalOpen: false } };
+      break;
+    case 'SET_UPDATE_STATE':
+      state = {
+        ...state,
+        update: {
+          ...state.update,
+          state: action.state,
+          suppress: action.suppress,
+        },
+      };
+      break;
+    case 'SET_UPDATE_STATUS':
+      state = {
+        ...state,
+        update: {
+          ...state.update,
+          status: action.status,
+          errorMessage:
+            action.errorMessage !== undefined
+              ? action.errorMessage
+              : state.update.errorMessage,
+        },
+      };
+      break;
+    case 'SET_UPDATE_RUN_ID':
+      state = {
+        ...state,
+        update: {
+          ...state.update,
+          runId: action.runId,
+          startedAt:
+            action.startedAt !== undefined
+              ? action.startedAt
+              : state.update.startedAt,
+        },
+      };
+      break;
+    case 'APPEND_UPDATE_STREAM':
+      state = {
+        ...state,
+        update: {
+          ...state.update,
+          stream: [...state.update.stream, action.event],
+        },
+      };
+      break;
+    case 'RESET_UPDATE_RUN':
+      state = {
+        ...state,
+        update: {
+          ...state.update,
+          status: 'idle',
+          runId: null,
+          stream: [],
+          errorMessage: null,
+          startedAt: null,
+        },
+      };
+      break;
   }
   emit();
 }

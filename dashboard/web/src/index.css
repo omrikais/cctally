@@ -99,6 +99,179 @@ body { padding: 16px; box-sizing: border-box; }
 }
 @media (max-width: 1100px) { .grid { grid-template-columns: minmax(0, 1fr); } }
 
+/* -------- Update subcommand: header brand + badge (spec §6) -------- */
+/* Brand cluster: "cctally vX.Y.Z [↑ vA.B.C]" sits at the start of the
+   topbar row. The badge tucks inline beside the version so a glance at
+   the top of the page surfaces "newer is available." */
+.topbar-brand {
+  /* Tighten the gap inside the brand cluster relative to the
+     between-stat gap so name + version + badge read as one unit. */
+  gap: 8px !important;
+}
+.topbar-brand .brand-name {
+  color: var(--text); font-weight: 700; letter-spacing: 0.01em;
+}
+.topbar-brand .brand-version {
+  color: var(--text-dim); font-weight: 500;
+}
+.badge-update {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 9px; border-radius: 12px;
+  background: rgba(251,191,36,0.12);
+  color: var(--accent-amber);
+  border: 1px solid rgba(251,191,36,0.45);
+  cursor: pointer;
+  font: inherit; font-size: 12px; font-weight: 600;
+  font-family: var(--font-mono);
+}
+.badge-update:hover {
+  background: rgba(251,191,36,0.22);
+}
+.badge-update:focus-visible {
+  outline: 2px solid var(--accent-amber);
+  outline-offset: 2px;
+}
+.badge-update-arrow { display: inline-block; }
+.badge-update-version { display: inline-block; }
+
+/* -------- Update modal: shared chrome + per-state primitives -------- */
+/* The update modal lives in its own root so the running state can
+   persist across an /api/events SSE drop and the post-execvp restart.
+   Visual chrome reuses .modal-card / .modal-header / .modal-body. */
+.update-modal-root {
+  position: fixed; inset: 0; z-index: 110;
+  display: flex; align-items: center; justify-content: center;
+}
+/* Slightly wider card for the running-state stream block. */
+.update-modal-card { width: min(720px, 92vw); }
+.update-modal-card.accent-red { border-color: var(--accent-red); }
+
+.update-modal-body { padding: 4px 0 0; }
+
+/* Key/value rows ("Current / Latest / Method"). */
+.update-kv {
+  display: grid; grid-template-columns: 96px 1fr;
+  gap: 7px 16px; margin-bottom: 14px;
+}
+.update-kv .k { color: var(--text-dim); }
+.update-kv .v { color: var(--text); }
+.update-kv .v .muted { color: var(--text-dim); font-size: 12px; }
+
+.update-row-label {
+  color: var(--text-dim); font-size: 12px;
+  margin: 6px 0 4px;
+}
+
+.update-cmd {
+  display: inline-block;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  padding: 7px 12px; border-radius: 4px;
+  color: var(--accent-cyan);
+  margin: 0 0 14px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+.update-cmd-inline { margin: 0; }
+
+.update-link a {
+  color: var(--accent-blue);
+  text-decoration: none;
+  font-size: 12px;
+}
+.update-link a:hover { text-decoration: underline; }
+
+.update-prerelease-note {
+  color: var(--text-dim);
+  background: rgba(192,132,252,0.08);
+  border: 1px solid rgba(192,132,252,0.30);
+  padding: 8px 12px; border-radius: 4px;
+  white-space: pre-line;
+  font-size: 12px;
+  margin: 12px 0 4px;
+}
+.update-manual-note {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin: 4px 0 14px;
+}
+.update-manual-note a { color: var(--accent-blue); }
+
+.update-actions {
+  display: flex; gap: 8px; margin-top: 18px; flex-wrap: wrap;
+}
+.update-btn {
+  padding: 6px 14px; border-radius: 4px;
+  cursor: pointer; font-family: inherit; font-size: 12px;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg-2);
+  color: var(--text);
+}
+.update-btn:hover:not([disabled]) { background: var(--panel-bg); }
+.update-btn[disabled] { opacity: 0.55; cursor: not-allowed; }
+.update-btn-primary {
+  background: var(--accent-amber);
+  border-color: var(--accent-amber);
+  color: #1a1400;
+  font-weight: 700;
+}
+.update-btn-primary:hover:not([disabled]) {
+  background: #ffd44a;
+  border-color: #ffd44a;
+}
+
+/* Running / success / failed inline status row (spinner + cmd + elapsed). */
+.update-running-row {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+.update-running-row-success .update-cmd-inline { color: var(--accent-green); }
+.update-running-row-failed .update-cmd-inline { color: var(--accent-red); }
+.update-spinner {
+  color: var(--accent-blue);
+  display: inline-block;
+  animation: update-spin 1.1s linear infinite;
+  font-size: 16px;
+}
+@keyframes update-spin { to { transform: rotate(360deg); } }
+.update-check { color: var(--accent-green); font-weight: 700; font-size: 16px; }
+.update-x { color: var(--accent-red); font-weight: 700; font-size: 16px; }
+.update-elapsed {
+  margin-left: auto; color: var(--text-dim); font-size: 12px;
+}
+.update-success-reconnect {
+  color: var(--text-dim); font-size: 12px;
+}
+
+/* Stream viewer — fixed-height log block with monospace coloring. */
+.update-stream {
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  padding: 11px 13px;
+  margin: 4px 0 6px;
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px; line-height: 1.55;
+  font-family: var(--font-mono);
+  white-space: pre;
+  overflow-x: auto; overflow-y: auto;
+  max-height: 260px;
+}
+.update-stream-fail { max-height: 200px; }
+.update-stream-line { color: var(--text); }
+.update-stream-line.err { color: var(--accent-red); }
+.update-stream-step { color: var(--accent-blue); font-weight: 600; }
+.update-stream-exit { color: var(--text-dim); font-style: italic; }
+.update-stream-trunc { color: var(--text-dim); font-style: italic; }
+.update-stream-empty { color: var(--text-dim); font-style: italic; }
+.update-stream-cap {
+  color: var(--text-dim);
+  font-size: 11px;
+  margin: 4px 0 0;
+  text-align: right;
+}
+
 /* -------- Panel: header line + flex column so foot sticks to bottom -------- */
 .panel {
   border: 1px solid var(--border-soft);
@@ -2138,6 +2311,7 @@ mark.current {
      trio's row 1 territory (it would otherwise force actions to wrap
      to its own row). With a compact action trio (~140px) and a
      content-sized week stat (~134px), both fit on row 1 down to 320. */
+  .topbar .stat[data-stat="brand"]           { order: 0; flex: 0 0 auto; min-width: 0; }
   .topbar .stat[data-stat="week"]            { order: 1; flex: 0 1 auto; min-width: 0; }
   .topbar-actions                            { order: 2; }
   .topbar::after {
@@ -2149,6 +2323,15 @@ mark.current {
   .topbar .stat[data-stat="used"]            { order: 4; }
   .topbar .stat[data-stat="dollar-per-pct"]  { order: 5; }
   .topbar .stat[data-stat="forecast"]        { order: 6; }
+  /* Mobile: drop the "cctally" word + the version since horizontal
+     real estate is tight; keep just the update badge if present.
+     Re-prefix all property declarations with `.topbar` so they outrank
+     the desktop `.topbar-brand` rules (id-selector specificity floor
+     gotcha — mobile rule must be re-stated under the .topbar parent
+     scope, not bare-class, to win against the desktop chain). */
+  .topbar .topbar-brand .brand-name { display: none; }
+  .topbar .topbar-brand .brand-version { display: none; }
+  .topbar .topbar-brand { gap: 0 !important; }
   /* Let the week label render its full text ("May 02-May 09"); the
      parent stat has `flex: 0 1 auto` so it shrinks if it ever
      conflicts with the action trio's row 1 budget. Ellipsis remains

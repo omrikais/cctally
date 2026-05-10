@@ -10855,6 +10855,7 @@ class UpdateWorker:
                     pass
             with self._lock:
                 self._current_id = None
+                self._streams.pop(run_id, None)
 
 
 # Module-level singleton. Populated by cmd_dashboard on server boot;
