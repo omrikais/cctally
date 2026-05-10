@@ -42,6 +42,7 @@ import sqlite3
 import subprocess
 import tempfile
 import textwrap
+import threading
 import time
 import traceback
 import urllib.error
@@ -8838,7 +8839,26 @@ class RefreshUsageMalformedError(Exception):
 
 
 class UpdateError(Exception):
-    """User-facing error from the update subcommand. Caught at command boundary."""
+    """User-facing error from the update subcommand. Caught at command boundary.
+
+    Default rc when caught at the boundary is 1 (runtime / environment
+    failure: unknown install method, npm prefix not writable, etc.).
+    Validation errors (invalid --version syntax, --version+brew combo)
+    use the :class:`UpdateValidationError` subclass so the boundary can
+    map them to rc=2 — preserving the rc=1-vs-rc=2 distinction the
+    Task-4 inline gates exposed.
+    """
+
+
+class UpdateValidationError(UpdateError):
+    """Subclass of UpdateError marking input-validation failures (rc=2).
+
+    Two cases per spec §5.1: invalid --version syntax (must match
+    _SEMVER_RE), and --version with method=brew (no versioned formulae).
+    Carved out of UpdateError so cmd_update's try/except can branch on
+    type rather than message — the inline gates that Task 4 used both
+    returned rc=2; preserving that contract is the test invariant.
+    """
 
 
 class UpdateInProgressError(UpdateError):
@@ -10468,48 +10488,203 @@ def _do_update_check_user(*, force: bool, output_json: bool) -> int:
     return 0
 
 
+def _preflight_install(method: InstallMethod, version: str | None) -> None:
+    """Validate the install plan before any subprocess runs (spec §5.1).
+
+    Ordered checks (each raises and short-circuits the rest):
+      1. method != "unknown" — manual-fallback bucket per §2.4.
+      2. version (if not None) matches `_SEMVER_RE` — `X.Y.Z` or
+         `X.Y.Z-prerelease`.
+      3. (method, version) compatibility — brew has no versioned
+         formulae; pinned-version installs must be done manually.
+      4. npm-only: the `<prefix>/bin` directory must be writable; if
+         not, surface the sudo / `npm config set prefix` recipes
+         instead of letting npm fail with EACCES inside the run.
+
+    Raises :class:`UpdateValidationError` for input-validation failures
+    (rc=2 at the boundary): invalid --version syntax, --version+brew
+    combo. Raises :class:`UpdateError` for environment / runtime
+    failures (rc=1 at the boundary): unknown install method, npm
+    prefix not writable.
+
+    Brew preflight is intentionally a no-op beyond the version-combo
+    check (codex review #2): homebrew installs into ``libexec/bin/``,
+    so ``realpath`` lands inside the keg, not the brew bin prefix; brew
+    has its own permission model and ``brew doctor`` is the diagnostic
+    users already know.
+    """
+    if method.method == "unknown":
+        raise UpdateError(
+            "Install method is 'unknown' — automatic update unavailable.\n"
+            "If you installed from source: cd <your cctally repo> && git pull && bin/symlink"
+        )
+    if version is not None and not _SEMVER_RE.match(version):
+        raise UpdateValidationError(
+            f"Invalid version: {version!r} (expected X.Y.Z or X.Y.Z-id.N)"
+        )
+    if method.method == "brew" and version is not None:
+        raise UpdateValidationError(
+            "Pinned-version install is not supported on Homebrew "
+            "(no versioned formulae).\n"
+            "To install a specific version manually:\n"
+            f"  brew uninstall cctally\n"
+            f"  brew install https://github.com/{PUBLIC_REPO}/releases/download/v{version}/cctally-{version}.tar.gz"
+        )
+    if method.method == "npm":
+        # Defensive: Task-2 guarantees npm_prefix is set when method=="npm",
+        # so this is a `should never happen` branch. Still better than
+        # `os.path.join(None, "bin")` exploding inside an except clause.
+        if not method.npm_prefix:
+            raise UpdateError(
+                "npm install method detected but npm_prefix is empty "
+                "— rerun `cctally update --check --force` to refresh detection."
+            )
+        prefix_bin = os.path.join(method.npm_prefix, "bin")
+        if not os.access(prefix_bin, os.W_OK):
+            raise UpdateError(
+                f"npm prefix '{prefix_bin}' is not writable.\n"
+                f"Run with sudo: sudo npm install -g cctally@{version or 'latest'}\n"
+                "Or relocate: npm config set prefix ~/.npm-global"
+            )
+    # brew: NO preflight beyond the --version combo check above
+    # (codex review #2 amendment to spec §5.1).
+
+
+def _build_update_steps(
+    method: InstallMethod, version: str | None
+) -> list[tuple[str, list[str]]]:
+    """Build the ordered list of subprocess steps for an install plan.
+
+    Each step is ``(human_name, argv)`` where ``human_name`` is the
+    label rendered in dry-run output and the dashboard live-stream
+    modal, and ``argv`` is the list passed to ``subprocess.Popen`` (no
+    shell). Brew is two steps (``brew update`` then ``brew upgrade
+    cctally``) per spec §5.2 + Q6a — splitting them gives diagnostic
+    clarity (a stale tap manifesting as a hung ``brew update`` is
+    distinguishable from an ``upgrade`` failure). npm is one step.
+    """
+    if method.method == "brew":
+        return [
+            ("brew update", ["brew", "update", "--quiet"]),
+            ("brew upgrade cctally", ["brew", "upgrade", "cctally"]),
+        ]
+    if method.method == "npm":
+        target = f"cctally@{version}" if version else "cctally@latest"
+        return [("npm install -g", ["npm", "install", "-g", target])]
+    raise AssertionError(
+        f"step builder called with method={method.method!r} "
+        "(should have been rejected by _preflight_install)"
+    )
+
+
+def _run_streaming(
+    cmd: list[str],
+    *,
+    on_stdout: Callable[[str], None],
+    on_stderr: Callable[[str], None],
+    log_fd,
+) -> int:
+    """Run ``cmd``, line-buffer stdout/stderr to callbacks, append to log.
+
+    Two-thread pump (one per stream) → callbacks + log lines. Each log
+    line is ``<iso-utc> <STREAM> <raw-line>`` so a grep for the stream
+    label still recovers the chronological order even when stdout and
+    stderr interleave at sub-line resolution. ``proc.wait()`` is the
+    synchronization point; the pump threads are daemons so a crash in
+    the parent doesn't leave them lingering.
+
+    Used by:
+      - the CLI install path (Task 5; this file) where ``on_stdout`` /
+        ``on_stderr`` print to the parent's stdout/stderr;
+      - the dashboard ``UpdateWorker`` thread (Task 6) where the
+        callbacks push lines into a per-stream ring buffer for SSE.
+
+    Stdin is inherited from the parent — the wrapped commands
+    (``brew update``, ``npm install -g``) take no input; piping
+    ``DEVNULL`` would just add a syscall.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,
+        text=True,
+    )
+
+    def pump(stream, cb, label):
+        for line in stream:
+            cb(line.rstrip("\n"))
+            if log_fd is not None:
+                log_fd.write(f"{_now_utc().isoformat()} {label} {line}")
+                log_fd.flush()
+        stream.close()
+
+    t_out = threading.Thread(
+        target=pump, args=(proc.stdout, on_stdout, "STDOUT"), daemon=True
+    )
+    t_err = threading.Thread(
+        target=pump, args=(proc.stderr, on_stderr, "STDERR"), daemon=True
+    )
+    t_out.start()
+    t_err.start()
+    proc.wait()
+    t_out.join()
+    t_err.join()
+    return proc.returncode
+
+
 def _do_update_install(
     *, version: str | None, dry_run: bool, output_json: bool
 ) -> int:
-    """`cctally update` (no mode flag) — install execution.
+    """`cctally update` (no mode flag) — install execution (spec §5).
 
-    Task 4 lands the validation gates only; the actual execution path
-    is staged for Task 5.
+    Task-4 inline gates moved into :func:`_preflight_install`. Real
+    install: acquire lock → log INSTALL_START → run each step (logging
+    STEP_START/STEP_EXIT), bail on the first non-zero rc → log
+    INSTALL_SUCCESS → release lock + rotate log in finally.
+
+    Dry-run path passes ``mutate=False`` to detection (codex review
+    fix #4), prints "Would run: ..." (or one JSON-line per step) for
+    each planned step, and exits 0 without touching the lock or
+    running any subprocesses.
+
+    Raises :class:`UpdateError` (rc=1 at boundary) for unknown method
+    / write-perm-denied; :class:`UpdateValidationError` (rc=2) for
+    invalid --version / --version+brew. The boundary distinction is
+    enforced by :func:`cmd_update`'s try/except below.
     """
     method = _detect_install_method(mutate=not dry_run)
-    if method.method == "unknown":
-        # Manual-fallback bucket — print a helpful recipe and bail.
-        print(
-            "cctally update: automatic update unavailable for this install.",
-            file=sys.stderr,
-        )
-        print(
-            f"  Visit https://github.com/{PUBLIC_REPO}/releases for the "
-            "latest release.",
-            file=sys.stderr,
-        )
-        return 1
-    if version is not None and not _SEMVER_RE.match(version):
-        print(
-            f"cctally update: invalid --version {version!r} "
-            "(expected X.Y.Z[-id.N])",
-            file=sys.stderr,
-        )
-        return 2
-    if method.method == "brew" and version is not None:
-        print(
-            "cctally update: --version is not supported on Homebrew installs "
-            "(no versioned formulae).",
-            file=sys.stderr,
-        )
-        print(
-            f"  To install {version} manually: "
-            f"https://github.com/{PUBLIC_REPO}/releases/download/v{version}"
-            f"/cctally-{version}.tar.gz",
-            file=sys.stderr,
-        )
-        return 2
-    raise NotImplementedError("install execution lands in Task 5")
+    _preflight_install(method, version)
+    steps = _build_update_steps(method, version)
+    if dry_run:
+        for name, cmd in steps:
+            if output_json:
+                print(json.dumps({"step": name, "would_run": cmd}))
+            else:
+                quoted = " ".join(shlex.quote(c) for c in cmd)
+                print(f"Would run: {quoted}")
+        return 0
+    UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = _acquire_update_lock()
+    try:
+        with open(UPDATE_LOG_PATH, "a", encoding="utf-8") as log_fd:
+            _log_update_event(log_fd, "INSTALL_START", method=method.method)
+            for step_name, cmd in steps:
+                _log_update_event(log_fd, "STEP_START", name=step_name)
+                rc = _run_streaming(
+                    cmd,
+                    on_stdout=lambda line: print(line, file=sys.stdout, flush=True),
+                    on_stderr=lambda line: print(line, file=sys.stderr, flush=True),
+                    log_fd=log_fd,
+                )
+                _log_update_event(log_fd, "STEP_EXIT", name=step_name, rc=rc)
+                if rc != 0:
+                    return 1
+            _log_update_event(log_fd, "INSTALL_SUCCESS")
+            return 0
+    finally:
+        _release_update_lock(lock_fd)
+        _rotate_update_log_if_needed()
 
 
 def cmd_update(args) -> int:
@@ -10550,11 +10725,22 @@ def cmd_update(args) -> int:
             force=getattr(args, "force", False),
             output_json=getattr(args, "json", False),
         )
-    return _do_update_install(
-        version=version_arg,
-        dry_run=getattr(args, "dry_run", False),
-        output_json=getattr(args, "json", False),
-    )
+    try:
+        return _do_update_install(
+            version=version_arg,
+            dry_run=getattr(args, "dry_run", False),
+            output_json=getattr(args, "json", False),
+        )
+    except UpdateValidationError as e:
+        # Input validation failure (invalid --version syntax,
+        # --version+brew combo). rc=2 preserves the Task-4 contract.
+        print(f"cctally update: {e}", file=sys.stderr)
+        return 2
+    except UpdateError as e:
+        # Runtime / environment failure (unknown install method, npm
+        # prefix not writable, lock contention). rc=1.
+        print(f"cctally update: {e}", file=sys.stderr)
+        return 1
 
 
 def get_week_start_name(config: dict[str, Any], override: str | None = None) -> str:

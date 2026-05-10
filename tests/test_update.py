@@ -1457,3 +1457,198 @@ class TestUpdateArgparseCoverage:
         assert "install-mode only" in cp.stderr, (
             f"expected mutex message on stderr, got stderr={cp.stderr!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 5 — install execution (preflight, step builder, streaming).
+# ---------------------------------------------------------------------------
+
+
+class TestPreflight:
+    """`_preflight_install` (spec §5.1, amended by codex review #2: brew
+    preflight intentionally skipped — homebrew installs into
+    libexec/bin/, realpath lands in keg, brew has its own permission
+    model and `brew doctor` is the diagnostic users already know)."""
+
+    def test_unknown_method_raises(self, ns, update_paths):
+        method = ns["InstallMethod"](
+            method="unknown", realpath="/random/cctally", npm_prefix=None
+        )
+        with pytest.raises(ns["UpdateError"]) as exc:
+            ns["_preflight_install"](method, None)
+        assert "unknown" in str(exc.value).lower()
+
+    def test_invalid_version_raises_with_helpful_message(self, ns, update_paths):
+        method = ns["InstallMethod"](
+            method="npm", realpath="/p/cctally", npm_prefix="/p"
+        )
+        with pytest.raises(ns["UpdateValidationError"]) as exc:
+            ns["_preflight_install"](method, "not-a-semver")
+        assert "Invalid version" in str(exc.value)
+
+    def test_prerelease_version_accepted(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        # Build a writable npm prefix layout so the npm-write check passes.
+        prefix = tmp_path / "npm-prefix"
+        (prefix / "bin").mkdir(parents=True)
+        method = ns["InstallMethod"](
+            method="npm",
+            realpath=str(prefix / "lib" / "node_modules" / "cctally" / "bin" / "cctally"),
+            npm_prefix=str(prefix),
+        )
+        # Prerelease forms are valid per _SEMVER_RE.
+        ns["_preflight_install"](method, "1.7.0-rc.3")  # must not raise
+
+    def test_brew_with_version_raises_with_recipe(self, ns, update_paths):
+        method = ns["InstallMethod"](
+            method="brew",
+            realpath="/usr/local/Cellar/cctally/1.5.0/bin/cctally",
+            npm_prefix=None,
+        )
+        with pytest.raises(ns["UpdateValidationError"]) as exc:
+            ns["_preflight_install"](method, "1.7.2")
+        msg = str(exc.value)
+        assert "brew" in msg.lower() or "homebrew" in msg.lower()
+        # Recipe: brew uninstall + brew install <tarball-url>.
+        assert "brew uninstall" in msg
+        assert "brew install" in msg
+        assert "1.7.2" in msg
+
+    def test_npm_write_perm_denied(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        prefix = tmp_path / "npm-prefix"
+        (prefix / "bin").mkdir(parents=True)
+        method = ns["InstallMethod"](
+            method="npm",
+            realpath=str(prefix / "lib" / "node_modules" / "cctally" / "bin" / "cctally"),
+            npm_prefix=str(prefix),
+        )
+
+        # Simulate a non-writable bin/ via os.access stub (cross-platform).
+        real_access = os.access
+        def fake_access(path, mode):
+            if str(path) == str(prefix / "bin") and mode == os.W_OK:
+                return False
+            return real_access(path, mode)
+        monkeypatch.setattr(ns["os"], "access", fake_access)
+
+        with pytest.raises(ns["UpdateError"]) as exc:
+            ns["_preflight_install"](method, None)
+        assert "not writable" in str(exc.value)
+
+    def test_brew_no_write_perm_check(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        """Brew preflight is intentionally a no-op (codex review fix #2):
+        even when the realpath's parent dir is not writable, brew
+        preflight passes — brew's own diagnostics own the permission
+        model. The only brew gate is `--version` rejection (covered
+        elsewhere)."""
+        method = ns["InstallMethod"](
+            method="brew",
+            realpath="/usr/local/Cellar/cctally/1.5.0/bin/cctally",
+            npm_prefix=None,
+        )
+
+        # Make os.access return False for everything to prove no
+        # write-perm check is performed on brew.
+        monkeypatch.setattr(
+            ns["os"], "access", lambda *_a, **_kw: False
+        )
+        # No raise.
+        ns["_preflight_install"](method, None)
+
+
+class TestStepBuilder:
+    """`_build_update_steps` — emits the subprocess plan a method needs.
+
+    Brew is two steps (`brew update` then `brew upgrade cctally`) per
+    spec §5.2 + Q6a — separate steps for diagnostic clarity in both
+    CLI output and the dashboard live-stream modal. npm is one step.
+    """
+
+    def test_brew_two_steps(self, ns):
+        method = ns["InstallMethod"](
+            method="brew",
+            realpath="/usr/local/Cellar/cctally/1.5.0/bin/cctally",
+            npm_prefix=None,
+        )
+        steps = ns["_build_update_steps"](method, None)
+        assert steps == [
+            ("brew update", ["brew", "update", "--quiet"]),
+            ("brew upgrade cctally", ["brew", "upgrade", "cctally"]),
+        ]
+
+    def test_npm_one_step_latest(self, ns):
+        method = ns["InstallMethod"](
+            method="npm", realpath="/p/cctally", npm_prefix="/p"
+        )
+        steps = ns["_build_update_steps"](method, None)
+        assert steps == [
+            ("npm install -g", ["npm", "install", "-g", "cctally@latest"]),
+        ]
+
+    def test_npm_one_step_pinned(self, ns):
+        method = ns["InstallMethod"](
+            method="npm", realpath="/p/cctally", npm_prefix="/p"
+        )
+        steps = ns["_build_update_steps"](method, "1.6.4")
+        assert steps == [
+            ("npm install -g", ["npm", "install", "-g", "cctally@1.6.4"]),
+        ]
+
+
+class TestRunStreaming:
+    """`_run_streaming` — two-thread pump → callbacks + log file.
+
+    Used by the CLI install path and (in Task 6) the dashboard
+    UpdateWorker thread; the signature is shared.
+    """
+
+    def test_captures_stdout_lines_in_order(self, ns, tmp_path):
+        out_lines: list[str] = []
+        err_lines: list[str] = []
+        log_path = tmp_path / "stream.log"
+        with open(log_path, "w", encoding="utf-8") as log_fd:
+            rc = ns["_run_streaming"](
+                ["bash", "-c", "echo a; echo b; echo c"],
+                on_stdout=out_lines.append,
+                on_stderr=err_lines.append,
+                log_fd=log_fd,
+            )
+        assert rc == 0
+        assert out_lines == ["a", "b", "c"]
+        assert err_lines == []
+
+    def test_propagates_nonzero_exit(self, ns, tmp_path):
+        out_lines: list[str] = []
+        err_lines: list[str] = []
+        log_path = tmp_path / "stream.log"
+        with open(log_path, "w", encoding="utf-8") as log_fd:
+            rc = ns["_run_streaming"](
+                ["bash", "-c", "exit 42"],
+                on_stdout=out_lines.append,
+                on_stderr=err_lines.append,
+                log_fd=log_fd,
+            )
+        assert rc == 42
+
+    def test_writes_log_with_streamlabels(self, ns, tmp_path):
+        out_lines: list[str] = []
+        err_lines: list[str] = []
+        log_path = tmp_path / "stream.log"
+        with open(log_path, "w", encoding="utf-8") as log_fd:
+            rc = ns["_run_streaming"](
+                ["bash", "-c", "echo out; echo err 1>&2"],
+                on_stdout=out_lines.append,
+                on_stderr=err_lines.append,
+                log_fd=log_fd,
+            )
+        assert rc == 0
+        assert out_lines == ["out"]
+        assert err_lines == ["err"]
+        log_text = log_path.read_text(encoding="utf-8")
+        assert "STDOUT out" in log_text
+        assert "STDERR err" in log_text
