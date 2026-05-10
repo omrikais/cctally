@@ -10225,13 +10225,14 @@ def _format_update_command(method: str, version: str | None) -> str:
 
 def _prerelease_note(current: str) -> str | None:
     """Spec §1.8 — prerelease users get a one-shot informational note in
-    `--check` output. Returns the canned message if `current` looks like
-    a prerelease (`X.Y.Z-id.N` form), else None."""
+    `--check` output. Returns the canned two-line message verbatim per
+    spec when `current` looks like a prerelease (`X.Y.Z-id.N` form), else
+    None. Wording is exact-string contract — tests pin it."""
     if "-" not in current:
         return None
     return (
-        "You're on a prerelease build. The check compares against the "
-        "latest stable release; prereleases are not auto-suggested."
+        f"You're on prerelease {current}; this banner suggests stable.\n"
+        "To track prereleases, manage manually: npm install -g cctally@next"
     )
 
 
@@ -10284,10 +10285,23 @@ def _format_update_check_json(
     }
 
 
+_UPDATE_METHOD_HUMAN_LABEL = {
+    "brew": "Homebrew",
+    "npm": "npm",
+    "unknown": "unknown",
+}
+
+
 def _format_update_check_human(
     state: dict[str, Any], suppress: dict[str, Any]
 ) -> str:
-    """Multi-line plaintext block for `cctally update --check`."""
+    """Multi-line plaintext block for `cctally update --check` (spec §4.4).
+
+    Two-space-column table layout: every label left-padded to width 10
+    (`Will run` is the longest at 8 chars + 2-space gutter). Method row
+    appends `  (auto-detected)` per spec example. Up-to-date / unknown
+    variants append a fallback line below the table.
+    """
     cur = state.get("current_version") or "unknown"
     lat = state.get("latest_version") or "unknown"
     method = (state.get("install") or {}).get("method", "unknown")
@@ -10302,18 +10316,20 @@ def _format_update_check_human(
         except ValueError:
             cooked_available = False
 
+    method_label = _UPDATE_METHOD_HUMAN_LABEL.get(method, method)
     lines = [
-        f"Current: cctally {cur}",
-        f"Latest:  cctally {lat}",
-        f"Method:  {method}",
+        f"{'Current':<10}{cur}",
+        f"{'Latest':<10}{lat}",
+        f"{'Method':<10}{method_label}  (auto-detected)",
     ]
     will_run = _format_update_command(method, None)
     if will_run:
-        lines.append(f"Will run: {will_run}")
+        lines.append(f"{'Will run':<10}{will_run}")
     if url:
-        lines.append(f"Notes:   {url}")
+        lines.append(f"{'Notes':<10}{url}")
     if status and status != "ok":
-        lines.append(f"Status:  {status}" + (f" ({err})" if err else ""))
+        status_value = status + (f" ({err})" if err else "")
+        lines.append(f"{'Status':<10}{status_value}")
     lines.append("")
     if cooked_available:
         if method in ("npm", "brew"):
@@ -10398,26 +10414,50 @@ def _do_update_remind_later(days: int) -> int:
     return 0
 
 
+_UPDATE_CHECK_JSON_UNAVAILABLE_ENVELOPE = {
+    "_schema": 1,
+    "current_version": None,
+    "latest_version": None,
+    "available": False,
+    "method": "unknown",
+    "update_command": None,
+    "release_notes_url": None,
+    "check_status": "unavailable",
+    "check_error": "state unavailable",
+    "checked_at_utc": None,
+    "suppress": {"skipped": False, "remind_after_utc": None},
+    "prerelease_note": None,
+}
+
+
 def _do_update_check_user(*, force: bool, output_json: bool) -> int:
-    """`cctally update --check` — user-facing version-check render."""
+    """`cctally update --check` — user-facing version-check render.
+
+    `_do_update_check()` translates known failure modes (network,
+    parse, rate-limit) into `check_status` fields on the state file
+    via its own internal try/except (Task 3, spec §3.5); any unexpected
+    exception that escapes is a real bug and is left to surface in the
+    outer error log. The post-command banner hook in `main()` already
+    isolates banner failures.
+    """
     if force:
-        try:
-            _do_update_check()
-        except Exception as e:  # pragma: no cover - belt-and-suspenders
-            print(
-                f"cctally update: unexpected error during force check: {e}",
-                file=sys.stderr,
-            )
+        _do_update_check()
     state = _load_update_state()
     if state is None:
         # Still nothing on disk — try once even without --force so the
         # first invocation isn't a content-free "state unavailable".
-        try:
-            _do_update_check()
-        except Exception:
-            pass
+        _do_update_check()
         state = _load_update_state()
     if state is None:
+        if output_json:
+            # Emit a parseable minimal envelope so JSON consumers always
+            # get a payload; rc stays 0 (best-effort, matches the
+            # `cmd_refresh_usage` precedent that network failures are
+            # not user-actionable errors). Spec §4.4.
+            print(
+                json.dumps(_UPDATE_CHECK_JSON_UNAVAILABLE_ENVELOPE, indent=2)
+            )
+            return 0
         print("cctally update: state unavailable", file=sys.stderr)
         return 0
     suppress = _load_update_suppress()

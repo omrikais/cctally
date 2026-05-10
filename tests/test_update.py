@@ -1175,6 +1175,177 @@ class TestUpdateCmdDispatch:
         assert rc == 2
 
 
+class TestUpdateCheckOutputFormat:
+    """`--check` output formats — spec §1.8 (prerelease note) + §4.4
+    (two-space-column human table + minimal JSON envelope when state
+    is unavailable). The wording is contract; tests pin exact strings.
+    """
+
+    def test_prerelease_note_matches_spec_format(self, ns):
+        """Spec §1.8 exact wording for prerelease users."""
+        note = ns["_prerelease_note"]("1.7.0-rc.3")
+        assert note == (
+            "You're on prerelease 1.7.0-rc.3; this banner suggests stable.\n"
+            "To track prereleases, manage manually: npm install -g cctally@next"
+        )
+
+    def test_prerelease_note_none_for_stable(self, ns):
+        assert ns["_prerelease_note"]("1.7.0") is None
+
+    def test_human_output_table_layout_brew(self, ns, update_paths, capsys):
+        """Spec §4.4: two-space-column table; method humanized to
+        `Homebrew  (auto-detected)`; trailing fallback line when an
+        update is available."""
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.5.0",
+            "latest_version": "1.7.2",
+            "latest_version_url":
+                "https://github.com/omrikais/cctally/releases/tag/v1.7.2",
+            "source": "github-formula",
+            "check_status": "ok",
+            "checked_at_utc": "2026-05-09T00:00:00+00:00",
+            "check_error": None,
+            "install": {"method": "brew"},
+        })
+        args = _make_args(
+            command="update",
+            check=True,
+            skip=None,
+            remind_later=None,
+            install_version=None,
+            dry_run=False,
+            force=False,
+            json=False,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        expected = (
+            "Current   1.5.0\n"
+            "Latest    1.7.2\n"
+            "Method    Homebrew  (auto-detected)\n"
+            "Will run  brew update --quiet && brew upgrade cctally\n"
+            "Notes     https://github.com/omrikais/cctally/releases/tag/v1.7.2\n"
+            "\n"
+            "Run `cctally update` to install.\n"
+        )
+        assert out == expected
+
+    def test_human_output_table_layout_unknown_method(
+        self, ns, update_paths, capsys
+    ):
+        """Unknown install method: table still renders (no `Will run`
+        line because there's no recipe), and the manual-fallback
+        line replaces `Run \\`cctally update\\` to install.`."""
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.5.0",
+            "latest_version": "1.7.2",
+            "latest_version_url":
+                "https://github.com/omrikais/cctally/releases/tag/v1.7.2",
+            "source": "npm-registry",
+            "check_status": "ok",
+            "checked_at_utc": "2026-05-09T00:00:00+00:00",
+            "check_error": None,
+            "install": {"method": "unknown"},
+        })
+        args = _make_args(
+            command="update",
+            check=True,
+            skip=None,
+            remind_later=None,
+            install_version=None,
+            dry_run=False,
+            force=False,
+            json=False,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        lines = out.splitlines()
+        assert lines[0] == "Current   1.5.0"
+        assert lines[1] == "Latest    1.7.2"
+        assert lines[2] == "Method    unknown  (auto-detected)"
+        # No `Will run` line for unknown method (recipe is empty string).
+        assert not any(line.startswith("Will run") for line in lines)
+        assert lines[3] == (
+            "Notes     https://github.com/omrikais/cctally/releases/tag/v1.7.2"
+        )
+        assert lines[4] == ""
+        # Manual-fallback line for unknown methods.
+        assert "Automatic update unavailable" in lines[5]
+
+    def test_human_output_appends_prerelease_note(
+        self, ns, update_paths, capsys
+    ):
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.7.0-rc.3",
+            "latest_version": "1.7.0",
+            "check_status": "ok",
+            "install": {"method": "npm"},
+        })
+        args = _make_args(
+            command="update",
+            check=True,
+            skip=None,
+            remind_later=None,
+            install_version=None,
+            dry_run=False,
+            force=False,
+            json=False,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert out.endswith(
+            "\n"
+            "You're on prerelease 1.7.0-rc.3; this banner suggests stable.\n"
+            "To track prereleases, manage manually: npm install -g cctally@next\n"
+        )
+
+    def test_check_json_envelope_when_state_unavailable(
+        self, ns, update_paths, monkeypatch, capsys
+    ):
+        """When no state exists on disk and `_do_update_check()` can't
+        produce one (e.g. all network paths fail and write nothing),
+        `--json` still emits a parseable minimal envelope (rc=0) so
+        consumers don't have to handle empty stdout. Issue #3 from
+        the Task 4 code review."""
+        # Force `_do_update_check()` to be a no-op — no state file
+        # written → second `_load_update_state()` still returns None.
+        monkeypatch.setitem(ns, "_do_update_check", lambda: None)
+        args = _make_args(
+            command="update",
+            check=True,
+            skip=None,
+            remind_later=None,
+            install_version=None,
+            dry_run=False,
+            force=False,
+            json=True,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload == {
+            "_schema": 1,
+            "current_version": None,
+            "latest_version": None,
+            "available": False,
+            "method": "unknown",
+            "update_command": None,
+            "release_notes_url": None,
+            "check_status": "unavailable",
+            "check_error": "state unavailable",
+            "checked_at_utc": None,
+            "suppress": {"skipped": False, "remind_after_utc": None},
+            "prerelease_note": None,
+        }
+
+
 # ============================================================
 # End-to-end argparse coverage (subprocess-driven).
 #
