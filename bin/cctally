@@ -10798,7 +10798,14 @@ class UpdateWorker:
         # run_id -> queue.Queue of event dicts. Each subscriber drains
         # via ``stream(run_id)``; the worker thread enqueues via
         # ``_emit``. A single subscriber per run is the dashboard
-        # contract; multi-subscriber broadcast is out of scope.
+        # contract; multi-subscriber broadcast is out of scope. The
+        # producer (``_run``) intentionally does NOT pop its entry —
+        # that would race a late consumer (#32): the worker thread can
+        # complete its finally before the consumer enters ``stream()``,
+        # leaving the consumer to look up a missing key. Cleanup
+        # ownership now belongs to ``stream()``'s finally; if no
+        # consumer ever subscribes, ``start()`` reaps stale entries on
+        # the next run.
         self._streams: dict[str, "queue.Queue"] = {}
 
     def start(self, version: "str | None") -> tuple[bool, str]:
@@ -10811,6 +10818,12 @@ class UpdateWorker:
         with self._lock:
             if self._current_id is not None:
                 return (False, self._current_id)
+            # Reap any stale entries from prior no-consumer runs. Safe
+            # under the lock: ``_current_id is None`` here, so no live
+            # stream() generator holds a reference into the dict by
+            # run_id (only by local-variable q ref, which survives the
+            # pop).
+            self._streams.clear()
             run_id = secrets.token_hex(8)
             self._current_id = run_id
             self._streams[run_id] = queue.Queue()
@@ -10844,15 +10857,19 @@ class UpdateWorker:
         q = self._streams.get(run_id)
         if q is None:
             return
-        while True:
-            try:
-                ev = q.get(timeout=15)
-            except queue.Empty:
-                yield {"type": "heartbeat"}
-                continue
-            yield ev
-            if ev["type"] in ("execvp", "error_event", "done"):
-                return
+        try:
+            while True:
+                try:
+                    ev = q.get(timeout=15)
+                except queue.Empty:
+                    yield {"type": "heartbeat"}
+                    continue
+                yield ev
+                if ev["type"] in ("execvp", "error_event", "done"):
+                    return
+        finally:
+            with self._lock:
+                self._streams.pop(run_id, None)
 
     def _run(self, run_id: str, version: "str | None") -> None:
         lock_fd = None
@@ -10917,7 +10934,9 @@ class UpdateWorker:
                     pass
             with self._lock:
                 self._current_id = None
-                self._streams.pop(run_id, None)
+                # _streams[run_id] intentionally retained — see class
+                # docstring. Cleanup is owned by stream()'s finally;
+                # start() sweeps stale entries on the next run.
 
 
 # Module-level singleton. Populated by cmd_dashboard on server boot;

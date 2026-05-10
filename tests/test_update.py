@@ -1866,6 +1866,93 @@ class TestUpdateWorker:
         # Lock released exactly once on the success path (pre-execvp).
         assert released == [7]
 
+    def test_stream_observable_after_worker_completes_pre_subscribe(
+        self, tmp_path, monkeypatch
+    ):
+        # Regression for #32: under -n 16 contention the stubbed worker
+        # thread can complete its finally before the test thread enters
+        # stream(run_id). Pre-fix, the finally popped _streams[run_id]
+        # eagerly and stream() then took the q-is-None early-return
+        # branch, yielding an empty generator. This test forces the
+        # ordering deterministically (poll status() to None) and then
+        # subscribes — events must still be observable.
+        ns = load_script()
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(
+            ns, "_detect_install_method", lambda mutate=True: method
+        )
+        monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 99)
+        monkeypatch.setitem(ns, "_release_update_lock", lambda fd: None)
+        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setitem(
+            ns, "_run_streaming",
+            lambda cmd, *, on_stdout, on_stderr, log_fd: 1,
+        )
+        monkeypatch.setattr(ns["os"], "execvp", lambda *a, **kw: None)
+
+        worker = ns["UpdateWorker"]()
+        ok, run_id = worker.start(None)
+        assert ok is True
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if worker.status()["current_run_id"] is None:
+                break
+            time.sleep(0.01)
+        assert worker.status()["current_run_id"] is None, (
+            "worker thread did not finish within timeout"
+        )
+
+        events = _drain_stream(worker, run_id, timeout_s=5.0)
+        types = [ev.get("type") for ev in events]
+        assert "step" in types
+        assert "exit" in types
+        assert events[-1] == {"type": "done", "success": False}
+
+    def test_streams_dict_swept_on_next_start_when_no_consumer(
+        self, tmp_path, monkeypatch
+    ):
+        # If a run finishes without anyone subscribing, the queue entry
+        # stays in _streams (cleanup is deferred to stream()'s finally).
+        # The next start() must reap stale entries so the dict doesn't
+        # grow unbounded across many no-consumer runs.
+        ns = load_script()
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(
+            ns, "_detect_install_method", lambda mutate=True: method
+        )
+        monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 1)
+        monkeypatch.setitem(ns, "_release_update_lock", lambda fd: None)
+        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setitem(
+            ns, "_run_streaming",
+            lambda cmd, *, on_stdout, on_stderr, log_fd: 1,
+        )
+        monkeypatch.setattr(ns["os"], "execvp", lambda *a, **kw: None)
+
+        worker = ns["UpdateWorker"]()
+
+        ok1, rid1 = worker.start(None)
+        assert ok1
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if worker.status()["current_run_id"] is None:
+                break
+            time.sleep(0.01)
+        assert worker.status()["current_run_id"] is None
+        assert rid1 in worker._streams, "queue retained for late subscriber"
+
+        ok2, rid2 = worker.start(None)
+        assert ok2
+        assert rid1 not in worker._streams, "stale entry not swept on start()"
+        assert rid2 in worker._streams
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if worker.status()["current_run_id"] is None:
+                break
+            time.sleep(0.01)
+
     def test_status_reports_current_run_id(self, tmp_path, monkeypatch):
         ns = load_script()
         worker = ns["UpdateWorker"]()
