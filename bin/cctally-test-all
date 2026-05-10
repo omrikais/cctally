@@ -112,11 +112,20 @@ done
 
 # Phase 3: pytest tests/ (skipped if pytest unavailable). Runs after the
 # golden-file harnesses so any cross-harness state is settled before the
-# Python suite executes.
+# Python suite executes. When pytest-xdist is importable (declared in
+# tests/requirements-dev.txt as an optional dev dep), pass `-n "$JOBS"`
+# so the suite fans out across workers honoring the same concurrency
+# cap as the harness phase. Falls back to serial silently if xdist is
+# not installed — the suite still runs, just slower (~30s vs ~6s on
+# this machine).
 pytest_status="SKIPPED"
 if python3 -m pytest --version >/dev/null 2>&1; then
     pytest_log="$LOGDIR/pytest.log"
-    if (cd "$REPO_ROOT" && python3 -m pytest tests/ -q) > "$pytest_log" 2>&1; then
+    pytest_args=(tests/ -q)
+    if python3 -c 'import xdist' >/dev/null 2>&1; then
+        pytest_args+=(-n "$JOBS")
+    fi
+    if (cd "$REPO_ROOT" && python3 -m pytest "${pytest_args[@]}") > "$pytest_log" 2>&1; then
         pytest_status="PASS"
     else
         pytest_status="FAIL"

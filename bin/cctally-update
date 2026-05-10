@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin wrapper: `cctally-update` → `cctally update`.
+# Mirrors the `cctally-<cmd>` convention used by every other subcommand.
+set -euo pipefail
+exec "$(dirname "$0")/cctally" update "$@"

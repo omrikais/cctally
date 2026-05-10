@@ -23,12 +23,32 @@
 # First-run writes each scenario's golden; steady-state is a byte-stable diff.
 # Exits non-zero if any scenario fails. A trap ensures stray server PIDs die
 # on harness exit / Ctrl-C.
+#
+# The seven fixture scenarios (ok, warn, over, reset-week, no-data,
+# utc-tz, tz-override) run in parallel via `xargs -P` — each scenario
+# already has its own scratch HOME under $SCRATCH_ROOT/<name> and
+# binds its dashboard server to an ephemeral port (`--port 0`), so
+# they're fully isolated. Cap with CCTALLY_TEST_JOBS (default = host
+# CPU count, =1 forces serial). Per-scenario stdout/stderr is buffered
+# to <name>/_output.log and flushed in fixed scenario order so log
+# output stays coherent. The five banner sub-tests further down the
+# script stay sequential because banners 1/2/3 deliberately share a
+# HOME for the unflagged-default → --host 0.0.0.0 → suppressed-LAN
+# narrative; splitting that for parallelism would require giving each
+# its own scratch tree.
 
 set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$REPO_ROOT/bin/cctally"
 FIX_DIR="$REPO_ROOT/tests/fixtures/dashboard"
+
+default_jobs() {
+    local n
+    n=$(sysctl -n hw.ncpu 2>/dev/null) || n=$(nproc 2>/dev/null) || n=4
+    echo "$n"
+}
+JOBS=${CCTALLY_TEST_JOBS:-$(default_jobs)}
 
 # Per-run scratch root. Each scenario gets <SCRATCH_ROOT>/<name>/.local/...
 # as its HOME; the in-tree fixture dir is treated as a read-only template
@@ -108,7 +128,11 @@ print(json.dumps(env, indent=2, sort_keys=True))
 '
 }
 
-run_scenario () {
+# Phase 1 worker. Returns 0 on PASS, 1 on FAIL. Output goes to stdout/
+# stderr; `run_scenario` redirects those to a per-scenario log file
+# before invoking this. Counters live in the parent shell — the
+# aggregator after `xargs` reads each scenario's _result.txt and tallies.
+_run_scenario_inner () {
     local name="$1"
     local dir="$FIX_DIR/$name"
     local golden="$dir/golden-data.json"
@@ -116,8 +140,7 @@ run_scenario () {
 
     if [ ! -f "$dir/input.env" ]; then
         echo "FAIL $name: no input.env at $dir/input.env"
-        fail_count=$((fail_count + 1))
-        return
+        return 1
     fi
 
     # Pull AS_OF without sourcing input.env (keeps harness state clean).
@@ -125,8 +148,7 @@ run_scenario () {
     as_of=$(grep '^AS_OF=' "$dir/input.env" | head -1 | cut -d= -f2-)
     if [ -z "$as_of" ]; then
         echo "FAIL $name: input.env missing AS_OF"
-        fail_count=$((fail_count + 1))
-        return
+        return 1
     fi
 
     # FIXED_SESSION_ID is present for non-empty scenarios (ok/warn/over);
@@ -161,7 +183,11 @@ run_scenario () {
         "$BIN" dashboard --port 0 --no-browser --no-sync \
         --sync-interval 9999 --host 127.0.0.1 $extra_flags >"$log" 2>&1 &
     local pid=$!
-    BG_PIDS+=("$pid")
+    # The dashboard server is a child of this worker bash. Under xargs
+    # parallelism, the parent shell's BG_PIDS array can't reach it; the
+    # explicit kill+wait at the end of this function handles normal
+    # completion, and on Ctrl-C the worker bash dies and SIGCHLDs the
+    # server with it. So no BG_PIDS append here.
 
     # Wait up to ~15s for the banner line to appear. With --host 127.0.0.1
     # (loopback), the banner emits "dashboard: serving http://localhost:PORT/
@@ -192,8 +218,7 @@ run_scenario () {
         sed 's/^/    /' "$log" || true
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
-        fail_count=$((fail_count + 1))
-        return
+        return 1
     fi
 
     local base="http://127.0.0.1:$port"
@@ -407,19 +432,55 @@ print(label)
 
     if [ "$ok" = "1" ]; then
         echo "PASS $name"
-        pass_count=$((pass_count + 1))
+        return 0
     else
-        fail_count=$((fail_count + 1))
+        return 1
     fi
 }
 
-run_scenario ok
-run_scenario warn
-run_scenario over
-run_scenario reset-week
-run_scenario no-data
-run_scenario utc-tz
-run_scenario tz-override
+# Phase 1 wrapper: redirect the inner function's stdout/stderr to a
+# per-scenario log file so output stays coherent under parallelism, and
+# write the verdict to a per-scenario _result.txt for the aggregator.
+run_scenario () {
+    local name="$1"
+    local work_dir="$SCRATCH_ROOT/$name"
+    mkdir -p "$work_dir"
+    local out="$work_dir/_output.log"
+    local result_file="$work_dir/_result.txt"
+
+    if _run_scenario_inner "$name" > "$out" 2>&1; then
+        echo "PASS" > "$result_file"
+    else
+        echo "FAIL" > "$result_file"
+    fi
+}
+
+# Dispatch the seven fixture scenarios in parallel. Each scenario's
+# output goes to its own _output.log; the loop after `xargs` flushes
+# them in fixed scenario order so the harness output reads identically
+# to the old sequential version.
+fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override)
+export -f _run_scenario_inner run_scenario normalize_json normalize_session_json
+export FIX_DIR BIN SCRATCH_ROOT
+
+printf '%s\n' "${fixture_scenarios[@]}" \
+    | xargs -n1 -P "$JOBS" -I{} \
+        bash -c 'set -uo pipefail; run_scenario "$@"' _ {}
+
+for name in "${fixture_scenarios[@]}"; do
+    if [ -f "$SCRATCH_ROOT/$name/_output.log" ]; then
+        cat "$SCRATCH_ROOT/$name/_output.log"
+    fi
+    if [ -f "$SCRATCH_ROOT/$name/_result.txt" ] \
+       && [ "$(cat "$SCRATCH_ROOT/$name/_result.txt")" = "PASS" ]; then
+        pass_count=$((pass_count + 1))
+    else
+        if [ ! -f "$SCRATCH_ROOT/$name/_result.txt" ]; then
+            echo "FAIL $name: worker crashed before writing result"
+        fi
+        fail_count=$((fail_count + 1))
+    fi
+done
 
 # Local assert helper used only by the banner scenarios below — kept
 # here (rather than at file top) so the existing scenario flow that

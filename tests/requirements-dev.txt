@@ -1,0 +1,11 @@
+# Optional dev dependencies for running the test suite. The runtime CLI
+# itself remains stdlib-only (see CLAUDE.md "Stdlib-only ethos"); these
+# are test-time only.
+#
+# Install: pip install -r tests/requirements-dev.txt
+# Or with uv: uv pip install -r tests/requirements-dev.txt
+#
+# pytest-xdist enables `pytest -n <N>` for parallel test execution.
+# bin/cctally-test-all detects it at runtime and passes -n "$JOBS"
+# when available; absence falls back to serial pytest with no error.
+pytest-xdist

@@ -2169,6 +2169,36 @@ CONFIG_LOCK_PATH = APP_DIR / "config.json.lock"
 LOG_DIR = APP_DIR / "logs"
 MIGRATION_ERROR_LOG_PATH = LOG_DIR / "migration-errors.log"
 
+# === Update subcommand (Section 1 of update-subcommand spec) ===
+# Path constants for the `cctally update` feature. Centralised here
+# (alongside other APP_DIR-derived paths) so the test fixture loader in
+# tests/conftest.py:redirect_paths can monkeypatch them, and so later
+# tasks (install detection, version-check pipeline, dashboard worker)
+# don't have to revisit constant placement.
+UPDATE_STATE_PATH         = APP_DIR / "update-state.json"
+UPDATE_SUPPRESS_PATH      = APP_DIR / "update-suppress.json"
+UPDATE_LOCK_PATH          = APP_DIR / "update.lock"
+UPDATE_LOG_PATH           = APP_DIR / "update.log"
+UPDATE_LOG_ROTATED_PATH   = APP_DIR / "update.log.1"
+UPDATE_LOG_ROTATE_BYTES   = 1024 * 1024  # 1 MB; spec §1.5
+UPDATE_CHECK_LAST_FETCH_PATH = APP_DIR / "update-check.last-fetch"
+
+UPDATE_NPM_REGISTRY_URL = os.environ.get(
+    "CCTALLY_TEST_UPDATE_NPM_URL",
+    "https://registry.npmjs.org/cctally/latest",
+)
+UPDATE_BREW_FORMULA_URL = os.environ.get(
+    "CCTALLY_TEST_UPDATE_BREW_URL",
+    "https://raw.githubusercontent.com/omrikais/homebrew-cctally/main/Formula/cctally.rb",
+)
+
+UPDATE_DEFAULT_TTL_HOURS  = 24
+UPDATE_MAX_TTL_HOURS      = 720    # 30 days
+UPDATE_NETWORK_TIMEOUT_S  = 5.0
+UPDATE_NPM_PREFIX_TIMEOUT_S = 2.0
+UPDATE_NPM_PREFIX_TTL_DAYS  = 7
+UPDATE_DASHBOARD_CHECK_POLL_S = 30 * 60
+
 
 def _migrate_legacy_data_dir() -> None:
     """One-shot: ~/.local/share/ccusage-subscription → ~/.local/share/cctally.
@@ -8798,6 +8828,56 @@ class RefreshUsageMalformedError(Exception):
     required seven_day fields (utilization or resets_at)."""
 
 
+# === `cctally update` exception cluster (spec §1, §3, §5) =================
+# These live near RefreshUsage* because the version-check pipeline (Task 3)
+# is structurally analogous: a single networked refresh that can rate-limit,
+# fail to fetch, or return unparseable bodies. The base class is caught at
+# the command boundary in cmd_update_* (Task 4); subtypes let JSON-mode
+# emit a `check_status` enum value (rate_limited / fetch_failed / etc.) per
+# spec §1.2.
+
+
+class UpdateError(Exception):
+    """User-facing error from the update subcommand. Caught at command boundary."""
+
+
+class UpdateInProgressError(UpdateError):
+    """Another update is already running. Carries the prior PID for the operator
+    message ("Another update is in progress (PID 12345)."). Raised by
+    _acquire_update_lock when a live PID still holds update.lock.
+
+    ``prior_pid`` is ``None`` when the lock body was unparseable (no
+    ``PID=`` line, or non-integer value) — rendered as
+    "(PID unknown)" rather than a sentinel like ``0`` (which is a real
+    PID in POSIX semantics: the kernel scheduler on Linux)."""
+
+    def __init__(self, prior_pid: int | None):
+        if prior_pid is None:
+            super().__init__("Another update is in progress (PID unknown).")
+        else:
+            super().__init__(f"Another update is in progress (PID {prior_pid}).")
+        self.prior_pid = prior_pid
+
+
+class UpdateCheckNetworkError(UpdateError):
+    """DNS / connection / non-rate-limit HTTP failure during version check."""
+
+
+class UpdateCheckRateLimited(UpdateError):
+    """HTTP 429 from npm registry or GitHub raw-content host. Treated as
+    non-error (last-known `latest_version` preserved); banner predicate is
+    still evaluated against the cached value."""
+
+
+class UpdateCheckHTTPError(UpdateError):
+    """Non-200, non-429 HTTP status from a version-check endpoint."""
+
+
+class UpdateCheckParseError(UpdateError):
+    """Endpoint returned a body we couldn't parse (npm JSON missing
+    `version` field, formula ruby missing `version "X.Y.Z"` line)."""
+
+
 @dataclasses.dataclass
 class _RefreshUsageResult:
     """Outcome of a single _refresh_usage_inproc() invocation.
@@ -9484,6 +9564,954 @@ def save_config(data: dict[str, Any]) -> None:
     finally:
         os.close(fd)
     os.replace(str(tmp), str(CONFIG_PATH))
+
+
+# === update-subcommand state-file / lock / log helpers (spec §1) =========
+# These live next to load_config / save_config because they share the
+# atomic-write idiom (PID-suffixed tmp + os.replace) and the schema-
+# versioned-JSON contract. Kept stdlib-only per the project's zero-dep
+# ethos.
+
+_UPDATE_STATE_SCHEMA_MAX = 1
+_UPDATE_SUPPRESS_SCHEMA_MAX = 1
+
+
+def _load_update_state() -> dict[str, Any] | None:
+    """Read ``update-state.json``. Returns None when the file is absent
+    so callers can distinguish "never checked" from "checked, no update."
+
+    Raises :class:`UpdateError` when ``_schema`` exceeds the highest
+    version this binary knows about — forward-compat invariant from
+    spec §1.7. An older cctally must NOT silently drop fields that a
+    newer cctally wrote (that would invert the suppress-versions list,
+    miss new check_status enum values, etc.).
+
+    JSON-decode errors also raise :class:`UpdateError`; the writer's
+    atomic os.replace guarantees readers never see partial bytes, so a
+    parse failure means the file was already corrupt before our read.
+    """
+    try:
+        text = UPDATE_STATE_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise UpdateError(f"update-state.json is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise UpdateError(
+            f"update-state.json must be a JSON object, got {type(data).__name__}"
+        )
+    schema = data.get("_schema", 0)
+    if not isinstance(schema, int) or schema > _UPDATE_STATE_SCHEMA_MAX:
+        raise UpdateError(
+            f"update-state.json has _schema={schema!r}; this cctally is older "
+            f"than the state file. Upgrade cctally."
+        )
+    return data
+
+
+def _save_update_state(state: dict[str, Any]) -> None:
+    """Persist ``update-state.json`` atomically.
+
+    Mirrors :func:`save_config`: PID-suffixed tmp sibling, fsync the
+    bytes, then ``os.replace`` onto the final path. POSIX rename(2) is
+    atomic on the same filesystem, so concurrent readers see either the
+    pre-rename or post-rename contents but never partial bytes.
+    Concurrent writers don't race the bytes themselves but may stomp
+    each other's logical updates — the update subcommand serializes
+    writers via ``UPDATE_LOCK_PATH`` (spec §5.3).
+    """
+    UPDATE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = (
+        json.dumps(state, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    tmp = UPDATE_STATE_PATH.with_name(
+        f"{UPDATE_STATE_PATH.name}.tmp.{os.getpid()}"
+    )
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(str(tmp), str(UPDATE_STATE_PATH))
+
+
+def _load_update_suppress() -> dict[str, Any]:
+    """Read ``update-suppress.json``. Returns a default empty record when
+    the file is absent (spec §1.3) so the banner predicate doesn't have
+    to None-guard every read. Same forward-compat schema check as
+    :func:`_load_update_state`.
+    """
+    default = {"_schema": 1, "skipped_versions": [], "remind_after": None}
+    try:
+        text = UPDATE_SUPPRESS_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return default
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise UpdateError(
+            f"update-suppress.json is not valid JSON: {e}"
+        ) from e
+    if not isinstance(data, dict):
+        raise UpdateError(
+            f"update-suppress.json must be a JSON object, got "
+            f"{type(data).__name__}"
+        )
+    schema = data.get("_schema", 0)
+    if not isinstance(schema, int) or schema > _UPDATE_SUPPRESS_SCHEMA_MAX:
+        raise UpdateError(
+            f"update-suppress.json has _schema={schema!r}; this cctally is "
+            f"older than the suppress file. Upgrade cctally."
+        )
+    return data
+
+
+def _save_update_suppress(suppress: dict[str, Any]) -> None:
+    """Persist ``update-suppress.json`` atomically. Same idiom as
+    :func:`_save_update_state`."""
+    UPDATE_SUPPRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = (
+        json.dumps(suppress, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    tmp = UPDATE_SUPPRESS_PATH.with_name(
+        f"{UPDATE_SUPPRESS_PATH.name}.tmp.{os.getpid()}"
+    )
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(str(tmp), str(UPDATE_SUPPRESS_PATH))
+
+
+def _read_lock_pid(fd: int) -> int | None:
+    """Parse ``PID=<n>`` out of an open update.lock fd. Returns None on
+    any failure (file empty, missing PID line, non-integer value) — the
+    caller treats "unknown holder" the same as a stale lock and
+    attempts a second LOCK_NB acquire."""
+    try:
+        os.lseek(fd, 0, 0)
+        body = os.read(fd, 1024).decode("utf-8")
+    except OSError:
+        return None
+    for line in body.splitlines():
+        if line.startswith("PID="):
+            try:
+                return int(line[4:])
+            except ValueError:
+                return None
+    return None
+
+
+def _acquire_update_lock() -> int:
+    """Acquire the singleton update.lock under spec §5.3 contract.
+
+    Returns the open fd on success. Caller MUST pass the fd to
+    :func:`_release_update_lock` to drop the flock + unlink the file.
+
+    Raises :class:`UpdateInProgressError` when a *live* PID still holds
+    the lock. Stale locks (writer crashed without releasing) are
+    silently reclaimed: ``kill(pid, 0)`` raising ``ProcessLookupError``
+    is the only signal we trust for reclaim — kernel-authoritative,
+    free of read-the-file-then-stat races.
+
+    Body format (text, line-oriented for ``cat update.lock``)::
+
+        PID=12345
+        STARTED_AT_UTC=2026-05-10T13:05:23+00:00
+        COMMAND=cctally update
+    """
+    UPDATE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(
+        str(UPDATE_LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o644
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        prior = _read_lock_pid(fd)
+        if prior is not None:
+            try:
+                os.kill(prior, 0)
+            except ProcessLookupError:
+                pass  # stale → fall through to reclaim attempt
+            else:
+                # Live PID still holds the lock — refuse.
+                os.close(fd)
+                raise UpdateInProgressError(prior)
+        # Stale (or unparseable PID): retry the non-blocking acquire.
+        # If it still fails, another process raced us into the same
+        # reclaim path; surface it as in-progress with the best PID
+        # we observed (or 0 if we couldn't read one).
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise UpdateInProgressError(prior)
+    os.ftruncate(fd, 0)
+    body = (
+        f"PID={os.getpid()}\n"
+        f"STARTED_AT_UTC={_now_utc().isoformat()}\n"
+        f"COMMAND=cctally update\n"
+    ).encode("utf-8")
+    os.write(fd, body)
+    return fd
+
+
+def _release_update_lock(fd: int) -> None:
+    """Drop the flock, close the fd, and unlink update.lock.
+
+    Defensive on every step: a double-release (or a release after the
+    fd has been closed by an earlier error path) must not raise. The
+    final ``unlink`` swallows ``FileNotFoundError`` so a peer who
+    already reclaimed and unlinked our stale lock doesn't poison this
+    finally clause.
+    """
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        UPDATE_LOCK_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _rotate_update_log_if_needed() -> None:
+    """Rotate ``update.log`` → ``update.log.1`` when the live log
+    crosses :data:`UPDATE_LOG_ROTATE_BYTES` (1 MB, spec §1.5).
+
+    Single rotation slot: a second rotation overwrites the first.
+    Failed-install logs are preserved on disk only until the next
+    successful run grows the live log past 1 MB — operators chasing a
+    historical failure should grab ``update.log.1`` while it's still
+    around.
+
+    No-op when the file is absent or below threshold.
+    """
+    try:
+        size = UPDATE_LOG_PATH.stat().st_size
+    except FileNotFoundError:
+        return
+    if size < UPDATE_LOG_ROTATE_BYTES:
+        return
+    try:
+        UPDATE_LOG_ROTATED_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    UPDATE_LOG_PATH.rename(UPDATE_LOG_ROTATED_PATH)
+
+
+def _log_update_event(log_fd, event: str, **kv: Any) -> None:
+    """Append one event line to ``update.log``.
+
+    Format: ``<iso-utc> <EVENT> k=v k=v ...``. Strings containing
+    spaces are wrapped with ``repr`` so the log stays grep-friendly;
+    integers are emitted bare so size/elapsed columns can be
+    arithmetic-parsed. ``log_fd`` is any text-mode writable file-like
+    (``open(UPDATE_LOG_PATH, "a", encoding="utf-8")`` is the production
+    caller from Task 5).
+    """
+    parts = [_now_utc().isoformat(), event]
+    for k, v in kv.items():
+        if isinstance(v, str) and " " in v:
+            parts.append(f"{k}={v!r}")
+        else:
+            parts.append(f"{k}={v}")
+    log_fd.write(" ".join(parts) + "\n")
+    log_fd.flush()
+
+
+# === Update subcommand: install-method detection (spec §2) =================
+# Path-based heuristic over `realpath(sys.argv[0])`:
+#   - "/Cellar/cctally/" substring → method="brew" (Apple Silicon, Intel,
+#     and Linuxbrew all funnel through `<root>/Cellar/cctally/`).
+#   - "<npm-prefix>/lib/node_modules/cctally/" prefix → method="npm".
+#   - Anything else (source install, pnpm/yarn-global/volta, dev symlink)
+#     → method="unknown" → manual-fallback bucket per spec §2.4.
+# `mutate=False` is the dry-run contract (§5.5): every tier still
+# computes, but tier-C cache writes to update-state.json are skipped.
+
+
+@dataclass(frozen=True)
+class InstallMethod:
+    """Resolved install method for the running cctally binary (spec §2.1).
+
+    ``method`` is one of ``"brew"``, ``"npm"``, ``"unknown"``;
+    ``realpath`` is ``os.path.realpath(sys.argv[0])`` (the resolved
+    target of any symlinks on $PATH); ``npm_prefix`` is populated only
+    when ``method == "npm"`` so callers don't have to special-case it.
+    """
+
+    method: str
+    realpath: str
+    npm_prefix: str | None
+
+
+def _resolve_npm_prefix(*, mutate: bool = True) -> str | None:
+    """Three-tier ``npm prefix -g`` resolution (spec §2.2).
+
+    Tier A: ``$npm_config_prefix`` env var (rarely set; free).
+    Tier B: cached ``install.npm_prefix`` from update-state.json,
+        7-day TTL (one ``os.stat`` via ``_load_update_state``).
+    Tier C: ``subprocess.run(["npm", "prefix", "-g"], timeout=2.0)``
+        (200–300 ms cold). Tier-C success populates tier-B only when
+        ``mutate=True``; failure (npm not on PATH, timeout, non-zero
+        exit) returns ``None`` regardless of ``mutate``.
+    """
+    # Tier A — env var short-circuit.
+    env_pref = os.environ.get("npm_config_prefix")
+    if env_pref and pathlib.Path(env_pref).is_dir():
+        return env_pref
+    # Tier B — cached state-file value within 7-day TTL.
+    state = _load_update_state()
+    if state and isinstance(state.get("install"), dict):
+        cached = state["install"].get("npm_prefix")
+        detected_iso = state["install"].get("detected_at_utc")
+        if cached and detected_iso:
+            try:
+                detected = dt.datetime.fromisoformat(detected_iso)
+                age = (_now_utc() - detected).total_seconds()
+                if age < UPDATE_NPM_PREFIX_TTL_DAYS * 86400:
+                    return cached
+            except (ValueError, TypeError):
+                # Malformed timestamp → fall through to tier C.
+                pass
+    # Tier C — subprocess. Treat any failure as "unknown npm prefix"
+    # rather than raising; the caller maps None → method="unknown".
+    try:
+        result = subprocess.run(
+            ["npm", "prefix", "-g"],
+            timeout=UPDATE_NPM_PREFIX_TIMEOUT_S,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    prefix = result.stdout.strip()
+    if not prefix:
+        return None
+    if mutate:
+        _persist_npm_prefix_to_state(prefix)
+    return prefix
+
+
+def _persist_npm_prefix_to_state(prefix: str) -> None:
+    """Write ``install.npm_prefix`` + ``install.detected_at_utc`` to
+    update-state.json, preserving every other field. Used only by
+    tier-C of :func:`_resolve_npm_prefix` when ``mutate=True``.
+    """
+    state = _load_update_state() or {"_schema": 1}
+    state.setdefault("install", {})
+    state["install"]["npm_prefix"] = prefix
+    state["install"]["detected_at_utc"] = _now_utc().isoformat()
+    _save_update_state(state)
+
+
+def _detect_install_method(*, mutate: bool = True) -> InstallMethod:
+    """Detect how the running cctally was installed (spec §2.1).
+
+    Path-based heuristic — see module-level comment above
+    :class:`InstallMethod` for the algorithm. ``mutate=False`` honours
+    the ``--dry-run`` "touch nothing" contract: detection still runs,
+    but neither the npm-prefix tier-B cache nor the install block is
+    persisted to update-state.json.
+    """
+    real = os.path.realpath(sys.argv[0])
+    if "/Cellar/cctally/" in real:
+        method = InstallMethod(method="brew", realpath=real, npm_prefix=None)
+    else:
+        prefix = _resolve_npm_prefix(mutate=mutate)
+        if prefix:
+            nm_root = os.path.join(prefix, "lib", "node_modules", "cctally")
+            if real == nm_root or real.startswith(nm_root + os.sep):
+                method = InstallMethod(
+                    method="npm", realpath=real, npm_prefix=prefix
+                )
+            else:
+                method = InstallMethod(
+                    method="unknown", realpath=real, npm_prefix=None
+                )
+        else:
+            method = InstallMethod(
+                method="unknown", realpath=real, npm_prefix=None
+            )
+    if mutate:
+        _persist_install_method_to_state(method)
+    return method
+
+
+def _persist_install_method_to_state(method: InstallMethod) -> None:
+    """Replace the ``install`` block in update-state.json with a fresh
+    detection result, preserving every other field (e.g. ``latest_version``
+    written by the version-check pipeline in Task 3). ``current_version``
+    is also re-stamped from the CHANGELOG so the running binary's
+    self-version stays in sync with the install block.
+    """
+    state = _load_update_state() or {"_schema": 1}
+    state["install"] = {
+        "method": method.method,
+        "realpath": method.realpath,
+        "npm_prefix": method.npm_prefix,
+        "detected_at_utc": _now_utc().isoformat(),
+    }
+    cur = _release_read_latest_release_version()
+    if cur:
+        state["current_version"] = cur[0]
+    _save_update_state(state)
+
+
+# === Update subcommand: version-check pipeline (spec §3) ====================
+# Per-vector parsers, TTL gate, and the chokepoint `_do_update_check` that
+# touches the throttle marker FIRST (crash safety) before attempting any
+# remote fetch. Failures preserve the prior state's `latest_version` so the
+# banner predicate can still fire on the last-known-good value.
+
+# Priority regex chain for `_check_brew_latest_version`. First match wins:
+#   1. Explicit `version "X.Y.Z"` line (homebrew's preferred form).
+#   2. Archive URL `/vX.Y.Z[-prerelease.N].tar` (auto-archive form).
+#   3. Tag form `tag: "[v]X.Y.Z"` (occasionally seen in head/url blocks).
+_BREW_VERSION_RE_LIST = (
+    re.compile(r'^\s*version\s+"([^"]+)"\s*$', re.MULTILINE),
+    re.compile(
+        r'url\s+"[^"]*/v(\d+\.\d+\.\d+(?:-[a-zA-Z][a-zA-Z0-9-]*\.\d+)?)\.tar',
+        re.MULTILINE,
+    ),
+    re.compile(
+        r'tag:\s*"v?(\d+\.\d+\.\d+(?:-[a-zA-Z][a-zA-Z0-9-]*\.\d+)?)"',
+        re.MULTILINE,
+    ),
+)
+
+
+def _update_user_agent() -> str:
+    """User-Agent for `_fetch_url` HTTP requests.
+
+    Format: ``cctally-update-check/<version>``. Sources the version from
+    the CHANGELOG (same chokepoint as every other "what version am I"
+    callsite); falls back to ``"dev"`` for pre-release / unstamped trees.
+    """
+    cur = _release_read_latest_release_version()
+    ver = cur[0] if cur else "dev"
+    return f"cctally-update-check/{ver}"
+
+
+def _fetch_url(url: str, *, timeout: float = UPDATE_NETWORK_TIMEOUT_S) -> tuple[int, bytes]:
+    """Stdlib urllib HTTP GET. Raises typed exceptions on failure.
+
+    Returns ``(status_code, body_bytes)`` on success. Maps urllib failures
+    to the four `UpdateCheck*` exception types so callers can distinguish
+    "rate-limited (try again later)" from "HTTP fetch failed (treat as
+    last-known-good)" from "DNS / network down".
+    """
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _update_user_agent(),
+        "Accept": "*/*",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return (resp.status, resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise UpdateCheckRateLimited(str(e))
+        raise UpdateCheckHTTPError(f"HTTP {e.code}: {e}")
+    except urllib.error.URLError as e:
+        raise UpdateCheckNetworkError(str(e))
+
+
+def _check_npm_latest_version() -> str:
+    """Fetch the npm-registry `latest` JSON and return its `version` field.
+
+    Endpoint: :data:`UPDATE_NPM_REGISTRY_URL` (env-overridable via
+    ``CCTALLY_TEST_UPDATE_NPM_URL`` for fixture testing). JSON decode
+    errors and missing-key errors raise :class:`UpdateCheckParseError`.
+    """
+    status, body = _fetch_url(UPDATE_NPM_REGISTRY_URL)
+    try:
+        data = json.loads(body.decode("utf-8"))
+        return data["version"]
+    except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+        raise UpdateCheckParseError(f"npm registry parse failed: {e}")
+
+
+def _check_brew_latest_version() -> str:
+    """Fetch the brew formula raw blob and extract the version.
+
+    Endpoint: :data:`UPDATE_BREW_FORMULA_URL`. Applies
+    :data:`_BREW_VERSION_RE_LIST` in priority order; first match wins.
+    No regex matches → :class:`UpdateCheckParseError`.
+    """
+    status, body = _fetch_url(UPDATE_BREW_FORMULA_URL)
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise UpdateCheckParseError(f"brew formula decode failed: {e}")
+    for pattern in _BREW_VERSION_RE_LIST:
+        m = pattern.search(text)
+        if m:
+            return m.group(1)
+    raise UpdateCheckParseError("brew formula version not found")
+
+
+def _is_update_check_due(config: dict) -> bool:
+    """TTL gate (spec §3.4).
+
+    Reads ``update.check.enabled`` (default True) and
+    ``update.check.ttl_hours`` (default :data:`UPDATE_DEFAULT_TTL_HOURS`)
+    from the config. Returns False if disabled. Returns True if the
+    throttle marker (:data:`UPDATE_CHECK_LAST_FETCH_PATH`) is missing.
+    Otherwise: ``(now - mtime) >= ttl * 3600``.
+    """
+    check_cfg = (config.get("update", {}) or {}).get("check", {}) or {}
+    enabled = check_cfg.get("enabled", True)
+    if not enabled:
+        return False
+    ttl_hours = check_cfg.get("ttl_hours", UPDATE_DEFAULT_TTL_HOURS)
+    try:
+        mtime = UPDATE_CHECK_LAST_FETCH_PATH.stat().st_mtime
+    except FileNotFoundError:
+        return True
+    return (time.time() - mtime) >= ttl_hours * 3600
+
+
+def _do_update_check() -> None:
+    """Single chokepoint for a version-check fetch (spec §3.5).
+
+    Touches the throttle marker FIRST (crash-safety: if the process
+    dies mid-fetch, we still won't refetch for the full TTL window —
+    avoids hammering the registry on a flapping host). Then resolves
+    install method, ensures `current_version` is stamped from CHANGELOG,
+    preserves prior `latest_version` if any, and dispatches to the
+    per-vector check by `method.method`. On success: write
+    `check_status="ok"` + `latest_version_url`. On failure: map the
+    typed exception to a `check_status` enum (`rate_limited` /
+    `fetch_failed` / `parse_failed`); never lose the prior
+    `latest_version`. State is saved unconditionally on the way out.
+    """
+    # Touch marker FIRST — crash safety: a dead process mid-fetch must
+    # not trigger another fetch within the TTL window.
+    UPDATE_CHECK_LAST_FETCH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    UPDATE_CHECK_LAST_FETCH_PATH.touch()
+
+    method = _detect_install_method(mutate=True)
+
+    state = _load_update_state() or {"_schema": 1}
+    cur = _release_read_latest_release_version()
+    if cur:
+        state["current_version"] = cur[0]
+    # Preserve prior `latest_version`; default to current_version if
+    # nothing was ever recorded (so banner predicate has a comparable).
+    state.setdefault("latest_version", state.get("current_version"))
+    state["checked_at_utc"] = _now_utc().isoformat()
+    state["check_error"] = None
+
+    try:
+        if method.method == "npm":
+            latest = _check_npm_latest_version()
+            state["latest_version"] = latest
+            state["source"] = "npm-registry"
+        elif method.method == "brew":
+            latest = _check_brew_latest_version()
+            state["latest_version"] = latest
+            state["source"] = "github-formula"
+        else:
+            # Unknown install method — no remote check; still mark "ok"
+            # so the predicate doesn't keep retrying a fundamentally
+            # un-checkable install (manual-fallback bucket per §2.4).
+            state["check_status"] = "ok"
+            _save_update_state(state)
+            return
+        # Success: build the public-mirror release tag URL.
+        state["latest_version_url"] = (
+            f"https://github.com/{PUBLIC_REPO}/releases/tag/v{state['latest_version']}"
+        )
+        state["check_status"] = "ok"
+    except UpdateCheckRateLimited as e:
+        state["check_status"] = "rate_limited"
+        state["check_error"] = str(e)[:200]
+    except (UpdateCheckNetworkError, UpdateCheckHTTPError) as e:
+        state["check_status"] = "fetch_failed"
+        state["check_error"] = str(e)[:200]
+    except UpdateCheckParseError as e:
+        state["check_status"] = "parse_failed"
+        state["check_error"] = str(e)[:200]
+    finally:
+        _save_update_state(state)
+
+
+def _spawn_background_update_check() -> None:
+    """Fire-and-forget the hidden `_update-check` worker.
+
+    Detached `subprocess.Popen` with `start_new_session=True` so a
+    parent exit (the user closes the shell) doesn't propagate SIGHUP
+    to the child. stdin/stdout/stderr are all `/dev/null` so the child
+    can't accidentally pollute the parent's terminal. Exceptions are
+    swallowed: a failed spawn must not break the parent command.
+    """
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.realpath(sys.argv[0]), "_update-check"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception:
+        # Fire-and-forget: never let a spawn failure propagate.
+        pass
+
+
+def cmd_update_check_internal(args) -> int:
+    """Hidden ``_update-check`` subcommand handler (spec §3.6).
+
+    The detached-refresh worker — not user-facing. Logs lifecycle
+    events to ``update.log`` and rotates if needed. Always returns 0
+    (any error is logged but the process exits cleanly so the parent
+    spawn-and-forget contract holds).
+    """
+    # Ensure APP_DIR exists so log + state writes succeed on first run.
+    UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(UPDATE_LOG_PATH, "a", encoding="utf-8") as log_fd:
+            _log_update_event(log_fd, "CHECK_START")
+            _do_update_check()
+            _log_update_event(log_fd, "CHECK_EXIT", rc=0)
+    except Exception as e:
+        try:
+            with open(UPDATE_LOG_PATH, "a", encoding="utf-8") as log_fd:
+                _log_update_event(log_fd, "CHECK_EXIT", rc=1, error=str(e)[:200])
+        except Exception:
+            pass
+    _rotate_update_log_if_needed()
+    return 0
+
+
+# === User-facing `cctally update` (spec §4) ===
+# `cmd_update` routes by mode flag. Mode flags are mutually exclusive
+# (argparse enforces it; the dispatcher's redundant check is defense in
+# depth for programmatic callers and a clearer error message). The
+# install path is staged across two tasks: Task 4 lands the validation
+# gates and the user-mode `--check` rendering, then raises
+# NotImplementedError for actual execution. Task 5 fills in execvp +
+# streaming.
+
+# Sentinel for `--skip` with no positional argument — argparse `const`
+# doesn't accept `None` (collides with the absent-flag default). At
+# dispatch time the sentinel is replaced with `state.latest_version`.
+SKIP_USE_STATE_LATEST = "_USE_STATE_LATEST"
+
+
+def _format_update_command(method: str, version: str | None) -> str:
+    """One-line shell recipe used by both --check renderers and the
+    install-path manual fallback. Brew has no versioned formulae, so
+    the version arg is ignored there (callers gate it earlier)."""
+    if method == "brew":
+        return "brew update --quiet && brew upgrade cctally"
+    if method == "npm":
+        v = version if version else "latest"
+        return f"npm install -g cctally@{v}"
+    return ""
+
+
+def _prerelease_note(current: str) -> str | None:
+    """Spec §1.8 — prerelease users get a one-shot informational note in
+    `--check` output. Returns the canned message if `current` looks like
+    a prerelease (`X.Y.Z-id.N` form), else None."""
+    if "-" not in current:
+        return None
+    return (
+        "You're on a prerelease build. The check compares against the "
+        "latest stable release; prereleases are not auto-suggested."
+    )
+
+
+def _format_update_check_json(
+    state: dict[str, Any], suppress: dict[str, Any]
+) -> dict[str, Any]:
+    """JSON shape for `cctally update --check --json` (spec §4.4)."""
+    cur = state.get("current_version")
+    lat = state.get("latest_version")
+    method = (state.get("install") or {}).get("method", "unknown")
+    skipped = lat in suppress.get("skipped_versions", []) if lat else False
+    in_remind_window = False
+    remind = suppress.get("remind_after")
+    if remind is not None and lat is not None:
+        try:
+            if not _semver_gt(lat, remind["version"]):
+                until = dt.datetime.fromisoformat(remind["until_utc"])
+                if _now_utc() < until:
+                    in_remind_window = True
+        except (KeyError, ValueError):
+            pass
+    available = False
+    if cur and lat:
+        try:
+            available = (
+                _semver_gt(lat, cur)
+                and not skipped
+                and not in_remind_window
+            )
+        except ValueError:
+            available = False
+    return {
+        "_schema": 1,
+        "current_version": cur,
+        "latest_version": lat,
+        "available": available,
+        "method": method,
+        "update_command": _format_update_command(method, None),
+        "release_notes_url": state.get("latest_version_url"),
+        "check_status": state.get("check_status"),
+        "check_error": state.get("check_error"),
+        "checked_at_utc": state.get("checked_at_utc"),
+        "suppress": {
+            "skipped": list(suppress.get("skipped_versions", [])),
+            "remind_after_utc": (
+                remind.get("until_utc") if isinstance(remind, dict) else None
+            ),
+        },
+        "prerelease_note": _prerelease_note(cur) if cur else None,
+    }
+
+
+def _format_update_check_human(
+    state: dict[str, Any], suppress: dict[str, Any]
+) -> str:
+    """Multi-line plaintext block for `cctally update --check`."""
+    cur = state.get("current_version") or "unknown"
+    lat = state.get("latest_version") or "unknown"
+    method = (state.get("install") or {}).get("method", "unknown")
+    url = state.get("latest_version_url")
+    status = state.get("check_status")
+    err = state.get("check_error")
+    cooked_available = False
+    if state.get("current_version") and state.get("latest_version"):
+        try:
+            cooked_available = _semver_gt(lat, cur) and \
+                lat not in suppress.get("skipped_versions", [])
+        except ValueError:
+            cooked_available = False
+
+    lines = [
+        f"Current: cctally {cur}",
+        f"Latest:  cctally {lat}",
+        f"Method:  {method}",
+    ]
+    will_run = _format_update_command(method, None)
+    if will_run:
+        lines.append(f"Will run: {will_run}")
+    if url:
+        lines.append(f"Notes:   {url}")
+    if status and status != "ok":
+        lines.append(f"Status:  {status}" + (f" ({err})" if err else ""))
+    lines.append("")
+    if cooked_available:
+        if method in ("npm", "brew"):
+            lines.append("Run `cctally update` to install.")
+        else:
+            lines.append(
+                "Automatic update unavailable for this install. Visit "
+                f"{url or 'https://github.com/' + PUBLIC_REPO + '/releases'} "
+                "to install manually."
+            )
+    else:
+        lines.append("You're up to date.")
+    note = _prerelease_note(cur)
+    if note:
+        lines.append("")
+        lines.append(note)
+    return "\n".join(lines)
+
+
+def _do_update_skip(version_arg: str) -> int:
+    """`cctally update --skip [VERSION]` — record a skipped version."""
+    if version_arg == SKIP_USE_STATE_LATEST:
+        state = _load_update_state()
+        if state is None or not state.get("latest_version"):
+            print(
+                "cctally update: no version in cache to skip; run "
+                "`cctally update --check` first",
+                file=sys.stderr,
+            )
+            return 1
+        version = state["latest_version"]
+    else:
+        if not _SEMVER_RE.match(version_arg):
+            print(
+                f"cctally update: invalid version {version_arg!r} "
+                "(expected X.Y.Z[-id.N])",
+                file=sys.stderr,
+            )
+            return 2
+        version = version_arg
+    suppress = _load_update_suppress()
+    skipped = list(suppress.get("skipped_versions", []))
+    if version not in skipped:
+        skipped.append(version)
+    suppress["skipped_versions"] = skipped
+    suppress.setdefault("_schema", 1)
+    _save_update_suppress(suppress)
+    print(
+        f"Skipped cctally {version}. You won't be reminded about this version."
+    )
+    return 0
+
+
+def _do_update_remind_later(days: int) -> int:
+    """`cctally update --remind-later [DAYS]` — defer banner for N days."""
+    if not (1 <= days <= 365):
+        print(
+            f"cctally update: --remind-later must be 1..365 (got {days})",
+            file=sys.stderr,
+        )
+        return 2
+    state = _load_update_state()
+    if state is None or not state.get("latest_version"):
+        print(
+            "cctally update: no version in cache to defer; run "
+            "`cctally update --check` first",
+            file=sys.stderr,
+        )
+        return 1
+    until = (_now_utc() + dt.timedelta(days=days)).isoformat()
+    suppress = _load_update_suppress()
+    suppress["remind_after"] = {
+        "version": state["latest_version"],
+        "until_utc": until,
+    }
+    suppress.setdefault("_schema", 1)
+    _save_update_suppress(suppress)
+    print(
+        f"Will remind in {days} day{'s' if days != 1 else ''} "
+        "(or sooner if a newer version drops)."
+    )
+    return 0
+
+
+def _do_update_check_user(*, force: bool, output_json: bool) -> int:
+    """`cctally update --check` — user-facing version-check render."""
+    if force:
+        try:
+            _do_update_check()
+        except Exception as e:  # pragma: no cover - belt-and-suspenders
+            print(
+                f"cctally update: unexpected error during force check: {e}",
+                file=sys.stderr,
+            )
+    state = _load_update_state()
+    if state is None:
+        # Still nothing on disk — try once even without --force so the
+        # first invocation isn't a content-free "state unavailable".
+        try:
+            _do_update_check()
+        except Exception:
+            pass
+        state = _load_update_state()
+    if state is None:
+        print("cctally update: state unavailable", file=sys.stderr)
+        return 0
+    suppress = _load_update_suppress()
+    if output_json:
+        print(json.dumps(_format_update_check_json(state, suppress), indent=2))
+    else:
+        print(_format_update_check_human(state, suppress))
+    return 0
+
+
+def _do_update_install(
+    *, version: str | None, dry_run: bool, output_json: bool
+) -> int:
+    """`cctally update` (no mode flag) — install execution.
+
+    Task 4 lands the validation gates only; the actual execution path
+    is staged for Task 5.
+    """
+    method = _detect_install_method(mutate=not dry_run)
+    if method.method == "unknown":
+        # Manual-fallback bucket — print a helpful recipe and bail.
+        print(
+            "cctally update: automatic update unavailable for this install.",
+            file=sys.stderr,
+        )
+        print(
+            f"  Visit https://github.com/{PUBLIC_REPO}/releases for the "
+            "latest release.",
+            file=sys.stderr,
+        )
+        return 1
+    if version is not None and not _SEMVER_RE.match(version):
+        print(
+            f"cctally update: invalid --version {version!r} "
+            "(expected X.Y.Z[-id.N])",
+            file=sys.stderr,
+        )
+        return 2
+    if method.method == "brew" and version is not None:
+        print(
+            "cctally update: --version is not supported on Homebrew installs "
+            "(no versioned formulae).",
+            file=sys.stderr,
+        )
+        print(
+            f"  To install {version} manually: "
+            f"https://github.com/{PUBLIC_REPO}/releases/download/v{version}"
+            f"/cctally-{version}.tar.gz",
+            file=sys.stderr,
+        )
+        return 2
+    raise NotImplementedError("install execution lands in Task 5")
+
+
+def cmd_update(args) -> int:
+    """`cctally update` entry point — routes by mode flag (spec §4.1)."""
+    skip_arg = getattr(args, "skip", None)
+    remind_arg = getattr(args, "remind_later", None)
+    check_arg = getattr(args, "check", False)
+    version_arg = getattr(args, "version", None)
+    modes = sum(bool(x) for x in [
+        check_arg,
+        skip_arg is not None,
+        remind_arg is not None,
+    ])
+    if modes > 1:
+        print(
+            "cctally update: --check / --skip / --remind-later are "
+            "mutually exclusive",
+            file=sys.stderr,
+        )
+        return 2
+    if version_arg is not None and (
+        check_arg or skip_arg is not None or remind_arg is not None
+    ):
+        print(
+            "cctally update: --version is install-mode only",
+            file=sys.stderr,
+        )
+        return 2
+    if skip_arg is not None:
+        return _do_update_skip(skip_arg)
+    if remind_arg is not None:
+        return _do_update_remind_later(remind_arg)
+    if check_arg:
+        return _do_update_check_user(
+            force=getattr(args, "force", False),
+            output_json=getattr(args, "json", False),
+        )
+    return _do_update_install(
+        version=version_arg,
+        dry_run=getattr(args, "dry_run", False),
+        output_json=getattr(args, "json", False),
+    )
 
 
 def get_week_start_name(config: dict[str, Any], override: str | None = None) -> str:
@@ -13453,6 +14481,97 @@ def _args_emit_machine_stdout(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "status_line", False))
 
 
+# Update-banner suppression set — parallel to ``_BANNER_SUPPRESSED_COMMANDS``
+# (migration banner) but with its own membership. ``update`` itself shouldn't
+# advertise an update; ``_update-check`` is the detached-refresh worker
+# (silent by contract). Other suppressions (record-usage, hook-tick, sync-week,
+# cache-sync, refresh-usage, tui, db) ride the existing migration set so
+# the two banners stay aligned for those commands.
+_UPDATE_BANNER_EXTRA_SUPPRESSED = frozenset({"_update-check", "update"})
+
+
+def _semver_gt(a: str, b: str) -> bool:
+    """SemVer comparison via :func:`_release_parse_semver` + the
+    SemVer-§11.4-aware sort key. ``a > b`` returns True when ``a`` is
+    a strictly higher version. Raises :class:`ValueError` on either
+    input being malformed (callers wrap in try/except)."""
+    return _release_semver_sort_key(_release_parse_semver(a)) > \
+           _release_semver_sort_key(_release_parse_semver(b))
+
+
+def _should_show_update_banner(
+    command: str | None,
+    args: argparse.Namespace,
+    state: dict[str, Any] | None,
+    suppress: dict[str, Any],
+    config: dict[str, Any],
+) -> bool:
+    """Return True iff a one-line update banner should land on stderr
+    after this command's output (spec §4.2).
+
+    Composition is the key invariant: the predicate **must** delegate
+    machine-mode detection to the existing helpers
+    (:func:`_args_emit_json`, :func:`_args_emit_machine_stdout`) so a
+    new ``--json`` dest variant or status-line flag added to any
+    subcommand inherits the suppression automatically. Adding a parallel
+    list here would silently regress that invariant — the spec
+    amendment for Codex finding #8 codifies this.
+    """
+    if command in _BANNER_SUPPRESSED_COMMANDS or command in _UPDATE_BANNER_EXTRA_SUPPRESSED:
+        return False
+    if _args_emit_json(args):
+        return False
+    if _args_emit_machine_stdout(args):
+        return False
+    if getattr(args, "format", None) is not None:
+        return False
+    if not sys.stderr.isatty():
+        return False
+    if not config.get("update", {}).get("check", {}).get("enabled", True):
+        return False
+    if state is None:
+        return False
+    cur = state.get("current_version")
+    lat = state.get("latest_version")
+    if not cur or not lat:
+        return False
+    try:
+        if not _semver_gt(lat, cur):
+            return False
+    except ValueError:
+        return False
+    if lat in suppress.get("skipped_versions", []):
+        return False
+    remind = suppress.get("remind_after")
+    if remind is not None:
+        try:
+            # Hide while the deferral is active AND the user-pinned version
+            # is still the latest. A newer drop overrides the deferral.
+            if not _semver_gt(lat, remind["version"]):
+                until = dt.datetime.fromisoformat(remind["until_utc"])
+                if _now_utc() < until:
+                    return False
+        except (KeyError, ValueError):
+            # Malformed remind_after: fail-open (banner shows). Better
+            # than silently dropping a real update reminder.
+            pass
+    return True
+
+
+def _format_update_banner(state: dict[str, Any]) -> str:
+    """One-line stderr banner. Spec §4.2.
+
+    Includes the dismissal recipe inline so the user never has to
+    consult docs to silence it.
+    """
+    cur = state["current_version"]
+    lat = state["latest_version"]
+    return (
+        f"↑ cctally {lat} available (you're on {cur}). "
+        f"Run `cctally update`. Skip: cctally update --skip {lat}"
+    )
+
+
 def _print_migration_error_banner_if_needed(args) -> None:
     """Print a one-line warning banner if the migration error log has
     entries.
@@ -14896,6 +16015,31 @@ def _command_as_of() -> dt.datetime:
     time-dependent commands. Shared by cmd_project, cmd_weekly,
     cmd_cache_report, cmd_codex_weekly, cmd_diff (and any future
     time-dependent command). Format: ISO-8601 with Z or explicit tz offset.
+    """
+    override = os.environ.get("CCTALLY_AS_OF")
+    if override:
+        override = override.strip()
+        if override.endswith("Z"):
+            override = override[:-1] + "+00:00"
+        return dt.datetime.fromisoformat(override).astimezone(dt.timezone.utc)
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _now_utc() -> dt.datetime:
+    """UTC now, with CCTALLY_AS_OF env override for fixture-stability.
+
+    Single time source for the `update` subcommand and its supporting
+    state machine (TTL gates, ``remind_after.until_utc`` comparisons,
+    log timestamps, install-method detection cache). Mirrors the
+    documented CCTALLY_AS_OF precedent (see CLAUDE.md — `project` has
+    a hidden `CCTALLY_AS_OF` env hook, and `_command_as_of` /
+    `_share_now_utc` reuse it for `weekly`/`forecast`/share-render).
+    Accepts ISO-8601 with `Z` or explicit offset; result is always
+    tz-aware UTC.
+
+    Raises ValueError on malformed CCTALLY_AS_OF — deliberate fail-loud
+    for the dev hook so fixture authors notice typos immediately rather
+    than silently falling back to wall-clock time.
     """
     override = os.environ.get("CCTALLY_AS_OF")
     if override:
@@ -25438,6 +26582,75 @@ def build_parser() -> argparse.ArgumentParser:
                     help=argparse.SUPPRESS)  # JSON string fed to mock fetch (tests only)
     ht.set_defaults(func=cmd_hook_tick)
 
+    # ---- update (user-facing self-update subcommand; spec §4) ----
+    sub_update = sub.add_parser(
+        "update",
+        help="Update cctally to the latest version",
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Update cctally to the latest version (npm/brew installs only).
+
+            Modes:
+              cctally update                 install the latest version
+              cctally update --check         show update info without installing
+              cctally update --skip [VER]    don't remind about VER (default: latest)
+              cctally update --remind-later [DAYS]  defer the banner (default: 7)
+            """
+        ),
+    )
+    update_modes = sub_update.add_mutually_exclusive_group()
+    update_modes.add_argument(
+        "--check", action="store_true",
+        help="Show update info without installing",
+    )
+    update_modes.add_argument(
+        "--skip", nargs="?", const=SKIP_USE_STATE_LATEST, metavar="VERSION",
+        default=None,
+        help="Skip a specific version (default: latest in cache)",
+    )
+    update_modes.add_argument(
+        "--remind-later", nargs="?", type=int, const=7, metavar="DAYS",
+        default=None,
+        help="Defer reminders by N days (default: 7)",
+    )
+    # `--version` here is local to the update subparser; argparse subparser
+    # scoping keeps it separate from the top-level `cctally --version`.
+    sub_update.add_argument(
+        "--version", metavar="X.Y.Z", default=None,
+        help="Install a specific version (npm only; brew has no versioned formulae)",
+    )
+    sub_update.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would happen, don't install",
+    )
+    sub_update.add_argument(
+        "--force", action="store_true",
+        help="Bypass TTL on --check (force a fresh remote fetch)",
+    )
+    sub_update.add_argument(
+        "--json", action="store_true",
+        help="Emit JSON output (mostly with --check)",
+    )
+    sub_update.set_defaults(func=cmd_update)
+
+    # ---- _update-check (internal — hidden, detached-refresh worker for `cctally update`) ----
+    uc = sub.add_parser(
+        "_update-check",
+        help=argparse.SUPPRESS,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Internal subcommand: detached version-check worker spawned
+            by `cctally update` (spec §3.6). Touches the throttle
+            marker, fetches the latest version from npm or homebrew
+            depending on install method, and writes update-state.json.
+            Always returns 0; failures are logged to update.log.
+            """
+        ),
+    )
+    uc.set_defaults(func=cmd_update_check_internal)
+
     # Python 3.14 leaks `==SUPPRESS==` for hidden subparsers in --help; strip
     # the pseudo-action so the row disappears entirely. (The choice still
     # appears in the `{...}` choices header — there's no clean way to hide
@@ -33349,7 +34562,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("a subcommand is required")
     _print_migration_error_banner_if_needed(args)
     try:
-        return int(args.func(args))
+        rc = int(args.func(args))
     except KeyboardInterrupt:
         return 130
     except DowngradeDetected as exc:
@@ -33357,7 +34570,34 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except Exception as exc:  # pragma: no cover
         eprint(f"Error: {exc}")
-        return 1
+        rc = 1
+    # Post-command update hooks (spec §4.2). Best-effort: any exception
+    # in the banner / background-spawn path must not perturb the parent
+    # command's exit code or perceived output. Runs on both success and
+    # error paths so the user sees pending-update banners even when the
+    # current command failed.
+    try:
+        _post_command_update_hooks(getattr(args, "command", None), args)
+    except Exception:
+        pass
+    return rc
+
+
+def _post_command_update_hooks(command: str | None, args) -> None:
+    """Render the update banner if applicable + spawn the background
+    refresh check if its TTL has elapsed (spec §4.2 + §3.6).
+
+    Both paths are wrapped in their own try/except by the caller so a
+    failure here can't break the parent command. Reading state /
+    suppress / config is itself best-effort: a corrupt JSON file would
+    raise, but the outer caller swallows it."""
+    config = load_config()
+    state = _load_update_state()
+    suppress = _load_update_suppress()
+    if _should_show_update_banner(command, args, state, suppress, config):
+        sys.stderr.write(_format_update_banner(state) + "\n")
+    if _is_update_check_due(config):
+        _spawn_background_update_check()
 
 
 if __name__ == "__main__":

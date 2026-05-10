@@ -1,0 +1,1175 @@
+"""Pytest tests for the cctally update subcommand.
+
+Tests will mock subprocess / urllib / os.execvp as needed and use
+tmp_path for state files. Designed to run under pytest-xdist
+(xdist-safe — no shared mutable state between tests; each uses its
+own tmp_path / monkeypatch fixture).
+
+Task 0 lays down the `_now_utc()` chokepoint that every later
+update-related time query (TTL gates, remind_after.until_utc
+comparisons, log timestamps) routes through, so the
+CCTALLY_AS_OF env hook can pin time in fixture harnesses.
+
+Task 1 adds the data-model layer (spec §1): state-file helpers,
+suppress-file helpers, the update.lock contract with stale-PID
+recovery, and update.log rotation. Tests redirect the module-level
+path constants (UPDATE_STATE_PATH / UPDATE_LOCK_PATH / etc.) to
+per-test tmp_path dirs via monkeypatch.setitem on the loaded ns —
+mirrors the pattern in tests/conftest.py:redirect_paths.
+
+Task 2 adds install-method detection + npm-prefix caching (spec §2):
+`_detect_install_method()` and `_resolve_npm_prefix()` with a
+`mutate=False` keyword for the `--dry-run` path. Three-tier npm
+prefix resolution (env var → cached state with 7-day TTL → subprocess
+`npm prefix -g`). Tests build symlink layouts under tmp_path so the
+`/Cellar/cctally/` substring + `<prefix>/lib/node_modules/cctally/`
+prefix checks both fire on real on-disk paths, exercise the
+`mutate=False` no-write contract, and cover all three npm-prefix
+tiers including the subprocess-failure-returns-None path.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+import pytest
+
+from conftest import load_script
+
+
+@pytest.fixture(scope="module")
+def ns():
+    return load_script()
+
+
+@pytest.fixture()
+def update_paths(ns, tmp_path, monkeypatch):
+    """Redirect every UPDATE_* path constant to a per-test tmp_path dir.
+
+    Module-level constants in bin/cctally are bound at script-load time
+    (APP_DIR is `~/.local/share/cctally`), so setenv("HOME") alone won't
+    reroute them — we monkeypatch each constant in the loaded namespace
+    directly. Same pattern as tests/conftest.py:redirect_paths.
+    """
+    share = tmp_path / "cctally-data"
+    share.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setitem(ns, "APP_DIR", share)
+    monkeypatch.setitem(ns, "UPDATE_STATE_PATH", share / "update-state.json")
+    monkeypatch.setitem(ns, "UPDATE_SUPPRESS_PATH", share / "update-suppress.json")
+    monkeypatch.setitem(ns, "UPDATE_LOCK_PATH", share / "update.lock")
+    monkeypatch.setitem(ns, "UPDATE_LOG_PATH", share / "update.log")
+    monkeypatch.setitem(ns, "UPDATE_LOG_ROTATED_PATH", share / "update.log.1")
+    return share
+
+
+class TestNowUtcChokepoint:
+    """`_now_utc()` is the single time source for the update subcommand.
+
+    Honors the existing CCTALLY_AS_OF env hook (documented in CLAUDE.md
+    under the `project` subcommand and reused by `_command_as_of` /
+    `_share_now_utc`) so fixture harnesses can pin time deterministically.
+    """
+
+    def test_now_utc_honours_cctally_as_of(self, ns, monkeypatch):
+        monkeypatch.setenv("CCTALLY_AS_OF", "2026-05-10T12:00:00+00:00")
+        result = ns["_now_utc"]()
+        assert result == dt.datetime(
+            2026, 5, 10, 12, 0, 0, tzinfo=dt.timezone.utc
+        )
+
+    def test_now_utc_accepts_z_suffix(self, ns, monkeypatch):
+        """Z-suffix form mirrors the precedent set by `_command_as_of`
+        and `_share_now_utc` so fixture authors can use either form."""
+        monkeypatch.setenv("CCTALLY_AS_OF", "2026-05-10T12:00:00Z")
+        result = ns["_now_utc"]()
+        assert result == dt.datetime(
+            2026, 5, 10, 12, 0, 0, tzinfo=dt.timezone.utc
+        )
+
+    def test_now_utc_falls_back_to_real_clock(self, ns, monkeypatch):
+        monkeypatch.delenv("CCTALLY_AS_OF", raising=False)
+        result = ns["_now_utc"]()
+        # Sanity: tz-aware UTC, recent (within 5s of wall-clock now).
+        assert result.tzinfo is not None
+        assert result.utcoffset() == dt.timedelta(0)
+        assert abs(result.timestamp() - time.time()) < 5
+
+
+class TestUpdateStateIO:
+    """`_load_update_state` + `_save_update_state` (spec §1.2, §1.7).
+
+    Schema-versioned JSON; reader returns None when the file is absent
+    (so callers can distinguish "never checked" from "checked, no
+    update"); higher-than-known schema is a hard error so an older
+    cctally never silently drops fields a newer cctally wrote.
+    """
+
+    def test_load_returns_none_when_file_missing(self, ns, update_paths):
+        assert ns["_load_update_state"]() is None
+
+    def test_load_parses_v1_schema(self, ns, update_paths):
+        payload = {
+            "_schema": 1,
+            "current_version": "1.5.0",
+            "latest_version": "1.7.2",
+            "check_status": "ok",
+        }
+        ns["UPDATE_STATE_PATH"].write_text(json.dumps(payload), encoding="utf-8")
+        loaded = ns["_load_update_state"]()
+        assert loaded == payload
+
+    def test_load_refuses_higher_schema(self, ns, update_paths):
+        ns["UPDATE_STATE_PATH"].write_text(
+            json.dumps({"_schema": 2, "latest_version": "9.9.9"}),
+            encoding="utf-8",
+        )
+        with pytest.raises(ns["UpdateError"]):
+            ns["_load_update_state"]()
+
+    def test_save_atomic_rename_no_partial_file(self, ns, update_paths):
+        # Sanity-check the glob pattern itself: simulate a partial write
+        # by dropping a tmp sibling that matches `_save_update_state`'s
+        # actual naming scheme (`update-state.json.tmp.<PID>` — see
+        # bin/cctally:_save_update_state). If our glob misses this, the
+        # post-save assertion below would be vacuous and we'd never
+        # catch a real os.replace regression.
+        partial = update_paths / f"update-state.json.tmp.{os.getpid()}"
+        partial.write_text("partial", encoding="utf-8")
+        pre_save = list(update_paths.glob("update-state.json.tmp.*"))
+        assert partial in pre_save, (
+            "glob pattern 'update-state.json.tmp.*' must match the "
+            "tmp sibling shape produced by _save_update_state"
+        )
+        partial.unlink()
+
+        ns["_save_update_state"]({"_schema": 1, "current_version": "1.5.0"})
+        # Final file present, no .tmp siblings linger.
+        assert ns["UPDATE_STATE_PATH"].exists()
+        leftovers = list(update_paths.glob("update-state.json.tmp.*"))
+        assert leftovers == []
+
+    def test_save_then_load_round_trip(self, ns, update_paths):
+        payload = {
+            "_schema": 1,
+            "install": {
+                "method": "brew",
+                "realpath": "/opt/homebrew/Cellar/cctally/1.5.0/bin/cctally",
+                "detected_at_utc": "2026-05-10T12:34:56+00:00",
+                "npm_prefix": None,
+            },
+            "current_version": "1.5.0",
+            "latest_version": "1.7.2",
+            "latest_version_url": "https://example.invalid/v1.7.2",
+            "source": "github-formula",
+            "checked_at_utc": "2026-05-10T13:00:00+00:00",
+            "check_status": "ok",
+            "check_error": None,
+        }
+        ns["_save_update_state"](payload)
+        loaded = ns["_load_update_state"]()
+        assert loaded == payload
+
+
+class TestUpdateSuppressIO:
+    """`_load_update_suppress` + `_save_update_suppress` (spec §1.3).
+
+    Differs from state-file in that the loader returns a default empty
+    record when the file is absent — callers always get back a usable
+    dict so the banner predicate doesn't have to None-guard.
+    """
+
+    def test_load_returns_default_when_missing(self, ns, update_paths):
+        assert ns["_load_update_suppress"]() == {
+            "_schema": 1,
+            "skipped_versions": [],
+            "remind_after": None,
+        }
+
+    def test_round_trip(self, ns, update_paths):
+        payload = {
+            "_schema": 1,
+            "skipped_versions": ["1.7.0", "1.6.0"],
+            "remind_after": {
+                "version": "1.7.0",
+                "until_utc": "2026-05-17T13:00:00+00:00",
+            },
+        }
+        ns["_save_update_suppress"](payload)
+        assert ns["_load_update_suppress"]() == payload
+
+
+class TestUpdateLock:
+    """`_acquire_update_lock` / `_release_update_lock` (spec §1.4, §5.3).
+
+    The lock body records PID + start time + command; second concurrent
+    acquire raises UpdateInProgressError; a stale PID (the OS no longer
+    knows about it) gets reclaimed silently.
+    """
+
+    def test_acquire_creates_lock_with_pid(self, ns, update_paths):
+        fd = ns["_acquire_update_lock"]()
+        try:
+            body = ns["UPDATE_LOCK_PATH"].read_text(encoding="utf-8")
+            assert f"PID={os.getpid()}" in body
+            assert "STARTED_AT_UTC=" in body
+        finally:
+            ns["_release_update_lock"](fd)
+
+    def test_acquire_blocks_when_live_pid_holds_lock(self, ns, update_paths):
+        fd1 = ns["_acquire_update_lock"]()
+        try:
+            with pytest.raises(ns["UpdateInProgressError"]) as exc:
+                ns["_acquire_update_lock"]()
+            assert exc.value.prior_pid == os.getpid()
+        finally:
+            ns["_release_update_lock"](fd1)
+
+    def test_acquire_reclaims_stale_lock(self, ns, update_paths):
+        # PID that almost certainly does not exist on this host. POSIX
+        # PID space is unbounded above and `kill(pid, 0)` raises
+        # ProcessLookupError for any unallocated PID; 999_999_999 is
+        # comfortably outside any default `pid_max`.
+        ns["UPDATE_LOCK_PATH"].write_text(
+            "PID=999999999\nSTARTED_AT_UTC=stale\nCOMMAND=cctally update\n",
+            encoding="utf-8",
+        )
+        fd = ns["_acquire_update_lock"]()
+        try:
+            body = ns["UPDATE_LOCK_PATH"].read_text(encoding="utf-8")
+            assert f"PID={os.getpid()}" in body
+            assert "999999999" not in body
+        finally:
+            ns["_release_update_lock"](fd)
+
+    def test_release_unlinks_file(self, ns, update_paths):
+        fd = ns["_acquire_update_lock"]()
+        ns["_release_update_lock"](fd)
+        assert not ns["UPDATE_LOCK_PATH"].exists()
+
+
+class TestUpdateLog:
+    """`_rotate_update_log_if_needed` (spec §1.5).
+
+    Single rotation slot: when update.log crosses the 1 MB cap it
+    becomes update.log.1; a second rotation overwrites the first
+    (failed-install logs are preserved on disk only until the next
+    successful run grows the live file past 1 MB).
+    """
+
+    def test_rotation_at_1mb(self, ns, update_paths):
+        # Slightly over 1 MB to force a rotation.
+        threshold = ns["UPDATE_LOG_ROTATE_BYTES"]
+        body = b"x" * (threshold + 1024)
+        ns["UPDATE_LOG_PATH"].write_bytes(body)
+        ns["_rotate_update_log_if_needed"]()
+        assert not ns["UPDATE_LOG_PATH"].exists()
+        assert ns["UPDATE_LOG_ROTATED_PATH"].exists()
+        assert ns["UPDATE_LOG_ROTATED_PATH"].stat().st_size == len(body)
+
+    def test_two_rotations_overwrite_first(self, ns, update_paths):
+        threshold = ns["UPDATE_LOG_ROTATE_BYTES"]
+        # First rotation: log.log.1 receives the first body.
+        first = b"a" * (threshold + 16)
+        ns["UPDATE_LOG_PATH"].write_bytes(first)
+        ns["_rotate_update_log_if_needed"]()
+        # Second rotation: a new oversize live log overwrites .log.1.
+        second = b"b" * (threshold + 32)
+        ns["UPDATE_LOG_PATH"].write_bytes(second)
+        ns["_rotate_update_log_if_needed"]()
+        rotated = ns["UPDATE_LOG_ROTATED_PATH"].read_bytes()
+        assert rotated == second
+        assert not ns["UPDATE_LOG_PATH"].exists()
+
+    def test_no_rotation_below_threshold(self, ns, update_paths):
+        small = b"hello\n"
+        ns["UPDATE_LOG_PATH"].write_bytes(small)
+        ns["_rotate_update_log_if_needed"]()
+        assert ns["UPDATE_LOG_PATH"].exists()
+        assert ns["UPDATE_LOG_PATH"].read_bytes() == small
+        assert not ns["UPDATE_LOG_ROTATED_PATH"].exists()
+
+    def test_no_rotation_when_file_missing(self, ns, update_paths):
+        # Should be a no-op (not an error) when there is no log yet.
+        ns["_rotate_update_log_if_needed"]()
+        assert not ns["UPDATE_LOG_PATH"].exists()
+        assert not ns["UPDATE_LOG_ROTATED_PATH"].exists()
+
+
+class TestLogUpdateEvent:
+    """`_log_update_event` (spec §1.5).
+
+    Format: ``<iso-utc> <EVENT> k=v k=v ...\n``. Strings containing
+    spaces use ``repr`` quoting so the log stays grep-friendly; integers
+    are emitted bare so size/elapsed columns can be arithmetic-parsed.
+    """
+
+    def test_basic_format_emits_iso_event_kv(self, ns, update_paths, monkeypatch):
+        monkeypatch.setenv("CCTALLY_AS_OF", "2026-05-10T12:00:00+00:00")
+        p = update_paths / "events.log"
+        with open(p, "a", encoding="utf-8") as fd:
+            ns["_log_update_event"](fd, "EVENT", k1="v1", n=42)
+        line = p.read_text(encoding="utf-8")
+        assert line.endswith("\n")
+        # Exactly one line written.
+        assert line.count("\n") == 1
+        # iso-format UTC timestamp prefix (Task 0 _now_utc()).
+        assert line.startswith("2026-05-10T12:00:00+00:00 ")
+        assert " EVENT " in line
+        # Bare string-without-spaces and bare integer.
+        assert " k1=v1 " in line
+        assert " n=42" in line
+        # Integer must NOT be quoted.
+        assert " n='42'" not in line
+        assert ' n="42"' not in line
+
+    def test_strings_with_spaces_use_repr_quoting(self, ns, update_paths, monkeypatch):
+        monkeypatch.setenv("CCTALLY_AS_OF", "2026-05-10T12:00:00+00:00")
+        p = update_paths / "events.log"
+        cmd_value = "brew upgrade cctally"
+        with open(p, "a", encoding="utf-8") as fd:
+            ns["_log_update_event"](fd, "EXEC", cmd=cmd_value)
+        line = p.read_text(encoding="utf-8")
+        # Match whichever quoting repr() chose for that string.
+        expected_cmd = f"cmd={cmd_value!r}"
+        assert expected_cmd in line
+        # Bare-with-space form must NOT appear.
+        assert f"cmd={cmd_value} " not in line
+        assert not line.rstrip("\n").endswith(f"cmd={cmd_value}")
+
+
+# ---------------------------------------------------------------------------
+# Task 2 — install-method detection + npm-prefix caching (spec §2)
+# ---------------------------------------------------------------------------
+
+
+def _make_brew_layout(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Build an on-disk Cellar layout and return a symlink to the binary.
+
+    Mirrors the production layout exactly: real binary under
+    ``<root>/Cellar/cctally/<ver>/bin/cctally``, exposed via a symlink
+    at ``<root>/bin/cctally`` (the path that lands on $PATH after
+    ``brew install``). Tests point ``sys.argv[0]`` at the symlink so
+    ``os.path.realpath`` has to do the same resolution it does in
+    production for the `/Cellar/cctally/` substring check to hit.
+    """
+    real_dir = tmp_path / "Cellar" / "cctally" / "1.5.0" / "bin"
+    real_dir.mkdir(parents=True)
+    real_bin = real_dir / "cctally"
+    real_bin.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    link_dir = tmp_path / "bin"
+    link_dir.mkdir(parents=True, exist_ok=True)
+    link_bin = link_dir / "cctally"
+    link_bin.symlink_to(real_bin)
+    return link_bin
+
+
+def _make_npm_layout(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """Build an on-disk npm-prefix layout. Returns ``(symlink, prefix)``.
+
+    Real binary under ``<prefix>/lib/node_modules/cctally/bin/cctally``,
+    symlinked from ``<prefix>/bin/cctally``. Tests stash the prefix in
+    ``npm_config_prefix`` (tier-A short-circuit in `_resolve_npm_prefix`).
+    """
+    prefix = tmp_path / "npm-prefix"
+    real_dir = prefix / "lib" / "node_modules" / "cctally" / "bin"
+    real_dir.mkdir(parents=True)
+    real_bin = real_dir / "cctally"
+    real_bin.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    link_dir = prefix / "bin"
+    link_dir.mkdir(parents=True, exist_ok=True)
+    link_bin = link_dir / "cctally"
+    link_bin.symlink_to(real_bin)
+    return link_bin, prefix
+
+
+class TestInstallMethodDetection:
+    """`_detect_install_method` (spec §2.1).
+
+    Path-based heuristic: brew via the unambiguous `/Cellar/cctally/`
+    substring on `realpath(sys.argv[0])`; npm via prefix-match on
+    `<npm-prefix>/lib/node_modules/cctally/`; everything else is
+    "unknown" (the manual-fallback bucket per §2.4).
+    """
+
+    def test_brew_via_cellar_substring(self, ns, update_paths, tmp_path, monkeypatch):
+        link_bin = _make_brew_layout(tmp_path)
+        monkeypatch.setattr(sys, "argv", [str(link_bin)])
+        # Stub out the version reader so _persist_install_method_to_state
+        # doesn't touch the real CHANGELOG (and so the test stays
+        # deterministic across release cycles).
+        monkeypatch.setitem(
+            ns,
+            "_release_read_latest_release_version",
+            lambda: ("1.5.0", "2026-05-09"),
+        )
+        result = ns["_detect_install_method"]()
+        assert result.method == "brew"
+        assert "/Cellar/cctally/" in result.realpath
+        assert result.npm_prefix is None
+
+    def test_npm_via_prefix(self, ns, update_paths, tmp_path, monkeypatch):
+        link_bin, prefix = _make_npm_layout(tmp_path)
+        monkeypatch.setattr(sys, "argv", [str(link_bin)])
+        monkeypatch.setenv("npm_config_prefix", str(prefix))
+        monkeypatch.setitem(
+            ns,
+            "_release_read_latest_release_version",
+            lambda: ("1.5.0", "2026-05-09"),
+        )
+        result = ns["_detect_install_method"]()
+        assert result.method == "npm"
+        assert result.npm_prefix == str(prefix)
+        # realpath must point inside the npm-prefix layout (not the symlink).
+        assert "lib/node_modules/cctally" in result.realpath
+
+    def test_unknown_fallback(self, ns, update_paths, tmp_path, monkeypatch):
+        # Random path with no brew or npm signature.
+        rogue = tmp_path / "random" / "cctally"
+        rogue.parent.mkdir(parents=True)
+        rogue.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", [str(rogue)])
+        monkeypatch.delenv("npm_config_prefix", raising=False)
+        # No npm on PATH — point PATH at an empty dir so subprocess.run
+        # for `npm prefix -g` raises FileNotFoundError → tier-C returns
+        # None and the method falls through to "unknown".
+        empty_path = tmp_path / "empty-path"
+        empty_path.mkdir()
+        monkeypatch.setenv("PATH", str(empty_path))
+        monkeypatch.setitem(
+            ns,
+            "_release_read_latest_release_version",
+            lambda: ("1.5.0", "2026-05-09"),
+        )
+        result = ns["_detect_install_method"]()
+        assert result.method == "unknown"
+        assert result.npm_prefix is None
+
+    def test_mutate_false_skips_state_write(self, ns, update_paths, tmp_path, monkeypatch):
+        link_bin = _make_brew_layout(tmp_path)
+        monkeypatch.setattr(sys, "argv", [str(link_bin)])
+        monkeypatch.setitem(
+            ns,
+            "_release_read_latest_release_version",
+            lambda: ("1.5.0", "2026-05-09"),
+        )
+        # Sanity precondition.
+        assert not ns["UPDATE_STATE_PATH"].exists()
+        result = ns["_detect_install_method"](mutate=False)
+        assert result.method == "brew"
+        # The "touch nothing" contract: dry-run must not persist.
+        assert not ns["UPDATE_STATE_PATH"].exists()
+
+    def test_mutate_true_writes_state(self, ns, update_paths, tmp_path, monkeypatch):
+        link_bin = _make_brew_layout(tmp_path)
+        monkeypatch.setattr(sys, "argv", [str(link_bin)])
+        monkeypatch.setitem(
+            ns,
+            "_release_read_latest_release_version",
+            lambda: ("1.5.0", "2026-05-09"),
+        )
+        ns["_detect_install_method"](mutate=True)
+        assert ns["UPDATE_STATE_PATH"].exists()
+        loaded = ns["_load_update_state"]()
+        assert loaded is not None
+        assert loaded["install"]["method"] == "brew"
+        assert loaded["install"]["npm_prefix"] is None
+        assert "/Cellar/cctally/" in loaded["install"]["realpath"]
+        assert "detected_at_utc" in loaded["install"]
+        assert loaded["current_version"] == "1.5.0"
+
+    def test_persist_install_method_preserves_other_top_level_keys(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        # Pre-populate state with version-check fields plus a stale install
+        # block. The contract under test: writing a fresh install block must
+        # NOT clobber sibling top-level keys (latest_version,
+        # latest_version_url, checked_at_utc) — Task 3 will write those into
+        # the same file, and a regression to whole-state replacement would
+        # silently drop them. See spec §2.1 / Task 2 review follow-up.
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "latest_version": "1.6.0",
+            "latest_version_url": "https://example.com/release/1.6.0",
+            "checked_at_utc": "2026-05-09T12:00:00+00:00",
+            "install": {
+                "method": "unknown",
+                "realpath": "/stale/path",
+                "npm_prefix": None,
+                "detected_at_utc": "2026-05-01T00:00:00+00:00",
+            },
+        })
+
+        link_bin = _make_brew_layout(tmp_path)
+        monkeypatch.setattr(sys, "argv", [str(link_bin)])
+        monkeypatch.setitem(
+            ns,
+            "_release_read_latest_release_version",
+            lambda: ("1.5.0", "2026-05-09"),
+        )
+
+        ns["_detect_install_method"](mutate=True)
+
+        loaded = ns["_load_update_state"]()
+        assert loaded is not None
+        # Pre-populated top-level keys survive unchanged.
+        assert loaded["latest_version"] == "1.6.0"
+        assert loaded["latest_version_url"] == "https://example.com/release/1.6.0"
+        assert loaded["checked_at_utc"] == "2026-05-09T12:00:00+00:00"
+        # And the install block was overwritten with the freshly detected one.
+        assert loaded["install"]["method"] == "brew"
+        assert "/Cellar/cctally/" in loaded["install"]["realpath"]
+
+
+class TestNpmPrefixCaching:
+    """`_resolve_npm_prefix` (spec §2.2).
+
+    Three tiers: env var (cheap), cached state-file value within 7-d
+    TTL (one os.stat), subprocess `npm prefix -g` with a 2 s timeout
+    (200–300 ms cold). Tier-C success populates tier-B only when
+    ``mutate=True`` so the dry-run path doesn't persist surprise state.
+    """
+
+    def test_tier_a_env_var_short_circuit(self, ns, update_paths, tmp_path, monkeypatch):
+        # An existing dir; tier-A only honours real directories.
+        prefix_dir = tmp_path / "tier-a-prefix"
+        prefix_dir.mkdir()
+        monkeypatch.setenv("npm_config_prefix", str(prefix_dir))
+        # Even if a stale cached value exists, tier-A wins.
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "install": {
+                "npm_prefix": "/cached/should/not/be/returned",
+                "detected_at_utc": ns["_now_utc"]().isoformat(),
+            },
+        })
+        result = ns["_resolve_npm_prefix"]()
+        assert result == str(prefix_dir)
+
+    def test_tier_b_cached_within_ttl(self, ns, update_paths, tmp_path, monkeypatch):
+        monkeypatch.delenv("npm_config_prefix", raising=False)
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "install": {
+                "npm_prefix": "/cached/prefix",
+                "detected_at_utc": ns["_now_utc"]().isoformat(),
+            },
+        })
+
+        # Sentinel: subprocess.run MUST NOT be called when tier B hits.
+        def _boom(*a, **kw):
+            raise AssertionError(
+                "tier-C subprocess invoked despite tier-B cache hit"
+            )
+
+        monkeypatch.setattr(ns["subprocess"], "run", _boom)
+        result = ns["_resolve_npm_prefix"]()
+        assert result == "/cached/prefix"
+
+    def test_tier_c_subprocess_writes_cache_when_mutate(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("npm_config_prefix", raising=False)
+        # No cached state file; tier-C is the only path.
+        assert not ns["UPDATE_STATE_PATH"].exists()
+
+        calls: list[tuple] = []
+
+        def _fake_run(cmd, *a, **kw):
+            calls.append((tuple(cmd), kw))
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="/usr/local\n", stderr=""
+            )
+
+        monkeypatch.setattr(ns["subprocess"], "run", _fake_run)
+        result = ns["_resolve_npm_prefix"](mutate=True)
+        assert result == "/usr/local"
+        # The subprocess call wired through.
+        assert calls and calls[0][0] == ("npm", "prefix", "-g")
+        # Cache write happened — tier-B will hit on next call.
+        loaded = ns["_load_update_state"]()
+        assert loaded is not None
+        assert loaded["install"]["npm_prefix"] == "/usr/local"
+
+    def test_tier_c_failure_returns_none(self, ns, update_paths, tmp_path, monkeypatch):
+        monkeypatch.delenv("npm_config_prefix", raising=False)
+
+        def _fake_run(cmd, *a, **kw):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=1, stdout="", stderr="npm not found"
+            )
+
+        monkeypatch.setattr(ns["subprocess"], "run", _fake_run)
+        result = ns["_resolve_npm_prefix"](mutate=True)
+        assert result is None
+        # No state was written for a failed lookup.
+        loaded = ns["_load_update_state"]()
+        if loaded is not None:
+            assert "npm_prefix" not in loaded.get("install", {})
+
+
+# ---------------------------------------------------------------------------
+# Task 3 — version-check pipeline + hidden _update-check (spec §3)
+# ---------------------------------------------------------------------------
+
+
+class TestVersionCheckPipeline:
+    """Per-vector version checks + TTL gate + chokepoint (spec §3).
+
+    `_check_npm_latest_version` reads the npm-registry `latest` JSON;
+    `_check_brew_latest_version` reads the brew formula raw blob and
+    applies a priority regex chain. `_is_update_check_due` consults
+    update.check.{enabled,ttl_hours} config keys against the marker
+    file's mtime. `_do_update_check` is the single chokepoint:
+    touches the throttle marker FIRST (crash safety), then attempts
+    the per-vector fetch, preserving last-known-good `latest_version`
+    on any failure.
+    """
+
+    def test_fetch_url_parses_npm_registry(self, ns, update_paths, monkeypatch):
+        """`_check_npm_latest_version` returns the JSON `version` field."""
+        body = b'{"name": "cctally", "version": "1.7.2"}'
+        monkeypatch.setitem(
+            ns, "_fetch_url", lambda url, *, timeout=5.0: (200, body)
+        )
+        assert ns["_check_npm_latest_version"]() == "1.7.2"
+
+    def test_fetch_url_brew_regex_extracts_version_line(
+        self, ns, update_paths, monkeypatch
+    ):
+        """Tier-1 regex: explicit `version "X.Y.Z"` line."""
+        formula = (
+            'class Cctally < Formula\n'
+            '  desc "Local CLI for tracking Claude usage"\n'
+            '  homepage "https://github.com/omrikais/cctally"\n'
+            '  version "1.7.2"\n'
+            '  url "https://github.com/omrikais/cctally/archive/refs/tags/v9.9.9.tar.gz"\n'
+            'end\n'
+        ).encode("utf-8")
+        monkeypatch.setitem(
+            ns, "_fetch_url", lambda url, *, timeout=5.0: (200, formula)
+        )
+        # Tier 1 (`version "..."`) wins — even when the URL has a higher v9.9.9.
+        assert ns["_check_brew_latest_version"]() == "1.7.2"
+
+    def test_fetch_url_brew_regex_extracts_from_url_line(
+        self, ns, update_paths, monkeypatch
+    ):
+        """Tier-2 regex: archive URL `/vX.Y.Z.tar` form when no `version` line."""
+        formula = (
+            'class Cctally < Formula\n'
+            '  url "https://github.com/omrikais/cctally/archive/refs/tags/v1.7.2.tar.gz"\n'
+            'end\n'
+        ).encode("utf-8")
+        monkeypatch.setitem(
+            ns, "_fetch_url", lambda url, *, timeout=5.0: (200, formula)
+        )
+        assert ns["_check_brew_latest_version"]() == "1.7.2"
+
+    def test_fetch_url_brew_parse_failure_raises(
+        self, ns, update_paths, monkeypatch
+    ):
+        """No regex matches → `UpdateCheckParseError`."""
+        formula = b'class Cctally < Formula\n  homepage "x"\nend\n'
+        monkeypatch.setitem(
+            ns, "_fetch_url", lambda url, *, timeout=5.0: (200, formula)
+        )
+        with pytest.raises(ns["UpdateCheckParseError"]):
+            ns["_check_brew_latest_version"]()
+
+    def test_is_update_check_due_when_marker_missing(
+        self, ns, update_paths, monkeypatch
+    ):
+        """No marker file → due is True (first run after install)."""
+        monkeypatch.setitem(
+            ns, "UPDATE_CHECK_LAST_FETCH_PATH", update_paths / "update-check.last-fetch"
+        )
+        # Sanity: no marker.
+        assert not (update_paths / "update-check.last-fetch").exists()
+        config = {"update": {"check": {"enabled": True, "ttl_hours": 24}}}
+        assert ns["_is_update_check_due"](config) is True
+
+    def test_is_update_check_due_respects_ttl_hours(
+        self, ns, update_paths, monkeypatch
+    ):
+        """Marker just touched + ttl=48 → not due (within window)."""
+        marker = update_paths / "update-check.last-fetch"
+        monkeypatch.setitem(ns, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
+        marker.touch()
+        config = {"update": {"check": {"enabled": True, "ttl_hours": 48}}}
+        assert ns["_is_update_check_due"](config) is False
+
+    def test_is_update_check_due_disabled_by_config(
+        self, ns, update_paths, monkeypatch
+    ):
+        """`enabled=False` → never due (even with no marker)."""
+        marker = update_paths / "update-check.last-fetch"
+        monkeypatch.setitem(ns, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
+        # Sanity: no marker → would otherwise be True.
+        assert not marker.exists()
+        config = {"update": {"check": {"enabled": False, "ttl_hours": 24}}}
+        assert ns["_is_update_check_due"](config) is False
+
+    def test_do_update_check_writes_state_on_success(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        """Chokepoint success path: touches marker, writes state with
+        `check_status="ok"`, `latest_version`, `latest_version_url`."""
+        marker = update_paths / "update-check.last-fetch"
+        monkeypatch.setitem(ns, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
+        monkeypatch.setitem(
+            ns,
+            "_release_read_latest_release_version",
+            lambda: ("1.5.0", "2026-05-09"),
+        )
+        # Use the brew layout so detect_install_method resolves to "brew"
+        # (skips npm subprocess) and brew check is what gets called.
+        link_bin = _make_brew_layout(tmp_path)
+        monkeypatch.setattr(sys, "argv", [str(link_bin)])
+        monkeypatch.setitem(
+            ns, "_check_brew_latest_version", lambda: "1.7.2"
+        )
+
+        ns["_do_update_check"]()
+
+        # Marker present.
+        assert marker.exists()
+        # State written.
+        state = ns["_load_update_state"]()
+        assert state is not None
+        assert state["check_status"] == "ok"
+        assert state["latest_version"] == "1.7.2"
+        assert state["current_version"] == "1.5.0"
+        assert state["check_error"] is None
+        assert state["source"] == "github-formula"
+        assert "checked_at_utc" in state
+        # latest_version_url is the public-repo release tag URL.
+        assert state["latest_version_url"].endswith("/releases/tag/v1.7.2")
+
+    def test_do_update_check_preserves_last_known_good_on_network_error(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        """Network failure path: marker still touched (crash safety),
+        prior `latest_version` preserved, `check_status="fetch_failed"`."""
+        marker = update_paths / "update-check.last-fetch"
+        monkeypatch.setitem(ns, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
+        # Pre-populate state with a last-known-good `latest_version`.
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.5.0",
+            "latest_version": "1.7.0",
+            "latest_version_url": "https://example.com/v1.7.0",
+            "source": "github-formula",
+            "check_status": "ok",
+            "checked_at_utc": "2026-05-08T00:00:00+00:00",
+            "check_error": None,
+        })
+        monkeypatch.setitem(
+            ns,
+            "_release_read_latest_release_version",
+            lambda: ("1.5.0", "2026-05-09"),
+        )
+        link_bin = _make_brew_layout(tmp_path)
+        monkeypatch.setattr(sys, "argv", [str(link_bin)])
+
+        def _fail():
+            raise ns["UpdateCheckNetworkError"]("DNS resolution failed")
+
+        monkeypatch.setitem(ns, "_check_brew_latest_version", _fail)
+
+        ns["_do_update_check"]()
+
+        # Marker still present (crash-safety: touched FIRST).
+        assert marker.exists()
+        state = ns["_load_update_state"]()
+        assert state is not None
+        # Last-known-good preserved.
+        assert state["latest_version"] == "1.7.0"
+        # Status reflects the failure.
+        assert state["check_status"] == "fetch_failed"
+        assert state["check_error"] is not None
+        assert "DNS resolution failed" in state["check_error"]
+
+
+# ============================================================
+# Task 4 — banner predicate, cmd_update dispatch, --check rendering
+# ============================================================
+
+import argparse
+import io
+
+
+def _make_args(**kw) -> argparse.Namespace:
+    """Build an argparse.Namespace with defaults matching the dispatcher."""
+    base = dict(
+        command=kw.pop("command", "report"),
+        json=False,
+        emit_json=False,
+        status_line=False,
+        format=None,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+class _TTYStream:
+    """Minimal stdin-replacement that reports as a tty for predicate tests."""
+
+    def isatty(self):
+        return True
+
+    def write(self, _):
+        return 0
+
+    def flush(self):
+        return None
+
+
+class TestBannerPredicate:
+    """`_should_show_update_banner` (spec §4.2).
+
+    Composes over the existing chokepoints — `_BANNER_SUPPRESSED_COMMANDS`,
+    `_args_emit_json`, `_args_emit_machine_stdout`. Adds a parallel
+    suppression set covering `update` itself and the hidden
+    `_update-check` worker.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _force_tty(self, monkeypatch):
+        # The predicate gates on `sys.stderr.isatty()`; pytest's capture
+        # replaces stderr with a non-tty wrapper, so we patch isatty()
+        # directly on whatever stream is currently bound. Robust under
+        # both `pytest -s` (real tty) and `pytest` (captured).
+        monkeypatch.setattr(sys.stderr, "isatty", lambda: True, raising=False)
+
+    def _state_with_update(self):
+        return {
+            "_schema": 1,
+            "current_version": "1.5.0",
+            "latest_version": "1.7.2",
+            "check_status": "ok",
+        }
+
+    @pytest.mark.parametrize(
+        "command",
+        ["record-usage", "hook-tick", "sync-week", "cache-sync",
+         "_update-check", "update"],
+    )
+    def test_suppressed_on_hooks_and_internal(self, ns, command):
+        args = _make_args(command=command)
+        result = ns["_should_show_update_banner"](
+            command, args, self._state_with_update(), {}, {},
+        )
+        assert result is False
+
+    def test_shows_when_available(self, ns):
+        args = _make_args(command="report")
+        assert ns["_should_show_update_banner"](
+            "report", args, self._state_with_update(), {}, {},
+        ) is True
+
+    def test_suppressed_on_json(self, ns):
+        args = _make_args(command="report", json=True)
+        assert ns["_should_show_update_banner"](
+            "report", args, self._state_with_update(), {}, {},
+        ) is False
+
+    def test_suppressed_on_emit_json(self, ns):
+        # diff uses dest="emit_json"; the predicate must catch both.
+        args = _make_args(command="diff", emit_json=True)
+        assert ns["_should_show_update_banner"](
+            "diff", args, self._state_with_update(), {}, {},
+        ) is False
+
+    def test_suppressed_on_format_share(self, ns):
+        args = _make_args(command="report", format="html")
+        assert ns["_should_show_update_banner"](
+            "report", args, self._state_with_update(), {}, {},
+        ) is False
+
+    def test_suppressed_on_status_line(self, ns):
+        args = _make_args(command="forecast", status_line=True)
+        assert ns["_should_show_update_banner"](
+            "forecast", args, self._state_with_update(), {}, {},
+        ) is False
+
+    def test_suppressed_when_skipped(self, ns):
+        args = _make_args(command="report")
+        suppress = {"skipped_versions": ["1.7.2"]}
+        assert ns["_should_show_update_banner"](
+            "report", args, self._state_with_update(), suppress, {},
+        ) is False
+
+    def test_shown_when_newer_than_skipped(self, ns):
+        args = _make_args(command="report")
+        # Skipped 1.6.0; latest is 1.7.2 → still show.
+        suppress = {"skipped_versions": ["1.6.0"]}
+        assert ns["_should_show_update_banner"](
+            "report", args, self._state_with_update(), suppress, {},
+        ) is True
+
+    def test_suppressed_in_remind_window(self, ns, monkeypatch):
+        """remind_after.until_utc still in the future + version unchanged → hide."""
+        future = (
+            ns["_now_utc"]() + dt.timedelta(days=3)
+        ).isoformat()
+        suppress = {
+            "remind_after": {"version": "1.7.2", "until_utc": future},
+        }
+        args = _make_args(command="report")
+        assert ns["_should_show_update_banner"](
+            "report", args, self._state_with_update(), suppress, {},
+        ) is False
+
+    def test_suppressed_when_disabled_in_config(self, ns):
+        config = {"update": {"check": {"enabled": False}}}
+        args = _make_args(command="report")
+        assert ns["_should_show_update_banner"](
+            "report", args, self._state_with_update(), {}, config,
+        ) is False
+
+    def test_no_banner_when_no_state(self, ns):
+        args = _make_args(command="report")
+        assert ns["_should_show_update_banner"](
+            "report", args, None, {}, {},
+        ) is False
+
+    def test_no_banner_when_versions_equal(self, ns):
+        args = _make_args(command="report")
+        state = {
+            "_schema": 1,
+            "current_version": "1.7.2",
+            "latest_version": "1.7.2",
+            "check_status": "ok",
+        }
+        assert ns["_should_show_update_banner"](
+            "report", args, state, {}, {},
+        ) is False
+
+
+class TestUpdateCmdDispatch:
+    """`cmd_update` dispatch + sub-handlers (spec §4.1, §4.3, §4.4).
+
+    Mode flags `--check` / `--skip` / `--remind-later` are mutually
+    exclusive. `--skip` defaults to `state.latest_version`;
+    `--remind-later` defaults to 7 days. Both write to
+    ``update-suppress.json`` via the existing helpers.
+    """
+
+    def test_skip_writes_suppress(self, ns, update_paths, capsys):
+        args = _make_args(
+            command="update",
+            check=False,
+            skip="1.7.2",
+            remind_later=None,
+            version=None,
+            dry_run=False,
+            force=False,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 0
+        suppress = ns["_load_update_suppress"]()
+        assert "1.7.2" in suppress.get("skipped_versions", [])
+        out = capsys.readouterr().out
+        assert "Skipped" in out and "1.7.2" in out
+
+    def test_skip_no_arg_uses_state_latest(self, ns, update_paths, capsys):
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.5.0",
+            "latest_version": "1.7.2",
+            "check_status": "ok",
+        })
+        args = _make_args(
+            command="update",
+            check=False,
+            skip=ns["SKIP_USE_STATE_LATEST"],
+            remind_later=None,
+            version=None,
+            dry_run=False,
+            force=False,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 0
+        suppress = ns["_load_update_suppress"]()
+        assert "1.7.2" in suppress.get("skipped_versions", [])
+
+    def test_skip_no_arg_no_state_errors(self, ns, update_paths, capsys):
+        args = _make_args(
+            command="update",
+            check=False,
+            skip=ns["SKIP_USE_STATE_LATEST"],
+            remind_later=None,
+            version=None,
+            dry_run=False,
+            force=False,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "no version" in err.lower() or "--check" in err
+
+    def test_remind_later_writes_until(self, ns, update_paths, capsys):
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.5.0",
+            "latest_version": "1.7.2",
+            "check_status": "ok",
+        })
+        args = _make_args(
+            command="update",
+            check=False,
+            skip=None,
+            remind_later=14,
+            version=None,
+            dry_run=False,
+            force=False,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 0
+        suppress = ns["_load_update_suppress"]()
+        assert suppress["remind_after"]["version"] == "1.7.2"
+        # until_utc is parseable + roughly 14 days from now
+        until = dt.datetime.fromisoformat(suppress["remind_after"]["until_utc"])
+        now = ns["_now_utc"]()
+        delta = until - now
+        assert dt.timedelta(days=13, hours=23) < delta < dt.timedelta(days=14, hours=1)
+
+    def test_remind_later_invalid_zero(self, ns, update_paths, capsys):
+        args = _make_args(
+            command="update",
+            check=False,
+            skip=None,
+            remind_later=0,
+            version=None,
+            dry_run=False,
+            force=False,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 2
+
+    def test_mutually_exclusive_flags(self, ns, update_paths, capsys):
+        # Per the dispatcher, having two mode flags set simultaneously
+        # short-circuits to exit 2 (argparse enforces this too, but the
+        # dispatcher's defence-in-depth check is what we exercise here).
+        args = _make_args(
+            command="update",
+            check=True,
+            skip="1.0.0",
+            remind_later=None,
+            version=None,
+            dry_run=False,
+            force=False,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 2
+
+    def test_check_json_includes_cooked_available(
+        self, ns, update_paths, monkeypatch, capsys
+    ):
+        # No force → no _do_update_check call required if state already exists.
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.5.0",
+            "latest_version": "1.7.2",
+            "latest_version_url": "https://example.com/v1.7.2",
+            "source": "npm-registry",
+            "check_status": "ok",
+            "checked_at_utc": "2026-05-09T00:00:00+00:00",
+            "check_error": None,
+            "install": {"method": "npm"},
+        })
+        args = _make_args(
+            command="update",
+            check=True,
+            skip=None,
+            remind_later=None,
+            version=None,
+            dry_run=False,
+            force=False,
+            json=True,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload["_schema"] == 1
+        assert payload["current_version"] == "1.5.0"
+        assert payload["latest_version"] == "1.7.2"
+        assert payload["available"] is True
+        assert payload["method"] == "npm"
+
+    def test_check_json_available_false_when_skipped(
+        self, ns, update_paths, capsys
+    ):
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.5.0",
+            "latest_version": "1.7.2",
+            "check_status": "ok",
+            "install": {"method": "npm"},
+        })
+        ns["_save_update_suppress"]({
+            "_schema": 1,
+            "skipped_versions": ["1.7.2"],
+        })
+        args = _make_args(
+            command="update",
+            check=True,
+            skip=None,
+            remind_later=None,
+            version=None,
+            dry_run=False,
+            force=False,
+            json=True,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        # Cooked: latest > current but the user skipped it → not "available".
+        assert payload["available"] is False
+
+    def test_install_path_brew_with_version_exits_2(
+        self, ns, update_paths, tmp_path, monkeypatch, capsys
+    ):
+        """`--version` is npm-only (brew has no versioned formulae)."""
+        link_bin = _make_brew_layout(tmp_path)
+        monkeypatch.setattr(sys, "argv", [str(link_bin)])
+        args = _make_args(
+            command="update",
+            check=False,
+            skip=None,
+            remind_later=None,
+            version="1.7.2",
+            dry_run=False,
+            force=False,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "brew" in err.lower() or "homebrew" in err.lower()
+
+    def test_install_path_invalid_version_exits_2(
+        self, ns, update_paths, tmp_path, monkeypatch, capsys
+    ):
+        link_bin, prefix = _make_npm_layout(tmp_path)
+        monkeypatch.setattr(sys, "argv", [str(link_bin)])
+        # Suppress real subprocess npm prefix lookup. _persist_install_method_to_state
+        # serializes npm_prefix as JSON, so it must be a string (not a Path).
+        monkeypatch.setitem(ns, "_resolve_npm_prefix", lambda **_: str(prefix))
+        args = _make_args(
+            command="update",
+            check=False,
+            skip=None,
+            remind_later=None,
+            version="not-a-semver",
+            dry_run=False,
+            force=False,
+        )
+        rc = ns["cmd_update"](args)
+        assert rc == 2

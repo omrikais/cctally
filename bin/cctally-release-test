@@ -27,6 +27,12 @@
 # resolves CHANGELOG_PATH via __file__.parent.parent inside private/,
 # so it reads/writes the scratch CHANGELOG.md (NOT cctally-dev's own).
 #
+# Scenarios run in parallel via xargs -P; each scenario's output is
+# buffered to $work/_output.log and flushed in stable alphabetical
+# order after all jobs complete, so PASS/FAIL lines and diff dumps
+# stay coherent per scenario. Override the job count with
+# CCTALLY_RELEASE_TEST_JOBS (defaults to detected CPU count).
+#
 # The summary line MUST end with `passed: N   failed: M` (two spaces) so
 # the cctally-test-all aggregator's awk parser picks up the counts.
 
@@ -82,58 +88,60 @@ trap 'rm -rf "$SCRATCH_DIR"' EXIT
     exit 1
 }
 
-pass_count=0
-fail_count=0
-
+# Collect scenarios. Skip underscore-prefixed dirs (`_assets/` for shared
+# tarball/binary fixtures) and respect CCTALLY_RELEASE_TEST_SCENARIO for
+# single-scenario runs (used by cctally-release-harness-isolation-test).
+scenario_names=()
 for dir in "$FIXTURES_DIR"/*/; do
     name=$(basename "$dir")
-    # Skip underscore-prefixed dirs (e.g. `_assets/` for shared
-    # tarball/binary fixtures consumed by Phase 5/6 scenarios).
     case "$name" in
         _*) continue ;;
     esac
-    # Optional single-scenario filter. Used by
-    # bin/cctally-release-harness-isolation-test to exercise just one
-    # leak-prone scenario without paying the full-suite cost.
     if [ -n "${CCTALLY_RELEASE_TEST_SCENARIO:-}" ] \
        && [ "$name" != "${CCTALLY_RELEASE_TEST_SCENARIO}" ]; then
         continue
     fi
-    expected_exit=$(cat "$dir/golden-exit.txt" | tr -d '\n')
-    expected_stdout=$(cat "$dir/golden-stdout-substr.txt" | tr -d '\n')
-    expected_stderr=$(cat "$dir/golden-stderr-substr.txt" | tr -d '\n')
+    scenario_names+=("$name")
+done
 
-    work="$SCRATCH_DIR/run/$name"
+# Per-scenario worker. Buffers all output to $work/_output.log and
+# writes PASS|FAIL to $work/_result.txt so the main thread can flush
+# results in stable alphabetical order after `xargs -P` completes.
+run_scenario() {
+    local name="$1"
+    local dir="$FIXTURES_DIR/$name/"
+    local work="$SCRATCH_DIR/run/$name"
+    local out="$work/_output.log"
+    local result_file="$work/_result.txt"
+
     mkdir -p "$work"
     cp "$SCRATCH_DIR/built/$name/setup.sh" "$work/setup.sh"
     cp "$SCRATCH_DIR/built/$name/run.sh" "$work/run.sh"
 
-    setup_log="$work/_setup.log"
+    local expected_exit expected_stdout expected_stderr
+    expected_exit=$(cat "$dir/golden-exit.txt" | tr -d '\n')
+    expected_stdout=$(cat "$dir/golden-stdout-substr.txt" | tr -d '\n')
+    expected_stderr=$(cat "$dir/golden-stderr-substr.txt" | tr -d '\n')
+
+    local setup_log="$work/_setup.log"
     if ! (cd "$work" && bash setup.sh "$REPO_ROOT") >"$setup_log" 2>&1; then
-        echo "FAIL [$name]: setup.sh exited non-zero"
-        echo "  setup output:"
-        sed 's/^/    /' "$setup_log"
-        fail_count=$((fail_count + 1))
-        continue
+        {
+            echo "FAIL [$name]: setup.sh exited non-zero"
+            echo "  setup output:"
+            sed 's/^/    /' "$setup_log"
+        } >"$out"
+        echo "FAIL" >"$result_file"
+        return 1
     fi
 
     # Run from inside private/. The release script's __file__ is
     # $work/private/bin/cctally; CHANGELOG_PATH thus resolves to
     # $work/private/CHANGELOG.md.
-    run_log="$work/_run.log"
+    local run_log="$work/_run.log"
     (cd "$work/private" && bash ../run.sh "$REPO_ROOT") >"$run_log" 2>&1
-    actual_exit=$?
+    local actual_exit=$?
 
-    # Normalize artifacts (run.sh wrote them under $work/_artifacts/).
-    artifact_dir="$work/_artifacts"
-    actual_stdout=""
-    actual_stderr=""
-    if [ -f "$artifact_dir/stdout.txt" ]; then
-        actual_stdout=$(cat "$artifact_dir/stdout.txt")
-    fi
-    if [ -f "$artifact_dir/stderr.txt" ]; then
-        actual_stderr=$(cat "$artifact_dir/stderr.txt")
-    fi
+    local artifact_dir="$work/_artifacts"
     if [ -f "$artifact_dir/exit.txt" ]; then
         # run.sh wrote the inner-process exit code (the release script's
         # exit code) to exit.txt. Use that for the comparison so the
@@ -143,8 +151,8 @@ for dir in "$FIXTURES_DIR"/*/; do
         actual_exit=$(cat "$artifact_dir/exit.txt" | tr -d '\n')
     fi
 
-    pass=true
-    fail_reasons=()
+    local pass=true
+    local fail_reasons=()
 
     if [ "$actual_exit" != "$expected_exit" ]; then
         pass=false
@@ -162,7 +170,7 @@ for dir in "$FIXTURES_DIR"/*/; do
     fi
 
     # Optional byte-exact CHANGELOG check.
-    cl_golden="$dir/golden-changelog.md"
+    local cl_golden="$dir/golden-changelog.md"
     if [ -f "$cl_golden" ] && [ -f "$artifact_dir/changelog.md" ]; then
         if ! diff -u "$cl_golden" "$artifact_dir/changelog.md" >/dev/null; then
             pass=false
@@ -172,7 +180,7 @@ for dir in "$FIXTURES_DIR"/*/; do
 
     # Optional byte-exact commit-msg check (with <SHA7> normalization
     # already applied by run.sh).
-    cm_golden="$dir/golden-commit-msg.txt"
+    local cm_golden="$dir/golden-commit-msg.txt"
     if [ -f "$cm_golden" ] && [ -f "$artifact_dir/commit-msg.txt" ]; then
         if ! diff -u "$cm_golden" "$artifact_dir/commit-msg.txt" >/dev/null; then
             pass=false
@@ -181,7 +189,7 @@ for dir in "$FIXTURES_DIR"/*/; do
     fi
 
     # Optional tag-annotation check.
-    ta_golden="$dir/golden-tag-annotation.txt"
+    local ta_golden="$dir/golden-tag-annotation.txt"
     if [ -f "$ta_golden" ] && [ -f "$artifact_dir/tag-annotation.txt" ]; then
         if ! diff -u "$ta_golden" "$artifact_dir/tag-annotation.txt" >/dev/null; then
             pass=false
@@ -191,7 +199,7 @@ for dir in "$FIXTURES_DIR"/*/; do
 
     # Optional byte-exact package.json check (post-stamp). Phase 1
     # co-stamps package.json; this golden pins the exact stamped bytes.
-    pj_golden="$dir/golden-package-json.json"
+    local pj_golden="$dir/golden-package-json.json"
     if [ -f "$pj_golden" ] && [ -f "$artifact_dir/package.json" ]; then
         if ! diff -u "$pj_golden" "$artifact_dir/package.json" >/dev/null; then
             pass=false
@@ -202,7 +210,7 @@ for dir in "$FIXTURES_DIR"/*/; do
     # Optional body-canonical-three-sources check. The run.sh writes
     # `body-equal.txt` containing "1" or "0"; the golden pins "1" so a
     # silent shape change in any of the three body sources fails fast.
-    be_golden="$dir/golden-body-equal.txt"
+    local be_golden="$dir/golden-body-equal.txt"
     if [ -f "$be_golden" ] && [ -f "$artifact_dir/body-equal.txt" ]; then
         if ! diff -u "$be_golden" "$artifact_dir/body-equal.txt" >/dev/null; then
             pass=false
@@ -213,7 +221,7 @@ for dir in "$FIXTURES_DIR"/*/; do
     # Optional gh-argv check (for gh phase scenarios). The run.sh
     # captures `gh-argv.log` from $work/gh-argv.log; the golden pins
     # the exact recorded sequence with paths/PIDs normalized.
-    ga_golden="$dir/golden-gh-argv.txt"
+    local ga_golden="$dir/golden-gh-argv.txt"
     if [ -f "$ga_golden" ] && [ -f "$artifact_dir/gh-argv.log" ]; then
         # Normalize paths under the harness scratch tree so the golden is
         # byte-stable across runs (mktemp paths differ; PIDs differ).
@@ -230,7 +238,7 @@ for dir in "$FIXTURES_DIR"/*/; do
     # Optional npm-invocations check (Phase 5 scenarios). The run.sh
     # captures `npm-invocations.log` (the fake-npm's argv recording, one
     # invocation per line, in order). Golden pins the exact call shape.
-    ni_golden="$dir/golden-npm-invocations.txt"
+    local ni_golden="$dir/golden-npm-invocations.txt"
     if [ -f "$ni_golden" ] && [ -f "$artifact_dir/npm-invocations.log" ]; then
         if ! diff -u "$ni_golden" "$artifact_dir/npm-invocations.log" >/dev/null; then
             pass=false
@@ -243,12 +251,13 @@ for dir in "$FIXTURES_DIR"/*/; do
     # release. Golden is a substring (multi-line OK) — covers the
     # `url "..."` + `sha256 "..."` lines without pinning the entire
     # template render.
-    fs_golden="$dir/golden-formula-substr.txt"
+    local fs_golden="$dir/golden-formula-substr.txt"
     if [ -f "$fs_golden" ]; then
-        actual_formula=""
+        local actual_formula=""
         if [ -f "$artifact_dir/formula.rb" ]; then
             actual_formula=$(cat "$artifact_dir/formula.rb")
         fi
+        local expected_formula
         expected_formula=$(cat "$fs_golden")
         if ! grep -qF -- "$expected_formula" <<<"$actual_formula"; then
             pass=false
@@ -257,9 +266,12 @@ for dir in "$FIXTURES_DIR"/*/; do
     fi
 
     if $pass; then
-        echo "PASS [$name]"
-        pass_count=$((pass_count + 1))
-    else
+        echo "PASS [$name]" >"$out"
+        echo "PASS" >"$result_file"
+        return 0
+    fi
+
+    {
         echo "FAIL [$name]: ${fail_reasons[*]}"
         echo "  actual exit:   $actual_exit"
         echo "  actual stdout:"
@@ -320,6 +332,49 @@ for dir in "$FIXTURES_DIR"/*/; do
                     ;;
             esac
         done
+    } >"$out"
+    echo "FAIL" >"$result_file"
+    return 1
+}
+
+# Determine job count. CCTALLY_RELEASE_TEST_JOBS overrides; default to
+# detected logical CPU count. xargs -P 0 would mean unbounded, which we
+# do NOT want — fall back to 4 if detection fails.
+if [ -n "${CCTALLY_RELEASE_TEST_JOBS:-}" ]; then
+    JOBS="$CCTALLY_RELEASE_TEST_JOBS"
+else
+    JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null \
+        || sysctl -n hw.ncpu 2>/dev/null \
+        || echo 4)
+fi
+
+# Export everything run_scenario references — bash -c starts a fresh
+# subshell that doesn't inherit shell vars or functions otherwise.
+export FIXTURES_DIR SCRATCH_DIR REPO_ROOT
+export -f run_scenario
+
+# Dispatch in parallel. Each scenario's full output is buffered into
+# $work/_output.log; the main thread flushes them in stable order below.
+if [ "${#scenario_names[@]}" -gt 0 ]; then
+    printf '%s\n' "${scenario_names[@]}" \
+        | xargs -n1 -P "$JOBS" -I{} \
+            bash -c 'set -uo pipefail; run_scenario "$@"' _ {}
+fi
+
+# Flush per-scenario output in stable (alphabetical) order, tally results.
+pass_count=0
+fail_count=0
+for name in "${scenario_names[@]}"; do
+    work="$SCRATCH_DIR/run/$name"
+    if [ -f "$work/_output.log" ]; then
+        cat "$work/_output.log"
+    fi
+    if [ -f "$work/_result.txt" ] && [ "$(cat "$work/_result.txt")" = "PASS" ]; then
+        pass_count=$((pass_count + 1))
+    else
+        if [ ! -f "$work/_result.txt" ]; then
+            echo "FAIL [$name]: no result file (worker crashed before writing)"
+        fi
         fail_count=$((fail_count + 1))
     fi
 done

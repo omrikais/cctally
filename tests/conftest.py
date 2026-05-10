@@ -19,6 +19,11 @@ def _script_path() -> pathlib.Path:
 # exec() ~16ms; the 26K-line script is reparsed 335+ times in a full
 # pytest run, so caching the code object cuts ~50s off suite wallclock.
 # Each test still gets a fresh namespace via exec(), preserving isolation.
+# Under pytest-xdist (`pytest -n <N>`) each worker is a fresh Python
+# process, so this cache is per-worker — the compile cost is paid N
+# times instead of once. That's a small constant-cost regression
+# (~146ms × N) which is well within the parallel speedup; see
+# tests/requirements-dev.txt for the optional xdist dep.
 _SCRIPT_PATH = _script_path()
 _SCRIPT_CODE = compile(_SCRIPT_PATH.read_text(), str(_SCRIPT_PATH), "exec")
 

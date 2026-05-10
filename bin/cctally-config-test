@@ -1,11 +1,34 @@
 #!/usr/bin/env bash
 # Validates the `cctally config` subcommand.
 # Each test runs against a fresh HOME so config.json starts empty.
+#
+# The flat 33-test outer flow stays sequential — many tests deliberately
+# share $home across the test boundary for a set→get→unset→get
+# narrative (e.g. tests 2–8, 22–29, 30–33). The three concurrent-writer
+# stress loops (tests 10, 11, 20) parallelize their iteration loops via
+# `xargs -P` because each iteration is fully independent (own mktemp
+# dir, own concurrent writer fan-out). Cap with CCTALLY_TEST_JOBS
+# (default = host CPU count, =1 forces serial). Per-iteration failure
+# detail is buffered and emitted in numeric order so log output stays
+# coherent under parallelism.
 
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$REPO_ROOT/bin/cctally"
+
+default_jobs() {
+    local n
+    n=$(sysctl -n hw.ncpu 2>/dev/null) || n=$(nproc 2>/dev/null) || n=4
+    echo "$n"
+}
+JOBS=${CCTALLY_TEST_JOBS:-$(default_jobs)}
+
+# Scratch root for the three parallelized-iteration tests' per-run
+# verdict files. One subdir per test (test10, test11, test20).
+TALLY_ROOT=$(mktemp -d -t cctally-config-test.XXXXXX)
+trap 'rm -rf "$TALLY_ROOT"' EXIT
+export TALLY_ROOT BIN
 
 pass_count=0
 fail_count=0
@@ -116,19 +139,42 @@ rm -rf "$home"
 # 10. Concurrent set (2 writers): both writes succeed; final value is one of them.
 # Loops 30 times to exercise the race window — pre-fix this failed ~25% of runs
 # (issue #17). With config_writer_lock + atomic save_config, must be 30/30.
-runs10=30
-fail10=0
-for run in $(seq 1 "$runs10"); do
+# Iterations parallelized via xargs -P; each iteration is independent
+# (own mktemp, own concurrent writer fan-out, own verdict file).
+_test10_iter() {
+    local run="$1"
+    local home
     home=$(mktemp -d)
     ( HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz America/New_York >/dev/null ) &
     ( HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz Asia/Jerusalem >/dev/null ) &
     wait
+    local final
     final=$(HOME="$home" TZ=Etc/UTC "$BIN" config get display.tz)
     case "$final" in
-        display.tz=America/New_York|display.tz=Asia/Jerusalem) :;;
-        *) fail10=$((fail10 + 1)); echo "  run $run: $final" ;;
+        display.tz=America/New_York|display.tz=Asia/Jerusalem)
+            echo "OK" > "$TALLY_ROOT/test10/run-$run"
+            ;;
+        *)
+            printf 'FAIL\n  run %s: %s\n' "$run" "$final" > "$TALLY_ROOT/test10/run-$run"
+            ;;
     esac
     rm -rf "$home"
+}
+export -f _test10_iter
+
+runs10=30
+mkdir -p "$TALLY_ROOT/test10"
+seq 1 "$runs10" \
+    | xargs -n1 -P "$JOBS" -I{} bash -c 'set -uo pipefail; _test10_iter "$@"' _ {}
+
+fail10=0
+for run in $(seq 1 "$runs10"); do
+    f="$TALLY_ROOT/test10/run-$run"
+    if [ ! -f "$f" ] || ! head -1 "$f" | grep -q '^OK$'; then
+        fail10=$((fail10 + 1))
+        # Emit any captured detail line(s) below the FAIL marker.
+        [ -f "$f" ] && tail -n +2 "$f"
+    fi
 done
 if [ "$fail10" -eq 0 ]; then
     echo "PASS concurrent set last-write-wins (2 writers, $runs10 runs)"
@@ -141,25 +187,44 @@ fi
 # 11. Concurrent set (5 writers): all five fire simultaneously; final value
 # must be one of the five candidates. Defends against a future regression
 # that survives the 2-writer test but fails under heavier contention.
-runs11=20
-fail11=0
-candidates="America/New_York Asia/Jerusalem Europe/London Australia/Sydney America/Los_Angeles"
-for run in $(seq 1 "$runs11"); do
+# Iterations parallelized via xargs -P (see _test10_iter rationale).
+_test11_iter() {
+    local run="$1"
+    local home
     home=$(mktemp -d)
+    local candidates="America/New_York Asia/Jerusalem Europe/London Australia/Sydney America/Los_Angeles"
+    local tz
     for tz in $candidates; do
         ( HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz "$tz" >/dev/null ) &
     done
     wait
+    local final
     final=$(HOME="$home" TZ=Etc/UTC "$BIN" config get display.tz)
-    matched=0
+    local matched=0
     for tz in $candidates; do
         if [ "$final" = "display.tz=$tz" ]; then matched=1; break; fi
     done
-    if [ "$matched" -eq 0 ]; then
-        fail11=$((fail11 + 1))
-        echo "  run $run: $final"
+    if [ "$matched" -eq 1 ]; then
+        echo "OK" > "$TALLY_ROOT/test11/run-$run"
+    else
+        printf 'FAIL\n  run %s: %s\n' "$run" "$final" > "$TALLY_ROOT/test11/run-$run"
     fi
     rm -rf "$home"
+}
+export -f _test11_iter
+
+runs11=20
+mkdir -p "$TALLY_ROOT/test11"
+seq 1 "$runs11" \
+    | xargs -n1 -P "$JOBS" -I{} bash -c 'set -uo pipefail; _test11_iter "$@"' _ {}
+
+fail11=0
+for run in $(seq 1 "$runs11"); do
+    f="$TALLY_ROOT/test11/run-$run"
+    if [ ! -f "$f" ] || ! head -1 "$f" | grep -q '^OK$'; then
+        fail11=$((fail11 + 1))
+        [ -f "$f" ] && tail -n +2 "$f"
+    fi
 done
 if [ "$fail11" -eq 0 ]; then
     echo "PASS concurrent set last-write-wins (5 writers, $runs11 runs)"
@@ -342,27 +407,67 @@ rm -rf "$home"
 
 # 20. Concurrent unset (2 writers): both exit 0, file remains valid JSON.
 # Mirrors test 10's display.tz race — same writer-lock, same atomic save.
-runs20=20
-fail20=0
-for run in $(seq 1 "$runs20"); do
+# Iterations parallelized via xargs -P (see _test10_iter rationale).
+_test20_iter() {
+    local run="$1"
+    local home
     home=$(mktemp -d)
     HOME="$home" TZ=Etc/UTC "$BIN" config set alerts.enabled true >/dev/null
     ( HOME="$home" TZ=Etc/UTC "$BIN" config unset alerts.enabled >/dev/null ) &
     ( HOME="$home" TZ=Etc/UTC "$BIN" config unset alerts.enabled >/dev/null ) &
     wait
+    local final
     final=$(HOME="$home" TZ=Etc/UTC "$BIN" config get alerts.enabled 2>&1)
+    local fails=0
+    local detail=""
     case "$final" in
         alerts.enabled=false) :;;
-        *) fail20=$((fail20 + 1)); echo "  run $run: $final" ;;
+        *) fails=$((fails + 1)); detail+=$(printf '  run %s: %s\n' "$run" "$final") ;;
     esac
-    # Validate the file is still parseable JSON.
     if [ -f "$home/.local/share/cctally/config.json" ]; then
         if ! python3 -c "import json,sys; json.load(open('$home/.local/share/cctally/config.json'))" 2>/dev/null; then
-            fail20=$((fail20 + 1))
-            echo "  run $run: config.json not valid JSON"
+            fails=$((fails + 1))
+            detail+=$(printf '  run %s: config.json not valid JSON\n' "$run")
         fi
     fi
+    if [ "$fails" -eq 0 ]; then
+        echo "OK" > "$TALLY_ROOT/test20/run-$run"
+    else
+        # First line: FAIL plus the count this iteration contributed
+        # (unset can fail on both predicates within one run, so encode
+        # the per-iteration count rather than implying a single failure).
+        printf 'FAIL %d\n%s' "$fails" "$detail" > "$TALLY_ROOT/test20/run-$run"
+    fi
     rm -rf "$home"
+}
+export -f _test20_iter
+
+runs20=20
+mkdir -p "$TALLY_ROOT/test20"
+seq 1 "$runs20" \
+    | xargs -n1 -P "$JOBS" -I{} bash -c 'set -uo pipefail; _test20_iter "$@"' _ {}
+
+fail20=0
+for run in $(seq 1 "$runs20"); do
+    f="$TALLY_ROOT/test20/run-$run"
+    if [ ! -f "$f" ]; then
+        fail20=$((fail20 + 1))
+        echo "  run $run: missing tally file (worker crashed)"
+        continue
+    fi
+    head1=$(head -1 "$f")
+    case "$head1" in
+        OK) ;;
+        FAIL\ *)
+            count=${head1#FAIL }
+            fail20=$((fail20 + count))
+            tail -n +2 "$f"
+            ;;
+        *)
+            fail20=$((fail20 + 1))
+            echo "  run $run: malformed tally ($head1)"
+            ;;
+    esac
 done
 if [ "$fail20" -eq 0 ]; then
     echo "PASS concurrent unset (2 writers, $runs20 runs)"
