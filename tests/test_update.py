@@ -1652,3 +1652,530 @@ class TestRunStreaming:
         log_text = log_path.read_text(encoding="utf-8")
         assert "STDOUT out" in log_text
         assert "STDERR err" in log_text
+
+
+# === Task 6: dashboard backend (UpdateWorker, endpoints, SSE) ===
+# Per-test we always re-load the script via load_script() so module-
+# level globals (_UPDATE_WORKER, ORIGINAL_SYS_ARGV/ORIGINAL_ENTRYPOINT)
+# start clean. The cached compiled-code in conftest keeps this cheap.
+
+import http.client
+import threading
+
+from conftest import load_script
+
+
+def _writable_npm_method(ns, tmp_path):
+    """Build a writable-npm-prefix InstallMethod for preflight to pass."""
+    prefix = tmp_path / "npm-prefix"
+    (prefix / "bin").mkdir(parents=True)
+    return ns["InstallMethod"](
+        method="npm",
+        realpath=str(prefix / "lib" / "node_modules" / "cctally" / "bin" / "cctally"),
+        npm_prefix=str(prefix),
+    )
+
+
+def _drain_stream(worker, run_id, *, timeout_s=5.0):
+    """Drain the SSE generator until it returns. Bounded to avoid hangs."""
+    out: list[dict] = []
+    deadline = time.monotonic() + timeout_s
+    gen = worker.stream(run_id)
+    for ev in gen:
+        out.append(ev)
+        if ev.get("type") in ("execvp", "error_event", "done"):
+            break
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"stream drain exceeded {timeout_s}s; got {out!r}"
+            )
+    return out
+
+
+class TestUpdateWorker:
+    """`UpdateWorker` — single-slot orchestrator + SSE event queue.
+
+    Spec §5.6 invariants:
+      - First start → (True, run_id_a); concurrent start → (False, run_id_a)
+      - Subprocess failure → no execvp; ``done success=False`` event
+      - Subprocess success → ``execvp`` event + os.execvp called with
+        the resolved entrypoint (npm shim re-entry path per §5.7).
+    """
+
+    def test_single_slot_concurrent_start_returns_in_progress_id(
+        self, tmp_path, monkeypatch
+    ):
+        ns = load_script()
+        # Block _run_streaming on a gate so the first run holds the slot
+        # while we attempt a second start. Returns 0 to keep the worker
+        # running into execvp territory; we'll never actually reach
+        # execvp because we don't unblock.
+        gate = threading.Event()
+        unblock = threading.Event()
+        # Sentinel so the first run can reach _run_streaming after
+        # preflight + lock; we use a pre-built writable npm method.
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(
+            ns, "_detect_install_method", lambda mutate=True: method
+        )
+        # Stub the lock helpers so we don't touch filesystem locks.
+        monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 12345)
+        monkeypatch.setitem(ns, "_release_update_lock", lambda fd: None)
+        # update.log path → tmp.
+        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+
+        def blocking_run_streaming(cmd, *, on_stdout, on_stderr, log_fd):
+            gate.set()
+            unblock.wait(5)
+            return 0  # never reached if test unblocks; finishes via teardown
+
+        monkeypatch.setitem(ns, "_run_streaming", blocking_run_streaming)
+        # Block execvp so we don't replace the test process. Returning
+        # None mirrors the real syscall's "never returns" contract well
+        # enough for the worker thread to unwind cleanly.
+        monkeypatch.setattr(ns["os"], "execvp", lambda *_a, **_kw: None)
+
+        worker = ns["UpdateWorker"]()
+        ok_a, rid_a = worker.start(None)
+        assert ok_a is True
+        # Wait for the first run to actually be inside _run_streaming
+        # (i.e. past preflight + lock acquisition).
+        assert gate.wait(5), "first run never reached the blocking step"
+
+        ok_b, rid_b = worker.start(None)
+        assert ok_b is False
+        assert rid_b == rid_a, "second start must echo the in-progress id"
+
+        # Tear down: unblock so the worker thread can finish.
+        unblock.set()
+
+    def test_failure_emits_done_event_and_skips_execvp(
+        self, tmp_path, monkeypatch
+    ):
+        ns = load_script()
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(
+            ns, "_detect_install_method", lambda mutate=True: method
+        )
+        monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 1)
+        released: list[int] = []
+        monkeypatch.setitem(
+            ns, "_release_update_lock", lambda fd: released.append(fd)
+        )
+        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+
+        # Subprocess returns non-zero — must NOT call execvp.
+        monkeypatch.setitem(
+            ns, "_run_streaming",
+            lambda cmd, *, on_stdout, on_stderr, log_fd: 1,
+        )
+        execvp_calls: list[tuple] = []
+        monkeypatch.setattr(
+            ns["os"], "execvp",
+            lambda *args, **kw: execvp_calls.append((args, kw)),
+        )
+
+        worker = ns["UpdateWorker"]()
+        ok, run_id = worker.start(None)
+        assert ok is True
+        events = _drain_stream(worker, run_id, timeout_s=5.0)
+
+        types = [ev.get("type") for ev in events]
+        assert "step" in types
+        assert "exit" in types
+        # Must end with done success=False.
+        terminal = events[-1]
+        assert terminal == {"type": "done", "success": False}
+        # And execvp must NOT have been called.
+        assert execvp_calls == []
+        # Lock release happens in the worker's finally clause AFTER the
+        # final SSE event flush — wait for ``current_run_id`` to clear
+        # rather than racing the assertion.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if worker.status()["current_run_id"] is None:
+                break
+            time.sleep(0.01)
+        assert released == [1]
+
+    def test_success_calls_execvp_with_resolved_entrypoint(
+        self, tmp_path, monkeypatch
+    ):
+        ns = load_script()
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(
+            ns, "_detect_install_method", lambda mutate=True: method
+        )
+        monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 7)
+        released: list[int] = []
+        monkeypatch.setitem(
+            ns, "_release_update_lock", lambda fd: released.append(fd)
+        )
+        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setitem(
+            ns, "_run_streaming",
+            lambda cmd, *, on_stdout, on_stderr, log_fd: 0,
+        )
+
+        # Pre-set the boot-captured globals as cmd_dashboard would.
+        monkeypatch.setitem(ns, "ORIGINAL_SYS_ARGV", ["cctally", "dashboard"])
+        monkeypatch.setitem(
+            ns, "ORIGINAL_ENTRYPOINT", "/opt/homebrew/bin/cctally"
+        )
+
+        captured: list[tuple[str, list[str]]] = []
+
+        # Real ``os.execvp`` never returns (it replaces the process).
+        # In tests we record the call and return None — the worker
+        # thread then falls through to its ``finally`` block and exits
+        # cleanly, avoiding pytest's unhandled-thread-exception warning.
+        def fake_execvp(path, argv):
+            captured.append((path, list(argv)))
+            return None
+
+        monkeypatch.setattr(ns["os"], "execvp", fake_execvp)
+        # Drop the SSE-flush sleep so the test doesn't pay 500 ms.
+        monkeypatch.setattr(ns["time"], "sleep", lambda _s: None)
+
+        worker = ns["UpdateWorker"]()
+        ok, run_id = worker.start(None)
+        assert ok is True
+        events = _drain_stream(worker, run_id, timeout_s=5.0)
+
+        types = [ev.get("type") for ev in events]
+        assert "step" in types
+        assert "exit" in types
+        terminal = events[-1]
+        assert terminal["type"] == "execvp"
+        assert terminal["argv"] == [
+            "/opt/homebrew/bin/cctally", "dashboard"
+        ]
+        # The execvp event is emitted BEFORE the actual os.execvp call —
+        # wait for the worker thread to clear current_run_id (which
+        # happens in finally after fake_execvp's SystemExit unwinds).
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if worker.status()["current_run_id"] is None:
+                break
+            time.sleep(0.01)
+        # execvp was invoked with the resolved entrypoint.
+        assert captured == [(
+            "/opt/homebrew/bin/cctally",
+            ["/opt/homebrew/bin/cctally", "dashboard"],
+        )]
+        # Lock released exactly once on the success path (pre-execvp).
+        assert released == [7]
+
+    def test_status_reports_current_run_id(self, tmp_path, monkeypatch):
+        ns = load_script()
+        worker = ns["UpdateWorker"]()
+        assert worker.status() == {"current_run_id": None}
+
+    def test_resolve_execvp_target_falls_back_to_argv0(self, monkeypatch):
+        ns = load_script()
+        # Simulate `shutil.which("cctally")` returning None (rare path).
+        monkeypatch.setitem(
+            ns, "ORIGINAL_SYS_ARGV", ["/abs/path/to/cctally", "dashboard"]
+        )
+        monkeypatch.setitem(ns, "ORIGINAL_ENTRYPOINT", None)
+        target, argv = ns["_resolve_execvp_target"]()
+        assert target == "/abs/path/to/cctally"
+        assert argv == ["/abs/path/to/cctally", "dashboard"]
+
+
+class TestDashboardUpdateCheckThread:
+    """`_DashboardUpdateCheckThread` — independent of --no-sync.
+
+    The thread is intentionally minimal: poll, gate on
+    ``_is_update_check_due``, call ``_do_update_check``. Verify it
+    starts, ticks once, and stops cleanly on the stop event.
+    """
+
+    def test_runs_check_when_due_then_stops_on_event(
+        self, tmp_path, monkeypatch
+    ):
+        ns = load_script()
+        # Speed up: shorten the poll cadence so .wait() returns fast.
+        monkeypatch.setitem(ns, "UPDATE_DASHBOARD_CHECK_POLL_S", 0.05)
+        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+
+        called = threading.Event()
+        monkeypatch.setitem(ns, "_is_update_check_due", lambda cfg: True)
+        monkeypatch.setitem(ns, "_do_update_check", lambda: called.set())
+        # load_config: cheap stub.
+        monkeypatch.setitem(ns, "load_config", lambda: {})
+
+        stop_event = threading.Event()
+        t = ns["_DashboardUpdateCheckThread"](stop_event)
+        t.start()
+        try:
+            assert called.wait(2.0), "_do_update_check was not invoked"
+        finally:
+            stop_event.set()
+            t.join(timeout=2.0)
+        assert not t.is_alive()
+
+    def test_skips_when_not_due(self, tmp_path, monkeypatch):
+        ns = load_script()
+        monkeypatch.setitem(ns, "UPDATE_DASHBOARD_CHECK_POLL_S", 0.05)
+        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        called: list[int] = []
+        monkeypatch.setitem(ns, "_is_update_check_due", lambda cfg: False)
+        monkeypatch.setitem(
+            ns, "_do_update_check", lambda: called.append(1)
+        )
+        monkeypatch.setitem(ns, "load_config", lambda: {})
+
+        stop_event = threading.Event()
+        t = ns["_DashboardUpdateCheckThread"](stop_event)
+        t.start()
+        # Let it tick a couple of times.
+        time.sleep(0.2)
+        stop_event.set()
+        t.join(timeout=2.0)
+        assert called == [], "check ran despite gate returning False"
+
+
+class TestUpdateAPI:
+    """HTTP endpoint integration tests — POST /api/update,
+    POST /api/update/dismiss, GET /api/update/status, plus CSRF gate.
+
+    Mirrors the test_dashboard_csrf.py fixture pattern: spin a real
+    ThreadingHTTPServer, wire minimal class attributes, hit it via
+    http.client. The :class:`UpdateWorker` is replaced with a stub on
+    the namespace so the dashboard handler talks to it via
+    ``ns["_UPDATE_WORKER"]`` lookup at request time.
+    """
+
+    @staticmethod
+    def _wire_handler(ns):
+        ns["DashboardHTTPHandler"].hub = ns["SSEHub"]()
+        ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](
+            ns["_empty_dashboard_snapshot"]()
+        )
+        ns["DashboardHTTPHandler"].static_dir = ns["STATIC_DIR"]
+        ns["DashboardHTTPHandler"].sync_lock = threading.Lock()
+        ns["DashboardHTTPHandler"].run_sync_now = staticmethod(lambda: None)
+        ns["DashboardHTTPHandler"].run_sync_now_locked = staticmethod(
+            lambda: None
+        )
+        ns["DashboardHTTPHandler"].no_sync = False
+        ns["DashboardHTTPHandler"].display_tz_pref_override = None
+
+    @staticmethod
+    def _serve(ns, host="127.0.0.1"):
+        srv = ns["ThreadingHTTPServer"]((host, 0), ns["DashboardHTTPHandler"])
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        return srv, t, srv.server_address[1]
+
+    @staticmethod
+    def _post(host, port, path, body=b"{}", *, origin=None, host_header=None,
+              content_type="application/json"):
+        c = http.client.HTTPConnection(host, port, timeout=2)
+        c.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
+        c.putheader("Content-Type", content_type)
+        c.putheader("Content-Length", str(len(body)))
+        if origin:
+            c.putheader("Origin", f"http://{origin}")
+        if host_header:
+            c.putheader("Host", host_header)
+        c.endheaders()
+        c.send(body)
+        return c.getresponse()
+
+    def _install_stub_worker(self, ns, monkeypatch, *, busy=False):
+        """Swap in a deterministic stub UpdateWorker."""
+        class _StubWorker:
+            def __init__(self):
+                self.start_calls: list[str | None] = []
+                self.busy = busy
+
+            def start(self, version):
+                self.start_calls.append(version)
+                if self.busy:
+                    return (False, "rid-existing")
+                return (True, "rid-new")
+
+            def status(self):
+                return {"current_run_id": "rid-existing" if self.busy else None}
+
+            def stream(self, run_id):
+                # Minimal terminal so the SSE handler closes promptly.
+                yield {"type": "done", "success": True}
+
+        stub = _StubWorker()
+        monkeypatch.setitem(ns, "_UPDATE_WORKER", stub)
+        return stub
+
+    def test_post_update_accepts_returns_202_and_run_id(
+        self, tmp_path, monkeypatch
+    ):
+        ns = load_script()
+        from conftest import redirect_paths
+        redirect_paths(ns, monkeypatch, tmp_path)
+        self._wire_handler(ns)
+        stub = self._install_stub_worker(ns, monkeypatch, busy=False)
+        srv, t, port = self._serve(ns)
+        try:
+            r = self._post(
+                "127.0.0.1", port, "/api/update",
+                body=b"{}",
+                origin=f"127.0.0.1:{port}",
+                host_header=f"127.0.0.1:{port}",
+            )
+            assert r.status == 202, f"expected 202 got {r.status}"
+            payload = json.loads(r.read().decode("utf-8"))
+            assert payload == {"run_id": "rid-new"}
+            assert stub.start_calls == [None]
+        finally:
+            srv.shutdown()
+            t.join(timeout=2)
+
+    def test_post_update_409_when_busy(self, tmp_path, monkeypatch):
+        ns = load_script()
+        from conftest import redirect_paths
+        redirect_paths(ns, monkeypatch, tmp_path)
+        self._wire_handler(ns)
+        self._install_stub_worker(ns, monkeypatch, busy=True)
+        srv, t, port = self._serve(ns)
+        try:
+            r = self._post(
+                "127.0.0.1", port, "/api/update",
+                body=b"{}",
+                origin=f"127.0.0.1:{port}",
+                host_header=f"127.0.0.1:{port}",
+            )
+            assert r.status == 409
+            payload = json.loads(r.read().decode("utf-8"))
+            assert payload == {"run_id_in_progress": "rid-existing"}
+        finally:
+            srv.shutdown()
+            t.join(timeout=2)
+
+    def test_post_update_403_on_bad_origin(self, tmp_path, monkeypatch):
+        ns = load_script()
+        from conftest import redirect_paths
+        redirect_paths(ns, monkeypatch, tmp_path)
+        self._wire_handler(ns)
+        self._install_stub_worker(ns, monkeypatch, busy=False)
+        srv, t, port = self._serve(ns)
+        try:
+            r = self._post(
+                "127.0.0.1", port, "/api/update",
+                body=b"{}",
+                origin="evil.com",
+                host_header=f"127.0.0.1:{port}",
+            )
+            assert r.status == 403
+        finally:
+            srv.shutdown()
+            t.join(timeout=2)
+
+    def test_post_update_dismiss_skip_writes_suppress_and_204(
+        self, tmp_path, monkeypatch
+    ):
+        ns = load_script()
+        from conftest import redirect_paths
+        redirect_paths(ns, monkeypatch, tmp_path)
+        self._wire_handler(ns)
+        # No UpdateWorker needed for dismiss.
+        monkeypatch.setitem(ns, "_UPDATE_WORKER", None)
+        # Pre-stage update-state.json with a latest_version so
+        # SKIP_USE_STATE_LATEST resolves.
+        suppress_path = tmp_path / ".local" / "share" / "cctally"
+        monkeypatch.setitem(
+            ns, "UPDATE_STATE_PATH", suppress_path / "update-state.json"
+        )
+        monkeypatch.setitem(
+            ns, "UPDATE_SUPPRESS_PATH",
+            suppress_path / "update-suppress.json",
+        )
+        ns["UPDATE_STATE_PATH"].write_text(
+            json.dumps({"_schema": 1, "latest_version": "1.7.0"})
+        )
+
+        srv, t, port = self._serve(ns)
+        try:
+            r = self._post(
+                "127.0.0.1", port, "/api/update/dismiss",
+                body=json.dumps({"action": "skip"}).encode(),
+                origin=f"127.0.0.1:{port}",
+                host_header=f"127.0.0.1:{port}",
+            )
+            assert r.status == 204, f"expected 204 got {r.status}"
+        finally:
+            srv.shutdown()
+            t.join(timeout=2)
+
+        suppress = json.loads(ns["UPDATE_SUPPRESS_PATH"].read_text())
+        assert "1.7.0" in suppress.get("skipped_versions", [])
+
+    def test_post_update_dismiss_remind_writes_until_and_204(
+        self, tmp_path, monkeypatch
+    ):
+        ns = load_script()
+        from conftest import redirect_paths
+        redirect_paths(ns, monkeypatch, tmp_path)
+        self._wire_handler(ns)
+        monkeypatch.setitem(ns, "_UPDATE_WORKER", None)
+        share = tmp_path / ".local" / "share" / "cctally"
+        monkeypatch.setitem(
+            ns, "UPDATE_STATE_PATH", share / "update-state.json"
+        )
+        monkeypatch.setitem(
+            ns, "UPDATE_SUPPRESS_PATH", share / "update-suppress.json"
+        )
+        ns["UPDATE_STATE_PATH"].write_text(
+            json.dumps({"_schema": 1, "latest_version": "1.7.0"})
+        )
+
+        srv, t, port = self._serve(ns)
+        try:
+            r = self._post(
+                "127.0.0.1", port, "/api/update/dismiss",
+                body=json.dumps({"action": "remind", "days": 14}).encode(),
+                origin=f"127.0.0.1:{port}",
+                host_header=f"127.0.0.1:{port}",
+            )
+            assert r.status == 204
+        finally:
+            srv.shutdown()
+            t.join(timeout=2)
+
+        suppress = json.loads(ns["UPDATE_SUPPRESS_PATH"].read_text())
+        assert suppress["remind_after"]["version"] == "1.7.0"
+        assert "until_utc" in suppress["remind_after"]
+
+    def test_get_update_status_returns_state_and_worker(
+        self, tmp_path, monkeypatch
+    ):
+        ns = load_script()
+        from conftest import redirect_paths
+        redirect_paths(ns, monkeypatch, tmp_path)
+        self._wire_handler(ns)
+        self._install_stub_worker(ns, monkeypatch, busy=True)
+        share = tmp_path / ".local" / "share" / "cctally"
+        monkeypatch.setitem(
+            ns, "UPDATE_STATE_PATH", share / "update-state.json"
+        )
+        monkeypatch.setitem(
+            ns, "UPDATE_SUPPRESS_PATH", share / "update-suppress.json"
+        )
+        ns["UPDATE_STATE_PATH"].write_text(
+            json.dumps({"_schema": 1, "latest_version": "1.7.0"})
+        )
+
+        srv, t, port = self._serve(ns)
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            c.request("GET", "/api/update/status")
+            r = c.getresponse()
+            assert r.status == 200
+            body = json.loads(r.read().decode("utf-8"))
+        finally:
+            srv.shutdown()
+            t.join(timeout=2)
+        assert body["state"]["latest_version"] == "1.7.0"
+        assert body["current_run_id"] == "rid-existing"
+        assert "suppress" in body

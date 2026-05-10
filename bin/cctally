@@ -30,9 +30,11 @@ import dataclasses
 import datetime as dt
 import fcntl
 import hashlib
+import io
 import json
 import os
 import pathlib
+import queue
 import re
 import secrets
 import math
@@ -10531,14 +10533,6 @@ def _preflight_install(method: InstallMethod, version: str | None) -> None:
             f"  brew install https://github.com/{PUBLIC_REPO}/releases/download/v{version}/cctally-{version}.tar.gz"
         )
     if method.method == "npm":
-        # Defensive: Task-2 guarantees npm_prefix is set when method=="npm",
-        # so this is a `should never happen` branch. Still better than
-        # `os.path.join(None, "bin")` exploding inside an except clause.
-        if not method.npm_prefix:
-            raise UpdateError(
-                "npm install method detected but npm_prefix is empty "
-                "— rerun `cctally update --check --force` to refresh detection."
-            )
         prefix_bin = os.path.join(method.npm_prefix, "bin")
         if not os.access(prefix_bin, os.W_OK):
             raise UpdateError(
@@ -10685,6 +10679,230 @@ def _do_update_install(
     finally:
         _release_update_lock(lock_fd)
         _rotate_update_log_if_needed()
+
+
+# === Dashboard execvp re-entry (spec §5.7) ===
+# ORIGINAL_SYS_ARGV / ORIGINAL_ENTRYPOINT are captured at dashboard
+# server boot in cmd_dashboard. _resolve_execvp_target uses them to
+# return (entrypoint, exec_argv) for os.execvp:
+#
+#   - npm: entrypoint = <prefix>/bin/cctally → Node shim, which
+#     re-resolves CCTALLY_PYTHON before re-spawning Python (so a custom
+#     interpreter setting survives the restart).
+#   - brew: entrypoint = <brew>/bin/cctally → symlink into the
+#     post-upgrade Python script with its rewritten shebang.
+#   - Fallback when shutil.which("cctally") returned None: use
+#     sys.argv[0] directly. Loses the npm shim layer; we accept the
+#     degraded edge case rather than guess.
+ORIGINAL_SYS_ARGV: list[str] = []
+ORIGINAL_ENTRYPOINT: "str | None" = None
+
+
+def _resolve_execvp_target() -> tuple[str, list[str]]:
+    """Return (entrypoint, exec_argv) per spec §5.7.
+
+    Re-enters the npm shim by execvp'ing the PATH-resolved ``cctally``
+    (Node shim for npm, brew symlink for brew). Falls back to
+    ``sys.argv[0]`` only when ``shutil.which`` returned ``None`` at
+    dashboard boot (rare absolute-path invocation).
+    """
+    if ORIGINAL_ENTRYPOINT is not None:
+        return (
+            ORIGINAL_ENTRYPOINT,
+            [ORIGINAL_ENTRYPOINT, *ORIGINAL_SYS_ARGV[1:]],
+        )
+    return (ORIGINAL_SYS_ARGV[0], list(ORIGINAL_SYS_ARGV))
+
+
+class UpdateWorker:
+    """Single-slot dashboard-side update orchestrator (spec §5.6).
+
+    A single instance lives on the dashboard server (created in
+    cmd_dashboard, exposed as the module-level ``_UPDATE_WORKER``).
+    ``start()`` returns ``(True, run_id)`` on accept and
+    ``(False, current_run_id)`` when a run is already in progress —
+    serializes concurrent button clicks without taking the install lock
+    on the rejected path. ``_run`` runs preflight → lock → streamed
+    steps → execvp on success / error_event on failure / done on
+    non-zero subprocess exit. The ``released`` flag enforces the
+    idempotent-release contract from spec §5.6.1: success path releases
+    pre-execvp and skips the finally release; pre-execvp failure path
+    releases in finally.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._current_id: "str | None" = None
+        # run_id -> queue.Queue of event dicts. Each subscriber drains
+        # via ``stream(run_id)``; the worker thread enqueues via
+        # ``_emit``. A single subscriber per run is the dashboard
+        # contract; multi-subscriber broadcast is out of scope.
+        self._streams: dict[str, "queue.Queue"] = {}
+
+    def start(self, version: "str | None") -> tuple[bool, str]:
+        """Begin a run. Returns (accepted, run_id).
+
+        ``accepted=False`` when another run is in progress; the
+        returned ``run_id`` is the in-progress one (so the caller can
+        surface it as ``run_id_in_progress`` to the client).
+        """
+        with self._lock:
+            if self._current_id is not None:
+                return (False, self._current_id)
+            run_id = secrets.token_hex(8)
+            self._current_id = run_id
+            self._streams[run_id] = queue.Queue()
+        threading.Thread(
+            target=self._run, args=(run_id, version), daemon=True,
+            name="cctally-update-worker",
+        ).start()
+        return (True, run_id)
+
+    def status(self) -> dict:
+        """Return ``{"current_run_id": <run_id|None>}`` for /api/update/status."""
+        with self._lock:
+            return {"current_run_id": self._current_id}
+
+    def _emit(self, run_id: str, event: dict) -> None:
+        q = self._streams.get(run_id)
+        if q is not None:
+            q.put(event)
+
+    def stream(self, run_id: str):
+        """Generator yielding events for the given run_id.
+
+        Yields a ``{"type": "heartbeat"}`` event every 15 s of idle so
+        the SSE proxy / EventSource keep-alive stays warm. Closes
+        (returns) on the terminal events: ``execvp`` (success path),
+        ``error_event`` (preflight or other UpdateError), ``done``
+        (non-zero subprocess exit). Yields nothing and returns
+        immediately for unknown run_ids — the HTTP handler then closes
+        the SSE connection.
+        """
+        q = self._streams.get(run_id)
+        if q is None:
+            return
+        while True:
+            try:
+                ev = q.get(timeout=15)
+            except queue.Empty:
+                yield {"type": "heartbeat"}
+                continue
+            yield ev
+            if ev["type"] in ("execvp", "error_event", "done"):
+                return
+
+    def _run(self, run_id: str, version: "str | None") -> None:
+        lock_fd = None
+        released = False  # idempotent-release guard per §5.6.1
+        log_fd = None
+        try:
+            method = _detect_install_method(mutate=True)
+            _preflight_install(method, version)
+            UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            lock_fd = _acquire_update_lock()
+            log_fd = open(UPDATE_LOG_PATH, "a", encoding="utf-8")
+            _log_update_event(log_fd, "INSTALL_START", method=method.method)
+            for step_name, cmd in _build_update_steps(method, version):
+                self._emit(run_id, {"type": "step", "name": step_name})
+                _log_update_event(log_fd, "STEP_START", name=step_name)
+                rc = _run_streaming(
+                    cmd,
+                    on_stdout=lambda line, rid=run_id: self._emit(
+                        rid, {"type": "stdout", "data": line}
+                    ),
+                    on_stderr=lambda line, rid=run_id: self._emit(
+                        rid, {"type": "stderr", "data": line}
+                    ),
+                    log_fd=log_fd,
+                )
+                _log_update_event(log_fd, "STEP_EXIT", name=step_name, rc=rc)
+                self._emit(run_id, {"type": "exit", "rc": rc, "step": step_name})
+                if rc != 0:
+                    self._emit(run_id, {"type": "done", "success": False})
+                    return
+            _log_update_event(log_fd, "INSTALL_SUCCESS")
+            entrypoint, exec_argv = _resolve_execvp_target()
+            self._emit(run_id, {"type": "execvp", "argv": exec_argv})
+            try:
+                log_fd.close()
+            finally:
+                log_fd = None
+            # 0.5 s breathing room so the SSE pump flushes the final
+            # ``execvp`` event to the browser before we hand the
+            # process over to the new image. If the browser misses it
+            # the polling fallback (/api/update/status) covers reentry.
+            time.sleep(0.5)
+            _release_update_lock(lock_fd)
+            released = True
+            os.execvp(entrypoint, exec_argv)
+        except UpdateError as e:
+            self._emit(run_id, {"type": "error_event", "message": str(e)})
+        except Exception as e:
+            self._emit(
+                run_id, {"type": "error_event", "message": f"unexpected: {e!r}"}
+            )
+        finally:
+            if log_fd is not None:
+                try:
+                    log_fd.close()
+                except Exception:
+                    pass
+            if lock_fd is not None and not released:
+                try:
+                    _release_update_lock(lock_fd)
+                except Exception:
+                    pass
+            with self._lock:
+                self._current_id = None
+
+
+# Module-level singleton. Populated by cmd_dashboard on server boot;
+# consumed by DashboardHTTPHandler's /api/update* routes. Kept None
+# for non-dashboard subcommands so a stray test that loads the script
+# without booting the dashboard sees a clean uninitialized state.
+_UPDATE_WORKER: "UpdateWorker | None" = None
+
+
+class _DashboardUpdateCheckThread(threading.Thread):
+    """Dedicated update-check polling thread (spec §3.5).
+
+    Independent of the data-sync thread so it runs even under
+    ``--no-sync`` (codex review fix #5). Wakes once per
+    :data:`UPDATE_DASHBOARD_CHECK_POLL_S` (30 min), consults
+    :func:`_is_update_check_due`, runs :func:`_do_update_check` if so.
+    The poll cadence is NOT the network-call frequency — actual TTL
+    gate (default 24 h) lives in ``_is_update_check_due``. Disabling
+    via ``update.check.enabled = false`` is honoured inside the gate
+    so the thread becomes a no-op without needing teardown.
+    """
+
+    daemon = True
+
+    def __init__(self, stop_event: "threading.Event") -> None:
+        super().__init__(name="cctally-update-check")
+        self._stop = stop_event
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                config = load_config()
+                if _is_update_check_due(config):
+                    _do_update_check()
+            except Exception as e:
+                # Log but never propagate — this thread must keep
+                # ticking so a transient registry hiccup doesn't
+                # silently disable the polling cadence for the rest
+                # of the dashboard's lifetime.
+                try:
+                    UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    with open(UPDATE_LOG_PATH, "a", encoding="utf-8") as log_fd:
+                        _log_update_event(
+                            log_fd, "CHECK_FAILED", error=str(e)[:200]
+                        )
+                except Exception:
+                    pass
+            self._stop.wait(UPDATE_DASHBOARD_CHECK_POLL_S)
 
 
 def cmd_update(args) -> int:
@@ -31637,6 +31855,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_get_session_detail(path)
         elif path.startswith("/api/block/"):
             self._handle_get_block_detail(path)
+        elif path == "/api/update/status":
+            self._handle_get_update_status()
+        elif path.startswith("/api/update/stream/"):
+            self._handle_get_update_stream(path)
         else:
             self.send_error(404, "not found")
 
@@ -31648,6 +31870,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_post_settings()
         elif path == "/api/alerts/test":
             self._handle_post_alerts_test()
+        elif path == "/api/update":
+            self._handle_post_update()
+        elif path == "/api/update/dismiss":
+            self._handle_post_update_dismiss()
         else:
             self.send_error(404, "not found")
 
@@ -32329,6 +32555,194 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             pass
         finally:
             self.hub.unsubscribe(q)
+
+    # --- /api/update* (spec §5.6, §5.6.1, §5.7) ----------------------
+    # The four endpoints share the module-level singleton
+    # ``_UPDATE_WORKER`` which is created in ``cmd_dashboard``. POST
+    # routes pass through ``_check_origin_csrf`` (host-header parity);
+    # GET routes are read-only and skip CSRF intentionally so polling
+    # fallbacks survive odd Origin shapes (e.g. native browser tools).
+
+    def _read_update_post_body(self) -> "dict | None":
+        """Read + parse a small JSON body for /api/update* POSTs.
+
+        Empty body is allowed (returns ``{}``). Non-dict / malformed →
+        respond 400 and return ``None`` so the caller short-circuits.
+        Body is capped at 4 KB — same envelope as /api/settings.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        if length < 0 or length > 4096:
+            self._respond_json(400, {"error": "body too large (<=4 KB)"})
+            return None
+        if length == 0:
+            return {}
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._respond_json(400, {"error": "malformed json"})
+            return None
+        if not isinstance(payload, dict):
+            self._respond_json(400, {"error": "expected JSON object"})
+            return None
+        return payload
+
+    def _handle_post_update(self) -> None:
+        """POST /api/update — kick off an in-process update.
+
+        Body: ``{"version"?: "X.Y.Z"}``. CSRF-gated. Returns
+        202 + ``{"run_id": ...}`` on accept; 409 + ``{"run_id_in_progress": ...}``
+        when another run is already in progress.
+        """
+        if not self._check_origin_csrf():
+            return
+        payload = self._read_update_post_body()
+        if payload is None:
+            return
+        worker = _UPDATE_WORKER
+        if worker is None:
+            self._respond_json(
+                500, {"error": "update worker not initialized"}
+            )
+            return
+        version = payload.get("version") if isinstance(payload, dict) else None
+        if version is not None and not isinstance(version, str):
+            self._respond_json(
+                400, {"error": "version must be a string"}
+            )
+            return
+        accepted, run_id = worker.start(version)
+        if accepted:
+            self._respond_json(202, {"run_id": run_id})
+        else:
+            self._respond_json(409, {"run_id_in_progress": run_id})
+
+    def _handle_post_update_dismiss(self) -> None:
+        """POST /api/update/dismiss — record a skip / remind-later.
+
+        Body: ``{"action": "skip"|"remind", "version"?: "X.Y.Z", "days"?: int}``.
+        CSRF-gated. Mutates ``update-suppress.json`` via the same
+        ``_do_update_skip`` / ``_do_update_remind_later`` helpers the
+        CLI uses, so the on-disk shape stays single-source-of-truth.
+        Returns 204 on success, 400 on invalid action / shape.
+        """
+        if not self._check_origin_csrf():
+            return
+        payload = self._read_update_post_body()
+        if payload is None:
+            return
+        action = payload.get("action")
+        # Suppress stdout/stderr from _do_update_skip /
+        # _do_update_remind_later so their CLI-style "Skipped …" /
+        # "Will remind …" prints don't pollute the dashboard server's
+        # log stream. The HTTP response is the user-facing surface.
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            if action == "skip":
+                ver = payload.get("version")
+                if ver is None or ver == "":
+                    rc = _do_update_skip(SKIP_USE_STATE_LATEST)
+                elif not isinstance(ver, str):
+                    self._respond_json(
+                        400, {"error": "version must be a string"}
+                    )
+                    return
+                else:
+                    rc = _do_update_skip(ver)
+            elif action == "remind":
+                days_raw = payload.get("days", 7)
+                try:
+                    days = int(days_raw)
+                except (TypeError, ValueError):
+                    self._respond_json(
+                        400, {"error": "days must be an integer"}
+                    )
+                    return
+                rc = _do_update_remind_later(days)
+            else:
+                self._respond_json(
+                    400,
+                    {
+                        "error": (
+                            "action must be 'skip' or 'remind'"
+                        )
+                    },
+                )
+                return
+        if rc != 0:
+            # Helper printed an explanation to stderr (now swallowed).
+            # Map to a generic 400; UI's polling status will show the
+            # latest state. Future surface improvement: have the
+            # helpers return a structured error so we can echo the
+            # specific reason ("no version in cache to skip") here.
+            self._respond_json(400, {"error": "dismiss failed"})
+            return
+        self.send_response(204)
+        self.end_headers()
+
+    def _handle_get_update_status(self) -> None:
+        """GET /api/update/status — return state + suppress + worker status.
+
+        Polling-fallback friendly so a browser that missed the SSE
+        execvp event can detect "no run in progress" and re-render the
+        idle modal state. ``state`` and ``suppress`` come from the
+        canonical helpers so the on-disk shape is single-source-of-truth.
+        """
+        try:
+            state = _load_update_state()
+        except UpdateError as e:
+            state = {"_error": str(e)[:200]}
+        try:
+            suppress = _load_update_suppress()
+        except UpdateError as e:
+            suppress = {"_error": str(e)[:200]}
+        worker_status = (
+            _UPDATE_WORKER.status() if _UPDATE_WORKER is not None
+            else {"current_run_id": None}
+        )
+        body = {
+            "state": state,
+            "suppress": suppress,
+            **worker_status,
+        }
+        self._respond_json(200, body)
+
+    def _handle_get_update_stream(self, path: str) -> None:
+        """GET /api/update/stream/<run_id> — SSE event stream.
+
+        Yields events from ``UpdateWorker.stream(run_id)``. Closes on
+        the worker's terminal events (``execvp`` / ``error_event`` /
+        ``done``). 404 when the worker is uninitialized; the worker's
+        own generator returns immediately on unknown run_id, so the
+        connection closes cleanly.
+        """
+        worker = _UPDATE_WORKER
+        if worker is None:
+            self.send_error(404, "update worker not initialized")
+            return
+        run_id = path.rsplit("/", 1)[-1]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            for ev in worker.stream(run_id):
+                ev_type = ev.get("type", "message")
+                ev_data = json.dumps(
+                    {k: v for k, v in ev.items() if k != "type"},
+                    ensure_ascii=False,
+                )
+                msg = f"event: {ev_type}\ndata: {ev_data}\n\n"
+                self.wfile.write(msg.encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            # Browser disconnected mid-stream. The worker keeps
+            # running; subsequent reconnects can poll /api/update/status.
+            pass
 
 
 class _TuiSyncThread:
@@ -34183,6 +34597,16 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     import time as _time
     import webbrowser as _wb
 
+    # Spec §5.7: capture the un-mutated argv + PATH-resolved entrypoint
+    # at boot so the in-place ``execvp`` after a successful update
+    # re-enters the user-facing wrapper (npm Node shim → CCTALLY_PYTHON
+    # honoured; brew symlink → post-upgrade Python script). Module-level
+    # so :class:`UpdateWorker` can read them without plumbing.
+    global ORIGINAL_SYS_ARGV, ORIGINAL_ENTRYPOINT, _UPDATE_WORKER
+    ORIGINAL_SYS_ARGV = list(sys.argv)
+    ORIGINAL_ENTRYPOINT = shutil.which("cctally")
+    _UPDATE_WORKER = UpdateWorker()
+
     # Resolve display tz (--tz overrides config.display.tz). The dashboard's
     # envelope-emitted display block (Tasks 11-12) reads this; for now,
     # stash on args so downstream selectors can pick it up uniformly.
@@ -34317,6 +34741,14 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     if sync_thread is not None:
         sync_thread.start()
 
+    # Spec §3.5 (codex review fix #5): update-check thread runs even
+    # under --no-sync (frozen-data sessions still surface new versions).
+    # Dedicated stop event so we can join cleanly on shutdown without
+    # relying on the data-sync thread's lifecycle.
+    update_check_stop = threading.Event()
+    update_check_thread = _DashboardUpdateCheckThread(update_check_stop)
+    update_check_thread.start()
+
     # HTTP server on its own thread so the main thread can block on signal.
     srv = ThreadingHTTPServer((args.host, args.port), DashboardHTTPHandler)
     srv.daemon_threads = True  # SSE handler threads may block up to 15s on keep-alive timeout — let them die with the process.
@@ -34387,6 +34819,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     finally:
         if sync_thread is not None:
             sync_thread.stop()
+        update_check_stop.set()
         srv.shutdown()
         http_thread.join(timeout=2)
         print("dashboard: stopped", flush=True)
