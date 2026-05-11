@@ -60,7 +60,8 @@ registerKeymap([
   buildShareKeyBinding(),
   // Share v2 (spec §12.1). `B` opens the composer modal. Same guard
   // surface as `S` except the composer is global (no panel focus
-  // resolution) and case-insensitive (both `b` and `B` fire).
+  // resolution). Uppercase-only (mirrors the `S`-vs-`s` precedent;
+  // lowercase `b` stays free for future per-panel use).
   ...buildBasketKeyBindings(),
   {
     key: 'c',
