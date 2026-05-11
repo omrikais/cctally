@@ -10137,7 +10137,14 @@ def _fetch_url(url: str, *, timeout: float = UPDATE_NETWORK_TIMEOUT_S) -> tuple[
         if e.code == 429:
             raise UpdateCheckRateLimited(str(e))
         raise UpdateCheckHTTPError(f"HTTP {e.code}: {e}")
-    except urllib.error.URLError as e:
+    except (urllib.error.URLError, TimeoutError) as e:
+        # URLError covers connection-setup failures; TimeoutError
+        # (socket.timeout's alias since 3.10) covers stalls during
+        # resp.read() — that path raises directly through http.client
+        # without urllib wrapping. Both must funnel to
+        # UpdateCheckNetworkError so _do_update_check translates them
+        # into check_status="fetch_failed" instead of letting a slow
+        # registry crash --check with an uncaught traceback.
         raise UpdateCheckNetworkError(str(e))
 
 
@@ -10398,7 +10405,7 @@ def _format_update_check_json(
         "check_error": state.get("check_error"),
         "checked_at_utc": state.get("checked_at_utc"),
         "suppress": {
-            "skipped": list(suppress.get("skipped_versions", [])),
+            "skipped": skipped,
             "remind_after_utc": (
                 remind.get("until_utc") if isinstance(remind, dict) else None
             ),
@@ -10562,13 +10569,21 @@ def _do_update_check_user(*, force: bool, output_json: bool) -> int:
     exception that escapes is a real bug and is left to surface in the
     outer error log. The post-command banner hook in `main()` already
     isolates banner failures.
+
+    Refresh gate matches the user-facing docs (`docs/commands/update.md`):
+    `--check` refreshes when TTL has elapsed; `--force` bypasses the TTL
+    gate to refresh even on a fresh cache. Synchronous refresh here also
+    pre-empts the post-command background spawn — `_do_update_check`
+    touches `update-check.last-fetch` first, so `_is_update_check_due`
+    returns False by the time the hook runs.
     """
-    if force:
+    config = load_config()
+    if force or _is_update_check_due(config):
         _do_update_check()
     state = _load_update_state()
     if state is None:
-        # Still nothing on disk — try once even without --force so the
-        # first invocation isn't a content-free "state unavailable".
+        # Still nothing on disk — try once even with a fresh TTL marker
+        # so the first invocation isn't a content-free "state unavailable".
         _do_update_check()
         state = _load_update_state()
     if state is None:

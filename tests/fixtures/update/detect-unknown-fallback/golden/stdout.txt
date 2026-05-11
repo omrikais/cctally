@@ -10,7 +10,7 @@
   "check_error": null,
   "checked_at_utc": "2026-05-10T12:00:00+00:00",
   "suppress": {
-    "skipped": [],
+    "skipped": false,
     "remind_after_utc": null
   },
   "prerelease_note": null

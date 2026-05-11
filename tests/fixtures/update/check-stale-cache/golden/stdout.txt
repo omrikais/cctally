@@ -1,6 +1,7 @@
 Current   1.4.0
-Latest    1.4.0
-Method    unknown  (auto-detected)
-Notes     https://github.com/omrikais/cctally/releases/tag/v1.4.0
+Latest    1.7.2
+Method    npm  (auto-detected)
+Will run  npm install -g cctally@latest
+Notes     https://github.com/omrikais/cctally/releases/tag/v1.7.2
 
-Automatic update unavailable for this install. Visit https://github.com/omrikais/cctally/releases/tag/v1.4.0 to install manually.
+Run `cctally update` to install.
