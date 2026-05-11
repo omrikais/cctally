@@ -1175,11 +1175,15 @@ def _render_svg_fragment(snap: ShareSnapshot, *, palette: dict, branding: bool) 
 # --- Print stylesheet + MD frontmatter (placeholders for M2.x layering) ---
 
 def _print_stylesheet() -> str:
-    """Print-only CSS injected into HTML <head> for PDF export polish.
+    """Print-only CSS injected into HTML <head> for PDF export polish (spec §11.2).
 
-    M1.2 contract: helper exists but is NOT wired into `_wrap_document` yet —
-    inlining it would shift v1 HTML goldens. Wiring lands with the M3/M4
-    print-PDF surface that needs the rule.
+    M1.2 stub returned this string but it was NOT wired into `_wrap_document`
+    yet to keep v1 HTML goldens byte-stable through M1-M3. M4.2 wires it in
+    so Print → PDF on a dark-theme export renders as black-on-white instead
+    of a solid-black page, and forces page-break-inside avoidance on
+    semantic blocks. v1 + v2 HTML goldens re-baseline once on first run
+    after this change and are byte-stable thereafter; MD + SVG goldens are
+    unaffected (the stylesheet only lives in the HTML document head).
     """
     return (
         '<style>@media print {'
@@ -1305,7 +1309,10 @@ def _wrap_document(fragment, *, format: str, palette: Mapping[str, str] | None,
     if format == "html":
         return (
             f'<!DOCTYPE html>'
-            f'<html lang="en"><head><meta charset="utf-8"><title>{_xml_escape(snap.title)}</title></head>'
+            f'<html lang="en"><head><meta charset="utf-8">'
+            f'<title>{_xml_escape(snap.title)}</title>'
+            f'{_print_stylesheet()}'
+            f'</head>'
             f'<body style="background:{palette["bg"]};font-family:system-ui,-apple-system,sans-serif;padding:20px;max-width:680px;margin:auto">'
             f'{fragment}'
             f'</body></html>'
@@ -1385,6 +1392,7 @@ def _stitch_html(sections: tuple[ComposedSection, ...], *,
         f'<!DOCTYPE html>'
         f'<html lang="en"><head><meta charset="utf-8">'
         f'<title>{_xml_escape(opts.title)}</title>'
+        f'{_print_stylesheet()}'
         f'</head>{body_open}'
         f'{header}{"".join(blocks)}{footer}'
         f'</body></html>'

@@ -143,7 +143,7 @@ describe('<ActionBar>', () => {
     );
   });
 
-  it('Disabled-in-M1 buttons carry explanatory tooltips', () => {
+  it('Format-gated action buttons carry explanatory tooltips', () => {
     render(
       <ActionBar
         panel="weekly"
@@ -152,22 +152,26 @@ describe('<ActionBar>', () => {
         onOptionsChange={() => {}}
       />,
     );
+    // M4.1 — PNG is live but format-gated to SVG. Default options use
+    // format='md', so the button is disabled with a "SVG only" tooltip.
     const png = screen.getByRole('button', { name: /^png$/i });
     expect(png).toBeDisabled();
-    expect(png.getAttribute('title')).toMatch(/m4/i);
+    expect(png.getAttribute('title')).toMatch(/svg format only/i);
 
+    // M4.2 — Print → PDF is live but format-gated to HTML. With default
+    // format='md', the button is disabled with an "HTML only" tooltip.
     const print = screen.getByRole('button', { name: /print/i });
     expect(print).toBeDisabled();
-    expect(print.getAttribute('title')).toMatch(/m4/i);
+    expect(print.getAttribute('title')).toMatch(/html format only/i);
 
-    // M3.5 — + Basket is now live (no longer disabled). With a
+    // M3.5 — + Basket is live (no longer disabled). With a
     // templateId in scope it should be enabled and carry the
     // descriptive tooltip rather than the legacy "coming in M3" stub.
     const basket = screen.getByRole('button', { name: /\+ basket/i });
     expect(basket).not.toBeDisabled();
     expect(basket.getAttribute('title')).toMatch(/add this section to the report basket/i);
 
-    // M2.4 — Save preset is now live (no longer disabled). With a
+    // M2.4 — Save preset is live (no longer disabled). With a
     // templateId in scope it should be enabled and carry the
     // descriptive tooltip rather than the legacy "coming in M2" stub.
     const preset = screen.getByRole('button', { name: /save preset/i });
@@ -245,5 +249,90 @@ describe('<ActionBar>', () => {
       />,
     );
     expect(screen.getByRole('button', { name: /^open$/i })).toBeDisabled();
+  });
+
+  it('PNG button is enabled for SVG and rasterizes via canvas', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        body: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"/>',
+        content_type: 'image/svg+xml',
+        snapshot: {},
+      }),
+    }));
+    // Stub the URL + Image + canvas surfaces svgToPng touches.
+    const createObjectURL = vi.fn().mockReturnValue('blob:fake');
+    const revokeObjectURL = vi.fn();
+    stubProperty(URL, 'createObjectURL', createObjectURL);
+    stubProperty(URL, 'revokeObjectURL', revokeObjectURL);
+    stubProperty(Image.prototype as object, 'decode', vi.fn().mockResolvedValue(undefined));
+    Object.defineProperty(Image.prototype, 'naturalWidth', { value: 50, configurable: true });
+    Object.defineProperty(Image.prototype, 'naturalHeight', { value: 50, configurable: true });
+    HTMLCanvasElement.prototype.toBlob = function (cb: BlobCallback) {
+      cb(new Blob(['png'], { type: 'image/png' }));
+    };
+    HTMLCanvasElement.prototype.getContext = function () {
+      return {
+        fillRect: () => {}, scale: () => {}, drawImage: () => {}, fillStyle: '#fff',
+      } as unknown as CanvasRenderingContext2D;
+    } as unknown as HTMLCanvasElement['getContext'];
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+
+    const opts: ShareOptions = { ...defaults(), format: 'svg' };
+    render(
+      <ActionBar
+        panel="weekly"
+        templateId="weekly-recap"
+        options={opts}
+        onOptionsChange={() => {}}
+      />,
+    );
+    const png = screen.getByRole('button', { name: /^png$/i });
+    expect(png).not.toBeDisabled();
+    await act(async () => {
+      fireEvent.click(png);
+    });
+    expect(clickSpy).toHaveBeenCalled();
+  });
+
+  it('Print → PDF button is enabled for HTML and opens the print dialog', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        body: '<!DOCTYPE html><html><body>x</body></html>',
+        content_type: 'text/html',
+        snapshot: {},
+      }),
+    }));
+    // Patch the appendChild that printPdf uses so we can stub
+    // contentWindow.print before it's invoked synchronously.
+    const printSpy = vi.fn();
+    const origAppend = HTMLBodyElement.prototype.appendChild;
+    vi.spyOn(HTMLBodyElement.prototype, 'appendChild').mockImplementation(function (this: HTMLBodyElement, node: Node) {
+      const ret = origAppend.call(this, node) as Node;
+      if (node instanceof HTMLIFrameElement && node.contentWindow) {
+        Object.defineProperty(node.contentWindow, 'print', { value: printSpy, configurable: true });
+        Object.defineProperty(node.contentWindow, 'focus', { value: () => {}, configurable: true });
+      }
+      return ret;
+    });
+
+    const opts: ShareOptions = { ...defaults(), format: 'html' };
+    render(
+      <ActionBar
+        panel="weekly"
+        templateId="weekly-recap"
+        options={opts}
+        onOptionsChange={() => {}}
+      />,
+    );
+    const print = screen.getByRole('button', { name: /print/i });
+    expect(print).not.toBeDisabled();
+    await act(async () => {
+      fireEvent.click(print);
+    });
+    expect(printSpy).toHaveBeenCalledTimes(1);
+    // Cleanup: drain the iframe the handler appended.
+    document.querySelectorAll('iframe').forEach((f) => f.remove());
   });
 });

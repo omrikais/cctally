@@ -266,3 +266,38 @@ def test_compose_per_section_drift_flag_does_not_change_body():
     out_a = _LS.compose((a,), opts=opts)
     out_b = _LS.compose((b,), opts=opts)
     assert out_a == out_b, "drift_detected must not change rendered output"
+
+
+# --- M4.2: print stylesheet injection (spec §11.2) ---
+
+def test_html_output_carries_print_stylesheet():
+    """HTML render() must inject `_print_stylesheet()` into <head> so
+    Print → PDF on a dark-theme export prints as black-on-white instead
+    of a solid-black page."""
+    snap = _trivial_snapshot()
+    out = _LS.render(snap, format="html", theme="light", branding=True)
+    assert "@media print" in out
+    assert "color-scheme: light" in out
+    assert "page-break-inside: avoid" in out
+
+
+def test_print_stylesheet_unaffected_by_no_branding():
+    """The print stylesheet is functional CSS, not branding — keep it
+    under --no-branding (which only strips footer-link / frontmatter
+    branding, not document-level CSS rules)."""
+    snap = _trivial_snapshot()
+    out = _LS.render(snap, format="html", theme="light", branding=False)
+    assert "@media print" in out
+
+
+def test_compose_html_carries_print_stylesheet():
+    """`_stitch_html` must inject the same print stylesheet so multi-
+    section composed reports also print cleanly."""
+    sections = (_make_section(title="A"), _make_section(title="B"))
+    opts = _LS.ComposeOptions(
+        title="Combined", theme="dark", format="html",
+        no_branding=False, reveal_projects=True,
+    )
+    out = _LS.compose(sections, opts=opts)
+    assert "@media print" in out
+    assert "color-scheme: light" in out

@@ -32,6 +32,15 @@ import { sharePanelLabel, shareFormatExt } from './panelLabels';
 import { dispatch, getState } from '../store/store';
 import { makeBasketItem } from '../store/basketSlice';
 import { SavePresetPopover } from './SavePresetPopover';
+import { svgToPng } from './exporters/png';
+import { printPdf } from './exporters/printPdf';
+
+// PNG canvas background — kernel renders dark-theme bodies on a dark
+// fill and light-theme on a light fill; mirror those palette values so
+// the rasterized PNG matches the SVG preview's intended bg.
+function paletteBg(theme: 'light' | 'dark'): string {
+  return theme === 'light' ? '#ffffff' : '#0f172a';
+}
 
 interface Props {
   panel: SharePanelId;
@@ -77,7 +86,7 @@ function triggerDownload(filename: string, blob: Blob): void {
 }
 
 export function ActionBar({ panel, templateId, options, onOptionsChange }: Props) {
-  const [busy, setBusy] = useState<null | 'copy' | 'download' | 'open' | 'basket'>(null);
+  const [busy, setBusy] = useState<null | 'copy' | 'download' | 'open' | 'basket' | 'png' | 'print'>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   // M3.5 — short-lived "✓ Added" feedback flash on the + Basket button
   // (spec §7.6). Auto-clears 800 ms after a successful add. Track the
@@ -254,11 +263,62 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
     }
   };
 
+  // M4.1 — Spec §11.1. Pure browser path: SVG body → Image.decode →
+  // canvas → toBlob (or toDataURL fallback) → PNG blob → anchor click.
+  // No server endpoint; we re-use `fetchForExport` to get the SVG body
+  // through the normal anon-on-export route, then `svgToPng` rasterizes
+  // it client-side. Background fill is the theme palette bg so the PNG
+  // matches the SVG preview's intended look.
+  const handlePng = async () => {
+    if (!templateId || options.format !== 'svg' || disabledNoTemplate) return;
+    setBusy('png');
+    setActionError(null);
+    try {
+      const { body } = await fetchForExport();
+      const png = await svgToPng(body, 2, paletteBg(options.theme));
+      // Replace `.svg` with `.png` on the kernel filename rule so we
+      // keep the `cctally-<panel>-<utcdate>.png` shape from spec §6.5.
+      triggerDownload(shareFilename(panel, 'svg').replace(/\.svg$/, '.png'), png);
+      showToast('PNG downloaded');
+    } catch (err: unknown) {
+      const msg =
+        err instanceof ShareApiError
+          ? err.message ?? `HTTP ${err.status}`
+          : (err as Error).message;
+      setActionError(`PNG export failed: ${msg}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // M4.2 — Spec §11.2. Fetch the HTML body, hand it to `printPdf` which
+  // writes into a hidden iframe and calls the browser's native print()
+  // dialog. The kernel's `_print_stylesheet()` is in the document's
+  // <head>, so dark-theme exports print as black-on-white rather than
+  // a solid black page.
+  const handlePrint = async () => {
+    if (!templateId || options.format !== 'html' || disabledNoTemplate) return;
+    setBusy('print');
+    setActionError(null);
+    try {
+      const { body } = await fetchForExport();
+      printPdf(body);
+    } catch (err: unknown) {
+      const msg =
+        err instanceof ShareApiError
+          ? err.message ?? `HTTP ${err.status}`
+          : (err as Error).message;
+      setActionError(`Print failed: ${msg}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const canCopy = options.format === 'md' && !disabledNoTemplate;
   const canOpen =
     (options.format === 'html' || options.format === 'svg') && !disabledNoTemplate;
-  const canPng = options.format === 'svg'; // M4
-  const canPrint = options.format === 'html'; // M4
+  const canPng = options.format === 'svg' && !disabledNoTemplate;
+  const canPrint = options.format === 'html' && !disabledNoTemplate;
 
   return (
     <div className="share-actions">
@@ -320,29 +380,33 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
         </button>
         <button
           type="button"
-          className="share-action share-action-disabled"
-          disabled
-          aria-disabled="true"
+          className="share-action share-action-png"
+          onClick={handlePng}
+          disabled={!canPng}
           title={
-            canPng
-              ? 'PNG export — coming in M4'
-              : 'PNG export — available for SVG, coming in M4'
+            options.format !== 'svg'
+              ? 'PNG export — available for SVG format only'
+              : busy === 'png'
+                ? 'Rasterizing…'
+                : 'Download PNG (rasterized from SVG)'
           }
         >
-          PNG
+          {busy === 'png' ? 'Rasterizing…' : 'PNG'}
         </button>
         <button
           type="button"
-          className="share-action share-action-disabled"
-          disabled
-          aria-disabled="true"
+          className="share-action share-action-print"
+          onClick={handlePrint}
+          disabled={!canPrint}
           title={
-            canPrint
-              ? 'Print → PDF — coming in M4'
-              : 'Print → PDF — available for HTML, coming in M4'
+            options.format !== 'html'
+              ? 'Print → PDF — available for HTML format only'
+              : busy === 'print'
+                ? 'Opening print dialog…'
+                : 'Open the browser print dialog (save as PDF)'
           }
         >
-          Print → PDF
+          {busy === 'print' ? 'Printing…' : 'Print → PDF'}
         </button>
         <button
           type="button"
