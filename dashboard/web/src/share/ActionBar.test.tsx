@@ -11,11 +11,13 @@ import { ActionBar } from './ActionBar';
 import { _resetForTests } from '../store/store';
 import type { ShareOptions } from './types';
 
+// Mirrors production `defaultShareOptions()` in ShareModal.tsx — spec
+// Q7 / §6.3: anon-by-default on export, so `reveal_projects: false`.
 function defaults(): ShareOptions {
   return {
     format: 'md',
     theme: 'light',
-    reveal_projects: true,
+    reveal_projects: false,
     no_branding: false,
     top_n: 5,
     period: { kind: 'current' },
