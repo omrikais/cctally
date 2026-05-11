@@ -7,10 +7,38 @@ Spec: docs/superpowers/specs/2026-05-08-shareable-reports-design.md
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+
+
+# --- Version + digest ---
+#
+# KERNEL_VERSION is the contract version of the share renderer. Bump when
+# output shape changes in a way that requires re-rendering historical
+# basket items / share-history entries. The dashboard composer reads this
+# off basket snapshots and tags rows whose stored version != current.
+KERNEL_VERSION: int = 1
+
+
+def _data_digest(payload: object) -> str:
+    """Stable sha256 of a JSON-serializable payload.
+
+    Used by share-snapshot envelopes to let the composer detect data drift
+    between add-time and compose-time. Key ordering is sorted to make the
+    digest insensitive to dict construction order.
+
+    Payload must contain only JSON-native types or types with a stable
+    `str()` (e.g. `datetime`); arbitrary objects fall through `default=str`
+    and `<X object at 0x…>` reprs are per-process-unstable.
+    """
+    canon = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                       default=str).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canon).hexdigest()
 
 
 # --- Cell tagged union ---
@@ -835,7 +863,15 @@ def _scrub(snap: ShareSnapshot, *, reveal_projects: bool) -> ShareSnapshot:
 
 # --- Format renderers ---
 
-def _render_md(snap: ShareSnapshot, *, branding: bool) -> str:
+def _render_md_fragment(snap: ShareSnapshot, *, branding: bool) -> str:
+    """Render the MD section body.
+
+    M1.2 contract: returns the full current `_render_md` body. Frontmatter
+    (added by M2.2) is layered on at the wrap step via `_build_md_frontmatter`
+    + `_wrap_document`. Fragment shape is body-only by definition; even
+    without frontmatter the wrap layer remains the single chrome chokepoint
+    so future surfaces (compose, history) extend it once.
+    """
     parts = [f"# {_md_escape(snap.title)}"]
     if snap.subtitle:
         parts.append(f"_{_md_escape(snap.subtitle)}_")
@@ -1000,7 +1036,13 @@ def _render_html_table(snap: ShareSnapshot, palette: dict) -> str:
     )
 
 
-def _render_html(snap: ShareSnapshot, *, palette: dict, branding: bool) -> str:
+def _render_html_fragment(snap: ShareSnapshot, *, palette: dict, branding: bool) -> str:
+    """Render the HTML body fragment — header + chart + table + (branded footer).
+
+    Document chrome (<!DOCTYPE>/<html>/<head>/<body>) is layered on at the wrap
+    step via `_wrap_document`, keeping body-only content composable for v2's
+    multi-section stitcher.
+    """
     chart_svg = _render_svg(snap, palette=palette, branding=False, include_chrome=False)
     title_html = f'<h1 style="font-size:20px;color:{palette["fg"]};margin:0">{_xml_escape(snap.title)}</h1>'
     subtitle_html = (
@@ -1025,18 +1067,11 @@ def _render_html(snap: ShareSnapshot, *, palette: dict, branding: bool) -> str:
         )
     else:
         footer_html = ""
-    body = (
+    return (
         f'<header>{title_html}{subtitle_html}{timestamp_html}</header>'
         f'<div style="margin-top:12px">{chart_svg}</div>'
         f'{table_html}'
         f'{footer_html}'
-    )
-    return (
-        f'<!DOCTYPE html>'
-        f'<html lang="en"><head><meta charset="utf-8"><title>{_xml_escape(snap.title)}</title></head>'
-        f'<body style="background:{palette["bg"]};font-family:system-ui,-apple-system,sans-serif;padding:20px;max-width:680px;margin:auto">'
-        f'{body}'
-        f'</body></html>'
     )
 
 
@@ -1063,6 +1098,125 @@ def _render_md_table(snap: ShareSnapshot) -> str:
     return "\n".join(lines)
 
 
+# --- SVG fragment ---
+
+
+def _strip_outer_svg_tag(full_svg: str) -> tuple[str, float, float]:
+    """Extract inner XML + width/height from a standalone `<svg w h>...</svg>`.
+
+    Contract drift between renderer and stripper would raise here. Used by the
+    SVG fragment path so compose can position multiple sections vertically
+    inside one outer `<svg viewBox>` without nested-document weirdness.
+    """
+    m = re.match(
+        r'<svg[^>]*\bwidth="(?P<w>[\d.]+)"[^>]*\bheight="(?P<h>[\d.]+)"[^>]*>'
+        r'(?P<body>.*)</svg>\s*$',
+        full_svg,
+        flags=re.DOTALL,
+    )
+    if not m:
+        raise ValueError("unexpected SVG shape (renderer contract drift)")
+    return m.group("body"), float(m.group("w")), float(m.group("h"))
+
+
+def _render_svg_fragment(snap: ShareSnapshot, *, palette: dict, branding: bool) -> tuple[str, float, float]:
+    """Return (inner_xml, width, height) for a chart-and-chrome section.
+
+    Calls into the existing `_render_svg(include_chrome=True)` producer, then
+    strips the outer `<svg ...>` so the wrap step can rewrap byte-identically
+    today and compose can stitch sections under one viewBox later.
+    """
+    full = _render_svg(snap, palette=palette, branding=branding, include_chrome=True)
+    return _strip_outer_svg_tag(full)
+
+
+# --- Print stylesheet + MD frontmatter (placeholders for M2.x layering) ---
+
+def _print_stylesheet() -> str:
+    """Print-only CSS injected into HTML <head> for PDF export polish.
+
+    M1.2 contract: helper exists but is NOT wired into `_wrap_document` yet —
+    inlining it would shift v1 HTML goldens. Wiring lands with the M3/M4
+    print-PDF surface that needs the rule.
+    """
+    return (
+        '<style>@media print {'
+        ' body { color-scheme: light; background: #fff !important; color: #000 !important; }'
+        ' header, footer, section { page-break-inside: avoid; }'
+        '}</style>'
+    )
+
+
+def _build_md_frontmatter(snap: ShareSnapshot) -> str:
+    """YAML frontmatter prepended to MD exports.
+
+    M1.2 contract: returns "" (no frontmatter). M2.2 implements the real
+    body. `_wrap_document` skips the prepend on empty so v1 MD goldens stay
+    byte-identical until M2.2.
+    """
+    return ""
+
+
+# --- Fragment + wrap ---
+
+def _render_fragment(snap: ShareSnapshot, *, format: str,
+                     palette: Mapping[str, str], branding: bool) -> "str | tuple[str, float, float]":
+    """Body-only render — no document chrome.
+
+    Returns:
+      - format="html": str — the body fragment (header + chart + table + footer).
+      - format="md":   str — the markdown body (frontmatter not prepended).
+      - format="svg":  tuple[str, float, float] — (inner_xml, width, height).
+
+    Callers compose this into either:
+      - render(): wraps in full document chrome via `_wrap_document`.
+      - compose(): stitches multiple fragments under one wrapper (M3.x).
+    """
+    if format == "html":
+        return _render_html_fragment(snap, palette=palette, branding=branding)
+    if format == "svg":
+        return _render_svg_fragment(snap, palette=palette, branding=branding)
+    if format == "md":
+        return _render_md_fragment(snap, branding=branding)
+    raise ValueError(f"unknown format: {format!r}")
+
+
+def _wrap_document(fragment, *, format: str, palette: Mapping[str, str] | None,
+                   snap: ShareSnapshot) -> str:
+    """Wrap a fragment in document chrome.
+
+    Byte-stability invariant: for v1 single-section snapshots, the wrapped
+    output must equal the pre-refactor `_render_<fmt>` output character-for-
+    character. The v1 share goldens (`bin/cctally-share-test`) are the gate.
+    """
+    if format == "html":
+        return (
+            f'<!DOCTYPE html>'
+            f'<html lang="en"><head><meta charset="utf-8"><title>{_xml_escape(snap.title)}</title></head>'
+            f'<body style="background:{palette["bg"]};font-family:system-ui,-apple-system,sans-serif;padding:20px;max-width:680px;margin:auto">'
+            f'{fragment}'
+            f'</body></html>'
+        )
+    if format == "svg":
+        inner, w, h = fragment
+        # Mirror `_render_svg`'s exact outer-tag shape (xmlns, viewBox+w+h via
+        # `_fmt_num`) so single-section wraps are byte-identical to the v1
+        # producer. The 0 0 origin matches `_render_svg`'s `viewBox` literal.
+        return (
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {_fmt_num(w)} {_fmt_num(h)}" '
+            f'width="{_fmt_num(w)}" height="{_fmt_num(h)}">'
+            f'{inner}'
+            f'</svg>'
+        )
+    if format == "md":
+        front = _build_md_frontmatter(snap)
+        # Skip the prepend when frontmatter is empty so v1 MD goldens stay
+        # byte-identical — a bare "\n" prefix would diverge every md output.
+        return (front + "\n" + fragment) if front else fragment
+    raise ValueError(f"unknown format: {format!r}")
+
+
 # --- Public dispatch ---
 
 def render(snap: ShareSnapshot, *, format: str, theme: str, branding: bool) -> str:
@@ -1070,9 +1224,14 @@ def render(snap: ShareSnapshot, *, format: str, theme: str, branding: bool) -> s
 
     Pure function: no I/O, no DB, no filesystem, no locks. Caller is
     responsible for emitting the result (stdout/file/clipboard/open).
+
+    Thin delegator over `_render_fragment` + `_wrap_document`: separates
+    body-only rendering from document chrome so compose can stitch multiple
+    sections under a single wrapper (M3.x).
     """
     if format == "md":
-        return _render_md(snap, branding=branding)
+        frag = _render_fragment(snap, format="md", palette=PALETTE_LIGHT, branding=branding)
+        return _wrap_document(frag, format="md", palette=PALETTE_LIGHT, snap=snap)
 
     if theme == "light":
         palette = PALETTE_LIGHT
@@ -1081,9 +1240,25 @@ def render(snap: ShareSnapshot, *, format: str, theme: str, branding: bool) -> s
     else:
         raise ValueError(f"unknown theme: {theme!r}")
 
-    if format == "svg":
-        return _render_svg(snap, palette=palette, branding=branding, include_chrome=True)
-    if format == "html":
-        return _render_html(snap, palette=palette, branding=branding)
+    if format not in ("svg", "html"):
+        raise ValueError(f"unknown format: {format!r}")
+    frag = _render_fragment(snap, format=format, palette=palette, branding=branding)
+    return _wrap_document(frag, format=format, palette=palette, snap=snap)
 
-    raise ValueError(f"unknown format: {format!r}")
+
+# --- Backward-compat shims (Layer-A unit tests target these private helpers) ---
+#
+# The `_render_md` / `_render_html` names predate the fragment+wrap split.
+# v1 share goldens (`bin/cctally-share-test`) go through `render()` — these
+# shims exist solely to keep the Layer-A unit suite in `tests/test_lib_share.py`
+# pointed at byte-identical output without rewriting every call site. New code
+# should use `_render_fragment` + `_wrap_document` directly.
+
+def _render_md(snap: ShareSnapshot, *, branding: bool) -> str:
+    frag = _render_fragment(snap, format="md", palette=PALETTE_LIGHT, branding=branding)
+    return _wrap_document(frag, format="md", palette=PALETTE_LIGHT, snap=snap)
+
+
+def _render_html(snap: ShareSnapshot, *, palette: dict, branding: bool) -> str:
+    frag = _render_fragment(snap, format="html", palette=palette, branding=branding)
+    return _wrap_document(frag, format="html", palette=palette, snap=snap)
