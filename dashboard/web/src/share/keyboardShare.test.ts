@@ -14,16 +14,11 @@
 // WeeklyPanel.tsx). Tests can also focus child elements inside that
 // section to verify the `closest` walk.
 //
-// Spec §12.1 guards (literal):
-//   state.shareModal === null
-//   && state.composerModal === null
-//   && state.inputMode === 'none'
-//   && <focused panel is share-capable>
-//
-// We resolve two ambiguities from the spec text:
-//   1. `inputMode === 'none'` — the store type is `null | 'filter' |
-//      'search'` (store.ts:32); the canonical "no input owner" check is
-//      `inputMode === null`. The spec text is loose; the store wins.
+// Implemented contract (see keyboardShare.ts header for the full guard
+// list — these are the two non-obvious resolutions of spec ambiguity):
+//   1. `inputMode === 'none'` (spec) — store types it as `null | 'filter'
+//      | 'search'`; the canonical "no input owner" check is `=== null`.
+//      The spec text is loose; the store wins.
 //   2. We ALSO guard on `state.openModal === null` — spec §6.1 lets the
 //      share modal layer above a panel modal, but a free-floating `S`
 //      keystroke while a panel modal is open would be ambiguous (which
@@ -100,9 +95,7 @@ afterEach(() => {
   }
   appendedNodes.length = 0;
   // Restore activeElement to <body> so the next test starts unfocused.
-  if (document.body && typeof (document.body as HTMLElement).focus === 'function') {
-    (document.activeElement as HTMLElement | null)?.blur?.();
-  }
+  (document.activeElement as HTMLElement | null)?.blur?.();
   vi.restoreAllMocks();
 });
 

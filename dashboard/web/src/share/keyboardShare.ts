@@ -9,13 +9,10 @@
 // Focus resolution is DOM-driven: we walk up from
 // `document.activeElement` via `closest('[data-panel-kind]')` to find
 // the focused panel. Every panel `<section>` carries
-// `data-panel-kind="<panel-id>"` (see e.g. WeeklyPanel.tsx, the
-// AlertsPanel, etc.). This sidesteps the store's `focusIndex` slice
-// (which is dead in production — nothing dispatches `SET_FOCUS` outside
-// tests) and is more honest besides: "the focused panel" is literally
-// where the keyboard cursor sits, and `closest` correctly resolves the
-// parent panel even when Tab-traversal lands the user on a child
-// element (e.g. the panel's ShareIcon button).
+// `data-panel-kind="<panel-id>"` (see WeeklyPanel.tsx, AlertsPanel, et
+// al.). `closest` correctly resolves the parent panel even when
+// Tab-traversal lands the user on a child element (e.g. the panel's
+// ShareIcon button) — which is the common path.
 //
 // Guards (spec §12.1, with two resolved ambiguities — see test file):
 //   1. shareModal slot is empty (don't replace an already-open modal).
