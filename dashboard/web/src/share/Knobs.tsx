@@ -153,7 +153,7 @@ export function Knobs({ options, onChange }: Props) {
             type="checkbox"
             checked={options.show_chart}
             onChange={(e) => patch({ show_chart: e.target.checked })}
-            aria-label="Include the chart in the exported artifact"
+            aria-label="Include chart in export"
           />
           <span>Show chart</span>
         </label>
@@ -164,7 +164,7 @@ export function Knobs({ options, onChange }: Props) {
             type="checkbox"
             checked={options.show_table}
             onChange={(e) => patch({ show_table: e.target.checked })}
-            aria-label="Include the table in the exported artifact"
+            aria-label="Include table in export"
           />
           <span>Show table</span>
         </label>

@@ -6,13 +6,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { Knobs } from './Knobs';
 import type { ShareOptions } from './types';
 
-// NOTE: `reveal_projects: true` here deliberately diverges from
-// production `defaultShareOptions()` in ShareModal.tsx (which is `false`
-// per spec Q7 / §6.3). These tests assert the inverse mapping of the
-// "Anon on export" checkbox starting from BOTH states; the helper
-// represents the "Anon unchecked" (reveal=true) state and the test at
-// line 80 builds the inverse state explicitly. Don't flip this without
-// re-pivoting the two inverse-mapping tests.
+// `reveal_projects: true` here diverges from production
+// `defaultShareOptions()` (which is `false` per spec Q7 / §6.3) so the
+// inverse-mapping tests below can exercise the checkbox from BOTH
+// states; the explicit-inverse variant builds `reveal_projects: false`
+// inline.
 function defaults(): ShareOptions {
   return {
     format: 'md',

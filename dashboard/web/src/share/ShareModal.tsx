@@ -36,18 +36,11 @@ interface Props {
   onClose: () => void;
 }
 
-// Spec §6 / kernel defaults — when no template default_options are
-// available yet (loading state, or template provides only a partial
-// override), fall back to these.
-//
-// `reveal_projects: false` enforces spec Q7 / §6.3: "Reveal in preview;
-// anon by default on export." The "Anon on export" checkbox in <Knobs>
-// is the user-facing label and maps inversely to this flag — checked ⇒
-// reveal_projects=false (anonymize). With reveal_projects=false here,
-// the checkbox renders CHECKED on modal open, so the first export
-// click after opening the modal defaults to the privacy-safe variant.
-// Preview is unaffected — <PreviewPane> forces reveal_projects=true on
-// its fetch regardless of the recipe.
+// Fallback defaults — used when template `default_options` are missing
+// or only partially override. `reveal_projects: false` is the
+// spec-Q7/§6.3 "anon by default on export" contract; safe to apply at
+// this layer because <PreviewPane> forces `reveal_projects: true` on
+// its own fetch (the preview always reveals).
 function defaultShareOptions(): ShareOptions {
   return {
     format: 'md',
