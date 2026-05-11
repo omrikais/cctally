@@ -21386,12 +21386,48 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
         conn.close()
 
 
+# Decimal places retained when normalizing incoming percent floats.
+# Anthropic's `rate_limits.{5h,seven_day}.utilization` is computed as
+# `tokens / cap * 100` server-side and can land one ULP off the rational
+# answer (canonical sighting: `0.07 * 100 == 7.000000000000001`). 10dp
+# is well below any meaningful consumer precision (HWM comparisons
+# clamp at 1dp; JSON exports round to 3dp; floor-snap uses 1e-9) but
+# above IEEE 754 ULP scale near 100, so the round flushes the noise
+# without distorting any meaningful value.
+_PERCENT_NORMALIZE_DECIMALS = 10
+
+
+def _normalize_percent(value: "float | int | None") -> "float | None":
+    """Flush IEEE 754 ULP noise out of an ingress percent value.
+
+    Single chokepoint applied at every site where a raw percent enters
+    cctally's runtime path (OAuth fetch, hook-tick OAuth refresh, and
+    the cmd_record_usage CLI ingress). Downstream consumers — HWM
+    files, ``weekly_usage_snapshots.{weekly,five_hour}_percent`` REAL
+    columns, ``five_hour_blocks.final_five_hour_percent``, milestone
+    crossing values, and the SSE envelope's ``used_percent`` field —
+    all read the cleaned value, so a single round here stops
+    ``5h=7.000000000000001`` style strings from reaching any log or
+    serialized surface.
+
+    ``None`` is the canonical absent-percent sentinel; preserve it
+    unchanged so the optional-5h branches stay simple.
+    """
+    if value is None:
+        return None
+    return round(float(value), _PERCENT_NORMALIZE_DECIMALS)
+
+
 def cmd_record_usage(args: argparse.Namespace) -> int:
     """Record usage data from Claude Code status line rate_limits."""
     config = load_config()
     week_start_name = get_week_start_name(config, getattr(args, "week_start_name", None))
 
-    weekly_percent = float(args.percent)
+    # ULP-noise sanitization is applied at the cmd_record_usage ingress
+    # boundary so every downstream consumer (HWM files, DB rows,
+    # five_hour_blocks rollup, milestones) reads a stable value. See
+    # `_normalize_percent` for the rationale.
+    weekly_percent = _normalize_percent(args.percent)
     resets_at = int(args.resets_at)
 
     five_hour_percent: float | None = None
@@ -21399,7 +21435,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
     five_hour_window_key: int | None = None
     five_hour_resets_at_epoch: int | None = None
     if args.five_hour_percent is not None:
-        five_hour_percent = float(args.five_hour_percent)
+        five_hour_percent = _normalize_percent(args.five_hour_percent)
     if args.five_hour_resets_at is not None:
         five_hour_resets_at_epoch = int(args.five_hour_resets_at)
         five_hour_resets_at_str = dt.datetime.fromtimestamp(
@@ -22199,7 +22235,11 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
 
     seven = api.get("seven_day") or {}
     try:
-        seven_pct = float(seven["utilization"])
+        # Normalize at the OAuth ingress so the payload JSON published
+        # on the SSE envelope (`used_percent` field) is clean even when
+        # this code path doesn't reach cmd_record_usage (e.g. payload
+        # built then a downstream cmd_record_usage call fails).
+        seven_pct = _normalize_percent(float(seven["utilization"]))
         seven_resets_iso = seven["resets_at"]
         seven_resets_epoch = _iso_to_epoch(seven_resets_iso)
     except (TypeError, ValueError, KeyError) as exc:
@@ -22215,7 +22255,7 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
     warnings: list = []
     if five is not None and "utilization" in five and "resets_at" in five:
         try:
-            five_pct = float(five["utilization"])
+            five_pct = _normalize_percent(float(five["utilization"]))
             five_resets_iso = five["resets_at"]
             five_resets_epoch = _iso_to_epoch(five_resets_iso)
         except (TypeError, ValueError) as exc:
@@ -22425,7 +22465,7 @@ def _hook_tick_oauth_refresh(
         return "err(parse)", None
     seven = api["seven_day"]
     try:
-        seven_pct = float(seven["utilization"])
+        seven_pct = _normalize_percent(float(seven["utilization"]))
         seven_resets_epoch = _iso_to_epoch(seven["resets_at"])
     except (TypeError, ValueError, KeyError):
         return "err(parse)", None
@@ -22434,7 +22474,7 @@ def _hook_tick_oauth_refresh(
     five_resets_epoch: int | None = None
     if five is not None and "utilization" in five and "resets_at" in five:
         try:
-            five_pct = float(five["utilization"])
+            five_pct = _normalize_percent(float(five["utilization"]))
             five_resets_epoch = _iso_to_epoch(five["resets_at"])
         except (TypeError, ValueError):
             five_pct = None
