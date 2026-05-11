@@ -82,7 +82,7 @@ export function UpdateStream({ events, maxLines = 500 }: UpdateStreamProps) {
           return (
             <span key={i} className="update-stream-step">
               {'==> '}
-              {ev.step ?? ev.data ?? ''}
+              {ev.name ?? ev.step ?? ev.data ?? ''}
               {'\n'}
             </span>
           );

@@ -10057,6 +10057,32 @@ def _persist_install_method_to_state(method: InstallMethod) -> None:
     _save_update_state(state)
 
 
+def _stamp_install_success_to_state(installed_version: str | None) -> None:
+    """Stamp ``update-state.json`` with the just-installed version so the
+    post-install banner predicate + dashboard auto-close fire immediately.
+
+    Without this, both surfaces are stuck for up to ``ttl_hours`` (24h
+    default): ``_do_update_check`` touched the throttle marker before
+    install began, so ``_is_update_check_due`` returns False on every
+    subsequent boot until the TTL expires; ``current_version`` would
+    keep its pre-install value, and ``_semver_gt(latest, current)``
+    stays True. Banner re-fires on every CLI command; dashboard's
+    ``refreshUpdateState`` auto-close (``current === latest``) never
+    matches.
+
+    Falls back to ``state.latest_version`` when the caller didn't pass
+    an explicit ``--version`` — brew is always unpinned, and an
+    unpinned npm install resolves to whatever ``@latest`` advertised,
+    which is the value we just told the user about.
+    """
+    state = _load_update_state() or {"_schema": 1}
+    cur = installed_version or state.get("latest_version")
+    if cur:
+        state["current_version"] = cur
+        state["last_install_success_at_utc"] = _now_utc().isoformat()
+        _save_update_state(state)
+
+
 # === Update subcommand: version-check pipeline (spec §3) ====================
 # Per-vector parsers, TTL gate, and the chokepoint `_do_update_check` that
 # touches the throttle marker FIRST (crash safety) before attempting any
@@ -10750,6 +10776,7 @@ def _do_update_install(
                 if rc != 0:
                     return 1
             _log_update_event(log_fd, "INSTALL_SUCCESS")
+            _stamp_install_success_to_state(version)
             return 0
     finally:
         _release_update_lock(lock_fd)
@@ -10881,8 +10908,18 @@ class UpdateWorker:
                 if ev["type"] in ("execvp", "error_event", "done"):
                     return
         finally:
+            # Only reap when the worker is no longer the active producer
+            # for this run_id. A mid-run modal close unwinds this
+            # generator while ``_current_id == run_id`` and ``_run`` is
+            # still emitting — popping here would silently drop those
+            # events, and a modal reopen (slice.runId is preserved per
+            # spec §6) would re-subscribe against a missing queue.
+            # Cleanup still happens on the first ``stream()`` exit AFTER
+            # the worker terminates (its finally clears _current_id), or
+            # via ``start()``'s reap on the next run.
             with self._lock:
-                self._streams.pop(run_id, None)
+                if self._current_id != run_id:
+                    self._streams.pop(run_id, None)
 
     def _run(self, run_id: str, version: "str | None") -> None:
         lock_fd = None
@@ -10914,6 +10951,7 @@ class UpdateWorker:
                     self._emit(run_id, {"type": "done", "success": False})
                     return
             _log_update_event(log_fd, "INSTALL_SUCCESS")
+            _stamp_install_success_to_state(version)
             entrypoint, exec_argv = _resolve_execvp_target()
             self._emit(run_id, {"type": "execvp", "argv": exec_argv})
             try:
