@@ -32,6 +32,10 @@ export function BasketChip() {
   const prevCountRef = useRef(count);
 
   useEffect(() => {
+    // prevCountRef must update on BOTH paths — the count-grew branch
+    // (so the next render compares against the new floor) and the
+    // stable/decrement fallthrough (so an item removal followed by an
+    // add still pulses). Dual assignment is intentional.
     if (count > prevCountRef.current) {
       setPulse(true);
       const t = setTimeout(() => setPulse(false), PULSE_DURATION_MS);
