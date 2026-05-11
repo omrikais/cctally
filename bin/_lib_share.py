@@ -1148,13 +1148,79 @@ def _print_stylesheet() -> str:
 
 
 def _build_md_frontmatter(snap: ShareSnapshot) -> str:
-    """YAML frontmatter prepended to MD exports.
+    """YAML frontmatter prepended to MD exports (spec §11.5).
 
-    M1.2 contract: returns "" (no frontmatter). M2.2 implements the real
-    body. `_wrap_document` skips the prepend on empty so v1 MD goldens stay
-    byte-identical until M2.2.
+    Byte-stable: key order is fixed (title -> generated_at -> period ->
+    panel -> anonymized -> cctally_version); single-line values; no
+    eolian formatting. `_wrap_document` strips this when
+    `branding=False` so `--no-branding` behaves consistently with the
+    HTML/SVG footer-link stripping.
+
+    `anonymized` reflects whether `_scrub` has rewritten this snapshot --
+    detected via `_snapshot_is_anonymized` (label-prefix heuristic; see
+    that function for the contract).
     """
-    return ""
+    period = snap.period
+    period_iso = (
+        f"{period.start.isoformat()}.."
+        f"{period.end.isoformat()}"
+    )
+    anonymized = "true" if _snapshot_is_anonymized(snap) else "false"
+    lines = [
+        "---",
+        f"title: {_yaml_scalar(snap.title)}",
+        f"generated_at: {snap.generated_at.isoformat()}",
+        f"period: {period_iso}",
+        f"panel: {snap.cmd}",
+        f"anonymized: {anonymized}",
+        f"cctally_version: {snap.version}",
+        "---",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _yaml_scalar(s: str) -> str:
+    """Quote a YAML scalar value when it would otherwise be ambiguous.
+
+    YAML 1.2 reserves leading `:`, `#`, `&`, `*`, `!`, `|`, `>`, `'`,
+    `"`, `%`, `@`, `` ` `` and embedded `:` in plain scalars. We quote
+    aggressively (when the value contains any of these or leading/trailing
+    whitespace) to keep frontmatter parsers happy. Single quotes use
+    YAML's `''` escape for the rare title containing a quote.
+    """
+    if not s:
+        return '""'
+    if any(c in s for c in ":#&*!|>'\"%@`") or s.strip() != s:
+        return "'" + s.replace("'", "''") + "'"
+    return s
+
+
+def _snapshot_is_anonymized(snap: ShareSnapshot) -> bool:
+    """Return True if every ProjectCell label is either an anon token or a sentinel.
+
+    `_scrub` rewrites labels to `project-<N>` (1-indexed, cost-descending).
+    A snapshot with no `ProjectCell` rows returns False (nothing was
+    anonymized because there was nothing to anonymize). `(unknown)` is the
+    project-share sentinel for missing project_path (see
+    `cmd_project`'s `_proj_label_for`) — it is never a revealed real name,
+    so it is counted as also-anonymized. Mixed snapshots (some scrubbed,
+    some revealed) are reported False to keep the frontmatter semantic
+    ("are projects revealed in this MD?").
+    """
+    cells = [
+        cell
+        for row in snap.rows
+        for cell in row.cells.values()
+        if isinstance(cell, ProjectCell)
+    ]
+    if not cells:
+        return False
+    import re as _re
+    return all(
+        _re.fullmatch(r"project-\d+", c.label) or c.label == "(unknown)"
+        for c in cells
+    )
 
 
 # --- Fragment + wrap ---
@@ -1182,12 +1248,18 @@ def _render_fragment(snap: ShareSnapshot, *, format: str,
 
 
 def _wrap_document(fragment, *, format: str, palette: Mapping[str, str] | None,
-                   snap: ShareSnapshot) -> str:
+                   snap: ShareSnapshot, branding: bool = True) -> str:
     """Wrap a fragment in document chrome.
 
     Byte-stability invariant: for v1 single-section snapshots, the wrapped
-    output must equal the pre-refactor `_render_<fmt>` output character-for-
-    character. The v1 share goldens (`bin/cctally-share-test`) are the gate.
+    HTML/SVG output must equal the pre-refactor `_render_<fmt>` output
+    character-for-character. The v1 share goldens (`bin/cctally-share-test`)
+    are the gate.
+
+    MD: prepends `_build_md_frontmatter(snap)` when `branding=True` (spec
+    §11.5). Suppressed when `branding=False` -- same surface as the
+    HTML/SVG footer-link strip done inside the per-format renderers --
+    so `--no-branding` behaves consistently across all three formats.
     """
     if format == "html":
         return (
@@ -1210,10 +1282,12 @@ def _wrap_document(fragment, *, format: str, palette: Mapping[str, str] | None,
             f'</svg>'
         )
     if format == "md":
-        front = _build_md_frontmatter(snap)
-        # Skip the prepend when frontmatter is empty so v1 MD goldens stay
-        # byte-identical — a bare "\n" prefix would diverge every md output.
-        return (front + "\n" + fragment) if front else fragment
+        front = _build_md_frontmatter(snap) if branding else ""
+        # Frontmatter already ends with "---\n" (trailing "" in the join
+        # adds the separator newline); concat directly so the byte shape
+        # is `---\n...---\n\n<fragment>`. When branding=False, front is
+        # "" and the fragment passes through untouched.
+        return (front + fragment) if front else fragment
     raise ValueError(f"unknown format: {format!r}")
 
 
@@ -1231,7 +1305,8 @@ def render(snap: ShareSnapshot, *, format: str, theme: str, branding: bool) -> s
     """
     if format == "md":
         frag = _render_fragment(snap, format="md", palette=PALETTE_LIGHT, branding=branding)
-        return _wrap_document(frag, format="md", palette=PALETTE_LIGHT, snap=snap)
+        return _wrap_document(frag, format="md", palette=PALETTE_LIGHT, snap=snap,
+                              branding=branding)
 
     if theme == "light":
         palette = PALETTE_LIGHT
@@ -1243,7 +1318,8 @@ def render(snap: ShareSnapshot, *, format: str, theme: str, branding: bool) -> s
     if format not in ("svg", "html"):
         raise ValueError(f"unknown format: {format!r}")
     frag = _render_fragment(snap, format=format, palette=palette, branding=branding)
-    return _wrap_document(frag, format=format, palette=palette, snap=snap)
+    return _wrap_document(frag, format=format, palette=palette, snap=snap,
+                          branding=branding)
 
 
 # --- Backward-compat shims (Layer-A unit tests target these private helpers) ---
@@ -1256,9 +1332,11 @@ def render(snap: ShareSnapshot, *, format: str, theme: str, branding: bool) -> s
 
 def _render_md(snap: ShareSnapshot, *, branding: bool) -> str:
     frag = _render_fragment(snap, format="md", palette=PALETTE_LIGHT, branding=branding)
-    return _wrap_document(frag, format="md", palette=PALETTE_LIGHT, snap=snap)
+    return _wrap_document(frag, format="md", palette=PALETTE_LIGHT, snap=snap,
+                          branding=branding)
 
 
 def _render_html(snap: ShareSnapshot, *, palette: dict, branding: bool) -> str:
     frag = _render_fragment(snap, format="html", palette=palette, branding=branding)
-    return _wrap_document(frag, format="html", palette=palette, snap=snap)
+    return _wrap_document(frag, format="html", palette=palette, snap=snap,
+                          branding=branding)
