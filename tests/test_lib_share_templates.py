@@ -121,13 +121,11 @@ _STUB_PANEL_DATA = {
         ],
     },
     "daily": {
-        "days": [{"date": "2026-05-04", "cost_usd": 2.0,
-                  "top_projects": [("/p/a", 1.5)]}],
+        "days": [{"date": "2026-05-04", "cost_usd": 2.0}],
         "top_projects": [("/p/a", 1.5)],
     },
     "monthly": {
-        "months": [{"month": "2026-04", "cost_usd": 50.0,
-                    "top_projects": [("/p/a", 40.0)]}],
+        "months": [{"month": "2026-04", "cost_usd": 50.0}],
         "top_projects": [("/p/a", 40.0)],
     },
     "blocks": {
