@@ -6,7 +6,7 @@
 // We mock the share API so the gallery fetch resolves synchronously
 // (avoids spinning the test on a network round-trip) and the modal can
 // reach its rendered state.
-import { render, screen, act, cleanup, fireEvent } from '@testing-library/react';
+import { render, screen, act, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShareModalRoot } from './ShareModalRoot';
 import { dispatch, _resetForTests } from '../store/store';
@@ -33,6 +33,35 @@ beforeEach(() => {
     }),
   }));
 });
+
+// Convenience for the nested-Esc regression test: a single fetch stub
+// that answers both the share-modal templates fetch AND the presets
+// fetch driven by <PresetDropdown>. Switches on URL substring.
+function stubFetchForNestedModal() {
+  vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+    if (typeof url === 'string' && url.includes('/api/share/presets')) {
+      return Promise.resolve(new Response(
+        JSON.stringify({ presets: {} }),
+        { status: 200 },
+      ));
+    }
+    // Default: /api/share/templates response.
+    return Promise.resolve({
+      ok: true,
+      json: async () => ({
+        panel: 'weekly',
+        templates: [
+          {
+            id: 'weekly-recap',
+            label: 'Recap',
+            description: 'Text + tiny chart',
+            default_options: { format: 'md', theme: 'light' },
+          },
+        ],
+      }),
+    });
+  }));
+}
 
 afterEach(() => {
   cleanup();
@@ -148,5 +177,66 @@ describe('<ShareModalRoot>', () => {
       screen.queryByRole('heading', { name: /share weekly report/i }),
     ).toBeNull();
     expect(screen.getByRole('heading', { name: /^panel$/i })).toBeInTheDocument();
+  });
+
+  it('Esc closes nested ManagePresetsModal without closing the share modal', async () => {
+    // Regression for the M2 Impl C spec-review MUST-FIX: when the nested
+    // <ManagePresetsModal> is open inside <ShareModal>, pressing Esc
+    // would close the entire share modal (its overlay-scope Esc binding
+    // fired first via SCOPE_ORDER) instead of just the nested modal.
+    //
+    // The keymap dispatcher iterates bindings by scope, NOT DOM focus:
+    // overlay-scope handlers always preempt modal-scope ones unless the
+    // overlay binding gates itself out with `when:`. The fix wires
+    // <ShareModal>'s Esc binding with `when: () => !manageOpen` so its
+    // nested `modal`-scope Esc can fire while the manage modal is open.
+    stubFetchForNestedModal();
+    render(<ShareModalRoot />);
+    await act(async () => {
+      dispatch(openShareModal('weekly', null));
+    });
+    // Share modal rendered (its title is the dialog heading).
+    expect(
+      screen.getByRole('heading', { name: /share weekly report/i }),
+    ).toBeInTheDocument();
+
+    // Open the presets dropdown, then click "Manage presets…" to mount
+    // the nested manage modal.
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /presets/i }));
+    });
+    const manageItem = await screen.findByRole('menuitem', {
+      name: /manage presets/i,
+    });
+    await act(async () => {
+      fireEvent.click(manageItem);
+    });
+    // Sanity: nested manage modal is open (its dialog has the "Manage
+    // presets" aria-label).
+    await waitFor(() => {
+      expect(
+        screen.getByRole('dialog', { name: /manage presets/i }),
+      ).toBeInTheDocument();
+    });
+
+    // Fire Esc — the nested modal must close, the share modal must NOT.
+    await act(async () => {
+      fireEvent.keyDown(document, { key: 'Escape' });
+    });
+    expect(
+      screen.queryByRole('dialog', { name: /manage presets/i }),
+    ).toBeNull();
+    expect(
+      screen.getByRole('heading', { name: /share weekly report/i }),
+    ).toBeInTheDocument();
+
+    // Fire Esc again — now the share modal closes (the `when:` gate
+    // re-enables the overlay-scope binding once manageOpen is false).
+    await act(async () => {
+      fireEvent.keyDown(document, { key: 'Escape' });
+    });
+    expect(
+      screen.queryByRole('heading', { name: /share weekly report/i }),
+    ).toBeNull();
   });
 });

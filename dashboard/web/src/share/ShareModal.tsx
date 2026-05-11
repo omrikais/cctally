@@ -85,9 +85,22 @@ export function ShareModal({ panel, onClose }: Props) {
 
   // Esc-to-close at overlay scope. Overlay > modal in SCOPE_ORDER so
   // Esc closes the share modal first when layered atop a panel modal.
+  //
+  // BUT: when <ManagePresetsModal> is open (nested inside this share
+  // modal), suppress this overlay-scope binding so its `modal`-scope Esc
+  // can fire and close just the nested manage modal. The keymap
+  // dispatcher (store/keymap.ts) iterates registered bindings in
+  // SCOPE_ORDER and fires the FIRST match — it does NOT consider DOM
+  // focus. Without this `when:` gate, Esc inside the manage modal would
+  // close the entire share modal instead of just the nested overlay.
   const bindings = useMemo(
-    () => [{ key: 'Escape', scope: 'overlay' as const, action: onClose }],
-    [onClose],
+    () => [{
+      key: 'Escape',
+      scope: 'overlay' as const,
+      when: () => !manageOpen,
+      action: onClose,
+    }],
+    [onClose, manageOpen],
   );
   useKeymap(bindings);
 
