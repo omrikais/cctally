@@ -7,11 +7,11 @@
 // on (panel, name) — save is the only mutation surface), and this
 // keeps the implementation honest about the failure mode.
 //
-// Esc closes the modal — registered at `modal` scope so we don't
-// preempt the share modal's own overlay-scope Esc binding. (Visually
-// this modal layers above the share modal, but functionally it's
-// open/close-independent: opening it doesn't close the share modal,
-// closing it returns focus to the dropdown trigger.)
+// Esc closes the modal — registered at `modal` scope. The share
+// modal's overlay-scope Esc binding is gated by `when: () => !manageOpen`
+// (see ShareModal.tsx) so this modal's Esc binding fires first. Focus
+// restoration to the dropdown trigger is part of the M4.4 focus-restore
+// audit, not implemented here.
 import { useEffect, useMemo, useState } from 'react';
 import {
   listPresets, deletePreset, savePreset, type PresetRecord, ShareApiError,
