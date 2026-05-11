@@ -9,6 +9,7 @@ import { stepMatch, tryQuit } from './store/actions';
 import { refreshUpdateState } from './store/update';
 import { openPanelByPosition } from './lib/openPanelByPosition';
 import { buildShareKeyBinding } from './share/keyboardShare';
+import { buildBasketKeyBindings } from './share/keyboardBasket';
 import './index.css';
 
 // Boot SSE (module-scoped; StrictMode's double-mount cannot double-boot it).
@@ -57,6 +58,10 @@ registerKeymap([
   // share-capable panel, not mobile) live inside buildShareKeyBinding so
   // tests can drive them through the same module main.tsx wires up.
   buildShareKeyBinding(),
+  // Share v2 (spec §12.1). `B` opens the composer modal. Same guard
+  // surface as `S` except the composer is global (no panel focus
+  // resolution) and case-insensitive (both `b` and `B` fire).
+  ...buildBasketKeyBindings(),
   {
     key: 'c',
     scope: 'sessions',

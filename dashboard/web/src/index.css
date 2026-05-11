@@ -2588,6 +2588,142 @@ mark.current {
 }
 
 /* =========================================================================
+   Composer modal (spec §8). Multi-section editor layered over (and
+   independent of) the share modal. Two-pane on desktop: left = section
+   list with dnd-kit drag-handles + kebab menus, right = sandboxed
+   live-preview iframe. Mobile stack (composer-modal-mobile) sits in
+   the @media block below.
+   ========================================================================= */
+.composer-modal {
+  position: fixed; inset: 0; z-index: 210;
+  display: flex; flex-direction: column;
+  background: var(--panel-bg);
+  font-family: inherit;
+}
+.composer-modal::before {
+  /* Backdrop layer behind the modal card. We don't want a separate
+     overlay child since the modal itself fills the viewport, but a
+     subtle scrim keeps the look consistent with .share-overlay when
+     the composer is layered above other surfaces. */
+  content: '';
+  position: absolute; inset: 0; z-index: -1;
+  background: rgba(0, 0, 0, 0.55);
+}
+.composer-modal-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 12px 18px; border-bottom: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+}
+.composer-modal-header h2 { margin: 0; font-size: 17px; font-weight: 500; }
+.composer-modal-close {
+  background: none; border: none; color: inherit;
+  font-size: 22px; line-height: 1; cursor: pointer; padding: 4px 8px;
+}
+.composer-modal-close:hover { color: var(--accent-red); }
+.composer-empty-message {
+  padding: 18px; color: var(--text-dim);
+}
+.composer-knobs {
+  display: flex; gap: 12px; flex-wrap: wrap;
+  padding: 10px 18px; background: var(--panel-bg);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 13px;
+}
+.composer-knobs label {
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.composer-anon-banner {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 18px; background: var(--accent-yellow, #fbbf24);
+  color: var(--bg-elevated, #0f172a);
+  font-size: 13px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.composer-anon-banner button {
+  background: transparent;
+  border: 1px solid currentColor;
+  color: inherit;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.composer-anon-banner button:hover {
+  background: rgba(0, 0, 0, 0.1);
+}
+.composer-body {
+  flex: 1; display: grid; grid-template-columns: minmax(220px, 320px) 1fr;
+  gap: 16px; padding: 16px; min-height: 0; overflow: hidden;
+}
+.composer-section-list {
+  list-style: none; padding: 0; margin: 0;
+  overflow-y: auto;
+}
+.composer-section-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px; margin-bottom: 6px;
+  background: var(--panel-bg-2, var(--panel-bg));
+  position: relative;
+}
+.composer-section-label { flex: 1; min-width: 0; }
+.composer-drag-handle {
+  /* dndkit-touch-action gotcha: mobile pointer gestures must not be
+     preempted as page-scroll on the drag handle. */
+  touch-action: none;
+  cursor: grab; padding: 4px 6px; background: transparent;
+  border: none; color: var(--text-dim, #64748b);
+  font-size: 14px;
+}
+.composer-drag-handle:active { cursor: grabbing; }
+.composer-section-actions {
+  position: relative;
+}
+.composer-section-menu {
+  position: absolute; right: 0; top: 100%;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-soft); list-style: none;
+  padding: 4px 0; margin: 4px 0 0; z-index: 10;
+  min-width: 180px;
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+.composer-section-menu li { padding: 0; }
+.composer-section-menu button {
+  width: 100%; text-align: left;
+  background: transparent; border: none; color: inherit;
+  padding: 6px 12px; cursor: pointer; font-size: 13px;
+}
+.composer-section-menu button:hover { background: var(--border-soft); }
+.composer-outdated-badge {
+  background: var(--accent-yellow, #fbbf24);
+  color: var(--bg-elevated, #0f172a);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.composer-preview {
+  width: 100%; height: 100%;
+  border: 1px solid var(--border-soft);
+  background: white;
+  min-height: 0;
+}
+.composer-busy, .composer-error {
+  padding: 6px 18px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.composer-error { color: var(--accent-red); }
+.composer-actions {
+  padding: 12px 18px;
+  border-top: 1px solid var(--border-soft);
+  display: flex; gap: 8px;
+  background: var(--panel-bg);
+}
+
+/* =========================================================================
    Mobile (max-width: 640px) — phone-class viewports.
    Single shared breakpoint with src/lib/breakpoints.ts (MOBILE_BREAKPOINT_PX).
    All rules here are additive: layered on top of the existing 1100px tablet
@@ -3310,5 +3446,41 @@ mark.current {
   }
   .share-save-preset {
     margin-left: 0;
+  }
+
+  /* Composer modal (spec §8.10). Below 640px the composer stacks:
+     composite knobs top, horizontal-scroll section pill strip middle,
+     preview bottom, export bar pinned via position:sticky;bottom:0.
+     The .composer-modal-mobile class is toggled by useIsMobile() in
+     ComposerModal.tsx so the JS and CSS stay in lockstep on the same
+     MOBILE_MEDIA_QUERY threshold. */
+  .composer-modal-mobile .composer-knobs {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .composer-modal-mobile .composer-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+    padding: 10px;
+    gap: 10px;
+  }
+  .composer-modal-mobile .composer-section-list {
+    display: flex;
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+    max-height: none;
+    padding-bottom: 8px;
+  }
+  .composer-modal-mobile .composer-section-row {
+    flex: 0 0 auto;
+    min-width: 180px;
+    margin-right: 6px;
+    margin-bottom: 0;
+  }
+  .composer-modal-mobile .composer-actions {
+    position: sticky;
+    bottom: 0;
+    background: var(--panel-bg);
   }
 }

@@ -22,6 +22,7 @@ import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { closeShareModal } from '../store/shareSlice';
 import { ShareModal } from './ShareModal';
+import { ComposerModal } from './ComposerModal';
 
 export function ShareModalRoot() {
   const slot = useSyncExternalStore(subscribeStore, () => getState().shareModal);
@@ -58,25 +59,34 @@ export function ShareModalRoot() {
     }
   }, [slot]);
 
-  if (!slot) return null;
-
   const close = () => dispatch(closeShareModal());
+  // ComposerModal mounts in a sibling slot — it can layer above the
+  // share modal (the "Customize…" path opens the composer while the
+  // share modal is still up) and it can be opened independently via
+  // the `B` keystroke or the BasketChip click. Its mount/unmount is
+  // driven by `state.composerModal` (the ComposerModal component
+  // subscribes itself and returns null when the slot is empty).
   return (
-    <div
-      id="share-modal-root"
-      className="share-overlay"
-      // Click-outside (on the backdrop, not on the modal card itself) closes
-      // the modal. The card's own click handler stops propagation so clicks
-      // inside the card don't bubble back here. stopPropagation() on the
-      // overlay itself prevents any of those clicks from reaching the
-      // underlying panel/modal (we don't want to accidentally swap which
-      // panel modal is open while the share modal is up).
-      onClick={(e) => {
-        e.stopPropagation();
-        if (e.target === e.currentTarget) close();
-      }}
-    >
-      <ShareModal panel={slot.panel} onClose={close} />
-    </div>
+    <>
+      {slot ? (
+        <div
+          id="share-modal-root"
+          className="share-overlay"
+          // Click-outside (on the backdrop, not on the modal card itself) closes
+          // the modal. The card's own click handler stops propagation so clicks
+          // inside the card don't bubble back here. stopPropagation() on the
+          // overlay itself prevents any of those clicks from reaching the
+          // underlying panel/modal (we don't want to accidentally swap which
+          // panel modal is open while the share modal is up).
+          onClick={(e) => {
+            e.stopPropagation();
+            if (e.target === e.currentTarget) close();
+          }}
+        >
+          <ShareModal panel={slot.panel} onClose={close} />
+        </div>
+      ) : null}
+      <ComposerModal />
+    </>
   );
 }
