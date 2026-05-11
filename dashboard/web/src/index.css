@@ -1350,6 +1350,62 @@ mark.current {
   }
 }
 
+/* ----- Basket chip (spec §7.5) -----
+   Always-visible (DOM-removed when count = 0) affordance in the
+   topbar-actions cluster. Click → composer modal. Amber count badge
+   keeps the affordance scannable; pulse keyframe (also exercised by
+   the +Basket button in the share modal) is gated on
+   `prefers-reduced-motion: reduce` per spec §12.6.
+
+   Color contrast: amber #f59e0b on slate-900 #0f172a = 7.8:1, AA pass
+   (spec §12.7). */
+.basket-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  background: transparent;
+  border: 1px solid var(--border-muted, #334155);
+  border-radius: 6px;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  line-height: 1;
+}
+.basket-chip:focus-visible {
+  outline: 2px solid var(--accent-purple);
+  outline-offset: 2px;
+}
+.basket-chip:hover { filter: brightness(1.15); }
+.basket-chip-icon {
+  display: inline-block;
+  vertical-align: middle;
+}
+.basket-chip-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.4em;
+  height: 1.4em;
+  padding: 0 4px;
+  background: #f59e0b;
+  color: #0f172a;
+  border-radius: 9999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+@keyframes basket-chip-pulse {
+  0%   { transform: scale(1); }
+  50%  { transform: scale(1.15); }
+  100% { transform: scale(1); }
+}
+.basket-chip.basket-chip-pulse .basket-chip-count {
+  animation: basket-chip-pulse 320ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .basket-chip.basket-chip-pulse .basket-chip-count { animation: none; }
+}
+
 /* ----- Footer buttons (Phase 11) ----- */
 /* .kb-btn mirrors the .kb span visually; only hover + focus-visible
    indicate interactivity. Inherits font / color so the <kbd> children

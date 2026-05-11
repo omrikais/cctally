@@ -16,6 +16,13 @@ import {
   type ShareAction,
   type ShareModalState,
 } from './shareSlice';
+import {
+  basketReducer,
+  loadBasketFromStorage,
+  saveBasketToStorage,
+  type BasketAction,
+  type BasketSlice,
+} from './basketSlice';
 
 export type { ShareModalState, ComposerModalState } from './shareSlice';
 
@@ -263,6 +270,13 @@ export interface UIState {
   // OPEN_COMPOSER / CLOSE_COMPOSER through shareReducer.
   shareModal: ShareModalState | null;
   composerModal: ComposerModalState | null;
+  // Share v2 basket (spec §7). Recipe-only ordered list — never
+  // contains rendered bodies. Lifecycle is independent of `shareModal`
+  // (basket persists across the share modal closing/opening). Hydrated
+  // from localStorage on init; persisted on every mutation by the
+  // master dispatch wrapper below. State shape + pure reducer live in
+  // basketSlice.ts.
+  basket: BasketSlice;
 }
 
 function defaultPrefs(): Prefs {
@@ -341,6 +355,7 @@ function loadInitial(): UIState {
     dragPreviewOrder: null,
     update: defaultUpdateSlice(),
     ...initialShareState,
+    basket: { items: loadBasketFromStorage(), rejectedReason: null },
   };
 }
 
@@ -490,7 +505,12 @@ export type Action =
   // CLOSE_COMPOSER are forwarded to shareReducer (shareSlice.ts) and
   // emit() — the reducer is exported pure so the unit tests can drive
   // it without booting the master store.
-  | ShareAction;
+  | ShareAction
+  // Share v2 basket (spec §7). BASKET_ADD/REMOVE/REORDER/CLEAR are
+  // forwarded to basketReducer (basketSlice.ts); the master dispatch
+  // case persists every mutation to localStorage and surfaces the
+  // capacity-rejection toast.
+  | BasketAction;
 
 export function dispatch(action: Action): void {
   switch (action.type) {
@@ -841,6 +861,38 @@ export function dispatch(action: Action): void {
         action,
       );
       state = { ...state, ...slice };
+      break;
+    }
+    // Share v2 basket (spec §7). Forward to the pure reducer, then
+    // persist on every mutation AND surface a status toast on
+    // capacity-rejection. The toast is fired here (not in the
+    // reducer) so the reducer stays pure and tests don't need a
+    // master-store boot to exercise the rejection branch — the
+    // master-store integration test owns the toast-surfacing
+    // contract; the reducer test owns the rejectedReason sentinel.
+    case 'BASKET_ADD':
+    case 'BASKET_REMOVE':
+    case 'BASKET_REORDER':
+    case 'BASKET_CLEAR':
+    case 'BASKET_CLEAR_REJECTED':
+    case 'BASKET_HYDRATE': {
+      const next = basketReducer(state.basket, action);
+      if (next === state.basket) break;
+      // items array identity drives the localStorage write — we
+      // don't want to re-serialize 20 items every time the reducer
+      // toggles rejectedReason only.
+      const itemsChanged = next.items !== state.basket.items;
+      state = { ...state, basket: next };
+      if (itemsChanged) saveBasketToStorage(next.items);
+      if (action.type === 'BASKET_ADD' && next.rejectedReason === 'capacity') {
+        state = {
+          ...state,
+          toast: {
+            kind: 'status',
+            text: 'Basket is full (20 sections). Remove one to add another.',
+          },
+        };
+      }
       break;
     }
   }

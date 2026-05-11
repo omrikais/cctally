@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react';
+import { BasketChip } from './BasketChip';
 import { SyncChip } from './SyncChip';
 import { UpdateBadge } from './UpdateBadge';
 import { useSnapshot } from '../hooks/useSnapshot';
@@ -71,6 +72,10 @@ export function Header() {
         <span className="mute">vs last week</span>
       </div>
       <div className="topbar-actions">
+        {/* Share-report basket chip (spec §7.5). DOM-removed when
+            count = 0 — placed first in topbar-actions so it groups
+            with the action icon trio when present. */}
+        <BasketChip />
         <button
           type="button"
           className="topbar-icon-btn topbar-settings"
