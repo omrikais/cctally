@@ -208,6 +208,8 @@ class ComposeOptions:
     theme: str             # "light" | "dark"
     format: str            # "md" | "html" | "svg"
     no_branding: bool
+    # kernel: informational only — actual scrub happens upstream in
+    # the API layer before sections reach `compose()`.
     reveal_projects: bool
 
 
@@ -950,6 +952,8 @@ _SVG_PADDING = 20
 # baseline offsets for the 18pt title and 12pt subtitle — they live at the chrome
 # helper site, not at the composition site.)
 _SVG_FOOTER_BASELINE = 18
+# Vertical padding between stacked sections in `_stitch_svg`.
+_SVG_SECTION_GAP = 20.0
 
 
 def _render_svg(snap: ShareSnapshot, *, palette: dict,
@@ -1395,7 +1399,10 @@ def _stitch_md(sections: tuple[ComposedSection, ...], *,
         # Composite frontmatter: same key set as the single-section
         # `_build_md_frontmatter` but `panel` becomes `composed` and
         # `template_id` is dropped (multi-template).
-        from_section = sections[0].snap
+        # `generated_at` and `cctally_version` are taken from the first
+        # section since the composite document has no independent
+        # provenance — every section was rendered in the same request.
+        first_snap = sections[0].snap
         # `period` for the composite document = earliest start ..
         # latest end across all sections (per spec §11.5 implied
         # convention; reference test uses identical periods so the
@@ -1410,11 +1417,11 @@ def _stitch_md(sections: tuple[ComposedSection, ...], *,
         parts.append(
             "---\n"
             f"title: {_yaml_scalar(opts.title)}\n"
-            f"generated_at: {from_section.generated_at.isoformat()}\n"
+            f"generated_at: {first_snap.generated_at.isoformat()}\n"
             f"period: {earliest.isoformat()}..{latest.isoformat()}\n"
             f"panel: composed\n"
             f"anonymized: {anon_field}\n"
-            f"cctally_version: {from_section.version}\n"
+            f"cctally_version: {first_snap.version}\n"
             "---\n\n"
         )
     # Title as H1 (when frontmatter is present, this duplicates the
@@ -1433,7 +1440,12 @@ def _stitch_md(sections: tuple[ComposedSection, ...], *,
 
 def _stitch_svg(sections: tuple[ComposedSection, ...], *,
                 opts: ComposeOptions) -> str:
-    """SVG compose: single outer ``<svg>``, sections positioned vertically."""
+    """SVG compose: single outer ``<svg>``, sections positioned vertically.
+
+    `opts.no_branding` is intentionally unused: the SVG composite has no
+    chrome footer band, so there is nothing to strip. HTML stitcher uses
+    it to gate the `<footer>cctally · composed</footer>` line.
+    """
     palette = PALETTE_LIGHT if opts.theme == "light" else PALETTE_DARK
     inners: list[tuple[str, float, float]] = []
     for sec in sections:
@@ -1441,15 +1453,14 @@ def _stitch_svg(sections: tuple[ComposedSection, ...], *,
                                        palette=palette, branding=False)
         inners.append((inner, w, h))
     total_w = max(w for _, w, _ in inners)
-    SECTION_GAP = 20.0
-    total_h = sum(h for _, _, h in inners) + SECTION_GAP * (len(inners) - 1)
+    total_h = sum(h for _, _, h in inners) + _SVG_SECTION_GAP * (len(inners) - 1)
     body_blocks: list[str] = []
     y = 0.0
     for inner, _w, h in inners:
         body_blocks.append(
             f'<g transform="translate(0,{_fmt_num(y)})">{inner}</g>'
         )
-        y += h + SECTION_GAP
+        y += h + _SVG_SECTION_GAP
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" '
         f'viewBox="0 0 {_fmt_num(total_w)} {_fmt_num(total_h)}" '

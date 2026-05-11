@@ -33550,11 +33550,17 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             if not reveal_projects:
                 snap_built = ls._scrub(snap_built, reveal_projects=False)
 
-            digest_now = ls._data_digest({
-                "panel": panel,
-                "template_id": template_id,
-                "panel_data": panel_data,
-            })
+            # Defensive: digest is non-blocking metadata — fall back to
+            # "" on failure rather than 500-ing the whole compose
+            # (mirrors the render handler at bin/cctally:33402-33408).
+            try:
+                digest_now = ls._data_digest({
+                    "panel": panel,
+                    "template_id": template_id,
+                    "panel_data": panel_data,
+                })
+            except Exception:
+                digest_now = ""
             composed_sections.append(ls.ComposedSection(
                 snap=snap_built,
                 drift_detected=(digest_now != digest_at_add),
