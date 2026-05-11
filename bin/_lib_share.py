@@ -1216,9 +1216,8 @@ def _snapshot_is_anonymized(snap: ShareSnapshot) -> bool:
     ]
     if not cells:
         return False
-    import re as _re
     return all(
-        _re.fullmatch(r"project-\d+", c.label) or c.label == "(unknown)"
+        re.fullmatch(r"project-\d+", c.label) or c.label == "(unknown)"
         for c in cells
     )
 
@@ -1285,7 +1284,7 @@ def _wrap_document(fragment, *, format: str, palette: Mapping[str, str] | None,
         front = _build_md_frontmatter(snap) if branding else ""
         # Frontmatter already ends with "---\n" (trailing "" in the join
         # adds the separator newline); concat directly so the byte shape
-        # is `---\n...---\n\n<fragment>`. When branding=False, front is
+        # is `---\n...---\n<fragment>`. When branding=False, front is
         # "" and the fragment passes through untouched.
         return (front + fragment) if front else fragment
     raise ValueError(f"unknown format: {format!r}")
