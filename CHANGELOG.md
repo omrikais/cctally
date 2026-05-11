@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-05-11
+
 ### Added
 - `cctally update` subcommand for self-updating npm and Homebrew installs, with auto-suggest banner in CLI and amber update badge in the dashboard, plus `--check`, `--skip`, `--remind-later`, `--version` (npm only), `--json`, `--dry-run` flags. Source/dev installs fall through to a manual-recipe message. Dashboard modal streams live subprocess output and survives subprocess `execvp` restart via SSE auto-reconnect.
 - `update.check.enabled` and `update.check.ttl_hours` config keys for opting out of automatic version checks or extending the 24-hour default TTL up to 30 days.
