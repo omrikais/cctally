@@ -46,3 +46,32 @@ def test_share_template_dataclass_is_frozen():
         raise AssertionError("ShareTemplate should be frozen")
     except dataclasses.FrozenInstanceError:
         pass
+
+
+def _fake_weekly_panel_data():
+    """Synthetic panel_data shape returned by bin/cctally's _build_weekly_share_snapshot
+    when the source helper is reused."""
+    return {
+        "weeks": [
+            {"start_date": "2026-05-04", "cost_usd": 14.27, "pct_used": 0.71,
+             "dollar_per_pct": 0.20, "top_projects": [
+                ("project/aa", 5.12), ("project/bb", 3.81), ("project/cc", 2.04)]},
+        ],
+        "current_week_index": 0,
+    }
+
+
+def test_weekly_recap_builder_emits_snapshot():
+    tpl = _T.get_template("weekly-recap")
+    snap = tpl.builder(panel_data=_fake_weekly_panel_data(),
+                       options={"theme": "light", "reveal_projects": True,
+                                "no_branding": False, "top_n": 5,
+                                "show_chart": True, "show_table": True,
+                                "project_allowlist": None})
+    import dataclasses
+    assert dataclasses.is_dataclass(snap)
+    assert snap.cmd == "weekly"
+    assert snap.title and snap.period and snap.generated_at
+    # Recap should include both chart and table:
+    assert snap.chart is not None
+    assert len(snap.rows) > 0
