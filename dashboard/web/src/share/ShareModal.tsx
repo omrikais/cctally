@@ -28,6 +28,8 @@ import { TemplateGallery } from './TemplateGallery';
 import { Knobs } from './Knobs';
 import { PreviewPane } from './PreviewPane';
 import { ActionBar } from './ActionBar';
+import { PresetDropdown } from './PresetDropdown';
+import { ManagePresetsModal } from './ManagePresetsModal';
 import { sharePanelLabel } from './panelLabels';
 import { useKeymap } from '../hooks/useKeymap';
 
@@ -76,6 +78,8 @@ export function ShareModal({ panel, onClose }: Props) {
   // true, we stop re-applying template default_options when the
   // selectedTemplateId changes — the user's preferences win.
   const userTouchedOptionsRef = useRef(false);
+  // Manage-presets modal — opened from the PresetDropdown footer.
+  const [manageOpen, setManageOpen] = useState(false);
   // Title id for aria-labelledby. Stable across renders.
   const titleId = 'share-modal-title';
 
@@ -160,6 +164,19 @@ export function ShareModal({ panel, onClose }: Props) {
 
       <div className="share-modal-body">
         <section className="share-section share-gallery-section" aria-label="Template gallery">
+          <div className="share-gallery-header">
+            <PresetDropdown
+              panel={panel}
+              onPick={(tid, opts) => {
+                setSelectedTemplateId(tid);
+                // Picking a preset is an explicit user choice — stop
+                // re-applying template defaults from here on.
+                userTouchedOptionsRef.current = true;
+                setOptions((prev) => ({ ...prev, ...opts }));
+              }}
+              onManage={() => setManageOpen(true)}
+            />
+          </div>
           <TemplateGallery
             panel={panel}
             templates={templates}
@@ -203,6 +220,11 @@ export function ShareModal({ panel, onClose }: Props) {
       >
         ⤬
       </button>
+
+      <ManagePresetsModal
+        open={manageOpen}
+        onClose={() => setManageOpen(false)}
+      />
     </div>
   );
 }

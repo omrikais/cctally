@@ -163,9 +163,41 @@ describe('<ActionBar>', () => {
     expect(basket).toBeDisabled();
     expect(basket.getAttribute('title')).toMatch(/m3/i);
 
+    // M2.4 — Save preset is now live (no longer disabled). With a
+    // templateId in scope it should be enabled and carry the
+    // descriptive tooltip rather than the legacy "coming in M2" stub.
+    const preset = screen.getByRole('button', { name: /save preset/i });
+    expect(preset).not.toBeDisabled();
+    expect(preset.getAttribute('title')).toMatch(/save the current recipe/i);
+  });
+
+  it('Save preset is disabled when no template is selected', () => {
+    render(
+      <ActionBar
+        panel="weekly"
+        templateId={null}
+        options={defaults()}
+        onOptionsChange={() => {}}
+      />,
+    );
     const preset = screen.getByRole('button', { name: /save preset/i });
     expect(preset).toBeDisabled();
-    expect(preset.getAttribute('title')).toMatch(/m2/i);
+    expect(preset.getAttribute('title')).toMatch(/template/i);
+  });
+
+  it('Save preset click opens the inline popover', () => {
+    render(
+      <ActionBar
+        panel="weekly"
+        templateId="weekly-recap"
+        options={defaults()}
+        onOptionsChange={() => {}}
+      />,
+    );
+    const preset = screen.getByRole('button', { name: /save preset/i });
+    fireEvent.click(preset);
+    // Popover renders a role=dialog with aria-label "Save preset".
+    expect(screen.getByRole('dialog', { name: /save preset/i })).toBeInTheDocument();
   });
 
   it('Format radio dispatches onOptionsChange with new format', () => {

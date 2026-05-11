@@ -25,11 +25,12 @@
 // `!options.reveal_projects ? false : true` (i.e. honor the checkbox).
 // Because the preview already has a reveal=true copy in the iframe,
 // every export does a SEPARATE fetch — never re-use the preview body.
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { renderShare, ShareApiError } from './api';
 import type { ShareFormat, ShareOptions, SharePanelId } from './types';
 import { shareFormatExt } from './panelLabels';
 import { dispatch } from '../store/store';
+import { SavePresetPopover } from './SavePresetPopover';
 
 interface Props {
   panel: SharePanelId;
@@ -77,6 +78,25 @@ function triggerDownload(filename: string, blob: Blob): void {
 export function ActionBar({ panel, templateId, options, onOptionsChange }: Props) {
   const [busy, setBusy] = useState<null | 'copy' | 'download' | 'open'>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // M2 — "Save preset…" inline popover state. Anchored to the trigger
+  // button via a wrapping <div> so click-outside can close it.
+  const [savingOpen, setSavingOpen] = useState(false);
+  const saveTriggerRef = useRef<HTMLDivElement | null>(null);
+
+  // Click-outside-the-anchor dismisses the popover. mousedown so the
+  // press registers before the trigger's click re-opens it.
+  useEffect(() => {
+    if (!savingOpen) return;
+    function handler(e: MouseEvent) {
+      const root = saveTriggerRef.current;
+      if (!root) return;
+      if (!root.contains(e.target as Node)) {
+        setSavingOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [savingOpen]);
 
   // Clear stale error banner when the user pivots to a different format
   // or template — otherwise the prior "Copy failed: …" lingers while the
@@ -275,17 +295,33 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
           natural tab sequence matches spec §12.2 (tiles → knobs →
           format → actions → save preset). It is visually positioned
           right-aligned via CSS `.share-save-preset { margin-left: auto }`
-          inside its own row. */}
-      <div className="share-save-preset-row">
+          inside its own row. M2 — live trigger that hoists
+          <SavePresetPopover> inline, anchored to the button. */}
+      <div className="share-save-preset-row" ref={saveTriggerRef}>
         <button
           type="button"
           className="share-save-preset"
-          disabled
-          aria-disabled="true"
-          title="Save preset — coming in M2"
+          disabled={templateId == null || busy != null}
+          onClick={() => setSavingOpen((v) => !v)}
+          aria-haspopup="dialog"
+          aria-expanded={savingOpen}
+          title={
+            templateId == null
+              ? 'Pick a template first'
+              : 'Save the current recipe as a named preset'
+          }
         >
           Save preset…
         </button>
+        {savingOpen && templateId ? (
+          <SavePresetPopover
+            panel={panel}
+            templateId={templateId}
+            options={options}
+            onSaved={() => setSavingOpen(false)}
+            onCancel={() => setSavingOpen(false)}
+          />
+        ) : null}
       </div>
       {actionError ? (
         <div className="share-action-error" role="alert">
