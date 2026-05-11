@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { getState, subscribeStore } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 import { Modal } from './Modal';
+import { ShareIcon } from '../components/ShareIcon';
 import { modelChipClass } from '../lib/model';
 import type { SessionDetail } from '../types/envelope';
 
@@ -128,7 +130,18 @@ export function SessionModal() {
   }, [sessionId, generatedAt]);
 
   return (
-    <Modal title="Session detail" accentClass="accent-orange">
+    <Modal
+      title="Session detail"
+      accentClass="accent-orange"
+      headerExtras={
+        <ShareIcon
+          panel="sessions"
+          panelLabel="Session"
+          triggerId="session-modal"
+          onClick={() => dispatch(openShareModal('sessions', 'session-modal'))}
+        />
+      }
+    >
       <section className="modal-sessions">
         {loading ? (
           <div className="modal-loading" id="msess-loading">

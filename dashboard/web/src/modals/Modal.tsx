@@ -7,9 +7,16 @@ interface ModalProps {
   title: string;
   accentClass: string; // e.g. 'accent-green' | 'accent-purple' | 'accent-amber' | 'accent-orange'
   children: ReactNode;
+  // Optional slot rendered in the modal header, BEFORE the close button.
+  // Used by share-capable modals (plan §M1.10) to inject a <ShareIcon>
+  // alongside the existing × close affordance. Kept as a generic
+  // ReactNode slot rather than a typed ShareIcon prop so future header
+  // chrome (e.g. a basket-add toggle in M3) can use the same slot
+  // without churning Modal's signature.
+  headerExtras?: ReactNode;
 }
 
-export function Modal({ title, accentClass, children }: ModalProps) {
+export function Modal({ title, accentClass, children, headerExtras }: ModalProps) {
   const close = () => dispatch({ type: 'CLOSE_MODAL' });
   const bindings = useMemo(
     () => [{ key: 'Escape', scope: 'modal' as const, action: close }],
@@ -32,6 +39,7 @@ export function Modal({ title, accentClass, children }: ModalProps) {
         <div className="modal-handle" aria-hidden="true" />
         <header className="modal-header">
           <h2 id="modal-title">{title}</h2>
+          {headerExtras}
           <button className="modal-close" aria-label="Close" onClick={close}>
             ×
           </button>

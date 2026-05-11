@@ -8,6 +8,7 @@ import { triggerSync } from './store/sync';
 import { stepMatch, tryQuit } from './store/actions';
 import { refreshUpdateState } from './store/update';
 import { openPanelByPosition } from './lib/openPanelByPosition';
+import { buildShareKeyBinding } from './share/keyboardShare';
 import './index.css';
 
 // Boot SSE (module-scoped; StrictMode's double-mount cannot double-boot it).
@@ -51,6 +52,11 @@ registerKeymap([
   { key: 'q', scope: 'global', when: _updateOpenGuard, action: tryQuit },
   { key: 'n', scope: 'global', when: _updateOpenGuard, action: () => stepMatch(1) },
   { key: 'N', scope: 'global', when: _updateOpenGuard, action: () => stepMatch(-1) },
+  // Share v2 (spec §12.1). Opens the share modal for the focused panel.
+  // Guards (composer/share/panel modals empty, no input mode, focus on a
+  // share-capable panel, not mobile) live inside buildShareKeyBinding so
+  // tests can drive them through the same module main.tsx wires up.
+  buildShareKeyBinding(),
   {
     key: 'c',
     scope: 'sessions',

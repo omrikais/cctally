@@ -9,6 +9,15 @@ import { DEFAULT_PANEL_ORDER, type PanelId } from '../lib/panelIds';
 import { reconcilePanelOrder } from '../lib/reconcilePanelOrder';
 import { applyTableSort, coerceSortOverride, type SortOverride } from '../lib/tableSort';
 import { SESSIONS_COLUMNS } from '../lib/sessionsColumns';
+import {
+  initialShareState,
+  shareReducer,
+  type ComposerModalState,
+  type ShareAction,
+  type ShareModalState,
+} from './shareSlice';
+
+export type { ShareModalState, ComposerModalState } from './shareSlice';
 
 export type { SortOverride } from '../lib/tableSort';
 
@@ -175,7 +184,6 @@ export interface UIState {
   openSessionId: string | null;
   openBlockStartAt: string | null;
   openDailyDate: string | null;
-  focusIndex: number;            // 0..3 = panels, -1 = none
   sessionsSort: SessionSortKey;
   filterText: string;
   searchText: string;
@@ -244,6 +252,17 @@ export interface UIState {
   // status='success' and auto-closes when refreshState() returns
   // `current_version === latest_version`.
   update: UpdateSlice;
+  // Share v2 (spec §6.1). Two named slots, NOT folded into `openModal`,
+  // so the share modal can layer on top of a panel modal: the user opens
+  // a panel modal, inspects detail, clicks the share affordance, and the
+  // share modal appears in front without unmounting the underlying panel
+  // modal. `composerModal` is the multi-section editor that supersedes
+  // the per-panel `shareModal` when the user clicks "Customize…" inside
+  // it. State shape + reducer + action creators live in shareSlice.ts;
+  // the master dispatch below forwards OPEN_SHARE / CLOSE_SHARE /
+  // OPEN_COMPOSER / CLOSE_COMPOSER through shareReducer.
+  shareModal: ShareModalState | null;
+  composerModal: ComposerModalState | null;
 }
 
 function defaultPrefs(): Prefs {
@@ -304,7 +323,6 @@ function loadInitial(): UIState {
     openSessionId: null,
     openBlockStartAt: null,
     openDailyDate: null,
-    focusIndex: -1,
     sessionsSort: prefs.sortDefault,
     filterText: localStorage.getItem(FILTER_KEY) ?? '',
     searchText: '',
@@ -322,6 +340,7 @@ function loadInitial(): UIState {
     alertToastQueue: [],
     dragPreviewOrder: null,
     update: defaultUpdateSlice(),
+    ...initialShareState,
   };
 }
 
@@ -402,7 +421,6 @@ export type Action =
   | { type: 'SET_SEARCH_MATCHES'; matches: number[]; index: number }
   | { type: 'SET_SORT'; key: SessionSortKey }
   | { type: 'SET_INPUT_MODE'; mode: InputMode }
-  | { type: 'SET_FOCUS'; index: number }
   | { type: 'SAVE_PREFS'; patch: Partial<Prefs> }
   | { type: 'RESET_PREFS' }
   | { type: 'RESET_PANEL_ORDER' }
@@ -467,7 +485,12 @@ export type Action =
   | { type: 'SET_UPDATE_STATUS'; status: UpdateRunStatus; errorMessage?: string | null }
   | { type: 'SET_UPDATE_RUN_ID'; runId: string | null; startedAt?: number | null }
   | { type: 'APPEND_UPDATE_STREAM'; event: UpdateStreamEvent }
-  | { type: 'RESET_UPDATE_RUN' };
+  | { type: 'RESET_UPDATE_RUN' }
+  // Share v2 (spec §6.1). OPEN_SHARE / CLOSE_SHARE / OPEN_COMPOSER /
+  // CLOSE_COMPOSER are forwarded to shareReducer (shareSlice.ts) and
+  // emit() — the reducer is exported pure so the unit tests can drive
+  // it without booting the master store.
+  | ShareAction;
 
 export function dispatch(action: Action): void {
   switch (action.type) {
@@ -517,9 +540,6 @@ export function dispatch(action: Action): void {
     }
     case 'SET_INPUT_MODE':
       state = { ...state, inputMode: action.mode };
-      break;
-    case 'SET_FOCUS':
-      state = { ...state, focusIndex: action.index };
       break;
     case 'SAVE_PREFS': {
       const prefs = { ...state.prefs, ...action.patch };
@@ -807,6 +827,22 @@ export function dispatch(action: Action): void {
         },
       };
       break;
+    // Share v2 (spec §6.1). The four cases delegate the {shareModal,
+    // composerModal} slot updates to shareReducer (a pure function in
+    // shareSlice.ts) and lift the returned subset onto the master
+    // state. Mirrors the OPEN_MODAL / CLOSE_MODAL flow above: emit() at
+    // the bottom of dispatch picks up the new state for subscribers.
+    case 'OPEN_SHARE':
+    case 'CLOSE_SHARE':
+    case 'OPEN_COMPOSER':
+    case 'CLOSE_COMPOSER': {
+      const slice = shareReducer(
+        { shareModal: state.shareModal, composerModal: state.composerModal },
+        action,
+      );
+      state = { ...state, ...slice };
+      break;
+    }
   }
   emit();
 }

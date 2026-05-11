@@ -3,11 +3,13 @@ import { useSnapshot } from '../hooks/useSnapshot';
 import { Sparkline } from '../components/Sparkline';
 import { SortableHeader } from '../components/SortableHeader';
 import { PanelGrip } from '../components/PanelGrip';
+import { ShareIcon } from '../components/ShareIcon';
 import { fmt } from '../lib/fmt';
 import { applyTableSort } from '../lib/tableSort';
 import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
 import { buildTrendSparkData } from '../store/selectors';
 import { dispatch, getState, subscribeStore } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 
 // Reads trend.weeks (8 rows) via buildTrendSparkData — CLAUDE.md
 // gotcha: do NOT merge with trend.history (12 rows, modal-only).
@@ -46,6 +48,12 @@ export function TrendPanel() {
         <h3 style={{ color: 'var(--accent-amber)' }}>
           $/1% Trend <span className="sub">(8 weeks)</span>
         </h3>
+        <ShareIcon
+          panel="trend"
+          panelLabel="Trend"
+          triggerId="trend-panel"
+          onClick={() => dispatch(openShareModal('trend', 'trend-panel'))}
+        />
         <PanelGrip />
       </div>
       <div className="panel-body">

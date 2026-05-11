@@ -2,8 +2,10 @@ import { useSnapshot } from '../hooks/useSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { ProgressBar } from '../components/ProgressBar';
 import { PanelGrip } from '../components/PanelGrip';
+import { ShareIcon } from '../components/ShareIcon';
 import { fmt } from '../lib/fmt';
 import { dispatch } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 
 function formatHHMMSS(iso: string | null | undefined): string | null {
   if (!iso) return null;
@@ -86,6 +88,12 @@ export function CurrentWeekPanel() {
             {freshness.age_seconds}s ago
           </span>
         )}
+        <ShareIcon
+          panel="current-week"
+          panelLabel="Current week"
+          triggerId="current-week-panel"
+          onClick={() => dispatch(openShareModal('current-week', 'current-week-panel'))}
+        />
         <PanelGrip />
       </div>
       <div className="panel-body">

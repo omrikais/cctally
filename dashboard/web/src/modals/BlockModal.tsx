@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { getState, subscribeStore } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { Modal } from './Modal';
 import { BlockTimeline } from './BlockTimeline';
+import { ShareIcon } from '../components/ShareIcon';
 import { fmt, type FmtCtx } from '../lib/fmt';
 import { modelChipClass } from '../lib/model';
 import type { BlockDetail } from '../types/envelope';
@@ -112,7 +114,18 @@ export function BlockModal() {
     : 'Block';
 
   return (
-    <Modal title={title} accentClass="accent-blue">
+    <Modal
+      title={title}
+      accentClass="accent-blue"
+      headerExtras={
+        <ShareIcon
+          panel="blocks"
+          panelLabel="5-hour block"
+          triggerId="block-modal"
+          onClick={() => dispatch(openShareModal('blocks', 'block-modal'))}
+        />
+      }
+    >
       <section className="modal-block">
         {loading ? (
           <div className="modal-loading">Loading block detail…</div>

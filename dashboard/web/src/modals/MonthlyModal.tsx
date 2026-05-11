@@ -2,9 +2,11 @@ import { useEffect, useState } from 'react';
 import { Modal } from './Modal';
 import { PeriodDetailCard } from './PeriodDetailCard';
 import { PeriodTable } from './PeriodTable';
+import { ShareIcon } from '../components/ShareIcon';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { registerKeymap } from '../store/keymap';
-import { getState } from '../store/store';
+import { dispatch, getState } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 
 export function MonthlyModal() {
   const env = useSnapshot();
@@ -29,9 +31,22 @@ export function MonthlyModal() {
     ]);
   }, [rowCount]);
 
+  const headerExtras = (
+    <ShareIcon
+      panel="monthly"
+      panelLabel="Monthly"
+      triggerId="monthly-modal"
+      onClick={() => dispatch(openShareModal('monthly', 'monthly-modal'))}
+    />
+  );
+
   if (rowCount === 0) {
     return (
-      <Modal title="Monthly history · last 12" accentClass="accent-pink">
+      <Modal
+        title="Monthly history · last 12"
+        accentClass="accent-pink"
+        headerExtras={headerExtras}
+      >
         <div className="panel-empty">No usage history yet.</div>
       </Modal>
     );
@@ -40,7 +55,11 @@ export function MonthlyModal() {
   const row = rows[Math.min(selectedIndex, rowCount - 1)];
 
   return (
-    <Modal title="Monthly history · last 12" accentClass="accent-pink">
+    <Modal
+      title="Monthly history · last 12"
+      accentClass="accent-pink"
+      headerExtras={headerExtras}
+    >
       <PeriodDetailCard row={row} variant="monthly" accentClass="accent-pink" />
       <PeriodTable
         rows={rows}

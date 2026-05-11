@@ -2,9 +2,11 @@ import { useEffect, useState, useSyncExternalStore } from 'react';
 import { Modal } from './Modal';
 import { DailyMiniBars } from './DailyMiniBars';
 import { PeriodDetailCard } from './PeriodDetailCard';
+import { ShareIcon } from '../components/ShareIcon';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { registerKeymap } from '../store/keymap';
-import { getState, subscribeStore } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 import type { DailyPanelRow, PeriodRow } from '../types/envelope';
 
 /**
@@ -86,9 +88,22 @@ export function DailyModal() {
     ]);
   }, [rows, effectiveDate]);
 
+  const headerExtras = (
+    <ShareIcon
+      panel="daily"
+      panelLabel="Daily"
+      triggerId="daily-modal"
+      onClick={() => dispatch(openShareModal('daily', 'daily-modal'))}
+    />
+  );
+
   if (rows.length === 0) {
     return (
-      <Modal title="Daily history · last 30" accentClass="accent-indigo">
+      <Modal
+        title="Daily history · last 30"
+        accentClass="accent-indigo"
+        headerExtras={headerExtras}
+      >
         <div className="panel-empty">No usage history yet.</div>
       </Modal>
     );
@@ -102,7 +117,11 @@ export function DailyModal() {
   const periodRow = dailyToPeriodRow(selected, prior);
 
   return (
-    <Modal title="Daily history · last 30" accentClass="accent-indigo">
+    <Modal
+      title="Daily history · last 30"
+      accentClass="accent-indigo"
+      headerExtras={headerExtras}
+    >
       <DailyMiniBars
         rows={rows}
         selectedDate={effectiveDate}

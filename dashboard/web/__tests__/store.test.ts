@@ -160,10 +160,6 @@ describe('dispatch — UI state', () => {
     dispatch({ type: 'SET_INPUT_MODE', mode: null });
     expect(getState().inputMode).toBe(null);
   });
-  it('SET_FOCUS', () => {
-    dispatch({ type: 'SET_FOCUS', index: 3 });
-    expect(getState().focusIndex).toBe(3);
-  });
 });
 
 describe('localStorage migration — ccusage.dashboard.sort retirement', () => {

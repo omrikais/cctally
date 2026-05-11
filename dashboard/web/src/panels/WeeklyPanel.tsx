@@ -1,8 +1,10 @@
 import { useLayoutEffect, useRef, useState } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
+import { ShareIcon } from '../components/ShareIcon';
 import { fmt } from '../lib/fmt';
 import { dispatch } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 import type { PeriodRow } from '../types/envelope';
 
 const VISIBLE_ROWS = 8;
@@ -82,6 +84,12 @@ export function WeeklyPanel() {
         <h3 style={{ color: 'var(--accent-cyan)' }}>
           Weekly <span className="sub">(model split · 8 weeks)</span>
         </h3>
+        <ShareIcon
+          panel="weekly"
+          panelLabel="Weekly"
+          triggerId="weekly-panel"
+          onClick={() => dispatch(openShareModal('weekly', 'weekly-panel'))}
+        />
         <PanelGrip />
       </div>
       <div className="panel-body">

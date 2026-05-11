@@ -1,7 +1,10 @@
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { Modal } from './Modal';
+import { ShareIcon } from '../components/ShareIcon';
 import { fmt, type FmtCtx } from '../lib/fmt';
+import { dispatch } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 import type { Milestone } from '../types/envelope';
 
 function clamp0_100(v: number | null | undefined): number {
@@ -74,7 +77,18 @@ export function CurrentWeekModal() {
   const subText = msSub(ms);
 
   return (
-    <Modal title="Current Week — per-percent milestones" accentClass="accent-green">
+    <Modal
+      title="Current Week — per-percent milestones"
+      accentClass="accent-green"
+      headerExtras={
+        <ShareIcon
+          panel="current-week"
+          panelLabel="Current week"
+          triggerId="current-week-modal"
+          onClick={() => dispatch(openShareModal('current-week', 'current-week-modal'))}
+        />
+      }
+    >
       <section className="modal-current-week">
         <div className="m-chipstrip" id="mcw-badges">
           <span className="m-pill accent-green" id="mcw-week-pill">

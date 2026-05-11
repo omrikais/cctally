@@ -1,5 +1,7 @@
 # Shareable reports (`--format` on reporting commands)
 
+**For the dashboard GUI version**, see [`share-v2`](share-v2.md).
+
 `cctally` has a cross-command shareable-output surface: 8 reporting subcommands accept a `--format {md,html,svg}` flag that produces a self-contained artifact suitable for chat paste, GitHub issue, or screenshot. This page is the single reference for the flag surface; per-command pages document the per-command chart and table layouts.
 
 ## Supported subcommands

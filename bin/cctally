@@ -27638,6 +27638,15 @@ def _share_now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
+def _share_now_utc_iso() -> str:
+    """`generated_at` ISO-8601 source for /api/share/render snapshot envelopes.
+
+    Honors `CCTALLY_AS_OF` like `_share_now_utc` so fixture goldens stay
+    deterministic across the CLI and HTTP paths. Format `YYYY-MM-DDTHH:MM:SSZ`.
+    """
+    return _share_now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _share_resolve_version() -> str:
     """Source from CHANGELOG via the existing release helper. Empty string if unset.
 
@@ -28914,6 +28923,389 @@ def _build_session_snapshot(
         chart=chart, totals=totals, notes=notes,
         generated_at=_share_now_utc(), version=version,
     )
+
+
+# ---- v2 share panel_data builders (spec §5.2, plan M1.6) -------------
+#
+# These translate the live dashboard `DataSnapshot` into the dict shapes
+# the M1.4 Recap builders (in `bin/_lib_share_templates.py`) consume.
+# They're a thin extract step — the DataSnapshot was already built by
+# the sync thread, so this path doesn't re-query the DB on the share
+# hot path.
+#
+# Per-panel shape contracts live in each Recap builder's docstring in
+# `bin/_lib_share_templates.py` (see `_build_<panel>_recap`); the keys
+# below MUST stay in lockstep with those docstrings — the
+# producer/consumer contract.
+#
+# When the snapshot has no data for a given panel (fresh install, no
+# sync yet), the builder returns a minimal empty-shaped dict that the
+# downstream Recap builder renders as a "no data" snapshot (kernel
+# handles empty `weeks=[]` / `days=[]` / etc.).
+
+
+def _share_iso(value) -> "str | None":
+    """Coerce a datetime / ISO-string into an ISO-8601 string with `Z` suffix.
+
+    DataSnapshot mixes attribute types (`week_start_at` is a
+    `dt.datetime`; `WeeklyPeriodRow.week_start_at` is already a string).
+    Recap builders' `_parse_iso_utc` accepts both shapes via fromisoformat
+    + `Z`-swap, but normalizing here keeps the wire format consistent.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        v = value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
+        return v.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return str(value)
+
+
+def _build_share_panel_data(panel: str, options: dict,
+                            snap: "DataSnapshot | None") -> dict:
+    """Dispatch to the per-panel builder; reuses the dashboard DataSnapshot.
+
+    Each per-panel builder reads from the already-built `DataSnapshot`
+    rather than re-running CLI aggregation queries — keeps /api/share/render
+    cheap and ensures the share artifact matches what the dashboard panel
+    is currently showing.
+    """
+    if panel == "weekly":      return _build_weekly_share_panel_data(options, snap)
+    if panel == "daily":       return _build_daily_share_panel_data(options, snap)
+    if panel == "monthly":     return _build_monthly_share_panel_data(options, snap)
+    if panel == "trend":       return _build_trend_share_panel_data(options, snap)
+    if panel == "forecast":    return _build_forecast_share_panel_data(options, snap)
+    if panel == "blocks":      return _build_blocks_share_panel_data(options, snap)
+    if panel == "sessions":    return _build_sessions_share_panel_data(options, snap)
+    if panel == "current-week": return _build_current_week_share_panel_data(options, snap)
+    raise ValueError(f"unknown share panel: {panel!r}")
+
+
+def _share_empty_week_stub() -> dict:
+    """Minimal week shape so empty snapshots render as "no data" cleanly.
+
+    Recap builders index `weeks[idx]` directly; supplying one zero-filled
+    row keeps that access safe without leaking misleading numbers (the
+    rendered artifact shows $0.00 / 0.0% — accurate for an empty install).
+    """
+    return {
+        "start_date":     _share_now_utc().strftime("%Y-%m-%d"),
+        "cost_usd":       0.0,
+        "pct_used":       0.0,
+        "dollar_per_pct": 0.0,
+        "top_projects":   [],
+    }
+
+
+def _build_weekly_share_panel_data(options: dict,
+                                    snap: "DataSnapshot | None") -> dict:
+    """Weekly panel_data — last 8 subscription weeks + current-week index.
+
+    Reuses `DataSnapshot.weekly_periods` (WeeklyPeriodRow list), already
+    built by `_dashboard_build_weekly_periods` in the sync thread. Empty
+    snapshots emit a one-week stub so the Recap builder's `weeks[idx]`
+    access stays safe (renders as $0.00 / 0.0% — accurate "no data").
+    """
+    rows = list(getattr(snap, "weekly_periods", None) or []) if snap else []
+    # weekly_periods is built with n=12; clip to 8 for the share panel.
+    rows_8 = rows[-8:]
+    weeks: list[dict] = []
+    current_idx = 0
+    for i, r in enumerate(rows_8):
+        if getattr(r, "is_current", False):
+            current_idx = i
+        # WeeklyPeriodRow.week_start_at is an ISO datetime string; the
+        # Recap shape wants a YYYY-MM-DD date label. Slice the leading
+        # 10 chars (or fall back to parsing).
+        wsa = getattr(r, "week_start_at", "") or ""
+        start_date = wsa[:10] if isinstance(wsa, str) and len(wsa) >= 10 else wsa
+        cost = float(getattr(r, "cost_usd", 0.0) or 0.0)
+        used_pct_raw = getattr(r, "used_pct", None)
+        used_pct = (float(used_pct_raw) / 100.0) if used_pct_raw is not None else 0.0
+        dpp = float(getattr(r, "dollar_per_pct", 0.0) or 0.0)
+        weeks.append({
+            "start_date":     start_date,
+            "cost_usd":       cost,
+            "pct_used":       used_pct,
+            "dollar_per_pct": dpp,
+            "top_projects":   [],  # per-project rollup not on WeeklyPeriodRow yet
+        })
+    if not weeks:
+        weeks = [_share_empty_week_stub()]
+    return {"weeks": weeks, "current_week_index": current_idx}
+
+
+def _build_current_week_share_panel_data(options: dict,
+                                          snap: "DataSnapshot | None") -> dict:
+    """Current-week panel_data — KPI strip + daily progression + top projects.
+
+    Synthesized from `DataSnapshot.current_week` + `daily_panel` (no 1:1
+    CLI counterpart, per spec §9.5). `daily_progression` clips the daily
+    panel to the current subscription week.
+    """
+    cw = getattr(snap, "current_week", None) if snap else None
+    daily = list(getattr(snap, "daily_panel", None) or []) if snap else []
+    if cw is None:
+        # Empty-shape fallback — Recap builder renders "no data" gracefully.
+        return {
+            "kpi_cost_usd":       0.0,
+            "kpi_pct_used":       0.0,
+            "kpi_dollar_per_pct": 0.0,
+            "kpi_days_remaining": 0.0,
+            "daily_progression":  [],
+            "top_projects":       [],
+            "week_start_date":    _share_now_utc().strftime("%Y-%m-%d"),
+            "display_tz":         options.get("display_tz", "Etc/UTC"),
+        }
+    week_start = getattr(cw, "week_start_at", None)
+    week_end = getattr(cw, "week_end_at", None)
+    week_start_date = (
+        week_start.strftime("%Y-%m-%d") if isinstance(week_start, dt.datetime)
+        else _share_now_utc().strftime("%Y-%m-%d")
+    )
+    # Days remaining = hours_to_reset / 24
+    days_remaining = 0.0
+    if isinstance(week_end, dt.datetime):
+        remaining = (week_end - _share_now_utc()).total_seconds() / 86400.0
+        days_remaining = max(0.0, remaining)
+    used_pct = float(getattr(cw, "used_pct", 0.0) or 0.0) / 100.0
+    progression: list[dict] = []
+    if isinstance(week_start, dt.datetime):
+        ws_date = week_start.date()
+        for r in daily:
+            try:
+                d = dt.date.fromisoformat(getattr(r, "date", "") or "")
+            except ValueError:
+                continue
+            if d >= ws_date:
+                progression.append({
+                    "date":     d.isoformat(),
+                    "cost_usd": float(getattr(r, "cost_usd", 0.0) or 0.0),
+                })
+    return {
+        "kpi_cost_usd":       float(getattr(cw, "spent_usd", 0.0) or 0.0),
+        "kpi_pct_used":       used_pct,
+        "kpi_dollar_per_pct": float(getattr(cw, "dollars_per_percent", 0.0) or 0.0),
+        "kpi_days_remaining": days_remaining,
+        "daily_progression":  progression,
+        "top_projects":       [],  # per-project rollup not on TuiCurrentWeek
+        "week_start_date":    week_start_date,
+        "display_tz":         options.get("display_tz", "Etc/UTC"),
+    }
+
+
+def _build_trend_share_panel_data(options: dict,
+                                   snap: "DataSnapshot | None") -> dict:
+    """Trend panel_data — 8 weeks of $/% + 3-week delta KPI.
+
+    Reuses `DataSnapshot.trend` (TuiTrendRow list, already 8 rows).
+    """
+    trend = list(getattr(snap, "trend", None) or []) if snap else []
+    weeks: list[dict] = []
+    for r in trend:
+        wsa = getattr(r, "week_start_at", None)
+        start_date = (
+            wsa.strftime("%Y-%m-%d") if isinstance(wsa, dt.datetime)
+            else (str(wsa)[:10] if wsa else "")
+        )
+        used_pct_raw = getattr(r, "used_pct", None)
+        used_pct = (float(used_pct_raw) / 100.0) if used_pct_raw is not None else 0.0
+        dpp = float(getattr(r, "dollars_per_percent", 0.0) or 0.0)
+        weeks.append({
+            "start_date":     start_date,
+            "cost_usd":       dpp * (used_pct * 100.0),  # ≈ row total
+            "pct_used":       used_pct,
+            "dollar_per_pct": dpp,
+        })
+    # Compute 3-week delta: compare last row vs row-4-from-end.
+    delta = {"dpp_change_pct": 0.0, "cost_change_usd": 0.0}
+    if len(weeks) >= 4:
+        cur = weeks[-1]
+        ref = weeks[-4]
+        if ref["dollar_per_pct"]:
+            delta["dpp_change_pct"] = (
+                (cur["dollar_per_pct"] - ref["dollar_per_pct"]) / ref["dollar_per_pct"]
+            )
+        delta["cost_change_usd"] = cur["cost_usd"] - ref["cost_usd"]
+    return {"weeks": weeks, "delta_3_weeks": delta}
+
+
+def _build_daily_share_panel_data(options: dict,
+                                   snap: "DataSnapshot | None") -> dict:
+    """Daily panel_data — last 7 days with top model per day + top projects.
+
+    Reuses `DataSnapshot.daily_panel` (DailyPanelRow list, 30 rows in
+    full); clips to the most recent 7 for the Recap.
+    """
+    daily = list(getattr(snap, "daily_panel", None) or []) if snap else []
+    last_7 = daily[-7:]
+    total = sum(float(getattr(r, "cost_usd", 0.0) or 0.0) for r in last_7) or 1.0
+    days: list[dict] = []
+    for r in last_7:
+        cost = float(getattr(r, "cost_usd", 0.0) or 0.0)
+        models = getattr(r, "models", None) or []
+        top_model = (models[0].get("model") if models else None) or "—"
+        days.append({
+            "date":          getattr(r, "date", "") or "",
+            "cost_usd":      cost,
+            "pct_of_period": cost / total,
+            "top_model":     top_model,
+        })
+    return {"days": days, "top_projects": []}
+
+
+def _build_monthly_share_panel_data(options: dict,
+                                     snap: "DataSnapshot | None") -> dict:
+    """Monthly panel_data — last 12 months + top projects.
+
+    Reuses `DataSnapshot.monthly_periods` (MonthlyPeriodRow list).
+    `used_pct` isn't stored on MonthlyPeriodRow (monthly aggregates
+    don't carry a subscription-quota %), so it surfaces as 0.0.
+    """
+    rows = list(getattr(snap, "monthly_periods", None) or []) if snap else []
+    months: list[dict] = []
+    for r in rows:
+        models = getattr(r, "models", None) or []
+        top_model = (models[0].get("model") if models else None) or "—"
+        months.append({
+            "month":     getattr(r, "label", "") or "",  # "YYYY-MM"
+            "cost_usd":  float(getattr(r, "cost_usd", 0.0) or 0.0),
+            "pct_used":  0.0,
+            "top_model": top_model,
+        })
+    return {"months": months, "top_projects": []}
+
+
+def _build_forecast_share_panel_data(options: dict,
+                                      snap: "DataSnapshot | None") -> dict:
+    """Forecast panel_data — projection + per-day budgets + days-to-ceiling.
+
+    Reuses `DataSnapshot.forecast` (ForecastOutput).
+    `projection_curve` is synthesized from `r_avg` / `r_recent` /
+    `inputs.p_now` — the same arithmetic `snapshot_to_envelope` does for
+    `week_avg_projection_pct` / `recent_24h_projection_pct`, extended
+    across the next 7 days.
+    """
+    fc = getattr(snap, "forecast", None) if snap else None
+    if fc is None:
+        return {
+            "projected_end_pct":  0.0,
+            "days_to_100pct":     0.0,
+            "days_to_90pct":      0.0,
+            "daily_budgets": {
+                "avg": 0.0, "recent_24h": 0.0,
+                "until_90pct": 0.0, "until_100pct": 0.0,
+            },
+            "projection_curve": [],
+            "confidence":       "LOW CONF",
+        }
+    inputs = getattr(fc, "inputs", None)
+    p_now = float(getattr(inputs, "p_now", 0.0) or 0.0) if inputs else 0.0
+    remaining_hours = float(
+        getattr(inputs, "remaining_hours", 0.0) or 0.0
+    ) if inputs else 0.0
+    confidence = getattr(inputs, "confidence", "ok") if inputs else "ok"
+    r_avg = float(getattr(fc, "r_avg", 0.0) or 0.0)
+    r_recent_raw = getattr(fc, "r_recent", None)
+    r_recent = float(r_recent_raw) if r_recent_raw is not None else r_avg
+    # End-of-week projected %
+    projected_end_pct = (p_now + r_avg * remaining_hours) / 100.0
+    # Days to ceilings (simple inverse: hours-to-target / 24)
+    def _days_to_ceiling(target_pct: float) -> float:
+        if r_avg <= 0 or p_now >= target_pct:
+            return 0.0
+        hours = (target_pct - p_now) / r_avg
+        return max(0.0, hours / 24.0)
+    days_to_100 = _days_to_ceiling(100.0)
+    days_to_90 = _days_to_ceiling(90.0)
+    # Daily budgets — pull from fc.budgets[] when present
+    budgets: dict = {"avg": 0.0, "recent_24h": 0.0,
+                     "until_90pct": 0.0, "until_100pct": 0.0}
+    for b in getattr(fc, "budgets", None) or []:
+        tp = getattr(b, "target_percent", None)
+        dpd = float(getattr(b, "dollars_per_day", 0.0) or 0.0)
+        if tp == 100:
+            budgets["until_100pct"] = dpd
+        elif tp == 90:
+            budgets["until_90pct"] = dpd
+    # avg / recent_24h: derive from dollars-per-percent × r_avg/r_recent.
+    dpp = float(getattr(inputs, "dollars_per_percent", 0.0) or 0.0) if inputs else 0.0
+    budgets["avg"] = dpp * r_avg * 24.0
+    budgets["recent_24h"] = dpp * r_recent * 24.0
+    # Projection curve — 7-day forward, using r_avg
+    today = _share_now_utc().date()
+    projection_curve: list[dict] = []
+    for i in range(7):
+        d = today + dt.timedelta(days=i)
+        pct = (p_now + r_avg * (i * 24.0)) / 100.0
+        projection_curve.append({
+            "date":               d.isoformat(),
+            "projected_pct_used": pct,
+        })
+    return {
+        "projected_end_pct":  projected_end_pct,
+        "days_to_100pct":     days_to_100,
+        "days_to_90pct":      days_to_90,
+        "daily_budgets":      budgets,
+        "projection_curve":   projection_curve,
+        "confidence":         confidence,
+    }
+
+
+def _build_blocks_share_panel_data(options: dict,
+                                    snap: "DataSnapshot | None") -> dict:
+    """Blocks panel_data — current 5h block KPI + 8 recent blocks + top projects.
+
+    Reuses `DataSnapshot.blocks_panel` (BlocksPanelRow list). Current
+    block is the row with `is_active=True`; recent_blocks are the last 8.
+    """
+    rows = list(getattr(snap, "blocks_panel", None) or []) if snap else []
+    current = next((r for r in rows if getattr(r, "is_active", False)), None)
+    cb: dict = {}
+    if current is not None:
+        cb = {
+            "start_at":     _share_iso(getattr(current, "start_at", None)) or "",
+            "end_at":       _share_iso(getattr(current, "end_at", None)) or "",
+            "cost_usd":     float(getattr(current, "cost_usd", 0.0) or 0.0),
+            "pct_used":     0.0,  # BlocksPanelRow doesn't carry a %
+            "tokens_total": 0,    # BlocksPanelRow drops token counts
+        }
+    recent: list[dict] = []
+    for r in rows[-8:]:
+        recent.append({
+            "start_at": _share_iso(getattr(r, "start_at", None)) or "",
+            "cost_usd": float(getattr(r, "cost_usd", 0.0) or 0.0),
+        })
+    return {
+        "current_block": cb,
+        "recent_blocks": recent,
+        "top_projects":  [],
+    }
+
+
+def _build_sessions_share_panel_data(options: dict,
+                                      snap: "DataSnapshot | None") -> dict:
+    """Sessions panel_data — top N sessions table.
+
+    Reuses `DataSnapshot.sessions` (TuiSessionRow list). Truncated to
+    `options.top_n` (default 15) by upstream cap before the Recap builder
+    runs its own slice.
+    """
+    rows = list(getattr(snap, "sessions", None) or []) if snap else []
+    top_n = options.get("top_n", 15)
+    try:
+        top_n_int = max(1, int(top_n))
+    except (TypeError, ValueError):
+        top_n_int = 15
+    sessions: list[dict] = []
+    for r in rows[:top_n_int]:
+        sessions.append({
+            "session_id":   getattr(r, "session_id", "") or "",
+            "project_path": getattr(r, "project_label", "") or "",
+            "cost_usd":     float(getattr(r, "cost_usd", 0.0) or 0.0),
+            "started_at":   _share_iso(getattr(r, "started_at", None)) or "",
+            "model":        getattr(r, "model_primary", "") or "",
+        })
+    return {"sessions": sessions}
 
 
 def _share_render_and_emit(snap, args) -> None:
@@ -32215,6 +32607,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_get_update_status()
         elif path.startswith("/api/update/stream/"):
             self._handle_get_update_stream(path)
+        elif path == "/api/share/templates":
+            self._handle_share_templates_get()
         else:
             self.send_error(404, "not found")
 
@@ -32230,6 +32624,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_post_update()
         elif path == "/api/update/dismiss":
             self._handle_post_update_dismiss()
+        elif path == "/api/share/render":
+            self._handle_share_render_post()
         else:
             self.send_error(404, "not found")
 
@@ -32770,6 +33166,249 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             )
         status = _dispatch_alert_notification(payload, mode="test")
         self._respond_json(200, {"alert": payload, "dispatch": status})
+
+    # ---- share endpoints (spec §5.1) ----------------------------------
+    #
+    # GET  /api/share/templates?panel=<id> → list Recap/Visual/Detail
+    #      templates registered in _lib_share_templates for that panel.
+    # POST /api/share/render               → render one panel-section to
+    #      body via the kernel; returns {body, content_type, snapshot}
+    #      with kernel_version + data_digest for v2 composer drift checks.
+    #
+    # The template registry is late-imported per-request to keep dashboard
+    # startup cheap — matches cmd_tui's `rich` lazy-import pattern. Same
+    # late-load applies to the kernel (`_lib_share`) via `_share_load_lib`.
+    # GET is unauthenticated (idempotent read). POST gates on
+    # `_check_origin_csrf` (same convention as /api/sync, /api/settings).
+
+    def _share_load_templates_module(self):
+        """Late-load the share-templates registry, cached in sys.modules.
+
+        Keeps dashboard startup zero-cost — the registry only imports when
+        the first share request arrives. Subsequent requests reuse the
+        sys.modules entry; matches the `_share_load_lib` convention so
+        ShareTemplate identity stays stable across calls.
+        """
+        cached = sys.modules.get("_lib_share_templates")
+        if cached is not None:
+            return cached
+        import importlib.util as _ilu
+        p = pathlib.Path(__file__).resolve().parent / "_lib_share_templates.py"
+        spec = _ilu.spec_from_file_location("_lib_share_templates", p)
+        mod = _ilu.module_from_spec(spec)
+        sys.modules["_lib_share_templates"] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop("_lib_share_templates", None)
+            raise
+        return mod
+
+    def _handle_share_templates_get(self) -> None:
+        """List share templates registered for the requested panel.
+
+        Query: ?panel=<id>. Rejects missing or non-share-capable panels
+        (e.g., `alerts`) with 400 + {error, field} envelope (matches
+        existing dashboard error shape; see spec §5.5).
+        """
+        import urllib.parse as _urlparse
+        qs = _urlparse.urlparse(self.path).query
+        params = _urlparse.parse_qs(qs)
+        panel = (params.get("panel", [""])[0] or "").strip()
+        if not panel:
+            self._respond_json(400, {
+                "error": "missing query param: panel",
+                "field": "panel",
+            })
+            return
+        tpl_mod = self._share_load_templates_module()
+        if panel not in tpl_mod.SHARE_CAPABLE_PANELS:
+            self._respond_json(400, {
+                "error": f"unknown share panel: {panel!r}",
+                "field": "panel",
+            })
+            return
+        templates = [
+            {
+                "id": t.id,
+                "label": t.label,
+                "description": t.description,
+                "default_options": dict(t.default_options),
+            }
+            for t in tpl_mod.templates_for_panel(panel)
+        ]
+        self._respond_json(200, {"panel": panel, "templates": templates})
+
+    def _handle_share_render_post(self) -> None:
+        """Render a panel-section to body via the share kernel.
+
+        Body shape: ``{panel, template_id, options}``. Validates panel +
+        template_id against the registry, dispatches to the per-panel
+        `_build_<panel>_share_panel_data` helper to assemble the
+        builder-shaped dict from the current dashboard snapshot, runs the
+        template's builder, applies `_scrub` when
+        ``options.reveal_projects`` is False, then renders via
+        `_lib_share.render`. Response: ``{body, content_type, snapshot}``
+        where `snapshot` carries `kernel_version` + `data_digest` for the
+        v2 composer's drift detection (spec §5.2).
+
+        CSRF: Origin/Host parity via `_check_origin_csrf` — same gate as
+        `/api/sync`, `/api/settings`, `/api/alerts/test`.
+        """
+        if not self._check_origin_csrf():
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        try:
+            raw = self.rfile.read(length) if length > 0 else b""
+            req = json.loads(raw) if raw else {}
+        except (ValueError, json.JSONDecodeError):
+            self._respond_json(400, {"error": "malformed json"})
+            return
+        if not isinstance(req, dict):
+            self._respond_json(400, {"error": "expected JSON object"})
+            return
+        panel = req.get("panel")
+        template_id = req.get("template_id")
+        options = req.get("options") or {}
+        if not isinstance(options, dict):
+            self._respond_json(400, {
+                "error": "options must be an object",
+                "field": "options",
+            })
+            return
+        if not isinstance(panel, str) or not panel:
+            self._respond_json(400, {
+                "error": "missing or non-string panel",
+                "field": "panel",
+            })
+            return
+        if not isinstance(template_id, str) or not template_id:
+            self._respond_json(400, {
+                "error": "missing or non-string template_id",
+                "field": "template_id",
+            })
+            return
+        fmt = options.get("format", "html")
+        if fmt not in ("md", "html", "svg"):
+            self._respond_json(400, {
+                "error": f"unknown format: {fmt!r}",
+                "field": "options.format",
+            })
+            return
+        theme = options.get("theme", "light")
+        if theme not in ("light", "dark"):
+            self._respond_json(400, {
+                "error": f"unknown theme: {theme!r}",
+                "field": "options.theme",
+            })
+            return
+        if "top_n" in options:
+            top_n_raw = options["top_n"]
+            if not isinstance(top_n_raw, int) or isinstance(top_n_raw, bool) or top_n_raw < 1:
+                self._respond_json(400, {
+                    "error": f"top_n must be a positive integer, got {top_n_raw!r}",
+                    "field": "options.top_n",
+                })
+                return
+
+        tpl_mod = self._share_load_templates_module()
+        if panel not in tpl_mod.SHARE_CAPABLE_PANELS:
+            self._respond_json(400, {
+                "error": f"unknown share panel: {panel!r}",
+                "field": "panel",
+            })
+            return
+        try:
+            template = tpl_mod.get_template(template_id)
+        except KeyError:
+            self._respond_json(400, {
+                "error": f"unknown template_id: {template_id!r}",
+                "field": "template_id",
+            })
+            return
+        if template.panel != panel:
+            self._respond_json(400, {
+                "error": (
+                    f"template_id {template_id!r} belongs to panel "
+                    f"{template.panel!r}, not {panel!r}"
+                ),
+                "field": "template_id",
+            })
+            return
+
+        # Build panel_data from the live dashboard snapshot — reuses the
+        # already-built `DataSnapshot` so we don't re-query the DB on the
+        # share hot path. `_build_share_panel_data` dispatches per panel.
+        snap_ref = type(self).snapshot_ref
+        data_snap = snap_ref.get() if snap_ref is not None else None
+        try:
+            panel_data = _build_share_panel_data(panel, options, data_snap)
+        except Exception as exc:
+            self._respond_json(500, {"error": f"panel_data build failed: {exc}"})
+            return
+
+        # Run template builder → kernel render. Builder produces a
+        # ShareSnapshot; `_scrub` anonymizes project labels when the
+        # client opted in to anon-on-export (`reveal_projects=False`).
+        ls = _share_load_lib()
+        try:
+            snap_built = template.builder(panel_data=panel_data, options=options)
+        except Exception as exc:
+            self._respond_json(500, {"error": f"builder failed: {exc}"})
+            return
+        reveal = bool(options.get("reveal_projects", True))
+        if not reveal:
+            snap_built = ls._scrub(snap_built, reveal_projects=False)
+        try:
+            body = ls.render(
+                snap_built,
+                format=fmt,
+                theme=options.get("theme", "light"),
+                branding=not options.get("no_branding", False),
+            )
+        except Exception as exc:
+            self._respond_json(500, {"error": f"render failed: {exc}"})
+            return
+        content_type = {
+            "md":   "text/markdown",
+            "html": "text/html",
+            "svg":  "image/svg+xml",
+        }[fmt]
+
+        # data_digest hashes the inputs that identify the underlying DATA
+        # (panel + template + panel_data), NOT rendering toggles like theme
+        # / branding / reveal_projects / format. Used by the composer to
+        # detect "section data has drifted since add-time" (spec §5.2 /
+        # §7.1) — flipping anon-on-export must not register as drift, since
+        # the underlying data is identical.
+        digest_input = {
+            "panel": panel,
+            "template_id": template_id,
+            "panel_data": panel_data,
+        }
+        try:
+            data_digest = ls._data_digest(digest_input)
+        except Exception:
+            # Defensive: digest is non-blocking for the response — fall
+            # back to an empty string and let the composer treat it as
+            # "always drifted" rather than failing the whole render.
+            data_digest = ""
+
+        self._respond_json(200, {
+            "body": body,
+            "content_type": content_type,
+            "snapshot": {
+                "kernel_version": ls.KERNEL_VERSION,
+                "panel": panel,
+                "template_id": template_id,
+                "options": options,
+                "generated_at": _share_now_utc_iso(),
+                "data_digest": data_digest,
+            },
+        })
 
     # ---- helpers ----
 

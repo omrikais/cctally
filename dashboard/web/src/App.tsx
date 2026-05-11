@@ -8,6 +8,7 @@ import { PanelHost } from './components/PanelHost';
 import { PanelGridDnd } from './components/PanelGridDnd';
 import { UpdateModal } from './components/UpdateModal';
 import { ModalRoot } from './modals/ModalRoot';
+import { ShareModalRoot } from './share/ShareModalRoot';
 import { getState, subscribeStore } from './store/store';
 
 export function App() {
@@ -34,6 +35,10 @@ export function App() {
       <HelpOverlay />
       <SettingsOverlay />
       <ModalRoot />
+      {/* Share modal layer (spec §6.1) — separate from <ModalRoot> so
+          the share modal layers ABOVE any open panel modal. Renders
+          nothing when state.shareModal === null. */}
+      <ShareModalRoot />
       <UpdateModal />
       <Toast />
     </>

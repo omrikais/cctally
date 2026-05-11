@@ -1,7 +1,10 @@
 import { Fragment } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { Modal } from './Modal';
+import { ShareIcon } from '../components/ShareIcon';
 import { buildTrendHistoryData, type TrendChartDatum } from '../store/selectors';
+import { dispatch } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 
 function formatWeeksPill(n: number): string {
   const months = Math.max(1, Math.round(n / 4));
@@ -229,9 +232,24 @@ export function TrendModal() {
   const env = useSnapshot();
   const rows = buildTrendHistoryData(env);
 
+  // Shared header extras (share-affordance) reused across the early
+  // empty-state return and the main return below.
+  const headerExtras = (
+    <ShareIcon
+      panel="trend"
+      panelLabel="Trend"
+      triggerId="trend-modal"
+      onClick={() => dispatch(openShareModal('trend', 'trend-modal'))}
+    />
+  );
+
   if (!rows.length) {
     return (
-      <Modal title="Trend — 12-week history" accentClass="accent-amber">
+      <Modal
+        title="Trend — 12-week history"
+        accentClass="accent-amber"
+        headerExtras={headerExtras}
+      >
         <section className="modal-trend">
           <p className="empty-state" id="mtr-empty">
             No history data yet.
@@ -253,7 +271,11 @@ export function TrendModal() {
   const N = rows.length;
 
   return (
-    <Modal title="Trend — 12-week history" accentClass="accent-amber">
+    <Modal
+      title="Trend — 12-week history"
+      accentClass="accent-amber"
+      headerExtras={headerExtras}
+    >
       <section className="modal-trend">
         <div className="m-chipstrip">
           <span className="m-pill accent-amber" id="mtr-weeks-pill">

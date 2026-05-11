@@ -1,4 +1,4 @@
-export type KeymapScope = 'global' | 'sessions' | 'modal';
+export type KeymapScope = 'overlay' | 'global' | 'sessions' | 'modal';
 
 export interface Binding {
   key: string;
@@ -10,7 +10,11 @@ export interface Binding {
 const bindings = new Set<Binding>();
 let handler: ((e: KeyboardEvent) => void) | null = null;
 
-const SCOPE_ORDER: Record<KeymapScope, number> = { modal: 0, sessions: 1, global: 2 };
+// `overlay` sits ABOVE `modal` so an overlay-scope Esc handler (e.g. the
+// share modal layered on top of a panel modal) fires before the panel
+// modal's Esc handler — preserving the spec §12.1 "Esc closes the
+// topmost overlay" invariant when both surfaces are open simultaneously.
+const SCOPE_ORDER: Record<KeymapScope, number> = { overlay: 0, modal: 1, sessions: 2, global: 3 };
 
 function isTextInputFocused(target: EventTarget | null): boolean {
   if (!target || !(target instanceof Element)) return false;

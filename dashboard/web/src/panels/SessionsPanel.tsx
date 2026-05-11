@@ -11,9 +11,11 @@ import {
 import { SessionsControls } from '../components/SessionsControls';
 import { SortableHeader } from '../components/SortableHeader';
 import { PanelGrip } from '../components/PanelGrip';
+import { ShareIcon } from '../components/ShareIcon';
 import { SESSIONS_COLUMNS } from '../lib/sessionsColumns';
 import { fmt } from '../lib/fmt';
 import { modelChipClass } from '../lib/model';
+import { openShareModal } from '../store/shareSlice';
 
 function costClass(c: number | null | undefined): string {
   if (c == null) return 'cost-low';
@@ -108,6 +110,12 @@ export function SessionsPanel() {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           {!isMobile && <SessionsControls />}
+          <ShareIcon
+            panel="sessions"
+            panelLabel="Sessions"
+            triggerId="sessions-panel"
+            onClick={() => dispatch(openShareModal('sessions', 'sessions-panel'))}
+          />
           <button
             type="button"
             className="panel-collapse-toggle"

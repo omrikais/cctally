@@ -1,8 +1,10 @@
 import { useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
+import { ShareIcon } from '../components/ShareIcon';
 import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 import type { BlocksPanelRow } from '../types/envelope';
 
 function Row({ r, maxCost, isFirstMount }: { r: BlocksPanelRow; maxCost: number; isFirstMount: boolean }) {
@@ -99,6 +101,12 @@ export function BlocksPanel() {
           </h3>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+          <ShareIcon
+            panel="blocks"
+            panelLabel="5-hour blocks"
+            triggerId="blocks-panel"
+            onClick={() => dispatch(openShareModal('blocks', 'blocks-panel'))}
+          />
           <button
             type="button"
             className="panel-collapse-toggle"

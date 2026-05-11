@@ -1,8 +1,11 @@
 import { useEffect, useRef } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { Modal } from './Modal';
+import { ShareIcon } from '../components/ShareIcon';
 import { resolveVerdict } from '../lib/verdict';
 import { fmt } from '../lib/fmt';
+import { dispatch } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 import type { ForecastEnvelope } from '../types/envelope';
 
 // The range bar (pills + leaders + 3-zone track + bounds) is built via
@@ -216,9 +219,22 @@ export function ForecastModal() {
   const trackRef = useRef<HTMLDivElement>(null);
   useRangeBar(wrapRef, trackRef, fc);
 
+  const headerExtras = (
+    <ShareIcon
+      panel="forecast"
+      panelLabel="Forecast"
+      triggerId="forecast-modal"
+      onClick={() => dispatch(openShareModal('forecast', 'forecast-modal'))}
+    />
+  );
+
   if (!fc) {
     return (
-      <Modal title="Forecast — explain" accentClass="accent-purple">
+      <Modal
+        title="Forecast — explain"
+        accentClass="accent-purple"
+        headerExtras={headerExtras}
+      >
         <section className="modal-forecast">
           <p className="empty-state" id="mfc-empty">
             No forecast data yet.
@@ -249,7 +265,11 @@ export function ForecastModal() {
   const week = explain?.week;
 
   return (
-    <Modal title="Forecast — explain" accentClass="accent-purple">
+    <Modal
+      title="Forecast — explain"
+      accentClass="accent-purple"
+      headerExtras={headerExtras}
+    >
       <section className="modal-forecast">
         <div className="m-chipstrip" id="mfc-chips">
           <span className={verdictCls} id="mfc-verdict">

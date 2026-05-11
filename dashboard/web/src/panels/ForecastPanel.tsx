@@ -1,9 +1,11 @@
 import { useSnapshot } from '../hooks/useSnapshot';
 import { ConfidenceDots } from '../components/ConfidenceDots';
 import { PanelGrip } from '../components/PanelGrip';
+import { ShareIcon } from '../components/ShareIcon';
 import { resolveVerdict } from '../lib/verdict';
 import { fmt } from '../lib/fmt';
 import { dispatch } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 
 export function ForecastPanel() {
   const env = useSnapshot();
@@ -30,6 +32,12 @@ export function ForecastPanel() {
           <use href="/static/icons.svg#crystal-ball" />
         </svg>
         <h3 style={{ color: 'var(--accent-pink)' }}>Forecast</h3>
+        <ShareIcon
+          panel="forecast"
+          panelLabel="Forecast"
+          triggerId="forecast-panel"
+          onClick={() => dispatch(openShareModal('forecast', 'forecast-panel'))}
+        />
         <PanelGrip />
       </div>
       <div className="panel-body">

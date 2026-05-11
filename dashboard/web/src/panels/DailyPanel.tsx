@@ -2,8 +2,10 @@ import { Fragment, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { PanelGrip } from '../components/PanelGrip';
+import { ShareIcon } from '../components/ShareIcon';
 import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 import type { DailyPanelRow } from '../types/envelope';
 
 const MONTH_ABBR = [
@@ -104,6 +106,12 @@ export function DailyPanel() {
           </h3>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+          <ShareIcon
+            panel="daily"
+            panelLabel="Daily"
+            triggerId="daily-panel"
+            onClick={() => dispatch(openShareModal('daily', 'daily-panel'))}
+          />
           <button
             type="button"
             className="panel-collapse-toggle"

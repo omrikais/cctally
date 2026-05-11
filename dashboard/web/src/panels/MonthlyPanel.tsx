@@ -1,8 +1,10 @@
 import { useLayoutEffect, useRef, useState } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
+import { ShareIcon } from '../components/ShareIcon';
 import { fmt } from '../lib/fmt';
 import { dispatch } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
 import type { PeriodRow } from '../types/envelope';
 
 const VISIBLE_ROWS = 6;
@@ -78,6 +80,12 @@ export function MonthlyPanel() {
         <h3 style={{ color: 'var(--accent-pink)' }}>
           Monthly <span className="sub">(model split · 6 months)</span>
         </h3>
+        <ShareIcon
+          panel="monthly"
+          panelLabel="Monthly"
+          triggerId="monthly-panel"
+          onClick={() => dispatch(openShareModal('monthly', 'monthly-panel'))}
+        />
         <PanelGrip />
       </div>
       <div className="panel-body">
