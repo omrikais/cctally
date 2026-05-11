@@ -28,8 +28,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { renderShare, ShareApiError } from './api';
 import type { ShareFormat, ShareOptions, SharePanelId } from './types';
-import { shareFormatExt } from './panelLabels';
-import { dispatch } from '../store/store';
+import { sharePanelLabel, shareFormatExt } from './panelLabels';
+import { dispatch, getState } from '../store/store';
+import { makeBasketItem } from '../store/basketSlice';
 import { SavePresetPopover } from './SavePresetPopover';
 
 interface Props {
@@ -76,8 +77,17 @@ function triggerDownload(filename: string, blob: Blob): void {
 }
 
 export function ActionBar({ panel, templateId, options, onOptionsChange }: Props) {
-  const [busy, setBusy] = useState<null | 'copy' | 'download' | 'open'>(null);
+  const [busy, setBusy] = useState<null | 'copy' | 'download' | 'open' | 'basket'>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // M3.5 — short-lived "✓ Added" feedback flash on the + Basket button
+  // (spec §7.6). Auto-clears 800 ms after a successful add. Track the
+  // timer id in a ref so we can cancel it if the component unmounts
+  // before the timeout fires.
+  const [basketAdded, setBasketAdded] = useState(false);
+  const basketTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (basketTimerRef.current != null) clearTimeout(basketTimerRef.current);
+  }, []);
   // M2 — "Save preset…" inline popover state. Anchored to the trigger
   // button via a wrapping <div> so click-outside can close it.
   const [savingOpen, setSavingOpen] = useState(false);
@@ -163,6 +173,59 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
           ? err.message ?? `HTTP ${err.status}`
           : (err as Error).message;
       setActionError(`Download failed: ${msg}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // M3.5 (spec §6.5 + §7.6). Fetch the recipe, build a BasketItem
+  // capturing only the snapshot's recipe fields (no body), dispatch
+  // BASKET_ADD, flash "✓ Added" for 800 ms, and surface a status
+  // toast. The chip's pulse animation lights up automatically via
+  // BasketChip's count-grow effect — no separate trigger plumbing
+  // needed.
+  //
+  // We reuse the `busy` state machine (with a dedicated `'basket'`
+  // tag) so a click while another action is in flight is gated by
+  // the same `disabledNoTemplate` predicate, matching Copy/Download/
+  // Open. Errors surface inline via `setActionError`, identical to
+  // the other actions; we deliberately do NOT clear basketAdded on
+  // failure (the timer cleanup in finally is unnecessary because we
+  // only set the flag inside the success branch).
+  const handleAddToBasket = async () => {
+    if (disabledNoTemplate || !templateId) return;
+    setBusy('basket');
+    setActionError(null);
+    try {
+      const resp = await renderShare({
+        panel,
+        template_id: templateId,
+        options,
+      });
+      const item = makeBasketItem({
+        panel,
+        template_id: templateId,
+        options,
+        added_at: new Date().toISOString(),
+        data_digest_at_add: resp.snapshot.data_digest,
+        kernel_version: resp.snapshot.kernel_version,
+        label_hint: sharePanelLabel(panel),
+      });
+      dispatch({ type: 'BASKET_ADD', item });
+      setBasketAdded(true);
+      if (basketTimerRef.current != null) clearTimeout(basketTimerRef.current);
+      basketTimerRef.current = setTimeout(() => setBasketAdded(false), 800);
+      const count = getState().basket.items.length;
+      dispatch({
+        type: 'SHOW_STATUS_TOAST',
+        text: `Added ${item.label_hint} to basket (${count})`,
+      });
+    } catch (err: unknown) {
+      const msg =
+        err instanceof ShareApiError
+          ? err.message ?? `HTTP ${err.status}`
+          : (err as Error).message;
+      setActionError(`Add to basket failed: ${msg}`);
     } finally {
       setBusy(null);
     }
@@ -283,12 +346,18 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
         </button>
         <button
           type="button"
-          className="share-action share-action-disabled"
-          disabled
-          aria-disabled="true"
-          title="Add to basket — coming in M3"
+          className={`share-action share-action-basket${basketAdded ? ' share-action-basket-added' : ''}`}
+          onClick={handleAddToBasket}
+          disabled={disabledNoTemplate}
+          title={
+            disabledNoTemplate && templateId == null
+              ? 'Pick a template first'
+              : busy === 'basket'
+                ? 'Adding to basket…'
+                : 'Add this section to the report basket'
+          }
         >
-          + Basket
+          {basketAdded ? '✓ Added' : busy === 'basket' ? 'Adding…' : '+ Basket'}
         </button>
       </div>
       {/* Save preset lives AFTER the action row in DOM order so the

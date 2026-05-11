@@ -2,8 +2,9 @@
 //   - Copy fires navigator.clipboard.writeText (MD only).
 //   - Download builds a Blob and anchor-clicks (file ext matches format).
 //   - Open spawns window.open with a blob URL (HTML/SVG only).
-//   - Disabled-in-M1 buttons (PNG, Print → PDF, + Basket, Save preset)
-//     have explanatory tooltips and disabled attribute.
+//   - Disabled-in-M1 buttons (PNG, Print → PDF) have explanatory
+//     tooltips and disabled attribute. (Save preset went live in M2.4;
+//     + Basket went live in M3.5.)
 //   - Format radio dispatches onOptionsChange with new format.
 import { render, screen, fireEvent, act } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -159,9 +160,12 @@ describe('<ActionBar>', () => {
     expect(print).toBeDisabled();
     expect(print.getAttribute('title')).toMatch(/m4/i);
 
-    const basket = screen.getByRole('button', { name: /basket/i });
-    expect(basket).toBeDisabled();
-    expect(basket.getAttribute('title')).toMatch(/m3/i);
+    // M3.5 — + Basket is now live (no longer disabled). With a
+    // templateId in scope it should be enabled and carry the
+    // descriptive tooltip rather than the legacy "coming in M3" stub.
+    const basket = screen.getByRole('button', { name: /\+ basket/i });
+    expect(basket).not.toBeDisabled();
+    expect(basket.getAttribute('title')).toMatch(/add this section to the report basket/i);
 
     // M2.4 — Save preset is now live (no longer disabled). With a
     // templateId in scope it should be enabled and carry the
