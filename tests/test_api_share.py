@@ -168,3 +168,133 @@ def test_share_render_csrf_blocks_cross_origin(dashboard_server):
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(req, timeout=5)
     assert exc.value.code == 403
+
+
+# ---------- M2.3 — /api/share/presets CRUD ----------
+
+
+def test_presets_initial_get_returns_empty(dashboard_server):
+    port, _ = dashboard_server
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/api/share/presets", timeout=5,
+    ) as r:
+        body = json.loads(r.read())
+    assert body == {"presets": {}}
+
+
+def test_presets_post_roundtrip_then_get(dashboard_server):
+    port, _ = dashboard_server
+    payload = {
+        "panel": "weekly", "name": "team-monday",
+        "template_id": "weekly-recap",
+        "options": {"theme": "dark", "format": "md",
+                    "reveal_projects": False, "top_n": 5},
+    }
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/presets",
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={**_csrf_headers(port), "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        post_body = json.loads(r.read())
+    assert post_body["panel"] == "weekly"
+    assert post_body["name"] == "team-monday"
+    assert "saved_at" in post_body
+
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/api/share/presets", timeout=5,
+    ) as r:
+        get_body = json.loads(r.read())
+    assert get_body["presets"]["weekly"]["team-monday"]["template_id"] == "weekly-recap"
+    assert get_body["presets"]["weekly"]["team-monday"]["options"]["theme"] == "dark"
+
+
+def test_presets_post_overwrites_same_name(dashboard_server):
+    port, _ = dashboard_server
+    base = {"panel": "weekly", "name": "team-monday",
+            "template_id": "weekly-recap",
+            "options": {"theme": "light", "format": "md"}}
+    updated = {**base, "options": {"theme": "dark", "format": "html"}}
+    for payload in (base, updated):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/share/presets",
+            data=json.dumps(payload).encode(),
+            method="POST",
+            headers={**_csrf_headers(port), "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/api/share/presets", timeout=5,
+    ) as r:
+        body = json.loads(r.read())
+    presets = body["presets"]["weekly"]
+    assert len(presets) == 1, "second POST should overwrite, not append"
+    assert presets["team-monday"]["options"]["theme"] == "dark"
+
+
+def test_presets_delete_removes_entry(dashboard_server):
+    port, _ = dashboard_server
+    payload = {"panel": "weekly", "name": "team-monday",
+               "template_id": "weekly-recap",
+               "options": {"theme": "light", "format": "md"}}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/presets",
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={**_csrf_headers(port), "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5):
+        pass
+    del_req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/presets/weekly/team-monday",
+        method="DELETE",
+        headers=_csrf_headers(port),
+    )
+    with urllib.request.urlopen(del_req, timeout=5) as r:
+        assert r.status == 204
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/api/share/presets", timeout=5,
+    ) as r:
+        body = json.loads(r.read())
+    assert body["presets"] == {}
+
+
+def test_presets_post_csrf_gate(dashboard_server):
+    """POST without matching Origin returns 403."""
+    port, _ = dashboard_server
+    payload = {"panel": "weekly", "name": "x", "template_id": "weekly-recap",
+               "options": {}}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/presets",
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={"Origin": "http://evil.example.com",
+                 "Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        raised = None
+    except urllib.error.HTTPError as e:
+        raised = e
+    assert raised is not None and raised.code == 403
+
+
+def test_presets_post_rejects_unknown_panel(dashboard_server):
+    port, _ = dashboard_server
+    payload = {"panel": "alerts", "name": "x", "template_id": "x",
+               "options": {}}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/presets",
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={**_csrf_headers(port), "Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        raised = None
+    except urllib.error.HTTPError as e:
+        raised = e
+    assert raised is not None and raised.code == 400
+    assert json.loads(raised.read())["field"] == "panel"

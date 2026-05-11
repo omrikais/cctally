@@ -32609,6 +32609,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_get_update_stream(path)
         elif path == "/api/share/templates":
             self._handle_share_templates_get()
+        elif path == "/api/share/presets":
+            self._handle_share_presets_get()
         else:
             self.send_error(404, "not found")
 
@@ -32626,6 +32628,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_post_update_dismiss()
         elif path == "/api/share/render":
             self._handle_share_render_post()
+        elif path == "/api/share/presets":
+            self._handle_share_presets_post()
         else:
             self.send_error(404, "not found")
 
@@ -32642,6 +32646,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:  # noqa: N802 — stdlib API
         if self._method_not_allowed_for_settings():
+            return
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/api/share/presets/"):
+            self._handle_share_presets_delete()
             return
         self.send_error(501, "Unsupported method ('DELETE')")
 
@@ -33409,6 +33417,149 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 "data_digest": data_digest,
             },
         })
+
+    # ---- /api/share/presets — saved-recipe CRUD (spec §5.1, §11.3) ----
+    #
+    # GET    /api/share/presets                       → list, grouped by panel
+    # POST   /api/share/presets                       → upsert (panel, name)
+    # DELETE /api/share/presets/{panel}/{name}        → remove one preset
+    #
+    # Persistence: `config.json` under `share.presets[<panel>][<name>]` so
+    # the CLI can read them later (CLI consumer is designed for, not
+    # shipped — out of scope per spec §15). GET is unauthenticated like
+    # `/api/share/templates`; POST + DELETE go through `_check_origin_csrf`
+    # (same gate as `/api/sync`, `/api/settings`, `/api/alerts/test`).
+    # Write discipline: `config_writer_lock` + `_load_config_unlocked` +
+    # `save_config` (atomic `os.replace`). Never call `load_config` from
+    # inside the writer lock — `fcntl.flock` is per-fd and would
+    # self-deadlock; see `_cmd_config_set` for the established pattern.
+
+    def _handle_share_presets_get(self) -> None:
+        """List saved share presets, grouped by panel (spec §5.1, §11.3).
+
+        Read-only — no CSRF gate. `config.json` may not contain the
+        `share.presets` key on first run; returns `{"presets": {}}` then.
+        """
+        cfg = load_config()
+        presets = (cfg.get("share") or {}).get("presets") or {}
+        self._respond_json(200, {"presets": presets})
+
+    def _handle_share_presets_post(self) -> None:
+        """Create or overwrite a preset (idempotent on `(panel, name)`).
+
+        Body: ``{panel, name, template_id, options}``. CSRF-gated.
+
+        Persistence is a read-modify-write under ``config_writer_lock`` +
+        ``_load_config_unlocked``. The plain ``load_config`` would
+        self-deadlock on the same fcntl.flock fd; see the CLAUDE.md
+        config-write invariant and `_cmd_config_set` for the canonical
+        pattern.
+        """
+        if not self._check_origin_csrf():
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        try:
+            raw = self.rfile.read(length) if length > 0 else b""
+            req = json.loads(raw) if raw else {}
+        except (ValueError, json.JSONDecodeError):
+            self._respond_json(400, {"error": "malformed json"})
+            return
+        if not isinstance(req, dict):
+            self._respond_json(400, {"error": "expected JSON object"})
+            return
+        panel = req.get("panel")
+        name = req.get("name")
+        template_id = req.get("template_id")
+        options = req.get("options")
+        if not isinstance(panel, str) or not panel:
+            self._respond_json(400, {
+                "error": "missing or non-string panel",
+                "field": "panel",
+            })
+            return
+        tpl_mod = self._share_load_templates_module()
+        if panel not in tpl_mod.SHARE_CAPABLE_PANELS:
+            self._respond_json(400, {
+                "error": f"unknown share panel: {panel!r}",
+                "field": "panel",
+            })
+            return
+        if not isinstance(name, str) or not name or "/" in name or len(name) > 64:
+            self._respond_json(400, {
+                "error": "name must be 1-64 chars and contain no '/'",
+                "field": "name",
+            })
+            return
+        if not isinstance(template_id, str) or not template_id:
+            self._respond_json(400, {
+                "error": "missing or non-string template_id",
+                "field": "template_id",
+            })
+            return
+        if not isinstance(options, dict):
+            self._respond_json(400, {
+                "error": "options must be an object",
+                "field": "options",
+            })
+            return
+
+        saved_at = _share_now_utc_iso()
+        record = {"template_id": template_id, "options": options, "saved_at": saved_at}
+
+        with config_writer_lock():
+            cfg = _load_config_unlocked()
+            share = cfg.setdefault("share", {})
+            presets = share.setdefault("presets", {})
+            panel_bucket = presets.setdefault(panel, {})
+            panel_bucket[name] = record
+            save_config(cfg)
+        self._respond_json(200, {"panel": panel, "name": name, **record})
+
+    def _handle_share_presets_delete(self) -> None:
+        """Remove a preset by `(panel, name)`.
+
+        Path: ``/api/share/presets/{panel}/{name}``. Missing → 404 so
+        DELETE stays meaningful for idempotency-aware clients. CSRF-gated.
+        """
+        if not self._check_origin_csrf():
+            return
+        import urllib.parse as _urlparse
+        # Strip the query string defensively; the spec only uses path
+        # segments but a stray "?" shouldn't poison the name token.
+        path_only = self.path.split("?", 1)[0]
+        parts = path_only.split("/")
+        # Expected: ["", "api", "share", "presets", "<panel>", "<name>"]
+        if (
+            len(parts) != 6
+            or parts[1] != "api"
+            or parts[2] != "share"
+            or parts[3] != "presets"
+            or not parts[4]
+            or not parts[5]
+        ):
+            self._respond_json(400, {"error": "malformed delete path"})
+            return
+        panel = _urlparse.unquote(parts[4])
+        name = _urlparse.unquote(parts[5])
+        with config_writer_lock():
+            cfg = _load_config_unlocked()
+            share = cfg.get("share") or {}
+            presets = share.get("presets") or {}
+            panel_bucket = presets.get(panel) or {}
+            if name not in panel_bucket:
+                self._respond_json(404, {"error": "no such preset"})
+                return
+            del panel_bucket[name]
+            # Tidy empty buckets so GET stays clean.
+            if not panel_bucket:
+                presets.pop(panel, None)
+            save_config(cfg)
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     # ---- helpers ----
 
