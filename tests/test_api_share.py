@@ -298,3 +298,143 @@ def test_presets_post_rejects_unknown_panel(dashboard_server):
         raised = e
     assert raised is not None and raised.code == 400
     assert json.loads(raised.read())["field"] == "panel"
+
+
+# ---------- M3.2 — POST /api/share/compose ----------
+
+
+def _compose_request(port: int, sections: list[dict], **overrides):
+    payload = {
+        "title": "Test compose",
+        "theme": "light",
+        "format": "html",
+        "no_branding": False,
+        "reveal_projects": False,
+        "sections": sections,
+    }
+    payload.update(overrides)
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/compose",
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={**_csrf_headers(port), "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+def _section_recipe(panel: str, template_id: str, digest: str = "sha256:fake"):
+    return {
+        "snapshot": {
+            "panel": panel, "template_id": template_id,
+            "options": {
+                "format": "html", "theme": "light",
+                "reveal_projects": True, "no_branding": False,
+                "top_n": 5, "show_chart": True, "show_table": True,
+                "period": None, "project_allowlist": None,
+            },
+            "data_digest_at_add": digest,
+            "kernel_version": 1,
+        }
+    }
+
+
+def test_compose_single_section_round_trip(dashboard_server):
+    port, _ = dashboard_server
+    resp = _compose_request(port, [_section_recipe("weekly", "weekly-recap")])
+    assert resp["content_type"] == "text/html"
+    assert resp["body"].startswith("<!DOCTYPE")
+    assert resp["body"].count("<html") == 1
+    assert resp["body"].count('<section class="share-section"') == 1
+
+
+def test_compose_multi_section_in_order(dashboard_server):
+    port, _ = dashboard_server
+    sections = [
+        _section_recipe("weekly", "weekly-recap"),
+        _section_recipe("trend", "trend-recap"),
+        _section_recipe("forecast", "forecast-recap"),
+    ]
+    resp = _compose_request(port, sections)
+    assert resp["body"].count('<section class="share-section"') == 3
+    # Section order preserved by header presence + ordering. Use the
+    # composite H1 title to confirm the wrapper exists, then check the
+    # three section blocks appear in declared order via the section
+    # opening tags themselves.
+    body = resp["body"]
+    sec_positions = []
+    pos = 0
+    for _ in range(3):
+        idx = body.find('<section class="share-section"', pos)
+        assert idx >= 0
+        sec_positions.append(idx)
+        pos = idx + 1
+    assert sec_positions == sorted(sec_positions)
+
+
+def test_compose_response_carries_section_drift_flags(dashboard_server):
+    port, _ = dashboard_server
+    # Both sections supply a digest that won't match the freshly-computed
+    # one (we passed "sha256:fake") → both should be drift_detected.
+    sections = [_section_recipe("weekly", "weekly-recap"),
+                _section_recipe("daily",  "daily-recap")]
+    resp = _compose_request(port, sections)
+    assert "section_results" in resp["snapshot"]
+    results = resp["snapshot"]["section_results"]
+    assert len(results) == 2
+    for r in results:
+        assert r["drift_detected"] is True
+        assert r["data_digest_at_add"] == "sha256:fake"
+        assert r["data_digest_now"].startswith("sha256:")
+
+
+def test_compose_ignores_client_supplied_body(dashboard_server):
+    """Server must re-render from recipe; client `body` must be silently ignored."""
+    port, _ = dashboard_server
+    malicious = "<svg>real-name-leak-here</svg>"
+    section = _section_recipe("weekly", "weekly-recap")
+    # Plant a body field on the section — server MUST NOT echo it.
+    section["body"] = malicious
+    section["content_type"] = "image/svg+xml"
+    resp = _compose_request(port, [section], format="svg")
+    assert "real-name-leak-here" not in resp["body"], (
+        "server echoed client-supplied body — privacy chokepoint broken"
+    )
+
+
+def test_compose_rejects_invalid_template_in_section(dashboard_server):
+    port, _ = dashboard_server
+    section = _section_recipe("weekly", "definitely-not-a-real-template")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/compose",
+        data=json.dumps({"title": "X", "theme": "light", "format": "html",
+                         "no_branding": False, "reveal_projects": False,
+                         "sections": [section]}).encode(),
+        method="POST",
+        headers={**_csrf_headers(port), "Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        raised = None
+    except urllib.error.HTTPError as e:
+        raised = e
+    assert raised is not None and raised.code == 400
+
+
+def test_compose_csrf_gate(dashboard_server):
+    port, _ = dashboard_server
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/compose",
+        data=json.dumps({"title": "X", "theme": "light", "format": "html",
+                         "no_branding": False, "reveal_projects": False,
+                         "sections": [_section_recipe("weekly", "weekly-recap")]}).encode(),
+        method="POST",
+        headers={"Origin": "http://evil.example.com",
+                 "Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        raised = None
+    except urllib.error.HTTPError as e:
+        raised = e
+    assert raised is not None and raised.code == 403

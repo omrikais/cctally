@@ -179,3 +179,90 @@ def test_md_frontmatter_anonymized_field_reflects_scrub():
     out_anon = _LS.render(scrubbed, format="md", theme="light", branding=True)
     assert "anonymized: false" in out_reveal
     assert "anonymized: true" in out_anon
+
+
+# ---- M3.1 — compose() per-format stitching ---------------------------------
+
+
+def _make_section(cmd: str = "weekly", title: str = "S"):
+    """Build a minimal ComposedSection for stitch tests."""
+    snap = _LS.ShareSnapshot(
+        cmd=cmd, title=title, subtitle=None,
+        period=_LS.PeriodSpec(
+            start=datetime(2026, 5, 4, tzinfo=timezone.utc),
+            end=datetime(2026, 5, 10, tzinfo=timezone.utc),
+            display_tz="Etc/UTC", label="This week",
+        ),
+        columns=(), rows=(), chart=None, totals=(), notes=(),
+        generated_at=datetime(2026, 5, 11, 9, 30, tzinfo=timezone.utc),
+        version="1.5.0",
+    )
+    return _LS.ComposedSection(snap=snap, drift_detected=False)
+
+
+def test_compose_html_single_wrapper_one_body_per_section():
+    sections = (_make_section(title="A"), _make_section(title="B"))
+    opts = _LS.ComposeOptions(
+        title="Combined", theme="light", format="html",
+        no_branding=False, reveal_projects=True,
+    )
+    out = _LS.compose(sections, opts=opts)
+    # Exactly one document wrapper, two section blocks
+    assert out.count("<!DOCTYPE") == 1
+    assert out.count("<html") == 1
+    assert out.count("</html>") == 1
+    assert out.count('<section class="share-section"') == 2
+    assert "Combined" in out
+
+
+def test_compose_md_one_frontmatter_two_section_headers():
+    sections = (_make_section(title="A"), _make_section(title="B"))
+    opts = _LS.ComposeOptions(
+        title="Combined", theme="light", format="md",
+        no_branding=False, reveal_projects=True,
+    )
+    out = _LS.compose(sections, opts=opts)
+    # Exactly one frontmatter block (---...---) at the top
+    assert out.startswith("---\n"), "frontmatter must be first"
+    assert out.count("\n---\n") == 1, (
+        "expected exactly one closing --- delimiter; per-section "
+        "frontmatter is forbidden by spec §4.3"
+    )
+    assert "## A" in out
+    assert "## B" in out
+
+
+def test_compose_svg_outer_viewBox_covers_total_height():
+    sec_a = _make_section(title="A")
+    sec_b = _make_section(title="B")
+    opts = _LS.ComposeOptions(
+        title="Combined", theme="light", format="svg",
+        no_branding=False, reveal_projects=True,
+    )
+    out = _LS.compose((sec_a, sec_b), opts=opts)
+    assert out.startswith("<svg")
+    # Stacked vertically — two <g transform="translate(0,Y)"> wrappers
+    assert out.count('<g transform="translate(0') == 2
+
+
+def test_compose_no_branding_strips_md_frontmatter():
+    sections = (_make_section(title="A"),)
+    opts = _LS.ComposeOptions(
+        title="Combined", theme="light", format="md",
+        no_branding=True, reveal_projects=True,
+    )
+    out = _LS.compose(sections, opts=opts)
+    assert not out.startswith("---\n"), (
+        "no_branding must strip composite frontmatter (spec §11.5)"
+    )
+
+
+def test_compose_per_section_drift_flag_does_not_change_body():
+    """drift_detected is a metadata flag; it must not alter the rendered body."""
+    a = _LS.ComposedSection(snap=_make_section().snap, drift_detected=False)
+    b = _LS.ComposedSection(snap=_make_section().snap, drift_detected=True)
+    opts = _LS.ComposeOptions(title="C", theme="light", format="html",
+                              no_branding=False, reveal_projects=True)
+    out_a = _LS.compose((a,), opts=opts)
+    out_b = _LS.compose((b,), opts=opts)
+    assert out_a == out_b, "drift_detected must not change rendered output"

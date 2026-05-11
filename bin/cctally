@@ -32628,6 +32628,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_post_update_dismiss()
         elif path == "/api/share/render":
             self._handle_share_render_post()
+        elif path == "/api/share/compose":
+            self._handle_share_compose_post()
         elif path == "/api/share/presets":
             self._handle_share_presets_post()
         else:
@@ -33415,6 +33417,177 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 "options": options,
                 "generated_at": _share_now_utc_iso(),
                 "data_digest": data_digest,
+            },
+        })
+
+    # ---- /api/share/compose — stitch many basket sections (spec §5.3) ----
+
+    def _handle_share_compose_post(self) -> None:
+        """Stitch multiple panel sections into one composed document.
+
+        Recipe-only. The server re-renders every section from its
+        ``(panel, template_id, options)`` recipe — never accepting a client-
+        supplied ``body``. Per-section drift detection compares the fresh
+        ``data_digest`` against the client's ``data_digest_at_add``;
+        mismatches surface as ``section_results[i].drift_detected = true``
+        for the composer's "Outdated" badge.
+
+        Spec §5.3, §10.3. CSRF-gated.
+        """
+        if not self._check_origin_csrf():
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        try:
+            raw = self.rfile.read(length) if length > 0 else b""
+            req = json.loads(raw) if raw else {}
+        except (ValueError, json.JSONDecodeError):
+            self._respond_json(400, {"error": "malformed json"})
+            return
+        if not isinstance(req, dict):
+            self._respond_json(400, {"error": "expected JSON object"})
+            return
+
+        title = req.get("title")
+        theme = req.get("theme", "light")
+        fmt = req.get("format", "html")
+        no_branding = bool(req.get("no_branding", False))
+        reveal_projects = bool(req.get("reveal_projects", False))
+        sections_in = req.get("sections")
+        if not isinstance(title, str) or not title:
+            self._respond_json(400, {"error": "missing title", "field": "title"})
+            return
+        if theme not in ("light", "dark"):
+            self._respond_json(400, {"error": f"unknown theme: {theme!r}",
+                                      "field": "theme"})
+            return
+        if fmt not in ("md", "html", "svg"):
+            self._respond_json(400, {"error": f"unknown format: {fmt!r}",
+                                      "field": "format"})
+            return
+        if not isinstance(sections_in, list) or not sections_in:
+            self._respond_json(400, {
+                "error": "sections must be a non-empty array",
+                "field": "sections",
+            })
+            return
+
+        tpl_mod = self._share_load_templates_module()
+        ls = _share_load_lib()
+        snap_ref = type(self).snapshot_ref
+        data_snap = snap_ref.get() if snap_ref is not None else None
+
+        composed_sections: list = []
+        section_results: list[dict] = []
+
+        for idx, sec in enumerate(sections_in):
+            if not isinstance(sec, dict):
+                self._respond_json(400, {
+                    "error": f"sections[{idx}] must be an object",
+                    "field": f"sections[{idx}]",
+                })
+                return
+            # Explicit: client-supplied `body` and `content_type` are
+            # silently IGNORED. This is the privacy chokepoint — the
+            # regression test in tests/test_api_share.py guards it.
+            snap_recipe = sec.get("snapshot") or {}
+            panel = snap_recipe.get("panel")
+            template_id = snap_recipe.get("template_id")
+            sec_opts = snap_recipe.get("options") or {}
+            digest_at_add = snap_recipe.get("data_digest_at_add") or ""
+            if (not isinstance(panel, str)
+                    or panel not in tpl_mod.SHARE_CAPABLE_PANELS):
+                self._respond_json(400, {
+                    "error": (
+                        f"sections[{idx}].snapshot.panel invalid: {panel!r}"
+                    ),
+                    "field": f"sections[{idx}].snapshot.panel",
+                })
+                return
+            try:
+                template = tpl_mod.get_template(template_id)
+            except KeyError:
+                self._respond_json(400, {
+                    "error": (
+                        f"sections[{idx}].snapshot.template_id "
+                        f"unknown: {template_id!r}"
+                    ),
+                    "field": f"sections[{idx}].snapshot.template_id",
+                })
+                return
+            if template.panel != panel:
+                self._respond_json(400, {
+                    "error": (f"sections[{idx}].snapshot.template_id "
+                              f"{template_id!r} belongs to panel "
+                              f"{template.panel!r}, not {panel!r}"),
+                    "field": f"sections[{idx}].snapshot.template_id",
+                })
+                return
+
+            # Force the composite reveal_projects across every section
+            # (spec §8.5: per-section anon at add-time is ignored at compose).
+            composite_opts = {**sec_opts, "reveal_projects": reveal_projects,
+                              "theme": theme, "format": fmt,
+                              "no_branding": no_branding}
+            try:
+                panel_data = _build_share_panel_data(panel, composite_opts,
+                                                     data_snap)
+            except Exception as exc:
+                self._respond_json(500, {
+                    "error": f"sections[{idx}] panel_data build failed: {exc}",
+                })
+                return
+            try:
+                snap_built = template.builder(panel_data=panel_data,
+                                              options=composite_opts)
+            except Exception as exc:
+                self._respond_json(500, {
+                    "error": f"sections[{idx}] builder failed: {exc}",
+                })
+                return
+            if not reveal_projects:
+                snap_built = ls._scrub(snap_built, reveal_projects=False)
+
+            digest_now = ls._data_digest({
+                "panel": panel,
+                "template_id": template_id,
+                "panel_data": panel_data,
+            })
+            composed_sections.append(ls.ComposedSection(
+                snap=snap_built,
+                drift_detected=(digest_now != digest_at_add),
+            ))
+            section_results.append({
+                "snapshot_id": f"{idx:02d}",
+                "drift_detected": digest_now != digest_at_add,
+                "data_digest_at_add": digest_at_add,
+                "data_digest_now": digest_now,
+            })
+
+        compose_opts = ls.ComposeOptions(
+            title=title, theme=theme, format=fmt,
+            no_branding=no_branding, reveal_projects=reveal_projects,
+        )
+        try:
+            body = ls.compose(tuple(composed_sections), opts=compose_opts)
+        except Exception as exc:
+            self._respond_json(500, {"error": f"compose failed: {exc}"})
+            return
+
+        content_type = {
+            "md":   "text/markdown",
+            "html": "text/html",
+            "svg":  "image/svg+xml",
+        }[fmt]
+        self._respond_json(200, {
+            "body": body,
+            "content_type": content_type,
+            "snapshot": {
+                "kernel_version": ls.KERNEL_VERSION,
+                "composed_at": _share_now_utc_iso(),
+                "section_results": section_results,
             },
         })
 

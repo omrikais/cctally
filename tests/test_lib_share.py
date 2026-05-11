@@ -9,15 +9,29 @@ import sys
 from datetime import datetime, timezone
 
 # Load _lib_share by path (same pattern bin/cctally uses for its peers).
+# Reuse an already-loaded module if a peer test file (e.g.
+# `tests/test_lib_share_v2.py`) registered one — otherwise the LAST loader
+# wins for `sys.modules["_lib_share"]`, and `_lib_share_templates._LS`
+# (bound at templates' module-load time) and the `bin/cctally` API
+# handler's `_share_load_lib()` end up pointing at *different* module
+# objects depending on import order. That breaks `isinstance(cell,
+# TextCell)` in the kernel renderer when cells are constructed by the
+# templates and rendered through the API handler. Matching v2's
+# get-or-load pattern keeps a single module identity across the entire
+# pytest session.
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _LIB_SHARE_PATH = _REPO_ROOT / "bin" / "_lib_share.py"
-_spec = importlib.util.spec_from_file_location("_lib_share", _LIB_SHARE_PATH)
-_lib_share = importlib.util.module_from_spec(_spec)
-# Register in sys.modules BEFORE exec_module: Python 3.14's `dataclass`
-# decorator looks up `cls.__module__` in `sys.modules` for KW_ONLY type checks
-# during class processing, which fails if the module isn't registered yet.
-sys.modules["_lib_share"] = _lib_share
-_spec.loader.exec_module(_lib_share)
+if "_lib_share" in sys.modules:
+    _lib_share = sys.modules["_lib_share"]
+else:
+    _spec = importlib.util.spec_from_file_location("_lib_share", _LIB_SHARE_PATH)
+    _lib_share = importlib.util.module_from_spec(_spec)
+    # Register in sys.modules BEFORE exec_module: Python 3.14's `dataclass`
+    # decorator looks up `cls.__module__` in `sys.modules` for KW_ONLY type
+    # checks during class processing, which fails if the module isn't
+    # registered yet.
+    sys.modules["_lib_share"] = _lib_share
+    _spec.loader.exec_module(_lib_share)
 
 # Load bin/cctally as a module for testing destination/emit helpers. The
 # script has no .py extension, so we supply an explicit SourceFileLoader

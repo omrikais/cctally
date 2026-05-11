@@ -173,6 +173,44 @@ class ShareSnapshot:
     version: str
 
 
+# --- Compose: multi-section stitching (M3.1) ---
+#
+# `compose()` is the multi-section counterpart of `render()`: every basket
+# item is rendered via `_render_fragment` (the same body-only path the
+# single-panel `render()` uses) and the fragments are stitched under one
+# composite chrome — single <html>/<svg> wrapper or one MD frontmatter
+# block. See `compose()` for the format-specific stitching rules; the
+# dataclasses below pin the request shape.
+
+@dataclass(frozen=True)
+class ComposedSection:
+    """One section in a multi-section compose request.
+
+    `drift_detected` is metadata only — surfaced to the composer UI as the
+    "Outdated" badge (spec §7.7). It must NOT alter the rendered body;
+    the renderer ignores it. Compute it server-side by comparing the
+    section's `data_digest_at_add` against a fresh `_data_digest` over
+    the same panel_data slice.
+    """
+    snap: ShareSnapshot
+    drift_detected: bool
+
+
+@dataclass(frozen=True)
+class ComposeOptions:
+    """Composite knobs supplied by the composer modal (spec §8.5).
+
+    `theme`, `format`, `reveal_projects`, and `no_branding` are
+    single-source-of-truth: every section is re-rendered with these
+    values, regardless of what was captured per-section at add-time.
+    """
+    title: str
+    theme: str             # "light" | "dark"
+    format: str            # "md" | "html" | "svg"
+    no_branding: bool
+    reveal_projects: bool
+
+
 # --- Escape helpers ---
 
 _XML_ESCAPE_TABLE = {
@@ -1288,6 +1326,137 @@ def _wrap_document(fragment, *, format: str, palette: Mapping[str, str] | None,
         # "" and the fragment passes through untouched.
         return (front + fragment) if front else fragment
     raise ValueError(f"unknown format: {format!r}")
+
+
+# --- Compose: stitch many fragments under one chrome (M3.1) ---
+
+def compose(sections: tuple[ComposedSection, ...], *, opts: ComposeOptions) -> str:
+    """Stitch multiple section fragments into a single document.
+
+    Pure function. Each section's body comes from `_render_fragment(...)` —
+    the same body-only renderer used by single-panel share. `compose`
+    wraps them all in composite chrome (one title, one footer, one outer
+    wrapper) per format-specific stitching rules in spec §4.3.
+
+    `opts.reveal_projects` does NOT scrub here — scrubbing must have
+    happened upstream (in the API layer) before the snapshot reaches
+    this function. The kernel is anon-agnostic at compose time; the
+    composer endpoint is the chokepoint.
+    """
+    if not sections:
+        raise ValueError("compose requires at least one section")
+    fmt = opts.format
+    if fmt == "html":
+        return _stitch_html(sections, opts=opts)
+    if fmt == "md":
+        return _stitch_md(sections, opts=opts)
+    if fmt == "svg":
+        return _stitch_svg(sections, opts=opts)
+    raise ValueError(f"unknown format: {fmt!r}")
+
+
+def _stitch_html(sections: tuple[ComposedSection, ...], *,
+                 opts: ComposeOptions) -> str:
+    """HTML compose: single ``<html><body>`` wrapper, sections as ``<section>`` blocks."""
+    palette = PALETTE_LIGHT if opts.theme == "light" else PALETTE_DARK
+    body_open = (
+        f'<body style="background:{palette["bg"]};'
+        f'font-family:system-ui,-apple-system,sans-serif;'
+        f'padding:20px;max-width:680px;margin:auto">'
+    )
+    header = f'<header><h1>{_xml_escape(opts.title)}</h1></header>'
+    blocks = []
+    for sec in sections:
+        # branding here is for the *fragment* — composite footer is one
+        # level up, so per-section branding is unconditional False to
+        # keep the chrome single.
+        frag = _render_fragment(sec.snap, format="html",
+                                palette=palette, branding=False)
+        blocks.append(f'<section class="share-section">{frag}</section>')
+    footer = (
+        f'<footer style="font-size:11px;color:{palette["muted"]};margin-top:24px">'
+        f'cctally · composed</footer>' if not opts.no_branding else ""
+    )
+    return (
+        f'<!DOCTYPE html>'
+        f'<html lang="en"><head><meta charset="utf-8">'
+        f'<title>{_xml_escape(opts.title)}</title>'
+        f'</head>{body_open}'
+        f'{header}{"".join(blocks)}{footer}'
+        f'</body></html>'
+    )
+
+
+def _stitch_md(sections: tuple[ComposedSection, ...], *,
+               opts: ComposeOptions) -> str:
+    """MD compose: one composite frontmatter + ``## `` headers + bodies."""
+    parts: list[str] = []
+    if not opts.no_branding:
+        # Composite frontmatter: same key set as the single-section
+        # `_build_md_frontmatter` but `panel` becomes `composed` and
+        # `template_id` is dropped (multi-template).
+        from_section = sections[0].snap
+        # `period` for the composite document = earliest start ..
+        # latest end across all sections (per spec §11.5 implied
+        # convention; reference test uses identical periods so the
+        # union collapses).
+        earliest = min(sec.snap.period.start for sec in sections)
+        latest = max(sec.snap.period.end for sec in sections)
+        anon_field = (
+            "true"
+            if all(_snapshot_is_anonymized(s.snap) for s in sections)
+            else "false"
+        )
+        parts.append(
+            "---\n"
+            f"title: {_yaml_scalar(opts.title)}\n"
+            f"generated_at: {from_section.generated_at.isoformat()}\n"
+            f"period: {earliest.isoformat()}..{latest.isoformat()}\n"
+            f"panel: composed\n"
+            f"anonymized: {anon_field}\n"
+            f"cctally_version: {from_section.version}\n"
+            "---\n\n"
+        )
+    # Title as H1 (when frontmatter is present, this duplicates the
+    # title key visually — accept the duplication; markdown readers
+    # vary in how they render frontmatter and the H1 is the universal
+    # fallback).
+    parts.append(f"# {opts.title}\n\n")
+    for sec in sections:
+        frag = _render_fragment(sec.snap, format="md", palette=PALETTE_LIGHT,
+                                branding=False)
+        parts.append(f"## {sec.snap.title}\n\n")
+        parts.append(frag)
+        parts.append("\n\n")
+    return "".join(parts)
+
+
+def _stitch_svg(sections: tuple[ComposedSection, ...], *,
+                opts: ComposeOptions) -> str:
+    """SVG compose: single outer ``<svg>``, sections positioned vertically."""
+    palette = PALETTE_LIGHT if opts.theme == "light" else PALETTE_DARK
+    inners: list[tuple[str, float, float]] = []
+    for sec in sections:
+        inner, w, h = _render_fragment(sec.snap, format="svg",
+                                       palette=palette, branding=False)
+        inners.append((inner, w, h))
+    total_w = max(w for _, w, _ in inners)
+    SECTION_GAP = 20.0
+    total_h = sum(h for _, _, h in inners) + SECTION_GAP * (len(inners) - 1)
+    body_blocks: list[str] = []
+    y = 0.0
+    for inner, _w, h in inners:
+        body_blocks.append(
+            f'<g transform="translate(0,{_fmt_num(y)})">{inner}</g>'
+        )
+        y += h + SECTION_GAP
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'viewBox="0 0 {_fmt_num(total_w)} {_fmt_num(total_h)}" '
+        f'width="{_fmt_num(total_w)}" height="{_fmt_num(total_h)}">'
+        f'{"".join(body_blocks)}'
+        f'</svg>'
+    )
 
 
 # --- Public dispatch ---
