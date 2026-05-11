@@ -19,8 +19,13 @@ import { UpdateFailedModal } from './UpdateFailedModal';
 //
 // The Esc binding is registered via useKeymap with scope='modal' so it
 // wins over the global digit/letter bindings (modal scope is sorted
-// first in the keymap dispatch order). We pass `when` as a guard so the
-// binding is inert when modalOpen flips false during teardown.
+// first in the keymap dispatch order). UpdateModal is mounted for the
+// app's lifetime (so a running update survives a tab close+reopen), so
+// the `when` guard is load-bearing: without it the modal-scope Escape
+// fires unconditionally and swallows the event before Settings/Help
+// (global scope) or the conditionally-mounted panel Modal (modal scope,
+// registered later) can close. See gotcha:
+// `project_global_hotkeys_modal_guard`.
 
 const TITLE_BY_STATUS: Record<string, string> = {
   idle: 'Update available',
@@ -40,7 +45,12 @@ export function UpdateModal() {
   const update = useSyncExternalStore(subscribeStore, () => getState().update);
   const close = () => dispatch({ type: 'CLOSE_UPDATE_MODAL' });
   const bindings = useMemo(
-    () => [{ key: 'Escape', scope: 'modal' as const, action: close }],
+    () => [{
+      key: 'Escape',
+      scope: 'modal' as const,
+      action: close,
+      when: () => getState().update.modalOpen,
+    }],
     [],
   );
   useKeymap(bindings);

@@ -806,6 +806,66 @@ class TestVersionCheckPipeline:
         assert state["check_error"] is not None
         assert "DNS resolution failed" in state["check_error"]
 
+    def test_do_update_check_clears_stale_latest_on_unknown_method(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        """Unknown-method branch resets `latest_version` to
+        `current_version` so the banner predicate's
+        ``_semver_gt(lat, cur)`` is False. Without this reset, a prior
+        npm/brew `latest_version` would survive (via the `setdefault`
+        no-op) and trigger an "Update available" banner pointing to
+        `cctally update`, which then fails with "unknown install
+        method".
+        """
+        marker = update_paths / "update-check.last-fetch"
+        monkeypatch.setitem(ns, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
+        # Pre-populate state as if a prior npm install had recorded
+        # a fresher upstream version. The user has since switched to a
+        # source/dev checkout, so detection will return "unknown".
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.5.0",
+            "latest_version": "1.7.0",
+            "latest_version_url": "https://example.com/v1.7.0",
+            "source": "npm-registry",
+            "install": {
+                "method": "npm",
+                "realpath": "/old/npm/cctally",
+                "npm_prefix": "/old/npm",
+                "detected_at_utc": "2026-05-08T00:00:00+00:00",
+            },
+            "check_status": "ok",
+            "checked_at_utc": "2026-05-08T00:00:00+00:00",
+            "check_error": None,
+        })
+        monkeypatch.setitem(
+            ns,
+            "_release_read_latest_release_version",
+            lambda: ("1.5.0", "2026-05-09"),
+        )
+        # sys.argv points at an unrelated path (no /Cellar/, not under
+        # any npm prefix) so detection resolves to "unknown".
+        unrelated = tmp_path / "src" / "cctally"
+        unrelated.parent.mkdir(parents=True)
+        unrelated.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", [str(unrelated)])
+        # No npm_config_prefix → tier-A short-circuit fails. Stub the
+        # subprocess fallback to also fail so detection commits to
+        # "unknown" without touching the real system npm.
+        monkeypatch.delenv("npm_config_prefix", raising=False)
+        monkeypatch.setitem(ns, "_resolve_npm_prefix", lambda *, mutate=True: None)
+
+        ns["_do_update_check"]()
+
+        state = ns["_load_update_state"]()
+        assert state is not None
+        assert state["check_status"] == "unavailable"
+        # Stale npm-era `latest_version` is now equal to current — no
+        # ghost banner can fire.
+        assert state["latest_version"] == "1.5.0"
+        assert state["current_version"] == "1.5.0"
+        assert state["install"]["method"] == "unknown"
+
 
 # ============================================================
 # Task 4 — banner predicate, cmd_update dispatch, --check rendering
@@ -2033,6 +2093,48 @@ class TestDashboardUpdateCheckThread:
         stop_event.set()
         t.join(timeout=2.0)
         assert called == [], "check ran despite gate returning False"
+
+    def test_publishes_snapshot_after_successful_check(
+        self, tmp_path, monkeypatch
+    ):
+        """After ``_do_update_check`` returns, the thread republishes the
+        current snapshot to the SSE hub. Without this, ``--no-sync``
+        mode would leave long-open dashboard tabs unaware of the fresh
+        ``latest_version`` written to ``update-state.json`` (the
+        periodic data-sync thread that normally publishes is disabled
+        under ``--no-sync``).
+        """
+        ns = load_script()
+        monkeypatch.setitem(ns, "UPDATE_DASHBOARD_CHECK_POLL_S", 0.05)
+        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setitem(ns, "_is_update_check_due", lambda cfg: True)
+        monkeypatch.setitem(ns, "_do_update_check", lambda: None)
+        monkeypatch.setitem(ns, "load_config", lambda: {})
+
+        hub = ns["SSEHub"]()
+        ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+        published = threading.Event()
+
+        original_publish = hub.publish
+
+        def _record_publish(snap):
+            original_publish(snap)
+            published.set()
+
+        hub.publish = _record_publish  # type: ignore[assignment]
+
+        stop_event = threading.Event()
+        t = ns["_DashboardUpdateCheckThread"](
+            stop_event, hub=hub, snapshot_ref=ref,
+        )
+        t.start()
+        try:
+            assert published.wait(2.0), (
+                "thread did not publish after successful update check"
+            )
+        finally:
+            stop_event.set()
+            t.join(timeout=2.0)
 
 
 class TestUpdateAPI:

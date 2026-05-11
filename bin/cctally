@@ -10212,10 +10212,17 @@ def _do_update_check() -> None:
             state["source"] = "github-formula"
         else:
             # Unknown install method — no remote check possible
-            # (manual-fallback bucket per §2.4). Surface "unavailable"
-            # so `--check` doesn't lie about being current; the banner
-            # predicate stays suppressed via `lat == cur` (setdefault
-            # above) or `lat is None`.
+            # (manual-fallback bucket per §2.4). Reset `latest_version`
+            # to `current_version` so the banner predicate's
+            # `_semver_gt(lat, cur)` returns False; preserving a prior
+            # npm/brew latest here would advertise an update that
+            # `cctally update` cannot apply (install method is now
+            # unknown). The setdefault above is insufficient because
+            # state may already carry a `latest_version` from an
+            # earlier npm/brew install before the user switched to a
+            # source checkout. Same suppression flows to the dashboard
+            # amber badge, which reads `latest_version` directly.
+            state["latest_version"] = state.get("current_version")
             state["check_status"] = "unavailable"
             _save_update_state(state)
             return
@@ -10963,13 +10970,28 @@ class _DashboardUpdateCheckThread(threading.Thread):
     gate (default 24 h) lives in ``_is_update_check_due``. Disabling
     via ``update.check.enabled = false`` is honoured inside the gate
     so the thread becomes a no-op without needing teardown.
+
+    After a successful check, republishes the current snapshot via the
+    SSE hub so long-open dashboard tabs in ``--no-sync`` mode pick up
+    the fresh ``latest_version`` written to ``update-state.json``. The
+    snapshot itself is unchanged — ``snapshot_to_envelope`` re-reads
+    the state file per envelope build, so a bare publish is enough to
+    refresh the badge for every live subscriber.
     """
 
     daemon = True
 
-    def __init__(self, stop_event: "threading.Event") -> None:
+    def __init__(
+        self,
+        stop_event: "threading.Event",
+        *,
+        hub: "SSEHub | None" = None,
+        snapshot_ref: "_SnapshotRef | None" = None,
+    ) -> None:
         super().__init__(name="cctally-update-check")
         self._stop = stop_event
+        self._hub = hub
+        self._ref = snapshot_ref
 
     def run(self) -> None:
         while not self._stop.is_set():
@@ -10977,6 +10999,10 @@ class _DashboardUpdateCheckThread(threading.Thread):
                 config = load_config()
                 if _is_update_check_due(config):
                     _do_update_check()
+                    if self._hub is not None and self._ref is not None:
+                        snap = self._ref.get()
+                        if snap is not None:
+                            self._hub.publish(snap)
             except Exception as e:
                 # Log but never propagate — this thread must keep
                 # ticking so a transient registry hiccup doesn't
@@ -35097,7 +35123,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # Dedicated stop event so we can join cleanly on shutdown without
     # relying on the data-sync thread's lifecycle.
     update_check_stop = threading.Event()
-    update_check_thread = _DashboardUpdateCheckThread(update_check_stop)
+    update_check_thread = _DashboardUpdateCheckThread(
+        update_check_stop, hub=hub, snapshot_ref=ref,
+    )
     update_check_thread.start()
 
     # HTTP server on its own thread so the main thread can block on signal.

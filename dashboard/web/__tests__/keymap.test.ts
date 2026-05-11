@@ -214,6 +214,38 @@ describe('keymap dispatcher', () => {
     expect(getState().openDailyDate).toBeNull();
   });
 
+  it('UpdateModal modal-scope Esc is gated by update.modalOpen', () => {
+    // Regression: UpdateModal is mounted for the app's lifetime, so its
+    // modal-scope Escape binding is always registered. Without the
+    // `when: () => getState().update.modalOpen` guard, it would win
+    // over Settings/Help (global scope) Escape and swallow the event,
+    // leaving those overlays unable to close on Esc.
+    const updateClose = vi.fn();
+    const settingsClose = vi.fn();
+    registerKeymap([
+      {
+        key: 'Escape',
+        scope: 'modal',
+        action: updateClose,
+        when: () => getState().update.modalOpen,
+      },
+    ]);
+    registerKeymap([{ key: 'Escape', scope: 'global', action: settingsClose }]);
+
+    // Update modal closed → modal-scope binding inert; global fires.
+    expect(getState().update.modalOpen).toBe(false);
+    keyDown('Escape');
+    expect(updateClose).not.toHaveBeenCalled();
+    expect(settingsClose).toHaveBeenCalledTimes(1);
+
+    // Open the update modal → modal-scope binding wins.
+    dispatch({ type: 'OPEN_UPDATE_MODAL' });
+    keyDown('Escape');
+    expect(updateClose).toHaveBeenCalledTimes(1);
+    // Global Settings Esc must NOT fire again — modal wins.
+    expect(settingsClose).toHaveBeenCalledTimes(1);
+  });
+
   it("'c' binding is suppressed when a modal is open (when guard)", () => {
     const spy = vi.fn();
     const guardedAction = (): void => {
