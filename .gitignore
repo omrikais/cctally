@@ -43,3 +43,15 @@ tests/fixtures/codex-session/token-count-dedup/.local/share/ccusage-subscription
 # Vite/React deps (handled by dashboard/web/.gitignore) stay untouched.
 /node_modules
 /package-lock.json
+
+# === Browser-MCP / manual-smoke artifacts ===
+# Playwright MCP writes a page snapshot + console log to .playwright-mcp/
+# on every browser interaction during share-v2 smoke passes (M1.20+).
+# Tool-generated; regenerated every session.
+.playwright-mcp/
+# Ad-hoc smoke screenshots saved at the repo root during manual share-v2
+# smoke testing (M1.20 + follow-up passes). `smoke*` matches both the
+# first-pass `share-v2-smoke-N-...` and second-pass `share-v2-smoke2-N-...`
+# naming. Anchored to root so an intentional asset elsewhere (e.g.,
+# docs/) isn't accidentally dropped.
+/share-v2-smoke*.png
