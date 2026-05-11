@@ -9,8 +9,10 @@
 import { render, screen, act, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShareModalRoot } from './ShareModalRoot';
-import { dispatch, _resetForTests } from '../store/store';
-import { openShareModal, closeShareModal } from '../store/shareSlice';
+import { dispatch, getState, _resetForTests } from '../store/store';
+import {
+  openShareModal, closeShareModal, openComposer,
+} from '../store/shareSlice';
 import { installGlobalKeydown, _resetForTests as _resetKeymap } from '../store/keymap';
 import { Modal } from '../modals/Modal';
 
@@ -235,6 +237,53 @@ describe('<ShareModalRoot>', () => {
     await act(async () => {
       fireEvent.keyDown(document, { key: 'Escape' });
     });
+    expect(
+      screen.queryByRole('heading', { name: /share weekly report/i }),
+    ).toBeNull();
+  });
+
+  it('Esc closes the composer first when layered above the share modal (spec §12.1)', async () => {
+    // Regression for M3 Impl C spec-compliance fix: when the composer
+    // is layered above an open share modal (the "Customize…" / `B`
+    // path), pressing Esc must close the composer and leave the share
+    // modal up. Both register at overlay scope; the share modal's
+    // binding now gates itself out with
+    // `when: () => !manageOpen && composerModal === null`, so the
+    // composer's Esc fires alone.
+    render(<ShareModalRoot />);
+    await act(async () => {
+      dispatch(openShareModal('weekly', null));
+      dispatch(openComposer());
+    });
+    // Sanity: both overlays are mounted. The share modal renders its
+    // own `role=dialog` (aria-label via title) and the composer renders
+    // an aria-labelled dialog as well.
+    expect(
+      screen.getByRole('heading', { name: /share weekly report/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('dialog', { name: /compose report/i }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.keyDown(document, { key: 'Escape' });
+    });
+    // Composer closed; share modal stays open.
+    expect(getState().composerModal).toBeNull();
+    expect(getState().shareModal).not.toBeNull();
+    expect(
+      screen.queryByRole('dialog', { name: /compose report/i }),
+    ).toBeNull();
+    expect(
+      screen.getByRole('heading', { name: /share weekly report/i }),
+    ).toBeInTheDocument();
+
+    // Press Esc again — now the share modal closes (its `when:` gate
+    // re-enables once composerModal is null).
+    await act(async () => {
+      fireEvent.keyDown(document, { key: 'Escape' });
+    });
+    expect(getState().shareModal).toBeNull();
     expect(
       screen.queryByRole('heading', { name: /share weekly report/i }),
     ).toBeNull();

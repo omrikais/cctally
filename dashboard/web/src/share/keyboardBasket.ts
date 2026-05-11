@@ -12,14 +12,11 @@
 //      per the project's global-hotkeys-modal-guard convention.
 //   5. inputMode === null — no input owner (filter `f` or search `/`).
 //
-// Spec §12.1 reads the binding as a single literal `B`, but the
-// keymap dispatcher's match is case-sensitive on `e.key`. To stay
-// robust against shift-state quirks we register both 'b' and 'B':
-// `buildBasketKeyBindings()` returns the pair, and main.tsx spreads it
-// into `registerKeymap`. Note: NOT case-sensitive on purpose — the
-// composer hotkey is the primary action; spec doesn't reserve
-// lowercase for anything else here. (The `S` binding diverges: it is
-// uppercase-only because lowercase `s` is reserved for Settings.)
+// Case-sensitivity: uppercase-only, mirroring the M1.16 `S` precedent.
+// The keymap dispatcher matches `key` literally; we register only
+// 'B' (Shift+B). Lowercase 'b' is NOT bound — leaving it free for
+// future per-panel use, and matching the `S`-vs-`s` divergence (where
+// lowercase `s` is owned by Settings).
 import type { Binding } from '../store/keymap';
 import { dispatch, getState } from '../store/store';
 import { openComposer } from '../store/shareSlice';
@@ -32,7 +29,7 @@ function isMobileViewport(): boolean {
 
 export function buildBasketKeyBinding(): Binding {
   return {
-    key: 'b',
+    key: 'B',
     scope: 'global',
     when: () => {
       const s = getState();
@@ -47,10 +44,10 @@ export function buildBasketKeyBinding(): Binding {
   };
 }
 
-// keymap dispatcher matches `key` literally; register the uppercase
-// twin so Shift-B works the same as plain `b`. Both share the same
-// guard predicate and action.
+// Returned as an array so main.tsx can spread into `registerKeymap`
+// uniformly with the other `build*KeyBindings()` helpers. The list
+// currently has a single entry (uppercase B); kept array-shaped so
+// future related bindings can land here without churning the caller.
 export function buildBasketKeyBindings(): Binding[] {
-  const base = buildBasketKeyBinding();
-  return [base, { ...base, key: 'B' }];
+  return [buildBasketKeyBinding()];
 }

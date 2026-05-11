@@ -11,6 +11,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ComposerModal } from './ComposerModal';
 import { _resetForTests, dispatch, getState } from '../store/store';
 import { openComposer } from '../store/shareSlice';
+import {
+  installGlobalKeydown, _resetForTests as _resetKeymap,
+} from '../store/keymap';
 import type { BasketItem } from '../store/basketSlice';
 import type { ShareOptions } from './types';
 
@@ -35,6 +38,8 @@ function jsonResponse(payload: unknown, status = 200): Response {
 
 beforeEach(() => {
   _resetForTests();
+  _resetKeymap();
+  installGlobalKeydown();
   // Default: NOT mobile (the modal renders desktop unless overridden).
   vi.stubGlobal('matchMedia', (q: string) => ({
     matches: false, media: q, onchange: null,
@@ -45,6 +50,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  _resetKeymap();
   vi.restoreAllMocks();
 });
 
@@ -210,6 +216,38 @@ describe('<ComposerModal>', () => {
     dispatch(openComposer());
     render(<ComposerModal />);
     fireEvent.click(screen.getByRole('button', { name: /^close$/i }));
+    expect(getState().composerModal).toBeNull();
+  });
+
+  it('Esc closes the composer (spec §12.1 MUST FIX regression)', () => {
+    // Spec §12.1 mandates Esc closes any share/composer overlay. The
+    // composer registers Esc at overlay scope with a `when:` gate
+    // requiring composerModal !== null, so it fires only while the
+    // composer is mounted-and-open.
+    seedBasket([{
+      id: 'a', panel: 'weekly', template_id: 'weekly-recap',
+      options: defaultOpts(), added_at: 't', data_digest_at_add: 'sha256:abc',
+      kernel_version: 1, label_hint: 'Weekly recap',
+    }]);
+    dispatch(openComposer());
+    render(<ComposerModal />);
+    expect(getState().composerModal).not.toBeNull();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(getState().composerModal).toBeNull();
+  });
+
+  it('Esc closes empty-state composer too', () => {
+    // Empty basket renders the empty-state branch; the Esc binding is
+    // registered before the early-return on closed, so it must still
+    // fire when the user dismisses an empty composer. Explicitly seed
+    // an empty basket to guard against localStorage carryover from
+    // earlier tests in the file (BASKET_HYDRATE persists; the master
+    // store re-reads on _resetForTests).
+    seedBasket([]);
+    dispatch(openComposer());
+    render(<ComposerModal />);
+    expect(screen.getByText(/basket is empty/i)).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: 'Escape' });
     expect(getState().composerModal).toBeNull();
   });
 });

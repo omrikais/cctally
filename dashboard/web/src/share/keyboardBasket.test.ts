@@ -5,8 +5,9 @@
 // The binding is registered in main.tsx alongside the other always-on
 // globals. These tests drive it through the same dispatcher: install
 // the global keydown handler, register the binding via the helper, then
-// fire `keydown { key: 'b' }` on document and assert the resulting
-// store state.
+// fire `keydown { key: 'B' }` (uppercase — the M3 spec-compliance fix
+// dropped the lowercase twin to mirror the `S`-vs-`s` precedent) on
+// document and assert the resulting store state.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent } from '@testing-library/react';
 import {
@@ -19,7 +20,7 @@ import { buildBasketKeyBindings } from './keyboardBasket';
 import { openShareModal, openComposer } from '../store/shareSlice';
 import { MOBILE_MEDIA_QUERY } from '../lib/breakpoints';
 
-function fireB() { fireEvent.keyDown(document, { key: 'b' }); }
+function fireB() { fireEvent.keyDown(document, { key: 'B' }); }
 
 beforeEach(() => {
   _resetStore();
@@ -87,8 +88,8 @@ describe('B keybinding (composer)', () => {
     expect(getState().composerModal).toBeNull();
   });
 
-  it('uppercase B also triggers (per spec — composer hotkey is case-insensitive)', () => {
-    fireEvent.keyDown(document, { key: 'B' });
-    expect(getState().composerModal).not.toBeNull();
+  it('lowercase b does NOT trigger (uppercase-only, mirrors the S precedent)', () => {
+    fireEvent.keyDown(document, { key: 'b' });
+    expect(getState().composerModal).toBeNull();
   });
 });

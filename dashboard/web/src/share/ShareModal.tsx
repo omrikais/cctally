@@ -32,6 +32,7 @@ import { PresetDropdown } from './PresetDropdown';
 import { ManagePresetsModal } from './ManagePresetsModal';
 import { sharePanelLabel } from './panelLabels';
 import { useKeymap } from '../hooks/useKeymap';
+import { getState } from '../store/store';
 
 interface Props {
   panel: SharePanelId;
@@ -93,11 +94,21 @@ export function ShareModal({ panel, onClose }: Props) {
   // SCOPE_ORDER and fires the FIRST match — it does NOT consider DOM
   // focus. Without this `when:` gate, Esc inside the manage modal would
   // close the entire share modal instead of just the nested overlay.
+  //
+  // Same shape for the composer: when <ComposerModal> is layered above
+  // this share modal (the "Customize…" / `B` path), both register Esc
+  // at overlay scope. The composer's `when:` already gates on
+  // `composerModal !== null`, so without this matching gate here the
+  // dispatcher would fire both handlers on a single Escape press (the
+  // composer first by registration order, then us). Gate ourselves out
+  // whenever the composer slot is non-null. `getState()` is read at
+  // fire time, not closure-captured, so we don't need to thread it
+  // into the deps array.
   const bindings = useMemo(
     () => [{
       key: 'Escape',
       scope: 'overlay' as const,
-      when: () => !manageOpen,
+      when: () => !manageOpen && getState().composerModal === null,
       action: onClose,
     }],
     [onClose, manageOpen],

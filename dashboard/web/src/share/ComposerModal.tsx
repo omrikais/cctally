@@ -27,6 +27,7 @@ import { closeComposer } from '../store/shareSlice';
 import { makeBasketItem } from '../store/basketSlice';
 import { bannerVisible, effectiveReveal } from './anonFormula';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { useKeymap } from '../hooks/useKeymap';
 import type { ShareFormat, ShareTheme } from './types';
 
 const COMPOSE_DEBOUNCE_MS = 200;
@@ -59,6 +60,27 @@ export function ComposerModal() {
   const [composeErr, setComposeErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const acRef = useRef<AbortController | null>(null);
+
+  // Esc-to-close at overlay scope (spec §12.1). The composer can layer
+  // ABOVE the share modal (the "Customize…" path opens the composer
+  // while the share modal is still up); both register their Esc at
+  // overlay scope, but ShareModal's binding is gated with
+  // `when: () => !manageOpen && composerModal === null` so this one
+  // wins when both are mounted. The `when:` guard here ensures the
+  // binding is inert when the composer slot is null — without it, even
+  // a closed-then-reopened ComposerModal would keep stealing Esc from
+  // sibling overlays. Binding identity is stable (empty deps); the
+  // dispatch + getState reads happen at fire time.
+  const bindings = useMemo(
+    () => [{
+      key: 'Escape',
+      scope: 'overlay' as const,
+      when: () => getState().composerModal !== null,
+      action: () => dispatch(closeComposer()),
+    }],
+    [],
+  );
+  useKeymap(bindings);
 
   // Default title once: "cctally report — <utcdate>" (spec §8.5; UTC
   // matches the CLI filename convention so a shared link's title and
