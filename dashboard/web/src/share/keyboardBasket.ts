@@ -7,10 +7,14 @@
 //   2. shareModal slot is empty (don't replace an open share modal).
 //   3. composerModal slot is empty (idempotent: re-pressing B while the
 //      composer is up is a no-op, not a re-open).
-//   4. !state.update.modalOpen — the update modal owns its own boolean
+//   4. openModal === null — no panel modal is up. Without this, B
+//      layered the composer over an open panel modal, contradicting
+//      spec §12.1 ("S/B are inert while a panel modal is open") and
+//      the project's global-hotkeys-modal-guard convention.
+//   5. !state.update.modalOpen — the update modal owns its own boolean
 //      slot (NOT `openModal`); every letter/digit global gates on it
 //      per the project's global-hotkeys-modal-guard convention.
-//   5. inputMode === null — no input owner (filter `f` or search `/`).
+//   6. inputMode === null — no input owner (filter `f` or search `/`).
 //
 // Case-sensitivity: uppercase-only, mirroring the M1.16 `S` precedent.
 // The keymap dispatcher matches `key` literally; we register only
@@ -36,6 +40,7 @@ export function buildBasketKeyBinding(): Binding {
       if (isMobileViewport()) return false;
       if (s.shareModal !== null) return false;
       if (s.composerModal !== null) return false;
+      if (s.openModal !== null) return false;
       if (s.update.modalOpen) return false;
       if (s.inputMode !== null) return false;
       return true;

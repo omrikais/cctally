@@ -207,6 +207,52 @@ def test_render_unknown_theme_raises():
     raise AssertionError("expected ValueError on unknown theme")
 
 
+# ---------------------------------------------------------------------
+# show_chart / show_table toggles drop the chart wrapper and table chrome
+# rather than emitting empty `<svg>` chart areas / empty `<table>` chrome
+# in HTML output. The toggle is applied upstream by
+# `_share_apply_content_toggles`; this test pins the renderer side of
+# the contract — chart=None must mean "no chart wrapper", columns=() must
+# mean "no table at all" — so a future inversion (e.g. emitting a
+# placeholder rect for "the user disabled the chart") is caught.
+# ---------------------------------------------------------------------
+
+import dataclasses as _dc  # noqa: E402 — used by the toggle-gating tests below
+
+
+def test_render_html_omits_chart_wrapper_when_chart_none():
+    snap = _dc.replace(_make_minimal_snapshot(), chart=None)
+    out = _lib_share.render(snap, format="html", theme="light", branding=True)
+    # The chart wrapper div has `margin-top:12px` and contains an `<svg`
+    # element — emitting the wrapper means the renderer leaked the
+    # empty chart area into the document.
+    assert "<svg" not in out, "HTML body should not contain <svg> when chart is None"
+
+
+def test_render_html_omits_table_when_columns_empty():
+    snap = _dc.replace(_make_minimal_snapshot(), columns=(), rows=())
+    out = _lib_share.render(snap, format="html", theme="light", branding=True)
+    # The HTML table chrome always starts with `<table style=…><thead>…`;
+    # gating on `snap.columns` drops the whole element rather than
+    # emitting empty `<thead><tr></tr></thead><tbody></tbody>`.
+    assert "<table" not in out, "HTML body should not contain <table> when columns are empty"
+
+
+def test_render_html_emits_chart_when_chart_present():
+    """Sanity: gating doesn't drop content when toggles are on."""
+    snap = _dc.replace(
+        _make_minimal_snapshot(),
+        chart=LineChart(
+            points=(ChartPoint(x_label="0", x_value=0.0, y_value=1.0),),
+            y_label="$",
+            reference_lines=(),
+        ),
+    )
+    out = _lib_share.render(snap, format="html", theme="light", branding=True)
+    assert "<svg" in out
+    assert "<table" in out
+
+
 def test_md_escape_backslash_does_not_double_escape():
     # A literal backslash becomes \\ — single pass, no doubling.
     assert _lib_share._md_escape("a\\b") == "a\\\\b"
@@ -446,7 +492,17 @@ def test_render_svg_chart_only_with_no_chart_returns_empty_svg():
 
 
 def test_render_html_wraps_chart_only_svg():
-    snap = _make_minimal_snapshot()
+    # Use a chart-bearing snap — the post-toggle renderer gates the chart
+    # wrapper on `snap.chart is not None` (chart=None drops the wrapper
+    # entirely; covered by `test_render_html_omits_chart_wrapper_when_chart_none`).
+    snap = _dc.replace(
+        _make_minimal_snapshot(),
+        chart=LineChart(
+            points=(ChartPoint(x_label="0", x_value=0.0, y_value=1.0),),
+            y_label="$",
+            reference_lines=(),
+        ),
+    )
     out = _lib_share._render_html(snap, palette=_lib_share.PALETTE_LIGHT, branding=True)
     assert out.startswith("<!DOCTYPE html>")
     assert "<html" in out and "</html>" in out

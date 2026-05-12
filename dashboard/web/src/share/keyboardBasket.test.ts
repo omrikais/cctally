@@ -77,6 +77,17 @@ describe('B keybinding (composer)', () => {
     expect(getState().composerModal).toBeNull();
   });
 
+  it('does nothing when a panel modal is open (openModal !== null)', () => {
+    // Spec §12.1: S/B are inert while a panel modal is open. Prior
+    // omission of this guard let B layer the composer over an open
+    // panel modal — confusing focus ownership and breaking the
+    // global-hotkey-modal-guard convention codified at
+    // `project_global_hotkeys_modal_guard`.
+    dispatch({ type: 'OPEN_MODAL', kind: 'weekly' });
+    fireB();
+    expect(getState().composerModal).toBeNull();
+  });
+
   it('does nothing on mobile', () => {
     vi.stubGlobal('matchMedia', (q: string) => ({
       matches: q === MOBILE_MEDIA_QUERY, media: q, onchange: null,
