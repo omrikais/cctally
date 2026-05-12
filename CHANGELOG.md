@@ -5,6 +5,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Dashboard share GUI: per-panel `↗` share icon opens a modal with 24 infographic templates (8 panels × 3 archetypes), live preview, themed export to MD/HTML/SVG, client-side PNG, and browser-native Print → PDF. Keyboard: `S` shares the focused panel, `B` opens the basket composer.
+- Multi-section composer: collect template recipes from any panel into a `📋 basket` (localStorage-persisted, hard cap 20), then stitch them with `/api/share/compose` into one document under composite chrome (single title, single frontmatter, one footer). Sections show "Outdated" when underlying data or kernel version has shifted; per-section refresh re-renders without losing the basket order.
+- Share presets + history: save the current template + knob recipe under a panel-scoped name (`/api/share/presets`); recall presets and the last 20 export recipes via the gallery's `presets ▾` dropdown.
+- New endpoints: `GET /api/share/templates`, `POST /api/share/render`, `POST /api/share/compose`, full CRUD on `/api/share/presets` and `/api/share/history`. All write paths CSRF-gated; compose is recipe-only (client-supplied bodies are silently ignored — privacy chokepoint preserved).
+
+### Changed
+- Markdown exports now carry YAML frontmatter (title, generated_at, period, panel, anonymized, cctally_version). Same set of v1 share goldens churn once with this release. Stripped by `--no-branding`.
+
+### Docs
+- New user-facing reference: `docs/commands/share-v2.md`.
+
 ## [1.5.0] - 2026-05-11
 
 ### Added

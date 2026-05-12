@@ -1,6 +1,6 @@
 # Shareable reports (`--format` on reporting commands)
 
-**For the dashboard GUI version**, see [`share-v2`](share-v2.md).
+> The dashboard ships a **GUI** for these flags — see [`share-v2.md`](share-v2.md). The two paths share the render kernel (`bin/_lib_share.py`), so output is byte-stable across them.
 
 `cctally` has a cross-command shareable-output surface: 8 reporting subcommands accept a `--format {md,html,svg}` flag that produces a self-contained artifact suitable for chat paste, GitHub issue, or screenshot. This page is the single reference for the flag surface; per-command pages document the per-command chart and table layouts.
 
