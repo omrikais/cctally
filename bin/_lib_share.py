@@ -1441,12 +1441,15 @@ def _stitch_md(sections: tuple[ComposedSection, ...], *,
     # Title as H1 (when frontmatter is present, this duplicates the
     # title key visually — accept the duplication; markdown readers
     # vary in how they render frontmatter and the H1 is the universal
-    # fallback).
-    parts.append(f"# {opts.title}\n\n")
+    # fallback). Title and per-section heading go through `_md_escape`
+    # to match the single-section path (`_render_md_body` at line 915);
+    # otherwise inline HTML or MD specials in a user-entered title
+    # would survive into the export unescaped.
+    parts.append(f"# {_md_escape(opts.title)}\n\n")
     for sec in sections:
         frag = _render_fragment(sec.snap, format="md", palette=PALETTE_LIGHT,
                                 branding=False)
-        parts.append(f"## {sec.snap.title}\n\n")
+        parts.append(f"## {_md_escape(sec.snap.title)}\n\n")
         parts.append(frag)
         parts.append("\n\n")
     return "".join(parts)

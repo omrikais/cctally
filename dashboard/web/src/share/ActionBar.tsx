@@ -246,13 +246,19 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
         label_hint: sharePanelLabel(panel),
       });
       dispatch({ type: 'BASKET_ADD', item });
+      // BASKET_ADD can be rejected when the basket is already at the
+      // 20-section cap. The store has fired its own "Basket is full"
+      // toast; suppress the success UI so we don't lie or overwrite it.
+      const after = getState().basket;
+      if (after.rejectedReason === 'capacity') {
+        return;
+      }
       setBasketAdded(true);
       if (basketTimerRef.current != null) clearTimeout(basketTimerRef.current);
       basketTimerRef.current = setTimeout(() => setBasketAdded(false), 800);
-      const count = getState().basket.items.length;
       dispatch({
         type: 'SHOW_STATUS_TOAST',
-        text: `Added ${item.label_hint} to basket (${count})`,
+        text: `Added ${item.label_hint} to basket (${after.items.length})`,
       });
     } catch (err: unknown) {
       const msg =

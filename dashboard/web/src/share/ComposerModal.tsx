@@ -25,7 +25,7 @@ import { ShareApiError, renderShare } from './api';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { closeComposer } from '../store/shareSlice';
 import { makeBasketItem } from '../store/basketSlice';
-import { bannerVisible, effectiveReveal } from './anonFormula';
+import { bannerVisible } from './anonFormula';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useKeymap } from '../hooks/useKeymap';
 import type { ShareFormat, ShareTheme } from './types';
@@ -221,23 +221,15 @@ export function ComposerModal() {
     }
   }
 
-  // Real-name banner (spec §10.5 + §8.7). Visible iff any section
-  // would expose its project names in the export under the current
-  // composite reveal_projects (= !anonOnExport) and the section's own
-  // recorded reveal_at_add. Click "Anonymize all" → flip composite anon
-  // ON; the recompose effect picks it up via the anonOnExport dep.
+  // Real-name banner (spec §8.5 / §10.4). The compose endpoint
+  // unconditionally overrides per-section reveal_projects with the
+  // composite value, so the banner fires whenever the composite would
+  // reveal AND the basket is non-empty. Click "Anonymize all" → flip
+  // composite anon ON; the recompose effect picks it up via the
+  // anonOnExport dep.
   const compositeReveal = !anonOnExport;
-  const sectionReveals = useMemo(
-    () => basket.items.map((it) => it.options.reveal_projects),
-    [basket.items],
-  );
-  const showBanner = bannerVisible(sectionReveals, compositeReveal);
-  const revealedCount = useMemo(
-    () => basket.items.filter((it) => effectiveReveal(
-      it.options.reveal_projects, compositeReveal,
-    )).length,
-    [basket.items, compositeReveal],
-  );
+  const showBanner = bannerVisible(basket.items.length, compositeReveal);
+  const revealedCount = compositeReveal ? basket.items.length : 0;
 
   if (!composerModal?.open) return null;
 

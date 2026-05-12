@@ -146,6 +146,36 @@ describe('<ComposerModal>', () => {
     await waitFor(() => expect(screen.getByText(/outdated/i)).toBeInTheDocument());
   });
 
+  it('real-name banner appears for anonymous-at-add sections under composite reveal', async () => {
+    // Codex P1 regression on PR #35 — the prior AND-with-add-time
+    // formula silently dropped this banner when every basket item
+    // was added anonymously, even though the server forces composite
+    // reveal across all sections at compose time. Now the banner
+    // fires whenever composite reveal is enabled and any sections
+    // are queued.
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({
+        body: '<html />', content_type: 'text/html',
+        snapshot: { kernel_version: 1, composed_at: 't', section_results: [] },
+      }),
+    );
+    seedBasket([{
+      id: 'a', panel: 'weekly', template_id: 'weekly-recap',
+      // Note: reveal_projects=false → "anonymous at add-time."
+      options: { ...defaultOpts(), reveal_projects: false },
+      added_at: 't', data_digest_at_add: 'sha256:abc',
+      kernel_version: 1, label_hint: 'Weekly recap',
+    }]);
+    dispatch(openComposer());
+    render(<ComposerModal />);
+    // Default "Anon on export" checked → composite reveal off → banner hidden.
+    expect(screen.queryByText(/real project names/i)).toBeNull();
+    // Uncheck "Anon on export" → composite reveal on → banner appears.
+    const anonCheckbox = screen.getByLabelText(/anon on export/i) as HTMLInputElement;
+    fireEvent.click(anonCheckbox);
+    await waitFor(() => expect(screen.getByText(/real project names/i)).toBeInTheDocument());
+  });
+
   it('real-name banner appears when a reveal-at-add section is present and anon-on-export unchecked', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       jsonResponse({

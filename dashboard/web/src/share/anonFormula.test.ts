@@ -1,37 +1,32 @@
-// Spec §10.5 — the formula behind the composer's real-name banner.
+// Spec §8.5 / §10.4 — the formula behind the composer's real-name banner.
 //
-// We parameterize all four truth-table combos so a future edit to the
-// formula can't silently drift the predicate (e.g. flipping `&&` → `||`
-// would surface here, not just downstream in the composer UI).
+// The server overrides per-section reveal_projects with the composer's
+// composite value at compose time, so the banner predicate ignores
+// add-time reveal entirely. See anonFormula.ts header for the privacy
+// rationale (Codex P1 on PR #35).
 import { describe, expect, it } from 'vitest';
-import { bannerVisible, effectiveReveal } from './anonFormula';
+import { bannerVisible } from './anonFormula';
 
-describe('anon formula (spec §10.5)', () => {
-  // Truth table: effective_reveal[i] = composite_reveal && section_reveal_at_add[i]
-  it.each<[boolean, boolean, boolean]>([
-    // composite, section, expected effective_reveal
-    [false, false, false],
-    [false, true,  false],
-    [true,  false, false],
-    [true,  true,  true],
-  ])('composite=%s, section=%s → effective_reveal=%s',
-    (comp, sec, expected) => {
-      expect(effectiveReveal(sec, comp)).toBe(expected);
+describe('anon banner formula (spec §8.5)', () => {
+  it.each<[number, boolean, boolean]>([
+    // sectionCount, compositeReveal, expected
+    [0, false, false],
+    [0, true,  false],   // empty basket: nothing to warn about
+    [1, false, false],   // composite anon: no reveal possible
+    [1, true,  true],    // composite reveal + ≥1 section: warn
+    [3, false, false],
+    [3, true,  true],
+  ])('sectionCount=%s, compositeReveal=%s → bannerVisible=%s',
+    (count, composite, expected) => {
+      expect(bannerVisible(count, composite)).toBe(expected);
     });
 
-  it('banner_visible = sections.some(effectiveReveal=true)', () => {
-    // All anon at add-time → composite reveal doesn't matter, banner hidden.
-    expect(bannerVisible([false, false], true)).toBe(false);
-    // One section captured with reveal → composite reveal exposes it → banner visible.
-    expect(bannerVisible([false, true], true)).toBe(true);
-    // Composite anon → all sections suppressed → banner hidden.
-    expect(bannerVisible([true, true], false)).toBe(false);
-  });
-
-  it('banner_visible on an empty sections list is false', () => {
-    // Trivially: Array.prototype.some on [] is false. Documenting it
-    // here because the composer's empty-state path renders no banner.
-    expect(bannerVisible([], true)).toBe(false);
-    expect(bannerVisible([], false)).toBe(false);
+  it('anonymous-at-add sections still trip the banner under composite reveal', () => {
+    // Regression: under the prior AND formula a single anonymous-at-add
+    // basket item would silence the banner even though the composite
+    // override would still reveal names on export. Now the section's
+    // add-time anon state has no effect on banner visibility — only
+    // the composite + non-empty-basket gate does.
+    expect(bannerVisible(1, true)).toBe(true);
   });
 });

@@ -1,31 +1,24 @@
-// Real-name banner formula — spec §10.5.
+// Real-name banner formula — spec §8.5 / §10.4.
 //
-// The composer's privacy nudge has one defining rule:
+// At compose time, the server re-renders every section from recipe with
+// the composer's composite `reveal_projects` value — per-section
+// add-time `reveal_projects` is unconditionally ignored (the explicit
+// `composite_opts` override at bin/cctally:33563-33567). So the banner
+// fires whenever the composite would reveal real names AND there is at
+// least one section in the basket:
 //
-//   effective_reveal[i] = composite_reveal_projects && section_reveal_at_add_time[i]
-//   banner_visible      = sections.some(i => effective_reveal[i])
+//   banner_visible = composite_reveal_projects && section_count > 0
 //
-// In words: a section's projects appear in the composed output ONLY IF
-// both the composite ("Anon on export" UNCHECKED, i.e. composite_reveal
-// = true) AND the section was added with reveal_projects = true. If
-// composite "Anon on export" is checked, every section is anonymized
-// regardless of how it was captured — the banner disappears.
-//
-// Lifted into its own module so the formula is the single source of
-// truth: the modal renders against it, the unit test parameterizes all
-// four truth-table combos, and a future implementor can't silently
-// drift the predicate by editing the modal without touching the test.
-
-export function effectiveReveal(
-  sectionRevealAtAddTime: boolean,
-  compositeRevealProjects: boolean,
-): boolean {
-  return compositeRevealProjects && sectionRevealAtAddTime;
-}
+// Codex review on PR #35 flagged that the prior AND-with-add-time
+// formula (§10.5) was silent when a section captured anonymously was
+// nonetheless revealed by the composite override — i.e. the banner
+// hid a real-name export. Aligning with §8.5 (server behavior) closes
+// that gap; the §10.5 wording in the design doc was amended in the
+// same PR.
 
 export function bannerVisible(
-  sectionReveals: boolean[],
+  sectionCount: number,
   compositeRevealProjects: boolean,
 ): boolean {
-  return sectionReveals.some((r) => effectiveReveal(r, compositeRevealProjects));
+  return compositeRevealProjects && sectionCount > 0;
 }

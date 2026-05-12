@@ -257,6 +257,57 @@ def test_compose_no_branding_strips_md_frontmatter():
     )
 
 
+def test_compose_md_escapes_composite_title_and_section_headings():
+    """Codex P2 on PR #35 — `_stitch_md` previously emitted `opts.title`
+    and `sec.snap.title` raw into H1/H2. Per single-section parity
+    (`_render_md_body` at bin/_lib_share.py:915), composite headings
+    must also route through `_md_escape` so MD/HTML specials in a
+    user-entered title don't survive into the export unescaped."""
+    sec = _LS.ComposedSection(
+        snap=_LS.ShareSnapshot(
+            cmd="weekly",
+            title="Section<script>alert('x')</script>",
+            subtitle=None,
+            period=_LS.PeriodSpec(
+                start=datetime(2026, 5, 4, tzinfo=timezone.utc),
+                end=datetime(2026, 5, 10, tzinfo=timezone.utc),
+                display_tz="Etc/UTC", label="This week",
+            ),
+            columns=(), rows=(), chart=None, totals=(), notes=(),
+            generated_at=datetime(2026, 5, 11, 9, 30, tzinfo=timezone.utc),
+            version="1.5.0",
+        ),
+        drift_detected=False,
+    )
+    opts = _LS.ComposeOptions(
+        title='Composite "report" & <em>more</em>',
+        theme="light", format="md",
+        no_branding=False, reveal_projects=True,
+    )
+    out = _LS.compose((sec,), opts=opts)
+    # The H1 line is the composite title — HTML chars must be escaped.
+    # `_md_escape` covers &/</> but not quotes; the regression is HTML
+    # specials surviving in markdown body, which is the privacy/safety
+    # hole. (Frontmatter is a separate concern: it carries the title as
+    # a YAML scalar, which is opaque to MD/HTML renderers.)
+    assert '# Composite "report" &amp; &lt;em&gt;more&lt;/em&gt;' in out, (
+        "composite title H1 must be _md_escape'd"
+    )
+    # The H2 section heading carries the user-entered section title —
+    # must also be escaped so embedded HTML doesn't survive.
+    assert "## Section&lt;script&gt;alert('x')&lt;/script&gt;" in out, (
+        "section heading H2 must be _md_escape'd"
+    )
+    # Body (post-frontmatter) must not carry raw HTML.
+    body_only = out.split("\n---\n\n", 1)[-1]
+    assert "<em>more</em>" not in body_only, (
+        "raw <em> must not survive into MD body H1"
+    )
+    assert "<script>" not in body_only, (
+        "raw <script> must not survive into MD body H2"
+    )
+
+
 def test_compose_per_section_drift_flag_does_not_change_body():
     """drift_detected is a metadata flag; it must not alter the rendered body."""
     a = _LS.ComposedSection(snap=_make_section().snap, drift_detected=False)

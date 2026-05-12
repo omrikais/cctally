@@ -28978,6 +28978,33 @@ def _share_iso(value) -> "str | None":
     return str(value)
 
 
+def _share_apply_content_toggles(snap_built, options: dict):
+    """Strip chart / table from a built ShareSnapshot per render options.
+
+    The render kernel consumes whatever the template builder emits, so
+    chart/table on-off can't be expressed by the builder alone (every
+    builder unconditionally emits both). Apply the toggle here, after
+    the builder, before `_scrub` and `render`. ShareSnapshot is frozen;
+    `dataclasses.replace` returns a new instance.
+
+    Defaults preserve pre-toggle behavior: `show_chart` defaults to
+    True, `show_table` defaults to True. Explicit False on either
+    drops the corresponding payload.
+    """
+    import dataclasses as _dc
+    show_chart = bool(options.get("show_chart", True))
+    show_table = bool(options.get("show_table", True))
+    changes: dict = {}
+    if not show_chart:
+        changes["chart"] = None
+    if not show_table:
+        changes["columns"] = ()
+        changes["rows"] = ()
+    if not changes:
+        return snap_built
+    return _dc.replace(snap_built, **changes)
+
+
 def _build_share_panel_data(panel: str, options: dict,
                             snap: "DataSnapshot | None") -> dict:
     """Dispatch to the per-panel builder; reuses the dashboard DataSnapshot.
@@ -33349,7 +33376,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 "field": "options.theme",
             })
             return
-        if "top_n" in options:
+        # `top_n` may be explicit-null when the UI's Top-N input is
+        # cleared (Knobs.tsx:43); treat null as "use template default"
+        # rather than 400-ing every preview/export until the user types
+        # a number.
+        if options.get("top_n") is not None:
             top_n_raw = options["top_n"]
             if not isinstance(top_n_raw, int) or isinstance(top_n_raw, bool) or top_n_raw < 1:
                 self._respond_json(400, {
@@ -33403,6 +33434,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._respond_json(500, {"error": f"builder failed: {exc}"})
             return
+        # Content toggles (spec §Q4). Defaults match the existing
+        # behavior (chart on, table on); explicit False strips the
+        # corresponding section from the ShareSnapshot. ShareSnapshot
+        # is frozen so we use dataclasses.replace.
+        snap_built = _share_apply_content_toggles(snap_built, options)
         reveal = bool(options.get("reveal_projects", True))
         if not reveal:
             snap_built = ls._scrub(snap_built, reveal_projects=False)
@@ -33581,6 +33617,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     "error": f"sections[{idx}] builder failed: {exc}",
                 })
                 return
+            # Same content toggles as the single-section render path.
+            # Per-section `show_chart`/`show_table` from the basket
+            # recipe are applied here; the composite anon flag is
+            # already merged into composite_opts upstream.
+            snap_built = _share_apply_content_toggles(snap_built, composite_opts)
             if not reveal_projects:
                 snap_built = ls._scrub(snap_built, reveal_projects=False)
 

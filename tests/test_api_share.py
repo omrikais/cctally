@@ -152,6 +152,123 @@ def test_share_render_rejects_unknown_template(dashboard_server):
     assert "template" in err["error"].lower()
 
 
+def test_share_render_accepts_null_top_n(dashboard_server):
+    """Codex P2 on PR #35 — Knobs.tsx emits `top_n: null` when the
+    Top-N input is cleared (Knobs.tsx:43). The validator must treat
+    null as "not provided" rather than 400-ing every preview/export
+    until the user types a number. Regression for the rejection path
+    is exercised by test_share_render_rejects_invalid_top_n below."""
+    port, _ = dashboard_server
+    req_body = json.dumps({
+        "panel": "weekly", "template_id": "weekly-recap",
+        "options": {"format": "md", "top_n": None,
+                    "period": {"kind": "current"}},
+    }).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/render",
+        data=req_body, method="POST",
+        headers=_csrf_headers(port),
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        body = json.loads(r.read())
+    assert body["content_type"] == "text/markdown"
+
+
+def test_share_render_rejects_invalid_top_n(dashboard_server):
+    """Belt to the null-acceptance test above: non-null invalid values
+    (0, negative ints, non-ints, bool) MUST still 400 with the
+    same error envelope."""
+    port, _ = dashboard_server
+    for bad in (0, -3, "five", True):
+        req_body = json.dumps({
+            "panel": "weekly", "template_id": "weekly-recap",
+            "options": {"format": "md", "top_n": bad},
+        }).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/share/render",
+            data=req_body, method="POST",
+            headers=_csrf_headers(port),
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc.value.code == 400, f"expected 400 for top_n={bad!r}"
+        err = json.loads(exc.value.read())
+        assert err["field"] == "options.top_n"
+
+
+def test_share_render_show_chart_false_strips_chart(dashboard_server):
+    """Codex P2 on PR #35 — `show_chart=False` must drop the chart from
+    the rendered output. SVG carries an `<svg>` body whose only LineChart
+    we can probe via the absence of `<polyline`; MD includes the chart's
+    `_emit_md` output if the chart is present."""
+    port, _ = dashboard_server
+    base = {"panel": "weekly", "template_id": "weekly-recap"}
+    common_opts = {"format": "svg", "theme": "light",
+                   "reveal_projects": True, "no_branding": False,
+                   "period": {"kind": "current"}}
+    # With chart (control).
+    with urllib.request.urlopen(
+        urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/share/render",
+            data=json.dumps({**base, "options": {**common_opts,
+                              "show_chart": True, "show_table": True}}).encode(),
+            method="POST", headers=_csrf_headers(port),
+        ), timeout=5,
+    ) as r:
+        with_chart = json.loads(r.read())["body"]
+    # Without chart.
+    with urllib.request.urlopen(
+        urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/share/render",
+            data=json.dumps({**base, "options": {**common_opts,
+                              "show_chart": False, "show_table": True}}).encode(),
+            method="POST", headers=_csrf_headers(port),
+        ), timeout=5,
+    ) as r:
+        without_chart = json.loads(r.read())["body"]
+    # The SVG chart renderer emits `<polyline` for the LineChart trace.
+    # Stripping `chart` from the snapshot must remove that element.
+    assert "<polyline" in with_chart, "control: chart-on should render polyline"
+    assert "<polyline" not in without_chart, "show_chart=False must strip chart"
+
+
+def test_share_render_show_table_false_strips_table(dashboard_server):
+    """Codex P2 on PR #35 — `show_table=False` must drop the table from
+    the rendered output. Probe via MD format where the table renders as
+    a pipe-delimited block."""
+    port, _ = dashboard_server
+    base = {"panel": "daily", "template_id": "daily-recap"}
+    common_opts = {"format": "md", "theme": "light",
+                   "reveal_projects": True, "no_branding": True,
+                   "period": {"kind": "current"}}
+    with urllib.request.urlopen(
+        urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/share/render",
+            data=json.dumps({**base, "options": {**common_opts,
+                              "show_chart": True, "show_table": True}}).encode(),
+            method="POST", headers=_csrf_headers(port),
+        ), timeout=5,
+    ) as r:
+        with_table = json.loads(r.read())["body"]
+    with urllib.request.urlopen(
+        urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/share/render",
+            data=json.dumps({**base, "options": {**common_opts,
+                              "show_chart": True, "show_table": False}}).encode(),
+            method="POST", headers=_csrf_headers(port),
+        ), timeout=5,
+    ) as r:
+        without_table = json.loads(r.read())["body"]
+    # MD table heading divider `| --- |` is the canonical signal.
+    assert "---" in with_table, "control: show_table=True should render the table"
+    # Without table, MD body must have no pipe-table rows. (Frontmatter
+    # would carry `---` so we strip --no-branding by setting no_branding
+    # = True via the request options above.)
+    assert " | " not in without_table, (
+        "show_table=False must strip pipe-table rows from MD body"
+    )
+
+
 def test_share_render_csrf_blocks_cross_origin(dashboard_server):
     port, _ = dashboard_server
     req_body = json.dumps({"panel": "weekly", "template_id": "weekly-recap",
