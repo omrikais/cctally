@@ -165,6 +165,31 @@ def test_render_svg_outer_width_grows_with_wide_table():
     )
 
 
+def test_render_svg_table_band_extends_to_used_width_under_clamp():
+    """Header band + row stripes must cover every column even when the
+    clamp pushes the table past `max_width`. Without this, right-side
+    cells sit on the outer SVG background instead of the band/stripe
+    color — breaks the Treatment A visual contract. Regression test
+    for the second half of the Codex PR #40 P2 follow-up.
+    """
+    import re
+    snap = _make_snap_with_n_columns(49)
+    svg, _h, used_w = _LS._render_svg_table(
+        snap, palette=_LS.PALETTE_LIGHT,
+        x=0, y=0, max_width=_LS._SVG_WIDTH,
+    )
+    # First <rect> in the table fragment is the header band.
+    first_rect = re.search(r'<rect [^/]*width="([\d.]+)"', svg)
+    assert first_rect is not None, svg[:200]
+    band_w = float(first_rect.group(1))
+    assert band_w > _LS._SVG_WIDTH, (
+        f"Header band width {band_w} should exceed _SVG_WIDTH {_LS._SVG_WIDTH} "
+        f"when the clamp fires (used_width={used_w})."
+    )
+    # Band matches the actual used width.
+    assert band_w == used_w, f"band_w {band_w} != used_w {used_w}"
+
+
 def test_render_svg_outer_width_unchanged_at_normal_top_n():
     # The common-case guard: when the table fits naturally, outer SVG
     # width stays at 640px. Locks the byte-stable invariant for the 16

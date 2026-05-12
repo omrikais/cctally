@@ -1190,10 +1190,17 @@ def _render_svg_table(
     for w in widths[:-1]:
         col_xs.append(col_xs[-1] + w)
 
+    # Band rects span the full rendered width — when min-col-w clamp
+    # pushes sum(widths) past max_width, both the header band and the
+    # alternating row stripes extend with the columns so right-side
+    # cells sit on the band color, not on the outer SVG background.
+    used_width = sum(widths)
+    band_width = max(max_width, used_width)
+
     pieces: list[str] = []
 
     # Header band.
-    pieces.append(svg_rect(x, y, max_width, header_h,
+    pieces.append(svg_rect(x, y, band_width, header_h,
                            fill=palette["table_header_bg"]))
     # Header text.
     for i, c in enumerate(cols):
@@ -1213,7 +1220,7 @@ def _render_svg_table(
     for r, _ in enumerate(rows):
         rh = body_heights[r]
         row_bg = palette["table_row_alt"] if (r % 2 == 1) else palette["bg"]
-        pieces.append(svg_rect(x, row_y, max_width, rh, fill=row_bg))
+        pieces.append(svg_rect(x, row_y, band_width, rh, fill=row_bg))
 
         for i, c in enumerate(cols):
             cx = col_xs[i]
@@ -1228,7 +1235,6 @@ def _render_svg_table(
                 ))
         row_y += rh
 
-    used_width = sum(widths)
     return "".join(pieces), total_h, used_width
 
 
