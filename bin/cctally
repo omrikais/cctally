@@ -24128,6 +24128,267 @@ def _setup_recent_log_stats(seconds: float = 24 * 3600) -> dict:
     return counts
 
 
+def doctor_gather_state(
+    *,
+    now_utc: "dt.datetime | None" = None,
+    runtime_bind: "str | None" = None,
+):
+    """Assemble a DoctorState from existing helpers + raw config read +
+    JSONL probes + DB read-only SELECTs. Spec §7.2.
+
+    Each source wrapped in try/except so a partial failure leaves the
+    relevant field None and the dependent check degrades cleanly. The
+    function is the SINGLE I/O chokepoint for `cctally doctor` — the
+    pure kernel in `bin/_lib_doctor.py` consumes the returned
+    DoctorState dataclass and emits the report (spec §7.1).
+
+    Special concerns:
+      * config.json is read RAW (NOT via load_config) — load_config
+        auto-creates the file on first run, which would mutate user
+        state under a read-only diagnostic command (codex H1).
+      * `runtime_bind` is passed by the dashboard subcommand only;
+        CLI `cmd_doctor` always leaves it None and the report renders
+        a "config-only" note so users understand a running dashboard
+        may differ.
+      * `now_utc` honors `CCTALLY_AS_OF` (same hidden env hook as
+        `cctally project`) so fixture-based tests get deterministic
+        timestamps.
+    """
+    import _lib_doctor
+
+    if now_utc is None:
+        as_of = os.environ.get("CCTALLY_AS_OF")
+        if as_of:
+            now_utc = parse_iso_datetime(
+                as_of, "CCTALLY_AS_OF"
+            ).astimezone(dt.timezone.utc)
+        else:
+            now_utc = dt.datetime.now(dt.timezone.utc)
+
+    # ── Install ──────────────────────────────────────────────────────
+    repo_root = _setup_resolve_repo_root()
+    dst_dir = _setup_local_bin_dir()
+    symlink_state: "list[tuple[str, str]] | None" = []
+    try:
+        for name in SETUP_SYMLINK_NAMES:
+            dst = dst_dir / name
+            src = _setup_resolve_symlink_source(repo_root, name)
+            if dst.is_symlink() and pathlib.Path(os.readlink(dst)) == src:
+                symlink_state.append((name, "ok"))
+            elif dst.exists():
+                symlink_state.append((name, "wrong"))
+            else:
+                symlink_state.append((name, "missing"))
+    except Exception:
+        symlink_state = None
+    try:
+        path_includes = _setup_path_includes_local_bin()
+    except Exception:
+        path_includes = None
+    try:
+        legacy_snippet = _setup_detect_legacy_snippet()
+    except Exception:
+        legacy_snippet = None
+
+    # ── Hooks ────────────────────────────────────────────────────────
+    try:
+        settings = _load_claude_settings()
+    except Exception:
+        settings = None
+    try:
+        hook_counts = _setup_count_hook_entries(settings or {})
+    except Exception:
+        hook_counts = None
+    try:
+        legacy_bespoke = _setup_detect_legacy_bespoke_hooks(settings or {})
+    except Exception:
+        legacy_bespoke = None
+    try:
+        activity = _setup_recent_log_stats()
+    except Exception:
+        activity = None
+
+    # ── Auth ─────────────────────────────────────────────────────────
+    try:
+        oauth_token_present = _setup_oauth_token_present()
+    except Exception:
+        oauth_token_present = None
+
+    # ── DB ───────────────────────────────────────────────────────────
+    try:
+        stats_db_status = _db_status_for(DB_PATH, _STATS_MIGRATIONS, "stats.db")
+        if not DB_PATH.exists():
+            stats_db_status["_file_exists"] = False
+    except Exception as exc:
+        stats_db_status = {"path": str(DB_PATH), "user_version": 0,
+                           "registry_size": len(_STATS_MIGRATIONS),
+                           "migrations": [], "_open_error": str(exc)}
+    try:
+        cache_db_status = _db_status_for(CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db")
+        if not CACHE_DB_PATH.exists():
+            cache_db_status["_file_exists"] = False
+    except Exception as exc:
+        cache_db_status = {"path": str(CACHE_DB_PATH), "user_version": 0,
+                           "registry_size": len(_CACHE_MIGRATIONS),
+                           "migrations": [], "_open_error": str(exc)}
+
+    # ── Data freshness ───────────────────────────────────────────────
+    latest_snapshot_at = None
+    try:
+        if DB_PATH.exists():
+            conn = sqlite3.connect(str(DB_PATH))
+            try:
+                row = conn.execute(
+                    "SELECT MAX(captured_at_utc) FROM weekly_usage_snapshots"
+                ).fetchone()
+                if row and row[0]:
+                    latest_snapshot_at = parse_iso_datetime(
+                        row[0], "weekly_usage_snapshots.captured_at_utc",
+                    ).astimezone(dt.timezone.utc)
+            except sqlite3.OperationalError:
+                pass  # table missing — treat as no snapshots yet
+            finally:
+                conn.close()
+    except Exception:
+        pass
+
+    cache_entries_count = None
+    cache_last_entry_at = None
+    try:
+        if CACHE_DB_PATH.exists():
+            conn = sqlite3.connect(str(CACHE_DB_PATH))
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*), MAX(timestamp_utc) FROM session_entries"
+                ).fetchone()
+                if row:
+                    cache_entries_count = int(row[0]) if row[0] is not None else 0
+                    if row[1]:
+                        cache_last_entry_at = parse_iso_datetime(
+                            row[1], "session_entries.timestamp_utc",
+                        ).astimezone(dt.timezone.utc)
+            except sqlite3.OperationalError:
+                pass  # table missing — treat as zero
+            finally:
+                conn.close()
+    except Exception:
+        pass
+
+    claude_jsonl_present = False
+    try:
+        claude_dir = pathlib.Path.home() / ".claude" / "projects"
+        if claude_dir.exists():
+            claude_jsonl_present = next(claude_dir.glob("**/*.jsonl"), None) is not None
+    except Exception:
+        pass
+
+    codex_entries_count = None
+    codex_last_entry_at = None
+    try:
+        if CACHE_DB_PATH.exists():
+            conn = sqlite3.connect(str(CACHE_DB_PATH))
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*), MAX(timestamp_utc) FROM codex_session_entries"
+                ).fetchone()
+                if row:
+                    codex_entries_count = int(row[0]) if row[0] is not None else 0
+                    if row[1]:
+                        codex_last_entry_at = parse_iso_datetime(
+                            row[1], "codex_session_entries.timestamp_utc",
+                        ).astimezone(dt.timezone.utc)
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                conn.close()
+    except Exception:
+        pass
+
+    codex_jsonl_present = False
+    try:
+        codex_dir = pathlib.Path.home() / ".codex" / "sessions"
+        if codex_dir.exists():
+            codex_jsonl_present = next(codex_dir.glob("**/*.jsonl"), None) is not None
+    except Exception:
+        pass
+
+    # ── Safety ───────────────────────────────────────────────────────
+    # `dashboard.bind` is read via the same chokepoint that powers
+    # `cctally config get dashboard.bind` — _config_known_value
+    # normalizes hand-edited junk back to "loopback", matching the
+    # value cmd_dashboard would actually bind to. We use
+    # _load_config_unlocked (NOT load_config) so a fresh HOME doesn't
+    # trigger first-run config.json creation under doctor.
+    try:
+        dashboard_bind_stored = _config_known_value(
+            _load_config_unlocked(), "dashboard.bind",
+        ) or "loopback"
+    except Exception:
+        dashboard_bind_stored = "loopback"
+
+    # config.json — RAW READ, never load_config(). load_config()
+    # auto-creates on first run AND silently falls back to defaults
+    # on corruption — both behaviors would hide diagnostic state
+    # (codex H1).
+    config_json_error = None
+    try:
+        if CONFIG_PATH.exists():
+            json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        config_json_error = f"{type(exc).__name__}: {exc}"
+    except OSError as exc:
+        config_json_error = f"OSError: {exc}"
+
+    update_state = None
+    update_state_error = None
+    try:
+        update_state = _load_update_state()
+    except Exception as exc:
+        update_state_error = f"{type(exc).__name__}: {exc}"
+
+    update_suppress = None
+    update_suppress_error = None
+    try:
+        update_suppress = _load_update_suppress()
+    except Exception as exc:
+        update_suppress_error = f"{type(exc).__name__}: {exc}"
+
+    # ── Meta ─────────────────────────────────────────────────────────
+    cctally_version_tuple = _release_read_latest_release_version()
+    cctally_version = (
+        cctally_version_tuple[0] if cctally_version_tuple else "unknown"
+    )
+
+    return _lib_doctor.DoctorState(
+        symlink_state=symlink_state,
+        path_includes_local_bin=path_includes,
+        legacy_snippet=legacy_snippet,
+        legacy_bespoke=legacy_bespoke,
+        claude_settings=settings,
+        hook_counts=hook_counts,
+        log_activity_24h=activity,
+        oauth_token_present=oauth_token_present,
+        stats_db_status=stats_db_status,
+        cache_db_status=cache_db_status,
+        latest_snapshot_at=latest_snapshot_at,
+        cache_entries_count=cache_entries_count,
+        cache_last_entry_at=cache_last_entry_at,
+        claude_jsonl_present=claude_jsonl_present,
+        codex_entries_count=codex_entries_count,
+        codex_last_entry_at=codex_last_entry_at,
+        codex_jsonl_present=codex_jsonl_present,
+        dashboard_bind_stored=dashboard_bind_stored,
+        runtime_bind=runtime_bind,
+        config_json_error=config_json_error,
+        update_state=update_state,
+        update_state_error=update_state_error,
+        update_suppress=update_suppress,
+        update_suppress_error=update_suppress_error,
+        now_utc=now_utc,
+        cctally_version=cctally_version,
+    )
+
+
 def _setup_status(args: argparse.Namespace) -> int:
     repo_root = _setup_resolve_repo_root()
     dst_dir = _setup_local_bin_dir()
