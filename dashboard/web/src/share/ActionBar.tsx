@@ -1,19 +1,15 @@
 // Action buttons + format radio for the share modal (spec §6.2 footer,
 // §6.5 actions table, plan §M1.15).
 //
-// Three M1-functional actions:
-//   Copy     — MD only.   navigator.clipboard.writeText(body) + toast
-//   Download — all formats. Blob → anchor.click filename includes
-//              `cctally-<panel>-<utcdate>.<ext>`.
-//   Open     — HTML / SVG only. window.open(URL.createObjectURL(blob))
-//
-// M2/M3/M4 stubs render as disabled buttons with explanatory tooltips so
-// the affordance is discoverable but the user gets immediate feedback
-// that the feature is not yet shipped:
-//   PNG          — disabled, "Coming in M4" (SVG only)
-//   Print → PDF  — disabled, "Coming in M4" (HTML only)
-//   + Basket     — disabled, "Coming in M3"
-//   Save preset… — disabled, "Coming in M2"
+// Live actions:
+//   Copy         — MD only.   navigator.clipboard.writeText(body) + toast.
+//   Download     — all formats. Blob → anchor.click filename includes
+//                  `cctally-<panel>-<utcdate>.<ext>`.
+//   Open         — HTML / SVG only. window.open(URL.createObjectURL(blob)).
+//   PNG          — SVG only.  svgToPng → canvas → toBlob → anchor.click (M4.1).
+//   Print → PDF  — HTML only. Hidden iframe + iframe.contentWindow.print() (M4.2).
+//   + Basket     — pushes recipe to the composer basket (M3.5).
+//   Save preset… — inline popover saves the current recipe (M2.4).
 //
 // The format radio also lives here (the spec puts it ABOVE the action
 // buttons in the §6.2 ASCII diagram). It calls onOptionsChange with the

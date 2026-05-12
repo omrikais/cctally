@@ -2582,6 +2582,8 @@ mark.current {
 .share-action-copy:not([disabled]) { border-color: var(--accent-green); }
 .share-action-download:not([disabled]) { border-color: var(--accent-blue); }
 .share-action-open:not([disabled]) { border-color: var(--accent-cyan); }
+.share-action-png:not([disabled]) { border-color: var(--accent-purple); }
+.share-action-print:not([disabled]) { border-color: var(--accent-amber); }
 .share-action-error {
   margin-top: 6px;
   color: var(--accent-red); font-size: 12px;
