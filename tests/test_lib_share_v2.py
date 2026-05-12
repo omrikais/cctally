@@ -140,6 +140,17 @@ def test_md_frontmatter_stripped_when_no_branding():
     )
 
 
+def test_md_frontmatter_utc_uses_z_suffix(tmp_path):
+    """Issue #37 — UTC `generated_at:` / `period:` must end with `Z`, not
+    `+00:00`. Routes through `_format_generated_at_iso` to match spec §11.5
+    and the SVG/HTML chrome (which already emits `Z`)."""
+    snap = _trivial_snapshot()
+    out = _LS.render(snap, format="md", theme="light", branding=True)
+    assert "generated_at: 2026-05-11T09:30:00Z\n" in out
+    assert "period: 2026-05-04T00:00:00Z..2026-05-10T00:00:00Z\n" in out
+    assert "+00:00" not in out
+
+
 def _project_snapshot():
     """A snapshot with two ProjectCell rows so `_scrub` produces project-N labels.
 
@@ -306,6 +317,20 @@ def test_compose_md_escapes_composite_title_and_section_headings():
     assert "## Section&lt;script&gt;alert('x')&lt;/script&gt;" in out, (
         "section heading H2 must be _md_escape'd"
     )
+
+
+def test_compose_md_frontmatter_utc_uses_z_suffix():
+    """Issue #37 — composite-MD frontmatter must also emit `Z` for UTC
+    datetimes, matching the single-section path."""
+    sections = (_make_section(title="A"), _make_section(title="B"))
+    opts = _LS.ComposeOptions(
+        title="Combined", theme="light", format="md",
+        no_branding=False, reveal_projects=True,
+    )
+    out = _LS.compose(sections, opts=opts)
+    assert "generated_at: 2026-05-11T09:30:00Z\n" in out
+    assert "period: 2026-05-04T00:00:00Z..2026-05-10T00:00:00Z\n" in out
+    assert "+00:00" not in out
     # Body (post-frontmatter) must not carry raw HTML.
     body_only = out.split("\n---\n\n", 1)[-1]
     assert "<em>more</em>" not in body_only, (

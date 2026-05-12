@@ -1529,14 +1529,14 @@ def _build_md_frontmatter(snap: ShareSnapshot) -> str:
     """
     period = snap.period
     period_iso = (
-        f"{period.start.isoformat()}.."
-        f"{period.end.isoformat()}"
+        f"{_format_generated_at_iso(period.start)}.."
+        f"{_format_generated_at_iso(period.end)}"
     )
     anonymized = "true" if _snapshot_is_anonymized(snap) else "false"
     lines = [
         "---",
         f"title: {_yaml_scalar(snap.title)}",
-        f"generated_at: {snap.generated_at.isoformat()}",
+        f"generated_at: {_format_generated_at_iso(snap.generated_at)}",
         f"period: {period_iso}",
         f"panel: {snap.cmd}",
     ]
@@ -1760,8 +1760,9 @@ def _stitch_md(sections: tuple[ComposedSection, ...], *,
         parts.append(
             "---\n"
             f"title: {_yaml_scalar(opts.title)}\n"
-            f"generated_at: {first_snap.generated_at.isoformat()}\n"
-            f"period: {earliest.isoformat()}..{latest.isoformat()}\n"
+            f"generated_at: {_format_generated_at_iso(first_snap.generated_at)}\n"
+            f"period: {_format_generated_at_iso(earliest)}.."
+            f"{_format_generated_at_iso(latest)}\n"
             f"panel: composed\n"
             f"anonymized: {anon_field}\n"
             f"cctally_version: {first_snap.version}\n"
