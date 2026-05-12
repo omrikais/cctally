@@ -438,3 +438,165 @@ def test_compose_csrf_gate(dashboard_server):
     except urllib.error.HTTPError as e:
         raised = e
     assert raised is not None and raised.code == 403
+
+
+# ---------- M4.3 — /api/share/history ring buffer ----------
+
+
+def test_history_initial_get_returns_empty(dashboard_server):
+    """First call on a fresh config — no `share.history` key — must shape
+    the response as `{"history": []}` so the frontend's parser doesn't
+    have to special-case missing keys."""
+    port, _ = dashboard_server
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/api/share/history", timeout=5,
+    ) as r:
+        body = json.loads(r.read())
+    assert body == {"history": []}
+
+
+def test_history_post_appends_and_trims_to_20(dashboard_server):
+    """Spec §11.4 — server-side ring buffer caps at 20, FIFO trim so the
+    newest entry is always the last element."""
+    port, _ = dashboard_server
+    for _ in range(25):
+        payload = {
+            "panel": "weekly",
+            "template_id": "weekly-recap",
+            "options": {"format": "md"},
+            "format": "md",
+            "destination": "download",
+        }
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/share/history",
+            data=json.dumps(payload).encode(),
+            method="POST",
+            headers=_csrf_headers(port),
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert r.status == 200
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/api/share/history", timeout=5,
+    ) as r:
+        body = json.loads(r.read())
+    assert len(body["history"]) == 20
+    # FIFO trim: oldest dropped, newest at the end. `exported_at` is a
+    # monotonic UTC timestamp so the last entry must be >= the first.
+    assert body["history"][-1]["exported_at"] >= body["history"][0]["exported_at"]
+
+
+def test_history_post_returns_recipe_with_server_fields(dashboard_server):
+    """POST response carries the persisted record so the client can show
+    it in the dropdown without an extra GET round-trip."""
+    port, _ = dashboard_server
+    payload = {
+        "panel": "weekly",
+        "template_id": "weekly-recap",
+        "options": {"format": "md", "theme": "light"},
+        "format": "md",
+        "destination": "download",
+    }
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/history",
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers=_csrf_headers(port),
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        body = json.loads(r.read())
+    assert body["panel"] == "weekly"
+    assert body["template_id"] == "weekly-recap"
+    assert body["format"] == "md"
+    assert body["destination"] == "download"
+    assert isinstance(body.get("recipe_id"), str) and body["recipe_id"]
+    assert isinstance(body.get("exported_at"), str) and body["exported_at"]
+
+
+def test_history_post_rejects_unknown_panel(dashboard_server):
+    """Panel validation mirrors presets POST — refuses non-share-capable
+    panels with HTTP 400."""
+    port, _ = dashboard_server
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/history",
+        data=json.dumps({
+            "panel": "alerts",
+            "template_id": "weekly-recap",
+            "options": {"format": "md"},
+            "format": "md",
+            "destination": "download",
+        }).encode(),
+        method="POST",
+        headers=_csrf_headers(port),
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 400
+
+
+def test_history_post_csrf_gate(dashboard_server):
+    """Cross-origin POST must be refused with 403, matching the other
+    write surfaces (presets, settings, alerts/test)."""
+    port, _ = dashboard_server
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/history",
+        data=json.dumps({
+            "panel": "weekly",
+            "template_id": "weekly-recap",
+            "options": {"format": "md"},
+            "format": "md",
+            "destination": "download",
+        }).encode(),
+        method="POST",
+        headers={"Origin": "http://evil.example.com",
+                 "Content-Type": "application/json"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 403
+
+
+def test_history_delete_clears_buffer(dashboard_server):
+    """DELETE empties the ring buffer entirely; subsequent GET returns
+    `{"history": []}` like the first-run case."""
+    port, _ = dashboard_server
+    payload = {
+        "panel": "weekly",
+        "template_id": "weekly-recap",
+        "options": {"format": "md"},
+        "format": "md",
+        "destination": "download",
+    }
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/history",
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers=_csrf_headers(port),
+    )
+    with urllib.request.urlopen(req, timeout=5):
+        pass
+    del_req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/history",
+        method="DELETE",
+        headers={"Origin": f"http://127.0.0.1:{port}",
+                 "Host": f"127.0.0.1:{port}"},
+    )
+    with urllib.request.urlopen(del_req, timeout=5) as r:
+        assert r.status == 204
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/api/share/history", timeout=5,
+    ) as r:
+        body = json.loads(r.read())
+    assert body == {"history": []}
+
+
+def test_history_delete_csrf_gate(dashboard_server):
+    """Cross-origin DELETE must be refused with 403."""
+    port, _ = dashboard_server
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/history",
+        method="DELETE",
+        headers={"Origin": "http://evil.example.com"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 403

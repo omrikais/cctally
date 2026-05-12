@@ -27647,6 +27647,24 @@ def _share_now_utc_iso() -> str:
     return _share_now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Spec §11.4 — recent-shares ring buffer caps at 20. Server-side trim
+# in `_handle_share_history_post` so the on-disk `config.json` can't
+# grow unbounded even if a misbehaving client floods POSTs.
+_SHARE_HISTORY_RING_CAP = 20
+
+
+def _share_history_recipe_id() -> str:
+    """Server-stamped opaque id for a history record.
+
+    Random base16 (26 chars / 13 bytes) is sufficient: we order by
+    insertion (ring buffer position), never by id, so we don't need
+    ULID timestamp-prefix monotonicity. `secrets.token_hex` keeps us
+    on stdlib and avoids the predictability of `random`.
+    """
+    import secrets
+    return secrets.token_hex(13)
+
+
 def _share_resolve_version() -> str:
     """Source from CHANGELOG via the existing release helper. Empty string if unset.
 
@@ -32611,6 +32629,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_share_templates_get()
         elif path == "/api/share/presets":
             self._handle_share_presets_get()
+        elif path == "/api/share/history":
+            self._handle_share_history_get()
         else:
             self.send_error(404, "not found")
 
@@ -32632,6 +32652,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_share_compose_post()
         elif path == "/api/share/presets":
             self._handle_share_presets_post()
+        elif path == "/api/share/history":
+            self._handle_share_history_post()
         else:
             self.send_error(404, "not found")
 
@@ -32652,6 +32674,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path.startswith("/api/share/presets/"):
             self._handle_share_presets_delete()
+            return
+        if path == "/api/share/history":
+            self._handle_share_history_delete()
             return
         self.send_error(501, "Unsupported method ('DELETE')")
 
@@ -33736,6 +33761,133 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             if not panel_bucket:
                 presets.pop(panel, None)
             save_config(cfg)
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    # ---- /api/share/history — export-recipe ring buffer (spec §5.1, §11.4) ----
+    #
+    # GET    /api/share/history  → list (newest last) of last 20 export recipes
+    # POST   /api/share/history  → append; server-side FIFO trim to 20
+    # DELETE /api/share/history  → clear the entire buffer
+    #
+    # Persisted under `share.history` in `config.json`. Write discipline
+    # matches the presets handlers above: `config_writer_lock` +
+    # `_load_config_unlocked` + `save_config`. GET is unauthenticated
+    # like `/api/share/templates`; POST + DELETE go through
+    # `_check_origin_csrf`. The frontend posts fire-and-forget after
+    # every successful export — history failures are non-fatal.
+
+    def _handle_share_history_get(self) -> None:
+        """Return the recent-shares ring buffer (newest last, spec §11.4)."""
+        cfg = load_config()
+        history = (cfg.get("share") or {}).get("history") or []
+        self._respond_json(200, {"history": history})
+
+    def _handle_share_history_post(self) -> None:
+        """Append a recipe to the ring buffer; FIFO trim to 20.
+
+        Body: ``{panel, template_id, options, format, destination}``. The
+        server stamps ``recipe_id`` (random hex) and ``exported_at``
+        (UTC ISO-8601) so the client doesn't need a clock or a UUID lib.
+        CSRF-gated. Read-modify-write under ``config_writer_lock`` —
+        same pattern as the presets POST.
+        """
+        if not self._check_origin_csrf():
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        try:
+            raw = self.rfile.read(length) if length > 0 else b""
+            req = json.loads(raw) if raw else {}
+        except (ValueError, json.JSONDecodeError):
+            self._respond_json(400, {"error": "malformed json"})
+            return
+        if not isinstance(req, dict):
+            self._respond_json(400, {"error": "expected JSON object"})
+            return
+        panel = req.get("panel")
+        template_id = req.get("template_id")
+        options = req.get("options") or {}
+        fmt = req.get("format")
+        destination = req.get("destination")
+        if not isinstance(panel, str) or not panel:
+            self._respond_json(400, {
+                "error": "missing or non-string panel",
+                "field": "panel",
+            })
+            return
+        tpl_mod = self._share_load_templates_module()
+        if panel not in tpl_mod.SHARE_CAPABLE_PANELS:
+            self._respond_json(400, {
+                "error": f"unknown share panel: {panel!r}",
+                "field": "panel",
+            })
+            return
+        if not isinstance(template_id, str) or not template_id:
+            self._respond_json(400, {
+                "error": "missing or non-string template_id",
+                "field": "template_id",
+            })
+            return
+        if not isinstance(options, dict):
+            self._respond_json(400, {
+                "error": "options must be an object",
+                "field": "options",
+            })
+            return
+        # `format` and `destination` are advisory strings — accept any
+        # non-empty string; the frontend uses them only as display hints
+        # in the dropdown row. None/missing is allowed (mirrors how the
+        # CLI doesn't always know which destination produced the export).
+        if fmt is not None and not isinstance(fmt, str):
+            self._respond_json(400, {
+                "error": "format must be a string if provided",
+                "field": "format",
+            })
+            return
+        if destination is not None and not isinstance(destination, str):
+            self._respond_json(400, {
+                "error": "destination must be a string if provided",
+                "field": "destination",
+            })
+            return
+
+        record = {
+            "recipe_id": _share_history_recipe_id(),
+            "panel": panel,
+            "template_id": template_id,
+            "options": options,
+            "format": fmt,
+            "destination": destination,
+            "exported_at": _share_now_utc_iso(),
+        }
+        with config_writer_lock():
+            cfg = _load_config_unlocked()
+            share = cfg.setdefault("share", {})
+            history = share.setdefault("history", [])
+            history.append(record)
+            # Ring buffer: trim from the front so the newest is always
+            # last. `del history[:n]` keeps the same list instance, so
+            # callers holding a reference (none in this scope, but a
+            # safe invariant) see the same object mutated in place.
+            if len(history) > _SHARE_HISTORY_RING_CAP:
+                del history[: len(history) - _SHARE_HISTORY_RING_CAP]
+            save_config(cfg)
+        self._respond_json(200, record)
+
+    def _handle_share_history_delete(self) -> None:
+        """Empty the share-history ring buffer (spec §11.4)."""
+        if not self._check_origin_csrf():
+            return
+        with config_writer_lock():
+            cfg = _load_config_unlocked()
+            share = cfg.get("share")
+            if isinstance(share, dict) and "history" in share:
+                share["history"] = []
+                save_config(cfg)
         self.send_response(204)
         self.send_header("Content-Length", "0")
         self.end_headers()
