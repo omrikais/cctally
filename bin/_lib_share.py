@@ -1228,18 +1228,38 @@ def _render_svg_table(
 
 
 def _render_svg(snap: ShareSnapshot, *, palette: dict,
-                branding: bool, include_chrome: bool = True) -> str:
+                branding: bool,
+                include_chrome: bool = True,
+                include_table: bool = True) -> str:
     """Render snapshot to SVG.
 
-    include_chrome=True → standalone SVG with title/subtitle/timestamp/footer.
-    include_chrome=False → chart-only (HTML wrapper consumes this).
+    include_chrome=True  → standalone SVG with title/subtitle/timestamp/footer.
+    include_chrome=False → chart(+optional table)-only (HTML wrapper consumes this).
+    include_table=True   → emit `_render_svg_table` body when snap.columns
+                           is non-empty. HTML wrapper passes False so the
+                           chart-slot embed stays table-free (HTML <table>
+                           is rendered separately as a sibling element).
     """
-    if include_chrome:
-        height = _SVG_HEADER_H + _SVG_CHART_H + _SVG_FOOTER_H + (_SVG_PADDING * 2)
-    else:
-        height = _SVG_CHART_H + (_SVG_PADDING * 2)
+    has_table = include_table and bool(snap.columns)
+    chart_h = _SVG_CHART_H if snap.chart is not None else 0
 
-    pieces = []
+    # Pre-layout the table (we need its height before declaring outer SVG height).
+    if has_table:
+        table_y = _SVG_PADDING + (_SVG_HEADER_H if include_chrome else 0) + chart_h + _SVG_TABLE_GAP
+        table_svg, table_h = _render_svg_table(
+            snap, palette=palette, x=_SVG_PADDING, y=table_y, max_width=_SVG_WIDTH,
+        )
+    else:
+        table_svg, table_h = "", 0.0
+
+    table_block_h = (_SVG_TABLE_GAP + table_h) if has_table else 0
+
+    if include_chrome:
+        height = _SVG_HEADER_H + chart_h + table_block_h + _SVG_FOOTER_H + (_SVG_PADDING * 2)
+    else:
+        height = chart_h + table_block_h + (_SVG_PADDING * 2)
+
+    pieces: list[str] = []
 
     if include_chrome:
         pieces.append(_render_svg_header(
@@ -1247,7 +1267,6 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
             x=_SVG_PADDING, y=_SVG_PADDING, width=_SVG_WIDTH,
         ))
 
-    # Chart.
     chart_y = _SVG_PADDING + (_SVG_HEADER_H if include_chrome else 0)
     if snap.chart is not None:
         if isinstance(snap.chart, LineChart):
@@ -1266,13 +1285,15 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
                 x=_SVG_PADDING, y=chart_y, width=_SVG_WIDTH, height=_SVG_CHART_H,
             ))
 
+    if has_table:
+        pieces.append(table_svg)
+
     if include_chrome:
+        footer_y = _SVG_PADDING + _SVG_HEADER_H + chart_h + table_block_h + _SVG_FOOTER_BASELINE
         pieces.append(_render_svg_footer(
             snap, palette=palette,
-            x=_SVG_PADDING,
-            y=_SVG_PADDING + _SVG_HEADER_H + _SVG_CHART_H + _SVG_FOOTER_BASELINE,
-            width=_SVG_WIDTH,
-            branding=branding,
+            x=_SVG_PADDING, y=footer_y,
+            width=_SVG_WIDTH, branding=branding,
         ))
 
     total_w = _SVG_WIDTH + (_SVG_PADDING * 2)
@@ -1362,7 +1383,7 @@ def _render_html_fragment(snap: ShareSnapshot, *, palette: dict, branding: bool)
     # rather than rendering empty chrome (an empty `<svg>` chart area or an
     # `<table>` with no `<th>`/`<td>`).
     chart_html = (
-        f'<div style="margin-top:12px">{_render_svg(snap, palette=palette, branding=False, include_chrome=False)}</div>'
+        f'<div style="margin-top:12px">{_render_svg(snap, palette=palette, branding=False, include_chrome=False, include_table=False)}</div>'
         if snap.chart is not None else ""
     )
     title_html = f'<h1 style="font-size:20px;color:{palette["fg"]};margin:0">{_xml_escape(snap.title)}</h1>'
