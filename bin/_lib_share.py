@@ -1092,13 +1092,17 @@ def _svg_table_anchor_and_x(align: str, col_x: float, col_w: float,
 def _render_svg_table(
     snap: "ShareSnapshot", *, palette: dict,
     x: float, y: float, max_width: float,
-) -> tuple[str, float]:
+) -> tuple[str, float, float]:
     """Render the cross-tab / project / sessions table body as SVG.
 
-    Returns (svg_fragment, total_height). Caller (`_render_svg`) uses
-    the returned height to position the footer band and declare the
-    outer `<svg height="…">` attribute. Caller MUST short-circuit when
-    `snap.columns` is empty — this helper is a precondition violation
+    Returns (svg_fragment, total_height, used_width). Caller
+    (`_render_svg`) uses the returned height to position the footer
+    band, and `used_width` to size the outer canvas — at pathological
+    `top_n` the min-width clamp can push `sum(widths)` past
+    `max_width`, in which case the outer SVG expands so columns are
+    never clipped (issue #38 follow-up: Codex P2 review on PR #40).
+    Caller MUST short-circuit when `snap.columns` is empty — this
+    helper is a precondition violation
     if called with `columns=()`.
 
     Layout: greedy auto-size, shrink only oversized columns, clamp
@@ -1224,7 +1228,8 @@ def _render_svg_table(
                 ))
         row_y += rh
 
-    return "".join(pieces), total_h
+    used_width = sum(widths)
+    return "".join(pieces), total_h, used_width
 
 
 def _render_svg(snap: ShareSnapshot, *, palette: dict,
@@ -1246,11 +1251,18 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
     # Pre-layout the table (we need its height before declaring outer SVG height).
     if has_table:
         table_y = _SVG_PADDING + (_SVG_HEADER_H if include_chrome else 0) + chart_h + _SVG_TABLE_GAP
-        table_svg, table_h = _render_svg_table(
+        table_svg, table_h, table_w = _render_svg_table(
             snap, palette=palette, x=_SVG_PADDING, y=table_y, max_width=_SVG_WIDTH,
         )
     else:
-        table_svg, table_h = "", 0.0
+        table_svg, table_h, table_w = "", 0.0, 0.0
+
+    # Canvas grows when the table's used width exceeds _SVG_WIDTH — happens
+    # only when the min-col-w clamp fired (pathological top_n). Header /
+    # chart / footer keep their original positioning anchored at _SVG_WIDTH;
+    # the canvas just extends to the right so wide tables aren't clipped at
+    # the viewBox. Issue #38 follow-up (Codex PR #40 P2).
+    content_w = max(_SVG_WIDTH, table_w)
 
     table_block_h = (_SVG_TABLE_GAP + table_h) if has_table else 0
 
@@ -1296,7 +1308,7 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
             width=_SVG_WIDTH, branding=branding,
         ))
 
-    total_w = _SVG_WIDTH + (_SVG_PADDING * 2)
+    total_w = content_w + (_SVG_PADDING * 2)
     bg_rect = svg_rect(0, 0, total_w, height, fill=palette["bg"])
     inner = bg_rect + "".join(pieces)
     return (
