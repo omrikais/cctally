@@ -30,6 +30,32 @@ import { makeBasketItem } from '../store/basketSlice';
 import { SavePresetPopover } from './SavePresetPopover';
 import { svgToPng } from './exporters/png';
 import { printPdf } from './exporters/printPdf';
+import { appendHistory } from './presetsApi';
+
+// M4.3 (spec §5.1, §11.4). After every successful export action we POST
+// the recipe to /api/share/history so the next dropdown open shows it
+// under "Recent shares". The call is fire-and-forget — failures are
+// swallowed because history is a recall convenience, not core
+// functionality, and we don't want a transient server hiccup to surface
+// a confusing toast on top of the "Copied" / "Downloaded" success path.
+function recordHistory(args: {
+  panel: SharePanelId;
+  template_id: string;
+  options: ShareOptions;
+  destination: 'copy' | 'download' | 'open' | 'png' | 'print';
+}): void {
+  void appendHistory({
+    panel: args.panel,
+    template_id: args.template_id,
+    options: args.options,
+    // PNG/print don't preserve `format` in the dropdown row's display
+    // — they ARE the format. For SVG-derived PNG and HTML-derived
+    // print, we stamp the destination so the row hints at the export
+    // type even if the format string is the source format.
+    format: args.options.format,
+    destination: args.destination,
+  }).catch(() => { /* non-fatal — see comment above */ });
+}
 
 // PNG canvas background — kernel renders dark-theme bodies on a dark
 // fill and light-theme on a light fill; mirror those palette values so
@@ -142,7 +168,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
   };
 
   const handleCopy = async () => {
-    if (disabledNoTemplate) return;
+    if (disabledNoTemplate || !templateId) return;
     setBusy('copy');
     setActionError(null);
     try {
@@ -152,6 +178,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
       }
       await navigator.clipboard.writeText(body);
       showToast('Copied');
+      recordHistory({ panel, template_id: templateId, options, destination: 'copy' });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -164,7 +191,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
   };
 
   const handleDownload = async () => {
-    if (disabledNoTemplate) return;
+    if (disabledNoTemplate || !templateId) return;
     setBusy('download');
     setActionError(null);
     try {
@@ -172,6 +199,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
       const blob = new Blob([body], { type: mimeFor(format) });
       triggerDownload(shareFilename(panel, format), blob);
       showToast('Downloaded');
+      recordHistory({ panel, template_id: templateId, options, destination: 'download' });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -237,7 +265,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
   };
 
   const handleOpen = async () => {
-    if (disabledNoTemplate) return;
+    if (disabledNoTemplate || !templateId) return;
     setBusy('open');
     setActionError(null);
     try {
@@ -248,6 +276,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
       // revoke it (the user may want to keep the tab open). Browsers
       // GC blob URLs when the window unloads.
       window.open(url, '_blank', 'noopener,noreferrer');
+      recordHistory({ panel, template_id: templateId, options, destination: 'open' });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -276,6 +305,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
       // keep the `cctally-<panel>-<utcdate>.png` shape from spec §6.5.
       triggerDownload(shareFilename(panel, 'svg').replace(/\.svg$/, '.png'), png);
       showToast('PNG downloaded');
+      recordHistory({ panel, template_id: templateId, options, destination: 'png' });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -299,6 +329,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
     try {
       const { body } = await fetchForExport();
       printPdf(body);
+      recordHistory({ panel, template_id: templateId, options, destination: 'print' });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError

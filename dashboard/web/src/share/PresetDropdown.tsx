@@ -1,11 +1,12 @@
 // Spec §6.6 — gallery tile's "presets ▾" affordance.
 //
-// M2 surfaces saved presets for the current panel; the "Recent shares"
-// history group lands in M4.3 as a second segmented group inside this
-// same dropdown. Lazy fetch on open so the modal mount stays cheap.
+// M2 surfaces saved presets for the current panel; M4.3 adds the
+// "Recent shares" history group below them. Both fetched lazily on open
+// so the modal mount stays cheap.
 //
-// Picking a preset calls `onPick(template_id, options)`; the parent
-// (ShareModal) overwrites its local recipe state. The "Manage
+// Picking a preset OR a history row calls `onPick(template_id, options)`;
+// the parent (ShareModal) overwrites its local recipe state. History
+// rows never auto-export — spec §6.6 mandates re-confirm. The "Manage
 // presets…" footer item invokes `onManage()` so the parent can hoist
 // <ManagePresetsModal>.
 //
@@ -16,7 +17,13 @@
 // (which un-mounts this dropdown); for "just close the menu" the user
 // re-clicks the trigger or any other element.
 import { useEffect, useRef, useState } from 'react';
-import { listPresets, type PresetRecord, ShareApiError } from './presetsApi';
+import {
+  listPresets,
+  listHistory,
+  type PresetRecord,
+  type HistoryRecord,
+  ShareApiError,
+} from './presetsApi';
 import type { SharePanelId, ShareOptions } from './types';
 
 interface Props {
@@ -25,20 +32,50 @@ interface Props {
   onManage: () => void;
 }
 
+// Render the dropdown's history timestamp in the user's locale. Falls
+// back to the raw ISO string when the parse fails (defensive — the
+// server always emits valid ISO-8601, but a future schema change
+// shouldn't blow up the menu).
+function formatHistoryTimestamp(isoUtc: string): string {
+  const d = new Date(isoUtc);
+  if (Number.isNaN(d.getTime())) return isoUtc;
+  return d.toLocaleString();
+}
+
 export function PresetDropdown({ panel, onPick, onManage }: Props) {
   const [open, setOpen] = useState(false);
   const [presets, setPresets] = useState<Record<string, PresetRecord>>({});
+  const [history, setHistory] = useState<HistoryRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   // Lazy fetch on open. Re-fetch on panel change so switching panels
-  // (rare — the modal is per-panel) doesn't show stale presets.
+  // (rare — the modal is per-panel) doesn't show stale presets/history.
+  //
+  // Presets + history fetched in parallel via Promise.all so the
+  // dropdown shows everything in one render — no flicker between the
+  // two groups. If either request fails we still surface the error,
+  // but the other's data is rendered.
   useEffect(() => {
     if (!open) return;
     const ac = new AbortController();
     setError(null);
-    listPresets({ signal: ac.signal })
-      .then((r) => setPresets(r.presets[panel] ?? {}))
+    Promise.all([
+      listPresets({ signal: ac.signal }),
+      listHistory({ signal: ac.signal }),
+    ])
+      .then(([presResp, histResp]) => {
+        setPresets(presResp.presets[panel] ?? {});
+        // Filter to the current panel and reverse so newest is first
+        // (server stores newest last for ring-buffer semantics; users
+        // expect "most recent at top" in a recall dropdown).
+        setHistory(
+          histResp.history
+            .filter((h) => h.panel === panel)
+            .slice()
+            .reverse(),
+        );
+      })
       .catch((err: unknown) => {
         if ((err as { name?: string })?.name === 'AbortError') return;
         const msg =
@@ -104,6 +141,39 @@ export function PresetDropdown({ panel, onPick, onManage }: Props) {
                 </li>
               ))}
             </ul>
+          ) : null}
+          {history.length > 0 ? (
+            <div className="share-presets-history">
+              <div
+                className="share-presets-history-heading"
+                role="presentation"
+              >
+                Recent shares
+              </div>
+              <ul className="share-presets-history-list">
+                {history.map((h) => (
+                  <li key={h.recipe_id}>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="share-presets-history-item"
+                      onClick={() => {
+                        onPick(h.template_id, h.options);
+                        setOpen(false);
+                      }}
+                      title={`${h.template_id} · ${h.format ?? 'unknown'} · ${h.exported_at}`}
+                    >
+                      <span className="share-presets-history-template">
+                        {h.template_id}
+                      </span>
+                      <span className="share-presets-history-meta">
+                        {' · '}{h.format ?? 'unknown'}{' · '}{formatHistoryTimestamp(h.exported_at)}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
           ) : null}
           <div className="share-presets-footer">
             <button
