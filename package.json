@@ -17,6 +17,8 @@
     "postinstall": "node ./bin/cctally-npm-postinstall.js"
   },
   "files": [
+    "bin/_lib_share.py",
+    "bin/_lib_share_templates.py",
     "bin/cctally",
     "bin/cctally-alerts",
     "bin/cctally-dashboard",
