@@ -48,10 +48,11 @@ function recordHistory(args: {
     panel: args.panel,
     template_id: args.template_id,
     options: args.options,
-    // PNG/print don't preserve `format` in the dropdown row's display
-    // — they ARE the format. For SVG-derived PNG and HTML-derived
-    // print, we stamp the destination so the row hints at the export
-    // type even if the format string is the source format.
+    // We stamp `options.format` — that's the recipe's replay format
+    // (svg for PNG, html for print). The `destination` string tells the
+    // dropdown row what the user actually did with that output (Copy,
+    // Download, Open, PNG, Print) so the row's icon can reflect the
+    // export action, not just the source format.
     format: args.options.format,
     destination: args.destination,
   }).catch(() => { /* non-fatal — see comment above */ });
