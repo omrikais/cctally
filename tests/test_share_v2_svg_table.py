@@ -9,13 +9,19 @@ import importlib.util
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-SPEC = importlib.util.spec_from_file_location(
-    "_lib_share", REPO / "bin" / "_lib_share.py",
-)
-_LS = importlib.util.module_from_spec(SPEC)
-sys.modules["_lib_share"] = _LS
-SPEC.loader.exec_module(_LS)
+# Guard mirrors the pattern in tests/test_lib_share_v2.py:17-25 — unconditional
+# `sys.modules["_lib_share"] = _LS` re-bind is a known footgun under pytest-xdist
+# because the LAST loader wins, breaking `isinstance(cell, _LS.PercentCell)`
+# checks across files that reference different module objects.
+_HERE = Path(__file__).resolve().parent
+if "_lib_share" in sys.modules:
+    _LS = sys.modules["_lib_share"]
+else:
+    _SPEC_PATH = _HERE.parent / "bin" / "_lib_share.py"
+    _SPEC = importlib.util.spec_from_file_location("_lib_share", _SPEC_PATH)
+    _LS = importlib.util.module_from_spec(_SPEC)
+    sys.modules["_lib_share"] = _LS
+    _SPEC.loader.exec_module(_LS)
 
 
 # --- _svg_text_width ---

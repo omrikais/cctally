@@ -1125,7 +1125,7 @@ def _render_svg_table(
     ]
 
     # 2. Natural per-column width = max(header, max body) + 2*pad_x.
-    def _col_natural(i: int, c) -> float:
+    def _col_natural(i: int, c: "ColumnSpec") -> float:
         widths = [_svg_text_width(c.label, font_size)]
         for r in range(len(rows)):
             widths.append(_svg_text_width(cell_strs[r][i], font_size))
@@ -1138,17 +1138,18 @@ def _render_svg_table(
         widths = list(nat_w)
     else:
         fair = max_width / n
-        oversize_idx = {i for i in range(n) if nat_w[i] > fair}
+        oversize_idx = [i for i in range(n) if nat_w[i] > fair]
+        oversize_set = set(oversize_idx)
         if not oversize_idx:
             scale = max_width / sum(nat_w)
             widths = [w * scale for w in nat_w]
         else:
-            other_total = sum(nat_w[i] for i in range(n) if i not in oversize_idx)
+            other_total = sum(nat_w[i] for i in range(n) if i not in oversize_set)
             total_oversize = sum(nat_w[i] for i in oversize_idx)
             budget = max_width - other_total
             scale = budget / total_oversize if total_oversize > 0 else 1.0
             widths = [
-                (nat_w[i] * scale) if i in oversize_idx else nat_w[i]
+                (nat_w[i] * scale) if i in oversize_set else nat_w[i]
                 for i in range(n)
             ]
         # 4b. Min-width clamp (pathological top_n).
@@ -1205,7 +1206,7 @@ def _render_svg_table(
 
     # Body rows.
     row_y = y + header_h
-    for r, _row in enumerate(rows):
+    for r, _ in enumerate(rows):
         rh = body_heights[r]
         row_bg = palette["table_row_alt"] if (r % 2 == 1) else palette["bg"]
         pieces.append(svg_rect(x, row_y, max_width, rh, fill=row_bg))
