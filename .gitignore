@@ -4,6 +4,7 @@
 __pycache__/
 .worktrees/
 .superpowers/
+.agents/
 # Ignore everything in .claude/ EXCEPT the project-scoped skills tree
 # (which is tracked so skill definitions survive fresh clones / propagate
 # to CI). Use `.claude/*` rather than `.claude/` so git still traverses
