@@ -29419,6 +29419,10 @@ def _build_monthly_share_panel_data(options: dict,
     don't carry a subscription-quota %), so it surfaces as 0.0.
     """
     rows = list(getattr(snap, "monthly_periods", None) or []) if snap else []
+    # monthly_periods is newest-first (see _dashboard_build_monthly_periods).
+    # Reverse to oldest→newest — the Recap template reads months[0] as the
+    # period-start anchor and months[-1] as the most recent month.
+    rows = list(reversed(rows))
     months: list[dict] = []
     for r in rows:
         models = getattr(r, "models", None) or []
@@ -29526,8 +29530,12 @@ def _build_blocks_share_panel_data(options: dict,
             "pct_used":     0.0,  # BlocksPanelRow doesn't carry a %
             "tokens_total": 0,    # BlocksPanelRow drops token counts
         }
+    # blocks_panel is newest-first (see _dashboard_build_blocks_panel:
+    # `rows.sort(key=lambda r: r.start_at, reverse=True)`). Take the most
+    # recent 8 blocks and reverse to oldest→newest so the template's chart
+    # (uses enumerate(recent) for x-position) plots left→right time order.
     recent: list[dict] = []
-    for r in rows[-8:]:
+    for r in list(reversed(rows[:8])):
         recent.append({
             "start_at": _share_iso(getattr(r, "start_at", None)) or "",
             "cost_usd": float(getattr(r, "cost_usd", 0.0) or 0.0),
