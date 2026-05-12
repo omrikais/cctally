@@ -1,0 +1,21 @@
+cctally doctor — 2026-05-13 14:22:31 UTC
+
+Install
+  ⚠ Symlinks                 0/13 present; missing cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-release, cctally-sync-week, cctally-tui, cctally-update
+      → Run `cctally setup`
+Hooks
+  ⚠ Recent activity (24h)    0 fires
+      → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
+  ⚠ Last hook fire           never
+      → No hook has fired yet. Restart Claude Code.
+Auth
+Database
+  ⚠ cache.db                 absent (fresh install)
+  ⚠ Pending migrations       3 pending
+      → Run any cctally command — opens the DB and applies pending migrations
+Data
+Safety
+  ✗ update-state.json        unreadable: UpdateError: update-state.json is not valid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+      → `rm ~/.local/share/cctally/update-state.json` (will be regenerated)
+
+Summary: 14 OK · 5 WARN · 1 FAIL

@@ -2,9 +2,18 @@
 import datetime as dt
 import json
 import pathlib
+import sys
 
 import pytest
 from conftest import load_script
+
+# Allow `import _lib_doctor` (run from `snapshot_to_envelope`'s doctor
+# block) to resolve even when pytest's cwd has no `bin/` on sys.path.
+# Without this the doctor block would land on the bare ``ModuleNotFoundError``
+# fallback whose error message is non-deterministic across hosts.
+_BIN = pathlib.Path(__file__).resolve().parent.parent / "bin"
+if str(_BIN) not in sys.path:
+    sys.path.insert(0, str(_BIN))
 
 GOLDEN = pathlib.Path(__file__).parent / "golden" / "dashboard_envelope_with_blocks_daily.json"
 
@@ -33,12 +42,26 @@ def _pin_update_envelope_loaders(ns):
     a developer machine), which would leak into the full-envelope
     golden assertion otherwise. Each ``load_script()`` returns a fresh
     namespace, so the override has to be done per test rather than via
-    a module-scoped autouse fixture."""
+    a module-scoped autouse fixture.
+
+    Also stub out the doctor I/O chokepoint: ``snapshot_to_envelope``
+    runs ``doctor_gather_state`` + ``_lib_doctor.run_checks`` on every
+    call (spec §5.5 aggregate-only block). Both touch real paths on the
+    dev machine; left unpinned they leak host-specific state (sqlite
+    user_version, hooks count, log mtimes) into the full-envelope
+    golden. Force the synthetic FAIL-fallback path with a deterministic
+    fingerprint so the assertion stays stable. Doctor's own goldens
+    cover the happy-path payload shape (bin/cctally-doctor-test, 65
+    fixture scenarios)."""
     ns["_load_update_state"] = lambda: None
     ns["_load_update_suppress"] = lambda: {
         "skipped_versions": [],
         "remind_after": None,
     }
+
+    def _raise_doctor(**_kw):
+        raise RuntimeError("pinned: doctor disabled for envelope golden")
+    ns["doctor_gather_state"] = _raise_doctor
 
 
 def _make_snapshot(ns):

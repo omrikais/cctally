@@ -1,0 +1,34 @@
+cctally doctor — 2026-05-13 14:22:31 UTC
+
+Install
+  ✓ Symlinks                 13/13 present
+  ✓ PATH                     ~/.local/bin on $PATH
+  ✓ Legacy status-line snippet not detected
+  ✓ Legacy bespoke hooks     not detected
+Hooks
+  ✓ Hook entries installed   PostToolBatch, Stop, SubagentStop
+  ⚠ Recent activity (24h)    0 fires
+      → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
+  ⚠ Last hook fire           never
+      → No hook has fired yet. Restart Claude Code.
+Auth
+  ✓ OAuth token              present
+Database
+  ✓ stats.db                 version 0 / 3 known
+  ⚠ cache.db                 absent (fresh install)
+  ✓ Migrations               0/3 applied
+  ⚠ Pending migrations       3 pending
+      → Run any cctally command — opens the DB and applies pending migrations
+Data
+  ✓ Latest snapshot          2s ago
+  ✓ Claude cache             0 entries (no JSONL corpus)
+  ✓ Codex cache              none (no ~/.codex/sessions/)
+Safety
+  ✓ Dashboard bind           config: loopback
+  ✓ config.json              absent or parses cleanly
+  ⚠ update-state.json        absent (first run)
+      → Run `cctally update --check` to populate
+  ✓ update-suppress.json     parses cleanly
+  ✓ Update available         no
+
+Summary: 15 OK · 5 WARN · 0 FAIL

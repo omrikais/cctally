@@ -1,0 +1,82 @@
+cctally doctor — 2026-05-13 14:22:31 UTC
+
+Install
+  ⚠ Symlinks                 0/13 present; missing cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-release, cctally-sync-week, cctally-tui, cctally-update
+      → Run `cctally setup`
+      details:
+        present: 0
+        total: 13
+        missing: ['cctally', 'cctally-alerts', 'cctally-dashboard', 'cctally-dollar-per-percent', 'cctally-five-hour-blocks', 'cctally-five-hour-breakdown', 'cctally-forecast', 'cctally-project', 'cctally-refresh-usage', 'cctally-release', 'cctally-sync-week', 'cctally-tui', 'cctally-update']
+  ✓ PATH                     ~/.local/bin on $PATH
+  ✓ Legacy status-line snippet not detected
+  ✓ Legacy bespoke hooks     not detected
+Hooks
+  ⚠ Hook entries installed   missing PostToolBatch, Stop, SubagentStop
+      → Run `cctally setup`
+      details:
+        counts: {'PostToolBatch': 0, 'Stop': 0, 'SubagentStop': 0}
+        missing: ['PostToolBatch', 'Stop', 'SubagentStop']
+  ⚠ Recent activity (24h)    0 fires
+      → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
+      details:
+        fires: 0
+        errors: 0
+        by_event: {}
+        last_fire_age_s: None
+  ⚠ Last hook fire           never
+      → No hook has fired yet. Restart Claude Code.
+      details:
+        last_fire_age_s: None
+Auth
+  ✗ OAuth token              missing
+      → Log into Claude Code to populate the OAuth token
+Database
+  ✓ stats.db                 version 0 / 3 known
+      details:
+        path: $HOME/.local/share/cctally/stats.db
+        user_version: 0
+        registry_size: 3
+  ⚠ cache.db                 absent (fresh install)
+      details:
+        path: $HOME/.local/share/cctally/cache.db
+  ✗ Migrations               1 failed
+      → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
+      details:
+        failed: [('stats.db', '001_five_hour_block_models_backfill_v1')]
+        by_db: {'stats.db': {'applied': [], 'skipped': [], 'pending': ['002_five_hour_block_projects_backfill_v1', '003_merge_5h_block_duplicates_v1'], 'failed': ['001_five_hour_block_models_backfill_v1']}, 'cache.db': {'applied': [], 'skipped': [], 'pending': [], 'failed': []}}
+  ⚠ Pending migrations       2 pending
+      → Run any cctally command — opens the DB and applies pending migrations
+      details:
+        pending: [('stats.db', '002_five_hour_block_projects_backfill_v1'), ('stats.db', '003_merge_5h_block_duplicates_v1')]
+Data
+  ✗ Latest snapshot          7200s ago
+      → No snapshot in >1h. Hooks may be broken — check `cctally setup --status`.
+      details:
+        latest_snapshot_at: 2026-05-13T12:22:31+00:00
+        latest_snapshot_age_s: 7200
+  ✓ Claude cache             0 entries (no JSONL corpus)
+      details:
+        entries: 0
+        claude_jsonl_present: False
+  ✓ Codex cache              none (no ~/.codex/sessions/)
+      details:
+        entries: 0
+        codex_jsonl_present: False
+Safety
+  ✓ Dashboard bind           config: loopback
+      details:
+        config: loopback
+        runtime_bind: None
+  ✓ config.json              absent or parses cleanly
+  ⚠ update-state.json        absent (first run)
+      → Run `cctally update --check` to populate
+  ✓ update-suppress.json     parses cleanly
+      details:
+        skipped_versions: []
+        remind_after: None
+  ✓ Update available         no
+      details:
+        current_version: None
+        latest_version: None
+
+Summary: 10 OK · 7 WARN · 3 FAIL

@@ -32984,7 +32984,8 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                          now_utc: "dt.datetime",
                          monotonic_now: "float | None" = None,
                          oauth_usage_cfg: "dict | None" = None,
-                         display_tz_pref_override: "str | None" = None) -> dict:
+                         display_tz_pref_override: "str | None" = None,
+                         runtime_bind: "str | None" = None) -> dict:
     """Serialize a DataSnapshot into the JSON envelope consumed by the
     browser (design spec §2.2).
 
@@ -33316,6 +33317,32 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         "suppress": _update_suppress_envelope,
     }
 
+    # Doctor aggregate block (spec §5.5). Only the small severity tree
+    # rides on every SSE tick (~120 bytes); the full per-check payload
+    # is fetched lazily via `GET /api/doctor`. `runtime_bind` is the
+    # actual host the dashboard process is bound to (Codex H4) so
+    # `safety.dashboard_bind` reflects the running state, not just
+    # `config.json`. Defensive: never crash the snapshot pipeline on
+    # a doctor failure — surface a synthetic FAIL block with `_error`.
+    try:
+        import _lib_doctor as _ld
+        _doc_state = doctor_gather_state(now_utc=now_utc, runtime_bind=runtime_bind)
+        _doc_report = _ld.run_checks(_doc_state)
+        doctor_envelope: "dict" = {
+            "severity":     _doc_report.overall_severity,
+            "counts":       dict(_doc_report.counts),
+            "generated_at": _ld._iso_z(_doc_report.generated_at),
+            "fingerprint":  _ld.fingerprint(_doc_report),
+        }
+    except Exception as exc:  # noqa: BLE001 — never crash SSE on doctor failure
+        doctor_envelope = {
+            "severity":     "fail",
+            "counts":       {"ok": 0, "warn": 0, "fail": 1},
+            "generated_at": _iso_z(now_utc),
+            "fingerprint":  "sha1:" + ("0" * 40),
+            "_error":       f"{type(exc).__name__}: {exc}",
+        }
+
     return {
         "envelope_version": 2,
         "generated_at":     _iso_z(snap.generated_at),
@@ -33452,6 +33479,10 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # dashboard client's existing coerceUpdateState/Suppress logic
         # consumes both surfaces uniformly.
         "update":           update_envelope,
+
+        # Doctor aggregate-only block (spec §5.5). Full per-check
+        # report fetched lazily via GET /api/doctor.
+        "doctor":           doctor_envelope,
     }
 
 
@@ -33513,6 +33544,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         GET /api/events             → SSE stream                (Task 5)
         GET /api/session/:id        → per-session detail JSON   (v2)
         GET /api/block/:start_at    → per-block detail JSON     (v3)
+        GET /api/doctor             → full doctor report JSON   (spec §5.6)
         POST /api/sync              → trigger a sync tick       (v2)
     Anything else → 404.
 
@@ -33538,6 +33570,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     # routes through `_apply_display_tz_override` so the override wins
     # over `config.display.tz`. Set by cmd_dashboard before serve_forever.
     display_tz_pref_override: "str | None" = None
+    # Doctor (spec §5.5, §7.4): the host the dashboard process is
+    # ACTUALLY bound to (`args.host`). Threaded into `doctor_gather_state`
+    # so `safety.dashboard_bind` reflects the running state — the CLI
+    # path leaves this None and only sees the `config.json` view, which
+    # is the Codex H4 finding. Set by cmd_dashboard before serve_forever.
+    cctally_host: "str | None" = None
 
     # Silence the default per-request access log — noisy in the parent
     # terminal, and we pipe it through our own logger in cmd_dashboard.
@@ -33606,6 +33644,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_share_presets_get()
         elif path == "/api/share/history":
             self._handle_share_history_get()
+        elif path == "/api/doctor":
+            self._handle_get_doctor()
         else:
             self.send_error(404, "not found")
 
@@ -35003,6 +35043,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             monotonic_now=time.monotonic(),
             oauth_usage_cfg=cfg_oauth,
             display_tz_pref_override=type(self).display_tz_pref_override,
+            runtime_bind=type(self).cctally_host,
         )
         body = json.dumps(env, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
@@ -35011,6 +35052,40 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
+
+    def _handle_get_doctor(self) -> None:
+        """`GET /api/doctor` — full kernel-serialized doctor report (spec §5.6).
+
+        Lazy companion to the aggregate-only `doctor` block on the SSE
+        envelope. Re-runs the gather + checks fresh on every call (cheap;
+        no per-tick cache needed — the kernel's identity-slice fingerprint
+        carries the dedup story for the SSE channel, not this endpoint).
+        Passes `runtime_bind = cctally_host` so `safety.dashboard_bind`
+        sees the bind the dashboard is ACTUALLY serving (Codex H4 — CLI
+        path stays config-only).
+
+        GET endpoints are read-only and loopback-protected by the
+        dashboard's default bind; no CSRF gating here (mirrors
+        `/api/data`, `/api/session/:id`, `/api/block/:start_at`).
+        """
+        try:
+            import _lib_doctor as _ld
+            state = doctor_gather_state(
+                runtime_bind=type(self).cctally_host,
+            )
+            report = _ld.run_checks(state)
+            body = json.dumps(
+                _ld.serialize_json(report), ensure_ascii=False,
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("/api/doctor failed: %r", exc)
+            self._respond_json(500, {"error": f"{type(exc).__name__}: {exc}"})
 
     def _handle_get_session_detail(self, path: str) -> None:
         """Return TuiSessionDetail JSON for the given session id (spec §3.2).
@@ -35192,6 +35267,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     monotonic_now=time.monotonic(),
                     oauth_usage_cfg=cfg_oauth,
                     display_tz_pref_override=type(self).display_tz_pref_override,
+                    runtime_bind=type(self).cctally_host,
                 )
                 msg = (
                     "event: update\n"
@@ -37360,6 +37436,10 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     DashboardHTTPHandler.sync_lock = sync_lock
     DashboardHTTPHandler.no_sync = bool(args.no_sync)
     DashboardHTTPHandler.display_tz_pref_override = display_tz_pref_override
+    # Doctor (spec §7.4 / Codex H4): runtime bind, so safety.dashboard_bind
+    # in the doctor SSE block + /api/doctor reflects the actual --host
+    # the process is serving, not just the config-only view the CLI sees.
+    DashboardHTTPHandler.cctally_host = args.host
     DashboardHTTPHandler.run_sync_now = staticmethod(
         lambda: _run_sync_now(skip_sync=args.no_sync)
     )

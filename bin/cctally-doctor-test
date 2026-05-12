@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# bin/cctally-doctor-test — golden-file harness for `cctally doctor`.
+#
+# For each tests/fixtures/doctor/<NN-name>/ directory:
+#   1. Create a scratch HARNESS_FAKE_HOME (mktemp -d, isolated per scenario).
+#   2. Run setup.sh against it.
+#   3. Run cctally doctor four ways (default / --quiet / --verbose / --json)
+#      with CCTALLY_AS_OF pinned for deterministic age computations.
+#   4. Canonicalize host-specific paths (HARNESS_FAKE_HOME → $HOME) and
+#      the cctally version (which tracks CHANGELOG.md) before diffing.
+#   5. Diff each output against the per-scenario golden.
+#   6. Diff exit code against expected.exit.
+#
+# Run: bin/cctally-doctor-test
+# Regenerate goldens: CCTALLY_DOCTOR_REGENERATE=1 bin/cctally-doctor-test
+#
+# Why canonicalization is needed:
+#   - JSON `details.path` for stats.db / cache.db embeds the absolute
+#     HARNESS_FAKE_HOME mktemp path (`/var/folders/.../tmp.XXXXX/...`),
+#     which differs per host and per run. Same for the verbose text dump.
+#   - JSON top-level `cctally_version` is read from the repo CHANGELOG.md,
+#     so it bumps with every release. We redact to a stable placeholder.
+#   - The PATH check is host-PATH dependent; the harness exports a
+#     scratch-HOME-relative PATH to make the check deterministic.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+CCTALLY="$REPO_ROOT/bin/cctally"
+FIXTURES="$REPO_ROOT/tests/fixtures/doctor"
+AS_OF="2026-05-13T14:22:31+00:00"
+REGENERATE="${CCTALLY_DOCTOR_REGENERATE:-}"
+
+pass_count=0
+fail_count=0
+
+# Per-run scratch root for ALL scenarios. Each scenario gets its own
+# subdir under here so concurrent harnesses don't collide.
+SCRATCH_ROOT=$(mktemp -d -t cctally-doctor-fixtures-XXXXXX)
+trap 'rm -rf "$SCRATCH_ROOT"' EXIT
+
+# Refresh setup.sh + .gitignore from the builder so harness output
+# reflects current scaffold (parallels build-forecast-fixtures.py
+# invocation in cctally-forecast-test).
+"$REPO_ROOT/bin/build-doctor-fixtures.py" >/dev/null || {
+    echo "FAIL: build-doctor-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+# canonicalize STDIN: redact host-specific paths + version strings so
+# goldens are byte-stable across hosts/releases. $1 is the scratch HOME.
+canonicalize() {
+    local scratch="$1"
+    # First pass: strip the scratch HOME prefix.
+    # Second pass: redact cctally_version line in JSON (the only place it
+    # appears in any mode is JSON top-level — reads CHANGELOG.md so it
+    # bumps every release).
+    python3 "$REPO_ROOT/tests/fixtures/doctor/_canonicalize.py" "$scratch"
+}
+
+run_mode () {
+    # name, mode-label, flags, golden-suffix
+    local name="$1" label="$2" flags="$3" suffix="$4"
+    local dir="$FIXTURES/$name"
+    local golden="$dir/expected.$suffix"
+    # Fresh scratch per mode: the post-command update hook
+    # (`_post_command_update_hooks`) calls load_config (auto-creates
+    # config.json) and may fire-and-forget `_update-check` which writes
+    # update-state.json + update.log. Sharing scratch across modes would
+    # let those mutations leak into the next mode's gather pass.
+    local scratch="$SCRATCH_ROOT/${name}-${suffix}"
+    mkdir -p "$scratch"
+    HARNESS_FAKE_HOME="$scratch" REPO_ROOT="$REPO_ROOT" \
+        bash "$dir/setup.sh" >/dev/null 2>&1 || {
+        echo "FAIL $name/$label  (setup.sh crashed)"
+        fail_count=$((fail_count + 1))
+        return 1
+    }
+
+    # Build PATH so install.path check passes ($scratch/.local/bin first).
+    local fake_path="$scratch/.local/bin:$PATH"
+
+    # Capture stdout only. The post-command hook (which fires AFTER
+    # cmd_doctor returns) calls load_config(); for the corrupt-config
+    # scenario this writes a `warning: ignoring corrupt …` line to
+    # stderr. Letting that line into stdout would break json.tool parse
+    # for the JSON mode and add a host-specific path to every other
+    # mode's golden. Discard stderr; doctor's user-facing output is
+    # 100% on stdout per spec.
+    local raw
+    # shellcheck disable=SC2086
+    raw=$(HOME="$scratch" TZ=Etc/UTC \
+          PATH="$fake_path" \
+          CCTALLY_AS_OF="$AS_OF" \
+          NO_COLOR=1 \
+          "$CCTALLY" doctor $flags 2>/dev/null) || true
+
+    local actual
+    if [ "$suffix" = "json" ]; then
+        actual=$(printf '%s\n' "$raw" | python3 -m json.tool --sort-keys 2>/dev/null \
+                 | canonicalize "$scratch")
+    else
+        actual=$(printf '%s\n' "$raw" | canonicalize "$scratch")
+    fi
+
+    if [ -n "$REGENERATE" ]; then
+        printf '%s' "$actual" > "$golden"
+        echo "REGEN $name/$label"
+        return 0
+    fi
+
+    if [ ! -f "$golden" ]; then
+        echo "MISSING GOLDEN $name/$label — actual output:"
+        printf '%s\n' "$actual" | sed 's/^/    /'
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+
+    if ! diff -u <(printf '%s' "$actual") "$golden" >/dev/null; then
+        echo "FAIL $name/$label"
+        diff -u "$golden" <(printf '%s' "$actual") | head -200
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    echo "PASS $name/$label"
+    pass_count=$((pass_count + 1))
+    return 0
+}
+
+run_exit_code () {
+    local name="$1"
+    local dir="$FIXTURES/$name"
+    local scratch="$SCRATCH_ROOT/${name}-exit"
+    mkdir -p "$scratch"
+    HARNESS_FAKE_HOME="$scratch" REPO_ROOT="$REPO_ROOT" \
+        bash "$dir/setup.sh" >/dev/null 2>&1 || {
+        echo "FAIL $name/exit  (setup.sh crashed)"
+        fail_count=$((fail_count + 1))
+        return 1
+    }
+    local fake_path="$scratch/.local/bin:$PATH"
+    local exit_file="$dir/expected.exit"
+    local actual_exit
+
+    HOME="$scratch" TZ=Etc/UTC PATH="$fake_path" \
+        CCTALLY_AS_OF="$AS_OF" NO_COLOR=1 \
+        "$CCTALLY" doctor --json >/dev/null 2>&1
+    actual_exit=$?
+
+    if [ -n "$REGENERATE" ]; then
+        echo "$actual_exit" > "$exit_file"
+        echo "REGEN $name/exit ($actual_exit)"
+        return 0
+    fi
+
+    local expected_exit
+    expected_exit=$(cat "$exit_file" 2>/dev/null || echo "0")
+    if [ "$actual_exit" != "$expected_exit" ]; then
+        echo "FAIL $name/exit  expected=$expected_exit  actual=$actual_exit"
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    echo "PASS $name/exit"
+    pass_count=$((pass_count + 1))
+    return 0
+}
+
+if [ ! -d "$FIXTURES" ]; then
+    echo "cctally-doctor-test: fixtures dir missing: $FIXTURES" >&2
+    exit 1
+fi
+
+echo "cctally-doctor-test: running scenarios under $FIXTURES"
+
+# Each run_mode call re-runs setup.sh against a fresh per-mode scratch
+# so the post-command update hook's mutations (config.json auto-create,
+# fire-and-forget update-check subprocess writing update-state.json) do
+# not leak across modes.
+for d in "$FIXTURES"/*/; do
+    name=$(basename "${d%/}")
+    [ -f "$d/setup.sh" ] || continue
+    run_mode "$name" "default" ""          "txt"
+    run_mode "$name" "quiet"   "--quiet"   "quiet.txt"
+    run_mode "$name" "verbose" "--verbose" "verbose.txt"
+    run_mode "$name" "json"    "--json"    "json"
+    run_exit_code "$name"
+done
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]
