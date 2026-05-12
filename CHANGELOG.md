@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-05-12
+
 ### Fixed
 - v1.6.1's `package.json` `files[]` edit was a necessary but incomplete fix for the dashboard share GUI on npm installs: `bin/_lib_share_templates.py` also needed to be promoted to public in `.mirror-allowlist`, where it was lingering as `unmatched` from a stale "private kernel adjunct" classification dating to share-v2 implementation. The npm-publish GHA workflow runs from the public clone, so a file the mirror filters out never reaches the tarball regardless of `files[]`. v1.6.2 promotes the module and removes the stale comment block; v1.6.1's CLI `--format` fix is unchanged. The `tests/test_package_files.py` guard now ALSO asserts every `files[]` path classifies as `public` against `.mirror-allowlist`, so a future runtime-sibling promotion that updates only one of the two layers can't ship.
 
