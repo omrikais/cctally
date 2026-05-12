@@ -134,6 +134,28 @@ def test_share_render_returns_body_and_snapshot(dashboard_server):
     assert isinstance(snap["kernel_version"], int)
 
 
+def test_share_render_md_frontmatter_carries_template_id(dashboard_server):
+    port, _ = dashboard_server
+    req_body = json.dumps({
+        "panel": "weekly",
+        "template_id": "weekly-recap",
+        "options": {"format": "md", "theme": "light", "reveal_projects": True,
+                    "no_branding": False, "top_n": 5,
+                    "period": {"kind": "current"},
+                    "project_allowlist": None,
+                    "show_chart": True, "show_table": True},
+    }).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/render",
+        data=req_body, method="POST",
+        headers=_csrf_headers(port),
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        body = json.loads(r.read())
+    assert body["content_type"] == "text/markdown"
+    assert "\ntemplate_id: weekly-recap\n" in body["body"]
+
+
 def test_share_render_rejects_unknown_template(dashboard_server):
     port, _ = dashboard_server
     req_body = json.dumps({

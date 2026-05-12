@@ -171,6 +171,7 @@ class ShareSnapshot:
     notes: tuple[str, ...]
     generated_at: datetime
     version: str
+    template_id: str | None = None
 
 
 # --- Compose: multi-section stitching (M3.1) ---
@@ -880,6 +881,7 @@ def _apply_anon_mapping(
         notes=snap.notes,
         generated_at=snap.generated_at,
         version=snap.version,
+        template_id=snap.template_id,
     )
 
 
@@ -1205,16 +1207,13 @@ def _build_md_frontmatter(snap: ShareSnapshot) -> str:
     """YAML frontmatter prepended to MD exports (spec §11.5).
 
     Byte-stable: key order is fixed (title -> generated_at -> period ->
-    panel -> anonymized -> cctally_version); single-line values; no
-    eolian formatting. `_wrap_document` strips this when
+    panel -> optional template_id -> anonymized -> cctally_version);
+    single-line values; no eolian formatting. `_wrap_document` strips this when
     `branding=False` so `--no-branding` behaves consistently with the
     HTML/SVG footer-link stripping.
 
-    NOTE: spec §11.5 lists `template_id` as a 7th key, but the kernel
-    has no `ShareSnapshot.template_id` field (templates are a v2
-    registry concept above the kernel). Threading it through requires
-    a kernel signature change with v1 CLI golden churn — deferred to
-    issue #34.
+    `template_id` is present for dashboard share-v2 snapshots and omitted
+    for legacy CLI snapshots that have no template recipe.
 
     `anonymized` reflects whether `_scrub` has rewritten this snapshot --
     detected via `_snapshot_is_anonymized` (label-prefix heuristic; see
@@ -1232,11 +1231,15 @@ def _build_md_frontmatter(snap: ShareSnapshot) -> str:
         f"generated_at: {snap.generated_at.isoformat()}",
         f"period: {period_iso}",
         f"panel: {snap.cmd}",
+    ]
+    if snap.template_id:
+        lines.append(f"template_id: {_yaml_scalar(snap.template_id)}")
+    lines.extend([
         f"anonymized: {anonymized}",
         f"cctally_version: {snap.version}",
         "---",
         "",
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -1420,7 +1423,8 @@ def _stitch_md(sections: tuple[ComposedSection, ...], *,
     if not opts.no_branding:
         # Composite frontmatter: same key set as the single-section
         # `_build_md_frontmatter` but `panel` becomes `composed` and
-        # `template_id` is dropped (multi-template).
+        # `template_id` is omitted because one composed document can contain
+        # multiple section templates.
         # `generated_at` and `cctally_version` are taken from the first
         # section since the composite document has no independent
         # provenance — every section was rendered in the same request.

@@ -33869,6 +33869,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._respond_json(500, {"error": f"builder failed: {exc}"})
             return
+        snap_built = replace(snap_built, template_id=template_id)
         # Content toggles (spec §Q4). Defaults match the existing
         # behavior (chart on, table on); explicit False strips the
         # corresponding section from the ShareSnapshot. ShareSnapshot
@@ -34063,6 +34064,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     "error": f"sections[{idx}] builder failed: {exc}",
                 })
                 return
+            snap_built = replace(snap_built, template_id=template_id)
             # Same content toggles as the single-section render path.
             # Per-section `show_chart`/`show_table` from the basket
             # recipe are applied here; the composite anon flag is

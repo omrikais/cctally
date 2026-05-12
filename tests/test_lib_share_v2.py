@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,6 +69,7 @@ def _trivial_snapshot():
         notes=(),
         generated_at=datetime(2026, 5, 11, 9, 30, tzinfo=timezone.utc),
         version="1.5.0",
+        template_id="weekly-recap",
     )
 
 
@@ -112,13 +114,19 @@ def test_md_frontmatter_byte_stable_for_identical_input():
     assert out_a.startswith("---\n")
     # Ordered keys per spec §11.5
     keys_in_order = ["title:", "generated_at:", "period:", "panel:",
-                     "anonymized:", "cctally_version:"]
+                     "template_id:", "anonymized:", "cctally_version:"]
     prev_idx = -1
     for key in keys_in_order:
         idx = out_a.find(key)
         assert idx > 0, f"frontmatter missing key {key!r}"
         assert idx > prev_idx, f"frontmatter key {key!r} out of lexical order"
         prev_idx = idx
+
+
+def test_md_frontmatter_includes_template_id_when_present():
+    snap = replace(_trivial_snapshot(), template_id="weekly-visual")
+    out = _LS.render(snap, format="md", theme="light", branding=True)
+    assert "template_id: weekly-visual\n" in out
 
 
 def test_md_frontmatter_stripped_when_no_branding():

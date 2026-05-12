@@ -84,7 +84,7 @@ Live in the left column of the modal. Knob changes debounce by 200 ms before re-
 
 | Format | Output |
 |---|---|
-| `md` | Markdown — paste-friendly for Slack, GitHub issues, code reviews. (MD frontmatter ships in M2.) |
+| `md` | Markdown — paste-friendly for Slack, GitHub issues, code reviews. Includes YAML frontmatter with panel, template id, period, anonymization, and version metadata. |
 | `html` | Self-contained themed HTML document — open in browser, screenshot, or print to PDF. |
 | `svg` | Inline graphics rendering. Same data shape as HTML; vector for slide decks. |
 
