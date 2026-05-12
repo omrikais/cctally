@@ -590,6 +590,48 @@ def test_presets_post_rejects_unknown_panel(dashboard_server):
     assert json.loads(raised.read())["field"] == "panel"
 
 
+def test_presets_post_rejects_unknown_template_id(dashboard_server):
+    """Persisting a preset with a template_id that no longer exists would
+    leak a recipe into config.json that fails every later replay through
+    /api/share/render. Mirror the render/compose `get_template` lookup."""
+    port, _ = dashboard_server
+    payload = {"panel": "weekly", "name": "team-monday",
+               "template_id": "weekly-bogus", "options": {"format": "md"}}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/presets",
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={**_csrf_headers(port), "Content-Type": "application/json"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 400
+    err = json.loads(exc.value.read())
+    assert err["field"] == "template_id"
+    assert "weekly-bogus" in err["error"]
+
+
+def test_presets_post_rejects_wrong_panel_template(dashboard_server):
+    """A `weekly-recap` template stored against `panel='daily'` would
+    surface a dropdown row that 400s on every replay. Reject at write
+    time with the same panel-mismatch envelope as /api/share/render."""
+    port, _ = dashboard_server
+    payload = {"panel": "daily", "name": "x",
+               "template_id": "weekly-recap", "options": {"format": "md"}}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/presets",
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={**_csrf_headers(port), "Content-Type": "application/json"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 400
+    err = json.loads(exc.value.read())
+    assert err["field"] == "template_id"
+    assert "belongs to panel" in err["error"]
+
+
 # ---------- M3.2 — POST /api/share/compose ----------
 
 
@@ -821,6 +863,56 @@ def test_history_post_rejects_unknown_panel(dashboard_server):
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(req, timeout=5)
     assert exc.value.code == 400
+
+
+def test_history_post_rejects_unknown_template_id(dashboard_server):
+    """History records are persisted recipes, so an unknown `template_id`
+    poisons the recent-shares dropdown with a row that 400s on replay.
+    Mirror the render/compose `get_template` lookup."""
+    port, _ = dashboard_server
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/history",
+        data=json.dumps({
+            "panel": "weekly",
+            "template_id": "weekly-bogus",
+            "options": {"format": "md"},
+            "format": "md",
+            "destination": "download",
+        }).encode(),
+        method="POST",
+        headers=_csrf_headers(port),
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 400
+    err = json.loads(exc.value.read())
+    assert err["field"] == "template_id"
+    assert "weekly-bogus" in err["error"]
+
+
+def test_history_post_rejects_wrong_panel_template(dashboard_server):
+    """`weekly-recap` recorded against `panel='daily'` would land in the
+    ring buffer and surface a recent-shares row that 400s on every replay.
+    Reject at write time with the same envelope as /api/share/render."""
+    port, _ = dashboard_server
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/history",
+        data=json.dumps({
+            "panel": "daily",
+            "template_id": "weekly-recap",
+            "options": {"format": "md"},
+            "format": "md",
+            "destination": "download",
+        }).encode(),
+        method="POST",
+        headers=_csrf_headers(port),
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 400
+    err = json.loads(exc.value.read())
+    assert err["field"] == "template_id"
+    assert "belongs to panel" in err["error"]
 
 
 def test_history_post_csrf_gate(dashboard_server):

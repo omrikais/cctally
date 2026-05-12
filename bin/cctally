@@ -34201,6 +34201,23 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 "field": "template_id",
             })
             return
+        try:
+            template = tpl_mod.get_template(template_id)
+        except KeyError:
+            self._respond_json(400, {
+                "error": f"unknown template_id: {template_id!r}",
+                "field": "template_id",
+            })
+            return
+        if template.panel != panel:
+            self._respond_json(400, {
+                "error": (
+                    f"template_id {template_id!r} belongs to panel "
+                    f"{template.panel!r}, not {panel!r}"
+                ),
+                "field": "template_id",
+            })
+            return
         if not isinstance(options, dict):
             self._respond_json(400, {
                 "error": "options must be an object",
@@ -34327,6 +34344,23 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if not isinstance(template_id, str) or not template_id:
             self._respond_json(400, {
                 "error": "missing or non-string template_id",
+                "field": "template_id",
+            })
+            return
+        try:
+            template = tpl_mod.get_template(template_id)
+        except KeyError:
+            self._respond_json(400, {
+                "error": f"unknown template_id: {template_id!r}",
+                "field": "template_id",
+            })
+            return
+        if template.panel != panel:
+            self._respond_json(400, {
+                "error": (
+                    f"template_id {template_id!r} belongs to panel "
+                    f"{template.panel!r}, not {panel!r}"
+                ),
                 "field": "template_id",
             })
             return
