@@ -269,6 +269,157 @@ def test_share_render_show_table_false_strips_table(dashboard_server):
     )
 
 
+def test_share_render_accepts_period_current(dashboard_server):
+    """Codex P2 on PR #35 — `kind='current'` is the default (no override);
+    server must accept and render without DB re-query."""
+    port, _ = dashboard_server
+    req_body = json.dumps({
+        "panel": "weekly", "template_id": "weekly-recap",
+        "options": {"format": "md", "period": {"kind": "current"}},
+    }).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/render",
+        data=req_body, method="POST", headers=_csrf_headers(port),
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        assert r.status == 200
+
+
+def test_share_render_rejects_unknown_period_kind(dashboard_server):
+    port, _ = dashboard_server
+    req_body = json.dumps({
+        "panel": "weekly", "template_id": "weekly-recap",
+        "options": {"format": "md", "period": {"kind": "bogus"}},
+    }).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/render",
+        data=req_body, method="POST", headers=_csrf_headers(port),
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 400
+    err = json.loads(exc.value.read())
+    assert err["field"] == "options.period.kind"
+    assert "bogus" in err["error"]
+
+
+def test_share_render_rejects_period_override_for_forecast(dashboard_server):
+    """forecast/current-week panels have intrinsic period semantics —
+    `kind='previous'` and `kind='custom'` are meaningless and rejected
+    with 400."""
+    port, _ = dashboard_server
+    for panel, tpl in [("forecast", "forecast-recap"),
+                        ("current-week", "current-week-recap")]:
+        for kind in ("previous", "custom"):
+            req_body = json.dumps({
+                "panel": panel, "template_id": tpl,
+                "options": {"format": "md", "period": {"kind": kind,
+                                                        "start": "2026-05-01",
+                                                        "end": "2026-05-07"}},
+            }).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/share/render",
+                data=req_body, method="POST", headers=_csrf_headers(port),
+            )
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(req, timeout=5)
+            assert exc.value.code == 400, (
+                f"expected 400 for panel={panel} kind={kind}"
+            )
+            err = json.loads(exc.value.read())
+            assert err["field"] == "options.period.kind"
+
+
+def test_share_render_rejects_custom_period_without_start_end(dashboard_server):
+    port, _ = dashboard_server
+    for bad_period in (
+        {"kind": "custom"},                                      # no dates
+        {"kind": "custom", "start": "2026-05-04"},                # no end
+        {"kind": "custom", "start": "", "end": "2026-05-10"},     # empty start
+    ):
+        req_body = json.dumps({
+            "panel": "weekly", "template_id": "weekly-recap",
+            "options": {"format": "md", "period": bad_period},
+        }).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/share/render",
+            data=req_body, method="POST", headers=_csrf_headers(port),
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc.value.code == 400, f"expected 400 for {bad_period!r}"
+        err = json.loads(exc.value.read())
+        assert err["field"].startswith("options.period")
+
+
+def test_share_render_rejects_inverted_custom_range(dashboard_server):
+    """end <= start → 400 (spec §6.2: "invalid options: custom-period range inverted")."""
+    port, _ = dashboard_server
+    req_body = json.dumps({
+        "panel": "weekly", "template_id": "weekly-recap",
+        "options": {"format": "md", "period": {"kind": "custom",
+                                                "start": "2026-05-10",
+                                                "end": "2026-05-04"}},
+    }).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/render",
+        data=req_body, method="POST", headers=_csrf_headers(port),
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 400
+    err = json.loads(exc.value.read())
+    assert "after start" in err["error"].lower() or "inverted" in err["error"].lower()
+
+
+def test_share_render_previous_period_accepted_for_overridable_panels(dashboard_server):
+    """`kind='previous'` opens a DB connection and re-builds the panel
+    field with shifted now_utc. On an empty test DB this still returns
+    200 with an empty / zero-stub body — the wiring works without
+    crashing the handler."""
+    port, _ = dashboard_server
+    for panel, tpl in [
+        ("weekly", "weekly-recap"),
+        ("daily", "daily-recap"),
+        ("monthly", "monthly-recap"),
+        ("trend", "trend-recap"),
+        ("blocks", "blocks-recap"),
+    ]:
+        req_body = json.dumps({
+            "panel": panel, "template_id": tpl,
+            "options": {"format": "md", "period": {"kind": "previous"}},
+        }).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/share/render",
+            data=req_body, method="POST", headers=_csrf_headers(port),
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert r.status == 200, f"panel={panel}"
+            body = json.loads(r.read())
+            assert body["content_type"] == "text/markdown"
+
+
+def test_share_render_custom_period_accepted_for_overridable_panels(dashboard_server):
+    """`kind='custom'` with a valid range re-builds via DB and renders."""
+    port, _ = dashboard_server
+    custom = {"kind": "custom", "start": "2026-04-27", "end": "2026-05-04"}
+    for panel, tpl in [
+        ("weekly", "weekly-recap"),
+        ("daily", "daily-recap"),
+        ("trend", "trend-recap"),
+    ]:
+        req_body = json.dumps({
+            "panel": panel, "template_id": tpl,
+            "options": {"format": "md", "period": custom},
+        }).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/share/render",
+            data=req_body, method="POST", headers=_csrf_headers(port),
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert r.status == 200, f"panel={panel}"
+
+
 def test_share_render_csrf_blocks_cross_origin(dashboard_server):
     port, _ = dashboard_server
     req_body = json.dumps({"panel": "weekly", "template_id": "weekly-recap",

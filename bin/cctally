@@ -28978,6 +28978,209 @@ def _share_iso(value) -> "str | None":
     return str(value)
 
 
+# ---- Period override (spec §6.2 Q4 + Codex P2 on PR #35) ----
+#
+# The share modal's Period control offers three kinds — current, previous,
+# custom — but the original render path consumed the dashboard's cached
+# DataSnapshot directly, which only ever holds "current" data. Override
+# semantics by panel:
+#
+#   panel        current             previous              custom (start/end)
+#   --------     ------------------  --------------------  -------------------
+#   weekly       this subscription   one week earlier      week containing end
+#                week
+#   daily        last 7 display-tz   7 days earlier        7 days ending at end
+#                days ending today
+#   monthly      last 12 months      12 months earlier     12 months ending at end
+#                ending now
+#   trend        last 8 weeks        8 weeks earlier       8 weeks ending at end
+#                ending now
+#   blocks       recent 5h blocks    blocks ending one     blocks ending at end
+#                                     5h-window earlier
+#   forecast     future projection   (rejected: previous
+#                from now             forecast doesn't exist)
+#   current-week this subscription   (rejected: panel IS current)
+#                week
+#   sessions     recent sessions     (deferred: ambiguous semantics — could
+#                                     mean "older sessions" or "sessions in
+#                                     date range"; revisit when use case clear)
+#
+# Override mechanics: derive a `now_utc` from the period option and
+# re-build only the relevant DataSnapshot field by calling the same
+# `_dashboard_build_*` function the sync thread uses, just with a
+# shifted `now_utc`. `dataclasses.replace` returns a new DataSnapshot
+# with that field swapped; everything downstream (panel_data builder,
+# template builder, kernel render) consumes it unchanged.
+#
+# Validation failures land on the request as HTTP 400 with
+# `field: "options.period.<key>"` so the UI can highlight the offending
+# control.
+
+_SHARE_PANELS_PERIOD_FIXED = ("forecast", "current-week", "sessions")
+# Panels whose period is intrinsic to the panel's identity. We accept
+# `kind="current"` (= no override) and reject anything else with 400.
+
+_SHARE_PANELS_PERIOD_OVERRIDABLE = ("weekly", "daily", "monthly", "trend", "blocks")
+
+
+def _share_resolve_period(panel: str, options: dict):
+    """Return (now_utc_override, error_dict) for the requested period.
+
+    - `(None, None)` — no override needed (period absent or
+      `kind="current"`). Caller continues with the cached DataSnapshot.
+    - `(datetime, None)` — caller should re-build the relevant panel
+      field with this `now_utc`.
+    - `(None, {"error": str, "field": str})` — validation failure;
+      caller emits 400 with this envelope.
+
+    `parse_iso_datetime` (the same parser used by every other share
+    surface) accepts trailing `Z` / `+HH:MM` and naive forms. Naive
+    inputs are treated as UTC by `parse_iso_datetime` and downstream
+    UTC-fixup, so a date-only string like ``"2026-05-04"`` lands at
+    midnight UTC.
+    """
+    period = options.get("period")
+    if period is None or not isinstance(period, dict):
+        # Absent → no override, defaults to current. (Permissive: the
+        # UI always sends a period block, but older basket recipes /
+        # CLI parity may omit it.)
+        return (None, None)
+    kind = period.get("kind", "current")
+    if kind not in ("current", "previous", "custom"):
+        return (None, {"error": f"unknown period kind: {kind!r}",
+                       "field": "options.period.kind"})
+    if panel in _SHARE_PANELS_PERIOD_FIXED:
+        if kind != "current":
+            return (None, {
+                "error": (f"panel {panel!r} only supports period kind='current'; "
+                          f"got {kind!r}"),
+                "field": "options.period.kind",
+            })
+        return (None, None)
+    # Overridable panels — handle each kind.
+    if kind == "current":
+        return (None, None)
+    if kind == "previous":
+        delta = _share_previous_period_delta(panel)
+        return (_share_now_utc() - delta, None)
+    # kind == "custom"
+    start_str = period.get("start")
+    end_str = period.get("end")
+    if not isinstance(start_str, str) or not start_str \
+            or not isinstance(end_str, str) or not end_str:
+        return (None, {
+            "error": "custom period requires non-empty start + end ISO dates",
+            "field": "options.period",
+        })
+    try:
+        start_dt = parse_iso_datetime(start_str, "options.period.start")
+        end_dt = parse_iso_datetime(end_str, "options.period.end")
+    except ValueError as exc:
+        return (None, {"error": f"invalid period date: {exc}",
+                       "field": "options.period"})
+    if end_dt <= start_dt:
+        return (None, {
+            "error": ("custom period end must be strictly after start "
+                      f"(got start={start_str!r}, end={end_str!r})"),
+            "field": "options.period",
+        })
+    return (end_dt, None)
+
+
+def _share_previous_period_delta(panel: str) -> "dt.timedelta":
+    """How far back `now_utc` shifts for `kind='previous'` on each panel.
+
+    weekly/daily: 7 days. monthly: one whole month worth (we shift to
+    the last day of the previous month at call time to handle variable
+    month length, so this is unused — the caller routes through
+    `_share_resolve_period` which special-cases monthly). trend: 8 weeks
+    (one trend window). blocks: 5 hours (one block).
+    """
+    if panel == "weekly":
+        return dt.timedelta(days=7)
+    if panel == "daily":
+        return dt.timedelta(days=7)
+    if panel == "monthly":
+        return dt.timedelta(days=30)  # close-enough for the resolver;
+                                       # see _share_resolve_period_monthly
+                                       # below for the calendar-aware
+                                       # version when needed.
+    if panel == "trend":
+        return dt.timedelta(days=8 * 7)
+    if panel == "blocks":
+        return dt.timedelta(hours=5)
+    raise ValueError(f"_share_previous_period_delta: no delta for panel {panel!r}")
+
+
+def _share_apply_period_override(panel: str, options: dict,
+                                  snap: "DataSnapshot | None"):
+    """Return (snap_or_None, error_dict_or_None).
+
+    Walks `_share_resolve_period`, then re-builds the panel's DataSnapshot
+    field from DB when an override is requested. `dataclasses.replace`
+    yields a shallow copy with one field swapped. Returns the original
+    `snap` unchanged when no override applies.
+    """
+    if snap is None:
+        # No cached snapshot to override against — return None unchanged
+        # and let the panel_data builder's empty-snapshot path handle it.
+        # Still validate the period option so the user gets a 400 on
+        # malformed input even before the sync thread's first tick.
+        _, err = _share_resolve_period(panel, options)
+        return (snap, err)
+    now_override, err = _share_resolve_period(panel, options)
+    if err is not None:
+        return (None, err)
+    if now_override is None:
+        return (snap, None)
+    import dataclasses as _dc
+    conn = open_db()
+    try:
+        if panel == "weekly":
+            rows = _dashboard_build_weekly_periods(conn, now_override,
+                                                    skip_sync=True)
+            return (_dc.replace(snap, weekly_periods=rows), None)
+        if panel == "daily":
+            display_tz_name = options.get("display_tz", "Etc/UTC")
+            try:
+                display_tz = ZoneInfo(display_tz_name) if display_tz_name else None
+            except Exception:
+                display_tz = None
+            rows = _dashboard_build_daily_panel(conn, now_override,
+                                                 skip_sync=True,
+                                                 display_tz=display_tz)
+            return (_dc.replace(snap, daily_panel=rows), None)
+        if panel == "monthly":
+            rows = _dashboard_build_monthly_periods(conn, now_override,
+                                                     skip_sync=True)
+            return (_dc.replace(snap, monthly_periods=rows), None)
+        if panel == "trend":
+            rows = _tui_build_trend(conn, now_override, skip_sync=True)
+            return (_dc.replace(snap, trend=rows), None)
+        if panel == "blocks":
+            # `_dashboard_build_blocks_panel` is week-anchored; derive a
+            # 7-day window ending at the override `now_utc`. This is
+            # intentionally NOT aligned to subscription-week boundaries
+            # (the share period override is wall-clock-aware, not quota
+            # -aware), so a `kind='previous'` blocks export covers
+            # exactly the seven days before `now_utc - 5h`.
+            week_start_at = now_override - dt.timedelta(days=7)
+            week_end_at = now_override
+            rows = _dashboard_build_blocks_panel(
+                conn, now_override,
+                week_start_at=week_start_at,
+                week_end_at=week_end_at,
+                skip_sync=True,
+            )
+            return (_dc.replace(snap, blocks_panel=rows), None)
+        # forecast / current-week / sessions: resolver already gated; we
+        # only reach here for `kind="current"`, which returns no
+        # override.
+        return (snap, None)
+    finally:
+        conn.close()
+
+
 def _share_apply_content_toggles(snap_built, options: dict):
     """Strip chart / table from a built ShareSnapshot per render options.
 
@@ -33419,6 +33622,15 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         # share hot path. `_build_share_panel_data` dispatches per panel.
         snap_ref = type(self).snapshot_ref
         data_snap = snap_ref.get() if snap_ref is not None else None
+        # Period override (current / previous / custom). For
+        # `kind='current'` (the default) this is a no-op; otherwise we
+        # re-build the relevant panel's DataSnapshot field from DB with
+        # a shifted `now_utc` before slicing.
+        data_snap, period_err = _share_apply_period_override(panel, options,
+                                                              data_snap)
+        if period_err is not None:
+            self._respond_json(400, period_err)
+            return
         try:
             panel_data = _build_share_panel_data(panel, options, data_snap)
         except Exception as exc:
@@ -33601,9 +33813,20 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             composite_opts = {**sec_opts, "reveal_projects": reveal_projects,
                               "theme": theme, "format": fmt,
                               "no_branding": no_branding}
+            # Per-section period override — each basket item carries its
+            # own period recipe, independent of the composite anon flag.
+            sec_snap, period_err = _share_apply_period_override(
+                panel, composite_opts, data_snap,
+            )
+            if period_err is not None:
+                self._respond_json(400, {
+                    "error": f"sections[{idx}]: {period_err['error']}",
+                    "field": f"sections[{idx}].snapshot.{period_err['field']}",
+                })
+                return
             try:
                 panel_data = _build_share_panel_data(panel, composite_opts,
-                                                     data_snap)
+                                                     sec_snap)
             except Exception as exc:
                 self._respond_json(500, {
                     "error": f"sections[{idx}] panel_data build failed: {exc}",
