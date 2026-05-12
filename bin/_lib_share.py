@@ -359,7 +359,8 @@ def svg_rect(x: float, y: float, w: float, h: float, *,
 
 def svg_text(x: float, y: float, text: str, *,
              font_size: float, fill: str,
-             anchor: str = "start", weight: str = "normal") -> str:
+             anchor: str = "start", weight: str = "normal",
+             font_family: str | None = None) -> str:
     attrs = {
         "x": x,
         "y": y,
@@ -369,6 +370,8 @@ def svg_text(x: float, y: float, text: str, *,
     }
     if weight and weight != "normal":
         attrs["font-weight"] = weight
+    if font_family:
+        attrs["font-family"] = font_family
     return f'<text {_serialize_attrs(attrs)}>{_xml_escape(text)}</text>'
 
 
@@ -988,6 +991,239 @@ _SVG_PADDING = 20
 _SVG_FOOTER_BASELINE = 18
 # Vertical padding between stacked sections in `_stitch_svg`.
 _SVG_SECTION_GAP = 20.0
+
+# --- SVG table geometry (issue #38) ---
+_SVG_TABLE_FONT = 11
+_SVG_TABLE_CELL_PAD_X = 8
+_SVG_TABLE_CELL_PAD_Y = 6
+_SVG_TABLE_LINE_H_MULT = 1.4
+_SVG_TABLE_GAP = 16
+_SVG_TABLE_MAX_WRAP_LINES = 3
+_SVG_TABLE_MIN_COL_W = 24
+_SVG_AVG_GLYPH_WIDTH_FRACTION = 0.6
+_SVG_WRAP_BREAK_CHARS = (" ", "/", "-", "_")
+_SVG_ELLIPSIS = "…"
+
+
+def _svg_text_width(text: str, font_size: float) -> float:
+    """Estimate rendered width of `text` at `font_size` in a sans-serif font.
+
+    Heuristic-only: actual width depends on the UA-selected font. SVG
+    goldens are diffed as source text, so this function's job is
+    determinism, not pixel-perfect measurement. Wrap-then-ellipsize
+    layout tolerates moderate over/under-allocation.
+    """
+    return len(text) * font_size * _SVG_AVG_GLYPH_WIDTH_FRACTION
+
+
+def _wrap_for_width(text: str, content_w: float, font_size: float) -> list[str]:
+    """Wrap `text` into lines that each fit within `content_w` pixels.
+
+    Greedy left-to-right: binary-search the longest prefix that fits,
+    then cut at the rightmost break-char inside the run. Cap output
+    at `_SVG_TABLE_MAX_WRAP_LINES`. If the input still has tail after
+    the cap, ellipsize the last emitted line until ellipsis fits.
+    Empty text → [""]. Unbreakable token longer than `content_w` →
+    hard-cut + ellipsis on the tail.
+    """
+    if not text:
+        return [""]
+    if _svg_text_width(text, font_size) <= content_w:
+        return [text]
+
+    lines: list[str] = []
+    remaining = text
+    while remaining and len(lines) < _SVG_TABLE_MAX_WRAP_LINES:
+        lo, hi = 0, len(remaining)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _svg_text_width(remaining[:mid], font_size) <= content_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        fit_end = lo
+
+        if fit_end == len(remaining):
+            lines.append(remaining)
+            remaining = ""
+            break
+
+        if fit_end == 0:
+            # Even one character overflows — abort wrap, fall through to ellipsis.
+            break
+
+        break_at = -1
+        for ch in _SVG_WRAP_BREAK_CHARS:
+            idx = remaining.rfind(ch, 0, fit_end + 1)
+            if idx > break_at:
+                break_at = idx
+
+        if break_at <= 0:
+            lines.append(remaining[:fit_end])
+            remaining = remaining[fit_end:]
+        else:
+            lines.append(remaining[:break_at + 1].rstrip())
+            remaining = remaining[break_at + 1:]
+
+    if remaining:
+        last = lines[-1] if lines else ""
+        while last and _svg_text_width(last + _SVG_ELLIPSIS, font_size) > content_w:
+            last = last[:-1]
+        if last:
+            lines[-1] = last + _SVG_ELLIPSIS
+        elif lines:
+            lines[-1] = _SVG_ELLIPSIS
+        else:
+            lines.append(_SVG_ELLIPSIS)
+
+    return lines or [_SVG_ELLIPSIS]
+
+
+def _svg_table_anchor_and_x(align: str, col_x: float, col_w: float,
+                             pad_x: float) -> tuple[str, float]:
+    """Map `ColumnSpec.align` to SVG text-anchor + x-coordinate."""
+    if align == "right":
+        return "end", col_x + col_w - pad_x
+    if align == "center":
+        return "middle", col_x + col_w / 2
+    return "start", col_x + pad_x
+
+
+def _render_svg_table(
+    snap: "ShareSnapshot", *, palette: dict,
+    x: float, y: float, max_width: float,
+) -> tuple[str, float]:
+    """Render the cross-tab / project / sessions table body as SVG.
+
+    Returns (svg_fragment, total_height). Caller (`_render_svg`) uses
+    the returned height to position the footer band and declare the
+    outer `<svg height="…">` attribute. Caller MUST short-circuit when
+    `snap.columns` is empty — this helper is a precondition violation
+    if called with `columns=()`.
+
+    Layout: greedy auto-size, shrink only oversized columns, clamp
+    to `_SVG_TABLE_MIN_COL_W` minimum, wrap headers AND body cells
+    with the same break-priority rule. Visual: Treatment A (HTML-
+    mirror) — header band + alternating row stripes + body text;
+    no borders or inter-column rules.
+    """
+    cols = snap.columns
+    rows = snap.rows
+    n = len(cols)
+    assert n > 0, "_render_svg_table: precondition snap.columns non-empty"
+
+    font_size = _SVG_TABLE_FONT
+    pad_x = _SVG_TABLE_CELL_PAD_X
+    pad_y = _SVG_TABLE_CELL_PAD_Y
+    line_h = font_size * _SVG_TABLE_LINE_H_MULT
+
+    # 1. Pre-format every cell to plain text.
+    cell_strs = [
+        [_render_cell_text(row.cells.get(c.key, TextCell("")))
+         for c in cols]
+        for row in rows
+    ]
+
+    # 2. Natural per-column width = max(header, max body) + 2*pad_x.
+    def _col_natural(i: int, c) -> float:
+        widths = [_svg_text_width(c.label, font_size)]
+        for r in range(len(rows)):
+            widths.append(_svg_text_width(cell_strs[r][i], font_size))
+        return max(widths) + 2 * pad_x
+
+    nat_w = [_col_natural(i, c) for i, c in enumerate(cols)]
+
+    # 3+4. Fit or shrink.
+    if sum(nat_w) <= max_width:
+        widths = list(nat_w)
+    else:
+        fair = max_width / n
+        oversize_idx = {i for i in range(n) if nat_w[i] > fair}
+        if not oversize_idx:
+            scale = max_width / sum(nat_w)
+            widths = [w * scale for w in nat_w]
+        else:
+            other_total = sum(nat_w[i] for i in range(n) if i not in oversize_idx)
+            total_oversize = sum(nat_w[i] for i in oversize_idx)
+            budget = max_width - other_total
+            scale = budget / total_oversize if total_oversize > 0 else 1.0
+            widths = [
+                (nat_w[i] * scale) if i in oversize_idx else nat_w[i]
+                for i in range(n)
+            ]
+        # 4b. Min-width clamp (pathological top_n).
+        widths = [max(w, _SVG_TABLE_MIN_COL_W) for w in widths]
+
+    # 5a. Header wrap.
+    header_lines: list[list[str]] = []
+    for i, c in enumerate(cols):
+        content_w = widths[i] - 2 * pad_x
+        header_lines.append(_wrap_for_width(c.label, content_w, font_size))
+    max_header_lines = max((len(ls) for ls in header_lines), default=1)
+
+    # 5b. Body wrap.
+    wrapped_body: list[list[list[str]]] = []
+    row_lines: list[int] = []
+    for r in range(len(rows)):
+        cells_wrapped: list[list[str]] = []
+        mx = 1
+        for i in range(n):
+            content_w = widths[i] - 2 * pad_x
+            ls = _wrap_for_width(cell_strs[r][i], content_w, font_size)
+            cells_wrapped.append(ls)
+            mx = max(mx, len(ls))
+        wrapped_body.append(cells_wrapped)
+        row_lines.append(mx)
+
+    # 6. Heights.
+    header_h = max_header_lines * line_h + 2 * pad_y
+    body_heights = [nl * line_h + 2 * pad_y for nl in row_lines]
+    total_h = header_h + sum(body_heights)
+
+    # 7. Emit. Column x-offsets are cumulative.
+    col_xs = [x]
+    for w in widths[:-1]:
+        col_xs.append(col_xs[-1] + w)
+
+    pieces: list[str] = []
+
+    # Header band.
+    pieces.append(svg_rect(x, y, max_width, header_h,
+                           fill=palette["table_header_bg"]))
+    # Header text.
+    for i, c in enumerate(cols):
+        cx = col_xs[i]
+        cw = widths[i]
+        anchor, tx = _svg_table_anchor_and_x(c.align, cx, cw, pad_x)
+        for j, line in enumerate(header_lines[i]):
+            baseline = y + pad_y + font_size + j * line_h
+            pieces.append(svg_text(
+                tx, baseline, line,
+                font_size=font_size, fill=palette["fg"],
+                anchor=anchor, weight="bold", font_family="sans-serif",
+            ))
+
+    # Body rows.
+    row_y = y + header_h
+    for r, _row in enumerate(rows):
+        rh = body_heights[r]
+        row_bg = palette["table_row_alt"] if (r % 2 == 1) else palette["bg"]
+        pieces.append(svg_rect(x, row_y, max_width, rh, fill=row_bg))
+
+        for i, c in enumerate(cols):
+            cx = col_xs[i]
+            cw = widths[i]
+            anchor, tx = _svg_table_anchor_and_x(c.align, cx, cw, pad_x)
+            for j, line in enumerate(wrapped_body[r][i]):
+                baseline = row_y + pad_y + font_size + j * line_h
+                pieces.append(svg_text(
+                    tx, baseline, line,
+                    font_size=font_size, fill=palette["fg"],
+                    anchor=anchor, font_family="sans-serif",
+                ))
+        row_y += rh
+
+    return "".join(pieces), total_h
 
 
 def _render_svg(snap: ShareSnapshot, *, palette: dict,
