@@ -24136,52 +24136,22 @@ def doctor_gather_state(
     now_utc: "dt.datetime | None" = None,
     runtime_bind: "str | None" = None,
 ):
-    """Assemble a DoctorState from existing helpers + raw config read +
-    JSONL probes + DB read-only SELECTs. Spec §7.2.
+    """I/O chokepoint for `cctally doctor` (spec §7.2).
 
-    Each source wrapped in try/except so a partial failure leaves the
-    relevant field None and the dependent check degrades cleanly. The
-    function is the SINGLE I/O chokepoint for `cctally doctor` — the
-    pure kernel in `bin/_lib_doctor.py` consumes the returned
-    DoctorState dataclass and emits the report (spec §7.1).
-
-    Special concerns:
-      * config.json is read RAW (NOT via load_config) — load_config
-        auto-creates the file on first run, which would mutate user
-        state under a read-only diagnostic command (codex H1).
-      * `runtime_bind` is passed by the dashboard subcommand only;
-        CLI `cmd_doctor` always leaves it None and the report renders
-        a "config-only" note so users understand a running dashboard
-        may differ.
-      * `now_utc` honors `CCTALLY_AS_OF` (same hidden env hook as
-        `cctally project`) so fixture-based tests get deterministic
-        timestamps.
+    H1 invariant: config.json is read RAW (NOT via load_config), since
+    load_config auto-creates the file on first run — a read-only
+    diagnostic command must never mutate user state.
     """
     import _lib_doctor
 
     if now_utc is None:
-        as_of = os.environ.get("CCTALLY_AS_OF")
-        if as_of:
-            now_utc = parse_iso_datetime(
-                as_of, "CCTALLY_AS_OF"
-            ).astimezone(dt.timezone.utc)
-        else:
-            now_utc = dt.datetime.now(dt.timezone.utc)
+        now_utc = _now_utc()
 
     # ── Install ──────────────────────────────────────────────────────
     repo_root = _setup_resolve_repo_root()
     dst_dir = _setup_local_bin_dir()
-    symlink_state: "list[tuple[str, str]] | None" = []
     try:
-        for name in SETUP_SYMLINK_NAMES:
-            dst = dst_dir / name
-            src = _setup_resolve_symlink_source(repo_root, name)
-            if dst.is_symlink() and pathlib.Path(os.readlink(dst)) == src:
-                symlink_state.append((name, "ok"))
-            elif dst.exists():
-                symlink_state.append((name, "wrong"))
-            else:
-                symlink_state.append((name, "missing"))
+        symlink_state = _setup_compute_symlink_state(repo_root, dst_dir)
     except Exception:
         symlink_state = None
     try:
@@ -24196,8 +24166,11 @@ def doctor_gather_state(
     # ── Hooks ────────────────────────────────────────────────────────
     try:
         settings = _load_claude_settings()
-    except Exception:
+    except SetupError:
         settings = None
+    # Below: fail-soft posture for the diagnostic — any unexpected error
+    # in a sub-probe degrades that field to None rather than aborting the
+    # whole report.
     try:
         hook_counts = _setup_count_hook_entries(settings or {})
     except Exception:
@@ -24214,7 +24187,7 @@ def doctor_gather_state(
     # ── Auth ─────────────────────────────────────────────────────────
     try:
         oauth_token_present = _setup_oauth_token_present()
-    except Exception:
+    except OSError:
         oauth_token_present = None
 
     # ── DB ───────────────────────────────────────────────────────────
@@ -24222,7 +24195,7 @@ def doctor_gather_state(
         stats_db_status = _db_status_for(DB_PATH, _STATS_MIGRATIONS, "stats.db")
         if not DB_PATH.exists():
             stats_db_status["_file_exists"] = False
-    except Exception as exc:
+    except sqlite3.Error as exc:
         stats_db_status = {"path": str(DB_PATH), "user_version": 0,
                            "registry_size": len(_STATS_MIGRATIONS),
                            "migrations": [], "_open_error": str(exc)}
@@ -24230,7 +24203,7 @@ def doctor_gather_state(
         cache_db_status = _db_status_for(CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db")
         if not CACHE_DB_PATH.exists():
             cache_db_status["_file_exists"] = False
-    except Exception as exc:
+    except sqlite3.Error as exc:
         cache_db_status = {"path": str(CACHE_DB_PATH), "user_version": 0,
                            "registry_size": len(_CACHE_MIGRATIONS),
                            "migrations": [], "_open_error": str(exc)}
@@ -24392,19 +24365,33 @@ def doctor_gather_state(
     )
 
 
-def _setup_status(args: argparse.Namespace) -> int:
-    repo_root = _setup_resolve_repo_root()
-    dst_dir = _setup_local_bin_dir()
-    sym_state = []
+def _setup_compute_symlink_state(
+    repo_root: pathlib.Path, dst_dir: pathlib.Path,
+) -> "list[tuple[str, str]]":
+    """Per-symlink (name, state) for `_setup_status` + `doctor_gather_state`.
+
+    state ∈ {"ok", "wrong", "missing"}: "ok" = symlink resolves to
+    expected source; "wrong" = path exists but isn't the right symlink
+    (e.g., regular file or symlink → elsewhere); "missing" = no path
+    at all.
+    """
+    out: list[tuple[str, str]] = []
     for name in SETUP_SYMLINK_NAMES:
         dst = dst_dir / name
         src = _setup_resolve_symlink_source(repo_root, name)
         if dst.is_symlink() and pathlib.Path(os.readlink(dst)) == src:
-            sym_state.append((name, "ok"))
+            out.append((name, "ok"))
         elif dst.exists():
-            sym_state.append((name, "wrong"))
+            out.append((name, "wrong"))
         else:
-            sym_state.append((name, "missing"))
+            out.append((name, "missing"))
+    return out
+
+
+def _setup_status(args: argparse.Namespace) -> int:
+    repo_root = _setup_resolve_repo_root()
+    dst_dir = _setup_local_bin_dir()
+    sym_state = _setup_compute_symlink_state(repo_root, dst_dir)
     sym_ok = sum(1 for _, s in sym_state if s == "ok")
     on_path = _setup_path_includes_local_bin()
     try:
