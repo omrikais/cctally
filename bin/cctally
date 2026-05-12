@@ -29704,6 +29704,16 @@ def _build_daily_share_panel_data(options: dict,
             "pct_of_period": cost / total,
             "top_model":     top_model,
         })
+    # `days[*].date` is bucketed in display_tz by `_dashboard_build_daily_panel`,
+    # so the query window must use display-tz midnights too — otherwise entries
+    # near midnight (up to ±UTC-offset hours) get queried under the wrong UTC
+    # day and either spill into Other or vanish from cross-tab cells while
+    # still counted in the row total.
+    display_tz_name = options.get("display_tz", "Etc/UTC")
+    try:
+        _range_tz = ZoneInfo(display_tz_name) if display_tz_name else dt.timezone.utc
+    except Exception:
+        _range_tz = dt.timezone.utc
     # Daily top_projects: aggregate over the 7-day window. Derive the
     # range from the dates rendered above so the rollup covers exactly
     # what the panel shows (rather than re-deriving "7 days ago" from
@@ -29711,15 +29721,17 @@ def _build_daily_share_panel_data(options: dict,
     top_projects: list[tuple[str, float]] = []
     if days:
         try:
-            range_start = dt.datetime.fromisoformat(
-                f"{days[0]['date']}T00:00:00+00:00"
+            first_date = dt.date.fromisoformat(days[0]["date"])
+            last_date = dt.date.fromisoformat(days[-1]["date"])
+            range_start = dt.datetime(
+                first_date.year, first_date.month, first_date.day,
+                tzinfo=_range_tz,
             )
             # Include the last day in full — end-exclusive boundary at
-            # the start of the next UTC day.
-            last_date = dt.date.fromisoformat(days[-1]["date"])
+            # the start of the next display-tz day.
             range_end = dt.datetime(
                 last_date.year, last_date.month, last_date.day,
-                tzinfo=dt.timezone.utc,
+                tzinfo=_range_tz,
             ) + dt.timedelta(days=1)
             top_projects = _share_top_projects_for_range(range_start, range_end)
         except (ValueError, KeyError):
@@ -29728,17 +29740,19 @@ def _build_daily_share_panel_data(options: dict,
     per_day_per_project: dict[str, dict[str, float]] = {}
     if days:
         try:
-            pdpp_range_start = dt.datetime.fromisoformat(
-                f"{days[0]['date']}T00:00:00+00:00"
-            )
+            first_date = dt.date.fromisoformat(days[0]["date"])
             last_date = dt.date.fromisoformat(days[-1]["date"])
+            pdpp_range_start = dt.datetime(
+                first_date.year, first_date.month, first_date.day,
+                tzinfo=_range_tz,
+            )
             pdpp_range_end = dt.datetime(
                 last_date.year, last_date.month, last_date.day,
-                tzinfo=dt.timezone.utc,
+                tzinfo=_range_tz,
             ) + dt.timedelta(days=1)
             per_day_per_project = _share_per_day_per_project_for_range(
                 pdpp_range_start, pdpp_range_end,
-                display_tz=options.get("display_tz", "Etc/UTC"),
+                display_tz=display_tz_name,
             )
         except (ValueError, KeyError):
             per_day_per_project = {}
@@ -33954,6 +33968,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 "field": "options",
             })
             return
+        # Client `ShareOptions` (dashboard/web/src/share/types.ts) does
+        # not carry `display_tz`; server-side config is the source of
+        # truth. Inject before `_share_apply_period_override` so the
+        # daily panel rebuild and per-day cross-tab bucketing both see
+        # the user's display tz instead of falling back to UTC.
+        if "display_tz" not in options:
+            options["display_tz"] = get_display_tz_pref(load_config())
         if not isinstance(panel, str) or not panel:
             self._respond_json(400, {
                 "error": "missing or non-string panel",
@@ -34162,6 +34183,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         ls = _share_load_lib()
         snap_ref = type(self).snapshot_ref
         data_snap = snap_ref.get() if snap_ref is not None else None
+        # Resolve display_tz from config once (client `ShareOptions`
+        # does not carry it); applied to every section's options below
+        # so daily panel rebuilds and per-day cross-tab cells bucket in
+        # the user's display tz, not UTC.
+        composite_display_tz = get_display_tz_pref(load_config())
 
         composed_sections: list = []
         section_results: list[dict] = []
@@ -34215,6 +34241,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             composite_opts = {**sec_opts, "reveal_projects": reveal_projects,
                               "theme": theme, "format": fmt,
                               "no_branding": no_branding}
+            composite_opts.setdefault("display_tz", composite_display_tz)
             # Per-section period override — each basket item carries its
             # own period recipe, independent of the composite anon flag.
             sec_snap, period_err = _share_apply_period_override(

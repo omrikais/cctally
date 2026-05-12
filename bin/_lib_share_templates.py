@@ -180,8 +180,8 @@ def _aggregate_breakdowns(
 ) -> list[tuple[str, float]]:
     """Aggregate per-row breakdowns into window-wide totals.
 
-    Returns (label, total) sorted by total desc, ties broken lex
-    ascending. Deterministic for goldens.
+    Returns a list of (label, total) tuples sorted by total desc, ties
+    broken lex ascending. Deterministic for goldens.
     """
     totals: dict[str, float] = {}
     for br in breakdowns:
@@ -260,8 +260,9 @@ def _detect_residual(
     *,
     epsilon: float = 1e-9,
 ) -> bool:
-    """Return True iff any row's residual (row_total - SUM(top-K cells))
-    exceeds epsilon. Drives `has_other_residual` in `_cross_tab_columns`.
+    """Return True if any row's residual (row_total - SUM(top-K cells))
+    exceeds epsilon. Short-circuits at the first violating row. Drives
+    `has_other_residual` in `_cross_tab_columns`.
     """
     for row_total, breakdown in rows_and_breakdowns:
         top_k_sum = sum(float(breakdown.get(lbl, 0.0)) for lbl in top_k_labels)

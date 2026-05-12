@@ -773,6 +773,9 @@ def _collect_project_costs(snap: ShareSnapshot) -> dict[str, float]:
     # project-typed columns (cross-tab Detail templates, issue #33). Sum the
     # MoneyCell values for each kind='project' column across all rows; the
     # column.label is the original project path (anon happens AFTER _collect).
+    # No current panel mixes ProjectCell rows AND project-typed columns — if a
+    # future template does, the `+=` here will double-count that project's
+    # total. Refactor to a (path, source) keyed accumulator if/when that lands.
     for col in snap.columns:
         if col.kind != "project":
             continue
