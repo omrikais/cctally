@@ -137,6 +137,10 @@ if "<new_col>" not in cols:
 
 Follow this pattern when extending the schema.
 
+## Diagnostics
+
+`cctally doctor` is a pure-function kernel (`bin/_lib_doctor.py`) wrapping read-only inspections of every diagnostic source — install symlinks, hook activity, OAuth state, migration markers, snapshot freshness, dashboard bind safety, update-state files. The kernel takes a `DoctorState` dataclass assembled by `doctor_gather_state` in `bin/cctally` (the I/O layer reusing existing helpers like `_db_status_for`, `_setup_count_hook_entries`, `_load_update_state`). The same kernel powers the CLI report (text + JSON), the dashboard SSE envelope's aggregate `doctor` block, and the `GET /api/doctor` full-payload endpoint.
+
 ## Where to read next
 
 - [runtime-data.md](runtime-data.md) — exact schema of `stats.db` and `cache.db`
