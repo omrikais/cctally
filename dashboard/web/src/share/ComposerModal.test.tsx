@@ -6,7 +6,7 @@
 // vi.spyOn(globalThis, 'fetch'). The recompose useEffect fires through
 // setTimeout, so each "did we POST?" assertion uses waitFor to wait
 // past the debounce.
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ComposerModal } from './ComposerModal';
 import { _resetForTests, dispatch, getState } from '../store/store';
@@ -279,5 +279,197 @@ describe('<ComposerModal>', () => {
     expect(screen.getByText(/basket is empty/i)).toBeInTheDocument();
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(getState().composerModal).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------
+// M4 export actions (spec §8.8 / §11.5 row 511). The composer footer
+// gets the same five buttons as ActionBar (Copy/Download/Open/PNG/
+// Print), each doing a fresh POST to /api/share/compose with the right
+// format override. Disable rules match ActionBar (Copy → md only;
+// PNG → svg only; Print → html only; Open → html/svg only;
+// Download → all). Each export sends the composite reveal_projects
+// (inverse of the "Anon on export" checkbox).
+// ---------------------------------------------------------------------
+
+// jsdom doesn't implement URL.createObjectURL; tests that download / open
+// a blob must stub it. We capture the prior descriptor so the stub
+// doesn't leak between sibling test files in the same worker (the
+// pattern ActionBar.test.tsx documents in detail).
+const exportPropRefs: Array<[object, string, PropertyDescriptor | undefined]> = [];
+function exportStubProperty<T extends object>(obj: T, key: string, value: unknown): void {
+  exportPropRefs.push([obj, key, Object.getOwnPropertyDescriptor(obj, key)]);
+  Object.defineProperty(obj, key, { value, configurable: true });
+}
+
+function exportRestoreProperties(): void {
+  while (exportPropRefs.length > 0) {
+    const [obj, key, desc] = exportPropRefs.pop()!;
+    if (desc) Object.defineProperty(obj, key, desc);
+    else delete (obj as Record<string, unknown>)[key];
+  }
+}
+
+function exportComposeResp(body: string, contentType: string): Response {
+  return jsonResponse({
+    body,
+    content_type: contentType,
+    snapshot: {
+      kernel_version: 1,
+      composed_at: '2026-05-11T09:00:00Z',
+      section_results: [{
+        snapshot_id: '00',
+        drift_detected: false,
+        data_digest_at_add: 'sha256:abc',
+        data_digest_now: 'sha256:abc',
+      }],
+    },
+  });
+}
+
+function seedOneItemBasket(): void {
+  seedBasket([{
+    id: 'a', panel: 'weekly', template_id: 'weekly-recap',
+    options: defaultOpts(), added_at: '2026-05-11T09:00:00Z',
+    data_digest_at_add: 'sha256:abc', kernel_version: 1,
+    label_hint: 'Weekly recap',
+  }]);
+}
+
+describe('<ComposerModal> export actions (spec §8.8)', () => {
+  afterEach(() => {
+    exportRestoreProperties();
+  });
+
+  it('Copy is enabled only when format = md; click writes body to clipboard', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      exportComposeResp('# Composed report\n\nbody', 'text/markdown'),
+    );
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    exportStubProperty(navigator, 'clipboard', { writeText });
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+
+    // Default format is html → Copy disabled with explanatory tooltip.
+    const copy = screen.getByRole('button', { name: /^copy$/i });
+    expect(copy).toBeDisabled();
+    expect(copy.getAttribute('title')).toMatch(/markdown only/i);
+
+    // Switch format to md → Copy enabled, click triggers a fresh
+    // compose POST with format='md' and writes the body to clipboard.
+    fireEvent.change(screen.getByLabelText(/^format$/i), { target: { value: 'md' } });
+    await waitFor(() => expect(copy).not.toBeDisabled());
+
+    await act(async () => {
+      fireEvent.click(copy);
+    });
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('# Composed report\n\nbody'));
+
+    // The export call passed format='md' (independent of any preview format).
+    const lastCall = fetchSpy.mock.calls[fetchSpy.mock.calls.length - 1];
+    const bodyJson = JSON.parse((lastCall[1] as RequestInit).body as string);
+    expect(bodyJson.format).toBe('md');
+  });
+
+  it('Download triggers a Blob + anchor click and respects composite reveal_projects', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      exportComposeResp('<html><body>report</body></html>', 'text/html'),
+    );
+    const createObjectURL = vi.fn().mockReturnValue('blob:fake-url');
+    const revokeObjectURL = vi.fn();
+    exportStubProperty(URL, 'createObjectURL', createObjectURL);
+    exportStubProperty(URL, 'revokeObjectURL', revokeObjectURL);
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+
+    // Default "Anon on export" is checked → composite reveal=false.
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^download$/i }));
+    });
+    expect(createObjectURL).toHaveBeenCalled();
+    expect(clickSpy).toHaveBeenCalled();
+
+    // Composite reveal flows from !anonOnExport → false (checkbox on).
+    const downloadCall = fetchSpy.mock.calls[fetchSpy.mock.calls.length - 1];
+    const bodyJson = JSON.parse((downloadCall[1] as RequestInit).body as string);
+    expect(bodyJson.reveal_projects).toBe(false);
+  });
+
+  it('Open spawns window.open for HTML format with the composite recipe', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      exportComposeResp('<html>x</html>', 'text/html'),
+    );
+    const createObjectURL = vi.fn().mockReturnValue('blob:fake-url');
+    exportStubProperty(URL, 'createObjectURL', createObjectURL);
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^open$/i }));
+    });
+    expect(openSpy).toHaveBeenCalledWith('blob:fake-url', '_blank', 'noopener,noreferrer');
+  });
+
+  it('PNG is format-gated to SVG; Print is format-gated to HTML (spec §8.8)', () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      exportComposeResp('<html />', 'text/html'),
+    );
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+
+    // Default format is html.
+    const png = screen.getByRole('button', { name: /^png$/i });
+    expect(png).toBeDisabled();
+    expect(png.getAttribute('title')).toMatch(/svg format only/i);
+
+    const print = screen.getByRole('button', { name: /print/i });
+    // Print is enabled because default format is html.
+    expect(print).not.toBeDisabled();
+
+    // Switch to svg → PNG enabled, Print disabled with explanatory tooltip.
+    fireEvent.change(screen.getByLabelText(/^format$/i), { target: { value: 'svg' } });
+    expect(png).not.toBeDisabled();
+    expect(print).toBeDisabled();
+    expect(print.getAttribute('title')).toMatch(/html format only/i);
+  });
+
+  it('Export click forwards composite reveal_projects when anon-on-export is unchecked', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      exportComposeResp('<html />', 'text/html'),
+    );
+    const createObjectURL = vi.fn().mockReturnValue('blob:fake-url');
+    exportStubProperty(URL, 'createObjectURL', createObjectURL);
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+
+    // Uncheck "Anon on export" → composite reveal_projects flips to true.
+    fireEvent.click(screen.getByLabelText(/anon on export/i));
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^download$/i }));
+    });
+    const downloadCall = fetchSpy.mock.calls[fetchSpy.mock.calls.length - 1];
+    const bodyJson = JSON.parse((downloadCall[1] as RequestInit).body as string);
+    expect(bodyJson.reveal_projects).toBe(true);
+  });
+
+  it('Clear all still wipes the basket', () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      exportComposeResp('<html />', 'text/html'),
+    );
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+    expect(getState().basket.items).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+    expect(getState().basket.items).toHaveLength(0);
   });
 });

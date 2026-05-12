@@ -28,7 +28,47 @@ import { makeBasketItem } from '../store/basketSlice';
 import { bannerVisible } from './anonFormula';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useKeymap } from '../hooks/useKeymap';
+import { svgToPng } from './exporters/png';
+import { printPdf } from './exporters/printPdf';
 import type { ShareFormat, ShareTheme } from './types';
+
+// Composite filename — `cctally-report-<utcdate>.<ext>` (spec §8.8 mirrors
+// the single-share §6.5 rule but uses the panel-agnostic "report" slug
+// since the composed document spans multiple panels). UTC matches the
+// CLI filename convention.
+function composeFilename(format: ShareFormat): string {
+  const utc = new Date().toISOString().slice(0, 10).replaceAll('-', '');
+  const ext = format === 'md' ? 'md' : format;
+  return `cctally-report-${utc}.${ext}`;
+}
+
+function mimeFor(format: ShareFormat): string {
+  switch (format) {
+    case 'md':   return 'text/markdown;charset=utf-8';
+    case 'html': return 'text/html;charset=utf-8';
+    case 'svg':  return 'image/svg+xml;charset=utf-8';
+  }
+}
+
+// Mirrors ActionBar's palette-bg helper: PNG canvas needs an explicit
+// fill so dark-theme exports don't render on transparent (which some
+// viewers paint solid black). Keep the values byte-identical with
+// ActionBar so single + composite PNGs look the same.
+function paletteBg(theme: 'light' | 'dark'): string {
+  return theme === 'light' ? '#ffffff' : '#0f172a';
+}
+
+function triggerDownload(filename: string, blob: Blob): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
 
 const COMPOSE_DEBOUNCE_MS = 200;
 
@@ -80,6 +120,19 @@ export function ComposerModal() {
   const [composeErr, setComposeErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const acRef = useRef<AbortController | null>(null);
+  // Export actions (spec §8.8). Separate from the recompose `busy` flag
+  // so a running export doesn't suppress preview refresh, and a running
+  // recompose doesn't block a click on Download — but two exports
+  // cannot overlap (single chokepoint mirroring ActionBar).
+  type ExportKind = 'copy' | 'download' | 'open' | 'png' | 'print';
+  const [actionBusy, setActionBusy] = useState<ExportKind | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  // Clear stale action error on format/theme/anon flip so the prior
+  // "Copy failed: …" doesn't linger while the user explores a different
+  // export path (mirrors ActionBar's reset-on-format-change effect).
+  useEffect(() => {
+    setActionError(null);
+  }, [format, theme, anonOnExport, noBranding]);
 
   // Esc-to-close at overlay scope (spec §12.1). The composer can layer
   // ABOVE the share modal (the "Customize…" path opens the composer
@@ -221,6 +274,97 @@ export function ComposerModal() {
     }
   }
 
+  // Export handlers (spec §8.8 / §11.5 row 511). Each action does a
+  // fresh POST to /api/share/compose with the requested format — never
+  // reuses `composeResp.body` because:
+  //   (a) the preview is locked to the user-chosen format, but PNG
+  //       needs SVG and Print needs HTML;
+  //   (b) the spec is explicit: server re-renders every section from
+  //       recipe using the composite reveal_projects value.
+  // Disable rules match ActionBar exactly (Copy → md only; PNG → svg
+  // only; Print → html only; Open → html/svg only; Download → all).
+  // Spec §8.8: "PNG only when format = SVG; Print only when format =
+  // HTML; both greyed otherwise with explanatory tooltip."
+  const composeForExport = async (
+    fmt: ShareFormat,
+  ): Promise<{ body: string; content_type: string }> => {
+    const req = buildComposeRequest(basket.items, {
+      title,
+      theme,
+      format: fmt,
+      no_branding: noBranding,
+      reveal_projects: !anonOnExport,
+    });
+    const resp = await composeShare(req);
+    return { body: resp.body, content_type: resp.content_type };
+  };
+
+  const showToast = (text: string) =>
+    dispatch({ type: 'SHOW_STATUS_TOAST', text });
+
+  const runExport = async (
+    kind: ExportKind,
+    fn: () => Promise<void>,
+    failLabel: string,
+  ): Promise<void> => {
+    if (actionBusy != null) return;
+    setActionBusy(kind);
+    setActionError(null);
+    try {
+      await fn();
+    } catch (err: unknown) {
+      const msg = err instanceof ShareApiError
+        ? (err.message ?? `HTTP ${err.status}`)
+        : (err as Error).message;
+      setActionError(`${failLabel} failed: ${msg}`);
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const handleExportCopy = () => runExport('copy', async () => {
+    const { body } = await composeForExport('md');
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+      throw new Error('Clipboard API unavailable in this browser');
+    }
+    await navigator.clipboard.writeText(body);
+    showToast('Copied');
+  }, 'Copy');
+
+  const handleExportDownload = () => runExport('download', async () => {
+    const { body } = await composeForExport(format);
+    const blob = new Blob([body], { type: mimeFor(format) });
+    triggerDownload(composeFilename(format), blob);
+    showToast('Downloaded');
+  }, 'Download');
+
+  const handleExportOpen = () => runExport('open', async () => {
+    const { body } = await composeForExport(format);
+    const blob = new Blob([body], { type: mimeFor(format) });
+    const url = URL.createObjectURL(blob);
+    // The new window owns the blob URL for its lifetime; mirrors
+    // ActionBar's lifecycle.
+    window.open(url, '_blank', 'noopener,noreferrer');
+  }, 'Open');
+
+  const handleExportPng = () => runExport('png', async () => {
+    const { body } = await composeForExport('svg');
+    const png = await svgToPng(body, 2, paletteBg(theme));
+    triggerDownload(composeFilename('svg').replace(/\.svg$/, '.png'), png);
+    showToast('PNG downloaded');
+  }, 'PNG export');
+
+  const handleExportPrint = () => runExport('print', async () => {
+    const { body } = await composeForExport('html');
+    printPdf(body);
+  }, 'Print');
+
+  const canCopy = actionBusy == null && format === 'md' && basket.items.length > 0;
+  const canDownload = actionBusy == null && basket.items.length > 0;
+  const canOpen = actionBusy == null && (format === 'html' || format === 'svg') && basket.items.length > 0;
+  const canPng = actionBusy == null && format === 'svg' && basket.items.length > 0;
+  const canPrint = actionBusy == null && format === 'html' && basket.items.length > 0;
+
   // Real-name banner (spec §8.5 / §10.4). The compose endpoint
   // unconditionally overrides per-section reveal_projects with the
   // composite value, so the banner fires whenever the composite would
@@ -347,9 +491,84 @@ export function ComposerModal() {
       </div>
       {busy ? <div className="composer-busy">Composing&hellip;</div> : null}
       {composeErr ? <div className="composer-error" role="alert">{composeErr}</div> : null}
+      {actionError ? (
+        <div className="composer-error" role="alert">{actionError}</div>
+      ) : null}
       <footer className="composer-actions">
+        <div className="composer-export-row">
+          <button
+            type="button"
+            className="share-action share-action-copy"
+            onClick={handleExportCopy}
+            disabled={!canCopy}
+            title={
+              format !== 'md'
+                ? 'Copy is available for Markdown only'
+                : actionBusy === 'copy'
+                  ? 'Copying…'
+                  : 'Copy composed report to clipboard'
+            }
+          >
+            {actionBusy === 'copy' ? 'Copying…' : 'Copy'}
+          </button>
+          <button
+            type="button"
+            className="share-action share-action-download"
+            onClick={handleExportDownload}
+            disabled={!canDownload}
+            title={actionBusy === 'download' ? 'Downloading…' : 'Download composed report'}
+          >
+            {actionBusy === 'download' ? 'Downloading…' : 'Download'}
+          </button>
+          <button
+            type="button"
+            className="share-action share-action-open"
+            onClick={handleExportOpen}
+            disabled={!canOpen}
+            title={
+              !(format === 'html' || format === 'svg')
+                ? 'Open is available for HTML/SVG'
+                : actionBusy === 'open'
+                  ? 'Opening…'
+                  : 'Open composed report in new tab'
+            }
+          >
+            {actionBusy === 'open' ? 'Opening…' : 'Open'}
+          </button>
+          <button
+            type="button"
+            className="share-action share-action-png"
+            onClick={handleExportPng}
+            disabled={!canPng}
+            title={
+              format !== 'svg'
+                ? 'PNG export — available for SVG format only'
+                : actionBusy === 'png'
+                  ? 'Rasterizing…'
+                  : 'Download composed report as PNG'
+            }
+          >
+            {actionBusy === 'png' ? 'Rasterizing…' : 'PNG'}
+          </button>
+          <button
+            type="button"
+            className="share-action share-action-print"
+            onClick={handleExportPrint}
+            disabled={!canPrint}
+            title={
+              format !== 'html'
+                ? 'Print → PDF — available for HTML format only'
+                : actionBusy === 'print'
+                  ? 'Opening print dialog…'
+                  : 'Open the browser print dialog (save as PDF)'
+            }
+          >
+            {actionBusy === 'print' ? 'Printing…' : 'Print → PDF'}
+          </button>
+        </div>
         <button
           type="button"
+          className="composer-clear-all"
           onClick={() => dispatch({ type: 'BASKET_CLEAR' })}
         >
           Clear all
