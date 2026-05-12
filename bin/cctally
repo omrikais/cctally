@@ -29268,6 +29268,73 @@ def _share_apply_content_toggles(snap_built, options: dict):
     return _dc.replace(snap_built, **changes)
 
 
+# Cap on how many `(project, cost)` rows builders return for top_projects.
+# Templates take `top_n` from options (default 5, see _lib_share_templates)
+# and apply their own cap on top of this. The headroom matters because:
+#   (a) the scrubber walks ProjectCells once per row, so unbounded length
+#       balloons render-time anonymization cost;
+#   (b) the live preview iframe streams the full table chrome;
+#   (c) 20 covers any realistic `top_n` knob value (UI typically caps at 10).
+_SHARE_TOP_PROJECTS_BUILDER_CAP = 20
+
+
+def _share_top_projects_for_range(
+    range_start: "dt.datetime",
+    range_end: "dt.datetime",
+    *,
+    skip_sync: bool = True,
+) -> list[tuple[str, float]]:
+    """Aggregate session_entries in `[range_start, range_end]` by project_path.
+
+    Returns `[(project_path_or_'(unknown)', cost_usd), ...]` sorted desc by
+    cost and capped at `_SHARE_TOP_PROJECTS_BUILDER_CAP`. Templates apply
+    a further `top_n` cap (default 5).
+
+    Routes through `get_claude_session_entries` so we get `project_path`
+    in the join — same cache-first/lock-contention/direct-JSONL fallback
+    chain the rest of the share path relies on. `skip_sync=True` by
+    default: the sync thread has already done its tick at snapshot-build
+    time, and a per-request ingest would block the share render on
+    `cache.db.lock`.
+
+    Cost computation goes through `_calculate_entry_cost` — the
+    single-source-of-truth pricing path. Mirrors `_compute_block_totals`'
+    `by_project` bucketing exactly, so the reconcile invariant
+    `SUM(top_projects) ≈ panel.cost_usd` is preserved within ULP drift
+    when the panel's cost matches the same time range (e.g., current
+    week, current 5h block).
+
+    NULL `project_path` collapses to the `(unknown)` sentinel. Anon
+    happens later in `_scrub()`; builders always emit real names per
+    the kernel's privacy chokepoint contract.
+    """
+    bucket: dict[str, float] = {}
+    try:
+        entries = get_claude_session_entries(
+            range_start, range_end, skip_sync=skip_sync,
+        )
+    except Exception:
+        # `get_claude_session_entries` already has its own fallback chain,
+        # but if even that fails (e.g., HOME unset in a fixture run with
+        # no monkeypatch), don't break the whole share render — just emit
+        # an empty top_projects.
+        return []
+    for entry in entries:
+        usage = {
+            "input_tokens":                entry.input_tokens,
+            "output_tokens":               entry.output_tokens,
+            "cache_creation_input_tokens": entry.cache_creation_tokens,
+            "cache_read_input_tokens":     entry.cache_read_tokens,
+        }
+        cost = _calculate_entry_cost(
+            entry.model, usage, mode="auto", cost_usd=entry.cost_usd,
+        )
+        key = entry.project_path or "(unknown)"
+        bucket[key] = bucket.get(key, 0.0) + cost
+    ranked = sorted(bucket.items(), key=lambda kv: -kv[1])
+    return [(path, cost) for path, cost in ranked[:_SHARE_TOP_PROJECTS_BUILDER_CAP]]
+
+
 def _build_share_panel_data(panel: str, options: dict,
                             snap: "DataSnapshot | None") -> dict:
     """Dispatch to the per-panel builder; reuses the dashboard DataSnapshot.
@@ -29333,12 +29400,26 @@ def _build_weekly_share_panel_data(options: dict,
         used_pct_raw = getattr(r, "used_pct", None)
         used_pct = (float(used_pct_raw) / 100.0) if used_pct_raw is not None else 0.0
         dpp = float(getattr(r, "dollar_per_pct", 0.0) or 0.0)
+        # Per-week top_projects: WeeklyPeriodRow doesn't carry a
+        # per-project rollup, but `week_start_at` / `week_end_at` give us
+        # an exact range — aggregate session_entries once per week so the
+        # Recap template's `weeks[i].top_projects` table is meaningful.
+        # 8 queries per share render is the perf trade; cached.
+        week_end_at = getattr(r, "week_end_at", "") or ""
+        top_projects: list[tuple[str, float]] = []
+        try:
+            ws_dt = parse_iso_datetime(wsa, "week_start_at") if isinstance(wsa, str) and wsa else None
+            we_dt = parse_iso_datetime(week_end_at, "week_end_at") if isinstance(week_end_at, str) and week_end_at else None
+        except ValueError:
+            ws_dt = we_dt = None
+        if ws_dt is not None and we_dt is not None:
+            top_projects = _share_top_projects_for_range(ws_dt, we_dt)
         weeks.append({
             "start_date":     start_date,
             "cost_usd":       cost,
             "pct_used":       used_pct,
             "dollar_per_pct": dpp,
-            "top_projects":   [],  # per-project rollup not on WeeklyPeriodRow yet
+            "top_projects":   top_projects,
         })
     if not weeks:
         weeks = [_share_empty_week_stub()]
@@ -29395,13 +29476,21 @@ def _build_current_week_share_panel_data(options: dict,
                     "date":     d.isoformat(),
                     "cost_usd": float(getattr(r, "cost_usd", 0.0) or 0.0),
                 })
+    # Current-week top_projects: aggregate from `[week_start, now]`.
+    # `cw.week_end_at` is the reset instant; using `now` keeps the rollup
+    # symmetric with the panel's "spent this week" KPI (week-to-date).
+    top_projects: list[tuple[str, float]] = []
+    if isinstance(week_start, dt.datetime):
+        top_projects = _share_top_projects_for_range(
+            week_start, _share_now_utc(),
+        )
     return {
         "kpi_cost_usd":       float(getattr(cw, "spent_usd", 0.0) or 0.0),
         "kpi_pct_used":       used_pct,
         "kpi_dollar_per_pct": float(getattr(cw, "dollars_per_percent", 0.0) or 0.0),
         "kpi_days_remaining": days_remaining,
         "daily_progression":  progression,
-        "top_projects":       [],  # per-project rollup not on TuiCurrentWeek
+        "top_projects":       top_projects,
         "week_start_date":    week_start_date,
         "display_tz":         options.get("display_tz", "Etc/UTC"),
     }
@@ -29467,7 +29556,27 @@ def _build_daily_share_panel_data(options: dict,
             "pct_of_period": cost / total,
             "top_model":     top_model,
         })
-    return {"days": days, "top_projects": []}
+    # Daily top_projects: aggregate over the 7-day window. Derive the
+    # range from the dates rendered above so the rollup covers exactly
+    # what the panel shows (rather than re-deriving "7 days ago" from
+    # now and potentially clipping the oldest bucket).
+    top_projects: list[tuple[str, float]] = []
+    if days:
+        try:
+            range_start = dt.datetime.fromisoformat(
+                f"{days[0]['date']}T00:00:00+00:00"
+            )
+            # Include the last day in full — end-exclusive boundary at
+            # the start of the next UTC day.
+            last_date = dt.date.fromisoformat(days[-1]["date"])
+            range_end = dt.datetime(
+                last_date.year, last_date.month, last_date.day,
+                tzinfo=dt.timezone.utc,
+            ) + dt.timedelta(days=1)
+            top_projects = _share_top_projects_for_range(range_start, range_end)
+        except (ValueError, KeyError):
+            top_projects = []
+    return {"days": days, "top_projects": top_projects}
 
 
 def _build_monthly_share_panel_data(options: dict,
@@ -29493,7 +29602,27 @@ def _build_monthly_share_panel_data(options: dict,
             "pct_used":  0.0,
             "top_model": top_model,
         })
-    return {"months": months, "top_projects": []}
+    # Monthly top_projects: aggregate across the entire 12-month window.
+    # Range = [first day of oldest month, last day of newest month + 1].
+    top_projects: list[tuple[str, float]] = []
+    if months:
+        try:
+            oldest_year, oldest_month = months[0]["month"].split("-")
+            newest_year, newest_month = months[-1]["month"].split("-")
+            range_start = dt.datetime(
+                int(oldest_year), int(oldest_month), 1,
+                tzinfo=dt.timezone.utc,
+            )
+            # End-exclusive: first day of the month AFTER the newest one.
+            ny, nm = int(newest_year), int(newest_month) + 1
+            if nm == 13:
+                ny += 1
+                nm = 1
+            range_end = dt.datetime(ny, nm, 1, tzinfo=dt.timezone.utc)
+            top_projects = _share_top_projects_for_range(range_start, range_end)
+        except (ValueError, KeyError):
+            top_projects = []
+    return {"months": months, "top_projects": top_projects}
 
 
 def _build_forecast_share_panel_data(options: dict,
@@ -29600,10 +29729,36 @@ def _build_blocks_share_panel_data(options: dict,
             "start_at": _share_iso(getattr(r, "start_at", None)) or "",
             "cost_usd": float(getattr(r, "cost_usd", 0.0) or 0.0),
         })
+    # Blocks top_projects: aggregate across the window covered by
+    # `recent_blocks` (the oldest block's start through the most recent
+    # block's end — also the active block, if any). Mirrors what the
+    # panel actually shows the user.
+    top_projects: list[tuple[str, float]] = []
+    if recent:
+        try:
+            range_start = parse_iso_datetime(
+                recent[0]["start_at"], "blocks.recent_blocks[0].start_at",
+            )
+            # Pick the end of the latest block. `recent` is oldest→newest
+            # after the slice/reverse, so `recent[-1]` is the most recent.
+            # Each block is 5 hours long; if `current_block` has an
+            # explicit `end_at`, prefer that since it may be the active
+            # block whose end_at lives in the future.
+            if cb.get("end_at"):
+                range_end = parse_iso_datetime(
+                    cb["end_at"], "blocks.current_block.end_at",
+                )
+            else:
+                range_end = parse_iso_datetime(
+                    recent[-1]["start_at"], "blocks.recent_blocks[-1].start_at",
+                ) + dt.timedelta(hours=5)
+            top_projects = _share_top_projects_for_range(range_start, range_end)
+        except (ValueError, KeyError):
+            top_projects = []
     return {
         "current_block": cb,
         "recent_blocks": recent,
-        "top_projects":  [],
+        "top_projects":  top_projects,
     }
 
 
