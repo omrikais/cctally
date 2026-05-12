@@ -24,6 +24,7 @@ One page per subcommand. Pages follow a consistent shape:
 | --- | --- |
 | `cache-report` | [cache-report.md](cache-report.md) |
 | `cache-sync` | [cache-sync.md](cache-sync.md) |
+| `doctor` | [doctor.md](doctor.md) — read-only health report (install / hooks / OAuth / DB / freshness / safety) |
 | `range-cost` | [range-cost.md](range-cost.md) |
 
 ## Claude usage rollups
