@@ -39,6 +39,21 @@ installGlobalKeydown();
 // scope-priority sort. See `gotcha: project_global_hotkeys_modal_guard`.
 const _updateOpenGuard = () => !getState().update.modalOpen;
 
+// Doctor key (`d`) uses a composite guard per spec §6.4 (Codex M5):
+// - !openModal      — a panel modal isn't currently up.
+// - !update.modalOpen — the update modal (own root) isn't up.
+// - inputMode === null — search/filter input modes own the keyboard.
+// The bare _updateOpenGuard pattern would let `d` fire through a
+// panel modal or during text-input mode. The same triple guard the
+// share/composer/basket keys use (see share/keyboardShare.ts).
+const _doctorOpenGuard = (): boolean => {
+  const s = getState();
+  if (s.openModal !== null) return false;
+  if (s.update.modalOpen) return false;
+  if (s.inputMode !== null) return false;
+  return true;
+};
+
 registerKeymap([
   { key: '1', scope: 'global', when: _updateOpenGuard, action: () => openPanelByPosition(1) },
   { key: '2', scope: 'global', when: _updateOpenGuard, action: () => openPanelByPosition(2) },
@@ -53,6 +68,8 @@ registerKeymap([
   { key: 'q', scope: 'global', when: _updateOpenGuard, action: tryQuit },
   { key: 'n', scope: 'global', when: _updateOpenGuard, action: () => stepMatch(1) },
   { key: 'N', scope: 'global', when: _updateOpenGuard, action: () => stepMatch(-1) },
+  // Doctor modal — composite guard (see _doctorOpenGuard above).
+  { key: 'd', scope: 'global', when: _doctorOpenGuard, action: () => dispatch({ type: 'OPEN_DOCTOR_MODAL' }) },
   // Share v2 (spec §12.1). Opens the share modal for the focused panel.
   // Guards (composer/share/panel modals empty, no input mode, focus on a
   // share-capable panel, not mobile) live inside buildShareKeyBinding so

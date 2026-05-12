@@ -6,6 +6,7 @@ import { SettingsOverlay } from './components/SettingsOverlay';
 import { Toast } from './components/Toast';
 import { PanelHost } from './components/PanelHost';
 import { PanelGridDnd } from './components/PanelGridDnd';
+import { DoctorModal } from './components/DoctorModal';
 import { UpdateModal } from './components/UpdateModal';
 import { ModalRoot } from './modals/ModalRoot';
 import { ShareModalRoot } from './share/ShareModalRoot';
@@ -40,6 +41,12 @@ export function App() {
           nothing when state.shareModal === null. */}
       <ShareModalRoot />
       <UpdateModal />
+      {/* Doctor modal layer (spec §6.3) — mounted for the app's
+          lifetime; its own `doctorModalOpen` flag (NOT openModal)
+          gates the chrome so the composite `d` keymap guard in
+          main.tsx can read it alongside update.modalOpen + inputMode
+          per spec §6.4 (Codex M5). */}
+      <DoctorModal />
       <Toast />
     </>
   );
