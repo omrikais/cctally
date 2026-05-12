@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.3] - 2026-05-12
+
 ### Fixed
 - npm tarball for v1.6.2 was built by the public-repo GHA workflow from a pre-fix tree (the workflow fired on a tag push that briefly pointed at the wrong commit before the cut was redone). The published v1.6.2 npm package therefore lacks `bin/_lib_share_templates.py` even though the GH release page, brew formula, and public repo all carry the correct fixed commit. v1.6.3 republishes the same v1.6.2 content under a fresh version so `cctally update` and fresh `npm install -g cctally` resolve to a working build. npm `cctally@1.6.2` will be deprecated post-publish; brew users on v1.6.2 are unaffected (brew builds from the GH archive which points at the corrected commit).
 
