@@ -2726,6 +2726,38 @@ mark.current {
 }
 
 /* =========================================================================
+   Reduced motion — share-v2 surfaces (spec §12.6 + plan M4.4).
+
+   Defensive gate covering every share/composer overlay surface so any
+   future `animation:` / `transition:` rule attached to these classes
+   automatically respects the user's OS-level prefers-reduced-motion
+   preference. Today these surfaces have no animations (the basket-chip
+   pulse and the mobile panel-modal sheet-up are gated individually
+   near their keyframes), but adding one without a sibling reduced-
+   motion gate would silently break the contract — putting the gate
+   here means future edits inherit the right behavior.
+
+   The dnd-kit drag-overlay smoothing on composer rows is JS-side
+   (`useSortable()` returns an inline `transition` value). It is gated
+   in <ComposerSectionList> via the useReducedMotion() hook, mirroring
+   <PanelHost>'s pattern — that path can't be reached via CSS because
+   inline styles outrank @media rules without `!important`, and
+   `!important` on a property the library re-sets every render is a
+   losing battle.
+   ========================================================================= */
+@media (prefers-reduced-motion: reduce) {
+  .share-overlay,
+  .share-modal,
+  .composer-modal,
+  .share-manage-modal,
+  .share-presets-menu,
+  .share-savepreset-popover {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* =========================================================================
    Mobile (max-width: 640px) — phone-class viewports.
    Single shared breakpoint with src/lib/breakpoints.ts (MOBILE_BREAKPOINT_PX).
    All rules here are additive: layered on top of the existing 1100px tablet

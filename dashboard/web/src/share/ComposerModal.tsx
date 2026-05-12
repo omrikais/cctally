@@ -40,6 +40,12 @@ const COMPOSE_DEBOUNCE_MS = 200;
 function selectComposerModal() { return getState().composerModal; }
 function selectBasket() { return getState().basket; }
 
+// Stable id for aria-labelledby — spec §12.4 requires the modal's
+// dialog role be named by a referenced element, not by inline
+// aria-label, so screen-reader output matches the visible header
+// (and so headers added later automatically participate).
+const COMPOSER_MODAL_TITLE_ID = 'composer-modal-title';
+
 export function ComposerModal() {
   const composerModal = useSyncExternalStore(subscribeStore, selectComposerModal);
   const basket = useSyncExternalStore(subscribeStore, selectBasket);
@@ -48,6 +54,20 @@ export function ComposerModal() {
   // applied to both the empty-state and the populated path so the
   // stylesheet rules can target either.
   const isMobile = useIsMobile();
+  // Focus restoration (spec §12.8 + M4.4): capture the element that
+  // had focus when the composer opened (BasketChip click, B keymap, or
+  // a future "Customize…" button) and restore focus to it on close.
+  // The capture happens the first time `composerModal.open` flips to
+  // true; the restore happens when it flips back to null (the slot is
+  // wiped by `closeComposer()`). If the captured element has been
+  // detached from the DOM by the time we close (panel re-render while
+  // the composer was open), fall back to `document.body.focus()` —
+  // without the fallback, focus would silently stay on whatever
+  // internal control happened to be focused inside the composer, which
+  // then itself unmounts → activeElement becomes implicit and screen
+  // readers lose the cursor.
+  const triggerElementRef = useRef<HTMLElement | null>(null);
+  const wasOpenRef = useRef(false);
   const [title, setTitle] = useState('');
   const [theme, setTheme] = useState<ShareTheme>('light');
   const [format, setFormat] = useState<ShareFormat>('html');
@@ -91,6 +111,38 @@ export function ComposerModal() {
       setTitle(`cctally report — ${utc}`);
     }
   }, [composerModal?.open, title]);
+
+  // Focus capture + restore (spec §12.8). Mirrors <ShareModalRoot>'s
+  // pattern; kept local rather than threading a triggerId through the
+  // openComposer() action because (a) `B` keymap fires from no
+  // particular element, (b) BasketChip is the most common opener and
+  // is always the active element when clicked, (c) future "Customize…"
+  // affordances inside the share modal can rely on the same capture
+  // path with no new slice plumbing.
+  useEffect(() => {
+    if (composerModal?.open) {
+      if (!wasOpenRef.current) {
+        wasOpenRef.current = true;
+        triggerElementRef.current =
+          document.activeElement as HTMLElement | null;
+      }
+    } else if (wasOpenRef.current) {
+      wasOpenRef.current = false;
+      const el = triggerElementRef.current;
+      triggerElementRef.current = null;
+      if (el && typeof el.focus === 'function' && document.contains(el)) {
+        el.focus();
+      } else {
+        // Detached opener: blur whatever is currently focused so the
+        // screen reader doesn't keep announcing the composer's
+        // about-to-unmount internal control. Project precedent at
+        // <ShareModalRoot>.
+        const active = document.activeElement as HTMLElement | null;
+        if (active && typeof active.blur === 'function') active.blur();
+        document.body.focus();
+      }
+    }
+  }, [composerModal?.open]);
 
   // Debounced recompose. Triggers: mount, reorder, knob change,
   // per-section refresh (which mutates basket.items via remove+add).
@@ -194,10 +246,11 @@ export function ComposerModal() {
       <div
         className={`composer-modal composer-modal-empty${isMobile ? ' composer-modal-mobile' : ''}`}
         role="dialog"
-        aria-label="Compose report"
+        aria-modal="true"
+        aria-labelledby={COMPOSER_MODAL_TITLE_ID}
       >
         <header className="composer-modal-header">
-          <h2>Compose report</h2>
+          <h2 id={COMPOSER_MODAL_TITLE_ID}>Compose report</h2>
           <button
             type="button"
             className="composer-modal-close"
@@ -218,10 +271,11 @@ export function ComposerModal() {
     <div
       className={`composer-modal${isMobile ? ' composer-modal-mobile' : ''}`}
       role="dialog"
-      aria-label="Compose report"
+      aria-modal="true"
+      aria-labelledby={COMPOSER_MODAL_TITLE_ID}
     >
       <header className="composer-modal-header">
-        <h2>Compose report</h2>
+        <h2 id={COMPOSER_MODAL_TITLE_ID}>Compose report</h2>
         <button
           type="button"
           className="composer-modal-close"

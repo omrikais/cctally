@@ -12,7 +12,7 @@
 // (see ShareModal.tsx) so this modal's Esc binding fires first. Focus
 // restoration to the dropdown trigger is part of the M4.4 focus-restore
 // audit, not implemented here.
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   listPresets, deletePreset, savePreset, type PresetRecord, ShareApiError,
 } from './presetsApi';
@@ -25,6 +25,11 @@ interface Props {
   open: boolean;
   onClose: () => void;
 }
+
+// Stable id for aria-labelledby — spec §12.4 names the dialog via the
+// visible header element rather than an inline aria-label so screen
+// readers read what's actually painted.
+const MANAGE_PRESETS_TITLE_ID = 'share-manage-presets-title';
 
 interface Row {
   panel: SharePanelId;
@@ -44,6 +49,40 @@ export function ManagePresetsModal({ open, onClose }: Props) {
     [open, onClose],
   );
   useKeymap(bindings);
+
+  // Focus restoration (spec §12.8 + M4.4). Capture the active element
+  // the moment `open` transitions to true; restore it when `open`
+  // flips back to false. Mirrors <ShareModalRoot> and <ComposerModal>.
+  // We capture on the `open` true → keep the ref while open. The
+  // restore is invoked on the false transition, NOT on unmount, because
+  // the parent <ShareModal> keeps <ManagePresetsModal> rendered with
+  // `open=false` rather than unmounting — so a cleanup-only restore
+  // would never fire.
+  const triggerElementRef = useRef<HTMLElement | null>(null);
+  const wasOpenRef = useRef(false);
+  useEffect(() => {
+    if (open) {
+      if (!wasOpenRef.current) {
+        wasOpenRef.current = true;
+        triggerElementRef.current =
+          document.activeElement as HTMLElement | null;
+      }
+    } else if (wasOpenRef.current) {
+      wasOpenRef.current = false;
+      const el = triggerElementRef.current;
+      triggerElementRef.current = null;
+      if (el && typeof el.focus === 'function' && document.contains(el)) {
+        el.focus();
+      } else {
+        // Detached opener (rare — the share modal stays open above us
+        // while we're mounted). Blur the currently-focused element so
+        // it doesn't outlive the closed manage modal.
+        const active = document.activeElement as HTMLElement | null;
+        if (active && typeof active.blur === 'function') active.blur();
+        document.body.focus();
+      }
+    }
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -131,11 +170,11 @@ export function ManagePresetsModal({ open, onClose }: Props) {
       className="share-manage-modal"
       role="dialog"
       aria-modal="true"
-      aria-label="Manage presets"
+      aria-labelledby={MANAGE_PRESETS_TITLE_ID}
       onClick={(e) => e.stopPropagation()}
     >
       <div className="share-manage-header">
-        <h2>Manage presets</h2>
+        <h2 id={MANAGE_PRESETS_TITLE_ID}>Manage presets</h2>
         <button
           type="button"
           onClick={onClose}

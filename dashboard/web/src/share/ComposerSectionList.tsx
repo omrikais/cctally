@@ -28,6 +28,7 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import { useState } from 'react';
 import { dispatch } from '../store/store';
+import { useReducedMotion } from '../hooks/useReducedMotion';
 import type { BasketItem } from '../store/basketSlice';
 import type { ComposeSectionResult } from './composerApi';
 
@@ -91,9 +92,15 @@ function Row({
   const {
     attributes, listeners, setNodeRef, transform, transition, isDragging,
   } = useSortable({ id: item.id });
+  // dnd-kit returns an inline `transition` value for the drag-overlay
+  // smoothing — the rule sits in inline style, so CSS @media reduced-
+  // motion can't override it without `!important` (which the library
+  // would clobber on next render). Gate JS-side, mirroring
+  // <PanelHost>'s pattern. Spec §12.6 + M4.4.
+  const reducedMotion = useReducedMotion();
   const style = {
     transform: CSS.Transform.toString(transform),
-    transition,
+    transition: reducedMotion ? undefined : transition,
     opacity: isDragging ? 0.4 : 1,
   };
   const [kebabOpen, setKebabOpen] = useState(false);

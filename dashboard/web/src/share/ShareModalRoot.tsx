@@ -49,12 +49,28 @@ export function ShareModalRoot() {
     } else if (wasOpenRef.current) {
       // Just closed. Restore focus to the captured trigger, then clear
       // the ref. Guard the call — the element may have unmounted (e.g.
-      // panel order changed while the modal was open).
+      // panel order changed while the modal was open). When the
+      // captured element is no longer in the DOM, fall back to
+      // `document.body.focus()` so the screen-reader cursor doesn't
+      // stay parked on whatever internal share-modal control had focus
+      // last (which is about to unmount). Project precedent + spec
+      // §12.8 + M4.4.
       wasOpenRef.current = false;
       const el = triggerElementRef.current;
       triggerElementRef.current = null;
       if (el && typeof el.focus === 'function' && document.contains(el)) {
         el.focus();
+      } else {
+        // Detached opener. Blur whatever is currently focused so the
+        // screen-reader cursor doesn't stay parked on an
+        // about-to-unmount internal control; then try
+        // `document.body.focus()` (body needs `tabindex` to be the
+        // real activeElement target on some browsers, but the blur
+        // alone is enough — activeElement falls back to body). Both
+        // calls are no-ops when the conditions don't apply.
+        const active = document.activeElement as HTMLElement | null;
+        if (active && typeof active.blur === 'function') active.blur();
+        document.body.focus();
       }
     }
   }, [slot]);
