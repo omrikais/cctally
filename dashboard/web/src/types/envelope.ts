@@ -44,6 +44,20 @@ export interface Envelope {
   // a Python without this mirror (older snapshot path or test fixtures
   // built before the field landed) doesn't break the type contract.
   update?: UpdateEnvelope;
+  // Doctor aggregate (spec §6). Aggregate-only — full per-check report
+  // is fetched lazily via GET /api/doctor by useDoctorReport. Optional
+  // so a Python without the mirror keeps the type contract intact.
+  // `_error` is present iff the server-side gather raised (Python
+  // emits a synthetic-FAIL aggregate so the chip still surfaces).
+  doctor?: DoctorEnvelope;
+}
+
+export interface DoctorEnvelope {
+  severity: 'ok' | 'warn' | 'fail';
+  counts: { ok: number; warn: number; fail: number };
+  generated_at: string;
+  fingerprint: string;
+  _error?: string;
 }
 
 export interface UpdateEnvelope {

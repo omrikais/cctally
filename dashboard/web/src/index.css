@@ -134,6 +134,108 @@ body { padding: 16px; box-sizing: border-box; }
 .badge-update-arrow { display: inline-block; }
 .badge-update-version { display: inline-block; }
 
+/* -------- Doctor chip (spec §6.1) --------------------------------- */
+/* Sibling of .badge-update. The pill is colorless by default
+   (transparent bg + currentColor border) and picks up the severity
+   color via the .doctor-chip--<sev> modifier — matches the existing
+   accent-green/amber/red token surface so the chip blends with the
+   topbar's existing palette. */
+.doctor-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 9px; border-radius: 12px;
+  background: transparent;
+  border: 1px solid currentColor;
+  cursor: pointer;
+  font: inherit; font-size: 12px; font-weight: 600;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+}
+.doctor-chip:hover {
+  /* Subtle hover bump — the chip is a button, not a stat. */
+  background: rgba(255, 255, 255, 0.04);
+}
+.doctor-chip:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+.doctor-chip__dot { font-size: 10px; line-height: 1; }
+.doctor-chip__label { display: inline-block; }
+.doctor-chip--ok   { color: var(--accent-green); }
+.doctor-chip--warn { color: var(--accent-amber); }
+.doctor-chip--fail { color: var(--accent-red); }
+
+/* -------- Doctor modal (spec §6.3) -------------------------------- */
+/* Reuses .modal-backdrop / .modal-card / .modal-header / .modal-body
+   shell. Per-category accordion sections + per-check rows are scoped
+   under .doctor-modal-card so they don't bleed into other modals. */
+.doctor-modal-card { width: min(720px, 92vw); }
+.doctor-modal__summary {
+  margin: 0 0 12px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+.doctor-modal__error {
+  margin: 0 0 12px;
+  color: var(--accent-red);
+}
+.doctor-modal__category {
+  margin: 8px 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.doctor-modal__category--warn { border-color: rgba(251, 191, 36, 0.5); }
+.doctor-modal__category--fail { border-color: rgba(248, 113, 113, 0.5); }
+.doctor-modal__category-header {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.02);
+  border: none; cursor: pointer;
+  color: inherit; font: inherit; font-weight: 600; text-align: left;
+}
+.doctor-modal__category-header:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.doctor-modal__category--ok   .doctor-modal__glyph { color: var(--accent-green); }
+.doctor-modal__category--warn .doctor-modal__glyph { color: var(--accent-amber); }
+.doctor-modal__category--fail .doctor-modal__glyph { color: var(--accent-red); }
+.doctor-modal__check {
+  padding: 8px 14px;
+  border-top: 1px solid var(--border-soft);
+}
+.doctor-modal__check p { margin: 0 0 4px; }
+.doctor-modal__check--ok   .doctor-modal__glyph { color: var(--accent-green); }
+.doctor-modal__check--warn .doctor-modal__glyph { color: var(--accent-amber); }
+.doctor-modal__check--fail .doctor-modal__glyph { color: var(--accent-red); }
+.doctor-modal__remediation {
+  color: var(--text-dim);
+  font-style: italic;
+}
+.doctor-modal__details-toggle {
+  background: none; border: none; padding: 0;
+  color: var(--accent-cyan); cursor: pointer;
+  font: inherit; font-size: 12px;
+}
+.doctor-modal__details {
+  margin: 6px 0 0;
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 4px;
+  font-size: 12px;
+  overflow: auto;
+  max-height: 200px;
+}
+.doctor-modal__header-actions {
+  display: flex; align-items: center; gap: 8px;
+}
+.doctor-modal__refresh {
+  background: none; border: 1px solid var(--border-soft);
+  padding: 4px 10px; border-radius: 4px;
+  color: inherit; font: inherit; cursor: pointer;
+}
+.doctor-modal__refresh:hover { background: rgba(255, 255, 255, 0.04); }
+.doctor-modal__refresh[disabled] { opacity: 0.5; cursor: wait; }
+
 /* -------- Update modal: shared chrome + per-state primitives -------- */
 /* The update modal lives in its own root so the running state can
    persist across an /api/events SSE drop and the post-execvp restart.

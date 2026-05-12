@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react';
 import { BasketChip } from './BasketChip';
+import { DoctorChip } from './DoctorChip';
 import { SyncChip } from './SyncChip';
 import { UpdateBadge } from './UpdateBadge';
 import { useSnapshot } from '../hooks/useSnapshot';
@@ -72,6 +73,12 @@ export function Header() {
         <span className="mute">vs last week</span>
       </div>
       <div className="topbar-actions">
+        {/* Doctor aggregate chip (spec §6.1). Renders nothing until
+            the first SSE tick carrying snap.doctor lands. Click +
+            `d` keymap both open the DoctorModal. Placed before the
+            basket chip so it sits adjacent to the brand/version
+            block when both are present. */}
+        <DoctorChip />
         {/* Share-report basket chip (spec §7.5). DOM-removed when
             count = 0 — placed first in topbar-actions so it groups
             with the action icon trio when present. */}

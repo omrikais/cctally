@@ -128,6 +128,29 @@ function defaultUpdateSlice(): UpdateSlice {
   };
 }
 
+// ---------- Doctor subcommand (spec §6 — dashboard chip + modal) -----
+//
+// `DoctorAggregate` mirrors the SSE envelope's `doctor` block. The
+// Python emits this slim payload on every tick (~120 bytes); the full
+// per-check report is fetched lazily via `GET /api/doctor` (see
+// `useDoctorReport` in hooks/). `fingerprint` is the identity-slice
+// hash from the kernel (`_lib_doctor.fingerprint`), so two ticks with
+// the same severity/counts/check-ids collapse to one fetch even when
+// the rendered summaries (and ages baked into `details`) tick over.
+// `_error` is present iff the gather raised inside the snapshot
+// pipeline — the Python emits a synthetic-FAIL aggregate with
+// counts={ok:0,warn:0,fail:1} in that case so the chip still surfaces
+// the failure rather than silently disappearing.
+export interface DoctorAggregate {
+  severity: 'ok' | 'warn' | 'fail';
+  counts: { ok: number; warn: number; fail: number };
+  generated_at: string;
+  fingerprint: string;
+  // Present iff the server-side gather raised. The chip surfaces the
+  // synthetic-FAIL aggregate identically; this field is informational.
+  _error?: string;
+}
+
 // The `available` cooking predicate + semver comparison live in
 // `store/update.ts` so the action helpers (refreshState, skip, remind)
 // share one source of truth. Tests import from update.ts directly.
@@ -277,6 +300,16 @@ export interface UIState {
   // master dispatch wrapper below. State shape + pure reducer live in
   // basketSlice.ts.
   basket: BasketSlice;
+  // Doctor subcommand (spec §6). Aggregate-only block written by the
+  // SSE ingest each tick (full per-check report fetched lazily via GET
+  // /api/doctor by the DoctorModal). `null` until the first envelope
+  // arrives, then a `DoctorAggregate`. `doctorModalOpen` is part of
+  // the store (NOT `openModal`) so the `d` keymap's composite guard
+  // can read it alongside `update.modalOpen` + `inputMode` per spec
+  // §6.4 (Codex M5), and so the doctor modal can layer above panel
+  // modals if a future iteration wants that pattern.
+  doctor: DoctorAggregate | null;
+  doctorModalOpen: boolean;
 }
 
 function defaultPrefs(): Prefs {
@@ -356,6 +389,8 @@ function loadInitial(): UIState {
     update: defaultUpdateSlice(),
     ...initialShareState,
     basket: { items: loadBasketFromStorage(), rejectedReason: null },
+    doctor: null,
+    doctorModalOpen: false,
   };
 }
 
@@ -510,7 +545,17 @@ export type Action =
   // forwarded to basketReducer (basketSlice.ts); the master dispatch
   // case persists every mutation to localStorage and surfaces the
   // capacity-rejection toast.
-  | BasketAction;
+  | BasketAction
+  // Doctor subcommand (spec §6).
+  // SET_DOCTOR_AGGREGATE writes the SSE-mirrored aggregate slice (the
+  //   ingest in sse.ts dispatches this each tick when snap.doctor is
+  //   present). Missing field → no dispatch (slice stays as last
+  //   known good, mirroring the UPDATE slice's tolerance).
+  // OPEN_DOCTOR_MODAL / CLOSE_DOCTOR_MODAL mirror the UPDATE_MODAL
+  //   precedent — flag-only, no reset of any other slice.
+  | { type: 'SET_DOCTOR_AGGREGATE'; doctor: DoctorAggregate | null }
+  | { type: 'OPEN_DOCTOR_MODAL' }
+  | { type: 'CLOSE_DOCTOR_MODAL' };
 
 export function dispatch(action: Action): void {
   switch (action.type) {
@@ -895,6 +940,19 @@ export function dispatch(action: Action): void {
       }
       break;
     }
+    // Doctor subcommand (spec §6). The aggregate slice is replaced
+    // wholesale every tick; OPEN/CLOSE flip a boolean modal flag that
+    // the composite `d` keymap guard in main.tsx reads alongside
+    // openModal + update.modalOpen + inputMode per spec §6.4.
+    case 'SET_DOCTOR_AGGREGATE':
+      state = { ...state, doctor: action.doctor };
+      break;
+    case 'OPEN_DOCTOR_MODAL':
+      state = { ...state, doctorModalOpen: true };
+      break;
+    case 'CLOSE_DOCTOR_MODAL':
+      state = { ...state, doctorModalOpen: false };
+      break;
   }
   emit();
 }

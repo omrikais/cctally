@@ -60,6 +60,7 @@ export function startSSE(cb: SSECallbacks = {}): void {
       if (updateSnapshot(snap)) {
         ingestAlerts(snap);
         ingestUpdate(snap);
+        ingestDoctor(snap);
       }
       cb.onConnect?.();
     } catch (err) {
@@ -74,6 +75,7 @@ export function startSSE(cb: SSECallbacks = {}): void {
       if (updateSnapshot(snap)) {
         ingestAlerts(snap);
         ingestUpdate(snap);
+        ingestDoctor(snap);
       }
       if (disconnected) {
         disconnected = false;
@@ -136,6 +138,22 @@ function ingestUpdate(snap: Envelope): void {
   const suppress = coerceUpdateSuppress(snap.update.suppress);
   const state = coerceUpdateState(snap.update.state, suppress);
   dispatch({ type: 'SET_UPDATE_STATE', state, suppress });
+}
+
+// Mirror of the envelope's `doctor` block (spec §6). Pre-mirror Python
+// builds omit the field entirely; in that case the slice stays at its
+// previous value (the chip just doesn't repaint until a backend with
+// the field arrives — same posture as ingestUpdate). The Python
+// emits a synthetic-FAIL aggregate with `_error` when the gather
+// raised, so absent-field and gather-failure are distinct cases:
+// absent = no dispatch, failure = dispatch a payload whose severity
+// is "fail".
+function ingestDoctor(snap: Envelope): void {
+  if (!snap.doctor) return;
+  // Trust the server's shape — coerceDoctor would be overkill since
+  // the field is small and Python writes it via a typed dict. Cast
+  // straight through the import type.
+  dispatch({ type: 'SET_DOCTOR_AGGREGATE', doctor: snap.doctor });
 }
 
 export function closeSSE(): void {
