@@ -34,6 +34,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `bin/cctally-share-v2-test` runs a Vitest-based GUI smoke
+      # (`dashboard/web/src/share/ShareManualSmoke.test.tsx`) via
+      # `npm test` from `dashboard/web/`, which needs the workspace's
+      # `node_modules/.bin/vitest` on disk. Without these two steps the
+      # smoke fails with `sh: vitest: command not found` on a fresh
+      # runner checkout (the share-v2 harness counts that as a hard
+      # failure). Mirrors the setup-node + `npm ci` pair the
+      # `dashboard-build-stability` job already uses.
+      - name: Setup Node (per .nvmrc)
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: dashboard/web/.nvmrc
+          cache: npm
+          cache-dependency-path: dashboard/web/package-lock.json
+
+      - name: Install dashboard deps (vitest for share-v2 smoke)
+        working-directory: dashboard/web
+        run: npm ci
+
       - name: Run cctally test suite
         env:
           # Pin Python to brew's 3.13 by prepending its libexec/bin (where

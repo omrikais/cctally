@@ -494,7 +494,7 @@ describe('share-v2 manual smoke harness', () => {
     await openWeeklyShareModal();
 
     fireEvent.click(screen.getByLabelText('Dark'));
-    fireEvent.change(screen.getByLabelText(/top-n rows/i), { target: { value: '10' } });
+    fireEvent.change(screen.getByLabelText(/^top-n$/i), { target: { value: '10' } });
     await clickExport(/^copy$/i);
     await waitFor(() => expect(server.history).toHaveLength(1));
 
@@ -527,13 +527,13 @@ describe('share-v2 manual smoke harness', () => {
 
     fireEvent.click(preset);
     expect(screen.getByLabelText('Dark')).toBeChecked();
-    expect(screen.getByLabelText(/top-n rows/i)).toHaveValue(10);
+    expect(screen.getByLabelText(/^top-n$/i)).toHaveValue(10);
 
     fireEvent.click(screen.getByRole('button', { name: /presets/i }));
     const recent = await screen.findByRole('menuitem', { name: /weekly-recap/i });
     fireEvent.click(recent);
     expect(screen.getByLabelText('Dark')).toBeChecked();
-    expect(screen.getByLabelText(/top-n rows/i)).toHaveValue(10);
+    expect(screen.getByLabelText(/^top-n$/i)).toHaveValue(10);
 
     await act(async () => {
       dispatch(closeShareModal());

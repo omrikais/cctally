@@ -48,7 +48,7 @@ describe('<Knobs>', () => {
   it('Top-N number input updates top_n', () => {
     const onChange = vi.fn();
     render(<Knobs options={defaults()} onChange={onChange} />);
-    fireEvent.change(screen.getByLabelText(/top-n rows/i), {
+    fireEvent.change(screen.getByLabelText(/^top-n$/i), {
       target: { value: '12' },
     });
     const next = onChange.mock.calls[0][0] as ShareOptions;
@@ -58,7 +58,7 @@ describe('<Knobs>', () => {
   it('clamps Top-N to a minimum of 1 (client-side validation)', () => {
     const onChange = vi.fn();
     render(<Knobs options={defaults()} onChange={onChange} />);
-    fireEvent.change(screen.getByLabelText(/top-n rows/i), {
+    fireEvent.change(screen.getByLabelText(/^top-n$/i), {
       target: { value: '0' },
     });
     const next = onChange.mock.calls[0][0] as ShareOptions;

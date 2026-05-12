@@ -171,6 +171,105 @@ _PROJECT_COLUMNS = (
 )
 
 
+# --- Cross-tab Detail-template helpers (issue #33, spec §6.1) ---
+_CROSS_TAB_OTHER_KEY = "_other"
+
+
+def _aggregate_breakdowns(
+    breakdowns: list[dict[str, float]],
+) -> list[tuple[str, float]]:
+    """Aggregate per-row breakdowns into window-wide totals.
+
+    Returns (label, total) sorted by total desc, ties broken lex
+    ascending. Deterministic for goldens.
+    """
+    totals: dict[str, float] = {}
+    for br in breakdowns:
+        for k, v in br.items():
+            totals[k] = totals.get(k, 0.0) + float(v or 0.0)
+    return sorted(totals.items(), key=lambda p: (-p[1], p[0]))
+
+
+def _cross_tab_columns(
+    row_label_col: "_LS.ColumnSpec",
+    members: list[tuple[str, float]],
+    top_n: int,
+    has_other_residual: bool,
+    *,
+    kind: str,                  # "project" | "model"
+) -> tuple[tuple, tuple[str, ...], bool]:
+    """Build (columns, top_k_labels, has_other) for a cross-tab table.
+
+    Column keys are stable synthetic identifiers (m_0..m_K, _other) so
+    project paths with awkward characters or post-scrub labels never
+    affect renderer `row.cells.get(col.key)` lookups.
+
+    `has_other` is True iff either:
+      - len(members) > top_n (overflow case), OR
+      - has_other_residual is True (partial-coverage case).
+
+    Caller computes `has_other_residual` via `_detect_residual` over the
+    provisional top-K labels. Spec §4.2.
+    """
+    top = members[:top_n]
+    has_other_cap = len(members) > top_n
+    has_other = has_other_cap or has_other_residual
+    cols: list = [
+        row_label_col,
+        _LS.ColumnSpec(key="total", label="$", align="right", emphasis=True),
+    ]
+    for i, (lbl, _total) in enumerate(top):
+        cols.append(_LS.ColumnSpec(
+            key=f"m_{i}", label=lbl, align="right", kind=kind,
+        ))
+    if has_other:
+        # kind=None: "Other" rollup is never a project name; scrubber skips.
+        cols.append(_LS.ColumnSpec(
+            key=_CROSS_TAB_OTHER_KEY, label="Other", align="right",
+        ))
+    return tuple(cols), tuple(t[0] for t in top), has_other
+
+
+def _cross_tab_row(
+    *,
+    row_label_key: str,
+    row_label_cell,
+    row_total: float,
+    breakdown: dict[str, float],
+    top_k_labels: tuple[str, ...],
+    has_other: bool,
+):
+    """One cross-tab row. Other = clamp(row_total - SUM(top_k cells), 0)."""
+    cells: dict = {
+        row_label_key: row_label_cell,
+        "total": _LS.MoneyCell(usd=row_total),
+    }
+    other_sum = row_total
+    for i, lbl in enumerate(top_k_labels):
+        v = float(breakdown.get(lbl, 0.0))
+        cells[f"m_{i}"] = _LS.MoneyCell(usd=v)
+        other_sum -= v
+    if has_other:
+        cells[_CROSS_TAB_OTHER_KEY] = _LS.MoneyCell(usd=max(0.0, other_sum))
+    return _LS.Row(cells=cells)
+
+
+def _detect_residual(
+    rows_and_breakdowns: list[tuple[float, dict[str, float]]],
+    top_k_labels: tuple[str, ...],
+    *,
+    epsilon: float = 1e-9,
+) -> bool:
+    """Return True iff any row's residual (row_total - SUM(top-K cells))
+    exceeds epsilon. Drives `has_other_residual` in `_cross_tab_columns`.
+    """
+    for row_total, breakdown in rows_and_breakdowns:
+        top_k_sum = sum(float(breakdown.get(lbl, 0.0)) for lbl in top_k_labels)
+        if abs(row_total - top_k_sum) > epsilon:
+            return True
+    return False
+
+
 def _utc_now() -> _dt.datetime:
     """Override-aware UTC now (per `CCTALLY_AS_OF` env hook for fixture tests)."""
     s = os.environ.get("CCTALLY_AS_OF")
@@ -727,29 +826,51 @@ def _build_weekly_visual(*, panel_data, options):
 
 
 def _build_weekly_detail(*, panel_data, options):
-    """Weekly detail — full per-week × per-project table (spec §9.5).
+    """Weekly detail — per-week × per-model cross-tab (spec §9.5).
 
-    Same panel_data shape as `_build_weekly_recap`; Detail uses
-    `top_n=50` (or higher) and includes all projects as table rows alongside
-    the chart.
-
-    NOTE: ships as per-project table; spec §9.5 calls for per-week × per-model
-    cross-tab — deferred until `_build_weekly_share_panel_data` carries the
-    cross-tab series (see issue #33).
+    `panel_data["weeks"][i].models: dict[model_name, cost_usd]` carries
+    each week's per-model breakdown. Window-wide top-K + `Other` rollup
+    is computed at render time via `_aggregate_breakdowns` (spec §4.2).
     """
     weeks = panel_data["weeks"]
     idx = panel_data.get("current_week_index", 0)
     w = weeks[idx]
     start = _parse_iso_utc(w["start_date"])
     end = start + _dt.timedelta(days=6)
-    top_n = max(int(options.get("top_n", 50)), 1)
+    top_n = max(int(options.get("top_n", 5)), 1)
+
+    breakdowns = [dict(week.get("models") or {}) for week in weeks]
+    members = _aggregate_breakdowns(breakdowns)
+    top_k_labels_provisional = tuple(m[0] for m in members[:top_n])
+    rows_and_breakdowns = [
+        (float(week["cost_usd"]), dict(week.get("models") or {}))
+        for week in weeks
+    ]
+    has_other_residual = _detect_residual(
+        rows_and_breakdowns, top_k_labels_provisional,
+    )
+    columns, top_k, has_other = _cross_tab_columns(
+        _LS.ColumnSpec(key="week", label="Week", align="left"),
+        members, top_n, has_other_residual, kind="model",
+    )
+    rows = tuple(
+        _cross_tab_row(
+            row_label_key="week",
+            row_label_cell=_LS.TextCell(week["start_date"]),
+            row_total=float(week["cost_usd"]),
+            breakdown=dict(week.get("models") or {}),
+            top_k_labels=top_k,
+            has_other=has_other,
+        )
+        for week in weeks
+    )
     return _LS.ShareSnapshot(
         cmd="weekly",
         title=f"Weekly detail — week of {w['start_date']}",
         subtitle=None,
         period=_period(start, end, label="This week", display_tz=_display_tz(options)),
-        columns=_PROJECT_COLUMNS,
-        rows=_top_projects_rows(w.get("top_projects") or [], top_n),
+        columns=columns,
+        rows=rows,
         chart=_LS.LineChart(
             points=tuple(
                 _LS.ChartPoint(x_label=w2["start_date"], x_value=float(i),
@@ -949,25 +1070,50 @@ def _build_daily_visual(*, panel_data, options):
 
 
 def _build_daily_detail(*, panel_data, options):
-    """Daily detail — per-day × per-project full table (spec §9.5).
+    """Daily detail — per-day × per-project cross-tab (spec §9.5).
 
-    NOTE: ships as per-project table; spec §9.5 calls for per-day × per-project
-    cross-tab — deferred until `_build_daily_share_panel_data` carries
-    per-day per-project cells (see issue #33).
+    `panel_data["days"][i].projects: dict[project_path, cost_usd]`
+    carries each day's per-project breakdown.
     """
     days = panel_data.get("days") or []
     start = _parse_iso_utc(days[0]["date"]) if days else _utc_now()
     end_anchor = _parse_iso_utc(days[-1]["date"]) if days else start
     end = end_anchor + _dt.timedelta(days=1)
     sum_cost = sum(float(d["cost_usd"]) for d in days)
-    top_n = max(int(options.get("top_n", 50)), 1)
+    top_n = max(int(options.get("top_n", 5)), 1)
+
+    breakdowns = [dict(d.get("projects") or {}) for d in days]
+    members = _aggregate_breakdowns(breakdowns)
+    top_k_labels_provisional = tuple(m[0] for m in members[:top_n])
+    rows_and_breakdowns = [
+        (float(d["cost_usd"]), dict(d.get("projects") or {}))
+        for d in days
+    ]
+    has_other_residual = _detect_residual(
+        rows_and_breakdowns, top_k_labels_provisional,
+    )
+    columns, top_k, has_other = _cross_tab_columns(
+        _LS.ColumnSpec(key="date", label="Day", align="left"),
+        members, top_n, has_other_residual, kind="project",
+    )
+    rows = tuple(
+        _cross_tab_row(
+            row_label_key="date",
+            row_label_cell=_LS.TextCell(d["date"]),
+            row_total=float(d["cost_usd"]),
+            breakdown=dict(d.get("projects") or {}),
+            top_k_labels=top_k,
+            has_other=has_other,
+        )
+        for d in days
+    )
     return _LS.ShareSnapshot(
         cmd="daily",
         title=f"Daily detail — last {len(days)} day{'s' if len(days) != 1 else ''}",
         subtitle=None,
         period=_period(start, end, label="Last 7 days", display_tz=_display_tz(options)),
-        columns=_PROJECT_COLUMNS,
-        rows=_top_projects_rows(panel_data.get("top_projects") or [], top_n),
+        columns=columns,
+        rows=rows,
         chart=_LS.BarChart(
             points=tuple(
                 _LS.ChartPoint(x_label=d["date"], x_value=float(i),
@@ -1028,12 +1174,7 @@ def _build_monthly_visual(*, panel_data, options):
 
 
 def _build_monthly_detail(*, panel_data, options):
-    """Monthly detail — per-month × per-project full table (spec §9.5).
-
-    NOTE: ships as per-project table; spec §9.5 calls for per-month × per-project
-    cross-tab — deferred until `_build_monthly_share_panel_data` carries
-    per-month per-project cells (see issue #33).
-    """
+    """Monthly detail — per-month × per-model cross-tab (spec §9.5)."""
     months = panel_data.get("months") or []
 
     def _month_start(s):
@@ -1047,15 +1188,41 @@ def _build_monthly_detail(*, panel_data, options):
     else:
         end = start
     sum_cost = sum(float(m["cost_usd"]) for m in months)
-    top_n = max(int(options.get("top_n", 50)), 1)
+    top_n = max(int(options.get("top_n", 5)), 1)
+
+    breakdowns = [dict(m.get("models") or {}) for m in months]
+    members = _aggregate_breakdowns(breakdowns)
+    top_k_labels_provisional = tuple(m[0] for m in members[:top_n])
+    rows_and_breakdowns = [
+        (float(m["cost_usd"]), dict(m.get("models") or {}))
+        for m in months
+    ]
+    has_other_residual = _detect_residual(
+        rows_and_breakdowns, top_k_labels_provisional,
+    )
+    columns, top_k, has_other = _cross_tab_columns(
+        _LS.ColumnSpec(key="month", label="Month", align="left"),
+        members, top_n, has_other_residual, kind="model",
+    )
+    rows = tuple(
+        _cross_tab_row(
+            row_label_key="month",
+            row_label_cell=_LS.TextCell(m["month"]),
+            row_total=float(m["cost_usd"]),
+            breakdown=dict(m.get("models") or {}),
+            top_k_labels=top_k,
+            has_other=has_other,
+        )
+        for m in months
+    )
     return _LS.ShareSnapshot(
         cmd="monthly",
         title=f"Monthly detail — last {len(months)} month{'s' if len(months) != 1 else ''}",
         subtitle=None,
         period=_period(start, end, label="Recent months",
                        display_tz=_display_tz(options)),
-        columns=_PROJECT_COLUMNS,
-        rows=_top_projects_rows(panel_data.get("top_projects") or [], top_n),
+        columns=columns,
+        rows=rows,
         chart=_LS.BarChart(
             points=tuple(
                 _LS.ChartPoint(x_label=m["month"], x_value=float(i),
@@ -1108,25 +1275,46 @@ def _build_blocks_visual(*, panel_data, options):
 
 
 def _build_blocks_detail(*, panel_data, options):
-    """Blocks detail — full per-project rows + recent-blocks chart (spec §9.5).
-
-    NOTE: ships as per-project table; spec §9.5 calls for per-block × per-project
-    cross-tab — deferred until `_build_blocks_share_panel_data` carries
-    per-block per-project cells (see issue #33).
-    """
+    """Blocks detail — per-block × per-project cross-tab (spec §9.5)."""
     cb = panel_data.get("current_block") or {}
     recent = panel_data.get("recent_blocks") or []
     start = _parse_iso_utc(cb["start_at"]) if cb.get("start_at") else _utc_now()
     end = _parse_iso_utc(cb["end_at"]) if cb.get("end_at") else start + _dt.timedelta(hours=5)
-    top_n = max(int(options.get("top_n", 50)), 1)
+    top_n = max(int(options.get("top_n", 5)), 1)
+
+    breakdowns = [dict(b.get("projects") or {}) for b in recent]
+    members = _aggregate_breakdowns(breakdowns)
+    top_k_labels_provisional = tuple(m[0] for m in members[:top_n])
+    rows_and_breakdowns = [
+        (float(b["cost_usd"]), dict(b.get("projects") or {}))
+        for b in recent
+    ]
+    has_other_residual = _detect_residual(
+        rows_and_breakdowns, top_k_labels_provisional,
+    )
+    columns, top_k, has_other = _cross_tab_columns(
+        _LS.ColumnSpec(key="block", label="Block (start)", align="left"),
+        members, top_n, has_other_residual, kind="project",
+    )
+    rows = tuple(
+        _cross_tab_row(
+            row_label_key="block",
+            row_label_cell=_LS.TextCell(b["start_at"]),
+            row_total=float(b["cost_usd"]),
+            breakdown=dict(b.get("projects") or {}),
+            top_k_labels=top_k,
+            has_other=has_other,
+        )
+        for b in recent
+    )
     return _LS.ShareSnapshot(
         cmd="five-hour-blocks",
         title="Current 5-hour block — detail",
         subtitle=None,
         period=_period(start, end, label="Current block",
                        display_tz=_display_tz(options)),
-        columns=_PROJECT_COLUMNS,
-        rows=_top_projects_rows(panel_data.get("top_projects") or [], top_n),
+        columns=columns,
+        rows=rows,
         chart=_LS.LineChart(
             points=tuple(
                 _LS.ChartPoint(x_label=b["start_at"], x_value=float(i),
@@ -1443,8 +1631,8 @@ _VISUAL = (
 
 _DETAIL = (
     ShareTemplate(id="weekly-detail", panel="weekly", label="Detail",
-                  description="Per-week × per-project full table",
-                  default_options={"top_n": 50, "show_chart": True, "show_table": True},
+                  description="Per-week × per-model cross-tab",
+                  default_options={"top_n": 5, "show_chart": True, "show_table": True},
                   builder=_build_weekly_detail),
     ShareTemplate(id="current-week-detail", panel="current-week", label="Detail",
                   description="Per-project table + sidebar chart",
@@ -1455,16 +1643,16 @@ _DETAIL = (
                   default_options={"top_n": 50, "show_chart": True, "show_table": True},
                   builder=_build_trend_detail),
     ShareTemplate(id="daily-detail", panel="daily", label="Detail",
-                  description="Per-day × per-project full table",
-                  default_options={"top_n": 50, "show_chart": True, "show_table": True},
+                  description="Per-day × per-project cross-tab",
+                  default_options={"top_n": 5, "show_chart": True, "show_table": True},
                   builder=_build_daily_detail),
     ShareTemplate(id="monthly-detail", panel="monthly", label="Detail",
-                  description="Per-month × per-project full table",
-                  default_options={"top_n": 50, "show_chart": True, "show_table": True},
+                  description="Per-month × per-model cross-tab",
+                  default_options={"top_n": 5, "show_chart": True, "show_table": True},
                   builder=_build_monthly_detail),
     ShareTemplate(id="blocks-detail", panel="blocks", label="Detail",
-                  description="Per-block × per-project rows",
-                  default_options={"top_n": 50, "show_chart": True, "show_table": True},
+                  description="Per-block × per-project cross-tab",
+                  default_options={"top_n": 5, "show_chart": True, "show_table": True},
                   builder=_build_blocks_detail),
     ShareTemplate(id="forecast-detail", panel="forecast", label="Detail",
                   description="Per-day forecast table with $/% budget",

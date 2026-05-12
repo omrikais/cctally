@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- `share`: Detail templates for `weekly` / `daily` / `monthly` / `blocks` now ship cross-tab data (per-week × per-model, per-day × per-project, per-month × per-model, per-block × per-project) in their MD and HTML exports — resolves the per-project narrowing landed in M2.1 ([#33](https://github.com/omrikais/cctally-dev/issues/33)). SVG output for these templates continues to omit the table body and is tracked separately at [#38](https://github.com/omrikais/cctally-dev/issues/38).
+
 ## [1.6.3] - 2026-05-12
 
 ### Fixed

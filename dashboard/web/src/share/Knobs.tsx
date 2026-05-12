@@ -123,7 +123,7 @@ export function Knobs({ options, onChange }: Props) {
           inputMode="numeric"
           value={options.top_n ?? ''}
           onChange={(e) => handleTopN(e.target.value)}
-          aria-label="Top-N rows"
+          aria-label="Top-N"
         />
       </div>
 

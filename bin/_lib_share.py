@@ -80,6 +80,7 @@ class ColumnSpec:
     label: str
     align: str = "left"   # "left" | "right" | "center"
     emphasis: bool = False
+    kind: str | None = None   # "project" | "model" | None — privacy chokepoint signal
 
 
 @dataclass(frozen=True)
@@ -769,6 +770,19 @@ def _collect_project_costs(snap: ShareSnapshot) -> dict[str, float]:
             if p.project_label and p.project_label not in costs:
                 costs[p.project_label] = p.y_value
 
+    # project-typed columns (cross-tab Detail templates, issue #33). Sum the
+    # MoneyCell values for each kind='project' column across all rows; the
+    # column.label is the original project path (anon happens AFTER _collect).
+    for col in snap.columns:
+        if col.kind != "project":
+            continue
+        col_total = 0.0
+        for row in snap.rows:
+            cell = row.cells.get(col.key)
+            if isinstance(cell, MoneyCell):
+                col_total += cell.usd
+        costs[col.label] = costs.get(col.label, 0.0) + col_total
+
     return costs
 
 
@@ -867,6 +881,21 @@ def _apply_anon_mapping(
                 cap=snap.chart.cap,
             )
 
+    # Rewrite project-typed column headers (cross-tab Detail templates, issue
+    # #33). Fail-closed: any column.label not in `mapping` maps to "(unknown)",
+    # mirroring the ChartPoint arm above. Frozen-dataclass-compliant — we emit
+    # a new tuple of new ColumnSpec instances, never mutate snap.columns.
+    new_columns: list[ColumnSpec] = []
+    for col in snap.columns:
+        if col.kind == "project":
+            new_label = mapping.get(col.label, "(unknown)")
+            new_columns.append(ColumnSpec(
+                key=col.key, label=new_label,
+                align=col.align, emphasis=col.emphasis, kind=col.kind,
+            ))
+        else:
+            new_columns.append(col)
+
     # When ShareSnapshot grows a new field, add it to this constructor — the
     # scrubber must thread every field through to preserve frozen semantics.
     return ShareSnapshot(
@@ -874,7 +903,7 @@ def _apply_anon_mapping(
         title=snap.title,
         subtitle=snap.subtitle,
         period=snap.period,
-        columns=snap.columns,
+        columns=tuple(new_columns),
         rows=tuple(new_rows),
         chart=new_chart,
         totals=snap.totals,
@@ -1260,16 +1289,20 @@ def _yaml_scalar(s: str) -> str:
 
 
 def _snapshot_is_anonymized(snap: ShareSnapshot) -> bool:
-    """Return True if every ProjectCell label is either an anon token or a sentinel.
+    """Return True if every project label (cell or column) is anon or sentinel.
 
     `_scrub` rewrites labels to `project-<N>` (1-indexed, cost-descending).
-    A snapshot with no `ProjectCell` rows returns False (nothing was
-    anonymized because there was nothing to anonymize). `(unknown)` is the
-    project-share sentinel for missing project_path (see
-    `cmd_project`'s `_proj_label_for`) — it is never a revealed real name,
-    so it is counted as also-anonymized. Mixed snapshots (some scrubbed,
-    some revealed) are reported False to keep the frontmatter semantic
-    ("are projects revealed in this MD?").
+    A snapshot with no `ProjectCell` rows AND no `kind='project'` columns
+    returns False (nothing was anonymized because there was nothing to
+    anonymize). `(unknown)` is the project-share sentinel for missing
+    project_path (see `cmd_project`'s `_proj_label_for`) — it is never a
+    revealed real name, so it is counted as also-anonymized. Mixed snapshots
+    (some scrubbed, some revealed) are reported False to keep the
+    frontmatter semantic ("are projects revealed in this MD?").
+
+    Cross-tab Detail templates (issue #33) carry project labels in
+    `kind='project'` columns rather than `ProjectCell` rows; we walk both
+    surfaces so MD frontmatter `anonymized:` stays correct for those panels.
     """
     cells = [
         cell
@@ -1277,11 +1310,16 @@ def _snapshot_is_anonymized(snap: ShareSnapshot) -> bool:
         for cell in row.cells.values()
         if isinstance(cell, ProjectCell)
     ]
-    if not cells:
+    project_cols = [col for col in snap.columns if col.kind == "project"]
+    if not cells and not project_cols:
         return False
-    return all(
-        re.fullmatch(r"project-\d+", c.label) or c.label == "(unknown)"
-        for c in cells
+
+    def _is_anon(label: str) -> bool:
+        return bool(re.fullmatch(r"project-\d+", label)) or label == "(unknown)"
+
+    return (
+        all(_is_anon(c.label) for c in cells)
+        and all(_is_anon(col.label) for col in project_cols)
     )
 
 

@@ -873,7 +873,24 @@ class TestResume:
             cctally, "_release_phase_mirror_done", lambda v, c: False
         )
         monkeypatch.setattr(cctally, "_release_phase_gh_done", lambda v: False)
-        # Stub all four phase runners + body extractor.
+        monkeypatch.setattr(
+            cctally, "_release_phase_npm_done", lambda v: False
+        )
+        # Phase 6 (brew) fall-through: discovery returns a fake clone so
+        # the loop reaches the brew runner; the done-signal is False so
+        # the loop actually calls the (stubbed) runner. Without these
+        # stubs the runner consults the host's real brew clone and the
+        # monotonic-version gate (issue #30) rejects the v1.0.0 stub
+        # version against any newer formula on disk (issue #36).
+        monkeypatch.setattr(
+            cctally,
+            "_release_discover_brew_clone",
+            lambda args: Path("/tmp/fake-brew-clone"),
+        )
+        monkeypatch.setattr(
+            cctally, "_release_phase_brew_done", lambda v, c: False
+        )
+        # Stub all six phase runners + body extractor.
         called: list[str] = []
         monkeypatch.setattr(
             cctally,
@@ -902,6 +919,11 @@ class TestResume:
         )
         monkeypatch.setattr(
             cctally,
+            "_release_run_phase_brew",
+            lambda *a, **kw: called.append("brew") or 0,
+        )
+        monkeypatch.setattr(
+            cctally,
             "_release_extract_body_from_changelog",
             lambda v: "### Added\n- Foo",
         )
@@ -910,7 +932,7 @@ class TestResume:
         assert rc == 0
         # Phase loop ran (each helper short-circuits internally based on
         # its own signal — the stubs simulate "do the work").
-        assert called == ["stamp", "tag", "mirror", "gh", "npm"]
+        assert called == ["stamp", "tag", "mirror", "gh", "npm", "brew"]
         out = capsys.readouterr().out
         # Non-already-done resume: prints the published-line, NOT
         # `already published`.

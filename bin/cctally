@@ -29335,6 +29335,147 @@ def _share_top_projects_for_range(
     return [(path, cost) for path, cost in ranked[:_SHARE_TOP_PROJECTS_BUILDER_CAP]]
 
 
+def _share_all_projects_for_range(
+    range_start: "dt.datetime",
+    range_end: "dt.datetime",
+    *,
+    skip_sync: bool = True,
+) -> dict[str, float]:
+    """Like `_share_top_projects_for_range` but uncapped and unsorted.
+
+    Returns {project_path_or_'(unknown)': cost_usd} for every project
+    active in the range. Caller orders or caps as needed. Used by
+    `_share_per_block_per_project`'s fallback path so the fallback's
+    accuracy matches the canonical rollup-table path (spec §7.2.1,
+    issue #33).
+    """
+    bucket: dict[str, float] = {}
+    try:
+        entries = get_claude_session_entries(
+            range_start, range_end, skip_sync=skip_sync,
+        )
+    except Exception:
+        return bucket
+    for entry in entries:
+        usage = {
+            "input_tokens":                entry.input_tokens,
+            "output_tokens":               entry.output_tokens,
+            "cache_creation_input_tokens": entry.cache_creation_tokens,
+            "cache_read_input_tokens":     entry.cache_read_tokens,
+        }
+        cost = _calculate_entry_cost(
+            entry.model, usage, mode="auto", cost_usd=entry.cost_usd,
+        )
+        key = entry.project_path or "(unknown)"
+        bucket[key] = bucket.get(key, 0.0) + cost
+    return bucket
+
+
+def _share_per_day_per_project_for_range(
+    range_start: "dt.datetime",
+    range_end: "dt.datetime",
+    *,
+    display_tz: str,
+    skip_sync: bool = True,
+) -> dict[str, dict[str, float]]:
+    """Aggregate session_entries in [range_start, range_end] by
+    (day-in-display_tz, project_path).
+
+    Returns {date_str: {project_path_or_'(unknown)': cost_usd}}. Same
+    cache-first/lock-contention/direct-JSONL fallback chain as
+    `_share_top_projects_for_range`. Day bucket computed in display_tz
+    so the rendered row label matches. Issue #33.
+    """
+    try:
+        tz = ZoneInfo(display_tz) if display_tz else dt.timezone.utc
+    except Exception:
+        tz = dt.timezone.utc
+    out: dict[str, dict[str, float]] = {}
+    try:
+        entries = get_claude_session_entries(
+            range_start, range_end, skip_sync=skip_sync,
+        )
+    except Exception:
+        return out
+    for entry in entries:
+        usage = {
+            "input_tokens":                entry.input_tokens,
+            "output_tokens":               entry.output_tokens,
+            "cache_creation_input_tokens": entry.cache_creation_tokens,
+            "cache_read_input_tokens":     entry.cache_read_tokens,
+        }
+        cost = _calculate_entry_cost(
+            entry.model, usage, mode="auto", cost_usd=entry.cost_usd,
+        )
+        day = entry.timestamp.astimezone(tz).strftime("%Y-%m-%d")
+        proj = entry.project_path or "(unknown)"
+        out.setdefault(day, {})
+        out[day][proj] = out[day].get(proj, 0.0) + cost
+    return out
+
+
+def _share_per_block_per_project(
+    recent_blocks: list[dict],
+) -> dict[str, dict[str, float]]:
+    """Aggregate per-block per-project costs from `five_hour_block_projects`.
+
+    Returns {block_start_at_iso: {project_path_or_'(unknown)': cost_usd}}.
+    Block.start_at → five_hour_window_key via `_canonical_5h_window_key`
+    (10-min floor; same chokepoint as `maybe_update_five_hour_block`,
+    per CLAUDE.md "5-hour windows" gotcha — never derive a third key shape).
+
+    Fallback (rollup empty/unreadable): per-block sweep over
+    `_share_all_projects_for_range` — uncapped, accuracy parity with the
+    canonical path. Fires only during the first tick after fresh install
+    or before stats-migration `002_five_hour_block_projects_backfill_v1`
+    completes. Issue #33.
+    """
+    if not recent_blocks:
+        return {}
+    out: dict[str, dict[str, float]] = {}
+    keys: list[int] = []
+    iso_by_key: dict[int, str] = {}
+    for b in recent_blocks:
+        try:
+            ts = parse_iso_datetime(b["start_at"], "share.block.start_at")
+        except (ValueError, KeyError):
+            continue
+        wk = _canonical_5h_window_key(int(ts.timestamp()))
+        keys.append(wk)
+        iso_by_key[wk] = b["start_at"]
+    if not keys:
+        return out
+    try:
+        conn = open_db()
+        placeholders = ",".join("?" for _ in keys)
+        rows = conn.execute(
+            f"SELECT five_hour_window_key, project_path, cost_usd "
+            f"FROM five_hour_block_projects "
+            f"WHERE five_hour_window_key IN ({placeholders})",
+            keys,
+        ).fetchall()
+        for wk, project_path, cost in rows:
+            block_iso = iso_by_key.get(wk)
+            if block_iso is None:
+                continue
+            proj = project_path or "(unknown)"
+            out.setdefault(block_iso, {})
+            out[block_iso][proj] = out[block_iso].get(proj, 0.0) + float(cost)
+        if out:
+            return out
+    except (sqlite3.DatabaseError, OSError):
+        pass
+    # Fallback: per-block uncapped session_entries sweep.
+    for b in recent_blocks:
+        try:
+            ts = parse_iso_datetime(b["start_at"], "share.block.start_at")
+        except (ValueError, KeyError):
+            continue
+        end = ts + dt.timedelta(hours=5)
+        out[b["start_at"]] = _share_all_projects_for_range(ts, end)
+    return out
+
+
 def _build_share_panel_data(panel: str, options: dict,
                             snap: "DataSnapshot | None") -> dict:
     """Dispatch to the per-panel builder; reuses the dashboard DataSnapshot.
@@ -29414,12 +29555,19 @@ def _build_weekly_share_panel_data(options: dict,
             ws_dt = we_dt = None
         if ws_dt is not None and we_dt is not None:
             top_projects = _share_top_projects_for_range(ws_dt, we_dt)
+        # Per-week × per-model breakdown (issue #33 cross-tab Detail).
+        models_list = getattr(r, "models", None) or []
+        models = {
+            (m.get("model") or "(unknown)"): float(m.get("cost_usd", 0.0) or 0.0)
+            for m in models_list
+        }
         weeks.append({
             "start_date":     start_date,
             "cost_usd":       cost,
             "pct_used":       used_pct,
             "dollar_per_pct": dpp,
             "top_projects":   top_projects,
+            "models":         models,
         })
     if not weeks:
         weeks = [_share_empty_week_stub()]
@@ -29576,6 +29724,26 @@ def _build_daily_share_panel_data(options: dict,
             top_projects = _share_top_projects_for_range(range_start, range_end)
         except (ValueError, KeyError):
             top_projects = []
+    # Per-day × per-project breakdown (issue #33 cross-tab Detail).
+    per_day_per_project: dict[str, dict[str, float]] = {}
+    if days:
+        try:
+            pdpp_range_start = dt.datetime.fromisoformat(
+                f"{days[0]['date']}T00:00:00+00:00"
+            )
+            last_date = dt.date.fromisoformat(days[-1]["date"])
+            pdpp_range_end = dt.datetime(
+                last_date.year, last_date.month, last_date.day,
+                tzinfo=dt.timezone.utc,
+            ) + dt.timedelta(days=1)
+            per_day_per_project = _share_per_day_per_project_for_range(
+                pdpp_range_start, pdpp_range_end,
+                display_tz=options.get("display_tz", "Etc/UTC"),
+            )
+        except (ValueError, KeyError):
+            per_day_per_project = {}
+    for d in days:
+        d["projects"] = per_day_per_project.get(d["date"], {})
     return {"days": days, "top_projects": top_projects}
 
 
@@ -29594,13 +29762,19 @@ def _build_monthly_share_panel_data(options: dict,
     rows = list(reversed(rows))
     months: list[dict] = []
     for r in rows:
-        models = getattr(r, "models", None) or []
-        top_model = (models[0].get("model") if models else None) or "—"
+        models_list = getattr(r, "models", None) or []
+        top_model = (models_list[0].get("model") if models_list else None) or "—"
+        # Per-month × per-model breakdown (issue #33 cross-tab Detail).
+        models = {
+            (m.get("model") or "(unknown)"): float(m.get("cost_usd", 0.0) or 0.0)
+            for m in models_list
+        }
         months.append({
             "month":     getattr(r, "label", "") or "",  # "YYYY-MM"
             "cost_usd":  float(getattr(r, "cost_usd", 0.0) or 0.0),
             "pct_used":  0.0,
             "top_model": top_model,
+            "models":    models,
         })
     # Monthly top_projects: aggregate across the entire 12-month window.
     # Range = [first day of oldest month, last day of newest month + 1].
@@ -29755,6 +29929,10 @@ def _build_blocks_share_panel_data(options: dict,
             top_projects = _share_top_projects_for_range(range_start, range_end)
         except (ValueError, KeyError):
             top_projects = []
+    # Per-block × per-project breakdown (issue #33 cross-tab Detail).
+    per_block_per_project = _share_per_block_per_project(recent)
+    for r in recent:
+        r["projects"] = per_block_per_project.get(r["start_at"], {})
     return {
         "current_block": cb,
         "recent_blocks": recent,
