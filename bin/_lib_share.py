@@ -1454,12 +1454,13 @@ def _stitch_md(sections: tuple[ComposedSection, ...], *,
     # otherwise inline HTML or MD specials in a user-entered title
     # would survive into the export unescaped.
     parts.append(f"# {_md_escape(opts.title)}\n\n")
-    for sec in sections:
+    last_idx = len(sections) - 1
+    for idx, sec in enumerate(sections):
         frag = _render_fragment(sec.snap, format="md", palette=PALETTE_LIGHT,
                                 branding=False)
         parts.append(f"## {_md_escape(sec.snap.title)}\n\n")
-        parts.append(frag)
-        parts.append("\n\n")
+        parts.append(frag.rstrip("\n"))
+        parts.append("\n\n" if idx < last_idx else "\n")
     return "".join(parts)
 
 
