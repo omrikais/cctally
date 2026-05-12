@@ -29024,8 +29024,11 @@ def _build_weekly_share_panel_data(options: dict,
     access stays safe (renders as $0.00 / 0.0% — accurate "no data").
     """
     rows = list(getattr(snap, "weekly_periods", None) or []) if snap else []
-    # weekly_periods is built with n=12; clip to 8 for the share panel.
-    rows_8 = rows[-8:]
+    # weekly_periods is newest-first (see _dashboard_build_weekly_periods).
+    # Take the newest 8 and reverse to oldest→newest — the Recap template
+    # reads weeks[0] as the start anchor and weeks[-1] as the right-edge
+    # (current-week) anchor, and current_week_index addresses that order.
+    rows_8 = list(reversed(rows[:8]))
     weeks: list[dict] = []
     current_idx = 0
     for i, r in enumerate(rows_8):
@@ -29089,7 +29092,10 @@ def _build_current_week_share_panel_data(options: dict,
     progression: list[dict] = []
     if isinstance(week_start, dt.datetime):
         ws_date = week_start.date()
-        for r in daily:
+        # daily_panel is newest-first; iterate reversed so progression is
+        # oldest→newest, matching the Recap template's progression[-1] =
+        # today contract and the chart's left→right time axis.
+        for r in reversed(daily):
             try:
                 d = dt.date.fromisoformat(getattr(r, "date", "") or "")
             except ValueError:
@@ -29155,7 +29161,10 @@ def _build_daily_share_panel_data(options: dict,
     full); clips to the most recent 7 for the Recap.
     """
     daily = list(getattr(snap, "daily_panel", None) or []) if snap else []
-    last_7 = daily[-7:]
+    # daily_panel is newest-first (today at index 0); take the most recent
+    # 7 and reverse to oldest→newest so the Recap template's days[-1]
+    # anchor lands on today.
+    last_7 = list(reversed(daily[:7]))
     total = sum(float(getattr(r, "cost_usd", 0.0) or 0.0) for r in last_7) or 1.0
     days: list[dict] = []
     for r in last_7:
