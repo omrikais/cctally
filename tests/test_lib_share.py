@@ -491,8 +491,8 @@ def test_render_svg_chart_only_with_and_without_table():
     The minimal snapshot has 2 columns + 1 row + chart=None, so the table
     path emits its header band + body row when `include_table` defaults
     to True. Passing `include_table=False` opts out of both chrome AND
-    the table — the contract used by `_render_html_fragment` at
-    `bin/_lib_share.py:1128` to keep the HTML wrapper's standalone
+    the table — the contract used by `_render_html_fragment`'s
+    chart-only embed call to keep the HTML wrapper's standalone
     `<table>` from being duplicated inside the embedded chart SVG.
     """
     snap = _make_minimal_snapshot()
@@ -526,12 +526,16 @@ def test_render_svg_chart_only_with_and_without_table():
 
 
 def test_render_svg_chart_only_with_no_chart_returns_empty_svg():
+    # `include_table=False` keeps this test honest to its name: with
+    # only `include_chrome=False` (table defaulting True) the snapshot's
+    # 2-column table would emit and "empty SVG" would no longer be
+    # accurate. The contract proven here: chart=None + chrome=False +
+    # table=False → no <polyline> chart geometry.
     snap = _make_minimal_snapshot()  # chart=None
     out = _lib_share._render_svg(snap, palette=_lib_share.PALETTE_LIGHT,
-                                 branding=True, include_chrome=False)
-    # Inner content empty (or whitespace-only) for table-only snapshots.
+                                 branding=True, include_chrome=False,
+                                 include_table=False)
     inner = out[len('<svg xmlns="http://www.w3.org/2000/svg" '):]
-    # No chart elements (no <polyline>, <line>, <rect>).
     assert "<polyline" not in inner
 
 
