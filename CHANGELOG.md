@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-05-12
+
 ### Added
 - Dashboard share GUI: per-panel `↗` share icon opens a modal with 24 infographic templates (8 panels × 3 archetypes), live preview, themed export to MD/HTML/SVG, client-side PNG, and browser-native Print → PDF. Keyboard: `S` shares the focused panel, `B` opens the basket composer.
 - Multi-section composer: collect template recipes from any panel into a `📋 basket` (localStorage-persisted, hard cap 20), then stitch them with `/api/share/compose` into one document under composite chrome (single title, single frontmatter, one footer). Sections show "Outdated" when underlying data or kernel version has shifted; per-section refresh re-renders without losing the basket order.
