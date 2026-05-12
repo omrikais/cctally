@@ -169,7 +169,7 @@ The basket persists across page reloads in browser localStorage (`cctally:share:
 
 Every successful export appends a recipe (no body) to a 20-deep ring buffer at `share.history` in `config.json`. Surfaced under the **Recent shares** segmented group inside the gallery's **presets ▾** dropdown — filtered to the panel you're sharing. Clicking a history entry overwrites the modal's options; it does NOT auto-export.
 
-Clear via the dropdown's `Clear history` action. (For now, you can also edit `~/.local/share/cctally/config.json` directly or `DELETE /api/share/history` via curl.)
+Clearing history has no GUI control in v2 yet — edit `~/.local/share/cctally/config.json` directly (drop the `share.history` key) or call `DELETE /api/share/history` (Origin/Host CSRF gate applies; pass `-H 'Origin: http://127.0.0.1:8789'`).
 
 ## Examples
 
