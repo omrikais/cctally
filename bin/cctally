@@ -29024,14 +29024,19 @@ _SHARE_PANELS_PERIOD_OVERRIDABLE = ("weekly", "daily", "monthly", "trend", "bloc
 
 
 def _share_resolve_period(panel: str, options: dict):
-    """Return (now_utc_override, error_dict) for the requested period.
+    """Return (now_utc_override, start_override, error_dict) for the period.
 
-    - `(None, None)` — no override needed (period absent or
+    - `(None, None, None)` — no override needed (period absent or
       `kind="current"`). Caller continues with the cached DataSnapshot.
-    - `(datetime, None)` — caller should re-build the relevant panel
-      field with this `now_utc`.
-    - `(None, {"error": str, "field": str})` — validation failure;
-      caller emits 400 with this envelope.
+    - `(datetime, None, None)` — `kind="previous"`. Caller rebuilds with
+      this `now_utc`; window length stays at the panel default.
+    - `(datetime, datetime, None)` — `kind="custom"`. Caller rebuilds
+      with `now_utc = end_dt` AND a derived window length spanning
+      `[start_dt, end_dt]` (computed by `_share_apply_period_override`
+      per panel). Spec §6.3 advertises "Custom (start–end pickers)";
+      honoring the start picker means the rendered window's left edge
+      moves with it. The 2-tuple form silently ignored `start_dt`.
+    - `(None, None, {...})` — validation failure; caller emits 400.
 
     `parse_iso_datetime` (the same parser used by every other share
     surface) accepts trailing `Z` / `+HH:MM` and naive forms. Naive
@@ -29044,31 +29049,31 @@ def _share_resolve_period(panel: str, options: dict):
         # Absent → no override, defaults to current. (Permissive: the
         # UI always sends a period block, but older basket recipes /
         # CLI parity may omit it.)
-        return (None, None)
+        return (None, None, None)
     kind = period.get("kind", "current")
     if kind not in ("current", "previous", "custom"):
-        return (None, {"error": f"unknown period kind: {kind!r}",
-                       "field": "options.period.kind"})
+        return (None, None, {"error": f"unknown period kind: {kind!r}",
+                              "field": "options.period.kind"})
     if panel in _SHARE_PANELS_PERIOD_FIXED:
         if kind != "current":
-            return (None, {
+            return (None, None, {
                 "error": (f"panel {panel!r} only supports period kind='current'; "
                           f"got {kind!r}"),
                 "field": "options.period.kind",
             })
-        return (None, None)
+        return (None, None, None)
     # Overridable panels — handle each kind.
     if kind == "current":
-        return (None, None)
+        return (None, None, None)
     if kind == "previous":
         delta = _share_previous_period_delta(panel)
-        return (_share_now_utc() - delta, None)
+        return (_share_now_utc() - delta, None, None)
     # kind == "custom"
     start_str = period.get("start")
     end_str = period.get("end")
     if not isinstance(start_str, str) or not start_str \
             or not isinstance(end_str, str) or not end_str:
-        return (None, {
+        return (None, None, {
             "error": "custom period requires non-empty start + end ISO dates",
             "field": "options.period",
         })
@@ -29076,15 +29081,48 @@ def _share_resolve_period(panel: str, options: dict):
         start_dt = parse_iso_datetime(start_str, "options.period.start")
         end_dt = parse_iso_datetime(end_str, "options.period.end")
     except ValueError as exc:
-        return (None, {"error": f"invalid period date: {exc}",
-                       "field": "options.period"})
+        return (None, None, {"error": f"invalid period date: {exc}",
+                              "field": "options.period"})
     if end_dt <= start_dt:
-        return (None, {
+        return (None, None, {
             "error": ("custom period end must be strictly after start "
                       f"(got start={start_str!r}, end={end_str!r})"),
             "field": "options.period",
         })
-    return (end_dt, None)
+    return (end_dt, start_dt, None)
+
+
+def _share_custom_window_n(panel: str, start_dt: "dt.datetime",
+                            end_dt: "dt.datetime") -> int:
+    """Per-panel window length covering `[start_dt, end_dt]`, min 1.
+
+    Each overridable panel exposes a different unit:
+        - weekly / trend → weeks
+        - daily          → days (inclusive)
+        - monthly        → calendar months (inclusive)
+    Blocks doesn't use this helper — its builder is window-anchored via
+    `week_start_at`/`week_end_at`, not `n`, so we pass `start_dt`/`end_dt`
+    directly to `_dashboard_build_blocks_panel`.
+
+    Inputs are timezone-aware UTC datetimes (`parse_iso_datetime` UTCs
+    naive inputs upstream). Math is purely on the timedelta + calendar
+    diffs; `_dashboard_build_monthly_periods` does its own display-tz
+    bucketing on the resulting window.
+    """
+    import math as _math
+    delta_seconds = (end_dt - start_dt).total_seconds()
+    delta_days = _math.ceil(delta_seconds / 86400.0)
+    if panel in ("weekly", "trend"):
+        return max(1, _math.ceil(delta_days / 7))
+    if panel == "daily":
+        return max(1, int(delta_days))
+    if panel == "monthly":
+        months = ((end_dt.year - start_dt.year) * 12
+                  + (end_dt.month - start_dt.month) + 1)
+        return max(1, months)
+    # Shouldn't reach here — `_share_apply_period_override` handles
+    # blocks separately. Defensive: return 1 rather than raising.
+    return 1
 
 
 def _share_previous_period_delta(panel: str) -> "dt.timedelta":
@@ -29126,19 +29164,29 @@ def _share_apply_period_override(panel: str, options: dict,
         # and let the panel_data builder's empty-snapshot path handle it.
         # Still validate the period option so the user gets a 400 on
         # malformed input even before the sync thread's first tick.
-        _, err = _share_resolve_period(panel, options)
+        _, _, err = _share_resolve_period(panel, options)
         return (snap, err)
-    now_override, err = _share_resolve_period(panel, options)
+    now_override, start_override, err = _share_resolve_period(panel, options)
     if err is not None:
         return (None, err)
     if now_override is None:
         return (snap, None)
+    # For `kind="custom"`, derive a per-panel window length covering
+    # `[start_override, now_override]` so the rendered window honors the
+    # Start picker (spec §6.3). For `kind="previous"`, `start_override`
+    # is None → window length stays at the panel's default.
+    n_override = (
+        _share_custom_window_n(panel, start_override, now_override)
+        if start_override is not None else None
+    )
     import dataclasses as _dc
     conn = open_db()
     try:
         if panel == "weekly":
-            rows = _dashboard_build_weekly_periods(conn, now_override,
-                                                    skip_sync=True)
+            kwargs: dict = {"skip_sync": True}
+            if n_override is not None:
+                kwargs["n"] = n_override
+            rows = _dashboard_build_weekly_periods(conn, now_override, **kwargs)
             return (_dc.replace(snap, weekly_periods=rows), None)
         if panel == "daily":
             display_tz_name = options.get("display_tz", "Etc/UTC")
@@ -29146,26 +29194,38 @@ def _share_apply_period_override(panel: str, options: dict,
                 display_tz = ZoneInfo(display_tz_name) if display_tz_name else None
             except Exception:
                 display_tz = None
-            rows = _dashboard_build_daily_panel(conn, now_override,
-                                                 skip_sync=True,
-                                                 display_tz=display_tz)
+            kwargs = {"skip_sync": True, "display_tz": display_tz}
+            if n_override is not None:
+                kwargs["n"] = n_override
+            rows = _dashboard_build_daily_panel(conn, now_override, **kwargs)
             return (_dc.replace(snap, daily_panel=rows), None)
         if panel == "monthly":
-            rows = _dashboard_build_monthly_periods(conn, now_override,
-                                                     skip_sync=True)
+            kwargs = {"skip_sync": True}
+            if n_override is not None:
+                kwargs["n"] = n_override
+            rows = _dashboard_build_monthly_periods(conn, now_override, **kwargs)
             return (_dc.replace(snap, monthly_periods=rows), None)
         if panel == "trend":
-            rows = _tui_build_trend(conn, now_override, skip_sync=True)
+            kwargs = {"skip_sync": True}
+            if n_override is not None:
+                kwargs["count"] = n_override
+            rows = _tui_build_trend(conn, now_override, **kwargs)
             return (_dc.replace(snap, trend=rows), None)
         if panel == "blocks":
-            # `_dashboard_build_blocks_panel` is week-anchored; derive a
-            # 7-day window ending at the override `now_utc`. This is
+            # `_dashboard_build_blocks_panel` is window-anchored via
+            # `week_start_at`/`week_end_at`, not `n`. For `kind='custom'`,
+            # use the user's [start_dt, end_dt] verbatim. For
+            # `kind='previous'`, fall back to a 7-day window ending at
+            # the override `now_utc` (the spec's prior-block semantics —
             # intentionally NOT aligned to subscription-week boundaries
-            # (the share period override is wall-clock-aware, not quota
-            # -aware), so a `kind='previous'` blocks export covers
-            # exactly the seven days before `now_utc - 5h`.
-            week_start_at = now_override - dt.timedelta(days=7)
-            week_end_at = now_override
+            # since the share period override is wall-clock-aware, not
+            # quota-aware).
+            if start_override is not None:
+                week_start_at = start_override
+                week_end_at = now_override
+            else:
+                week_start_at = now_override - dt.timedelta(days=7)
+                week_end_at = now_override
             rows = _dashboard_build_blocks_panel(
                 conn, now_override,
                 week_start_at=week_start_at,
