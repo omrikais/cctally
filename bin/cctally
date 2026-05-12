@@ -15056,6 +15056,9 @@ _BANNER_SUPPRESSED_COMMANDS = frozenset({
     "tui",             # rich Live mode takes over the screen; banner would be clobbered
     "db",              # `db status` shows failure state in its own output;
                        # `db skip` / `db unskip` are mid-fix — banner would be redundant.
+    "doctor",          # consolidates migration + update banner state into its
+                       # own report; double-printing the banner would duplicate
+                       # findings doctor already surfaces structurally.
     # Note: `setup` carve-out handled separately (only suppressed w/o --status).
     # Note: `dashboard` carve-out handled separately (banner printed in cmd_dashboard).
 })
@@ -25516,6 +25519,39 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
     return 3
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Run all doctor checks and emit the report. Spec §4, §7.3.
+
+    Calls the I/O chokepoint (doctor_gather_state) → pure kernel
+    (_lib_doctor.run_checks) → renderer (render_text or
+    serialize_json). The argparse `add_mutually_exclusive_group`
+    handles the --quiet/--verbose collision at parse time; the
+    defense-in-depth check here covers programmatic invocation that
+    bypasses argparse.
+
+    Exit code follows the loose mapping in spec §4.5: 0 unless
+    overall_severity == "fail", then 2. Note that warn → 0; doctor
+    is read-only and warn-class findings are advisories, not errors.
+    """
+    import _lib_doctor
+    quiet = bool(getattr(args, "quiet", False))
+    verbose = bool(getattr(args, "verbose", False))
+    if quiet and verbose:
+        eprint("doctor: --quiet and --verbose are mutually exclusive")
+        return 2
+    state = doctor_gather_state()
+    report = _lib_doctor.run_checks(state)
+    if getattr(args, "json", False):
+        print(json.dumps(
+            _lib_doctor.serialize_json(report), indent=2, sort_keys=True,
+        ))
+    else:
+        sys.stdout.write(_lib_doctor.render_text(
+            report, quiet=quiet, verbose=verbose,
+        ))
+    return 2 if report.overall_severity == "fail" else 0
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     # Migration flags are install-mode-only. Reject combinations with
     # --status or --uninstall (per spec Section 2 mode×flag matrix). The
@@ -27496,6 +27532,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Migration name (NNN_… or qualified)",
     )
     db_unskip.set_defaults(func=cmd_db_unskip)
+
+    # ─── doctor (Diagnostics) ───────────────────────────────────────────
+    doctor_p = sub.add_parser(
+        "doctor",
+        help="Diagnose data freshness and install state",
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Run all read-only diagnostic checks and emit a report.
+
+            Categories: install, hooks, auth, db, data, safety. Each
+            category renders a severity (✓ ok / ⚠ warn / ✗ fail) and
+            actionable remediation guidance for non-OK rows.
+
+            Exit code: 0 unless any check is FAIL (then exit 2). WARN
+            rows do not change the exit code — doctor is a read-only
+            diagnostic and warn-class findings are advisories.
+
+            See docs/commands/doctor.md for the full check inventory
+            and JSON schema reference.
+            """
+        ),
+    )
+    doctor_p.add_argument(
+        "--json", action="store_true",
+        help="Emit machine-readable JSON to stdout (schema_version: 1)",
+    )
+    doctor_mutex = doctor_p.add_mutually_exclusive_group()
+    doctor_mutex.add_argument(
+        "--quiet", "-q", action="store_true",
+        help="Hide OK rows (human mode only)",
+    )
+    doctor_mutex.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Include each check's details block (human mode only)",
+    )
+    doctor_p.set_defaults(func=cmd_doctor)
 
     # ---- release (issue #24 release automation) ----
     p_release = sub.add_parser(
