@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-05-12
+
 ### Fixed
 - npm-installed `cctally` now ships the `bin/_lib_share.py` and `bin/_lib_share_templates.py` runtime sibling modules in the package tarball. They were latently absent from `package.json` `files[]` since v1.4.0; brew and source installs were unaffected (Homebrew copies the whole prefix). On npm installs the dashboard share GUI failed at "Couldn't load templates: Load failed" on every panel because the lazy-loader couldn't open the sibling file. A new `tests/test_package_files.py` guard asserts every `bin/_lib_*.py` runtime module is enumerated in `files[]` so a future sibling addition can't silently drop out of the npm distribution.
 
