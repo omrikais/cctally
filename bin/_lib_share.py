@@ -1202,6 +1202,12 @@ def _build_md_frontmatter(snap: ShareSnapshot) -> str:
     `branding=False` so `--no-branding` behaves consistently with the
     HTML/SVG footer-link stripping.
 
+    NOTE: spec §11.5 lists `template_id` as a 7th key, but the kernel
+    has no `ShareSnapshot.template_id` field (templates are a v2
+    registry concept above the kernel). Threading it through requires
+    a kernel signature change with v1 CLI golden churn — deferred to
+    issue #34.
+
     `anonymized` reflects whether `_scrub` has rewritten this snapshot --
     detected via `_snapshot_is_anonymized` (label-prefix heuristic; see
     that function for the contract).
