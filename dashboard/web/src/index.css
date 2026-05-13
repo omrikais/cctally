@@ -82,7 +82,11 @@ body { padding: 16px; box-sizing: border-box; }
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 4px;
+  /* 10px gives the .doctor-chip / .basket-chip pills breathing room
+     against the .topbar-sync icon cluster (4px crowded the rounded
+     pill border into the refresh arrow). Also brings the mobile
+     thumb-tap buttons closer to the 8pt HIG minimum. */
+  gap: 10px;
 }
 .topbar-actions > .topbar-icon-btn { display: none; }
 
