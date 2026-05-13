@@ -173,3 +173,82 @@ def test_setup_compute_symlink_state_helper(tmp_path):
         assert state_by_name[names[1]] == "wrong"
     for name in names[2:]:
         assert state_by_name[name] == "missing"
+
+
+def test_setup_compute_symlink_state_cross_install(tmp_path):
+    """Regression: a symlink that points at a DIFFERENT valid cctally
+    install (e.g., user has npm-installed cctally + the source clone
+    they're running doctor from) must still report "ok". The strict
+    source-equality check produced 0/13 false negatives on every fresh
+    `cctally dashboard` launched from the dev tree, even though the
+    `~/.local/bin/cctally-*` symlinks were perfectly healthy."""
+    other_install = tmp_path / "other-cctally" / "bin"
+    other_install.mkdir(parents=True)
+    dst_dir = tmp_path / "local-bin"
+    dst_dir.mkdir()
+    driver = textwrap.dedent(f"""
+        import sys, json, pathlib, os
+        sys.path.insert(0, {str(REPO / 'bin')!r})
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("cctally", {str(CCTALLY)!r})
+        spec = importlib.util.spec_from_loader("cctally", loader)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        repo_root = mod._setup_resolve_repo_root()
+        dst_dir = pathlib.Path({str(dst_dir)!r})
+        other_bin = pathlib.Path({str(other_install)!r})
+        # Seed the foreign install with an executable file per SETUP name
+        # and symlink each name in dst_dir to it. None of the symlinks
+        # point at `repo_root/bin/<name>` — the strict pre-fix check
+        # would classify all of them "wrong".
+        for name in mod.SETUP_SYMLINK_NAMES:
+            target = other_bin / name
+            target.write_text("#!/bin/sh\\nexit 0\\n")
+            target.chmod(0o755)
+            (dst_dir / name).symlink_to(target)
+        state = mod._setup_compute_symlink_state(repo_root, dst_dir)
+        print(json.dumps(state))
+    """)
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path / "home")
+    env["TZ"] = "Etc/UTC"
+    (tmp_path / "home").mkdir()
+    res = subprocess.run([sys.executable, "-c", driver],
+                         env=env, capture_output=True, text=True, check=True)
+    state_by_name = dict(json.loads(res.stdout))
+    for name, st in state_by_name.items():
+        assert st == "ok", (name, st)
+
+
+def test_setup_compute_symlink_state_dangling_symlink(tmp_path):
+    """Dangling symlink → "wrong" (not "missing", not "ok"). The
+    loose check derives reachability via `resolve(strict=True)` rather
+    than path equality, so a target that vanished after install must
+    not be misreported as a healthy slot."""
+    dst_dir = tmp_path / "local-bin"
+    dst_dir.mkdir()
+    driver = textwrap.dedent(f"""
+        import sys, json, pathlib, os
+        sys.path.insert(0, {str(REPO / 'bin')!r})
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("cctally", {str(CCTALLY)!r})
+        spec = importlib.util.spec_from_loader("cctally", loader)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        repo_root = mod._setup_resolve_repo_root()
+        dst_dir = pathlib.Path({str(dst_dir)!r})
+        first = mod.SETUP_SYMLINK_NAMES[0]
+        (dst_dir / first).symlink_to(pathlib.Path({str(tmp_path)!r}) / "does-not-exist")
+        state = dict(mod._setup_compute_symlink_state(repo_root, dst_dir))
+        print(json.dumps({{"first": first, "state": state[first]}}))
+    """)
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path / "home")
+    env["TZ"] = "Etc/UTC"
+    (tmp_path / "home").mkdir()
+    res = subprocess.run([sys.executable, "-c", driver],
+                         env=env, capture_output=True, text=True, check=True)
+    payload = json.loads(res.stdout)
+    assert payload["state"] == "wrong"

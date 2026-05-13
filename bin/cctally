@@ -24499,17 +24499,34 @@ def _setup_compute_symlink_state(
 ) -> "list[tuple[str, str]]":
     """Per-symlink (name, state) for `_setup_status` + `doctor_gather_state`.
 
-    state ∈ {"ok", "wrong", "missing"}: "ok" = symlink resolves to
-    expected source; "wrong" = path exists but isn't the right symlink
-    (e.g., regular file or symlink → elsewhere); "missing" = no path
-    at all.
+    state ∈ {"ok", "wrong", "missing"}:
+      - "ok": ``dst_dir/name`` is a symlink whose target is reachable.
+        The target is NOT required to match ``repo_root/bin/<name>`` —
+        power users routinely have the symlinks installed by one
+        cctally channel (npm/brew) while running ``doctor`` from a
+        parallel source clone, which would otherwise produce a 0/N
+        false negative on a perfectly healthy install. The diagnostic
+        question is "is `cctally-X` invokable from PATH?", not "did
+        THIS checkout install the symlink?". ``_setup_create_symlinks``
+        keeps its own strict equality check for install-management
+        (replace-vs-already).
+      - "wrong": a non-symlink file occupies the slot, or the symlink
+        target is dangling.
+      - "missing": nothing at ``dst_dir/name``.
+
+    ``repo_root`` is unused here — retained on the signature for
+    call-site stability across `_setup_status` and `doctor_gather_state`.
     """
+    del repo_root  # unused; see docstring
     out: list[tuple[str, str]] = []
     for name in SETUP_SYMLINK_NAMES:
         dst = dst_dir / name
-        src = _setup_resolve_symlink_source(repo_root, name)
-        if dst.is_symlink() and pathlib.Path(os.readlink(dst)) == src:
-            out.append((name, "ok"))
+        if dst.is_symlink():
+            try:
+                dst.resolve(strict=True)
+                out.append((name, "ok"))
+            except (FileNotFoundError, OSError):
+                out.append((name, "wrong"))
         elif dst.exists():
             out.append((name, "wrong"))
         else:
