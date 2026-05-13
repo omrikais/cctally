@@ -2945,7 +2945,16 @@ mark.current {
      content-sized week stat (~134px), both fit on row 1 down to 320. */
   .topbar .stat[data-stat="brand"]           { order: 0; flex: 0 0 auto; min-width: 0; }
   .topbar .stat[data-stat="week"]            { order: 1; flex: 0 1 auto; min-width: 0; }
-  .topbar-actions                            { order: 2; }
+  /* Mobile-specific gap: the desktop value (10px) gives the doctor
+     pill breathing room from the sync cluster, but on mobile the
+     trio's total width matters — adding ~18px pushes the trio over
+     the row 1 budget and forces a third-row wrap. 4px keeps the
+     compact ~140px width the row 1 layout was tuned around. The
+     `.topbar` ancestor prefix outranks the desktop `.topbar-actions`
+     rule (id-selector specificity floor gotcha — bare-class mobile
+     rules silently lose to longer chains in unrelated stylesheets,
+     so always re-prefix under the parent scope on mobile). */
+  .topbar .topbar-actions                    { order: 2; gap: 4px; }
   .topbar::after {
     content: "";
     flex-basis: 100%;
