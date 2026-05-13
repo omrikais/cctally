@@ -10070,17 +10070,76 @@ def _stamp_install_success_to_state(installed_version: str | None) -> None:
     ``refreshUpdateState`` auto-close (``current === latest``) never
     matches.
 
-    Falls back to ``state.latest_version`` when the caller didn't pass
-    an explicit ``--version`` — brew is always unpinned, and an
-    unpinned npm install resolves to whatever ``@latest`` advertised,
-    which is the value we just told the user about.
+    Resolution order:
+      1. ``installed_version`` — caller passed an explicit ``--version``.
+      2. Freshly-installed CHANGELOG (``_release_read_latest_release_version``).
+         For npm the install overwrites ``CHANGELOG.md`` in place, so
+         this read inside the same Python process returns the just-
+         installed version. For brew the running process's
+         ``CHANGELOG_PATH`` resolved to the OLD Cellar at boot, so the
+         read returns the OLD version — same failure mode as the
+         legacy fallback, but at least consistent with what the OLD
+         binary's ``cctally --version`` would say.
+      3. ``state.latest_version`` — last resort. Used to be the
+         primary fallback before issue surfaced where a stale
+         ``latest_version`` (cached probe from before the registry
+         advanced) caused ``cctally update`` to stamp the wrong
+         version (``current_version=1.6.0`` after installing 1.6.3).
+         Kept as last-resort only because it's the only signal
+         available when CHANGELOG is unreadable.
     """
     state = _load_update_state() or {"_schema": 1}
-    cur = installed_version or state.get("latest_version")
+    cur = installed_version
+    if cur is None:
+        fresh = _release_read_latest_release_version()
+        if fresh:
+            cur = fresh[0]
+    if cur is None:
+        cur = state.get("latest_version")
     if cur:
         state["current_version"] = cur
         state["last_install_success_at_utc"] = _now_utc().isoformat()
         _save_update_state(state)
+
+
+def _self_heal_current_version() -> None:
+    """Reconcile ``update-state.json``'s ``current_version`` with the
+    running binary's CHANGELOG when they disagree.
+
+    Closes the documented gap (memory:
+    ``gotcha_update_state_cache_lies_after_version_bump``) where a user
+    upgrades via ``npm install -g cctally@latest`` (or any out-of-band
+    path that bypasses ``cctally update``) and ``current_version``
+    stays frozen on the pre-upgrade value until the next TTL probe
+    fires (24h default). The dashboard's brand-version label and the
+    CLI banner predicate both read ``current_version``, so users see
+    a stale "you're on <old>" indefinitely.
+
+    Best-effort: any failure — state missing/corrupt, CHANGELOG
+    unreadable, save fails — is silently swallowed. The caller is in
+    a post-command hook and must never break the parent command.
+
+    Why not bootstrap when state is missing: a ``None`` state means no
+    update probe has ever run, so we have no ``latest_version`` /
+    ``install`` block to seed alongside ``current_version``. Writing a
+    partial state would mask the missing-probe condition that
+    ``_check_safety_update_state`` and the doctor report rely on; the
+    next ``_do_update_check`` creates the file fully.
+    """
+    try:
+        fresh = _release_read_latest_release_version()
+        if fresh is None:
+            return
+        running = fresh[0]
+        state = _load_update_state()
+        if state is None:
+            return
+        if state.get("current_version") == running:
+            return
+        state["current_version"] = running
+        _save_update_state(state)
+    except Exception:
+        pass
 
 
 # === Update subcommand: version-check pipeline (spec §3) ====================
@@ -11049,6 +11108,26 @@ class _DashboardUpdateCheckThread(threading.Thread):
     def run(self) -> None:
         while not self._stop.is_set():
             try:
+                # Self-heal runs every tick (every 30 min by default),
+                # NOT gated by `_is_update_check_due`'s 24h TTL. Catches
+                # the case where the user upgrades the npm package
+                # out-of-band (no `cctally update` invocation) — the
+                # dashboard's brand-version label needs to reflect the
+                # new binary without waiting up to 24h for the next
+                # TTL probe. Re-publish the snapshot after a self-heal
+                # write so live SSE subscribers pick up the corrected
+                # `current_version` on their next envelope.
+                healed_before = _load_update_state()
+                _self_heal_current_version()
+                healed_after = _load_update_state()
+                if (
+                    healed_before != healed_after
+                    and self._hub is not None
+                    and self._ref is not None
+                ):
+                    snap = self._ref.get()
+                    if snap is not None:
+                        self._hub.publish(snap)
                 config = load_config()
                 if _is_update_check_due(config):
                     _do_update_check()
@@ -38067,6 +38146,11 @@ def _post_command_update_hooks(command: str | None, args) -> None:
         return
     if command == "doctor":
         return
+    # Self-heal: reconcile current_version with the running binary's
+    # CHANGELOG. Cheap (one CHANGELOG read, write only on the first
+    # command after a manual upgrade). Runs before load_config so a
+    # bumped version is visible to the banner predicate immediately.
+    _self_heal_current_version()
     config = load_config()
     state = _load_update_state()
     suppress = _load_update_suppress()

@@ -11,6 +11,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - `share`: Detail templates for `weekly` / `daily` / `monthly` / `blocks` now ship cross-tab data (per-week × per-model, per-day × per-project, per-month × per-model, per-block × per-project) in their MD and HTML exports — resolves the per-project narrowing landed in M2.1 ([#33](https://github.com/omrikais/cctally-dev/issues/33)). SVG output for these templates continues to omit the table body and is tracked separately at [#38](https://github.com/omrikais/cctally-dev/issues/38).
 
+### Fixed
+- `update`: Dashboard version label and CLI banner no longer stay frozen on the pre-upgrade version after an out-of-band install (`npm install -g cctally@X` outside `cctally update`) — a new self-heal compares the running binary's CHANGELOG against `update-state.json` on every CLI command and every dashboard tick, re-stamping `current_version` when they disagree. Also fixed the underlying bug where `cctally update` (without `--version`) stamped the cached `latest_version` as the just-installed version: a stale probe from before the registry advanced caused `current_version` to land on the wrong value even though npm had actually fetched a newer release. `_stamp_install_success_to_state` now prefers the freshly-installed CHANGELOG, falling back to `latest_version` only when CHANGELOG is unreadable.
+
 ## [1.6.3] - 2026-05-12
 
 ### Fixed

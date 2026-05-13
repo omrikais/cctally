@@ -537,6 +537,195 @@ class TestInstallMethodDetection:
         assert "/Cellar/cctally/" in loaded["install"]["realpath"]
 
 
+class TestStampInstallSuccess:
+    """`_stamp_install_success_to_state` (spec §3.6, codex review #1).
+
+    Stamping policy: prefer the caller-supplied ``installed_version``,
+    then the freshly-installed CHANGELOG, then the cached
+    ``latest_version`` as last resort. The CHANGELOG hop fixes the bug
+    where a stale ``latest_version`` (cached probe from before the
+    registry advanced) caused ``cctally update`` to stamp the wrong
+    ``current_version`` after a successful install.
+    """
+
+    def test_explicit_version_wins_over_changelog(
+        self, ns, update_paths, monkeypatch,
+    ):
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "latest_version": "1.6.0",
+        })
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: ("1.6.3", "2026-05-12"),
+        )
+        ns["_stamp_install_success_to_state"]("1.6.5")
+        loaded = ns["_load_update_state"]()
+        assert loaded["current_version"] == "1.6.5"
+
+    def test_prefers_fresh_changelog_over_stale_latest_version(
+        self, ns, update_paths, monkeypatch,
+    ):
+        """Regression: stale ``latest_version=1.6.0`` from a pre-registry-
+        advance probe used to clobber ``current_version`` to 1.6.0 after
+        an unpinned ``cctally update`` (which actually installed 1.6.3
+        because npm resolves ``@latest`` independently). The freshly-
+        installed CHANGELOG (npm overwrites in place) is now consulted
+        before the cached ``latest_version``.
+        """
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "latest_version": "1.6.0",
+            "checked_at_utc": "2026-05-12T07:25:14+00:00",
+        })
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: ("1.6.3", "2026-05-12"),
+        )
+        ns["_stamp_install_success_to_state"](None)
+        loaded = ns["_load_update_state"]()
+        assert loaded["current_version"] == "1.6.3"
+        # Sibling top-level keys survive.
+        assert loaded["latest_version"] == "1.6.0"
+        assert loaded["checked_at_utc"] == "2026-05-12T07:25:14+00:00"
+        assert "last_install_success_at_utc" in loaded
+
+    def test_falls_back_to_latest_version_when_changelog_missing(
+        self, ns, update_paths, monkeypatch,
+    ):
+        """When CHANGELOG is unreadable (returns None), the last-resort
+        fallback to ``state.latest_version`` kicks in. Preserves the
+        pre-fix behaviour for source checkouts without a stamped
+        CHANGELOG."""
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "latest_version": "1.6.0",
+        })
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: None,
+        )
+        ns["_stamp_install_success_to_state"](None)
+        loaded = ns["_load_update_state"]()
+        assert loaded["current_version"] == "1.6.0"
+
+    def test_no_op_when_no_signal_available(
+        self, ns, update_paths, monkeypatch,
+    ):
+        """No installed_version, no CHANGELOG, no latest_version → write
+        nothing. State stays at its pre-call shape (no current_version
+        key, no last_install_success_at_utc)."""
+        ns["_save_update_state"]({"_schema": 1})
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: None,
+        )
+        ns["_stamp_install_success_to_state"](None)
+        loaded = ns["_load_update_state"]()
+        assert "current_version" not in loaded
+        assert "last_install_success_at_utc" not in loaded
+
+
+class TestSelfHealCurrentVersion:
+    """`_self_heal_current_version` — reconciles ``current_version`` in
+    update-state.json with the running binary's CHANGELOG when they
+    disagree. Closes the manual-`npm install -g` gap documented in
+    memory ``gotcha_update_state_cache_lies_after_version_bump``.
+    """
+
+    def test_updates_current_version_when_changelog_differs(
+        self, ns, update_paths, monkeypatch,
+    ):
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.6.0",
+            "latest_version": "1.6.0",
+            "checked_at_utc": "2026-05-12T07:25:14+00:00",
+        })
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: ("1.6.3", "2026-05-12"),
+        )
+        ns["_self_heal_current_version"]()
+        loaded = ns["_load_update_state"]()
+        assert loaded["current_version"] == "1.6.3"
+        # Sibling fields survive — self-heal must be a surgical update.
+        assert loaded["latest_version"] == "1.6.0"
+        assert loaded["checked_at_utc"] == "2026-05-12T07:25:14+00:00"
+
+    def test_no_op_when_state_matches_changelog(
+        self, ns, update_paths, monkeypatch,
+    ):
+        """When current_version already matches the running binary,
+        self-heal must not write — avoids spurious mtime churn on
+        every CLI command in the steady state."""
+        before_state = {
+            "_schema": 1,
+            "current_version": "1.6.3",
+            "latest_version": "1.6.3",
+        }
+        ns["_save_update_state"](before_state)
+        mtime_before = ns["UPDATE_STATE_PATH"].stat().st_mtime
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: ("1.6.3", "2026-05-12"),
+        )
+        ns["_self_heal_current_version"]()
+        mtime_after = ns["UPDATE_STATE_PATH"].stat().st_mtime
+        assert mtime_after == mtime_before, "self-heal should not write on no-op"
+
+    def test_no_op_when_state_file_absent(
+        self, ns, update_paths, monkeypatch,
+    ):
+        """Bootstrapping a partial state would mask the missing-probe
+        condition that ``_check_safety_update_state`` relies on. The
+        next ``_do_update_check`` creates the file fully."""
+        assert not ns["UPDATE_STATE_PATH"].exists()
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: ("1.6.3", "2026-05-12"),
+        )
+        ns["_self_heal_current_version"]()
+        assert not ns["UPDATE_STATE_PATH"].exists()
+
+    def test_no_op_when_changelog_unreadable(
+        self, ns, update_paths, monkeypatch,
+    ):
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.6.0",
+        })
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: None,
+        )
+        ns["_self_heal_current_version"]()
+        loaded = ns["_load_update_state"]()
+        assert loaded["current_version"] == "1.6.0"
+
+    def test_swallows_save_exceptions(
+        self, ns, update_paths, monkeypatch,
+    ):
+        """Best-effort contract: a corrupt save path must not break the
+        parent command (post-command hook wraps this in try/except too,
+        but the helper's own try/except is the front line)."""
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.6.0",
+        })
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: ("1.6.3", "2026-05-12"),
+        )
+
+        def boom(*_a, **_k):
+            raise OSError("simulated write failure")
+
+        monkeypatch.setitem(ns, "_save_update_state", boom)
+        # Must not raise.
+        ns["_self_heal_current_version"]()
+
+
 class TestNpmPrefixCaching:
     """`_resolve_npm_prefix` (spec §2.2).
 
