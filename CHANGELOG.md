@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- `update` (self-heal): `_self_heal_current_version` no longer corrupts the global `update-state.json` when `cctally` is invoked from a development clone. The post-command hook reads `CHANGELOG_PATH` via `__file__` (resolved against the dev tree's `CHANGELOG.md`, not the installed binary's), so any `./bin/cctally` invocation from the source tree — including the six phases of `cctally release` itself — stamped `current_version` to whatever the dev tree's CHANGELOG claimed, masking the actually-installed version on the user's machine until the next `rm ~/.local/share/cctally/update-state.json`. The self-heal now early-returns when a `.git/` directory sits next to `CHANGELOG_PATH`, since production tarballs (npm tar, brew archive) never ship `.git/`; legitimate out-of-band upgrades on installed npm/brew binaries still self-heal as before. Symmetric twin of the v1.7.0 brew fix (CHANGELOG-via-`__file__` ≠ installed-binary's CHANGELOG); same root cause, different trigger. Resolves [#42](https://github.com/omrikais/cctally-dev/issues/42).
+
 ## [1.7.0] - 2026-05-13
 
 ### Added

@@ -10134,8 +10134,20 @@ def _self_heal_current_version() -> None:
     partial state would mask the missing-probe condition that
     ``_check_safety_update_state`` and the doctor report rely on; the
     next ``_do_update_check`` creates the file fully.
+
+    Dev-clone guard (issue #42): when ``CHANGELOG_PATH``'s parent
+    contains a ``.git/`` directory, the running binary is a development
+    checkout, not the globally-installed one. The CHANGELOG describes
+    the working tree (e.g. a release-cut Phase 1 stamp), so stamping
+    the global state from it would corrupt ``current_version`` to a
+    version that is NOT what is installed. Production tarballs (npm
+    tar, brew archive) never ship ``.git/``, so this heuristic only
+    ever skips dev clones; legitimate out-of-band upgrades on npm/brew
+    still self-heal as before.
     """
     try:
+        if (CHANGELOG_PATH.parent / ".git").exists():
+            return
         fresh = _release_read_latest_release_version()
         if fresh is None:
             return

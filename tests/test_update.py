@@ -688,7 +688,23 @@ class TestSelfHealCurrentVersion:
     update-state.json with the running binary's CHANGELOG when they
     disagree. Closes the manual-`npm install -g` gap documented in
     memory ``gotcha_update_state_cache_lies_after_version_bump``.
+
+    All tests below redirect ``CHANGELOG_PATH`` to a per-test tmp dir
+    (matching the ``update_paths`` redirection pattern). Required since
+    the issue #42 dev-clone guard short-circuits when ``.git/`` sits
+    next to ``CHANGELOG_PATH`` — without redirection, the real dev
+    tree's ``.git/`` would trip the guard in every test.
     """
+
+    @pytest.fixture(autouse=True)
+    def _redirect_changelog_path(self, ns, tmp_path, monkeypatch):
+        """Pin ``CHANGELOG_PATH`` to a non-git tmp dir for every test
+        in this class. Tests that exercise the dev-clone guard
+        explicitly override this with their own ``.git/``-bearing dir.
+        """
+        fake_install = tmp_path / "self-heal-install"
+        fake_install.mkdir()
+        monkeypatch.setitem(ns, "CHANGELOG_PATH", fake_install / "CHANGELOG.md")
 
     def test_updates_current_version_when_changelog_differs(
         self, ns, update_paths, monkeypatch,
@@ -781,6 +797,65 @@ class TestSelfHealCurrentVersion:
         monkeypatch.setitem(ns, "_save_update_state", boom)
         # Must not raise.
         ns["_self_heal_current_version"]()
+
+    def test_skips_when_running_from_git_clone(
+        self, ns, update_paths, tmp_path, monkeypatch,
+    ):
+        """Dev-tree gotcha (issue #42): when ``CHANGELOG_PATH``'s parent
+        contains a ``.git/`` directory, the running binary is a dev
+        clone, not the globally-installed one — the CHANGELOG describes
+        the working tree (e.g. a release-cut Phase 1 stamp), so
+        self-healing the global state from it corrupts ``current_version``.
+
+        Production tarballs (npm tar, brew archive) never ship
+        ``.git/``, so this heuristic only ever skips dev clones.
+        """
+        fake_repo = tmp_path / "fake-repo"
+        fake_repo.mkdir()
+        (fake_repo / ".git").mkdir()
+        (fake_repo / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n## [9.9.9] - 2026-05-13\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setitem(ns, "CHANGELOG_PATH", fake_repo / "CHANGELOG.md")
+
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.6.0",
+            "latest_version": "1.6.0",
+        })
+        ns["_self_heal_current_version"]()
+        loaded = ns["_load_update_state"]()
+        assert loaded["current_version"] == "1.6.0", (
+            "self-heal must not stamp from a dev-tree CHANGELOG"
+        )
+
+    def test_proceeds_when_no_git_marker_present(
+        self, ns, update_paths, tmp_path, monkeypatch,
+    ):
+        """Sanity for the issue #42 guard: without a ``.git/`` marker,
+        the self-heal proceeds normally. Mirrors the production layout
+        for npm tarballs and brew archives — both of which exclude
+        ``.git/`` from the published artifact.
+        """
+        fake_install = tmp_path / "fake-install"
+        fake_install.mkdir()
+        (fake_install / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n## [1.7.0] - 2026-05-13\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setitem(ns, "CHANGELOG_PATH", fake_install / "CHANGELOG.md")
+
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "current_version": "1.6.3",
+            "latest_version": "1.6.3",
+        })
+        ns["_self_heal_current_version"]()
+        loaded = ns["_load_update_state"]()
+        assert loaded["current_version"] == "1.7.0", (
+            "self-heal must run when no dev-tree marker is present"
+        )
 
 
 class TestNpmPrefixCaching:
