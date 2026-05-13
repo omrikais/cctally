@@ -37,7 +37,7 @@ usable as a healthcheck without false-positive noise:
 
 ## Check inventory
 
-Six categories, ~18 checks. Each check has a stable `id` (used as the
+Six categories, 20 checks. Each check has a stable `id` (used as the
 JSON key), a one-line summary, and a remediation hint shown when
 severity != `OK`.
 
