@@ -26,6 +26,7 @@ def test_doctor_state_has_required_fields():
         "config_json_error",
         "update_state", "update_state_error",
         "update_suppress", "update_suppress_error",
+        "effective_update_available", "effective_update_reason",
         "now_utc", "cctally_version",
     }
     assert fields == expected, fields ^ expected
@@ -88,6 +89,11 @@ def _state(**overrides) -> L.DoctorState:
         # Canonical default record per bin/cctally:9731 (_load_update_suppress).
         update_suppress={"_schema": 1, "skipped_versions": [], "remind_after": None},
         update_suppress_error=None,
+        # Defaults match the happy-path update_state (cur == lat → "no_newer");
+        # individual tests can override these alongside `update_state` to drive
+        # the warn / skipped / reminded paths.
+        effective_update_available=False,
+        effective_update_reason="no_newer",
         now_utc=dt.datetime(2026, 5, 13, 14, 22, 31, tzinfo=dt.timezone.utc),
         cctally_version="1.6.3",
     )
@@ -467,13 +473,66 @@ def test_safety_update_suppress_ok_when_remind_after_null():
 def test_safety_update_available_ok_when_uptodate():
     r = L._check_safety_update_available(_state())
     assert r.severity == "ok"
+    assert "suppressed" not in r.details
 
 
 def test_safety_update_available_warn_when_newer():
-    s = _state(update_state={"current_version": "1.6.0", "latest_version": "1.6.3"})
+    s = _state(
+        update_state={"current_version": "1.6.0", "latest_version": "1.6.3"},
+        effective_update_available=True,
+        effective_update_reason=None,
+    )
     r = L._check_safety_update_available(s)
     assert r.severity == "warn"
     assert "1.6.3" in r.summary
+
+
+def test_safety_update_available_ok_when_skipped():
+    """Newer version exists but the user skipped it via `cctally update --skip`.
+    The banner stays silent; doctor must match — no `Run cctally update`
+    remediation. Suppression reason is surfaced in details for verbose readers.
+    """
+    s = _state(
+        update_state={"current_version": "1.6.0", "latest_version": "1.6.3"},
+        update_suppress={
+            "_schema": 1,
+            "skipped_versions": ["1.6.3"],
+            "remind_after": None,
+        },
+        effective_update_available=False,
+        effective_update_reason="skipped",
+    )
+    r = L._check_safety_update_available(s)
+    assert r.severity == "ok"
+    assert r.summary == "no"
+    assert r.remediation is None
+    assert r.details["suppressed"] is True
+    assert r.details["suppression_reason"] == "skipped"
+
+
+def test_safety_update_available_ok_when_reminded():
+    """Newer version exists but the user deferred via `cctally update --remind`.
+    Same contract as skipped: banner silent → doctor silent."""
+    s = _state(
+        update_state={"current_version": "1.6.0", "latest_version": "1.6.3"},
+        effective_update_available=False,
+        effective_update_reason="reminded",
+    )
+    r = L._check_safety_update_available(s)
+    assert r.severity == "ok"
+    assert r.details["suppressed"] is True
+    assert r.details["suppression_reason"] == "reminded"
+
+
+def test_safety_update_available_details_omit_suppressed_when_irrelevant():
+    """No probe yet (missing_state / no_newer): details preserve the
+    pre-existing shape (no `suppressed` key) so 13 existing fixture
+    goldens stay byte-stable."""
+    s = _state(update_state=None, effective_update_available=False,
+               effective_update_reason="missing_state")
+    r = L._check_safety_update_available(s)
+    assert "suppressed" not in r.details
+    assert "suppression_reason" not in r.details
 
 
 def test_run_checks_returns_six_categories():

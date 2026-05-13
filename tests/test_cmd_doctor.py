@@ -170,3 +170,34 @@ def test_doctor_quiet_and_verbose_mutually_exclusive(tmp_path):
 def test_doctor_in_help_listing():
     r = _run(["--help"])
     assert "doctor" in r.stdout
+
+
+def test_doctor_writes_nothing_to_app_dir_on_fresh_home(tmp_path):
+    """Read-only diagnostic contract: `cctally doctor --json` on a
+    virgin HOME must not create `config.json`, `update-state.json`,
+    `update.log`, or any other side-effect file under APP_DIR.
+
+    Regression test for the bug where `_post_command_update_hooks`
+    ran after `cmd_doctor`, calling `load_config()` (auto-creates
+    config.json) and `_spawn_background_update_check()` (writes
+    update-state.json + update.log). Adding `doctor` to
+    `_BANNER_SUPPRESSED_COMMANDS` only silenced the banner; the
+    side effects persisted. Fixed by an early return in
+    `_post_command_update_hooks` for `command == "doctor"`.
+    """
+    r = _run(["doctor", "--json"], home=tmp_path)
+    # The command itself should succeed (return 0 or 2 depending on
+    # whether unrelated checks FAIL on a fresh HOME); we only assert
+    # the no-side-effect invariant here.
+    assert r.returncode in (0, 2), (
+        f"doctor crashed: rc={r.returncode}\nstderr={r.stderr}"
+    )
+    app_dir = tmp_path / ".local" / "share" / "cctally"
+    # Doctor may legitimately read these files if a prior command
+    # created them, but on a fresh HOME the directory should not even
+    # exist after `doctor` runs. ensure_dirs() — invoked only via
+    # load_config() — is the function that would have created it.
+    assert not app_dir.exists(), (
+        f"doctor created APP_DIR on fresh HOME: "
+        f"{sorted(p.name for p in app_dir.rglob('*'))}"
+    )

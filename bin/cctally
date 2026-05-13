@@ -15116,6 +15116,58 @@ def _semver_gt(a: str, b: str) -> bool:
            _release_semver_sort_key(_release_parse_semver(b))
 
 
+def _compute_effective_update_available(
+    state: dict[str, Any] | None,
+    suppress: dict[str, Any] | None,
+    now_utc: "dt.datetime",
+) -> "tuple[bool, str | None]":
+    """Shared core of "is there a *real* pending update?"
+
+    Returns ``(available, reason)`` where ``reason`` is:
+      - ``"missing_state"`` — current/latest unknown (no probe yet)
+      - ``"no_newer"`` — latest is not strictly greater than current
+      - ``"skipped"`` — user has skipped the latest version
+      - ``"reminded"`` — user has deferred and the window is still active
+      - ``None`` — available (warn-worthy)
+
+    Single source of truth for both ``_should_show_update_banner`` and
+    ``cctally doctor``'s ``safety.update_available`` check. Keeping this
+    shared avoids the bug where doctor would advertise an update the
+    banner suppresses (see review finding "Respect skipped/reminded
+    updates"). Malformed ``remind_after`` fails open — matches the
+    banner's pre-extraction posture: better to show a real reminder
+    than to silently drop one because of a corrupt suppress file.
+    """
+    if state is None:
+        return False, "missing_state"
+    cur = state.get("current_version")
+    lat = state.get("latest_version")
+    if not cur or not lat:
+        return False, "missing_state"
+    try:
+        if not _semver_gt(lat, cur):
+            return False, "no_newer"
+    except ValueError:
+        return False, "no_newer"
+    sup = suppress or {}
+    if lat in sup.get("skipped_versions", []):
+        return False, "skipped"
+    remind = sup.get("remind_after")
+    if remind is not None:
+        try:
+            # Hide while the deferral is active AND the user-pinned version
+            # is still the latest. A newer drop overrides the deferral.
+            if not _semver_gt(lat, remind["version"]):
+                until = dt.datetime.fromisoformat(remind["until_utc"])
+                if now_utc < until:
+                    return False, "reminded"
+        except (KeyError, ValueError):
+            # Malformed remind_after: fail-open. Better to surface a
+            # real update than to silently drop it.
+            pass
+    return True, None
+
+
 def _should_show_update_banner(
     command: str | None,
     args: argparse.Namespace,
@@ -15133,6 +15185,10 @@ def _should_show_update_banner(
     subcommand inherits the suppression automatically. Adding a parallel
     list here would silently regress that invariant — the spec
     amendment for Codex finding #8 codifies this.
+
+    Semver + skipped + remind logic is delegated to
+    :func:`_compute_effective_update_available` so ``cctally doctor``
+    stays in lockstep with this predicate.
     """
     if command in _BANNER_SUPPRESSED_COMMANDS or command in _UPDATE_BANNER_EXTRA_SUPPRESSED:
         return False
@@ -15146,33 +15202,8 @@ def _should_show_update_banner(
         return False
     if not config.get("update", {}).get("check", {}).get("enabled", True):
         return False
-    if state is None:
-        return False
-    cur = state.get("current_version")
-    lat = state.get("latest_version")
-    if not cur or not lat:
-        return False
-    try:
-        if not _semver_gt(lat, cur):
-            return False
-    except ValueError:
-        return False
-    if lat in suppress.get("skipped_versions", []):
-        return False
-    remind = suppress.get("remind_after")
-    if remind is not None:
-        try:
-            # Hide while the deferral is active AND the user-pinned version
-            # is still the latest. A newer drop overrides the deferral.
-            if not _semver_gt(lat, remind["version"]):
-                until = dt.datetime.fromisoformat(remind["until_utc"])
-                if _now_utc() < until:
-                    return False
-        except (KeyError, ValueError):
-            # Malformed remind_after: fail-open (banner shows). Better
-            # than silently dropping a real update reminder.
-            pass
-    return True
+    available, _ = _compute_effective_update_available(state, suppress, _now_utc())
+    return available
 
 
 def _format_update_banner(state: dict[str, Any]) -> str:
@@ -24290,17 +24321,28 @@ def doctor_gather_state(
 
     # ── Safety ───────────────────────────────────────────────────────
     # `dashboard.bind` is read via the same chokepoint that powers
-    # `cctally config get dashboard.bind` — _config_known_value
+    # `cctally config get dashboard.bind` — `_config_known_value`
     # normalizes hand-edited junk back to "loopback", matching the
-    # value cmd_dashboard would actually bind to. We use
-    # _load_config_unlocked (NOT load_config) so a fresh HOME doesn't
-    # trigger first-run config.json creation under doctor.
+    # value cmd_dashboard would actually bind to.
+    #
+    # Raw JSON read (NOT load_config or _load_config_unlocked): both
+    # call `ensure_dirs()`, which creates `~/.local/share/cctally/`
+    # and `logs/` on a fresh HOME. Doctor is a read-only diagnostic
+    # (H1 invariant) — it must never mutate user state, even by
+    # creating an empty directory tree. Corrupt JSON yields
+    # `dashboard_bind_stored = "loopback"` (the same fallback the
+    # original try/except gave); the dedicated `config_json_valid`
+    # check surfaces the corruption separately.
+    dashboard_bind_stored = "loopback"
     try:
-        dashboard_bind_stored = _config_known_value(
-            _load_config_unlocked(), "dashboard.bind",
-        ) or "loopback"
-    except Exception:
-        dashboard_bind_stored = "loopback"
+        if CONFIG_PATH.exists():
+            raw_cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw_cfg, dict):
+                dashboard_bind_stored = (
+                    _config_known_value(raw_cfg, "dashboard.bind") or "loopback"
+                )
+    except (json.JSONDecodeError, OSError):
+        pass
 
     # config.json — RAW READ, never load_config(). load_config()
     # auto-creates on first run AND silently falls back to defaults
@@ -24328,6 +24370,12 @@ def doctor_gather_state(
         update_suppress = _load_update_suppress()
     except Exception as exc:
         update_suppress_error = f"{type(exc).__name__}: {exc}"
+
+    # Same predicate the update banner uses; doctor must not warn about
+    # updates the user has already skipped or deferred.
+    effective_update_available, effective_update_reason = (
+        _compute_effective_update_available(update_state, update_suppress, now_utc)
+    )
 
     # ── Meta ─────────────────────────────────────────────────────────
     cctally_version_tuple = _release_read_latest_release_version()
@@ -24360,6 +24408,8 @@ def doctor_gather_state(
         update_state_error=update_state_error,
         update_suppress=update_suppress,
         update_suppress_error=update_suppress_error,
+        effective_update_available=effective_update_available,
+        effective_update_reason=effective_update_reason,
         now_utc=now_utc,
         cctally_version=cctally_version,
     )
@@ -38002,8 +38052,20 @@ def _post_command_update_hooks(command: str | None, args) -> None:
     ``ensure_dirs()`` first-run path, leaving a stub config.json behind
     and breaking the post-purge "data dir gone" invariant. Skip the
     hook entirely for that command — the banner is moot post-uninstall
-    anyway."""
+    anyway.
+
+    Skip-for-doctor: ``doctor`` is a read-only diagnostic by contract.
+    ``load_config()`` would call ``ensure_dirs()`` and write a stub
+    ``config.json`` on a fresh HOME; ``_spawn_background_update_check``
+    would write ``update-state.json`` and ``update.log``. Adding doctor
+    to ``_BANNER_SUPPRESSED_COMMANDS`` only silences the banner — it
+    does not stop these side effects. Doctor reads update state for
+    its report via the gather layer; it must not refresh that state
+    opportunistically. Users who want a fresh check have
+    ``cctally update --check``."""
     if command == "setup" and getattr(args, "uninstall", False):
+        return
+    if command == "doctor":
         return
     config = load_config()
     state = _load_update_state()

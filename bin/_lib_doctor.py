@@ -60,6 +60,13 @@ class DoctorState:
     update_state_error: Optional[str]
     update_suppress: Optional[dict]
     update_suppress_error: Optional[str]
+    # Precomputed by `doctor_gather_state` via the same predicate that
+    # gates the update banner (`_compute_effective_update_available`).
+    # Keeps the kernel free of release-version knowledge while staying
+    # in lockstep with the banner: doctor must never warn about an
+    # update the user has skipped or deferred.
+    effective_update_available: Optional[bool]
+    effective_update_reason: Optional[str]
     # Meta
     now_utc: dt.datetime
     cctally_version: str
@@ -654,12 +661,26 @@ def _check_safety_update_available(s: DoctorState) -> CheckResult:
     st = s.update_state or {}
     cur = st.get("current_version")
     lat = st.get("latest_version")
-    if not cur or not lat or cur == lat:
+    # `effective_update_available` is precomputed by the I/O layer via
+    # the same predicate the update banner uses (semver + skipped +
+    # remind_after). If the user has skipped or deferred a newer
+    # version, the banner stays silent — doctor must do the same.
+    if not s.effective_update_available:
+        details = {"current_version": cur, "latest_version": lat}
+        reason = s.effective_update_reason
+        # Surface the suppression reason only when it matters — i.e.
+        # there *is* a newer version, but the user has opted out.
+        # Preserves the byte-stable details shape for the common case
+        # (no probe yet / no newer version) while informing verbose
+        # readers when a real update is being held back.
+        if reason in ("skipped", "reminded"):
+            details["suppressed"] = True
+            details["suppression_reason"] = reason
         return CheckResult(
             id="safety.update_available", title="Update available",
             severity="ok", summary="no",
             remediation=None,
-            details={"current_version": cur, "latest_version": lat},
+            details=details,
         )
     return CheckResult(
         id="safety.update_available", title="Update available",
