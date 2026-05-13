@@ -2939,31 +2939,49 @@ mark.current {
      .topbar-actions (last in DOM) lands beside Week; the ::after
      pseudo with flex-basis:100% inserts a hard wrap point so the
      break is independent of stat-cell widths. */
-  /* `flex: 0 1 auto` so the week stat doesn't grow into the actions
-     trio's row 1 territory (it would otherwise force actions to wrap
-     to its own row). With a compact action trio (~140px) and a
-     content-sized week stat (~134px), both fit on row 1 down to 320. */
+  /* Two-row mobile header (user spec, 2026-05-13):
+       Row 1: Week + Used + $/1%   (Fcst hidden on mobile)
+       Row 2: Doctor pill (left) ............... ⚙ ? ⟳ (right)
+     `flex: 0 1 auto` on the row-1 stats lets the row reflow at
+     narrow viewports without spilling Used / $/1% to a third row
+     ahead of the action trio. */
   .topbar .stat[data-stat="brand"]           { order: 0; flex: 0 0 auto; min-width: 0; }
   .topbar .stat[data-stat="week"]            { order: 1; flex: 0 1 auto; min-width: 0; }
-  /* Mobile-specific gap: the desktop value (10px) gives the doctor
-     pill breathing room from the sync cluster, but on mobile the
-     trio's total width matters — adding ~18px pushes the trio over
-     the row 1 budget and forces a third-row wrap. 4px keeps the
-     compact ~140px width the row 1 layout was tuned around. The
-     `.topbar` ancestor prefix outranks the desktop `.topbar-actions`
-     rule (id-selector specificity floor gotcha — bare-class mobile
-     rules silently lose to longer chains in unrelated stylesheets,
-     so always re-prefix under the parent scope on mobile). */
-  .topbar .topbar-actions                    { order: 2; gap: 4px; }
+  .topbar .stat[data-stat="used"]            { order: 2; flex: 0 1 auto; min-width: 0; }
+  .topbar .stat[data-stat="dollar-per-pct"]  { order: 3; flex: 0 1 auto; min-width: 0; }
+  /* Forecast is dropped on mobile to keep row 1 to three stats.
+     Used + $/1% are the two budget-critical numbers; Fcst lives in
+     the dedicated Forecast panel a tap below. */
+  .topbar .stat[data-stat="forecast"]        { display: none; }
+  /* Hard wrap point AFTER the row-1 stats, BEFORE the action trio.
+     `::after` with flex-basis:100% works regardless of how the
+     row-1 stats reflow internally. */
   .topbar::after {
     content: "";
     flex-basis: 100%;
     height: 0;
-    order: 3;
+    order: 4;
   }
-  .topbar .stat[data-stat="used"]            { order: 4; }
-  .topbar .stat[data-stat="dollar-per-pct"]  { order: 5; }
-  .topbar .stat[data-stat="forecast"]        { order: 6; }
+  /* Row 2 = the action band: doctor pill at the start, basket chip +
+     icon trio clustered at the end. Width:100% claims the full row;
+     `margin-left:0` overrides the desktop `margin-left:auto` (which
+     would hug the wrapper to the right edge and strand the doctor
+     pill mid-row). The flex container stays `flex-start` — the
+     doctor chip's own `margin-right:auto` (below) absorbs all
+     leftover space, pushing every sibling that follows it to the
+     right edge as one cluster. `justify-content: space-between`
+     would NOT work here: it would distribute slack between every
+     pair of children, spreading the icon trio across the row
+     instead of clustering them. */
+  .topbar .topbar-actions {
+    order: 5;
+    margin-left: 0;
+    width: 100%;
+    gap: 4px;
+  }
+  .topbar .topbar-actions .doctor-chip {
+    margin-right: auto;
+  }
   /* Mobile: drop the "cctally" word + the version since horizontal
      real estate is tight; keep just the update badge if present.
      Re-prefix all property declarations with `.topbar` so they outrank
