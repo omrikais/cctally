@@ -31,19 +31,23 @@ refreshUpdateState();
 
 // Install the global keydown listener and the always-on bindings.
 installGlobalKeydown();
-// All digit/letter globals are guarded against `update.modalOpen` so a
-// keystroke while the update modal is showing doesn't dispatch a
-// parallel panel modal into ModalRoot (UpdateModal mounts in its own
-// root). `q`/`r`/`n`/`N` all skip while the update modal is open, but
-// Esc still routes to UpdateModal's modal-scope binding via the
-// scope-priority sort. See `gotcha: project_global_hotkeys_modal_guard`.
-const _updateOpenGuard = () => !getState().update.modalOpen;
+// All digit/letter globals are guarded against modals layered in their
+// own root (`update.modalOpen`, `doctorModalOpen`) so a keystroke
+// behind one of those modals doesn't dispatch a parallel panel modal
+// into ModalRoot or fire `q`/`r` invisibly underneath. The Update and
+// Doctor modals each manage their own `Escape` via modal-scope bindings,
+// so closing them is unaffected by this guard. See
+// `gotcha: project_global_hotkeys_modal_guard`.
+const _globalKeyGuard = (): boolean => {
+  const s = getState();
+  return !s.update.modalOpen && !s.doctorModalOpen;
+};
 
 // Doctor key (`d`) uses a composite guard per spec §6.4 (Codex M5):
 // - !openModal      — a panel modal isn't currently up.
 // - !update.modalOpen — the update modal (own root) isn't up.
 // - inputMode === null — search/filter input modes own the keyboard.
-// The bare _updateOpenGuard pattern would let `d` fire through a
+// The bare _globalKeyGuard pattern would let `d` fire through a
 // panel modal or during text-input mode. The same triple guard the
 // share/composer/basket keys use (see share/keyboardShare.ts).
 const _doctorOpenGuard = (): boolean => {
@@ -55,19 +59,19 @@ const _doctorOpenGuard = (): boolean => {
 };
 
 registerKeymap([
-  { key: '1', scope: 'global', when: _updateOpenGuard, action: () => openPanelByPosition(1) },
-  { key: '2', scope: 'global', when: _updateOpenGuard, action: () => openPanelByPosition(2) },
-  { key: '3', scope: 'global', when: _updateOpenGuard, action: () => openPanelByPosition(3) },
-  { key: '4', scope: 'global', when: _updateOpenGuard, action: () => openPanelByPosition(4) },
-  { key: '5', scope: 'global', when: _updateOpenGuard, action: () => openPanelByPosition(5) },
-  { key: '6', scope: 'global', when: _updateOpenGuard, action: () => openPanelByPosition(6) },
-  { key: '7', scope: 'global', when: _updateOpenGuard, action: () => openPanelByPosition(7) },
-  { key: '8', scope: 'global', when: _updateOpenGuard, action: () => openPanelByPosition(8) },
-  { key: '9', scope: 'global', when: _updateOpenGuard, action: () => openPanelByPosition(9) },
-  { key: 'r', scope: 'global', when: _updateOpenGuard, action: () => triggerSync() },
-  { key: 'q', scope: 'global', when: _updateOpenGuard, action: tryQuit },
-  { key: 'n', scope: 'global', when: _updateOpenGuard, action: () => stepMatch(1) },
-  { key: 'N', scope: 'global', when: _updateOpenGuard, action: () => stepMatch(-1) },
+  { key: '1', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(1) },
+  { key: '2', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(2) },
+  { key: '3', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(3) },
+  { key: '4', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(4) },
+  { key: '5', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(5) },
+  { key: '6', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(6) },
+  { key: '7', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(7) },
+  { key: '8', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(8) },
+  { key: '9', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(9) },
+  { key: 'r', scope: 'global', when: _globalKeyGuard, action: () => triggerSync() },
+  { key: 'q', scope: 'global', when: _globalKeyGuard, action: tryQuit },
+  { key: 'n', scope: 'global', when: _globalKeyGuard, action: () => stepMatch(1) },
+  { key: 'N', scope: 'global', when: _globalKeyGuard, action: () => stepMatch(-1) },
   // Doctor modal — composite guard (see _doctorOpenGuard above).
   { key: 'd', scope: 'global', when: _doctorOpenGuard, action: () => dispatch({ type: 'OPEN_DOCTOR_MODAL' }) },
   // Share v2 (spec §12.1). Opens the share modal for the focused panel.

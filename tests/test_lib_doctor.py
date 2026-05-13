@@ -452,13 +452,15 @@ def test_safety_update_suppress_warn_on_missing_fields():
 
 def test_safety_update_suppress_warn_on_bad_types():
     """Spec §3.6 — WARN on unexpected types. skipped_versions must be a
-    list; remind_after may be None / str / numeric."""
+    list; remind_after may be None / str / numeric / dict."""
     r = L._check_safety_update_suppress(_state(
         update_suppress={"skipped_versions": "not-a-list", "remind_after": None}))
     assert r.severity == "warn"
     assert r.details["bad_types"] == ["skipped_versions"]
+    # A bool / list value for `remind_after` is still WARN — it doesn't
+    # match any producer shape past or present.
     r2 = L._check_safety_update_suppress(_state(
-        update_suppress={"skipped_versions": [], "remind_after": {"bad": "dict"}}))
+        update_suppress={"skipped_versions": [], "remind_after": [1, 2, 3]}))
     assert r2.severity == "warn"
     assert r2.details["bad_types"] == ["remind_after"]
 
@@ -467,6 +469,19 @@ def test_safety_update_suppress_ok_when_remind_after_null():
     """Default record has remind_after=None; that must be OK, not WARN."""
     r = L._check_safety_update_suppress(_state(
         update_suppress={"_schema": 1, "skipped_versions": [], "remind_after": None}))
+    assert r.severity == "ok"
+
+
+def test_safety_update_suppress_ok_when_remind_after_is_producer_dict():
+    """`cctally update --remind-later` writes `remind_after` as a dict
+    `{"version", "until_utc"}`. Doctor must accept that shape, not flag
+    the user's legitimate deferral as a corrupt file."""
+    r = L._check_safety_update_suppress(_state(
+        update_suppress={
+            "_schema": 1,
+            "skipped_versions": [],
+            "remind_after": {"version": "1.6.4", "until_utc": "2026-05-20T12:00:00+00:00"},
+        }))
     assert r.severity == "ok"
 
 

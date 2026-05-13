@@ -263,4 +263,42 @@ describe('keymap dispatcher', () => {
     guardedAction();
     expect(spy).toHaveBeenCalledTimes(1); // not called again
   });
+
+  it('global digit/letter bindings are suppressed while DoctorModal is open', () => {
+    // Regression: Doctor mounts its own root with its own `doctorModalOpen`
+    // flag (NOT folded into `openModal`). Without folding that flag into
+    // the global-key guard, `q`/`r`/`1`-`9` would fire underneath Doctor —
+    // quitting the dashboard, triggering a sync, or popping a panel modal
+    // into ModalRoot behind the Doctor card.
+    const globalGuard = (): boolean => {
+      const s = getState();
+      return !s.update.modalOpen && !s.doctorModalOpen;
+    };
+    const onOne = vi.fn();
+    const onQ = vi.fn();
+    const onR = vi.fn();
+    registerKeymap([
+      { key: '1', scope: 'global', when: globalGuard, action: onOne },
+      { key: 'q', scope: 'global', when: globalGuard, action: onQ },
+      { key: 'r', scope: 'global', when: globalGuard, action: onR },
+    ]);
+
+    // Doctor closed → all three fire.
+    keyDown('1'); keyDown('q'); keyDown('r');
+    expect(onOne).toHaveBeenCalledTimes(1);
+    expect(onQ).toHaveBeenCalledTimes(1);
+    expect(onR).toHaveBeenCalledTimes(1);
+
+    // Doctor open → all three suppressed.
+    dispatch({ type: 'OPEN_DOCTOR_MODAL' });
+    keyDown('1'); keyDown('q'); keyDown('r');
+    expect(onOne).toHaveBeenCalledTimes(1);
+    expect(onQ).toHaveBeenCalledTimes(1);
+    expect(onR).toHaveBeenCalledTimes(1);
+
+    // Close Doctor → bindings resume.
+    dispatch({ type: 'CLOSE_DOCTOR_MODAL' });
+    keyDown('1');
+    expect(onOne).toHaveBeenCalledTimes(2);
+  });
 });

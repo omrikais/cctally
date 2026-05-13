@@ -625,6 +625,63 @@ class TestStampInstallSuccess:
         assert "current_version" not in loaded
         assert "last_install_success_at_utc" not in loaded
 
+    def test_brew_prefers_latest_version_over_stale_changelog(
+        self, ns, update_paths, monkeypatch,
+    ):
+        """Regression: `brew upgrade cctally` runs inside the OLD-Cellar
+        Python process. Its `CHANGELOG_PATH` is bound to the pre-upgrade
+        Cellar, so `_release_read_latest_release_version()` returns the
+        OLD version. Passing the InstallMethod through must short-circuit
+        the CHANGELOG lookup and stamp the freshly-probed
+        `state.latest_version` (which `cctally update` had just refreshed
+        right before invoking brew).
+        """
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "latest_version": "1.6.4",
+            "checked_at_utc": "2026-05-13T07:25:14+00:00",
+        })
+        # CHANGELOG read returns OLD value because the running process's
+        # path resolves to the pre-upgrade Cellar.
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: ("1.6.3", "2026-05-12"),
+        )
+        brew_method = ns["InstallMethod"](
+            method="brew", realpath="/opt/homebrew/Cellar/cctally/1.6.3/bin/cctally",
+            npm_prefix=None,
+        )
+        ns["_stamp_install_success_to_state"](None, brew_method)
+        loaded = ns["_load_update_state"]()
+        # Must stamp the just-installed (latest probed) version, not the
+        # OLD-Cellar CHANGELOG.
+        assert loaded["current_version"] == "1.6.4"
+
+    def test_npm_path_still_prefers_changelog(
+        self, ns, update_paths, monkeypatch,
+    ):
+        """npm install overwrites CHANGELOG.md in place, so the same-
+        process read returns the just-installed version. The brew
+        short-circuit must NOT fire for npm — the prior stale-probe
+        regression (1.6.0-after-installing-1.6.3) depended on CHANGELOG
+        winning here."""
+        ns["_save_update_state"]({
+            "_schema": 1,
+            "latest_version": "1.6.0",  # stale cached probe
+        })
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: ("1.6.3", "2026-05-12"),
+        )
+        npm_method = ns["InstallMethod"](
+            method="npm",
+            realpath="/usr/local/lib/node_modules/cctally/bin/cctally",
+            npm_prefix="/usr/local",
+        )
+        ns["_stamp_install_success_to_state"](None, npm_method)
+        loaded = ns["_load_update_state"]()
+        assert loaded["current_version"] == "1.6.3"
+
 
 class TestSelfHealCurrentVersion:
     """`_self_heal_current_version` — reconciles ``current_version`` in

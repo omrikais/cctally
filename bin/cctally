@@ -10057,7 +10057,10 @@ def _persist_install_method_to_state(method: InstallMethod) -> None:
     _save_update_state(state)
 
 
-def _stamp_install_success_to_state(installed_version: str | None) -> None:
+def _stamp_install_success_to_state(
+    installed_version: str | None,
+    method: "InstallMethod | None" = None,
+) -> None:
     """Stamp ``update-state.json`` with the just-installed version so the
     post-install banner predicate + dashboard auto-close fire immediately.
 
@@ -10072,24 +10075,30 @@ def _stamp_install_success_to_state(installed_version: str | None) -> None:
 
     Resolution order:
       1. ``installed_version`` — caller passed an explicit ``--version``.
-      2. Freshly-installed CHANGELOG (``_release_read_latest_release_version``).
+      2. For brew (when ``method.method == "brew"`` and no explicit
+         version), ``state.latest_version`` — the freshly-probed value
+         that drove the install. The running process's ``CHANGELOG_PATH``
+         resolved to the OLD Cellar at boot, so a CHANGELOG read here
+         returns the pre-upgrade version and would stamp the wrong
+         ``current_version`` until the next dashboard self-heal (up to
+         30 min) or the next CLI invocation. The stale-probe regression
+         that pushed CHANGELOG ahead of ``latest_version`` (1.6.0-after-
+         installing-1.6.3) does not apply on the brew path: brew's
+         install probe ran inside the user's just-issued
+         ``cctally update``, so ``latest_version`` is current.
+      3. Freshly-installed CHANGELOG (``_release_read_latest_release_version``).
          For npm the install overwrites ``CHANGELOG.md`` in place, so
          this read inside the same Python process returns the just-
-         installed version. For brew the running process's
-         ``CHANGELOG_PATH`` resolved to the OLD Cellar at boot, so the
-         read returns the OLD version — same failure mode as the
-         legacy fallback, but at least consistent with what the OLD
-         binary's ``cctally --version`` would say.
-      3. ``state.latest_version`` — last resort. Used to be the
-         primary fallback before issue surfaced where a stale
-         ``latest_version`` (cached probe from before the registry
-         advanced) caused ``cctally update`` to stamp the wrong
-         version (``current_version=1.6.0`` after installing 1.6.3).
-         Kept as last-resort only because it's the only signal
-         available when CHANGELOG is unreadable.
+         installed version. Skipped on brew for the reason above.
+      4. ``state.latest_version`` — last resort, also covers the npm
+         path when CHANGELOG is unreadable.
     """
     state = _load_update_state() or {"_schema": 1}
     cur = installed_version
+    if cur is None and method is not None and method.method == "brew":
+        # Brew: prefer the cached probe (just observed by `cctally
+        # update`) over CHANGELOG, which reads from the OLD Cellar.
+        cur = state.get("latest_version")
     if cur is None:
         fresh = _release_read_latest_release_version()
         if fresh:
@@ -10850,7 +10859,7 @@ def _do_update_install(
                 if rc != 0:
                     return 1
             _log_update_event(log_fd, "INSTALL_SUCCESS")
-            _stamp_install_success_to_state(version)
+            _stamp_install_success_to_state(version, method)
             return 0
     finally:
         _release_update_lock(lock_fd)
@@ -11025,7 +11034,7 @@ class UpdateWorker:
                     self._emit(run_id, {"type": "done", "success": False})
                     return
             _log_update_event(log_fd, "INSTALL_SUCCESS")
-            _stamp_install_success_to_state(version)
+            _stamp_install_success_to_state(version, method)
             entrypoint, exec_argv = _resolve_execvp_target()
             self._emit(run_id, {"type": "execvp", "argv": exec_argv})
             try:

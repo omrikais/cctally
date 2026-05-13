@@ -633,7 +633,13 @@ def _check_safety_update_suppress(s: DoctorState) -> CheckResult:
             bad_types.append("skipped_versions")
     if "remind_after" in s.update_suppress:
         v = s.update_suppress["remind_after"]
-        if v is not None and not isinstance(v, (str, int, float)):
+        # The producer (bin/cctally `_do_update_remind_later`) writes
+        # `remind_after` as a dict `{"version", "until_utc"}`; the
+        # banner predicate consumes that shape. Accept it here so a
+        # legitimate deferral doesn't render as "bad types: remind_after".
+        # `None` (default record) and the legacy scalar form (older
+        # binaries persisted a bare until-string) both stay valid.
+        if v is not None and not isinstance(v, (str, int, float, dict)):
             bad_types.append("remind_after")
     if missing or bad_types:
         bits = []
