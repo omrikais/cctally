@@ -54,6 +54,33 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+
+def _load_sibling(name: str):
+    """Load bin/<name>.py via spec_from_file_location, register in sys.modules.
+
+    Robust across script-runtime AND test-loader contexts (the latter often
+    lack bin/ on sys.path; tests/conftest.py historically used compile+exec
+    which doesn't set it, and SourceFileLoader callers in tests/ insert
+    sys.path explicitly only when needed). The spec_from_file_location path
+    bypasses sys.path entirely.
+
+    Registers in sys.modules BEFORE exec_module so dataclass(frozen=True)
+    paths that inspect cls.__module__'s sys.modules entry work correctly.
+
+    Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md §6.3
+    """
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    import importlib.util as _ilu
+    p = pathlib.Path(__file__).resolve().parent / f"{name}.py"
+    spec = _ilu.spec_from_file_location(name, p)
+    mod = _ilu.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 APP_DIR = pathlib.Path.home() / ".local" / "share" / "cctally"
 LEGACY_APP_DIR = pathlib.Path.home() / ".local" / "share" / "ccusage-subscription"
 # Hook-tick runtime artifacts (Section 1 of onboarding spec).
@@ -128,7 +155,25 @@ def _homebrew_template_path() -> pathlib.Path:
 # paths by visibility — this is the publish target.
 PUBLIC_REPO = "omrikais/cctally"
 
-_SEMVER_NUM = r'(?:0|[1-9]\d*)'
+# === Eager-loaded library siblings ===
+#
+# Re-export pure-fn primitives from _lib_*.py so test/harness code that
+# reaches into cctally._release_parse_semver, cctally._SEMVER_RE, etc.
+# continues to work via the same attribute path. The actual definitions
+# live in the sibling modules; bin/cctally's namespace simply re-aliases
+# them. Eager because these are touched by code defined later in this
+# file (e.g. RELEASE_HEADER_RE uses _SEMVER_NUM).
+#
+# Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md §6.3-6.4
+
+_lib_semver = _load_sibling("_lib_semver")
+_SEMVER_NUM = _lib_semver._SEMVER_NUM
+_SEMVER_RE = _lib_semver._SEMVER_RE
+_release_parse_semver = _lib_semver._release_parse_semver
+_release_format_semver = _lib_semver._release_format_semver
+_release_compute_next_version = _lib_semver._release_compute_next_version
+_release_semver_sort_key = _lib_semver._release_semver_sort_key
+
 RELEASE_HEADER_RE = re.compile(
     rf'^## \[({_SEMVER_NUM}\.{_SEMVER_NUM}\.{_SEMVER_NUM}'
     rf'(?:-[a-zA-Z][a-zA-Z0-9-]*\.{_SEMVER_NUM})?)\] - (\d{{4}}-\d{{2}}-\d{{2}})\s*$',
@@ -136,76 +181,6 @@ RELEASE_HEADER_RE = re.compile(
 )
 
 RELEASE_SUBSECTION_ORDER = ("Added", "Changed", "Deprecated", "Removed", "Fixed", "Security")
-
-_SEMVER_RE = re.compile(
-    rf'^({_SEMVER_NUM})\.({_SEMVER_NUM})\.({_SEMVER_NUM})'
-    rf'(?:-([a-zA-Z][a-zA-Z0-9-]*)\.({_SEMVER_NUM}))?$'
-)
-
-
-def _release_parse_semver(s: str) -> tuple[int, int, int, str | None, int | None]:
-    """Parse SemVer; raises ValueError on malformed input."""
-    m = _SEMVER_RE.match(s)
-    if not m:
-        raise ValueError(f"invalid semver: {s!r}")
-    major, minor, patch, prerelease_id, prerelease_n = m.groups()
-    return (
-        int(major),
-        int(minor),
-        int(patch),
-        prerelease_id,
-        int(prerelease_n) if prerelease_n is not None else None,
-    )
-
-
-def _release_format_semver(
-    major: int, minor: int, patch: int,
-    prerelease_id: str | None = None, prerelease_n: int | None = None,
-) -> str:
-    base = f"{major}.{minor}.{patch}"
-    if prerelease_id is None:
-        return base
-    return f"{base}-{prerelease_id}.{prerelease_n}"
-
-
-def _release_compute_next_version(
-    current: str | None, kind: str, bump: str | None, prerelease_id: str,
-) -> str:
-    """Pure function. Implements bump rules from spec Section 4.4."""
-    if current is None:
-        # First-ever release. Treat as 0.0.0 base.
-        cur_maj, cur_min, cur_pat, cur_id, cur_n = 0, 0, 0, None, None
-    else:
-        cur_maj, cur_min, cur_pat, cur_id, cur_n = _release_parse_semver(current)
-    is_prerelease = cur_id is not None
-
-    if kind == "finalize":
-        if not is_prerelease:
-            raise ValueError("cannot finalize: current version is not a prerelease")
-        return _release_format_semver(cur_maj, cur_min, cur_pat)
-
-    if kind == "prerelease":
-        if is_prerelease:
-            if bump is not None:
-                raise ValueError("--bump invalid when current version is a prerelease; rc counter increments only")
-            return _release_format_semver(cur_maj, cur_min, cur_pat, cur_id, cur_n + 1)
-        if bump is None:
-            raise ValueError("--bump required for first prerelease from stable version")
-        # Apply bump kind to current stable, then attach -<id>.1
-        nxt = _release_compute_next_version(current or "0.0.0", bump, None, prerelease_id)
-        nxt_maj, nxt_min, nxt_pat, _, _ = _release_parse_semver(nxt)
-        return _release_format_semver(nxt_maj, nxt_min, nxt_pat, prerelease_id, 1)
-
-    if is_prerelease:
-        raise ValueError("current version is a prerelease; run 'cctally release finalize' first or use --bump in a prerelease bump")
-
-    if kind == "patch":
-        return _release_format_semver(cur_maj, cur_min, cur_pat + 1)
-    if kind == "minor":
-        return _release_format_semver(cur_maj, cur_min + 1, 0)
-    if kind == "major":
-        return _release_format_semver(cur_maj + 1, 0, 0)
-    raise ValueError(f"unknown bump kind: {kind!r}")
 
 
 def _release_read_latest_release_version() -> tuple[str, str] | None:
@@ -237,24 +212,6 @@ def _release_extract_formula_version(text: str) -> str | None:
     """
     m = _FORMULA_VERSION_RE.search(text)
     return m.group(1) if m else None
-
-
-def _release_semver_sort_key(
-    parsed: tuple[int, int, int, str | None, int | None],
-) -> tuple:
-    """Total-order sort key for `_release_parse_semver` output.
-
-    SemVer §11.4: a stable release has higher precedence than a pre-release
-    of the same MAJOR.MINOR.PATCH. Naive tuple comparison breaks because
-    Python rejects ``None < str`` at runtime. The key returned here makes
-    stable releases sort *after* their pre-releases by inverting the
-    "has-prerelease" axis: stable → ``(maj, min, pat, 1, "", 0)``,
-    pre-release → ``(maj, min, pat, 0, id, n)``.
-    """
-    maj, min_, pat, pre_id, pre_n = parsed
-    if pre_id is None:
-        return (maj, min_, pat, 1, "", 0)
-    return (maj, min_, pat, 0, pre_id, pre_n)
 
 
 def _release_brew_archive_url(version: str) -> str:

@@ -252,6 +252,16 @@ cp "$REPO_ROOT/bin/cctally" bin/
 chmod +x bin/cctally
 cp "$REPO_ROOT/bin/cctally-mirror-public" bin/
 chmod +x bin/cctally-mirror-public
+# bin/cctally eager-loads sibling _lib_*.py modules via
+# spec_from_file_location relative to its own resolved path
+# (see bin/cctally: _load_sibling). Mirror them into the scratch bin/
+# so the eager loads at module import time succeed — without this,
+# every `cctally release …` invocation in the scenario crashes at
+# import with FileNotFoundError on _lib_semver.py.
+for libsib in "$REPO_ROOT"/bin/_lib_*.py; do
+    [ -f "$libsib" ] || continue
+    cp "$libsib" bin/
+done
 
 # CHANGELOG.md is seeded per-scenario (after this scaffold ends). The
 # infra-bootstrap commit lands AFTER CHANGELOG.md is written so the

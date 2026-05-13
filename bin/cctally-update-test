@@ -201,6 +201,17 @@ _run_scenario_inner () {
     cp "$BIN" "$target_cctally"
     chmod +x "$target_cctally"
 
+    # bin/cctally eager-loads sibling _lib_*.py modules via
+    # spec_from_file_location relative to its own resolved path
+    # (see bin/cctally: _load_sibling). Mirror them into the realpath
+    # tree so the eager loads at module import time succeed — without
+    # this, every `cctally update …` invocation in the scenario crashes
+    # at import with FileNotFoundError on _lib_semver.py.
+    for libsib in "$REPO_ROOT"/bin/_lib_*.py; do
+        [ -f "$libsib" ] || continue
+        cp "$libsib" "$realpath_dir/$(basename "$libsib")"
+    done
+
     # The user-facing $PATH cctally lives at <scratch>/bin/cctally and
     # symlinks to the realpath copy. This mirrors what brew/npm install
     # would produce: a $PATH symlink pointing at the install tree.
