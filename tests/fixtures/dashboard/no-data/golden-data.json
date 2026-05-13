@@ -26,6 +26,7 @@
     "resolved_tz": "Etc/UTC",
     "tz": "local"
   },
+  "doctor": "__DOCTOR_BLOCK__",
   "envelope_version": 2,
   "forecast": null,
   "generated_at": "__NOW__",

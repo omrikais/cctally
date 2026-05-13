@@ -91,6 +91,17 @@ normalize_json () {
 import json, sys
 env = json.load(sys.stdin)
 env["generated_at"] = "__NOW__"
+# Doctor block sentinel mirrors the `update` block treatment below:
+# the _DashboardUpdateCheckThread runs concurrently with the HTTP
+# fetch, so update-state.json may or may not exist when the doctor
+# gather fires (TOCTOU race for safety.update_state). Counts flip by
+# one between racing runs, churning fingerprint and ok/warn counts.
+# Wholesale-sentinelize the whole block; wire-level invariants
+# (block presence, fingerprint stability under age drift, JSON
+# serialization) are covered exhaustively by tests/test_doctor_*.py
+# under pytest. Same compromise the `update` block already makes.
+if "doctor" in env:
+    env["doctor"] = "__DOCTOR_BLOCK__"
 # last_sync_at is always None in the envelope today, but normalize
 # defensively so future changes do not leak wall clock into goldens.
 env["last_sync_at"] = "__SYNC_AT__" if env.get("last_sync_at") else None

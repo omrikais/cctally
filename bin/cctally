@@ -35039,7 +35039,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             cfg_oauth = dict(_OAUTH_USAGE_DEFAULTS)
         env = snapshot_to_envelope(
             snap,
-            now_utc=dt.datetime.now(dt.timezone.utc),
+            # `_now_utc()` honors CCTALLY_AS_OF for harness determinism;
+            # zero production impact (the env var is never set outside
+            # fixture tests). Without this, the doctor block's now_utc
+            # flows from wall clock and severity flips on borderline-age
+            # checks between parallel test runs, churning goldens.
+            now_utc=_now_utc(),
             monotonic_now=time.monotonic(),
             oauth_usage_cfg=cfg_oauth,
             display_tz_pref_override=type(self).display_tz_pref_override,

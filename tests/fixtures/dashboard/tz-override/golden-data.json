@@ -61,6 +61,7 @@
     "resolved_tz": "Etc/UTC",
     "tz": "utc"
   },
+  "doctor": "__DOCTOR_BLOCK__",
   "envelope_version": 2,
   "forecast": {
     "budget_100_per_day_usd": 0.0,
