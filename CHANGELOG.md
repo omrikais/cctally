@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-05-13
+
 ### Added
 - `cctally doctor` — read-only diagnostic subcommand consolidating install / hooks / OAuth / DB / freshness / safety state into one severity-ranked report (human + JSON; exit 0 unless any check FAILs, then 2); the dashboard exposes the same diagnostic via an aggregate-health header chip and a full-report modal opened by clicking the chip or pressing `d`, backed by `GET /api/doctor`.
 
