@@ -201,13 +201,15 @@ _run_scenario_inner () {
     cp "$BIN" "$target_cctally"
     chmod +x "$target_cctally"
 
-    # bin/cctally eager-loads sibling _lib_*.py modules via
-    # spec_from_file_location relative to its own resolved path
-    # (see bin/cctally: _load_sibling). Mirror them into the realpath
-    # tree so the eager loads at module import time succeed — without
-    # this, every `cctally update …` invocation in the scenario crashes
-    # at import with FileNotFoundError on _lib_semver.py.
-    for libsib in "$REPO_ROOT"/bin/_lib_*.py; do
+    # bin/cctally eager-loads sibling _lib_*.py modules and lazy-loads
+    # _cctally_*.py modules via spec_from_file_location relative to its
+    # own resolved path (see bin/cctally: _load_sibling). Mirror BOTH
+    # prefixes into the realpath tree so the eager loads at module import
+    # time AND the PEP 562 lazy loads on first release/etc. access succeed
+    # — without this, every `cctally update …` invocation in the scenario
+    # crashes at import with FileNotFoundError on _lib_semver.py (eager)
+    # or every `cctally release …` crashes on _cctally_release.py (lazy).
+    for libsib in "$REPO_ROOT"/bin/_lib_*.py "$REPO_ROOT"/bin/_cctally_*.py; do
         [ -f "$libsib" ] || continue
         cp "$libsib" "$realpath_dir/$(basename "$libsib")"
     done

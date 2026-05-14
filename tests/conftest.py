@@ -5,6 +5,7 @@ package) into a throwaway namespace so tests can exercise its
 internals without running the CLI.
 """
 import pathlib
+import sys
 import types
 
 import pytest
@@ -29,10 +30,42 @@ _SCRIPT_CODE = compile(_SCRIPT_PATH.read_text(), str(_SCRIPT_PATH), "exec")
 
 
 def load_script():
-    """Execute the main script in a fresh namespace and return it."""
-    ns = {"__file__": str(_SCRIPT_PATH)}
-    exec(_SCRIPT_CODE, ns)
-    return ns
+    """Execute the main script and return its globals dict.
+
+    The dict IS the namespace of a real types.ModuleType registered in
+    sys.modules['cctally']. Two facts make this work without behaviour
+    change for tests:
+      1. exec(code, mod.__dict__) populates the module's namespace from
+         the script's globals, and `mod.__dict__ is ns` afterwards.
+      2. Attribute lookup on a module reads its __dict__; mutating the
+         dict (monkeypatch.setitem(ns, "X", v)) is immediately visible
+         as mod.X for siblings that import cctally.
+
+    Net: tests keep their `ns["X"]` / `monkeypatch.setitem(ns, "X", v)`
+    patterns AND `import cctally; cctally.X` from sibling lazy modules
+    sees the same value. Per-test isolation: each call rebuilds a fresh
+    module and re-binds sys.modules['cctally'] (latest call wins).
+
+    Drops cached `_cctally_*.py` sibling modules from sys.modules so
+    that when PEP 562 (or the dispatch thunk) next triggers
+    `_load_sibling("_cctally_release")`, the sibling re-executes its
+    `import cctally` against the FRESH cctally module — not the stale
+    instance from the previous test's load_script(). Without this clear,
+    `_cctally_release.cctally` remains pinned to the prior module, so
+    monkeypatches on the new `cctally.CHANGELOG_PATH` don't propagate
+    into MOVED helpers, and tests that monkeypatch real-path constants
+    leak writes to the on-disk repo. Spec §5.5 (circular-import safety)
+    + §6.0a.
+
+    Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md §6.0a
+    """
+    for _name in [n for n in sys.modules if n.startswith("_cctally_")]:
+        del sys.modules[_name]
+    mod = types.ModuleType("cctally")
+    mod.__file__ = str(_SCRIPT_PATH)
+    sys.modules["cctally"] = mod
+    exec(_SCRIPT_CODE, mod.__dict__)
+    return mod.__dict__
 
 
 def redirect_paths(ns, monkeypatch, tmp_path):

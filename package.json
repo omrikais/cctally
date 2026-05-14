@@ -17,6 +17,7 @@
     "postinstall": "node ./bin/cctally-npm-postinstall.js"
   },
   "files": [
+    "bin/_cctally_release.py",
     "bin/_lib_doctor.py",
     "bin/_lib_semver.py",
     "bin/_lib_share.py",

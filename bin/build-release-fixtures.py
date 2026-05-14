@@ -252,13 +252,15 @@ cp "$REPO_ROOT/bin/cctally" bin/
 chmod +x bin/cctally
 cp "$REPO_ROOT/bin/cctally-mirror-public" bin/
 chmod +x bin/cctally-mirror-public
-# bin/cctally eager-loads sibling _lib_*.py modules via
-# spec_from_file_location relative to its own resolved path
-# (see bin/cctally: _load_sibling). Mirror them into the scratch bin/
-# so the eager loads at module import time succeed — without this,
-# every `cctally release …` invocation in the scenario crashes at
-# import with FileNotFoundError on _lib_semver.py.
-for libsib in "$REPO_ROOT"/bin/_lib_*.py; do
+# bin/cctally eager-loads sibling _lib_*.py modules and lazy-loads
+# _cctally_*.py modules via spec_from_file_location relative to its
+# own resolved path (see bin/cctally: _load_sibling). Mirror BOTH
+# prefixes into the scratch bin/ so the eager loads at module import
+# time AND the PEP 562 lazy loads on first release/etc. access succeed
+# — without this, every `cctally release …` invocation in the scenario
+# crashes at import with FileNotFoundError on _lib_semver.py (eager)
+# or on _cctally_release.py (lazy, first release-region access).
+for libsib in "$REPO_ROOT"/bin/_lib_*.py "$REPO_ROOT"/bin/_cctally_*.py; do
     [ -f "$libsib" ] || continue
     cp "$libsib" bin/
 done

@@ -45,13 +45,17 @@ def test_package_files_includes_every_lib_sibling():
     pkg = json.loads((REPO_ROOT / "package.json").read_text())
     files = set(pkg.get("files", []))
     libs = sorted(p.name for p in (REPO_ROOT / "bin").glob("_lib_*.py"))
-    assert libs, "expected at least one bin/_lib_*.py runtime module"
+    cctally_libs = sorted(p.name for p in (REPO_ROOT / "bin").glob("_cctally_*.py"))
+    libs = sorted(set(libs) | set(cctally_libs))
+    assert libs, (
+        "expected at least one bin/_lib_*.py or bin/_cctally_*.py runtime module"
+    )
     missing = [f"bin/{lib}" for lib in libs if f"bin/{lib}" not in files]
     assert not missing, (
-        f"bin/_lib_*.py runtime modules missing from package.json files[]: "
-        f"{missing}. Add them, or npm-installed cctally will fail when "
-        f"bin/cctally tries to late-load them via "
-        f"Path(__file__).parent / '_lib_*.py'."
+        f"bin/_lib_*.py and bin/_cctally_*.py runtime modules missing from "
+        f"package.json files[]: {missing}. Add them, or npm-installed cctally "
+        f"will fail when bin/cctally tries to late-load them via "
+        f"Path(__file__).parent / '_lib_*.py' or '_cctally_*.py'."
     )
 
 
