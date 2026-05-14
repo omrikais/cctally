@@ -17,6 +17,7 @@ Stdlib only. No external dependencies.
 """
 from __future__ import annotations
 
+import atexit
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,82 @@ from typing import Optional
 # so cache.db rebuilds are byte-deterministic. Arbitrary UTC instant — value
 # doesn't matter; only stability does.
 FIXED_LAST_INGESTED_AT = "2026-04-15T15:00:00Z"
+
+
+# Bytes 96–99 of the SQLite header carry SQLITE_VERSION_NUMBER for the
+# library that last wrote the file (per https://www.sqlite.org/fileformat.html
+# — "library write version"). The field is informational only; SQLite
+# does not consult it on read for compatibility decisions. Without
+# normalization, the byte differs across Python interpreter sqlite3
+# library versions (e.g. cpython 3.13's bundled lib is 3.53.0, 3.14's is
+# 3.53.1), so every harness rebuild on a different interpreter dirties
+# the in-tree fixtures by exactly one byte per file. Zeroing the field
+# makes builder output byte-deterministic across SQLite library bumps.
+_SQLITE_HEADER_LIBRARY_WRITE_VERSION_OFFSET = 96
+_SQLITE_HEADER_LIBRARY_WRITE_VERSION_LEN = 4
+
+# Set populated by `create_stats_db` / `create_cache_db` and any other
+# builder helper that writes a `.db` file. The atexit hook below walks
+# each registered parent directory at process exit and zeros the writer-
+# version field on every `*.db` it finds. Registration happens at DB
+# creation time; subsequent seed connections (`with sqlite3.connect(path)`
+# blocks in builder scripts) re-stamp the field, but the atexit hook
+# fires AFTER they close, so the final on-disk state is normalized.
+_REGISTERED_FIXTURE_DIRS: set[Path] = set()
+
+
+def normalize_sqlite_writer_version(path: Path) -> None:
+    """Zero bytes 96–99 of the SQLite header at *path*.
+
+    Safe to call on any well-formed SQLite file. No-op if the file does
+    not exist. Does not open a sqlite3 connection — just rewrites four
+    bytes via the filesystem, so it has no interaction with WAL state,
+    schema, or transactions.
+    """
+    if not path.exists():
+        return
+    with path.open("r+b") as f:
+        f.seek(_SQLITE_HEADER_LIBRARY_WRITE_VERSION_OFFSET)
+        f.write(b"\x00" * _SQLITE_HEADER_LIBRARY_WRITE_VERSION_LEN)
+
+
+def register_fixture_db(path: Path) -> None:
+    """Track a fixture DB so the atexit hook normalizes it.
+
+    Called automatically from `create_stats_db` / `create_cache_db`.
+    Builder scripts that write `.db` files outside those helpers (e.g.
+    `bin/build-migrations-fixtures.py`) should call this directly for
+    each DB they create, so the writer-version field is normalized on
+    process exit regardless of which `sqlite3.connect()` site last
+    touched the file.
+    """
+    _REGISTERED_FIXTURE_DIRS.add(path.parent)
+
+
+def _normalize_all_registered_fixture_dbs() -> None:
+    # Builder scripts pervasively use `with sqlite3.connect(path) as conn:`
+    # which commits but does NOT close the connection — it lingers until
+    # garbage collection, and `sqlite3.Connection.__del__` runs AFTER
+    # atexit handlers, restamping the writer-version field every time.
+    # Force-close any open Connection objects first so the on-disk state
+    # we normalize next is final. We avoid keeping our own registry of
+    # connections (builders open many) and rely on gc to enumerate them.
+    import gc
+    gc.collect()
+    for obj in gc.get_objects():
+        if isinstance(obj, sqlite3.Connection):
+            try:
+                obj.close()
+            except Exception:
+                pass
+    for d in _REGISTERED_FIXTURE_DIRS:
+        if not d.exists():
+            continue
+        for db in sorted(d.glob("*.db")):
+            normalize_sqlite_writer_version(db)
+
+
+atexit.register(_normalize_all_registered_fixture_dbs)
 
 
 def create_stats_db(path: Path) -> None:
@@ -56,6 +133,7 @@ def create_stats_db(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         path.unlink()
+    register_fixture_db(path)
     with sqlite3.connect(path) as conn:
         # Match production's open_db(): fixtures must be WAL so a first
         # open by the harness doesn't flip bytes 18/19 of the DB header.
@@ -270,6 +348,7 @@ def create_cache_db(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         path.unlink()
+    register_fixture_db(path)
     with sqlite3.connect(path) as conn:
         # Match production's open_cache_db(): fixtures must be WAL so a
         # first open by the harness doesn't flip bytes 18/19 of the DB

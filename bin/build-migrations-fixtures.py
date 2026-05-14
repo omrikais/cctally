@@ -19,6 +19,11 @@ import sqlite3
 import sys
 from pathlib import Path
 
+# Make _fixture_builders importable when run directly (bin/ is not on sys.path).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _fixture_builders import register_fixture_db  # noqa: E402
+
 
 FIXTURES_ROOT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "migrations"
 
@@ -31,6 +36,7 @@ TS_003_APPLIED = "2026-05-04T08:12:11Z"
 def _new_stats_db(path: Path) -> sqlite3.Connection:
     if path.exists():
         path.unlink()
+    register_fixture_db(path)
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
@@ -42,6 +48,7 @@ def _new_stats_db(path: Path) -> sqlite3.Connection:
 def _new_cache_db(path: Path) -> sqlite3.Connection:
     if path.exists():
         path.unlink()
+    register_fixture_db(path)
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
