@@ -1329,6 +1329,114 @@ def _migration_heal_forked_week_start_date_buckets(conn: sqlite3.Connection) -> 
         raise
 
 
+@stats_migration("005_percent_milestones_reset_event_id")
+def _migration_percent_milestones_reset_event_id(conn: sqlite3.Connection) -> None:
+    """Add ``reset_event_id`` to ``percent_milestones`` so post-credit
+    threshold crossings can coexist with pre-credit ones for the same
+    ``(week_start_date, percent_threshold)``.
+
+    Sentinel: ``0`` = pre-credit / no event. Existing rows backfill to
+    ``0`` via the ``DEFAULT 0`` clause on the new column.
+
+    The new UNIQUE constraint is
+    ``UNIQUE(week_start_date, percent_threshold, reset_event_id)`` so the
+    same (week, threshold) pair can land twice if a goodwill credit
+    re-opens the segment under a fresh ``week_reset_events.id``. SQLite
+    can't ALTER a UNIQUE constraint in place — we use the
+    rename-recreate-copy idiom.
+
+    Companion live-path edits: ``cmd_record_usage`` now stamps the
+    active segment (the latest ``week_reset_events.id`` for the
+    current ``new_week_end_at``, else 0) into ``reset_event_id``; the
+    in-place credit detection branch can re-fire the same threshold
+    after a credit.
+
+    Idempotent: a second invocation finds the column already present
+    and returns. Empty-table fast path: when the column is already
+    present the marker still gets stamped — no schema edit needed.
+    """
+    # Fast-path probe: column already present means a prior run of this
+    # migration (or a fresh-install fast-stamp from the dispatcher that
+    # already picked up the new live-schema CREATE TABLE) has done the
+    # work. Just stamp the marker and return.
+    cols = {
+        str(r[1])
+        for r in conn.execute("PRAGMA table_info(percent_milestones)").fetchall()
+    }
+    if "reset_event_id" in cols:
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
+            "VALUES (?, ?)",
+            ("005_percent_milestones_reset_event_id", now_utc_iso()),
+        )
+        conn.commit()
+        return
+
+    conn.execute("BEGIN")
+    try:
+        # Add the column with sentinel 0 default (covers existing rows).
+        conn.execute(
+            "ALTER TABLE percent_milestones "
+            "ADD COLUMN reset_event_id INTEGER NOT NULL DEFAULT 0"
+        )
+        # SQLite can't ALTER a UNIQUE constraint in place; rename, recreate
+        # with the new 3-column UNIQUE, copy, drop. Preserves ids and every
+        # existing column (including those added by add_column_if_missing:
+        # five_hour_percent_at_crossing, alerted_at).
+        conn.execute(
+            "ALTER TABLE percent_milestones RENAME TO percent_milestones_old_005"
+        )
+        conn.execute(
+            """
+            CREATE TABLE percent_milestones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at_utc TEXT NOT NULL,
+                week_start_date TEXT NOT NULL,
+                week_end_date TEXT NOT NULL,
+                week_start_at TEXT,
+                week_end_at TEXT,
+                percent_threshold INTEGER NOT NULL,
+                cumulative_cost_usd REAL NOT NULL,
+                marginal_cost_usd REAL,
+                usage_snapshot_id INTEGER NOT NULL,
+                cost_snapshot_id INTEGER NOT NULL,
+                five_hour_percent_at_crossing REAL,
+                alerted_at TEXT,
+                reset_event_id INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(week_start_date, percent_threshold, reset_event_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO percent_milestones (
+                id, captured_at_utc, week_start_date, week_end_date,
+                week_start_at, week_end_at, percent_threshold,
+                cumulative_cost_usd, marginal_cost_usd,
+                usage_snapshot_id, cost_snapshot_id,
+                five_hour_percent_at_crossing, alerted_at, reset_event_id
+            )
+            SELECT id, captured_at_utc, week_start_date, week_end_date,
+                   week_start_at, week_end_at, percent_threshold,
+                   cumulative_cost_usd, marginal_cost_usd,
+                   usage_snapshot_id, cost_snapshot_id,
+                   five_hour_percent_at_crossing, alerted_at,
+                   reset_event_id
+              FROM percent_milestones_old_005
+            """
+        )
+        conn.execute("DROP TABLE percent_milestones_old_005")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
+            "VALUES (?, ?)",
+            ("005_percent_milestones_reset_event_id", now_utc_iso()),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 # === Region 8: Test-only migration registration (was bin/cctally:12086-12140) ===
 
 # ──────────────────────────────────────────────────────────────────────

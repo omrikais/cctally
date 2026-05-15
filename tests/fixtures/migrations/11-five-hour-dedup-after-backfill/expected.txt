@@ -2,13 +2,14 @@
 1
 ## state
 stats.db:
-  user_version: 5
+  user_version: 6
   schema_migrations:
     001_five_hour_block_models_backfill_v1
     002_five_hour_block_projects_backfill_v1
     003_merge_5h_block_duplicates_v1
     004_heal_forked_week_start_date_buckets
-    005_test_failure_injection
+    005_percent_milestones_reset_event_id
+    006_test_failure_injection
   schema_migrations_skipped:
 ## log
 <no migration-errors.log>

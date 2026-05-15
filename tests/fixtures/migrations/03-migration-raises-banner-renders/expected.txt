@@ -1,7 +1,7 @@
 ## stdout
 No data yet. Add record-usage to your status line script (see record-usage --help).
 ## stderr
-[migration stats.db:005_test_failure_injection] failed: test failure injected
+[migration stats.db:006_test_failure_injection] failed: test failure injected
 ## exit
 0
 ## state
@@ -12,9 +12,10 @@ stats.db:
     002_five_hour_block_projects_backfill_v1
     003_merge_5h_block_duplicates_v1
     004_heal_forked_week_start_date_buckets
+    005_percent_milestones_reset_event_id
   schema_migrations_skipped:
 ## log
-[<REDACTED>] stats.db:005_test_failure_injection
+[<REDACTED>] stats.db:006_test_failure_injection
   test failure injected
   Traceback (most recent call last):
     File "<CCTALLY_BIN>", line <N>, in _run_pending_migrations

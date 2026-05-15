@@ -3817,12 +3817,20 @@ def open_db() -> sqlite3.Connection:
             marginal_cost_usd REAL,
             usage_snapshot_id INTEGER NOT NULL,
             cost_snapshot_id INTEGER NOT NULL,
-            UNIQUE(week_start_date, percent_threshold)
+            reset_event_id INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(week_start_date, percent_threshold, reset_event_id)
         )
         """
     )
 
     add_column_if_missing(conn, "percent_milestones", "five_hour_percent_at_crossing", "REAL")
+    # reset_event_id: segment column added by migration 005. Fresh-install
+    # DBs get it via the live CREATE TABLE above + the dispatcher
+    # fast-stamps the migration. Existing pre-005 DBs trip the migration's
+    # rename-recreate-copy idiom (handler in _cctally_db.py); the handler's
+    # fast-path probe stamps the marker when the column is already present
+    # (covers the corner case where a partially-upgraded DB has the column
+    # but not the new UNIQUE — re-run is safe).
 
     # alerted_at: populated by the alert-dispatch path when a milestone-INSERT
     # row's threshold matches the user's configured alerts.weekly_thresholds /

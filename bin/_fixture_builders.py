@@ -193,7 +193,9 @@ def create_stats_db(path: Path) -> None:
                 usage_snapshot_id INTEGER NOT NULL,
                 cost_snapshot_id INTEGER NOT NULL,
                 five_hour_percent_at_crossing REAL,
-                UNIQUE(week_start_date, percent_threshold)
+                alerted_at TEXT,
+                reset_event_id INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(week_start_date, percent_threshold, reset_event_id)
             );
 
             CREATE TABLE week_reset_events (
