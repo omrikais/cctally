@@ -8314,6 +8314,24 @@ def cmd_report(args: argparse.Namespace) -> int:
                 week_end_date=current_end.isoformat(),
             )
 
+        # Bug D (v1.7.2 round-4): when an in-place credit event exists for
+        # the current subscription week, `_apply_reset_events_to_weekrefs`
+        # synthesizes a pre-credit ref alongside the post-credit one (both
+        # share `WeekRef.key`). The live "current week" segment is the
+        # POST-credit one (its `week_start_at` was shifted to the
+        # effective reset moment). Route `current_ref` through the same
+        # override so its `week_start_at` reflects the post-credit start;
+        # this lets the per-row match below disambiguate the synthesized
+        # pre-credit ref from the live post-credit ref via both
+        # `key` AND `week_start_at`. Order contract from
+        # `_apply_reset_events_to_weekrefs`: post-credit ref lands at
+        # index 0, pre-credit at index 1. Non-credit weeks return the
+        # single input ref unchanged, so this is a no-op on the common
+        # path.
+        _adjusted_current = _apply_reset_events_to_weekrefs(conn, [current_ref])
+        if _adjusted_current:
+            current_ref = _adjusted_current[0]
+
         weeks = get_recent_weeks(conn, max(1, args.weeks))
         if not weeks:
             # Format-aware empty path mirrors cmd_forecast:18578-18629 — a
@@ -8461,7 +8479,20 @@ def cmd_report(args: argparse.Namespace) -> int:
                         "age_seconds": int(age_s),
                     }
             trend.append(row)
-            if week_ref.key == current_ref.key:
+            # Bug D (v1.7.2 round-4): for credited weeks `weeks` contains
+            # TWO refs sharing `key` (pre-credit + post-credit segments).
+            # `current_ref` was routed through
+            # `_apply_reset_events_to_weekrefs` above so its
+            # `week_start_at` reflects the post-credit segment's effective
+            # start (or the original start for non-credit weeks). Match on
+            # BOTH `key` AND `week_start_at` so the pre-credit ref doesn't
+            # overwrite the post-credit row's selection on the second
+            # iteration (last-write-wins on key-only equality picked the
+            # wrong row on the user's live data).
+            if (
+                week_ref.key == current_ref.key
+                and week_ref.week_start_at == current_ref.week_start_at
+            ):
                 current_row = row
 
         if current_row is None and trend:

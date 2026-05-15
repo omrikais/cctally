@@ -2023,3 +2023,144 @@ def test_blocks_anchor_falls_back_when_no_five_hour_blocks_row(ns):
     assert expected_floor in windows, (
         f"raw-snapshot anchor missing without five_hour_blocks: {windows}"
     )
+
+
+# ── Round-4 Bug D: cmd_report current-row picks post-credit ref ───────
+
+
+def test_cmd_report_current_row_picks_post_credit_for_credited_week(ns, capsys):
+    """Bug D (v1.7.2 round-4): on the user's live DB, ``cmd_report``'s
+    "current week" summary box rendered the PRE-credit row (67%, the
+    closed segment) instead of the POST-credit row (4%, the live
+    segment). Root cause: both refs share ``WeekRef.key``, the match
+    predicate ``week_ref.key == current_ref.key`` matched both, and
+    last-write-wins picked the wrong row.
+
+    Fix: route ``current_ref`` through ``_apply_reset_events_to_weekrefs``
+    so its ``week_start_at`` reflects the post-credit segment, then
+    match on BOTH ``key`` AND ``week_start_at``.
+    """
+    import json
+    end_iso = "2026-05-16T17:00:00+00:00"
+    effective_iso = "2026-05-15T17:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = "2026-05-09T17:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        # Pre-credit snapshot at 67%, captured BEFORE the effective
+        # reset moment.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T16:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        # Post-credit snapshot at 4%, captured AFTER the effective
+        # reset moment (so it sorts as `latest_usage`).
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T20:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=4.0,
+        )
+        _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=effective_iso,
+            old_week_end_at=effective_iso,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rc = ns["cmd_report"](argparse.Namespace(
+        weeks=1,
+        sync_current=False,
+        week_start_name=None,
+        mode="auto",
+        offline=True,
+        project=None,
+        json=True,
+        detail=False,
+        format=None,
+        theme=None,
+        reveal_projects=False,
+        no_branding=False,
+        output=None,
+        copy=False,
+        open=False,
+        tz=None,
+    ))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    current = payload["current"]
+    assert current is not None, payload
+    # The "current" row must be the POST-credit segment:
+    # week_start_at == effective_iso, weeklyPercent == 4.0.
+    assert current["weekStartAt"] == effective_iso, current
+    assert current["weekEndAt"] == end_iso, current
+    assert current["weeklyPercent"] == 4.0, current
+    # The currentWeek envelope mirrors the same post-credit anchor.
+    assert payload["currentWeek"]["weekStartAt"] == effective_iso
+
+
+def test_cmd_report_current_row_legacy_uncredited_week(ns, capsys):
+    """Bug D regression guard: an uncredited week (single ref, no
+    reset event row) must still pick its sole ref as the current row.
+    The round-4 fix re-routes ``current_ref`` through
+    ``_apply_reset_events_to_weekrefs`` but with no events the function
+    is a no-op (returns ``refs`` unchanged), so non-credited weeks are
+    unaffected.
+    """
+    import json
+    end_iso = "2026-05-16T17:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = "2026-05-09T17:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T20:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=42.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rc = ns["cmd_report"](argparse.Namespace(
+        weeks=1,
+        sync_current=False,
+        week_start_name=None,
+        mode="auto",
+        offline=True,
+        project=None,
+        json=True,
+        detail=False,
+        format=None,
+        theme=None,
+        reveal_projects=False,
+        no_branding=False,
+        output=None,
+        copy=False,
+        open=False,
+        tz=None,
+    ))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    current = payload["current"]
+    assert current is not None
+    assert current["weekStartAt"] == week_start_at
+    assert current["weekEndAt"] == end_iso
+    assert current["weeklyPercent"] == 42.0
