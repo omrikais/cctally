@@ -317,6 +317,10 @@ def get_milestones_for_week(*args, **kwargs):
     return sys.modules["cctally"].get_milestones_for_week(*args, **kwargs)
 
 
+def _canonicalize_optional_iso(*args, **kwargs):
+    return sys.modules["cctally"]._canonicalize_optional_iso(*args, **kwargs)
+
+
 def get_recent_weeks(*args, **kwargs):
     return sys.modules["cctally"].get_recent_weeks(*args, **kwargs)
 
@@ -949,7 +953,8 @@ class TuiPercentMilestone:
 def _tui_build_percent_milestones(
     conn: sqlite3.Connection,
 ) -> list[TuiPercentMilestone]:
-    """Return per-percent crossings for the current week, ascending by percent.
+    """Return per-percent crossings for the current week's ACTIVE
+    segment, ascending by percent.
 
     Resolves `week_start_date` from the latest `weekly_usage_snapshots` row
     — the same path `cmd_percent_breakdown` takes. The post-override
@@ -957,15 +962,55 @@ def _tui_build_percent_milestones(
     reset, `_apply_midweek_reset_override` shifts that datetime forward to
     the reset instant, whose `.date()` no longer matches the `week_start_date`
     under which milestones were recorded.
-    Returns [] if no usage snapshot (or no milestone) exists.
+
+    v1.7.2: when a `week_reset_events` row exists for the snapshot's
+    `week_end_at`, narrow to the active segment so the dashboard /
+    TUI milestone panel stays coherent with the already-credit-aware
+    header. ``active_segment = 0`` (sentinel) preserves legacy
+    behavior on un-credited weeks.
+
+    Returns [] if no usage snapshot exists, OR if the active segment
+    has no milestone rows yet (post-credit "fresh" state).
     """
     latest = conn.execute(
-        "SELECT week_start_date FROM weekly_usage_snapshots "
+        "SELECT week_start_date, week_end_at FROM weekly_usage_snapshots "
+        "WHERE week_end_at IS NOT NULL "
         "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
     ).fetchone()
     if latest is None:
-        return []
-    rows = get_milestones_for_week(conn, latest["week_start_date"])
+        # Legacy fallback: a snapshot without week_end_at can still have
+        # milestones — keep the prior behavior in that path.
+        latest = conn.execute(
+            "SELECT week_start_date, NULL AS week_end_at "
+            "FROM weekly_usage_snapshots "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+        ).fetchone()
+        if latest is None:
+            return []
+
+    # Resolve active segment via the canonical end_at.
+    active_segment = 0
+    if latest["week_end_at"]:
+        try:
+            canon_end = _canonicalize_optional_iso(
+                latest["week_end_at"], "tui.pm.cur"
+            )
+        except (AttributeError, ValueError):
+            canon_end = None
+        if canon_end:
+            seg_row = conn.execute(
+                "SELECT id FROM week_reset_events "
+                "WHERE new_week_end_at = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (canon_end,),
+            ).fetchone()
+            if seg_row is not None:
+                active_segment = int(seg_row["id"])
+
+    rows = [
+        r for r in get_milestones_for_week(conn, latest["week_start_date"])
+        if int(r["reset_event_id"] or 0) == active_segment
+    ]
     out: list[TuiPercentMilestone] = []
     for r in rows:
         try:

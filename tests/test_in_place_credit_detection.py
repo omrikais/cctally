@@ -975,3 +975,71 @@ def test_percent_breakdown_empty_post_credit_hint(ns, capsys):
     assert rc == 0
     captured = capsys.readouterr()
     assert "post-credit" in captured.out.lower(), captured.out
+
+
+# ── Task 7: dashboard milestone panel filter (shared with TUI) ───────
+
+
+def test_tui_percent_milestones_filters_to_active_segment(ns):
+    """``_tui_build_percent_milestones`` (shared builder for the TUI
+    panel AND the dashboard's ``snap.percent_milestones`` envelope
+    array) filters to the active segment when a credit event exists for
+    the week.
+    """
+    end_iso = "2026-05-16T05:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = week_start_date + "T05:00:00+00:00"
+    effective = "2026-05-14T17:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        # Pre-credit milestones (segment 0).
+        for pct in (1, 2, 3):
+            conn.execute(
+                "INSERT INTO percent_milestones "
+                "(captured_at_utc, week_start_date, week_end_date, "
+                " week_start_at, week_end_at, percent_threshold, "
+                " cumulative_cost_usd, marginal_cost_usd, "
+                " usage_snapshot_id, cost_snapshot_id, reset_event_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("2026-05-12T10:00:00Z", week_start_date, week_end_date,
+                 week_start_at, end_iso, pct, 100.0 * pct, None, pct, pct, 0),
+            )
+        # Event row.
+        evt_id = _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=effective,
+            old_week_end_at=end_iso,
+        )
+        # One post-credit milestone.
+        conn.execute(
+            "INSERT INTO percent_milestones "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, percent_threshold, "
+            " cumulative_cost_usd, marginal_cost_usd, "
+            " usage_snapshot_id, cost_snapshot_id, reset_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-05-15T10:00:00Z", week_start_date, week_end_date,
+             week_start_at, end_iso, 1, 5.0, None, 4, 4, evt_id),
+        )
+        # Latest snapshot points the builder at this week.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T10:30:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=1.0,
+        )
+        conn.commit()
+
+        out = ns["_tui_build_percent_milestones"](conn)
+    finally:
+        conn.close()
+
+    # Active segment is evt_id; only the post-credit row (1%, $5.00) shows.
+    assert len(out) == 1, out
+    assert out[0].percent == 1
+    assert out[0].cumulative_cost_usd == 5.0
