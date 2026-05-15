@@ -100,6 +100,7 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 """
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import fcntl
 import importlib.util as _ilu
@@ -265,9 +266,9 @@ def _resolve_project_key(
 
 def _get_codex_sessions_dir() -> pathlib.Path | None:
     """Return the Codex sessions directory if present, else None."""
-    codex_sessions_dir = _cctally().CODEX_SESSIONS_DIR
-    if codex_sessions_dir.is_dir():
-        return codex_sessions_dir
+    c = _cctally()
+    if c.CODEX_SESSIONS_DIR.is_dir():
+        return c.CODEX_SESSIONS_DIR
     return None
 
 
@@ -1375,7 +1376,7 @@ def open_cache_db() -> sqlite3.Connection:
 # === Region 7: cmd_cache_sync (was bin/cctally:11563-11616) ===
 
 
-def cmd_cache_sync(args) -> int:
+def cmd_cache_sync(args: argparse.Namespace) -> int:
     """Explicitly sync (or rebuild) the session-entry cache.
 
     Transparent auto-sync happens on every JSONL-reading command; this

@@ -110,10 +110,12 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         monkeypatch.setattr(db_sibling, "MIGRATION_ERROR_LOG_PATH", share / "logs" / "migration-errors.log")
     # Post Phase D #17 split: the session-entry cache subsystem lives
     # in `bin/_cctally_cache.py` and routes `APP_DIR` / `CACHE_DB_PATH`
-    # / `CACHE_LOCK_PATH` / `CACHE_LOCK_CODEX_PATH` /
-    # `CODEX_SESSIONS_DIR` through the `c = _cctally()` call-time
-    # accessor (spec §5.5). The `monkeypatch.setitem(ns, ...)` calls
-    # above propagate transparently — no sibling-side patches needed.
+    # / `CACHE_LOCK_PATH` / `CACHE_LOCK_CODEX_PATH` through the
+    # `c = _cctally()` call-time accessor (spec §5.5). The
+    # `monkeypatch.setitem(ns, ...)` calls above propagate
+    # transparently — no sibling-side patches needed.
+    # ``CODEX_SESSIONS_DIR`` is not redirected here (Codex tests
+    # rebind via fresh ``HOME`` through harness scratch dirs).
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
 
 
