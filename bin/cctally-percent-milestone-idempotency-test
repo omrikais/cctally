@@ -163,5 +163,103 @@ assert_eq "first insert rowcount" "1" "$n1"
 assert_eq "duplicate insert rowcount" "0" "$n2"
 assert_eq "row count after duplicate" "1" "$count"
 
+# ── v1.7.2 post-credit segment scenario ──────────────────────────────
+# Verify the new UNIQUE shape (week_start_date, percent_threshold,
+# reset_event_id) lets a post-credit threshold land as a SEPARATE row
+# from any pre-credit one at the same threshold. The old 2-col UNIQUE
+# would have silently dedup'd the post-credit insert to rowcount 0;
+# the new shape returns rowcount 1.
+
+SCRATCH2="$(mktemp -d -t cctally-pms-segment.XXXXXX)"
+out2=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$SCRATCH2" TZ=Etc/UTC python3 - <<'PY'
+import importlib.util, os, pathlib, sys, traceback
+from importlib.machinery import SourceFileLoader
+
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
+spec = importlib.util.spec_from_loader("cctally_mod", loader)
+mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
+loader.exec_module(mod)
+mod.APP_DIR.mkdir(parents=True, exist_ok=True)
+
+conn = mod.open_db()
+try:
+    # Seed dependencies (usage + cost snapshots so the FK-ish columns
+    # have valid ids).
+    captured_at = mod.now_utc_iso()
+    usage_id = int(conn.execute(
+        "INSERT INTO weekly_usage_snapshots "
+        "(captured_at_utc, week_start_date, week_end_date, "
+        " week_start_at, week_end_at, weekly_percent, payload_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (captured_at, "2026-04-27", "2026-05-03", None, None, 3.0, "{}"),
+    ).lastrowid)
+    cost_id = int(conn.execute(
+        "INSERT INTO weekly_cost_snapshots "
+        "(captured_at_utc, week_start_date, week_end_date, "
+        " week_start_at, week_end_at, cost_usd) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (captured_at, "2026-04-27", "2026-05-03", None, None, 12.0),
+    ).lastrowid)
+    conn.commit()
+
+    # Pre-credit insert at threshold 3, reset_event_id=0 (default).
+    n_pre = mod.insert_percent_milestone(
+        conn,
+        "2026-04-27", "2026-05-03", None, None,
+        3, 100.0, None, usage_id, cost_id, None,
+    )
+
+    # Post-credit insert at same week+threshold but reset_event_id=42.
+    # Under the new UNIQUE shape this MUST be a fresh row (rowcount 1).
+    n_post = mod.insert_percent_milestone(
+        conn,
+        "2026-04-27", "2026-05-03", None, None,
+        3, 12.0, None, usage_id, cost_id, None,
+        reset_event_id=42,
+    )
+
+    # Same (week, threshold, reset_event_id=42) again — INSERT OR IGNORE
+    # under the new UNIQUE should swallow this (rowcount 0).
+    n_dup = mod.insert_percent_milestone(
+        conn,
+        "2026-04-27", "2026-05-03", None, None,
+        3, 13.0, None, usage_id, cost_id, None,
+        reset_event_id=42,
+    )
+
+    total = int(conn.execute(
+        "SELECT COUNT(*) FROM percent_milestones "
+        "WHERE week_start_date='2026-04-27' AND percent_threshold=3"
+    ).fetchone()[0])
+    print(f"n_pre={n_pre}")
+    print(f"n_post={n_post}")
+    print(f"n_dup={n_dup}")
+    print(f"total={total}")
+finally:
+    conn.close()
+PY
+)
+ec2=$?
+rm -rf "$SCRATCH2"
+
+if [ $ec2 -ne 0 ]; then
+    echo "FAIL post-credit python harness exited with $ec2"
+    printf '%s\n' "$out2"
+    fail_count=$((fail_count + 1))
+    echo "passed: $pass_count   failed: $fail_count"
+    exit 1
+fi
+
+n_pre=$(printf '%s\n' "$out2" | awk -F= '/^n_pre=/{print $2}')
+n_post=$(printf '%s\n' "$out2" | awk -F= '/^n_post=/{print $2}')
+n_dup=$(printf '%s\n' "$out2" | awk -F= '/^n_dup=/{print $2}')
+total=$(printf '%s\n' "$out2" | awk -F= '/^total=/{print $2}')
+
+assert_eq "pre-credit (segment 0) insert rowcount" "1" "$n_pre"
+assert_eq "post-credit (segment N) insert rowcount" "1" "$n_post"
+assert_eq "post-credit duplicate insert rowcount" "0" "$n_dup"
+assert_eq "rows after credit: pre + post coexist" "2" "$total"
+
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]
