@@ -39,6 +39,6 @@ _spec.loader.exec_module(_mod)
 
 DataSnapshot = _mod.DataSnapshot
 
-SNAPSHOT = DataSnapshot.synthesize_for_marketing(as_of_iso="2026-05-14T14:00:00Z")
+SNAPSHOT = DataSnapshot.synthesize_for_marketing(as_of_iso="2026-05-07T14:00:00Z")
 
 RUNTIME_OVERRIDES = {}

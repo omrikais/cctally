@@ -27,6 +27,19 @@ def _load_builder():
     return mod
 
 
+def _isolated_build(mod, tmp_path, as_of_str="2026-05-05", subdir="home"):
+    """Invoke the builder with both `out_dir` AND `tui_snapshot_path`
+    redirected under tmp_path. Without an explicit `tui_snapshot_path`,
+    the builder's default writes to the in-tree
+    `tests/fixtures/readme/tui_snapshot.py`, leaking test side effects
+    into the working tree and overwriting the committed marketing
+    snapshot. Returns the resolved `out_dir`."""
+    out = tmp_path / subdir / ".local" / "share" / "cctally"
+    snap = tmp_path / subdir / "tui_snapshot.py"
+    mod.build(out_dir=out, as_of_str=as_of_str, tui_snapshot_path=snap)
+    return out
+
+
 def test_builder_module_loads():
     mod = _load_builder()
     assert hasattr(mod, "build")
@@ -35,16 +48,14 @@ def test_builder_module_loads():
 
 def test_builder_writes_both_dbs(tmp_path):
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     assert (out / "stats.db").exists()
     assert (out / "cache.db").exists()
 
 
 def test_both_dbs_have_wal(tmp_path):
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     for db_name in ("stats.db", "cache.db"):
         with sqlite3.connect(out / db_name) as conn:
             mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
@@ -53,8 +64,7 @@ def test_both_dbs_have_wal(tmp_path):
 
 def test_eight_weeks_of_usage_snapshots(tmp_path):
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     with sqlite3.connect(out / "stats.db") as conn:
         n = conn.execute(
             "SELECT COUNT(DISTINCT week_start_date) FROM weekly_usage_snapshots"
@@ -64,8 +74,7 @@ def test_eight_weeks_of_usage_snapshots(tmp_path):
 
 def test_four_projects_in_session_entries(tmp_path):
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     with sqlite3.connect(out / "cache.db") as conn:
         rows = conn.execute(
             "SELECT DISTINCT project_path FROM session_files "
@@ -79,8 +88,7 @@ def test_four_projects_in_session_entries(tmp_path):
 
 def test_percent_milestones_present(tmp_path):
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     with sqlite3.connect(out / "stats.db") as conn:
         n = conn.execute("SELECT COUNT(*) FROM percent_milestones").fetchone()[0]
     assert n >= 5, f"expected at least 5 milestone rows, got {n}"
@@ -88,8 +96,7 @@ def test_percent_milestones_present(tmp_path):
 
 def test_five_hour_blocks_present(tmp_path):
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     with sqlite3.connect(out / "stats.db") as conn:
         n = conn.execute("SELECT COUNT(*) FROM five_hour_blocks").fetchone()[0]
     assert n >= 4, f"expected at least 4 block rows, got {n}"
@@ -97,10 +104,8 @@ def test_five_hour_blocks_present(tmp_path):
 
 def test_deterministic_for_fixed_as_of(tmp_path):
     mod = _load_builder()
-    out_a = tmp_path / "a" / ".local" / "share" / "cctally"
-    out_b = tmp_path / "b" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out_a, as_of_str="2026-05-05")
-    mod.build(out_dir=out_b, as_of_str="2026-05-05")
+    out_a = _isolated_build(mod, tmp_path, subdir="a")
+    out_b = _isolated_build(mod, tmp_path, subdir="b")
     for db_name in ("stats.db", "cache.db"):
         # WAL mode complicates byte equality; compare normalized SQL dumps instead.
         with sqlite3.connect(out_a / db_name) as ca:
@@ -143,8 +148,7 @@ def test_session_entries_cover_all_projects_regardless_of_weekday(tmp_path):
         ("Sun", "2026-05-10"),
     ]
     for label, as_of_str in weekday_dates:
-        out = tmp_path / label / ".local" / "share" / "cctally"
-        mod.build(out_dir=out, as_of_str=as_of_str)
+        out = _isolated_build(mod, tmp_path, as_of_str=as_of_str, subdir=label)
         with sqlite3.connect(out / "cache.db") as conn:
             rows = conn.execute(
                 "SELECT DISTINCT sf.project_path "
@@ -173,8 +177,7 @@ def test_cli_invocation_smoke():
 def test_daily_panel_has_data_across_30_days(tmp_path):
     """Regression: Daily panel renders 30-day heatmap; ensure entries span all days."""
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     with sqlite3.connect(out / "cache.db") as conn:
         # Group entry timestamps by date (UTC) — count distinct days.
         days = conn.execute(
@@ -185,8 +188,7 @@ def test_daily_panel_has_data_across_30_days(tmp_path):
 
 def test_each_project_has_at_least_five_entries(tmp_path):
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     with sqlite3.connect(out / "cache.db") as conn:
         rows = conn.execute(
             """SELECT sf.project_path, COUNT(*) FROM session_entries se
@@ -208,8 +210,7 @@ def test_dollar_per_percent_has_visible_variance(tmp_path):
     matching what the Trend chart renders.
     """
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     with sqlite3.connect(out / "stats.db") as conn:
         rows = conn.execute(
             """
@@ -241,8 +242,7 @@ def test_daily_panel_has_distinct_intensity_buckets(tmp_path):
     delta between min and max non-zero per-day cost is at least 2x.
     """
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     with sqlite3.connect(out / "cache.db") as conn:
         rows = conn.execute(
             """SELECT substr(timestamp_utc, 1, 10) AS d,
@@ -267,8 +267,7 @@ def test_latest_snapshot_binds_to_open_block(tmp_path):
     current-week panel falls back to the legacy single-big-number layout.
     """
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     with sqlite3.connect(out / "stats.db") as conn:
         latest_key = conn.execute(
             "SELECT five_hour_window_key FROM weekly_usage_snapshots "
@@ -311,8 +310,7 @@ def test_current_week_has_three_snapshots_for_high_confidence(tmp_path):
     current week has three snapshots spanning ≥24h.
     """
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     # `as_of_str` Tuesday → Thursday 14:00 UTC anchor inside builder.
     as_of = "2026-05-07T14:00:00Z"
     twenty_four_ago = "2026-05-06T14:00:00Z"
@@ -351,10 +349,8 @@ def test_config_json_is_byte_deterministic(tmp_path):
     the existing SQLite-only determinism harness.
     """
     mod = _load_builder()
-    out_a = tmp_path / "a" / ".local" / "share" / "cctally"
-    out_b = tmp_path / "b" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out_a, as_of_str="2026-05-05")
-    mod.build(out_dir=out_b, as_of_str="2026-05-05")
+    out_a = _isolated_build(mod, tmp_path, subdir="a")
+    out_b = _isolated_build(mod, tmp_path, subdir="b")
     assert (out_a / "config.json").read_bytes() == (out_b / "config.json").read_bytes(), (
         "config.json is not byte-deterministic across builds"
     )
@@ -366,8 +362,7 @@ def test_config_json_pins_la_display_tz(tmp_path):
     so dashboard + CLI surfaces resolve dates consistently across hosts.
     """
     mod = _load_builder()
-    out = tmp_path / "home" / ".local" / "share" / "cctally"
-    mod.build(out_dir=out, as_of_str="2026-05-05")
+    out = _isolated_build(mod, tmp_path)
     config_path = out / "config.json"
     assert config_path.exists(), f"{config_path} not written"
     import json
