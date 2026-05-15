@@ -11192,8 +11192,14 @@ def pick_week_selection(
         if start_override and end_override:
             start_dt = parse_iso_datetime(start_override, "weekStartAt")
             end_dt = parse_iso_datetime(end_override, "weekEndAt")
-            week_start = start_dt.date()
-            week_end = end_dt.date()
+            # See `_derive_week_from_payload` for the host-TZ rationale.
+            # The bucket-key date is anchored on the canonical UTC ISO so
+            # `cmd_sync_week`'s `weekly_cost_snapshots.week_start_date`
+            # matches `cmd_record_usage`'s `weekly_usage_snapshots.week_
+            # start_date` for the same subscription week regardless of
+            # the host process's local TZ offset.
+            week_start = start_dt.astimezone(dt.timezone.utc).date()
+            week_end = end_dt.astimezone(dt.timezone.utc).date()
         else:
             week_start = dt.date.fromisoformat(latest_usage["week_start_date"])
             week_end = dt.date.fromisoformat(latest_usage["week_end_date"])
@@ -17661,9 +17667,23 @@ def _derive_week_from_payload(payload: dict[str, Any], week_start_name: str) -> 
         end_at = parse_iso_datetime(end_iso, "weekEndAt")
         if end_at <= start_at:
             raise ValueError("weekEndAt must be after weekStartAt")
+        # Anchor the bucket-key date on the canonical UTC ISO, not on
+        # `.date()` of the parsed datetime — `parse_iso_datetime` ends
+        # with `.astimezone()` which converts to host-local TZ. If the
+        # cctally process inherits a TZ whose offset puts the UTC moment
+        # on a different calendar date, `start_at.date()` silently
+        # forks the `week_start_date` column for the SAME physical
+        # subscription week, producing a ghost row that never gets
+        # updated (regression: Israel host briefly running with
+        # TZ=America/Los_Angeles for 7 minutes during refactor work
+        # spawned 18 ghost usage rows + 2 ghost cost rows under
+        # week_start_date='2026-05-08' while every other row sat at
+        # '2026-05-09'). Re-canonicalize to UTC before `.date()` so the
+        # bucket key matches what `cmd_record_usage` writes (it derives
+        # `week_start_date` directly from `resets_at` in UTC).
         return DerivedWeekWindow(
-            week_start=start_at.date(),
-            week_end=end_at.date(),
+            week_start=start_at.astimezone(dt.timezone.utc).date(),
+            week_end=end_at.astimezone(dt.timezone.utc).date(),
             week_start_at=start_iso,
             week_end_at=end_iso,
         )
