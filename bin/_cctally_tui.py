@@ -213,10 +213,6 @@ def eprint(*args, **kwargs):
     return sys.modules["cctally"].eprint(*args, **kwargs)
 
 
-def now_utc_iso(*args, **kwargs):
-    return sys.modules["cctally"].now_utc_iso(*args, **kwargs)
-
-
 def parse_iso_datetime(*args, **kwargs):
     return sys.modules["cctally"].parse_iso_datetime(*args, **kwargs)
 
@@ -233,10 +229,6 @@ def load_config(*args, **kwargs):
     return sys.modules["cctally"].load_config(*args, **kwargs)
 
 
-def save_config(*args, **kwargs):
-    return sys.modules["cctally"].save_config(*args, **kwargs)
-
-
 def format_display_dt(*args, **kwargs):
     return sys.modules["cctally"].format_display_dt(*args, **kwargs)
 
@@ -247,10 +239,6 @@ def resolve_display_tz(*args, **kwargs):
 
 def normalize_display_tz_value(*args, **kwargs):
     return sys.modules["cctally"].normalize_display_tz_value(*args, **kwargs)
-
-
-def get_display_tz_pref(*args, **kwargs):
-    return sys.modules["cctally"].get_display_tz_pref(*args, **kwargs)
 
 
 def _resolve_display_tz_obj(*args, **kwargs):
@@ -313,34 +301,6 @@ def _aggregate_monthly(*args, **kwargs):
     return sys.modules["cctally"]._aggregate_monthly(*args, **kwargs)
 
 
-def _calculate_entry_cost(*args, **kwargs):
-    return sys.modules["cctally"]._calculate_entry_cost(*args, **kwargs)
-
-
-def _canonical_5h_window_key(*args, **kwargs):
-    return sys.modules["cctally"]._canonical_5h_window_key(*args, **kwargs)
-
-
-def _chip_for_model(*args, **kwargs):
-    return sys.modules["cctally"]._chip_for_model(*args, **kwargs)
-
-
-def _short_model_name(*args, **kwargs):
-    return sys.modules["cctally"]._short_model_name(*args, **kwargs)
-
-
-def _compute_subscription_weeks(*args, **kwargs):
-    return sys.modules["cctally"]._compute_subscription_weeks(*args, **kwargs)
-
-
-def _group_entries_into_blocks(*args, **kwargs):
-    return sys.modules["cctally"]._group_entries_into_blocks(*args, **kwargs)
-
-
-def get_entries(*args, **kwargs):
-    return sys.modules["cctally"].get_entries(*args, **kwargs)
-
-
 def get_claude_session_entries(*args, **kwargs):
     return sys.modules["cctally"].get_claude_session_entries(*args, **kwargs)
 
@@ -359,10 +319,6 @@ def get_milestones_for_week(*args, **kwargs):
 
 def get_recent_weeks(*args, **kwargs):
     return sys.modules["cctally"].get_recent_weeks(*args, **kwargs)
-
-
-def make_week_ref(*args, **kwargs):
-    return sys.modules["cctally"].make_week_ref(*args, **kwargs)
 
 
 def sync_cache(*args, **kwargs):
@@ -417,14 +373,6 @@ def _SnapshotRef(*args, **kwargs):
 
 
 # Alerts back-refs.
-def _get_alerts_config(*args, **kwargs):
-    return sys.modules["cctally"]._get_alerts_config(*args, **kwargs)
-
-
-def _warn_alerts_bad_config_once(*args, **kwargs):
-    return sys.modules["cctally"]._warn_alerts_bad_config_once(*args, **kwargs)
-
-
 # Module-level __getattr__ — lazy-resolves cctally globals at attribute-access
 # time. PEP 562 fires on ``module.X``-shaped access from outside this module;
 # bare-name lookups in function bodies bypass it. Used here for the
