@@ -18,6 +18,7 @@
   },
   "files": [
     "bin/_cctally_release.py",
+    "bin/_cctally_setup.py",
     "bin/_lib_aggregators.py",
     "bin/_lib_alerts_payload.py",
     "bin/_lib_blocks.py",
