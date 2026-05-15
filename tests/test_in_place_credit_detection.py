@@ -2164,3 +2164,237 @@ def test_cmd_report_current_row_legacy_uncredited_week(ns, capsys):
     assert current["weekStartAt"] == week_start_at
     assert current["weekEndAt"] == end_iso
     assert current["weeklyPercent"] == 42.0
+
+
+# ── Round-4 Bug E: cmd_blocks active row swaps to canonical ──────────
+
+
+def test_blocks_active_uses_five_hour_blocks_when_anchor_differs(
+    ns, monkeypatch
+):
+    """Bug E (v1.7.2 round-4): when the ACTIVE 5h block is heuristic-
+    anchored (e.g. activity restarted at 23:00 IDT after a gap) but a
+    canonical ``five_hour_blocks`` row pins the current API window
+    elsewhere (e.g. 20:50 IDT), ``cmd_blocks`` must surface the
+    API-anchored window for the ACTIVE row — heuristic and canonical
+    can sit in different 10-minute floor buckets, so the round-3
+    anchor-overlay in ``_load_recorded_five_hour_windows`` doesn't
+    catch this case.
+    """
+    # API-anchored window: 20:50 IDT (17:50Z) start, 01:50 IDT (22:50Z) end.
+    # Heuristic anchor would be at 23:00 IDT (20:00Z) — 130 min later.
+    canonical_block_start = "2026-05-15T17:50:00+00:00"
+    canonical_resets_at = "2026-05-15T22:50:00+00:00"
+    canonical_key = int(dt.datetime.fromisoformat(canonical_resets_at).timestamp())
+
+    # Pin "now" between 23:00 IDT (heuristic anchor) and the canonical
+    # window end (22:50Z), so the canonical window is still ACTIVE.
+    now_utc = dt.datetime(2026, 5, 15, 20, 30, 0, tzinfo=dt.timezone.utc)
+    monkeypatch.setenv("CCTALLY_AS_OF", now_utc.isoformat(timespec="seconds"))
+
+    conn = ns["open_db"]()
+    try:
+        # Seed a weekly_usage_snapshots row that pins the live
+        # five_hour_window_key. _maybe_swap_active_block_to_canonical
+        # picks the latest snapshot's key.
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, weekly_percent, "
+            " source, payload_json, "
+            " five_hour_percent, five_hour_resets_at, "
+            " five_hour_window_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (now_utc.isoformat(timespec="seconds"),
+             "2026-05-09", "2026-05-16",
+             "2026-05-09T17:00:00+00:00", "2026-05-16T17:00:00+00:00",
+             5.0, "test", "{}", 25.0,
+             canonical_resets_at, canonical_key),
+        )
+        # Seed the canonical five_hour_blocks row.
+        conn.execute(
+            "INSERT INTO five_hour_blocks "
+            "(five_hour_window_key, five_hour_resets_at, block_start_at, "
+            " first_observed_at_utc, last_observed_at_utc, "
+            " final_five_hour_percent, is_closed, "
+            " created_at_utc, last_updated_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            (canonical_key, canonical_resets_at, canonical_block_start,
+             canonical_block_start, canonical_block_start,
+             25.0, canonical_block_start, canonical_block_start),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Build a heuristic ACTIVE block at 23:00 IDT — emulates the post-
+    # gap reanchoring `_group_entries_into_blocks` produces from real
+    # JSONL activity.
+    Block = ns["Block"]
+    heuristic_start = dt.datetime(
+        2026, 5, 15, 20, 0, 0, tzinfo=dt.timezone.utc,
+    )  # 23:00 IDT
+    heuristic_end = heuristic_start + dt.timedelta(hours=5)
+    blocks = [
+        Block(
+            start_time=heuristic_start,
+            end_time=heuristic_end,
+            actual_end_time=now_utc,
+            is_active=True,
+            is_gap=False,
+            entries_count=3,
+            input_tokens=100,
+            output_tokens=200,
+            cache_creation_tokens=0,
+            cache_read_tokens=0,
+            total_tokens=300,
+            cost_usd=1.23,
+            models=["claude-opus-4-7"],
+            burn_rate=None,
+            projection=None,
+            anchor="heuristic",
+        ),
+    ]
+
+    ns["_maybe_swap_active_block_to_canonical"](blocks, now=now_utc)
+
+    # The active block's times must be rewritten to the canonical
+    # window and its anchor flipped to "recorded".
+    active = blocks[0]
+    expected_start = dt.datetime.fromisoformat(
+        canonical_block_start
+    ).astimezone(dt.timezone.utc)
+    expected_end = dt.datetime.fromisoformat(
+        canonical_resets_at
+    ).astimezone(dt.timezone.utc)
+    assert active.start_time == expected_start, active.start_time
+    assert active.end_time == expected_end, active.end_time
+    assert active.anchor == "recorded", active.anchor
+
+
+def test_blocks_active_falls_back_when_no_canonical_row(ns, monkeypatch):
+    """Bug E regression guard: when no ``five_hour_blocks`` row matches
+    the live key (or the table is empty), the heuristic ACTIVE block
+    is preserved verbatim — same times, ``anchor="heuristic"``, so the
+    renderer keeps the ``~`` prefix.
+    """
+    now_utc = dt.datetime(2026, 5, 15, 20, 30, 0, tzinfo=dt.timezone.utc)
+    monkeypatch.setenv("CCTALLY_AS_OF", now_utc.isoformat(timespec="seconds"))
+
+    # No five_hour_blocks row at all. (Setup doesn't need to seed
+    # weekly_usage_snapshots either — the function returns early when
+    # no snapshot has a five_hour_window_key.)
+    Block = ns["Block"]
+    heuristic_start = dt.datetime(
+        2026, 5, 15, 20, 0, 0, tzinfo=dt.timezone.utc,
+    )
+    heuristic_end = heuristic_start + dt.timedelta(hours=5)
+    blocks = [
+        Block(
+            start_time=heuristic_start,
+            end_time=heuristic_end,
+            actual_end_time=now_utc,
+            is_active=True,
+            is_gap=False,
+            entries_count=3,
+            input_tokens=100,
+            output_tokens=200,
+            cache_creation_tokens=0,
+            cache_read_tokens=0,
+            total_tokens=300,
+            cost_usd=1.23,
+            models=["claude-opus-4-7"],
+            burn_rate=None,
+            projection=None,
+            anchor="heuristic",
+        ),
+    ]
+
+    ns["_maybe_swap_active_block_to_canonical"](blocks, now=now_utc)
+
+    # Active block unchanged.
+    active = blocks[0]
+    assert active.start_time == heuristic_start
+    assert active.end_time == heuristic_end
+    assert active.anchor == "heuristic"
+
+
+def test_blocks_active_skips_when_canonical_window_already_closed(
+    ns, monkeypatch
+):
+    """Bug E corner case: if the canonical ``five_hour_blocks`` row's
+    ``five_hour_resets_at`` is already in the past relative to ``now``,
+    the canonical block is closed — the heuristic active block reflects
+    a NEW window's worth of real activity and must NOT be overwritten.
+    """
+    # Canonical window: 12:50Z → 17:50Z (already closed at 20:30Z).
+    canonical_block_start = "2026-05-15T12:50:00+00:00"
+    canonical_resets_at = "2026-05-15T17:50:00+00:00"
+    canonical_key = int(dt.datetime.fromisoformat(canonical_resets_at).timestamp())
+    now_utc = dt.datetime(2026, 5, 15, 20, 30, 0, tzinfo=dt.timezone.utc)
+    monkeypatch.setenv("CCTALLY_AS_OF", now_utc.isoformat(timespec="seconds"))
+
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, weekly_percent, "
+            " source, payload_json, "
+            " five_hour_percent, five_hour_resets_at, "
+            " five_hour_window_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (now_utc.isoformat(timespec="seconds"),
+             "2026-05-09", "2026-05-16",
+             "2026-05-09T17:00:00+00:00", "2026-05-16T17:00:00+00:00",
+             5.0, "test", "{}", 25.0,
+             canonical_resets_at, canonical_key),
+        )
+        conn.execute(
+            "INSERT INTO five_hour_blocks "
+            "(five_hour_window_key, five_hour_resets_at, block_start_at, "
+            " first_observed_at_utc, last_observed_at_utc, "
+            " final_five_hour_percent, is_closed, "
+            " created_at_utc, last_updated_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (canonical_key, canonical_resets_at, canonical_block_start,
+             canonical_block_start, canonical_block_start,
+             80.0, canonical_block_start, canonical_block_start),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    Block = ns["Block"]
+    heuristic_start = dt.datetime(
+        2026, 5, 15, 20, 0, 0, tzinfo=dt.timezone.utc,
+    )
+    heuristic_end = heuristic_start + dt.timedelta(hours=5)
+    blocks = [
+        Block(
+            start_time=heuristic_start,
+            end_time=heuristic_end,
+            actual_end_time=now_utc,
+            is_active=True,
+            is_gap=False,
+            entries_count=3,
+            input_tokens=100,
+            output_tokens=200,
+            cache_creation_tokens=0,
+            cache_read_tokens=0,
+            total_tokens=300,
+            cost_usd=1.23,
+            models=["claude-opus-4-7"],
+            burn_rate=None,
+            projection=None,
+            anchor="heuristic",
+        ),
+    ]
+
+    ns["_maybe_swap_active_block_to_canonical"](blocks, now=now_utc)
+
+    active = blocks[0]
+    # Heuristic times preserved; anchor unchanged.
+    assert active.start_time == heuristic_start
+    assert active.end_time == heuristic_end
+    assert active.anchor == "heuristic"

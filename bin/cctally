@@ -5554,6 +5554,20 @@ def cmd_blocks(args: argparse.Namespace) -> int:
         recorded_windows=recorded_windows, now=now_utc,
     )
 
+    # Bug E (v1.7.2 round-4): when the ACTIVE block is heuristic-anchored
+    # but a canonical ``five_hour_blocks`` row exists for the current 5h
+    # window key, swap the active block's times to the API-anchored
+    # ``block_start_at`` / ``five_hour_resets_at`` and flip its anchor to
+    # ``"recorded"`` so the renderer drops the ``~`` prefix. The
+    # heuristic anchor can sit in a different 10-minute floor bucket
+    # than the canonical anchor (e.g. 23:00 IDT vs 20:50 IDT — 130 min
+    # apart), so round-3's anchor-overlay in
+    # ``_load_recorded_five_hour_windows`` doesn't catch this case.
+    # Match by the live 5h window key (the same key
+    # ``cmd_five_hour_blocks`` would surface for the ACTIVE row) — falls
+    # back to heuristic behavior whenever the canonical row is missing.
+    _maybe_swap_active_block_to_canonical(blocks, now=now_utc)
+
     if args.json:
         print(_blocks_to_json(blocks))
         return 0
@@ -5561,6 +5575,86 @@ def cmd_blocks(args: argparse.Namespace) -> int:
     # Table output
     print(_render_blocks_table(blocks, breakdown=args.breakdown, now=now_utc, tz=tz))
     return 0
+
+
+def _maybe_swap_active_block_to_canonical(
+    blocks: list[Any], *, now: dt.datetime
+) -> None:
+    """In-place swap of an ACTIVE heuristic block to its API-anchored
+    canonical times.
+
+    Looks up the live ``five_hour_window_key`` from the most recent
+    ``weekly_usage_snapshots`` row, then joins to ``five_hour_blocks``
+    for that key. If found AND the canonical window still contains
+    ``now`` (resets_at > now), rewrites the active block's
+    ``start_time`` / ``end_time`` from the canonical row and flips
+    ``anchor`` to ``"recorded"``.
+
+    No-op when:
+      - No block is active (no ``is_active`` and not gap).
+      - The active block's anchor is already ``"recorded"``.
+      - No live snapshot exists, or the snapshot's ``five_hour_window_key``
+        is NULL.
+      - No canonical ``five_hour_blocks`` row matches the live key.
+      - The canonical window's ``five_hour_resets_at`` is already in
+        the past relative to ``now`` (canonical block is closed; the
+        heuristic block is genuinely the current activity).
+
+    Token / cost totals on the swapped block are NOT recomputed — the
+    underlying entries are unchanged; only the displayed window
+    boundaries shift. This matches the round-4 spec for Bug E.
+
+    Surgical helper called once from ``cmd_blocks`` after grouping.
+    """
+    # Find the active (non-gap, heuristic) block — there's at most one.
+    active = None
+    for b in blocks:
+        if not b.is_gap and b.is_active:
+            active = b
+            break
+    if active is None or active.anchor != "heuristic":
+        return
+    try:
+        with open_db() as conn:
+            snap = conn.execute(
+                "SELECT five_hour_window_key FROM weekly_usage_snapshots "
+                "WHERE five_hour_window_key IS NOT NULL "
+                "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+            ).fetchone()
+            if snap is None or snap["five_hour_window_key"] is None:
+                return
+            key = int(snap["five_hour_window_key"])
+            row = conn.execute(
+                "SELECT block_start_at, five_hour_resets_at "
+                "FROM five_hour_blocks WHERE five_hour_window_key = ? "
+                "LIMIT 1",
+                (key,),
+            ).fetchone()
+    except (sqlite3.DatabaseError, OSError):
+        return
+    if row is None:
+        return
+    try:
+        block_start = parse_iso_datetime(
+            row["block_start_at"], "five_hour_blocks.block_start_at"
+        )
+        block_end = parse_iso_datetime(
+            row["five_hour_resets_at"], "five_hour_blocks.five_hour_resets_at"
+        )
+    except ValueError:
+        return
+    # Normalize to UTC for stable comparisons (block_start_at can carry
+    # the host-local offset; five_hour_resets_at is UTC).
+    block_start_utc = block_start.astimezone(dt.timezone.utc)
+    block_end_utc = block_end.astimezone(dt.timezone.utc)
+    # If the canonical window has already ended, don't displace the
+    # heuristic active block — the canonical block is closed and the
+    # heuristic anchor reflects real ongoing activity in a later window.
+    if block_end_utc <= now.astimezone(dt.timezone.utc):
+        return
+    active.start_time = block_start_utc
+    active.end_time = block_end_utc
+    active.anchor = "recorded"
 
 
 def _parse_cli_date_range(
