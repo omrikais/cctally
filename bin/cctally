@@ -365,6 +365,14 @@ _alerts_log_path = _cctally_alerts._alerts_log_path
 _dispatch_alert_notification = _cctally_alerts._dispatch_alert_notification
 cmd_alerts_test = _cctally_alerts.cmd_alerts_test
 
+# Eager re-export of bin/_cctally_sync_week.py — `cmd_sync_week` is
+# called by bare name from non-extracted `cmd_record_usage` (the
+# milestone cost-sync path) and `cmd_report` (the lazy-sync path),
+# so it must live in cctally's namespace (bare-name lookups inside
+# cctally bypass PEP 562).
+_cctally_sync_week = _load_sibling("_cctally_sync_week")
+cmd_sync_week = _cctally_sync_week.cmd_sync_week
+
 
 # === Lazy-loaded library siblings (PEP 562 registry) ===
 #
@@ -15843,85 +15851,6 @@ def cmd_session(args: argparse.Namespace) -> int:
         tz=tz,
     ))
     return 0
-
-
-def cmd_sync_week(args: argparse.Namespace) -> int:
-    config = load_config()
-    week_start_name = get_week_start_name(config, args.week_start_name)
-
-    conn = open_db()
-    try:
-        selection = pick_week_selection(
-            conn,
-            args.week_start,
-            args.week_end,
-            week_start_name,
-        )
-        week_start = selection.week_start
-        week_end = selection.week_end
-        result = compute_week_cost(
-            week_start=week_start,
-            week_end=week_end,
-            mode=args.mode,
-            offline=args.offline,
-            project=args.project,
-            start_iso_override=selection.start_iso_override,
-            end_iso_override=selection.end_iso_override,
-        )
-        week_start_at = selection.start_iso_override or format_local_iso(week_start, end_of_day=False)
-        week_end_at = selection.end_iso_override or format_local_iso(week_end, end_of_day=True)
-        insert_id = insert_cost_snapshot(
-            conn,
-            week_start=week_start,
-            week_end=week_end,
-            week_start_at=week_start_at,
-            week_end_at=week_end_at,
-            range_start_iso=result.start_iso,
-            range_end_iso=result.end_iso,
-            cost_usd=result.cost_usd,
-            mode=args.mode,
-            project=args.project,
-        )
-
-        week_ref = make_week_ref(
-            week_start_date=week_start.isoformat(),
-            week_end_date=week_end.isoformat(),
-            week_start_at=week_start_at,
-            week_end_at=week_end_at,
-        )
-        usage_row = get_latest_usage_for_week(conn, week_ref)
-        weekly_percent = float(usage_row["weekly_percent"]) if usage_row else None
-        dollars_per_percent = (
-            result.cost_usd / weekly_percent if weekly_percent and weekly_percent > 0 else None
-        )
-
-        payload = {
-            "id": insert_id,
-            "weekStartDate": week_start.isoformat(),
-            "weekEndDate": week_end.isoformat(),
-            "weekStartAt": week_start_at,
-            "weekEndAt": week_end_at,
-            "rangeStartIso": result.start_iso,
-            "rangeEndIso": result.end_iso,
-            "costUSD": round(result.cost_usd, 9),
-            "weeklyPercent": weekly_percent,
-            "dollarsPerPercent": round(dollars_per_percent, 9) if dollars_per_percent is not None else None,
-        }
-
-        if args.json:
-            print(json.dumps(payload, indent=2))
-        elif not args.quiet:
-            print(
-                f"Synced week {payload['weekStartDate']}..{payload['weekEndDate']} "
-                f"=> ${payload['costUSD']:.6f}"
-            )
-            if weekly_percent is not None:
-                print(f"Latest weekly usage: {weekly_percent:.2f}%")
-            if dollars_per_percent is not None:
-                print(f"$ per 1% usage: ${dollars_per_percent:.6f}")
-        return 0
-    finally:
-        conn.close()
 
 
 def _extract_range_overrides_from_cost_row(row: sqlite3.Row) -> tuple[str | None, str | None]:
