@@ -19,6 +19,7 @@
   "files": [
     "bin/_cctally_release.py",
     "bin/_lib_alerts_payload.py",
+    "bin/_lib_blocks.py",
     "bin/_lib_display_tz.py",
     "bin/_lib_doctor.py",
     "bin/_lib_five_hour.py",
