@@ -11,7 +11,7 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Pending migrations       4 pending
+  ⚠ Pending migrations       5 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
 Safety
@@ -20,4 +20,4 @@ Safety
   ✗ update-suppress.json     unreadable: UpdateError: update-suppress.json is not valid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
       → `rm ~/.local/share/cctally/update-suppress.json`
 
-Summary: 14 OK · 6 WARN · 1 FAIL
+Summary: 15 OK · 6 WARN · 1 FAIL

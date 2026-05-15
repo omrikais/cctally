@@ -15,16 +15,17 @@ Hooks
 Auth
   ✓ OAuth token              present
 Database
-  ✓ stats.db                 version 0 / 4 known
+  ✓ stats.db                 version 0 / 5 known
   ⚠ cache.db                 absent (fresh install)
-  ✓ Migrations               0/4 applied
-  ⚠ Pending migrations       4 pending
+  ✓ Migrations               0/5 applied
+  ⚠ Pending migrations       5 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
   ✓ Latest snapshot          2s ago
   ✓ Claude cache             0 entries (no JSONL corpus)
   ✓ Codex cache              none (no ~/.codex/sessions/)
   ✓ Forked week buckets      none
+  ✓ Post-credit milestones   no credited weeks
 Safety
   ✓ Dashboard bind           config: loopback
   ✓ config.json              absent or parses cleanly
@@ -34,4 +35,4 @@ Safety
       → `rm ~/.local/share/cctally/update-suppress.json`
   ✓ Update available         no
 
-Summary: 14 OK · 6 WARN · 1 FAIL
+Summary: 15 OK · 6 WARN · 1 FAIL

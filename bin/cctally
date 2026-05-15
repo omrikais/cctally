@@ -10001,6 +10001,7 @@ def doctor_gather_state(
     # ── Data freshness ───────────────────────────────────────────────
     latest_snapshot_at = None
     forked_bucket_counts: dict | None = None
+    credited_weeks: list[dict] | None = None
     try:
         if DB_PATH.exists():
             conn = sqlite3.connect(str(DB_PATH))
@@ -10037,6 +10038,61 @@ def doctor_gather_state(
                         )
                     except sqlite3.OperationalError:
                         forked_bucket_counts[key] = 0
+                # v1.7.2 credited-week tracking. For each week with a
+                # past-effective ``week_reset_events`` row, gather the
+                # latest weekly_percent + count of post-credit milestones.
+                # The check warns when latest_percent >= 1.0 AND
+                # post_credit_milestone_count == 0.
+                # unixepoch() normalizes the cross-offset comparison.
+                try:
+                    credit_rows = conn.execute(
+                        """
+                        SELECT wre.id AS event_id,
+                               wre.new_week_end_at AS end_at,
+                               wre.effective_reset_at_utc AS effective
+                          FROM week_reset_events wre
+                         WHERE unixepoch(wre.effective_reset_at_utc)
+                               <= unixepoch(?)
+                        """,
+                        (now_utc_iso(),),
+                    ).fetchall()
+                    credited_weeks = []
+                    for cr in credit_rows:
+                        end_at = cr[1]
+                        evt_id = cr[0]
+                        latest = conn.execute(
+                            """
+                            SELECT week_start_date, weekly_percent
+                              FROM weekly_usage_snapshots
+                             WHERE week_end_at = ?
+                             ORDER BY captured_at_utc DESC, id DESC
+                             LIMIT 1
+                            """,
+                            (end_at,),
+                        ).fetchone()
+                        if latest is None or latest[0] is None:
+                            continue
+                        ws = latest[0]
+                        lp = float(latest[1] or 0.0)
+                        try:
+                            mc_row = conn.execute(
+                                "SELECT COUNT(*) FROM percent_milestones "
+                                "WHERE week_start_date = ? AND reset_event_id = ?",
+                                (ws, evt_id),
+                            ).fetchone()
+                            mc = int(mc_row[0]) if mc_row and mc_row[0] else 0
+                        except sqlite3.OperationalError:
+                            mc = 0
+                        credited_weeks.append({
+                            "week_start_date": ws,
+                            "latest_weekly_percent": lp,
+                            "post_credit_milestone_count": mc,
+                            "event_id": evt_id,
+                        })
+                except sqlite3.OperationalError:
+                    # week_reset_events table missing — treat as no
+                    # credited weeks (pre-feature DB).
+                    credited_weeks = []
             finally:
                 conn.close()
     except Exception:
@@ -10182,6 +10238,7 @@ def doctor_gather_state(
         cache_last_entry_at=cache_last_entry_at,
         claude_jsonl_present=claude_jsonl_present,
         forked_bucket_counts=forked_bucket_counts,
+        credited_weeks=credited_weeks,
         codex_entries_count=codex_entries_count,
         codex_last_entry_at=codex_last_entry_at,
         codex_jsonl_present=codex_jsonl_present,

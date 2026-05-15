@@ -60,6 +60,19 @@ class DoctorState:
     # skipped/failed/pending or (b) a buggy writer slipped through
     # after the migration ran.
     forked_bucket_counts: Optional[dict]
+    # v1.7.2 credited-week tracking. Each entry is a dict with:
+    #   * ``week_start_date``   — the credited week's bucket key
+    #   * ``latest_weekly_percent`` — most recent weekly_percent for that
+    #     week (used to gate the WARN — a credit + 0% means the user
+    #     hasn't started the new segment yet, which is the EXPECTED
+    #     state and shouldn't warn)
+    #   * ``post_credit_milestone_count`` — count of percent_milestones
+    #     rows with ``reset_event_id`` matching the credit event for
+    #     this week
+    # None means the stats.db couldn't be opened to gather; check
+    # degrades to OK rather than FAIL (consistent with the rest of
+    # the doctor kernel's degradation posture).
+    credited_weeks: Optional[list[dict]]
     codex_entries_count: Optional[int]
     codex_last_entry_at: Optional[dt.datetime]
     codex_jsonl_present: bool
@@ -559,6 +572,71 @@ def _check_data_forked_buckets(s: DoctorState) -> CheckResult:
 
 
 
+def _check_data_post_credit_milestones(s: DoctorState) -> CheckResult:
+    """Invariant: for every week with a ``week_reset_events`` row whose
+    ``effective_reset_at_utc`` is in the past AND latest_weekly_percent
+    >= 1.0, the percent_milestones ledger should have at least one row
+    in the credit's segment.
+
+    Pre-v1.7.2 the milestone writer didn't know about segments, so a
+    credited week could have a non-empty pre-credit ledger but zero
+    post-credit rows even after the user's usage climbed past 1%. This
+    check surfaces that drift as a WARN (informational; no remediation
+    — the next ``record-usage`` tick at >=1% will self-heal via the
+    segment-aware probe).
+
+    OK (silent) when:
+      * No credited weeks exist (state.credited_weeks is empty/None).
+      * Every credited week has at least one post-credit milestone row
+        OR latest_weekly_percent < 1.0 (= "new segment not started yet,
+        which is expected on a fresh credit").
+    """
+    weeks = s.credited_weeks
+    if weeks is None:
+        # Gather failed (stats.db open error). Don't double-warn; the
+        # db.stats.file check already covers DB-open issues.
+        return CheckResult(
+            id="data.post_credit_milestones",
+            title="Post-credit milestones",
+            severity="ok",
+            summary="no data",
+            remediation=None,
+            details={"reason": "credited_weeks gather returned None"},
+        )
+    stuck = [
+        w for w in weeks
+        if float(w.get("latest_weekly_percent") or 0.0) >= 1.0
+        and int(w.get("post_credit_milestone_count") or 0) == 0
+    ]
+    if not stuck:
+        return CheckResult(
+            id="data.post_credit_milestones",
+            title="Post-credit milestones",
+            severity="ok",
+            summary=(
+                f"{len(weeks)} credited week(s); all tracked"
+                if weeks else "no credited weeks"
+            ),
+            remediation=None,
+            details={"credited_weeks": len(weeks)},
+        )
+    starts = ", ".join(sorted(w["week_start_date"] for w in stuck))
+    return CheckResult(
+        id="data.post_credit_milestones",
+        title="Post-credit milestones",
+        severity="warn",
+        summary=(
+            f"{len(stuck)} credited week(s) with no post-credit milestone "
+            f"crossings yet: {starts}"
+        ),
+        remediation=None,
+        details={
+            "stuck_week_count": len(stuck),
+            "stuck_week_starts": [w["week_start_date"] for w in stuck],
+        },
+    )
+
+
 _LOOPBACK_HOSTS = frozenset({"loopback", "127.0.0.1", "::1", "localhost"})
 
 
@@ -786,6 +864,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("data.cache_sync_state", "_check_data_cache_sync_state"),
         ("data.codex_cache", "_check_data_codex_cache"),
         ("data.forked_buckets", "_check_data_forked_buckets"),
+        ("data.post_credit_milestones", "_check_data_post_credit_milestones"),
     )),
     ("safety", "Safety", (
         ("safety.dashboard_bind", "_check_safety_dashboard_bind"),

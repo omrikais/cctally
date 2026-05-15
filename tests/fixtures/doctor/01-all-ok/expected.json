@@ -101,12 +101,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/stats.db",
-                        "registry_size": 4,
+                        "registry_size": 5,
                         "user_version": 0
                     },
                     "id": "db.stats.file",
                     "severity": "ok",
-                    "summary": "version 0 / 4 known",
+                    "summary": "version 0 / 5 known",
                     "title": "stats.db"
                 },
                 {
@@ -134,7 +134,8 @@
                                     "001_five_hour_block_models_backfill_v1",
                                     "002_five_hour_block_projects_backfill_v1",
                                     "003_merge_5h_block_duplicates_v1",
-                                    "004_heal_forked_week_start_date_buckets"
+                                    "004_heal_forked_week_start_date_buckets",
+                                    "005_percent_milestones_reset_event_id"
                                 ],
                                 "skipped": []
                             }
@@ -142,7 +143,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/4 applied",
+                    "summary": "0/5 applied",
                     "title": "Migrations"
                 },
                 {
@@ -163,13 +164,17 @@
                             [
                                 "stats.db",
                                 "004_heal_forked_week_start_date_buckets"
+                            ],
+                            [
+                                "stats.db",
+                                "005_percent_milestones_reset_event_id"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "4 pending",
+                    "summary": "5 pending",
                     "title": "Pending migrations"
                 }
             ],
@@ -219,6 +224,15 @@
                     "severity": "ok",
                     "summary": "none",
                     "title": "Forked week buckets"
+                },
+                {
+                    "details": {
+                        "credited_weeks": 0
+                    },
+                    "id": "data.post_credit_milestones",
+                    "severity": "ok",
+                    "summary": "no credited weeks",
+                    "title": "Post-credit milestones"
                 }
             ],
             "id": "data",
@@ -283,7 +297,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 16,
+            "ok": 17,
             "warn": 5
         },
         "severity": "warn"

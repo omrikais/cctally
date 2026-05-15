@@ -10,11 +10,11 @@ Hooks
       → No hook has fired yet. Restart Claude Code.
 Auth
 Database
-  ⚠ Pending migrations       4 pending
+  ⚠ Pending migrations       5 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
 Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
 
-Summary: 16 OK · 5 WARN · 0 FAIL
+Summary: 17 OK · 5 WARN · 0 FAIL

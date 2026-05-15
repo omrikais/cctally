@@ -29,6 +29,7 @@ def test_doctor_state_has_required_fields():
         "effective_update_available", "effective_update_reason",
         "now_utc", "cctally_version",
         "forked_bucket_counts",
+        "credited_weeks",
     }
     assert fields == expected, fields ^ expected
 
@@ -81,6 +82,8 @@ def _state(**overrides) -> L.DoctorState:
         claude_jsonl_present=True,
         # Happy path: stats.db is clean — no forked-bucket rows.
         forked_bucket_counts={"usage": 0, "cost": 0, "milestones": 0},
+        # Happy path: no credited weeks yet.
+        credited_weeks=[],
         codex_entries_count=0,
         codex_last_entry_at=None,
         codex_jsonl_present=False,
@@ -399,6 +402,61 @@ def test_data_forked_buckets_none_state_fail():
     r = L._check_data_forked_buckets(s)
     assert r.severity == "fail"
     assert "state unavailable" in r.summary
+
+
+def test_data_post_credit_milestones_no_credits_ok():
+    """No credited weeks → OK silent."""
+    r = L._check_data_post_credit_milestones(_state(credited_weeks=[]))
+    assert r.severity == "ok"
+
+
+def test_data_post_credit_milestones_credit_with_no_crossings_warns():
+    """A credited week with weekly_percent >= 1.0 and zero post-credit
+    milestone rows → WARN with the week_start_date in the summary."""
+    s = _state(credited_weeks=[{
+        "week_start_date": "2026-05-09",
+        "latest_weekly_percent": 5.0,
+        "post_credit_milestone_count": 0,
+        "event_id": 1,
+    }])
+    r = L._check_data_post_credit_milestones(s)
+    assert r.severity == "warn"
+    assert "2026-05-09" in r.summary
+
+
+def test_data_post_credit_milestones_credit_with_zero_percent_ok():
+    """A credited week with weekly_percent < 1.0 doesn't warn — the
+    user just got credited and hasn't started using the new segment;
+    the absence of post-credit milestones is the EXPECTED state.
+    """
+    s = _state(credited_weeks=[{
+        "week_start_date": "2026-05-09",
+        "latest_weekly_percent": 0.5,
+        "post_credit_milestone_count": 0,
+        "event_id": 1,
+    }])
+    r = L._check_data_post_credit_milestones(s)
+    assert r.severity == "ok"
+
+
+def test_data_post_credit_milestones_credit_with_crossings_ok():
+    """A credited week with at least one post-credit milestone → OK."""
+    s = _state(credited_weeks=[{
+        "week_start_date": "2026-05-09",
+        "latest_weekly_percent": 3.0,
+        "post_credit_milestone_count": 3,
+        "event_id": 1,
+    }])
+    r = L._check_data_post_credit_milestones(s)
+    assert r.severity == "ok"
+
+
+def test_data_post_credit_milestones_none_state_ok():
+    """When stats.db couldn't be opened to gather credited_weeks,
+    degrade to OK (the db.stats.file check covers DB-open issues)."""
+    s = _state(credited_weeks=None)
+    r = L._check_data_post_credit_milestones(s)
+    assert r.severity == "ok"
 
 
 def test_safety_dashboard_bind_loopback_ok():
