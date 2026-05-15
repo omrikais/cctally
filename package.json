@@ -17,6 +17,7 @@
     "postinstall": "node ./bin/cctally-npm-postinstall.js"
   },
   "files": [
+    "bin/_cctally_alerts.py",
     "bin/_cctally_release.py",
     "bin/_cctally_setup.py",
     "bin/_lib_aggregators.py",
