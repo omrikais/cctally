@@ -5392,6 +5392,27 @@ def _load_recorded_five_hour_windows(
     """Return sorted, UTC-aware recorded ``five_hour_resets_at`` values
     that anchor real 5h windows in ``[range_start, range_end]``.
 
+    Two sources contribute to the merged anchor set:
+
+    1. ``weekly_usage_snapshots.five_hour_resets_at`` — every
+       record-usage tick stores the API-derived reset moment here. The
+       count of supporting rows weights each anchor (low-count anchors
+       are downvoted in ``_select_non_overlapping_recorded_windows``).
+
+    2. ``five_hour_blocks.five_hour_resets_at`` — the canonical
+       API-anchored rollup table. Each row represents ONE accepted 5h
+       window after ``maybe_update_five_hour_block`` has merged jittered
+       reset values via ``_canonical_5h_window_key``. These are the
+       authoritative anchors; we count them with a heavy weight (1000)
+       so they always dominate over jittered raw snapshot values when
+       both sources see the same physical window. Without this source,
+       ``cctally blocks`` falls back to the heuristic anchor for the
+       ACTIVE row whenever the most recent
+       ``weekly_usage_snapshots.five_hour_resets_at`` value disagrees
+       with the canonical anchor — Bug C in v1.7.2 round 3. Tied
+       windows (jitter within 10-minute floor) collapse to the same
+       key and the canonical weight dominates.
+
     Each value is parsed as ISO-8601 (the storage format produced by
     ``cmd_record_usage``) and normalized to UTC. Naive datetimes are
     treated as already-UTC. Values are floored to the previous
@@ -5418,6 +5439,24 @@ def _load_recorded_five_hour_windows(
                 "  AND five_hour_resets_at <= ?",
                 (range_start.isoformat(), range_end.isoformat()),
             ).fetchall()
+            # Canonical API-anchored windows from the rollup table.
+            # Heavy-weight (1000 per row) so they always dominate over
+            # any jittered raw-snapshot value sharing the same floored
+            # 10-minute bucket. Wrapped in a defensive try in case the
+            # five_hour_blocks table doesn't exist yet (very-old DB on
+            # first open before the bootstrap migration ran).
+            canonical_rows: list[Any] = []
+            try:
+                canonical_rows = conn.execute(
+                    "SELECT five_hour_resets_at "
+                    "FROM five_hour_blocks "
+                    "WHERE five_hour_resets_at IS NOT NULL "
+                    "  AND five_hour_resets_at >= ? "
+                    "  AND five_hour_resets_at <= ?",
+                    (range_start.isoformat(), range_end.isoformat()),
+                ).fetchall()
+            except sqlite3.DatabaseError:
+                canonical_rows = []
     except (sqlite3.DatabaseError, OSError):
         # OSError covers ensure_dirs() failures (read-only FS, permission
         # denied on parent dir) that propagate from open_db() before any
@@ -5438,6 +5477,28 @@ def _load_recorded_five_hour_windows(
             d = d.astimezone(dt.timezone.utc)
         snapped = _floor_to_ten_minutes(d)
         counts[snapped] = counts.get(snapped, 0) + 1
+    # Overlay canonical rollup anchors at heavy weight. Same flooring
+    # rule so a jittered raw value (e.g. 17:48Z) and its canonicalized
+    # rollup (e.g. 17:50Z) collapse into the same bucket; without that
+    # the high-weight canonical entry would create a NEW bucket and
+    # both would be reported as separate windows, then
+    # `_select_non_overlapping_recorded_windows` (5h-disjoint
+    # invariant) would drop the lower-weight one — but the wrong
+    # one would win when jitter exceeds 10 minutes.
+    for row in canonical_rows:
+        raw = row["five_hour_resets_at"] if hasattr(row, "keys") else row[0]
+        if raw is None:
+            continue
+        try:
+            d = dt.datetime.fromisoformat(str(raw))
+        except ValueError:
+            continue
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        else:
+            d = d.astimezone(dt.timezone.utc)
+        snapped = _floor_to_ten_minutes(d)
+        counts[snapped] = counts.get(snapped, 0) + 1000
     return _select_non_overlapping_recorded_windows(list(counts.items()))
 
 
@@ -7093,11 +7154,29 @@ def _apply_reset_events_to_weekrefs(
         week: its API-derived start (= new resets_at - 7d) backdates into
         the pre-reset week. Override ref.week_start_at = effective_reset_at_utc
         so the new week starts at the actual reset moment.
+      - **In-place credit (v1.7.2 round-3, Bug B).** Detected via the row
+        shape ``old_week_end_at == effective_reset_at_utc`` (the live and
+        backfill detection paths both write this shape — see
+        ``test_event_row_old_is_effective_not_cur_end``). For these events,
+        the credited week's ref matches ``new_week_end_at`` (the original
+        resets_at is unchanged), so the post-credit override above
+        rewrites ``week_start_at`` to ``effective``. But the pre-credit
+        segment of the SAME week — where the user spent the bulk of their
+        usage before the credit — is dropped, because no other ref in
+        ``refs`` carries ``week_end_at == effective``. Synthesize a
+        pre-credit ref alongside the post-credit one: its
+        ``week_start_at`` stays at the ref's original API-derived value,
+        its ``week_end_at`` becomes ``effective`` (closes the pre-credit
+        segment). Credited weeks render as TWO trend rows downstream.
 
     The ref's `week_start` (date) and `key` fields are intentionally left at
     the API-derived values — they're the lookup keys for
     weekly_usage_snapshots / weekly_cost_snapshots. Only the display-facing
     `week_start_at` / `week_end_at` (and the derived `week_end` date) shift.
+    Both the pre-credit and post-credit synthesized refs share the same
+    `key` so downstream per-segment readers
+    (``cmd_percent_breakdown`` / dashboard milestone panel) can still
+    filter milestones by ``reset_event_id`` against the same lookup keys.
     """
     events = conn.execute(
         "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
@@ -7107,6 +7186,15 @@ def _apply_reset_events_to_weekrefs(
         return refs
     pre_map  = {e["old_week_end_at"]: e["effective_reset_at_utc"] for e in events}
     post_map = {e["new_week_end_at"]: e["effective_reset_at_utc"] for e in events}
+    # In-place credit events have `old == effective` (the row shape the
+    # live + backfill detection paths agree on). Project the set of
+    # `new_week_end_at` values for those events so we can detect them
+    # while iterating refs and split the credited week into TWO refs.
+    in_place_credit_new_ends: set[str] = {
+        e["new_week_end_at"]
+        for e in events
+        if e["old_week_end_at"] == e["effective_reset_at_utc"]
+    }
     out: list[WeekRef] = []
     for ref in refs:
         new_ref = ref
@@ -7121,7 +7209,43 @@ def _apply_reset_events_to_weekrefs(
                 pass
         if ref.week_end_at and ref.week_end_at in post_map:
             reset_at = post_map[ref.week_end_at]
+            # In-place credit: synthesize a pre-credit ref FIRST so it
+            # lands in `out` before the post-credit ref. The pre-credit
+            # ref keeps the ORIGINAL API-derived week_start_at; only its
+            # week_end_at shifts to `effective`. The post-credit ref
+            # (constructed below via the standard `replace`) carries
+            # week_start_at = effective, week_end_at = original.
+            # Order: pre-credit BEFORE post-credit so chronological
+            # iteration in cmd_report's trend table renders them
+            # naturally (older segment above the newer one in DESC
+            # ordering: post-credit is "more recent" so the post-credit
+            # row should come FIRST in the DESC list — but the original
+            # ref was already in DESC position, and we insert pre-credit
+            # AFTER the post-credit. Concretely: post-credit takes the
+            # ref's original slot; pre-credit goes one slot later).
+            if ref.week_end_at in in_place_credit_new_ends:
+                try:
+                    reset_dt = parse_iso_datetime(
+                        reset_at, "reset_event.effective"
+                    )
+                    pre_end_date = (
+                        # internal fallback: host-local intentional
+                        reset_dt - dt.timedelta(seconds=1)
+                    ).astimezone().date()
+                    pre_credit_ref = replace(
+                        ref,
+                        week_end_at=reset_at,
+                        week_end=pre_end_date,
+                    )
+                except ValueError:
+                    pre_credit_ref = None
+            else:
+                pre_credit_ref = None
             new_ref = replace(new_ref, week_start_at=reset_at)
+            out.append(new_ref)
+            if pre_credit_ref is not None:
+                out.append(pre_credit_ref)
+            continue
         out.append(new_ref)
     return out
 
@@ -8242,8 +8366,38 @@ def cmd_report(args: argparse.Namespace) -> int:
         except OauthUsageConfigError:
             _fresh_cfg = _get_oauth_usage_config({})
 
+        # Build a set of week_start_date keys that occur MORE THAN ONCE
+        # in `weeks` — these are credited weeks (round-3, Bug B) where
+        # `_apply_reset_events_to_weekrefs` synthesized a pre-credit
+        # ref alongside the post-credit ref. Both refs share
+        # `week_start_date` so the default
+        # ``get_latest_usage_for_week(conn, ref)`` returns the SAME row
+        # (the most recent snapshot in the whole week) for both,
+        # collapsing the pre-credit row's `weeklyPercent` to the
+        # post-credit value. For those keys ONLY, pin `as_of_utc` to
+        # the ref's `week_end_at` so each segment renders its own
+        # latest snapshot. Non-credit weeks (single ref per key) keep
+        # the legacy unfiltered lookup so test fixtures that seed
+        # snapshots OUTSIDE the API-derived week window (e.g.
+        # `test_report_freshness`) keep finding their rows.
+        _split_keys = {
+            r.week_start.isoformat()
+            for r in weeks
+            if sum(
+                1 for x in weeks
+                if x.week_start.isoformat() == r.week_start.isoformat()
+            ) > 1
+        }
+
         for week_ref in weeks:
-            usage = get_latest_usage_for_week(conn, week_ref)
+            key = week_ref.week_start.isoformat()
+            usage = get_latest_usage_for_week(
+                conn,
+                week_ref,
+                as_of_utc=(
+                    week_ref.week_end_at if key in _split_keys else None
+                ),
+            )
 
             # For weeks touched by a reset event, the cached
             # weekly_cost_snapshots row covers the API-derived range (which

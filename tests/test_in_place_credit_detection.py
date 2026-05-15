@@ -1560,3 +1560,466 @@ def test_alerts_envelope_id_unique_across_segments(ns):
         assert all(s.startswith(f"weekly:{week_start_date}:3:") for s in ids), ids
     finally:
         conn.close()
+
+
+# ── Round-3 user-test regressions (v1.7.2) ───────────────────────────
+
+
+def test_credit_branch_defensive_cleanup_removes_stale_replays(ns, tmp_path):
+    """Bug A: race-defensive cleanup in the credit-detection branch.
+
+    Failure mode the user hit: between the moment Anthropic credited the
+    user (effective_reset_at_utc) and the next cctally record-usage
+    invocation, the EXTERNAL claude-statusline tool replayed stale
+    pre-credit ``--percent 67`` values (its in-memory HWM cache hadn't
+    caught up). Those replays landed at ``captured_at_utc >= effective``
+    with ``weekly_percent == 67`` (the pre-credit MAX), then dominated
+    the reset-aware clamp's MAX over the post-credit segment so
+    legitimate fresh OAuth values were rejected.
+
+    Fix: after the credit branch writes the event row + force-writes
+    hwm-7d, run a defensive DELETE pass scoped to the same week, rows
+    captured at-or-after ``effective``, with ``weekly_percent`` exactly
+    matching the pre-credit value (round-to-1dp equality).
+    """
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, week_end_date = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        # 1. Pre-credit baseline snapshot at 67%.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        # 2. Race condition: the EXTERNAL statusline tool already wrote
+        # POST-credit-time rows still carrying the stale 67% value
+        # (these are the rows the defensive DELETE must clean up). Use
+        # captured_at_utc values that we KNOW will be >= effective_iso
+        # — the credit branch computes effective_iso as floor_to_hour
+        # of `now`, so anything >= "now floored to hour" works. We use
+        # the very-recent-past minute so the timestamps stamp AFTER
+        # floor_to_hour(now). Critically, these rows are the MOST
+        # RECENT prior snapshots, so the in-place credit detection
+        # branch reads weekly_percent=67 as `prior_pct` (latest row by
+        # captured_at_utc DESC) — that's exactly what fires the
+        # detection (prior=67 vs new=2 = 65pp drop) and what the
+        # cleanup uses for its strict-equality predicate.
+        now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        floor_hour = now_utc.replace(minute=0, second=0)
+        # Two stale-replay rows captured AT and just-after the floor.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc=floor_hour.isoformat().replace("+00:00", "Z"),
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc=(floor_hour + dt.timedelta(minutes=5))
+            .isoformat().replace("+00:00", "Z"),
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Drive the credit branch. percent=2 < clamp MAX over the stale 67%
+    # replays if the cleanup didn't run; with cleanup, the post-credit
+    # segment's MAX is 5% (the legitimate survivor), and 2% is still
+    # below that — but the seed snapshot path runs in this same
+    # invocation. We mainly assert the DELETE happened.
+    args = _record_usage_args(percent=2.0, resets_at=end_epoch)
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        # Event row written (proves we entered the credit branch).
+        events = conn.execute(
+            "SELECT old_week_end_at, new_week_end_at, "
+            "       effective_reset_at_utc FROM week_reset_events"
+        ).fetchall()
+        assert len(events) == 1, events
+        effective_iso = events[0]["effective_reset_at_utc"]
+
+        # The two 67% post-credit-time replay rows MUST be gone.
+        stale_post_credit = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+            "  AND round(weekly_percent, 1) = 67.0",
+            (week_start_date, effective_iso),
+        ).fetchone()[0]
+        assert stale_post_credit == 0, (
+            "defensive cleanup should have deleted post-credit-time"
+            " stale 67% replays"
+        )
+
+        # Pre-credit 67% row (captured BEFORE the credit moment) MUST
+        # survive — its captured_at_utc is "2026-05-14T10:00:00Z" which
+        # is well before any plausible floor_to_hour(now). The
+        # equality predicate is fine; the filter that protects this
+        # row is the timestamp half (>= effective_iso).
+        pre_credit_67 = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? "
+            "  AND captured_at_utc < ? "
+            "  AND round(weekly_percent, 1) = 67.0",
+            (week_start_date, effective_iso),
+        ).fetchone()[0]
+        assert pre_credit_67 == 1, (
+            "pre-credit 67% rows must survive (clamp's reset-aware"
+            " filter handles them)"
+        )
+
+        # The post-credit 2% seed snapshot MUST have landed — proves
+        # the cleanup unblocked the seed. Without cleanup, the
+        # reset-aware clamp's MAX would still see the post-credit-time
+        # 67% rows (they're at-or-after effective_reset_at_utc and
+        # part of the segment's MAX window), and the 2% reading would
+        # be rejected as a regression.
+        seed_landed = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? AND round(weekly_percent, 1) = 2.0",
+            (week_start_date,),
+        ).fetchone()[0]
+        assert seed_landed == 1, (
+            "post-credit seed snapshot must land after cleanup"
+        )
+    finally:
+        conn.close()
+
+
+# ── Round-3 Bug B: pre-credit ref synthesis ──────────────────────────
+
+
+def test_apply_reset_events_synthesizes_pre_credit_ref(ns):
+    """Bug B: a credited week must render as TWO refs after
+    ``_apply_reset_events_to_weekrefs`` — a pre-credit segment closed
+    at ``effective_reset_at_utc`` AND the existing post-credit segment.
+    Detected via the in-place credit row shape
+    ``old_week_end_at == effective_reset_at_utc``.
+    """
+    end_iso = "2026-05-16T17:00:00+00:00"
+    effective_iso = "2026-05-15T17:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = "2026-05-09T17:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        # Seed an in-place credit event row (old==effective shape).
+        _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=effective_iso,
+            old_week_end_at=effective_iso,
+        )
+        # Build ONE WeekRef matching the credited week.
+        ref = ns["make_week_ref"](
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+        )
+        out = ns["_apply_reset_events_to_weekrefs"](conn, [ref])
+    finally:
+        conn.close()
+
+    # Two refs returned for the credited week.
+    assert len(out) == 2, f"expected 2 refs (pre + post), got {len(out)}: {out}"
+
+    # First ref returned is the POST-credit segment (preserves
+    # ref-slot ordering in the DESC-sorted output of get_recent_weeks).
+    post = out[0]
+    pre = out[1]
+
+    assert post.week_start_at == effective_iso
+    assert post.week_end_at == end_iso
+
+    assert pre.week_start_at == week_start_at
+    assert pre.week_end_at == effective_iso
+
+    # Both refs share the same lookup keys (week_start date + the
+    # `key` field) so per-segment milestone readers can still join on
+    # ``reset_event_id``.
+    assert pre.week_start == post.week_start
+    assert pre.key == post.key
+
+
+def test_apply_reset_events_does_not_split_for_boundary_shift(ns):
+    """Regression guard: an event with ``old != effective`` (the
+    classic boundary-shift case, where Anthropic moved ``resets_at``
+    forward before the natural end) must NOT trigger the new split
+    behavior. The pre_map / post_map logic for boundary shifts is
+    unchanged.
+    """
+    # Two distinct weeks for the boundary-shift event.
+    pre_end_iso = "2026-05-10T17:00:00+00:00"
+    new_end_iso = "2026-05-12T19:00:00+00:00"
+    effective_iso = "2026-05-12T19:00:00+00:00"  # different from old
+    # The old end is OLDER than effective (classic shift); critically
+    # `old != effective` (the marker that distinguishes shifts from
+    # in-place credits).
+    old_end_iso = pre_end_iso
+
+    pre_week_start_at = "2026-05-03T17:00:00+00:00"
+    post_week_start_at = "2026-05-05T19:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        _seed_reset_event(
+            conn,
+            new_week_end_at=new_end_iso,
+            effective=effective_iso,
+            old_week_end_at=old_end_iso,
+        )
+        pre_ref = ns["make_week_ref"](
+            week_start_date="2026-05-03",
+            week_end_date="2026-05-10",
+            week_start_at=pre_week_start_at,
+            week_end_at=old_end_iso,
+        )
+        post_ref = ns["make_week_ref"](
+            week_start_date="2026-05-05",
+            week_end_date="2026-05-12",
+            week_start_at=post_week_start_at,
+            week_end_at=new_end_iso,
+        )
+        out = ns["_apply_reset_events_to_weekrefs"](
+            conn, [post_ref, pre_ref],
+        )
+    finally:
+        conn.close()
+
+    # Exactly 2 refs (one per input). No synthesized split.
+    assert len(out) == 2, out
+
+    # Post-reset ref: week_start_at rewritten to effective.
+    post_out = next(r for r in out if r.week_end_at == new_end_iso)
+    assert post_out.week_start_at == effective_iso
+
+    # Pre-reset ref: week_end_at rewritten to effective.
+    pre_out = next(r for r in out if r.week_start_at == pre_week_start_at)
+    assert pre_out.week_end_at == effective_iso
+
+
+def test_trend_table_shows_pre_credit_row(ns, capsys):
+    """End-to-end: with an in-place credit event row + seeded
+    weekly_usage_snapshots, ``cmd_report`` (JSON mode) must emit TWO
+    trend rows for the credited week — pre-credit (closed at
+    ``effective``) and post-credit (opened at ``effective``).
+
+    Verifies the per-segment cost paths in ``cmd_report`` don't crash
+    on a duplicated lookup key (both refs share ``week_start_date``).
+    """
+    import json
+    end_iso = "2026-05-16T17:00:00+00:00"
+    effective_iso = "2026-05-15T17:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = "2026-05-09T17:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        # Pre-credit snapshot at 67%.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T16:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        # Post-credit snapshot at 4%.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T20:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=4.0,
+        )
+        _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=effective_iso,
+            old_week_end_at=effective_iso,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rc = ns["cmd_report"](argparse.Namespace(
+        weeks=1,
+        sync_current=False,
+        week_start_name=None,
+        mode="auto",
+        offline=True,
+        project=None,
+        json=True,
+        detail=False,
+        format=None,
+        theme=None,
+        reveal_projects=False,
+        no_branding=False,
+        output=None,
+        copy=False,
+        open=False,
+        tz=None,
+    ))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    trend = payload["trend"]
+    # 2 refs for the credited week (pre + post segment).
+    credited = [
+        r for r in trend if r["weekStartDate"] == week_start_date
+    ]
+    assert len(credited) == 2, f"expected 2 trend rows, got: {credited}"
+
+    # Identify pre vs post by week_end_at.
+    pre = next(r for r in credited if r["weekEndAt"] == effective_iso)
+    post = next(r for r in credited if r["weekEndAt"] == end_iso)
+
+    # Pre-credit row carries the pre-credit usage value (67%).
+    assert pre["weeklyPercent"] == 67.0, pre
+    # Post-credit row carries the post-credit usage value (4%).
+    assert post["weeklyPercent"] == 4.0, post
+
+
+# ── Round-3 Bug C: cctally blocks uses API-anchored data ─────────────
+
+
+def _seed_five_hour_block_row(
+    conn,
+    *,
+    five_hour_resets_at: str,
+    block_start_at: str,
+    five_hour_window_key: int,
+    final_pct: float = 50.0,
+) -> int:
+    """Insert a minimal ``five_hour_blocks`` row and return its id."""
+    cur = conn.execute(
+        "INSERT INTO five_hour_blocks "
+        "(five_hour_window_key, five_hour_resets_at, block_start_at, "
+        " first_observed_at_utc, last_observed_at_utc, "
+        " final_five_hour_percent, is_closed, "
+        " created_at_utc, last_updated_at_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+        (five_hour_window_key, five_hour_resets_at, block_start_at,
+         block_start_at, block_start_at, final_pct,
+         block_start_at, block_start_at),
+    )
+    return int(cur.lastrowid)
+
+
+def test_blocks_anchor_picks_five_hour_blocks_when_available(ns):
+    """Bug C: ``_load_recorded_five_hour_windows`` must also pull
+    ``five_hour_resets_at`` from the canonical ``five_hour_blocks``
+    rollup table — and the canonical entry must dominate over any
+    jittered raw value sharing the same 10-minute floor.
+    """
+    # Use a moment in the recent past so it falls inside the default
+    # range (2020-01-01 → now widened by 5h).
+    canonical_resets = "2026-05-15T22:50:00+00:00"  # 17:50Z block start
+    block_start = "2026-05-15T17:50:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        # Seed a weekly_usage_snapshots row whose
+        # `five_hour_resets_at` is JITTERED away from the canonical
+        # value by less than 10 minutes — these should collapse to the
+        # same floored bucket and the canonical (heavy-weight) entry
+        # should dominate.
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, weekly_percent, "
+            " source, payload_json, "
+            " five_hour_percent, five_hour_resets_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-05-15T20:00:00Z", "2026-05-09", "2026-05-16",
+             "2026-05-09T17:00:00+00:00", "2026-05-16T17:00:00+00:00",
+             5.0, "test", "{}", 25.0,
+             "2026-05-15T22:48:00+00:00"),  # 2min jitter from canonical
+        )
+        _seed_five_hour_block_row(
+            conn,
+            five_hour_resets_at=canonical_resets,
+            block_start_at=block_start,
+            five_hour_window_key=int(
+                dt.datetime.fromisoformat(canonical_resets).timestamp()
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    range_start = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+    range_end = dt.datetime(2026, 5, 16, tzinfo=dt.timezone.utc)
+    windows = ns["_load_recorded_five_hour_windows"](range_start, range_end)
+
+    assert len(windows) >= 1, f"expected at least one window, got {windows}"
+
+    # The returned anchor must be the floored canonical value (22:50Z).
+    expected_floor = dt.datetime(
+        2026, 5, 15, 22, 50, 0, tzinfo=dt.timezone.utc,
+    )
+    assert expected_floor in windows, (
+        f"canonical 22:50Z anchor missing from windows: {windows}"
+    )
+
+
+def test_blocks_anchor_falls_back_when_no_five_hour_blocks_row(ns):
+    """Bug C regression guard: when the ``five_hour_blocks`` table is
+    empty (no canonical anchors available), ``_load_recorded_five_hour_windows``
+    must still return raw-snapshot anchors. Heuristic behavior unchanged
+    in this case.
+    """
+    raw_resets = "2026-05-15T22:48:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        # Seed several weekly_usage_snapshots rows with the same raw
+        # reset (count >= 1 to survive the
+        # _select_non_overlapping_recorded_windows filter).
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO weekly_usage_snapshots "
+                "(captured_at_utc, week_start_date, week_end_date, "
+                " week_start_at, week_end_at, weekly_percent, "
+                " source, payload_json, "
+                " five_hour_percent, five_hour_resets_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"2026-05-15T20:0{i}:00Z", "2026-05-09", "2026-05-16",
+                 "2026-05-09T17:00:00+00:00",
+                 "2026-05-16T17:00:00+00:00",
+                 5.0 + i, "test", "{}", 25.0 + i, raw_resets),
+            )
+        conn.execute("DELETE FROM five_hour_blocks")
+        conn.commit()
+    finally:
+        conn.close()
+
+    range_start = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+    range_end = dt.datetime(2026, 5, 16, tzinfo=dt.timezone.utc)
+    windows = ns["_load_recorded_five_hour_windows"](range_start, range_end)
+
+    # Raw anchor (floored to 22:40Z because :48 floors to :40 in
+    # 10-minute buckets).
+    expected_floor = dt.datetime(
+        2026, 5, 15, 22, 40, 0, tzinfo=dt.timezone.utc,
+    )
+    assert expected_floor in windows, (
+        f"raw-snapshot anchor missing without five_hour_blocks: {windows}"
+    )

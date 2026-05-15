@@ -1435,6 +1435,42 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                                 )
                             except OSError:
                                 pass
+
+                            # Race-defensive cleanup. Between the moment
+                            # Anthropic credited the user (effective_iso)
+                            # and this code firing, the EXTERNAL
+                            # claude-statusline tool can replay stale
+                            # pre-credit `--percent` values (it has its
+                            # own in-memory HWM cache and re-runs us once
+                            # per status-line tick). Those replays land
+                            # captured_at_utc >= effective_iso with
+                            # weekly_percent == prior_pct (the pre-credit
+                            # value), and they dominate the reset-aware
+                            # clamp's MAX over the post-credit segment so
+                            # legitimate fresh OAuth values are rejected.
+                            # Strict equality (round(.,1)) keeps this
+                            # narrow: we only delete rows whose percent
+                            # exactly matches the pre-credit value we just
+                            # observed — legitimate post-credit climbs
+                            # past `prior_pct` (rare, but possible if the
+                            # credit is small + activity is heavy) stay.
+                            try:
+                                conn.execute(
+                                    "DELETE FROM weekly_usage_snapshots "
+                                    "WHERE week_start_date = ? "
+                                    "  AND unixepoch(captured_at_utc) >= "
+                                    "      unixepoch(?) "
+                                    "  AND round(weekly_percent, 1) = "
+                                    "      round(?, 1)",
+                                    (week_start_date, effective_iso,
+                                     float(prior_pct)),
+                                )
+                                conn.commit()
+                            except sqlite3.DatabaseError as exc:
+                                eprint(
+                                    "[record-usage] post-credit cleanup "
+                                    f"failed: {exc}"
+                                )
         except (sqlite3.DatabaseError, ValueError) as exc:
             eprint(f"[record-usage] reset-event detection failed: {exc}")
 
