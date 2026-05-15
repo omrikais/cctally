@@ -253,6 +253,13 @@ _compute_display_block = _lib_display_tz._compute_display_block
 format_display_dt = _lib_display_tz.format_display_dt
 _argparse_tz = _lib_display_tz._argparse_tz
 
+_lib_alerts_payload = _load_sibling("_lib_alerts_payload")
+_alert_text_weekly = _lib_alerts_payload._alert_text_weekly
+_alert_text_five_hour = _lib_alerts_payload._alert_text_five_hour
+_escape_applescript_string = _lib_alerts_payload._escape_applescript_string
+_build_alert_payload_weekly = _lib_alerts_payload._build_alert_payload_weekly
+_build_alert_payload_five_hour = _lib_alerts_payload._build_alert_payload_five_hour
+
 
 # === Lazy-loaded library siblings (PEP 562 registry) ===
 #
@@ -4275,67 +4282,6 @@ def _resolve_codex_tz_name(args: argparse.Namespace,
     return getattr(args, "timezone", None)
 
 
-
-def _alert_text_weekly(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, str]:
-    """Build (title, subtitle, body) for a weekly threshold alert.
-
-    Most datetime renders go through ``format_display_dt`` (chokepoint
-    rule), but ``week_start_date`` is a CALENDAR DAY (``YYYY-MM-DD``),
-    not a clock instant — tagging it as UTC-midnight and then routing
-    through ``format_display_dt(..., tz)`` would shift the wall-clock
-    day for non-UTC ``display.tz`` (e.g. "Sun, Apr 27" → "Sat, Apr 26"
-    in ``America/Los_Angeles``). Render the date directly via
-    ``dt.date.fromisoformat`` so the rendered weekday/day matches the
-    calendar date the user thinks of as "this week".
-    """
-    threshold = int(payload["threshold"])
-    title = f"cctally - Weekly usage {threshold}% reached"
-    ctx = payload.get("context") or {}
-    week_start_date = ctx.get("week_start_date")
-    if week_start_date:
-        # Calendar-day render: ``week_start_date`` is a date, not an
-        # instant; bypass tz conversion to avoid the off-by-one shift
-        # documented above. ``tz`` is accepted for signature parity
-        # with peer alert builders and intentionally unused here.
-        subtitle = "Week starting " + dt.date.fromisoformat(
-            week_start_date
-        ).strftime("%a, %b %d")
-    else:
-        subtitle = "Current week"
-    cumulative = float(ctx.get("cumulative_cost_usd") or 0.0)
-    dpp = ctx.get("dollars_per_percent")
-    if dpp is not None:
-        body = f"${cumulative:.2f} spent so far - ${float(dpp):.2f} per 1%"
-    else:
-        body = f"${cumulative:.2f} spent so far"
-    return title, subtitle, body
-
-
-def _alert_text_five_hour(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, str]:
-    """Build (title, subtitle, body) for a 5h-block threshold alert.
-
-    All datetime renders go through ``format_display_dt`` (chokepoint rule).
-    """
-    threshold = int(payload["threshold"])
-    title = f"cctally - 5h-block usage {threshold}% reached"
-    ctx = payload.get("context") or {}
-    bsa_iso = ctx.get("block_start_at")
-    if bsa_iso:
-        bsa = dt.datetime.fromisoformat(str(bsa_iso).replace("Z", "+00:00"))
-        subtitle = "Block started " + format_display_dt(
-            bsa, tz, fmt="%H:%M", suffix=False
-        )
-    else:
-        subtitle = "Current 5h block"
-    cost = float(ctx.get("block_cost_usd") or 0.0)
-    model = ctx.get("primary_model")
-    if model:
-        body = f"${cost:.2f} spent in this block - current model: {model}"
-    else:
-        body = f"${cost:.2f} spent in this block"
-    return title, subtitle, body
-
-
 def _alerts_log_path() -> "pathlib.Path":
     """Return ``~/.local/share/cctally/logs/alerts.log`` (parent dirs created).
 
@@ -4346,21 +4292,6 @@ def _alerts_log_path() -> "pathlib.Path":
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     return LOG_DIR / "alerts.log"
-
-
-def _escape_applescript_string(s: str) -> str:
-    """Escape ``s`` for embedding inside an AppleScript double-quoted literal.
-
-    Order matters: backslashes first (otherwise the inserted backslashes
-    from the double-quote escape get re-escaped), then double quotes,
-    then newlines/CRs collapse to spaces (AppleScript chokes on raw NL).
-    """
-    return (
-        s.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", " ")
-        .replace("\r", " ")
-    )
 
 
 def _dispatch_alert_notification(
@@ -4450,70 +4381,6 @@ def _dispatch_alert_notification(
         pass  # log-write failures must not affect dispatch contract
 
     return status
-
-
-def _build_alert_payload_weekly(
-    *,
-    threshold: int,
-    crossed_at_utc: str,
-    week_start_date: str,
-    cumulative_cost_usd: float,
-    dollars_per_percent: "float | None",
-) -> dict:
-    """Build the alert payload for a weekly threshold crossing.
-
-    ``alerted_at`` mirrors ``crossed_at`` here because the production caller
-    sets the DB ``alerted_at`` BEFORE invoking ``_dispatch_alert_notification``
-    (set-then-dispatch invariant, spec §3.2). Consumers (envelope builders,
-    test inspectors) read the ``alerted_at`` field as the authoritative
-    "alert was attempted" timestamp.
-    """
-    return {
-        "id": f"weekly:{week_start_date}:{threshold}",
-        "axis": "weekly",
-        "threshold": int(threshold),
-        "crossed_at": crossed_at_utc,
-        "alerted_at": crossed_at_utc,  # set-then-dispatch
-        "context": {
-            "week_start_date": week_start_date,
-            "cumulative_cost_usd": float(cumulative_cost_usd),
-            "dollars_per_percent": (
-                float(dollars_per_percent) if dollars_per_percent is not None else None
-            ),
-        },
-    }
-
-
-def _build_alert_payload_five_hour(
-    *,
-    threshold: int,
-    crossed_at_utc: str,
-    five_hour_window_key: int,
-    block_start_at: str,
-    block_cost_usd: float,
-    primary_model: "str | None",
-) -> dict:
-    """Build the alert payload for a 5h-block threshold crossing.
-
-    See ``_build_alert_payload_weekly`` for the ``alerted_at == crossed_at``
-    rationale. ``primary_model`` is the highest-cost model active in the
-    block (resolved via ``_resolve_primary_model_for_block``); ``None`` when
-    the rollup-children child table is empty (e.g., direct-JSONL-fallback
-    path before lazy backfill).
-    """
-    return {
-        "id": f"five_hour:{five_hour_window_key}:{threshold}",
-        "axis": "five_hour",
-        "threshold": int(threshold),
-        "crossed_at": crossed_at_utc,
-        "alerted_at": crossed_at_utc,  # set-then-dispatch
-        "context": {
-            "five_hour_window_key": int(five_hour_window_key),
-            "block_start_at": block_start_at,
-            "block_cost_usd": float(block_cost_usd),
-            "primary_model": primary_model,
-        },
-    }
 
 
 def _resolve_primary_model_for_block(
