@@ -398,7 +398,31 @@ def maybe_record_milestone(
 
     conn = open_db()
     try:
-        max_existing = get_max_milestone_for_week(conn, week_start_date)
+        # Resolve the active segment for THIS captured moment. The segment
+        # is the latest week_reset_events row keyed on week_end_at whose
+        # effective_reset_at_utc <= captured_at; 0 = pre-credit / no-event
+        # sentinel. ``unixepoch()`` normalizes the comparison across mixed
+        # +00:00 / Z offsets (see precedent at bin/cctally:_compute_block_totals
+        # cross-reset detection; also project gotcha
+        # ``unixepoch_for_cross_offset_compare``).
+        captured_at_iso = saved.get("capturedAt") or now_utc_iso()
+        reset_event_id = 0
+        if week_end_at:
+            seg_row = conn.execute(
+                """
+                SELECT id FROM week_reset_events
+                 WHERE new_week_end_at = ?
+                   AND unixepoch(effective_reset_at_utc) <= unixepoch(?)
+                 ORDER BY id DESC LIMIT 1
+                """,
+                (week_end_at, captured_at_iso),
+            ).fetchone()
+            if seg_row is not None:
+                reset_event_id = int(seg_row["id"])
+
+        max_existing = get_max_milestone_for_week(
+            conn, week_start_date, reset_event_id=reset_event_id,
+        )
         if max_existing is not None and current_floor <= max_existing:
             return
 
@@ -482,7 +506,10 @@ def maybe_record_milestone(
         pending_alerts: list[dict[str, Any]] = []
         for pct in range(start_threshold, current_floor + 1):
             if pct == start_threshold and max_existing is not None:
-                prev_cost = get_milestone_cost_for_week(conn, week_start_date, max_existing)
+                prev_cost = get_milestone_cost_for_week(
+                    conn, week_start_date, max_existing,
+                    reset_event_id=reset_event_id,
+                )
                 marginal = (cumulative_cost - prev_cost) if prev_cost is not None else None
             else:
                 marginal = None
@@ -499,6 +526,7 @@ def maybe_record_milestone(
                 cost_snapshot_id=cost_snapshot_id,
                 five_hour_percent_at_crossing=five_hour_percent,
                 commit=False,
+                reset_event_id=reset_event_id,
             )
             # ── Threshold-actions dispatch (set-then-dispatch, spec §3.2) ──
             # Only the genuine-new-crossing winner (rowcount==1) reaches this
@@ -523,17 +551,22 @@ def maybe_record_milestone(
                     conn.execute(
                         "UPDATE percent_milestones SET alerted_at = ? "
                         "WHERE week_start_date = ? AND percent_threshold = ? "
-                        "AND alerted_at IS NULL",
-                        (crossed_at, week_start_date, pct),
+                        "  AND reset_event_id = ? "
+                        "  AND alerted_at IS NULL",
+                        (crossed_at, week_start_date, pct, reset_event_id),
                     )
                     # Cheap re-read for payload context (cumulative_cost_usd
                     # reflects the value persisted on insert, immune to any
                     # subsequent recompute drift). SELECT inside the open
                     # transaction is fine; values reflect post-INSERT state.
+                    # Filter by reset_event_id so a credited week's
+                    # alert payload reads the post-credit row, not a
+                    # stale pre-credit row at the same (week, threshold).
                     row = conn.execute(
                         "SELECT cumulative_cost_usd FROM percent_milestones "
-                        "WHERE week_start_date = ? AND percent_threshold = ?",
-                        (week_start_date, pct),
+                        "WHERE week_start_date = ? AND percent_threshold = ? "
+                        "  AND reset_event_id = ?",
+                        (week_start_date, pct, reset_event_id),
                     ).fetchone()
                     if row is not None:
                         cum = float(row["cumulative_cost_usd"])

@@ -611,3 +611,242 @@ def test_backfill_preserves_boundary_shift_branch(ns):
         assert events[0]["new_week_end_at"] == end_2_iso
     finally:
         conn.close()
+
+
+# ── Task 5: milestone writer stamps reset_event_id ────────────────────
+
+
+def _seed_cost_snapshot(
+    conn,
+    *,
+    week_start_date: str,
+    week_end_date: str,
+    week_start_at: str,
+    week_end_at: str,
+    cost_usd: float,
+    captured_at_utc: str = "2026-05-15T18:00:00Z",
+) -> int:
+    """Insert a weekly_cost_snapshots row (avoids the milestone writer
+    bailing out on missing cost data).
+    """
+    cur = conn.execute(
+        "INSERT INTO weekly_cost_snapshots "
+        "(captured_at_utc, week_start_date, week_end_date, "
+        " week_start_at, week_end_at, cost_usd, mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (captured_at_utc, week_start_date, week_end_date,
+         week_start_at, week_end_at, cost_usd, "auto"),
+    )
+    return int(cur.lastrowid)
+
+
+def test_milestone_segment_zero_when_no_event(ns):
+    """No ``week_reset_events`` row for this week_end_at →
+    ``maybe_record_milestone`` writes ``reset_event_id = 0`` (pre-credit
+    sentinel).
+    """
+    end_iso = "2026-05-09T05:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = week_start_date + "T05:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        # Cost snapshot so the writer doesn't bail.
+        _seed_cost_snapshot(
+            conn,
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            cost_usd=12.34,
+        )
+        # Usage snapshot at 3% (so floor(3) = 3 → threshold 3 crosses).
+        usage_id = _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-04T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            week_start_at=week_start_at,
+            weekly_percent=3.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    saved = {
+        "id": usage_id,
+        "weeklyPercent": 3.0,
+        "weekStartDate": week_start_date,
+        "weekEndDate": week_end_date,
+        "weekStartAt": week_start_at,
+        "weekEndAt": end_iso,
+        "fiveHourPercent": None,
+    }
+    ns["maybe_record_milestone"](saved)
+
+    conn = ns["open_db"]()
+    try:
+        # When max_existing is None and current_floor is 3, the writer
+        # records only the just-crossed threshold (3), not the prior
+        # ones. The point of this test is to assert reset_event_id=0,
+        # not the multi-threshold-catchup loop.
+        rows = conn.execute(
+            "SELECT percent_threshold, reset_event_id FROM percent_milestones "
+            "WHERE week_start_date = ? ORDER BY percent_threshold",
+            (week_start_date,),
+        ).fetchall()
+        assert len(rows) == 1, rows
+        assert rows[0]["percent_threshold"] == 3
+        assert rows[0]["reset_event_id"] == 0
+    finally:
+        conn.close()
+
+
+def test_milestone_segment_assigned_when_event_active(ns):
+    """``week_reset_events`` row exists with effective < captured_at:
+    new milestone rows get ``reset_event_id = event.id``.
+    """
+    end_iso = "2026-05-16T05:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = week_start_date + "T05:00:00+00:00"
+    effective = "2026-05-14T17:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        _seed_cost_snapshot(
+            conn,
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            cost_usd=12.34,
+        )
+        evt_id = _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=effective,
+            old_week_end_at=end_iso,
+        )
+        # Usage snapshot captured AFTER the credit moment.
+        usage_id = _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T18:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=3.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    saved = {
+        "id": usage_id,
+        "weeklyPercent": 3.0,
+        "weekStartDate": week_start_date,
+        "weekEndDate": week_end_date,
+        "weekStartAt": week_start_at,
+        "weekEndAt": end_iso,
+        "fiveHourPercent": None,
+        "capturedAt": "2026-05-14T18:00:00Z",
+    }
+    ns["maybe_record_milestone"](saved)
+
+    conn = ns["open_db"]()
+    try:
+        rows = conn.execute(
+            "SELECT percent_threshold, reset_event_id FROM percent_milestones "
+            "WHERE week_start_date = ? ORDER BY percent_threshold",
+            (week_start_date,),
+        ).fetchall()
+        # Only threshold 3 lands (no prior max_existing → start at
+        # current_floor). The assertion of interest is reset_event_id.
+        assert len(rows) == 1, rows
+        assert rows[0]["percent_threshold"] == 3
+        assert rows[0]["reset_event_id"] == evt_id
+    finally:
+        conn.close()
+
+
+def test_milestone_post_credit_threshold_lands_as_new_row(ns):
+    """Pre-credit milestone (week, threshold=3, reset_event_id=0) exists.
+    Seed event row. Drive ``maybe_record_milestone`` for the same week
+    + threshold=3 captured post-event.
+    Assert: TWO rows exist for (week, threshold=3) — pre-credit
+    reset_event_id=0 + post-credit reset_event_id=event.id.
+    """
+    end_iso = "2026-05-16T05:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = week_start_date + "T05:00:00+00:00"
+    effective = "2026-05-14T17:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        _seed_cost_snapshot(
+            conn,
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            cost_usd=12.34,
+        )
+        # Pre-credit milestone (reset_event_id = 0).
+        conn.execute(
+            "INSERT INTO percent_milestones "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, percent_threshold, "
+            " cumulative_cost_usd, marginal_cost_usd, "
+            " usage_snapshot_id, cost_snapshot_id, reset_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-05-12T10:00:00Z", week_start_date, week_end_date,
+             week_start_at, end_iso, 3, 100.0, None, 1, 1, 0),
+        )
+        # Event row for the credit boundary.
+        evt_id = _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=effective,
+            old_week_end_at=end_iso,
+        )
+        # New usage snapshot at 3%, captured post-event.
+        usage_id = _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T18:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=3.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    saved = {
+        "id": usage_id,
+        "weeklyPercent": 3.0,
+        "weekStartDate": week_start_date,
+        "weekEndDate": week_end_date,
+        "weekStartAt": week_start_at,
+        "weekEndAt": end_iso,
+        "fiveHourPercent": None,
+        "capturedAt": "2026-05-14T18:00:00Z",
+    }
+    ns["maybe_record_milestone"](saved)
+
+    conn = ns["open_db"]()
+    try:
+        rows = conn.execute(
+            "SELECT percent_threshold, reset_event_id "
+            "FROM percent_milestones "
+            "WHERE week_start_date = ? AND percent_threshold = 3 "
+            "ORDER BY reset_event_id ASC",
+            (week_start_date,),
+        ).fetchall()
+        assert len(rows) == 2, rows
+        assert rows[0]["reset_event_id"] == 0
+        assert rows[1]["reset_event_id"] == evt_id
+    finally:
+        conn.close()

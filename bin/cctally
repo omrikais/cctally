@@ -4725,15 +4725,27 @@ def insert_cost_snapshot(
 def get_max_milestone_for_week(
     conn: sqlite3.Connection,
     week_start_date: str,
+    *,
+    reset_event_id: int = 0,
 ) -> int | None:
-    """Return the highest percent_threshold recorded for a week, or None."""
+    """Return the highest percent_threshold recorded for a week's segment,
+    or None.
+
+    ``reset_event_id`` (v1.7.2): default 0 (= pre-credit / no-event
+    sentinel) preserves legacy behavior on un-credited weeks. When an
+    in-place credit lifts a week into a new segment, callers pass the
+    segment id so the segment's threshold ledger is independent of the
+    pre-credit one — the post-credit 1% / 2% / 3% milestones fire even
+    if the pre-credit segment already crossed those thresholds.
+    """
     row = conn.execute(
         """
         SELECT MAX(percent_threshold) AS max_pct
         FROM percent_milestones
         WHERE week_start_date = ?
+          AND reset_event_id = ?
         """,
-        (week_start_date,),
+        (week_start_date, reset_event_id),
     ).fetchone()
     if row and row["max_pct"] is not None:
         return int(row["max_pct"])
@@ -4744,15 +4756,27 @@ def get_milestone_cost_for_week(
     conn: sqlite3.Connection,
     week_start_date: str,
     percent_threshold: int,
+    *,
+    reset_event_id: int = 0,
 ) -> float | None:
-    """Return the cumulative_cost_usd for a specific threshold, or None."""
+    """Return the cumulative_cost_usd for a specific (week, threshold,
+    segment), or None.
+
+    ``reset_event_id`` (v1.7.2): segment-aware lookup. Default 0 preserves
+    legacy behavior. Used by ``maybe_record_milestone`` to compute the
+    marginal cost between consecutive thresholds inside the SAME segment
+    — without the filter, the post-credit threshold-3 row would compute
+    its marginal against the pre-credit threshold-2 cost (wrong segment).
+    """
     row = conn.execute(
         """
         SELECT cumulative_cost_usd
         FROM percent_milestones
-        WHERE week_start_date = ? AND percent_threshold = ?
+        WHERE week_start_date = ?
+          AND percent_threshold = ?
+          AND reset_event_id = ?
         """,
-        (week_start_date, percent_threshold),
+        (week_start_date, percent_threshold, reset_event_id),
     ).fetchone()
     if row:
         return float(row["cumulative_cost_usd"])
@@ -4789,18 +4813,29 @@ def insert_percent_milestone(
     five_hour_percent_at_crossing: float | None = None,
     *,
     commit: bool = True,
+    reset_event_id: int = 0,
 ) -> int:
     """Insert a percent_milestones row idempotently.
 
     Returns the SQLite rowcount: 1 on a genuinely new crossing, 0 if a row
-    for (week_start_date, percent_threshold) already exists. Race-safe under
-    concurrent record-usage instances — aligns with the existing 5h-milestone
-    INSERT OR IGNORE pattern (see five_hour_milestones write path).
+    for (week_start_date, percent_threshold, reset_event_id) already exists.
+    Race-safe under concurrent record-usage instances — aligns with the
+    existing 5h-milestone INSERT OR IGNORE pattern (see five_hour_milestones
+    write path).
+
+    ``reset_event_id`` (v1.7.2 segment column, migration 005): defaults to
+    ``0`` (= pre-credit / no-event sentinel). When an in-place credit fires
+    for the current week, the caller (``maybe_record_milestone``) resolves
+    the active segment from ``week_reset_events`` and passes it in so
+    post-credit threshold crossings land as a SEPARATE row from any
+    pre-credit one at the same (week, threshold). The UNIQUE constraint
+    is on the 3-tuple, so (week=W, threshold=T, segment=0) and (W, T,
+    event_id) coexist.
 
     Callers that need the row id MUST follow up with an explicit
     `SELECT id FROM percent_milestones WHERE week_start_date=? AND
-    percent_threshold=?` query — `lastrowid` is unreliable when the row
-    is the silent-duplicate target.
+    percent_threshold=? AND reset_event_id=?` query — `lastrowid` is
+    unreliable when the row is the silent-duplicate target.
 
     ``commit=False`` skips the inner ``conn.commit()`` so the caller can
     bundle the INSERT with a follow-up ``alerted_at`` UPDATE in a single
@@ -4825,9 +4860,10 @@ def insert_percent_milestone(
           marginal_cost_usd,
           usage_snapshot_id,
           cost_snapshot_id,
-          five_hour_percent_at_crossing
+          five_hour_percent_at_crossing,
+          reset_event_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             now_utc_iso(),
@@ -4841,6 +4877,7 @@ def insert_percent_milestone(
             usage_snapshot_id,
             cost_snapshot_id,
             five_hour_percent_at_crossing,
+            reset_event_id,
         ),
     )
     if commit:
