@@ -132,9 +132,17 @@ scenario_dump_log () {
         return 0
     fi
     # Escape regex meta-chars in the bin path before substitution.
+    # Also redact paths into sibling modules (bin/_cctally_db.py etc.)
+    # — migration framework + handlers + dispatcher live in
+    # bin/_cctally_db.py post Phase C #16 split; pre-split tracebacks
+    # pointed at bin/cctally directly. Sentinel stays <CCTALLY_BIN> so
+    # goldens written before and after the split read the same.
     local bin_pat="${HARNESS_BIN//./\\.}"
+    local sibling_dir="${REPO_ROOT}/bin"
+    local sibling_pat="${sibling_dir//./\\.}/_cctally_[a-z_]+\\.py"
     sed -E \
         -e 's/\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\]/[<REDACTED>]/g' \
+        -e "s|${sibling_pat}|<CCTALLY_BIN>|g" \
         -e "s|${bin_pat}|<CCTALLY_BIN>|g" \
         -e 's/line [0-9]+,/line <N>,/g' \
         "$log_path"

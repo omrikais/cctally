@@ -75,6 +75,15 @@ def redirect_paths(ns, monkeypatch, tmp_path):
     setenv("HOME") alone wouldn't redirect them — we monkeypatch the
     namespace dict entries directly. Also creates an empty
     ~/.claude/projects so sync_cache walks find no JSONL files.
+
+    Post Phase C #16 split: the migration framework's error sentinel
+    + cmd_db_* helpers live in `bin/_cctally_db.py` and resolve
+    ``DB_PATH`` / ``CACHE_DB_PATH`` / ``LOG_DIR`` /
+    ``MIGRATION_ERROR_LOG_PATH`` via bare-name lookup in their own
+    module's __dict__. We also patch those so any migration code
+    triggered during a redirected test (e.g. `cmd_db_status` against
+    fixture HOME) reads the redirected paths, not the production
+    ones seeded at bin/cctally module-load time.
     """
     share = tmp_path / ".local" / "share" / "cctally"
     share.mkdir(parents=True, exist_ok=True)
@@ -88,6 +97,17 @@ def redirect_paths(ns, monkeypatch, tmp_path):
     monkeypatch.setitem(ns, "CONFIG_PATH", share / "config.json")
     monkeypatch.setitem(ns, "CONFIG_LOCK_PATH", share / "config.json.lock")
     monkeypatch.setitem(ns, "LOG_DIR", share / "logs")
+    monkeypatch.setitem(ns, "MIGRATION_ERROR_LOG_PATH", share / "logs" / "migration-errors.log")
+    # _cctally_db sibling's own copies — populated by the seed block
+    # near the bin/cctally path-constant region. Update them here so
+    # bare-name lookups inside the migration framework + cmd_db_*
+    # helpers see the fixture-redirected values.
+    db_sibling = ns.get("_cctally_db")
+    if db_sibling is not None:
+        monkeypatch.setattr(db_sibling, "DB_PATH", share / "stats.db")
+        monkeypatch.setattr(db_sibling, "CACHE_DB_PATH", share / "cache.db")
+        monkeypatch.setattr(db_sibling, "LOG_DIR", share / "logs")
+        monkeypatch.setattr(db_sibling, "MIGRATION_ERROR_LOG_PATH", share / "logs" / "migration-errors.log")
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
 
 
