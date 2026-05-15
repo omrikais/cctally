@@ -8708,7 +8708,39 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
             except ValueError:
                 pass
 
-        milestones = get_milestones_for_week(conn, week_start_date)
+        # v1.7.2 segment filter: when a week_reset_events row exists for
+        # the current ``week_end_at``, narrow the milestone listing to
+        # the active (latest) segment so a credited week's header (which
+        # already reflects the post-credit window via the canon-boundary
+        # rewrite above) is coherent with the body. Sentinel ``0`` covers
+        # pre-credit / no-event weeks; pre-005 DBs that didn't have the
+        # column also default to 0 via the migration's ALTER DEFAULT.
+        active_segment = 0
+        canon_end_for_lookup = None
+        latest_end_row = conn.execute(
+            "SELECT week_end_at FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? AND week_end_at IS NOT NULL "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+            (week_start_date,),
+        ).fetchone()
+        if latest_end_row is not None:
+            canon_end_for_lookup = _canonicalize_optional_iso(
+                latest_end_row["week_end_at"], "pb.cur"
+            )
+        if canon_end_for_lookup:
+            seg_row = conn.execute(
+                "SELECT id FROM week_reset_events "
+                "WHERE new_week_end_at = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (canon_end_for_lookup,),
+            ).fetchone()
+            if seg_row is not None:
+                active_segment = int(seg_row["id"])
+
+        milestones = [
+            m for m in get_milestones_for_week(conn, week_start_date)
+            if int(m["reset_event_id"] or 0) == active_segment
+        ]
 
         milestone_list = []
         for m in milestones:
@@ -8743,7 +8775,17 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
         else:
             print(f"Week: {week_start_date}..{week_end_date}")
         if not milestone_list:
-            print("No percent milestones recorded for this week.")
+            if active_segment > 0:
+                # v1.7.2: distinguish post-credit empty (just got
+                # credited, no crossings yet) from genuinely-empty week.
+                # The pre-credit ledger still exists in the DB — just
+                # filtered out of the body — so the user shouldn't see
+                # "No milestones" and assume the data is gone.
+                print(
+                    "(post-credit segment, no milestones crossed yet)"
+                )
+            else:
+                print("No percent milestones recorded for this week.")
             return 0
 
         print("Percent breakdown:\n")

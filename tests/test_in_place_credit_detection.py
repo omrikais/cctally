@@ -850,3 +850,128 @@ def test_milestone_post_credit_threshold_lands_as_new_row(ns):
         assert rows[1]["reset_event_id"] == evt_id
     finally:
         conn.close()
+
+
+# ── Task 6: percent-breakdown filters by active segment ──────────────
+
+
+def test_percent_breakdown_filters_by_active_segment(ns, capsys):
+    """Seed pre-credit + post-credit milestones for the same week +
+    threshold. Run ``cmd_percent_breakdown --json``. The active segment
+    is the post-credit one; only its rows appear in the milestone list.
+    """
+    end_iso = "2026-05-16T05:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = week_start_date + "T05:00:00+00:00"
+    effective = "2026-05-14T17:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        # Pre-credit row (segment 0).
+        conn.execute(
+            "INSERT INTO percent_milestones "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, percent_threshold, "
+            " cumulative_cost_usd, marginal_cost_usd, "
+            " usage_snapshot_id, cost_snapshot_id, reset_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-05-12T10:00:00Z", week_start_date, week_end_date,
+             week_start_at, end_iso, 3, 100.0, None, 1, 1, 0),
+        )
+        # Event row.
+        evt_id = _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=effective,
+            old_week_end_at=end_iso,
+        )
+        # Post-credit row (same threshold, different segment).
+        conn.execute(
+            "INSERT INTO percent_milestones "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, percent_threshold, "
+            " cumulative_cost_usd, marginal_cost_usd, "
+            " usage_snapshot_id, cost_snapshot_id, reset_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-05-15T10:00:00Z", week_start_date, week_end_date,
+             week_start_at, end_iso, 3, 12.0, None, 2, 2, evt_id),
+        )
+        # Seed a usage snapshot so cmd_percent_breakdown resolves this week.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T10:30:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=3.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    args = argparse.Namespace(
+        week_start=None, week_start_name=None, json=True, tz=None,
+    )
+    rc = ns["cmd_percent_breakdown"](args)
+    assert rc == 0
+    captured = capsys.readouterr()
+    import json as _json
+    out = _json.loads(captured.out)
+    assert len(out["milestones"]) == 1, out["milestones"]
+    # Post-credit row has cumulative_cost_usd = 12.0; pre-credit had 100.0.
+    assert out["milestones"][0]["cumulativeCostUSD"] == 12.0
+
+
+def test_percent_breakdown_empty_post_credit_hint(ns, capsys):
+    """Seed event row + pre-credit milestones but no post-credit ones.
+    Run cmd_percent_breakdown. The active segment has no rows, so the
+    output should include a clear "post-credit segment, no milestones
+    crossed yet" hint instead of the generic "No percent milestones
+    recorded for this week" line.
+    """
+    end_iso = "2026-05-16T05:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = week_start_date + "T05:00:00+00:00"
+    effective = "2026-05-14T17:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        # Pre-credit rows only.
+        for pct in (1, 2, 3):
+            conn.execute(
+                "INSERT INTO percent_milestones "
+                "(captured_at_utc, week_start_date, week_end_date, "
+                " week_start_at, week_end_at, percent_threshold, "
+                " cumulative_cost_usd, marginal_cost_usd, "
+                " usage_snapshot_id, cost_snapshot_id, reset_event_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("2026-05-12T10:00:00Z", week_start_date, week_end_date,
+                 week_start_at, end_iso, pct, 10.0 * pct, None, pct, pct, 0),
+            )
+        _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=effective,
+            old_week_end_at=end_iso,
+        )
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T10:30:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=1.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    args = argparse.Namespace(
+        week_start=None, week_start_name=None, json=False, tz=None,
+    )
+    rc = ns["cmd_percent_breakdown"](args)
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "post-credit" in captured.out.lower(), captured.out
