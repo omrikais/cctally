@@ -7215,12 +7215,51 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
                 and prior_pct is not None and cur_pct is not None
                 and (float(prior_pct) - float(cur_pct)) >= _RESET_PCT_DROP_THRESHOLD
             ):
-                effective_iso = _floor_to_hour(captured_dt).isoformat(timespec="seconds")
+                # Pre-check on ``new_week_end_at`` (mirrors the live
+                # detection path's pre-check). Necessary because the
+                # UNIQUE(old, new) constraint alone WON'T dedup against
+                # legacy/broken-shape rows: pre-fix DBs may have
+                # ``(cur_end, cur_end)`` rows for the same credit that
+                # the new shape writes as ``(effective_iso, cur_end)``.
+                # Without this pre-check, the backfill writes a second
+                # row for the same credit on every open_db() call after
+                # upgrade. (See round-2 review Bug 1.)
+                already = conn.execute(
+                    "SELECT 1 FROM week_reset_events "
+                    "WHERE new_week_end_at = ? LIMIT 1",
+                    (cur_end,),
+                ).fetchone()
+                if already is not None:
+                    prior_end = cur_end
+                    prior_pct = cur_pct
+                    continue
+                # Canonicalize to UTC before isoformat so the stored
+                # offset is `+00:00`, matching the live detection path
+                # (cmd_record_usage uses now_utc which is already UTC).
+                # parse_iso_datetime returns .astimezone() (host-local
+                # fallback at bin/cctally:_local_tz_name gate); without
+                # this normalization, non-UTC hosts would store the
+                # column as e.g. `+03:00`, breaking lex comparisons
+                # downstream (CLAUDE.md gotcha: 5h-block cross-reset
+                # comparisons go through unixepoch(), NOT lex
+                # BETWEEN/</>; the reset-aware DB clamp here applies
+                # the same rule). The reset-aware clamp now wraps both
+                # sides with unixepoch() (Bug 2 fix), but a canonical
+                # UTC offset on write is the right defense-in-depth.
+                effective_iso = (
+                    _floor_to_hour(captured_dt.astimezone(dt.timezone.utc))
+                    .isoformat(timespec="seconds")
+                )
+                # Row shape: old=effective_iso, new=cur_end (distinct
+                # values). See the live-detection site in
+                # bin/_cctally_record.py for the full rationale; in
+                # short, old==new collapses the credited week to a
+                # zero-width window in _apply_reset_events_to_weekrefs.
                 conn.execute(
                     "INSERT OR IGNORE INTO week_reset_events "
                     "(detected_at_utc, old_week_end_at, new_week_end_at, "
                     " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
-                    (row["captured_at_utc"], cur_end, cur_end, effective_iso),
+                    (row["captured_at_utc"], effective_iso, cur_end, effective_iso),
                 )
         prior_end = cur_end
         prior_pct = cur_pct

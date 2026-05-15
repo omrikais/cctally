@@ -300,10 +300,18 @@ rc = mod.cmd_record_usage(argparse.Namespace(
 assert rc == 0, f"rc={rc}"
 conn = mod.open_db()
 try:
-    events = conn.execute("SELECT old_week_end_at, new_week_end_at FROM week_reset_events").fetchall()
+    events = conn.execute(
+        "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
+        "FROM week_reset_events"
+    ).fetchall()
     assert len(events) == 1, f"events={list(events)}"
     assert events[0]["new_week_end_at"] == end_iso
-    assert events[0]["old_week_end_at"] == end_iso
+    # In-place credit row shape (post-Bug-1 fix): old == effective,
+    # new == cur_end (DISTINCT). The old==new shape collapsed the
+    # credited week to a zero-width window in
+    # _apply_reset_events_to_weekrefs.
+    assert events[0]["old_week_end_at"] == events[0]["effective_reset_at_utc"]
+    assert events[0]["old_week_end_at"] != events[0]["new_week_end_at"]
     cnt = conn.execute(
         "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE weekly_percent = 2.0"
     ).fetchone()[0]

@@ -288,12 +288,19 @@ def test_detection_fires_on_threshold(ns, tmp_path):
     conn = ns["open_db"]()
     try:
         events = conn.execute(
-            "SELECT old_week_end_at, new_week_end_at FROM week_reset_events"
+            "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
+            "FROM week_reset_events"
         ).fetchall()
         assert len(events) == 1, events
-        # In-place credit means old == new == cur_end_canon (no boundary shift).
+        # In-place credit row shape (post-Bug-1 fix): old == effective,
+        # new == cur_end_canon (DISTINCT values). The previous
+        # old==new==cur_end shape collapsed the credited week to a
+        # zero-width window in _apply_reset_events_to_weekrefs because
+        # both pre_map[old] and post_map[new] fired on the same WeekRef.
+        # See bin/_cctally_record.py:cmd_record_usage for the rationale.
         assert events[0]["new_week_end_at"] == end_iso
-        assert events[0]["old_week_end_at"] == end_iso
+        assert events[0]["old_week_end_at"] == events[0]["effective_reset_at_utc"]
+        assert events[0]["old_week_end_at"] != events[0]["new_week_end_at"]
 
         # 1 new snapshot at 2%.
         cnt = conn.execute(
@@ -509,9 +516,13 @@ def test_backfill_detects_historical_in_place_credit(ns):
             "FROM week_reset_events"
         ).fetchall()
         assert len(events) == 1, events
-        # In-place credit shape: old == new == cur_end.
-        assert events[0]["old_week_end_at"] == end_iso
+        # In-place credit row shape (post-Bug-1 fix): old == effective,
+        # new == cur_end (DISTINCT). See live-detection test
+        # ``test_detection_fires_on_threshold`` for the same shape and
+        # bin/_cctally_record.py:cmd_record_usage for rationale.
         assert events[0]["new_week_end_at"] == end_iso
+        assert events[0]["old_week_end_at"] == events[0]["effective_reset_at_utc"]
+        assert events[0]["old_week_end_at"] != events[0]["new_week_end_at"]
         # Effective is floor-to-hour of the captured_at when the drop
         # was first observed (Anthropic's reset times are always
         # hour-aligned). Compare as UTC moment to absorb the host-tz
@@ -1235,5 +1246,317 @@ def test_self_heal_probe_scoped_to_active_segment(ns):
         post = [r for r in rows if r["reset_event_id"] != 0]
         assert len(post) == 1
         assert post[0]["percent_threshold"] == 1
+    finally:
+        conn.close()
+
+
+# ── Round-2 review regressions (v1.7.2) ──────────────────────────────
+
+
+def test_event_row_old_is_effective_not_cur_end(ns, tmp_path):
+    """Regression for round-2 review Bug 1: the in-place credit event
+    row's ``old_week_end_at`` MUST be the effective reset moment
+    (floor-to-hour of now), NOT ``cur_end_canon``. Old shape stored
+    ``old==new==cur_end``, which collapsed the credited week to a
+    zero-width window in ``_apply_reset_events_to_weekrefs`` because
+    both ``pre_map[old]`` and ``post_map[new]`` fired on the same
+    WeekRef. New shape is ``(effective, cur_end)`` — distinct values.
+
+    Covers the live detection path; a sibling test
+    ``test_backfill_event_row_old_is_effective_not_cur_end`` covers
+    the backfill path.
+    """
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, week_end_date = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    args = _record_usage_args(percent=2.0, resets_at=end_epoch)
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        row = conn.execute(
+            "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
+            "FROM week_reset_events"
+        ).fetchone()
+        assert row is not None, "live detection must have written an event row"
+        assert row["old_week_end_at"] != row["new_week_end_at"], (
+            "old==new collapses the credited week to a zero-width window"
+            f" (got old={row['old_week_end_at']!r}, new={row['new_week_end_at']!r})"
+        )
+        assert row["old_week_end_at"] == row["effective_reset_at_utc"]
+        assert row["new_week_end_at"] == end_iso
+    finally:
+        conn.close()
+
+
+def test_backfill_event_row_old_is_effective_not_cur_end(ns):
+    """Bug-1 regression in the backfill path. Seed a historical
+    snapshot pattern (67% then 2%, same end) and call
+    ``_backfill_week_reset_events`` directly. The synthesized event
+    row must carry ``old_week_end_at == effective_reset_at_utc``,
+    NOT ``old == new``.
+    """
+    end_iso, _ = _future_week_end_iso()
+    week_start_date, week_end_date = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        # Wipe any backfill-synthesized rows from the open_db()
+        # invocation above; we want a clean slate. The backfill is
+        # idempotent (UNIQUE + INSERT OR IGNORE + pre-check) so
+        # re-running is safe.
+        conn.execute("DELETE FROM week_reset_events")
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-13T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T17:30:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=2.0,
+        )
+        conn.commit()
+        ns["_backfill_week_reset_events"](conn)
+
+        row = conn.execute(
+            "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
+            "FROM week_reset_events"
+        ).fetchone()
+        assert row is not None, "backfill must have synthesized an event row"
+        assert row["old_week_end_at"] != row["new_week_end_at"], (
+            f"backfill wrote zero-width row: old={row['old_week_end_at']!r},"
+            f" new={row['new_week_end_at']!r}"
+        )
+        assert row["old_week_end_at"] == row["effective_reset_at_utc"]
+        assert row["new_week_end_at"] == end_iso
+    finally:
+        conn.close()
+
+
+def test_reset_aware_clamp_handles_non_utc_event_offset(ns):
+    """Regression for round-2 review Bug 2: the reset-aware DB clamp
+    must use ``unixepoch()`` on both sides, not lex string compare.
+
+    Setup: insert a ``week_reset_events`` row with
+    ``effective_reset_at_utc='2026-03-01T14:00:00-03:00'`` (BACKFILL-
+    shaped event written from a NEGATIVE-offset host before Bug 3 was
+    fixed). The real UTC moment is ``2026-03-01T17:00:00Z`` (subtract a
+    negative offset = add hours).
+
+    Seed a pre-credit 67% snapshot at ``captured_at_utc=2026-03-01T15:00:00Z``:
+      * Real time: 15:00 UTC — BEFORE the credit (17:00 UTC),
+        i.e., legitimately pre-credit and MUST be filtered out of the
+        post-credit segment's MAX.
+      * Lex string compare: ``'2026-03-01T15:00:00Z'`` vs
+        ``'2026-03-01T14:00:00-03:00'`` differs at char 12 (`5` > `4`)
+        → ``'15:00:00Z'`` is lex-GREATER than ``'14:00:00-03:00'``,
+        so a lex ``>=`` filter would WRONGLY INCLUDE the pre-credit
+        67% row in the post-credit MAX.
+
+    Drive ``cmd_record_usage(percent=4)``. Under the lex bug, the MAX
+    includes 67 → 4 < 67 → ``should_insert = False`` → the new
+    post-credit reading is silently dropped. With ``unixepoch()``
+    wrapping both sides, 15:00Z = 15 UTC, 14:00-03:00 = 17 UTC; 15 < 17
+    so the 67% row is correctly EXCLUDED, MAX = None (no post-credit
+    rows yet), and the 4% reading lands.
+
+    Negative-offset hosts are the failure mode where the bug bites the
+    clamp; positive-offset hosts trip a different (also-bug) corner
+    where real-time-post-credit rows get lex-EXCLUDED from MAX,
+    which would also break the post-credit clamp but in a way that
+    happens to allow this specific test percent to pass. Negative
+    offsets surface the rejection path cleanly.
+    """
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, week_end_date = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        # Pre-credit 67% snapshot — captured BEFORE the credit moment
+        # in real time but LEX-greater than the effective string due
+        # to the legacy `-03:00` offset on the event row.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-03-01T15:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        # Event row with NEGATIVE-offset effective_reset_at_utc
+        # (legacy shape that Bug 3 would have written from a host
+        # like America/Buenos_Aires before the .astimezone(UTC) fix).
+        # Real UTC equivalent: 2026-03-01T17:00:00Z.
+        conn.execute(
+            "INSERT INTO week_reset_events "
+            "(detected_at_utc, old_week_end_at, new_week_end_at, "
+            " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+            ("2026-03-01T14:35:00-03:00",
+             "2026-03-01T14:00:00-03:00",
+             end_iso,
+             "2026-03-01T14:00:00-03:00"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    args = _record_usage_args(percent=4.0, resets_at=end_epoch)
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE weekly_percent = 4.0"
+        ).fetchone()[0]
+        assert cnt == 1, (
+            "post-credit 4% reading must land — the lex bug would have"
+            " wrongly INCLUDED the pre-credit 67% row in the segment"
+            " MAX (lex '15:00:00Z' > '14:00:00-03:00') and rejected 4%"
+            " as a regression"
+        )
+    finally:
+        conn.close()
+
+
+def test_backfill_writes_effective_with_utc_offset(ns):
+    """Regression for round-2 review Bug 3: the backfill's
+    ``effective_reset_at_utc`` must be stored with ``+00:00`` offset,
+    NOT host-local. ``parse_iso_datetime`` returns ``.astimezone()``
+    (host-local fallback), so without the explicit ``.astimezone(UTC)``
+    canonicalization before ``isoformat``, the column would be e.g.
+    ``+03:00`` on a non-UTC host — breaking lex comparisons in any
+    downstream consumer that hasn't yet been upgraded to ``unixepoch()``
+    (Bug 2's defense applies to the clamp, but defense-in-depth on
+    write keeps future readers safe).
+    """
+    end_iso, _ = _future_week_end_iso()
+    week_start_date, week_end_date = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        conn.execute("DELETE FROM week_reset_events")
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-13T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T17:30:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=2.0,
+        )
+        conn.commit()
+        ns["_backfill_week_reset_events"](conn)
+
+        row = conn.execute(
+            "SELECT effective_reset_at_utc FROM week_reset_events"
+        ).fetchone()
+        assert row is not None
+        eff = row["effective_reset_at_utc"]
+        # Either trailing `+00:00` or `Z` (both denote UTC) is acceptable;
+        # a host-local offset like `+03:00` is the bug.
+        assert eff.endswith("+00:00") or eff.endswith("Z"), (
+            f"effective_reset_at_utc must be UTC; got {eff!r}"
+        )
+    finally:
+        conn.close()
+
+
+def test_alerts_envelope_id_unique_across_segments(ns):
+    """Regression for round-2 review Bug 4: the dashboard's alerts
+    envelope id MUST include ``reset_event_id`` so pre-credit (segment
+    0) and post-credit (segment N) alerts at the same
+    (week_start_date, threshold) don't collide on the React key.
+
+    Without the segment in the id, both rows render with the same
+    ``id``, causing duplicate-key warnings and non-deterministic
+    render order in ``<li key={a.id}>`` / ``<tr key={a.id}>``.
+    """
+    end_iso = "2026-05-16T05:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = week_start_date + "T05:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        # Pre-credit alerted milestone (reset_event_id = 0).
+        conn.execute(
+            "INSERT INTO percent_milestones "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, percent_threshold, "
+            " cumulative_cost_usd, marginal_cost_usd, "
+            " usage_snapshot_id, cost_snapshot_id, "
+            " alerted_at, reset_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-05-12T10:00:00Z", week_start_date, week_end_date,
+             week_start_at, end_iso, 3, 100.0, None, 1, 1,
+             "2026-05-12T11:00:00Z", 0),
+        )
+        evt_id = _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective="2026-05-14T17:00:00+00:00",
+            old_week_end_at="2026-05-14T17:00:00+00:00",
+        )
+        # Post-credit alerted milestone at the SAME (week, threshold)
+        # but reset_event_id = evt_id. Under the old envelope-id
+        # format these two rows would collide on
+        # `weekly:<week>:<threshold>`.
+        conn.execute(
+            "INSERT INTO percent_milestones "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, percent_threshold, "
+            " cumulative_cost_usd, marginal_cost_usd, "
+            " usage_snapshot_id, cost_snapshot_id, "
+            " alerted_at, reset_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-05-14T20:00:00Z", week_start_date, week_end_date,
+             week_start_at, end_iso, 3, 5.0, None, 2, 2,
+             "2026-05-14T20:00:00Z", evt_id),
+        )
+        conn.commit()
+
+        dashboard_mod = ns["_cctally_dashboard"]
+        envelope = dashboard_mod._build_alerts_envelope_array(conn)
+        weekly = [a for a in envelope if a.get("axis") == "weekly"
+                  and a.get("threshold") == 3
+                  and a.get("context", {}).get("week_start_date") == week_start_date]
+        assert len(weekly) == 2, (
+            "both pre-credit and post-credit alerted rows must surface"
+            f" (got {len(weekly)}: {weekly})"
+        )
+        ids = [a["id"] for a in weekly]
+        assert len(set(ids)) == 2, (
+            f"alerts envelope ids must be unique across segments; got {ids}"
+        )
+        assert all(s.startswith(f"weekly:{week_start_date}:3:") for s in ids), ids
     finally:
         conn.close()

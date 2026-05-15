@@ -1358,12 +1358,17 @@ try:
 
     # RECON_CREDIT_1: post-segment MAX equals latest captured_at's
     # weekly_percent in the post-segment window, within 1e-9.
+    # Comparison wraps both sides with ``unixepoch()`` so a stored
+    # ``effective_reset_at_utc`` with a non-UTC offset (legacy backfill
+    # rows from before Bug 3 was fixed) doesn't break the bound under
+    # lex string compare — same rule as the production clamp in
+    # bin/_cctally_record.py.
     row = conn.execute(
         """
         SELECT MAX(weekly_percent) AS m
           FROM weekly_usage_snapshots
          WHERE week_start_date = ?
-           AND captured_at_utc >= ?
+           AND unixepoch(captured_at_utc) >= unixepoch(?)
         """,
         (ws, effective),
     ).fetchone()
@@ -1372,7 +1377,7 @@ try:
         SELECT weekly_percent
           FROM weekly_usage_snapshots
          WHERE week_start_date = ?
-           AND captured_at_utc >= ?
+           AND unixepoch(captured_at_utc) >= unixepoch(?)
          ORDER BY captured_at_utc DESC, id DESC LIMIT 1
         """,
         (ws, effective),

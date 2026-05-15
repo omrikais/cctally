@@ -1396,11 +1396,28 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                         if already is None:
                             effective_dt = _floor_to_hour(now_utc)
                             effective_iso = effective_dt.isoformat(timespec="seconds")
+                            # Row shape: old=effective_iso, new=cur_end_canon
+                            # (distinct values). The previous shape stored
+                            # old==new==cur_end_canon, which let BOTH
+                            # _apply_reset_events_to_weekrefs maps
+                            # (pre_map[old] and post_map[new]) fire on the
+                            # SAME WeekRef — pre_map rewrote week_end_at to
+                            # effective, post_map rewrote week_start_at to
+                            # effective, collapsing the credited week to a
+                            # zero-width window in downstream renders. With
+                            # old==effective and new==cur_end_canon, only
+                            # post_map fires on the credited week (setting
+                            # week_start_at = effective, the intended
+                            # behavior); pre_map keys on effective_iso and
+                            # finds no matching WeekRef in practice. The
+                            # UNIQUE(old, new) constraint permits this
+                            # row, and the pre-check above keys on
+                            # new_week_end_at so dedup still works.
                             conn.execute(
                                 "INSERT OR IGNORE INTO week_reset_events "
                                 "(detected_at_utc, old_week_end_at, new_week_end_at, "
                                 " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
-                                (now_utc_iso(), cur_end_canon, cur_end_canon,
+                                (now_utc_iso(), effective_iso, cur_end_canon,
                                  effective_iso),
                             )
                             conn.commit()
@@ -1430,19 +1447,28 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         # (e.g. 67%). When no event row exists, COALESCE defaults to
         # epoch-zero so the filter is a no-op and legacy clamp behavior
         # is preserved byte-identically.
+        # NB: comparison wrapped with ``unixepoch()`` on BOTH sides.
+        # ``captured_at_utc`` is stored with `Z` suffix, but
+        # ``effective_reset_at_utc`` may have a non-UTC offset on
+        # historical backfill rows written before Bug 3 was fixed
+        # (parse_iso_datetime returned host-local). Lex string compare
+        # on mixed offsets silently mis-orders moments for non-UTC
+        # hosts (CLAUDE.md gotcha: 5h-block cross-reset flag — "all
+        # comparisons go through unixepoch(), NOT lex
+        # BETWEEN/`<`/`>`"). Same rule applies here.
         max_row = conn.execute(
             """
             SELECT MAX(weekly_percent) AS v
               FROM weekly_usage_snapshots
              WHERE week_start_date = ?
-               AND captured_at_utc >= COALESCE(
+               AND unixepoch(captured_at_utc) >= unixepoch(COALESCE(
                  (SELECT effective_reset_at_utc
                     FROM week_reset_events
                    WHERE new_week_end_at = ?
                    ORDER BY id DESC
                    LIMIT 1),
                  '1970-01-01T00:00:00Z'
-               )
+               ))
             """,
             (week_start_date, week_end_at),
         ).fetchone()

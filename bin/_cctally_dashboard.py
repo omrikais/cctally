@@ -2397,10 +2397,17 @@ def _build_alerts_envelope_array(
     final sort.
     """
     out: list[dict] = []
+    # ``reset_event_id`` (v1.7.2) segments the same (week, threshold)
+    # across pre-credit (0) and post-credit (event.id) cohorts, both
+    # of which can be alerted. The envelope id must include the
+    # segment so React's <li key={a.id}> / <tr key={a.id}> doesn't
+    # collide on the duplicate (week, threshold) pair. Older clients
+    # tolerate longer ids — the id is opaque to them; only the React
+    # key uniqueness invariant matters.
     weekly_rows = conn.execute(
         """
         SELECT week_start_date, percent_threshold, captured_at_utc,
-               alerted_at, cumulative_cost_usd
+               alerted_at, cumulative_cost_usd, reset_event_id
         FROM percent_milestones
         WHERE alerted_at IS NOT NULL
         ORDER BY alerted_at DESC
@@ -2413,7 +2420,7 @@ def _build_alerts_envelope_array(
         cumulative = float(r["cumulative_cost_usd"])
         dpp = (cumulative / threshold) if threshold else None
         out.append({
-            "id": f"weekly:{r['week_start_date']}:{threshold}",
+            "id": f"weekly:{r['week_start_date']}:{threshold}:{r['reset_event_id']}",
             "axis": "weekly",
             "threshold": threshold,
             "crossed_at": r["captured_at_utc"],
