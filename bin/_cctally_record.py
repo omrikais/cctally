@@ -1305,9 +1305,9 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                     prior["week_end_at"], "record.prior"
                 )
                 prior_pct = prior["weekly_percent"]
+                now_utc = dt.datetime.now(dt.timezone.utc)
                 if prior_end_canon and prior_end_canon != cur_end_canon:
                     prior_end_dt = parse_iso_datetime(prior_end_canon, "prior.week_end_at")
-                    now_utc = dt.datetime.now(dt.timezone.utc)
                     # Fire only when (a) prior window was still in the FUTURE
                     # (Anthropic shifted the boundary before natural expiration),
                     # AND (b) weekly_percent dropped by RESET_PCT_DROP_THRESHOLD
@@ -1331,6 +1331,60 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                              effective_iso),
                         )
                         conn.commit()
+                elif prior_end_canon and prior_end_canon == cur_end_canon:
+                    # In-place credit branch (v1.7.2). When `resets_at` stays
+                    # unchanged but `weekly_percent` drops by RESET_PCT_DROP_THRESHOLD
+                    # or more, Anthropic has issued a goodwill in-place weekly
+                    # credit. Emit one week_reset_events row keyed on the
+                    # current end_at (old == new) so the reset-aware clamp
+                    # above and the milestone segment writer can pivot to
+                    # the post-credit segment. The seed snapshot lands via
+                    # the now-reset-aware clamp on this same call.
+                    prior_end_dt = parse_iso_datetime(prior_end_canon, "prior.week_end_at")
+                    if (
+                        prior_end_dt > now_utc
+                        and prior_pct is not None
+                        and (float(prior_pct) - float(weekly_percent)) >= c._RESET_PCT_DROP_THRESHOLD
+                    ):
+                        # Pre-check (Q5 belt-and-suspenders): suppress duplicate
+                        # event rows for the same new_week_end_at across
+                        # consecutive ticks. UNIQUE(old, new) at the DDL
+                        # also catches the duplicate in the (old == new) case,
+                        # but the pre-check avoids a useless write attempt
+                        # and keeps the log clean. After the seed lands at
+                        # post-credit %, the next tick's `prior_pct` will be
+                        # the post-credit value so the drop predicate alone
+                        # also suffices — pre-check is belt-and-suspenders.
+                        already = conn.execute(
+                            "SELECT 1 FROM week_reset_events "
+                            "WHERE new_week_end_at = ? LIMIT 1",
+                            (cur_end_canon,),
+                        ).fetchone()
+                        if already is None:
+                            effective_dt = _floor_to_hour(now_utc)
+                            effective_iso = effective_dt.isoformat(timespec="seconds")
+                            conn.execute(
+                                "INSERT OR IGNORE INTO week_reset_events "
+                                "(detected_at_utc, old_week_end_at, new_week_end_at, "
+                                " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+                                (now_utc_iso(), cur_end_canon, cur_end_canon,
+                                 effective_iso),
+                            )
+                            conn.commit()
+                            # Force-write hwm-7d so the next status-line
+                            # render reflects the post-credit value. The
+                            # monotonic guard at the normal write site (below)
+                            # would refuse to decrease the file; this write
+                            # is the credit-only escape hatch. Lands AFTER
+                            # the conn.commit() so a concurrent record-usage
+                            # reader doesn't see the new HWM before the
+                            # event row is durable.
+                            try:
+                                (c.APP_DIR / "hwm-7d").write_text(
+                                    f"{week_start_date} {weekly_percent}\n"
+                                )
+                            except OSError:
+                                pass
         except (sqlite3.DatabaseError, ValueError) as exc:
             eprint(f"[record-usage] reset-event detection failed: {exc}")
 

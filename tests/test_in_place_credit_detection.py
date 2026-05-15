@@ -123,20 +123,32 @@ def _epoch(iso: str) -> int:
 # ── Task 2: reset-aware DB clamp ──────────────────────────────────────
 
 
+def _past_week_end_iso() -> tuple[str, int]:
+    """Build an ISO + epoch tuple in the PAST. Used for Task 2 clamp
+    tests where we want to exercise the clamp alone WITHOUT tripping the
+    in-place credit detection branch (which requires
+    ``prior_end_dt > now_utc``).
+    """
+    past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).replace(
+        minute=0, second=0, microsecond=0
+    )
+    return past.isoformat(timespec="seconds"), int(past.timestamp())
+
+
 def test_reset_aware_clamp_without_event_preserves_legacy_behavior(ns):
     """No week_reset_events row → clamp behaves like before (MAX over
     the whole week, post-credit reading is rejected as a regression).
+    Uses a past end_at so the in-place credit detection branch is
+    skipped (predicate ``prior_end_dt > now_utc`` is false).
     """
-    # Resets_at points to the same week_end_at as the seeded prior row.
-    end_at_epoch = _epoch("2026-05-16T05:00:00+00:00")
-    end_at_iso = "2026-05-16T05:00:00+00:00"
-    # Seed a 67% sample on the same week (no event row).
+    end_at_iso, end_at_epoch = _past_week_end_iso()
+    week_start_date, _ = _week_start_for(end_at_iso)
     conn = ns["open_db"]()
     try:
         _seed_usage_snapshot(
             conn,
             captured_at_utc="2026-05-13T10:00:00Z",
-            week_start_date="2026-05-09",
+            week_start_date=week_start_date,
             week_end_at=end_at_iso,
             weekly_percent=67.0,
         )
@@ -145,7 +157,8 @@ def test_reset_aware_clamp_without_event_preserves_legacy_behavior(ns):
         conn.close()
 
     # Drive cmd_record_usage with percent=2.0 (post-credit shape) and the
-    # same end_at — without an event row, the legacy clamp must reject.
+    # same end_at — without an event row AND the window is in the past
+    # so detection is skipped, the legacy clamp must reject.
     args = _record_usage_args(percent=2.0, resets_at=end_at_epoch)
     rc = ns["cmd_record_usage"](args)
     assert rc == 0
@@ -164,9 +177,12 @@ def test_reset_aware_clamp_with_event_filters_to_post_credit(ns):
     """With a week_reset_events row, the MAX query filters to samples
     captured at-or-after effective_reset_at_utc. Pre-credit 67% no
     longer dominates; a fresh post-credit 4% lands.
+    Uses a past end_at so this test exercises the CLAMP alone, not the
+    in-place credit detection branch (which would also fire on a future
+    end_at and double-write the event row).
     """
-    end_at_iso = "2026-05-16T05:00:00+00:00"
-    end_at_epoch = _epoch(end_at_iso)
+    end_at_iso, end_at_epoch = _past_week_end_iso()
+    week_start_date, _ = _week_start_for(end_at_iso)
     effective_iso = "2026-05-15T17:00:00+00:00"
 
     conn = ns["open_db"]()
@@ -174,8 +190,8 @@ def test_reset_aware_clamp_with_event_filters_to_post_credit(ns):
         # Pre-credit 67% sample.
         _seed_usage_snapshot(
             conn,
-            captured_at_utc="2026-05-14T10:00:00Z",
-            week_start_date="2026-05-09",
+            captured_at_utc="2026-05-13T10:00:00Z",
+            week_start_date=week_start_date,
             week_end_at=end_at_iso,
             weekly_percent=67.0,
         )
@@ -190,7 +206,7 @@ def test_reset_aware_clamp_with_event_filters_to_post_credit(ns):
         _seed_usage_snapshot(
             conn,
             captured_at_utc="2026-05-15T18:00:00Z",
-            week_start_date="2026-05-09",
+            week_start_date=week_start_date,
             week_end_at=end_at_iso,
             weekly_percent=2.0,
         )
@@ -210,5 +226,245 @@ def test_reset_aware_clamp_with_event_filters_to_post_credit(ns):
             "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE weekly_percent = 4.0"
         ).fetchone()[0]
         assert cnt == 1, "clamp should have passed the 4% reading post-credit"
+    finally:
+        conn.close()
+
+
+# ── Task 3: in-place credit detection branch ─────────────────────────
+
+
+def _future_week_end_iso() -> tuple[str, int]:
+    """Build an ISO + epoch tuple a few days in the future. The
+    detection branch requires ``prior_end_dt > now_utc`` and we'd
+    rather not freeze ``dt.datetime.now`` — the test owns its own
+    "future" by stamping at "now + 3 days, rounded to next hour".
+    """
+    now = dt.datetime.now(dt.timezone.utc)
+    future = (now + dt.timedelta(days=3)).replace(
+        minute=0, second=0, microsecond=0
+    )
+    return future.isoformat(timespec="seconds"), int(future.timestamp())
+
+
+def _week_start_for(end_iso: str) -> tuple[str, str]:
+    """Given a week_end_at ISO, return (week_start_date, week_end_date)."""
+    end = dt.datetime.fromisoformat(end_iso)
+    start = end - dt.timedelta(days=7)
+    return start.date().isoformat(), end.date().isoformat()
+
+
+def test_detection_fires_on_threshold(ns, tmp_path):
+    """prior=67, cur=2 (drop 65pp ≥ 25pp threshold) with the SAME
+    week_end_at as the new fetch: writes event row, seed snapshot
+    lands via the reset-aware clamp, and hwm-7d gets force-written.
+    """
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, week_end_date = _week_start_for(end_iso)
+
+    # Seed prior 67% snapshot with the SAME end_at as the new fetch.
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Pre-seed hwm-7d so we can verify the force-write decreased it.
+    hwm_path = ns["APP_DIR"] / "hwm-7d"
+    hwm_path.write_text(f"{week_start_date} 67.0\n")
+
+    args = _record_usage_args(percent=2.0, resets_at=end_epoch)
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    # 1 event row written with new == cur_end_canon.
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute(
+            "SELECT old_week_end_at, new_week_end_at FROM week_reset_events"
+        ).fetchall()
+        assert len(events) == 1, events
+        # In-place credit means old == new == cur_end_canon (no boundary shift).
+        assert events[0]["new_week_end_at"] == end_iso
+        assert events[0]["old_week_end_at"] == end_iso
+
+        # 1 new snapshot at 2%.
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE weekly_percent = 2.0"
+        ).fetchone()[0]
+        assert cnt == 1, "post-credit 2% reading should have landed"
+    finally:
+        conn.close()
+
+    # hwm-7d force-written to the new (lower) value.
+    parts = hwm_path.read_text().strip().split()
+    assert parts == [week_start_date, "2.0"], parts
+
+
+def test_detection_does_not_fire_below_threshold(ns, tmp_path):
+    """prior=26, cur=2 (drop 24pp < 25pp): no event row, no seed insert
+    (legacy monotonic clamp blocks the lower percent), hwm unchanged.
+    """
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=26.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    hwm_path = ns["APP_DIR"] / "hwm-7d"
+    hwm_path.write_text(f"{week_start_date} 26.0\n")
+
+    args = _record_usage_args(percent=2.0, resets_at=end_epoch)
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute(
+            "SELECT COUNT(*) FROM week_reset_events"
+        ).fetchone()[0]
+        assert events == 0, "drop below threshold must not fire detection"
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE weekly_percent = 2.0"
+        ).fetchone()[0]
+        assert cnt == 0, "legacy clamp should still block the lower reading"
+    finally:
+        conn.close()
+
+    parts = hwm_path.read_text().strip().split()
+    assert parts == [week_start_date, "26.0"], parts
+
+
+def test_detection_skipped_when_window_expired(ns, tmp_path):
+    """prior=67, cur=2 BUT prior_end_dt <= now_utc: no event row.
+    This is the natural-rollover case (the old week's end has actually
+    passed), not a goodwill credit. Use a past end_at.
+    """
+    past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).replace(
+        minute=0, second=0, microsecond=0
+    )
+    end_iso = past.isoformat(timespec="seconds")
+    end_epoch = int(past.timestamp())
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    args = _record_usage_args(percent=2.0, resets_at=end_epoch)
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute(
+            "SELECT COUNT(*) FROM week_reset_events"
+        ).fetchone()[0]
+        assert events == 0, "expired-window case must not fire detection"
+    finally:
+        conn.close()
+
+
+def test_dedup_via_pre_check(ns, tmp_path):
+    """Pre-seed a week_reset_events row for the current new_week_end_at.
+    Drive a 67→2 record-usage call. The pre-check fires before the
+    INSERT, so no second event row is written.
+    """
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective="2026-05-15T17:00:00+00:00",
+            old_week_end_at=end_iso,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    args = _record_usage_args(percent=2.0, resets_at=end_epoch)
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute(
+            "SELECT COUNT(*) FROM week_reset_events"
+        ).fetchone()[0]
+        assert events == 1, "pre-check should have prevented a duplicate event row"
+    finally:
+        conn.close()
+
+
+def test_dedup_via_seed_snapshot(ns, tmp_path):
+    """First call writes event + 2% seed. Second call (next OAuth fetch
+    at 3%) sees prior=2 (post-credit) → branch not entered (drop is 1pp
+    not >= 25pp) → no second event row.
+    """
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # First call: detection fires.
+    rc = ns["cmd_record_usage"](_record_usage_args(percent=2.0, resets_at=end_epoch))
+    assert rc == 0
+    # Second call: prior is now 2%, drop 2→3 is +1, branch not entered.
+    rc = ns["cmd_record_usage"](_record_usage_args(percent=3.0, resets_at=end_epoch))
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute(
+            "SELECT COUNT(*) FROM week_reset_events"
+        ).fetchone()[0]
+        assert events == 1, "second call must not re-fire the detection branch"
     finally:
         conn.close()
