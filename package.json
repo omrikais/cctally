@@ -27,6 +27,7 @@
     "bin/_cctally_release.py",
     "bin/_cctally_setup.py",
     "bin/_cctally_sync_week.py",
+    "bin/_cctally_tui.py",
     "bin/_cctally_update.py",
     "bin/_lib_aggregators.py",
     "bin/_lib_alerts_payload.py",
