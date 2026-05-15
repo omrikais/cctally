@@ -373,3 +373,119 @@ def test_dashboard_weekly_period_uses_display_date_after_reset(
     labels = [r.label for r in rows]
     assert "04-13" in labels, f"expected 04-13 in {labels}"
     assert "04-11" not in labels, f"unexpected 04-11 in {labels}"
+
+
+def test_dashboard_weekly_synthesizes_pre_credit_row(tmp_path, monkeypatch):
+    """Bug K regression guard (v1.7.2 round-5).
+
+    In-place credit event (where ``old_week_end_at == effective_reset_at_utc``)
+    leaves the credited SubWeek's start_ts shifted to ``effective`` —
+    the weekly bucket then aggregates ONLY the post-credit interval,
+    silently hiding the bulk of the week's cost. The dashboard's Weekly
+    panel must synthesize an extra pre-credit row so the user sees both
+    segments.
+
+    Seed: a single credited week with snapshots at 67% (pre-credit) and
+    4% (post-credit). One entry in EACH segment so both buckets emit
+    measurable cost. After the build, the rows list must contain TWO
+    entries for the credited week — labeled by their respective
+    display dates.
+    """
+    import pathlib, sys
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
+    from _fixture_builders import (
+        create_cache_db, seed_session_file, seed_session_entry,
+        seed_weekly_usage_snapshot,
+    )
+    share = tmp_path / ".local" / "share" / "cctally"
+    open_db = ns["open_db"]
+
+    week_start = "2026-05-09T15:00:00+00:00"
+    week_end   = "2026-05-16T15:00:00+00:00"
+    effective  = "2026-05-15T17:00:00+00:00"
+
+    with open_db() as conn:
+        # Pre-credit snapshot at 67%, captured before the credit.
+        seed_weekly_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T16:00:00Z",
+            week_start_date="2026-05-09",
+            week_end_date="2026-05-16",
+            week_start_at=week_start,
+            week_end_at=week_end,
+            weekly_percent=67.0,
+        )
+        # Post-credit snapshot at 4%.
+        seed_weekly_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T19:00:00Z",
+            week_start_date="2026-05-09",
+            week_end_date="2026-05-16",
+            week_start_at=week_start,
+            week_end_at=week_end,
+            weekly_percent=4.0,
+        )
+        # In-place credit event: old == effective (the round-2 shape).
+        conn.execute(
+            "INSERT INTO week_reset_events "
+            "(detected_at_utc, old_week_end_at, new_week_end_at, "
+            " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+            ("2026-05-15T17:01:00Z",
+             effective, week_end, effective),
+        )
+        conn.commit()
+
+    # Seed one entry in each segment so both buckets register cost.
+    cache_path = share / "cache.db"
+    create_cache_db(cache_path)
+    with sqlite3.connect(cache_path) as cconn:
+        seed_session_file(
+            cconn, path="/fake/sess.jsonl",
+            session_id="s1", project_path="/p",
+        )
+        seed_session_entry(  # pre-credit
+            cconn, source_path="/fake/sess.jsonl",
+            line_offset=0,
+            timestamp_utc="2026-05-13T12:00:00Z",
+            model="claude-opus-4-5-20251101",
+            input_tokens=10_000, output_tokens=5_000,
+            cache_create=100_000, cache_read=500_000,
+        )
+        seed_session_entry(  # post-credit
+            cconn, source_path="/fake/sess.jsonl",
+            line_offset=1,
+            timestamp_utc="2026-05-15T18:30:00Z",
+            model="claude-opus-4-5-20251101",
+            input_tokens=100, output_tokens=50,
+            cache_create=1_000, cache_read=5_000,
+        )
+
+    with open_db() as conn:
+        builder = ns["_dashboard_build_weekly_periods"]
+        now_utc = dt.datetime(2026, 5, 15, 20, 0, 0, tzinfo=dt.timezone.utc)
+        rows = builder(conn, now_utc, n=6, skip_sync=True)
+
+    # Find the two credited-week rows by their week_end_at: pre-credit
+    # ends at `effective`, post-credit ends at the original `week_end`.
+    pre_rows = [r for r in rows if r.week_end_at == effective]
+    post_rows = [r for r in rows if r.week_end_at == week_end]
+    assert len(pre_rows) == 1, f"expected 1 pre-credit row, rows={[r.label for r in rows]}"
+    assert len(post_rows) == 1, f"expected 1 post-credit row, rows={[r.label for r in rows]}"
+
+    pre = pre_rows[0]
+    post = post_rows[0]
+
+    # Pre-credit segment: 67% peak, cost reflects entry at 2026-05-13.
+    assert pre.used_pct == 67.0, pre.used_pct
+    assert pre.cost_usd > post.cost_usd, (pre.cost_usd, post.cost_usd)
+    # Post-credit segment: 4% peak.
+    assert post.used_pct == 4.0, post.used_pct
+    # is_current is on the post-credit segment only (it's the live one).
+    assert post.is_current is True
+    assert pre.is_current is False
+    # Pre-credit label uses the ORIGINAL week start date.
+    assert pre.label == "05-09", pre.label
+    # Post-credit label uses the effective reset date.
+    assert post.label == "05-15", post.label

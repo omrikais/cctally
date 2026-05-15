@@ -624,7 +624,7 @@ def test_load_recorded_five_hour_windows_collapses_jittery_pairs(
     load = ns["_load_recorded_five_hour_windows"]
     range_start = dt.datetime(2026, 4, 22, 0, 0, tzinfo=dt.timezone.utc)
     range_end = dt.datetime(2026, 4, 24, 0, 0, tzinfo=dt.timezone.utc)
-    result = load(range_start, range_end)
+    result, _overrides = load(range_start, range_end)
 
     expected = dt.datetime(2026, 4, 23, 23, 0, 0, tzinfo=dt.timezone.utc)
     assert result == [expected], (
@@ -698,7 +698,7 @@ def test_load_recorded_five_hour_windows_drops_phantom_in_real_window(
     load = ns["_load_recorded_five_hour_windows"]
     range_start = dt.datetime(2026, 4, 24, 0, 0, tzinfo=dt.timezone.utc)
     range_end = dt.datetime(2026, 4, 26, 0, 0, tzinfo=dt.timezone.utc)
-    result = load(range_start, range_end)
+    result, _overrides = load(range_start, range_end)
 
     expected = [
         dt.datetime(2026, 4, 25, 4, 10, tzinfo=dt.timezone.utc),

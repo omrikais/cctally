@@ -1955,6 +1955,176 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
             week_end_at=sw.end_ts,
         ))
 
+    # Bug K (v1.7.2 round-5): synthesize a pre-credit segment row for
+    # each in-place credit event. Without this the credited week shows
+    # ONLY the post-credit segment ($134 on live data) and the bulk of
+    # the week's cost (~$372 in entries before the credit moment) is
+    # invisible to the user.
+    #
+    # _apply_reset_events_to_subweeks shifts the credited SubWeek's
+    # start_ts to ``effective_reset_at_utc``, so _aggregate_weekly's
+    # bucket for that SubWeek already covers ONLY the post-credit
+    # interval. We rebuild the pre-credit bucket here by filtering the
+    # same ``entries`` list to ``[original_start, effective)`` and
+    # re-aggregating cost / tokens / per-model.
+    #
+    # The pre-credit row's ``used_pct`` comes from the
+    # weekly_usage_snapshots row captured at-or-before the credit
+    # moment (the pre-credit peak the user reached); fall back to None
+    # if no snapshot was recorded before the credit fired.
+    in_place_credits = conn.execute(
+        "SELECT new_week_end_at, effective_reset_at_utc "
+        "FROM week_reset_events "
+        "WHERE old_week_end_at = effective_reset_at_utc"
+    ).fetchall()
+    if in_place_credits:
+        _lib_pricing = sys.modules.get("_lib_pricing")
+        if _lib_pricing is None:
+            import importlib.util as _ilu, pathlib as _pl
+            _p = _pl.Path(__file__).resolve().parent / "_lib_pricing.py"
+            _spec = _ilu.spec_from_file_location("_lib_pricing", _p)
+            _lib_pricing = _ilu.module_from_spec(_spec)
+            sys.modules["_lib_pricing"] = _lib_pricing
+            _spec.loader.exec_module(_lib_pricing)
+        _calc = _lib_pricing._calculate_entry_cost
+
+        insertions: list[tuple[int, WeeklyPeriodRow]] = []
+        for ev in in_place_credits:
+            try:
+                eff_dt = parse_iso_datetime(
+                    ev["effective_reset_at_utc"], "credit.eff"
+                )
+                new_end_dt = parse_iso_datetime(
+                    ev["new_week_end_at"], "credit.new_end"
+                )
+            except ValueError:
+                continue
+            # Find the SubWeek whose end_ts equals new_week_end_at (the
+            # post-credit segment); its start_ts has already been
+            # shifted to ``effective`` by _apply_reset_events_to_subweeks.
+            post_sw = None
+            for w in weeks:
+                try:
+                    w_end = parse_iso_datetime(w.end_ts, "sw.end")
+                except ValueError:
+                    continue
+                if w_end == new_end_dt:
+                    post_sw = w
+                    break
+            if post_sw is None:
+                continue
+
+            # Original start instant: take the EARLIEST recorded
+            # week_start_at for this week_start_date. The post-credit
+            # SubWeek's start_ts is the shifted value (= effective); the
+            # MIN over weekly_usage_snapshots gives us the original
+            # API-derived start before the override fired.
+            orig_row = conn.execute(
+                "SELECT MIN(week_start_at) AS ws "
+                "FROM weekly_usage_snapshots "
+                "WHERE week_start_date = ? AND week_start_at IS NOT NULL",
+                (post_sw.start_date.isoformat(),),
+            ).fetchone()
+            if orig_row is None or orig_row["ws"] is None:
+                continue
+            try:
+                original_start_iso = str(orig_row["ws"])
+                original_start_dt = parse_iso_datetime(
+                    original_start_iso, "credit.original_start"
+                )
+            except ValueError:
+                continue
+            if original_start_dt >= eff_dt:
+                # No pre-credit interval to aggregate.
+                continue
+
+            # Aggregate entries in [original_start, effective).
+            pre_input = pre_output = pre_cc = pre_cr = 0
+            pre_cost = 0.0
+            pre_models: dict[str, float] = {}
+            pre_entry_count = 0
+            for e in entries:
+                if original_start_dt <= e.timestamp < eff_dt:
+                    usage = e.usage
+                    pre_input  += usage.get("input_tokens", 0)
+                    pre_output += usage.get("output_tokens", 0)
+                    pre_cc     += usage.get("cache_creation_input_tokens", 0)
+                    pre_cr     += usage.get("cache_read_input_tokens", 0)
+                    c = _calc(
+                        e.model, usage, mode="auto", cost_usd=e.cost_usd,
+                    )
+                    pre_cost += c
+                    pre_models[e.model] = pre_models.get(e.model, 0.0) + c
+                    pre_entry_count += 1
+            if pre_entry_count == 0 and pre_cost <= 0:
+                # No measurable pre-credit activity — skip insertion.
+                continue
+
+            # Pre-credit used_pct: latest snapshot at-or-before the
+            # credit moment for this week_start_date.
+            pre_usage = conn.execute(
+                "SELECT weekly_percent FROM weekly_usage_snapshots "
+                "WHERE week_start_date = ? "
+                "  AND unixepoch(captured_at_utc) <= unixepoch(?) "
+                "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+                (post_sw.start_date.isoformat(), ev["effective_reset_at_utc"]),
+            ).fetchone()
+            pre_used_pct: float | None = None
+            if pre_usage is not None and pre_usage["weekly_percent"] is not None:
+                pre_used_pct = float(pre_usage["weekly_percent"])
+            pre_dpp = (
+                pre_cost / pre_used_pct
+                if pre_used_pct and pre_used_pct > 0 else None
+            )
+
+            pre_total = pre_input + pre_output + pre_cc + pre_cr
+            pre_model_breakdowns = [
+                {"modelName": m, "cost": c}
+                for m, c in sorted(pre_models.items(), key=lambda kv: -kv[1])
+            ]
+            pre_label = original_start_dt.strftime("%m-%d")
+            pre_row = WeeklyPeriodRow(
+                label=pre_label,
+                cost_usd=pre_cost,
+                total_tokens=pre_total,
+                input_tokens=pre_input,
+                output_tokens=pre_output,
+                cache_creation_tokens=pre_cc,
+                cache_read_tokens=pre_cr,
+                used_pct=pre_used_pct,
+                dollar_per_pct=pre_dpp,
+                delta_cost_pct=None,
+                # Pre-credit segment is historical even though it
+                # shares the bucket date with the live week.
+                is_current=False,
+                models=_model_breakdowns_to_models(
+                    pre_model_breakdowns, pre_cost
+                ),
+                week_start_at=original_start_iso,
+                week_end_at=ev["effective_reset_at_utc"],
+            )
+
+            # Find post-credit row's index and insert pre-credit BEFORE
+            # it (chronological order: pre then post in oldest-first).
+            post_idx = None
+            for i, r in enumerate(rows_oldest_first):
+                if r.week_start_at == post_sw.start_ts and r.week_end_at == post_sw.end_ts:
+                    post_idx = i
+                    break
+            if post_idx is None:
+                # The post-credit row may have been dropped by
+                # _aggregate_weekly (no entries in the post-credit
+                # interval) — append at the most-recent slot so the
+                # pre-credit segment still surfaces.
+                insertions.append((len(rows_oldest_first), pre_row))
+            else:
+                insertions.append((post_idx, pre_row))
+
+        # Apply insertions in REVERSE index order so prior insertions
+        # don't shift the indices of later ones.
+        for idx, pre_row in sorted(insertions, key=lambda t: -t[0]):
+            rows_oldest_first.insert(idx, pre_row)
+
     # Reverse so caller gets newest-first; compute delta_cost_pct vs the
     # immediately older row in that orientation.
     rows = list(reversed(rows_oldest_first))
@@ -2091,10 +2261,14 @@ def _dashboard_build_blocks_panel(conn: "sqlite3.Connection",
     entries = get_entries(fetch_start, fetch_end, skip_sync=skip_sync)
     entries = [e for e in entries if week_start_at <= e.timestamp < week_end_at]
 
-    recorded_windows = _load_recorded_five_hour_windows(fetch_start, fetch_end)
+    recorded_windows, block_start_overrides = _load_recorded_five_hour_windows(
+        fetch_start, fetch_end,
+    )
     blocks = _group_entries_into_blocks(
         entries, mode="auto",
-        recorded_windows=recorded_windows, now=now_utc,
+        recorded_windows=recorded_windows,
+        block_start_overrides=block_start_overrides,
+        now=now_utc,
     )
     blocks = [b for b in blocks if not b.is_gap]
     if not blocks:
@@ -4665,8 +4839,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             now_utc = _command_as_of()
             # Recorded-windows lookup widens by one block on each side so
             # a recorded reset just outside the bounds can still anchor.
-            recorded_windows = _load_recorded_five_hour_windows(
-                start_at - BLOCK_DURATION, end_at + BLOCK_DURATION,
+            recorded_windows, block_start_overrides = (
+                _load_recorded_five_hour_windows(
+                    start_at - BLOCK_DURATION, end_at + BLOCK_DURATION,
+                )
             )
             # Entries: only the window we care about. Mirrors the panel's
             # discipline of pre-filtering before grouping (cf.
@@ -4684,7 +4860,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             ))
             blocks = _group_entries_into_blocks(
                 entries_in_window, mode="auto",
-                recorded_windows=recorded_windows, now=now_utc,
+                recorded_windows=recorded_windows,
+                block_start_overrides=block_start_overrides,
+                now=now_utc,
             )
             target = next(
                 (b for b in blocks

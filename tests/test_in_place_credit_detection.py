@@ -1967,7 +1967,9 @@ def test_blocks_anchor_picks_five_hour_blocks_when_available(ns):
 
     range_start = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
     range_end = dt.datetime(2026, 5, 16, tzinfo=dt.timezone.utc)
-    windows = ns["_load_recorded_five_hour_windows"](range_start, range_end)
+    windows, _overrides = ns["_load_recorded_five_hour_windows"](
+        range_start, range_end,
+    )
 
     assert len(windows) >= 1, f"expected at least one window, got {windows}"
 
@@ -2013,7 +2015,9 @@ def test_blocks_anchor_falls_back_when_no_five_hour_blocks_row(ns):
 
     range_start = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
     range_end = dt.datetime(2026, 5, 16, tzinfo=dt.timezone.utc)
-    windows = ns["_load_recorded_five_hour_windows"](range_start, range_end)
+    windows, _overrides = ns["_load_recorded_five_hour_windows"](
+        range_start, range_end,
+    )
 
     # Raw anchor (floored to 22:40Z because :48 floors to :40 in
     # 10-minute buckets).
@@ -2256,7 +2260,7 @@ def test_blocks_active_uses_five_hour_blocks_when_anchor_differs(
         ),
     ]
 
-    ns["_maybe_swap_active_block_to_canonical"](blocks, now=now_utc)
+    ns["_maybe_swap_active_block_to_canonical"](blocks, [], now=now_utc)
 
     # The active block's times must be rewritten to the canonical
     # window and its anchor flipped to "recorded".
@@ -2310,7 +2314,7 @@ def test_blocks_active_falls_back_when_no_canonical_row(ns, monkeypatch):
         ),
     ]
 
-    ns["_maybe_swap_active_block_to_canonical"](blocks, now=now_utc)
+    ns["_maybe_swap_active_block_to_canonical"](blocks, [], now=now_utc)
 
     # Active block unchanged.
     active = blocks[0]
@@ -2391,10 +2395,377 @@ def test_blocks_active_skips_when_canonical_window_already_closed(
         ),
     ]
 
-    ns["_maybe_swap_active_block_to_canonical"](blocks, now=now_utc)
+    ns["_maybe_swap_active_block_to_canonical"](blocks, [], now=now_utc)
 
     active = blocks[0]
     # Heuristic times preserved; anchor unchanged.
     assert active.start_time == heuristic_start
     assert active.end_time == heuristic_end
     assert active.anchor == "heuristic"
+
+
+def test_blocks_active_swap_recomputes_totals_over_canonical_interval(
+    ns, monkeypatch
+):
+    """Bug F regression guard (v1.7.2 round-5).
+
+    Round-4's swap only rewrote ``start_time`` / ``end_time`` and flipped
+    ``anchor`` to ``"recorded"`` — token / cost totals were left at the
+    heuristic-grouped values. On live data the heuristic anchor at 23:00 IDT
+    captured only entries from 23:00 onward (~$45), but the canonical
+    window started 2h 10min earlier at 20:50 IDT and contains ~$128 of
+    activity. Result: the displayed window said 20:50 → 01:50 with $45,
+    confusingly mismatched.
+
+    This test seeds entries spanning the WIDER canonical window and a
+    heuristic block that only sees a slice of them, then verifies that
+    after the swap the block's totals reflect the full canonical
+    interval.
+    """
+    # Canonical window: 17:50Z → 22:50Z (5h, currently active).
+    canonical_block_start = "2026-05-15T17:50:00+00:00"
+    canonical_resets_at = "2026-05-15T22:50:00+00:00"
+    canonical_key = int(dt.datetime.fromisoformat(canonical_resets_at).timestamp())
+    now_utc = dt.datetime(2026, 5, 15, 21, 30, 0, tzinfo=dt.timezone.utc)
+    monkeypatch.setenv("CCTALLY_AS_OF", now_utc.isoformat(timespec="seconds"))
+
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, weekly_percent, "
+            " source, payload_json, "
+            " five_hour_percent, five_hour_resets_at, "
+            " five_hour_window_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (now_utc.isoformat(timespec="seconds"),
+             "2026-05-09", "2026-05-16",
+             "2026-05-09T17:00:00+00:00", "2026-05-16T17:00:00+00:00",
+             5.0, "test", "{}", 25.0,
+             canonical_resets_at, canonical_key),
+        )
+        conn.execute(
+            "INSERT INTO five_hour_blocks "
+            "(five_hour_window_key, five_hour_resets_at, block_start_at, "
+            " first_observed_at_utc, last_observed_at_utc, "
+            " final_five_hour_percent, is_closed, "
+            " created_at_utc, last_updated_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            (canonical_key, canonical_resets_at, canonical_block_start,
+             canonical_block_start, canonical_block_start,
+             25.0, canonical_block_start, canonical_block_start),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Build a synthetic UsageEntry list spanning the canonical interval:
+    # one entry early (17:55Z — INSIDE canonical, OUTSIDE heuristic) and
+    # one entry late (20:30Z — inside both).
+    UsageEntry = ns["UsageEntry"]
+    early = UsageEntry(
+        timestamp=dt.datetime(2026, 5, 15, 17, 55, 0, tzinfo=dt.timezone.utc),
+        model="claude-opus-4-7",
+        usage={
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "cache_creation_input_tokens": 200,
+            "cache_read_input_tokens": 0,
+        },
+        cost_usd=None,
+    )
+    late = UsageEntry(
+        timestamp=dt.datetime(2026, 5, 15, 20, 30, 0, tzinfo=dt.timezone.utc),
+        model="claude-opus-4-7",
+        usage={
+            "input_tokens": 2000,
+            "output_tokens": 1000,
+            "cache_creation_input_tokens": 400,
+            "cache_read_input_tokens": 100,
+        },
+        cost_usd=None,
+    )
+    all_entries = [early, late]
+
+    # Heuristic block at 20:00Z (only catches `late`).
+    Block = ns["Block"]
+    heuristic_start = dt.datetime(2026, 5, 15, 20, 0, 0, tzinfo=dt.timezone.utc)
+    heuristic_end = heuristic_start + dt.timedelta(hours=5)
+    # Stub a heuristic block whose totals reflect only `late`.
+    _build = ns["_build_activity_block"]
+    heuristic_block = _build(
+        [late], heuristic_start, heuristic_end, now_utc, "auto",
+        anchor="heuristic",
+    )
+    blocks = [heuristic_block]
+    heuristic_cost = heuristic_block.cost_usd
+    heuristic_input = heuristic_block.input_tokens
+
+    ns["_maybe_swap_active_block_to_canonical"](blocks, all_entries, now=now_utc)
+
+    active = blocks[0]
+    expected_start = dt.datetime.fromisoformat(
+        canonical_block_start
+    ).astimezone(dt.timezone.utc)
+    expected_end = dt.datetime.fromisoformat(
+        canonical_resets_at
+    ).astimezone(dt.timezone.utc)
+
+    # Timestamps + anchor: canonical.
+    assert active.start_time == expected_start
+    assert active.end_time == expected_end
+    assert active.anchor == "recorded"
+
+    # Totals MUST cover both entries (early + late), strictly greater
+    # than the heuristic-only baseline. This is the Bug F invariant.
+    assert active.input_tokens == 3000, active.input_tokens
+    assert active.input_tokens > heuristic_input
+    assert active.cost_usd > heuristic_cost
+    assert active.entries_count == 2
+
+
+# ── Round-5 Bug G: dashboard trend pre-credit row ────────────────────
+
+
+def test_tui_build_trend_credited_week_shows_pre_credit_segment(ns):
+    """Bug G regression guard (v1.7.2 round-5).
+
+    The dashboard envelope's ``trend.weeks[]`` is built from
+    ``_tui_build_trend`` (in ``bin/_cctally_tui.py``). ``get_recent_weeks``
+    already routes refs through ``_apply_reset_events_to_weekrefs`` which
+    splits a credited week into TWO refs (pre + post) sharing
+    ``WeekRef.key``. Without the round-5 fix, ``get_latest_usage_for_week``
+    returned the SAME post-credit snapshot for both refs (key-only join),
+    collapsing both rendered rows to 4.0% — the user saw two adjacent
+    "May 09 4%" and "May 15 4%" entries on the trend panel.
+
+    This test seeds a credit event + two snapshots (one pre, one post),
+    calls ``_tui_build_trend``, and asserts the credited week yields TWO
+    rows whose ``used_pct`` correctly reflect the per-segment values
+    (67% pre-credit, 4% post-credit). It also asserts that only the
+    post-credit row is flagged ``is_current`` — the pre-credit segment
+    is historical even though it shares the bucket key with the current
+    one.
+    """
+    end_iso = "2026-05-16T17:00:00+00:00"
+    effective_iso = "2026-05-15T17:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = "2026-05-09T17:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T16:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T20:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=4.0,
+        )
+        _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=effective_iso,
+            old_week_end_at=effective_iso,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = ns["open_db"]()
+    try:
+        now_utc = dt.datetime(2026, 5, 15, 21, 0, 0, tzinfo=dt.timezone.utc)
+        rows = ns["_tui_build_trend"](conn, now_utc, count=8)
+    finally:
+        conn.close()
+
+    # Trend is oldest-first. Find the credited week's two segments by
+    # their week_start_at instant on the TuiTrendRow.
+    pre_dt = ns["parse_iso_datetime"](week_start_at, "test")
+    eff_dt = ns["parse_iso_datetime"](effective_iso, "test")
+    pre_row = next((r for r in rows if r.week_start_at == pre_dt), None)
+    post_row = next((r for r in rows if r.week_start_at == eff_dt), None)
+    assert pre_row is not None, [r.week_start_at for r in rows]
+    assert post_row is not None, [r.week_start_at for r in rows]
+
+    # Per-segment used_pct lookups via as_of_utc=week_end_at must
+    # resolve to the right snapshot.
+    assert pre_row.used_pct == 67.0, pre_row.used_pct
+    assert post_row.used_pct == 4.0, post_row.used_pct
+
+    # is_current discriminates by week_start_at — post-credit only.
+    assert post_row.is_current is True, post_row
+    assert pre_row.is_current is False, pre_row
+
+
+def test_tui_build_trend_non_credit_week_keeps_legacy_behavior(ns):
+    """Bug G fix must NOT change rendering on un-credited weeks: a
+    single ref per key, no ``as_of_utc`` pin (so legacy snapshots
+    written outside the API-derived window still resolve), and
+    ``is_current`` falls back to key-only matching when no reset event
+    exists for the latest snapshot's week.
+    """
+    week_start_date, week_end_date = _week_start_for(
+        "2026-05-16T17:00:00+00:00"
+    )
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T20:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at="2026-05-09T17:00:00+00:00",
+            week_end_at="2026-05-16T17:00:00+00:00",
+            weekly_percent=42.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = ns["open_db"]()
+    try:
+        now_utc = dt.datetime(2026, 5, 15, 21, 0, 0, tzinfo=dt.timezone.utc)
+        rows = ns["_tui_build_trend"](conn, now_utc, count=8)
+    finally:
+        conn.close()
+
+    # Single ref for this key; used_pct resolves to the seeded snapshot.
+    credited = [r for r in rows if r.used_pct == 42.0]
+    assert len(credited) == 1, [r.used_pct for r in rows]
+    assert credited[0].is_current is True
+
+
+# ── Round-5 Bug J: phantom heuristic block from overlapping canonicals ─
+
+
+def test_load_recorded_five_hour_windows_truncates_credit_overlap(
+    ns,
+):
+    """Bug J regression guard (v1.7.2 round-5).
+
+    In-place credit creates two overlapping canonical 5h windows: the
+    pre-credit window (anchored before the credit fired) and the
+    post-credit window (anchored at-or-near the credit moment). On
+    live data the user saw:
+
+      block A: [15:50, 20:50] UTC (pre-credit 5h, supposed to end at 20:50)
+      block B: [17:50, 22:50] UTC (post-credit 5h, ACTIVE)
+
+    Without round-5, ``_select_non_overlapping_recorded_windows`` drops
+    one — leaving entries 15:50-17:50Z unanchored. The renderer shows
+    them as a phantom "~" heuristic block (cost ~$45) sandwiched
+    between two canonical rows, confusing the user.
+
+    The fix truncates block A's R to ``effective_reset_at_utc`` so the
+    weighted scheduler keeps BOTH anchors. The override map carries
+    block A's real ``block_start_at`` for display.
+    """
+    canonical_resets_a = "2026-05-15T20:50:00+00:00"
+    block_start_a      = "2026-05-15T15:50:00+00:00"
+    canonical_resets_b = "2026-05-15T22:50:00+00:00"
+    block_start_b      = "2026-05-15T17:50:00+00:00"
+    credit_effective   = "2026-05-15T17:58:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        _seed_five_hour_block_row(
+            conn,
+            five_hour_resets_at=canonical_resets_a,
+            block_start_at=block_start_a,
+            five_hour_window_key=int(
+                dt.datetime.fromisoformat(canonical_resets_a).timestamp()
+            ),
+        )
+        _seed_five_hour_block_row(
+            conn,
+            five_hour_resets_at=canonical_resets_b,
+            block_start_at=block_start_b,
+            five_hour_window_key=int(
+                dt.datetime.fromisoformat(canonical_resets_b).timestamp()
+            ),
+        )
+        # In-place credit event (old == effective shape).
+        conn.execute(
+            "INSERT INTO week_reset_events "
+            "(detected_at_utc, old_week_end_at, new_week_end_at, "
+            " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+            ("2026-05-15T18:00:00Z",
+             credit_effective,
+             "2026-05-16T17:00:00+00:00",
+             credit_effective),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    range_start = dt.datetime(2026, 5, 15, 0, 0, tzinfo=dt.timezone.utc)
+    range_end   = dt.datetime(2026, 5, 16, 0, 0, tzinfo=dt.timezone.utc)
+    anchors, overrides = ns["_load_recorded_five_hour_windows"](
+        range_start, range_end,
+    )
+
+    # The earlier block's R MUST be truncated to the credit moment so
+    # both anchors survive _select_non_overlapping_recorded_windows.
+    credit_floored = dt.datetime(
+        2026, 5, 15, 17, 50, 0, tzinfo=dt.timezone.utc,
+    )  # 17:58 floors to 17:50
+    post_credit_anchor = dt.datetime(
+        2026, 5, 15, 22, 50, 0, tzinfo=dt.timezone.utc,
+    )
+    # The original 20:50 anchor must NOT appear (it was truncated).
+    assert dt.datetime(2026, 5, 15, 20, 50, 0, tzinfo=dt.timezone.utc) not in anchors, anchors
+    assert post_credit_anchor in anchors, anchors
+    assert credit_floored in anchors, anchors
+
+    # And the truncated R must carry an override → real block_start_a.
+    expected_start = dt.datetime(
+        2026, 5, 15, 15, 50, 0, tzinfo=dt.timezone.utc,
+    )
+    assert credit_floored in overrides, overrides
+    assert overrides[credit_floored] == expected_start, overrides
+
+
+def test_group_entries_into_blocks_uses_block_start_override(ns):
+    """Bug J regression guard: the override threads through
+    `_group_entries_into_blocks` so the recorded block's displayed
+    ``start_time`` matches Anthropic's real block_start_at — not the
+    R-5h default which is hours earlier for a credit-truncated block.
+    """
+    UsageEntry = ns["UsageEntry"]
+    group = ns["_group_entries_into_blocks"]
+
+    # Truncated R = 17:50 UTC (10-min floor of 17:58). Real start = 15:50 UTC.
+    truncated_R = dt.datetime(2026, 5, 15, 17, 50, 0, tzinfo=dt.timezone.utc)
+    real_start = dt.datetime(2026, 5, 15, 15, 50, 0, tzinfo=dt.timezone.utc)
+    entry = UsageEntry(
+        timestamp=dt.datetime(2026, 5, 15, 16, 30, 0, tzinfo=dt.timezone.utc),
+        model="claude-opus-4-7",
+        usage={"input_tokens": 100, "output_tokens": 50,
+               "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+        cost_usd=None,
+    )
+    now = dt.datetime(2026, 5, 15, 21, 0, 0, tzinfo=dt.timezone.utc)
+    blocks = group(
+        [entry],
+        recorded_windows=[truncated_R],
+        block_start_overrides={truncated_R: real_start},
+        now=now,
+    )
+    activity = [b for b in blocks if not b.is_gap]
+    assert len(activity) == 1
+    assert activity[0].start_time == real_start
+    assert activity[0].end_time == truncated_R
+    assert activity[0].anchor == "recorded"

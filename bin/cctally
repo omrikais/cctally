@@ -5388,7 +5388,7 @@ def _select_non_overlapping_recorded_windows(
 def _load_recorded_five_hour_windows(
     range_start: dt.datetime,
     range_end: dt.datetime,
-) -> list[dt.datetime]:
+) -> tuple[list[dt.datetime], dict[dt.datetime, dt.datetime]]:
     """Return sorted, UTC-aware recorded ``five_hour_resets_at`` values
     that anchor real 5h windows in ``[range_start, range_end]``.
 
@@ -5445,10 +5445,13 @@ def _load_recorded_five_hour_windows(
             # 10-minute bucket. Wrapped in a defensive try in case the
             # five_hour_blocks table doesn't exist yet (very-old DB on
             # first open before the bootstrap migration ran).
+            # Pull ``block_start_at`` alongside ``five_hour_resets_at``
+            # so Bug J's overlap-truncation step (below) can preserve
+            # the real display start for credit-truncated blocks.
             canonical_rows: list[Any] = []
             try:
                 canonical_rows = conn.execute(
-                    "SELECT five_hour_resets_at "
+                    "SELECT five_hour_resets_at, block_start_at "
                     "FROM five_hour_blocks "
                     "WHERE five_hour_resets_at IS NOT NULL "
                     "  AND five_hour_resets_at >= ? "
@@ -5457,11 +5460,37 @@ def _load_recorded_five_hour_windows(
                 ).fetchall()
             except sqlite3.DatabaseError:
                 canonical_rows = []
+            # In-place credit events — used by Bug J to detect canonical
+            # block overlaps that should be resolved by truncating the
+            # earlier block at the credit moment (rather than dropping
+            # one via _select_non_overlapping_recorded_windows, which
+            # leaves the dropped block's entries unanchored and
+            # rendered as a phantom heuristic "~" row).
+            credit_moments: list[dt.datetime] = []
+            try:
+                credit_rows = conn.execute(
+                    "SELECT effective_reset_at_utc "
+                    "FROM week_reset_events "
+                    "WHERE old_week_end_at = effective_reset_at_utc"
+                ).fetchall()
+                for c in credit_rows:
+                    raw = c["effective_reset_at_utc"]
+                    try:
+                        d = dt.datetime.fromisoformat(str(raw))
+                    except ValueError:
+                        continue
+                    if d.tzinfo is None:
+                        d = d.replace(tzinfo=dt.timezone.utc)
+                    else:
+                        d = d.astimezone(dt.timezone.utc)
+                    credit_moments.append(d)
+            except sqlite3.DatabaseError:
+                credit_moments = []
     except (sqlite3.DatabaseError, OSError):
         # OSError covers ensure_dirs() failures (read-only FS, permission
         # denied on parent dir) that propagate from open_db() before any
         # SQL runs. Either way, fall back to the heuristic anchor path.
-        return []
+        return [], {}
     counts: dict[dt.datetime, int] = {}
     for row in rows:
         raw = row["five_hour_resets_at"] if hasattr(row, "keys") else row[0]
@@ -5485,21 +5514,102 @@ def _load_recorded_five_hour_windows(
     # `_select_non_overlapping_recorded_windows` (5h-disjoint
     # invariant) would drop the lower-weight one — but the wrong
     # one would win when jitter exceeds 10 minutes.
+    #
+    # Bug J (v1.7.2 round-5): collect canonical (block_start, R) pairs
+    # so we can detect in-place-credit overlaps before flattening into
+    # the weighted scheduler. When two canonical 5h blocks overlap AND
+    # an in-place credit event falls inside the overlap, truncate the
+    # EARLIER block's R to the credit moment (floored to 10 min so it
+    # collapses with any same-bucket raw-snapshot value). The
+    # truncated R keeps both blocks visible — without this fix the
+    # earlier block's entries are silently rendered as a phantom
+    # heuristic "~" row by `_group_entries_into_blocks`.
+    canonical_pairs: list[tuple[dt.datetime, dt.datetime]] = []
     for row in canonical_rows:
-        raw = row["five_hour_resets_at"] if hasattr(row, "keys") else row[0]
-        if raw is None:
+        rs_raw = row["five_hour_resets_at"] if hasattr(row, "keys") else row[0]
+        bs_raw = row["block_start_at"]      if hasattr(row, "keys") else row[1]
+        if rs_raw is None or bs_raw is None:
             continue
         try:
-            d = dt.datetime.fromisoformat(str(raw))
+            rs = dt.datetime.fromisoformat(str(rs_raw))
+            bs = dt.datetime.fromisoformat(str(bs_raw))
         except ValueError:
             continue
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=dt.timezone.utc)
+        if rs.tzinfo is None:
+            rs = rs.replace(tzinfo=dt.timezone.utc)
         else:
-            d = d.astimezone(dt.timezone.utc)
-        snapped = _floor_to_ten_minutes(d)
+            rs = rs.astimezone(dt.timezone.utc)
+        if bs.tzinfo is None:
+            bs = bs.replace(tzinfo=dt.timezone.utc)
+        else:
+            bs = bs.astimezone(dt.timezone.utc)
+        canonical_pairs.append((bs, rs))
+    canonical_pairs.sort(key=lambda p: p[0])
+
+    # Detect overlap-with-credit and replace the earlier R with a
+    # credit-truncated anchor. The (anchor → real_block_start) map is
+    # returned alongside the anchor list so the renderer can show the
+    # real block_start_at on the display row (instead of the default
+    # R - 5h, which would be hours earlier for a 2h-truncated block).
+    block_start_overrides: dict[dt.datetime, dt.datetime] = {}
+    truncated_pairs: list[tuple[dt.datetime, dt.datetime]] = []
+    for i, (bs, rs) in enumerate(canonical_pairs):
+        truncated_R = rs
+        if i + 1 < len(canonical_pairs):
+            next_bs, _next_rs = canonical_pairs[i + 1]
+            if rs > next_bs:  # overlap with next block
+                # Look for a credit moment inside [next_bs, rs] — the
+                # part of the earlier block that overlaps the next.
+                for cm in credit_moments:
+                    if next_bs <= cm <= rs:
+                        cm_floored = _floor_to_ten_minutes(cm)
+                        # Only truncate if cm is strictly inside the
+                        # earlier block; otherwise leave R alone and
+                        # let `_select_non_overlapping_recorded_windows`
+                        # drop one via its weight-tiebreaker.
+                        if bs < cm_floored < rs:
+                            truncated_R = cm_floored
+                            block_start_overrides[cm_floored] = bs
+                            break
+        truncated_pairs.append((bs, truncated_R))
+
+    # Truncated anchors are credit-adjusted and known-good; bypass the
+    # `_select_non_overlapping_recorded_windows` weighted scheduler for
+    # them (the scheduler treats every R as the END of a fixed 5h
+    # window and would see a truncated R conflicting with the adjacent
+    # canonical block one slot earlier — e.g. truncated R=17:50 would
+    # collide with the prior block's R=15:50 even though their REAL
+    # intervals are [15:50, 17:50] and [10:50, 15:50] respectively —
+    # adjacent, not overlapping). Add their R directly to the selector
+    # input weight (so jittered same-bucket raw values still collapse)
+    # but skip them when computing the overlap-safe subset.
+    truncated_anchors: set[dt.datetime] = set()
+    for bs, rs in truncated_pairs:
+        snapped = _floor_to_ten_minutes(rs)
+        if rs != _floor_to_ten_minutes(rs):
+            if rs in block_start_overrides:
+                block_start_overrides[snapped] = block_start_overrides.pop(rs)
+        # Identify truncated anchors by membership in the override map
+        # (only credit-truncated entries land there).
+        if snapped in block_start_overrides:
+            truncated_anchors.add(snapped)
         counts[snapped] = counts.get(snapped, 0) + 1000
-    return _select_non_overlapping_recorded_windows(list(counts.items()))
+
+    non_truncated_items = [
+        (a, w) for a, w in counts.items() if a not in truncated_anchors
+    ]
+    selected_non_truncated = _select_non_overlapping_recorded_windows(
+        non_truncated_items
+    )
+    # Merge truncated anchors back in, sorted ascending. Their non-
+    # overlap with the surrounding canonical blocks is guaranteed by
+    # the credit-moment truncation: a truncated R sits strictly
+    # between its real block_start (which equals the prior block's R)
+    # and the next block's R.
+    selected = sorted(
+        list(selected_non_truncated) + list(truncated_anchors)
+    )
+    return selected, block_start_overrides
 
 
 def cmd_blocks(args: argparse.Namespace) -> int:
@@ -5544,14 +5654,16 @@ def cmd_blocks(args: argparse.Namespace) -> int:
     # reset R just after ``range_end`` (e.g. the active window when
     # range_end is wall-clock "now") can still anchor entries that fall
     # inside [range_start, range_end].
-    recorded_windows = _load_recorded_five_hour_windows(
+    recorded_windows, block_start_overrides = _load_recorded_five_hour_windows(
         range_start - BLOCK_DURATION, range_end + BLOCK_DURATION,
     )
 
     # Group into blocks
     blocks = _group_entries_into_blocks(
         all_entries, mode="auto",
-        recorded_windows=recorded_windows, now=now_utc,
+        recorded_windows=recorded_windows,
+        block_start_overrides=block_start_overrides,
+        now=now_utc,
     )
 
     # Bug E (v1.7.2 round-4): when the ACTIVE block is heuristic-anchored
@@ -5566,7 +5678,15 @@ def cmd_blocks(args: argparse.Namespace) -> int:
     # Match by the live 5h window key (the same key
     # ``cmd_five_hour_blocks`` would surface for the ACTIVE row) — falls
     # back to heuristic behavior whenever the canonical row is missing.
-    _maybe_swap_active_block_to_canonical(blocks, now=now_utc)
+    #
+    # Bug F (v1.7.2 round-5): pass ``all_entries`` so the swap also
+    # re-aggregates token / cost totals over the canonical interval. The
+    # heuristic block holds only entries from the heuristic anchor
+    # onwards; the canonical block may start earlier and include 1-2h of
+    # additional entries. Without re-aggregation the displayed window
+    # said one thing and the cost said another (live data: window
+    # 20:50→01:50 with $45 cost vs the real $128).
+    _maybe_swap_active_block_to_canonical(blocks, all_entries, now=now_utc)
 
     if args.json:
         print(_blocks_to_json(blocks))
@@ -5578,17 +5698,24 @@ def cmd_blocks(args: argparse.Namespace) -> int:
 
 
 def _maybe_swap_active_block_to_canonical(
-    blocks: list[Any], *, now: dt.datetime
+    blocks: list[Any],
+    all_entries: list[Any],
+    *,
+    now: dt.datetime,
 ) -> None:
     """In-place swap of an ACTIVE heuristic block to its API-anchored
-    canonical times.
+    canonical window — timestamps AND token/cost totals.
 
     Looks up the live ``five_hour_window_key`` from the most recent
     ``weekly_usage_snapshots`` row, then joins to ``five_hour_blocks``
     for that key. If found AND the canonical window still contains
-    ``now`` (resets_at > now), rewrites the active block's
-    ``start_time`` / ``end_time`` from the canonical row and flips
-    ``anchor`` to ``"recorded"``.
+    ``now`` (resets_at > now), rewrites the active block to span the
+    canonical ``[block_start_at, five_hour_resets_at)`` interval and
+    flips ``anchor`` to ``"recorded"``. Token / cost totals are
+    re-aggregated from ``all_entries`` filtered to that interval via
+    ``_aggregate_block`` — the canonical window may contain 1-2h more
+    activity than the heuristic grouping did, so the cost shown next
+    to the swapped timestamps stays consistent with them (Bug F).
 
     No-op when:
       - No block is active (no ``is_active`` and not gap).
@@ -5600,20 +5727,17 @@ def _maybe_swap_active_block_to_canonical(
         the past relative to ``now`` (canonical block is closed; the
         heuristic block is genuinely the current activity).
 
-    Token / cost totals on the swapped block are NOT recomputed — the
-    underlying entries are unchanged; only the displayed window
-    boundaries shift. This matches the round-4 spec for Bug E.
-
     Surgical helper called once from ``cmd_blocks`` after grouping.
     """
     # Find the active (non-gap, heuristic) block — there's at most one.
-    active = None
-    for b in blocks:
+    active_idx = None
+    for i, b in enumerate(blocks):
         if not b.is_gap and b.is_active:
-            active = b
+            active_idx = i
             break
-    if active is None or active.anchor != "heuristic":
+    if active_idx is None or blocks[active_idx].anchor != "heuristic":
         return
+    active = blocks[active_idx]
     try:
         with open_db() as conn:
             snap = conn.execute(
@@ -5652,9 +5776,24 @@ def _maybe_swap_active_block_to_canonical(
     # heuristic anchor reflects real ongoing activity in a later window.
     if block_end_utc <= now.astimezone(dt.timezone.utc):
         return
-    active.start_time = block_start_utc
-    active.end_time = block_end_utc
-    active.anchor = "recorded"
+    # Re-aggregate entries over the canonical interval. Build a fresh
+    # Block via ``_build_activity_block`` (mode="auto" matches
+    # ``_group_entries_into_blocks``'s default) so every total stays in
+    # one code path — no field-by-field assignment that could drift if
+    # the dataclass grows new fields.
+    canonical_entries = [
+        e for e in all_entries
+        if block_start_utc <= e.timestamp < block_end_utc
+    ]
+    rebuilt = _build_activity_block(
+        canonical_entries,
+        block_start_utc,
+        block_end_utc,
+        now.astimezone(dt.timezone.utc),
+        "auto",
+        anchor="recorded",
+    )
+    blocks[active_idx] = rebuilt
 
 
 def _parse_cli_date_range(
