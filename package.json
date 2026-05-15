@@ -21,6 +21,7 @@
     "bin/_lib_alerts_payload.py",
     "bin/_lib_display_tz.py",
     "bin/_lib_doctor.py",
+    "bin/_lib_five_hour.py",
     "bin/_lib_pricing.py",
     "bin/_lib_semver.py",
     "bin/_lib_share.py",
