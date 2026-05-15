@@ -1334,12 +1334,30 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         except (sqlite3.DatabaseError, ValueError) as exc:
             eprint(f"[record-usage] reset-event detection failed: {exc}")
 
-        # 7-day usage is monotonically non-decreasing within a billing week.
-        # A lower value means stale rate-limit data from a previous API call;
-        # skip the insert to avoid regressing the reported usage.
+        # 7-day usage is monotonically non-decreasing within a billing week
+        # — UNTIL Anthropic issues an in-place weekly credit. When a
+        # week_reset_events row exists for THIS week_end_at, the MAX query
+        # filters to samples captured at-or-after the segment's
+        # effective_reset_at_utc so a fresh post-credit OAuth value (e.g.
+        # 2%) lands instead of being held back by stale pre-credit history
+        # (e.g. 67%). When no event row exists, COALESCE defaults to
+        # epoch-zero so the filter is a no-op and legacy clamp behavior
+        # is preserved byte-identically.
         max_row = conn.execute(
-            "SELECT MAX(weekly_percent) AS v FROM weekly_usage_snapshots WHERE week_start_date = ?",
-            (week_start_date,),
+            """
+            SELECT MAX(weekly_percent) AS v
+              FROM weekly_usage_snapshots
+             WHERE week_start_date = ?
+               AND captured_at_utc >= COALESCE(
+                 (SELECT effective_reset_at_utc
+                    FROM week_reset_events
+                   WHERE new_week_end_at = ?
+                   ORDER BY id DESC
+                   LIMIT 1),
+                 '1970-01-01T00:00:00Z'
+               )
+            """,
+            (week_start_date, week_end_at),
         ).fetchone()
         if max_row and max_row["v"] is not None and round(weekly_percent, 1) < round(float(max_row["v"]), 1):
             should_insert = False
