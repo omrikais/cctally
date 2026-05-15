@@ -141,11 +141,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fcntl
-import importlib.util as _ilu
 import json
 import math
 import os
-import pathlib
 import sqlite3
 import sys
 import time
@@ -311,43 +309,14 @@ def _hook_tick_make_mock_refresh(*args, **kwargs):
     return sys.modules["cctally"]._hook_tick_make_mock_refresh(*args, **kwargs)
 
 
-# Self-contained sibling loader so this module can be exercised in
-# isolation (tests that compile + exec without going through bin/cctally
-# first). Mirrors ``_cctally_cache.py``'s pattern.
-def _load_lib(name: str):
-    cached = sys.modules.get(name)
-    if cached is not None:
-        return cached
-    p = pathlib.Path(__file__).resolve().parent / f"{name}.py"
-    spec = _ilu.spec_from_file_location(name, p)
-    mod = _ilu.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-# Exception-class shim resolved via cctally at use time. We can't bind
-# the class object at module-load time because cctally may not have
-# finished executing yet (sibling load fires from within cctally's
-# eager-load block). Catch sites use ``except _AlertsConfigError`` which
-# Python evaluates at except-time (CPython resolves the name on every
-# raise/except), so this lazy attribute resolution is safe.
-class _AlertsConfigErrorProxy:
-    def __getattr__(self, name):  # pragma: no cover (only used at class lookup)
-        return getattr(sys.modules["cctally"]._AlertsConfigError, name)
-
-
-# Hoist into module globals so `except _AlertsConfigError` byte-identical
-# from the original bodies resolves via cctally's class object. Python's
-# ``except`` syntax requires a class (or tuple); we cannot use a
-# descriptor here. Instead, expose the real class through a module-level
-# property-like alias by re-binding at every call. The simplest correct
-# pattern: a function that bin/cctally's eager-load block calls AFTER
-# both modules are loaded — but cleaner is to thread the catch through a
-# helper. The bare ``except`` site appears in two functions only
-# (``maybe_record_milestone``, ``maybe_update_five_hour_block``); both
-# rewrite to ``except sys.modules['cctally']._AlertsConfigError`` to
-# avoid any binding gymnastics.
+# Exception classes raised by callees that stay in bin/cctally
+# (``_AlertsConfigError``) or in another sibling (``OauthUsageConfigError``
+# in ``bin/_cctally_refresh.py``) are caught here via
+# ``except sys.modules['cctally'].SomeError`` — Python evaluates the
+# ``except`` expression at except-time, so each catch resolves to the
+# live class object that the raiser also reaches. See call sites in
+# ``maybe_record_milestone``, ``maybe_update_five_hour_block``, and
+# ``cmd_hook_tick`` for the three rewrites.
 
 
 # Constants referenced by the moved bodies. Defined here (rather than
@@ -1809,13 +1778,7 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
 
         mock = getattr(args, "mock_oauth_response", None)
         if mock is not None:
-            # Replace the OAuth-refresh function on the cctally module so
-            # this sibling's shim (and any other consumer that resolves
-            # via ``sys.modules['cctally']``) picks up the mock on the
-            # very next call. Pre-split this was a self-mutating
-            # ``globals()`` write inside bin/cctally; post-split it
-            # writes through to the cctally module instead so the same
-            # call-time lookup pattern resolves the mock.
+            # Replace the throttle path's fetch fn for this process.
             sys.modules["cctally"]._hook_tick_oauth_refresh = _hook_tick_make_mock_refresh(mock)
 
         # Throttle check + OAuth (under flock)
