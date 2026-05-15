@@ -150,9 +150,8 @@ What stays in bin/cctally:
   ``_compute_subscription_weeks``, ``_group_entries_into_blocks``,
   ``get_entries``, ``get_claude_session_entries``,
   ``get_latest_usage_for_week``, ``make_week_ref``,
-  ``_compute_block_totals``, ``_get_alerts_config``,
-  ``_AlertsConfigError``, ``_ALERTS_CONFIG_VALID_KEYS``,
-  ``_validate_threshold_list``, ``_warn_alerts_bad_config_once``,
+  ``_get_alerts_config``, ``_AlertsConfigError``,
+  ``_warn_alerts_bad_config_once``,
   ``_OAUTH_USAGE_DEFAULTS``, ``_load_recorded_five_hour_windows``,
   ``_make_run_sync_now``, ``_make_run_sync_now_locked``,
   ``_build_forecast_json_payload``, ``_build_alert_payload_weekly``,
@@ -223,7 +222,6 @@ import bisect
 import contextlib
 import dataclasses
 import datetime as dt
-import hashlib
 import io
 import json
 import math
@@ -231,23 +229,20 @@ import os
 import pathlib
 import queue
 import re
-import secrets
 import shutil
 import signal as _signal
 import socket
 import sqlite3
 import sys
-import textwrap
 import threading
 import time
-import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser as _wb
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Literal
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -293,10 +288,6 @@ def save_config(*args, **kwargs):
 
 def open_db(*args, **kwargs):
     return sys.modules["cctally"].open_db(*args, **kwargs)
-
-
-def sync_cache(*args, **kwargs):
-    return sys.modules["cctally"].sync_cache(*args, **kwargs)
 
 
 def get_entries(*args, **kwargs):
@@ -371,16 +362,8 @@ def _group_entries_into_blocks(*args, **kwargs):
     return sys.modules["cctally"]._group_entries_into_blocks(*args, **kwargs)
 
 
-def _compute_block_totals(*args, **kwargs):
-    return sys.modules["cctally"]._compute_block_totals(*args, **kwargs)
-
-
 def _get_alerts_config(*args, **kwargs):
     return sys.modules["cctally"]._get_alerts_config(*args, **kwargs)
-
-
-def _validate_threshold_list(*args, **kwargs):
-    return sys.modules["cctally"]._validate_threshold_list(*args, **kwargs)
 
 
 def _warn_alerts_bad_config_once(*args, **kwargs):
@@ -467,10 +450,6 @@ def _validate_update_check_ttl_hours_value(*args, **kwargs):
     return sys.modules["cctally"]._validate_update_check_ttl_hours_value(*args, **kwargs)
 
 
-def _normalize_update_check_enabled_value(*args, **kwargs):
-    return sys.modules["cctally"]._normalize_update_check_enabled_value(*args, **kwargs)
-
-
 def _config_known_value(*args, **kwargs):
     return sys.modules["cctally"]._config_known_value(*args, **kwargs)
 
@@ -529,10 +508,13 @@ def BlocksPanelRow(*args, **kwargs):
 # + cmd_dashboard. UpdateError / UpdateWorker / _DashboardUpdateCheckThread
 # live in _cctally_update (Phase F #21); the names below resolve through
 # cctally's re-exported namespace so monkeypatches on cctally propagate.
-def UpdateError(*args, **kwargs):
-    return sys.modules["cctally"].UpdateError(*args, **kwargs)
-
-
+#
+# UpdateError is NOT a callable shim — exception classes used in `except`
+# clauses must be the class object itself, not a function that returns
+# one (Python rejects non-class objects in `except` with TypeError).
+# All `except UpdateError:` sites in this file use the explicit
+# `except sys.modules["cctally"].UpdateError:` form (3 sites; same
+# pattern as `_AlertsConfigError` per Phase D #18 precedent).
 def UpdateWorker(*args, **kwargs):
     return sys.modules["cctally"].UpdateWorker(*args, **kwargs)
 
@@ -553,7 +535,6 @@ def _DashboardUpdateCheckThread(*args, **kwargs):
 # ``ns["_AlertsConfigError"]`` etc. access pattern.
 _LAZY_ATTRS = (
     "_AlertsConfigError",
-    "_ALERTS_CONFIG_VALID_KEYS",
     "_OAUTH_USAGE_DEFAULTS",
     "_SHARE_HISTORY_RING_CAP",
     "SKIP_USE_STATE_LATEST",
@@ -2801,7 +2782,7 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     # null-state shape `coerceUpdateState` already understands.
     try:
         _update_state_envelope = _load_update_state()
-    except UpdateError:
+    except sys.modules["cctally"].UpdateError:
         # _load_update_state() raises on truly malformed JSON. Surface
         # an _error sentinel so the client renders "no update info" the
         # same way it does for unreachable /api/update/status.
@@ -4928,11 +4909,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         """
         try:
             state = _load_update_state()
-        except UpdateError as e:
+        except sys.modules["cctally"].UpdateError as e:
             state = {"_error": str(e)[:200]}
         try:
             suppress = _load_update_suppress()
-        except UpdateError as e:
+        except sys.modules["cctally"].UpdateError as e:
             suppress = {"_error": str(e)[:200]}
         _w = sys.modules["cctally"]._UPDATE_WORKER
         worker_status = (
