@@ -468,3 +468,146 @@ def test_dedup_via_seed_snapshot(ns, tmp_path):
         assert events == 1, "second call must not re-fire the detection branch"
     finally:
         conn.close()
+
+
+# ── Task 4: backfill extension for historical in-place credits ───────
+
+
+def test_backfill_detects_historical_in_place_credit(ns):
+    """Seed snapshots showing 67→2 with the SAME week_end on consecutive
+    captures (captured BEFORE the end_at — i.e., we were "in the window"
+    when the credit landed). Run ``_backfill_week_reset_events``.
+    Assert: one event row with old == new == cur_end (in-place credit
+    shape), effective == floor_to_hour(captured_at_of_2pct_row).
+    """
+    # Use a future end_at so captured_dt < prior_end_dt is true.
+    end_iso, _ = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-13T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T17:30:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=2.0,
+        )
+        # No event row pre-seeded; backfill should synthesize one.
+        conn.commit()
+        ns["_backfill_week_reset_events"](conn)
+
+        events = conn.execute(
+            "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
+            "FROM week_reset_events"
+        ).fetchall()
+        assert len(events) == 1, events
+        # In-place credit shape: old == new == cur_end.
+        assert events[0]["old_week_end_at"] == end_iso
+        assert events[0]["new_week_end_at"] == end_iso
+        # Effective is floor-to-hour of the captured_at when the drop
+        # was first observed (Anthropic's reset times are always
+        # hour-aligned). Compare as UTC moment to absorb the host-tz
+        # rendering quirk in ``parse_iso_datetime`` — see project
+        # gotcha ``unixepoch_for_cross_offset_compare``.
+        eff_dt = dt.datetime.fromisoformat(events[0]["effective_reset_at_utc"])
+        assert eff_dt.astimezone(dt.timezone.utc) == dt.datetime(
+            2026, 5, 14, 17, 0, 0, tzinfo=dt.timezone.utc
+        )
+    finally:
+        conn.close()
+
+
+def test_backfill_idempotent_on_rerun(ns):
+    """Run ``_backfill_week_reset_events`` twice. Assert: only one event
+    row exists (UNIQUE(old_week_end_at, new_week_end_at) + INSERT OR
+    IGNORE).
+    """
+    end_iso, _ = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-13T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T17:30:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=2.0,
+        )
+        conn.commit()
+        ns["_backfill_week_reset_events"](conn)
+        ns["_backfill_week_reset_events"](conn)
+        ns["_backfill_week_reset_events"](conn)
+
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM week_reset_events"
+        ).fetchone()[0]
+        assert cnt == 1, "backfill should be idempotent (UNIQUE + IGNORE)"
+    finally:
+        conn.close()
+
+
+def test_backfill_preserves_boundary_shift_branch(ns):
+    """Boundary-shift legacy: classic mid-week reset where the API
+    advances ``week_end_at`` to a new value AND ``weekly_percent``
+    drops. Backfill should still emit an event row in the legacy shape
+    (``old == prior_end``, ``new == cur_end``, distinct values). This
+    is the regression guard for the v1.7.1 path that the in-place
+    credit branch must NOT clobber.
+    """
+    # Future ends so captured < prior_end is satisfied.
+    end_1 = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=3, hours=0)).replace(
+        minute=0, second=0, microsecond=0
+    )
+    end_2 = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=2, hours=0)).replace(
+        minute=0, second=0, microsecond=0
+    )
+    end_1_iso = end_1.isoformat(timespec="seconds")
+    end_2_iso = end_2.isoformat(timespec="seconds")
+    week_start = (end_1 - dt.timedelta(days=7)).date().isoformat()
+    week_start_2 = (end_2 - dt.timedelta(days=7)).date().isoformat()
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-13T10:00:00Z",
+            week_start_date=week_start,
+            week_end_at=end_1_iso,
+            weekly_percent=67.0,
+        )
+        # Same captured ordering, NEW end_at (Anthropic shifted the boundary),
+        # weekly_percent dropped 25+pp.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T17:30:00Z",
+            week_start_date=week_start_2,
+            week_end_at=end_2_iso,
+            weekly_percent=2.0,
+        )
+        conn.commit()
+        ns["_backfill_week_reset_events"](conn)
+
+        events = conn.execute(
+            "SELECT old_week_end_at, new_week_end_at FROM week_reset_events"
+        ).fetchall()
+        assert len(events) == 1, events
+        assert events[0]["old_week_end_at"] == end_1_iso
+        assert events[0]["new_week_end_at"] == end_2_iso
+    finally:
+        conn.close()

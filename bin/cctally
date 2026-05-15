@@ -7159,6 +7159,32 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
                     " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
                     (row["captured_at_utc"], prior_end, cur_end, effective_iso),
                 )
+        elif prior_end and cur_end == prior_end:
+            # In-place credit branch (v1.7.2). Mirrors the live detection
+            # in cmd_record_usage: same end_at across two captures + ≥25pp
+            # drop in weekly_percent + prior end still in the future at
+            # captured_dt → Anthropic-issued goodwill credit. One event
+            # row with old == new == cur_end, effective = floor_to_hour
+            # of the captured_at when the drop was first observed.
+            try:
+                prior_end_dt = parse_iso_datetime(prior_end, "backfill.prior")
+                captured_dt  = parse_iso_datetime(row["captured_at_utc"], "backfill.cap")
+            except ValueError:
+                prior_end = cur_end
+                prior_pct = cur_pct
+                continue
+            if (
+                captured_dt < prior_end_dt
+                and prior_pct is not None and cur_pct is not None
+                and (float(prior_pct) - float(cur_pct)) >= _RESET_PCT_DROP_THRESHOLD
+            ):
+                effective_iso = _floor_to_hour(captured_dt).isoformat(timespec="seconds")
+                conn.execute(
+                    "INSERT OR IGNORE INTO week_reset_events "
+                    "(detected_at_utc, old_week_end_at, new_week_end_at, "
+                    " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+                    (row["captured_at_utc"], cur_end, cur_end, effective_iso),
+                )
         prior_end = cur_end
         prior_pct = cur_pct
     # Flush implicit transaction so callers using explicit BEGIN
