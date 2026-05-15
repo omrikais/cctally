@@ -34,6 +34,7 @@
     "bin/_lib_five_hour.py",
     "bin/_lib_jsonl.py",
     "bin/_lib_pricing.py",
+    "bin/_lib_render.py",
     "bin/_lib_semver.py",
     "bin/_lib_share.py",
     "bin/_lib_share_templates.py",
