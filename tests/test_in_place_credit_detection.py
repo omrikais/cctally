@@ -1043,3 +1043,197 @@ def test_tui_percent_milestones_filters_to_active_segment(ns):
     assert len(out) == 1, out
     assert out[0].percent == 1
     assert out[0].cumulative_cost_usd == 5.0
+
+
+# ── Task 8: alerts dedup (independent post-credit fire) ──────────────
+
+
+def test_post_credit_alert_fires_independently(ns):
+    """Pre-credit milestone (threshold=3, ``alerted_at=NOW``,
+    ``reset_event_id=0``) exists. Drive a post-credit milestone for
+    threshold=3 captured after the event. The new row INSERTs at
+    ``reset_event_id = event.id`` (cohabits with the pre-credit row
+    via the new UNIQUE), ``alerted_at`` gets stamped on the new row
+    via the segment-filtered UPDATE, the pre-credit row's
+    ``alerted_at`` is untouched.
+
+    This is the alert dedup verification: the alert pipeline reads
+    rows via ``maybe_record_milestone``'s INSERT OR IGNORE + UPDATE
+    set-then-dispatch flow. Without the segment-filtered UPDATE
+    (Task 5), the post-credit row would land but the UPDATE would
+    target a row keyed on (week, threshold) ignoring segment — the
+    pre-credit row matches WHERE first, gets re-stamped, and the
+    post-credit row stays NULL.
+    """
+    end_iso = "2026-05-16T05:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = week_start_date + "T05:00:00+00:00"
+    effective = "2026-05-14T17:00:00+00:00"
+    pre_alerted_at = "2026-05-12T11:00:00Z"
+
+    conn = ns["open_db"]()
+    try:
+        # Pre-credit milestone, already alerted.
+        conn.execute(
+            "INSERT INTO percent_milestones "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, percent_threshold, "
+            " cumulative_cost_usd, marginal_cost_usd, "
+            " usage_snapshot_id, cost_snapshot_id, "
+            " alerted_at, reset_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-05-12T10:00:00Z", week_start_date, week_end_date,
+             week_start_at, end_iso, 3, 100.0, None, 1, 1,
+             pre_alerted_at, 0),
+        )
+        # Cost snapshot (so the writer doesn't bail).
+        _seed_cost_snapshot(
+            conn,
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            cost_usd=12.0,
+        )
+        evt_id = _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=effective,
+            old_week_end_at=end_iso,
+        )
+        usage_id = _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T18:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=3.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Configure alerts: weekly_thresholds = [3] so the threshold-3 alert
+    # would fire. ``five_hour_thresholds`` must be non-empty per config
+    # validation (paired-axis invariant). Set in config.json.
+    ns["save_config"]({"alerts": {"enabled": True,
+                                   "weekly_thresholds": [3],
+                                   "five_hour_thresholds": [95]}})
+
+    saved = {
+        "id": usage_id,
+        "weeklyPercent": 3.0,
+        "weekStartDate": week_start_date,
+        "weekEndDate": week_end_date,
+        "weekStartAt": week_start_at,
+        "weekEndAt": end_iso,
+        "fiveHourPercent": None,
+        "capturedAt": "2026-05-14T18:00:00Z",
+    }
+    ns["maybe_record_milestone"](saved)
+
+    conn = ns["open_db"]()
+    try:
+        rows = conn.execute(
+            "SELECT percent_threshold, reset_event_id, alerted_at "
+            "FROM percent_milestones "
+            "WHERE week_start_date = ? AND percent_threshold = 3 "
+            "ORDER BY reset_event_id ASC",
+            (week_start_date,),
+        ).fetchall()
+        assert len(rows) == 2, rows
+        # Pre-credit row: alerted_at preserved.
+        assert rows[0]["reset_event_id"] == 0
+        assert rows[0]["alerted_at"] == pre_alerted_at
+        # Post-credit row: alerted_at stamped fresh (some recent ISO).
+        assert rows[1]["reset_event_id"] == evt_id
+        assert rows[1]["alerted_at"] is not None
+        assert rows[1]["alerted_at"] != pre_alerted_at
+    finally:
+        conn.close()
+
+
+def test_self_heal_probe_scoped_to_active_segment(ns):
+    """When the live record-usage path bails on dedup-no-insert, the
+    self-heal probe re-checks whether a milestone is owed. With a
+    credited week + pre-credit MAX=67 in segment 0, the post-credit
+    segment N has zero rows — a probe that didn't scope to the segment
+    would silently no-op even though the post-credit threshold-1 row
+    is owed.
+    """
+    end_iso = "2026-05-16T05:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = week_start_date + "T05:00:00+00:00"
+    effective = "2026-05-14T17:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        # Pre-credit milestones up to threshold 67.
+        for pct in (1, 2, 67):
+            conn.execute(
+                "INSERT INTO percent_milestones "
+                "(captured_at_utc, week_start_date, week_end_date, "
+                " week_start_at, week_end_at, percent_threshold, "
+                " cumulative_cost_usd, marginal_cost_usd, "
+                " usage_snapshot_id, cost_snapshot_id, reset_event_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("2026-05-12T10:00:00Z", week_start_date, week_end_date,
+                 week_start_at, end_iso, pct, 10.0 * pct, None, pct, pct, 0),
+            )
+        _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=effective,
+            old_week_end_at=end_iso,
+        )
+        _seed_cost_snapshot(
+            conn,
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            cost_usd=12.0,
+        )
+        # Latest snapshot at 1% (post-credit) — but NO milestone row yet
+        # in the post-credit segment. The live record-usage path will
+        # bail on the dedup since this matches an existing snapshot
+        # shape (one-row test setup); the self-heal probe must spot
+        # the missing milestone.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T18:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=1.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Drive record-usage with the SAME percent as the latest snapshot
+    # to trip the dedup path (forces self-heal to run).
+    end_at_epoch = _epoch(end_iso)
+    args = _record_usage_args(percent=1.0, resets_at=end_at_epoch)
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    # The post-credit segment should now have a threshold-1 row.
+    conn = ns["open_db"]()
+    try:
+        rows = conn.execute(
+            "SELECT percent_threshold, reset_event_id "
+            "FROM percent_milestones "
+            "WHERE week_start_date = ? "
+            "ORDER BY reset_event_id, percent_threshold",
+            (week_start_date,),
+        ).fetchall()
+        # Pre-credit 1, 2, 67 + post-credit 1 = 4 rows total.
+        assert len(rows) == 4, rows
+        post = [r for r in rows if r["reset_event_id"] != 0]
+        assert len(post) == 1
+        assert post[0]["percent_threshold"] == 1
+    finally:
+        conn.close()

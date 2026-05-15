@@ -1531,11 +1531,29 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                 )
                 need_milestone_heal = False
                 if latest_floor >= 1:
+                    # v1.7.2: scope the heal probe to the ACTIVE segment.
+                    # Without this, a credited week's MAX over the whole
+                    # ledger would still read the pre-credit ceiling
+                    # (e.g. 67%) and silently suppress the post-credit
+                    # ledger's heal even though it has zero rows.
+                    captured_at_for_probe = latest_row["captured_at_utc"]
+                    week_end_at_for_probe = latest_row["week_end_at"]
+                    heal_segment = 0
+                    if week_end_at_for_probe and captured_at_for_probe:
+                        seg = heal_conn.execute(
+                            "SELECT id FROM week_reset_events "
+                            "WHERE new_week_end_at = ? "
+                            "  AND unixepoch(effective_reset_at_utc) <= unixepoch(?) "
+                            "ORDER BY id DESC LIMIT 1",
+                            (week_end_at_for_probe, captured_at_for_probe),
+                        ).fetchone()
+                        if seg is not None:
+                            heal_segment = int(seg["id"])
                     max_existing = heal_conn.execute(
                         "SELECT MAX(percent_threshold) AS m "
                         "FROM percent_milestones "
-                        "WHERE week_start_date = ?",
-                        (week_start_date,),
+                        "WHERE week_start_date = ? AND reset_event_id = ?",
+                        (week_start_date, heal_segment),
                     ).fetchone()
                     if max_existing is None or max_existing["m"] is None:
                         need_milestone_heal = True
