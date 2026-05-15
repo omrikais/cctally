@@ -173,6 +173,52 @@ def test_bootstrap_rename_idempotent(cctally_module):
     assert all(n.startswith(("001_", "002_", "003_")) for n in names)
 
 
+def test_bootstrap_rename_idempotent_when_both_legacy_and_prefixed_exist(cctally_module):
+    """When BOTH the legacy unprefixed AND the prefixed marker rows
+    are present (a user briefly ran a framework build, then reverted
+    to a pre-framework binary that re-applied the legacy markers), a
+    plain ``UPDATE name = prefixed WHERE name = legacy`` would collide
+    on schema_migrations.PRIMARY KEY and abort the whole bootstrap,
+    permanently blocking the dispatcher from running ANY downstream
+    migration. The fix: DELETE the legacy row when its prefixed
+    counterpart already exists; keep the prefixed row (it carries the
+    dispatcher-managed applied_at_utc)."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+    )
+    # Both legacy and prefixed for ONE migration; pure legacy for another.
+    conn.executemany(
+        "INSERT INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
+        [
+            # Prefixed (dispatcher-managed, earlier date — authoritative).
+            ("001_five_hour_block_models_backfill_v1",   "2026-04-30T12:00:00Z"),
+            # Legacy duplicate of #1 written by a reverted pre-framework
+            # binary on a later date — colliding row.
+            ("five_hour_block_models_backfill_v1",       "2026-05-06T10:33:15Z"),
+            # Pure legacy for #2 — should be renamed in the normal path.
+            ("five_hour_block_projects_backfill_v1",     "2026-04-30T12:00:00Z"),
+        ],
+    )
+
+    # Pre-fix this raised sqlite3.IntegrityError; post-fix it returns clean.
+    cctally_module._bootstrap_rename_legacy_markers(conn, "stats.db")
+
+    rows = {r["name"]: r["applied_at_utc"]
+            for r in conn.execute(
+                "SELECT name, applied_at_utc FROM schema_migrations"
+            ).fetchall()}
+    # The duplicate-collision case: legacy DROPPED, prefixed PRESERVED
+    # with its own applied_at_utc (NOT overwritten by the legacy row's
+    # later timestamp).
+    assert "five_hour_block_models_backfill_v1" not in rows
+    assert rows["001_five_hour_block_models_backfill_v1"] == "2026-04-30T12:00:00Z"
+    # The pure-legacy case: renamed to prefixed (UPDATE path).
+    assert "five_hour_block_projects_backfill_v1" not in rows
+    assert "002_five_hour_block_projects_backfill_v1" in rows
+
+
 def test_bootstrap_rename_skips_cache_db(cctally_module):
     """Cache.db has no pre-framework markers; bootstrap is a no-op."""
     conn = sqlite3.connect(":memory:")

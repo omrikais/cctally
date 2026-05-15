@@ -28,6 +28,7 @@ def test_doctor_state_has_required_fields():
         "update_suppress", "update_suppress_error",
         "effective_update_available", "effective_update_reason",
         "now_utc", "cctally_version",
+        "forked_bucket_counts",
     }
     assert fields == expected, fields ^ expected
 
@@ -78,6 +79,8 @@ def _state(**overrides) -> L.DoctorState:
         cache_entries_count=1_000,
         cache_last_entry_at=dt.datetime(2026, 5, 13, 14, 22, 27, tzinfo=dt.timezone.utc),
         claude_jsonl_present=True,
+        # Happy path: stats.db is clean — no forked-bucket rows.
+        forked_bucket_counts={"usage": 0, "cost": 0, "milestones": 0},
         codex_entries_count=0,
         codex_last_entry_at=None,
         codex_jsonl_present=False,
@@ -366,6 +369,36 @@ def test_data_codex_cache_present_ok():
     s = _state(codex_entries_count=10, codex_last_entry_at=_ts(60), codex_jsonl_present=True)
     r = L._check_data_codex_cache(s)
     assert r.severity == "ok"
+
+
+def test_data_forked_buckets_all_zero_ok():
+    r = L._check_data_forked_buckets(_state())
+    assert r.severity == "ok"
+    assert r.summary == "none"
+    assert r.id == "data.forked_buckets"
+
+
+def test_data_forked_buckets_nonzero_fail():
+    """One forked usage row + one forked cost row → fail with both
+    surfaced in the summary."""
+    s = _state(forked_bucket_counts={"usage": 2, "cost": 1, "milestones": 0})
+    r = L._check_data_forked_buckets(s)
+    assert r.severity == "fail"
+    assert "2 usage" in r.summary
+    assert "1 cost" in r.summary
+    # milestones=0 is omitted from the summary, kept in details.
+    assert "milestones" not in r.summary
+    assert r.details == {"usage": 2, "cost": 1, "milestones": 0}
+    assert "004_heal_forked_week_start_date_buckets" in (r.remediation or "")
+
+
+def test_data_forked_buckets_none_state_fail():
+    """When stats.db couldn't be opened to gather, surface as fail
+    rather than silently passing."""
+    s = _state(forked_bucket_counts=None)
+    r = L._check_data_forked_buckets(s)
+    assert r.severity == "fail"
+    assert "state unavailable" in r.summary
 
 
 def test_safety_dashboard_bind_loopback_ok():

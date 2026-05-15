@@ -9887,19 +9887,43 @@ def doctor_gather_state(
 
     # ── Data freshness ───────────────────────────────────────────────
     latest_snapshot_at = None
+    forked_bucket_counts: dict | None = None
     try:
         if DB_PATH.exists():
             conn = sqlite3.connect(str(DB_PATH))
             try:
-                row = conn.execute(
-                    "SELECT MAX(captured_at_utc) FROM weekly_usage_snapshots"
-                ).fetchone()
-                if row and row[0]:
-                    latest_snapshot_at = parse_iso_datetime(
-                        row[0], "weekly_usage_snapshots.captured_at_utc",
-                    ).astimezone(dt.timezone.utc)
-            except sqlite3.OperationalError:
-                pass  # table missing — treat as no snapshots yet
+                try:
+                    row = conn.execute(
+                        "SELECT MAX(captured_at_utc) FROM weekly_usage_snapshots"
+                    ).fetchone()
+                    if row and row[0]:
+                        latest_snapshot_at = parse_iso_datetime(
+                            row[0], "weekly_usage_snapshots.captured_at_utc",
+                        ).astimezone(dt.timezone.utc)
+                except sqlite3.OperationalError:
+                    pass  # table missing — treat as no snapshots yet
+                # Forked-bucket invariant probe. Each fork count is
+                # a raw SELECT against the already-open connection —
+                # no bonus open_db() recursion. Tables missing →
+                # count 0 (legacy DBs without one of these tables
+                # are intact by definition for that table).
+                forked_bucket_counts = {}
+                for table, key in (
+                    ("weekly_usage_snapshots", "usage"),
+                    ("weekly_cost_snapshots", "cost"),
+                    ("percent_milestones", "milestones"),
+                ):
+                    try:
+                        row = conn.execute(
+                            f"SELECT COUNT(*) FROM {table} "
+                            f" WHERE week_start_at IS NOT NULL "
+                            f"   AND week_start_date != substr(week_start_at, 1, 10)"
+                        ).fetchone()
+                        forked_bucket_counts[key] = (
+                            int(row[0]) if row and row[0] else 0
+                        )
+                    except sqlite3.OperationalError:
+                        forked_bucket_counts[key] = 0
             finally:
                 conn.close()
     except Exception:
@@ -10044,6 +10068,7 @@ def doctor_gather_state(
         cache_entries_count=cache_entries_count,
         cache_last_entry_at=cache_last_entry_at,
         claude_jsonl_present=claude_jsonl_present,
+        forked_bucket_counts=forked_bucket_counts,
         codex_entries_count=codex_entries_count,
         codex_last_entry_at=codex_last_entry_at,
         codex_jsonl_present=codex_jsonl_present,

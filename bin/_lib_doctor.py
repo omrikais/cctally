@@ -49,6 +49,17 @@ class DoctorState:
     cache_entries_count: Optional[int]
     cache_last_entry_at: Optional[dt.datetime]
     claude_jsonl_present: bool
+    # Forked-bucket invariant counts (data.forked_buckets check).
+    # Keys: "usage", "cost", "milestones" — each maps to the count of
+    # rows in the respective table where ``week_start_at IS NOT NULL``
+    # AND ``week_start_date != substr(week_start_at, 1, 10)``. None
+    # means the stats.db couldn't be opened to check; the migration
+    # ``004_heal_forked_week_start_date_buckets`` auto-merges any
+    # detected rows on the next ``open_db()``, so a non-zero count
+    # here indicates either (a) the migration is gated as
+    # skipped/failed/pending or (b) a buggy writer slipped through
+    # after the migration ran.
+    forked_bucket_counts: Optional[dict]
     codex_entries_count: Optional[int]
     codex_last_entry_at: Optional[dt.datetime]
     codex_jsonl_present: bool
@@ -502,6 +513,52 @@ def _check_data_codex_cache(s: DoctorState) -> CheckResult:
     )
 
 
+def _check_data_forked_buckets(s: DoctorState) -> CheckResult:
+    """Invariant: for every row with ``week_start_at IS NOT NULL``,
+    ``week_start_date == substr(week_start_at, 1, 10)``.
+
+    Pair with migration ``004_heal_forked_week_start_date_buckets``,
+    which auto-merges any detected rows on the next ``open_db()``. A
+    non-zero count here means either (a) the migration is gated as
+    skipped/failed/pending or (b) a buggy writer slipped through
+    after the migration ran. Either way the user has a fork that
+    needs attention.
+    """
+    counts = s.forked_bucket_counts
+    if counts is None:
+        return CheckResult(
+            id="data.forked_buckets", title="Forked week buckets",
+            severity="fail", summary="state unavailable",
+            remediation="Check stats.db opens (`cctally db status`)",
+            details={"reason": "gather returned None"},
+        )
+    total = sum(int(counts.get(k, 0)) for k in ("usage", "cost", "milestones"))
+    if total == 0:
+        return CheckResult(
+            id="data.forked_buckets", title="Forked week buckets",
+            severity="ok", summary="none",
+            remediation=None,
+            details=dict(counts),
+        )
+    parts = [
+        f"{counts.get(k, 0)} {k}"
+        for k in ("usage", "cost", "milestones")
+        if counts.get(k, 0)
+    ]
+    return CheckResult(
+        id="data.forked_buckets", title="Forked week buckets",
+        severity="fail",
+        summary=f"{total} forked row(s): {', '.join(parts)}",
+        remediation=(
+            "Run any cctally command to trigger the auto-heal migration "
+            "(`004_heal_forked_week_start_date_buckets`); if it's already "
+            "applied, see `cctally db status`."
+        ),
+        details=dict(counts),
+    )
+
+
+
 _LOOPBACK_HOSTS = frozenset({"loopback", "127.0.0.1", "::1", "localhost"})
 
 
@@ -728,6 +785,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("data.latest_snapshot_age", "_check_data_latest_snapshot_age"),
         ("data.cache_sync_state", "_check_data_cache_sync_state"),
         ("data.codex_cache", "_check_data_codex_cache"),
+        ("data.forked_buckets", "_check_data_forked_buckets"),
     )),
     ("safety", "Safety", (
         ("safety.dashboard_bind", "_check_safety_dashboard_bind"),

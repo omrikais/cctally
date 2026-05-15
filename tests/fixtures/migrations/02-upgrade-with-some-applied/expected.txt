@@ -1,9 +1,10 @@
 ## stdout
-stats.db (<HOME>/.local/share/cctally/stats.db)  version 4 / 4 known
+stats.db (<HOME>/.local/share/cctally/stats.db)  version 5 / 5 known
   ✓ 001_five_hour_block_models_backfill_v1         applied <REDACTED>
   ✓ 002_five_hour_block_projects_backfill_v1       applied <REDACTED>
   ✓ 003_merge_5h_block_duplicates_v1               applied <REDACTED>
-  ✓ 004_test_failure_injection                     applied <REDACTED>
+  ✓ 004_heal_forked_week_start_date_buckets        applied <REDACTED>
+  ✓ 005_test_failure_injection                     applied <REDACTED>
 
 cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 1 known
   · 001_test_cache_migration                       pending
@@ -13,12 +14,13 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 1 known
 0
 ## state
 stats.db:
-  user_version: 4
+  user_version: 5
   schema_migrations:
     001_five_hour_block_models_backfill_v1
     002_five_hour_block_projects_backfill_v1
     003_merge_5h_block_duplicates_v1
-    004_test_failure_injection
+    004_heal_forked_week_start_date_buckets
+    005_test_failure_injection
   schema_migrations_skipped:
 cache.db:
   user_version: 0

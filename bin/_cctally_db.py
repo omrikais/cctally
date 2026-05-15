@@ -268,11 +268,33 @@ def _bootstrap_rename_legacy_markers(conn: sqlite3.Connection, db_label: str) ->
 
     Idempotent on subsequent opens: the UPDATEs find nothing to rename
     and the log clears find nothing to drop.
+
+    Idempotent against the duplicate-marker case too: if BOTH the
+    legacy (``old``) and the prefixed (``new``) rows already exist
+    (e.g., a user briefly ran a dev build that prefixed the markers,
+    then reverted to a pre-framework binary that re-applied the legacy
+    unprefixed markers), the UPDATE would collide on the schema_migrations
+    PRIMARY KEY (``name``) — observed in the wild as a recurring
+    ``UNIQUE constraint failed: schema_migrations.name`` failure that
+    permanently blocked the dispatcher from running ANY downstream
+    migration. Resolution: DELETE the legacy row first when its
+    prefixed counterpart already exists, then UPDATE the rest. The
+    prefixed row wins because it carries the dispatcher-managed
+    applied_at_utc that newer code reads for sequencing decisions.
     """
     aliases = _LEGACY_MARKER_ALIASES_BY_DB.get(db_label, {})
     if not aliases:
         return
     for old, new in aliases.items():
+        # If the prefixed marker is already present, drop the legacy
+        # duplicate (UPDATE would collide on PRIMARY KEY); keep the
+        # prefixed row's applied_at_utc as authoritative.
+        conn.execute(
+            "DELETE FROM schema_migrations "
+            " WHERE name = ? "
+            "   AND EXISTS (SELECT 1 FROM schema_migrations WHERE name = ?)",
+            (old, new),
+        )
         conn.execute(
             "UPDATE schema_migrations SET name = ? WHERE name = ?",
             (new, old),
@@ -333,6 +355,16 @@ def _run_pending_migrations(
                 "CREATE TABLE IF NOT EXISTS schema_migrations "
                 "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
             )
+        # Clear stale bootstrap-rename failure entries. If user_version
+        # reached len(registry), every migration is applied OR skipped
+        # — by definition no pending failure remains. Any persisted
+        # bootstrap-rename entry in the error log is from a PRIOR
+        # buggy bootstrap (now repaired) and is stale; clear it so the
+        # banner stops rendering. Cheap no-op when the log file
+        # doesn't exist or doesn't contain a matching entry.
+        _clear_migration_error_log_entries(
+            f"{db_label}:_bootstrap_rename_legacy_markers"
+        )
         return  # fast path
 
     # Track whether schema_migrations existed before this open so we can
@@ -369,6 +401,15 @@ def _run_pending_migrations(
         conn.execute("BEGIN")
         _bootstrap_rename_legacy_markers(conn, db_label)
         conn.commit()
+        # On success, clear any persisted error from a PRIOR bootstrap-rename
+        # failure (e.g., the duplicate-marker UNIQUE collision that was
+        # observed in the wild and is now repaired by the DELETE-before-UPDATE
+        # in _bootstrap_rename_legacy_markers). Without this clear, the
+        # banner from the prior failed run would persist forever after the
+        # repair, even though the dispatcher now completes cleanly.
+        _clear_migration_error_log_entries(
+            f"{db_label}:_bootstrap_rename_legacy_markers"
+        )
     except Exception as exc:
         try:
             conn.rollback()
@@ -1144,6 +1185,148 @@ def _migration_merge_5h_block_duplicates_v1(conn: sqlite3.Connection) -> None:
         conn.rollback()
         raise
 
+
+# === Region 7b: 004 handler — self-heal forked week_start_date buckets ===
+
+@stats_migration("004_heal_forked_week_start_date_buckets")
+def _migration_heal_forked_week_start_date_buckets(conn: sqlite3.Connection) -> None:
+    """One-shot self-heal: merge rows whose ``week_start_date`` was forked
+    by a host-TZ contamination at insert time (pre-fix
+    ``_derive_week_from_payload`` / ``pick_week_selection`` took ``.date()``
+    of a host-local-TZ datetime instead of the canonical UTC ISO).
+
+    Defense-in-depth pairing with commit ``6def75f8`` (UTC-anchor the
+    bucket-key date at the writer). The writer fix prevents NEW ghost
+    rows on the FIXED binary, but a still-deployed older binary (e.g.,
+    npm v1.7.0 on the user's machine) can keep writing ghosts every
+    time the host process inherits a non-UTC ``TZ``. This migration
+    auto-merges any such ghost rows on the next ``open_db()``, so the
+    in-place corruption gets cleaned up regardless of which binary
+    happened to write it.
+
+    Invariant: for every row with ``week_start_at IS NOT NULL``,
+    ``week_start_date`` MUST equal ``substr(week_start_at, 1, 10)`` (the
+    canonical UTC calendar day of the subscription-week boundary).
+
+    Per-table action when the invariant is violated:
+
+      * ``weekly_usage_snapshots`` / ``weekly_cost_snapshots`` — no
+        UNIQUE constraint on ``(week_start_date, ...)``, so simply
+        UPDATE both date columns to ``substr(week_start_at, 1, 10)`` /
+        ``substr(week_end_at, 1, 10)``. The ghost rows merge into the
+        canonical bucket as additional samples on the same physical
+        week.
+
+      * ``percent_milestones`` — UNIQUE(week_start_date,
+        percent_threshold). For each ghost row: if a canonical-keyed
+        row at the same threshold already exists, DELETE the ghost
+        (canonical preserves the original alerted_at and the genuine
+        crossing's cumulative cost). Otherwise UPDATE.
+
+    Idempotent: a second invocation finds zero forked rows and is a
+    no-op. Forward-only — never regresses canonical rows. Reads no
+    external state (no ``cache.db`` open, no JSONL walk).
+
+    Empty-table fast path: when none of the three tables has a forked
+    row, INSERT the marker and return without opening a transaction.
+
+    Spec hook: paired regression test in
+    ``tests/test_heal_forked_week_start_date_buckets.py``.
+    """
+    # Empty-fork fast path. UNION ALL across the three tables; one
+    # SELECT 1 / LIMIT 1 short-circuits on the first violator. When
+    # zero rows are forked, skip the BEGIN/UPDATE block entirely and
+    # just stamp the marker.
+    has_fork_row = conn.execute(
+        """
+        SELECT 1 FROM (
+          SELECT 1 FROM weekly_usage_snapshots
+           WHERE week_start_at IS NOT NULL
+             AND week_start_date != substr(week_start_at, 1, 10)
+          UNION ALL
+          SELECT 1 FROM weekly_cost_snapshots
+           WHERE week_start_at IS NOT NULL
+             AND week_start_date != substr(week_start_at, 1, 10)
+          UNION ALL
+          SELECT 1 FROM percent_milestones
+           WHERE week_start_at IS NOT NULL
+             AND week_start_date != substr(week_start_at, 1, 10)
+        ) LIMIT 1
+        """
+    ).fetchone()
+    if not has_fork_row:
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
+            "VALUES (?, ?)",
+            ("004_heal_forked_week_start_date_buckets", now_utc_iso()),
+        )
+        conn.commit()
+        return
+
+    conn.execute("BEGIN")
+    try:
+        # (a) weekly_usage_snapshots — no UNIQUE; straight UPDATE.
+        conn.execute(
+            """
+            UPDATE weekly_usage_snapshots
+               SET week_start_date = substr(week_start_at, 1, 10),
+                   week_end_date   = substr(week_end_at,   1, 10)
+             WHERE week_start_at IS NOT NULL
+               AND week_start_date != substr(week_start_at, 1, 10)
+            """
+        )
+
+        # (b) weekly_cost_snapshots — same.
+        conn.execute(
+            """
+            UPDATE weekly_cost_snapshots
+               SET week_start_date = substr(week_start_at, 1, 10),
+                   week_end_date   = substr(week_end_at,   1, 10)
+             WHERE week_start_at IS NOT NULL
+               AND week_start_date != substr(week_start_at, 1, 10)
+            """
+        )
+
+        # (c) percent_milestones — UNIQUE(week_start_date,
+        # percent_threshold). DELETE ghosts whose canonical-keyed
+        # counterpart already exists at the same threshold BEFORE
+        # UPDATEing the rest, otherwise the UPDATE collides on UNIQUE
+        # and rolls back the migration.
+        conn.execute(
+            """
+            DELETE FROM percent_milestones
+             WHERE week_start_at IS NOT NULL
+               AND week_start_date != substr(week_start_at, 1, 10)
+               AND EXISTS (
+                     SELECT 1 FROM percent_milestones canon
+                      WHERE canon.week_start_date
+                            = substr(percent_milestones.week_start_at, 1, 10)
+                        AND canon.percent_threshold
+                            = percent_milestones.percent_threshold
+                   )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE percent_milestones
+               SET week_start_date = substr(week_start_at, 1, 10),
+                   week_end_date   = substr(week_end_at,   1, 10)
+             WHERE week_start_at IS NOT NULL
+               AND week_start_date != substr(week_start_at, 1, 10)
+            """
+        )
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc)
+            VALUES (?, ?)
+            """,
+            ("004_heal_forked_week_start_date_buckets", now_utc_iso()),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 # === Region 8: Test-only migration registration (was bin/cctally:12086-12140) ===

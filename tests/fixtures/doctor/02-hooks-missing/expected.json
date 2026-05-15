@@ -122,12 +122,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/stats.db",
-                        "registry_size": 3,
+                        "registry_size": 4,
                         "user_version": 0
                     },
                     "id": "db.stats.file",
                     "severity": "ok",
-                    "summary": "version 0 / 3 known",
+                    "summary": "version 0 / 4 known",
                     "title": "stats.db"
                 },
                 {
@@ -154,7 +154,8 @@
                                 "pending": [
                                     "001_five_hour_block_models_backfill_v1",
                                     "002_five_hour_block_projects_backfill_v1",
-                                    "003_merge_5h_block_duplicates_v1"
+                                    "003_merge_5h_block_duplicates_v1",
+                                    "004_heal_forked_week_start_date_buckets"
                                 ],
                                 "skipped": []
                             }
@@ -162,7 +163,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/3 applied",
+                    "summary": "0/4 applied",
                     "title": "Migrations"
                 },
                 {
@@ -179,13 +180,17 @@
                             [
                                 "stats.db",
                                 "003_merge_5h_block_duplicates_v1"
+                            ],
+                            [
+                                "stats.db",
+                                "004_heal_forked_week_start_date_buckets"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "3 pending",
+                    "summary": "4 pending",
                     "title": "Pending migrations"
                 }
             ],
@@ -224,6 +229,17 @@
                     "severity": "ok",
                     "summary": "none (no ~/.codex/sessions/)",
                     "title": "Codex cache"
+                },
+                {
+                    "details": {
+                        "cost": 0,
+                        "milestones": 0,
+                        "usage": 0
+                    },
+                    "id": "data.forked_buckets",
+                    "severity": "ok",
+                    "summary": "none",
+                    "title": "Forked week buckets"
                 }
             ],
             "id": "data",
@@ -288,7 +304,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 13,
+            "ok": 14,
             "warn": 7
         },
         "severity": "warn"

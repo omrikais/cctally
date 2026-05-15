@@ -15,15 +15,16 @@ Hooks
 Auth
   ✓ OAuth token              present
 Database
-  ✓ stats.db                 version 0 / 3 known
+  ✓ stats.db                 version 0 / 4 known
   ⚠ cache.db                 absent (fresh install)
-  ✓ Migrations               0/3 applied
-  ⚠ Pending migrations       3 pending
+  ✓ Migrations               0/4 applied
+  ⚠ Pending migrations       4 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
   ✓ Latest snapshot          2s ago
   ✓ Claude cache             0 entries (no JSONL corpus)
   ✓ Codex cache              none (no ~/.codex/sessions/)
+  ✓ Forked week buckets      none
 Safety
   ✓ Dashboard bind           config: loopback
   ✗ config.json              unreadable: JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
@@ -33,4 +34,4 @@ Safety
   ✓ update-suppress.json     parses cleanly
   ✓ Update available         no
 
-Summary: 13 OK · 6 WARN · 1 FAIL
+Summary: 14 OK · 6 WARN · 1 FAIL

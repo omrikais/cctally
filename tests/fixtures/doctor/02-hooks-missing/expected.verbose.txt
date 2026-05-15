@@ -30,21 +30,21 @@ Hooks
 Auth
   ✓ OAuth token              present
 Database
-  ✓ stats.db                 version 0 / 3 known
+  ✓ stats.db                 version 0 / 4 known
       details:
         path: $HOME/.local/share/cctally/stats.db
         user_version: 0
-        registry_size: 3
+        registry_size: 4
   ⚠ cache.db                 absent (fresh install)
       details:
         path: $HOME/.local/share/cctally/cache.db
-  ✓ Migrations               0/3 applied
+  ✓ Migrations               0/4 applied
       details:
-        by_db: {'stats.db': {'applied': [], 'skipped': [], 'pending': ['001_five_hour_block_models_backfill_v1', '002_five_hour_block_projects_backfill_v1', '003_merge_5h_block_duplicates_v1'], 'failed': []}, 'cache.db': {'applied': [], 'skipped': [], 'pending': [], 'failed': []}}
-  ⚠ Pending migrations       3 pending
+        by_db: {'stats.db': {'applied': [], 'skipped': [], 'pending': ['001_five_hour_block_models_backfill_v1', '002_five_hour_block_projects_backfill_v1', '003_merge_5h_block_duplicates_v1', '004_heal_forked_week_start_date_buckets'], 'failed': []}, 'cache.db': {'applied': [], 'skipped': [], 'pending': [], 'failed': []}}
+  ⚠ Pending migrations       4 pending
       → Run any cctally command — opens the DB and applies pending migrations
       details:
-        pending: [('stats.db', '001_five_hour_block_models_backfill_v1'), ('stats.db', '002_five_hour_block_projects_backfill_v1'), ('stats.db', '003_merge_5h_block_duplicates_v1')]
+        pending: [('stats.db', '001_five_hour_block_models_backfill_v1'), ('stats.db', '002_five_hour_block_projects_backfill_v1'), ('stats.db', '003_merge_5h_block_duplicates_v1'), ('stats.db', '004_heal_forked_week_start_date_buckets')]
 Data
   ✓ Latest snapshot          2s ago
       details:
@@ -58,6 +58,11 @@ Data
       details:
         entries: 0
         codex_jsonl_present: False
+  ✓ Forked week buckets      none
+      details:
+        usage: 0
+        cost: 0
+        milestones: 0
 Safety
   ✓ Dashboard bind           config: loopback
       details:
@@ -75,4 +80,4 @@ Safety
         current_version: None
         latest_version: None
 
-Summary: 13 OK · 7 WARN · 0 FAIL
+Summary: 14 OK · 7 WARN · 0 FAIL

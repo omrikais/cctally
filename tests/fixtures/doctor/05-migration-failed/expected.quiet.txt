@@ -13,11 +13,11 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
-  ⚠ Pending migrations       2 pending
+  ⚠ Pending migrations       3 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
 Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
 
-Summary: 13 OK · 6 WARN · 1 FAIL
+Summary: 14 OK · 6 WARN · 1 FAIL
