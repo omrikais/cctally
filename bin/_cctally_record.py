@@ -372,6 +372,44 @@ def _normalize_percent(value: "float | int | None") -> "float | None":
     return round(float(value), _PERCENT_NORMALIZE_DECIMALS)
 
 
+def _resolve_active_five_hour_reset_event_id(
+    conn: "sqlite3.Connection",
+    five_hour_window_key: int,
+) -> int:
+    """Return ``id`` of the most-recent ``five_hour_reset_events`` row for
+    ``five_hour_window_key``, else 0 (pre-credit / no-event sentinel).
+
+    Mirrors the weekly active-segment resolution pattern used by
+    ``maybe_record_milestone`` for ``percent_milestones.reset_event_id``.
+    Called once per ``maybe_update_five_hour_block`` invocation and the
+    return value is threaded through every read/write site that keys on
+    ``(five_hour_window_key, percent_threshold)`` so post-credit threshold
+    crossings land as a distinct row from any pre-credit one at the same
+    threshold. See spec
+    docs/superpowers/specs/2026-05-16-5h-in-place-credit-detection.md §3.3.
+
+    Returns ``0`` when:
+      - The window has no ``five_hour_reset_events`` row (most blocks).
+      - The table doesn't exist yet (DB predates this feature).
+
+    Returns the largest ``id`` matching the window otherwise; the read uses
+    ``ORDER BY id DESC LIMIT 1`` so it survives the rare stacked-credit case
+    (spec §2.3 — multiple events across distinct 10-min slots).
+    """
+    try:
+        row = conn.execute(
+            "SELECT id FROM five_hour_reset_events "
+            "WHERE five_hour_window_key = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (int(five_hour_window_key),),
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        return 0
+    if row is None:
+        return 0
+    return int(row["id"])
+
+
 def maybe_record_milestone(
     saved: dict[str, Any],
 ) -> None:
@@ -963,7 +1001,23 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
             # Snap-up-by-1e-9 per the gotcha: 0.50 * 100 == 49.99...9 in
             # IEEE-754, so bare math.floor would miss the 50 threshold.
             current_floor = math.floor(float(five_hour_percent) + 1e-9)
+
+            # Resolve active segment ONCE so every per-site read + write
+            # below sees the same value within this transaction. Spec
+            # §3.3 & §3.4 of
+            # docs/superpowers/specs/2026-05-16-5h-in-place-credit-detection.md:
+            # the active segment is the latest five_hour_reset_events row
+            # for this window_key, else sentinel 0 (pre-credit).
+            active_reset_event_id = _resolve_active_five_hour_reset_event_id(
+                conn, int(five_hour_window_key)
+            )
+
             if current_floor >= 1:
+                # Site A — MAX(percent_threshold) scoped to active segment.
+                # Without the reset_event_id filter, MAX returns the
+                # pre-credit max and post-credit milestones from 1..max
+                # are silently never emitted.
+                #
                 # Use max(percent_threshold) directly (not prior block's
                 # final_pct) so first-observation already-mid-stream doesn't
                 # synthesize crossings 1..(current_floor - 1) we never had
@@ -971,8 +1025,8 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                 # maybe_record_milestone's max_existing path.
                 row = conn.execute(
                     "SELECT MAX(percent_threshold) AS m FROM five_hour_milestones "
-                    "WHERE five_hour_window_key = ?",
-                    (int(five_hour_window_key),),
+                    "WHERE five_hour_window_key = ? AND reset_event_id = ?",
+                    (int(five_hour_window_key), active_reset_event_id),
                 ).fetchone()
                 max_existing = row["m"] if row and row["m"] is not None else None
 
@@ -985,14 +1039,21 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                     # block_id was resolved above (before the children writes) and
                     # is still in scope here.
 
+                    # Site B — prior-cost lookup scoped to active segment.
                     # Marginal-cost lookup for the start_threshold milestone
                     # (only when there's a prior milestone in this block).
+                    # Without the reset_event_id filter, marginal could be
+                    # computed against a pre-credit row whose block_cost is
+                    # unrelated to the post-credit segment's totals.
                     prior_cost: float | None = None
                     if max_existing is not None:
                         prev_row = conn.execute(
                             "SELECT block_cost_usd FROM five_hour_milestones "
-                            "WHERE five_hour_window_key = ? AND percent_threshold = ?",
-                            (int(five_hour_window_key), int(max_existing)),
+                            "WHERE five_hour_window_key = ? "
+                            "  AND percent_threshold = ? "
+                            "  AND reset_event_id = ?",
+                            (int(five_hour_window_key), int(max_existing),
+                             active_reset_event_id),
                         ).fetchone()
                         if prev_row is not None:
                             prior_cost = float(prev_row["block_cost_usd"])
@@ -1002,6 +1063,12 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                             marginal: float | None = totals["cost_usd"] - prior_cost
                         else:
                             marginal = None
+                        # Site C — INSERT stamps the resolved
+                        # ``active_reset_event_id`` (0 = pre-credit, else
+                        # the latest five_hour_reset_events.id). UNIQUE
+                        # is now (window_key, threshold, reset_event_id)
+                        # so post-credit threshold crossings re-fire
+                        # fresh — not absorbed into the pre-credit row.
                         cur = conn.execute(
                             """
                             INSERT OR IGNORE INTO five_hour_milestones (
@@ -1016,9 +1083,10 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                               block_cache_read_tokens,
                               block_cost_usd,
                               marginal_cost_usd,
-                              seven_day_pct_at_crossing
+                              seven_day_pct_at_crossing,
+                              reset_event_id
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 block_id,
@@ -1033,6 +1101,7 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                                 totals["cost_usd"],
                                 marginal,
                                 weekly_percent,
+                                active_reset_event_id,
                             ),
                         )
                         # ── Threshold-actions dispatch (set-then-dispatch, spec §3.2) ──
@@ -1061,11 +1130,19 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                             and pct in alerts_cfg["five_hour_thresholds"]
                         ):
                             crossed_at = now_utc_iso()
+                            # Site D — alerted_at UPDATE scoped to the
+                            # active segment, so the post-credit row
+                            # gets stamped without overwriting an
+                            # already-alerted pre-credit row at the
+                            # same threshold.
                             conn.execute(
                                 "UPDATE five_hour_milestones SET alerted_at = ? "
-                                "WHERE five_hour_window_key = ? AND percent_threshold = ? "
-                                "AND alerted_at IS NULL",
-                                (crossed_at, int(five_hour_window_key), int(pct)),
+                                "WHERE five_hour_window_key = ? "
+                                "  AND percent_threshold = ? "
+                                "  AND reset_event_id = ? "
+                                "  AND alerted_at IS NULL",
+                                (crossed_at, int(five_hour_window_key),
+                                 int(pct), active_reset_event_id),
                             )
                             # Cheap re-reads inside BEGIN are SELECT-only and
                             # safe; values reflect post-INSERT state. We
@@ -1073,10 +1150,17 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                             # are in scope) and defer ONLY the Popen-side
                             # _dispatch_alert_notification to after the outer
                             # commit.
+                            # Site E — alert-payload reread scoped to
+                            # the active segment so the dispatch shows
+                            # post-credit cost, not the pre-credit
+                            # row's stale value at the same threshold.
                             cost_row = conn.execute(
                                 "SELECT block_cost_usd FROM five_hour_milestones "
-                                "WHERE five_hour_window_key = ? AND percent_threshold = ?",
-                                (int(five_hour_window_key), int(pct)),
+                                "WHERE five_hour_window_key = ? "
+                                "  AND percent_threshold = ? "
+                                "  AND reset_event_id = ?",
+                                (int(five_hour_window_key), int(pct),
+                                 active_reset_event_id),
                             ).fetchone()
                             block_row = conn.execute(
                                 "SELECT block_start_at FROM five_hour_blocks "
@@ -1471,6 +1555,172 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                                     "[record-usage] post-credit cleanup "
                                     f"failed: {exc}"
                                 )
+
+            # ── 5h in-place credit detection (parallel to weekly above) ──
+            # Spec §2.2 of
+            # docs/superpowers/specs/2026-05-16-5h-in-place-credit-detection.md.
+            # Slot SECOND so the weekly branch retains control-flow
+            # priority — both branches are independent (they touch
+            # different tables) and the order has no behavioral
+            # interaction. Same outer try/except wraps both so a
+            # 5h-detection failure logs but does not regress the rest
+            # of cmd_record_usage.
+            #
+            # Diverges from weekly in three places:
+            #   - Threshold: 5.0pp (constant on cctally module), not 25.0pp.
+            #     The 5h envelope is smaller so a 5pp move is
+            #     proportionally larger.
+            #   - Effective-iso floor: 10-min (matches
+            #     ``_canonical_5h_window_key``'s 600s floor), not hour.
+            #     Up to ~30 distinct slots per 5h block; same-slot
+            #     collisions absorbed by UNIQUE per spec §2.3.
+            #   - Pre-check: compares latest event's ``post_percent``
+            #     against this tick's prior_5h_pct, not ``new_week_end_at``
+            #     equality. A second NEW credit later in the block
+            #     has prior_5h_pct > previous event's post_percent so
+            #     the INSERT lands; a re-observation of the same credit
+            #     has prior_5h_pct == post_percent and is skipped.
+            try:
+                if (
+                    five_hour_window_key is not None
+                    and five_hour_percent is not None
+                ):
+                    prior_5h_row = conn.execute(
+                        "SELECT five_hour_window_key, five_hour_percent, "
+                        "       five_hour_resets_at "
+                        "  FROM weekly_usage_snapshots "
+                        " WHERE five_hour_window_key IS NOT NULL "
+                        "   AND five_hour_percent IS NOT NULL "
+                        " ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+                    ).fetchone()
+                    if (
+                        prior_5h_row is not None
+                        and int(prior_5h_row["five_hour_window_key"])
+                            == int(five_hour_window_key)
+                        and prior_5h_row["five_hour_resets_at"] is not None
+                    ):
+                        prior_5h_pct = float(prior_5h_row["five_hour_percent"])
+                        prior_5h_resets_dt = parse_iso_datetime(
+                            prior_5h_row["five_hour_resets_at"],
+                            "prior.five_hour_resets_at",
+                        )
+                        # ``now_utc`` was bound at the top of the outer
+                        # try (line ~1341) from
+                        # ``dt.datetime.now(dt.timezone.utc)``; reuse it
+                        # so both branches see the same instant.
+                        if (
+                            prior_5h_resets_dt > now_utc
+                            and (prior_5h_pct - float(five_hour_percent))
+                                >= c._FIVE_HOUR_RESET_PCT_DROP_THRESHOLD
+                        ):
+                            # Post_percent-aware pre-check (spec §2.2,
+                            # Codex r1 finding 4): only skip when the
+                            # most-recent event for THIS window already
+                            # records exactly this drop (the same credit
+                            # re-observed, prior_5h_pct equals the
+                            # stored post_percent — a stale-replica or
+                            # delayed-tick replay).
+                            most_recent = conn.execute(
+                                "SELECT post_percent FROM five_hour_reset_events "
+                                " WHERE five_hour_window_key = ? "
+                                " ORDER BY id DESC LIMIT 1",
+                                (int(five_hour_window_key),),
+                            ).fetchone()
+                            is_dup = (
+                                most_recent is not None
+                                and round(prior_5h_pct, 1)
+                                == round(float(most_recent["post_percent"]), 1)
+                            )
+                            if not is_dup:
+                                # 10-min floor (spec §2.3 — bounded
+                                # stacked-credit resolution; one event
+                                # per 10-min slot per block).
+                                # ``_floor_to_ten_minutes`` is a cctally
+                                # module attribute; the c.X accessor
+                                # resolves at call time so test
+                                # ``monkeypatch.setitem(ns,
+                                # "_floor_to_ten_minutes", …)``
+                                # propagates.
+                                effective_dt = c._floor_to_ten_minutes(now_utc)
+                                effective_iso = effective_dt.isoformat(
+                                    timespec="seconds"
+                                )
+                                cur5h = conn.execute(
+                                    "INSERT OR IGNORE INTO five_hour_reset_events "
+                                    "(detected_at_utc, five_hour_window_key, "
+                                    " prior_percent, post_percent, "
+                                    " effective_reset_at_utc) "
+                                    "VALUES (?, ?, ?, ?, ?)",
+                                    (
+                                        now_utc_iso(),
+                                        int(five_hour_window_key),
+                                        prior_5h_pct,
+                                        float(five_hour_percent),
+                                        effective_iso,
+                                    ),
+                                )
+                                conn.commit()
+                                # Only fire the pivots (HWM force-write
+                                # + stale-replica DELETE) when this
+                                # tick won the race (rowcount == 1).
+                                # Concurrent writers in the same 10-min
+                                # slot get rowcount == 0 from UNIQUE
+                                # and skip both pivots — the winning
+                                # writer's pivots cover them.
+                                if cur5h.rowcount == 1:
+                                    # Force-write hwm-5h: bypasses the
+                                    # monotonic guard at the normal
+                                    # writer (line ~1722). Lands AFTER
+                                    # ``conn.commit()`` so a concurrent
+                                    # reader doesn't see the new HWM
+                                    # before the event row is durable.
+                                    # File format matches the canonical
+                                    # writer: ``<key> <percent>\n``.
+                                    try:
+                                        (c.APP_DIR / "hwm-5h").write_text(
+                                            f"{int(five_hour_window_key)} "
+                                            f"{float(five_hour_percent)}\n"
+                                        )
+                                    except OSError:
+                                        pass
+                                    # Stale-replica DELETE (spec §4.3).
+                                    # Defends against claude-statusline
+                                    # replaying the pre-credit
+                                    # ``--five-hour-percent`` value past
+                                    # the credit moment from its own
+                                    # in-memory HWM cache. Strict
+                                    # round-1 equality keeps the scope
+                                    # narrow — only rows whose
+                                    # five_hour_percent exactly matches
+                                    # the just-observed pre-credit
+                                    # value are removed. ``unixepoch()``
+                                    # on both sides for offset
+                                    # robustness (Z vs +00:00).
+                                    try:
+                                        conn.execute(
+                                            "DELETE FROM weekly_usage_snapshots "
+                                            " WHERE five_hour_window_key = ? "
+                                            "   AND unixepoch(captured_at_utc) "
+                                            "       >= unixepoch(?) "
+                                            "   AND round(five_hour_percent, 1) "
+                                            "       = round(?, 1)",
+                                            (
+                                                int(five_hour_window_key),
+                                                effective_iso,
+                                                prior_5h_pct,
+                                            ),
+                                        )
+                                        conn.commit()
+                                    except sqlite3.DatabaseError as exc:
+                                        eprint(
+                                            "[record-usage] 5h post-credit "
+                                            f"cleanup failed: {exc}"
+                                        )
+            except (sqlite3.DatabaseError, ValueError) as exc:
+                eprint(
+                    f"[record-usage] 5h in-place-credit detection "
+                    f"failed: {exc}"
+                )
         except (sqlite3.DatabaseError, ValueError) as exc:
             eprint(f"[record-usage] reset-event detection failed: {exc}")
 
@@ -1511,19 +1761,54 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         if max_row and max_row["v"] is not None and round(weekly_percent, 1) < round(float(max_row["v"]), 1):
             should_insert = False
         else:
-            # 5-hour usage is monotonically non-decreasing within a window.
-            # A lower value means stale API data; clamp to existing max.
-            # Joining on five_hour_window_key (canonical 10-min-floored
+            # 5-hour usage is monotonically non-decreasing within a window
+            # — UNTIL an in-place 5h credit fires. When a
+            # ``five_hour_reset_events`` row exists for THIS
+            # ``five_hour_window_key``, the MAX query filters to samples
+            # captured at-or-after the event's ``effective_reset_at_utc``
+            # so a fresh post-credit OAuth value (e.g. 4%) lands instead
+            # of being re-clamped to the pre-credit max (e.g. 28%). When
+            # no event row exists, ``COALESCE`` defaults to epoch-zero so
+            # the filter is a no-op and legacy clamp behavior is preserved
+            # byte-identically.
+            #
+            # ``unixepoch()`` on BOTH sides for offset robustness — stored
+            # ``captured_at_utc`` carries ``Z`` while
+            # ``effective_reset_at_utc`` carries ``+00:00``. Lex compare
+            # would silently mis-order moments for non-UTC hosts (same
+            # gotcha as the weekly clamp / 5h-block cross-reset flag).
+            #
+            # Joining on ``five_hour_window_key`` (canonical 10-min-floored
             # epoch) absorbs Anthropic's seconds-level jitter on
-            # resets_at; an ISO-string equality at this site silently
+            # ``resets_at``; an ISO-string equality at this site silently
             # skipped the clamp every time a jittered fetch landed in
             # the same physical 5h window (spec Bug B).
+            #
+            # Spec §4.1 of
+            # docs/superpowers/specs/2026-05-16-5h-in-place-credit-detection.md.
             if five_hour_percent is not None and five_hour_window_key is not None:
                 max_5h_row = conn.execute(
-                    "SELECT MAX(five_hour_percent) AS v FROM weekly_usage_snapshots WHERE five_hour_window_key = ?",
-                    (five_hour_window_key,),
+                    """
+                    SELECT MAX(five_hour_percent) AS v
+                      FROM weekly_usage_snapshots
+                     WHERE five_hour_window_key = ?
+                       AND unixepoch(captured_at_utc) >= unixepoch(COALESCE(
+                         (SELECT effective_reset_at_utc
+                            FROM five_hour_reset_events
+                           WHERE five_hour_window_key = ?
+                           ORDER BY id DESC
+                           LIMIT 1),
+                         '1970-01-01T00:00:00Z'
+                       ))
+                    """,
+                    (int(five_hour_window_key), int(five_hour_window_key)),
                 ).fetchone()
-                if max_5h_row and max_5h_row["v"] is not None and round(five_hour_percent, 1) < round(float(max_5h_row["v"]), 1):
+                if (
+                    max_5h_row
+                    and max_5h_row["v"] is not None
+                    and round(five_hour_percent, 1)
+                        < round(float(max_5h_row["v"]), 1)
+                ):
                     five_hour_percent = float(max_5h_row["v"])
 
             # Dedup vs last snapshot: if BOTH weekly_percent and

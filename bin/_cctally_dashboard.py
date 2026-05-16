@@ -2606,10 +2606,18 @@ def _build_alerts_envelope_array(
             },
         })
 
+    # Site F (spec §3.2 bucket C / §3.3): widen the row identity to
+    # include ``reset_event_id`` so post-credit (seg=event.id) crossings
+    # of the same (window_key, threshold) don't collide with pre-credit
+    # (seg=0) crossings on the React row key. Older clients tolerate
+    # longer ids — the id is opaque to them; only the React key
+    # uniqueness invariant matters. Mirrors the weekly precedent at
+    # line ~2597.
     fh_rows = conn.execute(
         """
         SELECT m.five_hour_window_key, m.percent_threshold, m.captured_at_utc,
-               m.alerted_at, m.block_cost_usd, b.block_start_at
+               m.alerted_at, m.block_cost_usd, m.reset_event_id,
+               b.block_start_at
         FROM five_hour_milestones m
         LEFT JOIN five_hour_blocks b ON b.five_hour_window_key = m.five_hour_window_key
         WHERE m.alerted_at IS NOT NULL
@@ -2621,7 +2629,10 @@ def _build_alerts_envelope_array(
     for r in fh_rows:
         threshold = int(r["percent_threshold"])
         out.append({
-            "id":          f"five_hour:{int(r['five_hour_window_key'])}:{threshold}",
+            "id":          (
+                f"five_hour:{int(r['five_hour_window_key'])}:"
+                f"{threshold}:{int(r['reset_event_id'])}"
+            ),
             "axis":        "five_hour",
             "threshold":   threshold,
             "crossed_at":  r["captured_at_utc"],
@@ -2630,6 +2641,7 @@ def _build_alerts_envelope_array(
                 "five_hour_window_key": int(r["five_hour_window_key"]),
                 "block_start_at":       r["block_start_at"] or "",
                 "block_cost_usd":       float(r["block_cost_usd"] or 0.0),
+                "reset_event_id":       int(r["reset_event_id"]),
             },
         })
 
