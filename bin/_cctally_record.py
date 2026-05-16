@@ -392,9 +392,12 @@ def _resolve_active_five_hour_reset_event_id(
       - The window has no ``five_hour_reset_events`` row (most blocks).
       - The table doesn't exist yet (DB predates this feature).
 
-    Returns the largest ``id`` matching the window otherwise; the read uses
-    ``ORDER BY id DESC LIMIT 1`` so it survives the rare stacked-credit case
-    (spec §2.3 — multiple events across distinct 10-min slots).
+    Returns the largest ``id`` matching the window otherwise; the
+    ``ORDER BY id DESC LIMIT 1`` clause is what *defines* "active" in
+    the stacked-credit case (spec §2.3 — multiple events across distinct
+    10-min slots): pre-credit milestones key on ``seg=0``, milestones
+    between credit 1 and credit 2 key on event-1's id, and milestones
+    after credit 2 key on event-2's id.
     """
     try:
         row = conn.execute(
@@ -1604,8 +1607,8 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                             prior_5h_row["five_hour_resets_at"],
                             "prior.five_hour_resets_at",
                         )
-                        # ``now_utc`` was bound at the top of the outer
-                        # try (line ~1341) from
+                        # ``now_utc`` was bound earlier in this same
+                        # outer try block from
                         # ``dt.datetime.now(dt.timezone.utc)``; reuse it
                         # so both branches see the same instant.
                         if (
@@ -1667,10 +1670,17 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                                 # slot get rowcount == 0 from UNIQUE
                                 # and skip both pivots — the winning
                                 # writer's pivots cover them.
+                                # INSERT OR IGNORE returns rowcount=1 on
+                                # real insert, 0 on UNIQUE collision
+                                # (CLAUDE.md Alerts contract — matches
+                                # the INSERT OR IGNORE shape used by
+                                # ``insert_percent_milestone`` and the
+                                # inline ``five_hour_milestones`` writer
+                                # below).
                                 if cur5h.rowcount == 1:
                                     # Force-write hwm-5h: bypasses the
                                     # monotonic guard at the normal
-                                    # writer (line ~1722). Lands AFTER
+                                    # hwm-5h writer below. Lands AFTER
                                     # ``conn.commit()`` so a concurrent
                                     # reader doesn't see the new HWM
                                     # before the event row is durable.

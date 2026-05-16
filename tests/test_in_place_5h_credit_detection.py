@@ -528,19 +528,31 @@ def test_stacked_credits_across_distinct_10min_slots(ns, tmp_path, monkeypatch):
         conn.close()
 
 
-def test_same_slot_collision_absorbed_by_unique(ns, tmp_path):
+def test_same_slot_collision_absorbed_by_unique(ns, tmp_path, monkeypatch):
     """Two credits within the SAME 10-min slot collide on UNIQUE → second
     INSERT OR IGNORE'd. Spec §2.3 documented cap (Codex r3).
 
-    Both calls use the real ``_floor_to_ten_minutes`` (no monkeypatch),
-    so they land in whatever 10-min slot the wall clock dictates. The
-    seed-update between the two calls is what allows the predicate to
-    fire a "second" time at all (otherwise dedup-vs-last-snapshot would
-    block it earlier).
+    We pin ``_floor_to_ten_minutes`` to a constant so both observations
+    deterministically share an ``effective_reset_at_utc`` and collide on
+    the UNIQUE(window_key, effective_iso) index — otherwise wall-clock
+    drift across the two calls could land them in adjacent slots and
+    produce two event rows (~10% flake odds; mirrors the ``shifted_floor``
+    pattern from ``test_stacked_credits_across_distinct_10min_slots``,
+    but with a fixed return value to force same-slot collision).
+
+    The seed-update between the two calls is what allows the predicate
+    to fire a "second" time at all (otherwise dedup-vs-last-snapshot
+    would block it earlier).
     """
     end_iso, end_epoch = _future_week_end()
     resets_iso, resets_epoch_str, resets_epoch = _future_5h_block_window()
     window_key = ns["_canonical_5h_window_key"](resets_epoch)
+
+    # Pin the 10-min floor to a fixed instant so both record-usage calls
+    # produce identical ``effective_reset_at_utc`` values and the second
+    # INSERT OR IGNORE collides on UNIQUE deterministically.
+    fixed_floor_dt = dt.datetime(2026, 5, 1, 12, 30, 0, tzinfo=dt.timezone.utc)
+    monkeypatch.setitem(ns, "_floor_to_ten_minutes", lambda _d: fixed_floor_dt)
 
     conn = ns["open_db"]()
     try:
