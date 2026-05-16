@@ -117,6 +117,46 @@ cctally five-hour-breakdown --json
 }
 ```
 
+## Credit divider rows
+
+When the selected 5h block has in-place credit events, the per-percent
+table interleaves `⚡ CREDIT  −Xpp @ HH:MM` divider rows between
+pre-credit and post-credit milestones (merged stream ordered by
+`captured_at_utc` for milestones and `effective_reset_at_utc` for the
+divider). Post-credit thresholds may repeat pre-credit threshold numbers
+— distinguished by the per-milestone `resetEventId` field in JSON
+(sentinel `0` = pre-credit segment, positive integer = the
+`five_hour_reset_events.id` of the post-credit segment).
+
+JSON envelope gains a sibling `credits[]` array parallel to
+`milestones[]`:
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "block":        { /* same shape as five-hour-blocks */ },
+  "milestones": [
+    { "percentThreshold": 10, "resetEventId": 0, /* … */ },
+    { "percentThreshold": 25, "resetEventId": 0, /* … */ },
+    { "percentThreshold": 1,  "resetEventId": 5, /* … */ },
+    { "percentThreshold": 5,  "resetEventId": 5, /* … */ }
+  ],
+  "credits": [
+    {
+      "effectiveResetAtUtc": "2026-05-16T21:00:00Z",
+      "priorPercent":         28.0,
+      "postPercent":          8.0,
+      "deltaPp":              -20.0
+    }
+  ]
+}
+```
+
+The `credits` field is omitted (or empty `[]`) on uncredited blocks. The
+breakdown's per-percent table renders the full merged stream regardless
+of segment (a "read all segments" reader; see CLAUDE.md "5-hour windows"
+gotcha for the three-bucket filter scope).
+
 ## Notes
 
 - Forward-only / write-once. A block opened on a pre-schema DB shows

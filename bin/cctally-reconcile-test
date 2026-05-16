@@ -1429,6 +1429,151 @@ PYCRED
 }
 credit_invariants
 
+# ── 5h in-place credit invariants ─────────────────────────────────────
+# R-5HC1: every five_hour_reset_events row has prior_percent - post_percent
+#         >= _FIVE_HOUR_RESET_PCT_DROP_THRESHOLD (5.0pp) AND
+#         prior_percent > post_percent strictly. The threshold is the
+#         single bound that distinguishes an Anthropic-issued credit from
+#         OAuth jitter (parallel to RECON_CREDIT_* for the weekly axis;
+#         the 5h threshold is 5pp because intra-block percents are smaller).
+#
+# R-5HC2: effective_reset_at_utc falls within the block window keyed by
+#         the same five_hour_window_key
+#         (block_start_at <= effective_reset_at_utc); unixepoch() on both
+#         sides absorbs the +00:00-vs-Z offset mix between stored values
+#         (same rule as the production clamp). No row in five_hour_blocks
+#         for that key (e.g. heuristic-only history) skips this check
+#         gracefully via the LEFT JOIN — there is no body to compare to.
+#
+# R-5HC3: UNIQUE(five_hour_window_key, effective_reset_at_utc) is enforced
+#         at the schema level; this is a belt-and-suspenders runtime
+#         check that catches data imported via raw INSERT bypassing the
+#         constraint (e.g. operator restore from a pre-UNIQUE backup).
+#
+# All three run against a synthesized DB inside a scratch HOME so the
+# harness can be re-run on any clone without requiring a real credited
+# stats.db; this mirrors the credit_invariants() pattern above.
+
+five_hour_credit_invariants () {
+    local name="five_hour_credit_invariants"
+    local home; home="$(mktemp -d -t cctally-reconcile-5hcredit.XXXXXX)"
+    local result rc_py
+    result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$home" TZ=Etc/UTC python3 - <<'PY5HC' 2>&1)
+import importlib.util, os, pathlib, sys
+from importlib.machinery import SourceFileLoader
+
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
+spec = importlib.util.spec_from_loader("cctally_mod", loader)
+mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
+loader.exec_module(mod)
+mod.APP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Block whose 10-min-floored start is 19:30 UTC on 2026-05-16, window key
+# floored to 10 min, end at 24:30 (+5h). Effective credit lands at 21:00.
+block_start = "2026-05-16T19:30:00+00:00"
+window_key = 1779478200  # unixepoch of 2026-05-16T19:30:00+00:00
+effective_a = "2026-05-16T21:00:00+00:00"
+effective_b = "2026-05-16T21:30:00+00:00"  # distinct 10-min slot, same block
+
+conn = mod.open_db()
+try:
+    # Seed parent block row so the LEFT JOIN in R-5HC2 has a body. Column
+    # names match the ``five_hour_blocks`` DDL at bin/cctally:3905 — the
+    # rollup table is open (`is_closed=0`); created/updated timestamps are
+    # arbitrary in this harness since R-5HC* don't read them.
+    conn.execute(
+        "INSERT INTO five_hour_blocks "
+        "(five_hour_window_key, five_hour_resets_at, block_start_at, "
+        " first_observed_at_utc, last_observed_at_utc, "
+        " final_five_hour_percent, total_input_tokens, total_output_tokens, "
+        " total_cache_create_tokens, total_cache_read_tokens, "
+        " total_cost_usd, is_closed, created_at_utc, last_updated_at_utc) "
+        "VALUES (?, ?, ?, ?, ?, 8.0, 100, 200, 300, 400, 12.34, 0, ?, ?)",
+        (window_key, "2026-05-17T00:30:00+00:00", block_start,
+         "2026-05-16T19:35:00Z", "2026-05-16T22:00:00Z",
+         "2026-05-16T19:35:00Z", "2026-05-16T22:00:00Z"),
+    )
+    # Seed two valid credit events for the same block on distinct 10-min
+    # slots — both must satisfy R-5HC1/2/3.
+    conn.execute(
+        "INSERT INTO five_hour_reset_events "
+        "(detected_at_utc, five_hour_window_key, prior_percent, "
+        " post_percent, effective_reset_at_utc) VALUES (?, ?, ?, ?, ?)",
+        ("2026-05-16T21:00:00Z", window_key, 28.0, 8.0, effective_a),
+    )
+    conn.execute(
+        "INSERT INTO five_hour_reset_events "
+        "(detected_at_utc, five_hour_window_key, prior_percent, "
+        " post_percent, effective_reset_at_utc) VALUES (?, ?, ?, ?, ?)",
+        ("2026-05-16T21:30:00Z", window_key, 15.0, 5.0, effective_b),
+    )
+    conn.commit()
+
+    # R-5HC1: prior_percent - post_percent >= 5.0 AND prior > post for every row.
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM five_hour_reset_events
+         WHERE NOT (prior_percent - post_percent >= 5.0
+                AND prior_percent > post_percent)
+        """,
+    ).fetchone()
+    assert row["c"] == 0, (
+        f"R-5HC1 fail: {row['c']} rows violate the 5.0pp threshold invariant"
+    )
+
+    # R-5HC2: effective_reset_at_utc >= block_start_at for every event row
+    # whose window_key matches a five_hour_blocks row. unixepoch() on both
+    # sides handles the offset mix between stored values (some +00:00, some
+    # Z); lex compare would silently misorder on non-UTC hosts.
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM five_hour_reset_events e
+        LEFT JOIN five_hour_blocks b
+          ON b.five_hour_window_key = e.five_hour_window_key
+         WHERE b.id IS NOT NULL
+           AND unixepoch(e.effective_reset_at_utc) < unixepoch(b.block_start_at)
+        """,
+    ).fetchone()
+    assert row["c"] == 0, (
+        f"R-5HC2 fail: {row['c']} events have effective_reset_at_utc "
+        f"before block_start_at"
+    )
+
+    # R-5HC3: no two five_hour_reset_events rows share
+    # (five_hour_window_key, effective_reset_at_utc). The UNIQUE constraint
+    # at the schema level handles inserts via the normal path; this catches
+    # raw-INSERT imports that bypass UNIQUE (e.g. operator restore).
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM (
+          SELECT five_hour_window_key, effective_reset_at_utc, COUNT(*) AS n
+            FROM five_hour_reset_events
+           GROUP BY five_hour_window_key, effective_reset_at_utc
+          HAVING n > 1
+        )
+        """,
+    ).fetchone()
+    assert row["c"] == 0, (
+        f"R-5HC3 fail: {row['c']} duplicate (window_key, effective_iso) pairs"
+    )
+
+    print("OK")
+finally:
+    conn.close()
+PY5HC
+    rc_py=$?
+    rm -rf "$home"
+    if [ $rc_py -ne 0 ]; then
+        echo "RECONCILE FAIL $name: $result"
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    echo "PASS $name"
+    pass_count=$((pass_count + 1))
+}
+five_hour_credit_invariants
+
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

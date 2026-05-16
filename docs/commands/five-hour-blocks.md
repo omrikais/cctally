@@ -101,6 +101,39 @@ present only under the matching `--breakdown` value, omitted otherwise.
 The sentinel `"projectPath": "(unknown)"` covers entries with NULL
 `session_files.project_path`.
 
+## Credit annotations
+
+When Anthropic issues an in-place 5h credit (utilization drops while
+`rate_limits.5h.resets_at` stays unchanged), affected block rows render
+with an inline `⚡ credited −Xpp @ HH:MM` chip beside the block-start
+time. Multiple credits in the same block concatenate as `⚡ −Xpp, −Ypp`
+(up to ~30 distinct 10-minute slots per block; same-slot collisions
+absorb to the first observation by the underlying
+`UNIQUE(five_hour_window_key, effective_reset_at_utc)` schema
+constraint). The chip carries through `--format md` / `html` / `svg`
+share output in the same `block_start` cell.
+
+JSON envelopes carry the credit details per block. Each credit row
+exposes the 10-min-floored effective moment plus the pre- and post-credit
+percent values so downstream consumers can render the chip without
+re-querying snapshots:
+
+```jsonc
+{
+  "blockStartAt": "2026-05-16T19:30:00Z",
+  "credits": [
+    {
+      "effectiveResetAtUtc": "2026-05-16T21:00:00Z",
+      "priorPercent":         28.0,
+      "postPercent":          8.0,
+      "deltaPp":              -20.0
+    }
+  ]
+}
+```
+
+The `credits` field is omitted (or empty `[]`) on uncredited blocks.
+
 ## Notes
 
 - API-anchored only. Heuristic windows (no recorded `rate_limits.5h.resets_at`
