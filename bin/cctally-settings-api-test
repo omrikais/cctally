@@ -258,19 +258,31 @@ stop_server
 
 # --- Case 8: F2 immediate SSE broadcast --------------------------------------
 # Subscribe to /api/events in the background, capture the first frame
-# (initial seed sent on subscribe), then POST /api/settings and read
-# the next frame within ~1.2s. Under --no-sync, the only way a fresh
-# frame arrives is the synchronous broadcast triggered by the POST,
-# so seeing TWO frames within the window proves the F2 path.
+# (initial seed sent on subscribe), then POST /api/settings and watch
+# for a frame carrying the NEW resolved_tz. Under --no-sync, the only
+# frame source that re-reads config.json with the new tz is the POST
+# handler's synchronous broadcast — so a frame containing
+# `"resolved_tz": "Asia/Jerusalem"` proves the F2 path.
+#
+# Race note (issue #47): the dashboard's _DashboardUpdateCheckThread
+# also publishes the current snap to the SSE hub on its first iteration
+# (after a synchronous network/install-method check). Under CI load
+# that republish can land between the seed frame and the POST broadcast,
+# satisfying a naive count-based "2nd frame arrived" check with a frame
+# that carries the OLD (pre-POST) config — serialized by the SSE writer
+# thread before the POST handler's save_config completed. Drive the
+# wait loop off CONTENT (the new resolved_tz) so the test waits for the
+# actual POST broadcast and tolerates an arbitrary number of interloper
+# frames before it.
 start_server || exit 1
 sse_log=$(mktemp)
-( curl -sN --max-time 3 "$base/api/events" > "$sse_log" ) &
+( curl -sN --max-time 5 "$base/api/events" > "$sse_log" ) &
 sse_pid=$!
 BG_PIDS+=("$sse_pid")
 # Wait for the seed frame to land.
 seed_tries=0
 while [ $seed_tries -lt 20 ]; do
-    if grep -qc 'event: update' "$sse_log" 2>/dev/null; then
+    if grep -q 'event: update' "$sse_log" 2>/dev/null; then
         break
     fi
     sleep 0.1
@@ -282,13 +294,17 @@ seed_count="${seed_count:-0}"
 curl -s -X POST "$base/api/settings" \
     -H "Origin: http://127.0.0.1:$PORT" \
     -d '{"display":{"tz":"Asia/Jerusalem"}}' > /dev/null
-# Wait up to ~1.5s for the second frame.
+# Wait up to ~2.5s for a frame carrying the NEW resolved_tz. Polling
+# on content (not just frame count) keeps the test robust against
+# interloper publishes from _DashboardUpdateCheckThread.
 post_tries=0
+matched_new_tz=0
 final_count=$seed_count
-while [ $post_tries -lt 15 ]; do
+while [ $post_tries -lt 25 ]; do
     final_count=$( { grep -c 'event: update' "$sse_log" 2>/dev/null || true; } | head -1)
     final_count="${final_count:-0}"
-    if [ "$final_count" -gt "$seed_count" ]; then
+    if grep -q '"resolved_tz": "Asia/Jerusalem"' "$sse_log" 2>/dev/null; then
+        matched_new_tz=1
         break
     fi
     sleep 0.1
@@ -301,12 +317,13 @@ else
     echo "FAIL F2 immediate SSE broadcast: seed=$seed_count final=$final_count"
     fail_count=$((fail_count + 1))
 fi
-# Confirm at least one of the broadcast frames carries the new resolved_tz.
-if grep -q '"resolved_tz": "Asia/Jerusalem"' "$sse_log" 2>/dev/null; then
+if [ "$matched_new_tz" -eq 1 ]; then
     echo "PASS F2 SSE frame contains new resolved_tz"
     pass_count=$((pass_count + 1))
 else
     echo "FAIL F2 SSE frame missing new resolved_tz"
+    printf '  sse_log tail:\n'
+    tail -c 2048 "$sse_log" | sed 's/^/    /' >&2 || true
     fail_count=$((fail_count + 1))
 fi
 rm -f "$sse_log"

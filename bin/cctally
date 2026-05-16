@@ -5532,6 +5532,18 @@ def _load_recorded_five_hour_windows(
                     else:
                         d = d.astimezone(dt.timezone.utc)
                     credit_moments.append(d)
+                # Issue #44: the inner-loop break below latches onto the
+                # first credit in [next_bs, rs]. With two credits inside
+                # the same pre-credit canonical 5h window, the wrong one
+                # (the later one) wins when SQLite returns rows in
+                # insertion order rather than time order — collapsing
+                # two distinct truncated anchors onto the same floored
+                # bucket and silently dropping one via override-map
+                # overwrite. Sort once so the break consistently picks
+                # the EARLIEST credit, which is the one that actually
+                # ended the earlier block (its floor equals the next
+                # block's block_start_at by construction).
+                credit_moments.sort()
             except sqlite3.DatabaseError:
                 credit_moments = []
     except (sqlite3.DatabaseError, OSError):

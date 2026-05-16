@@ -2771,6 +2771,157 @@ def test_group_entries_into_blocks_uses_block_start_override(ns):
     assert activity[0].anchor == "recorded"
 
 
+def test_load_recorded_five_hour_windows_truncates_each_overlap_independently(
+    ns,
+):
+    """Issue #44 regression guard.
+
+    Two in-place credits inside the same pre-credit canonical 5h window
+    each spawn a post-credit canonical block. The truncation loop runs
+    once per adjacent (i, i+1) canonical pair: pair (A, B) must pick
+    credit_1, pair (B, C) must pick credit_2.
+
+    Pre-fix the inner credit loop broke on the FIRST matching credit
+    regardless of order. When ``credit_moments`` came back from SQLite
+    in reverse-time order (no ``ORDER BY``), pair (A, B) latched onto
+    credit_2 — collapsing two distinct truncated anchors onto the same
+    10-minute floor and silently dropping one via override-map
+    overwrite. The pre-credit entries between credit_1 and credit_2
+    then surfaced as a phantom heuristic ``~`` row.
+    """
+    canonical_resets_a = "2026-05-15T05:00:00+00:00"
+    block_start_a      = "2026-05-15T00:00:00+00:00"
+    canonical_resets_b = "2026-05-15T06:00:00+00:00"
+    block_start_b      = "2026-05-15T01:00:00+00:00"
+    canonical_resets_c = "2026-05-15T08:00:00+00:00"
+    block_start_c      = "2026-05-15T03:00:00+00:00"
+    credit_1_effective = "2026-05-15T01:00:00+00:00"
+    credit_2_effective = "2026-05-15T03:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        _seed_five_hour_block_row(
+            conn,
+            five_hour_resets_at=canonical_resets_a,
+            block_start_at=block_start_a,
+            five_hour_window_key=int(
+                dt.datetime.fromisoformat(canonical_resets_a).timestamp()
+            ),
+        )
+        _seed_five_hour_block_row(
+            conn,
+            five_hour_resets_at=canonical_resets_b,
+            block_start_at=block_start_b,
+            five_hour_window_key=int(
+                dt.datetime.fromisoformat(canonical_resets_b).timestamp()
+            ),
+        )
+        _seed_five_hour_block_row(
+            conn,
+            five_hour_resets_at=canonical_resets_c,
+            block_start_at=block_start_c,
+            five_hour_window_key=int(
+                dt.datetime.fromisoformat(canonical_resets_c).timestamp()
+            ),
+        )
+        # Insert credits in REVERSE-time order. Without an ORDER BY in
+        # the credit-moments query, SQLite returns rows in insertion
+        # order — exercising the order-dependent bug.
+        conn.execute(
+            "INSERT INTO week_reset_events "
+            "(detected_at_utc, old_week_end_at, new_week_end_at, "
+            " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+            ("2026-05-15T03:00:00Z",
+             credit_2_effective,
+             "2026-05-16T19:00:00+00:00",
+             credit_2_effective),
+        )
+        conn.execute(
+            "INSERT INTO week_reset_events "
+            "(detected_at_utc, old_week_end_at, new_week_end_at, "
+            " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+            ("2026-05-15T01:00:00Z",
+             credit_1_effective,
+             "2026-05-16T17:00:00+00:00",
+             credit_1_effective),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    range_start = dt.datetime(2026, 5, 15, 0, 0, tzinfo=dt.timezone.utc)
+    range_end   = dt.datetime(2026, 5, 15, 23, 0, tzinfo=dt.timezone.utc)
+    anchors, overrides = ns["_load_recorded_five_hour_windows"](
+        range_start, range_end,
+    )
+
+    truncated_a = dt.datetime(2026, 5, 15, 1, 0, 0, tzinfo=dt.timezone.utc)
+    truncated_b = dt.datetime(2026, 5, 15, 3, 0, 0, tzinfo=dt.timezone.utc)
+    canonical_c = dt.datetime(2026, 5, 15, 8, 0, 0, tzinfo=dt.timezone.utc)
+
+    # Three distinct anchors must survive — one per canonical block.
+    # Pre-fix the override map collapsed truncated_a's override onto
+    # truncated_b's floor, leaving only two anchors and a phantom gap.
+    assert truncated_a in anchors, anchors
+    assert truncated_b in anchors, anchors
+    assert canonical_c in anchors, anchors
+
+    expected_start_a = dt.datetime(2026, 5, 15, 0, 0, 0, tzinfo=dt.timezone.utc)
+    expected_start_b = dt.datetime(2026, 5, 15, 1, 0, 0, tzinfo=dt.timezone.utc)
+    assert overrides.get(truncated_a) == expected_start_a, overrides
+    assert overrides.get(truncated_b) == expected_start_b, overrides
+
+
+def test_group_entries_into_blocks_no_phantom_between_two_credits(ns):
+    """Issue #44 phantom-row regression guard at the renderer.
+
+    With three truncated anchors threaded through, entries spanning the
+    pre-credit window must land in the three canonical blocks — never a
+    fourth heuristic ``~`` row covering the gap between credit_1 and
+    credit_2.
+    """
+    UsageEntry = ns["UsageEntry"]
+    group = ns["_group_entries_into_blocks"]
+
+    truncated_a = dt.datetime(2026, 5, 15, 1, 0, 0, tzinfo=dt.timezone.utc)
+    truncated_b = dt.datetime(2026, 5, 15, 3, 0, 0, tzinfo=dt.timezone.utc)
+    canonical_c = dt.datetime(2026, 5, 15, 8, 0, 0, tzinfo=dt.timezone.utc)
+    start_a = dt.datetime(2026, 5, 15, 0, 0, 0, tzinfo=dt.timezone.utc)
+    start_b = dt.datetime(2026, 5, 15, 1, 0, 0, tzinfo=dt.timezone.utc)
+
+    def _e(when: dt.datetime) -> object:
+        return UsageEntry(
+            timestamp=when,
+            model="claude-opus-4-7",
+            usage={"input_tokens": 100, "output_tokens": 50,
+                   "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0},
+            cost_usd=None,
+        )
+
+    entries = [
+        _e(dt.datetime(2026, 5, 15, 0, 30, 0, tzinfo=dt.timezone.utc)),  # A
+        _e(dt.datetime(2026, 5, 15, 2, 0, 0, tzinfo=dt.timezone.utc)),   # B
+        _e(dt.datetime(2026, 5, 15, 5, 0, 0, tzinfo=dt.timezone.utc)),   # C
+    ]
+    now = dt.datetime(2026, 5, 15, 9, 0, 0, tzinfo=dt.timezone.utc)
+    blocks = group(
+        entries,
+        recorded_windows=[truncated_a, truncated_b, canonical_c],
+        block_start_overrides={truncated_a: start_a, truncated_b: start_b},
+        now=now,
+    )
+
+    activity = [b for b in blocks if not b.is_gap]
+    # Exactly three canonical blocks, all recorded. No phantom ``~`` row.
+    assert len(activity) == 3, [
+        (b.start_time, b.end_time, b.anchor) for b in activity
+    ]
+    assert all(b.anchor == "recorded" for b in activity), [
+        (b.start_time, b.end_time, b.anchor) for b in activity
+    ]
+
+
 # ── Round-3: pivots run even when event row already committed ────────
 
 

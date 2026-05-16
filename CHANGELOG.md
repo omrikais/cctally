@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- `cctally blocks`: round-5 Bug J follow-up — `_load_recorded_five_hour_windows` now sorts `credit_moments` ascending before the inner credit-pick loop. The pre-fix loop broke on the first matching credit in `[next_bs, rs]` regardless of order; with two in-place credits inside the same pre-credit canonical 5h window and SQLite returning rows in insertion order (no `ORDER BY` on `week_reset_events`), pair `(A, B)` could latch onto credit_2 instead of credit_1, collapsing two distinct truncated anchors onto the same 10-minute floor and silently dropping one via override-map overwrite — re-introducing the phantom heuristic `~` row Bug J was meant to eliminate. Sorting once ensures the break consistently picks the earliest credit, which by construction is the one whose floor equals the next block's `block_start_at`. P2 (not seen in production; every observed in-place credit so far is one-per-week). Regressions: `tests/test_in_place_credit_detection.py::test_load_recorded_five_hour_windows_truncates_each_overlap_independently` (exercises reverse-time SQL order to prove the order-dependent bug) + `test_group_entries_into_blocks_no_phantom_between_two_credits` (renderer-side defense in depth — three canonical blocks render with `recorded` anchor and no `~` row in the gap). Issue [#44](https://github.com/omrikais/cctally-dev/issues/44).
+
 ## [1.7.3] - 2026-05-16
 
 ### Added
