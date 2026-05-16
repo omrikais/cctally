@@ -7632,6 +7632,14 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
 # 86→0 and 34→0 cases while filtering 35→33-style jitter.
 _RESET_PCT_DROP_THRESHOLD = 25.0
 
+# In-place 5h-credit threshold. Mirrors `_RESET_PCT_DROP_THRESHOLD` but
+# scaled down for the 5h dimension: typical 5h usage stays under ~10pp in
+# a single block, so a 5pp drop sits well above natural variation while
+# proportionally being a larger signal than 25pp is on the weekly scale.
+# See spec docs/superpowers/specs/2026-05-16-5h-in-place-credit-detection.md
+# §2.1 (Q1) for rationale.
+_FIVE_HOUR_RESET_PCT_DROP_THRESHOLD = 5.0
+
 
 def _week_ref_has_reset_event(
     conn: sqlite3.Connection, ref: WeekRef
