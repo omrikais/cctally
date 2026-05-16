@@ -1480,9 +1480,9 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                             "WHERE new_week_end_at = ? LIMIT 1",
                             (cur_end_canon,),
                         ).fetchone()
+                        effective_dt = _floor_to_hour(now_utc)
+                        effective_iso = effective_dt.isoformat(timespec="seconds")
                         if already is None:
-                            effective_dt = _floor_to_hour(now_utc)
-                            effective_iso = effective_dt.isoformat(timespec="seconds")
                             # Row shape: old=effective_iso, new=cur_end_canon
                             # (distinct values). The previous shape stored
                             # old==new==cur_end_canon, which let BOTH
@@ -1508,56 +1508,78 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                                  effective_iso),
                             )
                             conn.commit()
-                            # Force-write hwm-7d so the next status-line
-                            # render reflects the post-credit value. The
-                            # monotonic guard at the normal write site (below)
-                            # would refuse to decrease the file; this write
-                            # is the credit-only escape hatch. Lands AFTER
-                            # the conn.commit() so a concurrent record-usage
-                            # reader doesn't see the new HWM before the
-                            # event row is durable.
-                            try:
-                                (c.APP_DIR / "hwm-7d").write_text(
-                                    f"{week_start_date} {weekly_percent}\n"
-                                )
-                            except OSError:
-                                pass
+                        # Pivots fire UNCONDITIONALLY whenever a credit
+                        # is detected — they're NOT gated on
+                        # ``already is None``. Memory
+                        # ``project_dedup_must_not_gate_side_effects.md``:
+                        # "Skipping a no-op INSERT must NOT skip
+                        # milestones/rollups/alerts; prior run may have
+                        # died mid-flight." Crash scenario: tick N
+                        # committed the event row, then died before
+                        # HWM + DELETE. Tick N+1's pre-check sees
+                        # ``already`` non-None (the row IS in the
+                        # table) and would skip the pivots, leaving
+                        # the system wedged on pre-credit HWM + stale-
+                        # replica rows. Pivots are individually
+                        # idempotent (file overwrite + DELETE on stable
+                        # predicate), so re-running them is safe.
+                        # ``effective_iso`` is resolved above; on a
+                        # recovery tick it lands on the SAME 10-min
+                        # slot as the original (now_utc has drifted
+                        # only seconds), so the DELETE predicate's
+                        # ``unixepoch(captured_at_utc) >= unixepoch(?)``
+                        # still matches every stale-replica row.
+                        #
+                        # Force-write hwm-7d so the next status-line
+                        # render reflects the post-credit value. The
+                        # monotonic guard at the normal write site
+                        # (below) would refuse to decrease the file;
+                        # this write is the credit-only escape hatch.
+                        # Lands AFTER the conn.commit() so a concurrent
+                        # record-usage reader doesn't see the new HWM
+                        # before the event row is durable.
+                        try:
+                            (c.APP_DIR / "hwm-7d").write_text(
+                                f"{week_start_date} {weekly_percent}\n"
+                            )
+                        except OSError:
+                            pass
 
-                            # Race-defensive cleanup. Between the moment
-                            # Anthropic credited the user (effective_iso)
-                            # and this code firing, the EXTERNAL
-                            # claude-statusline tool can replay stale
-                            # pre-credit `--percent` values (it has its
-                            # own in-memory HWM cache and re-runs us once
-                            # per status-line tick). Those replays land
-                            # captured_at_utc >= effective_iso with
-                            # weekly_percent == prior_pct (the pre-credit
-                            # value), and they dominate the reset-aware
-                            # clamp's MAX over the post-credit segment so
-                            # legitimate fresh OAuth values are rejected.
-                            # Strict equality (round(.,1)) keeps this
-                            # narrow: we only delete rows whose percent
-                            # exactly matches the pre-credit value we just
-                            # observed — legitimate post-credit climbs
-                            # past `prior_pct` (rare, but possible if the
-                            # credit is small + activity is heavy) stay.
-                            try:
-                                conn.execute(
-                                    "DELETE FROM weekly_usage_snapshots "
-                                    "WHERE week_start_date = ? "
-                                    "  AND unixepoch(captured_at_utc) >= "
-                                    "      unixepoch(?) "
-                                    "  AND round(weekly_percent, 1) = "
-                                    "      round(?, 1)",
-                                    (week_start_date, effective_iso,
-                                     float(prior_pct)),
-                                )
-                                conn.commit()
-                            except sqlite3.DatabaseError as exc:
-                                eprint(
-                                    "[record-usage] post-credit cleanup "
-                                    f"failed: {exc}"
-                                )
+                        # Race-defensive cleanup. Between the moment
+                        # Anthropic credited the user (effective_iso)
+                        # and this code firing, the EXTERNAL
+                        # claude-statusline tool can replay stale
+                        # pre-credit `--percent` values (it has its
+                        # own in-memory HWM cache and re-runs us once
+                        # per status-line tick). Those replays land
+                        # captured_at_utc >= effective_iso with
+                        # weekly_percent == prior_pct (the pre-credit
+                        # value), and they dominate the reset-aware
+                        # clamp's MAX over the post-credit segment so
+                        # legitimate fresh OAuth values are rejected.
+                        # Strict equality (round(.,1)) keeps this
+                        # narrow: we only delete rows whose percent
+                        # exactly matches the pre-credit value we just
+                        # observed — legitimate post-credit climbs
+                        # past `prior_pct` (rare, but possible if the
+                        # credit is small + activity is heavy) stay.
+                        try:
+                            conn.execute(
+                                "DELETE FROM weekly_usage_snapshots "
+                                "WHERE week_start_date = ? "
+                                "  AND unixepoch(captured_at_utc) >= "
+                                "      unixepoch(?) "
+                                "  AND round(weekly_percent, 1) = "
+                                "      round(?, 1)",
+                                (week_start_date, effective_iso,
+                                 float(prior_pct)),
+                            )
+                            conn.commit()
+                        except sqlite3.DatabaseError as exc:
+                            eprint(
+                                "[record-usage] post-credit cleanup "
+                                f"failed: {exc}"
+                            )
 
             # ── 5h in-place credit detection (parallel to weekly above) ──
             # Spec §2.2 of
@@ -1648,7 +1670,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                                 effective_iso = effective_dt.isoformat(
                                     timespec="seconds"
                                 )
-                                cur5h = conn.execute(
+                                conn.execute(
                                     "INSERT OR IGNORE INTO five_hour_reset_events "
                                     "(detected_at_utc, five_hour_window_key, "
                                     " prior_percent, post_percent, "
@@ -1663,69 +1685,85 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                                     ),
                                 )
                                 conn.commit()
-                                # Only fire the pivots (HWM force-write
-                                # + stale-replica DELETE) when this
-                                # tick won the race (rowcount == 1).
-                                # Concurrent writers in the same 10-min
-                                # slot get rowcount == 0 from UNIQUE
-                                # and skip both pivots — the winning
-                                # writer's pivots cover them.
-                                # INSERT OR IGNORE returns rowcount=1 on
-                                # real insert, 0 on UNIQUE collision
-                                # (CLAUDE.md Alerts contract — matches
-                                # the INSERT OR IGNORE shape used by
-                                # ``insert_percent_milestone`` and the
-                                # inline ``five_hour_milestones`` writer
-                                # below).
-                                if cur5h.rowcount == 1:
-                                    # Force-write hwm-5h: bypasses the
-                                    # monotonic guard at the normal
-                                    # hwm-5h writer below. Lands AFTER
-                                    # ``conn.commit()`` so a concurrent
-                                    # reader doesn't see the new HWM
-                                    # before the event row is durable.
-                                    # File format matches the canonical
-                                    # writer: ``<key> <percent>\n``.
-                                    try:
-                                        (c.APP_DIR / "hwm-5h").write_text(
-                                            f"{int(five_hour_window_key)} "
-                                            f"{float(five_hour_percent)}\n"
-                                        )
-                                    except OSError:
-                                        pass
-                                    # Stale-replica DELETE (spec §4.3).
-                                    # Defends against claude-statusline
-                                    # replaying the pre-credit
-                                    # ``--five-hour-percent`` value past
-                                    # the credit moment from its own
-                                    # in-memory HWM cache. Strict
-                                    # round-1 equality keeps the scope
-                                    # narrow — only rows whose
-                                    # five_hour_percent exactly matches
-                                    # the just-observed pre-credit
-                                    # value are removed. ``unixepoch()``
-                                    # on both sides for offset
-                                    # robustness (Z vs +00:00).
-                                    try:
-                                        conn.execute(
-                                            "DELETE FROM weekly_usage_snapshots "
-                                            " WHERE five_hour_window_key = ? "
-                                            "   AND unixepoch(captured_at_utc) "
-                                            "       >= unixepoch(?) "
-                                            "   AND round(five_hour_percent, 1) "
-                                            "       = round(?, 1)",
-                                            (
-                                                int(five_hour_window_key),
-                                                effective_iso,
-                                                prior_5h_pct,
-                                            ),
-                                        )
-                                        conn.commit()
-                                    except sqlite3.DatabaseError as exc:
-                                        eprint(
-                                            "[record-usage] 5h post-credit "
-                                            f"cleanup failed: {exc}"
-                                        )
+                                # Pivots fire UNCONDITIONALLY whenever a
+                                # credit is detected — they're not gated
+                                # on ``rowcount == 1`` for the
+                                # INSERT OR IGNORE above. Memory
+                                # ``project_dedup_must_not_gate_side_effects.md``:
+                                # "Skipping a no-op INSERT must NOT skip
+                                # milestones/rollups/alerts; prior run
+                                # may have died mid-flight." Crash
+                                # scenario: tick N committed the event
+                                # row, then died before HWM + DELETE.
+                                # Tick N+1's INSERT OR IGNORE returns
+                                # rowcount == 0 (UNIQUE absorbs), but
+                                # the system is still wedged on the
+                                # pre-credit HWM and the stale-replica
+                                # rows. The pivots are individually
+                                # idempotent (file overwrite + DELETE
+                                # on stable predicate), so re-running
+                                # them is safe — what matters is that
+                                # they always run when this tick has
+                                # observed a credit. The
+                                # ``not is_dup`` guard above
+                                # (post_percent-aware pre-check) is the
+                                # right idempotency level: it skips
+                                # work only when the most-recent
+                                # event's post_percent equals this
+                                # tick's prior_5h_pct (i.e. claude-
+                                # statusline replaying the same pre-
+                                # credit value past the credit moment,
+                                # AFTER our DELETE has already
+                                # cleaned the prior replay rows).
+                                #
+                                # Force-write hwm-5h: bypasses the
+                                # monotonic guard at the normal
+                                # hwm-5h writer below. Lands AFTER
+                                # ``conn.commit()`` so a concurrent
+                                # reader doesn't see the new HWM
+                                # before the event row is durable.
+                                # File format matches the canonical
+                                # writer: ``<key> <percent>\n``.
+                                try:
+                                    (c.APP_DIR / "hwm-5h").write_text(
+                                        f"{int(five_hour_window_key)} "
+                                        f"{float(five_hour_percent)}\n"
+                                    )
+                                except OSError:
+                                    pass
+                                # Stale-replica DELETE (spec §4.3).
+                                # Defends against claude-statusline
+                                # replaying the pre-credit
+                                # ``--five-hour-percent`` value past
+                                # the credit moment from its own
+                                # in-memory HWM cache. Strict
+                                # round-1 equality keeps the scope
+                                # narrow — only rows whose
+                                # five_hour_percent exactly matches
+                                # the just-observed pre-credit
+                                # value are removed. ``unixepoch()``
+                                # on both sides for offset
+                                # robustness (Z vs +00:00).
+                                try:
+                                    conn.execute(
+                                        "DELETE FROM weekly_usage_snapshots "
+                                        " WHERE five_hour_window_key = ? "
+                                        "   AND unixepoch(captured_at_utc) "
+                                        "       >= unixepoch(?) "
+                                        "   AND round(five_hour_percent, 1) "
+                                        "       = round(?, 1)",
+                                        (
+                                            int(five_hour_window_key),
+                                            effective_iso,
+                                            prior_5h_pct,
+                                        ),
+                                    )
+                                    conn.commit()
+                                except sqlite3.DatabaseError as exc:
+                                    eprint(
+                                        "[record-usage] 5h post-credit "
+                                        f"cleanup failed: {exc}"
+                                    )
             except (sqlite3.DatabaseError, ValueError) as exc:
                 eprint(
                     f"[record-usage] 5h in-place-credit detection "
@@ -1922,6 +1960,16 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                 # last_observed_at_utc is stale relative to the latest
                 # snapshot's captured_at_utc (the kill landed between
                 # insert_usage_snapshot and maybe_update_five_hour_block).
+                #
+                # Round-3: ALSO scope the milestone-coverage half of
+                # this probe by ACTIVE 5h SEGMENT. Without this, a
+                # credited block's MAX over the whole milestone ledger
+                # would still read the pre-credit ceiling (e.g. 28%) and
+                # silently suppress the post-credit ledger's heal even
+                # though it has zero rows. Mirrors weekly Probe 1's
+                # segment-aware fix above. Uses
+                # ``_resolve_active_five_hour_reset_event_id`` to find
+                # the active segment for the latest snapshot's window.
                 need_5h_heal = False
                 window_key = latest_row["five_hour_window_key"]
                 if window_key is not None:
@@ -1938,6 +1986,45 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                         < latest_row["captured_at_utc"]
                     ):
                         need_5h_heal = True
+                    else:
+                        # Block row exists AND last_observed is fresh
+                        # — but the post-credit milestone segment may
+                        # still owe rows. Scope MAX(percent_threshold)
+                        # by the active reset_event_id segment so
+                        # post-credit climbs from threshold 1 trigger
+                        # heal even when the pre-credit segment already
+                        # crossed higher thresholds. Probe shape mirrors
+                        # weekly Probe 1 (lines 1922-1956).
+                        five_hour_percent_for_probe = latest_row[
+                            "five_hour_percent"
+                        ]
+                        if five_hour_percent_for_probe is not None:
+                            latest_5h_floor = math.floor(
+                                float(five_hour_percent_for_probe) + 1e-9
+                            )
+                            if latest_5h_floor >= 1:
+                                heal_5h_segment = (
+                                    _resolve_active_five_hour_reset_event_id(
+                                        heal_conn, int(window_key)
+                                    )
+                                )
+                                max_5h_existing = heal_conn.execute(
+                                    "SELECT MAX(percent_threshold) AS m "
+                                    "FROM five_hour_milestones "
+                                    "WHERE five_hour_window_key = ? "
+                                    "  AND reset_event_id = ?",
+                                    (int(window_key), heal_5h_segment),
+                                ).fetchone()
+                                if (
+                                    max_5h_existing is None
+                                    or max_5h_existing["m"] is None
+                                ):
+                                    need_5h_heal = True
+                                elif (
+                                    int(max_5h_existing["m"])
+                                    < latest_5h_floor
+                                ):
+                                    need_5h_heal = True
             finally:
                 heal_conn.close()
 

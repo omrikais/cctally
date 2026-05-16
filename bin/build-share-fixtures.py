@@ -77,8 +77,29 @@ SCENARIOS: tuple[str, ...] = (
     "project-md-anon",
     "project-md-reveal",
     "five-hour-blocks-md",
+    # Round-3 (issue #43): credit-annotated variants of
+    # five-hour-blocks across all three share formats. Seed one
+    # ``five_hour_reset_events`` row tied to the active block's window
+    # so the ``__credits`` side-channel populates and the ``⚡ -20pp``
+    # chip flows uniformly through md / html / svg snapshot rendering
+    # (spec §5.1.1, Codex r2 finding 3).
+    "five-hour-blocks-credit-md",
+    "five-hour-blocks-credit-html",
+    "five-hour-blocks-credit-svg",
     "session-md",
 )
+
+# Scenarios that need an in-place 5h credit event seeded against the
+# five_hour_blocks row's window key. Stamps one row in
+# five_hour_reset_events; the live ``cmd_five_hour_blocks`` JOIN
+# attaches it as the ``__credits`` side-channel on the rendered row.
+# Forward-compat: each new five-hour-blocks-credit-<fmt> scenario adds
+# itself here.
+_CREDIT_FIVE_HOUR_SCENARIOS: frozenset[str] = frozenset({
+    "five-hour-blocks-credit-md",
+    "five-hour-blocks-credit-html",
+    "five-hour-blocks-credit-svg",
+})
 
 # Scenarios that need a stats.db with no weekly_usage_snapshots /
 # weekly_cost_snapshots / five_hour_blocks rows. Used to exercise
@@ -119,7 +140,9 @@ SESSION_FILES: tuple[tuple[str, str | None, str | None], ...] = (
 )
 
 
-def _seed_stats_db(path: pathlib.Path, *, empty: bool = False) -> None:
+def _seed_stats_db(
+    path: pathlib.Path, *, empty: bool = False, seed_credit: bool = False,
+) -> None:
     """Stats.db: weekly_usage_snapshots + weekly_cost_snapshots + one
     five_hour_blocks row.
 
@@ -194,6 +217,27 @@ def _seed_stats_db(path: pathlib.Path, *, empty: bool = False) -> None:
              300, 600, 0, 100, 1.85,
              block_start_iso, block_start_iso),
         )
+        if seed_credit:
+            # Round-3 (issue #43) — seed one in-place credit event for
+            # the active 5h block's window. The ``cmd_five_hour_blocks``
+            # caller JOINs against this table and attaches a
+            # ``__credits`` side-channel; the share snapshot builder
+            # appends ``⚡ -20pp`` to the block_start cell so md / html /
+            # svg goldens carry the annotation uniformly (spec §5.1.1).
+            # Effective ISO at +10min inside the block keeps it well
+            # within the [block_start_at, last_observed_at_utc] interval
+            # any downstream invariant might check.
+            credit_iso = "2026-05-07T13:10:00+00:00"
+            conn.execute(
+                """
+                INSERT INTO five_hour_reset_events (
+                    detected_at_utc, five_hour_window_key,
+                    prior_percent, post_percent,
+                    effective_reset_at_utc
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (credit_iso, window_key, 28.0, 8.0, credit_iso),
+            )
         conn.commit()
 
 
@@ -266,7 +310,12 @@ def main() -> int:
         scen_dir = FIXTURE_ROOT / scenario
         scen_dir.mkdir(parents=True, exist_ok=True)
         empty_stats = scenario in _EMPTY_STATS_SCENARIOS
-        _seed_stats_db(scen_dir / "stats.db", empty=empty_stats)
+        seed_credit = scenario in _CREDIT_FIVE_HOUR_SCENARIOS
+        _seed_stats_db(
+            scen_dir / "stats.db",
+            empty=empty_stats,
+            seed_credit=seed_credit,
+        )
         _seed_cache_db(scen_dir / "cache.db")
         _write_changelog(scen_dir / "CHANGELOG.md")
         _write_gitignore(scen_dir)

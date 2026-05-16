@@ -232,3 +232,151 @@ def test_null_block_start_pct_suppresses_delta(ctx):
     assert fhb is not None
     assert fhb["seven_day_pct_at_block_start"] is None
     assert fhb["seven_day_pct_delta_pp"] is None
+
+
+def _seed_credit_event(
+    conn: sqlite3.Connection,
+    *,
+    key: int,
+    effective_iso: str,
+    prior_pct: float,
+    post_pct: float,
+    detected_iso: str | None = None,
+) -> int:
+    """Insert a ``five_hour_reset_events`` row for ``key``.
+
+    Mirrors the live-write shape in
+    ``bin/_cctally_record.py`` (Spec §3.1 schema). Returns the row id.
+    """
+    if detected_iso is None:
+        detected_iso = effective_iso
+    cur = conn.execute(
+        """
+        INSERT INTO five_hour_reset_events
+            (detected_at_utc, five_hour_window_key, prior_percent,
+             post_percent, effective_reset_at_utc)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (detected_iso, key, prior_pct, post_pct, effective_iso),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def _seed_five_hour_milestone(
+    conn: sqlite3.Connection,
+    *,
+    block_id: int,
+    key: int,
+    threshold: int,
+    captured_at: str,
+    cost_usd: float = 1.0,
+    reset_event_id: int = 0,
+    usage_snapshot_id: int = 0,
+):
+    """Insert a ``five_hour_milestones`` row. Mirrors live INSERT
+    shape at ``bin/_cctally_record.py:1077`` (Site C).
+    """
+    conn.execute(
+        """
+        INSERT INTO five_hour_milestones (
+            block_id, five_hour_window_key, percent_threshold,
+            captured_at_utc, usage_snapshot_id, block_cost_usd,
+            reset_event_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (block_id, key, threshold, captured_at, usage_snapshot_id,
+         cost_usd, reset_event_id),
+    )
+    conn.commit()
+
+
+def test_block_envelope_populates_credits_when_event_row_exists(ctx):
+    """Round-3 Item 4b: ``_select_current_block_for_envelope`` returns
+    ``credits[]`` populated from ``five_hour_reset_events`` when a
+    credit event row exists for the active window.
+
+    Asserts the envelope shape downstream consumers (panel chip +
+    modal divider) depend on — `effective_reset_at_utc`,
+    `prior_percent`, `post_percent`, `delta_pp` all present and
+    correctly typed (float for the percents, rounded delta_pp).
+    """
+    ns, conn = ctx
+    key = 1777595400
+    _seed_block(conn, key=key, start_iso="2026-04-30T10:30:00+00:00",
+                p_start=60.0, p_end=64.0)
+    _seed_snapshot(conn, used_pct=66.7, key=key,
+                   captured="2026-04-30T11:00:00+00:00")
+    # One in-place credit during the active block: 28% → 8% drop.
+    _seed_credit_event(
+        conn,
+        key=key,
+        effective_iso="2026-04-30T11:10:00+00:00",
+        prior_pct=28.0,
+        post_pct=8.0,
+    )
+
+    fhb = ns["_select_current_block_for_envelope"](
+        conn, current_used_pct=66.7, now_utc=_PINNED_NOW,
+    )
+    assert fhb is not None
+    assert "credits" in fhb, "envelope MUST carry credits key"
+    assert isinstance(fhb["credits"], list)
+    assert len(fhb["credits"]) == 1
+    c = fhb["credits"][0]
+    assert c["effective_reset_at_utc"] == "2026-04-30T11:10:00+00:00"
+    assert c["prior_percent"] == pytest.approx(28.0, abs=1e-9)
+    assert c["post_percent"] == pytest.approx(8.0, abs=1e-9)
+    assert c["delta_pp"] == pytest.approx(-20.0, abs=1e-9)
+
+
+def test_block_envelope_credits_empty_when_no_event(ctx):
+    """Sanity: ``credits[]`` is an empty list (not missing key) when no
+    ``five_hour_reset_events`` row exists for the window — keeps the
+    downstream React conditionals (``Array.isArray(credits) &&
+    credits.length > 0``) stable across pre/post-v1.7.x DBs.
+    """
+    ns, conn = ctx
+    key = 1777595400
+    _seed_block(conn, key=key, start_iso="2026-04-30T10:30:00+00:00",
+                p_start=60.0, p_end=64.0)
+    _seed_snapshot(conn, used_pct=66.7, key=key,
+                   captured="2026-04-30T11:00:00+00:00")
+
+    fhb = ns["_select_current_block_for_envelope"](
+        conn, current_used_pct=66.7, now_utc=_PINNED_NOW,
+    )
+    assert fhb is not None
+    assert fhb.get("credits") == [], "credits MUST be [] not missing"
+
+
+def test_block_envelope_credits_chain_in_ascending_order(ctx):
+    """Stacked credits across distinct 10-min slots emit multiple
+    ``credits[]`` entries ordered by ``effective_reset_at_utc`` ASC
+    (envelope contract; clients merge with milestones into one
+    chronological stream).
+    """
+    ns, conn = ctx
+    key = 1777595400
+    _seed_block(conn, key=key, start_iso="2026-04-30T10:30:00+00:00",
+                p_start=60.0, p_end=64.0)
+    _seed_snapshot(conn, used_pct=66.7, key=key,
+                   captured="2026-04-30T11:00:00+00:00")
+    # Two credit events in distinct 10-min slots (spec §2.3).
+    _seed_credit_event(conn, key=key,
+                       effective_iso="2026-04-30T11:10:00+00:00",
+                       prior_pct=28.0, post_pct=8.0)
+    _seed_credit_event(conn, key=key,
+                       effective_iso="2026-04-30T11:30:00+00:00",
+                       prior_pct=22.0, post_pct=2.0)
+
+    fhb = ns["_select_current_block_for_envelope"](
+        conn, current_used_pct=66.7, now_utc=_PINNED_NOW,
+    )
+    assert fhb is not None
+    credits = fhb["credits"]
+    assert len(credits) == 2
+    # Ascending order.
+    assert credits[0]["effective_reset_at_utc"] < credits[1]["effective_reset_at_utc"]
+    assert credits[0]["delta_pp"] == pytest.approx(-20.0, abs=1e-9)
+    assert credits[1]["delta_pp"] == pytest.approx(-20.0, abs=1e-9)

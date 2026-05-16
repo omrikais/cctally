@@ -143,4 +143,85 @@ describe('<CurrentWeekPanel />', () => {
       expect(body).toBeNull();
     });
   });
+
+  // ---- 5h credit chip (Round-3 Item 4a / spec §5.3) -----------------
+
+  // Build an envelope with one or more in-place 5h credits attached to
+  // the current week's five_hour_block. Used by the credit-chip tests
+  // below. Leaves everything else identical to the canonical fixture.
+  function withCredits(
+    deltas: number[],
+  ): Envelope {
+    const base = JSON.parse(JSON.stringify(fixture)) as Envelope;
+    const cw = base.current_week;
+    if (cw) {
+      // Canonical fixture lacks five_hour_block; build a minimal one
+      // so the credit-chip render path lights up.
+      cw.five_hour_block = {
+        block_start_at: '2026-04-24T10:00:00+00:00',
+        five_hour_window_key: 1745493600,
+        seven_day_pct_at_block_start: 14.0,
+        seven_day_pct_delta_pp: 3.4,
+        crossed_seven_day_reset: false,
+        credits: deltas.map((delta_pp, i) => ({
+          effective_reset_at_utc: `2026-04-24T1${i}:00:00+00:00`,
+          prior_percent: 28.0,
+          post_percent: 28.0 + delta_pp,
+          delta_pp,
+        })),
+      };
+    }
+    return base;
+  }
+
+  describe('credit chip (Round-3)', () => {
+    it('renders no chip when credits[] is absent or empty', () => {
+      // Canonical fixture has no credits → no chip.
+      render(<CurrentWeekPanel />);
+      expect(document.querySelector('.credit-chip')).toBeNull();
+    });
+
+    it('renders an inline credit chip when credits[] is non-empty', () => {
+      _resetForTests();
+      updateSnapshot(withCredits([-20]));
+      render(<CurrentWeekPanel />);
+      const chip = document.querySelector('.credit-chip');
+      expect(chip).not.toBeNull();
+      // Chip carries the ⚡ glyph + "credited" verb + delta value.
+      expect(chip?.textContent).toMatch(/⚡/);
+      expect(chip?.textContent).toMatch(/credited/);
+      expect(chip?.textContent).toMatch(/-20pp/);
+    });
+
+    it('exposes credit count via data-credit-count for analytics', () => {
+      _resetForTests();
+      updateSnapshot(withCredits([-20, -8]));
+      render(<CurrentWeekPanel />);
+      const chip = document.querySelector('.credit-chip');
+      expect(chip?.getAttribute('data-credit-count')).toBe('2');
+    });
+
+    it('concatenates multiple credits in the chip text', () => {
+      _resetForTests();
+      updateSnapshot(withCredits([-20, -8]));
+      render(<CurrentWeekPanel />);
+      const chip = document.querySelector('.credit-chip');
+      expect(chip).not.toBeNull();
+      // Both deltas surface (spec §5.3 — "⚡ credited −Xpp, −Ypp").
+      expect(chip?.textContent).toMatch(/-20pp/);
+      expect(chip?.textContent).toMatch(/-8pp/);
+    });
+
+    it('places the chip inside the 5-hour row next to the percent reading', () => {
+      _resetForTests();
+      updateSnapshot(withCredits([-20]));
+      render(<CurrentWeekPanel />);
+      const chip = document.querySelector('.credit-chip');
+      expect(chip).not.toBeNull();
+      // Chip must live within the 5-hour cw-kv row so it visually
+      // suffixes the percent number (spec §5.3 layout).
+      const row = chip?.closest('.kv-five-hour');
+      expect(row).not.toBeNull();
+    });
+  });
 });

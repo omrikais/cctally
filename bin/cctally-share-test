@@ -81,6 +81,14 @@ for scenario_dir in "$FIXTURES_DIR"/*/; do
         project-md-anon)       cmd="project";          fmt="md";   theme="light" ;;
         project-md-reveal)     cmd="project";          fmt="md";   theme="light"; extra="--reveal-projects" ;;
         five-hour-blocks-md)   cmd="five-hour-blocks"; fmt="md";   theme="light" ;;
+        # Round-3 (issue #43) — credit-annotated five-hour-blocks
+        # variants across md / html / svg. Same harness arg surface as
+        # the baseline five-hour-blocks-md case; the credit annotation
+        # piggybacks on the block_start cell via __credits side-channel
+        # so no extra flag is needed.
+        five-hour-blocks-credit-md)   cmd="five-hour-blocks"; fmt="md";   theme="light" ;;
+        five-hour-blocks-credit-html) cmd="five-hour-blocks"; fmt="html"; theme="light" ;;
+        five-hour-blocks-credit-svg)  cmd="five-hour-blocks"; fmt="svg";  theme="light" ;;
         session-md)            cmd="session";          fmt="md";   theme="light" ;;
         *)
             echo "FAIL $scenario: unknown scenario (no case arm)"

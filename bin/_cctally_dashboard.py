@@ -2633,6 +2633,14 @@ def _build_alerts_envelope_array(
                 "week_start_date":     r["week_start_date"],
                 "cumulative_cost_usd": cumulative,
                 "dollars_per_percent": dpp,
+                # Round-3: parallel to the 5h context block below — both
+                # axes now expose ``reset_event_id`` so downstream
+                # clients (panel, modal, third-party consumers) can
+                # discriminate pre- vs post-credit crossings of the
+                # same (week, threshold) without scraping the
+                # envelope ``id`` string. 0 = pre-credit / no-event;
+                # event.id = post-credit segment.
+                "reset_event_id":      int(r["reset_event_id"]),
             },
         })
 

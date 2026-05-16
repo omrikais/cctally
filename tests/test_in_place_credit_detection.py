@@ -2769,3 +2769,132 @@ def test_group_entries_into_blocks_uses_block_start_override(ns):
     assert activity[0].start_time == real_start
     assert activity[0].end_time == truncated_R
     assert activity[0].anchor == "recorded"
+
+
+# ── Round-3: pivots run even when event row already committed ────────
+
+
+def test_weekly_pivots_run_when_event_row_already_committed(ns, tmp_path):
+    """Round-3 / memory ``project_dedup_must_not_gate_side_effects.md``:
+    weekly credit pivots (hwm-7d force-write + stale-replica DELETE)
+    MUST run even when the ``already`` pre-check sees the event row
+    is in the table because a prior crashed invocation committed the
+    INSERT before dying.
+
+    Failure mode: tick N detects the credit, INSERTs the week_reset_events
+    row, ``conn.commit()`` lands — and then the process dies (CC
+    self-update, OOM, kill -9) before the HWM force-write + DELETE
+    could run. On tick N+1 the same predicate fires; the
+    ``already`` pre-check finds the row and (pre-fix) the entire
+    ``if already is None:`` block skipped — leaving the system wedged
+    on the pre-credit HWM and the stale-replica rows.
+
+    Fix: hoist pivots out of the ``if already is None:`` body. The
+    INSERT stays gated (no double-write), but the pivots are
+    individually idempotent so re-running them is safe.
+    """
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        # 1. Pre-credit baseline snapshot (LATEST snapshot when tick
+        # N+1 runs — proves the detection predicate re-fires because
+        # prior_pct still reads 67%).
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        # 2. Pre-committed event row (simulates the crashed tick N).
+        # Use a floor_to_hour result for the same wall-clock window
+        # the recovery tick will compute so DELETE predicate's
+        # ``unixepoch(captured_at_utc) >= unixepoch(effective_iso)``
+        # still matches stale-replica rows we stage at "now".
+        now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        precommitted_floor = now_utc.replace(minute=0, second=0)
+        precommitted_iso = precommitted_floor.isoformat(timespec="seconds")
+        _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=precommitted_iso,
+            old_week_end_at=precommitted_iso,
+        )
+        # 3. Stale-replica row at the pre-credit value, captured
+        # at-or-after the pre-committed effective_iso (claude-statusline
+        # replay landed between the crash and the recovery tick).
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc=ns["now_utc_iso"](),
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 4. Stage hwm-7d at the pre-credit value (proves the recovery
+    # tick force-writes it back down).
+    (tmp_path / ".local" / "share" / "cctally" / "hwm-7d").write_text(
+        f"{week_start_date} 67.0\n"
+    )
+
+    # 5. Recovery tick. Same percent (2%) as the original credit
+    # observation. Pre-check sees ``already`` non-None → before the
+    # fix, the entire body skipped; with the fix, INSERT is skipped
+    # but pivots still run.
+    args = _record_usage_args(percent=2.0, resets_at=end_epoch)
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    # Assertion 1: still exactly one event row (pre-check guarded
+    # the duplicate INSERT correctly).
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute(
+            "SELECT effective_reset_at_utc FROM week_reset_events"
+        ).fetchall()
+        assert len(events) == 1, [dict(e) for e in events]
+        assert events[0]["effective_reset_at_utc"] == precommitted_iso
+    finally:
+        conn.close()
+
+    # Assertion 2: HWM force-written back down (pivot ran despite
+    # ``already`` being non-None). File used to be "67.0"; recovery
+    # tick must overwrite to "2.0".
+    hwm_path = tmp_path / ".local" / "share" / "cctally" / "hwm-7d"
+    hwm_parts = hwm_path.read_text().strip().split()
+    assert len(hwm_parts) == 2, hwm_parts
+    assert hwm_parts[0] == week_start_date
+    assert round(float(hwm_parts[1]), 1) == 2.0, (
+        f"hwm-7d force-write pivot must run on recovery tick; got "
+        f"{hwm_parts[1]} (pre-fix bug: stays at 67.0)"
+    )
+
+    # Assertion 3: stale-replica DELETE ran — no rows at the
+    # pre-credit value captured at-or-after the pre-committed
+    # effective_iso.
+    conn = ns["open_db"]()
+    try:
+        stale_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+            "  AND round(weekly_percent, 1) = 67.0",
+            (week_start_date, precommitted_iso),
+        ).fetchone()["c"]
+        assert stale_count == 0, (
+            "stale-replica DELETE pivot must run on recovery tick"
+        )
+        # Original pre-credit seed (well before effective_iso)
+        # survives.
+        original = conn.execute(
+            "SELECT COUNT(*) AS c FROM weekly_usage_snapshots "
+            "WHERE captured_at_utc = '2026-05-14T10:00:00Z'"
+        ).fetchone()["c"]
+        assert original == 1
+    finally:
+        conn.close()

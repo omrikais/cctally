@@ -509,3 +509,102 @@ def test_site_f_dashboard_alerts_widens_id_not_filters(ns, tmp_path):
         )
     finally:
         conn.close()
+
+
+def test_weekly_alerts_context_exposes_reset_event_id(ns, tmp_path):
+    """Round-3 Item 3: weekly alerts envelope ``context`` block must
+    expose ``reset_event_id`` in parallel to the 5h shape.
+
+    Pre-Round-3 the weekly path widened the row identity (``id``
+    string includes ``:{reset_event_id}``) but did NOT include the
+    segment in the ``context`` block, while the 5h path did — asymmetric
+    payload that forced downstream consumers to scrape the opaque
+    ``id`` string to discriminate pre- vs post-credit crossings of the
+    same (week, threshold). Round-3 adds ``context.reset_event_id`` to
+    weekly so both axes mirror the same shape (parallel-not-identical
+    consistency).
+    """
+    week_start_date = "2026-05-10"
+    week_end_date = "2026-05-17"
+    week_start_at = "2026-05-10T00:00:00+00:00"
+    week_end_at = "2026-05-17T00:00:00+00:00"
+    conn = ns["open_db"]()
+    try:
+        # Cost snapshot (the milestone-writer's marginal lookup; not
+        # strictly required for the alerts envelope which reads
+        # ``percent_milestones`` directly, but mirrors the weekly
+        # precedent test setup at site F).
+        conn.execute(
+            "INSERT INTO weekly_cost_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, cost_usd, mode) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("2026-05-15T18:00:00Z", week_start_date, week_end_date,
+             week_start_at, week_end_at, 12.0, "auto"),
+        )
+        # Reset event so the post-credit segment has a positive id.
+        conn.execute(
+            "INSERT INTO week_reset_events "
+            "(detected_at_utc, old_week_end_at, new_week_end_at, "
+            " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+            ("2026-05-14T17:00:00Z", "2026-05-14T17:00:00+00:00",
+             week_end_at, "2026-05-14T17:00:00+00:00"),
+        )
+        event_id = conn.execute(
+            "SELECT id FROM week_reset_events "
+            "WHERE new_week_end_at = ? ORDER BY id DESC LIMIT 1",
+            (week_end_at,),
+        ).fetchone()["id"]
+        # Pre-credit alerted milestone (seg=0) at threshold 10:
+        conn.execute(
+            "INSERT INTO percent_milestones "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, percent_threshold, "
+            " cumulative_cost_usd, usage_snapshot_id, cost_snapshot_id, "
+            " alerted_at, reset_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-05-13T10:00:00Z", week_start_date, week_end_date,
+             week_start_at, week_end_at, 10, 5.0, 200, 200,
+             "2026-05-13T10:05:00Z", 0),
+        )
+        # Post-credit alerted milestone (seg=event_id) at threshold 10:
+        conn.execute(
+            "INSERT INTO percent_milestones "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, percent_threshold, "
+            " cumulative_cost_usd, usage_snapshot_id, cost_snapshot_id, "
+            " alerted_at, reset_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-05-15T11:00:00Z", week_start_date, week_end_date,
+             week_start_at, week_end_at, 10, 1.5, 201, 201,
+             "2026-05-15T11:05:00Z", event_id),
+        )
+        conn.commit()
+
+        dashboard_mod = ns["_cctally_dashboard"]
+        envelope = dashboard_mod._build_alerts_envelope_array(conn)
+        weekly = [
+            a for a in envelope
+            if a.get("axis") == "weekly" and a.get("threshold") == 10
+            and a.get("context", {}).get("week_start_date") == week_start_date
+        ]
+        assert len(weekly) == 2, (
+            "both pre- and post-credit weekly alerts must surface "
+            f"(got {len(weekly)}: {weekly})"
+        )
+        # Round-3 invariant: context.reset_event_id is exposed.
+        ctx_segs = sorted(
+            int(a["context"].get("reset_event_id", -1)) for a in weekly
+        )
+        assert ctx_segs == sorted({0, event_id}), (
+            "context.reset_event_id must surface on weekly alerts "
+            "for client-side filtering parity with 5h"
+        )
+        # Sanity: the post-credit row's context.reset_event_id is the
+        # positive event id.
+        post = [a for a in weekly
+                if int(a["context"]["reset_event_id"]) == event_id]
+        assert len(post) == 1
+        assert int(post[0]["context"]["reset_event_id"]) == event_id
+    finally:
+        conn.close()

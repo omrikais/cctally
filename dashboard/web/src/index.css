@@ -461,6 +461,17 @@ body { padding: 16px; box-sizing: border-box; }
 .cw-kv.kv-five-hour .sub.delta-elevated { color: var(--accent-amber); }
 .cw-kv.kv-five-hour .sub.delta-high     { color: var(--accent-red); }
 
+/* Round-3 / spec §5.3 — credit chip suffixed to the 5h percent
+   reading on the CurrentWeekPanel. Amber on a faint amber wash so
+   the ⚡ glyph reads as "Anthropic-issued goodwill" (same colour
+   family as the elevated-delta sub above), without competing with
+   the primary cyan percent value. ``sub`` parent already drops the
+   font-size; only the colour distinguishes the credit chip. */
+.credit-chip {
+  color: var(--accent-amber);
+  margin-left: 6px;
+}
+
 .cw-right {
   display: flex; flex-direction: column; gap: 18px;
   border-left: 1px solid var(--border-soft);
@@ -792,6 +803,25 @@ body { padding: 16px; box-sizing: border-box; }
 .m-sec.sec-spark { color: var(--accent-amber); }    /* Trend sparkline */
 .m-sec.sec-tbl   { color: var(--accent-purple); }   /* Trend table */
 .m-sec.sec-burn  { color: var(--accent-amber); }    /* Block burn rate / projection */
+/* Round-3 / spec §5.3 — 5h milestone section. Uses the panel's 5h
+   cyan accent so the section header matches the percent number's
+   colour treatment elsewhere on the panel. */
+.m-sec.sec-5h    { color: var(--accent-cyan); }     /* CW 5h milestones */
+
+/* Round-3 / spec §5.3 — credit divider row inside the 5h milestone
+   table. Pure visual differentiation; no logic depends on it.
+   Amber-on-amber-wash mirrors the credit-chip treatment on the
+   CurrentWeekPanel so the user reads the two surfaces as "the same
+   event". Dashed borders signal "interruption / not a regular row"
+   without competing with the modal's existing solid borders. */
+.mcw-5h-credit-row .mcw-5h-credit-cell {
+  color: var(--accent-amber);
+  background: rgba(251,191,36,0.08);
+  border-top: 1px dashed var(--border-soft);
+  border-bottom: 1px dashed var(--border-soft);
+  text-align: center;
+  font-weight: 600;
+}
 
 /* Pill — padding + radius base; color via .accent-<name>. */
 .m-pill {
