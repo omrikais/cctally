@@ -1484,10 +1484,12 @@ def _migration_five_hour_milestones_reset_event_id(conn: sqlite3.Connection) -> 
     ``percent_milestones``).
 
     Companion live-path edits land at (Task 2 of issue #43):
-      - bin/_cctally_record.py:962+ (5h milestone INSERT + alert paths;
-        Sites A-E in spec §3.3)
-      - bin/_cctally_dashboard.py:2611 (alerts list row-identity widening;
-        Site F in spec §3.3 — bucket C per spec §3.2's three-bucket model)
+      - bin/_cctally_record.py — 5h milestone INSERT + alert paths
+        (Sites A-E in spec §3.3); grep ``active_reset_event_id`` to
+        locate (line numbers drift per ``gotcha_cited_line_numbers_stale``)
+      - bin/_cctally_dashboard.py — alerts list row-identity widening
+        (Site F in spec §3.3 — bucket C per spec §3.2's three-bucket model);
+        grep ``reset_event_id`` near the 5h alerts SELECT
 
     Idempotent: a second invocation finds the column already present and
     returns. Empty-table fast path: when the column is already present
@@ -1499,7 +1501,10 @@ def _migration_five_hour_milestones_reset_event_id(conn: sqlite3.Connection) -> 
     # Fast-path probe: column already present means a prior run of this
     # migration (or a fresh-install fast-stamp from the dispatcher that
     # already picked up the new live-schema CREATE TABLE) has done the
-    # work. Just stamp the marker and return.
+    # work. Just stamp the marker and return. The marker INSERT runs in
+    # SQLite's implicit transaction (auto-opened by the write, closed by
+    # ``commit()`` — same shape as migration 005's fast path); no explicit
+    # ``BEGIN`` is needed for a single-statement DML.
     cols = {
         str(r[1])
         for r in conn.execute("PRAGMA table_info(five_hour_milestones)").fetchall()
