@@ -244,11 +244,27 @@ def create_stats_db(path: Path) -> None:
                 block_cost_usd              REAL    NOT NULL DEFAULT 0,
                 marginal_cost_usd           REAL,
                 seven_day_pct_at_crossing   REAL,
-                UNIQUE(five_hour_window_key, percent_threshold),
+                alerted_at                  TEXT,
+                reset_event_id              INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(five_hour_window_key, percent_threshold, reset_event_id),
                 FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
             );
             CREATE INDEX idx_five_hour_milestones_block
                 ON five_hour_milestones(block_id);
+
+            -- five_hour_reset_events: parallel to week_reset_events for the
+            -- 5h dimension. Added by issue #43 (live DDL in bin/cctally
+            -- mirrored here so fixture stats.db files don't trigger inline
+            -- CREATE TABLE at open time).
+            CREATE TABLE five_hour_reset_events (
+                id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+                detected_at_utc        TEXT NOT NULL,
+                five_hour_window_key   INTEGER NOT NULL,
+                prior_percent          REAL NOT NULL,
+                post_percent           REAL NOT NULL,
+                effective_reset_at_utc TEXT NOT NULL,
+                UNIQUE(five_hour_window_key, effective_reset_at_utc)
+            );
 
             CREATE TABLE schema_migrations (
                 name             TEXT PRIMARY KEY,
@@ -316,6 +332,7 @@ def _self_test_create_stats_db() -> None:
             "weekly_usage_snapshots", "weekly_cost_snapshots",
             "percent_milestones", "week_reset_events",
             "five_hour_blocks", "five_hour_milestones",
+            "five_hour_reset_events",
             "five_hour_block_models", "five_hour_block_projects",
             "schema_migrations",
         }

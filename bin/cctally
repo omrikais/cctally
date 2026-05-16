@@ -3864,6 +3864,43 @@ def open_db() -> sqlite3.Connection:
     )
     _backfill_week_reset_events(conn)
 
+    # ── five_hour_reset_events (Anthropic-issued in-place 5h credits) ──
+    # Parallel concept to ``week_reset_events`` for the 5h dimension; lives
+    # adjacent in ``_apply_schema`` because the two carry the same kind of
+    # signal at different cadences. Diverges from weekly in that the payload
+    # is the *percent values* (prior + post) rather than boundary keys,
+    # because the 5h variant has a stable ``five_hour_window_key`` and only
+    # the percent moves. See spec
+    # docs/superpowers/specs/2026-05-16-5h-in-place-credit-detection.md §3.1
+    # for rationale.
+    #
+    # UNIQUE(five_hour_window_key, effective_reset_at_utc) — supports stacked
+    # credits across DISTINCT 10-min slots inside one block (see spec §2.3
+    # "Bounded stacked-credit resolution" for the cap statement: ~30 distinct
+    # slots per 5h block when floor matches ``_canonical_5h_window_key``'s
+    # 600-second floor; same-slot collisions silently absorbed by
+    # INSERT OR IGNORE — an intentional cap, not a bug).
+    #
+    # No FK per CLAUDE.md gotcha: FKs in this codebase are documentation-only
+    # (``PRAGMA foreign_keys`` not enabled). ``five_hour_window_key`` provides
+    # the join key without a formal FK.
+    #
+    # No ``_backfill_five_hour_reset_events`` call follows (forward-only ship
+    # per spec Q5; historical backfill deferred to a future issue).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS five_hour_reset_events (
+            id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+            detected_at_utc        TEXT NOT NULL,
+            five_hour_window_key   INTEGER NOT NULL,
+            prior_percent          REAL NOT NULL,
+            post_percent           REAL NOT NULL,
+            effective_reset_at_utc TEXT NOT NULL,
+            UNIQUE(five_hour_window_key, effective_reset_at_utc)
+        )
+        """
+    )
+
     # ── five_hour_blocks (rollup, one row per API-anchored 5h block) ──
     conn.execute(
         """
@@ -3913,7 +3950,8 @@ def open_db() -> sqlite3.Connection:
             block_cost_usd              REAL    NOT NULL DEFAULT 0,
             marginal_cost_usd           REAL,
             seven_day_pct_at_crossing   REAL,
-            UNIQUE(five_hour_window_key, percent_threshold),
+            reset_event_id              INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(five_hour_window_key, percent_threshold, reset_event_id),
             FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
         )
         """
@@ -3932,6 +3970,16 @@ def open_db() -> sqlite3.Connection:
     # "alerts disabled at moment of crossing OR threshold not configured"
     # — never "delivery failed".
     add_column_if_missing(conn, "five_hour_milestones", "alerted_at", "TEXT")
+
+    # reset_event_id: segment column added by migration 006. Fresh-install
+    # DBs get it via the live CREATE TABLE above + the dispatcher fast-stamps
+    # the migration marker (the live DDL must carry the column AND the 3-col
+    # UNIQUE for fast-stamp to be safe — see spec §3.2). Existing pre-006
+    # DBs trip the migration's rename-recreate-copy idiom (handler in
+    # bin/_cctally_db.py); the handler's fast-path probe stamps the marker
+    # when the column is already present (covers the corner case where a
+    # partially-upgraded DB has the column but not the new UNIQUE — re-run
+    # is safe). Mirrors weekly migration 005 / `percent_milestones`.
 
     # ── five_hour_block_models (per-(block, model) rollup-child) ──
     # MUST be created BEFORE the parent-backfill gate below, because

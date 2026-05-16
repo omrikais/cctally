@@ -1,11 +1,12 @@
 ## stdout
-stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 6 known
+stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 7 known
   · 001_five_hour_block_models_backfill_v1         pending
   · 002_five_hour_block_projects_backfill_v1       pending
   · 003_merge_5h_block_duplicates_v1               pending
   · 004_heal_forked_week_start_date_buckets        pending
   · 005_percent_milestones_reset_event_id          pending
-  · 006_test_failure_injection                     pending
+  · 006_five_hour_milestones_reset_event_id        pending
+  · 007_test_failure_injection                     pending
 
 cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 1 known
   · 001_test_cache_migration                       pending

@@ -1009,36 +1009,65 @@ def _migration_merge_5h_block_duplicates_v1(conn: sqlite3.Connection) -> None:
 
             # (c) Milestones: per-threshold dedup, keep earliest
             # captured_at_utc, re-FK keepers to canonical.
+            #
+            # Defensive widening (Codex r2 finding 1, spec §3.4): if
+            # migration 006 has already landed and added ``reset_event_id``,
+            # key the dedup on ``(percent_threshold, reset_event_id)`` so
+            # we don't silently collapse legitimately distinct pre/post-
+            # credit rows at the same physical threshold. On the legacy
+            # upgrade path (column doesn't exist yet because 003 runs
+            # before 006 in migration order), ``has_seg`` is False and the
+            # dedup key collapses to ``(threshold, 0)`` — byte-identical
+            # to the original threshold-only shape. PRAGMA probe rather
+            # than version-detect so the path also covers operator
+            # re-runs (e.g. ``cctally db unskip 003_*``) post-006.
+            ms_cols = {
+                str(r[1])
+                for r in conn.execute(
+                    "PRAGMA table_info(five_hour_milestones)"
+                ).fetchall()
+            }
+            has_seg = "reset_event_id" in ms_cols
             ms_id_placeholders = ",".join(
                 "?" * (len(dropped_ids) + 1)
             )
-            all_milestones = conn.execute(
-                f"SELECT id, percent_threshold, captured_at_utc "
-                f"  FROM five_hour_milestones "
-                f" WHERE block_id IN ({ms_id_placeholders})",
-                [canonical["id"], *dropped_ids],
-            ).fetchall()
-            by_threshold: dict[int, dict] = {}
+            if has_seg:
+                all_milestones = conn.execute(
+                    f"SELECT id, percent_threshold, captured_at_utc, "
+                    f"       reset_event_id "
+                    f"  FROM five_hour_milestones "
+                    f" WHERE block_id IN ({ms_id_placeholders})",
+                    [canonical["id"], *dropped_ids],
+                ).fetchall()
+            else:
+                all_milestones = conn.execute(
+                    f"SELECT id, percent_threshold, captured_at_utc "
+                    f"  FROM five_hour_milestones "
+                    f" WHERE block_id IN ({ms_id_placeholders})",
+                    [canonical["id"], *dropped_ids],
+                ).fetchall()
+            by_key: dict[tuple[int, int], dict] = {}
             for m in all_milestones:
-                t = m["percent_threshold"]
+                seg = int(m["reset_event_id"]) if has_seg else 0
+                key = (int(m["percent_threshold"]), seg)
                 md = dict(m)
                 if (
-                    t not in by_threshold
+                    key not in by_key
                     or md["captured_at_utc"]
-                    < by_threshold[t]["captured_at_utc"]
+                    < by_key[key]["captured_at_utc"]
                 ):
-                    by_threshold[t] = md
-            keep_ids = {m["id"] for m in by_threshold.values()}
+                    by_key[key] = md
+            keep_ids = {m["id"] for m in by_key.values()}
             # DELETE non-keepers BEFORE rekeying keepers. Otherwise, when
             # both canonical and a dropped block hold a milestone for the
-            # same percent_threshold and the dropped row's milestone is
-            # the earlier keeper, UPDATEing it to the canonical key
-            # collides with canonical's still-present non-keeper on
-            # UNIQUE(five_hour_window_key, percent_threshold), rolling
-            # back the migration. After this DELETE the only milestones
-            # referencing dropped_keys are the keepers themselves
-            # (one per threshold), so the UPDATE loop below is collision-
-            # free.
+            # same physical key and the dropped row's milestone is the
+            # earlier keeper, UPDATEing it to the canonical key collides
+            # with canonical's still-present non-keeper on UNIQUE
+            # (either the 2-col legacy shape or the 3-col post-006 shape),
+            # rolling back the migration. After this DELETE the only
+            # milestones referencing dropped_keys are the keepers
+            # themselves (one per dedup key), so the UPDATE loop below is
+            # collision-free.
             non_keep_ids = [
                 m["id"] for m in all_milestones if m["id"] not in keep_ids
             ]
@@ -1049,7 +1078,7 @@ def _migration_merge_5h_block_duplicates_v1(conn: sqlite3.Connection) -> None:
                     f" WHERE id IN ({nk_placeholders})",
                     non_keep_ids,
                 )
-            for m in by_threshold.values():
+            for m in by_key.values():
                 conn.execute(
                     "UPDATE five_hour_milestones "
                     "   SET block_id = ?, "
@@ -1430,6 +1459,133 @@ def _migration_percent_milestones_reset_event_id(conn: sqlite3.Connection) -> No
             "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
             "VALUES (?, ?)",
             ("005_percent_milestones_reset_event_id", now_utc_iso()),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+@stats_migration("006_five_hour_milestones_reset_event_id")
+def _migration_five_hour_milestones_reset_event_id(conn: sqlite3.Connection) -> None:
+    """Add ``reset_event_id`` to ``five_hour_milestones`` so post-credit
+    threshold crossings can coexist with pre-credit ones for the same
+    ``(five_hour_window_key, percent_threshold)``.
+
+    Sentinel: ``0`` = pre-credit / no event. Existing rows backfill to
+    ``0`` via the ``DEFAULT 0`` clause on the new column.
+
+    The new UNIQUE constraint is
+    ``UNIQUE(five_hour_window_key, percent_threshold, reset_event_id)`` so
+    the same (window_key, threshold) pair can land twice if a goodwill
+    credit re-opens the segment under a fresh ``five_hour_reset_events.id``.
+    SQLite can't ALTER a UNIQUE constraint in place — we use the
+    rename-recreate-copy idiom (same as migration 005 did for
+    ``percent_milestones``).
+
+    Companion live-path edits land at (Task 2 of issue #43):
+      - bin/_cctally_record.py:962+ (5h milestone INSERT + alert paths;
+        Sites A-E in spec §3.3)
+      - bin/_cctally_dashboard.py:2611 (alerts list row-identity widening;
+        Site F in spec §3.3 — bucket C per spec §3.2's three-bucket model)
+
+    Idempotent: a second invocation finds the column already present and
+    returns. Empty-table fast path: when the column is already present
+    (fresh-install fast-stamp from the dispatcher because the live
+    ``CREATE TABLE IF NOT EXISTS five_hour_milestones`` already carries
+    the new shape — REQUIRED for fresh-install correctness per spec §3.2),
+    the marker still gets stamped — no schema edit needed.
+    """
+    # Fast-path probe: column already present means a prior run of this
+    # migration (or a fresh-install fast-stamp from the dispatcher that
+    # already picked up the new live-schema CREATE TABLE) has done the
+    # work. Just stamp the marker and return.
+    cols = {
+        str(r[1])
+        for r in conn.execute("PRAGMA table_info(five_hour_milestones)").fetchall()
+    }
+    if "reset_event_id" in cols:
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
+            "VALUES (?, ?)",
+            ("006_five_hour_milestones_reset_event_id", now_utc_iso()),
+        )
+        conn.commit()
+        return
+
+    conn.execute("BEGIN")
+    try:
+        # Add the column with sentinel 0 default (covers existing rows).
+        conn.execute(
+            "ALTER TABLE five_hour_milestones "
+            "ADD COLUMN reset_event_id INTEGER NOT NULL DEFAULT 0"
+        )
+        # SQLite can't ALTER a UNIQUE constraint in place; rename, recreate
+        # with the new 3-column UNIQUE, copy, drop. Preserves ids and every
+        # existing column (including those added by add_column_if_missing:
+        # alerted_at).
+        conn.execute(
+            "ALTER TABLE five_hour_milestones "
+            "RENAME TO five_hour_milestones_old_006"
+        )
+        conn.execute(
+            """
+            CREATE TABLE five_hour_milestones (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_id                    INTEGER NOT NULL,
+                five_hour_window_key        INTEGER NOT NULL,
+                percent_threshold           INTEGER NOT NULL,
+                captured_at_utc             TEXT    NOT NULL,
+                usage_snapshot_id           INTEGER NOT NULL,
+                block_input_tokens          INTEGER NOT NULL DEFAULT 0,
+                block_output_tokens         INTEGER NOT NULL DEFAULT 0,
+                block_cache_create_tokens   INTEGER NOT NULL DEFAULT 0,
+                block_cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+                block_cost_usd              REAL    NOT NULL DEFAULT 0,
+                marginal_cost_usd           REAL,
+                seven_day_pct_at_crossing   REAL,
+                alerted_at                  TEXT,
+                reset_event_id              INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(five_hour_window_key, percent_threshold, reset_event_id),
+                FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO five_hour_milestones (
+                id, block_id, five_hour_window_key, percent_threshold,
+                captured_at_utc, usage_snapshot_id,
+                block_input_tokens, block_output_tokens,
+                block_cache_create_tokens, block_cache_read_tokens,
+                block_cost_usd, marginal_cost_usd,
+                seven_day_pct_at_crossing, alerted_at, reset_event_id
+            )
+            SELECT id, block_id, five_hour_window_key, percent_threshold,
+                   captured_at_utc, usage_snapshot_id,
+                   block_input_tokens, block_output_tokens,
+                   block_cache_create_tokens, block_cache_read_tokens,
+                   block_cost_usd, marginal_cost_usd,
+                   seven_day_pct_at_crossing, alerted_at, reset_event_id
+              FROM five_hour_milestones_old_006
+            """
+        )
+        # Recreate the block_id index that was attached to the original
+        # table; the rename carried index metadata with the table, but
+        # the new table needs its own index entry. Safe under
+        # IF NOT EXISTS if the rename preserved it (it does in practice,
+        # but the explicit recreate is defensive).
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_five_hour_milestones_block
+            ON five_hour_milestones(block_id)
+            """
+        )
+        conn.execute("DROP TABLE five_hour_milestones_old_006")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
+            "VALUES (?, ?)",
+            ("006_five_hour_milestones_reset_event_id", now_utc_iso()),
         )
         conn.commit()
     except Exception:
