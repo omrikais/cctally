@@ -949,9 +949,12 @@ def test_pivots_run_when_event_row_already_committed(ns, tmp_path):
     pre-credit HWM (status line frozen) and the stale-replica rows
     (clamp re-clamps fresh OAuth values upward).
 
-    Fix: gate pivots on ``not is_dup`` (the post_percent-aware
-    pre-check), not on rowcount. Both pivots are individually
-    idempotent so re-running is safe.
+    Fix: hoist pivots OUT of the ``if not is_dup:`` block so they
+    fire unconditionally on every detection entry. Both pivots are
+    individually idempotent (file overwrite + DELETE on stable
+    predicate) so re-running on a replay or recovery tick is safe.
+    See round-4 follow-up for the pair-check refinement that
+    distinguishes a genuine replay from a new credit-with-idle.
     """
     end_iso, end_epoch = _future_week_end()
     resets_iso, resets_epoch_str, resets_epoch = _future_5h_block_window()

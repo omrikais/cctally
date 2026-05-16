@@ -1781,7 +1781,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                                     "[record-usage] 5h post-credit "
                                     f"cleanup failed: {exc}"
                                 )
-            except (sqlite3.DatabaseError, ValueError) as exc:
+            except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
                 eprint(
                     f"[record-usage] 5h in-place-credit detection "
                     f"failed: {exc}"
