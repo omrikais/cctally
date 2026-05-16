@@ -1700,6 +1700,142 @@ def test_credit_branch_defensive_cleanup_removes_stale_replays(ns, tmp_path):
         conn.close()
 
 
+def test_credit_branch_cleanup_tolerates_rounding_drift(ns, tmp_path):
+    """Issue #45 defensive hardening: replay rows whose ``weekly_percent``
+    differs from the stored pre-credit baseline by ≤1pp must still be
+    cleaned up.
+
+    Today the EXTERNAL claude-statusline tool replays cctally's
+    ``hwm-7d`` value byte-identically (its in-memory HWM equals the
+    HWM we just wrote), so strict ``round(.,1)`` equality has worked.
+    If Anthropic ever rounds the ``--percent`` payload differently
+    from the OAuth API used by record-usage, or if statusline grows
+    its own coarser rounding, a replay at ``67.5`` against a stored
+    ``prior_pct = 67.4`` would survive strict equality and then
+    dominate the reset-aware clamp's MAX over the post-credit segment,
+    masking legitimate post-credit values.
+
+    Scenario:
+      - pre-credit baseline at 67.4 (long-ago snapshot, protected by
+        the cleanup's timestamp filter)
+      - stale replay at 67.5 captured after ``effective_iso`` — the
+        row we want deleted; 0.1pp away from prior_pct
+      - post-credit OAuth-lag read at 67.4 captured even later —
+        becomes the latest row, so ``prior_pct = 67.4`` at the SELECT
+        site
+
+    Under strict ``round(.,1)`` equality, the 67.5 replay survives;
+    the reset-aware clamp's MAX(=67.5) then rejects the legitimate
+    post-credit 2% seed. The 1.0pp tolerance band catches the drift
+    so both the stale row and the seed land where they should.
+    """
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, week_end_date = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=67.4,
+        )
+        now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        floor_hour = now_utc.replace(minute=0, second=0)
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc=(floor_hour + dt.timedelta(minutes=5))
+            .isoformat().replace("+00:00", "Z"),
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=67.5,
+        )
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc=(floor_hour + dt.timedelta(minutes=6))
+            .isoformat().replace("+00:00", "Z"),
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_end_at=end_iso,
+            weekly_percent=67.4,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    args = _record_usage_args(percent=2.0, resets_at=end_epoch)
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute(
+            "SELECT effective_reset_at_utc FROM week_reset_events"
+        ).fetchall()
+        assert len(events) == 1, events
+        effective_iso = events[0]["effective_reset_at_utc"]
+
+        # The 67.5 drift replay (post-effective) MUST be gone. Under
+        # strict round-to-1dp equality it survived (round(67.5,1)=67.5
+        # vs round(67.4,1)=67.4); the tolerance band cleans it up.
+        stale_drift = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+            "  AND ABS(weekly_percent - 67.5) < 0.01",
+            (week_start_date, effective_iso),
+        ).fetchone()[0]
+        assert stale_drift == 0, (
+            "tolerance-band cleanup must remove replay rows whose "
+            "percent differs from prior_pct by ≤1pp (this row at 67.5 "
+            "vs prior_pct=67.4 survives strict round-to-1dp equality)"
+        )
+
+        # Pre-credit 67.4 baseline (captured before effective) MUST
+        # survive — the timestamp filter is the protection.
+        pre_credit = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? "
+            "  AND captured_at_utc < ? "
+            "  AND ABS(weekly_percent - 67.4) < 0.01",
+            (week_start_date, effective_iso),
+        ).fetchone()[0]
+        assert pre_credit == 1, (
+            "pre-credit 67.4 baseline must survive (timestamp filter)"
+        )
+
+        # Post-credit 2% seed MUST land. With the 67.5 replay surviving
+        # the cleanup under strict equality, the reset-aware clamp's
+        # MAX over the post-credit segment would be 67.5, and 2% would
+        # be rejected as a regression. The tolerance-band cleanup
+        # removes that row so the seed lands.
+        seed_landed = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? "
+            "  AND ABS(weekly_percent - 2.0) < 0.01",
+            (week_start_date,),
+        ).fetchone()[0]
+        assert seed_landed == 1, (
+            "post-credit 2% seed must land — proves the tolerance-band "
+            "cleanup unblocked the reset-aware clamp"
+        )
+
+        # The event row's observed_pre_credit_pct stamps the value we
+        # observed (67.4 — the value that drove prior_pct at the SELECT
+        # site). Decouples future cleanup tooling from re-deriving
+        # prior_pct.
+        ev = conn.execute(
+            "SELECT observed_pre_credit_pct FROM week_reset_events"
+        ).fetchone()
+        assert ev["observed_pre_credit_pct"] is not None
+        assert abs(float(ev["observed_pre_credit_pct"]) - 67.4) < 0.01
+    finally:
+        conn.close()
+
+
 # ── Round-3 Bug B: pre-credit ref synthesis ──────────────────────────
 
 

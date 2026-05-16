@@ -116,12 +116,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/stats.db",
-                        "registry_size": 6,
+                        "registry_size": 7,
                         "user_version": 0
                     },
                     "id": "db.stats.file",
                     "severity": "ok",
-                    "summary": "version 0 / 6 known",
+                    "summary": "version 0 / 7 known",
                     "title": "stats.db"
                 },
                 {
@@ -151,7 +151,8 @@
                                     "003_merge_5h_block_duplicates_v1",
                                     "004_heal_forked_week_start_date_buckets",
                                     "005_percent_milestones_reset_event_id",
-                                    "006_five_hour_milestones_reset_event_id"
+                                    "006_five_hour_milestones_reset_event_id",
+                                    "007_observed_pre_credit_pct"
                                 ],
                                 "skipped": []
                             }
@@ -159,7 +160,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/6 applied",
+                    "summary": "0/7 applied",
                     "title": "Migrations"
                 },
                 {
@@ -188,13 +189,17 @@
                             [
                                 "stats.db",
                                 "006_five_hour_milestones_reset_event_id"
+                            ],
+                            [
+                                "stats.db",
+                                "007_observed_pre_credit_pct"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "6 pending",
+                    "summary": "7 pending",
                     "title": "Pending migrations"
                 }
             ],

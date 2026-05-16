@@ -1500,12 +1500,19 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                             # UNIQUE(old, new) constraint permits this
                             # row, and the pre-check above keys on
                             # new_week_end_at so dedup still works.
+                            # Stamp ``observed_pre_credit_pct = prior_pct``
+                            # (issue #45): durable record of the pre-credit
+                            # baseline we observed at write time. Decouples
+                            # any future cleanup tooling from re-deriving
+                            # prior_pct via SELECT. Existing rows from
+                            # migration 007 carry NULL.
                             conn.execute(
                                 "INSERT OR IGNORE INTO week_reset_events "
                                 "(detected_at_utc, old_week_end_at, new_week_end_at, "
-                                " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+                                " effective_reset_at_utc, observed_pre_credit_pct) "
+                                "VALUES (?, ?, ?, ?, ?)",
                                 (now_utc_iso(), effective_iso, cur_end_canon,
-                                 effective_iso),
+                                 effective_iso, float(prior_pct)),
                             )
                             conn.commit()
                         # Pivots fire UNCONDITIONALLY whenever a credit
@@ -1553,24 +1560,29 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                         # own in-memory HWM cache and re-runs us once
                         # per status-line tick). Those replays land
                         # captured_at_utc >= effective_iso with
-                        # weekly_percent == prior_pct (the pre-credit
+                        # weekly_percent near prior_pct (the pre-credit
                         # value), and they dominate the reset-aware
                         # clamp's MAX over the post-credit segment so
                         # legitimate fresh OAuth values are rejected.
-                        # Strict equality (round(.,1)) keeps this
-                        # narrow: we only delete rows whose percent
-                        # exactly matches the pre-credit value we just
-                        # observed — legitimate post-credit climbs
-                        # past `prior_pct` (rare, but possible if the
-                        # credit is small + activity is heavy) stay.
+                        # 1.0pp tolerance band (issue #45) around the
+                        # observed pre-credit baseline absorbs any
+                        # rounding drift between cctally's OAuth read
+                        # and statusline's --percent payload (today
+                        # they match byte-identically, but the band
+                        # future-proofs against Anthropic or statusline
+                        # changing rounding). The band stays well below
+                        # the 25pp in-place credit detection threshold,
+                        # so legitimate post-credit values are never
+                        # caught. Bind is the in-scope ``prior_pct``,
+                        # which equals the just-stamped
+                        # ``observed_pre_credit_pct`` on the event row.
                         try:
                             conn.execute(
                                 "DELETE FROM weekly_usage_snapshots "
                                 "WHERE week_start_date = ? "
                                 "  AND unixepoch(captured_at_utc) >= "
                                 "      unixepoch(?) "
-                                "  AND round(weekly_percent, 1) = "
-                                "      round(?, 1)",
+                                "  AND ABS(weekly_percent - ?) < 1.0",
                                 (week_start_date, effective_iso,
                                  float(prior_pct)),
                             )

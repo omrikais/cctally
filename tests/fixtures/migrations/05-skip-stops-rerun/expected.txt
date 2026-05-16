@@ -1,12 +1,13 @@
 ## stdout
-stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 7 known
+stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 8 known
   ✓ 001_five_hour_block_models_backfill_v1         applied <REDACTED>
   ✓ 002_five_hour_block_projects_backfill_v1       applied <REDACTED>
   ✓ 003_merge_5h_block_duplicates_v1               applied <REDACTED>
   ✓ 004_heal_forked_week_start_date_buckets        applied <REDACTED>
   ✓ 005_percent_milestones_reset_event_id          applied <REDACTED>
   ✓ 006_five_hour_milestones_reset_event_id        applied <REDACTED>
-  ✗ 007_test_failure_injection                     FAILED last at <REDACTED>
+  ✓ 007_observed_pre_credit_pct                    applied <REDACTED>
+  ✗ 008_test_failure_injection                     FAILED last at <REDACTED>
                                                 See <HOME>/.local/share/cctally/logs/migration-errors.log
 
 cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 1 known
@@ -25,9 +26,10 @@ stats.db:
     004_heal_forked_week_start_date_buckets
     005_percent_milestones_reset_event_id
     006_five_hour_milestones_reset_event_id
+    007_observed_pre_credit_pct
   schema_migrations_skipped:
 ## log
-[<REDACTED>] stats.db:007_test_failure_injection
+[<REDACTED>] stats.db:008_test_failure_injection
   test failure injected
   Traceback (most recent call last):
     File "<CCTALLY_BIN>", line <N>, in _run_pending_migrations

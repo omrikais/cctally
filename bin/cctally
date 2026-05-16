@@ -3858,6 +3858,7 @@ def open_db() -> sqlite3.Connection:
             old_week_end_at        TEXT NOT NULL,
             new_week_end_at        TEXT NOT NULL,
             effective_reset_at_utc TEXT NOT NULL,
+            observed_pre_credit_pct REAL,
             UNIQUE(old_week_end_at, new_week_end_at)
         )
         """

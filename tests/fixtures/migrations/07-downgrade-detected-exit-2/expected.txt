@@ -1,6 +1,6 @@
 ## stdout
 
 ## stderr
-cctally: stats.db is at version 99 but this cctally only knows up to 7.
+cctally: stats.db is at version 99 but this cctally only knows up to 8.
 ## exit
 2

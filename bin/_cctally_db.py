@@ -1598,6 +1598,78 @@ def _migration_five_hour_milestones_reset_event_id(conn: sqlite3.Connection) -> 
         raise
 
 
+@stats_migration("007_observed_pre_credit_pct")
+def _migration_observed_pre_credit_pct(conn: sqlite3.Connection) -> None:
+    """Add ``observed_pre_credit_pct`` to ``week_reset_events`` so the
+    race-defensive cleanup DELETE in the in-place weekly credit branch
+    has a durable record of the pre-credit baseline we observed at
+    write time — independent of how the upstream claude-statusline
+    tool rounds replays.
+
+    Today statusline replays cctally's ``hwm-7d`` value byte-identically,
+    so the existing strict ``round(.,1)`` equality predicate is sound.
+    Future-proofs against rounding drift: if Anthropic ever rounds the
+    ``--percent`` payload differently from the OAuth API used by
+    record-usage, or if statusline grows its own coarser rounding, a
+    replay at e.g. 67.5 against a stored prior_pct = 67.4 would slip
+    past strict equality and then dominate the reset-aware clamp's
+    MAX over the post-credit segment. With the value stamped on the
+    event row, the cleanup predicate widens to a 1.0pp tolerance band
+    (issue #45) — wide enough to absorb single-digit drift, narrow
+    enough that legitimate post-credit observations (≥25pp away by
+    the in-place credit detection threshold's hypothesis) stay.
+
+    Backfill: NULL on existing rows. NULL is legacy / never-stamped;
+    the live cleanup's bind still uses the current tick's in-scope
+    ``prior_pct`` (the value we just observed and would have stamped),
+    so the cleanup remains correct on the very tick that writes the
+    row. The stored value matters for future tooling that may re-run
+    cleanup against an already-written event row.
+
+    Companion live-path edits land in:
+      - bin/cctally — CREATE TABLE adds the column for fresh installs.
+      - bin/_cctally_record.py — in-place credit INSERT stamps
+        ``observed_pre_credit_pct = prior_pct``; race-defensive DELETE
+        switches from ``round(weekly_percent,1) = round(?,1)`` to
+        ``ABS(weekly_percent - ?) < 1.0``.
+
+    Idempotent: a second invocation finds the column already present
+    and returns. Empty-column fast path: when the live CREATE TABLE
+    already carries the column (fresh install), stamp the marker and
+    return without an ALTER. Simple ADD COLUMN — no UNIQUE constraint
+    change, so no rename-recreate-copy needed (contrast migrations
+    005 / 006).
+    """
+    cols = {
+        str(r[1])
+        for r in conn.execute("PRAGMA table_info(week_reset_events)").fetchall()
+    }
+    if "observed_pre_credit_pct" in cols:
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
+            "VALUES (?, ?)",
+            ("007_observed_pre_credit_pct", now_utc_iso()),
+        )
+        conn.commit()
+        return
+
+    conn.execute("BEGIN")
+    try:
+        conn.execute(
+            "ALTER TABLE week_reset_events "
+            "ADD COLUMN observed_pre_credit_pct REAL"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
+            "VALUES (?, ?)",
+            ("007_observed_pre_credit_pct", now_utc_iso()),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 # === Region 8: Test-only migration registration (was bin/cctally:12086-12140) ===
 
 # ──────────────────────────────────────────────────────────────────────
