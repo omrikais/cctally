@@ -2671,6 +2671,12 @@ def _five_hour_blocks_to_json(
             "sevenDayPctAtBlockEnd":   p_end,
             "sevenDayPctDeltaPp":      delta,
             "crossedSevenDayReset":    crossed,
+            # Spec §5.1 — in-place credit events for this 5h block, in
+            # ascending effective_reset_at order. Empty list when the
+            # block carries no credit detections. Source: ``__credits``
+            # side-channel attached by ``cmd_five_hour_blocks`` via
+            # ``credits_by_window``.
+            "credits":                 d.get("__credits") or [],
         }
         if breakdown_axis == "model":
             out["modelBreakdowns"] = [
@@ -2752,6 +2758,20 @@ def _render_five_hour_blocks_table(
         formatted_start = _format_block_start(d["block_start_at"], args._resolved_tz)
         if crossed:
             formatted_start = f"⚡ {formatted_start}"
+        # Spec §5.1 — credit chip suffix. When the block carries one or
+        # more in-place credit events (5h credit detection v1.7.x;
+        # __credits side-channel set by ``cmd_five_hour_blocks``), append
+        # a ⚡-prefixed chip listing the per-credit delta-pp. Multiple
+        # credits in the same block concatenate (e.g.
+        # `⚡ credited -20pp, -8pp`). The chip text sits AFTER the
+        # block-start cell's existing crossed-reset glyph so the two
+        # signals visually disambiguate by position (crossed-reset
+        # prefix vs. credit suffix). Both use ⚡ — different semantics,
+        # different positions.
+        credits = d.get("__credits") or []
+        if credits:
+            deltas = ", ".join(f"{c['deltaPp']:+.0f}pp" for c in credits)
+            formatted_start = f"{formatted_start} ⚡ credited {deltas}"
         rows.append([
             formatted_start,
             "ACTIVE" if d["__is_active"] else "closed",

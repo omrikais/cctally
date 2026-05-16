@@ -149,3 +149,50 @@ def test_json_breakdown_omitted_by_default(home):
     payload = _run(home)
     assert "modelBreakdowns" not in payload["blocks"][0]
     assert "projectBreakdowns" not in payload["blocks"][0]
+
+
+def test_json_credits_empty_array_by_default(home):
+    """Spec §5.1 — every block carries ``credits`` (possibly empty)."""
+    payload = _run(home)
+    for blk in payload["blocks"]:
+        assert "credits" in blk
+        assert blk["credits"] == []
+
+
+def test_json_credits_populated_when_event_present(home, monkeypatch):
+    """Spec §5.1 — when a 5h credit event exists for a block's
+    ``five_hour_window_key``, the JSON envelope carries it under
+    ``credits[]`` with snake-case→camelCase mapping.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, home)
+    conn = ns["open_db"]()
+    # Attach credit to the most-recent block.
+    row = conn.execute(
+        "SELECT five_hour_window_key, block_start_at "
+        "  FROM five_hour_blocks ORDER BY block_start_at DESC LIMIT 1"
+    ).fetchone()
+    win_key = row["five_hour_window_key"]
+    conn.execute(
+        """
+        INSERT INTO five_hour_reset_events (
+            detected_at_utc, five_hour_window_key,
+            prior_percent, post_percent, effective_reset_at_utc
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        ("2026-04-30T12:00:00+00:00", win_key, 30.0, 5.0,
+         "2026-04-30T12:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+    payload = _run(home)
+    most_recent = payload["blocks"][0]
+    assert len(most_recent["credits"]) == 1
+    cred = most_recent["credits"][0]
+    assert cred["priorPercent"] == 30.0
+    assert cred["postPercent"] == 5.0
+    assert cred["deltaPp"] == -25.0
+    assert cred["effectiveResetAtUtc"] == "2026-04-30T12:00:00+00:00"
+    # Other blocks (no matching credit row) carry empty list.
+    other = payload["blocks"][1]
+    assert other["credits"] == []

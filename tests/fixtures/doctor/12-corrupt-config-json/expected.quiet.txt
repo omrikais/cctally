@@ -11,7 +11,7 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Pending migrations       5 pending
+  ⚠ Pending migrations       6 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
 Safety

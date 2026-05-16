@@ -2490,7 +2490,7 @@ def _select_current_block_for_envelope(
 
     block = conn.execute(
         """
-        SELECT block_start_at, last_observed_at_utc,
+        SELECT five_hour_window_key, block_start_at, last_observed_at_utc,
                seven_day_pct_at_block_start,
                crossed_seven_day_reset
           FROM five_hour_blocks
@@ -2539,11 +2539,41 @@ def _select_current_block_for_envelope(
         None if (p_anchor is None or current_used_pct is None)
         else round(current_used_pct - p_anchor, 9)
     )
+
+    # Spec §5.3 — in-place credit events for this 5h block's window,
+    # ascending by ``effective_reset_at_utc``. Drives the
+    # ``CurrentWeekPanel.tsx`` ``⚡ credited -Xpp`` chip and the
+    # ``CurrentWeekModal.tsx`` merged-stream 5h milestones section.
+    # Snake_case keys to match the envelope convention (see CLAUDE.md;
+    # CLI ``--json`` uses camelCase, dashboard envelope is snake_case).
+    cred_rows = conn.execute(
+        """
+        SELECT effective_reset_at_utc, prior_percent, post_percent
+          FROM five_hour_reset_events
+         WHERE five_hour_window_key = ?
+         ORDER BY effective_reset_at_utc ASC
+        """,
+        (int(block["five_hour_window_key"]),),
+    ).fetchall()
+    credits = [
+        {
+            "effective_reset_at_utc": c["effective_reset_at_utc"],
+            "prior_percent": float(c["prior_percent"]),
+            "post_percent": float(c["post_percent"]),
+            "delta_pp": round(
+                float(c["post_percent"]) - float(c["prior_percent"]), 1
+            ),
+        }
+        for c in cred_rows
+    ]
+
     return {
         "block_start_at":               block["block_start_at"],
+        "five_hour_window_key":         int(block["five_hour_window_key"]),
         "seven_day_pct_at_block_start": p_start,
         "seven_day_pct_delta_pp":       delta,
         "crossed_seven_day_reset":      crossed,
+        "credits":                      credits,
     }
 
 
@@ -3077,6 +3107,17 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                     }
                     for m in (snap.percent_milestones or [])
                 ],
+                # Spec §5.3 (Codex r1 finding 3) — NEW envelope key
+                # parallel to ``milestones`` (which carries the WEEKLY
+                # timeline). 5h-block milestones for the active block,
+                # in capture-time order, both pre- and post-credit
+                # segments included (bucket B per §3.2 — no
+                # ``reset_event_id`` filter; the React layer renders
+                # repeated thresholds as distinct rows keyed on
+                # ``reset_event_id``). Empty list when no 5h block is
+                # bound or the data source crashed during sync
+                # (recorded on ``last_sync_error``).
+                "five_hour_milestones":     getattr(snap, "five_hour_milestones", []) or [],
             },
 
         "forecast":

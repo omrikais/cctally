@@ -246,6 +246,7 @@
   "current_week": {
     "dollar_per_pct": 0.4521904761904763,
     "five_hour_block": null,
+    "five_hour_milestones": [],
     "five_hour_pct": null,
     "five_hour_resets_in_sec": null,
     "freshness": {

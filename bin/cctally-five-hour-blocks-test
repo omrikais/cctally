@@ -174,9 +174,9 @@ RESETS_7D=2100000000
     blocks_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('five_hour_blocks');")
     milestones_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('five_hour_milestones');")
     assert_eq "$blocks_cols"     "18" "five_hour_blocks column count"
-    # 14 = 13 base columns + `alerted_at TEXT` added by the threshold-actions
-    # T1 migration.
-    assert_eq "$milestones_cols" "14" "five_hour_milestones column count"
+    # 15 = 13 base columns + `alerted_at TEXT` (threshold-actions T1 migration)
+    # + `reset_event_id` (migration 006 — 5h in-place credit segment column).
+    assert_eq "$milestones_cols" "15" "five_hour_milestones column count"
 
     # Spot-check a few critical columns by name.
     has_window_key=$(sql "$home" "SELECT name FROM pragma_table_info('five_hour_blocks') WHERE name='five_hour_window_key';")

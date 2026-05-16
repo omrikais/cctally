@@ -148,6 +148,22 @@ export function CurrentWeekPanel() {
                 <div className="row1">
                   <span className="k">5-hour</span>
                   <span className="v cyan">{fmt.pct1(cw?.five_hour_pct)}</span>
+                  {/* Spec §5.3 — credit chip when one or more in-place
+                      credits exist for this block. Suffix to the 5h%
+                      reading; multiple credits concatenate as
+                      `⚡ credited -Xpp, -Ypp`. */}
+                  {fhb && Array.isArray(fhb.credits) && fhb.credits.length > 0 && (
+                    <span className="sub credit-chip" data-credit-count={fhb.credits.length}>
+                      {' '}⚡ credited{' '}
+                      {fhb.credits.map((c, i) => (
+                        <span key={i}>
+                          {i > 0 ? ', ' : ''}
+                          {c.delta_pp > 0 ? '+' : ''}
+                          {c.delta_pp.toFixed(0)}pp
+                        </span>
+                      ))}
+                    </span>
+                  )}
                 </div>
                 {fhb ? (
                   <div

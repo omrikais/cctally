@@ -129,3 +129,127 @@ def test_text_header_shows_block_metadata(home):
     assert "2026-04-30 10:30 UTC" in res.stdout
     assert "5h%: 42.0%" in res.stdout
     assert "Δ +4.2pp" in res.stdout
+
+
+@pytest.fixture
+def home_with_credit(tmp_path, monkeypatch):
+    """Block with 2 pre-credit milestones, 1 credit event, 2 post-credit
+    milestones (one at the same human threshold as a pre-credit row).
+
+    Exercises Spec §5.2's merged-stream render: text mode interleaves
+    the ⚡ CREDIT divider between pre- and post-credit milestones; JSON
+    envelope carries ``credits[]`` and per-milestone ``resetEventId``
+    discriminating segment cohorts.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("TZ", "Etc/UTC")
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    conn = ns["open_db"]()
+    resets_iso = "2026-04-30T15:30:00+00:00"
+    start_iso = "2026-04-30T10:30:00+00:00"
+    credit_iso = "2026-04-30T12:00:00+00:00"
+    key = ns["_canonical_5h_window_key"](
+        int(dt.datetime.fromisoformat(resets_iso).timestamp())
+    )
+    conn.execute(
+        """
+        INSERT INTO five_hour_blocks (
+            five_hour_window_key, five_hour_resets_at, block_start_at,
+            first_observed_at_utc, last_observed_at_utc,
+            final_five_hour_percent, total_cost_usd,
+            seven_day_pct_at_block_start, seven_day_pct_at_block_end,
+            crossed_seven_day_reset, is_closed,
+            created_at_utc, last_updated_at_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (key, resets_iso, start_iso, start_iso, resets_iso,
+         15.0, 10.50, 60.0, 64.0, 0, 1,
+         start_iso, resets_iso),
+    )
+    block_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+
+    # In-place credit event mid-block: 28% -> 8%.
+    cur = conn.execute(
+        """
+        INSERT INTO five_hour_reset_events (
+            detected_at_utc, five_hour_window_key,
+            prior_percent, post_percent, effective_reset_at_utc
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (credit_iso, key, 28.0, 8.0, credit_iso),
+    )
+    event_id = cur.lastrowid
+
+    # Pre-credit milestones (reset_event_id=0, the sentinel).
+    pre = [
+        (10, 5.00, None, 25.0, "2026-04-30T11:00:00+00:00"),
+        (15, 8.00, 0.60, 28.0, "2026-04-30T11:30:00+00:00"),
+    ]
+    for thr, cum, marg, p7d, ts in pre:
+        conn.execute(
+            """
+            INSERT INTO five_hour_milestones (
+                block_id, five_hour_window_key, percent_threshold,
+                captured_at_utc, usage_snapshot_id,
+                block_cost_usd, marginal_cost_usd, seven_day_pct_at_crossing,
+                reset_event_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (block_id, key, thr, ts, 0, cum, marg, p7d),
+        )
+    # Post-credit milestones (reset_event_id=<event_id>); note the
+    # threshold=10 repeats — distinct segment in the schema.
+    post = [
+        (10, 9.50, None, 30.0, "2026-04-30T13:00:00+00:00"),
+        (15, 10.50, 0.20, 32.0, "2026-04-30T13:45:00+00:00"),
+    ]
+    for thr, cum, marg, p7d, ts in post:
+        conn.execute(
+            """
+            INSERT INTO five_hour_milestones (
+                block_id, five_hour_window_key, percent_threshold,
+                captured_at_utc, usage_snapshot_id,
+                block_cost_usd, marginal_cost_usd, seven_day_pct_at_crossing,
+                reset_event_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (block_id, key, thr, ts, 0, cum, marg, p7d, event_id),
+        )
+    conn.commit()
+    conn.close()
+    return tmp_path
+
+
+def test_breakdown_renders_credit_divider_and_credits_array(home_with_credit):
+    """Spec §5.2 — JSON envelope carries credits[] + per-milestone
+    resetEventId; text mode shows ⚡ CREDIT divider between the
+    pre- and post-credit milestone segments.
+    """
+    payload = _run_json(home_with_credit)
+    # credits[] populated.
+    assert len(payload["credits"]) == 1
+    cred = payload["credits"][0]
+    assert cred["priorPercent"] == 28.0
+    assert cred["postPercent"] == 8.0
+    assert cred["deltaPp"] == -20.0
+    assert cred["effectiveResetAtUtc"] == "2026-04-30T12:00:00+00:00"
+
+    # milestones[] preserved AND ordered by captured_at_utc, NOT
+    # threshold. Pre-credit then post-credit; threshold=10 appears twice.
+    ms = payload["milestones"]
+    assert len(ms) == 4
+    thresholds = [m["percentThreshold"] for m in ms]
+    assert thresholds == [10, 15, 10, 15]
+    # resetEventId discriminates: 0 for pre-credit, >0 for post.
+    seg_ids = [m["resetEventId"] for m in ms]
+    assert seg_ids[0] == 0 and seg_ids[1] == 0
+    assert seg_ids[2] > 0 and seg_ids[3] > 0
+    assert seg_ids[2] == seg_ids[3]  # both post-credit share event id
+
+    # Text mode: ⚡ CREDIT divider in the table.
+    res = _run_text(home_with_credit)
+    assert res.returncode == 0
+    assert "⚡ CREDIT" in res.stdout
+    assert "-20pp" in res.stdout
+    assert "@ 12:00" in res.stdout

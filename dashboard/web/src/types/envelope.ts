@@ -148,6 +148,12 @@ export interface CurrentWeekEnvelope {
   // five_hour_window_key. Triggers fallback to the legacy single-big-number
   // layout in CurrentWeekPanel. Refs spec §4.1.
   five_hour_block: FiveHourBlockEnvelope | null;
+  // Spec §5.3 (Codex r1 finding 3) — NEW key, parallel to ``milestones``
+  // (which is the WEEKLY timeline). 5h-block per-percent milestones for
+  // the active 5h block, capture-time-ordered, both pre- and
+  // post-credit segments included. Optional for backward compat with
+  // older envelopes that predate v1.7.x.
+  five_hour_milestones?: FiveHourMilestone[];
 }
 
 export interface Milestone {
@@ -158,13 +164,43 @@ export interface Milestone {
   five_hour_pct_at_cross: number | null;
 }
 
+// Spec §5.3 — 5h-block milestone row. Snake_case to match the envelope.
+// Mirrors the CLI ``five-hour-breakdown --json`` milestone objects but
+// with envelope-convention key names.
+export interface FiveHourMilestone {
+  percent_threshold: number;
+  captured_at_utc: string;
+  block_cost_usd: number;
+  marginal_cost_usd: number | null;
+  seven_day_pct_at_crossing: number | null;
+  // Segment column (migration 006): ``0`` is the pre-credit / no-credit
+  // sentinel; non-zero values reference a ``five_hour_reset_events.id``.
+  // React's row key MUST include this to distinguish post-credit
+  // threshold repeats from their pre-credit counterparts.
+  reset_event_id: number;
+}
+
 // Snake_case to match the Python envelope; see CLAUDE.md re. snake/camel
 // inconsistency between dashboard envelope and CLI --json (intentional).
 export interface FiveHourBlockEnvelope {
   block_start_at: string;                    // ISO 8601 with offset
+  // Window key threading from server-side ``_select_current_block_for_envelope``.
+  // Used by analytics dispatches; optional for backward compat.
+  five_hour_window_key?: number;
   seven_day_pct_at_block_start: number | null;
   seven_day_pct_delta_pp: number | null;     // null on crossed-reset or missing anchor
   crossed_seven_day_reset: boolean;
+  // Spec §5.3 — in-place credit events for this block. Empty array when
+  // no credits detected. Optional for backward compat with envelopes
+  // that predate v1.7.x.
+  credits?: FiveHourCredit[];
+}
+
+export interface FiveHourCredit {
+  effective_reset_at_utc: string;
+  prior_percent: number;
+  post_percent: number;
+  delta_pp: number;
 }
 
 export interface ForecastEnvelope {

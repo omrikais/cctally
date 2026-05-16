@@ -9513,6 +9513,31 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
         # to fill seven_day_pct_at_block_end on the active row.
         latest_7d, latest_window_key = _latest_seven_day_and_window(conn)
 
+        # Pre-load credit events for every window_key the rows query
+        # returned. Single index-scan over `five_hour_reset_events`;
+        # build a window_key -> list[Credit] map keyed for in-process
+        # JOIN against each block dict. Used by both the text/JSON
+        # render path AND the share-output snapshot wiring (spec §5.1.1).
+        # Loaded in a single pass — no per-block SELECT.
+        credit_rows = conn.execute(
+            "SELECT five_hour_window_key, prior_percent, post_percent, "
+            "       effective_reset_at_utc "
+            "  FROM five_hour_reset_events "
+            " ORDER BY five_hour_window_key, effective_reset_at_utc"
+        ).fetchall()
+        credits_by_window: dict[int, list[dict]] = {}
+        for cr in credit_rows:
+            credits_by_window.setdefault(
+                int(cr["five_hour_window_key"]), []
+            ).append({
+                "effectiveResetAtUtc": cr["effective_reset_at_utc"],
+                "priorPercent": float(cr["prior_percent"]),
+                "postPercent": float(cr["post_percent"]),
+                "deltaPp": round(
+                    float(cr["post_percent"]) - float(cr["prior_percent"]), 1
+                ),
+            })
+
         # Build per-block dicts with the active-flag side-channel.
         block_dicts: list[dict] = []
         for r in rows:
@@ -9521,6 +9546,11 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
             d["__is_active"] = is_active
             if is_active and latest_7d is not None:
                 d["seven_day_pct_at_block_end"] = latest_7d
+            # Side-channel (parallel to __is_active): list of credit
+            # event dicts for this block's window. Empty list when none.
+            d["__credits"] = credits_by_window.get(
+                int(d["five_hour_window_key"]), []
+            )
             block_dicts.append(d)
 
         # Shareable-reports gate: --format short-circuits the JSON / table
@@ -9634,17 +9664,49 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
             )
             return 2
 
+        # Spec §5.2: ORDER BY captured_at_utc ASC (NOT percent_threshold)
+        # so post-credit segments interleave with pre-credit ones in
+        # time-order — same human threshold number can appear twice
+        # (once per reset_event_id segment) and must render in the
+        # order it crossed. Bucket B per §3.2: read ALL segments (no
+        # ``reset_event_id`` filter).
         milestones = conn.execute(
             """
             SELECT percent_threshold, captured_at_utc,
                    block_cost_usd, marginal_cost_usd,
-                   seven_day_pct_at_crossing
+                   seven_day_pct_at_crossing, reset_event_id
               FROM five_hour_milestones
              WHERE block_id = ?
-             ORDER BY percent_threshold ASC
+             ORDER BY captured_at_utc ASC, id ASC
             """,
             (block["id"],),
         ).fetchall()
+
+        # Spec §5.2 — load in-place credit events for this block's
+        # window, ascending by effective_reset_at_utc, so the text
+        # renderer can interleave a ``⚡ CREDIT  -Xpp @ HH:MM`` divider
+        # row between pre- and post-credit milestone segments and JSON
+        # consumers see the parallel ``credits[]`` array (Section 5.2).
+        credit_rows = conn.execute(
+            """
+            SELECT effective_reset_at_utc, prior_percent, post_percent
+              FROM five_hour_reset_events
+             WHERE five_hour_window_key = ?
+             ORDER BY effective_reset_at_utc ASC
+            """,
+            (block["five_hour_window_key"],),
+        ).fetchall()
+        credits_list: list[dict] = [
+            {
+                "effectiveResetAtUtc": c["effective_reset_at_utc"],
+                "priorPercent": float(c["prior_percent"]),
+                "postPercent": float(c["post_percent"]),
+                "deltaPp": round(
+                    float(c["post_percent"]) - float(c["prior_percent"]), 1
+                ),
+            }
+            for c in credit_rows
+        ]
 
         crossed = bool(block.get("crossed_seven_day_reset"))
         p_start = block.get("seven_day_pct_at_block_start")
@@ -9682,6 +9744,10 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
             "sevenDayPctDeltaPp":      delta,
             "crossedSevenDayReset":    crossed,
         }
+        # Spec §5.2: expose ``resetEventId`` on each milestone so JSON
+        # consumers can disambiguate post-credit threshold repeats from
+        # pre-credit ones. ``0`` is the pre-credit/no-credit sentinel
+        # (matches the schema default).
         ms_out = [
             {
                 "percentThreshold":      m["percent_threshold"],
@@ -9692,13 +9758,23 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
                     else round(m["marginal_cost_usd"], 9)
                 ),
                 "sevenDayPctAtCrossing": m["seven_day_pct_at_crossing"],
+                "resetEventId":          int(m["reset_event_id"] or 0),
             }
             for m in milestones
         ]
 
         if args.json:
+            # Spec §5.2: ``credits`` is the parallel array to
+            # ``milestones`` — same shape as the ``credits`` field on
+            # ``five-hour-blocks --json`` (§5.1). Stacked credits across
+            # distinct 10-min slots produce multiple entries.
             print(json.dumps(
-                {"schemaVersion": 1, "block": block_out, "milestones": ms_out},
+                {
+                    "schemaVersion": 1,
+                    "block": block_out,
+                    "milestones": ms_out,
+                    "credits": credits_list,
+                },
                 indent=2,
             ))
             return 0
@@ -9739,7 +9815,47 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
         headers = ["#", "Threshold", "Cumulative Cost", "Marginal Cost",
                    "7d at crossing"]
         rows = []
-        for idx, m in enumerate(ms_out, start=1):
+        # Spec §5.2 — merged event stream. Interleave milestones and
+        # credits in time-order (``capturedAt`` for milestones,
+        # ``effectiveResetAtUtc`` for credits). Credits render as a
+        # divider row with ``⚡ CREDIT`` in the Threshold cell and the
+        # delta-pp + HH:MM in the rightmost cell; the milestone row
+        # numbering counter (``#``) continues across the divider so the
+        # ordinal still reflects "the Nth event in this block."
+        merged_events: list[tuple[str, dict]] = []
+        for m in ms_out:
+            merged_events.append(("milestone", m))
+        for c in credits_list:
+            merged_events.append(("credit", c))
+        merged_events.sort(key=lambda ev: (
+            ev[1]["effectiveResetAtUtc"] if ev[0] == "credit"
+            else ev[1]["capturedAt"]
+        ))
+        idx = 0
+        for kind, ev in merged_events:
+            idx += 1
+            if kind == "credit":
+                # Spec §5.2: ⚡ CREDIT  -Xpp @ HH:MM divider row.
+                # HH:MM rendered in the display tz via format_display_dt.
+                # ``format_display_dt`` is the documented chokepoint for
+                # human-displayed datetimes (CLAUDE.md). The deltaPp
+                # value is float; format as integer ppm (mirrors the
+                # five-hour-blocks chip in §5.1).
+                hhmm = format_display_dt(
+                    ev["effectiveResetAtUtc"],
+                    args._resolved_tz,
+                    fmt="%H:%M",
+                    suffix=False,
+                )
+                rows.append([
+                    str(idx),
+                    "⚡ CREDIT",
+                    f"{ev['deltaPp']:+.0f}pp",
+                    "",
+                    f"@ {hhmm}",
+                ])
+                continue
+            m = ev
             cum = f"${m['blockCostUSD']:.6f}"
             marg = (
                 "n/a" if m["marginalCostUSD"] is None
@@ -13888,8 +14004,21 @@ def _build_five_hour_blocks_snapshot(
         used_pct = float(r.get("final_five_hour_percent") or 0.0)
         crossed = bool(r.get("crossed_seven_day_reset"))
         cell_text = "⚡" if crossed else "—"
+        # Spec §5.1.1 (Codex r2 finding 3): consume the ``__credits``
+        # side-channel set by ``cmd_five_hour_blocks`` and append a
+        # ``⚡ -Xpp, -Ypp`` chip to the block_start cell. Pure-string
+        # cell content flows uniformly through markdown / HTML table /
+        # SVG text renderers without per-format additions. Symmetric to
+        # the existing ⚡ glyph in the cross_reset cell — by position
+        # (block_start suffix vs. dedicated column) the two annotations
+        # remain visually distinguishable.
+        credits = r.get("__credits") or []
+        block_cell = block_lbl
+        if credits:
+            deltas = ", ".join(f"{c['deltaPp']:+.0f}pp" for c in credits)
+            block_cell = f"{block_lbl} ⚡ {deltas}"
         snap_rows.append(_lib_share.Row(cells={
-            "block_start": _lib_share.TextCell(block_lbl),
+            "block_start": _lib_share.TextCell(block_cell),
             "cost": _lib_share.MoneyCell(cost_usd),
             "used_pct": _lib_share.PercentCell(used_pct),
             "cross_reset": _lib_share.TextCell(cell_text),

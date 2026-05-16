@@ -1030,6 +1030,56 @@ def _tui_build_percent_milestones(
     return out
 
 
+def _tui_build_five_hour_milestones(
+    conn: sqlite3.Connection,
+    five_hour_window_key: int | None,
+) -> list[dict]:
+    """Return per-percent 5h-block milestones for the given window, in
+    capture-time order. Spec §5.3 — drives the CurrentWeekModal's new
+    5h-milestone timeline section.
+
+    Bucket B per §3.2: NO ``reset_event_id`` filter — both pre- and
+    post-credit segments render in the merged chronological stream so
+    the user sees the full history of the active block including
+    repeated threshold values after an in-place credit. The React layer
+    differentiates rows by ``reset_event_id`` for key uniqueness.
+
+    Returns [] when the current week has no API-anchored 5h block. The
+    envelope-shaped dict mirrors the CLI ``five-hour-breakdown --json``
+    milestone objects but with snake_case keys (envelope convention).
+    """
+    if five_hour_window_key is None:
+        return []
+    rows = conn.execute(
+        """
+        SELECT percent_threshold, captured_at_utc, block_cost_usd,
+               marginal_cost_usd, seven_day_pct_at_crossing,
+               reset_event_id
+          FROM five_hour_milestones
+         WHERE five_hour_window_key = ?
+         ORDER BY captured_at_utc ASC, id ASC
+        """,
+        (int(five_hour_window_key),),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        out.append({
+            "percent_threshold": int(r["percent_threshold"]),
+            "captured_at_utc":   r["captured_at_utc"],
+            "block_cost_usd":    float(r["block_cost_usd"]),
+            "marginal_cost_usd": (
+                None if r["marginal_cost_usd"] is None
+                else float(r["marginal_cost_usd"])
+            ),
+            "seven_day_pct_at_crossing": (
+                None if r["seven_day_pct_at_crossing"] is None
+                else float(r["seven_day_pct_at_crossing"])
+            ),
+            "reset_event_id": int(r["reset_event_id"] or 0),
+        })
+    return out
+
+
 @dataclass
 class DataSnapshot:
     """All data needed to render one TUI frame. Produced by sync thread,
@@ -1062,6 +1112,13 @@ class DataSnapshot:
     # `current_week.five_hour_block` is precomputed via
     # `_select_current_block_for_envelope`).
     alerts: list[dict] = field(default_factory=list)
+    # ---- 5h in-place credit (v1.7.x) ----
+    # Already-envelope-shaped dicts for the CurrentWeekModal's new 5h
+    # milestone timeline (spec §5.3, Codex r1 finding 3). Parallel to
+    # ``percent_milestones`` (which carries the WEEKLY timeline). Loaded
+    # at sync-thread time so ``snapshot_to_envelope`` stays a pure
+    # renderer; empty list when no current 5h block is bound.
+    five_hour_milestones: list[dict] = field(default_factory=list)
 
     @classmethod
     def synthesize_for_marketing(cls, *, as_of_iso: str) -> "DataSnapshot":
@@ -1888,6 +1945,19 @@ def _tui_build_snapshot(
             alerts = _build_alerts_envelope_array(conn)
         except Exception as exc:
             errors.append(f"alerts: {exc}")
+        # ---- 5h in-place credit (v1.7.x) ----
+        # Load 5h milestones (pre + post credit) for the current
+        # block's window so CurrentWeekModal can render a merged
+        # chronological timeline alongside its weekly milestones.
+        # Spec §5.3 (Codex r1 finding 3).
+        fh_milestones: list[dict] = []
+        try:
+            win_key = None
+            if cw is not None and isinstance(cw.five_hour_block, dict):
+                win_key = cw.five_hour_block.get("five_hour_window_key")
+            fh_milestones = _tui_build_five_hour_milestones(conn, win_key)
+        except Exception as exc:
+            errors.append(f"five-hour-milestones: {exc}")
         return DataSnapshot(
             current_week=cw,
             forecast=fc,
@@ -1903,6 +1973,7 @@ def _tui_build_snapshot(
             blocks_panel=blocks_panel,
             daily_panel=daily_panel,
             alerts=alerts,
+            five_hour_milestones=fh_milestones,
         )
     finally:
         conn.close()
@@ -2375,11 +2446,26 @@ def _tui_panel_current_week(
         f"${cw.dollars_per_percent:.2f}"
         if cw.dollars_per_percent is not None else "—"
     )
+    # Spec §5.4 — credit badge next to the 5h percent. Source: same
+    # ``cw.five_hour_block.credits`` channel that drives the dashboard
+    # chip; only show when at least one credit is present for the
+    # current block. Format: ``⚡ -Xpp`` (single) / ``⚡ -Xpp, -Ypp``
+    # (stacked across distinct 10-min slots).
+    fh_credit_badge = ""
+    fhb = getattr(cw, "five_hour_block", None)
+    if isinstance(fhb, dict):
+        fh_credits = fhb.get("credits") or []
+        if fh_credits:
+            deltas = ", ".join(
+                f"{float(c.get('delta_pp', 0.0)):+.0f}pp"
+                for c in fh_credits
+            )
+            fh_credit_badge = f" {{bright}}⚡ {deltas}{{/}}"
     lines = [
         "",
         f" Used   {{{used_cls}}}{bar_fill}{{/}} {{{used_cls}.b}}{cw.used_pct:>5.1f}%{{/}}",
         "",
-        f" 5-hour {{bar.accent}}{five_bar}{{/}} {{bright}}{int(five):>3d}%{{/}}",
+        f" 5-hour {{bar.accent}}{five_bar}{{/}} {{bright}}{int(five):>3d}%{{/}}{fh_credit_badge}",
         f"        {{dim}}{fr_str}{{/}}" if fr_str else "",
         "",
         f" {{dim}}Spent{{/}}    {{bright}}${cw.spent_usd:.2f}{{/}}        "
@@ -2427,6 +2513,19 @@ def _tui_panel_current_week_hero(
         reset_suffix = f"   {{dim}}resets {fr_hr}h {fr_mn:02d}m{{/}}"
     else:
         reset_suffix = ""
+
+    # Spec §5.4 — credit badge in the hero variant. Same source as the
+    # grid variant; append after the reset suffix so the badge follows
+    # the "resets in" timer.
+    fhb_hero = getattr(cw, "five_hour_block", None)
+    if isinstance(fhb_hero, dict):
+        fh_credits_hero = fhb_hero.get("credits") or []
+        if fh_credits_hero:
+            deltas_hero = ", ".join(
+                f"{float(c.get('delta_pp', 0.0)):+.0f}pp"
+                for c in fh_credits_hero
+            )
+            reset_suffix = f"{reset_suffix}  {{bright}}⚡ {deltas_hero}{{/}}"
 
     if snap.last_sync_error:
         health = "{warn}daemon error{/}"
