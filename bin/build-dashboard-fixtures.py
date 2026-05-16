@@ -47,6 +47,7 @@ from _fixture_builders import (  # noqa: E402
     create_stats_db,
     seed_session_entry,
     seed_session_file,
+    seed_week_reset_event,
 )
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests/fixtures/dashboard"
@@ -134,6 +135,7 @@ def _insert_milestones(
     dollars_per_percent: float,
     first_crossed_at: dt.datetime,
     per_percent_spacing: dt.timedelta,
+    reset_event_id: int = 0,
 ) -> None:
     """Seed `final_pct` percent_milestones rows for the given week.
     percent_threshold ranges from 1..final_pct; each crossing advances
@@ -143,6 +145,8 @@ def _insert_milestones(
     five_hour_percent_at_crossing left None (fixtures have no 5-hr data).
     usage_snapshot_id / cost_snapshot_id set to 0 (schema is NOT NULL but
     the reader path does not join on them).
+    reset_event_id: 0 (sentinel) for legacy / uncredited weeks, or a
+    week_reset_events.id for post-credit segment milestones (Task 5).
     """
     for p in range(1, final_pct + 1):
         crossed = first_crossed_at + per_percent_spacing * (p - 1)
@@ -154,8 +158,8 @@ def _insert_milestones(
                 week_start_at, week_end_at, percent_threshold,
                 cumulative_cost_usd, marginal_cost_usd,
                 usage_snapshot_id, cost_snapshot_id,
-                five_hour_percent_at_crossing)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                five_hour_percent_at_crossing, reset_event_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 _iso(crossed),
                 week_start.date().isoformat(),
@@ -168,6 +172,7 @@ def _insert_milestones(
                 0,
                 0,
                 None,
+                reset_event_id,
             ),
         )
 
@@ -772,13 +777,44 @@ def build_reset_week(as_of: dt.datetime) -> None:
                 week_start=week_start, week_end=post_reset_end, pct=pct,
             )
 
+        # Pre-seed the week_reset_events row that `_backfill_week_reset_events`
+        # would otherwise synthesize at first open. Inserting it here lets us
+        # stamp the post-credit milestones with the matching `reset_event_id`
+        # (Task 5) so the dashboard milestone-panel segment filter (Task 7)
+        # surfaces them. AUTOINCREMENT on a fresh table assigns id=1; backfill
+        # is `INSERT OR IGNORE` keyed on UNIQUE(old, new) so it no-ops at open.
+        # Production stores boundary timestamps via `_canonicalize_optional_iso`
+        # which renders the UTC offset as `+00:00`, NOT `Z` — use the matching
+        # form here so the UNIQUE constraint recognizes the backfill's attempt
+        # as a duplicate. With `Z` form, backfill would insert a SECOND row
+        # with `+00:00`, the segment lookup would pick id=2, and milestones
+        # stamped with id=1 would be filtered out as a stale segment.
+        def _iso_canon(d: dt.datetime) -> str:
+            return d.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+
+        seed_week_reset_event(
+            stats_conn,
+            detected_at_utc=_iso_canon(reset_at),
+            old_week_end_at=_iso_canon(pre_reset_end),
+            new_week_end_at=_iso_canon(post_reset_end),
+            effective_reset_at_utc=_iso_canon(reset_at),
+        )
+        reset_event_id_row = stats_conn.execute(
+            "SELECT id FROM week_reset_events WHERE new_week_end_at = ?",
+            (_iso_canon(post_reset_end),),
+        ).fetchone()
+        assert reset_event_id_row is not None, "reset event row missing"
+        post_credit_event_id = int(reset_event_id_row[0])
+
         # Post-reset milestones 1..5. Keyed with week_start_date from the
         # week_start datetime — matches what `cmd_record_usage` writes on
         # live crossings, regardless of whether a reset happened. The
         # milestone lookup path under test must re-resolve this from the
         # latest usage snapshot, NOT from
         # `TuiCurrentWeek.week_start_at.date()` (which, post-override,
-        # would be '2026-04-17').
+        # would be '2026-04-17'). reset_event_id stamps these as
+        # post-credit segment milestones so they survive the v1.7.2
+        # active-segment filter.
         _insert_milestones(
             stats_conn,
             week_start=week_start, week_end=post_reset_end,
@@ -786,6 +822,7 @@ def build_reset_week(as_of: dt.datetime) -> None:
             dollars_per_percent=0.95,
             first_crossed_at=reset_at + dt.timedelta(hours=2),
             per_percent_spacing=dt.timedelta(hours=4, minutes=30),
+            reset_event_id=post_credit_event_id,
         )
 
         # A few current-week sessions so spent_usd / $/1% have plausible
