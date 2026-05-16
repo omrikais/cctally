@@ -1083,3 +1083,249 @@ def test_pivots_run_when_event_row_already_committed(ns, tmp_path):
         assert original == 1
     finally:
         conn.close()
+
+
+# ── round-4 (Codex P1): pair-check dedup + pivot hoist ─────────────────
+
+
+def test_consecutive_credits_with_idle_between(ns, tmp_path):
+    """Codex r4 P1 regression: a second legitimate credit MUST land when
+    the user was idle between credits and the pre-check sees a
+    coincidental ``prior_5h_pct == prior_credit.post_percent`` match.
+
+    Pre-fix (round-3 predicate compared only post_percent against
+    prior_5h_pct): Credit 1 lands prior=20/post=5. User does NOTHING
+    (no activity, no ticks change five_hour_percent). Credit 2 arrives:
+    new CLI percent=0, prior_5h_pct still reads 5 (the snapshot from
+    Credit 1). The round-3 ``is_dup`` predicate read
+    ``round(prior_5h_pct, 1) == round(most_recent.post_percent, 1)`` →
+    ``5 == 5`` → True → second credit silently swallowed, no event row
+    written, no HWM force-write, no DELETE.
+
+    Post-fix (pair-check): the predicate now requires BOTH
+    ``(prior, post)`` to match the stored event. Credit 2's
+    ``(prior=5, post=0)`` does NOT match Credit 1's stored
+    ``(prior=20, post=5)``, so detection correctly proceeds.
+    """
+    end_iso, end_epoch = _future_week_end()
+    resets_iso, resets_epoch_str, resets_epoch = _future_5h_block_window()
+    window_key = ns["_canonical_5h_window_key"](resets_epoch)
+
+    conn = ns["open_db"]()
+    try:
+        # Pre-seed Credit 1's event row (prior=20, post=5) at an
+        # effective_iso in the recent past — simulates the state after
+        # Credit 1 has fully processed.
+        now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        credit_1_floor = ns["_floor_to_ten_minutes"](
+            now_utc - dt.timedelta(minutes=20)
+        )
+        credit_1_iso = credit_1_floor.isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO five_hour_reset_events "
+            "(detected_at_utc, five_hour_window_key, "
+            " prior_percent, post_percent, effective_reset_at_utc) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                ns["now_utc_iso"](),
+                window_key,
+                20.0,
+                5.0,
+                credit_1_iso,
+            ),
+        )
+        # Pre-seed the post-Credit-1 snapshot at percent=5 — this is
+        # what ``prior_5h_row`` will read on the Credit-2 tick.
+        _seed_5h_snapshot(
+            conn,
+            captured_at_utc=ns["now_utc_iso"](),
+            weekly_percent=42.0,
+            five_hour_percent=5.0,
+            five_hour_window_key=window_key,
+            five_hour_resets_at_iso=resets_iso,
+            week_end_at=end_iso,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Stage hwm-5h at the post-Credit-1 value so we can assert the
+    # second credit's force-write decreased it again.
+    hwm_path = ns["APP_DIR"] / "hwm-5h"
+    hwm_path.write_text(f"{window_key} 5.0\n")
+
+    # Credit 2 arrives: CLI percent=0; prior_5h_pct reads 5; Δ=5pp ≥ 5pp
+    # threshold. The pair-check sees stored (20,5) vs proposed (5,0) —
+    # NEITHER field matches → not a duplicate → proceeds to write.
+    args = _record_usage_args(
+        percent=42.0,
+        resets_at=end_epoch,
+        five_hour_percent=0.0,
+        five_hour_resets_at=resets_epoch_str,
+    )
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute(
+            "SELECT prior_percent, post_percent, effective_reset_at_utc "
+            "  FROM five_hour_reset_events "
+            " WHERE five_hour_window_key = ? "
+            " ORDER BY id",
+            (window_key,),
+        ).fetchall()
+        assert len(events) == 2, (
+            f"Credit 2 must land as a distinct event row; got "
+            f"{[dict(e) for e in events]}"
+        )
+        ev0, ev1 = [dict(e) for e in events]
+        # Credit 1 (pre-seeded).
+        assert round(ev0["prior_percent"], 1) == 20.0
+        assert round(ev0["post_percent"], 1) == 5.0
+        # Credit 2 (newly written by the fix).
+        assert round(ev1["prior_percent"], 1) == 5.0
+        assert round(ev1["post_percent"], 1) == 0.0
+    finally:
+        conn.close()
+
+    # hwm-5h force-written to 0.0 (the second credit's post_percent),
+    # proving the HWM pivot ran on the second credit.
+    hwm_parts = hwm_path.read_text().strip().split()
+    assert int(hwm_parts[0]) == window_key
+    assert round(float(hwm_parts[1]), 1) == 0.0, (
+        f"hwm-5h must force-write Credit 2's post_percent (=0.0); got "
+        f"{hwm_parts[1]}"
+    )
+
+
+def test_replay_with_pair_match_still_runs_pivots(ns, tmp_path):
+    """Round-4 hoist regression (memory
+    ``project_dedup_must_not_gate_side_effects.md``): when a recovery
+    tick pair-matches the already-stored event row (genuine replay),
+    the dedup pre-check correctly suppresses the duplicate INSERT —
+    but the pivots (HWM force-write + stale-replica DELETE) MUST
+    still fire.
+
+    Pre-fix (pivots gated on ``if not is_dup:``): a crash-recovery
+    tick where the original credit's event row already exists AND
+    the snapshot was rolled back (so prior_5h_pct still reads the
+    pre-credit value) takes the pair-match dedup path and skips
+    pivots → system stays wedged on the pre-credit HWM + any
+    stale-replica rows that have accumulated since the crash.
+
+    Post-fix (pivots hoisted out of the ``if not is_dup:`` block):
+    pivots always fire when detection has been entered. Both pivots
+    are individually idempotent — overwriting hwm-5h with the same
+    value is a no-op; DELETEing zero rows is a no-op — so re-running
+    them on the recovery tick is always safe.
+    """
+    end_iso, end_epoch = _future_week_end()
+    resets_iso, resets_epoch_str, resets_epoch = _future_5h_block_window()
+    window_key = ns["_canonical_5h_window_key"](resets_epoch)
+
+    conn = ns["open_db"]()
+    try:
+        # Pre-committed event row (crash mid-flight after the INSERT
+        # landed). Use a 10-min slot in the recent past so the
+        # recovery tick's effective_iso (= 10-min floor of now) is
+        # >= this and the DELETE predicate matches stale-replica rows.
+        now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        precommitted_floor = ns["_floor_to_ten_minutes"](now_utc)
+        precommitted_iso = precommitted_floor.isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO five_hour_reset_events "
+            "(detected_at_utc, five_hour_window_key, "
+            " prior_percent, post_percent, effective_reset_at_utc) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                ns["now_utc_iso"](),
+                window_key,
+                20.0,
+                5.0,
+                precommitted_iso,
+            ),
+        )
+        # Pre-credit snapshot still present (snapshot rolled back
+        # before commit; the event was already durable). prior_5h_pct
+        # will read 20 on the recovery tick.
+        _seed_5h_snapshot(
+            conn,
+            captured_at_utc=ns["now_utc_iso"](),
+            weekly_percent=42.0,
+            five_hour_percent=20.0,
+            five_hour_window_key=window_key,
+            five_hour_resets_at_iso=resets_iso,
+            week_end_at=end_iso,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Stage hwm-5h at the pre-credit value (pivots must force-write it
+    # back down on the recovery tick).
+    hwm_path = ns["APP_DIR"] / "hwm-5h"
+    hwm_path.write_text(f"{window_key} 20.0\n")
+
+    # Recovery tick: same percents as the crashed Credit 1 (prior=20,
+    # new=5). Pair-check predicate sees stored (20,5) vs proposed
+    # (20,5) — BOTH match → is_dup=True → INSERT skipped. Pivots
+    # must still run.
+    args = _record_usage_args(
+        percent=42.0,
+        resets_at=end_epoch,
+        five_hour_percent=5.0,
+        five_hour_resets_at=resets_epoch_str,
+    )
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    # Assertion 1: NO second event row (pair-match correctly dedups).
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute(
+            "SELECT prior_percent, post_percent "
+            "  FROM five_hour_reset_events "
+            " WHERE five_hour_window_key = ?",
+            (window_key,),
+        ).fetchall()
+        assert len(events) == 1, (
+            f"pair-match must dedup; got {[dict(e) for e in events]}"
+        )
+        assert round(events[0]["prior_percent"], 1) == 20.0
+        assert round(events[0]["post_percent"], 1) == 5.0
+    finally:
+        conn.close()
+
+    # Assertion 2: HWM force-written to the post-credit value (the
+    # hoisted pivot ran despite is_dup=True). File used to be "20.0";
+    # recovery tick force-writes it to "5.0".
+    hwm_parts = hwm_path.read_text().strip().split()
+    assert len(hwm_parts) == 2, hwm_parts
+    assert int(hwm_parts[0]) == window_key
+    assert round(float(hwm_parts[1]), 1) == 5.0, (
+        f"hwm-5h force-write pivot must run on pair-match recovery "
+        f"tick; got {hwm_parts[1]} (pre-fix bug: stays at 20.0)"
+    )
+
+    # Assertion 3: stale-replica DELETE ran (idempotent — the
+    # pre-credit snapshot we staged with captured_at = "now" matches
+    # the DELETE predicate `captured_at >= effective_iso AND
+    # five_hour_percent = prior_5h_pct = 20.0`). After the pivot,
+    # zero rows at the pre-credit value should remain at-or-after the
+    # effective_iso slot.
+    conn = ns["open_db"]()
+    try:
+        stale_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM weekly_usage_snapshots "
+            "WHERE five_hour_window_key = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+            "  AND round(five_hour_percent, 1) = 20.0",
+            (window_key, precommitted_iso),
+        ).fetchone()["c"]
+        assert stale_count == 0, (
+            "stale-replica DELETE pivot must run on pair-match recovery "
+            "tick"
+        )
+    finally:
+        conn.close()

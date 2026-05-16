@@ -1599,12 +1599,14 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
             #     ``_canonical_5h_window_key``'s 600s floor), not hour.
             #     Up to ~30 distinct slots per 5h block; same-slot
             #     collisions absorbed by UNIQUE per spec §2.3.
-            #   - Pre-check: compares latest event's ``post_percent``
-            #     against this tick's prior_5h_pct, not ``new_week_end_at``
-            #     equality. A second NEW credit later in the block
-            #     has prior_5h_pct > previous event's post_percent so
-            #     the INSERT lands; a re-observation of the same credit
-            #     has prior_5h_pct == post_percent and is skipped.
+            #   - Pre-check: pair-checks the latest event's
+            #     ``(prior_percent, post_percent)`` against this tick's
+            #     ``(prior_5h_pct, five_hour_percent)``, not
+            #     ``new_week_end_at`` equality. A genuine replay matches
+            #     BOTH fields; a NEW credit-with-idle (prior_pct equals
+            #     the prior credit's post_pct because the user didn't
+            #     move between credits) matches only one field and
+            #     correctly proceeds to write a second event row.
             try:
                 if (
                     five_hour_window_key is not None
@@ -1638,15 +1640,26 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                             and (prior_5h_pct - float(five_hour_percent))
                                 >= c._FIVE_HOUR_RESET_PCT_DROP_THRESHOLD
                         ):
-                            # Post_percent-aware pre-check (spec §2.2,
-                            # Codex r1 finding 4): only skip when the
-                            # most-recent event for THIS window already
-                            # records exactly this drop (the same credit
-                            # re-observed, prior_5h_pct equals the
-                            # stored post_percent — a stale-replica or
-                            # delayed-tick replay).
+                            # Pair-check dedup pre-check (spec §2.2;
+                            # refined by Codex r4 P1 finding). The
+                            # round-1 predicate compared only the
+                            # latest event's ``post_percent`` against
+                            # this tick's ``prior_5h_pct``; that
+                            # false-positived on a legitimate 2nd
+                            # credit where the user was idle between
+                            # credits (Credit 1 lands prior=20/post=5;
+                            # user does nothing; Credit 2 arrives with
+                            # CLI percent=0 so prior_5h_pct=5 reads
+                            # equal to stored post_percent=5 →
+                            # silently swallowed). Pair-checking
+                            # against BOTH fields disambiguates: a
+                            # genuine replay matches BOTH; a new
+                            # credit-with-idle matches at most ONE
+                            # (the prior side coincides but
+                            # post_percent differs).
                             most_recent = conn.execute(
-                                "SELECT post_percent FROM five_hour_reset_events "
+                                "SELECT prior_percent, post_percent "
+                                "  FROM five_hour_reset_events "
                                 " WHERE five_hour_window_key = ? "
                                 " ORDER BY id DESC LIMIT 1",
                                 (int(five_hour_window_key),),
@@ -1654,22 +1667,31 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                             is_dup = (
                                 most_recent is not None
                                 and round(prior_5h_pct, 1)
+                                == round(float(most_recent["prior_percent"]), 1)
+                                and round(float(five_hour_percent), 1)
                                 == round(float(most_recent["post_percent"]), 1)
                             )
+                            # 10-min floor (spec §2.3 — bounded
+                            # stacked-credit resolution; one event per
+                            # 10-min slot per block). Resolved BEFORE
+                            # the ``if not is_dup`` branch so it's in
+                            # scope for the pivots below (per memory
+                            # ``project_dedup_must_not_gate_side_effects.md``:
+                            # the recovery-tick path must still force
+                            # HWM + DELETE even when the INSERT is
+                            # absorbed by the pre-check or by
+                            # UNIQUE — see comment below for the
+                            # crash scenario). ``_floor_to_ten_minutes``
+                            # is a cctally module attribute; the
+                            # ``c.X`` accessor resolves at call time
+                            # so test ``monkeypatch.setitem(ns,
+                            # "_floor_to_ten_minutes", …)``
+                            # propagates.
+                            effective_dt = c._floor_to_ten_minutes(now_utc)
+                            effective_iso = effective_dt.isoformat(
+                                timespec="seconds"
+                            )
                             if not is_dup:
-                                # 10-min floor (spec §2.3 — bounded
-                                # stacked-credit resolution; one event
-                                # per 10-min slot per block).
-                                # ``_floor_to_ten_minutes`` is a cctally
-                                # module attribute; the c.X accessor
-                                # resolves at call time so test
-                                # ``monkeypatch.setitem(ns,
-                                # "_floor_to_ten_minutes", …)``
-                                # propagates.
-                                effective_dt = c._floor_to_ten_minutes(now_utc)
-                                effective_iso = effective_dt.isoformat(
-                                    timespec="seconds"
-                                )
                                 conn.execute(
                                     "INSERT OR IGNORE INTO five_hour_reset_events "
                                     "(detected_at_utc, five_hour_window_key, "
@@ -1685,85 +1707,80 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                                     ),
                                 )
                                 conn.commit()
-                                # Pivots fire UNCONDITIONALLY whenever a
-                                # credit is detected — they're not gated
-                                # on ``rowcount == 1`` for the
-                                # INSERT OR IGNORE above. Memory
-                                # ``project_dedup_must_not_gate_side_effects.md``:
-                                # "Skipping a no-op INSERT must NOT skip
-                                # milestones/rollups/alerts; prior run
-                                # may have died mid-flight." Crash
-                                # scenario: tick N committed the event
-                                # row, then died before HWM + DELETE.
-                                # Tick N+1's INSERT OR IGNORE returns
-                                # rowcount == 0 (UNIQUE absorbs), but
-                                # the system is still wedged on the
-                                # pre-credit HWM and the stale-replica
-                                # rows. The pivots are individually
-                                # idempotent (file overwrite + DELETE
-                                # on stable predicate), so re-running
-                                # them is safe — what matters is that
-                                # they always run when this tick has
-                                # observed a credit. The
-                                # ``not is_dup`` guard above
-                                # (post_percent-aware pre-check) is the
-                                # right idempotency level: it skips
-                                # work only when the most-recent
-                                # event's post_percent equals this
-                                # tick's prior_5h_pct (i.e. claude-
-                                # statusline replaying the same pre-
-                                # credit value past the credit moment,
-                                # AFTER our DELETE has already
-                                # cleaned the prior replay rows).
-                                #
-                                # Force-write hwm-5h: bypasses the
-                                # monotonic guard at the normal
-                                # hwm-5h writer below. Lands AFTER
-                                # ``conn.commit()`` so a concurrent
-                                # reader doesn't see the new HWM
-                                # before the event row is durable.
-                                # File format matches the canonical
-                                # writer: ``<key> <percent>\n``.
-                                try:
-                                    (c.APP_DIR / "hwm-5h").write_text(
-                                        f"{int(five_hour_window_key)} "
-                                        f"{float(five_hour_percent)}\n"
-                                    )
-                                except OSError:
-                                    pass
-                                # Stale-replica DELETE (spec §4.3).
-                                # Defends against claude-statusline
-                                # replaying the pre-credit
-                                # ``--five-hour-percent`` value past
-                                # the credit moment from its own
-                                # in-memory HWM cache. Strict
-                                # round-1 equality keeps the scope
-                                # narrow — only rows whose
-                                # five_hour_percent exactly matches
-                                # the just-observed pre-credit
-                                # value are removed. ``unixepoch()``
-                                # on both sides for offset
-                                # robustness (Z vs +00:00).
-                                try:
-                                    conn.execute(
-                                        "DELETE FROM weekly_usage_snapshots "
-                                        " WHERE five_hour_window_key = ? "
-                                        "   AND unixepoch(captured_at_utc) "
-                                        "       >= unixepoch(?) "
-                                        "   AND round(five_hour_percent, 1) "
-                                        "       = round(?, 1)",
-                                        (
-                                            int(five_hour_window_key),
-                                            effective_iso,
-                                            prior_5h_pct,
-                                        ),
-                                    )
-                                    conn.commit()
-                                except sqlite3.DatabaseError as exc:
-                                    eprint(
-                                        "[record-usage] 5h post-credit "
-                                        f"cleanup failed: {exc}"
-                                    )
+                            # Pivots fire UNCONDITIONALLY whenever a
+                            # credit is detected — NOT gated on
+                            # ``not is_dup`` and NOT on
+                            # ``rowcount == 1``. Memory
+                            # ``project_dedup_must_not_gate_side_effects.md``:
+                            # "Skipping a no-op INSERT must NOT skip
+                            # milestones/rollups/alerts; prior run may
+                            # have died mid-flight." Crash scenario A:
+                            # tick N committed the event row, then died
+                            # before HWM + DELETE. Tick N+1's
+                            # INSERT OR IGNORE returns rowcount == 0
+                            # (UNIQUE absorbs) but the system is still
+                            # wedged on the pre-credit HWM + stale-
+                            # replica rows. Crash scenario B (the
+                            # Codex r4 finding): a recovery tick where
+                            # ``(prior, post)`` pair-matches the
+                            # already-stored event row also takes the
+                            # ``is_dup`` branch; without the hoist the
+                            # pivots would be skipped and the system
+                            # would stay wedged. The pivots are
+                            # individually idempotent (file overwrite
+                            # + DELETE on a stable predicate), so
+                            # re-running them on the recovery tick is
+                            # always safe. Mirrors the weekly hoist at
+                            # ``_cctally_record.py`` after the
+                            # ``if already is None`` block (grep
+                            # ``Force-write hwm-7d``).
+                            #
+                            # Force-write hwm-5h: bypasses the
+                            # monotonic guard at the normal hwm-5h
+                            # writer below. Lands AFTER
+                            # ``conn.commit()`` so a concurrent reader
+                            # doesn't see the new HWM before the
+                            # event row is durable. File format
+                            # matches the canonical writer:
+                            # ``<key> <percent>\n``.
+                            try:
+                                (c.APP_DIR / "hwm-5h").write_text(
+                                    f"{int(five_hour_window_key)} "
+                                    f"{float(five_hour_percent)}\n"
+                                )
+                            except OSError:
+                                pass
+                            # Stale-replica DELETE (spec §4.3).
+                            # Defends against claude-statusline
+                            # replaying the pre-credit
+                            # ``--five-hour-percent`` value past the
+                            # credit moment from its own in-memory
+                            # HWM cache. Strict round-1 equality
+                            # keeps the scope narrow — only rows
+                            # whose five_hour_percent exactly matches
+                            # the just-observed pre-credit value are
+                            # removed. ``unixepoch()`` on both sides
+                            # for offset robustness (Z vs +00:00).
+                            try:
+                                conn.execute(
+                                    "DELETE FROM weekly_usage_snapshots "
+                                    " WHERE five_hour_window_key = ? "
+                                    "   AND unixepoch(captured_at_utc) "
+                                    "       >= unixepoch(?) "
+                                    "   AND round(five_hour_percent, 1) "
+                                    "       = round(?, 1)",
+                                    (
+                                        int(five_hour_window_key),
+                                        effective_iso,
+                                        prior_5h_pct,
+                                    ),
+                                )
+                                conn.commit()
+                            except sqlite3.DatabaseError as exc:
+                                eprint(
+                                    "[record-usage] 5h post-credit "
+                                    f"cleanup failed: {exc}"
+                                )
             except (sqlite3.DatabaseError, ValueError) as exc:
                 eprint(
                     f"[record-usage] 5h in-place-credit detection "
