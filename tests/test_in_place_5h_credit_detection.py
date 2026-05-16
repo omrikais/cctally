@@ -765,6 +765,174 @@ def test_stale_replica_delete(ns, tmp_path):
         conn.close()
 
 
+def test_credit_branch_5h_cleanup_tolerates_rounding_drift(ns, tmp_path):
+    """Issue #48 defensive hardening (symmetric follow-up to #45): 5h
+    replay rows whose ``five_hour_percent`` differs from the stored
+    pre-credit baseline by ≤1pp must still be cleaned up.
+
+    Today the EXTERNAL claude-statusline tool replays cctally's
+    ``hwm-5h`` value byte-identically, so the existing strict
+    ``round(.,1)`` equality predicate has worked. The vulnerability
+    is forward-looking: if Anthropic ever rounds the
+    ``--five-hour-percent`` payload differently from the OAuth API
+    used by record-usage, or if statusline grows its own coarser
+    rounding for the 5h dimension, a replay at ``27.5`` against a
+    stored ``prior_5h_pct = 27.4`` would slip past strict equality
+    and then dominate the reset-aware 5h clamp's MAX over the
+    post-credit segment, masking legitimate post-credit values.
+
+    Scenario (mirrors weekly drift test):
+      - pre-credit baseline at 27.4 (long-ago snapshot, protected by
+        the cleanup's timestamp filter)
+      - stale replay at 27.5 captured at-or-after the runtime's
+        10-min floor (post-effective_iso, 0.1pp drift)
+      - post-credit OAuth-lag at 27.4 captured even later (latest
+        row, so ``prior_5h_pct = 27.4`` at the SELECT site)
+      - record-usage tick with five_hour_percent=4.0 fires detection
+        (27.4 − 4.0 = 23.4pp ≫ 5.0pp threshold)
+
+    Under strict ``round(.,1)`` equality the 27.5 replay survives;
+    the reset-aware clamp's MAX(=27.5) then rejects the legitimate
+    post-credit 4% seed. The 1.0pp tolerance band catches the drift
+    so both the stale row and the seed land where they should. The
+    band stays well below the 5.0pp 5h detection threshold (4pp
+    safety margin), so legitimate post-credit values (≥5pp away
+    from prior_5h_pct by the detection threshold's hypothesis) are
+    never caught.
+    """
+    end_iso, end_epoch = _future_week_end()
+    resets_iso, resets_epoch_str, resets_epoch = _future_5h_block_window()
+    window_key = ns["_canonical_5h_window_key"](resets_epoch)
+
+    conn = ns["open_db"]()
+    try:
+        # Pre-credit baseline at 27.4 (long-ago captured_at — survives
+        # the cleanup's timestamp filter regardless of predicate).
+        _seed_5h_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            weekly_percent=42.0,
+            five_hour_percent=27.4,
+            five_hour_window_key=window_key,
+            five_hour_resets_at_iso=resets_iso,
+            week_end_at=end_iso,
+        )
+        # Two post-effective rows in the current 10-min slot. Build them
+        # 2s and 1s before wall-clock now so they're as far as possible
+        # from the next 10-min boundary (same flakiness profile as
+        # ``test_stale_replica_delete``, which seeds at ``now_iso``).
+        now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        earlier_iso = (now_utc - dt.timedelta(seconds=2)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        later_iso = (now_utc - dt.timedelta(seconds=1)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        # Stale replay at 27.5 — 0.1pp drift from the pre-credit
+        # baseline. Survives strict round-to-1dp equality; caught by
+        # the 1.0pp tolerance band.
+        _seed_5h_snapshot(
+            conn,
+            captured_at_utc=earlier_iso,
+            weekly_percent=42.0,
+            five_hour_percent=27.5,
+            five_hour_window_key=window_key,
+            five_hour_resets_at_iso=resets_iso,
+            week_end_at=end_iso,
+        )
+        # Post-credit OAuth-lag at 27.4 — captured even later, so
+        # ``prior_5h_pct = 27.4`` at the detection SELECT site
+        # (ORDER BY captured_at_utc DESC, id DESC LIMIT 1).
+        _seed_5h_snapshot(
+            conn,
+            captured_at_utc=later_iso,
+            weekly_percent=42.0,
+            five_hour_percent=27.4,
+            five_hour_window_key=window_key,
+            five_hour_resets_at_iso=resets_iso,
+            week_end_at=end_iso,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Fire the credit tick at 4.0% — drop = 23.4pp, well above the
+    # 5.0pp threshold. weekly_percent varies vs seeded 42.0 so the
+    # dedup-vs-last pre-check doesn't swallow the insert.
+    args = _record_usage_args(
+        percent=43.0,
+        resets_at=end_epoch,
+        five_hour_percent=4.0,
+        five_hour_resets_at=resets_epoch_str,
+    )
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute(
+            "SELECT prior_percent, post_percent, effective_reset_at_utc "
+            "FROM five_hour_reset_events"
+        ).fetchall()
+        assert len(events) == 1, events
+        effective_iso = events[0]["effective_reset_at_utc"]
+
+        # The 27.5 drift replay MUST be gone. Under strict round-to-1dp
+        # equality it survived (round(27.5,1)=27.5 vs round(27.4,1)=27.4);
+        # the tolerance band cleans it up.
+        stale_drift = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE five_hour_window_key = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+            "  AND ABS(five_hour_percent - 27.5) < 0.01",
+            (window_key, effective_iso),
+        ).fetchone()[0]
+        assert stale_drift == 0, (
+            "tolerance-band cleanup must remove replay rows whose "
+            "five_hour_percent differs from prior_5h_pct by ≤1pp "
+            "(this row at 27.5 vs prior_5h_pct=27.4 survives strict "
+            "round-to-1dp equality)"
+        )
+
+        # Pre-credit 27.4 baseline (captured 2026-05-14T10:00:00Z, well
+        # before effective_iso) MUST survive — timestamp filter is the
+        # protection for the historical row.
+        pre_credit = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE captured_at_utc = '2026-05-14T10:00:00Z' "
+            "  AND ABS(five_hour_percent - 27.4) < 0.01"
+        ).fetchone()[0]
+        assert pre_credit == 1, (
+            "pre-credit 27.4 baseline must survive (timestamp filter)"
+        )
+
+        # Post-credit 4.0 seed MUST land. With the 27.5 replay surviving
+        # the cleanup under strict equality, the reset-aware 5h clamp's
+        # MAX over the post-credit segment would be 27.5, and 4.0 would
+        # be clamped UP to 27.5 — masking the legitimate post-credit
+        # value. The tolerance-band cleanup removes that row so the
+        # seed lands.
+        seed_landed = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE ABS(five_hour_percent - 4.0) < 0.01"
+        ).fetchone()[0]
+        assert seed_landed == 1, (
+            "post-credit 4.0 seed must land — proves the tolerance-band "
+            "cleanup unblocked the reset-aware 5h clamp"
+        )
+
+        # The event row's prior_percent stamps the observed pre-credit
+        # baseline (27.4 — the value that drove prior_5h_pct at the
+        # SELECT site). The 5h event row already carried prior_percent
+        # at v1.7.3 ship (issue #43), so no migration was needed for
+        # this fix; the durable column lets future cleanup tooling
+        # re-derive the baseline from the event row alone.
+        assert abs(float(events[0]["prior_percent"]) - 27.4) < 0.01
+        assert abs(float(events[0]["post_percent"]) - 4.0) < 0.01
+    finally:
+        conn.close()
+
+
 # ── self-heal probe parity with weekly (Round-3 Item 2) ──────────────
 
 

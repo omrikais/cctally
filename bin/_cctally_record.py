@@ -1767,20 +1767,34 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                             # replaying the pre-credit
                             # ``--five-hour-percent`` value past the
                             # credit moment from its own in-memory
-                            # HWM cache. Strict round-1 equality
-                            # keeps the scope narrow — only rows
-                            # whose five_hour_percent exactly matches
-                            # the just-observed pre-credit value are
-                            # removed. ``unixepoch()`` on both sides
-                            # for offset robustness (Z vs +00:00).
+                            # HWM cache. 1.0pp tolerance band (issue
+                            # #48 — symmetric follow-up to weekly #45)
+                            # around the observed pre-credit baseline
+                            # absorbs any rounding drift between
+                            # cctally's OAuth read and statusline's
+                            # ``--five-hour-percent`` payload (today
+                            # they match byte-identically, but the
+                            # band future-proofs against Anthropic or
+                            # statusline changing 5h rounding). The
+                            # band stays well below the 5.0pp 5h
+                            # in-place credit detection threshold
+                            # (``_FIVE_HOUR_RESET_PCT_DROP_THRESHOLD``)
+                            # — 4pp safety margin — so legitimate
+                            # post-credit values are never caught.
+                            # ``unixepoch()`` on both sides for offset
+                            # robustness (Z vs +00:00). Bind is the
+                            # in-scope ``prior_5h_pct``, which equals
+                            # the just-stamped
+                            # ``five_hour_reset_events.prior_percent``
+                            # on the event row.
                             try:
                                 conn.execute(
                                     "DELETE FROM weekly_usage_snapshots "
                                     " WHERE five_hour_window_key = ? "
                                     "   AND unixepoch(captured_at_utc) "
                                     "       >= unixepoch(?) "
-                                    "   AND round(five_hour_percent, 1) "
-                                    "       = round(?, 1)",
+                                    "   AND ABS(five_hour_percent - ?) "
+                                    "       < 1.0",
                                     (
                                         int(five_hour_window_key),
                                         effective_iso,
