@@ -5258,7 +5258,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
         # subcommands (cmd_report's --detail, etc.).
         display_tz_str = _share_display_tz_label(tz)
         snap = _build_daily_snapshot(
-            days,
+            view,
             period_start=range_start,
             period_end=range_end,
             display_tz=display_tz_str,
@@ -12416,7 +12416,7 @@ def _build_report_snapshot(
 
 
 def _build_daily_snapshot(
-    rows: list["BucketUsage"],
+    view: "DailyView",
     *,
     period_start: dt.datetime,
     period_end: dt.datetime,
@@ -12427,10 +12427,11 @@ def _build_daily_snapshot(
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally daily`.
 
-    `rows` is the in-memory `BucketUsage` list produced by `_aggregate_daily`
-    inside `cmd_daily`. Each bucket has: `bucket` (YYYY-MM-DD date string),
-    `cost_usd`, `model_breakdowns` (list[dict] sorted by cost desc; first
-    entry is the top model).
+    Consumes the unified DailyView (spec §6.1). `view.aggregated` is
+    the gap-free BucketUsage tuple in newest-first order; we reverse
+    here so BarChart bars render left-to-right chronologically.
+    `view.total_cost_usd` is the pre-computed sum (replacing the
+    prior inline re-totaling).
 
     Deviations from the plan sketch (which assumed dict rows with keys
     `date` / `cost_usd` / `pct_of_week` / `top_model`):
@@ -12443,13 +12444,11 @@ def _build_daily_snapshot(
     - `top_model` is the first entry of `model_breakdowns` (sorted by cost
       desc per upstream ccusage parity); empty → "—".
 
-    Caller MUST pass `rows` in chronological order so the BarChart bars
-    line up left-to-right with time. `_aggregate_daily` already returns
-    asc; the gate site re-sorts after `args.order == "desc"` was applied.
-
-    `theme` and `reveal_projects` flow into the subtitle directly so the
-    builder owns the canonical subtitle shape — no post-build re-stamp at
-    the gate site.
+    `period_start` / `period_end` / `display_tz` are passed by the
+    caller (they reflect the CLI's `--since` / `--until` window which
+    may extend past the data window). `theme` and `reveal_projects`
+    flow into the subtitle directly so the builder owns the canonical
+    subtitle shape — no post-build re-stamp at the gate site.
     """
     _lib_share = _share_load_lib()
     columns = (
@@ -12461,9 +12460,11 @@ def _build_daily_snapshot(
         _lib_share.ColumnSpec(key="top_model", label="Top Model",
                               align="left"),
     )
-    total_cost = 0.0
-    for r in rows:
-        total_cost += float(getattr(r, "cost_usd", 0.0) or 0.0)
+    # Caller MUST pass rows in chronological order so the BarChart bars
+    # line up left-to-right with time. view.aggregated is newest-first
+    # (matches dashboard convention); reverse for chronological iteration.
+    rows = list(reversed(view.aggregated))
+    total_cost = view.total_cost_usd
 
     snap_rows: list = []
     chart_pts: list = []
