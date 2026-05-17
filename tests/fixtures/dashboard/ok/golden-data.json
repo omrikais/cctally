@@ -1604,6 +1604,7 @@
   },
   "sync_age_s": null,
   "trend": {
+    "avg_dollars_per_pct": 0.4178466954125681,
     "history": [
       {
         "delta": null,

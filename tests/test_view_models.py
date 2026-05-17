@@ -354,3 +354,167 @@ class TestWeeklyView:
         assert view.rows[0].used_pct is None
         assert view.rows[0].dollar_per_pct is None
         assert view.overlay[0] == (None, None)
+
+
+class TestTrendView:
+    """Trend view tests — requires in-memory SQLite seeded with
+    weekly_usage_snapshots + weekly_cost_snapshots."""
+
+    @staticmethod
+    def _seed_db():
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE weekly_usage_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_date TEXT, week_end_date TEXT,
+                week_start_at TEXT, week_end_at TEXT,
+                weekly_percent REAL, five_hour_percent REAL,
+                captured_at_utc TEXT
+            );
+            CREATE TABLE weekly_cost_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_date TEXT, week_end_date TEXT,
+                week_start_at TEXT, week_end_at TEXT,
+                cost_usd REAL,
+                range_start_iso TEXT, range_end_iso TEXT,
+                captured_at_utc TEXT
+            );
+            CREATE TABLE week_reset_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                old_week_end_at TEXT, new_week_end_at TEXT,
+                effective_reset_at_utc TEXT
+            );
+            CREATE TABLE percent_milestones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_date TEXT,
+                week_start_at TEXT,
+                percent_threshold INTEGER,
+                cumulative_cost_usd REAL,
+                marginal_cost_usd REAL,
+                five_hour_percent_at_crossing REAL,
+                captured_at_utc TEXT,
+                alerted_at TEXT
+            );
+        """)
+        return conn
+
+    def test_empty_returns_none_avg(self, vm):
+        conn = self._seed_db()
+        view = vm.build_trend_view(conn, now_utc=_now(), n=8,
+                                    display_tz=None)
+        assert view.rows == ()
+        assert view.avg_dollars_per_pct is None
+
+    def test_fewer_than_3_samples_avg_is_none(self, vm):
+        """Seed 2 weeks with valid usage% + cost — avg should be None
+        per the 3-sample rule (spec §4.3)."""
+        conn = self._seed_db()
+        # Two weeks: 2026-04-27 (week of) and 2026-05-04 (week of).
+        for ws_d, we_d, pct, cost in [
+            ("2026-04-27", "2026-05-04", 50.0, 25.0),
+            ("2026-05-04", "2026-05-11", 80.0, 40.0),
+        ]:
+            ws_at = ws_d + "T00:00:00Z"
+            we_at = we_d + "T00:00:00Z"
+            cap = ws_d + "T12:00:00Z"
+            conn.execute(
+                "INSERT INTO weekly_usage_snapshots ("
+                " week_start_date, week_end_date, week_start_at, "
+                " week_end_at, weekly_percent, five_hour_percent, "
+                " captured_at_utc) VALUES (?,?,?,?,?,?,?)",
+                (ws_d, we_d, ws_at, we_at, pct, 0.0, cap),
+            )
+            conn.execute(
+                "INSERT INTO weekly_cost_snapshots ("
+                " week_start_date, week_end_date, week_start_at, "
+                " week_end_at, cost_usd, range_start_iso, "
+                " range_end_iso, captured_at_utc) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (ws_d, we_d, ws_at, we_at, cost, ws_at, we_at, cap),
+            )
+        conn.commit()
+        view = vm.build_trend_view(conn, now_utc=_now(), n=8,
+                                    display_tz=None)
+        assert len(view.rows) == 2
+        # 2 valid samples → avg None (3-sample rule).
+        assert view.avg_dollars_per_pct is None
+
+    def test_at_least_3_samples_avg_computed(self, vm):
+        conn = self._seed_db()
+        for ws_d, we_d, pct, cost in [
+            ("2026-04-13", "2026-04-20", 30.0, 15.0),   # dpp = 0.5
+            ("2026-04-20", "2026-04-27", 40.0, 24.0),   # dpp = 0.6
+            ("2026-04-27", "2026-05-04", 50.0, 30.0),   # dpp = 0.6
+        ]:
+            ws_at = ws_d + "T00:00:00Z"
+            we_at = we_d + "T00:00:00Z"
+            cap = ws_d + "T12:00:00Z"
+            conn.execute(
+                "INSERT INTO weekly_usage_snapshots ("
+                " week_start_date, week_end_date, week_start_at, "
+                " week_end_at, weekly_percent, five_hour_percent, "
+                " captured_at_utc) VALUES (?,?,?,?,?,?,?)",
+                (ws_d, we_d, ws_at, we_at, pct, 0.0, cap),
+            )
+            conn.execute(
+                "INSERT INTO weekly_cost_snapshots ("
+                " week_start_date, week_end_date, week_start_at, "
+                " week_end_at, cost_usd, range_start_iso, "
+                " range_end_iso, captured_at_utc) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (ws_d, we_d, ws_at, we_at, cost, ws_at, we_at, cap),
+            )
+        conn.commit()
+        view = vm.build_trend_view(conn, now_utc=_now(), n=8,
+                                    display_tz=None)
+        assert len(view.rows) == 3
+        # avg = (0.5 + 0.6 + 0.6) / 3 = 0.5666…
+        assert view.avg_dollars_per_pct == pytest.approx(
+            (0.5 + 0.6 + 0.6) / 3.0, abs=1e-9,
+        )
+
+    def test_extended_fields_populated(self, vm):
+        """TuiTrendRow's 10 extended nullable fields must be populated
+        when the trend builder owns the row construction (spec §4.1).
+        """
+        conn = self._seed_db()
+        ws_d, we_d = "2026-04-27", "2026-05-04"
+        ws_at = ws_d + "T00:00:00Z"
+        we_at = we_d + "T00:00:00Z"
+        cap = ws_d + "T12:00:00Z"
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots ("
+            " week_start_date, week_end_date, week_start_at, "
+            " week_end_at, weekly_percent, five_hour_percent, "
+            " captured_at_utc) VALUES (?,?,?,?,?,?,?)",
+            (ws_d, we_d, ws_at, we_at, 50.0, 0.0, cap),
+        )
+        conn.execute(
+            "INSERT INTO weekly_cost_snapshots ("
+            " week_start_date, week_end_date, week_start_at, "
+            " week_end_at, cost_usd, range_start_iso, "
+            " range_end_iso, captured_at_utc) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (ws_d, we_d, ws_at, we_at, 25.0, ws_at, we_at, cap),
+        )
+        conn.commit()
+        view = vm.build_trend_view(conn, now_utc=_now(), n=8,
+                                    display_tz=None)
+        assert len(view.rows) == 1
+        r = view.rows[0]
+        assert r.week_start_date == dt.date(2026, 4, 27)
+        assert r.week_end_date == dt.date(2026, 5, 4)
+        assert r.weekly_cost_usd == pytest.approx(25.0, abs=1e-9)
+        assert r.usage_captured_at == cap
+        assert r.cost_captured_at == cap
+        assert r.range_start_iso == ws_at
+        assert r.range_end_iso == we_at
+        # as_of = max(usage_captured, cost_captured) — both equal `cap`
+        # here. _parse_iso_datetime_optional rebases to host-local tz
+        # before isoformat; compare by parsing back to UTC for a tz-
+        # agnostic instant check.
+        assert r.as_of is not None
+        as_of_dt = dt.datetime.fromisoformat(r.as_of).astimezone(dt.timezone.utc)
+        assert as_of_dt == dt.datetime(2026, 4, 27, 12, 0, 0, tzinfo=dt.timezone.utc)

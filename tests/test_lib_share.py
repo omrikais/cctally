@@ -1559,20 +1559,46 @@ def test_report_builder_renders_none_metrics_as_em_dash():
     """Missing weeklyPercent / weeklyCostUSD / dollarsPerPercent must render
     as TextCell("—") in the share table — parity with terminal's em-dash
     convention. Coercing None to 0.0 conflates missing data with genuine zero.
+
+    View-model unification (Bundle 1): `_build_report_snapshot` now
+    consumes a `TrendView` of typed `TuiTrendRow` instances instead of
+    a `list[dict]`. Construct the rows directly so the builder reads
+    them by attribute.
     """
-    rows = [
+    TuiTrendRow = _cctally.TuiTrendRow
+    TrendView = _cctally.TrendView
+    base = datetime(2026, 4, 13, tzinfo=timezone.utc)
+    trend_rows = (
         # Week with all metrics present.
-        {"weekStartDate": "2026-04-13", "weeklyPercent": 65.2,
-         "weeklyCostUSD": 35.40, "dollarsPerPercent": 0.54},
+        TuiTrendRow(
+            week_label="Apr 13", week_start_at=base,
+            used_pct=65.2, dollars_per_percent=0.54, delta_dpp=None,
+            spark_height=1, is_current=False,
+            week_start_date=datetime(2026, 4, 13).date(),
+            weekly_cost_usd=35.40,
+        ),
         # Week with NO usage snapshot — all metrics None.
-        {"weekStartDate": "2026-04-20", "weeklyPercent": None,
-         "weeklyCostUSD": None, "dollarsPerPercent": None},
-        # Week with cost recorded but no usage snapshot — used_pct/dpp None.
-        {"weekStartDate": "2026-04-27", "weeklyPercent": None,
-         "weeklyCostUSD": 12.50, "dollarsPerPercent": None},
-    ]
+        TuiTrendRow(
+            week_label="Apr 20",
+            week_start_at=datetime(2026, 4, 20, tzinfo=timezone.utc),
+            used_pct=None, dollars_per_percent=None, delta_dpp=None,
+            spark_height=1, is_current=False,
+            week_start_date=datetime(2026, 4, 20).date(),
+            weekly_cost_usd=None,
+        ),
+        # Week with cost recorded but no usage snapshot.
+        TuiTrendRow(
+            week_label="Apr 27",
+            week_start_at=datetime(2026, 4, 27, tzinfo=timezone.utc),
+            used_pct=None, dollars_per_percent=None, delta_dpp=None,
+            spark_height=1, is_current=False,
+            week_start_date=datetime(2026, 4, 27).date(),
+            weekly_cost_usd=12.50,
+        ),
+    )
+    view = TrendView(rows=trend_rows, avg_dollars_per_pct=None)
     snap = _cctally._build_report_snapshot(
-        rows,
+        view,
         period_start=datetime(2026, 4, 13, tzinfo=timezone.utc),
         period_end=datetime(2026, 5, 4, tzinfo=timezone.utc),
         display_tz="UTC",
@@ -1606,17 +1632,30 @@ def test_report_builder_skips_none_dpp_from_chart_and_avg():
     has the correct number of points AND the Avg total averages over only
     present samples.
     """
-    rows = [
-        {"weekStartDate": f"2026-04-{day:02d}",
-         "weeklyPercent": 50.0, "weeklyCostUSD": 10.0, "dollarsPerPercent": 0.20}
-        for day in (6, 13, 20, 27)
-    ]
-    # Inject a None-dpp week in the middle.
-    rows[2]["dollarsPerPercent"] = None
-    rows[2]["weeklyCostUSD"] = None
-    rows[2]["weeklyPercent"] = None
+    TuiTrendRow = _cctally.TuiTrendRow
+    TrendView = _cctally.TrendView
+    trend_rows = []
+    for day in (6, 13, 20, 27):
+        trend_rows.append(TuiTrendRow(
+            week_label=f"Apr {day:02d}",
+            week_start_at=datetime(2026, 4, day, tzinfo=timezone.utc),
+            used_pct=50.0, dollars_per_percent=0.20, delta_dpp=None,
+            spark_height=1, is_current=False,
+            week_start_date=datetime(2026, 4, day).date(),
+            weekly_cost_usd=10.0,
+        ))
+    # Inject a None-dpp week in the middle (index 2 = day 20).
+    trend_rows[2] = _dc.replace(
+        trend_rows[2],
+        used_pct=None, dollars_per_percent=None, weekly_cost_usd=None,
+    )
+    # 3 valid dpp samples → builder's avg path uses view.avg_dollars_per_pct
+    # (3-sample rule). Mean = 0.20.
+    view = TrendView(
+        rows=tuple(trend_rows), avg_dollars_per_pct=0.20,
+    )
     snap = _cctally._build_report_snapshot(
-        rows,
+        view,
         period_start=datetime(2026, 4, 6, tzinfo=timezone.utc),
         period_end=datetime(2026, 5, 4, tzinfo=timezone.utc),
         display_tz="UTC", version="9.9.9", theme="light",

@@ -564,3 +564,270 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
         period_end=now_utc,
         display_tz_label=_display_tz_label(display_tz),
     )
+
+
+# === TrendView + build_trend_view (Task 10) ================================
+
+
+@dataclass(frozen=True)
+class TrendView:
+    """Trend view — last n subscription weeks for cmd_report / TUI / dashboard
+    trend panel / share `_build_report_snapshot` (spec §4.2, §5.4).
+
+    Rows are typed ``TuiTrendRow`` (extended per spec §4.1 with 10
+    nullable fields so the same shape serves both the TUI's 7-field
+    surface and ``cmd_report``'s 11-field JSON contract).
+
+    ``avg_dollars_per_pct`` is the 3-sample-rule mean (None when fewer
+    than 3 rows carry a non-None ``dollars_per_percent``). The
+    dashboard envelope adapter emits it as ``trend.avg_dollars_per_pct``
+    so the React layer doesn't re-derive.
+
+    Row ordering matches ``cmd_report`` / ``_tui_build_trend``:
+    chronological (oldest first), suitable for the TUI sparkline left-
+    to-right walk + cmd_report's `--json` trend list (which is then
+    sorted by recency at the render site).
+    """
+    rows: tuple = ()                          # tuple[TuiTrendRow, ...] (oldest-first)
+    avg_dollars_per_pct: "float | None" = None
+    period_start: "dt.datetime | None" = None
+    period_end: "dt.datetime | None" = None
+    display_tz_label: str = ""
+
+
+def build_trend_view(conn, *, now_utc, n=8, display_tz=None):
+    """Build a ``TrendView`` of the last ``n`` subscription weeks
+    (spec §5.4).
+
+    Reads ``weekly_usage_snapshots`` for usage% per ``WeekRef``. Reads
+    ``weekly_cost_snapshots`` for cost — EXCEPT for weeks touched by a
+    reset event, where the builder bypasses the cache and live-
+    computes cost from ``session_entries`` via
+    ``_compute_cost_for_weekref(week_ref)``. This matches the existing
+    cmd_report path (``bin/cctally:~7969-7979``) and ``_tui_build_trend``
+    (``bin/_cctally_tui.py:~1515-1524``).
+
+    Rows are emitted oldest-first (chronological); each row populates
+    all 17 ``TuiTrendRow`` fields (7 historical + 10 extended).
+    ``delta_dpp`` is computed against the prior chronological row's
+    non-None dpp. ``spark_height`` is normalized 1..8 across the
+    window's valid dpp samples.
+
+    ``avg_dollars_per_pct`` follows the 3-sample rule (spec §4.3):
+    mean over non-None ``dollars_per_percent`` values iff at least 3
+    rows qualify; else None. Mirrors
+    ``_build_report_snapshot``'s historical behavior.
+    """
+    _share = _load_lib("_lib_share")  # noqa: F841 — defensive; unused but mirrors siblings
+    _cct_core = _load_lib("_cctally_core")
+    parse_iso = _cct_core.parse_iso_datetime
+    make_ref = _cct_core.make_week_ref
+    get_usage = _cct_core.get_latest_usage_for_week
+    c = _cctally()
+
+    week_refs = c.get_recent_weeks(conn, max(1, n))
+    if not week_refs:
+        return TrendView(
+            rows=(), avg_dollars_per_pct=None,
+            period_start=None, period_end=now_utc,
+            display_tz_label=_display_tz_label(display_tz),
+        )
+
+    # Determine current_key + current_week_start_at — same pattern as
+    # _tui_build_trend / cmd_report's Bug D handling.
+    latest_usage = conn.execute(
+        "SELECT week_start_date, week_end_date "
+        "FROM weekly_usage_snapshots "
+        "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+    ).fetchone()
+    current_key = None
+    current_week_start_at = None
+    if latest_usage is not None and latest_usage["week_start_date"] is not None:
+        current_key = latest_usage["week_start_date"]
+        try:
+            canon_start, canon_end = c._get_canonical_boundary_for_date(
+                conn, latest_usage["week_start_date"]
+            )
+            current_ref = make_ref(
+                week_start_date=latest_usage["week_start_date"],
+                week_end_date=latest_usage["week_end_date"],
+                week_start_at=canon_start,
+                week_end_at=canon_end,
+            )
+            _adjusted = c._apply_reset_events_to_weekrefs(conn, [current_ref])
+            if _adjusted:
+                current_week_start_at = _adjusted[0].week_start_at
+        except Exception:
+            current_week_start_at = None
+
+    # Build a chronological (oldest-first) intermediate over week_refs.
+    # week_refs come newest-first from get_recent_weeks; reverse.
+    chrono = list(reversed(week_refs))
+
+    # Split-key set (Bug D): credited weeks appear twice in week_refs
+    # with identical WeekRef.key. Pin as_of_utc=week_end_at for those
+    # so each segment finds its own latest snapshot.
+    split_keys = {
+        r.key for r in week_refs
+        if sum(1 for x in week_refs if x.key == r.key) > 1
+    }
+
+    try:
+        _fresh_cfg = c._get_oauth_usage_config(c.load_config())
+    except Exception:
+        _fresh_cfg = c._get_oauth_usage_config({})
+
+    intermediate: list = []
+    for week_ref in chrono:
+        usage = get_usage(
+            conn, week_ref,
+            as_of_utc=(
+                week_ref.week_end_at if week_ref.key in split_keys else None
+            ),
+        )
+        usage_captured_at = usage["captured_at_utc"] if usage else None
+        if c._week_ref_has_reset_event(conn, week_ref):
+            cost_usd = c._compute_cost_for_weekref(week_ref)
+            cost_captured_at = (
+                usage_captured_at if cost_usd is not None else None
+            )
+            range_start_iso = week_ref.week_start_at
+            range_end_iso = week_ref.week_end_at
+        else:
+            cost = c.get_latest_cost_for_week(conn, week_ref)
+            cost_usd = float(cost["cost_usd"]) if cost else None
+            cost_captured_at = cost["captured_at_utc"] if cost else None
+            range_start_iso = (
+                cost["range_start_iso"] if cost and cost["range_start_iso"]
+                else None
+            )
+            range_end_iso = (
+                cost["range_end_iso"] if cost and cost["range_end_iso"]
+                else None
+            )
+        percent = float(usage["weekly_percent"]) if usage else None
+        ratio = (
+            cost_usd / percent
+            if (cost_usd is not None and percent and percent > 0)
+            else None
+        )
+        intermediate.append({
+            "week_ref": week_ref,
+            "used_pct": percent,
+            "cost_usd": cost_usd,
+            "dpp": ratio,
+            "usage_captured_at": usage_captured_at,
+            "cost_captured_at": cost_captured_at,
+            "range_start_iso": range_start_iso,
+            "range_end_iso": range_end_iso,
+        })
+
+    # Normalize dpp into spark heights 1..8 across the chrono window.
+    dpps = [d["dpp"] for d in intermediate if d["dpp"] is not None]
+    if dpps:
+        lo, hi = min(dpps), max(dpps)
+        span = (hi - lo) or 1e-9
+    else:
+        lo, hi, span = 0.0, 1.0, 1e-9
+
+    rows: list = []
+    prev_dpp: float | None = None
+    for d in intermediate:
+        week_ref = d["week_ref"]
+        percent = d["used_pct"]
+        cost_usd = d["cost_usd"]
+        dpp = d["dpp"]
+        usage_captured_at = d["usage_captured_at"]
+        cost_captured_at = d["cost_captured_at"]
+        range_start_iso = d["range_start_iso"]
+        range_end_iso = d["range_end_iso"]
+
+        delta = (
+            (dpp - prev_dpp)
+            if (dpp is not None and prev_dpp is not None) else None
+        )
+        spark = 1
+        if dpp is not None:
+            spark = int(round((dpp - lo) / span * 7)) + 1
+            spark = max(1, min(8, spark))
+
+        # WeekRef.week_start is a date; build a tz-aware datetime.
+        if week_ref.week_start_at:
+            week_start_dt = parse_iso(week_ref.week_start_at, "week_start_at")
+            _format_dt = c.format_display_dt
+            week_label = _format_dt(
+                week_start_dt, display_tz, fmt="%b %d", suffix=False,
+            )
+        else:
+            week_start_dt = dt.datetime.combine(
+                week_ref.week_start, dt.time(0, 0), dt.timezone.utc,
+            )
+            week_label = week_ref.week_start.strftime("%b %d")
+
+        is_cur = (
+            current_key is not None
+            and week_ref.key == current_key
+            and (
+                current_week_start_at is None
+                or week_ref.week_start_at == current_week_start_at
+            )
+        )
+
+        # as_of = max(usage_captured_at, cost_captured_at).
+        usage_dt = c._parse_iso_datetime_optional(usage_captured_at)
+        cost_dt = c._parse_iso_datetime_optional(cost_captured_at)
+        if usage_dt and cost_dt:
+            as_of_dt = usage_dt if usage_dt >= cost_dt else cost_dt
+        else:
+            as_of_dt = usage_dt or cost_dt
+        as_of = as_of_dt.isoformat(timespec="seconds") if as_of_dt else None
+
+        freshness = None
+        if usage_captured_at:
+            age_s = c._seconds_since_iso(usage_captured_at)
+            if age_s is not None and age_s <= 86400:
+                freshness = {
+                    "label": c._freshness_label(age_s, _fresh_cfg),
+                    "captured_at": usage_captured_at,
+                    "age_seconds": int(age_s),
+                }
+
+        rows.append(TuiTrendRow(
+            week_label=week_label,
+            week_start_at=week_start_dt,
+            used_pct=percent,
+            dollars_per_percent=dpp,
+            delta_dpp=delta,
+            spark_height=spark,
+            is_current=is_cur,
+            # Extended fields (spec §4.1)
+            week_start_date=week_ref.week_start,
+            week_end_date=week_ref.week_end,
+            week_end_at=(
+                parse_iso(week_ref.week_end_at, "week_end_at")
+                if week_ref.week_end_at else None
+            ),
+            weekly_cost_usd=cost_usd,
+            usage_captured_at=usage_captured_at,
+            cost_captured_at=cost_captured_at,
+            as_of=as_of,
+            range_start_iso=range_start_iso,
+            range_end_iso=range_end_iso,
+            freshness=freshness,
+        ))
+        if dpp is not None:
+            prev_dpp = dpp
+
+    # 3-sample average rule (spec §4.3): mean of non-None dpps iff at
+    # least 3 samples qualify.
+    valid_dpps = [r.dollars_per_percent for r in rows
+                  if r.dollars_per_percent is not None]
+    avg = (sum(valid_dpps) / len(valid_dpps)) if len(valid_dpps) >= 3 else None
+
+    return TrendView(
+        rows=tuple(rows),
+        avg_dollars_per_pct=avg,
+        period_start=None,
+        period_end=now_utc,
+        display_tz_label=_display_tz_label(display_tz),
+    )

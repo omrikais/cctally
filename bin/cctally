@@ -354,6 +354,8 @@ MonthlyView = _lib_view_models.MonthlyView
 build_monthly_view = _lib_view_models.build_monthly_view
 WeeklyView = _lib_view_models.WeeklyView
 build_weekly_view = _lib_view_models.build_weekly_view
+TrendView = _lib_view_models.TrendView
+build_trend_view = _lib_view_models.build_trend_view
 
 _lib_render = _load_sibling("_lib_render")
 _CODEX_MONTHS = _lib_render._CODEX_MONTHS
@@ -7892,7 +7894,7 @@ def cmd_report(args: argparse.Namespace) -> int:
                     we_d + dt.timedelta(days=1), dt.time.min, tzinfo=local_tz
                 )
                 snap = _build_report_snapshot(
-                    [],
+                    TrendView(),
                     period_start=ws_dt,
                     period_end=we_dt,
                     display_tz=display_tz_str,
@@ -7908,124 +7910,113 @@ def cmd_report(args: argparse.Namespace) -> int:
                 print("No data yet. Add record-usage to your status line script (see record-usage --help).")
             return 0
 
-        trend: list[dict[str, Any]] = []
-        current_row: dict[str, Any] | None = None
-
-        # Resolve oauth_usage cfg once -- it's loop-invariant across all
-        # trend rows. Falls back to defaults on config validation error.
-        try:
-            _fresh_cfg = _get_oauth_usage_config(config)
-        except OauthUsageConfigError:
-            _fresh_cfg = _get_oauth_usage_config({})
-
-        # Build a set of week_start_date keys that occur MORE THAN ONCE
-        # in `weeks` — these are credited weeks (round-3, Bug B) where
-        # `_apply_reset_events_to_weekrefs` synthesized a pre-credit
-        # ref alongside the post-credit ref. Both refs share
-        # `week_start_date` so the default
-        # ``get_latest_usage_for_week(conn, ref)`` returns the SAME row
-        # (the most recent snapshot in the whole week) for both,
-        # collapsing the pre-credit row's `weeklyPercent` to the
-        # post-credit value. For those keys ONLY, pin `as_of_utc` to
-        # the ref's `week_end_at` so each segment renders its own
-        # latest snapshot. Non-credit weeks (single ref per key) keep
-        # the legacy unfiltered lookup so test fixtures that seed
-        # snapshots OUTSIDE the API-derived week window (e.g.
-        # `test_report_freshness`) keep finding their rows.
-        _split_keys = {
-            r.week_start.isoformat()
-            for r in weeks
-            if sum(
-                1 for x in weeks
-                if x.week_start.isoformat() == r.week_start.isoformat()
-            ) > 1
-        }
-
-        for week_ref in weeks:
-            key = week_ref.week_start.isoformat()
-            usage = get_latest_usage_for_week(
-                conn,
-                week_ref,
-                as_of_utc=(
-                    week_ref.week_end_at if key in _split_keys else None
-                ),
+        # Build the unified trend view (spec §5.4). `build_trend_view`
+        # owns the per-row construction, including:
+        # - get_latest_usage_for_week with split-key as_of_utc pinning
+        #   for credited weeks (Bug D / round-3 Bug B parity)
+        # - _week_ref_has_reset_event → _compute_cost_for_weekref bypass
+        #   for reset-affected weeks
+        # - freshness sub-dict derivation
+        # - 3-sample-rule average
+        # Note: build_trend_view returns rows oldest-first (chronological);
+        # cmd_report's JSON contract is newest-first to mirror
+        # get_recent_weeks's order — we reverse below.
+        view = build_trend_view(conn, now_utc=_command_as_of(), n=args.weeks,
+                                 display_tz=tz)
+        # Serialize TuiTrendRow → today's camelCase keys. Order:
+        # newest-first (matches the prior cmd_report behavior).
+        # Map week_start_date → original WeekRef ISO strings so the
+        # JSON serialization preserves the snapshot-stored tz format
+        # (`+00:00` for UTC-anchored weeks) — TuiTrendRow's datetime
+        # form re-localizes via parse_iso_datetime, which would emit
+        # `+03:00` on a UTC+3 host and break byte-stability.
+        week_iso_by_key: dict[str, tuple[str | None, str | None]] = {}
+        for wr in weeks:
+            week_iso_by_key[(wr.week_start.isoformat(), wr.week_start_at)] = (
+                wr.week_start_at,
+                wr.week_end_at,
             )
 
-            # For weeks touched by a reset event, the cached
-            # weekly_cost_snapshots row covers the API-derived range (which
-            # extends past the reset into the NEW week or starts days
-            # BEFORE the reset in the new week). Bypass the cache and live-
-            # compute from session_entries over the effective range that
-            # _apply_reset_events_to_weekrefs baked into the ref. Normal
-            # weeks still hit the cache — zero perf change for the common
-            # path. `cost_captured_at` is pinned to the usage snapshot's
-            # captured time (not wall-clock `now_utc`): `_trend_row_recency_
-            # seconds` ranks the trend table by the freshest-data timestamp,
-            # and if every reset-affected week reported wall-clock now the
-            # oldest such week would sort like the newest and the current
-            # subscription week could slide below historical rows.
-            cost: sqlite3.Row | None = None
-            usage_captured_at = usage["captured_at_utc"] if usage else None
-            if _week_ref_has_reset_event(conn, week_ref):
-                cost_usd = _compute_cost_for_weekref(week_ref)
-                cost_captured_at = usage_captured_at if cost_usd is not None else None
-                range_start_iso = week_ref.week_start_at
-                range_end_iso = week_ref.week_end_at
-            else:
-                cost = get_latest_cost_for_week(conn, week_ref)
-                cost_usd = float(cost["cost_usd"]) if cost else None
-                cost_captured_at = cost["captured_at_utc"] if cost else None
-                range_start_iso = cost["range_start_iso"] if cost and cost["range_start_iso"] else None
-                range_end_iso = cost["range_end_iso"] if cost and cost["range_end_iso"] else None
+        def _row_to_dict(r):
+            # Match this row's WeekRef by (week_start_date, isoformat of
+            # week_start_at parsed-then-utc) — credited weeks share
+            # week_start_date so we disambiguate via week_start_at.
+            wsd_str = (
+                r.week_start_date.isoformat() if r.week_start_date else None
+            )
+            # The row's week_start_at is a parsed datetime (host-local
+            # after parse_iso_datetime). Normalize to UTC for the
+            # lookup; both candidate weeks share the same UTC instant.
+            # But the dict key uses the raw +00:00 string from WeekRef,
+            # so we need an inverse match. Walk weeks looking for a
+            # WeekRef whose parsed week_start_at instant matches r's.
+            ws_at = ws_at_end = None
+            if r.week_start_at is not None:
+                r_utc = r.week_start_at.astimezone(dt.timezone.utc)
+                for wr in weeks:
+                    if wr.week_start.isoformat() != wsd_str:
+                        continue
+                    try:
+                        wr_dt = parse_iso_datetime(
+                            wr.week_start_at, "wr.week_start_at",
+                        )
+                    except Exception:
+                        continue
+                    if wr_dt.astimezone(dt.timezone.utc) == r_utc:
+                        ws_at = wr.week_start_at
+                        ws_at_end = wr.week_end_at
+                        break
 
-            percent = float(usage["weekly_percent"]) if usage else None
-            ratio = (cost_usd / percent) if (cost_usd is not None and percent and percent > 0) else None
-            usage_captured_dt = _parse_iso_datetime_optional(usage_captured_at)
-            cost_captured_dt = _parse_iso_datetime_optional(cost_captured_at)
-
-            as_of_dt: dt.datetime | None = None
-            if usage_captured_dt and cost_captured_dt:
-                as_of_dt = usage_captured_dt if usage_captured_dt >= cost_captured_dt else cost_captured_dt
-            else:
-                as_of_dt = usage_captured_dt or cost_captured_dt
-            as_of = as_of_dt.isoformat(timespec="seconds") if as_of_dt else None
-
-            row = {
-                "weekStartDate": week_ref.week_start.isoformat(),
-                "weekEndDate": week_ref.week_end.isoformat() if week_ref.week_end else None,
-                "weekStartAt": week_ref.week_start_at,
-                "weekEndAt": week_ref.week_end_at,
-                "weeklyPercent": percent,
-                "weeklyCostUSD": round(cost_usd, 9) if cost_usd is not None else None,
-                "dollarsPerPercent": round(ratio, 9) if ratio is not None else None,
-                "usageCapturedAt": usage_captured_at,
-                "costCapturedAt": cost_captured_at,
-                "asOf": as_of,
-                "rangeStartIso": range_start_iso,
-                "rangeEndIso": range_end_iso,
+            d: dict[str, Any] = {
+                "weekStartDate": wsd_str,
+                "weekEndDate": (
+                    r.week_end_date.isoformat() if r.week_end_date else None
+                ),
+                "weekStartAt": ws_at,
+                "weekEndAt": ws_at_end,
+                "weeklyPercent": r.used_pct,
+                "weeklyCostUSD": (
+                    round(r.weekly_cost_usd, 9)
+                    if r.weekly_cost_usd is not None else None
+                ),
+                "dollarsPerPercent": (
+                    round(r.dollars_per_percent, 9)
+                    if r.dollars_per_percent is not None else None
+                ),
+                "usageCapturedAt": r.usage_captured_at,
+                "costCapturedAt": r.cost_captured_at,
+                "asOf": r.as_of,
+                "rangeStartIso": r.range_start_iso,
+                "rangeEndIso": r.range_end_iso,
             }
-            if usage_captured_at:
-                age_s = _seconds_since_iso(usage_captured_at)
-                if age_s is not None and age_s <= 86400:
-                    row["freshness"] = {
-                        "label": _freshness_label(age_s, _fresh_cfg),
-                        "captured_at": usage_captured_at,
-                        "age_seconds": int(age_s),
-                    }
+            if r.freshness:
+                d["freshness"] = r.freshness
+            return d
+
+        # view.rows is oldest-first; reverse for cmd_report's newest-first
+        # JSON contract. Also need WeekRef-based current_row matching —
+        # use weekRef key + week_start_at to disambiguate credited weeks.
+        # We re-walk the original `weeks` list to map (key, week_start_at)
+        # → the corresponding dict row.
+        trend: list[dict[str, Any]] = []
+        current_row: dict[str, Any] | None = None
+        # `view.rows` order = chrono asc (oldest first). Build trend in
+        # the reverse order (newest first) to match the historical
+        # cmd_report contract.
+        # The view's TuiTrendRow doesn't carry WeekRef.key directly; we
+        # use (week_start_date, week_start_at) for the match — week_start_at
+        # in TuiTrendRow is a parsed datetime, and current_ref carries
+        # ISO strings.
+        for r in reversed(view.rows):
+            row = _row_to_dict(r)
             trend.append(row)
-            # Bug D (v1.7.2 round-4): for credited weeks `weeks` contains
-            # TWO refs sharing `key` (pre-credit + post-credit segments).
-            # `current_ref` was routed through
-            # `_apply_reset_events_to_weekrefs` above so its
-            # `week_start_at` reflects the post-credit segment's effective
-            # start (or the original start for non-credit weeks). Match on
-            # BOTH `key` AND `week_start_at` so the pre-credit ref doesn't
-            # overwrite the post-credit row's selection on the second
-            # iteration (last-write-wins on key-only equality picked the
-            # wrong row on the user's live data).
+            # Match against current_ref. Compare by week_start ISO date
+            # AND week_start_at ISO string.
+            week_start_at_iso = row["weekStartAt"]
             if (
-                week_ref.key == current_ref.key
-                and week_ref.week_start_at == current_ref.week_start_at
+                r.week_start_date is not None
+                and r.week_start_date.isoformat() == current_ref.key
+                and week_start_at_iso == current_ref.week_start_at
             ):
                 current_row = row
 
@@ -8069,17 +8060,28 @@ def cmd_report(args: argparse.Namespace) -> int:
             # detail isn't in the share spec scope). Same convention applies
             # to other share-enabled subcommands (cmd_daily's --breakdown,
             # etc.).
-            ordered_trend = list(reversed(trend))
-            if ordered_trend:
-                first_wsd = ordered_trend[0].get("weekStartDate")
-                last_wed = ordered_trend[-1].get("weekEndDate") or ordered_trend[-1].get("weekStartDate")
+            #
+            # `view.rows` is already chronological (oldest-first), the
+            # order the chart needs. period_start / period_end derived
+            # from the view's oldest / newest rows.
+            if view.rows:
+                first_r = view.rows[0]
+                last_r = view.rows[-1]
+                first_wsd = (
+                    first_r.week_start_date.isoformat()
+                    if first_r.week_start_date else None
+                )
+                last_wed = (
+                    last_r.week_end_date.isoformat()
+                    if last_r.week_end_date else first_wsd
+                )
                 period_start = _share_parse_date_to_dt(first_wsd, tz)
                 period_end = _share_parse_date_to_dt(last_wed, tz)
             else:
                 period_start = period_end = _share_now_utc()
             display_tz_str = _share_display_tz_label(tz)
             snap = _build_report_snapshot(
-                ordered_trend,
+                view,
                 period_start=period_start,
                 period_end=period_end,
                 display_tz=display_tz_str,
@@ -12301,7 +12303,7 @@ def _share_display_tz_label(tz: "ZoneInfo | None") -> str:
 
 
 def _build_report_snapshot(
-    rows: list[dict[str, object]],
+    view: "TrendView",
     *,
     period_start: dt.datetime,
     period_end: dt.datetime,
@@ -12312,21 +12314,23 @@ def _build_report_snapshot(
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally report`.
 
-    `rows` is the in-memory `trend` list produced by `cmd_report` — a list
-    of dicts keyed in the existing JSON-shape camelCase
-    (`weekStartDate`, `weeklyPercent`, `weeklyCostUSD`, `dollarsPerPercent`).
-    The plan's snake_case keys (`week_start_date`, `used_pct`, `cost_usd`,
-    `dollar_per_pct`) are NOT the actual `cmd_report` data shape — see
-    Implementor 7 commit body for the deviation.
+    Consumes the unified TrendView (spec §6.4). `view.rows` is the
+    chronological (oldest-first) TuiTrendRow tuple — exactly the order
+    the chart needs (BarChart polyline trends left→right with time);
+    no reversal needed.
 
-    Caller MUST pass `rows` in chronological order (oldest first) so the
-    chart line trends left→right with time. `cmd_report`'s native `trend`
-    is newest-first; the gate site reverses before calling.
+    The earlier camelCase-dict workaround (recorded in the commit body
+    of Implementor 7 of the share-v2 work) is obsolete: `TuiTrendRow`
+    now carries 10 nullable extended fields (spec §4.1) and is the
+    single typed shape that flows through both CLI report and share
+    builders. Cmd_report's JSON serialization happens at the gate site
+    (camelCase mapping done in cmd_report); this function reads
+    attributes directly from the typed row.
 
-    `theme` and `reveal_projects` flow into the subtitle directly so the
-    builder owns the canonical subtitle shape — no post-build re-stamp at
-    the gate site. The forward-reference return type matches the kernel's
-    lazy-import boundary.
+    `theme` and `reveal_projects` flow into the subtitle directly so
+    the builder owns the canonical subtitle shape — no post-build
+    re-stamp at the gate site. The forward-reference return type
+    matches the kernel's lazy-import boundary.
     """
     _lib_share = _share_load_lib()
     columns = (
@@ -12336,12 +12340,11 @@ def _build_report_snapshot(
         _lib_share.ColumnSpec(key="dpp", label="$ / %", align="right",
                               emphasis=True),
     )
+    rows = view.rows  # oldest-first; matches chart's left→right walk.
     snap_rows: list = []
     chart_pts: list = []
     for i, r in enumerate(rows):
-        wsd = r.get("weekStartDate")
-        # `weekStartDate` is sourced from `week_ref.week_start.isoformat()`
-        # — guaranteed `str`. Empty / unparseable falls back to em-dash.
+        wsd = r.week_start_date.isoformat() if r.week_start_date else None
         if isinstance(wsd, str) and wsd:
             try:
                 week_label = dt.date.fromisoformat(wsd).strftime("%b %d")
@@ -12354,9 +12357,9 @@ def _build_report_snapshot(
         # share artifact follows the same convention. Coercing None to
         # 0.0 would render `$0.00` / `0.0%` — indistinguishable from a
         # genuine zero, and would skew the avg / chart.
-        used_pct_raw = r.get("weeklyPercent")
-        cost_raw = r.get("weeklyCostUSD")
-        dpp_raw = r.get("dollarsPerPercent")
+        used_pct_raw = r.used_pct
+        cost_raw = r.weekly_cost_usd
+        dpp_raw = r.dollars_per_percent
         snap_rows.append(_lib_share.Row(cells={
             "week": _lib_share.TextCell(week_label),
             "used": (
@@ -12385,10 +12388,17 @@ def _build_report_snapshot(
         _lib_share.LineChart(points=tuple(chart_pts), y_label="$ / %")
         if len(chart_pts) >= 3 else None
     )
-    avg_dpp = (
-        sum(p.y_value for p in chart_pts) / len(chart_pts)
-        if chart_pts else 0.0
-    )
+    # Source the avg from the view (3-sample rule). Falls back to a
+    # length-based average over the chart points for the <3-sample case
+    # so the Totalled cell always renders something concrete; preserves
+    # the prior $0.00 sentinel on empty data.
+    if view.avg_dollars_per_pct is not None:
+        avg_dpp = view.avg_dollars_per_pct
+    else:
+        avg_dpp = (
+            sum(p.y_value for p in chart_pts) / len(chart_pts)
+            if chart_pts else 0.0
+        )
     totals = (
         _lib_share.Totalled(label="Avg $/%", value=f"${avg_dpp:,.2f}"),
     )

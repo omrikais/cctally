@@ -1438,158 +1438,16 @@ def _tui_build_trend(
 ) -> list[TuiTrendRow]:
     """Build the last `count` trend rows, chronological (oldest first).
 
-    `cmd_report` inlines its row build rather than delegating to a helper,
-    so instead of refactoring the subcommand we call the same underlying
-    loaders (`get_recent_weeks` + `get_latest_usage_for_week` +
-    `get_latest_cost_for_week`) directly here. Output for the shared
-    columns (`week_start_at`, `used_pct`, `dollars_per_percent`) matches
-    `cmd_report` byte-for-byte — verified in the bundle regression diff.
+    Bundle 1 / Task 10: wraps the unified ``build_trend_view`` kernel
+    (spec §5.4) — the loop body that used to live here moved into
+    ``bin/_lib_view_models.build_trend_view``. The TUI snapshot module
+    consumes the first 7 ``TuiTrendRow`` fields and ignores the 10
+    extended fields (which exist for cmd_report's JSON contract).
     """
-    # `get_recent_weeks` returns WeekRef rows DESC by week_start_date,
-    # already routed through `_apply_reset_events_to_weekrefs` so credited
-    # weeks come back as TWO refs (pre-credit + post-credit) sharing the
-    # same `WeekRef.key`.
-    week_refs = get_recent_weeks(conn, max(1, count))
-
-    # Figure out which week_ref corresponds to the current subscription week.
-    # Mirrors `cmd_report`'s Bug D pattern: build a current_ref from the
-    # latest usage snapshot, route it through `_apply_reset_events_to_weekrefs`
-    # so its `week_start_at` reflects the post-credit segment (or the
-    # original start for non-credit weeks), then disambiguate the
-    # synthesized pre-credit ref from the live post-credit ref via BOTH
-    # `key` AND `week_start_at`. Key-only equality marks both segments
-    # as current, which is why the dashboard's trend panel previously
-    # showed two adjacent rows both highlighted as "current" with
-    # identical 4.0% values on the user's live in-place credit data.
-    latest_usage = conn.execute(
-        "SELECT week_start_date, week_end_date "
-        "FROM weekly_usage_snapshots "
-        "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
-    ).fetchone()
-    current_key: str | None = None
-    current_week_start_at: str | None = None
-    if latest_usage is not None and latest_usage["week_start_date"] is not None:
-        current_key = latest_usage["week_start_date"]
-        try:
-            c = _cctally()
-            canon_start, canon_end = c._get_canonical_boundary_for_date(
-                conn, latest_usage["week_start_date"]
-            )
-            current_ref = make_week_ref(
-                week_start_date=latest_usage["week_start_date"],
-                week_end_date=latest_usage["week_end_date"],
-                week_start_at=canon_start,
-                week_end_at=canon_end,
-            )
-            _adjusted = c._apply_reset_events_to_weekrefs(conn, [current_ref])
-            if _adjusted:
-                current_week_start_at = _adjusted[0].week_start_at
-        except (ValueError, sqlite3.DatabaseError, AttributeError):
-            current_week_start_at = None
-
-    # Build an intermediate list of (week_ref, used_pct, dpp) in oldest-first
-    # chronological order.
-    chrono = list(reversed(week_refs))
-    # Split-key set (Bug D): credited weeks appear twice in `week_refs`
-    # with identical `WeekRef.key`. For those keys ONLY, pin
-    # `as_of_utc=week_ref.week_end_at` so each segment finds its own
-    # latest snapshot — without this both segments collapse to the
-    # post-credit snapshot's weekly_percent. Non-credit weeks (single
-    # ref per key) keep the legacy unfiltered lookup.
-    _split_keys = {
-        r.key
-        for r in week_refs
-        if sum(1 for x in week_refs if x.key == r.key) > 1
-    }
-    intermediate: list[tuple[Any, float | None, float | None]] = []
-    for week_ref in chrono:
-        usage = get_latest_usage_for_week(
-            conn,
-            week_ref,
-            as_of_utc=(
-                week_ref.week_end_at if week_ref.key in _split_keys else None
-            ),
-        )
-        # See cmd_report for why reset-affected weeks skip the cost cache
-        # and live-compute from session_entries over the effective range.
-        if _week_ref_has_reset_event(conn, week_ref):
-            cost_usd = _compute_cost_for_weekref(week_ref)
-        else:
-            cost = get_latest_cost_for_week(conn, week_ref)
-            cost_usd = float(cost["cost_usd"]) if cost else None
-        percent = float(usage["weekly_percent"]) if usage else None
-        ratio = (cost_usd / percent) if (
-            cost_usd is not None and percent and percent > 0
-        ) else None
-        intermediate.append((week_ref, percent, ratio))
-
-    # Normalize dpp into spark heights 1..8 across the window.
-    dpps = [d for _, _, d in intermediate if d is not None]
-    if dpps:
-        lo, hi = min(dpps), max(dpps)
-        span = (hi - lo) or 1e-9
-    else:
-        lo, hi, span = 0.0, 1.0, 1e-9
-
-    out: list[TuiTrendRow] = []
-    prev_dpp: float | None = None
-    for week_ref, percent, dpp in intermediate:
-        delta = (dpp - prev_dpp) if (dpp is not None and prev_dpp is not None) else None
-        spark = 1
-        if dpp is not None:
-            spark = int(round((dpp - lo) / span * 7)) + 1
-            spark = max(1, min(8, spark))
-        # WeekRef.week_start is a date; synthesize a UTC datetime so
-        # TuiTrendRow carries a timezone-aware instant (prefer the explicit
-        # week_start_at if present).
-        if week_ref.week_start_at:
-            week_start_dt = parse_iso_datetime(
-                week_ref.week_start_at, "week_start_at"
-            )
-            week_label = format_display_dt(
-                week_start_dt, display_tz, fmt="%b %d", suffix=False,
-            )
-        else:
-            week_start_dt = dt.datetime.combine(
-                week_ref.week_start, dt.time(0, 0), dt.timezone.utc
-            )
-            # No real boundary instant — format the calendar date directly so
-            # localizing midnight-UTC doesn't shift it to the prior day in
-            # zones west of UTC (e.g. 2026-04-14 → "Apr 13" in America/New_York).
-            week_label = week_ref.week_start.strftime("%b %d")
-        # Bug G (v1.7.2 round-5): match on BOTH `key` AND `week_start_at`
-        # for credited weeks so the pre-credit synthesized ref doesn't
-        # also light up as "current" — both refs share `key`, only their
-        # `week_start_at` differs (post-credit = effective reset moment,
-        # pre-credit = original API-derived start). Non-credit weeks
-        # have only one ref per key so `week_start_at` matching is
-        # automatic. When `current_week_start_at` is None (no reset
-        # event for the current week, or the resolution above failed),
-        # falls back to legacy key-only matching.
-        is_cur = (
-            current_key is not None
-            and week_ref.key == current_key
-            and (
-                current_week_start_at is None
-                or week_ref.week_start_at == current_week_start_at
-            )
-        )
-        out.append(TuiTrendRow(
-            week_label=week_label,
-            week_start_at=week_start_dt,
-            # Preserve None when no usage snapshot exists for this week —
-            # matches `cmd_report`'s "n/a" rendering (9980) and avoids
-            # fabricating a 0.0% row for the phantom-week case (cost
-            # snapshot present, usage snapshot absent).
-            used_pct=float(percent) if percent is not None else None,
-            dollars_per_percent=dpp,
-            delta_dpp=delta,
-            spark_height=spark,
-            is_current=is_cur,
-        ))
-        if dpp is not None:
-            prev_dpp = dpp
-    return out
+    c = _cctally()
+    view = c.build_trend_view(conn, now_utc=now_utc, n=max(1, count),
+                               display_tz=display_tz)
+    return list(view.rows)
 
 
 def _tui_build_weekly_history(
@@ -1796,10 +1654,19 @@ def _tui_build_snapshot(
             fc = _tui_build_forecast(conn, now_utc, skip_sync=skip_sync)
         except Exception as exc:
             errors.append(f"forecast: {exc}")
+        # Trend: source from build_trend_view so we capture the 3-sample
+        # avg_dollars_per_pct alongside the rows. The TUI build path
+        # historically called _tui_build_trend (which now wraps the
+        # builder); calling the builder directly here saves one
+        # `_aggregate_*` round-trip.
+        trend_avg_dpp = None
         try:
-            trend = _tui_build_trend(
-                conn, now_utc, skip_sync=skip_sync, display_tz=_build_display_tz,
+            c = _cctally()
+            _trend_view = c.build_trend_view(
+                conn, now_utc=now_utc, n=8, display_tz=_build_display_tz,
             )
+            trend = list(_trend_view.rows)
+            trend_avg_dpp = _trend_view.avg_dollars_per_pct
         except Exception as exc:
             errors.append(f"trend: {exc}")
         try:
@@ -1982,6 +1849,7 @@ def _tui_build_snapshot(
             monthly_total_tokens=monthly_total_tokens,
             weekly_total_cost_usd=weekly_total_cost_usd,
             weekly_total_tokens=weekly_total_tokens,
+            trend_avg_dollars_per_pct=trend_avg_dpp,
         )
     finally:
         conn.close()

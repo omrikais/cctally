@@ -3098,6 +3098,12 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                     }
                     for w in (snap.weekly_history or [])
                 ],
+                # View-model unification (Bundle 1; spec §6.6): the
+                # pre-computed 3-sample $/% mean. TrendPanel can stop
+                # re-deriving the panel-average; TrendModal's median
+                # over trend.history is out of scope for this refactor
+                # (separate dataset, separate follow-up).
+                "avg_dollars_per_pct": snap.trend_avg_dollars_per_pct,
             },
 
         "weekly":  weekly_env,

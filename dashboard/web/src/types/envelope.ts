@@ -218,6 +218,10 @@ export interface TrendEnvelope {
   weeks: TrendRow[];           // 8 rows — panel sparkline
   spark_heights: number[];     // parallel to weeks[]
   history: TrendRow[];         // up to 12 rows — modal
+  // ---- view-model unification additive scalar (Bundle 1) ----
+  // 3-sample $/% mean over `weeks`. Null when fewer than 3 valid samples.
+  // TrendModal's median over `history` stays unaffected (out of scope).
+  avg_dollars_per_pct?: number | null;
 }
 
 export interface TrendRow {
