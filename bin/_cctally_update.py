@@ -201,12 +201,10 @@ from _cctally_config import save_config
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
 # Each shim resolves ``sys.modules['cctally'].X`` at CALL TIME (not bind
 # time), so monkeypatches on cctally's namespace propagate into the moved
-# code unchanged. Mirrors the precedent established in
-# ``bin/_cctally_record.py`` (34 shims), ``bin/_cctally_cache.py``
-# (4 shims), and ``bin/_cctally_db.py`` (4 shims).
-# `load_config` STAYS as a shim even though its natural home is
-# _cctally_config — tests monkeypatch it via `ns["load_config"]` (16
-# sites, audited 2026-05-17); direct import would silently bypass.
+# code unchanged. `load_config` STAYS as a shim even though its natural
+# home is _cctally_config — tests monkeypatch it via `ns["load_config"]`
+# (16 sites, audited 2026-05-17); direct import would silently bypass.
+# See spec §3.5 (carve-out) and §3.7 (stays-on-shim allowlist).
 def load_config(*args, **kwargs):
     return sys.modules["cctally"].load_config(*args, **kwargs)
 

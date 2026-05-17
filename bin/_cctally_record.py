@@ -178,13 +178,12 @@ from _lib_pricing import _calculate_entry_cost
 # Module-level back-ref shims. Each shim resolves
 # ``sys.modules['cctally'].X`` at CALL TIME (not bind time), so
 # monkeypatches on cctally's namespace propagate into the moved code
-# unchanged. Mirrors the precedent established in
-# ``bin/_cctally_cache.py`` and ``bin/_cctally_db.py``.
-# `load_config` and `get_claude_session_entries` STAY as shims even
-# though their natural homes are decentralized (_cctally_config /
-# _cctally_cache) — tests monkeypatch them via `ns["X"]` (21 sites
-# total, audited 2026-05-17); direct imports would silently bypass
-# the patches.
+# unchanged. `load_config` and `get_claude_session_entries` STAY as
+# shims even though their natural homes are decentralized
+# (_cctally_config / _cctally_cache) — tests monkeypatch them via
+# `ns["X"]` (21 sites total, audited 2026-05-17); direct imports would
+# silently bypass the patches.
+# See spec §3.5 (carve-out) and §3.7 (stays-on-shim allowlist).
 def load_config(*args, **kwargs):
     return sys.modules["cctally"].load_config(*args, **kwargs)
 

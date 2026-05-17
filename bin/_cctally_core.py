@@ -13,7 +13,6 @@ docs/superpowers/specs/2026-05-17-cctally-core-kernel-extraction.md §2.
 from __future__ import annotations
 import datetime as dt
 import os
-import pathlib
 import re
 import sqlite3
 import sys
@@ -337,10 +336,13 @@ def _get_alerts_config(cfg: "dict | None") -> dict:
 
 def open_db() -> sqlite3.Connection:
     c = _cctally()
-    # Bind helpers that live outside core (in bin/cctally and the
-    # _cctally_db sibling) into locals once — direct `c.X(...)` call
-    # inside core would trip the §4.2 regression guard
-    # (test_core_uses_accessor_only_for_path_constants).
+    # Spec §2.6 carve-out: open_db reaches the migration framework
+    # (lives in _cctally_db + bin/cctally). Direct imports would
+    # create a cycle (_cctally_db imports kernel from this module).
+    # Local-binding via the call-time accessor preserves byte-stable
+    # behavior with the reach list explicit at the top of the function.
+    # Enforced by tests/test_kernel_extraction_invariants.py
+    # test_core_accessor_use_is_bounded (lands in I2).
     add_column_if_missing = c.add_column_if_missing
     _canonical_5h_window_key = c._canonical_5h_window_key
     _backfill_week_reset_events = c._backfill_week_reset_events
