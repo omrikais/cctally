@@ -1491,6 +1491,14 @@ def _tui_build_sessions(
 
     When `skip_sync=True`, honors the parent's `--no-sync` intent: no
     ingest pass, just read whatever is already cached.
+
+    Bundle 2 / Task 15: wraps the unified ``build_sessions_view``
+    kernel — the prior 40-line inline-derivation body now lives at
+    ``bin/_lib_view_models.build_sessions_view``. The TUI keeps
+    ownership of the bounded 365-day scan window (rationale below) and
+    consumes ``view.rows`` (the typed ``TuiSessionRow`` tuple). The
+    view's parallel ``view.aggregated`` is reserved for the CLI / share
+    surfaces; the TUI doesn't need ``ClaudeSessionUsage`` fields.
     """
     # Bounded scan window — the sessions pane promises "last `limit`". A
     # 365-day scan covers virtually all users (even one-session-every-few-days
@@ -1499,23 +1507,11 @@ def _tui_build_sessions(
     # on every entry in the window before slicing.
     range_start = now_utc - dt.timedelta(days=365)
     entries = get_claude_session_entries(range_start, now_utc, skip_sync=skip_sync)
-    sessions = _aggregate_claude_sessions(entries)   # last_activity desc
-    out: list[TuiSessionRow] = []
-    for s in sessions[:limit]:
-        duration_min = (s.last_activity - s.first_activity).total_seconds() / 60.0
-        total_read = s.cache_read_tokens
-        total_io = s.input_tokens + s.cache_creation_tokens + s.cache_read_tokens
-        cache_pct = (total_read / total_io * 100) if total_io > 0 else None
-        out.append(TuiSessionRow(
-            started_at=s.first_activity,
-            duration_minutes=duration_min,
-            model_primary=(s.models[0] if s.models else "—"),
-            cost_usd=s.cost_usd,
-            cache_hit_pct=cache_pct,
-            project_label=os.path.basename(s.project_path) or s.project_path,
-            session_id=s.session_id,
-        ))
-    return out
+    c = _cctally()
+    view = c.build_sessions_view(
+        entries, now_utc=now_utc, limit=limit, display_tz=None,
+    )
+    return list(view.rows)
 
 
 @dataclass
