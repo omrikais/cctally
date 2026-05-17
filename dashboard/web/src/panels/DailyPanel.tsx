@@ -84,7 +84,11 @@ export function DailyPanel() {
   // (top-left → bottom-right).
   const orderedRows = [...rows].reverse();
   const chunks = chunkRows(orderedRows, 7);
-  const total = rows.reduce((acc, r) => acc + r.cost_usd, 0);
+  // View-model unification (spec §6.6a): consume the envelope's pre-
+  // computed gap-free total instead of re-summing materialized rows
+  // (which include zero-cost gap days). Falls back to 0 when the
+  // sync hasn't published the field yet.
+  const total = env?.daily?.total_cost_usd ?? 0;
   const peak = env?.daily?.peak ?? null;
 
   return (
