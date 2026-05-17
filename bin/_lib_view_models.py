@@ -174,3 +174,142 @@ class TuiSessionRow:
     cache_hit_pct: float | None
     project_label: str           # basename of project_path
     session_id: str              # full session UUID (v2: needed for session-detail modal)
+
+
+# === Internal helpers ======================================================
+
+
+def _display_tz_label(display_tz) -> str:
+    """Mirror of cctally._share_display_tz_label.
+
+    Kept here so builders don't depend on the cctally namespace at
+    build time. ``ZoneInfo`` -> ``zone.key``; ``None`` -> ``"local"``
+    (per resolve_display_tz's convention).
+    """
+    return display_tz.key if display_tz is not None else "local"
+
+
+def _model_breakdowns_to_models_late(model_breakdowns, cost_usd):
+    """Late-bound shim for ``_model_breakdowns_to_models`` in
+    ``_cctally_dashboard``.
+
+    Cannot eagerly import at module load (``_cctally_dashboard`` is a
+    heavier sibling and creating an import-time edge would force its
+    side-effects on every builder load). Resolved at first call.
+    """
+    mod = _load_lib("_cctally_dashboard")
+    return mod._model_breakdowns_to_models(model_breakdowns, cost_usd)
+
+
+# === DailyView + build_daily_view (Task 3) =================================
+
+
+@dataclass(frozen=True)
+class DailyView:
+    """Daily domain view — entries-driven, newest-first.
+
+    ``rows`` carries one ``DailyPanelRow`` per *non-empty* day (NO
+    gap-fill — the dashboard envelope adapter materializes the
+    contiguous heatmap window post-builder; CLI / share consume rows
+    as-is to preserve byte-stable ``cctally daily --json``).
+
+    ``aggregated`` is the parallel ``BucketUsage`` tuple from
+    ``_aggregate_daily`` (same order as ``rows``). CLI's
+    ``_bucket_to_json`` and ``_render_bucket_table`` plus the share
+    ``_build_daily_snapshot`` consume this shape; the dashboard
+    envelope adapter consumes ``rows``.
+
+    Carrying both shapes (BucketUsage + DailyPanelRow) mirrors the
+    SessionsView pattern in Bundle 2 (spec §6.5) — CLI/share renderers
+    today depend on BucketUsage fields (``bucket``, ``model_breakdowns``,
+    ``models: list[str]``) that aren't present on ``DailyPanelRow``;
+    forcing the rename onto the renderer would break byte-stable
+    ``cctally daily --json``.
+    """
+    rows: tuple = ()                          # tuple[DailyPanelRow, ...]
+    aggregated: tuple = ()                    # tuple[BucketUsage, ...]
+    total_cost_usd: float = 0.0
+    total_tokens: int = 0
+    period_start: "dt.datetime | None" = None
+    period_end: "dt.datetime | None" = None
+    display_tz_label: str = ""
+
+
+def build_daily_view(entries, *, now_utc, display_tz=None):
+    """Build a ``DailyView`` from raw ``UsageEntry`` list (spec §5.1).
+
+    Gap-free: only days with entries appear in ``view.rows`` /
+    ``view.aggregated`` (newest-first). The contiguous-window
+    materialization the dashboard heatmap needs is presentation logic
+    and stays at the dashboard envelope adapter.
+
+    Per-row derivations: ``cache_hit_pct`` (cache_read / (input +
+    cache_creation + cache_read) * 100), ``is_today`` (date == today
+    in display_tz), ``models[]`` via
+    ``_model_breakdowns_to_models``.
+
+    Leaves ``DailyPanelRow.label`` and ``intensity_bucket`` at dataclass
+    defaults — the dashboard envelope adapter populates them. CLI /
+    share consumers ignore them and read ``view.aggregated`` instead.
+    """
+    _agg = _load_lib("_lib_aggregators")
+    buckets = _agg._aggregate_daily(entries, mode="auto", tz=display_tz)
+    if not buckets:
+        return DailyView(
+            rows=(),
+            aggregated=(),
+            total_cost_usd=0.0,
+            total_tokens=0,
+            period_start=None,
+            period_end=now_utc,
+            display_tz_label=_display_tz_label(display_tz),
+        )
+
+    today_local = (
+        now_utc.astimezone(display_tz) if display_tz is not None
+        # internal fallback: host-local intentional
+        else now_utc.astimezone()
+    ).date()
+
+    rows = []
+    # buckets come oldest-first from _aggregate_daily; reverse for newest-first.
+    reversed_buckets = list(reversed(buckets))
+    total_cost = 0.0
+    total_tok = 0
+    for b in reversed_buckets:
+        denom = b.input_tokens + b.cache_creation_tokens + b.cache_read_tokens
+        cache_hit = (b.cache_read_tokens / denom * 100.0) if denom > 0 else None
+        d = dt.date.fromisoformat(b.bucket)
+        row = DailyPanelRow(
+            date=b.bucket,
+            label="",                  # adapter fills
+            cost_usd=b.cost_usd,
+            is_today=(d == today_local),
+            intensity_bucket=0,        # adapter fills
+            models=_model_breakdowns_to_models_late(
+                b.model_breakdowns, b.cost_usd,
+            ),
+            input_tokens=b.input_tokens,
+            output_tokens=b.output_tokens,
+            cache_creation_tokens=b.cache_creation_tokens,
+            cache_read_tokens=b.cache_read_tokens,
+            total_tokens=b.total_tokens,
+            cache_hit_pct=cache_hit,
+        )
+        rows.append(row)
+        total_cost += b.cost_usd
+        total_tok += b.total_tokens
+
+    earliest = dt.date.fromisoformat(buckets[0].bucket)
+    period_start = dt.datetime.combine(
+        earliest, dt.time.min, tzinfo=dt.timezone.utc,
+    )
+    return DailyView(
+        rows=tuple(rows),
+        aggregated=tuple(reversed_buckets),
+        total_cost_usd=total_cost,
+        total_tokens=total_tok,
+        period_start=period_start,
+        period_end=now_utc,
+        display_tz_label=_display_tz_label(display_tz),
+    )
