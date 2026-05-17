@@ -156,25 +156,41 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3.
+from _cctally_core import (
+    eprint,
+    now_utc_iso,
+    parse_iso_datetime,
+    open_db,
+    get_week_start_name,
+    compute_week_bounds,
+    parse_date_str,
+    _canonicalize_optional_iso,
+    make_week_ref,
+    _get_alerts_config,
+    _AlertsConfigError,
+)
+from _lib_five_hour import _canonical_5h_window_key
+from _lib_pricing import _calculate_entry_cost
+
+
 # Module-level back-ref shims. Each shim resolves
 # ``sys.modules['cctally'].X`` at CALL TIME (not bind time), so
 # monkeypatches on cctally's namespace propagate into the moved code
 # unchanged. Mirrors the precedent established in
 # ``bin/_cctally_cache.py`` and ``bin/_cctally_db.py``.
-def eprint(*args, **kwargs):
-    return sys.modules["cctally"].eprint(*args, **kwargs)
+# `load_config` and `get_claude_session_entries` STAY as shims even
+# though their natural homes are decentralized (_cctally_config /
+# _cctally_cache) — tests monkeypatch them via `ns["X"]` (21 sites
+# total, audited 2026-05-17); direct imports would silently bypass
+# the patches.
+def load_config(*args, **kwargs):
+    return sys.modules["cctally"].load_config(*args, **kwargs)
 
 
-def now_utc_iso(*args, **kwargs):
-    return sys.modules["cctally"].now_utc_iso(*args, **kwargs)
-
-
-def parse_iso_datetime(*args, **kwargs):
-    return sys.modules["cctally"].parse_iso_datetime(*args, **kwargs)
-
-
-def open_db(*args, **kwargs):
-    return sys.modules["cctally"].open_db(*args, **kwargs)
+def get_claude_session_entries(*args, **kwargs):
+    return sys.modules["cctally"].get_claude_session_entries(*args, **kwargs)
 
 
 def open_cache_db(*args, **kwargs):
@@ -183,30 +199,6 @@ def open_cache_db(*args, **kwargs):
 
 def sync_cache(*args, **kwargs):
     return sys.modules["cctally"].sync_cache(*args, **kwargs)
-
-
-def load_config(*args, **kwargs):
-    return sys.modules["cctally"].load_config(*args, **kwargs)
-
-
-def get_week_start_name(*args, **kwargs):
-    return sys.modules["cctally"].get_week_start_name(*args, **kwargs)
-
-
-def compute_week_bounds(*args, **kwargs):
-    return sys.modules["cctally"].compute_week_bounds(*args, **kwargs)
-
-
-def parse_date_str(*args, **kwargs):
-    return sys.modules["cctally"].parse_date_str(*args, **kwargs)
-
-
-def _canonicalize_optional_iso(*args, **kwargs):
-    return sys.modules["cctally"]._canonicalize_optional_iso(*args, **kwargs)
-
-
-def _canonical_5h_window_key(*args, **kwargs):
-    return sys.modules["cctally"]._canonical_5h_window_key(*args, **kwargs)
 
 
 def _floor_to_hour(*args, **kwargs):
@@ -245,20 +237,8 @@ def insert_percent_milestone(*args, **kwargs):
     return sys.modules["cctally"].insert_percent_milestone(*args, **kwargs)
 
 
-def make_week_ref(*args, **kwargs):
-    return sys.modules["cctally"].make_week_ref(*args, **kwargs)
-
-
 def cmd_sync_week(*args, **kwargs):
     return sys.modules["cctally"].cmd_sync_week(*args, **kwargs)
-
-
-def _calculate_entry_cost(*args, **kwargs):
-    return sys.modules["cctally"]._calculate_entry_cost(*args, **kwargs)
-
-
-def get_claude_session_entries(*args, **kwargs):
-    return sys.modules["cctally"].get_claude_session_entries(*args, **kwargs)
 
 
 def _resolve_primary_model_for_block(*args, **kwargs):
@@ -279,10 +259,6 @@ def _build_alert_payload_five_hour(*args, **kwargs):
 
 def _dispatch_alert_notification(*args, **kwargs):
     return sys.modules["cctally"]._dispatch_alert_notification(*args, **kwargs)
-
-
-def _get_alerts_config(*args, **kwargs):
-    return sys.modules["cctally"]._get_alerts_config(*args, **kwargs)
 
 
 def _warn_alerts_bad_config_once(*args, **kwargs):
@@ -532,7 +508,7 @@ def maybe_record_milestone(
         # the underlying problem is config-wide, not axis-specific.
         try:
             alerts_cfg: "dict | None" = _get_alerts_config(load_config())
-        except sys.modules["cctally"]._AlertsConfigError as exc:
+        except _AlertsConfigError as exc:
             _warn_alerts_bad_config_once(exc)
             alerts_cfg = None
 
@@ -803,7 +779,7 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
         cfg_for_alerts = load_config()
         try:
             alerts_cfg: "dict | None" = _get_alerts_config(cfg_for_alerts)
-        except sys.modules["cctally"]._AlertsConfigError as exc:
+        except _AlertsConfigError as exc:
             _warn_alerts_bad_config_once(exc)
             alerts_cfg = None
         # Resolve display.tz once (shares the cfg load above). Threaded

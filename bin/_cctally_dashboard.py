@@ -251,6 +251,39 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
+# import from _cctally_core; already-decentralized buckets (X = _lib_*,
+# Y = _cctally_*) import from their natural home. These bypass the
+# legacy shim pattern entirely.
+from _cctally_core import (
+    eprint,
+    now_utc_iso,
+    parse_iso_datetime,
+    _now_utc,
+    _command_as_of,
+    open_db,
+    get_latest_usage_for_week,
+    make_week_ref,
+    _get_alerts_config,
+    _AlertsConfigError,
+)
+from _lib_display_tz import (
+    format_display_dt,
+    resolve_display_tz,
+    normalize_display_tz_value,
+    _compute_display_block,
+)
+from _lib_aggregators import _aggregate_daily, _aggregate_monthly, _aggregate_weekly
+from _lib_pricing import _calculate_entry_cost, _chip_for_model, _short_model_name
+from _lib_five_hour import _canonical_5h_window_key
+from _lib_subscription_weeks import _compute_subscription_weeks
+from _lib_blocks import _group_entries_into_blocks
+from _cctally_config import save_config, _load_config_unlocked
+from _cctally_db import _render_migration_error_banner
+from _cctally_cache import get_entries
+
+
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
 # Each shim resolves ``sys.modules['cctally'].X`` at CALL TIME (not bind
 # time), so monkeypatches on cctally's namespace propagate into the moved
@@ -258,112 +291,18 @@ def _cctally():
 # ``bin/_cctally_record.py`` (34 shims), ``bin/_cctally_cache.py``
 # (4 shims), ``bin/_cctally_db.py`` (4 shims), and
 # ``bin/_cctally_update.py`` (8 shims).
-def eprint(*args, **kwargs):
-    return sys.modules["cctally"].eprint(*args, **kwargs)
-
-
-def now_utc_iso(*args, **kwargs):
-    return sys.modules["cctally"].now_utc_iso(*args, **kwargs)
-
-
-def parse_iso_datetime(*args, **kwargs):
-    return sys.modules["cctally"].parse_iso_datetime(*args, **kwargs)
-
-
-def _now_utc(*args, **kwargs):
-    return sys.modules["cctally"]._now_utc(*args, **kwargs)
-
-
-def _command_as_of(*args, **kwargs):
-    return sys.modules["cctally"]._command_as_of(*args, **kwargs)
-
-
+# `load_config` and `get_claude_session_entries` STAY as shims even
+# though their natural homes are decentralized (_cctally_config /
+# _cctally_cache) — tests monkeypatch them via `ns["X"]` (21 sites
+# total, audited 2026-05-17); direct imports would silently bypass
+# the patches and yield false negatives in test_share_top_projects /
+# test_refresh_usage_helpers / test_update.
 def load_config(*args, **kwargs):
     return sys.modules["cctally"].load_config(*args, **kwargs)
 
 
-def save_config(*args, **kwargs):
-    return sys.modules["cctally"].save_config(*args, **kwargs)
-
-
-def open_db(*args, **kwargs):
-    return sys.modules["cctally"].open_db(*args, **kwargs)
-
-
-def get_entries(*args, **kwargs):
-    return sys.modules["cctally"].get_entries(*args, **kwargs)
-
-
 def get_claude_session_entries(*args, **kwargs):
     return sys.modules["cctally"].get_claude_session_entries(*args, **kwargs)
-
-
-def get_latest_usage_for_week(*args, **kwargs):
-    return sys.modules["cctally"].get_latest_usage_for_week(*args, **kwargs)
-
-
-def make_week_ref(*args, **kwargs):
-    return sys.modules["cctally"].make_week_ref(*args, **kwargs)
-
-
-def format_display_dt(*args, **kwargs):
-    return sys.modules["cctally"].format_display_dt(*args, **kwargs)
-
-
-def resolve_display_tz(*args, **kwargs):
-    return sys.modules["cctally"].resolve_display_tz(*args, **kwargs)
-
-
-def normalize_display_tz_value(*args, **kwargs):
-    return sys.modules["cctally"].normalize_display_tz_value(*args, **kwargs)
-
-
-def _compute_display_block(*args, **kwargs):
-    return sys.modules["cctally"]._compute_display_block(*args, **kwargs)
-
-
-def _render_migration_error_banner(*args, **kwargs):
-    return sys.modules["cctally"]._render_migration_error_banner(*args, **kwargs)
-
-
-def _aggregate_daily(*args, **kwargs):
-    return sys.modules["cctally"]._aggregate_daily(*args, **kwargs)
-
-
-def _aggregate_monthly(*args, **kwargs):
-    return sys.modules["cctally"]._aggregate_monthly(*args, **kwargs)
-
-
-def _aggregate_weekly(*args, **kwargs):
-    return sys.modules["cctally"]._aggregate_weekly(*args, **kwargs)
-
-
-def _calculate_entry_cost(*args, **kwargs):
-    return sys.modules["cctally"]._calculate_entry_cost(*args, **kwargs)
-
-
-def _canonical_5h_window_key(*args, **kwargs):
-    return sys.modules["cctally"]._canonical_5h_window_key(*args, **kwargs)
-
-
-def _chip_for_model(*args, **kwargs):
-    return sys.modules["cctally"]._chip_for_model(*args, **kwargs)
-
-
-def _short_model_name(*args, **kwargs):
-    return sys.modules["cctally"]._short_model_name(*args, **kwargs)
-
-
-def _compute_subscription_weeks(*args, **kwargs):
-    return sys.modules["cctally"]._compute_subscription_weeks(*args, **kwargs)
-
-
-def _group_entries_into_blocks(*args, **kwargs):
-    return sys.modules["cctally"]._group_entries_into_blocks(*args, **kwargs)
-
-
-def _get_alerts_config(*args, **kwargs):
-    return sys.modules["cctally"]._get_alerts_config(*args, **kwargs)
 
 
 def _warn_alerts_bad_config_once(*args, **kwargs):
@@ -400,10 +339,6 @@ def _dispatch_alert_notification(*args, **kwargs):
 
 def doctor_gather_state(*args, **kwargs):
     return sys.modules["cctally"].doctor_gather_state(*args, **kwargs)
-
-
-def _load_config_unlocked(*args, **kwargs):
-    return sys.modules["cctally"]._load_config_unlocked(*args, **kwargs)
 
 
 def _apply_display_tz_override(*args, **kwargs):
@@ -2987,7 +2922,7 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     alerts_array = list(getattr(snap, "alerts", []) or [])
     try:
         _alerts_cfg = _get_alerts_config(load_config())
-    except sys.modules["cctally"]._AlertsConfigError as exc:
+    except _AlertsConfigError as exc:
         _warn_alerts_bad_config_once(exc)
         _alerts_cfg = {
             "enabled": False,
@@ -3782,7 +3717,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 # save_config has not yet been called).
                 try:
                     _get_alerts_config(merged)
-                except sys.modules["cctally"]._AlertsConfigError as exc:
+                except _AlertsConfigError as exc:
                     self._respond_json(400, {"error": str(exc)})
                     return
 

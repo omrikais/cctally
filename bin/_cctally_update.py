@@ -192,26 +192,23 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3.
+from _cctally_core import eprint, _now_utc
+from _cctally_config import save_config
+
+
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
 # Each shim resolves ``sys.modules['cctally'].X`` at CALL TIME (not bind
 # time), so monkeypatches on cctally's namespace propagate into the moved
 # code unchanged. Mirrors the precedent established in
 # ``bin/_cctally_record.py`` (34 shims), ``bin/_cctally_cache.py``
 # (4 shims), and ``bin/_cctally_db.py`` (4 shims).
-def eprint(*args, **kwargs):
-    return sys.modules["cctally"].eprint(*args, **kwargs)
-
-
-def _now_utc(*args, **kwargs):
-    return sys.modules["cctally"]._now_utc(*args, **kwargs)
-
-
+# `load_config` STAYS as a shim even though its natural home is
+# _cctally_config — tests monkeypatch it via `ns["load_config"]` (16
+# sites, audited 2026-05-17); direct import would silently bypass.
 def load_config(*args, **kwargs):
     return sys.modules["cctally"].load_config(*args, **kwargs)
-
-
-def save_config(*args, **kwargs):
-    return sys.modules["cctally"].save_config(*args, **kwargs)
 
 
 def _release_read_latest_release_version(*args, **kwargs):

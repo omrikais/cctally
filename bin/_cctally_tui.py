@@ -202,6 +202,25 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3.
+from _cctally_core import (
+    eprint,
+    parse_iso_datetime,
+    _now_utc,
+    open_db,
+    get_latest_usage_for_week,
+    _canonicalize_optional_iso,
+)
+from _lib_display_tz import (
+    format_display_dt,
+    resolve_display_tz,
+    normalize_display_tz_value,
+    _compute_display_block,
+)
+from _lib_aggregators import _aggregate_monthly
+
+
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
 # Each shim resolves ``sys.modules['cctally'].X`` at CALL TIME (not bind
 # time), so monkeypatches on cctally's namespace propagate into the moved
@@ -209,36 +228,17 @@ def _cctally():
 # ``bin/_cctally_record.py``, ``bin/_cctally_cache.py``,
 # ``bin/_cctally_db.py``, ``bin/_cctally_update.py``, and
 # ``bin/_cctally_dashboard.py``.
-def eprint(*args, **kwargs):
-    return sys.modules["cctally"].eprint(*args, **kwargs)
-
-
-def parse_iso_datetime(*args, **kwargs):
-    return sys.modules["cctally"].parse_iso_datetime(*args, **kwargs)
-
-
-def _now_utc(*args, **kwargs):
-    return sys.modules["cctally"]._now_utc(*args, **kwargs)
-
-
-def open_db(*args, **kwargs):
-    return sys.modules["cctally"].open_db(*args, **kwargs)
-
-
+# `load_config` and `get_claude_session_entries` STAY as shims even
+# though their natural homes are decentralized (_cctally_config /
+# _cctally_cache) — tests monkeypatch them via `ns["X"]` (21 sites
+# total, audited 2026-05-17); direct imports would silently bypass
+# the patches.
 def load_config(*args, **kwargs):
     return sys.modules["cctally"].load_config(*args, **kwargs)
 
 
-def format_display_dt(*args, **kwargs):
-    return sys.modules["cctally"].format_display_dt(*args, **kwargs)
-
-
-def resolve_display_tz(*args, **kwargs):
-    return sys.modules["cctally"].resolve_display_tz(*args, **kwargs)
-
-
-def normalize_display_tz_value(*args, **kwargs):
-    return sys.modules["cctally"].normalize_display_tz_value(*args, **kwargs)
+def get_claude_session_entries(*args, **kwargs):
+    return sys.modules["cctally"].get_claude_session_entries(*args, **kwargs)
 
 
 def _resolve_display_tz_obj(*args, **kwargs):
@@ -251,10 +251,6 @@ def _apply_display_tz_override(*args, **kwargs):
 
 def _apply_midweek_reset_override(*args, **kwargs):
     return sys.modules["cctally"]._apply_midweek_reset_override(*args, **kwargs)
-
-
-def _compute_display_block(*args, **kwargs):
-    return sys.modules["cctally"]._compute_display_block(*args, **kwargs)
 
 
 def _compute_forecast(*args, **kwargs):
@@ -297,28 +293,12 @@ def _aggregate_claude_sessions(*args, **kwargs):
     return sys.modules["cctally"]._aggregate_claude_sessions(*args, **kwargs)
 
 
-def _aggregate_monthly(*args, **kwargs):
-    return sys.modules["cctally"]._aggregate_monthly(*args, **kwargs)
-
-
-def get_claude_session_entries(*args, **kwargs):
-    return sys.modules["cctally"].get_claude_session_entries(*args, **kwargs)
-
-
-def get_latest_usage_for_week(*args, **kwargs):
-    return sys.modules["cctally"].get_latest_usage_for_week(*args, **kwargs)
-
-
 def get_latest_cost_for_week(*args, **kwargs):
     return sys.modules["cctally"].get_latest_cost_for_week(*args, **kwargs)
 
 
 def get_milestones_for_week(*args, **kwargs):
     return sys.modules["cctally"].get_milestones_for_week(*args, **kwargs)
-
-
-def _canonicalize_optional_iso(*args, **kwargs):
-    return sys.modules["cctally"]._canonicalize_optional_iso(*args, **kwargs)
 
 
 def get_recent_weeks(*args, **kwargs):

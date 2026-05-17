@@ -20,6 +20,7 @@
     "bin/_cctally_alerts.py",
     "bin/_cctally_cache.py",
     "bin/_cctally_config.py",
+    "bin/_cctally_core.py",
     "bin/_cctally_dashboard.py",
     "bin/_cctally_db.py",
     "bin/_cctally_record.py",
