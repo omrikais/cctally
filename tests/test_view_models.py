@@ -518,3 +518,203 @@ class TestTrendView:
         assert r.as_of is not None
         as_of_dt = dt.datetime.fromisoformat(r.as_of).astimezone(dt.timezone.utc)
         assert as_of_dt == dt.datetime(2026, 4, 27, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+
+class TestSessionsView:
+    """Sessions view tests — exercises the dual-shape (`rows` +
+    `aggregated`) contract from spec §6.5, the merge-resumed-sessions
+    invariant, and the limit-truncation behaviour.
+
+    Uses inline `_JoinedClaudeEntry` builders so the tests stay isolated
+    from the cache.db / session_files lazy-population pathway. The
+    aggregator (`_aggregate_claude_sessions`) consumes joined entries
+    directly — no DB-state mocking needed.
+    """
+
+    @staticmethod
+    def _entry(*, ts, sid, src, project, model="claude-opus-4-5",
+               input_tokens=100, output_tokens=50,
+               cache_creation_tokens=0, cache_read_tokens=0):
+        if str(BIN_DIR) not in sys.path:
+            sys.path.insert(0, str(BIN_DIR))
+        # `_JoinedClaudeEntry` lives in `_cctally_cache.py` (the cache-
+        # tier sibling); `_lib_aggregators._aggregate_claude_sessions`
+        # consumes it via a forward-string annotation. We import it
+        # directly so the row builder gets the canonical dataclass
+        # identity used by production code.
+        from _cctally_cache import _JoinedClaudeEntry  # noqa: WPS433
+        return _JoinedClaudeEntry(
+            timestamp=ts,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            cache_read_tokens=cache_read_tokens,
+            source_path=src,
+            session_id=sid,
+            project_path=project,
+        )
+
+    def test_empty_entries_returns_empty_view(self, vm):
+        view = vm.build_sessions_view(
+            [], now_utc=_now(), limit=100, display_tz=None,
+        )
+        assert view.rows == ()
+        assert view.aggregated == ()
+        assert view.total_sessions == 0
+        assert view.total_cost_usd == 0.0
+        assert view.display_tz_label  # non-empty string
+
+    def test_single_session_one_row(self, vm):
+        sid = "11111111-2222-3333-4444-555555555555"
+        ts = dt.datetime(2026, 5, 16, 14, 0, 0, tzinfo=dt.timezone.utc)
+        entries = [
+            self._entry(
+                ts=ts, sid=sid,
+                src="/tmp/sess.jsonl",
+                project="/Users/me/work/proj",
+            ),
+        ]
+        view = vm.build_sessions_view(
+            entries, now_utc=_now(), limit=100, display_tz=None,
+        )
+        assert view.total_sessions == 1
+        assert len(view.rows) == 1
+        assert len(view.aggregated) == 1
+        # rows[i] and aggregated[i] describe the same merged sessionId.
+        assert view.rows[0].session_id == sid
+        assert view.aggregated[0].session_id == sid
+        assert view.rows[0].model_primary == "claude-opus-4-5"
+        assert view.rows[0].project_label == "proj"
+        # total_cost_usd matches the aggregator's computed cost; we only
+        # assert it's a positive float (the exact value depends on
+        # CLAUDE_MODEL_PRICING which evolves).
+        assert view.total_cost_usd > 0.0
+        assert view.aggregated[0].cost_usd == pytest.approx(
+            view.total_cost_usd, abs=1e-9,
+        )
+
+    def test_resumed_session_merges_across_files(self, vm):
+        """A session_id that appears in TWO source files (resume scenario)
+        collapses into ONE row in BOTH `rows` and `aggregated` (CLAUDE.md
+        gotcha: 'session merges resumed sessions'). `source_paths` on
+        the aggregated entry preserves the file set.
+        """
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        ts1 = dt.datetime(2026, 5, 16, 14, 0, 0, tzinfo=dt.timezone.utc)
+        ts2 = dt.datetime(2026, 5, 16, 14, 30, 0, tzinfo=dt.timezone.utc)
+        entries = [
+            self._entry(
+                ts=ts1, sid=sid,
+                src="/tmp/sess-a.jsonl",
+                project="/Users/me/work/proj",
+            ),
+            self._entry(
+                ts=ts2, sid=sid,
+                src="/tmp/sess-b.jsonl",
+                project="/Users/me/work/proj",
+            ),
+        ]
+        view = vm.build_sessions_view(
+            entries, now_utc=_now(), limit=100, display_tz=None,
+        )
+        assert view.total_sessions == 1
+        assert len(view.rows) == 1
+        assert len(view.aggregated) == 1
+        # source_paths on aggregated preserves the file set (multi-JSONL
+        # resume merge invariant).
+        assert set(view.aggregated[0].source_paths) == {
+            "/tmp/sess-a.jsonl", "/tmp/sess-b.jsonl",
+        }
+
+    def test_session_without_models_has_em_dash_primary(self, vm):
+        """Defensive: a session whose aggregator output lists no models
+        should render `model_primary='—'`. In practice this is hard to
+        trigger via the public aggregator (entries imply a model), but
+        the builder branch must stay defensive.
+        """
+        if str(BIN_DIR) not in sys.path:
+            sys.path.insert(0, str(BIN_DIR))
+        from _lib_aggregators import ClaudeSessionUsage  # noqa: WPS433
+
+        sid = "cccccccc-0000-0000-0000-000000000000"
+        ts = dt.datetime(2026, 5, 16, 14, 0, 0, tzinfo=dt.timezone.utc)
+        # Construct a fake aggregator output by monkey-patching the
+        # builder's _aggregate_claude_sessions call via direct
+        # ClaudeSessionUsage list and calling the row-build loop
+        # indirectly. The cleanest path: stub the aggregator on
+        # _lib_aggregators for one call.
+        import _lib_aggregators as _agg  # noqa: WPS433
+        orig = _agg._aggregate_claude_sessions
+        fake = ClaudeSessionUsage(
+            session_id=sid,
+            project_path="/Users/me/work/proj",
+            source_paths=["/tmp/sess.jsonl"],
+            first_activity=ts,
+            last_activity=ts,
+            input_tokens=0, cache_creation_tokens=0, cache_read_tokens=0,
+            output_tokens=0, total_tokens=0,
+            cost_usd=0.0,
+            models=[],
+            model_breakdowns=[],
+        )
+        _agg._aggregate_claude_sessions = lambda _entries: [fake]
+        try:
+            view = vm.build_sessions_view(
+                [], now_utc=_now(), limit=100, display_tz=None,
+            )
+        finally:
+            _agg._aggregate_claude_sessions = orig
+        assert view.rows[0].model_primary == "—"
+        # cache_hit_pct stays None when the I/O denominator is zero.
+        assert view.rows[0].cache_hit_pct is None
+
+    def test_limit_truncates_both_parallel_tuples(self, vm):
+        """`limit=N` truncates rows AND aggregated to N — preserving
+        the spec §4.3 invariant `total_sessions == len(rows) ==
+        len(aggregated)`. The aggregator returns descending-by-
+        last_activity, so the leading N are the most recent.
+        """
+        entries = []
+        # 5 distinct sessions, descending in activity time. Use day i.
+        for i in range(5):
+            sid = f"{i:08x}-0000-0000-0000-000000000000"
+            ts = dt.datetime(2026, 5, 10 + i, 14, 0, 0,
+                             tzinfo=dt.timezone.utc)
+            entries.append(self._entry(
+                ts=ts, sid=sid,
+                src=f"/tmp/sess-{i}.jsonl",
+                project="/Users/me/work/proj",
+            ))
+        view = vm.build_sessions_view(
+            entries, now_utc=_now(), limit=3, display_tz=None,
+        )
+        assert len(view.rows) == 3
+        assert len(view.aggregated) == 3
+        assert view.total_sessions == 3
+        # Aggregator sort is desc by last_activity → leading 3 are the
+        # newest. i=4 (May 14) first, i=3, i=2.
+        assert view.rows[0].session_id == "00000004-0000-0000-0000-000000000000"
+        assert view.rows[1].session_id == "00000003-0000-0000-0000-000000000000"
+        assert view.rows[2].session_id == "00000002-0000-0000-0000-000000000000"
+
+    def test_limit_none_keeps_all_sessions(self, vm):
+        """`limit=None` is the CLI use case (`cctally session` emits
+        every session in the date range). Builder must NOT truncate.
+        """
+        entries = []
+        for i in range(5):
+            sid = f"{i:08x}-0000-0000-0000-000000000000"
+            ts = dt.datetime(2026, 5, 10 + i, 14, 0, 0,
+                             tzinfo=dt.timezone.utc)
+            entries.append(self._entry(
+                ts=ts, sid=sid,
+                src=f"/tmp/sess-{i}.jsonl",
+                project="/Users/me/work/proj",
+            ))
+        view = vm.build_sessions_view(
+            entries, now_utc=_now(), limit=None, display_tz=None,
+        )
+        assert len(view.rows) == 5
+        assert len(view.aggregated) == 5
+        assert view.total_sessions == 5

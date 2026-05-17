@@ -1025,13 +1025,18 @@ class DataSnapshot:
     # renderer; empty list when no current 5h block is bound.
     five_hour_milestones: list[dict] = field(default_factory=list)
     # ---- view-model unification (Bundle 1): pre-computed totals ----
-    # Populated by the sync thread from `build_daily_view` /
-    # `build_monthly_view` / `build_weekly_view` /
-    # `build_trend_view` so the dashboard envelope adapter can emit
-    # `<domain>.total_cost_usd` / `total_tokens` scalars without
-    # re-summing (and React panels can stop running `rows.reduce(...)`
-    # in JS). Defaults preserve compatibility with pre-Bundle-1 fixture
-    # modules that construct `DataSnapshot` positionally. Spec §6.6.
+    # Populated by the sync thread as sum-over-visible-rows over the
+    # panel rows ``_dashboard_build_{daily,monthly,weekly}_periods``
+    # returned (see ``_tui_build_snapshot``); the dashboard envelope
+    # adapter emits these as ``<domain>.total_cost_usd`` /
+    # ``total_tokens`` so the React panels stop running
+    # ``rows.reduce(...)`` in JS. Sum-over-visible-rows is a structural
+    # invariant: ``total === sum(rows[*].cost_usd)`` by construction —
+    # see ``test_weekly_envelope_total_matches_sum_of_visible_rows``.
+    # ``trend_avg_dollars_per_pct`` is sourced from ``build_trend_view``
+    # (3-sample-rule mean per spec §4.3). Defaults preserve
+    # compatibility with pre-Bundle-1 fixture modules that construct
+    # ``DataSnapshot`` positionally. Spec §6.6.
     daily_total_cost_usd: float = 0.0
     daily_total_tokens: int = 0
     monthly_total_cost_usd: float = 0.0
@@ -1709,8 +1714,15 @@ def _tui_build_snapshot(
             weekly_periods = _dashboard_build_weekly_periods(
                 conn, now_utc, n=12, skip_sync=skip_sync
             )
-            weekly_total_cost_usd = sum(r.cost_usd for r in weekly_periods)
-            weekly_total_tokens = sum(r.total_tokens for r in weekly_periods)
+            # ``sum(..., 0.0)`` pins the type to ``float`` on empty rows so
+            # the envelope stays byte-stable with the pre-fix ``0.0`` shape
+            # (the dashboard fixture goldens assert exact JSON match).
+            weekly_total_cost_usd = sum(
+                (r.cost_usd for r in weekly_periods), 0.0,
+            )
+            weekly_total_tokens = sum(
+                (r.total_tokens for r in weekly_periods), 0,
+            )
         except Exception as exc:
             errors.append(f"weekly-periods: {exc}")
         # Sync-thread view-model totals (spec §6.6): sum-over-visible-rows
@@ -1725,8 +1737,12 @@ def _tui_build_snapshot(
                 conn, now_utc, n=12, skip_sync=skip_sync,
                 display_tz=_build_display_tz,
             )
-            monthly_total_cost_usd = sum(r.cost_usd for r in monthly_periods)
-            monthly_total_tokens = sum(r.total_tokens for r in monthly_periods)
+            monthly_total_cost_usd = sum(
+                (r.cost_usd for r in monthly_periods), 0.0,
+            )
+            monthly_total_tokens = sum(
+                (r.total_tokens for r in monthly_periods), 0,
+            )
         except Exception as exc:
             errors.append(f"monthly-periods: {exc}")
         # ---- v2.2 additions: dashboard Blocks / Daily panels ----
@@ -1754,8 +1770,12 @@ def _tui_build_snapshot(
                 conn, now_utc, n=30, skip_sync=skip_sync,
                 display_tz=_build_display_tz,
             )
-            daily_total_cost_usd = sum(r.cost_usd for r in daily_panel)
-            daily_total_tokens = sum(r.total_tokens for r in daily_panel)
+            daily_total_cost_usd = sum(
+                (r.cost_usd for r in daily_panel), 0.0,
+            )
+            daily_total_tokens = sum(
+                (r.total_tokens for r in daily_panel), 0,
+            )
         except Exception as exc:
             errors.append(f"daily-panel: {exc}")
         # ---- threshold-actions T5: alerts envelope array ----

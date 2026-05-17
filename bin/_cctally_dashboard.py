@@ -1757,10 +1757,15 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
                                     skip_sync: bool = False) -> "list[WeeklyPeriodRow]":
     """Latest n subscription weeks as WeeklyPeriodRow, newest-first.
 
-    Mirrors the bucket+overlay path used by `cmd_weekly`, scoped to a
-    trailing 84-day window (12 weeks plus slack). Boundaries come from
-    `_compute_subscription_weeks`; usage % comes from
-    `weekly_usage_snapshots` via `get_latest_usage_for_week`.
+    Thin builder-using prelude + Bug-K pre-credit synthesis on top of
+    ``view.rows``. ``build_weekly_view`` (in ``bin/_lib_view_models.py``)
+    owns the bucket+overlay walk — this function calls it, swaps two
+    presentation fields (``label`` ← ``display_start_date`` for post-
+    early-reset weeks; ``is_current`` ← SubWeek-containing-now_utc with
+    snapshot fallback so the "Now" pill tracks wall time), layers Bug-K
+    pre-credit synthesized rows over the natural rows, then recomputes
+    ``delta_cost_pct`` newest-first so the synthesized rows participate
+    in the deltas.
 
     Note: weekly bucketing intentionally does NOT take ``display_tz`` —
     SubWeek bucket keys come from server-anchored stored anchors and the
@@ -1778,16 +1783,21 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
         parse_iso_datetime(weeks[0].start_ts, "week_start_at"),
     )
     entries = get_entries(fetch_start, range_end, skip_sync=skip_sync)
-    buckets = _aggregate_weekly(entries, weeks)
-    if not buckets:
-        return []
-
     as_of_utc = (
         range_end.astimezone(dt.timezone.utc)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+    # Builder prelude: produce the natural newest-first rows + overlay.
+    c = _cctally()
+    view = c.build_weekly_view(
+        conn, entries, weeks=weeks, now_utc=now_utc,
+        display_tz=None, as_of_utc=as_of_utc,
+    )
+    if not view.rows:
+        return []
 
     # Prefer the SubWeek that actually contains `now_utc` so the "Now" pill
     # tracks wall time even when `weekly_usage_snapshots` is stale (e.g.,
@@ -1813,47 +1823,36 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
         else:
             cur_week_start = max(weeks, key=lambda w: w.start_date).start_date.isoformat()
 
+    # SubWeek lookup by (start_ts, end_ts) — the builder identifies each row
+    # by these ISO strings on ``WeeklyPeriodRow``, which match SubWeek 1:1
+    # post _aggregate_weekly invariant.
+    sw_by_window = {(w.start_ts, w.end_ts): w for w in weeks}
+
+    # Convert builder rows (newest-first) → oldest-first so the existing
+    # Bug-K insertion logic (oldest-first indices) stays unchanged. Override
+    # the two presentation fields that diverge between CLI/share (which use
+    # ``start_date`` + "now in window" semantics) and the dashboard panel
+    # (which uses ``display_start_date`` + "current SubWeek" semantics).
     rows_oldest_first: list[WeeklyPeriodRow] = []
-    for bucket in buckets:
-        sw = next(w for w in weeks if w.start_date.isoformat() == bucket.bucket)
-        # Label = MM-DD of the week's display_start_date — for non-reset
-        # weeks this equals start_date; for post-early-reset weeks the
-        # post-processor shifts it forward to the effective reset moment
-        # so the user sees the date the week actually began (04-23 vs the
-        # API-derived backdated 04-18).
-        label = sw.display_start_date.strftime("%m-%d")
-        ref = make_week_ref(
-            week_start_date=sw.start_date.isoformat(),
-            week_end_date=sw.end_date.isoformat(),
-            week_start_at=sw.start_ts,
-            week_end_at=sw.end_ts,
-        )
-        usage_row = get_latest_usage_for_week(conn, ref, as_of_utc=as_of_utc)
-        used_pct = None
-        dpp = None
-        if usage_row is not None and usage_row["weekly_percent"] is not None:
-            used_pct = float(usage_row["weekly_percent"])
-            dpp = (bucket.cost_usd / used_pct) if used_pct > 0 else None
-        rows_oldest_first.append(WeeklyPeriodRow(
-            label=label,
-            cost_usd=bucket.cost_usd,
-            total_tokens=bucket.total_tokens,
-            input_tokens=bucket.input_tokens,
-            output_tokens=bucket.output_tokens,
-            cache_creation_tokens=bucket.cache_creation_tokens,
-            cache_read_tokens=bucket.cache_read_tokens,
-            used_pct=used_pct,
-            dollar_per_pct=dpp,
-            delta_cost_pct=None,  # filled below in newest-first pass
+    for r in reversed(view.rows):
+        sw = sw_by_window.get((r.week_start_at, r.week_end_at))
+        if sw is not None:
+            # Label = MM-DD of the week's display_start_date — for non-reset
+            # weeks this equals start_date; for post-early-reset weeks the
+            # post-processor shifts it forward to the effective reset moment
+            # so the user sees the date the week actually began (04-23 vs the
+            # API-derived backdated 04-18).
+            r.label = sw.display_start_date.strftime("%m-%d")
             # is_current keys on start_date (the bucket / lookup key) on both
             # sides of the comparison; display_start_date may diverge for
             # reset-event weeks but that is intentional — display vs. lookup
             # are kept separate.
-            is_current=(sw.start_date.isoformat() == cur_week_start),
-            models=_model_breakdowns_to_models(bucket.model_breakdowns, bucket.cost_usd),
-            week_start_at=sw.start_ts,
-            week_end_at=sw.end_ts,
-        ))
+            r.is_current = (sw.start_date.isoformat() == cur_week_start)
+        # delta_cost_pct: builder computed it in asc order; reset and
+        # recompute newest-first below AFTER Bug-K rows merge in, so the
+        # synthesized rows participate in the deltas.
+        r.delta_cost_pct = None
+        rows_oldest_first.append(r)
 
     # Bug K (v1.7.2 round-5): synthesize a pre-credit segment row for
     # each in-place credit event. Without this the credited week shows

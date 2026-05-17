@@ -3,24 +3,53 @@
 This module owns the per-domain row dataclasses and the ``*View``
 wrappers that carry rows + data-plane aggregates (totals, averages).
 
-Bundle 1 (this commit) starts with row dataclass relocation from
-``bin/_cctally_tui.py``:
+Bundle 1 (landed):
+
+Row dataclasses moved verbatim from ``bin/_cctally_tui.py`` — no field
+changes:
 
 - ``DailyPanelRow``, ``MonthlyPeriodRow``, ``WeeklyPeriodRow``,
-  ``TuiSessionRow`` move **verbatim** (no field changes).
-- ``TuiTrendRow`` moves with the 10 nullable fields added per spec §4.1
-  (``week_start_date``, ``week_end_date``, ``week_end_at``,
-  ``weekly_cost_usd``, ``usage_captured_at``, ``cost_captured_at``,
-  ``as_of``, ``range_start_iso``, ``range_end_iso``, ``freshness``).
-  All defaults are ``None`` so existing TUI / dashboard fixtures that
-  construct ``TuiTrendRow`` positionally stay byte-stable.
+  ``TuiSessionRow``.
+
+``TuiTrendRow`` moved with the 10 nullable fields added per spec §4.1
+(``week_start_date``, ``week_end_date``, ``week_end_at``,
+``weekly_cost_usd``, ``usage_captured_at``, ``cost_captured_at``,
+``as_of``, ``range_start_iso``, ``range_end_iso``, ``freshness``). All
+defaults are ``None`` so existing TUI / dashboard fixtures that
+construct ``TuiTrendRow`` positionally stay byte-stable.
+
+Frozen ``*View`` dataclasses + builders:
+
+- ``DailyView`` + ``build_daily_view(entries, *, now_utc, display_tz)``
+- ``MonthlyView`` + ``build_monthly_view(entries, *, now_utc, n,
+  display_tz)``
+- ``WeeklyView`` + ``build_weekly_view(conn, entries, *, weeks, now_utc,
+  display_tz, as_of_utc)``
+- ``TrendView`` + ``build_trend_view(conn, *, now_utc, n, display_tz)``
+- ``SessionsView`` + ``build_sessions_view(entries, *, now_utc, limit,
+  display_tz)``
+
+Each ``*View`` carries ``rows`` (typed row tuple) plus a parallel
+``aggregated`` ``BucketUsage`` tuple where CLI byte-stable JSON requires
+it (the weekly view also carries an ``overlay`` tuple of ``(used_pct,
+dpp)`` pairs aligned with ``aggregated``). All builders return totals
+(``total_cost_usd`` / ``total_tokens``) so the dashboard envelope
+adapter (in ``bin/_cctally_dashboard.py``) and the React panel layer
+share a single source of truth.
+
+Helpers:
+
+- ``_load_lib(name)`` — late-import a sibling under ``bin/`` (matches
+  ``_lib_aggregators._load_lib``; keeps the import-time graph acyclic).
+- ``_cctally()`` — accessor for the ``cctally`` module at call-time
+  (spec §5.5; lets builders touch top-level helpers without binding at
+  module load).
+- ``_display_tz_label`` / ``_model_breakdowns_to_models_late`` —
+  presentation-side helpers shared across builders.
 
 ``bin/_cctally_tui.py`` re-exports each name so historical imports
 (``from _cctally_tui import DailyPanelRow``, ``ns["DailyPanelRow"]``
 direct-dict reads in tests) keep resolving.
-
-Subsequent Bundle 1 tasks add ``*View`` frozen dataclasses and the
-``build_*_view(...)`` builders.
 
 Spec: docs/superpowers/specs/2026-05-17-view-model-unification-design.md
 """
@@ -226,8 +255,8 @@ class DailyView:
     forcing the rename onto the renderer would break byte-stable
     ``cctally daily --json``.
     """
-    rows: tuple = ()                          # tuple[DailyPanelRow, ...]
-    aggregated: tuple = ()                    # tuple[BucketUsage, ...]
+    rows: "tuple[DailyPanelRow, ...]" = ()
+    aggregated: tuple = ()                    # tuple[BucketUsage, ...] — forward-ref kept untyped to avoid an import-time edge into the aggregator's BucketUsage shape.
     total_cost_usd: float = 0.0
     total_tokens: int = 0
     period_start: "dt.datetime | None" = None
@@ -335,8 +364,8 @@ class MonthlyView:
     ``delta_cost_pct`` is computed per row vs the next-older row; the
     oldest row's value is ``None`` (no prior to compare against).
     """
-    rows: tuple = ()                          # tuple[MonthlyPeriodRow, ...]
-    aggregated: tuple = ()                    # tuple[BucketUsage, ...]
+    rows: "tuple[MonthlyPeriodRow, ...]" = ()
+    aggregated: tuple = ()                    # tuple[BucketUsage, ...] — forward-ref kept untyped to avoid an import-time edge into the aggregator's BucketUsage shape.
     total_cost_usd: float = 0.0
     total_tokens: int = 0
     period_start: "dt.datetime | None" = None
@@ -434,9 +463,9 @@ class WeeklyView:
     ``rows`` and ``aggregated`` are both newest-first. ``overlay``
     aligns with ``aggregated``.
     """
-    rows: tuple = ()                          # tuple[WeeklyPeriodRow, ...]
-    aggregated: tuple = ()                    # tuple[BucketUsage, ...]
-    overlay: tuple = ()                       # tuple[(used_pct, dpp), ...]
+    rows: "tuple[WeeklyPeriodRow, ...]" = ()
+    aggregated: tuple = ()                    # tuple[BucketUsage, ...] — forward-ref kept untyped to avoid an import-time edge into the aggregator's BucketUsage shape.
+    overlay: "tuple[tuple[float | None, float | None], ...]" = ()
     total_cost_usd: float = 0.0
     total_tokens: int = 0
     period_start: "dt.datetime | None" = None
@@ -490,10 +519,19 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
     for i, b in enumerate(buckets_asc):
         sw = week_by_key.get(b.bucket)
         if sw is None:
-            # Should not happen given _aggregate_weekly's invariant; be
-            # defensive — emit a no-overlay row.
-            asc_overlay.append((None, None))
-            continue
+            # _aggregate_weekly invariant: every emitted bucket key maps
+            # 1:1 to a SubWeek in ``weeks``. Surface the invariant
+            # violation loudly rather than silently desynchronizing the
+            # three parallel lists (``asc_rows`` vs ``asc_overlay`` vs
+            # ``buckets_asc``) — under the prior defensive ``continue``
+            # branch, ``asc_overlay`` would advance one slot while
+            # ``asc_rows`` stayed put, creating a latent index-misalign
+            # for any consumer reading ``view.rows`` parallel to
+            # ``view.aggregated`` / ``view.overlay``.
+            raise AssertionError(
+                f"_aggregate_weekly emitted bucket without matching "
+                f"SubWeek (invariant violation): bucket={b.bucket!r}"
+            )
         ref = make_ref(
             week_start_date=sw.start_date.isoformat(),
             week_end_date=sw.end_date.isoformat(),
@@ -519,7 +557,9 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
             sw_start = parse_iso(sw.start_ts, "week.start_ts")
             sw_end = parse_iso(sw.end_ts, "week.end_ts")
             is_current = sw_start <= now_utc < sw_end
-        except Exception:
+        except ValueError:
+            # parse_iso_datetime raises ValueError on malformed ISO; any
+            # other exception is a genuine bug — let it propagate.
             is_current = False
 
         asc_rows.append(WeeklyPeriodRow(
@@ -552,7 +592,9 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
     if weeks:
         try:
             period_start_dt = parse_iso(weeks[0].start_ts, "weeks[0].start_ts")
-        except Exception:
+        except ValueError:
+            # parse_iso_datetime raises ValueError on malformed ISO; any
+            # other exception is a genuine bug — let it propagate.
             period_start_dt = None
     return WeeklyView(
         rows=tuple(rows),
@@ -588,7 +630,7 @@ class TrendView:
     to-right walk + cmd_report's `--json` trend list (which is then
     sorted by recency at the render site).
     """
-    rows: tuple = ()                          # tuple[TuiTrendRow, ...] (oldest-first)
+    rows: "tuple[TuiTrendRow, ...]" = ()        # oldest-first
     avg_dollars_per_pct: "float | None" = None
     period_start: "dt.datetime | None" = None
     period_end: "dt.datetime | None" = None
@@ -618,7 +660,6 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None):
     rows qualify; else None. Mirrors
     ``_build_report_snapshot``'s historical behavior.
     """
-    _share = _load_lib("_lib_share")  # noqa: F841 — defensive; unused but mirrors siblings
     _cct_core = _load_lib("_cctally_core")
     parse_iso = _cct_core.parse_iso_datetime
     make_ref = _cct_core.make_week_ref
@@ -828,6 +869,125 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None):
         rows=tuple(rows),
         avg_dollars_per_pct=avg,
         period_start=None,
+        period_end=now_utc,
+        display_tz_label=_display_tz_label(display_tz),
+    )
+
+
+# === SessionsView + build_sessions_view (Task 13) ==========================
+
+
+@dataclass(frozen=True)
+class SessionsView:
+    """Sessions domain view — Claude sessions (merged across resumes),
+    last-activity descending.
+
+    Dual-shape per the spec §6.5 pattern that the daily/monthly/weekly
+    views established:
+
+    - ``rows`` carries the typed ``TuiSessionRow`` tuple consumed by the
+      TUI sessions panel and the dashboard session-detail surface.
+    - ``aggregated`` carries the parallel ``ClaudeSessionUsage`` tuple
+      consumed by ``cmd_session`` (CLI table + ``--json``) and the
+      share ``_build_session_snapshot`` (needs ``source_paths``,
+      ``model_breakdowns``, ``last_activity`` — fields ``TuiSessionRow``
+      doesn't carry).
+
+    Both shapes derive from the SAME ``_aggregate_claude_sessions``
+    call so the resumed-session merge invariant (``CLAUDE.md`` "Cost /
+    weekly / session" gotcha block — a ``sessionId`` across multiple
+    JSONL files collapses into ONE row) is preserved end-to-end:
+    ``rows[i]`` and ``aggregated[i]`` describe the same merged
+    sessionId.
+
+    ``total_sessions == len(rows) == len(aggregated)`` always (spec
+    §4.3). Empty entries → ``rows=()``, ``aggregated=()``, totals
+    zero — no exceptions on empty input.
+
+    ``limit=None`` keeps the full aggregator output (CLI use case —
+    ``cctally session`` has no ``--limit`` flag and emits everything in
+    the date range). ``limit`` ≥ 1 truncates BOTH parallel tuples to
+    the leading ``limit`` rows (TUI / dashboard use case — the
+    sessions pane promises "last N sessions"). The aggregator's
+    descending-by-last-activity sort means the leading rows are the
+    most recent; the TUI's ``[:100]`` cap stays semantic-stable.
+    """
+    rows: "tuple[TuiSessionRow, ...]" = ()
+    aggregated: tuple = ()              # tuple[ClaudeSessionUsage, ...] — forward-ref kept untyped to avoid an import-time edge into the aggregator's ClaudeSessionUsage shape.
+    total_sessions: int = 0
+    total_cost_usd: float = 0.0
+    period_start: "dt.datetime | None" = None
+    period_end: "dt.datetime | None" = None
+    display_tz_label: str = ""
+
+
+def build_sessions_view(entries, *, now_utc, limit=None, display_tz=None):
+    """Build a ``SessionsView`` from joined Claude session entries
+    (spec §5.5).
+
+    ``entries`` is the ``list[_JoinedClaudeEntry]`` from
+    ``get_claude_session_entries(range_start, range_end)``. The caller
+    controls the date window + ``skip_sync`` semantics; the builder
+    does no I/O of its own beyond what ``_aggregate_claude_sessions``
+    already does (cost recompute from ``CLAUDE_MODEL_PRICING``).
+
+    Per-row derivations (mirror today's ``_tui_build_sessions``
+    inline body):
+      - ``duration_minutes`` = ``(last_activity - first_activity)`` in
+        minutes (float).
+      - ``cache_hit_pct`` = ``cache_read / (input + cache_creation +
+        cache_read) * 100`` when the denominator is positive; ``None``
+        otherwise.
+      - ``model_primary`` = first model in the session's first-seen
+        order; ``"—"`` if the session somehow has no models (defensive
+        — the aggregator only emits sessions with at least one entry).
+      - ``project_label`` = ``os.path.basename(project_path)`` or
+        ``project_path`` itself when the basename is empty (root paths).
+
+    ``period_start`` is set to ``now_utc - 365d`` to match
+    ``_tui_build_sessions``' bounded scan window — strictly cosmetic
+    metadata (the caller's actual date range owns the entries fetched).
+    Share / CLI consumers prefer the caller-supplied range; this field
+    is informational only.
+    """
+    import os as _os                # late: keep top-level imports lean.
+    _agg = _load_lib("_lib_aggregators")
+    aggregated = _agg._aggregate_claude_sessions(entries)
+    # Apply limit truncation up front so `rows` and `aggregated` stay
+    # in lockstep (spec §4.3 invariant: `total_sessions == len(rows)
+    # == len(aggregated)`). limit=None → keep everything.
+    if limit is not None:
+        aggregated = aggregated[:limit]
+
+    rows = []
+    total_cost = 0.0
+    for s in aggregated:
+        duration_min = (
+            (s.last_activity - s.first_activity).total_seconds() / 60.0
+        )
+        denom = s.input_tokens + s.cache_creation_tokens + s.cache_read_tokens
+        cache_pct = (
+            (s.cache_read_tokens / denom * 100.0) if denom > 0 else None
+        )
+        rows.append(TuiSessionRow(
+            started_at=s.first_activity,
+            duration_minutes=duration_min,
+            model_primary=(s.models[0] if s.models else "—"),
+            cost_usd=s.cost_usd,
+            cache_hit_pct=cache_pct,
+            project_label=(
+                _os.path.basename(s.project_path) or s.project_path
+            ),
+            session_id=s.session_id,
+        ))
+        total_cost += s.cost_usd
+
+    return SessionsView(
+        rows=tuple(rows),
+        aggregated=tuple(aggregated),
+        total_sessions=len(rows),
+        total_cost_usd=total_cost,
+        period_start=(now_utc - dt.timedelta(days=365)),
         period_end=now_utc,
         display_tz_label=_display_tz_label(display_tz),
     )

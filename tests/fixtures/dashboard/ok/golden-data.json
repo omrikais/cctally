@@ -1321,7 +1321,7 @@
         "total_tokens": 8328000
       }
     ],
-    "total_cost_usd": 208.22999699999997,
+    "total_cost_usd": 208.229997,
     "total_tokens": 40269999
   },
   "sessions": {
@@ -1966,7 +1966,7 @@
         "week_start_at": "2026-02-16T14:00:00Z"
       }
     ],
-    "total_cost_usd": 208.229997,
+    "total_cost_usd": 208.22999700000003,
     "total_tokens": 40269999
   }
 }

@@ -7930,42 +7930,42 @@ def cmd_report(args: argparse.Namespace) -> int:
         # (`+00:00` for UTC-anchored weeks) — TuiTrendRow's datetime
         # form re-localizes via parse_iso_datetime, which would emit
         # `+03:00` on a UTC+3 host and break byte-stability.
-        week_iso_by_key: dict[str, tuple[str | None, str | None]] = {}
+        #
+        # Index by ``(week_start_date_iso, week_start_at_utc_instant)``
+        # so ``_row_to_dict`` resolves a row's original WeekRef ISO
+        # strings in O(1) — credited weeks share ``week_start_date`` so
+        # the UTC-instant disambiguates them. The lookup key matches the
+        # row-side derivation in ``_row_to_dict`` (UTC instant from the
+        # parsed datetime).
+        week_iso_by_key: dict[tuple[str, dt.datetime],
+                              tuple[str | None, str | None]] = {}
         for wr in weeks:
-            week_iso_by_key[(wr.week_start.isoformat(), wr.week_start_at)] = (
+            if wr.week_start_at is None:
+                continue
+            try:
+                wr_utc = parse_iso_datetime(
+                    wr.week_start_at, "wr.week_start_at",
+                ).astimezone(dt.timezone.utc)
+            except ValueError:
+                continue
+            week_iso_by_key[(wr.week_start.isoformat(), wr_utc)] = (
                 wr.week_start_at,
                 wr.week_end_at,
             )
 
         def _row_to_dict(r):
-            # Match this row's WeekRef by (week_start_date, isoformat of
-            # week_start_at parsed-then-utc) — credited weeks share
-            # week_start_date so we disambiguate via week_start_at.
+            # Match this row's WeekRef by (week_start_date, UTC instant
+            # of parsed week_start_at) — credited weeks share
+            # week_start_date so we disambiguate via the UTC instant.
             wsd_str = (
                 r.week_start_date.isoformat() if r.week_start_date else None
             )
-            # The row's week_start_at is a parsed datetime (host-local
-            # after parse_iso_datetime). Normalize to UTC for the
-            # lookup; both candidate weeks share the same UTC instant.
-            # But the dict key uses the raw +00:00 string from WeekRef,
-            # so we need an inverse match. Walk weeks looking for a
-            # WeekRef whose parsed week_start_at instant matches r's.
             ws_at = ws_at_end = None
-            if r.week_start_at is not None:
+            if wsd_str is not None and r.week_start_at is not None:
                 r_utc = r.week_start_at.astimezone(dt.timezone.utc)
-                for wr in weeks:
-                    if wr.week_start.isoformat() != wsd_str:
-                        continue
-                    try:
-                        wr_dt = parse_iso_datetime(
-                            wr.week_start_at, "wr.week_start_at",
-                        )
-                    except Exception:
-                        continue
-                    if wr_dt.astimezone(dt.timezone.utc) == r_utc:
-                        ws_at = wr.week_start_at
-                        ws_at_end = wr.week_end_at
-                        break
+                hit = week_iso_by_key.get((wsd_str, r_utc))
+                if hit is not None:
+                    ws_at, ws_at_end = hit
 
             d: dict[str, Any] = {
                 "weekStartDate": wsd_str,
