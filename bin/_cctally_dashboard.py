@@ -2236,12 +2236,15 @@ def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
     ``display_tz`` so users on a non-host display zone see days
     grouped consistently with the rest of the UI.
 
-    Sync-thread totals: the caller also invokes ``build_daily_view``
-    once to capture ``view.total_cost_usd`` / ``view.total_tokens``
-    and stashes them on ``DataSnapshot.daily_total_cost_usd`` /
-    ``daily_total_tokens`` for the envelope adapter. Doing it at the
-    sync-thread site keeps this function's return type stable
-    (preserving the dashboard / TUI / test fixture monkeypatch
+    Sync-thread totals: the caller sums over the materialized rows
+    this function returns and stashes the result on
+    ``DataSnapshot.daily_total_cost_usd`` / ``daily_total_tokens`` for
+    the envelope adapter. Sum-over-visible-rows preserves the
+    structural-equality invariant the dashboard footer reads
+    (`total === rows.reduce(...)`); gap days carry ``cost_usd=0.0`` /
+    ``total_tokens=0`` so the sum stays gap-free semantically. Doing
+    it at the sync-thread site keeps this function's return type
+    stable (preserving the dashboard / TUI / test fixture monkeypatch
     surface that consumes a plain ``list[DailyPanelRow]``).
     """
     # Wide trailing window — n days of slack on either side keeps it
@@ -2855,18 +2858,22 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     weekly_env = {
         "rows": [_weekly_row_to_dict(r) for r in snap.weekly_periods],
         # View-model unification (Bundle 1; spec §6.6): pre-computed
-        # totals. Source is `build_weekly_view`; the dashboard's
-        # `_dashboard_build_weekly_periods` still owns the pre-credit
-        # synthesis (Bug K) and that path is unchanged.
+        # totals. Sourced from sum-over-visible-rows in the sync thread
+        # (``_tui_build_snapshot``) so the footer total is structurally
+        # equal to the React panel's ``rows.reduce(...)``. The earlier
+        # ``build_weekly_view``-sourced totals undercounted Bug-K
+        # pre-credit synthesized rows on credit weeks; the regression is
+        # captured by
+        # ``test_weekly_envelope_total_matches_sum_of_visible_rows``.
         "total_cost_usd": snap.weekly_total_cost_usd,
         "total_tokens":   snap.weekly_total_tokens,
     }
     monthly_env = {
         "rows": [_monthly_row_to_dict(r) for r in snap.monthly_periods],
         # View-model unification (Bundle 1; spec §6.6): pre-computed
-        # gap-free totals. Source is `build_monthly_view` so the React
-        # MonthlyPanel's smoking-gun `rows.reduce(...)` collapses to a
-        # single envelope read.
+        # totals via sum-over-visible-rows so the React MonthlyPanel's
+        # smoking-gun ``rows.reduce(...)`` collapses to a single envelope
+        # read with the structural-equality invariant preserved.
         "total_cost_usd": snap.monthly_total_cost_usd,
         "total_tokens":   snap.monthly_total_tokens,
     }
@@ -2890,11 +2897,12 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         "quantile_thresholds": daily_thresholds,
         "peak":                daily_peak,
         # View-model unification (Bundle 1; spec §6.6): pre-computed
-        # gap-free totals so React's MonthlyPanel-style `rows.reduce(...)`
-        # collapses to a single envelope read. Values are sourced from
-        # `build_daily_view` (gap-free) — the panel's materialized
-        # `daily_rows` would over-count zero-cost gap days had we summed
-        # them here.
+        # totals via sum-over-visible-rows in the sync thread. Gap days
+        # carry ``cost_usd=0.0`` and ``total_tokens=0`` so summing the
+        # materialized panel rows preserves the gap-free semantics. The
+        # React panel's `rows.reduce(...)` collapses to a single
+        # envelope read with the structural-equality invariant
+        # preserved.
         "total_cost_usd":      snap.daily_total_cost_usd,
         "total_tokens":        snap.daily_total_tokens,
     }

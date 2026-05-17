@@ -1691,52 +1691,33 @@ def _tui_build_snapshot(
         except Exception as exc:
             errors.append(f"weekly-history: {exc}")
         # ---- v2.1 additions: dashboard Weekly / Monthly panels ----
-        # Sync-thread view-model totals (spec §6.6) for weekly. The
-        # dashboard builder does its own pre-credit synthesis (Bug K
-        # v1.7.2) and is too specialized to fully absorb into the
-        # view-model kernel; we still capture totals via a parallel
-        # build_weekly_view call so MonthlyPanel-style envelope-read
-        # substitution works on WeeklyPanel.tsx too.
+        # Sync-thread view-model totals (spec §6.6): sum directly over
+        # the panel rows the dashboard ACTUALLY renders. The previous
+        # implementation called ``build_weekly_view`` a second time to
+        # capture totals, but that builder doesn't see the Bug-K
+        # pre-credit synthesized rows that ``_dashboard_build_weekly_periods``
+        # layers on top (``_apply_reset_events_to_subweeks`` shifts the
+        # post-reset SubWeek's ``start_ts`` so the pre-credit interval
+        # has no SubWeek for ``_aggregate_weekly`` to bucket). On credit
+        # weeks the sync-thread total understated the rendered footer by
+        # hundreds of dollars (~$372 in the v1.7.2 round-5 data).
+        # Sum-over-visible-rows is a structural invariant — see
+        # ``test_weekly_envelope_total_matches_sum_of_visible_rows``.
         weekly_total_cost_usd = 0.0
         weekly_total_tokens = 0
         try:
             weekly_periods = _dashboard_build_weekly_periods(
                 conn, now_utc, n=12, skip_sync=skip_sync
             )
-            # Mirror the dashboard builder's window (12 weeks + slack).
-            _w_n = 12
-            _w_range_end = now_utc
-            _w_range_start = now_utc - dt.timedelta(days=7 * (_w_n + 1))
-            c = _cctally()
-            _weeks = c._compute_subscription_weeks(
-                conn, _w_range_start, _w_range_end,
-            )
-            if _weeks:
-                _fetch_start = min(
-                    _w_range_start,
-                    parse_iso_datetime(_weeks[0].start_ts, "week_start_at"),
-                )
-                _w_entries = c.get_entries(
-                    _fetch_start, _w_range_end, skip_sync=True,
-                )
-                _w_as_of = (
-                    _w_range_end.astimezone(dt.timezone.utc)
-                    .replace(microsecond=0)
-                    .isoformat()
-                    .replace("+00:00", "Z")
-                )
-                _w_view = c.build_weekly_view(
-                    conn, _w_entries, weeks=_weeks, now_utc=now_utc,
-                    display_tz=None, as_of_utc=_w_as_of,
-                )
-                weekly_total_cost_usd = _w_view.total_cost_usd
-                weekly_total_tokens = _w_view.total_tokens
+            weekly_total_cost_usd = sum(r.cost_usd for r in weekly_periods)
+            weekly_total_tokens = sum(r.total_tokens for r in weekly_periods)
         except Exception as exc:
             errors.append(f"weekly-periods: {exc}")
-        # Sync-thread view-model totals (spec §6.6): mirror the daily
-        # pattern. Re-call build_monthly_view with the same window
-        # _dashboard_build_monthly_periods uses; cache-backed
-        # get_entries makes the second pass cheap.
+        # Sync-thread view-model totals (spec §6.6): sum-over-visible-rows
+        # (same invariant as weekly above). Monthly has no Bug-K analogue,
+        # but coupling the footer total to the panel-row source of truth
+        # eliminates a parallel ``build_monthly_view`` pass that did the
+        # same arithmetic with no behavioral upside.
         monthly_total_cost_usd = 0.0
         monthly_total_tokens = 0
         try:
@@ -1744,25 +1725,8 @@ def _tui_build_snapshot(
                 conn, now_utc, n=12, skip_sync=skip_sync,
                 display_tz=_build_display_tz,
             )
-            # Mirror _dashboard_build_monthly_periods' window calc
-            # (~12 months back from now_utc).
-            _mn = 12
-            _sy, _sm = now_utc.year, now_utc.month
-            for _ in range(_mn - 1):
-                _sm -= 1
-                if _sm == 0:
-                    _sm = 12
-                    _sy -= 1
-            _m_range_start = dt.datetime(_sy, _sm, 1, tzinfo=dt.timezone.utc)
-            c = _cctally()
-            _monthly_entries = c.get_entries(_m_range_start, now_utc,
-                                              skip_sync=True)
-            _monthly_view = c.build_monthly_view(
-                _monthly_entries, now_utc=now_utc, n=_mn,
-                display_tz=_build_display_tz,
-            )
-            monthly_total_cost_usd = _monthly_view.total_cost_usd
-            monthly_total_tokens = _monthly_view.total_tokens
+            monthly_total_cost_usd = sum(r.cost_usd for r in monthly_periods)
+            monthly_total_tokens = sum(r.total_tokens for r in monthly_periods)
         except Exception as exc:
             errors.append(f"monthly-periods: {exc}")
         # ---- v2.2 additions: dashboard Blocks / Daily panels ----
@@ -1777,13 +1741,12 @@ def _tui_build_snapshot(
                 )
         except Exception as exc:
             errors.append(f"blocks-panel: {exc}")
-        # Sync-thread view-model totals (Bundle 1 / spec §6.6): build
-        # the unified DailyView ALONGSIDE the materialized panel rows.
-        # The aggregator runs twice but the read-side is cache-backed
-        # via `get_entries`, so the second pass is in-memory only. The
-        # builder is gap-free and the panel adapter materializes the
-        # contiguous N-day window — see `_dashboard_build_daily_panel`'s
-        # docstring for the two-layer composition.
+        # Sync-thread view-model totals (Bundle 1 / spec §6.6):
+        # sum-over-visible-rows (same invariant as weekly/monthly above).
+        # Gap days in the materialized panel carry ``cost_usd=0.0`` /
+        # ``total_tokens=0``, so summing the panel rows preserves the
+        # gap-free totals semantically — and removes a duplicate
+        # ``build_daily_view`` pass that did the same arithmetic.
         daily_total_cost_usd = 0.0
         daily_total_tokens = 0
         try:
@@ -1791,18 +1754,8 @@ def _tui_build_snapshot(
                 conn, now_utc, n=30, skip_sync=skip_sync,
                 display_tz=_build_display_tz,
             )
-            # Wide trailing window matches the panel builder's; using
-            # the same shape keeps cache-hit semantics identical.
-            c = _cctally()
-            _daily_entries = c.get_entries(
-                now_utc - dt.timedelta(days=31), now_utc, skip_sync=True,
-            )
-            _daily_view = c.build_daily_view(
-                _daily_entries, now_utc=now_utc,
-                display_tz=_build_display_tz,
-            )
-            daily_total_cost_usd = _daily_view.total_cost_usd
-            daily_total_tokens = _daily_view.total_tokens
+            daily_total_cost_usd = sum(r.cost_usd for r in daily_panel)
+            daily_total_tokens = sum(r.total_tokens for r in daily_panel)
         except Exception as exc:
             errors.append(f"daily-panel: {exc}")
         # ---- threshold-actions T5: alerts envelope array ----
