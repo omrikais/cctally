@@ -30,12 +30,27 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
+# import from _cctally_core. `load_config` stays on the _cctally()
+# accessor per spec §3.5 monkeypatch carve-out. Z-high helpers
+# (`compute_week_cost`, `insert_cost_snapshot`) and out-of-scope
+# (`pick_week_selection`) stay on the accessor per spec §3.7.
+from _cctally_core import (
+    get_week_start_name,
+    open_db,
+    format_local_iso,
+    make_week_ref,
+    get_latest_usage_for_week,
+)
+
+
 def cmd_sync_week(args: argparse.Namespace) -> int:
     c = _cctally()
     config = c.load_config()
-    week_start_name = c.get_week_start_name(config, args.week_start_name)
+    week_start_name = get_week_start_name(config, args.week_start_name)
 
-    conn = c.open_db()
+    conn = open_db()
     try:
         selection = c.pick_week_selection(
             conn,
@@ -54,8 +69,8 @@ def cmd_sync_week(args: argparse.Namespace) -> int:
             start_iso_override=selection.start_iso_override,
             end_iso_override=selection.end_iso_override,
         )
-        week_start_at = selection.start_iso_override or c.format_local_iso(week_start, end_of_day=False)
-        week_end_at = selection.end_iso_override or c.format_local_iso(week_end, end_of_day=True)
+        week_start_at = selection.start_iso_override or format_local_iso(week_start, end_of_day=False)
+        week_end_at = selection.end_iso_override or format_local_iso(week_end, end_of_day=True)
         insert_id = c.insert_cost_snapshot(
             conn,
             week_start=week_start,
@@ -69,13 +84,13 @@ def cmd_sync_week(args: argparse.Namespace) -> int:
             project=args.project,
         )
 
-        week_ref = c.make_week_ref(
+        week_ref = make_week_ref(
             week_start_date=week_start.isoformat(),
             week_end_date=week_end.isoformat(),
             week_start_at=week_start_at,
             week_end_at=week_end_at,
         )
-        usage_row = c.get_latest_usage_for_week(conn, week_ref)
+        usage_row = get_latest_usage_for_week(conn, week_ref)
         weekly_percent = float(usage_row["weekly_percent"]) if usage_row else None
         dollars_per_percent = (
             result.cost_usd / weekly_percent if weekly_percent and weekly_percent > 0 else None

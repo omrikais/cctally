@@ -118,17 +118,18 @@ def _cctally():
     return sys.modules["cctally"]
 
 
-# Module-level back-ref shims for the four bare-name helpers consumed
-# throughout the moved bodies. Each shim resolves
-# ``sys.modules['cctally'].X`` at CALL TIME (not bind time), so
-# monkeypatches on cctally's namespace propagate into the moved code
-# unchanged. Mirrors the precedent established in ``bin/_cctally_db.py``
-# (``now_utc_iso`` / ``parse_iso_datetime`` / ``_compute_block_totals``
-# / ``eprint`` shims).
-def eprint(*args, **kwargs):
-    return sys.modules["cctally"].eprint(*args, **kwargs)
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
+# (Z-leaf + Z-mid) import from _cctally_core. The legacy shim function
+# for ``eprint`` is deleted.
+from _cctally_core import eprint
 
 
+# Module-level back-ref shims for the three out-of-scope JSONL/project
+# discovery helpers that STAY in bin/cctally per spec §3.7. Each shim
+# resolves ``sys.modules['cctally'].X`` at CALL TIME (not bind time),
+# so monkeypatches on cctally's namespace propagate into the moved code
+# unchanged.
 def _decode_escaped_cwd(*args, **kwargs):
     return sys.modules["cctally"]._decode_escaped_cwd(*args, **kwargs)
 

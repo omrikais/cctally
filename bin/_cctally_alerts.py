@@ -76,6 +76,14 @@ _build_alert_payload_weekly = _lib_alerts_payload._build_alert_payload_weekly
 _build_alert_payload_five_hour = _lib_alerts_payload._build_alert_payload_five_hour
 
 
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
+# import from _cctally_core. `LOG_DIR` stays on the _cctally() accessor
+# per Q1=B (path constants propagate via monkeypatch.setitem against the
+# cctally namespace).
+from _cctally_core import now_utc_iso
+
+
 def _alerts_log_path() -> "pathlib.Path":
     """Return ``~/.local/share/cctally/logs/alerts.log`` (parent dirs created).
 
@@ -167,7 +175,7 @@ def _dispatch_alert_notification(
             or ""
         )
         line = (
-            f"{_cctally().now_utc_iso()}\t{axis}\t{payload.get('threshold')}\t{window_key}"
+            f"{now_utc_iso()}\t{axis}\t{payload.get('threshold')}\t{window_key}"
             f"\t{mode}\t{status}\n"
         )
         with open(log_path, "a") as f:
@@ -194,7 +202,6 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
       2  --threshold out of [1, 100] range
       3  other spawn error (PermissionError, OSError, ...)
     """
-    c = _cctally()
     axis = "weekly" if args.axis == "weekly" else "five_hour"
     threshold = int(args.threshold)
     if not (1 <= threshold <= 100):
@@ -206,7 +213,7 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
     if axis == "weekly":
         payload = _build_alert_payload_weekly(
             threshold=threshold,
-            crossed_at_utc=c.now_utc_iso(),
+            crossed_at_utc=now_utc_iso(),
             week_start_date=dt.date.today().isoformat(),
             cumulative_cost_usd=1.23,
             dollars_per_percent=0.01,
@@ -214,9 +221,9 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
     else:
         payload = _build_alert_payload_five_hour(
             threshold=threshold,
-            crossed_at_utc=c.now_utc_iso(),
+            crossed_at_utc=now_utc_iso(),
             five_hour_window_key=int(dt.datetime.now(dt.timezone.utc).timestamp()),
-            block_start_at=c.now_utc_iso(),
+            block_start_at=now_utc_iso(),
             block_cost_usd=1.23,
             primary_model="claude-sonnet-4-6",
         )

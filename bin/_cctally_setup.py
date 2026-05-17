@@ -63,6 +63,18 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
+# import from _cctally_core. Path constants (`APP_DIR`,
+# `CLAUDE_SETTINGS_PATH`, `HOOK_TICK_LOG_PATH`) plus the extensive
+# out-of-scope setup-specific helpers (legacy migration, hook surgery,
+# OAuth token, sync_cache, …) stay on the _cctally() accessor.
+from _cctally_core import (
+    eprint,
+    _command_as_of,
+)
+
+
 # ── settings.json hook surgery ─────────────────────────────────────────
 
 
@@ -430,7 +442,7 @@ def _legacy_resolve_backup_dir() -> pathlib.Path:
     so a re-run never overwrites a prior migration's snapshot.
     """
     c = _cctally()
-    now = c._command_as_of()
+    now = _command_as_of()
     stamp = now.strftime("%Y%m%d-%H%M%S")
     base = pathlib.Path.home() / ".claude" / f"{c._LEGACY_BACKUP_DIR_PREFIX}{stamp}"
     base.mkdir(parents=True, exist_ok=True)
@@ -614,7 +626,6 @@ def _setup_read_legacy_prompt_input(stream, reprompt: str | None = None) -> bool
     us). When None (test default), no reprompt is emitted — useful for unit
     tests that drive `stream` from io.StringIO.
     """
-    eprint = _cctally().eprint
     yes_words = {"y", "yes"}
     no_words = {"n", "no"}
     for attempt in range(3):
@@ -815,7 +826,7 @@ def _setup_status(args: argparse.Namespace) -> int:
     try:
         settings = c._load_claude_settings()
     except c.SetupError as exc:
-        c.eprint(f"setup: warning: {exc}")
+        eprint(f"setup: warning: {exc}")
         settings = {}
     hook_counts = _setup_count_hook_entries(settings)
     oauth = _setup_oauth_token_present()
@@ -911,14 +922,14 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
     try:
         settings = c._load_claude_settings()
     except c.SetupError as exc:
-        c.eprint(f"setup: {exc}")
+        eprint(f"setup: {exc}")
         return 1
     settings, removed = _settings_merge_uninstall(settings)
     if removed:
         try:
             c._write_claude_settings_atomic(settings)
         except OSError as exc:
-            c.eprint(f"setup: failed to write {c.CLAUDE_SETTINGS_PATH}: {exc}")
+            eprint(f"setup: failed to write {c.CLAUDE_SETTINGS_PATH}: {exc}")
             return 2
     out.append(f"Removed {removed} hook entries from {c.CLAUDE_SETTINGS_PATH}")
 
@@ -938,7 +949,7 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
                     dst.unlink()
                     sym_removed += 1
                 except OSError as exc:
-                    c.eprint(f"setup: failed to remove {dst}: {exc}")
+                    eprint(f"setup: failed to remove {dst}: {exc}")
     out.append(f"Removed {sym_removed} symlinks from {dst_dir}/")
 
     legacy = _setup_detect_legacy_snippet()
@@ -1000,7 +1011,7 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
                         "exit_code": 1,
                     }, indent=2))
                 else:
-                    c.eprint(f"setup: failed to wipe {c.APP_DIR}: {exc}")
+                    eprint(f"setup: failed to wipe {c.APP_DIR}: {exc}")
                 return 1
     else:
         out.append(
@@ -1039,7 +1050,7 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
         # against an empty dict simply yields detected=False for entries (files
         # detection is independent of settings). Mirror _setup_status's pattern
         # so the user sees the same condition that would fail _setup_install.
-        c.eprint(f"setup: warning: {exc}")
+        eprint(f"setup: warning: {exc}")
         settings = {}
     detection = _setup_detect_legacy_bespoke_hooks(settings)
     sym_results = []
@@ -1238,7 +1249,7 @@ def _setup_install(args: argparse.Namespace) -> int:
 
     claude_dir = pathlib.Path.home() / ".claude"
     if not claude_dir.exists():
-        c.eprint(
+        eprint(
             f"~/.claude/ does not exist. If Claude Code isn't installed yet, "
             f"install it first. If it is installed, run `claude` once to "
             f"initialize, then re-run cctally setup."
@@ -1259,7 +1270,7 @@ def _setup_install(args: argparse.Namespace) -> int:
     try:
         settings = c._load_claude_settings()
     except c.SetupError as exc:
-        c.eprint(f"setup: {exc}")
+        eprint(f"setup: {exc}")
         return 1
 
     # ── Legacy bespoke hook detection + migration decision (spec §1, §2) ──
@@ -1304,7 +1315,7 @@ def _setup_install(args: argparse.Namespace) -> int:
             # still propagates into this code path post-extraction (§5.6 option C).
             backup_dir = c._legacy_resolve_backup_dir()
         except OSError as exc:
-            c.eprint(f"setup: cannot create migration backup dir: {exc}")
+            eprint(f"setup: cannot create migration backup dir: {exc}")
             return 1
         # Unwire BEFORE the merge so the same atomic write removes legacy
         # entries and adds cctally entries (spec §2 step 6).
@@ -1322,14 +1333,14 @@ def _setup_install(args: argparse.Namespace) -> int:
     try:
         _settings_merge_install(settings, abs_path)
     except c.SetupError as exc:
-        c.eprint(f"setup: {exc}")
+        eprint(f"setup: {exc}")
         return 1
 
     sym_results = _setup_create_symlinks(repo_root, dst_dir)
     failed = [r for r in sym_results if r.status == "failed"]
     if failed:
         for r in failed:
-            c.eprint(f"setup: symlink {r.name} failed: {r.detail}")
+            eprint(f"setup: symlink {r.name} failed: {r.detail}")
         return 1
     new_count = sum(1 for r in sym_results if r.status == "created")
     same_count = sum(1 for r in sym_results if r.status == "already")
@@ -1356,7 +1367,7 @@ def _setup_install(args: argparse.Namespace) -> int:
     try:
         c._write_claude_settings_atomic(settings)
     except OSError as exc:
-        c.eprint(f"setup: failed to write {c.CLAUDE_SETTINGS_PATH}: {exc}")
+        eprint(f"setup: failed to write {c.CLAUDE_SETTINGS_PATH}: {exc}")
         return 2
 
     # ── Post-write migration apply (spec §2 steps 6a, 6b) ──
@@ -1560,7 +1571,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         else None
     )
     if mig_flag and (getattr(args, "status", False) or getattr(args, "uninstall", False)):
-        c.eprint(f"setup: {mig_flag} is install-mode only")
+        eprint(f"setup: {mig_flag} is install-mode only")
         return 2
     if getattr(args, "uninstall", False):
         return _setup_uninstall(args)

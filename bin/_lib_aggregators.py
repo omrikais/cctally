@@ -79,6 +79,13 @@ _lib_subscription_weeks = _load_lib("_lib_subscription_weeks")
 SubWeek = _lib_subscription_weeks.SubWeek
 
 
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
+# import from _cctally_core. `CODEX_SESSIONS_DIR` (path constant) and
+# `_decode_escaped_cwd` (out-of-scope) stay on the _cctally() accessor.
+from _cctally_core import parse_iso_datetime
+
+
 @dataclass
 class BucketUsage:
     """Aggregated usage for one time bucket.
@@ -247,7 +254,6 @@ def _aggregate_weekly(
     # candidate week in O(log W) per entry rather than the linear
     # scan that previously ran ~130k x ~54 = 7M comparisons.
     import bisect
-    parse_iso_datetime = _cctally().parse_iso_datetime
     parsed_bounds: list[tuple[dt.datetime, dt.datetime, str]] = []
     for w in weeks:
         start_dt = parse_iso_datetime(w.start_ts, "week.start_ts")

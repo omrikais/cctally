@@ -116,21 +116,31 @@ _resolve_tz = _lib_display_tz._resolve_tz
 format_display_dt = _lib_display_tz.format_display_dt
 
 
-# Module-level back-ref shims. Each shim resolves
-# ``sys.modules['cctally'].X`` at CALL TIME (not bind time), so
-# monkeypatches on cctally's namespace propagate into the moved code
-# unchanged. Mirrors the precedent established in
-# ``bin/_lib_render.py`` / ``bin/_cctally_record.py``.
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
+# (Z-leaf + Z-mid) import from _cctally_core. The legacy shim functions
+# for these names are deleted.
+from _cctally_core import (
+    open_db,
+    _command_as_of,
+    _canonicalize_optional_iso,
+    parse_iso_datetime,
+)
+
+
+# === Module-level back-ref shims for helpers that STAY in bin/cctally ======
+# Each shim resolves ``sys.modules['cctally'].X`` at CALL TIME (not bind
+# time), so monkeypatches on cctally's namespace propagate into the moved
+# code unchanged. `get_claude_session_entries` STAYS as a shim even though
+# its natural home is _cctally_cache — tests monkeypatch it via ``ns["X"]``
+# (audited 2026-05-17); a direct import would silently bypass the patches.
+# See spec §3.5 (carve-out) and §3.7 (stays-on-shim allowlist).
 def get_claude_session_entries(*args, **kwargs):
     return sys.modules["cctally"].get_claude_session_entries(*args, **kwargs)
 
 
 def _resolve_project_key(*args, **kwargs):
     return sys.modules["cctally"]._resolve_project_key(*args, **kwargs)
-
-
-def open_db(*args, **kwargs):
-    return sys.modules["cctally"].open_db(*args, **kwargs)
 
 
 def _iso_z(*args, **kwargs):
@@ -143,18 +153,6 @@ def _supports_unicode_stdout(*args, **kwargs):
 
 def _style_ansi(*args, **kwargs):
     return sys.modules["cctally"]._style_ansi(*args, **kwargs)
-
-
-def _command_as_of(*args, **kwargs):
-    return sys.modules["cctally"]._command_as_of(*args, **kwargs)
-
-
-def _canonicalize_optional_iso(*args, **kwargs):
-    return sys.modules["cctally"]._canonicalize_optional_iso(*args, **kwargs)
-
-
-def parse_iso_datetime(*args, **kwargs):
-    return sys.modules["cctally"].parse_iso_datetime(*args, **kwargs)
 
 
 # Private eprint shim per spec §5.3 (pure layer does not back-import

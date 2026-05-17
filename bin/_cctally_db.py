@@ -71,33 +71,30 @@ def _cctally():
     return sys.modules["cctally"]
 
 
-# Module-level back-ref shims for the four callables most heavily used
-# across migration handlers + cmd_db_* renderers. Each shim resolves
-# `sys.modules['cctally'].X` at CALL TIME (not bind time), so
-# monkeypatches on cctally's namespace propagate into the moved code
-# unchanged. This lets the moved function bodies stay byte-identical
-# at every bare-name call site (`now_utc_iso(...)`,
-# `parse_iso_datetime(...)`, etc.) without requiring per-function
-# `c = _cctally()` boilerplate or `c.X` rewrites at every call site.
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
+# import from _cctally_core. The legacy shim functions for these names
+# are deleted.
+from _cctally_core import (
+    eprint,
+    now_utc_iso,
+    parse_iso_datetime,
+)
+
+
+# Module-level back-ref shim for the one Z-high callable that STAYS in
+# bin/cctally. Resolves `sys.modules['cctally'].X` at CALL TIME (not
+# bind time), so monkeypatches on cctally's namespace propagate into the
+# moved code unchanged. `_compute_block_totals` is Z-high (reaches into
+# _cctally_cache via get_claude_session_entries) and is explicitly listed
+# in spec §3.7's stays-on-shim allowlist.
 #
 # Path constants and rarer helpers (`MIGRATION_ERROR_LOG_PATH`,
 # `LOG_DIR`, `DB_PATH`, `CACHE_DB_PATH`, `format_local_iso`) are
 # accessed via the standard `c = _cctally()` + `c.X` pattern instead
 # (call-time lookup so fixture-HOME redirects propagate).
-def now_utc_iso(*args, **kwargs):
-    return sys.modules["cctally"].now_utc_iso(*args, **kwargs)
-
-
-def parse_iso_datetime(*args, **kwargs):
-    return sys.modules["cctally"].parse_iso_datetime(*args, **kwargs)
-
-
 def _compute_block_totals(*args, **kwargs):
     return sys.modules["cctally"]._compute_block_totals(*args, **kwargs)
-
-
-def eprint(*args, **kwargs):
-    return sys.modules["cctally"].eprint(*args, **kwargs)
 
 
 # === BEGIN MOVED REGIONS ===

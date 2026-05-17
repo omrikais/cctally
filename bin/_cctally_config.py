@@ -48,6 +48,25 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
+# import from _cctally_core; the Bucket-X helper `normalize_display_tz_value`
+# imports from `_lib_display_tz`. Path constants (`CONFIG_PATH`,
+# `CONFIG_LOCK_PATH`) plus out-of-scope validators
+# (`_normalize_alerts_enabled_value`, `_validate_dashboard_bind_value`,
+# `_validate_update_check_ttl_hours_value`, `_normalize_update_check_enabled_value`,
+# `get_display_tz_pref`, `UPDATE_DEFAULT_TTL_HOURS`) stay on the
+# _cctally() accessor.
+from _cctally_core import (
+    eprint,
+    ensure_dirs,
+    DEFAULT_WEEK_START,
+    _get_alerts_config,
+    _AlertsConfigError,
+)
+from _lib_display_tz import normalize_display_tz_value
+
+
 _CONFIG_CORRUPT_WARNED = False  # one-shot warn flag for load_config
 
 
@@ -61,20 +80,19 @@ def _warn_config_corrupt_once(reason: str) -> None:
         return
     _CONFIG_CORRUPT_WARNED = True
     c = _cctally()
-    c.eprint(
+    eprint(
         f"warning: ignoring corrupt {c.CONFIG_PATH} ({reason}); "
         "using in-memory defaults"
     )
 
 
 def _default_config_data() -> dict[str, Any]:
-    c = _cctally()
     return {
         "collector": {
             "host": "127.0.0.1",
             "port": 17321,
             "token": secrets.token_hex(16),
-            "week_start": c.DEFAULT_WEEK_START,
+            "week_start": DEFAULT_WEEK_START,
         }
     }
 
@@ -122,7 +140,7 @@ def config_writer_lock():
     either the pre-rename or post-rename file, never partial bytes.
     """
     c = _cctally()
-    c.ensure_dirs()
+    ensure_dirs()
     c.CONFIG_LOCK_PATH.touch()
     fh = open(c.CONFIG_LOCK_PATH, "w")
     try:
@@ -154,7 +172,7 @@ def load_config() -> dict[str, Any]:
     #17 fix).
     """
     c = _cctally()
-    c.ensure_dirs()
+    ensure_dirs()
     parsed = _try_read_config()
     if parsed is not None:
         return parsed
@@ -186,8 +204,7 @@ def _load_config_unlocked() -> dict[str, Any]:
     do its own save_config call atomically. Corrupt-file path returns
     in-memory defaults (caller's save will overwrite cleanly).
     """
-    c = _cctally()
-    c.ensure_dirs()
+    ensure_dirs()
     parsed = _try_read_config()
     if parsed is not None:
         return parsed
@@ -208,7 +225,7 @@ def save_config(data: dict[str, Any]) -> None:
     not the read-modify-write semantics of `cctally config set`.
     """
     c = _cctally()
-    c.ensure_dirs()
+    ensure_dirs()
     payload = (json.dumps(data, indent=2) + "\n").encode("utf-8")
     tmp = c.CONFIG_PATH.with_name(f"{c.CONFIG_PATH.name}.tmp.{os.getpid()}")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -248,7 +265,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         return _cmd_config_set(args)
     if action == "unset":
         return _cmd_config_unset(args)
-    c.eprint(f"cctally config: unknown action {action!r}")
+    eprint(f"cctally config: unknown action {action!r}")
     return 2
 
 
@@ -265,7 +282,7 @@ def _config_known_value(config: dict, key: str) -> "object":
     if key == "display.tz":
         return c.get_display_tz_pref(config)
     if key == "alerts.enabled":
-        return bool(c._get_alerts_config(config)["enabled"])
+        return bool(_get_alerts_config(config)["enabled"])
     if key == "dashboard.bind":
         # Default semantic alias is 'loopback' (resolves to 127.0.0.1 at
         # bind time). LAN exposure is opt-in via `set dashboard.bind lan`
@@ -306,10 +323,9 @@ def _config_known_value(config: dict, key: str) -> "object":
 
 
 def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
-    c = _cctally()
     key = args.key
     if key is not None and key not in ALLOWED_CONFIG_KEYS:
-        c.eprint(f"cctally config: unknown config key {key!r}")
+        eprint(f"cctally config: unknown config key {key!r}")
         return 2
     pairs: "list[tuple[str, object]]" = []
     if key is None:
@@ -350,13 +366,13 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
     c = _cctally()
     key, raw = args.key, args.value
     if key not in ALLOWED_CONFIG_KEYS:
-        c.eprint(f"cctally config: unknown config key {key!r}")
+        eprint(f"cctally config: unknown config key {key!r}")
         return 2
     if key == "display.tz":
         try:
-            canonical = c.normalize_display_tz_value(raw)
+            canonical = normalize_display_tz_value(raw)
         except ValueError:
-            c.eprint(f"cctally config: invalid IANA zone {raw!r}")
+            eprint(f"cctally config: invalid IANA zone {raw!r}")
             return 2
         with config_writer_lock():
             config = _load_config_unlocked()
@@ -399,8 +415,8 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
             # Validate the would-be merged block before persisting so
             # we never write a config that fails subsequent reads.
             try:
-                c._get_alerts_config({**config, "alerts": alerts_block})
-            except c._AlertsConfigError as exc:
+                _get_alerts_config({**config, "alerts": alerts_block})
+            except _AlertsConfigError as exc:
                 print(f"cctally: alerts config error: {exc}", file=sys.stderr)
                 return 2
             config["alerts"] = alerts_block
@@ -489,10 +505,9 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
 
 
 def _cmd_config_unset(args: argparse.Namespace) -> int:
-    c = _cctally()
     key = args.key
     if key not in ALLOWED_CONFIG_KEYS:
-        c.eprint(f"cctally config: unknown config key {key!r}")
+        eprint(f"cctally config: unknown config key {key!r}")
         return 2
     if key == "display.tz":
         with config_writer_lock():

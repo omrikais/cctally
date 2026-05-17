@@ -73,6 +73,18 @@ _resolve_tz = _lib_display_tz._resolve_tz
 _local_tz_name = _lib_display_tz._local_tz_name
 
 
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
+# import from _cctally_core. `load_config` stays on the _cctally()
+# accessor per spec §3.5 monkeypatch carve-out (tests reach it via
+# ``ns["load_config"]``).
+from _cctally_core import (
+    parse_iso_datetime,
+    get_week_start_name,
+    WEEKDAY_MAP,
+)
+
+
 @dataclass(frozen=True)
 class SubWeek:
     """One subscription-week bounded interval.
@@ -142,7 +154,6 @@ def _clamp_end_ats_to_next_start(
     `pairs` must be sorted by start_at ascending. None values are
     passed through unchanged and never participate in clamping.
     """
-    parse_iso_datetime = _cctally().parse_iso_datetime
     n = len(pairs)
     if n < 2:
         return [p[1] for p in pairs]
@@ -182,7 +193,6 @@ def _apply_overlap_clamp_to_subweeks(weeks: list[SubWeek]) -> list[SubWeek]:
     Input must be sorted by start_ts ascending (invariant of
     _compute_subscription_weeks in all three branches).
     """
-    parse_iso_datetime = _cctally().parse_iso_datetime
     if len(weeks) < 2:
         return weeks
     pairs: list[tuple[str | None, str | None]] = [(w.start_ts, w.end_ts) for w in weeks]
@@ -217,7 +227,6 @@ def _apply_reset_events_to_subweeks(
     raw snapshot strings that may be written in non-UTC offsets while
     `week_reset_events.{old,new}_week_end_at` are canonicalized UTC.
     """
-    parse_iso_datetime = _cctally().parse_iso_datetime
     rows = conn.execute(
         "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
         "FROM week_reset_events"
@@ -289,9 +298,6 @@ def _compute_subscription_weeks(
     dates that miss actual snapshot boundaries for middle weeks. Using
     snapshot rows directly for weeks they cover avoids that drift.
     """
-    cctally = _cctally()
-    parse_iso_datetime = cctally.parse_iso_datetime
-
     # Case A: snapshots exist.
     snap_rows = conn.execute(
         "SELECT "
@@ -460,9 +466,11 @@ def _compute_subscription_weeks(
         return _apply_overlap_clamp_to_subweeks(weeks)
 
     # Case B: no snapshots — config-based calendar-week fallback.
-    config = cctally.load_config()
-    week_start_name = cctally.get_week_start_name(config)
-    week_start_idx = cctally.WEEKDAY_MAP[week_start_name]
+    # `load_config` stays on the _cctally() accessor per spec §3.5
+    # monkeypatch carve-out — tests reach it via ``ns["load_config"]``.
+    config = _cctally().load_config()
+    week_start_name = get_week_start_name(config)
+    week_start_idx = WEEKDAY_MAP[week_start_name]
     # internal fallback: host-local intentional
     local_start_date = range_start.astimezone().date()
     diff = (local_start_date.weekday() - week_start_idx) % 7

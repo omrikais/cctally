@@ -55,6 +55,23 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+# === Honest imports from extracted homes ===================================
+# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
+# import from _cctally_core. `load_config` plus out-of-scope helpers
+# (`_resolve_oauth_token`, `_fetch_oauth_usage`, `_bust_statusline_cache`,
+# `_refresh_usage_inproc`, `_get_oauth_usage_config`,
+# `_seconds_since_iso`, `_select_last_known_snapshot`,
+# `_newest_snapshot_age_seconds`, `_normalize_percent`,
+# `_forecast_color_enabled`, `_discover_cc_version`, `cmd_record_usage`)
+# stay on the _cctally() accessor.
+from _cctally_core import (
+    eprint,
+    now_utc_iso,
+    _iso_to_epoch,
+    _format_short_duration,
+)
+
+
 # =========================================================================
 # Exception classes
 # =========================================================================
@@ -296,7 +313,7 @@ def _render_refresh_usage_text(payload: dict, color: bool, now_epoch: int) -> st
     seven_pct = seven["used_percent"]
     seven_resets = seven.get("resets_at_epoch")
     if seven_resets is not None:
-        seven_ttl = c._format_short_duration(seven_resets - now_epoch)
+        seven_ttl = _format_short_duration(seven_resets - now_epoch)
         seven_seg = (
             f"{a['yellow']}7d {seven_pct:.0f}%{a['reset']}"
             f" {a['orange']}(in {seven_ttl}){a['reset']}"
@@ -309,7 +326,7 @@ def _render_refresh_usage_text(payload: dict, color: bool, now_epoch: int) -> st
         five_pct = five["used_percent"]
         five_resets = five.get("resets_at_epoch")
         if five_resets is not None:
-            five_ttl = c._format_short_duration(five_resets - now_epoch)
+            five_ttl = _format_short_duration(five_resets - now_epoch)
             five_seg = (
                 f" | {a['yellow']}5h {five_pct:.0f}%{a['reset']}"
                 f" {a['orange']}(in {five_ttl}){a['reset']}"
@@ -427,7 +444,7 @@ def _bust_statusline_cache(path: str = _STATUSLINE_OAUTH_CACHE) -> str:
     except FileNotFoundError:
         return "absent"
     except OSError as exc:
-        c.eprint(f"refresh-usage: cache-bust failed: {exc}")
+        eprint(f"refresh-usage: cache-bust failed: {exc}")
         return "error"
 
 
@@ -450,7 +467,7 @@ def _cmd_refresh_usage_handle_rate_limit(args: argparse.Namespace, exc) -> int:
     quiet = bool(getattr(args, "quiet", False))
 
     if snap is None:
-        c.eprint("refresh-usage: rate-limited; no last-known data; "
+        eprint("refresh-usage: rate-limited; no last-known data; "
                  "status-line will populate on next CC tick")
         if json_mode:
             print(json.dumps({
@@ -467,7 +484,7 @@ def _cmd_refresh_usage_handle_rate_limit(args: argparse.Namespace, exc) -> int:
         _freshness_label(age_s, cfg) if age_s is not None else "stale"
     )
 
-    c.eprint(f"refresh-usage: rate-limited; using last-known "
+    eprint(f"refresh-usage: rate-limited; using last-known "
              f"(captured {int(age_s) if age_s is not None else '?'}s ago)")
 
     if json_mode:
@@ -550,7 +567,7 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
         # built then a downstream cmd_record_usage call fails).
         seven_pct = c._normalize_percent(float(seven["utilization"]))
         seven_resets_iso = seven["resets_at"]
-        seven_resets_epoch = c._iso_to_epoch(seven_resets_iso)
+        seven_resets_epoch = _iso_to_epoch(seven_resets_iso)
     except (TypeError, ValueError, KeyError) as exc:
         return _RefreshUsageResult(
             status="parse_failed",
@@ -566,7 +583,7 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
         try:
             five_pct = c._normalize_percent(float(five["utilization"]))
             five_resets_iso = five["resets_at"]
-            five_resets_epoch = c._iso_to_epoch(five_resets_iso)
+            five_resets_epoch = _iso_to_epoch(five_resets_iso)
         except (TypeError, ValueError) as exc:
             # 5h is optional - silently degrade rather than fail the command
             # (parity with the previous cmd_refresh_usage behavior; the eprint
@@ -599,7 +616,7 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
     # (tests/test_refresh_usage_cmd.py:55, test_refresh_usage_inproc.py:18).
     cache_state = c._bust_statusline_cache()
 
-    fetched_at = c.now_utc_iso()
+    fetched_at = now_utc_iso()
     fresh_envelope = {
         "label": "fresh",
         "captured_at": fetched_at,
@@ -652,7 +669,7 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
         # Emit BEFORE rendering so stderr flushes consistently for harnesses
         # that grep across both streams.
         for warning in result.warnings:
-            c.eprint(f"refresh-usage: {warning}")
+            eprint(f"refresh-usage: {warning}")
         payload = result.payload or {}
         if getattr(args, "json", False):
             print(_serialize_refresh_usage_json(payload))
@@ -668,7 +685,7 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
             args, RefreshUsageRateLimitError(result.reason or "rate limited"))
 
     if result.status == "no_oauth_token":
-        c.eprint("refresh-usage: no OAuth token found "
+        eprint("refresh-usage: no OAuth token found "
                  "(run 'claude' once to authenticate)")
         return 2
 
@@ -678,9 +695,9 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
         # config-error reason string verbatim so we can detect it here.
         reason = result.reason or ""
         if reason.startswith("invalid oauth_usage config:"):
-            c.eprint(f"cctally: {reason}")
+            eprint(f"cctally: {reason}")
             return 2
-        c.eprint(f"refresh-usage: OAuth fetch failed: {reason}")
+        eprint(f"refresh-usage: OAuth fetch failed: {reason}")
         return 3
 
     if result.status == "parse_failed":
@@ -688,7 +705,7 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
         # only seven_day failures (RefreshUsageMalformedError or unparseable
         # field extraction) propagate here. Preserve the original exact
         # error-line shape for bash harnesses that grep stderr.
-        c.eprint(f"refresh-usage: {result.reason or ''}")
+        eprint(f"refresh-usage: {result.reason or ''}")
         return 4
 
     if result.status == "record_failed":
@@ -698,13 +715,13 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
                 rc = int(reason.split()[1])
             except (IndexError, ValueError):
                 rc = -1
-            c.eprint(f"refresh-usage: failed to record usage (exit {rc})")
+            eprint(f"refresh-usage: failed to record usage (exit {rc})")
         else:
-            c.eprint(f"refresh-usage: failed to record usage: {reason}")
+            eprint(f"refresh-usage: failed to record usage: {reason}")
         return 5
 
     # Defensive: unknown status from _refresh_usage_inproc -> treat as parse error.
-    c.eprint(f"refresh-usage: unexpected status {result.status!r}")
+    eprint(f"refresh-usage: unexpected status {result.status!r}")
     return 4
 
 
@@ -757,7 +774,7 @@ def _hook_tick_oauth_refresh(
     seven = api["seven_day"]
     try:
         seven_pct = c._normalize_percent(float(seven["utilization"]))
-        seven_resets_epoch = c._iso_to_epoch(seven["resets_at"])
+        seven_resets_epoch = _iso_to_epoch(seven["resets_at"])
     except (TypeError, ValueError, KeyError):
         return "err(parse)", None
     five = api.get("five_hour") if isinstance(api.get("five_hour"), dict) else None
@@ -766,7 +783,7 @@ def _hook_tick_oauth_refresh(
     if five is not None and "utilization" in five and "resets_at" in five:
         try:
             five_pct = c._normalize_percent(float(five["utilization"]))
-            five_resets_epoch = c._iso_to_epoch(five["resets_at"])
+            five_resets_epoch = _iso_to_epoch(five["resets_at"])
         except (TypeError, ValueError):
             five_pct = None
             five_resets_epoch = None
