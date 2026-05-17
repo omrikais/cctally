@@ -1,7 +1,7 @@
 {
   "name": "cctally",
   "version": "1.7.4",
-  "description": "Track Claude Code subscription usage as a weekly $-per-1% trend. Local web dashboard, terminal UI, forecasts, and threshold alerts.",
+  "description": "Claude Code usage tracker and local dashboard for Pro/Max subscription limits - weekly cost-per-percent trend, quota forecasts, threshold alerts. ccusage-compatible.",
   "homepage": "https://github.com/omrikais/cctally",
   "repository": {
     "type": "git",
@@ -74,18 +74,18 @@
   "keywords": [
     "claude",
     "claude-code",
+    "claude-code-dashboard",
+    "claude-code-quota",
+    "claude-code-cost",
     "ccusage",
+    "ccusage-alternative",
     "anthropic",
-    "usage",
     "usage-tracker",
-    "cost",
     "cost-tracking",
-    "tracker",
+    "quota-tracking",
     "tui",
     "dashboard",
     "cli",
-    "codex",
-    "llm",
-    "ai-tools"
+    "codex"
   ]
 }

@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- Refine npm package description and README header for discoverability: front-load high-intent search terms ("Claude Code usage tracker", "dashboard", "Pro/Max subscription limits", "quota forecasts", "ccusage-compatible") while preserving the distinctive "cost-per-percent trend" hook. Swap five `package.json` keywords — drop generic noise (`usage`, `cost`, `tracker`, `llm`, `ai-tools`) and add high-intent terms (`claude-code-dashboard`, `claude-code-quota`, `claude-code-cost`, `ccusage-alternative`, `quota-tracking`). GitHub repo About and topics updated to match in lockstep. Description re-indexes on npm at next publish.
+
 ## [1.7.4] - 2026-05-17
 
 ### Changed

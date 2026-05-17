@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <strong>Track Claude Code subscription usage as a weekly $-per-1% trend. Local web dashboard, terminal UI, forecasts, and threshold alerts.</strong>
+  <strong>Claude Code usage tracker and local dashboard for Pro/Max subscription limits - weekly cost-per-percent trend, quota forecasts, threshold alerts. ccusage-compatible.</strong>
 </p>
 
 <p align="center">
