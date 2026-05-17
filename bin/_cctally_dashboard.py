@@ -2250,27 +2250,48 @@ def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
                                   display_tz: "ZoneInfo | None" = None) -> "list[DailyPanelRow]":
     """Latest n display-tz dates as DailyPanelRow, newest-first.
 
-    Mirrors `_dashboard_build_monthly_periods`: walks a wide trailing
-    window, runs `_aggregate_daily`, reverses to newest-first, caps to
-    `n`, then computes intensity buckets in-place. Bucketing and the
-    `is_today` reference both follow `display_tz` so users on a
-    non-host display zone see days grouped consistently with the rest
-    of the UI.
+    Two-layer composition (spec §4.4, §6.1):
+
+    1. ``build_daily_view`` (in ``bin/_lib_view_models.py``) is the
+       data plane — gap-free rows + totals derived from the
+       aggregator output.
+    2. This function is the presentation adapter — materializes the
+       contiguous N-day calendar window (gap days as zero-cost rows
+       so the heatmap shows them as faded cells), fills the
+       presentation-only ``label`` (``MM-DD``) and
+       ``intensity_bucket`` (quintile via
+       ``_compute_intensity_buckets``) fields.
+
+    Bucketing and the ``is_today`` reference both follow
+    ``display_tz`` so users on a non-host display zone see days
+    grouped consistently with the rest of the UI.
+
+    Sync-thread totals: the caller also invokes ``build_daily_view``
+    once to capture ``view.total_cost_usd`` / ``view.total_tokens``
+    and stashes them on ``DataSnapshot.daily_total_cost_usd`` /
+    ``daily_total_tokens`` for the envelope adapter. Doing it at the
+    sync-thread site keeps this function's return type stable
+    (preserving the dashboard / TUI / test fixture monkeypatch
+    surface that consumes a plain ``list[DailyPanelRow]``).
     """
     # Wide trailing window — n days of slack on either side keeps it
     # forgiving of tz boundary issues.
     range_start = now_utc - dt.timedelta(days=n + 1)
     range_end = now_utc
     entries = get_entries(range_start, range_end, skip_sync=skip_sync)
-    buckets = _aggregate_daily(entries, mode="auto", tz=display_tz)
-    if not buckets:
+
+    c = _cctally()
+    view = c.build_daily_view(entries, now_utc=now_utc,
+                              display_tz=display_tz)
+    if not view.rows:
         return []
 
-    # Materialize the full n-day calendar window so gap days render as
-    # zero-cost h0 cells (and today always appears, even on idle days).
-    # _aggregate_daily only emits buckets for dates with entries, so we
-    # overlay them onto a contiguous newest-first range.
-    buckets_by_date = {b.bucket: b for b in buckets}
+    # Materialize the contiguous N-day window. ``view.rows`` is gap-free
+    # (newest-first) and carries the data-plane fields; the adapter
+    # overlays it onto the calendar window and fills the presentation-
+    # only ``label`` / ``intensity_bucket`` (which the builder left at
+    # dataclass defaults per spec §4.4).
+    rows_by_date = {r.date: r for r in view.rows}
     today_local = (
         now_utc.astimezone(display_tz) if display_tz is not None
         # internal fallback: host-local intentional
@@ -2281,28 +2302,12 @@ def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
     for i in range(n):
         d = today_local - dt.timedelta(days=i)
         date_str = d.isoformat()
-        b = buckets_by_date.get(date_str)
-        if b is not None:
-            # cache_read / (input + cache_creation + cache_read) — same ratio
-            # used by Block / Session / TuiSession dashboard surfaces. Do NOT
-            # switch to the diff-metrics formula (cache_read / (cache_read +
-            # input)) without aligning all dashboard surfaces.
-            denom = b.input_tokens + b.cache_creation_tokens + b.cache_read_tokens
-            cache_hit = (b.cache_read_tokens / denom * 100.0) if denom > 0 else None
-            rows.append(DailyPanelRow(
-                date=date_str,
-                label=date_str[5:],  # YYYY-MM-DD → MM-DD
-                cost_usd=b.cost_usd,
-                is_today=(d == today_local),
-                intensity_bucket=0,  # set by _compute_intensity_buckets below
-                models=_model_breakdowns_to_models(b.model_breakdowns, b.cost_usd),
-                input_tokens=b.input_tokens,
-                output_tokens=b.output_tokens,
-                cache_creation_tokens=b.cache_creation_tokens,
-                cache_read_tokens=b.cache_read_tokens,
-                total_tokens=b.total_tokens,
-                cache_hit_pct=cache_hit,
-            ))
+        existing = rows_by_date.get(date_str)
+        if existing is not None:
+            # Use the view-model row but fill the presentation-only
+            # ``label`` (intensity_bucket is set by
+            # ``_compute_intensity_buckets`` below).
+            rows.append(dataclasses.replace(existing, label=date_str[5:]))
         else:
             # Zero-cost gap day: tokens default to 0, cache_hit_pct to None
             # (avoids /0 and signals 'no data' cleanly to the modal tile).
@@ -2898,6 +2903,14 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         "rows":                [_daily_row_to_dict(r) for r in daily_rows],
         "quantile_thresholds": daily_thresholds,
         "peak":                daily_peak,
+        # View-model unification (Bundle 1; spec §6.6): pre-computed
+        # gap-free totals so React's MonthlyPanel-style `rows.reduce(...)`
+        # collapses to a single envelope read. Values are sourced from
+        # `build_daily_view` (gap-free) — the panel's materialized
+        # `daily_rows` would over-count zero-cost gap days had we summed
+        # them here.
+        "total_cost_usd":      snap.daily_total_cost_usd,
+        "total_tokens":        snap.daily_total_tokens,
     }
 
     # ---- threshold-actions T5: alerts envelope + settings mirror ----

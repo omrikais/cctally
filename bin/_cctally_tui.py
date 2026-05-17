@@ -1024,6 +1024,21 @@ class DataSnapshot:
     # at sync-thread time so ``snapshot_to_envelope`` stays a pure
     # renderer; empty list when no current 5h block is bound.
     five_hour_milestones: list[dict] = field(default_factory=list)
+    # ---- view-model unification (Bundle 1): pre-computed totals ----
+    # Populated by the sync thread from `build_daily_view` /
+    # `build_monthly_view` / `build_weekly_view` /
+    # `build_trend_view` so the dashboard envelope adapter can emit
+    # `<domain>.total_cost_usd` / `total_tokens` scalars without
+    # re-summing (and React panels can stop running `rows.reduce(...)`
+    # in JS). Defaults preserve compatibility with pre-Bundle-1 fixture
+    # modules that construct `DataSnapshot` positionally. Spec §6.6.
+    daily_total_cost_usd: float = 0.0
+    daily_total_tokens: int = 0
+    monthly_total_cost_usd: float = 0.0
+    monthly_total_tokens: int = 0
+    weekly_total_cost_usd: float = 0.0
+    weekly_total_tokens: int = 0
+    trend_avg_dollars_per_pct: float | None = None
 
     @classmethod
     def synthesize_for_marketing(cls, *, as_of_iso: str) -> "DataSnapshot":
@@ -1834,11 +1849,32 @@ def _tui_build_snapshot(
                 )
         except Exception as exc:
             errors.append(f"blocks-panel: {exc}")
+        # Sync-thread view-model totals (Bundle 1 / spec §6.6): build
+        # the unified DailyView ALONGSIDE the materialized panel rows.
+        # The aggregator runs twice but the read-side is cache-backed
+        # via `get_entries`, so the second pass is in-memory only. The
+        # builder is gap-free and the panel adapter materializes the
+        # contiguous N-day window — see `_dashboard_build_daily_panel`'s
+        # docstring for the two-layer composition.
+        daily_total_cost_usd = 0.0
+        daily_total_tokens = 0
         try:
             daily_panel = _dashboard_build_daily_panel(
                 conn, now_utc, n=30, skip_sync=skip_sync,
                 display_tz=_build_display_tz,
             )
+            # Wide trailing window matches the panel builder's; using
+            # the same shape keeps cache-hit semantics identical.
+            c = _cctally()
+            _daily_entries = c.get_entries(
+                now_utc - dt.timedelta(days=31), now_utc, skip_sync=True,
+            )
+            _daily_view = c.build_daily_view(
+                _daily_entries, now_utc=now_utc,
+                display_tz=_build_display_tz,
+            )
+            daily_total_cost_usd = _daily_view.total_cost_usd
+            daily_total_tokens = _daily_view.total_tokens
         except Exception as exc:
             errors.append(f"daily-panel: {exc}")
         # ---- threshold-actions T5: alerts envelope array ----
@@ -1879,6 +1915,8 @@ def _tui_build_snapshot(
             daily_panel=daily_panel,
             alerts=alerts,
             five_hour_milestones=fh_milestones,
+            daily_total_cost_usd=daily_total_cost_usd,
+            daily_total_tokens=daily_total_tokens,
         )
     finally:
         conn.close()

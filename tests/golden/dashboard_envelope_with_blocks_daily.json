@@ -82,7 +82,9 @@
         "output_tokens": 0,
         "total_tokens": 0
       }
-    ]
+    ],
+    "total_cost_usd": 0.0,
+    "total_tokens": 0
   },
   "display": {
     "offset_label": "UTC",

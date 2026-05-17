@@ -385,4 +385,9 @@ export interface DailyEnvelope {
   quantile_thresholds: number[];      // length 5 when any non-zero day; [] otherwise.
                                       // Duplicates intentional — do NOT dedup.
   peak:                { date: string; cost_usd: number } | null;
+  // ---- view-model unification additive scalars (Bundle 1) ----
+  // Pre-computed gap-free total over `build_daily_view`'s rows; lets
+  // DailyPanel.tsx swap its `rows.reduce(...)` for a single read.
+  total_cost_usd?:     number;
+  total_tokens?:       number;
 }

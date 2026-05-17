@@ -1168,7 +1168,9 @@
         "output_tokens": 644000,
         "total_tokens": 3864000
       }
-    ]
+    ],
+    "total_cost_usd": 122.91,
+    "total_tokens": 23206000
   },
   "display": {
     "offset_label": "UTC",
