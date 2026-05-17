@@ -15,6 +15,9 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Absolute path: the python3 -c subshells below pass $BIN to
+# SourceFileLoader, which resolves relative paths against the subshell's
+# CWD (not this script's invocation directory) and silently fails.
 BIN="$REPO_ROOT/bin/cctally"
 
 default_jobs() {
@@ -264,9 +267,9 @@ assert_eq "corrupt-config not silently re-saved" "$before" "$after"
 rm -rf "$home"
 
 # 13. _get_alerts_config returns canonical defaults on empty config
-out=$(python3 - <<'PY' 2>&1
-import sys, importlib.util, importlib.machinery
-loader = importlib.machinery.SourceFileLoader('cctally', 'bin/cctally')
+out=$(BIN="$BIN" python3 - <<'PY' 2>&1
+import os, sys, importlib.util, importlib.machinery
+loader = importlib.machinery.SourceFileLoader('cctally', os.environ['BIN'])
 spec = importlib.util.spec_from_loader('cctally', loader)
 m = importlib.util.module_from_spec(spec)
 sys.modules['cctally'] = m
@@ -284,9 +287,9 @@ assert_eq "alerts defaults exit" "0" "$ec"
 assert_contains "alerts defaults output" "OK defaults" "$out"
 
 # 14. _get_alerts_config rejects non-strictly-increasing weekly_thresholds
-out=$(python3 - <<'PY' 2>&1
-import sys, importlib.util, importlib.machinery
-loader = importlib.machinery.SourceFileLoader('cctally', 'bin/cctally')
+out=$(BIN="$BIN" python3 - <<'PY' 2>&1
+import os, sys, importlib.util, importlib.machinery
+loader = importlib.machinery.SourceFileLoader('cctally', os.environ['BIN'])
 spec = importlib.util.spec_from_loader('cctally', loader)
 m = importlib.util.module_from_spec(spec)
 sys.modules['cctally'] = m
@@ -308,9 +311,9 @@ assert_eq "alerts non-increasing exit" "0" "$ec"
 assert_contains "alerts non-increasing output" "OK reject non-increasing" "$out"
 
 # 15. _normalize_alerts_enabled_value accepts canonical forms
-out=$(python3 - <<'PY' 2>&1
-import sys, importlib.util, importlib.machinery
-loader = importlib.machinery.SourceFileLoader('cctally', 'bin/cctally')
+out=$(BIN="$BIN" python3 - <<'PY' 2>&1
+import os, sys, importlib.util, importlib.machinery
+loader = importlib.machinery.SourceFileLoader('cctally', os.environ['BIN'])
 spec = importlib.util.spec_from_loader('cctally', loader)
 m = importlib.util.module_from_spec(spec)
 sys.modules['cctally'] = m
