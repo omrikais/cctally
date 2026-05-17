@@ -1636,23 +1636,42 @@ def test_weekly_builder_renders_none_used_pct_as_em_dash():
     `BucketUsage.cost_usd` is genuinely 0 when there are no entries (not
     missing), so cost cells stay MoneyCell. Only the overlay-provided
     `used_pct` carries the missing-vs-zero distinction.
+
+    View-model unification (Bundle 1): `_build_weekly_snapshot` now
+    consumes a `WeeklyView` instead of `(buckets, overlay)`. The
+    builder's `view.aggregated` is newest-first; we provide it
+    accordingly so the builder's `reversed` step yields the asc
+    order the test fixtures expect.
     """
     BucketUsage = _cctally.BucketUsage
-    buckets = [
-        BucketUsage(
-            bucket="2026-04-13", input_tokens=0, output_tokens=0,
-            cache_creation_tokens=0, cache_read_tokens=0, total_tokens=0,
-            cost_usd=10.0, models=["m"], model_breakdowns=[],
-        ),
+    WeeklyView = _cctally.WeeklyView
+    # The builder iterates view.aggregated reversed (newest-first ->
+    # asc); we pass newest-first.
+    aggregated_newest_first = (
         BucketUsage(
             bucket="2026-04-20", input_tokens=0, output_tokens=0,
             cache_creation_tokens=0, cache_read_tokens=0, total_tokens=0,
             cost_usd=12.0, models=["m"], model_breakdowns=[],
         ),
-    ]
-    overlay = [(50.0, 0.20), (None, None)]  # second week missing snapshot
+        BucketUsage(
+            bucket="2026-04-13", input_tokens=0, output_tokens=0,
+            cache_creation_tokens=0, cache_read_tokens=0, total_tokens=0,
+            cost_usd=10.0, models=["m"], model_breakdowns=[],
+        ),
+    )
+    # Overlay parallel to aggregated (newest-first): second week
+    # (2026-04-20) missing snapshot.
+    overlay_newest_first = ((None, None), (50.0, 0.20))
+    view = WeeklyView(
+        rows=(), aggregated=aggregated_newest_first,
+        overlay=overlay_newest_first,
+        total_cost_usd=22.0, total_tokens=0,
+        period_start=datetime(2026, 4, 13, tzinfo=timezone.utc),
+        period_end=datetime(2026, 4, 27, tzinfo=timezone.utc),
+        display_tz_label="UTC",
+    )
     snap = _cctally._build_weekly_snapshot(
-        buckets, overlay,
+        view,
         period_start=datetime(2026, 4, 13, tzinfo=timezone.utc),
         period_end=datetime(2026, 4, 27, tzinfo=timezone.utc),
         display_tz="UTC", version="9.9.9", theme="light",

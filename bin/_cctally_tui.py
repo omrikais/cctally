@@ -1824,10 +1824,46 @@ def _tui_build_snapshot(
         except Exception as exc:
             errors.append(f"weekly-history: {exc}")
         # ---- v2.1 additions: dashboard Weekly / Monthly panels ----
+        # Sync-thread view-model totals (spec §6.6) for weekly. The
+        # dashboard builder does its own pre-credit synthesis (Bug K
+        # v1.7.2) and is too specialized to fully absorb into the
+        # view-model kernel; we still capture totals via a parallel
+        # build_weekly_view call so MonthlyPanel-style envelope-read
+        # substitution works on WeeklyPanel.tsx too.
+        weekly_total_cost_usd = 0.0
+        weekly_total_tokens = 0
         try:
             weekly_periods = _dashboard_build_weekly_periods(
                 conn, now_utc, n=12, skip_sync=skip_sync
             )
+            # Mirror the dashboard builder's window (12 weeks + slack).
+            _w_n = 12
+            _w_range_end = now_utc
+            _w_range_start = now_utc - dt.timedelta(days=7 * (_w_n + 1))
+            c = _cctally()
+            _weeks = c._compute_subscription_weeks(
+                conn, _w_range_start, _w_range_end,
+            )
+            if _weeks:
+                _fetch_start = min(
+                    _w_range_start,
+                    parse_iso_datetime(_weeks[0].start_ts, "week_start_at"),
+                )
+                _w_entries = c.get_entries(
+                    _fetch_start, _w_range_end, skip_sync=True,
+                )
+                _w_as_of = (
+                    _w_range_end.astimezone(dt.timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                _w_view = c.build_weekly_view(
+                    conn, _w_entries, weeks=_weeks, now_utc=now_utc,
+                    display_tz=None, as_of_utc=_w_as_of,
+                )
+                weekly_total_cost_usd = _w_view.total_cost_usd
+                weekly_total_tokens = _w_view.total_tokens
         except Exception as exc:
             errors.append(f"weekly-periods: {exc}")
         # Sync-thread view-model totals (spec §6.6): mirror the daily
@@ -1944,6 +1980,8 @@ def _tui_build_snapshot(
             daily_total_tokens=daily_total_tokens,
             monthly_total_cost_usd=monthly_total_cost_usd,
             monthly_total_tokens=monthly_total_tokens,
+            weekly_total_cost_usd=weekly_total_cost_usd,
+            weekly_total_tokens=weekly_total_tokens,
         )
     finally:
         conn.close()

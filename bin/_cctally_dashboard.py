@@ -2852,7 +2852,15 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     # can distinguish "loading / not synced yet" (null parent) from
     # "synced + no data" (empty rows). For Weekly/Monthly, sync always
     # builds the rows list (even if empty), so we always emit the object.
-    weekly_env = {"rows": [_weekly_row_to_dict(r) for r in snap.weekly_periods]}
+    weekly_env = {
+        "rows": [_weekly_row_to_dict(r) for r in snap.weekly_periods],
+        # View-model unification (Bundle 1; spec §6.6): pre-computed
+        # totals. Source is `build_weekly_view`; the dashboard's
+        # `_dashboard_build_weekly_periods` still owns the pre-credit
+        # synthesis (Bug K) and that path is unchanged.
+        "total_cost_usd": snap.weekly_total_cost_usd,
+        "total_tokens":   snap.weekly_total_tokens,
+    }
     monthly_env = {
         "rows": [_monthly_row_to_dict(r) for r in snap.monthly_periods],
         # View-model unification (Bundle 1; spec §6.6): pre-computed

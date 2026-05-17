@@ -223,3 +223,134 @@ class TestMonthlyView:
         # Newest-first; cap to 2 takes 2026-04, 2026-03.
         assert view.rows[0].label == "2026-04"
         assert view.rows[1].label == "2026-03"
+
+
+class TestWeeklyView:
+    """Weekly view requires SubWeek records + an in-memory SQLite seeded
+    with `weekly_usage_snapshots` rows for the usage overlay (spec §5.3).
+    """
+
+    @staticmethod
+    def _seed_db():
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE weekly_usage_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_date TEXT, week_end_date TEXT,
+                week_start_at TEXT, week_end_at TEXT,
+                weekly_percent REAL, five_hour_percent REAL,
+                captured_at_utc TEXT
+            );
+        """)
+        return conn
+
+    @staticmethod
+    def _make_subweek(start_date, end_date):
+        """Build a minimal `SubWeek`-like namespace object.
+
+        SubWeek is a frozen dataclass in _lib_subscription_weeks; we
+        only need the fields the builder reads.
+        """
+        import sys as _sys
+        if str(BIN_DIR) not in _sys.path:
+            _sys.path.insert(0, str(BIN_DIR))
+        import _lib_subscription_weeks  # noqa: WPS433
+        return _lib_subscription_weeks.SubWeek(
+            start_ts=dt.datetime.combine(
+                start_date, dt.time.min, tzinfo=dt.timezone.utc,
+            ).isoformat(),
+            end_ts=dt.datetime.combine(
+                end_date, dt.time.min, tzinfo=dt.timezone.utc,
+            ).isoformat(),
+            start_date=start_date,
+            end_date=end_date,
+            source="snapshot",
+            display_start_date=start_date,
+        )
+
+    def test_empty_entries_returns_empty_view(self, vm):
+        conn = self._seed_db()
+        view = vm.build_weekly_view(
+            conn, [], weeks=[], now_utc=_now(), display_tz=None,
+        )
+        assert view.rows == ()
+        assert view.aggregated == ()
+        assert view.overlay == ()
+
+    def test_overlay_drives_used_pct_and_dpp(self, vm):
+        """With a usage snapshot row, used_pct flows through and
+        dollar_per_pct = cost_usd / used_pct."""
+        if str(BIN_DIR) not in sys.path:
+            sys.path.insert(0, str(BIN_DIR))
+        from _lib_aggregators import UsageEntry  # noqa: WPS433
+
+        conn = self._seed_db()
+        sw_start = dt.date(2026, 5, 11)
+        sw_end = dt.date(2026, 5, 18)
+        # Seed a usage snapshot at 50% for this week.
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots ("
+            "  week_start_date, week_end_date, week_start_at, week_end_at, "
+            "  weekly_percent, five_hour_percent, captured_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                sw_start.isoformat(), sw_end.isoformat(),
+                dt.datetime.combine(sw_start, dt.time.min,
+                                    tzinfo=dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                dt.datetime.combine(sw_end, dt.time.min,
+                                    tzinfo=dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                50.0, 0.0,
+                "2026-05-15T12:00:00Z",
+            ),
+        )
+        conn.commit()
+        sw = self._make_subweek(sw_start, sw_end)
+        entries = [
+            UsageEntry(
+                timestamp=dt.datetime(2026, 5, 14, 12, tzinfo=dt.timezone.utc),
+                model="claude-opus-4-5",
+                usage={"input_tokens": 1000, "output_tokens": 500,
+                       "cache_creation_input_tokens": 0,
+                       "cache_read_input_tokens": 0},
+                cost_usd=10.0,
+            ),
+        ]
+        view = vm.build_weekly_view(
+            conn, entries, weeks=[sw], now_utc=_now(), display_tz=None,
+        )
+        assert len(view.rows) == 1
+        r = view.rows[0]
+        assert r.used_pct == pytest.approx(50.0, abs=1e-9)
+        # dpp = 10.0 / 50.0 = 0.2
+        assert r.dollar_per_pct == pytest.approx(0.2, abs=1e-9)
+        # overlay parallel to aggregated.
+        assert view.overlay[0] == (pytest.approx(50.0, abs=1e-9),
+                                    pytest.approx(0.2, abs=1e-9))
+
+    def test_no_overlay_when_no_snapshot(self, vm):
+        """Week without a weekly_usage_snapshot row → used_pct=None,
+        dollar_per_pct=None."""
+        if str(BIN_DIR) not in sys.path:
+            sys.path.insert(0, str(BIN_DIR))
+        from _lib_aggregators import UsageEntry  # noqa: WPS433
+
+        conn = self._seed_db()
+        sw = self._make_subweek(dt.date(2026, 5, 4), dt.date(2026, 5, 11))
+        entries = [
+            UsageEntry(
+                timestamp=dt.datetime(2026, 5, 7, 12, tzinfo=dt.timezone.utc),
+                model="claude-opus-4-5",
+                usage={"input_tokens": 100, "output_tokens": 50,
+                       "cache_creation_input_tokens": 0,
+                       "cache_read_input_tokens": 0},
+                cost_usd=1.0,
+            ),
+        ]
+        view = vm.build_weekly_view(
+            conn, entries, weeks=[sw], now_utc=_now(), display_tz=None,
+        )
+        assert view.rows[0].used_pct is None
+        assert view.rows[0].dollar_per_pct is None
+        assert view.overlay[0] == (None, None)

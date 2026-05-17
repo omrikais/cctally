@@ -45,7 +45,9 @@ function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
 export function WeeklyPanel() {
   const env = useSnapshot();
   const rows = (env?.weekly?.rows ?? []).slice(0, VISIBLE_ROWS);
-  const total = rows.reduce((acc, r) => acc + r.cost_usd, 0);
+  // View-model unification (spec §6.6a): consume the envelope's pre-
+  // computed total instead of re-summing in JS.
+  const total = env?.weekly?.total_cost_usd ?? 0;
 
   // First-mount animation: track which row labels we've already painted.
   // On first encounter, render at width:0; after one layout pass, mark the

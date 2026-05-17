@@ -2055,6 +2055,8 @@
         "week_end_at": "2026-03-09T14:00:00Z",
         "week_start_at": "2026-03-02T14:00:00Z"
       }
-    ]
+    ],
+    "total_cost_usd": 455.48,
+    "total_tokens": 55548000
   }
 }

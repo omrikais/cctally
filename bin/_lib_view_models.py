@@ -415,3 +415,152 @@ def build_monthly_view(entries, *, now_utc, n=12, display_tz=None):
         period_end=now_utc,
         display_tz_label=_display_tz_label(display_tz),
     )
+
+
+# === WeeklyView + build_weekly_view (Task 9) ===============================
+
+
+@dataclass(frozen=True)
+class WeeklyView:
+    """Weekly domain view — subscription-week aligned, newest-first.
+
+    ``rows`` carries the typed ``WeeklyPeriodRow`` tuple (already
+    overlaid with ``weekly_usage_snapshots``); ``aggregated`` carries
+    the parallel ``BucketUsage`` tuple for CLI byte-stability;
+    ``overlay`` carries ``(used_pct, dollar_per_pct)`` tuples in the
+    same order as ``aggregated`` (drives the CLI's
+    ``_render_weekly_table`` / ``_weekly_to_json``).
+
+    ``rows`` and ``aggregated`` are both newest-first. ``overlay``
+    aligns with ``aggregated``.
+    """
+    rows: tuple = ()                          # tuple[WeeklyPeriodRow, ...]
+    aggregated: tuple = ()                    # tuple[BucketUsage, ...]
+    overlay: tuple = ()                       # tuple[(used_pct, dpp), ...]
+    total_cost_usd: float = 0.0
+    total_tokens: int = 0
+    period_start: "dt.datetime | None" = None
+    period_end: "dt.datetime | None" = None
+    display_tz_label: str = ""
+
+
+def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
+                      as_of_utc=None):
+    """Build a ``WeeklyView`` from subscription-week boundaries
+    (spec §5.3).
+
+    ``weeks`` is the ``list[SubWeek]`` computed by the caller via
+    ``_compute_subscription_weeks(conn, range_start, range_end)``.
+
+    Calls ``_aggregate_weekly(entries, weeks)`` and overlays
+    ``weekly_usage_snapshots`` per ``WeekRef`` via
+    ``get_latest_usage_for_week`` (clamped to ``as_of_utc`` when
+    provided — the CLI passes ``range_end``-Z so historical
+    ``--until <past>`` queries pick the period-relevant snapshot, not
+    today's). Derives ``dollar_per_pct``, ``delta_cost_pct``,
+    ``is_current``.
+
+    Output is newest-first across ``rows`` / ``aggregated`` /
+    ``overlay`` — the CLI re-reverses for asc rendering.
+    """
+    _agg = _load_lib("_lib_aggregators")
+    _cct_core = _load_lib("_cctally_core")
+    buckets_asc = _agg._aggregate_weekly(entries, weeks)
+    if not buckets_asc:
+        return WeeklyView(
+            rows=(), aggregated=(), overlay=(),
+            total_cost_usd=0.0, total_tokens=0,
+            period_start=None, period_end=now_utc,
+            display_tz_label=_display_tz_label(display_tz),
+        )
+
+    # Index SubWeek by `start_date.isoformat()` — the invariant
+    # _aggregate_weekly enforces is one-to-one between bucket key and
+    # SubWeek.
+    week_by_key = {w.start_date.isoformat(): w for w in weeks}
+    parse_iso = _cct_core.parse_iso_datetime
+    make_ref = _cct_core.make_week_ref
+    get_usage = _cct_core.get_latest_usage_for_week
+
+    # Build asc overlay + asc WeeklyPeriodRow list first; reverse later.
+    asc_overlay: list = []
+    asc_rows: list = []
+    total_cost = 0.0
+    total_tok = 0
+    for i, b in enumerate(buckets_asc):
+        sw = week_by_key.get(b.bucket)
+        if sw is None:
+            # Should not happen given _aggregate_weekly's invariant; be
+            # defensive — emit a no-overlay row.
+            asc_overlay.append((None, None))
+            continue
+        ref = make_ref(
+            week_start_date=sw.start_date.isoformat(),
+            week_end_date=sw.end_date.isoformat(),
+            week_start_at=sw.start_ts,
+            week_end_at=sw.end_ts,
+        )
+        usage_row = get_usage(conn, ref, as_of_utc=as_of_utc)
+        used_pct = None
+        if usage_row is not None and usage_row["weekly_percent"] is not None:
+            used_pct = float(usage_row["weekly_percent"])
+        dpp = (b.cost_usd / used_pct) if (used_pct and used_pct > 0) else None
+        asc_overlay.append((used_pct, dpp))
+
+        # delta_cost_pct vs the prior (older) bucket. asc order: prior
+        # is at index i - 1.
+        prev = buckets_asc[i - 1] if i > 0 else None
+        delta = None
+        if prev is not None and prev.cost_usd > 0:
+            delta = (b.cost_usd - prev.cost_usd) / prev.cost_usd
+
+        # is_current: now_utc falls inside [start_ts, end_ts).
+        try:
+            sw_start = parse_iso(sw.start_ts, "week.start_ts")
+            sw_end = parse_iso(sw.end_ts, "week.end_ts")
+            is_current = sw_start <= now_utc < sw_end
+        except Exception:
+            is_current = False
+
+        asc_rows.append(WeeklyPeriodRow(
+            label=sw.start_date.strftime("%m-%d"),
+            cost_usd=b.cost_usd,
+            total_tokens=b.total_tokens,
+            input_tokens=b.input_tokens,
+            output_tokens=b.output_tokens,
+            cache_creation_tokens=b.cache_creation_tokens,
+            cache_read_tokens=b.cache_read_tokens,
+            used_pct=used_pct,
+            dollar_per_pct=dpp,
+            delta_cost_pct=delta,
+            is_current=is_current,
+            models=_model_breakdowns_to_models_late(
+                b.model_breakdowns, b.cost_usd,
+            ),
+            week_start_at=sw.start_ts,
+            week_end_at=sw.end_ts,
+        ))
+        total_cost += b.cost_usd
+        total_tok += b.total_tokens
+
+    # Reverse to newest-first across all three parallel lists.
+    rows = list(reversed(asc_rows))
+    aggregated = list(reversed(buckets_asc))
+    overlay = list(reversed(asc_overlay))
+
+    period_start_dt = None
+    if weeks:
+        try:
+            period_start_dt = parse_iso(weeks[0].start_ts, "weeks[0].start_ts")
+        except Exception:
+            period_start_dt = None
+    return WeeklyView(
+        rows=tuple(rows),
+        aggregated=tuple(aggregated),
+        overlay=tuple(overlay),
+        total_cost_usd=total_cost,
+        total_tokens=total_tok,
+        period_start=period_start_dt,
+        period_end=now_utc,
+        display_tz_label=_display_tz_label(display_tz),
+    )

@@ -94,7 +94,11 @@ def test_envelope_weekly_monthly_empty_rows_on_empty_snapshot():
     snap = ns["_empty_dashboard_snapshot"]()
     env = ns["snapshot_to_envelope"](snap, now_utc=dt.datetime(2026, 4, 20,
                                                                12, 0, tzinfo=dt.timezone.utc))
-    assert env["weekly"] == {"rows": []}
+    assert env["weekly"] == {
+        "rows": [],
+        "total_cost_usd": 0.0,
+        "total_tokens": 0,
+    }
     assert env["monthly"] == {
         "rows": [],
         "total_cost_usd": 0.0,
