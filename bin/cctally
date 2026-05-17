@@ -356,6 +356,8 @@ WeeklyView = _lib_view_models.WeeklyView
 build_weekly_view = _lib_view_models.build_weekly_view
 TrendView = _lib_view_models.TrendView
 build_trend_view = _lib_view_models.build_trend_view
+SessionsView = _lib_view_models.SessionsView
+build_sessions_view = _lib_view_models.build_sessions_view
 
 _lib_render = _load_sibling("_lib_render")
 _CODEX_MONTHS = _lib_render._CODEX_MONTHS
@@ -6526,7 +6528,20 @@ def cmd_session(args: argparse.Namespace) -> int:
     range_start, range_end = range
 
     entries = get_claude_session_entries(range_start, range_end)
-    sessions = _aggregate_claude_sessions(entries)
+    # Unified view-model kernel (spec §6.5). `limit=None` keeps the
+    # full aggregator output — `cctally session` has no `--limit` flag
+    # and emits every session in the requested range. `view.aggregated`
+    # is the `list[ClaudeSessionUsage]` shape the legacy CLI / share
+    # renderers consume (table, --json, share-snapshot); `view.rows`
+    # is the typed `TuiSessionRow` tuple reserved for the TUI /
+    # dashboard wiring in Task 15 / 16. Keeping both shapes parallel
+    # at the builder preserves the resumed-session merge invariant
+    # documented in CLAUDE.md (one sessionId across multiple JSONL
+    # files collapses to ONE entry in BOTH tuples).
+    view = build_sessions_view(
+        entries, now_utc=_command_as_of(), limit=None, display_tz=tz,
+    )
+    sessions = list(view.aggregated)
 
     # Shareable-reports gate: --format short-circuits the JSON / table
     # dispatch via `_share_render_and_emit`. The mutex in
