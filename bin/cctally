@@ -6575,7 +6575,7 @@ def cmd_session(args: argparse.Namespace) -> int:
         # cmd_daily / cmd_project.
         display_tz_str = _share_display_tz_label(tz)
         snap = _build_session_snapshot(
-            sessions,
+            view,
             period_start=range_start,
             period_end=range_end,
             display_tz=display_tz_str,
@@ -13393,7 +13393,7 @@ def _session_disambiguate_labels(
 
 
 def _build_session_snapshot(
-    sessions: list["ClaudeSessionUsage"],
+    view: "SessionsView",
     *,
     period_start: dt.datetime,
     period_end: dt.datetime,
@@ -13406,11 +13406,17 @@ def _build_session_snapshot(
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally session`.
 
-    `sessions` is the in-memory `ClaudeSessionUsage` list produced by
-    `_aggregate_claude_sessions` inside `cmd_session`. Each session has:
-    `session_id` (UUID), `project_path` (filesystem path), `cost_usd`,
-    `last_activity` (`dt.datetime`), `models` (first-seen-order
-    `list[str]`), and the token aggregates.
+    Consumes the unified ``SessionsView`` (spec §6.5). ``view.aggregated``
+    is the ``ClaudeSessionUsage`` tuple — the shape this builder needs
+    for ``source_paths`` / ``model_breakdowns`` / ``last_activity``
+    (fields ``view.rows`` / ``TuiSessionRow`` doesn't carry). The
+    in-memory shape is unchanged at the read boundary — only the
+    parameter container differs.
+
+    Each ``ClaudeSessionUsage`` has: ``session_id`` (UUID),
+    ``project_path`` (filesystem path), ``cost_usd``,
+    ``last_activity`` (``dt.datetime``), ``models`` (first-seen-order
+    ``list[str]``), and the token aggregates.
 
     Privacy invariant (Section 8.4 / Section 5.3): the builder populates
     `ProjectCell.label`, `ChartPoint.project_label`, and
@@ -13435,12 +13441,14 @@ def _build_session_snapshot(
       not present on session data) to suffix `" (parent)"` on
       collisions before the scrubber runs.
 
-    Caller MUST pass `sessions` already sorted in the desired order;
-    the builder re-sorts internally by descending cost so the chart's
-    HBar bars rank consistently with the anonymization-mapping
-    (`_build_anon_mapping` also sorts by descending cost) — keeping
-    `project-1` aligned with the highest-cost bar in the chart even
-    when the user asked for `--order asc`.
+    Caller MUST pass ``view`` whose ``aggregated`` tuple is already
+    sorted in the desired order (``cmd_session`` keeps the
+    aggregator's descending-by-last_activity sort); the builder
+    re-sorts internally by descending cost so the chart's HBar bars
+    rank consistently with the anonymization-mapping
+    (``_build_anon_mapping`` also sorts by descending cost) — keeping
+    ``project-1`` aligned with the highest-cost bar in the chart even
+    when the user asked for ``--order asc``.
 
     `top_n`, when set (must be `>= 1`; caller validates), truncates
     BOTH the table rows and the chart points to the top-N by cost.
@@ -13467,7 +13475,8 @@ def _build_session_snapshot(
     # Sort by descending cost so the snapshot's chart-order matches the
     # `_build_anon_mapping` sort key (also descending cost).
     sorted_sessions = sorted(
-        sessions, key=lambda s: -float(getattr(s, "cost_usd", 0.0) or 0.0)
+        view.aggregated,
+        key=lambda s: -float(getattr(s, "cost_usd", 0.0) or 0.0),
     )
     # Apply --top-n truncation (caller validated >= 1). Truncation status
     # gates the title shape below.
