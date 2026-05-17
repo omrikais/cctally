@@ -211,6 +211,7 @@ from _cctally_core import (
     open_db,
     get_latest_usage_for_week,
     _canonicalize_optional_iso,
+    make_week_ref,
 )
 from _lib_display_tz import (
     format_display_dt,
@@ -1531,7 +1532,7 @@ def _tui_build_trend(
             canon_start, canon_end = c._get_canonical_boundary_for_date(
                 conn, latest_usage["week_start_date"]
             )
-            current_ref = c.make_week_ref(
+            current_ref = make_week_ref(
                 week_start_date=latest_usage["week_start_date"],
                 week_end_date=latest_usage["week_end_date"],
                 week_start_at=canon_start,

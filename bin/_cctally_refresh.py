@@ -306,7 +306,6 @@ def _render_refresh_usage_text(payload: dict, color: bool, now_epoch: int) -> st
     The ``5h`` segment is omitted entirely when ``payload["five_hour"]`` is None.
     Color codes are emitted only when ``color`` is True.
     """
-    c = _cctally()
     a = _REFRESH_USAGE_ANSI if color else {k: "" for k in _REFRESH_USAGE_ANSI}
 
     seven = payload["seven_day"]
@@ -437,7 +436,6 @@ def _bust_statusline_cache(path: str = _STATUSLINE_OAUTH_CACHE) -> str:
     ``"absent"`` (file did not exist), ``"error"`` (delete failed for
     a non-FileNotFoundError reason — logged via eprint, does NOT raise).
     """
-    c = _cctally()
     try:
         os.remove(path)
         return "busted"

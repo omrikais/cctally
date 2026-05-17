@@ -2109,7 +2109,7 @@ def _should_show_update_banner(
         return False
     if not config.get("update", {}).get("check", {}).get("enabled", True):
         return False
-    available, _ = c._compute_effective_update_available(state, suppress, c._now_utc())
+    available, _ = c._compute_effective_update_available(state, suppress, _now_utc())
     return available
 
 

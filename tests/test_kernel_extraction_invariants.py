@@ -20,21 +20,29 @@ KERNEL_SYMBOLS = {
 
 
 def test_kernel_symbols_have_no_shims_in_siblings():
-    """After kernel extraction, no sibling shims `sys.modules["cctally"].<kernel>`."""
-    pattern = re.compile(
-        r'sys\.modules\["cctally"\]\.(' +
-        "|".join(re.escape(s) for s in KERNEL_SYMBOLS) +
-        r')\b'
-    )
+    """After kernel extraction, no sibling reaches the kernel via the accessor.
+
+    Catches BOTH forms:
+    - `sys.modules["cctally"].<kernel>(...)` — the shim function pattern
+    - `c.<kernel>(...)` where `c = _cctally()` — the inline accessor pattern
+
+    Both should be replaced by `from _cctally_core import <kernel>` per spec §3.3.
+    """
+    sym_alt = "|".join(re.escape(s) for s in KERNEL_SYMBOLS)
+    shim_pattern = re.compile(rf'sys\.modules\["cctally"\]\.({sym_alt})\b')
+    accessor_pattern = re.compile(rf'\bc\.({sym_alt})\s*\(')
     offenders = []
     for sib in SIBLINGS:
         if sib.name == "_cctally_core.py":
             continue
         text = sib.read_text()
-        for m in pattern.finditer(text):
+        for m in shim_pattern.finditer(text):
             line = text[:m.start()].count("\n") + 1
             offenders.append(f"{sib.name}:{line}: {m.group(0)}")
-    assert not offenders, "Kernel symbol shim leaks:\n" + "\n".join(offenders)
+        for m in accessor_pattern.finditer(text):
+            line = text[:m.start()].count("\n") + 1
+            offenders.append(f"{sib.name}:{line}: {m.group(0)} (use `from _cctally_core import {m.group(1)}` instead)")
+    assert not offenders, "Kernel symbol reach leaks:\n" + "\n".join(offenders)
 
 
 def test_core_accessor_use_is_bounded():

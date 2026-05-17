@@ -1559,7 +1559,6 @@ def _setup_install(args: argparse.Namespace) -> int:
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    c = _cctally()
     # Migration flags are install-mode-only. Reject combinations with
     # --status or --uninstall (per spec Section 2 mode×flag matrix). The
     # mutex group on the parser already prevents both flags being set
