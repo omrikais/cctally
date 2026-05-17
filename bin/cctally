@@ -345,6 +345,12 @@ _aggregate_codex_sessions = _lib_aggregators._aggregate_codex_sessions
 _session_path_parts = _lib_aggregators._session_path_parts
 _aggregate_claude_sessions = _lib_aggregators._aggregate_claude_sessions
 
+# View-model kernel — per-domain frozen dataclasses + builders.
+# Spec: docs/superpowers/specs/2026-05-17-view-model-unification-design.md.
+_lib_view_models = _load_sibling("_lib_view_models")
+DailyView = _lib_view_models.DailyView
+build_daily_view = _lib_view_models.build_daily_view
+
 _lib_render = _load_sibling("_lib_render")
 _CODEX_MONTHS = _lib_render._CODEX_MONTHS
 _render_blocks_table = _lib_render._render_blocks_table
@@ -5222,8 +5228,19 @@ def cmd_daily(args: argparse.Namespace) -> int:
     # Collect entries.
     all_entries = get_entries(range_start, range_end)
 
-    # Aggregate by display-tz date (Q5/F6: day boundary follows display.tz).
-    days = _aggregate_daily(all_entries, mode="auto", tz=tz)
+    # Build the unified daily view (spec §5.1: gap-free; the dashboard
+    # heatmap's contiguous-window materialization stays at the dashboard
+    # envelope adapter so CLI byte-stability is preserved). Consume
+    # `view.aggregated` (BucketUsage tuple) for the CLI renderers — the
+    # JSON shape's `bucket` / `model_breakdowns` / `models: list[str]`
+    # fields live on BucketUsage, not on DailyPanelRow. The builder's
+    # `_aggregate_daily` call is the same one we used inline.
+    view = build_daily_view(all_entries, now_utc=_command_as_of(),
+                            display_tz=tz)
+    # `_aggregate_daily` returned ascending order; build_daily_view stores
+    # `aggregated` newest-first. CLI's default order is ascending, so
+    # re-reverse to match the prior on-the-wire shape.
+    days = list(reversed(view.aggregated))
 
     # Shareable-reports gate: --format short-circuits the JSON / table
     # dispatch via `_share_render_and_emit`. The mutex in
