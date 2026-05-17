@@ -1830,11 +1830,36 @@ def _tui_build_snapshot(
             )
         except Exception as exc:
             errors.append(f"weekly-periods: {exc}")
+        # Sync-thread view-model totals (spec §6.6): mirror the daily
+        # pattern. Re-call build_monthly_view with the same window
+        # _dashboard_build_monthly_periods uses; cache-backed
+        # get_entries makes the second pass cheap.
+        monthly_total_cost_usd = 0.0
+        monthly_total_tokens = 0
         try:
             monthly_periods = _dashboard_build_monthly_periods(
                 conn, now_utc, n=12, skip_sync=skip_sync,
                 display_tz=_build_display_tz,
             )
+            # Mirror _dashboard_build_monthly_periods' window calc
+            # (~12 months back from now_utc).
+            _mn = 12
+            _sy, _sm = now_utc.year, now_utc.month
+            for _ in range(_mn - 1):
+                _sm -= 1
+                if _sm == 0:
+                    _sm = 12
+                    _sy -= 1
+            _m_range_start = dt.datetime(_sy, _sm, 1, tzinfo=dt.timezone.utc)
+            c = _cctally()
+            _monthly_entries = c.get_entries(_m_range_start, now_utc,
+                                              skip_sync=True)
+            _monthly_view = c.build_monthly_view(
+                _monthly_entries, now_utc=now_utc, n=_mn,
+                display_tz=_build_display_tz,
+            )
+            monthly_total_cost_usd = _monthly_view.total_cost_usd
+            monthly_total_tokens = _monthly_view.total_tokens
         except Exception as exc:
             errors.append(f"monthly-periods: {exc}")
         # ---- v2.2 additions: dashboard Blocks / Daily panels ----
@@ -1917,6 +1942,8 @@ def _tui_build_snapshot(
             five_hour_milestones=fh_milestones,
             daily_total_cost_usd=daily_total_cost_usd,
             daily_total_tokens=daily_total_tokens,
+            monthly_total_cost_usd=monthly_total_cost_usd,
+            monthly_total_tokens=monthly_total_tokens,
         )
     finally:
         conn.close()

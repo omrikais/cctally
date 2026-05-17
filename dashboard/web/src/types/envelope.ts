@@ -302,7 +302,12 @@ export interface PeriodRow {
 }
 
 export interface WeeklyEnvelope  { rows: PeriodRow[]; }   // 12 newest-first
-export interface MonthlyEnvelope { rows: PeriodRow[]; }   // 12 newest-first
+export interface MonthlyEnvelope {
+  rows: PeriodRow[];                  // 12 newest-first
+  // ---- view-model unification additive scalars (Bundle 1) ----
+  total_cost_usd?: number;
+  total_tokens?:   number;
+}
 
 // ---- Blocks panel (envelope §1.3) ------------------------------------
 

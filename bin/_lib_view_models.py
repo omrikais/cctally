@@ -313,3 +313,105 @@ def build_daily_view(entries, *, now_utc, display_tz=None):
         period_end=now_utc,
         display_tz_label=_display_tz_label(display_tz),
     )
+
+
+# === MonthlyView + build_monthly_view (Task 8) =============================
+
+
+@dataclass(frozen=True)
+class MonthlyView:
+    """Monthly domain view — entries-driven, newest-first.
+
+    Like ``DailyView``: ``rows`` carries the typed ``MonthlyPeriodRow``
+    tuple for dashboard/share, ``aggregated`` carries the parallel
+    ``BucketUsage`` tuple for CLI byte-stability.
+
+    Boundary-spillover bucket is dropped (mirrors the existing dashboard
+    builder at ``_dashboard_build_monthly_periods:1752``):
+    in tzs west of UTC, the bucket builder emits an extra ``YYYY-MM``
+    row for entries that straddle the UTC range start into the prior
+    local month. Slicing to ``n`` after reversal drops it.
+
+    ``delta_cost_pct`` is computed per row vs the next-older row; the
+    oldest row's value is ``None`` (no prior to compare against).
+    """
+    rows: tuple = ()                          # tuple[MonthlyPeriodRow, ...]
+    aggregated: tuple = ()                    # tuple[BucketUsage, ...]
+    total_cost_usd: float = 0.0
+    total_tokens: int = 0
+    period_start: "dt.datetime | None" = None
+    period_end: "dt.datetime | None" = None
+    display_tz_label: str = ""
+
+
+def build_monthly_view(entries, *, now_utc, n=12, display_tz=None):
+    """Build a ``MonthlyView`` for the trailing ``n`` calendar months
+    (spec §5.2).
+
+    Calls ``_aggregate_monthly``. Drops the boundary-spillover bucket
+    (mirrors ``_dashboard_build_monthly_periods``). Computes
+    ``delta_cost_pct`` per row vs the next-older row. Newest-first.
+
+    Totals (``total_cost_usd`` / ``total_tokens``) sum over the
+    truncated row set so the React panel sees the same number as the
+    CLI table footer would.
+    """
+    _agg = _load_lib("_lib_aggregators")
+    buckets = _agg._aggregate_monthly(entries, mode="auto", tz=display_tz)
+    if not buckets:
+        return MonthlyView(
+            rows=(), aggregated=(),
+            total_cost_usd=0.0, total_tokens=0,
+            period_start=None, period_end=now_utc,
+            display_tz_label=_display_tz_label(display_tz),
+        )
+
+    # Reverse for newest-first AND cap to n BEFORE the delta loop —
+    # boundary-spillover drop (see MonthlyView docstring).
+    buckets = list(reversed(buckets))[:n]
+    cur_label = (
+        now_utc.astimezone(display_tz) if display_tz is not None
+        # internal fallback: host-local intentional
+        else now_utc.astimezone()
+    ).strftime("%Y-%m")
+
+    rows = []
+    total_cost = 0.0
+    total_tok = 0
+    for i, b in enumerate(buckets):
+        prev = buckets[i + 1] if i + 1 < len(buckets) else None
+        delta = None
+        if prev is not None and prev.cost_usd > 0:
+            delta = (b.cost_usd - prev.cost_usd) / prev.cost_usd
+        rows.append(MonthlyPeriodRow(
+            label=b.bucket,                          # "YYYY-MM"
+            cost_usd=b.cost_usd,
+            total_tokens=b.total_tokens,
+            input_tokens=b.input_tokens,
+            output_tokens=b.output_tokens,
+            cache_creation_tokens=b.cache_creation_tokens,
+            cache_read_tokens=b.cache_read_tokens,
+            delta_cost_pct=delta,
+            is_current=(b.bucket == cur_label),
+            models=_model_breakdowns_to_models_late(
+                b.model_breakdowns, b.cost_usd,
+            ),
+        ))
+        total_cost += b.cost_usd
+        total_tok += b.total_tokens
+
+    # period_start = first day of the oldest visible month, UTC.
+    earliest_label = buckets[-1].bucket
+    yr, mo = earliest_label.split("-")
+    period_start = dt.datetime(
+        int(yr), int(mo), 1, tzinfo=dt.timezone.utc,
+    )
+    return MonthlyView(
+        rows=tuple(rows),
+        aggregated=tuple(buckets),
+        total_cost_usd=total_cost,
+        total_tokens=total_tok,
+        period_start=period_start,
+        period_end=now_utc,
+        display_tz_label=_display_tz_label(display_tz),
+    )

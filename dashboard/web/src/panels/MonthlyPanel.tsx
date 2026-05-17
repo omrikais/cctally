@@ -45,7 +45,11 @@ function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
 export function MonthlyPanel() {
   const env = useSnapshot();
   const rows = (env?.monthly?.rows ?? []).slice(0, VISIBLE_ROWS);
-  const total = rows.reduce((acc, r) => acc + r.cost_usd, 0);
+  // View-model unification (spec §6.6a, the canonical "smoking gun"
+  // substitution): consume the envelope's pre-computed total instead
+  // of re-summing in JS. `?? 0` covers the first-paint window before
+  // sync publishes the field.
+  const total = env?.monthly?.total_cost_usd ?? 0;
 
   // First-mount animation: see WeeklyPanel for full notes. Spec §4.4.
   const seenLabels = useRef<Set<string>>(new Set());

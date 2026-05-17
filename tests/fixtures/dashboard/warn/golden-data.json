@@ -1399,7 +1399,9 @@
         "output_tokens": 3520000,
         "total_tokens": 21120000
       }
-    ]
+    ],
+    "total_cost_usd": 190.30000000000004,
+    "total_tokens": 37342000
   },
   "sessions": {
     "rows": [

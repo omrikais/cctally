@@ -141,7 +141,9 @@
   "last_sync_at": null,
   "last_sync_error": null,
   "monthly": {
-    "rows": []
+    "rows": [],
+    "total_cost_usd": 0.0,
+    "total_tokens": 0
   },
   "sessions": {
     "rows": [],

@@ -1719,10 +1719,14 @@ def _dashboard_build_monthly_periods(conn: "sqlite3.Connection",
                                      display_tz: "ZoneInfo | None" = None) -> "list[MonthlyPeriodRow]":
     """Latest n calendar months as MonthlyPeriodRow, newest-first.
 
-    Builds via `_aggregate_monthly` over the trailing window
-    [now_utc - n calendar months, now_utc]. Bucketing and `is_current`
-    label both follow `display_tz` so users on a non-host display zone
-    see months grouped consistently with the rest of the UI.
+    Thin wrapper around ``build_monthly_view`` (spec §6.2). The view
+    owns the aggregator call, boundary-spillover drop, delta_cost_pct
+    derivation, and ``is_current`` flagging — this function just
+    fetches the trailing window of entries and returns ``view.rows``.
+
+    The sync thread separately captures ``view.total_cost_usd`` /
+    ``view.total_tokens`` for the envelope; see
+    ``_tui_build_snapshot`` and ``DataSnapshot.monthly_total_*``.
     """
     # Compute window start = first day of the month that is (n - 1) months
     # before the current month. _aggregate_monthly walks all entries and
@@ -1741,44 +1745,10 @@ def _dashboard_build_monthly_periods(conn: "sqlite3.Connection",
     range_end = now_utc
 
     entries = get_entries(range_start, range_end, skip_sync=skip_sync)
-    buckets = _aggregate_monthly(entries, mode="auto", tz=display_tz)
-    # Reverse for newest-first AND cap to n BEFORE the delta loop. In tzs
-    # west of UTC, `range_start` (UTC midnight on the 1st) lands in the
-    # PREVIOUS local month, so entries in the boundary window get bucketed
-    # as a (n+1)th `'YYYY-MM'` row. Slicing here drops that partial bucket,
-    # which (a) keeps the visible history at the requested length and
-    # (b) makes the oldest visible row's delta `None` (prev = None) rather
-    # than a wildly wrong delta vs. a few-hour spillover bucket.
-    buckets = list(reversed(buckets))[:n]
-    rows: list[MonthlyPeriodRow] = []
-    # `_aggregate_monthly` keys buckets by `display_tz` (or local-tz when
-    # unset) month. Mirror that here so `is_current` matches even when
-    # now_utc straddles a tz month boundary (e.g. 23:30 UTC on the last
-    # of the month in a UTC+1 zone).
-    cur_label = (
-        now_utc.astimezone(display_tz) if display_tz is not None
-        # internal fallback: host-local intentional
-        else now_utc.astimezone()
-    ).strftime("%Y-%m")
-    for i, b in enumerate(buckets):
-        # b.bucket is the YYYY-MM string for monthly aggregation.
-        prev = buckets[i + 1] if i + 1 < len(buckets) else None
-        delta = None
-        if prev is not None and prev.cost_usd > 0:
-            delta = (b.cost_usd - prev.cost_usd) / prev.cost_usd
-        rows.append(MonthlyPeriodRow(
-            label=b.bucket,
-            cost_usd=b.cost_usd,
-            total_tokens=b.total_tokens,
-            input_tokens=b.input_tokens,
-            output_tokens=b.output_tokens,
-            cache_creation_tokens=b.cache_creation_tokens,
-            cache_read_tokens=b.cache_read_tokens,
-            delta_cost_pct=delta,
-            is_current=(b.bucket == cur_label),
-            models=_model_breakdowns_to_models(b.model_breakdowns, b.cost_usd),
-        ))
-    return rows
+    c = _cctally()
+    view = c.build_monthly_view(entries, now_utc=now_utc, n=n,
+                                 display_tz=display_tz)
+    return list(view.rows)
 
 
 def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
@@ -2883,7 +2853,15 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     # "synced + no data" (empty rows). For Weekly/Monthly, sync always
     # builds the rows list (even if empty), so we always emit the object.
     weekly_env = {"rows": [_weekly_row_to_dict(r) for r in snap.weekly_periods]}
-    monthly_env = {"rows": [_monthly_row_to_dict(r) for r in snap.monthly_periods]}
+    monthly_env = {
+        "rows": [_monthly_row_to_dict(r) for r in snap.monthly_periods],
+        # View-model unification (Bundle 1; spec §6.6): pre-computed
+        # gap-free totals. Source is `build_monthly_view` so the React
+        # MonthlyPanel's smoking-gun `rows.reduce(...)` collapses to a
+        # single envelope read.
+        "total_cost_usd": snap.monthly_total_cost_usd,
+        "total_tokens":   snap.monthly_total_tokens,
+    }
 
     blocks_env = {"rows": [_blocks_row_to_dict(r) for r in snap.blocks_panel]}
 

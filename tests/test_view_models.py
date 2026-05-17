@@ -138,3 +138,88 @@ class TestDailyView:
         view = vm.build_daily_view(entries, now_utc=_now(), display_tz=None)
         assert all(r.label == "" for r in view.rows)
         assert all(r.intensity_bucket == 0 for r in view.rows)
+
+
+class TestMonthlyView:
+    def test_empty_entries_returns_empty_view(self, vm):
+        view = vm.build_monthly_view([], now_utc=_now(), display_tz=None)
+        assert view.rows == ()
+        assert view.aggregated == ()
+        assert view.total_cost_usd == 0.0
+        assert view.total_tokens == 0
+
+    def test_multi_month_delta_linkage(self, vm):
+        """Newest-first ordering + delta_cost_pct points at the
+        immediately-older row; oldest row has delta None."""
+        if str(BIN_DIR) not in sys.path:
+            sys.path.insert(0, str(BIN_DIR))
+        from _lib_aggregators import UsageEntry  # noqa: WPS433
+
+        entries = [
+            UsageEntry(
+                timestamp=dt.datetime(2026, 3, 15, tzinfo=dt.timezone.utc),
+                model="claude-opus-4-5",
+                usage={"input_tokens": 100, "output_tokens": 50,
+                       "cache_creation_input_tokens": 0,
+                       "cache_read_input_tokens": 0},
+                cost_usd=0.10,
+            ),
+            UsageEntry(
+                timestamp=dt.datetime(2026, 4, 15, tzinfo=dt.timezone.utc),
+                model="claude-opus-4-5",
+                usage={"input_tokens": 100, "output_tokens": 50,
+                       "cache_creation_input_tokens": 0,
+                       "cache_read_input_tokens": 0},
+                cost_usd=0.15,
+            ),
+        ]
+        view = vm.build_monthly_view(entries, now_utc=_now(), display_tz=None)
+        # Newest-first: April first, March second.
+        assert view.rows[0].label == "2026-04"
+        assert view.rows[1].label == "2026-03"
+        # delta = (0.15 - 0.10) / 0.10 = 0.50
+        assert view.rows[0].delta_cost_pct == pytest.approx(0.5, abs=1e-9)
+        # Oldest row has no prior → delta None.
+        assert view.rows[1].delta_cost_pct is None
+
+    def test_is_current_marks_now_month(self, vm):
+        if str(BIN_DIR) not in sys.path:
+            sys.path.insert(0, str(BIN_DIR))
+        from _lib_aggregators import UsageEntry  # noqa: WPS433
+
+        entries = [
+            UsageEntry(
+                timestamp=dt.datetime(2026, 5, 5, tzinfo=dt.timezone.utc),
+                model="claude-opus-4-5",
+                usage={"input_tokens": 100, "output_tokens": 50,
+                       "cache_creation_input_tokens": 0,
+                       "cache_read_input_tokens": 0},
+                cost_usd=0.05,
+            ),
+        ]
+        # _now() is 2026-05-17 → current month is 2026-05.
+        view = vm.build_monthly_view(entries, now_utc=_now(), display_tz=None)
+        assert view.rows[0].is_current is True
+        assert view.rows[0].label == "2026-05"
+
+    def test_n_truncates_to_trailing_window(self, vm):
+        if str(BIN_DIR) not in sys.path:
+            sys.path.insert(0, str(BIN_DIR))
+        from _lib_aggregators import UsageEntry  # noqa: WPS433
+
+        entries = []
+        for mo in (1, 2, 3, 4):
+            entries.append(UsageEntry(
+                timestamp=dt.datetime(2026, mo, 15, tzinfo=dt.timezone.utc),
+                model="claude-opus-4-5",
+                usage={"input_tokens": 100, "output_tokens": 50,
+                       "cache_creation_input_tokens": 0,
+                       "cache_read_input_tokens": 0},
+                cost_usd=0.1 * mo,
+            ))
+        view = vm.build_monthly_view(entries, now_utc=_now(), n=2,
+                                      display_tz=None)
+        assert len(view.rows) == 2
+        # Newest-first; cap to 2 takes 2026-04, 2026-03.
+        assert view.rows[0].label == "2026-04"
+        assert view.rows[1].label == "2026-03"

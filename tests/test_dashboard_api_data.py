@@ -82,13 +82,24 @@ def test_envelope_has_weekly_and_monthly_keys():
 def test_envelope_weekly_monthly_empty_rows_on_empty_snapshot():
     """Empty snapshot -> `{rows: []}` panel keys, NOT null. Spec §2.7
     says the empty state is `weekly.rows === []`, not `weekly === null`,
-    so the panel can distinguish "synced + no data" from "loading"."""
+    so the panel can distinguish "synced + no data" from "loading".
+
+    View-model unification (Bundle 1, spec §6.6) added optional
+    `total_cost_usd` / `total_tokens` scalars on the monthly block;
+    empty snapshots emit them as 0.0 / 0 (additive identity, not None
+    — see ``DataSnapshot.monthly_total_*`` defaults). Weekly's totals
+    land in Task 9.
+    """
     ns = load_script()
     snap = ns["_empty_dashboard_snapshot"]()
     env = ns["snapshot_to_envelope"](snap, now_utc=dt.datetime(2026, 4, 20,
                                                                12, 0, tzinfo=dt.timezone.utc))
     assert env["weekly"] == {"rows": []}
-    assert env["monthly"] == {"rows": []}
+    assert env["monthly"] == {
+        "rows": [],
+        "total_cost_usd": 0.0,
+        "total_tokens": 0,
+    }
 
 
 def test_envelope_weekly_emits_rows_when_snapshot_populated():
