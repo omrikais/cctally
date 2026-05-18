@@ -1043,6 +1043,14 @@ class DataSnapshot:
     blocks_total_cost_usd: float = 0.0
     blocks_total_tokens: int = 0
     trend_avg_dollars_per_pct: float | None = None
+    # Forecast domain (issue #57). ``ForecastView`` wraps
+    # ``ForecastOutput`` and surfaces the per-method projection /
+    # verdict / header-routing / budget fields the dashboard envelope
+    # adapter used to re-derive inline. Field is ``None`` for fixture
+    # modules that construct ``DataSnapshot`` directly without going
+    # through ``_tui_build_snapshot``; the envelope adapter falls
+    # back to the legacy inline routing in that case.
+    forecast_view: Any | None = None
 
     @classmethod
     def synthesize_for_marketing(cls, *, as_of_iso: str) -> "DataSnapshot":
@@ -1425,11 +1433,32 @@ def _tui_build_forecast(
     *,
     skip_sync: bool = False,
 ):
-    """Call into existing forecast internals. Returns a ForecastOutput or None."""
-    inputs = _load_forecast_inputs(conn, now_utc, skip_sync=skip_sync)
-    if inputs is None:
-        return None
-    return _compute_forecast(inputs, [100, 90])
+    """Build the TUI/dashboard sync-thread forecast.
+
+    Issue #57: routes through ``build_forecast_view`` (the kernel-pattern
+    wrapper) and unwraps to a ``ForecastOutput`` for backward-compat with
+    every existing ``snap.forecast`` consumer (TUI panels, envelope
+    adapter, share builder). Use ``_tui_build_forecast_view`` when the
+    full view is needed (e.g. ``snap.forecast_view`` population).
+    """
+    view = _tui_build_forecast_view(conn, now_utc, skip_sync=skip_sync)
+    return view.output if view is not None else None
+
+
+def _tui_build_forecast_view(
+    conn: sqlite3.Connection,
+    now_utc: dt.datetime,
+    *,
+    skip_sync: bool = False,
+):
+    """Build the ``ForecastView`` (issue #57). Returns ``None`` only on
+    error in callers — the empty-state View is constructed by the
+    builder itself with ``output=None`` + ``verdict="LOW CONF"``.
+    """
+    c = _cctally()
+    return c.build_forecast_view(
+        conn, now_utc=now_utc, targets=(100, 90), skip_sync=skip_sync,
+    )
 
 
 def _tui_build_trend(
@@ -1650,8 +1679,14 @@ def _tui_build_snapshot(
             cw = _tui_build_current_week(conn, now_utc, skip_sync=skip_sync)
         except Exception as exc:
             errors.append(f"current-week: {exc}")
+        fc_view = None
         try:
-            fc = _tui_build_forecast(conn, now_utc, skip_sync=skip_sync)
+            # Issue #57: build the ForecastView once so we capture both
+            # the legacy ``ForecastOutput`` (for ``snap.forecast``, which
+            # the many TUI panel consumers still read) and the surface
+            # fields the envelope adapter used to re-derive inline.
+            fc_view = _tui_build_forecast_view(conn, now_utc, skip_sync=skip_sync)
+            fc = fc_view.output if fc_view is not None else None
         except Exception as exc:
             errors.append(f"forecast: {exc}")
         # Trend: source from build_trend_view so we capture the 3-sample
@@ -1830,6 +1865,7 @@ def _tui_build_snapshot(
             blocks_total_cost_usd=blocks_total_cost_usd,
             blocks_total_tokens=blocks_total_tokens,
             trend_avg_dollars_per_pct=trend_avg_dpp,
+            forecast_view=fc_view,
         )
     finally:
         conn.close()

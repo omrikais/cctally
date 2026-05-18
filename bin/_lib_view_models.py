@@ -34,6 +34,11 @@ Frozen ``*View`` dataclasses + builders:
   ``build_blocks_view_from_table_rows(block_dicts, *, period_start,
   period_end, display_tz)`` — API-anchored (cmd_five_hour_blocks
   share). Issue #56.
+- ``ForecastView`` + ``build_forecast_view(conn, *, now_utc, targets,
+  skip_sync, display_tz)`` — wraps the existing math kernel
+  (``_load_forecast_inputs`` + ``_compute_forecast``) and surfaces the
+  per-method projection / verdict / header-routing / budget fields
+  consumers used to re-derive. Issue #57.
 
 Each ``*View`` carries ``rows`` (typed row tuple) plus a parallel
 ``aggregated`` ``BucketUsage`` tuple where CLI byte-stable JSON requires
@@ -1217,4 +1222,250 @@ def build_blocks_view_from_table_rows(
         period_start=period_start,
         period_end=period_end,
         display_tz_label=_display_tz_label(display_tz),
+    )
+
+
+# === ForecastView + build_forecast_view (Issue #57) ========================
+
+
+_FORECAST_VERDICT_GOOD = "GOOD"
+_FORECAST_VERDICT_WARN = "WARN"
+_FORECAST_VERDICT_OVER = "OVER"
+_FORECAST_VERDICT_LOW_CONF = "LOW CONF"
+
+
+@dataclass(frozen=True)
+class ForecastView:
+    """Forecast domain view — wraps the existing math kernel.
+
+    Unlike the rows-shaped domain views, ``ForecastView`` projects a
+    *singular* week into the future. The wrapped ``output`` carries the
+    full ``ForecastOutput`` math result (inputs + r_avg + r_recent +
+    final_percent_{low,high} + budgets[] + cap_at), and the View
+    additively surfaces fields that consumers used to re-derive:
+
+    * ``verdict`` — TUI design-language mapping ("GOOD" / "WARN" /
+      "OVER" / "LOW CONF"). Mirrors ``_tui_verdict_of``.
+    * ``dashboard_verdict`` — dashboard envelope's mapping ("ok" /
+      "cap" / "capped"). Mirrors the per-method routing in
+      ``snapshot_to_envelope``.
+    * ``week_avg_projection_pct`` / ``recent_24h_projection_pct`` —
+      per-method projections from ``r_avg`` / ``r_recent``. The
+      recent-24h value is ``None`` when ``r_recent`` is ``None`` or its
+      projection equals ``week_avg_projection_pct`` (no new info).
+      Routing labels stay correct on decelerating weeks where
+      ``r_recent < r_avg``.
+    * ``header_projection_pct`` — "pick pessimistic when verdict
+      warns" routing the dashboard header runs. Surfaced once on the
+      view so the header field and the verdict pill always tell the
+      same story.
+    * ``budget_100_per_day_usd`` / ``budget_90_per_day_usd`` — the
+      matching ``BudgetRow.dollars_per_day`` values, ``None`` when the
+      target is out of headroom.
+    * ``confidence`` / ``low_confidence`` / ``low_confidence_reasons`` —
+      mirrors ``inputs.confidence``. Surfaced separately so callers can
+      key on ``view.low_confidence`` without crawling
+      ``view.output.inputs``.
+
+    ``output`` is ``None`` when ``_load_forecast_inputs`` returned
+    ``None`` (no current-week snapshot). The View still constructs in
+    that case so consumers can render an empty-state from a uniformly-
+    shaped object; ``verdict`` is then ``"LOW CONF"`` and the projection
+    / budget fields are ``None``.
+
+    ``period_start`` / ``period_end`` carry the subscription-week
+    bounds (``inputs.week_start_at`` / ``inputs.week_end_at``), mirroring
+    the other domain views.
+    """
+    output: Any | None = None                  # ForecastOutput | None — forward-ref kept untyped to avoid an import-time edge into cctally's dataclasses.
+    verdict: str = _FORECAST_VERDICT_LOW_CONF
+    dashboard_verdict: str = "ok"
+    confidence: str = "unknown"
+    low_confidence: bool = False
+    low_confidence_reasons: tuple = ()
+    week_avg_projection_pct: "float | None" = None
+    recent_24h_projection_pct: "float | None" = None
+    header_projection_pct: "float | None" = None
+    budget_100_per_day_usd: "float | None" = None
+    budget_90_per_day_usd: "float | None" = None
+    period_start: "dt.datetime | None" = None
+    period_end: "dt.datetime | None" = None
+    display_tz_label: str = ""
+    targets: tuple = ()
+
+
+def _forecast_verdict_of(output) -> str:
+    """Design-language verdict for a ``ForecastOutput``. Mirrors
+    ``_tui_verdict_of`` but lives on the view-model layer so consumers
+    don't have to round-trip through ``_cctally_tui``.
+
+    None output OR low confidence → ``"LOW CONF"``. Otherwise threshold
+    on ``final_percent_high``: ≥100 → OVER, ≥90 → WARN, else GOOD.
+    """
+    if output is None:
+        return _FORECAST_VERDICT_LOW_CONF
+    inputs = getattr(output, "inputs", None)
+    if inputs is not None and getattr(inputs, "confidence", "high") == "low":
+        return _FORECAST_VERDICT_LOW_CONF
+    high = float(getattr(output, "final_percent_high", 0.0))
+    if high >= 100:
+        return _FORECAST_VERDICT_OVER
+    if high >= 90:
+        return _FORECAST_VERDICT_WARN
+    return _FORECAST_VERDICT_GOOD
+
+
+def _forecast_dashboard_verdict_of(output) -> str:
+    """Dashboard-envelope verdict ("ok"/"cap"/"capped"). Pure helper
+    used by ``snapshot_to_envelope`` and ``build_forecast_view``."""
+    if output is None:
+        return "ok"
+    if getattr(output, "already_capped", False):
+        return "capped"
+    if getattr(output, "projected_cap", False):
+        return "cap"
+    return "ok"
+
+
+def _forecast_projection_pcts(output) -> "tuple[float | None, float | None]":
+    """Return (week_avg_projection_pct, recent_24h_projection_pct).
+
+    Decomposes the dual-method projections from ``r_avg`` / ``r_recent``
+    + ``inputs.p_now`` + ``inputs.remaining_hours``. Mirrors the routing
+    in ``snapshot_to_envelope``: recent-24h is ``None`` when ``r_recent``
+    is ``None`` or its projection equals the week-avg projection (no
+    new info — a second method that agrees with the first contributes
+    nothing to the user-facing range).
+    """
+    if output is None:
+        return None, None
+    inputs = getattr(output, "inputs", None)
+    if inputs is None:
+        return None, None
+    p_now = getattr(inputs, "p_now", None)
+    rem = getattr(inputs, "remaining_hours", None)
+    r_avg = getattr(output, "r_avg", None)
+    r_recent = getattr(output, "r_recent", None)
+    week_avg_pct = None
+    if p_now is not None and rem is not None and r_avg is not None:
+        week_avg_pct = p_now + r_avg * rem
+    recent_pct = None
+    if p_now is not None and rem is not None and r_recent is not None:
+        candidate = p_now + r_recent * rem
+        # Suppress the second projection only when it adds no info.
+        if week_avg_pct is None or candidate != week_avg_pct:
+            recent_pct = candidate
+    return week_avg_pct, recent_pct
+
+
+def _forecast_header_projection_pct(
+    week_avg_pct: "float | None",
+    recent_24h_pct: "float | None",
+    dashboard_verdict: str,
+) -> "float | None":
+    """Header field routing: when the verdict warns ("cap"/"capped")
+    and recent-24h is the more pessimistic of the two, surface that
+    so the header number and the verdict pill agree. Otherwise the
+    week-avg projection wins (the historical default).
+    """
+    if (
+        dashboard_verdict in ("cap", "capped")
+        and recent_24h_pct is not None
+        and week_avg_pct is not None
+        and recent_24h_pct > week_avg_pct
+    ):
+        return recent_24h_pct
+    return week_avg_pct
+
+
+def _forecast_budgets(output) -> "tuple[float | None, float | None]":
+    """Pull the (100%, 90%) ``BudgetRow.dollars_per_day`` pair from a
+    ``ForecastOutput.budgets`` list. Either may be ``None`` when the
+    target is out of headroom (``BudgetRow.dollars_per_day is None``).
+    """
+    if output is None:
+        return None, None
+    b100 = None
+    b90 = None
+    for b in getattr(output, "budgets", None) or []:
+        tp = getattr(b, "target_percent", None)
+        dpd = getattr(b, "dollars_per_day", None)
+        if tp == 100:
+            b100 = dpd
+        elif tp == 90:
+            b90 = dpd
+    return b100, b90
+
+
+def build_forecast_view(
+    conn,
+    *,
+    now_utc,
+    targets=(100, 90),
+    skip_sync: bool = False,
+    display_tz=None,
+):
+    """Build a ``ForecastView`` (issue #57).
+
+    Wraps the existing math kernel (``_load_forecast_inputs`` +
+    ``_compute_forecast``) without duplicating logic. Always returns a
+    ``ForecastView`` — when ``_load_forecast_inputs`` returns ``None``
+    (no current-week snapshot), the View constructs with
+    ``output=None`` + ``verdict="LOW CONF"`` so empty-state callers
+    don't branch on the wrapper itself.
+
+    ``targets`` are the percent ceilings forwarded to
+    ``_compute_forecast`` (default ``(100, 90)`` — matches both
+    ``cmd_forecast``'s ``--targets`` default and the TUI sync thread's
+    hard-coded value). ``skip_sync`` honours
+    ``cctally forecast --no-sync`` (and the dashboard's sync-thread
+    refresh skip).
+    """
+    c = _cctally()
+    inputs = c._load_forecast_inputs(conn, now_utc, skip_sync=skip_sync)
+    if inputs is None:
+        return ForecastView(
+            output=None,
+            verdict=_FORECAST_VERDICT_LOW_CONF,
+            dashboard_verdict="ok",
+            confidence="unknown",
+            low_confidence=False,
+            low_confidence_reasons=(),
+            week_avg_projection_pct=None,
+            recent_24h_projection_pct=None,
+            header_projection_pct=None,
+            budget_100_per_day_usd=None,
+            budget_90_per_day_usd=None,
+            period_start=None,
+            period_end=None,
+            display_tz_label=_display_tz_label(display_tz),
+            targets=tuple(int(t) for t in targets),
+        )
+    output = c._compute_forecast(inputs, list(int(t) for t in targets))
+    verdict = _forecast_verdict_of(output)
+    dashboard_verdict = _forecast_dashboard_verdict_of(output)
+    week_avg_pct, recent_pct = _forecast_projection_pcts(output)
+    header_pct = _forecast_header_projection_pct(
+        week_avg_pct, recent_pct, dashboard_verdict,
+    )
+    b100, b90 = _forecast_budgets(output)
+    confidence = getattr(inputs, "confidence", "high")
+    return ForecastView(
+        output=output,
+        verdict=verdict,
+        dashboard_verdict=dashboard_verdict,
+        confidence=confidence,
+        low_confidence=(confidence == "low"),
+        low_confidence_reasons=tuple(
+            getattr(inputs, "low_confidence_reasons", None) or ()
+        ),
+        week_avg_projection_pct=week_avg_pct,
+        recent_24h_projection_pct=recent_pct,
+        header_projection_pct=header_pct,
+        budget_100_per_day_usd=b100,
+        budget_90_per_day_usd=b90,
+        period_start=getattr(inputs, "week_start_at", None),
+        period_end=getattr(inputs, "week_end_at", None),
+        display_tz_label=_display_tz_label(display_tz),
+        targets=tuple(int(t) for t in targets),
     )

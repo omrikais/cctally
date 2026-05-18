@@ -1350,13 +1350,16 @@ def _build_forecast_share_panel_data(options: dict,
                                       snap: "DataSnapshot | None") -> dict:
     """Forecast panel_data — projection + per-day budgets + days-to-ceiling.
 
-    Reuses `DataSnapshot.forecast` (ForecastOutput).
-    `projection_curve` is synthesized from `r_avg` / `r_recent` /
-    `inputs.p_now` — the same arithmetic `snapshot_to_envelope` does for
-    `week_avg_projection_pct` / `recent_24h_projection_pct`, extended
-    across the next 7 days.
+    Reuses ``DataSnapshot.forecast`` (ForecastOutput) and, when populated
+    by the sync thread, ``DataSnapshot.forecast_view`` (the kernel
+    wrapper from issue #57) for the (100, 90) budget pair.
+    ``projection_curve`` is synthesized from ``r_avg`` / ``r_recent`` /
+    ``inputs.p_now`` — the same arithmetic ``snapshot_to_envelope`` does
+    for ``week_avg_projection_pct`` / ``recent_24h_projection_pct``,
+    extended across the next 7 days.
     """
     fc = getattr(snap, "forecast", None) if snap else None
+    fc_view = getattr(snap, "forecast_view", None) if snap else None
     if fc is None:
         return {
             "projected_end_pct":  0.0,
@@ -1388,16 +1391,26 @@ def _build_forecast_share_panel_data(options: dict,
         return max(0.0, hours / 24.0)
     days_to_100 = _days_to_ceiling(100.0)
     days_to_90 = _days_to_ceiling(90.0)
-    # Daily budgets — pull from fc.budgets[] when present
+    # Daily budgets — prefer ForecastView's pre-routed pair (issue #57)
+    # when available; otherwise replay the legacy ``fc.budgets`` scan
+    # inline so positionally-constructed fixture snapshots still work.
     budgets: dict = {"avg": 0.0, "recent_24h": 0.0,
                      "until_90pct": 0.0, "until_100pct": 0.0}
-    for b in getattr(fc, "budgets", None) or []:
-        tp = getattr(b, "target_percent", None)
-        dpd = float(getattr(b, "dollars_per_day", 0.0) or 0.0)
-        if tp == 100:
-            budgets["until_100pct"] = dpd
-        elif tp == 90:
-            budgets["until_90pct"] = dpd
+    if fc_view is not None:
+        budgets["until_100pct"] = float(
+            fc_view.budget_100_per_day_usd or 0.0,
+        )
+        budgets["until_90pct"] = float(
+            fc_view.budget_90_per_day_usd or 0.0,
+        )
+    else:
+        for b in getattr(fc, "budgets", None) or []:
+            tp = getattr(b, "target_percent", None)
+            dpd = float(getattr(b, "dollars_per_day", 0.0) or 0.0)
+            if tp == 100:
+                budgets["until_100pct"] = dpd
+            elif tp == 90:
+                budgets["until_90pct"] = dpd
     # avg / recent_24h: derive from dollars-per-percent × r_avg/r_recent.
     dpp = float(getattr(inputs, "dollars_per_percent", 0.0) or 0.0) if inputs else 0.0
     budgets["avg"] = dpp * r_avg * 24.0
@@ -2663,6 +2676,16 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     """
     cw = snap.current_week
     fc = snap.forecast
+    # Issue #57 — prefer ``snap.forecast_view`` (precomputed by the
+    # sync thread via ``build_forecast_view``) over re-deriving the
+    # projection / verdict / header-routing / budget fields inline.
+    # Falls back to the legacy inline routing below when
+    # ``forecast_view`` is missing — fixture modules that construct
+    # ``DataSnapshot`` positionally without the post-Bundle-1 fields
+    # leave it at ``None``, and their goldens predate the View so
+    # keeping the legacy path under that fallback preserves byte
+    # stability.
+    fc_view = getattr(snap, "forecast_view", None)
 
     # F1 fix: server-resolve the display tz to a CONCRETE IANA name and
     # surface it on the envelope so the browser never has to guess "local".
@@ -2691,19 +2714,35 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     five_hr  = getattr(cw, "five_hour_pct", None) if cw is not None else None
     dollar_pp = getattr(cw, "dollars_per_percent", None) if cw is not None else None
 
-    # Forecast fields: route each projection by method identity from
-    # r_avg / r_recent and inputs.{p_now, remaining_hours}. Don't use
-    # final_percent_{low,high} directly — those are numerical min/max of
-    # the two methods, which swaps the labels on decelerating weeks
-    # (r_recent < r_avg). Map defensively via getattr — the JS only
-    # needs the values, not the internal structure.
+    # Forecast field routing (issue #57). ``snap.forecast_view`` is the
+    # single source of truth: ``build_forecast_view`` runs the per-
+    # method projection / verdict / budget routing once and stashes
+    # the surface fields on the View. The legacy inline derivation
+    # remains as a fallback for fixture modules that construct
+    # ``DataSnapshot`` positionally without populating ``forecast_view``
+    # — their goldens predate the View, and the legacy block emits
+    # the same numbers so byte stability is preserved.
     fcast_pct: "float | None" = None
     recent_24h_pct: "float | None" = None
     verdict: "str | None" = None
     confidence: "str | None" = None
     budget_100: "float | None" = None
     budget_90: "float | None" = None
-    if fc is not None:
+    if fc_view is not None:
+        fcast_pct = fc_view.week_avg_projection_pct
+        recent_24h_pct = fc_view.recent_24h_projection_pct
+        # ForecastView.dashboard_verdict / .confidence default to
+        # ``"ok"`` / ``"unknown"`` even when ``output is None``; only
+        # surface non-None envelope values when there's an actual
+        # ForecastOutput backing them so the existing
+        # ``verdict / confidence is None when fc is None`` shape stays.
+        verdict = fc_view.dashboard_verdict if fc is not None else None
+        confidence = fc_view.confidence if fc is not None else None
+        budget_100 = fc_view.budget_100_per_day_usd
+        budget_90 = fc_view.budget_90_per_day_usd
+    elif fc is not None:
+        # Legacy inline routing — kept verbatim for positionally-
+        # constructed fixture snapshots that don't carry ``forecast_view``.
         inputs = getattr(fc, "inputs", None)
         if inputs is not None:
             confidence = getattr(inputs, "confidence", None)
@@ -2716,11 +2755,8 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         if (p_now is not None and rem_hrs is not None
                 and r_recent is not None):
             p_final_recent = p_now + r_recent * rem_hrs
-            # Only emit recent_24h when the two projections diverge — if
-            # r_recent equals r_avg the second method added no info.
             if fcast_pct is None or p_final_recent != fcast_pct:
                 recent_24h_pct = p_final_recent
-        # Verdict — simple mapping: "cap" if projected_cap, else "ok".
         if getattr(fc, "already_capped", False):
             verdict = "capped"
         elif getattr(fc, "projected_cap", False):
@@ -2774,20 +2810,23 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         reset_at_utc = we
 
     # Header forecast_pct should match the projection that drove the
-    # verdict pill next to it. When the verdict warns (projected to
-    # cap or already capped) and the recent-24h projection is higher
-    # than the week-average path, surface the pessimistic value so
-    # the number and the pill tell the same story. The Forecast panel
-    # still exposes both `week_avg_projection_pct` and
-    # `recent_24h_projection_pct` unchanged.
-    header_fcast_pct = fcast_pct
-    if (
-        verdict in ("cap", "capped")
-        and recent_24h_pct is not None
-        and fcast_pct is not None
-        and recent_24h_pct > fcast_pct
-    ):
-        header_fcast_pct = recent_24h_pct
+    # verdict pill next to it. The View (issue #57) carries the
+    # already-routed ``header_projection_pct``; the fallback path
+    # replays the legacy routing inline for fixture snapshots that
+    # don't populate ``forecast_view``. The Forecast panel still
+    # exposes both ``week_avg_projection_pct`` and
+    # ``recent_24h_projection_pct`` unchanged.
+    if fc_view is not None and fc is not None:
+        header_fcast_pct = fc_view.header_projection_pct
+    else:
+        header_fcast_pct = fcast_pct
+        if (
+            verdict in ("cap", "capped")
+            and recent_24h_pct is not None
+            and fcast_pct is not None
+            and recent_24h_pct > fcast_pct
+        ):
+            header_fcast_pct = recent_24h_pct
 
     # ---- weekly / monthly periods ---------------------------------
     def _weekly_row_to_dict(r: "WeeklyPeriodRow") -> dict:

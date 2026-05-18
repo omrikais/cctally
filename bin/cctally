@@ -362,6 +362,8 @@ build_sessions_view = _lib_view_models.build_sessions_view
 BlocksView = _lib_view_models.BlocksView
 build_blocks_view = _lib_view_models.build_blocks_view
 build_blocks_view_from_table_rows = _lib_view_models.build_blocks_view_from_table_rows
+ForecastView = _lib_view_models.ForecastView
+build_forecast_view = _lib_view_models.build_forecast_view
 
 _lib_render = _load_sibling("_lib_render")
 _CODEX_MONTHS = _lib_render._CODEX_MONTHS
@@ -8283,7 +8285,16 @@ def cmd_forecast(args: argparse.Namespace) -> int:
     # sync_cache(conn) here — that prior call ran on the stats DB connection
     # (wrong conn) and was a no-op for the real cache anyway.
 
-    inputs = _load_forecast_inputs(conn, now_utc, skip_sync=args.no_sync)
+    # Route through ``build_forecast_view`` (issue #57). The View is the
+    # kernel-pattern wrapper; ``view.output`` carries the existing
+    # ``ForecastOutput`` math result so every downstream renderer here
+    # (text / JSON / status-line / share) reuses the same projection,
+    # verdict, budgets, and per-method rate fields without recomputing.
+    view = build_forecast_view(
+        conn, now_utc=now_utc, targets=tuple(targets),
+        skip_sync=args.no_sync, display_tz=args._resolved_tz,
+    )
+    inputs = view.output.inputs if view.output is not None else None
     if inputs is None:
         # No snapshot for the current week.
         if getattr(args, "format", None):
@@ -8349,12 +8360,12 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             print("forecast: no data for current week yet")
         return 0
 
-    output = _compute_forecast(inputs, targets)
+    output = view.output
 
     # Shareable-reports gate: --format short-circuits the JSON / status-line /
     # terminal dispatch via `_share_render_and_emit`. The mutex in
     # `_add_share_args(has_status_line=True)` keeps `--format`, `--json`, and
-    # `--status-line` from coexisting. The gate fires AFTER `_compute_forecast`
+    # `--status-line` from coexisting. The gate fires AFTER ``build_forecast_view``
     # so the snapshot reuses the same projection math as the terminal/JSON
     # paths — no parallel computation.
     if getattr(args, "format", None):
