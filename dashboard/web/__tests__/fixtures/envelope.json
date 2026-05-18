@@ -357,7 +357,9 @@
         "week_start_at": "2026-04-16T09:59:00+02:00",
         "week_end_at":   "2026-04-23T09:59:00+02:00"
       }
-    ]
+    ],
+    "total_cost_usd": 92.31,
+    "total_tokens": 666000000
   },
   "monthly": {
     "rows": [
@@ -397,7 +399,9 @@
           {"model": "claude-haiku-4-5-20251001", "display": "haiku-4-5", "chip": "haiku","cost_usd": 26.9, "cost_pct": 15.0}
         ]
       }
-    ]
+    ],
+    "total_cost_usd": 361.71,
+    "total_tokens": 1950000000
   },
   "blocks": {
     "rows": [
@@ -437,7 +441,9 @@
         ],
         "label": "19:00 Apr 25"
       }
-    ]
+    ],
+    "total_cost_usd": 6.68,
+    "total_tokens": 0
   },
   "daily": {
     "rows": [
@@ -480,7 +486,9 @@
         "total_tokens": 0, "cache_hit_pct": null }
     ],
     "quantile_thresholds": [3.12, 5.71, 7.06, 7.40, 8.40],
-    "peak": { "date": "2026-04-26", "cost_usd": 8.40 }
+    "peak": { "date": "2026-04-26", "cost_usd": 8.40 },
+    "total_cost_usd": 31.69,
+    "total_tokens": 9950400
   },
   "sessions": {
     "total": 20,
