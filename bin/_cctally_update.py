@@ -116,8 +116,12 @@ What stays in bin/cctally:
   write surface in cmd_dashboard works unchanged; moved code
   reads via ``c.X``.
 - ``eprint``, ``_now_utc`` (used by moved code via shim/accessor),
-  ``_release_read_latest_release_version`` (stays in cctally per
-  spec §6.7 — 6+ external callers, file I/O over CHANGELOG.md),
+  ``_release_read_latest_release_version`` (impl moved to
+  ``_lib_changelog._read_latest_changelog_version``; cctally
+  re-exports the historical name. The shim below routes through
+  ``sys.modules['cctally']`` so test ``monkeypatch.setitem(ns, ...)``
+  on the historical name still overrides the 5 internal callers
+  here),
   ``_release_parse_semver`` / ``_release_semver_sort_key`` (lives
   in ``_lib_semver`` and re-exported by cctally),
   ``load_config`` (lives in ``_cctally_config``; re-exported),
@@ -210,6 +214,15 @@ def load_config(*args, **kwargs):
 
 
 def _release_read_latest_release_version(*args, **kwargs):
+    """Back-compat shim. The implementation now lives in
+    ``bin/_lib_changelog._read_latest_changelog_version``; ``bin/cctally``
+    re-exports it under the historical name. This shim routes through
+    the ``cctally`` namespace (not directly to ``_lib_changelog``) so
+    that ``monkeypatch.setitem(ns, "_release_read_latest_release_version", ...)``
+    in tests/test_update.py + tests/test_release_helpers.py overrides
+    the 5+ internal callers in this module. New code should call
+    ``_lib_changelog._read_latest_changelog_version`` directly.
+    """
     return sys.modules["cctally"]._release_read_latest_release_version(
         *args, **kwargs
     )

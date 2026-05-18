@@ -329,6 +329,17 @@ _aggregate_block = _lib_blocks._aggregate_block
 _build_activity_block = _lib_blocks._build_activity_block
 _blocks_to_json = _lib_blocks._blocks_to_json
 
+_lib_changelog = _load_sibling("_lib_changelog")
+# Backward-compat re-export: callers and tests reach the helper through
+# ``cctally._release_read_latest_release_version`` (incl. monkeypatch
+# sites in tests/test_release_helpers.py + tests/test_update.py and
+# the ``_cctally()._release_read_latest_release_version()`` call in
+# bin/_cctally_release.py). The canonical name is
+# ``_read_latest_changelog_version`` on _lib_changelog; this alias is
+# the same pattern _lib_semver uses to keep ``_release_parse_semver``
+# etc. reachable on the cctally namespace.
+_release_read_latest_release_version = _lib_changelog._read_latest_changelog_version
+
 _lib_aggregators = _load_sibling("_lib_aggregators")
 BucketUsage = _lib_aggregators.BucketUsage
 CodexBucketUsage = _lib_aggregators.CodexBucketUsage
@@ -877,18 +888,6 @@ RELEASE_HEADER_RE = re.compile(
 )
 
 RELEASE_SUBSECTION_ORDER = ("Added", "Changed", "Deprecated", "Removed", "Fixed", "Security")
-
-
-def _release_read_latest_release_version() -> tuple[str, str] | None:
-    """Read latest `## [X.Y.Z] - YYYY-MM-DD` header. Returns (version, date) or None."""
-    try:
-        text = CHANGELOG_PATH.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    m = RELEASE_HEADER_RE.search(text)
-    if not m:
-        return None
-    return (m.group(1), m.group(2))
 
 
 def _release_preflight_branch(allow_branch: str | None) -> None:
@@ -10209,7 +10208,7 @@ def doctor_gather_state(
     )
 
     # ── Meta ─────────────────────────────────────────────────────────
-    cctally_version_tuple = _release_read_latest_release_version()
+    cctally_version_tuple = _lib_changelog._read_latest_changelog_version()
     cctally_version = (
         cctally_version_tuple[0] if cctally_version_tuple else "unknown"
     )
@@ -12359,12 +12358,13 @@ def _share_history_recipe_id() -> str:
 
 
 def _share_resolve_version() -> str:
-    """Source from CHANGELOG via the existing release helper. Empty string if unset.
+    """Source from CHANGELOG via the public helper. Empty string if unset.
 
-    `_release_read_latest_release_version` returns `(version, date) | None`;
-    the snapshot's `version` field carries the version string only.
+    `_lib_changelog._read_latest_changelog_version` returns
+    `(version, date) | None`; the snapshot's `version` field carries
+    the version string only.
     """
-    info = _release_read_latest_release_version()
+    info = _lib_changelog._read_latest_changelog_version()
     return info[0] if info else ""
 
 
@@ -13938,7 +13938,7 @@ def main(argv: list[str] | None = None) -> int:
     # release header (issue #24); handle BEFORE subcommand dispatch so it
     # works without a subcommand (`cctally --version`).
     if getattr(args, "version", False):
-        v = _release_read_latest_release_version()
+        v = _lib_changelog._read_latest_changelog_version()
         if v is None:
             print("cctally unknown")
         else:

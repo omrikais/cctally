@@ -278,7 +278,7 @@ def _seed_cache_db(path: pathlib.Path) -> None:
 def _write_changelog(path: pathlib.Path) -> None:
     """Fixture CHANGELOG with a stable version stamp.
 
-    `_release_read_latest_release_version()` reads the first
+    `_lib_changelog._read_latest_changelog_version()` reads the first
     `## [X.Y.Z] - YYYY-MM-DD` header, so 9.9.9 lands in every snapshot's
     `version` field regardless of what the in-tree CHANGELOG happens to
     look like during this run.

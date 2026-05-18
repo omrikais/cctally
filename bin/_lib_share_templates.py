@@ -289,8 +289,10 @@ def _release_version() -> str:
     at `bin/cctally:86`). Falls back to `"dev"` when CHANGELOG is unreadable
     or has no stamped release entry yet (pre-release dev builds).
 
-    Parallel to `_release_read_latest_release_version` in `bin/cctally` —
-    intentionally duplicated so the template module stays free of any
+    Parallel to `_lib_changelog._read_latest_changelog_version`
+    (re-exported on `bin/cctally` under the historical
+    `_release_read_latest_release_version` name) — intentionally
+    duplicated so the template module stays free of any
     `bin/cctally` import. If CHANGELOG header format changes, update both.
     """
     from pathlib import Path
