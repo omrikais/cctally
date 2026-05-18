@@ -310,12 +310,12 @@ _blocks_to_json = _lib_blocks._blocks_to_json
 _lib_changelog = _load_sibling("_lib_changelog")
 # Backward-compat re-export: callers and tests reach the helper through
 # ``cctally._release_read_latest_release_version`` (incl. monkeypatch
-# sites in tests/test_release_helpers.py + tests/test_update.py and
+# sites in tests/test_release_internals.py + tests/test_update.py and
 # the ``_cctally()._release_read_latest_release_version()`` call in
 # bin/_cctally_release.py). The canonical name is
-# ``_read_latest_changelog_version`` on _lib_changelog; this alias is
-# the same pattern _lib_semver uses to keep ``_release_parse_semver``
-# etc. reachable on the cctally namespace.
+# ``_read_latest_changelog_version`` on _lib_changelog; the alias keeps
+# the historical cctally-namespace name reachable for the monkeypatch
+# surface those tests depend on.
 _release_read_latest_release_version = _lib_changelog._read_latest_changelog_version
 
 _lib_aggregators = _load_sibling("_lib_aggregators")
