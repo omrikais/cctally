@@ -39,6 +39,12 @@ Frozen ``*View`` dataclasses + builders:
   (``_load_forecast_inputs`` + ``_compute_forecast``) and surfaces the
   per-method projection / verdict / header-routing / budget fields
   consumers used to re-derive. Issue #57.
+- ``CodexDailyView`` / ``CodexMonthlyView`` / ``CodexWeeklyView`` /
+  ``CodexSessionView`` + ``build_codex_{daily,monthly,weekly,session}_view``
+  — wrap the existing ``_aggregate_codex_*`` kernel; preserve the
+  intentional divergences from upstream (LiteLLM token semantics,
+  duplicate-event dedup, ``codex-session`` descending-by-last-activity,
+  ``CODEX_LEGACY_FALLBACK_MODEL`` warning). Issue #58.
 
 Each ``*View`` carries ``rows`` (typed row tuple) plus a parallel
 ``aggregated`` ``BucketUsage`` tuple where CLI byte-stable JSON requires
@@ -1468,4 +1474,246 @@ def build_forecast_view(
         period_end=getattr(inputs, "week_end_at", None),
         display_tz_label=_display_tz_label(display_tz),
         targets=tuple(int(t) for t in targets),
+    )
+
+
+# === Codex domain views + builders (Issue #58) =============================
+#
+# Codex domain is CLI-only — no dashboard panel, no share consumer. The
+# four views below wrap the existing ``_aggregate_codex_{daily,monthly,
+# weekly,sessions}`` math kernel without changing it, so the
+# intentional divergences from upstream documented in CLAUDE.md (LiteLLM
+# token semantics, duplicate-event dedup, descending-by-last-activity
+# session sort, ``CODEX_LEGACY_FALLBACK_MODEL`` warning) are preserved
+# end-to-end.
+#
+# Naming differences from the Claude views are deliberate:
+#
+# - The slot carrying the aggregator output is named ``rows`` (not
+#   ``aggregated``) — Codex has no parallel typed surface row dataclass
+#   to pair with, so the aggregator's typed output IS the surface (same
+#   precedent as ``TrendView.rows`` of typed ``TuiTrendRow``).
+# - ``display_tz_label`` is the already-resolved string label
+#   (``tz_name or _local_tz_name()``), not the ``zoneinfo.ZoneInfo.key``
+#   the Claude views emit via ``_display_tz_label(tzinfo)``. Codex
+#   commands plumb a string ``tz_name`` end-to-end (see
+#   ``_resolve_codex_tz_name``); the View carries the rendered label so
+#   ``cmd_codex_*`` can read it directly.
+#
+# Bucket ordering: ``_aggregate_codex_daily`` / ``_aggregate_codex_monthly``
+# / ``_aggregate_codex_weekly`` return ASC (earliest bucket first); the
+# View carries that order. ``cmd_codex_*`` reverses to DESC when
+# ``--order desc``.
+#
+# Session ordering: ``_aggregate_codex_sessions`` returns DESC
+# (most-recent last_activity first); the View carries that order.
+# ``cmd_codex_session`` reverses to ASC when ``--order asc``. The
+# upstream-parity DESC default matches ``ccusage-codex``'s session view.
+
+
+@dataclass(frozen=True)
+class CodexDailyView:
+    """Codex daily-bucket view (CLI-only).
+
+    ``rows`` is the parallel ``CodexBucketUsage`` tuple in ASC order
+    (earliest bucket first) — same as the aggregator's default.
+    ``cmd_codex_daily`` reverses for ``--order desc``.
+    """
+    rows: tuple = ()                    # tuple[CodexBucketUsage, ...]
+    total_cost_usd: float = 0.0
+    total_tokens: int = 0
+    period_start: "dt.datetime | None" = None
+    period_end: "dt.datetime | None" = None
+    display_tz_label: str = ""
+
+
+@dataclass(frozen=True)
+class CodexMonthlyView:
+    """Codex monthly-bucket view (CLI-only).
+
+    ``rows`` is the parallel ``CodexBucketUsage`` tuple in ASC order
+    (earliest bucket first). ``cmd_codex_monthly`` reverses for
+    ``--order desc``.
+    """
+    rows: tuple = ()                    # tuple[CodexBucketUsage, ...]
+    total_cost_usd: float = 0.0
+    total_tokens: int = 0
+    period_start: "dt.datetime | None" = None
+    period_end: "dt.datetime | None" = None
+    display_tz_label: str = ""
+
+
+@dataclass(frozen=True)
+class CodexWeeklyView:
+    """Codex weekly-bucket view (CLI-only).
+
+    ``rows`` is the parallel ``CodexBucketUsage`` tuple in ASC order
+    (earliest week-start first). ``cmd_codex_weekly`` reverses for
+    ``--order desc``. Week-start day is resolved by the caller
+    (``week_start_idx``) from config.json + ``WEEKDAY_MAP``.
+    """
+    rows: tuple = ()                    # tuple[CodexBucketUsage, ...]
+    total_cost_usd: float = 0.0
+    total_tokens: int = 0
+    period_start: "dt.datetime | None" = None
+    period_end: "dt.datetime | None" = None
+    display_tz_label: str = ""
+
+
+@dataclass(frozen=True)
+class CodexSessionView:
+    """Codex session view (CLI-only).
+
+    ``rows`` is the parallel ``CodexSessionUsage`` tuple in DESC order
+    (most-recent ``last_activity`` first) — matches upstream
+    ``ccusage-codex`` and the aggregator's default sort.
+    ``cmd_codex_session`` reverses for ``--order asc``.
+    """
+    rows: tuple = ()                    # tuple[CodexSessionUsage, ...]
+    total_sessions: int = 0
+    total_cost_usd: float = 0.0
+    total_tokens: int = 0
+    period_start: "dt.datetime | None" = None
+    period_end: "dt.datetime | None" = None
+    display_tz_label: str = ""
+
+
+def _codex_tz_label(tz_name: "str | None") -> str:
+    """Render the timezone label the way ``cmd_codex_*`` already does
+    (``tz_name or _local_tz_name()``). Centralized here so the four
+    builders share one chokepoint."""
+    if tz_name:
+        return tz_name
+    return _cctally()._local_tz_name()
+
+
+def _codex_bucket_totals(buckets) -> "tuple[float, int]":
+    """Sum ``cost_usd`` and ``total_tokens`` across a
+    ``CodexBucketUsage`` list."""
+    total_cost = 0.0
+    total_tok = 0
+    for b in buckets:
+        total_cost += b.cost_usd
+        total_tok += b.total_tokens
+    return total_cost, total_tok
+
+
+def _codex_period_start_from_date_bucket(buckets) -> "dt.datetime | None":
+    """Parse the earliest ``YYYY-MM-DD`` bucket key (daily / weekly)
+    into a UTC datetime at midnight. ``None`` when ``buckets`` is empty."""
+    if not buckets:
+        return None
+    try:
+        d = dt.date.fromisoformat(buckets[0].bucket)
+    except ValueError:
+        return None
+    return dt.datetime.combine(d, dt.time.min, tzinfo=dt.timezone.utc)
+
+
+def _codex_period_start_from_month_bucket(buckets) -> "dt.datetime | None":
+    """Parse the earliest ``YYYY-MM`` bucket key (monthly) into a UTC
+    datetime at the 1st-of-month midnight. ``None`` when ``buckets`` is
+    empty or the key is malformed."""
+    if not buckets:
+        return None
+    try:
+        yr, mo = buckets[0].bucket.split("-")
+        return dt.datetime(int(yr), int(mo), 1, tzinfo=dt.timezone.utc)
+    except (ValueError, IndexError):
+        return None
+
+
+def build_codex_daily_view(entries, *, now_utc, tz_name=None):
+    """Build a ``CodexDailyView`` from a list of ``CodexEntry`` (issue #58).
+
+    Delegates bucketing to ``_aggregate_codex_daily`` (LiteLLM-snapshot
+    pricing + Codex token semantics — see CLAUDE.md "Codex (OpenAI)
+    parity" gotcha block). ``tz_name`` plumbs through verbatim
+    (None → host-local fallback inside the aggregator).
+    """
+    _agg = _load_lib("_lib_aggregators")
+    buckets = _agg._aggregate_codex_daily(entries, tz_name=tz_name)
+    total_cost, total_tok = _codex_bucket_totals(buckets)
+    return CodexDailyView(
+        rows=tuple(buckets),
+        total_cost_usd=total_cost,
+        total_tokens=total_tok,
+        period_start=_codex_period_start_from_date_bucket(buckets),
+        period_end=now_utc,
+        display_tz_label=_codex_tz_label(tz_name),
+    )
+
+
+def build_codex_monthly_view(entries, *, now_utc, tz_name=None):
+    """Build a ``CodexMonthlyView`` from a list of ``CodexEntry`` (issue #58).
+
+    Same wrap-the-kernel posture as ``build_codex_daily_view``; bucket
+    key is ``YYYY-MM`` so ``period_start`` resolves to the 1st of the
+    earliest visible month at UTC midnight.
+    """
+    _agg = _load_lib("_lib_aggregators")
+    buckets = _agg._aggregate_codex_monthly(entries, tz_name=tz_name)
+    total_cost, total_tok = _codex_bucket_totals(buckets)
+    return CodexMonthlyView(
+        rows=tuple(buckets),
+        total_cost_usd=total_cost,
+        total_tokens=total_tok,
+        period_start=_codex_period_start_from_month_bucket(buckets),
+        period_end=now_utc,
+        display_tz_label=_codex_tz_label(tz_name),
+    )
+
+
+def build_codex_weekly_view(entries, *, now_utc, tz_name=None,
+                            week_start_idx=0):
+    """Build a ``CodexWeeklyView`` from a list of ``CodexEntry`` (issue #58).
+
+    ``week_start_idx`` is the resolved Mon=0..Sun=6 index the caller
+    pulls from config via ``get_week_start_name`` + ``WEEKDAY_MAP``.
+    Bucket key is the ISO date of the week's first day in the display
+    timezone (matches ``_aggregate_codex_weekly`` contract).
+    """
+    _agg = _load_lib("_lib_aggregators")
+    buckets = _agg._aggregate_codex_weekly(entries, tz_name, week_start_idx)
+    total_cost, total_tok = _codex_bucket_totals(buckets)
+    return CodexWeeklyView(
+        rows=tuple(buckets),
+        total_cost_usd=total_cost,
+        total_tokens=total_tok,
+        period_start=_codex_period_start_from_date_bucket(buckets),
+        period_end=now_utc,
+        display_tz_label=_codex_tz_label(tz_name),
+    )
+
+
+def build_codex_session_view(entries, *, now_utc, tz_name=None):
+    """Build a ``CodexSessionView`` from a list of ``CodexEntry`` (issue #58).
+
+    ``rows`` order mirrors the aggregator: descending by
+    ``last_activity`` (upstream parity).
+    ``cmd_codex_session`` reverses to ASC when ``--order asc``.
+
+    ``period_start`` is set to ``min(s.last_activity)`` across emitted
+    sessions when any exist — best-available approximation since
+    ``CodexSessionUsage`` doesn't carry a ``first_activity`` field (the
+    aggregator only tracks ``last`` per session). ``None`` on empty.
+    """
+    _agg = _load_lib("_lib_aggregators")
+    sessions = _agg._aggregate_codex_sessions(entries)
+    total_cost = 0.0
+    total_tok = 0
+    earliest = None
+    for s in sessions:
+        total_cost += s.cost_usd
+        total_tok += s.total_tokens
+        if earliest is None or s.last_activity < earliest:
+            earliest = s.last_activity
+    return CodexSessionView(
+        rows=tuple(sessions),
+        total_sessions=len(sessions),
+        total_cost_usd=total_cost,
+        total_tokens=total_tok,
+        period_start=earliest,
+        period_end=now_utc,
+        display_tz_label=_codex_tz_label(tz_name),
     )

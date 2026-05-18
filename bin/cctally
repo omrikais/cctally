@@ -364,6 +364,14 @@ build_blocks_view = _lib_view_models.build_blocks_view
 build_blocks_view_from_table_rows = _lib_view_models.build_blocks_view_from_table_rows
 ForecastView = _lib_view_models.ForecastView
 build_forecast_view = _lib_view_models.build_forecast_view
+CodexDailyView = _lib_view_models.CodexDailyView
+build_codex_daily_view = _lib_view_models.build_codex_daily_view
+CodexMonthlyView = _lib_view_models.CodexMonthlyView
+build_codex_monthly_view = _lib_view_models.build_codex_monthly_view
+CodexWeeklyView = _lib_view_models.CodexWeeklyView
+build_codex_weekly_view = _lib_view_models.build_codex_weekly_view
+CodexSessionView = _lib_view_models.CodexSessionView
+build_codex_session_view = _lib_view_models.build_codex_session_view
 
 _lib_render = _load_sibling("_lib_render")
 _CODEX_MONTHS = _lib_render._CODEX_MONTHS
@@ -5552,7 +5560,14 @@ def cmd_codex_daily(args: argparse.Namespace) -> int:
     range_start, range_end = range
 
     entries = get_codex_entries(range_start, range_end)
-    days = _aggregate_codex_daily(entries, tz_name=tz_name)
+    # Route through ``build_codex_daily_view`` (issue #58). The View
+    # wraps ``_aggregate_codex_daily`` without changing it — preserves
+    # LiteLLM token semantics, intentional dedup vs upstream, and
+    # ``CODEX_LEGACY_FALLBACK_MODEL`` warning end-to-end.
+    view = build_codex_daily_view(
+        entries, now_utc=_command_as_of(), tz_name=tz_name,
+    )
+    days = list(view.rows)                  # asc — matches aggregator default
     if args.order == "desc":
         days = list(reversed(days))
 
@@ -5574,7 +5589,7 @@ def cmd_codex_daily(args: argparse.Namespace) -> int:
         y, m, d = bucket.split("-")
         return f"{_CODEX_MONTHS[int(m) - 1]} {int(d):02d},\n{y}"
 
-    tz_label = tz_name or _local_tz_name()
+    tz_label = view.display_tz_label
     title = f"Codex Token Usage Report - Daily (Timezone: {tz_label})"
     print(_render_codex_bucket_table(
         days,
@@ -5604,7 +5619,11 @@ def cmd_codex_monthly(args: argparse.Namespace) -> int:
     range_start, range_end = range
 
     entries = get_codex_entries(range_start, range_end)
-    months = _aggregate_codex_monthly(entries, tz_name=tz_name)
+    # Route through ``build_codex_monthly_view`` (issue #58).
+    view = build_codex_monthly_view(
+        entries, now_utc=_command_as_of(), tz_name=tz_name,
+    )
+    months = list(view.rows)
     if args.order == "desc":
         months = list(reversed(months))
 
@@ -5626,7 +5645,7 @@ def cmd_codex_monthly(args: argparse.Namespace) -> int:
         y, m = bucket.split("-")
         return f"{_CODEX_MONTHS[int(m) - 1]}\n{y}"
 
-    tz_label = tz_name or _local_tz_name()
+    tz_label = view.display_tz_label
     title = f"Codex Token Usage Report - Monthly (Timezone: {tz_label})"
     print(_render_codex_bucket_table(
         months,
@@ -5659,7 +5678,12 @@ def cmd_codex_weekly(args: argparse.Namespace) -> int:
     week_start_idx = WEEKDAY_MAP[week_start_name]
 
     entries = get_codex_entries(range_start, range_end)
-    weeks = _aggregate_codex_weekly(entries, tz_name, week_start_idx)
+    # Route through ``build_codex_weekly_view`` (issue #58).
+    view = build_codex_weekly_view(
+        entries, now_utc=now_utc, tz_name=tz_name,
+        week_start_idx=week_start_idx,
+    )
+    weeks = list(view.rows)
     if args.order == "desc":
         weeks = list(reversed(weeks))
 
@@ -5684,7 +5708,7 @@ def cmd_codex_weekly(args: argparse.Namespace) -> int:
         y, m, d = bucket.split("-")
         return f"{_CODEX_MONTHS[int(m) - 1]} {int(d):02d},\n{y}"
 
-    tz_label = tz_name or _local_tz_name()
+    tz_label = view.display_tz_label
     title = f"Codex Token Usage Report - Weekly (Timezone: {tz_label})"
     print(_render_codex_bucket_table(
         weeks,
@@ -5714,8 +5738,13 @@ def cmd_codex_session(args: argparse.Namespace) -> int:
     range_start, range_end = range
 
     entries = get_codex_entries(range_start, range_end)
-    sessions = _aggregate_codex_sessions(entries)
-    # Aggregator returns descending by last_activity; --order asc reverses.
+    # Route through ``build_codex_session_view`` (issue #58). View rows
+    # come descending by last_activity (aggregator default + upstream
+    # parity); --order asc reverses.
+    view = build_codex_session_view(
+        entries, now_utc=_command_as_of(), tz_name=tz_name,
+    )
+    sessions = list(view.rows)
     if args.order == "asc":
         sessions = list(reversed(sessions))
 
@@ -5729,7 +5758,7 @@ def cmd_codex_session(args: argparse.Namespace) -> int:
         print(_codex_sessions_to_json(sessions))
         return 0
 
-    tz_label = tz_name or _local_tz_name()
+    tz_label = view.display_tz_label
     # Upstream uses "Sessions" (plural) in the session banner title.
     title = f"Codex Token Usage Report - Sessions (Timezone: {tz_label})"
     print(_render_codex_session_table(
