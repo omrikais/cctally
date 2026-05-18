@@ -665,6 +665,16 @@ class TrendView:
     dashboard envelope adapter emits it as ``trend.avg_dollars_per_pct``
     so the React layer doesn't re-derive.
 
+    ``median_dpp_non_current_4w`` is the median of the last 4 non-current
+    ``dollars_per_percent`` values (``None`` when fewer than 4 valid
+    samples). Matches the rule TrendModal.tsx's ``median4NonCurrent``
+    helper used to compute client-side; pre-computed on the View so
+    the dashboard envelope can surface it as
+    ``trend.history_median_dpp`` (issue #59). The 8-row panel call also
+    populates the field — but the dashboard envelope only surfaces the
+    12-row history's median (panel modal vs panel-wide are different
+    summaries).
+
     Row ordering matches ``cmd_report`` / ``_tui_build_trend``:
     chronological (oldest first), suitable for the TUI sparkline left-
     to-right walk + cmd_report's `--json` trend list (which is then
@@ -672,6 +682,7 @@ class TrendView:
     """
     rows: "tuple[TuiTrendRow, ...]" = ()        # oldest-first
     avg_dollars_per_pct: "float | None" = None
+    median_dpp_non_current_4w: "float | None" = None
     period_start: "dt.datetime | None" = None
     period_end: "dt.datetime | None" = None
     display_tz_label: str = ""
@@ -905,9 +916,31 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None):
                   if r.dollars_per_percent is not None]
     avg = (sum(valid_dpps) / len(valid_dpps)) if len(valid_dpps) >= 3 else None
 
+    # Issue #59 — pre-compute the 4-week-median-non-current dpp scalar
+    # the dashboard's Trend modal hero KV displays. Rule mirrors
+    # ``TrendModal.tsx::median4NonCurrent`` byte-for-byte:
+    #   * drop the row at ``is_current==True`` (a single row at most)
+    #   * keep only non-None / finite dpp values
+    #   * take the LAST 4 (chronological-last, since ``rows`` is
+    #     oldest-first); sort ascending; return the average of the
+    #     middle two indices ``[1] + [2]) / 2``.
+    # Returns ``None`` when fewer than 4 non-current valid samples
+    # remain (matches the modal's empty-state). The 8-row panel call
+    # populates this too — harmless because the envelope only surfaces
+    # the 12-row history's value.
+    non_cur_dpps = [r.dollars_per_percent for r in rows
+                    if not r.is_current
+                    and r.dollars_per_percent is not None]
+    if len(non_cur_dpps) >= 4:
+        last4 = sorted(non_cur_dpps[-4:])
+        median_dpp_4w = (last4[1] + last4[2]) / 2
+    else:
+        median_dpp_4w = None
+
     return TrendView(
         rows=tuple(rows),
         avg_dollars_per_pct=avg,
+        median_dpp_non_current_4w=median_dpp_4w,
         period_start=None,
         period_end=now_utc,
         display_tz_label=_display_tz_label(display_tz),

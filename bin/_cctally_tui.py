@@ -1043,6 +1043,16 @@ class DataSnapshot:
     blocks_total_cost_usd: float = 0.0
     blocks_total_tokens: int = 0
     trend_avg_dollars_per_pct: float | None = None
+    # Trend modal median (issue #59). Sourced from
+    # ``build_trend_view``'s ``median_dpp_non_current_4w`` field — the
+    # last-4-non-current dpp median TrendModal.tsx used to compute
+    # client-side. Populated by the sync thread off the 12-row history
+    # build (NOT the 8-row panel build); the dashboard envelope adapter
+    # emits this as ``trend.history_median_dpp``. ``None`` for fixture
+    # modules that construct ``DataSnapshot`` positionally without
+    # going through ``_tui_build_snapshot``; the React modal keeps a
+    # client-side fallback for that case.
+    trend_history_median_dpp: float | None = None
     # Forecast domain (issue #57). ``ForecastView`` wraps
     # ``ForecastOutput`` and surfaces the per-method projection /
     # verdict / header-routing / budget fields the dashboard envelope
@@ -1498,9 +1508,46 @@ def _tui_build_weekly_history(
     than parameterising the call site keeps the snapshot fields
     semantically distinct (panel data vs. modal data) and avoids
     accidental cross-contamination.
+
+    Issue #59: list-returning shim kept for back-compat with the
+    public re-export at ``bin/cctally:13871``. New callers (the sync
+    thread populating ``snap.weekly_history`` + the modal-median
+    scalar) should prefer ``_tui_build_weekly_history_view`` so they
+    pick up the pre-computed ``median_dpp_non_current_4w`` scalar
+    without re-deriving.
     """
-    return _tui_build_trend(
-        conn, now_utc, skip_sync=skip_sync, count=count, display_tz=display_tz,
+    return list(
+        _tui_build_weekly_history_view(
+            conn, now_utc, skip_sync=skip_sync, count=count,
+            display_tz=display_tz,
+        ).rows
+    )
+
+
+def _tui_build_weekly_history_view(
+    conn: sqlite3.Connection,
+    now_utc: dt.datetime,
+    *,
+    skip_sync: bool = False,                # noqa: ARG001 — unused today, kept for API symmetry
+    count: int = 12,
+    display_tz: "ZoneInfo | None" = None,
+):
+    """Build the full ``TrendView`` for the dashboard Trend modal
+    (issue #59).
+
+    Wraps ``build_trend_view`` with the 12-row default the modal
+    consumes. The returned ``TrendView`` carries the
+    ``median_dpp_non_current_4w`` pre-computed scalar so the sync
+    thread can populate ``DataSnapshot.trend_history_median_dpp``
+    without re-running the median derivation client-side. The 8-row
+    panel call (``_tui_build_trend``) goes through the same
+    ``build_trend_view`` kernel; both builds carry their own median
+    field but only the 12-row build's value reaches the envelope
+    (``trend.history_median_dpp``).
+    """
+    c = _cctally()
+    return c.build_trend_view(
+        conn, now_utc=now_utc, n=max(1, count), display_tz=display_tz,
     )
 
 
@@ -1719,10 +1766,19 @@ def _tui_build_snapshot(
                 milestones = _tui_build_percent_milestones(conn)
         except Exception as exc:
             errors.append(f"milestones: {exc}")
+        history: list = []
+        history_median_dpp: "float | None" = None
         try:
-            history = _tui_build_weekly_history(
+            # Issue #59: build the full TrendView so we capture the
+            # pre-computed 4-week-median-non-current scalar alongside
+            # the row list; the dashboard envelope adapter surfaces
+            # the scalar as ``trend.history_median_dpp`` so
+            # TrendModal.tsx stops re-deriving it client-side.
+            history_view = _tui_build_weekly_history_view(
                 conn, now_utc, skip_sync=skip_sync, display_tz=_build_display_tz,
             )
+            history = list(history_view.rows)
+            history_median_dpp = history_view.median_dpp_non_current_4w
         except Exception as exc:
             errors.append(f"weekly-history: {exc}")
         # ---- v2.1 additions: dashboard Weekly / Monthly panels ----
@@ -1865,6 +1921,7 @@ def _tui_build_snapshot(
             blocks_total_cost_usd=blocks_total_cost_usd,
             blocks_total_tokens=blocks_total_tokens,
             trend_avg_dollars_per_pct=trend_avg_dpp,
+            trend_history_median_dpp=history_median_dpp,
             forecast_view=fc_view,
         )
     finally:

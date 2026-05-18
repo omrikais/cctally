@@ -164,6 +164,7 @@
         "used_pct": 12.0
       }
     ],
+    "history_median_dpp": null,
     "spark_heights": [
       1
     ],

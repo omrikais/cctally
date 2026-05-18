@@ -3157,11 +3157,20 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                     for w in (snap.weekly_history or [])
                 ],
                 # View-model unification (Bundle 1; spec §6.6): the
-                # pre-computed 3-sample $/% mean. TrendPanel can stop
-                # re-deriving the panel-average; TrendModal's median
-                # over trend.history is out of scope for this refactor
-                # (separate dataset, separate follow-up).
+                # pre-computed 3-sample $/% mean. TrendPanel reads this
+                # instead of re-deriving the panel-average.
                 "avg_dollars_per_pct": snap.trend_avg_dollars_per_pct,
+                # Issue #59 follow-up: pre-computed 4-week-median of
+                # non-current ``dollars_per_percent`` over the 12-row
+                # history. TrendModal.tsx's ``median4NonCurrent`` helper
+                # used to compute this client-side; pre-computing on
+                # ``build_trend_view`` keeps the rule
+                # (``sort(last 4 non-current dpps)``, midpoint
+                # ``(s[1]+s[2])/2``) in one place. ``None`` when fewer
+                # than 4 valid non-current samples — modal's client-side
+                # fallback handles the ``null`` case.
+                "history_median_dpp":
+                    getattr(snap, "trend_history_median_dpp", None),
             },
 
         "weekly":  weekly_env,

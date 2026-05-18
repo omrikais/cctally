@@ -220,8 +220,14 @@ export interface TrendEnvelope {
   history: TrendRow[];         // up to 12 rows — modal
   // ---- view-model unification additive scalar (Bundle 1) ----
   // 3-sample $/% mean over `weeks`. Null when fewer than 3 valid samples.
-  // TrendModal's median over `history` stays unaffected (out of scope).
   avg_dollars_per_pct?: number | null;
+  // ---- issue #59: TrendModal's 4-week-median-non-current scalar ----
+  // Pre-computed in `build_trend_view` (sort the last 4 non-current
+  // `dollar_per_pct` values, take the midpoint `(s[1]+s[2])/2`).
+  // Null when fewer than 4 valid non-current samples. TrendModal.tsx
+  // keeps a client-side fallback for envelopes that omit the field
+  // (additive contract).
+  history_median_dpp?: number | null;
 }
 
 export interface TrendRow {

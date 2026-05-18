@@ -16,7 +16,17 @@ function findCurrentIndex(rows: TrendChartDatum[]): number {
   return i >= 0 ? i : rows.length - 1;
 }
 
-function median4NonCurrent(rows: TrendChartDatum[], curIdx: number): number | null {
+// Issue #59 client-side fallback for envelopes that omit
+// `trend.history_median_dpp` (pre-v1.9 envelopes / fixture snapshots).
+// Rule mirrors `build_trend_view`'s pre-computed
+// `median_dpp_non_current_4w`: drop the current row, keep
+// non-null/finite dpp values, sort the last 4 ascending, take the
+// midpoint `(s[1]+s[2])/2`. Returns null when fewer than 4 valid
+// samples remain.
+function median4NonCurrentFallback(
+  rows: TrendChartDatum[],
+  curIdx: number,
+): number | null {
   const nonCur = rows
     .filter((_, i) => i !== curIdx)
     .map((r) => r.dollar_per_pct)
@@ -261,7 +271,16 @@ export function TrendModal() {
 
   const curIdx = findCurrentIndex(rows);
   const cur = rows[curIdx];
-  const med = median4NonCurrent(rows, curIdx);
+  // Issue #59: prefer the envelope's pre-computed median
+  // (`trend.history_median_dpp`) so the rule lives in one place
+  // (Python's `build_trend_view`). Falls back to the client-side
+  // implementation when the field is missing — fixture snapshots and
+  // pre-v1.9 envelopes don't carry it.
+  const envMedian = env?.trend?.history_median_dpp;
+  const med =
+    envMedian != null && isFinite(envMedian)
+      ? envMedian
+      : median4NonCurrentFallback(rows, curIdx);
   const delta =
     cur && cur.dollar_per_pct != null && med != null ? cur.dollar_per_pct - med : null;
   const dkv = deltaKv(delta);
