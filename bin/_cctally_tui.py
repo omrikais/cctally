@@ -2322,6 +2322,16 @@ class _TuiSyncThread:
                 self._ref.set(snap)
             except Exception as exc:
                 # Don't crash the thread on unexpected errors — surface in UI.
+                # Carry every additive view-model scalar through verbatim so
+                # the prior frame's panel rows and their envelope totals stay
+                # consistent. Bundle 1 / #56 / #57 / #59 each added envelope
+                # scalars the React panels now trust over a client-side
+                # ``rows.reduce``; without preserving them here, a sync crash
+                # leaves populated rows next to a ``$0.00`` footer (the
+                # dataclass defaults kick in for any field not explicitly
+                # passed). The structural-equality invariant
+                # ``total === sum(visible rows).cost_usd`` must survive a
+                # crash recovery, not just the happy path.
                 prev = self._ref.get()
                 self._ref.set(DataSnapshot(
                     current_week=prev.current_week,
@@ -2337,6 +2347,17 @@ class _TuiSyncThread:
                     monthly_periods=prev.monthly_periods,
                     blocks_panel=prev.blocks_panel,
                     daily_panel=prev.daily_panel,
+                    daily_total_cost_usd=prev.daily_total_cost_usd,
+                    daily_total_tokens=prev.daily_total_tokens,
+                    monthly_total_cost_usd=prev.monthly_total_cost_usd,
+                    monthly_total_tokens=prev.monthly_total_tokens,
+                    weekly_total_cost_usd=prev.weekly_total_cost_usd,
+                    weekly_total_tokens=prev.weekly_total_tokens,
+                    blocks_total_cost_usd=prev.blocks_total_cost_usd,
+                    blocks_total_tokens=prev.blocks_total_tokens,
+                    trend_avg_dollars_per_pct=prev.trend_avg_dollars_per_pct,
+                    trend_history_median_dpp=prev.trend_history_median_dpp,
+                    forecast_view=prev.forecast_view,
                 ))
             # Wait up to interval, or until forced.
             for _ in range(int(max(1, self._interval * 10))):

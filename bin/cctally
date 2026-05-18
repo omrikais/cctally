@@ -5035,6 +5035,13 @@ def cmd_blocks(args: argparse.Namespace) -> int:
     # (gaps included, oldest-first) — same shape the JSON / table
     # renderers expect. We materialize back to a list because
     # ``_maybe_swap_active_block_to_canonical`` mutates in-place.
+    #
+    # ``skip_rows=True`` (issue #60 review fix) opts out of the
+    # dashboard-row construction inside ``build_blocks_view`` — the
+    # per-block per-model enrichment that scans every entry per
+    # non-gap block (O(B × N)). The CLI never reads ``view.rows``
+    # (only ``view.aggregated`` here), so on large all-history blocks
+    # runs we avoid quadratic-ish work we'd discard.
     view = build_blocks_view(
         all_entries,
         now_utc=now_utc,
@@ -5044,6 +5051,7 @@ def cmd_blocks(args: argparse.Namespace) -> int:
         range_end=range_end,
         display_tz=tz,
         mode="auto",
+        skip_rows=True,
     )
     blocks = list(view.aggregated)
 

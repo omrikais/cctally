@@ -919,18 +919,32 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None):
     # Issue #59 — pre-compute the 4-week-median-non-current dpp scalar
     # the dashboard's Trend modal hero KV displays. Rule mirrors
     # ``TrendModal.tsx::median4NonCurrent`` byte-for-byte:
-    #   * drop the row at ``is_current==True`` (a single row at most)
-    #   * keep only non-None / finite dpp values
-    #   * take the LAST 4 (chronological-last, since ``rows`` is
-    #     oldest-first); sort ascending; return the average of the
-    #     middle two indices ``[1] + [2]) / 2``.
+    #   * Drop EXACTLY ONE row by index — the same row
+    #     ``findCurrentIndex`` would pick: the FIRST ``is_current``
+    #     row, or ``rows.length - 1`` (the last row) when no row is
+    #     marked current. This matters when (a) the Bug D credited-
+    #     week split emits two rows with the same ``current_key``
+    #     (both ``is_current=True``; we drop only the first) and (b)
+    #     cost-only histories with no usage snapshot have every row
+    #     ``is_current=False`` (we still drop the last row).
+    #   * Keep only non-None / finite dpp values.
+    #   * Take the LAST 4 (chronological-last, since ``rows`` is
+    #     oldest-first); sort ascending; return the midpoint
+    #     ``(s[1] + s[2]) / 2``.
     # Returns ``None`` when fewer than 4 non-current valid samples
     # remain (matches the modal's empty-state). The 8-row panel call
     # populates this too — harmless because the envelope only surfaces
     # the 12-row history's value.
-    non_cur_dpps = [r.dollars_per_percent for r in rows
-                    if not r.is_current
-                    and r.dollars_per_percent is not None]
+    if rows:
+        cur_idx = next(
+            (i for i, r in enumerate(rows) if r.is_current),
+            len(rows) - 1,
+        )
+    else:
+        cur_idx = -1
+    non_cur_dpps = [r.dollars_per_percent
+                    for i, r in enumerate(rows)
+                    if i != cur_idx and r.dollars_per_percent is not None]
     if len(non_cur_dpps) >= 4:
         last4 = sorted(non_cur_dpps[-4:])
         median_dpp_4w = (last4[1] + last4[2]) / 2
@@ -1116,6 +1130,7 @@ def build_blocks_view(
     range_end=None,
     display_tz=None,
     mode="auto",
+    skip_rows: bool = False,
 ):
     """Build a ``BlocksView`` from raw ``UsageEntry`` list (heuristic-
     aware path; spec §6 blocks follow-up).
@@ -1138,6 +1153,15 @@ def build_blocks_view(
     ``range_start`` / ``range_end`` override the period metadata when
     provided (the CLI ``cmd_blocks`` --since/--until path passes them
     explicitly; the dashboard path passes the week window).
+
+    ``skip_rows=True`` skips the dashboard-row construction loop
+    entirely — leaves ``view.rows = ()`` while still populating
+    ``aggregated`` + totals. The per-block per-model enrichment scans
+    every entry for every non-gap block (O(B × N)); the CLI
+    ``cmd_blocks`` reads only ``view.aggregated`` and discards rows,
+    so it opts in to skip that work on large histories. Dashboard /
+    share callers leave the default (``False``) to keep their
+    consumers fed.
     """
     _lib_blocks = _load_lib("_lib_blocks")
     _lib_pricing = _load_lib("_lib_pricing")
@@ -1156,38 +1180,39 @@ def build_blocks_view(
         for b in blocks:
             if b.is_gap:
                 continue
-            # Per-block per-model breakdown for the dashboard row.
-            # Mirrors `_dashboard_build_blocks_panel`'s historical
-            # inline body — re-aggregates entries inside the block
-            # interval through the single pricing chokepoint so per-
-            # model costs reconcile exactly with `b.cost_usd`.
-            per_model: dict[str, float] = {}
-            for e in entries:
-                if b.start_time <= e.timestamp < b.end_time:
-                    cost = _lib_pricing._calculate_entry_cost(
-                        e.model, e.usage, mode=mode, cost_usd=e.cost_usd,
+            if not skip_rows:
+                # Per-block per-model breakdown for the dashboard row.
+                # Mirrors `_dashboard_build_blocks_panel`'s historical
+                # inline body — re-aggregates entries inside the block
+                # interval through the single pricing chokepoint so per-
+                # model costs reconcile exactly with `b.cost_usd`.
+                per_model: dict[str, float] = {}
+                for e in entries:
+                    if b.start_time <= e.timestamp < b.end_time:
+                        cost = _lib_pricing._calculate_entry_cost(
+                            e.model, e.usage, mode=mode, cost_usd=e.cost_usd,
+                        )
+                        per_model[e.model] = per_model.get(e.model, 0.0) + cost
+                model_breakdowns = [
+                    {"modelName": name, "cost": cost}
+                    for name, cost in sorted(
+                        per_model.items(), key=lambda kv: -kv[1],
                     )
-                    per_model[e.model] = per_model.get(e.model, 0.0) + cost
-            model_breakdowns = [
-                {"modelName": name, "cost": cost}
-                for name, cost in sorted(
-                    per_model.items(), key=lambda kv: -kv[1],
+                ]
+                local_label = c.format_display_dt(
+                    b.start_time, display_tz, fmt="%H:%M %b %d", suffix=True,
                 )
-            ]
-            local_label = c.format_display_dt(
-                b.start_time, display_tz, fmt="%H:%M %b %d", suffix=True,
-            )
-            rows.append(BlocksPanelRow(
-                start_at=b.start_time.astimezone(dt.timezone.utc).isoformat(),
-                end_at=b.end_time.astimezone(dt.timezone.utc).isoformat(),
-                anchor=b.anchor,
-                is_active=bool(b.is_active and b.entries_count > 0),
-                cost_usd=b.cost_usd,
-                models=_model_breakdowns_to_models_late(
-                    model_breakdowns, b.cost_usd,
-                ),
-                label=local_label,
-            ))
+                rows.append(BlocksPanelRow(
+                    start_at=b.start_time.astimezone(dt.timezone.utc).isoformat(),
+                    end_at=b.end_time.astimezone(dt.timezone.utc).isoformat(),
+                    anchor=b.anchor,
+                    is_active=bool(b.is_active and b.entries_count > 0),
+                    cost_usd=b.cost_usd,
+                    models=_model_breakdowns_to_models_late(
+                        model_breakdowns, b.cost_usd,
+                    ),
+                    label=local_label,
+                ))
             total_cost += b.cost_usd
             total_tok += b.total_tokens
     rows.sort(key=lambda r: r.start_at, reverse=True)
