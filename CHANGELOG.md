@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-05-18
+
 ### Fixed
 - `cctally five-hour-blocks` and `cctally five-hour-breakdown`: rows annotated with the `⚡` credit marker no longer push the table's right border one cell to the right of non-credit rows. `_boxed_table` was computing column widths via `len()` and padding via `str.ljust` / `str.rjust`, both of which count Unicode codepoints; `⚡` (U+26A1, `unicodedata.east_asian_width == "W"`) is one codepoint but renders two terminal cells, so the credit-prefixed Block Start cell (and the `⚡ CREDIT` divider row in the breakdown's Threshold column) under-padded by one cell and the right border drifted off-column on those rows only. New module-level `_display_width()` helper counts terminal cells (Wide/Fullwidth → 2, combining marks → 0, else 1) and `_boxed_table` now uses it for both width-max and padding. Byte-identical on the common case — any cell with no East Asian Wide / Fullwidth glyph renders unchanged, so existing pytest + cctally-test-all goldens stay green (1124 pytest + 1004 harness scenarios). Regressions: `tests/test_boxed_table_display_width.py` (⚡ in first column, ⚡ in inner column, ASCII no-op invariance).
 
