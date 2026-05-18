@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-05-18
+
 ### Added
 - dashboard envelope: new `blocks.total_cost_usd` and `blocks.total_tokens` fields exposed alongside `blocks.rows[]` so `BlocksPanel` reads the footer total from the envelope instead of running `rows.reduce((acc, r) => acc + r.cost_usd, 0)` in JS. Additive — pre-#56 envelopes without the fields fall back to `?? 0` so first-paint stays stable. Sourced from the new `BlocksView.total_cost_usd` / `total_tokens` view-model fields populated by `build_blocks_view` at sync-thread time.
 
