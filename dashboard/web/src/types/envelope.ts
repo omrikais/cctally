@@ -334,6 +334,9 @@ export interface BlocksPanelRow {
 
 export interface BlocksEnvelope {
   rows: BlocksPanelRow[];
+  // ---- view-model unification additive scalars (issue #56) ----
+  total_cost_usd?: number;
+  total_tokens?:   number;
 }
 
 // /api/block/:start_at response — consumed by BlockModal.

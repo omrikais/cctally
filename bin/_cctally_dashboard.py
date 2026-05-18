@@ -2138,20 +2138,31 @@ def _build_block_detail(block: "Block",
     }
 
 
-def _dashboard_build_blocks_panel(conn: "sqlite3.Connection",
-                                   now_utc: "dt.datetime",
-                                   *,
-                                   week_start_at: "dt.datetime",
-                                   week_end_at: "dt.datetime",
-                                   skip_sync: bool = False,
-                                   display_tz: "ZoneInfo | None" = None) -> "list[BlocksPanelRow]":
-    """Activity blocks (`is_gap=False`) inside ``[week_start_at, week_end_at)``,
-    newest-first.
+def _dashboard_build_blocks_view(conn: "sqlite3.Connection",
+                                  now_utc: "dt.datetime",
+                                  *,
+                                  week_start_at: "dt.datetime",
+                                  week_end_at: "dt.datetime",
+                                  skip_sync: bool = False,
+                                  display_tz: "ZoneInfo | None" = None):
+    """Build a ``BlocksView`` for the dashboard Blocks panel window
+    ``[week_start_at, week_end_at)`` (issue #56).
 
-    Mirrors the recorded-windows-widening trick used by ``cmd_blocks``: loads
-    recorded reset windows from ``[start - BLOCK_DURATION, end + BLOCK_DURATION]``
-    so a recorded reset just outside the visible window can still anchor
-    blocks inside it.
+    Two-layer composition (mirrors `_dashboard_build_daily_panel`'s
+    pattern):
+
+    1. ``build_blocks_view`` (in ``bin/_lib_view_models.py``) is the
+       data plane — `_group_entries_into_blocks` plus per-block model
+       enrichment plus totals derivation.
+    2. This function is the presentation adapter — owns the
+       recorded-windows-widening trick (loads reset windows from
+       ``[start - BLOCK_DURATION, end + BLOCK_DURATION]`` so a recorded
+       reset just outside the visible window can still anchor blocks
+       inside it) and the strict-window entry filter.
+
+    Returning the full ``BlocksView`` (rows + totals) lets the sync
+    thread populate ``DataSnapshot.blocks_total_cost_usd`` /
+    ``blocks_total_tokens`` for the envelope without a second pass.
     """
     # Widen the entry window slightly so a recorded-reset window straddling
     # the boundary still picks up its entries.
@@ -2163,52 +2174,42 @@ def _dashboard_build_blocks_panel(conn: "sqlite3.Connection",
     recorded_windows, block_start_overrides = _load_recorded_five_hour_windows(
         fetch_start, fetch_end,
     )
-    blocks = _group_entries_into_blocks(
-        entries, mode="auto",
+    c = _cctally()
+    return c.build_blocks_view(
+        entries,
+        now_utc=now_utc,
         recorded_windows=recorded_windows,
         block_start_overrides=block_start_overrides,
-        now=now_utc,
+        range_start=week_start_at,
+        range_end=week_end_at,
+        display_tz=display_tz,
+        mode="auto",
     )
-    blocks = [b for b in blocks if not b.is_gap]
-    if not blocks:
-        return []
 
-    # Build per-block model-cost breakdown (matches _model_breakdowns_to_models
-    # input shape: dicts with `modelName` / `cost` keys, sorted desc by cost).
-    rows: list[BlocksPanelRow] = []
-    for b in blocks:
-        # Reaggregate the entries inside [b.start_time, b.end_time) for
-        # the model-split. _group_entries_into_blocks gives us total
-        # cost_usd per block but not per-model breakdown. Use
-        # `_calculate_entry_cost` (the single source-of-truth pricing
-        # path) so block per-model costs reconcile exactly with the
-        # block's own cost_usd.
-        per_model: dict[str, float] = {}
-        for e in entries:
-            if b.start_time <= e.timestamp < b.end_time:
-                cost = _calculate_entry_cost(
-                    e.model, e.usage, mode="auto", cost_usd=e.cost_usd,
-                )
-                per_model[e.model] = per_model.get(e.model, 0.0) + cost
-        model_breakdowns = [
-            {"modelName": name, "cost": cost}
-            for name, cost in sorted(per_model.items(), key=lambda kv: -kv[1])
-        ]
-        local_label = format_display_dt(
-            b.start_time, display_tz, fmt="%H:%M %b %d", suffix=True,
-        )
-        rows.append(BlocksPanelRow(
-            start_at=b.start_time.astimezone(dt.timezone.utc).isoformat(),
-            end_at=b.end_time.astimezone(dt.timezone.utc).isoformat(),
-            anchor=b.anchor,
-            is_active=bool(b.is_active and b.entries_count > 0),
-            cost_usd=b.cost_usd,
-            models=_model_breakdowns_to_models(model_breakdowns, b.cost_usd),
-            label=local_label,
-        ))
 
-    rows.sort(key=lambda r: r.start_at, reverse=True)
-    return rows
+def _dashboard_build_blocks_panel(conn: "sqlite3.Connection",
+                                   now_utc: "dt.datetime",
+                                   *,
+                                   week_start_at: "dt.datetime",
+                                   week_end_at: "dt.datetime",
+                                   skip_sync: bool = False,
+                                   display_tz: "ZoneInfo | None" = None) -> "list[BlocksPanelRow]":
+    """Activity blocks (`is_gap=False`) inside ``[week_start_at, week_end_at)``,
+    newest-first.
+
+    Thin presentation shim over ``_dashboard_build_blocks_view`` —
+    returns just ``view.rows`` so existing call sites (sync thread,
+    share-data override resolver, monkeypatch surfaces) keep their
+    ``list[BlocksPanelRow]`` contract.
+    """
+    view = _dashboard_build_blocks_view(
+        conn, now_utc,
+        week_start_at=week_start_at,
+        week_end_at=week_end_at,
+        skip_sync=skip_sync,
+        display_tz=display_tz,
+    )
+    return list(view.rows)
 
 
 def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
@@ -2877,7 +2878,18 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         "total_tokens":   snap.monthly_total_tokens,
     }
 
-    blocks_env = {"rows": [_blocks_row_to_dict(r) for r in snap.blocks_panel]}
+    blocks_env = {
+        "rows": [_blocks_row_to_dict(r) for r in snap.blocks_panel],
+        # View-model unification follow-up (issue #56): additive scalars
+        # so the React BlocksPanel can stop running `rows.reduce(...)`
+        # in JS. Cost is summed-over-visible-rows in
+        # `_dashboard_build_blocks_view` (same structural invariant as
+        # daily/weekly/monthly footers); ``total_tokens`` is sourced
+        # from the same view since ``BlocksPanelRow`` doesn't carry
+        # token columns and we don't want to widen that shape.
+        "total_cost_usd": snap.blocks_total_cost_usd,
+        "total_tokens":   snap.blocks_total_tokens,
+    }
 
     # Re-run helper to derive thresholds; mutates rows[*].intensity_bucket
     # (no-op for builder-constructed rows since values match cost_usd).

@@ -30,7 +30,9 @@
         ],
         "start_at": "2026-04-26T14:00:00+00:00"
       }
-    ]
+    ],
+    "total_cost_usd": 0.0,
+    "total_tokens": 0
   },
   "current_week": null,
   "daily": {

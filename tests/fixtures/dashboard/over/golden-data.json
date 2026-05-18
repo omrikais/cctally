@@ -241,7 +241,9 @@
         ],
         "start_at": "2026-04-13T17:00:00+00:00"
       }
-    ]
+    ],
+    "total_cost_usd": 47.48000000000001,
+    "total_tokens": 6588000
   },
   "current_week": {
     "dollar_per_pct": 0.4521904761904763,

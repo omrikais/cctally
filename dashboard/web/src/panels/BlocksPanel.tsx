@@ -67,7 +67,14 @@ export function BlocksPanel() {
   );
   const rows = env?.blocks?.rows ?? [];
   const maxCost = rows.length > 0 ? Math.max(...rows.map((r) => r.cost_usd), 0) : 0;
-  const total = rows.reduce((acc, r) => acc + r.cost_usd, 0);
+  // View-model unification follow-up (issue #56): footer total comes
+  // from the typed envelope scalar rather than re-summing rows in JS.
+  // The Python sync thread sums over the same visible rows via
+  // `BlocksView.total_cost_usd` so the invariant
+  // `total === sum(rows[*].cost_usd)` still holds structurally; the
+  // `?? 0` fallback covers pre-#56 first-paint envelopes that haven't
+  // populated the additive scalar yet.
+  const total = env?.blocks?.total_cost_usd ?? 0;
   const hasHeuristic = rows.some((r) => r.anchor === 'heuristic');
 
   // First-mount animation: paint .gauge-fill width:0, then rAF flips to

@@ -329,6 +329,10 @@ def _dashboard_build_blocks_panel(*args, **kwargs):
     return sys.modules["cctally"]._dashboard_build_blocks_panel(*args, **kwargs)
 
 
+def _dashboard_build_blocks_view(*args, **kwargs):
+    return sys.modules["cctally"]._dashboard_build_blocks_view(*args, **kwargs)
+
+
 def _dashboard_build_daily_panel(*args, **kwargs):
     return sys.modules["cctally"]._dashboard_build_daily_panel(*args, **kwargs)
 
@@ -822,27 +826,15 @@ from _lib_view_models import (  # noqa: E402
 )
 
 
-@dataclass
-class BlocksPanelRow:
-    """One row of the dashboard's Blocks panel.
-
-    Subset of the `Block` dataclass — drops token counts (panel is
-    cost-driven; tokens belong to a future modal), drops `entries_count`
-    / `is_gap` / `burn_rate` / `projection` (panel doesn't render them),
-    and pre-formats `label` server-side for the local-tz "HH:MM MMM DD"
-    display.
-    """
-    start_at: str          # ISO-8601 UTC
-    end_at: str            # ISO-8601 UTC, start_at + 5h
-    anchor: str            # 'recorded' | 'heuristic'
-    is_active: bool        # now_utc < end_at AND entries_count > 0
-    cost_usd: float
-    models: list[dict[str, Any]]   # ModelCostRow shape, sorted desc by cost
-    label: str             # "HH:MM MMM DD" in local tz, e.g. "14:00 Apr 26"
-
-
-# DailyPanelRow + TuiSessionRow moved to bin/_lib_view_models.py — re-export.
-from _lib_view_models import DailyPanelRow, TuiSessionRow  # noqa: E402
+# BlocksPanelRow + DailyPanelRow + TuiSessionRow moved to
+# bin/_lib_view_models.py — re-exported here so historical
+# ``from _cctally_tui import BlocksPanelRow`` (or ``ns["BlocksPanelRow"]``
+# direct-dict reads in tests) keep resolving.
+from _lib_view_models import (  # noqa: E402
+    BlocksPanelRow,
+    DailyPanelRow,
+    TuiSessionRow,
+)
 
 
 @dataclass
@@ -1043,6 +1035,13 @@ class DataSnapshot:
     monthly_total_tokens: int = 0
     weekly_total_cost_usd: float = 0.0
     weekly_total_tokens: int = 0
+    # Blocks domain (issue #56). ``BlocksPanelRow`` doesn't carry token
+    # columns, so the cost total alone preserves the structural
+    # ``total === sum(visible rows).cost_usd`` invariant; ``blocks_total_tokens``
+    # is sourced from the same ``BlocksView`` build so both scalars
+    # come from a single typed pass.
+    blocks_total_cost_usd: float = 0.0
+    blocks_total_tokens: int = 0
     trend_avg_dollars_per_pct: float | None = None
 
     @classmethod
@@ -1742,15 +1741,25 @@ def _tui_build_snapshot(
         except Exception as exc:
             errors.append(f"monthly-periods: {exc}")
         # ---- v2.2 additions: dashboard Blocks / Daily panels ----
+        # Issue #56: build the BlocksView once and read both rows
+        # (presentation) and totals (envelope scalars) from the same
+        # pass. ``_dashboard_build_blocks_view`` is the view-returning
+        # counterpart to ``_dashboard_build_blocks_panel`` (which is
+        # kept as a thin shim for monkeypatch surfaces).
+        blocks_total_cost_usd = 0.0
+        blocks_total_tokens = 0
         try:
             if cw is not None:
-                blocks_panel = _dashboard_build_blocks_panel(
+                _blocks_view = _dashboard_build_blocks_view(
                     conn, now_utc,
                     week_start_at=cw.week_start_at,
                     week_end_at=cw.week_end_at,
                     skip_sync=skip_sync,
                     display_tz=_build_display_tz,
                 )
+                blocks_panel = list(_blocks_view.rows)
+                blocks_total_cost_usd = _blocks_view.total_cost_usd
+                blocks_total_tokens = _blocks_view.total_tokens
         except Exception as exc:
             errors.append(f"blocks-panel: {exc}")
         # Sync-thread view-model totals (Bundle 1 / spec §6.6):
@@ -1818,6 +1827,8 @@ def _tui_build_snapshot(
             monthly_total_tokens=monthly_total_tokens,
             weekly_total_cost_usd=weekly_total_cost_usd,
             weekly_total_tokens=weekly_total_tokens,
+            blocks_total_cost_usd=blocks_total_cost_usd,
+            blocks_total_tokens=blocks_total_tokens,
             trend_avg_dollars_per_pct=trend_avg_dpp,
         )
     finally:

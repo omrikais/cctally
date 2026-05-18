@@ -12,7 +12,9 @@
     ]
   },
   "blocks": {
-    "rows": []
+    "rows": [],
+    "total_cost_usd": 0.0,
+    "total_tokens": 0
   },
   "current_week": null,
   "daily": {

@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- dashboard envelope: new `blocks.total_cost_usd` and `blocks.total_tokens` fields exposed alongside `blocks.rows[]` so `BlocksPanel` reads the footer total from the envelope instead of running `rows.reduce((acc, r) => acc + r.cost_usd, 0)` in JS. Additive — pre-#56 envelopes without the fields fall back to `?? 0` so first-paint stays stable. Sourced from the new `BlocksView.total_cost_usd` / `total_tokens` view-model fields populated by `build_blocks_view` at sync-thread time.
+
+### Changed
+- view-model kernel: extend `bin/_lib_view_models.py` with `BlocksView` and two builders — `build_blocks_view(entries, …)` for the heuristic-aware path (`cmd_blocks` + dashboard Blocks panel) and `build_blocks_view_from_table_rows(rows, …)` for the API-anchored path (`cmd_five_hour_blocks` + share snapshot). Both return the same `BlocksView` dataclass (`rows: tuple[BlocksPanelRow, …]` + `aggregated: tuple` + totals + period metadata). `cmd_blocks`, `_dashboard_build_blocks_panel`, and `_build_five_hour_blocks_snapshot` now all route through the kernel; `BlocksPanelRow` moves from `bin/_cctally_tui.py` to `bin/_lib_view_models.py` alongside the other panel row dataclasses (re-exported from `_cctally_tui` for back-compat). Reset-aware totals invariant preserved (API-anchored path reads `five_hour_blocks.total_cost_usd` straight from the table — not recomputed from `session_entries`). Closes #56.
+
 ## [1.8.1] - 2026-05-18
 
 ### Fixed

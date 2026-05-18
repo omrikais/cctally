@@ -28,6 +28,12 @@ Frozen ``*View`` dataclasses + builders:
 - ``TrendView`` + ``build_trend_view(conn, *, now_utc, n, display_tz)``
 - ``SessionsView`` + ``build_sessions_view(entries, *, now_utc, limit,
   display_tz)``
+- ``BlocksView`` + ``build_blocks_view(entries, *, now_utc,
+  recorded_windows, block_start_overrides, range_start, range_end,
+  display_tz, mode)`` — heuristic-aware (cmd_blocks + dashboard); and
+  ``build_blocks_view_from_table_rows(block_dicts, *, period_start,
+  period_end, display_tz)`` — API-anchored (cmd_five_hour_blocks
+  share). Issue #56.
 
 Each ``*View`` carries ``rows`` (typed row tuple) plus a parallel
 ``aggregated`` ``BucketUsage`` tuple where CLI byte-stable JSON requires
@@ -164,6 +170,29 @@ class MonthlyPeriodRow:
     delta_cost_pct: float | None
     is_current: bool
     models: list[dict[str, Any]]
+
+
+@dataclass
+class BlocksPanelRow:
+    """One row of the dashboard's Blocks panel.
+
+    Subset of the ``Block`` dataclass — drops token counts (panel is
+    cost-driven; tokens belong to a future modal), drops ``entries_count``
+    / ``is_gap`` / ``burn_rate`` / ``projection`` (panel doesn't render
+    them), and pre-formats ``label`` server-side for the local-tz
+    "HH:MM MMM DD" display.
+
+    Moved from ``bin/_cctally_tui.py`` alongside ``DailyPanelRow`` so
+    the BlocksView builder can construct rows without an import edge
+    back into the TUI module.
+    """
+    start_at: str          # ISO-8601 UTC
+    end_at: str            # ISO-8601 UTC, start_at + 5h
+    anchor: str            # 'recorded' | 'heuristic'
+    is_active: bool        # now_utc < end_at AND entries_count > 0
+    cost_usd: float
+    models: list[dict[str, Any]]   # ModelCostRow shape, sorted desc by cost
+    label: str             # "HH:MM MMM DD" in local tz, e.g. "14:00 Apr 26"
 
 
 @dataclass
@@ -989,5 +1018,203 @@ def build_sessions_view(entries, *, now_utc, limit=None, display_tz=None):
         total_cost_usd=total_cost,
         period_start=(now_utc - dt.timedelta(days=365)),
         period_end=now_utc,
+        display_tz_label=_display_tz_label(display_tz),
+    )
+
+
+# === BlocksView + build_blocks_view (Issue #56) ============================
+
+
+@dataclass(frozen=True)
+class BlocksView:
+    """Blocks domain view — covers two structurally distinct paths under
+    one dataclass.
+
+    1. **Heuristic-aware** (``cmd_blocks`` + dashboard Blocks panel):
+       built via ``build_blocks_view(entries, ...)``. Calls
+       ``_lib_blocks._group_entries_into_blocks`` and fills BOTH
+       ``rows`` (``tuple[BlocksPanelRow, ...]`` — non-gap, dashboard-
+       shape, newest-first) and ``aggregated`` (``tuple[Block, ...]``
+       — gaps included, CLI-shape, oldest-first per
+       ``_group_entries_into_blocks``'s contract). ``total_cost_usd``
+       / ``total_tokens`` are summed over non-gap blocks so the React
+       panel's footer ``total === sum(visible rows)`` invariant holds.
+
+    2. **API-anchored** (``cmd_five_hour_blocks`` + share snapshot):
+       built via ``build_blocks_view_from_table_rows(rows, ...)``.
+       Reads sqlite-Row-derived dicts from the ``five_hour_blocks``
+       TABLE; leaves ``rows`` empty (consumers read ``aggregated``
+       directly). Reset-aware (CLAUDE.md 5-hour gotcha block,
+       spec §3.2) — totals come from the table's per-block columns,
+       NOT recomputed from ``session_entries``.
+
+    Both builders return BlocksView; consumers branch on which field
+    they need. ``period_start`` / ``period_end`` carry time-window
+    bounds (used by the share path's ``PeriodSpec`` and by future
+    consumers that need a period label).
+    """
+    rows: "tuple[BlocksPanelRow, ...]" = ()
+    aggregated: tuple = ()                    # tuple[Block, ...] for heuristic; tuple[dict, ...] for API-anchored. Forward-ref kept untyped to avoid an import-time edge into _lib_blocks.
+    total_cost_usd: float = 0.0
+    total_tokens: int = 0
+    period_start: "dt.datetime | None" = None
+    period_end: "dt.datetime | None" = None
+    display_tz_label: str = ""
+
+
+def build_blocks_view(
+    entries,
+    *,
+    now_utc,
+    recorded_windows=None,
+    block_start_overrides=None,
+    range_start=None,
+    range_end=None,
+    display_tz=None,
+    mode="auto",
+):
+    """Build a ``BlocksView`` from raw ``UsageEntry`` list (heuristic-
+    aware path; spec §6 blocks follow-up).
+
+    ``aggregated`` carries the full Block list (gaps included), in
+    oldest-first order — consumed by ``cmd_blocks`` via
+    ``_blocks_to_json`` / ``_render_blocks_table``. ``rows`` carries
+    non-gap ``BlocksPanelRow`` entries (newest-first) — consumed by
+    ``_dashboard_build_blocks_panel`` and the dashboard envelope
+    serializer.
+
+    Per-row enrichment for the dashboard rows uses
+    ``_lib_pricing._calculate_entry_cost`` (single pricing source-of-
+    truth, mirrors the historical inline body of
+    ``_dashboard_build_blocks_panel``). ``label`` is pre-formatted via
+    ``format_display_dt`` ("HH:MM MMM DD" in display_tz).
+
+    Totals are summed over non-gap blocks (gaps contribute zero by
+    construction — they carry zero cost / tokens). Caller-supplied
+    ``range_start`` / ``range_end`` override the period metadata when
+    provided (the CLI ``cmd_blocks`` --since/--until path passes them
+    explicitly; the dashboard path passes the week window).
+    """
+    _lib_blocks = _load_lib("_lib_blocks")
+    _lib_pricing = _load_lib("_lib_pricing")
+    c = _cctally()
+    blocks = _lib_blocks._group_entries_into_blocks(
+        entries,
+        mode=mode,
+        recorded_windows=recorded_windows,
+        block_start_overrides=block_start_overrides,
+        now=now_utc,
+    )
+    rows: list = []
+    total_cost = 0.0
+    total_tok = 0
+    if blocks:
+        for b in blocks:
+            if b.is_gap:
+                continue
+            # Per-block per-model breakdown for the dashboard row.
+            # Mirrors `_dashboard_build_blocks_panel`'s historical
+            # inline body — re-aggregates entries inside the block
+            # interval through the single pricing chokepoint so per-
+            # model costs reconcile exactly with `b.cost_usd`.
+            per_model: dict[str, float] = {}
+            for e in entries:
+                if b.start_time <= e.timestamp < b.end_time:
+                    cost = _lib_pricing._calculate_entry_cost(
+                        e.model, e.usage, mode=mode, cost_usd=e.cost_usd,
+                    )
+                    per_model[e.model] = per_model.get(e.model, 0.0) + cost
+            model_breakdowns = [
+                {"modelName": name, "cost": cost}
+                for name, cost in sorted(
+                    per_model.items(), key=lambda kv: -kv[1],
+                )
+            ]
+            local_label = c.format_display_dt(
+                b.start_time, display_tz, fmt="%H:%M %b %d", suffix=True,
+            )
+            rows.append(BlocksPanelRow(
+                start_at=b.start_time.astimezone(dt.timezone.utc).isoformat(),
+                end_at=b.end_time.astimezone(dt.timezone.utc).isoformat(),
+                anchor=b.anchor,
+                is_active=bool(b.is_active and b.entries_count > 0),
+                cost_usd=b.cost_usd,
+                models=_model_breakdowns_to_models_late(
+                    model_breakdowns, b.cost_usd,
+                ),
+                label=local_label,
+            ))
+            total_cost += b.cost_usd
+            total_tok += b.total_tokens
+    rows.sort(key=lambda r: r.start_at, reverse=True)
+
+    # Period defaults: caller-supplied range wins; otherwise fall back
+    # to block extent (first block's start) so the share builder /
+    # period-label paths get a sensible window.
+    period_start_dt = range_start
+    if period_start_dt is None and blocks:
+        period_start_dt = blocks[0].start_time
+    period_end_dt = range_end or now_utc
+
+    return BlocksView(
+        rows=tuple(rows),
+        aggregated=tuple(blocks),
+        total_cost_usd=total_cost,
+        total_tokens=total_tok,
+        period_start=period_start_dt,
+        period_end=period_end_dt,
+        display_tz_label=_display_tz_label(display_tz),
+    )
+
+
+def build_blocks_view_from_table_rows(
+    block_dicts,
+    *,
+    period_start=None,
+    period_end=None,
+    display_tz=None,
+):
+    """Build a ``BlocksView`` from API-anchored ``five_hour_blocks``
+    table rows (issue #56 — share path).
+
+    Reset-aware totals (CLAUDE.md 5-hour gotcha block, spec §3.2):
+    ``total_cost_usd`` is summed from each row's ``total_cost_usd``
+    column (already credit-aware at write time);
+    ``total_tokens`` is summed across the four token columns
+    (``total_input_tokens`` + ``total_output_tokens`` +
+    ``total_cache_create_tokens`` + ``total_cache_read_tokens``).
+    No recomputation from ``session_entries`` — preserves the
+    write-time invariant that ``five_hour_blocks.total_cost_usd``
+    is the authoritative per-block cost.
+
+    ``rows`` is left empty — the API-anchored consumers
+    (``_five_hour_blocks_to_json``, ``_render_five_hour_blocks_table``,
+    ``_build_five_hour_blocks_snapshot``) read ``aggregated`` (the
+    underlying dict list) directly. ``BlocksPanelRow`` doesn't carry
+    the API-anchored extras (``final_five_hour_percent``,
+    ``crossed_seven_day_reset``, ``credits``, ...) so synthesizing
+    rows on this path would lose data.
+
+    ``block_dicts`` is consumed as-is; the caller controls ordering
+    (``cmd_five_hour_blocks`` produces newest-first DESC).
+    """
+    rows_seq = list(block_dicts)
+    total_cost = sum(
+        float(d.get("total_cost_usd") or 0.0) for d in rows_seq
+    )
+    total_tok = sum(
+        int(d.get("total_input_tokens") or 0)
+        + int(d.get("total_output_tokens") or 0)
+        + int(d.get("total_cache_create_tokens") or 0)
+        + int(d.get("total_cache_read_tokens") or 0)
+        for d in rows_seq
+    )
+    return BlocksView(
+        rows=(),
+        aggregated=tuple(rows_seq),
+        total_cost_usd=total_cost,
+        total_tokens=total_tok,
+        period_start=period_start,
+        period_end=period_end,
         display_tz_label=_display_tz_label(display_tz),
     )

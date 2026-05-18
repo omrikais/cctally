@@ -143,20 +143,29 @@ def test_envelope_blocks_daily_keys_match_golden():
     assert "blocks" in env
     assert "daily" in env
     # Inline expected shape (minus quantile_thresholds — see test_envelope_quantile_thresholds_consistent_with_helper).
-    assert env["blocks"] == {"rows": [
-        {
-            "start_at": "2026-04-26T14:00:00+00:00",
-            "end_at":   "2026-04-26T19:00:00+00:00",
-            "anchor":   "recorded",
-            "is_active": True,
-            "cost_usd": 4.21,
-            "models": [
-                {"model": "claude-opus-4-5-20251101", "display": "opus-4-5",
-                 "chip": "opus", "cost_usd": 3.28, "cost_pct": 78.0},
-            ],
-            "label": "14:00 Apr 26",
-        },
-    ]}
+    assert env["blocks"] == {
+        "rows": [
+            {
+                "start_at": "2026-04-26T14:00:00+00:00",
+                "end_at":   "2026-04-26T19:00:00+00:00",
+                "anchor":   "recorded",
+                "is_active": True,
+                "cost_usd": 4.21,
+                "models": [
+                    {"model": "claude-opus-4-5-20251101", "display": "opus-4-5",
+                     "chip": "opus", "cost_usd": 3.28, "cost_pct": 78.0},
+                ],
+                "label": "14:00 Apr 26",
+            },
+        ],
+        # View-model unification follow-up (issue #56): additive scalars.
+        # The helper-built snapshot leaves the new ``DataSnapshot.blocks_total_*``
+        # fields at their dataclass defaults (0.0 / 0); the envelope mirrors
+        # them verbatim. End-to-end tests (golden-data.json) exercise the
+        # populated path.
+        "total_cost_usd": 0.0,
+        "total_tokens": 0,
+    }
     assert env["daily"]["rows"] == [
         {
             "date": "2026-04-26",

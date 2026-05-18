@@ -359,6 +359,9 @@ TrendView = _lib_view_models.TrendView
 build_trend_view = _lib_view_models.build_trend_view
 SessionsView = _lib_view_models.SessionsView
 build_sessions_view = _lib_view_models.build_sessions_view
+BlocksView = _lib_view_models.BlocksView
+build_blocks_view = _lib_view_models.build_blocks_view
+build_blocks_view_from_table_rows = _lib_view_models.build_blocks_view_from_table_rows
 
 _lib_render = _load_sibling("_lib_render")
 _CODEX_MONTHS = _lib_render._CODEX_MONTHS
@@ -777,6 +780,7 @@ _dashboard_build_monthly_periods = _cctally_dashboard._dashboard_build_monthly_p
 _dashboard_build_weekly_periods = _cctally_dashboard._dashboard_build_weekly_periods
 _build_block_detail = _cctally_dashboard._build_block_detail
 _dashboard_build_blocks_panel = _cctally_dashboard._dashboard_build_blocks_panel
+_dashboard_build_blocks_view = _cctally_dashboard._dashboard_build_blocks_view
 _dashboard_build_daily_panel = _cctally_dashboard._dashboard_build_daily_panel
 _empty_dashboard_snapshot = _cctally_dashboard._empty_dashboard_snapshot
 _iso_z = _cctally_dashboard._iso_z
@@ -5016,13 +5020,22 @@ def cmd_blocks(args: argparse.Namespace) -> int:
         range_start - BLOCK_DURATION, range_end + BLOCK_DURATION,
     )
 
-    # Group into blocks
-    blocks = _group_entries_into_blocks(
-        all_entries, mode="auto",
+    # Group into blocks via the view-model kernel (issue #56). The
+    # heuristic-aware ``aggregated`` tuple holds the full Block list
+    # (gaps included, oldest-first) — same shape the JSON / table
+    # renderers expect. We materialize back to a list because
+    # ``_maybe_swap_active_block_to_canonical`` mutates in-place.
+    view = build_blocks_view(
+        all_entries,
+        now_utc=now_utc,
         recorded_windows=recorded_windows,
         block_start_overrides=block_start_overrides,
-        now=now_utc,
+        range_start=range_start,
+        range_end=range_end,
+        display_tz=tz,
+        mode="auto",
     )
+    blocks = list(view.aggregated)
 
     # Bug E (v1.7.2 round-4): when the ACTIVE block is heuristic-anchored
     # but a canonical ``five_hour_blocks`` row exists for the current 5h
@@ -8886,8 +8899,19 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
                 )
             else:
                 period_end = _share_now_utc()
-            snap = _build_five_hour_blocks_snapshot(
+            # Build a BlocksView from the API-anchored table rows
+            # (issue #56). Reset-aware totals come from the table's
+            # per-block columns (CLAUDE.md 5-hour gotcha block) so the
+            # share snapshot's footer reads from the single typed
+            # source rather than re-summing inline.
+            view = build_blocks_view_from_table_rows(
                 block_dicts,
+                period_start=period_start,
+                period_end=period_end,
+                display_tz=args._resolved_tz,
+            )
+            snap = _build_five_hour_blocks_snapshot(
+                view,
                 period_start=period_start,
                 period_end=period_end,
                 display_tz=display_tz_str,
@@ -13211,7 +13235,7 @@ def _build_project_snapshot(
 
 
 def _build_five_hour_blocks_snapshot(
-    rows: list[dict],
+    view: "BlocksView",
     *,
     period_start: dt.datetime,
     period_end: dt.datetime,
@@ -13223,13 +13247,18 @@ def _build_five_hour_blocks_snapshot(
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally five-hour-blocks`.
 
-    `rows` is the list of per-block dicts produced inside
-    `cmd_five_hour_blocks` (sqlite Row converted to dict, with the
-    `__is_active` side-channel attached). Schema fields used:
-    `block_start_at` (ISO timestamp), `total_cost_usd`,
-    `final_five_hour_percent`, `crossed_seven_day_reset` (0/1 int),
-    `seven_day_pct_at_block_start`, `seven_day_pct_at_block_end`, plus
-    the synthetic `__is_active` flag.
+    `view` is the ``BlocksView`` produced by
+    ``build_blocks_view_from_table_rows`` (issue #56). The
+    API-anchored block dicts (sqlite Row → dict with the
+    ``__is_active`` / ``__credits`` side-channels attached) live on
+    ``view.aggregated``; reset-aware totals come from
+    ``view.total_cost_usd`` so the share footer reads from the typed
+    single source rather than re-summing inline. Schema fields used
+    from each dict: ``block_start_at`` (ISO timestamp),
+    ``total_cost_usd``, ``final_five_hour_percent``,
+    ``crossed_seven_day_reset`` (0/1 int),
+    ``seven_day_pct_at_block_start``, ``seven_day_pct_at_block_end``,
+    plus the synthetic ``__is_active`` flag.
 
     Deviations from the plan sketch (which assumed dict rows with keys
     `block_start` / `cost_usd` / `used_pct_5h` / `top_model` /
@@ -13261,11 +13290,12 @@ def _build_five_hour_blocks_snapshot(
     the builder owns the canonical subtitle shape — no post-build
     re-stamp at the gate site.
 
-    Caller MUST pass `rows` already in the desired chronological order
-    (cmd_five_hour_blocks pulls newest-first; we reverse here so the
-    BarChart bars line up oldest→newest left-to-right). Tabular row
-    order in the snapshot is irrelevant because the snapshot is what
-    gets rendered (the gate site short-circuits the table renderer).
+    Caller MUST pass a view whose ``aggregated`` block dicts are
+    already in the desired chronological order (cmd_five_hour_blocks
+    pulls newest-first; we reverse here so the BarChart bars line up
+    oldest→newest left-to-right). Tabular row order in the snapshot is
+    irrelevant because the snapshot is what gets rendered (the gate
+    site short-circuits the table renderer).
     """
     _lib_share = _share_load_lib()
     columns = (
@@ -13278,9 +13308,11 @@ def _build_five_hour_blocks_snapshot(
         _lib_share.ColumnSpec(key="cross_reset", label="Reset",
                               align="left"),
     )
-    # Reverse so BarChart x-axis runs oldest→newest (cmd_five_hour_blocks
-    # produces newest-first DESC); table-row order in the snapshot tracks
-    # chart order so consumer expectations align.
+    # `view.aggregated` carries the newest-first DESC block dicts the
+    # caller built from the SELECT. Reverse so BarChart x-axis runs
+    # oldest→newest; table-row order tracks chart order so consumer
+    # expectations align.
+    rows = list(view.aggregated)
     chrono_rows = list(reversed(rows))
     snap_rows: list = []
     chart_pts: list = []
@@ -13336,7 +13368,11 @@ def _build_five_hour_blocks_snapshot(
         _lib_share.BarChart(points=tuple(chart_pts), y_label="$")
         if chart_pts else None
     )
-    sum_cost = sum(p.y_value for p in chart_pts)
+    # Reset-aware total comes from the BlocksView (issue #56); avg
+    # divides by `chart_pts` count so the share footer "Sum" totalled
+    # and the per-block `chart_pts` cost values share a single source-
+    # of-truth at `view.total_cost_usd`.
+    sum_cost = view.total_cost_usd
     avg_cost = (sum_cost / len(chart_pts)) if chart_pts else 0.0
     crossed_count = sum(
         1 for r in chrono_rows if bool(r.get("crossed_seven_day_reset"))
