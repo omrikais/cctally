@@ -5,8 +5,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-05-18
+
+### Added
+- dashboard envelope: new `daily.total_cost_usd` and `daily.total_tokens` fields exposed alongside the existing `daily.rows[]` so `DailyPanel` and downstream consumers can read the panel's total from the envelope instead of summing rows client-side. Backward-compatible additive change — consumers that ignore the new fields keep working. Sourced from the new `DailyView.total_cost_usd` / `DailyView.total_tokens` view-model fields populated by `build_daily_view` at envelope-construction time.
+
 ### Changed
+- view-model kernel: introduce `bin/_lib_view_models.py` as the single canonical builder for each report command's render dataset — adds `DailyView` + `build_daily_view`, `MonthlyView` + `build_monthly_view`, `WeeklyView` + `build_weekly_view`, `TrendView` + `build_trend_view`, and `SessionsView` + `build_sessions_view`. CLI consumers (`cmd_daily`, `cmd_monthly`, `cmd_weekly`, `cmd_report`, `cmd_session`), dashboard envelope builders (`_dashboard_build_*`), share-output snapshots (`_build_*_snapshot`), and TUI builders (`_tui_build_*`) now all route through the same kernel instead of re-aggregating from `iter_entries()` independently. Collapses the prior 3× re-totaling cost across CLI / dashboard / share for daily, monthly, weekly, and sessions; downstream renderers consume the dataclass directly and the camelCase dict workaround between `cmd_report` and the dashboard trend panel is removed. Refactor-only externally — behavior changes are limited to the additive envelope fields above and the credit-week footer fix below.
 - Refine npm package description and README header for discoverability: front-load high-intent search terms ("Claude Code usage tracker", "dashboard", "Pro/Max subscription limits", "quota forecasts", "ccusage-compatible") while preserving the distinctive "cost-per-percent trend" hook. Swap five `package.json` keywords — drop generic noise (`usage`, `cost`, `tracker`, `llm`, `ai-tools`) and add high-intent terms (`claude-code-dashboard`, `claude-code-quota`, `claude-code-cost`, `ccusage-alternative`, `quota-tracking`). GitHub repo About and topics updated to match in lockstep. Description re-indexes on npm at next publish.
+
+### Fixed
+- dashboard weekly panel: footer total now matches the synthesized rows on credit weeks. Pre-fix, the panel's row list included `_apply_midweek_reset_override`'s synthesized pre-credit + post-credit rows split at `effective_reset_at_utc`, but the footer total was read from `weekly_cost_snapshots.cost_usd` (the snapshotted total over the original whole week), so the displayed rows summed to a different number than the footer. Now the footer reads `WeeklyView.total_cost_usd`, which sums over the same synthesized rows the panel renders, so the two always match by construction.
 
 ## [1.7.4] - 2026-05-17
 
