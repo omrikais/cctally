@@ -80,6 +80,7 @@ import textwrap
 import threading
 import time
 import traceback
+import unicodedata
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -2691,6 +2692,29 @@ def _supports_unicode_stdout() -> bool:
     return "UTF" in encoding
 
 
+def _display_width(s: str) -> int:
+    """Terminal cells consumed by ``s``.
+
+    Counts each codepoint by its East Asian Width: ``W`` / ``F`` (Wide
+    / Fullwidth) → 2 cells; combining marks → 0; everything else → 1.
+    Ambiguous (``A``) defaults to 1, matching every non-CJK terminal
+    locale — cctally has no CJK content in cell data, and `→` / `—` /
+    `·` (all `A`) are intentionally rendered narrow.
+
+    Used by `_boxed_table` so cells containing wide glyphs (notably
+    `⚡` U+26A1 on credit-row annotations) pad to the right cell count
+    rather than the right codepoint count. Without this, `len()`-based
+    padding under-pads by one cell per wide glyph and the right border
+    drifts off-column on those rows only.
+    """
+    width = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
 def _boxed_table(
     headers: list[str],
     rows: list[list[str]],
@@ -2714,15 +2738,20 @@ def _boxed_table(
 
     widths: list[int] = []
     for idx, header in enumerate(headers):
-        max_cell = max((len(r[idx]) for r in sanitized_rows), default=0)
-        widths.append(max(len(header), max_cell))
+        max_cell = max((_display_width(r[idx]) for r in sanitized_rows), default=0)
+        widths.append(max(_display_width(header), max_cell))
 
     def _pad(text: str, width: int, align: str) -> str:
+        deficit = width - _display_width(text)
+        if deficit <= 0:
+            return text
+        pad = " " * deficit
         if align == "right":
-            return text.rjust(width)
+            return pad + text
         if align == "center":
-            return text.center(width)
-        return text.ljust(width)
+            left = deficit // 2
+            return (" " * left) + text + (" " * (deficit - left))
+        return text + pad
 
     if _supports_unicode_stdout():
         chars = {
