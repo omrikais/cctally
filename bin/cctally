@@ -188,12 +188,10 @@ PUBLIC_REPO = "omrikais/cctally"
 
 # === Eager-loaded library siblings ===
 #
-# Re-export pure-fn primitives from _lib_*.py so test/harness code that
-# reaches into cctally._release_parse_semver, cctally._SEMVER_RE, etc.
-# continues to work via the same attribute path. The actual definitions
-# live in the sibling modules; bin/cctally's namespace simply re-aliases
-# them. Eager because these are touched by code defined later in this
-# file (e.g. RELEASE_HEADER_RE uses _SEMVER_NUM).
+# Re-export pure-fn primitives from _lib_*.py so code defined later in
+# this file (e.g. RELEASE_HEADER_RE uses _SEMVER_NUM) can reach them via
+# the cctally module namespace. The actual definitions live in the
+# sibling modules; bin/cctally's namespace simply re-aliases them.
 #
 # Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md §6.3-6.4
 
@@ -235,10 +233,6 @@ get_latest_usage_for_week = _cctally_core.get_latest_usage_for_week
 _lib_semver = _load_sibling("_lib_semver")
 _SEMVER_NUM = _lib_semver._SEMVER_NUM
 _SEMVER_RE = _lib_semver._SEMVER_RE
-_release_parse_semver = _lib_semver._release_parse_semver
-_release_format_semver = _lib_semver._release_format_semver
-_release_compute_next_version = _lib_semver._release_compute_next_version
-_release_semver_sort_key = _lib_semver._release_semver_sort_key
 
 _lib_pricing = _load_sibling("_lib_pricing")
 TIERED_THRESHOLD = _lib_pricing.TIERED_THRESHOLD

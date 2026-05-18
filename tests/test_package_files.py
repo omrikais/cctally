@@ -5,10 +5,14 @@ Three related invariants protect the runtime-sibling loader pattern
 `_lib_*.py` and `_cctally_*.py` modules, so any install layout missing
 those files crashes at import or first-use):
 
-  1. `bin/_lib_*.py` runtime siblings must be listed in `package.json`
-     `files[]` — otherwise `npm pack` excludes them and the late-loader
-     in `bin/cctally` hits a missing path. v1.6.1 closed this leak for
-     `_lib_share_templates.py`.
+  1. Every PUBLIC `bin/_lib_*.py` / `bin/_cctally_*.py` runtime sibling
+     must be listed in `package.json` `files[]` — otherwise `npm pack`
+     excludes them and the late-loader in `bin/cctally` hits a missing
+     path. v1.6.1 closed this leak for `_lib_share_templates.py`.
+     Privacy is determined by `.mirror-allowlist`: a sibling that
+     classifies `unmatched` (e.g. `_cctally_release.py` after the
+     release-command-split privatization) is maintainer-only and never
+     enters the npm tarball, so it MUST NOT appear in `files[]` either.
 
   2. Every path in `files[]` must classify as `public` against
      `.mirror-allowlist`. The npm-publish GHA workflow runs from the
@@ -18,14 +22,15 @@ those files crashes at import or first-use):
      in the allowlist, so the v1.6.1 tarball still shipped without it.
      v1.6.2 closes the allowlist gap.
 
-  3. `homebrew/cctally.rb.template` must install every runtime sibling
-     into `libexec/bin` next to `bin/cctally`. The formula historically
-     listed only `USER_FACING_BINS`; once `_lib_semver` became an EAGER
-     import (bin/cctally:213 — the bin-split refactor), `cctally --help`
-     itself crashes on a brew layout that omits siblings. Asserting a
-     glob pattern (rather than per-name enumeration) lets future
-     `_lib_*.py` / `_cctally_*.py` additions land without touching the
-     formula.
+  3. `homebrew/cctally.rb.template` must install every PUBLIC runtime
+     sibling into `libexec/bin` next to `bin/cctally`, or `_load_sibling`
+     (which resolves `Path(__file__).parent / "<name>.py"`) hits
+     `FileNotFoundError`. Once `_lib_semver` became an EAGER import at
+     bin/cctally:213, that path fires during `cctally --help`. The
+     formula uses a `Dir.glob("bin/_lib_*.py", "bin/_cctally_*.py")`
+     pattern over the public-clone tree — so private siblings filtered
+     out by the mirror naturally don't appear and don't need a reject
+     filter in the formula.
 
 The three checks are kept side-by-side so any future runtime sibling
 addition trips every gate if any layer is misconfigured.
@@ -52,27 +57,45 @@ def _load_classifier():
     return mod.classify
 
 
+def _public_runtime_siblings():
+    """Sibling files that classify as `public` in `.mirror-allowlist`.
+
+    Maintainer-only siblings (e.g. `_cctally_release.py` after the
+    release-command-split privatization) classify `unmatched` and are
+    intentionally absent from the npm tarball + brew install — they
+    don't ride the public distribution surface.
+    """
+    classify = _load_classifier()
+    candidates = sorted(
+        {p.name for p in (REPO_ROOT / "bin").glob("_lib_*.py")}
+        | {p.name for p in (REPO_ROOT / "bin").glob("_cctally_*.py")}
+    )
+    paths = [f"bin/{name}" for name in candidates]
+    result = classify(paths, allowlist_path=str(REPO_ROOT / ".mirror-allowlist"))
+    public_paths = set(result.get("public", []))
+    return sorted(name for name in candidates if f"bin/{name}" in public_paths)
+
+
 def test_package_files_includes_every_lib_sibling():
     pkg = json.loads((REPO_ROOT / "package.json").read_text())
     files = set(pkg.get("files", []))
-    libs = sorted(p.name for p in (REPO_ROOT / "bin").glob("_lib_*.py"))
-    cctally_libs = sorted(p.name for p in (REPO_ROOT / "bin").glob("_cctally_*.py"))
-    libs = sorted(set(libs) | set(cctally_libs))
+    libs = _public_runtime_siblings()
     assert libs, (
-        "expected at least one bin/_lib_*.py or bin/_cctally_*.py runtime module"
+        "expected at least one PUBLIC bin/_lib_*.py or bin/_cctally_*.py "
+        "runtime module"
     )
     missing = [f"bin/{lib}" for lib in libs if f"bin/{lib}" not in files]
     assert not missing, (
-        f"bin/_lib_*.py and bin/_cctally_*.py runtime modules missing from "
-        f"package.json files[]: {missing}. Add them, or npm-installed cctally "
-        f"will fail when bin/cctally tries to late-load them via "
+        f"PUBLIC bin/_lib_*.py and bin/_cctally_*.py runtime modules missing "
+        f"from package.json files[]: {missing}. Add them, or npm-installed "
+        f"cctally will fail when bin/cctally tries to late-load them via "
         f"Path(__file__).parent / '_lib_*.py' or '_cctally_*.py'."
     )
 
 
 def test_brew_formula_installs_every_lib_sibling():
     """Parallel guard to test_package_files: the brew formula must install
-    every `bin/_lib_*.py` / `bin/_cctally_*.py` runtime sibling into
+    every PUBLIC `bin/_lib_*.py` / `bin/_cctally_*.py` runtime sibling into
     `libexec/bin` next to `bin/cctally`, or `_load_sibling` (which resolves
     `Path(__file__).parent / "<name>.py"`) hits `FileNotFoundError`.
 
@@ -82,15 +105,15 @@ def test_brew_formula_installs_every_lib_sibling():
     every command immediately.
 
     We accept either a `Dir.glob("bin/_lib_*.py", "bin/_cctally_*.py")`
-    pattern (preferred — future-proof) or explicit per-name install lines.
+    pattern (preferred — future-proof; the glob runs against the
+    public-clone tree, so private siblings never appear) or explicit
+    per-name install lines.
     """
     template = (REPO_ROOT / "homebrew" / "cctally.rb.template").read_text()
-    libs = sorted(
-        {p.name for p in (REPO_ROOT / "bin").glob("_lib_*.py")}
-        | {p.name for p in (REPO_ROOT / "bin").glob("_cctally_*.py")}
-    )
+    libs = _public_runtime_siblings()
     assert libs, (
-        "expected at least one bin/_lib_*.py or bin/_cctally_*.py runtime module"
+        "expected at least one PUBLIC bin/_lib_*.py or bin/_cctally_*.py "
+        "runtime module"
     )
     has_glob = (
         "bin/_lib_*.py" in template and "bin/_cctally_*.py" in template
@@ -99,9 +122,9 @@ def test_brew_formula_installs_every_lib_sibling():
         return
     missing = [name for name in libs if name not in template]
     assert not missing, (
-        f"bin/_lib_*.py / bin/_cctally_*.py runtime modules absent from "
-        f"homebrew/cctally.rb.template: {missing}. Add them to the install "
-        f"block, or switch to a Dir.glob pattern covering both "
+        f"PUBLIC bin/_lib_*.py / bin/_cctally_*.py runtime modules absent "
+        f"from homebrew/cctally.rb.template: {missing}. Add them to the "
+        f"install block, or switch to a Dir.glob pattern covering both "
         f"`bin/_lib_*.py` and `bin/_cctally_*.py`. Without these, a "
         f"brew-installed cctally crashes on `cctally --help` because "
         f"`_load_sibling('_lib_semver')` (bin/cctally:213) runs at import."

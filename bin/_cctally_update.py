@@ -123,7 +123,9 @@ What stays in bin/cctally:
   on the historical name still overrides the 5 internal callers
   here),
   ``_release_parse_semver`` / ``_release_semver_sort_key`` (lives
-  in ``_lib_semver`` and re-exported by cctally),
+  in ``_lib_semver``; shims below route directly to that module —
+  the cctally re-exports were removed in the release-command split
+  privatization),
   ``load_config`` (lives in ``_cctally_config``; re-exported),
   ``_BANNER_SUPPRESSED_COMMANDS`` (lives in ``_cctally_db``;
   re-exported by cctally — composed with the update-only
@@ -219,7 +221,7 @@ def _release_read_latest_release_version(*args, **kwargs):
     re-exports it under the historical name. This shim routes through
     the ``cctally`` namespace (not directly to ``_lib_changelog``) so
     that ``monkeypatch.setitem(ns, "_release_read_latest_release_version", ...)``
-    in tests/test_update.py + tests/test_release_helpers.py overrides
+    in tests/test_update.py + tests/test_release_internals.py overrides
     the 5+ internal callers in this module. New code should call
     ``_lib_changelog._read_latest_changelog_version`` directly.
     """
@@ -228,12 +230,21 @@ def _release_read_latest_release_version(*args, **kwargs):
     )
 
 
+# The semver shims now resolve via ``_lib_semver`` directly — the
+# cctally re-exports (``_release_parse_semver`` / ``_release_semver_sort_key``)
+# were removed in the release-command split privatization. Kept as
+# call-time shims (vs. module-top ``from _lib_semver import ...``) so
+# tests can still ``monkeypatch.setitem(ns, "_release_parse_semver", ...)``
+# on this module's namespace if needed; the bare-name lookup inside this
+# module resolves here, not at the import site.
 def _release_parse_semver(*args, **kwargs):
-    return sys.modules["cctally"]._release_parse_semver(*args, **kwargs)
+    import _lib_semver
+    return _lib_semver._release_parse_semver(*args, **kwargs)
 
 
 def _release_semver_sort_key(*args, **kwargs):
-    return sys.modules["cctally"]._release_semver_sort_key(*args, **kwargs)
+    import _lib_semver
+    return _lib_semver._release_semver_sort_key(*args, **kwargs)
 
 
 def _normalize_alerts_enabled_value(*args, **kwargs):

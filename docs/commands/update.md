@@ -208,7 +208,9 @@ If you installed from source: cd <repo> && git pull && bin/symlink
   `update.check.ttl_hours`.
 - [`cctally setup`](setup.md) — installs hooks and `~/.local/bin/`
   symlinks for cctally; also adds `cctally-update` to that symlink list.
-- [`cctally release`](release.md) — the publish side. The first version
-  that ships `cctally update` reaches users via existing manual update
-  workflows; from that version onward, auto-suggest covers future
-  updates.
+- The publish side runs on the maintainer's machine via the private
+  `cctally-release` tooling; published versions are visible on
+  [GitHub Releases](https://github.com/omrikais/cctally/releases). The
+  first version that ships `cctally update` reaches users via existing
+  manual update workflows; from that version onward, auto-suggest
+  covers future updates.
