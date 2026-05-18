@@ -14,18 +14,17 @@
                             "cctally-forecast",
                             "cctally-project",
                             "cctally-refresh-usage",
-                            "cctally-release",
                             "cctally-sync-week",
                             "cctally-tui",
                             "cctally-update"
                         ],
                         "present": 0,
-                        "total": 13
+                        "total": 12
                     },
                     "id": "install.symlinks",
                     "remediation": "Run `cctally setup`",
                     "severity": "warn",
-                    "summary": "0/13 present; missing cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-release, cctally-sync-week, cctally-tui, cctally-update",
+                    "summary": "0/12 present; missing cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-sync-week, cctally-tui, cctally-update",
                     "title": "Symlinks"
                 },
                 {

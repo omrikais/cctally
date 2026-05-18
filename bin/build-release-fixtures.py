@@ -250,6 +250,8 @@ cp "$REPO_ROOT/.githooks/pre-commit" .githooks/
 cp "$REPO_ROOT/.public-tag-patterns" .
 cp "$REPO_ROOT/bin/cctally" bin/
 chmod +x bin/cctally
+cp "$REPO_ROOT/bin/cctally-release" bin/
+chmod +x bin/cctally-release
 cp "$REPO_ROOT/bin/cctally-mirror-public" bin/
 chmod +x bin/cctally-mirror-public
 # bin/cctally eager-loads sibling _lib_*.py modules and lazy-loads
@@ -257,7 +259,7 @@ chmod +x bin/cctally-mirror-public
 # own resolved path (see bin/cctally: _load_sibling). Mirror BOTH
 # prefixes into the scratch bin/ so the eager loads at module import
 # time AND the PEP 562 lazy loads on first release/etc. access succeed
-# — without this, every `cctally release …` invocation in the scenario
+# — without this, every `cctally-release …` invocation in the scenario
 # crashes at import with FileNotFoundError on _lib_semver.py (eager)
 # or on _cctally_release.py (lazy, first release-region access).
 for libsib in "$REPO_ROOT"/bin/_lib_*.py "$REPO_ROOT"/bin/_cctally_*.py; do
@@ -383,7 +385,7 @@ def _seed_changelog_and_commit(content: str, push: bool = True,
 # Run-sh helpers.
 #
 # Every scenario's run.sh starts with `_RUN_HEADER` (env pinning + fake-gh
-# wiring), then issues a single `python3 bin/cctally release ...` and
+# wiring), then issues a single `python3 bin/cctally-release ...` and
 # captures artifacts into $work/_artifacts/.
 # ---------------------------------------------------------------------------
 
@@ -448,7 +450,7 @@ _CAPTURE_ARTIFACTS = (
 
 
 def _run_release(release_args: str) -> str:
-    """run.sh body that invokes `cctally release <release_args>` and
+    """run.sh body that invokes `cctally-release <release_args>` and
     captures all standard artifacts (stdout, stderr, exit, CHANGELOG,
     commit-msg, tag-annotation, gh-argv).
 
@@ -456,7 +458,7 @@ def _run_release(release_args: str) -> str:
     is the caller's responsibility.
     """
     return _RUN_HEADER + (
-        f'python3 bin/cctally release {release_args} '
+        f'python3 bin/cctally-release {release_args} '
         f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
         f'rc=$?\n'
         f'echo "$rc" > "$work/_artifacts/exit.txt"\n'
@@ -469,7 +471,7 @@ def _run_dry_run(release_args: str) -> str:
     """run.sh body for dry-run scenarios — captures artifacts AND asserts
     no tags / commits leaked beyond the seed."""
     return _RUN_HEADER + (
-        f'python3 bin/cctally release {release_args} --dry-run '
+        f'python3 bin/cctally-release {release_args} --dry-run '
         f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
         f'rc=$?\n'
         f'echo "$rc" > "$work/_artifacts/exit.txt"\n'
@@ -495,7 +497,7 @@ def _run_body_canonical(release_args: str) -> str:
       - $work/_artifacts/body-equal.txt = "1" or "0"
     """
     return _RUN_HEADER + (
-        f'python3 bin/cctally release {release_args} '
+        f'python3 bin/cctally-release {release_args} '
         f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
         f'rc=$?\n'
         f'echo "$rc" > "$work/_artifacts/exit.txt"\n'
@@ -564,7 +566,7 @@ def _run_commit_msg_hook(release_args: str) -> str:
         # explicitly chmod +x and set core.hooksPath).
         'chmod +x .githooks/commit-msg .githooks/pre-commit\n'
         'git config core.hooksPath .githooks\n'
-        f'python3 bin/cctally release {release_args} '
+        f'python3 bin/cctally-release {release_args} '
         f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
         f'rc=$?\n'
         f'echo "$rc" > "$work/_artifacts/exit.txt"\n'
@@ -619,7 +621,7 @@ def _run_release_with_npm(release_args: str) -> str:
         ': > "$work/npm-invocations.log"\n'
         'export NPM_MOCK_STATE_FILE="$work/npm-mock-state.json"\n'
         'export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"\n'
-        f'python3 bin/cctally release {release_args} '
+        f'python3 bin/cctally-release {release_args} '
         f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
         f'rc=$?\n'
         f'echo "$rc" > "$work/_artifacts/exit.txt"\n'
@@ -640,7 +642,7 @@ def _run_release_with_npm_env(release_args: str, env_lines: list[str]) -> str:
         'export NPM_MOCK_STATE_FILE="$work/npm-mock-state.json"\n'
         'export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"\n'
         + env_block
-        + f'python3 bin/cctally release {release_args} '
+        + f'python3 bin/cctally-release {release_args} '
         + f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
         + 'rc=$?\n'
         + 'echo "$rc" > "$work/_artifacts/exit.txt"\n'
@@ -670,7 +672,7 @@ def _run_release_with_brew(release_args: str) -> str:
     return _RUN_HEADER + (
         ': > "$work/npm-invocations.log"\n'
         'export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"\n'
-        f'python3 bin/cctally release {release_args} '
+        f'python3 bin/cctally-release {release_args} '
         f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
         f'rc=$?\n'
         f'echo "$rc" > "$work/_artifacts/exit.txt"\n'
@@ -700,7 +702,7 @@ def _run_release_with_brew_verify_tag(release_args: str, version: str) -> str:
     return _RUN_HEADER + (
         ': > "$work/npm-invocations.log"\n'
         'export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"\n'
-        f'python3 bin/cctally release {release_args} '
+        f'python3 bin/cctally-release {release_args} '
         f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
         f'rc=$?\n'
         f'echo "$rc" > "$work/_artifacts/exit.txt"\n'
@@ -742,7 +744,7 @@ def _run_release_with_npm_and_brew(release_args: str) -> str:
         ': > "$work/npm-invocations.log"\n'
         'export NPM_MOCK_STATE_FILE="$work/npm-mock-state.json"\n'
         'export NPM_MOCK_LOG_FILE="$work/npm-invocations.log"\n'
-        f'python3 bin/cctally release {release_args} '
+        f'python3 bin/cctally-release {release_args} '
         f'> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
         f'rc=$?\n'
         f'echo "$rc" > "$work/_artifacts/exit.txt"\n'
@@ -868,7 +870,7 @@ _add(
         "\n"
         "Stamp release v0.1.1 over 1 [Unreleased] entries.\n"
         "\n"
-        "Run by `cctally release patch` from main at <SHA7>.\n"
+        "Run by `cctally-release patch` from main at <SHA7>.\n"
         "Bump kind: patch.\n"
         "Subsections stamped: Added (1).\n"
         "\n"
@@ -920,7 +922,7 @@ _add(
         "\n"
         "Stamp release v0.2.0 over 3 [Unreleased] entries.\n"
         "\n"
-        "Run by `cctally release minor` from main at <SHA7>.\n"
+        "Run by `cctally-release minor` from main at <SHA7>.\n"
         "Bump kind: minor.\n"
         "Subsections stamped: Added (2), Fixed (1).\n"
         "\n"
@@ -976,7 +978,7 @@ _add(
         "\n"
         "Stamp release v1.0.0 over 1 [Unreleased] entries.\n"
         "\n"
-        "Run by `cctally release major` from main at <SHA7>.\n"
+        "Run by `cctally-release major` from main at <SHA7>.\n"
         "Bump kind: major.\n"
         "Subsections stamped: Changed (1).\n"
         "\n"
@@ -1132,7 +1134,7 @@ _add(
         "\n"
         "Stamp release v1.1.0-rc.1 over 1 [Unreleased] entries.\n"
         "\n"
-        "Run by `cctally release prerelease` from main at <SHA7>.\n"
+        "Run by `cctally-release prerelease` from main at <SHA7>.\n"
         "Bump kind: prerelease.\n"
         "Subsections stamped: Added (1).\n"
         "\n"
@@ -1246,8 +1248,8 @@ _add(
     stdout_substr="",
     # Helper-message wording (line 162 of bin/cctally) — the prefix is
     # stable; we substring-match a fragment that includes the
-    # `cctally release finalize` hint.
-    stderr_substr="cctally release finalize",
+    # `cctally-release finalize` hint.
+    stderr_substr="cctally-release finalize",
 )
 
 
@@ -1418,7 +1420,7 @@ _add(
 # We simulate the partial state by running phase 1 manually via the
 # stamp + commit path, then NOT running phase 2.
 #
-# Actual mechanism: invoke `cctally release patch --no-publish` which
+# Actual mechanism: invoke `cctally-release patch --no-publish` which
 # completes both phase 1 + 2, then DELETE the local tag + push of it.
 # That leaves the stamp committed but with no v0.1.1 tag. `--resume`
 # detects that and runs phase 2 again.
@@ -1435,7 +1437,7 @@ _add(
         # "not done" again. Use --no-publish to keep phases 3-4 out.
         'CCTALLY_RELEASE_DATE_UTC=2026-05-07 GIT_AUTHOR_DATE="2026-05-07T00:00:00+0000" '
         'GIT_COMMITTER_DATE="2026-05-07T00:00:00+0000" '
-        'python3 bin/cctally release patch --no-publish '
+        'python3 bin/cctally-release patch --no-publish '
         '> "$work/_partial.stdout" 2> "$work/_partial.stderr"\n'
         # Drop the tag locally and remotely; resume should recreate + push.
         'git tag -d v0.1.1 >/dev/null\n'
@@ -1461,7 +1463,7 @@ _add(
     extra_setup=(
         'CCTALLY_RELEASE_DATE_UTC=2026-05-07 GIT_AUTHOR_DATE="2026-05-07T00:00:00+0000" '
         'GIT_COMMITTER_DATE="2026-05-07T00:00:00+0000" '
-        'python3 bin/cctally release patch --no-publish '
+        'python3 bin/cctally-release patch --no-publish '
         '> "$work/_partial.stdout" 2> "$work/_partial.stderr"\n'
     ),
     run=_run_release("--resume"),
@@ -1474,7 +1476,7 @@ _add(
 # 20. resume-already-complete: full release done; `--resume` exits 0.
 # Strategy: pre-run the entire 4-phase release, then make the fake-gh
 # `release view` return 0 so phase 4 is detected as "done", then re-run
-# `cctally release --resume` and assert "already published".
+# `cctally-release --resume` and assert "already published".
 _add(
     name="resume-already-complete",
     seed_changelog=_PATCH_SEED,
@@ -1486,7 +1488,7 @@ _add(
         'GIT_COMMITTER_DATE="2026-05-07T00:00:00+0000" '
         'PATH="$work/fake-bin:$PATH" GH_ARGV_LOG="$work/gh-argv.log.partial" '
         'GH_NOTES_DEST="$work/gh-notes.partial.txt" '
-        'python3 bin/cctally release patch '
+        'python3 bin/cctally-release patch '
         '> "$work/_partial.stdout" 2> "$work/_partial.stderr"\n'
         # After the run, cause gh release view to return 0 — i.e.,
         # "release already exists" — for the subsequent --resume probe.
@@ -1646,7 +1648,7 @@ _add(
 
 
 # 25. public-clone-not-discoverable: unset all three discovery sources;
-# `cctally release patch` (with publish) fails phase 3 with discovery msg.
+# `cctally-release patch` (with publish) fails phase 3 with discovery msg.
 _add(
     name="public-clone-not-discoverable",
     seed_changelog=_PATCH_SEED,
@@ -1665,7 +1667,7 @@ _add(
     # APP_DIR check sees an empty marker dir. We override HOME inline.
     run=_RUN_HEADER + (
         'export HOME="$work/_fakehome"\n'
-        'python3 bin/cctally release patch '
+        'python3 bin/cctally-release patch '
         '> "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"\n'
         'rc=$?\n'
         'echo "$rc" > "$work/_artifacts/exit.txt"\n'
@@ -2060,7 +2062,7 @@ _add(
 
 
 # 35d. phase6-refuse-downgrade (issue #30): tap clone has a v2.0.0 formula
-# already committed + pushed. Operator runs `cctally release patch` from
+# already committed + pushed. Operator runs `cctally-release patch` from
 # a CHANGELOG seeded at v0.1.0 — Phase 6's target is v0.1.1, which is
 # strictly lower than the on-disk v2.0.0. The monotonic-version gate
 # refuses with exit 2 and a stderr explanation pointing at issue #30.
@@ -2234,10 +2236,10 @@ _add(
 #
 # These exercise the `--resume` gate (Task 42) at three different
 # completion states across all six phases. Every resume scenario shares
-# the same shape: setup pre-runs `cctally release patch [...]` with
+# the same shape: setup pre-runs `cctally-release patch [...]` with
 # selected `--skip-*` flags so phases 1-N land, then swaps the fake
 # binaries into their "phase done" responses, then run.sh issues a
-# `cctally release --resume` whose behavior depends on which phases
+# `cctally-release --resume` whose behavior depends on which phases
 # the gate sees as done.
 # ---------------------------------------------------------------------------
 # Shared swap snippets:
@@ -2304,7 +2306,7 @@ _add(
         + 'PATH="$work/fake-bin:$PATH" '
         + 'GH_ARGV_LOG="$work/gh-argv.log.partial" '
         + 'GH_NOTES_DEST="$work/gh-notes.partial.txt" '
-        + 'python3 bin/cctally release patch --skip-npm --skip-brew '
+        + 'python3 bin/cctally-release patch --skip-npm --skip-brew '
         + '> "$work/_partial.stdout" 2> "$work/_partial.stderr"\n'
         # Swap fake-gh so `release view` returns 0 (gh_done=True).
         + _FAKE_GH_DONE_SWAP
@@ -2359,7 +2361,7 @@ _add(
         + 'GH_NOTES_DEST="$work/gh-notes.partial.txt" '
         + 'NPM_MOCK_STATE_FILE="$work/npm-mock-state.json" '
         + 'NPM_MOCK_LOG_FILE="$work/npm-invocations.log.partial" '
-        + 'python3 bin/cctally release patch --skip-brew '
+        + 'python3 bin/cctally-release patch --skip-brew '
         + '> "$work/_partial.stdout" 2> "$work/_partial.stderr"\n'
         # Swap fake-gh so `release view` returns 0 (gh_done=True for
         # the resume run).
@@ -2381,7 +2383,7 @@ _add(
 
 
 # 42. resume-all-done: all six phases complete. Pre-run runs the full
-# `cctally release patch`; setup then swaps every fake into its
+# `cctally-release patch`; setup then swaps every fake into its
 # "phase done" state so the resume gate sees stamp/tag/mirror/gh/npm/brew
 # all True and short-circuits with `already published` — phase runners
 # stay untouched.
@@ -2407,7 +2409,7 @@ _add(
         + 'GH_NOTES_DEST="$work/gh-notes.partial.txt" '
         + 'NPM_MOCK_STATE_FILE="$work/npm-mock-state.json" '
         + 'NPM_MOCK_LOG_FILE="$work/npm-invocations.log.partial" '
-        + 'python3 bin/cctally release patch '
+        + 'python3 bin/cctally-release patch '
         + '> "$work/_partial.stdout" 2> "$work/_partial.stderr"\n'
         # Swap fake-gh + npm-mock-state into "phase done" responses so
         # the resume gate sees gh_done + npm_done True. Brew tap clone

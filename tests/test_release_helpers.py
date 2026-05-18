@@ -20,6 +20,36 @@ cctally = importlib.util.module_from_spec(_SPEC)
 sys.modules["cctally"] = cctally
 _LOADER.exec_module(cctally)
 
+# Load bin/_cctally_release.py too — release-automation helpers and
+# `cmd_release` were moved out of bin/cctally into this module; tests
+# monkeypatch them via `_cctally_release.X` now.
+_RELSCRIPT = _REPO / "bin" / "_cctally_release.py"
+_RELLOADER = importlib.machinery.SourceFileLoader("_cctally_release", str(_RELSCRIPT))
+_RELSPEC = importlib.util.spec_from_loader("_cctally_release", _RELLOADER)
+_cctally_release = importlib.util.module_from_spec(_RELSPEC)
+sys.modules["_cctally_release"] = _cctally_release
+_RELLOADER.exec_module(_cctally_release)
+
+
+@pytest.fixture(autouse=True)
+def _pin_cctally_in_sys_modules(monkeypatch):
+    """Pin `sys.modules["cctally"]` to this file's module-global `cctally`
+    for the duration of each test.
+
+    Necessary because conftest.load_script() (used by other test files
+    such as tests/test_lib_changelog.py) replaces `sys.modules["cctally"]`
+    with a freshly-loaded module instance and does NOT restore it on
+    tear-down. `_cctally_release._cctally()` resolves the cctally module
+    via `sys.modules["cctally"]` at call-time (so monkeypatches via the
+    `ns` dict propagate into MOVED helpers under load_script). Without
+    this pin, monkeypatches on this file's module-global `cctally` —
+    e.g. `monkeypatch.setattr(cctally, "CHANGELOG_PATH", tmp)` — wouldn't
+    reach the helpers when test ordering interleaves with load_script
+    callers. monkeypatch restores the prior `sys.modules` entry on
+    tear-down, keeping subsequent tests' invariants intact.
+    """
+    monkeypatch.setitem(sys.modules, "cctally", cctally)
+
 
 class TestParseSemver:
     def test_stable(self):
@@ -82,7 +112,7 @@ class TestComputeNextVersion:
             cctally._release_compute_next_version("1.0.0", "prerelease", None, "rc")
 
     def test_bump_kind_on_prerelease_refuses(self):
-        with pytest.raises(ValueError, match="run 'cctally release finalize'"):
+        with pytest.raises(ValueError, match="run 'cctally-release finalize'"):
             cctally._release_compute_next_version("1.1.0-rc.1", "patch", None, "rc")
 
     def test_bump_flag_on_prerelease_refuses(self):
@@ -104,7 +134,7 @@ class TestParseChangelog:
 - Foo
 - Bar
 """
-        parsed = cctally._release_parse_changelog(text)
+        parsed = _cctally_release._release_parse_changelog(text)
         assert parsed["sections"][0]["heading"] == "## [Unreleased]"
         added = next(s for s in parsed["sections"][0]["subsections"] if s["heading"] == "### Added")
         assert added["bullets"] == ["- Foo", "- Bar"]
@@ -122,7 +152,7 @@ class TestParseChangelog:
 ### Added
 - Initial
 """
-        parsed = cctally._release_parse_changelog(text)
+        parsed = _cctally_release._release_parse_changelog(text)
         assert len(parsed["sections"]) == 2
         assert parsed["sections"][1]["heading"] == "## [1.0.0] - 2026-01-01"
 
@@ -136,7 +166,7 @@ class TestParseChangelog:
   continuation
 - Second
 """
-        parsed = cctally._release_parse_changelog(text)
+        parsed = _cctally_release._release_parse_changelog(text)
         added = parsed["sections"][0]["subsections"][0]
         # Continuation lines are part of the previous bullet block
         assert added["bullets"][0] == "- First line\n  continuation"
@@ -154,7 +184,7 @@ class TestParseChangelog:
   ```
 - Bar
 """
-        parsed = cctally._release_parse_changelog(text)
+        parsed = _cctally_release._release_parse_changelog(text)
         added = parsed["sections"][0]["subsections"][0]
         assert len(added["bullets"]) == 2  # fenced "### Fixed" not mistaken for heading
 
@@ -168,7 +198,7 @@ class TestStampChangelog:
 ### Added
 - Foo
 """
-        new_text, body = cctally._release_stamp_changelog(text, "1.0.0", "2026-05-07")
+        new_text, body = _cctally_release._release_stamp_changelog(text, "1.0.0", "2026-05-07")
         assert "## [1.0.0] - 2026-05-07" in new_text
         assert "## [Unreleased]\n\n## [1.0.0]" in new_text  # empty Unreleased + new section
         assert "- Foo" in new_text
@@ -179,11 +209,11 @@ class TestStampChangelog:
         # GH Release notes (spec §7.4). Re-parsing the stamped CHANGELOG
         # and asking for the new section's canonical body must yield the
         # exact same string.
-        reparsed = cctally._release_parse_changelog(new_text)
+        reparsed = _cctally_release._release_parse_changelog(new_text)
         new_section = next(
             s for s in reparsed["sections"] if s["heading"] == "## [1.0.0] - 2026-05-07"
         )
-        assert cctally._release_canonical_body(new_section) == body
+        assert _cctally_release._release_canonical_body(new_section) == body
 
     def test_empty_unreleased_raises(self):
         text = """# Changelog
@@ -191,7 +221,7 @@ class TestStampChangelog:
 ## [Unreleased]
 """
         with pytest.raises(ValueError, match=r"\[Unreleased\] is empty"):
-            cctally._release_stamp_changelog(text, "1.0.0", "2026-05-07")
+            _cctally_release._release_stamp_changelog(text, "1.0.0", "2026-05-07")
 
     def test_only_empty_subsections_raises(self):
         text = """# Changelog
@@ -203,7 +233,7 @@ class TestStampChangelog:
 ### Fixed
 """
         with pytest.raises(ValueError, match=r"\[Unreleased\] is empty"):
-            cctally._release_stamp_changelog(text, "1.0.0", "2026-05-07")
+            _cctally_release._release_stamp_changelog(text, "1.0.0", "2026-05-07")
 
     def test_multiple_subsections(self):
         text = """# Changelog
@@ -217,7 +247,7 @@ class TestStampChangelog:
 - F1
 - F2
 """
-        new_text, body = cctally._release_stamp_changelog(text, "1.1.0", "2026-05-07")
+        new_text, body = _cctally_release._release_stamp_changelog(text, "1.1.0", "2026-05-07")
         assert body == "### Added\n- A1\n\n### Fixed\n- F1\n- F2"
 
     def test_stamp_preserves_prior_release(self):
@@ -233,7 +263,7 @@ class TestStampChangelog:
 ### Added
 - Old
 """
-        new_text, _ = cctally._release_stamp_changelog(text, "1.1.0", "2026-05-07")
+        new_text, _ = _cctally_release._release_stamp_changelog(text, "1.1.0", "2026-05-07")
         # Order: Unreleased (empty), then 1.1.0 (new), then 1.0.0 (prior)
         idx_unr = new_text.find("## [Unreleased]")
         idx_new = new_text.find("## [1.1.0] - 2026-05-07")
@@ -253,14 +283,14 @@ class TestStampChangelogIdempotency:
 ### Added
 - First entry
 """
-        once, _ = cctally._release_stamp_changelog(text, "1.0.0", "2026-05-07")
+        once, _ = _cctally_release._release_stamp_changelog(text, "1.0.0", "2026-05-07")
         # Re-prime [Unreleased] for a second stamp
         text2 = once.replace(
             "## [Unreleased]\n",
             "## [Unreleased]\n\n### Fixed\n- F1\n",
             1,
         )
-        twice, _ = cctally._release_stamp_changelog(text2, "1.1.0", "2026-05-08")
+        twice, _ = _cctally_release._release_stamp_changelog(text2, "1.1.0", "2026-05-08")
         # Count blank lines between preamble line "# Changelog" and the first "## [...]"
         # Should be exactly one blank line (matching the original input convention).
         idx_h = twice.index("# Changelog\n")
@@ -283,9 +313,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 ### Added
 - A
 """
-        n1, _ = cctally._release_stamp_changelog(text, "1.0.0", "2026-05-07")
+        n1, _ = _cctally_release._release_stamp_changelog(text, "1.0.0", "2026-05-07")
         n2_prime = n1.replace("## [Unreleased]\n", "## [Unreleased]\n\n### Added\n- B\n", 1)
-        n2, _ = cctally._release_stamp_changelog(n2_prime, "1.1.0", "2026-05-08")
+        n2, _ = _cctally_release._release_stamp_changelog(n2_prime, "1.1.0", "2026-05-08")
         # The number of newlines BEFORE the FIRST section heading should be the same in n1 and n2
         # (i.e., no monotonic drift across stamps)
         def newlines_before_first_section(s):
@@ -330,8 +360,8 @@ class TestPreflight:
         """Clean tree on main: branch + clean-tree preflights pass silently."""
         monkeypatch.setattr(cctally, "CHANGELOG_PATH", temp_git_repo / "CHANGELOG.md")
         # Run preflights directly — expect no exception.
-        cctally._release_preflight_branch(allow_branch=None)
-        cctally._release_preflight_clean_tree()
+        _cctally_release._release_preflight_branch(allow_branch=None)
+        _cctally_release._release_preflight_clean_tree()
 
     def test_preflight_wrong_branch_refuses(self, temp_git_repo, monkeypatch):
         """On a feature branch with no --allow-branch override, exit 2."""
@@ -341,7 +371,7 @@ class TestPreflight:
             check=True, cwd=temp_git_repo,
         )
         with pytest.raises(SystemExit) as e:
-            cctally._release_preflight_branch(allow_branch=None)
+            _cctally_release._release_preflight_branch(allow_branch=None)
         assert e.value.code == 2
 
     def test_preflight_allow_branch(self, temp_git_repo, monkeypatch):
@@ -352,14 +382,14 @@ class TestPreflight:
             check=True, cwd=temp_git_repo,
         )
         # No raise.
-        cctally._release_preflight_branch(allow_branch="feature/foo")
+        _cctally_release._release_preflight_branch(allow_branch="feature/foo")
 
     def test_preflight_dirty_tree_refuses(self, temp_git_repo, monkeypatch):
         """Untracked file in working tree: clean-tree preflight exits 2."""
         monkeypatch.setattr(cctally, "CHANGELOG_PATH", temp_git_repo / "CHANGELOG.md")
         (temp_git_repo / "dirty.txt").write_text("x")
         with pytest.raises(SystemExit) as e:
-            cctally._release_preflight_clean_tree()
+            _cctally_release._release_preflight_clean_tree()
         assert e.value.code == 2
 
 
@@ -374,8 +404,8 @@ class TestPhaseStamp:
         commit, returns the new HEAD sha; signal-done flips True."""
         monkeypatch.setattr(cctally, "CHANGELOG_PATH", temp_git_repo / "CHANGELOG.md")
         monkeypatch.setenv("CCTALLY_RELEASE_DATE_UTC", "2026-05-07")
-        sha = cctally._release_run_phase_stamp(
-            "1.0.0", remote="origin", invocation="cctally release minor"
+        sha = _cctally_release._release_run_phase_stamp(
+            "1.0.0", remote="origin", invocation="cctally-release minor"
         )
         text = (temp_git_repo / "CHANGELOG.md").read_text()
         assert "## [1.0.0] - 2026-05-07" in text
@@ -386,7 +416,7 @@ class TestPhaseStamp:
         assert sha in log
         assert "chore(release): v1.0.0" in log
         # Signal-done now reports True with the same SHA.
-        done, sig_sha = cctally._release_phase_stamp_done("1.0.0")
+        done, sig_sha = _cctally_release._release_phase_stamp_done("1.0.0")
         assert done is True
         assert sig_sha == sha
 
@@ -394,8 +424,8 @@ class TestPhaseStamp:
         """Second invocation short-circuits: same SHA, no new commit."""
         monkeypatch.setattr(cctally, "CHANGELOG_PATH", temp_git_repo / "CHANGELOG.md")
         monkeypatch.setenv("CCTALLY_RELEASE_DATE_UTC", "2026-05-07")
-        sha1 = cctally._release_run_phase_stamp(
-            "1.0.0", remote="origin", invocation="cctally release minor"
+        sha1 = _cctally_release._release_run_phase_stamp(
+            "1.0.0", remote="origin", invocation="cctally-release minor"
         )
         commit_count_before = int(
             subprocess.check_output(
@@ -403,8 +433,8 @@ class TestPhaseStamp:
                 text=True, cwd=temp_git_repo,
             ).strip()
         )
-        sha2 = cctally._release_run_phase_stamp(
-            "1.0.0", remote="origin", invocation="cctally release minor"
+        sha2 = _cctally_release._release_run_phase_stamp(
+            "1.0.0", remote="origin", invocation="cctally-release minor"
         )
         assert sha1 == sha2
         commit_count_after = int(
@@ -436,8 +466,8 @@ class TestPhaseTag:
         subprocess.run(
             ["git", "push", "-q", "origin", "main"], check=True, cwd=repo
         )
-        stamp_sha = cctally._release_run_phase_stamp(
-            "1.0.0", "origin", "cctally release minor", "minor"
+        stamp_sha = _cctally_release._release_run_phase_stamp(
+            "1.0.0", "origin", "cctally-release minor", "minor"
         )
         return upstream, stamp_sha
 
@@ -445,7 +475,7 @@ class TestPhaseTag:
         """Annotated tag landed locally and on remote; tag object is `tag`,
         not a lightweight `commit`."""
         upstream, stamp_sha = self._setup_with_stamp(temp_git_repo, monkeypatch)
-        cctally._release_run_phase_tag("1.0.0", "origin", stamp_sha)
+        _cctally_release._release_run_phase_tag("1.0.0", "origin", stamp_sha)
         out = subprocess.check_output(
             ["git", "tag", "-l", "v1.0.0"], text=True, cwd=temp_git_repo,
         ).strip()
@@ -464,9 +494,9 @@ class TestPhaseTag:
     def test_tag_idempotent(self, temp_git_repo, monkeypatch):
         """Second invocation no-ops: same local + remote state, no exception."""
         _, stamp_sha = self._setup_with_stamp(temp_git_repo, monkeypatch)
-        cctally._release_run_phase_tag("1.0.0", "origin", stamp_sha)
+        _cctally_release._release_run_phase_tag("1.0.0", "origin", stamp_sha)
         # Second run is a no-op (signal-done short-circuit).
-        cctally._release_run_phase_tag("1.0.0", "origin", stamp_sha)
+        _cctally_release._release_run_phase_tag("1.0.0", "origin", stamp_sha)
         out = subprocess.check_output(
             ["git", "tag", "-l", "v1.0.0"], text=True, cwd=temp_git_repo,
         ).strip()
@@ -490,16 +520,16 @@ class TestPhaseTag:
         re-parsed from CHANGELOG.md.
         """
         _, stamp_sha = self._setup_with_stamp(temp_git_repo, monkeypatch)
-        cctally._release_run_phase_tag("1.0.0", "origin", stamp_sha)
+        _cctally_release._release_run_phase_tag("1.0.0", "origin", stamp_sha)
 
         # Source 0: the canonical body, recomputed from CHANGELOG.
         text = (temp_git_repo / "CHANGELOG.md").read_text(encoding="utf-8")
-        parsed = cctally._release_parse_changelog(text)
+        parsed = _cctally_release._release_parse_changelog(text)
         section = next(
             s for s in parsed["sections"]
             if s["heading"].lstrip().startswith("## [1.0.0]")
         )
-        canonical = cctally._release_canonical_body(section)
+        canonical = _cctally_release._release_canonical_body(section)
 
         # Source 1: commit message public block.
         commit_msg = subprocess.check_output(
@@ -548,8 +578,8 @@ class TestResumeSafety:
         monkeypatch.setattr(cctally, "CHANGELOG_PATH", temp_git_repo / "CHANGELOG.md")
         monkeypatch.setenv("CCTALLY_RELEASE_DATE_UTC", "2026-05-07")
         # Stamp succeeds.
-        cctally._release_run_phase_stamp(
-            "1.0.0", "origin", "cctally release minor", "minor"
+        _cctally_release._release_run_phase_stamp(
+            "1.0.0", "origin", "cctally-release minor", "minor"
         )
         # Operator lands an unrelated commit on top.
         (temp_git_repo / "README.md").write_text("oops")
@@ -562,7 +592,7 @@ class TestResumeSafety:
         )
         # Done-signal must refuse with exit 2 (NOT silently return done).
         with pytest.raises(SystemExit) as e:
-            cctally._release_phase_stamp_done("1.0.0")
+            _cctally_release._release_phase_stamp_done("1.0.0")
         assert e.value.code == 2
 
     def test_tag_push_local_exists_remote_missing(
@@ -591,9 +621,9 @@ class TestResumeSafety:
             cwd=temp_git_repo,
         )
         # phase-tag-done returns False (remote tag missing).
-        assert not cctally._release_phase_tag_done("1.0.0", "origin")
+        assert not _cctally_release._release_phase_tag_done("1.0.0", "origin")
         # Re-run must succeed: skip `git tag`, push the tag explicitly.
-        cctally._release_run_phase_tag("1.0.0", "origin", stamp_sha)
+        _cctally_release._release_run_phase_tag("1.0.0", "origin", stamp_sha)
         # Remote should now have the tag.
         out = subprocess.check_output(
             ["git", "ls-remote", "--tags", str(upstream), "refs/tags/v1.0.0"],
@@ -613,7 +643,7 @@ class TestPublicCloneDiscovery:
         public.mkdir()
         subprocess.run(["git", "init", "-q", str(public)], check=True)
         args = argparse.Namespace(public_clone=str(public))
-        result = cctally._release_discover_public_clone(args)
+        result = _cctally_release._release_discover_public_clone(args)
         assert result.resolve() == public.resolve()
 
     def test_git_config_fallback(self, temp_git_repo, tmp_path):
@@ -631,7 +661,7 @@ class TestPublicCloneDiscovery:
             check=True, cwd=temp_git_repo,
         )
         args = argparse.Namespace(public_clone=None)
-        result = cctally._release_discover_public_clone(args)
+        result = _cctally_release._release_discover_public_clone(args)
         assert result.resolve() == public.resolve()
 
     def test_marker_file_fallback(
@@ -647,7 +677,7 @@ class TestPublicCloneDiscovery:
         marker.write_text(str(public) + "\n")
         monkeypatch.setattr(cctally, "APP_DIR", marker_dir)
         args = argparse.Namespace(public_clone=None)
-        result = cctally._release_discover_public_clone(args)
+        result = _cctally_release._release_discover_public_clone(args)
         assert result.resolve() == public.resolve()
 
     def test_no_discovery_refuses(
@@ -659,7 +689,7 @@ class TestPublicCloneDiscovery:
         monkeypatch.setattr(cctally, "APP_DIR", marker_dir)
         args = argparse.Namespace(public_clone=None)
         with pytest.raises(SystemExit) as e:
-            cctally._release_discover_public_clone(args)
+            _cctally_release._release_discover_public_clone(args)
         assert e.value.code == 2
 
 
@@ -677,7 +707,7 @@ class TestPhaseMirrorDoneSignal:
         subprocess.run(["git", "init", "-q", str(public)], check=True)
         # No `git remote add origin` — `git remote get-url origin` will
         # exit non-zero, which the helper traps as "not done."
-        assert cctally._release_phase_mirror_done("1.0.0", public) is False
+        assert _cctally_release._release_phase_mirror_done("1.0.0", public) is False
 
 
 class TestPhaseGh:
@@ -716,7 +746,7 @@ exit {exit_code}
         omrikais/cctally` with a notes file."""
         bin_dir, log = self._make_fake_gh(tmp_path)
         monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
-        rc = cctally._release_run_phase_gh("1.0.0", body="### Added\n- Foo")
+        rc = _cctally_release._release_run_phase_gh("1.0.0", body="### Added\n- Foo")
         assert rc == 0
         argv_log = log.read_text()
         assert "release create v1.0.0" in argv_log
@@ -728,7 +758,7 @@ exit {exit_code}
         `gh release create` command for the operator."""
         bin_dir, log = self._make_fake_gh(tmp_path, status_exit=1)
         monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
-        rc = cctally._release_run_phase_gh("1.0.0", body="### Added\n- Foo")
+        rc = _cctally_release._release_run_phase_gh("1.0.0", body="### Added\n- Foo")
         assert rc == 0  # Don't fail the whole release.
         out = capsys.readouterr().out
         assert "skipped" in out.lower() or "manual" in out.lower()
@@ -739,7 +769,7 @@ exit {exit_code}
         `--prerelease` to `gh release create`."""
         bin_dir, log = self._make_fake_gh(tmp_path)
         monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
-        cctally._release_run_phase_gh("1.0.0-rc.1", body="### Added\n- X")
+        _cctally_release._release_run_phase_gh("1.0.0-rc.1", body="### Added\n- X")
         argv_log = log.read_text()
         assert "--prerelease" in argv_log
 
@@ -774,13 +804,13 @@ class TestResume:
         circuit gate runs after these, so they have to pass for the gate
         to be exercised but their internals don't matter for the test."""
         monkeypatch.setattr(
-            cctally, "_release_preflight_branch", lambda *a, **kw: None
+            _cctally_release, "_release_preflight_branch", lambda *a, **kw: None
         )
         monkeypatch.setattr(
-            cctally, "_release_preflight_clean_tree", lambda *a, **kw: None
+            _cctally_release, "_release_preflight_clean_tree", lambda *a, **kw: None
         )
         monkeypatch.setattr(
-            cctally, "_release_preflight_up_to_date", lambda *a, **kw: None
+            _cctally_release, "_release_preflight_up_to_date", lambda *a, **kw: None
         )
         monkeypatch.setattr(
             cctally,
@@ -796,56 +826,56 @@ class TestResume:
         self._stub_preflight_and_version(monkeypatch)
         # All four signals: done.
         monkeypatch.setattr(
-            cctally, "_release_phase_stamp_done", lambda v: (True, "abc1234")
+            _cctally_release, "_release_phase_stamp_done", lambda v: (True, "abc1234")
         )
         monkeypatch.setattr(
-            cctally, "_release_phase_tag_done", lambda v, r: True
+            _cctally_release, "_release_phase_tag_done", lambda v, r: True
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_discover_public_clone",
             lambda args: Path("/tmp/fake-public-clone"),
         )
         monkeypatch.setattr(
-            cctally, "_release_phase_mirror_done", lambda v, c: True
+            _cctally_release, "_release_phase_mirror_done", lambda v, c: True
         )
-        monkeypatch.setattr(cctally, "_release_phase_gh_done", lambda v: True)
+        monkeypatch.setattr(_cctally_release, "_release_phase_gh_done", lambda v: True)
         # Phases 5 + 6 also done — gate now spans all six phases.
         monkeypatch.setattr(
-            cctally, "_release_phase_npm_done", lambda v: True
+            _cctally_release, "_release_phase_npm_done", lambda v: True
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_discover_brew_clone",
             lambda args: Path("/tmp/fake-brew-clone"),
         )
         monkeypatch.setattr(
-            cctally, "_release_phase_brew_done", lambda v, c: True
+            _cctally_release, "_release_phase_brew_done", lambda v, c: True
         )
         # Tripwire: phase runners must NOT be called.
         called: list[str] = []
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_stamp",
             lambda *a, **kw: called.append("stamp") or "deadbeef",
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_tag",
             lambda *a, **kw: called.append("tag"),
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_mirror",
             lambda *a, **kw: called.append("mirror"),
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_gh",
             lambda *a, **kw: called.append("gh") or 0,
         )
 
-        rc = cctally.cmd_release(self._make_resume_args())
+        rc = _cctally_release.cmd_release(self._make_resume_args())
         assert rc == 0
         assert called == [], f"phase runners called on already-done resume: {called}"
         out = capsys.readouterr().out
@@ -859,22 +889,22 @@ class TestResume:
         self._stub_preflight_and_version(monkeypatch)
         # Only stamp signal-done; tag/mirror/gh are not.
         monkeypatch.setattr(
-            cctally, "_release_phase_stamp_done", lambda v: (True, "abc1234")
+            _cctally_release, "_release_phase_stamp_done", lambda v: (True, "abc1234")
         )
         monkeypatch.setattr(
-            cctally, "_release_phase_tag_done", lambda v, r: False
+            _cctally_release, "_release_phase_tag_done", lambda v, r: False
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_discover_public_clone",
             lambda args: Path("/tmp/fake-public-clone"),
         )
         monkeypatch.setattr(
-            cctally, "_release_phase_mirror_done", lambda v, c: False
+            _cctally_release, "_release_phase_mirror_done", lambda v, c: False
         )
-        monkeypatch.setattr(cctally, "_release_phase_gh_done", lambda v: False)
+        monkeypatch.setattr(_cctally_release, "_release_phase_gh_done", lambda v: False)
         monkeypatch.setattr(
-            cctally, "_release_phase_npm_done", lambda v: False
+            _cctally_release, "_release_phase_npm_done", lambda v: False
         )
         # Phase 6 (brew) fall-through: discovery returns a fake clone so
         # the loop reaches the brew runner; the done-signal is False so
@@ -883,52 +913,52 @@ class TestResume:
         # monotonic-version gate (issue #30) rejects the v1.0.0 stub
         # version against any newer formula on disk (issue #36).
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_discover_brew_clone",
             lambda args: Path("/tmp/fake-brew-clone"),
         )
         monkeypatch.setattr(
-            cctally, "_release_phase_brew_done", lambda v, c: False
+            _cctally_release, "_release_phase_brew_done", lambda v, c: False
         )
         # Stub all six phase runners + body extractor.
         called: list[str] = []
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_stamp",
             lambda *a, **kw: called.append("stamp") or "deadbeef",
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_tag",
             lambda *a, **kw: called.append("tag"),
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_mirror",
             lambda *a, **kw: called.append("mirror"),
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_gh",
             lambda *a, **kw: called.append("gh") or 0,
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_npm",
             lambda *a, **kw: called.append("npm") or 0,
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_brew",
             lambda *a, **kw: called.append("brew") or 0,
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_extract_body_from_changelog",
             lambda v: "### Added\n- Foo",
         )
 
-        rc = cctally.cmd_release(self._make_resume_args())
+        rc = _cctally_release.cmd_release(self._make_resume_args())
         assert rc == 0
         # Phase loop ran (each helper short-circuits internally based on
         # its own signal — the stubs simulate "do the work").
@@ -952,61 +982,61 @@ class TestResume:
         self._stub_preflight_and_version(monkeypatch)
         # Stamp + tag + gh: done. Discovery raises SystemExit(2).
         monkeypatch.setattr(
-            cctally, "_release_phase_stamp_done", lambda v: (True, "abc1234")
+            _cctally_release, "_release_phase_stamp_done", lambda v: (True, "abc1234")
         )
         monkeypatch.setattr(
-            cctally, "_release_phase_tag_done", lambda v, r: True
+            _cctally_release, "_release_phase_tag_done", lambda v, r: True
         )
 
         def _raise_exit(*a, **kw):
             raise SystemExit(2)
 
         monkeypatch.setattr(
-            cctally, "_release_discover_public_clone", _raise_exit
+            _cctally_release, "_release_discover_public_clone", _raise_exit
         )
         # Tripwire: mirror_done helper must NOT be reached (we trust gh).
         called: list[str] = []
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_phase_mirror_done",
             lambda v, c: called.append("mirror_done") or True,
         )
-        monkeypatch.setattr(cctally, "_release_phase_gh_done", lambda v: True)
+        monkeypatch.setattr(_cctally_release, "_release_phase_gh_done", lambda v: True)
         # Phases 5 + 6 also done — gate now spans all six phases.
         monkeypatch.setattr(
-            cctally, "_release_phase_npm_done", lambda v: True
+            _cctally_release, "_release_phase_npm_done", lambda v: True
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_discover_brew_clone",
             lambda args: Path("/tmp/fake-brew-clone"),
         )
         monkeypatch.setattr(
-            cctally, "_release_phase_brew_done", lambda v, c: True
+            _cctally_release, "_release_phase_brew_done", lambda v, c: True
         )
         # Tripwire: phase runners must NOT be called either.
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_stamp",
             lambda *a, **kw: called.append("stamp") or "deadbeef",
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_tag",
             lambda *a, **kw: called.append("tag"),
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_mirror",
             lambda *a, **kw: called.append("mirror"),
         )
         monkeypatch.setattr(
-            cctally,
+            _cctally_release,
             "_release_run_phase_gh",
             lambda *a, **kw: called.append("gh") or 0,
         )
 
-        rc = cctally.cmd_release(self._make_resume_args())
+        rc = _cctally_release.cmd_release(self._make_resume_args())
         captured = capsys.readouterr()
         assert rc == 0
         # mirror_done helper short-circuited under SystemExit, phase
@@ -1025,8 +1055,8 @@ class TestReleasePhase5Polling:
     """Phase 5 (await-npm-via-GHA) polling behavior."""
 
     def test_already_on_registry_short_circuits(self, monkeypatch, capsys):
-        monkeypatch.setattr(cctally, "_release_phase_npm_done", lambda v: True)
-        rc = cctally._release_run_phase_npm(
+        monkeypatch.setattr(_cctally_release, "_release_phase_npm_done", lambda v: True)
+        rc = _cctally_release._release_run_phase_npm(
             "0.1.1", Path("/tmp/x"), dist_tag="latest"
         )
         assert rc == 0
@@ -1041,11 +1071,11 @@ class TestReleasePhase5Polling:
             calls.append(v)
             return next(responses)
 
-        monkeypatch.setattr(cctally, "_release_phase_npm_done", _done)
+        monkeypatch.setattr(_cctally_release, "_release_phase_npm_done", _done)
         monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S", "10")
         monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_INTERVAL_S", "0.01")
 
-        rc = cctally._release_run_phase_npm(
+        rc = _cctally_release._release_run_phase_npm(
             "0.1.1", Path("/tmp/x"), dist_tag="latest"
         )
         assert rc == 0
@@ -1056,11 +1086,11 @@ class TestReleasePhase5Polling:
     def test_poll_timeout_returns_0_with_actions_url(
         self, monkeypatch, capsys
     ):
-        monkeypatch.setattr(cctally, "_release_phase_npm_done", lambda v: False)
+        monkeypatch.setattr(_cctally_release, "_release_phase_npm_done", lambda v: False)
         monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S", "0.05")
         monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_INTERVAL_S", "0.01")
 
-        rc = cctally._release_run_phase_npm(
+        rc = _cctally_release._release_run_phase_npm(
             "0.1.1", Path("/tmp/x"), dist_tag="latest"
         )
         assert rc == 0
@@ -1073,18 +1103,18 @@ class TestReleasePhase5Polling:
         # Defaults when env is absent.
         monkeypatch.delenv("CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S", raising=False)
         monkeypatch.delenv("CCTALLY_RELEASE_NPM_POLL_INTERVAL_S", raising=False)
-        timeout, interval = cctally._release_npm_poll_timing()
+        timeout, interval = _cctally_release._release_npm_poll_timing()
         assert timeout == 300.0
         assert interval == 10.0
 
         # Honored when set.
         monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S", "42")
         monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_INTERVAL_S", "1.5")
-        timeout, interval = cctally._release_npm_poll_timing()
+        timeout, interval = _cctally_release._release_npm_poll_timing()
         assert timeout == 42.0
         assert interval == 1.5
 
         # Non-numeric falls back to defaults.
         monkeypatch.setenv("CCTALLY_RELEASE_NPM_POLL_TIMEOUT_S", "not-a-number")
-        timeout, _ = cctally._release_npm_poll_timing()
+        timeout, _ = _cctally_release._release_npm_poll_timing()
         assert timeout == 300.0

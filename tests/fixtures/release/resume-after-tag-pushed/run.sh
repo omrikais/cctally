@@ -23,7 +23,7 @@ export GH_NOTES_DEST="$work/_artifacts/gh-notes.txt"
 # Per-scenario artifact dir; the harness reads files under it for the
 # golden-* comparisons.
 mkdir -p "$work/_artifacts"
-python3 bin/cctally release --resume > "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"
+python3 bin/cctally-release --resume > "$work/_artifacts/stdout.txt" 2> "$work/_artifacts/stderr.txt"
 rc=$?
 echo "$rc" > "$work/_artifacts/exit.txt"
 cp CHANGELOG.md "$work/_artifacts/changelog.md" 2>/dev/null || true

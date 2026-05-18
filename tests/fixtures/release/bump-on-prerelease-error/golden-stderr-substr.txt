@@ -1,1 +1,1 @@
-cctally release finalize
+cctally-release finalize

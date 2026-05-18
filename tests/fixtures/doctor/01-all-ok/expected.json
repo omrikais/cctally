@@ -5,12 +5,12 @@
                 {
                     "details": {
                         "missing": [],
-                        "present": 13,
-                        "total": 13
+                        "present": 12,
+                        "total": 12
                     },
                     "id": "install.symlinks",
                     "severity": "ok",
-                    "summary": "13/13 present",
+                    "summary": "12/12 present",
                     "title": "Symlinks"
                 },
                 {

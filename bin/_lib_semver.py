@@ -76,7 +76,7 @@ def _release_compute_next_version(
         return _release_format_semver(nxt_maj, nxt_min, nxt_pat, prerelease_id, 1)
 
     if is_prerelease:
-        raise ValueError("current version is a prerelease; run 'cctally release finalize' first or use --bump in a prerelease bump")
+        raise ValueError("current version is a prerelease; run 'cctally-release finalize' first or use --bump in a prerelease bump")
 
     if kind == "patch":
         return _release_format_semver(cur_maj, cur_min, cur_pat + 1)

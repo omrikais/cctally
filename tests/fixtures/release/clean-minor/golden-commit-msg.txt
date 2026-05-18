@@ -2,7 +2,7 @@ chore(release): v0.2.0
 
 Stamp release v0.2.0 over 3 [Unreleased] entries.
 
-Run by `cctally release minor` from main at <SHA7>.
+Run by `cctally-release minor` from main at <SHA7>.
 Bump kind: minor.
 Subsections stamped: Added (2), Fixed (1).
 

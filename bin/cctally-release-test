@@ -7,7 +7,7 @@
 #                                 private.git bare + public working
 #                                 clone + public.git bare); seeds
 #                                 CHANGELOG.md per-scenario.
-#   - run.sh                    : invokes `cctally release ...` from
+#   - run.sh                    : invokes `cctally-release ...` from
 #                                 inside private/ and writes deterministic
 #                                 artifacts to $work/_artifacts/ for the
 #                                 harness to compare against goldens.
@@ -60,7 +60,7 @@ export CCTALLY_RELEASE_BREW_ARCHIVE_URL="file://$REPO_ROOT/tests/fixtures/releas
 # do `release.brewClone = …` for their real homebrew clone failed
 # locally. /dev/null is the documented git-supported sentinel for
 # "skip this config layer." Applies to every git invocation issued by
-# setup.sh, run.sh, and the cctally release subprocess they fork.
+# setup.sh, run.sh, and the cctally-release subprocess they fork.
 export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_CONFIG_NOSYSTEM=1
 
@@ -145,7 +145,7 @@ run_scenario() {
     if [ -f "$artifact_dir/exit.txt" ]; then
         # run.sh wrote the inner-process exit code (the release script's
         # exit code) to exit.txt. Use that for the comparison so the
-        # harness sees the actual cctally release exit, not the wrapper's
+        # harness sees the actual cctally-release exit, not the wrapper's
         # bash exit (which can differ if run.sh has its own assertions
         # before exiting).
         actual_exit=$(cat "$artifact_dir/exit.txt" | tr -d '\n')

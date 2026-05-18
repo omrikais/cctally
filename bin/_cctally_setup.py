@@ -242,8 +242,20 @@ def _setup_local_bin_dir() -> pathlib.Path:
 @dataclasses.dataclass
 class _SetupSymlinkResult:
     name: str
-    status: str   # "created" | "already" | "replaced" | "failed"
+    status: str   # "created" | "already" | "replaced" | "failed" | "removed-stale"
     detail: str = ""
+
+
+# Symlink names cctally USED to install but no longer does. We keep
+# cleaning them up for one major-version's worth of upgraders so
+# `~/.local/bin/` doesn't accumulate dangling symlinks pointing at
+# scripts the current cctally checkout doesn't ship. Removal is
+# conservative: we only unlink symlinks whose `readlink()` target's
+# basename matches the stale name — a user's hand-rolled symlink with
+# the same name pointing elsewhere is left alone.
+_SETUP_STALE_SYMLINK_NAMES = (
+    "cctally-release",  # Removed in v1.9.0; release tooling went private.
+)
 
 
 def _setup_resolve_symlink_source(repo_root: pathlib.Path, name: str) -> pathlib.Path:
@@ -323,6 +335,42 @@ def _setup_create_symlinks(
             results.append(_SetupSymlinkResult(name, "created"))
         except OSError as exc:
             results.append(_SetupSymlinkResult(name, "failed", str(exc)))
+    return results
+
+
+def _setup_cleanup_stale_symlinks(
+    dst_dir: pathlib.Path,
+) -> list[_SetupSymlinkResult]:
+    """Unlink stale `cctally-*` symlinks left over from prior versions.
+
+    For each entry in :data:`_SETUP_STALE_SYMLINK_NAMES`, removes the
+    matching symlink in ``dst_dir`` **only** when its readlink target
+    basename matches the stale name — a user's hand-rolled symlink with
+    the same name pointing at something else is left alone. Returns a
+    list of :class:`_SetupSymlinkResult` entries for the actions taken
+    (so callers can fold them into install output).
+    """
+    results: list[_SetupSymlinkResult] = []
+    for name in _SETUP_STALE_SYMLINK_NAMES:
+        dst = dst_dir / name
+        if not dst.is_symlink():
+            continue
+        try:
+            target = os.readlink(dst)
+        except OSError:
+            continue
+        if pathlib.Path(target).name != name:
+            # User-managed symlink that happens to share the name; leave alone.
+            continue
+        try:
+            dst.unlink()
+            results.append(
+                _SetupSymlinkResult(name, "removed-stale", "stale (from prior version)")
+            )
+        except OSError as exc:
+            results.append(
+                _SetupSymlinkResult(name, "failed", f"unlink failed: {exc}")
+            )
     return results
 
 
@@ -816,12 +864,36 @@ def _setup_compute_symlink_state(
     return out
 
 
+def _setup_detect_stale_symlinks(dst_dir: pathlib.Path) -> list[str]:
+    """Return names of stale-but-still-present cctally symlinks in ``dst_dir``.
+
+    Mirrors :func:`_setup_cleanup_stale_symlinks` detection (without
+    removing): a symlink is "stale" only when both the name appears in
+    :data:`_SETUP_STALE_SYMLINK_NAMES` AND its readlink target's
+    basename matches that name (so user-managed symlinks sharing the
+    name don't get falsely flagged).
+    """
+    found: list[str] = []
+    for name in _SETUP_STALE_SYMLINK_NAMES:
+        dst = dst_dir / name
+        if not dst.is_symlink():
+            continue
+        try:
+            target = os.readlink(dst)
+        except OSError:
+            continue
+        if pathlib.Path(target).name == name:
+            found.append(name)
+    return found
+
+
 def _setup_status(args: argparse.Namespace) -> int:
     c = _cctally()
     repo_root = _setup_resolve_repo_root()
     dst_dir = _setup_local_bin_dir()
     sym_state = _setup_compute_symlink_state(repo_root, dst_dir)
     sym_ok = sum(1 for _, s in sym_state if s == "ok")
+    stale_syms = _setup_detect_stale_symlinks(dst_dir)
     on_path = _setup_path_includes_local_bin()
     try:
         settings = c._load_claude_settings()
@@ -842,6 +914,7 @@ def _setup_status(args: argparse.Namespace) -> int:
             "install": {
                 "symlinks_present": sym_ok,
                 "symlinks_total": len(c.SETUP_SYMLINK_NAMES),
+                "symlinks_stale": stale_syms,
                 "path_includes": on_path,
             },
             "hooks": {ev: hook_counts[ev] for ev in c.SETUP_HOOK_EVENTS},
@@ -869,6 +942,11 @@ def _setup_status(args: argparse.Namespace) -> int:
     out.append("Install")
     sym_marker = "✓" if sym_ok == len(c.SETUP_SYMLINK_NAMES) else "✗"
     out.append(f"  Symlinks       {sym_ok}/{len(c.SETUP_SYMLINK_NAMES)} present at {dst_dir}/  {sym_marker}")
+    if stale_syms:
+        out.append(
+            f"  Stale symlinks {len(stale_syms)} from prior version: {', '.join(stale_syms)}  ⚠"
+        )
+        out.append("                 run `cctally setup` to remove")
     out.append(f"  PATH includes  {'yes' if on_path else 'no'}                                   "
                f"{'✓' if on_path else '⚠'}")
     out.append(f"Hooks ({c.CLAUDE_SETTINGS_PATH})")
@@ -1336,6 +1414,13 @@ def _setup_install(args: argparse.Namespace) -> int:
         eprint(f"setup: {exc}")
         return 1
 
+    # Clean up symlinks left behind by prior cctally versions whose
+    # subcommand surface has changed (e.g. v1.9.0 retired
+    # `cctally-release` when release tooling went private). Only unlinks
+    # symlinks whose target's basename matches the stale name; never
+    # disturbs a user's hand-rolled symlink sharing the name.
+    stale_results = _setup_cleanup_stale_symlinks(dst_dir)
+
     sym_results = _setup_create_symlinks(repo_root, dst_dir)
     failed = [r for r in sym_results if r.status == "failed"]
     if failed:
@@ -1354,6 +1439,16 @@ def _setup_install(args: argparse.Namespace) -> int:
         detail_parts.append(f"{repl_count} re-pointed")
     detail = ", ".join(detail_parts) or "no changes"
     out.append(f"✓ Symlinks at {dst_dir}/: {len(sym_results)}/{len(sym_results)} ({detail})")
+    removed_stale = [r for r in stale_results if r.status == "removed-stale"]
+    failed_stale = [r for r in stale_results if r.status == "failed"]
+    if removed_stale:
+        out.append(
+            "✓ Cleaned up stale symlink(s) from prior version: "
+            + ", ".join(r.name for r in removed_stale)
+        )
+    for r in failed_stale:
+        out.append(f"⚠ Could not remove stale {r.name}: {r.detail}")
+        warnings += 1
 
     if not _setup_path_includes_local_bin():
         warnings += 1

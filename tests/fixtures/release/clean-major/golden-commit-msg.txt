@@ -2,7 +2,7 @@ chore(release): v1.0.0
 
 Stamp release v1.0.0 over 1 [Unreleased] entries.
 
-Run by `cctally release major` from main at <SHA7>.
+Run by `cctally-release major` from main at <SHA7>.
 Bump kind: major.
 Subsections stamped: Changed (1).
 

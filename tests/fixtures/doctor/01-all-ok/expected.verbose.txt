@@ -1,10 +1,10 @@
 cctally doctor — 2026-05-13 14:22:31 UTC
 
 Install
-  ✓ Symlinks                 13/13 present
+  ✓ Symlinks                 12/12 present
       details:
-        present: 13
-        total: 13
+        present: 12
+        total: 12
         missing: []
   ✓ PATH                     ~/.local/bin on $PATH
   ✓ Legacy status-line snippet not detected

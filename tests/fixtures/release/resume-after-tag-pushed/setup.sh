@@ -164,8 +164,22 @@ cp "$REPO_ROOT/.githooks/pre-commit" .githooks/
 cp "$REPO_ROOT/.public-tag-patterns" .
 cp "$REPO_ROOT/bin/cctally" bin/
 chmod +x bin/cctally
+cp "$REPO_ROOT/bin/cctally-release" bin/
+chmod +x bin/cctally-release
 cp "$REPO_ROOT/bin/cctally-mirror-public" bin/
 chmod +x bin/cctally-mirror-public
+# bin/cctally eager-loads sibling _lib_*.py modules and lazy-loads
+# _cctally_*.py modules via spec_from_file_location relative to its
+# own resolved path (see bin/cctally: _load_sibling). Mirror BOTH
+# prefixes into the scratch bin/ so the eager loads at module import
+# time AND the PEP 562 lazy loads on first release/etc. access succeed
+# — without this, every `cctally-release …` invocation in the scenario
+# crashes at import with FileNotFoundError on _lib_semver.py (eager)
+# or on _cctally_release.py (lazy, first release-region access).
+for libsib in "$REPO_ROOT"/bin/_lib_*.py "$REPO_ROOT"/bin/_cctally_*.py; do
+    [ -f "$libsib" ] || continue
+    cp "$libsib" bin/
+done
 
 # CHANGELOG.md is seeded per-scenario (after this scaffold ends). The
 # infra-bootstrap commit lands AFTER CHANGELOG.md is written so the
@@ -220,4 +234,4 @@ CCTALLY_BOOTSTRAP_PY_EOF
   git add -A && \
   git commit -q --no-verify -m "seed: bootstrap public mirror" && \
   git push -q origin main)
-CCTALLY_RELEASE_DATE_UTC=2026-05-07 GIT_AUTHOR_DATE="2026-05-07T00:00:00+0000" GIT_COMMITTER_DATE="2026-05-07T00:00:00+0000" python3 bin/cctally release patch --no-publish > "$work/_partial.stdout" 2> "$work/_partial.stderr"
+CCTALLY_RELEASE_DATE_UTC=2026-05-07 GIT_AUTHOR_DATE="2026-05-07T00:00:00+0000" GIT_COMMITTER_DATE="2026-05-07T00:00:00+0000" python3 bin/cctally-release patch --no-publish > "$work/_partial.stdout" 2> "$work/_partial.stderr"
