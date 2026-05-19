@@ -3869,6 +3869,35 @@ mark.current {
   outline-offset: 2px;
 }
 
+/* Footer hint row (spec §3.1 layout item 6): keyboard shortcuts +
+ * live freshness chip. Muted, 12px, separator dots between groups.
+ * Wraps on narrow viewports — each shortcut group is its own inline
+ * span so flexbox can break between them. */
+.projects-modal-footer-hint {
+  display: flex; flex-wrap: wrap; align-items: baseline;
+  gap: 4px 8px;
+  margin-top: 14px; padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+  color: var(--text-dim); font-size: 12px;
+}
+.projects-modal-footer-hint .sep { color: var(--border-soft); }
+.projects-modal-footer-hint kbd {
+  font-family: inherit; font-size: 11px;
+  padding: 1px 4px; margin: 0 1px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-soft);
+  color: var(--text-dim);
+}
+/* SyncChip in the footer drops its own background/padding — we just
+ * want the text reading "synced 3s ago" inline with the hints. */
+.projects-modal-footer-hint .sync-chip {
+  font-size: 12px;
+  padding: 0;
+  background: none;
+  margin-left: auto;
+}
+
 .projects-drill {
   margin-top: 14px; padding: 12px 14px; border-radius: 8px;
   border: 1px dashed var(--border-soft);

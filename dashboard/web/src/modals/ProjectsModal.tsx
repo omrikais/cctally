@@ -25,8 +25,10 @@ import { Modal } from './Modal';
 import { ProjectsTrendChart } from './ProjectsTrendChart';
 import { ProjectsDrillPanel } from './ProjectsDrillPanel';
 import { ShareIcon } from '../components/ShareIcon';
+import { SyncChip } from '../components/SyncChip';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
+import { useKeymap } from '../hooks/useKeymap';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { fmt } from '../lib/fmt';
@@ -150,6 +152,56 @@ export function ProjectsModal() {
   const visibleRows = tableExpanded ? tableRows : collapsedRows;
   const canExpand = hiddenWhenCollapsed > 0;
 
+  // Spec §3.7 keyboard bindings. Bindings re-register each render so the
+  // closures capture the latest selectedKey / visibleRows / windowWeeks
+  // / yMode — useKeymap accepts the re-registration cost in exchange
+  // for not needing refs for every captured value (its docstring
+  // explicitly allows this trade-off). `0` maps to 12w by convention
+  // (`0` reads as "max").
+  useKeymap([
+    { key: '1', scope: 'modal', action: () => savePref('projectsWindowWeeks', 1) },
+    { key: '4', scope: 'modal', action: () => savePref('projectsWindowWeeks', 4) },
+    { key: '8', scope: 'modal', action: () => savePref('projectsWindowWeeks', 8) },
+    { key: '0', scope: 'modal', action: () => savePref('projectsWindowWeeks', 12) },
+    {
+      key: 's',
+      scope: 'modal',
+      action: () =>
+        savePref('projectsTrendYMode', yMode === 'share' ? 'absolute' : 'share'),
+    },
+    {
+      key: 'ArrowUp',
+      scope: 'modal',
+      action: () => {
+        if (visibleRows.length === 0) return;
+        const idx = visibleRows.findIndex((r) => r.key === selectedKey);
+        const next = idx <= 0 ? visibleRows.length - 1 : idx - 1;
+        setSelectedKey(visibleRows[next].key);
+      },
+    },
+    {
+      key: 'ArrowDown',
+      scope: 'modal',
+      action: () => {
+        if (visibleRows.length === 0) return;
+        const idx = visibleRows.findIndex((r) => r.key === selectedKey);
+        const next = idx === -1 || idx === visibleRows.length - 1 ? 0 : idx + 1;
+        setSelectedKey(visibleRows[next].key);
+      },
+    },
+    {
+      key: 'Enter',
+      scope: 'modal',
+      action: () => {
+        if (selectedKey) {
+          setSelectedKey(null);
+        } else if (visibleRows.length > 0) {
+          setSelectedKey(visibleRows[0].key);
+        }
+      },
+    },
+  ]);
+
   return (
     <Modal
       title={`Projects · last ${windowWeeks}w`}
@@ -271,6 +323,24 @@ export function ProjectsModal() {
         {selectedKey && (
           <ProjectsDrillPanel projectKey={selectedKey} windowWeeks={windowWeeks} />
         )}
+
+        <div
+          className="projects-modal-footer-hint"
+          data-testid="projects-modal-footer-hint"
+          aria-live="off"
+        >
+          <span><kbd>1</kbd>/<kbd>4</kbd>/<kbd>8</kbd>/<kbd>0</kbd> window</span>
+          <span className="sep" aria-hidden="true">·</span>
+          <span><kbd>↑↓</kbd> row</span>
+          <span className="sep" aria-hidden="true">·</span>
+          <span><kbd>Enter</kbd> drill</span>
+          <span className="sep" aria-hidden="true">·</span>
+          <span><kbd>s</kbd> share/$</span>
+          <span className="sep" aria-hidden="true">·</span>
+          <span><kbd>Esc</kbd> close</span>
+          <span className="sep" aria-hidden="true">·</span>
+          <SyncChip />
+        </div>
       </div>
     </Modal>
   );

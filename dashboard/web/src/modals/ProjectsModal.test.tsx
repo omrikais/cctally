@@ -17,6 +17,10 @@ import {
   getState,
   updateSnapshot,
 } from '../store/store';
+import {
+  installGlobalKeydown,
+  _resetForTests as _resetKeymap,
+} from '../store/keymap';
 import type {
   Envelope,
   ProjectDetail,
@@ -182,11 +186,14 @@ function stubFetchOk(body: unknown) {
 beforeEach(() => {
   localStorage.clear();
   _resetForTests();
+  _resetKeymap();
+  installGlobalKeydown();
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  _resetKeymap();
 });
 
 describe('<ProjectsModal />', () => {
@@ -534,6 +541,77 @@ describe('<ProjectsModal />', () => {
     fireEvent.click(link);
     expect(getState().filterText).toBe('project-1');
     expect(getState().openModal).toBeNull();
+  });
+
+  it('renders the footer hint row with shortcuts + freshness chip (spec §3.1 item 6)', () => {
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));
+    render(<ProjectsModal />);
+    const footer = screen.getByTestId('projects-modal-footer-hint');
+    // Shortcut chips are advertised in the hint.
+    expect(footer).toHaveTextContent('window');
+    expect(footer).toHaveTextContent('row');
+    expect(footer).toHaveTextContent('drill');
+    expect(footer).toHaveTextContent('close');
+    // SyncChip rendered as a child — falls back to "sync paused" when
+    // the envelope's sync_age_s is null (baseEnvelope default), which
+    // is enough to prove the freshness slot is wired.
+    expect(footer.querySelector('.sync-chip')).not.toBeNull();
+  });
+
+  it('keymap: pressing 8 sets the window to 8w; 0 sets it to 12w (spec §3.7)', () => {
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 12 }));
+    render(<ProjectsModal />);
+    expect(getState().prefs.projectsWindowWeeks).toBe(4); // default
+    fireEvent.keyDown(document, { key: '8' });
+    expect(getState().prefs.projectsWindowWeeks).toBe(8);
+    fireEvent.keyDown(document, { key: '0' });
+    expect(getState().prefs.projectsWindowWeeks).toBe(12);
+    fireEvent.keyDown(document, { key: '1' });
+    expect(getState().prefs.projectsWindowWeeks).toBe(1);
+  });
+
+  it('keymap: pressing s toggles the yMode (spec §3.7)', () => {
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4 }));
+    render(<ProjectsModal />);
+    expect(getState().prefs.projectsTrendYMode).toBe('absolute');
+    fireEvent.keyDown(document, { key: 's' });
+    expect(getState().prefs.projectsTrendYMode).toBe('share');
+    fireEvent.keyDown(document, { key: 's' });
+    expect(getState().prefs.projectsTrendYMode).toBe('absolute');
+  });
+
+  it('keymap: ArrowDown / ArrowUp navigates row selection (spec §3.7)', () => {
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));
+    render(<ProjectsModal />);
+    // Leader (project-1) pre-selected on mount.
+    expect(document.querySelector('tr.selected')?.firstElementChild?.textContent).toBe('project-1');
+    fireEvent.keyDown(document, { key: 'ArrowDown' });
+    expect(document.querySelector('tr.selected')?.firstElementChild?.textContent).toBe('project-2');
+    fireEvent.keyDown(document, { key: 'ArrowDown' });
+    expect(document.querySelector('tr.selected')?.firstElementChild?.textContent).toBe('project-3');
+    // Wrap from last → first.
+    fireEvent.keyDown(document, { key: 'ArrowDown' });
+    expect(document.querySelector('tr.selected')?.firstElementChild?.textContent).toBe('project-1');
+    // ArrowUp wraps the other way.
+    fireEvent.keyDown(document, { key: 'ArrowUp' });
+    expect(document.querySelector('tr.selected')?.firstElementChild?.textContent).toBe('project-3');
+  });
+
+  it('keymap: Enter toggles drill on the selected row (spec §3.7)', () => {
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));
+    render(<ProjectsModal />);
+    // Leader auto-selected → drill is open. Enter collapses.
+    expect(document.querySelector('tr.selected')).not.toBeNull();
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(document.querySelector('tr.selected')).toBeNull();
+    // Press Enter again with no selection → re-opens on the leader.
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(document.querySelector('tr.selected')?.firstElementChild?.textContent).toBe('project-1');
   });
 
   it('chart aria-label reflects yMode (cost vs share %)', () => {
