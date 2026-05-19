@@ -1446,10 +1446,34 @@
       "projects": [
         {
           "bucket_path": "/fake/repos/beta",
-          "first_seen_at": "2026-03-18T06:00:00Z",
+          "first_seen_per_week": [
+            null,
+            null,
+            "2026-03-18T06:00:00Z",
+            null,
+            null,
+            "2026-04-08T06:00:00Z",
+            "2026-04-14T00:00:00Z"
+          ],
           "key": "beta",
-          "last_seen_at": "2026-04-18T10:05:00Z",
-          "sessions_count_12w": 7,
+          "last_seen_per_week": [
+            null,
+            null,
+            "2026-03-18T06:00:00Z",
+            null,
+            null,
+            "2026-04-08T06:00:00Z",
+            "2026-04-18T10:05:00Z"
+          ],
+          "sessions_per_week": [
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            5
+          ],
           "weekly_cost": [
             0.0,
             0.0,
@@ -1471,10 +1495,34 @@
         },
         {
           "bucket_path": "/fake/repos/gamma",
-          "first_seen_at": "2026-03-11T06:00:00Z",
+          "first_seen_per_week": [
+            null,
+            "2026-03-11T06:00:00Z",
+            null,
+            null,
+            "2026-04-01T06:00:00Z",
+            null,
+            "2026-04-14T10:00:00Z"
+          ],
           "key": "gamma",
-          "last_seen_at": "2026-04-18T14:35:00Z",
-          "sessions_count_12w": 7,
+          "last_seen_per_week": [
+            null,
+            "2026-03-11T06:00:00Z",
+            null,
+            null,
+            "2026-04-01T06:00:00Z",
+            null,
+            "2026-04-18T14:35:00Z"
+          ],
+          "sessions_per_week": [
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            5
+          ],
           "weekly_cost": [
             0.0,
             26.400000000000002,
@@ -1496,10 +1544,34 @@
         },
         {
           "bucket_path": "/fake/repos/alpha",
-          "first_seen_at": "2026-03-04T06:00:00Z",
+          "first_seen_per_week": [
+            "2026-03-04T06:00:00Z",
+            null,
+            null,
+            "2026-03-25T06:00:00Z",
+            null,
+            null,
+            "2026-04-13T14:00:00Z"
+          ],
           "key": "alpha",
-          "last_seen_at": "2026-04-18T05:35:00Z",
-          "sessions_count_12w": 7,
+          "last_seen_per_week": [
+            "2026-03-04T06:00:00Z",
+            null,
+            null,
+            "2026-03-25T06:00:00Z",
+            null,
+            null,
+            "2026-04-18T05:35:00Z"
+          ],
+          "sessions_per_week": [
+            1,
+            0,
+            0,
+            1,
+            0,
+            0,
+            5
+          ],
           "weekly_cost": [
             26.400000000000002,
             0.0,
@@ -1521,10 +1593,34 @@
         },
         {
           "bucket_path": "/fake/repos/fixture-demo",
-          "first_seen_at": "2026-04-18T12:00:00Z",
+          "first_seen_per_week": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "2026-04-18T12:00:00Z"
+          ],
           "key": "fixture-demo",
-          "last_seen_at": "2026-04-18T12:50:00Z",
-          "sessions_count_12w": 1,
+          "last_seen_per_week": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "2026-04-18T12:50:00Z"
+          ],
+          "sessions_per_week": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1
+          ],
           "weekly_cost": [
             0.0,
             0.0,

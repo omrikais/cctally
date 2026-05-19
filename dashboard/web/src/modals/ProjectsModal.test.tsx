@@ -86,14 +86,28 @@ function buildProjectsEnvelope(opts: BuildOpts): Envelope {
         { length: actual },
         (_, j) => (projectCount - i) + j * 0.1,
       );
+      // 1 session per week, baseline timestamps that vary by week so
+      // window-scoped first/last differ from all-time first/last.
+      const sessions_per_week: number[] = Array.from(
+        { length: actual },
+        () => 1,
+      );
+      const first_seen_per_week: (string | null)[] = Array.from(
+        { length: actual },
+        (_, j) => `2026-04-${String(j + 1).padStart(2, '0')}T00:00:00Z`,
+      );
+      const last_seen_per_week: (string | null)[] = Array.from(
+        { length: actual },
+        (_, j) => `2026-04-${String(j + 1).padStart(2, '0')}T23:00:00Z`,
+      );
       return {
         key: `project-${i + 1}`,
         bucket_path: `/repos/project-${i + 1}`,
         weekly_cost,
         weekly_pct,
-        first_seen_at: '2026-04-01T00:00:00Z',
-        last_seen_at: '2026-05-13T10:00:00Z',
-        sessions_count_12w: 10 + i,
+        sessions_per_week,
+        first_seen_per_week,
+        last_seen_per_week,
       };
     },
   );
@@ -103,9 +117,9 @@ function buildProjectsEnvelope(opts: BuildOpts): Envelope {
       bucket_path: `/repos/inactive-${k + 1}`,
       weekly_cost: Array.from({ length: actual }, () => 0),
       weekly_pct: Array.from({ length: actual }, () => null),
-      first_seen_at: '2026-02-01T00:00:00Z',
-      last_seen_at: '2026-02-15T00:00:00Z',
-      sessions_count_12w: 1,
+      sessions_per_week: Array.from({ length: actual }, () => 0),
+      first_seen_per_week: Array.from({ length: actual }, () => null),
+      last_seen_per_week: Array.from({ length: actual }, () => null),
     });
   }
   const projectsEnv: ProjectsEnvelope = {
@@ -176,27 +190,65 @@ afterEach(() => {
 });
 
 describe('<ProjectsModal />', () => {
-  it('I2 (cross-branch review): window-unaware columns advertise their actual scope', () => {
-    // The "Sessions" / "First seen" / "Last seen" columns read
-    // `sessions_count_12w`, `first_seen_at`, `last_seen_at` from the
-    // envelope — fixed 12w-aggregate / all-time values that do NOT
-    // change when the window pill flips. Spec §3.4 wants them
-    // window-scoped, which requires per-week sessions counts +
-    // first/last-seen in the envelope shape. Until that follow-up
-    // lands, the labels are widened to disclose what the cell actually
-    // shows so the user isn't misled by the 1w / 4w / 8w / 12w pill.
+  it('Sessions / First seen / Last seen columns render bare labels (issue #71 full fix)', () => {
+    // Per spec §3.4 these three columns are window-scoped — derived
+    // client-side from the envelope's per-week arrays. The widened
+    // "(12w)" / "(all-time)" labels from the I2 stopgap are gone.
     vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
     updateSnapshot(buildProjectsEnvelope({ windowWeeks: 12 }));
     render(<ProjectsModal />);
     expect(
-      screen.getByRole('columnheader', { name: 'Sessions (12w)' }),
+      screen.getByRole('columnheader', { name: 'Sessions' }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole('columnheader', { name: 'First seen (all-time)' }),
+      screen.getByRole('columnheader', { name: 'First seen' }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole('columnheader', { name: 'Last seen (all-time)' }),
+      screen.getByRole('columnheader', { name: 'Last seen' }),
     ).toBeInTheDocument();
+    // The widened labels are absent.
+    expect(
+      screen.queryByRole('columnheader', { name: 'Sessions (12w)' }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole('columnheader', { name: 'First seen (all-time)' }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole('columnheader', { name: 'Last seen (all-time)' }),
+    ).toBeNull();
+  });
+
+  it('flipping the window pill rescopes Sessions / First seen / Last seen cells (issue #71)', () => {
+    // Each project's per-week arrays carry 1 session per week + ascending
+    // first_seen / last_seen timestamps (one calendar day per week). The
+    // 4w and 12w windows therefore land on different counts (4 vs 12),
+    // different first_seen (slice-head), and identical-or-different
+    // last_seen (slice-tail) — proving the table cells follow the pill.
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    dispatch({ type: 'SAVE_PREFS', patch: { projectsWindowWeeks: 12 } });
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 12, projectCount: 1 }));
+    render(<ProjectsModal />);
+
+    const row12 = screen.getByTestId('projects-table-row');
+    expect(row12.getAttribute('data-sessions')).toBe('12');
+    const cells12 = row12.querySelectorAll('td');
+    const sessionsCell12 = cells12[1].textContent;
+    const firstSeenCell12 = cells12[2].textContent;
+    const lastSeenCell12 = cells12[3].textContent;
+    expect(sessionsCell12).toBe('12');
+
+    // Flip to 4w — Sessions count must collapse to 4, and the
+    // first-seen / last-seen cells should shift to the trailing 4 weeks
+    // (i.e. NOT the same as the 12w extremes).
+    fireEvent.click(screen.getByRole('radio', { name: '4w' }));
+    const row4 = screen.getByTestId('projects-table-row');
+    expect(row4.getAttribute('data-sessions')).toBe('4');
+    const cells4 = row4.querySelectorAll('td');
+    expect(cells4[1].textContent).toBe('4');
+    // Different first-seen between 12w (week 0) and 4w (week 8).
+    expect(cells4[2].textContent).not.toBe(firstSeenCell12);
+    // Same last-seen (both windows end at the latest week).
+    expect(cells4[3].textContent).toBe(lastSeenCell12);
   });
 
   it('renders window pills with the current selection (default 4w)', () => {

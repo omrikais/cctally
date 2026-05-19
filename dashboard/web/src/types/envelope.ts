@@ -304,9 +304,15 @@ export interface ProjectsTrendProject {
   // Parallel arrays — index i corresponds to `weeks[i]`.
   weekly_cost: number[];
   weekly_pct: (number | null)[];
-  first_seen_at: string | null;
-  last_seen_at: string | null;
-  sessions_count_12w: number;
+  // Per-week distinct session counts / first / last activity within
+  // each (project, week) bucket. The modal slices these to the active
+  // window pill (1w / 4w / 8w / 12w) so the table's Sessions / First
+  // seen / Last seen columns reflect that window (spec §3.4 + issue
+  // #71's full fix). Nulls for first/last mean the project had no
+  // activity in that week.
+  sessions_per_week: number[];
+  first_seen_per_week: (string | null)[];
+  last_seen_per_week: (string | null)[];
 }
 
 export interface ProjectsTrendEnvelope {

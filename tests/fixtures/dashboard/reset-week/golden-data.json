@@ -789,10 +789,28 @@
       "projects": [
         {
           "bucket_path": "/fake/repos/alpha",
-          "first_seen_at": "2026-03-18T06:00:00Z",
+          "first_seen_per_week": [
+            "2026-03-18T06:00:00Z",
+            null,
+            "2026-04-01T06:00:00Z",
+            null,
+            "2026-04-17T15:00:00Z"
+          ],
           "key": "alpha",
-          "last_seen_at": "2026-04-18T06:25:00Z",
-          "sessions_count_12w": 6,
+          "last_seen_per_week": [
+            "2026-03-18T06:00:00Z",
+            null,
+            "2026-04-01T06:00:00Z",
+            null,
+            "2026-04-18T06:25:00Z"
+          ],
+          "sessions_per_week": [
+            1,
+            0,
+            1,
+            0,
+            4
+          ],
           "weekly_cost": [
             18.0,
             0.0,
@@ -810,10 +828,28 @@
         },
         {
           "bucket_path": "/fake/repos/beta",
-          "first_seen_at": "2026-03-25T06:00:00Z",
+          "first_seen_per_week": [
+            null,
+            "2026-03-25T06:00:00Z",
+            null,
+            "2026-04-08T06:00:00Z",
+            null
+          ],
           "key": "beta",
-          "last_seen_at": "2026-04-08T06:00:00Z",
-          "sessions_count_12w": 2,
+          "last_seen_per_week": [
+            null,
+            "2026-03-25T06:00:00Z",
+            null,
+            "2026-04-08T06:00:00Z",
+            null
+          ],
+          "sessions_per_week": [
+            0,
+            1,
+            0,
+            1,
+            0
+          ],
           "weekly_cost": [
             0.0,
             18.0,
@@ -831,10 +867,28 @@
         },
         {
           "bucket_path": "/fake/repos/fixture-demo",
-          "first_seen_at": "2026-04-18T09:00:00Z",
+          "first_seen_per_week": [
+            null,
+            null,
+            null,
+            null,
+            "2026-04-18T09:00:00Z"
+          ],
           "key": "fixture-demo",
-          "last_seen_at": "2026-04-18T09:35:00Z",
-          "sessions_count_12w": 1,
+          "last_seen_per_week": [
+            null,
+            null,
+            null,
+            null,
+            "2026-04-18T09:35:00Z"
+          ],
+          "sessions_per_week": [
+            0,
+            0,
+            0,
+            0,
+            1
+          ],
           "weekly_cost": [
             0.0,
             0.0,

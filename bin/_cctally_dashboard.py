@@ -1620,16 +1620,22 @@ def _build_projects_share_panel_data(options: dict,
         for tp in trend.get("projects") or []:
             wc = (tp.get("weekly_cost") or [])[-take:]
             wp = (tp.get("weekly_pct") or [])[-take:]
+            ws = (tp.get("sessions_per_week") or [])[-take:]
             cost = float(sum(wc))
             running_total += cost
             valid_pct = [float(p) for p in wp if p is not None]
             attributed = sum(valid_pct) if valid_pct else None
+            # Sum per-week distinct session counts. Slight over-count when a
+            # single session spans a week boundary; the envelope's per-week
+            # bucketing has no session-id sets to union, so this is the
+            # cheapest reasonable approximation and matches the modal's
+            # client-side derivation (envelope.ts → ProjectsModal.tsx).
             rows.append({
                 "key":            tp["key"],
                 "bucket_path":    tp["bucket_path"],
                 "cost_usd":       cost,
                 "attributed_pct": attributed,
-                "sessions_count": int(tp.get("sessions_count_12w", 0) or 0),
+                "sessions_count": int(sum(ws)),
             })
         rows.sort(key=lambda r: (-r["cost_usd"], r["key"]))
         total_cost = running_total
@@ -2778,14 +2784,17 @@ def _build_projects_envelope(
     for bp in bucket_paths_sorted:
         weekly_cost: list[float] = []
         weekly_pct_arr: list[float | None] = []
-        sessions_12w: set[str] = set()
-        first_seen: dt.datetime | None = None
-        last_seen: dt.datetime | None = None
+        sessions_per_week: list[int] = []
+        first_seen_per_week: list[str | None] = []
+        last_seen_per_week: list[str | None] = []
         for w in trend_weeks:
             b = buckets.get((bp, w))
             if b is None:
                 weekly_cost.append(0.0)
                 weekly_pct_arr.append(None)
+                sessions_per_week.append(0)
+                first_seen_per_week.append(None)
+                last_seen_per_week.append(None)
                 continue
             week_total = total_cost_by_week.get(w, 0.0)
             week_pct = weekly_pct_by_week.get(w)
@@ -2795,24 +2804,22 @@ def _build_projects_envelope(
                 attributed = None
             weekly_cost.append(b["cost_usd"])
             weekly_pct_arr.append(attributed)
-            sessions_12w |= b["sessions"]
-            if first_seen is None or b["first_seen"] < first_seen:
-                first_seen = b["first_seen"]
-            if last_seen is None or b["last_seen"] > last_seen:
-                last_seen = b["last_seen"]
+            sessions_per_week.append(len(b["sessions"]))
+            first_seen_per_week.append(_iso_z(b["first_seen"]))
+            last_seen_per_week.append(_iso_z(b["last_seen"]))
         # Skip projects with zero total cost across the entire window
         # (the bucket-loop only enters projects that have at least one
         # entry, so this is mainly a safety check).
         if all(c == 0.0 for c in weekly_cost):
             continue
         trend_projects.append({
-            "key":             display_key_by_bucket[bp],
-            "bucket_path":     bp,
-            "weekly_cost":     weekly_cost,
-            "weekly_pct":      weekly_pct_arr,
-            "first_seen_at":   _iso_z(first_seen) if first_seen else None,
-            "last_seen_at":    _iso_z(last_seen) if last_seen else None,
-            "sessions_count_12w": len(sessions_12w),
+            "key":                 display_key_by_bucket[bp],
+            "bucket_path":         bp,
+            "weekly_cost":         weekly_cost,
+            "weekly_pct":          weekly_pct_arr,
+            "sessions_per_week":   sessions_per_week,
+            "first_seen_per_week": first_seen_per_week,
+            "last_seen_per_week":  last_seen_per_week,
         })
     # Stable sort: desc by total window cost, ties broken by key.
     trend_projects.sort(

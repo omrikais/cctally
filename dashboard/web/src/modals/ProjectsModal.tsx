@@ -88,13 +88,14 @@ export function ProjectsModal() {
   };
 
   // Window-aware project rows: window-summed cost + window-summed
-  // attributed pct + derived $/1%. Sorted desc by window cost (spec
+  // attributed pct + window-summed sessions + window min/max of
+  // first/last seen + derived $/1%. Sorted desc by window cost (spec
   // §3.4 — default sort).
   type DerivedRow = {
     key: string;
-    sessions_count_12w: number;
-    first_seen_at: string | null;
-    last_seen_at: string | null;
+    sessionsCount: number;
+    firstSeenAt: string | null;
+    lastSeenAt: string | null;
     windowCost: number;
     windowPct: number | null;
     dollarsPerPct: number | null;
@@ -108,6 +109,9 @@ export function ProjectsModal() {
     .map((p) => {
       const weeklyCost = p.weekly_cost.slice(-windowWeeks);
       const weeklyPct = p.weekly_pct.slice(-windowWeeks);
+      const weeklySessions = p.sessions_per_week.slice(-windowWeeks);
+      const weeklyFirstSeen = p.first_seen_per_week.slice(-windowWeeks);
+      const weeklyLastSeen = p.last_seen_per_week.slice(-windowWeeks);
       const windowCost = weeklyCost.reduce((s, c) => s + c, 0);
       const windowPct = weeklyPct.reduce<number | null>(
         (s, c) => (c == null ? s : (s ?? 0) + c),
@@ -115,11 +119,24 @@ export function ProjectsModal() {
       );
       const dpp =
         windowPct != null && windowPct > 0 ? windowCost / windowPct : null;
+      // Per-week counts double-count cross-week sessions (rare in
+      // practice — a single Claude session typically stays inside one
+      // ISO Monday boundary). Matches the share-flow's window sum at
+      // `_build_share_projects_envelope` in bin/_cctally_dashboard.py.
+      const sessionsCount = weeklySessions.reduce((s, c) => s + c, 0);
+      const firstSeenAt = weeklyFirstSeen.reduce<string | null>(
+        (acc, ts) => (ts == null ? acc : acc == null || ts < acc ? ts : acc),
+        null,
+      );
+      const lastSeenAt = weeklyLastSeen.reduce<string | null>(
+        (acc, ts) => (ts == null ? acc : acc == null || ts > acc ? ts : acc),
+        null,
+      );
       return {
         key: p.key,
-        sessions_count_12w: p.sessions_count_12w,
-        first_seen_at: p.first_seen_at,
-        last_seen_at: p.last_seen_at,
+        sessionsCount,
+        firstSeenAt,
+        lastSeenAt,
         windowCost,
         windowPct,
         dollarsPerPct: dpp,
@@ -206,20 +223,9 @@ export function ProjectsModal() {
           <thead>
             <tr>
               <th>Project</th>
-              {/*
-                I2 (cross-branch review): these three columns read
-                window-unaware envelope fields (`sessions_count_12w`,
-                `first_seen_at`, `last_seen_at`) — they do NOT change
-                when the 1w / 4w / 8w / 12w pill flips. Spec §3.4 wants
-                them window-scoped, but that requires per-week sessions
-                counts + first/last-seen in the envelope shape, too
-                large for this commit. Widen the labels until the
-                envelope-shape follow-up lands (tracking: cctally-dev
-                issue).
-              */}
-              <th>Sessions (12w)</th>
-              <th>First seen (all-time)</th>
-              <th>Last seen (all-time)</th>
+              <th>Sessions</th>
+              <th>First seen</th>
+              <th>Last seen</th>
               <th>Cost ▼</th>
               <th>Used %</th>
               <th>$/1%</th>
@@ -231,14 +237,15 @@ export function ProjectsModal() {
                 key={r.key}
                 data-testid="projects-table-row"
                 data-cost={r.windowCost}
+                data-sessions={r.sessionsCount}
                 aria-expanded={selectedKey === r.key}
                 className={selectedKey === r.key ? 'selected' : ''}
                 onClick={() => onRowClick(r.key)}
               >
                 <td className="project">{r.key}</td>
-                <td>{r.sessions_count_12w}</td>
-                <td className="started">{fmt.dateShort(r.first_seen_at, ctx) ?? '—'}</td>
-                <td className="started">{fmt.dateShort(r.last_seen_at, ctx) ?? '—'}</td>
+                <td>{r.sessionsCount}</td>
+                <td className="started">{fmt.dateShort(r.firstSeenAt, ctx) ?? '—'}</td>
+                <td className="started">{fmt.dateShort(r.lastSeenAt, ctx) ?? '—'}</td>
                 <td className={costClass(r.windowCost)}>{fmt.usd2(r.windowCost)}</td>
                 <td>{r.windowPct == null ? '—' : fmt.pct0(r.windowPct)}</td>
                 <td className={r.dollarsPerPct == null ? '' : costClass(r.dollarsPerPct)}>{r.dollarsPerPct == null ? '—' : fmt.usd2(r.dollarsPerPct)}</td>

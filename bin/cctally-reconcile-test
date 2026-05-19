@@ -1613,6 +1613,20 @@ five_hour_credit_invariants
 #          byte-identical (determinism). The memo cache exercises this
 #          implicitly; this is the explicit cross-call regression.
 #
+# R-PROJ6: per-week arrays (`sessions_per_week`, `first_seen_per_week`,
+#          `last_seen_per_week`) — added to support window-scoped
+#          Sessions / First seen / Last seen columns in ProjectsModal
+#          (issue #71, spec §3.4) — satisfy:
+#            (a) length == len(trend.weeks)
+#            (b) sessions_per_week[i] >= 0
+#            (c) sessions_per_week[i] > 0  ⇔  first_seen_per_week[i] is not None
+#            (d) sessions_per_week[i] > 0  ⇔  last_seen_per_week[i] is not None
+#            (e) first_seen_per_week[i] <= last_seen_per_week[i] (ISO compare)
+#            (f) sum(sessions_per_week) equals the number of (project, week)
+#                buckets that produced at least one session for that project
+#                — a structural check that the per-week emission cannot
+#                drop weeks silently.
+#
 # All five run against the in-tree fixture `tests/fixtures/projects/`
 # (single-conn schema; the harness builders are not regenerated here
 # since fixture stability is enforced by the per-fixture .gitignore +
@@ -1792,6 +1806,72 @@ try:
     )
 finally:
     conn.close()
+
+
+# ---- R-PROJ6 (per-week sessions / first / last shape invariants) ----
+# Verifies the issue-#71 envelope addition holds across fixtures.
+for label, fixture in (
+    ("multi-week", "multi-week.db"),
+    ("edge-cases", "edge-cases.db"),
+    ("single-week", "single-week.db"),
+):
+    conn = _open(FIXTURE_DIR / fixture)
+    try:
+        D._projects_reset_memo()
+        env = D._build_projects_envelope(
+            conn, now_utc=NOW, current_week=None, weeks_back=12,
+        )
+        n_weeks = len(env["trend"]["weeks"])
+        for tp in env["trend"]["projects"]:
+            key = tp["key"]
+            sw = tp.get("sessions_per_week")
+            fs = tp.get("first_seen_per_week")
+            ls = tp.get("last_seen_per_week")
+            assert sw is not None and fs is not None and ls is not None, (
+                f"R-PROJ6 ({label}, {key}) fail: missing per-week arrays "
+                f"(got keys={sorted(tp.keys())})"
+            )
+            # (a) length matches weeks
+            assert len(sw) == n_weeks == len(fs) == len(ls), (
+                f"R-PROJ6 ({label}, {key}) fail: per-week length mismatch — "
+                f"weeks={n_weeks} sessions={len(sw)} first={len(fs)} last={len(ls)}"
+            )
+            sum_active_weeks = 0
+            for i, (s, f, l) in enumerate(zip(sw, fs, ls)):
+                # (b) non-negative count
+                assert isinstance(s, int) and s >= 0, (
+                    f"R-PROJ6 ({label}, {key}) fail: sessions_per_week[{i}]={s!r}"
+                )
+                # (c)+(d) presence parity with first/last seen
+                if s > 0:
+                    assert f is not None and l is not None, (
+                        f"R-PROJ6 ({label}, {key}) fail: week[{i}] has "
+                        f"{s} sessions but first/last is None "
+                        f"(first={f!r} last={l!r})"
+                    )
+                    sum_active_weeks += 1
+                else:
+                    assert f is None and l is None, (
+                        f"R-PROJ6 ({label}, {key}) fail: week[{i}] has 0 "
+                        f"sessions but first/last is non-None "
+                        f"(first={f!r} last={l!r})"
+                    )
+                # (e) first <= last on weeks that have activity
+                if f is not None and l is not None:
+                    assert f <= l, (
+                        f"R-PROJ6 ({label}, {key}) fail: first_seen_per_week[{i}]={f!r} "
+                        f">  last_seen_per_week[{i}]={l!r}"
+                    )
+            # (f) Each project has at least one week with sessions — the
+            # bucket-loop only emits projects that have at least one
+            # nonzero week.
+            assert sum_active_weeks >= 1, (
+                f"R-PROJ6 ({label}, {key}) fail: project emitted but no "
+                f"week recorded any sessions"
+            )
+    finally:
+        conn.close()
+
 
 print("OK")
 PYPROJ

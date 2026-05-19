@@ -1374,10 +1374,40 @@
       "projects": [
         {
           "bucket_path": "/fake/repos/project-2",
-          "first_seen_at": "2026-02-25T06:00:00Z",
+          "first_seen_per_week": [
+            null,
+            "2026-02-25T06:00:00Z",
+            null,
+            null,
+            "2026-03-18T06:00:00Z",
+            null,
+            null,
+            "2026-04-08T06:00:00Z",
+            "2026-04-13T18:30:00Z"
+          ],
           "key": "project-2",
-          "last_seen_at": "2026-04-15T21:00:00Z",
-          "sessions_count_12w": 9,
+          "last_seen_per_week": [
+            null,
+            "2026-02-25T06:00:00Z",
+            null,
+            null,
+            "2026-03-18T06:00:00Z",
+            null,
+            null,
+            "2026-04-08T06:00:00Z",
+            "2026-04-15T21:00:00Z"
+          ],
+          "sessions_per_week": [
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            6
+          ],
           "weekly_cost": [
             0.0,
             21.84,
@@ -1403,10 +1433,40 @@
         },
         {
           "bucket_path": "/fake/repos/project-3",
-          "first_seen_at": "2026-02-18T06:00:00Z",
+          "first_seen_per_week": [
+            "2026-02-18T06:00:00Z",
+            null,
+            null,
+            "2026-03-11T06:00:00Z",
+            null,
+            null,
+            "2026-04-01T06:00:00Z",
+            null,
+            "2026-04-13T21:00:00Z"
+          ],
           "key": "project-3",
-          "last_seen_at": "2026-04-15T23:30:00Z",
-          "sessions_count_12w": 9,
+          "last_seen_per_week": [
+            "2026-02-18T06:00:00Z",
+            null,
+            null,
+            "2026-03-11T06:00:00Z",
+            null,
+            null,
+            "2026-04-01T06:00:00Z",
+            null,
+            "2026-04-15T23:30:00Z"
+          ],
+          "sessions_per_week": [
+            1,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            6
+          ],
           "weekly_cost": [
             19.8,
             0.0,
@@ -1432,10 +1492,40 @@
         },
         {
           "bucket_path": "/fake/repos/project-1",
-          "first_seen_at": "2026-03-04T06:00:00Z",
+          "first_seen_per_week": [
+            null,
+            null,
+            "2026-03-04T06:00:00Z",
+            null,
+            null,
+            "2026-03-25T06:00:00Z",
+            null,
+            null,
+            "2026-04-13T16:00:00Z"
+          ],
           "key": "project-1",
-          "last_seen_at": "2026-04-16T04:30:00Z",
-          "sessions_count_12w": 9,
+          "last_seen_per_week": [
+            null,
+            null,
+            "2026-03-04T06:00:00Z",
+            null,
+            null,
+            "2026-03-25T06:00:00Z",
+            null,
+            null,
+            "2026-04-16T04:30:00Z"
+          ],
+          "sessions_per_week": [
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            0,
+            7
+          ],
           "weekly_cost": [
             0.0,
             0.0,
@@ -1461,10 +1551,40 @@
         },
         {
           "bucket_path": "/fake/repos/project-4",
-          "first_seen_at": "2026-04-13T23:30:00Z",
+          "first_seen_per_week": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "2026-04-13T23:30:00Z"
+          ],
           "key": "project-4",
-          "last_seen_at": "2026-04-16T02:00:00Z",
-          "sessions_count_12w": 6,
+          "last_seen_per_week": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "2026-04-16T02:00:00Z"
+          ],
+          "sessions_per_week": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            6
+          ],
           "weekly_cost": [
             0.0,
             0.0,
@@ -1490,10 +1610,40 @@
         },
         {
           "bucket_path": "/fake/repos/fixture-demo",
-          "first_seen_at": "2026-04-16T10:00:00Z",
+          "first_seen_per_week": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "2026-04-16T10:00:00Z"
+          ],
           "key": "fixture-demo",
-          "last_seen_at": "2026-04-16T10:40:00Z",
-          "sessions_count_12w": 1,
+          "last_seen_per_week": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "2026-04-16T10:40:00Z"
+          ],
+          "sessions_per_week": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1
+          ],
           "weekly_cost": [
             0.0,
             0.0,
