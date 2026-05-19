@@ -98,9 +98,22 @@ export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPan
               </button>
             ))
           )}
-          {remaining > 0 && (
-            <div className="muted">+{remaining} more</div>
-          )}
+          <div className="drill-session-footer">
+            {remaining > 0 && (
+              <span className="muted">+{remaining} more</span>
+            )}
+            <button
+              type="button"
+              data-testid="drill-show-in-sessions"
+              className="drill-show-in-sessions"
+              onClick={() => {
+                dispatch({ type: 'SET_FILTER', text: data.key });
+                dispatch({ type: 'CLOSE_MODAL' });
+              }}
+            >
+              Show in Sessions →
+            </button>
+          </div>
         </div>
       </div>
     </div>

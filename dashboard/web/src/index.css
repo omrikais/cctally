@@ -3926,6 +3926,22 @@ mark.current {
 }
 .drill-session-row .cost { text-align: right; }
 
+/* Drill footer "Show in Sessions" cross-nav link (spec §4.3). Lives
+ * after the session rows in the right column of the drill grid; lays
+ * out the optional "+M more" count + link on a single row so both read
+ * as one footer block. */
+.drill-session-footer {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 12px; padding-top: 6px; font-size: 12px;
+}
+.drill-session-footer .muted { font-size: 12px; }
+.drill-show-in-sessions {
+  background: none; border: none; padding: 0;
+  font: inherit; color: var(--accent-cyan);
+  cursor: pointer; margin-left: auto;
+}
+.drill-show-in-sessions:hover { color: var(--accent-magenta); }
+
 @media (max-width: 640px) {
   #root .projects-drill-grid {
     grid-template-columns: 1fr;

@@ -520,6 +520,22 @@ describe('<ProjectsModal />', () => {
     });
   });
 
+  it('drill footer "Show in Sessions" filters Sessions to the project + closes modal (spec §4.3)', async () => {
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));
+    render(<ProjectsModal />);
+    // Open the modal so CLOSE_MODAL has something to close.
+    dispatch({ type: 'OPEN_MODAL', kind: 'projects', projectKey: 'project-1' });
+    expect(getState().openModal).toBe('projects');
+
+    // Footer renders after the drill fetch resolves.
+    const link = await screen.findByTestId('drill-show-in-sessions');
+    expect(link).toHaveTextContent(/Show in Sessions/);
+    fireEvent.click(link);
+    expect(getState().filterText).toBe('project-1');
+    expect(getState().openModal).toBeNull();
+  });
+
   it('chart aria-label reflects yMode (cost vs share %)', () => {
     vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
     updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));
