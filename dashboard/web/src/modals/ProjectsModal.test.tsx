@@ -355,4 +355,132 @@ describe('<ProjectsModal />', () => {
       expect(selectedText).toBe(targetKey);
     });
   });
+
+  it('SSE-tick race: in-flight initial fetch survives a snapshot update', async () => {
+    // Regression: Playwright e2e surfaced an endless-loading bug where the
+    // SWR effect aborted the in-flight initial fetch on every SSE tick
+    // (generatedAt change in the dep array). With ~10s server response
+    // and ~5s SSE cadence, the fetch was constantly cancelled and never
+    // resolved — `Loading…` rendered indefinitely.
+    //
+    // Verify the fix by:
+    //   1. Stubbing fetch with a manually-resolved promise (held open).
+    //   2. Updating the snapshot to a new generated_at (simulates SSE tick).
+    //   3. Asserting the fetch was called EXACTLY ONCE (no abort+restart).
+    //   4. Resolving the held promise and verifying the drill renders.
+    let resolveFetch: ((r: Response) => void) | null = null;
+    const fetchSpy = vi.fn().mockImplementation(
+      () =>
+        new Promise<Response>((res) => {
+          resolveFetch = res;
+        }),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));
+    render(<ProjectsModal />);
+
+    // Leader (project-1) is pre-selected on mount → fetch #1 starts.
+    await waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    // Simulate an SSE tick: same envelope shape but a new generated_at.
+    const next = buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 });
+    next.generated_at = '2026-05-13T10:00:05Z';
+    updateSnapshot(next);
+
+    // Give React a microtask to flush; the in-flight fetch must NOT be
+    // cancelled + restarted. Still exactly one fetch.
+    await new Promise((f) => setTimeout(f, 10));
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // Resolve the held fetch — drill should now render.
+    resolveFetch!({
+      ok: true,
+      status: 200,
+      json: async () => buildProjectDetail('project-1'),
+    } as unknown as Response);
+    await waitFor(() => {
+      expect(screen.getByText(/Models \(this project\)/)).toBeInTheDocument();
+    });
+  });
+
+  it('stale-on-switch: drill renders Loading… not stale data when projectKey changes', async () => {
+    // Regression (Bug #2 from Playwright e2e): the SWR pattern keeps the
+    // previously-fetched `data` mounted while the next fetch is in
+    // flight. That's correct for SSE-tick revalidation but WRONG when
+    // the user changed selection — the drill title is built from
+    // `data.key` and would show the PREVIOUS project's name + stats
+    // under a table row visually marked as the new selection.
+    //
+    // Verify the drill renders the Loading… placeholder while
+    // `data.key !== projectKey`.
+    let detailCalls = 0;
+    let resolveSecond: ((r: Response) => void) | null = null;
+    const fetchSpy = vi.fn().mockImplementation((url: string) => {
+      detailCalls += 1;
+      if (detailCalls === 1) {
+        // First call: project-1 (auto-selected leader) — resolve immediately.
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => buildProjectDetail('project-1'),
+        } as unknown as Response);
+      }
+      // Second call: project-2 — hold it open so we can observe the
+      // intermediate Loading… state.
+      expect(url).toContain('project-2');
+      return new Promise<Response>((res) => {
+        resolveSecond = res;
+      });
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));
+    render(<ProjectsModal />);
+
+    // Wait for the first fetch (project-1) to land and the drill to
+    // render its content.
+    await waitFor(() => {
+      expect(screen.getByText(/Models \(this project\)/)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/▾ project-1/)).toBeInTheDocument();
+
+    // Switch selection to project-2 — second fetch starts but stays
+    // open. The drill MUST NOT show project-1's stats anymore.
+    const rows = screen.getAllByTestId('projects-table-row');
+    fireEvent.click(rows[1]); // project-2
+    await waitFor(() => {
+      // Drill renders "Loading…" instead of the stale project-1 title.
+      expect(screen.queryByText(/▾ project-1/)).toBeNull();
+      expect(screen.getByText(/Loading…/)).toBeInTheDocument();
+    });
+
+    // Resolve project-2 — drill swaps to its title.
+    resolveSecond!({
+      ok: true,
+      status: 200,
+      json: async () => buildProjectDetail('project-2'),
+    } as unknown as Response);
+    await waitFor(() => {
+      expect(screen.getByText(/▾ project-2/)).toBeInTheDocument();
+    });
+  });
+
+  it('chart aria-label reflects yMode (cost vs share %)', () => {
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));
+    render(<ProjectsModal />);
+    // Default yMode is 'absolute' — aria-label mentions "cost".
+    const svgAbs = document.querySelector('svg[role="img"]');
+    expect(svgAbs?.getAttribute('aria-label')).toContain('cost');
+    expect(svgAbs?.getAttribute('aria-label')).not.toContain('share %');
+
+    // Flip to 'share %' — aria-label updates.
+    fireEvent.click(screen.getByRole('radio', { name: 'share %' }));
+    const svgShare = document.querySelector('svg[role="img"]');
+    expect(svgShare?.getAttribute('aria-label')).toContain('share %');
+    expect(svgShare?.getAttribute('aria-label')).not.toContain('cost');
+  });
 });

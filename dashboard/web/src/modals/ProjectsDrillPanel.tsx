@@ -26,7 +26,16 @@ export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPan
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
 
-  if (loading && !data) return <div className="panel-empty">Loading…</div>;
+  // Stale-on-switch guard: while `useProjectDetail` is fetching for the
+  // newly selected project, the SWR pattern keeps prior `data` mounted
+  // — but `data.key` is then for the PREVIOUS project, which would
+  // render the wrong title + models + sessions under a row visually
+  // marked as the new selection. Render Loading… until the new fetch
+  // resolves so the drill never lies about which project it's for.
+  const isStaleForCurrentKey = data != null && data.key !== projectKey;
+
+  if ((loading && !data) || isStaleForCurrentKey)
+    return <div className="panel-empty">Loading…</div>;
   if (error && !data) return <div className="panel-empty">{error}</div>;
   if (!data) return null;
 

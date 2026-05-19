@@ -131,7 +131,7 @@ export function ProjectsTrendChart({
         viewBox={`0 0 ${VW} ${VH}`}
         preserveAspectRatio="none"
         role="img"
-        aria-label={`Stacked area: project cost over ${weekCount} weeks`}
+        aria-label={`Stacked area: project ${yMode === 'share' ? 'share %' : 'cost'} over ${weekCount} weeks`}
       >
         {polygons.map((p) => {
           const isOther = p.key === '(other)';

@@ -23,6 +23,17 @@
 // without this guard the retry would be classified as a refetch (a 404
 // would skip the eviction path and a network error would be silently
 // swallowed), leaving the modal stuck on the spinner.
+//
+// `inFlightRef` prevents the endless-loading bug surfaced in Playwright
+// e2e testing: when /api/project/<heavy-key>?weeks=12 takes longer than
+// the SSE tick interval (e.g. ~10s fetch vs ~5s ticks for a 500+ session
+// project over 12 weeks), the bare effect would cleanup-abort every
+// in-flight initial fetch on each generatedAt refire. Because `data`
+// stays null and `isInitial` keeps re-firing setLoading(true), the
+// drill rendered "Loading…" indefinitely. Guarding the effect body on
+// `inFlightRef.current && isInitial` lets the original fetch resolve
+// naturally; subsequent SSE-tick revalidations only fire AFTER data is
+// loaded (where the SWR pattern is correct and welcome).
 import { useEffect, useRef, useState } from 'react';
 import { useSnapshot } from './useSnapshot';
 import type { ProjectDetail } from '../types/envelope';
@@ -45,6 +56,7 @@ export function useProjectDetail(
   const consec404Ref = useRef(0);
   const lastKeyRef = useRef<string | null>(null);
   const lastWindowRef = useRef<number | null>(null);
+  const inFlightRef = useRef(false);
 
   useEffect(() => {
     if (!projectKey) {
@@ -54,23 +66,31 @@ export function useProjectDetail(
       consec404Ref.current = 0;
       lastKeyRef.current = null;
       lastWindowRef.current = null;
+      inFlightRef.current = false;
       return;
     }
-    const isInitial =
+    const keyOrWindowChanged =
       lastKeyRef.current !== projectKey ||
-      lastWindowRef.current !== windowWeeks ||
-      data == null;
+      lastWindowRef.current !== windowWeeks;
+    const isInitial = keyOrWindowChanged || data == null;
+    // SSE-tick race guard: if an initial fetch is already in flight for
+    // the same (key, window), let it resolve. Don't abort + restart on
+    // every generatedAt change — that's the bug.
+    if (isInitial && inFlightRef.current && !keyOrWindowChanged) {
+      return;
+    }
     if (isInitial) {
       setLoading(true);
       setError(null);
     }
     // Reset the 404 arm on (key, window) change so a new drill does not
     // inherit a prior project's armed state.
-    if (lastKeyRef.current !== projectKey || lastWindowRef.current !== windowWeeks) {
+    if (keyOrWindowChanged) {
       consec404Ref.current = 0;
     }
     lastKeyRef.current = projectKey;
     lastWindowRef.current = windowWeeks;
+    inFlightRef.current = true;
     const ctl = new AbortController();
     const url = `/api/project/${encodeURIComponent(projectKey)}?weeks=${windowWeeks}`;
     fetch(url, { signal: ctl.signal })
@@ -109,6 +129,9 @@ export function useProjectDetail(
           setError("Couldn't load project detail — will retry on next tick.");
           setLoading(false);
         }
+      })
+      .finally(() => {
+        inFlightRef.current = false;
       });
     return () => ctl.abort();
     // We intentionally exclude `data` from the dep array: including it
