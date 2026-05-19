@@ -3781,28 +3781,28 @@ mark.current {
   padding: 4px 0;
 }
 .projects-controls .pill {
-  padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border);
-  font-size: 11.5px; color: var(--text-muted); cursor: pointer;
+  padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border-soft);
+  font-size: 11.5px; color: var(--text-dim); cursor: pointer;
   background: transparent;
 }
 .projects-controls .pill.on {
   background: rgba(217, 70, 239, 0.18);
   border-color: var(--accent-magenta); color: #f5d0fe;
 }
-.projects-controls .sep { color: var(--text-muted); margin: 0 4px; }
+.projects-controls .sep { color: var(--text-dim); margin: 0 4px; }
 
 .projects-notice {
-  font-size: 11.5px; color: var(--text-muted); padding: 6px 2px 0;
+  font-size: 11.5px; color: var(--text-dim); padding: 6px 2px 0;
 }
 
 .projects-trend { margin: 8px 0; }
 .projects-trend svg {
   width: 100%; height: 150px; display: block;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-soft);
 }
 .projects-trend-xaxis {
   display: flex; justify-content: space-between;
-  font-size: 10.5px; color: var(--text-muted);
+  font-size: 10.5px; color: var(--text-dim);
   padding: 4px 2px 0;
 }
 .projects-trend-legend {
@@ -3833,7 +3833,7 @@ mark.current {
 
 .projects-drill {
   margin-top: 14px; padding: 12px 14px; border-radius: 8px;
-  border: 1px dashed var(--border);
+  border: 1px dashed var(--border-soft);
   background: rgba(217, 70, 239, 0.04);
 }
 .projects-drill-head .title {
@@ -3844,11 +3844,11 @@ mark.current {
   margin-top: 8px;
 }
 .projects-drill .section-label {
-  font-size: 11.5px; color: var(--text-muted);
+  font-size: 11.5px; color: var(--text-dim);
   text-transform: uppercase; letter-spacing: 0.04em;
   margin-bottom: 4px;
 }
-.projects-drill .muted { color: var(--text-muted); font-size: 12px; }
+.projects-drill .muted { color: var(--text-dim); font-size: 12px; }
 .drill-bar-row {
   display: grid; grid-template-columns: 110px 1fr 60px; gap: 6px;
   align-items: center; font-size: 12px; margin: 3px 0;
@@ -3871,7 +3871,7 @@ mark.current {
 }
 .drill-session-row:hover { color: var(--accent-magenta); }
 .drill-session-row + .drill-session-row {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--border-soft);
 }
 .drill-session-row .cost { text-align: right; }
 
