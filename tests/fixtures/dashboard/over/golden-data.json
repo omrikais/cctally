@@ -1607,6 +1607,139 @@
     "total_cost_usd": 455.4799999999999,
     "total_tokens": 55548000
   },
+  "projects": {
+    "current_week": {
+      "rows": [],
+      "total_cost_usd": 0.0,
+      "week_label": "wk Apr 13",
+      "week_start_at": "2026-04-13T14:00:00Z",
+      "week_start_date": "2026-04-13"
+    },
+    "trend": {
+      "projects": [
+        {
+          "bucket_path": "/fake/repos/heavy",
+          "first_seen_at": "2026-03-04T06:00:00Z",
+          "key": "heavy",
+          "last_seen_at": "2026-04-18T07:40:00Z",
+          "sessions_count_12w": 9,
+          "weekly_cost": [
+            68.0,
+            0.0,
+            68.0,
+            0.0,
+            68.0,
+            0.0,
+            21.6
+          ],
+          "weekly_pct": [
+            78.0,
+            null,
+            78.0,
+            null,
+            78.0,
+            null,
+            47.767481
+          ]
+        },
+        {
+          "bucket_path": "/fake/repos/ship-it",
+          "first_seen_at": "2026-03-11T06:00:00Z",
+          "key": "ship-it",
+          "last_seen_at": "2026-04-18T18:40:00Z",
+          "sessions_count_12w": 9,
+          "weekly_cost": [
+            0.0,
+            68.0,
+            0.0,
+            68.0,
+            0.0,
+            68.0,
+            21.6
+          ],
+          "weekly_pct": [
+            null,
+            78.0,
+            null,
+            78.0,
+            null,
+            78.0,
+            47.767481
+          ]
+        },
+        {
+          "bucket_path": "/fake/repos/fixture-demo",
+          "first_seen_at": "2026-04-19T02:00:00Z",
+          "key": "fixture-demo",
+          "last_seen_at": "2026-04-19T02:55:00Z",
+          "sessions_count_12w": 1,
+          "weekly_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            4.28
+          ],
+          "weekly_pct": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            9.465038
+          ]
+        }
+      ],
+      "weeks": [
+        {
+          "total_cost_usd": 68.0,
+          "total_pct": 78.0,
+          "week_label": "wk Mar 02",
+          "week_start_date": "2026-03-02"
+        },
+        {
+          "total_cost_usd": 68.0,
+          "total_pct": 78.0,
+          "week_label": "wk Mar 09",
+          "week_start_date": "2026-03-09"
+        },
+        {
+          "total_cost_usd": 68.0,
+          "total_pct": 78.0,
+          "week_label": "wk Mar 16",
+          "week_start_date": "2026-03-16"
+        },
+        {
+          "total_cost_usd": 68.0,
+          "total_pct": 78.0,
+          "week_label": "wk Mar 23",
+          "week_start_date": "2026-03-23"
+        },
+        {
+          "total_cost_usd": 68.0,
+          "total_pct": 78.0,
+          "week_label": "wk Mar 30",
+          "week_start_date": "2026-03-30"
+        },
+        {
+          "total_cost_usd": 68.0,
+          "total_pct": 78.0,
+          "week_label": "wk Apr 06",
+          "week_start_date": "2026-04-06"
+        },
+        {
+          "total_cost_usd": 47.48,
+          "total_pct": 105.0,
+          "week_label": "wk Apr 13",
+          "week_start_date": "2026-04-13"
+        }
+      ],
+      "window_weeks": 7
+    }
+  },
   "sessions": {
     "rows": [
       {
@@ -1614,6 +1747,7 @@
         "duration_min": 55,
         "model": "claude-opus-4-7",
         "project": "fixture-demo",
+        "project_key": "fixture-demo",
         "session_id": "fixture-over-session-0000000000000000",
         "started_utc": "2026-04-19T02:00:00Z"
       },
@@ -1622,6 +1756,7 @@
         "duration_min": 40,
         "model": "claude-opus-4-7",
         "project": "ship-it",
+        "project_key": "ship-it",
         "session_id": "over-cur-s011-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-18T18:00:00Z"
       },
@@ -1630,6 +1765,7 @@
         "duration_min": 40,
         "model": "claude-opus-4-7",
         "project": "heavy",
+        "project_key": "heavy",
         "session_id": "over-cur-s010-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-18T07:00:00Z"
       },
@@ -1638,6 +1774,7 @@
         "duration_min": 40,
         "model": "claude-opus-4-7",
         "project": "ship-it",
+        "project_key": "ship-it",
         "session_id": "over-cur-s009-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-17T20:00:00Z"
       },
@@ -1646,6 +1783,7 @@
         "duration_min": 40,
         "model": "claude-opus-4-7",
         "project": "heavy",
+        "project_key": "heavy",
         "session_id": "over-cur-s008-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-17T09:00:00Z"
       },
@@ -1654,6 +1792,7 @@
         "duration_min": 40,
         "model": "claude-opus-4-7",
         "project": "ship-it",
+        "project_key": "ship-it",
         "session_id": "over-cur-s007-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-16T22:00:00Z"
       },
@@ -1662,6 +1801,7 @@
         "duration_min": 40,
         "model": "claude-opus-4-7",
         "project": "heavy",
+        "project_key": "heavy",
         "session_id": "over-cur-s006-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-16T11:00:00Z"
       },
@@ -1670,6 +1810,7 @@
         "duration_min": 40,
         "model": "claude-opus-4-7",
         "project": "ship-it",
+        "project_key": "ship-it",
         "session_id": "over-cur-s005-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-16T00:00:00Z"
       },
@@ -1678,6 +1819,7 @@
         "duration_min": 40,
         "model": "claude-opus-4-7",
         "project": "heavy",
+        "project_key": "heavy",
         "session_id": "over-cur-s004-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T13:00:00Z"
       },
@@ -1686,6 +1828,7 @@
         "duration_min": 40,
         "model": "claude-opus-4-7",
         "project": "ship-it",
+        "project_key": "ship-it",
         "session_id": "over-cur-s003-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T02:00:00Z"
       },
@@ -1694,6 +1837,7 @@
         "duration_min": 40,
         "model": "claude-opus-4-7",
         "project": "heavy",
+        "project_key": "heavy",
         "session_id": "over-cur-s002-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-14T15:00:00Z"
       },
@@ -1702,6 +1846,7 @@
         "duration_min": 40,
         "model": "claude-opus-4-7",
         "project": "ship-it",
+        "project_key": "ship-it",
         "session_id": "over-cur-s001-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-14T04:00:00Z"
       },
@@ -1710,6 +1855,7 @@
         "duration_min": 40,
         "model": "claude-opus-4-7",
         "project": "heavy",
+        "project_key": "heavy",
         "session_id": "over-cur-s000-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-13T17:00:00Z"
       },
@@ -1718,6 +1864,7 @@
         "duration_min": 0,
         "model": "claude-opus-4-7",
         "project": "ship-it",
+        "project_key": "ship-it",
         "session_id": "prior-wk01-00000000-0000-0000-0000-0000",
         "started_utc": "2026-04-08T06:00:00Z"
       },
@@ -1726,6 +1873,7 @@
         "duration_min": 0,
         "model": "claude-opus-4-7",
         "project": "heavy",
+        "project_key": "heavy",
         "session_id": "prior-wk02-00000000-0000-0000-0000-0000",
         "started_utc": "2026-04-01T06:00:00Z"
       },
@@ -1734,6 +1882,7 @@
         "duration_min": 0,
         "model": "claude-opus-4-7",
         "project": "ship-it",
+        "project_key": "ship-it",
         "session_id": "prior-wk03-00000000-0000-0000-0000-0000",
         "started_utc": "2026-03-25T06:00:00Z"
       },
@@ -1742,6 +1891,7 @@
         "duration_min": 0,
         "model": "claude-opus-4-7",
         "project": "heavy",
+        "project_key": "heavy",
         "session_id": "prior-wk04-00000000-0000-0000-0000-0000",
         "started_utc": "2026-03-18T06:00:00Z"
       },
@@ -1750,6 +1900,7 @@
         "duration_min": 0,
         "model": "claude-opus-4-7",
         "project": "ship-it",
+        "project_key": "ship-it",
         "session_id": "prior-wk05-00000000-0000-0000-0000-0000",
         "started_utc": "2026-03-11T06:00:00Z"
       },
@@ -1758,6 +1909,7 @@
         "duration_min": 0,
         "model": "claude-opus-4-7",
         "project": "heavy",
+        "project_key": "heavy",
         "session_id": "prior-wk06-00000000-0000-0000-0000-0000",
         "started_utc": "2026-03-04T06:00:00Z"
       }

@@ -243,6 +243,20 @@ class TuiSessionRow:
     cache_hit_pct: float | None
     project_label: str           # basename of project_path
     session_id: str              # full session UUID (v2: needed for session-detail modal)
+    # Disambiguated display key (matches the Projects panel envelope's
+    # `current_week.rows[].key` / `trend.projects[].key`). Populated by
+    # the sync-thread builder after `_build_projects_envelope` runs so
+    # the SessionsPanel → ProjectsModal cross-nav (spec §4.1) routes by
+    # a stable identity. Defaults to ``None`` for fixture modules that
+    # construct ``TuiSessionRow`` positionally without the Bundle 6 /
+    # projects-panel additions; the client renders the cell as plain
+    # text in that case per spec §4.1 stopgap.
+    project_key: str | None = None
+    # Absolute project_path (NULL ⇒ ``(unknown)`` resolved upstream).
+    # Carried so the sync-thread builder can compute ``project_key``
+    # without re-reading ``session_files`` and so the share path can
+    # privacy-scrub via ``_lib_share._scrub``.
+    project_path: str | None = None
 
 
 # === Internal helpers ======================================================
@@ -1066,6 +1080,12 @@ def build_sessions_view(entries, *, now_utc, limit=None, display_tz=None):
                 _os.path.basename(s.project_path) or s.project_path
             ),
             session_id=s.session_id,
+            # `project_key` is populated downstream by `_tui_build_snapshot`
+            # after `_build_projects_envelope` runs (so the disambiguated
+            # display_key matches the Projects envelope exactly). Stash
+            # the absolute path here so that pass can map back without
+            # re-reading session_files.
+            project_path=s.project_path or None,
         ))
         total_cost += s.cost_usd
 

@@ -2310,6 +2310,404 @@ def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
     return rows
 
 
+# --- Projects panel / modal (spec 2026-05-19-projects-panel-design.md) ------
+#
+# Per-tick projects envelope builder. Runs on the sync thread that
+# populates ``DataSnapshot``; the dashboard's pure ``snapshot_to_envelope``
+# reads it back unchanged and assigns to ``envelope["projects"]`` so the
+# serializer stays DB-free.
+#
+# See spec §5.2 (envelope shape), §6.2 (signatures), §6.4 (memoization),
+# §9.2 (R-PROJ1..R-PROJ5 reconcile invariants).
+#
+# Identity:
+#   - ``key``         = disambiguated ``ProjectKey.display_key`` via
+#                       ``_lib_render._project_disambiguate_labels``.
+#                       Stable within a single envelope (a `foo` collision
+#                       resolves to `foo (parent_dir)`).
+#   - ``bucket_path`` = canonical equality key (``ProjectKey.bucket_path``)
+#                       — the absolute on-disk path. Privacy-sensitive;
+#                       _lib_share._scrub strips it on the share path.
+
+# Per-tick memo (spec §6.4 + memory: *Pre-probe before sync_cache*).
+# Keyed on (max(session_entries.id), current_week.week_start_at,
+# weeks_back); single entry, in-process only. Bounded per-tick cost on
+# large caches: subsequent calls within the same sync tick hit the
+# memo and skip the aggregation walk.
+_PROJECTS_ENV_MEMO: dict = {"key": None, "value": None}
+
+
+def _projects_reset_memo() -> None:
+    """Clear the projects envelope memo. Used by unit tests that want to
+    measure the inner aggregation cost in isolation."""
+    _PROJECTS_ENV_MEMO["key"] = None
+    _PROJECTS_ENV_MEMO["value"] = None
+
+
+def _projects_week_start_monday_utc(ts: "dt.datetime") -> "dt.datetime":
+    """Anchor ``ts`` to its containing ISO-Monday 00:00 UTC subscription
+    week start. Fallback shape used when no snapshot anchor is available
+    — mirrors ``cmd_project``'s Monday fallback (bin/cctally:4711)."""
+    base = ts.astimezone(dt.timezone.utc)
+    return (base - dt.timedelta(days=base.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+
+
+def _projects_week_label(week_start: "dt.datetime") -> str:
+    """Render a `wk Mon DD` label for the trend chart x-axis.
+
+    Per spec §5.2's `weeks[].week_label` example (`"wk Apr 22"`).
+    UTC-anchored so JSON output is tz-agnostic.
+    """
+    return f"wk {week_start.strftime('%b %d')}"
+
+
+def _projects_iter_session_entries(conn: "sqlite3.Connection",
+                                   *,
+                                   since: "dt.datetime",
+                                   until: "dt.datetime"):
+    """Read ``session_entries`` joined with ``session_files`` over
+    [since, until]. Yields rows directly off the passed conn — no
+    cache.db monkeypatch, no production ``get_claude_session_entries``
+    pipeline. The fixture DBs co-locate both schemas in one file; the
+    production wiring opens both DBs and ATTACHes cache.db as a schema
+    on the stats conn (see ``_run_dashboard_sync_tick``).
+    """
+    since_iso = since.astimezone(dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    until_iso = until.astimezone(dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    cur = conn.execute(
+        "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
+        "       e.output_tokens, e.cache_create_tokens, e.cache_read_tokens, "
+        "       e.cost_usd_raw, e.source_path, "
+        "       sf.session_id, sf.project_path "
+        "FROM session_entries e "
+        "LEFT JOIN session_files sf ON sf.path = e.source_path "
+        "WHERE e.timestamp_utc >= ? AND e.timestamp_utc <= ? "
+        "ORDER BY e.timestamp_utc ASC, e.id ASC",
+        (since_iso, until_iso),
+    )
+    for row in cur:
+        yield row
+
+
+def _build_projects_envelope(
+    conn: "sqlite3.Connection",
+    *,
+    now_utc: "dt.datetime",
+    current_week: "Any | None" = None,
+    weeks_back: int = 12,
+) -> dict:
+    """Build the ``projects.{current_week, trend}`` envelope block.
+
+    Reuses ``cmd_project``'s identity model — per-(``ProjectKey``, week)
+    rollup over ``session_entries`` with display-key disambiguation via
+    ``_project_disambiguate_labels`` — but emits the simpler envelope
+    shape from spec §5.2 (no per-model breakdowns, no first/last seen
+    per session, no per-row $/1%; just cost / attributed_pct / sessions).
+
+    Week boundaries follow ``cmd_project``'s Monday-anchored UTC
+    fallback (``bin/cctally:4711``); ``weekly_usage_snapshots`` rows are
+    matched by ``week_start_date`` (date-only) for ``attributed_pct``.
+
+    ``current_week`` is passed through opaquely — if non-None and
+    carrying a ``.week_start_at`` UTC datetime, that boundary supplants
+    the Monday fallback for the current week's bucket. None (the
+    default) preserves the fallback.
+
+    Determinism: same conn + same ``now_utc`` ⇒ byte-identical JSON
+    (R-PROJ5 invariant). Per-tick memoized on
+    ``(max(session_entries.id), cw_week_start, weeks_back)``.
+    """
+    c = _cctally()
+
+    # ---- Pre-probe gate / memoization (spec §6.4) -----------------------
+    cur = conn.execute("SELECT COALESCE(MAX(id), 0) FROM session_entries")
+    max_id = cur.fetchone()[0]
+    cw_key: "dt.datetime | None" = None
+    if current_week is not None:
+        cw_key = getattr(current_week, "week_start_at", None)
+    memo_key = (max_id, cw_key, weeks_back)
+    cached = _PROJECTS_ENV_MEMO.get("value")
+    if cached is not None and _PROJECTS_ENV_MEMO.get("key") == memo_key:
+        return cached
+
+    # ---- Week-start anchor (current subscription week) ------------------
+    if cw_key is not None:
+        cw_start = cw_key.astimezone(dt.timezone.utc).replace(
+            microsecond=0,
+        )
+    else:
+        cw_start = _projects_week_start_monday_utc(now_utc)
+
+    # Build a list of canonical Monday-anchored week starts ending with
+    # cw_start, oldest → newest, of length ``weeks_back``. Clamping to
+    # actual history happens after the entry walk reveals what weeks
+    # have any activity.
+    weeks_full = [
+        cw_start - dt.timedelta(days=7 * (weeks_back - 1 - i))
+        for i in range(weeks_back)
+    ]
+    cw_end = cw_start + dt.timedelta(days=7)
+    since_dt = weeks_full[0]
+    until_dt = cw_end  # exclusive end; SQL is `>= since AND <= until`
+
+    # ---- Bucket entries per (ProjectKey, week_start) --------------------
+    # `_resolve_project_key` is the production resolver; we use git-root
+    # mode (default for `cmd_project --group` absent) — matches the
+    # CLI's default.
+    _resolve_project_key = c._resolve_project_key
+    pricing = c.CLAUDE_MODEL_PRICING
+    resolver_cache: dict = {}
+
+    # buckets[(bucket_path, week_start)] -> {key, cost, sessions, ...}
+    buckets: dict[tuple[str, dt.datetime], dict] = {}
+    # Track total cost per week across ALL entries (attribution denominator).
+    total_cost_by_week: dict[dt.datetime, float] = {}
+    # Track first-seen ProjectKey instance per bucket_path so we can pass
+    # the dict to `_project_disambiguate_labels` (which keys on `key.bucket_path`
+    # equality via ProjectKey.__eq__).
+    key_by_bucket: dict[str, Any] = {}
+
+    def _week_for(ts: dt.datetime) -> "dt.datetime | None":
+        wstart = _projects_week_start_monday_utc(ts)
+        if wstart < weeks_full[0] or wstart > weeks_full[-1]:
+            return None
+        return wstart
+
+    for row in _projects_iter_session_entries(
+        conn, since=since_dt, until=until_dt,
+    ):
+        (entry_id, ts_iso, model, input_tok, output_tok,
+         cache_create, cache_read, cost_raw, source_path,
+         session_id, project_path) = row
+        if model == "<synthetic>":
+            continue
+        # Parse timestamp; assume Z / +00:00 — production iterators do
+        # the same via `parse_iso_datetime`.
+        ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
+        wstart = _week_for(ts)
+        if wstart is None:
+            continue
+
+        # Entry cost via the shared pricing chokepoint.
+        entry_cost = _calculate_entry_cost(
+            model,
+            {
+                "input_tokens": input_tok or 0,
+                "output_tokens": output_tok or 0,
+                "cache_creation_input_tokens": cache_create or 0,
+                "cache_read_input_tokens": cache_read or 0,
+            },
+            mode="auto",
+            cost_usd=cost_raw,
+        )
+
+        # Project-key identity (`git_root` mode = production default).
+        pkey = _resolve_project_key(project_path, "git-root", resolver_cache)
+        bkey = (pkey.bucket_path, wstart)
+        b = buckets.get(bkey)
+        if b is None:
+            b = {
+                "key": pkey,
+                "cost_usd": 0.0,
+                "sessions": set(),
+                "first_seen": ts,
+                "last_seen": ts,
+            }
+            buckets[bkey] = b
+        b["cost_usd"] += entry_cost
+        if session_id:
+            b["sessions"].add(session_id)
+        elif source_path:
+            # Fallback: treat one source_path as one session when
+            # session_files.session_id is NULL (lazy population).
+            b["sessions"].add(source_path)
+        if ts < b["first_seen"]:
+            b["first_seen"] = ts
+        if ts > b["last_seen"]:
+            b["last_seen"] = ts
+        total_cost_by_week[wstart] = (
+            total_cost_by_week.get(wstart, 0.0) + entry_cost
+        )
+        # Remember first-seen ProjectKey for each bucket_path so the
+        # disambiguator pass below sees consistent ProjectKey instances.
+        if pkey.bucket_path not in key_by_bucket:
+            key_by_bucket[pkey.bucket_path] = pkey
+
+    # ---- Load weekly_usage_snapshots for attribution --------------------
+    # weekly_percent keyed by week_start (UTC datetime, Monday). We
+    # match on `week_start_date` (date-only) since that's the canonical
+    # cross-table key per the CLAUDE.md weekly handling notes.
+    weekly_pct_by_week: dict[dt.datetime, float] = {}
+    try:
+        cur = conn.execute(
+            "SELECT week_start_date, MAX(weekly_percent) "
+            "FROM weekly_usage_snapshots "
+            "GROUP BY week_start_date"
+        )
+        rows = cur.fetchall()
+    except sqlite3.OperationalError:
+        # No weekly_usage_snapshots table — leaves attributed_pct = None
+        # throughout (acceptable per spec §2.7).
+        rows = []
+    for week_date_str, weekly_pct in rows:
+        try:
+            wd = dt.date.fromisoformat(week_date_str)
+        except (TypeError, ValueError):
+            continue
+        # Snap the date to UTC Monday 00:00 (matches the bucketing key).
+        wstart = dt.datetime.combine(
+            wd, dt.time(0, 0, 0), tzinfo=dt.timezone.utc,
+        )
+        # Snap to Monday (snapshot rows that captured a non-Monday week
+        # boundary still align to the same canonical bucket as the entry
+        # walk, since the bucketing is Monday-anchored).
+        wstart = _projects_week_start_monday_utc(wstart)
+        if weekly_pct is not None:
+            weekly_pct_by_week[wstart] = float(weekly_pct)
+
+    # ---- Disambiguate display_keys across the union of projects --------
+    # `_project_disambiguate_labels` expects a list of dicts each with a
+    # `key` field that's a ProjectKey. Sort by bucket_path for stable
+    # indexing.
+    bucket_paths_sorted = sorted(key_by_bucket.keys())
+    disambig_rows = [
+        {"key": key_by_bucket[bp]} for bp in bucket_paths_sorted
+    ]
+    augmented_by_idx = c._project_disambiguate_labels(disambig_rows)
+    display_key_by_bucket: dict[str, str] = {}
+    for idx, bp in enumerate(bucket_paths_sorted):
+        pkey = key_by_bucket[bp]
+        display_key_by_bucket[bp] = augmented_by_idx.get(
+            idx, pkey.display_key,
+        )
+
+    # ---- Determine actual weeks emitted (clamp to history) -------------
+    weeks_with_activity = sorted(
+        ws for ws in {ws for (_bp, ws) in buckets.keys()}
+    )
+    if weeks_with_activity:
+        # Window = inclusive [oldest_active_week, cw_start]. Always emits
+        # cw_start (panel + trend share the same current_week column).
+        oldest = min(weeks_with_activity[0], cw_start)
+        trend_weeks = []
+        w = oldest
+        while w <= cw_start:
+            trend_weeks.append(w)
+            w += dt.timedelta(days=7)
+    else:
+        trend_weeks = [cw_start]
+
+    # ---- current_week.rows ---------------------------------------------
+    cw_rows = []
+    cw_pct = weekly_pct_by_week.get(cw_start)
+    cw_total_cost = total_cost_by_week.get(cw_start, 0.0)
+    for bp in bucket_paths_sorted:
+        b = buckets.get((bp, cw_start))
+        if b is None:
+            continue
+        if cw_pct is not None and cw_total_cost > 0:
+            attributed = (b["cost_usd"] / cw_total_cost) * cw_pct
+        else:
+            attributed = None
+        cw_rows.append({
+            "key":              display_key_by_bucket[bp],
+            "bucket_path":      bp,
+            "cost_usd":         round(b["cost_usd"], 6),
+            "attributed_pct":   (
+                None if attributed is None else round(attributed, 6)
+            ),
+            "sessions_count":   len(b["sessions"]),
+        })
+    # Desc by cost (ties broken by key for byte-stability across runs).
+    cw_rows.sort(key=lambda r: (-r["cost_usd"], r["key"]))
+
+    cw_block = {
+        "week_label":      _projects_week_label(cw_start),
+        "week_start_date": cw_start.date().isoformat(),
+        "week_start_at":   _iso_z(cw_start),
+        "total_cost_usd":  round(cw_total_cost, 6),
+        "rows":            cw_rows,
+    }
+
+    # ---- trend.weeks[] + trend.projects[] ------------------------------
+    trend_weeks_blocks = []
+    for w in trend_weeks:
+        wpct = weekly_pct_by_week.get(w)
+        trend_weeks_blocks.append({
+            "week_start_date": w.date().isoformat(),
+            "week_label":      _projects_week_label(w),
+            "total_cost_usd":  round(total_cost_by_week.get(w, 0.0), 6),
+            "total_pct":       None if wpct is None else round(wpct, 6),
+        })
+
+    trend_projects = []
+    for bp in bucket_paths_sorted:
+        weekly_cost: list[float] = []
+        weekly_pct_arr: list[float | None] = []
+        sessions_12w: set[str] = set()
+        first_seen: dt.datetime | None = None
+        last_seen: dt.datetime | None = None
+        for w in trend_weeks:
+            b = buckets.get((bp, w))
+            if b is None:
+                weekly_cost.append(0.0)
+                weekly_pct_arr.append(None)
+                continue
+            week_total = total_cost_by_week.get(w, 0.0)
+            week_pct = weekly_pct_by_week.get(w)
+            if week_pct is not None and week_total > 0:
+                attributed = (b["cost_usd"] / week_total) * week_pct
+            else:
+                attributed = None
+            weekly_cost.append(round(b["cost_usd"], 6))
+            weekly_pct_arr.append(
+                None if attributed is None else round(attributed, 6)
+            )
+            sessions_12w |= b["sessions"]
+            if first_seen is None or b["first_seen"] < first_seen:
+                first_seen = b["first_seen"]
+            if last_seen is None or b["last_seen"] > last_seen:
+                last_seen = b["last_seen"]
+        # Skip projects with zero total cost across the entire window
+        # (the bucket-loop only enters projects that have at least one
+        # entry, so this is mainly a safety check).
+        if all(c == 0.0 for c in weekly_cost):
+            continue
+        trend_projects.append({
+            "key":             display_key_by_bucket[bp],
+            "bucket_path":     bp,
+            "weekly_cost":     weekly_cost,
+            "weekly_pct":      weekly_pct_arr,
+            "first_seen_at":   _iso_z(first_seen) if first_seen else None,
+            "last_seen_at":    _iso_z(last_seen) if last_seen else None,
+            "sessions_count_12w": len(sessions_12w),
+        })
+    # Stable sort: desc by total window cost, ties broken by key.
+    trend_projects.sort(
+        key=lambda p: (-sum(p["weekly_cost"]), p["key"]),
+    )
+
+    trend_block = {
+        "window_weeks": len(trend_weeks),
+        "weeks":        trend_weeks_blocks,
+        "projects":     trend_projects,
+    }
+
+    result = {
+        "current_week": cw_block,
+        "trend":        trend_block,
+    }
+    _PROJECTS_ENV_MEMO["key"] = memo_key
+    _PROJECTS_ENV_MEMO["value"] = result
+    return result
+
+
 def _empty_dashboard_snapshot() -> "DataSnapshot":
     """A minimal DataSnapshot used at startup before the first sync
     completes. All panels render placeholders; the sync thread replaces
@@ -3188,11 +3586,25 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                     "duration_min": int(round(s.duration_minutes)) if s.duration_minutes else 0,
                     "model":        s.model_primary,
                     "project":      s.project_label,
+                    # Projects-panel cross-nav identity (spec §4.1).
+                    # Disambiguated display_key matching the projects
+                    # envelope's `current_week.rows[].key`; ``None`` when
+                    # the projects envelope sub-build failed, the row's
+                    # project_path is missing, or the lookup didn't
+                    # resolve (the React cell falls back to plain text).
+                    "project_key":  getattr(s, "project_key", None),
                     "cost_usd":     round(s.cost_usd, 4) if s.cost_usd is not None else None,
                 }
                 for s in snap.sessions
             ],
         },
+
+        # Projects panel + modal envelope block (spec §5.2).
+        # Populated on the sync thread; the serializer reads it back
+        # unchanged so it stays a pure renderer (no DB I/O). ``None``
+        # on first tick before sync completes; the client renders the
+        # panel-empty state in that case.
+        "projects":         getattr(snap, "projects_envelope", None),
 
         # threshold-actions T5: see prelude above for rationale.
         "alerts":           alerts_array,

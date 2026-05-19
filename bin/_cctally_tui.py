@@ -1061,6 +1061,16 @@ class DataSnapshot:
     # through ``_tui_build_snapshot``; the envelope adapter falls
     # back to the legacy inline routing in that case.
     forecast_view: Any | None = None
+    # Projects panel + modal envelope block (spec §5.2 /
+    # 2026-05-19-projects-panel-design.md). Populated on the sync
+    # thread by ``_build_projects_envelope`` (per-tick DB-touching
+    # aggregation that runs alongside the existing per-panel builds);
+    # the dashboard's pure ``snapshot_to_envelope`` reads this back
+    # unchanged and assigns it to ``envelope["projects"]``. ``None``
+    # on first tick before sync completes — the TS envelope mirror
+    # declares ``ProjectsEnvelope | null`` and the client renders the
+    # panel-empty state until the next tick replaces it.
+    projects_envelope: dict | None = None
 
     @classmethod
     def synthesize_for_marketing(cls, *, as_of_iso: str) -> "DataSnapshot":
@@ -1896,6 +1906,95 @@ def _tui_build_snapshot(
             fh_milestones = _tui_build_five_hour_milestones(conn, win_key)
         except Exception as exc:
             errors.append(f"five-hour-milestones: {exc}")
+        # ---- Projects panel + modal envelope (spec §5.2, plan Task 1) -----
+        # Per-tick aggregation lives on the sync thread; the dashboard's
+        # pure ``snapshot_to_envelope`` reads ``snap.projects_envelope``
+        # back unchanged. Errors are recorded on ``last_sync_error`` —
+        # the client renders the panel-empty state when the field is
+        # None (first tick, or sub-build failure).
+        #
+        # ATTACH cache.db onto the open stats conn so
+        # ``_build_projects_envelope`` (which reads ``session_entries`` +
+        # ``session_files`` + ``weekly_usage_snapshots`` off one conn —
+        # the test contract per tests/test_projects_envelope.py) sees
+        # all three tables. ATTACH/DETACH is cheap and scoped to this
+        # sub-build; no schema migration / lock acquisition is needed.
+        projects_envelope_block: dict | None = None
+        try:
+            c = _cctally()
+            cache_db_path = c.CACHE_DB_PATH
+            conn.execute(
+                "ATTACH DATABASE ? AS cache_db",
+                (str(cache_db_path),),
+            )
+            # session_entries / session_files live in cache.db; the
+            # builder reads them via raw SQL keyed by the unqualified
+            # table names. SQLite's name resolution prefers the `main`
+            # schema, so create temporary views in `main` that point
+            # at the attached schema's tables. Aliasing via VIEWs keeps
+            # the builder portable: unit tests pass one conn carrying
+            # both schemas; production wiring uses an attached cache.
+            conn.execute(
+                "CREATE TEMP VIEW IF NOT EXISTS session_entries AS "
+                "SELECT * FROM cache_db.session_entries"
+            )
+            conn.execute(
+                "CREATE TEMP VIEW IF NOT EXISTS session_files AS "
+                "SELECT * FROM cache_db.session_files"
+            )
+            projects_envelope_block = c._build_projects_envelope(
+                conn,
+                now_utc=now_utc,
+                current_week=cw,
+                weeks_back=12,
+            )
+        except Exception as exc:
+            errors.append(f"projects-envelope: {exc}")
+        finally:
+            try:
+                conn.execute("DROP VIEW IF EXISTS session_entries")
+                conn.execute("DROP VIEW IF EXISTS session_files")
+            except Exception:
+                pass
+            try:
+                conn.execute("DETACH DATABASE cache_db")
+            except Exception:
+                pass
+        # Late-bind disambiguated `project_key` onto each SessionsPanel
+        # row so the SessionsPanel → ProjectsModal cross-nav (spec §4.1)
+        # routes by the same identity the Projects envelope emits.
+        # Cheap dict-lookup per row; no second aggregation pass.
+        if projects_envelope_block is not None:
+            try:
+                key_by_bucket_path: dict[str, str] = {}
+                for r in projects_envelope_block.get(
+                    "current_week", {}
+                ).get("rows", []):
+                    bp = r.get("bucket_path")
+                    k = r.get("key")
+                    if bp and k:
+                        key_by_bucket_path[bp] = k
+                for r in projects_envelope_block.get(
+                    "trend", {}
+                ).get("projects", []):
+                    bp = r.get("bucket_path")
+                    k = r.get("key")
+                    if bp and k and bp not in key_by_bucket_path:
+                        key_by_bucket_path[bp] = k
+                annotated: list[TuiSessionRow] = []
+                for srow in sessions:
+                    pkey = None
+                    if srow.project_path:
+                        pkey = key_by_bucket_path.get(srow.project_path)
+                    if pkey is None:
+                        annotated.append(srow)
+                    else:
+                        annotated.append(
+                            dataclasses.replace(srow, project_key=pkey)
+                        )
+                sessions = annotated
+            except Exception as exc:
+                errors.append(f"projects-cross-nav-bind: {exc}")
         return DataSnapshot(
             current_week=cw,
             forecast=fc,
@@ -1923,6 +2022,7 @@ def _tui_build_snapshot(
             trend_avg_dollars_per_pct=trend_avg_dpp,
             trend_history_median_dpp=history_median_dpp,
             forecast_view=fc_view,
+            projects_envelope=projects_envelope_block,
         )
     finally:
         conn.close()

@@ -781,6 +781,11 @@ _dashboard_build_blocks_view = _cctally_dashboard._dashboard_build_blocks_view
 _dashboard_build_daily_panel = _cctally_dashboard._dashboard_build_daily_panel
 _empty_dashboard_snapshot = _cctally_dashboard._empty_dashboard_snapshot
 _iso_z = _cctally_dashboard._iso_z
+# Projects panel + modal (spec 2026-05-19-projects-panel-design.md).
+# Re-export so the sync-thread builder at `_cctally_tui._tui_build_snapshot`
+# can reach the dashboard sibling's aggregator via `c = _cctally()`.
+_build_projects_envelope = _cctally_dashboard._build_projects_envelope
+_projects_reset_memo = _cctally_dashboard._projects_reset_memo
 _select_current_block_for_envelope = _cctally_dashboard._select_current_block_for_envelope
 _build_alerts_envelope_array = _cctally_dashboard._build_alerts_envelope_array
 snapshot_to_envelope = _cctally_dashboard.snapshot_to_envelope

@@ -1326,6 +1326,221 @@
     "total_cost_usd": 208.229997,
     "total_tokens": 40269999
   },
+  "projects": {
+    "current_week": {
+      "rows": [],
+      "total_cost_usd": 0.0,
+      "week_label": "wk Apr 13",
+      "week_start_at": "2026-04-13T14:00:00Z",
+      "week_start_date": "2026-04-13"
+    },
+    "trend": {
+      "projects": [
+        {
+          "bucket_path": "/fake/repos/project-2",
+          "first_seen_at": "2026-02-25T06:00:00Z",
+          "key": "project-2",
+          "last_seen_at": "2026-04-15T21:00:00Z",
+          "sessions_count_12w": 9,
+          "weekly_cost": [
+            0.0,
+            21.84,
+            0.0,
+            0.0,
+            19.32,
+            0.0,
+            0.0,
+            22.92,
+            10.8
+          ],
+          "weekly_pct": [
+            null,
+            44.0,
+            null,
+            null,
+            39.0,
+            null,
+            null,
+            45.0,
+            11.383399
+          ]
+        },
+        {
+          "bucket_path": "/fake/repos/project-3",
+          "first_seen_at": "2026-02-18T06:00:00Z",
+          "key": "project-3",
+          "last_seen_at": "2026-04-15T23:30:00Z",
+          "sessions_count_12w": 9,
+          "weekly_cost": [
+            19.8,
+            0.0,
+            0.0,
+            23.279997,
+            0.0,
+            0.0,
+            21.12,
+            0.0,
+            6.48
+          ],
+          "weekly_pct": [
+            38.0,
+            null,
+            null,
+            46.0,
+            null,
+            null,
+            42.0,
+            null,
+            6.83004
+          ]
+        },
+        {
+          "bucket_path": "/fake/repos/project-1",
+          "first_seen_at": "2026-03-04T06:00:00Z",
+          "key": "project-1",
+          "last_seen_at": "2026-04-16T04:30:00Z",
+          "sessions_count_12w": 9,
+          "weekly_cost": [
+            0.0,
+            0.0,
+            20.4,
+            0.0,
+            0.0,
+            21.6,
+            0.0,
+            0.0,
+            7.56
+          ],
+          "weekly_pct": [
+            null,
+            null,
+            41.0,
+            null,
+            null,
+            43.0,
+            null,
+            null,
+            7.968379
+          ]
+        },
+        {
+          "bucket_path": "/fake/repos/project-4",
+          "first_seen_at": "2026-04-13T23:30:00Z",
+          "key": "project-4",
+          "last_seen_at": "2026-04-16T02:00:00Z",
+          "sessions_count_12w": 6,
+          "weekly_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            10.8
+          ],
+          "weekly_pct": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            11.383399
+          ]
+        },
+        {
+          "bucket_path": "/fake/repos/fixture-demo",
+          "first_seen_at": "2026-04-16T10:00:00Z",
+          "key": "fixture-demo",
+          "last_seen_at": "2026-04-16T10:40:00Z",
+          "sessions_count_12w": 1,
+          "weekly_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            2.31
+          ],
+          "weekly_pct": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            2.434783
+          ]
+        }
+      ],
+      "weeks": [
+        {
+          "total_cost_usd": 19.8,
+          "total_pct": 38.0,
+          "week_label": "wk Feb 16",
+          "week_start_date": "2026-02-16"
+        },
+        {
+          "total_cost_usd": 21.84,
+          "total_pct": 44.0,
+          "week_label": "wk Feb 23",
+          "week_start_date": "2026-02-23"
+        },
+        {
+          "total_cost_usd": 20.4,
+          "total_pct": 41.0,
+          "week_label": "wk Mar 02",
+          "week_start_date": "2026-03-02"
+        },
+        {
+          "total_cost_usd": 23.279997,
+          "total_pct": 46.0,
+          "week_label": "wk Mar 09",
+          "week_start_date": "2026-03-09"
+        },
+        {
+          "total_cost_usd": 19.32,
+          "total_pct": 39.0,
+          "week_label": "wk Mar 16",
+          "week_start_date": "2026-03-16"
+        },
+        {
+          "total_cost_usd": 21.6,
+          "total_pct": 43.0,
+          "week_label": "wk Mar 23",
+          "week_start_date": "2026-03-23"
+        },
+        {
+          "total_cost_usd": 21.12,
+          "total_pct": 42.0,
+          "week_label": "wk Mar 30",
+          "week_start_date": "2026-03-30"
+        },
+        {
+          "total_cost_usd": 22.92,
+          "total_pct": 45.0,
+          "week_label": "wk Apr 06",
+          "week_start_date": "2026-04-06"
+        },
+        {
+          "total_cost_usd": 37.95,
+          "total_pct": 40.0,
+          "week_label": "wk Apr 13",
+          "week_start_date": "2026-04-13"
+        }
+      ],
+      "window_weeks": 9
+    }
+  },
   "sessions": {
     "rows": [
       {
@@ -1333,6 +1548,7 @@
         "duration_min": 40,
         "model": "claude-sonnet-4-6",
         "project": "fixture-demo",
+        "project_key": "fixture-demo",
         "session_id": "fixture-ok-session-0000000000000000",
         "started_utc": "2026-04-16T10:00:00Z"
       },
@@ -1341,6 +1557,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-1",
+        "project_key": "project-1",
         "session_id": "ok-cur-s024-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-16T04:00:00Z"
       },
@@ -1349,6 +1566,7 @@
         "duration_min": 30,
         "model": "claude-opus-4-7",
         "project": "project-4",
+        "project_key": "project-4",
         "session_id": "ok-cur-s023-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-16T01:30:00Z"
       },
@@ -1357,6 +1575,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-3",
+        "project_key": "project-3",
         "session_id": "ok-cur-s022-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T23:00:00Z"
       },
@@ -1365,6 +1584,7 @@
         "duration_min": 30,
         "model": "claude-opus-4-7",
         "project": "project-2",
+        "project_key": "project-2",
         "session_id": "ok-cur-s021-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T20:30:00Z"
       },
@@ -1373,6 +1593,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-1",
+        "project_key": "project-1",
         "session_id": "ok-cur-s020-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T18:00:00Z"
       },
@@ -1381,6 +1602,7 @@
         "duration_min": 30,
         "model": "claude-opus-4-7",
         "project": "project-4",
+        "project_key": "project-4",
         "session_id": "ok-cur-s019-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T15:30:00Z"
       },
@@ -1389,6 +1611,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-3",
+        "project_key": "project-3",
         "session_id": "ok-cur-s018-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T13:00:00Z"
       },
@@ -1397,6 +1620,7 @@
         "duration_min": 30,
         "model": "claude-opus-4-7",
         "project": "project-2",
+        "project_key": "project-2",
         "session_id": "ok-cur-s017-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T10:30:00Z"
       },
@@ -1405,6 +1629,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-1",
+        "project_key": "project-1",
         "session_id": "ok-cur-s016-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T08:00:00Z"
       },
@@ -1413,6 +1638,7 @@
         "duration_min": 30,
         "model": "claude-opus-4-7",
         "project": "project-4",
+        "project_key": "project-4",
         "session_id": "ok-cur-s015-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T05:30:00Z"
       },
@@ -1421,6 +1647,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-3",
+        "project_key": "project-3",
         "session_id": "ok-cur-s014-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T03:00:00Z"
       },
@@ -1429,6 +1656,7 @@
         "duration_min": 30,
         "model": "claude-opus-4-7",
         "project": "project-2",
+        "project_key": "project-2",
         "session_id": "ok-cur-s013-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T00:30:00Z"
       },
@@ -1437,6 +1665,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-1",
+        "project_key": "project-1",
         "session_id": "ok-cur-s012-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-14T22:00:00Z"
       },
@@ -1445,6 +1674,7 @@
         "duration_min": 30,
         "model": "claude-opus-4-7",
         "project": "project-4",
+        "project_key": "project-4",
         "session_id": "ok-cur-s011-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-14T19:30:00Z"
       },
@@ -1453,6 +1683,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-3",
+        "project_key": "project-3",
         "session_id": "ok-cur-s010-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-14T17:00:00Z"
       },
@@ -1461,6 +1692,7 @@
         "duration_min": 30,
         "model": "claude-opus-4-7",
         "project": "project-2",
+        "project_key": "project-2",
         "session_id": "ok-cur-s009-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-14T14:30:00Z"
       },
@@ -1469,6 +1701,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-1",
+        "project_key": "project-1",
         "session_id": "ok-cur-s008-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-14T12:00:00Z"
       },
@@ -1477,6 +1710,7 @@
         "duration_min": 30,
         "model": "claude-opus-4-7",
         "project": "project-4",
+        "project_key": "project-4",
         "session_id": "ok-cur-s007-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-14T09:30:00Z"
       },
@@ -1485,6 +1719,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-3",
+        "project_key": "project-3",
         "session_id": "ok-cur-s006-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-14T07:00:00Z"
       },
@@ -1493,6 +1728,7 @@
         "duration_min": 30,
         "model": "claude-opus-4-7",
         "project": "project-2",
+        "project_key": "project-2",
         "session_id": "ok-cur-s005-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-14T04:30:00Z"
       },
@@ -1501,6 +1737,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-1",
+        "project_key": "project-1",
         "session_id": "ok-cur-s004-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-14T02:00:00Z"
       },
@@ -1509,6 +1746,7 @@
         "duration_min": 30,
         "model": "claude-opus-4-7",
         "project": "project-4",
+        "project_key": "project-4",
         "session_id": "ok-cur-s003-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-13T23:30:00Z"
       },
@@ -1517,6 +1755,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-3",
+        "project_key": "project-3",
         "session_id": "ok-cur-s002-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-13T21:00:00Z"
       },
@@ -1525,6 +1764,7 @@
         "duration_min": 30,
         "model": "claude-opus-4-7",
         "project": "project-2",
+        "project_key": "project-2",
         "session_id": "ok-cur-s001-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-13T18:30:00Z"
       },
@@ -1533,6 +1773,7 @@
         "duration_min": 30,
         "model": "claude-sonnet-4-6",
         "project": "project-1",
+        "project_key": "project-1",
         "session_id": "ok-cur-s000-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-13T16:00:00Z"
       },
@@ -1541,6 +1782,7 @@
         "duration_min": 0,
         "model": "claude-sonnet-4-6",
         "project": "project-2",
+        "project_key": "project-2",
         "session_id": "ok-hist-wk01-0000-0000-0000-0000",
         "started_utc": "2026-04-08T06:00:00Z"
       },
@@ -1549,6 +1791,7 @@
         "duration_min": 0,
         "model": "claude-sonnet-4-6",
         "project": "project-3",
+        "project_key": "project-3",
         "session_id": "ok-hist-wk02-0000-0000-0000-0000",
         "started_utc": "2026-04-01T06:00:00Z"
       },
@@ -1557,6 +1800,7 @@
         "duration_min": 0,
         "model": "claude-sonnet-4-6",
         "project": "project-1",
+        "project_key": "project-1",
         "session_id": "ok-hist-wk03-0000-0000-0000-0000",
         "started_utc": "2026-03-25T06:00:00Z"
       },
@@ -1565,6 +1809,7 @@
         "duration_min": 0,
         "model": "claude-sonnet-4-6",
         "project": "project-2",
+        "project_key": "project-2",
         "session_id": "ok-hist-wk04-0000-0000-0000-0000",
         "started_utc": "2026-03-18T06:00:00Z"
       },
@@ -1573,6 +1818,7 @@
         "duration_min": 0,
         "model": "claude-sonnet-4-6",
         "project": "project-3",
+        "project_key": "project-3",
         "session_id": "ok-hist-wk05-0000-0000-0000-0000",
         "started_utc": "2026-03-11T06:00:00Z"
       },
@@ -1581,6 +1827,7 @@
         "duration_min": 0,
         "model": "claude-sonnet-4-6",
         "project": "project-1",
+        "project_key": "project-1",
         "session_id": "ok-hist-wk06-0000-0000-0000-0000",
         "started_utc": "2026-03-04T06:00:00Z"
       },
@@ -1589,6 +1836,7 @@
         "duration_min": 0,
         "model": "claude-sonnet-4-6",
         "project": "project-2",
+        "project_key": "project-2",
         "session_id": "ok-hist-wk07-0000-0000-0000-0000",
         "started_utc": "2026-02-25T06:00:00Z"
       },
@@ -1597,6 +1845,7 @@
         "duration_min": 0,
         "model": "claude-sonnet-4-6",
         "project": "project-3",
+        "project_key": "project-3",
         "session_id": "ok-hist-wk08-0000-0000-0000-0000",
         "started_utc": "2026-02-18T06:00:00Z"
       }

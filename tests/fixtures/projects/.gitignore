@@ -1,0 +1,11 @@
+# Fixture-scoped gitignore (CLAUDE.md memory: Fixture-scoped gitignore)
+# WAL/shm sidecars and config / lock / log files spawn whenever a fake
+# HOME points into this dir or a sqlite3 connection opens a fixture .db
+# in WAL mode. Per-fixture .gitignore so the in-tree fixtures stay byte
+# stable across `bin/cctally-test-all` runs and ad-hoc dev opens.
+*.db-wal
+*.db-shm
+.config/
+.local/
+*.log
+*.lock

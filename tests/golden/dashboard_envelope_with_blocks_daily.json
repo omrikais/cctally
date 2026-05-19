@@ -124,6 +124,7 @@
     "total_cost_usd": 0.0,
     "total_tokens": 0
   },
+  "projects": null,
   "sessions": {
     "rows": [],
     "sort_key": "started_desc",
