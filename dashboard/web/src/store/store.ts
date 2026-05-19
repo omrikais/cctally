@@ -565,7 +565,7 @@ export type Action =
       alertsSettings: AlertsConfig;
       isFirstTick: boolean;
     }
-  | { type: 'SET_TABLE_SORT'; table: 'trend' | 'sessions'; override: SortOverride | null }
+  | { type: 'SET_TABLE_SORT'; table: 'trend' | 'sessions' | 'projects'; override: SortOverride | null }
   | { type: 'CLEAR_TABLE_SORTS' }
   // ---------- Update subcommand actions (spec §6) ----------
   // OPEN_UPDATE_MODAL / CLOSE_UPDATE_MODAL: badge click + Esc / X.
@@ -872,7 +872,12 @@ export function dispatch(action: Action): void {
       break;
     }
     case 'SET_TABLE_SORT': {
-      const key = action.table === 'trend' ? 'trendSortOverride' : 'sessionsSortOverride';
+      const key =
+        action.table === 'trend'
+          ? 'trendSortOverride'
+          : action.table === 'projects'
+            ? 'projectsSortOverride'
+            : 'sessionsSortOverride';
       const prefs = { ...state.prefs, [key]: action.override };
       localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
       const next = { ...state, prefs };
@@ -885,6 +890,7 @@ export function dispatch(action: Action): void {
         ...state.prefs,
         trendSortOverride: null,
         sessionsSortOverride: null,
+        projectsSortOverride: null,
       };
       localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
       const next = { ...state, prefs };

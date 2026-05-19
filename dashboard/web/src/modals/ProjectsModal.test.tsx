@@ -614,6 +614,177 @@ describe('<ProjectsModal />', () => {
     expect(document.querySelector('tr.selected')?.firstElementChild?.textContent).toBe('project-1');
   });
 
+  // Issue #66 — column headers route through `SortableHeader`, default
+  // sort is cost-desc, override persists at `prefs.projectsSortOverride`,
+  // and the action widens `SET_TABLE_SORT.table` to include `'projects'`.
+  describe('column sort (#66 / spec §3.4)', () => {
+    // Three projects with distinct, non-monotone-with-cost values so each
+    // header click resolves to a different visible row order than the
+    // cost-desc default.
+    function buildSortEnvelope(): Envelope {
+      const env = baseEnvelope();
+      const make = (
+        key: string,
+        cost: number,
+        pct: number,
+        sessions: number,
+        dayOffset: number,
+      ): ProjectsTrendProject => ({
+        key,
+        bucket_path: `/repos/${key}`,
+        weekly_cost: Array.from({ length: 4 }, () => cost),
+        weekly_pct: Array.from({ length: 4 }, () => pct),
+        sessions_per_week: Array.from({ length: 4 }, () => sessions),
+        first_seen_per_week: Array.from(
+          { length: 4 },
+          (_, j) =>
+            `2026-04-${String(dayOffset + j * 7).padStart(2, '0')}T00:00:00Z`,
+        ),
+        last_seen_per_week: Array.from(
+          { length: 4 },
+          (_, j) =>
+            `2026-04-${String(dayOffset + j * 7).padStart(2, '0')}T23:00:00Z`,
+        ),
+      });
+      // Column orderings (rows always presented in their list order here;
+      // the modal sorts cost-desc by default, so leader is zulu):
+      //   cost desc:    zulu(200), mid(100), alpha(40)
+      //   project asc:  alpha,     mid,      zulu
+      //   sessions desc: alpha(36), zulu(16), mid(8)
+      const projects: ProjectsTrendProject[] = [
+        make('alpha', 10, 1, 9, 1),
+        make('mid', 25, 5, 2, 2),
+        make('zulu', 50, 10, 4, 3),
+      ];
+      env.projects = {
+        current_week: {
+          week_label: 'wk May 13',
+          week_start_date: '2026-05-13',
+          week_start_at: '2026-05-13T00:00:00Z',
+          total_cost_usd: projects.reduce(
+            (s, p) => s + p.weekly_cost[p.weekly_cost.length - 1]!,
+            0,
+          ),
+          rows: projects.map((p) => ({
+            key: p.key,
+            bucket_path: p.bucket_path,
+            cost_usd: p.weekly_cost[p.weekly_cost.length - 1]!,
+            attributed_pct: 10,
+            sessions_count: 5,
+          })),
+        },
+        trend: {
+          window_weeks: 4,
+          weeks: Array.from({ length: 4 }, (_, j) => ({
+            week_start_date: `2026-04-0${j + 1}`,
+            week_label: `wk0${j + 1}`,
+            total_cost_usd: 85,
+            total_pct: 17,
+          })),
+          projects,
+        },
+      };
+      return env;
+    }
+
+    function rowKeys(): string[] {
+      return screen
+        .getAllByTestId('projects-table-row')
+        .map((r) => r.querySelector('td.project')?.textContent ?? '');
+    }
+
+    it('renders SortableHeader columnheaders with no active sort by default', () => {
+      vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('zulu')));
+      updateSnapshot(buildSortEnvelope());
+      render(<ProjectsModal />);
+      // Every header is a columnheader with aria-sort="none" (no override).
+      const headers = screen.getAllByRole('columnheader');
+      expect(headers).toHaveLength(7);
+      for (const h of headers) {
+        expect(h.getAttribute('aria-sort')).toBe('none');
+      }
+      // Default order is still cost-desc — the static ▼ on the Cost header
+      // is gone (now driven by SortableHeader's caret span).
+      expect(rowKeys()).toEqual(['zulu', 'mid', 'alpha']);
+    });
+
+    it('clicking the Cost header cycles desc → asc → null (3-state) and persists override', () => {
+      vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('zulu')));
+      updateSnapshot(buildSortEnvelope());
+      render(<ProjectsModal />);
+      const costHeader = screen.getByRole('columnheader', { name: 'Cost' });
+
+      // First click: null → cost desc. Rows already cost-desc; caret = ▼.
+      fireEvent.click(costHeader);
+      expect(getState().prefs.projectsSortOverride).toEqual({
+        column: 'cost',
+        direction: 'desc',
+      });
+      expect(costHeader.getAttribute('aria-sort')).toBe('descending');
+      expect(rowKeys()).toEqual(['zulu', 'mid', 'alpha']);
+
+      // Second click: desc → asc. Rows flip; caret = ▲.
+      fireEvent.click(costHeader);
+      expect(getState().prefs.projectsSortOverride).toEqual({
+        column: 'cost',
+        direction: 'asc',
+      });
+      expect(costHeader.getAttribute('aria-sort')).toBe('ascending');
+      expect(rowKeys()).toEqual(['alpha', 'mid', 'zulu']);
+
+      // Third click: asc → null. Rows fall back to default cost-desc.
+      fireEvent.click(costHeader);
+      expect(getState().prefs.projectsSortOverride).toBeNull();
+      expect(costHeader.getAttribute('aria-sort')).toBe('none');
+      expect(rowKeys()).toEqual(['zulu', 'mid', 'alpha']);
+    });
+
+    it('clicking the Project header sorts ascending by display key (text default)', () => {
+      vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('zulu')));
+      updateSnapshot(buildSortEnvelope());
+      render(<ProjectsModal />);
+      const projectHeader = screen.getByRole('columnheader', { name: 'Project' });
+      fireEvent.click(projectHeader);
+      expect(getState().prefs.projectsSortOverride).toEqual({
+        column: 'project',
+        direction: 'asc',
+      });
+      expect(projectHeader.getAttribute('aria-sort')).toBe('ascending');
+      expect(rowKeys()).toEqual(['alpha', 'mid', 'zulu']);
+    });
+
+    it('clicking the Sessions header sorts descending by sessions count (num default)', () => {
+      vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('zulu')));
+      updateSnapshot(buildSortEnvelope());
+      render(<ProjectsModal />);
+      const sessionsHeader = screen.getByRole('columnheader', { name: 'Sessions' });
+      fireEvent.click(sessionsHeader);
+      expect(getState().prefs.projectsSortOverride).toEqual({
+        column: 'sessions',
+        direction: 'desc',
+      });
+      expect(sessionsHeader.getAttribute('aria-sort')).toBe('descending');
+      // sessions per project per week: alpha=9, mid=2, zulu=4 (× 4 weeks).
+      expect(rowKeys()).toEqual(['alpha', 'zulu', 'mid']);
+    });
+
+    it('hydrates persisted override on mount (project asc)', () => {
+      vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('alpha')));
+      // Seed pref before mount so the modal reads the persisted override.
+      dispatch({
+        type: 'SET_TABLE_SORT',
+        table: 'projects',
+        override: { column: 'project', direction: 'asc' },
+      });
+      updateSnapshot(buildSortEnvelope());
+      render(<ProjectsModal />);
+      expect(rowKeys()).toEqual(['alpha', 'mid', 'zulu']);
+      expect(
+        screen.getByRole('columnheader', { name: 'Project' }).getAttribute('aria-sort'),
+      ).toBe('ascending');
+    });
+  });
+
   it('chart aria-label reflects yMode (cost vs share %)', () => {
     vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
     updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));

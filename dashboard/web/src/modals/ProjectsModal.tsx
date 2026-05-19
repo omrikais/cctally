@@ -25,6 +25,7 @@ import { Modal } from './Modal';
 import { ProjectsTrendChart } from './ProjectsTrendChart';
 import { ProjectsDrillPanel } from './ProjectsDrillPanel';
 import { ShareIcon } from '../components/ShareIcon';
+import { SortableHeader } from '../components/SortableHeader';
 import { SyncChip } from '../components/SyncChip';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
@@ -33,6 +34,8 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { fmt } from '../lib/fmt';
 import { costClass } from '../lib/cost';
+import { applyTableSort } from '../lib/tableSort';
+import { PROJECTS_COLUMNS, type ProjectsTableRow } from '../lib/projectsColumns';
 
 type WindowPill = 1 | 4 | 8 | 12;
 const WINDOW_PILLS: readonly WindowPill[] = [1, 4, 8, 12];
@@ -49,6 +52,10 @@ export function ProjectsModal() {
   const yMode = useSyncExternalStore(
     subscribeStore,
     () => getState().prefs.projectsTrendYMode,
+  );
+  const sortOverride = useSyncExternalStore(
+    subscribeStore,
+    () => getState().prefs.projectsSortOverride,
   );
   const [selectedKey, setSelectedKey] = useState<string | null>(projectKey ?? null);
   // Collapse the projects table to the top-N active projects by default;
@@ -91,23 +98,18 @@ export function ProjectsModal() {
 
   // Window-aware project rows: window-summed cost + window-summed
   // attributed pct + window-summed sessions + window min/max of
-  // first/last seen + derived $/1%. Sorted desc by window cost (spec
-  // §3.4 — default sort).
-  type DerivedRow = {
-    key: string;
-    sessionsCount: number;
-    firstSeenAt: string | null;
-    lastSeenAt: string | null;
-    windowCost: number;
-    windowPct: number | null;
-    dollarsPerPct: number | null;
-  };
+  // first/last seen + derived $/1%. Default sort is desc by window cost
+  // (spec §3.4); a click on any `SortableHeader` cell persists an
+  // override at `prefs.projectsSortOverride` and routes through
+  // `applyTableSort`.
   // Top-N active projects shown by default; rest behind an expand toggle.
-  // "Active" = nonzero window cost. Spec §3.4's default sort is desc by
-  // cost, so the top-N active are simply the leading rows of the sorted
-  // table after filtering out zero-cost entries.
+  // "Active" = nonzero window cost. The default cost-desc sort means the
+  // top-N active are simply the leading rows after filtering out
+  // zero-cost entries; under an override the user-chosen order is
+  // applied AFTER the active-filter so they still only see the top
+  // ACTIVE_COLLAPSE_LIMIT rows when collapsed.
   const ACTIVE_COLLAPSE_LIMIT = 10;
-  const tableRows: DerivedRow[] = (trend?.projects ?? [])
+  const baseRows: ProjectsTableRow[] = (trend?.projects ?? [])
     .map((p) => {
       const weeklyCost = p.weekly_cost.slice(-windowWeeks);
       const weeklyPct = p.weekly_pct.slice(-windowWeeks);
@@ -143,8 +145,17 @@ export function ProjectsModal() {
         windowPct,
         dollarsPerPct: dpp,
       };
-    })
-    .sort((a, b) => b.windowCost - a.windowCost);
+    });
+
+  // Apply override when set; otherwise fall back to cost-desc (spec §3.4
+  // "Default sort: cost desc"). `applyTableSort` does NOT mutate its
+  // input — slice() inside.
+  const tableRows: ProjectsTableRow[] = sortOverride
+    ? applyTableSort(baseRows, PROJECTS_COLUMNS, sortOverride)
+    : applyTableSort(baseRows, PROJECTS_COLUMNS, {
+        column: 'cost',
+        direction: 'desc',
+      });
 
   const activeRows = tableRows.filter((r) => r.windowCost > 0);
   const collapsedRows = activeRows.slice(0, ACTIVE_COLLAPSE_LIMIT);
@@ -272,17 +283,14 @@ export function ProjectsModal() {
         )}
 
         <table className="projects-table">
-          <thead>
-            <tr>
-              <th>Project</th>
-              <th>Sessions</th>
-              <th>First seen</th>
-              <th>Last seen</th>
-              <th>Cost ▼</th>
-              <th>Used %</th>
-              <th>$/1%</th>
-            </tr>
-          </thead>
+          <SortableHeader
+            columns={PROJECTS_COLUMNS}
+            override={sortOverride}
+            onChange={(next) =>
+              dispatch({ type: 'SET_TABLE_SORT', table: 'projects', override: next })
+            }
+            accentVar="--accent-magenta"
+          />
           <tbody>
             {visibleRows.map((r) => (
               <tr
