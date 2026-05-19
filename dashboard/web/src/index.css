@@ -3824,6 +3824,20 @@ mark.current {
 .projects-table th:first-child, .projects-table td:first-child {
   text-align: left;
 }
+.projects-table thead th {
+  color: var(--accent-amber); font-weight: 700;
+}
+/* Semantic cell coloring — same palette as `.sess-table` so Sessions
+ * and Projects tables stay visually consistent. Project name -> blue
+ * (cross-nav target), date columns -> cyan (chronological), cost
+ * columns flow through cost-xs/low/mid/high (green/amber/red) via the
+ * shared `costClass` helper in `lib/cost.ts`. */
+.projects-table tbody td.project { color: var(--accent-blue); }
+.projects-table tbody td.started { color: var(--accent-cyan); }
+.projects-table tbody td.cost-low  { color: var(--accent-green); }
+.projects-table tbody td.cost-mid  { color: var(--accent-amber); }
+.projects-table tbody td.cost-high { color: var(--accent-red); }
+.projects-table tbody td.cost-xs   { color: var(--accent-green); }
 .projects-table tbody tr { cursor: pointer; }
 .projects-table tbody tr:hover { background: rgba(217, 70, 239, 0.06); }
 .projects-table tbody tr.selected {
@@ -3887,12 +3901,25 @@ mark.current {
   border-radius: 2px;
 }
 .drill-bar-row .cost { text-align: right; }
+/* Drill cost spans inherit the same green/amber/red palette as
+ * `.sess-table` cost cells via the shared `costClass` helper.
+ * Defined with `:where()` so the specificity stays compatible with
+ * the `.drill-session-row:hover` magenta sweep below. */
+.drill-bar-row .cost.cost-xs,
+.drill-bar-row .cost.cost-low,
+.drill-session-row .cost.cost-xs,
+.drill-session-row .cost.cost-low { color: var(--accent-green); }
+.drill-bar-row .cost.cost-mid,
+.drill-session-row .cost.cost-mid { color: var(--accent-amber); }
+.drill-bar-row .cost.cost-high,
+.drill-session-row .cost.cost-high { color: var(--accent-red); }
 .drill-session-row {
   display: grid; grid-template-columns: 1fr auto auto; gap: 8px;
   align-items: center; padding: 4px 0; border: none;
   background: none; color: inherit; font: inherit;
   cursor: pointer; width: 100%; text-align: left;
 }
+.drill-session-row .started { color: var(--accent-cyan); }
 .drill-session-row:hover { color: var(--accent-magenta); }
 .drill-session-row + .drill-session-row {
   border-top: 1px solid var(--border-soft);

@@ -14,6 +14,7 @@ import { dispatch } from '../store/store';
 import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { modelChipClass } from '../lib/model';
+import { costClass } from '../lib/cost';
 import type { CSSProperties } from 'react';
 
 export interface ProjectsDrillPanelProps {
@@ -65,7 +66,7 @@ export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPan
                 <div className="drill-bar-row" key={m.model}>
                   <span className={`chip ${modelChipClass(m.model)}`}>{m.model}</span>
                   <div className="drill-bar" style={style} />
-                  <span className="cost">{fmt.usd2(m.cost_usd)}</span>
+                  <span className={`cost ${costClass(m.cost_usd)}`}>{fmt.usd2(m.cost_usd)}</span>
                 </div>
               );
             })
@@ -89,11 +90,11 @@ export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPan
                   })
                 }
               >
-                <span>{fmt.datetimeShort(s.last_activity_at, ctx)}</span>
+                <span className="started">{fmt.datetimeShort(s.last_activity_at, ctx)}</span>
                 <span className={`chip ${modelChipClass(s.primary_model)}`}>
                   {s.primary_model}
                 </span>
-                <span className="cost">{fmt.usd2(s.cost_usd)}</span>
+                <span className={`cost ${costClass(s.cost_usd)}`}>{fmt.usd2(s.cost_usd)}</span>
               </button>
             ))
           )}

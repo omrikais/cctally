@@ -15,15 +15,8 @@ import { ShareIcon } from '../components/ShareIcon';
 import { SESSIONS_COLUMNS } from '../lib/sessionsColumns';
 import { fmt } from '../lib/fmt';
 import { modelChipClass } from '../lib/model';
+import { costClass } from '../lib/cost';
 import { openShareModal } from '../store/shareSlice';
-
-function costClass(c: number | null | undefined): string {
-  if (c == null) return 'cost-low';
-  if (c < 0.25) return 'cost-xs';
-  if (c < 1.0) return 'cost-low';
-  if (c < 3.0) return 'cost-mid';
-  return 'cost-high';
-}
 
 export function SessionsPanel() {
   const env = useSnapshot();

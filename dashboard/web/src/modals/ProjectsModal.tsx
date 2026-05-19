@@ -30,6 +30,7 @@ import { useDisplayTz } from '../hooks/useDisplayTz';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { fmt } from '../lib/fmt';
+import { costClass } from '../lib/cost';
 
 type WindowPill = 1 | 4 | 8 | 12;
 const WINDOW_PILLS: readonly WindowPill[] = [1, 4, 8, 12];
@@ -234,13 +235,13 @@ export function ProjectsModal() {
                 className={selectedKey === r.key ? 'selected' : ''}
                 onClick={() => onRowClick(r.key)}
               >
-                <td>{r.key}</td>
+                <td className="project">{r.key}</td>
                 <td>{r.sessions_count_12w}</td>
-                <td>{fmt.dateShort(r.first_seen_at, ctx) ?? '—'}</td>
-                <td>{fmt.dateShort(r.last_seen_at, ctx) ?? '—'}</td>
-                <td>{fmt.usd2(r.windowCost)}</td>
+                <td className="started">{fmt.dateShort(r.first_seen_at, ctx) ?? '—'}</td>
+                <td className="started">{fmt.dateShort(r.last_seen_at, ctx) ?? '—'}</td>
+                <td className={costClass(r.windowCost)}>{fmt.usd2(r.windowCost)}</td>
                 <td>{r.windowPct == null ? '—' : fmt.pct0(r.windowPct)}</td>
-                <td>{r.dollarsPerPct == null ? '—' : fmt.usd2(r.dollarsPerPct)}</td>
+                <td className={r.dollarsPerPct == null ? '' : costClass(r.dollarsPerPct)}>{r.dollarsPerPct == null ? '—' : fmt.usd2(r.dollarsPerPct)}</td>
               </tr>
             ))}
           </tbody>
