@@ -360,6 +360,13 @@ SCENARIOS.append((
 # 8. tag-held-back: Public-Skip commit + tag v1.0.0 on it. Mirror skips
 # the commit AND emits a held-back warning (the tag's target commit was
 # never published, so it can't propagate to anything).
+#
+# Pre-Task-2 note: this scenario intentionally ends with an unflushed
+# Public-Skip commit carrying a public-classified path (docs/internal.md).
+# The fingerprint precheck (spec §6) would correctly flag the gap between
+# private HEAD's public-classified projection and the public clone's
+# tree as drift. This scenario tests the tag-held-back warning surface,
+# not the precheck — so we bypass via --skip-fingerprint-check via run.sh.
 SCENARIOS.append((
     "tag-held-back",
     'mkdir -p docs\n'
@@ -373,7 +380,8 @@ SCENARIOS.append((
     + 'git tag -a v1.0.0 -m "v1.0.0"\n',
     0, "tag not propagated", "",
     None,
-    None,
+    "python3 bin/cctally-mirror-public --public-clone ../public --yes "
+    "--skip-fingerprint-check\n",
 ))
 
 
@@ -640,8 +648,15 @@ SCENARIOS.append((
     # run.sh: invoke mirror once (skip-only), capture cursor, then add
     # a publish commit on a different path and invoke mirror again.
     # Assert both files exist with expected content on the public side.
+    #
+    # Pre-Task-2 note: run 1 ends with an unflushed Public-Skip carrying
+    # docs/skipped.md (public-classified). The fingerprint precheck would
+    # correctly flag the gap; this scenario tests cross-run accumulation
+    # rather than the precheck, so we bypass via --skip-fingerprint-check.
+    # Run 2 publishes both paths, so the default invocation (with the
+    # precheck active) passes cleanly there.
     'CURSOR_BEFORE=$(git rev-parse refs/tags/mirror-cursor)\n'
-    'python3 bin/cctally-mirror-public --public-clone ../public --yes\n'
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes --skip-fingerprint-check\n'
     'rc=$?\n'
     'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: run1 exit=$rc"; exit "$rc"; fi\n'
     'CURSOR_AFTER1=$(git rev-parse refs/tags/mirror-cursor)\n'
@@ -1332,9 +1347,18 @@ SCENARIOS.append((
     # produced (S1/S2/S3 are all private/unmatched). The "(no public
     # commits to produce; advancing cursor only)" line is the stdout
     # signature of a private-only walk.
+    #
+    # Pre-Task-2 note: after S3, HEAD's allowlist promotes extras/** to
+    # public, but no publish-kind commit ever touched extras/widget.txt,
+    # so it never landed on the public clone. The fingerprint precheck
+    # (spec §6) would correctly flag this as drift — the canonical "promote
+    # a file to public but never touched it" gotcha. This scenario tests
+    # the no-retroactive-flag rule (commit-time allowlist semantics) not
+    # the precheck, so we bypass via --skip-fingerprint-check via run.sh.
     0, "advancing cursor only", "",
     None,  # no public-HEAD message check (no publish happened)
-    None,
+    "python3 bin/cctally-mirror-public --public-clone ../public --yes "
+    "--skip-fingerprint-check\n",
 ))
 
 
@@ -1621,23 +1645,344 @@ SCENARIOS.append((
 ))
 
 
+# ---------------------------------------------------------------------------
+# Precheck scenarios (Task 2 — spec §6).
+#
+# These exercise the release-time fingerprint precheck wired into
+# cmd_mirror between the apply pass and _propagate_tags. Both scenarios
+# pre-seed the public clone with a drift state that the apply pass
+# itself cannot detect (because the drift was introduced outside the
+# mirror tool's per-commit replay), then run the mirror normally and
+# expect exit 2 + the three-bucket diagnostic on stderr.
+#
+# Setup pattern: append a publish-kind commit on the PRIVATE side that
+# carries a legitimate public file (so the apply pass HAS something to
+# replay; otherwise nothing_to_apply hits and the apply pass becomes a
+# no-op). Then directly commit a stale file on the PUBLIC side (bypassing
+# the mirror tool). The mirror runs, applies the publish, then the
+# precheck compares private HEAD's projection vs public HEAD's tree —
+# they disagree → exit 2 + diagnostic.
+# ---------------------------------------------------------------------------
+
+
+# drift-precheck-tripwire: legacy drift simulation. Public clone carries
+# a stale file (legacy/stale.md) that has no counterpart on the private
+# side. After a routine publish, the precheck refuses because the public
+# clone still contains the stale path.
+SCENARIOS.append((
+    "drift-precheck-tripwire",
+    # Private body: a publish commit on docs/notes.md so the apply pass
+    # has something to do (the precheck still fires even on
+    # nothing_to_apply runs, but tying the precheck assertion to a
+    # routine publish keeps the scenario closer to the real release-time
+    # failure mode).
+    'mkdir -p docs\n'
+    'echo "notes v1" > docs/notes.md\n'
+    'git add docs/notes.md\n'
+    + _commit_msg_heredoc(
+        "feat: seed public notes\n"
+        "\n"
+        "--- public ---\n"
+        "docs: seed notes\n",
+        sentinel="CCTALLY_MSG_EOF_SEED",
+    )
+    # Now seed a stale file directly on the PUBLIC clone, bypassing the
+    # mirror tool. Simulates the pre-fix v1.9.0 drift (313 stale files
+    # accumulated outside the per-commit-diff walk).
+    + 'pushd "$work/public" >/dev/null\n'
+      'mkdir -p legacy\n'
+      'echo "stale content" > legacy/stale.md\n'
+      'git add legacy/stale.md\n'
+      'git commit --no-verify -q -m "chore: seed stale legacy file"\n'
+      'popd >/dev/null\n',
+    # Expected: exit 2, stderr contains the "only on public" bucket label
+    # plus the stale path. No public-msg / public-tree check (the public
+    # clone HEAD is left exactly where the seed-stale commit put it — the
+    # mirror's apply pass had a chance to advance HEAD with a publish,
+    # but it ROLLED BACK when the precheck returned 2? No — the precheck
+    # runs AFTER the apply pass commits; the public clone has both the
+    # publish commit AND the stale commit on it. The precheck doesn't
+    # rewrite history, just refuses the run. We don't pin the public-tree
+    # because the answer is the union of {docs/notes.md (just applied),
+    # legacy/stale.md (pre-seeded)} which is stable but uninteresting.)
+    2, "", "only on public",
+    None,
+    None,
+))
+
+
+# drift-precheck-mode-mismatch: regression for finding F2 (mode in the
+# fingerprint key). Public clone carries the SAME path + blob as private,
+# but with 100644 mode where private has 100755. Blob-only keying would
+# have missed it; the widened (mode, blob) key surfaces it under the
+# "blob mismatch" bucket.
+#
+# Pattern: a two-run sequence via run.sh. Run 1 mirrors a publish that
+# lands bin/cctally-foo at 100755 on the public clone. Between runs we
+# directly chmod 0644 + amend on the public clone (bypassing the mirror
+# tool) so the wrong mode survives into the next mirror invocation. Run
+# 2 has nothing new to apply (cursor at HEAD) but the precheck fires
+# and sees the mode delta under the "blob mismatch" bucket.
+SCENARIOS.append((
+    "drift-precheck-mode-mismatch",
+    # Seed body: a single publish commit on bin/cctally-foo at 100755.
+    'mkdir -p bin\n'
+    'printf \'#!/bin/bash\\necho foo\\n\' > bin/cctally-foo\n'
+    'chmod +x bin/cctally-foo\n'
+    'git add bin/cctally-foo\n'
+    + _commit_msg_heredoc(
+        "feat: seed exec wrapper\n"
+        "\n"
+        "--- public ---\n"
+        "feat: add cctally-foo wrapper\n",
+        sentinel="CCTALLY_MSG_EOF_SEED",
+    ),
+    2, "", "blob mismatch (same path, different content)",
+    None,
+    # run.sh: mirror once to land 100755 on public, then directly mutate
+    # the public clone to 100644 (bypassing the mirror tool — simulates
+    # the pre-fix-era drift where an unrelated tool flipped a mode), then
+    # re-run the mirror with no new private commits. The second run hits
+    # the precheck on the mode-only delta.
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes\n'
+    'rc=$?\n'
+    'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: run1 exit=$rc"; exit "$rc"; fi\n'
+    # Sanity: bin/cctally-foo landed at 100755 on the public clone.
+    'mode=$(git -C ../public ls-tree HEAD -- bin/cctally-foo | awk \'{print $1}\')\n'
+    '[ "$mode" = "100755" ] || { echo "ASSERT_FAIL: expected 100755 after run1, got $mode"; exit 2; }\n'
+    # Demote mode on the public clone via direct chmod + commit. This
+    # bypasses the mirror tool — exactly the drift the precheck is
+    # there to catch.
+    'pushd ../public >/dev/null\n'
+    'chmod 0644 bin/cctally-foo\n'
+    'git update-index --chmod=-x bin/cctally-foo\n'
+    'git commit --no-verify -q -m "chore: simulate drift — chmod 0644"\n'
+    'popd >/dev/null\n'
+    # Re-run mirror; no new private commits → nothing_to_apply, but the
+    # precheck still fires and exits 2 because of the mode mismatch.
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes\n'
+    'rc=$?\n'
+    'if [ "$rc" -eq 2 ]; then echo "ASSERT_OK_PRECHECK_REFUSED"; exit 2; fi\n'
+    'echo "ASSERT_FAIL: expected exit 2 from precheck, got $rc"\n'
+    'exit "$rc"\n',
+))
+
+
+# ---------------------------------------------------------------------------
+# Reconcile scenarios (Task 3 — spec §7).
+#
+# These exercise the `--reconcile` fix-forward recovery mode. Each
+# scenario must satisfy two preconditions before reconcile itself can
+# run (or refuse on the right guard):
+#   1. Public clone's origin URL must resolve to `omrikais/cctally`
+#      (Guard 2 — wrong-clone). The scaffold doesn't set origin, so
+#      each scenario's run.sh adds it as a faux-remote pointing at a
+#      bogus path (the URL is only inspected by `_normalize_origin_url`,
+#      never dereferenced for fetch/push).
+#   2. mirror-cursor must equal private HEAD (Guard 3 — cursor invariant)
+#      EXCEPT in `drift-reconcile-refuses-cursor-behind`, which
+#      deliberately advances HEAD past the cursor to trip the guard.
+#
+# Note: --reconcile does NOT advance mirror-cursor or push tags. The
+# operator pushes manually per spec §7 *Algorithm* step 10. Scenarios
+# don't try to verify push behavior.
+# ---------------------------------------------------------------------------
+
+
+# drift-reconcile-clean: same seed as drift-precheck-tripwire (stale
+# file on public). run.sh invokes --reconcile; expect exit 0, a single
+# new commit on public removing the stale file, post-commit precheck
+# passes.
+SCENARIOS.append((
+    "drift-reconcile-clean",
+    # No scenario-specific private commits — the infra-bootstrap commit
+    # is HEAD, and `mirror-cursor` is tagged at HEAD by the scaffold.
+    # Seed the public clone with the stale file directly.
+    'pushd "$work/public" >/dev/null\n'
+    'mkdir -p legacy\n'
+    'echo "stale content" > legacy/stale.md\n'
+    'git add legacy/stale.md\n'
+    'git commit --no-verify -q -m "chore: seed stale legacy file"\n'
+    'popd >/dev/null\n',
+    0, "ASSERT_OK", "",
+    None,
+    # run.sh: configure faux origin → run --reconcile → assert one new
+    # public commit removed the stale file + verify reconcile-source
+    # trailer + verify mirror-cursor unchanged (reconcile MUST NOT
+    # advance it).
+    'pushd ../public >/dev/null\n'
+    'git remote remove origin 2>/dev/null || true\n'
+    'git remote add origin https://github.com/omrikais/cctally.git\n'
+    'popd >/dev/null\n'
+    'PUB_HEAD_BEFORE=$(git -C ../public rev-parse HEAD)\n'
+    'CURSOR_BEFORE=$(git rev-parse refs/tags/mirror-cursor)\n'
+    'python3 bin/cctally-mirror-public --public-clone ../public --reconcile --yes\n'
+    'rc=$?\n'
+    'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: reconcile exit=$rc"; exit "$rc"; fi\n'
+    'PUB_HEAD_AFTER=$(git -C ../public rev-parse HEAD)\n'
+    'CURSOR_AFTER=$(git rev-parse refs/tags/mirror-cursor)\n'
+    'if [ "$PUB_HEAD_BEFORE" = "$PUB_HEAD_AFTER" ]; then\n'
+    '  echo "ASSERT_FAIL: reconcile produced no commit (HEAD unchanged)"\n'
+    '  exit 2\n'
+    'fi\n'
+    'if [ "$CURSOR_BEFORE" != "$CURSOR_AFTER" ]; then\n'
+    '  echo "ASSERT_FAIL: reconcile advanced mirror-cursor (must not move)"\n'
+    '  exit 2\n'
+    'fi\n'
+    'test ! -e ../public/legacy/stale.md || { echo "ASSERT_FAIL: stale file survived reconcile"; exit 2; }\n'
+    # Subject + trailer assertions.
+    'subject=$(git -C ../public log -1 --format=%s)\n'
+    '[ "$subject" = "chore: reconcile public tree against allowlist" ] || { echo "ASSERT_FAIL: subject=$subject"; exit 2; }\n'
+    'git -C ../public log -1 --format=%B | grep -q "^Reconcile-Source: " || { echo "ASSERT_FAIL: missing Reconcile-Source trailer"; exit 2; }\n'
+    'echo "ASSERT_OK"\n',
+))
+
+
+# drift-reconcile-idempotent: invoke --reconcile twice in a row. The
+# first run produces one cleanup commit; the second sees private HEAD
+# projection == public HEAD tree and exits 0 with `no drift to
+# reconcile.` — no new commit.
+SCENARIOS.append((
+    "drift-reconcile-idempotent",
+    'pushd "$work/public" >/dev/null\n'
+    'mkdir -p legacy\n'
+    'echo "stale content" > legacy/stale.md\n'
+    'git add legacy/stale.md\n'
+    'git commit --no-verify -q -m "chore: seed stale legacy file"\n'
+    'popd >/dev/null\n',
+    0, "ASSERT_OK", "",
+    None,
+    # run.sh: configure faux origin → reconcile twice → assert second
+    # run produced no new commit and stdout contains the no-op string.
+    'pushd ../public >/dev/null\n'
+    'git remote remove origin 2>/dev/null || true\n'
+    'git remote add origin https://github.com/omrikais/cctally.git\n'
+    'popd >/dev/null\n'
+    'python3 bin/cctally-mirror-public --public-clone ../public --reconcile --yes\n'
+    'rc=$?\n'
+    'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: reconcile1 exit=$rc"; exit "$rc"; fi\n'
+    'HEAD_AFTER_RUN1=$(git -C ../public rev-parse HEAD)\n'
+    'python3 bin/cctally-mirror-public --public-clone ../public --reconcile --yes \\\n'
+    '  > /tmp/cctally-reconcile-idempotent-run2.txt 2>&1\n'
+    'rc=$?\n'
+    'cat /tmp/cctally-reconcile-idempotent-run2.txt\n'
+    'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: reconcile2 exit=$rc"; exit "$rc"; fi\n'
+    'HEAD_AFTER_RUN2=$(git -C ../public rev-parse HEAD)\n'
+    'if [ "$HEAD_AFTER_RUN1" != "$HEAD_AFTER_RUN2" ]; then\n'
+    '  echo "ASSERT_FAIL: idempotent reconcile produced a second commit"\n'
+    '  exit 2\n'
+    'fi\n'
+    'grep -q "no drift to reconcile" /tmp/cctally-reconcile-idempotent-run2.txt || { echo "ASSERT_FAIL: expected no-drift message on second run"; exit 2; }\n'
+    'echo "ASSERT_OK"\n',
+))
+
+
+# drift-reconcile-refuses-dirty: leave an uncommitted file in the
+# public clone; --reconcile must refuse with the dirty-worktree guard
+# message and exit 2 without modifying public HEAD.
+SCENARIOS.append((
+    "drift-reconcile-refuses-dirty",
+    # No private-side scenario commits. Stage a dirty file on the
+    # PUBLIC clone (the dirty-worktree guard runs `git status
+    # --porcelain` on the public clone, not the private).
+    'pushd "$work/public" >/dev/null\n'
+    'echo "uncommitted draft" > UNCOMMITTED.md\n'
+    'popd >/dev/null\n',
+    2, "ASSERT_OK_REFUSE", "refuses dirty public clone",
+    None,
+    'pushd ../public >/dev/null\n'
+    'git remote remove origin 2>/dev/null || true\n'
+    'git remote add origin https://github.com/omrikais/cctally.git\n'
+    'popd >/dev/null\n'
+    'PUB_HEAD_BEFORE=$(git -C ../public rev-parse HEAD)\n'
+    'python3 bin/cctally-mirror-public --public-clone ../public --reconcile --yes\n'
+    'rc=$?\n'
+    'PUB_HEAD_AFTER=$(git -C ../public rev-parse HEAD)\n'
+    'if [ "$PUB_HEAD_BEFORE" != "$PUB_HEAD_AFTER" ]; then\n'
+    '  echo "ASSERT_FAIL: refused reconcile mutated public HEAD"\n'
+    '  exit 2\n'
+    'fi\n'
+    'if [ "$rc" -eq 2 ]; then echo "ASSERT_OK_REFUSE"; exit 2; fi\n'
+    'echo "ASSERT_FAIL: expected exit 2, got $rc"\n'
+    'exit "$rc"\n',
+))
+
+
+# drift-reconcile-refuses-cursor-behind: advance private HEAD past
+# `mirror-cursor` without running the apply pass; --reconcile must
+# refuse with the cursor-invariant guard message and exit 2.
+SCENARIOS.append((
+    "drift-reconcile-refuses-cursor-behind",
+    # Scaffold's mirror-cursor is at the infra-bootstrap commit. Add a
+    # private-only commit after the scaffold so HEAD advances past
+    # mirror-cursor. The commit is private (no public files touched,
+    # touches an unmatched path) so it neither carries `--- public ---`
+    # nor `Public-Skip:` and the pre-commit hooks (which aren't active
+    # in scratch repos anyway) would allow it.
+    'mkdir -p docs\n'
+    'echo "internal note" > docs/internal-only.md\n'
+    'git add docs/internal-only.md\n'
+    + _commit_msg_heredoc(
+        "chore: private-only commit to advance HEAD past cursor\n",
+        sentinel="CCTALLY_MSG_EOF_BEHIND",
+    ),
+    2, "ASSERT_OK_REFUSE", "--reconcile refused — mirror-cursor",
+    None,
+    'pushd ../public >/dev/null\n'
+    'git remote remove origin 2>/dev/null || true\n'
+    'git remote add origin https://github.com/omrikais/cctally.git\n'
+    'popd >/dev/null\n'
+    'PUB_HEAD_BEFORE=$(git -C ../public rev-parse HEAD)\n'
+    'python3 bin/cctally-mirror-public --public-clone ../public --reconcile --yes\n'
+    'rc=$?\n'
+    'PUB_HEAD_AFTER=$(git -C ../public rev-parse HEAD)\n'
+    'if [ "$PUB_HEAD_BEFORE" != "$PUB_HEAD_AFTER" ]; then\n'
+    '  echo "ASSERT_FAIL: refused reconcile mutated public HEAD"\n'
+    '  exit 2\n'
+    'fi\n'
+    'if [ "$rc" -eq 2 ]; then echo "ASSERT_OK_REFUSE"; exit 2; fi\n'
+    'echo "ASSERT_FAIL: expected exit 2, got $rc"\n'
+    'exit "$rc"\n',
+))
+
+
 # Public-clone tree goldens for the drift scenarios. Each value is the
 # expected `git -C public ls-tree -r --name-only HEAD | sort` output
 # after run.sh completes. The harness checks this when present.
 #
-# All four scenarios converge on the same tree shape: docs/notes.md
-# (still public) survives; bin/cctally-foo / bin/cctally-bar are either
-# absent (demote) or present (promote).
+# All four per-commit-drift scenarios converge on the same tree shape:
+# docs/notes.md (still public) survives; bin/cctally-foo /
+# bin/cctally-bar are either absent (demote) or present (promote).
+# Reconcile scenarios add their own goldens (clean = empty tree, the
+# refused ones omit the tree golden since exit 2 means no mutation).
 PUBLIC_TREE_GOLDENS: dict[str, str] = {
     "drift-demote-only": "docs/notes.md\n",
     "drift-promote-only": "bin/cctally-bar\ndocs/notes.md\n",
     "drift-demote-via-public-skip": "docs/notes.md\n",
     "drift-mixed-allowlist-and-file": "docs/notes.md\n",
+    # drift-reconcile-clean: after reconcile, the only thing on public
+    # is the synthetic reconcile commit's tree. The infra commit had no
+    # public-classified paths (everything was private/unmatched in the
+    # scaffold), so the reconcile commit's tree is empty (legacy/stale
+    # .md was the only file on the prior public HEAD and reconcile
+    # deletes it). Empty tree golden = empty string.
+    "drift-reconcile-clean": "",
+    "drift-reconcile-idempotent": "",
 }
 
 
 def build(out_root: Path) -> None:
     out_root.mkdir(parents=True, exist_ok=True)
+    # Typo guard for PUBLIC_TREE_GOLDENS keys — a misspelled scenario
+    # name in the dict would silently disable its tree check, masking
+    # regressions. Fail loudly at build time instead.
+    _scenario_names = {s[0] for s in SCENARIOS}
+    for _golden_name in PUBLIC_TREE_GOLDENS:
+        if _golden_name not in _scenario_names:
+            raise RuntimeError(
+                f"PUBLIC_TREE_GOLDENS has key {_golden_name!r} that does "
+                f"not match any SCENARIOS entry — typo or stale name."
+            )
     for (
         name,
         body,

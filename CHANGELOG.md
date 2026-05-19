@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Mirror tool now propagates file deletions/additions when `.mirror-allowlist` edits change classification, with a release-time fingerprint precheck + `--reconcile` recovery mode. Closes #62.
+
 ## [1.9.0] - 2026-05-19
 
 ### Removed

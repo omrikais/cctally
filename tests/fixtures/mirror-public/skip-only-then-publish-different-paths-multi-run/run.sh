@@ -1,7 +1,7 @@
 #!/bin/bash
 set -uo pipefail
 CURSOR_BEFORE=$(git rev-parse refs/tags/mirror-cursor)
-python3 bin/cctally-mirror-public --public-clone ../public --yes
+python3 bin/cctally-mirror-public --public-clone ../public --yes --skip-fingerprint-check
 rc=$?
 if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: run1 exit=$rc"; exit "$rc"; fi
 CURSOR_AFTER1=$(git rev-parse refs/tags/mirror-cursor)
