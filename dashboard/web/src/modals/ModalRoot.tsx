@@ -8,6 +8,7 @@ import { WeeklyModal } from './WeeklyModal';
 import { MonthlyModal } from './MonthlyModal';
 import { BlockModal } from './BlockModal';
 import { DailyModal } from './DailyModal';
+import { ProjectsModal } from './ProjectsModal';
 import { RecentAlertsModal } from '../components/RecentAlertsModal';
 
 export function ModalRoot() {
@@ -31,6 +32,8 @@ export function ModalRoot() {
       return <BlockModal />;
     case 'daily':
       return <DailyModal />;
+    case 'projects':
+      return <ProjectsModal />;
     case 'alerts':
       return <RecentAlertsModal />;
   }

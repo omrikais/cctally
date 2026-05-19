@@ -3764,3 +3764,130 @@ mark.current {
   outline: 2px solid var(--accent-magenta);
   outline-offset: 2px;
 }
+
+/* ---- ProjectsModal (Task 5) ----------------------------------------
+ * Window pills + Y-axis radios, stacked-area trend chart, sortable
+ * project table, and per-project drill panel. Mobile media query at
+ * the bottom drops the First-seen / Last-seen columns and collapses
+ * the drill grid to one column.
+ *
+ * Per project memory "id-selector specificity floor": every mobile
+ * override re-prefixes with `#root` so the desktop rules (some of
+ * which also start with class selectors) lose specificity.
+ */
+.projects-modal-body { padding: 4px 0; }
+.projects-controls {
+  display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  padding: 4px 0;
+}
+.projects-controls .pill {
+  padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border);
+  font-size: 11.5px; color: var(--text-muted); cursor: pointer;
+  background: transparent;
+}
+.projects-controls .pill.on {
+  background: rgba(217, 70, 239, 0.18);
+  border-color: var(--accent-magenta); color: #f5d0fe;
+}
+.projects-controls .sep { color: var(--text-muted); margin: 0 4px; }
+
+.projects-notice {
+  font-size: 11.5px; color: var(--text-muted); padding: 6px 2px 0;
+}
+
+.projects-trend { margin: 8px 0; }
+.projects-trend svg {
+  width: 100%; height: 150px; display: block;
+  border-bottom: 1px solid var(--border);
+}
+.projects-trend-xaxis {
+  display: flex; justify-content: space-between;
+  font-size: 10.5px; color: var(--text-muted);
+  padding: 4px 2px 0;
+}
+.projects-trend-legend {
+  display: flex; flex-wrap: wrap; gap: 12px;
+  font-size: 11.5px; padding: 8px 2px 4px;
+}
+.projects-trend-legend .sw {
+  display: inline-block; width: 10px; height: 10px;
+  border-radius: 2px; margin-right: 5px; vertical-align: middle;
+}
+
+.projects-table {
+  width: 100%; border-collapse: collapse;
+  font-size: 12.5px; margin-top: 6px;
+}
+.projects-table th, .projects-table td {
+  padding: 6px 8px; text-align: right;
+}
+.projects-table th:first-child, .projects-table td:first-child {
+  text-align: left;
+}
+.projects-table tbody tr { cursor: pointer; }
+.projects-table tbody tr:hover { background: rgba(217, 70, 239, 0.06); }
+.projects-table tbody tr.selected {
+  background: rgba(217, 70, 239, 0.14);
+  outline: 1px solid rgba(217, 70, 239, 0.5);
+}
+
+.projects-drill {
+  margin-top: 14px; padding: 12px 14px; border-radius: 8px;
+  border: 1px dashed var(--border);
+  background: rgba(217, 70, 239, 0.04);
+}
+.projects-drill-head .title {
+  font-size: 13px; font-weight: 700; color: #f5d0fe;
+}
+.projects-drill-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+  margin-top: 8px;
+}
+.projects-drill .section-label {
+  font-size: 11.5px; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.projects-drill .muted { color: var(--text-muted); font-size: 12px; }
+.drill-bar-row {
+  display: grid; grid-template-columns: 110px 1fr 60px; gap: 6px;
+  align-items: center; font-size: 12px; margin: 3px 0;
+}
+.drill-bar {
+  height: 8px; background: rgba(217, 70, 239, 0.1);
+  border-radius: 2px; position: relative;
+}
+.drill-bar::after {
+  content: ""; position: absolute; inset: 0 auto 0 0;
+  width: var(--w, 0%); background: var(--accent-magenta);
+  border-radius: 2px;
+}
+.drill-bar-row .cost { text-align: right; }
+.drill-session-row {
+  display: grid; grid-template-columns: 1fr auto auto; gap: 8px;
+  align-items: center; padding: 4px 0; border: none;
+  background: none; color: inherit; font: inherit;
+  cursor: pointer; width: 100%; text-align: left;
+}
+.drill-session-row:hover { color: var(--accent-magenta); }
+.drill-session-row + .drill-session-row {
+  border-top: 1px solid var(--border);
+}
+.drill-session-row .cost { text-align: right; }
+
+@media (max-width: 640px) {
+  #root .projects-drill-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+  #root .projects-trend svg {
+    height: 110px;
+    width: 100%;
+  }
+  #root .projects-table th:nth-child(3),
+  #root .projects-table td:nth-child(3),
+  #root .projects-table th:nth-child(4),
+  #root .projects-table td:nth-child(4) {
+    display: none;
+  }
+}
