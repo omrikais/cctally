@@ -344,23 +344,25 @@ def _setup_cleanup_stale_symlinks(
     """Unlink stale `cctally-*` symlinks left over from prior versions.
 
     For each entry in :data:`_SETUP_STALE_SYMLINK_NAMES`, removes the
-    matching symlink in ``dst_dir`` **only** when its readlink target
-    basename matches the stale name — a user's hand-rolled symlink with
-    the same name pointing at something else is left alone. Returns a
-    list of :class:`_SetupSymlinkResult` entries for the actions taken
-    (so callers can fold them into install output).
+    matching symlink in ``dst_dir`` **only** when (a) its readlink
+    target basename matches the stale name AND (b) the target is
+    *dangling* — i.e. doesn't resolve to a real file. That second
+    clause is what distinguishes "leftover from a prior install whose
+    checkout has since been deleted/moved" from "intentional manual
+    link a maintainer still uses to keep the retired tool on PATH"
+    (e.g. ``~/.local/bin/cctally-release -> <checkout>/bin/cctally-release``
+    while ``cctally-release`` remains shipped in ``bin/`` but is no
+    longer auto-symlinked by ``cctally setup``). Without the dangling
+    check, basename-only matching would silently delete those
+    intentional links on the next ``cctally setup``.
+
+    Returns a list of :class:`_SetupSymlinkResult` entries for the
+    actions taken (so callers can fold them into install output).
     """
     results: list[_SetupSymlinkResult] = []
     for name in _SETUP_STALE_SYMLINK_NAMES:
         dst = dst_dir / name
-        if not dst.is_symlink():
-            continue
-        try:
-            target = os.readlink(dst)
-        except OSError:
-            continue
-        if pathlib.Path(target).name != name:
-            # User-managed symlink that happens to share the name; leave alone.
+        if not _setup_symlink_is_stale_dangling(dst, name):
             continue
         try:
             dst.unlink()
@@ -372,6 +374,42 @@ def _setup_cleanup_stale_symlinks(
                 _SetupSymlinkResult(name, "failed", f"unlink failed: {exc}")
             )
     return results
+
+
+def _setup_symlink_is_stale_dangling(dst: pathlib.Path, name: str) -> bool:
+    """Detection predicate for retired auto-symlinks at install time.
+
+    Returns True iff ``dst`` is a symlink, its readlink target basename
+    matches ``name``, AND the target does not resolve to an existing
+    filesystem entry. The dangling clause preserves intentional
+    maintainer-managed links to retired-but-still-shipped tooling (see
+    :func:`_setup_cleanup_stale_symlinks` docstring). Shared by the
+    cleanup site (``_setup_cleanup_stale_symlinks``) and the read-only
+    detection site (``_setup_detect_stale_symlinks``) so ``--status``
+    and ``setup`` agree on what they call "stale".
+    """
+    if not dst.is_symlink():
+        return False
+    try:
+        target = os.readlink(dst)
+    except OSError:
+        return False
+    if pathlib.Path(target).name != name:
+        # User-managed symlink that happens to share the name; leave alone.
+        return False
+    # Resolve target relative to the symlink's parent so relative
+    # readlinks (rare for cctally setup-installed links, but possible
+    # for hand-rolled ones) classify correctly. Use lexists()-style
+    # check via Path.exists() — broken links return False, which is
+    # the "dangling, treat as stale" branch we want.
+    target_path = pathlib.Path(target)
+    if not target_path.is_absolute():
+        target_path = dst.parent / target_path
+    try:
+        return not target_path.exists()
+    except OSError:
+        # Permission errors etc. — be conservative and don't remove.
+        return False
 
 
 def _setup_path_includes_local_bin() -> bool:
@@ -868,21 +906,19 @@ def _setup_detect_stale_symlinks(dst_dir: pathlib.Path) -> list[str]:
     """Return names of stale-but-still-present cctally symlinks in ``dst_dir``.
 
     Mirrors :func:`_setup_cleanup_stale_symlinks` detection (without
-    removing): a symlink is "stale" only when both the name appears in
-    :data:`_SETUP_STALE_SYMLINK_NAMES` AND its readlink target's
-    basename matches that name (so user-managed symlinks sharing the
-    name don't get falsely flagged).
+    removing): a symlink is "stale" only when its name appears in
+    :data:`_SETUP_STALE_SYMLINK_NAMES`, its readlink target basename
+    matches that name, AND the target is dangling (no longer resolves
+    to a real file). Routing through
+    :func:`_setup_symlink_is_stale_dangling` keeps ``--status`` and
+    ``setup`` in lockstep so a manually-maintained link to a still-
+    shipped retired tool (``~/.local/bin/cctally-release -> <checkout>/
+    bin/cctally-release``) is neither reported as stale nor removed.
     """
     found: list[str] = []
     for name in _SETUP_STALE_SYMLINK_NAMES:
         dst = dst_dir / name
-        if not dst.is_symlink():
-            continue
-        try:
-            target = os.readlink(dst)
-        except OSError:
-            continue
-        if pathlib.Path(target).name == name:
+        if _setup_symlink_is_stale_dangling(dst, name):
             found.append(name)
     return found
 
@@ -1028,6 +1064,33 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
                     sym_removed += 1
                 except OSError as exc:
                     eprint(f"setup: failed to remove {dst}: {exc}")
+    # Also clean up legacy symlinks that older cctally versions used to
+    # install but the current version no longer manages (see
+    # :data:`_SETUP_STALE_SYMLINK_NAMES`). Without this loop, an
+    # upgrader who ran ``cctally setup`` on a prior version and now runs
+    # ``cctally setup --uninstall`` would keep e.g.
+    # ``~/.local/bin/cctally-release`` on PATH — typically as a
+    # dangling symlink once their old checkout is gone. Predicate
+    # mirrors the active-symlink loop above (``target == expected``)
+    # so a maintainer's hand-rolled link pointing somewhere unrelated
+    # is preserved; only links the prior ``cctally setup`` itself would
+    # have installed are removed.
+    for name in _SETUP_STALE_SYMLINK_NAMES:
+        dst = dst_dir / name
+        if not dst.is_symlink():
+            continue
+        try:
+            target = pathlib.Path(os.readlink(dst))
+        except OSError:
+            continue
+        expected = _setup_resolve_symlink_source(repo_root, name)
+        if target != expected:
+            continue
+        try:
+            dst.unlink()
+            sym_removed += 1
+        except OSError as exc:
+            eprint(f"setup: failed to remove {dst}: {exc}")
     out.append(f"Removed {sym_removed} symlinks from {dst_dir}/")
 
     legacy = _setup_detect_legacy_snippet()
