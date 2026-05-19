@@ -95,7 +95,12 @@ describe('<HelpOverlay />', () => {
     expect(tens).toHaveLength(0);
   });
 
-  it('lists the 0 → Projects modal binding', async () => {
+  it('lists a Projects modal binding (5 → Projects in default order)', async () => {
+    // Projects sits at index 4 of DEFAULT_PANEL_ORDER → keyboard '5'.
+    // The position-10 binding ('0') maps to whatever is last in the
+    // order (alerts in default), NOT specifically projects — this
+    // assertion only confirms the Projects row appears in the overlay
+    // with some shortcut, not that it's bound to '0'.
     render(<HelpOverlay />);
     const user = userEvent.setup();
     await user.keyboard('?');

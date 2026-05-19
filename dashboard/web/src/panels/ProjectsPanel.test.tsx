@@ -107,6 +107,18 @@ describe('<ProjectsPanel />', () => {
     expect(screen.getByText(/Projects data unavailable/)).toBeInTheDocument();
   });
 
+  it('null-envelope branch still renders the ShareIcon (spec §2.6)', () => {
+    // The "ShareIcon still visible" guarantee from spec §2.6 extends to
+    // the unavailable-envelope case so users keep the share affordance
+    // even when the panel has no data to render — share kernel handles
+    // empty envelope shape per spec §7.4.
+    updateSnapshot(baseEnvelope());  // projects: null
+    render(<ProjectsPanel />);
+    const shareBtn = document.querySelector('#projects-panel');
+    expect(shareBtn).not.toBeNull();
+    expect(shareBtn?.getAttribute('data-share-panel')).toBe('projects');
+  });
+
   it('row click dispatches OPEN_MODAL with projectKey set', () => {
     updateSnapshot(envelopeWithProjects(3));
     render(<ProjectsPanel />);

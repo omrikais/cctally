@@ -182,7 +182,7 @@ export function SessionsPanel() {
                     </span>
                   </td>
                   <td className="project">
-                    {r.project_key ? (
+                    {r.project_key && r.project_key !== '(unknown)' ? (
                       <button
                         type="button"
                         className="project-cell-link"
@@ -202,8 +202,11 @@ export function SessionsPanel() {
                       </button>
                     ) : (
                       // Null project_key (session_files row not yet
-                      // ingested) — render plain text. Per spec §4.1
-                      // stopgap.
+                      // ingested) OR literal '(unknown)' bucket — render
+                      // plain text. Per spec §4.1: "When project_key is
+                      // null or (unknown), the cell renders plain text
+                      // (not clickable) with tooltip 'Project still
+                      // resolving'."
                       <span title="Project still resolving">{r.project}</span>
                     )}
                   </td>

@@ -361,6 +361,23 @@ describe('<SessionsPanel /> Sessions → Projects cross-nav', () => {
     expect(cellTexts).toContain('(unknown)');
   });
 
+  it("project cell renders as plain text when project_key is literal '(unknown)'", () => {
+    // Per spec §4.1: "When project_key is null OR (unknown), the cell
+    // renders plain text (not clickable) with tooltip 'Project still
+    // resolving'." This is the LITERAL-string case — distinct from null.
+    // The `(unknown)` bucket IS a valid envelope key (sessions with NULL
+    // project_path collapse there), but the SessionsPanel cross-nav
+    // contract is unconditional: plain text either way.
+    updateSnapshot(snapWithSession('(unknown)', '(unknown)'));
+    dispatch({ type: 'SAVE_PREFS', patch: { sessionsCollapsed: false } });
+    render(<SessionsPanel />);
+    const cellBtn = document.querySelector('button.project-cell-link');
+    expect(cellBtn).toBeNull();
+    const projectCells = document.querySelectorAll('td.project');
+    const cellTexts = Array.from(projectCells).map((c) => c.textContent);
+    expect(cellTexts).toContain('(unknown)');
+  });
+
   it('project-cell click does NOT bubble to the row → no session modal', async () => {
     updateSnapshot(snapWithSession('cctally-dev', 'cctally-dev'));
     dispatch({ type: 'SAVE_PREFS', patch: { sessionsCollapsed: false } });

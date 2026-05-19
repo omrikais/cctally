@@ -699,7 +699,15 @@ export function dispatch(action: Action): void {
       break;
     }
     case 'RESET_PANEL_ORDER': {
-      const prefs = { ...state.prefs, panelOrder: [...DEFAULT_PANEL_ORDER] };
+      // Defensively pin the schema-version cursor to CURRENT here so a
+      // future bug that allowed the cursor to drift backwards (e.g.
+      // corrupt JSON in localStorage parsed as v1) does not re-trigger
+      // migrations on the next reload after a user-initiated reset.
+      const prefs = {
+        ...state.prefs,
+        panelOrder: [...DEFAULT_PANEL_ORDER],
+        panelOrderSchemaVersion: CURRENT_PANEL_ORDER_SCHEMA_VERSION,
+      };
       localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
       state = { ...state, prefs };
       break;

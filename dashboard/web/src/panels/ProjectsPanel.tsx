@@ -23,8 +23,42 @@ const TOP_N = 5;
 export function ProjectsPanel() {
   const env = useSnapshot();
   const cw = env?.projects?.current_week;
+  const rows = cw?.rows ?? [];
+  const isUnavailable = env?.projects == null;
 
-  if (env?.projects == null) {
+  // ShareIcon + PanelGrip render in BOTH the populated and the
+  // unavailable-envelope branches per spec §2.6 ("ShareIcon still
+  // visible"). The header parity also restores the folder icon and
+  // row-count sub-span across both branches; only the panel-body
+  // content varies.
+  const header = (
+    <div className="panel-header" style={{ justifyContent: 'space-between' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+        <svg className="icon" style={{ color: 'var(--accent-magenta)' }}>
+          <use href="/static/icons.svg#folder" />
+        </svg>
+        <h3 style={{ color: 'var(--accent-magenta)' }}>
+          Projects{' '}
+          <span className="sub">
+            {isUnavailable ? '(unavailable)' : `(${rows.length} this week)`}
+          </span>
+        </h3>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <ShareIcon
+          panel="projects"
+          panelLabel="Projects"
+          triggerId="projects-panel"
+          onClick={() =>
+            dispatch(openShareModal('projects', 'projects-panel'))
+          }
+        />
+        <PanelGrip />
+      </div>
+    </div>
+  );
+
+  if (isUnavailable) {
     return (
       <section
         className="panel accent-magenta"
@@ -34,21 +68,22 @@ export function ProjectsPanel() {
         aria-label="Projects panel"
         tabIndex={0}
       >
-        <div className="panel-header">
-          <h3 style={{ color: 'var(--accent-magenta)' }}>Projects</h3>
-          <PanelGrip />
-        </div>
-        <div className="panel-empty">
-          Projects data unavailable — restart the dashboard.
+        {header}
+        <div className="panel-body projects-body">
+          <div className="panel-empty">
+            Projects data unavailable — restart the dashboard.
+          </div>
         </div>
       </section>
     );
   }
 
-  const rows = cw?.rows ?? [];
   const top = rows.slice(0, TOP_N);
   const tail = rows.slice(TOP_N);
   const tailCost = tail.reduce((s, r) => s + r.cost_usd, 0);
+  // tailPctRaw treats null attributed_pct as 0 — fine for "+N more"
+  // rollup semantics where the sum represents the visible share of
+  // attributed_pct (null rows by definition contribute no attribution).
   const tailPctRaw = tail.reduce<number>((s, r) => s + (r.attributed_pct ?? 0), 0);
   // div-by-zero guard: when the top row's cost is 0 the bar widths
   // collapse to 0% (visually empty); never divide by 0 directly.
@@ -81,30 +116,7 @@ export function ProjectsPanel() {
         }
       }}
     >
-      <div
-        className="panel-header"
-        style={{ justifyContent: 'space-between' }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <svg className="icon" style={{ color: 'var(--accent-magenta)' }}>
-            <use href="/static/icons.svg#folder" />
-          </svg>
-          <h3 style={{ color: 'var(--accent-magenta)' }}>
-            Projects <span className="sub">({rows.length} this week)</span>
-          </h3>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <ShareIcon
-            panel="projects"
-            panelLabel="Projects"
-            triggerId="projects-panel"
-            onClick={() =>
-              dispatch(openShareModal('projects', 'projects-panel'))
-            }
-          />
-          <PanelGrip />
-        </div>
-      </div>
+      {header}
       <div className="panel-body projects-body">
         {rows.length === 0 ? (
           <div className="panel-empty">
