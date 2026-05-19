@@ -1338,6 +1338,304 @@ SCENARIOS.append((
 ))
 
 
+# ---------------------------------------------------------------------------
+# Drift scenarios (issue #62).
+#
+# Four scenarios exercising _emit_allowlist_drift's per-commit allowlist-
+# drift detection: an allowlist edit that demotes or promotes a path
+# WITHOUT touching the affected file in the same diff is invisible to
+# the per-commit-diff walk. The helper compares the two allowlists at
+# baseline_sha vs sha, classifies the full tree under each, and emits
+# symmetric `git rm` / `git add` for the deltas, excluding any path
+# already handled by the per-commit-diff walk.
+#
+# Each scenario uses run.sh to chain TWO mirror invocations: the first
+# establishes the public clone's pre-drift state; the second exercises
+# the drift detection. Assertions on the public-clone tree at HEAD
+# (via `git ls-tree -r --name-only HEAD`) ride a separate
+# golden-public-tree.txt mechanism — see PUBLIC_TREE_GOLDENS below.
+#
+# Note: ASSERT_OK is the harness's stdout-substring signature for
+# run.sh-driven scenarios.
+# ---------------------------------------------------------------------------
+
+
+# drift-demote-only: allowlist-only demotion via Public-Skip. After the
+# demotion + a separate publish-kind commit, the public clone HEAD must
+# no longer contain the demoted path. Mirrors the v1.9.0 saga (313 stale
+# files survived for ~30 minutes of hand-recovery) in miniature.
+SCENARIOS.append((
+    "drift-demote-only",
+    # Setup body: create bin/cctally-foo (public) + docs/notes.md (public)
+    # in a single publish commit. The scenario uses run.sh to drive two
+    # mirror invocations, so the setup body's job is to leave the
+    # repo in a "ready for first mirror" state.
+    'mkdir -p bin docs\n'
+    'echo "#!/bin/bash\necho foo" > bin/cctally-foo\n'
+    'chmod +x bin/cctally-foo\n'
+    'echo "notes v1" > docs/notes.md\n'
+    'git add bin/cctally-foo docs/notes.md\n'
+    + _commit_msg_heredoc(
+        "feat: seed public surface\n"
+        "\n"
+        "--- public ---\n"
+        "feat: add cctally-foo wrapper + notes\n",
+        sentinel="CCTALLY_MSG_EOF_SEED",
+    ),
+    0, "ASSERT_OK", "",
+    None,  # no public-HEAD-msg check (the 2nd publish's msg is checked
+           # via PUBLIC_MSG below if needed; we rely on the tree check).
+    # run.sh: mirror once (lands bin/cctally-foo + docs/notes.md). Then
+    # demote bin/cctally-foo via allowlist-only Public-Skip + add a
+    # publish commit that touches docs/notes.md. Mirror again. Assert
+    # public clone no longer contains bin/cctally-foo but still has
+    # docs/notes.md.
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes\n'
+    'rc=$?\n'
+    'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: run1 exit=$rc"; exit "$rc"; fi\n'
+    # Sanity: bin/cctally-foo lands publicly on the first run.
+    'test -f ../public/bin/cctally-foo || { echo "ASSERT_FAIL: bin/cctally-foo not on public after run1"; exit 2; }\n'
+    # Demote via allowlist edit only (Public-Skip).
+    "current=$(cat .mirror-allowlist)\n"
+    "printf '%s\\n!bin/cctally-foo\\n' \"$current\" > .mirror-allowlist\n"
+    'git add .mirror-allowlist\n'
+    "git commit --no-verify -q -F - <<'CCTALLY_MSG_EOF_DEMOTE'\n"
+    "chore: privatize cctally-foo via allowlist\n"
+    "\n"
+    "Public-Skip: true\n"
+    "CCTALLY_MSG_EOF_DEMOTE\n"
+    # Publish-kind commit: nontrivial diff so the mirror has a publish
+    # to attach the drift's emission to.
+    'echo "notes v2" > docs/notes.md\n'
+    'git add docs/notes.md\n'
+    "git commit --no-verify -q -F - <<'CCTALLY_MSG_EOF_PUB2'\n"
+    "fix: bump notes\n"
+    "\n"
+    "--- public ---\n"
+    "docs: refresh notes\n"
+    "CCTALLY_MSG_EOF_PUB2\n"
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes\n'
+    'rc=$?\n'
+    'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: run2 exit=$rc"; exit "$rc"; fi\n'
+    'test ! -e ../public/bin/cctally-foo || { echo "ASSERT_FAIL: bin/cctally-foo still on public after demote"; exit 2; }\n'
+    'test -f ../public/docs/notes.md || { echo "ASSERT_FAIL: docs/notes.md missing"; exit 2; }\n'
+    'echo "ASSERT_OK"\n',
+))
+
+
+# drift-promote-only: allowlist-only promotion. A file pre-exists on the
+# private side under a negating allowlist; a Public-Skip commit removes
+# the negation; a publish-kind commit drives the mirror to apply. After
+# the second mirror, the public clone HEAD must contain the promoted
+# path. Symmetric to drift-demote-only.
+SCENARIOS.append((
+    "drift-promote-only",
+    # Setup body uses TWO commits to keep classification clean:
+    #   Seed A (publish): create docs/notes.md only — the public file
+    #     that drives a real public commit on the first mirror run.
+    #   Seed B (Public-Skip): create bin/cctally-bar AND edit
+    #     .mirror-allowlist to add `!bin/cctally-bar`. Under THIS
+    #     commit's allowlist (which already carries the negation),
+    #     bin/cctally-bar is private and .mirror-allowlist is
+    #     unmatched — no `public` paths, so a single Public-Skip
+    #     trailer suffices.
+    'mkdir -p bin docs\n'
+    'echo "notes v1" > docs/notes.md\n'
+    'git add docs/notes.md\n'
+    + _commit_msg_heredoc(
+        "feat: seed public notes\n"
+        "\n"
+        "--- public ---\n"
+        "docs: seed notes\n",
+        sentinel="CCTALLY_MSG_EOF_SEED_A",
+    )
+    + 'echo "#!/bin/bash\necho bar" > bin/cctally-bar\n'
+      'chmod +x bin/cctally-bar\n'
+      'current=$(cat .mirror-allowlist)\n'
+      "printf '%s\\n!bin/cctally-bar\\n' \"$current\" > .mirror-allowlist\n"
+      'git add bin/cctally-bar .mirror-allowlist\n'
+    + _commit_msg_heredoc(
+        "chore: add bin/cctally-bar (starts private)\n"
+        "\n"
+        "Public-Skip: true\n",
+        sentinel="CCTALLY_MSG_EOF_SEED_B",
+    ),
+    0, "ASSERT_OK", "",
+    None,
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes\n'
+    'rc=$?\n'
+    'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: run1 exit=$rc"; exit "$rc"; fi\n'
+    # Sanity: bin/cctally-bar must NOT be on public yet (still negated).
+    'test ! -e ../public/bin/cctally-bar || { echo "ASSERT_FAIL: bin/cctally-bar leaked to public on run1"; exit 2; }\n'
+    'test -f ../public/docs/notes.md || { echo "ASSERT_FAIL: docs/notes.md not on public after run1"; exit 2; }\n'
+    # Promote via allowlist edit only (Public-Skip): strip the
+    # `!bin/cctally-bar` line.
+    "grep -v '^!bin/cctally-bar$' .mirror-allowlist > .mirror-allowlist.new\n"
+    'mv .mirror-allowlist.new .mirror-allowlist\n'
+    'git add .mirror-allowlist\n'
+    "git commit --no-verify -q -F - <<'CCTALLY_MSG_EOF_PROMOTE'\n"
+    "chore: promote cctally-bar via allowlist\n"
+    "\n"
+    "Public-Skip: true\n"
+    "CCTALLY_MSG_EOF_PROMOTE\n"
+    # Publish-kind commit to drive the mirror.
+    'echo "notes v2" > docs/notes.md\n'
+    'git add docs/notes.md\n'
+    "git commit --no-verify -q -F - <<'CCTALLY_MSG_EOF_PUB2'\n"
+    "fix: bump notes\n"
+    "\n"
+    "--- public ---\n"
+    "docs: refresh notes\n"
+    "CCTALLY_MSG_EOF_PUB2\n"
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes\n'
+    'rc=$?\n'
+    'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: run2 exit=$rc"; exit "$rc"; fi\n'
+    'test -f ../public/bin/cctally-bar || { echo "ASSERT_FAIL: bin/cctally-bar not promoted to public after run2"; exit 2; }\n'
+    # Mode must round-trip as 100755 (executable).
+    'mode=$(git -C ../public ls-tree HEAD -- bin/cctally-bar | awk \'{print $1}\')\n'
+    '[ "$mode" = "100755" ] || { echo "ASSERT_FAIL: bin/cctally-bar mode=$mode (expected 100755)"; exit 2; }\n'
+    'echo "ASSERT_OK"\n',
+))
+
+
+# drift-demote-via-public-skip: a Public-Skip commit demotes the file;
+# a LATER publish-kind commit lands the effect. Critically, the drift
+# baseline is the last-APPLIED publish (not git-parent of the publish-
+# kind commit), so a Public-Skip commit's allowlist edit correctly
+# reaches the drift baseline of the next publish. If baseline were
+# git-parent of the publish, the drift helper would see the post-
+# demotion allowlist on both sides and emit nothing.
+SCENARIOS.append((
+    "drift-demote-via-public-skip",
+    'mkdir -p bin docs\n'
+    'echo "#!/bin/bash\necho foo" > bin/cctally-foo\n'
+    'chmod +x bin/cctally-foo\n'
+    'echo "notes v1" > docs/notes.md\n'
+    'git add bin/cctally-foo docs/notes.md\n'
+    + _commit_msg_heredoc(
+        "feat: seed public surface\n"
+        "\n"
+        "--- public ---\n"
+        "feat: add cctally-foo + notes\n",
+        sentinel="CCTALLY_MSG_EOF_SEED",
+    ),
+    0, "ASSERT_OK", "",
+    None,
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes\n'
+    'rc=$?\n'
+    'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: run1 exit=$rc"; exit "$rc"; fi\n'
+    'test -f ../public/bin/cctally-foo || { echo "ASSERT_FAIL: bin/cctally-foo not on public after run1"; exit 2; }\n'
+    # Public-Skip commit A: demote via allowlist edit only.
+    "current=$(cat .mirror-allowlist)\n"
+    "printf '%s\\n!bin/cctally-foo\\n' \"$current\" > .mirror-allowlist\n"
+    'git add .mirror-allowlist\n'
+    "git commit --no-verify -q -F - <<'CCTALLY_MSG_EOF_SKIP'\n"
+    "chore: demote cctally-foo (deferred to next publish)\n"
+    "\n"
+    "Public-Skip: true\n"
+    "CCTALLY_MSG_EOF_SKIP\n"
+    # Publish commit B: an UNRELATED public-file edit (docs/notes.md).
+    # The publish commit DOES NOT touch the demoted file or the
+    # allowlist. The git-parent of B is A (the Public-Skip commit),
+    # whose allowlist already has the negation — so a git-parent
+    # baseline would see identical allowlists and emit no drift. The
+    # mirror tool uses the last-applied publish as baseline (the seed
+    # commit), which DOES see the demotion.
+    'echo "notes v2" > docs/notes.md\n'
+    'git add docs/notes.md\n'
+    "git commit --no-verify -q -F - <<'CCTALLY_MSG_EOF_PUB2'\n"
+    "fix: bump notes\n"
+    "\n"
+    "--- public ---\n"
+    "docs: refresh notes\n"
+    "CCTALLY_MSG_EOF_PUB2\n"
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes\n'
+    'rc=$?\n'
+    'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: run2 exit=$rc"; exit "$rc"; fi\n'
+    'test ! -e ../public/bin/cctally-foo || { echo "ASSERT_FAIL: bin/cctally-foo survived Public-Skip demote (baseline = git-parent bug)"; exit 2; }\n'
+    'test -f ../public/docs/notes.md || { echo "ASSERT_FAIL: docs/notes.md missing"; exit 2; }\n'
+    'echo "ASSERT_OK"\n',
+))
+
+
+# drift-mixed-allowlist-and-file: a SINGLE commit both demotes a file
+# via allowlist edit AND modifies the file's body. The per-commit-diff
+# walk's absent-branch already removes the file (the diff classification
+# under the new allowlist puts the file under 'private', so the diff
+# walk produces no add — but, critically, the file is ALSO in
+# `demoted` via the drift helper. Without the `diff_paths` exclusion,
+# the drift helper would double-emit: try to `git rm` an already-
+# removed path, raising. The diff walk's emission must win.
+#
+# This scenario specifically guards against a double-emit regression.
+SCENARIOS.append((
+    "drift-mixed-allowlist-and-file",
+    'mkdir -p bin docs\n'
+    'echo "#!/bin/bash\necho foo" > bin/cctally-foo\n'
+    'chmod +x bin/cctally-foo\n'
+    'echo "notes v1" > docs/notes.md\n'
+    'git add bin/cctally-foo docs/notes.md\n'
+    + _commit_msg_heredoc(
+        "feat: seed public surface\n"
+        "\n"
+        "--- public ---\n"
+        "feat: add cctally-foo + notes\n",
+        sentinel="CCTALLY_MSG_EOF_SEED",
+    ),
+    0, "ASSERT_OK", "",
+    None,
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes\n'
+    'rc=$?\n'
+    'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: run1 exit=$rc"; exit "$rc"; fi\n'
+    'test -f ../public/bin/cctally-foo || { echo "ASSERT_FAIL: bin/cctally-foo not on public after run1"; exit 2; }\n'
+    # Single commit: edit allowlist (demote bin/cctally-foo) AND modify
+    # the file body. Both changes ride one private commit. Since the
+    # commit, under its OWN allowlist, classifies bin/cctally-foo as
+    # private, the commit overall is private (no `public` paths) →
+    # no `--- public ---` trailer required.
+    "current=$(cat .mirror-allowlist)\n"
+    "printf '%s\\n!bin/cctally-foo\\n' \"$current\" > .mirror-allowlist\n"
+    'echo "#!/bin/bash\necho updated-foo" > bin/cctally-foo\n'
+    'chmod +x bin/cctally-foo\n'
+    'git add .mirror-allowlist bin/cctally-foo\n'
+    "git commit --no-verify -q -F - <<'CCTALLY_MSG_EOF_MIXED'\n"
+    "chore: privatize + tweak cctally-foo\n"
+    "\n"
+    "Public-Skip: true\n"
+    "CCTALLY_MSG_EOF_MIXED\n"
+    # A subsequent publish to drive the mirror.
+    'echo "notes v2" > docs/notes.md\n'
+    'git add docs/notes.md\n'
+    "git commit --no-verify -q -F - <<'CCTALLY_MSG_EOF_PUB2'\n"
+    "fix: bump notes\n"
+    "\n"
+    "--- public ---\n"
+    "docs: refresh notes\n"
+    "CCTALLY_MSG_EOF_PUB2\n"
+    'python3 bin/cctally-mirror-public --public-clone ../public --yes\n'
+    'rc=$?\n'
+    'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: run2 exit=$rc (double-emit may have raised)"; exit "$rc"; fi\n'
+    'test ! -e ../public/bin/cctally-foo || { echo "ASSERT_FAIL: bin/cctally-foo still on public"; exit 2; }\n'
+    'test -f ../public/docs/notes.md || { echo "ASSERT_FAIL: docs/notes.md missing"; exit 2; }\n'
+    'echo "ASSERT_OK"\n',
+))
+
+
+# Public-clone tree goldens for the drift scenarios. Each value is the
+# expected `git -C public ls-tree -r --name-only HEAD | sort` output
+# after run.sh completes. The harness checks this when present.
+#
+# All four scenarios converge on the same tree shape: docs/notes.md
+# (still public) survives; bin/cctally-foo / bin/cctally-bar are either
+# absent (demote) or present (promote).
+PUBLIC_TREE_GOLDENS: dict[str, str] = {
+    "drift-demote-only": "docs/notes.md\n",
+    "drift-promote-only": "bin/cctally-bar\ndocs/notes.md\n",
+    "drift-demote-via-public-skip": "docs/notes.md\n",
+    "drift-mixed-allowlist-and-file": "docs/notes.md\n",
+}
+
+
 def build(out_root: Path) -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     for (
@@ -1379,6 +1677,18 @@ def build(out_root: Path) -> None:
             run_path.write_text("#!/bin/bash\nset -uo pipefail\n" + run,
                                 encoding="utf-8")
             run_path.chmod(0o755)
+        # Optional public-tree golden: sorted `git -C public ls-tree -r
+        # --name-only HEAD`. When present, the harness verifies the
+        # public clone's tree matches byte-for-byte after the mirror
+        # run. Used by the drift-* scenarios where the assertion is
+        # "did files disappear / appear as expected." Existing scenarios
+        # without an entry in PUBLIC_TREE_GOLDENS leave their fixture
+        # dir without the file → the harness skips the check.
+        tree_path = d / "golden-public-tree.txt"
+        if name in PUBLIC_TREE_GOLDENS:
+            tree_path.write_text(PUBLIC_TREE_GOLDENS[name], encoding="utf-8")
+        elif tree_path.exists():
+            tree_path.unlink()
 
 
 def main() -> int:

@@ -1,0 +1,2 @@
+bin/cctally-bar
+docs/notes.md
