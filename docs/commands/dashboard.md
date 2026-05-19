@@ -93,6 +93,8 @@ the UI with either input.
 | Key | Action |
 |---|---|
 | `1`/`2`/`3`/`4` | Open Current Week / Forecast / Trend / Sessions modal |
+| `5` | Open Projects modal |
+| `0` | Open the panel at position 10 (the 10th-slot panel in your current order — `alerts` in default order; vim-style "10 wraps to 0") |
 | `Tab` + `Enter` | Focus a panel and open its modal |
 | `Esc` | Close modal / settings / collapse filter-search |
 | `r` | Force immediate sync |
@@ -106,6 +108,35 @@ the UI with either input.
 Every keybind has a clickable equivalent: footer pills are real buttons, the
 sync chip posts to `/api/sync`, panel bodies and session rows open their
 modals on click.
+
+## Projects panel + modal
+
+The Projects panel renders the current subscription week's top-5 projects
+sorted by cost descending, with a horizontal-bar visualization, an
+attributed `Used %` per project, and a magenta accent. A "+N more" tail
+row collapses everything below the top 5. Cross-nav from the Sessions
+panel: clicking a project name in a Sessions row opens the Projects
+modal pre-expanded on that project's drill.
+
+Clicking the panel header or any row opens the **Projects modal**. The
+modal shows a `1w` / `4w` / `8w` / `12w` window-pill selector, a
+stacked-area trend chart over the selected window, a 7-column per-project
+table (cost desc by default), and an in-place per-project drill into
+model breakdown + recent sessions. Clicking a session in the drill
+opens the Session modal (replaces, not stacks). The modal's share
+affordance routes through the same `_build_project_snapshot` kernel as
+the panel and carries the active `windowWeeks` into the share flow.
+
+The panel sits at index 4 of `DEFAULT_PANEL_ORDER` and is reachable via
+keyboard shortcut `5` (or the position-N digit if you have reordered
+panels). New users land it there automatically; upgraders are migrated
+in-place by `reconcilePanelOrder` so any custom order is preserved.
+
+Lazy detail endpoint: `GET /api/project/<key>?weeks=N` returns the
+window-scoped trend points + drill payload (top models, recent
+sessions). Mirrors the SessionModal stale-while-revalidate pattern —
+the modal renders from the envelope's top-N summary first, then
+hydrates the full drill on demand.
 
 ## Sync chip / 'r' shortcut
 
