@@ -17,8 +17,8 @@ describe('Prefs.panelOrder', () => {
     expect(getState().prefs.onboardingToastSeen).toBe(false);
   });
 
-  it('reads a previously-persisted custom order', () => {
-    const custom = ['daily', 'blocks', 'monthly', 'weekly', 'sessions', 'trend', 'forecast', 'current-week', 'alerts'];
+  it('reads a previously-persisted custom order (post-migration schema)', () => {
+    const custom: PanelId[] = ['daily', 'blocks', 'monthly', 'weekly', 'projects', 'sessions', 'trend', 'forecast', 'current-week', 'alerts'];
     localStorage.setItem('ccusage.dashboard.prefs', JSON.stringify({
       sortDefault: 'started desc',
       sessionsPerPage: 100,
@@ -27,10 +27,34 @@ describe('Prefs.panelOrder', () => {
       dailyCollapsed: true,
       panelOrder: custom,
       onboardingToastSeen: true,
+      // Bump cursor past the migration so the saved order round-trips verbatim.
+      panelOrderSchemaVersion: 2,
     }));
     const initial = loadInitialForTests();
     expect(initial.prefs.panelOrder).toEqual(custom);
     expect(initial.prefs.onboardingToastSeen).toBe(true);
+  });
+
+  it('upgrades a v1 saved order by splicing projects at index 4', () => {
+    // v1 = no panelOrderSchemaVersion key, no 'projects' in panelOrder.
+    const v1Custom: PanelId[] = [
+      'daily', 'blocks', 'monthly', 'weekly',
+      'sessions', 'trend', 'forecast', 'current-week', 'alerts',
+    ];
+    localStorage.setItem('ccusage.dashboard.prefs', JSON.stringify({
+      panelOrder: v1Custom,
+      onboardingToastSeen: true,
+    }));
+    const initial = loadInitialForTests();
+    expect(initial.prefs.panelOrder).toEqual([
+      'daily', 'blocks', 'monthly', 'weekly',
+      'projects',  // spliced at canonical index 4
+      'sessions', 'trend', 'forecast', 'current-week', 'alerts',
+    ]);
+    expect(initial.prefs.panelOrderSchemaVersion).toBe(2);
+    // Migration is persisted immediately so a refresh doesn't re-fire it.
+    const raw = localStorage.getItem('ccusage.dashboard.prefs');
+    expect(JSON.parse(raw!).panelOrderSchemaVersion).toBe(2);
   });
 
   it('reconciles a stale saved order (drops unknown, appends missing)', () => {

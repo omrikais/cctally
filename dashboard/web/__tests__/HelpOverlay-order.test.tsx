@@ -25,11 +25,11 @@ async function open(user: ReturnType<typeof userEvent.setup>) {
 }
 
 describe('<HelpOverlay /> reflects panelOrder', () => {
-  it('renders all 9 number keys with their default labels', async () => {
+  it('renders all 10 number keys with their default labels', async () => {
     const user = userEvent.setup();
     render(<HelpOverlay />);
     await open(user);
-    for (const label of ['Current Week', 'Forecast', 'Trend', 'Sessions', 'Weekly', 'Monthly', 'Blocks', 'Daily', 'Recent alerts']) {
+    for (const label of ['Current Week', 'Forecast', 'Trend', 'Sessions', 'Projects', 'Weekly', 'Monthly', 'Blocks', 'Daily', 'Recent alerts']) {
       expect(screen.getByText(`Open ${label} modal`)).toBeTruthy();
     }
   });

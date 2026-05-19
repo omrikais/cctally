@@ -33,10 +33,10 @@ describe('<HelpOverlay />', () => {
     expect(card).not.toBeNull();
     // h2 "Keybindings"
     expect(card?.querySelector('h2')?.textContent).toBe('Keybindings');
-    // 16 table rows: 9 panel keys (1-9, alerts added in T8) + r, s, drag tip,
-    // Shift+arrows, ↑/↓, ?, Esc
+    // 17 table rows: 10 panel keys (1-9 + 0 for projects, spec §2.1) +
+    // r, s, drag tip, Shift+arrows, ↑/↓, ?, Esc.
     const rows = card?.querySelectorAll('table tr');
-    expect(rows?.length).toBe(16);
+    expect(rows?.length).toBe(17);
     // Meta line with server URL
     const meta = card?.querySelector('p.meta');
     expect(meta?.textContent).toMatch(/cctally/);
@@ -76,6 +76,30 @@ describe('<HelpOverlay />', () => {
     const user = userEvent.setup();
     await user.keyboard('?');
     expect(screen.getByText(/select period/i)).toBeInTheDocument();
+  });
+
+  it('renders 0 as the 10th panel shortcut (not "10")', async () => {
+    render(<HelpOverlay />);
+    const user = userEvent.setup();
+    await user.keyboard('?');
+    // First 10 panel-row <kbd>s should read '1'..'9' then '0' (per
+    // main.tsx's '0' → openPanelByPosition(10) binding).
+    const kbds = Array.from(document.querySelectorAll('table kbd'))
+      .map((el) => el.textContent)
+      .filter((t): t is string => !!t)
+      .slice(0, 10);
+    expect(kbds).toEqual(['1','2','3','4','5','6','7','8','9','0']);
+    // No "10" anywhere — would point at an unbound key.
+    const tens = Array.from(document.querySelectorAll('table kbd'))
+      .filter((el) => el.textContent === '10');
+    expect(tens).toHaveLength(0);
+  });
+
+  it('lists the 0 → Projects modal binding', async () => {
+    render(<HelpOverlay />);
+    const user = userEvent.setup();
+    await user.keyboard('?');
+    expect(screen.getByText(/open projects modal/i)).toBeInTheDocument();
   });
 
   it('closes on Escape when open', async () => {

@@ -11,7 +11,8 @@ export type ShareFormat = 'md' | 'html' | 'svg';
 export type ShareTheme = 'light' | 'dark';
 export type SharePanelId =
   | 'current-week' | 'trend' | 'weekly' | 'daily'
-  | 'monthly' | 'blocks' | 'forecast' | 'sessions';
+  | 'monthly' | 'blocks' | 'forecast' | 'sessions'
+  | 'projects';
 
 export interface SharePeriod {
   kind: 'current' | 'previous' | 'custom';

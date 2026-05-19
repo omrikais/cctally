@@ -30,8 +30,18 @@ describe('openPanelByPosition', () => {
     expect(getState().openModal).toBeNull();
   });
 
-  it('opens the panel currently at position 9 (alerts in default order)', () => {
+  it('opens the panel currently at position 9 (daily in the default 10-panel order)', () => {
     openPanelByPosition(9);
+    expect(getState().openModal).toBe('daily');
+  });
+
+  it('opens the panel currently at position 10 — "0" key (alerts in default order)', () => {
+    openPanelByPosition(10);
     expect(getState().openModal).toBe('alerts');
+  });
+
+  it('opens the projects panel at position 5 in the default order', () => {
+    openPanelByPosition(5);
+    expect(getState().openModal).toBe('projects');
   });
 });

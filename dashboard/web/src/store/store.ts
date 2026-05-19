@@ -6,7 +6,11 @@ import {
   sessionComparator,
 } from './selectors';
 import { DEFAULT_PANEL_ORDER, type PanelId } from '../lib/panelIds';
-import { reconcilePanelOrder } from '../lib/reconcilePanelOrder';
+import {
+  applyPanelOrderMigration,
+  CURRENT_PANEL_ORDER_SCHEMA_VERSION,
+  reconcilePanelOrder,
+} from '../lib/reconcilePanelOrder';
 import { applyTableSort, coerceSortOverride, type SortOverride } from '../lib/tableSort';
 import { SESSIONS_COLUMNS } from '../lib/sessionsColumns';
 import {
@@ -35,7 +39,7 @@ const PREFS_KEY = 'ccusage.dashboard.prefs';
 const FILTER_KEY = 'ccusage.dashboard.filter';
 const LEGACY_SORT_KEY = 'ccusage.dashboard.sort'; // retired — migrated on first load
 
-export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'weekly' | 'monthly' | 'block' | 'daily' | 'alerts' | 'update';
+export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'weekly' | 'monthly' | 'block' | 'daily' | 'alerts' | 'update' | 'projects';
 export type InputMode = null | 'filter' | 'search';
 
 // ---------- Update subcommand (spec §6) ----------
@@ -189,6 +193,22 @@ export interface Prefs {
   mobileOnboardingToastSeen: boolean;
   trendSortOverride: SortOverride | null;
   sessionsSortOverride: SortOverride | null;
+  // Projects modal prefs (spec §5.2 + §7.3). `projectsWindowWeeks`
+  // controls both the trend chart window AND the share artifact window
+  // when the modal share affordance fires (ShareModalState.params slot).
+  // `projectsTrendYMode` swaps between absolute USD ($/wk) and relative
+  // share-of-week (%). `projectsSortOverride` mirrors the trend/sessions
+  // pattern for the modal's project table.
+  // `panelOrderSchemaVersion` is the localStorage migration cursor: 1 →
+  // pre-projects schema (9 default panels), 2 → projects spliced at
+  // canonical index 4. Bumped by `applyPanelOrderMigration` on first
+  // load post-upgrade; tracked in prefs (not a separate localStorage
+  // key) so it persists through `RESET_PREFS` re-seeds with the rest of
+  // the prefs blob.
+  projectsWindowWeeks: 1 | 4 | 8 | 12;
+  projectsTrendYMode: 'share' | 'absolute';
+  projectsSortOverride: SortOverride | null;
+  panelOrderSchemaVersion: number;
 }
 
 // Toast variant pattern (T8). The `status` shape is the legacy
@@ -214,6 +234,10 @@ export interface UIState {
   openSessionId: string | null;
   openBlockStartAt: string | null;
   openDailyDate: string | null;
+  // Spec §4.1 — when OPEN_MODAL { kind: 'projects' } carries a
+  // projectKey, the modal opens with that project's detail pre-expanded.
+  // Null on un-targeted opens (panel chrome click / '0' keybinding).
+  openProjectKey: string | null;
   sessionsSort: SessionSortKey;
   filterText: string;
   searchText: string;
@@ -325,6 +349,12 @@ function defaultPrefs(): Prefs {
     mobileOnboardingToastSeen: false,
     trendSortOverride: null,
     sessionsSortOverride: null,
+    projectsWindowWeeks: 4,
+    projectsTrendYMode: 'absolute',
+    projectsSortOverride: null,
+    // Pre-migration baseline — bumps to 2 in `loadInitial` once
+    // `applyPanelOrderMigration` runs on first load post-upgrade.
+    panelOrderSchemaVersion: 1,
   };
 }
 
@@ -349,20 +379,47 @@ function loadInitial(): UIState {
     try {
       const parsed = JSON.parse(rawPrefs) as Partial<Prefs>;
       prefs = { ...defaultPrefs(), ...parsed };
-      prefs.panelOrder = reconcilePanelOrder(parsed.panelOrder ?? null, DEFAULT_PANEL_ORDER);
+      // Panel-order migration runs BEFORE reconcile — see
+      // applyPanelOrderMigration's doc for the ordering rationale.
+      // A first-time v1 user has parsed.panelOrderSchemaVersion === undefined,
+      // which coerces to NaN through Number() — clamp to 1.
+      const rawVersion = typeof parsed.panelOrderSchemaVersion === 'number'
+        ? parsed.panelOrderSchemaVersion
+        : 1;
+      const migrated = applyPanelOrderMigration(parsed.panelOrder ?? null, rawVersion);
+      prefs.panelOrderSchemaVersion = migrated.newVersion;
+      prefs.panelOrder = reconcilePanelOrder(migrated.panels, DEFAULT_PANEL_ORDER);
       prefs.trendSortOverride = coerceSortOverride(prefs.trendSortOverride ?? null);
       prefs.sessionsSortOverride = coerceSortOverride(prefs.sessionsSortOverride ?? null);
+      prefs.projectsSortOverride = coerceSortOverride(prefs.projectsSortOverride ?? null);
+      // Persist the cursor advancement immediately so a tab refresh
+      // doesn't re-run the migration on every load.
+      if (rawVersion !== migrated.newVersion) {
+        localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+      }
     } catch {
       prefs = defaultPrefs();
+      // Brand-new user (or corrupt prefs) — schema is at CURRENT.
+      prefs.panelOrderSchemaVersion = CURRENT_PANEL_ORDER_SCHEMA_VERSION;
     }
     // Retire the legacy key unconditionally when prefs exists — prefs wins.
     if (legacySort != null) localStorage.removeItem(LEGACY_SORT_KEY);
   } else if (legacySort) {
     // One-time migration: no prefs yet, legacy sort exists → write prefs
-    // with that sortDefault and delete the legacy key.
-    prefs = { ...defaultPrefs(), sortDefault: legacySort as SessionSortKey };
+    // with that sortDefault and delete the legacy key. No panel-order
+    // migration to run (no saved order yet); schema cursor lands at
+    // CURRENT directly so a future v3+ migration sees a sane starting
+    // point.
+    prefs = {
+      ...defaultPrefs(),
+      sortDefault: legacySort as SessionSortKey,
+      panelOrderSchemaVersion: CURRENT_PANEL_ORDER_SCHEMA_VERSION,
+    };
     localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
     localStorage.removeItem(LEGACY_SORT_KEY);
+  } else {
+    // Brand-new user, no prefs, no legacy sort — schema is at CURRENT.
+    prefs.panelOrderSchemaVersion = CURRENT_PANEL_ORDER_SCHEMA_VERSION;
   }
   return {
     snapshot: null,
@@ -370,6 +427,7 @@ function loadInitial(): UIState {
     openSessionId: null,
     openBlockStartAt: null,
     openDailyDate: null,
+    openProjectKey: null,
     sessionsSort: prefs.sortDefault,
     filterText: localStorage.getItem(FILTER_KEY) ?? '',
     searchText: '',
@@ -464,7 +522,7 @@ export function resetSnapshotOrdering(): void { lastGeneratedAt = ''; }
 
 // ----- Actions -----
 export type Action =
-  | { type: 'OPEN_MODAL'; kind: ModalKind; sessionId?: string; blockStartAt?: string; dailyDate?: string }
+  | { type: 'OPEN_MODAL'; kind: ModalKind; sessionId?: string; blockStartAt?: string; dailyDate?: string; projectKey?: string }
   | { type: 'CLOSE_MODAL' }
   | { type: 'SET_FILTER'; text: string }
   | { type: 'SET_SEARCH'; text: string }
@@ -566,6 +624,7 @@ export function dispatch(action: Action): void {
         openSessionId: action.sessionId ?? null,
         openBlockStartAt: action.blockStartAt ?? null,
         openDailyDate: action.dailyDate ?? null,
+        openProjectKey: action.projectKey ?? null,
       };
       break;
     case 'CLOSE_MODAL':
@@ -575,6 +634,7 @@ export function dispatch(action: Action): void {
         openSessionId: null,
         openBlockStartAt: null,
         openDailyDate: null,
+        openProjectKey: null,
       };
       break;
     case 'SET_FILTER': {

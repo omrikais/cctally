@@ -2,9 +2,12 @@ import { describe, it, expect } from 'vitest';
 import { PANEL_REGISTRY, DEFAULT_PANEL_ORDER } from '../src/lib/panelRegistry';
 
 describe('panelRegistry', () => {
-  it('DEFAULT_PANEL_ORDER has all 9 ids in canonical order', () => {
+  it('DEFAULT_PANEL_ORDER has all 10 ids in canonical order', () => {
+    // 'projects' lands at index 4 (spec §2.1) — guarded by
+    // applyPanelOrderMigration so v1 users get the same splice.
     expect(DEFAULT_PANEL_ORDER).toEqual([
       'current-week', 'forecast', 'trend', 'sessions',
+      'projects',
       'weekly', 'monthly', 'blocks', 'daily', 'alerts',
     ]);
   });

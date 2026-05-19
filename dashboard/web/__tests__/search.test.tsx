@@ -25,6 +25,7 @@ function mkRow(partial: Partial<SessionRow>): SessionRow {
     duration_min: 10,
     model: 'sonnet',
     project: 'repo',
+    project_key: null,
     cost_usd: 1.0,
     ...partial,
   };
@@ -54,6 +55,7 @@ function mkEnvelope(rows: SessionRow[]): Envelope {
     blocks:  { rows: [] },
     daily:   { rows: [], quantile_thresholds: [], peak: null },
     sessions: { total: rows.length, sort_key: 'started_desc', rows },
+    projects: null,
     display: { tz: 'local', resolved_tz: 'Etc/UTC', offset_label: 'UTC', offset_seconds: 0 },
     alerts: [],
     alerts_settings: { enabled: true, weekly_thresholds: [], five_hour_thresholds: [] },

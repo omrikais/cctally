@@ -68,6 +68,10 @@ registerKeymap([
   { key: '7', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(7) },
   { key: '8', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(8) },
   { key: '9', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(9) },
+  // 10th panel — `0` follows the keyboard-shortcut "10 wraps to 0"
+  // convention (mirrors how vim / many TUIs map digit keys). The same
+  // `_globalKeyGuard` blocks it while update/doctor modals are open.
+  { key: '0', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(10) },
   { key: 'r', scope: 'global', when: _globalKeyGuard, action: () => triggerSync() },
   { key: 'q', scope: 'global', when: _globalKeyGuard, action: tryQuit },
   { key: 'n', scope: 'global', when: _globalKeyGuard, action: () => stepMatch(1) },

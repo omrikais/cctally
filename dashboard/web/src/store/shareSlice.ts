@@ -23,6 +23,12 @@ export interface ShareModalState {
   // close (a11y: matches the existing panel-modal focus-restore pattern).
   // String — not an HTMLElement ref — so the slot stays serializable.
   triggerId: string | null;
+  // Opaque per-panel params slot. Spec §7.3: the Projects modal share
+  // affordance supplies `windowWeeks` so the rendered share artifact
+  // reflects the modal's currently-active trend window (1 / 4 / 8 / 12).
+  // Other panels omit; existing call sites unaffected. Kept narrow on
+  // purpose — when a new panel needs more params, widen the union here.
+  params?: { windowWeeks?: 1 | 4 | 8 | 12 };
 }
 
 export interface ComposerModalState {
@@ -42,15 +48,23 @@ export const initialShareState: ShareSlice = {
 };
 
 export type ShareAction =
-  | { type: 'OPEN_SHARE'; panel: SharePanelId; triggerId: string | null }
+  | { type: 'OPEN_SHARE'; panel: SharePanelId; triggerId: string | null; params?: { windowWeeks?: 1 | 4 | 8 | 12 } }
   | { type: 'CLOSE_SHARE' }
   | { type: 'OPEN_COMPOSER' }
   | { type: 'CLOSE_COMPOSER' };
 
 export function shareReducer(state: ShareSlice, action: ShareAction): ShareSlice {
   switch (action.type) {
-    case 'OPEN_SHARE':
-      return { ...state, shareModal: { panel: action.panel, triggerId: action.triggerId } };
+    case 'OPEN_SHARE': {
+      // Only carry `params` onto the modal state when the action
+      // actually supplies one. Spread-assigning `params: undefined`
+      // would leave the key in the object and break narrowed
+      // discriminated-union checks downstream.
+      const modal: ShareModalState = action.params !== undefined
+        ? { panel: action.panel, triggerId: action.triggerId, params: action.params }
+        : { panel: action.panel, triggerId: action.triggerId };
+      return { ...state, shareModal: modal };
+    }
     case 'CLOSE_SHARE':
       return { ...state, shareModal: null };
     case 'OPEN_COMPOSER':
@@ -62,8 +76,14 @@ export function shareReducer(state: ShareSlice, action: ShareAction): ShareSlice
   }
 }
 
-export function openShareModal(panel: SharePanelId, triggerId: string | null): ShareAction {
-  return { type: 'OPEN_SHARE', panel, triggerId };
+export function openShareModal(
+  panel: SharePanelId,
+  triggerId: string | null,
+  params?: { windowWeeks?: 1 | 4 | 8 | 12 },
+): ShareAction {
+  return params !== undefined
+    ? { type: 'OPEN_SHARE', panel, triggerId, params }
+    : { type: 'OPEN_SHARE', panel, triggerId };
 }
 export function closeShareModal(): ShareAction { return { type: 'CLOSE_SHARE' }; }
 export function openComposer(): ShareAction { return { type: 'OPEN_COMPOSER' }; }

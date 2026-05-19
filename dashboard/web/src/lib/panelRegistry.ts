@@ -3,6 +3,7 @@ import { CurrentWeekPanel } from '../panels/CurrentWeekPanel';
 import { ForecastPanel } from '../panels/ForecastPanel';
 import { TrendPanel } from '../panels/TrendPanel';
 import { SessionsPanel } from '../panels/SessionsPanel';
+import { ProjectsPanel } from '../panels/ProjectsPanel';
 import { WeeklyPanel } from '../panels/WeeklyPanel';
 import { MonthlyPanel } from '../panels/MonthlyPanel';
 import { BlocksPanel } from '../panels/BlocksPanel';
@@ -52,6 +53,12 @@ export const PANEL_REGISTRY: Record<PanelId, PanelDef> = {
     label: 'Sessions',
     Component: SessionsPanel,
     openAction: openMostRecentSessionModal,
+  },
+  projects: {
+    id: 'projects',
+    label: 'Projects',
+    Component: ProjectsPanel,
+    openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'projects' }),
   },
   weekly: {
     id: 'weekly',

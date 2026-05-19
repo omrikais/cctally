@@ -14,7 +14,9 @@ function KeyTable({ panelOrder }: KeyTableProps) {
       <tbody>
         {panelOrder.map((id, idx) => (
           <tr key={id}>
-            <td><kbd>{idx + 1}</kbd></td>
+            {/* 10th panel renders '0' (not '10') — mirrors the main.tsx
+                keymap binding for position 10. */}
+            <td><kbd>{idx === 9 ? '0' : String(idx + 1)}</kbd></td>
             <td>Open {PANEL_REGISTRY[id].label} modal</td>
           </tr>
         ))}

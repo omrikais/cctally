@@ -21,6 +21,12 @@ export interface Envelope {
   blocks:  BlocksEnvelope;
   daily:   DailyEnvelope;
   sessions: SessionsEnvelope;
+  // Projects panel envelope (spec §5.2). Null when the server-side
+  // build returned no usable rows (e.g. empty cache, missing
+  // session_files rows for active entries). Non-null parent with empty
+  // `current_week.rows` and empty `trend.weeks`/`trend.projects` is the
+  // canonical "no project activity yet this week" empty state.
+  projects: ProjectsEnvelope | null;
   // Display tz block — per F1 of the localize-datetime-display spec.
   // The server resolves "local" to a concrete IANA zone (using the
   // dashboard process's host tz) BEFORE emitting the envelope; the
@@ -250,7 +256,97 @@ export interface SessionRow {
   duration_min: number;
   model: string;
   project: string;
+  // Spec §4.1 — opaque project key for cross-nav routing. Non-null when
+  // the row's project IS present in the projects envelope (server
+  // guarantees the lookup will resolve); null when project_path is None
+  // in the cache (e.g. session_files row not yet ingested). Null rows
+  // render as plain text per the stopgap; non-null rows render as a
+  // clickable button that dispatches OPEN_MODAL with projectKey set.
+  project_key: string | null;
   cost_usd: number | null;
+}
+
+// ---- Projects panel + modal (spec §5.2) ------------------------------
+//
+// Mirrors `build_projects_view` in `bin/_lib_projects.py`. The envelope
+// carries TWO sub-blocks: `current_week` (the live leaderboard the panel
+// renders) and `trend` (the 12-week trend the modal renders). The
+// per-project detail (sessions + model breakdown) is fetched lazily via
+// GET /api/project/<key>?weeks=N and consumed as `ProjectDetail`.
+
+export interface ProjectsCurrentWeekRow {
+  key: string;
+  bucket_path: string;
+  cost_usd: number;
+  // Null when the week's total cost is zero (attribution undefined).
+  attributed_pct: number | null;
+  sessions_count: number;
+}
+
+export interface ProjectsCurrentWeekEnvelope {
+  week_label: string | null;
+  week_start_date: string | null;
+  week_start_at: string | null;
+  total_cost_usd: number;
+  rows: ProjectsCurrentWeekRow[];
+}
+
+export interface ProjectsTrendWeek {
+  week_start_date: string;
+  week_label: string;
+  total_cost_usd: number;
+  total_pct: number | null;
+}
+
+export interface ProjectsTrendProject {
+  key: string;
+  bucket_path: string;
+  // Parallel arrays — index i corresponds to `weeks[i]`.
+  weekly_cost: number[];
+  weekly_pct: (number | null)[];
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+  sessions_count_12w: number;
+}
+
+export interface ProjectsTrendEnvelope {
+  window_weeks: number;
+  weeks: ProjectsTrendWeek[];
+  projects: ProjectsTrendProject[];
+}
+
+export interface ProjectsEnvelope {
+  current_week: ProjectsCurrentWeekEnvelope;
+  trend: ProjectsTrendEnvelope;
+}
+
+// /api/project/<key>?weeks=N response — consumed by ProjectsModal (Task 5).
+export interface ProjectDetailModelRow {
+  model: string;
+  cost_usd: number;
+  sessions_count: number;
+  tokens_input: number;
+  tokens_output: number;
+}
+
+export interface ProjectDetailSessionRow {
+  session_id: string;
+  started_at: string;
+  last_activity_at: string;
+  primary_model: string;
+  cost_usd: number;
+}
+
+export interface ProjectDetail {
+  key: string;
+  bucket_path: string;
+  window_weeks: number;
+  window_cost_usd: number;
+  window_attributed_pct: number | null;
+  models: ProjectDetailModelRow[];
+  sessions: ProjectDetailSessionRow[];
+  models_total: number;
+  sessions_total: number;
 }
 
 // /api/session/:id response — consumed by SessionModal.

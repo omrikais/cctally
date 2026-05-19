@@ -21,6 +21,7 @@ function row(partial: Partial<SessionRow>): SessionRow {
     duration_min: 10,
     model: 'sonnet',
     project: 'repo',
+    project_key: null,
     cost_usd: 1.0,
     ...partial,
   };
@@ -271,6 +272,7 @@ function snapWith(rows: SessionRow[]): Envelope {
     weekly: { rows: [] }, monthly: { rows: [] }, blocks: { rows: [] },
     daily: { rows: [], quantile_thresholds: [], peak: null },
     sessions: { total: rows.length, sort_key: 'started desc', rows },
+    projects: null,
     display: { tz: 'local', resolved_tz: 'Etc/UTC', offset_label: 'UTC', offset_seconds: 0 },
     alerts: [],
     alerts_settings: { enabled: true, weekly_thresholds: [], five_hour_thresholds: [] },
@@ -285,11 +287,11 @@ describe('getRenderedRows with sessionsSortOverride', () => {
 
   const rows: SessionRow[] = [
     { session_id: 'a', started_utc: '2026-04-27T10:00:00Z', duration_min: 5,
-      model: 'opus', project: 'beta', cost_usd: 1.0 },
+      model: 'opus', project: 'beta', project_key: null, cost_usd: 1.0 },
     { session_id: 'b', started_utc: '2026-04-26T10:00:00Z', duration_min: 5,
-      model: 'sonnet', project: 'alpha', cost_usd: 9.0 },
+      model: 'sonnet', project: 'alpha', project_key: null, cost_usd: 9.0 },
     { session_id: 'c', started_utc: '2026-04-28T10:00:00Z', duration_min: 5,
-      model: 'haiku', project: 'gamma', cost_usd: 5.0 },
+      model: 'haiku', project: 'gamma', project_key: null, cost_usd: 5.0 },
   ];
 
   it('falls back to sessionComparator when no override is set', () => {

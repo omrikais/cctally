@@ -34,6 +34,7 @@ function mkSnap(generated_at: string, used_pct = 10): Envelope {
     blocks:  { rows: [] },
     daily:   { rows: [], quantile_thresholds: [], peak: null },
     sessions: { total: 0, sort_key: 'started_desc', rows: [] },
+    projects: null,
     display: { tz: 'local', resolved_tz: 'Etc/UTC', offset_label: 'UTC', offset_seconds: 0 },
     alerts: [],
     alerts_settings: { enabled: true, weekly_thresholds: [], five_hour_thresholds: [] },

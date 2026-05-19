@@ -16,6 +16,7 @@ export const SHARE_PANEL_LABELS: Record<SharePanelId, string> = {
   blocks: '5-hour blocks',
   forecast: 'Forecast',
   sessions: 'Sessions',
+  projects: 'Projects',
 };
 
 export function sharePanelLabel(panel: SharePanelId): string {

@@ -107,7 +107,7 @@ describe('SESSIONS_COLUMNS registry', () => {
   it('cost comparator orders by cost_usd ascending', () => {
     const cost = SESSIONS_COLUMNS.find((c) => c.id === 'cost')!;
     const a: SessionRow = {
-      session_id: 'a', started_utc: null, duration_min: 1, model: 'm', project: 'p', cost_usd: 1.0,
+      session_id: 'a', started_utc: null, duration_min: 1, model: 'm', project: 'p', project_key: null, cost_usd: 1.0,
     };
     const b: SessionRow = { ...a, session_id: 'b', cost_usd: 2.0 };
     expect(cost.compare(a, b)).toBeLessThan(0);
@@ -118,7 +118,7 @@ describe('SESSIONS_COLUMNS registry', () => {
     const started = SESSIONS_COLUMNS.find((c) => c.id === 'started')!;
     const a: SessionRow = {
       session_id: 'a', started_utc: '2026-04-27T10:00:00Z', duration_min: 1,
-      model: 'm', project: 'p', cost_usd: 0,
+      model: 'm', project: 'p', project_key: null, cost_usd: 0,
     };
     const b: SessionRow = { ...a, session_id: 'b', started_utc: '2026-04-28T10:00:00Z' };
     expect(started.compare(a, b)).toBeLessThan(0);
@@ -127,7 +127,7 @@ describe('SESSIONS_COLUMNS registry', () => {
   it('null-safe: cost comparator treats null cost_usd as 0', () => {
     const cost = SESSIONS_COLUMNS.find((c) => c.id === 'cost')!;
     const a: SessionRow = {
-      session_id: 'a', started_utc: null, duration_min: 1, model: 'm', project: 'p', cost_usd: null,
+      session_id: 'a', started_utc: null, duration_min: 1, model: 'm', project: 'p', project_key: null, cost_usd: null,
     };
     const b: SessionRow = { ...a, session_id: 'b', cost_usd: 5.0 };
     expect(cost.compare(a, b)).toBeLessThan(0);
@@ -136,11 +136,11 @@ describe('SESSIONS_COLUMNS registry', () => {
   it('started comparator stays transitive with null started_utc rows interleaved', () => {
     const started = SESSIONS_COLUMNS.find((c) => c.id === 'started')!;
     const rows: SessionRow[] = [
-      { session_id: 'a', started_utc: '2026-01-02T00:00:00Z', duration_min: 1, model: 'm', project: 'p', cost_usd: 0 },
-      { session_id: 'x', started_utc: null,                     duration_min: 1, model: 'm', project: 'p', cost_usd: 0 },
-      { session_id: 'b', started_utc: '2026-01-01T00:00:00Z', duration_min: 1, model: 'm', project: 'p', cost_usd: 0 },
-      { session_id: 'y', started_utc: null,                     duration_min: 1, model: 'm', project: 'p', cost_usd: 0 },
-      { session_id: 'c', started_utc: '2026-01-03T00:00:00Z', duration_min: 1, model: 'm', project: 'p', cost_usd: 0 },
+      { session_id: 'a', started_utc: '2026-01-02T00:00:00Z', duration_min: 1, model: 'm', project: 'p', project_key: null, cost_usd: 0 },
+      { session_id: 'x', started_utc: null,                     duration_min: 1, model: 'm', project: 'p', project_key: null, cost_usd: 0 },
+      { session_id: 'b', started_utc: '2026-01-01T00:00:00Z', duration_min: 1, model: 'm', project: 'p', project_key: null, cost_usd: 0 },
+      { session_id: 'y', started_utc: null,                     duration_min: 1, model: 'm', project: 'p', project_key: null, cost_usd: 0 },
+      { session_id: 'c', started_utc: '2026-01-03T00:00:00Z', duration_min: 1, model: 'm', project: 'p', project_key: null, cost_usd: 0 },
     ];
     const sorted = rows.slice().sort(started.compare);
     // Filter to non-null rows only — their relative order MUST be ascending by date.
