@@ -1328,10 +1328,46 @@
   },
   "projects": {
     "current_week": {
-      "rows": [],
-      "total_cost_usd": 0.0,
+      "rows": [
+        {
+          "attributed_pct": 11.383399209486164,
+          "bucket_path": "/fake/repos/project-2",
+          "cost_usd": 10.8,
+          "key": "project-2",
+          "sessions_count": 6
+        },
+        {
+          "attributed_pct": 11.383399209486164,
+          "bucket_path": "/fake/repos/project-4",
+          "cost_usd": 10.8,
+          "key": "project-4",
+          "sessions_count": 6
+        },
+        {
+          "attributed_pct": 7.968379446640315,
+          "bucket_path": "/fake/repos/project-1",
+          "cost_usd": 7.5600000000000005,
+          "key": "project-1",
+          "sessions_count": 7
+        },
+        {
+          "attributed_pct": 6.8300395256916975,
+          "bucket_path": "/fake/repos/project-3",
+          "cost_usd": 6.48,
+          "key": "project-3",
+          "sessions_count": 6
+        },
+        {
+          "attributed_pct": 2.434782608695652,
+          "bucket_path": "/fake/repos/fixture-demo",
+          "cost_usd": 2.31,
+          "key": "fixture-demo",
+          "sessions_count": 1
+        }
+      ],
+      "total_cost_usd": 37.95000000000001,
       "week_label": "wk Apr 13",
-      "week_start_at": "2026-04-13T14:00:00Z",
+      "week_start_at": "2026-04-13T00:00:00Z",
       "week_start_date": "2026-04-13"
     },
     "trend": {

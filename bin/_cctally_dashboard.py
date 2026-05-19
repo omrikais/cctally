@@ -2554,10 +2554,20 @@ def _build_projects_envelope(
         return cached
 
     # ---- Week-start anchor (current subscription week) ------------------
+    # ``TuiCurrentWeek.week_start_at`` is NOT a valid Monday lookup key
+    # after ``_apply_midweek_reset_override`` — it is shifted to the
+    # in-week reset instant (e.g. Friday 13:00 UTC) while the bucket
+    # aggregator below snaps every entry to its containing ISO-Monday
+    # via ``_week_for``. Using ``cw_key`` directly as the bucket-lookup
+    # key strands all current-week activity in an empty bucket and emits
+    # ``rows: []`` with ``total_cost_usd: 0.0``. Snap to the canonical
+    # Monday-UTC week anchor here so the lookup keys align — same
+    # invariant the weekly handling notes call out for
+    # ``weekly_usage_snapshots``/``percent_milestones`` cross-table
+    # joins. Regression: ``tests/fixtures/dashboard/reset-week/`` +
+    # ``test_current_week_rows_populated_after_midweek_reset``.
     if cw_key is not None:
-        cw_start = cw_key.astimezone(dt.timezone.utc).replace(
-            microsecond=0,
-        )
+        cw_start = _projects_week_start_monday_utc(cw_key)
     else:
         cw_start = _projects_week_start_monday_utc(now_utc)
 

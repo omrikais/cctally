@@ -173,6 +173,69 @@ def test_memo_invalidates_on_weeks_back_change():
     assert env_b["trend"]["window_weeks"] <= 4
 
 
+def test_current_week_rows_populated_after_midweek_reset():
+    """B1 regression: ``TuiCurrentWeek.week_start_at`` shifted by
+    ``_apply_midweek_reset_override`` (e.g. Friday 13:00 UTC after an
+    Anthropic-shifted mid-week reset) MUST NOT empty out the panel.
+
+    Buggy behavior: ``cw_start`` was set to the raw mid-week instant
+    (Friday 00:00 UTC after a `.replace(microsecond=0)` snap), but the
+    bucket aggregator anchors every entry to its ISO-Monday via
+    ``_week_for``. The lookup ``buckets.get((bp, cw_start))`` then
+    targeted Friday 00:00 UTC and missed every Monday-keyed bucket,
+    yielding ``rows: []`` / ``total_cost_usd: 0.0``.
+
+    Fixed behavior: ``cw_start`` is canonicalized to the containing
+    ISO-Monday-UTC week start via ``_projects_week_start_monday_utc``,
+    so the lookup matches whichever bucket the aggregator wrote.
+
+    Authoritative CLAUDE.md memory: "``TuiCurrentWeek.week_start_at``
+    is NOT a valid ``week_start_date`` lookup key after a mid-week
+    reset."
+    """
+    from types import SimpleNamespace
+
+    # multi-week.db has 4 projects active in the current week (the
+    # NOW_UTC=2026-05-19 Tuesday-anchored bucket = Monday 2026-05-18 UTC).
+    conn = _open(FIXTURE_DIR / "multi-week.db")
+
+    # Mid-week reset instant: Friday 2026-05-22 13:00 UTC — same calendar
+    # week as NOW_UTC, but a non-Monday boundary that the legacy code
+    # would have stranded as the bucket-lookup key.
+    midweek_reset_at = dt.datetime(
+        2026, 5, 22, 13, 0, 0, tzinfo=dt.timezone.utc,
+    )
+    cw_stub = SimpleNamespace(week_start_at=midweek_reset_at)
+
+    _cctally_dashboard._projects_reset_memo()
+    env = _build_projects_envelope(
+        conn,
+        now_utc=NOW_UTC,
+        current_week=cw_stub,
+        weeks_back=12,
+    )
+
+    cw = env["current_week"]
+    # Canonical Monday anchor: 2026-05-18 (the Monday containing both
+    # NOW_UTC and the mid-week reset instant).
+    assert cw["week_start_date"] == "2026-05-18", \
+        f"cw_start should snap to Monday-UTC: {cw['week_start_date']}"
+    assert cw["week_start_at"] == "2026-05-18T00:00:00Z", \
+        f"cw_start ISO should be Monday-UTC 00:00:00Z: {cw['week_start_at']}"
+    assert len(cw["rows"]) > 0, (
+        "B1 regression: current_week.rows MUST be populated after a "
+        f"mid-week reset; got {cw['rows']!r}"
+    )
+    assert cw["total_cost_usd"] > 0.0, (
+        "B1 regression: current_week.total_cost_usd MUST be > 0 after "
+        f"a mid-week reset; got {cw['total_cost_usd']!r}"
+    )
+    # Row-sum invariant still holds (mirrors test_current_week_total_matches_row_sum).
+    assert abs(
+        cw["total_cost_usd"] - sum(r["cost_usd"] for r in cw["rows"])
+    ) < 1e-9
+
+
 def test_memo_invalidates_on_new_session_entry():
     """A new row in `session_entries` bumps `MAX(id)` → memo must miss.
 

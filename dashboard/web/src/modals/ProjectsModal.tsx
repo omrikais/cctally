@@ -189,9 +189,20 @@ export function ProjectsModal() {
           <thead>
             <tr>
               <th>Project</th>
-              <th>Sessions</th>
-              <th>First seen</th>
-              <th>Last seen</th>
+              {/*
+                I2 (cross-branch review): these three columns read
+                window-unaware envelope fields (`sessions_count_12w`,
+                `first_seen_at`, `last_seen_at`) — they do NOT change
+                when the 1w / 4w / 8w / 12w pill flips. Spec §3.4 wants
+                them window-scoped, but that requires per-week sessions
+                counts + first/last-seen in the envelope shape, too
+                large for this commit. Widen the labels until the
+                envelope-shape follow-up lands (tracking: cctally-dev
+                issue).
+              */}
+              <th>Sessions (12w)</th>
+              <th>First seen (all-time)</th>
+              <th>Last seen (all-time)</th>
               <th>Cost ▼</th>
               <th>Used %</th>
               <th>$/1%</th>

@@ -152,7 +152,7 @@
       "rows": [],
       "total_cost_usd": 0.0,
       "week_label": "wk Apr 13",
-      "week_start_at": "2026-04-13T14:00:00Z",
+      "week_start_at": "2026-04-13T00:00:00Z",
       "week_start_date": "2026-04-13"
     },
     "trend": {
@@ -160,7 +160,7 @@
       "weeks": [
         {
           "total_cost_usd": 0.0,
-          "total_pct": null,
+          "total_pct": 12.0,
           "week_label": "wk Apr 13",
           "week_start_date": "2026-04-13"
         }

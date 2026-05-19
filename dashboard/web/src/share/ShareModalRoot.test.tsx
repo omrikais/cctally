@@ -242,6 +242,93 @@ describe('<ShareModalRoot>', () => {
     ).toBeNull();
   });
 
+  it('I1 regression: windowWeeks param threads through /api/share/render body', async () => {
+    // The Projects modal supplies `windowWeeks` via
+    // `dispatch(openShareModal('projects', triggerId, { windowWeeks: 8 }))`.
+    // The store carries it on `shareModal.params` (shareSlice.ts), but
+    // prior to this fix the client share path (ShareModal /
+    // ActionBar / PreviewPane) ignored `slot.params` entirely. The
+    // server reads `options.get("windowWeeks", 1)` at
+    // `bin/_cctally_dashboard.py:1581`, so the request body MUST carry
+    // it under `options.windowWeeks` for the rendered artifact to
+    // match the user's 8w pill — otherwise every share silently
+    // defaults to 1w.
+    //
+    // Assertion is on the captured fetch call's REQUEST BODY, not on
+    // the store slot (the bug was: store slot correct, body silently
+    // dropping the field).
+    const fetchCalls: Array<{ url: string; body: unknown }> = [];
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(
+      async (input: string | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.includes('/api/share/render')) {
+          let parsed: unknown = null;
+          if (typeof init?.body === 'string') {
+            try { parsed = JSON.parse(init.body); } catch { /* leave null */ }
+          }
+          fetchCalls.push({ url, body: parsed });
+          return {
+            ok: true,
+            json: async () => ({
+              body: '# preview',
+              content_type: 'text/markdown',
+              snapshot: {
+                kernel_version: 1,
+                panel: 'projects',
+                template_id: 'projects-recap',
+                options: { format: 'md', theme: 'light' },
+                generated_at: '2026-05-19T12:00:00Z',
+                data_digest: 'sha256:test',
+              },
+            }),
+          };
+        }
+        // Templates fetch.
+        return {
+          ok: true,
+          json: async () => ({
+            panel: 'projects',
+            templates: [
+              {
+                id: 'projects-recap',
+                label: 'Recap',
+                description: 'Projects recap',
+                default_options: { format: 'md', theme: 'light' },
+              },
+            ],
+          }),
+        };
+      },
+    ));
+
+    render(<ShareModalRoot />);
+    await act(async () => {
+      dispatch(openShareModal('projects', null, { windowWeeks: 8 }));
+    });
+    // PreviewPane has a 200 ms debounce before firing /api/share/render.
+    // Wait for the first preview request to land.
+    await waitFor(() => {
+      const previewCalls = fetchCalls.filter(
+        (c) => c.url.includes('/api/share/render'),
+      );
+      expect(previewCalls.length).toBeGreaterThan(0);
+    }, { timeout: 2000 });
+
+    const renderCall = fetchCalls.find(
+      (c) => c.url.includes('/api/share/render'),
+    );
+    expect(renderCall).toBeDefined();
+    // The body is `{ panel, template_id, options }` per api.ts; verify
+    // `options.windowWeeks === 8` round-trips into the request body.
+    const body = renderCall!.body as {
+      panel: string;
+      template_id: string;
+      options: { windowWeeks?: number };
+    };
+    expect(body.panel).toBe('projects');
+    expect(body.options.windowWeeks).toBe(8);
+  });
+
   it('Esc closes the composer first when layered above the share modal (spec §12.1)', async () => {
     // Regression for M3 Impl C spec-compliance fix: when the composer
     // is layered above an open share modal (the "Customize…" / `B`

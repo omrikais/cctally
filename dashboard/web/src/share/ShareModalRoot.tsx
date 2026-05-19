@@ -99,7 +99,11 @@ export function ShareModalRoot() {
             if (e.target === e.currentTarget) close();
           }}
         >
-          <ShareModal panel={slot.panel} onClose={close} />
+          <ShareModal
+            panel={slot.panel}
+            initialParams={slot.params}
+            onClose={close}
+          />
         </div>
       ) : null}
       <ComposerModal />

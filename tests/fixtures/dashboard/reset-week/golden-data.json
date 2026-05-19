@@ -764,11 +764,26 @@
   },
   "projects": {
     "current_week": {
-      "rows": [],
-      "total_cost_usd": 0.0,
-      "week_label": "wk Apr 17",
-      "week_start_at": "2026-04-17T13:00:00Z",
-      "week_start_date": "2026-04-17"
+      "rows": [
+        {
+          "attributed_pct": 37.94729542302358,
+          "bucket_path": "/fake/repos/alpha",
+          "cost_usd": 4.56,
+          "key": "alpha",
+          "sessions_count": 4
+        },
+        {
+          "attributed_pct": 22.052704576976424,
+          "bucket_path": "/fake/repos/fixture-demo",
+          "cost_usd": 2.65,
+          "key": "fixture-demo",
+          "sessions_count": 1
+        }
+      ],
+      "total_cost_usd": 7.209999999999999,
+      "week_label": "wk Apr 13",
+      "week_start_at": "2026-04-13T00:00:00Z",
+      "week_start_date": "2026-04-13"
     },
     "trend": {
       "projects": [

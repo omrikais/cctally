@@ -158,6 +158,29 @@ afterEach(() => {
 });
 
 describe('<ProjectsModal />', () => {
+  it('I2 (cross-branch review): window-unaware columns advertise their actual scope', () => {
+    // The "Sessions" / "First seen" / "Last seen" columns read
+    // `sessions_count_12w`, `first_seen_at`, `last_seen_at` from the
+    // envelope — fixed 12w-aggregate / all-time values that do NOT
+    // change when the window pill flips. Spec §3.4 wants them
+    // window-scoped, which requires per-week sessions counts +
+    // first/last-seen in the envelope shape. Until that follow-up
+    // lands, the labels are widened to disclose what the cell actually
+    // shows so the user isn't misled by the 1w / 4w / 8w / 12w pill.
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 12 }));
+    render(<ProjectsModal />);
+    expect(
+      screen.getByRole('columnheader', { name: 'Sessions (12w)' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('columnheader', { name: 'First seen (all-time)' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('columnheader', { name: 'Last seen (all-time)' }),
+    ).toBeInTheDocument();
+  });
+
   it('renders window pills with the current selection (default 4w)', () => {
     vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
     updateSnapshot(buildProjectsEnvelope({ windowWeeks: 12 }));

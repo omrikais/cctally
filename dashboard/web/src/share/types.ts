@@ -30,6 +30,13 @@ export interface ShareOptions {
   project_allowlist: string[] | null;
   show_chart: boolean;
   show_table: boolean;
+  // Per-panel scalar overrides — currently only the Projects panel
+  // emits this, sourced from the ProjectsModal's 1w / 4w / 8w / 12w
+  // pill state via `shareModal.params.windowWeeks`. The server reads
+  // it at `bin/_cctally_dashboard.py:1581` (`options.get("windowWeeks", 1)`).
+  // Optional + narrowly-typed on purpose so other panels keep the
+  // shape unchanged. Empty/missing → server default (`1`).
+  windowWeeks?: 1 | 4 | 8 | 12;
 }
 
 export interface ShareTemplate {

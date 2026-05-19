@@ -37,6 +37,12 @@ import { getState } from '../store/store';
 interface Props {
   panel: SharePanelId;
   onClose: () => void;
+  // Opaque per-panel params forwarded from the store's `shareModal.params`
+  // slot (set by the opener via `dispatch(openShareModal(..., params))`).
+  // Currently only the Projects modal supplies `windowWeeks`; merged into
+  // the initial options so /api/share/render fetches carry the correct
+  // window, instead of silently defaulting to the server's `1w`.
+  initialParams?: { windowWeeks?: 1 | 4 | 8 | 12 };
 }
 
 // Fallback defaults — used when template `default_options` are missing
@@ -69,12 +75,24 @@ function mergeOptions(base: ShareOptions, override: Partial<ShareOptions> | unde
   return next;
 }
 
-export function ShareModal({ panel, onClose }: Props) {
+export function ShareModal({ panel, onClose, initialParams }: Props) {
   const panelLabel = sharePanelLabel(panel);
   const [templates, setTemplates] = useState<ShareTemplate[] | null>(null);
   const [templatesError, setTemplatesError] = useState<string | null>(null);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
-  const [options, setOptions] = useState<ShareOptions>(() => defaultShareOptions());
+  // Seed options with the caller-provided `windowWeeks` (Projects modal's
+  // active pill — 1 / 4 / 8 / 12). Empty/undefined leaves the options
+  // shape untouched so the server falls back to `1` per spec. Template
+  // default_options can still override via the post-mount merge below,
+  // but the merge is shallow — and `windowWeeks` is not one of the
+  // template-controlled knobs — so the caller's value sticks.
+  const [options, setOptions] = useState<ShareOptions>(() => {
+    const base = defaultShareOptions();
+    if (initialParams?.windowWeeks != null) {
+      return { ...base, windowWeeks: initialParams.windowWeeks };
+    }
+    return base;
+  });
   // Whether the user has interacted with the Knobs / Format radio. Once
   // true, we stop re-applying template default_options when the
   // selectedTemplateId changes — the user's preferences win.
