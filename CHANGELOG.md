@@ -8,6 +8,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Removed
 - `cctally release` subcommand — maintainer-only release automation moved to private `bin/cctally-release`. End-user npm/brew installs no longer carry release tooling, and `cctally setup` no longer expects a `cctally-release` symlink (stale symlinks from prior versions are auto-cleaned by `cctally setup --install`). The actual release process is unchanged for the maintainer; see `docs/RELEASE.md`.
 
+### Fixed
+- Maintainer-only release tooling: recovery hints in `bin/_cctally_release.py` (Phase 4 `gh auth` fallback, Phase 5 npm poll timeout, Phase 6 brew dirty-clone refusal) now tell the operator to re-run `cctally-release --resume`, not `cctally release --resume`. The latter was extracted into a standalone command in this release; following the old hint produced argparse's `invalid choice: 'release'` error instead of resuming the cut. `docs/RELEASE.md` + `.claude/skills/release-cctally/SKILL.md` also gain a new "Invocation" note clarifying that `cctally-release` is run from the maintainer's `cctally-dev` checkout via `bin/cctally-release` (it is not symlinked onto `~/.local/bin/` by `cctally setup`); end-user surfaces are unaffected.
+
 ## [1.8.2] - 2026-05-18
 
 ### Added
