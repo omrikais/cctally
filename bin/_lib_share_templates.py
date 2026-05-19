@@ -37,6 +37,9 @@ SHARE_CAPABLE_PANELS: frozenset[str] = frozenset({
     "blocks",
     "forecast",
     "sessions",
+    # Projects panel + modal (spec 2026-05-19-projects-panel-design.md).
+    # 9th share-capable panel — three templates land in this module.
+    "projects",
 })
 
 
@@ -1552,6 +1555,176 @@ def _build_sessions_detail(*, panel_data, options):
     )
 
 
+# --- Projects panel + modal builders (spec §7.6) ---
+#
+# The three Projects-panel templates share a single internal kernel so
+# the table / chart / KPI layout stays consistent across archetypes:
+# only the "what's emphasized" shape differs (recap = top-N table,
+# visual = chart-forward, detail = full table + chart). All three
+# consume `panel_data` from `_build_projects_share_panel_data` in
+# `bin/_cctally_dashboard.py`, NOT `_build_project_snapshot` directly —
+# that kernel takes `ProjectKey` objects, but the dashboard envelope
+# emits already-disambiguated string `key`s. Both paths end up at the
+# same column shape: `Project | $ Cost | % Used | Sessions`.
+
+_PROJECTS_TABLE_COLUMNS = (
+    _LS.ColumnSpec(key="project", label="Project", align="left"),
+    _LS.ColumnSpec(key="cost",    label="$ Cost",  align="right", emphasis=True),
+    _LS.ColumnSpec(key="used",    label="% Used",  align="right"),
+    _LS.ColumnSpec(key="sessions", label="Sessions", align="right"),
+)
+
+
+def _projects_rows_for_template(rows: list[dict], cap: int) -> tuple:
+    """Build `Row` tuple for the Projects table from the dashboard
+    panel_data row shape.
+
+    `rows` is a list of dicts {key, bucket_path, cost_usd,
+    attributed_pct, sessions_count} (post-disambiguation, sorted by
+    caller). `cap` truncates to top-N by caller order. Mirrors
+    `_build_project_snapshot`'s row layout in bin/cctally:11774 but
+    with string keys (no ProjectKey objects).
+    """
+    out: list = []
+    for r in (rows or [])[:cap]:
+        attr = r.get("attributed_pct")
+        out.append(_LS.Row(cells={
+            "project":  _LS.ProjectCell(label=str(r["key"])),
+            "cost":     _LS.MoneyCell(usd=float(r["cost_usd"])),
+            "used":     (
+                _LS.PercentCell(float(attr)) if attr is not None
+                else _LS.TextCell("—")
+            ),
+            "sessions": _LS.TextCell(str(int(r.get("sessions_count", 0) or 0))),
+        }))
+    return tuple(out)
+
+
+def _projects_chart_for_template(rows: list[dict], cap: int):
+    """Build the HorizontalBarChart for the Projects share artifact.
+    Cap=12 mirrors `_build_project_snapshot` (bin/cctally:11813).
+    """
+    if not rows:
+        return None
+    points = []
+    for r in rows[:cap]:
+        label = str(r["key"])
+        cost = float(r["cost_usd"])
+        points.append(_LS.ChartPoint(
+            x_label=label,
+            x_value=cost,
+            y_value=cost,
+            project_label=label,
+        ))
+    return _LS.HorizontalBarChart(
+        points=tuple(points), x_label="$", cap=cap,
+    )
+
+
+def _projects_period(panel_data: dict, options: dict):
+    start = panel_data["period_start"]
+    end = panel_data["period_end"]
+    weeks = int(panel_data.get("window_weeks", 1) or 1)
+    label = "This week" if weeks == 1 else f"Last {weeks} weeks"
+    return _period(start, end, label=label,
+                   display_tz=_display_tz(options))
+
+
+def _projects_subtitle(options: dict, total_rows: int) -> str:
+    reveal = options.get("reveal_projects", True)
+    return " · ".join([
+        f"{total_rows} project{'' if total_rows == 1 else 's'}",
+        "real projects" if reveal else "projects anonymized",
+    ])
+
+
+def _build_projects_recap(*, panel_data, options):
+    """Projects recap — top-N table + KPI strip + HBar chart.
+
+    Mirrors `weekly-recap`'s balanced shape (table + chart + KPIs).
+    Top-N defaults to 5 (matches the panel's top-5 rows from spec §2.3).
+    """
+    rows = panel_data.get("rows") or []
+    cap = int(options.get("top_n", 5))
+    total = float(panel_data.get("total_cost_usd", 0.0) or 0.0)
+    return _LS.ShareSnapshot(
+        cmd="projects",
+        title=f"Projects recap — top {min(cap, len(rows))}",
+        subtitle=_projects_subtitle(options, len(rows)),
+        period=_projects_period(panel_data, options),
+        columns=_PROJECTS_TABLE_COLUMNS,
+        rows=_projects_rows_for_template(rows, cap),
+        chart=_projects_chart_for_template(rows, cap=12),
+        totals=_kpi_strip(
+            ("$ spent", f"${total:,.2f}"),
+            ("Projects", str(len(rows))),
+        ),
+        notes=(),
+        generated_at=_utc_now(),
+        version=_release_version(),
+    )
+
+
+def _build_projects_visual(*, panel_data, options):
+    """Projects visual — chart-forward HBar of top-12 projects by cost.
+
+    Mirrors `weekly-visual` / `current-week-visual` — chart-led, no
+    table. Spec §7.6 routes the visual archetype to a HorizontalBarChart
+    of the top-12 projects.
+    """
+    rows = panel_data.get("rows") or []
+    cap_chart = 12
+    total = float(panel_data.get("total_cost_usd", 0.0) or 0.0)
+    return _LS.ShareSnapshot(
+        cmd="projects",
+        title=f"Projects — top {min(cap_chart, len(rows))} by cost",
+        subtitle=_projects_subtitle(options, len(rows)),
+        period=_projects_period(panel_data, options),
+        columns=_PROJECTS_TABLE_COLUMNS,
+        rows=(),                                  # visual archetype: empty table
+        chart=_projects_chart_for_template(rows, cap=cap_chart),
+        totals=_kpi_strip(
+            ("$ spent", f"${total:,.2f}"),
+            ("Projects", str(len(rows))),
+        ),
+        notes=(),
+        generated_at=_utc_now(),
+        version=_release_version(),
+    )
+
+
+def _build_projects_detail(*, panel_data, options):
+    """Projects detail — full table + chart. Closest fit to today's CLI
+    `cctally project --format` output (spec §7.6 routes detail here).
+
+    Default top_n=50 means "all rows" for typical caches.
+    """
+    rows = panel_data.get("rows") or []
+    cap = int(options.get("top_n", 50))
+    total = float(panel_data.get("total_cost_usd", 0.0) or 0.0)
+    notes: tuple[str, ...] = ()
+    if len(rows) > 12:
+        notes = (
+            f"Showing top 12 in chart; table includes all {len(rows)}.",
+        )
+    return _LS.ShareSnapshot(
+        cmd="projects",
+        title=f"Projects detail — {len(rows)} project{'' if len(rows) == 1 else 's'}",
+        subtitle=_projects_subtitle(options, len(rows)),
+        period=_projects_period(panel_data, options),
+        columns=_PROJECTS_TABLE_COLUMNS,
+        rows=_projects_rows_for_template(rows, cap),
+        chart=_projects_chart_for_template(rows, cap=12),
+        totals=_kpi_strip(
+            ("$ spent",  f"${total:,.2f}"),
+            ("Projects", str(len(rows))),
+        ),
+        notes=notes,
+        generated_at=_utc_now(),
+        version=_release_version(),
+    )
+
+
 # --- Register Recap templates ---
 
 _RECAP = (
@@ -1587,6 +1760,11 @@ _RECAP = (
                   description="Top-N sessions table + total",
                   default_options={"top_n": 15, "show_chart": False, "show_table": True},
                   builder=_build_sessions_recap),
+    # Projects panel + modal (spec §7.6).
+    ShareTemplate(id="projects-recap", panel="projects", label="Recap",
+                  description="Top-N projects table + total + HBar chart",
+                  default_options={"top_n": 5, "show_chart": True, "show_table": True},
+                  builder=_build_projects_recap),
 )
 
 SHARE_TEMPLATES = SHARE_TEMPLATES + _RECAP
@@ -1627,6 +1805,11 @@ _VISUAL = (
                   description="Horizontal bar of top-N sessions by cost",
                   default_options={"top_n": 8, "show_chart": True, "show_table": False},
                   builder=_build_sessions_visual),
+    # Projects panel + modal (spec §7.6).
+    ShareTemplate(id="projects-visual", panel="projects", label="Visual",
+                  description="Chart-forward HBar of top-12 projects by cost",
+                  default_options={"top_n": 12, "show_chart": True, "show_table": False},
+                  builder=_build_projects_visual),
 )
 
 
@@ -1665,6 +1848,13 @@ _DETAIL = (
                   description="Top-50 sessions with full columns",
                   default_options={"top_n": 50, "show_chart": False, "show_table": True},
                   builder=_build_sessions_detail),
+    # Projects panel + modal (spec §7.6). Default top_n=50 means "all
+    # rows" for typical caches; matches today's CLI `cctally project
+    # --format` table shape.
+    ShareTemplate(id="projects-detail", panel="projects", label="Detail",
+                  description="Full projects table + HBar chart (top-12)",
+                  default_options={"top_n": 50, "show_chart": True, "show_table": True},
+                  builder=_build_projects_detail),
 )
 
 SHARE_TEMPLATES = SHARE_TEMPLATES + _VISUAL + _DETAIL

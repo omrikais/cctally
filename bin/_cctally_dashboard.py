@@ -1026,6 +1026,7 @@ def _build_share_panel_data(panel: str, options: dict,
     if panel == "blocks":      return _build_blocks_share_panel_data(options, snap)
     if panel == "sessions":    return _build_sessions_share_panel_data(options, snap)
     if panel == "current-week": return _build_current_week_share_panel_data(options, snap)
+    if panel == "projects":    return _build_projects_share_panel_data(options, snap)
     raise ValueError(f"unknown share panel: {panel!r}")
 
 
@@ -1524,6 +1525,122 @@ def _build_sessions_share_panel_data(options: dict,
             "model":        getattr(r, "model_primary", "") or "",
         })
     return {"sessions": sessions}
+
+
+def _build_projects_share_panel_data(options: dict,
+                                      snap: "DataSnapshot | None") -> dict:
+    """Projects panel_data — per-project rollup over a selectable window.
+
+    Reuses ``DataSnapshot.projects_envelope`` already populated by the
+    sync thread, so the share artifact matches what the dashboard panel
+    is showing. ``options.windowWeeks`` (spec §5.4 + §7.3) selects the
+    aggregation window:
+
+      - ``windowWeeks=1`` (default): current_week only (PANEL share flow).
+      - ``windowWeeks ∈ {4, 8, 12}``: sum across the trend window
+        (MODAL share flow — supplies its active window pill).
+
+    Output shape (consumed by `_build_projects_recap` / `_visual` /
+    `_detail` builders below — see bin/_lib_share_templates.py):
+
+      {
+        "rows": [
+          {
+            "key":            "<disambiguated display_key>",
+            "bucket_path":    "<absolute path>",
+            "cost_usd":       <float>,
+            "attributed_pct": <float | None>,
+            "sessions_count": <int>,
+          },
+          ...                                       # desc by cost
+        ],
+        "total_cost_usd": <float>,
+        "period_start":   <dt.datetime UTC>,
+        "period_end":     <dt.datetime UTC>,
+        "window_weeks":   <int>,
+      }
+
+    The Privacy invariant per spec §7.4 lives at the share-render gate
+    (`_lib_share._scrub`), NOT here. This panel_data carries REAL
+    display_keys + bucket_paths; downstream `_scrub` rewrites them
+    when ``reveal_projects=false``.
+    """
+    env: dict = getattr(snap, "projects_envelope", None) or {} if snap else {}
+    if not env:
+        # First-tick / sub-build failure → render a minimal "no data"
+        # shape. _build_project_snapshot already handles empty rows
+        # downstream via "no data" title.
+        now = _share_now_utc()
+        return {
+            "rows":           [],
+            "total_cost_usd": 0.0,
+            "period_start":   now - dt.timedelta(days=7),
+            "period_end":     now,
+            "window_weeks":   1,
+        }
+    weeks_back_raw = options.get("windowWeeks", 1)
+    try:
+        weeks_back = int(weeks_back_raw)
+    except (TypeError, ValueError):
+        weeks_back = 1
+    if weeks_back not in {1, 4, 8, 12}:
+        weeks_back = 1
+    cw = env.get("current_week", {}) or {}
+    trend = env.get("trend", {}) or {}
+
+    # Compute window bounds: cw_start - (weeks_back - 1) × 7d → cw_end.
+    cw_start_iso = cw.get("week_start_at") or _share_now_utc_iso()
+    cw_start = parse_iso_datetime(cw_start_iso, "projects.cw_start")
+    period_end = cw_start + dt.timedelta(days=7)
+    period_start = cw_start - dt.timedelta(days=7 * (weeks_back - 1))
+
+    rows: list[dict]
+    if weeks_back == 1:
+        rows = [
+            {
+                "key":            r["key"],
+                "bucket_path":    r["bucket_path"],
+                "cost_usd":       float(r["cost_usd"]),
+                "attributed_pct": r.get("attributed_pct"),
+                "sessions_count": int(r.get("sessions_count", 0) or 0),
+            }
+            for r in (cw.get("rows") or [])
+        ]
+        total_cost = float(cw.get("total_cost_usd", 0.0) or 0.0)
+    else:
+        # Multi-week: sum across the trailing `weeks_back` slices of
+        # trend.projects[i].weekly_cost. attributed_pct sums each
+        # project's weekly_pct (None when no week has a snapshot).
+        n_weeks = len(trend.get("weeks") or [])
+        # The trend window is already clamped to <= 12; we take the
+        # trailing `weeks_back` slices.
+        take = min(weeks_back, n_weeks)
+        rows = []
+        running_total = 0.0
+        for tp in trend.get("projects") or []:
+            wc = (tp.get("weekly_cost") or [])[-take:]
+            wp = (tp.get("weekly_pct") or [])[-take:]
+            cost = float(sum(wc))
+            running_total += cost
+            valid_pct = [float(p) for p in wp if p is not None]
+            attributed = sum(valid_pct) if valid_pct else None
+            rows.append({
+                "key":            tp["key"],
+                "bucket_path":    tp["bucket_path"],
+                "cost_usd":       cost,
+                "attributed_pct": attributed,
+                "sessions_count": int(tp.get("sessions_count_12w", 0) or 0),
+            })
+        rows.sort(key=lambda r: (-r["cost_usd"], r["key"]))
+        total_cost = running_total
+
+    return {
+        "rows":           rows,
+        "total_cost_usd": total_cost,
+        "period_start":   period_start,
+        "period_end":     period_end,
+        "window_weeks":   weeks_back,
+    }
 
 
 
@@ -2618,10 +2735,12 @@ def _build_projects_envelope(
         cw_rows.append({
             "key":              display_key_by_bucket[bp],
             "bucket_path":      bp,
-            "cost_usd":         round(b["cost_usd"], 6),
-            "attributed_pct":   (
-                None if attributed is None else round(attributed, 6)
-            ),
+            # NOTE: NOT rounded — `round(..., 6)` introduces ~1e-6 error
+            # that breaks the R-PROJ1/R-PROJ2 1e-9 reconcile tolerance.
+            # The JSON serializer emits up to 17 significant digits;
+            # network bandwidth is negligible (KB-scale payloads).
+            "cost_usd":         b["cost_usd"],
+            "attributed_pct":   attributed,
             "sessions_count":   len(b["sessions"]),
         })
     # Desc by cost (ties broken by key for byte-stability across runs).
@@ -2631,7 +2750,7 @@ def _build_projects_envelope(
         "week_label":      _projects_week_label(cw_start),
         "week_start_date": cw_start.date().isoformat(),
         "week_start_at":   _iso_z(cw_start),
-        "total_cost_usd":  round(cw_total_cost, 6),
+        "total_cost_usd":  cw_total_cost,
         "rows":            cw_rows,
     }
 
@@ -2642,8 +2761,8 @@ def _build_projects_envelope(
         trend_weeks_blocks.append({
             "week_start_date": w.date().isoformat(),
             "week_label":      _projects_week_label(w),
-            "total_cost_usd":  round(total_cost_by_week.get(w, 0.0), 6),
-            "total_pct":       None if wpct is None else round(wpct, 6),
+            "total_cost_usd":  total_cost_by_week.get(w, 0.0),
+            "total_pct":       wpct,
         })
 
     trend_projects = []
@@ -2665,10 +2784,8 @@ def _build_projects_envelope(
                 attributed = (b["cost_usd"] / week_total) * week_pct
             else:
                 attributed = None
-            weekly_cost.append(round(b["cost_usd"], 6))
-            weekly_pct_arr.append(
-                None if attributed is None else round(attributed, 6)
-            )
+            weekly_cost.append(b["cost_usd"])
+            weekly_pct_arr.append(attributed)
             sessions_12w |= b["sessions"]
             if first_seen is None or b["first_seen"] < first_seen:
                 first_seen = b["first_seen"]
@@ -2706,6 +2823,303 @@ def _build_projects_envelope(
     _PROJECTS_ENV_MEMO["key"] = memo_key
     _PROJECTS_ENV_MEMO["value"] = result
     return result
+
+
+def _project_detail_for_window(
+    conn: "sqlite3.Connection",
+    *,
+    project_key: str,
+    weeks_back: int,
+    now_utc: "dt.datetime",
+    current_week: "Any | None" = None,
+) -> "dict | None":
+    """Build the drill payload for ``GET /api/project/<key>?weeks=N``
+    (spec §5.3).
+
+    Resolves ``project_key`` against the same disambiguated display
+    keys the envelope emits. Returns ``None`` on miss → caller maps to
+    HTTP 404. Top-N sessions by ``last_activity`` desc (cap=5 per spec
+    §5.3); models list is desc by cost. ``window_attributed_pct`` is
+    the across-window sum of ``(project_cost_in_week / week_total) *
+    week_pct`` — ``None`` when no contributing week has a snapshot.
+
+    Identity invariant (CLAUDE.md spec §9.2 R-PROJ3 + Codex F6):
+    ``project_key`` is matched against the DISAMBIGUATED display_key
+    (`foo (repos)` etc.), NOT a substring filter — the CLI
+    ``--project <pattern>`` form does NOT reliably round-trip
+    disambiguated keys. The reconcile harness asserts this by
+    ``bucket_path`` identity, not pattern.
+    """
+    c = _cctally()
+
+    # Build the envelope first; the per-window bucket map there is the
+    # authoritative shape (matches what the panel renders). We can
+    # cheaply enrich the matched project with model + recent-session
+    # detail by walking session_entries one more time.
+    env = _build_projects_envelope(
+        conn,
+        now_utc=now_utc,
+        current_week=current_week,
+        weeks_back=weeks_back,
+    )
+
+    # Resolve project_key → bucket_path via the envelope's identity map.
+    bucket_path: "str | None" = None
+    matching_trend: "dict | None" = None
+    for tp in env["trend"]["projects"]:
+        if tp["key"] == project_key:
+            bucket_path = tp["bucket_path"]
+            matching_trend = tp
+            break
+    if bucket_path is None:
+        # The project may have shown up in current_week (panel only)
+        # but had 0 cost across the window — fall back to that.
+        for r in env["current_week"]["rows"]:
+            if r["key"] == project_key:
+                bucket_path = r["bucket_path"]
+                break
+    if bucket_path is None:
+        return None
+
+    # ---- Window bounds (Monday-anchored UTC fallback, like the builder) -
+    cw_start = parse_iso_datetime(
+        env["current_week"]["week_start_at"],
+        "projects.current_week.week_start_at",
+    )
+    since_dt = cw_start - dt.timedelta(days=7 * (weeks_back - 1))
+    until_dt = cw_start + dt.timedelta(days=7)
+
+    # ---- Walk session_entries once, attribute to (model, session) -----
+    # `entry_cost` via the shared pricing chokepoint; model rows
+    # accumulate input/output/cache_create/cache_read tokens.
+    resolver_cache: dict = {}
+    _resolve_project_key_fn = c._resolve_project_key
+    pricing = c.CLAUDE_MODEL_PRICING
+
+    # Per-model rollup: {model -> {cost_usd, sessions, in, out, cache_*}}
+    models: dict[str, dict] = {}
+    # Per-session rollup: {session_id -> {cost_usd, last_activity,
+    #                                     started_at, primary_model}}
+    sessions: dict[str, dict] = {}
+    # Aggregate scalars across the window.
+    window_cost = 0.0
+    window_input_t = 0
+    window_output_t = 0
+
+    for row in _projects_iter_session_entries(
+        conn, since=since_dt, until=until_dt,
+    ):
+        (entry_id, ts_iso, model, input_tok, output_tok,
+         cache_create, cache_read, cost_raw, source_path,
+         session_id, project_path) = row
+        if model == "<synthetic>":
+            continue
+        pkey = _resolve_project_key_fn(
+            project_path, "git-root", resolver_cache,
+        )
+        if pkey.bucket_path != bucket_path:
+            continue
+        ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
+        entry_cost = _calculate_entry_cost(
+            model,
+            {
+                "input_tokens": input_tok or 0,
+                "output_tokens": output_tok or 0,
+                "cache_creation_input_tokens": cache_create or 0,
+                "cache_read_input_tokens": cache_read or 0,
+            },
+            mode="auto",
+            cost_usd=cost_raw,
+        )
+        window_cost += entry_cost
+        window_input_t += int(input_tok or 0)
+        window_output_t += int(output_tok or 0)
+
+        # Per-model rollup.
+        m = models.get(model)
+        if m is None:
+            m = {
+                "model":          model,
+                "cost_usd":       0.0,
+                "sessions":       set(),
+                "tokens_input":   0,
+                "tokens_output":  0,
+            }
+            models[model] = m
+        m["cost_usd"] += entry_cost
+        m["tokens_input"] += int(input_tok or 0)
+        m["tokens_output"] += int(output_tok or 0)
+        if session_id:
+            m["sessions"].add(session_id)
+        elif source_path:
+            m["sessions"].add(source_path)
+
+        # Per-session rollup.
+        sid = session_id or source_path
+        if not sid:
+            continue
+        s = sessions.get(sid)
+        if s is None:
+            s = {
+                "session_id":       sid,
+                "started_at":       ts,
+                "last_activity_at": ts,
+                "primary_model":    model,
+                "cost_usd":         0.0,
+            }
+            sessions[sid] = s
+        else:
+            if ts < s["started_at"]:
+                s["started_at"] = ts
+            if ts > s["last_activity_at"]:
+                s["last_activity_at"] = ts
+        s["cost_usd"] += entry_cost
+
+    # Models desc by cost (ties broken by model name for stability).
+    models_list = sorted(
+        models.values(),
+        key=lambda m: (-m["cost_usd"], m["model"]),
+    )
+    models_out = []
+    for m in models_list:
+        models_out.append({
+            "model":          m["model"],
+            "cost_usd":       round(m["cost_usd"], 6),
+            "sessions_count": len(m["sessions"]),
+            "tokens_input":   m["tokens_input"],
+            "tokens_output":  m["tokens_output"],
+        })
+
+    # Sessions: top-5 by last_activity_at desc (per spec §5.3).
+    sessions_sorted = sorted(
+        sessions.values(),
+        key=lambda s: s["last_activity_at"],
+        reverse=True,
+    )
+    sessions_out = []
+    for s in sessions_sorted[:5]:
+        sessions_out.append({
+            "session_id":       s["session_id"],
+            "started_at":       _iso_z(s["started_at"]),
+            "last_activity_at": _iso_z(s["last_activity_at"]),
+            "primary_model":    s["primary_model"],
+            "cost_usd":         round(s["cost_usd"], 6),
+        })
+
+    # window_attributed_pct: prefer the trend projection (already
+    # computed correctly). Sum across weeks; None when all weeks lack
+    # snapshots.
+    win_pct: "float | None" = None
+    if matching_trend is not None:
+        wp = [p for p in matching_trend["weekly_pct"] if p is not None]
+        if wp:
+            win_pct = round(sum(wp), 6)
+
+    return {
+        "key":                    project_key,
+        "bucket_path":            bucket_path,
+        "window_weeks":           weeks_back,
+        "window_cost_usd":        round(window_cost, 6),
+        "window_attributed_pct":  win_pct,
+        "models":                 models_out,
+        "sessions":               sessions_out,
+        "models_total":           len(models_out),
+        "sessions_total":         len(sessions),
+    }
+
+
+# Test-surface impl. The HTTP handler `_handle_get_project_detail`
+# delegates here so unit tests can exercise the path parser + dispatch
+# logic without spinning up a real server. ``handler`` is anything that
+# exposes ``self.path`` (the URL path + query), ``send_response``,
+# ``send_header``, ``end_headers``, ``send_error``, and ``wfile.write``
+# — that's the BaseHTTPRequestHandler surface plus the
+# ``test_dashboard_project_endpoint._FakeHandler`` stand-in.
+def _handle_get_project_detail_impl(handler, *,
+                                    conn: "sqlite3.Connection") -> None:
+    """Shared impl for ``GET /api/project/<key>?weeks=N``.
+
+    Parses the percent-decoded key + the ``weeks`` query param,
+    validates ``weeks ∈ {1, 4, 8, 12}``, then delegates to
+    ``_project_detail_for_window``. 400 on missing/invalid weeks,
+    404 on unknown key, 200 with the detail JSON otherwise.
+    """
+    import urllib.parse as _urlparse
+    raw_path = handler.path
+    path_only, sep, query_str = raw_path.partition("?")
+    # Strip the route prefix; what remains is the percent-encoded key.
+    raw_key = path_only[len("/api/project/"):]
+    project_key = _urlparse.unquote(raw_key)
+    # Parse `weeks` from the query string.
+    query = _urlparse.parse_qs(query_str)
+    weeks_vals = query.get("weeks", [None])
+    weeks_raw = weeks_vals[0] if weeks_vals else None
+    try:
+        weeks = int(weeks_raw) if weeks_raw is not None else None
+    except (TypeError, ValueError):
+        weeks = None
+    if weeks not in {1, 4, 8, 12}:
+        body = json.dumps({"error": "invalid weeks param"}).encode("utf-8")
+        handler.send_response(400)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+        return
+
+    # ``now_utc`` should mirror the current snapshot's generated_at so
+    # the endpoint stays consistent with the panel rows the user just
+    # clicked through. Pull it from the snapshot when available;
+    # otherwise fall back to _command_as_of (CCTALLY_AS_OF honored).
+    snap = None
+    try:
+        snap_ref = getattr(handler, "snapshot_ref", None)
+        if snap_ref is not None:
+            snap = snap_ref.get()
+    except Exception:
+        snap = None
+    if snap is not None and getattr(snap, "generated_at", None) is not None:
+        now_utc = snap.generated_at
+    else:
+        now_utc = _command_as_of()
+    current_week = getattr(snap, "current_week", None) if snap else None
+
+    try:
+        detail = _project_detail_for_window(
+            conn,
+            project_key=project_key,
+            weeks_back=weeks,
+            now_utc=now_utc,
+            current_week=current_week,
+        )
+    except Exception as exc:
+        handler.log_error("/api/project failed: %r", exc)
+        body = json.dumps(
+            {"error": "project detail failed"}
+        ).encode("utf-8")
+        handler.send_response(500)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+        return
+    if detail is None:
+        body = json.dumps(
+            {"error": "project not found", "key": project_key},
+        ).encode("utf-8")
+        handler.send_response(404)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+        return
+    body = json.dumps(detail, ensure_ascii=False).encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-cache")
+    handler.end_headers()
+    handler.wfile.write(body)
 
 
 def _empty_dashboard_snapshot() -> "DataSnapshot":
@@ -3773,6 +4187,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._serve_api_events()
         elif path.startswith("/api/session/"):
             self._handle_get_session_detail(path)
+        elif path.startswith("/api/project/"):
+            self._handle_get_project_detail()
         elif path.startswith("/api/block/"):
             self._handle_get_block_detail(path)
         elif path == "/api/update/status":
@@ -5281,6 +5697,57 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
+
+    def _handle_get_project_detail(self) -> None:
+        """Return ProjectDetail JSON for ``GET /api/project/<key>?weeks=N``
+        (spec §5.3 / §6.5).
+
+        Opens the stats DB and ATTACHes cache.db so the shared builder
+        sees both schemas off one conn (same contract the sync thread
+        uses). Loopback bind + Origin parity is the entire auth
+        surface — no CSRF needed for GETs.
+        """
+        try:
+            conn = open_db()
+        except Exception as exc:
+            self.log_error("/api/project open_db failed: %r", exc)
+            self.send_error(500, "project detail failed")
+            return
+        try:
+            try:
+                c = _cctally()
+                conn.execute(
+                    "ATTACH DATABASE ? AS cache_db",
+                    (str(c.CACHE_DB_PATH),),
+                )
+                conn.execute(
+                    "CREATE TEMP VIEW IF NOT EXISTS session_entries AS "
+                    "SELECT * FROM cache_db.session_entries"
+                )
+                conn.execute(
+                    "CREATE TEMP VIEW IF NOT EXISTS session_files AS "
+                    "SELECT * FROM cache_db.session_files"
+                )
+            except Exception as exc:
+                # ATTACH/CREATE failure → fall back to the stats conn
+                # alone; the builder will see no session_entries and
+                # return None on key match. We still want to 500 here
+                # because the dashboard contract is "should have both".
+                self.log_error("/api/project ATTACH failed: %r", exc)
+                self.send_error(500, "project detail failed")
+                return
+            _handle_get_project_detail_impl(self, conn=conn)
+        finally:
+            try:
+                conn.execute("DROP VIEW IF EXISTS session_entries")
+                conn.execute("DROP VIEW IF EXISTS session_files")
+            except Exception:
+                pass
+            try:
+                conn.execute("DETACH DATABASE cache_db")
+            except Exception:
+                pass
+            conn.close()
 
     def _handle_get_block_detail(self, path: str) -> None:
         """Return BlockDetail JSON for the block whose start_time equals

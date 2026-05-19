@@ -1574,6 +1574,230 @@ PY5HC
 }
 five_hour_credit_invariants
 
+# ── Projects panel + modal invariants (spec §9.2) ─────────────────────
+# R-PROJ1: sum(current_week.rows[].cost_usd) ≈ current_week.total_cost_usd
+#          (the panel-row sum equals the row-source total within 1e-9
+#          USD). Mirrors the existing "sum-over-visible-rows" structural
+#          invariant the dashboard footer reads for every other panel.
+#
+# R-PROJ2: sum(current_week.rows[].attributed_pct) ≈ weekly_percent
+#          (the row sum equals the source weekly snapshot's percent
+#          within 1e-9 pp) WHEN a weekly_usage_snapshots row exists for
+#          the current week. Skipped silently when no snapshot exists —
+#          attributed_pct is None per spec §2.7 and the invariant has
+#          nothing to compare against.
+#
+# R-PROJ3: per project (by bucket_path — the canonical ProjectKey
+#          equality key per bin/_cctally_cache.py:188), running
+#          _build_projects_envelope twice produces the same
+#          sum(weekly_cost) for that project. NOT via
+#          `cmd_project --project <pattern>` CLI filter — the substring
+#          filter does NOT reliably round-trip disambiguated display_keys
+#          (Codex F6: filter matches display_key.lower() OR
+#          (git_root or bucket_path).lower() — but the disambiguator's
+#          parent-dir suffix is appended AFTER display_key, so a query
+#          for `foo (repos)` may match unrelated `foo` rows).
+#
+# R-PROJ4: /api/project/<key>?weeks=N window_cost_usd equals R-PROJ3's
+#          sum (the endpoint and the trend matrix agree).
+#
+# R-PROJ5: re-running _build_projects_envelope with the same inputs is
+#          byte-identical (determinism). The memo cache exercises this
+#          implicitly; this is the explicit cross-call regression.
+#
+# All five run against the in-tree fixture `tests/fixtures/projects/`
+# (single-conn schema; the harness builders are not regenerated here
+# since fixture stability is enforced by the per-fixture .gitignore +
+# `register_fixture_db` atexit normalization).
+projects_envelope_invariants () {
+    local name="projects_envelope_invariants"
+    local result rc_py
+    result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" TZ=Etc/UTC python3 - <<'PYPROJ' 2>&1)
+import importlib.util, os, pathlib, sqlite3, sys, types
+from importlib.machinery import SourceFileLoader
+
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+# Register the cctally module BEFORE exec so the @dataclass machinery
+# can resolve `cls.__module__` -> sys.modules during decoration
+# (Python 3.14's dataclass eagerly probes sys.modules; without the
+# pre-register the script crashes deep inside dataclass init).
+script_path = repo_root / "bin" / "cctally"
+mod = types.ModuleType("cctally")
+mod.__file__ = str(script_path)
+sys.modules["cctally"] = mod
+code = compile(script_path.read_text(), str(script_path), "exec")
+exec(code, mod.__dict__)
+
+sys.path.insert(0, str(repo_root / "bin"))
+import _cctally_dashboard as D
+
+import datetime as dt
+NOW = dt.datetime(2026, 5, 19, 12, 0, 0, tzinfo=dt.timezone.utc)
+FIXTURE_DIR = repo_root / "tests" / "fixtures" / "projects"
+
+
+def _open(path):
+    return sqlite3.connect(path)
+
+
+# ---- R-PROJ1 + R-PROJ2 (multi-week + edge-cases) --------------------
+def _check_proj1_proj2(label, db_path):
+    conn = _open(db_path)
+    try:
+        D._projects_reset_memo()
+        env = D._build_projects_envelope(
+            conn, now_utc=NOW, current_week=None, weeks_back=12,
+        )
+        cw = env["current_week"]
+        rows = cw["rows"]
+        # R-PROJ1: row sum equals total within 1e-9 USD.
+        row_sum = sum(r["cost_usd"] for r in rows)
+        diff = abs(row_sum - cw["total_cost_usd"])
+        assert diff < 1e-9, (
+            f"R-PROJ1 ({label}) fail: row_sum={row_sum} "
+            f"total={cw['total_cost_usd']} diff={diff}"
+        )
+
+        # R-PROJ2: when a weekly snapshot exists for the current week,
+        # sum(attributed_pct) equals the snapshot's weekly_percent.
+        week_start_iso = cw["week_start_at"]
+        week_date = week_start_iso[:10]
+        cur = conn.execute(
+            "SELECT MAX(weekly_percent) FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ?",
+            (week_date,),
+        )
+        snapshot_pct = cur.fetchone()[0]
+        if snapshot_pct is None:
+            # No snapshot → attributed_pct must be None everywhere
+            # (spec §2.7). Verify the fail-closed shape; nothing to
+            # sum-compare against.
+            for r in rows:
+                assert r["attributed_pct"] is None, (
+                    f"R-PROJ2 ({label}) fail: "
+                    f"snapshot absent but attributed_pct={r['attributed_pct']!r}"
+                )
+            return
+        valid_pcts = [r["attributed_pct"] for r in rows
+                      if r["attributed_pct"] is not None]
+        # All-or-nothing: either every row has attribution or none do.
+        assert len(valid_pcts) == len(rows), (
+            f"R-PROJ2 ({label}) fail: partial attribution — "
+            f"{len(valid_pcts)} of {len(rows)} have attributed_pct"
+        )
+        attr_sum = sum(valid_pcts)
+        diff2 = abs(attr_sum - float(snapshot_pct))
+        assert diff2 < 1e-9, (
+            f"R-PROJ2 ({label}) fail: sum(attributed_pct)={attr_sum} "
+            f"snapshot={snapshot_pct} diff={diff2}"
+        )
+    finally:
+        conn.close()
+
+
+_check_proj1_proj2("multi-week", FIXTURE_DIR / "multi-week.db")
+_check_proj1_proj2("edge-cases", FIXTURE_DIR / "edge-cases.db")
+_check_proj1_proj2("single-week", FIXTURE_DIR / "single-week.db")
+
+
+# ---- R-PROJ3 (multi-week, bucket_path identity) ---------------------
+# Per project (matched on bucket_path — the canonical ProjectKey
+# equality key, NOT the display_key), sum(weekly_cost) across the
+# trend matrix equals the same sum when _build_projects_envelope is
+# re-run with the same inputs. Spec §9.2 + Codex F6: by bucket_path,
+# never via `cmd_project --project` substring filter.
+conn = _open(FIXTURE_DIR / "multi-week.db")
+try:
+    D._projects_reset_memo()
+    env_a = D._build_projects_envelope(
+        conn, now_utc=NOW, current_week=None, weeks_back=4,
+    )
+    D._projects_reset_memo()
+    env_b = D._build_projects_envelope(
+        conn, now_utc=NOW, current_week=None, weeks_back=4,
+    )
+    map_a = {p["bucket_path"]: sum(p["weekly_cost"]) for p in env_a["trend"]["projects"]}
+    map_b = {p["bucket_path"]: sum(p["weekly_cost"]) for p in env_b["trend"]["projects"]}
+    assert set(map_a) == set(map_b), (
+        f"R-PROJ3 fail: bucket_path set mismatch — "
+        f"{set(map_a) ^ set(map_b)}"
+    )
+    for bp in map_a:
+        diff = abs(map_a[bp] - map_b[bp])
+        assert diff < 1e-9, (
+            f"R-PROJ3 fail (bp={bp}): a={map_a[bp]} b={map_b[bp]} diff={diff}"
+        )
+finally:
+    conn.close()
+
+
+# ---- R-PROJ4 (endpoint window_cost == trend weekly_cost sum) --------
+# /api/project/<key>?weeks=N's `window_cost_usd` equals the sum of
+# trend.projects[i].weekly_cost over the same window for the project
+# whose bucket_path matches.
+conn = _open(FIXTURE_DIR / "multi-week.db")
+try:
+    D._projects_reset_memo()
+    env = D._build_projects_envelope(
+        conn, now_utc=NOW, current_week=None, weeks_back=4,
+    )
+    for tp in env["trend"]["projects"]:
+        target_key = tp["key"]
+        bp = tp["bucket_path"]
+        trend_sum = sum(tp["weekly_cost"])
+        D._projects_reset_memo()
+        detail = D._project_detail_for_window(
+            conn, project_key=target_key, weeks_back=4,
+            now_utc=NOW, current_week=None,
+        )
+        assert detail is not None, f"R-PROJ4 fail: endpoint missed key={target_key}"
+        assert detail["bucket_path"] == bp, (
+            f"R-PROJ4 fail: bucket_path drift (key={target_key}): "
+            f"trend={bp} vs endpoint={detail['bucket_path']}"
+        )
+        diff = abs(detail["window_cost_usd"] - trend_sum)
+        assert diff < 1e-9, (
+            f"R-PROJ4 fail (key={target_key}): endpoint={detail['window_cost_usd']} "
+            f"trend_sum={trend_sum} diff={diff}"
+        )
+finally:
+    conn.close()
+
+
+# ---- R-PROJ5 (determinism / byte-identical re-runs) -----------------
+import json as _json
+conn = _open(FIXTURE_DIR / "multi-week.db")
+try:
+    D._projects_reset_memo()
+    env_a = D._build_projects_envelope(
+        conn, now_utc=NOW, current_week=None, weeks_back=12,
+    )
+    D._projects_reset_memo()
+    env_b = D._build_projects_envelope(
+        conn, now_utc=NOW, current_week=None, weeks_back=12,
+    )
+    sa = _json.dumps(env_a, sort_keys=True)
+    sb = _json.dumps(env_b, sort_keys=True)
+    assert sa == sb, (
+        f"R-PROJ5 fail: non-deterministic output across re-runs "
+        f"(lens: a={len(sa)} b={len(sb)})"
+    )
+finally:
+    conn.close()
+
+print("OK")
+PYPROJ
+    rc_py=$?
+    if [ $rc_py -ne 0 ]; then
+        echo "RECONCILE FAIL $name: $result"
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    echo "PASS $name"
+    pass_count=$((pass_count + 1))
+}
+projects_envelope_invariants
+
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

@@ -152,12 +152,29 @@ _STUB_PANEL_DATA = {
                        "started_at": "2026-05-04T09:00:00Z",
                        "model": "claude-sonnet-4-5"}],
     },
+    "projects": {
+        "rows": [
+            {"key": "alpha", "bucket_path": "/p/a", "cost_usd": 10.0,
+             "attributed_pct": 5.0, "sessions_count": 3},
+            {"key": "beta",  "bucket_path": "/p/b", "cost_usd":  4.0,
+             "attributed_pct": 2.0, "sessions_count": 2},
+        ],
+        "total_cost_usd": 14.0,
+        "period_start":   __import__("datetime").datetime(
+            2026, 5, 4, 0, 0, 0, tzinfo=__import__("datetime").timezone.utc),
+        "period_end":     __import__("datetime").datetime(
+            2026, 5, 11, 0, 0, 0, tzinfo=__import__("datetime").timezone.utc),
+        "window_weeks":   1,
+    },
 }
 
 
-def test_template_registry_has_24_entries():
-    assert len(_T.SHARE_TEMPLATES) == 24, (
-        f"expected 24 templates (8 panels × 3 archetypes), got {len(_T.SHARE_TEMPLATES)}"
+def test_template_registry_has_27_entries():
+    """Bumped from 24 (8 panels × 3 archetypes) to 27 (9 panels × 3) when
+    'projects' joined SHARE_CAPABLE_PANELS in the projects-panel feature
+    (spec §7.6)."""
+    assert len(_T.SHARE_TEMPLATES) == 27, (
+        f"expected 27 templates (9 panels × 3 archetypes), got {len(_T.SHARE_TEMPLATES)}"
     )
 
 

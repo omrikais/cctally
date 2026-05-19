@@ -790,7 +790,7 @@
             null,
             38.0,
             null,
-            37.947295
+            37.94729542302358
           ]
         },
         {
@@ -832,7 +832,7 @@
             null,
             null,
             null,
-            22.052705
+            22.052704576976424
           ]
         }
       ],
@@ -862,7 +862,7 @@
           "week_start_date": "2026-04-06"
         },
         {
-          "total_cost_usd": 7.21,
+          "total_cost_usd": 7.209999999999999,
           "total_pct": 60.0,
           "week_label": "wk Apr 13",
           "week_start_date": "2026-04-13"
