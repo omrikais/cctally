@@ -2841,6 +2841,7 @@ def _project_detail_for_window(
     weeks_back: int,
     now_utc: "dt.datetime",
     current_week: "Any | None" = None,
+    projects_envelope: "dict | None" = None,
 ) -> "dict | None":
     """Build the drill payload for ``GET /api/project/<key>?weeks=N``
     (spec §5.3).
@@ -2858,19 +2859,44 @@ def _project_detail_for_window(
     ``--project <pattern>`` form does NOT reliably round-trip
     disambiguated keys. The reconcile harness asserts this by
     ``bucket_path`` identity, not pattern.
+
+    Performance — two layered optimizations make this O(project-rows-
+    in-window) instead of O(all-rows-in-window):
+
+    1. ``projects_envelope`` (HTTP path passes ``snap.projects_envelope``):
+       reuse the sync thread's already-built envelope for the
+       ``project_key`` → ``bucket_path`` resolution and the trend-pct
+       lookup, instead of rebuilding. On an active dashboard, the
+       per-process memo on ``_build_projects_envelope`` invalidates
+       every time ``session_entries.id`` advances — between the sync
+       tick and the user's click, that's almost always — so the memo
+       saves nothing on the HTTP path. Plumbing the snapshot's
+       envelope through skips ~1-2s of redundant work per drill.
+
+    2. SQL-side bucket filter: resolve ``bucket_path`` → set of
+       ``session_files.path`` once (cheap — ``session_files`` is
+       ~8k rows vs ``session_entries`` 150k+), stage into a TEMP TABLE,
+       and INNER JOIN the entries walk so the engine only touches this
+       project's rows. Eliminates the Python-side
+       ``if pkey.bucket_path != bucket_path: continue`` filter that
+       previously discarded ~99% of rows after paying for parse +
+       resolve + cost-compute on each.
     """
     c = _cctally()
 
-    # Build the envelope first; the per-window bucket map there is the
-    # authoritative shape (matches what the panel renders). We can
-    # cheaply enrich the matched project with model + recent-session
-    # detail by walking session_entries one more time.
-    env = _build_projects_envelope(
-        conn,
-        now_utc=now_utc,
-        current_week=current_week,
-        weeks_back=weeks_back,
-    )
+    # Resolve the projects envelope: prefer the snapshot-provided one
+    # (sync thread already built it for this tick) over rebuilding
+    # locally. ``None`` keeps the legacy behavior for callers that
+    # don't have a snapshot (tests, the reconcile harness).
+    if projects_envelope is not None:
+        env = projects_envelope
+    else:
+        env = _build_projects_envelope(
+            conn,
+            now_utc=now_utc,
+            current_week=current_week,
+            weeks_back=weeks_back,
+        )
 
     # Resolve project_key → bucket_path via the envelope's identity map.
     bucket_path: "str | None" = None
@@ -2898,11 +2924,93 @@ def _project_detail_for_window(
     since_dt = cw_start - dt.timedelta(days=7 * (weeks_back - 1))
     until_dt = cw_start + dt.timedelta(days=7)
 
-    # ---- Walk session_entries once, attribute to (model, session) -----
-    # `entry_cost` via the shared pricing chokepoint; model rows
-    # accumulate input/output/cache_create/cache_read tokens.
+    # ---- Build bucket → source_paths map for SQL-side scoping ----------
+    # Walk session_files (~8k rows) once instead of session_entries
+    # (~150k+ rows). _resolve_project_key gets called at most ~distinct-
+    # project_paths times (~127 on real DBs) instead of once per entry,
+    # and most of that is hashmap lookups via resolver_cache.
     resolver_cache: dict = {}
     _resolve_project_key_fn = c._resolve_project_key
+    unknown_bucket = bucket_path == "(unknown)"
+    bucket_source_paths: set[str] = set()
+    sf_cur = conn.execute(
+        "SELECT path, project_path FROM session_files"
+    )
+    for sf_path, sf_project_path in sf_cur:
+        pkey = _resolve_project_key_fn(
+            sf_project_path, "git-root", resolver_cache,
+        )
+        if pkey.bucket_path == bucket_path:
+            bucket_source_paths.add(sf_path)
+    if unknown_bucket:
+        # session_entries rows whose source_path has no session_files
+        # row at all LEFT-JOIN to NULL project_path → resolve to
+        # ``(unknown)`` via _resolve_project_key. session_files-only
+        # scan misses those.
+        orphan_cur = conn.execute(
+            "SELECT DISTINCT e.source_path "
+            "FROM session_entries e "
+            "LEFT JOIN session_files sf ON sf.path = e.source_path "
+            "WHERE sf.path IS NULL AND e.source_path IS NOT NULL"
+        )
+        for (sp,) in orphan_cur:
+            bucket_source_paths.add(sp)
+
+    if not bucket_source_paths:
+        # Project visible in envelope but no contributing source_paths
+        # for this conn (rare edge — e.g. an envelope built off a
+        # different conn). Emit an empty drill so the 404 path stays
+        # reserved for "key unknown."
+        return {
+            "key":                    project_key,
+            "bucket_path":            bucket_path,
+            "window_weeks":           weeks_back,
+            "window_cost_usd":        0.0,
+            "window_attributed_pct":  None,
+            "models":                 [],
+            "sessions":               [],
+            "models_total":           0,
+            "sessions_total":         0,
+        }
+
+    # Stage bucket source_paths into a TEMP TABLE so the entries walk
+    # can INNER JOIN an indexed lookup. ``IN (?, ?, ?, ...)`` would
+    # collide with SQLite's parameter cap (~999 bindings) on heavy
+    # multi-cwd projects. DROP-then-CREATE makes the function
+    # re-entrant on a reused conn (the HTTP handler closes the conn
+    # per request, but tests share conns across calls).
+    conn.execute("DROP TABLE IF EXISTS temp._drill_paths")
+    conn.execute(
+        "CREATE TEMP TABLE _drill_paths(path TEXT PRIMARY KEY)"
+    )
+    conn.executemany(
+        "INSERT OR IGNORE INTO _drill_paths(path) VALUES (?)",
+        [(p,) for p in bucket_source_paths],
+    )
+
+    since_iso = since_dt.astimezone(dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    until_iso = until_dt.astimezone(dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    # ---- Walk session_entries (project-scoped) once -------------------
+    # INNER JOIN to _drill_paths drops every row whose source_path
+    # doesn't belong to this bucket. The Python-side filter that
+    # previously discarded ~99% of rows post-resolve is gone.
+    entries_cur = conn.execute(
+        "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
+        "       e.output_tokens, e.cache_create_tokens, "
+        "       e.cache_read_tokens, e.cost_usd_raw, e.source_path, "
+        "       sf.session_id, sf.project_path "
+        "FROM session_entries e "
+        "INNER JOIN _drill_paths dp ON dp.path = e.source_path "
+        "LEFT JOIN session_files sf ON sf.path = e.source_path "
+        "WHERE e.timestamp_utc >= ? AND e.timestamp_utc <= ? "
+        "ORDER BY e.timestamp_utc ASC, e.id ASC",
+        (since_iso, until_iso),
+    )
 
     # Per-model rollup: {model -> {cost_usd, sessions, in, out, cache_*}}
     models: dict[str, dict] = {}
@@ -2914,19 +3022,15 @@ def _project_detail_for_window(
     window_input_t = 0
     window_output_t = 0
 
-    for row in _projects_iter_session_entries(
-        conn, since=since_dt, until=until_dt,
-    ):
+    for row in entries_cur:
         (entry_id, ts_iso, model, input_tok, output_tok,
          cache_create, cache_read, cost_raw, source_path,
          session_id, project_path) = row
         if model == "<synthetic>":
             continue
-        pkey = _resolve_project_key_fn(
-            project_path, "git-root", resolver_cache,
-        )
-        if pkey.bucket_path != bucket_path:
-            continue
+        # No need to call _resolve_project_key here — the INNER JOIN
+        # on _drill_paths already restricted the result set to entries
+        # whose source_path belongs to this bucket.
         ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
         entry_cost = _calculate_entry_cost(
             model,
@@ -3023,6 +3127,14 @@ def _project_detail_for_window(
         if wp:
             win_pct = sum(wp)
 
+    # Best-effort cleanup of the per-call TEMP TABLE so a reused conn
+    # doesn't carry path state into the next drill (tests share conns;
+    # production HTTP closes the conn so this is a no-op there).
+    try:
+        conn.execute("DROP TABLE IF EXISTS temp._drill_paths")
+    except sqlite3.Error:
+        pass
+
     return {
         "key":                    project_key,
         "bucket_path":            bucket_path,
@@ -3091,6 +3203,13 @@ def _handle_get_project_detail_impl(handler, *,
     else:
         now_utc = _command_as_of()
     current_week = getattr(snap, "current_week", None) if snap else None
+    # Reuse the sync-thread-built envelope when available. The per-process
+    # memo invalidates on every session_entries.id advance, so on an
+    # active dashboard the drill would otherwise rebuild the envelope
+    # from scratch on each click (~1-2s wasted). Plumbing it through
+    # skips that work; tests don't set ``projects_envelope`` on the
+    # fake snapshot and fall back to the legacy build path.
+    projects_envelope = getattr(snap, "projects_envelope", None) if snap else None
 
     try:
         detail = _project_detail_for_window(
@@ -3099,6 +3218,7 @@ def _handle_get_project_detail_impl(handler, *,
             weeks_back=weeks,
             now_utc=now_utc,
             current_week=current_week,
+            projects_envelope=projects_envelope,
         )
     except Exception as exc:
         handler.log_error("/api/project failed: %r", exc)

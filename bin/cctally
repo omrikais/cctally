@@ -12450,6 +12450,7 @@ _tui_build_trend = _cctally_tui._tui_build_trend
 _tui_build_weekly_history = _cctally_tui._tui_build_weekly_history
 _tui_build_sessions = _cctally_tui._tui_build_sessions
 _tui_build_session_detail = _cctally_tui._tui_build_session_detail
+_tui_build_session_detail_indexed = _cctally_tui._tui_build_session_detail_indexed
 _tui_build_snapshot = _cctally_tui._tui_build_snapshot
 _tui_empty_snapshot = _cctally_tui._tui_empty_snapshot
 # Key reader + dispatcher + sync thread base class
