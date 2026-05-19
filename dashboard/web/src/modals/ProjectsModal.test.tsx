@@ -59,12 +59,19 @@ interface BuildOpts {
   // `actualWeeks < windowWeeks` to exercise the "Showing N weeks"
   // notice. Defaults to `windowWeeks` when unset.
   actualWeeks?: number;
+  // Append N additional projects with all-zero `weekly_cost` (still
+  // present in the trend matrix because they have historical activity
+  // outside the active window). Used to exercise the collapse-to-top-N-
+  // active behavior — the inactive tail must hide behind the expand
+  // toggle by default.
+  inactiveTail?: number;
 }
 
 function buildProjectsEnvelope(opts: BuildOpts): Envelope {
   const env = baseEnvelope();
   const projectCount = opts.projectCount ?? 5;
   const actual = opts.actualWeeks ?? opts.windowWeeks;
+  const inactiveTail = opts.inactiveTail ?? 0;
   const projects: ProjectsTrendProject[] = Array.from(
     { length: projectCount },
     (_, i) => {
@@ -90,6 +97,17 @@ function buildProjectsEnvelope(opts: BuildOpts): Envelope {
       };
     },
   );
+  for (let k = 0; k < inactiveTail; k++) {
+    projects.push({
+      key: `inactive-${k + 1}`,
+      bucket_path: `/repos/inactive-${k + 1}`,
+      weekly_cost: Array.from({ length: actual }, () => 0),
+      weekly_pct: Array.from({ length: actual }, () => null),
+      first_seen_at: '2026-02-01T00:00:00Z',
+      last_seen_at: '2026-02-15T00:00:00Z',
+      sessions_count_12w: 1,
+    });
+  }
   const projectsEnv: ProjectsEnvelope = {
     current_week: {
       week_label: 'wk May 13',
@@ -277,6 +295,48 @@ describe('<ProjectsModal />', () => {
     fireEvent.click(otherPoly!);
     const after = document.querySelector('tr.selected')?.firstElementChild?.textContent;
     expect(after).toBe(before);
+  });
+
+  it('collapses to top-10 active projects by default and hides the rest behind expand', () => {
+    // 12 active projects (cost > 0) + 20 inactive (cost == 0) = 32 rows
+    // total. Default-collapsed view should render only the top 10 active.
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(
+      buildProjectsEnvelope({ windowWeeks: 4, projectCount: 12, inactiveTail: 20 }),
+    );
+    render(<ProjectsModal />);
+    const rows = screen.getAllByTestId('projects-table-row');
+    expect(rows).toHaveLength(10);
+    // All ten visible rows have non-zero cost.
+    const costs = rows.map((r) => parseFloat(r.getAttribute('data-cost') ?? '0'));
+    expect(costs.every((c) => c > 0)).toBe(true);
+    // Toggle text advertises the full count + hidden delta.
+    const toggle = screen.getByTestId('projects-table-toggle');
+    expect(toggle).toHaveTextContent(/Show all 32 projects \(\+22\)/);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('clicking the expand toggle reveals all rows including the inactive tail', () => {
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(
+      buildProjectsEnvelope({ windowWeeks: 4, projectCount: 12, inactiveTail: 20 }),
+    );
+    render(<ProjectsModal />);
+    fireEvent.click(screen.getByTestId('projects-table-toggle'));
+    expect(screen.getAllByTestId('projects-table-row')).toHaveLength(32);
+    const toggle = screen.getByTestId('projects-table-toggle');
+    expect(toggle).toHaveTextContent(/Show top 10 active/);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(toggle);
+    expect(screen.getAllByTestId('projects-table-row')).toHaveLength(10);
+  });
+
+  it('does NOT render the expand toggle when total rows already fit within the collapse limit', () => {
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 5 }));
+    render(<ProjectsModal />);
+    expect(screen.getAllByTestId('projects-table-row')).toHaveLength(5);
+    expect(screen.queryByTestId('projects-table-toggle')).toBeNull();
   });
 
   it('clicking a top-N band selects that project in the table', async () => {

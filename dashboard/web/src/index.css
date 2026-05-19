@@ -3831,6 +3831,30 @@ mark.current {
   outline: 1px solid rgba(217, 70, 239, 0.5);
 }
 
+.projects-table-toggle {
+  display: block;
+  margin: 6px 0 0 0;
+  padding: 6px 12px;
+  border: 1px dashed var(--border-soft);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  width: 100%;
+  text-align: center;
+}
+.projects-table-toggle:hover {
+  color: var(--accent-magenta);
+  border-color: var(--accent-magenta);
+  background: rgba(217, 70, 239, 0.04);
+}
+.projects-table-toggle:focus-visible {
+  outline: 2px solid var(--accent-magenta);
+  outline-offset: 2px;
+}
+
 .projects-drill {
   margin-top: 14px; padding: 12px 14px; border-radius: 8px;
   border: 1px dashed var(--border-soft);

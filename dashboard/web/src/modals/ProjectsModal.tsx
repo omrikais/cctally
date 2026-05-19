@@ -48,6 +48,11 @@ export function ProjectsModal() {
     () => getState().prefs.projectsTrendYMode,
   );
   const [selectedKey, setSelectedKey] = useState<string | null>(projectKey ?? null);
+  // Collapse the projects table to the top-N active projects by default;
+  // a real cache can carry 30+ historical projects, most of which are
+  // $0.00 in any given window — dumping all of them into the modal makes
+  // it tall and noisy. Expand reveals the rest (inactive + tail).
+  const [tableExpanded, setTableExpanded] = useState(false);
 
   // Re-bind selected key when the modal opens with a different
   // `openProjectKey` (cross-nav from panel/sessions) or when the
@@ -93,6 +98,11 @@ export function ProjectsModal() {
     windowPct: number | null;
     dollarsPerPct: number | null;
   };
+  // Top-N active projects shown by default; rest behind an expand toggle.
+  // "Active" = nonzero window cost. Spec §3.4's default sort is desc by
+  // cost, so the top-N active are simply the leading rows of the sorted
+  // table after filtering out zero-cost entries.
+  const ACTIVE_COLLAPSE_LIMIT = 10;
   const tableRows: DerivedRow[] = (trend?.projects ?? [])
     .map((p) => {
       const weeklyCost = p.weekly_cost.slice(-windowWeeks);
@@ -115,6 +125,12 @@ export function ProjectsModal() {
       };
     })
     .sort((a, b) => b.windowCost - a.windowCost);
+
+  const activeRows = tableRows.filter((r) => r.windowCost > 0);
+  const collapsedRows = activeRows.slice(0, ACTIVE_COLLAPSE_LIMIT);
+  const hiddenWhenCollapsed = tableRows.length - collapsedRows.length;
+  const visibleRows = tableExpanded ? tableRows : collapsedRows;
+  const canExpand = hiddenWhenCollapsed > 0;
 
   return (
     <Modal
@@ -209,7 +225,7 @@ export function ProjectsModal() {
             </tr>
           </thead>
           <tbody>
-            {tableRows.map((r) => (
+            {visibleRows.map((r) => (
               <tr
                 key={r.key}
                 data-testid="projects-table-row"
@@ -229,6 +245,20 @@ export function ProjectsModal() {
             ))}
           </tbody>
         </table>
+
+        {canExpand && (
+          <button
+            type="button"
+            className="projects-table-toggle"
+            data-testid="projects-table-toggle"
+            aria-expanded={tableExpanded}
+            onClick={() => setTableExpanded((v) => !v)}
+          >
+            {tableExpanded
+              ? `Show top ${ACTIVE_COLLAPSE_LIMIT} active`
+              : `Show all ${tableRows.length} projects (+${hiddenWhenCollapsed})`}
+          </button>
+        )}
 
         {selectedKey && (
           <ProjectsDrillPanel projectKey={selectedKey} windowWeeks={windowWeeks} />
