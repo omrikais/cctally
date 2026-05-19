@@ -181,7 +181,32 @@ export function SessionsPanel() {
                       {r.model}
                     </span>
                   </td>
-                  <td className="project">{r.project}</td>
+                  <td className="project">
+                    {r.project_key ? (
+                      <button
+                        type="button"
+                        className="project-cell-link"
+                        aria-label={`Open Projects modal for ${r.project_key}`}
+                        onClick={(e) => {
+                          // stopPropagation so the enclosing <tr>'s
+                          // session-modal click handler doesn't ALSO fire.
+                          e.stopPropagation();
+                          dispatch({
+                            type: 'OPEN_MODAL',
+                            kind: 'projects',
+                            projectKey: r.project_key ?? undefined,
+                          });
+                        }}
+                      >
+                        {r.project}
+                      </button>
+                    ) : (
+                      // Null project_key (session_files row not yet
+                      // ingested) — render plain text. Per spec §4.1
+                      // stopgap.
+                      <span title="Project still resolving">{r.project}</span>
+                    )}
+                  </td>
                   <td className={`num ${cCls}`}>{fmt.usd2(r.cost_usd)}</td>
                 </tr>
               );

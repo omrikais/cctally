@@ -284,3 +284,95 @@ describe('<SessionsPanel /> sortable header', () => {
     expect(label).toMatch(/project asc/);
   });
 });
+
+// Cross-nav from Sessions → Projects modal (spec §4.1). When a session
+// row's project_key is non-null, the project cell renders as a button
+// that dispatches OPEN_MODAL { kind: 'projects', projectKey } and
+// stops propagation so the row's own session-open handler doesn't
+// also fire. When project_key is null (cache hasn't ingested the
+// session_files row yet), the cell renders plain text — the stopgap.
+describe('<SessionsPanel /> Sessions → Projects cross-nav', () => {
+  function snapWithSession(
+    project: string,
+    projectKey: string | null,
+  ): Envelope {
+    return {
+      envelope_version: 2,
+      generated_at: '2026-05-13T10:00:00Z',
+      last_sync_at: null, sync_age_s: null, last_sync_error: null,
+      header: {
+        week_label: 'wk May 13', used_pct: 0, five_hour_pct: null,
+        dollar_per_pct: null, forecast_pct: null,
+        forecast_verdict: 'ok', vs_last_week_delta: null,
+      },
+      current_week: null, forecast: null, trend: null,
+      weekly: { rows: [] }, monthly: { rows: [] }, blocks: { rows: [] },
+      daily: { rows: [], quantile_thresholds: [], peak: null },
+      sessions: {
+        total: 1,
+        sort_key: 'started desc',
+        rows: [{
+          session_id: 's1',
+          started_utc: '2026-05-13T09:00:00Z',
+          duration_min: 5,
+          model: 'opus',
+          project,
+          project_key: projectKey,
+          cost_usd: 1.0,
+        }],
+      },
+      projects: null,
+      display: { tz: 'local', resolved_tz: 'Etc/UTC', offset_label: 'UTC', offset_seconds: 0 },
+      alerts: [],
+      alerts_settings: { enabled: true, weekly_thresholds: [], five_hour_thresholds: [] },
+    };
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    _resetForTests();
+  });
+
+  it('project cell opens Projects modal pre-expanded when project_key is set', async () => {
+    updateSnapshot(snapWithSession('cctally-dev', 'cctally-dev'));
+    // Expand the panel so the table is in the DOM.
+    dispatch({ type: 'SAVE_PREFS', patch: { sessionsCollapsed: false } });
+    const user = userEvent.setup();
+    render(<SessionsPanel />);
+    const cellBtn = document.querySelector(
+      'button.project-cell-link[aria-label="Open Projects modal for cctally-dev"]',
+    ) as HTMLButtonElement | null;
+    expect(cellBtn).not.toBeNull();
+    await user.click(cellBtn!);
+    expect(getState().openModal).toBe('projects');
+    expect(getState().openProjectKey).toBe('cctally-dev');
+  });
+
+  it('project cell renders as plain text when project_key is null', () => {
+    updateSnapshot(snapWithSession('(unknown)', null));
+    dispatch({ type: 'SAVE_PREFS', patch: { sessionsCollapsed: false } });
+    render(<SessionsPanel />);
+    // No project-cell-link button.
+    const cellBtn = document.querySelector('button.project-cell-link');
+    expect(cellBtn).toBeNull();
+    // Project name still appears as plain text in the project cell.
+    const projectCells = document.querySelectorAll('td.project');
+    const cellTexts = Array.from(projectCells).map((c) => c.textContent);
+    expect(cellTexts).toContain('(unknown)');
+  });
+
+  it('project-cell click does NOT bubble to the row → no session modal', async () => {
+    updateSnapshot(snapWithSession('cctally-dev', 'cctally-dev'));
+    dispatch({ type: 'SAVE_PREFS', patch: { sessionsCollapsed: false } });
+    const user = userEvent.setup();
+    render(<SessionsPanel />);
+    const cellBtn = document.querySelector(
+      'button.project-cell-link',
+    ) as HTMLButtonElement;
+    await user.click(cellBtn);
+    // openModal becomes 'projects', not 'session' — confirms the row
+    // click handler didn't also fire.
+    expect(getState().openModal).toBe('projects');
+    expect(getState().openSessionId).toBeNull();
+  });
+});

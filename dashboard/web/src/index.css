@@ -403,6 +403,7 @@ body { padding: 16px; box-sizing: border-box; }
 .panel.accent-pink   { border-color: var(--accent-pink);   --accent-line: rgba(236,72,153,0.32);  --accent-glow: rgba(236,72,153,0.06); --pill-bg: rgba(236,72,153,0.18); }
 .panel.accent-blue   { border-color: var(--accent-blue);   --accent-line: rgba(96,165,250,0.30);  --accent-glow: rgba(96,165,250,0.06);  --pill-bg: rgba(96,165,250,0.18); }
 .panel.accent-indigo { border-color: var(--accent-indigo); --accent-line: rgba(129,140,248,0.30); --accent-glow: rgba(129,140,248,0.06); --pill-bg: rgba(129,140,248,0.18); }
+.panel.accent-magenta { border-color: var(--accent-magenta); --accent-line: rgba(217,70,239,0.30); --accent-glow: rgba(217,70,239,0.06); --pill-bg: rgba(217,70,239,0.18); }
 
 .panel:hover {
   box-shadow: inset 0 0 28px var(--accent-glow);
@@ -1392,6 +1393,7 @@ mark.current {
 .panel.accent-pink:focus-visible   { outline: 2px solid var(--accent-pink); }
 .panel.accent-blue:focus-visible   { outline: 2px solid var(--accent-blue); }
 .panel.accent-indigo:focus-visible { outline: 2px solid var(--accent-indigo); }
+.panel.accent-magenta:focus-visible { outline: 2px solid var(--accent-magenta); }
 
 /* ----- Sync chip status text (Phase 11) ----- */
 /* SyncChip renders a span; the parent .topbar-sync <button> is the click
@@ -3690,4 +3692,75 @@ mark.current {
     bottom: 0;
     background: var(--panel-bg);
   }
+}
+
+/* ---- Projects panel leaderboard (spec §5.2) -------------------------
+ * Top-5 horizontal-bar rows. Bar width is CSS-var driven so each row
+ * sets its own --w in inline style (computed from cost / leaderCost).
+ * The tail row collapses cursor/hover to indicate non-clickability. */
+.projects-body { display: flex; flex-direction: column; gap: 6px; padding: 4px 0; }
+
+.projects-row {
+  display: grid;
+  grid-template-columns: 110px 1fr 56px 44px;
+  gap: 8px;
+  align-items: center;
+  font-size: 12.5px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.projects-row:hover { background: rgba(217, 70, 239, 0.06); }
+.projects-row.tail { cursor: default; }
+.projects-row.tail:hover { background: transparent; }
+.projects-row:focus-visible { outline: 2px solid var(--accent-magenta); outline-offset: -2px; }
+.projects-row .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.projects-row .name.muted,
+.projects-row .cost.muted,
+.projects-row .pct.muted { color: var(--text-dim); }
+.projects-row .lb-bar {
+  height: 10px;
+  background: rgba(217, 70, 239, 0.12);
+  border-radius: 3px;
+  position: relative;
+  overflow: hidden;
+}
+.projects-row .lb-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--w, 0%);
+  background: var(--accent-magenta);
+  border-radius: 3px;
+}
+.projects-row .lb-bar.muted::after { background: var(--text-dim); opacity: .6; }
+.projects-row .cost { color: var(--accent-green); text-align: right; }
+.projects-row .pct  { color: var(--accent-cyan); text-align: right; }
+
+/* `#root` re-prefix is the id-selector specificity floor — the desktop
+ * `.projects-row` rule above has its `.panel-body .projects-row` chain
+ * implied; the mobile @media override must outrank that or it loses. */
+@media (max-width: 640px) {
+  #root .projects-row {
+    grid-template-columns: 90px 1fr 50px 36px;
+    padding: 4px;
+  }
+}
+
+/* ---- Sessions panel: clickable project cell (cross-nav, spec §4.1) -
+ * Button-shaped <button> nested inside a <td>; resets browser defaults
+ * so the table row's normal layout stays intact. */
+.project-cell-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.project-cell-link:hover { color: var(--accent-magenta); }
+.project-cell-link:focus-visible {
+  outline: 2px solid var(--accent-magenta);
+  outline-offset: 2px;
 }
