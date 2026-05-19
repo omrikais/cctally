@@ -2578,7 +2578,6 @@ def _build_projects_envelope(
     # mode (default for `cmd_project --group` absent) — matches the
     # CLI's default.
     _resolve_project_key = c._resolve_project_key
-    pricing = c.CLAUDE_MODEL_PRICING
     resolver_cache: dict = {}
 
     # buckets[(bucket_path, week_start)] -> {key, cost, sessions, ...}
@@ -2894,7 +2893,6 @@ def _project_detail_for_window(
     # accumulate input/output/cache_create/cache_read tokens.
     resolver_cache: dict = {}
     _resolve_project_key_fn = c._resolve_project_key
-    pricing = c.CLAUDE_MODEL_PRICING
 
     # Per-model rollup: {model -> {cost_usd, sessions, in, out, cache_*}}
     models: dict[str, dict] = {}
@@ -2984,7 +2982,7 @@ def _project_detail_for_window(
     for m in models_list:
         models_out.append({
             "model":          m["model"],
-            "cost_usd":       round(m["cost_usd"], 6),
+            "cost_usd":       m["cost_usd"],
             "sessions_count": len(m["sessions"]),
             "tokens_input":   m["tokens_input"],
             "tokens_output":  m["tokens_output"],
@@ -3003,7 +3001,7 @@ def _project_detail_for_window(
             "started_at":       _iso_z(s["started_at"]),
             "last_activity_at": _iso_z(s["last_activity_at"]),
             "primary_model":    s["primary_model"],
-            "cost_usd":         round(s["cost_usd"], 6),
+            "cost_usd":         s["cost_usd"],
         })
 
     # window_attributed_pct: prefer the trend projection (already
@@ -3013,13 +3011,13 @@ def _project_detail_for_window(
     if matching_trend is not None:
         wp = [p for p in matching_trend["weekly_pct"] if p is not None]
         if wp:
-            win_pct = round(sum(wp), 6)
+            win_pct = sum(wp)
 
     return {
         "key":                    project_key,
         "bucket_path":            bucket_path,
         "window_weeks":           weeks_back,
-        "window_cost_usd":        round(window_cost, 6),
+        "window_cost_usd":        window_cost,
         "window_attributed_pct":  win_pct,
         "models":                 models_out,
         "sessions":               sessions_out,

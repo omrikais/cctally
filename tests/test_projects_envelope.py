@@ -171,3 +171,46 @@ def test_memo_invalidates_on_weeks_back_change():
     assert env_a is not env_b
     # Smaller window: trend.window_weeks shrinks.
     assert env_b["trend"]["window_weeks"] <= 4
+
+
+def test_memo_invalidates_on_new_session_entry():
+    """A new row in `session_entries` bumps `MAX(id)` → memo must miss.
+
+    This is the per-tick raison d'être of the memo (cache busts when fresh
+    activity arrives between two sync ticks). Without this test the
+    invalidation path is silently regressable.
+    """
+    import shutil
+    import tempfile
+
+    _cctally_dashboard._projects_reset_memo()
+    # Copy multi-week.db to a temp file so we can mutate it freely.
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        tmp_path = pathlib.Path(tmp.name)
+    try:
+        shutil.copyfile(FIXTURE_DIR / "multi-week.db", tmp_path)
+        conn = _open(tmp_path)
+        env_a = _build_projects_envelope(
+            conn, now_utc=NOW_UTC, current_week=None, weeks_back=12,
+        )
+        # Insert one new session_entries row. We don't care about the
+        # numeric values — only that MAX(id) advances by 1.
+        conn.execute(
+            "INSERT INTO session_entries "
+            "(source_path, line_offset, timestamp_utc, model, "
+            " input_tokens, output_tokens) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("/tmp/synthetic.jsonl", 0,
+             NOW_UTC.isoformat().replace("+00:00", "Z"),
+             "claude-sonnet-4-5", 100, 100),
+        )
+        conn.commit()
+        env_b = _build_projects_envelope(
+            conn, now_utc=NOW_UTC, current_week=None, weeks_back=12,
+        )
+        assert env_a is not env_b, (
+            "memo MUST invalidate when MAX(session_entries.id) advances"
+        )
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()

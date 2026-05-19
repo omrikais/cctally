@@ -1589,17 +1589,25 @@ five_hour_credit_invariants
 #
 # R-PROJ3: per project (by bucket_path — the canonical ProjectKey
 #          equality key per bin/_cctally_cache.py:188), running
-#          _build_projects_envelope twice produces the same
-#          sum(weekly_cost) for that project. NOT via
-#          `cmd_project --project <pattern>` CLI filter — the substring
-#          filter does NOT reliably round-trip disambiguated display_keys
-#          (Codex F6: filter matches display_key.lower() OR
-#          (git_root or bucket_path).lower() — but the disambiguator's
+#          _build_projects_envelope twice on the same inputs produces the
+#          same sum(weekly_cost) for that project. This is a STABILITY
+#          invariant on the trend matrix — both halves call
+#          _build_projects_envelope (so it does not cross-validate against
+#          a second source; R-PROJ4 is the cross-source check). It exists
+#          to detect drift in the bucket_path identity when re-aggregated,
+#          and to lock in that the matrix sum is keyed on bucket_path
+#          (NOT `cmd_project --project <pattern>` CLI filter — the
+#          substring filter does NOT reliably round-trip disambiguated
+#          display_keys per Codex F6: filter matches display_key.lower()
+#          OR (git_root or bucket_path).lower() — but the disambiguator's
 #          parent-dir suffix is appended AFTER display_key, so a query
 #          for `foo (repos)` may match unrelated `foo` rows).
 #
 # R-PROJ4: /api/project/<key>?weeks=N window_cost_usd equals R-PROJ3's
-#          sum (the endpoint and the trend matrix agree).
+#          sum (the endpoint and the trend matrix agree). This is the
+#          genuine cross-source check: the endpoint walks session_entries
+#          via _project_detail_for_window independently from the trend's
+#          weekly-cost projection.
 #
 # R-PROJ5: re-running _build_projects_envelope with the same inputs is
 #          byte-identical (determinism). The memo cache exercises this
