@@ -17,6 +17,9 @@
 //     trigger element via `document.getElementById(triggerId)`. Callers
 //     pass the SAME string they pass as the 2nd arg of
 //     `dispatch(openShareModal(panel, triggerId))`.
+//   - `dataTestId` (optional) — sets `data-testid=<dataTestId>` on the
+//     button so tests nested inside an enclosing `<section onClick>`
+//     can target the share button directly without a wrapper element.
 import type { MouseEvent } from 'react';
 import type { SharePanelId } from '../share/types';
 
@@ -25,9 +28,10 @@ interface Props {
   panelLabel: string;
   onClick: () => void;
   triggerId?: string;
+  dataTestId?: string;
 }
 
-export function ShareIcon({ panel, panelLabel, onClick, triggerId }: Props) {
+export function ShareIcon({ panel, panelLabel, onClick, triggerId, dataTestId }: Props) {
   // Stop the click from bubbling to the enclosing panel/modal section.
   // Most panels treat any in-section click as "open the panel modal,"
   // so without this guard the share button would also fire the panel
@@ -46,6 +50,7 @@ export function ShareIcon({ panel, panelLabel, onClick, triggerId }: Props) {
       onClick={handleClick}
       title="Share (S)"
       {...(triggerId ? { id: triggerId } : {})}
+      {...(dataTestId ? { 'data-testid': dataTestId } : {})}
     >
       <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
         <path

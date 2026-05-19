@@ -218,16 +218,15 @@ export function ProjectsModal() {
       title={`Projects · last ${windowWeeks}w`}
       accentClass="accent-magenta"
       headerExtras={
-        <span data-testid="share-icon-projects-modal">
-          <ShareIcon
-            panel="projects"
-            panelLabel="Projects"
-            triggerId="projects-modal"
-            onClick={() =>
-              dispatch(openShareModal('projects', 'projects-modal', { windowWeeks }))
-            }
-          />
-        </span>
+        <ShareIcon
+          panel="projects"
+          panelLabel="Projects"
+          triggerId="projects-modal"
+          dataTestId="share-icon-projects-modal"
+          onClick={() =>
+            dispatch(openShareModal('projects', 'projects-modal', { windowWeeks }))
+          }
+        />
       }
     >
       <div className="projects-modal-body">

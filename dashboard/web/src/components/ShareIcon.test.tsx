@@ -57,4 +57,28 @@ describe('<ShareIcon>', () => {
     const btn = screen.getByRole('button', { name: /share weekly report/i });
     expect(btn.hasAttribute('id')).toBe(false);
   });
+
+  // Issue #67 — `dataTestId` is forwarded to the rendered <button> as
+  // `data-testid`, so callers nested inside an enclosing section's
+  // `onClick` (e.g. ProjectsModal) can `screen.getByTestId(...)` the
+  // button directly instead of wrapping ShareIcon in a sentinel <span>.
+  it('renders the optional dataTestId prop as the button data-testid', () => {
+    render(
+      <ShareIcon
+        panel="weekly"
+        panelLabel="Weekly"
+        onClick={() => {}}
+        dataTestId="share-icon-weekly-panel"
+      />,
+    );
+    const btn = screen.getByTestId('share-icon-weekly-panel');
+    expect(btn.tagName).toBe('BUTTON');
+    expect(btn.getAttribute('data-share-panel')).toBe('weekly');
+  });
+
+  it('omits the data-testid attribute when dataTestId is not provided', () => {
+    render(<ShareIcon panel="weekly" panelLabel="Weekly" onClick={() => {}} />);
+    const btn = screen.getByRole('button', { name: /share weekly report/i });
+    expect(btn.hasAttribute('data-testid')).toBe(false);
+  });
 });

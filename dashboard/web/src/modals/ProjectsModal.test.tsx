@@ -329,13 +329,11 @@ describe('<ProjectsModal />', () => {
     dispatch({ type: 'SAVE_PREFS', patch: { projectsWindowWeeks: 8 } });
     updateSnapshot(buildProjectsEnvelope({ windowWeeks: 8 }));
     render(<ProjectsModal />);
-    // ShareIcon doesn't pass data-testid through to its <button>, so we
-    // target the wrapping <span> the modal exposes for testing and
-    // click the contained share button.
-    const wrapper = screen.getByTestId('share-icon-projects-modal');
-    const shareBtn = wrapper.querySelector('button[data-share-panel="projects"]');
-    expect(shareBtn).not.toBeNull();
-    fireEvent.click(shareBtn!);
+    // The share button forwards `dataTestId` directly onto its <button>
+    // (issue #67) so no wrapper element is needed.
+    const shareBtn = screen.getByTestId('share-icon-projects-modal');
+    expect(shareBtn.tagName).toBe('BUTTON');
+    fireEvent.click(shareBtn);
     const share = getState().shareModal;
     expect(share?.panel).toBe('projects');
     expect(share?.params?.windowWeeks).toBe(8);
