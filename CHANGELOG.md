@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-05-19
+
 ### Removed
 - `cctally release` subcommand — maintainer-only release automation moved to private `bin/cctally-release`. End-user npm/brew installs no longer carry release tooling, and `cctally setup` no longer expects a `cctally-release` symlink (stale symlinks from prior versions are auto-cleaned by `cctally setup --install`). The actual release process is unchanged for the maintainer; see `docs/RELEASE.md`.
 
