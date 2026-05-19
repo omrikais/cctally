@@ -119,6 +119,73 @@ class TestCleanupStaleSymlinksRespectsManualLinks:
         assert results == []
         assert (local_bin / "cctally-release").is_symlink()
 
+    def test_legacy_brew_keg_link_removed(self, ns, monkeypatch, tmp_path):
+        """`brew upgrade cctally` keeps the prior keg on disk until
+        ``brew cleanup``. A legacy ``~/.local/bin/cctally-release ->
+        <prefix>/Cellar/cctally/<old>/libexec/bin/cctally-release``
+        therefore still resolves to an existing file under the *old*
+        install root. The foreign-install-root branch of the
+        ``_setup_symlink_is_retired`` predicate must retire it even
+        though the target exists — otherwise the retired command
+        lingers on PATH across brew upgrades, as called out in the
+        round-3 Codex review.
+        """
+        redirect_paths(ns, monkeypatch, tmp_path)
+        local_bin = _make_local_bin(tmp_path)
+        # Build a path that *looks like* a homebrew keg: the
+        # ``/Cellar/cctally/<version>/`` segment is what the predicate
+        # keys on. The file at the end must exist for the test to
+        # cover the foreign-root branch (otherwise the dangling branch
+        # would carry it).
+        old_keg = (
+            tmp_path / "usr" / "local" / "Cellar" / "cctally" / "1.8.2"
+            / "libexec" / "bin"
+        )
+        old_keg.mkdir(parents=True, exist_ok=True)
+        target = old_keg / "cctally-release"
+        target.write_text("#!/bin/sh\n")
+        link = local_bin / "cctally-release"
+        os.symlink(target, link)
+        assert target.exists(), (
+            "test premise: old keg's cctally-release exists on disk"
+        )
+
+        setup = ns["_cctally_setup"]
+        results = setup._setup_cleanup_stale_symlinks(local_bin)
+
+        assert len(results) == 1
+        assert results[0].name == "cctally-release"
+        assert results[0].status == "removed-stale"
+        assert not link.exists() and not link.is_symlink()
+
+    def test_legacy_npm_node_modules_link_removed(self, ns, monkeypatch, tmp_path):
+        """``npm i -g cctally@<new>`` can leave the prior version's
+        ``node_modules/cctally/`` tree on disk. A legacy
+        ``~/.local/bin/cctally-release ->
+        <prefix>/lib/node_modules/cctally/bin/cctally-release`` still
+        resolves to a real file under the *old* npm install. Same
+        foreign-install-root retirement applies.
+        """
+        redirect_paths(ns, monkeypatch, tmp_path)
+        local_bin = _make_local_bin(tmp_path)
+        old_npm = (
+            tmp_path / "usr" / "local" / "lib" / "node_modules" / "cctally"
+            / "bin"
+        )
+        old_npm.mkdir(parents=True, exist_ok=True)
+        target = old_npm / "cctally-release"
+        target.write_text("#!/bin/sh\n")
+        link = local_bin / "cctally-release"
+        os.symlink(target, link)
+        assert target.exists()
+
+        setup = ns["_cctally_setup"]
+        results = setup._setup_cleanup_stale_symlinks(local_bin)
+
+        assert len(results) == 1
+        assert results[0].status == "removed-stale"
+        assert not link.exists() and not link.is_symlink()
+
 
 class TestDetectStaleSymlinksMatchesCleanup:
     """`setup --status`'s detection mirrors install-time cleanup.
@@ -145,6 +212,28 @@ class TestDetectStaleSymlinksMatchesCleanup:
         local_bin = _make_local_bin(tmp_path)
         bogus = tmp_path / "old-checkout" / "bin" / "cctally-release"
         os.symlink(bogus, local_bin / "cctally-release")
+
+        setup = ns["_cctally_setup"]
+        found = setup._setup_detect_stale_symlinks(local_bin)
+
+        assert found == ["cctally-release"]
+
+    def test_legacy_brew_keg_link_flagged_as_stale(self, ns, monkeypatch, tmp_path):
+        """``--status`` must agree with cleanup that a legacy brew-keg
+        link is stale, even though its target exists on disk. Without
+        this, the operator's status report would silently disagree
+        with what the next ``cctally setup`` will remove.
+        """
+        redirect_paths(ns, monkeypatch, tmp_path)
+        local_bin = _make_local_bin(tmp_path)
+        old_keg = (
+            tmp_path / "opt" / "homebrew" / "Cellar" / "cctally" / "1.8.2"
+            / "libexec" / "bin"
+        )
+        old_keg.mkdir(parents=True, exist_ok=True)
+        target = old_keg / "cctally-release"
+        target.write_text("#!/bin/sh\n")
+        os.symlink(target, local_bin / "cctally-release")
 
         setup = ns["_cctally_setup"]
         found = setup._setup_detect_stale_symlinks(local_bin)
@@ -247,3 +336,47 @@ class TestUninstallRemovesLegacyAutoSymlinks:
         assert link.is_symlink(), "unrelated-target link must be preserved"
         captured = capsys.readouterr().out
         assert "Removed 0 symlinks" in captured
+
+    def test_uninstall_removes_legacy_brew_keg_link(
+        self, ns, monkeypatch, tmp_path, capsys,
+    ):
+        """Round-3 follow-up: an upgrader from a pre-v1.9.0 brew install
+        keeps the old keg on disk until ``brew cleanup``. The legacy
+        symlink target therefore exists and is NOT equal to the
+        current install root's expected source, so the round-2
+        ``target == expected`` predicate alone would preserve it.
+        The foreign-install-root branch added in round 3 must retire
+        it.
+        """
+        redirect_paths(ns, monkeypatch, tmp_path)
+        self._pin_settings_io(ns, monkeypatch, tmp_path)
+        local_bin = _make_local_bin(tmp_path)
+        old_keg = (
+            tmp_path / "opt" / "homebrew" / "Cellar" / "cctally" / "1.8.2"
+            / "libexec" / "bin"
+        )
+        old_keg.mkdir(parents=True, exist_ok=True)
+        target = old_keg / "cctally-release"
+        target.write_text("#!/bin/sh\n")
+        link = local_bin / "cctally-release"
+        os.symlink(target, link)
+
+        # Sanity: the predicate the round-2 fix used would have kept
+        # this link, since target != expected.
+        setup = ns["_cctally_setup"]
+        repo_root = setup._setup_resolve_repo_root()
+        expected = setup._setup_resolve_symlink_source(repo_root, "cctally-release")
+        assert target != expected, (
+            "test premise: legacy brew-keg target differs from current "
+            "install's expected source"
+        )
+
+        args = argparse.Namespace(purge=False, yes=False, json=False)
+        rc = setup._setup_uninstall(args)
+
+        assert rc == 0
+        assert not link.exists() and not link.is_symlink(), (
+            "legacy brew-keg link must be removed by --uninstall on upgrade"
+        )
+        captured = capsys.readouterr().out
+        assert "Removed 1 symlinks" in captured

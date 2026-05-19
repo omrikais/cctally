@@ -344,25 +344,38 @@ def _setup_cleanup_stale_symlinks(
     """Unlink stale `cctally-*` symlinks left over from prior versions.
 
     For each entry in :data:`_SETUP_STALE_SYMLINK_NAMES`, removes the
-    matching symlink in ``dst_dir`` **only** when (a) its readlink
-    target basename matches the stale name AND (b) the target is
-    *dangling* — i.e. doesn't resolve to a real file. That second
-    clause is what distinguishes "leftover from a prior install whose
-    checkout has since been deleted/moved" from "intentional manual
-    link a maintainer still uses to keep the retired tool on PATH"
-    (e.g. ``~/.local/bin/cctally-release -> <checkout>/bin/cctally-release``
-    while ``cctally-release`` remains shipped in ``bin/`` but is no
-    longer auto-symlinked by ``cctally setup``). Without the dangling
-    check, basename-only matching would silently delete those
-    intentional links on the next ``cctally setup``.
+    matching symlink in ``dst_dir`` when its readlink target basename
+    matches the stale name AND the target points at a "retired" cctally
+    install — meaning either (a) the target is *dangling* (no longer
+    resolves to a real file, e.g. an old checkout that was deleted) OR
+    (b) the target lives under a *foreign* cctally install root
+    (Homebrew keg, npm ``node_modules/cctally/``), i.e. an install root
+    other than the one currently running ``cctally setup``.
+
+    The foreign-root clause is what handles the common upgrade path:
+    after ``brew upgrade cctally`` or ``npm i -g cctally@<new>``, the
+    *prior* keg / module dir often lingers on disk until ``brew
+    cleanup`` (or the next npm install GC), so a legacy
+    ``~/.local/bin/cctally-release`` symlink from a pre-v1.9.0 ``cctally
+    setup`` still resolves to an existing file under the *old* install
+    root. The dangling-only predicate would skip it, leaving the retired
+    command on PATH; the foreign-root check retires it instead.
+
+    Both clauses still preserve the maintainer's intentional manual
+    link to the *current* checkout's still-shipped retired tooling
+    (e.g. ``~/.local/bin/cctally-release ->
+    <cctally-dev>/bin/cctally-release``) — that target is neither
+    dangling nor foreign, so it's left alone. Likewise a hand-rolled
+    link pointing somewhere unrelated (``~/scripts/...``) survives.
 
     Returns a list of :class:`_SetupSymlinkResult` entries for the
     actions taken (so callers can fold them into install output).
     """
     results: list[_SetupSymlinkResult] = []
+    repo_root = _setup_resolve_repo_root()
     for name in _SETUP_STALE_SYMLINK_NAMES:
         dst = dst_dir / name
-        if not _setup_symlink_is_stale_dangling(dst, name):
+        if not _setup_symlink_is_retired(dst, name, repo_root):
             continue
         try:
             dst.unlink()
@@ -376,17 +389,59 @@ def _setup_cleanup_stale_symlinks(
     return results
 
 
-def _setup_symlink_is_stale_dangling(dst: pathlib.Path, name: str) -> bool:
+# Path tokens that identify a "foreign" cctally install root — i.e. a
+# directory tree managed by a different distribution channel (or a
+# different version of the same channel) than the one currently running
+# ``cctally setup``. A symlink whose target sits under one of these is
+# almost certainly a legacy auto-installed link from a prior version
+# whose install root the current run does NOT manage. Pre-resolved (no
+# trailing slash) so substring matching works on either UNIX or
+# resolved forms.
+_SETUP_FOREIGN_INSTALL_ROOT_TOKENS = (
+    # Homebrew keeps every installed version under
+    # ``<prefix>/Cellar/cctally/<version>/``. A target inside any of
+    # these directories points at a brew install — either the current
+    # one (when ``cctally setup`` runs from a brew install — possible
+    # but rare) or an older keg still on disk pending ``brew cleanup``.
+    "/Cellar/cctally/",
+    # npm globals land at ``<prefix>/lib/node_modules/cctally/``; npm
+    # locals at ``<project>/node_modules/cctally/``. Either way the
+    # ``/node_modules/cctally/`` segment is the discriminator. pnpm and
+    # yarn variants keep the segment, so this catches them too.
+    "/node_modules/cctally/",
+)
+
+
+def _setup_symlink_is_retired(
+    dst: pathlib.Path, name: str, repo_root: pathlib.Path,
+) -> bool:
     """Detection predicate for retired auto-symlinks at install time.
 
     Returns True iff ``dst`` is a symlink, its readlink target basename
-    matches ``name``, AND the target does not resolve to an existing
-    filesystem entry. The dangling clause preserves intentional
-    maintainer-managed links to retired-but-still-shipped tooling (see
-    :func:`_setup_cleanup_stale_symlinks` docstring). Shared by the
-    cleanup site (``_setup_cleanup_stale_symlinks``) and the read-only
-    detection site (``_setup_detect_stale_symlinks``) so ``--status``
-    and ``setup`` agree on what they call "stale".
+    matches ``name``, AND the target points at a "retired" cctally
+    install — i.e. one the current ``cctally setup`` run does not
+    manage. Two retirement classes:
+
+      1. **Dangling target** — readlink target does not resolve to an
+         existing filesystem entry. Covers the deleted-checkout case.
+      2. **Foreign install root** — target path contains one of
+         :data:`_SETUP_FOREIGN_INSTALL_ROOT_TOKENS` (``/Cellar/cctally/``
+         or ``/node_modules/cctally/``) AND that token does NOT also
+         appear in the current ``repo_root``. The second clause is what
+         keeps the (rare) case of running ``cctally setup`` *from* an
+         npm/brew install correctly — a symlink at the same install root
+         is NOT foreign, so it's left to the active-symlinks loop in
+         :func:`_setup_install` / :func:`_setup_uninstall`.
+
+    Targets that exist but live outside any recognized install root
+    (e.g. a maintainer's manual link to ``<checkout>/bin/cctally-release``
+    or a hand-rolled link at ``~/scripts/cctally-release``) are
+    preserved — they're either explicit operator setups or genuine
+    user-managed scripts that happen to share the name.
+
+    Shared by the cleanup site (``_setup_cleanup_stale_symlinks``) and
+    the read-only detection site (``_setup_detect_stale_symlinks``) so
+    ``--status`` and ``setup`` agree on what they call "stale".
     """
     if not dst.is_symlink():
         return False
@@ -406,10 +461,23 @@ def _setup_symlink_is_stale_dangling(dst: pathlib.Path, name: str) -> bool:
     if not target_path.is_absolute():
         target_path = dst.parent / target_path
     try:
-        return not target_path.exists()
+        target_exists = target_path.exists()
     except OSError:
         # Permission errors etc. — be conservative and don't remove.
         return False
+    if not target_exists:
+        return True
+    # Target exists — retire only if it lives under a *foreign* install
+    # root (a different brew keg / npm module dir than the one running
+    # this setup). Compare against ``repo_root`` so a setup running
+    # *from* an npm/brew install doesn't classify its own siblings as
+    # foreign — that's the active-symlinks loop's job.
+    target_str = str(target_path)
+    repo_root_str = str(repo_root)
+    for token in _SETUP_FOREIGN_INSTALL_ROOT_TOKENS:
+        if token in target_str and token not in repo_root_str:
+            return True
+    return False
 
 
 def _setup_path_includes_local_bin() -> bool:
@@ -906,19 +974,23 @@ def _setup_detect_stale_symlinks(dst_dir: pathlib.Path) -> list[str]:
     """Return names of stale-but-still-present cctally symlinks in ``dst_dir``.
 
     Mirrors :func:`_setup_cleanup_stale_symlinks` detection (without
-    removing): a symlink is "stale" only when its name appears in
+    removing): a symlink is "stale" when its name appears in
     :data:`_SETUP_STALE_SYMLINK_NAMES`, its readlink target basename
-    matches that name, AND the target is dangling (no longer resolves
-    to a real file). Routing through
-    :func:`_setup_symlink_is_stale_dangling` keeps ``--status`` and
-    ``setup`` in lockstep so a manually-maintained link to a still-
-    shipped retired tool (``~/.local/bin/cctally-release -> <checkout>/
-    bin/cctally-release``) is neither reported as stale nor removed.
+    matches that name, AND the target is "retired" — either dangling
+    OR pointing at a foreign cctally install root (see
+    :func:`_setup_symlink_is_retired`). Routing through the same
+    predicate keeps ``--status`` and ``setup`` in lockstep so a
+    manually-maintained link to a still-shipped retired tool
+    (``~/.local/bin/cctally-release -> <checkout>/bin/cctally-release``)
+    is neither reported as stale nor removed, while a legacy link left
+    over from a pre-v1.9.0 brew/npm install (target still resolves into
+    the old keg / ``node_modules`` tree) IS retired.
     """
     found: list[str] = []
+    repo_root = _setup_resolve_repo_root()
     for name in _SETUP_STALE_SYMLINK_NAMES:
         dst = dst_dir / name
-        if _setup_symlink_is_stale_dangling(dst, name):
+        if _setup_symlink_is_retired(dst, name, repo_root):
             found.append(name)
     return found
 
@@ -1069,12 +1141,25 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
     # :data:`_SETUP_STALE_SYMLINK_NAMES`). Without this loop, an
     # upgrader who ran ``cctally setup`` on a prior version and now runs
     # ``cctally setup --uninstall`` would keep e.g.
-    # ``~/.local/bin/cctally-release`` on PATH — typically as a
-    # dangling symlink once their old checkout is gone. Predicate
-    # mirrors the active-symlink loop above (``target == expected``)
-    # so a maintainer's hand-rolled link pointing somewhere unrelated
-    # is preserved; only links the prior ``cctally setup`` itself would
-    # have installed are removed.
+    # ``~/.local/bin/cctally-release`` on PATH.
+    #
+    # Two removal predicates compose here:
+    #   1. ``target == _setup_resolve_symlink_source(repo_root, name)``
+    #      — the legacy auto-installed link points at *this* install
+    #      root's binary (the common case for git-checkout upgraders
+    #      who ran ``cctally setup`` on a prior version, then ``git
+    #      pull``ed; symmetric with how the active-symlink loop above
+    #      treats user-pointed `cctally` itself).
+    #   2. ``_setup_symlink_is_retired`` — target is dangling OR lives
+    #      under a *foreign* cctally install root (old brew keg /
+    #      ``node_modules/cctally/`` left behind by ``brew upgrade``
+    #      or ``npm i -g cctally@<new>``). Without this, the common
+    #      brew/npm upgrade-then-uninstall path leaves the legacy
+    #      symlink in place because the prior keg's binary still
+    #      exists on disk (``target != expected``).
+    #
+    # A maintainer's hand-rolled link pointing somewhere unrelated
+    # (``~/scripts/...``) is preserved by both predicates.
     for name in _SETUP_STALE_SYMLINK_NAMES:
         dst = dst_dir / name
         if not dst.is_symlink():
@@ -1084,7 +1169,11 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
         except OSError:
             continue
         expected = _setup_resolve_symlink_source(repo_root, name)
-        if target != expected:
+        should_remove = (
+            target == expected
+            or _setup_symlink_is_retired(dst, name, repo_root)
+        )
+        if not should_remove:
             continue
         try:
             dst.unlink()
