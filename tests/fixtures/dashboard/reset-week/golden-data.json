@@ -766,14 +766,14 @@
     "current_week": {
       "rows": [
         {
-          "attributed_pct": 37.94729542302358,
+          "attributed_pct": 3.1622746185852986,
           "bucket_path": "/fake/repos/alpha",
           "cost_usd": 4.56,
           "key": "alpha",
           "sessions_count": 4
         },
         {
-          "attributed_pct": 22.052704576976424,
+          "attributed_pct": 1.837725381414702,
           "bucket_path": "/fake/repos/fixture-demo",
           "cost_usd": 2.65,
           "key": "fixture-demo",
@@ -823,7 +823,7 @@
             null,
             38.0,
             null,
-            37.94729542302358
+            3.1622746185852986
           ]
         },
         {
@@ -901,7 +901,7 @@
             null,
             null,
             null,
-            22.052704576976424
+            1.837725381414702
           ]
         }
       ],
@@ -932,7 +932,7 @@
         },
         {
           "total_cost_usd": 7.209999999999999,
-          "total_pct": 60.0,
+          "total_pct": 5.0,
           "week_label": "wk Apr 13",
           "week_start_date": "2026-04-13"
         }

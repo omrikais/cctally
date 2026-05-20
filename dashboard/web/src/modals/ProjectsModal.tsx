@@ -223,20 +223,58 @@ export function ProjectsModal() {
   // for not needing refs for every captured value (its docstring
   // explicitly allows this trade-off). `0` maps to 12w by convention
   // (`0` reads as "max").
+  //
+  // Every binding gates on `isProjectsTopmost()` — when the share /
+  // composer overlay is layered above ProjectsModal, those surfaces only
+  // register Escape at `overlay` scope, so single-char keys (1/4/8/0/s)
+  // and named keys (ArrowUp/ArrowDown/Enter) would otherwise fall
+  // through to these `modal`-scope bindings and silently mutate the
+  // hidden Projects state under the overlay. The gate keeps the user's
+  // share-view stable until they dismiss the overlay.
+  //
+  // We deliberately do NOT add `openModal === 'projects'` here because
+  // ProjectsModal mounts only via ModalRoot when `openModal` is already
+  // `'projects'`, so the component's mount-lifetime guarantees that;
+  // adding the check would also break component-in-isolation unit tests
+  // that render <ProjectsModal /> without dispatching OPEN_MODAL.
+  const isProjectsTopmost = (): boolean =>
+    getState().shareModal === null && getState().composerModal === null;
   useKeymap([
-    { key: '1', scope: 'modal', action: () => savePref('projectsWindowWeeks', 1) },
-    { key: '4', scope: 'modal', action: () => savePref('projectsWindowWeeks', 4) },
-    { key: '8', scope: 'modal', action: () => savePref('projectsWindowWeeks', 8) },
-    { key: '0', scope: 'modal', action: () => savePref('projectsWindowWeeks', 12) },
+    {
+      key: '1',
+      scope: 'modal',
+      when: isProjectsTopmost,
+      action: () => savePref('projectsWindowWeeks', 1),
+    },
+    {
+      key: '4',
+      scope: 'modal',
+      when: isProjectsTopmost,
+      action: () => savePref('projectsWindowWeeks', 4),
+    },
+    {
+      key: '8',
+      scope: 'modal',
+      when: isProjectsTopmost,
+      action: () => savePref('projectsWindowWeeks', 8),
+    },
+    {
+      key: '0',
+      scope: 'modal',
+      when: isProjectsTopmost,
+      action: () => savePref('projectsWindowWeeks', 12),
+    },
     {
       key: 's',
       scope: 'modal',
+      when: isProjectsTopmost,
       action: () =>
         savePref('projectsTrendYMode', yMode === 'share' ? 'absolute' : 'share'),
     },
     {
       key: 'ArrowUp',
       scope: 'modal',
+      when: isProjectsTopmost,
       action: () => {
         if (visibleRows.length === 0) return;
         const idx = visibleRows.findIndex((r) => r.key === selectedKey);
@@ -247,6 +285,7 @@ export function ProjectsModal() {
     {
       key: 'ArrowDown',
       scope: 'modal',
+      when: isProjectsTopmost,
       action: () => {
         if (visibleRows.length === 0) return;
         const idx = visibleRows.findIndex((r) => r.key === selectedKey);
@@ -257,6 +296,7 @@ export function ProjectsModal() {
     {
       key: 'Enter',
       scope: 'modal',
+      when: isProjectsTopmost,
       action: () => {
         if (selectedKey) {
           setSelectedKey(null);

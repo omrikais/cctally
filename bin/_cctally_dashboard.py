@@ -2711,12 +2711,26 @@ def _build_projects_envelope(
     # weekly_percent keyed by week_start (UTC datetime, Monday). We
     # match on `week_start_date` (date-only) since that's the canonical
     # cross-table key per the CLAUDE.md weekly handling notes.
+    #
+    # We use the LATEST snapshot per week_start_date — NOT MAX — because
+    # the "weekly_percent is monotonic within a week" invariant breaks
+    # on weeks that receive an in-place credit (see CLAUDE.md "In-place
+    # 5h credit" / `week_reset_events` notes). MAX would lock attribution
+    # to the pre-credit high-water mark even after Anthropic credits the
+    # week back down, overstating Used % on the Projects panel/modal
+    # forever. The "latest row" pattern matches `_select_last_known_snapshot`
+    # (bin/cctally:1162-1168) and the doctor credited-week check
+    # (bin/cctally:8706-8714).
+    #
+    # Portable per-key-latest pattern: read rows ordered by capture-
+    # ascending and let later rows overwrite. The final value per key
+    # is the most-recent snapshot.
     weekly_pct_by_week: dict[dt.datetime, float] = {}
     try:
         cur = conn.execute(
-            "SELECT week_start_date, MAX(weekly_percent) "
+            "SELECT week_start_date, weekly_percent "
             "FROM weekly_usage_snapshots "
-            "GROUP BY week_start_date"
+            "ORDER BY captured_at_utc ASC, id ASC"
         )
         rows = cur.fetchall()
     except sqlite3.OperationalError:
@@ -3171,11 +3185,24 @@ def _project_detail_for_window(
         })
 
     # window_attributed_pct: prefer the trend projection (already
-    # computed correctly). Sum across weeks; None when all weeks lack
+    # computed correctly). Sum across weeks within the requested
+    # ``weeks_back`` window; None when all contributing weeks lack
     # snapshots.
+    #
+    # IMPORTANT: when the HTTP path reuses ``snap.projects_envelope``
+    # (built by the sync thread with ``weeks_back=12``),
+    # ``matching_trend["weekly_pct"]`` is always a 12-element array even
+    # when the drill is requested with ``?weeks=1|4|8``. Slice to the
+    # trailing ``weeks_back`` entries — same pattern as
+    # ``snapshot_to_share_envelope`` at line 1629 — so the answer doesn't
+    # depend on whether the envelope was rebuilt or reused.
     win_pct: "float | None" = None
     if matching_trend is not None:
-        wp = [p for p in matching_trend["weekly_pct"] if p is not None]
+        weekly_pct_arr = matching_trend.get("weekly_pct") or []
+        n = len(weekly_pct_arr)
+        take = min(weeks_back, n) if n > 0 else 0
+        sliced = weekly_pct_arr[-take:] if take > 0 else []
+        wp = [p for p in sliced if p is not None]
         if wp:
             win_pct = sum(wp)
 
