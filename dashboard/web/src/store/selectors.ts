@@ -42,15 +42,21 @@ export function sessionComparator(key: SessionSortKey | string): (a: SessionRow,
   }
 }
 
-// Single case-insensitive substring match against project OR model.
-// Whitespace inside the needle is a literal char (so "node runner" works),
-// not a token separator. Empty needle returns rows untouched.
+// Single case-insensitive substring match against project, disambiguated
+// project_key, OR model. Whitespace inside the needle is a literal char
+// (so "node runner" works), not a token separator. Empty needle returns
+// rows untouched. `project_key` is in the haystack so that
+// SessionsPanel's "Show in Sessions" cross-nav (which dispatches
+// `SET_FILTER { text: data.key }`) hits when two projects collide on
+// basename — the disambiguated form (e.g. `"foo (repos)"`) lives on
+// `project_key`, not `project`.
 export function applySessionFilter(rows: SessionRow[], text: string): SessionRow[] {
   const t = (text || '').toLowerCase();
   if (!t) return rows;
   return rows.filter(
     (r) =>
       (r.project || '').toLowerCase().includes(t) ||
+      (r.project_key || '').toLowerCase().includes(t) ||
       (r.model || '').toLowerCase().includes(t),
   );
 }
@@ -72,7 +78,18 @@ export function formatRowHaystack(r: SessionRow, ctx: FmtCtx = FALLBACK_FMT_CTX)
     : '';
   const dur = r.duration_min != null ? `${r.duration_min}m` : '';
   const cost = r.cost_usd != null ? `$${r.cost_usd.toFixed(2)}` : '';
-  return [started === '—' ? '' : started, dur, r.model || '', r.project || '', cost]
+  // `project_key` is included so search (`/`) matches the disambiguated
+  // key the same way `applySessionFilter` does — e.g. `"foo (repos)"`
+  // when two projects collide on basename. Stable ordering: started, dur,
+  // model, project, project_key, cost.
+  return [
+    started === '—' ? '' : started,
+    dur,
+    r.model || '',
+    r.project || '',
+    r.project_key || '',
+    cost,
+  ]
     .join(' ')
     .toLowerCase();
 }

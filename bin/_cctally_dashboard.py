@@ -2549,12 +2549,25 @@ def _build_projects_envelope(
     c = _cctally()
 
     # ---- Pre-probe gate / memoization (spec §6.4) -----------------------
+    # `attributed_pct` and trend `total_pct` are functions of
+    # `weekly_usage_snapshots.weekly_percent`, which the throttled OAuth
+    # refresh path can advance between session_entries writes. Probe
+    # `MAX(weekly_usage_snapshots.id)` so the memo invalidates on that
+    # surface too (mirrors the operational-error guard the attribution
+    # SELECT uses below).
     cur = conn.execute("SELECT COALESCE(MAX(id), 0) FROM session_entries")
     max_id = cur.fetchone()[0]
+    try:
+        cur = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM weekly_usage_snapshots"
+        )
+        max_wus_id = cur.fetchone()[0]
+    except sqlite3.OperationalError:
+        max_wus_id = 0
     cw_key: "dt.datetime | None" = None
     if current_week is not None:
         cw_key = getattr(current_week, "week_start_at", None)
-    memo_key = (max_id, cw_key, weeks_back)
+    memo_key = (max_id, max_wus_id, cw_key, weeks_back)
     cached = _PROJECTS_ENV_MEMO.get("value")
     if cached is not None and _PROJECTS_ENV_MEMO.get("key") == memo_key:
         return cached
@@ -2611,6 +2624,15 @@ def _build_projects_envelope(
             return None
         return wstart
 
+    # Orphan handling: `_projects_iter_session_entries` LEFT JOINs
+    # `session_files` so entries whose source_path has no
+    # `session_files` row return `project_path = NULL`. Below,
+    # `_resolve_project_key(None, ...)` maps that to the
+    # `(unknown)` bucket — same identity the drill-down's explicit
+    # orphan scan in `_project_detail_for_window` (see the
+    # ``if unknown_bucket:`` branch around the
+    # `orphan_cur` SELECT) collects via a NULL-side LEFT JOIN. The
+    # two paths converge on the same `(unknown)` source_path set.
     for row in _projects_iter_session_entries(
         conn, since=since_dt, until=until_dt,
     ):
@@ -2954,6 +2976,15 @@ def _project_detail_for_window(
         # row at all LEFT-JOIN to NULL project_path → resolve to
         # ``(unknown)`` via _resolve_project_key. session_files-only
         # scan misses those.
+        #
+        # This explicit orphan scan is the drill-down's mirror of the
+        # envelope's implicit orphan path: the envelope walk in
+        # `_build_projects_envelope` (see the `_projects_iter_session_entries`
+        # loop above) routes the same orphan source_paths through the
+        # LEFT-JOIN→NULL→`_resolve_project_key(None, ...)` chain into the
+        # ``(unknown)`` bucket. Both surfaces converge on the same
+        # source_path set so envelope row counts/costs and drill row
+        # counts/costs reconcile.
         orphan_cur = conn.execute(
             "SELECT DISTINCT e.source_path "
             "FROM session_entries e "

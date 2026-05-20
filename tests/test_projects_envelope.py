@@ -277,3 +277,48 @@ def test_memo_invalidates_on_new_session_entry():
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
+
+
+def test_memo_invalidates_on_new_weekly_usage_snapshot():
+    """A new row in `weekly_usage_snapshots` bumps `MAX(id)` → memo MUST
+    miss so attributed_pct / trend total_pct reflect the fresh
+    weekly_percent. Regression for code-review Fix 3: the throttled OAuth
+    refresh path advances weekly_percent independently from
+    session_entries writes; previously the memo only probed
+    session_entries.MAX(id) and served stale attribution.
+    """
+    import shutil
+    import tempfile
+
+    _cctally_dashboard._projects_reset_memo()
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        tmp_path = pathlib.Path(tmp.name)
+    try:
+        shutil.copyfile(FIXTURE_DIR / "multi-week.db", tmp_path)
+        conn = _open(tmp_path)
+        env_a = _build_projects_envelope(
+            conn, now_utc=NOW_UTC, current_week=None, weeks_back=12,
+        )
+        # Insert a synthetic weekly_usage_snapshots row. Match the
+        # columns that exist in the fixture schema (table is shared with
+        # the live DB shape; we only need MAX(id) to advance).
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(week_start_date, week_end_date, captured_at_utc, "
+            " weekly_percent) "
+            "VALUES (?, ?, ?, ?)",
+            ("2026-05-18", "2026-05-25",
+             NOW_UTC.isoformat().replace("+00:00", "Z"),
+             42.0),
+        )
+        conn.commit()
+        env_b = _build_projects_envelope(
+            conn, now_utc=NOW_UTC, current_week=None, weeks_back=12,
+        )
+        assert env_a is not env_b, (
+            "memo MUST invalidate when MAX(weekly_usage_snapshots.id) "
+            "advances (code-review Fix 3)"
+        )
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()

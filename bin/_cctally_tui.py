@@ -2068,6 +2068,15 @@ def _tui_build_snapshot(
         # row so the SessionsPanel → ProjectsModal cross-nav (spec §4.1)
         # routes by the same identity the Projects envelope emits.
         # Cheap dict-lookup per row; no second aggregation pass.
+        #
+        # `key_by_bucket_path` is indexed by git-root bucket_path (the
+        # envelope builder calls `_resolve_project_key(..., "git-root")`
+        # in `_build_projects_envelope`), but `srow.project_path` is the
+        # raw cwd from `_aggregate_claude_sessions` — typically a
+        # subdirectory of the repo root for monorepo sessions. We must
+        # resolve each cwd through the same production resolver so the
+        # lookup hits; otherwise `project_key` stays None and the
+        # cross-nav button degrades to plain text.
         if projects_envelope_block is not None:
             try:
                 key_by_bucket_path: dict[str, str] = {}
@@ -2085,11 +2094,16 @@ def _tui_build_snapshot(
                     k = r.get("key")
                     if bp and k and bp not in key_by_bucket_path:
                         key_by_bucket_path[bp] = k
+                _resolve = _cctally()._resolve_project_key
+                resolver_cache: dict = {}
                 annotated: list[TuiSessionRow] = []
                 for srow in sessions:
                     pkey = None
                     if srow.project_path:
-                        pkey = key_by_bucket_path.get(srow.project_path)
+                        bp = _resolve(
+                            srow.project_path, "git-root", resolver_cache,
+                        ).bucket_path
+                        pkey = key_by_bucket_path.get(bp)
                     if pkey is None:
                         annotated.append(srow)
                     else:
