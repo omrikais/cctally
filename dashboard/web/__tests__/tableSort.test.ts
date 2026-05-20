@@ -46,6 +46,41 @@ describe('applyTableSort', () => {
     applyTableSort(ROWS, COLS, { column: 'n', direction: 'desc' });
     expect(ROWS).toEqual(copy);
   });
+
+  // Regression — Codex round 1 finding #2. A column with `nullKey` must
+  // park null-valued rows at the END for BOTH directions. Naïve "return
+  // 1/-1 from compare" breaks under desc because `applyTableSort`
+  // multiplies the comparator's return by sign.
+  describe('nullKey parks null rows at the end regardless of direction', () => {
+    interface NRow { id: string; v: number | null }
+    const NCOLS: TableColumn<NRow>[] = [
+      {
+        id: 'v',
+        label: 'V',
+        defaultDirection: 'desc',
+        numeric: true,
+        nullKey: (r) => r.v,
+        compare: (a, b) => (a.v as number) - (b.v as number),
+      },
+    ];
+    const NROWS: NRow[] = [
+      { id: 'a', v: 10 },
+      { id: 'b', v: null },
+      { id: 'c', v: 30 },
+      { id: 'd', v: null },
+      { id: 'e', v: 20 },
+    ];
+
+    it('desc: non-null rows sorted high→low, nulls at the bottom', () => {
+      const out = applyTableSort(NROWS, NCOLS, { column: 'v', direction: 'desc' });
+      expect(out.map((r) => r.id)).toEqual(['c', 'e', 'a', 'b', 'd']);
+    });
+
+    it('asc: non-null rows sorted low→high, nulls at the bottom', () => {
+      const out = applyTableSort(NROWS, NCOLS, { column: 'v', direction: 'asc' });
+      expect(out.map((r) => r.id)).toEqual(['a', 'e', 'c', 'b', 'd']);
+    });
+  });
 });
 
 describe('nextSortOverride', () => {

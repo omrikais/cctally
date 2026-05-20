@@ -1588,14 +1588,17 @@ def _build_projects_share_panel_data(options: dict,
     cw = env.get("current_week", {}) or {}
     trend = env.get("trend", {}) or {}
 
-    # Compute window bounds: cw_start - (weeks_back - 1) × 7d → cw_end.
-    cw_start_iso = cw.get("week_start_at") or _share_now_utc_iso()
-    cw_start = parse_iso_datetime(cw_start_iso, "projects.cw_start")
-    period_end = cw_start + dt.timedelta(days=7)
-    period_start = cw_start - dt.timedelta(days=7 * (weeks_back - 1))
-
+    # `effective_weeks` is the actual number of weeks of data the artifact
+    # represents. For the 1-week (panel) path it's always 1. For multi-week
+    # (modal) the trend envelope may carry fewer weeks than requested on
+    # thin-history dashboards (fresh installs, post-rebuild), so clamp to
+    # whatever history exists — otherwise the share artifact would label
+    # itself "Last 12 weeks" and render a 12-week date range while only
+    # (say) 3 weeks of rows were aggregated. The period bounds and the
+    # `window_weeks` returned downstream both ride on `effective_weeks`.
     rows: list[dict]
     if weeks_back == 1:
+        effective_weeks = 1
         rows = [
             {
                 "key":            r["key"],
@@ -1615,6 +1618,10 @@ def _build_projects_share_panel_data(options: dict,
         # The trend window is already clamped to <= 12; we take the
         # trailing `weeks_back` slices.
         take = min(weeks_back, n_weeks)
+        # On a brand-new dashboard with zero trend weeks, fall back to a
+        # single-week (current_week) period so the artifact's labelling
+        # still names a real range instead of "Last 0 weeks".
+        effective_weeks = max(1, take)
         rows = []
         running_total = 0.0
         for tp in trend.get("projects") or []:
@@ -1640,12 +1647,19 @@ def _build_projects_share_panel_data(options: dict,
         rows.sort(key=lambda r: (-r["cost_usd"], r["key"]))
         total_cost = running_total
 
+    # Compute window bounds from the *effective* span — see the
+    # `effective_weeks` note above.
+    cw_start_iso = cw.get("week_start_at") or _share_now_utc_iso()
+    cw_start = parse_iso_datetime(cw_start_iso, "projects.cw_start")
+    period_end = cw_start + dt.timedelta(days=7)
+    period_start = cw_start - dt.timedelta(days=7 * (effective_weeks - 1))
+
     return {
         "rows":           rows,
         "total_cost_usd": total_cost,
         "period_start":   period_start,
         "period_end":     period_end,
-        "window_weeks":   weeks_back,
+        "window_weeks":   effective_weeks,
     }
 
 

@@ -11,6 +11,15 @@ export interface TableColumn<T> {
   className?: string;
   numeric?: boolean;
   sortable?: boolean;
+  // Optional null-detection hook. When present, `applyTableSort` parks
+  // rows whose `nullKey(row)` is null/undefined at the END of the result
+  // unconditionally — regardless of asc/desc direction. The column's
+  // `compare` is only invoked for two non-null rows, so per-column
+  // comparators don't need to (and must not) re-implement null-last
+  // semantics: doing it in `compare` breaks under `desc` because
+  // `applyTableSort` flips the comparator's return via `sign`, which
+  // would flip the null parking too.
+  nullKey?: (row: T) => unknown;
 }
 
 export function applyTableSort<T>(
@@ -22,7 +31,20 @@ export function applyTableSort<T>(
   const col = columns.find((c) => c.id === override.column);
   if (!col) return rows;
   const sign = override.direction === 'desc' ? -1 : 1;
-  return rows.slice().sort((a, b) => sign * col.compare(a, b));
+  const nullKey = col.nullKey;
+  return rows.slice().sort((a, b) => {
+    if (nullKey) {
+      const an = nullKey(a) == null;
+      const bn = nullKey(b) == null;
+      // Null parking is direction-invariant — both directions place
+      // null values after non-null. The non-null branch falls through
+      // to the signed comparator below.
+      if (an && bn) return 0;
+      if (an) return 1;
+      if (bn) return -1;
+    }
+    return sign * col.compare(a, b);
+  });
 }
 
 // 3-state click cycle. Clicking a column header cycles:

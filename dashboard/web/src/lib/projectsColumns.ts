@@ -21,16 +21,14 @@ export interface ProjectsTableRow {
   shareOfWindow: number | null;
 }
 
-// Null-safe comparator helpers. nullsLast puts unknown values at the END
-// regardless of sort direction (matches the rendered "—" affordance — a
-// missing first_seen / last_seen / windowPct shouldn't jump to the top of
-// either direction).
-const nullsLast = (a: number | string | null, b: number | string | null): number | null => {
-  if (a == null && b == null) return 0;
-  if (a == null) return 1;
-  if (b == null) return -1;
-  return null;
-};
+// Null-last semantics live on `TableColumn.nullKey` (see lib/tableSort.ts).
+// Columns whose value can be null/undefined declare a `nullKey` extractor
+// and `applyTableSort` parks those rows at the END regardless of asc/desc.
+// The column's `compare` only runs for two non-null rows, so we can safely
+// `!`-assert the non-null fields inside `compare`. Doing null-last inside
+// `compare` is broken: `applyTableSort` flips the comparator under desc,
+// which flips the null parking too — that is the regression this layout
+// is designed to prevent (Codex round 1).
 const cmpStr = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 // Spec §3.4 default directions (per the table — "Sort" column):
@@ -55,22 +53,16 @@ export const PROJECTS_COLUMNS: TableColumn<ProjectsTableRow>[] = [
     id: 'first_seen',
     label: 'First seen',
     defaultDirection: 'asc',
-    compare: (a, b) => {
-      const n = nullsLast(a.firstSeenAt, b.firstSeenAt);
-      if (n != null) return n;
-      return cmpStr(a.firstSeenAt!, b.firstSeenAt!);
-    },
+    nullKey: (r) => r.firstSeenAt,
+    compare: (a, b) => cmpStr(a.firstSeenAt!, b.firstSeenAt!),
     className: 'started',
   },
   {
     id: 'last_seen',
     label: 'Last seen',
     defaultDirection: 'desc',
-    compare: (a, b) => {
-      const n = nullsLast(a.lastSeenAt, b.lastSeenAt);
-      if (n != null) return n;
-      return cmpStr(a.lastSeenAt!, b.lastSeenAt!);
-    },
+    nullKey: (r) => r.lastSeenAt,
+    compare: (a, b) => cmpStr(a.lastSeenAt!, b.lastSeenAt!),
     className: 'started',
   },
   {
@@ -85,21 +77,15 @@ export const PROJECTS_COLUMNS: TableColumn<ProjectsTableRow>[] = [
     label: 'Used %',
     defaultDirection: 'desc',
     numeric: true,
-    compare: (a, b) => {
-      const n = nullsLast(a.windowPct, b.windowPct);
-      if (n != null) return n;
-      return a.windowPct! - b.windowPct!;
-    },
+    nullKey: (r) => r.windowPct,
+    compare: (a, b) => a.windowPct! - b.windowPct!,
   },
   {
     id: 'share_of_window',
     label: '% of week',
     defaultDirection: 'desc',
     numeric: true,
-    compare: (a, b) => {
-      const n = nullsLast(a.shareOfWindow, b.shareOfWindow);
-      if (n != null) return n;
-      return a.shareOfWindow! - b.shareOfWindow!;
-    },
+    nullKey: (r) => r.shareOfWindow,
+    compare: (a, b) => a.shareOfWindow! - b.shareOfWindow!,
   },
 ];
