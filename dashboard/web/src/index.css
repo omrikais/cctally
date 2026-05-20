@@ -3971,10 +3971,11 @@ mark.current {
 }
 .drill-show-in-sessions:hover { color: var(--accent-magenta); }
 
-/* Issue #73: mobile (≤640px) ProjectsModal — stacked-card reflow,
- * sort cycle pill, and trend-chart legend clamp. The `<table>` stays
- * in markup; we reflow `tr` into a flex card via display rules, the
- * same pattern .sess-table uses for SessionsPanel on mobile.
+/* Issues #73 + #74: mobile (≤640px) ProjectsModal — stacked-card
+ * reflow, sort cycle pill (#73), and horizontal-scroll trend-chart
+ * legend (#74; replaces #73's interim 2-line clamp). The `<table>`
+ * stays in markup; we reflow `tr` into a flex card via display rules,
+ * the same pattern .sess-table uses for SessionsPanel on mobile.
  * Specificity prefix `#root` per the id-selector-specificity-floor
  * memory — must outrank the desktop `#root .projects-table` chain
  * defined at index.css:3817+. */
