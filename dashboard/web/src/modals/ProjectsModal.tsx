@@ -38,17 +38,22 @@ import { costClass } from '../lib/cost';
 import { applyTableSort } from '../lib/tableSort';
 import { PROJECTS_COLUMNS, type ProjectsTableRow } from '../lib/projectsColumns';
 
-// Mobile sort-cycle pill (≤640w). Mirrors PROJECTS_COLUMNS ids so
-// applyTableSort + persisted override (`prefs.projectsSortOverride`)
-// route through the same path as the desktop SortableHeader. Order
-// matches spec §1.4: cost desc → sessions desc → used desc → share
-// desc → first desc → last desc → project asc → cost desc.
+// Mobile sort-cycle pill (≤640w). Mirrors PROJECTS_COLUMNS ids and
+// their `defaultDirection`s (see lib/projectsColumns.ts) so:
+//   (a) applyTableSort + persisted override (`prefs.projectsSortOverride`)
+//       route through the same path as the desktop SortableHeader, and
+//   (b) a persisted desktop sort (e.g. first_seen asc) is representable
+//       in the mobile cycle's `findIndex` lookup — without this, a row
+//       persisted with the column's default direction would silently
+//       fall back to cost-desc on the first tap on mobile.
+// Order matches spec §1.4: cost desc → sessions desc → used desc →
+// share desc → first asc → last desc → project asc → cost desc.
 const PROJECTS_MOBILE_SORT_CYCLE = [
   { column: 'cost',            direction: 'desc', label: 'cost',     arrow: '↓' },
   { column: 'sessions',        direction: 'desc', label: 'sessions', arrow: '↓' },
   { column: 'used_pct',        direction: 'desc', label: 'used',     arrow: '↓' },
   { column: 'share_of_window', direction: 'desc', label: 'share',    arrow: '↓' },
-  { column: 'first_seen',      direction: 'desc', label: 'first',    arrow: '↓' },
+  { column: 'first_seen',      direction: 'asc',  label: 'first',    arrow: '↑' },
   { column: 'last_seen',       direction: 'desc', label: 'last',     arrow: '↓' },
   { column: 'project',         direction: 'asc',  label: 'project',  arrow: '↑' },
 ] as const;
@@ -96,6 +101,30 @@ export function ProjectsModal() {
     // the user's manual click-to-toggle interaction.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectKey, env?.projects?.current_week?.rows]);
+
+  // Visible-set fallback: when the persisted `selectedKey` references a
+  // project that is no longer in the current trend rows (cross-nav from
+  // an older Sessions row, or narrowing the window after selecting an
+  // older project), the drill would render against a row that doesn't
+  // exist — endpoint 404s on desktop, blank inline anchor on mobile.
+  // Re-fall back to the leader (or clear) so the drill always points at
+  // a real row. Cross-nav (`projectKey` set) takes priority above and
+  // returns early before this branch runs.
+  useEffect(() => {
+    if (projectKey) return;
+    if (!selectedKey) return;
+    const trendRows = env?.projects?.trend?.projects ?? [];
+    const presentInTrend = trendRows.some((p) => p.key === selectedKey);
+    if (presentInTrend) return;
+    const leader = env?.projects?.current_week?.rows?.[0]?.key ?? null;
+    setSelectedKey(leader);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    projectKey,
+    selectedKey,
+    env?.projects?.trend?.projects,
+    env?.projects?.current_week?.rows,
+  ]);
 
   const trend = env?.projects?.trend ?? null;
   const requested = windowWeeks;

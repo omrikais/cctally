@@ -17,7 +17,20 @@ from __future__ import annotations
 import datetime as dt
 from types import SimpleNamespace
 
+import pytest
+
 from conftest import load_script
+
+
+# `_build_projects_share_panel_data` now clips `period_end` to
+# min(cw_start + 7d, _share_now_utc()) — week-to-date semantics, per
+# Codex review 2026-05-20 finding #3. Pin `CCTALLY_AS_OF` past the
+# fixture's `cw_start + 7d` (2026-05-25) so each test sees the
+# "post-reset" branch and period_end stays at `cw_start + 7d` — that
+# is the pre-clip behavior these clamp tests assert against.
+@pytest.fixture(autouse=True)
+def _pin_share_now_after_week_end(monkeypatch):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-01T00:00:00Z")
 
 
 def _make_snap(ns, envelope: dict) -> object:
@@ -134,4 +147,48 @@ def test_panel_window_weeks_1_unaffected(monkeypatch, tmp_path):
     assert out["window_weeks"] == 1
     cw_start = dt.datetime(2026, 5, 18, tzinfo=dt.timezone.utc)
     assert out["period_start"] == cw_start
+    assert out["period_end"] == cw_start + dt.timedelta(days=7)
+
+
+# --- mid-week period_end clip (Codex review 2026-05-20 finding #3) ---
+
+
+def test_period_end_clipped_to_now_when_mid_week(monkeypatch, tmp_path):
+    """Mid-week exports must NOT advertise the next reset as `period_end`.
+
+    The rows in projects panel_data are week-to-date — `current_week.rows`
+    are aggregated through "now", and the multi-week branch's trailing
+    slice is also week-to-date. So a period_end of `cw_start + 7d` on a
+    mid-week export would advertise data through a future reset that the
+    rows don't actually include. Clip to `min(cw_start + 7d, now)` so the
+    frontmatter agrees with the live dashboard's "spent this week" KPI.
+    """
+    # Pin `now` to 3 days into the fixture week (cw_start = 2026-05-18) so
+    # the reset (cw_start + 7d = 2026-05-25) is strictly in the future. The
+    # autouse fixture above pins to 2026-06-01 (post-reset); override here
+    # for this single test.
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-05-21T00:00:00Z")
+    ns = load_script()
+    snap = _make_snap(ns, _envelope_with_n_trend_weeks(5))
+    build = ns["_build_projects_share_panel_data"]
+    out = build({"windowWeeks": 1}, snap)
+    expected = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
+    assert out["period_end"] == expected, (
+        f"period_end should clip to now (mid-week), got {out['period_end']!r}"
+    )
+
+
+def test_period_end_uses_week_end_when_now_past_reset(monkeypatch, tmp_path):
+    """After the reset has passed, period_end stays at cw_start + 7d.
+
+    A "current week" cw_start whose reset is already behind `now` is
+    typical of test fixtures and CCTALLY_AS_OF rewinds — the clip then
+    becomes a no-op, preserving the prior behavior.
+    """
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-01T00:00:00Z")
+    ns = load_script()
+    snap = _make_snap(ns, _envelope_with_n_trend_weeks(5))
+    build = ns["_build_projects_share_panel_data"]
+    out = build({"windowWeeks": 1}, snap)
+    cw_start = dt.datetime(2026, 5, 18, tzinfo=dt.timezone.utc)
     assert out["period_end"] == cw_start + dt.timedelta(days=7)

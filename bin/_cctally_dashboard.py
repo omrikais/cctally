@@ -1648,10 +1648,19 @@ def _build_projects_share_panel_data(options: dict,
         total_cost = running_total
 
     # Compute window bounds from the *effective* span — see the
-    # `effective_weeks` note above.
+    # `effective_weeks` note above. The rows in this panel_data are
+    # week-to-date (current_week.rows are aggregated through "now"; the
+    # multi-week branch sums weekly_cost slices, with the trailing slice
+    # also week-to-date), so clip `period_end` to min(reset_at, now).
+    # Without the clip a mid-week export advertises a future reset date
+    # in the rendered period/frontmatter and disagrees with the live
+    # dashboard's "spent this week" KPI, which is symmetrically clipped
+    # by `_build_current_week_share_panel_data`'s use of `now`.
     cw_start_iso = cw.get("week_start_at") or _share_now_utc_iso()
     cw_start = parse_iso_datetime(cw_start_iso, "projects.cw_start")
-    period_end = cw_start + dt.timedelta(days=7)
+    week_end = cw_start + dt.timedelta(days=7)
+    now = _share_now_utc()
+    period_end = week_end if week_end <= now else now
     period_start = cw_start - dt.timedelta(days=7 * (effective_weeks - 1))
 
     return {
