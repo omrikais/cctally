@@ -8,7 +8,7 @@
 //      history than the requested window.
 //   4. Stacked-area trend chart (top-5 + (other) bucket).
 //   5. Full 7-column projects table (Project / Sessions / First seen /
-//      Last seen / Cost / Used % / $/1%) sorted desc by window cost.
+//      Last seen / Cost / Used % / % of week) sorted desc by window cost.
 //   6. Per-project drill panel — appears below the selected row.
 //
 // Cross-nav (spec §4.1): when the modal opens with a `projectKey` set
@@ -98,10 +98,12 @@ export function ProjectsModal() {
 
   // Window-aware project rows: window-summed cost + window-summed
   // attributed pct + window-summed sessions + window min/max of
-  // first/last seen + derived $/1%. Default sort is desc by window cost
-  // (spec §3.4); a click on any `SortableHeader` cell persists an
+  // first/last seen + derived % of week. Default sort is desc by window
+  // cost (spec §3.4); a click on any `SortableHeader` cell persists an
   // override at `prefs.projectsSortOverride` and routes through
-  // `applyTableSort`.
+  // `applyTableSort`. % of week = `windowCost / sum(windowCost)` over
+  // the active window — the per-row differential signal that replaces
+  // the degenerate v1 `$/1%` column (issue #72).
   // Top-N active projects shown by default; rest behind an expand toggle.
   // "Active" = nonzero window cost. The default cost-desc sort means the
   // top-N active are simply the leading rows after filtering out
@@ -121,8 +123,6 @@ export function ProjectsModal() {
         (s, c) => (c == null ? s : (s ?? 0) + c),
         null,
       );
-      const dpp =
-        windowPct != null && windowPct > 0 ? windowCost / windowPct : null;
       // Per-week counts double-count cross-week sessions (rare in
       // practice — a single Claude session typically stays inside one
       // ISO Monday boundary). Matches the share-flow's window sum at
@@ -143,9 +143,18 @@ export function ProjectsModal() {
         lastSeenAt,
         windowCost,
         windowPct,
-        dollarsPerPct: dpp,
+        // shareOfWindow filled in a second pass below — needs the
+        // total across all rows first.
+        shareOfWindow: null as number | null,
       };
     });
+  // Second pass: fill shareOfWindow now that totalWindowCost is known.
+  // Stored as 0–100 so `fmt.pct0` renders directly (matches `windowPct`).
+  const totalWindowCost = baseRows.reduce((s, r) => s + r.windowCost, 0);
+  for (const r of baseRows) {
+    r.shareOfWindow =
+      totalWindowCost > 0 ? (r.windowCost / totalWindowCost) * 100 : null;
+  }
 
   // Apply override when set; otherwise fall back to cost-desc (spec §3.4
   // "Default sort: cost desc"). `applyTableSort` does NOT mutate its
@@ -307,7 +316,7 @@ export function ProjectsModal() {
                 <td className="started">{fmt.dateShort(r.lastSeenAt, ctx) ?? '—'}</td>
                 <td className={costClass(r.windowCost)}>{fmt.usd2(r.windowCost)}</td>
                 <td>{r.windowPct == null ? '—' : fmt.pct0(r.windowPct)}</td>
-                <td className={r.dollarsPerPct == null ? '' : costClass(r.dollarsPerPct)}>{r.dollarsPerPct == null ? '—' : fmt.usd2(r.dollarsPerPct)}</td>
+                <td>{r.shareOfWindow == null ? '—' : fmt.pct0(r.shareOfWindow)}</td>
               </tr>
             ))}
           </tbody>

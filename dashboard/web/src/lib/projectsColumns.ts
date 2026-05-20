@@ -11,7 +11,14 @@ export interface ProjectsTableRow {
   lastSeenAt: string | null;
   windowCost: number;
   windowPct: number | null;
-  dollarsPerPct: number | null;
+  // % of weekly cost — `windowCost / total_window_cost` (0–100, NOT 0–1
+  // so `fmt.pct0` renders directly). Replaces the v1 `dollarsPerPct`
+  // column, which collapsed to a constant across rows by construction
+  // (issue #72): `attributed_pct` is proportional to `cost_share`, so
+  // `cost / attributed_pct = total_cost / weekly_used_pct` for every
+  // project. `% of week` is the only orthogonal axis the data carries.
+  // `null` when the active window has zero total cost (all rows null).
+  shareOfWindow: number | null;
 }
 
 // Null-safe comparator helpers. nullsLast puts unknown values at the END
@@ -28,7 +35,7 @@ const cmpStr = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 // Spec §3.4 default directions (per the table — "Sort" column):
 //   Project=asc, Sessions=desc, First seen=asc, Last seen=desc,
-//   Cost=desc (default), Used %=desc, $/1%=desc.
+//   Cost=desc (default), Used %=desc, % of week=desc.
 export const PROJECTS_COLUMNS: TableColumn<ProjectsTableRow>[] = [
   {
     id: 'project',
@@ -85,14 +92,14 @@ export const PROJECTS_COLUMNS: TableColumn<ProjectsTableRow>[] = [
     },
   },
   {
-    id: 'dollar_per_pct',
-    label: '$/1%',
+    id: 'share_of_window',
+    label: '% of week',
     defaultDirection: 'desc',
     numeric: true,
     compare: (a, b) => {
-      const n = nullsLast(a.dollarsPerPct, b.dollarsPerPct);
+      const n = nullsLast(a.shareOfWindow, b.shareOfWindow);
       if (n != null) return n;
-      return a.dollarsPerPct! - b.dollarsPerPct!;
+      return a.shareOfWindow! - b.shareOfWindow!;
     },
   },
 ];

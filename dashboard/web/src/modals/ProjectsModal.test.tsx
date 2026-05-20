@@ -783,6 +783,41 @@ describe('<ProjectsModal />', () => {
     });
   });
 
+  describe("'% of week' column (#72)", () => {
+    // The legacy `$/1%` column was mathematically degenerate — every row
+    // showed `total_cost / weekly_used_pct` independent of the project.
+    // Replaced with a per-row `% of week` = cost[p] / sum(cost) over the
+    // active window, which IS differential across rows (spec §3.4).
+    it("replaces the '$/1%' header with '% of week' (header count unchanged)", () => {
+      vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+      updateSnapshot(buildProjectsEnvelope({ windowWeeks: 1, projectCount: 3 }));
+      render(<ProjectsModal />);
+      expect(
+        screen.getByRole('columnheader', { name: '% of week' }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole('columnheader', { name: '$/1%' }),
+      ).toBeNull();
+      // Column count stays at 7 — old shape, new label/derivation.
+      expect(screen.getAllByRole('columnheader')).toHaveLength(7);
+    });
+
+    it("renders each row's share of window cost", () => {
+      // buildProjectsEnvelope(windowWeeks=1, projectCount=3) yields
+      // weekly_cost = [30] / [20] / [10] → total 60 → shares 50% / 33% / 17%.
+      vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+      updateSnapshot(buildProjectsEnvelope({ windowWeeks: 1, projectCount: 3 }));
+      render(<ProjectsModal />);
+      const rows = screen.getAllByTestId('projects-table-row');
+      expect(rows).toHaveLength(3);
+      const cell = (rowIdx: number) =>
+        rows[rowIdx]!.querySelectorAll('td')[6]!.textContent;
+      expect(cell(0)).toBe('50%');
+      expect(cell(1)).toBe('33%');
+      expect(cell(2)).toBe('17%');
+    });
+  });
+
   it('chart aria-label reflects yMode (cost vs share %)', () => {
     vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
     updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));
