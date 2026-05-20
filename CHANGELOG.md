@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-05-20
+
 ### Fixed
 - dashboard static bundle: `dashboard/static/assets/index-*.js` now matches the TypeScript source. Three Projects-modal fixes that landed on `feat/projects-panel` in the final review round (drill stale-on-window-switch guard, persisted-selection re-bind on dropout, mobile sort cycle's `first_seen` direction) were applied to `dashboard/web/src/modals/*.tsx` but the regenerated Vite bundle was never committed, so the committed `dashboard/static/assets/index-DUKjFlG8.js` lagged the TSX by those three commits. Running `npm run build` (`tsc --noEmit && vite build`) produces `index-Cy59E7Ru.js` instead, and `dashboard/static/dashboard.html` now references it. The Python-side share `period_end` clip from the same review round shipped correctly on v1.10.0 via `bin/_cctally_dashboard.py`; this is purely a bundle-rebuild closure. CI regression: `dashboard-build-stability` job runs `git diff --exit-code dashboard/static/` after `npm run build`.
 
