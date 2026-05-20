@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-05-20
+
 ### Added
 - Add Projects panel + modal to the dashboard — top-5 current-week leaderboard with horizontal bars and attributed `Used %`, a configurable `1w` / `4w` / `8w` / `12w` Projects modal with a stacked-area trend chart, 7-column per-project table (cost desc by default), and an in-place drill into model breakdown + recent sessions; two-way navigation with Sessions (clicking a project cell in Sessions opens the Projects modal pre-expanded on that project's drill, and clicking a session in the drill opens the SessionModal as a replace). New global `5` shortcut opens the Projects modal directly (the panel sits at index 4 of `DEFAULT_PANEL_ORDER`); `0` now opens whichever panel occupies position 10 (vim-style "10 wraps to 0"; `alerts` in the default order). A lazy `GET /api/project/<key>?weeks=N` endpoint mirrors the SessionModal stale-while-revalidate pattern — the modal renders from the envelope's top-N summary first, then hydrates the full drill on demand. Three new share templates (`projects-recap`, `projects-visual`, `projects-detail`) join the kernel and carry the active `windowWeeks` into the share flow.
 
