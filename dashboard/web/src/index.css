@@ -3988,16 +3988,38 @@ mark.current {
     width: 100%;
   }
 
-  /* Trend legend clamp. Items can still be 5+1 (top-5 + other); the
-   * clamp keeps the legend to ≤2 visual lines so it doesn't push the
-   * table off-screen. Items beyond row 2 are cut without a reveal
-   * affordance — band-aid for #73; follow-up issue tracks the proper
-   * mobile legend UX. line-height pinned so the max-height math is
-   * deterministic (default line-height varies). */
+  /* D2 — horizontal-scroll mobile legend (#74). Single row,
+   * (other) pinned last, right-edge mask-gradient as persistent
+   * "more →" affordance, 36px tap-target height for non-(other)
+   * <button> items. JSDOM @media gap means visual checks (scroll,
+   * mask, snap, min-height) are pre-merge manual-only. */
   #root .projects-trend-legend {
-    line-height: 1.4;
-    max-height: 2.8em;
-    overflow: hidden;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-snap-type: x proximity;
+    -webkit-overflow-scrolling: touch;
+    -webkit-mask-image: linear-gradient(
+      90deg, #000 0, #000 calc(100% - 28px), transparent 100%);
+            mask-image: linear-gradient(
+      90deg, #000 0, #000 calc(100% - 28px), transparent 100%);
+    padding-right: 24px;
+  }
+  #root .projects-trend-legend .projects-trend-legend-item {
+    flex-shrink: 0;
+    scroll-snap-align: start;
+    display: inline-flex;
+    align-items: center;
+    min-height: 36px;
+  }
+  #root .projects-trend-legend button.projects-trend-legend-item {
+    background: none;
+    border: none;
+    padding: 0 4px;
+    margin: 0;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
   }
 
   /* Table → stacked-card reflow. */

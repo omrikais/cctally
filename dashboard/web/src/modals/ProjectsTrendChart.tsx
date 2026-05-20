@@ -19,6 +19,7 @@
 // ethos" (no new deps for the web client; vanilla `<svg>` is the
 // established pattern).
 import { useMemo } from 'react';
+import { useIsMobile } from '../hooks/useIsMobile';
 import type { ProjectsTrendEnvelope } from '../types/envelope';
 
 const SERIES_COLORS = ['#d946ef', '#c084fc', '#60a5fa', '#fbbf24', '#22d3ee'];
@@ -75,6 +76,8 @@ export function ProjectsTrendChart({
     }
     return { weeks, series };
   }, [trend, windowWeeks]);
+
+  const isMobile = useIsMobile();
 
   if (prepared.weeks.length === 0 || prepared.series.length === 0) {
     return (
@@ -170,12 +173,33 @@ export function ProjectsTrendChart({
       </svg>
       <div className="projects-trend-xaxis">{xAxisLabels}</div>
       <div className="projects-trend-legend">
-        {prepared.series.map((p) => (
-          <span key={p.key}>
-            <span className="sw" style={{ background: p.color }} />
-            {p.key}
-          </span>
-        ))}
+        {prepared.series.map((p) => {
+          const isOther = p.key === '(other)';
+          const swatch = <span className="sw" style={{ background: p.color }} />;
+          const content = <>{swatch}{p.key}</>;
+          if (isMobile && !isOther) {
+            return (
+              <button
+                key={p.key}
+                type="button"
+                className="projects-trend-legend-item"
+                data-series-key={p.key}
+                onClick={() => onProjectSelect?.(p.key)}
+              >
+                {content}
+              </button>
+            );
+          }
+          return (
+            <span
+              key={p.key}
+              className="projects-trend-legend-item"
+              data-series-key={p.key}
+            >
+              {content}
+            </span>
+          );
+        })}
       </div>
     </div>
   );

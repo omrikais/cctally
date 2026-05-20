@@ -414,6 +414,24 @@ describe('<ProjectsModal />', () => {
     });
   });
 
+  it('mobile: tapping a top-N legend item selects that project in the table', async () => {
+    stubMobileMedia(true);
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-3')));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 5 }));
+    render(<ProjectsModal />);
+    const buttons = document.querySelectorAll(
+      '.projects-trend-legend > button.projects-trend-legend-item[data-series-key]',
+    );
+    expect(buttons.length).toBeGreaterThanOrEqual(2);
+    const target = buttons[1] as HTMLButtonElement;
+    const targetKey = target.getAttribute('data-series-key');
+    fireEvent.click(target);
+    await waitFor(() => {
+      const selectedText = document.querySelector('tr.selected')?.firstElementChild?.textContent;
+      expect(selectedText).toBe(targetKey);
+    });
+  });
+
   it('SSE-tick race: in-flight initial fetch survives a snapshot update', async () => {
     // Regression: Playwright e2e surfaced an endless-loading bug where the
     // SWR effect aborted the in-flight initial fetch on every SSE tick
