@@ -90,8 +90,17 @@ export function ProjectsTrendChart({
   );
   const yMax = yMode === 'share' ? 100 : Math.max(...weekTotals, 0.01);
 
-  const xFor = (j: number) =>
-    weekCount <= 1 ? VW / 2 : (j / (weekCount - 1)) * VW;
+  // Issue #68: when `weekCount === 1` (fresh installs, 1w pill, or any
+  // trend with a single week of data) the prior `xFor` collapsed every
+  // point to `VW/2`, drawing each polygon as a zero-width vertical line.
+  // Synthesize a `[VW*0.1, VW*0.9]` horizontal span instead so each
+  // series renders as a rectangle (a wide stacked-bar segment).
+  const xFor = (j: number, edge: 'left' | 'right' = 'left'): number =>
+    weekCount <= 1
+      ? edge === 'left'
+        ? VW * 0.1
+        : VW * 0.9
+      : (j / (weekCount - 1)) * VW;
 
   // Stack-accumulator passed across series. Each polygon contributes its
   // own contribution to `accum`, walking bottom→top across the x-axis.
@@ -99,13 +108,19 @@ export function ProjectsTrendChart({
   type Poly = { color: string; key: string; points: string };
   const polygons: Poly[] = prepared.series.map((p) => {
     const points: string[] = [];
-    // Bottom edge — left → right at current accum.
+    // Bottom edge — left → right at current accum. The 1-week degenerate
+    // path emits both synthesized edges at the same accum y so each
+    // polygon closes as a rectangle (issue #68).
     for (let j = 0; j < weekCount; j++) {
       const y = VH - (accum[j] / yMax) * VH;
-      points.push(`${xFor(j).toFixed(2)},${y.toFixed(2)}`);
+      points.push(`${xFor(j, 'left').toFixed(2)},${y.toFixed(2)}`);
+      if (weekCount === 1) {
+        points.push(`${xFor(j, 'right').toFixed(2)},${y.toFixed(2)}`);
+      }
     }
     // Add this series' contribution, then walk back right → left along
-    // the new top edge.
+    // the new top edge. Mirror the 1-week doubling so the rectangle
+    // closes with the right-edge corner first.
     for (let j = weekCount - 1; j >= 0; j--) {
       const total = weekTotals[j] ?? 0;
       const contribution =
@@ -116,7 +131,10 @@ export function ProjectsTrendChart({
           : p.weekly[j] ?? 0;
       accum[j] += contribution;
       const y = VH - (accum[j] / yMax) * VH;
-      points.push(`${xFor(j).toFixed(2)},${y.toFixed(2)}`);
+      if (weekCount === 1) {
+        points.push(`${xFor(j, 'right').toFixed(2)},${y.toFixed(2)}`);
+      }
+      points.push(`${xFor(j, 'left').toFixed(2)},${y.toFixed(2)}`);
     }
     return { color: p.color, key: p.key, points: points.join(' ') };
   });
