@@ -21,6 +21,7 @@ import {
   installGlobalKeydown,
   _resetForTests as _resetKeymap,
 } from '../store/keymap';
+import { stubMobileMedia } from '../test-utils/mobileMedia';
 import type {
   Envelope,
   ProjectDetail,
@@ -832,5 +833,191 @@ describe('<ProjectsModal />', () => {
     const svgShare = document.querySelector('svg[role="img"]');
     expect(svgShare?.getAttribute('aria-label')).toContain('share %');
     expect(svgShare?.getAttribute('aria-label')).not.toContain('cost');
+  });
+});
+
+// Issue #73 — ProjectsModal mobile (≤640w) stacked-card layout.
+// JSDOM does not evaluate @media rules; these tests cover only the
+// React conditional branches gated by useIsMobile() (sort-cycle pill
+// presence, inline drill rendering, desktop-position drill suppression).
+// CSS reflow itself is verified by manual mobile-viewport check during
+// implementation.
+describe('ProjectsModal — mobile (≤640w) card layout', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    _resetForTests();
+    _resetKeymap();
+    installGlobalKeydown();
+    stubMobileMedia(true);
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+  });
+
+  afterEach(() => {
+    _resetKeymap();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  function openWithProjects(): void {
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 5 }));
+    dispatch({ type: 'OPEN_MODAL', kind: 'projects' });
+  }
+
+  it('renders the mobile sort-cycle pill above the card list', async () => {
+    render(<ProjectsModal />);
+    openWithProjects();
+    const pill = await screen.findByTestId('projects-mobile-sort');
+    expect(pill).toBeInTheDocument();
+    expect(pill.textContent).toMatch(/sort/i);
+  });
+
+  it('cycle pill cycles sort: cost → sessions → used → share → first → last → project → cost', async () => {
+    render(<ProjectsModal />);
+    openWithProjects();
+    const pill = await screen.findByTestId('projects-mobile-sort');
+    const expectedSequence = [
+      /sessions/i, /used/i, /share|week/i, /first/i, /last/i, /project/i, /cost/i,
+    ];
+    for (const re of expectedSequence) {
+      fireEvent.click(pill);
+      await waitFor(() => expect(pill.textContent ?? '').toMatch(re));
+    }
+  });
+
+  it('every metric is rendered in each card (no display:none losses)', async () => {
+    render(<ProjectsModal />);
+    openWithProjects();
+    const rows = await screen.findAllByTestId('projects-table-row');
+    expect(rows.length).toBeGreaterThan(0);
+    const first = rows[0]!;
+    expect(first.querySelectorAll('td').length).toBe(7);
+    expect(first.querySelector('td.project')?.textContent).toBeTruthy();
+    expect(first.querySelector('td.first-seen')?.textContent).toBeTruthy();
+    expect(first.querySelector('td.last-seen')?.textContent).toBeTruthy();
+  });
+
+  it('selected card has aria-expanded=true and inline drill rendered as the next sibling', async () => {
+    render(<ProjectsModal />);
+    openWithProjects();
+    const rows = await screen.findAllByTestId('projects-table-row');
+    // Stay on the auto-selected leader (project-1) so the stubFetchOk
+    // payload's `key` matches; the inline drill sibling is rendered
+    // synchronously off `selectedKey`, but the inner ProjectsDrillPanel
+    // testid only appears after `useProjectDetail` resolves (and only
+    // if `data.key === projectKey`).
+    expect(rows[0]!.getAttribute('aria-expanded')).toBe('true');
+    const sibling = rows[0]!.nextElementSibling;
+    expect(sibling).not.toBeNull();
+    expect(sibling?.classList.contains('projects-drill-row')).toBe(true);
+    await waitFor(() => {
+      expect(sibling?.querySelector('[data-testid="projects-drill"]')).not.toBeNull();
+    });
+  });
+
+  it('selecting a different card moves the inline drill; only one inline drill at a time', async () => {
+    render(<ProjectsModal />);
+    openWithProjects();
+    const rows = await screen.findAllByTestId('projects-table-row');
+    // Auto-selected leader is row 0; click row 1 to move selection. The
+    // inline `tr.projects-drill-row` follows `selectedKey` synchronously
+    // — we don't depend on the drill payload fetch resolving here.
+    fireEvent.click(rows[1]!);
+    await waitFor(() => {
+      expect(document.querySelectorAll('.projects-drill-row').length).toBe(1);
+      expect(rows[0]!.getAttribute('aria-expanded')).toBe('false');
+      expect(rows[1]!.getAttribute('aria-expanded')).toBe('true');
+    });
+    // The drill sibling now follows row 1.
+    expect(rows[1]!.nextElementSibling?.classList.contains('projects-drill-row')).toBe(true);
+  });
+
+  it('tapping the selected card again removes the inline drill', async () => {
+    render(<ProjectsModal />);
+    openWithProjects();
+    const rows = await screen.findAllByTestId('projects-table-row');
+    // Leader (row 0) is auto-selected on mount; the inline drill row
+    // appears immediately (no fetch dependency). Tap again to deselect.
+    await waitFor(() => expect(document.querySelector('.projects-drill-row')).not.toBeNull());
+    fireEvent.click(rows[0]!);
+    await waitFor(() => expect(document.querySelector('.projects-drill-row')).toBeNull());
+  });
+
+  it('does NOT render the desktop-position drill below the toggle when isMobile', async () => {
+    render(<ProjectsModal />);
+    openWithProjects();
+    const rows = await screen.findAllByTestId('projects-table-row');
+    // Leader (project-1) is auto-selected; matches stubFetchOk payload.
+    expect(rows[0]!.getAttribute('aria-expanded')).toBe('true');
+    await waitFor(() => expect(document.querySelector('.projects-drill-row')).not.toBeNull());
+    // Drill panel resolves once `useProjectDetail` returns the matching
+    // payload — assert the testid appears exclusively inside the
+    // .projects-drill-row, not below the toggle.
+    await waitFor(() => {
+      const allDrills = document.querySelectorAll('[data-testid="projects-drill"]');
+      expect(allDrills.length).toBe(1);
+    });
+    const inlineDrills = document.querySelectorAll('.projects-drill-row [data-testid="projects-drill"]');
+    expect(inlineDrills.length).toBe(1);
+  });
+
+  it('long project keys (>40 chars) render in row 1 with the ellipsis class hook', async () => {
+    const longKey = 'ccusage-subscription-stats-followups-mobile-redesign-v2';
+    const env = buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 });
+    // Rename the leader project so both trend and current_week rows carry
+    // the long key; the leader is auto-selected on mount.
+    env.projects!.trend.projects[0]!.key = longKey;
+    env.projects!.current_week!.rows[0]!.key = longKey;
+    updateSnapshot(env);
+    dispatch({ type: 'OPEN_MODAL', kind: 'projects' });
+    render(<ProjectsModal />);
+    // The key also appears in the drill panel header (which renders
+    // inline on mobile), so scope the lookup to the `.project` cell on
+    // the auto-selected leader row.
+    const rows = await screen.findAllByTestId('projects-table-row');
+    const cell = rows[0]!.querySelector('td.project');
+    expect(cell?.textContent).toBe(longKey);
+    expect(cell?.classList.contains('project')).toBe(true);
+  });
+});
+
+describe('ProjectsModal — desktop (>640w) unchanged regression', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    _resetForTests();
+    _resetKeymap();
+    installGlobalKeydown();
+    stubMobileMedia(false);
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+  });
+
+  afterEach(() => {
+    _resetKeymap();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('does NOT render the mobile sort-cycle pill', () => {
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 5 }));
+    dispatch({ type: 'OPEN_MODAL', kind: 'projects' });
+    render(<ProjectsModal />);
+    expect(screen.queryByTestId('projects-mobile-sort')).toBeNull();
+  });
+
+  it('renders the drill below the toggle (desktop position, NOT inline)', async () => {
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 5 }));
+    dispatch({ type: 'OPEN_MODAL', kind: 'projects' });
+    render(<ProjectsModal />);
+    const rows = await screen.findAllByTestId('projects-table-row');
+    // Stay on the auto-selected leader (project-1) so the stubFetchOk
+    // payload's `key` matches — clicking row[1] would trigger a switch
+    // to project-2 and trip the stale-on-switch guard (Loading…).
+    expect(rows[0]!.getAttribute('aria-expanded')).toBe('true');
+    await waitFor(() => {
+      // Desktop branch: no inline .projects-drill-row inside <tbody>.
+      expect(document.querySelector('.projects-drill-row')).toBeNull();
+      // Drill panel still renders, but in its desktop position (below
+      // the toggle, NOT as a child of the table).
+      expect(document.querySelector('[data-testid="projects-drill"]')).not.toBeNull();
+    });
   });
 });

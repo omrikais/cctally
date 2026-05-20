@@ -3971,6 +3971,13 @@ mark.current {
 }
 .drill-show-in-sessions:hover { color: var(--accent-magenta); }
 
+/* Issue #73: mobile (≤640px) ProjectsModal — stacked-card reflow,
+ * sort cycle pill, and trend-chart legend clamp. The `<table>` stays
+ * in markup; we reflow `tr` into a flex card via display rules, the
+ * same pattern .sess-table uses for SessionsPanel on mobile.
+ * Specificity prefix `#root` per the id-selector-specificity-floor
+ * memory — must outrank the desktop `#root .projects-table` chain
+ * defined at index.css:3817+. */
 @media (max-width: 640px) {
   #root .projects-drill-grid {
     grid-template-columns: 1fr;
@@ -3980,10 +3987,136 @@ mark.current {
     height: 110px;
     width: 100%;
   }
-  #root .projects-table th:nth-child(3),
-  #root .projects-table td:nth-child(3),
-  #root .projects-table th:nth-child(4),
-  #root .projects-table td:nth-child(4) {
-    display: none;
+
+  /* Trend legend clamp. Items can still be 5+1 (top-5 + other); the
+   * clamp keeps the legend to ≤2 visual lines so it doesn't push the
+   * table off-screen. Items beyond row 2 are cut without a reveal
+   * affordance — band-aid for #73; follow-up issue tracks the proper
+   * mobile legend UX. line-height pinned so the max-height math is
+   * deterministic (default line-height varies). */
+  #root .projects-trend-legend {
+    line-height: 1.4;
+    max-height: 2.8em;
+    overflow: hidden;
+  }
+
+  /* Table → stacked-card reflow. */
+  #root .projects-table thead { display: none; }
+  #root .projects-table tbody,
+  #root .projects-table tr { display: block; width: 100%; }
+  #root .projects-table tbody tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 10px;
+    row-gap: 2px;
+    padding: 8px 6px;
+    border-bottom: 1px solid var(--border-soft);
+    cursor: pointer;
+  }
+  #root .projects-table tbody td {
+    padding: 0;
+    border: none;
+    white-space: normal;
+  }
+
+  /* Row 1 left: project key (bold, ellipsized). */
+  #root .projects-table td.project {
+    order: 1;
+    flex: 1 1 auto;
+    min-width: 0;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Row 1 right: cost. Use the four cost-class hooks already applied
+   * by costClass() in ProjectsModal.tsx. */
+  #root .projects-table td.cost-xs,
+  #root .projects-table td.cost-low,
+  #root .projects-table td.cost-mid,
+  #root .projects-table td.cost-high {
+    order: 2;
+    flex: 0 0 auto;
+    margin-left: auto;
+    font-weight: 700;
+    text-align: right;
+  }
+
+  /* Row 2 meta — explicit per-cell order so visual order is
+   * sessions → used% → %week → firstSeen → lastSeen, independent
+   * of DOM order (DOM is cols 2,3,4,5,6,7 with dates between
+   * sessions and cost). All share dim styling. */
+  #root .projects-table td:nth-child(2),       /* sessions */
+  #root .projects-table td:nth-child(6),       /* used % */
+  #root .projects-table td:nth-child(7),       /* % of week */
+  #root .projects-table td.started {           /* first/last seen */
+    flex: 0 0 auto;
+    margin-top: 2px;
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+  #root .projects-table td:nth-child(2) { order: 3; }   /* sessions */
+  #root .projects-table td:nth-child(6) { order: 4; }   /* used % */
+  #root .projects-table td:nth-child(7) { order: 5; }   /* % of week */
+  #root .projects-table td.first-seen   { order: 6; }
+  #root .projects-table td.last-seen    { order: 7; }
+
+  /* Separators: `·` after sessions/used%/%week/first-seen; `→`
+   * after first-seen produces the "Mar 15 → Apr 28" date range.
+   * Last-seen has no trailing separator (it ends the meta line). */
+  #root .projects-table td:nth-child(2)::after,
+  #root .projects-table td:nth-child(6)::after,
+  #root .projects-table td:nth-child(7)::after {
+    content: " · ";
+    color: var(--text-faint);
+  }
+  #root .projects-table td.first-seen::after {
+    content: " → ";
+    color: var(--text-faint);
+  }
+
+  /* Selected card highlight (matches desktop). */
+  #root .projects-table tbody tr.selected {
+    background: rgba(217, 70, 239, 0.06);
+  }
+
+  /* Inline drill row — the `<tr>` is already display: block above,
+   * so this just contributes a full-width content box. The inner
+   * <td colSpan={7}> hosts ProjectsDrillPanel. */
+  #root .projects-table tr.projects-drill-row {
+    cursor: default;
+    background: rgba(217, 70, 239, 0.03);
+    padding: 8px 6px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  #root .projects-table tr.projects-drill-row td {
+    display: block;
+    width: 100%;
+  }
+
+  /* Sort cycle pill — sits between the trend chart and the first
+   * card. Tap target ≥32px (touch guideline). Reuses .pill visual
+   * language from .projects-controls. */
+  #root .projects-mobile-sort {
+    display: inline-flex;
+    align-items: center;
+    margin: 4px 0 6px;
+    padding: 6px 12px;
+    min-height: 32px;
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border-soft);
+    border-radius: 14px;
+    font: inherit;
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+  #root .projects-mobile-sort:hover {
+    background: rgba(217, 70, 239, 0.06);
+  }
+  #root .projects-mobile-sort:focus-visible {
+    outline: 2px solid var(--accent-magenta);
+    outline-offset: 2px;
   }
 }

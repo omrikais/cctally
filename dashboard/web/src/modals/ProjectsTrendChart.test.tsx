@@ -7,9 +7,10 @@
 // [VW*0.1, VW*0.9] so each series renders as a rectangle (wide stacked
 // "bar") instead of a line.
 import { render } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ProjectsTrendChart } from './ProjectsTrendChart';
 import type { ProjectsTrendEnvelope } from '../types/envelope';
+import { stubMobileMedia } from '../test-utils/mobileMedia';
 
 const VW = 400;
 const EXPECTED_LEFT = VW * 0.1; // 40
@@ -127,5 +128,46 @@ describe('<ProjectsTrendChart /> 1-week render (issue #68)', () => {
     // Multi-week path should still anchor x=0 (j=0) and x=VW (j=3).
     expect(Math.min(...xs)).toBeCloseTo(0, 2);
     expect(Math.max(...xs)).toBeCloseTo(VW, 2);
+  });
+});
+
+// Issue #73 — mobile legend clamp is CSS-only (max-height + overflow).
+// JSDOM does not evaluate @media rules, so we can only assert the legend
+// DOM is present with enough series-spans to make the clamp meaningful.
+// Visual ≤2-line behavior is verified by the manual phone-viewport
+// check during implementation.
+describe('<ProjectsTrendChart /> — mobile legend', () => {
+  beforeEach(() => stubMobileMedia(true));
+  afterEach(() => vi.restoreAllMocks());
+
+  it('renders the legend element with ≥6 series spans (CSS clamp verified manually)', () => {
+    // 6 projects → top-5 series + an (other) bucket = 6 legend spans.
+    const sixWeek: ProjectsTrendEnvelope = {
+      window_weeks: 4,
+      weeks: Array.from({ length: 4 }, (_, j) => ({
+        week_start_date: `2026-04-${String(j + 1).padStart(2, '0')}`,
+        week_label: `wk${j}`,
+        total_cost_usd: 100,
+        total_pct: 20,
+      })),
+      projects: Array.from({ length: 6 }, (_, i) => ({
+        key: `legend-project-${i + 1}`,
+        bucket_path: `/repos/legend-project-${i + 1}`,
+        weekly_cost: [10 + i, 11 + i, 12 + i, 13 + i],
+        weekly_pct: [1, 2, 3, 4],
+        sessions_per_week: [1, 1, 1, 1],
+        first_seen_per_week: [null, null, null, null],
+        last_seen_per_week: [null, null, null, null],
+      })),
+    };
+    const { container } = render(
+      <ProjectsTrendChart trend={sixWeek} yMode="absolute" windowWeeks={4} />,
+    );
+    const legend = container.querySelector('.projects-trend-legend');
+    expect(legend).not.toBeNull();
+    // top-5 projects + (other) = 6 spans; chart prepends/appends series
+    // by sum-cost rank, so the count is stable under the fixture above.
+    const spans = legend?.querySelectorAll(':scope > span') ?? [];
+    expect(spans.length).toBeGreaterThanOrEqual(6);
   });
 });

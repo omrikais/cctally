@@ -20,7 +20,7 @@
 // Drill session row click → `OPEN_MODAL { kind: 'session', sessionId }`
 // replaces the Projects modal (no modal stack); same behavior as the
 // existing per-panel modals.
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { Fragment, useEffect, useState, useSyncExternalStore } from 'react';
 import { Modal } from './Modal';
 import { ProjectsTrendChart } from './ProjectsTrendChart';
 import { ProjectsDrillPanel } from './ProjectsDrillPanel';
@@ -29,6 +29,7 @@ import { SortableHeader } from '../components/SortableHeader';
 import { SyncChip } from '../components/SyncChip';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
+import { useIsMobile } from '../hooks/useIsMobile';
 import { useKeymap } from '../hooks/useKeymap';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
@@ -36,6 +37,21 @@ import { fmt } from '../lib/fmt';
 import { costClass } from '../lib/cost';
 import { applyTableSort } from '../lib/tableSort';
 import { PROJECTS_COLUMNS, type ProjectsTableRow } from '../lib/projectsColumns';
+
+// Mobile sort-cycle pill (≤640w). Mirrors PROJECTS_COLUMNS ids so
+// applyTableSort + persisted override (`prefs.projectsSortOverride`)
+// route through the same path as the desktop SortableHeader. Order
+// matches spec §1.4: cost desc → sessions desc → used desc → share
+// desc → first desc → last desc → project asc → cost desc.
+const PROJECTS_MOBILE_SORT_CYCLE = [
+  { column: 'cost',            direction: 'desc', label: 'cost',     arrow: '↓' },
+  { column: 'sessions',        direction: 'desc', label: 'sessions', arrow: '↓' },
+  { column: 'used_pct',        direction: 'desc', label: 'used',     arrow: '↓' },
+  { column: 'share_of_window', direction: 'desc', label: 'share',    arrow: '↓' },
+  { column: 'first_seen',      direction: 'desc', label: 'first',    arrow: '↓' },
+  { column: 'last_seen',       direction: 'desc', label: 'last',     arrow: '↓' },
+  { column: 'project',         direction: 'asc',  label: 'project',  arrow: '↑' },
+] as const;
 
 type WindowPill = 1 | 4 | 8 | 12;
 const WINDOW_PILLS: readonly WindowPill[] = [1, 4, 8, 12];
@@ -172,6 +188,35 @@ export function ProjectsModal() {
   const visibleRows = tableExpanded ? tableRows : collapsedRows;
   const canExpand = hiddenWhenCollapsed > 0;
 
+  // Mobile (≤640w) — drives the sort-cycle pill + inline drill anchor.
+  // Issue #73.
+  const isMobile = useIsMobile();
+
+  // Resolve the current cycle position from the persisted sort override
+  // — when none is set we're on cost-desc (the table's default), which
+  // is index 0 of the cycle. Unknown overrides (e.g. legacy values) fall
+  // back to index 0 too so the next tap snaps to a known position.
+  const currentMobileSortIdx = (() => {
+    if (!sortOverride) return 0;
+    const i = PROJECTS_MOBILE_SORT_CYCLE.findIndex(
+      (s) =>
+        s.column === sortOverride.column && s.direction === sortOverride.direction,
+    );
+    return i === -1 ? 0 : i;
+  })();
+  const cycleMobileSort = (): void => {
+    const next =
+      PROJECTS_MOBILE_SORT_CYCLE[
+        (currentMobileSortIdx + 1) % PROJECTS_MOBILE_SORT_CYCLE.length
+      ];
+    dispatch({
+      type: 'SET_TABLE_SORT',
+      table: 'projects',
+      override: { column: next.column, direction: next.direction },
+    });
+  };
+  const mobileSortLabel = PROJECTS_MOBILE_SORT_CYCLE[currentMobileSortIdx];
+
   // Spec §3.7 keyboard bindings. Bindings re-register each render so the
   // closures capture the latest selectedKey / visibleRows / windowWeeks
   // / yMode — useKeymap accepts the re-registration cost in exchange
@@ -290,6 +335,18 @@ export function ProjectsModal() {
           <div className="panel-empty">Projects trend unavailable.</div>
         )}
 
+        {isMobile && (
+          <button
+            type="button"
+            className="projects-mobile-sort"
+            data-testid="projects-mobile-sort"
+            onClick={cycleMobileSort}
+            aria-label="Cycle sort column"
+          >
+            Sort: {mobileSortLabel.label} {mobileSortLabel.arrow}
+          </button>
+        )}
+
         <table className="projects-table">
           <SortableHeader
             columns={PROJECTS_COLUMNS}
@@ -301,23 +358,31 @@ export function ProjectsModal() {
           />
           <tbody>
             {visibleRows.map((r) => (
-              <tr
-                key={r.key}
-                data-testid="projects-table-row"
-                data-cost={r.windowCost}
-                data-sessions={r.sessionsCount}
-                aria-expanded={selectedKey === r.key}
-                className={selectedKey === r.key ? 'selected' : ''}
-                onClick={() => onRowClick(r.key)}
-              >
-                <td className="project">{r.key}</td>
-                <td>{r.sessionsCount}</td>
-                <td className="started">{fmt.dateShort(r.firstSeenAt, ctx) ?? '—'}</td>
-                <td className="started">{fmt.dateShort(r.lastSeenAt, ctx) ?? '—'}</td>
-                <td className={costClass(r.windowCost)}>{fmt.usd2(r.windowCost)}</td>
-                <td>{r.windowPct == null ? '—' : fmt.pct0(r.windowPct)}</td>
-                <td>{r.shareOfWindow == null ? '—' : fmt.pct0(r.shareOfWindow)}</td>
-              </tr>
+              <Fragment key={r.key}>
+                <tr
+                  data-testid="projects-table-row"
+                  data-cost={r.windowCost}
+                  data-sessions={r.sessionsCount}
+                  aria-expanded={selectedKey === r.key}
+                  className={selectedKey === r.key ? 'selected' : ''}
+                  onClick={() => onRowClick(r.key)}
+                >
+                  <td className="project">{r.key}</td>
+                  <td>{r.sessionsCount}</td>
+                  <td className="started first-seen">{fmt.dateShort(r.firstSeenAt, ctx) ?? '—'}</td>
+                  <td className="started last-seen">{fmt.dateShort(r.lastSeenAt, ctx) ?? '—'}</td>
+                  <td className={costClass(r.windowCost)}>{fmt.usd2(r.windowCost)}</td>
+                  <td>{r.windowPct == null ? '—' : fmt.pct0(r.windowPct)}</td>
+                  <td>{r.shareOfWindow == null ? '—' : fmt.pct0(r.shareOfWindow)}</td>
+                </tr>
+                {isMobile && selectedKey === r.key && (
+                  <tr className="projects-drill-row" aria-hidden="false">
+                    <td colSpan={7}>
+                      <ProjectsDrillPanel projectKey={r.key} windowWeeks={windowWeeks} />
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
             ))}
           </tbody>
         </table>
@@ -336,7 +401,7 @@ export function ProjectsModal() {
           </button>
         )}
 
-        {selectedKey && (
+        {!isMobile && selectedKey && (
           <ProjectsDrillPanel projectKey={selectedKey} windowWeeks={windowWeeks} />
         )}
 

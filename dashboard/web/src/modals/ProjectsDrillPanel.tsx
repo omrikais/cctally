@@ -45,7 +45,7 @@ export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPan
   const remaining = Math.max(0, data.sessions_total - data.sessions.length);
 
   return (
-    <div className="projects-drill" aria-live="polite">
+    <div className="projects-drill" data-testid="projects-drill" aria-live="polite">
       <div className="projects-drill-head">
         <span className="title">
           ▾ {data.key} · {data.sessions_total} session{data.sessions_total === 1 ? '' : 's'}
