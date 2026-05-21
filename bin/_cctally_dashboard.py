@@ -1748,6 +1748,9 @@ def _build_projects_share_panel_data(options: dict,
 # ``build_cache_report_snapshot()`` and shipped on the existing 5-minute
 # sync cadence — no separate ``/api/cache-report`` endpoint.
 
+# Hardcoded for v1; F10 tracks lifting via cache_report.anomaly_window_days config.
+CACHE_REPORT_WINDOW_DAYS = 14
+
 @dataclass(frozen=True)
 class CacheReportDailyRow:
     date: str  # YYYY-MM-DD in display tz
@@ -1884,10 +1887,11 @@ class CacheReportSnapshot:
 # === Cache-report snapshot builder (spec 2026-05-21 §5.2) ================
 # Adapter from the I/O layer (``get_claude_session_entries`` +
 # ``CLAUDE_MODEL_PRICING`` + ``_calculate_entry_cost``) into the kernel's
-# pure ``_build_cache_report`` orchestrator. The breakdown helpers
-# (``_aggregate_breakdown_by_project`` / ``_aggregate_breakdown_by_model``)
-# sum tokens + cache-dollar shares per project / model across the window
-# and cap to top-5 + ``(other)``.
+# pure ``_build_cache_report`` orchestrator. By-project + by-model
+# breakdowns dedup through the kernel's ``_aggregate_cache_breakdown``
+# (one path, one ``<synthetic>`` filter rule) so the two axes can't
+# silently disagree on token totals when a session has both real and
+# synthetic entries on the same project.
 
 def _cache_report_load_kernel():
     """Lazy-load ``_cctally_cache_report`` via the cctally ``_load_sibling``
@@ -1895,127 +1899,6 @@ def _cache_report_load_kernel():
     kernel module instance (matches the late-load pattern used by share /
     doctor helpers in this file)."""
     return sys.modules["cctally"]._load_sibling("_cctally_cache_report")
-
-
-def _aggregate_breakdown_by_project(
-    entries: list,
-    *,
-    pricing: dict,
-) -> tuple[CacheReportBreakdownRow, ...]:
-    """Sum cache hit % + net $ per project; top 5 + ``(other)`` by abs(net).
-
-    Project key comes from ``entry.project_path`` (the
-    ``session_files.project_path`` LEFT JOIN populated lazily by
-    ``sync_cache``); ``None`` collapses to ``'(unknown)'`` so a single
-    bucket aggregates the rare lazy-backfill window.
-
-    ``(other)``'s ``cache_hit_percent`` is the true aggregate hit
-    percentage over the tail buckets (not zero, not a placeholder) —
-    matches the by-project numbers users would see if they widened the
-    top-N.
-    """
-    crk = _cache_report_load_kernel()
-    buckets: dict[str, dict[str, Any]] = {}
-    for e in entries:
-        proj = (getattr(e, "project_path", None) or "(unknown)")
-        b = buckets.setdefault(proj, {
-            "input": 0, "creation": 0, "read": 0,
-            "saved": 0.0, "wasted": 0.0, "net": 0.0,
-        })
-        b["input"] += getattr(e, "input_tokens", 0)
-        b["creation"] += getattr(e, "cache_creation_tokens", 0)
-        b["read"] += getattr(e, "cache_read_tokens", 0)
-        s, w, n = crk._compute_entry_cache_dollars(
-            e.model,
-            getattr(e, "cache_creation_tokens", 0),
-            getattr(e, "cache_read_tokens", 0),
-            pricing=pricing,
-        )
-        b["saved"] += s
-        b["wasted"] += w
-        b["net"] += n
-
-    out: list[CacheReportBreakdownRow] = []
-    for key, b in buckets.items():
-        out.append(CacheReportBreakdownRow(
-            key=key,
-            cache_hit_percent=crk._compute_cache_hit_percent(
-                b["input"], b["creation"], b["read"],
-            ),
-            net_usd=b["net"],
-        ))
-    out.sort(key=lambda r: abs(r.net_usd), reverse=True)
-    if len(out) <= 5:
-        return tuple(out)
-    head = out[:5]
-    tail = out[5:]
-    tail_keys = {r.key for r in tail}
-    other_net = sum(r.net_usd for r in tail)
-    # True aggregate hit % over the tail buckets:
-    tail_input = sum(b["input"] for k, b in buckets.items() if k in tail_keys)
-    tail_creation = sum(b["creation"] for k, b in buckets.items() if k in tail_keys)
-    tail_read = sum(b["read"] for k, b in buckets.items() if k in tail_keys)
-    other_pct = crk._compute_cache_hit_percent(tail_input, tail_creation, tail_read)
-    head.append(CacheReportBreakdownRow(
-        key="(other)", cache_hit_percent=other_pct, net_usd=other_net,
-    ))
-    return tuple(head)
-
-
-def _aggregate_breakdown_by_model(
-    entries: list,
-    *,
-    pricing: dict,
-) -> tuple[CacheReportBreakdownRow, ...]:
-    """Same as by_project but keyed by ``entry.model``. ``(other)`` carries
-    the aggregate hit % over the tail buckets."""
-    crk = _cache_report_load_kernel()
-    buckets: dict[str, dict[str, Any]] = {}
-    for e in entries:
-        if e.model == "<synthetic>":
-            continue
-        b = buckets.setdefault(e.model, {
-            "input": 0, "creation": 0, "read": 0,
-            "saved": 0.0, "wasted": 0.0, "net": 0.0,
-        })
-        b["input"] += getattr(e, "input_tokens", 0)
-        b["creation"] += getattr(e, "cache_creation_tokens", 0)
-        b["read"] += getattr(e, "cache_read_tokens", 0)
-        s, w, n = crk._compute_entry_cache_dollars(
-            e.model,
-            getattr(e, "cache_creation_tokens", 0),
-            getattr(e, "cache_read_tokens", 0),
-            pricing=pricing,
-        )
-        b["saved"] += s
-        b["wasted"] += w
-        b["net"] += n
-
-    out = [
-        CacheReportBreakdownRow(
-            key=key,
-            cache_hit_percent=crk._compute_cache_hit_percent(
-                b["input"], b["creation"], b["read"],
-            ),
-            net_usd=b["net"],
-        )
-        for key, b in buckets.items()
-    ]
-    out.sort(key=lambda r: abs(r.net_usd), reverse=True)
-    if len(out) <= 5:
-        return tuple(out)
-    head = out[:5]
-    tail = out[5:]
-    tail_keys = {r.key for r in tail}
-    other_net = sum(r.net_usd for r in tail)
-    tail_input = sum(b["input"] for k, b in buckets.items() if k in tail_keys)
-    tail_creation = sum(b["creation"] for k, b in buckets.items() if k in tail_keys)
-    tail_read = sum(b["read"] for k, b in buckets.items() if k in tail_keys)
-    other_pct = crk._compute_cache_hit_percent(tail_input, tail_creation, tail_read)
-    head.append(CacheReportBreakdownRow(
-        key="(other)", cache_hit_percent=other_pct, net_usd=other_net,
-    ))
-    return tuple(head)
 
 
 def build_cache_report_snapshot(
@@ -2041,7 +1924,7 @@ def build_cache_report_snapshot(
     crk = _cache_report_load_kernel()
     cctally_ns = sys.modules["cctally"]
 
-    window_days = 14  # v1: hardcoded per spec §6.1.
+    window_days = CACHE_REPORT_WINDOW_DAYS  # v1: hardcoded per spec §6.1.
     since = now_utc - dt.timedelta(days=window_days)
 
     entries = list(get_claude_session_entries(since, now_utc, project=None))
@@ -2127,27 +2010,34 @@ def build_cache_report_snapshot(
 
     baseline_daily_row_count = len(other_rows)
 
+    # ``delta_pp`` sign convention (spec §4.2): "signed; negative = today
+    # below median" → ``delta = today − baseline``. The empty-day branch
+    # uses today_hit_pct = 0.0 so the formula degenerates to
+    # ``0.0 − baseline_median``, which IS what users expect (a flat-zero
+    # today read against a healthy 60% baseline yields delta=-60pp).
+    today_hit_pct = today_row.cache_hit_percent if today_row is not None else 0.0
+    delta_pp = (
+        None if baseline_median is None
+        else today_hit_pct - baseline_median
+    )
+
     if today_row is None:
         today_spotlight = CacheReportTodaySpotlight(
             date=today_iso,
             cache_hit_percent=0.0,
             baseline_median_percent=baseline_median,
-            delta_pp=(None if baseline_median is None else baseline_median),
+            delta_pp=delta_pp,
             net_usd=0.0, saved_usd=0.0, wasted_usd=0.0,
             anomaly_triggered=False,
             anomaly_reasons=(),
             baseline_daily_row_count=baseline_daily_row_count,
         )
     else:
-        delta = (
-            None if baseline_median is None
-            else baseline_median - today_row.cache_hit_percent
-        )
         today_spotlight = CacheReportTodaySpotlight(
             date=today_iso,
             cache_hit_percent=today_row.cache_hit_percent,
             baseline_median_percent=baseline_median,
-            delta_pp=delta,
+            delta_pp=delta_pp,
             net_usd=today_row.net_usd,
             saved_usd=today_row.saved_usd,
             wasted_usd=today_row.wasted_usd,
@@ -2191,9 +2081,34 @@ def build_cache_report_snapshot(
 
     # By-project + by-model breakdowns are window-wide aggregates (not
     # today-only) so the panel can surface the project / model carrying
-    # the bulk of net savings across the trailing 14d.
-    by_project = _aggregate_breakdown_by_project(entries, pricing=pricing)
-    by_model = _aggregate_breakdown_by_model(entries, pricing=pricing)
+    # the bulk of net savings across the trailing 14d. Both axes share
+    # the kernel's ``_aggregate_cache_breakdown`` so the synthetic-entry
+    # filter rule (drop ``<synthetic>``) is identical by construction —
+    # by-project and by-model can't silently disagree on token totals.
+    by_project_rows = crk._aggregate_cache_breakdown(
+        entries,
+        key_fn=lambda e: (getattr(e, "project_path", None) or "(unknown)"),
+        pricing=pricing,
+        skip_synthetic=True,
+    )
+    by_model_rows = crk._aggregate_cache_breakdown(
+        entries,
+        key_fn=lambda e: e.model,
+        pricing=pricing,
+        skip_synthetic=True,
+    )
+    by_project = tuple(
+        CacheReportBreakdownRow(
+            key=r.key, cache_hit_percent=r.cache_hit_percent, net_usd=r.net_usd,
+        )
+        for r in by_project_rows
+    )
+    by_model = tuple(
+        CacheReportBreakdownRow(
+            key=r.key, cache_hit_percent=r.cache_hit_percent, net_usd=r.net_usd,
+        )
+        for r in by_model_rows
+    )
 
     # 7-day rollup: today + 6 prior. Walk by string date; ``days_newest_first``
     # is already in the right order.

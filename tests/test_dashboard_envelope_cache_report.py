@@ -227,6 +227,124 @@ def test_build_cache_report_snapshot_threshold_propagates(monkeypatch):
     assert snap.window_days == 14  # v1: hardcoded
 
 
+def test_build_cache_report_snapshot_synthetic_filter_consistent_across_axes(monkeypatch):
+    """I1 regression at the envelope level: by-project and by-model
+    breakdowns MUST agree on token totals when a session has both a real
+    and a synthetic entry on the same project. Pre-fix the two helpers
+    used inconsistent filter logic (by-model dropped ``<synthetic>``,
+    by-project did not), so the by-project hit % was diluted by the
+    synthetic entry's tokens while by-model wasn't. Funneling both axes
+    through the kernel's ``_aggregate_cache_breakdown`` (one filter rule)
+    closes the drift by construction.
+    """
+    dash, cctally_ns = _bootstrap_dashboard()
+    now_utc = dt.datetime(2026, 5, 20, 23, 0, tzinfo=dt.timezone.utc)
+    ts = dt.datetime(2026, 5, 20, 12, 0, tzinfo=dt.timezone.utc)
+    entries = [
+        _make_joined_entry(
+            ts_utc=ts,
+            model="claude-sonnet-4-5",
+            input_tokens=100, output_tokens=50,
+            cache_creation=200, cache_read=300,
+            project_path="/proj/a",
+        ),
+        _make_joined_entry(
+            ts_utc=ts + dt.timedelta(hours=1),
+            model="<synthetic>",
+            input_tokens=999, output_tokens=999,
+            cache_creation=999, cache_read=999,
+            project_path="/proj/a",  # SAME project as the real entry.
+        ),
+    ]
+    monkeypatch.setitem(
+        cctally_ns, "get_claude_session_entries",
+        lambda *a, **kw: entries,
+    )
+
+    snap = dash.build_cache_report_snapshot(
+        now_utc=now_utc,
+        anomaly_threshold_pp=15,
+        anomaly_window_days=14,
+        display_tz=ZoneInfo("Etc/UTC"),
+    )
+
+    # Both axes collapse to one bucket (synthetic entry filtered).
+    assert len(snap.by_project) == 1
+    assert len(snap.by_model) == 1
+    # Cache hit % MUST be identical on both axes. Expected from the real
+    # entry alone: 300 / (100 + 200 + 300) = 50%.
+    assert abs(snap.by_project[0].cache_hit_percent - 50.0) < 1e-9
+    assert abs(snap.by_model[0].cache_hit_percent - 50.0) < 1e-9
+    assert snap.by_project[0].cache_hit_percent == snap.by_model[0].cache_hit_percent
+    # net_usd also agrees.
+    assert abs(snap.by_project[0].net_usd - snap.by_model[0].net_usd) < 1e-9
+
+
+def test_build_cache_report_snapshot_delta_pp_sign_matches_spec(monkeypatch):
+    """Spec §4.2: ``delta_pp`` is signed; **negative = today below median**
+    (i.e. ``delta = today − baseline``). Pre-fix the dashboard computed
+    ``baseline − today`` (sign flipped) and the empty-day branch hardcoded
+    ``delta_pp = baseline_median`` (read as "delta IS the median").
+    """
+    dash, cctally_ns = _bootstrap_dashboard()
+    # Anchor at 2026-05-21 so the trailing 14d window has plenty of room.
+    now_utc = dt.datetime(2026, 5, 21, 23, 0, tzinfo=dt.timezone.utc)
+
+    # Build 7 baseline days of stable high cache hit (~70%) and TODAY at
+    # ~4% hit. baseline_median should be ~70%, today_hit_pct ~4% → delta
+    # should be a large NEGATIVE number (today below median).
+    baseline_dates = [
+        dt.datetime(2026, 5, d, 12, 0, tzinfo=dt.timezone.utc)
+        for d in range(14, 21)  # 2026-05-14 .. 2026-05-20 (7 days, NOT today)
+    ]
+    entries = [
+        _make_joined_entry(
+            ts_utc=ts,
+            model="claude-sonnet-4-5",
+            input_tokens=100, cache_creation=0, cache_read=233,  # 233/333 ≈ 70%
+            project_path="/proj/a",
+        )
+        for ts in baseline_dates
+    ]
+    # Today (2026-05-21) at low hit %: input=700, read=30 → 30/730 ≈ 4%.
+    entries.append(
+        _make_joined_entry(
+            ts_utc=dt.datetime(2026, 5, 21, 12, 0, tzinfo=dt.timezone.utc),
+            model="claude-sonnet-4-5",
+            input_tokens=700, cache_creation=0, cache_read=30,
+            project_path="/proj/a",
+        )
+    )
+
+    monkeypatch.setitem(
+        cctally_ns, "get_claude_session_entries",
+        lambda *a, **kw: entries,
+    )
+
+    snap = dash.build_cache_report_snapshot(
+        now_utc=now_utc,
+        anomaly_threshold_pp=15,
+        anomaly_window_days=14,
+        display_tz=ZoneInfo("Etc/UTC"),
+    )
+
+    assert snap.today.date == "2026-05-21"
+    assert snap.today.baseline_median_percent is not None
+    assert snap.today.delta_pp is not None
+    # Today (~4%) is well below baseline (~70%); delta MUST be negative
+    # per spec §4.2.
+    assert snap.today.delta_pp < 0, (
+        f"delta_pp={snap.today.delta_pp} — spec §4.2 says today-below-median is NEGATIVE"
+    )
+    # The relation: delta_pp == today.cache_hit_percent − baseline_median.
+    expected = (
+        snap.today.cache_hit_percent - snap.today.baseline_median_percent
+    )
+    assert abs(snap.today.delta_pp - expected) < 1e-9, (
+        f"delta_pp={snap.today.delta_pp} != today − baseline ({expected})"
+    )
+
+
 def test_build_cache_report_snapshot_days_bounded_by_window(monkeypatch):
     """Spec §4.2: ``days`` has length up to ``window_days`` (i.e. <= 14).
 

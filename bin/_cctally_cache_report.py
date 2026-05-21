@@ -41,6 +41,20 @@ class CacheModelBreakdown:
 
 
 @dataclass
+class CacheBreakdownRow:
+    """One row of the panel/modal by-project / by-model breakdown.
+
+    Carried by the kernel so by-project and by-model share a single
+    aggregation path. The dashboard wraps each into the SSE-side frozen
+    ``CacheReportBreakdownRow`` (same field shape) without further
+    transformation.
+    """
+    key: str
+    cache_hit_percent: float
+    net_usd: float
+
+
+@dataclass
 class CacheRow:
     # Identity (exactly one group populated)
     date: str | None = None
@@ -672,6 +686,92 @@ def _classify_anomalies(
 
         row.anomaly_reasons = reasons
         row.anomaly_triggered = bool(reasons)
+
+
+# ---------------------------------------------------------------------------
+# Window-wide breakdown aggregator (by-project / by-model dedup)
+# ---------------------------------------------------------------------------
+
+def _aggregate_cache_breakdown(
+    entries: Iterable,
+    *,
+    key_fn: Callable[[Any], str],
+    pricing: dict,
+    skip_synthetic: bool = True,
+    top_n: int = 5,
+    other_label: str = "(other)",
+) -> tuple[CacheBreakdownRow, ...]:
+    """Sum cache hit % + net $ per bucket; top ``top_n`` + ``(other)``.
+
+    Single source of truth for the dashboard's by-project AND by-model
+    breakdowns (spec §4.2). The caller injects ``key_fn`` to pick the
+    bucket label per entry:
+
+    - by-project: ``lambda e: getattr(e, "project_path", None) or "(unknown)"``
+    - by-model:   ``lambda e: e.model``
+
+    ``skip_synthetic`` drops ``e.model == "<synthetic>"`` entries before
+    bucketing — Claude Code's internal markers aren't real model calls
+    and would inflate token totals for whichever axis is keyed on
+    something other than ``model``. Defaults to True so both axes agree
+    on which entries contribute (closes the by-project / by-model
+    drift previously caused by an inconsistent filter on the two
+    dashboard-side helpers).
+
+    Sorted by ``abs(net_usd)`` desc. When there are more than ``top_n``
+    buckets, the tail collapses into a single ``(other)`` row whose
+    ``cache_hit_percent`` is the TRUE aggregate hit % across the tail's
+    token totals (not a placeholder zero, not the mean of the tail's
+    per-bucket percentages) — matches the by-project numbers users
+    would see if they widened the top-N.
+    """
+    buckets: dict[str, dict[str, Any]] = {}
+    for e in entries:
+        if skip_synthetic and getattr(e, "model", None) == "<synthetic>":
+            continue
+        key = key_fn(e)
+        b = buckets.setdefault(key, {
+            "input": 0, "creation": 0, "read": 0,
+            "saved": 0.0, "wasted": 0.0, "net": 0.0,
+        })
+        b["input"] += getattr(e, "input_tokens", 0)
+        b["creation"] += getattr(e, "cache_creation_tokens", 0)
+        b["read"] += getattr(e, "cache_read_tokens", 0)
+        saved, wasted, net = _compute_entry_cache_dollars(
+            getattr(e, "model", ""),
+            getattr(e, "cache_creation_tokens", 0),
+            getattr(e, "cache_read_tokens", 0),
+            pricing=pricing,
+        )
+        b["saved"] += saved
+        b["wasted"] += wasted
+        b["net"] += net
+
+    out: list[CacheBreakdownRow] = []
+    for key, b in buckets.items():
+        out.append(CacheBreakdownRow(
+            key=key,
+            cache_hit_percent=_compute_cache_hit_percent(
+                b["input"], b["creation"], b["read"],
+            ),
+            net_usd=b["net"],
+        ))
+    out.sort(key=lambda r: abs(r.net_usd), reverse=True)
+    if len(out) <= top_n:
+        return tuple(out)
+    head = out[:top_n]
+    tail = out[top_n:]
+    tail_keys = {r.key for r in tail}
+    other_net = sum(r.net_usd for r in tail)
+    # True aggregate hit % over the tail buckets:
+    tail_input = sum(b["input"] for k, b in buckets.items() if k in tail_keys)
+    tail_creation = sum(b["creation"] for k, b in buckets.items() if k in tail_keys)
+    tail_read = sum(b["read"] for k, b in buckets.items() if k in tail_keys)
+    other_pct = _compute_cache_hit_percent(tail_input, tail_creation, tail_read)
+    head.append(CacheBreakdownRow(
+        key=other_label, cache_hit_percent=other_pct, net_usd=other_net,
+    ))
+    return tuple(head)
 
 
 # ---------------------------------------------------------------------------

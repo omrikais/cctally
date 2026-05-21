@@ -563,3 +563,148 @@ def test_build_cache_report_rejects_unknown_mode():
             pricing=_PRICING_SONNET,
             mode="invalid",  # type: ignore[arg-type]
         )
+
+
+# ---------------------------------------------------------------------------
+# _aggregate_cache_breakdown — single source of truth for by-project /
+# by-model breakdowns (closes the synthetic-filter inconsistency I1 where
+# the old by-project helper did NOT skip synthetic but by-model DID).
+# ---------------------------------------------------------------------------
+
+def _make_flat_entry(
+    *, model: str = "claude-sonnet-4-6",
+    input_tokens: int = 0, cache_creation: int = 0, cache_read: int = 0,
+    project_path: str | None = "/proj/a",
+) -> SimpleNamespace:
+    """Minimal _JoinedClaudeEntry-shaped object for breakdown aggregation.
+
+    ``_aggregate_cache_breakdown`` reads ``model``, ``input_tokens``,
+    ``cache_creation_tokens``, ``cache_read_tokens``, and whatever the
+    caller's ``key_fn`` pulls (``project_path`` for by-project).
+    """
+    return SimpleNamespace(
+        model=model,
+        input_tokens=input_tokens,
+        cache_creation_tokens=cache_creation,
+        cache_read_tokens=cache_read,
+        project_path=project_path,
+    )
+
+
+def test_aggregate_cache_breakdown_synthetic_filter_agrees_across_axes():
+    """I1 regression (code-review round 1): the by-project and by-model
+    breakdowns MUST report identical token totals when a session has both
+    a real and a synthetic entry on the same project. Pre-fix the two
+    axes used inconsistent filter logic — the by-project helper did NOT
+    skip ``model == '<synthetic>'`` while by-model did — so the synthetic
+    entry's tokens leaked into the by-project hit % but not by-model.
+    Funneling both axes through ``_aggregate_cache_breakdown`` (one
+    skip-synthetic rule) closes the drift by construction.
+    """
+    real = _make_flat_entry(
+        model="claude-sonnet-4-6",
+        input_tokens=100, cache_creation=200, cache_read=300,
+        project_path="/proj/a",
+    )
+    synth = _make_flat_entry(
+        model="<synthetic>",
+        input_tokens=999, cache_creation=999, cache_read=999,
+        project_path="/proj/a",  # SAME project as the real entry.
+    )
+
+    by_project = crk._aggregate_cache_breakdown(
+        [real, synth],
+        key_fn=lambda e: (getattr(e, "project_path", None) or "(unknown)"),
+        pricing=_PRICING_SONNET,
+        skip_synthetic=True,
+    )
+    by_model = crk._aggregate_cache_breakdown(
+        [real, synth],
+        key_fn=lambda e: e.model,
+        pricing=_PRICING_SONNET,
+        skip_synthetic=True,
+    )
+
+    # Both axes see exactly one bucket (the synthetic entry is filtered;
+    # by-project has /proj/a, by-model has claude-sonnet-4-6).
+    assert len(by_project) == 1
+    assert len(by_model) == 1
+    assert by_project[0].key == "/proj/a"
+    assert by_model[0].key == "claude-sonnet-4-6"
+
+    # Cache hit % MUST be the same on both axes (the I1 invariant).
+    # Expected from the real entry alone:
+    # cache_read / (input + creation + read) = 300 / (100+200+300) = 50%.
+    expected_hit_pct = 50.0
+    assert abs(by_project[0].cache_hit_percent - expected_hit_pct) < 1e-9
+    assert abs(by_model[0].cache_hit_percent - expected_hit_pct) < 1e-9
+    assert by_project[0].cache_hit_percent == by_model[0].cache_hit_percent
+
+    # net_usd also agrees (synthetic entry's tokens dropped on both axes,
+    # so the only contributor is the real entry).
+    assert abs(by_project[0].net_usd - by_model[0].net_usd) < 1e-9
+
+
+def test_aggregate_cache_breakdown_skip_synthetic_false_includes_them():
+    """When ``skip_synthetic=False`` the synthetic entry's tokens DO
+    contribute (kept as an escape hatch for future callers that need
+    full-population aggregation; the dashboard pins it to True)."""
+    real = _make_flat_entry(
+        model="claude-sonnet-4-6",
+        input_tokens=100, cache_creation=0, cache_read=0,
+        project_path="/proj/a",
+    )
+    synth = _make_flat_entry(
+        model="<synthetic>",
+        input_tokens=900, cache_creation=0, cache_read=0,
+        project_path="/proj/a",
+    )
+    rows = crk._aggregate_cache_breakdown(
+        [real, synth],
+        key_fn=lambda e: (getattr(e, "project_path", None) or "(unknown)"),
+        pricing=_PRICING_SONNET,
+        skip_synthetic=False,
+    )
+    # Both buckets collapsed into one /proj/a row; the synthetic entry's
+    # 900 input tokens contributed to the bucket. cache_read=0 means
+    # cache_hit_percent stays 0.0.
+    assert len(rows) == 1
+    assert rows[0].key == "/proj/a"
+    assert rows[0].cache_hit_percent == 0.0
+
+
+def test_aggregate_cache_breakdown_top_n_plus_other_collapse():
+    """7 buckets with top_n=5 collapse the tail into ``(other)``."""
+    entries = [
+        _make_flat_entry(
+            model="claude-sonnet-4-6",
+            input_tokens=100, cache_read=100,
+            project_path=f"/proj/{i}",
+        )
+        for i in range(7)
+    ]
+    rows = crk._aggregate_cache_breakdown(
+        entries,
+        key_fn=lambda e: (getattr(e, "project_path", None) or "(unknown)"),
+        pricing=_PRICING_SONNET,
+        skip_synthetic=True,
+        top_n=5,
+    )
+    assert len(rows) == 6
+    assert rows[-1].key == "(other)"
+
+
+def test_aggregate_cache_breakdown_none_project_collapses_to_unknown():
+    """The caller's ``key_fn`` is responsible for the ``(unknown)``
+    fallback when ``project_path`` is None (matches the dashboard
+    wiring); the kernel itself just calls key_fn."""
+    e_none = _make_flat_entry(
+        input_tokens=100, cache_read=100, project_path=None,
+    )
+    rows = crk._aggregate_cache_breakdown(
+        [e_none],
+        key_fn=lambda e: (getattr(e, "project_path", None) or "(unknown)"),
+        pricing=_PRICING_SONNET,
+    )
+    assert len(rows) == 1
+    assert rows[0].key == "(unknown)"

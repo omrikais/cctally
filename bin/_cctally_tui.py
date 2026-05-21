@@ -2144,11 +2144,13 @@ def _tui_build_snapshot(
                 threshold_pp = 15
             if threshold_pp < 1 or threshold_pp > 100:
                 threshold_pp = 15
-            _bcr = sys.modules["_cctally_dashboard"].build_cache_report_snapshot
+            _dash_mod = sys.modules["_cctally_dashboard"]
+            _bcr = _dash_mod.build_cache_report_snapshot
             cache_report_block = _bcr(
                 now_utc=now_utc,
                 anomaly_threshold_pp=threshold_pp,
-                anomaly_window_days=14,  # v1: hardcoded
+                # Hardcoded for v1; F10 tracks lifting via cache_report.anomaly_window_days config.
+                anomaly_window_days=_dash_mod.CACHE_REPORT_WINDOW_DAYS,
                 display_tz=_build_display_tz,
             )
         except Exception as exc:
