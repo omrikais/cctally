@@ -14,10 +14,22 @@ function KeyTable({ panelOrder }: KeyTableProps) {
       <tbody>
         {panelOrder.map((id, idx) => (
           <tr key={id}>
-            {/* 10th panel renders '0' (not '10') — mirrors the main.tsx
-                keymap binding for position 10. */}
-            <td><kbd>{idx === 9 ? '0' : String(idx + 1)}</kbd></td>
-            <td>Open {PANEL_REGISTRY[id].label} modal</td>
+            {/* Positions 1..10 are bound to digits 1, 2, …, 9, 0 in
+                main.tsx (position 10 renders '0', not '10'). Positions
+                ≥ 11 have NO digit binding — render an em-dash instead
+                of a literal "11". Spec 2026-05-21 §1 defers multi-key
+                chord support to F9. The rule is positional, not panel-
+                id-specific. */}
+            <td>
+              {idx < 9 ? (
+                <kbd>{String(idx + 1)}</kbd>
+              ) : idx === 9 ? (
+                <kbd>0</kbd>
+              ) : (
+                <span aria-hidden="true">—</span>
+              )}
+            </td>
+            <td>Open {PANEL_REGISTRY[id]?.label ?? id} modal</td>
           </tr>
         ))}
         <tr><td><kbd>r</kbd></td><td>force refresh</td></tr>
