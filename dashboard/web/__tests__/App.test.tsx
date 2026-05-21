@@ -35,13 +35,15 @@ describe('<App />', () => {
     const order = hosts.map((h) => h.dataset.panelHost);
     // Full expected order: 'current-week' moves from index 0 to index 3 via splice;
     // assert the entire array to catch off-by-one or direction regressions.
-    // Default 10-panel order with 'current-week' moved from index 0 to
-    // index 3: splice removes index 0, splice inserts at index 3 of the
-    // remaining 9-list, so 'current-week' lands AHEAD of 'projects'.
+    // Default 11-panel order (with 'cache-report' appended per spec
+    // 2026-05-21 §1) with 'current-week' moved from index 0 to index 3:
+    // splice removes index 0, splice inserts at index 3 of the remaining
+    // 10-list, so 'current-week' lands AHEAD of 'projects'.
     expect(order).toEqual([
       'forecast', 'trend', 'sessions', 'current-week',
       'projects',
       'weekly', 'monthly', 'blocks', 'daily', 'alerts',
+      'cache-report',
     ]);
   });
 });

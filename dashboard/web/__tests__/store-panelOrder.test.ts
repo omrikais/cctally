@@ -18,7 +18,11 @@ describe('Prefs.panelOrder', () => {
   });
 
   it('reads a previously-persisted custom order (post-migration schema)', () => {
-    const custom: PanelId[] = ['daily', 'blocks', 'monthly', 'weekly', 'projects', 'sessions', 'trend', 'forecast', 'current-week', 'alerts'];
+    // 11 entries — Task B3 (spec 2026-05-21) added 'cache-report' to
+    // DEFAULT_PANEL_ORDER. The persisted order must include it for the
+    // reconciler to round-trip verbatim (missing ids would otherwise be
+    // appended).
+    const custom: PanelId[] = ['daily', 'blocks', 'monthly', 'weekly', 'projects', 'sessions', 'trend', 'forecast', 'current-week', 'alerts', 'cache-report'];
     localStorage.setItem('ccusage.dashboard.prefs', JSON.stringify({
       sortDefault: 'started desc',
       sessionsPerPage: 100,
@@ -37,6 +41,8 @@ describe('Prefs.panelOrder', () => {
 
   it('upgrades a v1 saved order by splicing projects at index 4', () => {
     // v1 = no panelOrderSchemaVersion key, no 'projects' in panelOrder.
+    // The cache-report panel is also missing because the v1 user never
+    // had it; the reconciler appends it to the tail after migration.
     const v1Custom: PanelId[] = [
       'daily', 'blocks', 'monthly', 'weekly',
       'sessions', 'trend', 'forecast', 'current-week', 'alerts',
@@ -50,6 +56,7 @@ describe('Prefs.panelOrder', () => {
       'daily', 'blocks', 'monthly', 'weekly',
       'projects',  // spliced at canonical index 4
       'sessions', 'trend', 'forecast', 'current-week', 'alerts',
+      'cache-report',  // appended by reconciler since not in v1 saved order
     ]);
     expect(initial.prefs.panelOrderSchemaVersion).toBe(2);
     // Migration is persisted immediately so a refresh doesn't re-fire it.

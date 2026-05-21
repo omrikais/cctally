@@ -9,6 +9,7 @@ import { MonthlyPanel } from '../panels/MonthlyPanel';
 import { BlocksPanel } from '../panels/BlocksPanel';
 import { DailyPanel } from '../panels/DailyPanel';
 import { RecentAlertsPanel } from '../components/RecentAlertsPanel';
+import { CacheReportPanel } from '../panels/CacheReportPanel';
 import { dispatch } from '../store/store';
 import {
   openActiveOrNewestBlockModal,
@@ -89,5 +90,11 @@ export const PANEL_REGISTRY: Record<PanelId, PanelDef> = {
     label: 'Recent alerts',
     Component: RecentAlertsPanel,
     openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'alerts' }),
+  },
+  'cache-report': {
+    id: 'cache-report',
+    label: 'Cache Report',
+    Component: CacheReportPanel,
+    openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'cache-report' }),
   },
 };
