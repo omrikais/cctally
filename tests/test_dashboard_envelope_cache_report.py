@@ -225,3 +225,63 @@ def test_build_cache_report_snapshot_threshold_propagates(monkeypatch):
     assert snap.anomaly_threshold_pp == 25
     assert snap.anomaly_window_days == 14
     assert snap.window_days == 14  # v1: hardcoded
+
+
+def test_build_cache_report_snapshot_days_bounded_by_window(monkeypatch):
+    """Spec §4.2: ``days`` has length up to ``window_days`` (i.e. <= 14).
+
+    The kernel's ``since = now_utc - timedelta(days=14)`` rolling window
+    can straddle midnight in ``display_tz``, producing 15 distinct
+    calendar-date buckets. Without an explicit slice, ``days`` would
+    exceed ``window_days`` and break the contract any TS / React
+    consumer relies on (the sparkline ladder is hard-sized to 14
+    points). Regression for the spec-compliance review finding.
+
+    Concrete edge: ``now_utc = 2026-05-21T02:00Z`` = ``2026-05-20T18:00 PT``;
+    ``since = 2026-05-07T02:00Z`` = ``2026-05-06T18:00 PT``. The PT-local
+    calendar dates in ``[since, now_utc]`` are
+    ``2026-05-06 … 2026-05-20`` = 15 distinct buckets — one more than
+    ``window_days=14``.
+    """
+    dash, cctally_ns = _bootstrap_dashboard()
+    now_utc = dt.datetime(2026, 5, 21, 2, 0, tzinfo=dt.timezone.utc)
+    # Seed one entry on each of the 15 PT-local calendar dates the
+    # window straddles. Use 18:30 PT (= 01:30 UTC the next day) so each
+    # entry lands inside `[now_utc - 14d, now_utc]` AND maps to a
+    # distinct PT-local bucket.
+    pt = ZoneInfo("America/Los_Angeles")
+    pt_dates = [
+        dt.datetime(2026, 5, d, 18, 30, tzinfo=pt)
+        for d in range(6, 21)  # 2026-05-06 .. 2026-05-20 (15 days)
+    ]
+    entries = [
+        _make_joined_entry(
+            ts_utc=ts.astimezone(dt.timezone.utc),
+            cache_read=2000, cache_creation=200,
+            input_tokens=500, output_tokens=100,
+        )
+        for ts in pt_dates
+    ]
+    monkeypatch.setitem(
+        cctally_ns, "get_claude_session_entries",
+        lambda *a, **kw: entries,
+    )
+
+    snap = dash.build_cache_report_snapshot(
+        now_utc=now_utc,
+        anomaly_threshold_pp=15,
+        anomaly_window_days=14,
+        display_tz=pt,
+    )
+    # Sanity-check the edge: without a slice the kernel produces 15 buckets.
+    # Each date in pt_dates lives in `[since, now_utc]` and each maps to a
+    # unique PT calendar date, so the kernel returns 15 rows pre-slice.
+    # Spec §4.2 caps ``days`` length at ``window_days``.
+    assert snap.window_days == 14
+    assert len(snap.days) <= snap.window_days, (
+        f"days has {len(snap.days)} entries — exceeds window_days="
+        f"{snap.window_days} (spec §4.2)"
+    )
+    # Newest-first ordering means today (2026-05-20 PT) is at index 0
+    # and the oldest retained day is 13 entries back.
+    assert snap.days[0].date == "2026-05-20"

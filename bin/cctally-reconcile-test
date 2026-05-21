@@ -182,6 +182,157 @@ reconcile_invariant "cache_report_eq_daily_per_date" "$FIXTURES/cache-report/day
     "daily --json" \
     "$INVARIANT_3_PY"
 
+# ── Cache-report snapshot invariants (R-CR1..R-CR4) ────────────────────
+# Spec §7.9: assertions over the dashboard envelope built by
+# ``build_cache_report_snapshot`` (the CLI's ``cache-report --json``
+# emits per-row financials but not the envelope-level rollups —
+# ``today.*``, ``seven_day_*``, ``fourteen_day_*`` — that the panel /
+# modal consume). Each fixture spawns its own Python subprocess so the
+# module-level ``APP_DIR`` / ``CACHE_DB_PATH`` constants in ``cctally``
+# bind to the fixture's HOME at import time (the credit_invariants
+# pattern below this block uses the same recipe for the same reason).
+#
+# R-CR1: today.net_usd == today.saved_usd − today.wasted_usd (within 1e-9).
+# R-CR2: Σ days[0..7].net_usd == seven_day_net_usd (within 1e-9).
+# R-CR3: Σ days[0..14].saved_usd == fourteen_day_counterfactual_usd
+#        (within 1e-9).
+# R-CR4: fourteen_day_efficiency_ratio ==
+#        Σsaved / (Σsaved + Σ|wasted|) within 1e-9 when denom > 0;
+#        0.0 when denom == 0.
+#
+# Fixture coverage: cache-drop-anomaly carries one anomalous day +
+# five clean baseline days so the invariants exercise both branches
+# (anomaly_triggered=True/False rows interleave in the 14-day window).
+# healthy-cache-hit covers the all-clean path. net-negative-anomaly
+# stresses the wasted_usd-dominant path (R-CR4 denom path with a
+# negative net total).
+cache_report_snapshot_invariants () {
+    local name="cache_report_snapshot_invariants"
+    local fixture
+    for fixture in cache-drop-anomaly healthy-cache-hit net-negative-anomaly; do
+        local fixture_home="$FIXTURES/cache-report/$fixture"
+        if [ ! -f "$fixture_home/input.env" ]; then
+            echo "RECONCILE FAIL $name $fixture: no input.env"
+            fail_count=$((fail_count + 1))
+            continue
+        fi
+        local AS_OF=""
+        # shellcheck disable=SC1091
+        . "$fixture_home/input.env"
+        if [ -z "$AS_OF" ]; then
+            echo "RECONCILE FAIL $name $fixture: input.env missing AS_OF"
+            fail_count=$((fail_count + 1))
+            continue
+        fi
+
+        local result rc_py
+        result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" \
+                 HOME="$fixture_home" TZ=Etc/UTC AS_OF="$AS_OF" \
+                 FIXTURE_LABEL="$fixture" \
+                 python3 - <<'PYCR' 2>&1)
+import importlib.util, os, pathlib, sys, types, datetime as dt
+from importlib.machinery import SourceFileLoader
+
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+script_path = repo_root / "bin" / "cctally"
+mod = types.ModuleType("cctally")
+mod.__file__ = str(script_path)
+sys.modules["cctally"] = mod
+code = compile(script_path.read_text(), str(script_path), "exec")
+exec(code, mod.__dict__)
+
+sys.path.insert(0, str(repo_root / "bin"))
+import _cctally_dashboard as D
+
+label = os.environ["FIXTURE_LABEL"]
+as_of = os.environ["AS_OF"].rstrip("Z")
+now_utc = dt.datetime.fromisoformat(as_of).replace(tzinfo=dt.timezone.utc)
+
+# Build the snapshot exactly as the dashboard sync thread would, with
+# the same hardcoded v1 anomaly knobs (spec §6.1). display_tz=None
+# means "host-local" — under TZ=Etc/UTC + tzset that's UTC, matching
+# the fixture builder's bucketing assumptions.
+snap = D.build_cache_report_snapshot(
+    now_utc=now_utc,
+    anomaly_threshold_pp=15,
+    anomaly_window_days=14,
+    display_tz=None,
+)
+
+# Defensive: every fixture in this loop is expected to produce a
+# non-empty snapshot. If a future fixture re-uses this slot with no
+# entries, the invariants would silently pass (R-CR3/R-CR4 with
+# empty sums are vacuously true). Fail loud so the maintainer
+# notices.
+assert not snap.is_empty, (
+    f"R-CR ({label}) fail: snapshot is empty — fixture has no entries"
+)
+
+# R-CR1: today.net_usd == today.saved_usd − today.wasted_usd.
+r_cr1 = abs(
+    snap.today.net_usd - (snap.today.saved_usd - snap.today.wasted_usd)
+)
+assert r_cr1 < 1e-9, (
+    f"R-CR1 ({label}) fail (spec §7.9): "
+    f"today.net_usd={snap.today.net_usd} vs saved−wasted="
+    f"{snap.today.saved_usd - snap.today.wasted_usd} "
+    f"|diff|={r_cr1} >= 1e-9"
+)
+
+# R-CR2: Σ days[0..7].net_usd == seven_day_net_usd.
+seven_day_rows = snap.days[:7]
+seven_sum = sum(r.net_usd for r in seven_day_rows)
+r_cr2 = abs(seven_sum - snap.seven_day_net_usd)
+assert r_cr2 < 1e-9, (
+    f"R-CR2 ({label}) fail (spec §7.9): "
+    f"Σ days[0..7].net_usd={seven_sum} vs "
+    f"seven_day_net_usd={snap.seven_day_net_usd} "
+    f"|diff|={r_cr2} >= 1e-9"
+)
+
+# R-CR3: Σ days[0..14].saved_usd == fourteen_day_counterfactual_usd.
+saved_sum = sum(r.saved_usd for r in snap.days)
+r_cr3 = abs(saved_sum - snap.fourteen_day_counterfactual_usd)
+assert r_cr3 < 1e-9, (
+    f"R-CR3 ({label}) fail (spec §7.9): "
+    f"Σ days[].saved_usd={saved_sum} vs "
+    f"fourteen_day_counterfactual_usd="
+    f"{snap.fourteen_day_counterfactual_usd} "
+    f"|diff|={r_cr3} >= 1e-9"
+)
+
+# R-CR4: fourteen_day_efficiency_ratio matches sum(saved) / (sum(saved)
+# + sum(|wasted|)) within 1e-9 when denom > 0; 0.0 when denom == 0.
+wasted_abs_sum = sum(abs(r.wasted_usd) for r in snap.days)
+denom = saved_sum + wasted_abs_sum
+if denom > 1e-9:
+    expected_ratio = saved_sum / denom
+else:
+    expected_ratio = 0.0
+r_cr4 = abs(snap.fourteen_day_efficiency_ratio - expected_ratio)
+assert r_cr4 < 1e-9, (
+    f"R-CR4 ({label}) fail (spec §7.9): "
+    f"fourteen_day_efficiency_ratio="
+    f"{snap.fourteen_day_efficiency_ratio} vs expected="
+    f"{expected_ratio} (Σsaved={saved_sum}, "
+    f"Σ|wasted|={wasted_abs_sum}, denom={denom}) "
+    f"|diff|={r_cr4} >= 1e-9"
+)
+
+print("OK")
+PYCR
+        rc_py=$?
+        if [ $rc_py -ne 0 ]; then
+            echo "RECONCILE FAIL $name $fixture: $result"
+            fail_count=$((fail_count + 1))
+        else
+            echo "PASS $name $fixture (R-CR1..R-CR4)"
+            pass_count=$((pass_count + 1))
+        fi
+    done
+}
+cache_report_snapshot_invariants
+
 # Invariant 4: codex-monthly.costUSD == Σ codex-daily.costUSD for entries in
 # the month. codex-daily's date format is "Mar 31, 2026"; codex-monthly's
 # month format is "Mar 2026". Parse both to map daily entries to months.

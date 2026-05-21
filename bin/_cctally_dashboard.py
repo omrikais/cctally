@@ -2156,10 +2156,22 @@ def build_cache_report_snapshot(
             baseline_daily_row_count=baseline_daily_row_count,
         )
 
-    # Daily rows — newest first.
+    # Daily rows — newest first, capped at ``window_days``.
+    #
+    # Slice cap (spec §4.2 — "length up to ``window_days``"): the kernel's
+    # ``since = now_utc - timedelta(days=window_days)`` rolling window
+    # straddles midnight in any non-UTC ``display_tz`` (and in fact even
+    # in UTC, since ``now_utc - 14d`` and ``now_utc`` flank the same
+    # wall-clock minute on different calendar dates), so the kernel can
+    # emit ``window_days + 1`` distinct calendar-date buckets. Capping
+    # here (and not in the kernel) keeps the kernel agnostic of the
+    # envelope's hard ceiling while honoring the contract every TS /
+    # React consumer relies on (the sparkline ladder is hard-sized to
+    # ``window_days`` points). Regression:
+    # ``test_build_cache_report_snapshot_days_bounded_by_window``.
     days_newest_first = sorted(
         result.rows, key=lambda r: r.date or "", reverse=True,
-    )
+    )[:window_days]
     days = tuple(
         CacheReportDailyRow(
             date=r.date or "",
