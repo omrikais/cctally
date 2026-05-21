@@ -4189,3 +4189,258 @@ mark.current {
     display: none;
   }
 }
+
+/* =========================================================================
+   Cache Report modal (.crm-*)
+   Spec 2026-05-21 §3 — six sub-sections, per-column header accents on
+   the daily-rows table, settings popover.
+   ========================================================================= */
+
+.crm-header {
+  border-bottom: 1px solid rgba(45,212,191,0.28);
+}
+
+/* Today's spotlight sub-card */
+.crm-spotlight {
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 18px;
+  background: linear-gradient(180deg, rgba(45,212,191,0.04), transparent);
+  border: 1px solid rgba(45,212,191,0.28);
+}
+.crm-spotlight.anom {
+  background: linear-gradient(180deg, rgba(251,191,36,0.07), transparent);
+  border-color: rgba(251,191,36,0.32);
+}
+.crm-spotlight .pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 10px; border-radius: 4px; font-size: 12px; font-weight: 600;
+  border: 1px solid rgba(251,191,36,0.36);
+  background: rgba(251,191,36,0.18); color: var(--accent-amber);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.crm-spotlight .pill.ok {
+  background: rgba(61,220,132,0.18); color: var(--accent-green);
+  border-color: rgba(61,220,132,0.36);
+}
+.crm-spotlight .pill.thin {
+  background: rgba(255,255,255,0.05); color: var(--text-dim);
+  border-color: rgba(255,255,255,0.10);
+}
+.crm-spotlight .k {
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-right: 4px;
+}
+.crm-spotlight strong {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.crm-spotlight .reasons {
+  margin-top: 8px; font-size: 11px; color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+.crm-spotlight .reasons code {
+  color: var(--accent-amber); background: transparent; padding: 0;
+}
+
+/* Section heading colors */
+.crm-section { margin-bottom: 18px; }
+.crm-section .crm-section-head {
+  display: flex; align-items: baseline; gap: 10px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+  font-weight: 700; margin-bottom: 8px;
+}
+.crm-section .meta {
+  color: var(--text-faint); font-weight: 400;
+  text-transform: none; letter-spacing: 0; font-size: 11px; margin-left: auto;
+}
+.crm-sh-spotlight  { color: var(--accent-teal); }
+.crm-sh-timeline   { color: var(--accent-cyan); }
+.crm-sh-net        { color: var(--accent-purple); }
+.crm-sh-table      { color: var(--accent-teal); }
+.crm-sh-projects   { color: var(--accent-magenta); }
+.crm-sh-models     { color: var(--accent-blue); }
+
+/* Chart frames */
+.crm-chart-frame {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px; padding: 10px 12px;
+}
+.crm-chart-frame.timeline { border-color: rgba(34,211,238,0.22); }
+.crm-chart-frame.netbars  { border-color: rgba(192,132,252,0.22); }
+
+/* Counterfactual callout */
+.crm-counterfactual {
+  margin-top: 14px;
+  margin-bottom: 18px;
+  background: rgba(61,220,132,0.05);
+  border: 1px solid rgba(61,220,132,0.22);
+  border-radius: 8px; padding: 10px 14px;
+  font-size: 12.5px; color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+.crm-counterfactual strong {
+  color: var(--accent-green); font-size: 14px; font-weight: 700;
+}
+
+/* Daily rows table — per-column header accents (.ch-table) */
+.ch-table {
+  width: 100%; border-collapse: collapse; font-size: 12.5px;
+  font-family: var(--font-mono);
+}
+.ch-table thead th {
+  text-align: left; font-weight: 700;
+  padding: 4px 12px 8px 0;
+  text-transform: uppercase; font-size: 10.5px; letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--border-soft);
+}
+.ch-table thead th.num { text-align: right; }
+.ch-table thead th.c-date    { color: var(--text); }
+.ch-table thead th.c-hit     { color: var(--accent-cyan); }
+.ch-table thead th.c-tokens  { color: var(--text-dim); }
+.ch-table thead th.c-saved   { color: var(--accent-green); }
+.ch-table thead th.c-wasted  { color: var(--accent-red); }
+.ch-table thead th.c-net     { color: var(--accent-purple); }
+.ch-table thead th.c-flag    { color: var(--accent-amber); }
+
+.ch-table tbody td {
+  padding: 5px 12px 5px 0;
+  font-variant-numeric: tabular-nums;
+}
+.ch-table tbody td.num { text-align: right; }
+.ch-table tbody tr.cur {
+  background: rgba(251,191,36,0.07);
+}
+.ch-table tbody tr.cur td:first-child {
+  border-left: 2px solid var(--accent-amber);
+  padding-left: 8px;
+}
+.ch-table tbody td.hit-good { color: var(--accent-cyan); }
+.ch-table tbody td.hit-bad  { color: var(--accent-amber); }
+.ch-table tbody td.net-pos  { color: var(--accent-green); }
+.ch-table tbody td.net-neg  { color: var(--accent-amber); }
+.ch-table tbody td.flag-warn { color: var(--accent-amber); }
+.ch-table tbody td.flag-ok   { color: var(--text-faint); }
+.ch-table tbody tr:hover td  { background: rgba(255,255,255,0.02); }
+
+/* Breakdown sub-cards */
+.crm-breakdowns {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+}
+.crm-bd-card {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px; padding: 12px 14px;
+}
+.crm-bd-card.bd-projects { border-color: rgba(217,70,239,0.24); }
+.crm-bd-card.bd-models   { border-color: rgba(96,165,250,0.24); }
+.crm-bd-card .crm-bd-head {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em;
+  font-weight: 700; margin-bottom: 8px;
+}
+.crm-bd-card.bd-projects .crm-bd-head { color: var(--accent-magenta); }
+.crm-bd-card.bd-models   .crm-bd-head { color: var(--accent-blue); }
+.crm-bd-card table {
+  width: 100%; border-collapse: collapse; font-size: 12px;
+  font-family: var(--font-mono);
+}
+.crm-bd-card td {
+  padding: 3px 0; font-variant-numeric: tabular-nums;
+}
+.crm-bd-card td:last-child { text-align: right; }
+.crm-bd-card td.net-pos { color: var(--accent-green); }
+.crm-bd-card td.net-neg { color: var(--accent-amber); }
+.crm-bd-card .empty {
+  color: var(--text-dim); font-size: 11px; font-style: italic;
+}
+
+/* Settings popover (anchored beneath the modal header gear icon) */
+.crm-settings-popover {
+  position: absolute; right: 16px; top: 48px;
+  background: var(--panel-bg);
+  border: 1px solid var(--accent-teal);
+  border-radius: 8px;
+  padding: 14px 16px;
+  width: 280px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  z-index: 100;
+}
+.crm-settings-popover h4 {
+  margin: 0 0 10px;
+  color: var(--accent-teal);
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+}
+.crm-settings-popover label {
+  display: block; margin-bottom: 6px;
+  font-size: 11px; color: var(--text-dim);
+}
+.crm-settings-popover input {
+  width: 100%; padding: 6px 8px;
+  background: var(--panel-bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  color: var(--text); font-family: var(--font-mono);
+  font-size: 13px;
+  box-sizing: border-box;
+}
+.crm-settings-popover input.invalid {
+  border-color: var(--accent-red);
+}
+.crm-settings-popover .err {
+  margin-top: 6px; font-size: 11px; color: var(--accent-red);
+}
+.crm-settings-popover .saved {
+  margin-top: 6px; font-size: 11px; color: var(--accent-green);
+}
+.crm-settings-popover .actions {
+  display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px;
+}
+.crm-settings-popover button {
+  padding: 4px 12px;
+  background: var(--panel-bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+  font-family: var(--font-mono); font-size: 12px;
+}
+.crm-settings-popover button.primary {
+  background: rgba(45,212,191,0.18);
+  border-color: var(--accent-teal);
+  color: var(--accent-teal);
+}
+
+/* Modal-side mobile reflow (< 720 px). The panel-side mobile reflow
+   sits above in the @media block. */
+@media (max-width: 719px) {
+  .crm-breakdowns { grid-template-columns: 1fr; }
+  /* Table → card form, mirroring the trend modal pattern at
+     index.css:3236+. */
+  .ch-table thead { display: none; }
+  .ch-table tbody, .ch-table tr {
+    display: block; padding: 0;
+  }
+  .ch-table tr {
+    border-bottom: 1px solid var(--border-soft);
+    padding: 8px 0;
+  }
+  .ch-table tbody td {
+    display: inline-block;
+    padding: 2px 6px 2px 0;
+  }
+  .ch-table tbody td:first-child {
+    display: block;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  /* Mobile settings popover anchors to the screen bottom as a sheet. */
+  .crm-settings-popover {
+    position: fixed; left: 0; right: 0; bottom: 0; top: auto;
+    width: auto; border-radius: 8px 8px 0 0;
+  }
+}

@@ -214,3 +214,20 @@ describe('<CacheReportPanel /> empty state', () => {
     expect(document.querySelector('.cr-spark')).toBeNull();
   });
 });
+
+describe('<CacheReportPanel /> loading state', () => {
+  it('renders loading placeholder before first sync', () => {
+    // No snapshot ingested — env?.cache_report is undefined. The panel
+    // still mounts so panelOrder/drag-and-drop has a real DOM target,
+    // and the click is wired so the modal can still open.
+    render(<CacheReportPanel />);
+    const panel = screen.getByRole('region', { name: /cache report/i });
+    expect(panel).toHaveClass('accent-teal');
+    expect(screen.getByText(/\(loading\)/i)).toBeInTheDocument();
+    // Sparkline omitted before first sync.
+    expect(document.querySelector('.cr-spark')).toBeNull();
+    // Clicking the loading placeholder still opens the modal.
+    fireEvent.click(panel);
+    expect(getState().openModal).toBe('cache-report');
+  });
+});

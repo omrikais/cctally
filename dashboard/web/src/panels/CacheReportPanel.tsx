@@ -22,6 +22,7 @@
 // No ShareIcon in v1 — cache-report is not in SHARE_CAPABLE_PANELS
 // (spec §2.6).
 import { useSnapshot } from '../hooks/useSnapshot';
+import { useIsMobile } from '../hooks/useIsMobile';
 import { dispatch } from '../store/store';
 import { PanelGrip } from '../components/PanelGrip';
 import { CacheSparkline } from '../modals/CacheSparkline';
@@ -46,6 +47,13 @@ function floorPct(p: number): number {
 export function CacheReportPanel() {
   const env = useSnapshot();
   const cr = env?.cache_report;
+  // Mobile-driven collapse (< 720 px). The `.cache-report-collapsed`
+  // modifier class hides the sparkline + secondary subline via the
+  // existing @media rule at index.css:4186 so the panel reads as a
+  // single-line summary on phones. Mirrors the daily-collapsed /
+  // sessions-collapsed convention but is viewport-driven (no user pref).
+  const isMobile = useIsMobile();
+  const collapseClass = isMobile ? ' cache-report-collapsed' : '';
   const openModal = () => dispatch({ type: 'OPEN_MODAL', kind: 'cache-report' });
 
   // No data yet — minimal placeholder (envelope cold-start). The panel
@@ -55,7 +63,7 @@ export function CacheReportPanel() {
   if (!cr) {
     return (
       <section
-        className="panel accent-teal"
+        className={`panel accent-teal${collapseClass}`}
         id="panel-cache-report"
         data-panel-kind="cache-report"
         role="region"
@@ -80,7 +88,7 @@ export function CacheReportPanel() {
   if (cr.is_empty) {
     return (
       <section
-        className="panel accent-teal"
+        className={`panel accent-teal${collapseClass}`}
         id="panel-cache-report"
         data-panel-kind="cache-report"
         role="region"
@@ -199,7 +207,7 @@ export function CacheReportPanel() {
 
   return (
     <section
-      className={`panel ${accentClass}`}
+      className={`panel ${accentClass}${collapseClass}`}
       id="panel-cache-report"
       data-panel-kind="cache-report"
       role="region"
