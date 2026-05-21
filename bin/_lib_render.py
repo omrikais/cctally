@@ -206,10 +206,11 @@ def _render_blocks_table(
         return f"{h}h {m:02d}m"
 
     def _fmt_gap_duration(total_seconds: float) -> str:
-        hours = round(total_seconds / 3600)
-        if hours < 1:
-            hours = 1
-        return f"{hours}h gap"
+        total_minutes = int(total_seconds / 60)
+        if total_minutes < 60:
+            return f"{max(total_minutes, 1)}m gap"
+        h, m = divmod(total_minutes, 60)
+        return f"{h}h {m:02d}m gap" if m else f"{h}h gap"
 
     # ── determine if % column is needed ─────────────────────────────────
     max_completed_tokens = 0

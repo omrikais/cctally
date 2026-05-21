@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- `blocks` gap rows now render the correct duration. Pre-fix, `_fmt_gap_duration` in `bin/_lib_render.py` computed `round(total_seconds / 3600)` and clamped sub-hour values to 1, so every gap shorter than 30 minutes surfaced as `"1h gap"` (e.g. a 5-minute or 1-minute gap rendered identically to a 50-minute gap). The bug was hidden until #76: the pre-#76 partition floored block boundaries to 10-minute increments, which usually erased the sub-hour seam between adjacent recorded windows; once #76 routed `(bs, rs)` through `_exact_interval(R)`, real ~1-minute seams became visible and the formatter's coarseness surfaced. The fix mirrors the existing `_fmt_duration_hm` shape: sub-hour gaps render as `"Nm gap"` (with `max(N, 1)` to floor at one minute), 60+ minute gaps render as `"Hh Mm gap"` or `"Hh gap"` when minutes are zero. Additionally, gaps shorter than 60 seconds are suppressed at the phase-3 gap-insertion site in `_group_entries_into_blocks` (`bin/_lib_blocks.py`) — a 1-second seam from a `:59:59` end to a `:00:00` start no longer emits a row. Regression: new `tests/test_blocks_gap_rendering.py` (5 renderer cases — 5m / 30m / 60m / 90m / 12h — plus 2 grouper cases for sub-minute suppression and 65s-threshold boundary); `tests/fixtures/blocks/floor-band-trap/golden-terminal.txt` updated to assert `"5m gap"` on its 5-minute seam. ([#79](https://github.com/omrikais/cctally-dev/issues/79))
+
 ## [1.10.2] - 2026-05-21
 
 ### Fixed

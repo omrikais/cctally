@@ -290,6 +290,10 @@ def _group_entries_into_blocks(
             if prev.end_time < b.start_time:
                 first_entry_ts = first_entry_ts_by_block.get(id(b), b.start_time)
                 prev_actual_end = prev.actual_end_time or prev.end_time
+                gap_seconds = (first_entry_ts - prev_actual_end).total_seconds()
+                if gap_seconds < 60:
+                    final_blocks.append(b)
+                    continue
                 final_blocks.append(Block(
                     start_time=prev_actual_end,
                     end_time=first_entry_ts,
