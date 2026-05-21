@@ -229,3 +229,127 @@ def test_aggregate_by_day_sums_tokens_across_models():
     assert [mb.model_name for mb in row.model_breakdowns] == [
         "claude-haiku-4-5", "claude-sonnet-4-6"
     ]
+
+
+# ---------------------------------------------------------------------------
+# Task A4 — _aggregate_cache_by_session
+# ---------------------------------------------------------------------------
+
+def _make_session_entry(
+    *, ts_utc: dt.datetime, model: str = "claude-sonnet-4-6",
+    input_tokens: int = 0, output_tokens: int = 0,
+    cache_creation: int = 0, cache_read: int = 0,
+    cost_usd: float | None = None,
+    source_path: str = "/tmp/abc-1234.jsonl",
+    session_id: str | None = "sess-1",
+    project_path: str | None = "/home/user/proj",
+) -> SimpleNamespace:
+    """Minimal ClaudeSessionEntry-shaped object (kernel session input).
+
+    Matches the shape produced by ``get_claude_session_entries`` —
+    flat ``input_tokens`` / ``cache_creation_tokens`` / ``cost_usd`` /
+    ``session_id`` / ``project_path`` / ``source_path`` attributes
+    (vs. day-mode's ``usage`` dict).
+    """
+    return SimpleNamespace(
+        timestamp=ts_utc,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_tokens=cache_creation,
+        cache_read_tokens=cache_read,
+        cost_usd=cost_usd,
+        source_path=source_path,
+        session_id=session_id,
+        project_path=project_path,
+    )
+
+
+def test_aggregate_by_session_returns_empty_for_no_entries():
+    rows = crk._aggregate_cache_by_session(
+        [],
+        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
+        pricing=_PRICING_SONNET,
+    )
+    assert rows == []
+
+
+def test_aggregate_by_session_merges_two_files_one_session():
+    """Two source files sharing a session_id collapse into one row."""
+    base = dt.datetime(2026, 5, 20, 12, 0, tzinfo=dt.timezone.utc)
+    entries = [
+        _make_session_entry(
+            ts_utc=base,
+            input_tokens=100, cache_read=200,
+            source_path="/tmp/a.jsonl", session_id="sess-1",
+        ),
+        _make_session_entry(
+            ts_utc=base + dt.timedelta(hours=1),
+            input_tokens=50, cache_read=80,
+            source_path="/tmp/b.jsonl", session_id="sess-1",
+        ),
+    ]
+    rows = crk._aggregate_cache_by_session(
+        entries,
+        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
+        pricing=_PRICING_SONNET,
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.session_id == "sess-1"
+    assert row.input_tokens == 150
+    assert row.cache_read_tokens == 280
+    assert sorted(row.source_paths) == ["/tmp/a.jsonl", "/tmp/b.jsonl"]
+    # Most-recent activity is the second entry.
+    assert row.last_activity == base + dt.timedelta(hours=1)
+
+
+def test_aggregate_by_session_skips_synthetic_model():
+    """Entries with ``model == '<synthetic>'`` are dropped before bucketing."""
+    base = dt.datetime(2026, 5, 20, 12, 0, tzinfo=dt.timezone.utc)
+    entries = [
+        _make_session_entry(
+            ts_utc=base,
+            model="<synthetic>",
+            input_tokens=999,
+            session_id="sess-synth",
+        ),
+        _make_session_entry(
+            ts_utc=base + dt.timedelta(hours=1),
+            input_tokens=10, cache_read=20,
+            session_id="sess-real",
+        ),
+    ]
+    rows = crk._aggregate_cache_by_session(
+        entries,
+        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
+        pricing=_PRICING_SONNET,
+    )
+    assert len(rows) == 1
+    assert rows[0].session_id == "sess-real"
+
+
+def test_aggregate_by_session_falls_back_to_filename_uuid_stem_when_session_id_null():
+    """Entries with NULL session_id fall back to the source path's filename
+    UUID stem (the same convention ``cctally session`` uses)."""
+    base = dt.datetime(2026, 5, 20, 12, 0, tzinfo=dt.timezone.utc)
+    entries = [
+        _make_session_entry(
+            ts_utc=base,
+            input_tokens=10, cache_read=20,
+            source_path="/tmp/abc-1234.jsonl",
+            session_id=None,
+        ),
+    ]
+    rows = crk._aggregate_cache_by_session(
+        entries,
+        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
+        pricing=_PRICING_SONNET,
+    )
+    assert len(rows) == 1
+    # filename stem = part before first "."
+    assert rows[0].session_id == "abc-1234"

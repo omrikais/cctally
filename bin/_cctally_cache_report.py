@@ -319,3 +319,228 @@ def _aggregate_cache_by_day(
             row.net_usd += mb.net_usd
         result.append(row)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Session-mode aggregator (resume-merged across JSONL files)
+# ---------------------------------------------------------------------------
+
+def _filename_uuid_stem(path: str) -> str:
+    """Extract the UUID stem from a JSONL filename.
+
+    Claude JSONL files are named ``<uuid>.jsonl``; fall back to the full
+    filename (without extension) if the stem isn't a valid UUID shape.
+    Matches the ``session`` subcommand's convention for unresolved session
+    IDs. Stays pure — uses only ``str.partition``, no ``os.path`` and no
+    syscalls.
+    """
+    # The original lived in bin/cctally and used os.path.basename; this
+    # rebuild matches that contract with pure-string slicing so the
+    # kernel doesn't import os.
+    last_slash = path.rfind("/")
+    base = path[last_slash + 1:] if last_slash != -1 else path
+    stem, _, _ = base.partition(".")
+    return stem
+
+
+def _default_project_decoder(source_path: str) -> str:
+    """Fallback project label when the caller doesn't inject a decoder.
+
+    Returns the basename of the directory containing the JSONL — the same
+    raw label ``_decode_escaped_cwd(os.path.basename(os.path.dirname(...)))``
+    operated on, but without the escape-decoding. CLI / dashboard callers
+    inject the full ``_decode_escaped_cwd`` so resumed sessions display the
+    decoded cwd. Pure-string slicing keeps the kernel ``os``-free.
+    """
+    last_slash = source_path.rfind("/")
+    if last_slash == -1:
+        return source_path
+    parent = source_path[:last_slash]
+    parent_slash = parent.rfind("/")
+    return parent[parent_slash + 1:] if parent_slash != -1 else parent
+
+
+@dataclass
+class _SessionAggregationResult:
+    """Bundles session rows + the fallback warning count.
+
+    Returned by ``_aggregate_cache_by_session_with_warnings`` so callers
+    can choose whether to emit the "N entries lacked session_files rows"
+    one-shot warning. The plain ``_aggregate_cache_by_session`` wrapper
+    discards the count for the common case.
+    """
+    rows: list[CacheRow]
+    fallback_count: int
+
+
+def _aggregate_cache_by_session_with_warnings(
+    entries: Iterable,
+    *,
+    since: dt.datetime,
+    until: dt.datetime,
+    pricing: dict,
+    cost_calculator: Callable[[str, dict, str, Optional[float]], float] | None = None,
+    project_decoder: Callable[[str], str] | None = None,
+) -> _SessionAggregationResult:
+    """Group Claude entries by sessionId (resumed-merged) within ``[since, until]``.
+
+    Resume-merging: entries from multiple JSONL files sharing a sessionId
+    collapse into one row. ``project_path`` reflects the most-recent
+    in-window entry's resolved project (with a per-session fallback to
+    the decoded cwd from the source path's parent directory).
+
+    Synthetic entries (``model == '<synthetic>'``) are dropped — they're
+    Claude Code's internal markers, not real model calls — before any
+    bucketing, so they don't inflate the fallback count either.
+
+    Entries with ``session_id is None`` fall back to the filename UUID
+    stem (matching ``cctally session``); the count of such fallback
+    entries rides back on ``_SessionAggregationResult.fallback_count``
+    so the caller can emit the legacy one-shot stderr warning.
+
+    ``cost_calculator`` and ``pricing`` mirror the day-mode kernel — both
+    are injected so the kernel stays free of pricing globals /
+    cost-dispatch I/O. ``project_decoder`` is the optional
+    ``_decode_escaped_cwd``-style helper (defaults to a raw dirname
+    basename).
+
+    ``since`` / ``until`` are accepted for caller parity; the kernel
+    trusts callers to pre-filter entries via their own query.
+    """
+    cc = cost_calculator if cost_calculator is not None else _default_entry_cost
+    pd = project_decoder if project_decoder is not None else _default_project_decoder
+
+    _ = since
+    _ = until
+
+    # buckets[sid] = {"entries": [...], "project_path": str|None,
+    #                 "last_activity": dt|None, "source_paths": set[str]}
+    buckets: dict[str, dict[str, Any]] = {}
+    fallback_count = 0
+    for entry in entries:
+        if entry.model == "<synthetic>":
+            continue
+        sid = entry.session_id
+        if sid is None:
+            sid = _filename_uuid_stem(entry.source_path)
+            fallback_count += 1
+        b = buckets.setdefault(sid, {
+            "entries": [],
+            # Seed with decoded-cwd fallback so rows still resolve a
+            # Project cell while session_files backfill is incomplete.
+            # Real project_path from session_files (if present on any
+            # joined row) overrides below.
+            "project_path": pd(entry.source_path),
+            "last_activity": None,
+            "source_paths": set(),
+        })
+        b["entries"].append(entry)
+        b["source_paths"].add(entry.source_path)
+        if b["last_activity"] is None or entry.timestamp > b["last_activity"]:
+            b["last_activity"] = entry.timestamp
+            # Project path from most-recent in-window entry that has it.
+            if entry.project_path:
+                b["project_path"] = entry.project_path
+
+    result: list[CacheRow] = []
+    for sid, b in buckets.items():
+        # Per-model sub-buckets scoped to this session's entries.
+        model_buckets: dict[str, dict[str, Any]] = {}
+        for entry in b["entries"]:
+            mb_raw = model_buckets.setdefault(entry.model, {
+                "inputTokens": 0, "outputTokens": 0,
+                "cacheCreationTokens": 0, "cacheReadTokens": 0, "cost": 0.0,
+                "savedUsd": 0.0, "wastedUsd": 0.0, "netUsd": 0.0,
+            })
+            mb_raw["inputTokens"] += entry.input_tokens
+            mb_raw["outputTokens"] += entry.output_tokens
+            mb_raw["cacheCreationTokens"] += entry.cache_creation_tokens
+            mb_raw["cacheReadTokens"] += entry.cache_read_tokens
+            mb_raw["cost"] += cc(
+                entry.model,
+                {
+                    "input_tokens": entry.input_tokens,
+                    "output_tokens": entry.output_tokens,
+                    "cache_creation_input_tokens": entry.cache_creation_tokens,
+                    "cache_read_input_tokens": entry.cache_read_tokens,
+                },
+                "auto",
+                entry.cost_usd,
+            )
+            saved, wasted, net = _compute_entry_cache_dollars(
+                entry.model,
+                entry.cache_creation_tokens,
+                entry.cache_read_tokens,
+                pricing=pricing,
+            )
+            mb_raw["savedUsd"] += saved
+            mb_raw["wastedUsd"] += wasted
+            mb_raw["netUsd"] += net
+
+        row = CacheRow(
+            session_id=sid,
+            project_path=b["project_path"],
+            last_activity=b["last_activity"],
+            source_paths=sorted(b["source_paths"]),
+        )
+        for model_name in sorted(model_buckets.keys()):
+            mb_raw = model_buckets[model_name]
+            mb = CacheModelBreakdown(
+                model_name=model_name,
+                input_tokens=mb_raw["inputTokens"],
+                output_tokens=mb_raw["outputTokens"],
+                cache_creation_tokens=mb_raw["cacheCreationTokens"],
+                cache_read_tokens=mb_raw["cacheReadTokens"],
+                cache_hit_percent=_compute_cache_hit_percent(
+                    mb_raw["inputTokens"],
+                    mb_raw["cacheCreationTokens"],
+                    mb_raw["cacheReadTokens"],
+                ),
+                cost=mb_raw["cost"],
+                saved_usd=mb_raw["savedUsd"],
+                wasted_usd=mb_raw["wastedUsd"],
+                net_usd=mb_raw["netUsd"],
+            )
+            row.model_breakdowns.append(mb)
+            row.input_tokens += mb.input_tokens
+            row.output_tokens += mb.output_tokens
+            row.cache_creation_tokens += mb.cache_creation_tokens
+            row.cache_read_tokens += mb.cache_read_tokens
+            row.cost += mb.cost
+            row.saved_usd += mb.saved_usd
+            row.wasted_usd += mb.wasted_usd
+            row.net_usd += mb.net_usd
+        result.append(row)
+
+    # Initial ordering descending by last_activity; the CLI's
+    # ``_sort_cache_rows`` may resort under ``--sort``. Use tz-aware
+    # sentinel to avoid naive-vs-aware comparison errors on rows missing
+    # last_activity.
+    _min_dt = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    result.sort(key=lambda r: r.last_activity or _min_dt, reverse=True)
+    return _SessionAggregationResult(rows=result, fallback_count=fallback_count)
+
+
+def _aggregate_cache_by_session(
+    entries: Iterable,
+    *,
+    since: dt.datetime,
+    until: dt.datetime,
+    pricing: dict,
+    cost_calculator: Callable[[str, dict, str, Optional[float]], float] | None = None,
+    project_decoder: Callable[[str], str] | None = None,
+) -> list[CacheRow]:
+    """Thin wrapper around ``_aggregate_cache_by_session_with_warnings``
+    that discards the fallback warning count.
+
+    Callers that want to emit the legacy "N entries lacked session_files
+    rows" one-shot warning should reach for
+    ``_aggregate_cache_by_session_with_warnings`` directly.
+    """
+    return _aggregate_cache_by_session_with_warnings(
+        entries,
+        since=since, until=until,
+        pricing=pricing,
+        cost_calculator=cost_calculator,
+        project_decoder=project_decoder,
+    ).rows
