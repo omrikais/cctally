@@ -380,6 +380,72 @@ def _validate_update_check_ttl_hours_value(*args, **kwargs):
     return sys.modules["cctally"]._validate_update_check_ttl_hours_value(*args, **kwargs)
 
 
+# === Cache-report settings validator (spec 2026-05-21 §6) ================
+# Validates the optional ``config.json:cache_report`` block. Strict in
+# v1: only ``anomaly_threshold_pp`` is settable, must be a plain int in
+# ``[1, 100]`` (bool / float / string rejected — bool because it's an
+# int subclass in Python and quietly accepting ``true`` for a numeric
+# field is exactly the trip-up ``_validate_update_check_ttl_hours_value``
+# protects against). HTTP write path raises ``_CacheReportConfigError``
+# → ``_handle_post_settings`` maps to HTTP 400 + ``{error, field}``
+# (matches the existing handler convention at lines 4587-4602; spec
+# explicitly says 400, NOT 422).
+
+@dataclass(frozen=True)
+class _CacheReportSettings:
+    anomaly_threshold_pp: int
+
+
+class _CacheReportConfigError(Exception):
+    """Validation error for the ``cache_report`` config block.
+
+    ``field`` carries the offending key path (``anomaly_threshold_pp`` or
+    the unknown-key name) so the JSON 400 response can surface it.
+    """
+    def __init__(self, message: str, *, field: str | None = None):
+        super().__init__(message)
+        self.field = field
+
+
+_CACHE_REPORT_ALLOWED_KEYS = frozenset({"anomaly_threshold_pp"})
+
+
+def _validate_cache_report_settings(block: dict) -> _CacheReportSettings:
+    """Validate a ``cache_report`` config block.
+
+    Pure function. Raises ``_CacheReportConfigError`` on invalid input;
+    returns ``_CacheReportSettings`` with defaults filled in otherwise.
+
+    v1 only accepts ``anomaly_threshold_pp`` — ``anomaly_window_days``
+    stays hardcoded at 14 (spec §6.1; F10 from spec §10 tracks adding
+    a configurable baseline window along with the UI-copy work).
+    """
+    if not isinstance(block, dict):
+        raise _CacheReportConfigError(
+            "cache_report must be an object", field="cache_report",
+        )
+    for key in block:
+        if key not in _CACHE_REPORT_ALLOWED_KEYS:
+            raise _CacheReportConfigError(
+                f"unknown key in cache_report block: {key!r}",
+                field=key,
+            )
+    threshold = block.get("anomaly_threshold_pp", 15)
+    # bool is an int subclass — reject it explicitly (mirrors the
+    # update.check.ttl_hours precedent).
+    if isinstance(threshold, bool) or not isinstance(threshold, int):
+        raise _CacheReportConfigError(
+            "anomaly_threshold_pp must be an integer",
+            field="anomaly_threshold_pp",
+        )
+    if threshold < 1 or threshold > 100:
+        raise _CacheReportConfigError(
+            "anomaly_threshold_pp must be in [1, 100]",
+            field="anomaly_threshold_pp",
+        )
+    return _CacheReportSettings(anomaly_threshold_pp=threshold)
+
+
 def _config_known_value(*args, **kwargs):
     return sys.modules["cctally"]._config_known_value(*args, **kwargs)
 
@@ -5068,10 +5134,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         """Persist a settings update and trigger an immediate SSE broadcast.
 
         Body shape: ``{"display"?: {"tz": "..."}, "alerts"?: {...},
-        "update"?: {"check"?: {"enabled"?: bool, "ttl_hours"?: int}}}``
-        — every top-level key is optional; any subset may be sent
-        together (combined save). Unknown top-level keys are rejected
-        with 400.
+        "update"?: {"check"?: {"enabled"?: bool, "ttl_hours"?: int}},
+        "cache_report"?: {"anomaly_threshold_pp"?: int}}`` — every
+        top-level key is optional; any subset may be sent together
+        (combined save). Unknown top-level keys are rejected with 400.
 
         Per-block validation:
           * ``display.tz`` — "local", "utc", or a valid IANA zone (via
@@ -5085,6 +5151,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             ``[1, 720]``; 400 on out-of-range or non-int. Bool is rejected
             (Python ``True`` is an int subclass, so a permissive check
             would silently accept ``true`` for a numeric field).
+          * ``cache_report.anomaly_threshold_pp`` — JSON int (NOT bool /
+            float / string), in ``[1, 100]``; 400 with
+            ``{error, field: "anomaly_threshold_pp"}`` on out-of-range
+            or non-int. Spec §6.1 hardcodes ``anomaly_window_days``;
+            F10 tracks lifting that.
 
         Atomic merged write: if all touched blocks validate, the merged
         config is persisted in a single ``save_config`` call inside the
@@ -5136,7 +5207,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             return
 
         # Reject unknown top-level keys (forward-compat hygiene).
-        allowed_top_keys = {"display", "alerts", "update"}
+        allowed_top_keys = {"display", "alerts", "update", "cache_report"}
         for k in payload.keys():
             if k not in allowed_top_keys:
                 self._respond_json(
@@ -5149,15 +5220,41 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             "display" not in payload
             and "alerts" not in payload
             and "update" not in payload
+            and "cache_report" not in payload
         ):
             self._respond_json(
                 400,
                 {"error": (
                     "body must contain at least one of: "
-                    "display, alerts, update"
+                    "display, alerts, update, cache_report"
                 )},
             )
             return
+
+        # Pre-validate cache_report block (spec 2026-05-21 §6.2). Outside
+        # the config_writer_lock so a 400 short-circuit doesn't take the
+        # lock unnecessarily. Returns HTTP 400 (NOT 422) on validation
+        # error — matches the convention every other block here uses.
+        cache_report_validated: "_CacheReportSettings | None" = None
+        if "cache_report" in payload:
+            cache_report_block = payload["cache_report"]
+            if not isinstance(cache_report_block, dict):
+                self._respond_json(
+                    400,
+                    {"error": "cache_report must be an object",
+                     "field": "cache_report"},
+                )
+                return
+            try:
+                cache_report_validated = _validate_cache_report_settings(
+                    cache_report_block
+                )
+            except _CacheReportConfigError as exc:
+                self._respond_json(
+                    400,
+                    {"error": str(exc), "field": exc.field or "cache_report"},
+                )
+                return
 
         # Pre-validate display block (outside the config_writer_lock so a
         # 400 short-circuit doesn't take the lock unnecessarily).
@@ -5346,6 +5443,21 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 merged_update["check"] = merged_check
                 merged["update"] = merged_update
 
+            if cache_report_validated is not None:
+                # Same hand-edited-junk guard as alerts / update: a non
+                # -dict ``cache_report`` block in config.json should
+                # surface as a recoverable 400, not a 500.
+                existing_cr = merged.get("cache_report")
+                if existing_cr is not None and not isinstance(existing_cr, dict):
+                    self._respond_json(
+                        400, {"error": "cache_report must be an object",
+                              "field": "cache_report"}
+                    )
+                    return
+                merged["cache_report"] = {
+                    "anomaly_threshold_pp": cache_report_validated.anomaly_threshold_pp,
+                }
+
             save_config(merged)
 
         # Build the response: subset of touched blocks.
@@ -5368,6 +5480,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                         merged, "update.check.ttl_hours"
                     ),
                 }
+            }
+        if cache_report_validated is not None:
+            out["cache_report"] = {
+                "anomaly_threshold_pp": cache_report_validated.anomaly_threshold_pp,
             }
         out["saved_at"] = (
             dt.datetime.now(dt.timezone.utc)
