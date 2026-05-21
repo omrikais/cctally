@@ -18,12 +18,14 @@ export type PanelId =
   | 'monthly'
   | 'blocks'
   | 'daily'
-  | 'alerts';
+  | 'alerts'
+  | 'cache-report';
 
 export const DEFAULT_PANEL_ORDER: PanelId[] = [
   'current-week', 'forecast', 'trend', 'sessions',
   'projects',
   'weekly', 'monthly', 'blocks', 'daily', 'alerts',
+  'cache-report',
 ];
 
 // Panels for which a share affordance is rendered (spec §6.1, plan §M1.9).
