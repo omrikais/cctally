@@ -467,3 +467,99 @@ def test_compute_baseline_median_returns_value_when_sufficient():
     assert median is not None
     # All rows have 233/333 ≈ 69.97%
     assert abs(median - (233 / 333 * 100)) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# Task A6 — _build_cache_report orchestrator
+# ---------------------------------------------------------------------------
+
+def test_build_cache_report_end_to_end_clean_run():
+    """Full pipeline: 7 days of clean data → no anomalies, today healthy."""
+    base = dt.datetime(2026, 5, 14, 12, 0, tzinfo=dt.timezone.utc)
+    entries = [
+        _make_entry(
+            ts_utc=base + dt.timedelta(days=d),
+            cache_read=2000, cache_creation=200,
+            input_tokens=500, output_tokens=100,
+        )
+        for d in range(7)  # 7 days of data ending 2026-05-20
+    ]
+    now_utc = dt.datetime(2026, 5, 20, 23, 0, tzinfo=dt.timezone.utc)
+    result = crk._build_cache_report(
+        entries,
+        now_utc=now_utc,
+        window_days=14,
+        anomaly_threshold_pp=15,
+        anomaly_window_days=14,
+        display_tz=ZoneInfo("Etc/UTC"),
+        pricing=_PRICING_SONNET,
+        mode="day",
+    )
+    assert len(result.rows) == 7
+    assert all(r.anomaly_triggered is False for r in result.rows)
+    today_row = result.rows[-1]
+    assert today_row.date == "2026-05-20"
+    assert result.mode == "day"
+    assert result.window_days == 14
+    assert result.anomaly_threshold_pp == 15
+    assert result.display_tz_key == "Etc/UTC"
+
+
+def test_build_cache_report_passes_display_tz_none_through():
+    """display_tz=None → result.display_tz_key is None (host-local fallback)."""
+    base = dt.datetime(2026, 5, 20, 12, 0, tzinfo=dt.timezone.utc)
+    entries = [_make_entry(ts_utc=base, cache_read=100)]
+    result = crk._build_cache_report(
+        entries,
+        now_utc=base + dt.timedelta(hours=1),
+        window_days=14,
+        anomaly_threshold_pp=15,
+        anomaly_window_days=14,
+        display_tz=None,
+        pricing=_PRICING_SONNET,
+        mode="day",
+    )
+    assert result.display_tz_key is None
+    assert len(result.rows) == 1
+
+
+def test_build_cache_report_anomaly_disabled():
+    """When anomaly_enabled=False, classifier zeros out all anomaly fields."""
+    base = dt.datetime(2026, 5, 1, 12, 0, tzinfo=dt.timezone.utc)
+    # Insert a deliberately-anomalous today (net_negative) plus baseline.
+    entries = []
+    for d in range(20):
+        entries.append(_make_entry(
+            ts_utc=base + dt.timedelta(days=d),
+            cache_read=1000, cache_creation=200, input_tokens=100,
+        ))
+    now_utc = base + dt.timedelta(days=20)
+    result = crk._build_cache_report(
+        entries,
+        now_utc=now_utc,
+        window_days=14,
+        anomaly_threshold_pp=15,
+        anomaly_window_days=14,
+        display_tz=ZoneInfo("Etc/UTC"),
+        pricing=_PRICING_SONNET,
+        mode="day",
+        anomaly_enabled=False,
+    )
+    assert all(r.anomaly_triggered is False for r in result.rows)
+    assert all(r.anomaly_reasons == [] for r in result.rows)
+
+
+def test_build_cache_report_rejects_unknown_mode():
+    import pytest
+    base = dt.datetime(2026, 5, 20, 12, 0, tzinfo=dt.timezone.utc)
+    with pytest.raises(ValueError, match="unknown mode"):
+        crk._build_cache_report(
+            [_make_entry(ts_utc=base)],
+            now_utc=base,
+            window_days=14,
+            anomaly_threshold_pp=15,
+            anomaly_window_days=14,
+            display_tz=ZoneInfo("Etc/UTC"),
+            pricing=_PRICING_SONNET,
+            mode="invalid",  # type: ignore[arg-type]
+        )

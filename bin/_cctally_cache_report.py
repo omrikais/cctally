@@ -672,3 +672,88 @@ def _classify_anomalies(
 
         row.anomaly_reasons = reasons
         row.anomaly_triggered = bool(reasons)
+
+
+# ---------------------------------------------------------------------------
+# Top-level orchestrator
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _CacheReportResult:
+    """Internal dataclass returned by ``_build_cache_report``.
+
+    Consumed by both the CLI renderer (which formats into table or JSON)
+    and the dashboard snapshot builder (which shapes into
+    ``CacheReportSnapshot`` for the SSE envelope). ``display_tz_key`` is
+    the resolved IANA zone name (or ``None`` when the caller passed
+    ``display_tz=None`` and the kernel fell back to host-local).
+    """
+    rows: list[CacheRow]
+    mode: Literal["day", "session"]
+    window_days: int
+    anomaly_threshold_pp: int
+    anomaly_window_days: int
+    display_tz_key: str | None
+
+
+def _build_cache_report(
+    entries: Iterable,
+    *,
+    now_utc: dt.datetime,
+    window_days: int,
+    anomaly_threshold_pp: int,
+    anomaly_window_days: int,
+    display_tz: ZoneInfo | None,
+    pricing: dict,
+    mode: Literal["day", "session"] = "day",
+    cost_calculator: Callable[[str, dict, str, Optional[float]], float] | None = None,
+    project_decoder: Callable[[str], str] | None = None,
+    anomaly_enabled: bool = True,
+) -> _CacheReportResult:
+    """Top-level orchestrator: aggregate + classify anomalies.
+
+    Returns a ``_CacheReportResult`` that both the CLI renderer and the
+    dashboard snapshot builder consume. Pure-function — no I/O, no
+    logging, no environment reads. Callers (CLI / dashboard) own all
+    I/O via the ``entries`` iterable + the optional ``cost_calculator``
+    / ``project_decoder`` injections.
+
+    ``mode="day"`` buckets entries by display-tz calendar date;
+    ``mode="session"`` buckets by Claude ``sessionId`` (resume-merged
+    across JSONL files). The ``since`` window for both modes is
+    ``now_utc − window_days``; the kernel trusts callers to pre-filter
+    via their own query (``get_entries`` / ``get_claude_session_entries``).
+    """
+    since = now_utc - dt.timedelta(days=window_days)
+    if mode == "day":
+        rows = _aggregate_cache_by_day(
+            entries,
+            since=since, until=now_utc,
+            display_tz=display_tz, pricing=pricing,
+            cost_calculator=cost_calculator,
+        )
+    elif mode == "session":
+        rows = _aggregate_cache_by_session(
+            entries,
+            since=since, until=now_utc,
+            pricing=pricing,
+            cost_calculator=cost_calculator,
+            project_decoder=project_decoder,
+        )
+    else:
+        raise ValueError(f"unknown mode: {mode!r}")
+
+    _classify_anomalies(
+        rows,
+        threshold_pp=anomaly_threshold_pp,
+        window_days=anomaly_window_days,
+        enabled=anomaly_enabled,
+    )
+    return _CacheReportResult(
+        rows=rows,
+        mode=mode,
+        window_days=window_days,
+        anomaly_threshold_pp=anomaly_threshold_pp,
+        anomaly_window_days=anomaly_window_days,
+        display_tz_key=display_tz.key if display_tz is not None else None,
+    )
