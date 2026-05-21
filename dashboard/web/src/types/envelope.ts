@@ -56,6 +56,64 @@ export interface Envelope {
   // `_error` is present iff the server-side gather raised (Python
   // emits a synthetic-FAIL aggregate so the chip still surfaces).
   doctor?: DoctorEnvelope;
+  // Cache Report (spec 2026-05-21). Optional + nullable; matches the
+  // additive-field pattern of update? / doctor?. envelope_version stays
+  // at 2 — no bump for additive optional fields. The Python serializer
+  // at bin/_cctally_dashboard.py :: _cache_report_snapshot_to_dict
+  // emits snake_case keys to mirror this interface field-for-field.
+  cache_report?: CacheReportEnvelope | null;
+}
+
+// Cache Report envelope (spec 2026-05-21).
+// Snake_case to match the Python envelope; see CLAUDE.md re.
+// snake/camel inconsistency between dashboard envelope and CLI --json.
+
+export interface CacheReportDailyRow {
+  date: string;                       // YYYY-MM-DD in display tz
+  cache_hit_percent: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  saved_usd: number;
+  wasted_usd: number;
+  net_usd: number;
+  anomaly_triggered: boolean;
+  anomaly_reasons: string[];
+}
+
+export interface CacheReportBreakdownRow {
+  key: string;
+  cache_hit_percent: number;
+  net_usd: number;
+}
+
+export interface CacheReportTodaySpotlight {
+  date: string;
+  cache_hit_percent: number;
+  baseline_median_percent: number | null;
+  delta_pp: number | null;
+  net_usd: number;
+  saved_usd: number;
+  wasted_usd: number;
+  anomaly_triggered: boolean;
+  anomaly_reasons: string[];
+  baseline_daily_row_count: number;
+}
+
+export interface CacheReportEnvelope {
+  window_days: number;
+  anomaly_threshold_pp: number;
+  anomaly_window_days: number;
+  today: CacheReportTodaySpotlight;
+  days: CacheReportDailyRow[];        // newest-first
+  by_project: CacheReportBreakdownRow[];
+  by_model: CacheReportBreakdownRow[];
+  seven_day_net_usd: number;
+  seven_day_anomaly_count: number;
+  fourteen_day_counterfactual_usd: number;
+  fourteen_day_efficiency_ratio: number;
+  is_empty: boolean;
 }
 
 export interface DoctorEnvelope {
