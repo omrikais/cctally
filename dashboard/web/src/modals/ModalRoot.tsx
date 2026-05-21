@@ -9,6 +9,7 @@ import { MonthlyModal } from './MonthlyModal';
 import { BlockModal } from './BlockModal';
 import { DailyModal } from './DailyModal';
 import { ProjectsModal } from './ProjectsModal';
+import { CacheReportModal } from './CacheReportModal';
 import { RecentAlertsModal } from '../components/RecentAlertsModal';
 
 export function ModalRoot() {
@@ -36,5 +37,7 @@ export function ModalRoot() {
       return <ProjectsModal />;
     case 'alerts':
       return <RecentAlertsModal />;
+    case 'cache-report':
+      return <CacheReportModal />;
   }
 }
