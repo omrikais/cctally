@@ -237,7 +237,7 @@ describe('<CacheReportModal /> settings popover', () => {
 
   it('Save dispatches POST /api/settings with the correct body', async () => {
     const fetchSpy = vi
-      .spyOn(global, 'fetch')
+      .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response('{}', { status: 200 }));
     updateSnapshot(envelopeWith(makeCacheReport()));
     render(<CacheReportModal />);
@@ -258,7 +258,7 @@ describe('<CacheReportModal /> settings popover', () => {
   });
 
   it('HTTP 400 error surfaces inline under the input', async () => {
-    vi.spyOn(global, 'fetch').mockResolvedValue(
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
           error: 'anomaly_threshold_pp must be in [1, 100]',
@@ -283,7 +283,7 @@ describe('<CacheReportModal /> settings popover', () => {
   });
 
   it('client-side guard rejects non-integer / out-of-range without dispatch', () => {
-    const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue(
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response('{}', { status: 200 }),
     );
     updateSnapshot(envelopeWith(makeCacheReport()));
