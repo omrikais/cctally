@@ -88,6 +88,55 @@ function envelopeWith(cr: CacheReportEnvelope): Envelope {
   return env;
 }
 
+function anomalousCacheReport(): CacheReportEnvelope {
+  const base = healthyCacheReport();
+  return {
+    ...base,
+    today: {
+      ...base.today,
+      cache_hit_percent: 49,
+      baseline_median_percent: 67,
+      delta_pp: 18,         // 18 pp below median
+      net_usd: -0.42,
+      saved_usd: 0.36,
+      wasted_usd: 0.78,
+      anomaly_triggered: true,
+      anomaly_reasons: ['cache_drop', 'net_negative'],
+    },
+    seven_day_anomaly_count: 2,
+  };
+}
+
+function insufficientBaselineCacheReport(): CacheReportEnvelope {
+  const base = healthyCacheReport();
+  return {
+    ...base,
+    today: {
+      ...base.today,
+      baseline_median_percent: null,
+      delta_pp: null,
+      baseline_daily_row_count: 3,
+    },
+    days: base.days.slice(0, 3),
+  };
+}
+
+function emptyCacheReport(): CacheReportEnvelope {
+  const base = healthyCacheReport();
+  return {
+    ...base,
+    today: { ...base.today, cache_hit_percent: 0 },
+    days: [],
+    by_project: [],
+    by_model: [],
+    seven_day_net_usd: 0,
+    seven_day_anomaly_count: 0,
+    fourteen_day_counterfactual_usd: 0,
+    fourteen_day_efficiency_ratio: 0,
+    is_empty: true,
+  };
+}
+
 describe('<CacheReportPanel /> healthy state', () => {
   it('renders healthy state with teal accent and the check glyph', () => {
     updateSnapshot(envelopeWith(healthyCacheReport()));
@@ -114,5 +163,54 @@ describe('<CacheReportPanel /> healthy state', () => {
     const panel = screen.getByRole('region', { name: /cache report/i });
     fireEvent.click(panel);
     expect(getState().openModal).toBe('cache-report');
+  });
+});
+
+describe('<CacheReportPanel /> anomalous state', () => {
+  it('renders anomalous state with amber accent and the warning glyph', () => {
+    updateSnapshot(envelopeWith(anomalousCacheReport()));
+    render(<CacheReportPanel />);
+    const panel = screen.getByRole('region', { name: /cache report/i });
+    expect(panel).toHaveClass('accent-amber');
+    expect(screen.queryByText('✓')).toBeNull();
+    expect(screen.getByText('⚠')).toBeInTheDocument();
+    // cache_drop wins over net_negative when both fire: headline reads
+    // "Today: cache hit ↓ 18pp" (delta floored, abs).
+    expect(screen.getByText(/↓ 18pp/)).toBeInTheDocument();
+    // Second subline surfaces the anomaly count.
+    expect(screen.getByText(/2 ⚠ days/)).toBeInTheDocument();
+  });
+
+  it('renders an amber today-marker on the sparkline when anomalous', () => {
+    updateSnapshot(envelopeWith(anomalousCacheReport()));
+    render(<CacheReportPanel />);
+    const marker = screen.getByTestId('cr-spark-today-marker');
+    // Color comes from the panel via the today_marker_color prop.
+    expect(marker.getAttribute('fill')).toBe('var(--accent-amber)');
+  });
+});
+
+describe('<CacheReportPanel /> insufficient-baseline state', () => {
+  it('renders the ~ glyph and "Building baseline N/5 days" headline', () => {
+    updateSnapshot(envelopeWith(insufficientBaselineCacheReport()));
+    render(<CacheReportPanel />);
+    const panel = screen.getByRole('region', { name: /cache report/i });
+    // Stays teal — insufficient baseline is not an anomaly.
+    expect(panel).toHaveClass('accent-teal');
+    expect(screen.getByText('~')).toBeInTheDocument();
+    expect(screen.getByText(/Building baseline · 3\/5 days/i)).toBeInTheDocument();
+    // Sparkline omitted in insufficient-baseline state.
+    expect(document.querySelector('.cr-spark')).toBeNull();
+  });
+});
+
+describe('<CacheReportPanel /> empty state', () => {
+  it('renders the − glyph and "No Claude activity yet" headline when is_empty', () => {
+    updateSnapshot(envelopeWith(emptyCacheReport()));
+    render(<CacheReportPanel />);
+    expect(screen.getByText('−')).toBeInTheDocument();
+    expect(screen.getByText(/No Claude activity yet/i)).toBeInTheDocument();
+    // Sparkline omitted in empty state.
+    expect(document.querySelector('.cr-spark')).toBeNull();
   });
 });
