@@ -16,6 +16,7 @@
   --accent-blue: #60a5fa;
   --accent-cyan: #22d3ee;
   --accent-indigo: #818cf8;
+  --accent-teal: #2dd4bf;          /* spec 2026-05-21 §1 — 11th panel */
   --chip-sonnet: #1f6d3a;
   --chip-opus:   #6d28d9;
   --chip-haiku:  #1d4ed8;
@@ -404,6 +405,7 @@ body { padding: 16px; box-sizing: border-box; }
 .panel.accent-blue   { border-color: var(--accent-blue);   --accent-line: rgba(96,165,250,0.30);  --accent-glow: rgba(96,165,250,0.06);  --pill-bg: rgba(96,165,250,0.18); }
 .panel.accent-indigo { border-color: var(--accent-indigo); --accent-line: rgba(129,140,248,0.30); --accent-glow: rgba(129,140,248,0.06); --pill-bg: rgba(129,140,248,0.18); }
 .panel.accent-magenta { border-color: var(--accent-magenta); --accent-line: rgba(217,70,239,0.30); --accent-glow: rgba(217,70,239,0.06); --pill-bg: rgba(217,70,239,0.18); }
+.panel.accent-teal   { border-color: var(--accent-teal);   --accent-line: rgba(45,212,191,0.28);  --accent-glow: rgba(45,212,191,0.06); --pill-bg: rgba(45,212,191,0.18); }
 
 .panel:hover {
   box-shadow: inset 0 0 28px var(--accent-glow);
@@ -4141,5 +4143,49 @@ mark.current {
   #root .projects-mobile-sort:focus-visible {
     outline: 2px solid var(--accent-magenta);
     outline-offset: 2px;
+  }
+}
+
+/* =========================================================================
+   Cache Report panel (.cr-*)
+   Spec 2026-05-21 §2. The panel flips between .panel.accent-teal (healthy
+   / insufficient / empty) and .panel.accent-amber (today's row triggered
+   an anomaly). Sparkline + headline / subline live inside .cr-status-row.
+   ========================================================================= */
+
+.cr-status-row {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 6px;
+}
+
+.cr-glyph {
+  font-size: 20px; line-height: 1;
+}
+.cr-glyph.ok    { color: var(--accent-green); }
+.cr-glyph.warn  { color: var(--accent-amber); }
+.cr-glyph.thin  { color: var(--text-dim); }
+
+.cr-headline {
+  font-size: 13.5px; color: var(--text);
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+}
+.cr-headline .delta-good { color: var(--accent-green); }
+.cr-headline .delta-bad  { color: var(--accent-amber); }
+
+.cr-subline {
+  font-size: 11px; color: var(--text-dim); margin-top: 4px;
+  font-family: var(--font-mono);
+}
+.cr-subline .ok   { color: var(--accent-green); }
+.cr-subline .warn { color: var(--accent-amber); }
+
+.cr-spark { display: block; margin-top: 10px; }
+
+/* Mobile collapse (< 720 px) — mirrors daily-collapsed / blocks-collapsed
+   patterns at index.css ~3236+. Implementor 3 fine-tunes if needed. */
+@media (max-width: 719px) {
+  .panel.cache-report-collapsed .cr-spark,
+  .panel.cache-report-collapsed .cr-subline.second {
+    display: none;
   }
 }
