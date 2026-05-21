@@ -39,7 +39,7 @@ const PREFS_KEY = 'ccusage.dashboard.prefs';
 const FILTER_KEY = 'ccusage.dashboard.filter';
 const LEGACY_SORT_KEY = 'ccusage.dashboard.sort'; // retired — migrated on first load
 
-export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'weekly' | 'monthly' | 'block' | 'daily' | 'alerts' | 'update' | 'projects';
+export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'weekly' | 'monthly' | 'block' | 'daily' | 'alerts' | 'update' | 'projects' | 'cache-report';
 export type InputMode = null | 'filter' | 'search';
 
 // ---------- Update subcommand (spec §6) ----------
