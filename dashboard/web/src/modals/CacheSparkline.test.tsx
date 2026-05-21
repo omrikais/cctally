@@ -22,7 +22,7 @@ function row(date: string, pct: number): CacheReportDailyRow {
     wasted_usd: 0.1,
     net_usd: 0.9,
     anomaly_triggered: false,
-    anomaly_reasons: [] as string[],
+    anomaly_reasons: [],
   };
 }
 

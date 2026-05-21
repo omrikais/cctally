@@ -68,6 +68,8 @@ export interface Envelope {
 // Snake_case to match the Python envelope; see CLAUDE.md re.
 // snake/camel inconsistency between dashboard envelope and CLI --json.
 
+export type CacheAnomalyReason = 'net_negative' | 'cache_drop';
+
 export interface CacheReportDailyRow {
   date: string;                       // YYYY-MM-DD in display tz
   cache_hit_percent: number;
@@ -79,7 +81,7 @@ export interface CacheReportDailyRow {
   wasted_usd: number;
   net_usd: number;
   anomaly_triggered: boolean;
-  anomaly_reasons: string[];
+  anomaly_reasons: CacheAnomalyReason[];
 }
 
 export interface CacheReportBreakdownRow {
@@ -97,7 +99,7 @@ export interface CacheReportTodaySpotlight {
   saved_usd: number;
   wasted_usd: number;
   anomaly_triggered: boolean;
-  anomaly_reasons: string[];
+  anomaly_reasons: CacheAnomalyReason[];
   baseline_daily_row_count: number;
 }
 

@@ -81,13 +81,11 @@ export function CacheReportSettings({
         setSaved(true);
         setTimeout(() => setSaved(false), 1500);
       } else {
-        // Kept for forward-compat: the client-side parseInt + [1, 100]
-        // check above already rejects everything _validate_cache_report_settings
-        // does today, so this branch is unreachable via the UI for v1.
-        // It's still here so a future server-side constraint the client
-        // doesn't know about (e.g. per-account threshold caps, new fields
-        // in the cache_report settings block) can surface inline without
-        // requiring a parallel client-side rule. Issue #77 P3-2.
+        // Forward-compat: client-side validation above is a strict
+        // subset of the server's _validate_cache_report_settings rules,
+        // so this branch is unreachable today. Surfaces a future
+        // server-only constraint (per-account caps, new fields) inline
+        // without needing a parallel client rule.
         const body = await r.json().catch(() => ({} as Record<string, unknown>));
         const msg = typeof body.error === 'string' ? body.error : `HTTP ${r.status}`;
         setErr(msg);

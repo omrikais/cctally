@@ -27,22 +27,12 @@ import { CacheSparkline } from './CacheSparkline';
 import { CacheNetBars } from './CacheNetBars';
 import { CacheBreakdownCard } from './CacheBreakdownCard';
 import { CacheReportSettings } from './CacheReportSettings';
-
-function floorPct(p: number): number {
-  return Math.floor(p + 1e-9);
-}
-
-function fmtUsd(n: number): string {
-  return `$${n.toFixed(2)}`;
-}
-
-function fmtSignedUsd(n: number): string {
-  const sign = n >= 0 ? '+' : '−';
-  return `${sign}$${Math.abs(n).toFixed(2)}`;
-}
+import { fmt } from '../lib/fmt';
 
 // Compact token count: 1234567 → "1.2M", 123456 → "123K", 1234 → "1K",
-// 0 → "0". Anything under 1K → raw integer.
+// 0 → "0". Anything under 1K → raw integer. Local rather than
+// `fmt.compact` because this view uses uppercase K/M (cosmetic
+// divergence; matches the table's existing spec sample output).
 function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
@@ -117,7 +107,7 @@ export function CacheReportModal() {
 
   // Mirror the panel's severity flip on the modal-card border so the
   // teal -> amber visual handoff between panel and modal stays
-  // consistent on an anomalous day. Issue #77 P3-1.
+  // consistent on an anomalous day.
   const accentClass = cr.today.anomaly_triggered
     ? 'accent-amber'
     : 'accent-teal';
@@ -217,14 +207,14 @@ export function CacheReportModal() {
                       baselineKnown ? (isHitBad ? 'hit-bad' : 'hit-good') : ''
                     }`.trim()}
                   >
-                    {floorPct(d.cache_hit_percent)}%
+                    {fmt.pctFloor(d.cache_hit_percent)}%
                   </td>
                   <td className="num">{fmtTokens(d.input_tokens)}</td>
                   <td className="num">{fmtTokens(d.output_tokens)}</td>
-                  <td className="num">{fmtUsd(d.saved_usd)}</td>
-                  <td className="num">{fmtUsd(d.wasted_usd)}</td>
+                  <td className="num">{fmt.usd2(d.saved_usd)}</td>
+                  <td className="num">{fmt.usd2(d.wasted_usd)}</td>
                   <td className={`num ${isNetNeg ? 'net-neg' : 'net-pos'}`}>
-                    {fmtSignedUsd(d.net_usd)}
+                    {fmt.usdSigned(d.net_usd)}
                   </td>
                   <td
                     className={`num ${

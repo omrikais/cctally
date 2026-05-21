@@ -2152,6 +2152,7 @@ def _tui_build_snapshot(
                 # Hardcoded for v1; F10 tracks lifting via cache_report.anomaly_window_days config.
                 anomaly_window_days=_dash_mod.CACHE_REPORT_WINDOW_DAYS,
                 display_tz=_build_display_tz,
+                skip_sync=skip_sync,
             )
         except Exception as exc:
             errors.append(f"cache-report: {exc}")

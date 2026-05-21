@@ -774,6 +774,68 @@ def _aggregate_cache_breakdown(
     return tuple(head)
 
 
+def _aggregate_cache_breakdown_from_rows(
+    rows: Iterable["CacheRow"],
+    *,
+    skip_synthetic: bool = True,
+    top_n: int = 5,
+    other_label: str = "(other)",
+) -> tuple[CacheBreakdownRow, ...]:
+    """By-model breakdown folded from day-mode rows.
+
+    Day-mode ``_aggregate_cache_by_day`` already buckets per-entry cache
+    dollars by ``(date, model)``. Walking those pre-aggregated buckets is
+    O(rows × distinct_models) — orders of magnitude cheaper than calling
+    ``_aggregate_cache_breakdown`` a second time over the raw entries
+    iterable (which re-runs the tiered-pricing math per entry). Output
+    is byte-equivalent to ``_aggregate_cache_breakdown(entries, key_fn=
+    lambda e: e.model)`` modulo float-addition ordering.
+
+    ``skip_synthetic`` drops the ``"<synthetic>"`` model bucket. Day-mode
+    keeps synthetic entries in ``row.model_breakdowns`` because that view
+    is intra-day diagnostic; the by-model view here is the user-facing
+    "where did the savings land" rollup, so synthetic is dropped to match
+    ``_aggregate_cache_breakdown``'s contract.
+    """
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        for mb in row.model_breakdowns:
+            if skip_synthetic and mb.model_name == "<synthetic>":
+                continue
+            b = buckets.setdefault(mb.model_name, {
+                "input": 0, "creation": 0, "read": 0, "net": 0.0,
+            })
+            b["input"] += mb.input_tokens
+            b["creation"] += mb.cache_creation_tokens
+            b["read"] += mb.cache_read_tokens
+            b["net"] += mb.net_usd
+
+    out: list[CacheBreakdownRow] = []
+    for key, b in buckets.items():
+        out.append(CacheBreakdownRow(
+            key=key,
+            cache_hit_percent=_compute_cache_hit_percent(
+                b["input"], b["creation"], b["read"],
+            ),
+            net_usd=b["net"],
+        ))
+    out.sort(key=lambda r: abs(r.net_usd), reverse=True)
+    if len(out) <= top_n:
+        return tuple(out)
+    head = out[:top_n]
+    tail = out[top_n:]
+    tail_keys = {r.key for r in tail}
+    other_net = sum(r.net_usd for r in tail)
+    tail_input = sum(b["input"] for k, b in buckets.items() if k in tail_keys)
+    tail_creation = sum(b["creation"] for k, b in buckets.items() if k in tail_keys)
+    tail_read = sum(b["read"] for k, b in buckets.items() if k in tail_keys)
+    other_pct = _compute_cache_hit_percent(tail_input, tail_creation, tail_read)
+    head.append(CacheBreakdownRow(
+        key=other_label, cache_hit_percent=other_pct, net_usd=other_net,
+    ))
+    return tuple(head)
+
+
 # ---------------------------------------------------------------------------
 # Top-level orchestrator
 # ---------------------------------------------------------------------------

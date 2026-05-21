@@ -11,9 +11,8 @@
 //
 //   - mini: viewBox 0 0 272 28, rendered at width=100% / height=100%
 //     with preserveAspectRatio="none" so the SVG stretches to fill
-//     whatever flex slot the panel gives it (issue #77 P2-4 Round 2
-//     dynamic-fill iteration). The panel wraps the bars in a
-//     flex: 1 1 auto container so they edge-to-edge fill the panel
+//     whatever flex slot the panel gives it. The panel wraps the bars
+//     in a flex: 1 1 auto container so they edge-to-edge fill the panel
 //     between the sparkline above and the 14d-net subline below.
 //     Single-direction bars (always rising from a baseline); color
 //     encodes sign — green for positive net, amber for negative. No

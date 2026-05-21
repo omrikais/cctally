@@ -8,17 +8,15 @@
 // Layout:
 //   - mini: viewBox 0 0 272 32, rendered at width="100%" / fixed 32 px
 //     height with preserveAspectRatio="none" so the line spans the
-//     panel edge-to-edge alongside the bars below it (issue #77 P2-4
-//     Round 2). No axis labels. The today-marker circle becomes a
-//     slight horizontal ellipse after the asymmetric stretch — an
-//     accepted trade for the matching width with the net-bars.
+//     panel edge-to-edge alongside the bars below it. No axis labels.
+//     The today-marker circle becomes a slight horizontal ellipse
+//     after the asymmetric stretch — an accepted trade for matching
+//     width with the net-bars.
 //   - large: viewBox 800x90 rendered with width="100%" so it shrinks
-//     to fit the modal body at narrow viewports (issue #77 P2-1).
-//     Axis labels ("100%" / "0%") live in HTML <span> siblings
-//     stacked above/below the SVG via flex column so the polyline
-//     can't collide with the "100%" text when cache_hit_percent hugs
-//     the top (issue #77 P2-2; Round 2 restructure after Round 1's
-//     absolute-over-SVG version regressed). Five faint horizontal
+//     to fit the modal body at narrow viewports. Axis labels ("100%" /
+//     "0%") live in HTML <span> siblings stacked above/below the SVG
+//     via flex column so the polyline can't collide with the "100%"
+//     text when cache_hit_percent hugs the top. Five faint horizontal
 //     gridlines at 0/25/50/75/100% give the user a visual cue that
 //     the chart is bounded to [0, 100] — without them a polyline
 //     hugging 97-98% reads as a flat line floating in nowhere.

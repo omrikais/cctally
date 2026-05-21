@@ -10,19 +10,7 @@
 //
 // Spec 2026-05-21 §3.3.
 import type { CacheReportEnvelope } from '../types/envelope';
-
-function fmtSignedUsd(n: number): string {
-  // Match the panel's signed-dollar rendering (Unicode minus sign);
-  // see CacheReportPanel.tsx for the precedent.
-  const sign = n >= 0 ? '+' : '−';
-  return `${sign}$${Math.abs(n).toFixed(2)}`;
-}
-
-// Snap-up before floor — same idiom CLAUDE.md requires for any
-// fraction-times-100 percent integer.
-function floorPct(p: number): number {
-  return Math.floor(p + 1e-9);
-}
+import { fmt } from '../lib/fmt';
 
 export interface CacheReportSpotlightProps {
   cr: CacheReportEnvelope;
@@ -55,7 +43,7 @@ export function CacheReportSpotlight({ cr }: CacheReportSpotlightProps) {
   if (delta === null) {
     deltaText = '—';
   } else {
-    const abs = floorPct(Math.abs(delta));
+    const abs = fmt.pctFloor(Math.abs(delta));
     deltaText = `${delta < 0 ? '−' : '+'}${abs}pp`;
   }
 
@@ -79,18 +67,18 @@ export function CacheReportSpotlight({ cr }: CacheReportSpotlightProps) {
           <span className={`pill${pill.cls ? ' ' + pill.cls : ''}`}>{pill.text}</span>
           <span>
             <span className="k">Cache hit</span>{' '}
-            <strong>{floorPct(cr.today.cache_hit_percent)}%</strong>
+            <strong>{fmt.pctFloor(cr.today.cache_hit_percent)}%</strong>
           </span>
           <span>
             <span className="k">14d median</span>{' '}
-            <strong>{median !== null ? `${floorPct(median)}%` : '—'}</strong>
+            <strong>{median !== null ? `${fmt.pctFloor(median)}%` : '—'}</strong>
           </span>
           <span>
             <span className="k">Δ</span> <strong>{deltaText}</strong>
           </span>
           <span>
             <span className="k">Net</span>{' '}
-            <strong>{fmtSignedUsd(cr.today.net_usd)}</strong>
+            <strong>{fmt.usdSigned(cr.today.net_usd)}</strong>
           </span>
           <span>
             <span className="k">Saved / Wasted</span>{' '}

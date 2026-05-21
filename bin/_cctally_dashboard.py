@@ -1907,6 +1907,7 @@ def build_cache_report_snapshot(
     anomaly_threshold_pp: int,
     anomaly_window_days: int,
     display_tz: "ZoneInfo | None",
+    skip_sync: bool = False,
 ) -> CacheReportSnapshot:
     """Build the ``cache_report`` envelope field from the session-entry cache.
 
@@ -1927,7 +1928,9 @@ def build_cache_report_snapshot(
     window_days = CACHE_REPORT_WINDOW_DAYS  # v1: hardcoded per spec §6.1.
     since = now_utc - dt.timedelta(days=window_days)
 
-    entries = list(get_claude_session_entries(since, now_utc, project=None))
+    entries = list(
+        get_claude_session_entries(since, now_utc, project=None, skip_sync=skip_sync)
+    )
 
     today_iso = now_utc.astimezone(
         display_tz if display_tz is not None else dt.timezone.utc
@@ -2081,20 +2084,20 @@ def build_cache_report_snapshot(
 
     # By-project + by-model breakdowns are window-wide aggregates (not
     # today-only) so the panel can surface the project / model carrying
-    # the bulk of net savings across the trailing 14d. Both axes share
-    # the kernel's ``_aggregate_cache_breakdown`` so the synthetic-entry
-    # filter rule (drop ``<synthetic>``) is identical by construction —
-    # by-project and by-model can't silently disagree on token totals.
+    # the bulk of net savings across the trailing 14d. by-project walks
+    # raw entries (project_path is per-entry, not on the day-model
+    # buckets); by-model folds the per-row ``model_breakdowns`` already
+    # produced by day-mode, which avoids re-running the tiered-pricing
+    # math per entry. Both paths apply the same ``<synthetic>`` filter so
+    # the axes can't silently disagree on token totals.
     by_project_rows = crk._aggregate_cache_breakdown(
         entries,
         key_fn=lambda e: (getattr(e, "project_path", None) or "(unknown)"),
         pricing=pricing,
         skip_synthetic=True,
     )
-    by_model_rows = crk._aggregate_cache_breakdown(
-        entries,
-        key_fn=lambda e: e.model,
-        pricing=pricing,
+    by_model_rows = crk._aggregate_cache_breakdown_from_rows(
+        result.rows,
         skip_synthetic=True,
     )
     by_project = tuple(

@@ -215,6 +215,21 @@ export const fmt = {
   usd2(v: number | null | undefined): string {
     return v == null ? '—' : `$${(+v).toFixed(2)}`;
   },
+  // "+$1.20" / "−$0.42" — signed USD with Unicode U+2212 minus on
+  // negatives, matching the dashboard's typographic standard
+  // (see `delta` / `deltaPct` / `pp`).
+  usdSigned(v: number | null | undefined): string {
+    if (v == null) return '—';
+    const sign = v >= 0 ? '+' : '−';
+    return `${sign}$${Math.abs(+v).toFixed(2)}`;
+  },
+  // Snap a percent-like float up by 1e-9 before Math.floor so values
+  // like 0.57*100 = 56.99999999999999 floor to 57, not 56. Same
+  // safeguard the Python side applies via `math.floor(pct + 1e-9)`
+  // (see CLAUDE.md "Pricing & schema").
+  pctFloor(v: number): number {
+    return Math.floor(v + 1e-9);
+  },
   usd3(v: number | null | undefined): string {
     return v == null ? '—' : `$${(+v).toFixed(3)}`;
   },

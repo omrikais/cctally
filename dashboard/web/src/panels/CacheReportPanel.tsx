@@ -14,15 +14,12 @@
 //   Empty (no activity):   accent-teal border, − glyph, "No Claude
 //                          activity yet".
 //
-// Mini net-bars (issue #77 P2-4) sit under the sparkline to fill the
-// ~180 px of dead space the v1 layout had. They're a single-direction
-// version of CacheNetBars (green=positive net day, amber=negative),
-// scaled to max |net| so trends are visible at 28 px tall. The 14d-net
-// subline below them is the panel's headline summary number; it
-// replaced the prior "7d: +$X saved · N ⚠ days" line per #77 Round 2
-// (Q1 answer "Replace 7d subline with 14d-net" — 14d aligns with the
-// bars and the modal Section 3, at the cost of the ⚠-days count token
-// which still shows up in the modal table).
+// Mini net-bars sit under the sparkline to fill the panel body.
+// Single-direction version of CacheNetBars (green=positive net day,
+// amber=negative), scaled to max |net| so trends are visible at 28 px
+// tall. The 14d-net subline below them is the panel's headline
+// summary number; the ⚠-days count is surfaced in the modal table
+// rather than competing for panel space.
 //
 // Click anywhere on the panel body dispatches OPEN_MODAL kind:
 // 'cache-report'. The PanelGrip touch handle inside the header is
@@ -38,23 +35,11 @@ import { dispatch } from '../store/store';
 import { PanelGrip } from '../components/PanelGrip';
 import { CacheSparkline } from '../modals/CacheSparkline';
 import { CacheNetBars } from '../modals/CacheNetBars';
+import { fmt } from '../lib/fmt';
 
 const TEAL = 'var(--accent-teal)';
 const AMBER = 'var(--accent-amber)';
 const GREEN = 'var(--accent-green)';
-
-function fmtSignedUsd(n: number): string {
-  // Match the spec's "+$1.20" / "−$0.42" rendering (Unicode minus sign).
-  const sign = n >= 0 ? '+' : '−';
-  return `${sign}$${Math.abs(n).toFixed(2)}`;
-}
-
-// Always snap up by 1e-9 before Math.floor on a percent-like float —
-// the same idiom enforced in CLAUDE.md to defend against ULP drift on
-// `fraction * 100` boundaries.
-function floorPct(p: number): number {
-  return Math.floor(p + 1e-9);
-}
 
 export function CacheReportPanel() {
   const env = useSnapshot();
@@ -148,8 +133,8 @@ export function CacheReportPanel() {
     headline = <>Building baseline · {n}/5 days</>;
     sublineFirst = (
       <>
-        Today: cache hit {floorPct(cr.today.cache_hit_percent)}% · net{' '}
-        {fmtSignedUsd(cr.today.net_usd)}
+        Today: cache hit {fmt.pctFloor(cr.today.cache_hit_percent)}% · net{' '}
+        {fmt.usdSigned(cr.today.net_usd)}
       </>
     );
   } else if (anomalous) {
@@ -157,7 +142,7 @@ export function CacheReportPanel() {
     // Worst trigger picks the headline; cache_drop wins when both fire.
     const reasons = cr.today.anomaly_reasons;
     if (reasons.includes('cache_drop') && cr.today.delta_pp !== null) {
-      const drop = Math.abs(floorPct(cr.today.delta_pp));
+      const drop = Math.abs(fmt.pctFloor(cr.today.delta_pp));
       headline = (
         <>
           Today: cache hit <span className="delta-bad">↓ {drop}pp</span>
@@ -167,7 +152,7 @@ export function CacheReportPanel() {
       headline = (
         <>
           Today: net{' '}
-          <span className="delta-bad">{fmtSignedUsd(cr.today.net_usd)}</span>
+          <span className="delta-bad">{fmt.usdSigned(cr.today.net_usd)}</span>
         </>
       );
     }
@@ -175,10 +160,10 @@ export function CacheReportPanel() {
       <>
         vs 14d median{' '}
         {cr.today.baseline_median_percent !== null
-          ? floorPct(cr.today.baseline_median_percent) + '%'
+          ? fmt.pctFloor(cr.today.baseline_median_percent) + '%'
           : '—'}{' '}
         · net{' '}
-        <span className="warn">{fmtSignedUsd(cr.today.net_usd)}</span>
+        <span className="warn">{fmt.usdSigned(cr.today.net_usd)}</span>
       </>
     );
   } else {
@@ -187,17 +172,17 @@ export function CacheReportPanel() {
     headline = (
       <>
         Today: cache hit{' '}
-        <span className="delta-good">{floorPct(cr.today.cache_hit_percent)}%</span>
+        <span className="delta-good">{fmt.pctFloor(cr.today.cache_hit_percent)}%</span>
       </>
     );
     sublineFirst = (
       <>
         vs 14d median{' '}
         {cr.today.baseline_median_percent !== null
-          ? floorPct(cr.today.baseline_median_percent) + '%'
+          ? fmt.pctFloor(cr.today.baseline_median_percent) + '%'
           : '—'}{' '}
         · net{' '}
-        <span className="ok">{fmtSignedUsd(cr.today.net_usd)}</span>
+        <span className="ok">{fmt.usdSigned(cr.today.net_usd)}</span>
       </>
     );
   }
@@ -214,7 +199,7 @@ export function CacheReportPanel() {
   ) : (
     <>
       14d net:{' '}
-      <span className={fourteenDayNetClass}>{fmtSignedUsd(fourteenDayNet)}</span>
+      <span className={fourteenDayNetClass}>{fmt.usdSigned(fourteenDayNet)}</span>
     </>
   );
 
@@ -266,7 +251,7 @@ export function CacheReportPanel() {
           />
           {/* flex: 1 wrapper — the bars edge-to-edge fill whatever
               vertical room is left in the panel between the sparkline
-              and the 14d-net subline (issue #77 P2-4 Round 2). */}
+              and the 14d-net subline. */}
           <div className="cr-netbars-mini-wrap">
             <CacheNetBars days={cr.days} size="mini" />
           </div>

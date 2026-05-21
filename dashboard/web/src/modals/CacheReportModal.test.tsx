@@ -72,7 +72,7 @@ function makeCacheReport(
     wasted_usd: 0.15,
     net_usd: 1.05,
     anomaly_triggered: false,
-    anomaly_reasons: [] as string[],
+    anomaly_reasons: [],
   }));
   return {
     window_days: 14,
@@ -87,7 +87,7 @@ function makeCacheReport(
       saved_usd: 1.35,
       wasted_usd: 0.15,
       anomaly_triggered: false,
-      anomaly_reasons: [] as string[],
+      anomaly_reasons: [],
       baseline_daily_row_count: 13,
     },
     days,

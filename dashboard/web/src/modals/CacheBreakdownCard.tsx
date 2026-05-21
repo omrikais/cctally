@@ -12,27 +12,16 @@
 //
 // Long project paths are middle-truncated so a card at ~310 px wide
 // keeps both the leading segment (so the user can tell which volume /
-// repo) and the basename (so they can tell which checkout / worktree),
-// per issue #77 P2-3 Option 2. The full path is preserved in the
-// `title` attribute for hover-to-reveal.
+// repo) and the basename (so they can tell which checkout / worktree).
+// The full path is preserved in the `title` attribute for hover-to-reveal.
 //
 // Spec 2026-05-21 §3.8.
 import type { CacheReportBreakdownRow } from '../types/envelope';
+import { fmt } from '../lib/fmt';
 
 export interface CacheBreakdownCardProps {
   kind: 'projects' | 'models';
   rows: CacheReportBreakdownRow[];
-}
-
-function fmtSignedUsd(n: number): string {
-  // Same convention as the panel + spotlight — Unicode minus on
-  // negatives so the column visually distinguishes "saved" from "lost."
-  const sign = n >= 0 ? '+' : '−';
-  return `${sign}$${Math.abs(n).toFixed(2)}`;
-}
-
-function floorPct(p: number): number {
-  return Math.floor(p + 1e-9);
 }
 
 // Middle-truncate a filesystem path so a 2-column breakdown card
@@ -99,9 +88,9 @@ export function CacheBreakdownCard({ kind, rows }: CacheBreakdownCardProps) {
                   >
                     {display}
                   </td>
-                  <td>{floorPct(r.cache_hit_percent)}%</td>
+                  <td>{fmt.pctFloor(r.cache_hit_percent)}%</td>
                   <td className={r.net_usd >= 0 ? 'net-pos' : 'net-neg'}>
-                    {fmtSignedUsd(r.net_usd)}
+                    {fmt.usdSigned(r.net_usd)}
                   </td>
                 </tr>
               );
