@@ -92,6 +92,98 @@
     "total_cost_usd": 7.209999999999999,
     "total_tokens": 1522000
   },
+  "cache_report": {
+    "anomaly_threshold_pp": 15,
+    "anomaly_window_days": 14,
+    "by_model": [
+      {
+        "cache_hit_percent": 0.0,
+        "key": "claude-sonnet-4-6",
+        "net_usd": 0.0
+      },
+      {
+        "cache_hit_percent": 0.0,
+        "key": "claude-opus-4-7",
+        "net_usd": 0.0
+      }
+    ],
+    "by_project": [
+      {
+        "cache_hit_percent": 0.0,
+        "key": "/fake/repos/beta",
+        "net_usd": 0.0
+      },
+      {
+        "cache_hit_percent": 0.0,
+        "key": "/fake/repos/alpha",
+        "net_usd": 0.0
+      },
+      {
+        "cache_hit_percent": 0.0,
+        "key": "/fake/repos/fixture-demo",
+        "net_usd": 0.0
+      }
+    ],
+    "days": [
+      {
+        "anomaly_reasons": [],
+        "anomaly_triggered": false,
+        "cache_creation_tokens": 0,
+        "cache_hit_percent": 0.0,
+        "cache_read_tokens": 0,
+        "date": "2026-04-18",
+        "input_tokens": 880000,
+        "net_usd": 0.0,
+        "output_tokens": 122000,
+        "saved_usd": 0.0,
+        "wasted_usd": 0.0
+      },
+      {
+        "anomaly_reasons": [],
+        "anomaly_triggered": false,
+        "cache_creation_tokens": 0,
+        "cache_hit_percent": 0.0,
+        "cache_read_tokens": 0,
+        "date": "2026-04-17",
+        "input_tokens": 460000,
+        "net_usd": 0.0,
+        "output_tokens": 60000,
+        "saved_usd": 0.0,
+        "wasted_usd": 0.0
+      },
+      {
+        "anomaly_reasons": [],
+        "anomaly_triggered": false,
+        "cache_creation_tokens": 0,
+        "cache_hit_percent": 0.0,
+        "cache_read_tokens": 0,
+        "date": "2026-04-08",
+        "input_tokens": 3000000,
+        "net_usd": 0.0,
+        "output_tokens": 600000,
+        "saved_usd": 0.0,
+        "wasted_usd": 0.0
+      }
+    ],
+    "fourteen_day_counterfactual_usd": 0.0,
+    "fourteen_day_efficiency_ratio": 0.0,
+    "is_empty": false,
+    "seven_day_anomaly_count": 0,
+    "seven_day_net_usd": 0.0,
+    "today": {
+      "anomaly_reasons": [],
+      "anomaly_triggered": false,
+      "baseline_daily_row_count": 2,
+      "baseline_median_percent": null,
+      "cache_hit_percent": 0.0,
+      "date": "2026-04-18",
+      "delta_pp": null,
+      "net_usd": 0.0,
+      "saved_usd": 0.0,
+      "wasted_usd": 0.0
+    },
+    "window_days": 14
+  },
   "current_week": {
     "dollar_per_pct": 1.4419999999999997,
     "five_hour_block": null,

@@ -125,6 +125,7 @@
     "total_tokens": 0
   },
   "projects": null,
+  "cache_report": null,
   "sessions": {
     "rows": [],
     "sort_key": "started_desc",

@@ -1723,6 +1723,73 @@ class CacheReportTodaySpotlight:
     baseline_daily_row_count: int
 
 
+def _cache_report_snapshot_to_dict(cr: "CacheReportSnapshot | None") -> "dict | None":
+    """Serialize a ``CacheReportSnapshot`` to the SSE envelope dict.
+
+    Returns ``None`` when the snapshot is ``None`` (first tick before
+    sync, or sub-build failure recorded on ``last_sync_error``). Snake-
+    case keys throughout — the envelope is intentionally snake_case end
+    -to-end per ``envelope.ts:189`` (no ``to_camel`` pass). Tuples are
+    flattened to lists for JSON palatability.
+    """
+    if cr is None:
+        return None
+    return {
+        "window_days": cr.window_days,
+        "anomaly_threshold_pp": cr.anomaly_threshold_pp,
+        "anomaly_window_days": cr.anomaly_window_days,
+        "today": {
+            "date": cr.today.date,
+            "cache_hit_percent": cr.today.cache_hit_percent,
+            "baseline_median_percent": cr.today.baseline_median_percent,
+            "delta_pp": cr.today.delta_pp,
+            "net_usd": cr.today.net_usd,
+            "saved_usd": cr.today.saved_usd,
+            "wasted_usd": cr.today.wasted_usd,
+            "anomaly_triggered": cr.today.anomaly_triggered,
+            "anomaly_reasons": list(cr.today.anomaly_reasons),
+            "baseline_daily_row_count": cr.today.baseline_daily_row_count,
+        },
+        "days": [
+            {
+                "date": d.date,
+                "cache_hit_percent": d.cache_hit_percent,
+                "input_tokens": d.input_tokens,
+                "output_tokens": d.output_tokens,
+                "cache_creation_tokens": d.cache_creation_tokens,
+                "cache_read_tokens": d.cache_read_tokens,
+                "saved_usd": d.saved_usd,
+                "wasted_usd": d.wasted_usd,
+                "net_usd": d.net_usd,
+                "anomaly_triggered": d.anomaly_triggered,
+                "anomaly_reasons": list(d.anomaly_reasons),
+            }
+            for d in cr.days
+        ],
+        "by_project": [
+            {
+                "key": b.key,
+                "cache_hit_percent": b.cache_hit_percent,
+                "net_usd": b.net_usd,
+            }
+            for b in cr.by_project
+        ],
+        "by_model": [
+            {
+                "key": b.key,
+                "cache_hit_percent": b.cache_hit_percent,
+                "net_usd": b.net_usd,
+            }
+            for b in cr.by_model
+        ],
+        "seven_day_net_usd": cr.seven_day_net_usd,
+        "seven_day_anomaly_count": cr.seven_day_anomaly_count,
+        "fourteen_day_counterfactual_usd": cr.fourteen_day_counterfactual_usd,
+        "fourteen_day_efficiency_ratio": cr.fourteen_day_efficiency_ratio,
+        "is_empty": cr.is_empty,
+    }
+
+
 @dataclass(frozen=True)
 class CacheReportSnapshot:
     """The complete cache-report envelope block.
@@ -4643,6 +4710,17 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # on first tick before sync completes; the client renders the
         # panel-empty state in that case.
         "projects":         getattr(snap, "projects_envelope", None),
+
+        # Cache-report panel + modal envelope block (spec
+        # 2026-05-21-cache-report-panel-design.md §4.2). Snake_case
+        # keys throughout — the envelope is intentionally snake_case
+        # end-to-end (envelope.ts:189). ``None`` on first tick before
+        # sync completes; the client renders the panel-empty state in
+        # that case. envelope_version stays at 2 (additive optional
+        # field, matches the update? / doctor? precedent).
+        "cache_report":     _cache_report_snapshot_to_dict(
+            getattr(snap, "cache_report", None)
+        ),
 
         # threshold-actions T5: see prelude above for rationale.
         "alerts":           alerts_array,

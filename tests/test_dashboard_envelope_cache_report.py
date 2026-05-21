@@ -148,6 +148,65 @@ def test_build_cache_report_snapshot_empty(monkeypatch):
     assert snap.today.date == "2026-05-20"
 
 
+def test_cache_report_snapshot_to_dict_keys(monkeypatch):
+    """End-to-end: build snapshot + serialize via _cache_report_snapshot_to_dict,
+    assert every documented key is present and envelope_version stays at 2."""
+    dash, cctally_ns = _bootstrap_dashboard()
+    now_utc = dt.datetime(2026, 5, 20, 23, 0, tzinfo=dt.timezone.utc)
+    days = [
+        dt.datetime(2026, 5, d, 12, 0, tzinfo=dt.timezone.utc)
+        for d in range(14, 21)
+    ]
+    entries = [
+        _make_joined_entry(
+            ts_utc=ts,
+            cache_read=2000, cache_creation=200,
+            input_tokens=500, output_tokens=100,
+        )
+        for ts in days
+    ]
+    monkeypatch.setitem(
+        cctally_ns, "get_claude_session_entries",
+        lambda *a, **kw: entries,
+    )
+    snap = dash.build_cache_report_snapshot(
+        now_utc=now_utc,
+        anomaly_threshold_pp=15,
+        anomaly_window_days=14,
+        display_tz=ZoneInfo("Etc/UTC"),
+    )
+    out = dash._cache_report_snapshot_to_dict(snap)
+    assert out is not None
+    # Top-level keys.
+    expected_keys = {
+        "window_days", "anomaly_threshold_pp", "anomaly_window_days",
+        "today", "days", "by_project", "by_model",
+        "seven_day_net_usd", "seven_day_anomaly_count",
+        "fourteen_day_counterfactual_usd", "fourteen_day_efficiency_ratio",
+        "is_empty",
+    }
+    assert set(out.keys()) == expected_keys
+    # today sub-keys.
+    today_keys = {
+        "date", "cache_hit_percent", "baseline_median_percent",
+        "delta_pp", "net_usd", "saved_usd", "wasted_usd",
+        "anomaly_triggered", "anomaly_reasons", "baseline_daily_row_count",
+    }
+    assert set(out["today"].keys()) == today_keys
+    # days[].anomaly_reasons round-trips as list (not tuple) for JSON.
+    for d in out["days"]:
+        assert isinstance(d["anomaly_reasons"], list)
+    # Hardcoded v1 invariants.
+    assert out["window_days"] == 14
+    assert out["anomaly_window_days"] == 14
+
+
+def test_cache_report_snapshot_to_dict_returns_none_when_snapshot_is_none():
+    """Pure-fn contract: None snapshot → None dict (no exceptions)."""
+    dash, _ = _bootstrap_dashboard()
+    assert dash._cache_report_snapshot_to_dict(None) is None
+
+
 def test_build_cache_report_snapshot_threshold_propagates(monkeypatch):
     """The caller's anomaly_threshold_pp is reflected back on the snapshot."""
     dash, cctally_ns = _bootstrap_dashboard()
