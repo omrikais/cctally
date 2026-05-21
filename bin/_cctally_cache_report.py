@@ -544,3 +544,131 @@ def _aggregate_cache_by_session(
         cost_calculator=cost_calculator,
         project_decoder=project_decoder,
     ).rows
+
+
+# ---------------------------------------------------------------------------
+# Anomaly classification + baseline median
+# ---------------------------------------------------------------------------
+
+def _row_anchor(r: CacheRow) -> dt.datetime | None:
+    """Return the row's position in time for baseline-window comparison.
+
+    Session rows carry ``last_activity`` (an aware datetime); daily rows
+    carry ``date`` (an ISO-8601 ``YYYY-MM-DD``). For daily rows we use
+    ``.astimezone()`` (not ``.replace(tzinfo=...)``) so the OS tzdb
+    gives the correct offset for the given date — avoids DST drift on
+    dates that straddle a DST boundary. Mirrors the idiom in
+    ``_parse_cli_date_range``.
+    """
+    if r.last_activity is not None:
+        return r.last_activity
+    if r.date:
+        # internal fallback: host-local intentional
+        return dt.datetime.strptime(r.date, "%Y-%m-%d").astimezone()
+    return None
+
+
+def _compute_baseline_median(
+    rows: list[CacheRow],
+    *,
+    anchor: dt.datetime,
+    window_days: int,
+    min_samples: int,
+    exclude_row: CacheRow | None = None,
+    is_session_mode: bool = False,
+) -> float | None:
+    """Median ``cache_hit_percent`` across rows whose anchor falls in
+    ``[anchor − window_days, anchor − upper_offset]``.
+
+    Returns ``None`` when fewer than ``min_samples`` rows qualify. The
+    upper offset is ``1s`` in session mode (recent sessions stay
+    eligible even when they collide on the second) and ``1d`` in daily
+    mode (yesterday IS in the baseline but today is excluded).
+
+    ``exclude_row`` lets the per-row classifier skip the focal row when
+    computing the baseline median for that row — without this, a row's
+    own hit % would self-include in its baseline. Callers passing the
+    cross-row "median over the whole window" (e.g. the dashboard
+    spotlight) leave ``exclude_row=None``.
+    """
+    import statistics
+
+    upper_offset = (
+        dt.timedelta(seconds=1) if is_session_mode else dt.timedelta(days=1)
+    )
+    lower_bound = anchor - dt.timedelta(days=window_days)
+    upper_bound = anchor - upper_offset
+    values: list[float] = []
+    for r in rows:
+        if exclude_row is not None and r is exclude_row:
+            continue
+        ra = _row_anchor(r)
+        if ra is None:
+            continue
+        if lower_bound <= ra <= upper_bound:
+            values.append(r.cache_hit_percent)
+    if len(values) < min_samples:
+        return None
+    return statistics.median(values)
+
+
+def _classify_anomalies(
+    rows: list[CacheRow],
+    *,
+    threshold_pp: int,
+    window_days: int,
+    enabled: bool = True,
+) -> None:
+    """Mutate each row's ``anomaly_triggered`` / ``anomaly_reasons`` in place.
+
+    Trigger 1 (``net_negative``): ``net_usd < 0`` (strict). Skipped when the
+    row has zero cache activity (no-op session, not a bug).
+
+    Trigger 2 (``cache_drop``): ``cache_hit_percent`` is ``>= threshold_pp``
+    below the trailing ``window_days`` median of OTHER rows. Requires
+    a minimum of 5 (daily) or 10 (session) baseline samples; silently
+    skipped otherwise.
+
+    Reasons are appended in deterministic order: ``net_negative`` first
+    (no baseline needed), then ``cache_drop`` (matches the
+    pre-extraction order tests / fixtures expect).
+
+    Mode is inferred from the first row: if it has a ``session_id``,
+    session mode (window_days back to ``<= last_activity − 1s``);
+    else daily mode (window_days back to ``<= date − 1 day``).
+    """
+    if not enabled:
+        for row in rows:
+            row.anomaly_triggered = False
+            row.anomaly_reasons = []
+        return
+    if not rows:
+        return
+
+    is_session_mode = rows[0].session_id is not None
+    min_baseline = 10 if is_session_mode else 5
+
+    # Pre-compute anchors once to avoid O(n²·datetime-parse) overhead.
+    anchors: list[dt.datetime | None] = [_row_anchor(r) for r in rows]
+
+    for i, row in enumerate(rows):
+        reasons: list[str] = []
+
+        # Trigger 1: net_negative (no baseline needed; cache-activity guard).
+        if row.cache_creation_tokens + row.cache_read_tokens > 0:
+            if row.net_usd < 0:
+                reasons.append("net_negative")
+
+        # Trigger 2: cache_drop (requires baseline).
+        anchor = anchors[i]
+        if anchor is not None:
+            median = _compute_baseline_median(
+                rows, anchor=anchor,
+                window_days=window_days, min_samples=min_baseline,
+                exclude_row=row, is_session_mode=is_session_mode,
+            )
+            if median is not None and (median - row.cache_hit_percent) >= threshold_pp:
+                reasons.append("cache_drop")
+
+        row.anomaly_reasons = reasons
+        row.anomaly_triggered = bool(reasons)

@@ -2305,82 +2305,19 @@ def _annotate_anomalies(
     *,
     enabled: bool = True,
 ) -> None:
-    """Mutate each row's anomaly_triggered / anomaly_reasons in place.
+    """CLI adapter: thin shim around the kernel's ``_classify_anomalies``.
 
-    Trigger 1 (net_negative): net_usd < 0 (strict). Skipped when the row has
-    zero cache activity (no-op session, not a bug).
-    Trigger 2 (cache_drop): cache_hit_percent is >= threshold_pp below the
-    trailing window_days median of OTHER rows. Requires minimum 5 (daily)
-    or 10 (session) baseline samples; silently skipped otherwise.
-
-    Mode is inferred from the first row: if it has a session_id, session
-    mode (window_days back to <= last_activity - 1s); else daily mode
-    (window_days back to <= date - 1 day).
+    Kept under the original name so the existing call site in
+    ``cmd_cache_report`` resolves unchanged. The kernel mutates each row
+    in place (same contract as the pre-extraction implementation —
+    ``anomaly_triggered`` / ``anomaly_reasons`` set on each ``CacheRow``).
     """
-    import statistics
-
-    if not enabled:
-        for row in rows:
-            row.anomaly_triggered = False
-            row.anomaly_reasons = []
-        return
-    if not rows:
-        return
-
-    # Determine mode + baseline minimum from the first row's identity.
-    is_session_mode = rows[0].session_id is not None
-    min_baseline = 10 if is_session_mode else 5
-
-    def _row_anchor(r: CacheRow) -> dt.datetime | None:
-        """Return the row's position in time for baseline-window comparison."""
-        if r.last_activity is not None:
-            return r.last_activity
-        if r.date:
-            # Use .astimezone() (not .replace(tzinfo=...)) so the OS tzdb
-            # gives the correct offset for the given date — avoids DST drift
-            # on dates that straddle a DST boundary. Mirrors the idiom in
-            # _parse_cli_date_range.
-            # internal fallback: host-local intentional
-            return dt.datetime.strptime(r.date, "%Y-%m-%d").astimezone()
-        return None
-
-    window = dt.timedelta(days=window_days)
-    upper_offset = (
-        dt.timedelta(seconds=1) if is_session_mode else dt.timedelta(days=1)
+    _cctally_cache_report._classify_anomalies(
+        rows,
+        threshold_pp=threshold_pp,
+        window_days=window_days,
+        enabled=enabled,
     )
-
-    # Pre-compute anchors once to avoid O(n^2 * datetime-parse) overhead.
-    anchors: list[dt.datetime | None] = [_row_anchor(r) for r in rows]
-
-    for i, row in enumerate(rows):
-        reasons: list[str] = []
-
-        # Trigger 1: net_negative (no baseline needed; cache-activity guard).
-        if row.cache_creation_tokens + row.cache_read_tokens > 0:
-            if row.net_usd < 0:
-                reasons.append("net_negative")
-
-        # Trigger 2: cache_drop (requires baseline).
-        anchor = anchors[i]
-        if anchor is not None:
-            lower_bound = anchor - window
-            upper_bound = anchor - upper_offset
-            baseline_values: list[float] = []
-            for j, other in enumerate(rows):
-                if j == i:
-                    continue
-                other_anchor = anchors[j]
-                if other_anchor is None:
-                    continue
-                if lower_bound <= other_anchor <= upper_bound:
-                    baseline_values.append(other.cache_hit_percent)
-            if len(baseline_values) >= min_baseline:
-                median = statistics.median(baseline_values)
-                if (median - row.cache_hit_percent) >= threshold_pp:
-                    reasons.append("cache_drop")
-
-        row.anomaly_reasons = reasons
-        row.anomaly_triggered = bool(reasons)
 
 
 @dataclass

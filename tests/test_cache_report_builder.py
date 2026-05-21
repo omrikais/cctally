@@ -353,3 +353,117 @@ def test_aggregate_by_session_falls_back_to_filename_uuid_stem_when_session_id_n
     assert len(rows) == 1
     # filename stem = part before first "."
     assert rows[0].session_id == "abc-1234"
+
+
+# ---------------------------------------------------------------------------
+# Task A5 — _classify_anomalies + _compute_baseline_median
+# ---------------------------------------------------------------------------
+
+def _make_daily_row(
+    date: str, hit_pct_inputs: tuple[int, int, int], net_usd: float,
+) -> "crk.CacheRow":
+    """Build a daily CacheRow with explicit token counts that resolve to a
+    known cache_hit_percent. ``hit_pct_inputs`` = (input, creation, read);
+    ``CacheRow.cache_hit_percent`` is computed via ``_compute_cache_hit_percent``.
+    """
+    inp, cc_tok, cr_tok = hit_pct_inputs
+    return crk.CacheRow(
+        date=date,
+        input_tokens=inp,
+        cache_creation_tokens=cc_tok,
+        cache_read_tokens=cr_tok,
+        output_tokens=50,
+        net_usd=net_usd,
+    )
+
+
+def test_classify_anomalies_skips_when_disabled():
+    rows = [_make_daily_row("2026-05-20", (100, 100, 100), -1.0)]
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14, enabled=False)
+    assert rows[0].anomaly_triggered is False
+    assert rows[0].anomaly_reasons == []
+
+
+def test_classify_anomalies_net_negative_only():
+    """Today drives net_usd < 0; baseline stays around 70% so no cache_drop."""
+    rows = []
+    # 14 baseline days @ stable 70% hit, positive net.
+    for d in range(1, 15):
+        rows.append(_make_daily_row(
+            f"2026-05-{d:02d}", (100, 0, 233), 1.0,  # 233/333 ≈ 70%
+        ))
+    # Today: same 70%, but net negative.
+    rows.append(_make_daily_row("2026-05-15", (100, 0, 233), -0.5))
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14, enabled=True)
+    assert rows[-1].anomaly_reasons == ["net_negative"]
+    assert rows[-1].anomaly_triggered is True
+
+
+def test_classify_anomalies_silent_skip_when_baseline_too_thin():
+    """Fewer than 5 daily rows in window → cache_drop trigger silently skipped."""
+    rows = [
+        _make_daily_row("2026-05-19", (100, 0, 200), 0.5),   # 200/300 ≈ 67%
+        _make_daily_row("2026-05-20", (700, 0, 30), -1.0),   # 30/730 ≈ 4%, 60+pp below
+    ]
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14, enabled=True)
+    # Only net_negative fires (cache_drop skipped — insufficient baseline)
+    assert rows[1].anomaly_reasons == ["net_negative"]
+
+
+def test_classify_anomalies_cache_drop_fires_when_baseline_sufficient():
+    """5+ baseline days @ 70% + today @ <55% with cache activity → cache_drop."""
+    rows = []
+    # Baseline: days 01..14 at 70% hit, positive net.
+    for d in range(1, 15):
+        rows.append(_make_daily_row(
+            f"2026-05-{d:02d}", (100, 0, 233), 1.0,
+        ))
+    # Today: 4% hit, positive net (so net_negative does NOT fire).
+    rows.append(_make_daily_row("2026-05-15", (700, 0, 30), 0.1))
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14, enabled=True)
+    today = rows[-1]
+    assert "cache_drop" in today.anomaly_reasons
+    assert "net_negative" not in today.anomaly_reasons
+
+
+def test_classify_anomalies_both_triggers_in_deterministic_order():
+    """When both trigger, reasons[] is in append order: net_negative first,
+    cache_drop second (matches the existing pre-extraction order)."""
+    rows = []
+    for d in range(1, 15):
+        rows.append(_make_daily_row(
+            f"2026-05-{d:02d}", (100, 0, 233), 1.0,
+        ))
+    rows.append(_make_daily_row("2026-05-15", (700, 0, 30), -2.0))
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14, enabled=True)
+    assert rows[-1].anomaly_reasons == ["net_negative", "cache_drop"]
+
+
+def test_compute_baseline_median_returns_none_when_thin():
+    rows = [
+        _make_daily_row(f"2026-05-0{d}", (100, 0, 233), 1.0)
+        for d in (1, 2)
+    ]
+    # Anchor today; only 2 baseline days exist → None at min_samples=5.
+    today = dt.datetime(2026, 5, 20).astimezone()
+    median = crk._compute_baseline_median(
+        rows, anchor=today, window_days=14, min_samples=5,
+    )
+    assert median is None
+
+
+def test_compute_baseline_median_returns_value_when_sufficient():
+    # 7 days of baseline inside the window. Anchor at 2026-05-08 means
+    # window = [2026-04-24, 2026-05-07] — all 7 rows fall in (rows for
+    # 2026-05-01..07).
+    rows = [
+        _make_daily_row(f"2026-05-{d:02d}", (100, 0, 233), 1.0)
+        for d in range(1, 8)
+    ]
+    anchor = dt.datetime(2026, 5, 8).astimezone()
+    median = crk._compute_baseline_median(
+        rows, anchor=anchor, window_days=14, min_samples=5,
+    )
+    assert median is not None
+    # All rows have 233/333 ≈ 69.97%
+    assert abs(median - (233 / 333 * 100)) < 0.01
