@@ -1674,6 +1674,80 @@ def _build_projects_share_panel_data(options: dict,
 
 
 
+# === Cache-report envelope dataclasses (spec 2026-05-21) =================
+# Snake_case fields are emitted verbatim into the SSE envelope so the React
+# store can read ``state.cache_report.<field>`` without a key-transform pass
+# (the envelope is intentionally snake_case end-to-end; see
+# ``dashboard/web/src/types/envelope.ts:189``). Built by
+# ``build_cache_report_snapshot()`` and shipped on the existing 5-minute
+# sync cadence — no separate ``/api/cache-report`` endpoint.
+
+@dataclass(frozen=True)
+class CacheReportDailyRow:
+    date: str  # YYYY-MM-DD in display tz
+    cache_hit_percent: float
+    input_tokens: int
+    output_tokens: int
+    cache_creation_tokens: int
+    cache_read_tokens: int
+    saved_usd: float
+    wasted_usd: float
+    net_usd: float
+    anomaly_triggered: bool
+    anomaly_reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CacheReportBreakdownRow:
+    """One row of the by-project / by-model breakdown sub-cards."""
+    key: str
+    cache_hit_percent: float
+    net_usd: float
+
+
+@dataclass(frozen=True)
+class CacheReportTodaySpotlight:
+    """Today's spotlight card: hit %, baseline-median, Δ vs baseline,
+    cumulative net / saved / wasted, anomaly state, and the count of
+    baseline daily rows so the React panel can gate the
+    "Building baseline · N/5 days" insufficient-baseline state."""
+    date: str
+    cache_hit_percent: float
+    baseline_median_percent: float | None
+    delta_pp: float | None
+    net_usd: float
+    saved_usd: float
+    wasted_usd: float
+    anomaly_triggered: bool
+    anomaly_reasons: tuple[str, ...]
+    baseline_daily_row_count: int
+
+
+@dataclass(frozen=True)
+class CacheReportSnapshot:
+    """The complete cache-report envelope block.
+
+    ``days`` is newest-first, length ``≤ window_days``. ``by_project`` /
+    ``by_model`` are sorted by ``abs(net_usd)`` descending and capped at
+    6 entries (top 5 + ``(other)``). ``window_days`` is hardcoded at 14
+    in v1; ``anomaly_threshold_pp`` is read from
+    ``config.json:cache_report.anomaly_threshold_pp`` (default 15) via
+    the dashboard sync thread.
+    """
+    window_days: int
+    anomaly_threshold_pp: int
+    anomaly_window_days: int
+    today: CacheReportTodaySpotlight
+    days: tuple[CacheReportDailyRow, ...]
+    by_project: tuple[CacheReportBreakdownRow, ...]
+    by_model: tuple[CacheReportBreakdownRow, ...]
+    seven_day_net_usd: float
+    seven_day_anomaly_count: int
+    fourteen_day_counterfactual_usd: float
+    fourteen_day_efficiency_ratio: float
+    is_empty: bool
+
+
 # === Dashboard server core: _SnapshotRef + SSEHub + envelope builders =====
 # Pre-extract location: bin/cctally L16265.
 
@@ -2330,8 +2404,8 @@ def _dashboard_build_blocks_view(conn: "sqlite3.Connection",
     entries = get_entries(fetch_start, fetch_end, skip_sync=skip_sync)
     entries = [e for e in entries if week_start_at <= e.timestamp < week_end_at]
 
-    recorded_windows, block_start_overrides, canonical_intervals = (
-        _load_recorded_five_hour_windows(fetch_start, fetch_end)
+    recorded_windows, block_start_overrides = _load_recorded_five_hour_windows(
+        fetch_start, fetch_end,
     )
     c = _cctally()
     return c.build_blocks_view(
@@ -2339,7 +2413,6 @@ def _dashboard_build_blocks_view(conn: "sqlite3.Connection",
         now_utc=now_utc,
         recorded_windows=recorded_windows,
         block_start_overrides=block_start_overrides,
-        canonical_intervals=canonical_intervals,
         range_start=week_start_at,
         range_end=week_end_at,
         display_tz=display_tz,
@@ -5998,7 +6071,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             now_utc = _command_as_of()
             # Recorded-windows lookup widens by one block on each side so
             # a recorded reset just outside the bounds can still anchor.
-            recorded_windows, block_start_overrides, canonical_intervals = (
+            recorded_windows, block_start_overrides = (
                 _load_recorded_five_hour_windows(
                     start_at - BLOCK_DURATION, end_at + BLOCK_DURATION,
                 )
@@ -6021,7 +6094,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 entries_in_window, mode="auto",
                 recorded_windows=recorded_windows,
                 block_start_overrides=block_start_overrides,
-                canonical_intervals=canonical_intervals,
                 now=now_utc,
             )
             target = next(
