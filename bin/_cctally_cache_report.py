@@ -183,3 +183,139 @@ def _compute_entry_cache_dollars(
     wasted = cache_creation_tokens * max(0.0, create_rate - base_for_create)
     net = saved - wasted
     return (saved, wasted, net)
+
+
+# ---------------------------------------------------------------------------
+# Day-mode aggregator with explicit display_tz threading
+# ---------------------------------------------------------------------------
+
+def _resolve_bucket_tz(display_tz: ZoneInfo | None) -> dt.tzinfo:
+    """Return the tz used to bucket entry timestamps into calendar days.
+
+    ``display_tz`` is the caller's resolved IANA zone (from
+    ``resolve_display_tz`` in the CLI / dashboard). ``None`` triggers the
+    legacy host-local fallback — preserves the pre-extraction contract
+    for direct internal callers and matches the
+    "internal fallback: host-local intentional" annotation in
+    ``bin/cctally`` for the pre-extraction call site.
+    """
+    if display_tz is not None:
+        return display_tz
+    # internal fallback: host-local intentional
+    return dt.datetime.now().astimezone().tzinfo  # type: ignore[return-value]
+
+
+def _default_entry_cost(model: str, usage: dict, mode: str,
+                        cost_usd: float | None) -> float:
+    """Fallback cost calculator used when the caller doesn't inject one.
+
+    Mirrors the ``mode == "auto"`` branch of ``_calculate_entry_cost`` for
+    the common case: respect a recorded ``cost_usd`` when present,
+    otherwise return 0.0. The CLI / dashboard pass the full pricing-aware
+    calculator (``_calculate_entry_cost`` from ``_lib_pricing``) via
+    ``cost_calculator`` so unknown / re-priced models pick up the embedded
+    pricing tables; this default exists so the kernel stays unit-testable
+    without dragging the full pricing dispatch along.
+    """
+    return cost_usd if cost_usd is not None else 0.0
+
+
+def _aggregate_cache_by_day(
+    entries: Iterable,
+    *,
+    since: dt.datetime,
+    until: dt.datetime,
+    display_tz: ZoneInfo | None,
+    pricing: dict,
+    cost_calculator: Callable[[str, dict, str, Optional[float]], float] | None = None,
+) -> list[CacheRow]:
+    """Group entries by display-tz local date within ``[since, until]``.
+
+    ``display_tz`` controls bucketing. ``None`` falls back to host-local —
+    matches the legacy contract for direct callers (the pre-extraction
+    site was annotated "internal fallback: host-local intentional"). The
+    extraction closes a pre-existing minor bug where the CLI parsed
+    ``--since`` / ``--until`` in display tz but bucketed by host-local
+    (spec §1.6 / plan A3); callers pass the same resolved tz they used
+    for window parsing.
+
+    ``cost_calculator`` is the per-entry cost function (the CLI uses
+    ``_calculate_entry_cost`` with embedded pricing; the dashboard
+    snapshot builder injects the same). When None, falls back to a
+    minimal default that reads ``entry.cost_usd`` if present, else
+    returns 0.0 — sufficient for unit tests, insufficient for production
+    runs against entries lacking a recorded ``cost_usd``.
+
+    ``since`` / ``until`` are read by callers to bound their
+    ``get_entries`` / ``get_claude_session_entries`` query; the kernel
+    itself does NOT re-filter on the window (entries are assumed
+    pre-filtered). They're accepted in the signature for parity with the
+    pre-extraction call site and so future kernel versions can apply a
+    defensive in-kernel window filter without breaking callers.
+    """
+    tz = _resolve_bucket_tz(display_tz)
+    cc = cost_calculator if cost_calculator is not None else _default_entry_cost
+
+    # Per spec §1.6, `since` / `until` are accepted for caller parity; the
+    # kernel trusts callers to pre-filter via their own get_entries query.
+    _ = since
+    _ = until
+
+    day_model_buckets: dict[str, dict[str, dict[str, Any]]] = {}
+    for entry in entries:
+        # ``entry.timestamp`` is an aware UTC datetime per SessionEntry
+        # contract; ``astimezone(tz)`` shifts to the display tz before
+        # taking the calendar date.
+        day_key = entry.timestamp.astimezone(tz).strftime("%Y-%m-%d")
+        cost = cc(entry.model, entry.usage, "auto", entry.cost_usd)
+        create_tok = entry.usage.get("cache_creation_input_tokens", 0)
+        read_tok = entry.usage.get("cache_read_input_tokens", 0)
+        saved, wasted, net = _compute_entry_cache_dollars(
+            entry.model, create_tok, read_tok, pricing=pricing,
+        )
+        models = day_model_buckets.setdefault(day_key, {})
+        b = models.setdefault(entry.model, {
+            "inputTokens": 0, "outputTokens": 0,
+            "cacheCreationTokens": 0, "cacheReadTokens": 0, "cost": 0.0,
+            "savedUsd": 0.0, "wastedUsd": 0.0, "netUsd": 0.0,
+        })
+        b["inputTokens"] += entry.usage.get("input_tokens", 0)
+        b["outputTokens"] += entry.usage.get("output_tokens", 0)
+        b["cacheCreationTokens"] += create_tok
+        b["cacheReadTokens"] += read_tok
+        b["cost"] += cost
+        b["savedUsd"] += saved
+        b["wastedUsd"] += wasted
+        b["netUsd"] += net
+
+    result: list[CacheRow] = []
+    for day_key in sorted(day_model_buckets.keys()):
+        models = day_model_buckets[day_key]
+        row = CacheRow(date=day_key)
+        for model_name in sorted(models.keys()):
+            b = models[model_name]
+            mb = CacheModelBreakdown(
+                model_name=model_name,
+                input_tokens=b["inputTokens"],
+                output_tokens=b["outputTokens"],
+                cache_creation_tokens=b["cacheCreationTokens"],
+                cache_read_tokens=b["cacheReadTokens"],
+                cache_hit_percent=_compute_cache_hit_percent(
+                    b["inputTokens"], b["cacheCreationTokens"], b["cacheReadTokens"]
+                ),
+                cost=b["cost"],
+                saved_usd=b["savedUsd"],
+                wasted_usd=b["wastedUsd"],
+                net_usd=b["netUsd"],
+            )
+            row.model_breakdowns.append(mb)
+            row.input_tokens += mb.input_tokens
+            row.output_tokens += mb.output_tokens
+            row.cache_creation_tokens += mb.cache_creation_tokens
+            row.cache_read_tokens += mb.cache_read_tokens
+            row.cost += mb.cost
+            row.saved_usd += mb.saved_usd
+            row.wasted_usd += mb.wasted_usd
+            row.net_usd += mb.net_usd
+        result.append(row)
+    return result

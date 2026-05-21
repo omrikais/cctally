@@ -2224,68 +2224,30 @@ def _aggregate_cache_by_day(
     since: dt.datetime,
     until: dt.datetime,
     project: str | None = None,
+    *,
+    display_tz: "ZoneInfo | None" = None,
 ) -> list[CacheRow]:
-    """Group Claude Code entries by local date within [since, until]."""
-    # internal fallback: host-local intentional
-    local_tz = dt.datetime.now().astimezone().tzinfo
+    """CLI adapter: pulls entries from ``get_entries`` and delegates to the
+    pure-fn kernel ``_cctally_cache_report._aggregate_cache_by_day``.
 
-    day_model_buckets: dict[str, dict[str, dict[str, Any]]] = {}
-    for entry in get_entries(since, until, project=project):
-        day_key = entry.timestamp.astimezone(local_tz).strftime("%Y-%m-%d")
-        cost = _calculate_entry_cost(
-            entry.model, entry.usage, mode="auto", cost_usd=entry.cost_usd
-        )
-        create_tok = entry.usage.get("cache_creation_input_tokens", 0)
-        read_tok = entry.usage.get("cache_read_input_tokens", 0)
-        saved, wasted, net = _compute_entry_cache_dollars(
-            entry.model, create_tok, read_tok
-        )
-        models = day_model_buckets.setdefault(day_key, {})
-        b = models.setdefault(entry.model, {
-            "inputTokens": 0, "outputTokens": 0,
-            "cacheCreationTokens": 0, "cacheReadTokens": 0, "cost": 0.0,
-            "savedUsd": 0.0, "wastedUsd": 0.0, "netUsd": 0.0,
-        })
-        b["inputTokens"] += entry.usage.get("input_tokens", 0)
-        b["outputTokens"] += entry.usage.get("output_tokens", 0)
-        b["cacheCreationTokens"] += create_tok
-        b["cacheReadTokens"] += read_tok
-        b["cost"] += cost
-        b["savedUsd"] += saved
-        b["wastedUsd"] += wasted
-        b["netUsd"] += net
+    Adds an explicit ``display_tz`` kwarg (closes the pre-existing minor bug
+    where ``--tz`` shifted the window edges but not the day-bucketing —
+    spec §1.6, plan A3). Passes the embedded ``CLAUDE_MODEL_PRICING`` +
+    ``_calculate_entry_cost`` into the kernel so the kernel itself stays
+    free of pricing globals / cost-dispatch I/O.
 
-    result: list[CacheRow] = []
-    for day_key in sorted(day_model_buckets.keys()):
-        models = day_model_buckets[day_key]
-        row = CacheRow(date=day_key)
-        for model_name in sorted(models.keys()):
-            b = models[model_name]
-            mb = CacheModelBreakdown(
-                model_name=model_name,
-                input_tokens=b["inputTokens"],
-                output_tokens=b["outputTokens"],
-                cache_creation_tokens=b["cacheCreationTokens"],
-                cache_read_tokens=b["cacheReadTokens"],
-                cache_hit_percent=_compute_cache_hit_percent(
-                    b["inputTokens"], b["cacheCreationTokens"], b["cacheReadTokens"]
-                ),
-                cost=b["cost"],
-                saved_usd=b["savedUsd"],
-                wasted_usd=b["wastedUsd"],
-                net_usd=b["netUsd"],
-            )
-            row.model_breakdowns.append(mb)
-            row.input_tokens += mb.input_tokens
-            row.output_tokens += mb.output_tokens
-            row.cache_creation_tokens += mb.cache_creation_tokens
-            row.cache_read_tokens += mb.cache_read_tokens
-            row.cost += mb.cost
-            row.saved_usd += mb.saved_usd
-            row.wasted_usd += mb.wasted_usd
-            row.net_usd += mb.net_usd
-        result.append(row)
-    return result
+    Direct callers that don't pass ``display_tz`` (legacy contract) fall
+    back to host-local via the kernel's ``None``-tz handling, matching
+    pre-extraction behavior byte-for-byte.
+    """
+    entries = list(get_entries(since, until, project=project))
+    return _cctally_cache_report._aggregate_cache_by_day(
+        entries,
+        since=since, until=until,
+        display_tz=display_tz,
+        pricing=CLAUDE_MODEL_PRICING,
+        cost_calculator=_calculate_entry_cost,
+    )
 
 
 def _filename_uuid_stem(path: str) -> str:
@@ -8282,7 +8244,13 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
     if mode == "session":
         rows = _aggregate_cache_by_session(since, until, project=args.project)
     else:
-        rows = _aggregate_cache_by_day(since, until, project=args.project)
+        # Task A3: pass the resolved display_tz so day buckets match the
+        # ``--tz`` flag (closes the pre-existing minor bug where the
+        # window edges shifted but day buckets stayed on host-local —
+        # spec §1.6 / plan A3).
+        rows = _aggregate_cache_by_day(
+            since, until, project=args.project, display_tz=tz,
+        )
 
     if not rows:
         if args.json:
