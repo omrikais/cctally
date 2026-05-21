@@ -177,8 +177,10 @@ describe('<CacheReportPanel /> anomalous state', () => {
     // cache_drop wins over net_negative when both fire: headline reads
     // "Today: cache hit ↓ 18pp" (delta floored, abs).
     expect(screen.getByText(/↓ 18pp/)).toBeInTheDocument();
-    // Second subline surfaces the anomaly count.
-    expect(screen.getByText(/2 ⚠ days/)).toBeInTheDocument();
+    // Second subline is the 14d-net summary (issue #77 Round 2);
+    // the prior "N ⚠ days" token now lives only in the modal's daily
+    // table and spotlight.
+    expect(screen.getByText(/14d net:/i)).toBeInTheDocument();
   });
 
   it('renders an amber today-marker on the sparkline when anomalous', () => {
@@ -229,5 +231,71 @@ describe('<CacheReportPanel /> loading state', () => {
     // Clicking the loading placeholder still opens the modal.
     fireEvent.click(panel);
     expect(getState().openModal).toBe('cache-report');
+  });
+});
+
+// ---- Issue #77 Round 2 (P2-4): mini net-bars + 14d-net subline ----
+
+describe('<CacheReportPanel /> mini net-bars (issue #77 P2-4)', () => {
+  it('renders 14 mini net-bars under the sparkline on a healthy day', () => {
+    updateSnapshot(envelopeWith(healthyCacheReport()));
+    render(<CacheReportPanel />);
+    const bars = document.querySelectorAll('[data-testid="crm-netbar-mini"]');
+    expect(bars.length).toBe(14);
+    // All-positive fixture days => all bars carry sign='pos'.
+    bars.forEach((b) => expect(b.getAttribute('data-sign')).toBe('pos'));
+  });
+
+  it('renders mini net-bars on an anomalous day too (today is amber)', () => {
+    updateSnapshot(envelopeWith(anomalousCacheReport()));
+    render(<CacheReportPanel />);
+    const bars = document.querySelectorAll('[data-testid="crm-netbar-mini"]');
+    expect(bars.length).toBe(14);
+    // The fixture still produces all-positive days[] (today.net_usd is
+    // a separate top-level field that doesn't replace days[13]); we
+    // assert presence here, not per-bar coloring.
+  });
+
+  it('omits mini net-bars in the insufficient-baseline state', () => {
+    updateSnapshot(envelopeWith(insufficientBaselineCacheReport()));
+    render(<CacheReportPanel />);
+    expect(
+      document.querySelectorAll('[data-testid="crm-netbar-mini"]').length,
+    ).toBe(0);
+  });
+
+  it('omits mini net-bars in the empty state', () => {
+    updateSnapshot(envelopeWith(emptyCacheReport()));
+    render(<CacheReportPanel />);
+    expect(
+      document.querySelectorAll('[data-testid="crm-netbar-mini"]').length,
+    ).toBe(0);
+  });
+});
+
+describe('<CacheReportPanel /> 14d-net subline (issue #77 P2-4)', () => {
+  it('reads "14d net: +$9.80" on the healthy fixture (sum of 14 × 0.70)', () => {
+    updateSnapshot(envelopeWith(healthyCacheReport()));
+    render(<CacheReportPanel />);
+    // Use within-subline scoping so we don't accidentally match a stray
+    // "14d" in the headline.
+    const subline = document.querySelector('.cr-subline.second');
+    expect(subline).toBeTruthy();
+    expect(subline?.textContent).toMatch(/14d net:\s*\+\$9\.80/);
+    // Positive-net class is applied so the dollar amount renders green.
+    const amount = subline?.querySelector('span');
+    expect(amount?.className).toBe('ok');
+  });
+
+  it('keeps the "Watchdog activates at 5 days" copy in insufficient-baseline', () => {
+    updateSnapshot(envelopeWith(insufficientBaselineCacheReport()));
+    render(<CacheReportPanel />);
+    expect(
+      screen.getByText(/Watchdog activates at 5 days of history/i),
+    ).toBeInTheDocument();
+    // The 14d-net subline is suppressed in this state — only the
+    // watchdog hint shows up in .cr-subline.second.
+    const subline = document.querySelector('.cr-subline.second');
+    expect(subline?.textContent).not.toMatch(/14d net:/);
   });
 });

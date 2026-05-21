@@ -4181,10 +4181,31 @@ mark.current {
 
 .cr-spark { display: block; margin-top: 10px; }
 
+/* Mini net-bars wrapper edge-to-edge fills the panel below the
+   sparkline (issue #77 P2-4 Round 2). The panel is a flex column
+   (.panel { display: flex; flex-direction: column }), so giving this
+   container flex: 1 1 auto pulls it down to consume all leftover
+   vertical space between the sparkline and the 14d-net subline. The
+   inner SVG renders width: 100% / height: 100% with
+   preserveAspectRatio="none" so the bars stretch to whatever rect the
+   wrapper resolves to at the current panel height. */
+.cr-netbars-mini-wrap {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 60px; /* don't collapse to nothing in unusually tight layouts */
+  margin-top: 6px;
+}
+.cr-netbars-mini {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
 /* Mobile collapse (< 720 px) — mirrors daily-collapsed / blocks-collapsed
    patterns at index.css ~3236+. Implementor 3 fine-tunes if needed. */
 @media (max-width: 719px) {
   .panel.cache-report-collapsed .cr-spark,
+  .panel.cache-report-collapsed .cr-netbars-mini-wrap,
   .panel.cache-report-collapsed .cr-subline.second {
     display: none;
   }
@@ -4275,31 +4296,33 @@ mark.current {
 .crm-chart-frame.netbars  { border-color: rgba(192,132,252,0.22); }
 
 /* Large-variant sparkline wrapper — axis labels render as HTML siblings
-   so the polyline at high cache-hit % can't collide with the "100%"
-   text (issue #77 P2-2). The SVG inside scales width: 100% with its
-   viewBox-driven aspect ratio, so the labels' absolute positions
-   track the chart's top/bottom edges. */
+   stacked ABOVE and BELOW the SVG (flex column) so the polyline at
+   high cache-hit % can't collide with the "100%" text. Issue #77 P2-2
+   (Round 1's absolute-over-SVG version regressed: with the SVG filling
+   the wrapper width: 100%, the labels at top:0 / bottom:0 sat on top
+   of the chart area at the exact y-coordinates a 97-100% polyline
+   would draw). Round 2 stacks them as flex siblings instead. */
 .cr-spark-wrap {
-  position: relative;
+  display: flex;
+  flex-direction: column;
   width: 100%;
-  line-height: 0; /* drop inline whitespace under the SVG */
 }
 .cr-spark-wrap .cr-spark {
   display: block; /* eliminate the inline-baseline gap under the SVG */
   width: 100%;
   height: auto;
+  flex: 0 0 auto;
 }
 .cr-spark-axis {
-  position: absolute;
-  left: 4px;
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 10px;
-  line-height: 1;
-  pointer-events: none;
+  line-height: 1.2;
+  padding-left: 4px;
+  flex: 0 0 auto;
 }
-.cr-spark-axis-top { top: 0; }
-.cr-spark-axis-bot { bottom: 0; }
+.cr-spark-axis-top { /* renders above the SVG via document order */ }
+.cr-spark-axis-bot { /* renders below the SVG via document order */ }
 
 /* Counterfactual callout */
 .crm-counterfactual {
@@ -4379,6 +4402,10 @@ mark.current {
 .crm-bd-card td {
   padding: 3px 0; font-variant-numeric: tabular-nums;
 }
+/* Inter-cell gap so the cache-% and net-$ columns don't visually touch
+   (e.g. "97%+$15149.14"). First cell is bd-key with width:100% so we
+   only add padding-left on subsequent cells. */
+.crm-bd-card td + td { padding-left: 10px; }
 .crm-bd-card td:last-child { text-align: right; }
 .crm-bd-card td.net-pos { color: var(--accent-green); }
 .crm-bd-card td.net-neg { color: var(--accent-amber); }

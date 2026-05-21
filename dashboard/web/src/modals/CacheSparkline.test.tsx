@@ -99,7 +99,7 @@ describe('<CacheSparkline /> size=large layout (issue #77 P2-1, P2-2)', () => {
     expect(svg.getAttribute('viewBox')).toBe('0 0 800 90');
   });
 
-  it('size=mini still uses fixed pixel width and no wrapper', () => {
+  it('size=mini renders width="100%" with preserveAspectRatio="none" for edge-to-edge fill (issue #77 P2-4 Round 2)', () => {
     const { container } = render(
       <CacheSparkline
         days={SAMPLE}
@@ -109,10 +109,63 @@ describe('<CacheSparkline /> size=large layout (issue #77 P2-1, P2-2)', () => {
       />,
     );
     const svg = container.querySelector('svg.cr-spark') as SVGSVGElement;
-    expect(svg.getAttribute('width')).toBe('272');
+    expect(svg.getAttribute('width')).toBe('100%');
     expect(svg.getAttribute('height')).toBe('32');
+    expect(svg.getAttribute('preserveAspectRatio')).toBe('none');
+    // ViewBox keeps the polyline coordinate math (0..272 x, 0..32 y).
+    expect(svg.getAttribute('viewBox')).toBe('0 0 272 32');
     // No wrapper, no axis labels for the panel variant.
     expect(container.querySelector('.cr-spark-wrap')).toBeNull();
     expect(container.querySelector('.cr-spark-axis-top')).toBeNull();
+  });
+
+  it('size=mini omits the large-only horizontal gridlines', () => {
+    const { container } = render(
+      <CacheSparkline
+        days={SAMPLE}
+        baseline_median_percent={null}
+        today_marker_color="var(--accent-green)"
+        size="mini"
+      />,
+    );
+    expect(
+      container.querySelectorAll('[data-testid^="cr-spark-gridline-"]').length,
+    ).toBe(0);
+  });
+
+  it('size=large renders 5 horizontal gridlines (0/25/50/75/100)', () => {
+    const { container } = render(
+      <CacheSparkline
+        days={SAMPLE}
+        baseline_median_percent={null}
+        today_marker_color="var(--accent-green)"
+        size="large"
+      />,
+    );
+    [0, 25, 50, 75, 100].forEach((pct) => {
+      expect(
+        container.querySelector(`[data-testid="cr-spark-gridline-${pct}"]`),
+      ).toBeTruthy();
+    });
+    // Bound rules (0/100) are solid; quarter cues (25/50/75) are dashed
+    // and use a lower-alpha stroke so they cue without competing.
+    const boundStroke = container
+      .querySelector('[data-testid="cr-spark-gridline-100"]')
+      ?.getAttribute('stroke');
+    const midStroke = container
+      .querySelector('[data-testid="cr-spark-gridline-50"]')
+      ?.getAttribute('stroke');
+    expect(boundStroke).toMatch(/rgba\(255,255,255,0\.4/);
+    expect(midStroke).toMatch(/rgba\(255,255,255,0\.1/);
+    expect(
+      container
+        .querySelector('[data-testid="cr-spark-gridline-50"]')
+        ?.getAttribute('stroke-dasharray'),
+    ).toBe('4,3');
+    expect(
+      container
+        .querySelector('[data-testid="cr-spark-gridline-100"]')
+        ?.getAttribute('stroke-dasharray'),
+    ).toBeNull();
   });
 });

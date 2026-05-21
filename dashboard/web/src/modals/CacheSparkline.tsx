@@ -1,18 +1,27 @@
 // CacheSparkline — 14-day cache-hit % line; hand-rolled SVG.
 //
-// Used by CacheReportPanel (mini variant, ~272x32) and the
-// CacheReportModal section 2 (large variant, responsive: viewBox 800x90
-// rendered at width 100%, axis labels in HTML siblings).
+// Used by CacheReportPanel (mini variant, edge-to-edge in the panel
+// width) and the CacheReportModal section 2 (large variant, axis labels
+// in HTML siblings stacked above/below the SVG via flex column).
 // Spec 2026-05-21 §2.3 + §3.4.
 //
 // Layout:
-//   - mini: fixed width/height (272x32). No axis labels.
+//   - mini: viewBox 0 0 272 32, rendered at width="100%" / fixed 32 px
+//     height with preserveAspectRatio="none" so the line spans the
+//     panel edge-to-edge alongside the bars below it (issue #77 P2-4
+//     Round 2). No axis labels. The today-marker circle becomes a
+//     slight horizontal ellipse after the asymmetric stretch — an
+//     accepted trade for the matching width with the net-bars.
 //   - large: viewBox 800x90 rendered with width="100%" so it shrinks
 //     to fit the modal body at narrow viewports (issue #77 P2-1).
 //     Axis labels ("100%" / "0%") live in HTML <span> siblings
-//     outside the SVG so the polyline doesn't collide with the
-//     "100%" text when cache_hit_percent hugs the top (issue #77 P2-2;
-//     Option B from the issue).
+//     stacked above/below the SVG via flex column so the polyline
+//     can't collide with the "100%" text when cache_hit_percent hugs
+//     the top (issue #77 P2-2; Round 2 restructure after Round 1's
+//     absolute-over-SVG version regressed). Five faint horizontal
+//     gridlines at 0/25/50/75/100% give the user a visual cue that
+//     the chart is bounded to [0, 100] — without them a polyline
+//     hugging 97-98% reads as a flat line floating in nowhere.
 //   - x-axis: oldest -> newest, evenly spaced. We reverse the
 //     newest-first envelope days[] in-place so the today marker sits at
 //     the right edge.
@@ -36,7 +45,13 @@ export interface CacheSparklineProps {
   baseline_median_percent: number | null;
   /** Color of today's marker — amber on anomaly, green when healthy. */
   today_marker_color: string;
-  /** Layout variant. Mini = 272x32 (panel). Large = 800x90 (modal). */
+  /**
+   * Layout variant.
+   * - mini: width="100%" / fixed height / preserveAspectRatio="none"
+   *   so the line stretches edge-to-edge alongside the panel net-bars.
+   * - large: viewBox 800x90 rendered width="100%" with gridlines and
+   *   HTML axis labels for the modal.
+   */
   size: 'mini' | 'large';
 }
 
@@ -44,6 +59,11 @@ const SIZES = {
   mini:  { width: 272, height: 32, padTop: 4, padBot: 4 },
   large: { width: 800, height: 90, padTop: 6, padBot: 6 },
 } as const;
+
+// Y-axis gridline percentages drawn on the large variant. Includes the
+// outer bounds (0/100) plus quarter marks so the user can read the
+// polyline position by eye without a tooltip.
+const GRIDLINE_PCTS = [0, 25, 50, 75, 100] as const;
 
 export function CacheSparkline({
   days,
@@ -56,14 +76,18 @@ export function CacheSparkline({
   // Reverse newest-first envelope so the polyline renders oldest -> newest.
   const ordered = [...days].reverse();
 
-  // For the large variant: width="100%" and no explicit height — the SVG
-  // auto-sizes its height from the viewBox's intrinsic aspect ratio
-  // (800/90), so at narrow viewports it shrinks proportionally without
-  // leaving empty space above/below the content (default
-  // preserveAspectRatio behavior). For mini, keep fixed dimensions.
+  // Mini = width:100% + fixed height + preserveAspectRatio="none" so
+  // the polyline x-positions stretch the full panel width to match
+  // the net-bars below. Large = width:100% with default preserveAspectRatio
+  // so the viewBox aspect ratio is preserved and the chart scales
+  // proportionally at narrow viewports.
   const svgSizeProps = isLarge
     ? { width: '100%' as const }
-    : { width: cfg.width, height: cfg.height };
+    : {
+        width: '100%' as const,
+        height: cfg.height,
+        preserveAspectRatio: 'none',
+      };
 
   if (ordered.length === 0) {
     const emptySvg = (
@@ -109,6 +133,32 @@ export function CacheSparkline({
       viewBox={`0 0 ${cfg.width} ${cfg.height}`}
       aria-label={`Cache hit % timeline, ${ordered.length} days`}
     >
+      {/* Gridlines (large only) — five horizontal rules at 0/25/50/75/100%
+          so the user can read the polyline's y-position without a
+          tooltip. The 0 and 100 rules are solid white at moderate
+          opacity (they're the y-axis bounds and need to read as
+          structural); the 25/50/75 rules are dashed and fainter so
+          they cue the quarters without competing with the polyline.
+          Theme-token colors like --border-soft were too low-contrast
+          against the dark modal background to be visible at all. */}
+      {isLarge &&
+        GRIDLINE_PCTS.map((pct) => {
+          const isBound = pct === 0 || pct === 100;
+          return (
+            <line
+              key={`grid-${pct}`}
+              x1={0}
+              x2={cfg.width}
+              y1={yFor(pct)}
+              y2={yFor(pct)}
+              stroke={isBound ? 'rgba(255,255,255,0.45)' : 'rgba(255,255,255,0.18)'}
+              strokeWidth={isBound ? 1 : 0.5}
+              strokeDasharray={isBound ? undefined : '4,3'}
+              opacity={1}
+              data-testid={`cr-spark-gridline-${pct}`}
+            />
+          );
+        })}
       {baseline_median_percent !== null && (
         <>
           {/* Tinted baseline band: +/- 5pp around the median. */}

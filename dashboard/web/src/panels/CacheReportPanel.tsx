@@ -4,14 +4,25 @@
 // Visual states (calm-when-healthy / loud-when-anomalous):
 //
 //   Healthy:               accent-teal border, ✓ glyph, today's % +
-//                          14d median compare, sparkline rendered.
+//                          14d median compare, sparkline + mini
+//                          net-bars rendered, "14d net: +$X.XX" subline.
 //   Anomalous:             accent-amber border, ⚠ glyph, worst-trigger
 //                          headline, sparkline rendered with amber
-//                          today-marker.
+//                          today-marker, mini net-bars rendered.
 //   Insufficient baseline: accent-teal border, ~ glyph, "Building
-//                          baseline N/5 days" — sparkline omitted.
+//                          baseline N/5 days" — sparkline + bars omitted.
 //   Empty (no activity):   accent-teal border, − glyph, "No Claude
 //                          activity yet".
+//
+// Mini net-bars (issue #77 P2-4) sit under the sparkline to fill the
+// ~180 px of dead space the v1 layout had. They're a single-direction
+// version of CacheNetBars (green=positive net day, amber=negative),
+// scaled to max |net| so trends are visible at 28 px tall. The 14d-net
+// subline below them is the panel's headline summary number; it
+// replaced the prior "7d: +$X saved · N ⚠ days" line per #77 Round 2
+// (Q1 answer "Replace 7d subline with 14d-net" — 14d aligns with the
+// bars and the modal Section 3, at the cost of the ⚠-days count token
+// which still shows up in the modal table).
 //
 // Click anywhere on the panel body dispatches OPEN_MODAL kind:
 // 'cache-report'. The PanelGrip touch handle inside the header is
@@ -26,6 +37,7 @@ import { useIsMobile } from '../hooks/useIsMobile';
 import { dispatch } from '../store/store';
 import { PanelGrip } from '../components/PanelGrip';
 import { CacheSparkline } from '../modals/CacheSparkline';
+import { CacheNetBars } from '../modals/CacheNetBars';
 
 const TEAL = 'var(--accent-teal)';
 const AMBER = 'var(--accent-amber)';
@@ -190,18 +202,19 @@ export function CacheReportPanel() {
     );
   }
 
+  // 14-day net = sum of per-day net (positive = caching paid off net
+  // of waste; negative = caching cost more than it saved). Reduce
+  // computes from the same array the mini bars render, so the headline
+  // number and the bar magnitudes can never disagree.
+  const fourteenDayNet = cr.days.reduce((acc, d) => acc + d.net_usd, 0);
+  const fourteenDayNetClass = fourteenDayNet >= 0 ? 'ok' : 'warn';
+
   const sublineSecond = insufficient ? (
     <>Watchdog activates at 5 days of history</>
   ) : (
     <>
-      7d:{' '}
-      <span className="ok">{fmtSignedUsd(cr.seven_day_net_usd)} saved</span>
-      {' · '}
-      {cr.seven_day_anomaly_count > 0 ? (
-        <span className="warn">{cr.seven_day_anomaly_count} ⚠ days</span>
-      ) : (
-        <>0 ⚠ days</>
-      )}
+      14d net:{' '}
+      <span className={fourteenDayNetClass}>{fmtSignedUsd(fourteenDayNet)}</span>
     </>
   );
 
@@ -244,12 +257,20 @@ export function CacheReportPanel() {
       </div>
 
       {!insufficient && cr.days.length > 0 && (
-        <CacheSparkline
-          days={cr.days}
-          baseline_median_percent={cr.today.baseline_median_percent}
-          today_marker_color={todayMarker}
-          size="mini"
-        />
+        <>
+          <CacheSparkline
+            days={cr.days}
+            baseline_median_percent={cr.today.baseline_median_percent}
+            today_marker_color={todayMarker}
+            size="mini"
+          />
+          {/* flex: 1 wrapper — the bars edge-to-edge fill whatever
+              vertical room is left in the panel between the sparkline
+              and the 14d-net subline (issue #77 P2-4 Round 2). */}
+          <div className="cr-netbars-mini-wrap">
+            <CacheNetBars days={cr.days} size="mini" />
+          </div>
+        </>
       )}
 
       <div className="cr-subline second">{sublineSecond}</div>

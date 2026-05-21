@@ -157,7 +157,7 @@ export function CacheReportModal() {
       </div>
 
       {/* 3. Net $ per day */}
-      <CacheNetBars days={cr.days} />
+      <CacheNetBars days={cr.days} size="large" />
 
       {/* 4. Counterfactual callout */}
       <div className="crm-counterfactual">
