@@ -2103,7 +2103,7 @@ def test_blocks_anchor_picks_five_hour_blocks_when_available(ns):
 
     range_start = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
     range_end = dt.datetime(2026, 5, 16, tzinfo=dt.timezone.utc)
-    windows, _overrides = ns["_load_recorded_five_hour_windows"](
+    windows, _overrides, _intervals = ns["_load_recorded_five_hour_windows"](
         range_start, range_end,
     )
 
@@ -2151,7 +2151,7 @@ def test_blocks_anchor_falls_back_when_no_five_hour_blocks_row(ns):
 
     range_start = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
     range_end = dt.datetime(2026, 5, 16, tzinfo=dt.timezone.utc)
-    windows, _overrides = ns["_load_recorded_five_hour_windows"](
+    windows, _overrides, _intervals = ns["_load_recorded_five_hour_windows"](
         range_start, range_end,
     )
 
@@ -2849,7 +2849,7 @@ def test_load_recorded_five_hour_windows_truncates_credit_overlap(
 
     range_start = dt.datetime(2026, 5, 15, 0, 0, tzinfo=dt.timezone.utc)
     range_end   = dt.datetime(2026, 5, 16, 0, 0, tzinfo=dt.timezone.utc)
-    anchors, overrides = ns["_load_recorded_five_hour_windows"](
+    anchors, overrides, _intervals = ns["_load_recorded_five_hour_windows"](
         range_start, range_end,
     )
 
@@ -2987,7 +2987,7 @@ def test_load_recorded_five_hour_windows_truncates_each_overlap_independently(
 
     range_start = dt.datetime(2026, 5, 15, 0, 0, tzinfo=dt.timezone.utc)
     range_end   = dt.datetime(2026, 5, 15, 23, 0, tzinfo=dt.timezone.utc)
-    anchors, overrides = ns["_load_recorded_five_hour_windows"](
+    anchors, overrides, _intervals = ns["_load_recorded_five_hour_windows"](
         range_start, range_end,
     )
 

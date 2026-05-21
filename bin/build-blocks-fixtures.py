@@ -24,6 +24,10 @@ Scenarios
                        later entries inside recorded window.
 5. active-window     — AS_OF inside a recorded window; ACTIVE row with
                        real remaining time.
+6. floor-band-trap   — issue #76. Canonical R off the 10-min floor
+                       (e.g. T:39:59 UTC); entries dense in the floor
+                       band [T:30, T:39:59) must land in the EARLIER
+                       block, not in a phantom heuristic block.
 """
 from __future__ import annotations
 
@@ -226,6 +230,157 @@ def build_mixed() -> None:
         ])
 
 
+# -- Scenario 6: floor-band-trap (issue #76) -----------------------------
+def build_floor_band_trap() -> None:
+    """Floor-band-trap scenario (issue #76).
+
+    Canonical anchor R = T:39:59 UTC (NOT on a 10-min boundary) for the
+    earlier (prior) block; a next canonical anchor 5h later on a
+    :40:00 UTC boundary (the active window). Session entries dense in
+    the band [T:30, T:39:59) UTC are exactly where the legacy 10-min
+    floor would trap them into a phantom heuristic block. AS_OF pinned
+    ~5 min after the active block opens (active block alive, prior
+    block already closed).
+
+    Pre-fix (the bug): two ACTIVE rows — a phantom heuristic ~T-1:00
+    UTC and the recorded T:40 UTC — or two identical T:40 rows after
+    the swap helper. Post-fix: exactly one ACTIVE row anchored on the
+    canonical T:40 UTC window; floor-band entries are attributed to
+    the EARLIER (closed) block whose displayed window matches the
+    exact canonical interval (e.g. [04:39:59, 09:39:59) instead of
+    the legacy floored [04:30, 09:30)).
+    """
+    base, share, _ = _fixture_tree("floor-band-trap")
+    # Pin all moments to absolute UTC values inside Etc/UTC tz (harness
+    # sets TZ=Etc/UTC). Use a synthetic 2026-04-15 base so the fixture
+    # is not entangled with any production-window date.
+    prior_bs   = dt.datetime(2026, 4, 15, 4, 39, 59, tzinfo=dt.timezone.utc)
+    prior_rs   = dt.datetime(2026, 4, 15, 9, 39, 59, tzinfo=dt.timezone.utc)
+    active_bs  = dt.datetime(2026, 4, 15, 9, 40, 0,  tzinfo=dt.timezone.utc)
+    active_rs  = dt.datetime(2026, 4, 15, 14, 40, 0, tzinfo=dt.timezone.utc)
+    as_of      = dt.datetime(2026, 4, 15, 9, 45, 0,  tzinfo=dt.timezone.utc)
+    _write_input_env(base, _iso(as_of))
+
+    # stats.db: weekly_usage_snapshots rows (one per anchor, captured
+    # near each block's last_observed; raw rs values, NOT floored) AND
+    # five_hour_blocks rows (the canonical truth that drives the
+    # partition predicate).
+    create_stats_db(share / "stats.db")
+    with sqlite3.connect(share / "stats.db") as sc:
+        # Weekly-usage snapshots for both windows so the
+        # `_load_recorded_five_hour_windows` raw query also returns
+        # these anchors (parity with production where every record-
+        # usage tick writes both surfaces).
+        _seed_week_snapshot(
+            sc,
+            R=prior_rs,
+            captured_at=prior_rs - dt.timedelta(seconds=10),
+            weekly_percent=20.0,
+            five_hour_percent=80.0,
+        )
+        _seed_week_snapshot(
+            sc,
+            R=active_rs,
+            captured_at=as_of,
+            weekly_percent=25.0,
+            five_hour_percent=5.0,
+        )
+        # Canonical five_hour_blocks rows. The window key is the floor
+        # of rs to 10 minutes (matches `_canonical_5h_window_key` for
+        # epoch-int callers — same formula).
+        prior_window_key  = int(prior_rs.timestamp())  - (int(prior_rs.timestamp())  % 600)
+        active_window_key = int(active_rs.timestamp()) - (int(active_rs.timestamp()) % 600)
+        sc.execute(
+            "INSERT INTO five_hour_blocks ("
+            "  five_hour_window_key, five_hour_resets_at, block_start_at,"
+            "  first_observed_at_utc, last_observed_at_utc,"
+            "  final_five_hour_percent, total_cost_usd, is_closed,"
+            "  created_at_utc, last_updated_at_utc"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                prior_window_key,
+                prior_rs.isoformat(),
+                prior_bs.isoformat(),
+                prior_bs.isoformat(),
+                prior_rs.isoformat(),
+                80.0, 0.0, 1,
+                prior_bs.isoformat(),
+                prior_rs.isoformat(),
+            ),
+        )
+        sc.execute(
+            "INSERT INTO five_hour_blocks ("
+            "  five_hour_window_key, five_hour_resets_at, block_start_at,"
+            "  first_observed_at_utc, last_observed_at_utc,"
+            "  final_five_hour_percent, total_cost_usd, is_closed,"
+            "  created_at_utc, last_updated_at_utc"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                active_window_key,
+                active_rs.isoformat(),
+                active_bs.isoformat(),
+                active_bs.isoformat(),
+                as_of.isoformat(),
+                5.0, 0.0, 0,
+                active_bs.isoformat(),
+                as_of.isoformat(),
+            ),
+        )
+
+    # cache.db: session entries — 4 entries in the prior block (around
+    # 08:00 UTC), 8 entries DENSE in the floor band [09:30, 09:39:59)
+    # UTC (the trap), 3 entries in the active block (around 09:42 UTC).
+    create_cache_db(share / "cache.db")
+    with sqlite3.connect(share / "cache.db") as cc:
+        seed_session_file(
+            cc,
+            path="/fx/blocks-fbt.jsonl",
+            session_id="s-fbt",
+            project_path="/fx",
+        )
+        idx = 0
+        # Prior-block entries — early in [04:39:59, 09:39:59).
+        for i in range(4):
+            ts = dt.datetime(2026, 4, 15, 8, 0, i * 10, tzinfo=dt.timezone.utc)
+            seed_session_entry(
+                cc,
+                source_path="/fx/blocks-fbt.jsonl",
+                line_offset=idx,
+                timestamp_utc=_iso(ts),
+                model=FIXED_MODEL,
+                input_tokens=100,
+                output_tokens=200,
+            )
+            idx += 1
+        # Floor-band entries [09:30, 09:39:59) UTC — the TRAP.
+        # Pre-fix these would land in a phantom heuristic block.
+        for i in range(8):
+            ts = dt.datetime(2026, 4, 15, 9, 30 + i, 0, tzinfo=dt.timezone.utc)
+            seed_session_entry(
+                cc,
+                source_path="/fx/blocks-fbt.jsonl",
+                line_offset=idx,
+                timestamp_utc=_iso(ts),
+                model=FIXED_MODEL,
+                input_tokens=300,
+                output_tokens=400,
+            )
+            idx += 1
+        # Active-block entries — inside [09:40:00, 14:40:00).
+        for i in range(3):
+            ts = dt.datetime(2026, 4, 15, 9, 42 + i, 0, tzinfo=dt.timezone.utc)
+            seed_session_entry(
+                cc,
+                source_path="/fx/blocks-fbt.jsonl",
+                line_offset=idx,
+                timestamp_utc=_iso(ts),
+                model=FIXED_MODEL,
+                input_tokens=500,
+                output_tokens=600,
+            )
+            idx += 1
+
+
 # -- Scenario 5: active-window -------------------------------------------
 def build_active_window() -> None:
     """AS_OF inside a recorded window; ACTIVE row with real remaining time."""
@@ -274,6 +429,7 @@ if __name__ == "__main__":
         build_heuristic_fallback,
         build_mixed,
         build_active_window,
+        build_floor_band_trap,
     ):
         builder()
     print(f"Built fixtures under {FIXTURES_DIR}")

@@ -1146,6 +1146,7 @@ def build_blocks_view(
     now_utc,
     recorded_windows=None,
     block_start_overrides=None,
+    canonical_intervals=None,
     range_start=None,
     range_end=None,
     display_tz=None,
@@ -1191,6 +1192,7 @@ def build_blocks_view(
         mode=mode,
         recorded_windows=recorded_windows,
         block_start_overrides=block_start_overrides,
+        canonical_intervals=canonical_intervals,
         now=now_utc,
     )
     rows: list = []

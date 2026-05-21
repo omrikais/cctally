@@ -95,6 +95,9 @@ def _group_entries_into_blocks(
     *,
     recorded_windows: list[dt.datetime] | None = None,
     block_start_overrides: dict[dt.datetime, dt.datetime] | None = None,
+    canonical_intervals: dict[
+        dt.datetime, tuple[dt.datetime, dt.datetime]
+    ] | None = None,
     now: dt.datetime | None = None,
 ) -> list[Block]:
     """Group sorted UsageEntry objects into 5-hour blocks with gap detection.
@@ -103,21 +106,29 @@ def _group_entries_into_blocks(
     The last block is marked active if now < block_start + 5h.
 
     When `recorded_windows` is non-empty, entries whose timestamp falls in
-    [R - BLOCK_DURATION, R) for some R in recorded_windows are partitioned
-    into per-R buckets and built as 'recorded' blocks. Leftover entries
-    run through the existing gap-detection heuristic (anchor='heuristic').
+    the exact ``[bs, rs)`` interval of each accepted anchor are
+    partitioned into per-R buckets and built as 'recorded' blocks.
+    Leftover entries run through the existing gap-detection heuristic
+    (anchor='heuristic').
+
+    `canonical_intervals` (issue #76): an optional
+    ``{R_floored → (bs_utc, rs_utc)}`` map carrying the EXACT
+    ``(block_start_at, five_hour_resets_at)`` per accepted anchor. Drives
+    both the partition predicate AND Phase 1.5 ``Block`` construction
+    so floor-band entries (timestamps inside ``[floor(R), R)`` for a
+    canonical reset that doesn't fall on a 10-minute boundary) land in
+    the right bucket and the rendered window matches Anthropic's actual
+    interval. Anchors missing from the map fall back to ``(R - 5h, R)``
+    (the legacy floored shape) — preserves raw-only / pre-rollup
+    history behavior.
 
     `block_start_overrides` (v1.7.2 round-5 / Bug J): an optional
-    `{R → block_start_at}` map. When present for a given R, the
-    recorded block's displayed ``start_time`` becomes the override
-    instead of the default ``R - BLOCK_DURATION``. Used by
-    ``_load_recorded_five_hour_windows`` to preserve the real
-    ``five_hour_blocks.block_start_at`` for credit-truncated windows
-    (an in-place credit shortens the prior 5h block's effective end
-    to the credit moment, but the block's API-derived START is
-    unchanged — without an override the renderer would compute
-    ``start = truncated_R - 5h`` which is hours before the real start
-    and confuses the user with an off-by-hours window header).
+    ``{R → block_start_at}`` map. Provides the same override semantics
+    for callers that don't pass ``canonical_intervals``. When BOTH are
+    present, ``canonical_intervals`` wins (the credit-truncation path
+    in ``_load_recorded_five_hour_windows`` writes a unified entry
+    into ``canonical_intervals`` already carrying the override-supplied
+    ``bs`` and the truncated ``rs``).
 
     `now` pins the current instant (typically via `_command_as_of()`). When
     omitted, falls back to wall clock so existing callers are unaffected.
@@ -131,31 +142,44 @@ def _group_entries_into_blocks(
 
     recorded_windows = sorted(recorded_windows or [])
     block_start_overrides = block_start_overrides or {}
+    canonical_intervals = canonical_intervals or {}
+
+    # Single source of truth for the (bs, rs) interval of each accepted
+    # anchor — shared by the partition predicate below AND Phase 1.5
+    # block construction. issue #76: a 10-min-floored R as a partition
+    # boundary trapped floor-band entries into a phantom heuristic
+    # block whenever R was off the 10-min boundary; routing both
+    # surfaces through this helper keeps them consistent.
+    def _exact_interval(R: dt.datetime) -> tuple[dt.datetime, dt.datetime]:
+        if R in canonical_intervals:
+            return canonical_intervals[R]
+        bs = block_start_overrides.get(R, R - BLOCK_DURATION)
+        return (bs, R)
 
     # ── Partition entries by recorded windows ──────────────────────────
     # For each R in recorded_windows, entries whose timestamp falls in
-    # [override_start_or_R-5h, R) go into recorded_buckets[R]. Everything
-    # else (gaps between recorded windows, or fully outside any window)
-    # drops into `leftover` and runs through the existing heuristic
-    # grouper.
-    #
-    # Why override_start_or_R-5h, not always R-5h: a credit-truncated
-    # canonical block has R = effective_reset_at_utc (e.g. 17:58Z) but
-    # its real ``block_start_at`` is unchanged (e.g. 15:50Z). Using
-    # `R - 5h` as the partition floor would pull entries from earlier
-    # blocks (e.g. 12:58-15:50Z range) into the truncated bucket. The
-    # override keeps the real start so each entry lands in the bucket
-    # whose API-defined interval actually contains it.
+    # [bs, rs) (the EXACT canonical interval, NOT the 10-min-floored
+    # shape) go into recorded_buckets[R]. Everything else (gaps between
+    # recorded windows, or fully outside any window) drops into
+    # `leftover` and runs through the existing heuristic grouper.
     recorded_buckets: dict[dt.datetime, list[UsageEntry]] = {
         R: [] for R in recorded_windows
     }
     leftover: list[UsageEntry] = []
+    # Sort the (interval, R) pairs by rs so bisect_right(rs_keys, ts)
+    # locates the candidate window in O(log n) per entry.
+    sorted_intervals: list[
+        tuple[tuple[dt.datetime, dt.datetime], dt.datetime]
+    ] = sorted(
+        [(_exact_interval(R), R) for R in recorded_windows],
+        key=lambda item: item[0][1],
+    )
+    rs_keys = [iv[0][1] for iv in sorted_intervals]
     for entry in entries_sorted:
-        idx = bisect.bisect_right(recorded_windows, entry.timestamp)
-        if idx < len(recorded_windows):
-            R = recorded_windows[idx]
-            bucket_start = block_start_overrides.get(R, R - BLOCK_DURATION)
-            if bucket_start <= entry.timestamp:
+        idx = bisect.bisect_right(rs_keys, entry.timestamp)
+        if idx < len(sorted_intervals):
+            (bs, rs), R = sorted_intervals[idx]
+            if bs <= entry.timestamp < rs:
                 recorded_buckets[R].append(entry)
                 continue
         leftover.append(entry)
@@ -192,17 +216,22 @@ def _group_entries_into_blocks(
 
     # Clamp each raw_block's end so it cannot overlap a later recorded
     # window. Entries in `leftover` are by construction earlier than the
-    # next recorded R - 5h boundary, so the heuristic block belongs to a
-    # PREVIOUS 5h window that ended no later than that boundary. Without
-    # this clamp, the +5h heuristic span can cross into the recorded
-    # window and produce two simultaneously-active rows.
+    # next recorded window's real ``bs``, so the heuristic block belongs
+    # to a PREVIOUS 5h window that ended no later than that boundary.
+    # Without this clamp, the +5h heuristic span can cross into the
+    # recorded window and produce two simultaneously-active rows.
+    # issue #76: use the EXACT ``bs`` from ``_exact_interval`` so the
+    # clamp matches the partition predicate above (using a floored
+    # ``R - 5h`` would leave a sliver of overlap whenever bs sits in
+    # the 10-min floor band).
     if recorded_windows:
         for rb in raw_blocks:
             idx = bisect.bisect_right(recorded_windows, rb["start"])
             if idx < len(recorded_windows):
-                next_R_start = recorded_windows[idx] - BLOCK_DURATION
-                if rb["start"] < next_R_start < rb["end"]:
-                    rb["end"] = next_R_start
+                next_R = recorded_windows[idx]
+                next_bs, _next_rs = _exact_interval(next_R)
+                if rb["start"] < next_bs < rb["end"]:
+                    rb["end"] = next_bs
 
     # Track the "actual first entry timestamp" for each block so Phase 3
     # can compute gap ends the same way the legacy interleaved code did
@@ -210,18 +239,19 @@ def _group_entries_into_blocks(
     # floor-to-hour window start). Maps id(block) -> actual first ts.
     first_entry_ts_by_block: dict[int, dt.datetime] = {}
 
-    # Phase 1.5: Build recorded Block objects from non-empty buckets
+    # Phase 1.5: Build recorded Block objects from non-empty buckets.
+    # issue #76: ``start_time`` / ``end_time`` come from the SAME
+    # ``_exact_interval(R)`` that drives the partition predicate above.
+    # Without this, a canonical reset off the 10-min boundary would
+    # render with the floored window (off by up to 9m59s) and
+    # ``is_active`` / burn / projection would compute against the
+    # wrong endpoints, even though the partition was correct.
     recorded_block_objs: list[Block] = []
     for R in recorded_windows:
         bucket = recorded_buckets[R]
         if not bucket:
             continue
-        # Display start: override when present (credit-truncated
-        # canonical blocks need their real block_start_at so the
-        # rendered window header matches Anthropic's actual interval);
-        # default to R - BLOCK_DURATION for normal canonical anchors.
-        start_time = block_start_overrides.get(R, R - BLOCK_DURATION)
-        end_time = R
+        start_time, end_time = _exact_interval(R)
         bucket_sorted = sorted(bucket, key=lambda e: e.timestamp)
         blk = _build_activity_block(
             bucket_sorted, start_time, end_time, now, mode,
