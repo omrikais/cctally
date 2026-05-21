@@ -1071,6 +1071,16 @@ class DataSnapshot:
     # declares ``ProjectsEnvelope | null`` and the client renders the
     # panel-empty state until the next tick replaces it.
     projects_envelope: dict | None = None
+    # Cache-report panel + modal envelope block (spec
+    # 2026-05-21-cache-report-panel-design.md §4.2). Populated on the
+    # sync thread by ``build_cache_report_snapshot`` alongside the
+    # existing projects build. The dashboard's
+    # ``snapshot_to_envelope`` reads this back unchanged and assigns it
+    # to ``envelope["cache_report"]``. ``None`` on first tick before
+    # sync completes — the TS envelope mirror declares
+    # ``CacheReportEnvelope | null`` and the client renders the
+    # panel-empty state until the next tick replaces it.
+    cache_report: Any | None = None
 
     @classmethod
     def synthesize_for_marketing(cls, *, as_of_iso: str) -> "DataSnapshot":
@@ -2113,6 +2123,37 @@ def _tui_build_snapshot(
                 sessions = annotated
             except Exception as exc:
                 errors.append(f"projects-cross-nav-bind: {exc}")
+
+        # Cache-report panel + modal envelope block (spec
+        # 2026-05-21-cache-report-panel-design.md §5.2). Per-tick build
+        # alongside the projects envelope. Threshold is read from
+        # ``config.json:cache_report.anomaly_threshold_pp`` (default
+        # 15); ``anomaly_window_days`` is hardcoded at 14 in v1.
+        # display_tz inherits the same resolved zone as every other
+        # panel so today-bucketing matches the envelope's ``display``
+        # block. Errors record on ``last_sync_error``; ``None`` lands
+        # on the DataSnapshot field and the client renders the empty
+        # state.
+        cache_report_block = None
+        try:
+            cfg_cr = load_config().get("cache_report") or {}
+            threshold_raw = cfg_cr.get("anomaly_threshold_pp", 15)
+            try:
+                threshold_pp = int(threshold_raw)
+            except (TypeError, ValueError):
+                threshold_pp = 15
+            if threshold_pp < 1 or threshold_pp > 100:
+                threshold_pp = 15
+            _bcr = sys.modules["_cctally_dashboard"].build_cache_report_snapshot
+            cache_report_block = _bcr(
+                now_utc=now_utc,
+                anomaly_threshold_pp=threshold_pp,
+                anomaly_window_days=14,  # v1: hardcoded
+                display_tz=_build_display_tz,
+            )
+        except Exception as exc:
+            errors.append(f"cache-report: {exc}")
+
         return DataSnapshot(
             current_week=cw,
             forecast=fc,
@@ -2141,6 +2182,7 @@ def _tui_build_snapshot(
             trend_history_median_dpp=history_median_dpp,
             forecast_view=fc_view,
             projects_envelope=projects_envelope_block,
+            cache_report=cache_report_block,
         )
     finally:
         conn.close()
