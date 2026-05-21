@@ -223,6 +223,39 @@ describe('<CacheReportModal /> anomaly spotlight', () => {
   });
 });
 
+describe('<CacheReportModal /> modal-card severity mirror (issue #77 P3-1)', () => {
+  it('uses accent-teal on a healthy day', () => {
+    updateSnapshot(envelopeWith(makeCacheReport()));
+    render(<CacheReportModal />);
+    const card = document.querySelector('.modal-card');
+    expect(card).toBeTruthy();
+    expect(card!.classList.contains('accent-teal')).toBe(true);
+    expect(card!.classList.contains('accent-amber')).toBe(false);
+  });
+
+  it('flips to accent-amber on an anomalous day so it matches the panel border', () => {
+    updateSnapshot(envelopeWith(makeCacheReport({
+      today: {
+        date: '2026-05-20',
+        cache_hit_percent: 49,
+        baseline_median_percent: 67,
+        delta_pp: -18,
+        net_usd: -0.42,
+        saved_usd: 0.36,
+        wasted_usd: 0.78,
+        anomaly_triggered: true,
+        anomaly_reasons: ['cache_drop', 'net_negative'],
+        baseline_daily_row_count: 13,
+      },
+    })));
+    render(<CacheReportModal />);
+    const card = document.querySelector('.modal-card');
+    expect(card).toBeTruthy();
+    expect(card!.classList.contains('accent-amber')).toBe(true);
+    expect(card!.classList.contains('accent-teal')).toBe(false);
+  });
+});
+
 describe('<CacheReportModal /> settings popover', () => {
   it('opens on gear click', () => {
     updateSnapshot(envelopeWith(makeCacheReport()));

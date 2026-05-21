@@ -1,11 +1,18 @@
 // CacheSparkline — 14-day cache-hit % line; hand-rolled SVG.
 //
-// Used by CacheReportPanel (mini variant, ~272x32) and the upcoming
-// CacheReportModal section 2 (large variant, ~800x90, Implementor C).
+// Used by CacheReportPanel (mini variant, ~272x32) and the
+// CacheReportModal section 2 (large variant, responsive: viewBox 800x90
+// rendered at width 100%, axis labels in HTML siblings).
 // Spec 2026-05-21 §2.3 + §3.4.
 //
 // Layout:
-//   - viewBox is the same as width / height (no responsive scaling).
+//   - mini: fixed width/height (272x32). No axis labels.
+//   - large: viewBox 800x90 rendered with width="100%" so it shrinks
+//     to fit the modal body at narrow viewports (issue #77 P2-1).
+//     Axis labels ("100%" / "0%") live in HTML <span> siblings
+//     outside the SVG so the polyline doesn't collide with the
+//     "100%" text when cache_hit_percent hugs the top (issue #77 P2-2;
+//     Option B from the issue).
 //   - x-axis: oldest -> newest, evenly spaced. We reverse the
 //     newest-first envelope days[] in-place so the today marker sits at
 //     the right edge.
@@ -34,8 +41,8 @@ export interface CacheSparklineProps {
 }
 
 const SIZES = {
-  mini:  { width: 272, height: 32,  axis: false, padTop: 4,  padBot: 4  },
-  large: { width: 800, height: 90,  axis: true,  padTop: 12, padBot: 12 },
+  mini:  { width: 272, height: 32, padTop: 4, padBot: 4 },
+  large: { width: 800, height: 90, padTop: 6, padBot: 6 },
 } as const;
 
 export function CacheSparkline({
@@ -45,19 +52,35 @@ export function CacheSparkline({
   size,
 }: CacheSparklineProps) {
   const cfg = SIZES[size];
+  const isLarge = size === 'large';
   // Reverse newest-first envelope so the polyline renders oldest -> newest.
   const ordered = [...days].reverse();
 
+  // For the large variant: width="100%" and no explicit height — the SVG
+  // auto-sizes its height from the viewBox's intrinsic aspect ratio
+  // (800/90), so at narrow viewports it shrinks proportionally without
+  // leaving empty space above/below the content (default
+  // preserveAspectRatio behavior). For mini, keep fixed dimensions.
+  const svgSizeProps = isLarge
+    ? { width: '100%' as const }
+    : { width: cfg.width, height: cfg.height };
+
   if (ordered.length === 0) {
-    return (
+    const emptySvg = (
       <svg
         className="cr-spark"
-        width={cfg.width}
-        height={cfg.height}
+        {...svgSizeProps}
         viewBox={`0 0 ${cfg.width} ${cfg.height}`}
         aria-label="no data"
       />
     );
+    return isLarge ? (
+      <div className="cr-spark-wrap">
+        <span className="cr-spark-axis cr-spark-axis-top">100%</span>
+        {emptySvg}
+        <span className="cr-spark-axis cr-spark-axis-bot">0%</span>
+      </div>
+    ) : emptySvg;
   }
 
   // y-axis: 0% at bottom, 100% at top.
@@ -79,11 +102,10 @@ export function CacheSparkline({
   const todayCx = xFor(todayIdx);
   const todayCy = yFor(ordered[todayIdx].cache_hit_percent);
 
-  return (
+  const svg = (
     <svg
       className="cr-spark"
-      width={cfg.width}
-      height={cfg.height}
+      {...svgSizeProps}
       viewBox={`0 0 ${cfg.width} ${cfg.height}`}
       aria-label={`Cache hit % timeline, ${ordered.length} days`}
     >
@@ -114,25 +136,27 @@ export function CacheSparkline({
           />
         </>
       )}
-      {cfg.axis && (
-        <>
-          <text x={4} y={12} fill="var(--text-dim)" fontSize={10}>100%</text>
-          <text x={4} y={cfg.height - 4} fill="var(--text-dim)" fontSize={10}>0%</text>
-        </>
-      )}
       <polyline
         points={points}
         fill="none"
         stroke="var(--accent-cyan)"
-        strokeWidth={size === 'large' ? 2 : 1.5}
+        strokeWidth={isLarge ? 2 : 1.5}
       />
       <circle
         cx={todayCx}
         cy={todayCy}
-        r={size === 'large' ? 5 : 3.5}
+        r={isLarge ? 5 : 3.5}
         fill={today_marker_color}
         data-testid="cr-spark-today-marker"
       />
     </svg>
   );
+
+  return isLarge ? (
+    <div className="cr-spark-wrap">
+      <span className="cr-spark-axis cr-spark-axis-top">100%</span>
+      {svg}
+      <span className="cr-spark-axis cr-spark-axis-bot">0%</span>
+    </div>
+  ) : svg;
 }

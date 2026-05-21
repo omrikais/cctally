@@ -4274,6 +4274,33 @@ mark.current {
 .crm-chart-frame.timeline { border-color: rgba(34,211,238,0.22); }
 .crm-chart-frame.netbars  { border-color: rgba(192,132,252,0.22); }
 
+/* Large-variant sparkline wrapper — axis labels render as HTML siblings
+   so the polyline at high cache-hit % can't collide with the "100%"
+   text (issue #77 P2-2). The SVG inside scales width: 100% with its
+   viewBox-driven aspect ratio, so the labels' absolute positions
+   track the chart's top/bottom edges. */
+.cr-spark-wrap {
+  position: relative;
+  width: 100%;
+  line-height: 0; /* drop inline whitespace under the SVG */
+}
+.cr-spark-wrap .cr-spark {
+  display: block; /* eliminate the inline-baseline gap under the SVG */
+  width: 100%;
+  height: auto;
+}
+.cr-spark-axis {
+  position: absolute;
+  left: 4px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+  pointer-events: none;
+}
+.cr-spark-axis-top { top: 0; }
+.cr-spark-axis-bot { bottom: 0; }
+
 /* Counterfactual callout */
 .crm-counterfactual {
   margin-top: 14px;
@@ -4355,6 +4382,16 @@ mark.current {
 .crm-bd-card td:last-child { text-align: right; }
 .crm-bd-card td.net-pos { color: var(--accent-green); }
 .crm-bd-card td.net-neg { color: var(--accent-amber); }
+/* Key cell (project path / model name): never wrap mid-token; clip with
+   ellipsis if the cell is still narrower than the rendered text after
+   middle-truncation. Issue #77 P2-3. */
+.crm-bd-card td.bd-key {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 0;
+  width: 100%;
+}
 .crm-bd-card .empty {
   color: var(--text-dim); font-size: 11px; font-style: italic;
 }
@@ -4415,10 +4452,18 @@ mark.current {
   color: var(--accent-teal);
 }
 
+/* Modal mid-width reflow (< 900 px): the default modal-card width is
+   ~640 px on desktop, and at that width a 2-column breakdown gives
+   each card ~310 px — too narrow for project paths to read cleanly
+   even with middle-truncation. Collapse to a single column so each
+   card spans the full modal width. Issue #77 P2-3 (Option 4). */
+@media (max-width: 899px) {
+  .crm-breakdowns { grid-template-columns: 1fr; }
+}
+
 /* Modal-side mobile reflow (< 720 px). The panel-side mobile reflow
    sits above in the @media block. */
 @media (max-width: 719px) {
-  .crm-breakdowns { grid-template-columns: 1fr; }
   /* Table → card form, mirroring the trend modal pattern at
      index.css:3236+. */
   .ch-table thead { display: none; }

@@ -115,12 +115,19 @@ export function CacheReportModal() {
     ? 'var(--accent-amber)'
     : 'var(--accent-green)';
 
+  // Mirror the panel's severity flip on the modal-card border so the
+  // teal -> amber visual handoff between panel and modal stays
+  // consistent on an anomalous day. Issue #77 P3-1.
+  const accentClass = cr.today.anomaly_triggered
+    ? 'accent-amber'
+    : 'accent-teal';
+
   // Counterfactual efficiency ratio for the callout (already
   // computed server-side; we just format).
   const efficiencyPct = Math.round(cr.fourteen_day_efficiency_ratio * 100);
 
   return (
-    <Modal title="Cache Report" accentClass="accent-teal" headerExtras={headerExtras}>
+    <Modal title="Cache Report" accentClass={accentClass} headerExtras={headerExtras}>
       {showSettings && (
         <CacheReportSettings
           current_threshold_pp={cr.anomaly_threshold_pp}
