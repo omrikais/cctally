@@ -227,6 +227,101 @@ def test_z_alias_bridge_invokes_resolver(monkeypatch, capsys):
     assert ns.tz == "utc", ns.tz
 
 
+# T1 follow-up parity (spec §2 closing paragraph): codex commands ALREADY
+# carry the ccusage-codex sharedArgs alias surface via
+# `_add_codex_shared_args`. Session A is test-only over these — we verify
+# the parity claim doesn't regress (e.g., from a future refactor that
+# splits _add_codex_shared_args) and that Implementor 1's
+# `_parse_dual_form_date` promotion didn't break codex date parsing.
+CODEX_CMDS = ["codex-daily", "codex-monthly", "codex-weekly", "codex-session"]
+
+
+# Session A flags that should NOT appear on codex subparsers (spec §7.6:
+# the new Claude-side helper does not fire on codex parsers). If any of
+# these flags is parsed by a codex command, that's a contamination
+# regression — the new helper would have to have been wired onto codex
+# parsers by accident, which the closing paragraph of spec §2 explicitly
+# forbids.
+SESSION_A_CLAUDE_ONLY_FLAGS = [
+    "--debug-samples",
+    "--single-thread",
+    "--config",
+]
+
+
+@pytest.mark.parametrize("cmd", CODEX_CMDS)
+class TestCodexAliasParity:
+    """§2 closing paragraph: codex-* parsers already carry the ccusage-
+    codex sharedArgs alias surface via `_add_codex_shared_args`. Session
+    A's test-only verification keeps that contract observable.
+    """
+
+    def test_z_timezone(self, cmd, fake_home):
+        r = _run(cmd, "-z", "UTC")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_timezone_long_form(self, cmd, fake_home):
+        r = _run(cmd, "--timezone", "UTC")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_offline_short(self, cmd, fake_home):
+        r = _run(cmd, "-O")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_offline_long(self, cmd, fake_home):
+        r = _run(cmd, "--offline")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_no_offline(self, cmd, fake_home):
+        r = _run(cmd, "--no-offline")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_compact(self, cmd, fake_home):
+        r = _run(cmd, "--compact")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_color(self, cmd, fake_home):
+        r = _run(cmd, "--color")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_dual_date_form_yyyy_mm_dd(self, cmd, fake_home):
+        # codex commands already accept both forms; this confirms
+        # Implementor 1's _parse_dual_form_date promotion didn't regress
+        # the codex date parsers.
+        r = _run(cmd, "--since", "2026-01-01")
+        assert "must be" not in r.stderr, r.stderr
+
+    def test_dual_date_form_yyyymmdd(self, cmd, fake_home):
+        r = _run(cmd, "--since", "20260101")
+        assert "must be" not in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("cmd", CODEX_CMDS)
+@pytest.mark.parametrize("flag", SESSION_A_CLAUDE_ONLY_FLAGS)
+def test_codex_does_not_carry_claude_only_session_a_flags(cmd, flag, fake_home):
+    """Spec §7.6 (closing paragraph): `_add_ccusage_alias_args` fires
+    only on the 10 Claude-side parsers. If a codex parser accepts one of
+    these flags, the helper was incorrectly wired onto a codex parser
+    (or `_add_codex_shared_args` was extended with the Session A
+    Claude-side surface — a scope violation).
+    """
+    r = _run(cmd, flag, "5" if flag == "--debug-samples" else "")
+    # The flag must be rejected as an unknown argument (returncode 2,
+    # "unrecognized arguments" in stderr). We trim the empty trailing
+    # arg for flags that don't take a value.
+    args = [cmd, flag]
+    if flag == "--debug-samples":
+        args.append("5")
+    elif flag == "--config":
+        args.append("/tmp/whatever.json")
+    r = _run(*args)
+    assert "unrecognized arguments" in r.stderr or r.returncode == 2, (
+        f"codex {cmd} unexpectedly accepted Claude-only Session A flag "
+        f"{flag!r}; this is a scope violation (spec §7.6 closing paragraph). "
+        f"returncode={r.returncode} stderr={r.stderr!r}"
+    )
+
+
 @pytest.mark.parametrize("cmd", INSCOPE_CMDS_DATE)
 class TestDualDateForm:
     """§7.1.1 / §9.1 — every date-taking in-scope cmd accepts BOTH
