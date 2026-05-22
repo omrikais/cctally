@@ -2238,12 +2238,12 @@ def _aggregate_cache_by_day(
 
     Direct callers that don't pass ``display_tz`` (legacy contract) fall
     back to host-local via the kernel's ``None``-tz handling, matching
-    pre-extraction behavior byte-for-byte.
+    pre-extraction behavior byte-for-byte. ``since`` / ``until`` bound
+    the I/O query here; the kernel itself trusts the caller's pre-filter.
     """
     entries = list(get_entries(since, until, project=project))
     return _cctally_cache_report._aggregate_cache_by_day(
         entries,
-        since=since, until=until,
         display_tz=display_tz,
         pricing=CLAUDE_MODEL_PRICING,
         cost_calculator=_calculate_entry_cost,
@@ -2264,7 +2264,7 @@ def _aggregate_cache_by_session(
 ) -> list[CacheRow]:
     """CLI adapter: pulls Claude session entries from
     ``get_claude_session_entries`` and delegates to the pure-fn kernel
-    ``_cctally_cache_report._aggregate_cache_by_session_with_warnings``.
+    ``_cctally_cache_report._aggregate_cache_by_session``.
 
     Preserves the legacy one-shot ``Warning: N entries lacked
     session_files rows (cache may be catching up).`` stderr line by
@@ -2272,7 +2272,8 @@ def _aggregate_cache_by_session(
     here (kept on the I/O side; kernel stays pure). Injects
     ``CLAUDE_MODEL_PRICING`` + ``_calculate_entry_cost`` +
     ``_decode_escaped_cwd`` so the kernel doesn't reach for cctally
-    globals.
+    globals. ``since`` / ``until`` bound the I/O query; the kernel
+    itself trusts the caller's pre-filter.
     """
     entries = get_claude_session_entries(since, until, project=project)
     if not entries:
@@ -2283,9 +2284,8 @@ def _aggregate_cache_by_session(
             os.path.basename(os.path.dirname(source_path))
         )
 
-    agg = _cctally_cache_report._aggregate_cache_by_session_with_warnings(
+    agg = _cctally_cache_report._aggregate_cache_by_session(
         entries,
-        since=since, until=until,
         pricing=CLAUDE_MODEL_PRICING,
         cost_calculator=_calculate_entry_cost,
         project_decoder=_project_decoder,

@@ -17,6 +17,31 @@ import _cctally_cache_report as crk  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
+# Shared injection shims — mirror what the dropped _default_entry_cost /
+# _default_project_decoder used to do. The kernel now requires these
+# kwargs (QUAL-7); tests pass these trivial lambdas inline.
+# ---------------------------------------------------------------------------
+
+def _trivial_cost(model, usage, mode, cost_usd):
+    return cost_usd if cost_usd is not None else 0.0
+
+
+def _trivial_project_decoder(source_path):
+    """Basename of the directory containing the JSONL.
+
+    Pure-string slicing — mirrors what the dropped
+    ``_default_project_decoder`` did. CLI / dashboard inject the full
+    ``_decode_escaped_cwd`` instead.
+    """
+    last_slash = source_path.rfind("/")
+    if last_slash == -1:
+        return source_path
+    parent = source_path[:last_slash]
+    parent_slash = parent.rfind("/")
+    return parent[parent_slash + 1:] if parent_slash != -1 else parent
+
+
+# ---------------------------------------------------------------------------
 # Task A2 — leaf helpers: _compute_cache_hit_percent + _compute_entry_cache_dollars
 # ---------------------------------------------------------------------------
 
@@ -129,10 +154,9 @@ def test_aggregate_by_day_buckets_by_display_tz_tokyo():
     )
     rows = crk._aggregate_cache_by_day(
         [entry],
-        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
-        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
         display_tz=ZoneInfo("Asia/Tokyo"),
         pricing=_PRICING_SONNET,
+        cost_calculator=_trivial_cost,
     )
     # 23:30 UTC == 08:30 Tokyo on 2026-05-21
     assert len(rows) == 1
@@ -147,10 +171,9 @@ def test_aggregate_by_day_buckets_by_display_tz_utc():
     )
     rows = crk._aggregate_cache_by_day(
         [entry],
-        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
-        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
         display_tz=ZoneInfo("Etc/UTC"),
         pricing=_PRICING_SONNET,
+        cost_calculator=_trivial_cost,
     )
     assert len(rows) == 1
     assert rows[0].date == "2026-05-20"
@@ -164,10 +187,9 @@ def test_aggregate_by_day_display_tz_none_falls_back_to_host_local():
     )
     rows = crk._aggregate_cache_by_day(
         [entry],
-        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
-        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
         display_tz=None,
         pricing=_PRICING_SONNET,
+        cost_calculator=_trivial_cost,
     )
     # Host-local fallback — date depends on host tz, but must be a non-empty list.
     assert len(rows) == 1
@@ -177,10 +199,9 @@ def test_aggregate_by_day_display_tz_none_falls_back_to_host_local():
 def test_aggregate_by_day_returns_zero_rows_for_empty_input():
     rows = crk._aggregate_cache_by_day(
         [],
-        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
-        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
         display_tz=ZoneInfo("Etc/UTC"),
         pricing=_PRICING_SONNET,
+        cost_calculator=_trivial_cost,
     )
     assert rows == []
 
@@ -213,10 +234,9 @@ def test_aggregate_by_day_sums_tokens_across_models():
     }
     rows = crk._aggregate_cache_by_day(
         entries,
-        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
-        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
         display_tz=ZoneInfo("Etc/UTC"),
         pricing=pricing,
+        cost_calculator=_trivial_cost,
     )
     assert len(rows) == 1
     row = rows[0]
@@ -266,13 +286,14 @@ def _make_session_entry(
 
 
 def test_aggregate_by_session_returns_empty_for_no_entries():
-    rows = crk._aggregate_cache_by_session(
+    agg = crk._aggregate_cache_by_session(
         [],
-        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
-        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
         pricing=_PRICING_SONNET,
+        cost_calculator=_trivial_cost,
+        project_decoder=_trivial_project_decoder,
     )
-    assert rows == []
+    assert agg.rows == []
+    assert agg.fallback_count == 0
 
 
 def test_aggregate_by_session_merges_two_files_one_session():
@@ -290,12 +311,13 @@ def test_aggregate_by_session_merges_two_files_one_session():
             source_path="/tmp/b.jsonl", session_id="sess-1",
         ),
     ]
-    rows = crk._aggregate_cache_by_session(
+    agg = crk._aggregate_cache_by_session(
         entries,
-        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
-        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
         pricing=_PRICING_SONNET,
+        cost_calculator=_trivial_cost,
+        project_decoder=_trivial_project_decoder,
     )
+    rows = agg.rows
     assert len(rows) == 1
     row = rows[0]
     assert row.session_id == "sess-1"
@@ -322,12 +344,13 @@ def test_aggregate_by_session_skips_synthetic_model():
             session_id="sess-real",
         ),
     ]
-    rows = crk._aggregate_cache_by_session(
+    agg = crk._aggregate_cache_by_session(
         entries,
-        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
-        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
         pricing=_PRICING_SONNET,
+        cost_calculator=_trivial_cost,
+        project_decoder=_trivial_project_decoder,
     )
+    rows = agg.rows
     assert len(rows) == 1
     assert rows[0].session_id == "sess-real"
 
@@ -344,15 +367,17 @@ def test_aggregate_by_session_falls_back_to_filename_uuid_stem_when_session_id_n
             session_id=None,
         ),
     ]
-    rows = crk._aggregate_cache_by_session(
+    agg = crk._aggregate_cache_by_session(
         entries,
-        since=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
-        until=dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc),
         pricing=_PRICING_SONNET,
+        cost_calculator=_trivial_cost,
+        project_decoder=_trivial_project_decoder,
     )
+    rows = agg.rows
     assert len(rows) == 1
     # filename stem = part before first "."
     assert rows[0].session_id == "abc-1234"
+    assert agg.fallback_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +425,8 @@ def test_classify_anomalies_net_negative_only():
 
 
 def test_classify_anomalies_silent_skip_when_baseline_too_thin():
-    """Fewer than 5 daily rows in window → cache_drop trigger silently skipped."""
+    """Fewer than CACHE_REPORT_MIN_BASELINE_DAYS daily rows in window →
+    cache_drop trigger silently skipped."""
     rows = [
         _make_daily_row("2026-05-19", (100, 0, 200), 0.5),   # 200/300 ≈ 67%
         _make_daily_row("2026-05-20", (700, 0, 30), -1.0),   # 30/730 ≈ 4%, 60+pp below
@@ -444,10 +470,11 @@ def test_compute_baseline_median_returns_none_when_thin():
         _make_daily_row(f"2026-05-0{d}", (100, 0, 233), 1.0)
         for d in (1, 2)
     ]
-    # Anchor today; only 2 baseline days exist → None at min_samples=5.
+    # Anchor today; only 2 baseline days exist → None at min_samples=DAYS.
     today = dt.datetime(2026, 5, 20).astimezone()
     median = crk._compute_baseline_median(
-        rows, anchor=today, window_days=14, min_samples=5,
+        rows, anchor=today, window_days=14,
+        min_samples=crk.CACHE_REPORT_MIN_BASELINE_DAYS,
     )
     assert median is None
 
@@ -462,7 +489,8 @@ def test_compute_baseline_median_returns_value_when_sufficient():
     ]
     anchor = dt.datetime(2026, 5, 8).astimezone()
     median = crk._compute_baseline_median(
-        rows, anchor=anchor, window_days=14, min_samples=5,
+        rows, anchor=anchor, window_days=14,
+        min_samples=crk.CACHE_REPORT_MIN_BASELINE_DAYS,
     )
     assert median is not None
     # All rows have 233/333 ≈ 69.97%
@@ -494,6 +522,7 @@ def test_build_cache_report_end_to_end_clean_run():
         display_tz=ZoneInfo("Etc/UTC"),
         pricing=_PRICING_SONNET,
         mode="day",
+        cost_calculator=_trivial_cost,
     )
     assert len(result.rows) == 7
     assert all(r.anomaly_triggered is False for r in result.rows)
@@ -518,6 +547,7 @@ def test_build_cache_report_passes_display_tz_none_through():
         display_tz=None,
         pricing=_PRICING_SONNET,
         mode="day",
+        cost_calculator=_trivial_cost,
     )
     assert result.display_tz_key is None
     assert len(result.rows) == 1
@@ -543,6 +573,7 @@ def test_build_cache_report_anomaly_disabled():
         display_tz=ZoneInfo("Etc/UTC"),
         pricing=_PRICING_SONNET,
         mode="day",
+        cost_calculator=_trivial_cost,
         anomaly_enabled=False,
     )
     assert all(r.anomaly_triggered is False for r in result.rows)
@@ -562,7 +593,85 @@ def test_build_cache_report_rejects_unknown_mode():
             display_tz=ZoneInfo("Etc/UTC"),
             pricing=_PRICING_SONNET,
             mode="invalid",  # type: ignore[arg-type]
+            cost_calculator=_trivial_cost,
         )
+
+
+def test_build_cache_report_surfaces_today_baseline_median():
+    """EFF-3: ``result.today_baseline_median`` equals what
+    ``_compute_baseline_median`` would have returned if a caller had run it
+    over the same row set with today's row excluded.
+
+    The dashboard snapshot builder relies on this — pre-EFF-3 it re-ran the
+    median computation as a second pass. Asserts the kernel-side value
+    matches the adapter-side value to byte equality.
+    """
+    # 7 baseline days at ~70% + today at ~4%. The trailing-14d median over
+    # the 7 baseline rows is ~70% (the 7 rows all have the same hit %).
+    now_utc = dt.datetime(2026, 5, 21, 23, 0, tzinfo=dt.timezone.utc)
+    entries = []
+    for d in range(14, 21):  # 2026-05-14..20
+        entries.append(_make_entry(
+            ts_utc=dt.datetime(2026, 5, d, 12, 0, tzinfo=dt.timezone.utc),
+            input_tokens=100, cache_creation=0, cache_read=233,
+        ))
+    # Today (2026-05-21) at low hit %.
+    entries.append(_make_entry(
+        ts_utc=dt.datetime(2026, 5, 21, 12, 0, tzinfo=dt.timezone.utc),
+        input_tokens=700, cache_creation=0, cache_read=30,
+    ))
+    result = crk._build_cache_report(
+        entries,
+        now_utc=now_utc,
+        window_days=14,
+        anomaly_threshold_pp=15,
+        anomaly_window_days=14,
+        display_tz=ZoneInfo("Etc/UTC"),
+        pricing=_PRICING_SONNET,
+        mode="day",
+        cost_calculator=_trivial_cost,
+    )
+
+    # Reproduce what the dashboard adapter used to compute by hand
+    # (pre-EFF-3 second pass).
+    today_iso = "2026-05-21"
+    today_anchor = dt.datetime.strptime(today_iso, "%Y-%m-%d").astimezone(
+        dt.timezone.utc
+    )
+    other_rows = [r for r in result.rows if r.date != today_iso]
+    expected = crk._compute_baseline_median(
+        other_rows, anchor=today_anchor, window_days=14,
+        min_samples=crk.CACHE_REPORT_MIN_BASELINE_DAYS,
+    )
+
+    assert result.today_baseline_median is not None
+    assert expected is not None
+    assert abs(result.today_baseline_median - expected) < 1e-9
+
+
+def test_build_cache_report_session_mode_no_today_baseline_median():
+    """Session mode has no equivalent "today" anchor concept; the kernel
+    leaves ``today_baseline_median`` as None."""
+    base = dt.datetime(2026, 5, 20, 12, 0, tzinfo=dt.timezone.utc)
+    entries = [
+        _make_session_entry(
+            ts_utc=base,
+            input_tokens=100, cache_read=200,
+        ),
+    ]
+    result = crk._build_cache_report(
+        entries,
+        now_utc=base + dt.timedelta(hours=1),
+        window_days=14,
+        anomaly_threshold_pp=15,
+        anomaly_window_days=14,
+        display_tz=ZoneInfo("Etc/UTC"),
+        pricing=_PRICING_SONNET,
+        mode="session",
+        cost_calculator=_trivial_cost,
+        project_decoder=_trivial_project_decoder,
+    )
+    assert result.today_baseline_median is None
 
 
 # ---------------------------------------------------------------------------

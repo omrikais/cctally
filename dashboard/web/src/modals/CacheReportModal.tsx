@@ -28,16 +28,7 @@ import { CacheNetBars } from './CacheNetBars';
 import { CacheBreakdownCard } from './CacheBreakdownCard';
 import { CacheReportSettings } from './CacheReportSettings';
 import { fmt } from '../lib/fmt';
-
-// Compact token count: 1234567 → "1.2M", 123456 → "123K", 1234 → "1K",
-// 0 → "0". Anything under 1K → raw integer. Local rather than
-// `fmt.compact` because this view uses uppercase K/M (cosmetic
-// divergence; matches the table's existing spec sample output).
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
-  return String(n);
-}
+import { CACHE_REPORT_BAND_PP } from '../lib/cache-report-constants';
 
 export function CacheReportModal() {
   const env = useSnapshot();
@@ -133,7 +124,7 @@ export function CacheReportModal() {
         <div className="crm-section-head crm-sh-timeline">
           Cache hit % — {cr.window_days}-day timeline
           <span className="meta">
-            band = {cr.anomaly_window_days}d median ±5pp
+            band = {cr.anomaly_window_days}d median ±{CACHE_REPORT_BAND_PP}pp
           </span>
         </div>
         <div className="crm-chart-frame timeline">
@@ -192,7 +183,7 @@ export function CacheReportModal() {
               const baselineKnown = cr.today.baseline_median_percent !== null;
               const isHitBad =
                 baselineKnown &&
-                d.cache_hit_percent < (cr.today.baseline_median_percent as number) - 5;
+                d.cache_hit_percent < (cr.today.baseline_median_percent as number) - CACHE_REPORT_BAND_PP;
               const isNetNeg = d.net_usd < 0;
               return (
                 <tr
@@ -209,8 +200,8 @@ export function CacheReportModal() {
                   >
                     {fmt.pctFloor(d.cache_hit_percent)}%
                   </td>
-                  <td className="num">{fmtTokens(d.input_tokens)}</td>
-                  <td className="num">{fmtTokens(d.output_tokens)}</td>
+                  <td className="num">{fmt.compact(d.input_tokens, { upper: true })}</td>
+                  <td className="num">{fmt.compact(d.output_tokens, { upper: true })}</td>
                   <td className="num">{fmt.usd2(d.saved_usd)}</td>
                   <td className="num">{fmt.usd2(d.wasted_usd)}</td>
                   <td className={`num ${isNetNeg ? 'net-neg' : 'net-pos'}`}>

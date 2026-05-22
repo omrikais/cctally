@@ -36,6 +36,7 @@ import { PanelGrip } from '../components/PanelGrip';
 import { CacheSparkline } from '../modals/CacheSparkline';
 import { CacheNetBars } from '../modals/CacheNetBars';
 import { fmt } from '../lib/fmt';
+import { CACHE_REPORT_MIN_BASELINE_DAYS } from '../lib/cache-report-constants';
 
 const TEAL = 'var(--accent-teal)';
 const AMBER = 'var(--accent-amber)';
@@ -70,7 +71,7 @@ export function CacheReportPanel() {
         style={{ cursor: 'pointer' }}
       >
         <div className="panel-header" style={{ justifyContent: 'space-between' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div className="cr-panel-header-inner">
             <h3 style={{ color: TEAL }}>
               Cache Report <span className="sub">(loading)</span>
             </h3>
@@ -95,7 +96,7 @@ export function CacheReportPanel() {
         style={{ cursor: 'pointer' }}
       >
         <div className="panel-header" style={{ justifyContent: 'space-between' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div className="cr-panel-header-inner">
             <h3 style={{ color: TEAL }}>Cache Report</h3>
           </div>
           <PanelGrip />
@@ -111,9 +112,9 @@ export function CacheReportPanel() {
     );
   }
 
-  // Decide state.
   const anomalous = cr.today.anomaly_triggered;
-  const insufficient = cr.today.baseline_daily_row_count < 5;
+  const insufficient =
+    cr.today.baseline_daily_row_count < CACHE_REPORT_MIN_BASELINE_DAYS;
 
   // Accent class flip (anomalous => amber). The header color follows the
   // same flip so the title text reads correctly against the bordered
@@ -122,7 +123,6 @@ export function CacheReportPanel() {
   const headerColor = anomalous ? AMBER : TEAL;
   const todayMarker = anomalous ? AMBER : GREEN;
 
-  // Glyph + headline + subline content varies by state.
   let glyph: { icon: string; cls: string };
   let headline: React.ReactNode;
   let sublineFirst: React.ReactNode = null;
@@ -130,7 +130,7 @@ export function CacheReportPanel() {
   if (insufficient) {
     glyph = { icon: '~', cls: 'thin' };
     const n = cr.today.baseline_daily_row_count;
-    headline = <>Building baseline · {n}/5 days</>;
+    headline = <>Building baseline · {n}/{CACHE_REPORT_MIN_BASELINE_DAYS} days</>;
     sublineFirst = (
       <>
         Today: cache hit {fmt.pctFloor(cr.today.cache_hit_percent)}% · net{' '}
@@ -167,7 +167,6 @@ export function CacheReportPanel() {
       </>
     );
   } else {
-    // Healthy.
     glyph = { icon: '✓', cls: 'ok' };
     headline = (
       <>
@@ -195,7 +194,7 @@ export function CacheReportPanel() {
   const fourteenDayNetClass = fourteenDayNet >= 0 ? 'ok' : 'warn';
 
   const sublineSecond = insufficient ? (
-    <>Watchdog activates at 5 days of history</>
+    <>Watchdog activates at {CACHE_REPORT_MIN_BASELINE_DAYS} days of history</>
   ) : (
     <>
       14d net:{' '}
@@ -224,7 +223,7 @@ export function CacheReportPanel() {
       style={{ cursor: 'pointer' }}
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <div className="cr-panel-header-inner">
           <h3 style={{ color: headerColor }}>
             Cache Report
             {anomalous && <span className="sub">⚠ Today</span>}

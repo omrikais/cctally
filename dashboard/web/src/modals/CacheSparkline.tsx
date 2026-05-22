@@ -35,6 +35,7 @@
 // No new dependencies — pure inline SVG, mirrors ProjectsTrendChart.tsx
 // and BlockTimeline.tsx precedent.
 import type { CacheReportDailyRow } from '../types/envelope';
+import { CACHE_REPORT_BAND_PP } from '../lib/cache-report-constants';
 
 export interface CacheSparklineProps {
   /** Newest-first daily rows from the envelope. Up to 14 entries. */
@@ -159,14 +160,14 @@ export function CacheSparkline({
         })}
       {baseline_median_percent !== null && (
         <>
-          {/* Tinted baseline band: +/- 5pp around the median. */}
+          {/* Tinted baseline band: ±BAND_PP around the median. */}
           <rect
             x={0}
-            y={yFor(baseline_median_percent + 5)}
+            y={yFor(baseline_median_percent + CACHE_REPORT_BAND_PP)}
             width={cfg.width}
             height={
-              yFor(baseline_median_percent - 5)
-              - yFor(baseline_median_percent + 5)
+              yFor(baseline_median_percent - CACHE_REPORT_BAND_PP)
+              - yFor(baseline_median_percent + CACHE_REPORT_BAND_PP)
             }
             fill="var(--accent-cyan)"
             opacity={0.10}

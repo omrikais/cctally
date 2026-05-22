@@ -1998,18 +1998,13 @@ def build_cache_report_snapshot(
     # Pick out today's row (if any) and the baseline-daily-row count for
     # the spotlight. The spotlight median is computed against ALL rows
     # except today (cross-row reference; mirrors what the panel's
-    # "Δ vs 14d median" label means).
+    # "Δ vs 14d median" label means). The median itself rides back on
+    # ``result.today_baseline_median`` (EFF-3 — kernel computes it once
+    # alongside the anomaly classifier so we don't re-walk the same
+    # row set here).
     today_row = next((r for r in result.rows if r.date == today_iso), None)
     other_rows = [r for r in result.rows if r.date != today_iso]
-    today_anchor = (
-        dt.datetime.strptime(today_iso, "%Y-%m-%d").astimezone(
-            display_tz if display_tz is not None else dt.timezone.utc
-        )
-    )
-    baseline_median = crk._compute_baseline_median(
-        other_rows, anchor=today_anchor,
-        window_days=anomaly_window_days, min_samples=5,
-    )
+    baseline_median = result.today_baseline_median
 
     baseline_daily_row_count = len(other_rows)
 

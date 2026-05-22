@@ -17,13 +17,21 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Literal, Optional, Tuple
+from typing import Any, Callable, Iterable, Literal, Optional
 from zoneinfo import ZoneInfo
 
 
 # Anthropic's per-call >200K-tokens tier — kept in sync with bin/_lib_pricing.
 # Callers may override via the ``tiered_threshold`` kwarg.
 DEFAULT_TIERED_THRESHOLD = 200_000
+
+
+# Minimum baseline samples for the per-row anomaly classifier.
+# Daily mode: >=5 trailing days. Session mode: >=10 trailing sessions
+# (richer signal per sample so a higher minimum keeps thin-baseline
+# false positives down).
+CACHE_REPORT_MIN_BASELINE_DAYS = 5
+CACHE_REPORT_MIN_BASELINE_SESSIONS = 10
 
 
 @dataclass
@@ -46,17 +54,26 @@ class CacheBreakdownRow:
 
     Carried by the kernel so by-project and by-model share a single
     aggregation path. The dashboard wraps each into the SSE-side frozen
-    ``CacheReportBreakdownRow`` (same field shape) without further
-    transformation.
+    ``CacheReportBreakdownRow`` (same field shape — only ``key`` /
+    ``cache_hit_percent`` / ``net_usd`` cross the envelope boundary)
+    without further transformation. The token fields stay internal:
+    they're populated so the tail-aggregate "(other)" row hit-% can
+    sum directly from the head rows rather than re-walking the raw
+    bucket map (EFF-4).
     """
     key: str
     cache_hit_percent: float
     net_usd: float
+    input_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
 
 
 @dataclass
 class CacheRow:
-    # Identity (exactly one group populated)
+    # Day-mode rows carry ``date``. Session-mode rows carry ``session_id``,
+    # ``project_path``, ``last_activity``, ``source_paths``. The two are
+    # never populated together.
     date: str | None = None
     session_id: str | None = None
     project_path: str | None = None
@@ -94,6 +111,27 @@ class CacheRow:
         return _compute_cache_hit_percent(
             self.input_tokens, self.cache_creation_tokens, self.cache_read_tokens
         )
+
+
+@dataclass
+class _Bucket:
+    """Per-(day,model) / per-session / per-breakdown-key aggregation accumulator.
+
+    Used by ``_aggregate_cache_by_day``, ``_aggregate_cache_by_session``,
+    and ``_aggregate_cache_breakdown`` so all three aggregators share one
+    set of field names — typos become type errors, not silent runtime
+    zero. The breakdown aggregator only populates the token + cache-$
+    fields (``output_tokens`` / ``cost`` stay zero); that's fine — the
+    by-project / by-model paths don't surface them.
+    """
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost: float = 0.0
+    saved_usd: float = 0.0
+    wasted_usd: float = 0.0
+    net_usd: float = 0.0
 
 
 def _compute_cache_hit_percent(
@@ -219,31 +257,14 @@ def _resolve_bucket_tz(display_tz: ZoneInfo | None) -> dt.tzinfo:
     return dt.datetime.now().astimezone().tzinfo  # type: ignore[return-value]
 
 
-def _default_entry_cost(model: str, usage: dict, mode: str,
-                        cost_usd: float | None) -> float:
-    """Fallback cost calculator used when the caller doesn't inject one.
-
-    Mirrors the ``mode == "auto"`` branch of ``_calculate_entry_cost`` for
-    the common case: respect a recorded ``cost_usd`` when present,
-    otherwise return 0.0. The CLI / dashboard pass the full pricing-aware
-    calculator (``_calculate_entry_cost`` from ``_lib_pricing``) via
-    ``cost_calculator`` so unknown / re-priced models pick up the embedded
-    pricing tables; this default exists so the kernel stays unit-testable
-    without dragging the full pricing dispatch along.
-    """
-    return cost_usd if cost_usd is not None else 0.0
-
-
 def _aggregate_cache_by_day(
     entries: Iterable,
     *,
-    since: dt.datetime,
-    until: dt.datetime,
     display_tz: ZoneInfo | None,
     pricing: dict,
-    cost_calculator: Callable[[str, dict, str, Optional[float]], float] | None = None,
+    cost_calculator: Callable[[str, dict, str, Optional[float]], float],
 ) -> list[CacheRow]:
-    """Group entries by display-tz local date within ``[since, until]``.
+    """Group entries by display-tz local date.
 
     ``display_tz`` controls bucketing. ``None`` falls back to host-local —
     matches the legacy contract for direct callers (the pre-extraction
@@ -253,54 +274,46 @@ def _aggregate_cache_by_day(
     (spec §1.6 / plan A3); callers pass the same resolved tz they used
     for window parsing.
 
-    ``cost_calculator`` is the per-entry cost function (the CLI uses
+    ``cost_calculator`` is the per-entry cost function (the CLI passes
     ``_calculate_entry_cost`` with embedded pricing; the dashboard
-    snapshot builder injects the same). When None, falls back to a
-    minimal default that reads ``entry.cost_usd`` if present, else
-    returns 0.0 — sufficient for unit tests, insufficient for production
-    runs against entries lacking a recorded ``cost_usd``.
+    snapshot builder injects the same). Required: the kernel does not
+    fall back to a default so production callers can't accidentally
+    bypass the embedded pricing tables.
 
-    ``since`` / ``until`` are read by callers to bound their
-    ``get_entries`` / ``get_claude_session_entries`` query; the kernel
-    itself does NOT re-filter on the window (entries are assumed
-    pre-filtered). They're accepted in the signature for parity with the
-    pre-extraction call site and so future kernel versions can apply a
-    defensive in-kernel window filter without breaking callers.
+    Overlaps with ``_lib_aggregators._aggregate_buckets`` but kept
+    separate: the cache-report kernel is purity-contract (no internal
+    imports per module docstring), and the day-bucket shape diverges
+    (per-model breakdown children, cache-dollar tiered math). Cross-ref
+    for future unification if the kernel ever takes an
+    ``_lib_pricing`` dependency.
+
+    Callers pre-filter entries to the desired window via their own
+    ``get_entries`` query; the kernel does not re-filter.
     """
     tz = _resolve_bucket_tz(display_tz)
-    cc = cost_calculator if cost_calculator is not None else _default_entry_cost
 
-    # Per spec §1.6, `since` / `until` are accepted for caller parity; the
-    # kernel trusts callers to pre-filter via their own get_entries query.
-    _ = since
-    _ = until
-
-    day_model_buckets: dict[str, dict[str, dict[str, Any]]] = {}
+    day_model_buckets: dict[str, dict[str, _Bucket]] = {}
     for entry in entries:
         # ``entry.timestamp`` is an aware UTC datetime per SessionEntry
         # contract; ``astimezone(tz)`` shifts to the display tz before
         # taking the calendar date.
         day_key = entry.timestamp.astimezone(tz).strftime("%Y-%m-%d")
-        cost = cc(entry.model, entry.usage, "auto", entry.cost_usd)
+        cost = cost_calculator(entry.model, entry.usage, "auto", entry.cost_usd)
         create_tok = entry.usage.get("cache_creation_input_tokens", 0)
         read_tok = entry.usage.get("cache_read_input_tokens", 0)
         saved, wasted, net = _compute_entry_cache_dollars(
             entry.model, create_tok, read_tok, pricing=pricing,
         )
         models = day_model_buckets.setdefault(day_key, {})
-        b = models.setdefault(entry.model, {
-            "inputTokens": 0, "outputTokens": 0,
-            "cacheCreationTokens": 0, "cacheReadTokens": 0, "cost": 0.0,
-            "savedUsd": 0.0, "wastedUsd": 0.0, "netUsd": 0.0,
-        })
-        b["inputTokens"] += entry.usage.get("input_tokens", 0)
-        b["outputTokens"] += entry.usage.get("output_tokens", 0)
-        b["cacheCreationTokens"] += create_tok
-        b["cacheReadTokens"] += read_tok
-        b["cost"] += cost
-        b["savedUsd"] += saved
-        b["wastedUsd"] += wasted
-        b["netUsd"] += net
+        b = models.setdefault(entry.model, _Bucket())
+        b.input_tokens += entry.usage.get("input_tokens", 0)
+        b.output_tokens += entry.usage.get("output_tokens", 0)
+        b.cache_creation_tokens += create_tok
+        b.cache_read_tokens += read_tok
+        b.cost += cost
+        b.saved_usd += saved
+        b.wasted_usd += wasted
+        b.net_usd += net
 
     result: list[CacheRow] = []
     for day_key in sorted(day_model_buckets.keys()):
@@ -310,17 +323,17 @@ def _aggregate_cache_by_day(
             b = models[model_name]
             mb = CacheModelBreakdown(
                 model_name=model_name,
-                input_tokens=b["inputTokens"],
-                output_tokens=b["outputTokens"],
-                cache_creation_tokens=b["cacheCreationTokens"],
-                cache_read_tokens=b["cacheReadTokens"],
+                input_tokens=b.input_tokens,
+                output_tokens=b.output_tokens,
+                cache_creation_tokens=b.cache_creation_tokens,
+                cache_read_tokens=b.cache_read_tokens,
                 cache_hit_percent=_compute_cache_hit_percent(
-                    b["inputTokens"], b["cacheCreationTokens"], b["cacheReadTokens"]
+                    b.input_tokens, b.cache_creation_tokens, b.cache_read_tokens
                 ),
-                cost=b["cost"],
-                saved_usd=b["savedUsd"],
-                wasted_usd=b["wastedUsd"],
-                net_usd=b["netUsd"],
+                cost=b.cost,
+                saved_usd=b.saved_usd,
+                wasted_usd=b.wasted_usd,
+                net_usd=b.net_usd,
             )
             row.model_breakdowns.append(mb)
             row.input_tokens += mb.input_tokens
@@ -357,46 +370,28 @@ def _filename_uuid_stem(path: str) -> str:
     return stem
 
 
-def _default_project_decoder(source_path: str) -> str:
-    """Fallback project label when the caller doesn't inject a decoder.
-
-    Returns the basename of the directory containing the JSONL — the same
-    raw label ``_decode_escaped_cwd(os.path.basename(os.path.dirname(...)))``
-    operated on, but without the escape-decoding. CLI / dashboard callers
-    inject the full ``_decode_escaped_cwd`` so resumed sessions display the
-    decoded cwd. Pure-string slicing keeps the kernel ``os``-free.
-    """
-    last_slash = source_path.rfind("/")
-    if last_slash == -1:
-        return source_path
-    parent = source_path[:last_slash]
-    parent_slash = parent.rfind("/")
-    return parent[parent_slash + 1:] if parent_slash != -1 else parent
-
-
 @dataclass
 class _SessionAggregationResult:
     """Bundles session rows + the fallback warning count.
 
-    Returned by ``_aggregate_cache_by_session_with_warnings`` so callers
-    can choose whether to emit the "N entries lacked session_files rows"
-    one-shot warning. The plain ``_aggregate_cache_by_session`` wrapper
-    discards the count for the common case.
+    Returned by ``_aggregate_cache_by_session`` so callers can choose
+    whether to emit the "N entries lacked session_files rows" one-shot
+    warning. The CLI adapter consumes ``fallback_count`` to emit the
+    legacy stderr line; the dashboard snapshot builder ignores it (the
+    panel surfaces freshness via the doctor chip instead).
     """
     rows: list[CacheRow]
     fallback_count: int
 
 
-def _aggregate_cache_by_session_with_warnings(
+def _aggregate_cache_by_session(
     entries: Iterable,
     *,
-    since: dt.datetime,
-    until: dt.datetime,
     pricing: dict,
-    cost_calculator: Callable[[str, dict, str, Optional[float]], float] | None = None,
-    project_decoder: Callable[[str], str] | None = None,
+    cost_calculator: Callable[[str, dict, str, Optional[float]], float],
+    project_decoder: Callable[[str], str],
 ) -> _SessionAggregationResult:
-    """Group Claude entries by sessionId (resumed-merged) within ``[since, until]``.
+    """Group Claude entries by sessionId (resumed-merged).
 
     Resume-merging: entries from multiple JSONL files sharing a sessionId
     collapse into one row. ``project_path`` reflects the most-recent
@@ -412,21 +407,14 @@ def _aggregate_cache_by_session_with_warnings(
     entries rides back on ``_SessionAggregationResult.fallback_count``
     so the caller can emit the legacy one-shot stderr warning.
 
-    ``cost_calculator`` and ``pricing`` mirror the day-mode kernel — both
-    are injected so the kernel stays free of pricing globals /
-    cost-dispatch I/O. ``project_decoder`` is the optional
-    ``_decode_escaped_cwd``-style helper (defaults to a raw dirname
-    basename).
+    ``cost_calculator`` / ``pricing`` / ``project_decoder`` are required
+    keyword-only — production callers inject ``_calculate_entry_cost`` +
+    ``CLAUDE_MODEL_PRICING`` + a ``_decode_escaped_cwd``-backed decoder
+    so the kernel stays free of pricing globals / cost-dispatch I/O.
 
-    ``since`` / ``until`` are accepted for caller parity; the kernel
-    trusts callers to pre-filter entries via their own query.
+    Callers pre-filter entries to the desired window via their own
+    ``get_claude_session_entries`` query; the kernel does not re-filter.
     """
-    cc = cost_calculator if cost_calculator is not None else _default_entry_cost
-    pd = project_decoder if project_decoder is not None else _default_project_decoder
-
-    _ = since
-    _ = until
-
     # buckets[sid] = {"entries": [...], "project_path": str|None,
     #                 "last_activity": dt|None, "source_paths": set[str]}
     buckets: dict[str, dict[str, Any]] = {}
@@ -444,7 +432,7 @@ def _aggregate_cache_by_session_with_warnings(
             # Project cell while session_files backfill is incomplete.
             # Real project_path from session_files (if present on any
             # joined row) overrides below.
-            "project_path": pd(entry.source_path),
+            "project_path": project_decoder(entry.source_path),
             "last_activity": None,
             "source_paths": set(),
         })
@@ -459,18 +447,14 @@ def _aggregate_cache_by_session_with_warnings(
     result: list[CacheRow] = []
     for sid, b in buckets.items():
         # Per-model sub-buckets scoped to this session's entries.
-        model_buckets: dict[str, dict[str, Any]] = {}
+        model_buckets: dict[str, _Bucket] = {}
         for entry in b["entries"]:
-            mb_raw = model_buckets.setdefault(entry.model, {
-                "inputTokens": 0, "outputTokens": 0,
-                "cacheCreationTokens": 0, "cacheReadTokens": 0, "cost": 0.0,
-                "savedUsd": 0.0, "wastedUsd": 0.0, "netUsd": 0.0,
-            })
-            mb_raw["inputTokens"] += entry.input_tokens
-            mb_raw["outputTokens"] += entry.output_tokens
-            mb_raw["cacheCreationTokens"] += entry.cache_creation_tokens
-            mb_raw["cacheReadTokens"] += entry.cache_read_tokens
-            mb_raw["cost"] += cc(
+            mb_raw = model_buckets.setdefault(entry.model, _Bucket())
+            mb_raw.input_tokens += entry.input_tokens
+            mb_raw.output_tokens += entry.output_tokens
+            mb_raw.cache_creation_tokens += entry.cache_creation_tokens
+            mb_raw.cache_read_tokens += entry.cache_read_tokens
+            mb_raw.cost += cost_calculator(
                 entry.model,
                 {
                     "input_tokens": entry.input_tokens,
@@ -487,9 +471,9 @@ def _aggregate_cache_by_session_with_warnings(
                 entry.cache_read_tokens,
                 pricing=pricing,
             )
-            mb_raw["savedUsd"] += saved
-            mb_raw["wastedUsd"] += wasted
-            mb_raw["netUsd"] += net
+            mb_raw.saved_usd += saved
+            mb_raw.wasted_usd += wasted
+            mb_raw.net_usd += net
 
         row = CacheRow(
             session_id=sid,
@@ -501,19 +485,19 @@ def _aggregate_cache_by_session_with_warnings(
             mb_raw = model_buckets[model_name]
             mb = CacheModelBreakdown(
                 model_name=model_name,
-                input_tokens=mb_raw["inputTokens"],
-                output_tokens=mb_raw["outputTokens"],
-                cache_creation_tokens=mb_raw["cacheCreationTokens"],
-                cache_read_tokens=mb_raw["cacheReadTokens"],
+                input_tokens=mb_raw.input_tokens,
+                output_tokens=mb_raw.output_tokens,
+                cache_creation_tokens=mb_raw.cache_creation_tokens,
+                cache_read_tokens=mb_raw.cache_read_tokens,
                 cache_hit_percent=_compute_cache_hit_percent(
-                    mb_raw["inputTokens"],
-                    mb_raw["cacheCreationTokens"],
-                    mb_raw["cacheReadTokens"],
+                    mb_raw.input_tokens,
+                    mb_raw.cache_creation_tokens,
+                    mb_raw.cache_read_tokens,
                 ),
-                cost=mb_raw["cost"],
-                saved_usd=mb_raw["savedUsd"],
-                wasted_usd=mb_raw["wastedUsd"],
-                net_usd=mb_raw["netUsd"],
+                cost=mb_raw.cost,
+                saved_usd=mb_raw.saved_usd,
+                wasted_usd=mb_raw.wasted_usd,
+                net_usd=mb_raw.net_usd,
             )
             row.model_breakdowns.append(mb)
             row.input_tokens += mb.input_tokens
@@ -533,31 +517,6 @@ def _aggregate_cache_by_session_with_warnings(
     _min_dt = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
     result.sort(key=lambda r: r.last_activity or _min_dt, reverse=True)
     return _SessionAggregationResult(rows=result, fallback_count=fallback_count)
-
-
-def _aggregate_cache_by_session(
-    entries: Iterable,
-    *,
-    since: dt.datetime,
-    until: dt.datetime,
-    pricing: dict,
-    cost_calculator: Callable[[str, dict, str, Optional[float]], float] | None = None,
-    project_decoder: Callable[[str], str] | None = None,
-) -> list[CacheRow]:
-    """Thin wrapper around ``_aggregate_cache_by_session_with_warnings``
-    that discards the fallback warning count.
-
-    Callers that want to emit the legacy "N entries lacked session_files
-    rows" one-shot warning should reach for
-    ``_aggregate_cache_by_session_with_warnings`` directly.
-    """
-    return _aggregate_cache_by_session_with_warnings(
-        entries,
-        since=since, until=until,
-        pricing=pricing,
-        cost_calculator=cost_calculator,
-        project_decoder=project_decoder,
-    ).rows
 
 
 # ---------------------------------------------------------------------------
@@ -640,8 +599,9 @@ def _classify_anomalies(
 
     Trigger 2 (``cache_drop``): ``cache_hit_percent`` is ``>= threshold_pp``
     below the trailing ``window_days`` median of OTHER rows. Requires
-    a minimum of 5 (daily) or 10 (session) baseline samples; silently
-    skipped otherwise.
+    a minimum of ``CACHE_REPORT_MIN_BASELINE_DAYS`` (daily) or
+    ``CACHE_REPORT_MIN_BASELINE_SESSIONS`` (session) baseline samples;
+    silently skipped otherwise.
 
     Reasons are appended in deterministic order: ``net_negative`` first
     (no baseline needed), then ``cache_drop`` (matches the
@@ -660,7 +620,10 @@ def _classify_anomalies(
         return
 
     is_session_mode = rows[0].session_id is not None
-    min_baseline = 10 if is_session_mode else 5
+    min_baseline = (
+        CACHE_REPORT_MIN_BASELINE_SESSIONS if is_session_mode
+        else CACHE_REPORT_MIN_BASELINE_DAYS
+    )
 
     # Pre-compute anchors once to avoid O(n²·datetime-parse) overhead.
     anchors: list[dt.datetime | None] = [_row_anchor(r) for r in rows]
@@ -723,53 +686,59 @@ def _aggregate_cache_breakdown(
     ``cache_hit_percent`` is the TRUE aggregate hit % across the tail's
     token totals (not a placeholder zero, not the mean of the tail's
     per-bucket percentages) — matches the by-project numbers users
-    would see if they widened the top-N.
+    would see if they widened the top-N. The aggregate is computed by
+    summing the head rows' token fields rather than re-walking the raw
+    bucket map (EFF-4).
     """
-    buckets: dict[str, dict[str, Any]] = {}
+    buckets: dict[str, _Bucket] = {}
     for e in entries:
         if skip_synthetic and getattr(e, "model", None) == "<synthetic>":
             continue
         key = key_fn(e)
-        b = buckets.setdefault(key, {
-            "input": 0, "creation": 0, "read": 0,
-            "saved": 0.0, "wasted": 0.0, "net": 0.0,
-        })
-        b["input"] += getattr(e, "input_tokens", 0)
-        b["creation"] += getattr(e, "cache_creation_tokens", 0)
-        b["read"] += getattr(e, "cache_read_tokens", 0)
+        b = buckets.setdefault(key, _Bucket())
+        b.input_tokens += getattr(e, "input_tokens", 0)
+        b.cache_creation_tokens += getattr(e, "cache_creation_tokens", 0)
+        b.cache_read_tokens += getattr(e, "cache_read_tokens", 0)
         saved, wasted, net = _compute_entry_cache_dollars(
             getattr(e, "model", ""),
             getattr(e, "cache_creation_tokens", 0),
             getattr(e, "cache_read_tokens", 0),
             pricing=pricing,
         )
-        b["saved"] += saved
-        b["wasted"] += wasted
-        b["net"] += net
+        b.saved_usd += saved
+        b.wasted_usd += wasted
+        b.net_usd += net
 
     out: list[CacheBreakdownRow] = []
     for key, b in buckets.items():
         out.append(CacheBreakdownRow(
             key=key,
             cache_hit_percent=_compute_cache_hit_percent(
-                b["input"], b["creation"], b["read"],
+                b.input_tokens, b.cache_creation_tokens, b.cache_read_tokens,
             ),
-            net_usd=b["net"],
+            net_usd=b.net_usd,
+            input_tokens=b.input_tokens,
+            cache_creation_tokens=b.cache_creation_tokens,
+            cache_read_tokens=b.cache_read_tokens,
         ))
     out.sort(key=lambda r: abs(r.net_usd), reverse=True)
     if len(out) <= top_n:
         return tuple(out)
     head = out[:top_n]
     tail = out[top_n:]
-    tail_keys = {r.key for r in tail}
     other_net = sum(r.net_usd for r in tail)
-    # True aggregate hit % over the tail buckets:
-    tail_input = sum(b["input"] for k, b in buckets.items() if k in tail_keys)
-    tail_creation = sum(b["creation"] for k, b in buckets.items() if k in tail_keys)
-    tail_read = sum(b["read"] for k, b in buckets.items() if k in tail_keys)
+    # True aggregate hit % over the tail buckets — sum directly from the
+    # CacheBreakdownRow token fields (EFF-4 — avoids the previous triple
+    # walk over ``buckets.items()``).
+    tail_input = sum(r.input_tokens for r in tail)
+    tail_creation = sum(r.cache_creation_tokens for r in tail)
+    tail_read = sum(r.cache_read_tokens for r in tail)
     other_pct = _compute_cache_hit_percent(tail_input, tail_creation, tail_read)
     head.append(CacheBreakdownRow(
         key=other_label, cache_hit_percent=other_pct, net_usd=other_net,
+        input_tokens=tail_input,
+        cache_creation_tokens=tail_creation,
+        cache_read_tokens=tail_read,
     ))
     return tuple(head)
 
@@ -797,41 +766,44 @@ def _aggregate_cache_breakdown_from_rows(
     "where did the savings land" rollup, so synthetic is dropped to match
     ``_aggregate_cache_breakdown``'s contract.
     """
-    buckets: dict[str, dict[str, Any]] = {}
+    buckets: dict[str, _Bucket] = {}
     for row in rows:
         for mb in row.model_breakdowns:
             if skip_synthetic and mb.model_name == "<synthetic>":
                 continue
-            b = buckets.setdefault(mb.model_name, {
-                "input": 0, "creation": 0, "read": 0, "net": 0.0,
-            })
-            b["input"] += mb.input_tokens
-            b["creation"] += mb.cache_creation_tokens
-            b["read"] += mb.cache_read_tokens
-            b["net"] += mb.net_usd
+            b = buckets.setdefault(mb.model_name, _Bucket())
+            b.input_tokens += mb.input_tokens
+            b.cache_creation_tokens += mb.cache_creation_tokens
+            b.cache_read_tokens += mb.cache_read_tokens
+            b.net_usd += mb.net_usd
 
     out: list[CacheBreakdownRow] = []
     for key, b in buckets.items():
         out.append(CacheBreakdownRow(
             key=key,
             cache_hit_percent=_compute_cache_hit_percent(
-                b["input"], b["creation"], b["read"],
+                b.input_tokens, b.cache_creation_tokens, b.cache_read_tokens,
             ),
-            net_usd=b["net"],
+            net_usd=b.net_usd,
+            input_tokens=b.input_tokens,
+            cache_creation_tokens=b.cache_creation_tokens,
+            cache_read_tokens=b.cache_read_tokens,
         ))
     out.sort(key=lambda r: abs(r.net_usd), reverse=True)
     if len(out) <= top_n:
         return tuple(out)
     head = out[:top_n]
     tail = out[top_n:]
-    tail_keys = {r.key for r in tail}
     other_net = sum(r.net_usd for r in tail)
-    tail_input = sum(b["input"] for k, b in buckets.items() if k in tail_keys)
-    tail_creation = sum(b["creation"] for k, b in buckets.items() if k in tail_keys)
-    tail_read = sum(b["read"] for k, b in buckets.items() if k in tail_keys)
+    tail_input = sum(r.input_tokens for r in tail)
+    tail_creation = sum(r.cache_creation_tokens for r in tail)
+    tail_read = sum(r.cache_read_tokens for r in tail)
     other_pct = _compute_cache_hit_percent(tail_input, tail_creation, tail_read)
     head.append(CacheBreakdownRow(
         key=other_label, cache_hit_percent=other_pct, net_usd=other_net,
+        input_tokens=tail_input,
+        cache_creation_tokens=tail_creation,
+        cache_read_tokens=tail_read,
     ))
     return tuple(head)
 
@@ -849,6 +821,13 @@ class _CacheReportResult:
     ``CacheReportSnapshot`` for the SSE envelope). ``display_tz_key`` is
     the resolved IANA zone name (or ``None`` when the caller passed
     ``display_tz=None`` and the kernel fell back to host-local).
+
+    ``today_baseline_median`` is the median cache_hit_percent across
+    "other" rows (excluding today's row) over the trailing
+    ``anomaly_window_days`` — populated in day mode only (session mode
+    has no equivalent "today" concept). Surfaced here so the dashboard
+    snapshot builder can read it without re-running
+    ``_compute_baseline_median`` over the same data (EFF-3).
     """
     rows: list[CacheRow]
     mode: Literal["day", "session"]
@@ -856,6 +835,7 @@ class _CacheReportResult:
     anomaly_threshold_pp: int
     anomaly_window_days: int
     display_tz_key: str | None
+    today_baseline_median: float | None = None
 
 
 def _build_cache_report(
@@ -867,8 +847,8 @@ def _build_cache_report(
     anomaly_window_days: int,
     display_tz: ZoneInfo | None,
     pricing: dict,
+    cost_calculator: Callable[[str, dict, str, Optional[float]], float],
     mode: Literal["day", "session"] = "day",
-    cost_calculator: Callable[[str, dict, str, Optional[float]], float] | None = None,
     project_decoder: Callable[[str], str] | None = None,
     anomaly_enabled: bool = True,
 ) -> _CacheReportResult:
@@ -877,31 +857,34 @@ def _build_cache_report(
     Returns a ``_CacheReportResult`` that both the CLI renderer and the
     dashboard snapshot builder consume. Pure-function — no I/O, no
     logging, no environment reads. Callers (CLI / dashboard) own all
-    I/O via the ``entries`` iterable + the optional ``cost_calculator``
-    / ``project_decoder`` injections.
+    I/O via the ``entries`` iterable + the ``cost_calculator`` /
+    ``project_decoder`` injections.
 
     ``mode="day"`` buckets entries by display-tz calendar date;
     ``mode="session"`` buckets by Claude ``sessionId`` (resume-merged
-    across JSONL files). The ``since`` window for both modes is
-    ``now_utc − window_days``; the kernel trusts callers to pre-filter
-    via their own query (``get_entries`` / ``get_claude_session_entries``).
+    across JSONL files). Session mode requires ``project_decoder`` (the
+    CLI passes its ``_decode_escaped_cwd``-backed shim); day mode
+    ignores it.
+
+    The ``since`` window for both modes is ``now_utc − window_days``;
+    the kernel trusts callers to pre-filter via their own query
+    (``get_entries`` / ``get_claude_session_entries``).
     """
-    since = now_utc - dt.timedelta(days=window_days)
     if mode == "day":
         rows = _aggregate_cache_by_day(
             entries,
-            since=since, until=now_utc,
             display_tz=display_tz, pricing=pricing,
             cost_calculator=cost_calculator,
         )
     elif mode == "session":
+        if project_decoder is None:
+            raise ValueError("session mode requires project_decoder")
         rows = _aggregate_cache_by_session(
             entries,
-            since=since, until=now_utc,
             pricing=pricing,
             cost_calculator=cost_calculator,
             project_decoder=project_decoder,
-        )
+        ).rows
     else:
         raise ValueError(f"unknown mode: {mode!r}")
 
@@ -911,6 +894,33 @@ def _build_cache_report(
         window_days=anomaly_window_days,
         enabled=anomaly_enabled,
     )
+
+    # EFF-3: surface today's baseline median directly on the result so
+    # the dashboard snapshot builder doesn't have to re-run
+    # _compute_baseline_median over the same row set. Day-mode only —
+    # session mode has no equivalent "today" anchor concept. Anchor
+    # construction mirrors the pre-EFF-3 adapter byte-for-byte —
+    # the strptime + astimezone(display_tz_or_UTC) pair treats the
+    # naive parsed datetime as host-local before shifting, which IS
+    # the prior contract; do not change without re-verifying the
+    # dashboard envelope's today.baseline_median_percent stays stable
+    # against the existing golden fixtures.
+    today_baseline_median: float | None = None
+    if mode == "day":
+        today_iso = now_utc.astimezone(
+            display_tz if display_tz is not None else dt.timezone.utc
+        ).strftime("%Y-%m-%d")
+        today_anchor = dt.datetime.strptime(today_iso, "%Y-%m-%d").astimezone(
+            display_tz if display_tz is not None else dt.timezone.utc
+        )
+        other_rows = [r for r in rows if r.date != today_iso]
+        today_baseline_median = _compute_baseline_median(
+            other_rows,
+            anchor=today_anchor,
+            window_days=anomaly_window_days,
+            min_samples=CACHE_REPORT_MIN_BASELINE_DAYS,
+        )
+
     return _CacheReportResult(
         rows=rows,
         mode=mode,
@@ -918,4 +928,5 @@ def _build_cache_report(
         anomaly_threshold_pp=anomaly_threshold_pp,
         anomaly_window_days=anomaly_window_days,
         display_tz_key=display_tz.key if display_tz is not None else None,
+        today_baseline_median=today_baseline_median,
     )

@@ -4158,6 +4158,14 @@ mark.current {
   margin-bottom: 6px;
 }
 
+/* Cache Report panel header — inline grouping of glyph + title.
+   Promoted from inline flex per issue #83 QUAL-5. */
+.cr-panel-header-inner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .cr-glyph {
   font-size: 20px; line-height: 1;
 }
@@ -4232,6 +4240,14 @@ mark.current {
 .crm-spotlight.anom {
   background: linear-gradient(180deg, rgba(251,191,36,0.07), transparent);
   border-color: rgba(251,191,36,0.32);
+}
+/* Cache Report modal spotlight — inline stat-row inside .crm-spotlight.
+   Wraps on narrow widths. Promoted from inline flex per issue #83 QUAL-5. */
+.crm-spotlight-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
 }
 .crm-spotlight .pill {
   display: inline-flex; align-items: center; gap: 6px;

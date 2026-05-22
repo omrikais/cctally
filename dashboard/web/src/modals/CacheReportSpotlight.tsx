@@ -11,6 +11,7 @@
 // Spec 2026-05-21 §3.3.
 import type { CacheReportEnvelope } from '../types/envelope';
 import { fmt } from '../lib/fmt';
+import { CACHE_REPORT_MIN_BASELINE_DAYS } from '../lib/cache-report-constants';
 
 export interface CacheReportSpotlightProps {
   cr: CacheReportEnvelope;
@@ -18,14 +19,15 @@ export interface CacheReportSpotlightProps {
 
 export function CacheReportSpotlight({ cr }: CacheReportSpotlightProps) {
   const anomalous = cr.today.anomaly_triggered;
-  const insufficient = cr.today.baseline_daily_row_count < 5;
+  const insufficient =
+    cr.today.baseline_daily_row_count < CACHE_REPORT_MIN_BASELINE_DAYS;
 
   let pill: { text: string; cls: string };
   if (anomalous) {
     pill = { text: '⚠ Anomaly', cls: '' };
   } else if (insufficient) {
     pill = {
-      text: `~ Building baseline · ${cr.today.baseline_daily_row_count}/5 days`,
+      text: `~ Building baseline · ${cr.today.baseline_daily_row_count}/${CACHE_REPORT_MIN_BASELINE_DAYS} days`,
       cls: 'thin',
     };
   } else {
@@ -56,14 +58,7 @@ export function CacheReportSpotlight({ cr }: CacheReportSpotlightProps) {
         </span>
       </div>
       <div className={`crm-spotlight${anomalous ? ' anom' : ''}`}>
-        <div
-          style={{
-            display: 'flex',
-            flexWrap: 'wrap',
-            gap: 14,
-            alignItems: 'center',
-          }}
-        >
+        <div className="crm-spotlight-row">
           <span className={`pill${pill.cls ? ' ' + pill.cls : ''}`}>{pill.text}</span>
           <span>
             <span className="k">Cache hit</span>{' '}

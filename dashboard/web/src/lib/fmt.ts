@@ -330,7 +330,15 @@ export const fmt = {
   },
   // 1500 -> "1.5k", 21_300_000 -> "21.3M", 2_500_000_000 -> "2.5B".
   // Drops trailing ".0" (414_000 -> "414k", not "414.0k").
-  compact(v: number | null | undefined): string {
+  // With { upper: true }: K instead of k (cosmetic; M/B are already
+  // uppercase). Used by the Cache Report modal's token table.
+  // NOTE on precision under 100k: this formatter keeps one decimal
+  // (1234 -> "1.2K"). The pre-#83 local fmtTokens used a whole-K
+  // rounding (1234 -> "1K"). The Cache Report daily-rows totals
+  // are typically large enough that the visible diff is negligible;
+  // if future surfaces want byte-stable whole-K rounding, add a
+  // { round: "whole" } opt rather than forking the helper again.
+  compact(v: number | null | undefined, opts: { upper?: boolean } = {}): string {
     if (v == null) return '—';
     const n = Math.abs(v);
     let out: string;
@@ -344,7 +352,9 @@ export const fmt = {
     } else {
       return String(v | 0);
     }
-    return out.replace(/\.0(?=[kMB]$)/, '');
+    out = out.replace(/\.0(?=[kMB]$)/, '');
+    if (opts.upper) out = out.replace(/k$/, 'K');
+    return out;
   },
   deltaCls(v: number | null | undefined, isCurrent: boolean): string {
     if (v == null || isCurrent) return '';
