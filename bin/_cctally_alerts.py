@@ -24,11 +24,11 @@ in `bin/_lib_alerts_payload.py` (Phase A extraction); this module
 imports them directly via `_load_lib`, which keeps the dispatch path
 free of an extra bounce through cctally's re-exports.
 
-bin/cctally back-references via `_cctally()` (spec §5.5 pattern, same
-as `bin/_cctally_setup.py`):
-- `LOG_DIR` — base dir under which `alerts.log` lives (subject to
-  HOME-redirection by test fixtures via `monkeypatch.setitem(ns,
-  "LOG_DIR", ...)`).
+Kernel reads from `bin/_cctally_core` (call-time module-attribute access):
+- `LOG_DIR` — base dir under which `alerts.log` lives. Promoted to
+  `_cctally_core` 2026-05-22 (#84); test fixtures redirect via
+  `monkeypatch.setattr(_cctally_core, "LOG_DIR", tmp)` (or the
+  conftest `redirect_paths()` helper).
 - `now_utc_iso` — single timestamp source used for both the log-line
   timestamp and the synthetic test payload's `crossed_at_utc`.
 
