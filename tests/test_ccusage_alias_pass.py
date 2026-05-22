@@ -186,12 +186,18 @@ def test_five_hour_blocks_invalid_since_prints_one_stderr_line(
     ), lines[0]
 
 
-def test_z_alias_uses_resolver_in_cmd_blocks_path(monkeypatch, capsys):
+def test_z_alias_bridge_invokes_resolver(monkeypatch, capsys):
     """Spec §7.2 / Review-A P2-A: ``_resolve_claude_tz_name`` must be
     exercised in the production path (not only via the standalone unit
     suite). Monkeypatch the resolver to record calls; drive the
     in-process bridge with ``args.timezone='UTC'``; assert the resolver
     fired with the namespace + config combo.
+
+    Note: this test drives ``_bridge_z_into_tz`` directly rather than
+    spawning a full ``cctally blocks -z UTC`` subprocess — that proxy is
+    sufficient because every wired cmd_* calls the bridge unconditionally
+    (§7.2). End-to-end behavioral coverage of ``-z`` lives in the matrix
+    in ``TestAliasSurface``.
     """
     mod = _load_cctally_module()
 
