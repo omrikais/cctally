@@ -2131,14 +2131,32 @@ def build_cache_report_snapshot(
     # produced by day-mode, which avoids re-running the tiered-pricing
     # math per entry. Both paths apply the same ``<synthetic>`` filter so
     # the axes can't silently disagree on token totals.
+    #
+    # Constrain both axes to the SAME calendar dates as ``days``: the
+    # kernel's rolling window can emit ``window_days + 1`` distinct
+    # display-tz buckets (see the slice-cap comment above), and ``days``
+    # drops the oldest. Without the same drop here the by-project /
+    # by-model cards would silently include the clipped 15th day and
+    # their net totals stop reconciling against the visible table /
+    # CacheNetBars in the modal. The filter mirrors the kernel's
+    # bucket-key derivation (``entry.timestamp.astimezone(tz)``) so a
+    # cache entry and its corresponding day row always agree on which
+    # bucket they belong to.
+    kept_dates = frozenset(r.date for r in days if r.date)
+    bucket_tz = display_tz if display_tz is not None else dt.timezone.utc
+    entries_in_window = [
+        e for e in entries
+        if e.timestamp.astimezone(bucket_tz).strftime("%Y-%m-%d") in kept_dates
+    ]
+    rows_in_window = [r for r in result.rows if r.date in kept_dates]
     by_project_rows = crk._aggregate_cache_breakdown(
-        entries,
+        entries_in_window,
         key_fn=lambda e: (getattr(e, "project_path", None) or "(unknown)"),
         pricing=pricing,
         skip_synthetic=True,
     )
     by_model_rows = crk._aggregate_cache_breakdown_from_rows(
-        result.rows,
+        rows_in_window,
         skip_synthetic=True,
     )
     by_project = tuple(

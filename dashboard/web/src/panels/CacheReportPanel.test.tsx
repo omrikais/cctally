@@ -204,6 +204,32 @@ describe('<CacheReportPanel /> insufficient-baseline state', () => {
     // Sparkline omitted in insufficient-baseline state.
     expect(document.querySelector('.cr-spark')).toBeNull();
   });
+
+  it('keeps panel chrome teal even when today.anomaly_triggered is true while baseline samples are thin (round-2 finding)', () => {
+    // First 1-4 captured days: the server-side classifier can fire
+    // `net_negative` without a baseline, so `anomaly_triggered` arrives
+    // true while baseline_daily_row_count is still below the 5-day
+    // floor. The panel must keep accent-teal / "Building baseline" copy
+    // and NOT flip the border, header text color, or the "⚠ Today"
+    // badge — those would render a false warning before the watchdog is
+    // actually live and contradict the body copy below.
+    const cr = insufficientBaselineCacheReport();
+    cr.today = {
+      ...cr.today,
+      anomaly_triggered: true,
+      anomaly_reasons: ['net_negative'],
+      net_usd: -0.42,
+    };
+    updateSnapshot(envelopeWith(cr));
+    render(<CacheReportPanel />);
+    const panel = screen.getByRole('region', { name: /cache report/i });
+    expect(panel).toHaveClass('accent-teal');
+    expect(panel).not.toHaveClass('accent-amber');
+    // Headline still reads "Building baseline", not the anomalous copy.
+    expect(screen.getByText(/Building baseline · 3\/5 days/i)).toBeInTheDocument();
+    // No "⚠ Today" header badge — that's part of the amber chrome.
+    expect(screen.queryByText(/⚠ Today/i)).toBeNull();
+  });
 });
 
 describe('<CacheReportPanel /> empty state', () => {

@@ -197,6 +197,48 @@ describe('<CacheReportModal /> daily rows table', () => {
     expect(cells[1].className).toContain('hit-bad');
     expect(cells[cells.length - 1].className).toContain('flag-warn');
   });
+
+  it('hit-bad color tracks each row\'s own anomaly_reasons, not today\'s baseline (round-2 finding)', () => {
+    // Scenario from the round-2 review: five early 80% days followed by
+    // many 50% days. The server-side classifier uses each row's own
+    // baseline (exclude_row=row), so the first 50% rows were flagged
+    // `cache_drop` against the 80% reference and stay anomalous. But
+    // once today's median itself drifts to 50%, a per-row predicate that
+    // recomputes against `cr.today.baseline_median_percent` would paint
+    // those historical 50% rows green next to a ⚠ Flag — the cell color
+    // would contradict the Flag column on the same row.
+    const cr = makeCacheReport();
+    cr.today = {
+      ...cr.today,
+      baseline_median_percent: 50, // today's median has drifted down
+      cache_hit_percent: 50,
+    };
+    cr.days = cr.days.map((d, i) => {
+      if (i < 5) {
+        // First 5 historical rows: 50% hit + flagged cache_drop by
+        // their own per-row baseline (which still saw the prior 80%
+        // reference set).
+        return {
+          ...d,
+          cache_hit_percent: 50,
+          anomaly_triggered: true,
+          anomaly_reasons: ['cache_drop'],
+        };
+      }
+      return d;
+    });
+    updateSnapshot(envelopeWith(cr));
+    render(<CacheReportModal />);
+    const row = document.querySelector(
+      `[data-testid="crm-daily-row"][data-date="${cr.days[0].date}"]`,
+    );
+    expect(row).toBeTruthy();
+    const cells = row?.querySelectorAll('td') ?? [];
+    // hit cell (2nd col) must be hit-bad to match the ⚠ Flag column.
+    expect(cells[1].className).toContain('hit-bad');
+    expect(cells[1].className).not.toContain('hit-good');
+    expect(cells[cells.length - 1].className).toContain('flag-warn');
+  });
 });
 
 describe('<CacheReportModal /> anomaly spotlight', () => {

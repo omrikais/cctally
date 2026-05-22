@@ -28,7 +28,10 @@ import { CacheNetBars } from './CacheNetBars';
 import { CacheBreakdownCard } from './CacheBreakdownCard';
 import { CacheReportSettings } from './CacheReportSettings';
 import { fmt } from '../lib/fmt';
-import { CACHE_REPORT_BAND_PP } from '../lib/cache-report-constants';
+import {
+  CACHE_REPORT_BAND_PP,
+  CACHE_REPORT_MIN_BASELINE_DAYS,
+} from '../lib/cache-report-constants';
 
 export function CacheReportModal() {
   const env = useSnapshot();
@@ -97,19 +100,27 @@ export function CacheReportModal() {
     </>
   );
 
+  // Mirror the panel's chrome-amber gate: `anomaly_triggered` alone can
+  // be true during the first 1–4 captured days (net_negative fires
+  // without a baseline), so the panel deliberately stays teal until the
+  // 5-day floor exists. The modal MUST follow suit, otherwise the
+  // panel-to-modal handoff would be teal → amber on a baseline-building
+  // day and contradict the panel's "Building baseline" copy.
+  const insufficient =
+    cr.today.baseline_daily_row_count < CACHE_REPORT_MIN_BASELINE_DAYS;
+  const chromeAmber = cr.today.anomaly_triggered && !insufficient;
+
   // Today's marker color for the timeline circle. Mirrors the panel's
   // todayMarker derivation so the modal and panel agree on the
   // semantic green/amber color.
-  const todayMarker = cr.today.anomaly_triggered
+  const todayMarker = chromeAmber
     ? 'var(--accent-amber)'
     : 'var(--accent-green)';
 
   // Mirror the panel's severity flip on the modal-card border so the
   // teal -> amber visual handoff between panel and modal stays
   // consistent on an anomalous day.
-  const accentClass = cr.today.anomaly_triggered
-    ? 'accent-amber'
-    : 'accent-teal';
+  const accentClass = chromeAmber ? 'accent-amber' : 'accent-teal';
 
   // Counterfactual efficiency ratio for the callout (already
   // computed server-side; we just format).
@@ -184,14 +195,28 @@ export function CacheReportModal() {
           <tbody>
             {cr.days.map((d) => {
               const isToday = d.date === cr.today.date;
-              // hit-bad rule per spec §3.7: a row is bad iff baseline
-              // is known AND today's hit is below baseline-5pp. When
-              // baseline is null (insufficient samples) every row
-              // stays neutral.
+              // hit-bad rule per spec §3.7: a row is bad iff THIS row's
+              // own anomaly classifier flagged `cache_drop`. Comparing
+              // each row against TODAY's baseline_median_percent
+              // disagrees with the server: the per-row classifier
+              // (_cctally_cache_report.py:_classify_anomalies) builds
+              // each row's baseline with `exclude_row=row`, so a
+              // historical row can be flagged anomalous against a
+              // baseline different from today's. Concretely, a window
+              // with five 80% days followed by many 50% days would
+              // paint the first 50% rows green next to a ⚠ flag once
+              // today's median falls to 50%, contradicting the Flag
+              // column. Reusing `d.anomaly_reasons` keeps the cell
+              // color and the Flag column in lock-step regardless of
+              // how today's baseline moves.
+              //
+              // `baselineKnown` is still gated on today's median: it's
+              // the window-wide "do we have any baseline at all" signal
+              // (the rolling window is shared across rows), and the
+              // neutral cell class — '' rather than 'hit-good' — only
+              // makes sense when there's nothing to compare against.
               const baselineKnown = cr.today.baseline_median_percent !== null;
-              const isHitBad =
-                baselineKnown &&
-                d.cache_hit_percent < (cr.today.baseline_median_percent as number) - CACHE_REPORT_BAND_PP;
+              const isHitBad = d.anomaly_reasons.includes('cache_drop');
               const isNetNeg = d.net_usd < 0;
               return (
                 <tr

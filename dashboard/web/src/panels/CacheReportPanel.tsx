@@ -134,9 +134,20 @@ export function CacheReportPanel() {
   // Accent class flip (anomalous => amber). The header color follows the
   // same flip so the title text reads correctly against the bordered
   // panel.
-  const accentClass = anomalous ? 'accent-amber' : 'accent-teal';
-  const headerColor = anomalous ? AMBER : TEAL;
-  const todayMarker = anomalous ? AMBER : GREEN;
+  //
+  // Gate the chrome flip on `!insufficient`: during the first 1–4
+  // captured days a `net_negative` today already sets
+  // `cr.today.anomaly_triggered = true` (the server-side classifier
+  // skips only `cache_drop` when samples are thin), but the watchdog is
+  // supposed to read as neutral "Building baseline" until the 5-day
+  // floor exists. Flipping the border / header / sparkline-marker to
+  // amber here would render a false warning before the baseline is
+  // established and contradict the headline copy below
+  // (CacheReportModal mirrors the same gate on .modal-card).
+  const chromeAmber = anomalous && !insufficient;
+  const accentClass = chromeAmber ? 'accent-amber' : 'accent-teal';
+  const headerColor = chromeAmber ? AMBER : TEAL;
+  const todayMarker = chromeAmber ? AMBER : GREEN;
 
   let glyph: { icon: string; cls: string };
   let headline: React.ReactNode;
@@ -237,7 +248,7 @@ export function CacheReportPanel() {
         <div className="cr-panel-header-inner">
           <h3 style={{ color: headerColor }}>
             Cache Report
-            {anomalous && <span className="sub">⚠ Today</span>}
+            {chromeAmber && <span className="sub">⚠ Today</span>}
           </h3>
         </div>
         <PanelGrip />

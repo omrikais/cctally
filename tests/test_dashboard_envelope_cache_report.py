@@ -470,3 +470,75 @@ def test_build_cache_report_snapshot_days_bounded_by_window(monkeypatch):
     # Newest-first ordering means today (2026-05-20 PT) is at index 0
     # and the oldest retained day is 13 entries back.
     assert snap.days[0].date == "2026-05-20"
+
+
+def test_build_cache_report_snapshot_breakdowns_match_days_window(monkeypatch):
+    """Round-2 regression: by-project / by-model breakdowns must aggregate
+    only over the same calendar dates as ``days`` (the displayed 14-day
+    window), not over the unsliced 15-day raw set.
+
+    Setup mirrors ``test_build_cache_report_snapshot_days_bounded_by_window``:
+    one entry on each of 15 PT-local calendar dates straddling
+    ``now_utc - 14d`` … ``now_utc``. Without the date filter on the
+    breakdown inputs, the oldest day (which is dropped from ``days``)
+    still contributes to the by-project / by-model net totals — the
+    cards then can't reconcile against the visible table / CacheNetBars
+    in the modal.
+
+    The oldest entry uses a distinct ``project_path`` so we can assert
+    it's absent from ``by_project``.
+    """
+    dash, cctally_ns = _bootstrap_dashboard()
+    now_utc = dt.datetime(2026, 5, 21, 2, 0, tzinfo=dt.timezone.utc)
+    pt = ZoneInfo("America/Los_Angeles")
+    pt_dates = [
+        dt.datetime(2026, 5, d, 18, 30, tzinfo=pt)
+        for d in range(6, 21)  # 2026-05-06 .. 2026-05-20 (15 days)
+    ]
+    entries = []
+    for i, ts in enumerate(pt_dates):
+        # Oldest entry (2026-05-06 PT) goes on a unique project so we can
+        # detect leakage.
+        project = "/proj/oldest-leak" if i == 0 else "/proj/normal"
+        entries.append(
+            _make_joined_entry(
+                ts_utc=ts.astimezone(dt.timezone.utc),
+                cache_read=2000, cache_creation=200,
+                input_tokens=500, output_tokens=100,
+                project_path=project,
+            )
+        )
+    monkeypatch.setitem(
+        cctally_ns, "get_claude_session_entries",
+        lambda *a, **kw: entries,
+    )
+
+    snap = dash.build_cache_report_snapshot(
+        now_utc=now_utc,
+        anomaly_threshold_pp=15,
+        anomaly_window_days=14,
+        display_tz=pt,
+    )
+
+    # `days` is sliced to 14 — the 2026-05-06 PT bucket is dropped.
+    kept_dates = {r.date for r in snap.days}
+    assert "2026-05-06" not in kept_dates, (
+        f"days slice should drop the oldest bucket; kept={sorted(kept_dates)}"
+    )
+
+    # by_project must NOT include the leaked-project key — that entry's
+    # calendar date is outside the kept window.
+    project_keys = {b.key for b in snap.by_project}
+    assert "/proj/oldest-leak" not in project_keys, (
+        f"by_project leaked the dropped 2026-05-06 bucket: {project_keys}"
+    )
+
+    # Reconcile: sum of by_model net_usd must equal sum of days[*].net_usd
+    # within 1e-9 (single project + single model, no top-N truncation, so
+    # the two are pointwise the same set of buckets).
+    by_model_net = sum(b.net_usd for b in snap.by_model)
+    days_net = sum(d.net_usd for d in snap.days)
+    assert abs(by_model_net - days_net) < 1e-9, (
+        f"by_model net {by_model_net} != days net {days_net}; "
+        "breakdown is aggregating outside the displayed window"
+    )
