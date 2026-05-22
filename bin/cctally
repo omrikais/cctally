@@ -4575,7 +4575,11 @@ def _project_sort_key(row: dict, sort_by: str, order: str):
 def cmd_project(args: argparse.Namespace) -> int:
     """Roll entries up by project (git-root) with per-project usage attribution."""
     _share_validate_args(args)
+    _emit_debug_note_if_set(args)
     config = load_config()
+    # Session A (spec §7.2): bridge -z/--timezone into args.tz so the
+    # existing resolve_display_tz precedence absorbs the new alias.
+    _bridge_z_into_tz(args, config)
     args._resolved_tz = resolve_display_tz(args, config)
 
     # Flag-combination validation (must run before any expensive work).
@@ -5047,6 +5051,7 @@ _diff_resolve_anchor = _lib_diff_kernel._diff_resolve_anchor
 
 def cmd_diff(args: argparse.Namespace) -> int:
     """Compare Claude usage between two windows."""
+    _emit_debug_note_if_set(args)
     now_utc = _command_as_of()
     if getattr(args, "debug_now", False):
         print(f"now_utc={_iso_z(now_utc)}")
@@ -5059,6 +5064,9 @@ def cmd_diff(args: argparse.Namespace) -> int:
     # Validation already happened via _argparse_tz; resolve now to a ZoneInfo
     # (or None for "local") and derive the IANA name for window resolution.
     config = load_config()
+    # Session A (spec §7.2): bridge -z/--timezone into args.tz so the
+    # existing resolve_display_tz precedence absorbs the new alias.
+    _bridge_z_into_tz(args, config)
     tz_obj = resolve_display_tz(args, config)
     args._resolved_tz = tz_obj
     tz_name = (tz_obj.key if tz_obj is not None else _local_tz_name())
@@ -7384,7 +7392,11 @@ def _load_breakdown(
 def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
     """List API-anchored 5h blocks with rollup totals + 7d-drift columns."""
     _share_validate_args(args)
+    _emit_debug_note_if_set(args)
     config = load_config()
+    # Session A (spec §7.2): bridge -z/--timezone into args.tz before
+    # resolve_display_tz so the new alias precedence lands.
+    _bridge_z_into_tz(args, config)
     args._resolved_tz = resolve_display_tz(args, config)
     # Pin "now" once (CCTALLY_AS_OF for fixture-pinned harnesses; mirrors
     # cmd_five_hour_breakdown). Used by the active-predicate to gate
@@ -8297,7 +8309,13 @@ def _sort_cache_rows(
 
 
 def cmd_cache_report(args: argparse.Namespace) -> int:
+    _emit_debug_note_if_set(args)
     config = load_config()
+    # Session A (spec §7.2): bridge -z/--timezone into args.tz so the
+    # existing resolve_display_tz precedence absorbs the new alias. The
+    # canonical --tz still wins (it's set on the namespace before this
+    # bridge fires); when --tz is unset and -z is supplied, use -z.
+    _bridge_z_into_tz(args, config)
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
 
@@ -8382,6 +8400,16 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
 
 
 def cmd_range_cost(args: argparse.Namespace) -> int:
+    _emit_debug_note_if_set(args)
+    # Session A (spec §7.2 / §7.6 row note): range-cost has no --tz of
+    # its own — start/end carry their own zone via ISO 8601. Calling the
+    # bridge keeps the alias-surface contract uniform across the 10
+    # in-scope cmds: -z/--timezone lands on args.tz unchanged (no
+    # downstream consumer), so this is a documented no-op for this
+    # command. The bridge still runs _resolve_claude_tz_name so the §9.2a
+    # production-path coverage is exercised here too.
+    config = load_config()
+    _bridge_z_into_tz(args, config)
     start_dt = parse_iso_datetime(args.start, "--start")
     if args.end:
         end_dt = parse_iso_datetime(args.end, "--end")
@@ -9747,9 +9775,14 @@ def build_parser() -> argparse.ArgumentParser:
              "Adds SessionId, Last Activity, and Project identity columns.",
     )
     pc.add_argument(
-        "--offline",
-        action="store_true",
-        help="Use cached pricing data in ccusage.",
+        "-O", "--offline",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="Use cached pricing data in ccusage. Session A (spec §7.1.2)"
+             " promotes the existing flag to BooleanOptionalAction + -O"
+             " short form so the ccusage drop-in alias surface (-O,"
+             " --offline, --no-offline) all work on cache-report; the"
+             " behavior under each is unchanged (cctally is always"
+             " offline — args.offline still lands as a bool).",
     )
     pc.add_argument(
         "--project",
@@ -9796,6 +9829,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
     )
+    # Session A (spec §7.6): ansi_emit=False; existing `--offline` is
+    # skipped by the helper's `_argparse_has_arg` guard (the collision
+    # case spec §7.1.2 calls out explicitly).
+    _add_ccusage_alias_args(pc, ansi_emit=False)
     pc.set_defaults(func=cmd_cache_report)
 
     # -- range-cost --
@@ -9850,6 +9887,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="total_only",
         help="Print numeric USD total only.",
     )
+    # Session A (spec §7.6): ansi_emit=False. range-cost has no --tz of
+    # its own (ISO timestamps carry zone info), but the helper-added
+    # -z/--timezone still lands on the namespace; the bridge promotes
+    # it onto args.tz where the rest of the pipeline treats it as a
+    # documented no-op (cmd_range_cost does not consume args.tz).
+    _add_ccusage_alias_args(rc, ansi_emit=False)
     rc.set_defaults(func=cmd_range_cost)
 
     # -- blocks --
@@ -9952,6 +9995,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
     )
+    # Session A (spec §7.6 / §7.6.3): ansi_emit=False. fhb already
+    # declares --no-color (refreshed to no-op text in spec §7.6.3); the
+    # helper's --no-color add is short-circuited by the existing-arg
+    # guard. The helper's --color add lands as a parsed-and-ignored
+    # no-op (the renderer emits plain text).
+    _add_ccusage_alias_args(fhb, ansi_emit=False)
     _add_share_args(fhb)
     fhb.set_defaults(func=cmd_five_hour_blocks)
 
@@ -10318,6 +10367,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_project.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
                            help="Display timezone: local, utc, or IANA name. "
                                 "Overrides config display.tz for this call.")
+    # Session A (spec §7.6): ansi_emit=True. project is one of the two
+    # real ANSI emitters. The helper skips its --no-color add (already
+    # declared at p_project above) and adds the new bool --color flag
+    # whose precedence flows through _resolve_color_enabled (§7.3).
+    _add_ccusage_alias_args(p_project, ansi_emit=True)
     _add_share_args(p_project)
     p_project.set_defaults(func=cmd_project)
 
@@ -10352,6 +10406,14 @@ def build_parser() -> argparse.ArgumentParser:
     diff_p.add_argument("--json", dest="emit_json", action="store_true")
     diff_p.add_argument("--width", type=int, help=argparse.SUPPRESS)
     diff_p.add_argument("--debug-now", action="store_true", help=argparse.SUPPRESS)
+    # Session A (spec §7.6): ansi_emit=True. diff is the other real
+    # ANSI emitter. The helper skips its --no-color add (declared
+    # above) and adds the new bool --color flag wired through
+    # _resolve_color_enabled (§7.3). Note: --debug here collides with
+    # diff's existing `--debug-now` (SUPPRESS'd internal flag) but
+    # `--debug-now` is a different option string; the helper still
+    # adds plain `--debug` cleanly.
+    _add_ccusage_alias_args(diff_p, ansi_emit=True)
     diff_p.set_defaults(func=cmd_diff)
 
     # -- session --
