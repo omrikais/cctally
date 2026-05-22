@@ -89,6 +89,13 @@ from _cctally_core import (
     parse_iso_datetime,
 )
 
+# Stats migration 008 needs the same per-entry cost computation used by
+# the live cost-report path. Direct import keeps the kernel single-sourced
+# (no shim drift); _lib_pricing is a stdlib-only leaf module so no cycle
+# risk. Other siblings (_cctally_record, _cctally_dashboard) follow the
+# same direct-import pattern.
+from _lib_pricing import _calculate_entry_cost
+
 
 # Module-level back-ref shim for the one Z-high callable that STAYS in
 # bin/cctally. Resolves `sys.modules['cctally'].X` at CALL TIME (not
@@ -1759,10 +1766,26 @@ def _gate_001_post_ingest_completed(
 
     Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3.
     """
-    gate_row = cache_ro.execute(
-        "SELECT applied_at_utc FROM schema_migrations WHERE name = ?",
-        ("001_dedup_highest_wins",),
-    ).fetchone()
+    # cache.db may exist as an empty file (e.g. very-early bootstrap, or
+    # the user has only ever opened it via paths that didn't run the
+    # dispatcher). In that state the ``schema_migrations`` table doesn't
+    # yet exist; reading from it raises ``sqlite3.OperationalError``
+    # ("no such table"). Treat this as Layer A failure — the marker is
+    # absent because the table is absent — and defer the same way we
+    # would for a present-but-empty table.
+    try:
+        gate_row = cache_ro.execute(
+            "SELECT applied_at_utc FROM schema_migrations WHERE name = ?",
+            ("001_dedup_highest_wins",),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            raise MigrationGateNotMet(
+                "cache.db has no schema_migrations table yet; "
+                "run any JSONL-reading command (e.g. `cctally weekly`) "
+                "once to bootstrap the migration framework."
+            ) from None
+        raise
     if gate_row is None:
         raise MigrationGateNotMet(
             "cache.db migration 001_dedup_highest_wins not yet applied; "
@@ -1784,11 +1807,20 @@ def _gate_001_post_ingest_completed(
     # "Cross-reset flag is interval-based" — block_start_at vs
     # week_start_at vs last_observed_at_utc all route through
     # ``unixepoch()`` to absorb offset-mix drift).
-    has_post_001_ingest = cache_ro.execute(
-        "SELECT 1 FROM session_files "
-        "WHERE unixepoch(last_ingested_at) > unixepoch(?) LIMIT 1",
-        (applied_at_utc,),
-    ).fetchone() is not None
+    try:
+        has_post_001_ingest = cache_ro.execute(
+            "SELECT 1 FROM session_files "
+            "WHERE unixepoch(last_ingested_at) > unixepoch(?) LIMIT 1",
+            (applied_at_utc,),
+        ).fetchone() is not None
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            # cache.db has a schema_migrations table (Layer A passed) but
+            # no session_files table. Equivalent to "no post-001 ingest
+            # observed"; fall through to the Layer C empty-disk check.
+            has_post_001_ingest = False
+        else:
+            raise
     if has_post_001_ingest:
         return
 
@@ -1855,6 +1887,121 @@ def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.rollback()
         raise
+
+
+# === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
+
+@stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")
+def _008_recompute_weekly_cost_snapshots_dedup_fix(
+    conn: sqlite3.Connection,
+) -> None:
+    """Recompute ``weekly_cost_snapshots.cost_usd`` from the now-corrected
+    ``session_entries``. Gated on cache migration 001 having applied AND
+    ``sync_cache`` having repopulated ``session_entries`` since.
+
+    Scope: only rows with ``mode='auto'`` AND ``project IS NULL``.
+    ``mode='display'`` rows preserve a user-supplied cost from a prior
+    ``calculate`` run (``docs/commands/sync-week.md``); per-project
+    snapshots have aggregation boundaries this fix doesn't know about.
+    Both are left untouched.
+
+    Legacy rows with ``range_start_iso IS NULL`` or
+    ``range_end_iso IS NULL`` are skipped (their pre-fix value stays);
+    CHANGELOG calls this out as the one exception to "post-fix
+    ``report`` matches ``weekly``."
+
+    Cross-DB plumbing
+    -----------------
+    Opens ``cache.db`` read-only via the ``file:?mode=ro`` URI form. We
+    do NOT ``ATTACH DATABASE`` — the existing transactional isolation
+    (write side on ``conn`` inside ``BEGIN``/``COMMIT``, read side on a
+    separate read-only connection) is the cleanest design and matches
+    how Task 3's gate helper already wires it.
+
+    Timestamp comparison
+    --------------------
+    ``range_start_iso`` and ``range_end_iso`` originate from
+    ``insert_cost_snapshot`` → ``parse_iso_datetime(...).isoformat()``,
+    which keeps the offset of whatever the caller passed (typically
+    ``+00:00`` from ``week_start_at`` canonicalization, but
+    ``parse_iso_datetime`` returns ``parsed.astimezone()`` so naive
+    inputs end up host-local). ``session_entries.timestamp_utc`` is the
+    raw JSONL ``timestamp`` field, typically ``Z``-suffixed but
+    upstream-controlled. Lex compare across mixed offsets silently
+    mis-orders moments for non-UTC hosts. We route both sides through
+    ``unixepoch()`` — same defense applied to the cross-reset flag and
+    the gate helper's ingest-time comparison.
+
+    Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3.
+    """
+    cache_db_path = _cctally_core.CACHE_DB_PATH
+    if not cache_db_path.exists():
+        raise MigrationGateNotMet(
+            "cache.db not yet initialized; run any JSONL-reading "
+            "command (e.g. `cctally weekly`) once and retry."
+        )
+    cache_ro = sqlite3.connect(f"file:{cache_db_path}?mode=ro", uri=True)
+    try:
+        _gate_001_post_ingest_completed(
+            cache_ro, _cctally_core.CLAUDE_PROJECTS_DIR,
+        )
+
+        # F3 scope: only rows we have authority over (see docstring).
+        snapshot_rows = conn.execute(
+            "SELECT id, range_start_iso, range_end_iso "
+            "FROM weekly_cost_snapshots "
+            "WHERE mode = 'auto' AND project IS NULL"
+        ).fetchall()
+
+        conn.execute("BEGIN")
+        try:
+            for snap_id, range_start_iso, range_end_iso in snapshot_rows:
+                if range_start_iso is None or range_end_iso is None:
+                    # Legacy row written before range_*_iso columns
+                    # existed. Skip (not crash) — leaves the snapshot at
+                    # its pre-fix value; CHANGELOG calls this out.
+                    continue
+                entries = cache_ro.execute(
+                    "SELECT model, input_tokens, output_tokens, "
+                    "cache_create_tokens, cache_read_tokens, "
+                    "usage_extra_json, cost_usd_raw "
+                    "FROM session_entries "
+                    "WHERE unixepoch(timestamp_utc) >= unixepoch(?) "
+                    "  AND unixepoch(timestamp_utc) <  unixepoch(?)",
+                    (range_start_iso, range_end_iso),
+                ).fetchall()
+                total = 0.0
+                for model, i, o, cc, cr, extras_json, raw in entries:
+                    usage = {
+                        "input_tokens": i,
+                        "output_tokens": o,
+                        "cache_creation_input_tokens": cc,
+                        "cache_read_input_tokens": cr,
+                    }
+                    if extras_json:
+                        usage.update(json.loads(extras_json))
+                    total += _calculate_entry_cost(
+                        model, usage, mode="auto", cost_usd=raw,
+                    )
+                conn.execute(
+                    "UPDATE weekly_cost_snapshots "
+                    "SET cost_usd = ? WHERE id = ?",
+                    (total, snap_id),
+                )
+            conn.execute(
+                "INSERT INTO schema_migrations (name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (
+                    "008_recompute_weekly_cost_snapshots_dedup_fix",
+                    now_utc_iso(),
+                ),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        cache_ro.close()
 
 
 # === Region 8: Test-only migration registration (was bin/cctally:12086-12140) ===

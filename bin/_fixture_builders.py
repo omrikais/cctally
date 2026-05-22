@@ -98,8 +98,12 @@ def _normalize_all_registered_fixture_dbs() -> None:
     for d in _REGISTERED_FIXTURE_DIRS:
         if not d.exists():
             continue
-        for db in sorted(d.glob("*.db")):
-            normalize_sqlite_writer_version(db)
+        # Per-migration fixtures live as `.sqlite` files (lazy-adopted
+        # naming convention; see CLAUDE.md) — include both extensions so
+        # the writer-version normalization covers them uniformly.
+        for pattern in ("*.db", "*.sqlite"):
+            for db in sorted(d.glob(pattern)):
+                normalize_sqlite_writer_version(db)
 
 
 atexit.register(_normalize_all_registered_fixture_dbs)

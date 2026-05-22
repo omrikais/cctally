@@ -115,12 +115,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/stats.db",
-                        "registry_size": 7,
+                        "registry_size": 8,
                         "user_version": 0
                     },
                     "id": "db.stats.file",
                     "severity": "ok",
-                    "summary": "version 0 / 7 known",
+                    "summary": "version 0 / 8 known",
                     "title": "stats.db"
                 },
                 {
@@ -138,7 +138,9 @@
                             "cache.db": {
                                 "applied": [],
                                 "failed": [],
-                                "pending": [],
+                                "pending": [
+                                    "001_dedup_highest_wins"
+                                ],
                                 "skipped": []
                             },
                             "stats.db": {
@@ -152,7 +154,8 @@
                                     "004_heal_forked_week_start_date_buckets",
                                     "005_percent_milestones_reset_event_id",
                                     "006_five_hour_milestones_reset_event_id",
-                                    "007_observed_pre_credit_pct"
+                                    "007_observed_pre_credit_pct",
+                                    "008_recompute_weekly_cost_snapshots_dedup_fix"
                                 ],
                                 "skipped": []
                             }
@@ -196,13 +199,21 @@
                             [
                                 "stats.db",
                                 "007_observed_pre_credit_pct"
+                            ],
+                            [
+                                "stats.db",
+                                "008_recompute_weekly_cost_snapshots_dedup_fix"
+                            ],
+                            [
+                                "cache.db",
+                                "001_dedup_highest_wins"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "6 pending",
+                    "summary": "8 pending",
                     "title": "Pending migrations"
                 }
             ],

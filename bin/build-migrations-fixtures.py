@@ -14,6 +14,9 @@ bin/cctally-migrations-test:
 Per-migration goldens (lazy-adopted; one pair per migration that ships them):
   - per-migration/001_dedup_highest_wins/{pre,post}.sqlite — cache.db pre/post for
     the ccusage-parity dedup migration. Loaded by tests/test_migration_001_per_migration_goldens.py.
+  - per-migration/008_recompute_weekly_cost_snapshots_dedup_fix/{pre,pre-cache,post}.sqlite
+    — paired stats+cache fixture for the ccusage-parity historical recompute.
+    Loaded by tests/test_migration_008_per_migration_goldens.py.
 """
 
 from __future__ import annotations
@@ -99,6 +102,70 @@ def build_03_failure(scenario_dir: Path) -> None:
     conn.execute("INSERT INTO test_failure_trigger VALUES (1)")
     conn.commit()
     conn.close()
+    # Cache.db: pre-bootstrap with the 001 cache migration marker + a
+    # post-001 session_files row so stats migration 008's cross-DB gate
+    # passes during the stats walk. Without this, 008 would defer on the
+    # gate (no error logged) and break BEFORE the test-injection
+    # migration runs — silently neutering scenarios 03/04/05/06/08 that
+    # depend on the test-injection failure firing. Cache schema mirrors
+    # production (matching the per-migration 001 fixture builder above).
+    cache = scenario_dir / "input.cache.db"
+    cache_conn = _new_cache_db(cache)
+    cache_conn.executescript(
+        """
+        CREATE TABLE schema_migrations (
+            name           TEXT PRIMARY KEY,
+            applied_at_utc TEXT NOT NULL
+        );
+        CREATE TABLE session_files (
+            path             TEXT PRIMARY KEY,
+            size_bytes       INTEGER NOT NULL,
+            mtime_ns         INTEGER NOT NULL,
+            last_byte_offset INTEGER NOT NULL,
+            last_ingested_at TEXT NOT NULL,
+            session_id       TEXT,
+            project_path     TEXT
+        );
+        CREATE TABLE session_entries (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path         TEXT    NOT NULL,
+            line_offset         INTEGER NOT NULL,
+            timestamp_utc       TEXT    NOT NULL,
+            model               TEXT    NOT NULL,
+            msg_id              TEXT,
+            req_id              TEXT,
+            input_tokens        INTEGER NOT NULL DEFAULT 0,
+            output_tokens       INTEGER NOT NULL DEFAULT 0,
+            cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+            usage_extra_json    TEXT,
+            cost_usd_raw        REAL
+        );
+        """
+    )
+    # 001 cache marker — stamped at TS_003_APPLIED so the post-001
+    # session_files row's last_ingested_at can strictly post-date it
+    # below.
+    cache_conn.execute(
+        "INSERT INTO schema_migrations VALUES (?, ?)",
+        ("001_dedup_highest_wins", TS_003_APPLIED),
+    )
+    # session_files row with last_ingested_at AFTER the 001 marker → the
+    # gate helper's Layer B (post-001 ingest observed) passes.
+    cache_conn.execute(
+        "INSERT INTO session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+        " session_id, project_path) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            "/fake/.claude/projects/p1/sess-a.jsonl",
+            100, 1_700_000_000_000_000_000, 100,
+            "2026-05-04T08:13:00Z",  # > TS_003_APPLIED = 2026-05-04T08:12:11Z
+            "sess-a", "p1",
+        ),
+    )
+    cache_conn.commit()
+    cache_conn.close()
 
 
 def build_07_downgrade(scenario_dir: Path) -> None:
@@ -478,6 +545,249 @@ def build_per_migration_001_dedup_highest_wins(scenario_dir: Path) -> None:
     _build_post(pre, post)
 
 
+def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for stats migration
+    ``008_recompute_weekly_cost_snapshots_dedup_fix``.
+
+    Emits THREE SQLite files (paired-DB pattern — first per-migration
+    scenario to need it):
+      * ``pre.sqlite``  — stats.db with 3 ``weekly_cost_snapshots`` rows:
+        one ``(mode='auto', project=NULL)`` with a stale pre-fix cost
+        (should be recomputed), one ``(mode='display', …)`` (must NOT
+        change), one ``(mode='auto', project='myproj')`` (must NOT
+        change). ``schema_migrations`` is empty for 008.
+      * ``pre-cache.sqlite`` — cache.db sidecar with the 001 marker, one
+        post-001 ``session_files`` row, and ONE ``session_entries`` row
+        whose ``model='claude-opus-4-7'`` and ``output_tokens=1000``
+        falls inside the auto-row's
+        ``[range_start_iso, range_end_iso)`` window — recomputed cost
+        is $0.025 at the embedded $25/Mtok opus output rate.
+      * ``post.sqlite`` — same as pre.sqlite after running the
+        production handler against the paired cache: row 1 updated to
+        $0.025, rows 2 & 3 unchanged, ``schema_migrations`` carries the
+        008 row.
+
+    Loaded by ``tests/test_migration_008_per_migration_goldens.py``.
+    Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre_stats = scenario_dir / "pre.sqlite"
+    pre_cache = scenario_dir / "pre-cache.sqlite"
+    post_stats = scenario_dir / "post.sqlite"
+
+    # Stable timestamp used by the seeded post-001 ingest row so the
+    # gate's Layer B (last_ingested_at > applied_at_utc) passes
+    # deterministically.
+    TS_001_APPLIED = "2026-05-22T00:00:00Z"
+    TS_POST_001_INGEST = "2026-05-22T01:00:00Z"
+    RANGE_START = "2026-05-15T00:00:00+00:00"
+    RANGE_END = "2026-05-22T00:00:00+00:00"
+    ENTRY_TS = "2026-05-18T00:00:00Z"
+
+    def _build_pre_stats(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(
+                """
+                CREATE TABLE schema_migrations (
+                    name           TEXT PRIMARY KEY,
+                    applied_at_utc TEXT NOT NULL
+                );
+                CREATE TABLE weekly_cost_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    captured_at_utc TEXT NOT NULL,
+                    week_start_date TEXT NOT NULL,
+                    week_end_date   TEXT NOT NULL,
+                    week_start_at   TEXT,
+                    week_end_at     TEXT,
+                    range_start_iso TEXT,
+                    range_end_iso   TEXT,
+                    cost_usd        REAL NOT NULL,
+                    source          TEXT NOT NULL DEFAULT 'cctally-range-cost',
+                    mode            TEXT NOT NULL DEFAULT 'auto',
+                    project         TEXT
+                );
+                """
+            )
+            conn.executemany(
+                "INSERT INTO weekly_cost_snapshots "
+                "(captured_at_utc, week_start_date, week_end_date, "
+                " range_start_iso, range_end_iso, cost_usd, mode, project) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                [
+                    # row 1 — auto/no-project: 100.0 is the pre-fix stale value.
+                    (
+                        "2026-05-22T00:00:00Z",
+                        "2026-05-15", "2026-05-22",
+                        RANGE_START, RANGE_END,
+                        100.0, "auto", None,
+                    ),
+                    # row 2 — mode='display': 999.0 is user-supplied; preserve.
+                    (
+                        "2026-05-22T00:00:00Z",
+                        "2026-05-15", "2026-05-22",
+                        RANGE_START, RANGE_END,
+                        999.0, "display", None,
+                    ),
+                    # row 3 — auto + project='myproj': per-project scope; preserve.
+                    (
+                        "2026-05-22T00:00:00Z",
+                        "2026-05-15", "2026-05-22",
+                        RANGE_START, RANGE_END,
+                        50.0, "auto", "myproj",
+                    ),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_pre_cache(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(
+                """
+                CREATE TABLE schema_migrations (
+                    name           TEXT PRIMARY KEY,
+                    applied_at_utc TEXT NOT NULL
+                );
+                CREATE TABLE session_files (
+                    path             TEXT PRIMARY KEY,
+                    size_bytes       INTEGER NOT NULL,
+                    mtime_ns         INTEGER NOT NULL,
+                    last_byte_offset INTEGER NOT NULL,
+                    last_ingested_at TEXT NOT NULL,
+                    session_id       TEXT,
+                    project_path     TEXT
+                );
+                CREATE TABLE session_entries (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_path         TEXT    NOT NULL,
+                    line_offset         INTEGER NOT NULL,
+                    timestamp_utc       TEXT    NOT NULL,
+                    model               TEXT    NOT NULL,
+                    msg_id              TEXT,
+                    req_id              TEXT,
+                    input_tokens        INTEGER NOT NULL DEFAULT 0,
+                    output_tokens       INTEGER NOT NULL DEFAULT 0,
+                    cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+                    usage_extra_json    TEXT,
+                    cost_usd_raw        REAL
+                );
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations VALUES (?, ?)",
+                ("001_dedup_highest_wins", TS_001_APPLIED),
+            )
+            # session_files row with last_ingested_at STRICTLY AFTER the
+            # 001 marker so the gate's Layer B passes.
+            conn.execute(
+                "INSERT INTO session_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, "
+                " last_ingested_at, session_id, project_path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "/fake/.claude/projects/p1/sess-a.jsonl",
+                    100, 1_700_000_000_000_000_000, 100,
+                    TS_POST_001_INGEST, "sess-a", "p1",
+                ),
+            )
+            # One entry inside [range_start, range_end): opus-4-7,
+            # 1000 output tokens → $25/Mtok * 1000 = $0.025.
+            conn.execute(
+                "INSERT INTO session_entries "
+                "(source_path, line_offset, timestamp_utc, model, "
+                " msg_id, req_id, input_tokens, output_tokens, "
+                " cache_create_tokens, cache_read_tokens, "
+                " usage_extra_json, cost_usd_raw) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "/fake/.claude/projects/p1/sess-a.jsonl", 0,
+                    ENTRY_TS, "claude-opus-4-7",
+                    "m1", "r1", 0, 1000, 0, 0, "{}", None,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(pre_stats_path: Path, pre_cache_path: Path, dst: Path) -> None:
+        # Copy pre_stats → post, then run the production handler against
+        # the post.sqlite copy with the cache sidecar in place via
+        # _cctally_core.CACHE_DB_PATH / CLAUDE_PROJECTS_DIR overrides.
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(pre_stats_path, dst)
+        register_fixture_db(dst)
+        # Load _cctally_db so we can call the registered handler. The
+        # SourceFileLoader-style import ensures we exercise the production
+        # handler (no copy-paste drift).
+        import importlib.util as ilu
+        bin_dir = Path(__file__).resolve().parent
+        spec = ilu.spec_from_file_location(
+            "_cctally_db", bin_dir / "_cctally_db.py",
+        )
+        mod = ilu.module_from_spec(spec)
+        sys.modules["_cctally_db"] = mod
+        spec.loader.exec_module(mod)
+
+        # Override the path constants on the SAME _cctally_core module
+        # instance that _cctally_db is using (mod._cctally_core), so the
+        # migration's lookups find our fixtures. Save + restore so other
+        # builders aren't affected.
+        core = mod._cctally_core
+        orig_cache_path = core.CACHE_DB_PATH
+        orig_projects_dir = core.CLAUDE_PROJECTS_DIR
+        # Synthetic JSONL on disk so the gate's empty-disk fallback
+        # doesn't short-circuit before checking Layer B.
+        projects_dir = scenario_dir / "_fake_projects"
+        projects_dir.mkdir(parents=True, exist_ok=True)
+        (projects_dir / "session1.jsonl").write_text("{}\n")
+
+        handler = None
+        for m in mod._STATS_MIGRATIONS:
+            if m.name == "008_recompute_weekly_cost_snapshots_dedup_fix":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit(
+                "008_recompute_weekly_cost_snapshots_dedup_fix not registered"
+            )
+        try:
+            core.CACHE_DB_PATH = pre_cache_path
+            core.CLAUDE_PROJECTS_DIR = projects_dir
+            conn = sqlite3.connect(dst)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                handler(conn)
+            finally:
+                conn.close()
+        finally:
+            core.CACHE_DB_PATH = orig_cache_path
+            core.CLAUDE_PROJECTS_DIR = orig_projects_dir
+            # Clean up the synthetic projects dir — fixture stays
+            # byte-stable across runs (no stray sibling tree).
+            import shutil as _sh
+            _sh.rmtree(projects_dir, ignore_errors=True)
+
+    _build_pre_stats(pre_stats)
+    _build_pre_cache(pre_cache)
+    _build_post(pre_stats, pre_cache, post_stats)
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -494,6 +804,10 @@ def main() -> int:
     )
     build_per_migration_001_dedup_highest_wins(
         FIXTURES_ROOT / "per-migration" / "001_dedup_highest_wins"
+    )
+    build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
+        FIXTURES_ROOT / "per-migration"
+        / "008_recompute_weekly_cost_snapshots_dedup_fix"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

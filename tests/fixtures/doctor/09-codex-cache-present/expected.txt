@@ -15,10 +15,10 @@ Hooks
 Auth
   ✓ OAuth token              present
 Database
-  ✓ stats.db                 version 0 / 7 known
-  ✓ cache.db                 version 0 / 0 known
-  ✓ Migrations               0/7 applied
-  ⚠ Pending migrations       7 pending
+  ✓ stats.db                 version 0 / 8 known
+  ✓ cache.db                 version 0 / 1 known
+  ✓ Migrations               0/9 applied
+  ⚠ Pending migrations       9 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
   ✓ Latest snapshot          2s ago

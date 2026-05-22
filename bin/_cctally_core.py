@@ -67,6 +67,7 @@ def _init_paths_from_env() -> None:
     global UPDATE_STATE_PATH, UPDATE_SUPPRESS_PATH
     global UPDATE_LOCK_PATH, UPDATE_LOG_PATH, UPDATE_LOG_ROTATED_PATH
     global UPDATE_CHECK_LAST_FETCH_PATH, CLAUDE_SETTINGS_PATH
+    global CLAUDE_PROJECTS_DIR
 
     home = pathlib.Path.home()
     APP_DIR = home / ".local" / "share" / "cctally"
@@ -107,6 +108,17 @@ def _init_paths_from_env() -> None:
     UPDATE_CHECK_LAST_FETCH_PATH = APP_DIR / "update-check.last-fetch"
 
     CLAUDE_SETTINGS_PATH = home / ".claude" / "settings.json"
+
+    # Claude session JSONL root. Production path is `~/.claude/projects`;
+    # exposed as a module-level constant so cross-DB migrations (e.g.
+    # stats migration 008) and the dispatcher's empty-disk fallback can
+    # honor a fixture override via tests' `monkeypatch.setattr(
+    # _cctally_core, "CLAUDE_PROJECTS_DIR", tmp_path / "...")`. The
+    # `_get_claude_data_dirs()` helper in bin/cctally remains the
+    # authoritative resolver for ad-hoc reads (multi-root + env-aware);
+    # this constant is the single-rooted production default that 99% of
+    # callers want.
+    CLAUDE_PROJECTS_DIR = home / ".claude" / "projects"
 
 
 _init_paths_from_env()
