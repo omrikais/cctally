@@ -995,6 +995,39 @@ def _sum_cost_for_range(
     return total
 
 
+def _resolve_claude_tz_name(args: argparse.Namespace,
+                            config: "dict | None") -> "str | None":
+    """Resolve display-tz precedence for Claude reporting commands.
+
+    Returns the tz name string (or ``None`` for host-local fallback).
+    Precedence (top wins):
+      1. ``--tz`` flag (canonical cctally flag).
+      2. ``-z`` / ``--timezone`` flag (ccusage-codex sharedArgs alias).
+      3. ``config.display.tz`` (persisted user pref).
+      4. ``None`` → host-local (existing fallback in ``resolve_display_tz``).
+
+    Spec §7.2 (issue #86 Session A). Mirrors ``_resolve_codex_tz_name``'s
+    structural shape for code-review familiarity, but the rung order
+    diverges: codex's resolver falls back to upstream's ``--timezone``
+    ONLY when neither ``--tz`` nor ``display.tz`` is set, while Claude's
+    Session A contract puts ``-z --timezone`` ahead of ``display.tz``.
+    Both shapes are intentional — the Codex helper preserves drop-in
+    parity with upstream's ``ccusage-codex sharedArgs``; the Claude
+    helper expresses the Session A precedence the spec promises.
+    """
+    tz = getattr(args, "tz", None)
+    if tz is not None:
+        return tz
+    tzname = getattr(args, "timezone", None)
+    if tzname is not None:
+        return tzname
+    display = (config or {}).get("display") or {}
+    cfg_tz = display.get("tz")
+    if cfg_tz:
+        return cfg_tz
+    return None
+
+
 def _resolve_codex_tz_name(args: argparse.Namespace,
                            config: "dict | None") -> "str | None":
     """Resolve the IANA tz NAME (or None for host-local) used by Codex
