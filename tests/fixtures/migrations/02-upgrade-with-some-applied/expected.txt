@@ -9,8 +9,9 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 8 / 8 known
   ✓ 007_observed_pre_credit_pct                    applied <REDACTED>
   ✓ 008_test_failure_injection                     applied <REDACTED>
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 1 known
-  · 001_test_cache_migration                       pending
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 2 known
+  · 001_dedup_highest_wins                         pending
+  · 002_test_cache_migration                       pending
 ## stderr
 
 ## exit

@@ -1679,6 +1679,52 @@ def _migration_observed_pre_credit_pct(conn: sqlite3.Connection) -> None:
         raise
 
 
+# === Region 7b: Cache migration 001_dedup_highest_wins (ccusage-parity fix) ===
+
+@cache_migration("001_dedup_highest_wins")
+def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
+    """One-time re-ingest of session_entries with corrected msg_id+req_id dedup.
+
+    The previous INSERT OR IGNORE kept the streaming-intermediate row of each
+    (msg_id, req_id) pair (output_tokens=1, no ``speed`` field) and rejected
+    the post-stream finalization row (output_tokens=N, ``speed='standard'``).
+    The winner's data is not recoverable from session_entries alone — it was
+    never inserted under the old rule. We wipe ``session_entries`` +
+    ``session_files`` so the next ``sync_cache`` re-reads JSONL under the new
+    ON CONFLICT DO UPDATE clause (highest-token-total wins, ``speed`` set
+    breaks ties).
+
+    Codex tables (``codex_session_entries``, ``codex_session_files``) are NOT
+    touched — the bug is Claude-side only.
+
+    Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I2.
+
+    Invariants:
+      * Marker row INSERTed inside the same BEGIN/COMMIT as the DELETEs.
+      * Empty cache (fresh install) still writes the marker —
+        table-emptiness is not the sentinel (CLAUDE.md "Pricing & schema").
+      * Migration handler does NOT call ``_log_migration_error`` /
+        ``_clear_migration_error_log_entries``; the dispatcher owns that
+        surface (CLAUDE.md "Migration error sentinel is uniform").
+    """
+    eprint(
+        "[cctally] Re-ingesting Claude session history with corrected dedup "
+        "(one-time; may take 10-30s depending on JSONL volume)..."
+    )
+    conn.execute("BEGIN")
+    try:
+        conn.execute("DELETE FROM session_entries")
+        conn.execute("DELETE FROM session_files")
+        conn.execute(
+            "INSERT INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
+            ("001_dedup_highest_wins", now_utc_iso()),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 # === Region 8: Test-only migration registration (was bin/cctally:12086-12140) ===
 
 # ──────────────────────────────────────────────────────────────────────

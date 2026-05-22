@@ -10,6 +10,10 @@ bin/cctally-migrations-test:
   - 10-legacy-marker-recognized-by-db-status/  — stats has unprefixed (pre-framework) markers
   - 11-five-hour-dedup-after-backfill/  — stats has jitter-forked snapshot keys, no five_hour_blocks
   - 12-skipped-dedup-not-rerun-after-backfill/  — like 11, but 003 is in schema_migrations_skipped
+
+Per-migration goldens (lazy-adopted; one pair per migration that ships them):
+  - per-migration/001_dedup_highest_wins/{pre,post}.sqlite — cache.db pre/post for
+    the ccusage-parity dedup migration. Loaded by tests/test_migration_001_per_migration_goldens.py.
 """
 
 from __future__ import annotations
@@ -323,6 +327,157 @@ def build_12_skipped_dedup_not_rerun(scenario_dir: Path) -> None:
     conn.close()
 
 
+def build_per_migration_001_dedup_highest_wins(scenario_dir: Path) -> None:
+    """Per-migration goldens for cache migration ``001_dedup_highest_wins``.
+
+    Emits two cache.db files:
+      * pre.sqlite  — cache schema + 2 ``session_files`` rows + 3 synthetic
+        ``session_entries`` "loser" rows (the streaming-intermediate shape:
+        ``output_tokens=1``, no ``speed`` field). schema_migrations is empty.
+      * post.sqlite — same DB after running the production migration handler.
+        Both seeded tables are empty; ``schema_migrations`` has one row
+        ``(001_dedup_highest_wins, <iso>)``.
+
+    Loaded by ``tests/test_migration_001_per_migration_goldens.py``.
+    Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I4.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Cache schema (mirror of bin/_fixture_builders.create_cache_db,
+            # minus the codex side which is unaffected by this migration).
+            conn.executescript(
+                """
+                CREATE TABLE session_files (
+                    path             TEXT PRIMARY KEY,
+                    size_bytes       INTEGER NOT NULL,
+                    mtime_ns         INTEGER NOT NULL,
+                    last_byte_offset INTEGER NOT NULL,
+                    last_ingested_at TEXT NOT NULL,
+                    session_id       TEXT,
+                    project_path     TEXT
+                );
+                CREATE INDEX idx_session_files_session_id
+                    ON session_files(session_id);
+
+                CREATE TABLE session_entries (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_path         TEXT    NOT NULL,
+                    line_offset         INTEGER NOT NULL,
+                    timestamp_utc       TEXT    NOT NULL,
+                    model               TEXT    NOT NULL,
+                    msg_id              TEXT,
+                    req_id              TEXT,
+                    input_tokens        INTEGER NOT NULL DEFAULT 0,
+                    output_tokens       INTEGER NOT NULL DEFAULT 0,
+                    cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+                    usage_extra_json    TEXT,
+                    cost_usd_raw        REAL
+                );
+                CREATE INDEX idx_entries_timestamp
+                    ON session_entries(timestamp_utc);
+                CREATE INDEX idx_entries_source
+                    ON session_entries(source_path);
+                CREATE UNIQUE INDEX idx_entries_dedup
+                    ON session_entries(msg_id, req_id)
+                    WHERE msg_id IS NOT NULL AND req_id IS NOT NULL;
+
+                CREATE TABLE schema_migrations (
+                    name           TEXT PRIMARY KEY,
+                    applied_at_utc TEXT NOT NULL
+                );
+                """
+            )
+            # Seed 2 session_files rows.
+            conn.executemany(
+                "INSERT INTO session_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+                " session_id, project_path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    ("/fake/.claude/projects/p1/sess-a.jsonl", 1024,
+                     1_700_000_000_000_000_000, 1024,
+                     "2026-04-15T15:00:00Z", "sess-a", "p1"),
+                    ("/fake/.claude/projects/p1/sess-b.jsonl", 2048,
+                     1_700_000_001_000_000_000, 2048,
+                     "2026-04-15T15:00:00Z", "sess-b", "p1"),
+                ],
+            )
+            # Seed 3 "loser" session_entries — streaming-intermediate rows
+            # (output_tokens=1, no speed). These represent the bug state
+            # the migration is designed to wipe.
+            conn.executemany(
+                "INSERT INTO session_entries "
+                "(source_path, line_offset, timestamp_utc, model, msg_id, "
+                " req_id, input_tokens, output_tokens, cache_create_tokens, "
+                " cache_read_tokens, usage_extra_json, cost_usd_raw) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    ("/fake/.claude/projects/p1/sess-a.jsonl", 100,
+                     "2026-04-15T15:00:00Z", "claude-opus-4-7",
+                     "m1", "r1", 100, 1, 0, 50, None, None),
+                    ("/fake/.claude/projects/p1/sess-a.jsonl", 200,
+                     "2026-04-15T15:00:10Z", "claude-opus-4-7",
+                     "m2", "r2", 100, 2, 0, 50, None, None),
+                    ("/fake/.claude/projects/p1/sess-b.jsonl", 100,
+                     "2026-04-15T15:00:20Z", "claude-opus-4-7",
+                     "m3", "r3", 100, 3, 0, 50, None, None),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        # Copy pre -> post, then run the handler against the copy.
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        # Load _cctally_db so we can call the registered handler.
+        # Use SourceFileLoader-style import so the production handler is
+        # the exact thing we exercise (no copy-paste drift).
+        import importlib.util as ilu
+        bin_dir = Path(__file__).resolve().parent
+        spec = ilu.spec_from_file_location(
+            "_cctally_db", bin_dir / "_cctally_db.py",
+        )
+        mod = ilu.module_from_spec(spec)
+        # _cctally_db imports `_cctally_core`, which is on sys.path because
+        # bin/ was prepended at the top of this script. Register in
+        # sys.modules BEFORE exec_module so the @dataclass decorator can
+        # look the module up (dataclasses.py walks cls.__module__ via
+        # sys.modules during _process_class).
+        sys.modules["_cctally_db"] = mod
+        spec.loader.exec_module(mod)
+        handler = None
+        for m in mod._CACHE_MIGRATIONS:
+            if m.name == "001_dedup_highest_wins":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit("001_dedup_highest_wins not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -336,6 +491,9 @@ def main() -> int:
     )
     build_12_skipped_dedup_not_rerun(
         FIXTURES_ROOT / "12-skipped-dedup-not-rerun-after-backfill"
+    )
+    build_per_migration_001_dedup_highest_wins(
+        FIXTURES_ROOT / "per-migration" / "001_dedup_highest_wins"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0
