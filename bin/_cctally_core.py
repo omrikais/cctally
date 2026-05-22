@@ -7,7 +7,7 @@ get_latest_usage_for_week.
 
 Path constants (APP_DIR, DB_PATH, LOG_DIR, etc.) live in this module as
 of 2026-05-22 (issue #84); `_cctally_core` is the single source of truth
-and the only legal monkeypatch target for the 22 promoted globals listed
+and the only legal monkeypatch target for the 23 promoted globals listed
 below. See docs/superpowers/specs/2026-05-22-cctally-core-data-globals.md.
 """
 from __future__ import annotations
@@ -42,7 +42,7 @@ def _cctally():
 
 
 def _init_paths_from_env() -> None:
-    """(Re)bind the 22 in-scope path globals to the current HOME env var.
+    """(Re)bind the 23 in-scope path globals to the current HOME env var.
 
     Called once at module import to populate the defaults, then again
     by `tests/conftest.py:load_script()` after each `setenv("HOME", …)`
@@ -100,20 +100,6 @@ def _init_paths_from_env() -> None:
 
     CLAUDE_SETTINGS_PATH = home / ".claude" / "settings.json"
 
-
-# Declare the names at module scope so `from _cctally_core import X`
-# (forbidden by the AST guard but technically syntactically possible)
-# doesn't error on missing attribute. _init_paths_from_env() populates
-# them with current-HOME values immediately below.
-APP_DIR = LEGACY_APP_DIR = LOG_DIR = None  # type: ignore[assignment]
-DB_PATH = CACHE_DB_PATH = None  # type: ignore[assignment]
-CACHE_LOCK_PATH = CACHE_LOCK_CODEX_PATH = CONFIG_LOCK_PATH = None  # type: ignore[assignment]
-CONFIG_PATH = MIGRATION_ERROR_LOG_PATH = CHANGELOG_PATH = None  # type: ignore[assignment]
-HOOK_TICK_LOG_DIR = HOOK_TICK_LOG_PATH = HOOK_TICK_LOG_ROTATED_PATH = None  # type: ignore[assignment]
-HOOK_TICK_THROTTLE_PATH = HOOK_TICK_THROTTLE_LOCK_PATH = None  # type: ignore[assignment]
-UPDATE_STATE_PATH = UPDATE_SUPPRESS_PATH = None  # type: ignore[assignment]
-UPDATE_LOCK_PATH = UPDATE_LOG_PATH = UPDATE_LOG_ROTATED_PATH = None  # type: ignore[assignment]
-UPDATE_CHECK_LAST_FETCH_PATH = CLAUDE_SETTINGS_PATH = None  # type: ignore[assignment]
 
 _init_paths_from_env()
 

@@ -257,16 +257,28 @@ def test_no_old_style_test_patches_for_promoted_globals():
             if name not in PROMOTED_GLOBALS:
                 continue
             forbidden = False
+            target_desc = "?"
             if method == "setitem" and isinstance(first_arg, ast.Name):
                 if first_arg.id in ("ns", "cctally_module_dict"):
                     forbidden = True
+                    target_desc = first_arg.id
+            elif method == "setitem" and isinstance(first_arg, ast.Attribute):
+                # `setitem(cctally.__dict__, "<PROMOTED>", v)` — the same
+                # cargo-cult as `setitem(ns,)` (`ns` IS `cctally.__dict__`).
+                # Catch the dotted form so the guard isn't trivially
+                # bypassable by inlining the .__dict__ access.
+                if first_arg.attr == "__dict__":
+                    forbidden = True
+                    inner = first_arg.value
+                    inner_id = inner.id if isinstance(inner, ast.Name) else "<expr>"
+                    target_desc = f"{inner_id}.__dict__"
             elif method == "setattr" and isinstance(first_arg, ast.Name):
                 if first_arg.id == "cctally":
                     forbidden = True
+                    target_desc = first_arg.id
             if forbidden:
-                target = first_arg.id if isinstance(first_arg, ast.Name) else "?"
                 bad.append(
-                    f"{path.name}:{node.lineno}: monkeypatch.{method}({target}, "
+                    f"{path.name}:{node.lineno}: monkeypatch.{method}({target_desc}, "
                     f"\"{name}\", …) — use monkeypatch.setattr(_cctally_core, ...) instead"
                 )
     assert not bad, (

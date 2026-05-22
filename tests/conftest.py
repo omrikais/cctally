@@ -70,7 +70,7 @@ def load_script():
     EXCEPTION: ``_cctally_core`` is the kernel and does NOT
     ``import cctally`` (it uses the call-time ``_cctally()`` accessor),
     so its module-load state is safe across reloads. After 2026-05-22
-    (issue #84) the 22 in-scope path globals live in
+    (issue #84) the 23 in-scope path globals live in
     ``_cctally_core``; keeping the same instance in sys.modules lets
     tests monkeypatch ``_cctally_core.X`` via a stable module-top
     ``import _cctally_core`` reference without it going stale on the
@@ -106,7 +106,7 @@ def load_script():
 def redirect_paths(ns, monkeypatch, tmp_path):
     """Pin the kernel's path constants to a tmp dir.
 
-    After 2026-05-22 (issue #84), the 22 in-scope path constants live
+    After 2026-05-22 (issue #84), the 23 in-scope path constants live
     in bin/_cctally_core.py and `_cctally_core` is the single legal
     monkeypatch target. Every reader (every sibling AND bin/cctally
     itself) goes through `_cctally_core.X` at call time.
@@ -119,6 +119,14 @@ def redirect_paths(ns, monkeypatch, tmp_path):
     Tests must STILL patch via `monkeypatch.setattr(_cctally_core,
     "X", v)` (the AST guard at `test_kernel_extraction_invariants.py`
     enforces this for `test_*.py` files; conftest itself is exempt).
+
+    Note: ``CHANGELOG_PATH`` is intentionally NOT redirected. It
+    resolves to ``<repo>/CHANGELOG.md`` based on the binary's own
+    filesystem location, not HOME — there is no fixture analogue
+    inside ``tmp_path`` to point it at, and existing tests that need
+    to override it (e.g. tests/test_release_internals.py) do so with
+    their own `monkeypatch.setattr(_cctally_core, "CHANGELOG_PATH",
+    …)` in the per-test fixture.
 
     The `_cctally_db` sibling carries its own bare-name copies of four
     paths (set by the seed block near the bin/cctally path-constant
