@@ -29,7 +29,7 @@ _SCRIPT_PATH = _script_path()
 _SCRIPT_CODE = compile(_SCRIPT_PATH.read_text(), str(_SCRIPT_PATH), "exec")
 
 # Ensure bin/ is on sys.path so tests can do `import _cctally_core` at the
-# top of the file. After 2026-05-22 (issue #84) the 22 in-scope path
+# top of the file. After 2026-05-22 (issue #84) the 23 in-scope path
 # globals live in _cctally_core; tests monkeypatch them via
 # ``monkeypatch.setattr(_cctally_core, "X", v)``. The module-top import
 # stays stable across ``load_script()`` reloads because the load_script

@@ -53,7 +53,7 @@ def update_paths(ns, tmp_path, monkeypatch):
     """Redirect every UPDATE_* path constant to a per-test tmp_path dir.
 
     Post 2026-05-22 (#84): `_cctally_core` is the canonical home for
-    the 22 promoted path globals, so we patch it for the sibling
+    the 23 promoted path globals, so we patch it for the sibling
     readers (`_cctally_update.py`). We ALSO mirror into ns because
     bin/cctally itself reads many of these via bare-name lookup
     against its own __dict__, and tests in this file read them via
@@ -2130,8 +2130,17 @@ class TestUpdateWorker:
         # Stub the lock helpers so we don't touch filesystem locks.
         monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 12345)
         monkeypatch.setitem(ns, "_release_update_lock", lambda fd: None)
-        # update.log path → tmp.
+        # update.log + update-state paths → tmp. ``UPDATE_STATE_PATH`` MUST
+        # be redirected because the success path (``_run_streaming`` returns
+        # 0 once we unblock) flows into ``_stamp_install_success_to_state``
+        # → ``_save_update_state``, which would otherwise mutate the
+        # maintainer's real ``~/.local/share/cctally/update-state.json``
+        # (and on sandboxed/unwritable-HOME CI flip the terminal event to
+        # ``error_event``).
         monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(
+            _cctally_core, "UPDATE_STATE_PATH", tmp_path / "update-state.json",
+        )
 
         def blocking_run_streaming(cmd, *, on_stdout, on_stderr, log_fd):
             gate.set()
@@ -2155,8 +2164,23 @@ class TestUpdateWorker:
         assert ok_b is False
         assert rid_b == rid_a, "second start must echo the in-progress id"
 
-        # Tear down: unblock so the worker thread can finish.
+        # Tear down: unblock so the worker thread can finish, AND wait
+        # for it to actually clear ``current_run_id``. Without the wait
+        # the worker's ``_stamp_install_success_to_state`` call (which
+        # writes through ``_cctally_core.UPDATE_STATE_PATH``) can race
+        # past the monkeypatch teardown that pytest runs on function
+        # return, leaking a real write into the developer's
+        # ``~/.local/share/cctally/update-state.json``.
         unblock.set()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if worker.status()["current_run_id"] is None:
+                break
+            time.sleep(0.01)
+        assert worker.status()["current_run_id"] is None, (
+            "worker thread did not finish within timeout — monkeypatch "
+            "teardown will race the stamp write"
+        )
 
     def test_failure_emits_done_event_and_skips_execvp(
         self, tmp_path, monkeypatch
@@ -2171,7 +2195,15 @@ class TestUpdateWorker:
         monkeypatch.setitem(
             ns, "_release_update_lock", lambda fd: released.append(fd)
         )
+        # rc=1 path short-circuits before ``_stamp_install_success_to_state``,
+        # but redirect ``UPDATE_STATE_PATH`` for symmetry with the
+        # success-path tests so a future refactor that moves the stamp
+        # earlier cannot silently leak state into the real
+        # ``~/.local/share/cctally/update-state.json``.
         monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(
+            _cctally_core, "UPDATE_STATE_PATH", tmp_path / "update-state.json",
+        )
 
         # Subprocess returns non-zero — must NOT call execvp.
         monkeypatch.setitem(
@@ -2220,7 +2252,13 @@ class TestUpdateWorker:
         monkeypatch.setitem(
             ns, "_release_update_lock", lambda fd: released.append(fd)
         )
+        # Success path runs ``_stamp_install_success_to_state`` after the
+        # last step; redirect ``UPDATE_STATE_PATH`` so it does NOT mutate
+        # the developer's real ``~/.local/share/cctally/update-state.json``.
         monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(
+            _cctally_core, "UPDATE_STATE_PATH", tmp_path / "update-state.json",
+        )
         monkeypatch.setitem(
             ns, "_run_streaming",
             lambda cmd, *, on_stdout, on_stderr, log_fd: 0,
@@ -2292,7 +2330,12 @@ class TestUpdateWorker:
         )
         monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 99)
         monkeypatch.setitem(ns, "_release_update_lock", lambda fd: None)
+        # See sibling success-path tests: redirect UPDATE_STATE_PATH for
+        # symmetric isolation even on the rc=1 short-circuit branch.
         monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(
+            _cctally_core, "UPDATE_STATE_PATH", tmp_path / "update-state.json",
+        )
         monkeypatch.setitem(
             ns, "_run_streaming",
             lambda cmd, *, on_stdout, on_stderr, log_fd: 1,
@@ -2332,7 +2375,12 @@ class TestUpdateWorker:
         )
         monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 1)
         monkeypatch.setitem(ns, "_release_update_lock", lambda fd: None)
+        # See sibling success-path tests: redirect UPDATE_STATE_PATH for
+        # symmetric isolation even on the rc=1 short-circuit branch.
         monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(
+            _cctally_core, "UPDATE_STATE_PATH", tmp_path / "update-state.json",
+        )
         monkeypatch.setitem(
             ns, "_run_streaming",
             lambda cmd, *, on_stdout, on_stderr, log_fd: 1,
@@ -2620,13 +2668,8 @@ class TestUpdateAPI:
         # No UpdateWorker needed for dismiss.
         monkeypatch.setitem(ns, "_UPDATE_WORKER", None)
         # Pre-stage update-state.json with a latest_version so
-        # SKIP_USE_STATE_LATEST resolves.
-        suppress_path = tmp_path / ".local" / "share" / "cctally"
-        monkeypatch.setattr(_cctally_core, "UPDATE_STATE_PATH", suppress_path / "update-state.json"
-        )
-        monkeypatch.setattr(_cctally_core, "UPDATE_SUPPRESS_PATH",
-            suppress_path / "update-suppress.json",
-        )
+        # SKIP_USE_STATE_LATEST resolves. Paths already redirected by
+        # `redirect_paths` above.
         ns["UPDATE_STATE_PATH"].write_text(
             json.dumps({"_schema": 1, "latest_version": "1.7.0"})
         )
@@ -2655,11 +2698,7 @@ class TestUpdateAPI:
         redirect_paths(ns, monkeypatch, tmp_path)
         self._wire_handler(ns)
         monkeypatch.setitem(ns, "_UPDATE_WORKER", None)
-        share = tmp_path / ".local" / "share" / "cctally"
-        monkeypatch.setattr(_cctally_core, "UPDATE_STATE_PATH", share / "update-state.json"
-        )
-        monkeypatch.setattr(_cctally_core, "UPDATE_SUPPRESS_PATH", share / "update-suppress.json"
-        )
+        # Paths already redirected by `redirect_paths` above.
         ns["UPDATE_STATE_PATH"].write_text(
             json.dumps({"_schema": 1, "latest_version": "1.7.0"})
         )
@@ -2689,11 +2728,7 @@ class TestUpdateAPI:
         redirect_paths(ns, monkeypatch, tmp_path)
         self._wire_handler(ns)
         self._install_stub_worker(ns, monkeypatch, busy=True)
-        share = tmp_path / ".local" / "share" / "cctally"
-        monkeypatch.setattr(_cctally_core, "UPDATE_STATE_PATH", share / "update-state.json"
-        )
-        monkeypatch.setattr(_cctally_core, "UPDATE_SUPPRESS_PATH", share / "update-suppress.json"
-        )
+        # Paths already redirected by `redirect_paths` above.
         ns["UPDATE_STATE_PATH"].write_text(
             json.dumps({"_schema": 1, "latest_version": "1.7.0"})
         )

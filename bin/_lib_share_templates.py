@@ -21,7 +21,17 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-import _cctally_core
+# NOTE: ``_cctally_core`` is imported lazily inside ``_release_version()``
+# (the sole consumer in this module) so that loading this file directly
+# via ``importlib.util.spec_from_file_location`` — the established
+# pattern used by ``_render_share_v2_fixture.py``,
+# ``_compose_share_v2_fixture.py``, and ``tests/test_lib_share_templates.py``
+# — does NOT depend on ``bin/`` being on ``sys.path`` at module-import
+# time. A module-top ``import _cctally_core`` would raise
+# ``ModuleNotFoundError`` for any standalone loader that hasn't already
+# arranged for ``_cctally_core`` to be importable, regressing the
+# parallel-loader pattern this module uses for ``_lib_share`` itself
+# (see ``_import_share_lib`` below).
 
 
 # --- Panel set ---
@@ -302,7 +312,15 @@ def _release_version() -> str:
     ``_release_read_latest_release_version`` name) — intentionally
     duplicated so the template module stays free of any
     ``bin/cctally`` import. If CHANGELOG header format changes, update both.
+
+    ``_cctally_core`` is imported lazily here (rather than at module top)
+    so that standalone loaders — see the note at the top of this file
+    and the ``_import_share_lib`` pattern below — can exec this module
+    without ``bin/`` already being on ``sys.path``. By the time
+    ``_release_version()`` is actually called, the caller (CLI boot,
+    dashboard, or fixture driver) has resolved the sibling layout.
     """
+    import _cctally_core  # noqa: PLC0415 — lazy by design (see module-top NOTE)
     path = _cctally_core.CHANGELOG_PATH
     try:
         for line in path.read_text(encoding="utf-8").splitlines():

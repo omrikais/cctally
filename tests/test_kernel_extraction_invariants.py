@@ -127,7 +127,7 @@ def test_moved_symbols_not_defined_in_cctally():
 # ============================================================================
 #
 # These assertions lock the invariants from the data-globals promotion. After
-# #84, the 22 in-scope path constants live in _cctally_core. Every sibling and
+# #84, the 23 in-scope path constants live in _cctally_core. Every sibling and
 # bin/cctally itself reads via `_cctally_core.X` at call time; tests
 # monkeypatch via `setattr(_cctally_core, "X", v)`. The four guards below
 # catch the four ways a future commit could silently break this:

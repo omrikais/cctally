@@ -42,13 +42,21 @@ def _cctally():
 
 
 def _init_paths_from_env() -> None:
-    """(Re)bind the 23 in-scope path globals to the current HOME env var.
+    """(Re)bind the 23 in-scope path globals from the current process env.
+
+    22 of the 23 resolve under ``Path.home()`` (i.e. the ``HOME`` env var).
+    The 23rd, ``CHANGELOG_PATH``, resolves from ``CCTALLY_TEST_CHANGELOG_PATH``
+    when set, else from ``__file__`` (``<repo>/CHANGELOG.md`` relative to
+    this kernel module's location) — independent of ``HOME``. Tests that
+    redirect the changelog (e.g. ``tests/test_release_internals.py``) drive
+    that override and rely on this re-init.
 
     Called once at module import to populate the defaults, then again
     by `tests/conftest.py:load_script()` after each `setenv("HOME", …)`
-    so the test sees a fresh path set without the cost of re-importing
-    `_cctally_core` (which would break tests that cached the module
-    object via a top-level `import _cctally_core`).
+    or `setenv("CCTALLY_TEST_CHANGELOG_PATH", …)` so the test sees a fresh
+    path set without the cost of re-importing `_cctally_core` (which would
+    break tests that cached the module object via a top-level
+    `import _cctally_core`).
     """
     global APP_DIR, LEGACY_APP_DIR, LOG_DIR
     global DB_PATH, CACHE_DB_PATH
