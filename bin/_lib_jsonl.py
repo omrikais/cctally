@@ -76,13 +76,21 @@ def _should_replace(
 ) -> bool:
     """Port of ccusage's `should_replace_deduped_entry` in
     rust/crates/ccusage/src/claude_loader.rs:531. Higher token total wins;
-    on equal totals, the row with `speed` set wins (the post-stream
-    finalization row carries `speed`; streaming intermediates don't)."""
+    on equal totals, the row with `speed` set (non-null) wins (the post-stream
+    finalization row carries `speed`; streaming intermediates don't).
+
+    The `usage.get("speed") is not None` check matches the SQL UPDATE WHERE
+    clause's `json_extract(..., '$.speed') IS NOT NULL` in `sync_cache`'s
+    INSERT … ON CONFLICT … DO UPDATE, keeping the direct-parse fallback and
+    cache-ingest paths in lockstep on the rare-but-possible "explicit JSON
+    null" payload.
+    """
     c_total = _entry_token_total(candidate)
     e_total = _entry_token_total(existing)
     if c_total != e_total:
         return c_total > e_total
-    return ("speed" in candidate.usage) and ("speed" not in existing.usage)
+    return (candidate.usage.get("speed") is not None
+            and existing.usage.get("speed") is None)
 
 
 def _parse_usage_entries(
@@ -90,7 +98,7 @@ def _parse_usage_entries(
     range_start: dt.datetime,
     range_end: dt.datetime,
     *,
-    dedupe_map: "dict[str, UsageEntry] | None" = None,
+    dedupe_map: "dict[str, UsageEntry]",
 ) -> list[UsageEntry]:
     """Parse one JSONL file's assistant entries within [range_start, range_end].
 
@@ -173,11 +181,6 @@ def _parse_usage_entries(
                 )
 
                 if msg_id is None or req_id is None:
-                    no_key_entries.append(entry)
-                    continue
-                if dedupe_map is None:
-                    # Caller opted out of cross-file dedup (rare; keep
-                    # legacy "all entries returned" shape).
                     no_key_entries.append(entry)
                     continue
                 key = f"{msg_id}:{req_id}"

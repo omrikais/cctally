@@ -509,13 +509,6 @@ def sync_cache(
                 with open(jp, "r", encoding="utf-8", errors="replace") as fh:
                     fh.seek(start_offset)
                     for offset, entry, msg_id, req_id in _iter_jsonl_entries_with_offsets(fh):
-                        # Belt-and-suspenders: _iter_jsonl_entries_with_offsets
-                        # already drops <synthetic> rows, but a defensive skip
-                        # here keeps the cache safe even if a future iterator
-                        # change ever relaxed the filter. Matches ccusage's
-                        # claude_loader.rs:454.
-                        if entry.model == "<synthetic>":
-                            continue
                         usage = entry.usage
                         inp = int(usage.get("input_tokens", 0) or 0)
                         out = int(usage.get("output_tokens", 0) or 0)
@@ -944,7 +937,7 @@ def _direct_parse_claude_session_entries(
     flat.sort(key=lambda pair: pair[0].timestamp)
     for entry, source_path in flat:
         usage = entry.usage
-        sid, cwd = meta_by_path.get(source_path, (None, None))
+        sid, cwd = meta_by_path[source_path]
         results.append(_JoinedClaudeEntry(
             timestamp=entry.timestamp,
             model=entry.model,
