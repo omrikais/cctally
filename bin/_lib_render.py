@@ -2421,6 +2421,7 @@ def _render_project_table(
     weeks_missing_snapshot: int = 0,
     weeks_in_range: int = 1,
     no_color: bool = False,
+    color: "bool | None" = None,
 ) -> str:
     """Render project rollup as a ccusage-style ANSI table.
 
@@ -2434,7 +2435,12 @@ def _render_project_table(
     first for width calc, ANSI applied at render time) and same banner /
     border / separator glyphs.
     """
-    color = False if no_color else _supports_color_stdout()
+    # Session A (spec §7.3): caller may pass an explicit ``color`` bool
+    # to override the auto-detect (so the new bool ``--color`` flag can
+    # force ANSI under NO_COLOR=1 env). Legacy ``no_color`` kwarg path
+    # is preserved for callers that haven't migrated.
+    if color is None:
+        color = False if no_color else _supports_color_stdout()
     unicode_ok = _supports_unicode_stdout()
 
     def _dim(s: str) -> str:  return _style_ansi(s, "90", color)

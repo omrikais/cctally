@@ -1443,6 +1443,39 @@ def _supports_color_stdout() -> bool:
     return False
 
 
+def _resolve_color_enabled(args: argparse.Namespace) -> bool:
+    """Resolve effective color-on/off for the 2 real ANSI Claude cmds.
+
+    Spec §7.3 (issue #86 Session A). Precedence (top wins):
+
+      1. ``args.no_color``  → False (deny-wins; overrides ``FORCE_COLOR``
+         env AND a co-supplied ``--color`` flag).
+      2. ``args.color``     → True (overrides ``NO_COLOR`` env).
+      3. ``FORCE_COLOR``    → True.
+      4. ``NO_COLOR``       → False.
+      5. ``isatty(stdout)`` or ``isatty(stderr)`` with non-dumb TERM
+                            → True (the same auto-detect that
+         ``_supports_color_stdout()`` uses; CI=True still enables).
+      6. else               → False.
+
+    The helper is consumed by ``cmd_project`` and ``cmd_diff`` — the only
+    two in-scope Claude cmds whose renderers honor color. The other 8
+    in-scope cmds parse ``--color`` / ``--no-color`` as documented no-op
+    surface (spec §3 T1.5).
+    """
+    # Rung 1 — deny-wins: --no-color always disables.
+    if getattr(args, "no_color", False):
+        return False
+    # Rung 2 — --color overrides env (NO_COLOR auto-detect).
+    if getattr(args, "color", False):
+        return True
+    # Rungs 3-6 — delegate to the existing env+tty auto-detector. It
+    # already honors FORCE_COLOR (rung 3) > NO_COLOR (rung 4) > CI/isatty
+    # (rung 5) > else (rung 6) in that order, which matches the spec's
+    # behavior on the no-flag rungs exactly.
+    return _supports_color_stdout()
+
+
 def _style_ansi(text: str, code: str, enabled: bool) -> str:
     if not enabled:
         return text
@@ -4966,13 +4999,20 @@ def cmd_project(args: argparse.Namespace) -> int:
         eprint("No project usage found in range.")
         return 0
 
+    # Session A (spec §7.3): the new --color flag overrides NO_COLOR
+    # env; --no-color overrides FORCE_COLOR env; deny-wins on the
+    # --color + --no-color clash. _resolve_color_enabled returns the
+    # effective bool; pass it as ``color=`` so the renderer skips its
+    # internal _supports_color_stdout() auto-detect (which would
+    # re-consult NO_COLOR and incorrectly disable color when the user
+    # passed --color under NO_COLOR=1).
     print(_render_project_table(
         sorted_rows,
         title=title,
         breakdown=args.breakdown,
         weeks_missing_snapshot=len(weeks_missing_snapshot),
         weeks_in_range=len(weeks_in_range),
-        no_color=args.no_color,
+        color=_resolve_color_enabled(args),
     ))
     return 0
 
@@ -5159,7 +5199,13 @@ def cmd_diff(args: argparse.Namespace) -> int:
         print(_diff_render_json(result, options=options))
         return 0
 
-    color = sys.stdout.isatty() and not args.no_color
+    # Session A (spec §7.3): route through the new color resolver so
+    # the bool --color flag overrides NO_COLOR env, --no-color overrides
+    # FORCE_COLOR env, and deny-wins on the --color + --no-color clash.
+    # The old computation (sys.stdout.isatty() and not args.no_color)
+    # only honored --no-color + isatty; the resolver supersedes both
+    # with the full spec §7.3 precedence.
+    color = _resolve_color_enabled(args)
     width = args.width or shutil.get_terminal_size().columns
     width = max(80, min(width, 160))
     print(_diff_render_full_output(
