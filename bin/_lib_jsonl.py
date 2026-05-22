@@ -59,14 +59,56 @@ class CodexEntry:
     source_path: str
 
 
+def _entry_token_total(entry: "UsageEntry") -> int:
+    """Sum of the four billed token fields. Mirrors ccusage's
+    `usage_token_total` in rust/crates/ccusage/src/claude_loader.rs:516."""
+    u = entry.usage
+    return (
+        int(u.get("input_tokens", 0) or 0)
+        + int(u.get("output_tokens", 0) or 0)
+        + int(u.get("cache_creation_input_tokens", 0) or 0)
+        + int(u.get("cache_read_input_tokens", 0) or 0)
+    )
+
+
+def _should_replace(
+    candidate: "UsageEntry", existing: "UsageEntry"
+) -> bool:
+    """Port of ccusage's `should_replace_deduped_entry` in
+    rust/crates/ccusage/src/claude_loader.rs:531. Higher token total wins;
+    on equal totals, the row with `speed` set wins (the post-stream
+    finalization row carries `speed`; streaming intermediates don't)."""
+    c_total = _entry_token_total(candidate)
+    e_total = _entry_token_total(existing)
+    if c_total != e_total:
+        return c_total > e_total
+    return ("speed" in candidate.usage) and ("speed" not in existing.usage)
+
+
 def _parse_usage_entries(
     jsonl_path: pathlib.Path,
     range_start: dt.datetime,
     range_end: dt.datetime,
-    seen_hashes: set[str] | None = None,
+    *,
+    dedupe_map: "dict[str, UsageEntry] | None" = None,
 ) -> list[UsageEntry]:
-    """Parse assistant entries from a JSONL file within the given time range."""
-    entries: list[UsageEntry] = []
+    """Parse one JSONL file's assistant entries within [range_start, range_end].
+
+    Dedup contract (matches ccusage's `push_deduped_entry`):
+    - Entries with non-null (msg_id, req_id) go into `dedupe_map`; if a key
+      already maps to an entry, replace iff `_should_replace(candidate, existing)`.
+    - Entries with null msg_id or null req_id (rare in modern Claude Code,
+      but possible on synthetic / legacy emissions) skip the dedup map and
+      land in a separate list — partial UNIQUE index on the cache mirrors
+      this behavior.
+    - `<synthetic>` model rows are dropped entirely (matches ccusage's
+      claude_loader.rs:454).
+
+    Caller is responsible for sorting the returned list by timestamp if
+    needed; `_collect_entries_direct` does this once across all files
+    after flattening `dedupe_map.values()`.
+    """
+    no_key_entries: list[UsageEntry] = []
     try:
         with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -96,6 +138,11 @@ def _parse_usage_entries(
                 model = msg.get("model") or obj.get("model")
                 if not isinstance(model, str) or not model.strip():
                     continue
+                model = model.strip()
+                if model == "<synthetic>":
+                    # Matches ccusage's claude_loader.rs:454 — synthetic
+                    # placeholder rows carry no billable usage.
+                    continue
 
                 try:
                     ts = dt.datetime.fromisoformat(
@@ -109,16 +156,8 @@ def _parse_usage_entries(
                 if ts < range_start or ts > range_end:
                     continue
 
-                # Deduplicate by message.id + requestId (same as ccusage)
                 msg_id = msg.get("id")
                 req_id = obj.get("requestId")
-                if msg_id is not None and req_id is not None:
-                    entry_hash = f"{msg_id}:{req_id}"
-                    if seen_hashes is not None:
-                        if entry_hash in seen_hashes:
-                            continue
-                        seen_hashes.add(entry_hash)
-
                 cost_usd_raw = obj.get("costUSD")
                 cost_usd = (
                     float(cost_usd_raw)
@@ -126,16 +165,31 @@ def _parse_usage_entries(
                     else None
                 )
 
-                entries.append(UsageEntry(
+                entry = UsageEntry(
                     timestamp=ts,
-                    model=model.strip(),
+                    model=model,
                     usage=usage,
                     cost_usd=cost_usd,
-                ))
+                )
+
+                if msg_id is None or req_id is None:
+                    no_key_entries.append(entry)
+                    continue
+                if dedupe_map is None:
+                    # Caller opted out of cross-file dedup (rare; keep
+                    # legacy "all entries returned" shape).
+                    no_key_entries.append(entry)
+                    continue
+                key = f"{msg_id}:{req_id}"
+                existing = dedupe_map.get(key)
+                if existing is None or _should_replace(entry, existing):
+                    dedupe_map[key] = entry
     except OSError as exc:
         _eprint(f"[cost] could not read {jsonl_path}: {exc}")
 
-    return entries
+    # The function returns ONLY this file's no-key entries; the caller
+    # flattens `dedupe_map.values()` once at the end across all files.
+    return no_key_entries
 
 
 def _iter_jsonl_entries_with_offsets(fh):
@@ -185,6 +239,13 @@ def _iter_jsonl_entries_with_offsets(fh):
         model = msg.get("model") or obj.get("model")
         if not isinstance(model, str) or not model.strip():
             continue
+        model = model.strip()
+        if model == "<synthetic>":
+            # Matches ccusage's claude_loader.rs:454. Filtered at the
+            # iterator level so the cache ingest path can't accidentally
+            # store these rows even if a downstream loop forgets to
+            # double-check (see `sync_cache` in _cctally_cache.py).
+            continue
 
         try:
             ts = dt.datetime.fromisoformat(ts_raw.strip().replace("Z", "+00:00"))
@@ -202,7 +263,7 @@ def _iter_jsonl_entries_with_offsets(fh):
             offset,
             UsageEntry(
                 timestamp=ts,
-                model=model.strip(),
+                model=model,
                 usage=usage,
                 cost_usd=cost_usd,
             ),

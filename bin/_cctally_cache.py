@@ -165,6 +165,7 @@ _CodexIterState = _lib_jsonl._CodexIterState
 _iter_jsonl_entries_with_offsets = _lib_jsonl._iter_jsonl_entries_with_offsets
 _iter_codex_jsonl_entries_with_offsets = _lib_jsonl._iter_codex_jsonl_entries_with_offsets
 _parse_usage_entries = _lib_jsonl._parse_usage_entries
+_should_replace = _lib_jsonl._should_replace
 
 _cctally_db_sib = _load_lib("_cctally_db")
 add_column_if_missing = _cctally_db_sib.add_column_if_missing
@@ -508,6 +509,13 @@ def sync_cache(
                 with open(jp, "r", encoding="utf-8", errors="replace") as fh:
                     fh.seek(start_offset)
                     for offset, entry, msg_id, req_id in _iter_jsonl_entries_with_offsets(fh):
+                        # Belt-and-suspenders: _iter_jsonl_entries_with_offsets
+                        # already drops <synthetic> rows, but a defensive skip
+                        # here keeps the cache safe even if a future iterator
+                        # change ever relaxed the filter. Matches ccusage's
+                        # claude_loader.rs:454.
+                        if entry.model == "<synthetic>":
+                            continue
                         usage = entry.usage
                         inp = int(usage.get("input_tokens", 0) or 0)
                         out = int(usage.get("output_tokens", 0) or 0)
@@ -552,13 +560,49 @@ def sync_cache(
                     stats.files_reset_truncated += 1
                 if rows:
                     before = conn.total_changes
+                    # ccusage-parity ON CONFLICT DO UPDATE: higher-token total
+                    # wins on conflict; speed-set breaks ties. The partial
+                    # UNIQUE index `idx_entries_dedup` restricts the conflict
+                    # target to (msg_id IS NOT NULL AND req_id IS NOT NULL),
+                    # so the WHERE clause on the conflict target MUST repeat
+                    # that predicate verbatim — bare `ON CONFLICT(msg_id,
+                    # req_id)` raises OperationalError. NULL-keyed rows fall
+                    # through to a plain INSERT, unchanged.
                     conn.executemany(
-                        """INSERT OR IGNORE INTO session_entries
+                        """INSERT INTO session_entries
                            (source_path, line_offset, timestamp_utc, model,
                             msg_id, req_id, input_tokens, output_tokens,
                             cache_create_tokens, cache_read_tokens,
                             usage_extra_json, cost_usd_raw)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(msg_id, req_id)
+                           WHERE msg_id IS NOT NULL AND req_id IS NOT NULL
+                           DO UPDATE SET
+                               source_path = excluded.source_path,
+                               line_offset = excluded.line_offset,
+                               timestamp_utc = excluded.timestamp_utc,
+                               model = excluded.model,
+                               input_tokens = excluded.input_tokens,
+                               output_tokens = excluded.output_tokens,
+                               cache_create_tokens = excluded.cache_create_tokens,
+                               cache_read_tokens = excluded.cache_read_tokens,
+                               usage_extra_json = excluded.usage_extra_json,
+                               cost_usd_raw = excluded.cost_usd_raw
+                           WHERE
+                               (excluded.input_tokens + excluded.output_tokens
+                                + excluded.cache_create_tokens + excluded.cache_read_tokens)
+                               >
+                               (session_entries.input_tokens + session_entries.output_tokens
+                                + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
+                            OR (
+                               (excluded.input_tokens + excluded.output_tokens
+                                + excluded.cache_create_tokens + excluded.cache_read_tokens)
+                               =
+                               (session_entries.input_tokens + session_entries.output_tokens
+                                + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
+                               AND json_extract(excluded.usage_extra_json, '$.speed') IS NOT NULL
+                               AND json_extract(session_entries.usage_extra_json, '$.speed') IS NULL
+                            )""",
                         rows,
                     )
                     stats.rows_inserted += conn.total_changes - before
@@ -664,15 +708,26 @@ def _collect_entries_direct(
     *,
     project: str | None = None,
 ) -> list[UsageEntry]:
-    """Legacy direct-parse fallback used when the cache DB can't be opened."""
+    """Legacy direct-parse fallback used when the cache DB can't be opened.
+
+    Uses the ccusage-parity dict-keyed accumulator: dedup-keyed entries
+    live in `dedupe_map` and are tiebroken via `_should_replace` (higher
+    token total wins, speed-set breaks ties). Entries with NULL msg_id or
+    req_id bypass the map and land verbatim — partial UNIQUE index on the
+    cache mirrors this behavior. Flattened + sorted once at the end.
+    """
     files = _discover_session_files(range_start, project=project)
-    seen_hashes: set[str] = set()
-    entries: list[UsageEntry] = []
+    dedupe_map: dict[str, UsageEntry] = {}
+    no_key: list[UsageEntry] = []
     for fp in files:
-        entries.extend(
-            _parse_usage_entries(fp, range_start, range_end, seen_hashes=seen_hashes)
+        no_key.extend(
+            _parse_usage_entries(
+                fp, range_start, range_end, dedupe_map=dedupe_map,
+            )
         )
-    return entries
+    all_entries = list(dedupe_map.values()) + no_key
+    all_entries.sort(key=lambda e: e.timestamp)
+    return all_entries
 
 
 # === Region 4: _JoinedClaudeEntry + get_claude_session_entries (was bin/cctally:2478-2668) ===
@@ -808,10 +863,23 @@ def _direct_parse_claude_session_entries(
     scan the file for the first `sessionId` / `cwd` value, else fall
     back to the filename UUID and the decoded-escaped parent directory
     — same logic as `_ensure_session_files_row`.
+
+    Uses the ccusage-parity dict-keyed accumulator. Each per-file parse
+    contributes into a global `(entry, source_path)` map keyed by
+    `msg_id:req_id`; ties broken by `_should_replace`. NULL-keyed entries
+    bypass dedup. After all files are walked, results are stamped with
+    their owning file's session_id/cwd metadata and emitted in
+    timestamp order.
     """
-    results: list[_JoinedClaudeEntry] = []
     files = _discover_session_files(range_start, project=project)
-    seen_hashes: set[str] = set()
+
+    # File metadata: source_path -> (session_id, project_path/cwd).
+    meta_by_path: dict[str, tuple[str, str]] = {}
+
+    # Global accumulator: (msg_id:req_id) -> (UsageEntry, source_path).
+    dedupe_map: dict[str, tuple[UsageEntry, str]] = {}
+    # Null-key entries (rare; same as the cache's partial-index fallthrough).
+    no_key_with_meta: list[tuple[UsageEntry, str]] = []
 
     for fp in files:
         source_path = str(fp)
@@ -846,27 +914,53 @@ def _direct_parse_claude_session_entries(
             session_id = os.path.splitext(os.path.basename(source_path))[0]
         if cwd is None:
             cwd = _decode_escaped_cwd(os.path.basename(os.path.dirname(source_path)))
+        meta_by_path[source_path] = (session_id, cwd)
 
-        for entry in _parse_usage_entries(
-            fp, range_start, range_end, seen_hashes=seen_hashes
-        ):
-            usage = entry.usage
-            results.append(_JoinedClaudeEntry(
-                timestamp=entry.timestamp,
-                model=entry.model,
-                input_tokens=int(usage.get("input_tokens", 0) or 0),
-                output_tokens=int(usage.get("output_tokens", 0) or 0),
-                cache_creation_tokens=int(
-                    usage.get("cache_creation_input_tokens", 0) or 0
-                ),
-                cache_read_tokens=int(
-                    usage.get("cache_read_input_tokens", 0) or 0
-                ),
-                source_path=source_path,
-                session_id=session_id,
-                project_path=cwd,
-                cost_usd=entry.cost_usd,
-            ))
+        # Parse this file with a fresh per-file dedupe_map so we can attach
+        # the source_path provenance to whatever wins this file's local
+        # contests. Then merge into the global map using the same
+        # `_should_replace` rule. (A shared dedupe_map across files would
+        # lose the source_path of the winning entry — _parse_usage_entries
+        # has no awareness of per-file metadata.)
+        file_dedupe_map: dict[str, UsageEntry] = {}
+        file_no_key = _parse_usage_entries(
+            fp, range_start, range_end, dedupe_map=file_dedupe_map,
+        )
+
+        # Merge file-local no-key entries directly (no dedup contest).
+        for entry in file_no_key:
+            no_key_with_meta.append((entry, source_path))
+
+        # Merge file-local dedup-keyed entries into the global map.
+        # Same tiebreaker as the cache's ON CONFLICT DO UPDATE clause.
+        for key, entry in file_dedupe_map.items():
+            existing = dedupe_map.get(key)
+            if existing is None or _should_replace(entry, existing[0]):
+                dedupe_map[key] = (entry, source_path)
+
+    # Flatten + emit.
+    results: list[_JoinedClaudeEntry] = []
+    flat: list[tuple[UsageEntry, str]] = list(dedupe_map.values()) + no_key_with_meta
+    flat.sort(key=lambda pair: pair[0].timestamp)
+    for entry, source_path in flat:
+        usage = entry.usage
+        sid, cwd = meta_by_path.get(source_path, (None, None))
+        results.append(_JoinedClaudeEntry(
+            timestamp=entry.timestamp,
+            model=entry.model,
+            input_tokens=int(usage.get("input_tokens", 0) or 0),
+            output_tokens=int(usage.get("output_tokens", 0) or 0),
+            cache_creation_tokens=int(
+                usage.get("cache_creation_input_tokens", 0) or 0
+            ),
+            cache_read_tokens=int(
+                usage.get("cache_read_input_tokens", 0) or 0
+            ),
+            source_path=source_path,
+            session_id=sid,
+            project_path=cwd,
+            cost_usd=entry.cost_usd,
+        ))
 
     return results
 
