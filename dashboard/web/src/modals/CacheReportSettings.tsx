@@ -76,7 +76,15 @@ export function CacheReportSettings({
 
   async function save() {
     setSaved(false);
-    const n = parseInt(value, 10);
+    // Strict integer guard: `parseInt('1.5', 10)` returns `1`, silently
+    // dropping the fractional part and POSTing a different value than
+    // the user typed. `type="number"` doesn't block fractional input
+    // (the user can paste or type `.`), so the client must reject
+    // anything that isn't a bare signed-integer literal before parsing.
+    // Examples now rejected with the inline error: '1.5', '15.9',
+    // '1.0', '15e2', ' 5 ' (whitespace handled by trim first).
+    const trimmed = value.trim();
+    const n = /^-?\d+$/.test(trimmed) ? parseInt(trimmed, 10) : NaN;
     if (!Number.isInteger(n) || n < 1 || n > 100) {
       setErr('Must be an integer between 1 and 100');
       return;

@@ -18,18 +18,29 @@ export interface CacheReportSpotlightProps {
 }
 
 export function CacheReportSpotlight({ cr }: CacheReportSpotlightProps) {
-  const anomalous = cr.today.anomaly_triggered;
   const insufficient =
     cr.today.baseline_daily_row_count < CACHE_REPORT_MIN_BASELINE_DAYS;
+  // Insufficient baseline takes precedence over anomaly_triggered: during
+  // the first 1–4 captured days a `net_negative` today already sets
+  // `cr.today.anomaly_triggered = true` (the server-side classifier skips
+  // only `cache_drop` when samples are thin) — but the panel and the
+  // outer modal-card chrome both stay teal under "Building baseline"
+  // copy until the 5-day floor exists. The spotlight pill, the section
+  // sub-card border, and the reasons line MUST follow the same gate so
+  // the spotlight doesn't contradict the panel handoff with an amber
+  // ⚠ Anomaly state on the same baseline-building day. Pairs with the
+  // identical gates in CacheReportPanel.tsx:147 and
+  // CacheReportModal.tsx:111.
+  const anomalous = cr.today.anomaly_triggered && !insufficient;
 
   let pill: { text: string; cls: string };
-  if (anomalous) {
-    pill = { text: '⚠ Anomaly', cls: '' };
-  } else if (insufficient) {
+  if (insufficient) {
     pill = {
       text: `~ Building baseline · ${cr.today.baseline_daily_row_count}/${CACHE_REPORT_MIN_BASELINE_DAYS} days`,
       cls: 'thin',
     };
+  } else if (anomalous) {
+    pill = { text: '⚠ Anomaly', cls: '' };
   } else {
     pill = { text: '✓ Healthy', cls: 'ok' };
   }

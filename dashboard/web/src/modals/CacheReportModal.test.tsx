@@ -198,46 +198,65 @@ describe('<CacheReportModal /> daily rows table', () => {
     expect(cells[cells.length - 1].className).toContain('flag-warn');
   });
 
-  it('hit-bad color tracks each row\'s own anomaly_reasons, not today\'s baseline (round-2 finding)', () => {
-    // Scenario from the round-2 review: five early 80% days followed by
-    // many 50% days. The server-side classifier uses each row's own
-    // baseline (exclude_row=row), so the first 50% rows were flagged
-    // `cache_drop` against the 80% reference and stay anomalous. But
-    // once today's median itself drifts to 50%, a per-row predicate that
-    // recomputes against `cr.today.baseline_median_percent` would paint
-    // those historical 50% rows green next to a ⚠ Flag — the cell color
-    // would contradict the Flag column on the same row.
+  it('hit-bad coloring tracks the displayed ±5pp band, not the per-row anomaly flag (round-3 finding)', () => {
+    // Round-3 review: the previous binding tied `hit-bad` to
+    // `d.anomaly_reasons.includes('cache_drop')`, which uses
+    // anomaly_threshold_pp (default 15) instead of the modal's
+    // displayed ±CACHE_REPORT_BAND_PP=5 band. A day 6-14pp below
+    // baseline visibly sat outside the sparkline band yet rendered
+    // green; raising the threshold widened the gap.
+    //
+    // New contract: cell coloring follows the band, the Flag column
+    // follows the per-row anomaly classifier — the two signals stay
+    // independent. A row that is within the band but still
+    // anomaly_triggered (e.g. net_negative-only) must render hit-good
+    // alongside flag-warn; a row that is below the band but NOT
+    // anomaly_triggered (e.g. between BAND_PP and anomaly_threshold_pp
+    // below baseline, no net loss) must still render hit-bad with
+    // flag-ok.
     const cr = makeCacheReport();
     cr.today = {
       ...cr.today,
-      baseline_median_percent: 50, // today's median has drifted down
-      cache_hit_percent: 50,
+      baseline_median_percent: 67,
     };
-    cr.days = cr.days.map((d, i) => {
-      if (i < 5) {
-        // First 5 historical rows: 50% hit + flagged cache_drop by
-        // their own per-row baseline (which still saw the prior 80%
-        // reference set).
-        return {
-          ...d,
-          cache_hit_percent: 50,
-          anomaly_triggered: true,
-          anomaly_reasons: ['cache_drop'],
-        };
-      }
-      return d;
-    });
+    // Day 1: in-band hit% but anomaly_triggered (net_negative-only).
+    // -> hit-good + flag-warn (independent signals).
+    cr.days[1] = {
+      ...cr.days[1],
+      cache_hit_percent: 65, // 67-65=2 <= BAND_PP=5
+      net_usd: -0.40,
+      anomaly_triggered: true,
+      anomaly_reasons: ['net_negative'],
+    };
+    // Day 2: below-band hit% but NOT anomaly_triggered (only 10pp drop,
+    // below the default 15pp anomaly_threshold_pp).
+    // -> hit-bad + flag-ok.
+    cr.days[2] = {
+      ...cr.days[2],
+      cache_hit_percent: 57, // 67-57=10 > BAND_PP=5
+      anomaly_triggered: false,
+      anomaly_reasons: [],
+    };
     updateSnapshot(envelopeWith(cr));
     render(<CacheReportModal />);
-    const row = document.querySelector(
-      `[data-testid="crm-daily-row"][data-date="${cr.days[0].date}"]`,
+
+    const row1 = document.querySelector(
+      `[data-testid="crm-daily-row"][data-date="${cr.days[1].date}"]`,
     );
-    expect(row).toBeTruthy();
-    const cells = row?.querySelectorAll('td') ?? [];
-    // hit cell (2nd col) must be hit-bad to match the ⚠ Flag column.
-    expect(cells[1].className).toContain('hit-bad');
-    expect(cells[1].className).not.toContain('hit-good');
-    expect(cells[cells.length - 1].className).toContain('flag-warn');
+    expect(row1).toBeTruthy();
+    const cells1 = row1?.querySelectorAll('td') ?? [];
+    expect(cells1[1].className).toContain('hit-good');
+    expect(cells1[1].className).not.toContain('hit-bad');
+    expect(cells1[cells1.length - 1].className).toContain('flag-warn');
+
+    const row2 = document.querySelector(
+      `[data-testid="crm-daily-row"][data-date="${cr.days[2].date}"]`,
+    );
+    expect(row2).toBeTruthy();
+    const cells2 = row2?.querySelectorAll('td') ?? [];
+    expect(cells2[1].className).toContain('hit-bad');
+    expect(cells2[1].className).not.toContain('hit-good');
+    expect(cells2[cells2.length - 1].className).toContain('flag-ok');
   });
 });
 
@@ -262,6 +281,38 @@ describe('<CacheReportModal /> anomaly spotlight', () => {
     // Reasons codes
     expect(screen.getByText(/cache_drop/)).toBeInTheDocument();
     expect(screen.getByText(/net_negative/)).toBeInTheDocument();
+  });
+
+  // Regression for round-3 Codex finding: during baseline-building
+  // (baseline_daily_row_count < CACHE_REPORT_MIN_BASELINE_DAYS=5),
+  // `cr.today.anomaly_triggered` can already be true (the server-side
+  // classifier still fires `net_negative` without a baseline). The
+  // panel and modal-card chrome both stay teal/"Building baseline" on
+  // such days; the spotlight pill MUST follow suit so the user does
+  // not see contradictory states between the panel and the spotlight.
+  // The previous precedence checked anomaly first, flipping the pill
+  // to ⚠ Anomaly on the same day the panel said Building baseline.
+  it('keeps the Building baseline pill (not ⚠ Anomaly) when baseline is thin even if anomaly_triggered=true', () => {
+    updateSnapshot(envelopeWith(makeCacheReport({
+      today: {
+        date: '2026-05-20',
+        cache_hit_percent: 60,
+        baseline_median_percent: null, // baseline not established
+        delta_pp: null,
+        net_usd: -0.30,
+        saved_usd: 0.10,
+        wasted_usd: 0.40,
+        // Server already flagged net_negative even though only 3 days
+        // of history exist (cache_drop is the one the server skips
+        // when samples are thin; net_negative is not gated).
+        anomaly_triggered: true,
+        anomaly_reasons: ['net_negative'],
+        baseline_daily_row_count: 3,
+      },
+    })));
+    render(<CacheReportModal />);
+    expect(screen.getByText(/Building baseline · 3\/5 days/i)).toBeInTheDocument();
+    expect(screen.queryByText(/⚠ Anomaly/i)).toBeNull();
   });
 });
 
@@ -406,17 +457,21 @@ describe('<CacheReportModal /> settings popover', () => {
 
   // Bound coverage: the server backstops via _validate_cache_report_settings,
   // but a regression that drops the lower or upper bound on the client (or
-  // accepts an empty / negative value) should still fire the inline-error
-  // path so the user sees the message without a server round-trip.
-  // NOTE: fractional values like '15.5' are NOT in this matrix — the client
-  // uses parseInt(value, 10) which silently truncates to 15 (a valid
-  // in-range integer) and POSTs successfully. The server is the only place
-  // that rejects fractional input; if you want client-side fractional
-  // rejection you have to swap parseInt for a strict /^-?\d+$/ guard.
+  // accepts an empty / negative / fractional value) should still fire the
+  // inline-error path so the user sees the message without a server
+  // round-trip. The fractional cases were added per round-3 Codex review:
+  // `parseInt('1.5', 10)` returns 1, so values like '1.5' / '15.9' / '1.0'
+  // were silently truncated and POSTed as a different threshold than the
+  // user typed. The current guard uses a strict /^-?\d+$/ regex against
+  // the trimmed input before parseInt, rejecting any non-integer literal.
   it.each([
     { name: 'upper bound (>100)', value: '101' },
     { name: 'empty string', value: '' },
     { name: 'negative integer', value: '-1' },
+    { name: 'fractional (1.5)', value: '1.5' },
+    { name: 'fractional (15.9)', value: '15.9' },
+    { name: 'fractional (1.0)', value: '1.0' },
+    { name: 'scientific notation (15e2)', value: '15e2' },
   ])('client-side guard rejects $name', ({ value }) => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response('{}', { status: 200 }),

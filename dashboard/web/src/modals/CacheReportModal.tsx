@@ -195,20 +195,25 @@ export function CacheReportModal() {
           <tbody>
             {cr.days.map((d) => {
               const isToday = d.date === cr.today.date;
-              // hit-bad rule per spec §3.7: a row is bad iff THIS row's
-              // own anomaly classifier flagged `cache_drop`. Comparing
-              // each row against TODAY's baseline_median_percent
-              // disagrees with the server: the per-row classifier
-              // (_cctally_cache_report.py:_classify_anomalies) builds
-              // each row's baseline with `exclude_row=row`, so a
-              // historical row can be flagged anomalous against a
-              // baseline different from today's. Concretely, a window
-              // with five 80% days followed by many 50% days would
-              // paint the first 50% rows green next to a ⚠ flag once
-              // today's median falls to 50%, contradicting the Flag
-              // column. Reusing `d.anomaly_reasons` keeps the cell
-              // color and the Flag column in lock-step regardless of
-              // how today's baseline moves.
+              // hit-bad rule: a row is bad iff its cache_hit_percent
+              // sits more than CACHE_REPORT_BAND_PP below today's
+              // baseline median — i.e. it falls below the SAME tinted
+              // ±BAND_PP band the sparkline draws around the median.
+              //
+              // Earlier rounds tied hit-bad to `d.anomaly_reasons`
+              // (cache_drop), but that uses the per-row anomaly
+              // classifier with `anomaly_threshold_pp` (default 15)
+              // instead of the modal's displayed ±5pp band. With the
+              // defaults, days 6-14pp below baseline rendered green
+              // even though they visibly sat outside the highlighted
+              // band; raising the threshold widened the gap. Re-binding
+              // to BAND_PP keeps the table cell color and the
+              // sparkline band always in lock-step, regardless of how
+              // the user configures `anomaly_threshold_pp`. The Flag
+              // column (`flag-warn` / `flag-ok` below) remains tied to
+              // each row's own `anomaly_triggered`, so the two signals
+              // — display-band coloring vs. per-row anomaly classifier
+              // — stay independent and each carries its own meaning.
               //
               // `baselineKnown` is still gated on today's median: it's
               // the window-wide "do we have any baseline at all" signal
@@ -216,7 +221,11 @@ export function CacheReportModal() {
               // neutral cell class — '' rather than 'hit-good' — only
               // makes sense when there's nothing to compare against.
               const baselineKnown = cr.today.baseline_median_percent !== null;
-              const isHitBad = d.anomaly_reasons.includes('cache_drop');
+              const isHitBad =
+                baselineKnown &&
+                cr.today.baseline_median_percent !== null &&
+                d.cache_hit_percent <
+                  cr.today.baseline_median_percent - CACHE_REPORT_BAND_PP;
               const isNetNeg = d.net_usd < 0;
               return (
                 <tr
