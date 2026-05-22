@@ -9985,7 +9985,8 @@ def build_parser() -> argparse.ArgumentParser:
     fhb.add_argument(
         "--no-color",
         action="store_true",
-        help="Disable ANSI color output (currently a no-op — table is plain text).",
+        help="Accepted for ccusage drop-in compat; this command emits "
+             "plain-text output and no ANSI is suppressed.",
     )
     fhb.add_argument(
         "--tz",
