@@ -8831,6 +8831,97 @@ def _argparse_has_arg(parser, option_string: str) -> bool:
     return False
 
 
+def _add_ccusage_alias_args(parser, *, ansi_emit: bool) -> None:
+    """Attach the Session A ccusage alias surface to a Claude-cmd subparser.
+
+    Sibling to ``_add_codex_shared_args`` (declared inside ``build_parser``)
+    but tailored for Claude commands. Every flag is guarded with
+    ``_argparse_has_arg`` so existing per-parser declarations
+    (cache-report's ``--offline``, project / five-hour-blocks / diff's
+    ``--no-color``) do NOT cause ``argparse.ArgumentError`` — the helper
+    just skips the duplicate. This makes future collisions self-healing
+    when a contributor adds a Session A-managed flag directly on a
+    subparser.
+
+    Args:
+      parser:    the subparser to mutate.
+      ansi_emit: ``True`` for project + diff (the 2 real ANSI emitters).
+                 ``False`` for the other 8 in-scope cmds. Controls only
+                 the ``--color`` help text and whether ``--no-color`` is
+                 attempted as a fresh add (when ``ansi_emit=True`` we
+                 skip ``--no-color`` entirely — those parsers already
+                 declared it themselves).
+
+    Spec §7.1.2 / issue #86 Session A.
+    """
+
+    def _maybe_add(opt: str, *args, **kwargs):
+        if _argparse_has_arg(parser, opt):
+            return
+        parser.add_argument(opt, *args, **kwargs)
+
+    def _maybe_add2(opt1: str, opt2: str, *args, **kwargs):
+        # Two-form add (short + long) — skip if EITHER is present.
+        if _argparse_has_arg(parser, opt1) or _argparse_has_arg(parser, opt2):
+            return
+        parser.add_argument(opt1, opt2, *args, **kwargs)
+
+    _maybe_add2(
+        "-z", "--timezone", default=None, metavar="TZ",
+        help="Alias for --tz (drop-in compat with ccusage). When both "
+             "are supplied, --tz wins.",
+    )
+    _maybe_add2(
+        "-O", "--offline",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="Accepted for ccusage drop-in compat; cctally is always offline.",
+    )
+    _maybe_add(
+        "--compact", action="store_true",
+        help="Force compact table layout regardless of terminal width.",
+    )
+    _maybe_add(
+        "--config", default=None, metavar="PATH",
+        help="Accepted for ccusage drop-in compat; cctally config is "
+             "loaded from ~/.local/share/cctally/config.json. Tracked at "
+             "issue #YY for real per-invocation override.",
+    )
+    _maybe_add2(
+        "-d", "--debug", action="store_true",
+        help="Accepted for ccusage drop-in compat; emits a one-time "
+             "stderr note. Real diagnostic-sample emission tracked at "
+             "issue #ZZ.",
+    )
+    _maybe_add(
+        "--debug-samples", type=int, default=5, metavar="N",
+        help="Accepted for ccusage drop-in compat; see --debug.",
+    )
+    _maybe_add(
+        "--single-thread", action="store_true",
+        help="Accepted for ccusage drop-in compat; cctally ingestion "
+             "is already single-threaded via the session-entry cache.",
+    )
+    if ansi_emit:
+        _maybe_add(
+            "--color", action="store_true", default=False,
+            help="Force ANSI color output (overrides NO_COLOR env). When "
+                 "neither --color nor --no-color is set, color is auto-"
+                 "detected from isatty() and NO_COLOR/FORCE_COLOR env.",
+        )
+        # --no-color already declared on these parsers; do nothing here.
+    else:
+        _maybe_add(
+            "--color", action="store_true", default=False,
+            help="Accepted for ccusage drop-in compat; no ANSI is "
+                 "emitted by this command.",
+        )
+        _maybe_add(
+            "--no-color", action="store_true", default=False,
+            help="Accepted for ccusage drop-in compat; no ANSI is "
+                 "emitted by this command.",
+        )
+
+
 def _add_share_args(parser, *, has_status_line: bool = False) -> None:
     """Attach shareable-reports flags + format/json mutex to a subparser.
 
