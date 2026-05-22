@@ -1774,8 +1774,19 @@ def _gate_001_post_ingest_completed(
     # last_ingested_at post-dates the 001 marker. 001 dropped every row
     # from session_files, so a row present now with `last_ingested_at >
     # applied_at_utc` was written by sync_cache AFTER the migration.
+    #
+    # Both columns are written by ``now_utc_iso()`` today, so lex
+    # comparison equals chronological comparison. We still route through
+    # ``unixepoch()`` on both sides as a forward-compatibility hedge: if
+    # any future code path ever writes one side with ``+00:00`` and the
+    # other with ``Z``, lex compare silently mis-orders moments. Mirrors
+    # the same defense applied to the cross-reset flag (CLAUDE.md
+    # "Cross-reset flag is interval-based" — block_start_at vs
+    # week_start_at vs last_observed_at_utc all route through
+    # ``unixepoch()`` to absorb offset-mix drift).
     has_post_001_ingest = cache_ro.execute(
-        "SELECT 1 FROM session_files WHERE last_ingested_at > ? LIMIT 1",
+        "SELECT 1 FROM session_files "
+        "WHERE unixepoch(last_ingested_at) > unixepoch(?) LIMIT 1",
         (applied_at_utc,),
     ).fetchone() is not None
     if has_post_001_ingest:
@@ -1818,8 +1829,12 @@ def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
 
     Invariants:
       * Marker row INSERTed inside the same BEGIN/COMMIT as the DELETEs.
-      * Empty cache (fresh install) still writes the marker —
-        table-emptiness is not the sentinel (CLAUDE.md "Pricing & schema").
+      * Empty session_entries (no JSONL ingested yet) still writes the
+        marker — table-emptiness is not the sentinel (CLAUDE.md "Pricing
+        & schema"). A truly fresh install short-circuits earlier via the
+        dispatcher's ``fresh_install`` fast-path; this handler only sees
+        the post-shipped-empty case where the cache.db schema and
+        migration tables already exist but ``session_entries`` is empty.
       * Migration handler does NOT call ``_log_migration_error`` /
         ``_clear_migration_error_log_entries``; the dispatcher owns that
         surface (CLAUDE.md "Migration error sentinel is uniform").
