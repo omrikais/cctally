@@ -3410,12 +3410,13 @@ def cmd_blocks(args: argparse.Namespace) -> int:
     args._resolved_tz = tz
 
     now_utc = _command_as_of()
-    # Parse --since / --until into datetime range
+    # Parse --since / --until into datetime range. Session A (spec §7.1.1)
+    # routes through the centralized dual-form helper so YYYY-MM-DD also
+    # works and the error message matches the other in-scope cmds.
     if args.since:
         try:
-            since_date = dt.datetime.strptime(args.since, "%Y%m%d")
+            since_date = _parse_dual_form_date(args.since, "--since")
         except ValueError:
-            eprint(f"Error: --since must be YYYYMMDD format, got '{args.since}'")
             return 1
         range_start = since_date.replace(tzinfo=dt.timezone.utc)
     else:
@@ -3424,9 +3425,8 @@ def cmd_blocks(args: argparse.Namespace) -> int:
 
     if args.until:
         try:
-            until_date = dt.datetime.strptime(args.until, "%Y%m%d")
+            until_date = _parse_dual_form_date(args.until, "--until")
         except ValueError:
-            eprint(f"Error: --until must be YYYYMMDD format, got '{args.until}'")
             return 1
         # End of that day
         range_end = until_date.replace(
@@ -3607,6 +3607,28 @@ def _maybe_swap_active_block_to_canonical(
     blocks[active_idx] = rebuilt
 
 
+def _parse_dual_form_date(raw: str, flag: str) -> dt.datetime:
+    """Parse a CLI date arg accepting both ``YYYY-MM-DD`` and ``YYYYMMDD``.
+
+    Tries ``%Y-%m-%d`` first (the more readable upstream ccusage / codex
+    sharedArgs preference), then ``%Y%m%d``. On failure, emits a stderr
+    error and raises ``ValueError``. Callers swallow the ``ValueError``
+    and return exit code 1.
+
+    Promoted from ``_resolve_codex_range._parse_date_arg`` so Claude
+    reporting commands can share the dual-form contract (issue #86
+    Session A, spec §7.1.1). Centralizes the error message so the eight
+    in-scope date-taking commands all surface the same diagnostic.
+    """
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return dt.datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    eprint(f"Error: {flag} must be YYYY-MM-DD or YYYYMMDD format, got '{raw}'")
+    raise ValueError
+
+
 def _parse_cli_date_range(
     args: argparse.Namespace,
     *,
@@ -3639,14 +3661,11 @@ def _parse_cli_date_range(
     the given date — this avoids DST-boundary drift that would occur if
     we used today's offset (via `datetime.now().astimezone().tzinfo`).
     """
-    def _parse_date_arg(raw: str, flag: str) -> dt.datetime:
-        for fmt in ("%Y-%m-%d", "%Y%m%d"):
-            try:
-                return dt.datetime.strptime(raw, fmt)
-            except ValueError:
-                continue
-        eprint(f"Error: {flag} must be YYYY-MM-DD or YYYYMMDD format, got '{raw}'")
-        raise ValueError
+    # Local binding to the module-level dual-form helper (spec §7.1.1).
+    # Keeps the diff inside _parse_cli_date_range minimal while sharing
+    # the centralized error message with cmd_blocks, _parse_date_filter,
+    # and _parse_window_arg.
+    _parse_date_arg = _parse_dual_form_date
 
     tz: Any = None
     if tz_name:
@@ -7178,18 +7197,21 @@ def _latest_seven_day_and_window(
 
 
 def _parse_date_filter(value: str, flag_name: str) -> str:
-    """Parse ``YYYYMMDD`` into a ``YYYY-MM-DD`` ISO date for SQL ``WHERE`` clauses.
+    """Parse ``YYYY-MM-DD`` or ``YYYYMMDD`` into an ISO date for SQL ``WHERE`` clauses.
 
     Used by ``cmd_five_hour_blocks`` ``--since``/``--until``. Mirrors the
-    upstream ccusage convention. Raises ``ValueError`` with a subcommand-only
-    error prefix on bad input; the caller is responsible for printing to
-    stderr and choosing the exit code.
+    upstream ccusage convention. Routes through the centralized
+    ``_parse_dual_form_date`` (spec §7.1.1) so the dual-form contract and
+    error message are shared with cmd_blocks / cmd_daily / etc. The
+    helper eprints to stderr on bad input; we re-raise a ``ValueError``
+    with a subcommand-prefixed message so the caller can choose an
+    appropriate exit code (legacy: 2 for parse errors here).
     """
     try:
-        return dt.datetime.strptime(value, "%Y%m%d").date().isoformat()
+        return _parse_dual_form_date(value, flag_name).date().isoformat()
     except ValueError as e:
         raise ValueError(
-            f"five-hour-blocks: {flag_name} expects YYYYMMDD (got '{value}')"
+            f"five-hour-blocks: {flag_name} expects YYYY-MM-DD or YYYYMMDD (got '{value}')"
         ) from e
 
 
@@ -7868,18 +7890,17 @@ def _resolve_cache_report_window(
         # Full-ISO args carry an explicit time component or tz marker.
         if "T" in raw or "+" in raw or "Z" in raw:
             return parse_iso_datetime(raw, flag)
-        # Date-only: try YYYY-MM-DD then YYYYMMDD (matching
-        # _parse_cli_date_range's precedent for daily/weekly/monthly).
-        for fmt in ("%Y-%m-%d", "%Y%m%d"):
-            try:
-                naive = dt.datetime.strptime(raw, fmt)
-                break
-            except ValueError:
-                continue
-        else:
-            # Not a date-only form either — fall back to parse_iso_datetime
-            # so callers still get a consistent error message.
-            return parse_iso_datetime(raw, flag)
+        # Date-only: route through the centralized dual-form helper
+        # (spec §7.1.1) so YYYY-MM-DD / YYYYMMDD parsing and the error
+        # message stay consistent with cmd_blocks / cmd_daily / etc.
+        try:
+            naive = _parse_dual_form_date(raw, flag)
+        except ValueError:
+            # Not a date-only form either — surface the centralized
+            # helper's error (already eprinted) by raising. Callers
+            # propagate the failure rather than fall through to
+            # parse_iso_datetime's secondary message.
+            raise
         if is_upper_bound:
             naive = naive.replace(
                 hour=23, minute=59, second=59, microsecond=999999,
@@ -8136,10 +8157,23 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
     args._resolved_tz = tz
 
     now_utc = _command_as_of()
-    since, until = _resolve_cache_report_window(
-        args, now_utc=now_utc,
-        tz_name=(tz.key if tz is not None else None),
-    )
+    # Session A (spec §7.1.1): the dual-form helper eprints its own
+    # diagnostic and raises a bare ValueError; catch it here so main()'s
+    # generic ``Error: {exc}`` fallback doesn't double-print an empty
+    # trailer. Mirrors the catch-and-return-1 shape in cmd_blocks.
+    try:
+        since, until = _resolve_cache_report_window(
+            args, now_utc=now_utc,
+            tz_name=(tz.key if tz is not None else None),
+        )
+    except ValueError as exc:
+        # Centralized helper already eprinted on the dual-form path; for
+        # the legacy parse_iso_datetime path (full-ISO mis-format) the
+        # ValueError carries the message, so eprint it.
+        msg = str(exc)
+        if msg:
+            eprint(f"Error: {msg}")
+        return 1
     mode = "session" if getattr(args, "by_session", False) else "day"
     top_key = "sessions" if mode == "session" else "days"
 
