@@ -83,6 +83,22 @@ def load_script():
     load_script()`` see fresh, HOME-derived path constants — same
     contract as before #84.
 
+    TRAP — patch ordering matters. ``_init_paths_from_env()`` runs at
+    the top of EVERY ``load_script()`` call and rebinds every promoted
+    global (``APP_DIR``, ``DB_PATH``, ``CLAUDE_SETTINGS_PATH``, etc.)
+    from the current ``HOME`` env var. This will CLOBBER any prior
+    ``monkeypatch.setattr(_cctally_core, "X", v)`` that ran BEFORE
+    ``load_script()``. The correct ordering is ALWAYS:
+
+        ns = load_script()                                        # FIRST
+        monkeypatch.setattr(_cctally_core, "X", tmp)              # THEN
+
+    or use the ``redirect_paths(ns, monkeypatch, tmp_path)`` helper
+    below which handles ordering correctly. Reversing the order
+    silently leaks the patched paths to the host machine — no
+    exception, no warning, just stale values from the unpatched
+    ``_init_paths_from_env()`` reset.
+
     Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md §6.0a
     """
     for _name in [n for n in sys.modules if n.startswith("_cctally_") and n != "_cctally_core"]:
@@ -128,12 +144,13 @@ def redirect_paths(ns, monkeypatch, tmp_path):
     their own `monkeypatch.setattr(_cctally_core, "CHANGELOG_PATH",
     …)` in the per-test fixture.
 
-    The `_cctally_db` sibling carries its own bare-name copies of four
-    paths (set by the seed block near the bin/cctally path-constant
-    region); we patch those here too so migration-framework code
-    triggered during a redirected test reads the fixture-redirected
-    values. That sibling block predates the data-globals migration and
-    is unaffected by it.
+    As of the data-globals promotion (2026-05-22, #84), `_cctally_db`
+    reads its four path constants
+    (``DB_PATH``/``CACHE_DB_PATH``/``LOG_DIR``/``MIGRATION_ERROR_LOG_PATH``)
+    via ``_cctally_core.X`` at call time, so the kernel patches above
+    propagate directly without a sibling-side re-patch block — the
+    previous seed-and-re-patch pair was a vestige of the pre-#84
+    bare-name pattern and has been removed.
     """
     share = tmp_path / ".local" / "share" / "cctally"
     share.mkdir(parents=True, exist_ok=True)
@@ -177,12 +194,12 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         # `tests/test_kernel_extraction_invariants.py`).
         monkeypatch.setitem(ns, name, value)
 
-    db_sibling = ns.get("_cctally_db")
-    if db_sibling is not None:
-        monkeypatch.setattr(db_sibling, "DB_PATH", share / "stats.db")
-        monkeypatch.setattr(db_sibling, "CACHE_DB_PATH", share / "cache.db")
-        monkeypatch.setattr(db_sibling, "LOG_DIR", share / "logs")
-        monkeypatch.setattr(db_sibling, "MIGRATION_ERROR_LOG_PATH", share / "logs" / "migration-errors.log")
+    # Note: `_cctally_db` used to require sibling-side re-patching of
+    # DB_PATH / CACHE_DB_PATH / LOG_DIR / MIGRATION_ERROR_LOG_PATH
+    # because it consumed them via bare-name reads against a seeded
+    # `_cctally_db.__dict__`. As of the data-globals promotion
+    # (2026-05-22, #84) it reads via `_cctally_core.X` at call time, so
+    # the kernel patches above propagate directly — no extra block here.
 
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
 

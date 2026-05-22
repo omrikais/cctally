@@ -614,12 +614,16 @@ def _e2e_pin_paths(ns, monkeypatch, home: pathlib.Path) -> None:
     explicit pinning since `monkeypatch.setenv("HOME", ...)` doesn't
     rebind constants that already evaluated `pathlib.Path.home()`.
 
-    Subtlety: ``_load_claude_settings`` / ``_write_claude_settings_atomic``
-    / ``_backup_claude_settings`` capture ``CLAUDE_SETTINGS_PATH`` as a
-    default-arg at function-def time, so monkeypatching the constant alone
-    isn't enough — the call sites in ``_setup_install`` invoke them with
-    no args and hit the captured default. We replace the three callables
-    with pinned-path closures so every settings I/O lands in the fake HOME.
+    Historical subtlety (now defensive belt-and-suspenders): pre-#84
+    ``_load_claude_settings`` / ``_write_claude_settings_atomic`` /
+    ``_backup_claude_settings`` captured ``CLAUDE_SETTINGS_PATH`` as a
+    def-time default arg, so monkeypatching the constant alone wasn't
+    enough — the call sites in ``_setup_install`` hit the captured
+    default. As of the data-globals promotion, those three helpers now
+    re-resolve ``_cctally_core.CLAUDE_SETTINGS_PATH`` at call time when
+    ``path`` is omitted, so the kernel patch above would suffice on its
+    own. The pinned-path closures below remain as defensive insulation
+    against any future regression in the call-time-read invariant.
 
     OAuth resolution is stubbed to None so the bootstrap path doesn't try
     to hit the real keychain or talk to Anthropic during the test.

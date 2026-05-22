@@ -70,6 +70,7 @@ def update_paths(ns, tmp_path, monkeypatch):
         "UPDATE_LOCK_PATH": share / "update.lock",
         "UPDATE_LOG_PATH": share / "update.log",
         "UPDATE_LOG_ROTATED_PATH": share / "update.log.1",
+        "UPDATE_CHECK_LAST_FETCH_PATH": share / "update-check.last-fetch",
     }
     for name, value in paths.items():
         monkeypatch.setattr(_cctally_core, name, value)
@@ -1028,9 +1029,8 @@ class TestVersionCheckPipeline:
         self, ns, update_paths, monkeypatch
     ):
         """No marker file → due is True (first run after install)."""
-        monkeypatch.setattr(_cctally_core, "UPDATE_CHECK_LAST_FETCH_PATH", update_paths / "update-check.last-fetch"
-        )
-        # Sanity: no marker.
+        # Sanity: no marker (UPDATE_CHECK_LAST_FETCH_PATH redirected by
+        # the `update_paths` fixture).
         assert not (update_paths / "update-check.last-fetch").exists()
         config = {"update": {"check": {"enabled": True, "ttl_hours": 24}}}
         assert ns["_is_update_check_due"](config) is True
@@ -1040,7 +1040,6 @@ class TestVersionCheckPipeline:
     ):
         """Marker just touched + ttl=48 → not due (within window)."""
         marker = update_paths / "update-check.last-fetch"
-        monkeypatch.setattr(_cctally_core, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
         marker.touch()
         config = {"update": {"check": {"enabled": True, "ttl_hours": 48}}}
         assert ns["_is_update_check_due"](config) is False
@@ -1050,7 +1049,6 @@ class TestVersionCheckPipeline:
     ):
         """`enabled=False` → never due (even with no marker)."""
         marker = update_paths / "update-check.last-fetch"
-        monkeypatch.setattr(_cctally_core, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
         # Sanity: no marker → would otherwise be True.
         assert not marker.exists()
         config = {"update": {"check": {"enabled": False, "ttl_hours": 24}}}
@@ -1062,7 +1060,6 @@ class TestVersionCheckPipeline:
         """Chokepoint success path: touches marker, writes state with
         `check_status="ok"`, `latest_version`, `latest_version_url`."""
         marker = update_paths / "update-check.last-fetch"
-        monkeypatch.setattr(_cctally_core, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
         monkeypatch.setitem(
             ns,
             "_release_read_latest_release_version",
@@ -1098,7 +1095,6 @@ class TestVersionCheckPipeline:
         """Network failure path: marker still touched (crash safety),
         prior `latest_version` preserved, `check_status="fetch_failed"`."""
         marker = update_paths / "update-check.last-fetch"
-        monkeypatch.setattr(_cctally_core, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
         # Pre-populate state with a last-known-good `latest_version`.
         ns["_save_update_state"]({
             "_schema": 1,
@@ -1148,7 +1144,6 @@ class TestVersionCheckPipeline:
         method".
         """
         marker = update_paths / "update-check.last-fetch"
-        monkeypatch.setattr(_cctally_core, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
         # Pre-populate state as if a prior npm install had recorded
         # a fresher upstream version. The user has since switched to a
         # source/dev checkout, so detection will return "unknown".
@@ -1485,6 +1480,9 @@ class TestUpdateCmdDispatch:
             "check_error": None,
             "install": {"method": "npm"},
         })
+        # Touch the throttle marker so `_is_update_check_due` returns False
+        # and cmd_update renders the pre-saved state without re-checking.
+        (update_paths / "update-check.last-fetch").touch()
         args = _make_args(
             command="update",
             check=True,
@@ -1610,6 +1608,9 @@ class TestUpdateCheckOutputFormat:
             "check_error": None,
             "install": {"method": "brew"},
         })
+        # Touch the throttle marker so `_is_update_check_due` returns False
+        # and cmd_update renders the pre-saved state without re-checking.
+        (update_paths / "update-check.last-fetch").touch()
         args = _make_args(
             command="update",
             check=True,
@@ -1652,6 +1653,9 @@ class TestUpdateCheckOutputFormat:
             "check_error": None,
             "install": {"method": "unknown"},
         })
+        # Touch the throttle marker so `_is_update_check_due` returns False
+        # and cmd_update renders the pre-saved state without re-checking.
+        (update_paths / "update-check.last-fetch").touch()
         args = _make_args(
             command="update",
             check=True,
@@ -1688,6 +1692,9 @@ class TestUpdateCheckOutputFormat:
             "check_status": "ok",
             "install": {"method": "npm"},
         })
+        # Touch the throttle marker so `_is_update_check_due` returns False
+        # and cmd_update renders the pre-saved state without re-checking.
+        (update_paths / "update-check.last-fetch").touch()
         args = _make_args(
             command="update",
             check=True,

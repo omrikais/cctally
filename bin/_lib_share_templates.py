@@ -288,22 +288,21 @@ def _utc_now() -> _dt.datetime:
 def _release_version() -> str:
     """Read CHANGELOG-stamped latest version.
 
-    Honors `CCTALLY_TEST_CHANGELOG_PATH` override (the documented test pattern
-    at `bin/cctally:86`). Falls back to `"dev"` when CHANGELOG is unreadable
-    or has no stamped release entry yet (pre-release dev builds).
+    Resolves through ``_cctally_core.CHANGELOG_PATH`` so the kernel's
+    env override (``CCTALLY_TEST_CHANGELOG_PATH``) and any test-side
+    ``monkeypatch.setattr(_cctally_core, "CHANGELOG_PATH", ...)`` both
+    propagate transparently. Falls back to ``"dev"`` when CHANGELOG is
+    unreadable or has no stamped release entry yet (pre-release dev
+    builds).
 
-    Parallel to `_lib_changelog._read_latest_changelog_version`
-    (re-exported on `bin/cctally` under the historical
-    `_release_read_latest_release_version` name) — intentionally
+    Parallel to ``_lib_changelog._read_latest_changelog_version``
+    (re-exported on ``bin/cctally`` under the historical
+    ``_release_read_latest_release_version`` name) — intentionally
     duplicated so the template module stays free of any
-    `bin/cctally` import. If CHANGELOG header format changes, update both.
+    ``bin/cctally`` import. If CHANGELOG header format changes, update both.
     """
-    from pathlib import Path
-    p = os.environ.get("CCTALLY_TEST_CHANGELOG_PATH")
-    if p:
-        path = Path(p)
-    else:
-        path = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
+    import _cctally_core
+    path = _cctally_core.CHANGELOG_PATH
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
             if line.startswith("## [") and "Unreleased" not in line:

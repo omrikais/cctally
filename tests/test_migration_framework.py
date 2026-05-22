@@ -233,16 +233,16 @@ def test_bootstrap_rename_skips_cache_db(cctally_module):
 def test_bootstrap_rename_clears_legacy_error_log_entries(cctally_module, tmp_path, monkeypatch):
     """When a legacy log entry exists, bootstrap drops it after the rename.
 
-    The bin/cctally script is exec'd into a dict whose contents are wrapped
-    in the SimpleNamespace exposed as ``cctally_module``; functions inside
-    that script resolve ``MIGRATION_ERROR_LOG_PATH`` via their own
-    ``__globals__`` (the original exec dict), NOT via the wrapping
-    SimpleNamespace. monkeypatching the SimpleNamespace would silently miss.
-    Instead, patch the underlying globals dict that the helper closes over.
+    Post-#84 (data-globals promotion 2026-05-22), the migration-error
+    sentinel helpers in ``_cctally_db`` read
+    ``_cctally_core.MIGRATION_ERROR_LOG_PATH`` at call time. Patch the
+    kernel module directly — the previous ``helper.__globals__``
+    indirection (which targeted the seeded bare-name lookup) no longer
+    propagates.
     """
+    import _cctally_core
     log_path = tmp_path / "migration-errors.log"
-    helper_globals = cctally_module._clear_migration_error_log_entries.__globals__
-    monkeypatch.setitem(helper_globals, "MIGRATION_ERROR_LOG_PATH", log_path)
+    monkeypatch.setattr(_cctally_core, "MIGRATION_ERROR_LOG_PATH", log_path)
     log_path.write_text(
         "[2026-05-01T10:00:00Z] merge_5h_block_duplicates_v1\n"
         "  ValueError: bad row\n"
@@ -355,15 +355,13 @@ def test_dispatcher_upgrade_runs_pending(cctally_module):
 def test_dispatcher_failure_breaks_loop(cctally_module, tmp_path, monkeypatch):
     """Migration N raises Exception → log + break; later migrations DO NOT run.
 
-    See the bootstrap test for why the log path is patched via
-    ``setitem(helper.__globals__, ...)`` rather than ``setattr`` on the
-    SimpleNamespace wrapper: helpers resolve module-level names through
-    their own ``__globals__`` (the original exec dict), so SimpleNamespace
-    attribute writes are silently invisible to them.
+    Post-#84 the migration-error sentinel helpers read
+    ``_cctally_core.MIGRATION_ERROR_LOG_PATH`` at call time, so we
+    patch the kernel module directly.
     """
+    import _cctally_core
     log_path = tmp_path / "migration-errors.log"
-    helper_globals = cctally_module._log_migration_error.__globals__
-    monkeypatch.setitem(helper_globals, "MIGRATION_ERROR_LOG_PATH", log_path)
+    monkeypatch.setattr(_cctally_core, "MIGRATION_ERROR_LOG_PATH", log_path)
 
     conn = _fresh_conn()
     conn.execute(
@@ -455,13 +453,13 @@ def test_dispatcher_skip_set_honored(cctally_module):
 def test_dispatcher_auto_clears_error_log_on_success(cctally_module, tmp_path, monkeypatch):
     """A previously-failing migration that now succeeds clears its log block.
 
-    Same ``setitem(helper.__globals__, ...)`` indirection as the
-    failure-path test; ``_clear_migration_error_log_entries`` resolves
-    ``MIGRATION_ERROR_LOG_PATH`` through its own ``__globals__``.
+    Post-#84 the migration-error sentinel helpers read
+    ``_cctally_core.MIGRATION_ERROR_LOG_PATH`` at call time, so we
+    patch the kernel module directly.
     """
+    import _cctally_core
     log_path = tmp_path / "migration-errors.log"
-    helper_globals = cctally_module._clear_migration_error_log_entries.__globals__
-    monkeypatch.setitem(helper_globals, "MIGRATION_ERROR_LOG_PATH", log_path)
+    monkeypatch.setattr(_cctally_core, "MIGRATION_ERROR_LOG_PATH", log_path)
     log_path.write_text(
         "[2026-05-01T10:00:00Z] stats.db:001_a\n"
         "  RuntimeError: prior failure\n"

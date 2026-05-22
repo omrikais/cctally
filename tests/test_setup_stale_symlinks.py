@@ -256,13 +256,16 @@ class TestUninstallRemovesLegacyAutoSymlinks:
     """
 
     def _pin_settings_io(self, ns, monkeypatch, home: pathlib.Path) -> None:
-        """Mirror _e2e_pin_paths from test_setup_legacy_migrate.py minimally.
+        """Mirror ``_e2e_pin_paths`` from test_setup_legacy_migrate.py minimally.
 
-        `_setup_uninstall` calls `_load_claude_settings` /
-        `_write_claude_settings_atomic` which capture
-        CLAUDE_SETTINGS_PATH as a default-arg at function-def time.
-        Replace them with pinned-path closures so settings I/O lands
-        in the fake HOME.
+        Historical context: pre-#84 ``_load_claude_settings`` /
+        ``_write_claude_settings_atomic`` / ``_backup_claude_settings``
+        captured ``CLAUDE_SETTINGS_PATH`` as a def-time default. As of
+        the data-globals promotion they re-resolve
+        ``_cctally_core.CLAUDE_SETTINGS_PATH`` at call time, so the
+        kernel patch suffices on its own. The closure wrappers remain
+        as defensive belt-and-suspenders so this test stays correct
+        even if a future regression reverts the call-time-read invariant.
         """
         pinned = home / ".claude" / "settings.json"
         pinned.parent.mkdir(parents=True, exist_ok=True)

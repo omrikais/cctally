@@ -843,25 +843,14 @@ LEGACY_STATUSLINE_NEEDLE = "cctally record-usage"
 
 CODEX_SESSIONS_DIR = pathlib.Path.home() / ".codex" / "sessions"
 
-# Seed `_cctally_db`'s namespace with path constants the migration
-# framework + error sentinel + cmd_db_* helpers reach via bare-name
-# lookup. We have to do this AFTER LOG_DIR / MIGRATION_ERROR_LOG_PATH
-# / DB_PATH / CACHE_DB_PATH are defined (i.e. here, not at the eager-
-# load site near the top). Bare-name lookup keeps the existing
-# `monkeypatch.setitem(helper.__globals__, "MIGRATION_ERROR_LOG_PATH",
-# tmp)` test pattern working (the helper's `__globals__` is now
-# `_cctally_db.__dict__`, so setitem there hits the bare-name lookup
-# path inside the helper). Tests that redirect HOME via the conftest
-# fixture also work because `redirect_paths` already patches the
-# cctally-side path constants AND will additionally need to patch the
-# sibling-side copy below — that's why we expose this seed: tests can
-# discover the sibling via `cctally_module._cctally_db` and patch via
-# `monkeypatch.setitem(_cctally_db.__dict__, "X", tmp)` if needed.
-_cctally_db.LOG_DIR = _cctally_core.LOG_DIR
-_cctally_db.MIGRATION_ERROR_LOG_PATH = _cctally_core.MIGRATION_ERROR_LOG_PATH
-_cctally_db.DB_PATH = _cctally_core.DB_PATH
-_cctally_db.CACHE_DB_PATH = _cctally_core.CACHE_DB_PATH
-
+# Note: `_cctally_db` reads its four path constants
+# (`LOG_DIR`/`MIGRATION_ERROR_LOG_PATH`/`DB_PATH`/`CACHE_DB_PATH`) via
+# `_cctally_core.X` at call time — the canonical sibling pattern after
+# the data-globals promotion (2026-05-22, issue #84). The previous
+# eager-seed block here is no longer needed: `_cctally_core` is the
+# single source of truth, and `monkeypatch.setattr(_cctally_core, "X",
+# v)` propagates into every reader without a sibling-side mirror.
+#
 # Note: `_cctally_cache.py` does NOT need a path-constant seed block
 # parallel to `_cctally_db` above — its moved bodies reach
 # `APP_DIR` / `CACHE_DB_PATH` / `CACHE_LOCK_PATH` /
@@ -7725,8 +7714,17 @@ class SetupError(RuntimeError):
     """Raised when setup hits a hard prerequisite failure (Section 2 of spec)."""
 
 
-def _load_claude_settings(path: pathlib.Path = CLAUDE_SETTINGS_PATH) -> dict:
-    """Read ~/.claude/settings.json. Empty/missing → {}. Malformed → SetupError."""
+def _load_claude_settings(path: pathlib.Path | None = None) -> dict:
+    """Read ~/.claude/settings.json. Empty/missing → {}. Malformed → SetupError.
+
+    ``path`` resolves to ``_cctally_core.CLAUDE_SETTINGS_PATH`` at CALL
+    TIME when omitted, so ``monkeypatch.setattr(_cctally_core,
+    "CLAUDE_SETTINGS_PATH", tmp)`` propagates without needing to swap
+    out this callable. Capturing the default at def-time would silently
+    pin the maintainer's real ``~/.claude/settings.json``.
+    """
+    if path is None:
+        path = _cctally_core.CLAUDE_SETTINGS_PATH
     if not path.exists():
         return {}
     raw = path.read_text(encoding="utf-8")
@@ -7743,8 +7741,14 @@ def _load_claude_settings(path: pathlib.Path = CLAUDE_SETTINGS_PATH) -> dict:
     return data
 
 
-def _backup_claude_settings(path: pathlib.Path = CLAUDE_SETTINGS_PATH) -> pathlib.Path | None:
-    """Best-effort daily backup; return backup path or None."""
+def _backup_claude_settings(path: pathlib.Path | None = None) -> pathlib.Path | None:
+    """Best-effort daily backup; return backup path or None.
+
+    ``path`` resolves to ``_cctally_core.CLAUDE_SETTINGS_PATH`` at CALL
+    TIME when omitted (see ``_load_claude_settings`` for rationale).
+    """
+    if path is None:
+        path = _cctally_core.CLAUDE_SETTINGS_PATH
     if not path.exists():
         return None
     today = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
@@ -7760,9 +7764,15 @@ def _backup_claude_settings(path: pathlib.Path = CLAUDE_SETTINGS_PATH) -> pathli
 
 
 def _write_claude_settings_atomic(
-    settings: dict, path: pathlib.Path = CLAUDE_SETTINGS_PATH
+    settings: dict, path: pathlib.Path | None = None
 ) -> None:
-    """Atomic write with 2-space indent, trailing newline."""
+    """Atomic write with 2-space indent, trailing newline.
+
+    ``path`` resolves to ``_cctally_core.CLAUDE_SETTINGS_PATH`` at CALL
+    TIME when omitted (see ``_load_claude_settings`` for rationale).
+    """
+    if path is None:
+        path = _cctally_core.CLAUDE_SETTINGS_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

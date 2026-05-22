@@ -34,15 +34,22 @@ Holds:
   ``_db_path_for_label``).
 
 What stays in bin/cctally (reached via the ``_cctally()`` accessor):
-- Path constants ``STATS_DB_PATH``, ``CACHE_DB_PATH``,
-  ``MIGRATION_ERROR_LOG_PATH``, ``LOG_DIR`` (spec §86–92 — every
-  path constant stays so monkeypatched HOME redirects propagate).
 - ``open_db`` / ``open_cache_db`` — DB-open primitives that CALL
   the dispatcher; they're the boundary owners, not internal to the
   migration system.
-- ``now_utc_iso``, ``parse_iso_datetime``, ``_compute_block_totals``,
-  ``eprint``, ``format_local_iso`` — tiny helpers / hot-path entry
-  points consumed by migration handlers + cmd_db_status renderers.
+- ``_compute_block_totals`` — Z-high callable consumed by migration
+  handlers; reached via the back-ref shim at the top of this module.
+
+Path constants reached via ``_cctally_core.X`` at call time:
+``DB_PATH`` / ``CACHE_DB_PATH`` / ``LOG_DIR`` /
+``MIGRATION_ERROR_LOG_PATH``. After the data-globals promotion
+(2026-05-22, issue #84) ``_cctally_core`` is the single source of
+truth and the only legal monkeypatch target; tests redirecting
+``HOME`` via ``redirect_paths`` propagate without a sibling-side
+seed block in ``bin/cctally``.
+
+Kernel helpers (``now_utc_iso``, ``parse_iso_datetime``, ``eprint``)
+are direct-imported from ``_cctally_core`` per spec §3.3.
 
 §5.6 audit: zero monkeypatch sites on any moved symbol — the
 extraction is pure-mechanical. No Option C call-site rewrites
@@ -75,6 +82,7 @@ def _cctally():
 # Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
 # import from _cctally_core. The legacy shim functions for these names
 # are deleted.
+import _cctally_core
 from _cctally_core import (
     eprint,
     now_utc_iso,
@@ -89,10 +97,12 @@ from _cctally_core import (
 # _cctally_cache via get_claude_session_entries) and is explicitly listed
 # in spec §3.7's stays-on-shim allowlist.
 #
-# Path constants and rarer helpers (`MIGRATION_ERROR_LOG_PATH`,
-# `LOG_DIR`, `DB_PATH`, `CACHE_DB_PATH`, `format_local_iso`) are
-# accessed via the standard `c = _cctally()` + `c.X` pattern instead
-# (call-time lookup so fixture-HOME redirects propagate).
+# Path constants (`MIGRATION_ERROR_LOG_PATH`, `LOG_DIR`, `DB_PATH`,
+# `CACHE_DB_PATH`) are accessed via `_cctally_core.X` at call time —
+# the canonical sibling pattern after the data-globals promotion
+# (2026-05-22, issue #84). `_cctally_core` is the single source of
+# truth and the only legal monkeypatch target; bin/cctally no longer
+# seeds duplicates into this module's namespace.
 def _compute_block_totals(*args, **kwargs):
     return sys.modules["cctally"]._compute_block_totals(*args, **kwargs)
 
@@ -101,9 +111,11 @@ def _compute_block_totals(*args, **kwargs):
 # Regions below are inserted verbatim from bin/cctally. Bare-name
 # references to `now_utc_iso(...)`, `parse_iso_datetime(...)`,
 # `_compute_block_totals(...)`, and `eprint(...)` resolve to the shims
-# above. Path-constant references (`MIGRATION_ERROR_LOG_PATH`,
-# `LOG_DIR`, `DB_PATH`, `CACHE_DB_PATH`) get rewritten to `c.X` form
-# with a top-of-function `c = _cctally()` binding inserted.
+# / direct imports above. Path-constant references
+# (`MIGRATION_ERROR_LOG_PATH`, `LOG_DIR`, `DB_PATH`, `CACHE_DB_PATH`)
+# are read as `_cctally_core.X` at call time (post-#84 canonical
+# sibling pattern; no `c = _cctally()` binding required for path
+# reads, since `_cctally_core` is direct-imported above).
 
 # === Region 1: add_column_if_missing (was bin/cctally:8584-8621) ===
 
@@ -697,12 +709,12 @@ def _log_migration_error(*, name: str, exc: BaseException, tb: str) -> None:
     # crash). Acceptable per "best effort" design — concurrent migration
     # failures are vanishingly rare since open_db() serializes via WAL.
     try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _cctally_core.LOG_DIR.mkdir(parents=True, exist_ok=True)
         ts = now_utc_iso()
         one_line_err = str(exc).replace("\n", " ").strip() or exc.__class__.__name__
         indented_tb = "\n".join("  " + line for line in tb.rstrip().splitlines())
         block = f"[{ts}] {name}\n  {one_line_err}\n{indented_tb}\n\n"
-        with open(MIGRATION_ERROR_LOG_PATH, "a") as fh:
+        with open(_cctally_core.MIGRATION_ERROR_LOG_PATH, "a") as fh:
             fh.write(block)
     except Exception as log_exc:
         eprint(f"[migration-error-log] failed to write: {log_exc}")
@@ -723,9 +735,9 @@ def _clear_migration_error_log_entries(name: str) -> None:
     # extra banner cycle. Not worth fcntl.flock complexity for failure-rare
     # code path.
     try:
-        if not MIGRATION_ERROR_LOG_PATH.exists():
+        if not _cctally_core.MIGRATION_ERROR_LOG_PATH.exists():
             return
-        content = MIGRATION_ERROR_LOG_PATH.read_text()
+        content = _cctally_core.MIGRATION_ERROR_LOG_PATH.read_text()
         # Entries are separated by "\n\n". Each entry's first line is
         # "[ts] <name>".
         blocks = [b for b in content.split("\n\n") if b.strip()]
@@ -737,9 +749,9 @@ def _clear_migration_error_log_entries(name: str) -> None:
                 continue
             kept.append(block)
         if not kept:
-            MIGRATION_ERROR_LOG_PATH.unlink()
+            _cctally_core.MIGRATION_ERROR_LOG_PATH.unlink()
             return
-        MIGRATION_ERROR_LOG_PATH.write_text("\n\n".join(kept) + "\n\n")
+        _cctally_core.MIGRATION_ERROR_LOG_PATH.write_text("\n\n".join(kept) + "\n\n")
     except Exception as exc:
         eprint(
             f"[migration-error-log] failed to clear entries for {name}: {exc}"
@@ -753,10 +765,10 @@ def _render_migration_error_banner() -> str | None:
     Parses the most recent entry's first line for the migration name and
     timestamp. Falls back to a generic message on parse failure.
     """
-    if not MIGRATION_ERROR_LOG_PATH.exists():
+    if not _cctally_core.MIGRATION_ERROR_LOG_PATH.exists():
         return None
     try:
-        content = MIGRATION_ERROR_LOG_PATH.read_text()
+        content = _cctally_core.MIGRATION_ERROR_LOG_PATH.read_text()
     except Exception:
         return None
     if not content.strip():
@@ -774,13 +786,13 @@ def _render_migration_error_banner() -> str | None:
             if ts and name:
                 return (
                     f"⚠ cctally: migration `{name}` failed at {ts}. "
-                    f"See {MIGRATION_ERROR_LOG_PATH}"
+                    f"See {_cctally_core.MIGRATION_ERROR_LOG_PATH}"
                 )
         except Exception:
             pass
     return (
         f"⚠ cctally: migration error logged. "
-        f"See {MIGRATION_ERROR_LOG_PATH}"
+        f"See {_cctally_core.MIGRATION_ERROR_LOG_PATH}"
     )
 
 
@@ -1737,8 +1749,8 @@ def cmd_db_status(args: argparse.Namespace) -> int:
     payload = {
         "schema_version": 1,
         "databases": {
-            "stats.db": _db_status_for(DB_PATH, _STATS_MIGRATIONS, "stats.db"),
-            "cache.db": _db_status_for(CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db"),
+            "stats.db": _db_status_for(_cctally_core.DB_PATH, _STATS_MIGRATIONS, "stats.db"),
+            "cache.db": _db_status_for(_cctally_core.CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db"),
         },
     }
     if getattr(args, "json", False):
@@ -1828,7 +1840,7 @@ def _db_status_for(
                 "seq": m.seq, "name": m.name,
                 "status": "failed",
                 "last_failure_at": failed_names[m.name],
-                "log_path": str(MIGRATION_ERROR_LOG_PATH),
+                "log_path": str(_cctally_core.MIGRATION_ERROR_LOG_PATH),
             })
         else:
             migrations_out.append({
@@ -1852,11 +1864,11 @@ def _db_status_failed_names_from_log(db_label: str) -> dict[str, str]:
     `merge_5h_block_duplicates_v1` are bootstrap-renamed at next open
     (via Task 4) so they don't accumulate post-PR.
     """
-    if not MIGRATION_ERROR_LOG_PATH.exists():
+    if not _cctally_core.MIGRATION_ERROR_LOG_PATH.exists():
         return {}
     out: dict[str, str] = {}
     try:
-        content = MIGRATION_ERROR_LOG_PATH.read_text()
+        content = _cctally_core.MIGRATION_ERROR_LOG_PATH.read_text()
     except Exception:
         return {}
     blocks = [b for b in content.split("\n\n") if b.strip()]
@@ -1929,9 +1941,9 @@ def _db_resolve_migration_name(name_arg: str) -> tuple[str, str, list[Migration]
 
 def _db_path_for_label(db_label: str) -> pathlib.Path:
     if db_label == "stats.db":
-        return DB_PATH
+        return _cctally_core.DB_PATH
     if db_label == "cache.db":
-        return CACHE_DB_PATH
+        return _cctally_core.CACHE_DB_PATH
     raise ValueError(f"unknown db_label: {db_label}")
 
 

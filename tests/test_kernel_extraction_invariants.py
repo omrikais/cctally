@@ -154,12 +154,12 @@ PROMOTED_GLOBALS = frozenset((
 
 
 def test_promoted_globals_live_in_core():
-    """Every PROMOTED_GLOBALS name is module-level in _cctally_core.
+    """Every PROMOTED_GLOBALS name exists as a module-level attribute on
+    _cctally_core after import.
 
-    Populated by `_init_paths_from_env()`; tested via direct attribute access
-    on the imported module (the `None` sentinel assignments before the
-    `_init_paths_from_env()` call make the names exist as attributes even if
-    the env-driven init were skipped).
+    The names are populated by ``_init_paths_from_env()`` which runs at
+    module-import time (``bin/_cctally_core.py:104``). This test imports
+    the module fresh and asserts that all 23 names are bound.
     """
     import importlib
     import sys
@@ -250,6 +250,19 @@ def test_no_old_style_test_patches_for_promoted_globals():
                 continue
             first_arg = node.args[0]
             second_arg = node.args[1]
+            # `second_arg` must be a string Constant for static detection.
+            # Dynamic-Name forms (`for name in (...): setitem(ns, name, v)`)
+            # are intentionally NOT flagged: that pattern is the legitimate
+            # "mirror into ns for test introspection" idiom used by
+            # `tests/conftest.py:redirect_paths` and by per-test dual-patch
+            # fixtures (e.g. `tests/test_update.py:update_paths`). Both
+            # paired with `monkeypatch.setattr(_cctally_core, name, value)`
+            # on the prior line — the kernel patch is the real surface;
+            # the `ns` mirror only keeps `ns["X"]` reads in sync. Flagging
+            # dynamic Names would force-break the fixture pattern.
+            # Alias-tracking patterns (`mod_ns = ns; setitem(mod_ns,...)`
+            # or `import cctally as ct; setattr(ct,...)`) require flow
+            # analysis and are explicitly out of scope.
             if not (isinstance(second_arg, ast.Constant)
                     and isinstance(second_arg.value, str)):
                 continue
@@ -276,6 +289,18 @@ def test_no_old_style_test_patches_for_promoted_globals():
                 if first_arg.id == "cctally":
                     forbidden = True
                     target_desc = first_arg.id
+            elif method == "setattr" and isinstance(first_arg, ast.Subscript):
+                # `setattr(sys.modules["cctally"], "<PROMOTED>", v)` —
+                # the subscript bypass. Match the exact shape
+                # `sys.modules["cctally"]`.
+                if (isinstance(first_arg.value, ast.Attribute)
+                    and isinstance(first_arg.value.value, ast.Name)
+                    and first_arg.value.value.id == "sys"
+                    and first_arg.value.attr == "modules"
+                    and isinstance(first_arg.slice, ast.Constant)
+                    and first_arg.slice.value == "cctally"):
+                    forbidden = True
+                    target_desc = "sys.modules['cctally']"
             if forbidden:
                 bad.append(
                     f"{path.name}:{node.lineno}: monkeypatch.{method}({target_desc}, "
@@ -283,6 +308,46 @@ def test_no_old_style_test_patches_for_promoted_globals():
                 )
     assert not bad, (
         "Old-style monkeypatch sites for promoted globals (forbidden):\n"
+        + "\n".join(bad)
+    )
+
+
+def test_no_direct_attribute_assignment_to_cctally_promoted_globals():
+    """No `cctally.<PROMOTED> = X` plain attribute assignment in any tests/test_*.py.
+
+    The only legal mutation surface for promoted globals is
+    `monkeypatch.setattr(_cctally_core, "X", v)`. Plain attribute
+    assignment on `cctally` mutates bin/cctally's re-export namespace
+    but does NOT propagate to actual readers (which route via
+    `_cctally_core.X`), so it silently produces no effect and may leak
+    to the host machine via the unpatched _cctally_core values.
+
+    Alias-tracking patterns (e.g. `import cctally as ct; ct.X = v`) are
+    explicitly out of scope — would require flow analysis.
+    """
+    import ast
+    bad = []
+    test_root = Path(__file__).resolve().parent
+    for path in sorted(test_root.rglob("test_*.py")):
+        text = path.read_text()
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if (isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "cctally"
+                    and target.attr in PROMOTED_GLOBALS):
+                    bad.append(
+                        f"{path.name}:{target.lineno}: cctally.{target.attr} = … — "
+                        f"use monkeypatch.setattr(_cctally_core, ...) instead"
+                    )
+    assert not bad, (
+        "Direct attribute assignments to cctally's promoted globals (forbidden):\n"
         + "\n".join(bad)
     )
 
