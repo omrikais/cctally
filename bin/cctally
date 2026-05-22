@@ -1028,6 +1028,37 @@ def _resolve_claude_tz_name(args: argparse.Namespace,
     return None
 
 
+_DEBUG_NOTE_EMITTED = False
+
+
+def _emit_debug_note_if_set(args: argparse.Namespace) -> None:
+    """Emit the §7.6.2 normative stderr note exactly once per process.
+
+    Called from every in-scope ``cmd_*`` body before any stdout write,
+    when ``args.debug`` is True. The one-time-per-process guard
+    (``_DEBUG_NOTE_EMITTED``) ensures a single CLI invocation that
+    internally re-enters ``cmd_*`` (e.g., via ``cmd_report`` →
+    ``cmd_sync_week`` composition) does not duplicate the line.
+
+    The note goes to **stderr**, never stdout — so ``--json`` /
+    ``--format`` pipelines remain parseable (spec §11 R6).
+
+    Spec §7.6.2 / issue #86 Session A. The ``#ZZ`` placeholder is
+    replaced with the real follow-up issue number by Task D3 (operator-
+    driven, post-implementation).
+    """
+    global _DEBUG_NOTE_EMITTED
+    if _DEBUG_NOTE_EMITTED:
+        return
+    if not getattr(args, "debug", False):
+        return
+    eprint(
+        "cctally: --debug diagnostic-sample emission is not yet wired "
+        "(tracked at issue #ZZ)"
+    )
+    _DEBUG_NOTE_EMITTED = True
+
+
 def _resolve_codex_tz_name(args: argparse.Namespace,
                            config: "dict | None") -> "str | None":
     """Resolve the IANA tz NAME (or None for host-local) used by Codex
