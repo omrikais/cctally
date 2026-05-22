@@ -268,6 +268,33 @@ describe('<CacheReportModal /> settings popover', () => {
     ).toBeInTheDocument();
   });
 
+  // Regression for H2 (/check-review round 4): a second click on the
+  // gear toggled showSettings from true→false in the onClick handler,
+  // but the popover's outside-mousedown listener fired FIRST on the
+  // same gesture (mousedown precedes click) and set showSettings to
+  // false. The functional setState then read latest state (false) and
+  // toggled BACK to true — net result, the popover re-opened and the
+  // gear stopped working as a close affordance. Fix: the listener
+  // exempts targets inside ``[data-cr-settings-toggle]``, so the
+  // mousedown is ignored and the click cleanly toggles closed.
+  it('second gear click toggles the popover CLOSED (H2 regression)', () => {
+    updateSnapshot(envelopeWith(makeCacheReport()));
+    render(<CacheReportModal />);
+    const gear = screen.getByRole('button', { name: /cache report settings/i });
+    // First click — popover opens.
+    fireEvent.mouseDown(gear);
+    fireEvent.click(gear);
+    expect(
+      screen.getByRole('dialog', { name: /cache report settings/i }),
+    ).toBeInTheDocument();
+    // Second click — popover MUST close (not re-open).
+    fireEvent.mouseDown(gear);
+    fireEvent.click(gear);
+    expect(
+      screen.queryByRole('dialog', { name: /cache report settings/i }),
+    ).toBeNull();
+  });
+
   it('Save dispatches POST /api/settings with the correct body', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')

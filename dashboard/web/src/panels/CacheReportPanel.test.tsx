@@ -273,6 +273,68 @@ describe('<CacheReportPanel /> mini net-bars (issue #77 P2-4)', () => {
   });
 });
 
+// Regression for M2 (/check-review round 4): the empty and loading
+// branches had ``tabIndex={0}`` + ``onClick={openModal}`` but omitted
+// the keyboard handler the healthy branch carries, leaving keyboard
+// users unable to open the modal in those states. The handler is now
+// shared across all three branches.
+describe('<CacheReportPanel /> keyboard access in every state (M2)', () => {
+  it('healthy state opens the modal on Enter key', () => {
+    updateSnapshot(envelopeWith(healthyCacheReport()));
+    render(<CacheReportPanel />);
+    const panel = screen.getByRole('region', { name: /cache report/i });
+    fireEvent.keyDown(panel, { key: 'Enter' });
+    expect(getState().openModal).toBe('cache-report');
+  });
+
+  it('healthy state opens the modal on Space key', () => {
+    updateSnapshot(envelopeWith(healthyCacheReport()));
+    render(<CacheReportPanel />);
+    const panel = screen.getByRole('region', { name: /cache report/i });
+    fireEvent.keyDown(panel, { key: ' ' });
+    expect(getState().openModal).toBe('cache-report');
+  });
+
+  it('loading state opens the modal on Enter key', () => {
+    // No snapshot → env.cache_report undefined → no-data branch.
+    render(<CacheReportPanel />);
+    const panel = screen.getByRole('region', { name: /cache report/i });
+    fireEvent.keyDown(panel, { key: 'Enter' });
+    expect(getState().openModal).toBe('cache-report');
+  });
+
+  it('loading state opens the modal on Space key', () => {
+    render(<CacheReportPanel />);
+    const panel = screen.getByRole('region', { name: /cache report/i });
+    fireEvent.keyDown(panel, { key: ' ' });
+    expect(getState().openModal).toBe('cache-report');
+  });
+
+  it('empty state opens the modal on Enter key', () => {
+    updateSnapshot(envelopeWith(emptyCacheReport()));
+    render(<CacheReportPanel />);
+    const panel = screen.getByRole('region', { name: /cache report/i });
+    fireEvent.keyDown(panel, { key: 'Enter' });
+    expect(getState().openModal).toBe('cache-report');
+  });
+
+  it('empty state opens the modal on Space key', () => {
+    updateSnapshot(envelopeWith(emptyCacheReport()));
+    render(<CacheReportPanel />);
+    const panel = screen.getByRole('region', { name: /cache report/i });
+    fireEvent.keyDown(panel, { key: ' ' });
+    expect(getState().openModal).toBe('cache-report');
+  });
+
+  it('ignores non-Enter/Space keys (no spurious dispatch)', () => {
+    updateSnapshot(envelopeWith(healthyCacheReport()));
+    render(<CacheReportPanel />);
+    const panel = screen.getByRole('region', { name: /cache report/i });
+    fireEvent.keyDown(panel, { key: 'a' });
+    expect(getState().openModal).toBeNull();
+  });
+});
+
 describe('<CacheReportPanel /> 14d-net subline (issue #77 P2-4)', () => {
   it('reads "14d net: +$9.80" on the healthy fixture (sum of 14 × 0.70)', () => {
     updateSnapshot(envelopeWith(healthyCacheReport()));

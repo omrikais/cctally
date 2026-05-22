@@ -410,11 +410,17 @@ class _CacheReportConfigError(Exception):
 _CACHE_REPORT_ALLOWED_KEYS = frozenset({"anomaly_threshold_pp"})
 
 
-def _validate_cache_report_settings(block: dict) -> _CacheReportSettings:
+def _validate_cache_report_settings(block: dict) -> dict:
     """Validate a ``cache_report`` config block.
 
     Pure function. Raises ``_CacheReportConfigError`` on invalid input;
-    returns ``_CacheReportSettings`` with defaults filled in otherwise.
+    returns a dict containing ONLY the keys that were present in the
+    input (validated). Callers merge the result into the existing
+    persisted block instead of replacing it wholesale — this mirrors
+    the ``update.check`` partial-PUT pattern at
+    ``_handle_post_settings`` (~line 5277) and prevents a combined save
+    that omits ``anomaly_threshold_pp`` from clobbering a previously
+    persisted user value with the default.
 
     v1 only accepts ``anomaly_threshold_pp`` — ``anomaly_window_days``
     stays hardcoded at 14 (spec §6.1; F10 from spec §10 tracks adding
@@ -430,20 +436,23 @@ def _validate_cache_report_settings(block: dict) -> _CacheReportSettings:
                 f"unknown key in cache_report block: {key!r}",
                 field=key,
             )
-    threshold = block.get("anomaly_threshold_pp", 15)
-    # bool is an int subclass — reject it explicitly (mirrors the
-    # update.check.ttl_hours precedent).
-    if isinstance(threshold, bool) or not isinstance(threshold, int):
-        raise _CacheReportConfigError(
-            "anomaly_threshold_pp must be an integer",
-            field="anomaly_threshold_pp",
-        )
-    if threshold < 1 or threshold > 100:
-        raise _CacheReportConfigError(
-            "anomaly_threshold_pp must be in [1, 100]",
-            field="anomaly_threshold_pp",
-        )
-    return _CacheReportSettings(anomaly_threshold_pp=threshold)
+    validated: dict = {}
+    if "anomaly_threshold_pp" in block:
+        threshold = block["anomaly_threshold_pp"]
+        # bool is an int subclass — reject it explicitly (mirrors the
+        # update.check.ttl_hours precedent).
+        if isinstance(threshold, bool) or not isinstance(threshold, int):
+            raise _CacheReportConfigError(
+                "anomaly_threshold_pp must be an integer",
+                field="anomaly_threshold_pp",
+            )
+        if threshold < 1 or threshold > 100:
+            raise _CacheReportConfigError(
+                "anomaly_threshold_pp must be in [1, 100]",
+                field="anomaly_threshold_pp",
+            )
+        validated["anomaly_threshold_pp"] = threshold
+    return validated
 
 
 def _config_known_value(*args, **kwargs):
@@ -5165,7 +5174,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         # the config_writer_lock so a 400 short-circuit doesn't take the
         # lock unnecessarily. Returns HTTP 400 (NOT 422) on validation
         # error — matches the convention every other block here uses.
-        cache_report_validated: "_CacheReportSettings | None" = None
+        #
+        # Validator returns a dict of ONLY the keys present in the input
+        # (partial-PUT semantics, mirroring the ``update.check`` block
+        # at ~line 5277). The handler below merges this into the
+        # existing persisted ``cache_report`` block so a combined save
+        # that omits ``anomaly_threshold_pp`` does not clobber the
+        # user's persisted threshold with the default.
+        cache_report_validated: "dict | None" = None
         if "cache_report" in payload:
             cache_report_block = payload["cache_report"]
             if not isinstance(cache_report_block, dict):
@@ -5384,9 +5400,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                               "field": "cache_report"}
                     )
                     return
-                merged["cache_report"] = {
-                    "anomaly_threshold_pp": cache_report_validated.anomaly_threshold_pp,
-                }
+                # Partial-PUT merge: preserve keys the request didn't
+                # touch (mirrors the update.check block at ~line 5371).
+                # Becomes load-bearing once F10 lifts
+                # ``anomaly_window_days`` to config — until then it
+                # still defends a combined save (e.g. display + empty
+                # cache_report) from clobbering ``anomaly_threshold_pp``
+                # with the default.
+                merged_cr = dict(existing_cr or {})
+                merged_cr.update(cache_report_validated)
+                merged["cache_report"] = merged_cr
 
             save_config(merged)
 
@@ -5412,8 +5435,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 }
             }
         if cache_report_validated is not None:
+            # Echo the full cooked block (resolved defaults included) so
+            # the dashboard composer can repaint without a follow-up GET
+            # — mirrors the update.check echo at ~line 5402. Read from
+            # the merged cache_report we just wrote; fall back to the
+            # documented default when neither the request nor the
+            # persisted config carries an explicit value.
+            persisted_cr = merged.get("cache_report") or {}
+            stored_threshold = persisted_cr.get("anomaly_threshold_pp", 15)
             out["cache_report"] = {
-                "anomaly_threshold_pp": cache_report_validated.anomaly_threshold_pp,
+                "anomaly_threshold_pp": stored_threshold,
             }
         out["saved_at"] = (
             dt.datetime.now(dt.timezone.utc)

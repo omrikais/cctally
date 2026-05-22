@@ -36,8 +36,24 @@ export function CacheReportSettings({
 
   // Click-outside to close. Bind on mousedown (not click) so the
   // close fires before any embedded onClick handlers run.
+  //
+  // Carve-out for the gear toggle (H2 in /check-review round 4):
+  // mousedown on the gear button fires BEFORE its click handler, so
+  // without this exemption the sequence
+  //   1. user clicks gear (popover open)
+  //   2. mousedown -> onClose() runs -> showSettings=false
+  //   3. click -> functional setState reads latest state (false) -> true
+  // re-opens the popover, leaving ESC / Close button as the only ways
+  // to dismiss. The exemption is element-attribute-based (not a parent
+  // ref) so a future second toggle button picks it up automatically;
+  // ``closest('[data-cr-settings-toggle]')`` matches whether the user
+  // clicks the button text or an inner SVG/glyph child.
   useEffect(() => {
     function onDocClick(e: MouseEvent) {
+      const target = e.target as Element | null;
+      if (target && target.closest('[data-cr-settings-toggle]')) {
+        return;
+      }
       if (popRef.current && !popRef.current.contains(e.target as Node)) {
         onClose();
       }

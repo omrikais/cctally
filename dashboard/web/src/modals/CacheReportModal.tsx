@@ -69,6 +69,7 @@ export function CacheReportModal() {
       <button
         type="button"
         aria-label="Cache Report settings"
+        data-cr-settings-toggle
         onClick={(e) => {
           // stopPropagation so the surrounding modal's chrome (close,
           // backdrop) doesn't also process the click.
@@ -84,6 +85,13 @@ export function CacheReportModal() {
           padding: '0 8px',
         }}
       >
+        {/*
+          ``data-cr-settings-toggle`` on the parent button is the carve-
+          out the popover's outside-mousedown listener uses to skip
+          closing when the user clicks the gear while the popover is
+          open. ``closest(...)`` matches whether the user lands on the
+          button itself or this inner glyph (H2 in /check-review).
+        */}
         ⚙
       </button>
     </>

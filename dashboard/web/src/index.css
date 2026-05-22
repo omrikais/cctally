@@ -4210,9 +4210,15 @@ mark.current {
   height: 100%;
 }
 
-/* Mobile collapse (< 720 px) — mirrors daily-collapsed / blocks-collapsed
-   patterns at index.css ~3236+. Implementor 3 fine-tunes if needed. */
-@media (max-width: 719px) {
+/* Mobile collapse (<= 640 px) — mirrors daily-collapsed / blocks-collapsed
+   patterns at index.css ~3236+. Pinned to the same 640 px value as
+   ``lib/breakpoints.ts:MOBILE_BREAKPOINT_PX`` so the JS-applied
+   ``cache-report-collapsed`` class (via ``useIsMobile``) and these CSS
+   rules activate together. L1 in /check-review round 4 corrected a
+   prior 719 px mismatch — under the larger value, the @media block
+   was unreachable between 641-719 px because the class never landed
+   there. Update both sides together if this number ever moves. */
+@media (max-width: 640px) {
   .panel.cache-report-collapsed .cr-spark,
   .panel.cache-report-collapsed .cr-netbars-mini-wrap,
   .panel.cache-report-collapsed .cr-subline.second {

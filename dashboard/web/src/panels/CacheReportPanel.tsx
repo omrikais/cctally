@@ -54,6 +54,19 @@ export function CacheReportPanel() {
   const collapseClass = isMobile ? ' cache-report-collapsed' : '';
   const openModal = () => dispatch({ type: 'OPEN_MODAL', kind: 'cache-report' });
 
+  // Shared keyboard handler attached to all three render branches
+  // (loading / empty / healthy) so a focused panel opens the modal on
+  // Enter / Space in every state — M2 in /check-review round 4. The
+  // section-focus-only guard mirrors SessionsPanel / ProjectsPanel so
+  // a key press inside a child element doesn't double-fire.
+  const handlePanelKeyDown = (e: React.KeyboardEvent) => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      openModal();
+    }
+  };
+
   // No data yet — minimal placeholder (envelope cold-start). The panel
   // still renders so panelOrder / drag-and-drop / keymap routing have
   // a real DOM target; click is wired so the modal can open even before
@@ -68,6 +81,7 @@ export function CacheReportPanel() {
         aria-label="Cache Report"
         tabIndex={0}
         onClick={openModal}
+        onKeyDown={handlePanelKeyDown}
         style={{ cursor: 'pointer' }}
       >
         <div className="panel-header" style={{ justifyContent: 'space-between' }}>
@@ -93,6 +107,7 @@ export function CacheReportPanel() {
         aria-label="Cache Report"
         tabIndex={0}
         onClick={openModal}
+        onKeyDown={handlePanelKeyDown}
         style={{ cursor: 'pointer' }}
       >
         <div className="panel-header" style={{ justifyContent: 'space-between' }}>
@@ -215,15 +230,7 @@ export function CacheReportPanel() {
       aria-label="Cache Report"
       tabIndex={0}
       onClick={openModal}
-      onKeyDown={(e) => {
-        // Mirror SessionsPanel / ProjectsPanel "section-focus-only" guard
-        // so a key press inside a child element doesn't double-fire.
-        if (e.target !== e.currentTarget) return;
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          openModal();
-        }
-      }}
+      onKeyDown={handlePanelKeyDown}
       style={{ cursor: 'pointer' }}
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>

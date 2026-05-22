@@ -31,19 +31,19 @@ def test_validate_accepts_default():
     dash = _bootstrap()
     block = {"anomaly_threshold_pp": 15}
     result = dash._validate_cache_report_settings(block)
-    assert result.anomaly_threshold_pp == 15
+    assert result == {"anomaly_threshold_pp": 15}
 
 
 def test_validate_accepts_low_bound():
     dash = _bootstrap()
     result = dash._validate_cache_report_settings({"anomaly_threshold_pp": 1})
-    assert result.anomaly_threshold_pp == 1
+    assert result == {"anomaly_threshold_pp": 1}
 
 
 def test_validate_accepts_high_bound():
     dash = _bootstrap()
     result = dash._validate_cache_report_settings({"anomaly_threshold_pp": 100})
-    assert result.anomaly_threshold_pp == 100
+    assert result == {"anomaly_threshold_pp": 100}
 
 
 def test_validate_rejects_negative_threshold():
@@ -115,11 +115,19 @@ def test_validate_rejects_anomaly_window_days_in_v1():
     assert "unknown" in str(exc.value).lower() or "anomaly_window_days" in str(exc.value)
 
 
-def test_validate_accepts_empty_block():
-    """Empty block falls back to defaults (threshold = 15)."""
+def test_validate_accepts_empty_block_returns_no_keys():
+    """Empty block is accepted and returns an empty dict.
+
+    Partial-PUT semantics: the validator only carries forward keys the
+    caller explicitly supplied. Defaults are resolved at handler
+    merge-time so a combined save with an empty ``cache_report`` does
+    NOT clobber a previously persisted threshold (see H3 in the
+    /check-review pass). The HTTP round-trip below covers this end-to-
+    end via ``test_http_cache_report_empty_block_preserves_persisted``.
+    """
     dash = _bootstrap()
     result = dash._validate_cache_report_settings({})
-    assert result.anomaly_threshold_pp == 15
+    assert result == {}
 
 
 # ---------------------------------------------------------------------------
@@ -286,5 +294,96 @@ def test_http_cache_report_combined_save_with_display(monkeypatch, tmp_path):
         assert status == 200, body
         assert body["cache_report"] == {"anomaly_threshold_pp": 20}
         assert body["display"]["resolved_tz"] == "Etc/UTC"
+    finally:
+        srv.shutdown()
+
+
+def test_http_cache_report_empty_block_preserves_persisted(
+    monkeypatch, tmp_path,
+):
+    """An empty ``cache_report: {}`` must NOT clobber a previously
+    persisted ``anomaly_threshold_pp``.
+
+    Regression for H3 (/check-review round 4): the prior handler
+    unconditionally replaced the whole ``cache_report`` block with
+    the validator's defaulted value, so a combined save that omitted
+    ``anomaly_threshold_pp`` silently overwrote the user's 42 with the
+    default 15. The validator now returns only keys present in the
+    request; the handler merges them into the existing block.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _wire_handlers(ns)
+    # Pre-seed config.json with a non-default threshold.
+    ns["CONFIG_PATH"].write_text(
+        json.dumps({"cache_report": {"anomaly_threshold_pp": 42}}),
+    )
+    srv, t, port = _serve(ns)
+    try:
+        # Empty cache_report block (representative of a combined save
+        # whose UI hasn't touched the cache-report tab).
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"cache_report": {}},
+        )
+        assert status == 200, body
+        # Echo carries the persisted value, not the default.
+        assert body["cache_report"] == {"anomaly_threshold_pp": 42}
+        # And the persisted config still has 42.
+        cfg = json.loads(ns["CONFIG_PATH"].read_text())
+        assert cfg.get("cache_report", {}).get("anomaly_threshold_pp") == 42
+    finally:
+        srv.shutdown()
+
+
+def test_http_cache_report_empty_block_with_no_persisted_uses_default(
+    monkeypatch, tmp_path,
+):
+    """Empty block with no prior config.json carries the documented
+    default (15) on the echo. The persisted block ends up empty until
+    the user actually saves a value — that's intentional (avoid
+    materializing defaults that downstream readers don't care about)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _wire_handlers(ns)
+    srv, t, port = _serve(ns)
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"cache_report": {}},
+        )
+        assert status == 200, body
+        # Echo defaults to 15 when nothing is persisted.
+        assert body["cache_report"] == {"anomaly_threshold_pp": 15}
+        cfg = json.loads(ns["CONFIG_PATH"].read_text())
+        # cache_report block was written (it's the merge target), but
+        # it doesn't carry an explicit threshold yet.
+        assert "anomaly_threshold_pp" not in cfg.get("cache_report", {})
+    finally:
+        srv.shutdown()
+
+
+def test_http_cache_report_partial_save_overwrites_existing_value(
+    monkeypatch, tmp_path,
+):
+    """When the request explicitly carries a new threshold, it overrides
+    the persisted value (sanity check for the partial-PUT merge — keys
+    present in the input MUST take precedence)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _wire_handlers(ns)
+    ns["CONFIG_PATH"].write_text(
+        json.dumps({"cache_report": {"anomaly_threshold_pp": 42}}),
+    )
+    srv, t, port = _serve(ns)
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"cache_report": {"anomaly_threshold_pp": 30}},
+        )
+        assert status == 200, body
+        assert body["cache_report"] == {"anomaly_threshold_pp": 30}
+        cfg = json.loads(ns["CONFIG_PATH"].read_text())
+        assert cfg["cache_report"]["anomaly_threshold_pp"] == 30
     finally:
         srv.shutdown()
