@@ -155,6 +155,56 @@ def test_gate_passes_when_no_jsonl_on_disk(db_module, tmp_path):
     db_module._gate_001_post_ingest_completed(cache, projects)
 
 
+def test_gate_raises_when_schema_migrations_table_absent(db_module, tmp_path):
+    """A cache.db that exists as an empty file (or has no
+    ``schema_migrations`` table for any reason) must surface as
+    ``MigrationGateNotMet`` — NOT raw ``sqlite3.OperationalError``.
+
+    Pre-fix this relied on substring-only match of
+    ``"no such table"`` in the error message. The fix tightens to the
+    two-signal predicate ``substring match AND sqlite_errorcode in
+    (None, 1)`` so future SQLite version drift in the error-message
+    format doesn't silently re-raise the OperationalError up the stack
+    (which the dispatcher would then log to migration-errors.log and
+    render the error banner for — bad UX for a transient/legitimate
+    bootstrap state).
+    """
+    # Fresh in-memory DB with no tables at all — reading
+    # schema_migrations raises ``no such table: schema_migrations``.
+    cache = sqlite3.connect(":memory:")
+    projects = tmp_path / "projects"
+    projects.mkdir()
+
+    with pytest.raises(db_module.MigrationGateNotMet, match="schema_migrations"):
+        db_module._gate_001_post_ingest_completed(cache, projects)
+
+
+def test_is_no_such_table_error_predicate(db_module):
+    """The centralized predicate ``_is_no_such_table_error`` correctly
+    distinguishes "no such table" from other ``OperationalError`` shapes.
+
+    Belt-and-suspenders unit test for the substring + errorcode pair.
+    SQLite's ``no such table`` always carries ``sqlite_errorcode == 1``
+    (``SQLITE_ERROR``); a generic "disk I/O error" carries 10
+    (``SQLITE_IOERR``) and must NOT trip the predicate even if it
+    contained the substring through some future quirk.
+    """
+    is_pred = db_module._is_no_such_table_error
+
+    # Real OperationalError from SQLite — guaranteed to carry the
+    # canonical message + errorcode=1.
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("SELECT 1 FROM nonexistent_table")
+    except sqlite3.OperationalError as exc:
+        assert is_pred(exc) is True
+
+    # Synthetic OperationalError that does NOT match — predicate stays
+    # False, dispatcher re-raises as a real failure.
+    other_exc = sqlite3.OperationalError("disk I/O error")
+    assert is_pred(other_exc) is False
+
+
 def test_gate_treats_pre_001_session_files_row_as_not_post_001(
     db_module, tmp_path,
 ):

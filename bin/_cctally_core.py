@@ -117,11 +117,50 @@ def _init_paths_from_env() -> None:
     # `_get_claude_data_dirs()` helper in bin/cctally remains the
     # authoritative resolver for ad-hoc reads (multi-root + env-aware);
     # this constant is the single-rooted production default that 99% of
-    # callers want.
+    # callers want. For multi-root, env-aware resolution (mirroring
+    # `_get_claude_data_dirs`), use `_resolve_claude_projects_dirs()`.
     CLAUDE_PROJECTS_DIR = home / ".claude" / "projects"
 
 
 _init_paths_from_env()
+
+
+def _resolve_claude_projects_dirs() -> list[pathlib.Path]:
+    """Return Claude Code projects dirs that exist on disk, env-aware.
+
+    Mirrors `_get_claude_data_dirs()` in bin/cctally but returns the
+    `projects/` subdir directly (since cross-DB migrations only care
+    about the JSONL root, not the parent Claude data dir). Honors
+    ``CLAUDE_CONFIG_DIR`` (comma-separated multi-root) and falls back
+    to ``~/.config/claude`` then ``~/.claude``.
+
+    Used by stats migration 008's gate helper to avoid falsely
+    short-circuiting Layer C's empty-disk fallback when the user has
+    ``CLAUDE_CONFIG_DIR=/other/path`` set AND no ``~/.claude/projects``
+    dir on disk: the gate would otherwise see zero JSONL files at the
+    hardcoded ``CLAUDE_PROJECTS_DIR`` and "pass" the gate, then run the
+    recompute as a no-op against an empty cache.
+
+    Tests can also feed an explicit list to the gate helper directly,
+    skipping this resolver.
+    """
+    env_val = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if env_val:
+        candidates = [pathlib.Path(p.strip()) for p in env_val.split(",") if p.strip()]
+        result = [
+            d / "projects"
+            for d in candidates
+            if d.is_dir() and (d / "projects").is_dir()
+        ]
+        if result:
+            return result
+
+    home = pathlib.Path.home()
+    defaults = [
+        home / ".config" / "claude",
+        home / ".claude",
+    ]
+    return [d / "projects" for d in defaults if d.is_dir() and (d / "projects").is_dir()]
 
 
 # === Logging =========================================================

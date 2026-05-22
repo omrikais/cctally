@@ -1720,7 +1720,7 @@ def _migration_observed_pre_credit_pct(conn: sqlite3.Connection) -> None:
 
 def _gate_001_post_ingest_completed(
     cache_ro: sqlite3.Connection,
-    claude_projects_dir: pathlib.Path,
+    claude_projects_dirs: pathlib.Path | list[pathlib.Path],
 ) -> None:
     """Raise ``MigrationGateNotMet`` unless cache migration 001 has applied
     AND ``sync_cache`` has run at least once after it (or there are no
@@ -1744,9 +1744,9 @@ def _gate_001_post_ingest_completed(
         with a post-001 timestamp must have been written by
         ``sync_cache`` AFTER the migration.
       * **Layer C — empty-disk fallback**: if no JSONL files exist
-        under ``claude_projects_dir``, the absence of ``session_files``
-        rows is the correct state — pass silently so users with no
-        Claude usage can still complete the upgrade.
+        under ANY of ``claude_projects_dirs``, the absence of
+        ``session_files`` rows is the correct state — pass silently so
+        users with no Claude usage can still complete the upgrade.
 
     Parameters
     ----------
@@ -1757,15 +1757,25 @@ def _gate_001_post_ingest_completed(
         body via ``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``.
         Exposed as an explicit parameter so tests can inject an
         in-memory or tmp-path connection without touching ``HOME``.
-    claude_projects_dir
-        Path that contains the JSONL session files (typically
-        ``~/.claude/projects``). Exposed as an explicit parameter so
-        tests can inject ``tmp_path / "projects"``. Production callers
-        resolve this from ``_get_claude_data_dirs()`` (the env-aware
-        helper in bin/cctally).
+    claude_projects_dirs
+        Either a single ``pathlib.Path`` (legacy single-rooted form) or
+        a ``list[pathlib.Path]`` of projects/ directories to scan for
+        JSONL files. Layer C ORs across every root — if no JSONL exists
+        under ANY root, the gate's empty-disk fallback fires.
+        Production callers resolve this via
+        ``_cctally_core._resolve_claude_projects_dirs()`` (env-aware,
+        honors ``CLAUDE_CONFIG_DIR``); tests typically inject
+        ``[tmp_path / "projects"]`` or a single ``tmp_path / "projects"``.
 
     Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3.
     """
+    # Normalize to list so the empty-disk fallback can OR across roots.
+    # Accepting a bare Path keeps the legacy test signature working.
+    if isinstance(claude_projects_dirs, pathlib.Path):
+        projects_dirs = [claude_projects_dirs]
+    else:
+        projects_dirs = list(claude_projects_dirs)
+
     # cache.db may exist as an empty file (e.g. very-early bootstrap, or
     # the user has only ever opened it via paths that didn't run the
     # dispatcher). In that state the ``schema_migrations`` table doesn't
@@ -1773,19 +1783,27 @@ def _gate_001_post_ingest_completed(
     # ("no such table"). Treat this as Layer A failure — the marker is
     # absent because the table is absent — and defer the same way we
     # would for a present-but-empty table.
+    #
+    # Belt-and-suspenders on the error predicate: SQLite's
+    # ``"no such table"`` message has been stable for ~20 years, but we
+    # also check ``sqlite_errorcode == SQLITE_ERROR (1)`` (Python 3.11+;
+    # cctally's floor is 3.13 per ``__min_python_version__`` in
+    # bin/cctally) so a future message-format change doesn't
+    # silently re-raise. ``getattr(..., None) in (None, 1)`` lets the
+    # check degrade gracefully if the attribute is ever missing.
     try:
         gate_row = cache_ro.execute(
             "SELECT applied_at_utc FROM schema_migrations WHERE name = ?",
             ("001_dedup_highest_wins",),
         ).fetchone()
     except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc).lower():
-            raise MigrationGateNotMet(
-                "cache.db has no schema_migrations table yet; "
-                "run any JSONL-reading command (e.g. `cctally weekly`) "
-                "once to bootstrap the migration framework."
-            ) from None
-        raise
+        if not _is_no_such_table_error(exc):
+            raise
+        raise MigrationGateNotMet(
+            "cache.db has no schema_migrations table yet; "
+            "run any JSONL-reading command (e.g. `cctally weekly`) "
+            "once to bootstrap the migration framework."
+        ) from None
     if gate_row is None:
         raise MigrationGateNotMet(
             "cache.db migration 001_dedup_highest_wins not yet applied; "
@@ -1814,7 +1832,7 @@ def _gate_001_post_ingest_completed(
             (applied_at_utc,),
         ).fetchone() is not None
     except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc).lower():
+        if _is_no_such_table_error(exc):
             # cache.db has a schema_migrations table (Layer A passed) but
             # no session_files table. Equivalent to "no post-001 ingest
             # observed"; fall through to the Layer C empty-disk check.
@@ -1825,17 +1843,41 @@ def _gate_001_post_ingest_completed(
         return
 
     # Layer C — empty-disk fallback. If there are no JSONL files to
-    # ingest, the absence of session_files rows is the correct state.
-    # No-op succeed so users with no Claude usage can still pass the
-    # gate; downstream migrations are also no-ops in this case (no
-    # cost rows to recompute, no aggregates to refresh).
-    has_any_jsonl = any(claude_projects_dir.glob("**/*.jsonl"))
+    # ingest under ANY of the resolved projects dirs, the absence of
+    # session_files rows is the correct state. No-op succeed so users
+    # with no Claude usage can still pass the gate; downstream
+    # migrations are also no-ops in this case (no cost rows to
+    # recompute, no aggregates to refresh).
+    has_any_jsonl = any(
+        any(p.glob("**/*.jsonl")) for p in projects_dirs
+    )
     if not has_any_jsonl:
         return
 
     raise MigrationGateNotMet(
         "cache.db post-001 ingest not yet observed; run any JSONL-reading "
         "command (e.g. `cctally weekly`) once and retry."
+    )
+
+
+def _is_no_such_table_error(exc: sqlite3.OperationalError) -> bool:
+    """Return True iff ``exc`` is SQLite's "no such table" error.
+
+    Two-signal predicate to defend against future SQLite version drift
+    in the error-message format:
+
+      * Substring match on the lowercased message (stable for ~20 years).
+      * ``exc.sqlite_errorcode == SQLITE_ERROR (1)`` (Python 3.11+;
+        cctally's floor is 3.13 per ``__min_python_version__``). The
+        ``getattr(..., None) in (None, 1)`` form degrades gracefully if
+        the attribute is ever missing — substring-only on legacy Python.
+
+    Centralized so both Layer A and Layer B "table missing" paths share
+    the same predicate.
+    """
+    return (
+        "no such table" in str(exc).lower()
+        and getattr(exc, "sqlite_errorcode", None) in (None, 1)
     )
 
 
@@ -1934,6 +1976,12 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
 
     Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3.
     """
+    # Banner is gated on "we actually have rows to recompute". The
+    # all-empty no-op case (most upgrade-time fresh-install topologies,
+    # and most goldens with no snapshot rows) skips the banner so we
+    # don't pollute thousands of test goldens / per-command stderr with
+    # a benign one-line announcement. Heavy users with 52+ snapshots
+    # still see it once.
     cache_db_path = _cctally_core.CACHE_DB_PATH
     if not cache_db_path.exists():
         raise MigrationGateNotMet(
@@ -1942,9 +1990,16 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
         )
     cache_ro = sqlite3.connect(f"file:{cache_db_path}?mode=ro", uri=True)
     try:
-        _gate_001_post_ingest_completed(
-            cache_ro, _cctally_core.CLAUDE_PROJECTS_DIR,
-        )
+        # Resolve projects dirs at call time so ``CLAUDE_CONFIG_DIR``
+        # users (whose JSONL lives outside ``~/.claude/projects``) don't
+        # falsely trigger the gate's empty-disk fallback. Falls back to
+        # ``[_cctally_core.CLAUDE_PROJECTS_DIR]`` when the resolver returns
+        # an empty list (e.g. no projects/ dirs exist on disk yet) so the
+        # gate still does a defensive glob at the documented default.
+        projects_dirs = _cctally_core._resolve_claude_projects_dirs()
+        if not projects_dirs:
+            projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
+        _gate_001_post_ingest_completed(cache_ro, projects_dirs)
 
         # F3 scope: only rows we have authority over (see docstring).
         snapshot_rows = conn.execute(
@@ -1952,6 +2007,18 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
             "FROM weekly_cost_snapshots "
             "WHERE mode = 'auto' AND project IS NULL"
         ).fetchall()
+
+        # Banner gated on "we actually have eligible rows to recompute".
+        # Empty-snapshot topologies (most goldens, fresh-install
+        # upgrades that hit this migration before any sync-week) skip
+        # the announcement so test goldens / one-shot CLI invocations
+        # stay quiet. Heavy users (52+ weekly snapshots) still see it.
+        if snapshot_rows:
+            eprint(
+                "[cctally] Recomputing weekly_cost_snapshots from "
+                "corrected session_entries (one-time; may take 30-60s "
+                "on heavy histories)..."
+            )
 
         conn.execute("BEGIN")
         try:
