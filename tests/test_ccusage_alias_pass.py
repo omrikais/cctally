@@ -243,6 +243,8 @@ CODEX_CMDS = ["codex-daily", "codex-monthly", "codex-weekly", "codex-session"]
 # parsers by accident, which the closing paragraph of spec §2 explicitly
 # forbids.
 SESSION_A_CLAUDE_ONLY_FLAGS = [
+    "-d",
+    "--debug",
     "--debug-samples",
     "--single-thread",
     "--config",
@@ -305,10 +307,10 @@ def test_codex_does_not_carry_claude_only_session_a_flags(cmd, flag, fake_home):
     (or `_add_codex_shared_args` was extended with the Session A
     Claude-side surface — a scope violation).
     """
-    r = _run(cmd, flag, "5" if flag == "--debug-samples" else "")
     # The flag must be rejected as an unknown argument (returncode 2,
-    # "unrecognized arguments" in stderr). We trim the empty trailing
-    # arg for flags that don't take a value.
+    # "unrecognized arguments" in stderr). Some Session A flags take
+    # a value; supply one so the assertion is "rejected as unknown"
+    # rather than "rejected for missing argument".
     args = [cmd, flag]
     if flag == "--debug-samples":
         args.append("5")
