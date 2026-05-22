@@ -2283,11 +2283,15 @@ def _render_claude_session_table(
         term_width = int(os.environ.get("COLUMNS", "120"))
 
     border_overhead = 3 * num_cols + 1
-    # Session A (spec \u00a77.6.1; Review-A P2-B): ``compact`` forces the
-    # proportional scale-down branch regardless of terminal width.
-    # Mirrors ``_render_codex_session_table`` (line ~2027); auto-detected
-    # width overflow continues to trigger the same path.
-    if compact or (sum(col_widths) + border_overhead > term_width):
+    # Session A (spec \u00a77.6.1; Review-A P2-B): the scale-down branch
+    # fires ONLY under explicit ``compact=True``. Pre-Session-A
+    # ``_render_claude_session_table`` had no auto-overflow branch
+    # (wide-by-default was the existing contract; 6 golden fixtures
+    # in tests/fixtures/session/ encode that contract). The
+    # Cross-Branch Reviewer flagged the gratuitous auto-detect arm
+    # added in fdfee047; this restores the pre-Session-A behavior
+    # while preserving the explicit-compact override.
+    if compact:
         available = term_width - border_overhead
         total_col = sum(col_widths)
         scale = available / total_col if total_col > 0 else 1.0
