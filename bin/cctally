@@ -667,11 +667,15 @@ _saved_dict_from_usage_row = _cctally_record._saved_dict_from_usage_row
 # the ``c = _cctally()`` accessor at call time so
 # ``setitem(ns, "_do_update_check", mock)`` propagates into
 # ``cmd_update_check_internal`` / ``_DashboardUpdateCheckThread.run``.
-# Path constants stay in bin/cctally (defined at L2001-2023 right after
-# APP_DIR) — moved bodies read them via ``c.UPDATE_STATE_PATH`` etc. so
-# ``setitem(ns, "UPDATE_LOG_PATH", tmp)`` in tests propagates with zero
-# sibling-side patches needed (same as Phase D #17/#18 path-constant
-# precedent).
+# Path constants (UPDATE_STATE_PATH, UPDATE_SUPPRESS_PATH,
+# UPDATE_LOCK_PATH, UPDATE_LOG_PATH, UPDATE_LOG_ROTATED_PATH,
+# UPDATE_CHECK_LAST_FETCH_PATH) were promoted to _cctally_core
+# 2026-05-22 (#84). Moved bodies in _cctally_update read them via
+# call-time ``_cctally_core.UPDATE_STATE_PATH`` etc.; tests patch via
+# ``monkeypatch.setattr(_cctally_core, "X", v)`` (the conftest
+# ``redirect_paths()`` helper covers the full set). The legacy
+# ``setitem(ns, …)`` pattern is forbidden by
+# ``test_no_old_style_test_patches_for_promoted_globals``.
 _cctally_update = _load_sibling("_cctally_update")
 UpdateError = _cctally_update.UpdateError
 UpdateValidationError = _cctally_update.UpdateValidationError
@@ -851,21 +855,11 @@ CODEX_SESSIONS_DIR = pathlib.Path.home() / ".codex" / "sessions"
 # single source of truth, and `monkeypatch.setattr(_cctally_core, "X",
 # v)` propagates into every reader without a sibling-side mirror.
 #
-# Note: `_cctally_cache.py` does NOT need a path-constant seed block
-# parallel to `_cctally_db` above — its moved bodies reach
-# `APP_DIR` / `CACHE_DB_PATH` / `CACHE_LOCK_PATH` /
-# `CACHE_LOCK_CODEX_PATH` / `CODEX_SESSIONS_DIR` via the
-# `c = _cctally()` call-time accessor (spec §5.5). That defers every
-# read until call-time `sys.modules['cctally'].X`, so
-# `monkeypatch.setitem(ns, "CACHE_DB_PATH", tmp)` test patches and
-# conftest `redirect_paths` HOME redirects propagate without
-# touching any sibling-side seeded copy. We chose `c.X` over the
-# `_cctally_db`-style seed block here because cache test sites are
-# widely scattered (record-usage tick, dashboard panels, share
-# render kernel, block tests, every JSONL-reading subcommand
-# fixture) — inline patches against ns by setitem are the
-# established idiom, and the c.X path keeps them all working with
-# zero test-file edits.
+# Note: `_cctally_cache.py` reaches `APP_DIR` / `CACHE_DB_PATH` /
+# `CACHE_LOCK_PATH` / `CACHE_LOCK_CODEX_PATH` via call-time
+# `_cctally_core.X` (promoted 2026-05-22, #84). Only `CODEX_SESSIONS_DIR`
+# is out of scope for #84 — that one is still read via the
+# `c = _cctally()` accessor and lives in this file.
 
 # === Update subcommand (Section 1 of update-subcommand spec) ===
 # Non-path constants for the `cctally update` feature. Path constants

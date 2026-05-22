@@ -64,11 +64,12 @@ def _cctally():
 
 
 # === Honest imports from extracted homes ===================================
-# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
-# import from _cctally_core. Path constants (`APP_DIR`,
-# `CLAUDE_SETTINGS_PATH`, `HOOK_TICK_LOG_PATH`) plus the extensive
-# out-of-scope setup-specific helpers (legacy migration, hook surgery,
-# OAuth token, sync_cache, …) stay on the _cctally() accessor.
+# Spec 2026-05-17 §3.3: kernel symbols import from _cctally_core. Path
+# constants (APP_DIR, CLAUDE_SETTINGS_PATH, HOOK_TICK_LOG_PATH, etc.)
+# moved to _cctally_core 2026-05-22 (#84) and are accessed via call-time
+# ``_cctally_core.X``. The setup-specific helpers (legacy migration, hook
+# surgery, OAuth token, sync_cache, …) that live in bin/cctally itself
+# stay on the _cctally() accessor.
 import _cctally_core
 from _cctally_core import (
     eprint,

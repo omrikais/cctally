@@ -74,20 +74,19 @@ _build_alert_payload_five_hour = _lib_alerts_payload._build_alert_payload_five_h
 
 
 # === Honest imports from extracted homes ===================================
-# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
-# import from _cctally_core. `LOG_DIR` stays on the _cctally() accessor
-# per Q1=B (path constants propagate via monkeypatch.setitem against the
-# cctally namespace).
+# Spec 2026-05-17 §3.3: kernel symbols import from _cctally_core.
+# LOG_DIR was promoted to _cctally_core 2026-05-22 (#84) and is read
+# via call-time module-attribute access (this sibling no longer needs
+# the historical _cctally() accessor).
 from _cctally_core import now_utc_iso
 
 
 def _alerts_log_path() -> "pathlib.Path":
     """Return ``~/.local/share/cctally/logs/alerts.log`` (parent dirs created).
 
-    Resolves through the same ``APP_DIR`` / ``LOG_DIR`` derived at module
-    import time from ``Path.home()``, so a HOME override before import (the
-    pattern used elsewhere in this codebase — e.g. ``cctally-config-test``)
-    transparently relocates the log without a separate env-var convention.
+    Reads ``LOG_DIR`` from ``_cctally_core`` at call time. Tests patch via
+    ``monkeypatch.setattr(_cctally_core, "LOG_DIR", tmp)`` (or the
+    conftest ``redirect_paths()`` helper).
     """
     log_dir = _cctally_core.LOG_DIR
     log_dir.mkdir(parents=True, exist_ok=True)

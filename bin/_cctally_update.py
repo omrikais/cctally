@@ -102,12 +102,19 @@ worker / polling thread:
   accessor; eager re-export from this sibling means the cctally
   namespace exposes them unchanged.
 
+What lives in bin/_cctally_core (promoted 2026-05-22, #84):
+- All ``UPDATE_*`` path constants: ``UPDATE_STATE_PATH``,
+  ``UPDATE_SUPPRESS_PATH``, ``UPDATE_LOCK_PATH``, ``UPDATE_LOG_PATH``,
+  ``UPDATE_LOG_ROTATED_PATH``, ``UPDATE_CHECK_LAST_FETCH_PATH``.
+  Moved bodies in this sibling read them via call-time
+  ``_cctally_core.UPDATE_STATE_PATH`` etc. Tests patch via
+  ``monkeypatch.setattr(_cctally_core, "UPDATE_STATE_PATH", tmp)`` —
+  the conftest helper ``redirect_paths()`` covers this for the full
+  set, ``tests/test_update.py:update_paths`` covers it for the
+  UPDATE_* subset. The legacy ``setitem(ns, …)`` pattern is forbidden
+  by ``test_no_old_style_test_patches_for_promoted_globals``.
+
 What stays in bin/cctally:
-- All ``UPDATE_*`` path constants (source-of-truth at L2001-2023);
-  consumed via ``c = _cctally(); _cctally_core.UPDATE_STATE_PATH`` etc. in moved
-  code so ``monkeypatch.setitem(ns, "UPDATE_STATE_PATH", tmp)`` in
-  ``tests/test_update.py`` propagates transparently — no sibling-side
-  patches needed. Mirrors Phase D #17/#18 precedent.
 - ``ORIGINAL_SYS_ARGV`` / ``ORIGINAL_ENTRYPOINT`` /
   ``_UPDATE_WORKER`` — module-level globals written by
   ``cmd_dashboard`` at boot (``global`` statement at L23205);

@@ -41,21 +41,18 @@ Holds:
 - ``cmd_cache_sync`` — entry point for ``cctally cache-sync
   [--source {claude,codex,all}] [--rebuild]``.
 
-What stays in bin/cctally:
+What lives in bin/_cctally_core (promoted 2026-05-22, #84):
 - Path constants ``APP_DIR``, ``CACHE_DB_PATH``, ``CACHE_LOCK_PATH``,
-  ``CACHE_LOCK_CODEX_PATH``, ``CODEX_SESSIONS_DIR`` — referenced from
-  the moved bodies via the ``c = _cctally()`` call-time accessor
-  pattern (spec §5.5, same as ``bin/_lib_subscription_weeks.py`` and
-  ``bin/_lib_aggregators.py``). The accessor resolves
-  ``sys.modules['cctally'].X`` on every call, so
-  ``monkeypatch.setitem(ns, "CACHE_DB_PATH", tmp)`` and conftest
-  ``redirect_paths`` HOME redirects propagate transparently with NO
-  test-side changes (tests already patch ``ns["CACHE_DB_PATH"]`` etc.
-  by setitem on the dict-as-module bridge). We chose ``c.X`` over the
-  ``_cctally_db.py``-style seed block here because cache tests are
-  widely scattered (record-usage tick, dashboard panels, share render
-  kernel, block tests, every JSONL-reading subcommand fixture) and
-  Phase C-style inline patching would touch dozens of sites.
+  ``CACHE_LOCK_CODEX_PATH``. Moved bodies read these via call-time
+  ``_cctally_core.X`` and tests patch via
+  ``monkeypatch.setattr(_cctally_core, "X", v)`` (or the conftest
+  ``redirect_paths()`` helper). The legacy
+  ``setitem(ns, "CACHE_DB_PATH", …)`` pattern is forbidden by
+  ``test_no_old_style_test_patches_for_promoted_globals``.
+
+What stays in bin/cctally:
+- ``CODEX_SESSIONS_DIR`` — out of scope for #84; still read via the
+  ``c = _cctally()`` call-time accessor (spec §5.5).
 - ``_sum_cost_for_range`` — sits at the cache↔report boundary; 6+
   callers outside cache (forecast, weekly, report, project, doctor),
   so the directive keeps it on the bin/cctally side.
@@ -176,11 +173,12 @@ _CACHE_MIGRATIONS = _cctally_db_sib._CACHE_MIGRATIONS
 
 
 # === BEGIN MOVED REGIONS ===
-# Path constants (APP_DIR, CACHE_DB_PATH, CACHE_LOCK_PATH,
-# CACHE_LOCK_CODEX_PATH, CODEX_SESSIONS_DIR) are accessed via the
-# `c = _cctally()` call-time accessor inside each function that
-# needs them — so ``monkeypatch.setitem(ns, "CACHE_DB_PATH", tmp)``
-# in tests resolves on every read (no stale module-level binding).
+# Path constants APP_DIR / CACHE_DB_PATH / CACHE_LOCK_PATH /
+# CACHE_LOCK_CODEX_PATH live in _cctally_core (promoted 2026-05-22, #84);
+# moved bodies read them via call-time ``_cctally_core.X`` and tests
+# patch via ``monkeypatch.setattr(_cctally_core, "X", v)``.
+# CODEX_SESSIONS_DIR stays in bin/cctally (out of scope for #84) and is
+# still accessed via the ``c = _cctally()`` call-time accessor.
 
 # === Region 1: ProjectKey + _resolve_project_key (was bin/cctally:1994-2069) ===
 

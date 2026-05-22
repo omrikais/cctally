@@ -9,25 +9,31 @@ predicate, `sync-week`, …) all resolve unchanged. Tests that mock
 work because Python's bare-name lookup inside non-extracted bin/cctally
 callers resolves in bin/cctally's namespace (where the re-export lives).
 
+What lives in bin/_cctally_core (promoted 2026-05-22, #84):
+  - ``CONFIG_PATH`` / ``CONFIG_LOCK_PATH`` path constants. Reads use
+    call-time ``_cctally_core.CONFIG_PATH`` / ``_cctally_core.CONFIG_LOCK_PATH``;
+    tests patch via ``monkeypatch.setattr(_cctally_core, "X", v)`` (or
+    the conftest ``redirect_paths()`` helper). The legacy
+    ``setitem(ns, "CONFIG_PATH", …)`` pattern is forbidden by
+    ``test_no_old_style_test_patches_for_promoted_globals``.
+
 What stays in bin/cctally:
   - ``_ALERTS_BAD_CONFIG_WARNED`` + ``_warn_alerts_bad_config_once`` —
     alerts-coupled warn-once flag/helper; the alerts-config readers
     (``_get_alerts_config`` / ``_AlertsConfigError``) still live in
     bin/cctally and these two travel with that block.
-  - ``CONFIG_PATH`` / ``CONFIG_LOCK_PATH`` path constants (spec §86–92
-    keeps every path constant in bin/cctally so monkeypatched
-    `cctally.CONFIG_PATH = …` redirects propagate everywhere).
   - ``eprint`` / ``ensure_dirs`` / ``DEFAULT_WEEK_START`` ubiquitous
     helpers/constants.
-  - All validator/normalizer primitives (``normalize_display_tz_value``,
-    ``_get_alerts_config``, ``_AlertsConfigError``,
-    ``_normalize_alerts_enabled_value``, ``_validate_dashboard_bind_value``,
+  - Non-path validator/normalizer primitives
+    (``_normalize_alerts_enabled_value``, ``_validate_dashboard_bind_value``,
     ``_normalize_update_check_enabled_value``,
     ``_validate_update_check_ttl_hours_value``,
     ``UPDATE_DEFAULT_TTL_HOURS``, ``get_display_tz_pref``) — these stay
     near the subsystem they belong to; we reach them via the
     ``_cctally()`` accessor (call-time lookup so test monkeypatches on
     bin/cctally's namespace still propagate, per spec §5.2).
+    (``normalize_display_tz_value`` imports directly from
+    ``_lib_display_tz`` — see the import block below.)
 
 Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 """
@@ -49,14 +55,16 @@ def _cctally():
 
 
 # === Honest imports from extracted homes ===================================
-# Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
-# import from _cctally_core; the Bucket-X helper `normalize_display_tz_value`
-# imports from `_lib_display_tz`. Path constants (`CONFIG_PATH`,
-# `CONFIG_LOCK_PATH`) plus out-of-scope validators
-# (`_normalize_alerts_enabled_value`, `_validate_dashboard_bind_value`,
-# `_validate_update_check_ttl_hours_value`, `_normalize_update_check_enabled_value`,
-# `get_display_tz_pref`, `UPDATE_DEFAULT_TTL_HOURS`) stay on the
-# _cctally() accessor.
+# Spec 2026-05-17 §3.3: kernel symbols import from _cctally_core; the
+# Bucket-X helper ``normalize_display_tz_value`` imports from
+# ``_lib_display_tz``. Path constants (``CONFIG_PATH``,
+# ``CONFIG_LOCK_PATH``) moved to _cctally_core 2026-05-22 (#84) and are
+# read via call-time ``_cctally_core.CONFIG_PATH`` etc. The out-of-scope
+# non-path validators (``_normalize_alerts_enabled_value``,
+# ``_validate_dashboard_bind_value``,
+# ``_validate_update_check_ttl_hours_value``,
+# ``_normalize_update_check_enabled_value``, ``get_display_tz_pref``,
+# ``UPDATE_DEFAULT_TTL_HOURS``) stay on the _cctally() accessor.
 import _cctally_core
 from _cctally_core import (
     eprint,

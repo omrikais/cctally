@@ -21,6 +21,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import _cctally_core
+
 
 # --- Panel set ---
 #
@@ -301,7 +303,6 @@ def _release_version() -> str:
     duplicated so the template module stays free of any
     ``bin/cctally`` import. If CHANGELOG header format changes, update both.
     """
-    import _cctally_core
     path = _cctally_core.CHANGELOG_PATH
     try:
         for line in path.read_text(encoding="utf-8").splitlines():

@@ -313,18 +313,17 @@ _logged_window_key_coerce_failure = False
 
 
 # === BEGIN MOVED REGIONS ===
-# Path constants (APP_DIR, HOOK_TICK_*) are accessed via the
-# `c = _cctally()` call-time accessor inside each function that needs
-# them — so ``monkeypatch.setitem(ns, "APP_DIR", tmp)`` in tests
-# resolves on every read (no stale module-level binding).
+# Path constants (APP_DIR, HOOK_TICK_*) moved to _cctally_core
+# 2026-05-22 (#84). Reads use call-time ``_cctally_core.X``; tests
+# patch via ``monkeypatch.setattr(_cctally_core, "X", v)``.
 #
-# Constants pulled from cctally at call time:
-#   c._FIVE_HOUR_JITTER_FLOOR_SECONDS — _lib_five_hour.* re-export
-#   c._RESET_PCT_DROP_THRESHOLD       — bin/cctally module-level constant
+# Constants pulled at call time:
+#   _cctally_core.APP_DIR
 #   _cctally_core.HOOK_TICK_LOG_DIR / _PATH / _ROTATED_PATH / _ROTATE_BYTES
 #   _cctally_core.HOOK_TICK_THROTTLE_PATH / _LOCK_PATH
+#   c._FIVE_HOUR_JITTER_FLOOR_SECONDS — _lib_five_hour.* re-export
+#   c._RESET_PCT_DROP_THRESHOLD       — bin/cctally module-level constant
 #   c.HOOK_TICK_DEFAULT_THROTTLE_SECONDS
-#   _cctally_core.APP_DIR
 
 
 def _normalize_percent(value: "float | int | None") -> "float | None":
