@@ -256,6 +256,7 @@ def _cctally():
 # import from _cctally_core; already-decentralized buckets (X = _lib_*,
 # Y = _cctally_*) import from their natural home. These bypass the
 # legacy shim pattern entirely.
+import _cctally_core
 from _cctally_core import (
     eprint,
     now_utc_iso,
@@ -6548,7 +6549,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 c = _cctally()
                 conn.execute(
                     "ATTACH DATABASE ? AS cache_db",
-                    (str(c.CACHE_DB_PATH),),
+                    (str(_cctally_core.CACHE_DB_PATH),),
                 )
                 conn.execute(
                     "CREATE TEMP VIEW IF NOT EXISTS session_entries AS "

@@ -69,6 +69,7 @@ def _cctally():
 # `CLAUDE_SETTINGS_PATH`, `HOOK_TICK_LOG_PATH`) plus the extensive
 # out-of-scope setup-specific helpers (legacy migration, hook surgery,
 # OAuth token, sync_cache, …) stay on the _cctally() accessor.
+import _cctally_core
 from _cctally_core import (
     eprint,
     _command_as_of,
@@ -863,7 +864,7 @@ def _setup_count_hook_entries(settings: dict) -> dict[str, int]:
 
 
 def _setup_data_dir_size_bytes() -> int:
-    app_dir = _cctally().APP_DIR
+    app_dir = _cctally_core.APP_DIR
     total = 0
     if not app_dir.exists():
         return 0
@@ -891,7 +892,7 @@ def _setup_recent_log_stats(seconds: float = 24 * 3600) -> dict:
     counts = {"fires": 0, "by_event": {}, "oauth_ok": 0, "throttled": 0,
               "errors": 0, "last_fire_ago_s": None}
     last_ts = 0.0
-    for path in (c.HOOK_TICK_LOG_ROTATED_PATH, c.HOOK_TICK_LOG_PATH):
+    for path in (_cctally_core.HOOK_TICK_LOG_ROTATED_PATH, _cctally_core.HOOK_TICK_LOG_PATH):
         if not path.exists():
             continue
         try:
@@ -1041,7 +1042,7 @@ def _setup_status(args: argparse.Namespace) -> int:
                     "files": bespoke["files"],
                 },
             },
-            "data": {"path": str(c.APP_DIR), "size_bytes": data_bytes},
+            "data": {"path": str(_cctally_core.APP_DIR), "size_bytes": data_bytes},
         }
         print(json.dumps(envelope, indent=2))
         return 0
@@ -1057,7 +1058,7 @@ def _setup_status(args: argparse.Namespace) -> int:
         out.append("                 run `cctally setup` to remove")
     out.append(f"  PATH includes  {'yes' if on_path else 'no'}                                   "
                f"{'✓' if on_path else '⚠'}")
-    out.append(f"Hooks ({c.CLAUDE_SETTINGS_PATH})")
+    out.append(f"Hooks ({_cctally_core.CLAUDE_SETTINGS_PATH})")
     for ev in c.SETUP_HOOK_EVENTS:
         marker = "✓" if hook_counts[ev] >= 1 else "✗"
         word = "installed" if hook_counts[ev] >= 1 else "missing"
@@ -1093,7 +1094,7 @@ def _setup_status(args: argparse.Namespace) -> int:
         )
         out.append("                       run `cctally setup --migrate-legacy-hooks` to migrate")
     out.append("Data")
-    out.append(f"  {c.APP_DIR}/    {_setup_format_bytes(data_bytes)}")
+    out.append(f"  {_cctally_core.APP_DIR}/    {_setup_format_bytes(data_bytes)}")
     _setup_emit_text(out)
     return 0
 
@@ -1115,9 +1116,9 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
         try:
             c._write_claude_settings_atomic(settings)
         except OSError as exc:
-            eprint(f"setup: failed to write {c.CLAUDE_SETTINGS_PATH}: {exc}")
+            eprint(f"setup: failed to write {_cctally_core.CLAUDE_SETTINGS_PATH}: {exc}")
             return 2
-    out.append(f"Removed {removed} hook entries from {c.CLAUDE_SETTINGS_PATH}")
+    out.append(f"Removed {removed} hook entries from {_cctally_core.CLAUDE_SETTINGS_PATH}")
 
     repo_root = _setup_resolve_repo_root()
     dst_dir = _setup_local_bin_dir()
@@ -1201,7 +1202,7 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
                     "hooks_removed": removed,
                     "symlinks_removed": sym_removed,
                     "purged": False,
-                    "data_path": str(c.APP_DIR),
+                    "data_path": str(_cctally_core.APP_DIR),
                     "data_size_bytes": data_bytes,
                     "legacy": {
                         "statusline_snippet_path": str(legacy[0]) if legacy else None,
@@ -1213,7 +1214,7 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
                 try:
                     resp = input(
                         f"Wipe {_setup_format_bytes(data_bytes)} of usage history at "
-                        f"{c.APP_DIR}/? [y/N] "
+                        f"{_cctally_core.APP_DIR}/? [y/N] "
                     )
                 except EOFError:
                     resp = "n"
@@ -1221,10 +1222,10 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
                     out.append("Purge declined.")
                     _setup_emit_text(out)
                     return 3
-        if c.APP_DIR.exists():
+        if _cctally_core.APP_DIR.exists():
             try:
-                shutil.rmtree(c.APP_DIR)
-                out.append(f"Wiped {c.APP_DIR}/")
+                shutil.rmtree(_cctally_core.APP_DIR)
+                out.append(f"Wiped {_cctally_core.APP_DIR}/")
             except OSError as exc:
                 if is_json:
                     print(json.dumps({
@@ -1233,7 +1234,7 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
                         "result": "err",
                         "reason": "rmtree_failed",
                         "error": str(exc),
-                        "data_path": str(c.APP_DIR),
+                        "data_path": str(_cctally_core.APP_DIR),
                         "data_size_bytes": data_bytes,
                         "legacy": {
                             "statusline_snippet_path": str(legacy[0]) if legacy else None,
@@ -1241,11 +1242,11 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
                         "exit_code": 1,
                     }, indent=2))
                 else:
-                    eprint(f"setup: failed to wipe {c.APP_DIR}: {exc}")
+                    eprint(f"setup: failed to wipe {_cctally_core.APP_DIR}: {exc}")
                 return 1
     else:
         out.append(
-            f"Note: usage history kept at {c.APP_DIR}/ "
+            f"Note: usage history kept at {_cctally_core.APP_DIR}/ "
             f"({_setup_format_bytes(data_bytes)}). Use --purge to remove."
         )
     if is_json:
@@ -1256,7 +1257,7 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
             "hooks_removed": removed,
             "symlinks_removed": sym_removed,
             "purged": purge,
-            "data_path": str(c.APP_DIR),
+            "data_path": str(_cctally_core.APP_DIR),
             "data_size_bytes": data_bytes,
             "legacy": {
                 "statusline_snippet_path": str(legacy[0]) if legacy else None,
@@ -1305,7 +1306,7 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
         out.append(f"⚠ Blocked (non-symlink files exist): {', '.join(blocked)}")
         out.append("  Remove them manually then re-run.")
 
-    out.append(f"Would add {len(c.SETUP_HOOK_EVENTS)} hook entries to {c.CLAUDE_SETTINGS_PATH}:")
+    out.append(f"Would add {len(c.SETUP_HOOK_EVENTS)} hook entries to {_cctally_core.CLAUDE_SETTINGS_PATH}:")
     abs_path = str(_setup_resolve_hook_target(repo_root))
     import shlex
     quoted = shlex.quote(abs_path)
@@ -1391,7 +1392,7 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
                     }
                     for ev in c.SETUP_HOOK_EVENTS
                 ],
-                "settings_path": str(c.CLAUDE_SETTINGS_PATH),
+                "settings_path": str(_cctally_core.CLAUDE_SETTINGS_PATH),
             },
             # Sibling parity with `_setup_status` and `_setup_install`
             # JSON envelopes (`legacy.bespoke_hooks` shape). Lets the same
@@ -1614,7 +1615,7 @@ def _setup_install(args: argparse.Namespace) -> int:
     try:
         c._write_claude_settings_atomic(settings)
     except OSError as exc:
-        eprint(f"setup: failed to write {c.CLAUDE_SETTINGS_PATH}: {exc}")
+        eprint(f"setup: failed to write {_cctally_core.CLAUDE_SETTINGS_PATH}: {exc}")
         return 2
 
     # ── Post-write migration apply (spec §2 steps 6a, 6b) ──
@@ -1674,7 +1675,7 @@ def _setup_install(args: argparse.Namespace) -> int:
     # The "✓ Wrote …" line follows any migrate-summary line so the
     # narrative reads "we did the migration, then wrote the new entries"
     # — matches the spec's success-path sample (Section 2).
-    out.append(f"✓ Wrote {len(c.SETUP_HOOK_EVENTS)} hook entries to {c.CLAUDE_SETTINGS_PATH}")
+    out.append(f"✓ Wrote {len(c.SETUP_HOOK_EVENTS)} hook entries to {_cctally_core.CLAUDE_SETTINGS_PATH}")
 
     if decision == "skip" and reason in {"user_declined", "no_migrate_flag"}:
         files_str = "{record-usage-stop,usage-poller{,-start,-stop}}.py"
@@ -1773,7 +1774,7 @@ def _setup_install(args: argparse.Namespace) -> int:
             },
             "hooks": {
                 "events_added": list(c.SETUP_HOOK_EVENTS),
-                "settings_path": str(c.CLAUDE_SETTINGS_PATH),
+                "settings_path": str(_cctally_core.CLAUDE_SETTINGS_PATH),
             },
             "auth": {
                 "oauth_token_present": oauth,

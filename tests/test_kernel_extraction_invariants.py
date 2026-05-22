@@ -120,3 +120,185 @@ def test_moved_symbols_not_defined_in_cctally():
         "Moved kernel symbols still have local def/class in bin/cctally "
         "(should be re-exports only): " + ", ".join(sorted(set(matches)))
     )
+
+
+# ============================================================================
+# Issue #84 — data-globals promotion regression guards (2026-05-22)
+# ============================================================================
+#
+# These assertions lock the invariants from the data-globals promotion. After
+# #84, the 22 in-scope path constants live in _cctally_core. Every sibling and
+# bin/cctally itself reads via `_cctally_core.X` at call time; tests
+# monkeypatch via `setattr(_cctally_core, "X", v)`. The four guards below
+# catch the four ways a future commit could silently break this:
+#
+#   1. test_promoted_globals_live_in_core            — kernel forgets a name
+#   2. test_no_sibling_accessor_reads_promoted       — sibling still uses c.X
+#   3. test_no_old_style_test_patches_for_promoted   — test still uses setitem(ns,)
+#   4. test_no_value_imports_of_promoted_in_siblings — sibling snapshots via `from`
+
+PROMOTED_GLOBALS = frozenset((
+    "APP_DIR", "LEGACY_APP_DIR", "LOG_DIR",
+    "DB_PATH", "CACHE_DB_PATH",
+    "CACHE_LOCK_PATH", "CACHE_LOCK_CODEX_PATH", "CONFIG_LOCK_PATH",
+    "CONFIG_PATH",
+    "MIGRATION_ERROR_LOG_PATH",
+    "CHANGELOG_PATH",
+    "HOOK_TICK_LOG_DIR", "HOOK_TICK_LOG_PATH", "HOOK_TICK_LOG_ROTATED_PATH",
+    "HOOK_TICK_THROTTLE_PATH", "HOOK_TICK_THROTTLE_LOCK_PATH",
+    "UPDATE_STATE_PATH", "UPDATE_SUPPRESS_PATH",
+    "UPDATE_LOCK_PATH", "UPDATE_LOG_PATH", "UPDATE_LOG_ROTATED_PATH",
+    "UPDATE_CHECK_LAST_FETCH_PATH",
+    "CLAUDE_SETTINGS_PATH",
+))
+
+
+def test_promoted_globals_live_in_core():
+    """Every PROMOTED_GLOBALS name is module-level in _cctally_core.
+
+    Populated by `_init_paths_from_env()`; tested via direct attribute access
+    on the imported module (the `None` sentinel assignments before the
+    `_init_paths_from_env()` call make the names exist as attributes even if
+    the env-driven init were skipped).
+    """
+    import importlib
+    import sys
+    sys.path.insert(0, str(BIN))
+    try:
+        core = importlib.import_module("_cctally_core")
+        missing = sorted(name for name in PROMOTED_GLOBALS if not hasattr(core, name))
+    finally:
+        if str(BIN) in sys.path:
+            sys.path.remove(str(BIN))
+    assert not missing, f"PROMOTED_GLOBALS missing from _cctally_core: {missing}"
+
+
+def test_no_sibling_accessor_reads_promoted_globals():
+    """No `c.<PROMOTED>` or `_cctally().<PROMOTED>` in any bin/_*.py.
+
+    `_cctally_core.py` itself is exempt — it reads its own globals via bare
+    names (e.g. `APP_DIR.mkdir(...)`), which is the correct pattern inside a
+    module's own namespace.
+    """
+    import ast
+    bad = []
+    for path in sorted(BIN.glob("_*.py")):
+        if path.name == "_cctally_core.py":
+            continue
+        text = path.read_text()
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            cctally_vars = set()
+            for sub in ast.walk(func):
+                if (isinstance(sub, ast.Assign)
+                    and isinstance(sub.value, ast.Call)
+                    and isinstance(sub.value.func, ast.Name)
+                    and sub.value.func.id == "_cctally"):
+                    for target in sub.targets:
+                        if isinstance(target, ast.Name):
+                            cctally_vars.add(target.id)
+            for sub in ast.walk(func):
+                if isinstance(sub, ast.Attribute):
+                    if (isinstance(sub.value, ast.Name)
+                        and sub.value.id in cctally_vars
+                        and sub.attr in PROMOTED_GLOBALS):
+                        bad.append(f"{path.name}:{sub.lineno}: c.{sub.attr}")
+                    if (isinstance(sub.value, ast.Call)
+                        and isinstance(sub.value.func, ast.Name)
+                        and sub.value.func.id == "_cctally"
+                        and sub.attr in PROMOTED_GLOBALS):
+                        bad.append(f"{path.name}:{sub.lineno}: _cctally().{sub.attr}")
+    assert not bad, (
+        "Sibling accessor reads of promoted globals (use `_cctally_core.X` "
+        "instead):\n" + "\n".join(bad)
+    )
+
+
+def test_no_old_style_test_patches_for_promoted_globals():
+    """No `setitem(ns, "<PROMOTED>", …)` / `setattr(cctally, "<PROMOTED>", …)`
+    in any tests/test_*.py.
+
+    Test files MUST patch via `monkeypatch.setattr(_cctally_core, "X", v)`.
+    Conftest.py is exempt: it mirrors the kernel patch into `ns` for tests
+    that *read* `ns["X"]` for introspection (NOT a second patch surface).
+    """
+    import ast
+    bad = []
+    test_root = Path(__file__).resolve().parent
+    for path in sorted(test_root.rglob("test_*.py")):
+        text = path.read_text()
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "monkeypatch"):
+                continue
+            method = node.func.attr
+            if method not in ("setitem", "setattr"):
+                continue
+            if len(node.args) < 2:
+                continue
+            first_arg = node.args[0]
+            second_arg = node.args[1]
+            if not (isinstance(second_arg, ast.Constant)
+                    and isinstance(second_arg.value, str)):
+                continue
+            name = second_arg.value
+            if name not in PROMOTED_GLOBALS:
+                continue
+            forbidden = False
+            if method == "setitem" and isinstance(first_arg, ast.Name):
+                if first_arg.id in ("ns", "cctally_module_dict"):
+                    forbidden = True
+            elif method == "setattr" and isinstance(first_arg, ast.Name):
+                if first_arg.id == "cctally":
+                    forbidden = True
+            if forbidden:
+                target = first_arg.id if isinstance(first_arg, ast.Name) else "?"
+                bad.append(
+                    f"{path.name}:{node.lineno}: monkeypatch.{method}({target}, "
+                    f"\"{name}\", …) — use monkeypatch.setattr(_cctally_core, ...) instead"
+                )
+    assert not bad, (
+        "Old-style monkeypatch sites for promoted globals (forbidden):\n"
+        + "\n".join(bad)
+    )
+
+
+def test_no_value_imports_of_promoted_globals_in_siblings():
+    """No `from _cctally_core import <PROMOTED>` in any bin/_*.py except core.
+
+    Value-import snapshots the module attribute at sibling-load time and
+    breaks `monkeypatch.setattr(_cctally_core, "X", v)` propagation: the
+    sibling's local binding is unchanged. Module-attr access (`_cctally_core.X`)
+    or bare-name reads (inside core itself) are the supported patterns.
+    """
+    import ast
+    bad = []
+    for path in sorted(BIN.glob("_*.py")):
+        if path.name == "_cctally_core.py":
+            continue
+        text = path.read_text()
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "_cctally_core":
+                for alias in node.names:
+                    if alias.name in PROMOTED_GLOBALS:
+                        bad.append(f"{path.name}:{node.lineno}: from _cctally_core import {alias.name}")
+    assert not bad, (
+        "Value imports of promoted globals (would snapshot at module-load — "
+        "use `_cctally_core.X` at call time instead):\n" + "\n".join(bad)
+    )

@@ -10,15 +10,23 @@ import pytest
 
 # conftest.load_script imports the main script as a module-like namespace.
 from conftest import load_script  # type: ignore[import-untyped]
+import _cctally_core
 
 
 def _patched_dirs(monkeypatch, tmp_path):
-    """Set up tmp legacy + new dirs and monkeypatch the script's constants."""
+    """Set up tmp legacy + new dirs and monkeypatch the script's constants.
+
+    Post 2026-05-22 (#84): `_cctally_core` is the canonical home, but
+    `_migrate_legacy_data_dir` (in bin/cctally) reads `APP_DIR` and
+    `LEGACY_APP_DIR` via bare-name lookup against cctally's own
+    __dict__, so we mirror into ns too. Same pattern as conftest's
+    redirect_paths and test_update.py's update_paths fixture.
+    """
     legacy = tmp_path / "legacy"
     new = tmp_path / "new"
     ns = load_script()
-    monkeypatch.setitem(ns, "LEGACY_APP_DIR", legacy)
-    monkeypatch.setitem(ns, "APP_DIR", new)
+    monkeypatch.setattr(_cctally_core, "LEGACY_APP_DIR", legacy)
+    monkeypatch.setattr(_cctally_core, "APP_DIR", new)
     return ns, legacy, new
 
 

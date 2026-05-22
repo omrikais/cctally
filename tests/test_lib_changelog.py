@@ -14,6 +14,7 @@ import sys
 import pytest
 
 from conftest import load_script
+import _cctally_core
 
 
 @pytest.fixture()
@@ -39,7 +40,7 @@ def test_reads_latest_stamped_section(tmp_path, ns_and_lib):
         "## [1.8.1] - 2026-05-10\n",
         encoding="utf-8",
     )
-    monkeypatch.setitem(ns, "CHANGELOG_PATH", cl)
+    monkeypatch.setattr(_cctally_core, "CHANGELOG_PATH", cl)
     assert lib._read_latest_changelog_version() == ("1.8.2", "2026-05-17")
 
 
@@ -50,7 +51,7 @@ def test_skips_unreleased_header(tmp_path, ns_and_lib):
         "## [Unreleased]\n\n## [1.0.0] - 2026-01-01\n",
         encoding="utf-8",
     )
-    monkeypatch.setitem(ns, "CHANGELOG_PATH", cl)
+    monkeypatch.setattr(_cctally_core, "CHANGELOG_PATH", cl)
     assert lib._read_latest_changelog_version() == ("1.0.0", "2026-01-01")
 
 
@@ -58,13 +59,13 @@ def test_returns_none_when_no_stamped_section(tmp_path, ns_and_lib):
     ns, lib, monkeypatch = ns_and_lib
     cl = tmp_path / "CHANGELOG.md"
     cl.write_text("## [Unreleased]\n\n### Added\n- thing\n", encoding="utf-8")
-    monkeypatch.setitem(ns, "CHANGELOG_PATH", cl)
+    monkeypatch.setattr(_cctally_core, "CHANGELOG_PATH", cl)
     assert lib._read_latest_changelog_version() is None
 
 
 def test_returns_none_when_file_missing(tmp_path, ns_and_lib):
     ns, lib, monkeypatch = ns_and_lib
-    monkeypatch.setitem(ns, "CHANGELOG_PATH", tmp_path / "does-not-exist.md")
+    monkeypatch.setattr(_cctally_core, "CHANGELOG_PATH", tmp_path / "does-not-exist.md")
     assert lib._read_latest_changelog_version() is None
 
 
@@ -72,5 +73,5 @@ def test_prerelease_version(tmp_path, ns_and_lib):
     ns, lib, monkeypatch = ns_and_lib
     cl = tmp_path / "CHANGELOG.md"
     cl.write_text("## [1.9.0-rc.1] - 2026-05-18\n", encoding="utf-8")
-    monkeypatch.setitem(ns, "CHANGELOG_PATH", cl)
+    monkeypatch.setattr(_cctally_core, "CHANGELOG_PATH", cl)
     assert lib._read_latest_changelog_version() == ("1.9.0-rc.1", "2026-05-18")

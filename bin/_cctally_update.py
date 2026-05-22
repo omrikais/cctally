@@ -104,7 +104,7 @@ worker / polling thread:
 
 What stays in bin/cctally:
 - All ``UPDATE_*`` path constants (source-of-truth at L2001-2023);
-  consumed via ``c = _cctally(); c.UPDATE_STATE_PATH`` etc. in moved
+  consumed via ``c = _cctally(); _cctally_core.UPDATE_STATE_PATH`` etc. in moved
   code so ``monkeypatch.setitem(ns, "UPDATE_STATE_PATH", tmp)`` in
   ``tests/test_update.py`` propagates transparently — no sibling-side
   patches needed. Mirrors Phase D #17/#18 precedent.
@@ -200,6 +200,7 @@ def _cctally():
 
 # === Honest imports from extracted homes ===================================
 # Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3.
+import _cctally_core
 from _cctally_core import eprint, _now_utc
 from _cctally_config import save_config
 
@@ -405,7 +406,7 @@ def _load_update_state() -> dict[str, Any] | None:
     """
     c = _cctally()
     try:
-        text = c.UPDATE_STATE_PATH.read_text(encoding="utf-8")
+        text = _cctally_core.UPDATE_STATE_PATH.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
     try:
@@ -437,12 +438,12 @@ def _save_update_state(state: dict[str, Any]) -> None:
     writers via ``UPDATE_LOCK_PATH`` (spec §5.3).
     """
     c = _cctally()
-    c.UPDATE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _cctally_core.UPDATE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = (
         json.dumps(state, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
-    tmp = c.UPDATE_STATE_PATH.with_name(
-        f"{c.UPDATE_STATE_PATH.name}.tmp.{os.getpid()}"
+    tmp = _cctally_core.UPDATE_STATE_PATH.with_name(
+        f"{_cctally_core.UPDATE_STATE_PATH.name}.tmp.{os.getpid()}"
     )
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
@@ -450,7 +451,7 @@ def _save_update_state(state: dict[str, Any]) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.replace(str(tmp), str(c.UPDATE_STATE_PATH))
+    os.replace(str(tmp), str(_cctally_core.UPDATE_STATE_PATH))
 
 
 def _load_update_suppress() -> dict[str, Any]:
@@ -462,7 +463,7 @@ def _load_update_suppress() -> dict[str, Any]:
     c = _cctally()
     default = {"_schema": 1, "skipped_versions": [], "remind_after": None}
     try:
-        text = c.UPDATE_SUPPRESS_PATH.read_text(encoding="utf-8")
+        text = _cctally_core.UPDATE_SUPPRESS_PATH.read_text(encoding="utf-8")
     except FileNotFoundError:
         return default
     try:
@@ -489,12 +490,12 @@ def _save_update_suppress(suppress: dict[str, Any]) -> None:
     """Persist ``update-suppress.json`` atomically. Same idiom as
     :func:`_save_update_state`."""
     c = _cctally()
-    c.UPDATE_SUPPRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _cctally_core.UPDATE_SUPPRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = (
         json.dumps(suppress, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
-    tmp = c.UPDATE_SUPPRESS_PATH.with_name(
-        f"{c.UPDATE_SUPPRESS_PATH.name}.tmp.{os.getpid()}"
+    tmp = _cctally_core.UPDATE_SUPPRESS_PATH.with_name(
+        f"{_cctally_core.UPDATE_SUPPRESS_PATH.name}.tmp.{os.getpid()}"
     )
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
@@ -502,7 +503,7 @@ def _save_update_suppress(suppress: dict[str, Any]) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.replace(str(tmp), str(c.UPDATE_SUPPRESS_PATH))
+    os.replace(str(tmp), str(_cctally_core.UPDATE_SUPPRESS_PATH))
 
 
 def _read_lock_pid(fd: int) -> int | None:
@@ -543,9 +544,9 @@ def _acquire_update_lock() -> int:
         COMMAND=cctally update
     """
     c = _cctally()
-    c.UPDATE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _cctally_core.UPDATE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(
-        str(c.UPDATE_LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o644
+        str(_cctally_core.UPDATE_LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o644
     )
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -622,16 +623,16 @@ def _rotate_update_log_if_needed() -> None:
     """
     c = _cctally()
     try:
-        size = c.UPDATE_LOG_PATH.stat().st_size
+        size = _cctally_core.UPDATE_LOG_PATH.stat().st_size
     except FileNotFoundError:
         return
     if size < c.UPDATE_LOG_ROTATE_BYTES:
         return
     try:
-        c.UPDATE_LOG_ROTATED_PATH.unlink()
+        _cctally_core.UPDATE_LOG_ROTATED_PATH.unlink()
     except FileNotFoundError:
         pass
-    c.UPDATE_LOG_PATH.rename(c.UPDATE_LOG_ROTATED_PATH)
+    _cctally_core.UPDATE_LOG_PATH.rename(_cctally_core.UPDATE_LOG_ROTATED_PATH)
 
 
 def _log_update_event(log_fd, event: str, **kv: Any) -> None:
@@ -892,7 +893,7 @@ def _self_heal_current_version() -> None:
     """
     c = _cctally()
     try:
-        if (c.CHANGELOG_PATH.parent / ".git").exists():
+        if (_cctally_core.CHANGELOG_PATH.parent / ".git").exists():
             return
         fresh = _release_read_latest_release_version()
         if fresh is None:
@@ -1029,7 +1030,7 @@ def _is_update_check_due(config: dict) -> bool:
         return False
     ttl_hours = check_cfg.get("ttl_hours", c.UPDATE_DEFAULT_TTL_HOURS)
     try:
-        mtime = c.UPDATE_CHECK_LAST_FETCH_PATH.stat().st_mtime
+        mtime = _cctally_core.UPDATE_CHECK_LAST_FETCH_PATH.stat().st_mtime
     except FileNotFoundError:
         return True
     return (time.time() - mtime) >= ttl_hours * 3600
@@ -1052,8 +1053,8 @@ def _do_update_check() -> None:
     c = _cctally()
     # Touch marker FIRST — crash safety: a dead process mid-fetch must
     # not trigger another fetch within the TTL window.
-    c.UPDATE_CHECK_LAST_FETCH_PATH.parent.mkdir(parents=True, exist_ok=True)
-    c.UPDATE_CHECK_LAST_FETCH_PATH.touch()
+    _cctally_core.UPDATE_CHECK_LAST_FETCH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _cctally_core.UPDATE_CHECK_LAST_FETCH_PATH.touch()
 
     method = c._detect_install_method(mutate=True)
 
@@ -1143,15 +1144,15 @@ def cmd_update_check_internal(args) -> int:
     """
     c = _cctally()
     # Ensure APP_DIR exists so log + state writes succeed on first run.
-    c.UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _cctally_core.UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with open(c.UPDATE_LOG_PATH, "a", encoding="utf-8") as log_fd:
+        with open(_cctally_core.UPDATE_LOG_PATH, "a", encoding="utf-8") as log_fd:
             _log_update_event(log_fd, "CHECK_START")
             c._do_update_check()
             _log_update_event(log_fd, "CHECK_EXIT", rc=0)
     except Exception as e:
         try:
-            with open(c.UPDATE_LOG_PATH, "a", encoding="utf-8") as log_fd:
+            with open(_cctally_core.UPDATE_LOG_PATH, "a", encoding="utf-8") as log_fd:
                 _log_update_event(log_fd, "CHECK_EXIT", rc=1, error=str(e)[:200])
         except Exception:
             pass
@@ -1615,10 +1616,10 @@ def _do_update_install(
                 quoted = " ".join(shlex.quote(c2) for c2 in cmd)
                 print(f"Would run: {quoted}")
         return 0
-    c.UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _cctally_core.UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     lock_fd = c._acquire_update_lock()
     try:
-        with open(c.UPDATE_LOG_PATH, "a", encoding="utf-8") as log_fd:
+        with open(_cctally_core.UPDATE_LOG_PATH, "a", encoding="utf-8") as log_fd:
             _log_update_event(log_fd, "INSTALL_START", method=method.method)
             for step_name, cmd in steps:
                 _log_update_event(log_fd, "STEP_START", name=step_name)
@@ -1790,9 +1791,9 @@ class UpdateWorker:
         try:
             method = c._detect_install_method(mutate=True)
             c._preflight_install(method, version)
-            c.UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _cctally_core.UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             lock_fd = c._acquire_update_lock()
-            log_fd = open(c.UPDATE_LOG_PATH, "a", encoding="utf-8")
+            log_fd = open(_cctally_core.UPDATE_LOG_PATH, "a", encoding="utf-8")
             _log_update_event(log_fd, "INSTALL_START", method=method.method)
             for step_name, cmd in c._build_update_steps(method, version):
                 self._emit(run_id, {"type": "step", "name": step_name})
@@ -1923,8 +1924,8 @@ class _DashboardUpdateCheckThread(threading.Thread):
                 # silently disable the polling cadence for the rest
                 # of the dashboard's lifetime.
                 try:
-                    c.UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-                    with open(c.UPDATE_LOG_PATH, "a", encoding="utf-8") as log_fd:
+                    _cctally_core.UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    with open(_cctally_core.UPDATE_LOG_PATH, "a", encoding="utf-8") as log_fd:
                         _log_update_event(
                             log_fd, "CHECK_FAILED", error=str(e)[:200]
                         )

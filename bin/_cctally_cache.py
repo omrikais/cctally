@@ -122,6 +122,7 @@ def _cctally():
 # Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
 # (Z-leaf + Z-mid) import from _cctally_core. The legacy shim function
 # for ``eprint`` is deleted.
+import _cctally_core
 from _cctally_core import eprint
 
 
@@ -422,10 +423,10 @@ def sync_cache(
     """
     stats = IngestStats()
     c = _cctally()
-    c.APP_DIR.mkdir(parents=True, exist_ok=True)
-    c.CACHE_LOCK_PATH.touch()
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _cctally_core.CACHE_LOCK_PATH.touch()
 
-    lock_fh = open(c.CACHE_LOCK_PATH, "w")
+    lock_fh = open(_cctally_core.CACHE_LOCK_PATH, "w")
     try:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -914,10 +915,10 @@ def sync_codex_cache(
     """
     stats = CodexIngestStats()
     c = _cctally()
-    c.APP_DIR.mkdir(parents=True, exist_ok=True)
-    c.CACHE_LOCK_CODEX_PATH.touch()
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _cctally_core.CACHE_LOCK_CODEX_PATH.touch()
 
-    lock_fh = open(c.CACHE_LOCK_CODEX_PATH, "w")
+    lock_fh = open(_cctally_core.CACHE_LOCK_CODEX_PATH, "w")
     try:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1263,17 +1264,17 @@ def open_cache_db() -> sqlite3.Connection:
     recreated — the cache is fully re-derivable from JSONL, so this is safe.
     """
     c = _cctally()
-    c.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        conn = sqlite3.connect(c.CACHE_DB_PATH)
+        conn = sqlite3.connect(_cctally_core.CACHE_DB_PATH)
         conn.execute("SELECT 1").fetchone()
     except sqlite3.DatabaseError as exc:
         eprint(f"[cache] corrupt cache DB ({exc}); recreating")
         try:
-            c.CACHE_DB_PATH.unlink()
+            _cctally_core.CACHE_DB_PATH.unlink()
         except FileNotFoundError:
             pass
-        conn = sqlite3.connect(c.CACHE_DB_PATH)
+        conn = sqlite3.connect(_cctally_core.CACHE_DB_PATH)
 
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")

@@ -57,6 +57,7 @@ def _cctally():
 # `_validate_update_check_ttl_hours_value`, `_normalize_update_check_enabled_value`,
 # `get_display_tz_pref`, `UPDATE_DEFAULT_TTL_HOURS`) stay on the
 # _cctally() accessor.
+import _cctally_core
 from _cctally_core import (
     eprint,
     ensure_dirs,
@@ -81,7 +82,7 @@ def _warn_config_corrupt_once(reason: str) -> None:
     _CONFIG_CORRUPT_WARNED = True
     c = _cctally()
     eprint(
-        f"warning: ignoring corrupt {c.CONFIG_PATH} ({reason}); "
+        f"warning: ignoring corrupt {_cctally_core.CONFIG_PATH} ({reason}); "
         "using in-memory defaults"
     )
 
@@ -106,10 +107,10 @@ def _try_read_config() -> "dict[str, Any] | None":
     config writer lock.
     """
     c = _cctally()
-    if not c.CONFIG_PATH.exists():
+    if not _cctally_core.CONFIG_PATH.exists():
         return None
     try:
-        raw = c.CONFIG_PATH.read_text(encoding="utf-8")
+        raw = _cctally_core.CONFIG_PATH.read_text(encoding="utf-8")
     except OSError as exc:
         _warn_config_corrupt_once(f"read failed: {exc}")
         return None
@@ -141,8 +142,8 @@ def config_writer_lock():
     """
     c = _cctally()
     ensure_dirs()
-    c.CONFIG_LOCK_PATH.touch()
-    fh = open(c.CONFIG_LOCK_PATH, "w")
+    _cctally_core.CONFIG_LOCK_PATH.touch()
+    fh = open(_cctally_core.CONFIG_LOCK_PATH, "w")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
@@ -177,7 +178,7 @@ def load_config() -> dict[str, Any]:
     if parsed is not None:
         return parsed
 
-    if c.CONFIG_PATH.exists():
+    if _cctally_core.CONFIG_PATH.exists():
         # Corrupt file: warning already emitted by _try_read_config.
         # Return in-memory defaults; do NOT persist — a transient
         # corruption is recoverable by the next legitimate
@@ -227,14 +228,14 @@ def save_config(data: dict[str, Any]) -> None:
     c = _cctally()
     ensure_dirs()
     payload = (json.dumps(data, indent=2) + "\n").encode("utf-8")
-    tmp = c.CONFIG_PATH.with_name(f"{c.CONFIG_PATH.name}.tmp.{os.getpid()}")
+    tmp = _cctally_core.CONFIG_PATH.with_name(f"{_cctally_core.CONFIG_PATH.name}.tmp.{os.getpid()}")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
         os.write(fd, payload)
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.replace(str(tmp), str(c.CONFIG_PATH))
+    os.replace(str(tmp), str(_cctally_core.CONFIG_PATH))
 
 
 ALLOWED_CONFIG_KEYS = (

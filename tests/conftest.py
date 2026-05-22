@@ -28,6 +28,16 @@ def _script_path() -> pathlib.Path:
 _SCRIPT_PATH = _script_path()
 _SCRIPT_CODE = compile(_SCRIPT_PATH.read_text(), str(_SCRIPT_PATH), "exec")
 
+# Ensure bin/ is on sys.path so tests can do `import _cctally_core` at the
+# top of the file. After 2026-05-22 (issue #84) the 22 in-scope path
+# globals live in _cctally_core; tests monkeypatch them via
+# ``monkeypatch.setattr(_cctally_core, "X", v)``. The module-top import
+# stays stable across ``load_script()`` reloads because the load_script
+# preserves ``_cctally_core`` in sys.modules (see note in load_script).
+_BIN_DIR = str(_SCRIPT_PATH.parent)
+if _BIN_DIR not in sys.path:
+    sys.path.insert(0, _BIN_DIR)
+
 
 def load_script():
     """Execute the main script and return its globals dict.
@@ -57,10 +67,35 @@ def load_script():
     leak writes to the on-disk repo. Spec §5.5 (circular-import safety)
     + §6.0a.
 
+    EXCEPTION: ``_cctally_core`` is the kernel and does NOT
+    ``import cctally`` (it uses the call-time ``_cctally()`` accessor),
+    so its module-load state is safe across reloads. After 2026-05-22
+    (issue #84) the 22 in-scope path globals live in
+    ``_cctally_core``; keeping the same instance in sys.modules lets
+    tests monkeypatch ``_cctally_core.X`` via a stable module-top
+    ``import _cctally_core`` reference without it going stale on the
+    next ``load_script()`` call. To preserve the pre-#84 behavior where
+    each ``load_script()`` re-derived path constants from the current
+    HOME env var, we explicitly call
+    ``_cctally_core._init_paths_from_env()`` here. That re-runs the
+    same Path.home() / "..." logic against the current env without
+    needing a fresh import, so tests doing ``setenv("HOME", tmp) +
+    load_script()`` see fresh, HOME-derived path constants — same
+    contract as before #84.
+
     Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md §6.0a
     """
-    for _name in [n for n in sys.modules if n.startswith("_cctally_")]:
+    for _name in [n for n in sys.modules if n.startswith("_cctally_") and n != "_cctally_core"]:
         del sys.modules[_name]
+    # Re-derive _cctally_core's path constants from the current HOME env
+    # var. Tests doing `setenv("HOME", tmp) + load_script()` rely on
+    # this to surface a fresh path set under the test's HOME without
+    # re-importing _cctally_core. Must run BEFORE the bin/cctally exec
+    # below so the script's `APP_DIR = _cctally_core.APP_DIR` re-export
+    # block snapshots the updated values.
+    core = sys.modules.get("_cctally_core")
+    if core is not None and hasattr(core, "_init_paths_from_env"):
+        core._init_paths_from_env()
     mod = types.ModuleType("cctally")
     mod.__file__ = str(_SCRIPT_PATH)
     sys.modules["cctally"] = mod
@@ -69,53 +104,78 @@ def load_script():
 
 
 def redirect_paths(ns, monkeypatch, tmp_path):
-    """Pin the script's module-level path constants to a tmp dir.
+    """Pin the kernel's path constants to a tmp dir.
 
-    APP_DIR/DB_PATH/CACHE_DB_PATH are bound at module-load time, so
-    setenv("HOME") alone wouldn't redirect them — we monkeypatch the
-    namespace dict entries directly. Also creates an empty
-    ~/.claude/projects so sync_cache walks find no JSONL files.
+    After 2026-05-22 (issue #84), the 22 in-scope path constants live
+    in bin/_cctally_core.py and `_cctally_core` is the single legal
+    monkeypatch target. Every reader (every sibling AND bin/cctally
+    itself) goes through `_cctally_core.X` at call time.
 
-    Post Phase C #16 split: the migration framework's error sentinel
-    + cmd_db_* helpers live in `bin/_cctally_db.py` and resolve
-    ``DB_PATH`` / ``CACHE_DB_PATH`` / ``LOG_DIR`` /
-    ``MIGRATION_ERROR_LOG_PATH`` via bare-name lookup in their own
-    module's __dict__. We also patch those so any migration code
-    triggered during a redirected test (e.g. `cmd_db_status` against
-    fixture HOME) reads the redirected paths, not the production
-    ones seeded at bin/cctally module-load time.
+    The `ns[X]` MIRROR below is NOT a second patch surface — it just
+    keeps `bin/cctally`'s eager re-exports (`cctally.APP_DIR` etc.) in
+    sync with the kernel patches, so tests that *read* `ns["X"]` to
+    introspect values (e.g. `ns["CONFIG_PATH"].read_text()`) see the
+    fixture-redirected paths instead of stale module-load snapshots.
+    Tests must STILL patch via `monkeypatch.setattr(_cctally_core,
+    "X", v)` (the AST guard at `test_kernel_extraction_invariants.py`
+    enforces this for `test_*.py` files; conftest itself is exempt).
+
+    The `_cctally_db` sibling carries its own bare-name copies of four
+    paths (set by the seed block near the bin/cctally path-constant
+    region); we patch those here too so migration-framework code
+    triggered during a redirected test reads the fixture-redirected
+    values. That sibling block predates the data-globals migration and
+    is unaffected by it.
     """
     share = tmp_path / ".local" / "share" / "cctally"
     share.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.setitem(ns, "APP_DIR", share)
-    monkeypatch.setitem(ns, "DB_PATH", share / "stats.db")
-    monkeypatch.setitem(ns, "CACHE_DB_PATH", share / "cache.db")
-    monkeypatch.setitem(ns, "CACHE_LOCK_PATH", share / "cache.db.lock")
-    monkeypatch.setitem(ns, "CACHE_LOCK_CODEX_PATH", share / "cache.db.codex.lock")
-    monkeypatch.setitem(ns, "CONFIG_PATH", share / "config.json")
-    monkeypatch.setitem(ns, "CONFIG_LOCK_PATH", share / "config.json.lock")
-    monkeypatch.setitem(ns, "LOG_DIR", share / "logs")
-    monkeypatch.setitem(ns, "MIGRATION_ERROR_LOG_PATH", share / "logs" / "migration-errors.log")
-    # _cctally_db sibling's own copies — populated by the seed block
-    # near the bin/cctally path-constant region. Update them here so
-    # bare-name lookups inside the migration framework + cmd_db_*
-    # helpers see the fixture-redirected values.
+
+    paths = {
+        "APP_DIR": share,
+        "LEGACY_APP_DIR": tmp_path / ".local" / "share" / "ccusage-subscription",
+        "LOG_DIR": share / "logs",
+        "DB_PATH": share / "stats.db",
+        "CACHE_DB_PATH": share / "cache.db",
+        "CACHE_LOCK_PATH": share / "cache.db.lock",
+        "CACHE_LOCK_CODEX_PATH": share / "cache.db.codex.lock",
+        "CONFIG_LOCK_PATH": share / "config.json.lock",
+        "CONFIG_PATH": share / "config.json",
+        "MIGRATION_ERROR_LOG_PATH": share / "logs" / "migration-errors.log",
+        "HOOK_TICK_LOG_DIR": share / "logs",
+        "HOOK_TICK_LOG_PATH": share / "logs" / "hook-tick.log",
+        "HOOK_TICK_LOG_ROTATED_PATH": share / "logs" / "hook-tick.log.1",
+        "HOOK_TICK_THROTTLE_PATH": share / "hook-tick.last-fetch",
+        "HOOK_TICK_THROTTLE_LOCK_PATH": share / "hook-tick.last-fetch.lock",
+        "UPDATE_STATE_PATH": share / "update-state.json",
+        "UPDATE_SUPPRESS_PATH": share / "update-suppress.json",
+        "UPDATE_LOCK_PATH": share / "update.lock",
+        "UPDATE_LOG_PATH": share / "update.log",
+        "UPDATE_LOG_ROTATED_PATH": share / "update.log.1",
+        "UPDATE_CHECK_LAST_FETCH_PATH": share / "update-check.last-fetch",
+        "CLAUDE_SETTINGS_PATH": tmp_path / ".claude" / "settings.json",
+    }
+
+    core = sys.modules["_cctally_core"]
+    for name, value in paths.items():
+        monkeypatch.setattr(core, name, value)
+        # Mirror the patch into bin/cctally's namespace so tests that
+        # read `ns["X"]` for introspection see the fixture-redirected
+        # paths. NOT a second patch target — only the `_cctally_core`
+        # patch above propagates to actual readers. This mirror is for
+        # test introspection only; per-test `setitem(ns, "<PROMOTED>",
+        # …)` from a test_*.py file is still forbidden (AST guard at
+        # `tests/test_kernel_extraction_invariants.py`).
+        monkeypatch.setitem(ns, name, value)
+
     db_sibling = ns.get("_cctally_db")
     if db_sibling is not None:
         monkeypatch.setattr(db_sibling, "DB_PATH", share / "stats.db")
         monkeypatch.setattr(db_sibling, "CACHE_DB_PATH", share / "cache.db")
         monkeypatch.setattr(db_sibling, "LOG_DIR", share / "logs")
         monkeypatch.setattr(db_sibling, "MIGRATION_ERROR_LOG_PATH", share / "logs" / "migration-errors.log")
-    # Post Phase D #17 split: the session-entry cache subsystem lives
-    # in `bin/_cctally_cache.py` and routes `APP_DIR` / `CACHE_DB_PATH`
-    # / `CACHE_LOCK_PATH` / `CACHE_LOCK_CODEX_PATH` through the
-    # `c = _cctally()` call-time accessor (spec §5.5). The
-    # `monkeypatch.setitem(ns, ...)` calls above propagate
-    # transparently — no sibling-side patches needed.
-    # ``CODEX_SESSIONS_DIR`` is not redirected here (Codex tests
-    # rebind via fresh ``HOME`` through harness scratch dirs).
+
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
 
 

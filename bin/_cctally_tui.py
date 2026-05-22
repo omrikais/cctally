@@ -204,6 +204,7 @@ def _cctally():
 
 # === Honest imports from extracted homes ===================================
 # Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3.
+import _cctally_core
 from _cctally_core import (
     eprint,
     parse_iso_datetime,
@@ -2036,7 +2037,7 @@ def _tui_build_snapshot(
         projects_envelope_block: dict | None = None
         try:
             c = _cctally()
-            cache_db_path = c.CACHE_DB_PATH
+            cache_db_path = _cctally_core.CACHE_DB_PATH
             conn.execute(
                 "ATTACH DATABASE ? AS cache_db",
                 (str(cache_db_path),),

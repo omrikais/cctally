@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import sys
 
+import _cctally_core
+
 
 def _cctally():
     """Call-time accessor for the ``cctally`` module (project memory
@@ -35,7 +37,7 @@ def _read_latest_changelog_version() -> tuple[str, str] | None:
     """
     c = _cctally()
     try:
-        text = c.CHANGELOG_PATH.read_text(encoding="utf-8")
+        text = _cctally_core.CHANGELOG_PATH.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
     m = c.RELEASE_HEADER_RE.search(text)

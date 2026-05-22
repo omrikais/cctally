@@ -5,6 +5,7 @@ import datetime as dt
 import pytest
 
 from conftest import load_script
+import _cctally_core
 
 
 @pytest.fixture(scope="module")
@@ -254,14 +255,14 @@ def test_cmd_blocks_reads_recorded_windows_from_db(ns, tmp_path, monkeypatch):
     share.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.setitem(ns, "APP_DIR", share)
-    monkeypatch.setitem(ns, "DB_PATH", share / "stats.db")
-    monkeypatch.setitem(ns, "CACHE_DB_PATH", share / "cache.db")
-    monkeypatch.setitem(ns, "CACHE_LOCK_PATH", share / "cache.db.lock")
-    monkeypatch.setitem(ns, "CACHE_LOCK_CODEX_PATH", share / "cache.db.codex.lock")
-    monkeypatch.setitem(ns, "CONFIG_PATH", share / "config.json")
-    monkeypatch.setitem(ns, "CONFIG_LOCK_PATH", share / "config.json.lock")
-    monkeypatch.setitem(ns, "LOG_DIR", share / "logs")
+    monkeypatch.setattr(_cctally_core, "APP_DIR", share)
+    monkeypatch.setattr(_cctally_core, "DB_PATH", share / "stats.db")
+    monkeypatch.setattr(_cctally_core, "CACHE_DB_PATH", share / "cache.db")
+    monkeypatch.setattr(_cctally_core, "CACHE_LOCK_PATH", share / "cache.db.lock")
+    monkeypatch.setattr(_cctally_core, "CACHE_LOCK_CODEX_PATH", share / "cache.db.codex.lock")
+    monkeypatch.setattr(_cctally_core, "CONFIG_PATH", share / "config.json")
+    monkeypatch.setattr(_cctally_core, "CONFIG_LOCK_PATH", share / "config.json.lock")
+    monkeypatch.setattr(_cctally_core, "LOG_DIR", share / "logs")
 
     # Recorded reset timestamp, and deterministic "now".
     R = "2026-04-23T12:00:00+00:00"
@@ -594,13 +595,13 @@ def test_load_recorded_five_hour_windows_collapses_jittery_pairs(
     share.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.setitem(ns, "APP_DIR", share)
-    monkeypatch.setitem(ns, "DB_PATH", share / "stats.db")
-    monkeypatch.setitem(ns, "CACHE_DB_PATH", share / "cache.db")
-    monkeypatch.setitem(ns, "CACHE_LOCK_PATH", share / "cache.db.lock")
-    monkeypatch.setitem(ns, "CACHE_LOCK_CODEX_PATH", share / "cache.db.codex.lock")
-    monkeypatch.setitem(ns, "CONFIG_PATH", share / "config.json")
-    monkeypatch.setitem(ns, "LOG_DIR", share / "logs")
+    monkeypatch.setattr(_cctally_core, "APP_DIR", share)
+    monkeypatch.setattr(_cctally_core, "DB_PATH", share / "stats.db")
+    monkeypatch.setattr(_cctally_core, "CACHE_DB_PATH", share / "cache.db")
+    monkeypatch.setattr(_cctally_core, "CACHE_LOCK_PATH", share / "cache.db.lock")
+    monkeypatch.setattr(_cctally_core, "CACHE_LOCK_CODEX_PATH", share / "cache.db.codex.lock")
+    monkeypatch.setattr(_cctally_core, "CONFIG_PATH", share / "config.json")
+    monkeypatch.setattr(_cctally_core, "LOG_DIR", share / "logs")
 
     # Seed two jittery R values 1s apart, both inside the query range.
     R_even = "2026-04-23T23:00:00+00:00"
@@ -647,13 +648,13 @@ def test_load_recorded_five_hour_windows_drops_phantom_in_real_window(
     share.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.setitem(ns, "APP_DIR", share)
-    monkeypatch.setitem(ns, "DB_PATH", share / "stats.db")
-    monkeypatch.setitem(ns, "CACHE_DB_PATH", share / "cache.db")
-    monkeypatch.setitem(ns, "CACHE_LOCK_PATH", share / "cache.db.lock")
-    monkeypatch.setitem(ns, "CACHE_LOCK_CODEX_PATH", share / "cache.db.codex.lock")
-    monkeypatch.setitem(ns, "CONFIG_PATH", share / "config.json")
-    monkeypatch.setitem(ns, "LOG_DIR", share / "logs")
+    monkeypatch.setattr(_cctally_core, "APP_DIR", share)
+    monkeypatch.setattr(_cctally_core, "DB_PATH", share / "stats.db")
+    monkeypatch.setattr(_cctally_core, "CACHE_DB_PATH", share / "cache.db")
+    monkeypatch.setattr(_cctally_core, "CACHE_LOCK_PATH", share / "cache.db.lock")
+    monkeypatch.setattr(_cctally_core, "CACHE_LOCK_CODEX_PATH", share / "cache.db.codex.lock")
+    monkeypatch.setattr(_cctally_core, "CONFIG_PATH", share / "config.json")
+    monkeypatch.setattr(_cctally_core, "LOG_DIR", share / "logs")
 
     real_resets = [
         ("2026-04-25T04:10:00+00:00", 31),  # session 1: 02:10-07:10 local

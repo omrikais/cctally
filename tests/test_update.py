@@ -40,6 +40,7 @@ import time
 import pytest
 
 from conftest import load_script
+import _cctally_core
 
 
 @pytest.fixture(scope="module")
@@ -51,19 +52,28 @@ def ns():
 def update_paths(ns, tmp_path, monkeypatch):
     """Redirect every UPDATE_* path constant to a per-test tmp_path dir.
 
-    Module-level constants in bin/cctally are bound at script-load time
-    (APP_DIR is `~/.local/share/cctally`), so setenv("HOME") alone won't
-    reroute them — we monkeypatch each constant in the loaded namespace
-    directly. Same pattern as tests/conftest.py:redirect_paths.
+    Post 2026-05-22 (#84): `_cctally_core` is the canonical home for
+    the 22 promoted path globals, so we patch it for the sibling
+    readers (`_cctally_update.py`). We ALSO mirror into ns because
+    bin/cctally itself reads many of these via bare-name lookup
+    against its own __dict__, and tests in this file read them via
+    `ns["UPDATE_LOCK_PATH"]` etc. — both surfaces need the patched
+    value. The conftest `redirect_paths` helper follows the same
+    dual-patch pattern.
     """
     share = tmp_path / "cctally-data"
     share.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setitem(ns, "APP_DIR", share)
-    monkeypatch.setitem(ns, "UPDATE_STATE_PATH", share / "update-state.json")
-    monkeypatch.setitem(ns, "UPDATE_SUPPRESS_PATH", share / "update-suppress.json")
-    monkeypatch.setitem(ns, "UPDATE_LOCK_PATH", share / "update.lock")
-    monkeypatch.setitem(ns, "UPDATE_LOG_PATH", share / "update.log")
-    monkeypatch.setitem(ns, "UPDATE_LOG_ROTATED_PATH", share / "update.log.1")
+    paths = {
+        "APP_DIR": share,
+        "UPDATE_STATE_PATH": share / "update-state.json",
+        "UPDATE_SUPPRESS_PATH": share / "update-suppress.json",
+        "UPDATE_LOCK_PATH": share / "update.lock",
+        "UPDATE_LOG_PATH": share / "update.log",
+        "UPDATE_LOG_ROTATED_PATH": share / "update.log.1",
+    }
+    for name, value in paths.items():
+        monkeypatch.setattr(_cctally_core, name, value)
+        monkeypatch.setitem(ns, name, value)
     return share
 
 
@@ -704,7 +714,7 @@ class TestSelfHealCurrentVersion:
         """
         fake_install = tmp_path / "self-heal-install"
         fake_install.mkdir()
-        monkeypatch.setitem(ns, "CHANGELOG_PATH", fake_install / "CHANGELOG.md")
+        monkeypatch.setattr(_cctally_core, "CHANGELOG_PATH", fake_install / "CHANGELOG.md")
 
     def test_updates_current_version_when_changelog_differs(
         self, ns, update_paths, monkeypatch,
@@ -817,7 +827,7 @@ class TestSelfHealCurrentVersion:
             "# Changelog\n\n## [Unreleased]\n\n## [9.9.9] - 2026-05-13\n",
             encoding="utf-8",
         )
-        monkeypatch.setitem(ns, "CHANGELOG_PATH", fake_repo / "CHANGELOG.md")
+        monkeypatch.setattr(_cctally_core, "CHANGELOG_PATH", fake_repo / "CHANGELOG.md")
 
         ns["_save_update_state"]({
             "_schema": 1,
@@ -844,7 +854,7 @@ class TestSelfHealCurrentVersion:
             "# Changelog\n\n## [Unreleased]\n\n## [1.7.0] - 2026-05-13\n",
             encoding="utf-8",
         )
-        monkeypatch.setitem(ns, "CHANGELOG_PATH", fake_install / "CHANGELOG.md")
+        monkeypatch.setattr(_cctally_core, "CHANGELOG_PATH", fake_install / "CHANGELOG.md")
 
         ns["_save_update_state"]({
             "_schema": 1,
@@ -1018,8 +1028,7 @@ class TestVersionCheckPipeline:
         self, ns, update_paths, monkeypatch
     ):
         """No marker file → due is True (first run after install)."""
-        monkeypatch.setitem(
-            ns, "UPDATE_CHECK_LAST_FETCH_PATH", update_paths / "update-check.last-fetch"
+        monkeypatch.setattr(_cctally_core, "UPDATE_CHECK_LAST_FETCH_PATH", update_paths / "update-check.last-fetch"
         )
         # Sanity: no marker.
         assert not (update_paths / "update-check.last-fetch").exists()
@@ -1031,7 +1040,7 @@ class TestVersionCheckPipeline:
     ):
         """Marker just touched + ttl=48 → not due (within window)."""
         marker = update_paths / "update-check.last-fetch"
-        monkeypatch.setitem(ns, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
+        monkeypatch.setattr(_cctally_core, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
         marker.touch()
         config = {"update": {"check": {"enabled": True, "ttl_hours": 48}}}
         assert ns["_is_update_check_due"](config) is False
@@ -1041,7 +1050,7 @@ class TestVersionCheckPipeline:
     ):
         """`enabled=False` → never due (even with no marker)."""
         marker = update_paths / "update-check.last-fetch"
-        monkeypatch.setitem(ns, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
+        monkeypatch.setattr(_cctally_core, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
         # Sanity: no marker → would otherwise be True.
         assert not marker.exists()
         config = {"update": {"check": {"enabled": False, "ttl_hours": 24}}}
@@ -1053,7 +1062,7 @@ class TestVersionCheckPipeline:
         """Chokepoint success path: touches marker, writes state with
         `check_status="ok"`, `latest_version`, `latest_version_url`."""
         marker = update_paths / "update-check.last-fetch"
-        monkeypatch.setitem(ns, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
+        monkeypatch.setattr(_cctally_core, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
         monkeypatch.setitem(
             ns,
             "_release_read_latest_release_version",
@@ -1089,7 +1098,7 @@ class TestVersionCheckPipeline:
         """Network failure path: marker still touched (crash safety),
         prior `latest_version` preserved, `check_status="fetch_failed"`."""
         marker = update_paths / "update-check.last-fetch"
-        monkeypatch.setitem(ns, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
+        monkeypatch.setattr(_cctally_core, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
         # Pre-populate state with a last-known-good `latest_version`.
         ns["_save_update_state"]({
             "_schema": 1,
@@ -1139,7 +1148,7 @@ class TestVersionCheckPipeline:
         method".
         """
         marker = update_paths / "update-check.last-fetch"
-        monkeypatch.setitem(ns, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
+        monkeypatch.setattr(_cctally_core, "UPDATE_CHECK_LAST_FETCH_PATH", marker)
         # Pre-populate state as if a prior npm install had recorded
         # a fresher upstream version. The user has since switched to a
         # source/dev checkout, so detection will return "unknown".
@@ -2115,7 +2124,7 @@ class TestUpdateWorker:
         monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 12345)
         monkeypatch.setitem(ns, "_release_update_lock", lambda fd: None)
         # update.log path → tmp.
-        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
 
         def blocking_run_streaming(cmd, *, on_stdout, on_stderr, log_fd):
             gate.set()
@@ -2155,7 +2164,7 @@ class TestUpdateWorker:
         monkeypatch.setitem(
             ns, "_release_update_lock", lambda fd: released.append(fd)
         )
-        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
 
         # Subprocess returns non-zero — must NOT call execvp.
         monkeypatch.setitem(
@@ -2204,7 +2213,7 @@ class TestUpdateWorker:
         monkeypatch.setitem(
             ns, "_release_update_lock", lambda fd: released.append(fd)
         )
-        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
         monkeypatch.setitem(
             ns, "_run_streaming",
             lambda cmd, *, on_stdout, on_stderr, log_fd: 0,
@@ -2276,7 +2285,7 @@ class TestUpdateWorker:
         )
         monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 99)
         monkeypatch.setitem(ns, "_release_update_lock", lambda fd: None)
-        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
         monkeypatch.setitem(
             ns, "_run_streaming",
             lambda cmd, *, on_stdout, on_stderr, log_fd: 1,
@@ -2316,7 +2325,7 @@ class TestUpdateWorker:
         )
         monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 1)
         monkeypatch.setitem(ns, "_release_update_lock", lambda fd: None)
-        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
         monkeypatch.setitem(
             ns, "_run_streaming",
             lambda cmd, *, on_stdout, on_stderr, log_fd: 1,
@@ -2377,7 +2386,7 @@ class TestDashboardUpdateCheckThread:
         ns = load_script()
         # Speed up: shorten the poll cadence so .wait() returns fast.
         monkeypatch.setitem(ns, "UPDATE_DASHBOARD_CHECK_POLL_S", 0.05)
-        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
 
         called = threading.Event()
         monkeypatch.setitem(ns, "_is_update_check_due", lambda cfg: True)
@@ -2398,7 +2407,7 @@ class TestDashboardUpdateCheckThread:
     def test_skips_when_not_due(self, tmp_path, monkeypatch):
         ns = load_script()
         monkeypatch.setitem(ns, "UPDATE_DASHBOARD_CHECK_POLL_S", 0.05)
-        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
         called: list[int] = []
         monkeypatch.setitem(ns, "_is_update_check_due", lambda cfg: False)
         monkeypatch.setitem(
@@ -2427,7 +2436,7 @@ class TestDashboardUpdateCheckThread:
         """
         ns = load_script()
         monkeypatch.setitem(ns, "UPDATE_DASHBOARD_CHECK_POLL_S", 0.05)
-        monkeypatch.setitem(ns, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
         monkeypatch.setitem(ns, "_is_update_check_due", lambda cfg: True)
         monkeypatch.setitem(ns, "_do_update_check", lambda: None)
         monkeypatch.setitem(ns, "load_config", lambda: {})
@@ -2606,11 +2615,9 @@ class TestUpdateAPI:
         # Pre-stage update-state.json with a latest_version so
         # SKIP_USE_STATE_LATEST resolves.
         suppress_path = tmp_path / ".local" / "share" / "cctally"
-        monkeypatch.setitem(
-            ns, "UPDATE_STATE_PATH", suppress_path / "update-state.json"
+        monkeypatch.setattr(_cctally_core, "UPDATE_STATE_PATH", suppress_path / "update-state.json"
         )
-        monkeypatch.setitem(
-            ns, "UPDATE_SUPPRESS_PATH",
+        monkeypatch.setattr(_cctally_core, "UPDATE_SUPPRESS_PATH",
             suppress_path / "update-suppress.json",
         )
         ns["UPDATE_STATE_PATH"].write_text(
@@ -2642,11 +2649,9 @@ class TestUpdateAPI:
         self._wire_handler(ns)
         monkeypatch.setitem(ns, "_UPDATE_WORKER", None)
         share = tmp_path / ".local" / "share" / "cctally"
-        monkeypatch.setitem(
-            ns, "UPDATE_STATE_PATH", share / "update-state.json"
+        monkeypatch.setattr(_cctally_core, "UPDATE_STATE_PATH", share / "update-state.json"
         )
-        monkeypatch.setitem(
-            ns, "UPDATE_SUPPRESS_PATH", share / "update-suppress.json"
+        monkeypatch.setattr(_cctally_core, "UPDATE_SUPPRESS_PATH", share / "update-suppress.json"
         )
         ns["UPDATE_STATE_PATH"].write_text(
             json.dumps({"_schema": 1, "latest_version": "1.7.0"})
@@ -2678,11 +2683,9 @@ class TestUpdateAPI:
         self._wire_handler(ns)
         self._install_stub_worker(ns, monkeypatch, busy=True)
         share = tmp_path / ".local" / "share" / "cctally"
-        monkeypatch.setitem(
-            ns, "UPDATE_STATE_PATH", share / "update-state.json"
+        monkeypatch.setattr(_cctally_core, "UPDATE_STATE_PATH", share / "update-state.json"
         )
-        monkeypatch.setitem(
-            ns, "UPDATE_SUPPRESS_PATH", share / "update-suppress.json"
+        monkeypatch.setattr(_cctally_core, "UPDATE_SUPPRESS_PATH", share / "update-suppress.json"
         )
         ns["UPDATE_STATE_PATH"].write_text(
             json.dumps({"_schema": 1, "latest_version": "1.7.0"})

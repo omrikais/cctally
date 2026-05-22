@@ -31,6 +31,7 @@ import pathlib
 
 import pytest
 from conftest import load_script, redirect_paths
+import _cctally_core
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -267,7 +268,7 @@ class TestUninstallRemovesLegacyAutoSymlinks:
         pinned.parent.mkdir(parents=True, exist_ok=True)
         if not pinned.exists():
             pinned.write_text("{}\n")
-        monkeypatch.setitem(ns, "CLAUDE_SETTINGS_PATH", pinned)
+        monkeypatch.setattr(_cctally_core, "CLAUDE_SETTINGS_PATH", pinned)
         real_load = ns["_load_claude_settings"]
         real_write = ns["_write_claude_settings_atomic"]
         real_backup = ns["_backup_claude_settings"]

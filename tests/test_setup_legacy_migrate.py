@@ -11,6 +11,7 @@ import time
 
 import pytest
 from conftest import load_script
+import _cctally_core
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -628,7 +629,7 @@ def _e2e_pin_paths(ns, monkeypatch, home: pathlib.Path) -> None:
     pinned_settings_path = home / ".claude" / "settings.json"
     # Re-pin Claude-side constants that conftest's redirect_paths leaves alone
     # (they belong to the install path, not the data layer).
-    monkeypatch.setitem(ns, "CLAUDE_SETTINGS_PATH", pinned_settings_path)
+    monkeypatch.setattr(_cctally_core, "CLAUDE_SETTINGS_PATH", pinned_settings_path)
     monkeypatch.setitem(ns, "_LEGACY_BESPOKE_HOOKS_DIR", home / ".claude" / "hooks")
     # Replace the three settings-I/O helpers with pinned-path closures so
     # the captured-default-arg pitfall doesn't leak the maintainer's real

@@ -50,10 +50,7 @@ import pathlib
 import subprocess
 import sys
 
-
-def _cctally():
-    """Resolve the current `cctally` module at call-time (spec §5.5)."""
-    return sys.modules["cctally"]
+import _cctally_core
 
 
 def _load_lib(name: str):
@@ -92,7 +89,7 @@ def _alerts_log_path() -> "pathlib.Path":
     pattern used elsewhere in this codebase — e.g. ``cctally-config-test``)
     transparently relocates the log without a separate env-var convention.
     """
-    log_dir = _cctally().LOG_DIR
+    log_dir = _cctally_core.LOG_DIR
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir / "alerts.log"
 

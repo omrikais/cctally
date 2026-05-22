@@ -32,45 +32,90 @@ def _cctally():
 # After this promotion `_cctally_core` is the single source of truth and
 # the only legal monkeypatch target. `bin/cctally` keeps eager re-exports
 # for ad-hoc REPL / scripts; tests MUST target this module directly.
+#
+# Path-constant initialization is wrapped in `_init_paths_from_env()` so
+# `tests/conftest.py:load_script()` can re-derive them from the current
+# HOME env var without re-importing this module (which would invalidate
+# tests' module-top `import _cctally_core` references). The bare module
+# attributes below are populated by the call to _init_paths_from_env()
+# at import time; subsequent load_script calls invoke it again.
 
-APP_DIR = pathlib.Path.home() / ".local" / "share" / "cctally"
-LEGACY_APP_DIR = pathlib.Path.home() / ".local" / "share" / "ccusage-subscription"
-LOG_DIR = APP_DIR / "logs"
 
-DB_PATH = APP_DIR / "stats.db"
-CACHE_DB_PATH = APP_DIR / "cache.db"
+def _init_paths_from_env() -> None:
+    """(Re)bind the 22 in-scope path globals to the current HOME env var.
 
-CACHE_LOCK_PATH = APP_DIR / "cache.db.lock"
-CACHE_LOCK_CODEX_PATH = APP_DIR / "cache.db.codex.lock"
-CONFIG_LOCK_PATH = APP_DIR / "config.json.lock"
+    Called once at module import to populate the defaults, then again
+    by `tests/conftest.py:load_script()` after each `setenv("HOME", …)`
+    so the test sees a fresh path set without the cost of re-importing
+    `_cctally_core` (which would break tests that cached the module
+    object via a top-level `import _cctally_core`).
+    """
+    global APP_DIR, LEGACY_APP_DIR, LOG_DIR
+    global DB_PATH, CACHE_DB_PATH
+    global CACHE_LOCK_PATH, CACHE_LOCK_CODEX_PATH, CONFIG_LOCK_PATH
+    global CONFIG_PATH, MIGRATION_ERROR_LOG_PATH, CHANGELOG_PATH
+    global HOOK_TICK_LOG_DIR, HOOK_TICK_LOG_PATH, HOOK_TICK_LOG_ROTATED_PATH
+    global HOOK_TICK_THROTTLE_PATH, HOOK_TICK_THROTTLE_LOCK_PATH
+    global UPDATE_STATE_PATH, UPDATE_SUPPRESS_PATH
+    global UPDATE_LOCK_PATH, UPDATE_LOG_PATH, UPDATE_LOG_ROTATED_PATH
+    global UPDATE_CHECK_LAST_FETCH_PATH, CLAUDE_SETTINGS_PATH
 
-CONFIG_PATH = APP_DIR / "config.json"
+    home = pathlib.Path.home()
+    APP_DIR = home / ".local" / "share" / "cctally"
+    LEGACY_APP_DIR = home / ".local" / "share" / "ccusage-subscription"
+    LOG_DIR = APP_DIR / "logs"
 
-MIGRATION_ERROR_LOG_PATH = LOG_DIR / "migration-errors.log"
+    DB_PATH = APP_DIR / "stats.db"
+    CACHE_DB_PATH = APP_DIR / "cache.db"
 
-# CHANGELOG_PATH: honor CCTALLY_TEST_CHANGELOG_PATH env override; otherwise
-# resolves to <repo>/CHANGELOG.md based on bin/_cctally_core.py's location
-# (alongside bin/cctally, so the parent chain is the same).
-_CHANGELOG_OVERRIDE = os.environ.get("CCTALLY_TEST_CHANGELOG_PATH")
-if _CHANGELOG_OVERRIDE:
-    CHANGELOG_PATH = pathlib.Path(_CHANGELOG_OVERRIDE)
-else:
-    CHANGELOG_PATH = pathlib.Path(__file__).resolve().parent.parent / "CHANGELOG.md"
+    CACHE_LOCK_PATH = APP_DIR / "cache.db.lock"
+    CACHE_LOCK_CODEX_PATH = APP_DIR / "cache.db.codex.lock"
+    CONFIG_LOCK_PATH = APP_DIR / "config.json.lock"
 
-HOOK_TICK_LOG_DIR = APP_DIR / "logs"
-HOOK_TICK_LOG_PATH = HOOK_TICK_LOG_DIR / "hook-tick.log"
-HOOK_TICK_LOG_ROTATED_PATH = HOOK_TICK_LOG_DIR / "hook-tick.log.1"
-HOOK_TICK_THROTTLE_PATH = APP_DIR / "hook-tick.last-fetch"
-HOOK_TICK_THROTTLE_LOCK_PATH = APP_DIR / "hook-tick.last-fetch.lock"
+    CONFIG_PATH = APP_DIR / "config.json"
 
-UPDATE_STATE_PATH = APP_DIR / "update-state.json"
-UPDATE_SUPPRESS_PATH = APP_DIR / "update-suppress.json"
-UPDATE_LOCK_PATH = APP_DIR / "update.lock"
-UPDATE_LOG_PATH = APP_DIR / "update.log"
-UPDATE_LOG_ROTATED_PATH = APP_DIR / "update.log.1"
-UPDATE_CHECK_LAST_FETCH_PATH = APP_DIR / "update-check.last-fetch"
+    MIGRATION_ERROR_LOG_PATH = LOG_DIR / "migration-errors.log"
 
-CLAUDE_SETTINGS_PATH = pathlib.Path.home() / ".claude" / "settings.json"
+    # CHANGELOG_PATH: honor CCTALLY_TEST_CHANGELOG_PATH env override; otherwise
+    # resolves to <repo>/CHANGELOG.md based on bin/_cctally_core.py's
+    # location (alongside bin/cctally, so the parent chain is the same).
+    override = os.environ.get("CCTALLY_TEST_CHANGELOG_PATH")
+    if override:
+        CHANGELOG_PATH = pathlib.Path(override)
+    else:
+        CHANGELOG_PATH = pathlib.Path(__file__).resolve().parent.parent / "CHANGELOG.md"
+
+    HOOK_TICK_LOG_DIR = APP_DIR / "logs"
+    HOOK_TICK_LOG_PATH = HOOK_TICK_LOG_DIR / "hook-tick.log"
+    HOOK_TICK_LOG_ROTATED_PATH = HOOK_TICK_LOG_DIR / "hook-tick.log.1"
+    HOOK_TICK_THROTTLE_PATH = APP_DIR / "hook-tick.last-fetch"
+    HOOK_TICK_THROTTLE_LOCK_PATH = APP_DIR / "hook-tick.last-fetch.lock"
+
+    UPDATE_STATE_PATH = APP_DIR / "update-state.json"
+    UPDATE_SUPPRESS_PATH = APP_DIR / "update-suppress.json"
+    UPDATE_LOCK_PATH = APP_DIR / "update.lock"
+    UPDATE_LOG_PATH = APP_DIR / "update.log"
+    UPDATE_LOG_ROTATED_PATH = APP_DIR / "update.log.1"
+    UPDATE_CHECK_LAST_FETCH_PATH = APP_DIR / "update-check.last-fetch"
+
+    CLAUDE_SETTINGS_PATH = home / ".claude" / "settings.json"
+
+
+# Declare the names at module scope so `from _cctally_core import X`
+# (forbidden by the AST guard but technically syntactically possible)
+# doesn't error on missing attribute. _init_paths_from_env() populates
+# them with current-HOME values immediately below.
+APP_DIR = LEGACY_APP_DIR = LOG_DIR = None  # type: ignore[assignment]
+DB_PATH = CACHE_DB_PATH = None  # type: ignore[assignment]
+CACHE_LOCK_PATH = CACHE_LOCK_CODEX_PATH = CONFIG_LOCK_PATH = None  # type: ignore[assignment]
+CONFIG_PATH = MIGRATION_ERROR_LOG_PATH = CHANGELOG_PATH = None  # type: ignore[assignment]
+HOOK_TICK_LOG_DIR = HOOK_TICK_LOG_PATH = HOOK_TICK_LOG_ROTATED_PATH = None  # type: ignore[assignment]
+HOOK_TICK_THROTTLE_PATH = HOOK_TICK_THROTTLE_LOCK_PATH = None  # type: ignore[assignment]
+UPDATE_STATE_PATH = UPDATE_SUPPRESS_PATH = None  # type: ignore[assignment]
+UPDATE_LOCK_PATH = UPDATE_LOG_PATH = UPDATE_LOG_ROTATED_PATH = None  # type: ignore[assignment]
+UPDATE_CHECK_LAST_FETCH_PATH = CLAUDE_SETTINGS_PATH = None  # type: ignore[assignment]
+
+_init_paths_from_env()
 
 
 # === Logging =========================================================
@@ -288,9 +333,8 @@ def compute_week_bounds(anchor_dt: dt.datetime, week_start_name: str) -> tuple[d
 
 
 def ensure_dirs() -> None:
-    c = _cctally()
-    c.APP_DIR.mkdir(parents=True, exist_ok=True)
-    c.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # === Alerts validation cluster ======================================
@@ -401,7 +445,7 @@ def open_db() -> sqlite3.Connection:
     _clear_migration_error_log_entries = c._clear_migration_error_log_entries
 
     ensure_dirs()
-    conn = sqlite3.connect(c.DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")

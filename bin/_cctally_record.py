@@ -158,6 +158,7 @@ def _cctally():
 
 # === Honest imports from extracted homes ===================================
 # Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3.
+import _cctally_core
 from _cctally_core import (
     eprint,
     now_utc_iso,
@@ -320,10 +321,10 @@ _logged_window_key_coerce_failure = False
 # Constants pulled from cctally at call time:
 #   c._FIVE_HOUR_JITTER_FLOOR_SECONDS — _lib_five_hour.* re-export
 #   c._RESET_PCT_DROP_THRESHOLD       — bin/cctally module-level constant
-#   c.HOOK_TICK_LOG_DIR / _PATH / _ROTATED_PATH / _ROTATE_BYTES
-#   c.HOOK_TICK_THROTTLE_PATH / _LOCK_PATH
+#   _cctally_core.HOOK_TICK_LOG_DIR / _PATH / _ROTATED_PATH / _ROTATE_BYTES
+#   _cctally_core.HOOK_TICK_THROTTLE_PATH / _LOCK_PATH
 #   c.HOOK_TICK_DEFAULT_THROTTLE_SECONDS
-#   c.APP_DIR
+#   _cctally_core.APP_DIR
 
 
 def _normalize_percent(value: "float | int | None") -> "float | None":
@@ -1521,7 +1522,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                         # record-usage reader doesn't see the new HWM
                         # before the event row is durable.
                         try:
-                            (c.APP_DIR / "hwm-7d").write_text(
+                            (_cctally_core.APP_DIR / "hwm-7d").write_text(
                                 f"{week_start_date} {weekly_percent}\n"
                             )
                         except OSError:
@@ -1731,7 +1732,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                             # matches the canonical writer:
                             # ``<key> <percent>\n``.
                             try:
-                                (c.APP_DIR / "hwm-5h").write_text(
+                                (_cctally_core.APP_DIR / "hwm-5h").write_text(
                                     f"{int(five_hour_window_key)} "
                                     f"{float(five_hour_percent)}\n"
                                 )
@@ -2096,7 +2097,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
     # Write high-water mark so the status line never displays a regression.
     # The file contains "week_start_date weekly_percent" on one line.
     try:
-        hwm_path = c.APP_DIR / "hwm-7d"
+        hwm_path = _cctally_core.APP_DIR / "hwm-7d"
         existing_hwm = 0.0
         try:
             parts = hwm_path.read_text().strip().split()
@@ -2119,7 +2120,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
     ):
         try:
             five_resets_key = five_hour_window_key
-            hwm5_path = c.APP_DIR / "hwm-5h"
+            hwm5_path = _cctally_core.APP_DIR / "hwm-5h"
             existing_hwm5 = 0.0
             try:
                 parts5 = hwm5_path.read_text().strip().split()
@@ -2143,8 +2144,8 @@ def _hook_tick_log_line(line: str) -> None:
     """
     c = _cctally()
     try:
-        c.HOOK_TICK_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        fd = os.open(c.HOOK_TICK_LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        _cctally_core.HOOK_TICK_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(_cctally_core.HOOK_TICK_LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:
             os.write(fd, (line.rstrip("\n") + "\n").encode("utf-8", errors="replace"))
         finally:
@@ -2157,7 +2158,7 @@ def _hook_tick_log_rotate_if_needed() -> None:
     """If hook-tick.log exceeds the size cap, atomic-rename to .1 (overwriting)."""
     c = _cctally()
     try:
-        size = c.HOOK_TICK_LOG_PATH.stat().st_size
+        size = _cctally_core.HOOK_TICK_LOG_PATH.stat().st_size
     except FileNotFoundError:
         return
     except OSError:
@@ -2165,7 +2166,7 @@ def _hook_tick_log_rotate_if_needed() -> None:
     if size <= c.HOOK_TICK_LOG_ROTATE_BYTES:
         return
     try:
-        os.replace(c.HOOK_TICK_LOG_PATH, c.HOOK_TICK_LOG_ROTATED_PATH)
+        os.replace(_cctally_core.HOOK_TICK_LOG_PATH, _cctally_core.HOOK_TICK_LOG_ROTATED_PATH)
     except OSError:
         pass
 
@@ -2174,7 +2175,7 @@ def _hook_tick_throttle_age_seconds() -> float:
     """Return seconds since last successful OAuth fetch; +inf if never."""
     c = _cctally()
     try:
-        mtime = c.HOOK_TICK_THROTTLE_PATH.stat().st_mtime
+        mtime = _cctally_core.HOOK_TICK_THROTTLE_PATH.stat().st_mtime
     except FileNotFoundError:
         return float("inf")
     except OSError:
@@ -2186,9 +2187,9 @@ def _hook_tick_throttle_touch() -> None:
     """Update mtime to now (creating the file if missing)."""
     c = _cctally()
     try:
-        c.APP_DIR.mkdir(parents=True, exist_ok=True)
-        c.HOOK_TICK_THROTTLE_PATH.touch(exist_ok=True)
-        os.utime(c.HOOK_TICK_THROTTLE_PATH, None)
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        _cctally_core.HOOK_TICK_THROTTLE_PATH.touch(exist_ok=True)
+        os.utime(_cctally_core.HOOK_TICK_THROTTLE_PATH, None)
     except OSError:
         pass
 
@@ -2313,9 +2314,9 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
     # immediately after Step 7, so the leak is bounded.
     if not explain:
         try:
-            c.HOOK_TICK_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            _cctally_core.HOOK_TICK_LOG_DIR.mkdir(parents=True, exist_ok=True)
             log_fd = os.open(
-                c.HOOK_TICK_LOG_PATH,
+                _cctally_core.HOOK_TICK_LOG_PATH,
                 os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644,
             )
             os.dup2(log_fd, 1)  # stdout
@@ -2368,10 +2369,10 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
 
         # Throttle check + OAuth (under flock)
         if not no_oauth:
-            c.APP_DIR.mkdir(parents=True, exist_ok=True)
+            _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
             try:
                 lock_fd = os.open(
-                    c.HOOK_TICK_THROTTLE_LOCK_PATH,
+                    _cctally_core.HOOK_TICK_THROTTLE_LOCK_PATH,
                     os.O_WRONLY | os.O_CREAT, 0o644,
                 )
             except OSError:
@@ -2437,7 +2438,7 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
     print("[1/4] Local sync (sync_cache)")
     print(f"      → ingested {max(0, ingested)} new entries")
     print("[2/4] Throttle check")
-    print(f"      → throttle file: {c.HOOK_TICK_THROTTLE_PATH}")
+    print(f"      → throttle file: {_cctally_core.HOOK_TICK_THROTTLE_PATH}")
     if pre_age == float("inf"):
         print("      → mtime: (file absent)")
     else:
@@ -2445,7 +2446,7 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
     print(f"      → threshold: {int(throttle_seconds)}s → {decision}")
     print("[3/4] OAuth refresh")
     print(f"      → status: {oauth_status}")
-    print(f"[4/4] Log written → {c.HOOK_TICK_LOG_PATH}")
+    print(f"[4/4] Log written → {_cctally_core.HOOK_TICK_LOG_PATH}")
     print(f"\nDone in {dur_ms} ms.")
     return rc
 

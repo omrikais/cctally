@@ -857,10 +857,10 @@ CODEX_SESSIONS_DIR = pathlib.Path.home() / ".codex" / "sessions"
 # sibling-side copy below — that's why we expose this seed: tests can
 # discover the sibling via `cctally_module._cctally_db` and patch via
 # `monkeypatch.setitem(_cctally_db.__dict__, "X", tmp)` if needed.
-_cctally_db.LOG_DIR = LOG_DIR
-_cctally_db.MIGRATION_ERROR_LOG_PATH = MIGRATION_ERROR_LOG_PATH
-_cctally_db.DB_PATH = DB_PATH
-_cctally_db.CACHE_DB_PATH = CACHE_DB_PATH
+_cctally_db.LOG_DIR = _cctally_core.LOG_DIR
+_cctally_db.MIGRATION_ERROR_LOG_PATH = _cctally_core.MIGRATION_ERROR_LOG_PATH
+_cctally_db.DB_PATH = _cctally_core.DB_PATH
+_cctally_db.CACHE_DB_PATH = _cctally_core.CACHE_DB_PATH
 
 # Note: `_cctally_cache.py` does NOT need a path-constant seed block
 # parallel to `_cctally_db` above — its moved bodies reach
@@ -906,14 +906,14 @@ def _migrate_legacy_data_dir() -> None:
     Removable in a future major version once early users have been on
     cctally long enough that the legacy dir is gone everywhere.
     """
-    if APP_DIR.exists():
+    if _cctally_core.APP_DIR.exists():
         return  # already migrated, or fresh install at the new path
-    if not LEGACY_APP_DIR.exists():
+    if not _cctally_core.LEGACY_APP_DIR.exists():
         return  # fresh install, no legacy data
-    APP_DIR.parent.mkdir(parents=True, exist_ok=True)
-    os.rename(LEGACY_APP_DIR, APP_DIR)
+    _cctally_core.APP_DIR.parent.mkdir(parents=True, exist_ok=True)
+    os.rename(_cctally_core.LEGACY_APP_DIR, _cctally_core.APP_DIR)
     print(
-        f"cctally: migrated data dir {LEGACY_APP_DIR} -> {APP_DIR}",
+        f"cctally: migrated data dir {_cctally_core.LEGACY_APP_DIR} -> {_cctally_core.APP_DIR}",
         file=sys.stderr,
     )
 
@@ -8414,19 +8414,19 @@ def doctor_gather_state(
 
     # ── DB ───────────────────────────────────────────────────────────
     try:
-        stats_db_status = _db_status_for(DB_PATH, _STATS_MIGRATIONS, "stats.db")
-        if not DB_PATH.exists():
+        stats_db_status = _db_status_for(_cctally_core.DB_PATH, _STATS_MIGRATIONS, "stats.db")
+        if not _cctally_core.DB_PATH.exists():
             stats_db_status["_file_exists"] = False
     except sqlite3.Error as exc:
-        stats_db_status = {"path": str(DB_PATH), "user_version": 0,
+        stats_db_status = {"path": str(_cctally_core.DB_PATH), "user_version": 0,
                            "registry_size": len(_STATS_MIGRATIONS),
                            "migrations": [], "_open_error": str(exc)}
     try:
-        cache_db_status = _db_status_for(CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db")
-        if not CACHE_DB_PATH.exists():
+        cache_db_status = _db_status_for(_cctally_core.CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db")
+        if not _cctally_core.CACHE_DB_PATH.exists():
             cache_db_status["_file_exists"] = False
     except sqlite3.Error as exc:
-        cache_db_status = {"path": str(CACHE_DB_PATH), "user_version": 0,
+        cache_db_status = {"path": str(_cctally_core.CACHE_DB_PATH), "user_version": 0,
                            "registry_size": len(_CACHE_MIGRATIONS),
                            "migrations": [], "_open_error": str(exc)}
 
@@ -8435,8 +8435,8 @@ def doctor_gather_state(
     forked_bucket_counts: dict | None = None
     credited_weeks: list[dict] | None = None
     try:
-        if DB_PATH.exists():
-            conn = sqlite3.connect(str(DB_PATH))
+        if _cctally_core.DB_PATH.exists():
+            conn = sqlite3.connect(str(_cctally_core.DB_PATH))
             try:
                 try:
                     row = conn.execute(
@@ -8533,8 +8533,8 @@ def doctor_gather_state(
     cache_entries_count = None
     cache_last_entry_at = None
     try:
-        if CACHE_DB_PATH.exists():
-            conn = sqlite3.connect(str(CACHE_DB_PATH))
+        if _cctally_core.CACHE_DB_PATH.exists():
+            conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
             try:
                 row = conn.execute(
                     "SELECT COUNT(*), MAX(timestamp_utc) FROM session_entries"
@@ -8563,8 +8563,8 @@ def doctor_gather_state(
     codex_entries_count = None
     codex_last_entry_at = None
     try:
-        if CACHE_DB_PATH.exists():
-            conn = sqlite3.connect(str(CACHE_DB_PATH))
+        if _cctally_core.CACHE_DB_PATH.exists():
+            conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
             try:
                 row = conn.execute(
                     "SELECT COUNT(*), MAX(timestamp_utc) FROM codex_session_entries"
@@ -8606,8 +8606,8 @@ def doctor_gather_state(
     # check surfaces the corruption separately.
     dashboard_bind_stored = "loopback"
     try:
-        if CONFIG_PATH.exists():
-            raw_cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if _cctally_core.CONFIG_PATH.exists():
+            raw_cfg = json.loads(_cctally_core.CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(raw_cfg, dict):
                 dashboard_bind_stored = (
                     _config_known_value(raw_cfg, "dashboard.bind") or "loopback"
@@ -8621,8 +8621,8 @@ def doctor_gather_state(
     # (codex H1).
     config_json_error = None
     try:
-        if CONFIG_PATH.exists():
-            json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if _cctally_core.CONFIG_PATH.exists():
+            json.loads(_cctally_core.CONFIG_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         config_json_error = f"{type(exc).__name__}: {exc}"
     except OSError as exc:
