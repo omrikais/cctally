@@ -199,6 +199,24 @@ class DowngradeDetected(Exception):
         )
 
 
+class MigrationGateNotMet(Exception):
+    """Migration cannot run yet because a cross-DB prerequisite is unsatisfied.
+
+    Dispatcher treats this as transient: do NOT write to
+    ``migration-errors.log``, do NOT mark the migration as skipped, do
+    NOT render the error banner. Retry on the next open.
+
+    Used by cross-DB migrations whose body needs to verify that a
+    sibling DB's migration has applied AND that downstream ingest has
+    repopulated the data the body depends on. The canonical use case
+    is stats migration 008 (recompute weekly_cost_snapshots) which
+    needs cache migration 001 (dedup wipe) AND a post-wipe
+    ``sync_cache`` cycle before it can safely re-sum cost.
+
+    Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §D4.
+    """
+
+
 def _make_migration_decorator(registry: list[Migration], db_label: str, name: str):
     """Internal helper — builds the @stats_migration / @cache_migration decorators.
 
@@ -464,6 +482,18 @@ def _run_pending_migrations(
             m.handler(conn)
             _clear_migration_error_log_entries(qualified_name)
             applied.add(m.name)
+        except MigrationGateNotMet as gate_exc:
+            # Transient cross-DB gating: do NOT log to migration-errors.log,
+            # do NOT mark as skipped, do NOT render the error banner. The
+            # migration stays pending; the next open re-tries it. Spec
+            # docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §D4.
+            if os.environ.get("CCTALLY_DEBUG"):
+                eprint(
+                    f"[migration {qualified_name}] deferred: {gate_exc}"
+                )
+            break  # stop on first deferral so later migrations don't see
+                   # partial-prior state either (mirror of the failure-break
+                   # rule below).
         except Exception as exc:
             _log_migration_error(
                 name=qualified_name,
@@ -1679,7 +1709,94 @@ def _migration_observed_pre_credit_pct(conn: sqlite3.Connection) -> None:
         raise
 
 
-# === Region 7b: Cache migration 001_dedup_highest_wins (ccusage-parity fix) ===
+# === Region 7b: Cross-DB migration gate helper (ccusage-parity prep) ===
+
+def _gate_001_post_ingest_completed(
+    cache_ro: sqlite3.Connection,
+    claude_projects_dir: pathlib.Path,
+) -> None:
+    """Raise ``MigrationGateNotMet`` unless cache migration 001 has applied
+    AND ``sync_cache`` has run at least once after it (or there are no
+    JSONL files to ingest in the first place).
+
+    The single-signal gate "001 marker present" is not enough: 001 writes
+    the marker immediately after the wipe, BEFORE any post-wipe
+    ``sync_cache`` repopulates ``session_entries``. A downstream
+    migration that re-aggregates from ``session_entries`` (e.g. stats
+    migration 008) would legally run against an empty just-wiped cache
+    and zero out every historical aggregate.
+
+    Composite gate:
+
+      * **Layer A — marker present**: ``schema_migrations`` carries
+        ``001_dedup_highest_wins``. Without this, the wipe hasn't even
+        started; downstream migrations have no business running.
+      * **Layer B — post-001 ingest observed**: any ``session_files``
+        row with ``last_ingested_at > 001.applied_at_utc``. Since 001
+        DELETEd every row from ``session_files``, any row present now
+        with a post-001 timestamp must have been written by
+        ``sync_cache`` AFTER the migration.
+      * **Layer C — empty-disk fallback**: if no JSONL files exist
+        under ``claude_projects_dir``, the absence of ``session_files``
+        rows is the correct state — pass silently so users with no
+        Claude usage can still complete the upgrade.
+
+    Parameters
+    ----------
+    cache_ro
+        Read-only sqlite3 connection to ``cache.db``. The migration
+        framework opens stats.db and cache.db separately; cross-DB
+        migrations open the sibling DB read-only inside their handler
+        body via ``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``.
+        Exposed as an explicit parameter so tests can inject an
+        in-memory or tmp-path connection without touching ``HOME``.
+    claude_projects_dir
+        Path that contains the JSONL session files (typically
+        ``~/.claude/projects``). Exposed as an explicit parameter so
+        tests can inject ``tmp_path / "projects"``. Production callers
+        resolve this from ``_get_claude_data_dirs()`` (the env-aware
+        helper in bin/cctally).
+
+    Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3.
+    """
+    gate_row = cache_ro.execute(
+        "SELECT applied_at_utc FROM schema_migrations WHERE name = ?",
+        ("001_dedup_highest_wins",),
+    ).fetchone()
+    if gate_row is None:
+        raise MigrationGateNotMet(
+            "cache.db migration 001_dedup_highest_wins not yet applied; "
+            "run any JSONL-reading command (e.g. `cctally weekly`) once."
+        )
+    applied_at_utc = gate_row[0]
+
+    # Layer B — proof of post-001 ingest: any session_files row whose
+    # last_ingested_at post-dates the 001 marker. 001 dropped every row
+    # from session_files, so a row present now with `last_ingested_at >
+    # applied_at_utc` was written by sync_cache AFTER the migration.
+    has_post_001_ingest = cache_ro.execute(
+        "SELECT 1 FROM session_files WHERE last_ingested_at > ? LIMIT 1",
+        (applied_at_utc,),
+    ).fetchone() is not None
+    if has_post_001_ingest:
+        return
+
+    # Layer C — empty-disk fallback. If there are no JSONL files to
+    # ingest, the absence of session_files rows is the correct state.
+    # No-op succeed so users with no Claude usage can still pass the
+    # gate; downstream migrations are also no-ops in this case (no
+    # cost rows to recompute, no aggregates to refresh).
+    has_any_jsonl = any(claude_projects_dir.glob("**/*.jsonl"))
+    if not has_any_jsonl:
+        return
+
+    raise MigrationGateNotMet(
+        "cache.db post-001 ingest not yet observed; run any JSONL-reading "
+        "command (e.g. `cctally weekly`) once and retry."
+    )
+
+
+# === Region 7c: Cache migration 001_dedup_highest_wins (ccusage-parity fix) ===
 
 @cache_migration("001_dedup_highest_wins")
 def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
