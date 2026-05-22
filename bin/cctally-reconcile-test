@@ -2037,6 +2037,373 @@ PYPROJ
 }
 projects_envelope_invariants
 
+# ── ccusage-parity dedup invariants (R-DEDUP1/2/3) ────────────────────
+# R-DEDUP1: for every (msg_id, req_id) key that appears in >=2 assistant
+#           emissions across the user's JSONL, `session_entries` holds
+#           exactly one row whose token total equals the MAX over all
+#           emissions for that key — the "highest-wins" contract from
+#           Task 1's `_should_replace`. Exact integer equality (no
+#           tolerance — token totals are integers; any divergence is a
+#           dedup bug, not float drift).
+#
+# R-DEDUP2: for every `mode='auto' AND project IS NULL` row in
+#           `weekly_cost_snapshots` whose `range_*_iso` columns are
+#           populated, the stored `cost_usd` equals re-running
+#           `_calculate_entry_cost` over `session_entries` across the
+#           same `[range_start_iso, range_end_iso]` window. Tolerance
+#           1e-9 USD (IEEE-754 ULP drift across two independent
+#           summations — same rule as every other USD invariant in this
+#           harness). Matches the PRODUCTION writer's predicate
+#           (`compute_week_cost` -> `iter_entries`: closed lex
+#           `timestamp_utc >= ? AND <= ?` on UTC-normalized ISO), NOT
+#           stats-migration 008's half-open `<` end — migration 008 is a
+#           one-time recompute; every subsequent `sync-week` row goes
+#           through the closed-interval writer, so the durable invariant
+#           must mirror the writer.
+#
+# R-DEDUP3: regression guard on the "`five_hour_blocks` totals recompute
+#           every tick from `session_entries`" contract (CLAUDE.md 5-hour
+#           windows section). For the active 5h block — the most recent
+#           row whose start+5h is still in the future — the stored
+#           `total_cost_usd` equals the recompute over
+#           `[block_start_at, captured_at_utc]`. Same 1e-9 USD tolerance
+#           rationale; same interval semantics as
+#           `get_claude_session_entries` (lex `timestamp_utc >= ?
+#           AND timestamp_utc <= ?` on ISO strings, NOT unixepoch —
+#           production reads use lex compare here).
+#
+# All three read the user's real production DBs (`stats.db` + `cache.db`)
+# so they exercise the actual ccusage-parity dedup wiring end-to-end. On
+# a fresh clone with no production data (CI, brand-new dev box) each
+# invariant skips gracefully — the python block prints "OK (skipped:
+# ...)" and the harness still reports PASS. The cache rebuild from
+# cache-migration 001 + stats-migration 008 populates the data that
+# makes these invariants meaningful; skip is the right outcome until
+# then.
+
+dedup_invariants () {
+    local name="dedup_invariants"
+    local result rc_py
+    result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" TZ=Etc/UTC python3 - <<'PYDEDUP' 2>&1)
+import datetime as dt
+import json
+import os
+import pathlib
+import sqlite3
+import sys
+from collections import defaultdict
+
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+sys.path.insert(0, str(repo_root / "bin"))
+from _lib_pricing import _calculate_entry_cost
+
+home = pathlib.Path.home()
+stats_db = home / ".local/share/cctally/stats.db"
+cache_db = home / ".local/share/cctally/cache.db"
+claude_projects = home / ".claude" / "projects"
+
+# Track sub-invariant status so a skip in one doesn't mask a fail in
+# another. Final stdout summarises each — "OK" + sub-status lines so the
+# bash wrapper still reports PASS while the operator can see what ran.
+sub_status: list[str] = []
+
+# ─── R-DEDUP1 ──────────────────────────────────────────────────────────
+if not claude_projects.exists():
+    sub_status.append("R-DEDUP1: skipped (no ~/.claude/projects on host)")
+elif not cache_db.exists():
+    sub_status.append("R-DEDUP1: skipped (no cache.db on host)")
+else:
+    # Gather all (msg_id, req_id) keys with multiple emissions, recording
+    # the MAX assistant-message token total per key. Bounds: walking every
+    # JSONL is unavoidable (we need the raw emissions, not the deduped
+    # cache) — heavy users have ~10MB of JSONL which scans in <1s.
+    max_totals: dict[tuple[str, str], int] = defaultdict(int)
+    emission_counts: dict[tuple[str, str], int] = defaultdict(int)
+    for fp in claude_projects.glob("**/*.jsonl"):
+        try:
+            fh = fp.open()
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") != "assistant":
+                    continue
+                msg = obj.get("message") or {}
+                usage = msg.get("usage") or {}
+                msg_id = msg.get("id")
+                req_id = obj.get("requestId")
+                if not msg_id or not req_id:
+                    continue
+                total = (
+                    usage.get("input_tokens", 0)
+                    + usage.get("output_tokens", 0)
+                    + usage.get("cache_creation_input_tokens", 0)
+                    + usage.get("cache_read_input_tokens", 0)
+                )
+                key = (msg_id, req_id)
+                emission_counts[key] += 1
+                if total > max_totals[key]:
+                    max_totals[key] = total
+
+    multi_emission_keys = [k for k, c in emission_counts.items() if c >= 2]
+    if not multi_emission_keys:
+        sub_status.append(
+            "R-DEDUP1: skipped (no multi-emission (msg_id, req_id) pairs)"
+        )
+    else:
+        # Sample bound at 100 keys per the plan — keeps runtime sane on
+        # heavy histories. The bound is enough to surface a regression
+        # in `_should_replace` (any single multi-emission key with a
+        # below-max cached row would fail).
+        conn = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
+        try:
+            sampled = multi_emission_keys[:100]
+            checked = 0
+            for msg_id, req_id in sampled:
+                row = conn.execute(
+                    "SELECT input_tokens + output_tokens "
+                    "       + cache_create_tokens + cache_read_tokens "
+                    "  FROM session_entries "
+                    " WHERE msg_id = ? AND req_id = ?",
+                    (msg_id, req_id),
+                ).fetchone()
+                # Missing row is treated as a skip-condition (key may
+                # belong to a JSONL file the cache hasn't ingested
+                # yet, e.g. mid-write). Not a fail.
+                if row is None:
+                    continue
+                cached_total = row[0]
+                expected = max_totals[(msg_id, req_id)]
+                assert cached_total == expected, (
+                    f"R-DEDUP1 violated: ({msg_id}, {req_id}) cache holds "
+                    f"{cached_total} tokens, max emission was {expected}"
+                )
+                checked += 1
+            sub_status.append(
+                f"R-DEDUP1: ok ({checked}/{len(sampled)} keys checked, "
+                f"{len(multi_emission_keys)} multi-emission keys total)"
+            )
+        finally:
+            conn.close()
+
+# ─── R-DEDUP2 ──────────────────────────────────────────────────────────
+if not stats_db.exists() or not cache_db.exists():
+    sub_status.append(
+        "R-DEDUP2: skipped (production stats.db/cache.db not present)"
+    )
+else:
+    stats = sqlite3.connect(f"file:{stats_db}?mode=ro", uri=True)
+    cache = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
+    try:
+        # Migration-008 scope: mode='auto' AND project IS NULL AND
+        # range_*_iso both non-NULL. The migration's own SELECT mirrors
+        # this — any divergence here means the migration ran but the
+        # stored values drifted from session_entries afterwards (e.g.
+        # cache rebuilt without re-running 008).
+        #
+        # Recency exclusion: skip snapshots whose `range_end_iso` is
+        # within the last hour. Those rows are by definition
+        # snapshots-of-an-active-tail: the cache continues ingesting
+        # new JSONL entries that may dedup-replace existing rows under
+        # the highest-tokens-wins UPSERT (Task 1), which can shift the
+        # recomputed cost (e.g. a 2nd assistant emission with HIGHER
+        # token total but DIFFERENT cache_creation vs cache_read mix
+        # renders cheaper or pricier than the row it replaced). The
+        # snapshot captured cost-at-write-instant; once the source set
+        # changes underneath, the equality cannot hold by design. One
+        # hour is a comfortable buffer beyond typical session-ending
+        # latencies; finalized weeks (every past `week_start_date`)
+        # always pass through this gate cleanly.
+        rows = stats.execute(
+            "SELECT id, range_start_iso, range_end_iso, cost_usd "
+            "  FROM weekly_cost_snapshots "
+            " WHERE mode = 'auto' AND project IS NULL "
+            "   AND range_start_iso IS NOT NULL "
+            "   AND range_end_iso IS NOT NULL "
+            "   AND unixepoch(range_end_iso) "
+            "       <= unixepoch('now', '-1 hour')"
+        ).fetchall()
+        if not rows:
+            sub_status.append(
+                "R-DEDUP2: skipped (no eligible weekly_cost_snapshots rows)"
+            )
+        else:
+            checked = 0
+            for snap_id, start_iso, end_iso, stored in rows:
+                # Match the PRODUCTION writer's predicate exactly:
+                # `iter_entries` converts the input datetimes to UTC ISO
+                # and then runs the closed-interval lex compare
+                # `timestamp_utc >= ? AND timestamp_utc <= ?` against
+                # `session_entries.timestamp_utc` (which is stored in
+                # UTC). Normalizing the stored `range_*_iso` (which
+                # may carry a host offset like `+03:00`) to UTC ISO
+                # here mirrors that one-shot conversion and keeps the
+                # row set identical to what `compute_week_cost`
+                # walked at write time.
+                start_utc = dt.datetime.fromisoformat(start_iso).astimezone(
+                    dt.timezone.utc).isoformat()
+                end_utc = dt.datetime.fromisoformat(end_iso).astimezone(
+                    dt.timezone.utc).isoformat()
+                entries = cache.execute(
+                    "SELECT model, input_tokens, output_tokens, "
+                    "       cache_create_tokens, cache_read_tokens, "
+                    "       usage_extra_json, cost_usd_raw "
+                    "  FROM session_entries "
+                    " WHERE timestamp_utc >= ? "
+                    "   AND timestamp_utc <= ?",
+                    (start_utc, end_utc),
+                ).fetchall()
+                computed = 0.0
+                for model, i, o, cc, cr, extras_json, raw in entries:
+                    usage = {
+                        "input_tokens": i,
+                        "output_tokens": o,
+                        "cache_creation_input_tokens": cc,
+                        "cache_read_input_tokens": cr,
+                    }
+                    if extras_json:
+                        usage.update(json.loads(extras_json))
+                    computed += _calculate_entry_cost(
+                        model, usage, mode="auto", cost_usd=raw,
+                    )
+                assert abs(stored - computed) < 1e-9, (
+                    f"R-DEDUP2 violated: snapshot id={snap_id} "
+                    f"stored=${stored:.9f} computed=${computed:.9f} "
+                    f"range=[{start_iso}, {end_iso}]"
+                )
+                checked += 1
+            sub_status.append(
+                f"R-DEDUP2: ok ({checked} weekly_cost_snapshots rows)"
+            )
+    finally:
+        stats.close()
+        cache.close()
+
+# ─── R-DEDUP3 ──────────────────────────────────────────────────────────
+if not stats_db.exists() or not cache_db.exists():
+    sub_status.append(
+        "R-DEDUP3: skipped (production stats.db/cache.db not present)"
+    )
+else:
+    stats = sqlite3.connect(f"file:{stats_db}?mode=ro", uri=True)
+    cache = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
+    try:
+        # Active block = the most recent five_hour_blocks row whose
+        # block_start_at + 5h is still in the future. Mirrors the same
+        # "is this block still live?" predicate the dashboard / TUI use
+        # for the ACTIVE row. unixepoch() on both sides keeps the
+        # comparison offset-agnostic (block_start_at may carry host
+        # offset; `now_utc_iso` is +00:00).
+        now_utc_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+        active = stats.execute(
+            "SELECT block_start_at, last_observed_at_utc, total_cost_usd "
+            "  FROM five_hour_blocks "
+            " WHERE unixepoch(block_start_at) + 5 * 3600 "
+            "       > unixepoch(?) "
+            " ORDER BY block_start_at DESC LIMIT 1",
+            (now_utc_iso,),
+        ).fetchone()
+        if active is None:
+            sub_status.append(
+                "R-DEDUP3: skipped (no active 5h block on host)"
+            )
+        else:
+            block_start_at, last_observed_at_utc, stored_cost = active
+            # Match `get_claude_session_entries` interval semantics: lex
+            # `timestamp_utc >= ? AND <= ?` on ISO strings AFTER
+            # normalizing both bounds to UTC. `block_start_at` is stored
+            # with the host's display offset (e.g. `+03:00`) per
+            # `parse_iso_datetime`'s host-local fallback (CLAUDE.md
+            # "Cross-reset flag is interval-based" note); raw lex compare
+            # against UTC-keyed `timestamp_utc` would silently miss every
+            # entry on a non-UTC host. Normalizing here mirrors the
+            # one-shot `astimezone(utc).isoformat()` `iter_entries` does
+            # at write time, keeping the row set identical to what
+            # `_compute_block_totals` walked.
+            block_start_utc = dt.datetime.fromisoformat(
+                block_start_at).astimezone(dt.timezone.utc).isoformat()
+            last_obs_utc = dt.datetime.fromisoformat(
+                last_observed_at_utc.replace("Z", "+00:00")
+            ).astimezone(dt.timezone.utc).isoformat()
+            # Cache-drift guard: if `session_entries` has rows with
+            # `timestamp_utc` inside the block window that were INSERTed
+            # or REPLACEd (highest-wins) AFTER the rollup's last
+            # `record-usage` tick, the rollup is stale by design — the
+            # recompute would diverge through no fault of the writer.
+            # We can't read a per-row `last_modified`, but the cache's
+            # `session_files.last_ingested_at` is a sound proxy: any
+            # file whose tail-ingest landed after `last_obs_utc` may
+            # have changed a row in our window. Skip in that case
+            # rather than report a spurious fail.
+            stale_row = cache.execute(
+                "SELECT 1 FROM session_files "
+                " WHERE last_ingested_at > ? LIMIT 1",
+                (last_obs_utc,),
+            ).fetchone()
+            if stale_row is not None:
+                sub_status.append(
+                    f"R-DEDUP3: skipped (active block at "
+                    f"{block_start_at} — cache ingested after last "
+                    f"record-usage tick)"
+                )
+            else:
+                entries = cache.execute(
+                    "SELECT model, input_tokens, output_tokens, "
+                    "       cache_create_tokens, cache_read_tokens, "
+                    "       usage_extra_json, cost_usd_raw "
+                    "  FROM session_entries "
+                    " WHERE timestamp_utc >= ? "
+                    "   AND timestamp_utc <= ?",
+                    (block_start_utc, last_obs_utc),
+                ).fetchall()
+                computed_cost = 0.0
+                for model, i, o, cc, cr, extras_json, raw in entries:
+                    usage = {
+                        "input_tokens": i,
+                        "output_tokens": o,
+                        "cache_creation_input_tokens": cc,
+                        "cache_read_input_tokens": cr,
+                    }
+                    if extras_json:
+                        usage.update(json.loads(extras_json))
+                    computed_cost += _calculate_entry_cost(
+                        model, usage, mode="auto", cost_usd=raw,
+                    )
+                assert abs(stored_cost - computed_cost) < 1e-9, (
+                    f"R-DEDUP3 violated: active block "
+                    f"block_start_at={block_start_at} "
+                    f"stored=${stored_cost:.9f} "
+                    f"computed=${computed_cost:.9f}"
+                )
+                sub_status.append(
+                    f"R-DEDUP3: ok (active block at {block_start_at})"
+                )
+    finally:
+        stats.close()
+        cache.close()
+
+print("OK")
+for s in sub_status:
+    print(f"  {s}")
+PYDEDUP
+    rc_py=$?
+    if [ $rc_py -ne 0 ]; then
+        echo "RECONCILE FAIL $name: $result"
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    echo "PASS $name"
+    # Surface the per-invariant sub-status lines so operators can see
+    # which of R-DEDUP1/2/3 actually ran vs skipped on this host.
+    echo "$result" | tail -n +2
+    pass_count=$((pass_count + 1))
+}
+dedup_invariants
+
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

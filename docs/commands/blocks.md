@@ -1,7 +1,19 @@
 # `blocks`
 
-Claude usage grouped by 5-hour session block. Drop-in replacement for
-`ccusage blocks`, offline.
+Claude usage grouped by 5-hour session block.
+
+`cctally blocks` aims for parity with `ccusage blocks`'s output shape but
+implements two intentional improvements over upstream:
+
+1. **5h block boundaries follow Anthropic's `rate_limits.5h.resets_at`**
+   (10-minute granularity), not the legacy hour-floor algorithm. A first
+   message at 7:10 PM anchors the block at 7:10, not 7:00. ccusage still
+   uses `floor_to_hour` (`rust/crates/ccusage/src/blocks.rs:51-54`).
+2. **Duplicate-pair dedup matches ccusage's `should_replace_deduped_entry`**
+   (`rust/crates/ccusage/src/claude_loader.rs:531`) — higher-token-total
+   wins, `speed`-set breaks ties. Fixed in v1.12.0; pre-fix versions kept
+   the streaming-intermediate row and systematically under-counted output
+   tokens on tool-using turns.
 
 ## Synopsis
 

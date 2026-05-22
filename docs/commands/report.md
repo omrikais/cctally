@@ -3,6 +3,15 @@
 Trend table of dollars per 1% weekly usage. The headline command of this
 project.
 
+As of v1.12.0, historical `weekly_cost_snapshots` rows are recomputed
+under the corrected dedup logic (per stats migration
+`008_recompute_weekly_cost_snapshots_dedup_fix`). `report` and `weekly`
+agree on historical cost for rows with `mode='auto' AND project IS NULL`.
+Rows with `mode='display'` (user-supplied costs) and per-project scoped
+snapshots are left untouched. Very old rows without `range_start_iso` /
+`range_end_iso` populated are skipped — their pre-fix value persists; if
+you need them corrected, delete the row and re-run `sync-week`.
+
 ## Synopsis
 
 ```

@@ -5,6 +5,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Dedup of streaming + post-stream JSONL rows now picks the post-stream finalization (matching upstream `ccusage`).** Earlier versions kept the FIRST emission of each `(message.id, requestId)` pair, which on tool-using turns is a streaming intermediate with `output_tokens=1`; the post-stream row (with the real `output_tokens` count) was rejected. Result was a systematic ~60% under-count of output tokens on agentic workloads, propagating to roughly $5/active block of missing cost on opus-4-7. cctally now picks the row with the higher token total (ccusage `should_replace_deduped_entry`), with a `speed`-set tiebreak for equal totals.
+
+### Changed
+- **`report` historical costs will be higher after upgrade.** Migration `008_recompute_weekly_cost_snapshots_dedup_fix` (stats.db) recomputes every `weekly_cost_snapshots.cost_usd` from the corrected session_entries for rows where `mode='auto' AND project IS NULL`. `cctally weekly` was already self-healing (it recomputes on read per CLAUDE.md). `report` and `weekly` now agree on historical figures for those rows.
+- **`percent-breakdown` and `five-hour-breakdown` pre-fix rows stay as-recorded.** `percent_milestones` and `five_hour_milestones` are write-once tables capturing cost-at-moment-of-crossing; per the existing "Write-once milestones" rule we do NOT backfill. New milestones from the upgrade forward are correct.
+
+### Migration notes
+- First `cctally` command after upgrade triggers cache migration `001_dedup_highest_wins` (cache.db): wipes session_entries + session_files and re-ingests from `~/.claude/projects/**/*.jsonl`. Expect a 10-30s pause on the first command for typical histories.
+- Stats migration `008_recompute_weekly_cost_snapshots_dedup_fix` requires that cache migration 001 has run first. If you ONLY run stats-only commands (e.g. `cctally report` exclusively), 008 will stay pending until you run any JSONL-reading command once (`cctally weekly`, `cctally blocks`, etc.). Run `cctally db status` to verify both migrations applied.
+- `weekly_cost_snapshots` rows with `range_start_iso IS NULL` are skipped by 008 (those columns were added later). Pre-fix value persists; delete the row and re-run `sync-week` if you need it recomputed.
+- To defer: `cctally db skip 001_dedup_highest_wins` (or `008_…`) with a `--reason`. Reverse with `db unskip`. Numbers stay pre-fix until you do.
+
 ## [1.11.1] - 2026-05-22
 
 ### Changed

@@ -55,6 +55,19 @@ the dict, and the next read sees the new prices — no invalidation.
 `cache-sync --rebuild` is always safe. If `cache.db` can't be opened (e.g.
 read-only fs), `get_entries()` falls back to direct JSONL parse.
 
+**JSONL dedup tiebreaker (v1.12.0+).** Two `type:assistant` rows in a
+single `~/.claude/projects/**/*.jsonl` can share the same
+`(message.id, requestId)` pair when Claude Code emits a streaming
+intermediate (`output_tokens=1`, no `speed` field) followed by a
+post-stream finalization (`output_tokens=N`, `speed="standard"`). Cache
+ingest and direct-JSONL parse both pick the higher-token row, breaking
+ties on `speed`-presence. This matches ccusage's
+`should_replace_deduped_entry` (`claude_loader.rs:531`). The cache's
+`session_entries` UNIQUE index on `(msg_id, req_id)` is partial
+(`WHERE msg_id IS NOT NULL AND req_id IS NOT NULL`); the ingest INSERT
+uses `ON CONFLICT(msg_id, req_id) WHERE msg_id IS NOT NULL AND req_id
+IS NOT NULL DO UPDATE … WHERE …` to match it.
+
 ## Week boundaries
 
 The hardest part of the codebase. Subscription weeks are anchored to the
