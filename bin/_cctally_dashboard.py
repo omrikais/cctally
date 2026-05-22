@@ -2071,10 +2071,41 @@ def build_cache_report_snapshot(
     # React consumer relies on (the sparkline ladder is hard-sized to
     # ``window_days`` points). Regression:
     # ``test_build_cache_report_snapshot_days_bounded_by_window``.
-    days_newest_first = sorted(
+    #
+    # Synthetic-today insertion: if the trailing window has older activity
+    # but no entries for the current display-tz day, the kernel emits a
+    # rows[] list whose newest row is yesterday (or older). Both React
+    # consumers (``CacheSparkline`` and ``CacheNetBars``) treat the
+    # rightmost element of ``days`` as "Today" purely positionally
+    # (``ordered.length - 1`` / ``isLast ? 'Today'``), so without an
+    # explicit today bucket they would mis-label the older row as Today.
+    # Insert a zero-valued CacheReportDailyRow at position 0 (newest)
+    # whenever ``today_row is None``. The zero values mirror the
+    # ``today_spotlight`` synthesized above (kept in lock-step), and
+    # contribute 0 to ``seven_day_*`` / ``fourteen_day_*`` rollups so
+    # the rollup math stays untouched.
+    raw_days_newest_first = sorted(
         result.rows, key=lambda r: r.date or "", reverse=True,
-    )[:window_days]
-    days = tuple(
+    )
+    days_newest_first: list = []
+    if today_row is None:
+        # Build a zero-valued synthetic today row mirroring today_spotlight.
+        days_newest_first.append(
+            CacheReportDailyRow(
+                date=today_iso,
+                cache_hit_percent=0.0,
+                input_tokens=0,
+                output_tokens=0,
+                cache_creation_tokens=0,
+                cache_read_tokens=0,
+                saved_usd=0.0,
+                wasted_usd=0.0,
+                net_usd=0.0,
+                anomaly_triggered=False,
+                anomaly_reasons=(),
+            )
+        )
+    days_newest_first.extend(
         CacheReportDailyRow(
             date=r.date or "",
             cache_hit_percent=r.cache_hit_percent,
@@ -2088,8 +2119,9 @@ def build_cache_report_snapshot(
             anomaly_triggered=r.anomaly_triggered,
             anomaly_reasons=tuple(r.anomaly_reasons),
         )
-        for r in days_newest_first
+        for r in raw_days_newest_first
     )
+    days = tuple(days_newest_first[:window_days])
 
     # By-project + by-model breakdowns are window-wide aggregates (not
     # today-only) so the panel can surface the project / model carrying

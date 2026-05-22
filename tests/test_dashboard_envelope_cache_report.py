@@ -345,6 +345,73 @@ def test_build_cache_report_snapshot_delta_pp_sign_matches_spec(monkeypatch):
     )
 
 
+def test_build_cache_report_snapshot_idle_today_gets_synthetic_zero_row(monkeypatch):
+    """Regression: when the trailing window has older activity but no entries
+    on the current display-tz day, the envelope's ``days[]`` MUST still
+    have today as its newest (index 0) row — otherwise the React
+    consumers (which treat the rightmost element as "Today" positionally)
+    mislabel an older row as Today.
+
+    Seed activity on 2026-05-14..2026-05-19 (yesterday and earlier) but
+    nothing on today (2026-05-20). Expect ``days[0].date == "2026-05-20"``
+    with all token / cost values at zero, mirroring ``today`` spotlight.
+    """
+    dash, cctally_ns = _bootstrap_dashboard()
+    now_utc = dt.datetime(2026, 5, 20, 23, 0, tzinfo=dt.timezone.utc)
+    # 6 days of activity ending YESTERDAY (2026-05-19). NOTHING on 2026-05-20.
+    days = [
+        dt.datetime(2026, 5, d, 12, 0, tzinfo=dt.timezone.utc)
+        for d in range(14, 20)  # 2026-05-14 .. 2026-05-19 (NO 2026-05-20)
+    ]
+    entries = [
+        _make_joined_entry(
+            ts_utc=ts,
+            cache_read=2000, cache_creation=200,
+            input_tokens=500, output_tokens=100,
+            project_path="/proj/a",
+        )
+        for ts in days
+    ]
+    monkeypatch.setitem(
+        cctally_ns, "get_claude_session_entries",
+        lambda *a, **kw: entries,
+    )
+
+    snap = dash.build_cache_report_snapshot(
+        now_utc=now_utc,
+        anomaly_threshold_pp=15,
+        anomaly_window_days=14,
+        display_tz=ZoneInfo("Etc/UTC"),
+    )
+
+    assert snap.is_empty is False
+    assert snap.today.date == "2026-05-20"
+    # The newest day in ``days`` MUST be today, not yesterday.
+    assert snap.days[0].date == "2026-05-20", (
+        f"days[0]={snap.days[0].date} — expected synthetic today row; "
+        f"React consumers will mislabel this as 'Today' positionally."
+    )
+    # Zero-valued (mirrors today_spotlight when today_row is None).
+    assert snap.days[0].cache_hit_percent == 0.0
+    assert snap.days[0].input_tokens == 0
+    assert snap.days[0].output_tokens == 0
+    assert snap.days[0].cache_creation_tokens == 0
+    assert snap.days[0].cache_read_tokens == 0
+    assert snap.days[0].saved_usd == 0.0
+    assert snap.days[0].wasted_usd == 0.0
+    assert snap.days[0].net_usd == 0.0
+    assert snap.days[0].anomaly_triggered is False
+    assert snap.days[0].anomaly_reasons == ()
+    # Yesterday's row sits at index 1.
+    assert snap.days[1].date == "2026-05-19"
+    # Total row count = 1 synthetic + 6 real, bounded by window_days.
+    assert len(snap.days) == 7
+    # The synthetic zero row contributes 0 to all rollups — totals should
+    # equal what they would have been pre-fix.
+    assert snap.fourteen_day_counterfactual_usd > 0
+    assert snap.seven_day_net_usd > 0
+
+
 def test_build_cache_report_snapshot_days_bounded_by_window(monkeypatch):
     """Spec §4.2: ``days`` has length up to ``window_days`` (i.e. <= 14).
 

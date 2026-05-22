@@ -70,10 +70,20 @@ export function CacheNetBars({ days, size }: CacheNetBarsProps) {
   }
 
   if (isLarge) {
-    // Symmetric scale (the modal variant — unchanged behavior).
+    // Symmetric scale. Positive days are drawn as a green ``saved_usd``
+    // bar with a red ``wasted_usd`` segment stacked on top, so the scale
+    // MUST include the full stacked height (``saved_usd + wasted_usd``).
+    // Pre-fix the denominator used ``max(saved_usd, |net_usd|)``, which
+    // omits the wasted segment entirely: with ``saved=10, wasted=9,
+    // net=1`` the chosen scale = 10 while the stacked bar reaches 19,
+    // so the red segment was drawn at negative y and clipped off the top
+    // of the SVG. Negative days are unaffected — ``|net_usd|`` is bounded
+    // by the new denominator for free.
     const maxAbsNet = Math.max(
       1e-9,
-      ...ordered.map((d) => Math.max(d.saved_usd, Math.abs(d.net_usd))),
+      ...ordered.map((d) =>
+        Math.max(d.saved_usd + d.wasted_usd, Math.abs(d.net_usd)),
+      ),
     );
     const yScale = (cfg.height - cfg.padTop - cfg.padBot) / 2 / maxAbsNet;
     const midY = cfg.padTop + (cfg.height - cfg.padTop - cfg.padBot) / 2;

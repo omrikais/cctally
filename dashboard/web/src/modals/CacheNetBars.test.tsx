@@ -142,4 +142,41 @@ describe('<CacheNetBars size="large" /> still wraps in section chrome', () => {
     const { container } = render(<CacheNetBars days={[]} size="large" />);
     expect(container.textContent).toMatch(/No daily activity to render/i);
   });
+
+  it('keeps the stacked green+red bar within the SVG when wasted_usd is large', () => {
+    // Regression: positive days draw a green ``saved_usd`` segment with a
+    // red ``wasted_usd`` segment stacked on top. The pre-fix y-scale only
+    // looked at ``max(saved_usd, |net_usd|)``, which omitted the wasted
+    // segment — with ``saved=10, wasted=9, net=1`` the stacked height
+    // ran past the top of the SVG and the red segment was drawn at a
+    // negative y. The post-fix scale uses ``saved_usd + wasted_usd`` so
+    // the stack always fits.
+    const day: CacheReportDailyRow = {
+      date: '2026-05-20',
+      cache_hit_percent: 50,
+      input_tokens: 1_000,
+      output_tokens: 100,
+      cache_creation_tokens: 9_000,
+      cache_read_tokens: 1_000,
+      saved_usd: 10,
+      wasted_usd: 9,
+      net_usd: 1,
+      anomaly_triggered: false,
+      anomaly_reasons: [],
+    };
+    const { container } = render(
+      <CacheNetBars days={[day]} size="large" />,
+    );
+    const bars = container.querySelectorAll<SVGRectElement>(
+      '[data-testid="crm-netbar"] rect',
+    );
+    expect(bars.length).toBe(2); // green base + red top.
+    // viewBox is "0 0 800 110" → top edge y=0.
+    bars.forEach((rect) => {
+      const y = parseFloat(rect.getAttribute('y') ?? '0');
+      const h = parseFloat(rect.getAttribute('height') ?? '0');
+      expect(y).toBeGreaterThanOrEqual(0);
+      expect(y + h).toBeLessThanOrEqual(110);
+    });
+  });
 });
