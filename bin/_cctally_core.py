@@ -5,14 +5,15 @@ logging (eprint), datetime helpers, week-name/bounds, time-of-day,
 alerts-config validation, open_db, WeekRef + make_week_ref,
 get_latest_usage_for_week.
 
-Path constants (APP_DIR, DB_PATH, LOG_DIR) intentionally live in
-bin/cctally and are read here via a call-time _cctally() accessor —
-this is the ONLY accessor use inside core. See
-docs/superpowers/specs/2026-05-17-cctally-core-kernel-extraction.md §2.
+Path constants (APP_DIR, DB_PATH, LOG_DIR, etc.) live in this module as
+of 2026-05-22 (issue #84); `_cctally_core` is the single source of truth
+and the only legal monkeypatch target for the 22 promoted globals listed
+below. See docs/superpowers/specs/2026-05-22-cctally-core-data-globals.md.
 """
 from __future__ import annotations
 import datetime as dt
 import os
+import pathlib
 import re
 import sqlite3
 import sys
@@ -23,6 +24,53 @@ from typing import Any
 
 def _cctally():
     return sys.modules["cctally"]
+
+
+# === Path constants ==================================================
+#
+# Promoted from bin/cctally per docs/superpowers/specs/2026-05-22-cctally-core-data-globals.md.
+# After this promotion `_cctally_core` is the single source of truth and
+# the only legal monkeypatch target. `bin/cctally` keeps eager re-exports
+# for ad-hoc REPL / scripts; tests MUST target this module directly.
+
+APP_DIR = pathlib.Path.home() / ".local" / "share" / "cctally"
+LEGACY_APP_DIR = pathlib.Path.home() / ".local" / "share" / "ccusage-subscription"
+LOG_DIR = APP_DIR / "logs"
+
+DB_PATH = APP_DIR / "stats.db"
+CACHE_DB_PATH = APP_DIR / "cache.db"
+
+CACHE_LOCK_PATH = APP_DIR / "cache.db.lock"
+CACHE_LOCK_CODEX_PATH = APP_DIR / "cache.db.codex.lock"
+CONFIG_LOCK_PATH = APP_DIR / "config.json.lock"
+
+CONFIG_PATH = APP_DIR / "config.json"
+
+MIGRATION_ERROR_LOG_PATH = LOG_DIR / "migration-errors.log"
+
+# CHANGELOG_PATH: honor CCTALLY_TEST_CHANGELOG_PATH env override; otherwise
+# resolves to <repo>/CHANGELOG.md based on bin/_cctally_core.py's location
+# (alongside bin/cctally, so the parent chain is the same).
+_CHANGELOG_OVERRIDE = os.environ.get("CCTALLY_TEST_CHANGELOG_PATH")
+if _CHANGELOG_OVERRIDE:
+    CHANGELOG_PATH = pathlib.Path(_CHANGELOG_OVERRIDE)
+else:
+    CHANGELOG_PATH = pathlib.Path(__file__).resolve().parent.parent / "CHANGELOG.md"
+
+HOOK_TICK_LOG_DIR = APP_DIR / "logs"
+HOOK_TICK_LOG_PATH = HOOK_TICK_LOG_DIR / "hook-tick.log"
+HOOK_TICK_LOG_ROTATED_PATH = HOOK_TICK_LOG_DIR / "hook-tick.log.1"
+HOOK_TICK_THROTTLE_PATH = APP_DIR / "hook-tick.last-fetch"
+HOOK_TICK_THROTTLE_LOCK_PATH = APP_DIR / "hook-tick.last-fetch.lock"
+
+UPDATE_STATE_PATH = APP_DIR / "update-state.json"
+UPDATE_SUPPRESS_PATH = APP_DIR / "update-suppress.json"
+UPDATE_LOCK_PATH = APP_DIR / "update.lock"
+UPDATE_LOG_PATH = APP_DIR / "update.log"
+UPDATE_LOG_ROTATED_PATH = APP_DIR / "update.log.1"
+UPDATE_CHECK_LAST_FETCH_PATH = APP_DIR / "update-check.last-fetch"
+
+CLAUDE_SETTINGS_PATH = pathlib.Path.home() / ".claude" / "settings.json"
 
 
 # === Logging =========================================================

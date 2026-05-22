@@ -135,15 +135,8 @@ def _load_sibling(name: str):
 _THIS_MODULE = sys.modules.get(__name__) or sys.modules.get("cctally")
 
 
-APP_DIR = pathlib.Path.home() / ".local" / "share" / "cctally"
-LEGACY_APP_DIR = pathlib.Path.home() / ".local" / "share" / "ccusage-subscription"
-# Hook-tick runtime artifacts (Section 1 of onboarding spec).
-HOOK_TICK_LOG_DIR = APP_DIR / "logs"
-HOOK_TICK_LOG_PATH = HOOK_TICK_LOG_DIR / "hook-tick.log"
-HOOK_TICK_LOG_ROTATED_PATH = HOOK_TICK_LOG_DIR / "hook-tick.log.1"
+# Hook-tick non-path constants (Section 1 of onboarding spec).
 HOOK_TICK_LOG_ROTATE_BYTES = 1024 * 1024  # 1 MB
-HOOK_TICK_THROTTLE_PATH = APP_DIR / "hook-tick.last-fetch"
-HOOK_TICK_THROTTLE_LOCK_PATH = APP_DIR / "hook-tick.last-fetch.lock"
 HOOK_TICK_DEFAULT_THROTTLE_SECONDS = 30.0
 
 # User-facing executables symlinked by `cctally setup` (Section 2.2 of spec).
@@ -166,19 +159,6 @@ SETUP_SYMLINK_NAMES = (
 SETUP_HOOK_EVENTS = ("PostToolBatch", "Stop", "SubagentStop")
 
 # === Release automation (issue #24) ===
-
-_CHANGELOG_OVERRIDE = os.environ.get("CCTALLY_TEST_CHANGELOG_PATH")
-if _CHANGELOG_OVERRIDE:
-    # Fixture-stability hook for `bin/cctally-share-test` — points
-    # `_share_resolve_version()` (and the broader release machinery) at a
-    # per-scenario CHANGELOG so version stamping in goldens stays
-    # deterministic regardless of the in-tree CHANGELOG state. Mirrors the
-    # `CCTALLY_AS_OF` env-only precedent: not in --help, no docstring
-    # surface; consumed exclusively by harness wrappers.
-    CHANGELOG_PATH = pathlib.Path(_CHANGELOG_OVERRIDE)
-else:
-    CHANGELOG_PATH = pathlib.Path(__file__).resolve().parent.parent / "CHANGELOG.md"
-
 
 # Public mirror repo identity (the GitHub `<owner>/<repo>` slug). Used by
 # Phase 3 (mirror push), Phase 4 (`gh release create` / view), and the
@@ -229,6 +209,45 @@ _canonicalize_optional_iso = _cctally_core._canonicalize_optional_iso
 make_week_ref = _cctally_core.make_week_ref
 _get_latest_row_for_week = _cctally_core._get_latest_row_for_week
 get_latest_usage_for_week = _cctally_core.get_latest_usage_for_week
+
+# === Path constants — re-exported from _cctally_core ================
+#
+# Promoted 2026-05-22 (docs/superpowers/specs/2026-05-22-cctally-core-data-globals.md).
+# `_cctally_core` is the single source of truth and the only legal
+# monkeypatch target. These re-exports exist for ad-hoc REPL / scripts
+# that read `cctally.APP_DIR` directly.
+
+APP_DIR = _cctally_core.APP_DIR
+LEGACY_APP_DIR = _cctally_core.LEGACY_APP_DIR
+LOG_DIR = _cctally_core.LOG_DIR
+
+DB_PATH = _cctally_core.DB_PATH
+CACHE_DB_PATH = _cctally_core.CACHE_DB_PATH
+
+CACHE_LOCK_PATH = _cctally_core.CACHE_LOCK_PATH
+CACHE_LOCK_CODEX_PATH = _cctally_core.CACHE_LOCK_CODEX_PATH
+CONFIG_LOCK_PATH = _cctally_core.CONFIG_LOCK_PATH
+
+CONFIG_PATH = _cctally_core.CONFIG_PATH
+
+MIGRATION_ERROR_LOG_PATH = _cctally_core.MIGRATION_ERROR_LOG_PATH
+
+CHANGELOG_PATH = _cctally_core.CHANGELOG_PATH
+
+HOOK_TICK_LOG_DIR = _cctally_core.HOOK_TICK_LOG_DIR
+HOOK_TICK_LOG_PATH = _cctally_core.HOOK_TICK_LOG_PATH
+HOOK_TICK_LOG_ROTATED_PATH = _cctally_core.HOOK_TICK_LOG_ROTATED_PATH
+HOOK_TICK_THROTTLE_PATH = _cctally_core.HOOK_TICK_THROTTLE_PATH
+HOOK_TICK_THROTTLE_LOCK_PATH = _cctally_core.HOOK_TICK_THROTTLE_LOCK_PATH
+
+UPDATE_STATE_PATH = _cctally_core.UPDATE_STATE_PATH
+UPDATE_SUPPRESS_PATH = _cctally_core.UPDATE_SUPPRESS_PATH
+UPDATE_LOCK_PATH = _cctally_core.UPDATE_LOCK_PATH
+UPDATE_LOG_PATH = _cctally_core.UPDATE_LOG_PATH
+UPDATE_LOG_ROTATED_PATH = _cctally_core.UPDATE_LOG_ROTATED_PATH
+UPDATE_CHECK_LAST_FETCH_PATH = _cctally_core.UPDATE_CHECK_LAST_FETCH_PATH
+
+CLAUDE_SETTINGS_PATH = _cctally_core.CLAUDE_SETTINGS_PATH
 
 _lib_semver = _load_sibling("_lib_semver")
 _SEMVER_NUM = _lib_semver._SEMVER_NUM
@@ -822,15 +841,7 @@ LEGACY_STATUSLINE_PATHS = (
 )
 LEGACY_STATUSLINE_NEEDLE = "cctally record-usage"
 
-DB_PATH = APP_DIR / "stats.db"
-CACHE_DB_PATH = APP_DIR / "cache.db"
-CACHE_LOCK_PATH = APP_DIR / "cache.db.lock"
-CACHE_LOCK_CODEX_PATH = APP_DIR / "cache.db.codex.lock"
 CODEX_SESSIONS_DIR = pathlib.Path.home() / ".codex" / "sessions"
-CONFIG_PATH = APP_DIR / "config.json"
-CONFIG_LOCK_PATH = APP_DIR / "config.json.lock"
-LOG_DIR = APP_DIR / "logs"
-MIGRATION_ERROR_LOG_PATH = LOG_DIR / "migration-errors.log"
 
 # Seed `_cctally_db`'s namespace with path constants the migration
 # framework + error sentinel + cmd_db_* helpers reach via bare-name
@@ -868,18 +879,9 @@ _cctally_db.CACHE_DB_PATH = CACHE_DB_PATH
 # zero test-file edits.
 
 # === Update subcommand (Section 1 of update-subcommand spec) ===
-# Path constants for the `cctally update` feature. Centralised here
-# (alongside other APP_DIR-derived paths) so the test fixture loader in
-# tests/conftest.py:redirect_paths can monkeypatch them, and so later
-# tasks (install detection, version-check pipeline, dashboard worker)
-# don't have to revisit constant placement.
-UPDATE_STATE_PATH         = APP_DIR / "update-state.json"
-UPDATE_SUPPRESS_PATH      = APP_DIR / "update-suppress.json"
-UPDATE_LOCK_PATH          = APP_DIR / "update.lock"
-UPDATE_LOG_PATH           = APP_DIR / "update.log"
-UPDATE_LOG_ROTATED_PATH   = APP_DIR / "update.log.1"
+# Non-path constants for the `cctally update` feature. Path constants
+# now live in bin/_cctally_core.py (promoted 2026-05-22; see #84).
 UPDATE_LOG_ROTATE_BYTES   = 1024 * 1024  # 1 MB; spec §1.5
-UPDATE_CHECK_LAST_FETCH_PATH = APP_DIR / "update-check.last-fetch"
 
 UPDATE_NPM_REGISTRY_URL = os.environ.get(
     "CCTALLY_TEST_UPDATE_NPM_URL",
@@ -7721,9 +7723,6 @@ def _is_cctally_hook_command(cmd: str) -> bool:
 
 class SetupError(RuntimeError):
     """Raised when setup hits a hard prerequisite failure (Section 2 of spec)."""
-
-
-CLAUDE_SETTINGS_PATH = pathlib.Path.home() / ".claude" / "settings.json"
 
 
 def _load_claude_settings(path: pathlib.Path = CLAUDE_SETTINGS_PATH) -> dict:
