@@ -142,7 +142,11 @@ export function CacheReportPanel() {
     // Worst trigger picks the headline; cache_drop wins when both fire.
     const reasons = cr.today.anomaly_reasons;
     if (reasons.includes('cache_drop') && cr.today.delta_pp !== null) {
-      const drop = Math.abs(fmt.pctFloor(cr.today.delta_pp));
+      // Snap-up-floor on the absolute value (matches Spotlight at
+      // CacheReportSpotlight.tsx:48). Floor-then-abs would round a
+      // negative delta away from zero (-16.7 -> floor=-17 -> abs=17),
+      // disagreeing with the modal by 1.
+      const drop = fmt.pctFloor(Math.abs(cr.today.delta_pp));
       headline = (
         <>
           Today: cache hit <span className="delta-bad">↓ {drop}pp</span>

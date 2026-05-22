@@ -1750,6 +1750,11 @@ def _build_projects_share_panel_data(options: dict,
 
 # Hardcoded for v1; F10 tracks lifting via cache_report.anomaly_window_days config.
 CACHE_REPORT_WINDOW_DAYS = 14
+# Two concepts that happen to share a value today: the data window the
+# panel renders vs. the baseline window the anomaly classifier reads
+# back over. Split so F10 can lift the latter without dragging the
+# former along.
+CACHE_REPORT_ANOMALY_WINDOW_DAYS = 14
 
 @dataclass(frozen=True)
 class CacheReportDailyRow:

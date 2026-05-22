@@ -334,6 +334,38 @@ describe('<CacheReportModal /> settings popover', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
     fetchSpy.mockRestore();
   });
+
+  // Bound coverage: the server backstops via _validate_cache_report_settings,
+  // but a regression that drops the lower or upper bound on the client (or
+  // accepts an empty / negative value) should still fire the inline-error
+  // path so the user sees the message without a server round-trip.
+  // NOTE: fractional values like '15.5' are NOT in this matrix — the client
+  // uses parseInt(value, 10) which silently truncates to 15 (a valid
+  // in-range integer) and POSTs successfully. The server is the only place
+  // that rejects fractional input; if you want client-side fractional
+  // rejection you have to swap parseInt for a strict /^-?\d+$/ guard.
+  it.each([
+    { name: 'upper bound (>100)', value: '101' },
+    { name: 'empty string', value: '' },
+    { name: 'negative integer', value: '-1' },
+  ])('client-side guard rejects $name', ({ value }) => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{}', { status: 200 }),
+    );
+    updateSnapshot(envelopeWith(makeCacheReport()));
+    render(<CacheReportModal />);
+    fireEvent.click(
+      screen.getByRole('button', { name: /cache report settings/i }),
+    );
+    const input = screen.getByLabelText(/anomaly threshold/i);
+    fireEvent.change(input, { target: { value } });
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+    expect(
+      screen.getByText(/must be an integer between 1 and 100/i),
+    ).toBeInTheDocument();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
+  });
 });
 
 describe('<CacheReportModal /> empty + loading states', () => {

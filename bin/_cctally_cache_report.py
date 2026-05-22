@@ -34,6 +34,12 @@ CACHE_REPORT_MIN_BASELINE_DAYS = 5
 CACHE_REPORT_MIN_BASELINE_SESSIONS = 10
 
 
+# Literal alias mirroring TS `CacheAnomalyReason` at
+# dashboard/web/src/types/envelope.ts:71 — keeps the two surfaces in
+# lockstep so a typo on either side fails type-check.
+CacheAnomalyReason = Literal["net_negative", "cache_drop"]
+
+
 @dataclass
 class CacheModelBreakdown:
     model_name: str
@@ -97,7 +103,7 @@ class CacheRow:
 
     # Anomaly (populated by _classify_anomalies)
     anomaly_triggered: bool = False
-    anomaly_reasons: list[str] = field(default_factory=list)
+    anomaly_reasons: list[CacheAnomalyReason] = field(default_factory=list)
 
     @property
     def total_tokens(self) -> int:
@@ -629,7 +635,7 @@ def _classify_anomalies(
     anchors: list[dt.datetime | None] = [_row_anchor(r) for r in rows]
 
     for i, row in enumerate(rows):
-        reasons: list[str] = []
+        reasons: list[CacheAnomalyReason] = []
 
         # Trigger 1: net_negative (no baseline needed; cache-activity guard).
         if row.cache_creation_tokens + row.cache_read_tokens > 0:

@@ -1396,6 +1396,7 @@ mark.current {
 .panel.accent-blue:focus-visible   { outline: 2px solid var(--accent-blue); }
 .panel.accent-indigo:focus-visible { outline: 2px solid var(--accent-indigo); }
 .panel.accent-magenta:focus-visible { outline: 2px solid var(--accent-magenta); }
+.panel.accent-teal:focus-visible   { outline: 2px solid var(--accent-teal); }
 
 /* ----- Sync chip status text (Phase 11) ----- */
 /* SyncChip renders a span; the parent .topbar-sync <button> is the click
