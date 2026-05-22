@@ -66,6 +66,95 @@ def _window_args(cmd):
     return []
 
 
+@pytest.mark.parametrize("cmd", INSCOPE_CMDS_ALL)
+class TestAliasSurface:
+    """§9.1 / §7.6 — every in-scope cmd accepts the full ccusage alias
+    surface: -z/--timezone, -O/--offline/--no-offline, --compact,
+    --config, -d/--debug, --debug-samples, --single-thread, --color,
+    --no-color. The helper's `_argparse_has_arg` guard means parsers
+    that already declared a flag don't trip an ArgumentError.
+    """
+
+    def test_z_timezone_alias(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "-z", "UTC")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_timezone_long_form(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "--timezone", "UTC")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_offline_short(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "-O")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_offline_long_form(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "--offline")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_no_offline(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "--no-offline")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_compact_parses(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "--compact")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_config_path_noop(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "--config", "/tmp/nonexistent.json")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+        # No spurious "config not found" warning (it's a documented no-op).
+        assert "config not found" not in r.stderr.lower()
+
+    def test_debug_emits_one_time_stderr_note(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "--debug", "--debug-samples", "3")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+        # When --debug is set, the §7.6.2 note appears on stderr exactly once.
+        note = "--debug diagnostic-sample emission is not yet wired"
+        note_count = r.stderr.count(note)
+        assert note_count == 1, f"expected exactly 1 note, got {note_count}: {r.stderr!r}"
+
+    def test_debug_note_absent_without_flag(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd))
+        assert "diagnostic-sample emission is not yet wired" not in r.stderr
+
+    def test_single_thread_noop(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "--single-thread")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_color_alias_parses(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "--color")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_no_color_alias_parses(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "--no-color")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+
+def test_debug_note_emitted_once_per_process(tmp_path, monkeypatch):
+    """Spec §7.6.2 / §9.1: the `_DEBUG_NOTE_EMITTED` guard means two
+    invocations in the SAME Python process produce the note exactly
+    once. Sub-process tests can't observe this; drive via the
+    importable cctally module.
+    """
+    from importlib.machinery import SourceFileLoader
+
+    loader = SourceFileLoader("cctally", str(CCTALLY))
+    spec = importlib.util.spec_from_loader("cctally", loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["cctally"] = mod
+    loader.exec_module(mod)
+    # Reset the guard so this test is independent of test ordering.
+    mod._DEBUG_NOTE_EMITTED = False
+
+    buf = io.StringIO()
+    ns = argparse.Namespace(debug=True)
+    with contextlib.redirect_stderr(buf):
+        mod._emit_debug_note_if_set(ns)
+        mod._emit_debug_note_if_set(ns)  # second call must be a no-op
+    note = "diagnostic-sample emission is not yet wired"
+    assert buf.getvalue().count(note) == 1
+
+
 @pytest.mark.parametrize("cmd", INSCOPE_CMDS_DATE)
 class TestDualDateForm:
     """§7.1.1 / §9.1 — every date-taking in-scope cmd accepts BOTH

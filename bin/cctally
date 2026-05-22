@@ -995,6 +995,42 @@ def _sum_cost_for_range(
     return total
 
 
+def _bridge_z_into_tz(args: argparse.Namespace) -> None:
+    """Promote ``-z`` / ``--timezone`` onto ``args.tz`` when ``--tz`` is unset.
+
+    Session A (spec §7.2) defines a 4-rung precedence for Claude display tz:
+    ``--tz`` > ``-z --timezone`` > ``config.display.tz`` > host-local. The
+    existing ``resolve_display_tz`` reads only ``args.tz`` and config; the
+    minimal-invasive way to fold in ``-z`` without modifying the shared
+    pure-fn layer is to set ``args.tz`` from ``args.timezone`` here when
+    ``--tz`` wasn't supplied. This mutates the namespace and is safe
+    because each cmd_* receives a fresh ``args`` per invocation.
+
+    Validates the bridged value via ``_argparse_tz`` so an invalid tz
+    name from ``-z`` surfaces the same canonical error as ``--tz``
+    (argparse-time validation can't run on the alias because the alias
+    flag is plain string, not ``type=_argparse_tz``).
+
+    Mirrors the rung-3 fallback ``_resolve_claude_tz_name`` exposes for
+    unit testing; the helper is used at call sites where a tz NAME is
+    needed in addition to (or instead of) the bridge.
+    """
+    if getattr(args, "tz", None) is not None:
+        return
+    tz_alias = getattr(args, "timezone", None)
+    if tz_alias is None:
+        return
+    try:
+        canonical = _argparse_tz(tz_alias)
+    except argparse.ArgumentTypeError as exc:
+        # Surface the same kind of error users get from --tz at parse
+        # time. We can't call parser.error from here, so emit-and-raise
+        # via SystemExit(2) for argparse-shape parity.
+        eprint(f"cctally: argument -z/--timezone: {exc}")
+        raise SystemExit(2) from exc
+    args.tz = canonical
+
+
 def _resolve_claude_tz_name(args: argparse.Namespace,
                             config: "dict | None") -> "str | None":
     """Resolve display-tz precedence for Claude reporting commands.
@@ -3469,7 +3505,9 @@ def _load_recorded_five_hour_windows(
 
 def cmd_blocks(args: argparse.Namespace) -> int:
     """Show usage report grouped by 5-hour session blocks."""
+    _emit_debug_note_if_set(args)
     config = load_config()
+    _bridge_z_into_tz(args)
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
 
@@ -3784,7 +3822,13 @@ def _parse_cli_date_range(
 def cmd_daily(args: argparse.Namespace) -> int:
     """Show usage report grouped by display-timezone date."""
     _share_validate_args(args)
+    _emit_debug_note_if_set(args)
     config = load_config()
+    # Session A (spec §7.2): bridge -z/--timezone into args.tz so the
+    # existing resolve_display_tz precedence absorbs the new alias. The
+    # canonical --tz still wins (it's set on the namespace before this
+    # bridge fires); when --tz is unset and -z is supplied, use -z.
+    _bridge_z_into_tz(args)
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
 
@@ -3858,6 +3902,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
         title_suffix="Daily",
         compact_split_fn=_daily_compact_split,
         breakdown=args.breakdown,
+        compact=getattr(args, "compact", False),
     ))
     return 0
 
@@ -3865,7 +3910,9 @@ def cmd_daily(args: argparse.Namespace) -> int:
 def cmd_monthly(args: argparse.Namespace) -> int:
     """Show usage report grouped by display-timezone calendar month."""
     _share_validate_args(args)
+    _emit_debug_note_if_set(args)
     config = load_config()
+    _bridge_z_into_tz(args)
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
 
@@ -3932,6 +3979,7 @@ def cmd_monthly(args: argparse.Namespace) -> int:
         title_suffix="Monthly",
         compact_split_fn=_monthly_compact_split,
         breakdown=args.breakdown,
+        compact=getattr(args, "compact", False),
     ))
     return 0
 
@@ -3939,7 +3987,9 @@ def cmd_monthly(args: argparse.Namespace) -> int:
 def cmd_weekly(args: argparse.Namespace) -> int:
     """Show Claude usage grouped by subscription week."""
     _share_validate_args(args)
+    _emit_debug_note_if_set(args)
     config = load_config()
+    _bridge_z_into_tz(args)
     args._resolved_tz = resolve_display_tz(args, config)
 
     now_utc = _command_as_of()
@@ -4049,6 +4099,7 @@ def cmd_weekly(args: argparse.Namespace) -> int:
         weeks=weeks,
         compact_split_fn=_daily_compact_split,
         breakdown=args.breakdown,
+        compact=getattr(args, "compact", False),
     ))
     return 0
 
@@ -5098,7 +5149,9 @@ def cmd_diff(args: argparse.Namespace) -> int:
 def cmd_session(args: argparse.Namespace) -> int:
     """Show Claude usage grouped by sessionId (merges resumed-across-files sessions)."""
     _share_validate_args(args)
+    _emit_debug_note_if_set(args)
     config = load_config()
+    _bridge_z_into_tz(args)
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
 
@@ -9808,6 +9861,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
     )
+    _add_ccusage_alias_args(bl, ansi_emit=False)
     bl.set_defaults(func=cmd_blocks)
 
     # -- five-hour-blocks --
@@ -9936,6 +9990,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
     )
+    _add_ccusage_alias_args(dy, ansi_emit=False)
     _add_share_args(dy)
     dy.set_defaults(func=cmd_daily)
 
@@ -9989,6 +10044,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
     )
+    _add_ccusage_alias_args(mo, ansi_emit=False)
     _add_share_args(mo)
     mo.set_defaults(func=cmd_monthly)
 
@@ -10024,6 +10080,7 @@ def build_parser() -> argparse.ArgumentParser:
     we.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
                     help="Display timezone: local, utc, or IANA name. "
                          "Overrides config display.tz for this call.")
+    _add_ccusage_alias_args(we, ansi_emit=False)
     _add_share_args(we)
     we.set_defaults(func=cmd_weekly)
 
@@ -10300,6 +10357,7 @@ def build_parser() -> argparse.ArgumentParser:
     se.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
                     help="Display timezone: local, utc, or IANA name. "
                          "Overrides config display.tz for this call.")
+    _add_ccusage_alias_args(se, ansi_emit=False)
     _add_share_args(se)
     se.set_defaults(func=cmd_session)
 

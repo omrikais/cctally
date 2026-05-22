@@ -977,6 +977,7 @@ def _render_bucket_table(
     title_suffix: str,
     compact_split_fn: Callable[[str], str],
     breakdown: bool = False,
+    compact: bool = False,
 ) -> str:
     """Render bucket aggregates as a ccusage-style ANSI table.
 
@@ -985,6 +986,8 @@ def _render_bucket_table(
       title_suffix    — banner text suffix ("Daily" or "Monthly").
       compact_split_fn — function that splits a bucket string into
                          "YYYY\\n..." for compact-mode two-line display.
+      compact         — force compact layout regardless of terminal width
+                        (Session A `--compact` flag; spec §7.6.1).
 
     Mirrors ccusage's ResponsiveTable behavior: single-line headers and dates
     when content fits the terminal; falls back to two-line compact headers
@@ -1109,7 +1112,11 @@ def _render_bucket_table(
         term_width = int(os.environ.get("COLUMNS", "120"))
 
     border_overhead = 3 * num_cols + 1
-    compact_mode = sum(col_widths) + border_overhead > term_width
+    # Session A (spec §7.6.1): `compact=True` (set by `--compact` flag on
+    # daily/monthly/weekly/blocks/...) forces compact-mode regardless of
+    # the actual terminal width. Auto-detected width-overflow continues to
+    # trigger compact mode as before.
+    compact_mode = compact or (sum(col_widths) + border_overhead > term_width)
 
     if compact_mode:
         # Scale down proportionally with narrow minimums.
@@ -1272,6 +1279,7 @@ def _render_weekly_table(
     weeks: list["SubWeek"],
     compact_split_fn: Callable[[str], str],
     breakdown: bool = False,
+    compact: bool = False,
 ) -> str:
     """Render weekly bucket aggregates as a ccusage-style ANSI table.
 
@@ -1443,7 +1451,11 @@ def _render_weekly_table(
         term_width = int(os.environ.get("COLUMNS", "120"))
 
     border_overhead = 3 * num_cols + 1
-    compact_mode = sum(col_widths) + border_overhead > term_width
+    # Session A (spec §7.6.1): `compact=True` (set by `--compact` flag on
+    # daily/monthly/weekly/blocks/...) forces compact-mode regardless of
+    # the actual terminal width. Auto-detected width-overflow continues to
+    # trigger compact mode as before.
+    compact_mode = compact or (sum(col_widths) + border_overhead > term_width)
 
     if compact_mode:
         # Scale down proportionally with narrow minimums.
