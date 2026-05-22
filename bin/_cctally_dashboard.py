@@ -2860,8 +2860,8 @@ def _dashboard_build_blocks_view(conn: "sqlite3.Connection",
     entries = get_entries(fetch_start, fetch_end, skip_sync=skip_sync)
     entries = [e for e in entries if week_start_at <= e.timestamp < week_end_at]
 
-    recorded_windows, block_start_overrides = _load_recorded_five_hour_windows(
-        fetch_start, fetch_end,
+    recorded_windows, block_start_overrides, canonical_intervals = (
+        _load_recorded_five_hour_windows(fetch_start, fetch_end)
     )
     c = _cctally()
     return c.build_blocks_view(
@@ -2869,6 +2869,7 @@ def _dashboard_build_blocks_view(conn: "sqlite3.Connection",
         now_utc=now_utc,
         recorded_windows=recorded_windows,
         block_start_overrides=block_start_overrides,
+        canonical_intervals=canonical_intervals,
         range_start=week_start_at,
         range_end=week_end_at,
         display_tz=display_tz,
@@ -6610,7 +6611,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             now_utc = _command_as_of()
             # Recorded-windows lookup widens by one block on each side so
             # a recorded reset just outside the bounds can still anchor.
-            recorded_windows, block_start_overrides = (
+            recorded_windows, block_start_overrides, canonical_intervals = (
                 _load_recorded_five_hour_windows(
                     start_at - BLOCK_DURATION, end_at + BLOCK_DURATION,
                 )
@@ -6633,6 +6634,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 entries_in_window, mode="auto",
                 recorded_windows=recorded_windows,
                 block_start_overrides=block_start_overrides,
+                canonical_intervals=canonical_intervals,
                 now=now_utc,
             )
             target = next(

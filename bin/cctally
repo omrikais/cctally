@@ -3111,9 +3111,41 @@ def _select_non_overlapping_recorded_windows(
 def _load_recorded_five_hour_windows(
     range_start: dt.datetime,
     range_end: dt.datetime,
-) -> tuple[list[dt.datetime], dict[dt.datetime, dt.datetime]]:
+) -> tuple[
+    list[dt.datetime],
+    dict[dt.datetime, dt.datetime],
+    dict[dt.datetime, tuple[dt.datetime, dt.datetime]],
+]:
     """Return sorted, UTC-aware recorded ``five_hour_resets_at`` values
     that anchor real 5h windows in ``[range_start, range_end]``.
+
+    Returns a 3-tuple ``(selected, block_start_overrides, canonical_intervals)``:
+
+      * ``selected``: list of 10-min-floored ``R`` anchors (sorted),
+        each representing one accepted canonical 5h window. Same shape
+        as before — drives `_group_entries_into_blocks`'s
+        ``recorded_windows=`` kwarg.
+
+      * ``block_start_overrides``: ``{R_floored → block_start_at_utc}``
+        for credit-truncated anchors (Bug J). When a credit moment
+        falls inside a canonical block's overlap with the next block,
+        the earlier ``R`` is replaced by the credit moment (floored to
+        10 min) and the original ``block_start_at`` is recorded here so
+        the renderer keeps the real display start.
+
+      * ``canonical_intervals``: ``{R_floored → (bs_utc, rs_utc)}``
+        carrying the **exact** ``(block_start_at, five_hour_resets_at)``
+        for every selected anchor that has a canonical
+        ``five_hour_blocks`` row. ``rs_utc`` is the un-floored reset
+        moment (jitter intact), ``bs_utc`` is the API-derived block
+        start normalized to UTC. Drives `_group_entries_into_blocks`'s
+        partition predicate AND Phase 1.5 block construction
+        (issue #76 — 10-min-floor partition trap). Anchors with no
+        canonical row (legacy weekly-snapshots-only) are absent from
+        the map and the partitioner falls back to ``(R - 5h, R)``.
+        Credit-truncated anchors land here with the truncated upper
+        bound (``rs = effective_reset``) and the override-supplied
+        ``bs`` (the real pre-truncation block start).
 
     Two sources contribute to the merged anchor set:
 
@@ -3225,7 +3257,7 @@ def _load_recorded_five_hour_windows(
         # OSError covers ensure_dirs() failures (read-only FS, permission
         # denied on parent dir) that propagate from open_db() before any
         # SQL runs. Either way, fall back to the heuristic anchor path.
-        return [], {}
+        return [], {}, {}
     counts: dict[dt.datetime, int] = {}
     for row in rows:
         raw = row["five_hour_resets_at"] if hasattr(row, "keys") else row[0]
@@ -3281,6 +3313,21 @@ def _load_recorded_five_hour_windows(
         canonical_pairs.append((bs, rs))
     canonical_pairs.sort(key=lambda p: p[0])
 
+    # issue #76: canonical_intervals maps every floored R -> its EXACT
+    # (block_start_at, five_hour_resets_at) — both UTC, rs un-floored
+    # (jitter intact). Drives the partition predicate AND Phase 1.5
+    # block construction in `_group_entries_into_blocks` so floor-band
+    # entries (timestamps in [floor(R), R)) land in the right bucket
+    # and the displayed window matches Anthropic's actual interval.
+    # Built before the credit-truncation loop below so that loop can
+    # rewrite the upper bound in-place (truncated R replaces rs).
+    canonical_intervals: dict[
+        dt.datetime, tuple[dt.datetime, dt.datetime]
+    ] = {}
+    for bs, rs in canonical_pairs:
+        snapped = _floor_to_ten_minutes(rs)
+        canonical_intervals[snapped] = (bs, rs)
+
     # Detect overlap-with-credit and replace the earlier R with a
     # credit-truncated anchor. The (anchor → real_block_start) map is
     # returned alongside the anchor list so the renderer can show the
@@ -3305,6 +3352,21 @@ def _load_recorded_five_hour_windows(
                         if bs < cm_floored < rs:
                             truncated_R = cm_floored
                             block_start_overrides[cm_floored] = bs
+                            # Rewrite canonical_intervals[snapped_orig]
+                            # to the truncated interval under the
+                            # truncated key. issue #76: the
+                            # partitioner reads canonical_intervals
+                            # for the exact bs/rs; the truncated entry
+                            # must reflect the credit-shifted upper
+                            # bound (cm_floored) AND the real bs (the
+                            # override) so partition + Phase 1.5
+                            # render the credit-shortened block
+                            # consistently.
+                            snapped_orig = _floor_to_ten_minutes(rs)
+                            canonical_intervals.pop(snapped_orig, None)
+                            canonical_intervals[cm_floored] = (
+                                bs, cm_floored,
+                            )
                             break
         truncated_pairs.append((bs, truncated_R))
 
@@ -3344,7 +3406,16 @@ def _load_recorded_five_hour_windows(
     selected = sorted(
         list(selected_non_truncated) + list(truncated_anchors)
     )
-    return selected, block_start_overrides
+    # Filter canonical_intervals down to selected anchors. Raw-only
+    # anchors (selected via weekly_usage_snapshots but absent from
+    # five_hour_blocks) stay out of the map; the partitioner falls
+    # back to (R - 5h, R) for them. issue #76 / spec §1.1 D1.
+    canonical_intervals = {
+        R: canonical_intervals[R]
+        for R in selected
+        if R in canonical_intervals
+    }
+    return selected, block_start_overrides, canonical_intervals
 
 
 def cmd_blocks(args: argparse.Namespace) -> int:
@@ -3389,8 +3460,10 @@ def cmd_blocks(args: argparse.Namespace) -> int:
     # reset R just after ``range_end`` (e.g. the active window when
     # range_end is wall-clock "now") can still anchor entries that fall
     # inside [range_start, range_end].
-    recorded_windows, block_start_overrides = _load_recorded_five_hour_windows(
-        range_start - BLOCK_DURATION, range_end + BLOCK_DURATION,
+    recorded_windows, block_start_overrides, canonical_intervals = (
+        _load_recorded_five_hour_windows(
+            range_start - BLOCK_DURATION, range_end + BLOCK_DURATION,
+        )
     )
 
     # Group into blocks via the view-model kernel (issue #56). The
@@ -3410,6 +3483,7 @@ def cmd_blocks(args: argparse.Namespace) -> int:
         now_utc=now_utc,
         recorded_windows=recorded_windows,
         block_start_overrides=block_start_overrides,
+        canonical_intervals=canonical_intervals,
         range_start=range_start,
         range_end=range_end,
         display_tz=tz,
