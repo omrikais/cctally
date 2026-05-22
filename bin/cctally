@@ -5180,6 +5180,16 @@ def cmd_session(args: argparse.Namespace) -> int:
     )
     sessions = list(view.aggregated)
 
+    # Session A (spec §7.4): exact-string filter on sessionId. Applied
+    # AFTER aggregation (so resume-merged sessions across multiple JSONL
+    # files are matched against their post-merge id) and BEFORE the
+    # `--order asc` reversal and the JSON / share / table render
+    # branches. Unknown id → empty `sessions` list, which falls through
+    # to the existing "no sessions" branch (table: "No Claude session
+    # data found."; JSON: `{"sessions": []}`).
+    if getattr(args, "id", None):
+        sessions = [s for s in sessions if s.session_id == args.id]
+
     # Shareable-reports gate: --format short-circuits the JSON / table
     # dispatch via `_share_render_and_emit`. The mutex in
     # `_add_share_args` keeps `--format` and `--json` from coexisting.
@@ -10357,6 +10367,13 @@ def build_parser() -> argparse.ArgumentParser:
     se.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
                     help="Display timezone: local, utc, or IANA name. "
                          "Overrides config display.tz for this call.")
+    se.add_argument(
+        "-i", "--id", default=None, metavar="SESSION_ID", dest="id",
+        help="Filter to a single session by exact-string sessionId. "
+             "Match is against the post-resume-merge id (sessions "
+             "resumed across multiple JSONL files collapse to one id). "
+             "Unknown id → exit 0 with the empty-render branch.",
+    )
     _add_ccusage_alias_args(se, ansi_emit=False)
     _add_share_args(se)
     se.set_defaults(func=cmd_session)
