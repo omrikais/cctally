@@ -11,7 +11,6 @@ import argparse
 import contextlib
 import importlib.util
 import io
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -41,7 +40,7 @@ def _run(*args, env=None):
     """Invoke ``cctally`` with the test's HOME so writes don't pollute real state."""
     return subprocess.run(
         [sys.executable, str(CCTALLY), *args],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, env=env, timeout=30,
     )
 
 
@@ -130,12 +129,8 @@ class TestAliasSurface:
         assert "unrecognized arguments" not in r.stderr, r.stderr
 
 
-def test_debug_note_emitted_once_per_process(tmp_path, monkeypatch):
-    """Spec §7.6.2 / §9.1: the `_DEBUG_NOTE_EMITTED` guard means two
-    invocations in the SAME Python process produce the note exactly
-    once. Sub-process tests can't observe this; drive via the
-    importable cctally module.
-    """
+def _load_cctally_module():
+    """Import the ``cctally`` script as a module (no .py extension)."""
     from importlib.machinery import SourceFileLoader
 
     loader = SourceFileLoader("cctally", str(CCTALLY))
@@ -143,8 +138,21 @@ def test_debug_note_emitted_once_per_process(tmp_path, monkeypatch):
     mod = importlib.util.module_from_spec(spec)
     sys.modules["cctally"] = mod
     loader.exec_module(mod)
+    return mod
+
+
+def test_debug_note_emitted_once_per_process(tmp_path, monkeypatch):
+    """Spec §7.6.2 / §9.1: the `_DEBUG_NOTE_EMITTED` guard means two
+    invocations in the SAME Python process produce the note exactly
+    once. Sub-process tests can't observe this; drive via the
+    importable cctally module.
+    """
+    mod = _load_cctally_module()
     # Reset the guard so this test is independent of test ordering.
-    mod._DEBUG_NOTE_EMITTED = False
+    # Use monkeypatch.setattr so the value is restored at teardown,
+    # avoiding cross-test pollution if another test loads the module
+    # later (Review-A P3-4).
+    monkeypatch.setattr(mod, "_DEBUG_NOTE_EMITTED", False)
 
     buf = io.StringIO()
     ns = argparse.Namespace(debug=True)
@@ -153,6 +161,64 @@ def test_debug_note_emitted_once_per_process(tmp_path, monkeypatch):
         mod._emit_debug_note_if_set(ns)  # second call must be a no-op
     note = "diagnostic-sample emission is not yet wired"
     assert buf.getvalue().count(note) == 1
+
+
+def test_five_hour_blocks_invalid_since_prints_one_stderr_line(
+    fake_home,
+):
+    """Spec §7.1.1 / Review-A P1-1: ``five-hour-blocks --since <bad>``
+    must print the centralized helper's error message exactly once on
+    stderr — not the helper line followed by a re-emitted subcommand-
+    prefixed line.
+
+    Regression guard for the double-print introduced when
+    ``_parse_date_filter`` wrapped the bare ValueError in a
+    five-hour-blocks-prefixed message and the caller re-printed it.
+    """
+    r = _run("five-hour-blocks", "--since", "bad-date")
+    assert r.returncode == 2, (r.returncode, r.stderr)
+    lines = [ln for ln in r.stderr.splitlines() if ln.strip()]
+    assert len(lines) == 1, (
+        f"expected exactly 1 stderr line, got {len(lines)}: {r.stderr!r}"
+    )
+    assert lines[0] == (
+        "Error: --since must be YYYY-MM-DD or YYYYMMDD format, got 'bad-date'"
+    ), lines[0]
+
+
+def test_z_alias_uses_resolver_in_cmd_blocks_path(monkeypatch, capsys):
+    """Spec §7.2 / Review-A P2-A: ``_resolve_claude_tz_name`` must be
+    exercised in the production path (not only via the standalone unit
+    suite). Monkeypatch the resolver to record calls; drive the
+    in-process bridge with ``args.timezone='UTC'``; assert the resolver
+    fired with the namespace + config combo.
+    """
+    mod = _load_cctally_module()
+
+    calls: list[tuple[str | None, str | None, dict | None]] = []
+
+    real_resolver = mod._resolve_claude_tz_name
+
+    def _recording_resolver(args, config):
+        calls.append((
+            getattr(args, "tz", None),
+            getattr(args, "timezone", None),
+            config,
+        ))
+        return real_resolver(args, config)
+
+    monkeypatch.setattr(mod, "_resolve_claude_tz_name", _recording_resolver)
+
+    ns = argparse.Namespace(tz=None, timezone="UTC")
+    mod._bridge_z_into_tz(ns, config={})
+    # The bridge must have called the resolver with our (args, config).
+    assert calls, "resolver was never invoked by _bridge_z_into_tz"
+    assert calls[-1] == (None, "UTC", {}), calls[-1]
+    # And the bridge promoted -z onto args.tz so resolve_display_tz picks
+    # it up. ``_argparse_tz`` canonicalizes "UTC" → "utc" (matches the
+    # --tz flag's existing type-check behavior), so assert on the
+    # canonical form.
+    assert ns.tz == "utc", ns.tz
 
 
 @pytest.mark.parametrize("cmd", INSCOPE_CMDS_DATE)

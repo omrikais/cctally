@@ -995,33 +995,43 @@ def _sum_cost_for_range(
     return total
 
 
-def _bridge_z_into_tz(args: argparse.Namespace) -> None:
+def _bridge_z_into_tz(args: argparse.Namespace,
+                      config: "dict | None" = None) -> None:
     """Promote ``-z`` / ``--timezone`` onto ``args.tz`` when ``--tz`` is unset.
 
     Session A (spec §7.2) defines a 4-rung precedence for Claude display tz:
     ``--tz`` > ``-z --timezone`` > ``config.display.tz`` > host-local. The
     existing ``resolve_display_tz`` reads only ``args.tz`` and config; the
     minimal-invasive way to fold in ``-z`` without modifying the shared
-    pure-fn layer is to set ``args.tz`` from ``args.timezone`` here when
-    ``--tz`` wasn't supplied. This mutates the namespace and is safe
-    because each cmd_* receives a fresh ``args`` per invocation.
+    pure-fn layer is to set ``args.tz`` here when ``--tz`` wasn't
+    supplied. This mutates the namespace and is safe because each cmd_*
+    receives a fresh ``args`` per invocation.
 
-    Validates the bridged value via ``_argparse_tz`` so an invalid tz
-    name from ``-z`` surfaces the same canonical error as ``--tz``
-    (argparse-time validation can't run on the alias because the alias
-    flag is plain string, not ``type=_argparse_tz``).
+    Internally delegates to :func:`_resolve_claude_tz_name`, which
+    encodes the 4-rung precedence and returns the tz-name string (or
+    ``None`` for host-local fallback). This wires the resolver into the
+    production path so the 7-case test contract (spec §9.2a) is
+    exercised end-to-end, not only by unit tests (Review-A P2-A).
 
-    Mirrors the rung-3 fallback ``_resolve_claude_tz_name`` exposes for
-    unit testing; the helper is used at call sites where a tz NAME is
-    needed in addition to (or instead of) the bridge.
+    Validates the bridged rung-2 value via ``_argparse_tz`` so an
+    invalid tz name from ``-z`` surfaces the same canonical error as
+    ``--tz`` (argparse-time validation can't run on the alias because
+    the alias flag is plain string, not ``type=_argparse_tz``). The
+    resolver returns the raw string, so we revalidate here on the path
+    that actually bridges into ``args.tz``.
     """
+    # Short-circuit: --tz already set wins all rungs (the resolver
+    # returns args.tz unchanged anyway, but skipping avoids touching
+    # the namespace and re-validating an already-canonical value).
     if getattr(args, "tz", None) is not None:
         return
-    tz_alias = getattr(args, "timezone", None)
-    if tz_alias is None:
+    resolved = _resolve_claude_tz_name(args, config)
+    if resolved is None:
         return
+    # Validate via _argparse_tz so an invalid --timezone surfaces the
+    # canonical argparse-style error (matches --tz's type-check).
     try:
-        canonical = _argparse_tz(tz_alias)
+        canonical = _argparse_tz(resolved)
     except argparse.ArgumentTypeError as exc:
         # Surface the same kind of error users get from --tz at parse
         # time. We can't call parser.error from here, so emit-and-raise
@@ -3507,7 +3517,7 @@ def cmd_blocks(args: argparse.Namespace) -> int:
     """Show usage report grouped by 5-hour session blocks."""
     _emit_debug_note_if_set(args)
     config = load_config()
-    _bridge_z_into_tz(args)
+    _bridge_z_into_tz(args, config)
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
 
@@ -3605,8 +3615,13 @@ def cmd_blocks(args: argparse.Namespace) -> int:
         print(_blocks_to_json(blocks))
         return 0
 
-    # Table output
-    print(_render_blocks_table(blocks, breakdown=args.breakdown, now=now_utc, tz=tz))
+    # Table output. Session A (spec §7.6.1; Review-A P2-B): thread
+    # --compact through so the renderer's scale-down branch fires
+    # regardless of terminal width when the flag is set.
+    print(_render_blocks_table(
+        blocks, breakdown=args.breakdown, now=now_utc, tz=tz,
+        compact=getattr(args, "compact", False),
+    ))
     return 0
 
 
@@ -3828,7 +3843,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
     # existing resolve_display_tz precedence absorbs the new alias. The
     # canonical --tz still wins (it's set on the namespace before this
     # bridge fires); when --tz is unset and -z is supplied, use -z.
-    _bridge_z_into_tz(args)
+    _bridge_z_into_tz(args, config)
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
 
@@ -3912,7 +3927,7 @@ def cmd_monthly(args: argparse.Namespace) -> int:
     _share_validate_args(args)
     _emit_debug_note_if_set(args)
     config = load_config()
-    _bridge_z_into_tz(args)
+    _bridge_z_into_tz(args, config)
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
 
@@ -3989,7 +4004,7 @@ def cmd_weekly(args: argparse.Namespace) -> int:
     _share_validate_args(args)
     _emit_debug_note_if_set(args)
     config = load_config()
-    _bridge_z_into_tz(args)
+    _bridge_z_into_tz(args, config)
     args._resolved_tz = resolve_display_tz(args, config)
 
     now_utc = _command_as_of()
@@ -5151,7 +5166,7 @@ def cmd_session(args: argparse.Namespace) -> int:
     _share_validate_args(args)
     _emit_debug_note_if_set(args)
     config = load_config()
-    _bridge_z_into_tz(args)
+    _bridge_z_into_tz(args, config)
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
 
@@ -5247,10 +5262,14 @@ def cmd_session(args: argparse.Namespace) -> int:
         print("No Claude session data found.")
         return 0
 
+    # Session A (spec §7.6.1; Review-A P2-B): thread --compact through
+    # so the renderer's scale-down branch fires regardless of terminal
+    # width when the flag is set.
     print(_render_claude_session_table(
         sessions,
         breakdown=args.breakdown,
         tz=tz,
+        compact=getattr(args, "compact", False),
     ))
     return 0
 
@@ -7329,17 +7348,14 @@ def _parse_date_filter(value: str, flag_name: str) -> str:
     Used by ``cmd_five_hour_blocks`` ``--since``/``--until``. Mirrors the
     upstream ccusage convention. Routes through the centralized
     ``_parse_dual_form_date`` (spec §7.1.1) so the dual-form contract and
-    error message are shared with cmd_blocks / cmd_daily / etc. The
-    helper eprints to stderr on bad input; we re-raise a ``ValueError``
-    with a subcommand-prefixed message so the caller can choose an
-    appropriate exit code (legacy: 2 for parse errors here).
+    error message are shared with cmd_blocks / cmd_daily / etc.
+
+    The helper already eprints its own diagnostic and raises a bare
+    ``ValueError``; we propagate that bare exception so callers can
+    return an exit code without double-printing (Review-A P1-1; mirrors
+    the bare-re-raise pattern used by ``cmd_cache_report``).
     """
-    try:
-        return _parse_dual_form_date(value, flag_name).date().isoformat()
-    except ValueError as e:
-        raise ValueError(
-            f"five-hour-blocks: {flag_name} expects YYYY-MM-DD or YYYYMMDD (got '{value}')"
-        ) from e
+    return _parse_dual_form_date(value, flag_name).date().isoformat()
 
 
 def _load_breakdown(
@@ -7377,6 +7393,9 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
     conn = open_db()
     try:
         # Date filter parsing — same convention as cmd_blocks.
+        # _parse_date_filter routes through _parse_dual_form_date, which
+        # eprints its own diagnostic and raises a bare ValueError on bad
+        # input (Review-A P1-1 — dedup stderr by NOT re-emitting here).
         try:
             since_iso = (
                 _parse_date_filter(args.since, "--since")
@@ -7386,8 +7405,7 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
                 _parse_date_filter(args.until, "--until")
                 if args.until else None
             )
-        except ValueError as e:
-            print(str(e), file=sys.stderr)
+        except ValueError:
             return 2
 
         where: list[str] = []
@@ -8288,6 +8306,11 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
     # diagnostic and raises a bare ValueError; catch it here so main()'s
     # generic ``Error: {exc}`` fallback doesn't double-print an empty
     # trailer. Mirrors the catch-and-return-1 shape in cmd_blocks.
+    #
+    # Session A note (Review-A P2-D): cache-report's argparse alias
+    # surface lands in Implementor 2's scope (B-series). The try/except
+    # here only routes _resolve_cache_report_window's bare ValueError
+    # around main()'s generic Error: handler — no parser-level changes.
     try:
         since, until = _resolve_cache_report_window(
             args, now_utc=now_utc,

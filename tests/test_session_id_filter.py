@@ -209,7 +209,7 @@ def test_id_subprocess_short_flag_parses(tmp_path, monkeypatch):
         [sys.executable, str(CCTALLY), "session",
          "-i", "totally-unknown-id-aaaa-bbbb-cccc",
          "--json"],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, env=env, timeout=30,
     )
     assert r.returncode == 0, r.stderr
     assert "unrecognized arguments" not in r.stderr

@@ -16,7 +16,7 @@ CCTALLY = Path(__file__).resolve().parent.parent / "bin" / "cctally"
 def _run(*args):
     return subprocess.run(
         [sys.executable, str(CCTALLY), *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=30,
     )
 
 

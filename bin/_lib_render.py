@@ -143,6 +143,7 @@ def _render_blocks_table(
     *,
     now: dt.datetime | None = None,
     tz: "ZoneInfo | None" = None,
+    compact: bool = False,
 ) -> str:
     """Render blocks as a ccusage-style ANSI table with box-drawing borders.
 
@@ -158,6 +159,11 @@ def _render_blocks_table(
 
     ``tz`` is the resolved display zone (``None`` means host local).
     Block-start cells are rendered in this zone.
+
+    ``compact`` forces the scale-down code path regardless of the actual
+    terminal width (Session A ``--compact`` flag; spec §7.6.1). Mirrors
+    the same kwarg on ``_render_bucket_table``. Auto-detected
+    width-overflow continues to trigger the same path as before.
     """
     if not blocks:
         return "No session blocks found in the specified date range."
@@ -416,10 +422,12 @@ def _render_blocks_table(
 
     # Scale down only when table exceeds terminal width.
     # ccusage does NOT expand columns when the table fits — it uses the
-    # padded content widths as-is.
+    # padded content widths as-is. Session A (spec §7.6.1): the
+    # ``compact`` kwarg forces this branch regardless of terminal width
+    # (Review-A P2-B; mirrors ``_render_bucket_table`` semantics).
     table_overhead = 3 * num_cols + 1
     available_width = term_width - table_overhead
-    if sum(col_widths) + table_overhead > term_width:
+    if compact or (sum(col_widths) + table_overhead > term_width):
         scale_factor = available_width / sum(col_widths)
         col_widths = [
             max(
@@ -1300,6 +1308,10 @@ def _render_weekly_table(
 
     `first_col_name` and `title_suffix` are hardcoded to "Week" and
     "Weekly" respectively.
+
+    `compact` forces compact layout regardless of terminal width
+    (Session A `--compact` flag; spec \u00a77.6.1). Mirrors the same kwarg
+    on `_render_bucket_table` (Review-A P3-1).
     """
     assert len(week_pct_overlay) == len(buckets), (
         f"week_pct_overlay length {len(week_pct_overlay)} does not match "
@@ -2111,6 +2123,7 @@ def _render_claude_session_table(
     title: str = "Claude Token Usage Report - Sessions",
     breakdown: bool = False,
     tz: "ZoneInfo | None" = None,
+    compact: bool = False,
 ) -> str:
     """Render Claude session aggregates matching upstream ccusage session view (11 cols).
 
@@ -2121,14 +2134,16 @@ def _render_claude_session_table(
     Structural clone of `_render_codex_session_table` with:
       - ``Reasoning`` column replaced by ``Cache Create`` (sourced from
         ``cache_creation_tokens`` instead of ``reasoning_output_tokens``).
-      - ``tz_name`` / ``force_compact`` parameters dropped — Claude-side
-        commands don't expose ``--timezone`` / ``--compact`` today; dates
-        render in local TZ via ``astimezone()`` and compact mode is
-        triggered by terminal width alone.
       - ``Session`` cell shows first 8 chars of ``session_id`` (full UUID
         lives in --json).
 
     ``breakdown`` toggles per-model sub-rows beneath each session row.
+
+    ``compact`` forces the proportional scale-down code path regardless
+    of the actual terminal width (Session A ``--compact`` flag; spec
+    §7.6.1; Review-A P2-B). Mirrors ``_render_codex_session_table``'s
+    ``force_compact`` semantics. Auto-detected width overflow continues
+    to trigger the same path.
     """
     color = _supports_color_stdout()
     unicode_ok = _supports_unicode_stdout()
@@ -2262,6 +2277,25 @@ def _render_claude_session_table(
 
     col_widths = [_wide_width(i, content_widths[i]) for i in range(num_cols)]
 
+    try:
+        term_width = os.get_terminal_size().columns
+    except (OSError, ValueError):
+        term_width = int(os.environ.get("COLUMNS", "120"))
+
+    border_overhead = 3 * num_cols + 1
+    # Session A (spec \u00a77.6.1; Review-A P2-B): ``compact`` forces the
+    # proportional scale-down branch regardless of terminal width.
+    # Mirrors ``_render_codex_session_table`` (line ~2027); auto-detected
+    # width overflow continues to trigger the same path.
+    if compact or (sum(col_widths) + border_overhead > term_width):
+        available = term_width - border_overhead
+        total_col = sum(col_widths)
+        scale = available / total_col if total_col > 0 else 1.0
+        col_widths = [max(int(w * scale), 8) for w in col_widths]
+        remainder = available - sum(col_widths)
+        if remainder > 0:
+            col_widths[1] += remainder  # grow Directory column
+
     def _split_cell(text: str) -> list[str]:
         return text.split("\n") if text else [""]
 
@@ -2324,7 +2358,14 @@ def _render_claude_session_table(
             parts = [_dim(V)]
             for i, (text, cfn) in enumerate(cells):
                 content = split_cells[i][li] if li < len(split_cells[i]) else ""
-                padded = _pad_cell(content, col_widths[i], aligns[i])
+                # Truncate with ellipsis if content exceeds column width
+                # (relevant under --compact when widths scale down below
+                # content). Mirrors _render_codex_session_table line ~2100.
+                w = col_widths[i]
+                if len(content) > w:
+                    ell = "…" if unicode_ok else "..."
+                    content = content[: max(0, w - len(ell))] + ell
+                padded = _pad_cell(content, w, aligns[i])
                 if cfn is not None:
                     padded = cfn(padded)
                 parts.append(f" {padded} ")
