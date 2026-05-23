@@ -2358,12 +2358,15 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
     which keeps the offset of whatever the caller passed (typically
     ``+00:00`` from ``week_start_at`` canonicalization, but
     ``parse_iso_datetime`` returns ``parsed.astimezone()`` so naive
-    inputs end up host-local). ``session_entries.timestamp_utc`` is the
-    raw JSONL ``timestamp`` field, typically ``Z``-suffixed but
-    upstream-controlled. Lex compare across mixed offsets silently
-    mis-orders moments for non-UTC hosts. We route both sides through
-    ``unixepoch()`` — same defense applied to the cross-reset flag and
-    the gate helper's ingest-time comparison.
+    inputs end up host-local). ``session_entries.timestamp_utc`` is
+    written via ``entry.timestamp.astimezone(dt.timezone.utc).isoformat()``
+    in ``sync_cache`` — canonical UTC ISO with ``+00:00`` offset.
+    Both sides are normalized at the Python boundary through
+    ``_canonical_utc_iso_for_index`` so plain lex compare against
+    ``timestamp_utc`` hits ``idx_entries_timestamp``. Mirrors the
+    canonicalization that ``iter_entries`` /
+    ``get_claude_session_entries`` apply to user-facing queries in
+    ``bin/_cctally_cache.py``.
 
     Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3.
     """
@@ -2472,14 +2475,22 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
                 # ``iter_entries`` — so R-DEDUP2 in
                 # ``bin/cctally-reconcile-test`` no longer needs to
                 # caveat the divergence.
+                # Canonicalize range bounds to the same UTC ISO shape
+                # ``session_entries.timestamp_utc`` carries on disk so
+                # lex compare hits ``idx_entries_timestamp`` instead of
+                # SCANning. See ``_canonical_utc_iso_for_index`` for the
+                # EXPLAIN QUERY PLAN rationale; mirrors
+                # ``iter_entries`` in bin/_cctally_cache.py.
                 entries = cache_ro.execute(
                     "SELECT model, input_tokens, output_tokens, "
                     "cache_create_tokens, cache_read_tokens, "
                     "usage_extra_json, cost_usd_raw "
                     "FROM session_entries "
-                    "WHERE unixepoch(timestamp_utc) >= unixepoch(?) "
-                    "  AND unixepoch(timestamp_utc) <= unixepoch(?)",
-                    (range_start_iso, range_end_iso),
+                    "WHERE timestamp_utc >= ? AND timestamp_utc <= ?",
+                    (
+                        _canonical_utc_iso_for_index(range_start_iso),
+                        _canonical_utc_iso_for_index(range_end_iso),
+                    ),
                 ).fetchall()
                 total = 0.0
                 for model, i, o, cc, cr, extras_json, raw in entries:
@@ -2581,6 +2592,56 @@ def _resolve_projects_dirs_for_gate() -> list[pathlib.Path]:
     return projects_dirs
 
 
+def _canonical_utc_iso_for_index(value: str) -> str:
+    """Normalize an ISO-8601 timestamp string to the canonical UTC form
+    that ``session_entries.timestamp_utc`` stores on disk, so a lex
+    comparison against the indexed column hits ``idx_entries_timestamp``
+    instead of degrading to a full SCAN.
+
+    Why this exists
+    ---------------
+    ``session_entries.timestamp_utc`` is always written via
+    ``entry.timestamp.astimezone(dt.timezone.utc).isoformat()`` in
+    ``sync_cache`` (bin/_cctally_cache.py — the only writer). On disk
+    every row therefore looks like ``2026-05-01T12:34:56.789012+00:00``.
+
+    Migration 008/009/010's range bounds arrive in mixed shapes:
+
+      * ``weekly_cost_snapshots.range_start_iso`` /
+        ``range_end_iso`` — host-local-offset bytes if the writer's
+        ``parse_iso_datetime`` saw a naive input (returns
+        ``parsed.astimezone()``) or ``+00:00`` when fed canonical
+        week-start instants.
+      * ``five_hour_blocks.block_start_at`` — host-local-offset
+        bytes (same ``parse_iso_datetime`` chokepoint).
+      * ``five_hour_blocks.last_observed_at_utc`` — always
+        ``Z``-suffixed (``now_utc_iso()``).
+      * ``percent_milestones.week_start_at`` /
+        ``captured_at_utc`` — same mix.
+
+    The prior implementation wrapped both sides of the WHERE in
+    ``unixepoch(...)`` to absorb the offset mix. That made the
+    comparison correct but defeated ``idx_entries_timestamp`` —
+    ``EXPLAIN QUERY PLAN`` rendered ``SCAN session_entries`` on every
+    range slice. On a heavy user's cache.db (10k+ rows) that turned
+    the one-time recompute from "30-60s" into multiple minutes.
+
+    By canonicalizing at the Python boundary into the same shape the
+    writer uses, both sides of ``WHERE timestamp_utc >= ? AND
+    timestamp_utc <= ?`` carry the same offset notation and lex
+    compare is correct. Index hit:
+    ``SEARCH session_entries USING INDEX idx_entries_timestamp
+    (timestamp_utc>? AND timestamp_utc<?)``.
+
+    Matches the canonicalization pattern in
+    ``bin/_cctally_cache.py``'s ``iter_entries`` /
+    ``get_claude_session_entries`` (the production read paths).
+    """
+    return parse_iso_datetime(
+        value, "migration-range-bound",
+    ).astimezone(dt.timezone.utc).isoformat()
+
+
 # === Region 7f: Stats migration 009_recompute_five_hour_blocks_dedup_fix ====
 
 @stats_migration("009_recompute_five_hour_blocks_dedup_fix")
@@ -2618,9 +2679,11 @@ def _009_recompute_five_hour_blocks_dedup_fix(
     (``parse_iso_datetime`` returns ``parsed.astimezone()``;
     ``+03:00`` on a non-UTC host); ``last_observed_at_utc`` is
     ``Z``-suffixed (``now_utc_iso()``); ``session_entries.timestamp_utc``
-    is the raw JSONL ``timestamp`` field, typically ``Z``. Lex compare
-    across mixed offsets silently mis-orders moments on non-UTC hosts.
-    Both sides route through ``unixepoch()`` — same defense as 008.
+    is canonical UTC ISO (``+00:00``) on disk. Both range bounds
+    normalize through ``_canonical_utc_iso_for_index`` at the Python
+    boundary so plain lex compare against ``timestamp_utc`` hits
+    ``idx_entries_timestamp`` — same shape as 008/010 and the
+    user-facing read paths in ``bin/_cctally_cache.py``.
 
     Closed interval (V1)
     --------------------
@@ -2692,6 +2755,13 @@ def _009_recompute_five_hour_blocks_dedup_fix(
                 # '(unknown)' at the bucket layer — same sentinel as the
                 # live writer (_compute_block_totals at
                 # bin/_cctally_record.py).
+                # Canonicalize range bounds to the same UTC ISO shape
+                # ``session_entries.timestamp_utc`` carries on disk so
+                # lex compare hits ``idx_entries_timestamp`` instead of
+                # SCANning. See ``_canonical_utc_iso_for_index`` for the
+                # EXPLAIN QUERY PLAN rationale; mirrors
+                # ``get_claude_session_entries`` in
+                # bin/_cctally_cache.py.
                 entries = cache_ro.execute(
                     "SELECT se.model, se.input_tokens, se.output_tokens, "
                     "       se.cache_create_tokens, se.cache_read_tokens, "
@@ -2700,11 +2770,14 @@ def _009_recompute_five_hour_blocks_dedup_fix(
                     "FROM session_entries se "
                     "LEFT JOIN session_files sf "
                     "  ON sf.path = se.source_path "
-                    "WHERE unixepoch(se.timestamp_utc) "
-                    "      >= unixepoch(?) "
-                    "  AND unixepoch(se.timestamp_utc) "
-                    "      <= unixepoch(?)",
-                    (block_start_at, last_observed_at_utc),
+                    "WHERE se.timestamp_utc >= ? "
+                    "  AND se.timestamp_utc <= ?",
+                    (
+                        _canonical_utc_iso_for_index(block_start_at),
+                        _canonical_utc_iso_for_index(
+                            last_observed_at_utc
+                        ),
+                    ),
                 ).fetchall()
 
                 total_in = 0
@@ -2895,7 +2968,11 @@ def _010_recompute_percent_milestones_dedup_fix(
 
     Timestamp comparison
     --------------------
-    Same ``unixepoch()`` rule as 008/009 across mixed offsets.
+    Range bounds normalize through ``_canonical_utc_iso_for_index``
+    at the Python boundary so plain lex compare against
+    ``timestamp_utc`` hits ``idx_entries_timestamp``. Same rule as
+    008/009 and the user-facing read paths in
+    ``bin/_cctally_cache.py``.
 
     Closed interval (V1)
     --------------------
@@ -2973,16 +3050,21 @@ def _010_recompute_percent_milestones_dedup_fix(
                     # parallel to 008's NULL range_*_iso skip.
                     continue
 
+                # Canonicalize range bounds to the same UTC ISO shape
+                # ``session_entries.timestamp_utc`` carries on disk so
+                # lex compare hits ``idx_entries_timestamp`` instead of
+                # SCANning. See ``_canonical_utc_iso_for_index`` for the
+                # EXPLAIN QUERY PLAN rationale; mirrors 008/009.
                 entries = cache_ro.execute(
                     "SELECT model, input_tokens, output_tokens, "
                     "       cache_create_tokens, cache_read_tokens, "
                     "       usage_extra_json, cost_usd_raw "
                     "FROM session_entries "
-                    "WHERE unixepoch(timestamp_utc) "
-                    "      >= unixepoch(?) "
-                    "  AND unixepoch(timestamp_utc) "
-                    "      <= unixepoch(?)",
-                    (range_start_iso, captured_at_utc),
+                    "WHERE timestamp_utc >= ? AND timestamp_utc <= ?",
+                    (
+                        _canonical_utc_iso_for_index(range_start_iso),
+                        _canonical_utc_iso_for_index(captured_at_utc),
+                    ),
                 ).fetchall()
 
                 cumulative = 0.0
