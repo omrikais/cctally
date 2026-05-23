@@ -99,6 +99,15 @@ def _read_entries(conn):
     ).fetchall()
 
 
+_MARKER = "claude_ingest_walk_complete"
+
+
+def _marker_present(conn):
+    return conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key=?", (_MARKER,)
+    ).fetchone() is not None
+
+
 def test_winner_data_preserved_when_loser_truncates(isolated_cache):
     """Scenario from U1+U3 design:
        1. A ingested first — row pinned to A, low tokens.
@@ -298,6 +307,90 @@ def test_truncation_simulated_crash_recovers_on_next_sync(isolated_cache, monkey
         f"MUST be present — if either is missing, the size_bytes match "
         f"short-circuited B's per-file re-ingest and the U3 P2 fix is "
         f"incomplete. Got: {msgs}"
+    )
+
+
+def test_truncation_clears_then_rewrites_walk_complete_marker(isolated_cache, monkeypatch):
+    """SAFETY (cctally-dev#93, D5/D2): the truncation full-reset DELETEs the
+    walk-complete marker atomically with `DELETE FROM session_entries`,
+    parallel to the rebuild path. A stale "complete" marker must never survive
+    a destructive wipe.
+
+    The wipe and the re-walk normally happen in the SAME `sync_cache` call:
+    the escalation clears the marker mid-run, then the run's own clean
+    re-ingest walk re-establishes it at the end-of-loop write. Asserting only
+    the post-call state would NOT prove the truncation-branch DELETE ran — the
+    end-of-loop write refreshes the marker either way, so the net post-state
+    is identical whether or not the DELETE fired.
+
+    To pin the truncation-branch DELETE specifically, we borrow the
+    crash-injection technique from
+    ``test_truncation_simulated_crash_recovers_on_next_sync``: monkeypatch the
+    per-file re-ingest iterator to RAISE right after the escalation commit.
+    The escalation's `DELETE FROM cache_meta` has committed, but the per-file
+    loop (and thus the end-of-loop marker rewrite) never runs. We then observe
+    the marker is ABSENT — which is only possible if the truncation branch
+    cleared it. A clean recovery sync afterward re-establishes it.
+    """
+    ns, conn, file_a, file_b, sync = isolated_cache
+
+    # First sync: a multi-line A (headroom to shrink) + single-line B. Clean
+    # walk over real JSONL with 001 applied => marker present.
+    file_a.write_text(
+        _assistant_line("m1", "r1", out_tokens=100)
+        + _assistant_line("m1x", "r1x", out_tokens=110)
+    )
+    file_b.write_text(_assistant_line("m2", "r2", out_tokens=200))
+    sync()
+    assert _marker_present(conn), (
+        "precondition: a clean walk with 001 applied writes the marker"
+    )
+
+    # Truncate A (size shrinks) so the next sync's pre-scan detects it and
+    # runs the full-reset branch. Inject a raise in the per-file re-ingest
+    # iterator so the escalation commit (DELETE session_entries + DELETE
+    # marker + zero session_files) lands, but the end-of-loop marker rewrite
+    # never executes.
+    file_a.write_text(_assistant_line("m1b", "r1b", out_tokens=150))
+    cache_mod = sys.modules["_cctally_cache"]
+    real_iter = cache_mod._iter_jsonl_entries_with_offsets
+
+    class _SimulatedCrash(Exception):
+        pass
+
+    def crash_after_escalation(*_args, **_kwargs):
+        raise _SimulatedCrash("simulated kill -9 after escalation commit")
+        yield  # pragma: no cover  (unreachable; makes this a generator)
+
+    monkeypatch.setattr(
+        cache_mod, "_iter_jsonl_entries_with_offsets", crash_after_escalation
+    )
+    with pytest.raises(_SimulatedCrash):
+        sync()
+    monkeypatch.setattr(cache_mod, "_iter_jsonl_entries_with_offsets", real_iter)
+
+    # The escalation committed its DELETE FROM cache_meta; the end-of-loop
+    # rewrite never ran. If the truncation branch did NOT clear the marker,
+    # it would still be present from the first sync. Its ABSENCE here is the
+    # load-bearing assertion for the truncation-path marker clear.
+    assert not _marker_present(conn), (
+        "truncation full-reset must DELETE the walk-complete marker "
+        "atomically with the session_entries wipe"
+    )
+    # And session_entries is empty (the wipe committed) — sanity that we are
+    # observing the post-escalation, pre-rewalk state.
+    assert conn.execute("SELECT COUNT(*) FROM session_entries").fetchone()[0] == 0
+
+    # Recovery sync (real iterator restored): a clean re-ingest walk
+    # re-establishes the marker for THIS walk.
+    sync()
+    assert _marker_present(conn), (
+        "a clean recovery walk re-establishes the marker"
+    )
+    rows = _read_entries(conn)
+    msgs = sorted(r[0] for r in rows)
+    assert msgs == ["m1b", "m2"], (
+        f"expected m1b (A's new content) + m2 (B unchanged), got {msgs}"
     )
 
 

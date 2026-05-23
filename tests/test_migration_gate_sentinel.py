@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
 import sqlite3
 import sys
@@ -158,3 +159,67 @@ def test_unchanged_file_early_exit_does_not_withhold_marker(driver):
     stats = ns["sync_cache"](conn)
     assert stats.files_skipped_unchanged >= 1
     assert conn.execute("SELECT 1 FROM cache_meta WHERE key=?", (MARKER,)).fetchone() is not None
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="chmod-0 unreadable injection has no effect when running as root",
+)
+def test_marker_withheld_when_a_file_read_fails_mid_walk(tmp_path, monkeypatch):
+    """SAFETY (cctally-dev#93, D5a): an INCOMPLETE walk must NOT write the
+    walk-complete marker, even when cache 001 is applied. This is the
+    ``walk_clean = False`` withhold property — the marker vouches for cache
+    completeness, so a per-file error-skip must veto it.
+
+    We inject a real per-file failure: one JSONL file is made unreadable
+    (``os.chmod(path, 0)``), which lets ``jp.stat()`` succeed but trips the
+    ``open(...)`` read-OSError branch (``walk_clean = False`` at the read-fail
+    skip). A second, fully-readable file ingests alongside it so the loop
+    actually runs and 001 is applied — proving the withhold is driven by the
+    unclean walk, not by an empty/uninteresting walk. The positive control is
+    ``test_marker_written_after_clean_walk_when_001_applied`` above: the SAME
+    fixture writes the marker when every file is readable.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    proj = tmp_path / ".claude" / "projects" / "-Users-u-demo"
+    proj.mkdir(parents=True)
+    good = proj / "good.jsonl"
+    bad = proj / "bad.jsonl"
+    good.write_text(_assistant_line("m_good", "r_good"))
+    bad.write_text(_assistant_line("m_bad", "r_bad"))
+
+    conn = ns["open_cache_db"]()  # applies cache 001 -> applied_at_start True
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name='001_dedup_highest_wins'"
+        ).fetchone() is not None  # precondition: 001 applied (gate would otherwise hide)
+
+        os.chmod(bad, 0)  # unreadable -> open() raises PermissionError (OSError)
+        try:
+            stats = ns["sync_cache"](conn)
+        finally:
+            # Restore readability so pytest's tmp_path teardown can unlink it.
+            os.chmod(bad, 0o644)
+
+        # The good file still ingested (loop ran), proving this is an unclean
+        # walk rather than an empty one.
+        assert conn.execute(
+            "SELECT 1 FROM session_entries WHERE msg_id='m_good'"
+        ).fetchone() is not None
+        # The bad file contributed nothing.
+        assert conn.execute(
+            "SELECT 1 FROM session_entries WHERE msg_id='m_bad'"
+        ).fetchone() is None
+        # Marker is WITHHELD: the read-fail flipped walk_clean = False.
+        assert conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?", (MARKER,)
+        ).fetchone() is None, (
+            "incomplete walk (a file read-failed) must NOT write the "
+            "walk-complete marker"
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
