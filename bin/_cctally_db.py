@@ -2629,8 +2629,21 @@ def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
         # Clear the walk-complete sentinel atomically with the wipe
         # (cctally-dev#93, D5/D2): a wiped session_entries must never coexist
         # with a "complete walk" marker. The end-of-loop write in sync_cache
-        # re-establishes it only after a subsequent clean walk.
-        conn.execute("DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'")
+        # re-establishes it only after a subsequent clean walk. In production
+        # ``_apply_cache_schema`` always creates ``cache_meta`` before the
+        # dispatcher fires 001 (open_cache_db / _eagerly_apply_cache_migrations
+        # both apply the schema first), so the table is present. Tolerate its
+        # absence defensively (a pre-cache_meta cache.db invoked through the
+        # handler directly, e.g. older per-migration goldens): a missing table
+        # means there is no stale marker to clear, so the no-op is correct.
+        # The "no such table" prepare-time error never opened a write, so the
+        # enclosing BEGIN IMMEDIATE transaction stays intact for the stamp +
+        # commit below.
+        try:
+            conn.execute("DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'")
+        except sqlite3.OperationalError as exc:
+            if not _is_no_such_table_error(exc):
+                raise
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
             "VALUES (?, ?)",
