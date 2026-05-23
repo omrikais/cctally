@@ -46,6 +46,7 @@ import json
 import os
 import secrets
 import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -162,17 +163,60 @@ def config_writer_lock():
         fh.close()
 
 
-def load_config() -> dict[str, Any]:
+def _load_config_from_explicit_path(path: "str | Path") -> dict[str, Any]:
+    """Read config from an explicit per-invocation override path (issue #88).
+
+    Contract differs from the default ``load_config()``:
+      - Missing file → ``SystemExit(2)`` with a clear stderr message.
+      - Unreadable / malformed JSON / non-object root → ``SystemExit(2)``
+        with a clear stderr message.
+      - Never writes, never acquires ``config_writer_lock``, never
+        creates the on-disk default config — the override is read-only
+        for this invocation.
+
+    Used by the ccusage drop-in ``--config <path>`` flag wired onto the
+    10 Claude reporting commands (spec §3 T1.6 / issue #86 Session A).
+    """
+    p = Path(path)
+    if not p.exists():
+        eprint(f"cctally: --config: file not found: {p}")
+        raise SystemExit(2)
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except OSError as exc:
+        eprint(f"cctally: --config: read failed for {p}: {exc}")
+        raise SystemExit(2) from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        eprint(f"cctally: --config: invalid JSON in {p}: {exc}")
+        raise SystemExit(2) from exc
+    if not isinstance(data, dict):
+        eprint(
+            f"cctally: --config: {p} top-level must be a JSON object"
+        )
+        raise SystemExit(2)
+    return data
+
+
+def load_config(path: "str | Path | None" = None) -> dict[str, Any]:
     """Read config.json, falling back to in-memory defaults on corruption.
 
-    Concurrent-safety: readers see either the pre-rename or post-rename
-    contents thanks to save_config's atomic os.replace. On corrupt or
-    non-object JSON, emits a one-shot stderr warning and returns
-    in-memory defaults WITHOUT re-saving — the next legitimate
-    save_config call (under config_writer_lock) will overwrite the bad
-    bytes atomically. On first run (file missing), creates the file
-    with a fresh collector token under the writer lock so two parallel
-    first-run processes don't clobber each other.
+    When ``path`` is None (default): reads the persisted user config at
+    ``_cctally_core.CONFIG_PATH``, creating it on first run with a fresh
+    collector token under the writer lock. Concurrent-safety: readers see
+    either the pre-rename or post-rename contents thanks to save_config's
+    atomic os.replace. On corrupt or non-object JSON, emits a one-shot
+    stderr warning and returns in-memory defaults WITHOUT re-saving — the
+    next legitimate save_config call (under config_writer_lock) will
+    overwrite the bad bytes atomically.
+
+    When ``path`` is set (issue #88 ccusage drop-in ``--config <path>``):
+    reads from the explicit override path and bypasses the default-path
+    branch entirely. Missing / unreadable / malformed paths surface as
+    ``SystemExit(2)`` with a clear stderr message — see
+    ``_load_config_from_explicit_path``. No writes, no first-run create,
+    no mutation of the on-disk default config.
 
     DEADLOCK NOTE: `fcntl.flock` is per-fd even within the same
     process. Callers that already hold config_writer_lock MUST use
@@ -180,6 +224,8 @@ def load_config() -> dict[str, Any]:
     inside an outer lock would block forever (verified during issue
     #17 fix).
     """
+    if path is not None:
+        return _load_config_from_explicit_path(path)
     c = _cctally()
     ensure_dirs()
     parsed = _try_read_config()

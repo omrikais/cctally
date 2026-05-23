@@ -98,11 +98,15 @@ class TestAliasSurface:
         r = _run(cmd, *_window_args(cmd), "--compact")
         assert "unrecognized arguments" not in r.stderr, r.stderr
 
-    def test_config_path_noop(self, cmd, fake_home):
-        r = _run(cmd, *_window_args(cmd), "--config", "/tmp/nonexistent.json")
+    def test_config_path_missing_errors_clearly(self, cmd, fake_home, tmp_path):
+        # Issue #88: --config <missing> now errors out with a clear stderr
+        # message (was a documented no-op pre-#88 under issue #86 Session A).
+        nonexistent = tmp_path / "definitely-not-there.json"
+        r = _run(cmd, *_window_args(cmd), "--config", str(nonexistent))
         assert "unrecognized arguments" not in r.stderr, r.stderr
-        # No spurious "config not found" warning (it's a documented no-op).
-        assert "config not found" not in r.stderr.lower()
+        assert r.returncode == 2, (r.returncode, r.stderr)
+        assert "--config: file not found" in r.stderr, r.stderr
+        assert str(nonexistent) in r.stderr, r.stderr
 
     def test_debug_emits_one_time_stderr_note(self, cmd, fake_home):
         r = _run(cmd, *_window_args(cmd), "--debug", "--debug-samples", "3")

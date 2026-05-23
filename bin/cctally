@@ -1105,6 +1105,22 @@ def _emit_debug_note_if_set(args: argparse.Namespace) -> None:
     _DEBUG_NOTE_EMITTED = True
 
 
+def _load_claude_config_for_args(args: argparse.Namespace) -> "dict":
+    """Load config honoring the ccusage ``--config <path>`` per-invocation override.
+
+    Thin shim over :func:`load_config` so the 10 in-scope Claude reporting
+    commands (spec §3 T1.6 / issue #88) surface the override behavior
+    uniformly. When ``args.config`` is set, reads from that explicit path
+    only — no first-run create, no writer-lock acquisition, no mutation
+    of the persisted default config at ``_cctally_core.CONFIG_PATH``.
+    Missing / unreadable / non-object-JSON paths raise ``SystemExit(2)``
+    with a clear stderr message (see ``_load_config_from_explicit_path``).
+    When ``args.config`` is unset (or absent), behavior is identical to
+    a bare ``load_config()`` call.
+    """
+    return load_config(getattr(args, "config", None))
+
+
 def _resolve_codex_tz_name(args: argparse.Namespace,
                            config: "dict | None") -> "str | None":
     """Resolve the IANA tz NAME (or None for host-local) used by Codex
@@ -3549,7 +3565,7 @@ def _load_recorded_five_hour_windows(
 def cmd_blocks(args: argparse.Namespace) -> int:
     """Show usage report grouped by 5-hour session blocks."""
     _emit_debug_note_if_set(args)
-    config = load_config()
+    config = _load_claude_config_for_args(args)
     _bridge_z_into_tz(args, config)
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
@@ -3871,7 +3887,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
     """Show usage report grouped by display-timezone date."""
     _share_validate_args(args)
     _emit_debug_note_if_set(args)
-    config = load_config()
+    config = _load_claude_config_for_args(args)
     # Session A (spec §7.2): bridge -z/--timezone into args.tz so the
     # existing resolve_display_tz precedence absorbs the new alias. The
     # canonical --tz still wins (it's set on the namespace before this
@@ -3959,7 +3975,7 @@ def cmd_monthly(args: argparse.Namespace) -> int:
     """Show usage report grouped by display-timezone calendar month."""
     _share_validate_args(args)
     _emit_debug_note_if_set(args)
-    config = load_config()
+    config = _load_claude_config_for_args(args)
     _bridge_z_into_tz(args, config)
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
@@ -4036,7 +4052,7 @@ def cmd_weekly(args: argparse.Namespace) -> int:
     """Show Claude usage grouped by subscription week."""
     _share_validate_args(args)
     _emit_debug_note_if_set(args)
-    config = load_config()
+    config = _load_claude_config_for_args(args)
     _bridge_z_into_tz(args, config)
     args._resolved_tz = resolve_display_tz(args, config)
 
@@ -4609,7 +4625,7 @@ def cmd_project(args: argparse.Namespace) -> int:
     """Roll entries up by project (git-root) with per-project usage attribution."""
     _share_validate_args(args)
     _emit_debug_note_if_set(args)
-    config = load_config()
+    config = _load_claude_config_for_args(args)
     # Session A (spec §7.2): bridge -z/--timezone into args.tz so the
     # existing resolve_display_tz precedence absorbs the new alias.
     _bridge_z_into_tz(args, config)
@@ -5103,7 +5119,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
     # Validation already happened via _argparse_tz; resolve now to a ZoneInfo
     # (or None for "local") and derive the IANA name for window resolution.
-    config = load_config()
+    config = _load_claude_config_for_args(args)
     # Session A (spec §7.2): bridge -z/--timezone into args.tz so the
     # existing resolve_display_tz precedence absorbs the new alias.
     _bridge_z_into_tz(args, config)
@@ -5219,7 +5235,7 @@ def cmd_session(args: argparse.Namespace) -> int:
     """Show Claude usage grouped by sessionId (merges resumed-across-files sessions)."""
     _share_validate_args(args)
     _emit_debug_note_if_set(args)
-    config = load_config()
+    config = _load_claude_config_for_args(args)
     _bridge_z_into_tz(args, config)
     tz = resolve_display_tz(args, config)
     args._resolved_tz = tz
@@ -7439,7 +7455,7 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
     """List API-anchored 5h blocks with rollup totals + 7d-drift columns."""
     _share_validate_args(args)
     _emit_debug_note_if_set(args)
-    config = load_config()
+    config = _load_claude_config_for_args(args)
     # Session A (spec §7.2): bridge -z/--timezone into args.tz before
     # resolve_display_tz so the new alias precedence lands.
     _bridge_z_into_tz(args, config)
@@ -8356,7 +8372,7 @@ def _sort_cache_rows(
 
 def cmd_cache_report(args: argparse.Namespace) -> int:
     _emit_debug_note_if_set(args)
-    config = load_config()
+    config = _load_claude_config_for_args(args)
     # Session A (spec §7.2): bridge -z/--timezone into args.tz so the
     # existing resolve_display_tz precedence absorbs the new alias. The
     # canonical --tz still wins (it's set on the namespace before this
@@ -8454,7 +8470,7 @@ def cmd_range_cost(args: argparse.Namespace) -> int:
     # downstream consumer), so this is a documented no-op for this
     # command. The bridge still runs _resolve_claude_tz_name so the §9.2a
     # production-path coverage is exercised here too.
-    config = load_config()
+    config = _load_claude_config_for_args(args)
     _bridge_z_into_tz(args, config)
     start_dt = parse_iso_datetime(args.start, "--start")
     if args.end:
@@ -9042,9 +9058,10 @@ def _add_ccusage_alias_args(parser, *, ansi_emit: bool) -> None:
     )
     _maybe_add(
         "--config", default=None, metavar="PATH",
-        help="Accepted for ccusage drop-in compat; cctally config is "
-             "loaded from ~/.local/share/cctally/config.json. Tracked at "
-             "issue #88 for real per-invocation override.",
+        help="Read config from PATH for this invocation only (no "
+             "mutation of the default config at "
+             "~/.local/share/cctally/config.json). Missing or invalid "
+             "PATH errors out with a clear message.",
     )
     _maybe_add2(
         "-d", "--debug", action="store_true",
