@@ -9,9 +9,17 @@ forever — trapping any downstream cross-DB consumer (stats migration 008)
 in infinite deferral.
 
 Post-fix: when 001 is poison-pill skipped, the gate considers the
-prerequisite satisfied (operator's affirmation that they accept dedup
-won't apply on this machine; downstream consumers proceed against
-whatever's currently in session_entries).
+prerequisite satisfied for a caller with NO historical rows to recompute
+(``data_present=False``) — operator's affirmation that they accept dedup
+won't apply on this machine; nothing to corrupt.
+
+P1/P2 follow-up: a caller that DOES hold historical rows
+(``data_present=True``) must NOT proceed against the stale pre-dedup
+``session_entries`` while 001 is skipped — recomputing + stamping its
+marker would strand the migration past a later ``db unskip`` (which only
+resets cache.db's user_version, never a stats migration's marker). The
+gate DEFERS in that case (see
+``test_gate_defers_when_001_skipped_and_data_present``).
 
 Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3 (G1).
 """
@@ -116,6 +124,38 @@ def test_gate_passes_when_001_skipped_even_without_session_files(
     (projects / "session1.jsonl").write_text("{}\n")
 
     db_module._gate_001_post_ingest_completed(cache, projects)
+
+
+def test_gate_defers_when_001_skipped_and_data_present(db_module, tmp_path):
+    """P2 — when 001 is skipped BUT the caller still holds historical rows
+    (``data_present=True``), the gate must DEFER rather than pass.
+
+    Passing would let a dependent recompute (008/009/010) run against the
+    stale pre-dedup ``session_entries`` and stamp its own marker. A later
+    ``cctally db unskip 001_dedup_highest_wins`` rebuilds cache.db's
+    session_entries but only resets cache.db's user_version — it cannot
+    re-trigger an already-stamped stats migration, so ``report`` and the
+    5h aggregates would stay permanently inflated. Deferring keeps the
+    dependent recompute pending until 001 has actually applied.
+    """
+    cache = sqlite3.connect(":memory:")
+    _seed_cache_schema(cache)
+    cache.execute(
+        "INSERT INTO schema_migrations_skipped "
+        "(name, skipped_at_utc, reason) VALUES (?, ?, ?)",
+        ("001_dedup_highest_wins", "2026-05-22T17:00:00Z", "manual skip"),
+    )
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    (projects / "session1.jsonl").write_text("{}\n")
+
+    with pytest.raises(
+        db_module.MigrationGateNotMet,
+        match="skipped",
+    ):
+        db_module._gate_001_post_ingest_completed(
+            cache, projects, data_present=True,
+        )
 
 
 def test_gate_still_defers_when_001_neither_applied_nor_skipped(

@@ -489,14 +489,17 @@ def test_008_eager_trigger_applies_001_marker_when_missing(
 ):
     """V4 — when cache.db has no 001 marker, the migration body's
     eager-cache-trigger applies it (instead of deferring) so the
-    same-invocation gate check then sees Layer A satisfied. With an
-    empty disk (no JSONL), Layer C empty-disk fallback then fires →
-    migration completes as a no-op (marker stamped, no rows touched).
+    same-invocation gate check then sees Layer A satisfied.
 
-    Pre-V4 this scenario raised ``MigrationGateNotMet`` (deferring 008
-    to the NEXT invocation). The eager trigger eliminates that one-
-    invocation lag so first-run ``cctally report`` no longer reads
-    stale snapshots.
+    The eager trigger (the V4 behavior under test here) runs BEFORE the
+    gate's Layer C check, so the 001 marker is stamped regardless of the
+    gate outcome. This stats.db carries real ``weekly_cost_snapshots``
+    rows AND the disk is empty (no JSONL), so the gate's data-present
+    guard (P1 fix) DEFERS rather than silently recomputing the historical
+    auto/no-project snapshot to ``0.0`` — recomputing over an empty
+    ``session_entries`` would destroy the only surviving copy of that
+    cost. The recompute stays pending until a real post-001 ingest
+    repopulates ``session_entries``.
     """
     db = _load_db()
     core = _load_core(db)
@@ -548,15 +551,35 @@ def test_008_eager_trigger_applies_001_marker_when_missing(
 
     stats = sqlite3.connect(stats_path)
     try:
-        # No exception — the eager trigger applied 001, the gate's
-        # Layer A passes, Layer C empty-disk also passes, the
-        # migration completes in this same invocation.
-        db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+        # The eager trigger applied 001 (Layer A now passes), but with
+        # snapshot rows present AND an empty disk the data-present guard
+        # DEFERS (P1 fix) rather than zeroing the historical snapshot.
+        with pytest.raises(db.MigrationGateNotMet):
+            db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+
+        # The auto/no-project snapshot was NOT zeroed — defer left it at
+        # its pre-fix value.
+        cost = stats.execute(
+            "SELECT cost_usd FROM weekly_cost_snapshots "
+            "WHERE mode = 'auto' AND project IS NULL"
+        ).fetchone()[0]
+        assert cost == pytest.approx(100.0, abs=1e-9), (
+            "data-present empty-disk defer must NOT touch the snapshot; "
+            f"got {cost!r}"
+        )
+
+        # 008's own marker must NOT be stamped on a gate-defer.
+        marker = stats.execute(
+            "SELECT 1 FROM schema_migrations "
+            "WHERE name = '008_recompute_weekly_cost_snapshots_dedup_fix'"
+        ).fetchone()
+        assert marker is None, "008 marker must NOT stamp on gate-defer"
     finally:
         stats.close()
 
-    # cache.db now carries the 001 marker (stamped by the eager
-    # dispatcher). Cross-DB invariant: the gate's premise is now true.
+    # cache.db STILL carries the 001 marker (stamped by the eager
+    # dispatcher BEFORE the gate's Layer C check). The eager trigger is
+    # the V4 behavior under test; the gate-defer above is independent.
     cache_ro = sqlite3.connect(cache_path)
     try:
         applied = cache_ro.execute(
@@ -676,12 +699,16 @@ def test_008_eager_trigger_creates_cache_db_when_missing(
     """V4 — when ``CACHE_DB_PATH`` points at a non-existent file, the
     migration body's eager-cache-trigger CREATES it (mirroring
     ``open_cache_db``'s contract that cache.db is fully re-derivable)
-    and applies cache migration 001 in the same pass. With no JSONL on
-    disk (Layer C empty-disk fallback) the migration then completes as
-    a no-op, marker stamped.
+    and applies cache migration 001 in the same pass.
 
-    Pre-V4 this raised ``MigrationGateNotMet`` (the RO gate connection
-    saw SQLITE_CANTOPEN and translated to gate-defer). G4's CANTOPEN→
+    The eager trigger (creating cache.db + stamping 001) is the V4
+    behavior under test; it runs BEFORE the gate's Layer C check. With
+    real ``weekly_cost_snapshots`` rows present AND an empty disk, the
+    gate's data-present guard (P1 fix) DEFERS rather than zeroing the
+    historical snapshot over an empty ``session_entries``.
+
+    Pre-V4 the missing cache.db raised ``MigrationGateNotMet`` via the RO
+    gate connection seeing SQLITE_CANTOPEN. G4's CANTOPEN→
     MigrationGateNotMet translation is still in place on the RO gate
     connection — it just rarely fires now because the eager trigger
     creates the file. The translation continues to defend against
@@ -707,13 +734,26 @@ def test_008_eager_trigger_creates_cache_db_when_missing(
 
     stats = sqlite3.connect(stats_path)
     try:
-        # No exception — eager trigger created cache.db, applied 001,
-        # Layer C empty-disk fallback passed.
-        db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+        # Eager trigger creates cache.db + applies 001, but the
+        # data-present empty-disk guard (P1 fix) then DEFERS rather than
+        # zeroing the historical snapshot.
+        with pytest.raises(db.MigrationGateNotMet):
+            db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+
+        # Snapshot NOT zeroed by the defer.
+        cost = stats.execute(
+            "SELECT cost_usd FROM weekly_cost_snapshots "
+            "WHERE mode = 'auto' AND project IS NULL"
+        ).fetchone()[0]
+        assert cost == pytest.approx(100.0, abs=1e-9), (
+            "data-present empty-disk defer must NOT touch the snapshot; "
+            f"got {cost!r}"
+        )
     finally:
         stats.close()
 
-    # cache.db now exists and carries the 001 marker.
+    # cache.db now exists and carries the 001 marker (eager trigger ran
+    # before the gate's data-present defer).
     assert missing_cache.exists(), (
         "V4: eager trigger must create cache.db when missing"
     )

@@ -23,15 +23,20 @@ write path would have been stamped applied without running.
 Fix shape (bin/_cctally_db.py:474)
 
 ``fresh_install`` now requires BOTH the schema_migrations-table
-absence (existing check) AND empty/absent probe table per DB:
+absence (existing check) AND empty/absent probe tables per DB:
 
-  * stats.db → ``weekly_cost_snapshots``
+  * stats.db → ``weekly_cost_snapshots`` (008), ``five_hour_blocks``
+    (009), ``percent_milestones`` (010) — ANY non-empty means "not
+    fresh." Probing ONLY ``weekly_cost_snapshots`` was a follow-up gap:
+    a legacy stats.db with live 5h history but no weekly snapshots was
+    falsely classified fresh, so 009 got stamped-without-running and its
+    historical 5h totals stayed inflated.
   * cache.db → ``session_entries``
 
-Probe-table absent (genuine pre-CREATE fresh install) keeps the
-fresh_install branch active. Probe-table present with one or more rows
-flips fresh_install to False and the registry walks normally with
-handlers invoked.
+Probe-tables all absent/empty (genuine pre-CREATE fresh install) keeps
+the fresh_install branch active. Any probe-table present with one or
+more rows flips fresh_install to False and the registry walks normally
+with handlers invoked.
 
 Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3 (D1).
 """
@@ -374,3 +379,107 @@ def test_stats_pre_framework_upgrade_marks_pending_runs_handlers(
             conn.close()
     finally:
         pass
+
+
+def _seed_pre_framework_stats_db_5h_only(path: pathlib.Path) -> None:
+    """Stage a stats.db with ``five_hour_blocks`` rows but ZERO
+    ``weekly_cost_snapshots`` rows, NO schema_migrations table.
+
+    This is the P2 gap topology: a legacy stats.db whose only history is
+    5h-window data. The single-table probe (``weekly_cost_snapshots``
+    only) would have seen it empty → fresh_install True → 009 stamped
+    without running → inflated 5h totals forever.
+    """
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE weekly_cost_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at_utc TEXT NOT NULL,
+                week_start_date TEXT NOT NULL,
+                week_end_date TEXT NOT NULL,
+                week_start_at TEXT,
+                week_end_at TEXT,
+                range_start_iso TEXT,
+                range_end_iso TEXT,
+                cost_usd REAL NOT NULL,
+                source TEXT NOT NULL DEFAULT 'cctally-range-cost',
+                mode TEXT NOT NULL DEFAULT 'auto',
+                project TEXT
+            );
+            CREATE TABLE five_hour_blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                five_hour_window_key INTEGER NOT NULL,
+                block_start_at TEXT NOT NULL,
+                last_observed_at_utc TEXT NOT NULL,
+                total_input_tokens INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd REAL NOT NULL DEFAULT 0.0
+            );
+            """
+        )
+        # weekly_cost_snapshots intentionally EMPTY; only 5h history.
+        conn.execute(
+            "INSERT INTO five_hour_blocks "
+            "(five_hour_window_key, block_start_at, last_observed_at_utc, "
+            " total_output_tokens, total_cost_usd) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (1746086400, "2026-05-01T00:00:00Z", "2026-05-01T04:00:00Z",
+             1000, 99.0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_stats_pre_framework_5h_only_is_not_classified_fresh(
+    db_module, tmp_path, monkeypatch,
+):
+    """P2 — a legacy stats.db whose ONLY history is ``five_hour_blocks``
+    (zero ``weekly_cost_snapshots`` rows) must take the UPGRADE path, not
+    the fresh-install stamp-only path.
+
+    Pre-fix the single-table probe checked only ``weekly_cost_snapshots``;
+    it was empty here, so fresh_install stayed True and every stats
+    migration (including 009's 5h recompute) was stamped applied WITHOUT
+    running — leaving the inflated pre-dedup 5h totals in place forever.
+
+    Post-fix the multi-table probe sees the ``five_hour_blocks`` row →
+    fresh_install is False → the dispatcher invokes handlers. We prove
+    invocation the same way the weekly-only test does: the stripped-down
+    fixture lacks the full production schema, so the first handler fails,
+    the dispatcher logs + breaks, and ``user_version`` stays at 0.
+    """
+    stats_path = tmp_path / "stats.db"
+    _seed_pre_framework_stats_db_5h_only(stats_path)
+
+    import _cctally_core
+    log_path = tmp_path / "migration-errors.log"
+    monkeypatch.setattr(_cctally_core, "MIGRATION_ERROR_LOG_PATH", log_path)
+    monkeypatch.setattr(_cctally_core, "LOG_DIR", tmp_path)
+
+    conn = sqlite3.connect(stats_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        db_module._run_pending_migrations(
+            conn,
+            registry=db_module._STATS_MIGRATIONS,
+            db_label="stats.db",
+        )
+
+        user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert user_version == 0, (
+            "P2: a 5h-only legacy stats.db must NOT be classified fresh; "
+            "handlers must be invoked (user_version stays 0 because the "
+            "stripped-down fixture makes the first handler fail). Pre-fix "
+            "the weekly-only probe advanced this to len(registry)."
+        )
+        assert log_path.exists(), (
+            "P2: handler invocation must produce a log entry; pre-fix the "
+            "fresh-install fast path never invoked a handler."
+        )
+    finally:
+        conn.close()

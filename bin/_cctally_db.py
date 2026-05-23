@@ -489,10 +489,17 @@ def _run_pending_migrations(
     # user. The handler is the entire fix — skipping it leaves the
     # buggy summed-tokens data in place indefinitely.
     #
-    # Probe table per DB:
-    #   * stats.db → ``weekly_cost_snapshots`` (the table 008 recomputes;
-    #     non-empty means real cost history that handlers may need to
-    #     touch).
+    # Probe tables per DB — ANY non-empty probe table means "not fresh":
+    #   * stats.db → every table the recompute migrations (008/009/010)
+    #     touch: ``weekly_cost_snapshots`` (008), ``five_hour_blocks``
+    #     (009), ``percent_milestones`` (010). Probing ONLY
+    #     ``weekly_cost_snapshots`` was a gap: a legacy stats.db with live
+    #     5h history but no weekly snapshots (e.g. a user who only ever ran
+    #     5h-window commands) was falsely classified as a fresh install,
+    #     so 009 got stamped-without-running and its historical 5h totals
+    #     stayed inflated forever — the exact bug this patch set exists to
+    #     fix. Probe all three so non-emptiness in ANY recompute target
+    #     forces the handlers to run.
     #   * cache.db → ``session_entries`` (the table 001 wipes; non-empty
     #     means real session history under the buggy old dedup rule).
     # Probe table absent → treat as empty (a brand-new DB hasn't run
@@ -500,11 +507,15 @@ def _run_pending_migrations(
     # genuine fresh install).
     fresh_install = (not schema_migrations_existed) and len(applied) == 0
     if fresh_install:
-        probe_table = {
-            "stats.db": "weekly_cost_snapshots",
-            "cache.db": "session_entries",
-        }.get(db_label)
-        if probe_table is not None:
+        probe_tables = {
+            "stats.db": (
+                "weekly_cost_snapshots",
+                "five_hour_blocks",
+                "percent_milestones",
+            ),
+            "cache.db": ("session_entries",),
+        }.get(db_label, ())
+        for probe_table in probe_tables:
             try:
                 data_row = conn.execute(
                     f"SELECT 1 FROM {probe_table} LIMIT 1"
@@ -514,10 +525,12 @@ def _run_pending_migrations(
                     # DB is NOT a fresh install. Run every handler
                     # normally so the upgrading user gets the fix.
                     fresh_install = False
+                    break
             except sqlite3.OperationalError as exc:
                 # Probe table doesn't exist yet (genuine pre-CREATE
-                # fresh install) — keep fresh_install=True. Anything
-                # else (corrupt DB, IO error) propagates.
+                # fresh install) — this table contributes no signal;
+                # keep checking the rest. Anything else (corrupt DB, IO
+                # error) propagates.
                 if not _is_no_such_table_error(exc):
                     raise
 
@@ -1796,10 +1809,36 @@ def _migration_observed_pre_credit_pct(conn: sqlite3.Connection) -> None:
 def _gate_001_post_ingest_completed(
     cache_ro: sqlite3.Connection,
     claude_projects_dirs: pathlib.Path | list[pathlib.Path],
+    *,
+    data_present: bool = False,
 ) -> None:
     """Raise ``MigrationGateNotMet`` unless cache migration 001 has applied
     AND ``sync_cache`` has run at least once after it (or there are no
     JSONL files to ingest in the first place).
+
+    ``data_present`` (keyword-only, defaults to ``False`` for backward
+    compatibility with the 2-arg test callers) tells the gate whether the
+    CALLER still holds historical rows it is about to recompute from
+    ``session_entries``. When it does, two otherwise-passing shortcuts
+    become DESTRUCTIVE and are converted to defers:
+
+      * **Layer C (empty-disk fallback)** — if the projects dir exists but
+        has been pruned of JSONL, ``session_entries`` is empty; recomputing
+        over it would zero the caller's historical aggregates (the only
+        remaining copy of that data). With ``data_present=True`` the gate
+        raises ``MigrationGateNotMet`` instead of silently passing.
+      * **001-skipped path** — ``cctally db skip 001_dedup_highest_wins``
+        means the dedup wipe never ran, so ``session_entries`` is still the
+        stale pre-dedup data. Letting the caller recompute and stamp its
+        marker now strands it: a later ``db unskip`` rebuilds the cache but
+        cannot re-trigger an already-stamped stats migration. With
+        ``data_present=True`` the gate defers so the recompute stays pending
+        until 001 has actually applied and post-ingest data exists.
+
+    Both shortcuts still pass freely on the truly-fresh-install topology
+    (``data_present=False`` because the caller has no rows): there is
+    nothing to corrupt, and deferring would loop forever (no JSONL → no
+    future ingest → resolver stays empty).
 
     The single-signal gate "001 marker present" is not enough: 001 writes
     the marker immediately after the wipe, BEFORE any post-wipe
@@ -1893,17 +1932,25 @@ def _gate_001_post_ingest_completed(
         ) from None
     if gate_row is None:
         # G1 — 001 may instead be poison-pill skipped via
-        # ``cctally db skip 001_dedup_highest_wins``. The operator's
-        # affirmation that they accept dedup won't apply on this
-        # machine is also acceptance that downstream cross-DB
-        # consumers (008's recompute over session_entries) should
-        # proceed against whatever's currently in session_entries,
-        # not block forever. Layer B's post-ingest check still runs
-        # against the timestamp the operator may not have stamped —
-        # so when 001 is skipped we treat Layer B as already
-        # satisfied (no marker to compare against). Layer C's
-        # empty-disk fallback still fires for users with no JSONL
-        # on disk.
+        # ``cctally db skip 001_dedup_highest_wins``.
+        #
+        # When the caller has NO historical rows to recompute
+        # (``data_present=False``), skipping 001 is acceptance that the
+        # cross-DB consumers should proceed against whatever's currently in
+        # session_entries rather than block forever — there's nothing to
+        # corrupt.
+        #
+        # When the caller DOES hold historical rows (``data_present=True``),
+        # passing here is DESTRUCTIVE-then-stranding: the dependent
+        # recompute would run against the stale pre-dedup ``session_entries``
+        # AND stamp its own marker. A later ``cctally db unskip
+        # 001_dedup_highest_wins`` rebuilds cache.db's session_entries but
+        # only resets cache.db's user_version — it cannot re-trigger an
+        # already-stamped stats migration, so ``report`` and the 5h
+        # aggregates would stay permanently inflated. So for a data-present
+        # caller we DEFER while 001 is skipped: the recompute stays pending
+        # (marker unstamped, user_version not advanced) until 001 has
+        # actually applied and post-ingest data exists.
         try:
             skipped_row = cache_ro.execute(
                 "SELECT 1 FROM schema_migrations_skipped WHERE name = ?",
@@ -1922,9 +1969,21 @@ def _gate_001_post_ingest_completed(
             else:
                 raise
         if skipped_row is not None:
-            # 001 explicitly skipped → gate passes. Caller proceeds
-            # against whatever's currently in session_entries. To
-            # unblock, the operator runs ``cctally db unskip
+            if data_present:
+                # 001 skipped but the caller still holds historical rows —
+                # defer rather than recompute-over-stale + stamp (which
+                # would strand the migration past a future ``db unskip``).
+                raise MigrationGateNotMet(
+                    "cache.db migration 001_dedup_highest_wins is skipped; "
+                    "deferring dependent recompute to avoid recomputing "
+                    "historical aggregates over stale pre-dedup "
+                    "session_entries. Run `cctally db unskip "
+                    "001_dedup_highest_wins` (then any JSONL-reading "
+                    "command once) to apply the dedup and unblock."
+                )
+            # 001 explicitly skipped AND no rows to recompute → gate
+            # passes (nothing to corrupt). To unblock the dedup itself,
+            # the operator runs ``cctally db unskip
             # 001_dedup_highest_wins`` and re-opens.
             return
         raise MigrationGateNotMet(
@@ -1988,10 +2047,29 @@ def _gate_001_post_ingest_completed(
     # with no Claude usage can still pass the gate; downstream
     # migrations are also no-ops in this case (no cost rows to
     # recompute, no aggregates to refresh).
+    #
+    # EXCEPTION (``data_present=True``): a caller that still holds
+    # historical rows must NOT take this shortcut. "No JSONL on disk" here
+    # means the user pruned ``~/.claude/projects/`` (or pointed
+    # ``CLAUDE_CONFIG_DIR`` at an emptied ``projects/`` dir) AFTER 001
+    # wiped session_entries — so session_entries is empty but the stats
+    # tables still carry the only surviving copy of the data. Passing
+    # would recompute over an empty cache and zero those historical
+    # aggregates irrecoverably. Defer instead; the recompute stays pending
+    # until a real post-001 ingest repopulates session_entries.
     has_any_jsonl = any(
         any(p.glob("**/*.jsonl")) for p in projects_dirs
     )
     if not has_any_jsonl:
+        if data_present:
+            raise MigrationGateNotMet(
+                "cache.db has no post-001 ingest and no JSONL on disk, but "
+                "historical rows remain to recompute; refusing the "
+                "empty-disk fallback to avoid zeroing them. Restore the "
+                "Claude projects/ JSONL (or fix CLAUDE_CONFIG_DIR) and run "
+                "any JSONL-reading command once, or `cctally db skip` this "
+                "migration to accept the stale aggregates."
+            )
         return
 
     raise MigrationGateNotMet(
@@ -2449,7 +2527,9 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
         # defer would loop forever on this topology.
         if not projects_dirs:
             projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
-        _gate_001_post_ingest_completed(cache_ro, projects_dirs)
+        _gate_001_post_ingest_completed(
+            cache_ro, projects_dirs, data_present=bool(snapshot_rows),
+        )
 
         # Banner gated on "we actually have eligible rows to recompute"
         # AND "active subcommand is not in _BANNER_SUPPRESSED_COMMANDS"
@@ -2742,7 +2822,9 @@ def _009_recompute_five_hour_blocks_dedup_fix(
 
         if not projects_dirs:
             projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
-        _gate_001_post_ingest_completed(cache_ro, projects_dirs)
+        _gate_001_post_ingest_completed(
+            cache_ro, projects_dirs, data_present=bool(block_rows),
+        )
 
         # SW5-style banner gating via the shared
         # ``_recompute_banner_should_emit`` helper: only print when
@@ -3022,7 +3104,9 @@ def _010_recompute_percent_milestones_dedup_fix(
             )
         if not projects_dirs:
             projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
-        _gate_001_post_ingest_completed(cache_ro, projects_dirs)
+        _gate_001_post_ingest_completed(
+            cache_ro, projects_dirs, data_present=bool(milestone_rows),
+        )
 
         # SW5-style banner gating via the shared
         # ``_recompute_banner_should_emit`` helper: only print when

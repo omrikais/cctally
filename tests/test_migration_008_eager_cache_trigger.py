@@ -184,19 +184,27 @@ def _stage_cache_with_session_entries_only(cache_path: pathlib.Path) -> None:
         cache.close()
 
 
-def test_v4_first_invocation_post_upgrade_runs_008_in_same_pass(
+def test_v4_first_invocation_post_upgrade_eager_trigger_then_defers(
     tmp_path, monkeypatch
 ):
-    """The critical V4 contract: on first ``cctally report`` post-
-    upgrade with a populated cache.db (no schema_migrations table at
-    all — purest pre-framework topology), the stats 008 handler
-    completes IN THE SAME invocation rather than deferring.
+    """V4 eager trigger + P1 data-present guard interaction: on first
+    ``cctally report`` post-upgrade with a populated cache.db (no
+    schema_migrations table at all — purest pre-framework topology), the
+    eager trigger fires (stamps cache 001, wipes session_entries), but
+    the stats 008 handler then DEFERS rather than recomputing.
+
+    Why defer (P1): cache 001 has just wiped ``session_entries`` and
+    there is NO JSONL on disk to re-ingest, while stats.db still holds a
+    real auto/no-project ``weekly_cost_snapshots`` row. Recomputing over
+    the empty cache would zero that historical cost irrecoverably. The
+    data-present guard converts the empty-disk Layer C shortcut into a
+    defer, leaving 008 pending until a real post-001 ingest exists.
 
     Verifies:
       * Cache 001 marker stamped (eager trigger fired).
       * Cache 001 wiped session_entries (per its handler contract).
-      * Stats 008 marker stamped (migration ran, not deferred).
-      * Empty-disk Layer C passed (no JSONL on disk).
+      * Stats 008 DEFERS (``MigrationGateNotMet``); 008 marker NOT
+        stamped; the snapshot cost is left untouched.
     """
     db = _load_db()
     core = db._cctally_core
@@ -207,8 +215,9 @@ def test_v4_first_invocation_post_upgrade_runs_008_in_same_pass(
     _stage_cache_with_session_entries_only(cache_path)
 
     _pin_paths(core, tmp_path, monkeypatch)
-    # Empty projects dir → no JSONL on disk → Layer C empty-disk
-    # fallback passes after the eager trigger applies 001.
+    # Empty projects dir → no JSONL on disk. The eager trigger still
+    # applies 001 and wipes session_entries, but the data-present guard
+    # then DEFERS 008 instead of zeroing the snapshot.
     fake_projects = tmp_path / "claude_projects"
     fake_projects.mkdir()
 
@@ -217,17 +226,27 @@ def test_v4_first_invocation_post_upgrade_runs_008_in_same_pass(
 
     stats = sqlite3.connect(stats_path)
     try:
-        # No exception → migration completed in the SAME invocation.
-        # Pre-V4 this would have raised ``MigrationGateNotMet``.
-        db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+        # Data present + empty disk → P1 guard defers.
+        with pytest.raises(db.MigrationGateNotMet):
+            db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
 
-        # Stats 008 marker stamped.
+        # Stats 008 marker NOT stamped (deferred, not applied).
         marker_008 = stats.execute(
             "SELECT 1 FROM schema_migrations "
             "WHERE name = '008_recompute_weekly_cost_snapshots_dedup_fix'"
         ).fetchone()
-        assert marker_008 is not None, (
-            "V4: stats 008 marker must be stamped in same invocation"
+        assert marker_008 is None, (
+            "P1: stats 008 marker must NOT be stamped on data-present "
+            "empty-disk defer"
+        )
+
+        # Snapshot cost untouched by the defer.
+        cost = stats.execute(
+            "SELECT cost_usd FROM weekly_cost_snapshots WHERE id = ?",
+            (snap_id,),
+        ).fetchone()[0]
+        assert cost == pytest.approx(100.0, abs=1e-9), (
+            f"snapshot cost_usd must be untouched on defer; got {cost!r}"
         )
     finally:
         stats.close()
