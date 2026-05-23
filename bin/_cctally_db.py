@@ -2260,6 +2260,99 @@ def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
 # === Region 7b2: Eager cache-migration trigger (V4 — same-invocation 008 apply) ===
 
 
+def _apply_cache_schema(conn: sqlite3.Connection) -> None:
+    """Single source of cache.db's schema (cctally-dev#93, spec D4).
+
+    ``_cctally()``-free so both ``open_cache_db`` (in _cctally_cache.py, which
+    already imports _cctally_db) and ``_eagerly_apply_cache_migrations`` (here)
+    can call it without an import cycle. Idempotent (CREATE ... IF NOT EXISTS +
+    ``add_column_if_missing``). Does NOT run the dispatcher and does NOT include
+    the Codex ``last_total_tokens`` ALTER, which carries a one-time purge
+    side-effect that stays in ``open_cache_db``: a future cross-DB migration
+    that needs a Codex column on the eager-apply path must revisit that
+    exception. The eager-apply path provably never touches Codex (cache 001 +
+    the 008/009/010 RO joins are all Claude-side), so the column's absence here
+    cannot surface a ``no such column``.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS session_files (
+            path             TEXT PRIMARY KEY,
+            size_bytes       INTEGER NOT NULL,
+            mtime_ns         INTEGER NOT NULL,
+            last_byte_offset INTEGER NOT NULL,
+            last_ingested_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS session_entries (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path         TEXT    NOT NULL,
+            line_offset         INTEGER NOT NULL,
+            timestamp_utc       TEXT    NOT NULL,
+            model               TEXT    NOT NULL,
+            msg_id              TEXT,
+            req_id              TEXT,
+            input_tokens        INTEGER NOT NULL DEFAULT 0,
+            output_tokens       INTEGER NOT NULL DEFAULT 0,
+            cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+            usage_extra_json    TEXT,
+            cost_usd_raw        REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_entries_timestamp
+            ON session_entries(timestamp_utc);
+        CREATE INDEX IF NOT EXISTS idx_entries_source
+            ON session_entries(source_path);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_dedup
+            ON session_entries(msg_id, req_id)
+            WHERE msg_id IS NOT NULL AND req_id IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS codex_session_files (
+            path             TEXT PRIMARY KEY,
+            size_bytes       INTEGER NOT NULL,
+            mtime_ns         INTEGER NOT NULL,
+            last_byte_offset INTEGER NOT NULL,
+            last_ingested_at TEXT NOT NULL,
+            last_session_id  TEXT,
+            last_model       TEXT
+        );
+        CREATE TABLE IF NOT EXISTS codex_session_entries (
+            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path              TEXT    NOT NULL,
+            line_offset              INTEGER NOT NULL,
+            timestamp_utc            TEXT    NOT NULL,
+            session_id               TEXT    NOT NULL,
+            model                    TEXT    NOT NULL,
+            input_tokens             INTEGER NOT NULL DEFAULT 0,
+            cached_input_tokens      INTEGER NOT NULL DEFAULT 0,
+            output_tokens            INTEGER NOT NULL DEFAULT 0,
+            reasoning_output_tokens  INTEGER NOT NULL DEFAULT 0,
+            total_tokens             INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(source_path, line_offset)
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_entries_timestamp
+            ON codex_session_entries(timestamp_utc);
+        CREATE INDEX IF NOT EXISTS idx_codex_entries_session
+            ON codex_session_entries(session_id);
+        CREATE INDEX IF NOT EXISTS idx_codex_entries_source
+            ON codex_session_entries(source_path);
+
+        CREATE TABLE IF NOT EXISTS cache_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """
+    )
+    # Inline migration: add session_id / project_path columns to session_files
+    # if they're missing. These were added for A2 `session` subcommand metadata;
+    # populated lazily in sync_cache() / _ensure_session_files_row().
+    add_column_if_missing(conn, "session_files", "session_id", "TEXT")
+    add_column_if_missing(conn, "session_files", "project_path", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
+        "ON session_files(session_id)"
+    )
+
+
 def _eagerly_apply_cache_migrations() -> None:
     """Open cache.db so its pending migrations (notably
     ``001_dedup_highest_wins``) apply BEFORE stats migration 008's gate
@@ -2314,16 +2407,19 @@ def _eagerly_apply_cache_migrations() -> None:
 
     Implementation note
     -------------------
-    We inline the minimal cache.db open here (schema CREATE +
-    dispatcher) rather than delegate to ``_cctally_cache.open_cache_db``
-    because the latter calls ``_cctally()`` (a back-reference into
-    ``sys.modules['cctally']``) which is set up by the bin/cctally
-    entrypoint but absent in test harnesses that exercise the stats
-    handler directly. The inlined open is a strict subset: the same
-    schema DDL + the same dispatcher call. Any future expansion of
-    ``open_cache_db`` (e.g. extra ALTERs) would need to be mirrored
-    here OR this helper would need to drop the inline pattern and
-    delegate (after removing the unused ``_cctally()`` line).
+    We open cache.db here directly (corruption-recovery connect + PRAGMAs +
+    schema + dispatcher) rather than delegate to
+    ``_cctally_cache.open_cache_db`` because the latter calls ``_cctally()``
+    (a back-reference into ``sys.modules['cctally']``) which is set up by the
+    bin/cctally entrypoint but absent in test harnesses that exercise the
+    stats handler directly. The schema is applied via the shared
+    ``_apply_cache_schema`` helper (cctally-dev#93, D4) — the SAME source
+    ``open_cache_db`` uses — so the two paths can no longer drift (the prior
+    hand-curated inline subset was the origin of the ``no such column:
+    sf.project_path`` landmine). The only divergence from ``open_cache_db``
+    is the Codex ``last_total_tokens`` ALTER + purge, which is deliberately
+    Claude-irrelevant and provably never reached by this path (see
+    ``_apply_cache_schema``'s docstring + spec D4/P1#3).
     """
     cache_db_path = _cctally_core.CACHE_DB_PATH
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -2345,48 +2441,16 @@ def _eagerly_apply_cache_migrations() -> None:
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS session_files (
-                path             TEXT PRIMARY KEY,
-                size_bytes       INTEGER NOT NULL,
-                mtime_ns         INTEGER NOT NULL,
-                last_byte_offset INTEGER NOT NULL,
-                last_ingested_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS session_entries (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_path         TEXT    NOT NULL,
-                line_offset         INTEGER NOT NULL,
-                timestamp_utc       TEXT    NOT NULL,
-                model               TEXT    NOT NULL,
-                msg_id              TEXT,
-                req_id              TEXT,
-                input_tokens        INTEGER NOT NULL DEFAULT 0,
-                output_tokens       INTEGER NOT NULL DEFAULT 0,
-                cache_create_tokens INTEGER NOT NULL DEFAULT 0,
-                cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
-                usage_extra_json    TEXT,
-                cost_usd_raw        REAL
-            );
-            """
-        )
-        # Mirror open_cache_db's ALTER-added columns on session_files. The
-        # CREATE TABLE IF NOT EXISTS above only lays down the base five
-        # columns; ``session_id`` / ``project_path`` were added later via
-        # ``add_column_if_missing`` in ``open_cache_db`` (A2 ``session``
-        # metadata). Stats migration 009 joins ``sf.project_path`` on the
-        # RO connection bootstrapped by THIS helper — on an older cache.db
-        # whose pre-existing session_files table predates those columns,
-        # the CREATE is a no-op (table exists) and the column would be
-        # absent, so 009's join would raise ``no such column:
-        # sf.project_path`` at prepare time (column resolution happens
-        # even with zero rows). Idempotent + cheap: a no-op when the
-        # columns already exist. Keeps this inline open a strict schema
-        # superset-mirror of ``open_cache_db`` (see the "Implementation
-        # note" in this function's docstring).
-        add_column_if_missing(conn, "session_files", "session_id", "TEXT")
-        add_column_if_missing(conn, "session_files", "project_path", "TEXT")
+        # Apply the shared cache.db schema (cctally-dev#93, D4). This is the
+        # SAME source ``open_cache_db`` uses, including ``session_id`` /
+        # ``project_path`` on session_files (009 joins ``sf.project_path`` on
+        # the RO gate connection bootstrapped here; column resolution happens
+        # at prepare time even with zero rows, so an absent column would raise
+        # ``no such column: sf.project_path``) and the new ``cache_meta``
+        # table. The Codex ``last_total_tokens`` ALTER stays out of the shared
+        # helper and is intentionally not applied here (Claude-only path; see
+        # ``_apply_cache_schema``'s docstring + spec D4/P1#3).
+        _apply_cache_schema(conn)
         # Dispatcher (cache.db side). Runs every pending cache
         # migration, including ``001_dedup_highest_wins``. Idempotent —
         # if 001 has already applied, this is a fast-path return.

@@ -1468,79 +1468,15 @@ def open_cache_db() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
 
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS session_files (
-            path             TEXT PRIMARY KEY,
-            size_bytes       INTEGER NOT NULL,
-            mtime_ns         INTEGER NOT NULL,
-            last_byte_offset INTEGER NOT NULL,
-            last_ingested_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS session_entries (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_path         TEXT    NOT NULL,
-            line_offset         INTEGER NOT NULL,
-            timestamp_utc       TEXT    NOT NULL,
-            model               TEXT    NOT NULL,
-            msg_id              TEXT,
-            req_id              TEXT,
-            input_tokens        INTEGER NOT NULL DEFAULT 0,
-            output_tokens       INTEGER NOT NULL DEFAULT 0,
-            cache_create_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
-            usage_extra_json    TEXT,
-            cost_usd_raw        REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_entries_timestamp
-            ON session_entries(timestamp_utc);
-        CREATE INDEX IF NOT EXISTS idx_entries_source
-            ON session_entries(source_path);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_dedup
-            ON session_entries(msg_id, req_id)
-            WHERE msg_id IS NOT NULL AND req_id IS NOT NULL;
-
-        CREATE TABLE IF NOT EXISTS codex_session_files (
-            path             TEXT PRIMARY KEY,
-            size_bytes       INTEGER NOT NULL,
-            mtime_ns         INTEGER NOT NULL,
-            last_byte_offset INTEGER NOT NULL,
-            last_ingested_at TEXT NOT NULL,
-            last_session_id  TEXT,
-            last_model       TEXT
-        );
-        CREATE TABLE IF NOT EXISTS codex_session_entries (
-            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_path              TEXT    NOT NULL,
-            line_offset              INTEGER NOT NULL,
-            timestamp_utc            TEXT    NOT NULL,
-            session_id               TEXT    NOT NULL,
-            model                    TEXT    NOT NULL,
-            input_tokens             INTEGER NOT NULL DEFAULT 0,
-            cached_input_tokens      INTEGER NOT NULL DEFAULT 0,
-            output_tokens            INTEGER NOT NULL DEFAULT 0,
-            reasoning_output_tokens  INTEGER NOT NULL DEFAULT 0,
-            total_tokens             INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(source_path, line_offset)
-        );
-        CREATE INDEX IF NOT EXISTS idx_codex_entries_timestamp
-            ON codex_session_entries(timestamp_utc);
-        CREATE INDEX IF NOT EXISTS idx_codex_entries_session
-            ON codex_session_entries(session_id);
-        CREATE INDEX IF NOT EXISTS idx_codex_entries_source
-            ON codex_session_entries(source_path);
-        """
-    )
-
-    # Inline migration: add session_id / project_path columns to session_files
-    # if they're missing. These were added for A2 `session` subcommand metadata;
-    # populated lazily in sync_cache() / _ensure_session_files_row().
-    add_column_if_missing(conn, "session_files", "session_id", "TEXT")
-    add_column_if_missing(conn, "session_files", "project_path", "TEXT")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
-        "ON session_files(session_id)"
-    )
+    # Apply the shared cache.db schema (cctally-dev#93, D4): Claude tables +
+    # indexes, the session_id / project_path column adds on session_files
+    # (A2 `session` metadata, populated lazily in sync_cache() /
+    # _ensure_session_files_row()), the Codex base tables + indexes, and the
+    # cache_meta sentinel table. This is the single cache.db schema source —
+    # the eager-apply path (_eagerly_apply_cache_migrations) uses the SAME
+    # helper, so the two can no longer drift. The Codex last_total_tokens
+    # ALTER + purge stays below (out of the shared helper — D4/P1#3).
+    _cctally_db_sib._apply_cache_schema(conn)
 
     # Migration: add last_total_tokens to codex_session_files. When the column
     # is newly added (i.e. this is the first run after upgrade), purge the
