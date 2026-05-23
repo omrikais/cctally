@@ -2037,7 +2037,7 @@ PYPROJ
 }
 projects_envelope_invariants
 
-# ── ccusage-parity dedup invariants (R-DEDUP1/2/3) ────────────────────
+# ── ccusage-parity dedup invariants (R-DEDUP1/2/3/4/5) ────────────────
 # R-DEDUP1: for every (msg_id, req_id) key that appears in >=2 assistant
 #           emissions across the user's JSONL, `session_entries` holds
 #           exactly one row whose token total equals the MAX over all
@@ -2076,7 +2076,21 @@ projects_envelope_invariants
 #           AND timestamp_utc <= ?` on ISO strings, NOT unixepoch —
 #           production reads use lex compare here).
 #
-# All three read the user's real production DBs (`stats.db` + `cache.db`)
+# R-DEDUP4: extends R-DEDUP3 to CLOSED historical `five_hour_blocks`
+#           rows. The live writer only recomputes the active block;
+#           migration 009 fills the gap by recomputing every row's
+#           `total_*` from the corrected `session_entries`. Recency
+#           exclusion (1d) + cache-drift skip mirror R-DEDUP2/3. Caps
+#           at 50 rows to keep the harness bounded on heavy histories.
+#
+# R-DEDUP5: `percent_milestones.cumulative_cost_usd` must equal the
+#           recompute over `[week_start_at_or_date_midnight,
+#           captured_at_utc]` after migration 010 applies. Pre-fix the
+#           milestone rows captured the pre-dedup inflated cumulative
+#           cost at the moment of crossing; 010 rewrites them. Recency
+#           exclusion (1d) + cache-drift skip + 100-row cap.
+#
+# All five read the user's real production DBs (`stats.db` + `cache.db`)
 # so they exercise the actual ccusage-parity dedup wiring end-to-end. On
 # a fresh clone with no production data (CI, brand-new dev box) each
 # invariant skips gracefully — the python block prints "OK (skipped:
@@ -2390,6 +2404,252 @@ else:
                 )
                 sub_status.append(
                     f"R-DEDUP3: ok (active block at {block_start_at})"
+                )
+    finally:
+        stats.close()
+        cache.close()
+
+# ─── R-DEDUP4 ──────────────────────────────────────────────────────────
+# Closed historical `five_hour_blocks` totals must equal the recompute
+# over `[block_start_at, last_observed_at_utc]` after migration 009
+# applies. Pre-migration the live writer (`maybe_update_five_hour_block`)
+# only recomputes the currently active block; closed blocks kept their
+# pre-dedup totals forever absent the one-shot migration.
+#
+# Scope: closed blocks only. Active block has its own invariant
+# (R-DEDUP3); covering it here would duplicate the same recompute path
+# without adding signal.
+#
+# Recency exclusion: skip blocks whose `last_observed_at_utc` is less
+# than 1 day old. Same rationale as R-DEDUP2 — the cache can keep
+# absorbing UPSERTs after a block closes (e.g. a JSONL file's tail
+# arrived late), which shifts the recomputed cost without the stored
+# total being able to track it. 1 day is conservative against
+# typical hours-not-days ingestion catch-up.
+#
+# Tolerance: 1e-9 USD (same float-ULP rule as R-DEDUP2/3).
+if not stats_db.exists() or not cache_db.exists():
+    sub_status.append(
+        "R-DEDUP4: skipped (production stats.db/cache.db not present)"
+    )
+else:
+    stats = sqlite3.connect(f"file:{stats_db}?mode=ro", uri=True)
+    cache = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
+    try:
+        # Resolve migration 009's applied_at_utc once. The cache-drift
+        # skip below probes `session_files.last_ingested_at > 009.applied_at`
+        # rather than `> last_observed_at_utc` (which would make every
+        # closed-historical block skip, since cache 001 wipes + re-ingests
+        # every session row at a timestamp far past any historical block's
+        # last_observed). The right semantics: migration 009 recomputed
+        # block totals against the post-001 cache snapshot at 009.applied;
+        # only ingests AFTER 009 could diverge the stored values from the
+        # current cache state. If 009 isn't applied yet, fall back to the
+        # conservative per-block guard.
+        mig_row = stats.execute(
+            "SELECT applied_at_utc FROM schema_migrations "
+            "WHERE name = '009_recompute_five_hour_blocks_dedup_fix'"
+        ).fetchone()
+        m009_applied = mig_row[0] if mig_row else None
+
+        rows = stats.execute(
+            "SELECT id, block_start_at, last_observed_at_utc, "
+            "       total_cost_usd "
+            "  FROM five_hour_blocks "
+            " WHERE is_closed = 1 "
+            "   AND unixepoch(last_observed_at_utc) "
+            "       < unixepoch('now', '-1 day') "
+            " ORDER BY block_start_at DESC LIMIT 50"
+        ).fetchall()
+        if not rows:
+            sub_status.append(
+                "R-DEDUP4: skipped (no eligible closed 5h blocks)"
+            )
+        else:
+            checked = 0
+            for (
+                block_id, block_start_at, last_observed_at_utc,
+                stored_cost,
+            ) in rows:
+                # Same UTC normalization as R-DEDUP3 — `block_start_at`
+                # may carry host offset.
+                block_start_utc = dt.datetime.fromisoformat(
+                    block_start_at
+                ).astimezone(dt.timezone.utc).isoformat()
+                last_obs_utc = dt.datetime.fromisoformat(
+                    last_observed_at_utc.replace("Z", "+00:00")
+                ).astimezone(dt.timezone.utc).isoformat()
+                # Cache-drift guard. Gate on 009's applied_at when
+                # present (recompute baseline); fall back to
+                # last_obs_utc when 009 hasn't run (conservative,
+                # mirrors R-DEDUP3's posture for the active block).
+                drift_baseline = m009_applied or last_obs_utc
+                stale_row = cache.execute(
+                    "SELECT 1 FROM session_files "
+                    " WHERE last_ingested_at > ? LIMIT 1",
+                    (drift_baseline,),
+                ).fetchone()
+                if stale_row is not None:
+                    continue
+                entries = cache.execute(
+                    "SELECT model, input_tokens, output_tokens, "
+                    "       cache_create_tokens, cache_read_tokens, "
+                    "       usage_extra_json, cost_usd_raw "
+                    "  FROM session_entries "
+                    " WHERE timestamp_utc >= ? "
+                    "   AND timestamp_utc <= ?",
+                    (block_start_utc, last_obs_utc),
+                ).fetchall()
+                computed_cost = 0.0
+                for model, i, o, cc, cr, extras_json, raw in entries:
+                    usage = {
+                        "input_tokens": i,
+                        "output_tokens": o,
+                        "cache_creation_input_tokens": cc,
+                        "cache_read_input_tokens": cr,
+                    }
+                    if extras_json:
+                        usage.update(json.loads(extras_json))
+                    computed_cost += _calculate_entry_cost(
+                        model, usage, mode="auto", cost_usd=raw,
+                    )
+                assert abs(stored_cost - computed_cost) < 1e-9, (
+                    f"R-DEDUP4 violated: block id={block_id} "
+                    f"block_start_at={block_start_at} "
+                    f"stored=${stored_cost:.9f} "
+                    f"computed=${computed_cost:.9f}"
+                )
+                checked += 1
+            if checked == 0:
+                sub_status.append(
+                    "R-DEDUP4: skipped (every eligible block had a "
+                    "post-close cache ingest)"
+                )
+            else:
+                sub_status.append(
+                    f"R-DEDUP4: ok ({checked} closed 5h blocks "
+                    f"reconciled)"
+                )
+    finally:
+        stats.close()
+        cache.close()
+
+# ─── R-DEDUP5 ──────────────────────────────────────────────────────────
+# `percent_milestones.cumulative_cost_usd` must equal the recompute over
+# `[week_start_at_or_date_midnight, captured_at_utc]` after migration
+# 010 applies. Pre-migration the milestones were write-once at the
+# moment of crossing using a `latest_cost` SELECT against the
+# (then-stale) `weekly_cost_snapshots` row — so the historical values
+# carried the pre-dedup inflated factor that 008/010 unwind.
+#
+# Scope: rows with `week_start_at` non-NULL OR `week_start_date`
+# parseable. Legacy rows missing both are skipped (migration 010 skips
+# them too — leaves them at pre-fix value).
+#
+# Recency exclusion: skip milestones whose `captured_at_utc` is less
+# than 1 day old. Same rationale as R-DEDUP2/4.
+#
+# Tolerance: 1e-9 USD.
+if not stats_db.exists() or not cache_db.exists():
+    sub_status.append(
+        "R-DEDUP5: skipped (production stats.db/cache.db not present)"
+    )
+else:
+    stats = sqlite3.connect(f"file:{stats_db}?mode=ro", uri=True)
+    cache = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
+    try:
+        # Mirror R-DEDUP4: gate cache-drift skip on migration 010's
+        # applied_at when present; fall back to per-row captured_at.
+        mig_row = stats.execute(
+            "SELECT applied_at_utc FROM schema_migrations "
+            "WHERE name = '010_recompute_percent_milestones_dedup_fix'"
+        ).fetchone()
+        m010_applied = mig_row[0] if mig_row else None
+
+        rows = stats.execute(
+            "SELECT id, week_start_date, week_start_at, "
+            "       captured_at_utc, cumulative_cost_usd "
+            "  FROM percent_milestones "
+            " WHERE unixepoch(captured_at_utc) "
+            "       < unixepoch('now', '-1 day') "
+            " ORDER BY captured_at_utc DESC LIMIT 100"
+        ).fetchall()
+        if not rows:
+            sub_status.append(
+                "R-DEDUP5: skipped (no eligible percent_milestones)"
+            )
+        else:
+            checked = 0
+            for (
+                mid, week_start_date, week_start_at,
+                captured_at_utc, stored_cum,
+            ) in rows:
+                # Migration 010's lower-bound fallback rule: prefer
+                # week_start_at, else week_start_date at midnight UTC.
+                if week_start_at:
+                    range_start_iso = week_start_at
+                elif week_start_date:
+                    range_start_iso = (
+                        f"{week_start_date}T00:00:00+00:00"
+                    )
+                else:
+                    continue
+                start_utc = dt.datetime.fromisoformat(
+                    range_start_iso
+                ).astimezone(dt.timezone.utc).isoformat()
+                end_utc = dt.datetime.fromisoformat(
+                    captured_at_utc.replace("Z", "+00:00")
+                ).astimezone(dt.timezone.utc).isoformat()
+                # Cache-drift guard: gate on 010's applied_at when
+                # present (recompute baseline); fall back to
+                # captured_at_utc when 010 hasn't run.
+                drift_baseline = m010_applied or captured_at_utc
+                stale_row = cache.execute(
+                    "SELECT 1 FROM session_files "
+                    " WHERE last_ingested_at > ? LIMIT 1",
+                    (drift_baseline,),
+                ).fetchone()
+                if stale_row is not None:
+                    continue
+                entries = cache.execute(
+                    "SELECT model, input_tokens, output_tokens, "
+                    "       cache_create_tokens, cache_read_tokens, "
+                    "       usage_extra_json, cost_usd_raw "
+                    "  FROM session_entries "
+                    " WHERE timestamp_utc >= ? "
+                    "   AND timestamp_utc <= ?",
+                    (start_utc, end_utc),
+                ).fetchall()
+                computed = 0.0
+                for model, i, o, cc, cr, extras_json, raw in entries:
+                    usage = {
+                        "input_tokens": i,
+                        "output_tokens": o,
+                        "cache_creation_input_tokens": cc,
+                        "cache_read_input_tokens": cr,
+                    }
+                    if extras_json:
+                        usage.update(json.loads(extras_json))
+                    computed += _calculate_entry_cost(
+                        model, usage, mode="auto", cost_usd=raw,
+                    )
+                assert abs(stored_cum - computed) < 1e-9, (
+                    f"R-DEDUP5 violated: milestone id={mid} "
+                    f"week={week_start_date} "
+                    f"captured={captured_at_utc} "
+                    f"stored=${stored_cum:.9f} "
+                    f"computed=${computed:.9f}"
+                )
+                checked += 1
+            if checked == 0:
+                sub_status.append(
+                    "R-DEDUP5: skipped (every eligible milestone had a "
+                    "post-capture cache ingest)"
+                )
+            else:
+                sub_status.append(
+                    f"R-DEDUP5: ok ({checked} percent_milestones "
+                    f"reconciled)"
                 )
     finally:
         stats.close()
