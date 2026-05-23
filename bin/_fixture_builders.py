@@ -452,6 +452,27 @@ def create_cache_db(path: Path) -> None:
                 ON codex_session_entries(session_id);
             CREATE INDEX idx_codex_entries_source
                 ON codex_session_entries(source_path);
+
+            -- Migration framework tables. Fixture DBs represent the
+            -- post-migration state, so we pre-stamp every shipped cache
+            -- migration as applied and advance user_version. Without
+            -- this, the dispatcher's data-emptiness check (D1) would
+            -- see populated session_entries (added by callers via
+            -- seed_session_entry) + missing markers and trigger the
+            -- 001_dedup_highest_wins handler — wiping the seeded data
+            -- before the test could exercise it.
+            CREATE TABLE schema_migrations (
+                name           TEXT PRIMARY KEY,
+                applied_at_utc TEXT NOT NULL
+            );
+            CREATE TABLE schema_migrations_skipped (
+                name           TEXT PRIMARY KEY,
+                skipped_at_utc TEXT NOT NULL,
+                reason         TEXT
+            );
+            INSERT INTO schema_migrations (name, applied_at_utc)
+            VALUES ('001_dedup_highest_wins', '2026-05-22T00:00:00Z');
+            PRAGMA user_version = 1;
         """)
 
 
@@ -470,9 +491,21 @@ def _self_test_create_cache_db() -> None:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )}
             expected = {"session_files", "session_entries",
-                        "codex_session_files", "codex_session_entries"}
+                        "codex_session_files", "codex_session_entries",
+                        "schema_migrations", "schema_migrations_skipped"}
             missing = expected - tables
             assert not missing, f"missing tables: {missing}"
+
+            # 001_dedup_highest_wins is pre-stamped so the dispatcher's
+            # D1 data-emptiness check doesn't fire 001 against seeded
+            # session_entries rows.
+            marker = conn.execute(
+                "SELECT applied_at_utc FROM schema_migrations "
+                "WHERE name = '001_dedup_highest_wins'"
+            ).fetchone()
+            assert marker is not None, "001_dedup_highest_wins marker not pre-stamped"
+            uv = conn.execute("PRAGMA user_version").fetchone()[0]
+            assert uv == 1, f"user_version not advanced to 1: {uv}"
 
             # Column-presence checks — catch a later edit that accidentally
             # drops an ALTER-added column (e.g., codex_session_files.last_total_tokens
