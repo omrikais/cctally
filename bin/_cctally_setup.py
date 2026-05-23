@@ -1724,11 +1724,15 @@ def _setup_install(args: argparse.Namespace) -> int:
                 pass
         bootstrap_rows = rows
         # `rows` counts both genuine INSERTs and ccusage-parity DO UPDATE
-        # replacements (see IngestStats.rows_changed). On the bootstrap
-        # path the cache is typically empty so every changed row is
-        # genuinely new; user-facing wording stays "new entries" because
-        # for the dominant case (first install) it's accurate, and on a
-        # re-install path the count is usually 0 anyway.
+        # replacements (see IngestStats.rows_changed). On first install
+        # this is always 0-vs-N pure inserts (cache is empty), so "N new
+        # entries" is exactly accurate. On a re-install / upgrade path
+        # with active sessions, `rows` also counts UPSERT replacements
+        # (streaming-vs-final tiebreaker swaps), so the count is more
+        # accurately "ingest activity" than "rows newly added" — but
+        # we keep "new entries" because (a) it's still a useful signal
+        # to the operator that the cache is alive, and (b) the dominant
+        # case (first install) reads literally.
         out.append(f"✓ Synced session cache ({rows} new entries)")
     except Exception as exc:
         out.append(f"⚠ sync_cache during bootstrap failed: {exc}")

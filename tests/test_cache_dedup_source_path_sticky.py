@@ -10,11 +10,9 @@ silently migrate between project buckets on each dedup tiebreaker swap.
 """
 from __future__ import annotations
 
-import importlib.util as _ilu
 import json
 import pathlib
 import sqlite3
-import sys
 
 import pytest
 
