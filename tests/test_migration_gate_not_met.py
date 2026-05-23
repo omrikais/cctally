@@ -338,6 +338,45 @@ def test_gate_treats_pre_001_session_files_row_as_not_post_001(
         db_module._gate_001_post_ingest_completed(cache, projects)
 
 
+def test_gate_passes_when_ingest_is_same_second_as_001_marker(
+    db_module, tmp_path,
+):
+    """A session_files row whose last_ingested_at EQUALS the 001 marker
+    is proof of a post-001 ingest, not a stale pre-001 row.
+
+    Both ``applied_at_utc`` and ``last_ingested_at`` come from
+    whole-second ``now_utc_iso()``. A JSONL-reading command that applies
+    001 and then runs sync_cache within the same wall-clock second writes
+    ``last_ingested_at == applied_at_utc``. 001 wipes session_files inside
+    the same transaction that stamps its marker, so an equal timestamp can
+    ONLY be a post-001 row — Layer B's ``>=`` must accept it. A strict
+    ``>`` would defer 008/009/010 forever for a subsequent stats-only
+    user. Regression for Codex round 1 P2.
+    """
+    cache = sqlite3.connect(":memory:")
+    _seed_cache_schema(cache)
+    cache.execute(
+        "INSERT INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
+        ("001_dedup_highest_wins", "2026-05-22T17:00:00Z"),
+    )
+    cache.execute(
+        "INSERT INTO session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+        " session_id, project_path) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        # last_ingested_at EQUALS applied_at_utc — same-second post-001
+        # ingest. Must satisfy the gate (no raise).
+        ("/tmp/session1.jsonl", 100, 0, 100,
+         "2026-05-22T17:00:00Z", "sess-a", "p1"),
+    )
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    (projects / "session1.jsonl").write_text("{}\n")
+
+    # Must NOT raise — same-second ingest is genuine post-001 evidence.
+    db_module._gate_001_post_ingest_completed(cache, projects)
+
+
 # ── Dispatcher integration tests ────────────────────────────────────────
 
 

@@ -1814,10 +1814,14 @@ def _gate_001_post_ingest_completed(
         ``001_dedup_highest_wins``. Without this, the wipe hasn't even
         started; downstream migrations have no business running.
       * **Layer B — post-001 ingest observed**: any ``session_files``
-        row with ``last_ingested_at > 001.applied_at_utc``. Since 001
-        DELETEd every row from ``session_files``, any row present now
-        with a post-001 timestamp must have been written by
-        ``sync_cache`` AFTER the migration.
+        row with ``last_ingested_at >= 001.applied_at_utc``. Since 001
+        DELETEd every row from ``session_files`` in the same transaction
+        that stamped the marker, any row present now must have been
+        written by ``sync_cache`` AFTER the migration. The comparison is
+        ``>=`` (not ``>``) so a same-second post-001 ingest — both
+        timestamps come from whole-second ``now_utc_iso()`` — still
+        counts; the wipe-before-marker invariant guarantees an equal
+        timestamp can only be a post-001 row.
       * **Layer C — empty-disk fallback**: if no JSONL files exist
         under ANY of ``claude_projects_dirs``, the absence of
         ``session_files`` rows is the correct state — pass silently so
@@ -1932,23 +1936,33 @@ def _gate_001_post_ingest_completed(
     applied_at_utc = gate_row[0]
 
     # Layer B — proof of post-001 ingest: any session_files row whose
-    # last_ingested_at post-dates the 001 marker. 001 dropped every row
-    # from session_files, so a row present now with `last_ingested_at >
-    # applied_at_utc` was written by sync_cache AFTER the migration.
+    # last_ingested_at is at-or-after the 001 marker. 001 DELETEs every
+    # row from session_files inside the SAME transaction that stamps its
+    # marker (see ``_001_dedup_highest_wins``), so NO pre-001 row can
+    # survive — any row present now was written by a sync_cache that ran
+    # AFTER the migration committed.
     #
-    # Both columns are written by ``now_utc_iso()`` today, so lex
-    # comparison equals chronological comparison. We still route through
-    # ``unixepoch()`` on both sides as a forward-compatibility hedge: if
-    # any future code path ever writes one side with ``+00:00`` and the
-    # other with ``Z``, lex compare silently mis-orders moments. Mirrors
-    # the same defense applied to the cross-reset flag (CLAUDE.md
+    # The comparison is ``>=``, not ``>``: both ``applied_at_utc`` and
+    # ``last_ingested_at`` are written via ``now_utc_iso()``, which
+    # truncates to whole seconds. If a JSONL-reading command applies 001
+    # and then runs sync_cache within that same wall-clock second,
+    # ``last_ingested_at == applied_at_utc`` even though the post-001
+    # ingest genuinely completed. A strict ``>`` would reject that real
+    # ingest and, for a stats-only user afterwards, defer 008/009/010
+    # forever. ``>=`` is safe precisely because of the wipe-before-marker
+    # invariant above: an equal timestamp can ONLY be a post-001 row.
+    #
+    # Both sides route through ``unixepoch()`` as a forward-compatibility
+    # hedge: if any future code path ever writes one side with ``+00:00``
+    # and the other with ``Z``, lex compare silently mis-orders moments.
+    # Mirrors the same defense applied to the cross-reset flag (CLAUDE.md
     # "Cross-reset flag is interval-based" — block_start_at vs
     # week_start_at vs last_observed_at_utc all route through
     # ``unixepoch()`` to absorb offset-mix drift).
     try:
         has_post_001_ingest = cache_ro.execute(
             "SELECT 1 FROM session_files "
-            "WHERE unixepoch(last_ingested_at) > unixepoch(?) LIMIT 1",
+            "WHERE unixepoch(last_ingested_at) >= unixepoch(?) LIMIT 1",
             (applied_at_utc,),
         ).fetchone() is not None
     except sqlite3.OperationalError as exc:

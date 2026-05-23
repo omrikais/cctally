@@ -1009,11 +1009,25 @@ def _direct_parse_claude_session_entries(
             no_key_with_meta.append((entry, source_path))
 
         # Merge file-local dedup-keyed entries into the global map.
-        # Same tiebreaker as the cache's ON CONFLICT DO UPDATE clause.
+        # Same tiebreaker as the cache's ON CONFLICT DO UPDATE clause:
+        # higher-token total wins the entry DATA. But `source_path` is
+        # STICKY to whichever file FIRST contributed the key — it is NOT
+        # flipped to the winner. This mirrors the cache ingest path, where
+        # `source_path` is intentionally OMITTED from the ON CONFLICT DO
+        # UPDATE SET clause (see this file's UPSERT, ~line 636) so the
+        # downstream `LEFT JOIN session_files ON sf.path = se.source_path`
+        # attributes tokens to the project of the file that first wrote the
+        # row. Replacing it here would move project attribution to the
+        # winner's file — `cctally project` (and any session_files join)
+        # would then disagree with the normal cached behavior exactly when
+        # this fallback path is exercised.
         for key, entry in file_dedupe_map.items():
             existing = dedupe_map.get(key)
-            if existing is None or _should_replace(entry, existing[0]):
+            if existing is None:
                 dedupe_map[key] = (entry, source_path)
+            elif _should_replace(entry, existing[0]):
+                # Winner's DATA, first contributor's source_path (sticky).
+                dedupe_map[key] = (entry, existing[1])
 
     # Flatten + emit.
     results: list[_JoinedClaudeEntry] = []
