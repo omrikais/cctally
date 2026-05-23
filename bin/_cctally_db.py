@@ -355,8 +355,17 @@ def _run_pending_migrations(
         auto-open on the UPDATE statements, so subsequent handler
         ``conn.execute("BEGIN")`` calls start cleanly.
       - Fresh install (schema_migrations just CREATE'd, zero rows
-        post-bootstrap) → stamp every migration applied without invoking
-        handlers.
+        post-bootstrap, AND the DB's primary data table is empty or
+        absent) → stamp every migration applied without invoking
+        handlers. The data-emptiness probe (D1) defends against the
+        pre-framework upgrade case where cache.db was populated by
+        a pre-v1.12.0 build that wrote ``session_entries`` without
+        ever creating ``schema_migrations`` — pre-fix that landscape
+        was falsely classified as fresh and stamped every migration
+        applied without running its handler, indefinitely persisting
+        the buggy summed-tokens dedup. Probe tables:
+        ``stats.db → weekly_cost_snapshots``,
+        ``cache.db → session_entries``.
       - Per migration: handler raises ``Exception`` → log + BREAK
         (Codex P1 #3 — the FIRST failure halts the registry walk so
         later migrations never see partial-prior state). ``BaseException``
@@ -468,10 +477,49 @@ def _run_pending_migrations(
         row[0] for row in conn.execute("SELECT name FROM schema_migrations_skipped").fetchall()
     }
 
-    # Fresh install: schema_migrations was just CREATE'd this open AND
-    # has zero rows post-bootstrap. (If bootstrap renamed pre-existing
-    # rows, those rows now appear in `applied`; not a fresh install.)
+    # D1 — fresh install requires BOTH "schema_migrations table did not
+    # exist" AND "the DB's primary data table is empty (or absent)".
+    # Pre-fix this check was schema_migrations-only: a pre-v1.12.0
+    # cache.db (populated session_entries but no schema_migrations
+    # table — the framework didn't exist for cache.db before this
+    # release) was falsely classified as a fresh install. The
+    # fresh-install branch then stamped EVERY pending migration's
+    # marker WITHOUT invoking its handler, so the cache 001
+    # dedup-highest-wins migration silently skipped on every upgrading
+    # user. The handler is the entire fix — skipping it leaves the
+    # buggy summed-tokens data in place indefinitely.
+    #
+    # Probe table per DB:
+    #   * stats.db → ``weekly_cost_snapshots`` (the table 008 recomputes;
+    #     non-empty means real cost history that handlers may need to
+    #     touch).
+    #   * cache.db → ``session_entries`` (the table 001 wipes; non-empty
+    #     means real session history under the buggy old dedup rule).
+    # Probe table absent → treat as empty (a brand-new DB hasn't run
+    # the schema CREATEs yet, so the data table doesn't exist; that's a
+    # genuine fresh install).
     fresh_install = (not schema_migrations_existed) and len(applied) == 0
+    if fresh_install:
+        probe_table = {
+            "stats.db": "weekly_cost_snapshots",
+            "cache.db": "session_entries",
+        }.get(db_label)
+        if probe_table is not None:
+            try:
+                data_row = conn.execute(
+                    f"SELECT 1 FROM {probe_table} LIMIT 1"
+                ).fetchone()
+                if data_row is not None:
+                    # Data exists from a pre-framework write path; the
+                    # DB is NOT a fresh install. Run every handler
+                    # normally so the upgrading user gets the fix.
+                    fresh_install = False
+            except sqlite3.OperationalError as exc:
+                # Probe table doesn't exist yet (genuine pre-CREATE
+                # fresh install) — keep fresh_install=True. Anything
+                # else (corrupt DB, IO error) propagates.
+                if not _is_no_such_table_error(exc):
+                    raise
 
     now_iso = now_utc_iso()
     for m in registry:
