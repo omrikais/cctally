@@ -1813,9 +1813,45 @@ def _gate_001_post_ingest_completed(
             "once to bootstrap the migration framework."
         ) from None
     if gate_row is None:
+        # G1 — 001 may instead be poison-pill skipped via
+        # ``cctally db skip 001_dedup_highest_wins``. The operator's
+        # affirmation that they accept dedup won't apply on this
+        # machine is also acceptance that downstream cross-DB
+        # consumers (008's recompute over session_entries) should
+        # proceed against whatever's currently in session_entries,
+        # not block forever. Layer B's post-ingest check still runs
+        # against the timestamp the operator may not have stamped —
+        # so when 001 is skipped we treat Layer B as already
+        # satisfied (no marker to compare against). Layer C's
+        # empty-disk fallback still fires for users with no JSONL
+        # on disk.
+        try:
+            skipped_row = cache_ro.execute(
+                "SELECT 1 FROM schema_migrations_skipped WHERE name = ?",
+                ("001_dedup_highest_wins",),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if _is_transient_sqlite_error(exc):
+                raise MigrationGateNotMet(
+                    "cache.db transiently locked; retry on next open."
+                ) from None
+            if _is_no_such_table_error(exc):
+                # schema_migrations_skipped doesn't exist yet —
+                # equivalent to "not skipped"; fall through to the
+                # "marker not present" defer below.
+                skipped_row = None
+            else:
+                raise
+        if skipped_row is not None:
+            # 001 explicitly skipped → gate passes. Caller proceeds
+            # against whatever's currently in session_entries. To
+            # unblock, the operator runs ``cctally db unskip
+            # 001_dedup_highest_wins`` and re-opens.
+            return
         raise MigrationGateNotMet(
             "cache.db migration 001_dedup_highest_wins not yet applied; "
-            "run any JSONL-reading command (e.g. `cctally weekly`) once."
+            "run any JSONL-reading command (e.g. `cctally weekly`) once, "
+            "or `cctally db skip 001_dedup_highest_wins` to defer."
         )
     applied_at_utc = gate_row[0]
 
