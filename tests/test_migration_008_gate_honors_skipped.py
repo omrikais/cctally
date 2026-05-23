@@ -56,7 +56,17 @@ def db_module():
 
 def _seed_cache_schema(conn: sqlite3.Connection) -> None:
     """Schema mirroring the production cache.db shape at the points the
-    gate touches: schema_migrations + schema_migrations_skipped + session_files.
+    gate touches: schema_migrations + schema_migrations_skipped +
+    session_files + session_entries + cache_meta.
+
+    cctally-dev#93: the gate reads the ``cache_meta``
+    ``claude_ingest_walk_complete`` marker (``walk_complete``) and
+    ``session_entries`` non-emptiness (``cache_has_entries``); both tables
+    are part of the schema the shell probes. The skip scenarios in this
+    file don't depend on those reads (rows 3/4 short-circuit on
+    ``cache_001_state == "skipped"`` before the walk/entries reads matter),
+    but the tables must exist so the probes don't flip
+    ``marker_state_readable=False`` on a no-such-table.
     """
     conn.executescript(
         """
@@ -77,6 +87,25 @@ def _seed_cache_schema(conn: sqlite3.Connection) -> None:
             last_ingested_at TEXT NOT NULL,
             session_id       TEXT,
             project_path     TEXT
+        );
+        CREATE TABLE session_entries (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path         TEXT    NOT NULL,
+            line_offset         INTEGER NOT NULL,
+            timestamp_utc       TEXT    NOT NULL,
+            model               TEXT    NOT NULL,
+            msg_id              TEXT,
+            req_id              TEXT,
+            input_tokens        INTEGER NOT NULL DEFAULT 0,
+            output_tokens       INTEGER NOT NULL DEFAULT 0,
+            cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+            usage_extra_json    TEXT,
+            cost_usd_raw        REAL
+        );
+        CREATE TABLE cache_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
         );
         """
     )
@@ -177,19 +206,21 @@ def test_gate_still_defers_when_001_neither_applied_nor_skipped(
         db_module._gate_001_post_ingest_completed(cache, projects)
 
 
-def test_gate_hint_mentions_db_skip(db_module, tmp_path):
-    """The defer message points at the documented escape hatch in both
-    directions.
+def test_pending_defer_hint_mentions_db_skip(db_module, tmp_path):
+    """The PENDING-001 defer message points at the ``db skip`` escape hatch.
 
-    Operators hitting an infinite-defer situation need to know
-    ``db skip`` is the way out — the gate's docstring describes the
-    Layer A predicate but the actual MigrationGateNotMet message is
-    what surfaces to humans via the dispatcher's CCTALLY_DEBUG eprint.
-    The symmetric ``db unskip`` revert path is mentioned alongside so
-    operators don't treat skip as a one-way door.
+    cctally-dev#93 split the old single "mentions both directions"
+    message into per-row reason strings owned by ``resolve_upgrade_gate``.
+    The PENDING row (row 2) is the "001 never applied; you're stuck
+    deferring" case — its recovery hint is ``db skip`` (the forward
+    escape hatch). Operators hitting an infinite-defer situation here
+    need to know ``db skip`` is the way out; the actual
+    ``MigrationGateNotMet`` message surfaces to humans via the
+    dispatcher's ``CCTALLY_DEBUG`` eprint.
     """
     cache = sqlite3.connect(":memory:")
     _seed_cache_schema(cache)
+    # Neither applied nor skipped → row 2 (pending).
     projects = tmp_path / "projects"
     projects.mkdir()
     (projects / "session1.jsonl").write_text("{}\n")
@@ -200,10 +231,43 @@ def test_gate_hint_mentions_db_skip(db_module, tmp_path):
     except db_module.MigrationGateNotMet as exc:
         msg = str(exc)
         assert "db skip" in msg, (
-            "defer hint should mention `db skip` so operators know the "
-            f"escape hatch; got: {msg!s}"
+            "pending-001 defer hint should mention `db skip` so operators "
+            f"know the escape hatch; got: {msg!s}"
         )
+
+
+def test_skipped_with_data_defer_hint_mentions_db_unskip(db_module, tmp_path):
+    """The SKIPPED-001-with-historical-rows defer message points at the
+    ``db unskip`` revert path.
+
+    cctally-dev#93: this is resolver row 3 — 001 is honored-skipped while
+    historical rows remain, so the gate DEFERs to avoid recomputing over
+    stale pre-dedup ``session_entries``. The correct recovery guidance for
+    an honored skip the operator must REVERSE to proceed is ``db unskip``
+    (not ``db skip`` — that's already in effect). This is the symmetric
+    half of the old "both directions" hint, now asserted against the row
+    where ``db unskip`` is the right next step, so operators don't treat
+    skip as a one-way door.
+    """
+    cache = sqlite3.connect(":memory:")
+    _seed_cache_schema(cache)
+    cache.execute(
+        "INSERT INTO schema_migrations_skipped "
+        "(name, skipped_at_utc, reason) VALUES (?, ?, ?)",
+        ("001_dedup_highest_wins", "2026-05-22T17:00:00Z", "manual skip"),
+    )
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    (projects / "session1.jsonl").write_text("{}\n")
+
+    try:
+        db_module._gate_001_post_ingest_completed(
+            cache, projects, data_present=True,
+        )
+        pytest.fail("expected MigrationGateNotMet")
+    except db_module.MigrationGateNotMet as exc:
+        msg = str(exc)
         assert "db unskip" in msg, (
-            "defer hint should also mention `db unskip` so operators "
-            f"know the revert path; got: {msg!s}"
+            "skipped-with-data defer hint should mention `db unskip` so "
+            f"operators know the revert path; got: {msg!s}"
         )

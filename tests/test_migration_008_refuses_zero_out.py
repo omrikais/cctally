@@ -125,47 +125,63 @@ def _stage_stats_empty(stats_path: pathlib.Path) -> None:
         stats.close()
 
 
-def _stage_cache_with_001_marker(cache_path: pathlib.Path) -> None:
-    """Stage cache.db with the 001 marker AND a post-001 session_files row
-    so the gate's Layer A + Layer B both pass when the gate is reached.
+def _cache_schema_script() -> str:
+    """Shared cache.db schema (cctally-dev#93): schema_migrations,
+    session_files, session_entries, AND the cache_meta sentinel table the
+    new gate reads for the walk-complete marker."""
+    return """
+        CREATE TABLE schema_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at_utc TEXT
+        );
+        CREATE TABLE session_files (
+            path TEXT PRIMARY KEY,
+            size_bytes INTEGER,
+            mtime_ns INTEGER,
+            last_byte_offset INTEGER,
+            last_ingested_at TEXT,
+            session_id TEXT,
+            project_path TEXT
+        );
+        CREATE TABLE session_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path TEXT, line_offset INTEGER, timestamp_utc TEXT,
+            model TEXT, msg_id TEXT, req_id TEXT,
+            input_tokens INTEGER, output_tokens INTEGER,
+            cache_create_tokens INTEGER, cache_read_tokens INTEGER,
+            usage_extra_json TEXT, cost_usd_raw REAL
+        );
+        CREATE TABLE cache_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """
 
-    For the G3 scenarios we want the projects-dir resolution to be the
-    failing signal, NOT some other gate layer.
+
+def _stage_cache_with_001_marker(cache_path: pathlib.Path) -> None:
+    """Stage cache.db with the 001 marker but NO ``cache_meta``
+    walk-complete marker and NO ``session_entries``.
+
+    For the G3 scenario-1 topology (no resolvable projects dir AND
+    snapshots present) we want the *projects-dir resolution* to be the
+    failing signal: 001 applied, ``disk_state="absent"``,
+    ``data_present=True`` → resolver row 7 (``walk✗ AND absent``), whose
+    reason text names ``projects/``. Seeding the walk marker here would
+    instead land on the empty-cache reason, defeating the scenario.
+    cctally-dev#93: the post-001-ingest PROCEED signal is the
+    ``cache_meta`` walk-complete marker, NOT a post-001 ``session_files``
+    row, so this helper deliberately omits both.
     """
     cache = sqlite3.connect(cache_path)
     try:
-        cache.executescript(
-            """
-            CREATE TABLE schema_migrations (
-                name TEXT PRIMARY KEY,
-                applied_at_utc TEXT
-            );
-            CREATE TABLE session_files (
-                path TEXT PRIMARY KEY,
-                size_bytes INTEGER,
-                mtime_ns INTEGER,
-                last_byte_offset INTEGER,
-                last_ingested_at TEXT,
-                session_id TEXT,
-                project_path TEXT
-            );
-            CREATE TABLE session_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_path TEXT, line_offset INTEGER, timestamp_utc TEXT,
-                model TEXT, msg_id TEXT, req_id TEXT,
-                input_tokens INTEGER, output_tokens INTEGER,
-                cache_create_tokens INTEGER, cache_read_tokens INTEGER,
-                usage_extra_json TEXT, cost_usd_raw REAL
-            );
-            """
-        )
+        cache.executescript(_cache_schema_script())
         cache.execute(
             "INSERT INTO schema_migrations VALUES (?, ?)",
             ("001_dedup_highest_wins", "2026-05-22T00:00:00Z"),
         )
-        # session_files row whose last_ingested_at strictly post-dates
-        # the 001 marker so the gate's Layer B (post-001 ingest)
-        # passes.
+        # session_files row retained for production-shape parity (no
+        # longer the gate signal post-cctally-dev#93). No walk-complete
+        # marker and no session_entries → walk✗, entries✗.
         cache.execute(
             "INSERT INTO session_files VALUES (?,?,?,?,?,?,?)",
             (
@@ -181,37 +197,14 @@ def _stage_cache_with_001_marker(cache_path: pathlib.Path) -> None:
 def _stage_cache_without_post_001_ingest(cache_path: pathlib.Path) -> None:
     """Stage cache.db with the 001 marker but NO session_files row.
 
-    For the fresh-install scenario: Layer A passes (marker present),
-    Layer B fails (no post-001 ingest), Layer C should pass because no
-    JSONL files exist anywhere → the migration completes as a no-op.
+    For the fresh-install scenario: 001 applied, no walk-complete marker,
+    no session_entries, and (in the test) no JSONL on disk →
+    ``disk_state="absent"`` + ``data_present=False`` (zero snapshot rows)
+    → resolver row 5 PROCEED → the migration completes as a no-op.
     """
     cache = sqlite3.connect(cache_path)
     try:
-        cache.executescript(
-            """
-            CREATE TABLE schema_migrations (
-                name TEXT PRIMARY KEY,
-                applied_at_utc TEXT
-            );
-            CREATE TABLE session_files (
-                path TEXT PRIMARY KEY,
-                size_bytes INTEGER,
-                mtime_ns INTEGER,
-                last_byte_offset INTEGER,
-                last_ingested_at TEXT,
-                session_id TEXT,
-                project_path TEXT
-            );
-            CREATE TABLE session_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_path TEXT, line_offset INTEGER, timestamp_utc TEXT,
-                model TEXT, msg_id TEXT, req_id TEXT,
-                input_tokens INTEGER, output_tokens INTEGER,
-                cache_create_tokens INTEGER, cache_read_tokens INTEGER,
-                usage_extra_json TEXT, cost_usd_raw REAL
-            );
-            """
-        )
+        cache.executescript(_cache_schema_script())
         cache.execute(
             "INSERT INTO schema_migrations VALUES (?, ?)",
             ("001_dedup_highest_wins", "2026-05-22T00:00:00Z"),
@@ -222,39 +215,26 @@ def _stage_cache_without_post_001_ingest(cache_path: pathlib.Path) -> None:
 
 
 def _stage_cache_with_session_entries_inside_window(cache_path: pathlib.Path) -> None:
-    """Stage cache.db with the 001 marker, a post-001 session_files row,
-    AND a session_entry inside [2026-05-15, 2026-05-22] so the happy
-    path produces a non-zero recompute."""
+    """Stage cache.db with the 001 marker, the ``cache_meta``
+    walk-complete marker, a ``session_files`` row, AND a session_entry
+    inside [2026-05-15, 2026-05-22] so the happy path produces a non-zero
+    recompute.
+
+    cctally-dev#93: the gate PROCEEDs on ``walk✓ AND entries✓`` (row 6) —
+    so this happy-path fixture seeds the ``cache_meta`` walk-complete
+    marker (walk✓) alongside the session_entry (entries✓).
+    """
     cache = sqlite3.connect(cache_path)
     try:
-        cache.executescript(
-            """
-            CREATE TABLE schema_migrations (
-                name TEXT PRIMARY KEY,
-                applied_at_utc TEXT
-            );
-            CREATE TABLE session_files (
-                path TEXT PRIMARY KEY,
-                size_bytes INTEGER,
-                mtime_ns INTEGER,
-                last_byte_offset INTEGER,
-                last_ingested_at TEXT,
-                session_id TEXT,
-                project_path TEXT
-            );
-            CREATE TABLE session_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_path TEXT, line_offset INTEGER, timestamp_utc TEXT,
-                model TEXT, msg_id TEXT, req_id TEXT,
-                input_tokens INTEGER, output_tokens INTEGER,
-                cache_create_tokens INTEGER, cache_read_tokens INTEGER,
-                usage_extra_json TEXT, cost_usd_raw REAL
-            );
-            """
-        )
+        cache.executescript(_cache_schema_script())
         cache.execute(
             "INSERT INTO schema_migrations VALUES (?, ?)",
             ("001_dedup_highest_wins", "2026-05-22T00:00:00Z"),
+        )
+        # walk✓ — the new gate's complete-walk signal.
+        cache.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('claude_ingest_walk_complete', '2026-05-22T01:00:00Z')"
         )
         cache.execute(
             "INSERT INTO session_files VALUES (?,?,?,?,?,?,?)",

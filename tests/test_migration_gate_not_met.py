@@ -10,9 +10,17 @@ Coverage:
   * The ``MigrationGateNotMet`` exception class exists and subclasses
     ``Exception``.
   * The ``_gate_001_post_ingest_completed`` helper raises on
-    (a) missing 001 marker, (b) marker present + empty ``session_files``
-    + JSONL files present on disk, and succeeds on (c) marker present
-    + post-001 ``session_files`` row, (d) no JSONL files on disk.
+    (a) missing 001 marker, (b) 001 applied + NO ``cache_meta``
+    walk-complete marker + JSONL on disk + historical rows to protect,
+    and succeeds on (c) 001 applied + ``cache_meta`` walk-complete
+    marker + non-empty ``session_entries``, (d) no historical rows to
+    protect.
+
+    NOTE (cctally-dev#93): the gate's post-001-ingest signal moved from
+    "a ``session_files`` row whose ``last_ingested_at >= 001.applied_at``"
+    to "the ``cache_meta`` ``claude_ingest_walk_complete`` marker present
+    AND ``session_entries`` non-empty." Tests below seed the NEW signal;
+    the DEFER/PROCEED intent of each scenario is preserved verbatim.
   * The dispatcher catches ``MigrationGateNotMet`` separately from
     generic ``Exception``: it does NOT write to ``migration-errors.log``,
     does NOT mark the migration as skipped, does NOT advance
@@ -67,8 +75,19 @@ def test_migration_gate_not_met_class_exists(db_module):
     assert "test message" in str(e)
 
 
+MARKER = "claude_ingest_walk_complete"
+
+
 def _seed_cache_schema(conn: sqlite3.Connection) -> None:
-    """Minimal schema for the gate helper: schema_migrations + session_files."""
+    """Minimal schema for the gate helper at the points it reads.
+
+    cctally-dev#93: the gate now reads the ``cache_meta``
+    ``claude_ingest_walk_complete`` marker (``walk_complete``) and
+    ``session_entries`` non-emptiness (``cache_has_entries``) instead of
+    a post-001 ``session_files`` row. ``session_files`` stays in the
+    schema for parity with production cache.db but is no longer the
+    gate signal.
+    """
     conn.executescript(
         """
         CREATE TABLE schema_migrations (
@@ -84,7 +103,42 @@ def _seed_cache_schema(conn: sqlite3.Connection) -> None:
             session_id       TEXT,
             project_path     TEXT
         );
+        CREATE TABLE session_entries (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path         TEXT    NOT NULL,
+            line_offset         INTEGER NOT NULL,
+            timestamp_utc       TEXT    NOT NULL,
+            model               TEXT    NOT NULL,
+            msg_id              TEXT,
+            req_id              TEXT,
+            input_tokens        INTEGER NOT NULL DEFAULT 0,
+            output_tokens       INTEGER NOT NULL DEFAULT 0,
+            cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+            usage_extra_json    TEXT,
+            cost_usd_raw        REAL
+        );
+        CREATE TABLE cache_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
         """
+    )
+
+
+def _seed_walk_complete_marker(conn: sqlite3.Connection) -> None:
+    """Seed the NEW post-001-ingest PROCEED signal (cctally-dev#93): the
+    ``cache_meta`` ``claude_ingest_walk_complete`` marker AND a non-empty
+    ``session_entries`` (row 6 requires BOTH ``walk✓`` and ``entries✓``)."""
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+        (MARKER, "2026-05-22T17:30:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO session_entries "
+        "(source_path, line_offset, timestamp_utc, model) "
+        "VALUES (?, ?, ?, ?)",
+        ("/tmp/session1.jsonl", 0, "2026-05-22T17:30:00Z", "claude-opus-4-7"),
     )
 
 
@@ -102,7 +156,16 @@ def test_gate_raises_when_001_marker_absent(db_module, tmp_path):
 def test_gate_raises_when_post_001_ingest_missing_and_jsonl_on_disk(
     db_module, tmp_path,
 ):
-    """Scenario B — marker present, session_files empty, JSONL exists → raise."""
+    """Scenario B — 001 applied, NO walk-complete marker, JSONL exists,
+    historical rows to protect → raise (row 7).
+
+    cctally-dev#93: the post-001-ingest PROCEED signal is now the
+    ``cache_meta`` walk-complete marker (not a ``session_files`` row).
+    Absent the marker, a caller with historical rows
+    (``data_present=True``) must DEFER so the recompute doesn't run over
+    an incomplete cache. The reason string is the resolver's row-7
+    ``walk✗ AND jsonl_present`` text ("ingest walk not yet complete").
+    """
     cache = sqlite3.connect(":memory:")
     _seed_cache_schema(cache)
     cache.execute(
@@ -113,31 +176,35 @@ def test_gate_raises_when_post_001_ingest_missing_and_jsonl_on_disk(
     projects.mkdir()
     (projects / "session1.jsonl").write_text("{}\n")
 
-    with pytest.raises(db_module.MigrationGateNotMet, match="post-001 ingest"):
-        db_module._gate_001_post_ingest_completed(cache, projects)
+    with pytest.raises(db_module.MigrationGateNotMet, match="ingest walk not yet complete"):
+        db_module._gate_001_post_ingest_completed(
+            cache, projects, data_present=True,
+        )
 
 
-def test_gate_passes_with_post_001_session_files_row(db_module, tmp_path):
-    """Scenario C — marker present, session_files has a post-001 row → pass."""
+def test_gate_passes_with_post_001_walk_complete_marker(db_module, tmp_path):
+    """Scenario C — 001 applied, walk-complete marker present, non-empty
+    ``session_entries`` → pass (row 6), even with historical rows.
+
+    cctally-dev#93: this is the new PROCEED signal (``walk✓ AND
+    entries✓``) replacing the old post-001 ``session_files`` row.
+    """
     cache = sqlite3.connect(":memory:")
     _seed_cache_schema(cache)
     cache.execute(
         "INSERT INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
         ("001_dedup_highest_wins", "2026-05-22T17:00:00Z"),
     )
-    cache.execute(
-        "INSERT INTO session_files "
-        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
-        " session_id, project_path) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ("/tmp/session1.jsonl", 100, 0, 100,
-         "2026-05-22T17:30:00Z", "sess-a", "p1"),
-    )
+    _seed_walk_complete_marker(cache)
     projects = tmp_path / "projects"
     projects.mkdir()
+    (projects / "session1.jsonl").write_text("{}\n")
 
-    # Must NOT raise.
-    db_module._gate_001_post_ingest_completed(cache, projects)
+    # Must NOT raise — complete, non-empty post-001 cache (row 6), even
+    # with historical rows to protect.
+    db_module._gate_001_post_ingest_completed(
+        cache, projects, data_present=True,
+    )
 
 
 def test_gate_passes_when_no_jsonl_on_disk(db_module, tmp_path):
@@ -237,11 +304,15 @@ def test_gate_raises_when_layer_a_select_hits_sqlite_busy(db_module, tmp_path):
         db_module._gate_001_post_ingest_completed(_BusyConn(cache), projects)
 
 
-def test_gate_raises_when_layer_b_select_hits_sqlite_locked(db_module, tmp_path):
-    """G5 — SQLITE_LOCKED on Layer B's session_files SELECT also defers.
+def test_gate_raises_when_second_read_hits_sqlite_locked(db_module, tmp_path):
+    """G5 — SQLITE_LOCKED on the SECOND gate read also defers.
 
-    Layer A (schema_migrations SELECT) must succeed, so the wrapper only
-    raises on the SECOND ``execute`` call (Layer B).
+    The first read (``schema_migrations`` SELECT) must succeed (001 is
+    seeded applied), so the wrapper only raises on the SECOND ``execute``
+    call. Post-cctally-dev#93 the second read is the ``cache_meta``
+    walk-complete probe (the old ``session_files`` Layer B read is gone);
+    a transient LOCKED there flips ``marker_state_readable=False`` →
+    resolver row 1 DEFER.
     """
     cache = sqlite3.connect(":memory:")
     _seed_cache_schema(cache)
@@ -303,15 +374,22 @@ def test_is_transient_sqlite_error_predicate(db_module):
     assert is_pred(exc) is False
 
 
-def test_gate_treats_pre_001_session_files_row_as_not_post_001(
+def test_gate_session_files_row_without_marker_is_not_proof(
     db_module, tmp_path,
 ):
-    """A session_files row whose last_ingested_at PRE-DATES the 001 marker
-    is NOT proof of post-001 ingest. The gate must still raise when JSONL
-    exists on disk.
+    """A ``session_files`` row is NOT, by itself, proof of a complete
+    post-001 ingest — the gate keys completeness on the ``cache_meta``
+    walk-complete marker now (cctally-dev#93).
 
-    This guards against the false-positive of "session_files non-empty
-    means ingest happened" — only post-001-marker timestamps count.
+    A ``session_files`` row can exist after a partial/straddling walk
+    (delta-resume state) without the walk-complete marker. With JSONL on
+    disk and historical rows to protect, the gate must still DEFER (row
+    7) — the marker, not a ``session_files`` row, is the signal.
+
+    This is the cctally-dev#93 analogue of the old "pre-001
+    session_files row is not post-001 proof" guard: the discriminator
+    moved from a ``last_ingested_at`` timestamp compare to marker
+    presence.
     """
     cache = sqlite3.connect(":memory:")
     _seed_cache_schema(cache)
@@ -319,39 +397,40 @@ def test_gate_treats_pre_001_session_files_row_as_not_post_001(
         "INSERT INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
         ("001_dedup_highest_wins", "2026-05-22T17:00:00Z"),
     )
+    # A session_files row present (delta-resume bookkeeping) but NO
+    # cache_meta walk-complete marker — not proof of a clean full walk.
     cache.execute(
         "INSERT INTO session_files "
         "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
         " session_id, project_path) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        # last_ingested_at is BEFORE applied_at_utc — pre-001 ingest
-        # somehow leaked through (e.g. an operator manually re-inserted
-        # rows). Should NOT satisfy the gate.
         ("/tmp/session1.jsonl", 100, 0, 100,
-         "2026-05-22T16:00:00Z", "sess-a", "p1"),
+         "2026-05-22T17:30:00Z", "sess-a", "p1"),
     )
     projects = tmp_path / "projects"
     projects.mkdir()
     (projects / "session1.jsonl").write_text("{}\n")
 
-    with pytest.raises(db_module.MigrationGateNotMet, match="post-001 ingest"):
-        db_module._gate_001_post_ingest_completed(cache, projects)
+    with pytest.raises(db_module.MigrationGateNotMet, match="ingest walk not yet complete"):
+        db_module._gate_001_post_ingest_completed(
+            cache, projects, data_present=True,
+        )
 
 
-def test_gate_passes_when_ingest_is_same_second_as_001_marker(
+def test_gate_passes_on_marker_regardless_of_ingest_timestamp(
     db_module, tmp_path,
 ):
-    """A session_files row whose last_ingested_at EQUALS the 001 marker
-    is proof of a post-001 ingest, not a stale pre-001 row.
+    """The walk-complete marker is presence-checked, NOT timestamp-compared
+    against the 001 marker (cctally-dev#93, spec D2).
 
-    Both ``applied_at_utc`` and ``last_ingested_at`` come from
-    whole-second ``now_utc_iso()``. A JSONL-reading command that applies
-    001 and then runs sync_cache within the same wall-clock second writes
-    ``last_ingested_at == applied_at_utc``. 001 wipes session_files inside
-    the same transaction that stamps its marker, so an equal timestamp can
-    ONLY be a post-001 row — Layer B's ``>=`` must accept it. A strict
-    ``>`` would defer 008/009/010 forever for a subsequent stats-only
-    user. Regression for Codex round 1 P2.
+    The OLD gate used a ``last_ingested_at >= 001.applied_at_utc``
+    timestamp compare (with a known same-second / clock-skew hazard,
+    Codex round-1 P2). The new gate keys completeness on marker
+    PRESENCE, which is immune to wall-clock non-monotonicity. So even a
+    walk-complete marker whose ``value`` timestamp PREDATES the 001
+    marker (an impossible-in-practice clock-skew artifact) still passes
+    — presence is the signal, the stored timestamp is debug-only. This
+    pins that the corrupting-direction clock-skew hole is gone.
     """
     cache = sqlite3.connect(":memory:")
     _seed_cache_schema(cache)
@@ -359,22 +438,27 @@ def test_gate_passes_when_ingest_is_same_second_as_001_marker(
         "INSERT INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
         ("001_dedup_highest_wins", "2026-05-22T17:00:00Z"),
     )
+    # Marker value timestamp deliberately BEFORE the 001 marker — under
+    # the old >= compare this would have falsely deferred (or worse,
+    # under a skewed clock, falsely passed). Presence semantics ignore it.
     cache.execute(
-        "INSERT INTO session_files "
-        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
-        " session_id, project_path) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        # last_ingested_at EQUALS applied_at_utc — same-second post-001
-        # ingest. Must satisfy the gate (no raise).
-        ("/tmp/session1.jsonl", 100, 0, 100,
-         "2026-05-22T17:00:00Z", "sess-a", "p1"),
+        "INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+        (MARKER, "2026-05-22T16:00:00+00:00"),
+    )
+    cache.execute(
+        "INSERT INTO session_entries "
+        "(source_path, line_offset, timestamp_utc, model) "
+        "VALUES (?, ?, ?, ?)",
+        ("/tmp/session1.jsonl", 0, "2026-05-22T17:30:00Z", "claude-opus-4-7"),
     )
     projects = tmp_path / "projects"
     projects.mkdir()
     (projects / "session1.jsonl").write_text("{}\n")
 
-    # Must NOT raise — same-second ingest is genuine post-001 evidence.
-    db_module._gate_001_post_ingest_completed(cache, projects)
+    # Must NOT raise — marker present + entries present (row 6).
+    db_module._gate_001_post_ingest_completed(
+        cache, projects, data_present=True,
+    )
 
 
 # ── Dispatcher integration tests ────────────────────────────────────────
