@@ -213,11 +213,13 @@ def test_migration_handler_recomputes_auto_rows_preserves_others(
 def test_migration_handler_idempotent_against_marker(
     db_module, tmp_path, monkeypatch
 ):
-    """A second invocation re-INSERTs the marker via the same
-    ``INSERT INTO ... VALUES`` form — INTEGRITY_ERROR on the PRIMARY KEY.
-    The dispatcher provides idempotency by tracking ``applied``; this test
-    just documents that the handler body is not idempotent against itself
-    (matches 001's per-migration goldens contract)."""
+    """A second invocation now silently no-ops on the marker INSERT
+    (D3 fix: ``INSERT OR IGNORE``). Pre-fix this raised
+    ``sqlite3.IntegrityError`` on the PRIMARY KEY collision; cross-process
+    races (dashboard + CLI on the same DB) would have surfaced one
+    side as a migration-error banner. The dispatcher's ``applied`` set
+    still provides per-process idempotency; the OR IGNORE is
+    cross-process race safety."""
     work_stats = tmp_path / "stats.db"
     shutil.copy(PRE_DB, work_stats)
 
@@ -233,7 +235,13 @@ def test_migration_handler_idempotent_against_marker(
     conn = sqlite3.connect(work_stats)
     try:
         handler(conn)
-        with pytest.raises(sqlite3.IntegrityError):
-            handler(conn)
+        # Pre-fix this raised sqlite3.IntegrityError; post-fix it returns clean.
+        handler(conn)
+        # Marker still present exactly once.
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations "
+            "WHERE name = '008_recompute_weekly_cost_snapshots_dedup_fix'"
+        ).fetchone()[0]
+        assert cnt == 1, "marker must remain exactly one row after re-run"
     finally:
         conn.close()

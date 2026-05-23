@@ -2010,8 +2010,14 @@ def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
     try:
         conn.execute("DELETE FROM session_entries")
         conn.execute("DELETE FROM session_files")
+        # D3 — INSERT OR IGNORE for race safety. Under concurrent
+        # dispatcher invocations (dashboard + CLI on the same DB), one
+        # process wins; the other hits IntegrityError → migration-error
+        # banner. Every other production migration uses INSERT OR IGNORE;
+        # mirror the convention here.
         conn.execute(
-            "INSERT INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
+            "VALUES (?, ?)",
             ("001_dedup_highest_wins", now_utc_iso()),
         )
         conn.commit()
@@ -2160,9 +2166,12 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
                     "SET cost_usd = ? WHERE id = ?",
                     (total, snap_id),
                 )
+            # D3 — INSERT OR IGNORE for race safety. Mirrors the
+            # convention applied to every other production migration
+            # and the matching change to cache migration 001.
             conn.execute(
-                "INSERT INTO schema_migrations (name, applied_at_utc) "
-                "VALUES (?, ?)",
+                "INSERT OR IGNORE INTO schema_migrations "
+                "(name, applied_at_utc) VALUES (?, ?)",
                 (
                     "008_recompute_weekly_cost_snapshots_dedup_fix",
                     now_utc_iso(),

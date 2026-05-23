@@ -165,19 +165,28 @@ def test_migration_handler_wipes_tables_and_stamps_marker(db_module, tmp_path):
 
 
 def test_migration_handler_idempotent_against_marker(db_module, tmp_path):
-    """A second invocation would re-insert the marker — `INSERT INTO ...`
-    raises ``IntegrityError`` (PRIMARY KEY violation) on the second run.
-    The migration framework expects each handler to run at most once via
-    the dispatcher's ``applied`` set; this test just documents that the
-    body is not idempotent against itself (the dispatcher provides
-    idempotency, not the body).
+    """A second invocation re-runs the body but the marker INSERT now
+    uses ``INSERT OR IGNORE`` (D3 fix) so it silently no-ops on the
+    second run instead of raising ``IntegrityError``.
+
+    Under concurrent dispatcher invocations (dashboard + CLI on the
+    same cache.db), the prior plain ``INSERT`` would cause the loser to
+    surface as a migration-error banner. The dispatcher's ``applied``
+    set still provides per-process idempotency; the OR IGNORE is
+    cross-process race safety.
     """
     work = tmp_path / "cache.db"
     shutil.copy(PRE_DB, work)
     conn = sqlite3.connect(work)
     try:
         _migration_handler(db_module)(conn)
-        with pytest.raises(sqlite3.IntegrityError):
-            _migration_handler(db_module)(conn)
+        # Pre-fix this raised sqlite3.IntegrityError; post-fix it returns clean.
+        _migration_handler(db_module)(conn)
+        # Marker still present exactly once.
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations "
+            "WHERE name = '001_dedup_highest_wins'"
+        ).fetchone()[0]
+        assert cnt == 1, "marker must remain exactly one row after re-run"
     finally:
         conn.close()
