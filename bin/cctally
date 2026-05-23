@@ -288,6 +288,26 @@ _compute_display_block = _lib_display_tz._compute_display_block
 format_display_dt = _lib_display_tz.format_display_dt
 _argparse_tz = _lib_display_tz._argparse_tz
 
+
+def _nonneg_int(raw: str) -> int:
+    """argparse `type=` validator for non-negative integer flags (issue #89).
+
+    Used by ``--debug-samples`` so a negative N is rejected at parse time
+    rather than silently coerced inside the helper. Raises
+    ``argparse.ArgumentTypeError`` so argparse surfaces the message under
+    the standard ``argument <flag>:`` prefix.
+    """
+    try:
+        n = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"must be a non-negative integer, got '{raw}'"
+        )
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {n}")
+    return n
+
+
 _lib_alerts_payload = _load_sibling("_lib_alerts_payload")
 _alert_text_weekly = _lib_alerts_payload._alert_text_weekly
 _alert_text_five_hour = _lib_alerts_payload._alert_text_five_hour
@@ -1074,35 +1094,301 @@ def _resolve_claude_tz_name(args: argparse.Namespace,
     return None
 
 
-_DEBUG_NOTE_EMITTED = False
+# ---------------------------------------------------------------------------
+# Issue #89 — Real --debug diagnostic-sample emission
+# ---------------------------------------------------------------------------
+# Spec: docs/superpowers/specs/2026-05-23-issue-89-debug-sample-emission.md
+# Replaces the §7.6.2 placeholder note with a real ccusage-parity
+# "Pricing Mismatch Debug Report" on stderr.
+
+from dataclasses import dataclass as _ms_dataclass, field as _ms_field
+import os as _ms_os
+import json as _ms_json
 
 
-def _emit_debug_note_if_set(args: argparse.Namespace) -> None:
-    """Emit the §7.6.2 normative stderr note exactly once per process.
+@_ms_dataclass
+class _MismatchModelStat:
+    total: int = 0
+    matches: int = 0
+    mismatches: int = 0
+    avg_percent_diff: float = 0.0
 
-    Called from every in-scope ``cmd_*`` body before any stdout write,
-    when ``args.debug`` is True. The one-time-per-process guard
-    (``_DEBUG_NOTE_EMITTED``) ensures a single CLI invocation that
-    internally re-enters ``cmd_*`` (e.g., via ``cmd_report`` →
-    ``cmd_sync_week`` composition) does not duplicate the line.
 
-    The note goes to **stderr**, never stdout — so ``--json`` /
-    ``--format`` pipelines remain parseable (spec §11 R6).
+@_ms_dataclass
+class _MismatchSample:
+    file: str
+    timestamp: str
+    model: str
+    original_cost: float
+    calculated_cost: float
+    difference: float
+    percent_diff: float
+    usage: dict
 
-    Spec §7.6.2 / issue #86 Session A. The ``#89`` placeholder is
-    replaced with the real follow-up issue number by Task D3 (operator-
-    driven, post-implementation).
+
+@_ms_dataclass
+class _MismatchStats:
+    command_label: str | None = None
+    total_entries: int = 0
+    entries_with_both: int = 0
+    matches: int = 0
+    mismatches: int = 0
+    model_stats: dict = _ms_field(default_factory=dict)
+    discrepancies: list = _ms_field(default_factory=list)
+
+
+def _compute_pricing_mismatch_stats(entries):
+    """Walk ``entries: Iterable[UsageEntry]`` and compute the mismatch stats
+    that ``_render_pricing_mismatch_report`` consumes.
+
+    Mirrors ccusage upstream's ``detectMismatches``
+    (``~/.npm/_npx/.../node_modules/ccusage/dist/debug-DvI5DUKR.js:6-95``):
+
+    - An entry counts toward ``entries_with_both`` iff its ``cost_usd``
+      is not None AND the model has pricing in ``CLAUDE_MODEL_PRICING``.
+    - Threshold: ``percent_diff < 0.1`` is a match; anything else is a
+      mismatch and gets appended to ``discrepancies`` in iteration order.
+    - ``percent_diff`` is ``0.0`` when recorded cost is zero (parity with
+      upstream's divide-by-zero guard).
+    - Per-model ``avg_percent_diff`` updated by streaming mean recurrence
+      to match upstream's per-row accumulation.
     """
-    global _DEBUG_NOTE_EMITTED
-    if _DEBUG_NOTE_EMITTED:
+    stats = _MismatchStats()
+    for entry in entries:
+        stats.total_entries += 1
+        if entry.cost_usd is None:
+            continue
+        if _resolve_model_pricing(entry.model) is None:
+            continue
+        stats.entries_with_both += 1
+        calculated = _calculate_entry_cost(
+            entry.model, entry.usage, mode="calculate",
+        )
+        original = float(entry.cost_usd)
+        difference = abs(original - calculated)
+        percent_diff = (difference / original * 100) if original > 0 else 0.0
+        ms = stats.model_stats.setdefault(entry.model, _MismatchModelStat())
+        ms.total += 1
+        if percent_diff < 0.1:
+            stats.matches += 1
+            ms.matches += 1
+        else:
+            stats.mismatches += 1
+            ms.mismatches += 1
+            stats.discrepancies.append(_MismatchSample(
+                file=_ms_os.path.basename(entry.source_path),
+                timestamp=entry.timestamp.isoformat(),
+                model=entry.model,
+                original_cost=original,
+                calculated_cost=calculated,
+                difference=difference,
+                percent_diff=percent_diff,
+                usage=dict(entry.usage),
+            ))
+        # Streaming-mean update for avg_percent_diff (matches upstream).
+        ms.avg_percent_diff = (
+            ms.avg_percent_diff * (ms.total - 1) + percent_diff
+        ) / ms.total
+    return stats
+
+
+def _render_pricing_mismatch_report(stats, sample_limit):
+    """Return the report as a list of stderr lines (caller prints \\n-joined).
+
+    Matches ccusage upstream's ``printMismatchReport``
+    (debug-DvI5DUKR.js:97-145) including:
+      - Early-return ``"No pricing data found to analyze."`` when
+        ``entries_with_both == 0``.
+      - Model Statistics + Sample Discrepancies sections omitted when
+        ``mismatches == 0``.
+      - Models with ``mismatches == 0`` omitted from Model Statistics.
+      - Sample header prints the requested ``sample_limit`` (not min with
+        discrepancies length).
+    Adds ONE intentional non-upstream line: ``Command: cctally <label>``
+    under the header so the report self-identifies (issue #89 acceptance
+    re: "command in each sample's context").
+    """
+    out = []
+    if stats.entries_with_both == 0:
+        out.append("No pricing data found to analyze.")
+        return out
+
+    match_rate = stats.matches / stats.entries_with_both * 100
+    out.append("")
+    out.append("=== Pricing Mismatch Debug Report ===")
+    if stats.command_label:
+        out.append(f"Command: cctally {stats.command_label}")
+    out.append(f"Total entries processed: {stats.total_entries:,}")
+    out.append(
+        f"Entries with both costUSD and model: {stats.entries_with_both:,}"
+    )
+    out.append(f"Matches (within 0.1%): {stats.matches:,}")
+    out.append(f"Mismatches: {stats.mismatches:,}")
+    out.append(f"Match rate: {match_rate:.2f}%")
+
+    if stats.mismatches > 0 and stats.model_stats:
+        out.append("")
+        out.append("=== Model Statistics ===")
+        sorted_models = sorted(
+            stats.model_stats.items(),
+            key=lambda kv: -kv[1].mismatches,
+        )
+        for model, ms in sorted_models:
+            if ms.mismatches == 0:
+                continue
+            rate = ms.matches / ms.total * 100
+            out.append(f"{model}:")
+            out.append(f"  Total entries: {ms.total:,}")
+            out.append(f"  Matches: {ms.matches:,} ({rate:.1f}%)")
+            out.append(f"  Mismatches: {ms.mismatches:,}")
+            out.append(f"  Avg % difference: {ms.avg_percent_diff:.1f}%")
+
+    if stats.discrepancies and sample_limit > 0:
+        out.append("")
+        out.append(f"=== Sample Discrepancies (first {sample_limit}) ===")
+        for d in stats.discrepancies[:sample_limit]:
+            out.append(f"File: {d.file}")
+            out.append(f"Timestamp: {d.timestamp}")
+            out.append(f"Model: {d.model}")
+            out.append(f"Original cost: ${d.original_cost:.6f}")
+            out.append(f"Calculated cost: ${d.calculated_cost:.6f}")
+            out.append(
+                f"Difference: ${d.difference:.6f} ({d.percent_diff:.2f}%)"
+            )
+            out.append(f"Tokens: {_ms_json.dumps(d.usage)}")
+            out.append("---")
+    return out
+
+
+_DEBUG_REPORT_EMITTED = False
+
+
+def _emit_debug_samples_if_set(
+    args,
+    entries_or_loader,
+    *,
+    command_label: str,
+) -> None:
+    """Emit the §7.6.2 normative stderr report exactly once per process
+    when ``args.debug`` is True (issue #89).
+
+    ``entries_or_loader`` is either a list[UsageEntry] (eager) or a
+    zero-arg callable returning list[UsageEntry] (deferred). The deferred
+    form keeps the JSONL scan off the hot path on SQL-backed cmds whose
+    --debug is rare.
+
+    The report mirrors ccusage's ``printMismatchReport`` shape per spec
+    §7.1.2; the one-time-per-process guard ensures a single CLI
+    invocation that composes multiple cmd_* doesn't double-emit. The
+    diff two-window case (``_emit_diff_debug_samples``) bypasses this
+    guard internally for the second window then sets the guard at the
+    end.
+    """
+    global _DEBUG_REPORT_EMITTED
+    if _DEBUG_REPORT_EMITTED:
         return
     if not getattr(args, "debug", False):
         return
-    eprint(
-        "cctally: --debug diagnostic-sample emission is not yet wired "
-        "(tracked at issue #89)"
+    sample_limit = int(getattr(args, "debug_samples", 5))
+    # Negative values are rejected at argparse parse time via _nonneg_int
+    # (§7.5); the helper assumes sample_limit >= 0.
+
+    entries = (
+        entries_or_loader()
+        if callable(entries_or_loader)
+        else entries_or_loader
     )
-    _DEBUG_NOTE_EMITTED = True
+    stats = _compute_pricing_mismatch_stats(entries)
+    stats.command_label = command_label
+    for line in _render_pricing_mismatch_report(stats, sample_limit):
+        eprint(line)
+    _DEBUG_REPORT_EMITTED = True
+
+
+def _usage_entry_from_joined(je) -> "UsageEntry":
+    """Shape a ``_JoinedClaudeEntry`` into a ``UsageEntry`` so the §7.1
+    mismatch helpers can consume both pipelines uniformly (issue #89
+    spec §7.2.1).
+
+    The joined-entry shape already carries ``source_path``, ``cost_usd``,
+    and the per-token integers; this adapter is pure shape conversion
+    with no cache re-read.
+    """
+    return UsageEntry(
+        timestamp=je.timestamp,
+        model=je.model,
+        usage={
+            "input_tokens": je.input_tokens,
+            "output_tokens": je.output_tokens,
+            "cache_creation_input_tokens": je.cache_creation_tokens,
+            "cache_read_input_tokens": je.cache_read_tokens,
+        },
+        cost_usd=je.cost_usd,
+        source_path=je.source_path,
+    )
+
+
+def _resolve_session_id_for_filter(je) -> str:
+    """Mirror ``_aggregate_claude_sessions``'s session_id resolution
+    (``bin/_lib_aggregators.py:623-627``): use ``je.session_id`` when
+    set, else fall back to the filename stem of ``je.source_path``.
+
+    Used by ``cmd_session``'s ``--id`` filter on the joined-entry list
+    (spec §7.2.1.1) so a rendered session that was assigned its id via
+    the filename-stem fallback isn't silently dropped from the --debug
+    report scope.
+    """
+    if je.session_id is not None:
+        return je.session_id
+    return _ms_os.path.splitext(_ms_os.path.basename(je.source_path))[0]
+
+
+def _project_filter_matches(key, project_patterns):
+    """Mirror ``cmd_project``'s ``--project`` predicate
+    (``bin/cctally:4792-4803``): substring match against
+    ``key.display_key`` AND ``key.git_root or key.bucket_path``.
+
+    Used by ``cmd_project``'s --debug report scope so basename-collision
+    suffixes (e.g. ``foo (repos)``) are still selectable by their path
+    segment (spec §7.2.1.2). Do NOT simplify to a raw
+    ``p in (je.project_path or "")`` substring — the report scope would
+    drift from the rendered scope.
+    """
+    if not project_patterns:
+        return True
+    dname = key.display_key.lower()
+    pname = (key.git_root or key.bucket_path or "").lower()
+    return any((p in dname) or (p in pname) for p in project_patterns)
+
+
+def _emit_diff_debug_samples(args, window_a, window_b) -> None:
+    """Two-window diff report (spec §7.2.2 Pattern D).
+
+    ``cmd_diff`` aggregates two windows; emitting a single union-report
+    would conflate per-window stats. This helper emits two separate
+    reports labeled by window token, then sets ``_DEBUG_REPORT_EMITTED``
+    so a downstream cmd_* composition doesn't double-emit.
+
+    Bypasses ``_emit_debug_samples_if_set``'s one-time guard internally
+    (it would short-circuit the second window).
+    """
+    global _DEBUG_REPORT_EMITTED
+    if _DEBUG_REPORT_EMITTED:
+        return
+    if not getattr(args, "debug", False):
+        return
+    sample_limit = int(getattr(args, "debug_samples", 5))
+    skip_sync = not bool(getattr(args, "sync", False))
+    for window, label_letter, token in (
+        (window_a, "A", getattr(args, "a", "")),
+        (window_b, "B", getattr(args, "b", "")),
+    ):
+        entries = get_entries(window.start, window.end, skip_sync=skip_sync)
+        stats = _compute_pricing_mismatch_stats(entries)
+        stats.command_label = f"diff (Window {label_letter}: {token})"
+        for line in _render_pricing_mismatch_report(stats, sample_limit):
+            eprint(line)
+    _DEBUG_REPORT_EMITTED = True
 
 
 def _load_claude_config_for_args(args: argparse.Namespace) -> "dict":
@@ -3564,7 +3850,6 @@ def _load_recorded_five_hour_windows(
 
 def cmd_blocks(args: argparse.Namespace) -> int:
     """Show usage report grouped by 5-hour session blocks."""
-    _emit_debug_note_if_set(args)
     config = _load_claude_config_for_args(args)
     _bridge_z_into_tz(args, config)
     tz = resolve_display_tz(args, config)
@@ -3599,6 +3884,10 @@ def cmd_blocks(args: argparse.Namespace) -> int:
 
     # Collect all entries
     all_entries = get_entries(range_start, range_end)
+
+    _emit_debug_samples_if_set(
+        args, all_entries, command_label="blocks",
+    )
 
     # Load recorded 5-hour reset timestamps. Widen both bounds by
     # BLOCK_DURATION: a window covers [R - 5h, R), so a reset R just
@@ -3886,7 +4175,6 @@ def _parse_cli_date_range(
 def cmd_daily(args: argparse.Namespace) -> int:
     """Show usage report grouped by display-timezone date."""
     _share_validate_args(args)
-    _emit_debug_note_if_set(args)
     config = _load_claude_config_for_args(args)
     # Session A (spec §7.2): bridge -z/--timezone into args.tz so the
     # existing resolve_display_tz precedence absorbs the new alias. The
@@ -3907,6 +4195,10 @@ def cmd_daily(args: argparse.Namespace) -> int:
 
     # Collect entries.
     all_entries = get_entries(range_start, range_end)
+
+    _emit_debug_samples_if_set(
+        args, all_entries, command_label="daily",
+    )
 
     # Build the unified daily view (spec §5.1: gap-free; the dashboard
     # heatmap's contiguous-window materialization stays at the dashboard
@@ -3974,7 +4266,6 @@ def cmd_daily(args: argparse.Namespace) -> int:
 def cmd_monthly(args: argparse.Namespace) -> int:
     """Show usage report grouped by display-timezone calendar month."""
     _share_validate_args(args)
-    _emit_debug_note_if_set(args)
     config = _load_claude_config_for_args(args)
     _bridge_z_into_tz(args, config)
     tz = resolve_display_tz(args, config)
@@ -3990,6 +4281,10 @@ def cmd_monthly(args: argparse.Namespace) -> int:
     range_start, range_end = range
 
     all_entries = get_entries(range_start, range_end)
+
+    _emit_debug_samples_if_set(
+        args, all_entries, command_label="monthly",
+    )
 
     # Build the unified monthly view (spec §5.2: drops boundary-spillover
     # bucket; computes delta_cost_pct internally). Consume
@@ -4051,7 +4346,6 @@ def cmd_monthly(args: argparse.Namespace) -> int:
 def cmd_weekly(args: argparse.Namespace) -> int:
     """Show Claude usage grouped by subscription week."""
     _share_validate_args(args)
-    _emit_debug_note_if_set(args)
     config = _load_claude_config_for_args(args)
     _bridge_z_into_tz(args, config)
     args._resolved_tz = resolve_display_tz(args, config)
@@ -4085,6 +4379,10 @@ def cmd_weekly(args: argparse.Namespace) -> int:
     else:
         fetch_start = range_start
     all_entries = get_entries(fetch_start, range_end)
+
+    _emit_debug_samples_if_set(
+        args, all_entries, command_label="weekly",
+    )
 
     # Bound the usage-snapshot lookup to `<= range_end` so historical
     # `--until <past date>` queries pick the usage% that was current at
@@ -4624,7 +4922,6 @@ def _project_sort_key(row: dict, sort_by: str, order: str):
 def cmd_project(args: argparse.Namespace) -> int:
     """Roll entries up by project (git-root) with per-project usage attribution."""
     _share_validate_args(args)
-    _emit_debug_note_if_set(args)
     config = _load_claude_config_for_args(args)
     # Session A (spec §7.2): bridge -z/--timezone into args.tz so the
     # existing resolve_display_tz precedence absorbs the new alias.
@@ -4750,7 +5047,45 @@ def cmd_project(args: argparse.Namespace) -> int:
     unknown_entry_count = 0
     missing_sid_count = 0
 
-    for entry in get_claude_session_entries(scan_start, scan_end):
+    # Issue #89: materialize the joined-entry iterator once so we can
+    # (a) pre-compute the --debug report's scope (entries passing all
+    # rendered-row filters — user slice + --model + --project) BEFORE
+    # the aggregation loop runs and (b) preserve the existing
+    # aggregation semantics (denominator widened to ALL entries; visible
+    # rows only the post-filter subset). The list is small enough to
+    # hold (entries already in memory via the cache row factory).
+    joined_entries_all = list(get_claude_session_entries(scan_start, scan_end))
+
+    # Build the --debug report dataset: skip synthetic + out-of-window
+    # entries, then apply --model and --project filters (mirroring the
+    # exact predicate at the aggregation loop below). This must match
+    # the rendered scope, NOT the denominator scope.
+    if getattr(args, "debug", False):
+        filtered_for_report = []
+        for je in joined_entries_all:
+            if je.model == "<synthetic>":
+                continue
+            if _week_start_for(je.timestamp) is None:
+                continue
+            if je.timestamp < since_dt or je.timestamp > until_dt:
+                continue
+            if model_patterns:
+                mname = (je.model or "").lower()
+                if not any(p in mname for p in model_patterns):
+                    continue
+            key_for_filter = _resolve_project_key(
+                je.project_path, args.group, resolver_cache,
+            )
+            if not _project_filter_matches(key_for_filter, project_patterns):
+                continue
+            filtered_for_report.append(je)
+        _emit_debug_samples_if_set(
+            args,
+            [_usage_entry_from_joined(je) for je in filtered_for_report],
+            command_label="project",
+        )
+
+    for entry in joined_entries_all:
         # Skip synthetic entries (Claude Code internal markers) to match
         # `_aggregate_cache_by_session` / `_aggregate_claude_sessions`.
         if entry.model == "<synthetic>":
@@ -5107,7 +5442,6 @@ _diff_resolve_anchor = _lib_diff_kernel._diff_resolve_anchor
 
 def cmd_diff(args: argparse.Namespace) -> int:
     """Compare Claude usage between two windows."""
-    _emit_debug_note_if_set(args)
     now_utc = _command_as_of()
     if getattr(args, "debug_now", False):
         print(f"now_utc={_iso_z(now_utc)}")
@@ -5146,6 +5480,11 @@ def cmd_diff(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"diff: {exc}", file=sys.stderr)
         return 2
+
+    # Issue #89 spec §7.2.2 Pattern D: emit one --debug report per window
+    # before any rendering, with window-A then window-B labels.
+    if getattr(args, "debug", False):
+        _emit_diff_debug_samples(args, window_a, window_b)
 
     threshold = NoiseThreshold(
         show_all=bool(args.show_all),
@@ -5234,7 +5573,6 @@ def cmd_diff(args: argparse.Namespace) -> int:
 def cmd_session(args: argparse.Namespace) -> int:
     """Show Claude usage grouped by sessionId (merges resumed-across-files sessions)."""
     _share_validate_args(args)
-    _emit_debug_note_if_set(args)
     config = _load_claude_config_for_args(args)
     _bridge_z_into_tz(args, config)
     tz = resolve_display_tz(args, config)
@@ -5250,6 +5588,23 @@ def cmd_session(args: argparse.Namespace) -> int:
     range_start, range_end = range
 
     entries = get_claude_session_entries(range_start, range_end)
+
+    # Issue #89: --debug report describes the joined-entry list filtered
+    # by --id (post-fallback session_id resolution) when set, matching
+    # the rendered scope of `sessions`.
+    if getattr(args, "id", None):
+        joined_for_report = [
+            je for je in entries
+            if _resolve_session_id_for_filter(je) == args.id
+        ]
+    else:
+        joined_for_report = entries
+    _emit_debug_samples_if_set(
+        args,
+        [_usage_entry_from_joined(je) for je in joined_for_report],
+        command_label="session",
+    )
+
     # Unified view-model kernel (spec §6.5). `limit=None` keeps the
     # full aggregator output — `cctally session` has no `--limit` flag
     # and emits every session in the requested range. `view.aggregated`
@@ -7454,7 +7809,6 @@ def _load_breakdown(
 def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
     """List API-anchored 5h blocks with rollup totals + 7d-drift columns."""
     _share_validate_args(args)
-    _emit_debug_note_if_set(args)
     config = _load_claude_config_for_args(args)
     # Session A (spec §7.2): bridge -z/--timezone into args.tz before
     # resolve_display_tz so the new alias precedence lands.
@@ -7506,6 +7860,31 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
             """,
             params,
         ).fetchall()
+
+        # Issue #89: --debug report scope = the time range spanned by
+        # the rendered block rows. When `rows` is empty, pass an empty
+        # list to short-circuit the loader entirely.
+        if rows:
+            # rows are ORDER BY block_start_at DESC; first row is newest,
+            # last row is oldest. The rendered window is
+            # [oldest_block_start, newest_block_start + BLOCK_DURATION).
+            oldest_start_iso = rows[-1]["block_start_at"]
+            newest_start_iso = rows[0]["block_start_at"]
+            block_window_start = parse_iso_datetime(
+                oldest_start_iso, "block_start_at",
+            )
+            block_window_end = parse_iso_datetime(
+                newest_start_iso, "block_start_at",
+            ) + BLOCK_DURATION
+            _emit_debug_samples_if_set(
+                args,
+                lambda: get_entries(block_window_start, block_window_end),
+                command_label="five-hour-blocks",
+            )
+        else:
+            _emit_debug_samples_if_set(
+                args, [], command_label="five-hour-blocks",
+            )
 
         # Detect truncation: cap applied AND there's at least one older
         # block beyond the cap. Probe with LIMIT 1 OFFSET <cap> over the
@@ -8371,7 +8750,6 @@ def _sort_cache_rows(
 
 
 def cmd_cache_report(args: argparse.Namespace) -> int:
-    _emit_debug_note_if_set(args)
     config = _load_claude_config_for_args(args)
     # Session A (spec §7.2): bridge -z/--timezone into args.tz so the
     # existing resolve_display_tz precedence absorbs the new alias. The
@@ -8404,6 +8782,15 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
         if msg:
             eprint(f"Error: {msg}")
         return 1
+
+    # Issue #89 Pattern C: deferred loader scoped to the rendered window
+    # (project filter mirrors what the cache-aggregator uses).
+    _emit_debug_samples_if_set(
+        args,
+        lambda: get_entries(since, until, project=args.project),
+        command_label="cache-report",
+    )
+
     mode = "session" if getattr(args, "by_session", False) else "day"
     top_key = "sessions" if mode == "session" else "days"
 
@@ -8462,7 +8849,6 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
 
 
 def cmd_range_cost(args: argparse.Namespace) -> int:
-    _emit_debug_note_if_set(args)
     # Session A (spec §7.2 / §7.6 row note): range-cost has no --tz of
     # its own — start/end carry their own zone via ISO 8601. Calling the
     # bridge keeps the alias-surface contract uniform across the 10
@@ -8488,7 +8874,15 @@ def cmd_range_cost(args: argparse.Namespace) -> int:
     last_match: dt.datetime | None = None
     model_buckets: dict[str, dict[str, Any]] = {}
 
-    for entry in get_entries(start_dt, end_dt, project=args.project):
+    # Issue #89: materialize the generator so --debug report can describe
+    # the same dataset as the rendered output. Project filter is applied
+    # at the loader (SELECT-time), so the scope is the same.
+    entries_list = list(get_entries(start_dt, end_dt, project=args.project))
+    _emit_debug_samples_if_set(
+        args, entries_list, command_label="range-cost",
+    )
+
+    for entry in entries_list:
         cost = _calculate_entry_cost(
             entry.model, entry.usage, mode=args.mode, cost_usd=entry.cost_usd,
         )
@@ -9065,13 +9459,15 @@ def _add_ccusage_alias_args(parser, *, ansi_emit: bool) -> None:
     )
     _maybe_add2(
         "-d", "--debug", action="store_true",
-        help="Accepted for ccusage drop-in compat; emits a one-time "
-             "stderr note. Real diagnostic-sample emission tracked at "
-             "issue #89.",
+        help="Emit a stderr 'Pricing Mismatch Debug Report' "
+             "(totals + per-model stats + sample discrepancies, "
+             "matching ccusage's --debug shape).",
     )
     _maybe_add(
-        "--debug-samples", type=int, default=5, metavar="N",
-        help="Accepted for ccusage drop-in compat; see --debug.",
+        "--debug-samples", type=_nonneg_int, default=5, metavar="N",
+        help="Cap on sample-discrepancy rows in the --debug report "
+             "(default 5; N=0 suppresses the sample block; "
+             "negatives rejected at parse time).",
     )
     _maybe_add(
         "--single-thread", action="store_true",

@@ -165,7 +165,6 @@ _CodexIterState = _lib_jsonl._CodexIterState
 _iter_jsonl_entries_with_offsets = _lib_jsonl._iter_jsonl_entries_with_offsets
 _iter_codex_jsonl_entries_with_offsets = _lib_jsonl._iter_codex_jsonl_entries_with_offsets
 _parse_usage_entries = _lib_jsonl._parse_usage_entries
-_should_replace = _lib_jsonl._should_replace
 
 _cctally_db_sib = _load_lib("_cctally_db")
 add_column_if_missing = _cctally_db_sib.add_column_if_missing
@@ -305,16 +304,7 @@ class IngestStats:
     files_processed: int = 0
     files_skipped_unchanged: int = 0
     files_reset_truncated: int = 0
-    # Count of session_entries rows written by this sync — both genuinely-
-    # new INSERTs and ccusage-parity ON CONFLICT DO UPDATE replacements
-    # (the dedup tiebreaker swaps a streaming-intermediate row for the
-    # post-stream finalization). SQLite's `total_changes` counter
-    # increments on both, so this field is "rows changed", not "rows
-    # newly inserted". Pre-dedup builds used INSERT OR IGNORE where
-    # conflicts did NOT bump the counter; the name change preserves the
-    # observability metric without misrepresenting UPSERT updates as
-    # new inserts.
-    rows_changed: int = 0
+    rows_inserted: int = 0
     lock_contended: bool = False
 
 
@@ -324,7 +314,7 @@ def _progress_stderr(stats: IngestStats, *, force: bool = False) -> None:
         return
     eprint(
         f"[cache-sync] {stats.files_processed}/{stats.files_total} files, "
-        f"{stats.rows_changed} rows changed"
+        f"{stats.rows_inserted} new rows"
     )
 
 
@@ -443,30 +433,6 @@ def sync_cache(
             stats.lock_contended = True
             return stats
 
-        # Walk-complete sentinel gating (cctally-dev#93, D5b/D6b). Capture
-        # whether cache 001 was already applied at the moment this sync
-        # acquired the lock. The end-of-loop marker write is gated on this so
-        # a walk whose baseline predates the 001 wipe (the "straddle" run)
-        # withholds the marker — it cannot vouch for a cache 001 wiped
-        # underneath it. On the normal first-upgrade flow open_cache_db runs
-        # the dispatcher (001 applies in-process) BEFORE sync_cache is ever
-        # called, so this is True and the marker is written as expected. If
-        # schema_migrations doesn't exist yet, treat as not-applied (False).
-        try:
-            applied_at_start = conn.execute(
-                "SELECT 1 FROM schema_migrations WHERE name='001_dedup_highest_wins'"
-            ).fetchone() is not None
-        except sqlite3.OperationalError:
-            applied_at_start = False
-
-        # Tracks whether every file in this walk was either ingested cleanly
-        # or confirmed-current. Any per-file error-skip (stat/read failure or
-        # a DB error that rolls back + continues) flips it False so the marker
-        # is withheld — an incomplete walk must not look complete. The
-        # unchanged-file early-exit (`size == prev_size`) does NOT flip it: a
-        # confirmed-current file still counts as walked.
-        walk_clean = True
-
         if rebuild:
             # Clear INSIDE the lock — a concurrent rebuild that lost the
             # race would otherwise have wiped this cache before bailing,
@@ -475,11 +441,6 @@ def sync_cache(
             # empty baseline.
             conn.execute("DELETE FROM session_entries")
             conn.execute("DELETE FROM session_files")
-            # Clear the walk-complete sentinel atomically with the wipe
-            # (cctally-dev#93, D5/D2): a stale "complete" marker must never
-            # survive a destructive rebuild. The end-of-loop write below
-            # re-establishes it only after this rebuild's clean walk.
-            conn.execute("DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'")
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Claude cached entries")
 
@@ -503,120 +464,6 @@ def sync_cache(
             )
         }
 
-        # Orphaned-tracked-file detection (cctally-dev#93 review). A path
-        # tracked in session_files (with data already ingested) but no
-        # longer present on disk leaves orphaned session_entries rows that
-        # the per-file loop below never visits — it iterates only on-disk
-        # `paths`. sync_cache deliberately does NOT prune those orphans
-        # in-place: a deleted file shares the truncation hazard (under the
-        # sticky source_path dedup a surviving file may carry the same
-        # (msg_id, req_id) yet keep its size_bytes, so a per-orphan DELETE
-        # could drop a row the survivor still owns without re-ingesting
-        # it), and a blanket full-reset would wrongly fire on the
-        # legitimate "cache seeded with synthetic source paths" fixture
-        # pattern. Instead we INVALIDATE the walk-complete marker: an
-        # orphaned cache no longer faithfully mirrors disk, so it is — by
-        # the marker's own definition — not a complete walk. We must
-        # actively DELETE any marker a PRIOR clean walk left behind (not
-        # merely withhold THIS run's end-of-loop rewrite — that rewrite is
-        # gated on walk_clean, but a stale marker from a previous sync
-        # would otherwise survive and keep vouching for completeness).
-        # Setting walk_clean=False additionally suppresses the end-of-loop
-        # rewrite so the marker stays absent for this run. With the marker
-        # gone the upgrade gate DEFERs the 008/009/010 recomputes (rather
-        # than certifying aggregates that still include data from files no
-        # longer on disk); the operator clears the orphans by running
-        # `cache-sync --rebuild` (the documented re-derive path), which
-        # re-establishes the marker. Only paths whose row carried ingested
-        # bytes (size_bytes > 0) count — a size_bytes=0 row holds no
-        # session_entries, so its absence leaves no orphan. The DELETE +
-        # commit lands BEFORE the per-file read+parse loop, so no write
-        # lock is held into that loop (same discipline as the truncation
-        # escalation just below).
-        on_disk_paths = {str(jp) for jp in paths}
-        orphaned_tracked_paths = [
-            p for p, (size_bytes, _, _) in existing.items()
-            if size_bytes and p not in on_disk_paths
-        ]
-        if orphaned_tracked_paths:
-            eprint(
-                f"[cache] {len(orphaned_tracked_paths)} tracked file(s) no "
-                f"longer on disk; invalidating walk-complete marker "
-                f"(run `cache-sync --rebuild` to prune orphaned entries)"
-            )
-            conn.execute(
-                "DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'"
-            )
-            conn.commit()
-            walk_clean = False  # orphaned rows -> cache doesn't mirror disk (D5a)
-
-        # Pre-scan for any truncation among tracked files. Under the
-        # ccusage-parity ON CONFLICT DO UPDATE, source_path is PINNED to
-        # whichever file first inserted a (msg_id, req_id) row (see U1
-        # in this file). Later UPSERTs from a DIFFERENT file may have
-        # updated the token columns on that row while leaving source_path
-        # pointing at the original (now possibly truncated) file. A
-        # naive per-file truncation path then deletes by source_path and
-        # loses data the other file is still carrying — but that other
-        # file's `size_bytes` is unchanged, so the per-file early-exit
-        # at `if size == prev_size: continue` skips its re-ingest.
-        #
-        # Escalation: when any file's size has shrunk, drop the entire
-        # session_entries cache and force every file to re-ingest from
-        # offset 0. The cache is fully re-derivable, this is rare (only
-        # on JSONL rotation / manual edits), and it sidesteps the
-        # per-key contributing-file bookkeeping that would otherwise be
-        # required. The lock is already held, so this is atomic with
-        # the subsequent per-file ingest.
-        truncated_paths: set[str] = set()
-        for jp in paths:
-            prev = existing.get(str(jp))
-            if prev is None:
-                continue
-            try:
-                st = jp.stat()
-            except OSError:
-                continue
-            if st.st_size < prev[0]:
-                truncated_paths.add(str(jp))
-
-        if truncated_paths:
-            eprint(
-                f"[cache-sync] truncation detected on {len(truncated_paths)} "
-                f"file(s) — re-ingesting all files (safe under ccusage-parity "
-                f"dedup)"
-            )
-            conn.execute("DELETE FROM session_entries")
-            # Clear the walk-complete sentinel atomically with the truncation
-            # full-reset (cctally-dev#93, D5/D2): the cache is being wiped, so
-            # any "complete" marker is now stale. The end-of-loop write below
-            # re-establishes it only after this run's clean re-ingest walk.
-            conn.execute("DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'")
-            # Crash-safety: also clear session_files's size/offset tracking
-            # so a partial-state recovery on the NEXT sync forces every
-            # file's per-file branch to take the fresh-ingest path. Without
-            # this, if the process is killed (kill -9, power loss) between
-            # this DELETE commit and the per-file re-ingest commits below,
-            # the next sync would only re-detect the originally-truncated
-            # file(s); other files still have matching size_bytes and the
-            # `if size == prev_size: continue` early-exit would leave them
-            # missing from session_entries until file size changes or an
-            # operator runs `cache-sync --rebuild`. UPDATE (not DELETE)
-            # preserves session_id / project_path columns lazy-backfilled
-            # by _ensure_session_files_row (used by the `session`
-            # subcommand's JOIN).
-            conn.execute(
-                "UPDATE session_files SET size_bytes = 0, last_byte_offset = 0"
-            )
-            conn.commit()
-            stats.files_reset_truncated += len(truncated_paths)
-            # Force every file to re-ingest from offset 0: clearing the
-            # `existing` map makes `prev is None` true downstream, so the
-            # per-file branch takes the fresh-ingest path (start_offset=0,
-            # truncated=False since we already wiped the table above —
-            # avoids a redundant per-file DELETE that would be a no-op).
-            existing = {}
-
         for jp in paths:
             path_str = str(jp)
             # Backfill session_id/project_path for A2 `session` subcommand.
@@ -630,7 +477,6 @@ def sync_cache(
                 st = jp.stat()
             except OSError as exc:
                 eprint(f"[cache] stat failed for {jp}: {exc}")
-                walk_clean = False  # skipped a file without ingesting (D5a)
                 continue
 
             size = st.st_size
@@ -661,7 +507,7 @@ def sync_cache(
             try:
                 with open(jp, "r", encoding="utf-8", errors="replace") as fh:
                     fh.seek(start_offset)
-                    for offset, entry, msg_id, req_id in _iter_jsonl_entries_with_offsets(fh):
+                    for offset, entry, msg_id, req_id in _iter_jsonl_entries_with_offsets(fh, str(jp)):
                         usage = entry.usage
                         inp = int(usage.get("input_tokens", 0) or 0)
                         out = int(usage.get("output_tokens", 0) or 0)
@@ -689,7 +535,6 @@ def sync_cache(
                     final_offset = fh.tell()
             except OSError as exc:
                 eprint(f"[cache] could not read {jp}: {exc}")
-                walk_clean = False  # skipped a file without ingesting (D5a)
                 continue
 
             # Python's sqlite3 module starts an implicit transaction on the
@@ -707,65 +552,16 @@ def sync_cache(
                     stats.files_reset_truncated += 1
                 if rows:
                     before = conn.total_changes
-                    # ccusage-parity ON CONFLICT DO UPDATE: higher-token total
-                    # wins on conflict; speed-set breaks ties. The partial
-                    # UNIQUE index `idx_entries_dedup` restricts the conflict
-                    # target to (msg_id IS NOT NULL AND req_id IS NOT NULL),
-                    # so the WHERE clause on the conflict target MUST repeat
-                    # that predicate verbatim — bare `ON CONFLICT(msg_id,
-                    # req_id)` raises OperationalError. NULL-keyed rows fall
-                    # through to a plain INSERT, unchanged.
-                    #
-                    # `source_path` is INTENTIONALLY OMITTED from the DO
-                    # UPDATE SET clause: it stays pinned to whichever JSONL
-                    # FIRST INSERTed the (msg_id, req_id) row. The
-                    # downstream `LEFT JOIN session_files ON sf.path =
-                    # se.source_path` uses source_path to attribute tokens
-                    # to a `project_path`. If a later UPSERT from a
-                    # different file flipped source_path, the row's
-                    # project attribution would move with the winner —
-                    # `cctally project` would mis-aggregate. Sticky
-                    # source_path matches pre-dedup INSERT OR IGNORE
-                    # behavior and the operator's mental model.
-                    # (`line_offset` is similarly sticky for the same
-                    # reason — the offset only makes sense within the
-                    # file that originally wrote the row.)
                     conn.executemany(
-                        """INSERT INTO session_entries
+                        """INSERT OR IGNORE INTO session_entries
                            (source_path, line_offset, timestamp_utc, model,
                             msg_id, req_id, input_tokens, output_tokens,
                             cache_create_tokens, cache_read_tokens,
                             usage_extra_json, cost_usd_raw)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                           ON CONFLICT(msg_id, req_id)
-                           WHERE msg_id IS NOT NULL AND req_id IS NOT NULL
-                           DO UPDATE SET
-                               timestamp_utc = excluded.timestamp_utc,
-                               model = excluded.model,
-                               input_tokens = excluded.input_tokens,
-                               output_tokens = excluded.output_tokens,
-                               cache_create_tokens = excluded.cache_create_tokens,
-                               cache_read_tokens = excluded.cache_read_tokens,
-                               usage_extra_json = excluded.usage_extra_json,
-                               cost_usd_raw = excluded.cost_usd_raw
-                           WHERE
-                               (excluded.input_tokens + excluded.output_tokens
-                                + excluded.cache_create_tokens + excluded.cache_read_tokens)
-                               >
-                               (session_entries.input_tokens + session_entries.output_tokens
-                                + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
-                            OR (
-                               (excluded.input_tokens + excluded.output_tokens
-                                + excluded.cache_create_tokens + excluded.cache_read_tokens)
-                               =
-                               (session_entries.input_tokens + session_entries.output_tokens
-                                + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
-                               AND json_extract(excluded.usage_extra_json, '$.speed') IS NOT NULL
-                               AND json_extract(session_entries.usage_extra_json, '$.speed') IS NULL
-                            )""",
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                         rows,
                     )
-                    stats.rows_changed += conn.total_changes - before
+                    stats.rows_inserted += conn.total_changes - before
                 # UPSERT preserves session_id / project_path columns populated
                 # by _ensure_session_files_row at the top of this loop. A plain
                 # INSERT OR REPLACE would wipe them on every changed-file sync.
@@ -788,7 +584,6 @@ def sync_cache(
             except sqlite3.DatabaseError as exc:
                 eprint(f"[cache] db error on {jp}: {exc}")
                 conn.rollback()
-                walk_clean = False  # rolled back this file without ingesting (D5a)
                 continue
 
             if progress is not None:
@@ -796,22 +591,6 @@ def sync_cache(
 
         if progress is not None:
             progress(stats)
-
-        # Walk-complete sentinel write (cctally-dev#93, D5a). Still inside the
-        # held fcntl lock, before the finally-unlock. Only when the entire walk
-        # was clean AND cache 001 was already applied at the start of this run
-        # (D5b): an unclean walk or a straddle run must not vouch for cache
-        # completeness. A lock-contended sync returned early above and never
-        # reaches here. Presence (not the timestamp) is the gate signal; the
-        # value stores the completion instant for doctor/debugging.
-        if walk_clean and applied_at_start:
-            conn.execute(
-                "INSERT INTO cache_meta(key, value) "
-                "VALUES('claude_ingest_walk_complete', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (dt.datetime.now(dt.timezone.utc).isoformat(),),
-            )
-            conn.commit()
         return stats
     finally:
         try:
@@ -839,7 +618,8 @@ def iter_entries(
 
     sql = (
         "SELECT timestamp_utc, model, input_tokens, output_tokens, "
-        "cache_create_tokens, cache_read_tokens, usage_extra_json, cost_usd_raw "
+        "cache_create_tokens, cache_read_tokens, usage_extra_json, "
+        "cost_usd_raw, source_path "
         "FROM session_entries "
         "WHERE timestamp_utc >= ? AND timestamp_utc <= ?"
     )
@@ -875,6 +655,7 @@ def iter_entries(
             model=row[1],
             usage=usage,
             cost_usd=row[7],
+            source_path=row[8],
         ))
     return entries
 
@@ -885,26 +666,15 @@ def _collect_entries_direct(
     *,
     project: str | None = None,
 ) -> list[UsageEntry]:
-    """Legacy direct-parse fallback used when the cache DB can't be opened.
-
-    Uses the ccusage-parity dict-keyed accumulator: dedup-keyed entries
-    live in `dedupe_map` and are tiebroken via `_should_replace` (higher
-    token total wins, speed-set breaks ties). Entries with NULL msg_id or
-    req_id bypass the map and land verbatim — partial UNIQUE index on the
-    cache mirrors this behavior. Flattened + sorted once at the end.
-    """
+    """Legacy direct-parse fallback used when the cache DB can't be opened."""
     files = _discover_session_files(range_start, project=project)
-    dedupe_map: dict[str, UsageEntry] = {}
-    no_key: list[UsageEntry] = []
+    seen_hashes: set[str] = set()
+    entries: list[UsageEntry] = []
     for fp in files:
-        no_key.extend(
-            _parse_usage_entries(
-                fp, range_start, range_end, dedupe_map=dedupe_map,
-            )
+        entries.extend(
+            _parse_usage_entries(fp, range_start, range_end, seen_hashes=seen_hashes)
         )
-    all_entries = list(dedupe_map.values()) + no_key
-    all_entries.sort(key=lambda e: e.timestamp)
-    return all_entries
+    return entries
 
 
 # === Region 4: _JoinedClaudeEntry + get_claude_session_entries (was bin/cctally:2478-2668) ===
@@ -1040,23 +810,10 @@ def _direct_parse_claude_session_entries(
     scan the file for the first `sessionId` / `cwd` value, else fall
     back to the filename UUID and the decoded-escaped parent directory
     — same logic as `_ensure_session_files_row`.
-
-    Uses the ccusage-parity dict-keyed accumulator. Each per-file parse
-    contributes into a global `(entry, source_path)` map keyed by
-    `msg_id:req_id`; ties broken by `_should_replace`. NULL-keyed entries
-    bypass dedup. After all files are walked, results are stamped with
-    their owning file's session_id/cwd metadata and emitted in
-    timestamp order.
     """
+    results: list[_JoinedClaudeEntry] = []
     files = _discover_session_files(range_start, project=project)
-
-    # File metadata: source_path -> (session_id, project_path/cwd).
-    meta_by_path: dict[str, tuple[str, str]] = {}
-
-    # Global accumulator: (msg_id:req_id) -> (UsageEntry, source_path).
-    dedupe_map: dict[str, tuple[UsageEntry, str]] = {}
-    # Null-key entries (rare; same as the cache's partial-index fallthrough).
-    no_key_with_meta: list[tuple[UsageEntry, str]] = []
+    seen_hashes: set[str] = set()
 
     for fp in files:
         source_path = str(fp)
@@ -1091,67 +848,27 @@ def _direct_parse_claude_session_entries(
             session_id = os.path.splitext(os.path.basename(source_path))[0]
         if cwd is None:
             cwd = _decode_escaped_cwd(os.path.basename(os.path.dirname(source_path)))
-        meta_by_path[source_path] = (session_id, cwd)
 
-        # Parse this file with a fresh per-file dedupe_map so we can attach
-        # the source_path provenance to whatever wins this file's local
-        # contests. Then merge into the global map using the same
-        # `_should_replace` rule. (A shared dedupe_map across files would
-        # lose the source_path of the winning entry — _parse_usage_entries
-        # has no awareness of per-file metadata.)
-        file_dedupe_map: dict[str, UsageEntry] = {}
-        file_no_key = _parse_usage_entries(
-            fp, range_start, range_end, dedupe_map=file_dedupe_map,
-        )
-
-        # Merge file-local no-key entries directly (no dedup contest).
-        for entry in file_no_key:
-            no_key_with_meta.append((entry, source_path))
-
-        # Merge file-local dedup-keyed entries into the global map.
-        # Same tiebreaker as the cache's ON CONFLICT DO UPDATE clause:
-        # higher-token total wins the entry DATA. But `source_path` is
-        # STICKY to whichever file FIRST contributed the key — it is NOT
-        # flipped to the winner. This mirrors the cache ingest path, where
-        # `source_path` is intentionally OMITTED from the ON CONFLICT DO
-        # UPDATE SET clause (see this file's UPSERT, ~line 636) so the
-        # downstream `LEFT JOIN session_files ON sf.path = se.source_path`
-        # attributes tokens to the project of the file that first wrote the
-        # row. Replacing it here would move project attribution to the
-        # winner's file — `cctally project` (and any session_files join)
-        # would then disagree with the normal cached behavior exactly when
-        # this fallback path is exercised.
-        for key, entry in file_dedupe_map.items():
-            existing = dedupe_map.get(key)
-            if existing is None:
-                dedupe_map[key] = (entry, source_path)
-            elif _should_replace(entry, existing[0]):
-                # Winner's DATA, first contributor's source_path (sticky).
-                dedupe_map[key] = (entry, existing[1])
-
-    # Flatten + emit.
-    results: list[_JoinedClaudeEntry] = []
-    flat: list[tuple[UsageEntry, str]] = list(dedupe_map.values()) + no_key_with_meta
-    flat.sort(key=lambda pair: pair[0].timestamp)
-    for entry, source_path in flat:
-        usage = entry.usage
-        sid, cwd = meta_by_path[source_path]
-        results.append(_JoinedClaudeEntry(
-            timestamp=entry.timestamp,
-            model=entry.model,
-            input_tokens=int(usage.get("input_tokens", 0) or 0),
-            output_tokens=int(usage.get("output_tokens", 0) or 0),
-            cache_creation_tokens=int(
-                usage.get("cache_creation_input_tokens", 0) or 0
-            ),
-            cache_read_tokens=int(
-                usage.get("cache_read_input_tokens", 0) or 0
-            ),
-            source_path=source_path,
-            session_id=sid,
-            project_path=cwd,
-            cost_usd=entry.cost_usd,
-        ))
+        for entry in _parse_usage_entries(
+            fp, range_start, range_end, seen_hashes=seen_hashes
+        ):
+            usage = entry.usage
+            results.append(_JoinedClaudeEntry(
+                timestamp=entry.timestamp,
+                model=entry.model,
+                input_tokens=int(usage.get("input_tokens", 0) or 0),
+                output_tokens=int(usage.get("output_tokens", 0) or 0),
+                cache_creation_tokens=int(
+                    usage.get("cache_creation_input_tokens", 0) or 0
+                ),
+                cache_read_tokens=int(
+                    usage.get("cache_read_input_tokens", 0) or 0
+                ),
+                source_path=source_path,
+                session_id=session_id,
+                project_path=cwd,
+                cost_usd=entry.cost_usd,
+            ))
 
     return results
 
@@ -1165,13 +882,7 @@ class CodexIngestStats:
     files_processed: int = 0
     files_skipped_unchanged: int = 0
     files_reset_truncated: int = 0
-    # Count of codex_session_entries rows written by this sync. Codex
-    # ingest uses INSERT OR IGNORE — ignored conflicts do NOT bump
-    # SQLite's `total_changes`, so this number is effectively "rows
-    # newly inserted". Field is named ``rows_changed`` for parity with
-    # ``IngestStats`` (Claude path) which carries an UPSERT and
-    # therefore counts both new INSERTs and DO UPDATE replacements.
-    rows_changed: int = 0
+    rows_inserted: int = 0
     lock_contended: bool = False
 
 
@@ -1181,7 +892,7 @@ def _progress_codex_stderr(stats: CodexIngestStats, *, force: bool = False) -> N
         return
     eprint(
         f"[codex-cache] {stats.files_processed}/{stats.files_total} files, "
-        f"{stats.rows_changed} rows changed"
+        f"{stats.rows_inserted} new rows"
     )
 
 
@@ -1386,7 +1097,7 @@ def sync_codex_cache(
                            VALUES (?,?,?,?,?,?,?,?,?,?)""",
                         rows,
                     )
-                    stats.rows_changed += conn.total_changes - before
+                    stats.rows_inserted += conn.total_changes - before
                 conn.execute(
                     """INSERT OR REPLACE INTO codex_session_files
                        (path, size_bytes, mtime_ns, last_byte_offset,
@@ -1568,15 +1279,79 @@ def open_cache_db() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
 
-    # Apply the shared cache.db schema (cctally-dev#93, D4): Claude tables +
-    # indexes, the session_id / project_path column adds on session_files
-    # (A2 `session` metadata, populated lazily in sync_cache() /
-    # _ensure_session_files_row()), the Codex base tables + indexes, and the
-    # cache_meta sentinel table. This is the single cache.db schema source —
-    # the eager-apply path (_eagerly_apply_cache_migrations) uses the SAME
-    # helper, so the two can no longer drift. The Codex last_total_tokens
-    # ALTER + purge stays below (out of the shared helper — D4/P1#3).
-    _cctally_db_sib._apply_cache_schema(conn)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS session_files (
+            path             TEXT PRIMARY KEY,
+            size_bytes       INTEGER NOT NULL,
+            mtime_ns         INTEGER NOT NULL,
+            last_byte_offset INTEGER NOT NULL,
+            last_ingested_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS session_entries (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path         TEXT    NOT NULL,
+            line_offset         INTEGER NOT NULL,
+            timestamp_utc       TEXT    NOT NULL,
+            model               TEXT    NOT NULL,
+            msg_id              TEXT,
+            req_id              TEXT,
+            input_tokens        INTEGER NOT NULL DEFAULT 0,
+            output_tokens       INTEGER NOT NULL DEFAULT 0,
+            cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+            usage_extra_json    TEXT,
+            cost_usd_raw        REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_entries_timestamp
+            ON session_entries(timestamp_utc);
+        CREATE INDEX IF NOT EXISTS idx_entries_source
+            ON session_entries(source_path);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_dedup
+            ON session_entries(msg_id, req_id)
+            WHERE msg_id IS NOT NULL AND req_id IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS codex_session_files (
+            path             TEXT PRIMARY KEY,
+            size_bytes       INTEGER NOT NULL,
+            mtime_ns         INTEGER NOT NULL,
+            last_byte_offset INTEGER NOT NULL,
+            last_ingested_at TEXT NOT NULL,
+            last_session_id  TEXT,
+            last_model       TEXT
+        );
+        CREATE TABLE IF NOT EXISTS codex_session_entries (
+            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path              TEXT    NOT NULL,
+            line_offset              INTEGER NOT NULL,
+            timestamp_utc            TEXT    NOT NULL,
+            session_id               TEXT    NOT NULL,
+            model                    TEXT    NOT NULL,
+            input_tokens             INTEGER NOT NULL DEFAULT 0,
+            cached_input_tokens      INTEGER NOT NULL DEFAULT 0,
+            output_tokens            INTEGER NOT NULL DEFAULT 0,
+            reasoning_output_tokens  INTEGER NOT NULL DEFAULT 0,
+            total_tokens             INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(source_path, line_offset)
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_entries_timestamp
+            ON codex_session_entries(timestamp_utc);
+        CREATE INDEX IF NOT EXISTS idx_codex_entries_session
+            ON codex_session_entries(session_id);
+        CREATE INDEX IF NOT EXISTS idx_codex_entries_source
+            ON codex_session_entries(source_path);
+        """
+    )
+
+    # Inline migration: add session_id / project_path columns to session_files
+    # if they're missing. These were added for A2 `session` subcommand metadata;
+    # populated lazily in sync_cache() / _ensure_session_files_row().
+    add_column_if_missing(conn, "session_files", "session_id", "TEXT")
+    add_column_if_missing(conn, "session_files", "project_path", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
+        "ON session_files(session_id)"
+    )
 
     # Migration: add last_total_tokens to codex_session_files. When the column
     # is newly added (i.e. this is the first run after upgrade), purge the
@@ -1635,7 +1410,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"[cache-sync] claude done: {stats.files_processed} processed, "
                 f"{stats.files_skipped_unchanged} skipped, "
                 f"{stats.files_reset_truncated} reset, "
-                f"{stats.rows_changed} rows changed"
+                f"{stats.rows_inserted} rows inserted"
             )
 
     if source in ("codex", "all"):
@@ -1653,7 +1428,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"[cache-sync] codex done: {stats.files_processed} processed, "
                 f"{stats.files_skipped_unchanged} skipped, "
                 f"{stats.files_reset_truncated} reset, "
-                f"{stats.rows_changed} rows changed"
+                f"{stats.rows_inserted} rows inserted"
             )
 
     return 0

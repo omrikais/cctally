@@ -109,15 +109,35 @@ class TestAliasSurface:
         assert str(nonexistent) in r.stderr, r.stderr
 
     def test_debug_emits_one_time_stderr_note(self, cmd, fake_home):
+        # Issue #89: --debug now emits a Pricing Mismatch Debug Report
+        # (or "No pricing data found to analyze." on empty windows) on
+        # stderr exactly once per process. The fake_home fixture is
+        # empty → the empty-path short form fires.
         r = _run(cmd, *_window_args(cmd), "--debug", "--debug-samples", "3")
         assert "unrecognized arguments" not in r.stderr, r.stderr
-        # When --debug is set, the §7.6.2 note appears on stderr exactly once.
-        note = "--debug diagnostic-sample emission is not yet wired"
-        note_count = r.stderr.count(note)
-        assert note_count == 1, f"expected exactly 1 note, got {note_count}: {r.stderr!r}"
+        # The new report appears (long or short form, depending on data).
+        # For diff, Pattern D emits TWO reports (one per window) — but
+        # only when window resolution succeeds. An empty fake_home has
+        # no subscription-week anchor, so the parser bails before the
+        # debug emission point; cover that case too.
+        header_count = r.stderr.count("=== Pricing Mismatch Debug Report ===")
+        short_count = r.stderr.count("No pricing data found to analyze.")
+        if cmd == "diff":
+            # Either Pattern D emitted two reports, OR the anchor
+            # resolution failed before reaching the emit point. Both
+            # outcomes prove the placeholder is gone.
+            if "no subscription-week anchor available" not in r.stderr:
+                assert header_count + short_count >= 2, r.stderr
+        else:
+            assert header_count + short_count >= 1, r.stderr
+        # The placeholder note from Session A T1.8 is GONE
+        assert "diagnostic-sample emission is not yet wired" not in r.stderr, r.stderr
 
     def test_debug_note_absent_without_flag(self, cmd, fake_home):
+        # Without --debug, neither the new report header NOR the old
+        # placeholder note appears.
         r = _run(cmd, *_window_args(cmd))
+        assert "=== Pricing Mismatch Debug Report ===" not in r.stderr
         assert "diagnostic-sample emission is not yet wired" not in r.stderr
 
     def test_single_thread_noop(self, cmd, fake_home):
@@ -145,26 +165,23 @@ def _load_cctally_module():
     return mod
 
 
-def test_debug_note_emitted_once_per_process(tmp_path, monkeypatch):
-    """Spec §7.6.2 / §9.1: the `_DEBUG_NOTE_EMITTED` guard means two
-    invocations in the SAME Python process produce the note exactly
-    once. Sub-process tests can't observe this; drive via the
-    importable cctally module.
+def test_debug_report_emitted_once_per_process(tmp_path, monkeypatch):
+    """Issue #89 / spec §7.1.3: the `_DEBUG_REPORT_EMITTED` guard means
+    two invocations in the SAME Python process emit the report exactly
+    once. Sub-process tests can't observe this; drive via the importable
+    cctally module.
     """
     mod = _load_cctally_module()
-    # Reset the guard so this test is independent of test ordering.
-    # Use monkeypatch.setattr so the value is restored at teardown,
-    # avoiding cross-test pollution if another test loads the module
-    # later (Review-A P3-4).
-    monkeypatch.setattr(mod, "_DEBUG_NOTE_EMITTED", False)
+    monkeypatch.setattr(mod, "_DEBUG_REPORT_EMITTED", False)
 
     buf = io.StringIO()
-    ns = argparse.Namespace(debug=True)
+    ns = argparse.Namespace(debug=True, debug_samples=5)
     with contextlib.redirect_stderr(buf):
-        mod._emit_debug_note_if_set(ns)
-        mod._emit_debug_note_if_set(ns)  # second call must be a no-op
-    note = "diagnostic-sample emission is not yet wired"
-    assert buf.getvalue().count(note) == 1
+        mod._emit_debug_samples_if_set(ns, [], command_label="daily")
+        mod._emit_debug_samples_if_set(ns, [], command_label="daily")
+    # Empty-path short form should appear exactly once.
+    short = "No pricing data found to analyze."
+    assert buf.getvalue().count(short) == 1, buf.getvalue()
 
 
 def test_five_hour_blocks_invalid_since_prints_one_stderr_line(

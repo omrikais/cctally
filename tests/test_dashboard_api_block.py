@@ -18,6 +18,7 @@ def _make_entry(ns, *, ts: dt.datetime, model: str,
             "cache_read_input_tokens": cache_read,
         },
         cost_usd=None,
+        source_path="synth-test",
     )
 
 

@@ -75,6 +75,7 @@ class TestDailyView:
                     "cache_read_input_tokens": 200,
                 },
                 cost_usd=0.05,
+                source_path="synth-test",
             ),
         ]
         view = vm.build_daily_view(entries, now_utc=_now(), display_tz=None)
@@ -102,6 +103,7 @@ class TestDailyView:
                        "cache_creation_input_tokens": 0,
                        "cache_read_input_tokens": 0},
                 cost_usd=0.01,
+                source_path="synth-test",
             ),
             UsageEntry(
                 timestamp=ts2, model="claude-opus-4-5",
@@ -109,6 +111,7 @@ class TestDailyView:
                        "cache_creation_input_tokens": 0,
                        "cache_read_input_tokens": 0},
                 cost_usd=0.02,
+                source_path="synth-test",
             ),
         ]
         view = vm.build_daily_view(entries, now_utc=_now(), display_tz=None)
@@ -133,6 +136,7 @@ class TestDailyView:
                        "cache_creation_input_tokens": 0,
                        "cache_read_input_tokens": 0},
                 cost_usd=0.01,
+                source_path="synth-test",
             ),
         ]
         view = vm.build_daily_view(entries, now_utc=_now(), display_tz=None)
@@ -163,6 +167,7 @@ class TestMonthlyView:
                        "cache_creation_input_tokens": 0,
                        "cache_read_input_tokens": 0},
                 cost_usd=0.10,
+                source_path="synth-test",
             ),
             UsageEntry(
                 timestamp=dt.datetime(2026, 4, 15, tzinfo=dt.timezone.utc),
@@ -171,6 +176,7 @@ class TestMonthlyView:
                        "cache_creation_input_tokens": 0,
                        "cache_read_input_tokens": 0},
                 cost_usd=0.15,
+                source_path="synth-test",
             ),
         ]
         view = vm.build_monthly_view(entries, now_utc=_now(), display_tz=None)
@@ -195,6 +201,7 @@ class TestMonthlyView:
                        "cache_creation_input_tokens": 0,
                        "cache_read_input_tokens": 0},
                 cost_usd=0.05,
+                source_path="synth-test",
             ),
         ]
         # _now() is 2026-05-17 → current month is 2026-05.
@@ -216,6 +223,7 @@ class TestMonthlyView:
                        "cache_creation_input_tokens": 0,
                        "cache_read_input_tokens": 0},
                 cost_usd=0.1 * mo,
+                source_path="synth-test",
             ))
         view = vm.build_monthly_view(entries, now_utc=_now(), n=2,
                                       display_tz=None)
@@ -315,6 +323,7 @@ class TestWeeklyView:
                        "cache_creation_input_tokens": 0,
                        "cache_read_input_tokens": 0},
                 cost_usd=10.0,
+                source_path="synth-test",
             ),
         ]
         view = vm.build_weekly_view(
@@ -346,6 +355,7 @@ class TestWeeklyView:
                        "cache_creation_input_tokens": 0,
                        "cache_read_input_tokens": 0},
                 cost_usd=1.0,
+                source_path="synth-test",
             ),
         ]
         view = vm.build_weekly_view(
