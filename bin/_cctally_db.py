@@ -922,6 +922,11 @@ _BANNER_SUPPRESSED_COMMANDS = frozenset({
     "doctor",          # consolidates migration + update banner state into its
                        # own report; double-printing the banner would duplicate
                        # findings doctor already surfaces structurally.
+    "blocks",          # stdout-formatted table replacing `ccusage blocks`;
+                       # stderr noise pollutes the visually-aligned report and
+                       # confuses scripted pipelines piping via `2>&1`.
+                       # Banner still lands on the next interactive non-report
+                       # command (`report`, `weekly`, `percent-breakdown`, etc.).
     # Note: `setup` carve-out handled separately (only suppressed w/o --status).
     # Note: `dashboard` carve-out handled separately (banner printed in cmd_dashboard).
 })
@@ -2171,39 +2176,76 @@ def _eagerly_apply_cache_migrations() -> None:
 # === Region 7c: Cache migration 001_dedup_highest_wins (ccusage-parity fix) ===
 
 
-def _001_banner_should_emit(conn: sqlite3.Connection) -> bool:
-    """SW5 — gate cache migration 001's banner on two conditions:
+def _recompute_banner_should_emit(
+    *,
+    data_present: bool,
+) -> bool:
+    """Shared banner-suppression gate for recompute-style migrations
+    (cache 001, stats 008, 009, 010). Combines two conditions:
 
-      (a) session_entries has at least one row to re-ingest. Empty
-          tables make the handler a marker-only no-op; the banner has
-          nothing to announce. Symmetric with migration 008's
-          ``snapshot_rows`` gate.
+      (a) ``data_present`` — caller checked that the migration has
+          actual rows to recompute. Empty-data topologies (most
+          fresh-install upgrades, every golden fixture without seed
+          rows) make the migration body a marker-only no-op; the
+          banner would announce work that isn't happening. Caller
+          owns this check because each migration scopes "data" to a
+          different table (``session_entries`` for 001,
+          ``weekly_cost_snapshots`` for 008, ``five_hour_blocks`` for
+          009, ``percent_milestones`` for 010).
 
-      (b) The active subcommand (``sys.argv[1]``) is NOT in
-          ``_BANNER_SUPPRESSED_COMMANDS``. Hot paths machine-consume
-          stderr (status-line, hook-tick) or take over the screen
-          (tui, dashboard); banner has no safe surface. Interactive
-          commands (``report``, ``weekly``, etc.) still see the banner
-          once on the upgrade.
+      (b) ``sys.argv[1]`` NOT in ``_BANNER_SUPPRESSED_COMMANDS``. Hot
+          paths (``record-usage``, ``hook-tick``, ``sync-week``,
+          ``cache-sync``, ``refresh-usage``) machine-consume stderr;
+          ``tui`` / ``dashboard`` take over the screen; ``db`` and
+          ``doctor`` surface migration state in their own reports;
+          ``blocks`` is a stdout-formatted table whose stderr noise
+          confuses scripted pipelines. Banner still lands on the
+          next interactive non-report command (``report``,
+          ``weekly``, ``percent-breakdown``, etc.) once on upgrade.
 
     Returns True iff the banner should be printed. Defensive: any
-    error reading either signal falls back to "don't print" — silence
+    error reading ``sys.argv`` falls back to "don't print" — silence
     is the safer side under uncertainty (worst case, a heavy user
     misses the one-line announcement; not a correctness regression).
+
+    SW5-extended — replaces the per-migration ad-hoc banner gates
+    that drifted between 001 (which checked argv1 in suppression
+    list) and 008/009/010 (which only checked data-table emptiness).
+    The asymmetry caused ``cctally blocks`` to emit 009's banner
+    even when ``record-usage`` would not — surfaced by
+    ``floor-band-trap`` golden-terminal.txt drift.
     """
+    if not data_present:
+        return False
     try:
         argv1 = sys.argv[1] if len(sys.argv) > 1 else None
     except Exception:
         argv1 = None
     if argv1 in _BANNER_SUPPRESSED_COMMANDS:
         return False
+    return True
+
+
+def _001_banner_should_emit(conn: sqlite3.Connection) -> bool:
+    """SW5 — gate cache migration 001's banner. Thin shim around the
+    shared ``_recompute_banner_should_emit`` helper: probes
+    ``session_entries`` for non-emptiness, then defers to the shared
+    suppression-argv1 check.
+
+    Kept as a named function (rather than inlined at the call site)
+    because cache migration 001's data check requires a defensive
+    ``sqlite3.Error`` swallow — the migration runs early and the
+    table may not yet exist on certain ALTER-mid-upgrade topologies.
+    Stats 008/009/010 don't need this swallow because their gate
+    runs after the schema is fully bootstrapped.
+    """
     try:
         row = conn.execute(
             "SELECT 1 FROM session_entries LIMIT 1"
         ).fetchone()
     except sqlite3.Error:
         return False
-    return row is not None
+    return _recompute_banner_should_emit(data_present=row is not None)
 
 
 @cache_migration("001_dedup_highest_wins")
@@ -2325,82 +2367,25 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
 
     Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3.
     """
-    # Banner is gated on "we actually have rows to recompute". The
-    # all-empty no-op case (most upgrade-time fresh-install topologies,
-    # and most goldens with no snapshot rows) skips the banner so we
-    # don't pollute thousands of test goldens / per-command stderr with
-    # a benign one-line announcement. Heavy users with 52+ snapshots
-    # still see it once.
+    # Banner is gated on "we actually have rows to recompute" via the
+    # shared ``_recompute_banner_should_emit`` helper (composed below).
+    # The all-empty no-op case (most upgrade-time fresh-install
+    # topologies, and most goldens with no snapshot rows) skips the
+    # banner so we don't pollute thousands of test goldens /
+    # per-command stderr with a benign one-line announcement. Heavy
+    # users with 52+ snapshots still see it once.
     #
-    # V4 — eagerly trigger cache.db's dispatcher BEFORE the gate read.
-    # This ensures cache migration 001's marker is in place even on
-    # invocations that would otherwise only open stats.db (e.g.
-    # ``cctally report`` without ``--sync-current``). Without this
-    # the gate would falsely defer 008 on every such invocation and
-    # ``report`` would silently use stale snapshots forever. See the
-    # ``_eagerly_apply_cache_migrations`` docstring above for the full
-    # rationale + lock-ordering argument.
-    #
-    # Wrapped in the same transient-defer translation as the RO gate
-    # connection below: if cache.db can't be opened (disk pressure,
-    # permission denied, truly missing parent dir, transiently
-    # locked by another writer), surface as
-    # ``MigrationGateNotMet`` and let the dispatcher defer cleanly
-    # — symmetric with G4/G5 on the gate's RO connection.
+    # ``_open_cache_ro_with_gate_defer`` (shared with 009/010) eagerly
+    # applies cache.db's dispatcher (V4: ensures cache migration 001's
+    # marker is in place even on stats-only invocations) then opens
+    # cache.db RO with the G4/G5 transient-defer translation baked in.
+    cache_ro = _open_cache_ro_with_gate_defer()
     try:
-        _eagerly_apply_cache_migrations()
-    except sqlite3.OperationalError as exc:
-        if _is_transient_sqlite_error(exc):
-            raise MigrationGateNotMet(
-                "cache.db not yet initialized or transiently locked; "
-                "run any JSONL-reading command (e.g. `cctally weekly`) "
-                "once and retry."
-            ) from None
-        raise
-
-    # G4 fix: open cache.db inside the try so a TOCTOU race
-    # (file unlinked between an ``exists()`` probe and ``sqlite3.connect``,
-    # or never created yet) surfaces as ``SQLITE_CANTOPEN`` and translates
-    # to ``MigrationGateNotMet`` via ``_is_transient_sqlite_error`` —
-    # rather than escaping to the dispatcher's ``except Exception`` and
-    # rendering the migration-error banner for a transient/self-healing
-    # condition. We drop the prior ``exists()`` check entirely; the
-    # ``sqlite3.connect`` call on a non-existent file raises CANTOPEN,
-    # which is the same outcome (a gate defer) without the race window.
-    cache_db_path = _cctally_core.CACHE_DB_PATH
-    try:
-        cache_ro = sqlite3.connect(
-            f"file:{cache_db_path}?mode=ro", uri=True,
-        )
-    except sqlite3.OperationalError as exc:
-        if _is_transient_sqlite_error(exc):
-            raise MigrationGateNotMet(
-                "cache.db not yet initialized or transiently locked; "
-                "run any JSONL-reading command (e.g. `cctally weekly`) "
-                "once and retry."
-            ) from None
-        raise
-    try:
-        # Resolve projects dirs at call time so ``CLAUDE_CONFIG_DIR``
-        # users (whose JSONL lives outside ``~/.claude/projects``) don't
-        # falsely trigger the gate's empty-disk fallback. The resolver
-        # returns ONLY directories that exist on disk (``is_dir()``-
-        # filtered); an empty list means no projects/ dir resolved
-        # successfully under the env-configured roots.
-        projects_dirs = _cctally_core._resolve_claude_projects_dirs()
-
-        # Defensive fallback: when the resolver returned ``[]`` BUT the
-        # documented default ``CLAUDE_PROJECTS_DIR`` exists on disk
-        # (test-time monkeypatch override; or an exotic real-world
-        # topology the resolver doesn't model), feed the gate that path
-        # so Layer C can do its usual scan. The resolver's ``is_dir()``
-        # filter SHOULD already match production's
-        # ``~/.claude/projects``; the fallback exists for the test
-        # surface where ``CLAUDE_PROJECTS_DIR`` is monkeypatched to a
-        # fixture dir that the resolver (which walks ``$HOME``-derived
-        # defaults) won't find.
-        if not projects_dirs and _cctally_core.CLAUDE_PROJECTS_DIR.is_dir():
-            projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
+        # Resolve projects dirs via the shared helper (mirrors 009/010).
+        # Empty list returned only when NO projects/ dir resolves under
+        # any env-configured or default root; G3-style fail-closed
+        # below.
+        projects_dirs = _resolve_projects_dirs_for_gate()
 
         # F3 scope: only rows we have authority over (see docstring).
         snapshot_rows = conn.execute(
@@ -2449,12 +2434,15 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
             projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
         _gate_001_post_ingest_completed(cache_ro, projects_dirs)
 
-        # Banner gated on "we actually have eligible rows to recompute".
-        # Empty-snapshot topologies (most goldens, fresh-install
-        # upgrades that hit this migration before any sync-week) skip
-        # the announcement so test goldens / one-shot CLI invocations
-        # stay quiet. Heavy users (52+ weekly snapshots) still see it.
-        if snapshot_rows:
+        # Banner gated on "we actually have eligible rows to recompute"
+        # AND "active subcommand is not in _BANNER_SUPPRESSED_COMMANDS"
+        # — composed via the shared ``_recompute_banner_should_emit``
+        # helper that 001/008/009/010 all funnel through. Empty-
+        # snapshot topologies (most goldens, fresh-install upgrades)
+        # plus hot/scripted paths (`blocks`, `record-usage`, etc.)
+        # stay quiet. Heavy users invoking interactive non-report
+        # commands (52+ weekly snapshots) still see it once.
+        if _recompute_banner_should_emit(data_present=bool(snapshot_rows)):
             eprint(
                 "[cctally] Recomputing weekly_cost_snapshots from "
                 "corrected session_entries (one-time; may take 30-60s "
@@ -2679,10 +2667,13 @@ def _009_recompute_five_hour_blocks_dedup_fix(
             projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
         _gate_001_post_ingest_completed(cache_ro, projects_dirs)
 
-        # SW5-style banner gating: only print when there's actual work
-        # to do. Empty topologies (most goldens, fresh-install upgrades
-        # before any 5h block has been recorded) skip the announcement.
-        if block_rows:
+        # SW5-style banner gating via the shared
+        # ``_recompute_banner_should_emit`` helper: only print when
+        # block_rows is non-empty AND the active subcommand is not in
+        # ``_BANNER_SUPPRESSED_COMMANDS`` (notably ``blocks``, whose
+        # stdout-formatted table would otherwise get prefixed by a
+        # stderr announcement — surfaced by floor-band-trap fixture).
+        if _recompute_banner_should_emit(data_present=bool(block_rows)):
             eprint(
                 "[cctally] Recomputing closed 5h block totals after "
                 "dedup fix (one-time; may take 30-60s on heavy "
@@ -2942,7 +2933,13 @@ def _010_recompute_percent_milestones_dedup_fix(
             projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
         _gate_001_post_ingest_completed(cache_ro, projects_dirs)
 
-        if milestone_rows:
+        # SW5-style banner gating via the shared
+        # ``_recompute_banner_should_emit`` helper: only print when
+        # milestone_rows is non-empty AND the active subcommand is not
+        # in ``_BANNER_SUPPRESSED_COMMANDS``. Mirrors 008/009.
+        if _recompute_banner_should_emit(
+            data_present=bool(milestone_rows)
+        ):
             eprint(
                 "[cctally] Recomputing percent milestone costs after "
                 "dedup fix (one-time; may take 30-60s on heavy "
