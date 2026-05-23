@@ -438,6 +438,10 @@ def build_per_migration_001_dedup_highest_wins(scenario_dir: Path) -> None:
     Loaded by ``tests/test_migration_001_per_migration_goldens.py``.
     Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I4.
     """
+    # Note: post.sqlite's schema_migrations.applied_at_utc is a wall-clock
+    # now_utc_iso() stamped by the real migration handler, so a rebuild churns
+    # a few bytes there. The per-migration goldens test deliberately does NOT
+    # assert applied_at_utc — this is expected, not a phantom dirty fixture.
     scenario_dir.mkdir(parents=True, exist_ok=True)
     pre = scenario_dir / "pre.sqlite"
     post = scenario_dir / "post.sqlite"
@@ -617,6 +621,10 @@ def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
     Loaded by ``tests/test_migration_008_per_migration_goldens.py``.
     Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3.
     """
+    # Note: post.sqlite's schema_migrations.applied_at_utc is a wall-clock
+    # now_utc_iso() stamped by the real migration handler, so a rebuild churns
+    # a few bytes there. The per-migration goldens test deliberately does NOT
+    # assert applied_at_utc — this is expected, not a phantom dirty fixture.
     scenario_dir.mkdir(parents=True, exist_ok=True)
     pre_stats = scenario_dir / "pre.sqlite"
     pre_cache = scenario_dir / "pre-cache.sqlite"

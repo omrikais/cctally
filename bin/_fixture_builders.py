@@ -117,6 +117,40 @@ def _normalize_all_registered_fixture_dbs() -> None:
 atexit.register(_normalize_all_registered_fixture_dbs)
 
 
+# Deterministic fixed instant for every stamped ``schema_migrations`` row —
+# NOT wall-clock, so regenerating render-only fixtures stays byte-stable. Matches
+# the instant ``create_cache_db`` stamps cache ``001`` with.
+_STATS_MIGRATION_STAMP_AT = "2026-05-22T00:00:00Z"
+
+
+def stamp_all_stats_migrations_applied(conn: sqlite3.Connection) -> None:
+    """Stamp every registered stats migration applied + advance
+    ``user_version`` so the migration dispatcher fast-paths (no body runs).
+
+    Render-only fixtures (share, dashboard) ship as fully-migrated users so a
+    read command's ``sync_cache`` walk can't flip the cctally-dev#93 upgrade-gate
+    to PROCEED and recompute the seeded display tables (``weekly_cost_snapshots`` /
+    ``five_hour_blocks`` / ``percent_milestones``) to ``$0``. Enumerates the live
+    ``_STATS_MIGRATIONS`` registry so a future recompute migration is covered
+    automatically. Uses a fixed deterministic timestamp for byte-stable output.
+
+    The ``_cctally_db`` import is FUNCTION-LEVEL (lazy) so this module stays
+    import-time stdlib-pure and there is no import cycle (``_cctally_db`` does
+    not import ``_fixture_builders``). Callers already put ``bin/`` on
+    ``sys.path`` before invoking the helper.
+    """
+    from _cctally_db import _STATS_MIGRATIONS  # noqa: E402,PLC0415 (intentional lazy)
+    names = [m.name for m in _STATS_MIGRATIONS]
+    conn.executemany(
+        "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
+        "VALUES (?, ?)",
+        [(name, _STATS_MIGRATION_STAMP_AT) for name in names],
+    )
+    # user_version == len(registry) is the dispatcher's all-applied fast-path
+    # sentinel (_cctally_db._run_pending_migrations).
+    conn.execute(f"PRAGMA user_version = {len(names)}")
+
+
 def create_stats_db(path: Path) -> None:
     """Create (overwriting any existing file) a stats.db with the full
     current production schema. Every column that `open_db()` would add
@@ -474,6 +508,25 @@ def create_cache_db(path: Path) -> None:
             VALUES ('001_dedup_highest_wins', '2026-05-22T00:00:00Z');
             PRAGMA user_version = 1;
         """)
+
+
+def _self_test_stamp_all_stats_migrations_applied() -> None:
+    """Verify the shared stamp helper marks every registered stats migration
+    applied and advances user_version to len(registry) (cctally-dev#94)."""
+    import tempfile
+    from _cctally_db import _STATS_MIGRATIONS
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "stats.db"
+        create_stats_db(db)
+        with sqlite3.connect(db) as conn:
+            stamp_all_stats_migrations_applied(conn)
+            conn.commit()
+            applied = {r[0] for r in conn.execute("SELECT name FROM schema_migrations")}
+            uv = conn.execute("PRAGMA user_version").fetchone()[0]
+        expected = {m.name for m in _STATS_MIGRATIONS}
+        assert applied == expected, f"stamp helper missing: {expected - applied}"
+        assert uv == len(_STATS_MIGRATIONS), f"user_version not advanced: {uv}"
+    print("OK: stamp_all_stats_migrations_applied")
 
 
 def _self_test_create_cache_db() -> None:
@@ -1043,6 +1096,7 @@ def _self_test_emit_streaming_pair() -> None:
 
 if __name__ == "__main__":
     _self_test_create_stats_db()
+    _self_test_stamp_all_stats_migrations_applied()
     _self_test_create_cache_db()
     _self_test_claude_seeders()
     _self_test_weekly_usage_seeder()

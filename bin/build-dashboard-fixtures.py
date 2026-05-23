@@ -30,6 +30,17 @@ Each scenario writes ``input.env`` containing a single line
 ``CCTALLY_AS_OF``.
 
 Run: ``bin/build-dashboard-fixtures.py`` (idempotent; overwrites).
+
+Migration posture (cctally-dev#94): every scenario's stats.db ships as a
+fully-migrated user — `stamp_all_stats_migrations_applied` marks every
+registered stats migration applied + sets `PRAGMA user_version = len(registry)`
+so the dispatcher fast-paths and no dedup-recompute body (008/009/010) can
+overwrite the seeded display tables on a dashboard read. This mirrors
+`bin/build-share-fixtures.py` and replaces the prior fragile reliance on the
+#93 upgrade-gate happening to DEFER on the `--no-sync` dashboard path (a future
+dashboard change that wrote the cache_meta walk-complete marker would otherwise
+flip the gate to PROCEED and recompute the seeded tables to $0). `_stamp_and_verify`
+asserts the stamped state per scenario.
 """
 from __future__ import annotations
 
@@ -48,9 +59,32 @@ from _fixture_builders import (  # noqa: E402
     seed_session_entry,
     seed_session_file,
     seed_week_reset_event,
+    stamp_all_stats_migrations_applied,
 )
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests/fixtures/dashboard"
+
+
+def _stamp_and_verify(stats_conn: sqlite3.Connection) -> None:
+    """Stamp the dashboard stats.db as a fully-migrated user (cctally-dev#94)
+    and assert it — see the module docstring 'Migration posture' section.
+
+    Replaces the prior load-bearing-but-undocumented invariant ("the #93
+    upgrade-gate happens to DEFER on the --no-sync dashboard path") with an
+    explicit, checked one: every registered stats migration is stamped applied
+    so the dispatcher fast-paths and no dedup-recompute body (008/009/010) can
+    overwrite the seeded display tables, regardless of whether a future
+    dashboard change writes the cache_meta walk-complete marker.
+    """
+    from _cctally_db import _STATS_MIGRATIONS
+    stamp_all_stats_migrations_applied(stats_conn)
+    applied = {r[0] for r in stats_conn.execute(
+        "SELECT name FROM schema_migrations")}
+    expected = {m.name for m in _STATS_MIGRATIONS}
+    assert applied >= expected, f"stamp incomplete: missing {expected - applied}"
+    uv = stats_conn.execute("PRAGMA user_version").fetchone()[0]
+    assert uv == len(_STATS_MIGRATIONS), (
+        f"user_version={uv} != len(registry)={len(_STATS_MIGRATIONS)}")
 
 
 def _iso(d: dt.datetime) -> str:
@@ -468,6 +502,7 @@ def build_ok(as_of: dt.datetime) -> None:
             first_crossed_at=week_start + dt.timedelta(hours=6),
             per_percent_spacing=dt.timedelta(minutes=99),  # (66h span)/(40 crossings) ≈ 99min
         )
+        _stamp_and_verify(stats_conn)
         stats_conn.commit()
         cache_conn.commit()
     finally:
@@ -580,6 +615,7 @@ def build_warn(as_of: dt.datetime) -> None:
             first_crossed_at=week_start + dt.timedelta(hours=6),
             per_percent_spacing=dt.timedelta(minutes=107),
         )
+        _stamp_and_verify(stats_conn)
         stats_conn.commit()
         cache_conn.commit()
     finally:
@@ -693,6 +729,7 @@ def build_over(as_of: dt.datetime) -> None:
             first_crossed_at=week_start + dt.timedelta(hours=6),
             per_percent_spacing=dt.timedelta(minutes=72),
         )
+        _stamp_and_verify(stats_conn)
         stats_conn.commit()
         cache_conn.commit()
     finally:
@@ -863,6 +900,7 @@ def build_reset_week(as_of: dt.datetime) -> None:
             line_offset_start=next_off,
         )
 
+        _stamp_and_verify(stats_conn)
         stats_conn.commit()
         cache_conn.commit()
     finally:
@@ -876,12 +914,24 @@ def build_reset_week(as_of: dt.datetime) -> None:
 
 
 def build_no_data(as_of: dt.datetime) -> None:
-    """Empty DBs. All panels serialize as None; sessions.total == 0."""
+    """Empty DBs. All panels serialize as None; sessions.total == 0.
+
+    Still stamped fully-migrated (cctally-dev#94) so the committed fixture is
+    unambiguous. (Empty fixtures already reach applied=len(registry) at open
+    because the gate has no historical rows to protect, but stamping makes the
+    posture explicit and identical to the data-rich scenarios.)
+    """
     scenario_dir, app_dir = _scenario_dirs("no-data")
     stats_path = app_dir / "stats.db"
     cache_path = app_dir / "cache.db"
     create_stats_db(stats_path)
     create_cache_db(cache_path)
+    conn = sqlite3.connect(stats_path)
+    try:
+        _stamp_and_verify(conn)
+        conn.commit()
+    finally:
+        conn.close()
     (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
 
 
@@ -970,6 +1020,7 @@ def build_tz_override(as_of: dt.datetime) -> None:
             model="claude-sonnet-4-6",
             entries=[(entry_at, 100_000, 12_000, 0, 0)],
         )
+        _stamp_and_verify(stats_conn)
         stats_conn.commit()
         cache_conn.commit()
     finally:
@@ -1008,6 +1059,12 @@ def build_utc_tz(as_of: dt.datetime) -> None:
     config_path.write_text(
         json.dumps({"display": {"tz": "utc"}}, indent=2) + "\n"
     )
+    conn = sqlite3.connect(stats_path)
+    try:
+        _stamp_and_verify(conn)
+        conn.commit()
+    finally:
+        conn.close()
     (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
 
 

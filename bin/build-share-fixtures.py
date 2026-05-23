@@ -52,19 +52,14 @@ import sys
 # Make _fixture_builders importable when run directly (bin/ is not on sys.path).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from _cctally_db import _STATS_MIGRATIONS  # noqa: E402
 from _fixture_builders import (  # noqa: E402
     create_cache_db,
     create_stats_db,
     seed_session_entry,
     seed_session_file,
     seed_weekly_usage_snapshot,
+    stamp_all_stats_migrations_applied,
 )
-
-# Deterministic fixed instant for every stamped `schema_migrations` row —
-# NOT wall-clock, so regenerating the fixtures stays byte-stable. Matches
-# the style of the 001 stamp in `_fixture_builders.create_cache_db`.
-_STATS_MIGRATION_STAMP_AT = "2026-05-22T00:00:00Z"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "share"
@@ -167,26 +162,6 @@ SESSION_FILES: tuple[tuple[str, str | None, str | None], ...] = (
 )
 
 
-def _stamp_stats_migrations_applied(conn: sqlite3.Connection) -> None:
-    """Stamp every registered stats migration applied + advance
-    ``user_version`` so the dispatcher fast-paths (no recompute).
-
-    Enumerates the real registered ``_STATS_MIGRATIONS`` names so a future
-    recompute migration is covered automatically and can't silently start
-    overwriting share display fixtures on read (cctally-dev#93). Uses a
-    fixed deterministic timestamp for byte-stable output.
-    """
-    names = [m.name for m in _STATS_MIGRATIONS]
-    conn.executemany(
-        "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
-        "VALUES (?, ?)",
-        [(name, _STATS_MIGRATION_STAMP_AT) for name in names],
-    )
-    # user_version == len(registry) is the dispatcher's all-applied
-    # fast-path sentinel (_cctally_db._run_pending_migrations).
-    conn.execute(f"PRAGMA user_version = {len(names)}")
-
-
 def _seed_stats_db(
     path: pathlib.Path, *, empty: bool = False, seed_credit: bool = False,
 ) -> None:
@@ -214,11 +189,11 @@ def _seed_stats_db(
         # Even the empty fixture is a fully-migrated user: stamp the
         # migrations so the dispatcher fast-paths (no recompute attempt).
         with sqlite3.connect(path) as conn:
-            _stamp_stats_migrations_applied(conn)
+            stamp_all_stats_migrations_applied(conn)
             conn.commit()
         return
     with sqlite3.connect(path) as conn:
-        _stamp_stats_migrations_applied(conn)
+        stamp_all_stats_migrations_applied(conn)
         for ws, used_pct, cost in WEEKS:
             # Compute week_end_date 7 days later — required NOT NULL on both tables.
             from datetime import date, timedelta
