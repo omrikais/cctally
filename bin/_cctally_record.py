@@ -2350,7 +2350,7 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
             cache_conn = open_cache_db()
             try:
                 stats = sync_cache(cache_conn)
-                ingested = int(stats.rows_inserted)
+                ingested = int(stats.rows_changed)
             finally:
                 try:
                     cache_conn.close()

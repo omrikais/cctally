@@ -305,7 +305,16 @@ class IngestStats:
     files_processed: int = 0
     files_skipped_unchanged: int = 0
     files_reset_truncated: int = 0
-    rows_inserted: int = 0
+    # Count of session_entries rows written by this sync — both genuinely-
+    # new INSERTs and ccusage-parity ON CONFLICT DO UPDATE replacements
+    # (the dedup tiebreaker swaps a streaming-intermediate row for the
+    # post-stream finalization). SQLite's `total_changes` counter
+    # increments on both, so this field is "rows changed", not "rows
+    # newly inserted". Pre-dedup builds used INSERT OR IGNORE where
+    # conflicts did NOT bump the counter; the name change preserves the
+    # observability metric without misrepresenting UPSERT updates as
+    # new inserts.
+    rows_changed: int = 0
     lock_contended: bool = False
 
 
@@ -315,7 +324,7 @@ def _progress_stderr(stats: IngestStats, *, force: bool = False) -> None:
         return
     eprint(
         f"[cache-sync] {stats.files_processed}/{stats.files_total} files, "
-        f"{stats.rows_inserted} new rows"
+        f"{stats.rows_changed} rows changed"
     )
 
 
@@ -465,6 +474,52 @@ def sync_cache(
             )
         }
 
+        # Pre-scan for any truncation among tracked files. Under the
+        # ccusage-parity ON CONFLICT DO UPDATE, source_path is PINNED to
+        # whichever file first inserted a (msg_id, req_id) row (see U1
+        # in this file). Later UPSERTs from a DIFFERENT file may have
+        # updated the token columns on that row while leaving source_path
+        # pointing at the original (now possibly truncated) file. A
+        # naive per-file truncation path then deletes by source_path and
+        # loses data the other file is still carrying — but that other
+        # file's `size_bytes` is unchanged, so the per-file early-exit
+        # at `if size == prev_size: continue` skips its re-ingest.
+        #
+        # Escalation: when any file's size has shrunk, drop the entire
+        # session_entries cache and force every file to re-ingest from
+        # offset 0. The cache is fully re-derivable, this is rare (only
+        # on JSONL rotation / manual edits), and it sidesteps the
+        # per-key contributing-file bookkeeping that would otherwise be
+        # required. The lock is already held, so this is atomic with
+        # the subsequent per-file ingest.
+        truncated_paths: set[str] = set()
+        for jp in paths:
+            prev = existing.get(str(jp))
+            if prev is None:
+                continue
+            try:
+                st = jp.stat()
+            except OSError:
+                continue
+            if st.st_size < prev[0]:
+                truncated_paths.add(str(jp))
+
+        if truncated_paths:
+            eprint(
+                f"[cache-sync] truncation detected on {len(truncated_paths)} "
+                f"file(s) — re-ingesting all files (safe under ccusage-parity "
+                f"dedup)"
+            )
+            conn.execute("DELETE FROM session_entries")
+            conn.commit()
+            stats.files_reset_truncated += len(truncated_paths)
+            # Force every file to re-ingest from offset 0: clearing the
+            # `existing` map makes `prev is None` true downstream, so the
+            # per-file branch takes the fresh-ingest path (start_offset=0,
+            # truncated=False since we already wiped the table above —
+            # avoids a redundant per-file DELETE that would be a no-op).
+            existing = {}
+
         for jp in paths:
             path_str = str(jp)
             # Backfill session_id/project_path for A2 `session` subcommand.
@@ -561,6 +616,21 @@ def sync_cache(
                     # that predicate verbatim — bare `ON CONFLICT(msg_id,
                     # req_id)` raises OperationalError. NULL-keyed rows fall
                     # through to a plain INSERT, unchanged.
+                    #
+                    # `source_path` is INTENTIONALLY OMITTED from the DO
+                    # UPDATE SET clause: it stays pinned to whichever JSONL
+                    # FIRST INSERTed the (msg_id, req_id) row. The
+                    # downstream `LEFT JOIN session_files ON sf.path =
+                    # se.source_path` uses source_path to attribute tokens
+                    # to a `project_path`. If a later UPSERT from a
+                    # different file flipped source_path, the row's
+                    # project attribution would move with the winner —
+                    # `cctally project` would mis-aggregate. Sticky
+                    # source_path matches pre-dedup INSERT OR IGNORE
+                    # behavior and the operator's mental model.
+                    # (`line_offset` is similarly sticky for the same
+                    # reason — the offset only makes sense within the
+                    # file that originally wrote the row.)
                     conn.executemany(
                         """INSERT INTO session_entries
                            (source_path, line_offset, timestamp_utc, model,
@@ -571,8 +641,6 @@ def sync_cache(
                            ON CONFLICT(msg_id, req_id)
                            WHERE msg_id IS NOT NULL AND req_id IS NOT NULL
                            DO UPDATE SET
-                               source_path = excluded.source_path,
-                               line_offset = excluded.line_offset,
                                timestamp_utc = excluded.timestamp_utc,
                                model = excluded.model,
                                input_tokens = excluded.input_tokens,
@@ -598,7 +666,7 @@ def sync_cache(
                             )""",
                         rows,
                     )
-                    stats.rows_inserted += conn.total_changes - before
+                    stats.rows_changed += conn.total_changes - before
                 # UPSERT preserves session_id / project_path columns populated
                 # by _ensure_session_files_row at the top of this loop. A plain
                 # INSERT OR REPLACE would wipe them on every changed-file sync.
@@ -967,7 +1035,13 @@ class CodexIngestStats:
     files_processed: int = 0
     files_skipped_unchanged: int = 0
     files_reset_truncated: int = 0
-    rows_inserted: int = 0
+    # Count of codex_session_entries rows written by this sync. Codex
+    # ingest uses INSERT OR IGNORE — ignored conflicts do NOT bump
+    # SQLite's `total_changes`, so this number is effectively "rows
+    # newly inserted". Field is named ``rows_changed`` for parity with
+    # ``IngestStats`` (Claude path) which carries an UPSERT and
+    # therefore counts both new INSERTs and DO UPDATE replacements.
+    rows_changed: int = 0
     lock_contended: bool = False
 
 
@@ -977,7 +1051,7 @@ def _progress_codex_stderr(stats: CodexIngestStats, *, force: bool = False) -> N
         return
     eprint(
         f"[codex-cache] {stats.files_processed}/{stats.files_total} files, "
-        f"{stats.rows_inserted} new rows"
+        f"{stats.rows_changed} rows changed"
     )
 
 
@@ -1182,7 +1256,7 @@ def sync_codex_cache(
                            VALUES (?,?,?,?,?,?,?,?,?,?)""",
                         rows,
                     )
-                    stats.rows_inserted += conn.total_changes - before
+                    stats.rows_changed += conn.total_changes - before
                 conn.execute(
                     """INSERT OR REPLACE INTO codex_session_files
                        (path, size_bytes, mtime_ns, last_byte_offset,
@@ -1495,7 +1569,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"[cache-sync] claude done: {stats.files_processed} processed, "
                 f"{stats.files_skipped_unchanged} skipped, "
                 f"{stats.files_reset_truncated} reset, "
-                f"{stats.rows_inserted} rows inserted"
+                f"{stats.rows_changed} rows changed"
             )
 
     if source in ("codex", "all"):
@@ -1513,7 +1587,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"[cache-sync] codex done: {stats.files_processed} processed, "
                 f"{stats.files_skipped_unchanged} skipped, "
                 f"{stats.files_reset_truncated} reset, "
-                f"{stats.rows_inserted} rows inserted"
+                f"{stats.rows_changed} rows changed"
             )
 
     return 0

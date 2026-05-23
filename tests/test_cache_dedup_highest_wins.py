@@ -63,8 +63,11 @@ def cache_db(tmp_path):
     conn.close()
 
 
-# The SQL we're about to ship — keep it as a fixture-level constant so the
-# tests read like production. Production INSERT will be byte-identical.
+# Production UPSERT — must be byte-identical to bin/_cctally_cache.py's
+# `INSERT INTO session_entries ... ON CONFLICT(msg_id, req_id) DO UPDATE SET`
+# clause. `source_path` and `line_offset` are intentionally OMITTED from the
+# DO UPDATE SET so they stay pinned to whichever file first inserted the row
+# (project-attribution sticky; see U1 in _cctally_cache.py).
 UPSERT_SQL = """
 INSERT INTO session_entries (
     source_path, line_offset, timestamp_utc, model,
@@ -75,8 +78,6 @@ INSERT INTO session_entries (
 ON CONFLICT(msg_id, req_id)
 WHERE msg_id IS NOT NULL AND req_id IS NOT NULL
 DO UPDATE SET
-    source_path = excluded.source_path,
-    line_offset = excluded.line_offset,
     timestamp_utc = excluded.timestamp_utc,
     model = excluded.model,
     input_tokens = excluded.input_tokens,

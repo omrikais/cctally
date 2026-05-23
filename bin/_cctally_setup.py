@@ -1716,13 +1716,19 @@ def _setup_install(args: argparse.Namespace) -> int:
         cache_conn = c.open_cache_db()
         try:
             stats = c.sync_cache(cache_conn)
-            rows = int(stats.rows_inserted)
+            rows = int(stats.rows_changed)
         finally:
             try:
                 cache_conn.close()
             except Exception:
                 pass
         bootstrap_rows = rows
+        # `rows` counts both genuine INSERTs and ccusage-parity DO UPDATE
+        # replacements (see IngestStats.rows_changed). On the bootstrap
+        # path the cache is typically empty so every changed row is
+        # genuinely new; user-facing wording stays "new entries" because
+        # for the dominant case (first install) it's accurate, and on a
+        # re-install path the count is usually 0 anyway.
         out.append(f"✓ Synced session cache ({rows} new entries)")
     except Exception as exc:
         out.append(f"⚠ sync_cache during bootstrap failed: {exc}")
