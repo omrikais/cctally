@@ -609,23 +609,17 @@ def _run_pending_migrations(
             "cache.db": ("session_entries",),
         }.get(db_label, ())
         for probe_table in probe_tables:
-            try:
-                data_row = conn.execute(
-                    f"SELECT 1 FROM {probe_table} LIMIT 1"
-                ).fetchone()
-                if data_row is not None:
-                    # Data exists from a pre-framework write path; the
-                    # DB is NOT a fresh install. Run every handler
-                    # normally so the upgrading user gets the fix.
-                    fresh_install = False
-                    break
-            except sqlite3.OperationalError as exc:
-                # Probe table doesn't exist yet (genuine pre-CREATE
-                # fresh install) — this table contributes no signal;
-                # keep checking the rest. Anything else (corrupt DB, IO
-                # error) propagates.
-                if not _is_no_such_table_error(exc):
-                    raise
+            # _probe_table_nonempty centralizes the "is there data here?"
+            # probe (cctally-dev#93): a present-and-non-empty table means
+            # data exists from a pre-framework write path, so the DB is
+            # NOT a fresh install — run every handler normally so the
+            # upgrading user gets the fix. A missing table contributes no
+            # signal (genuine pre-CREATE fresh install); keep checking the
+            # rest. Transient BUSY/LOCKED and any other OperationalError
+            # propagate (corrupt DB / IO error).
+            if _probe_table_nonempty(conn, probe_table):
+                fresh_install = False
+                break
 
     now_iso = now_utc_iso()
     for m in registry:
@@ -2073,6 +2067,21 @@ def _is_no_such_table_error(exc: sqlite3.OperationalError) -> bool:
         "no such table" in str(exc).lower()
         and getattr(exc, "sqlite_errorcode", None) in (None, 1)
     )
+
+
+def _probe_table_nonempty(conn: sqlite3.Connection, table: str) -> bool:
+    """True iff ``table`` exists and has at least one row. Missing table -> False.
+
+    Single source for the 'is there data here?' probe shared by the dispatcher
+    fresh-install fast-path and the gate shell's cache_has_entries input
+    (cctally-dev#93). Transient BUSY/LOCKED propagates to the caller.
+    """
+    try:
+        return conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+    except sqlite3.OperationalError as exc:
+        if _is_no_such_table_error(exc):
+            return False
+        raise
 
 
 def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
