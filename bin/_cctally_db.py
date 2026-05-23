@@ -542,6 +542,18 @@ def _run_pending_migrations(
             # do NOT mark as skipped, do NOT render the error banner. The
             # migration stays pending; the next open re-tries it. Spec
             # docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §D4.
+            #
+            # P2 — defensive log-entry clear, symmetric with the success
+            # branch above. A prior run may have logged a hard failure
+            # for this migration; if the underlying state has since
+            # shifted such that the migration now gate-defers (e.g. a
+            # prereq vanished mid-cycle, or the handler was rewritten to
+            # gate where it previously raised), the stale error log
+            # entry would persist forever and the banner would mislead.
+            # Clearing here keeps the contract crisp: any non-failure
+            # outcome (apply OR gate-defer) clears any prior failure log
+            # for this migration's qualified name.
+            _clear_migration_error_log_entries(qualified_name)
             if os.environ.get("CCTALLY_DEBUG"):
                 eprint(
                     f"[migration {qualified_name}] deferred: {gate_exc}"

@@ -485,6 +485,97 @@ def test_dispatcher_treats_gate_as_transient(db_module, tmp_path, monkeypatch):
         conn.close()
 
 
+def test_dispatcher_gate_defer_clears_stale_error_log(
+    db_module, tmp_path, monkeypatch,
+):
+    """P2 — When a migration that previously failed (and left a row in
+    migration-errors.log) later transitions to gate-deferred (because
+    its prereq has shifted state — e.g. operator removed a dependency
+    that no longer exists, or the handler was rewritten to gate-defer
+    where it previously raised), the dispatcher must clear the stale
+    log entry on the gate-defer branch, symmetric with the success
+    branch's existing ``_clear_migration_error_log_entries`` call.
+
+    Without this, the migration-errors banner would render forever
+    against a name whose underlying state is now "transiently gated,"
+    not "broken." The contract is uniform: any non-failure outcome
+    (apply OR gate-defer) clears any prior failure log for the
+    qualified name.
+    """
+    import _cctally_core
+    log_path = tmp_path / "migration-errors.log"
+    monkeypatch.setattr(_cctally_core, "MIGRATION_ERROR_LOG_PATH", log_path)
+    monkeypatch.setattr(_cctally_core, "LOG_DIR", tmp_path)
+
+    test_seq = len(db_module._STATS_MIGRATIONS) + 1
+    test_name = f"{test_seq:03d}_gate_defer_clears_log_test"
+    qualified_name = f"stats.db:{test_name}"
+
+    @db_module.stats_migration(test_name)
+    def _always_gates(conn):
+        raise db_module.MigrationGateNotMet(
+            "prereq unsatisfied (test fixture)"
+        )
+
+    try:
+        # Seed a stale error-log entry for this migration's qualified
+        # name. The dispatcher should clear it on the gate-defer path.
+        db_module._log_migration_error(
+            name=qualified_name,
+            exc=RuntimeError("prior failure (stale)"),
+            tb="Traceback (most recent call last):\n  ...\n"
+               "RuntimeError: prior failure (stale)\n",
+        )
+        assert log_path.exists(), "fixture setup: log entry should exist"
+        assert qualified_name in log_path.read_text(), (
+            "fixture setup: log should contain the qualified name"
+        )
+
+        db_path = tmp_path / "stats.db"
+        conn = _open_fresh_stats_db(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at_utc TEXT NOT NULL
+            );
+            """
+        )
+        for m in db_module._STATS_MIGRATIONS:
+            if m.name == test_name:
+                continue
+            conn.execute(
+                "INSERT INTO schema_migrations (name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (m.name, "2026-05-22T00:00:00Z"),
+            )
+        conn.commit()
+
+        # Dispatcher walk — test migration gate-defers; stale log entry
+        # for its qualified name must be cleared.
+        db_module._run_pending_migrations(
+            conn,
+            registry=db_module._STATS_MIGRATIONS,
+            db_label="stats.db",
+        )
+
+        # Either the log file is gone (it was the only entry) or the
+        # qualified-name entry no longer appears in it. Both are
+        # correct outcomes per _clear_migration_error_log_entries'
+        # contract.
+        if log_path.exists():
+            remaining = log_path.read_text()
+            assert qualified_name not in remaining, (
+                "gate-defer branch must clear the stale log entry for "
+                f"{qualified_name}; got: {remaining!r}"
+            )
+        # No file at all is also acceptable (and the expected outcome
+        # when the seeded entry was the only one).
+    finally:
+        db_module._STATS_MIGRATIONS.pop()
+        conn.close()
+
+
 def test_dispatcher_normal_exception_still_logs(db_module, tmp_path, monkeypatch):
     """Belt-and-suspenders: a non-``MigrationGateNotMet`` exception in a
     migration handler must STILL write to ``migration-errors.log`` (the
