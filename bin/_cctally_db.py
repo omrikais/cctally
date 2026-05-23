@@ -1909,7 +1909,8 @@ def _gate_001_post_ingest_completed(
         raise MigrationGateNotMet(
             "cache.db migration 001_dedup_highest_wins not yet applied; "
             "run any JSONL-reading command (e.g. `cctally weekly`) once, "
-            "or `cctally db skip 001_dedup_highest_wins` to defer."
+            "or `cctally db skip 001_dedup_highest_wins` to defer "
+            "(`cctally db unskip 001_dedup_highest_wins` reverts)."
         )
     applied_at_utc = gate_row[0]
 

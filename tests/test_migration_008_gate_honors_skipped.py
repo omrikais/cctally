@@ -138,12 +138,15 @@ def test_gate_still_defers_when_001_neither_applied_nor_skipped(
 
 
 def test_gate_hint_mentions_db_skip(db_module, tmp_path):
-    """The defer message points at the documented escape hatch.
+    """The defer message points at the documented escape hatch in both
+    directions.
 
     Operators hitting an infinite-defer situation need to know
     ``db skip`` is the way out — the gate's docstring describes the
     Layer A predicate but the actual MigrationGateNotMet message is
     what surfaces to humans via the dispatcher's CCTALLY_DEBUG eprint.
+    The symmetric ``db unskip`` revert path is mentioned alongside so
+    operators don't treat skip as a one-way door.
     """
     cache = sqlite3.connect(":memory:")
     _seed_cache_schema(cache)
@@ -155,7 +158,12 @@ def test_gate_hint_mentions_db_skip(db_module, tmp_path):
         db_module._gate_001_post_ingest_completed(cache, projects)
         pytest.fail("expected MigrationGateNotMet")
     except db_module.MigrationGateNotMet as exc:
-        assert "db skip" in str(exc), (
+        msg = str(exc)
+        assert "db skip" in msg, (
             "defer hint should mention `db skip` so operators know the "
-            f"escape hatch; got: {exc!s}"
+            f"escape hatch; got: {msg!s}"
+        )
+        assert "db unskip" in msg, (
+            "defer hint should also mention `db unskip` so operators "
+            f"know the revert path; got: {msg!s}"
         )

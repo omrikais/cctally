@@ -8,7 +8,7 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 9 known
   ✓ 006_five_hour_milestones_reset_event_id        applied <REDACTED>
   ✓ 007_observed_pre_credit_pct                    applied <REDACTED>
   · 008_recompute_weekly_cost_snapshots_dedup_fix  pending
-  · 009_test_failure_injection                     pending
+  ✓ 009_test_failure_injection                     applied <REDACTED>
 
 cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 2 known
   · 001_dedup_highest_wins                         pending
@@ -28,6 +28,7 @@ stats.db:
     005_percent_milestones_reset_event_id
     006_five_hour_milestones_reset_event_id
     007_observed_pre_credit_pct
+    009_test_failure_injection
   schema_migrations_skipped:
 cache.db:
   user_version: 0

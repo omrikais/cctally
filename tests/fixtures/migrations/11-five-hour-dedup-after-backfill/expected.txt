@@ -11,6 +11,7 @@ stats.db:
     005_percent_milestones_reset_event_id
     006_five_hour_milestones_reset_event_id
     007_observed_pre_credit_pct
+    009_test_failure_injection
   schema_migrations_skipped:
 ## log
 <no migration-errors.log>
