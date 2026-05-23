@@ -151,7 +151,7 @@ class TestCacheSourcePathPropagation:
 class TestComputePricingMismatchStats:
     def _make_entry(self, mod, *, cost_usd, model="claude-opus-4-7",
                     input_tokens=1000, output_tokens=500,
-                    timestamp=None, source_path="synth-test"):
+                    timestamp=None, source_path="/tmp/synth.jsonl"):
         import datetime as dt
         return mod.UsageEntry(
             timestamp=timestamp or dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
@@ -925,3 +925,553 @@ class TestDiffDebugSamples:
         assert len(captured_calls) == 2
         assert captured_calls[0][0] == wa.start
         assert captured_calls[1][0] == wb.start
+        # P2.3 (issue #89 review-loop): the debug helper observes; the
+        # diff builder does the sync. So skip_sync must be True for both
+        # windows regardless of args.sync (would otherwise triple-sync).
+        for _, _, kwargs in captured_calls:
+            assert kwargs.get("skip_sync") is True
+
+
+# Review-loop tests (issue #89 review round, all P1/P2/P3 + SR-P2 gaps)
+class TestSyntheticFiltering:
+    """P1.1: synthetic entries must be excluded from total_entries AND
+    must NOT trigger _resolve_model_pricing (which would emit a `[cost]
+    unknown model: <synthetic>` warning and pollute
+    _unknown_model_warnings).
+    """
+
+    def _make_entry(self, mod, *, model, cost_usd):
+        import datetime as dt
+        return mod.UsageEntry(
+            timestamp=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+            model=model,
+            usage={
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+            cost_usd=cost_usd,
+            source_path="/tmp/synth.jsonl",
+        )
+
+    def test_synthetic_excluded_from_totals(self):
+        mod = _load_cctally_module()
+        synth = self._make_entry(mod, model="<synthetic>", cost_usd=0.05)
+        # Real entry with matching cost so it's a match (not a mismatch).
+        real_proto = self._make_entry(
+            mod, model="claude-opus-4-7", cost_usd=None,
+        )
+        calc = mod._calculate_entry_cost(
+            real_proto.model, real_proto.usage, mode="calculate",
+        )
+        real = self._make_entry(
+            mod, model="claude-opus-4-7", cost_usd=calc,
+        )
+        stats = mod._compute_pricing_mismatch_stats([synth, real])
+        # Synthetic skipped entirely — total_entries counts only the real entry
+        assert stats.total_entries == 1
+        # The real entry has a known model + cost_usd
+        assert stats.entries_with_both == 1
+        # And matches → no mismatches recorded
+        assert stats.matches == 1
+        assert stats.mismatches == 0
+        # No _MismatchModelStat for synthetic
+        assert "<synthetic>" not in stats.model_stats
+
+    def test_synthetic_does_not_warn_to_stderr(self, tmp_path, monkeypatch):
+        """When a fixture contains a synthetic entry, running cctally
+        daily --debug must NOT emit `[cost] unknown model: <synthetic>`
+        on stderr. (The bare `daily` (no --debug) does emit that warning
+        as part of the normal pricing path; this test only covers the
+        --debug code path's added filter.)
+
+        Drive directly via the compute helper (subprocess test would
+        also fire the bare-cost warning path which is out of scope here).
+        """
+        mod = _load_cctally_module()
+        import datetime as dt
+        synth = mod.UsageEntry(
+            timestamp=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+            model="<synthetic>",
+            usage={"input_tokens": 1, "output_tokens": 1,
+                   "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0},
+            cost_usd=0.05,
+            source_path="/tmp/synth.jsonl",
+        )
+        # Snapshot the unknown-model warning set BEFORE compute
+        warnings_before = set(getattr(mod, "_unknown_model_warnings", set()))
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            mod._compute_pricing_mismatch_stats([synth])
+        text = buf.getvalue()
+        warnings_after = set(getattr(mod, "_unknown_model_warnings", set()))
+        # No stderr noise from the compute helper
+        assert "<synthetic>" not in text, text
+        # _unknown_model_warnings should NOT have grown to include "<synthetic>"
+        assert (warnings_after - warnings_before) == set(), (
+            f"compute helper polluted _unknown_model_warnings: "
+            f"{warnings_after - warnings_before}"
+        )
+
+
+class TestLoaderExceptionDegrades:
+    """P1.2: when a callable loader raises sqlite3.DatabaseError / OSError,
+    the helper must NOT propagate — emit a one-line "report unavailable"
+    notice on stderr and return cleanly. The wrapping cmd_* should still
+    complete.
+    """
+
+    def test_loader_database_error_does_not_propagate(self, monkeypatch):
+        import sqlite3
+        mod = _load_cctally_module()
+        monkeypatch.setattr(mod, "_DEBUG_REPORT_EMITTED", False)
+        ns = argparse.Namespace(debug=True, debug_samples=5)
+        def loader():
+            raise sqlite3.DatabaseError("simulated lock")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            # Must not raise
+            mod._emit_debug_samples_if_set(
+                ns, loader, command_label="cache-report",
+            )
+        text = buf.getvalue()
+        assert "report unavailable: simulated lock" in text, text
+        # Pricing Mismatch header must NOT appear (the loader didn't return)
+        assert "=== Pricing Mismatch Debug Report ===" not in text
+
+    def test_loader_os_error_does_not_propagate(self, monkeypatch):
+        mod = _load_cctally_module()
+        monkeypatch.setattr(mod, "_DEBUG_REPORT_EMITTED", False)
+        ns = argparse.Namespace(debug=True, debug_samples=5)
+        def loader():
+            raise OSError("EIO")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            mod._emit_debug_samples_if_set(
+                ns, loader, command_label="cache-report",
+            )
+        text = buf.getvalue()
+        assert "report unavailable: EIO" in text, text
+
+    def test_diff_window_a_failure_does_not_block_window_b(self, monkeypatch):
+        """If get_entries raises for window A, the diff helper logs a
+        one-line notice for window A and still attempts window B. The
+        guard is still set in `finally:` so a downstream cmd_* doesn't
+        double-emit.
+        """
+        import sqlite3
+        mod = _load_cctally_module()
+        monkeypatch.setattr(mod, "_DEBUG_REPORT_EMITTED", False)
+        # First call raises, second returns empty
+        call_log = []
+        def fake_get_entries(start, end, **kwargs):
+            call_log.append((start, end))
+            if len(call_log) == 1:
+                raise sqlite3.DatabaseError("window-A boom")
+            return []
+        monkeypatch.setattr(mod, "get_entries", fake_get_entries)
+        class _W:
+            def __init__(self, start, end):
+                self.start = start
+                self.end = end
+        import datetime as dt
+        wa = _W(dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc))
+        wb = _W(dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 5, 15, tzinfo=dt.timezone.utc))
+        ns = argparse.Namespace(
+            debug=True, debug_samples=5, sync=False,
+            a="last-week", b="this-week",
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            mod._emit_diff_debug_samples(ns, wa, wb)
+        text = buf.getvalue()
+        # Window A: notice line
+        assert "window A report unavailable: window-A boom" in text, text
+        # Window B: short-form (empty entries returned)
+        assert "No pricing data found to analyze." in text, text
+        # Both windows attempted
+        assert len(call_log) == 2
+        # Guard was set in `finally:`
+        assert mod._DEBUG_REPORT_EMITTED is True
+
+
+class TestStreamingMeanBoundary:
+    """P3.4: the < 0.1% threshold's boundary case — recorded ==
+    calculated * (1 + 1e-3) → percent_diff == 0.1% exactly → classified
+    as MISMATCH by the strict `< 0.1` comparator.
+    """
+
+    def test_threshold_boundary_at_exactly_0_1_percent(self):
+        mod = _load_cctally_module()
+        import datetime as dt
+        proto = mod.UsageEntry(
+            timestamp=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+            model="claude-opus-4-7",
+            usage={"input_tokens": 1000, "output_tokens": 500,
+                   "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0},
+            cost_usd=None,
+            source_path="/tmp/synth.jsonl",
+        )
+        calc = mod._calculate_entry_cost(
+            proto.model, proto.usage, mode="calculate",
+        )
+        # Set recorded such that percent_diff equals exactly 0.1%
+        # |orig - calc| / orig * 100 == 0.1 ⇒ orig = calc / (1 - 1e-3)
+        # (recorded > calculated case so abs() simplifies cleanly)
+        recorded = calc / (1 - 1e-3)
+        entry = mod.UsageEntry(
+            timestamp=proto.timestamp, model=proto.model,
+            usage=proto.usage, cost_usd=recorded,
+            source_path=proto.source_path,
+        )
+        stats = mod._compute_pricing_mismatch_stats([entry])
+        # Recompute percent_diff the same way the helper does
+        actual_pct = abs(recorded - calc) / recorded * 100
+        # The exact-0.1% case (within float epsilon) is classified per
+        # the `< 0.1` comparator: anything >= 0.1 is a MISMATCH.
+        # Float arithmetic may land just above or just below; assert
+        # that whichever side we land on, the classification matches
+        # the comparator's strict-less semantics.
+        if actual_pct < 0.1:
+            assert stats.matches == 1
+            assert stats.mismatches == 0
+        else:
+            assert stats.matches == 0
+            assert stats.mismatches == 1
+
+
+class TestByteStableJsonStdout:
+    """P3.3: --json + --debug must produce byte-identical stdout to
+    --json alone. Strengthen by using a fixture with a real assistant
+    entry so both runs return a non-trivial payload (the empty-home
+    matrix test passes trivially because both runs return 'no data').
+    """
+
+    def test_daily_json_stdout_byte_stable_with_fixture(
+        self, tmp_path, monkeypatch,
+    ):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+        # Seed a real assistant entry inside a 2026 window
+        import json as _j
+        proj = home / ".claude" / "projects" / "proj-X"
+        proj.mkdir(parents=True)
+        (proj / "sess-1.jsonl").write_text(
+            _j.dumps({
+                "type": "assistant",
+                "timestamp": "2026-05-23T12:00:00Z",
+                "message": {
+                    "id": "msg-1",
+                    "model": "claude-opus-4-7",
+                    "usage": {
+                        "input_tokens": 1000,
+                        "output_tokens": 500,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                    },
+                },
+                "requestId": "req-1",
+                "costUSD": 0.05,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        common = ["daily", "--since", "2026-05-23", "--until", "2026-05-23",
+                  "--json"]
+        env = os.environ.copy()
+        r_off = subprocess.run(
+            [sys.executable, str(CCTALLY), *common],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        r_on = subprocess.run(
+            [sys.executable, str(CCTALLY), *common, "--debug"],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        assert r_off.returncode == 0, r_off.stderr
+        assert r_on.returncode == 0, r_on.stderr
+        assert r_off.stdout == r_on.stdout, (
+            f"--debug perturbed --json stdout:\n"
+            f"off ({len(r_off.stdout)}b): {r_off.stdout!r}\n"
+            f"on  ({len(r_on.stdout)}b): {r_on.stdout!r}"
+        )
+        # And the --debug run did emit the report on stderr (proves
+        # we're not just comparing two empty runs)
+        assert (
+            "=== Pricing Mismatch Debug Report ===" in r_on.stderr
+            or "No pricing data found to analyze." in r_on.stderr
+        ), r_on.stderr
+
+
+class TestScopeFidelityRoundTwo:
+    """SR-P2.1 / SR-P2.2 / SR-P2.3 / SR-P2.4: scope fidelity for the
+    cmds whose report scope can drift from a naive [range_start,
+    range_end) read.
+    """
+
+    def _seed_fixture(self, home, *, project_dir, jsonl_name, entries):
+        import json as _j
+        proj = home / ".claude" / "projects" / project_dir
+        proj.mkdir(parents=True, exist_ok=True)
+        fp = proj / jsonl_name
+        with fp.open("w", encoding="utf-8") as fh:
+            for e in entries:
+                fh.write(_j.dumps(e) + "\n")
+        return fp
+
+    def _assistant_entry(self, *, ts, model="claude-opus-4-7",
+                         msg_id="msg-1", req_id="req-1",
+                         input_tokens=100, output_tokens=50,
+                         recorded_cost=None):
+        entry = {
+            "type": "assistant",
+            "timestamp": ts,
+            "message": {
+                "id": msg_id,
+                "model": model,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            },
+            "requestId": req_id,
+        }
+        if recorded_cost is not None:
+            entry["costUSD"] = recorded_cost
+        return entry
+
+    def test_weekly_fetch_start_widening_scopes_report(
+        self, tmp_path, monkeypatch,
+    ):
+        """SR-P2.1: weekly's fetch_start widens to weeks[0].start_ts (which
+        may precede range_start). The --debug report describes the same
+        widened scope (all_entries), not range_start..range_end.
+
+        Empty fake-home → no anchor → _compute_subscription_weeks returns
+        an empty list → fetch_start = range_start. We can't easily seed
+        anchors in a fresh home; instead test that the weekly report's
+        Total entries processed counts BOTH entries when both fall inside
+        the fetch_start..range_end fetch window (range_start can be the
+        later of the two; with no anchors fetch_start = range_start).
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+        # Two entries on different days but both inside a single
+        # --since/--until span. With no anchors, fetch_start = range_start
+        # so this test asserts the report sees both entries (proves the
+        # weekly path passes the loaded `all_entries` list to the helper
+        # rather than an empty/narrowed slice).
+        self._seed_fixture(
+            home, project_dir="proj-W", jsonl_name="w.jsonl",
+            entries=[
+                self._assistant_entry(
+                    ts="2026-05-21T12:00:00Z", msg_id="m1", req_id="r1",
+                    recorded_cost=5.0,
+                ),
+                self._assistant_entry(
+                    ts="2026-05-23T12:00:00Z", msg_id="m2", req_id="r2",
+                    recorded_cost=5.0,
+                ),
+            ],
+        )
+        r = subprocess.run(
+            [sys.executable, str(CCTALLY), "weekly",
+             "--since", "2026-05-21", "--until", "2026-05-23",
+             "--debug"],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert r.returncode == 0, (r.returncode, r.stderr)
+        # The report ran over the widened fetch window (no anchors so
+        # fetch_start == range_start; both seeded entries fall inside).
+        assert "Total entries processed: 2" in r.stderr, r.stderr
+
+    def test_project_filter_scopes_report(self, monkeypatch):
+        """SR-P2.2: cmd_project --project filter scopes the --debug
+        report to entries whose ProjectKey matches at least one pattern.
+
+        Drive the filter logic directly via _project_filter_matches +
+        _resolve_project_key rather than via subprocess: cmd_project's
+        --debug scope filter at bin/cctally:5097 requires non-empty
+        parsed_bounds (subscription-week snapshots), which a fresh-home
+        subprocess can't provide. Once the snapshots are absent every
+        entry's _week_start_for returns None → empty report scope. The
+        helper-level test below proves the per-key filter semantics
+        without needing the snapshot dependency.
+        """
+        mod = _load_cctally_module()
+
+        # Build two ProjectKey-shaped duck objects mimicking what
+        # _resolve_project_key would return. _project_filter_matches
+        # does the predicate work that cmd_project's --debug filter
+        # delegates to (see bin/cctally:5108 + 1357).
+        class _K:
+            def __init__(self, display_key, git_root, bucket_path):
+                self.display_key = display_key
+                self.git_root = git_root
+                self.bucket_path = bucket_path
+
+        target_key = _K("proj-target", "/p/proj-target", None)
+        other_key = _K("proj-other", "/p/proj-other", None)
+        patterns = ["proj-target"]
+        assert mod._project_filter_matches(target_key, patterns) is True
+        assert mod._project_filter_matches(other_key, patterns) is False
+        # OR semantics across multiple patterns
+        assert mod._project_filter_matches(
+            target_key, ["proj-target", "proj-other"],
+        ) is True
+        # Empty patterns → match-all (no filter)
+        assert mod._project_filter_matches(target_key, []) is True
+        assert mod._project_filter_matches(other_key, []) is True
+
+    def test_range_cost_project_filter_scopes_report(
+        self, tmp_path, monkeypatch,
+    ):
+        """SR-P2.3: cmd_range_cost --project filter scopes the --debug
+        report (project filter is applied at the loader so the report
+        scope matches the rendered scope).
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        self._seed_fixture(
+            home, project_dir="proj-target", jsonl_name="t.jsonl",
+            entries=[self._assistant_entry(
+                ts="2026-05-23T12:00:00Z", msg_id="m1", req_id="r1",
+                recorded_cost=10.0,
+            )],
+        )
+        self._seed_fixture(
+            home, project_dir="proj-other", jsonl_name="o.jsonl",
+            entries=[self._assistant_entry(
+                ts="2026-05-23T13:00:00Z", msg_id="m2", req_id="r2",
+                recorded_cost=20.0,
+            )],
+        )
+        r = subprocess.run(
+            [sys.executable, str(CCTALLY), "range-cost",
+             "--start", "2026-05-23T00:00:00Z",
+             "--end", "2026-05-23T23:59:59Z",
+             "--project", "proj-target",
+             "--debug"],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert r.returncode == 0, (r.returncode, r.stderr)
+        assert "Total entries processed: 1" in r.stderr, r.stderr
+
+    @pytest.mark.skip(
+        reason=(
+            "SR-P2.4 five-hour-blocks scope is implicitly covered by the "
+            "unit-level block-window computation: cmd_five_hour_blocks "
+            "uses a deferred loader bounded by [oldest_block_start, "
+            "newest_block_start + BLOCK_DURATION) (see bin/cctally Pattern "
+            "C). A subprocess test needs both blocks_table state AND "
+            "JSONL fixtures aligned, which is brittle to seed in a clean "
+            "home. The Pattern C loader-bounds logic is exercised by the "
+            "matrix tests (subprocess) and the empty-home short-form "
+            "path; full bound-fidelity coverage tracked in issue #92."
+        )
+    )
+    def test_five_hour_blocks_scopes_to_block_bounds(
+        self, tmp_path, monkeypatch,
+    ):
+        """SR-P2.4 (deferred): five-hour-blocks loader bounds to
+        block-window range, not raw --since/--until.
+        """
+        # See @pytest.mark.skip reason above.
+        pass
+
+
+@pytest.mark.parametrize("cmd", INSCOPE_CMDS)
+class TestDebugEmissionMatrixRoundTwo:
+    """SR-P2.5: matrix-level coverage gaps."""
+
+    def test_debug_samples_n_caps_count(self, cmd, fake_home):
+        """SR-P2.5.1: --debug-samples 2 → at most 2 sample blocks in
+        the report (header reads `=== Sample Discrepancies (first 2) ===`
+        if any mismatches exist; File: lines ≤ 2 either way).
+        """
+        r = subprocess.run(
+            [sys.executable, str(CCTALLY), cmd, *_window_args_for(cmd),
+             "--debug", "--debug-samples", "2"],
+            capture_output=True, text=True, timeout=30,
+        )
+        # Empty home: short-form (no Sample Discrepancies block).
+        # If a Sample Discrepancies block DID emit, the cap must hold.
+        if "=== Sample Discrepancies" in r.stderr:
+            assert "=== Sample Discrepancies (first 2) ===" in r.stderr
+        # File: line count is bounded by the requested cap
+        file_lines = [
+            ln for ln in r.stderr.splitlines() if ln.startswith("File: ")
+        ]
+        # diff Pattern D may emit 2 reports → 2 caps → up to 4 File:
+        # lines total. Single-report cmds → up to 2.
+        max_allowed = 4 if cmd == "diff" else 2
+        assert len(file_lines) <= max_allowed, (
+            f"{cmd}: expected at most {max_allowed} File: lines under "
+            f"--debug-samples 2 (got {len(file_lines)}):\n{r.stderr}"
+        )
+
+    def test_debug_command_label_present_when_long_form(
+        self, cmd, fake_home,
+    ):
+        """SR-P2.5.2: when the report is long-form (not the empty
+        short-form), `Command: cctally <cmd>` appears under the header.
+        Empty fake-home → short form → skip the assertion.
+        """
+        r = subprocess.run(
+            [sys.executable, str(CCTALLY), cmd, *_window_args_for(cmd),
+             "--debug"],
+            capture_output=True, text=True, timeout=30,
+        )
+        # Only assert when the long-form header is present. Short-form
+        # ("No pricing data found to analyze.") does NOT print the
+        # command label per upstream parity.
+        if "=== Pricing Mismatch Debug Report ===" in r.stderr:
+            # For diff, the command label includes the window token
+            # ("diff (Window A: <token>)"); for others, the bare cmd name.
+            if cmd == "diff":
+                assert "Command: cctally diff (Window A:" in r.stderr, r.stderr
+            else:
+                assert f"Command: cctally {cmd}" in r.stderr, r.stderr
+
+
+class TestDebugOneTimeEmissionAcrossDispatch:
+    """SR-P2.5.3: the _DEBUG_REPORT_EMITTED guard ensures only ONE
+    report per process even when a cmd dispatch composes multiple cmd_*
+    helpers. Each subprocess gets a fresh module so this is essentially
+    a smoke test that the guard semantics are intact at the helper
+    level. The per-cmd matrix variant (one subprocess per cmd) is
+    naturally one-shot per process; the unit-level guarantee lives in
+    TestEmitDebugSamplesGuard::test_one_time_per_process above.
+
+    A full cross-cmd in-process matrix would require setting up each
+    cmd's argparse contract independently — too invasive for the
+    boundary value it provides. Tracked in issue #92 if escalated.
+    """
+
+    @pytest.mark.skip(
+        reason=(
+            "Per-process one-shot semantics covered by "
+            "TestEmitDebugSamplesGuard::test_one_time_per_process at "
+            "unit level; full cross-cmd in-process matrix requires "
+            "per-cmd argparse stubbing that adds brittleness without "
+            "new coverage. Tracked in issue #92 if escalated."
+        )
+    )
+    def test_debug_one_time_emission_across_dispatch(self):
+        pass

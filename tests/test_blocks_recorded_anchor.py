@@ -22,7 +22,7 @@ def _entry(ns, ts: dt.datetime, model: str = "claude-sonnet-4-6"):
         usage={"input_tokens": 100, "output_tokens": 200,
                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         cost_usd=None,
-        source_path="synth-test",
+        source_path="/tmp/synth.jsonl",
     )
 
 

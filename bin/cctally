@@ -1101,12 +1101,7 @@ def _resolve_claude_tz_name(args: argparse.Namespace,
 # Replaces the §7.6.2 placeholder note with a real ccusage-parity
 # "Pricing Mismatch Debug Report" on stderr.
 
-from dataclasses import dataclass as _ms_dataclass, field as _ms_field
-import os as _ms_os
-import json as _ms_json
-
-
-@_ms_dataclass
+@dataclass
 class _MismatchModelStat:
     total: int = 0
     matches: int = 0
@@ -1114,7 +1109,7 @@ class _MismatchModelStat:
     avg_percent_diff: float = 0.0
 
 
-@_ms_dataclass
+@dataclass
 class _MismatchSample:
     file: str
     timestamp: str
@@ -1126,15 +1121,15 @@ class _MismatchSample:
     usage: dict
 
 
-@_ms_dataclass
+@dataclass
 class _MismatchStats:
     command_label: str | None = None
     total_entries: int = 0
     entries_with_both: int = 0
     matches: int = 0
     mismatches: int = 0
-    model_stats: dict = _ms_field(default_factory=dict)
-    discrepancies: list = _ms_field(default_factory=list)
+    model_stats: dict = field(default_factory=dict)
+    discrepancies: list = field(default_factory=list)
 
 
 def _compute_pricing_mismatch_stats(entries):
@@ -1155,6 +1150,15 @@ def _compute_pricing_mismatch_stats(entries):
     """
     stats = _MismatchStats()
     for entry in entries:
+        # P1.1 (issue #89 review-loop): mirror ccusage upstream's
+        # ``detectMismatches`` precondition filter at debug-DvI5DUKR.js:42
+        # — synthetic entries are excluded from total_entries AND skip the
+        # _resolve_model_pricing call (which would otherwise emit a
+        # ``[cost] unknown model: <synthetic>`` warning and mutate the
+        # module-level _unknown_model_warnings set, suppressing future
+        # legitimate emissions).
+        if entry.model == "<synthetic>":
+            continue
         stats.total_entries += 1
         if entry.cost_usd is None:
             continue
@@ -1176,7 +1180,7 @@ def _compute_pricing_mismatch_stats(entries):
             stats.mismatches += 1
             ms.mismatches += 1
             stats.discrepancies.append(_MismatchSample(
-                file=_ms_os.path.basename(entry.source_path),
+                file=os.path.basename(entry.source_path),
                 timestamp=entry.timestamp.isoformat(),
                 model=entry.model,
                 original_cost=original,
@@ -1255,7 +1259,7 @@ def _render_pricing_mismatch_report(stats, sample_limit):
             out.append(
                 f"Difference: ${d.difference:.6f} ({d.percent_diff:.2f}%)"
             )
-            out.append(f"Tokens: {_ms_json.dumps(d.usage)}")
+            out.append(f"Tokens: {json.dumps(d.usage)}")
             out.append("---")
     return out
 
@@ -1293,11 +1297,20 @@ def _emit_debug_samples_if_set(
     # Negative values are rejected at argparse parse time via _nonneg_int
     # (§7.5); the helper assumes sample_limit >= 0.
 
-    entries = (
-        entries_or_loader()
-        if callable(entries_or_loader)
-        else entries_or_loader
-    )
+    # P1.2 (issue #89 review-loop): only the loader call is wrapped — the
+    # pure compute + render functions raising would be a programmer bug,
+    # not a transient. On loader failure we degrade gracefully with a
+    # one-line stderr notice and DO set the guard so a downstream cmd_*
+    # composition doesn't retry (and re-emit) on the same transient.
+    if callable(entries_or_loader):
+        try:
+            entries = entries_or_loader()
+        except (sqlite3.DatabaseError, OSError) as exc:
+            eprint(f"cctally --debug: report unavailable: {exc}")
+            _DEBUG_REPORT_EMITTED = True
+            return
+    else:
+        entries = entries_or_loader
     stats = _compute_pricing_mismatch_stats(entries)
     stats.command_label = command_label
     for line in _render_pricing_mismatch_report(stats, sample_limit):
@@ -1340,7 +1353,7 @@ def _resolve_session_id_for_filter(je) -> str:
     """
     if je.session_id is not None:
         return je.session_id
-    return _ms_os.path.splitext(_ms_os.path.basename(je.source_path))[0]
+    return os.path.splitext(os.path.basename(je.source_path))[0]
 
 
 def _project_filter_matches(key, project_patterns):
@@ -1378,17 +1391,33 @@ def _emit_diff_debug_samples(args, window_a, window_b) -> None:
     if not getattr(args, "debug", False):
         return
     sample_limit = int(getattr(args, "debug_samples", 5))
-    skip_sync = not bool(getattr(args, "sync", False))
-    for window, label_letter, token in (
-        (window_a, "A", getattr(args, "a", "")),
-        (window_b, "B", getattr(args, "b", "")),
-    ):
-        entries = get_entries(window.start, window.end, skip_sync=skip_sync)
-        stats = _compute_pricing_mismatch_stats(entries)
-        stats.command_label = f"diff (Window {label_letter}: {token})"
-        for line in _render_pricing_mismatch_report(stats, sample_limit):
-            eprint(line)
-    _DEBUG_REPORT_EMITTED = True
+    # P2.3 (issue #89 review-loop): debug observes; diff builder syncs.
+    # Avoids the triple-sync that would otherwise fire (one per window
+    # here, plus _build_diff_result's own sync) when --sync is set.
+    try:
+        for window, label_letter, token in (
+            (window_a, "A", getattr(args, "a", "")),
+            (window_b, "B", getattr(args, "b", "")),
+        ):
+            try:
+                entries = get_entries(
+                    window.start, window.end, skip_sync=True,
+                )
+            except (sqlite3.DatabaseError, OSError) as exc:
+                eprint(
+                    f"cctally --debug: window {label_letter} report "
+                    f"unavailable: {exc}"
+                )
+                continue
+            stats = _compute_pricing_mismatch_stats(entries)
+            stats.command_label = f"diff (Window {label_letter}: {token})"
+            for line in _render_pricing_mismatch_report(stats, sample_limit):
+                eprint(line)
+    finally:
+        # P1.2 (issue #89 review-loop): set the guard in finally so a
+        # downstream cmd_* composition doesn't double-emit even if one
+        # window raised — the partial output we did emit is enough.
+        _DEBUG_REPORT_EMITTED = True
 
 
 def _load_claude_config_for_args(args: argparse.Namespace) -> "dict":
@@ -8874,10 +8903,12 @@ def cmd_range_cost(args: argparse.Namespace) -> int:
     last_match: dt.datetime | None = None
     model_buckets: dict[str, dict[str, Any]] = {}
 
-    # Issue #89: materialize the generator so --debug report can describe
-    # the same dataset as the rendered output. Project filter is applied
-    # at the loader (SELECT-time), so the scope is the same.
-    entries_list = list(get_entries(start_dt, end_dt, project=args.project))
+    # Issue #89: keep the loaded list around so the --debug report can
+    # describe the same dataset as the rendered output. Project filter is
+    # applied at the loader (SELECT-time), so the scope is the same.
+    # P2.2 (issue #89 review-loop): get_entries already returns
+    # list[UsageEntry] per bin/_cctally_cache.py:1224 — no list() wrap.
+    entries_list = get_entries(start_dt, end_dt, project=args.project)
     _emit_debug_samples_if_set(
         args, entries_list, command_label="range-cost",
     )

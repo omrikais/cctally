@@ -2610,7 +2610,7 @@ def test_blocks_active_swap_recomputes_totals_over_canonical_interval(
             "cache_read_input_tokens": 0,
         },
         cost_usd=None,
-        source_path="synth-test",
+        source_path="/tmp/synth.jsonl",
     )
     late = UsageEntry(
         timestamp=dt.datetime(2026, 5, 15, 20, 30, 0, tzinfo=dt.timezone.utc),
@@ -2622,7 +2622,7 @@ def test_blocks_active_swap_recomputes_totals_over_canonical_interval(
             "cache_read_input_tokens": 100,
         },
         cost_usd=None,
-        source_path="synth-test",
+        source_path="/tmp/synth.jsonl",
     )
     all_entries = [early, late]
 
@@ -2894,7 +2894,7 @@ def test_group_entries_into_blocks_uses_block_start_override(ns):
         usage={"input_tokens": 100, "output_tokens": 50,
                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         cost_usd=None,
-        source_path="synth-test",
+        source_path="/tmp/synth.jsonl",
     )
     now = dt.datetime(2026, 5, 15, 21, 0, 0, tzinfo=dt.timezone.utc)
     blocks = group(
@@ -3036,7 +3036,7 @@ def test_group_entries_into_blocks_no_phantom_between_two_credits(ns):
                    "cache_creation_input_tokens": 0,
                    "cache_read_input_tokens": 0},
             cost_usd=None,
-            source_path="synth-test",
+            source_path="/tmp/synth.jsonl",
         )
 
     entries = [

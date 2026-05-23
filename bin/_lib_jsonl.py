@@ -39,7 +39,11 @@ class UsageEntry:
     model: str
     usage: dict[str, Any]
     cost_usd: float | None
-    source_path: str   # absolute JSONL path; basename used in --debug samples (issue #89)
+    source_path: str   # REQUIRED — absolute JSONL path; basename used in
+                       # --debug samples (issue #89). Always supply a
+                       # non-empty path-like string; "" is invalid per
+                       # spec R5 (no silent empty-string passthrough,
+                       # crashes loudly at construction instead).
 
 
 @dataclass

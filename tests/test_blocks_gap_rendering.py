@@ -36,7 +36,7 @@ def _entry(ns, ts: dt.datetime, *, model: str = "claude-sonnet-4-6", tokens: int
             "cache_read_input_tokens": 0,
         },
         cost_usd=None,
-        source_path="synth-test",
+        source_path="/tmp/synth.jsonl",
     )
 
 
