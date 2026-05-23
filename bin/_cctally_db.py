@@ -1994,12 +1994,37 @@ def _gate_001_post_ingest_completed(
         )
     applied_at_utc = gate_row[0]
 
-    # Layer B — proof of post-001 ingest: any session_files row whose
-    # last_ingested_at is at-or-after the 001 marker. 001 DELETEs every
-    # row from session_files inside the SAME transaction that stamps its
-    # marker (see ``_001_dedup_highest_wins``), so NO pre-001 row can
-    # survive — any row present now was written by a sync_cache that ran
-    # AFTER the migration committed.
+    # Layer B — proof of a COMPLETED post-001 ingest: a session_files row
+    # whose last_ingested_at is at-or-after the 001 marker AND whose
+    # delta-resume columns were written by sync_cache's post-entries
+    # commit. 001 DELETEs every row from session_files inside the SAME
+    # transaction that stamps its marker (see ``_001_dedup_highest_wins``),
+    # so NO pre-001 row can survive — any row present now was written by a
+    # sync_cache that ran AFTER the migration committed.
+    #
+    # ``size_bytes > 0 OR last_byte_offset > 0`` is the completion proof.
+    # ``sync_cache`` writes a session_files row in TWO phases:
+    #   (1) ``_ensure_session_files_row`` commits a PLACEHOLDER row at the
+    #       top of the per-file loop — ``(size_bytes=0, mtime_ns=0,
+    #       last_byte_offset=0, last_ingested_at=now)`` — BEFORE the file's
+    #       JSONL is parsed, so the `session` subcommand's session_id /
+    #       project_path join is populated even for unchanged files.
+    #   (2) The post-entries commit UPSERTs the REAL ``size_bytes`` /
+    #       ``last_byte_offset`` AFTER ``session_entries`` rows are
+    #       inserted, in the same transaction as those inserts.
+    # A row stuck at phase (1) — sync_cache was interrupted (kill -9,
+    # power loss, crash) between the placeholder commit and the first
+    # per-file entries commit — carries a fresh ``last_ingested_at`` but
+    # NO entries behind it. The pre-fix predicate (timestamp-only) would
+    # pass on that placeholder while ``session_entries`` is empty/partial,
+    # letting 008/009/010 recompute over a near-empty cache and stamp
+    # their markers permanently — silently zeroing historical weekly
+    # cost, 5h block totals, and percent milestones until a manual rerun.
+    # Requiring a non-zero delta-resume column rejects the placeholder:
+    # any file with at least one byte ingested has ``size_bytes > 0``
+    # after phase (2). A genuinely 0-byte JSONL contributes no entries to
+    # undercount anyway, and the Layer C empty-disk fallback covers the
+    # no-usage-on-disk topology.
     #
     # The comparison is ``>=``, not ``>``: both ``applied_at_utc`` and
     # ``last_ingested_at`` are written via ``now_utc_iso()``, which
@@ -2021,7 +2046,8 @@ def _gate_001_post_ingest_completed(
     try:
         has_post_001_ingest = cache_ro.execute(
             "SELECT 1 FROM session_files "
-            "WHERE unixepoch(last_ingested_at) >= unixepoch(?) LIMIT 1",
+            "WHERE unixepoch(last_ingested_at) >= unixepoch(?) "
+            "  AND (size_bytes > 0 OR last_byte_offset > 0) LIMIT 1",
             (applied_at_utc,),
         ).fetchone() is not None
     except sqlite3.OperationalError as exc:
@@ -2252,6 +2278,22 @@ def _eagerly_apply_cache_migrations() -> None:
             );
             """
         )
+        # Mirror open_cache_db's ALTER-added columns on session_files. The
+        # CREATE TABLE IF NOT EXISTS above only lays down the base five
+        # columns; ``session_id`` / ``project_path`` were added later via
+        # ``add_column_if_missing`` in ``open_cache_db`` (A2 ``session``
+        # metadata). Stats migration 009 joins ``sf.project_path`` on the
+        # RO connection bootstrapped by THIS helper — on an older cache.db
+        # whose pre-existing session_files table predates those columns,
+        # the CREATE is a no-op (table exists) and the column would be
+        # absent, so 009's join would raise ``no such column:
+        # sf.project_path`` at prepare time (column resolution happens
+        # even with zero rows). Idempotent + cheap: a no-op when the
+        # columns already exist. Keeps this inline open a strict schema
+        # superset-mirror of ``open_cache_db`` (see the "Implementation
+        # note" in this function's docstring).
+        add_column_if_missing(conn, "session_files", "session_id", "TEXT")
+        add_column_if_missing(conn, "session_files", "project_path", "TEXT")
         # Dispatcher (cache.db side). Runs every pending cache
         # migration, including ``001_dedup_highest_wins``. Idempotent —
         # if 001 has already applied, this is a fast-path return.
@@ -2394,15 +2436,39 @@ def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
             "corrected dedup (one-time; may take 10-30s depending on "
             "JSONL volume)..."
         )
-    conn.execute("BEGIN")
+    # D3 — BEGIN IMMEDIATE so the destructive DELETEs are race-guarded,
+    # not just the marker insert. The dispatcher snapshots the applied
+    # set ONCE before its registry walk (``_run_pending_migrations``),
+    # so two concurrent openers (e.g. dashboard + CLI on the same
+    # cache.db) can BOTH classify 001 as pending and BOTH enter this
+    # handler. With a plain ``BEGIN`` (deferred), each acquires the
+    # write lock only on its first DELETE: the loser would wait for the
+    # winner's COMMIT, then DELETE — wiping the rows the winner's
+    # subsequent ``sync_cache`` already reingested, leaving the cache
+    # partially rebuilt until another full sync. ``BEGIN IMMEDIATE``
+    # grabs the write lock up front, so the loser blocks here BEFORE
+    # touching any data; once it acquires the lock the winner's marker
+    # is already committed, and the in-transaction re-check below turns
+    # the loser's body into a no-op. The marker INSERT stays
+    # ``INSERT OR IGNORE`` as a belt-and-suspenders against an
+    # IntegrityError banner.
+    conn.execute("BEGIN IMMEDIATE")
     try:
+        already_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1",
+            ("001_dedup_highest_wins",),
+        ).fetchone() is not None
+        if already_applied:
+            # A concurrent opener won the race and already wiped +
+            # stamped 001 (and may already be repopulating via
+            # sync_cache). Re-running the DELETEs here would destroy that
+            # reingested data. Commit the empty IMMEDIATE transaction
+            # (releases the write lock) and return — the marker is
+            # present, so the dispatcher records us as applied.
+            conn.commit()
+            return
         conn.execute("DELETE FROM session_entries")
         conn.execute("DELETE FROM session_files")
-        # D3 — INSERT OR IGNORE for race safety. Under concurrent
-        # dispatcher invocations (dashboard + CLI on the same DB), one
-        # process wins; the other hits IntegrityError → migration-error
-        # banner. Every other production migration uses INSERT OR IGNORE;
-        # mirror the convention here.
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
             "VALUES (?, ?)",
