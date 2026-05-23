@@ -22,7 +22,7 @@ _spec.loader.exec_module(_db)
 MARKER = "claude_ingest_walk_complete"
 
 
-def _cache(tmp_path, *, applied, marker, entries):
+def _cache(tmp_path, *, applied, marker, entries, skipped=False):
     conn = sqlite3.connect(tmp_path / "cache.db")
     _db._apply_cache_schema(conn)
     # ``_apply_cache_schema`` defines data tables only; the migration
@@ -32,9 +32,16 @@ def _cache(tmp_path, *, applied, marker, entries):
         "CREATE TABLE IF NOT EXISTS schema_migrations "
         "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations_skipped "
+        "(name TEXT PRIMARY KEY, skipped_at_utc TEXT NOT NULL, reason TEXT)"
+    )
     if applied:
         conn.execute("INSERT INTO schema_migrations(name, applied_at_utc) "
                      "VALUES('001_dedup_highest_wins','2026-01-01T00:00:00+00:00')")
+    if skipped:
+        conn.execute("INSERT INTO schema_migrations_skipped(name, skipped_at_utc, reason) "
+                     "VALUES('001_dedup_highest_wins','2026-01-01T00:00:00+00:00','poison')")
     if marker:
         conn.execute("INSERT INTO cache_meta(key,value) VALUES(?, '2026-01-01T00:00:00+00:00')", (MARKER,))
     if entries:
@@ -63,3 +70,32 @@ def test_defer_when_marker_present_but_cache_empty(tmp_path):
     proj = tmp_path / "projects"; proj.mkdir()  # pruned: dir exists, no jsonl
     with pytest.raises(_db.MigrationGateNotMet):
         _db._gate_001_post_ingest_completed(conn, [proj], data_present=True)
+
+
+def test_proceed_when_no_historical_rows_even_if_incomplete(tmp_path):
+    # Row 5: applied 001, but no marker / no entries — yet ``data_present``
+    # is False, so there is nothing to protect and the body would no-op.
+    # The shell must derive ``caller_has_historical_rows=False`` and let
+    # the resolver PROCEED (no raise), regardless of walk/cache state.
+    conn = _cache(tmp_path, applied=True, marker=False, entries=False)
+    proj = tmp_path / "projects"; proj.mkdir()  # pruned: dir exists, no jsonl
+    _db._gate_001_post_ingest_completed(conn, [proj], data_present=False)
+
+
+def test_defer_when_001_skipped_with_historical_rows(tmp_path):
+    # Rows 3/4: 001 marked skipped (poison-pill) while the caller still
+    # holds historical rows. The shell must read
+    # ``schema_migrations_skipped`` → ``cache_001_state="skipped"`` and the
+    # resolver DEFERs to avoid recomputing over stale pre-dedup data.
+    conn = _cache(tmp_path, applied=False, marker=False, entries=True, skipped=True)
+    proj = tmp_path / "projects"; proj.mkdir(); (proj / "s.jsonl").write_text("{}\n")
+    with pytest.raises(_db.MigrationGateNotMet):
+        _db._gate_001_post_ingest_completed(conn, [proj], data_present=True)
+
+
+def test_proceed_when_001_skipped_with_no_historical_rows(tmp_path):
+    # Rows 3/4 (the PROCEED leg): 001 skipped but nothing to protect, so
+    # the body would no-op — the resolver PROCEEDs (no raise).
+    conn = _cache(tmp_path, applied=False, marker=False, entries=True, skipped=True)
+    proj = tmp_path / "projects"; proj.mkdir(); (proj / "s.jsonl").write_text("{}\n")
+    _db._gate_001_post_ingest_completed(conn, [proj], data_present=False)

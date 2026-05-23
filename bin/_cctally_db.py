@@ -1920,10 +1920,15 @@ def _gate_001_post_ingest_completed(
         >= 001.applied_at_utc`` proof — the marker is the single
         ingest-completeness signal now. A missing ``cache_meta`` table
         composes as ``False`` (not a hard defer).
-      * ``cache_has_entries`` — ``session_entries`` is non-empty (via
-        ``_probe_table_nonempty``). Together with ``walk_complete`` this
-        closes the round-3 partial-walk false-pass and the P1 empty-cache
-        rebuild-over-pruned-disk case (spec D3): row 6 requires BOTH.
+      * ``cache_has_entries`` — ``session_entries`` is non-empty, read
+        via an inline ``SELECT 1 FROM session_entries LIMIT 1``
+        (deliberately NOT ``_probe_table_nonempty``, which propagates
+        transient errors by design — the shell must CATCH a transient
+        BUSY/LOCKED here and flip ``marker_state_readable=False`` so the
+        resolver DEFERs at row 1; the helper cannot do that). Together
+        with ``walk_complete`` this closes the round-3 partial-walk
+        false-pass and the P1 empty-cache rebuild-over-pruned-disk case
+        (spec D3): row 6 requires BOTH.
       * ``caller_has_historical_rows`` — caller-supplied ``data_present``;
         each migration passes its OWN scoped row set (008
         ``bool(snapshot_rows)``, etc.) so a no-op upgrade isn't wedged.
@@ -2060,8 +2065,8 @@ def _is_no_such_table_error(exc: sqlite3.OperationalError) -> bool:
         ``getattr(..., None) in (None, 1)`` form degrades gracefully if
         the attribute is ever missing — substring-only on legacy Python.
 
-    Centralized so both Layer A and Layer B "table missing" paths share
-    the same predicate.
+    Centralized so the gate shell's cache-state reads and the migration
+    table-existence checks share the same "table missing" predicate.
     """
     return (
         "no such table" in str(exc).lower()
@@ -2244,15 +2249,21 @@ def _eagerly_apply_cache_migrations() -> None:
 
     This helper inverts the dependency: stats 008 itself triggers
     cache.db's dispatcher BEFORE checking the gate. After this returns,
-    cache 001's marker is present and Layer A passes. For users with
-    no JSONL on disk (or no projects/ dir at all), Layer C also
-    passes — 008 completes in the SAME invocation. For users with
-    JSONL, Layer B still requires a subsequent ``sync_cache`` call
-    (cache 001 wipes ``session_files``); 008 defers cleanly on this
-    first invocation, and the operator's next JSONL-reading command
-    populates ``session_files`` → the invocation after that runs
-    008 successfully. That's worst-case one extra invocation instead
-    of unbounded deferral.
+    cache 001's marker is present (``cache_001_state="applied"``). But
+    an eager-applied 001 WIPES the cache and clears the ``cache_meta``
+    ``claude_ingest_walk_complete`` marker (spec D5) — and the gate
+    (``_gate_001_post_ingest_completed`` → ``resolve_upgrade_gate``) now
+    keys ingest-completeness on that walk-complete marker, not on a
+    post-001 ``session_files`` row. So the gate DEFERs on this first
+    invocation until a subsequent clean ``sync_cache`` re-walks the
+    on-disk JSONL and re-establishes the marker. For users with no
+    JSONL on disk (or no projects/ dir at all), ``disk_state="absent"``
+    lets the resolver PROCEED (no data to lose) — 008 completes in the
+    SAME invocation. For users with JSONL, the operator's next
+    JSONL-reading command runs ``sync_cache``, which sets the
+    walk-complete marker → the invocation after that runs 008
+    successfully. That's worst-case one extra invocation instead of
+    unbounded deferral.
 
     Lock ordering
     -------------
@@ -2755,9 +2766,11 @@ def _resolve_projects_dirs_for_gate() -> list[pathlib.Path]:
     default exists on disk (covers test-time monkeypatch overrides).
 
     Empty list returned only when NO projects/ dir resolves under any
-    env-configured or default root. Callers must G3-style fail-closed
-    when this list is empty AND they have rows that would be silently
-    zeroed by recomputing against an empty ``session_entries``.
+    env-configured or default root. An empty list is the legitimate
+    ``disk_state="absent"`` topology — callers no longer fail-closed
+    inline (Task 5 removed every caller's G3 block); they unconditionally
+    delegate the empty-list decision to the resolver, which DEFERs at
+    row 7 when historical rows remain and PROCEEDs at row 5 otherwise.
     """
     projects_dirs = _cctally_core._resolve_claude_projects_dirs()
     if not projects_dirs and _cctally_core.CLAUDE_PROJECTS_DIR.is_dir():
@@ -2824,8 +2837,10 @@ def _009_recompute_five_hour_blocks_dedup_fix(
     """Recompute ``five_hour_blocks.total_*`` + rollup-children
     (``five_hour_block_models`` / ``five_hour_block_projects``) from the
     now-corrected ``session_entries``. Gated on cache migration 001
-    having applied AND ``sync_cache`` having repopulated
-    ``session_entries`` since (Layer A + B + C, same as 008).
+    having applied AND ``sync_cache`` having re-walked the on-disk JSONL
+    since (the ``cache_meta`` ``claude_ingest_walk_complete`` marker is
+    present) — the shared gate (``_gate_001_post_ingest_completed`` →
+    ``resolve_upgrade_gate``), same as 008.
 
     Scope (B1)
     ----------
