@@ -175,9 +175,18 @@ def test_migration_handler_recomputes_auto_rows_preserves_others(
     """Run the production handler against a copy of pre.sqlite with the
     paired pre-cache.sqlite wired in via core's path constants. Result must
     match post.sqlite (modulo the marker's applied_at_utc, which is
-    now_utc_iso() at handler time)."""
+    now_utc_iso() at handler time).
+
+    V4 note: the handler now eagerly opens cache.db (via
+    ``_eagerly_apply_cache_migrations``) BEFORE the gate check, so
+    ``CACHE_DB_PATH`` must point at a WRITABLE copy of the fixture —
+    pointing it at the in-tree ``PRE_CACHE_DB`` would dirty the
+    fixture on first run (cache 001's wipe + marker stamp).
+    """
     work_stats = tmp_path / "stats.db"
     shutil.copy(PRE_DB, work_stats)
+    work_cache = tmp_path / "cache.db"
+    shutil.copy(PRE_CACHE_DB, work_cache)
 
     # Synthetic JSONL so the gate's empty-disk fallback doesn't fire — we
     # want Layer B (post-001 ingest) to be the path that passes.
@@ -186,7 +195,7 @@ def test_migration_handler_recomputes_auto_rows_preserves_others(
     (projects_dir / "session1.jsonl").write_text("{}\n")
 
     core = db_module._cctally_core
-    monkeypatch.setattr(core, "CACHE_DB_PATH", PRE_CACHE_DB)
+    monkeypatch.setattr(core, "CACHE_DB_PATH", work_cache)
     monkeypatch.setattr(core, "CLAUDE_PROJECTS_DIR", projects_dir)
 
     handler = _migration_handler(db_module)
@@ -219,16 +228,22 @@ def test_migration_handler_idempotent_against_marker(
     races (dashboard + CLI on the same DB) would have surfaced one
     side as a migration-error banner. The dispatcher's ``applied`` set
     still provides per-process idempotency; the OR IGNORE is
-    cross-process race safety."""
+    cross-process race safety.
+
+    V4 note: writable cache.db copy, same rationale as the sibling
+    test above.
+    """
     work_stats = tmp_path / "stats.db"
     shutil.copy(PRE_DB, work_stats)
+    work_cache = tmp_path / "cache.db"
+    shutil.copy(PRE_CACHE_DB, work_cache)
 
     projects_dir = tmp_path / "claude_projects"
     projects_dir.mkdir()
     (projects_dir / "session1.jsonl").write_text("{}\n")
 
     core = db_module._cctally_core
-    monkeypatch.setattr(core, "CACHE_DB_PATH", PRE_CACHE_DB)
+    monkeypatch.setattr(core, "CACHE_DB_PATH", work_cache)
     monkeypatch.setattr(core, "CLAUDE_PROJECTS_DIR", projects_dir)
 
     handler = _migration_handler(db_module)

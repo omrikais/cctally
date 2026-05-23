@@ -11,9 +11,9 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 9 known
   ✗ 009_test_failure_injection                     FAILED last at <REDACTED>
                                                 See <HOME>/.local/share/cctally/logs/migration-errors.log
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 2 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 2 / 2 known
   ✓ 001_dedup_highest_wins                         applied <REDACTED>
-  · 002_test_cache_migration                       pending
+  ✓ 002_test_cache_migration                       applied <REDACTED>
 ## stderr
 
 ## exit

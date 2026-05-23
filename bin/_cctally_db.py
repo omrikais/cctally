@@ -2041,6 +2041,133 @@ def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
     return False
 
 
+# === Region 7b2: Eager cache-migration trigger (V4 — same-invocation 008 apply) ===
+
+
+def _eagerly_apply_cache_migrations() -> None:
+    """Open cache.db so its pending migrations (notably
+    ``001_dedup_highest_wins``) apply BEFORE stats migration 008's gate
+    check.
+
+    Why
+    ---
+    On the very first ``cctally`` invocation post-upgrade against a
+    populated stats.db, the natural call order is:
+
+      1. ``cmd_<reporting>`` opens stats.db via ``open_db()`` (runs the
+         stats dispatcher → stats 008 fires).
+      2. (Maybe) ``cmd_<jsonl-reader>`` opens cache.db via
+         ``open_cache_db()`` (runs the cache dispatcher → cache 001
+         fires).
+
+    Step 1 happens BEFORE step 2 — and for commands that read stats.db
+    only (e.g. ``cctally report`` without ``--sync-current``), step 2
+    NEVER happens. So stats 008's gate finds no 001 marker in
+    cache.db, raises ``MigrationGateNotMet``, the dispatcher defers,
+    and ``report`` proceeds with stale ``weekly_cost_snapshots``
+    forever (until the user happens to run a JSONL-reading command).
+
+    This helper inverts the dependency: stats 008 itself triggers
+    cache.db's dispatcher BEFORE checking the gate. After this returns,
+    cache 001's marker is present and Layer A passes. For users with
+    no JSONL on disk (or no projects/ dir at all), Layer C also
+    passes — 008 completes in the SAME invocation. For users with
+    JSONL, Layer B still requires a subsequent ``sync_cache`` call
+    (cache 001 wipes ``session_files``); 008 defers cleanly on this
+    first invocation, and the operator's next JSONL-reading command
+    populates ``session_files`` → the invocation after that runs
+    008 successfully. That's worst-case one extra invocation instead
+    of unbounded deferral.
+
+    Lock ordering
+    -------------
+    Stats and cache are SEPARATE SQLite files with SEPARATE WAL locks.
+    ``open_cache_db()`` does not touch stats.db. Stats.db is currently
+    inside the migration dispatcher (the 008 handler hasn't started a
+    ``BEGIN`` on the stats connection yet — that happens later in the
+    body, AFTER this helper returns). No deadlock potential.
+
+    Failure modes
+    -------------
+    If cache.db can't be opened (rare — disk full, permission denied,
+    truly missing parent dir), let the exception propagate to the
+    stats 008 body's ``try``, where the existing
+    ``_is_transient_sqlite_error`` predicate translates it to
+    ``MigrationGateNotMet``. The dispatcher then defers — symmetric
+    with G4/G5 behavior on the read-only gate connection.
+
+    Implementation note
+    -------------------
+    We inline the minimal cache.db open here (schema CREATE +
+    dispatcher) rather than delegate to ``_cctally_cache.open_cache_db``
+    because the latter calls ``_cctally()`` (a back-reference into
+    ``sys.modules['cctally']``) which is set up by the bin/cctally
+    entrypoint but absent in test harnesses that exercise the stats
+    handler directly. The inlined open is a strict subset: the same
+    schema DDL + the same dispatcher call. Any future expansion of
+    ``open_cache_db`` (e.g. extra ALTERs) would need to be mirrored
+    here OR this helper would need to drop the inline pattern and
+    delegate (after removing the unused ``_cctally()`` line).
+    """
+    cache_db_path = _cctally_core.CACHE_DB_PATH
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        conn = sqlite3.connect(cache_db_path)
+        conn.execute("SELECT 1").fetchone()
+    except sqlite3.DatabaseError as exc:
+        # Corruption recovery mirrors the contract in
+        # ``_cctally_cache.open_cache_db``: cache.db is fully
+        # re-derivable from JSONL, so we unlink + recreate. Stay quiet
+        # under tests — the dispatcher's gate-defer machinery handles
+        # the case where this fails outright.
+        eprint(f"[cache] corrupt cache DB ({exc}); recreating")
+        try:
+            cache_db_path.unlink()
+        except FileNotFoundError:
+            pass
+        conn = sqlite3.connect(cache_db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS session_files (
+                path             TEXT PRIMARY KEY,
+                size_bytes       INTEGER NOT NULL,
+                mtime_ns         INTEGER NOT NULL,
+                last_byte_offset INTEGER NOT NULL,
+                last_ingested_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_entries (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path         TEXT    NOT NULL,
+                line_offset         INTEGER NOT NULL,
+                timestamp_utc       TEXT    NOT NULL,
+                model               TEXT    NOT NULL,
+                msg_id              TEXT,
+                req_id              TEXT,
+                input_tokens        INTEGER NOT NULL DEFAULT 0,
+                output_tokens       INTEGER NOT NULL DEFAULT 0,
+                cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+                usage_extra_json    TEXT,
+                cost_usd_raw        REAL
+            );
+            """
+        )
+        # Dispatcher (cache.db side). Runs every pending cache
+        # migration, including ``001_dedup_highest_wins``. Idempotent —
+        # if 001 has already applied, this is a fast-path return.
+        _run_pending_migrations(
+            conn, registry=_CACHE_MIGRATIONS, db_label="cache.db",
+        )
+    finally:
+        # Close immediately so the WAL writer lock (if any) is
+        # released before the stats 008 body opens its read-only
+        # gate connection.
+        conn.close()
+
+
 # === Region 7c: Cache migration 001_dedup_highest_wins (ccusage-parity fix) ===
 
 @cache_migration("001_dedup_highest_wins")
@@ -2149,6 +2276,32 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
     # a benign one-line announcement. Heavy users with 52+ snapshots
     # still see it once.
     #
+    # V4 — eagerly trigger cache.db's dispatcher BEFORE the gate read.
+    # This ensures cache migration 001's marker is in place even on
+    # invocations that would otherwise only open stats.db (e.g.
+    # ``cctally report`` without ``--sync-current``). Without this
+    # the gate would falsely defer 008 on every such invocation and
+    # ``report`` would silently use stale snapshots forever. See the
+    # ``_eagerly_apply_cache_migrations`` docstring above for the full
+    # rationale + lock-ordering argument.
+    #
+    # Wrapped in the same transient-defer translation as the RO gate
+    # connection below: if cache.db can't be opened (disk pressure,
+    # permission denied, truly missing parent dir, transiently
+    # locked by another writer), surface as
+    # ``MigrationGateNotMet`` and let the dispatcher defer cleanly
+    # — symmetric with G4/G5 on the gate's RO connection.
+    try:
+        _eagerly_apply_cache_migrations()
+    except sqlite3.OperationalError as exc:
+        if _is_transient_sqlite_error(exc):
+            raise MigrationGateNotMet(
+                "cache.db not yet initialized or transiently locked; "
+                "run any JSONL-reading command (e.g. `cctally weekly`) "
+                "once and retry."
+            ) from None
+        raise
+
     # G4 fix: open cache.db inside the try so a TOCTOU race
     # (file unlinked between an ``exists()`` probe and ``sqlite3.connect``,
     # or never created yet) surfaces as ``SQLITE_CANTOPEN`` and translates

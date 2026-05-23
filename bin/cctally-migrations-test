@@ -197,12 +197,20 @@ scenario_01_fresh_install () {
 
 # 02-upgrade-with-some-applied: stats.db has 001+002 markers; cache.db is
 # fresh. First `report --weeks 1` triggers the dispatcher walk via
-# open_db(); 003 + 004 (test injection, no trigger seeded) apply cleanly,
-# user_version advances to 4. cache.db's open path is NOT exercised by
-# `report` (which only opens stats.db) — its 1 cache migration stays
-# pending, surfaced by the post-walk `db status` capture. `db status` is
-# a raw-sqlite3 read that does NOT trigger another walk, so its output
-# reflects the post-`report` state.
+# open_db(); the remaining stats migrations apply cleanly and
+# user_version advances to len(_STATS_MIGRATIONS).
+#
+# V4 update: stats migration 008 now eagerly opens cache.db inside its
+# handler body (BEFORE the gate check) via
+# ``_eagerly_apply_cache_migrations``, so cache.db's dispatcher fires
+# as a side effect of stats.db's open path. Both DBs end up at
+# user_version == len(registry) after the single `report` call. The
+# eager trigger ensures the first-run-post-upgrade flow doesn't
+# silently leave stats 008 deferred (which would have made `report`
+# read stale ``weekly_cost_snapshots`` indefinitely).
+#
+# `db status` is a raw-sqlite3 read that does NOT trigger another
+# walk, so its output reflects the post-`report` state.
 scenario_02_upgrade () {
     local scenario_dir="$HARNESS_FIXTURES_DIR/02-upgrade-with-some-applied"
     scenario_setup "$scenario_dir"

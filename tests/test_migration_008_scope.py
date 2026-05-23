@@ -484,9 +484,20 @@ def test_008_gate_passes_with_zero_jsonl(tmp_path, monkeypatch):
     )
 
 
-def test_008_gate_defers_when_001_marker_missing(tmp_path, monkeypatch):
-    """MigrationGateNotMet when cache.db has no 001 marker at all. Layer A
-    failure path."""
+def test_008_eager_trigger_applies_001_marker_when_missing(
+    tmp_path, monkeypatch
+):
+    """V4 — when cache.db has no 001 marker, the migration body's
+    eager-cache-trigger applies it (instead of deferring) so the
+    same-invocation gate check then sees Layer A satisfied. With an
+    empty disk (no JSONL), Layer C empty-disk fallback then fires →
+    migration completes as a no-op (marker stamped, no rows touched).
+
+    Pre-V4 this scenario raised ``MigrationGateNotMet`` (deferring 008
+    to the NEXT invocation). The eager trigger eliminates that one-
+    invocation lag so first-run ``cctally report`` no longer reads
+    stale snapshots.
+    """
     db = _load_db()
     core = _load_core(db)
 
@@ -494,7 +505,7 @@ def test_008_gate_defers_when_001_marker_missing(tmp_path, monkeypatch):
     cache_path = tmp_path / "cache.db"
     _stage_stats(stats_path)
 
-    # Cache with empty schema_migrations.
+    # Cache with empty schema_migrations (no 001 marker yet).
     cache = sqlite3.connect(cache_path)
     try:
         cache.executescript(
@@ -527,6 +538,8 @@ def test_008_gate_defers_when_001_marker_missing(tmp_path, monkeypatch):
         cache.close()
 
     _pin_resolver_to_fake_home(core, tmp_path, monkeypatch)
+    # Empty projects dir → no JSONL on disk → Layer C empty-disk
+    # fallback passes after the eager trigger applies 001.
     fake_projects = tmp_path / "claude_projects"
     fake_projects.mkdir()
 
@@ -535,10 +548,26 @@ def test_008_gate_defers_when_001_marker_missing(tmp_path, monkeypatch):
 
     stats = sqlite3.connect(stats_path)
     try:
-        with pytest.raises(db.MigrationGateNotMet):
-            db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+        # No exception — the eager trigger applied 001, the gate's
+        # Layer A passes, Layer C empty-disk also passes, the
+        # migration completes in this same invocation.
+        db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
     finally:
         stats.close()
+
+    # cache.db now carries the 001 marker (stamped by the eager
+    # dispatcher). Cross-DB invariant: the gate's premise is now true.
+    cache_ro = sqlite3.connect(cache_path)
+    try:
+        applied = cache_ro.execute(
+            "SELECT 1 FROM schema_migrations "
+            "WHERE name = '001_dedup_highest_wins'"
+        ).fetchone()
+    finally:
+        cache_ro.close()
+    assert applied is not None, (
+        "V4: eager trigger must apply cache 001 marker on first run"
+    )
 
 
 def test_008_gate_honors_claude_config_dir(tmp_path, monkeypatch):
@@ -641,14 +670,22 @@ def test_008_gate_honors_claude_config_dir(tmp_path, monkeypatch):
         stats.close()
 
 
-def test_008_defers_when_cache_db_path_missing(tmp_path, monkeypatch):
-    """G4 — when ``CACHE_DB_PATH`` does NOT exist on disk, ``sqlite3.connect``
-    (RO URI form) raises ``SQLITE_CANTOPEN``. The migration body must
-    translate this to ``MigrationGateNotMet`` via the
-    ``_is_transient_sqlite_error`` predicate, NOT let the
-    ``OperationalError`` escape to the dispatcher's ``except Exception``
-    (which would log to ``migration-errors.log`` and render the migration
-    error banner for a self-healing condition).
+def test_008_eager_trigger_creates_cache_db_when_missing(
+    tmp_path, monkeypatch
+):
+    """V4 — when ``CACHE_DB_PATH`` points at a non-existent file, the
+    migration body's eager-cache-trigger CREATES it (mirroring
+    ``open_cache_db``'s contract that cache.db is fully re-derivable)
+    and applies cache migration 001 in the same pass. With no JSONL on
+    disk (Layer C empty-disk fallback) the migration then completes as
+    a no-op, marker stamped.
+
+    Pre-V4 this raised ``MigrationGateNotMet`` (the RO gate connection
+    saw SQLITE_CANTOPEN and translated to gate-defer). G4's CANTOPEN→
+    MigrationGateNotMet translation is still in place on the RO gate
+    connection — it just rarely fires now because the eager trigger
+    creates the file. The translation continues to defend against
+    pathological cases (disk full mid-flight, permission flip, etc.).
     """
     db = _load_db()
     core = _load_core(db)
@@ -656,7 +693,8 @@ def test_008_defers_when_cache_db_path_missing(tmp_path, monkeypatch):
     stats_path = tmp_path / "stats.db"
     _stage_stats(stats_path)
 
-    # CACHE_DB_PATH points at a non-existent file.
+    # CACHE_DB_PATH points at a non-existent file initially. The eager
+    # helper will create it.
     missing_cache = tmp_path / "does_not_exist.cache.db"
     assert not missing_cache.exists()
 
@@ -669,7 +707,24 @@ def test_008_defers_when_cache_db_path_missing(tmp_path, monkeypatch):
 
     stats = sqlite3.connect(stats_path)
     try:
-        with pytest.raises(db.MigrationGateNotMet):
-            db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+        # No exception — eager trigger created cache.db, applied 001,
+        # Layer C empty-disk fallback passed.
+        db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
     finally:
         stats.close()
+
+    # cache.db now exists and carries the 001 marker.
+    assert missing_cache.exists(), (
+        "V4: eager trigger must create cache.db when missing"
+    )
+    cache_ro = sqlite3.connect(missing_cache)
+    try:
+        applied = cache_ro.execute(
+            "SELECT 1 FROM schema_migrations "
+            "WHERE name = '001_dedup_highest_wins'"
+        ).fetchone()
+    finally:
+        cache_ro.close()
+    assert applied is not None, (
+        "V4: cache 001 marker must be stamped after eager trigger"
+    )
