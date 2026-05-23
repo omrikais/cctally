@@ -146,14 +146,25 @@ def _stage_cache(
                 cache_create_tokens INTEGER, cache_read_tokens INTEGER,
                 usage_extra_json TEXT, cost_usd_raw REAL
             );
+            CREATE TABLE cache_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
             """
         )
         cache.execute(
             "INSERT INTO schema_migrations VALUES (?, ?)",
             ("001_dedup_highest_wins", applied_at_utc),
         )
-        # session_files row whose last_ingested_at is strictly AFTER the
-        # 001 marker so the post-001 ingest gate (Layer B) passes.
+        # cache_meta walk-complete marker: the gate's PROCEED signal now
+        # (cctally-dev#93), paired with the non-empty session_entries
+        # seeded below.
+        cache.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('claude_ingest_walk_complete', '2026-05-22T02:00:00Z')"
+        )
+        # session_files row retained for parity with production seeding;
+        # it no longer gates the walk (the marker does).
         cache.execute(
             "INSERT INTO session_files VALUES (?,?,?,?,?,?,?)",
             (

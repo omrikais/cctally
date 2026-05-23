@@ -135,8 +135,10 @@ def _stage_stats(stats_path: pathlib.Path) -> None:
 def _stage_cache(
     cache_path: pathlib.Path, applied_at_utc: str = "2026-05-22T00:00:00Z"
 ) -> None:
-    """Stage cache.db with the 001 marker + one post-001 session_files row
-    + one session_entry inside the week range.
+    """Stage cache.db so the upgrade gate PROCEEDs: 001 marker + the
+    cache_meta walk-complete marker + non-empty session_entries (the new
+    PROCEED signal, cctally-dev#93) + one session_entry inside the week
+    range.
 
     Entry: claude-opus-4-7, output_tokens=1000 → $25/Mtok * 1000 = $0.025.
     """
@@ -165,14 +167,25 @@ def _stage_cache(
                 cache_create_tokens INTEGER, cache_read_tokens INTEGER,
                 usage_extra_json TEXT, cost_usd_raw REAL
             );
+            CREATE TABLE cache_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
             """
         )
         cache.execute(
             "INSERT INTO schema_migrations VALUES (?, ?)",
             ("001_dedup_highest_wins", applied_at_utc),
         )
-        # session_files: last_ingested_at strictly AFTER the 001 marker so
-        # the post-001 ingest gate (Layer B) passes.
+        # cache_meta walk-complete marker: the gate's PROCEED signal now
+        # (replaces the session_files last_ingested_at proof). The
+        # session_files row is retained for the LEFT JOIN project
+        # attribution that 009 relies on, but no longer gates the walk.
+        cache.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('claude_ingest_walk_complete', ?)",
+            ("2026-05-22T02:00:00Z",),
+        )
         cache.execute(
             "INSERT INTO session_files VALUES (?,?,?,?,?,?,?)",
             (

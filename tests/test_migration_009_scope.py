@@ -141,7 +141,18 @@ CREATE TABLE session_entries (
     usage_extra_json TEXT,
     cost_usd_raw REAL
 );
+CREATE TABLE cache_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
+
+# The gate's PROCEED signal (cctally-dev#93): the cache_meta walk-complete
+# marker + non-empty session_entries. Seed alongside the 001 stamp.
+_WALK_COMPLETE_MARKER_INSERT = (
+    "INSERT INTO cache_meta(key, value) VALUES "
+    "('claude_ingest_walk_complete', '2026-05-22T02:00:00Z')"
+)
 
 
 def _stage_stats_with_blocks(
@@ -213,6 +224,7 @@ def _stage_cache_with_entries(
             "INSERT INTO schema_migrations VALUES (?, ?)",
             ("001_dedup_highest_wins", "2026-05-22T00:00:00Z"),
         )
+        conn.execute(_WALK_COMPLETE_MARKER_INSERT)
         # Stage session_files for each entry's source so the LEFT JOIN
         # carries a project_path. Two project paths so the test can
         # observe replace-all expanding the row set.
@@ -438,6 +450,7 @@ def test_009_null_project_path_collapses_to_unknown(tmp_path, monkeypatch):
             "INSERT INTO schema_migrations VALUES (?, ?)",
             ("001_dedup_highest_wins", "2026-05-22T00:00:00Z"),
         )
+        conn.execute(_WALK_COMPLETE_MARKER_INSERT)
         conn.execute(
             "INSERT INTO session_files "
             "(path, size_bytes, mtime_ns, last_byte_offset, "

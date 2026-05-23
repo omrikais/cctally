@@ -425,11 +425,23 @@ def test_v4_recompute_correct_after_eager_trigger_and_post_001_ingest(
                 usage_extra_json    TEXT,
                 cost_usd_raw        REAL
             );
+            CREATE TABLE cache_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
             """
         )
         cache.execute(
             "INSERT INTO schema_migrations VALUES (?, ?)",
             ("001_dedup_highest_wins", "2026-05-22T00:00:00Z"),
+        )
+        # cache_meta walk-complete marker: the gate's PROCEED signal now
+        # (cctally-dev#93). The eager-apply path does not run sync_cache,
+        # so the marker is seeded explicitly here alongside the non-empty
+        # session_entries below.
+        cache.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('claude_ingest_walk_complete', '2026-05-22T02:00:00Z')"
         )
         cache.execute(
             "INSERT INTO session_files VALUES (?,?,?,?,?,?,?)",

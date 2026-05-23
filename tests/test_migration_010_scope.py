@@ -115,6 +115,10 @@ CREATE TABLE session_entries (
     usage_extra_json TEXT,
     cost_usd_raw REAL
 );
+CREATE TABLE cache_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 
@@ -133,6 +137,13 @@ def _stage_cache_with_entries(cache_path, applied_at, entries):
         conn.execute(
             "INSERT INTO schema_migrations VALUES (?, ?)",
             ("001_dedup_highest_wins", applied_at),
+        )
+        # cache_meta walk-complete marker: the gate's PROCEED signal now
+        # (cctally-dev#93). Paired with the non-empty session_entries
+        # seeded below.
+        conn.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('claude_ingest_walk_complete', '2026-05-22T02:00:00Z')"
         )
         conn.execute(
             "INSERT INTO session_files "

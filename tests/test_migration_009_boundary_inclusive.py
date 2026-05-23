@@ -199,11 +199,21 @@ def test_009_boundary_entries_at_block_start_and_last_observed_included(
                 usage_extra_json TEXT,
                 cost_usd_raw REAL
             );
+            CREATE TABLE cache_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
             """
         )
         cache.execute(
             "INSERT INTO schema_migrations VALUES (?, ?)",
             ("001_dedup_highest_wins", "2026-05-22T00:00:00Z"),
+        )
+        # cache_meta walk-complete marker: the gate's PROCEED signal now
+        # (cctally-dev#93), paired with the non-empty session_entries below.
+        cache.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('claude_ingest_walk_complete', '2026-05-22T02:00:00Z')"
         )
         cache.execute(
             "INSERT INTO session_files "

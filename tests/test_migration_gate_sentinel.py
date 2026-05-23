@@ -223,3 +223,167 @@ def test_marker_withheld_when_a_file_read_fails_mid_walk(tmp_path, monkeypatch):
             conn.close()
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------
+# 5b‴ — Selective per-range source loss recomputes from surviving source
+#       (R5); no body-level guard (spec D7). The gate PROCEEDs because the
+#       cache is complete + non-empty OVERALL; a week whose JSONL was fully
+#       pruned recomputes to $0 (no preserve-guard), while a week whose
+#       JSONL survived recomputes to its corrected value. This locks in the
+#       D7-removal decision: 008 must NOT preserve a zero-entry range.
+# --------------------------------------------------------------------------
+
+
+def _stage_stats_two_weeks(stats_path):
+    """Stage stats.db with two auto/no-project weekly snapshots.
+
+    W1 [2026-05-08, 2026-05-15] — JSONL survives; cost recomputes.
+    W2 [2026-05-15, 2026-05-22] — JSONL fully pruned; recomputes to $0.
+    Both seeded with a large stale pre-fix cost so a no-op would be visible.
+    Returns (w1_id, w2_id).
+    """
+    stats = sqlite3.connect(stats_path)
+    try:
+        stats.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at_utc TEXT
+            );
+            CREATE TABLE weekly_cost_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at_utc TEXT NOT NULL,
+                week_start_date TEXT NOT NULL,
+                week_end_date TEXT NOT NULL,
+                week_start_at TEXT,
+                week_end_at TEXT,
+                range_start_iso TEXT,
+                range_end_iso TEXT,
+                cost_usd REAL NOT NULL,
+                source TEXT NOT NULL DEFAULT 'cctally-range-cost',
+                mode TEXT NOT NULL DEFAULT 'auto',
+                project TEXT
+            );
+            """
+        )
+        w1 = stats.execute(
+            "INSERT INTO weekly_cost_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " range_start_iso, range_end_iso, cost_usd, mode, project) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                "2026-05-15T00:00:00Z", "2026-05-08", "2026-05-15",
+                "2026-05-08T00:00:00Z", "2026-05-15T00:00:00Z",
+                99.99, "auto", None,
+            ),
+        ).lastrowid
+        w2 = stats.execute(
+            "INSERT INTO weekly_cost_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " range_start_iso, range_end_iso, cost_usd, mode, project) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                "2026-05-22T00:00:00Z", "2026-05-15", "2026-05-22",
+                "2026-05-15T00:00:00Z", "2026-05-22T00:00:00Z",
+                88.88, "auto", None,
+            ),
+        ).lastrowid
+        stats.commit()
+        return w1, w2
+    finally:
+        stats.close()
+
+
+def test_selective_prune_recomputes_surviving_and_zeros_pruned(
+    tmp_path, monkeypatch,
+):
+    """W1 (JSONL present) recomputes to its corrected cost; W2 (JSONL fully
+    pruned, zero in-range session_entries) recomputes to $0. The gate
+    PROCEEDs because the cache carries the walk-complete marker AND is
+    non-empty overall — selective per-range loss is accepted
+    recompute-from-source behavior (R5), not blocked by any body guard.
+    """
+    db = _load_db()
+    core = db._cctally_core
+
+    stats_path = tmp_path / "stats.db"
+    cache_path = tmp_path / "cache.db"
+    w1_id, w2_id = _stage_stats_two_weeks(stats_path)
+
+    # cache.db: the new gate PROCEED signal is the cache_meta marker +
+    # non-empty session_entries (NOT a session_files last_ingested_at
+    # proof). Seed one entry inside W1's window ONLY; W2's range has none
+    # (its JSONL was pruned), so W2's recompute sums to $0.
+    cache = sqlite3.connect(cache_path)
+    db._apply_cache_schema(cache)
+    cache.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations "
+        "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+    )
+    cache.execute(
+        "INSERT INTO schema_migrations VALUES ('001_dedup_highest_wins', ?)",
+        ("2026-05-01T00:00:00Z",),
+    )
+    cache.execute(
+        "INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+        (MARKER, "2026-05-23T00:00:00Z"),
+    )
+    cache.execute(
+        "INSERT INTO session_entries "
+        "(source_path, line_offset, timestamp_utc, model, "
+        " input_tokens, output_tokens, cache_create_tokens, "
+        " cache_read_tokens, usage_extra_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            "/tmp/session1.jsonl", 0, "2026-05-10T00:00:00Z",
+            "claude-opus-4-7", 0, 1000, 0, 0, "{}",
+        ),
+    )
+    cache.commit()
+    cache.close()
+
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    core._init_paths_from_env()
+
+    # A populated projects dir so disk_state="jsonl_present" and the gate
+    # reaches the complete+non-empty PROCEED (row 6).
+    fake_projects = tmp_path / "claude_projects"
+    fake_projects.mkdir()
+    (fake_projects / "session1.jsonl").write_text("{}\n")
+    monkeypatch.setattr(core, "CLAUDE_PROJECTS_DIR", fake_projects)
+    monkeypatch.setattr(core, "CACHE_DB_PATH", cache_path)
+
+    stats = sqlite3.connect(stats_path)
+    try:
+        db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+
+        w1_cost = stats.execute(
+            "SELECT cost_usd FROM weekly_cost_snapshots WHERE id=?", (w1_id,),
+        ).fetchone()[0]
+        w2_cost = stats.execute(
+            "SELECT cost_usd FROM weekly_cost_snapshots WHERE id=?", (w2_id,),
+        ).fetchone()[0]
+
+        # W1: 1000 opus-4-7 output tokens at $25/Mtok = $0.025 (corrected
+        # from the stale 99.99).
+        assert w1_cost == pytest.approx(0.025, abs=1e-9), (
+            f"surviving-source week must recompute to its corrected cost; "
+            f"got {w1_cost!r}"
+        )
+        # W2: zero in-range entries -> $0 (no preserve-guard; D7 removed).
+        assert w2_cost == pytest.approx(0.0, abs=1e-9), (
+            f"fully-pruned week must recompute to $0 (R5 / no body guard); "
+            f"got {w2_cost!r}"
+        )
+
+        marker = stats.execute(
+            "SELECT 1 FROM schema_migrations "
+            "WHERE name='008_recompute_weekly_cost_snapshots_dedup_fix'"
+        ).fetchone()
+        assert marker is not None, "008 marker must stamp on the PROCEED path"
+    finally:
+        stats.close()

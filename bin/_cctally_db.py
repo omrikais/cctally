@@ -2576,8 +2576,8 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
     try:
         # Resolve projects dirs via the shared helper (mirrors 009/010).
         # Empty list returned only when NO projects/ dir resolves under
-        # any env-configured or default root; G3-style fail-closed
-        # below.
+        # any env-configured or default root; the resolver classifies
+        # that as ``disk_state="absent"`` and decides accordingly.
         projects_dirs = _resolve_projects_dirs_for_gate()
 
         # F3 scope: only rows we have authority over (see docstring).
@@ -2587,44 +2587,16 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
             "WHERE mode = 'auto' AND project IS NULL"
         ).fetchall()
 
-        # G3 — refuse to zero historical snapshots when NO projects/
-        # dir resolves on disk under ANY env-configured or default
-        # root. Without this guard the prior unconditional fallback to
-        # ``[_cctally_core.CLAUDE_PROJECTS_DIR]`` (potentially missing
-        # in this scenario) made the gate's Layer C empty-disk
-        # fallback fire, which then ran the recompute against an empty
-        # ``session_entries`` and silently UPDATEd every
-        # ``mode='auto' AND project IS NULL`` snapshot to
-        # ``cost_usd = 0.0`` — destruction with no recovery path.
-        #
-        # Heuristic: only fail-closed when the operator's
-        # ``weekly_cost_snapshots`` HAS rows to recompute. A truly
-        # fresh install (no projects dirs AND no snapshot rows) is
-        # safe to no-op — there's nothing to corrupt, and gate-defer
-        # would loop forever (no JSONL → no future ingest → resolver
-        # stays empty → defer again).
-        #
-        # Surfaces as ``MigrationGateNotMet`` so the dispatcher's
-        # gate-defer machinery handles it cleanly (no migration-error
-        # banner, marker stays unstamped, ``user_version`` doesn't
-        # advance). The exception message tells the operator what to
-        # check and how to opt out via ``db skip``.
-        if not projects_dirs and snapshot_rows:
-            raise MigrationGateNotMet(
-                "CLAUDE_CONFIG_DIR resolves to no readable projects/ "
-                "dir; refusing to zero historical "
-                "weekly_cost_snapshots. Check the env var or run "
-                "`cctally db skip "
-                "008_recompute_weekly_cost_snapshots_dedup_fix` to "
-                "defer (`cctally db unskip ...` reverts)."
-            )
-
-        # Fresh install fall-through: no projects dirs AND no snapshot
-        # rows. Feed the gate a single defensive default so Layer C
-        # can still no-op the migration (mark applied + return). Gate-
-        # defer would loop forever on this topology.
-        if not projects_dirs:
-            projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
+        # The gate is now a pure state machine (cctally-dev#93): the old
+        # inline G3 fail-closed block and the defensive default-dir
+        # fallback are gone. An empty ``projects_dirs`` is the legitimate
+        # ``disk_state="absent"`` topology — the resolver DEFERS (row 7)
+        # when ``data_present`` and PROCEEDS (row 5, body no-ops) when
+        # there's nothing to protect, with the operator-guidance reason
+        # text baked into the resolver. No body-level recompute guard
+        # (spec D7): the recompute below computes every in-range value
+        # from surviving ``session_entries``, INCLUDING to $0 — the
+        # wholesale-zeroing protection lives entirely in the gate.
         _gate_001_post_ingest_completed(
             cache_ro, projects_dirs, data_present=bool(snapshot_rows),
         )
@@ -2905,21 +2877,13 @@ def _009_recompute_five_hour_blocks_dedup_fix(
             "FROM five_hour_blocks"
         ).fetchall()
 
-        # G3-style fail-closed: refuse to zero historical 5h block totals
-        # when no projects/ dir resolves on disk under any env-configured
-        # or default root. Fresh installs with no blocks AND no projects
-        # dir are safe to no-op.
-        if not projects_dirs and block_rows:
-            raise MigrationGateNotMet(
-                "CLAUDE_CONFIG_DIR resolves to no readable projects/ "
-                "dir; refusing to zero historical five_hour_blocks "
-                "totals. Check the env var or run `cctally db skip "
-                "009_recompute_five_hour_blocks_dedup_fix` to defer "
-                "(`cctally db unskip ...` reverts)."
-            )
-
-        if not projects_dirs:
-            projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
+        # Pure state-machine gate (cctally-dev#93): the inline G3
+        # fail-closed block and the default-dir fallback are gone; an
+        # empty ``projects_dirs`` is the ``disk_state="absent"`` topology
+        # the resolver handles (row 7 DEFER when data_present, row 5
+        # PROCEED otherwise). No body-level recompute guard (spec D7) —
+        # every in-range block recomputes from surviving
+        # ``session_entries``, including to $0.
         _gate_001_post_ingest_completed(
             cache_ro, projects_dirs, data_present=bool(block_rows),
         )
@@ -3192,16 +3156,14 @@ def _010_recompute_percent_milestones_dedup_fix(
             "         percent_threshold ASC, id ASC"
         ).fetchall()
 
-        if not projects_dirs and milestone_rows:
-            raise MigrationGateNotMet(
-                "CLAUDE_CONFIG_DIR resolves to no readable projects/ "
-                "dir; refusing to zero historical percent_milestones "
-                "costs. Check the env var or run `cctally db skip "
-                "010_recompute_percent_milestones_dedup_fix` to defer "
-                "(`cctally db unskip ...` reverts)."
-            )
-        if not projects_dirs:
-            projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
+        # Pure state-machine gate (cctally-dev#93): no inline G3 block, no
+        # default-dir fallback. The resolver classifies an empty
+        # ``projects_dirs`` as ``disk_state="absent"`` and decides (row 7
+        # DEFER when data_present, row 5 PROCEED otherwise). No body-level
+        # recompute guard and NO segment guard (spec D7): every milestone
+        # recomputes from surviving ``session_entries`` — a zero-entry
+        # segment correctly yields cumulative=0/marginal=0, kept isolated
+        # by the ``seg_key`` partitioning of the marginal chain.
         _gate_001_post_ingest_completed(
             cache_ro, projects_dirs, data_present=bool(milestone_rows),
         )
