@@ -1905,296 +1905,153 @@ def _gate_001_post_ingest_completed(
     *,
     data_present: bool = False,
 ) -> None:
-    """Raise ``MigrationGateNotMet`` unless cache migration 001 has applied
-    AND ``sync_cache`` has run at least once after it (or there are no
-    JSONL files to ingest in the first place).
+    """Thin I/O shell over the pure ``resolve_upgrade_gate`` resolver.
 
-    ``data_present`` (keyword-only, defaults to ``False`` for backward
-    compatibility with the 2-arg test callers) tells the gate whether the
-    CALLER still holds historical rows it is about to recompute from
-    ``session_entries``. When it does, two otherwise-passing shortcuts
-    become DESTRUCTIVE and are converted to defers:
+    Derives the six ``UpgradeGateInputs`` from cache.db reads + the
+    on-disk JSONL state, calls the resolver (the D3 truth table), and
+    raises ``MigrationGateNotMet(reason)`` when the resolution is
+    ``DEFER``. All decision logic lives in the resolver; this function
+    does only I/O. (cctally-dev#93, spec D1/D3.)
 
-      * **Layer C (empty-disk fallback)** — if the projects dir exists but
-        has been pruned of JSONL, ``session_entries`` is empty; recomputing
-        over it would zero the caller's historical aggregates (the only
-        remaining copy of that data). With ``data_present=True`` the gate
-        raises ``MigrationGateNotMet`` instead of silently passing.
-      * **001-skipped path** — ``cctally db skip 001_dedup_highest_wins``
-        means the dedup wipe never ran, so ``session_entries`` is still the
-        stale pre-dedup data. Letting the caller recompute and stamp its
-        marker now strands it: a later ``db unskip`` rebuilds the cache but
-        cannot re-trigger an already-stamped stats migration. With
-        ``data_present=True`` the gate defers so the recompute stays pending
-        until 001 has actually applied and post-ingest data exists.
-
-    Both shortcuts still pass freely on the truly-fresh-install topology
-    (``data_present=False`` because the caller has no rows): there is
-    nothing to corrupt, and deferring would loop forever (no JSONL → no
-    future ingest → resolver stays empty).
-
-    The single-signal gate "001 marker present" is not enough: 001 writes
-    the marker immediately after the wipe, BEFORE any post-wipe
-    ``sync_cache`` repopulates ``session_entries``. A downstream
-    migration that re-aggregates from ``session_entries`` (e.g. stats
-    migration 008) would legally run against an empty just-wiped cache
-    and zero out every historical aggregate.
-
-    Composite gate:
-
-      * **Layer A — marker present**: ``schema_migrations`` carries
-        ``001_dedup_highest_wins``. Without this, the wipe hasn't even
-        started; downstream migrations have no business running.
-      * **Layer B — post-001 ingest observed**: any ``session_files``
-        row with ``last_ingested_at >= 001.applied_at_utc``. Since 001
-        DELETEd every row from ``session_files`` in the same transaction
-        that stamped the marker, any row present now must have been
-        written by ``sync_cache`` AFTER the migration. The comparison is
-        ``>=`` (not ``>``) so a same-second post-001 ingest — both
-        timestamps come from whole-second ``now_utc_iso()`` — still
-        counts; the wipe-before-marker invariant guarantees an equal
-        timestamp can only be a post-001 row.
-      * **Layer C — empty-disk fallback**: if no JSONL files exist
-        under ANY of ``claude_projects_dirs``, the absence of
-        ``session_files`` rows is the correct state — pass silently so
-        users with no Claude usage can still complete the upgrade.
+    Input derivation
+    ----------------
+      * ``cache_001_state`` — ``"applied"`` if ``schema_migrations``
+        carries ``001_dedup_highest_wins``; else ``"skipped"`` if
+        ``schema_migrations_skipped`` carries it; else ``"pending"``.
+      * ``walk_complete_since_001`` — the ``cache_meta``
+        ``claude_ingest_walk_complete`` marker is present. ``sync_cache``
+        writes it only after a clean full walk that began with 001 already
+        applied, and cache 001 / rebuild / truncation clear it atomically
+        (spec D5). This REPLACES the old ``session_files.last_ingested_at
+        >= 001.applied_at_utc`` proof — the marker is the single
+        ingest-completeness signal now. A missing ``cache_meta`` table
+        composes as ``False`` (not a hard defer).
+      * ``cache_has_entries`` — ``session_entries`` is non-empty (via
+        ``_probe_table_nonempty``). Together with ``walk_complete`` this
+        closes the round-3 partial-walk false-pass and the P1 empty-cache
+        rebuild-over-pruned-disk case (spec D3): row 6 requires BOTH.
+      * ``caller_has_historical_rows`` — caller-supplied ``data_present``;
+        each migration passes its OWN scoped row set (008
+        ``bool(snapshot_rows)``, etc.) so a no-op upgrade isn't wedged.
+      * ``disk_state`` — ``"absent"`` (no projects dirs resolve),
+        ``"jsonl_present"`` (≥1 ``*.jsonl`` under any root), or
+        ``"pruned"`` (dirs resolve but hold no JSONL). REASON-only — it
+        never changes the decision, only the row-7 operator guidance text.
+      * ``marker_state_readable`` — ``False`` only when the
+        ``schema_migrations`` read is missing-table (cache.db never ran
+        the dispatcher) OR any of the reads is transiently
+        ``BUSY``/``LOCKED``/``CANTOPEN`` (per-read split, spec P2#1). The
+        resolver maps this to row 1 DEFER (retry next open).
 
     Parameters
     ----------
     cache_ro
-        Read-only sqlite3 connection to ``cache.db``. The migration
-        framework opens stats.db and cache.db separately; cross-DB
-        migrations open the sibling DB read-only inside their handler
-        body via ``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``.
-        Exposed as an explicit parameter so tests can inject an
-        in-memory or tmp-path connection without touching ``HOME``.
+        Read-only sqlite3 connection to ``cache.db``. Cross-DB migrations
+        open the sibling DB read-only inside their handler body via
+        ``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``. Exposed as
+        an explicit parameter so tests can inject a tmp-path connection
+        without touching ``HOME``.
     claude_projects_dirs
-        Either a single ``pathlib.Path`` (legacy single-rooted form) or
-        a ``list[pathlib.Path]`` of projects/ directories to scan for
-        JSONL files. Layer C ORs across every root — if no JSONL exists
-        under ANY root, the gate's empty-disk fallback fires.
-        Production callers resolve this via
-        ``_cctally_core._resolve_claude_projects_dirs()`` (env-aware,
-        honors ``CLAUDE_CONFIG_DIR``); tests typically inject
-        ``[tmp_path / "projects"]`` or a single ``tmp_path / "projects"``.
+        Either a single ``pathlib.Path`` (legacy single-rooted form) or a
+        ``list[pathlib.Path]`` of projects/ directories. The disk-state
+        classification ORs across every root. Production callers resolve
+        this via ``_resolve_projects_dirs_for_gate`` (env-aware); an empty
+        list is the legitimate ``disk_state="absent"`` topology and is
+        handled by the resolver (no per-migration default-dir fallback).
+    data_present
+        Keyword-only (defaults ``False`` for the 2-arg test callers).
+        Whether the caller still holds historical rows it is about to
+        recompute from ``session_entries``.
 
-    Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3.
+    Spec: docs/superpowers/specs/2026-05-23-migration-gate-state-machine-design.md D1/D3.
     """
-    # Normalize to list so the empty-disk fallback can OR across roots.
-    # Accepting a bare Path keeps the legacy test signature working.
+    # Normalize to list so the disk-state classification can OR across
+    # roots. Accepting a bare Path keeps the legacy test signature working.
     if isinstance(claude_projects_dirs, pathlib.Path):
         projects_dirs = [claude_projects_dirs]
     else:
         projects_dirs = list(claude_projects_dirs)
 
-    # cache.db may exist as an empty file (e.g. very-early bootstrap, or
-    # the user has only ever opened it via paths that didn't run the
-    # dispatcher). In that state the ``schema_migrations`` table doesn't
-    # yet exist; reading from it raises ``sqlite3.OperationalError``
-    # ("no such table"). Treat this as Layer A failure — the marker is
-    # absent because the table is absent — and defer the same way we
-    # would for a present-but-empty table.
-    #
-    # Belt-and-suspenders on the error predicate: SQLite's
-    # ``"no such table"`` message has been stable for ~20 years, but we
-    # also check ``sqlite_errorcode == SQLITE_ERROR (1)`` (Python 3.11+;
-    # cctally's floor is 3.13 per ``__min_python_version__`` in
-    # bin/cctally) so a future message-format change doesn't
-    # silently re-raise. ``getattr(..., None) in (None, 1)`` lets the
-    # check degrade gracefully if the attribute is ever missing.
-    try:
-        gate_row = cache_ro.execute(
-            "SELECT applied_at_utc FROM schema_migrations WHERE name = ?",
-            ("001_dedup_highest_wins",),
-        ).fetchone()
-    except sqlite3.OperationalError as exc:
-        # SQLITE_BUSY / SQLITE_LOCKED on the gate's RO read: the gate
-        # state is genuinely unknown at this instant. Defer rather than
-        # logging to migration-errors.log — the next dispatcher walk
-        # retries cleanly once the writer releases the lock (G5).
-        if _is_transient_sqlite_error(exc):
-            raise MigrationGateNotMet(
-                "cache.db transiently locked; retry on next open."
-            ) from None
-        if not _is_no_such_table_error(exc):
-            raise
-        raise MigrationGateNotMet(
-            "cache.db has no schema_migrations table yet; "
-            "run any JSONL-reading command (e.g. `cctally weekly`) "
-            "once to bootstrap the migration framework."
-        ) from None
-    if gate_row is None:
-        # G1 — 001 may instead be poison-pill skipped via
-        # ``cctally db skip 001_dedup_highest_wins``.
-        #
-        # When the caller has NO historical rows to recompute
-        # (``data_present=False``), skipping 001 is acceptance that the
-        # cross-DB consumers should proceed against whatever's currently in
-        # session_entries rather than block forever — there's nothing to
-        # corrupt.
-        #
-        # When the caller DOES hold historical rows (``data_present=True``),
-        # passing here is DESTRUCTIVE-then-stranding: the dependent
-        # recompute would run against the stale pre-dedup ``session_entries``
-        # AND stamp its own marker. A later ``cctally db unskip
-        # 001_dedup_highest_wins`` rebuilds cache.db's session_entries but
-        # only resets cache.db's user_version — it cannot re-trigger an
-        # already-stamped stats migration, so ``report`` and the 5h
-        # aggregates would stay permanently inflated. So for a data-present
-        # caller we DEFER while 001 is skipped: the recompute stays pending
-        # (marker unstamped, user_version not advanced) until 001 has
-        # actually applied and post-ingest data exists.
-        try:
-            skipped_row = cache_ro.execute(
-                "SELECT 1 FROM schema_migrations_skipped WHERE name = ?",
-                ("001_dedup_highest_wins",),
-            ).fetchone()
-        except sqlite3.OperationalError as exc:
-            if _is_transient_sqlite_error(exc):
-                raise MigrationGateNotMet(
-                    "cache.db transiently locked; retry on next open."
-                ) from None
-            if _is_no_such_table_error(exc):
-                # schema_migrations_skipped doesn't exist yet —
-                # equivalent to "not skipped"; fall through to the
-                # "marker not present" defer below.
-                skipped_row = None
-            else:
-                raise
-        if skipped_row is not None:
-            if data_present:
-                # 001 skipped but the caller still holds historical rows —
-                # defer rather than recompute-over-stale + stamp (which
-                # would strand the migration past a future ``db unskip``).
-                raise MigrationGateNotMet(
-                    "cache.db migration 001_dedup_highest_wins is skipped; "
-                    "deferring dependent recompute to avoid recomputing "
-                    "historical aggregates over stale pre-dedup "
-                    "session_entries. Run `cctally db unskip "
-                    "001_dedup_highest_wins` (then any JSONL-reading "
-                    "command once) to apply the dedup and unblock."
-                )
-            # 001 explicitly skipped AND no rows to recompute → gate
-            # passes (nothing to corrupt). To unblock the dedup itself,
-            # the operator runs ``cctally db unskip
-            # 001_dedup_highest_wins`` and re-opens.
-            return
-        raise MigrationGateNotMet(
-            "cache.db migration 001_dedup_highest_wins not yet applied; "
-            "run any JSONL-reading command (e.g. `cctally weekly`) once, "
-            "or `cctally db skip 001_dedup_highest_wins` to defer "
-            "(`cctally db unskip 001_dedup_highest_wins` reverts)."
-        )
-    applied_at_utc = gate_row[0]
+    marker_state_readable = True
 
-    # Layer B — proof of a COMPLETED post-001 ingest: a session_files row
-    # whose last_ingested_at is at-or-after the 001 marker AND whose
-    # delta-resume columns were written by sync_cache's post-entries
-    # commit. 001 DELETEs every row from session_files inside the SAME
-    # transaction that stamps its marker (see ``_001_dedup_highest_wins``),
-    # so NO pre-001 row can survive — any row present now was written by a
-    # sync_cache that ran AFTER the migration committed.
-    #
-    # ``size_bytes > 0 OR last_byte_offset > 0`` is the completion proof.
-    # ``sync_cache`` writes a session_files row in TWO phases:
-    #   (1) ``_ensure_session_files_row`` commits a PLACEHOLDER row at the
-    #       top of the per-file loop — ``(size_bytes=0, mtime_ns=0,
-    #       last_byte_offset=0, last_ingested_at=now)`` — BEFORE the file's
-    #       JSONL is parsed, so the `session` subcommand's session_id /
-    #       project_path join is populated even for unchanged files.
-    #   (2) The post-entries commit UPSERTs the REAL ``size_bytes`` /
-    #       ``last_byte_offset`` AFTER ``session_entries`` rows are
-    #       inserted, in the same transaction as those inserts.
-    # A row stuck at phase (1) — sync_cache was interrupted (kill -9,
-    # power loss, crash) between the placeholder commit and the first
-    # per-file entries commit — carries a fresh ``last_ingested_at`` but
-    # NO entries behind it. The pre-fix predicate (timestamp-only) would
-    # pass on that placeholder while ``session_entries`` is empty/partial,
-    # letting 008/009/010 recompute over a near-empty cache and stamp
-    # their markers permanently — silently zeroing historical weekly
-    # cost, 5h block totals, and percent milestones until a manual rerun.
-    # Requiring a non-zero delta-resume column rejects the placeholder:
-    # any file with at least one byte ingested has ``size_bytes > 0``
-    # after phase (2). A genuinely 0-byte JSONL contributes no entries to
-    # undercount anyway, and the Layer C empty-disk fallback covers the
-    # no-usage-on-disk topology.
-    #
-    # The comparison is ``>=``, not ``>``: both ``applied_at_utc`` and
-    # ``last_ingested_at`` are written via ``now_utc_iso()``, which
-    # truncates to whole seconds. If a JSONL-reading command applies 001
-    # and then runs sync_cache within that same wall-clock second,
-    # ``last_ingested_at == applied_at_utc`` even though the post-001
-    # ingest genuinely completed. A strict ``>`` would reject that real
-    # ingest and, for a stats-only user afterwards, defer 008/009/010
-    # forever. ``>=`` is safe precisely because of the wipe-before-marker
-    # invariant above: an equal timestamp can ONLY be a post-001 row.
-    #
-    # Both sides route through ``unixepoch()`` as a forward-compatibility
-    # hedge: if any future code path ever writes one side with ``+00:00``
-    # and the other with ``Z``, lex compare silently mis-orders moments.
-    # Mirrors the same defense applied to the cross-reset flag (CLAUDE.md
-    # "Cross-reset flag is interval-based" — block_start_at vs
-    # week_start_at vs last_observed_at_utc all route through
-    # ``unixepoch()`` to absorb offset-mix drift).
+    # --- cache 001 state (schema_migrations / schema_migrations_skipped) ---
+    # "applied" wins; else "skipped"; else "pending". A missing
+    # ``schema_migrations`` table (cache.db never ran the dispatcher) or a
+    # transient BUSY/LOCKED on the read flips ``marker_state_readable`` so
+    # the resolver defers at row 1 instead of guessing.
+    cache_001_state = "pending"
     try:
-        has_post_001_ingest = cache_ro.execute(
-            "SELECT 1 FROM session_files "
-            "WHERE unixepoch(last_ingested_at) >= unixepoch(?) "
-            "  AND (size_bytes > 0 OR last_byte_offset > 0) LIMIT 1",
-            (applied_at_utc,),
-        ).fetchone() is not None
+        if cache_ro.execute(
+            "SELECT 1 FROM schema_migrations WHERE name=?",
+            ("001_dedup_highest_wins",),
+        ).fetchone() is not None:
+            cache_001_state = "applied"
+        else:
+            try:
+                if cache_ro.execute(
+                    "SELECT 1 FROM schema_migrations_skipped WHERE name=?",
+                    ("001_dedup_highest_wins",),
+                ).fetchone() is not None:
+                    cache_001_state = "skipped"
+            except sqlite3.OperationalError as exc:
+                if _is_transient_sqlite_error(exc):
+                    marker_state_readable = False
+                elif not _is_no_such_table_error(exc):
+                    raise
+                # no_such_table on _skipped -> treat as "not skipped" (pending)
     except sqlite3.OperationalError as exc:
-        # Same transient-defer rule as Layer A (G5): BUSY/LOCKED on the
-        # RO read translates to MigrationGateNotMet, not failure.
-        if _is_transient_sqlite_error(exc):
-            raise MigrationGateNotMet(
-                "cache.db transiently locked; retry on next open."
-            ) from None
-        if _is_no_such_table_error(exc):
-            # cache.db has a schema_migrations table (Layer A passed) but
-            # no session_files table. Equivalent to "no post-001 ingest
-            # observed"; fall through to the Layer C empty-disk check.
-            has_post_001_ingest = False
+        if _is_transient_sqlite_error(exc) or _is_no_such_table_error(exc):
+            marker_state_readable = False
         else:
             raise
-    if has_post_001_ingest:
-        return
 
-    # Layer C — empty-disk fallback. If there are no JSONL files to
-    # ingest under ANY of the resolved projects dirs, the absence of
-    # session_files rows is the correct state. No-op succeed so users
-    # with no Claude usage can still pass the gate; downstream
-    # migrations are also no-ops in this case (no cost rows to
-    # recompute, no aggregates to refresh).
-    #
-    # EXCEPTION (``data_present=True``): a caller that still holds
-    # historical rows must NOT take this shortcut. "No JSONL on disk" here
-    # means the user pruned ``~/.claude/projects/`` (or pointed
-    # ``CLAUDE_CONFIG_DIR`` at an emptied ``projects/`` dir) AFTER 001
-    # wiped session_entries — so session_entries is empty but the stats
-    # tables still carry the only surviving copy of the data. Passing
-    # would recompute over an empty cache and zero those historical
-    # aggregates irrecoverably. Defer instead; the recompute stays pending
-    # until a real post-001 ingest repopulates session_entries.
-    has_any_jsonl = any(
-        any(p.glob("**/*.jsonl")) for p in projects_dirs
-    )
-    if not has_any_jsonl:
-        if data_present:
-            raise MigrationGateNotMet(
-                "cache.db has no post-001 ingest and no JSONL on disk, but "
-                "historical rows remain to recompute; refusing the "
-                "empty-disk fallback to avoid zeroing them. Restore the "
-                "Claude projects/ JSONL (or fix CLAUDE_CONFIG_DIR) and run "
-                "any JSONL-reading command once, or `cctally db skip` this "
-                "migration to accept the stale aggregates."
-            )
-        return
+    # --- walk_complete (cache_meta marker presence) ---
+    # The single ingest-completeness signal (spec D5). ``sync_cache`` writes
+    # it only after a clean full walk begun with 001 applied; cache 001 /
+    # rebuild / truncation clear it atomically. Missing table -> walk✗.
+    walk_complete = False
+    if marker_state_readable:
+        try:
+            walk_complete = cache_ro.execute(
+                "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+            ).fetchone() is not None
+        except sqlite3.OperationalError as exc:
+            if _is_transient_sqlite_error(exc):
+                marker_state_readable = False
+            elif not _is_no_such_table_error(exc):
+                raise
 
-    raise MigrationGateNotMet(
-        "cache.db post-001 ingest not yet observed; run any JSONL-reading "
-        "command (e.g. `cctally weekly`) once and retry."
-    )
+    # --- cache_has_entries (session_entries non-empty) ---
+    cache_has_entries = False
+    if marker_state_readable:
+        try:
+            cache_has_entries = cache_ro.execute(
+                "SELECT 1 FROM session_entries LIMIT 1"
+            ).fetchone() is not None
+        except sqlite3.OperationalError as exc:
+            if _is_transient_sqlite_error(exc):
+                marker_state_readable = False
+            elif not _is_no_such_table_error(exc):
+                raise
+
+    # --- disk_state (REASON-only; never changes the decision) ---
+    if not projects_dirs:
+        disk_state = "absent"
+    elif any(any(p.glob("**/*.jsonl")) for p in projects_dirs):
+        disk_state = "jsonl_present"
+    else:
+        disk_state = "pruned"
+
+    resolution = resolve_upgrade_gate(UpgradeGateInputs(
+        cache_001_state=cache_001_state,
+        walk_complete_since_001=walk_complete,
+        cache_has_entries=cache_has_entries,
+        caller_has_historical_rows=bool(data_present),
+        disk_state=disk_state,
+        marker_state_readable=marker_state_readable,
+    ))
+    if resolution.action is GateAction.DEFER:
+        raise MigrationGateNotMet(resolution.reason)
 
 
 def _is_no_such_table_error(exc: sqlite3.OperationalError) -> bool:
