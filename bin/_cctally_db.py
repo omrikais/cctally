@@ -2170,6 +2170,42 @@ def _eagerly_apply_cache_migrations() -> None:
 
 # === Region 7c: Cache migration 001_dedup_highest_wins (ccusage-parity fix) ===
 
+
+def _001_banner_should_emit(conn: sqlite3.Connection) -> bool:
+    """SW5 — gate cache migration 001's banner on two conditions:
+
+      (a) session_entries has at least one row to re-ingest. Empty
+          tables make the handler a marker-only no-op; the banner has
+          nothing to announce. Symmetric with migration 008's
+          ``snapshot_rows`` gate.
+
+      (b) The active subcommand (``sys.argv[1]``) is NOT in
+          ``_BANNER_SUPPRESSED_COMMANDS``. Hot paths machine-consume
+          stderr (status-line, hook-tick) or take over the screen
+          (tui, dashboard); banner has no safe surface. Interactive
+          commands (``report``, ``weekly``, etc.) still see the banner
+          once on the upgrade.
+
+    Returns True iff the banner should be printed. Defensive: any
+    error reading either signal falls back to "don't print" — silence
+    is the safer side under uncertainty (worst case, a heavy user
+    misses the one-line announcement; not a correctness regression).
+    """
+    try:
+        argv1 = sys.argv[1] if len(sys.argv) > 1 else None
+    except Exception:
+        argv1 = None
+    if argv1 in _BANNER_SUPPRESSED_COMMANDS:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM session_entries LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
 @cache_migration("001_dedup_highest_wins")
 def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
     """One-time re-ingest of session_entries with corrected msg_id+req_id dedup.
@@ -2199,11 +2235,31 @@ def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
       * Migration handler does NOT call ``_log_migration_error`` /
         ``_clear_migration_error_log_entries``; the dispatcher owns that
         surface (CLAUDE.md "Migration error sentinel is uniform").
+
+    SW5 — Banner suppression. Two gates compose:
+
+      (a) ``session_entries`` non-emptiness — if the table is empty (most
+          fresh-install upgrade topologies + every golden fixture), the
+          handler's body is a marker-only no-op and the banner has
+          nothing to announce. Mirrors the snapshot-rows gate on
+          migration 008's banner.
+
+      (b) ``sys.argv[1]`` in ``_BANNER_SUPPRESSED_COMMANDS`` — the same
+          set the dispatcher consults for its post-failure banner. Hot
+          paths (record-usage, hook-tick, sync-week, cache-sync,
+          refresh-usage, tui, dashboard, db, doctor) machine-consume
+          stderr or take over the screen, so the banner has nowhere
+          safe to land. Migration handlers don't receive ``args``, so
+          we read ``sys.argv`` directly — `argparse` hasn't run yet at
+          handler time anyway. Interactive surfaces (``report``,
+          ``weekly``, ``percent-breakdown``, etc.) still see it once.
     """
-    eprint(
-        "[cctally] Re-ingesting Claude session history with corrected dedup "
-        "(one-time; may take 10-30s depending on JSONL volume)..."
-    )
+    if _001_banner_should_emit(conn):
+        eprint(
+            "[cctally] Re-ingesting Claude session history with "
+            "corrected dedup (one-time; may take 10-30s depending on "
+            "JSONL volume)..."
+        )
     conn.execute("BEGIN")
     try:
         conn.execute("DELETE FROM session_entries")
