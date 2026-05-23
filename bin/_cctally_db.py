@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import enum
 import json
 import os
 import pathlib
@@ -222,6 +223,98 @@ class MigrationGateNotMet(Exception):
 
     Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §D4.
     """
+
+
+@dataclass(frozen=True)
+class UpgradeGateInputs:
+    """Frozen inputs to ``resolve_upgrade_gate`` (cctally-dev#93, spec D1).
+
+    All fields are derived by the thin I/O shell ``_gate_001_post_ingest_completed``;
+    the resolver itself does no I/O.
+    """
+    cache_001_state: str            # "applied" | "skipped" | "pending"
+    walk_complete_since_001: bool   # cache_meta marker present; missing table -> False
+    cache_has_entries: bool         # session_entries non-empty; missing table -> False
+    caller_has_historical_rows: bool
+    disk_state: str                 # "jsonl_present" | "pruned" | "absent" (REASON only)
+    marker_state_readable: bool     # False -> schema_migrations missing OR any read transiently locked
+
+
+class GateAction(enum.Enum):
+    PROCEED = "proceed"   # run the recompute body
+    DEFER = "defer"       # raise MigrationGateNotMet; stays pending, retried next open
+
+
+@dataclass(frozen=True)
+class GateResolution:
+    action: GateAction
+    reason: str
+
+
+def resolve_upgrade_gate(inp: UpgradeGateInputs) -> GateResolution:
+    """Pure decision function — the D3 truth table. First matching row wins.
+
+    Spec: docs/superpowers/specs/2026-05-23-migration-gate-state-machine-design.md D1/D3.
+    """
+    # Row 1 — marker state unreadable (missing schema_migrations or transient lock).
+    if not inp.marker_state_readable:
+        return GateResolution(
+            GateAction.DEFER,
+            "cache.db migration state unreadable (no schema_migrations table yet, "
+            "or transiently locked); retry on next open.",
+        )
+    # Row 2 — 001 not applied.
+    if inp.cache_001_state == "pending":
+        return GateResolution(
+            GateAction.DEFER,
+            "cache.db migration 001_dedup_highest_wins not yet applied; run any "
+            "JSONL-reading command (e.g. `cctally weekly`) once, or "
+            "`cctally db skip 001_dedup_highest_wins` to defer.",
+        )
+    # Rows 3/4 — 001 skipped.
+    if inp.cache_001_state == "skipped":
+        if inp.caller_has_historical_rows:
+            return GateResolution(
+                GateAction.DEFER,
+                "cache.db migration 001_dedup_highest_wins is skipped while historical "
+                "rows remain; deferring to avoid recomputing over stale pre-dedup "
+                "session_entries. Run `cctally db unskip 001_dedup_highest_wins` then "
+                "any JSONL-reading command once.",
+            )
+        return GateResolution(
+            GateAction.PROCEED,
+            "001 skipped and no historical rows to protect; proceed (body no-ops).",
+        )
+    # cache_001_state == "applied" below.
+    # Row 5 — nothing to protect.
+    if not inp.caller_has_historical_rows:
+        return GateResolution(
+            GateAction.PROCEED,
+            "no historical rows to protect; proceed (body no-ops).",
+        )
+    # Row 6 — complete, non-empty post-001 cache.
+    if inp.walk_complete_since_001 and inp.cache_has_entries:
+        return GateResolution(
+            GateAction.PROCEED,
+            "complete, non-empty post-001 walk observed; proceed.",
+        )
+    # Row 7 — DEFER; reason branches on disk_state (decision is identical).
+    if not inp.walk_complete_since_001:
+        if inp.disk_state == "jsonl_present":
+            reason = ("post-001 ingest walk not yet complete; run any JSONL-reading "
+                      "command (e.g. `cctally weekly`) once and retry.")
+        elif inp.disk_state == "pruned":
+            reason = ("no complete post-001 walk and projects/ holds no JSONL; restore "
+                      "the JSONL or `cctally db skip` this migration to accept stale "
+                      "aggregates.")
+        else:  # absent
+            reason = ("no complete post-001 walk and no projects/ dir resolves; check "
+                      "CLAUDE_CONFIG_DIR or `cctally db skip` this migration.")
+    else:  # walk complete but cache empty (rebuild/truncation over pruned disk)
+        reason = ("cache is empty after a rebuild over pruned disk; refusing to zero "
+                  "historical aggregates. Restore the JSONL or `cctally db skip` this "
+                  "migration.")
+    return GateResolution(GateAction.DEFER, reason)
 
 
 def _make_migration_decorator(registry: list[Migration], db_label: str, name: str):
