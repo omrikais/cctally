@@ -39,6 +39,21 @@ TS_001_APPLIED = "2026-04-30T12:00:00Z"
 TS_002_APPLIED = "2026-04-30T12:00:00Z"
 TS_003_APPLIED = "2026-05-04T08:12:11Z"
 
+# cctally-dev#93: cache.db carries a cache_meta KV table whose
+# ``claude_ingest_walk_complete`` row is the migration upgrade-gate's
+# ingest-completeness sentinel. The gate PROCEEDs (rows 4/5/6) only when
+# this marker is present (walk✓) AND session_entries is non-empty
+# (entries✓) — or there's nothing to protect. Every cache.db the builders
+# construct now creates the table (production-shape parity via
+# _apply_cache_schema); gate-PASSING goldens seed the marker.
+WALK_COMPLETE_MARKER = "claude_ingest_walk_complete"
+CACHE_META_DDL = """
+        CREATE TABLE cache_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+"""
+
 
 def _new_stats_db(path: Path) -> sqlite3.Connection:
     if path.exists():
@@ -102,13 +117,19 @@ def build_03_failure(scenario_dir: Path) -> None:
     conn.execute("INSERT INTO test_failure_trigger VALUES (1)")
     conn.commit()
     conn.close()
-    # Cache.db: pre-bootstrap with the 001 cache migration marker + a
-    # post-001 session_files row so stats migration 008's cross-DB gate
-    # passes during the stats walk. Without this, 008 would defer on the
-    # gate (no error logged) and break BEFORE the test-injection
-    # migration runs — silently neutering scenarios 03/04/05/06/08 that
-    # depend on the test-injection failure firing. Cache schema mirrors
-    # production (matching the per-migration 001 fixture builder above).
+    # Cache.db: pre-bootstrap with the 001 cache migration marker + the
+    # cache_meta walk-complete marker (cctally-dev#93) so stats migration
+    # 008's cross-DB gate is satisfied by the new ingest-completeness
+    # signal during the stats walk. (008's stats.db here holds no
+    # weekly_cost_snapshots rows, so data_present=False → the resolver
+    # PROCEEDs at row 5 even absent the marker; we still seed the marker
+    # for production-shape parity so this golden keeps exercising the
+    # PROCEED path the way a real upgraded cache.db would.) Without 008
+    # proceeding, it would defer (no error logged) and break BEFORE the
+    # test-injection migration runs — silently neutering scenarios
+    # 03/04/05/06/08 that depend on the test-injection failure firing.
+    # Cache schema mirrors production (_apply_cache_schema) incl. the
+    # cache_meta table.
     cache = scenario_dir / "input.cache.db"
     cache_conn = _new_cache_db(cache)
     cache_conn.executescript(
@@ -142,16 +163,21 @@ def build_03_failure(scenario_dir: Path) -> None:
             cost_usd_raw        REAL
         );
         """
+        + CACHE_META_DDL
     )
-    # 001 cache marker — stamped at TS_003_APPLIED so the post-001
-    # session_files row's last_ingested_at can strictly post-date it
-    # below.
+    # 001 cache marker — stamped at TS_003_APPLIED (production-shape).
     cache_conn.execute(
         "INSERT INTO schema_migrations VALUES (?, ?)",
         ("001_dedup_highest_wins", TS_003_APPLIED),
     )
-    # session_files row with last_ingested_at AFTER the 001 marker → the
-    # gate helper's Layer B (post-001 ingest observed) passes.
+    # cache_meta walk-complete marker — the new gate's walk✓ signal
+    # (cctally-dev#93). Replaces the old "post-001 session_files row" proof.
+    cache_conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+        (WALK_COMPLETE_MARKER, "2026-05-04T08:13:00Z"),
+    )
+    # session_files row retained for production-shape parity (no longer
+    # the gate signal post-cctally-dev#93).
     cache_conn.execute(
         "INSERT INTO session_files "
         "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
@@ -160,7 +186,7 @@ def build_03_failure(scenario_dir: Path) -> None:
         (
             "/fake/.claude/projects/p1/sess-a.jsonl",
             100, 1_700_000_000_000_000_000, 100,
-            "2026-05-04T08:13:00Z",  # > TS_003_APPLIED = 2026-05-04T08:12:11Z
+            "2026-05-04T08:13:00Z",
             "sess-a", "p1",
         ),
     )
@@ -400,10 +426,14 @@ def build_per_migration_001_dedup_highest_wins(scenario_dir: Path) -> None:
     Emits two cache.db files:
       * pre.sqlite  — cache schema + 2 ``session_files`` rows + 3 synthetic
         ``session_entries`` "loser" rows (the streaming-intermediate shape:
-        ``output_tokens=1``, no ``speed`` field). schema_migrations is empty.
+        ``output_tokens=1``, no ``speed`` field) + a ``cache_meta``
+        ``claude_ingest_walk_complete`` marker (a stale pre-dedup walk-complete
+        sentinel that 001 must clear, cctally-dev#93 D5). schema_migrations
+        is empty.
       * post.sqlite — same DB after running the production migration handler.
-        Both seeded tables are empty; ``schema_migrations`` has one row
-        ``(001_dedup_highest_wins, <iso>)``.
+        Both seeded tables are empty; the ``cache_meta`` marker is CLEARED
+        (001 DELETEs it atomically with the wipe); ``schema_migrations`` has
+        one row ``(001_dedup_highest_wins, <iso>)``.
 
     Loaded by ``tests/test_migration_001_per_migration_goldens.py``.
     Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I4.
@@ -462,7 +492,20 @@ def build_per_migration_001_dedup_highest_wins(scenario_dir: Path) -> None:
                     name           TEXT PRIMARY KEY,
                     applied_at_utc TEXT NOT NULL
                 );
+
+                CREATE TABLE cache_meta (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                );
                 """
+            )
+            # Seed a stale walk-complete marker so post.sqlite can
+            # demonstrate 001's atomic marker-CLEAR (cctally-dev#93 D5):
+            # a wiped session_entries must never coexist with a "complete
+            # walk" marker.
+            conn.execute(
+                "INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+                ("claude_ingest_walk_complete", "2026-04-15T16:00:00Z"),
             )
             # Seed 2 session_files rows.
             conn.executemany(
@@ -558,8 +601,10 @@ def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         (should be recomputed), one ``(mode='display', …)`` (must NOT
         change), one ``(mode='auto', project='myproj')`` (must NOT
         change). ``schema_migrations`` is empty for 008.
-      * ``pre-cache.sqlite`` — cache.db sidecar with the 001 marker, one
-        post-001 ``session_files`` row, and ONE ``session_entries`` row
+      * ``pre-cache.sqlite`` — cache.db sidecar with the 001 marker, the
+        ``cache_meta`` ``claude_ingest_walk_complete`` marker (the new
+        gate's walk✓ PROCEED signal, cctally-dev#93), a ``session_files``
+        row (production-shape parity), and ONE ``session_entries`` row
         whose ``model='claude-opus-4-7'`` and ``output_tokens=1000``
         falls inside the auto-row's
         ``[range_start_iso, range_end_iso)`` window — recomputed cost
@@ -686,13 +731,22 @@ def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
                     cost_usd_raw        REAL
                 );
                 """
+                + CACHE_META_DDL
             )
             conn.execute(
                 "INSERT INTO schema_migrations VALUES (?, ?)",
                 ("001_dedup_highest_wins", TS_001_APPLIED),
             )
-            # session_files row with last_ingested_at STRICTLY AFTER the
-            # 001 marker so the gate's Layer B passes.
+            # cache_meta walk-complete marker — the new gate's walk✓ PROCEED
+            # signal (cctally-dev#93). Paired with the non-empty
+            # session_entries seeded below, this is the row-6 PROCEED
+            # topology. Replaces the old "post-001 session_files row" proof.
+            conn.execute(
+                "INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+                (WALK_COMPLETE_MARKER, TS_POST_001_INGEST),
+            )
+            # session_files row retained for production-shape parity (no
+            # longer the gate signal post-cctally-dev#93).
             conn.execute(
                 "INSERT INTO session_files "
                 "(path, size_bytes, mtime_ns, last_byte_offset, "

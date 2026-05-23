@@ -14,9 +14,20 @@ import pathlib
 import sqlite3
 import sys
 
-
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+BIN_DIR = REPO_ROOT / "bin"
+if str(BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BIN_DIR))
+
+# Shared fixture-DB registry so the atexit hook normalizes the SQLite
+# writer-version bytes (96-99) on exit — otherwise every rebuild churns
+# those bytes and dirties the in-tree fixtures (CLAUDE.md gotcha "SQLite
+# writer-version dirties fixtures").
+from _fixture_builders import register_fixture_db  # noqa: E402
+
 FIX_BASE = REPO_ROOT / "tests" / "fixtures" / "migrations" / "per-migration"
+
+WALK_COMPLETE_MARKER = "claude_ingest_walk_complete"
 
 
 # ── Shared cache.db DDL ────────────────────────────────────────────────────
@@ -54,6 +65,10 @@ CREATE TABLE session_entries (
     usage_extra_json TEXT,
     cost_usd_raw REAL
 );
+CREATE TABLE cache_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 # Pricing reference: claude-opus-4-7 output rate is $25/Mtok in the
@@ -71,14 +86,18 @@ def _wal_connect(path: pathlib.Path) -> sqlite3.Connection:
     ):
         if sidecar.exists():
             sidecar.unlink()
+    register_fixture_db(path)
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
 def _build_cache(cache_path: pathlib.Path, *, entries: list[dict]) -> None:
-    """Build a cache.db with the 001 marker stamped, a post-001
-    session_files row (Layer B gate), and the given session_entries.
+    """Build a cache.db with the 001 marker stamped, the cache_meta
+    walk-complete marker (the new gate's walk✓ PROCEED signal,
+    cctally-dev#93), session_files rows (production-shape parity), and the
+    given session_entries (entries✓). Together these give the row-6
+    PROCEED topology the gate requires before 009/010 recompute.
     """
     conn = _wal_connect(cache_path)
     try:
@@ -87,8 +106,15 @@ def _build_cache(cache_path: pathlib.Path, *, entries: list[dict]) -> None:
             "INSERT INTO schema_migrations VALUES (?, ?)",
             ("001_dedup_highest_wins", "2026-05-22T00:00:00Z"),
         )
-        # session_files row whose last_ingested_at is strictly after the
-        # 001 marker so the post-001 ingest gate (Layer B) passes.
+        # cache_meta walk-complete marker — replaces the old "post-001
+        # session_files row" proof as the gate's PROCEED signal.
+        conn.execute(
+            "INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+            (WALK_COMPLETE_MARKER, "2026-05-22T01:00:00Z"),
+        )
+        # session_files rows retained for production-shape parity (no
+        # longer the gate signal); 009 still LEFT JOINs them for
+        # project_path attribution.
         conn.execute(
             "INSERT INTO session_files "
             "(path, size_bytes, mtime_ns, last_byte_offset, "

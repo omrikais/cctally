@@ -113,9 +113,16 @@ def test_pre_fixture_has_three_rows_and_no_008_marker(db_module):
         conn.close()
 
 
-def test_pre_cache_fixture_has_001_marker_and_post_001_ingest(db_module):
-    """Sanity: pre-cache.sqlite has the 001 marker, one post-001
-    session_files row, and one session_entry inside the week range."""
+def test_pre_cache_fixture_has_001_marker_and_walk_complete(db_module):
+    """Sanity: pre-cache.sqlite carries the 001 marker, the cache_meta
+    walk-complete marker (the new gate PROCEED signal, cctally-dev#93),
+    and one session_entry inside the week range.
+
+    The gate's post-001-ingest proof moved from "a session_files row whose
+    last_ingested_at >= 001.applied_at" to "the cache_meta
+    claude_ingest_walk_complete marker present AND session_entries
+    non-empty" (row 6). This fixture seeds that NEW signal.
+    """
     assert PRE_CACHE_DB.exists(), f"missing pre-cache fixture: {PRE_CACHE_DB}"
     conn = sqlite3.connect(PRE_CACHE_DB)
     try:
@@ -124,20 +131,17 @@ def test_pre_cache_fixture_has_001_marker_and_post_001_ingest(db_module):
             "WHERE name = '001_dedup_highest_wins'"
         ).fetchone()
         assert m is not None, "pre-cache.sqlite must have the 001 marker"
-        applied_at = m[0]
 
-        # Layer B gate: a session_files row whose last_ingested_at >
-        # applied_at_utc (proof of post-001 ingest).
-        post_001 = conn.execute(
-            "SELECT 1 FROM session_files "
-            "WHERE last_ingested_at > ? LIMIT 1",
-            (applied_at,),
+        # The NEW gate PROCEED signal: walk✓ (cache_meta marker present).
+        walk = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'"
         ).fetchone()
-        assert post_001 is not None, (
-            "pre-cache.sqlite must have at least one session_files row "
-            "with last_ingested_at > 001.applied_at_utc"
+        assert walk is not None, (
+            "pre-cache.sqlite must carry the cache_meta walk-complete "
+            "marker (the new gate's walk✓ PROCEED signal, cctally-dev#93)"
         )
 
+        # entries✓: row 6 requires both walk✓ AND a non-empty cache.
         entry_count = conn.execute(
             "SELECT COUNT(*) FROM session_entries"
         ).fetchone()[0]

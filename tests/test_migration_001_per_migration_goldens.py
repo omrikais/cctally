@@ -73,7 +73,8 @@ def _table_sql(conn: sqlite3.Connection, table: str) -> str:
 
 
 def test_pre_fixture_has_loser_rows(db_module):
-    """Sanity: pre.sqlite has 3 session_entries + 2 session_files + empty markers."""
+    """Sanity: pre.sqlite has 3 session_entries + 2 session_files + empty
+    markers + a STALE cache_meta walk-complete marker (cctally-dev#93)."""
     assert PRE_DB.exists(), f"missing pre fixture: {PRE_DB}"
     conn = sqlite3.connect(PRE_DB)
     try:
@@ -86,12 +87,22 @@ def test_pre_fixture_has_loser_rows(db_module):
         assert conn.execute(
             "SELECT COUNT(*) FROM schema_migrations"
         ).fetchone()[0] == 0
+        # cctally-dev#93: a stale walk-complete marker that 001 must clear.
+        marker = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+        ).fetchone()
+        assert marker is not None, (
+            "pre.sqlite must seed a stale cache_meta walk-complete marker "
+            "so post.sqlite can demonstrate 001's atomic marker-clear"
+        )
     finally:
         conn.close()
 
 
 def test_post_fixture_has_empty_tables_and_marker(db_module):
-    """Sanity: post.sqlite has empty entries/files tables and the marker row."""
+    """Sanity: post.sqlite has empty entries/files tables, the 001 marker
+    row, and the cache_meta walk-complete marker CLEARED (cctally-dev#93
+    D5: 001 DELETEs it atomically with the wipe)."""
     assert POST_DB.exists(), f"missing post fixture: {POST_DB}"
     conn = sqlite3.connect(POST_DB)
     try:
@@ -106,6 +117,15 @@ def test_post_fixture_has_empty_tables_and_marker(db_module):
             "WHERE name = '001_dedup_highest_wins'"
         ).fetchone()
         assert marker is not None, "post.sqlite missing 001 marker"
+        # cctally-dev#93: the walk-complete sentinel must be cleared.
+        walk = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+        ).fetchone()
+        assert walk is None, (
+            "post.sqlite must show the walk-complete marker CLEARED — a "
+            "wiped session_entries must never coexist with a complete-walk "
+            "marker (D5/D2)"
+        )
     finally:
         conn.close()
 
@@ -140,6 +160,16 @@ def test_migration_handler_wipes_tables_and_stamps_marker(db_module, tmp_path):
             "WHERE name='001_dedup_highest_wins'"
         ).fetchone()[0]
         assert cnt == 1
+
+        # cctally-dev#93 D5: the walk-complete sentinel is cleared
+        # atomically with the wipe (pre.sqlite seeds a stale one).
+        walk = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+        ).fetchone()
+        assert walk is None, (
+            "001 must clear the cache_meta walk-complete marker in the "
+            "same transaction as the wipe"
+        )
 
         # applied_at_utc is non-empty (now_utc_iso()); we don't assert its
         # exact value (it's wall-clock at handler time).

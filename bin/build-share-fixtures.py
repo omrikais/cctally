@@ -26,6 +26,21 @@ The fixtures share one synthetic dataset:
 Stats / cache schemas come from `_fixture_builders.create_stats_db` /
 `create_cache_db` so all post-migration columns + indexes are baked in
 (no first-open mutation, no dirty in-tree DBs).
+
+Migration posture (cctally-dev#93): the share harness tests *rendering*,
+not the dedup recompute math (that lives in `bin/cctally-migrations-test`).
+So each share `stats.db` ships as a *fully-migrated* user — every
+registered stats migration is stamped applied (`schema_migrations` rows +
+`PRAGMA user_version`). Without this, a read command (e.g.
+`cctally five-hour-blocks`) runs `sync_cache`, which on the harness's empty
+disk writes the `cache_meta` `claude_ingest_walk_complete` marker live; the
+dedup-recompute migrations (008 `weekly_cost_snapshots`,
+009 `five_hour_blocks`, 010 `percent_milestones`) then PROCEED past their
+#93 gate and recompute the display tables from `session_entries`,
+overwriting the seeded aggregates (e.g. the 5h block's `$1.85` → `$0.00`).
+Stamping them applied makes the dispatcher fast-path return, so the seeded
+display data renders unchanged. Mirrors `create_cache_db`'s pre-stamp of
+`001_dedup_highest_wins` in `_fixture_builders.py`.
 """
 
 from __future__ import annotations
@@ -37,6 +52,7 @@ import sys
 # Make _fixture_builders importable when run directly (bin/ is not on sys.path).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+from _cctally_db import _STATS_MIGRATIONS  # noqa: E402
 from _fixture_builders import (  # noqa: E402
     create_cache_db,
     create_stats_db,
@@ -44,6 +60,11 @@ from _fixture_builders import (  # noqa: E402
     seed_session_file,
     seed_weekly_usage_snapshot,
 )
+
+# Deterministic fixed instant for every stamped `schema_migrations` row —
+# NOT wall-clock, so regenerating the fixtures stays byte-stable. Matches
+# the style of the 001 stamp in `_fixture_builders.create_cache_db`.
+_STATS_MIGRATION_STAMP_AT = "2026-05-22T00:00:00Z"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "share"
@@ -119,14 +140,20 @@ WEEKS: tuple[tuple[str, float, float], ...] = (
 
 # Session entries spanning the most recent week. Tuples are
 # (source_path, line_offset, ts_iso, model, in, out, cc, cr, project_path).
+# Timestamps use the ``+00:00`` offset shape that production's cache ingest
+# stores (parse_iso_datetime → isoformat()), NOT the ``Z`` literal — so the
+# fixture data matches what live session_entries carry. This is what
+# migration 009's lexicographic ``[block_start_at, last_observed_at]`` window
+# expects when it recomputes 5h block totals; the prior ``Z`` shape made the
+# orphan entry fall outside the window (production never hits that path).
 ENTRIES: tuple[tuple[str, int, str, str, int, int, int, int, str | None], ...] = (
-    ("/fake/proj/alpha-internal/sess-a.jsonl", 0, "2026-05-04T10:00:00Z",
+    ("/fake/proj/alpha-internal/sess-a.jsonl", 0, "2026-05-04T10:00:00+00:00",
      "claude-sonnet-4-5", 1000, 2000, 0, 500, "/fake/proj/alpha-internal"),
-    ("/fake/proj/alpha-internal/sess-a.jsonl", 1, "2026-05-05T11:00:00Z",
+    ("/fake/proj/alpha-internal/sess-a.jsonl", 1, "2026-05-05T11:00:00+00:00",
      "claude-sonnet-4-5", 800, 1500, 0, 400, "/fake/proj/alpha-internal"),
-    ("/fake/proj/beta-public/sess-b.jsonl", 0, "2026-05-06T12:00:00Z",
+    ("/fake/proj/beta-public/sess-b.jsonl", 0, "2026-05-06T12:00:00+00:00",
      "claude-opus-4-5", 500, 800, 0, 200, "/fake/proj/beta-public"),
-    ("/fake/proj/orphan/sess-c.jsonl", 0, "2026-05-07T13:00:00Z",
+    ("/fake/proj/orphan/sess-c.jsonl", 0, "2026-05-07T13:00:00+00:00",
      "claude-sonnet-4-5", 300, 600, 0, 100, None),
 )
 
@@ -138,6 +165,26 @@ SESSION_FILES: tuple[tuple[str, str | None, str | None], ...] = (
      "/fake/proj/beta-public"),
     ("/fake/proj/orphan/sess-c.jsonl", "sess-cccc", None),
 )
+
+
+def _stamp_stats_migrations_applied(conn: sqlite3.Connection) -> None:
+    """Stamp every registered stats migration applied + advance
+    ``user_version`` so the dispatcher fast-paths (no recompute).
+
+    Enumerates the real registered ``_STATS_MIGRATIONS`` names so a future
+    recompute migration is covered automatically and can't silently start
+    overwriting share display fixtures on read (cctally-dev#93). Uses a
+    fixed deterministic timestamp for byte-stable output.
+    """
+    names = [m.name for m in _STATS_MIGRATIONS]
+    conn.executemany(
+        "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
+        "VALUES (?, ?)",
+        [(name, _STATS_MIGRATION_STAMP_AT) for name in names],
+    )
+    # user_version == len(registry) is the dispatcher's all-applied
+    # fast-path sentinel (_cctally_db._run_pending_migrations).
+    conn.execute(f"PRAGMA user_version = {len(names)}")
 
 
 def _seed_stats_db(
@@ -157,11 +204,21 @@ def _seed_stats_db(
 
     When ``empty=True`` the schema is created but no rows are seeded —
     used by ``report-empty-html`` to exercise the no-weeks share path.
+
+    Every stats migration is stamped applied (cctally-dev#93) so read
+    commands render the seeded display tables rather than recomputing them
+    from session_entries — see the module docstring.
     """
     create_stats_db(path)
     if empty:
+        # Even the empty fixture is a fully-migrated user: stamp the
+        # migrations so the dispatcher fast-paths (no recompute attempt).
+        with sqlite3.connect(path) as conn:
+            _stamp_stats_migrations_applied(conn)
+            conn.commit()
         return
     with sqlite3.connect(path) as conn:
+        _stamp_stats_migrations_applied(conn)
         for ws, used_pct, cost in WEEKS:
             # Compute week_end_date 7 days later — required NOT NULL on both tables.
             from datetime import date, timedelta
