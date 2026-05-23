@@ -205,6 +205,104 @@ def test_is_no_such_table_error_predicate(db_module):
     assert is_pred(other_exc) is False
 
 
+def test_gate_raises_when_layer_a_select_hits_sqlite_busy(db_module, tmp_path):
+    """G5 — SQLITE_BUSY on Layer A's RO SELECT must translate to
+    ``MigrationGateNotMet``, NOT escape as ``sqlite3.OperationalError``.
+
+    A genuine BUSY would require a real concurrent writer; we simulate by
+    wrapping the cache connection so its ``execute`` raises ``BUSY`` on
+    the first call. Pre-fix, the dispatcher would log to
+    ``migration-errors.log`` and render the error banner for a transient
+    self-healing condition.
+    """
+    cache = sqlite3.connect(":memory:")
+    _seed_cache_schema(cache)
+
+    class _BusyConn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, *args, **kwargs):
+            exc = sqlite3.OperationalError("database is locked")
+            # SQLITE_BUSY = 5 — Python 3.11+ exposes this attribute.
+            try:
+                exc.sqlite_errorcode = 5
+            except AttributeError:
+                pass
+            raise exc
+
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    with pytest.raises(db_module.MigrationGateNotMet, match="transiently locked"):
+        db_module._gate_001_post_ingest_completed(_BusyConn(cache), projects)
+
+
+def test_gate_raises_when_layer_b_select_hits_sqlite_locked(db_module, tmp_path):
+    """G5 — SQLITE_LOCKED on Layer B's session_files SELECT also defers.
+
+    Layer A (schema_migrations SELECT) must succeed, so the wrapper only
+    raises on the SECOND ``execute`` call (Layer B).
+    """
+    cache = sqlite3.connect(":memory:")
+    _seed_cache_schema(cache)
+    cache.execute(
+        "INSERT INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
+        ("001_dedup_highest_wins", "2026-05-22T17:00:00Z"),
+    )
+
+    class _LockedOnSecond:
+        def __init__(self, inner):
+            self._inner = inner
+            self._calls = 0
+
+        def execute(self, *args, **kwargs):
+            self._calls += 1
+            if self._calls >= 2:
+                exc = sqlite3.OperationalError("database table is locked")
+                try:
+                    exc.sqlite_errorcode = 6  # SQLITE_LOCKED
+                except AttributeError:
+                    pass
+                raise exc
+            return self._inner.execute(*args, **kwargs)
+
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    (projects / "session1.jsonl").write_text("{}\n")
+    with pytest.raises(db_module.MigrationGateNotMet, match="transiently locked"):
+        db_module._gate_001_post_ingest_completed(_LockedOnSecond(cache), projects)
+
+
+def test_is_transient_sqlite_error_predicate(db_module):
+    """G5 — ``_is_transient_sqlite_error`` accepts BUSY/LOCKED/CANTOPEN."""
+    is_pred = db_module._is_transient_sqlite_error
+
+    for code in (5, 6, 14):  # SQLITE_BUSY, SQLITE_LOCKED, SQLITE_CANTOPEN
+        exc = sqlite3.OperationalError("synthetic")
+        try:
+            exc.sqlite_errorcode = code
+        except AttributeError:
+            pytest.skip("sqlite_errorcode is not settable on this Python")
+        assert is_pred(exc) is True, f"errorcode {code} should be transient"
+
+    # SQLITE_ERROR (1) — "no such table" is NOT transient (it's a missing
+    # state we handle separately via _is_no_such_table_error).
+    exc = sqlite3.OperationalError("no such table: foo")
+    try:
+        exc.sqlite_errorcode = 1
+    except AttributeError:
+        pass
+    assert is_pred(exc) is False
+
+    # SQLITE_IOERR (10) — real IO failure, not transient.
+    exc = sqlite3.OperationalError("disk I/O error")
+    try:
+        exc.sqlite_errorcode = 10
+    except AttributeError:
+        pass
+    assert is_pred(exc) is False
+
+
 def test_gate_treats_pre_001_session_files_row_as_not_post_001(
     db_module, tmp_path,
 ):

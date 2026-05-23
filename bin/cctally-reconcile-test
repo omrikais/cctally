@@ -2206,18 +2206,23 @@ else:
         # cache rebuilt without re-running 008).
         #
         # Recency exclusion: skip snapshots whose `range_end_iso` is
-        # within the last hour. Those rows are by definition
-        # snapshots-of-an-active-tail: the cache continues ingesting
-        # new JSONL entries that may dedup-replace existing rows under
-        # the highest-tokens-wins UPSERT (Task 1), which can shift the
-        # recomputed cost (e.g. a 2nd assistant emission with HIGHER
-        # token total but DIFFERENT cache_creation vs cache_read mix
-        # renders cheaper or pricier than the row it replaced). The
-        # snapshot captured cost-at-write-instant; once the source set
-        # changes underneath, the equality cannot hold by design. One
-        # hour is a comfortable buffer beyond typical session-ending
-        # latencies; finalized weeks (every past `week_start_date`)
-        # always pass through this gate cleanly.
+        # less than 1 day old. Those rows are by definition
+        # snapshots-of-an-active-tail: the same subscription week can
+        # keep accumulating new `session_entries` until its week
+        # boundary closes, and each new ingest may dedup-replace
+        # existing rows under the highest-tokens-wins UPSERT (Task 1),
+        # which can shift the recomputed cost (e.g. a 2nd assistant
+        # emission with HIGHER token total but DIFFERENT cache_creation
+        # vs cache_read mix renders cheaper or pricier than the row it
+        # replaced). The snapshot captured cost-at-write-instant; once
+        # the source set changes underneath, the equality cannot hold
+        # by design. An earlier 1-hour boundary was too narrow — the
+        # in-progress week kept absorbing UPSERTs hours after capture
+        # (e.g. snapshot 4205 stored $1624.94 vs $1624.85 recompute,
+        # Δ -$0.088 about ~1h20min post-capture). 1 day is conservative
+        # against the typical hours-not-days ingestion catch-up: by the
+        # next day all activity for prior days has landed, and any
+        # later JSONL touches would only affect newer snapshots.
         rows = stats.execute(
             "SELECT id, range_start_iso, range_end_iso, cost_usd "
             "  FROM weekly_cost_snapshots "
@@ -2225,7 +2230,7 @@ else:
             "   AND range_start_iso IS NOT NULL "
             "   AND range_end_iso IS NOT NULL "
             "   AND unixepoch(range_end_iso) "
-            "       <= unixepoch('now', '-1 hour')"
+            "       < unixepoch('now', '-1 day')"
         ).fetchall()
         if not rows:
             sub_status.append(
@@ -2313,7 +2318,7 @@ else:
             )
         else:
             block_start_at, last_observed_at_utc, stored_cost = active
-            # Match `get_claude_session_entries` interval semantics: lex
+            # Match `iter_entries` interval semantics: lex
             # `timestamp_utc >= ? AND <= ?` on ISO strings AFTER
             # normalizing both bounds to UTC. `block_start_at` is stored
             # with the host's display offset (e.g. `+03:00`) per

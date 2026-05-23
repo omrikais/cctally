@@ -1,0 +1,34 @@
+{
+  "blocks": [
+    {
+      "id": "2026-04-23T07:00:00.000Z",
+      "startTime": "2026-04-23T07:00:00.000Z",
+      "endTime": "2026-04-23T12:00:00.000Z",
+      "actualEndTime": "2026-04-23T07:30:02.000Z",
+      "isActive": true,
+      "isGap": false,
+      "anchor": "recorded",
+      "entries": 2,
+      "tokenCounts": {
+        "inputTokens": 800,
+        "outputTokens": 5000,
+        "cacheCreationInputTokens": 0,
+        "cacheReadInputTokens": 0
+      },
+      "totalTokens": 5800,
+      "costUSD": 0.0774,
+      "models": [
+        "claude-sonnet-4-6"
+      ],
+      "burnRate": {
+        "tokensPerMinute": 32.22222222222222,
+        "costPerHour": 0.0258
+      },
+      "projection": {
+        "totalTokens": 9666,
+        "totalCost": 0.13,
+        "remainingMinutes": 120
+      }
+    }
+  ]
+}

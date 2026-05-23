@@ -1797,6 +1797,14 @@ def _gate_001_post_ingest_completed(
             ("001_dedup_highest_wins",),
         ).fetchone()
     except sqlite3.OperationalError as exc:
+        # SQLITE_BUSY / SQLITE_LOCKED on the gate's RO read: the gate
+        # state is genuinely unknown at this instant. Defer rather than
+        # logging to migration-errors.log — the next dispatcher walk
+        # retries cleanly once the writer releases the lock (G5).
+        if _is_transient_sqlite_error(exc):
+            raise MigrationGateNotMet(
+                "cache.db transiently locked; retry on next open."
+            ) from None
         if not _is_no_such_table_error(exc):
             raise
         raise MigrationGateNotMet(
@@ -1832,6 +1840,12 @@ def _gate_001_post_ingest_completed(
             (applied_at_utc,),
         ).fetchone() is not None
     except sqlite3.OperationalError as exc:
+        # Same transient-defer rule as Layer A (G5): BUSY/LOCKED on the
+        # RO read translates to MigrationGateNotMet, not failure.
+        if _is_transient_sqlite_error(exc):
+            raise MigrationGateNotMet(
+                "cache.db transiently locked; retry on next open."
+            ) from None
         if _is_no_such_table_error(exc):
             # cache.db has a schema_migrations table (Layer A passed) but
             # no session_files table. Equivalent to "no post-001 ingest
@@ -1879,6 +1893,45 @@ def _is_no_such_table_error(exc: sqlite3.OperationalError) -> bool:
         "no such table" in str(exc).lower()
         and getattr(exc, "sqlite_errorcode", None) in (None, 1)
     )
+
+
+def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
+    """Return True iff ``exc`` is a transient SQLite condition the gate
+    can legitimately defer on.
+
+    Covers:
+
+      * ``SQLITE_BUSY``    (errorcode 5)  — another writer holds the DB.
+      * ``SQLITE_LOCKED``  (errorcode 6)  — a table within the DB is locked.
+      * ``SQLITE_CANTOPEN``(errorcode 14) — the DB file doesn't exist /
+        can't be opened (e.g. unlinked mid-flight between an ``exists()``
+        probe and ``sqlite3.connect``, or never created yet).
+
+    Gate-defer semantics (G4 + G5): a transient error means the gate
+    state is genuinely unknown at this instant, NOT that the migration
+    has failed. The dispatcher should translate to ``MigrationGateNotMet``
+    rather than logging to ``migration-errors.log`` (which would render
+    a misleading error banner for a self-healing condition).
+
+    Belt-and-suspenders predicate: matches on ``sqlite_errorcode`` first
+    (stable Python 3.11+ API), with a substring fallback for the rare
+    case where the attribute is missing (legacy Python builds; the
+    ``getattr(..., None) in (...)`` form degrades to substring-only).
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code in (5, 6, 14):
+        return True
+    if code is None:
+        msg = str(exc).lower()
+        # Stable SQLite error-message fragments for the three transient
+        # codes; substring-only fallback when sqlite_errorcode is absent.
+        if (
+            "database is locked" in msg
+            or "database table is locked" in msg
+            or "unable to open database" in msg
+        ):
+            return True
+    return False
 
 
 # === Region 7c: Cache migration 001_dedup_highest_wins (ccusage-parity fix) ===
@@ -1982,13 +2035,29 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
     # don't pollute thousands of test goldens / per-command stderr with
     # a benign one-line announcement. Heavy users with 52+ snapshots
     # still see it once.
+    #
+    # G4 fix: open cache.db inside the try so a TOCTOU race
+    # (file unlinked between an ``exists()`` probe and ``sqlite3.connect``,
+    # or never created yet) surfaces as ``SQLITE_CANTOPEN`` and translates
+    # to ``MigrationGateNotMet`` via ``_is_transient_sqlite_error`` —
+    # rather than escaping to the dispatcher's ``except Exception`` and
+    # rendering the migration-error banner for a transient/self-healing
+    # condition. We drop the prior ``exists()`` check entirely; the
+    # ``sqlite3.connect`` call on a non-existent file raises CANTOPEN,
+    # which is the same outcome (a gate defer) without the race window.
     cache_db_path = _cctally_core.CACHE_DB_PATH
-    if not cache_db_path.exists():
-        raise MigrationGateNotMet(
-            "cache.db not yet initialized; run any JSONL-reading "
-            "command (e.g. `cctally weekly`) once and retry."
+    try:
+        cache_ro = sqlite3.connect(
+            f"file:{cache_db_path}?mode=ro", uri=True,
         )
-    cache_ro = sqlite3.connect(f"file:{cache_db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError as exc:
+        if _is_transient_sqlite_error(exc):
+            raise MigrationGateNotMet(
+                "cache.db not yet initialized or transiently locked; "
+                "run any JSONL-reading command (e.g. `cctally weekly`) "
+                "once and retry."
+            ) from None
+        raise
     try:
         # Resolve projects dirs at call time so ``CLAUDE_CONFIG_DIR``
         # users (whose JSONL lives outside ``~/.claude/projects``) don't

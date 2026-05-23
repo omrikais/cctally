@@ -4,7 +4,7 @@ Importable module (not executable). Consumed by `bin/build-<cmd>-fixtures.py`
 scripts to seed deterministic, byte-reproducible DB fixtures for the
 golden-file harnesses.
 
-Two concerns:
+Three concerns:
   * Schema builders: `create_stats_db(path)` and `create_cache_db(path)` —
     write the full current schema (every column, every migration applied)
     so fixture DBs never trigger inline ALTER TABLE migrations at open time.
@@ -12,12 +12,20 @@ Two concerns:
     `seed_weekly_usage_snapshot(...)`, `seed_codex_session_file(...)`,
     `seed_codex_session_entry(...)` — typed, keyword-only inserts with
     safe defaults.
+  * JSONL emitters: `emit_streaming_pair(...)` — write the
+    streaming-intermediate + post-stream-finalization two-row pattern
+    into a `.claude/projects/<encoded>/<session>.jsonl` file so that
+    blocks-/cache-/sync-week-style harnesses can exercise the v1.12.0
+    ccusage-parity dedup ingest path (higher token total wins; `speed`-set
+    breaks ties — mirrors ccusage's `should_replace_deduped_entry` at
+    `rust/crates/ccusage/src/claude_loader.rs:531`).
 
 Stdlib only. No external dependencies.
 """
 from __future__ import annotations
 
 import atexit
+import json
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -826,10 +834,185 @@ def _self_test_codex_seeders() -> None:
     print("OK: codex seeders")
 
 
+def emit_streaming_pair(
+    jsonl_path: Path,
+    *,
+    model: str,
+    msg_id: str,
+    req_id: str,
+    ts_intermediate: str,
+    ts_final: str,
+    intermediate_output_tokens: int,
+    final_output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_create_tokens: int = 0,
+    input_tokens: int = 1,
+    session_id: Optional[str] = None,
+    cwd: Optional[str] = None,
+    append: bool = True,
+) -> None:
+    """Append the streaming-pair two-row pattern to a JSONL file.
+
+    Writes two `type:"assistant"` rows sharing the same `(message.id,
+    requestId)` pair: first the streaming intermediate (no `speed` field,
+    `intermediate_output_tokens`), then the post-stream finalization
+    (`speed="standard"`, `final_output_tokens`). When `sync_cache()` later
+    ingests this JSONL via the v1.12.0 dedup path it MUST collapse the
+    pair down to the higher-token row (`final_output_tokens`) — matches
+    ccusage's `should_replace_deduped_entry` (`rust/crates/ccusage/src/
+    claude_loader.rs:531`). Shared by dedup-aware fixtures so the
+    same shape of pair is reproducible across harnesses.
+
+    Args:
+        jsonl_path: where to write. Parent must exist. The two rows are
+            appended (default) to preserve any prior emissions on the
+            same session file.
+        model: Claude model id (e.g. ``claude-opus-4-7``); used for cost
+            attribution by the downstream aggregator.
+        msg_id: `message.id` value — same on both rows so the dedup index
+            collapses them.
+        req_id: `requestId` value — same on both rows.
+        ts_intermediate / ts_final: ISO-8601 UTC timestamps for the two
+            rows. The intermediate row's timestamp is typically a few ms
+            before the final's, mirroring real Claude Code streaming.
+        intermediate_output_tokens: usually ``1`` (the on-wire shape of a
+            streaming intermediate in production).
+        final_output_tokens: the real output token count; this is the row
+            that must survive dedup.
+        cache_read_tokens / cache_create_tokens: identical on both rows.
+        input_tokens: identical on both rows (default ``1``, matches the
+            streaming-intermediate shape).
+        session_id / cwd: optional. When provided, written as ``sessionId``
+            and ``cwd`` keys on each row so the cache ingest path can
+            populate ``session_files.session_id`` / ``project_path`` from
+            the JSONL itself rather than the file's encoded dirname.
+        append: when ``True`` (default), append to ``jsonl_path``; when
+            ``False``, truncate first. The default matches real Claude
+            Code (a single session can emit many pairs).
+    """
+    intermediate: dict = {
+        "type": "assistant",
+        "timestamp": ts_intermediate,
+        "requestId": req_id,
+        "message": {
+            "id": msg_id,
+            "model": model,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": intermediate_output_tokens,
+                "cache_creation_input_tokens": cache_create_tokens,
+                "cache_read_input_tokens": cache_read_tokens,
+            },
+        },
+    }
+    final: dict = {
+        "type": "assistant",
+        "timestamp": ts_final,
+        "requestId": req_id,
+        "message": {
+            "id": msg_id,
+            "model": model,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": final_output_tokens,
+                "cache_creation_input_tokens": cache_create_tokens,
+                "cache_read_input_tokens": cache_read_tokens,
+                "speed": "standard",
+            },
+        },
+    }
+    if session_id is not None:
+        intermediate["sessionId"] = session_id
+        final["sessionId"] = session_id
+    if cwd is not None:
+        intermediate["cwd"] = cwd
+        final["cwd"] = cwd
+    mode = "a" if append else "w"
+    with jsonl_path.open(mode, encoding="utf-8") as f:
+        f.write(json.dumps(intermediate) + "\n")
+        f.write(json.dumps(final) + "\n")
+
+
+def _self_test_emit_streaming_pair() -> None:
+    """Verify emit_streaming_pair writes two valid JSON lines with the
+    streaming-intermediate (no `speed`) → post-stream-finalization
+    (`speed='standard'`) shape, and that overwrite vs append modes both
+    work."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        jsonl = Path(td) / "session.jsonl"
+        emit_streaming_pair(
+            jsonl,
+            model="claude-opus-4-7",
+            msg_id="msg_test_1",
+            req_id="req_test_1",
+            ts_intermediate="2026-05-22T17:04:00.100Z",
+            ts_final="2026-05-22T17:04:00.500Z",
+            intermediate_output_tokens=1,
+            final_output_tokens=3881,
+            cache_read_tokens=42,
+        )
+        lines = jsonl.read_text().splitlines()
+        assert len(lines) == 2, f"expected 2 lines, got {len(lines)}"
+        intermediate, final = json.loads(lines[0]), json.loads(lines[1])
+        assert intermediate["type"] == "assistant"
+        assert intermediate["message"]["id"] == "msg_test_1"
+        assert intermediate["requestId"] == "req_test_1"
+        assert intermediate["message"]["usage"]["output_tokens"] == 1
+        assert "speed" not in intermediate["message"]["usage"], \
+            "intermediate row must NOT carry speed key"
+        assert final["type"] == "assistant"
+        assert final["message"]["id"] == "msg_test_1"
+        assert final["requestId"] == "req_test_1"
+        assert final["message"]["usage"]["output_tokens"] == 3881
+        assert final["message"]["usage"]["speed"] == "standard"
+        assert (
+            intermediate["message"]["usage"]["cache_read_input_tokens"]
+            == final["message"]["usage"]["cache_read_input_tokens"]
+            == 42
+        ), "cache_read_input_tokens must be identical on both rows"
+
+        # Append-mode adds another pair without clobbering the first.
+        emit_streaming_pair(
+            jsonl,
+            model="claude-opus-4-7",
+            msg_id="msg_test_2",
+            req_id="req_test_2",
+            ts_intermediate="2026-05-22T17:05:00.100Z",
+            ts_final="2026-05-22T17:05:00.500Z",
+            intermediate_output_tokens=1,
+            final_output_tokens=2000,
+            session_id="sess-aaaa",
+            cwd="/repo/example",
+        )
+        lines = jsonl.read_text().splitlines()
+        assert len(lines) == 4, f"append did not extend file: got {len(lines)} lines"
+        second_pair_final = json.loads(lines[3])
+        assert second_pair_final["sessionId"] == "sess-aaaa"
+        assert second_pair_final["cwd"] == "/repo/example"
+
+        # Overwrite-mode clears the file.
+        emit_streaming_pair(
+            jsonl,
+            model="claude-opus-4-7",
+            msg_id="msg_test_3",
+            req_id="req_test_3",
+            ts_intermediate="2026-05-22T17:06:00.100Z",
+            ts_final="2026-05-22T17:06:00.500Z",
+            intermediate_output_tokens=1,
+            final_output_tokens=1500,
+            append=False,
+        )
+        lines = jsonl.read_text().splitlines()
+        assert len(lines) == 2, f"overwrite did not truncate: got {len(lines)} lines"
+    print("OK: emit_streaming_pair")
+
+
 if __name__ == "__main__":
     _self_test_create_stats_db()
     _self_test_create_cache_db()
     _self_test_claude_seeders()
     _self_test_weekly_usage_seeder()
     _self_test_codex_seeders()
+    _self_test_emit_streaming_pair()
     print("all self-tests passed")

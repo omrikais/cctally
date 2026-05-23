@@ -639,3 +639,37 @@ def test_008_gate_honors_claude_config_dir(tmp_path, monkeypatch):
         )
     finally:
         stats.close()
+
+
+def test_008_defers_when_cache_db_path_missing(tmp_path, monkeypatch):
+    """G4 — when ``CACHE_DB_PATH`` does NOT exist on disk, ``sqlite3.connect``
+    (RO URI form) raises ``SQLITE_CANTOPEN``. The migration body must
+    translate this to ``MigrationGateNotMet`` via the
+    ``_is_transient_sqlite_error`` predicate, NOT let the
+    ``OperationalError`` escape to the dispatcher's ``except Exception``
+    (which would log to ``migration-errors.log`` and render the migration
+    error banner for a self-healing condition).
+    """
+    db = _load_db()
+    core = _load_core(db)
+
+    stats_path = tmp_path / "stats.db"
+    _stage_stats(stats_path)
+
+    # CACHE_DB_PATH points at a non-existent file.
+    missing_cache = tmp_path / "does_not_exist.cache.db"
+    assert not missing_cache.exists()
+
+    _pin_resolver_to_fake_home(core, tmp_path, monkeypatch)
+    fake_projects = tmp_path / "claude_projects"
+    fake_projects.mkdir()
+
+    monkeypatch.setattr(core, "CACHE_DB_PATH", missing_cache)
+    monkeypatch.setattr(core, "CLAUDE_PROJECTS_DIR", fake_projects)
+
+    stats = sqlite3.connect(stats_path)
+    try:
+        with pytest.raises(db.MigrationGateNotMet):
+            db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+    finally:
+        stats.close()

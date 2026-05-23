@@ -28,6 +28,15 @@ Scenarios
                        (e.g. T:39:59 UTC); entries dense in the floor
                        band [T:30, T:39:59) must land in the EARLIER
                        block, not in a phantom heuristic block.
+7. streaming-pair-dedup — v1.12.0 ccusage-parity. Real JSONL files (no
+                          pre-seeded session_entries) carry the
+                          streaming-intermediate + post-stream-final
+                          two-row pattern. Harness's `cctally blocks`
+                          invocation runs `sync_cache()`, which MUST
+                          collapse each pair down to the higher-token
+                          row via the dedup-aware ingest path. Block
+                          totals must reflect `final_output_tokens`,
+                          not `intermediate_output_tokens=1`.
 """
 from __future__ import annotations
 
@@ -41,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _fixture_builders import (  # noqa: E402
     create_cache_db,
     create_stats_db,
+    emit_streaming_pair,
     seed_session_entry,
     seed_session_file,
     seed_weekly_usage_snapshot,
@@ -406,6 +416,97 @@ def build_active_window() -> None:
         ])
 
 
+# -- Scenario 7: streaming-pair-dedup (v1.12.0 ccusage-parity) ------------
+def build_streaming_pair_dedup() -> None:
+    """v1.12.0 ccusage-parity dedup tiebreaker exercise.
+
+    Unlike the other scenarios, this one does NOT pre-seed session_entries
+    via `seed_session_entry`. Instead, it writes a real JSONL file under
+    `.claude/projects/<encoded>/` containing two `(message.id, requestId)`
+    pairs in the streaming-intermediate + post-stream-finalization shape
+    (emit_streaming_pair). When the harness invokes `cctally blocks`,
+    `sync_cache()` ingests the JSONL through the v1.12.0 dedup-aware
+    INSERT … ON CONFLICT … WHERE token-sum-or-speed-tiebreak UPDATE path
+    and the resulting block totals carry the FINAL row's
+    `output_tokens` (3000 + 2000), not the intermediate's `1 + 1`.
+
+    Pre-fix (the bug): INSERT OR IGNORE kept the FIRST row of each pair
+    (the streaming intermediate, `output_tokens=1`), and the block's
+    output-token total + cost would be artificially low.
+    Post-fix: the dedup-aware UPSERT promotes the higher-token row of
+    each pair, matching ccusage's `should_replace_deduped_entry`.
+
+    The scenario uses a single CC-initiated 5h window (R-5h aligns with
+    the first message's hour) so the block anchor logic is the simplest
+    possible — leaving the dedup behavior as the only variable the
+    goldens lock in.
+    """
+    base, share, projects = _fixture_tree("streaming-pair-dedup")
+    first_msg = dt.datetime(2026, 4, 23, 7, 0, tzinfo=dt.timezone.utc)
+    R = first_msg + dt.timedelta(hours=5)
+    as_of = R - dt.timedelta(hours=2)  # well inside the active window
+    _write_input_env(base, _iso(as_of))
+
+    # stats.db: one 5h-anchor snapshot. No five_hour_blocks row — the
+    # blocks command resolves the anchor from weekly_usage_snapshots.
+    create_stats_db(share / "stats.db")
+    with sqlite3.connect(share / "stats.db") as sc:
+        _seed_week_snapshot(
+            sc,
+            R=R,
+            captured_at=first_msg + dt.timedelta(minutes=5),
+            weekly_percent=30.0,
+            five_hour_percent=15.0,
+        )
+
+    # cache.db: created empty so sync_cache() must ingest from JSONL on
+    # the harness's first `cctally blocks` run. Production sync_cache
+    # logic owns the dedup contract — this scenario locks in that the
+    # JSONL-to-table path picks the post-stream finalization.
+    create_cache_db(share / "cache.db")
+
+    # .claude/projects/<encoded-cwd>/<session>.jsonl. Encoded cwd
+    # convention: leading '-' + slashes mapped to '-' (see
+    # `_decode_escaped_cwd` in bin/cctally). Chose a stable synthetic
+    # path so the encoded dirname is byte-deterministic.
+    encoded_dir = projects / "-fx-streaming-pair-dedup"
+    encoded_dir.mkdir(parents=True, exist_ok=True)
+    jsonl = encoded_dir / "sess-streaming-pair.jsonl"
+    if jsonl.exists():
+        jsonl.unlink()
+
+    # Two pairs: each pair's intermediate output=1, final output=N.
+    # Post-dedup the block table reflects final outputs (3000 + 2000 =
+    # 5000) — pre-fix it would reflect intermediate outputs (1 + 1 = 2).
+    emit_streaming_pair(
+        jsonl,
+        model=FIXED_MODEL,
+        msg_id="msg_pair1",
+        req_id="req_pair1",
+        ts_intermediate=_iso(first_msg + dt.timedelta(seconds=1)),
+        ts_final=_iso(first_msg + dt.timedelta(seconds=2)),
+        intermediate_output_tokens=1,
+        final_output_tokens=3000,
+        input_tokens=500,
+        session_id="sess-streaming-pair",
+        cwd="/fx/streaming-pair-dedup",
+        append=False,  # first emission to a fresh file
+    )
+    emit_streaming_pair(
+        jsonl,
+        model=FIXED_MODEL,
+        msg_id="msg_pair2",
+        req_id="req_pair2",
+        ts_intermediate=_iso(first_msg + dt.timedelta(minutes=30, seconds=1)),
+        ts_final=_iso(first_msg + dt.timedelta(minutes=30, seconds=2)),
+        intermediate_output_tokens=1,
+        final_output_tokens=2000,
+        input_tokens=300,
+        session_id="sess-streaming-pair",
+        cwd="/fx/streaming-pair-dedup",
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -430,6 +531,7 @@ if __name__ == "__main__":
         build_mixed,
         build_active_window,
         build_floor_band_trap,
+        build_streaming_pair_dedup,
     ):
         builder()
     print(f"Built fixtures under {FIXTURES_DIR}")
