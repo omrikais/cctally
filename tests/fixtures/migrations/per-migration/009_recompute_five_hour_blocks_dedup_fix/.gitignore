@@ -1,0 +1,5 @@
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+_fake_projects/

@@ -2530,6 +2530,513 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
         cache_ro.close()
 
 
+# === Region 7e: Shared cross-DB gate setup for 008/009/010 ==================
+
+
+def _open_cache_ro_with_gate_defer() -> sqlite3.Connection:
+    """Shared bootstrap for stats migrations 008/009/010 that recompute
+    from cache.db's ``session_entries``.
+
+    Eagerly applies cache.db's dispatcher (so cache 001's marker is in
+    place even on stats-only invocations), then opens cache.db read-only
+    for the gate check. Either step's failure modes translate to
+    ``MigrationGateNotMet`` so the dispatcher's defer machinery handles
+    them cleanly (no migration-error banner). Mirrors the V4 + G4/G5
+    fixes baked into 008's body.
+
+    Returns the read-only cache.db connection. Caller is responsible for
+    ``.close()``.
+    """
+    try:
+        _eagerly_apply_cache_migrations()
+    except sqlite3.OperationalError as exc:
+        if _is_transient_sqlite_error(exc):
+            raise MigrationGateNotMet(
+                "cache.db not yet initialized or transiently locked; "
+                "run any JSONL-reading command (e.g. `cctally weekly`) "
+                "once and retry."
+            ) from None
+        raise
+
+    cache_db_path = _cctally_core.CACHE_DB_PATH
+    try:
+        return sqlite3.connect(
+            f"file:{cache_db_path}?mode=ro", uri=True,
+        )
+    except sqlite3.OperationalError as exc:
+        if _is_transient_sqlite_error(exc):
+            raise MigrationGateNotMet(
+                "cache.db not yet initialized or transiently locked; "
+                "run any JSONL-reading command (e.g. `cctally weekly`) "
+                "once and retry."
+            ) from None
+        raise
+
+
+def _resolve_projects_dirs_for_gate() -> list[pathlib.Path]:
+    """Shared resolver for stats migrations 008/009/010 gate checks.
+
+    Returns the list of Claude projects/ dirs to feed to
+    ``_gate_001_post_ingest_completed``. Mirrors 008's resolution chain:
+    env-aware resolver first, defensive fallback to
+    ``CLAUDE_PROJECTS_DIR`` when the resolver returns ``[]`` but the
+    default exists on disk (covers test-time monkeypatch overrides).
+
+    Empty list returned only when NO projects/ dir resolves under any
+    env-configured or default root. Callers must G3-style fail-closed
+    when this list is empty AND they have rows that would be silently
+    zeroed by recomputing against an empty ``session_entries``.
+    """
+    projects_dirs = _cctally_core._resolve_claude_projects_dirs()
+    if not projects_dirs and _cctally_core.CLAUDE_PROJECTS_DIR.is_dir():
+        projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
+    return projects_dirs
+
+
+# === Region 7f: Stats migration 009_recompute_five_hour_blocks_dedup_fix ====
+
+@stats_migration("009_recompute_five_hour_blocks_dedup_fix")
+def _009_recompute_five_hour_blocks_dedup_fix(
+    conn: sqlite3.Connection,
+) -> None:
+    """Recompute ``five_hour_blocks.total_*`` + rollup-children
+    (``five_hour_block_models`` / ``five_hour_block_projects``) from the
+    now-corrected ``session_entries``. Gated on cache migration 001
+    having applied AND ``sync_cache`` having repopulated
+    ``session_entries`` since (Layer A + B + C, same as 008).
+
+    Scope (B1)
+    ----------
+    The 5h block writer (``maybe_update_five_hour_block``) only recomputes
+    totals for the CURRENTLY ACTIVE block — closed historical blocks
+    keep their pre-dedup totals forever. ``five_hour_block_models`` /
+    ``five_hour_block_projects`` are recompute-every-tick on the active
+    block too. Without this migration, every historical 5h block + its
+    rollup children stays at the inflated pre-dedup numbers.
+
+    This migration walks EVERY row in ``five_hour_blocks`` (active and
+    closed), recomputes ``total_*`` from the corrected
+    ``session_entries`` over ``[block_start_at, last_observed_at_utc]``,
+    and replace-alls the per-(window, model) and per-(window, project)
+    rollup children. Mirrors the live writer's algorithm in
+    ``maybe_update_five_hour_block`` byte-for-byte — same closed
+    interval, same ``unixepoch()`` cross-offset normalization, same
+    ``LEFT JOIN session_files`` for project attribution, same
+    ``project_path or '(unknown)'`` sentinel.
+
+    Timestamp comparison
+    --------------------
+    ``block_start_at`` is stored with the host's display offset
+    (``parse_iso_datetime`` returns ``parsed.astimezone()``;
+    ``+03:00`` on a non-UTC host); ``last_observed_at_utc`` is
+    ``Z``-suffixed (``now_utc_iso()``); ``session_entries.timestamp_utc``
+    is the raw JSONL ``timestamp`` field, typically ``Z``. Lex compare
+    across mixed offsets silently mis-orders moments on non-UTC hosts.
+    Both sides route through ``unixepoch()`` — same defense as 008.
+
+    Closed interval (V1)
+    --------------------
+    ``<=`` matches the live writer's ``get_claude_session_entries``
+    predicate (``timestamp >= ? AND timestamp <= ?``). A pre-fix
+    half-open ``<`` would silently exclude any session_entries row
+    whose ``timestamp_utc`` exactly equalled a block's
+    ``last_observed_at_utc`` — an edge with positive probability since
+    ``last_observed_at_utc`` IS the timestamp of some session-line tick.
+
+    Banner
+    ------
+    Gated on ``five_hour_blocks`` non-emptiness so test goldens and
+    fresh-install upgrades stay quiet (mirrors 008's ``snapshot_rows``
+    gate). Heavy users with dozens of historical blocks still see it
+    once.
+
+    Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3 (B1).
+    """
+    cache_ro = _open_cache_ro_with_gate_defer()
+    try:
+        projects_dirs = _resolve_projects_dirs_for_gate()
+
+        block_rows = conn.execute(
+            "SELECT id, five_hour_window_key, block_start_at, "
+            "last_observed_at_utc "
+            "FROM five_hour_blocks"
+        ).fetchall()
+
+        # G3-style fail-closed: refuse to zero historical 5h block totals
+        # when no projects/ dir resolves on disk under any env-configured
+        # or default root. Fresh installs with no blocks AND no projects
+        # dir are safe to no-op.
+        if not projects_dirs and block_rows:
+            raise MigrationGateNotMet(
+                "CLAUDE_CONFIG_DIR resolves to no readable projects/ "
+                "dir; refusing to zero historical five_hour_blocks "
+                "totals. Check the env var or run `cctally db skip "
+                "009_recompute_five_hour_blocks_dedup_fix` to defer "
+                "(`cctally db unskip ...` reverts)."
+            )
+
+        if not projects_dirs:
+            projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
+        _gate_001_post_ingest_completed(cache_ro, projects_dirs)
+
+        # SW5-style banner gating: only print when there's actual work
+        # to do. Empty topologies (most goldens, fresh-install upgrades
+        # before any 5h block has been recorded) skip the announcement.
+        if block_rows:
+            eprint(
+                "[cctally] Recomputing closed 5h block totals after "
+                "dedup fix (one-time; may take 30-60s on heavy "
+                "histories)..."
+            )
+
+        conn.execute("BEGIN")
+        try:
+            for (
+                block_id, window_key, block_start_at,
+                last_observed_at_utc,
+            ) in block_rows:
+                # Walk session_entries over [block_start, last_observed]
+                # joined to session_files for project_path attribution.
+                # NULL session_files.project_path collapses to
+                # '(unknown)' at the bucket layer — same sentinel as the
+                # live writer (_compute_block_totals at
+                # bin/_cctally_record.py).
+                entries = cache_ro.execute(
+                    "SELECT se.model, se.input_tokens, se.output_tokens, "
+                    "       se.cache_create_tokens, se.cache_read_tokens, "
+                    "       se.usage_extra_json, se.cost_usd_raw, "
+                    "       sf.project_path "
+                    "FROM session_entries se "
+                    "LEFT JOIN session_files sf "
+                    "  ON sf.path = se.source_path "
+                    "WHERE unixepoch(se.timestamp_utc) "
+                    "      >= unixepoch(?) "
+                    "  AND unixepoch(se.timestamp_utc) "
+                    "      <= unixepoch(?)",
+                    (block_start_at, last_observed_at_utc),
+                ).fetchall()
+
+                total_in = 0
+                total_out = 0
+                total_cc = 0
+                total_cr = 0
+                total_cost = 0.0
+                by_model: dict[str, dict[str, Any]] = {}
+                by_project: dict[str, dict[str, Any]] = {}
+                for (
+                    model, in_t, out_t, cc_t, cr_t,
+                    extras_json, raw_cost, project_path,
+                ) in entries:
+                    usage = {
+                        "input_tokens": in_t,
+                        "output_tokens": out_t,
+                        "cache_creation_input_tokens": cc_t,
+                        "cache_read_input_tokens": cr_t,
+                    }
+                    if extras_json:
+                        usage.update(json.loads(extras_json))
+                    cost = _calculate_entry_cost(
+                        model, usage, mode="auto", cost_usd=raw_cost,
+                    )
+                    total_in += int(in_t or 0)
+                    total_out += int(out_t or 0)
+                    total_cc += int(cc_t or 0)
+                    total_cr += int(cr_t or 0)
+                    total_cost += cost
+
+                    proj_key = project_path or "(unknown)"
+                    for bucket_key, bucket_dict in (
+                        (model, by_model),
+                        (proj_key, by_project),
+                    ):
+                        b = bucket_dict.setdefault(
+                            bucket_key,
+                            {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "cache_create_tokens": 0,
+                                "cache_read_tokens": 0,
+                                "cost_usd": 0.0,
+                                "entry_count": 0,
+                            },
+                        )
+                        b["input_tokens"] += int(in_t or 0)
+                        b["output_tokens"] += int(out_t or 0)
+                        b["cache_create_tokens"] += int(cc_t or 0)
+                        b["cache_read_tokens"] += int(cr_t or 0)
+                        b["cost_usd"] += cost
+                        b["entry_count"] += 1
+
+                conn.execute(
+                    "UPDATE five_hour_blocks "
+                    "SET total_input_tokens = ?, "
+                    "    total_output_tokens = ?, "
+                    "    total_cache_create_tokens = ?, "
+                    "    total_cache_read_tokens = ?, "
+                    "    total_cost_usd = ? "
+                    "WHERE id = ?",
+                    (
+                        total_in, total_out, total_cc, total_cr,
+                        total_cost, block_id,
+                    ),
+                )
+
+                # Replace-all per-(window, model) and per-(window,
+                # project) rollup-children. Same pattern as the live
+                # writer (DELETE WHERE five_hour_window_key = ? +
+                # bulk INSERT). DELETE keyed on window_key (NOT
+                # block_id) so the replace-all sweeps any orphans from
+                # earlier parent rebuilds.
+                conn.execute(
+                    "DELETE FROM five_hour_block_models "
+                    "WHERE five_hour_window_key = ?",
+                    (int(window_key),),
+                )
+                if by_model:
+                    conn.executemany(
+                        "INSERT INTO five_hour_block_models "
+                        "(block_id, five_hour_window_key, model, "
+                        " input_tokens, output_tokens, "
+                        " cache_create_tokens, cache_read_tokens, "
+                        " cost_usd, entry_count) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            (
+                                int(block_id),
+                                int(window_key),
+                                model,
+                                b["input_tokens"],
+                                b["output_tokens"],
+                                b["cache_create_tokens"],
+                                b["cache_read_tokens"],
+                                b["cost_usd"],
+                                b["entry_count"],
+                            )
+                            for model, b in by_model.items()
+                        ],
+                    )
+
+                conn.execute(
+                    "DELETE FROM five_hour_block_projects "
+                    "WHERE five_hour_window_key = ?",
+                    (int(window_key),),
+                )
+                if by_project:
+                    conn.executemany(
+                        "INSERT INTO five_hour_block_projects "
+                        "(block_id, five_hour_window_key, "
+                        " project_path, "
+                        " input_tokens, output_tokens, "
+                        " cache_create_tokens, cache_read_tokens, "
+                        " cost_usd, entry_count) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            (
+                                int(block_id),
+                                int(window_key),
+                                proj,
+                                b["input_tokens"],
+                                b["output_tokens"],
+                                b["cache_create_tokens"],
+                                b["cache_read_tokens"],
+                                b["cost_usd"],
+                                b["entry_count"],
+                            )
+                            for proj, b in by_project.items()
+                        ],
+                    )
+
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations "
+                "(name, applied_at_utc) VALUES (?, ?)",
+                (
+                    "009_recompute_five_hour_blocks_dedup_fix",
+                    now_utc_iso(),
+                ),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        cache_ro.close()
+
+
+# === Region 7g: Stats migration 010_recompute_percent_milestones_dedup_fix ==
+
+@stats_migration("010_recompute_percent_milestones_dedup_fix")
+def _010_recompute_percent_milestones_dedup_fix(
+    conn: sqlite3.Connection,
+) -> None:
+    """Recompute ``percent_milestones.cumulative_cost_usd`` +
+    ``marginal_cost_usd`` from the now-corrected ``session_entries``.
+    Gated on cache migration 001 having applied AND ``sync_cache``
+    having repopulated ``session_entries`` since.
+
+    Scope (B2)
+    ----------
+    ``percent_milestones`` is normally write-once forward-only (per
+    "Write-once milestones" gotcha): the cost-at-moment-of-crossing is
+    captured at insert time and never recomputed. After the upstream
+    dedup fix, every historical milestone's ``cumulative_cost_usd`` is
+    inflated by the same factor that inflated
+    ``weekly_cost_snapshots`` — keeping them as-recorded would leave
+    ``percent-breakdown`` showing systematically higher numbers than
+    the corrected weekly cost for the same window.
+
+    This migration is the one-time scoped exception. For each row:
+
+      * ``cumulative_cost_usd`` = SUM cost over
+        ``[week_start_at_iso, captured_at_utc]`` from the corrected
+        ``session_entries``. Sentinel for week_start: prefer
+        ``week_start_at`` (ISO); fall back to ``week_start_date``
+        normalized to midnight UTC if ``week_start_at IS NULL``
+        (legacy rows; same shape as ``weekly_cost_snapshots``).
+      * ``marginal_cost_usd`` = ``cumulative - prior.cumulative``,
+        where ``prior`` is the immediately lower
+        ``percent_threshold`` for the same ``(week_start_date,
+        reset_event_id)``. First milestone of a week has
+        ``marginal == cumulative``.
+
+    Forward-going behavior is unchanged — new crossings keep their
+    "write-once at moment of crossing" semantics. This migration only
+    rewrites the historical rows once.
+
+    Timestamp comparison
+    --------------------
+    Same ``unixepoch()`` rule as 008/009 across mixed offsets.
+
+    Closed interval (V1)
+    --------------------
+    Same ``<=`` rule as 008/009 — matches the live writer's
+    ``iter_entries`` predicate.
+
+    Banner
+    ------
+    Gated on ``percent_milestones`` non-emptiness (symmetric with
+    008's ``snapshot_rows`` and 009's ``block_rows`` gates).
+
+    Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3 (B2).
+    """
+    cache_ro = _open_cache_ro_with_gate_defer()
+    try:
+        projects_dirs = _resolve_projects_dirs_for_gate()
+
+        milestone_rows = conn.execute(
+            "SELECT id, week_start_date, week_start_at, captured_at_utc, "
+            "       percent_threshold, reset_event_id "
+            "FROM percent_milestones "
+            "ORDER BY week_start_date ASC, reset_event_id ASC, "
+            "         percent_threshold ASC, id ASC"
+        ).fetchall()
+
+        if not projects_dirs and milestone_rows:
+            raise MigrationGateNotMet(
+                "CLAUDE_CONFIG_DIR resolves to no readable projects/ "
+                "dir; refusing to zero historical percent_milestones "
+                "costs. Check the env var or run `cctally db skip "
+                "010_recompute_percent_milestones_dedup_fix` to defer "
+                "(`cctally db unskip ...` reverts)."
+            )
+        if not projects_dirs:
+            projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
+        _gate_001_post_ingest_completed(cache_ro, projects_dirs)
+
+        if milestone_rows:
+            eprint(
+                "[cctally] Recomputing percent milestone costs after "
+                "dedup fix (one-time; may take 30-60s on heavy "
+                "histories)..."
+            )
+
+        conn.execute("BEGIN")
+        try:
+            # Track per-(week_start_date, reset_event_id) the cumulative
+            # cost of the immediately-prior threshold in the SAME segment
+            # so we can derive marginal = cumulative - prior.cumulative.
+            # The ORDER BY week_start_date, reset_event_id, threshold
+            # above is what makes this single-pass safe.
+            prev_cum_by_segment: dict[tuple[str, int], float] = {}
+
+            for (
+                mid, week_start_date, week_start_at, captured_at_utc,
+                threshold, reset_event_id,
+            ) in milestone_rows:
+                # week_start_at preferred; legacy rows fall back to
+                # week_start_date treated as midnight UTC (same shape
+                # weekly_cost_snapshots writers use when week_start_at
+                # is absent).
+                if week_start_at:
+                    range_start_iso = week_start_at
+                elif week_start_date:
+                    range_start_iso = f"{week_start_date}T00:00:00+00:00"
+                else:
+                    # Truly unrecoverable boundary — skip the row, leave
+                    # cumulative_cost as-recorded. CHANGELOG notes
+                    # parallel to 008's NULL range_*_iso skip.
+                    continue
+
+                entries = cache_ro.execute(
+                    "SELECT model, input_tokens, output_tokens, "
+                    "       cache_create_tokens, cache_read_tokens, "
+                    "       usage_extra_json, cost_usd_raw "
+                    "FROM session_entries "
+                    "WHERE unixepoch(timestamp_utc) "
+                    "      >= unixepoch(?) "
+                    "  AND unixepoch(timestamp_utc) "
+                    "      <= unixepoch(?)",
+                    (range_start_iso, captured_at_utc),
+                ).fetchall()
+
+                cumulative = 0.0
+                for (
+                    model, i, o, cc, cr, extras_json, raw,
+                ) in entries:
+                    usage = {
+                        "input_tokens": i,
+                        "output_tokens": o,
+                        "cache_creation_input_tokens": cc,
+                        "cache_read_input_tokens": cr,
+                    }
+                    if extras_json:
+                        usage.update(json.loads(extras_json))
+                    cumulative += _calculate_entry_cost(
+                        model, usage, mode="auto", cost_usd=raw,
+                    )
+
+                seg_key = (week_start_date, int(reset_event_id or 0))
+                prior_cum = prev_cum_by_segment.get(seg_key)
+                marginal = (
+                    cumulative
+                    if prior_cum is None
+                    else cumulative - prior_cum
+                )
+                prev_cum_by_segment[seg_key] = cumulative
+
+                conn.execute(
+                    "UPDATE percent_milestones "
+                    "SET cumulative_cost_usd = ?, "
+                    "    marginal_cost_usd = ? "
+                    "WHERE id = ?",
+                    (cumulative, marginal, mid),
+                )
+
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations "
+                "(name, applied_at_utc) VALUES (?, ?)",
+                (
+                    "010_recompute_percent_milestones_dedup_fix",
+                    now_utc_iso(),
+                ),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        cache_ro.close()
+
+
 # === Region 8: Test-only migration registration (was bin/cctally:12086-12140) ===
 
 # ──────────────────────────────────────────────────────────────────────
