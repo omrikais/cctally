@@ -498,9 +498,19 @@ def _run_pending_migrations(
                 eprint(
                     f"[migration {qualified_name}] deferred: {gate_exc}"
                 )
-            break  # stop on first deferral so later migrations don't see
-                   # partial-prior state either (mirror of the failure-break
-                   # rule below).
+            # D2 — ``continue``, NOT ``break``. A gate-defer leaves the DB
+            # in a fully-consistent prior state (the handler raised before
+            # touching anything, or rolled back its own BEGIN); later
+            # registry entries can legitimately attempt to run. The
+            # all-applied predicate below uses ``applied | skipped``, so
+            # this gated migration's absence from both sets keeps
+            # ``user_version`` from advancing — a future open re-tries
+            # the gated migration even if every later one succeeded.
+            #
+            # Contrast the Exception branch below, which DOES break: a
+            # generic handler exception may have left a partial transaction
+            # state, so later migrations should not see it.
+            continue
         except Exception as exc:
             _log_migration_error(
                 name=qualified_name,
