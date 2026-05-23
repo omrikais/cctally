@@ -2,7 +2,7 @@
 1
 ## state
 stats.db:
-  user_version: 9
+  user_version: 11
   schema_migrations:
     001_five_hour_block_models_backfill_v1
     002_five_hour_block_projects_backfill_v1
@@ -12,7 +12,9 @@ stats.db:
     006_five_hour_milestones_reset_event_id
     007_observed_pre_credit_pct
     008_recompute_weekly_cost_snapshots_dedup_fix
-    009_test_failure_injection
+    009_recompute_five_hour_blocks_dedup_fix
+    010_recompute_percent_milestones_dedup_fix
+    011_test_failure_injection
   schema_migrations_skipped:
 ## log
 <no migration-errors.log>
