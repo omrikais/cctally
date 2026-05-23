@@ -2174,14 +2174,24 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
     try:
         # Resolve projects dirs at call time so ``CLAUDE_CONFIG_DIR``
         # users (whose JSONL lives outside ``~/.claude/projects``) don't
-        # falsely trigger the gate's empty-disk fallback. Falls back to
-        # ``[_cctally_core.CLAUDE_PROJECTS_DIR]`` when the resolver returns
-        # an empty list (e.g. no projects/ dirs exist on disk yet) so the
-        # gate still does a defensive glob at the documented default.
+        # falsely trigger the gate's empty-disk fallback. The resolver
+        # returns ONLY directories that exist on disk (``is_dir()``-
+        # filtered); an empty list means no projects/ dir resolved
+        # successfully under the env-configured roots.
         projects_dirs = _cctally_core._resolve_claude_projects_dirs()
-        if not projects_dirs:
+
+        # Defensive fallback: when the resolver returned ``[]`` BUT the
+        # documented default ``CLAUDE_PROJECTS_DIR`` exists on disk
+        # (test-time monkeypatch override; or an exotic real-world
+        # topology the resolver doesn't model), feed the gate that path
+        # so Layer C can do its usual scan. The resolver's ``is_dir()``
+        # filter SHOULD already match production's
+        # ``~/.claude/projects``; the fallback exists for the test
+        # surface where ``CLAUDE_PROJECTS_DIR`` is monkeypatched to a
+        # fixture dir that the resolver (which walks ``$HOME``-derived
+        # defaults) won't find.
+        if not projects_dirs and _cctally_core.CLAUDE_PROJECTS_DIR.is_dir():
             projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
-        _gate_001_post_ingest_completed(cache_ro, projects_dirs)
 
         # F3 scope: only rows we have authority over (see docstring).
         snapshot_rows = conn.execute(
@@ -2189,6 +2199,46 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
             "FROM weekly_cost_snapshots "
             "WHERE mode = 'auto' AND project IS NULL"
         ).fetchall()
+
+        # G3 — refuse to zero historical snapshots when NO projects/
+        # dir resolves on disk under ANY env-configured or default
+        # root. Without this guard the prior unconditional fallback to
+        # ``[_cctally_core.CLAUDE_PROJECTS_DIR]`` (potentially missing
+        # in this scenario) made the gate's Layer C empty-disk
+        # fallback fire, which then ran the recompute against an empty
+        # ``session_entries`` and silently UPDATEd every
+        # ``mode='auto' AND project IS NULL`` snapshot to
+        # ``cost_usd = 0.0`` — destruction with no recovery path.
+        #
+        # Heuristic: only fail-closed when the operator's
+        # ``weekly_cost_snapshots`` HAS rows to recompute. A truly
+        # fresh install (no projects dirs AND no snapshot rows) is
+        # safe to no-op — there's nothing to corrupt, and gate-defer
+        # would loop forever (no JSONL → no future ingest → resolver
+        # stays empty → defer again).
+        #
+        # Surfaces as ``MigrationGateNotMet`` so the dispatcher's
+        # gate-defer machinery handles it cleanly (no migration-error
+        # banner, marker stays unstamped, ``user_version`` doesn't
+        # advance). The exception message tells the operator what to
+        # check and how to opt out via ``db skip``.
+        if not projects_dirs and snapshot_rows:
+            raise MigrationGateNotMet(
+                "CLAUDE_CONFIG_DIR resolves to no readable projects/ "
+                "dir; refusing to zero historical "
+                "weekly_cost_snapshots. Check the env var or run "
+                "`cctally db skip "
+                "008_recompute_weekly_cost_snapshots_dedup_fix` to "
+                "defer (`cctally db unskip ...` reverts)."
+            )
+
+        # Fresh install fall-through: no projects dirs AND no snapshot
+        # rows. Feed the gate a single defensive default so Layer C
+        # can still no-op the migration (mark applied + return). Gate-
+        # defer would loop forever on this topology.
+        if not projects_dirs:
+            projects_dirs = [_cctally_core.CLAUDE_PROJECTS_DIR]
+        _gate_001_post_ingest_completed(cache_ro, projects_dirs)
 
         # Banner gated on "we actually have eligible rows to recompute".
         # Empty-snapshot topologies (most goldens, fresh-install
