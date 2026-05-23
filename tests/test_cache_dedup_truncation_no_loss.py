@@ -210,6 +210,97 @@ def test_no_regression_on_pure_growth(isolated_cache):
     assert sorted(r[0] for r in rows) == ["m1", "m2", "m3"]
 
 
+def test_truncation_simulated_crash_recovers_on_next_sync(isolated_cache, monkeypatch):
+    """Crash-safety (U3 P2 follow-up): if the process is killed between
+    the escalation's `DELETE FROM session_entries` commit and the per-file
+    re-ingest commits, the NEXT sync must still re-ingest every file —
+    not just the originally-truncated one.
+
+    Without zeroing session_files.size_bytes/last_byte_offset alongside
+    the DELETE, the partial-state recovery sync would see size_bytes
+    unchanged for untruncated files and take the per-file early-exit
+    (`if size == prev_size: continue`), leaving rows missing from
+    session_entries until file size changes or the operator runs
+    `cache-sync --rebuild`.
+
+    We simulate the crash by monkeypatching the per-file re-ingest loop
+    to a no-op after the escalation commit, then run sync_cache a
+    SECOND time normally and assert all data is back.
+    """
+    ns, conn, file_a, file_b, sync = isolated_cache
+
+    # Seed: A and B share (m1,r1); B has higher tokens; a separate
+    # (m2,r2) lives only on B so we can detect whether B got re-ingested.
+    file_a.write_text(_assistant_line("m1", "r1", out_tokens=10))
+    file_b.write_text(
+        _assistant_line("m1", "r1", out_tokens=3881, speed="standard")
+        + _assistant_line("m2", "r2", out_tokens=500)
+    )
+    sync()
+    rows = _read_entries(conn)
+    msgs = sorted(r[0] for r in rows)
+    assert msgs == ["m1", "m2"], msgs
+    pre_offsets = dict(conn.execute(
+        "SELECT path, last_byte_offset FROM session_files"
+    ).fetchall())
+    assert all(v > 0 for v in pre_offsets.values()), pre_offsets
+
+    # Truncate A. Now monkeypatch the per-file JSONL iterator to RAISE,
+    # so the escalation commits (DELETE + UPDATE session_files) land but
+    # the per-file ingest aborts before any session_files write commits
+    # — simulating kill -9 right after the escalation commit, before any
+    # per-file `INSERT INTO session_files` runs.
+    file_a.write_text("")
+    cache_mod = sys.modules["_cctally_cache"]
+    real_iter = cache_mod._iter_jsonl_entries_with_offsets
+
+    class _SimulatedCrash(Exception):
+        pass
+
+    def crash_after_escalation(*_args, **_kwargs):
+        # Raise from the generator body so the per-file `with open(...)`
+        # block's read loop unwinds before the session_files UPSERT.
+        raise _SimulatedCrash("simulated kill -9 after escalation commit")
+        yield  # pragma: no cover  (unreachable; makes this a generator)
+
+    monkeypatch.setattr(
+        cache_mod, "_iter_jsonl_entries_with_offsets", crash_after_escalation
+    )
+    with pytest.raises(_SimulatedCrash):
+        sync()
+    monkeypatch.setattr(
+        cache_mod, "_iter_jsonl_entries_with_offsets", real_iter
+    )
+
+    # Post-"crash" state: session_entries empty, session_files offsets
+    # zeroed (the load-bearing invariant under test — U3 P2 fix).
+    assert conn.execute("SELECT COUNT(*) FROM session_entries").fetchone()[0] == 0
+    rows = conn.execute(
+        "SELECT size_bytes, last_byte_offset FROM session_files"
+    ).fetchall()
+    assert all(r[0] == 0 and r[1] == 0 for r in rows), (
+        f"session_files offsets must be zeroed after escalation; got {rows}"
+    )
+
+    # Recovery sync: even though file_b's on-disk size hasn't changed
+    # since the (pre-crash) first sync, the zeroed prev_size must force
+    # the per-file branch to re-ingest from offset 0. file_a is now
+    # empty so its content contributes nothing; both m1 and m2 must
+    # land on disk via file_b's re-ingest. WITHOUT the U3 P2 fix
+    # (UPDATE session_files SET size_bytes=0 ...) file_b would be
+    # skipped via `size == prev_size: continue` and both rows would
+    # stay missing.
+    sync()
+    rows = _read_entries(conn)
+    msgs = sorted(r[0] for r in rows)
+    assert msgs == ["m1", "m2"], (
+        f"after the crash-recovery sync, B's (m1,r1) AND (m2,r2) rows "
+        f"MUST be present — if either is missing, the size_bytes match "
+        f"short-circuited B's per-file re-ingest and the U3 P2 fix is "
+        f"incomplete. Got: {msgs}"
+    )
+
+
 def test_truncation_with_no_dedup_overlap(isolated_cache):
     """Truncation on a file that DOESN'T share dedup keys with any other
     file should still re-ingest correctly. (This is the common case —

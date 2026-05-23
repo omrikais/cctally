@@ -511,6 +511,22 @@ def sync_cache(
                 f"dedup)"
             )
             conn.execute("DELETE FROM session_entries")
+            # Crash-safety: also clear session_files's size/offset tracking
+            # so a partial-state recovery on the NEXT sync forces every
+            # file's per-file branch to take the fresh-ingest path. Without
+            # this, if the process is killed (kill -9, power loss) between
+            # this DELETE commit and the per-file re-ingest commits below,
+            # the next sync would only re-detect the originally-truncated
+            # file(s); other files still have matching size_bytes and the
+            # `if size == prev_size: continue` early-exit would leave them
+            # missing from session_entries until file size changes or an
+            # operator runs `cache-sync --rebuild`. UPDATE (not DELETE)
+            # preserves session_id / project_path columns lazy-backfilled
+            # by _ensure_session_files_row (used by the `session`
+            # subcommand's JOIN).
+            conn.execute(
+                "UPDATE session_files SET size_bytes = 0, last_byte_offset = 0"
+            )
             conn.commit()
             stats.files_reset_truncated += len(truncated_paths)
             # Force every file to re-ingest from offset 0: clearing the
