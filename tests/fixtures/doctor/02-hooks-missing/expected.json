@@ -121,12 +121,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/stats.db",
-                        "registry_size": 8,
+                        "registry_size": 10,
                         "user_version": 0
                     },
                     "id": "db.stats.file",
                     "severity": "ok",
-                    "summary": "version 0 / 8 known",
+                    "summary": "version 0 / 10 known",
                     "title": "stats.db"
                 },
                 {
@@ -160,7 +160,9 @@
                                     "005_percent_milestones_reset_event_id",
                                     "006_five_hour_milestones_reset_event_id",
                                     "007_observed_pre_credit_pct",
-                                    "008_recompute_weekly_cost_snapshots_dedup_fix"
+                                    "008_recompute_weekly_cost_snapshots_dedup_fix",
+                                    "009_recompute_five_hour_blocks_dedup_fix",
+                                    "010_recompute_percent_milestones_dedup_fix"
                                 ],
                                 "skipped": []
                             }
@@ -168,7 +170,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/9 applied",
+                    "summary": "0/11 applied",
                     "title": "Migrations"
                 },
                 {
@@ -207,6 +209,14 @@
                                 "008_recompute_weekly_cost_snapshots_dedup_fix"
                             ],
                             [
+                                "stats.db",
+                                "009_recompute_five_hour_blocks_dedup_fix"
+                            ],
+                            [
+                                "stats.db",
+                                "010_recompute_percent_milestones_dedup_fix"
+                            ],
+                            [
                                 "cache.db",
                                 "001_dedup_highest_wins"
                             ]
@@ -215,7 +225,7 @@
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "9 pending",
+                    "summary": "11 pending",
                     "title": "Pending migrations"
                 }
             ],

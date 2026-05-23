@@ -15,12 +15,18 @@ Reconcile invariant: R-DEDUP2 in ``bin/cctally-reconcile-test``.
 """
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util as ilu
 import pathlib
 import sqlite3
 import sys
 
 import pytest
+
+# Test-local import of ``parse_iso_datetime`` from bin/_cctally_core for
+# building the production-canonical UTC ISO shape of fixture entries.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+from _cctally_core import parse_iso_datetime  # noqa: E402
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -157,6 +163,13 @@ def _stage_cache(
         )
         # Entry A: strictly inside the window. 1000 output tokens of
         # claude-opus-4-7 at $25/Mtok → $0.025.
+        #
+        # ``timestamp_utc`` uses the canonical UTC-offset form (``+00:00``)
+        # that production's ``sync_cache`` always writes
+        # (``entry.timestamp.astimezone(dt.timezone.utc).isoformat()``).
+        # The fixture must match the on-disk invariant so the migration's
+        # lex compare against canonicalized range bounds (perf P1) hits
+        # both rows the same way it does for real users.
         cache.execute(
             "INSERT INTO session_entries "
             "(source_path, line_offset, timestamp_utc, model, "
@@ -164,14 +177,21 @@ def _stage_cache(
             " cache_read_tokens, usage_extra_json) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
             (
-                "/tmp/session1.jsonl", 0, "2026-05-18T00:00:00Z",
+                "/tmp/session1.jsonl", 0, "2026-05-18T00:00:00+00:00",
                 "claude-opus-4-7", 0, 1000, 0, 0, "{}",
             ),
         )
         # Entry B: timestamp_utc exactly equals the snapshot's
-        # range_end_iso boundary. Same model+tokens → another $0.025.
-        # Pre-fix the migration's `< unixepoch(range_end_iso)` predicate
-        # excluded this row; post-fix it's included (`<=`).
+        # range_end_iso boundary (same physical instant, canonical
+        # ``+00:00`` shape). Same model+tokens → another $0.025. Pre-fix
+        # the migration's `< unixepoch(range_end_iso)` predicate excluded
+        # this row; post-fix it's included (`<=`). Boundary is passed via
+        # the migration's range_end_iso (any ISO offset accepted —
+        # ``_canonical_utc_iso_for_index`` normalizes); the on-disk
+        # entry stays in production-canonical form.
+        boundary_canonical = parse_iso_datetime(
+            boundary_iso, "boundary"
+        ).astimezone(dt.timezone.utc).isoformat()
         cache.execute(
             "INSERT INTO session_entries "
             "(source_path, line_offset, timestamp_utc, model, "
@@ -179,7 +199,7 @@ def _stage_cache(
             " cache_read_tokens, usage_extra_json) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
             (
-                "/tmp/session1.jsonl", 1, boundary_iso,
+                "/tmp/session1.jsonl", 1, boundary_canonical,
                 "claude-opus-4-7", 0, 1000, 0, 0, "{}",
             ),
         )
