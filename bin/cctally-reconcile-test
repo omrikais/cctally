@@ -2055,11 +2055,15 @@ projects_envelope_invariants
 #           summations — same rule as every other USD invariant in this
 #           harness). Matches the PRODUCTION writer's predicate
 #           (`compute_week_cost` -> `iter_entries`: closed lex
-#           `timestamp_utc >= ? AND <= ?` on UTC-normalized ISO), NOT
-#           stats-migration 008's half-open `<` end — migration 008 is a
-#           one-time recompute; every subsequent `sync-week` row goes
-#           through the closed-interval writer, so the durable invariant
-#           must mirror the writer.
+#           `timestamp_utc >= ? AND <= ?` on UTC-normalized ISO).
+#           Migration 008's body is now SYMMETRIC with this predicate
+#           (V1 fix: `unixepoch(timestamp_utc) <= unixepoch(?)`); a row
+#           whose `timestamp_utc` exactly equals `range_end_iso` is
+#           included by both the one-shot recompute and every
+#           subsequent `sync-week` write, so the invariant holds even
+#           for snapshots whose `range_end_iso` lands on a real entry's
+#           timestamp (e.g. an entry written exactly on the
+#           subscription-week reset instant).
 #
 # R-DEDUP3: regression guard on the "`five_hour_blocks` totals recompute
 #           every tick from `session_entries`" contract (CLAUDE.md 5-hour

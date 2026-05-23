@@ -2210,13 +2210,28 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
                     # existed. Skip (not crash) — leaves the snapshot at
                     # its pre-fix value; CHANGELOG calls this out.
                     continue
+                # V1 — closed interval ``<=`` matches the production
+                # writer (``iter_entries`` in bin/_cctally_cache.py: lex
+                # ``timestamp_utc >= ? AND timestamp_utc <= ?``). The
+                # migration's prior half-open ``<`` end silently excluded
+                # any ``session_entries`` row whose ``timestamp_utc``
+                # equalled the snapshot's ``range_end_iso`` boundary —
+                # an edge with positive probability on subscription-week
+                # boundaries where Claude Code's status-line tick can
+                # land an entry exactly on the reset instant. After this
+                # fix, the migration's recompute is byte-for-byte
+                # symmetric with every subsequent ``sync-week`` row that
+                # gets written through ``compute_week_cost`` →
+                # ``iter_entries`` — so R-DEDUP2 in
+                # ``bin/cctally-reconcile-test`` no longer needs to
+                # caveat the divergence.
                 entries = cache_ro.execute(
                     "SELECT model, input_tokens, output_tokens, "
                     "cache_create_tokens, cache_read_tokens, "
                     "usage_extra_json, cost_usd_raw "
                     "FROM session_entries "
                     "WHERE unixepoch(timestamp_utc) >= unixepoch(?) "
-                    "  AND unixepoch(timestamp_utc) <  unixepoch(?)",
+                    "  AND unixepoch(timestamp_utc) <= unixepoch(?)",
                     (range_start_iso, range_end_iso),
                 ).fetchall()
                 total = 0.0
