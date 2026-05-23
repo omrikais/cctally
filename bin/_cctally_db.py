@@ -2626,6 +2626,11 @@ def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
             return
         conn.execute("DELETE FROM session_entries")
         conn.execute("DELETE FROM session_files")
+        # Clear the walk-complete sentinel atomically with the wipe
+        # (cctally-dev#93, D5/D2): a wiped session_entries must never coexist
+        # with a "complete walk" marker. The end-of-loop write in sync_cache
+        # re-establishes it only after a subsequent clean walk.
+        conn.execute("DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'")
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
             "VALUES (?, ?)",

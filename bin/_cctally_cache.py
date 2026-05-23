@@ -443,6 +443,30 @@ def sync_cache(
             stats.lock_contended = True
             return stats
 
+        # Walk-complete sentinel gating (cctally-dev#93, D5b/D6b). Capture
+        # whether cache 001 was already applied at the moment this sync
+        # acquired the lock. The end-of-loop marker write is gated on this so
+        # a walk whose baseline predates the 001 wipe (the "straddle" run)
+        # withholds the marker — it cannot vouch for a cache 001 wiped
+        # underneath it. On the normal first-upgrade flow open_cache_db runs
+        # the dispatcher (001 applies in-process) BEFORE sync_cache is ever
+        # called, so this is True and the marker is written as expected. If
+        # schema_migrations doesn't exist yet, treat as not-applied (False).
+        try:
+            applied_at_start = conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE name='001_dedup_highest_wins'"
+            ).fetchone() is not None
+        except sqlite3.OperationalError:
+            applied_at_start = False
+
+        # Tracks whether every file in this walk was either ingested cleanly
+        # or confirmed-current. Any per-file error-skip (stat/read failure or
+        # a DB error that rolls back + continues) flips it False so the marker
+        # is withheld — an incomplete walk must not look complete. The
+        # unchanged-file early-exit (`size == prev_size`) does NOT flip it: a
+        # confirmed-current file still counts as walked.
+        walk_clean = True
+
         if rebuild:
             # Clear INSIDE the lock — a concurrent rebuild that lost the
             # race would otherwise have wiped this cache before bailing,
@@ -451,6 +475,11 @@ def sync_cache(
             # empty baseline.
             conn.execute("DELETE FROM session_entries")
             conn.execute("DELETE FROM session_files")
+            # Clear the walk-complete sentinel atomically with the wipe
+            # (cctally-dev#93, D5/D2): a stale "complete" marker must never
+            # survive a destructive rebuild. The end-of-loop write below
+            # re-establishes it only after this rebuild's clean walk.
+            conn.execute("DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'")
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Claude cached entries")
 
@@ -511,6 +540,11 @@ def sync_cache(
                 f"dedup)"
             )
             conn.execute("DELETE FROM session_entries")
+            # Clear the walk-complete sentinel atomically with the truncation
+            # full-reset (cctally-dev#93, D5/D2): the cache is being wiped, so
+            # any "complete" marker is now stale. The end-of-loop write below
+            # re-establishes it only after this run's clean re-ingest walk.
+            conn.execute("DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'")
             # Crash-safety: also clear session_files's size/offset tracking
             # so a partial-state recovery on the NEXT sync forces every
             # file's per-file branch to take the fresh-ingest path. Without
@@ -549,6 +583,7 @@ def sync_cache(
                 st = jp.stat()
             except OSError as exc:
                 eprint(f"[cache] stat failed for {jp}: {exc}")
+                walk_clean = False  # skipped a file without ingesting (D5a)
                 continue
 
             size = st.st_size
@@ -607,6 +642,7 @@ def sync_cache(
                     final_offset = fh.tell()
             except OSError as exc:
                 eprint(f"[cache] could not read {jp}: {exc}")
+                walk_clean = False  # skipped a file without ingesting (D5a)
                 continue
 
             # Python's sqlite3 module starts an implicit transaction on the
@@ -705,6 +741,7 @@ def sync_cache(
             except sqlite3.DatabaseError as exc:
                 eprint(f"[cache] db error on {jp}: {exc}")
                 conn.rollback()
+                walk_clean = False  # rolled back this file without ingesting (D5a)
                 continue
 
             if progress is not None:
@@ -712,6 +749,22 @@ def sync_cache(
 
         if progress is not None:
             progress(stats)
+
+        # Walk-complete sentinel write (cctally-dev#93, D5a). Still inside the
+        # held fcntl lock, before the finally-unlock. Only when the entire walk
+        # was clean AND cache 001 was already applied at the start of this run
+        # (D5b): an unclean walk or a straddle run must not vouch for cache
+        # completeness. A lock-contended sync returned early above and never
+        # reaches here. Presence (not the timestamp) is the gate signal; the
+        # value stores the completion instant for doctor/debugging.
+        if walk_clean and applied_at_start:
+            conn.execute(
+                "INSERT INTO cache_meta(key, value) "
+                "VALUES('claude_ingest_walk_complete', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (dt.datetime.now(dt.timezone.utc).isoformat(),),
+            )
+            conn.commit()
         return stats
     finally:
         try:
