@@ -1603,8 +1603,17 @@ def _emit_diff_debug_samples(args, window_a, window_b) -> None:
             (window_b, "B", getattr(args, "b", "")),
         ):
             try:
-                entries = get_entries(
-                    window.start, window.end, skip_sync=skip_sync,
+                # Reuse the SAME half-open window accessor the rendered diff
+                # aggregation uses (`_diff_iter_claude_entries`): `ParsedWindow`
+                # exposes `start_utc`/`end_utc` (NOT `.start`/`.end`), and its
+                # `end_utc` is documented exclusive — the helper trims by 1 µs
+                # before hitting the inclusive-end shared cache reader so the
+                # debug report scopes to exactly the entries the rendered diff
+                # counts. Reading via `get_entries(window.start, window.end)`
+                # both raised AttributeError (wrong field names) and would have
+                # over-counted the exclusive end boundary.
+                entries = list(
+                    _diff_iter_claude_entries(window, skip_sync=skip_sync)
                 )
             except (sqlite3.DatabaseError, OSError) as exc:
                 eprint(
@@ -1987,15 +1996,23 @@ def _resolve_color_enabled(args: argparse.Namespace) -> bool:
       2. ``args.color``     → True (overrides ``NO_COLOR`` env).
       3. ``FORCE_COLOR``    → True.
       4. ``NO_COLOR``       → False.
-      5. ``isatty(stdout)`` or ``isatty(stderr)`` with non-dumb TERM
-                            → True (the same auto-detect that
-         ``_supports_color_stdout()`` uses; CI=True still enables).
+      5. ``isatty(stdout)`` with non-dumb TERM → True (the diff/project
+                            auto-detect; CI=True still enables).
       6. else               → False.
 
     The helper is consumed by ``cmd_project`` and ``cmd_diff`` — the only
     two in-scope Claude cmds whose renderers honor color. The other 8
     in-scope cmds parse ``--color`` / ``--no-color`` as documented no-op
     surface (spec §3 T1.5).
+
+    The rung-5 auto-detect keys on ``sys.stdout.isatty()`` ONLY — NOT the
+    shared ``_supports_color_stdout()`` (which is stdout-OR-stderr to match
+    ccusage's picocolors behavior). ``diff``'s pre-Session-A computation was
+    ``sys.stdout.isatty() and not args.no_color`` (stdout-only), and spec
+    §7.3 specifies preserving the *existing* auto-detect on the no-flag
+    rungs. Routing the fallback through the stdout-OR-stderr helper would
+    write ANSI into the pipe under ``cctally diff … | cat`` (stderr is still
+    a TTY) — a backwards-incompatible regression for plain-text consumers.
     """
     # Rung 1 — deny-wins: --no-color always disables.
     if getattr(args, "no_color", False):
@@ -2003,11 +2020,21 @@ def _resolve_color_enabled(args: argparse.Namespace) -> bool:
     # Rung 2 — --color overrides env (NO_COLOR auto-detect).
     if getattr(args, "color", False):
         return True
-    # Rungs 3-6 — delegate to the existing env+tty auto-detector. It
-    # already honors FORCE_COLOR (rung 3) > NO_COLOR (rung 4) > CI/isatty
-    # (rung 5) > else (rung 6) in that order, which matches the spec's
-    # behavior on the no-flag rungs exactly.
-    return _supports_color_stdout()
+    # Rung 3 — FORCE_COLOR env always enables (any value).
+    if "FORCE_COLOR" in os.environ:
+        return True
+    # Rung 4 — NO_COLOR env always disables (any value).
+    if "NO_COLOR" in os.environ:
+        return False
+    # Rung 5 — CI gets color; else stdout-only isatty with non-dumb TERM.
+    # Deliberately stdout-only so a piped stdout (stderr still a TTY) stays
+    # uncolored, preserving diff/project's pre-Session-A plain-text contract.
+    if "CI" in os.environ:
+        return True
+    if sys.stdout.isatty():
+        return os.environ.get("TERM", "").lower() != "dumb"
+    # Rung 6 — no flag, no env, non-tty stdout.
+    return False
 
 
 def _style_ansi(text: str, code: str, enabled: bool) -> str:
@@ -9758,15 +9785,25 @@ def _add_ccusage_alias_args(parser, *, ansi_emit: bool) -> None:
         )
         # --no-color already declared on these parsers; do nothing here.
     else:
+        # No-op-for-compat surface (spec §7.3): these flags parse but do
+        # NOT flow through the color resolver on this command. Color (where
+        # the renderer emits any) follows the auto-detect — isatty() plus
+        # NO_COLOR / FORCE_COLOR env — so the help must NOT claim "no ANSI
+        # is emitted" (daily/monthly/weekly/blocks/session/cache-report DO
+        # emit auto-detected ANSI on a TTY; only the no-color env vars
+        # suppress it). Force/suppress color on the 2 real ANSI commands
+        # (project, diff) instead, or use NO_COLOR=1 / FORCE_COLOR=1.
         _maybe_add(
             "--color", action="store_true", default=False,
-            help="Accepted for ccusage drop-in compat; no ANSI is "
-                 "emitted by this command.",
+            help="Accepted for ccusage drop-in compat; does not control "
+                 "this command's color. Color auto-detects from isatty() "
+                 "and honors NO_COLOR / FORCE_COLOR env.",
         )
         _maybe_add(
             "--no-color", action="store_true", default=False,
-            help="Accepted for ccusage drop-in compat; no ANSI is "
-                 "emitted by this command.",
+            help="Accepted for ccusage drop-in compat; does not suppress "
+                 "this command's color. Use NO_COLOR=1 env (or pipe stdout) "
+                 "to disable auto-detected ANSI.",
         )
 
 

@@ -32,10 +32,35 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 
 import pytest
 
 from conftest import load_script
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s)
+
+
+def _box_line_widths(ns, rendered: str) -> list[int]:
+    """Display widths of the box-drawing lines in a rendered table.
+
+    Filters to lines that are part of the table grid (start with a box
+    corner / border / vertical glyph) so the leading banner and trailing
+    notes don't pollute the width-uniformity check. Widths use the
+    renderer's own `_display_width` so wide glyphs count as 2 cells.
+    """
+    display_width = ns["_display_width"]
+    grid_prefixes = ("┌", "├", "└", "│")  # ┌ ├ └ │
+    widths = []
+    for raw in rendered.splitlines():
+        line = _strip_ansi(raw)
+        if line.startswith(grid_prefixes):
+            widths.append(display_width(line))
+    return widths
 
 
 @pytest.fixture(scope="module")
@@ -50,6 +75,22 @@ def wide_terminal(monkeypatch):
     monkeypatch.setenv("COLUMNS", "300")
     # Some renderers call os.get_terminal_size() first; make it raise so
     # the COLUMNS fallback fires.
+    real = os.get_terminal_size
+
+    def _raise(*a, **k):
+        raise OSError("forced for test")
+
+    monkeypatch.setattr(os, "get_terminal_size", _raise)
+    yield
+    monkeypatch.setattr(os, "get_terminal_size", real)
+
+
+@pytest.fixture
+def narrow_terminal(monkeypatch):
+    """Force an 80-column terminal so the compact scale-down branch
+    actually shrinks columns (the regression surface for headers wider
+    than their scaled column width)."""
+    monkeypatch.setenv("COLUMNS", "80")
     real = os.get_terminal_size
 
     def _raise(*a, **k):
@@ -168,6 +209,36 @@ def test_compact_changes_session_rendering(ns, wide_terminal):
     assert wide != compact, "compact kwarg had no effect on session render"
 
 
+def test_compact_session_border_alignment_on_narrow_terminal(
+    ns, narrow_terminal
+):
+    """Codex review (round 2): `--compact` must not shrink a column below
+    its (unsplittable) header width. On an 80-col terminal the scale-down
+    branch previously floored columns at 8 chars, but headers like
+    "Cache Create" (12), "Cost (USD)" (10) and "Last Activity" (13) are
+    padded — never truncated — in the header render, so the header row
+    overflowed the box border and the grid misaligned. Every box-drawing
+    line (top/header-sep/data-sep/bottom borders + the `│`-delimited
+    header & data rows) must share one display width.
+    """
+    render = ns["_render_claude_session_table"]
+    sessions = [
+        _claude_session(
+            ns,
+            sid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            project="/Users/alice/very/long/project/path/that/will/widen/this",
+            tokens=12345,
+        ),
+    ]
+    rendered = render(sessions, compact=True)
+    widths = _box_line_widths(ns, rendered)
+    assert widths, "no box-drawing lines found in compact session render"
+    assert len(set(widths)) == 1, (
+        f"compact session table misaligned: distinct box-line widths "
+        f"{sorted(set(widths))}\n{rendered}"
+    )
+
+
 # ── issue #91: project renderer (Shape A — force scale-down) ─────────────
 
 
@@ -208,6 +279,31 @@ def test_compact_changes_project_rendering(ns, wide_terminal):
     compact = render(rows, title="Project Usage", compact=True)
 
     assert wide != compact, "compact kwarg had no effect on project render"
+
+
+def test_compact_project_border_alignment_on_narrow_terminal(
+    ns, narrow_terminal
+):
+    """Codex review (round 2): same header-floor regression as session,
+    in the project renderer. Headers "First Seen" (10), "Cache Create"
+    (12) and "Cost (USD)" (10) are padded (not truncated) in the header
+    render, so flooring columns at 8 left the header wider than the
+    border. Assert one uniform display width across all box-drawing
+    lines under `--compact` on 80 columns."""
+    render = ns["_render_project_table"]
+    rows = [
+        _project_row(ns, display_key="alpha", bucket="/Users/a/alpha",
+                     tokens=12345, cost=4.21),
+        _project_row(ns, display_key="beta", bucket="/Users/a/beta",
+                     tokens=6789, cost=1.07),
+    ]
+    rendered = render(rows, title="Project Usage", compact=True)
+    widths = _box_line_widths(ns, rendered)
+    assert widths, "no box-drawing lines found in compact project render"
+    assert len(set(widths)) == 1, (
+        f"compact project table misaligned: distinct box-line widths "
+        f"{sorted(set(widths))}\n{rendered}"
+    )
 
 
 # ── issue #91: cache-report renderer (Shape A — force scale-down) ────────

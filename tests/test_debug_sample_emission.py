@@ -619,7 +619,14 @@ INSCOPE_CMDS = [
 
 def _window_args_for(cmd):
     if cmd == "diff":
-        return ["--a", "last-week", "--b", "this-week"]
+        # Explicit date-range tokens (NOT `last-week`/`this-week`): the
+        # subscription-week tokens raise NoAnchorError on an empty fake
+        # home and exit BEFORE reaching `_emit_diff_debug_samples`, which
+        # historically masked an AttributeError in the diff `--debug` path
+        # (it read `window.start`/`window.end`, but `ParsedWindow` only
+        # exposes `start_utc`/`end_utc`). Date ranges resolve without an
+        # anchor so the matrix actually exercises the debug emission.
+        return ["--a", "2026-05-01..2026-05-07", "--b", "2026-05-08..2026-05-14"]
     if cmd == "range-cost":
         return ["--start", "2026-01-01T00:00:00Z", "--end", "2026-01-02T00:00:00Z"]
     return []
@@ -888,25 +895,33 @@ class TestDiffDebugSamples:
         """
         mod = _load_cctally_module()
         monkeypatch.setattr(mod, "_DEBUG_REPORT_EMITTED", False)
-        # Stub get_entries so we don't need a real cache
+        # Stub the shared cache reader so we don't need a real cache. The
+        # debug helper reuses `_diff_iter_claude_entries`, which trims the
+        # half-open `end_utc` by 1 µs and calls `get_claude_session_entries`
+        # — patch THAT (not `get_entries`) to observe the real wiring.
         captured_calls = []
-        def fake_get_entries(start, end, **kwargs):
+        def fake_get_claude_session_entries(start, end, **kwargs):
             captured_calls.append((start, end, kwargs))
             return []  # empty → short-form report
-        monkeypatch.setattr(mod, "get_entries", fake_get_entries)
-        # Stub diff window objects — duck-typed
-        class _W:
-            def __init__(self, start, end, token):
-                self.start = start
-                self.end = end
-                self.token = token
+        monkeypatch.setattr(
+            mod, "get_claude_session_entries", fake_get_claude_session_entries
+        )
         import datetime as dt
-        wa = _W(dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
-                "last-week")
-        wb = _W(dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 5, 15, tzinfo=dt.timezone.utc),
-                "this-week")
+        # Real ParsedWindow objects (NOT a duck-typed `.start`/`.end` stub):
+        # `ParsedWindow` exposes `start_utc`/`end_utc`, so this exercises the
+        # production field names the helper now reads.
+        wa = mod.ParsedWindow(
+            label="last-week",
+            start_utc=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+            end_utc=dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
+            length_days=7.0, kind="week", week_aligned=True, full_weeks_count=1,
+        )
+        wb = mod.ParsedWindow(
+            label="this-week",
+            start_utc=dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
+            end_utc=dt.datetime(2026, 5, 15, tzinfo=dt.timezone.utc),
+            length_days=7.0, kind="week", week_aligned=True, full_weeks_count=1,
+        )
         ns = argparse.Namespace(
             debug=True, debug_samples=5, sync=False,
             a="last-week", b="this-week",
@@ -921,10 +936,14 @@ class TestDiffDebugSamples:
         # for the short-form path we instead assert there are exactly 2
         # "No pricing data found to analyze." lines.
         assert text.count("No pricing data found to analyze.") == 2, text
-        # Two get_entries calls, one per window
+        # Two reads, one per window.
         assert len(captured_calls) == 2
-        assert captured_calls[0][0] == wa.start
-        assert captured_calls[1][0] == wb.start
+        # Half-open semantics: the helper passes `start_utc` and an
+        # `end_utc - 1µs` exclusive end to the inclusive-end cache reader.
+        assert captured_calls[0][0] == wa.start_utc
+        assert captured_calls[0][1] == wa.end_utc - dt.timedelta(microseconds=1)
+        assert captured_calls[1][0] == wb.start_utc
+        assert captured_calls[1][1] == wb.end_utc - dt.timedelta(microseconds=1)
         # Without --sync, the debug helper observes the cache as-is (no
         # ingest): skip_sync stays True for both windows.
         for _, _, kwargs in captured_calls:
@@ -943,22 +962,25 @@ class TestDiffDebugSamples:
         mod = _load_cctally_module()
         monkeypatch.setattr(mod, "_DEBUG_REPORT_EMITTED", False)
         captured_calls = []
-        def fake_get_entries(start, end, **kwargs):
+        def fake_get_claude_session_entries(start, end, **kwargs):
             captured_calls.append((start, end, kwargs))
             return []
-        monkeypatch.setattr(mod, "get_entries", fake_get_entries)
-        class _W:
-            def __init__(self, start, end, token):
-                self.start = start
-                self.end = end
-                self.token = token
+        monkeypatch.setattr(
+            mod, "get_claude_session_entries", fake_get_claude_session_entries
+        )
         import datetime as dt
-        wa = _W(dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
-                "last-week")
-        wb = _W(dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 5, 15, tzinfo=dt.timezone.utc),
-                "this-week")
+        wa = mod.ParsedWindow(
+            label="last-week",
+            start_utc=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+            end_utc=dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
+            length_days=7.0, kind="week", week_aligned=True, full_weeks_count=1,
+        )
+        wb = mod.ParsedWindow(
+            label="this-week",
+            start_utc=dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
+            end_utc=dt.datetime(2026, 5, 15, tzinfo=dt.timezone.utc),
+            length_days=7.0, kind="week", week_aligned=True, full_weeks_count=1,
+        )
         ns = argparse.Namespace(
             debug=True, debug_samples=5, sync=True,
             a="last-week", b="this-week",
@@ -1097,7 +1119,7 @@ class TestLoaderExceptionDegrades:
         assert "report unavailable: EIO" in text, text
 
     def test_diff_window_a_failure_does_not_block_window_b(self, monkeypatch):
-        """If get_entries raises for window A, the diff helper logs a
+        """If the cache read raises for window A, the diff helper logs a
         one-line notice for window A and still attempts window B. The
         guard is still set in `finally:` so a downstream cmd_* doesn't
         double-emit.
@@ -1107,21 +1129,27 @@ class TestLoaderExceptionDegrades:
         monkeypatch.setattr(mod, "_DEBUG_REPORT_EMITTED", False)
         # First call raises, second returns empty
         call_log = []
-        def fake_get_entries(start, end, **kwargs):
+        def fake_get_claude_session_entries(start, end, **kwargs):
             call_log.append((start, end))
             if len(call_log) == 1:
                 raise sqlite3.DatabaseError("window-A boom")
             return []
-        monkeypatch.setattr(mod, "get_entries", fake_get_entries)
-        class _W:
-            def __init__(self, start, end):
-                self.start = start
-                self.end = end
+        monkeypatch.setattr(
+            mod, "get_claude_session_entries", fake_get_claude_session_entries
+        )
         import datetime as dt
-        wa = _W(dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc))
-        wb = _W(dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
-                dt.datetime(2026, 5, 15, tzinfo=dt.timezone.utc))
+        wa = mod.ParsedWindow(
+            label="last-week",
+            start_utc=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+            end_utc=dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
+            length_days=7.0, kind="week", week_aligned=True, full_weeks_count=1,
+        )
+        wb = mod.ParsedWindow(
+            label="this-week",
+            start_utc=dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
+            end_utc=dt.datetime(2026, 5, 15, tzinfo=dt.timezone.utc),
+            length_days=7.0, kind="week", week_aligned=True, full_weeks_count=1,
+        )
         ns = argparse.Namespace(
             debug=True, debug_samples=5, sync=False,
             a="last-week", b="this-week",

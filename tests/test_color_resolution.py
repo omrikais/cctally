@@ -120,6 +120,45 @@ def test_neither_flag_nor_env_no_tty(cctally_mod, monkeypatch):
     assert isinstance(val, bool)
 
 
+def test_piped_stdout_with_tty_stderr_stays_uncolored(cctally_mod, monkeypatch):
+    """Codex review (round 2): the no-flag auto-detect (rung 5) keys on
+    ``sys.stdout.isatty()`` ONLY, not stdout-OR-stderr.
+
+    ``cctally diff … | cat`` pipes stdout while stderr stays attached to
+    the terminal. The pre-Session-A computation was
+    ``sys.stdout.isatty() and not args.no_color`` (stdout-only), so it
+    emitted plain text in this case. Routing the fallback through the
+    shared ``_supports_color_stdout()`` (stdout-OR-stderr, to match
+    ccusage's picocolors) would write ANSI into the pipe — a
+    backwards-incompatible regression for plain-text consumers.
+    """
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True, raising=False)
+    assert (
+        cctally_mod._resolve_color_enabled(_ns(color=False, no_color=False))
+        is False
+    )
+
+
+def test_tty_stdout_no_flag_enables(cctally_mod, monkeypatch):
+    """Rung 5 positive case: stdout is a TTY with a non-dumb TERM and no
+    flag/env → color enabled."""
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
+    assert (
+        cctally_mod._resolve_color_enabled(_ns(color=False, no_color=False))
+        is True
+    )
+
+
 # ─── End-to-end subprocess tests on project + diff ─────────────────────
 
 

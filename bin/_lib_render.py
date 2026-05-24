@@ -2295,7 +2295,17 @@ def _render_claude_session_table(
         available = term_width - border_overhead
         total_col = sum(col_widths)
         scale = available / total_col if total_col > 0 else 1.0
-        col_widths = [max(int(w * scale), 8) for w in col_widths]
+        # Floor each column at its HEADER width, never a bare 8. Header
+        # cells are single-line unsplittable labels ("Cache Create",
+        # "Cost (USD)", "Last Activity") that the header render below pads
+        # with `_pad_cell` (no truncation, unlike data cells). Scaling a
+        # column below `len(header)` left the header wider than the border
+        # row's `H * (w + 2)`, so the box drawing misaligned under
+        # `--compact` on narrow terminals — defeating the flag's purpose.
+        col_floors = [max(8, len(h)) for h in headers]
+        col_widths = [
+            max(int(w * scale), col_floors[i]) for i, w in enumerate(col_widths)
+        ]
         remainder = available - sum(col_widths)
         if remainder > 0:
             col_widths[1] += remainder  # grow Directory column
@@ -2603,7 +2613,15 @@ def _render_project_table(
         available = term_width - border_overhead
         total_col = sum(col_widths)
         scale = available / total_col if total_col > 0 else 1.0
-        col_widths = [max(int(w * scale), 8) for w in col_widths]
+        # Floor each column at its HEADER width, never a bare 8 — headers
+        # ("First Seen", "Cache Create", "Cost (USD)") are single-line
+        # unsplittable labels the header render pads without truncation, so
+        # scaling below `len(header)` overflowed the border and misaligned
+        # the box on narrow / --compact terminals.
+        col_floors = [max(8, len(h)) for h in headers]
+        col_widths = [
+            max(int(w * scale), col_floors[i]) for i, w in enumerate(col_widths)
+        ]
         remainder = available - sum(col_widths)
         if remainder > 0:
             col_widths[0] += remainder  # grow Project column
