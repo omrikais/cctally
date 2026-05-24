@@ -16,10 +16,11 @@ __pycache__/
 !tests/fixtures/setup/*/input/.claude/
 !tests/fixtures/setup/*/input/.claude/**
 
-# Fixture runtime artifacts — cache.db and stats.db ARE committed per-fixture
-# (see git ls-files tests/fixtures/forecast/*/.local/...), but the
-# lock file, config, logs, and SQLite WAL/SHM sidecars regenerate on every
-# harness run.
+# Fixture runtime artifacts — the lock file, config, logs, and SQLite WAL/SHM
+# sidecars regenerate on every harness run and are never committed. (The
+# consumed-from-tree dashboard/share/migrations/doctor/projects fixtures DO
+# commit their stats.db/cache.db; the scratch-rebuild suites do not — see the
+# block below and #97.)
 cache.db*.lock
 cache.db-wal
 cache.db-shm
@@ -30,12 +31,25 @@ tests/fixtures/*/*/.local/share/ccusage-subscription/logs/
 tests/fixtures/*/*/.local/share/cctally/config.json
 tests/fixtures/*/*/.local/share/cctally/logs/
 
-# token-count-dedup scenarios intentionally leave cache.db empty-at-rest;
-# sync_codex_cache() populates it from the committed JSONL on every harness
-# run (that's the whole point of the scenario — exercise the dedup code
-# path). Treat cache.db here as a runtime artifact, not a committed golden.
-tests/fixtures/codex-daily/token-count-dedup/.local/share/ccusage-subscription/cache.db
-tests/fixtures/codex-session/token-count-dedup/.local/share/ccusage-subscription/cache.db
+# Scratch-rebuild harness suites: their {stats,cache}.db are NEVER read — the
+# harness rebuilds fresh into a `--out <scratch>` dir on every run (see #97), so
+# committed copies drift silently to stale schemas with no test catching it.
+# Don't track them; `bin/build-<cmd>-fixtures.py` regenerates on demand. The
+# consumed-from-tree fixtures (dashboard, share, migrations + per-migration
+# goldens, doctor, projects) are deliberately absent here — their committed
+# .db ARE the test input and stay tracked.
+tests/fixtures/alerts/*/.local/share/cctally/*.db
+tests/fixtures/blocks/*/.local/share/cctally/*.db
+tests/fixtures/cache-report/*/.local/share/cctally/*.db
+tests/fixtures/codex-daily/*/.local/share/cctally/*.db
+tests/fixtures/codex-monthly/*/.local/share/cctally/*.db
+tests/fixtures/codex-session/*/.local/share/cctally/*.db
+tests/fixtures/codex-weekly/*/.local/share/cctally/*.db
+tests/fixtures/diff/*/.local/share/cctally/*.db
+tests/fixtures/forecast/*/.local/share/cctally/*.db
+tests/fixtures/project/*/.local/share/cctally/*.db
+tests/fixtures/session/*/.local/share/cctally/*.db
+tests/fixtures/weekly/*/.local/share/cctally/*.db
 
 # === npm root install pollution ===
 # `package.json` at the repo root is the npm-publish sentinel; npm's natural

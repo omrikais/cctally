@@ -2063,7 +2063,13 @@ projects_envelope_invariants
 #           subsequent `sync-week` write, so the invariant holds even
 #           for snapshots whose `range_end_iso` lands on a real entry's
 #           timestamp (e.g. an entry written exactly on the
-#           subscription-week reset instant).
+#           subscription-week reset instant). Skip guards (both, mirroring
+#           R-DEDUP4/5): recency exclusion (`range_end_iso` >1 day old)
+#           AND cache-drift (a session file tail-ingested after migration
+#           008's applied_at). The cache-drift guard is what stops the
+#           CURRENT in-progress week from flaking on an active install
+#           (#95) — its `range_end` is recent, so recency alone never
+#           skips it, yet that's exactly when live ingests land in-window.
 #
 # R-DEDUP3: regression guard on the "`five_hour_blocks` totals recompute
 #           every tick from `session_entries`" contract (CLAUDE.md 5-hour
@@ -2125,6 +2131,33 @@ claude_projects = home / ".claude" / "projects"
 # bash wrapper still reports PASS while the operator can see what ran.
 sub_status: list[str] = []
 
+
+def _open_ro(label: str, *paths: pathlib.Path):
+    """Open one or more DBs read-only, returning the connections in order.
+
+    A concurrent cctally writer (hook-tick / sync_cache) can leave a
+    DB file momentarily un-openable even when the path exists, so a
+    `mode=ro` connect can raise `sqlite3.OperationalError: unable to
+    open database file`. Treat that as a SKIP for this invariant rather
+    than a hard fail — the live-host reconcile path stays meaningful
+    without flaking under normal active use. On failure, appends a skip
+    line to `sub_status`, closes any already-opened connections, and
+    returns None so the caller can short-circuit.
+    """
+    conns: list[sqlite3.Connection] = []
+    for p in paths:
+        try:
+            conns.append(sqlite3.connect(f"file:{p}?mode=ro", uri=True))
+        except sqlite3.OperationalError as exc:
+            for c in conns:
+                c.close()
+            sub_status.append(
+                f"{label}: skipped ({p.name} not openable — concurrent "
+                f"writer? {exc})"
+            )
+            return None
+    return conns[0] if len(conns) == 1 else tuple(conns)
+
 # ─── R-DEDUP1 ──────────────────────────────────────────────────────────
 if not claude_projects.exists():
     sub_status.append("R-DEDUP1: skipped (no ~/.claude/projects on host)")
@@ -2152,6 +2185,16 @@ else:
                     continue
                 msg = obj.get("message") or {}
                 usage = msg.get("usage") or {}
+                # Mirror the ingest path's `<synthetic>` drop
+                # (_parse_usage_entries / _iter_jsonl_entries_with_offsets
+                # in _lib_jsonl.py — matches ccusage claude_loader.rs:454).
+                # session_entries never holds these rows, so including
+                # them in max_totals here would report a false dedup
+                # regression whenever a synthetic emission shares a
+                # (msg_id, req_id) with — or out-totals — a real row.
+                model = msg.get("model") or obj.get("model")
+                if isinstance(model, str) and model.strip() == "<synthetic>":
+                    continue
                 msg_id = msg.get("id")
                 req_id = obj.get("requestId")
                 if not msg_id or not req_id:
@@ -2177,36 +2220,38 @@ else:
         # heavy histories. The bound is enough to surface a regression
         # in `_should_replace` (any single multi-emission key with a
         # below-max cached row would fail).
-        conn = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
-        try:
-            sampled = multi_emission_keys[:100]
-            checked = 0
-            for msg_id, req_id in sampled:
-                row = conn.execute(
-                    "SELECT input_tokens + output_tokens "
-                    "       + cache_create_tokens + cache_read_tokens "
-                    "  FROM session_entries "
-                    " WHERE msg_id = ? AND req_id = ?",
-                    (msg_id, req_id),
-                ).fetchone()
-                # Missing row is treated as a skip-condition (key may
-                # belong to a JSONL file the cache hasn't ingested
-                # yet, e.g. mid-write). Not a fail.
-                if row is None:
-                    continue
-                cached_total = row[0]
-                expected = max_totals[(msg_id, req_id)]
-                assert cached_total == expected, (
-                    f"R-DEDUP1 violated: ({msg_id}, {req_id}) cache holds "
-                    f"{cached_total} tokens, max emission was {expected}"
+        conn = _open_ro("R-DEDUP1", cache_db)
+        if conn is not None:
+            try:
+                sampled = multi_emission_keys[:100]
+                checked = 0
+                for msg_id, req_id in sampled:
+                    row = conn.execute(
+                        "SELECT input_tokens + output_tokens "
+                        "       + cache_create_tokens + cache_read_tokens "
+                        "  FROM session_entries "
+                        " WHERE msg_id = ? AND req_id = ?",
+                        (msg_id, req_id),
+                    ).fetchone()
+                    # Missing row is treated as a skip-condition (key may
+                    # belong to a JSONL file the cache hasn't ingested
+                    # yet, e.g. mid-write). Not a fail.
+                    if row is None:
+                        continue
+                    cached_total = row[0]
+                    expected = max_totals[(msg_id, req_id)]
+                    assert cached_total == expected, (
+                        f"R-DEDUP1 violated: ({msg_id}, {req_id}) cache "
+                        f"holds {cached_total} tokens, max emission was "
+                        f"{expected}"
+                    )
+                    checked += 1
+                sub_status.append(
+                    f"R-DEDUP1: ok ({checked}/{len(sampled)} keys checked, "
+                    f"{len(multi_emission_keys)} multi-emission keys total)"
                 )
-                checked += 1
-            sub_status.append(
-                f"R-DEDUP1: ok ({checked}/{len(sampled)} keys checked, "
-                f"{len(multi_emission_keys)} multi-emission keys total)"
-            )
-        finally:
-            conn.close()
+            finally:
+                conn.close()
 
 # ─── R-DEDUP2 ──────────────────────────────────────────────────────────
 if not stats_db.exists() or not cache_db.exists():
@@ -2214,97 +2259,140 @@ if not stats_db.exists() or not cache_db.exists():
         "R-DEDUP2: skipped (production stats.db/cache.db not present)"
     )
 else:
-    stats = sqlite3.connect(f"file:{stats_db}?mode=ro", uri=True)
-    cache = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
-    try:
-        # Migration-008 scope: mode='auto' AND project IS NULL AND
-        # range_*_iso both non-NULL. The migration's own SELECT mirrors
-        # this — any divergence here means the migration ran but the
-        # stored values drifted from session_entries afterwards (e.g.
-        # cache rebuilt without re-running 008).
-        #
-        # Recency exclusion: skip snapshots whose `range_end_iso` is
-        # less than 1 day old. Those rows are by definition
-        # snapshots-of-an-active-tail: the same subscription week can
-        # keep accumulating new `session_entries` until its week
-        # boundary closes, and each new ingest may dedup-replace
-        # existing rows under the highest-tokens-wins UPSERT (Task 1),
-        # which can shift the recomputed cost (e.g. a 2nd assistant
-        # emission with HIGHER token total but DIFFERENT cache_creation
-        # vs cache_read mix renders cheaper or pricier than the row it
-        # replaced). The snapshot captured cost-at-write-instant; once
-        # the source set changes underneath, the equality cannot hold
-        # by design. An earlier 1-hour boundary was too narrow — the
-        # in-progress week kept absorbing UPSERTs hours after capture
-        # (e.g. snapshot 4205 stored $1624.94 vs $1624.85 recompute,
-        # Δ -$0.088 about ~1h20min post-capture). 1 day is conservative
-        # against the typical hours-not-days ingestion catch-up: by the
-        # next day all activity for prior days has landed, and any
-        # later JSONL touches would only affect newer snapshots.
-        rows = stats.execute(
-            "SELECT id, range_start_iso, range_end_iso, cost_usd "
-            "  FROM weekly_cost_snapshots "
-            " WHERE mode = 'auto' AND project IS NULL "
-            "   AND range_start_iso IS NOT NULL "
-            "   AND range_end_iso IS NOT NULL "
-            "   AND unixepoch(range_end_iso) "
-            "       < unixepoch('now', '-1 day')"
-        ).fetchall()
-        if not rows:
-            sub_status.append(
-                "R-DEDUP2: skipped (no eligible weekly_cost_snapshots rows)"
-            )
-        else:
-            checked = 0
-            for snap_id, start_iso, end_iso, stored in rows:
-                # Match the PRODUCTION writer's predicate exactly:
-                # `iter_entries` converts the input datetimes to UTC ISO
-                # and then runs the closed-interval lex compare
-                # `timestamp_utc >= ? AND timestamp_utc <= ?` against
-                # `session_entries.timestamp_utc` (which is stored in
-                # UTC). Normalizing the stored `range_*_iso` (which
-                # may carry a host offset like `+03:00`) to UTC ISO
-                # here mirrors that one-shot conversion and keeps the
-                # row set identical to what `compute_week_cost`
-                # walked at write time.
-                start_utc = dt.datetime.fromisoformat(start_iso).astimezone(
-                    dt.timezone.utc).isoformat()
-                end_utc = dt.datetime.fromisoformat(end_iso).astimezone(
-                    dt.timezone.utc).isoformat()
-                entries = cache.execute(
-                    "SELECT model, input_tokens, output_tokens, "
-                    "       cache_create_tokens, cache_read_tokens, "
-                    "       usage_extra_json, cost_usd_raw "
-                    "  FROM session_entries "
-                    " WHERE timestamp_utc >= ? "
-                    "   AND timestamp_utc <= ?",
-                    (start_utc, end_utc),
-                ).fetchall()
-                computed = 0.0
-                for model, i, o, cc, cr, extras_json, raw in entries:
-                    usage = {
-                        "input_tokens": i,
-                        "output_tokens": o,
-                        "cache_creation_input_tokens": cc,
-                        "cache_read_input_tokens": cr,
-                    }
-                    if extras_json:
-                        usage.update(json.loads(extras_json))
-                    computed += _calculate_entry_cost(
-                        model, usage, mode="auto", cost_usd=raw,
-                    )
-                assert abs(stored - computed) < 1e-9, (
-                    f"R-DEDUP2 violated: snapshot id={snap_id} "
-                    f"stored=${stored:.9f} computed=${computed:.9f} "
-                    f"range=[{start_iso}, {end_iso}]"
+    _conns = _open_ro("R-DEDUP2", stats_db, cache_db)
+    if _conns is not None:
+        stats, cache = _conns
+        try:
+            # Migration-008 scope: mode='auto' AND project IS NULL AND
+            # range_*_iso both non-NULL. The migration's own SELECT mirrors
+            # this — any divergence here means the migration ran but the
+            # stored values drifted from session_entries afterwards (e.g.
+            # cache rebuilt without re-running 008).
+            #
+            # Recency exclusion: skip snapshots whose `range_end_iso` is
+            # less than 1 day old. Those rows are by definition
+            # snapshots-of-an-active-tail: the same subscription week can
+            # keep accumulating new `session_entries` until its week
+            # boundary closes, and each new ingest may dedup-replace
+            # existing rows under the highest-tokens-wins UPSERT (Task 1),
+            # which can shift the recomputed cost (e.g. a 2nd assistant
+            # emission with HIGHER token total but DIFFERENT cache_creation
+            # vs cache_read mix renders cheaper or pricier than the row it
+            # replaced). The snapshot captured cost-at-write-instant; once
+            # the source set changes underneath, the equality cannot hold
+            # by design. An earlier 1-hour boundary was too narrow — the
+            # in-progress week kept absorbing UPSERTs hours after capture
+            # (e.g. snapshot 4205 stored $1624.94 vs $1624.85 recompute,
+            # Δ -$0.088 about ~1h20min post-capture). 1 day is conservative
+            # against the typical hours-not-days ingestion catch-up: by the
+            # next day all activity for prior days has landed, and any
+            # later JSONL touches would only affect newer snapshots.
+            # Resolve migration 008's applied_at_utc once. The cache-drift
+            # skip in the loop gates on `session_files.last_ingested_at >
+            # 008.applied` (the recompute baseline) rather than per-row
+            # `captured_at`: cache 001 wipes + re-ingests every session row at
+            # a timestamp far past historical snapshots' capture instant, so a
+            # per-row `captured_at` baseline would make every historical
+            # snapshot skip. 008 recomputed `cost_usd` against the post-001
+            # cache; only ingests AFTER 008 could diverge stored from the
+            # current cache. If 008 isn't applied yet, fall back to the
+            # conservative per-row `captured_at_utc`. Same shape as R-DEDUP4/5.
+            mig_row = stats.execute(
+                "SELECT applied_at_utc FROM schema_migrations "
+                "WHERE name = '008_recompute_weekly_cost_snapshots_dedup_fix'"
+            ).fetchone()
+            m008_applied = mig_row[0] if mig_row else None
+
+            rows = stats.execute(
+                "SELECT id, range_start_iso, range_end_iso, cost_usd, "
+                "       captured_at_utc "
+                "  FROM weekly_cost_snapshots "
+                " WHERE mode = 'auto' AND project IS NULL "
+                "   AND range_start_iso IS NOT NULL "
+                "   AND range_end_iso IS NOT NULL "
+                "   AND unixepoch(range_end_iso) "
+                "       < unixepoch('now', '-1 day')"
+            ).fetchall()
+            if not rows:
+                sub_status.append(
+                    "R-DEDUP2: skipped (no eligible weekly_cost_snapshots rows)"
                 )
-                checked += 1
-            sub_status.append(
-                f"R-DEDUP2: ok ({checked} weekly_cost_snapshots rows)"
-            )
-    finally:
-        stats.close()
-        cache.close()
+            else:
+                checked = 0
+                for snap_id, start_iso, end_iso, stored, captured_at_utc in rows:
+                    # Cache-drift guard (mirrors R-DEDUP3/4/5): if any session
+                    # file was tail-ingested after the recompute baseline, a
+                    # row inside [range_start, range_end] may have been
+                    # INSERTed or REPLACEd (highest-tokens-wins UPSERT, Task 1)
+                    # since the snapshot was written, so the recompute would
+                    # diverge through no fault of the writer. This is the guard
+                    # R-DEDUP2 was missing (#95): the recency exclusion alone
+                    # never skips the CURRENT in-progress week (its `range_end`
+                    # is recent, not >1 day old), which is exactly when live
+                    # ingests land in-window and the race fires. Skip rather
+                    # than report a spurious fail.
+                    drift_baseline = m008_applied or captured_at_utc
+                    stale_row = cache.execute(
+                        "SELECT 1 FROM session_files "
+                        " WHERE last_ingested_at > ? LIMIT 1",
+                        (drift_baseline,),
+                    ).fetchone()
+                    if stale_row is not None:
+                        continue
+                    # Match the PRODUCTION writer's predicate exactly:
+                    # `iter_entries` converts the input datetimes to UTC ISO
+                    # and then runs the closed-interval lex compare
+                    # `timestamp_utc >= ? AND timestamp_utc <= ?` against
+                    # `session_entries.timestamp_utc` (which is stored in
+                    # UTC). Normalizing the stored `range_*_iso` (which
+                    # may carry a host offset like `+03:00`) to UTC ISO
+                    # here mirrors that one-shot conversion and keeps the
+                    # row set identical to what `compute_week_cost`
+                    # walked at write time.
+                    start_utc = dt.datetime.fromisoformat(start_iso).astimezone(
+                        dt.timezone.utc).isoformat()
+                    end_utc = dt.datetime.fromisoformat(end_iso).astimezone(
+                        dt.timezone.utc).isoformat()
+                    entries = cache.execute(
+                        "SELECT model, input_tokens, output_tokens, "
+                        "       cache_create_tokens, cache_read_tokens, "
+                        "       usage_extra_json, cost_usd_raw "
+                        "  FROM session_entries "
+                        " WHERE timestamp_utc >= ? "
+                        "   AND timestamp_utc <= ?",
+                        (start_utc, end_utc),
+                    ).fetchall()
+                    computed = 0.0
+                    for model, i, o, cc, cr, extras_json, raw in entries:
+                        usage = {
+                            "input_tokens": i,
+                            "output_tokens": o,
+                            "cache_creation_input_tokens": cc,
+                            "cache_read_input_tokens": cr,
+                        }
+                        if extras_json:
+                            usage.update(json.loads(extras_json))
+                        computed += _calculate_entry_cost(
+                            model, usage, mode="auto", cost_usd=raw,
+                        )
+                    assert abs(stored - computed) < 1e-9, (
+                        f"R-DEDUP2 violated: snapshot id={snap_id} "
+                        f"stored=${stored:.9f} computed=${computed:.9f} "
+                        f"range=[{start_iso}, {end_iso}]"
+                    )
+                    checked += 1
+                if checked == 0:
+                    sub_status.append(
+                        "R-DEDUP2: skipped (every eligible snapshot had a "
+                        "post-capture cache ingest)"
+                    )
+                else:
+                    sub_status.append(
+                        f"R-DEDUP2: ok ({checked} weekly_cost_snapshots rows)"
+                    )
+        finally:
+            stats.close()
+            cache.close()
 
 # ─── R-DEDUP3 ──────────────────────────────────────────────────────────
 if not stats_db.exists() or not cache_db.exists():
@@ -2312,102 +2400,103 @@ if not stats_db.exists() or not cache_db.exists():
         "R-DEDUP3: skipped (production stats.db/cache.db not present)"
     )
 else:
-    stats = sqlite3.connect(f"file:{stats_db}?mode=ro", uri=True)
-    cache = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
-    try:
-        # Active block = the most recent five_hour_blocks row whose
-        # block_start_at + 5h is still in the future. Mirrors the same
-        # "is this block still live?" predicate the dashboard / TUI use
-        # for the ACTIVE row. unixepoch() on both sides keeps the
-        # comparison offset-agnostic (block_start_at may carry host
-        # offset; `now_utc_iso` is +00:00).
-        now_utc_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-        active = stats.execute(
-            "SELECT block_start_at, last_observed_at_utc, total_cost_usd "
-            "  FROM five_hour_blocks "
-            " WHERE unixepoch(block_start_at) + 5 * 3600 "
-            "       > unixepoch(?) "
-            " ORDER BY block_start_at DESC LIMIT 1",
-            (now_utc_iso,),
-        ).fetchone()
-        if active is None:
-            sub_status.append(
-                "R-DEDUP3: skipped (no active 5h block on host)"
-            )
-        else:
-            block_start_at, last_observed_at_utc, stored_cost = active
-            # Match `iter_entries` interval semantics: lex
-            # `timestamp_utc >= ? AND <= ?` on ISO strings AFTER
-            # normalizing both bounds to UTC. `block_start_at` is stored
-            # with the host's display offset (e.g. `+03:00`) per
-            # `parse_iso_datetime`'s host-local fallback (CLAUDE.md
-            # "Cross-reset flag is interval-based" note); raw lex compare
-            # against UTC-keyed `timestamp_utc` would silently miss every
-            # entry on a non-UTC host. Normalizing here mirrors the
-            # one-shot `astimezone(utc).isoformat()` `iter_entries` does
-            # at write time, keeping the row set identical to what
-            # `_compute_block_totals` walked.
-            block_start_utc = dt.datetime.fromisoformat(
-                block_start_at).astimezone(dt.timezone.utc).isoformat()
-            last_obs_utc = dt.datetime.fromisoformat(
-                last_observed_at_utc.replace("Z", "+00:00")
-            ).astimezone(dt.timezone.utc).isoformat()
-            # Cache-drift guard: if `session_entries` has rows with
-            # `timestamp_utc` inside the block window that were INSERTed
-            # or REPLACEd (highest-wins) AFTER the rollup's last
-            # `record-usage` tick, the rollup is stale by design — the
-            # recompute would diverge through no fault of the writer.
-            # We can't read a per-row `last_modified`, but the cache's
-            # `session_files.last_ingested_at` is a sound proxy: any
-            # file whose tail-ingest landed after `last_obs_utc` may
-            # have changed a row in our window. Skip in that case
-            # rather than report a spurious fail.
-            stale_row = cache.execute(
-                "SELECT 1 FROM session_files "
-                " WHERE last_ingested_at > ? LIMIT 1",
-                (last_obs_utc,),
+    _conns = _open_ro("R-DEDUP3", stats_db, cache_db)
+    if _conns is not None:
+        stats, cache = _conns
+        try:
+            # Active block = the most recent five_hour_blocks row whose
+            # block_start_at + 5h is still in the future. Mirrors the same
+            # "is this block still live?" predicate the dashboard / TUI use
+            # for the ACTIVE row. unixepoch() on both sides keeps the
+            # comparison offset-agnostic (block_start_at may carry host
+            # offset; `now_utc_iso` is +00:00).
+            now_utc_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+            active = stats.execute(
+                "SELECT block_start_at, last_observed_at_utc, total_cost_usd "
+                "  FROM five_hour_blocks "
+                " WHERE unixepoch(block_start_at) + 5 * 3600 "
+                "       > unixepoch(?) "
+                " ORDER BY block_start_at DESC LIMIT 1",
+                (now_utc_iso,),
             ).fetchone()
-            if stale_row is not None:
+            if active is None:
                 sub_status.append(
-                    f"R-DEDUP3: skipped (active block at "
-                    f"{block_start_at} — cache ingested after last "
-                    f"record-usage tick)"
+                    "R-DEDUP3: skipped (no active 5h block on host)"
                 )
             else:
-                entries = cache.execute(
-                    "SELECT model, input_tokens, output_tokens, "
-                    "       cache_create_tokens, cache_read_tokens, "
-                    "       usage_extra_json, cost_usd_raw "
-                    "  FROM session_entries "
-                    " WHERE timestamp_utc >= ? "
-                    "   AND timestamp_utc <= ?",
-                    (block_start_utc, last_obs_utc),
-                ).fetchall()
-                computed_cost = 0.0
-                for model, i, o, cc, cr, extras_json, raw in entries:
-                    usage = {
-                        "input_tokens": i,
-                        "output_tokens": o,
-                        "cache_creation_input_tokens": cc,
-                        "cache_read_input_tokens": cr,
-                    }
-                    if extras_json:
-                        usage.update(json.loads(extras_json))
-                    computed_cost += _calculate_entry_cost(
-                        model, usage, mode="auto", cost_usd=raw,
+                block_start_at, last_observed_at_utc, stored_cost = active
+                # Match `iter_entries` interval semantics: lex
+                # `timestamp_utc >= ? AND <= ?` on ISO strings AFTER
+                # normalizing both bounds to UTC. `block_start_at` is stored
+                # with the host's display offset (e.g. `+03:00`) per
+                # `parse_iso_datetime`'s host-local fallback (CLAUDE.md
+                # "Cross-reset flag is interval-based" note); raw lex compare
+                # against UTC-keyed `timestamp_utc` would silently miss every
+                # entry on a non-UTC host. Normalizing here mirrors the
+                # one-shot `astimezone(utc).isoformat()` `iter_entries` does
+                # at write time, keeping the row set identical to what
+                # `_compute_block_totals` walked.
+                block_start_utc = dt.datetime.fromisoformat(
+                    block_start_at).astimezone(dt.timezone.utc).isoformat()
+                last_obs_utc = dt.datetime.fromisoformat(
+                    last_observed_at_utc.replace("Z", "+00:00")
+                ).astimezone(dt.timezone.utc).isoformat()
+                # Cache-drift guard: if `session_entries` has rows with
+                # `timestamp_utc` inside the block window that were INSERTed
+                # or REPLACEd (highest-wins) AFTER the rollup's last
+                # `record-usage` tick, the rollup is stale by design — the
+                # recompute would diverge through no fault of the writer.
+                # We can't read a per-row `last_modified`, but the cache's
+                # `session_files.last_ingested_at` is a sound proxy: any
+                # file whose tail-ingest landed after `last_obs_utc` may
+                # have changed a row in our window. Skip in that case
+                # rather than report a spurious fail.
+                stale_row = cache.execute(
+                    "SELECT 1 FROM session_files "
+                    " WHERE last_ingested_at > ? LIMIT 1",
+                    (last_obs_utc,),
+                ).fetchone()
+                if stale_row is not None:
+                    sub_status.append(
+                        f"R-DEDUP3: skipped (active block at "
+                        f"{block_start_at} — cache ingested after last "
+                        f"record-usage tick)"
                     )
-                assert abs(stored_cost - computed_cost) < 1e-9, (
-                    f"R-DEDUP3 violated: active block "
-                    f"block_start_at={block_start_at} "
-                    f"stored=${stored_cost:.9f} "
-                    f"computed=${computed_cost:.9f}"
-                )
-                sub_status.append(
-                    f"R-DEDUP3: ok (active block at {block_start_at})"
-                )
-    finally:
-        stats.close()
-        cache.close()
+                else:
+                    entries = cache.execute(
+                        "SELECT model, input_tokens, output_tokens, "
+                        "       cache_create_tokens, cache_read_tokens, "
+                        "       usage_extra_json, cost_usd_raw "
+                        "  FROM session_entries "
+                        " WHERE timestamp_utc >= ? "
+                        "   AND timestamp_utc <= ?",
+                        (block_start_utc, last_obs_utc),
+                    ).fetchall()
+                    computed_cost = 0.0
+                    for model, i, o, cc, cr, extras_json, raw in entries:
+                        usage = {
+                            "input_tokens": i,
+                            "output_tokens": o,
+                            "cache_creation_input_tokens": cc,
+                            "cache_read_input_tokens": cr,
+                        }
+                        if extras_json:
+                            usage.update(json.loads(extras_json))
+                        computed_cost += _calculate_entry_cost(
+                            model, usage, mode="auto", cost_usd=raw,
+                        )
+                    assert abs(stored_cost - computed_cost) < 1e-9, (
+                        f"R-DEDUP3 violated: active block "
+                        f"block_start_at={block_start_at} "
+                        f"stored=${stored_cost:.9f} "
+                        f"computed=${computed_cost:.9f}"
+                    )
+                    sub_status.append(
+                        f"R-DEDUP3: ok (active block at {block_start_at})"
+                    )
+        finally:
+            stats.close()
+            cache.close()
 
 # ─── R-DEDUP4 ──────────────────────────────────────────────────────────
 # Closed historical `five_hour_blocks` totals must equal the recompute
@@ -2433,106 +2522,107 @@ if not stats_db.exists() or not cache_db.exists():
         "R-DEDUP4: skipped (production stats.db/cache.db not present)"
     )
 else:
-    stats = sqlite3.connect(f"file:{stats_db}?mode=ro", uri=True)
-    cache = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
-    try:
-        # Resolve migration 009's applied_at_utc once. The cache-drift
-        # skip below probes `session_files.last_ingested_at > 009.applied_at`
-        # rather than `> last_observed_at_utc` (which would make every
-        # closed-historical block skip, since cache 001 wipes + re-ingests
-        # every session row at a timestamp far past any historical block's
-        # last_observed). The right semantics: migration 009 recomputed
-        # block totals against the post-001 cache snapshot at 009.applied;
-        # only ingests AFTER 009 could diverge the stored values from the
-        # current cache state. If 009 isn't applied yet, fall back to the
-        # conservative per-block guard.
-        mig_row = stats.execute(
-            "SELECT applied_at_utc FROM schema_migrations "
-            "WHERE name = '009_recompute_five_hour_blocks_dedup_fix'"
-        ).fetchone()
-        m009_applied = mig_row[0] if mig_row else None
+    _conns = _open_ro("R-DEDUP4", stats_db, cache_db)
+    if _conns is not None:
+        stats, cache = _conns
+        try:
+            # Resolve migration 009's applied_at_utc once. The cache-drift
+            # skip below probes `session_files.last_ingested_at > 009.applied_at`
+            # rather than `> last_observed_at_utc` (which would make every
+            # closed-historical block skip, since cache 001 wipes + re-ingests
+            # every session row at a timestamp far past any historical block's
+            # last_observed). The right semantics: migration 009 recomputed
+            # block totals against the post-001 cache snapshot at 009.applied;
+            # only ingests AFTER 009 could diverge the stored values from the
+            # current cache state. If 009 isn't applied yet, fall back to the
+            # conservative per-block guard.
+            mig_row = stats.execute(
+                "SELECT applied_at_utc FROM schema_migrations "
+                "WHERE name = '009_recompute_five_hour_blocks_dedup_fix'"
+            ).fetchone()
+            m009_applied = mig_row[0] if mig_row else None
 
-        rows = stats.execute(
-            "SELECT id, block_start_at, last_observed_at_utc, "
-            "       total_cost_usd "
-            "  FROM five_hour_blocks "
-            " WHERE is_closed = 1 "
-            "   AND unixepoch(last_observed_at_utc) "
-            "       < unixepoch('now', '-1 day') "
-            " ORDER BY block_start_at DESC LIMIT 50"
-        ).fetchall()
-        if not rows:
-            sub_status.append(
-                "R-DEDUP4: skipped (no eligible closed 5h blocks)"
-            )
-        else:
-            checked = 0
-            for (
-                block_id, block_start_at, last_observed_at_utc,
-                stored_cost,
-            ) in rows:
-                # Same UTC normalization as R-DEDUP3 — `block_start_at`
-                # may carry host offset.
-                block_start_utc = dt.datetime.fromisoformat(
-                    block_start_at
-                ).astimezone(dt.timezone.utc).isoformat()
-                last_obs_utc = dt.datetime.fromisoformat(
-                    last_observed_at_utc.replace("Z", "+00:00")
-                ).astimezone(dt.timezone.utc).isoformat()
-                # Cache-drift guard. Gate on 009's applied_at when
-                # present (recompute baseline); fall back to
-                # last_obs_utc when 009 hasn't run (conservative,
-                # mirrors R-DEDUP3's posture for the active block).
-                drift_baseline = m009_applied or last_obs_utc
-                stale_row = cache.execute(
-                    "SELECT 1 FROM session_files "
-                    " WHERE last_ingested_at > ? LIMIT 1",
-                    (drift_baseline,),
-                ).fetchone()
-                if stale_row is not None:
-                    continue
-                entries = cache.execute(
-                    "SELECT model, input_tokens, output_tokens, "
-                    "       cache_create_tokens, cache_read_tokens, "
-                    "       usage_extra_json, cost_usd_raw "
-                    "  FROM session_entries "
-                    " WHERE timestamp_utc >= ? "
-                    "   AND timestamp_utc <= ?",
-                    (block_start_utc, last_obs_utc),
-                ).fetchall()
-                computed_cost = 0.0
-                for model, i, o, cc, cr, extras_json, raw in entries:
-                    usage = {
-                        "input_tokens": i,
-                        "output_tokens": o,
-                        "cache_creation_input_tokens": cc,
-                        "cache_read_input_tokens": cr,
-                    }
-                    if extras_json:
-                        usage.update(json.loads(extras_json))
-                    computed_cost += _calculate_entry_cost(
-                        model, usage, mode="auto", cost_usd=raw,
-                    )
-                assert abs(stored_cost - computed_cost) < 1e-9, (
-                    f"R-DEDUP4 violated: block id={block_id} "
-                    f"block_start_at={block_start_at} "
-                    f"stored=${stored_cost:.9f} "
-                    f"computed=${computed_cost:.9f}"
-                )
-                checked += 1
-            if checked == 0:
+            rows = stats.execute(
+                "SELECT id, block_start_at, last_observed_at_utc, "
+                "       total_cost_usd "
+                "  FROM five_hour_blocks "
+                " WHERE is_closed = 1 "
+                "   AND unixepoch(last_observed_at_utc) "
+                "       < unixepoch('now', '-1 day') "
+                " ORDER BY block_start_at DESC LIMIT 50"
+            ).fetchall()
+            if not rows:
                 sub_status.append(
-                    "R-DEDUP4: skipped (every eligible block had a "
-                    "post-close cache ingest)"
+                    "R-DEDUP4: skipped (no eligible closed 5h blocks)"
                 )
             else:
-                sub_status.append(
-                    f"R-DEDUP4: ok ({checked} closed 5h blocks "
-                    f"reconciled)"
-                )
-    finally:
-        stats.close()
-        cache.close()
+                checked = 0
+                for (
+                    block_id, block_start_at, last_observed_at_utc,
+                    stored_cost,
+                ) in rows:
+                    # Same UTC normalization as R-DEDUP3 — `block_start_at`
+                    # may carry host offset.
+                    block_start_utc = dt.datetime.fromisoformat(
+                        block_start_at
+                    ).astimezone(dt.timezone.utc).isoformat()
+                    last_obs_utc = dt.datetime.fromisoformat(
+                        last_observed_at_utc.replace("Z", "+00:00")
+                    ).astimezone(dt.timezone.utc).isoformat()
+                    # Cache-drift guard. Gate on 009's applied_at when
+                    # present (recompute baseline); fall back to
+                    # last_obs_utc when 009 hasn't run (conservative,
+                    # mirrors R-DEDUP3's posture for the active block).
+                    drift_baseline = m009_applied or last_obs_utc
+                    stale_row = cache.execute(
+                        "SELECT 1 FROM session_files "
+                        " WHERE last_ingested_at > ? LIMIT 1",
+                        (drift_baseline,),
+                    ).fetchone()
+                    if stale_row is not None:
+                        continue
+                    entries = cache.execute(
+                        "SELECT model, input_tokens, output_tokens, "
+                        "       cache_create_tokens, cache_read_tokens, "
+                        "       usage_extra_json, cost_usd_raw "
+                        "  FROM session_entries "
+                        " WHERE timestamp_utc >= ? "
+                        "   AND timestamp_utc <= ?",
+                        (block_start_utc, last_obs_utc),
+                    ).fetchall()
+                    computed_cost = 0.0
+                    for model, i, o, cc, cr, extras_json, raw in entries:
+                        usage = {
+                            "input_tokens": i,
+                            "output_tokens": o,
+                            "cache_creation_input_tokens": cc,
+                            "cache_read_input_tokens": cr,
+                        }
+                        if extras_json:
+                            usage.update(json.loads(extras_json))
+                        computed_cost += _calculate_entry_cost(
+                            model, usage, mode="auto", cost_usd=raw,
+                        )
+                    assert abs(stored_cost - computed_cost) < 1e-9, (
+                        f"R-DEDUP4 violated: block id={block_id} "
+                        f"block_start_at={block_start_at} "
+                        f"stored=${stored_cost:.9f} "
+                        f"computed=${computed_cost:.9f}"
+                    )
+                    checked += 1
+                if checked == 0:
+                    sub_status.append(
+                        "R-DEDUP4: skipped (every eligible block had a "
+                        "post-close cache ingest)"
+                    )
+                else:
+                    sub_status.append(
+                        f"R-DEDUP4: ok ({checked} closed 5h blocks "
+                        f"reconciled)"
+                    )
+        finally:
+            stats.close()
+            cache.close()
 
 # ─── R-DEDUP5 ──────────────────────────────────────────────────────────
 # `percent_milestones.cumulative_cost_usd` must equal the recompute over
@@ -2555,105 +2645,106 @@ if not stats_db.exists() or not cache_db.exists():
         "R-DEDUP5: skipped (production stats.db/cache.db not present)"
     )
 else:
-    stats = sqlite3.connect(f"file:{stats_db}?mode=ro", uri=True)
-    cache = sqlite3.connect(f"file:{cache_db}?mode=ro", uri=True)
-    try:
-        # Mirror R-DEDUP4: gate cache-drift skip on migration 010's
-        # applied_at when present; fall back to per-row captured_at.
-        mig_row = stats.execute(
-            "SELECT applied_at_utc FROM schema_migrations "
-            "WHERE name = '010_recompute_percent_milestones_dedup_fix'"
-        ).fetchone()
-        m010_applied = mig_row[0] if mig_row else None
+    _conns = _open_ro("R-DEDUP5", stats_db, cache_db)
+    if _conns is not None:
+        stats, cache = _conns
+        try:
+            # Mirror R-DEDUP4: gate cache-drift skip on migration 010's
+            # applied_at when present; fall back to per-row captured_at.
+            mig_row = stats.execute(
+                "SELECT applied_at_utc FROM schema_migrations "
+                "WHERE name = '010_recompute_percent_milestones_dedup_fix'"
+            ).fetchone()
+            m010_applied = mig_row[0] if mig_row else None
 
-        rows = stats.execute(
-            "SELECT id, week_start_date, week_start_at, "
-            "       captured_at_utc, cumulative_cost_usd "
-            "  FROM percent_milestones "
-            " WHERE unixepoch(captured_at_utc) "
-            "       < unixepoch('now', '-1 day') "
-            " ORDER BY captured_at_utc DESC LIMIT 100"
-        ).fetchall()
-        if not rows:
-            sub_status.append(
-                "R-DEDUP5: skipped (no eligible percent_milestones)"
-            )
-        else:
-            checked = 0
-            for (
-                mid, week_start_date, week_start_at,
-                captured_at_utc, stored_cum,
-            ) in rows:
-                # Migration 010's lower-bound fallback rule: prefer
-                # week_start_at, else week_start_date at midnight UTC.
-                if week_start_at:
-                    range_start_iso = week_start_at
-                elif week_start_date:
-                    range_start_iso = (
-                        f"{week_start_date}T00:00:00+00:00"
-                    )
-                else:
-                    continue
-                start_utc = dt.datetime.fromisoformat(
-                    range_start_iso
-                ).astimezone(dt.timezone.utc).isoformat()
-                end_utc = dt.datetime.fromisoformat(
-                    captured_at_utc.replace("Z", "+00:00")
-                ).astimezone(dt.timezone.utc).isoformat()
-                # Cache-drift guard: gate on 010's applied_at when
-                # present (recompute baseline); fall back to
-                # captured_at_utc when 010 hasn't run.
-                drift_baseline = m010_applied or captured_at_utc
-                stale_row = cache.execute(
-                    "SELECT 1 FROM session_files "
-                    " WHERE last_ingested_at > ? LIMIT 1",
-                    (drift_baseline,),
-                ).fetchone()
-                if stale_row is not None:
-                    continue
-                entries = cache.execute(
-                    "SELECT model, input_tokens, output_tokens, "
-                    "       cache_create_tokens, cache_read_tokens, "
-                    "       usage_extra_json, cost_usd_raw "
-                    "  FROM session_entries "
-                    " WHERE timestamp_utc >= ? "
-                    "   AND timestamp_utc <= ?",
-                    (start_utc, end_utc),
-                ).fetchall()
-                computed = 0.0
-                for model, i, o, cc, cr, extras_json, raw in entries:
-                    usage = {
-                        "input_tokens": i,
-                        "output_tokens": o,
-                        "cache_creation_input_tokens": cc,
-                        "cache_read_input_tokens": cr,
-                    }
-                    if extras_json:
-                        usage.update(json.loads(extras_json))
-                    computed += _calculate_entry_cost(
-                        model, usage, mode="auto", cost_usd=raw,
-                    )
-                assert abs(stored_cum - computed) < 1e-9, (
-                    f"R-DEDUP5 violated: milestone id={mid} "
-                    f"week={week_start_date} "
-                    f"captured={captured_at_utc} "
-                    f"stored=${stored_cum:.9f} "
-                    f"computed=${computed:.9f}"
-                )
-                checked += 1
-            if checked == 0:
+            rows = stats.execute(
+                "SELECT id, week_start_date, week_start_at, "
+                "       captured_at_utc, cumulative_cost_usd "
+                "  FROM percent_milestones "
+                " WHERE unixepoch(captured_at_utc) "
+                "       < unixepoch('now', '-1 day') "
+                " ORDER BY captured_at_utc DESC LIMIT 100"
+            ).fetchall()
+            if not rows:
                 sub_status.append(
-                    "R-DEDUP5: skipped (every eligible milestone had a "
-                    "post-capture cache ingest)"
+                    "R-DEDUP5: skipped (no eligible percent_milestones)"
                 )
             else:
-                sub_status.append(
-                    f"R-DEDUP5: ok ({checked} percent_milestones "
-                    f"reconciled)"
-                )
-    finally:
-        stats.close()
-        cache.close()
+                checked = 0
+                for (
+                    mid, week_start_date, week_start_at,
+                    captured_at_utc, stored_cum,
+                ) in rows:
+                    # Migration 010's lower-bound fallback rule: prefer
+                    # week_start_at, else week_start_date at midnight UTC.
+                    if week_start_at:
+                        range_start_iso = week_start_at
+                    elif week_start_date:
+                        range_start_iso = (
+                            f"{week_start_date}T00:00:00+00:00"
+                        )
+                    else:
+                        continue
+                    start_utc = dt.datetime.fromisoformat(
+                        range_start_iso
+                    ).astimezone(dt.timezone.utc).isoformat()
+                    end_utc = dt.datetime.fromisoformat(
+                        captured_at_utc.replace("Z", "+00:00")
+                    ).astimezone(dt.timezone.utc).isoformat()
+                    # Cache-drift guard: gate on 010's applied_at when
+                    # present (recompute baseline); fall back to
+                    # captured_at_utc when 010 hasn't run.
+                    drift_baseline = m010_applied or captured_at_utc
+                    stale_row = cache.execute(
+                        "SELECT 1 FROM session_files "
+                        " WHERE last_ingested_at > ? LIMIT 1",
+                        (drift_baseline,),
+                    ).fetchone()
+                    if stale_row is not None:
+                        continue
+                    entries = cache.execute(
+                        "SELECT model, input_tokens, output_tokens, "
+                        "       cache_create_tokens, cache_read_tokens, "
+                        "       usage_extra_json, cost_usd_raw "
+                        "  FROM session_entries "
+                        " WHERE timestamp_utc >= ? "
+                        "   AND timestamp_utc <= ?",
+                        (start_utc, end_utc),
+                    ).fetchall()
+                    computed = 0.0
+                    for model, i, o, cc, cr, extras_json, raw in entries:
+                        usage = {
+                            "input_tokens": i,
+                            "output_tokens": o,
+                            "cache_creation_input_tokens": cc,
+                            "cache_read_input_tokens": cr,
+                        }
+                        if extras_json:
+                            usage.update(json.loads(extras_json))
+                        computed += _calculate_entry_cost(
+                            model, usage, mode="auto", cost_usd=raw,
+                        )
+                    assert abs(stored_cum - computed) < 1e-9, (
+                        f"R-DEDUP5 violated: milestone id={mid} "
+                        f"week={week_start_date} "
+                        f"captured={captured_at_utc} "
+                        f"stored=${stored_cum:.9f} "
+                        f"computed=${computed:.9f}"
+                    )
+                    checked += 1
+                if checked == 0:
+                    sub_status.append(
+                        "R-DEDUP5: skipped (every eligible milestone had a "
+                        "post-capture cache ingest)"
+                    )
+                else:
+                    sub_status.append(
+                        f"R-DEDUP5: ok ({checked} percent_milestones "
+                        f"reconciled)"
+                    )
+        finally:
+            stats.close()
+            cache.close()
 
 print("OK")
 for s in sub_status:

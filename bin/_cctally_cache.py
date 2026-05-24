@@ -503,6 +503,53 @@ def sync_cache(
             )
         }
 
+        # Orphaned-tracked-file detection (cctally-dev#93 review). A path
+        # tracked in session_files (with data already ingested) but no
+        # longer present on disk leaves orphaned session_entries rows that
+        # the per-file loop below never visits — it iterates only on-disk
+        # `paths`. sync_cache deliberately does NOT prune those orphans
+        # in-place: a deleted file shares the truncation hazard (under the
+        # sticky source_path dedup a surviving file may carry the same
+        # (msg_id, req_id) yet keep its size_bytes, so a per-orphan DELETE
+        # could drop a row the survivor still owns without re-ingesting
+        # it), and a blanket full-reset would wrongly fire on the
+        # legitimate "cache seeded with synthetic source paths" fixture
+        # pattern. Instead we INVALIDATE the walk-complete marker: an
+        # orphaned cache no longer faithfully mirrors disk, so it is — by
+        # the marker's own definition — not a complete walk. We must
+        # actively DELETE any marker a PRIOR clean walk left behind (not
+        # merely withhold THIS run's end-of-loop rewrite — that rewrite is
+        # gated on walk_clean, but a stale marker from a previous sync
+        # would otherwise survive and keep vouching for completeness).
+        # Setting walk_clean=False additionally suppresses the end-of-loop
+        # rewrite so the marker stays absent for this run. With the marker
+        # gone the upgrade gate DEFERs the 008/009/010 recomputes (rather
+        # than certifying aggregates that still include data from files no
+        # longer on disk); the operator clears the orphans by running
+        # `cache-sync --rebuild` (the documented re-derive path), which
+        # re-establishes the marker. Only paths whose row carried ingested
+        # bytes (size_bytes > 0) count — a size_bytes=0 row holds no
+        # session_entries, so its absence leaves no orphan. The DELETE +
+        # commit lands BEFORE the per-file read+parse loop, so no write
+        # lock is held into that loop (same discipline as the truncation
+        # escalation just below).
+        on_disk_paths = {str(jp) for jp in paths}
+        orphaned_tracked_paths = [
+            p for p, (size_bytes, _, _) in existing.items()
+            if size_bytes and p not in on_disk_paths
+        ]
+        if orphaned_tracked_paths:
+            eprint(
+                f"[cache] {len(orphaned_tracked_paths)} tracked file(s) no "
+                f"longer on disk; invalidating walk-complete marker "
+                f"(run `cache-sync --rebuild` to prune orphaned entries)"
+            )
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+            )
+            conn.commit()
+            walk_clean = False  # orphaned rows -> cache doesn't mirror disk (D5a)
+
         # Pre-scan for any truncation among tracked files. Under the
         # ccusage-parity ON CONFLICT DO UPDATE, source_path is PINNED to
         # whichever file first inserted a (msg_id, req_id) row (see U1

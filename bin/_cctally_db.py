@@ -2743,7 +2743,7 @@ def _open_cache_ro_with_gate_defer() -> sqlite3.Connection:
 
     cache_db_path = _cctally_core.CACHE_DB_PATH
     try:
-        return sqlite3.connect(
+        cache_ro = sqlite3.connect(
             f"file:{cache_db_path}?mode=ro", uri=True,
         )
     except sqlite3.OperationalError as exc:
@@ -2754,6 +2754,36 @@ def _open_cache_ro_with_gate_defer() -> sqlite3.Connection:
                 "once and retry."
             ) from None
         raise
+
+    # Pin a SINGLE consistent cache.db snapshot for the whole recompute
+    # (cctally-dev#93 review). cache.db is WAL (bin/_cctally_cache.py:
+    # `PRAGMA journal_mode=WAL`), and Python's sqlite3 only auto-BEGINs
+    # before DML — every read on this RO connection would otherwise run
+    # in autocommit, so each `cache_ro.execute(SELECT …)` could observe a
+    # NEWER `session_entries` snapshot if `record-usage`/`hook-tick`/
+    # `cache-sync` committed between loop iterations. That lets one
+    # migration run recompute different rows from different cache states
+    # and still stamp its schema marker (an internally-inconsistent
+    # recompute). An explicit deferred BEGIN starts a read transaction
+    # whose snapshot is locked at the first read (the gate's
+    # schema_migrations probe) and held until COMMIT/ROLLBACK; in WAL the
+    # reader never blocks the writer, so concurrent ingests still
+    # proceed — they just land in a newer WAL frame this transaction
+    # won't see. The caller's `finally: cache_ro.close()` ends the
+    # transaction. The recompute writes target stats.db (`conn`), NOT
+    # this connection, so a still-open read txn here never blocks them.
+    try:
+        cache_ro.execute("BEGIN")
+    except sqlite3.OperationalError as exc:
+        cache_ro.close()
+        if _is_transient_sqlite_error(exc):
+            raise MigrationGateNotMet(
+                "cache.db not yet initialized or transiently locked; "
+                "run any JSONL-reading command (e.g. `cctally weekly`) "
+                "once and retry."
+            ) from None
+        raise
+    return cache_ro
 
 
 def _resolve_projects_dirs_for_gate() -> list[pathlib.Path]:

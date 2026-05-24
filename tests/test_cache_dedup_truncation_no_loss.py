@@ -422,3 +422,94 @@ def test_truncation_with_no_dedup_overlap(isolated_cache):
     assert msgs == ["m1b", "m2"], (
         f"expected m1b (A's new content) + m2 (B unchanged), got {msgs}"
     )
+
+
+# ── Orphaned-tracked-file detection (cctally-dev#93 review) ─────────────
+#
+# When a tracked JSONL is DELETED (not truncated) before the dedup
+# recompute migrations run, sync_cache must NOT refresh the walk-complete
+# marker — otherwise the upgrade gate certifies the cache as disk-complete
+# while it still holds orphaned session_entries from the deleted file, and
+# 008/009/010 stamp aggregates that OVERCOUNT (include data no longer on
+# disk). The chosen mechanism withholds the marker (rather than wiping
+# data in-place, which would collide with the synthetic-source_path
+# fixture pattern and risk dropping rows a surviving file still owns under
+# the sticky-source_path dedup). Recovery is `cache-sync --rebuild`.
+
+
+def test_deleting_tracked_file_withholds_walk_complete_marker(isolated_cache):
+    """A tracked file vanishing from disk withholds the marker on the next
+    sync, and the (now orphaned) entries are LEFT IN PLACE — sync_cache
+    does not prune them in-place."""
+    ns, conn, file_a, file_b, sync = isolated_cache
+
+    # First sync: two independent files (no shared dedup key), clean walk
+    # with 001 applied => marker present.
+    file_a.write_text(_assistant_line("m1", "r1", out_tokens=100))
+    file_b.write_text(_assistant_line("m2", "r2", out_tokens=200))
+    sync()
+    assert _marker_present(conn), (
+        "precondition: a clean walk with 001 applied writes the marker"
+    )
+    assert sorted(r[0] for r in _read_entries(conn)) == ["m1", "m2"]
+
+    # Delete file_a entirely (user prune / log rotation removing the file).
+    file_a.unlink()
+    stats = sync()
+
+    # The walk is no longer disk-complete: marker must be withheld.
+    assert not _marker_present(conn), (
+        "a tracked file no longer on disk must withhold the walk-complete "
+        "marker so the upgrade gate DEFERs the recompute"
+    )
+    # No in-place pruning: file_a's orphaned entry is still present (the
+    # recompute gate, not a destructive wipe, is the protection). file_b
+    # is unchanged and skipped via delta-resume.
+    assert sorted(r[0] for r in _read_entries(conn)) == ["m1", "m2"], (
+        "sync_cache must NOT wipe entries on deletion — orphans stay until "
+        "an explicit rebuild"
+    )
+    assert stats.files_reset_truncated == 0, (
+        "deletion must NOT trip the truncation full-reset escalation"
+    )
+
+    # Recovery: --rebuild clears the orphan AND re-establishes the marker.
+    sync_cache = ns["sync_cache"]
+    sync_cache(conn, rebuild=True)
+    assert sorted(r[0] for r in _read_entries(conn)) == ["m2"], (
+        "rebuild re-derives the cache from on-disk files only; the deleted "
+        "file's orphaned entry is gone"
+    )
+    assert _marker_present(conn), (
+        "a clean rebuild walk re-establishes the marker"
+    )
+
+
+def test_absent_uningested_tracked_row_does_not_withhold_marker(isolated_cache):
+    """A session_files row that never ingested data (size_bytes == 0) going
+    absent must NOT withhold the marker — it carries no session_entries, so
+    its absence leaves no orphan to protect against. Guards against a
+    spurious DEFER on lazily-created-but-empty tracking rows."""
+    ns, conn, file_a, file_b, sync = isolated_cache
+
+    # Clean baseline with one real file.
+    file_b.write_text(_assistant_line("m2", "r2", out_tokens=200))
+    sync()
+    assert _marker_present(conn)
+
+    # Inject a tracked row for a path that never existed / was never
+    # ingested (size_bytes == 0), then drop it from disk-consideration by
+    # leaving it off disk entirely.
+    conn.execute(
+        "INSERT INTO session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at) "
+        "VALUES (?, 0, 0, 0, ?)",
+        (str(file_a) + ".never", "2026-05-22T00:00:00Z"),
+    )
+    conn.commit()
+
+    sync()
+    assert _marker_present(conn), (
+        "a size_bytes=0 tracked row holds no entries; its absence from disk "
+        "must NOT withhold the marker"
+    )

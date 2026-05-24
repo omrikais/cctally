@@ -1,10 +1,10 @@
 # Runtime artifacts generated when the harness runs under HOME=<scenario>.
-# The committed per-scenario tree is:
+# The harness rebuilds the SQLite {stats,cache}.db fresh into a --out
+# scratch dir, so they are NOT committed (gitignored at the repo root;
+# see #97). The committed per-scenario tree is:
 #   <scenario>/input.env
 #   <scenario>/golden-terminal.txt
 #   <scenario>/golden-json.txt
-#   <scenario>/.local/share/cctally/stats.db
-#   <scenario>/.local/share/cctally/cache.db
 # Anything else SQLite or the CLI writes during a run is ignored so the
 # working tree stays clean after `build-diff-fixtures.py` and any
 # subsequent harness invocation.

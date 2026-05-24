@@ -223,3 +223,99 @@ def test_d6b_cross_reference():
         "D6b coverage moved/renamed: update this cross-reference and the "
         "sibling sentinel test name."
     )
+
+
+def test_open_cache_ro_with_gate_defer_pins_one_snapshot(tmp_path, monkeypatch):
+    """cctally-dev#93 review: 008/009/010 recompute from cache.db across a
+    loop of reads. ``_open_cache_ro_with_gate_defer`` must pin a SINGLE
+    cache.db snapshot for the whole recompute so a concurrent
+    ``record-usage``/``hook-tick``/``cache-sync`` writer that commits
+    between loop iterations cannot make consecutive reads observe
+    different ``session_entries`` states (which would let one migration
+    run stamp internally-inconsistent rows).
+
+    cache.db is WAL, and Python's sqlite3 only auto-BEGINs before DML, so
+    without the explicit deferred BEGIN every autocommit SELECT would see
+    the latest committed snapshot. The fix issues ``BEGIN`` right after
+    opening, locking the snapshot at the first read; in WAL the reader
+    never blocks the writer, so the writer's commit still succeeds — it
+    just lands in a WAL frame this read transaction won't observe.
+    """
+    db = _load_db()
+    import _cctally_core
+
+    cache_path = tmp_path / "cache.db"
+    seed = sqlite3.connect(cache_path)
+    seed.execute("PRAGMA journal_mode=WAL")
+    db._apply_cache_schema(seed)
+    # Minimal schema_migrations so the eager-apply + gate reads don't choke.
+    seed.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS schema_migrations_skipped (
+            name TEXT PRIMARY KEY, skipped_at_utc TEXT NOT NULL, reason TEXT
+        );
+        """
+    )
+    # Stamp every cache migration applied so the eager-apply inside
+    # ``_open_cache_ro_with_gate_defer`` is a clean no-op and does NOT wipe
+    # our seed row (cache 001's dedup re-ingest would otherwise empty
+    # session_entries — there is no on-disk JSONL to re-derive from here).
+    for name in (m.name for m in db._CACHE_MIGRATIONS):
+        seed.execute(
+            "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+            "VALUES (?, '2026-01-01T00:00:00+00:00')",
+            (name,),
+        )
+    seed.execute(
+        "INSERT INTO session_entries(source_path, line_offset, timestamp_utc, "
+        "model, input_tokens) VALUES "
+        "('/tmp/a.jsonl', 0, '2026-01-01T00:00:00+00:00', 'claude-x', 1)"
+    )
+    seed.commit()
+
+    monkeypatch.setattr(_cctally_core, "CACHE_DB_PATH", cache_path)
+
+    cache_ro = db._open_cache_ro_with_gate_defer()
+    try:
+        # First read pins the snapshot (1 row).
+        first = cache_ro.execute(
+            "SELECT COUNT(*) FROM session_entries"
+        ).fetchone()[0]
+        assert first == 1
+
+        # Concurrent writer commits a second row AFTER the snapshot is pinned.
+        writer = sqlite3.connect(cache_path)
+        writer.execute("PRAGMA busy_timeout=5000")
+        writer.execute(
+            "INSERT INTO session_entries(source_path, line_offset, "
+            "timestamp_utc, model, input_tokens) VALUES "
+            "('/tmp/b.jsonl', 0, '2026-01-02T00:00:00+00:00', 'claude-x', 2)"
+        )
+        writer.commit()  # must NOT block (WAL: readers don't block writers)
+        writer.close()
+
+        # The pinned snapshot still sees only the original row — the
+        # writer's commit landed in a newer WAL frame this read txn ignores.
+        second = cache_ro.execute(
+            "SELECT COUNT(*) FROM session_entries"
+        ).fetchone()[0]
+        assert second == 1, (
+            "the recompute connection must observe a STABLE snapshot; a "
+            f"concurrent commit must not leak into mid-loop reads (got {second})"
+        )
+    finally:
+        cache_ro.close()
+
+    # A fresh connection (post-close, new snapshot) sees both rows — proving
+    # the writer's commit really did land and we weren't just reading a
+    # stale file.
+    after = sqlite3.connect(cache_path)
+    try:
+        assert after.execute(
+            "SELECT COUNT(*) FROM session_entries"
+        ).fetchone()[0] == 2
+    finally:
+        after.close()

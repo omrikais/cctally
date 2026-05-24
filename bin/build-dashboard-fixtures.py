@@ -6,7 +6,7 @@ Writes one pair of (stats.db, cache.db) per scenario under
 All schema/seeding goes through ``bin/_fixture_builders.py`` — do not
 duplicate schema here. Idempotent: each builder overwrites existing DBs.
 
-Five scenarios:
+Seven scenarios:
   * ``ok``         — current week at ~40% with 8 weeks of history; forecast
                      verdict ``"ok"`` (renders as GOOD in the browser).
   * ``warn``       — current week at ~67% with a heavy recent-24h burn that
@@ -24,6 +24,12 @@ Five scenarios:
                      misused as the ``week_start_date`` lookup key after
                      ``_apply_midweek_reset_override`` shifted it forward).
   * ``no-data``    — empty schemas; every panel serializes as ``None``.
+  * ``utc-tz``     — empty-schema sibling of ``no-data`` but pre-seeds
+                     ``config.json`` with ``display.tz: "utc"`` to exercise
+                     the explicit-utc resolver path in the ``display`` block.
+  * ``tz-override``— persisted ``display.tz: "Asia/Tokyo"`` but launched with
+                     ``--tz utc`` (F3 override regression); also seeds a 5h
+                     block the harness fetches via ``GET /api/block/<start>``.
 
 Each scenario writes ``input.env`` containing a single line
 ``AS_OF=<iso-utc>`` consumed by the dashboard harness via

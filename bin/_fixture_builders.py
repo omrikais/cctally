@@ -389,112 +389,68 @@ def _self_test_create_stats_db() -> None:
 
 def create_cache_db(path: Path) -> None:
     """Create (overwriting any existing file) a cache.db with the full
-    current production schema — Claude side (session_files,
-    session_entries) and Codex side (codex_session_files,
-    codex_session_entries). All inline ALTER TABLE migrations are
-    pre-applied.
+    current production schema by delegating to the SINGLE schema source,
+    ``_cctally_db._apply_cache_schema`` (cctally-dev#96).
 
-    Schema source: `open_cache_db()` in bin/cctally.
-    Columns added by inline ALTER TABLE migrations are baked into the
-    initial CREATE TABLE statements below:
-      * session_files:       session_id, project_path
-      * codex_session_files: last_total_tokens
+    Delegating (rather than hand-maintaining inline DDL) means any cache
+    table/column later added to ``_apply_cache_schema`` lands in every
+    fixture suite's ``cache.db`` automatically — no silent post-migration
+    drift between fixtures and production. It is the same helper
+    ``open_cache_db`` calls, so the two cannot diverge.
 
-    Indexes created (to match production exactly so fixture DBs do not
-    trigger index-creation on first open):
-      * session_entries:        idx_entries_timestamp,
-                                idx_entries_source,
-                                idx_entries_dedup (UNIQUE, partial)
-      * session_files:          idx_session_files_session_id
-      * codex_session_entries:  idx_codex_entries_timestamp,
-                                idx_codex_entries_session,
-                                idx_codex_entries_source
+    On top of the shared schema this builder adds the two pieces that live
+    OUTSIDE the shared helper in production, so fixtures match the
+    post-migration on-disk state ``open_cache_db`` would produce:
+
+      * ``codex_session_files.last_total_tokens`` — the Codex ALTER stays
+        out of ``_apply_cache_schema`` because it carries a one-time purge
+        side-effect (irrelevant on a fresh empty table); replayed here via
+        ``add_column_if_missing``.
+      * the migration-framework tables (``schema_migrations`` /
+        ``schema_migrations_skipped``) with ``001_dedup_highest_wins``
+        pre-stamped applied + ``user_version = 1`` — see the inline comment.
+
+    ``_apply_cache_schema`` also creates the ``cache_meta`` sentinel table.
+    It is left EMPTY here, so the upgrade-gate's walk-complete probe reads
+    ``False`` exactly as it did when fixtures lacked the table entirely —
+    no behavioral change for harnesses that open the fixture through a real
+    ``cctally`` command.
+
+    The ``_cctally_db`` import is FUNCTION-LEVEL (lazy), mirroring
+    ``stamp_all_stats_migrations_applied``: keeps this module import-time
+    stdlib-pure with no import cycle (``_cctally_db`` does not import us).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         path.unlink()
     register_fixture_db(path)
+    from _cctally_db import (  # noqa: E402,PLC0415 (intentional lazy)
+        _apply_cache_schema,
+        add_column_if_missing,
+    )
     with sqlite3.connect(path) as conn:
         # Match production's open_cache_db(): fixtures must be WAL so a
         # first open by the harness doesn't flip bytes 18/19 of the DB
         # header.
         conn.execute("PRAGMA journal_mode=WAL")
+        # Single cache.db schema source — session_files (+ session_id /
+        # project_path ALTER + index), session_entries (+ indexes), the
+        # Codex tables, and the cache_meta sentinel.
+        _apply_cache_schema(conn)
+        # Codex last_total_tokens ALTER lives outside the shared helper in
+        # production (it carries a one-time purge side-effect); replay it so
+        # fixtures match the post-migration state. The purge is a no-op on a
+        # fresh empty Codex table.
+        add_column_if_missing(conn, "codex_session_files", "last_total_tokens", "INTEGER")
+        # Migration framework tables. Fixture DBs represent the
+        # post-migration state, so we pre-stamp every shipped cache
+        # migration as applied and advance user_version. Without
+        # this, the dispatcher's data-emptiness check (D1) would
+        # see populated session_entries (added by callers via
+        # seed_session_entry) + missing markers and trigger the
+        # 001_dedup_highest_wins handler — wiping the seeded data
+        # before the test could exercise it.
         conn.executescript("""
-            CREATE TABLE session_files (
-                path             TEXT PRIMARY KEY,
-                size_bytes       INTEGER NOT NULL,
-                mtime_ns         INTEGER NOT NULL,
-                last_byte_offset INTEGER NOT NULL,
-                last_ingested_at TEXT NOT NULL,
-                session_id       TEXT,
-                project_path     TEXT
-            );
-            CREATE INDEX idx_session_files_session_id
-                ON session_files(session_id);
-
-            CREATE TABLE session_entries (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_path         TEXT    NOT NULL,
-                line_offset         INTEGER NOT NULL,
-                timestamp_utc       TEXT    NOT NULL,
-                model               TEXT    NOT NULL,
-                msg_id              TEXT,
-                req_id              TEXT,
-                input_tokens        INTEGER NOT NULL DEFAULT 0,
-                output_tokens       INTEGER NOT NULL DEFAULT 0,
-                cache_create_tokens INTEGER NOT NULL DEFAULT 0,
-                cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
-                usage_extra_json    TEXT,
-                cost_usd_raw        REAL
-            );
-            CREATE INDEX idx_entries_timestamp
-                ON session_entries(timestamp_utc);
-            CREATE INDEX idx_entries_source
-                ON session_entries(source_path);
-            CREATE UNIQUE INDEX idx_entries_dedup
-                ON session_entries(msg_id, req_id)
-                WHERE msg_id IS NOT NULL AND req_id IS NOT NULL;
-
-            CREATE TABLE codex_session_files (
-                path              TEXT PRIMARY KEY,
-                size_bytes        INTEGER NOT NULL,
-                mtime_ns          INTEGER NOT NULL,
-                last_byte_offset  INTEGER NOT NULL,
-                last_ingested_at  TEXT NOT NULL,
-                last_session_id   TEXT,
-                last_model        TEXT,
-                last_total_tokens INTEGER
-            );
-
-            CREATE TABLE codex_session_entries (
-                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_path              TEXT    NOT NULL,
-                line_offset              INTEGER NOT NULL,
-                timestamp_utc            TEXT    NOT NULL,
-                session_id               TEXT    NOT NULL,
-                model                    TEXT    NOT NULL,
-                input_tokens             INTEGER NOT NULL DEFAULT 0,
-                cached_input_tokens      INTEGER NOT NULL DEFAULT 0,
-                output_tokens            INTEGER NOT NULL DEFAULT 0,
-                reasoning_output_tokens  INTEGER NOT NULL DEFAULT 0,
-                total_tokens             INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(source_path, line_offset)
-            );
-            CREATE INDEX idx_codex_entries_timestamp
-                ON codex_session_entries(timestamp_utc);
-            CREATE INDEX idx_codex_entries_session
-                ON codex_session_entries(session_id);
-            CREATE INDEX idx_codex_entries_source
-                ON codex_session_entries(source_path);
-
-            -- Migration framework tables. Fixture DBs represent the
-            -- post-migration state, so we pre-stamp every shipped cache
-            -- migration as applied and advance user_version. Without
-            -- this, the dispatcher's data-emptiness check (D1) would
-            -- see populated session_entries (added by callers via
-            -- seed_session_entry) + missing markers and trigger the
-            -- 001_dedup_highest_wins handler — wiping the seeded data
-            -- before the test could exercise it.
             CREATE TABLE schema_migrations (
                 name           TEXT PRIMARY KEY,
                 applied_at_utc TEXT NOT NULL
@@ -545,9 +501,19 @@ def _self_test_create_cache_db() -> None:
             )}
             expected = {"session_files", "session_entries",
                         "codex_session_files", "codex_session_entries",
+                        "cache_meta",
                         "schema_migrations", "schema_migrations_skipped"}
             missing = expected - tables
             assert not missing, f"missing tables: {missing}"
+
+            # cache_meta is created by _apply_cache_schema (cctally-dev#96)
+            # but left EMPTY here: with no claude_ingest_walk_complete row the
+            # upgrade-gate's walk-complete probe reads False — identical to the
+            # pre-#96 behavior when fixtures lacked the table entirely.
+            walk_row = conn.execute(
+                "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+            ).fetchone()
+            assert walk_row is None, "cache_meta walk-complete marker must be absent in fixtures"
 
             # 001_dedup_highest_wins is pre-stamped so the dispatcher's
             # D1 data-emptiness check doesn't fire 001 against seeded
