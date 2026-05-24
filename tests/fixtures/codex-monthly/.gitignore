@@ -1,0 +1,14 @@
+# Fixture-scoped gitignore (CLAUDE.md memory: Fixture-scoped gitignore; #98).
+# The bin/cctally-codex-*-test harnesses run every scenario inside a per-run
+# mktemp -d scratch HOME (builder --out + FAKE_HOME), so the in-tree fixtures
+# stay byte-stable under the suites. But any DIRECT `cctally codex-*` run with
+# HOME pointed at an in-tree scenario (or a builder run without --out) spawns
+# runtime artifacts under <scenario>/.local/share/{cctally,ccusage-subscription}/
+# — cache.db, *.lock, config.json[.lock], logs, WAL/shm. The root .gitignore
+# covers most of these per-command, but not every spawn (e.g. config.json.lock),
+# which surfaces as untracked and dirties the tree (it blocked the v1.12.0
+# release preflight's clean-tree check). Scope the whole per-scenario .local/
+# tree here so the tree stays clean regardless of which consumer runs the
+# fixture in-tree. Nothing under .local/ is ever committed for codex fixtures
+# (the JSONL seed lives under <scenario>/.codex/, untouched by this rule).
+*/.local/

@@ -165,7 +165,12 @@ def test_should_replace_helper(lib_jsonl):
              "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
         if speed is not None:
             u["speed"] = speed
-        return UsageEntry(timestamp=None, model="m", usage=u, cost_usd=None)
+        # source_path is REQUIRED on UsageEntry (issue #89) but irrelevant to
+        # _should_replace's output-token / speed tiebreak — any non-empty path.
+        return UsageEntry(
+            timestamp=None, model="m", usage=u, cost_usd=None,
+            source_path="/x.jsonl",
+        )
 
     sr = lib_jsonl._should_replace
     assert sr(make(3881), make(1)) is True               # higher wins
