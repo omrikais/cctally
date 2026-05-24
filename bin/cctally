@@ -1867,6 +1867,7 @@ def _boxed_table(
     aligns: list[str] | None = None,
     *,
     color_header: bool = True,
+    compact: bool = False,
 ) -> str:
     if not headers:
         return ""
@@ -1933,10 +1934,17 @@ def _boxed_table(
     def _dim(s: str) -> str:
         return _style_ansi(s, "90", color_enabled)
 
+    # Issue #91 (Shape B): ``compact`` drops the 1-space cell padding to
+    # 0 on this content-sized table (which has no proportional-width path
+    # to force). Borders and rows both key off ``pad`` so the default
+    # (``pad == 1``) reproduces the prior output byte-for-byte.
+    pad = 0 if compact else 1
+    pad_s = " " * pad
+
     def make_border(left: str, mid: str, right: str) -> str:
         return _dim(
             left
-            + mid.join(chars["h"] * (w + 2) for w in widths)
+            + mid.join(chars["h"] * (w + 2 * pad) for w in widths)
             + right
         )
 
@@ -1953,9 +1961,9 @@ def _boxed_table(
         v = _dim(chars["v"])
         return (
             v
-            + " "
-            + f" {v} ".join(styled_cells)
-            + " "
+            + pad_s
+            + f"{pad_s}{v}{pad_s}".join(styled_cells)
+            + pad_s
             + v
         )
 
@@ -2036,6 +2044,7 @@ def _layout_cache_table(
     wide_text_min: int = 15,
     narrow_text_min: int = 12,
     droppable_col_index: int | None = None,
+    compact: bool = False,
 ) -> str:
     """Shared responsive-width table layout for cache-report renderers.
 
@@ -2139,7 +2148,11 @@ def _layout_cache_table(
         term_width = int(os.environ.get("COLUMNS", "120"))
 
     border_overhead = 3 * num_cols + 1
-    compact_mode = sum(col_widths) + border_overhead > term_width
+    # Issue #91 (Shape A): the ``compact`` kwarg forces the responsive
+    # scale-down path regardless of terminal width, mirroring
+    # ``_render_project_table`` / ``_render_bucket_table``. Auto-detected
+    # width-overflow continues to trigger the same path as before.
+    compact_mode = compact or (sum(col_widths) + border_overhead > term_width)
 
     if compact_mode:
         available = term_width - border_overhead
@@ -2351,7 +2364,9 @@ def _layout_cache_table(
     return "\n".join(lines)
 
 
-def _render_cache_day_rows(rows: list[CacheRow], title: str) -> str:
+def _render_cache_day_rows(
+    rows: list[CacheRow], title: str, *, compact: bool = False,
+) -> str:
     """Render daily-mode cache report.
 
     Columns: Date, Models, Cache %, Input, Cache Create, Cache Read,
@@ -2480,12 +2495,13 @@ def _render_cache_day_rows(rows: list[CacheRow], title: str) -> str:
         wide_text_min=15,
         narrow_text_min=12,
         droppable_col_index=3,                         # Input column
+        compact=compact,
     )
 
 
 def _render_cache_session_rows(
     rows: list[CacheRow], title: str,
-    *, tz: "ZoneInfo | None" = None,
+    *, tz: "ZoneInfo | None" = None, compact: bool = False,
 ) -> str:
     """Render session-mode cache report.
 
@@ -2629,6 +2645,7 @@ def _render_cache_session_rows(
         wide_text_min=18,
         narrow_text_min=12,
         droppable_col_index=4,                                 # Input column
+        compact=compact,
     )
 
 
@@ -2638,16 +2655,20 @@ def _render_cache_report_table(
     *,
     mode: Literal["day", "session"] = "day",
     tz: "ZoneInfo | None" = None,
+    compact: bool = False,
 ) -> str:
     """Dispatcher: routes to daily or session renderer based on mode.
 
     ``tz`` is the resolved display zone (None = host local). Day-mode
     rows have no clock-instant cells (date strings only) so the parameter
     is currently consumed only by the session-mode renderer.
+
+    ``compact`` (issue #91, Shape A) forces ``_layout_cache_table``'s
+    responsive scale-down branch regardless of terminal width.
     """
     if mode == "session":
-        return _render_cache_session_rows(rows, title, tz=tz)
-    return _render_cache_day_rows(rows, title)
+        return _render_cache_session_rows(rows, title, tz=tz, compact=compact)
+    return _render_cache_day_rows(rows, title, compact=compact)
 
 
 def _trend_row_recency_seconds(row: dict[str, Any]) -> float:
@@ -5413,6 +5434,7 @@ def cmd_project(args: argparse.Namespace) -> int:
         weeks_missing_snapshot=len(weeks_missing_snapshot),
         weeks_in_range=len(weeks_in_range),
         color=_resolve_color_enabled(args),
+        compact=args.compact,
     ))
     return 0
 
@@ -5614,7 +5636,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
     width = max(80, min(width, 160))
     print(_diff_render_full_output(
         result, color=color, width=width, raw_aggregates=result.raw_totals,
-        tz=tz_obj,
+        tz=tz_obj, compact=args.compact,
     ))
     return 0
 
@@ -8893,7 +8915,7 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
         return 0
 
     title = _build_cache_report_title(args, mode)
-    print(_render_cache_report_table(rows, title, mode=mode, tz=tz))
+    print(_render_cache_report_table(rows, title, mode=mode, tz=tz, compact=args.compact))
     return 0
 
 
@@ -9038,7 +9060,7 @@ def cmd_range_cost(args: argparse.Namespace) -> int:
         ])
 
         aligns = ["left"] + ["right"] * (len(headers) - 1)
-        print(_boxed_table(headers, rows, aligns))
+        print(_boxed_table(headers, rows, aligns, compact=args.compact))
         return 0
 
     # Default: print cost

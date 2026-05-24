@@ -1234,11 +1234,18 @@ def _diff_render_section_table(
     used_pct_mode_a: str,
     used_pct_mode_b: str,
     threshold: "NoiseThreshold | None" = None,
+    compact: bool = False,
 ) -> str:
     """Render one bordered table for a section. The Total row sums all rows
     (visible + hidden) — the caller passes the unfiltered aggregate map as
-    total_a/total_b so hidden rows still contribute (spec §4 invariant)."""
+    total_a/total_b so hidden rows still contribute (spec §4 invariant).
+
+    ``compact`` (issue #91, Shape B) drops the 1-space cell padding to 0 on
+    this content-sized table, which has no proportional-width path to force.
+    ``pad == 1`` (the default) reproduces the prior output byte-for-byte."""
     boxes = _diff_box_chars()
+    pad = 0 if compact else 1
+    pad_s = " " * pad
     out: list = [_diff_section_heading(section.name, width), ""]
 
     header_cells: list = ["Model" if section.name == "models"
@@ -1318,7 +1325,7 @@ def _diff_render_section_table(
         fill = fill or boxes["h"]
         parts = [left]
         for i, w in enumerate(col_w):
-            parts.append(fill * (w + 2))
+            parts.append(fill * (w + 2 * pad))
             parts.append(right if i == n_cols - 1 else mid)
         return "".join(parts)
 
@@ -1340,7 +1347,7 @@ def _diff_render_section_table(
                 # result. Spaces stay outside the ANSI escape so column rules
                 # align identically with or without color.
                 styled = _style_ansi(padded, code, enabled=bool(code))
-                parts.append(f" {styled} ")
+                parts.append(f"{pad_s}{styled}{pad_s}")
                 parts.append(boxes["v"])
             out_lines.append("".join(parts))
         return "\n".join(out_lines)
@@ -1376,11 +1383,13 @@ def _diff_render_full_output(
     width: int,
     raw_aggregates: dict,
     tz: "ZoneInfo | None" = None,
+    compact: bool = False,
 ) -> str:
     """Compose banner + window header + each section's table.
 
     ``tz`` is forwarded to ``_diff_render_window_header`` for the date
-    labels; ``tz=None`` means host-local.
+    labels; ``tz=None`` means host-local. ``compact`` (issue #91, Shape B)
+    is forwarded to each section table's pad-reduction branch.
     """
     parts: list = [
         _diff_render_banner(), "",
@@ -1395,6 +1404,7 @@ def _diff_render_full_output(
             used_pct_mode_a=result.used_pct_mode_a,
             used_pct_mode_b=result.used_pct_mode_b,
             threshold=result.threshold,
+            compact=compact,
         ))
     return "\n".join(parts)
 

@@ -2426,6 +2426,7 @@ def _render_project_table(
     weeks_in_range: int = 1,
     no_color: bool = False,
     color: "bool | None" = None,
+    compact: bool = False,
 ) -> str:
     """Render project rollup as a ccusage-style ANSI table.
 
@@ -2594,7 +2595,11 @@ def _render_project_table(
         term_width = int(os.environ.get("COLUMNS", "120"))
 
     border_overhead = 3 * num_cols + 1
-    if sum(col_widths) + border_overhead > term_width:
+    # Issue #91 (Shape A): the ``compact`` kwarg forces this scale-down
+    # branch regardless of terminal width, mirroring ``_render_blocks_table``
+    # / ``_render_bucket_table``. Auto-detected width-overflow continues to
+    # trigger the same path as before.
+    if compact or (sum(col_widths) + border_overhead > term_width):
         available = term_width - border_overhead
         total_col = sum(col_widths)
         scale = available / total_col if total_col > 0 else 1.0
@@ -2863,7 +2868,7 @@ def _render_five_hour_blocks_table(
                 "", "", "",
             ])
 
-    print(_boxed_table(headers, rows, aligns))
+    print(_boxed_table(headers, rows, aligns, compact=args.compact))
     glyph = " · ⚡ = block crossed weekly reset" if has_crossed else ""
     print(f"\n{len(block_dicts)} blocks · cost: ${total_cost:.2f}{glyph}")
 
