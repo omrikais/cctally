@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-05-24
+
 ### Fixed
 - **Dedup of streaming + post-stream JSONL rows now picks the post-stream finalization (matching upstream `ccusage`).** Earlier versions kept the FIRST emission of each `(message.id, requestId)` pair, which on tool-using turns is a streaming intermediate with `output_tokens=1`; the post-stream row (with the real `output_tokens` count) was rejected. Result was a systematic ~60% under-count of output tokens on agentic workloads, propagating to roughly $5/active block of missing cost on opus-4-7. cctally now picks the row with the higher token total (ccusage `should_replace_deduped_entry`), with a `speed`-set tiebreak for equal totals.
 - **Pre-v1.12.0 cache.db upgrades now actually run the new dedup-wipe migration instead of being stamp-only.** The dispatcher's fresh-install heuristic classified every pre-v1.12.0 cache.db as a fresh install (because the cache migration framework was new in this release) and then stamped every pending migration's marker WITHOUT invoking its handler — silently skipping the `001_dedup_highest_wins` wipe on every upgrading user. The heuristic now also requires the DB's primary data table (`session_entries` for cache.db, `weekly_cost_snapshots` for stats.db) to be empty/absent before taking the stamp-only path. Genuine fresh installs still get the optimization; pre-framework upgrades now actually run their handlers, so the dedup fix above lands on upgrading users instead of being silently no-op'd. Symmetric protection applied to stats migration 008 for parity. (D1)
