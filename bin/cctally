@@ -5772,21 +5772,12 @@ def cmd_diff(args: argparse.Namespace) -> int:
         print(f"diff: {exc}", file=sys.stderr)
         return 2
 
-    # Issue #89 spec §7.2.2 Pattern D: emit one --debug report per window
-    # before any rendering, with window-A then window-B labels.
-    if getattr(args, "debug", False):
-        _emit_diff_debug_samples(args, window_a, window_b)
-
-    threshold = NoiseThreshold(
-        show_all=bool(args.show_all),
-        user_override=(args.min_delta_usd is not None
-                       or args.min_delta_pct is not None),
-    )
-    if args.min_delta_usd is not None:
-        threshold = dataclasses.replace(threshold, min_delta_usd=args.min_delta_usd)
-    if args.min_delta_pct is not None:
-        threshold = dataclasses.replace(threshold, min_delta_pct=args.min_delta_pct)
-
+    # Validate the remaining CLI surface (`--only` / `--with`) BEFORE the
+    # `--debug` emission below. `_emit_diff_debug_samples` prints reports and,
+    # under `--sync`, runs a cache ingest (a local-state mutation). A
+    # fail-fast usage error like `diff ... --only bogus --debug --sync` must
+    # not print unrelated debug output or touch the cache before returning
+    # exit 2 — so the validation gate has to precede the debug scan.
     sections_requested = ["overall", "models", "projects", "cache"]
     if args.only is not None:
         sections_requested = [s.strip() for s in args.only.split(",") if s.strip()]
@@ -5812,6 +5803,23 @@ def cmd_diff(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+
+    # Issue #89 spec §7.2.2 Pattern D: emit one --debug report per window
+    # before any rendering, with window-A then window-B labels. Runs only
+    # after the validation gate above so a usage error fails fast without
+    # debug output or a cache sync.
+    if getattr(args, "debug", False):
+        _emit_diff_debug_samples(args, window_a, window_b)
+
+    threshold = NoiseThreshold(
+        show_all=bool(args.show_all),
+        user_override=(args.min_delta_usd is not None
+                       or args.min_delta_pct is not None),
+    )
+    if args.min_delta_usd is not None:
+        threshold = dataclasses.replace(threshold, min_delta_usd=args.min_delta_usd)
+    if args.min_delta_pct is not None:
+        threshold = dataclasses.replace(threshold, min_delta_pct=args.min_delta_pct)
 
     try:
         result = _build_diff_result(

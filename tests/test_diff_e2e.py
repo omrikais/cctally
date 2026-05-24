@@ -77,3 +77,55 @@ def test_diff_with_trend_exits_1_with_clean_stderr(empty_home):
     assert r.returncode == 1
     assert "not yet implemented" in r.stderr
     assert "Traceback" not in r.stderr   # no Python traceback
+
+
+# Markers that uniquely appear in the --debug pricing-mismatch report
+# (`_emit_diff_debug_samples` -> `_render_pricing_mismatch_report`). On an
+# empty HOME the report degrades to the no-data line, but either marker
+# proves the debug scan ran.
+_DEBUG_REPORT_MARKERS = (
+    "Pricing Mismatch Debug Report",
+    "No pricing data found to analyze.",
+)
+
+
+def test_diff_invalid_only_fails_fast_no_debug_no_sync(empty_home):
+    """Codex round-4 P3: an invalid --only must fail (exit 2) BEFORE the
+    --debug scan emits any report or --sync mutates the cache.
+
+    Regression: previously `_emit_diff_debug_samples` ran (and, under
+    --sync, ingested into cache.db) before the --only validation gate, so
+    a fail-fast usage error still printed unrelated debug output and
+    touched local cache state.
+    """
+    cache_db = empty_home / ".local" / "share" / "cctally" / "cache.db"
+    assert not cache_db.exists()  # precondition: virgin HOME
+    r = _run(
+        ["diff", "--a", "last-7d", "--b", "prev-7d",
+         "--only", "bogus", "--debug", "--sync"],
+        env_override={"HOME": str(empty_home),
+                      "CCTALLY_AS_OF": "2026-04-25T19:30:00Z"},
+    )
+    assert r.returncode == 2, r.stderr
+    assert "unknown section" in r.stderr
+    # No debug report was emitted before the validation error.
+    for marker in _DEBUG_REPORT_MARKERS:
+        assert marker not in r.stderr, f"debug report leaked: {marker!r}"
+    # --sync did not run: the cache DB was never created.
+    assert not cache_db.exists(), "cache sync ran before validation"
+    assert "Traceback" not in r.stderr
+
+
+def test_diff_valid_only_still_emits_debug(empty_home):
+    """Guard the reorder didn't suppress --debug on a VALID invocation:
+    a well-formed --only + --debug must still emit the report."""
+    r = _run(
+        ["diff", "--a", "last-7d", "--b", "prev-7d",
+         "--only", "overall", "--debug"],
+        env_override={"HOME": str(empty_home),
+                      "CCTALLY_AS_OF": "2026-04-25T19:30:00Z"},
+    )
+    assert r.returncode == 0, r.stderr
+    assert any(marker in r.stderr for marker in _DEBUG_REPORT_MARKERS), (
+        "expected a --debug report on a valid invocation"
+    )
