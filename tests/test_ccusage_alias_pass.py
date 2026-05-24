@@ -248,6 +248,58 @@ def test_z_alias_bridge_invokes_resolver(monkeypatch, capsys):
     assert ns.tz == "utc", ns.tz
 
 
+def test_bridge_malformed_z_alias_hard_fails(capsys):
+    """#90 (rung-2 preserved): a malformed value the user typed on the
+    command line via ``-z``/``--timezone`` is a usage error — the bridge
+    emits the ``-z/--timezone`` message and exits 2, matching ``--tz``'s
+    argparse-time type-check.
+    """
+    mod = _load_cctally_module()
+    ns = argparse.Namespace(tz=None, timezone="Not/A/Real/Zone")
+    with pytest.raises(SystemExit) as exc:
+        mod._bridge_z_into_tz(ns, config={})
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "argument -z/--timezone" in err
+    # The bridge did not silently promote the bad value.
+    assert getattr(ns, "tz", None) is None
+
+
+def test_bridge_malformed_config_tz_degrades(capsys):
+    """#90 (rung-3 fix): a malformed ``config.display.tz`` with NO CLI tz
+    flag must NOT hard-fail or mis-attribute the error to ``-z/--timezone``.
+    The bridge leaves ``args.tz`` unset and falls through to the downstream
+    ``resolve_display_tz`` / ``get_display_tz_pref`` warn-and-default path
+    (exit 0) — matching codex commands, the dashboard, and pre-Session-A
+    behavior.
+    """
+    mod = _load_cctally_module()
+    ns = argparse.Namespace(tz=None, timezone=None)
+    config = {"display": {"tz": "Not/A/Real/Zone"}}
+    # No SystemExit — the bridge returns normally.
+    mod._bridge_z_into_tz(ns, config=config)
+    assert getattr(ns, "tz", None) is None
+    # And it did NOT emit the misleading CLI-flag error.
+    err = capsys.readouterr().err
+    assert "argument -z/--timezone" not in err
+
+
+def test_malformed_config_tz_exit_zero_end_to_end(fake_home):
+    """#90 end-to-end: a malformed persisted ``display.tz`` lets the in-scope
+    Claude reporting commands run to completion (exit 0) with a one-shot
+    config warning on stderr — no misleading ``-z/--timezone`` error."""
+    cfg_dir = fake_home / ".local" / "share" / "cctally"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(
+        '{"display": {"tz": "Not/A/Real/Zone"}}'
+    )
+    # fake_home monkeypatches HOME on os.environ; _run inherits it (env=None).
+    r = _run("blocks")
+    assert r.returncode == 0, (r.returncode, r.stderr)
+    assert "ignoring malformed display.tz" in r.stderr
+    assert "argument -z/--timezone" not in r.stderr
+
+
 # T1 follow-up parity (spec §2 closing paragraph): codex commands ALREADY
 # carry the ccusage-codex sharedArgs alias surface via
 # `_add_codex_shared_args`. Session A is test-only over these — we verify

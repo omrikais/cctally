@@ -15,10 +15,16 @@ Coverage:
       * explicit-path read does NOT create the default config or
         acquire the writer lock.
   - End-to-end integration via subprocess: confirm the override
-    actually reaches `_bridge_z_into_tz` for the 10 in-scope cmds by
-    putting an invalid IANA zone in the override file and asserting
-    the canonical tz-validation error surfaces (which it wouldn't if
-    `--config` were ignored).
+    actually reaches the tz-resolution path for the 9 display-tz-consuming
+    in-scope cmds by putting an invalid IANA zone in the override file and
+    asserting the `get_display_tz_pref` malformed-config warning surfaces
+    (which it wouldn't if `--config` were ignored). Post-#90, a malformed
+    config-rung tz degrades gracefully (warn + default-to-local, exit 0)
+    rather than hard-failing with a misleading `-z/--timezone` error, so
+    the warning — not the exit code — is the threading signal. `range-cost`
+    has no display-tz consumer (start/end carry their own ISO zone), so its
+    `--config` threading is proven via the universal load-time invalid-JSON
+    guard instead.
 """
 from __future__ import annotations
 
@@ -218,6 +224,12 @@ INSCOPE_CMDS_ALL = [
     "range-cost", "cache-report",
 ]
 
+# The 9 cmds that consume display.tz downstream — i.e. a malformed
+# config.display.tz surfaces the get_display_tz_pref warning. `range-cost`
+# is excluded: it documents no display-tz consumer (start/end carry their
+# own ISO zone), so a malformed config-rung tz is absorbed silently.
+INSCOPE_CMDS_TZ_CONSUMING = [c for c in INSCOPE_CMDS_ALL if c != "range-cost"]
+
 
 def _window_args(cmd):
     if cmd == "diff":
@@ -234,15 +246,19 @@ def _run(*args, env=None):
     )
 
 
-@pytest.mark.parametrize("cmd", INSCOPE_CMDS_ALL)
+@pytest.mark.parametrize("cmd", INSCOPE_CMDS_TZ_CONSUMING)
 def test_override_threads_into_bridge(cmd, fake_home, tmp_path):
-    """End-to-end: putting a bogus IANA zone in the override file surfaces
-    the canonical bridge-time tz-validation error on every in-scope cmd.
+    """End-to-end: a bogus IANA zone in the override file surfaces the
+    `get_display_tz_pref` malformed-config warning on every tz-consuming
+    in-scope cmd, proving the loaded override reaches the tz-resolution path.
 
     If `--config` were ignored (pre-#88 no-op), the empty fake_home's
-    default config has no `display.tz` and the bridge would return None
-    silently — no error. The fact that the bridge surfaces a bogus zone
-    confirms the override actually reaches `_bridge_z_into_tz`.
+    default config has no `display.tz`, so no warning would surface.
+
+    Post-#90: a malformed config-rung tz degrades gracefully (warn +
+    default-to-local) instead of hard-failing with a misleading
+    `-z/--timezone` error — so the warning is the signal, and the bogus
+    value must NOT be mis-attributed to the CLI alias.
     """
     override = tmp_path / "override.json"
     override.write_text(
@@ -252,9 +268,31 @@ def test_override_threads_into_bridge(cmd, fake_home, tmp_path):
     env.pop("XDG_DATA_HOME", None)
     env.pop("XDG_CONFIG_HOME", None)
     r = _run(cmd, *_window_args(cmd), "--config", str(override), env=env)
-    assert r.returncode == 2, (r.returncode, r.stderr)
+    # The override's bogus zone reached the tz-resolution path.
     assert "Bogus/NotAZone" in r.stderr, r.stderr
-    assert "invalid" in r.stderr.lower(), r.stderr
+    assert "ignoring malformed display.tz" in r.stderr, r.stderr
+    # #90 regression guard: not mis-attributed to the CLI alias.
+    assert "argument -z/--timezone" not in r.stderr, r.stderr
+
+
+def test_override_threads_into_range_cost_via_invalid_json(fake_home, tmp_path):
+    """`range-cost` has no display-tz consumer, so a malformed config.display.tz
+    is absorbed silently (post-#90) — the tz-warning probe can't observe its
+    `--config` threading. Prove it instead via the universal load-time guard:
+    every in-scope cmd_* calls `_load_claude_config_for_args(args)` at the top,
+    which exits 2 on invalid JSON before any command logic runs.
+    """
+    bad = tmp_path / "bad.json"
+    bad.write_text("{ not valid json", encoding="utf-8")
+    env = {**os.environ, "HOME": str(fake_home)}
+    env.pop("XDG_DATA_HOME", None)
+    env.pop("XDG_CONFIG_HOME", None)
+    r = _run(
+        "range-cost", *_window_args("range-cost"),
+        "--config", str(bad), env=env,
+    )
+    assert r.returncode == 2, (r.returncode, r.stderr)
+    assert "--config: invalid JSON" in r.stderr, r.stderr
 
 
 def test_override_with_no_flag_unchanged(fake_home, tmp_path):

@@ -1039,6 +1039,15 @@ def _bridge_z_into_tz(args: argparse.Namespace,
     the alias flag is plain string, not ``type=_argparse_tz``). The
     resolver returns the raw string, so we revalidate here on the path
     that actually bridges into ``args.tz``.
+
+    Error attribution is rung-aware (#90). A malformed value typed on
+    the command line (rung-2, ``-z``/``--timezone``) is a usage error
+    and hard-fails with the argparse-style message + exit 2. A malformed
+    ``config.display.tz`` (rung-3) is NOT promoted or hard-failed here:
+    it falls through to ``resolve_display_tz`` / ``get_display_tz_pref``
+    downstream, which warn once and default to host-local (exit 0). That
+    restores the pre-Session-A contract and matches how codex commands
+    and the dashboard already treat a malformed persisted tz pref.
     """
     # Short-circuit: --tz already set wins all rungs (the resolver
     # returns args.tz unchanged anyway, but skipping avoids touching
@@ -1048,16 +1057,27 @@ def _bridge_z_into_tz(args: argparse.Namespace,
     resolved = _resolve_claude_tz_name(args, config)
     if resolved is None:
         return
+    # ``args.tz`` is None here (short-circuited above), so ``resolved``
+    # came from rung-2 (``-z``/``--timezone``) iff ``args.timezone`` is
+    # set; otherwise it is the rung-3 ``config.display.tz`` value.
+    from_cli_alias = getattr(args, "timezone", None) is not None
     # Validate via _argparse_tz so an invalid --timezone surfaces the
     # canonical argparse-style error (matches --tz's type-check).
     try:
         canonical = _argparse_tz(resolved)
     except argparse.ArgumentTypeError as exc:
-        # Surface the same kind of error users get from --tz at parse
-        # time. We can't call parser.error from here, so emit-and-raise
-        # via SystemExit(2) for argparse-shape parity.
-        eprint(f"cctally: argument -z/--timezone: {exc}")
-        raise SystemExit(2) from exc
+        if from_cli_alias:
+            # Rung-2: a value the user typed on the command line. Surface
+            # the same error --tz gives at parse time. We can't call
+            # parser.error from here, so emit-and-raise via SystemExit(2)
+            # for argparse-shape parity.
+            eprint(f"cctally: argument -z/--timezone: {exc}")
+            raise SystemExit(2) from exc
+        # Rung-3: malformed config.display.tz with no CLI tz flag. Don't
+        # mis-attribute the error to -z/--timezone or hard-fail (#90).
+        # Leave args.tz unset; resolve_display_tz / get_display_tz_pref
+        # warn once and default to host-local downstream (exit 0).
+        return
     args.tz = canonical
 
 
