@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **`codex-daily` / `codex-monthly` / `codex-weekly` / `codex-session` now accept `-d/--debug` + `--debug-samples N`**, extending the Claude-side `--debug` diagnostic surface to the Codex commands. Because Codex JSONL records no `costUSD` to diff against, the report is a Codex variant — a "Codex Pricing Debug Report" on stderr with totals (entries processed, models seen, total computed cost) plus a "Sample Top Entries" block of the N highest computed-cost entries (`Recorded cost: (none)` per sample; `gpt-5`-fallback models tagged `(fallback→gpt-5)`). `--debug-samples` caps the sample block (default 5; `N=0` prints totals only). (#92)
+
 ## [1.12.0] - 2026-05-24
 
 ### Fixed

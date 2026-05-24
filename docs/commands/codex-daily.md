@@ -14,6 +14,7 @@ cctally codex-daily
     [-z TZ] [-l LOCALE]
     [--compact] [--color] [--noColor]
     [-O | --offline | --no-offline]
+    [-d | --debug] [--debug-samples N]
 ```
 
 ## Options
@@ -30,6 +31,8 @@ cctally codex-daily
 | `--compact` | Force compact table layout regardless of terminal width. |
 | `--color` / `--noColor` | No-op; accepted for drop-in compat (no ANSI emitted). |
 | `-O, --offline / --no-offline` | No-op; accepted for drop-in compat (always offline). |
+| `-d, --debug` | Emit a stderr "Codex Pricing Debug Report" (totals + the N highest computed-cost sample entries). See [Pricing debug report](#pricing-debug-report---debug). |
+| `--debug-samples N` | Cap on top-entry sample rows in the `--debug` report (default 5; `N=0` suppresses the sample block; negatives rejected at parse time). |
 
 ## Examples
 
@@ -79,6 +82,35 @@ rendered table's Input column shows non-cached (`input - cached`).
 Unknown Codex model names fall back to
 `CODEX_LEGACY_FALLBACK_MODEL = "gpt-5"` pricing with `isFallback: true`
 in JSON output. One stderr warning per unknown name per process.
+
+### Pricing debug report (`--debug`)
+
+`-d/--debug` writes a **Codex Pricing Debug Report** to stderr (stdout
+keeps the normal table/JSON). Unlike the Claude-side `--debug` report,
+Codex JSONL records no `costUSD`, so there is nothing to diff against —
+the report instead lists the **N highest computed-cost entries**:
+
+```
+=== Codex Pricing Debug Report ===
+Command: cctally codex-daily
+Total entries processed: 1,234
+Models seen: gpt-5-codex (1,200), gpt-5 (34)
+Total computed cost: $12.345678
+
+=== Sample Top Entries (first 5) ===
+File: rollout-abc.jsonl
+Timestamp: 2026-05-01T10:00:00+00:00
+Model: gpt-5-codex
+Recorded cost: (none)
+Calculated cost: $0.842310
+Tokens: {"input_tokens": 700, ...}
+---
+```
+
+`--debug-samples N` caps the sample block (default 5; `N=0` prints only
+the totals header). Models priced via the `gpt-5` fallback are tagged
+`(fallback→gpt-5)` in both "Models seen" and the per-sample `Model:`
+line.
 
 ## See also
 

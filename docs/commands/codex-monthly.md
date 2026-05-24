@@ -14,6 +14,7 @@ cctally codex-monthly
     [-z TZ] [-l LOCALE]
     [--compact] [--color] [--noColor]
     [-O | --offline | --no-offline]
+    [-d | --debug] [--debug-samples N]
 ```
 
 ## Options
@@ -30,6 +31,8 @@ cctally codex-monthly
 | `--compact` | Force compact table layout. |
 | `--color` / `--noColor` | No-op; accepted for drop-in compat. |
 | `-O, --offline / --no-offline` | No-op; always offline. |
+| `-d, --debug` | Emit a stderr "Codex Pricing Debug Report" (totals + top-N highest computed-cost entries). |
+| `--debug-samples N` | Cap on top-entry sample rows (default 5; `N=0` suppresses the block). |
 
 ## Examples
 
@@ -43,7 +46,9 @@ cctally codex-monthly --json
 
 Same dedup, token-semantics, and unknown-model behavior as
 [`codex-daily`](codex-daily.md#notes--diverges-from-upstream-ccusage-codex-on-duplicate-events) —
-read that page for the details.
+read that page for the details. The `--debug` report shape is also
+shared — see
+[Pricing debug report](codex-daily.md#pricing-debug-report---debug).
 
 ## See also
 

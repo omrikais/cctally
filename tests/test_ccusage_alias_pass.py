@@ -309,16 +309,15 @@ def test_malformed_config_tz_exit_zero_end_to_end(fake_home):
 CODEX_CMDS = ["codex-daily", "codex-monthly", "codex-weekly", "codex-session"]
 
 
-# Session A flags that should NOT appear on codex subparsers (spec §7.6:
-# the new Claude-side helper does not fire on codex parsers). If any of
-# these flags is parsed by a codex command, that's a contamination
-# regression — the new helper would have to have been wired onto codex
-# parsers by accident, which the closing paragraph of spec §2 explicitly
-# forbids.
+# Session A flags that REMAIN Claude-only on codex subparsers. As of
+# issue #92, `_add_codex_shared_args` was extended to ALSO accept
+# `-d/--debug` + `--debug-samples` (codex now emits a "Codex Pricing
+# Debug Report"), so those three left this list — see
+# TestCodexAliasParity.test_debug_* below. `--single-thread` and
+# `--config` stay out of scope: if a codex parser accepts either, the
+# Claude-side `_add_ccusage_alias_args` helper was incorrectly wired
+# onto a codex parser (a contamination regression).
 SESSION_A_CLAUDE_ONLY_FLAGS = [
-    "-d",
-    "--debug",
-    "--debug-samples",
     "--single-thread",
     "--config",
 ]
@@ -358,6 +357,27 @@ class TestCodexAliasParity:
     def test_color(self, cmd, fake_home):
         r = _run(cmd, "--color")
         assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    # Issue #92: codex parsers now carry `-d/--debug` + `--debug-samples`
+    # (the "Codex Pricing Debug Report" surface). These were Claude-only
+    # through #89; #92 extended `_add_codex_shared_args` to accept them.
+    def test_debug_short(self, cmd, fake_home):
+        r = _run(cmd, "-d")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_debug_long(self, cmd, fake_home):
+        r = _run(cmd, "--debug")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_debug_samples(self, cmd, fake_home):
+        r = _run(cmd, "--debug-samples", "5")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_debug_samples_rejects_negative(self, cmd, fake_home):
+        # _nonneg_int validator fires at parse time (shared with Claude side).
+        r = _run(cmd, "--debug-samples", "-1")
+        assert r.returncode == 2, (r.returncode, r.stderr)
+        assert "must be >= 0" in r.stderr, r.stderr
 
     def test_dual_date_form_yyyy_mm_dd(self, cmd, fake_home):
         # codex commands already accept both forms; this confirms

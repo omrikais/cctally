@@ -1338,6 +1338,181 @@ def _emit_debug_samples_if_set(
     _DEBUG_REPORT_EMITTED = True
 
 
+# ---------------------------------------------------------------------------
+# Codex --debug report (issue #92).
+#
+# Codex JSONL carries NO recorded costUSD, so the Claude-side "recorded vs
+# calculated mismatch" framing does not apply. The codex variant (chosen in
+# #92's design Q&A, option 2; #89 spec §12 precedent) is a "Codex Pricing
+# Debug Report": totals header (entries processed, models seen, total
+# computed cost) + a "Sample Top Entries" block of the N highest
+# computed-cost entries, each tagged ``Recorded cost: (none)``. Reuses the
+# process-wide ``_DEBUG_REPORT_EMITTED`` guard so one CLI invocation emits a
+# single debug report regardless of which family it ran.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CodexCostSample:
+    file: str
+    timestamp: str
+    model: str
+    calculated_cost: float
+    usage: dict
+    is_fallback: bool
+
+
+@dataclass
+class _CodexCostStats:
+    command_label: str | None = None
+    total_entries: int = 0
+    total_cost: float = 0.0
+    model_counts: dict = field(default_factory=dict)
+    fallback_models: set = field(default_factory=set)
+    samples: list = field(default_factory=list)
+
+
+def _compute_codex_cost_stats(entries):
+    """Walk ``entries: Iterable[CodexEntry]`` and compute the totals +
+    per-entry computed-cost samples that ``_render_codex_cost_report``
+    consumes (issue #92).
+
+    Unlike the Claude ``_compute_pricing_mismatch_stats`` there is no
+    recorded cost to diff against, so every entry contributes a sample.
+    Samples are collected for all entries and sorted descending by
+    computed cost; the renderer slices to ``--debug-samples``. (Memory is
+    O(entries); acceptable for typical codex histories and symmetric with
+    the Claude helper, which retains its full discrepancy list.)
+
+    Cost + fallback resolution mirror the live aggregation path:
+    ``_calculate_codex_entry_cost`` (LiteLLM token semantics) and
+    ``_resolve_codex_pricing`` (unknown model → ``gpt-5`` fallback).
+    """
+    stats = _CodexCostStats()
+    for entry in entries:
+        stats.total_entries += 1
+        stats.model_counts[entry.model] = (
+            stats.model_counts.get(entry.model, 0) + 1
+        )
+        _, is_fallback = _resolve_codex_pricing(entry.model)
+        if is_fallback:
+            stats.fallback_models.add(entry.model)
+        cost = _calculate_codex_entry_cost(
+            entry.model,
+            entry.input_tokens,
+            entry.cached_input_tokens,
+            entry.output_tokens,
+            entry.reasoning_output_tokens,
+        )
+        stats.total_cost += cost
+        stats.samples.append(_CodexCostSample(
+            file=os.path.basename(entry.source_path),
+            timestamp=entry.timestamp.isoformat(),
+            model=entry.model,
+            calculated_cost=cost,
+            usage={
+                "input_tokens": entry.input_tokens,
+                "cached_input_tokens": entry.cached_input_tokens,
+                "output_tokens": entry.output_tokens,
+                "reasoning_output_tokens": entry.reasoning_output_tokens,
+                "total_tokens": entry.total_tokens,
+            },
+            is_fallback=is_fallback,
+        ))
+    # Stable sort: equal-cost samples keep iteration order (mirrors the
+    # Claude helper's iteration-order discrepancy list).
+    stats.samples.sort(key=lambda s: -s.calculated_cost)
+    return stats
+
+
+def _render_codex_cost_report(stats, sample_limit):
+    """Return the codex --debug report as a list of stderr lines (issue #92).
+
+    Structurally parallel to ``_render_pricing_mismatch_report`` but with
+    no match/mismatch framing (codex has no recorded cost):
+
+      - Early-return ``"No Codex usage data found to analyze."`` when
+        ``total_entries == 0``.
+      - Totals header: entries processed, models seen (count desc, ties
+        by name asc; fallback models tagged ``(N, fallback→gpt-5)``),
+        total computed cost.
+      - ``Command: cctally <label>`` self-identifier when set (parity
+        with the Claude report's one non-upstream line).
+      - Sample block omitted when ``sample_limit == 0`` or no samples;
+        header prints the requested ``sample_limit`` (upstream parity).
+        Each sample carries ``Recorded cost: (none)`` and a
+        ``(fallback→gpt-5)`` model-line marker when applicable.
+    """
+    out = []
+    if stats.total_entries == 0:
+        out.append("No Codex usage data found to analyze.")
+        return out
+
+    fallback = CODEX_LEGACY_FALLBACK_MODEL
+    parts = []
+    for model, count in sorted(
+        stats.model_counts.items(), key=lambda kv: (-kv[1], kv[0]),
+    ):
+        if model in stats.fallback_models:
+            parts.append(f"{model} ({count:,}, fallback→{fallback})")
+        else:
+            parts.append(f"{model} ({count:,})")
+
+    out.append("")
+    out.append("=== Codex Pricing Debug Report ===")
+    if stats.command_label:
+        out.append(f"Command: cctally {stats.command_label}")
+    out.append(f"Total entries processed: {stats.total_entries:,}")
+    out.append(f"Models seen: {', '.join(parts)}")
+    out.append(f"Total computed cost: ${stats.total_cost:.6f}")
+
+    if stats.samples and sample_limit > 0:
+        out.append("")
+        out.append(f"=== Sample Top Entries (first {sample_limit}) ===")
+        for s in stats.samples[:sample_limit]:
+            model_line = (
+                f"{s.model} (fallback→{fallback})"
+                if s.is_fallback else s.model
+            )
+            out.append(f"File: {s.file}")
+            out.append(f"Timestamp: {s.timestamp}")
+            out.append(f"Model: {model_line}")
+            out.append("Recorded cost: (none)")
+            out.append(f"Calculated cost: ${s.calculated_cost:.6f}")
+            out.append(f"Tokens: {json.dumps(s.usage)}")
+            out.append("---")
+    return out
+
+
+def _emit_codex_debug_samples_if_set(
+    args,
+    entries,
+    *,
+    command_label: str,
+) -> None:
+    """Emit the codex --debug report once per process when ``args.debug``
+    is True (issue #92).
+
+    ``entries`` is an eager ``list[CodexEntry]`` — each ``cmd_codex_*`` body
+    already loads them via ``get_codex_entries`` before this call, so unlike
+    the Claude helper there is no deferred-loader variant. Shares the
+    process-wide ``_DEBUG_REPORT_EMITTED`` guard with
+    ``_emit_debug_samples_if_set`` so a single CLI invocation emits one
+    report regardless of family.
+    """
+    global _DEBUG_REPORT_EMITTED
+    if _DEBUG_REPORT_EMITTED:
+        return
+    if not getattr(args, "debug", False):
+        return
+    sample_limit = int(getattr(args, "debug_samples", 5))
+    stats = _compute_codex_cost_stats(entries)
+    stats.command_label = command_label
+    for line in _render_codex_cost_report(stats, sample_limit):
+        eprint(line)
+    _DEBUG_REPORT_EMITTED = True
+
+
 def _usage_entry_from_joined(je) -> "UsageEntry":
     """Shape a ``_JoinedClaudeEntry`` into a ``UsageEntry`` so the §7.1
     mismatch helpers can consume both pipelines uniformly (issue #89
@@ -4555,6 +4730,7 @@ def cmd_codex_daily(args: argparse.Namespace) -> int:
     range_start, range_end = range
 
     entries = get_codex_entries(range_start, range_end)
+    _emit_codex_debug_samples_if_set(args, entries, command_label="codex-daily")
     # Route through ``build_codex_daily_view`` (issue #58). The View
     # wraps ``_aggregate_codex_daily`` without changing it — preserves
     # LiteLLM token semantics, intentional dedup vs upstream, and
@@ -4614,6 +4790,7 @@ def cmd_codex_monthly(args: argparse.Namespace) -> int:
     range_start, range_end = range
 
     entries = get_codex_entries(range_start, range_end)
+    _emit_codex_debug_samples_if_set(args, entries, command_label="codex-monthly")
     # Route through ``build_codex_monthly_view`` (issue #58).
     view = build_codex_monthly_view(
         entries, now_utc=_command_as_of(), tz_name=tz_name,
@@ -4673,6 +4850,7 @@ def cmd_codex_weekly(args: argparse.Namespace) -> int:
     week_start_idx = WEEKDAY_MAP[week_start_name]
 
     entries = get_codex_entries(range_start, range_end)
+    _emit_codex_debug_samples_if_set(args, entries, command_label="codex-weekly")
     # Route through ``build_codex_weekly_view`` (issue #58).
     view = build_codex_weekly_view(
         entries, now_utc=now_utc, tz_name=tz_name,
@@ -4733,6 +4911,7 @@ def cmd_codex_session(args: argparse.Namespace) -> int:
     range_start, range_end = range
 
     entries = get_codex_entries(range_start, range_end)
+    _emit_codex_debug_samples_if_set(args, entries, command_label="codex-session")
     # Route through ``build_codex_session_view`` (issue #58). View rows
     # come descending by last_activity (aggregator default + upstream
     # parity); --order asc reverses.
@@ -10745,6 +10924,22 @@ def build_parser() -> argparse.ArgumentParser:
             help="Display timezone: local, utc, or IANA name. Overrides "
                  "config display.tz for this call. Takes precedence over "
                  "upstream's --timezone for drop-in parity.",
+        )
+        # Issue #92: codex parity for the #89 --debug surface. Codex JSONL
+        # has no recorded costUSD to diff against, so the report is the
+        # codex variant ("Codex Pricing Debug Report": totals + top-N
+        # highest computed-cost entries), wired via
+        # _emit_codex_debug_samples_if_set in each cmd_codex_* body.
+        parser.add_argument(
+            "-d", "--debug", action="store_true",
+            help="Emit a stderr 'Codex Pricing Debug Report' (totals + "
+                 "the N highest computed-cost sample entries).",
+        )
+        parser.add_argument(
+            "--debug-samples", type=_nonneg_int, default=5, metavar="N",
+            help="Cap on top-entry sample rows in the --debug report "
+                 "(default 5; N=0 suppresses the sample block; "
+                 "negatives rejected at parse time).",
         )
 
     # -- codex-daily --
