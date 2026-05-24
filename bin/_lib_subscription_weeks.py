@@ -283,6 +283,7 @@ def _compute_subscription_weeks(
     conn: sqlite3.Connection,
     range_start: dt.datetime,
     range_end: dt.datetime,
+    config: "dict | None" = None,
 ) -> list[SubWeek]:
     """Generate the ordered list of subscription weeks overlapping [range_start, range_end].
 
@@ -291,6 +292,16 @@ def _compute_subscription_weeks(
     earliest snapshot. When no snapshots exist at all, falls back to
     config-based calendar-week boundaries with every week tagged
     "extrapolated".
+
+    ``config`` (issue #88 ``--config`` surface): the resolved config dict
+    used by the no-snapshot Case-B calendar-week fallback. When the caller
+    already loaded config honoring the per-invocation ``--config <path>``
+    override (``_load_claude_config_for_args``), it MUST pass it here so the
+    fallback's ``collector.week_start`` matches the explicit override rather
+    than re-reading (and first-run-creating) the persisted default config.
+    ``None`` preserves the legacy bare-``load_config()`` behavior for callers
+    with no ``--config`` surface (dashboard) and for the monkeypatch
+    carve-out (tests reach ``load_config`` via ``ns["load_config"]``).
 
     Anthropic's reset day-of-week is not strictly stable across long spans —
     it can shift (observed: Thursday cycles in Feb, Friday cycles from Mar
@@ -466,9 +477,16 @@ def _compute_subscription_weeks(
         return _apply_overlap_clamp_to_subweeks(weeks)
 
     # Case B: no snapshots — config-based calendar-week fallback.
-    # `load_config` stays on the _cctally() accessor per spec §3.5
-    # monkeypatch carve-out — tests reach it via ``ns["load_config"]``.
-    config = _cctally().load_config()
+    # Honor the caller's `--config <path>` override when supplied (issue
+    # #88): `cmd_weekly` / `cmd_project` pass the config resolved by
+    # `_load_claude_config_for_args` so this fallback reads the explicit
+    # path's `collector.week_start` instead of recreating / reading the
+    # persisted default. When `config is None` (dashboard, or the spec §3.5
+    # monkeypatch carve-out where tests reach `load_config` via
+    # `ns["load_config"]`), fall back to a bare `load_config()` on the
+    # `_cctally()` accessor — identical to the prior behavior.
+    if config is None:
+        config = _cctally().load_config()
     week_start_name = get_week_start_name(config)
     week_start_idx = WEEKDAY_MAP[week_start_name]
     # internal fallback: host-local intentional

@@ -1586,9 +1586,17 @@ def _emit_diff_debug_samples(args, window_a, window_b) -> None:
     if not getattr(args, "debug", False):
         return
     sample_limit = int(getattr(args, "debug_samples", 5))
-    # P2.3 (issue #89 review-loop): debug observes; diff builder syncs.
-    # Avoids the triple-sync that would otherwise fire (one per window
-    # here, plus _build_diff_result's own sync) when --sync is set.
+    # Sync intent must match `_build_diff_result` (`skip_sync=not args.sync`).
+    # Under `diff --sync --debug` the rendered diff reflects freshly-synced
+    # JSONL while these debug stats, if they skipped sync, would be computed
+    # from the STALE cache — misleading in precisely the stale-cache case
+    # `--sync` exists to fix. So honor `--sync` here too: the first
+    # `get_entries(skip_sync=False)` runs the delta ingest, and every
+    # subsequent read (the second window here + `_build_diff_result`'s own
+    # reads) is a cheap delta no-op (file size/offset unchanged) — no
+    # redundant full walk. Without `--sync`, keep skipping (debug observes
+    # the cache as-is).
+    skip_sync = not bool(getattr(args, "sync", False))
     try:
         for window, label_letter, token in (
             (window_a, "A", getattr(args, "a", "")),
@@ -1596,7 +1604,7 @@ def _emit_diff_debug_samples(args, window_a, window_b) -> None:
         ):
             try:
                 entries = get_entries(
-                    window.start, window.end, skip_sync=True,
+                    window.start, window.end, skip_sync=skip_sync,
                 )
             except (sqlite3.DatabaseError, OSError) as exc:
                 eprint(
@@ -4605,8 +4613,12 @@ def cmd_weekly(args: argparse.Namespace) -> int:
 
     # Build the subscription-week list spanning the range. Boundaries are
     # anchored in `weekly_usage_snapshots` when available and otherwise
-    # extrapolated (see `_compute_subscription_weeks`).
-    weeks = _compute_subscription_weeks(conn, range_start, range_end)
+    # extrapolated (see `_compute_subscription_weeks`). Pass the
+    # `--config`-honoring resolved config (issue #88) so the no-snapshot
+    # calendar-week fallback uses the explicit override's `week_start`.
+    weeks = _compute_subscription_weeks(
+        conn, range_start, range_end, config=config,
+    )
 
     # Fetch entries and aggregate.
     # Cover each SubWeek's full [start_ts, end_ts) on the range_start side —
@@ -5225,7 +5237,7 @@ def cmd_project(args: argparse.Namespace) -> int:
         # false, which would otherwise wrongly fall through to the Monday
         # fallback for non-Monday-reset accounts).
         current_weeks = _compute_subscription_weeks(
-            conn, now, now + dt.timedelta(microseconds=1)
+            conn, now, now + dt.timedelta(microseconds=1), config=config,
         )
         if current_weeks:
             cw_start = parse_iso_datetime(
@@ -5245,7 +5257,9 @@ def cmd_project(args: argparse.Namespace) -> int:
     # Pre-compute subscription-week bounds for the query window so each entry
     # can be bucketed onto a canonical subscription-week start_ts. Mirrors
     # `_aggregate_weekly`'s bisect pattern (first-match-wins on overlap).
-    subweeks = _compute_subscription_weeks(conn, since_dt, until_dt)
+    subweeks = _compute_subscription_weeks(
+        conn, since_dt, until_dt, config=config,
+    )
     parsed_bounds: list[tuple[dt.datetime, dt.datetime]] = []
     for sw in subweeks:
         s_dt = parse_iso_datetime(sw.start_ts, "week.start_ts").astimezone(dt.timezone.utc)
@@ -5911,8 +5925,17 @@ def cmd_session(args: argparse.Namespace) -> int:
         # sub-rows aren't in the share spec scope). Same convention as
         # cmd_daily / cmd_project.
         display_tz_str = _share_display_tz_label(tz)
+        # Session A (spec §7.4): `_build_session_snapshot` reads
+        # `view.aggregated`, so the `--id` filter applied to the local
+        # `sessions` list above would otherwise be ignored for share
+        # exports (HTML/Markdown/SVG). Hand the builder a view whose
+        # `aggregated` is the filtered list so `--id` is honored across
+        # every output path. The builder reads only `aggregated` (never
+        # `rows` / `total_sessions`), so the parallel-tuple mismatch from
+        # the replace is inert here.
+        share_view = dataclasses.replace(view, aggregated=tuple(sessions))
         snap = _build_session_snapshot(
-            view,
+            share_view,
             period_start=range_start,
             period_end=range_end,
             display_tz=display_tz_str,

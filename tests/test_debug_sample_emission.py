@@ -925,11 +925,52 @@ class TestDiffDebugSamples:
         assert len(captured_calls) == 2
         assert captured_calls[0][0] == wa.start
         assert captured_calls[1][0] == wb.start
-        # P2.3 (issue #89 review-loop): the debug helper observes; the
-        # diff builder does the sync. So skip_sync must be True for both
-        # windows regardless of args.sync (would otherwise triple-sync).
+        # Without --sync, the debug helper observes the cache as-is (no
+        # ingest): skip_sync stays True for both windows.
         for _, _, kwargs in captured_calls:
             assert kwargs.get("skip_sync") is True
+
+    def test_sync_flag_propagates_to_debug_reads(self, monkeypatch):
+        """Codex review (round 1): under `diff --sync --debug` the debug
+        helper MUST run the same ingest as `_build_diff_result`
+        (`skip_sync=not args.sync`) so its pricing-mismatch stats reflect
+        the freshly-synced JSONL the rendered diff shows — otherwise the
+        debug report is computed from the STALE cache, misleading in
+        exactly the case `--sync` exists to fix. The first read runs the
+        delta ingest; subsequent reads (second window + the builder) are
+        cheap delta no-ops, so this is not a problematic triple full-walk.
+        """
+        mod = _load_cctally_module()
+        monkeypatch.setattr(mod, "_DEBUG_REPORT_EMITTED", False)
+        captured_calls = []
+        def fake_get_entries(start, end, **kwargs):
+            captured_calls.append((start, end, kwargs))
+            return []
+        monkeypatch.setattr(mod, "get_entries", fake_get_entries)
+        class _W:
+            def __init__(self, start, end, token):
+                self.start = start
+                self.end = end
+                self.token = token
+        import datetime as dt
+        wa = _W(dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
+                "last-week")
+        wb = _W(dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 5, 15, tzinfo=dt.timezone.utc),
+                "this-week")
+        ns = argparse.Namespace(
+            debug=True, debug_samples=5, sync=True,
+            a="last-week", b="this-week",
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            mod._emit_diff_debug_samples(ns, wa, wb)
+        assert len(captured_calls) == 2
+        # --sync set → skip_sync False for both windows (matches the
+        # builder's `skip_sync=not args.sync`).
+        for _, _, kwargs in captured_calls:
+            assert kwargs.get("skip_sync") is False
 
 
 # Review-loop tests (issue #89 review round, all P1/P2/P3 + SR-P2 gaps)

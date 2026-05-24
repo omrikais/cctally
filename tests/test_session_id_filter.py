@@ -190,6 +190,60 @@ def test_id_without_args_returns_all(patched_session):
     assert len(sessions) == 2
 
 
+def test_filter_applies_to_share_export(cctally_mod, monkeypatch):
+    """Codex review (round 1): `session --id X --format ...` must export
+    ONLY the matching session. The terminal/JSON paths filter the local
+    `sessions` list, but the share builder reads `view.aggregated`, so
+    `cmd_session` must hand it a view whose `aggregated` is the filtered
+    list — otherwise `--id` is silently ignored for HTML/Markdown/SVG.
+
+    Uses a real `SessionsView` (frozen dataclass) so the
+    `dataclasses.replace(view, aggregated=...)` in `cmd_session` works,
+    and intercepts `_build_session_snapshot` to assert the view it
+    receives carries only the filtered session.
+    """
+    mod = cctally_mod
+    sid_a = "session-a-uuid-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    sid_b = "session-b-uuid-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    sess_a = _fake_session(mod, session_id=sid_a, project_path="proj-a")
+    sess_b = _fake_session(mod, session_id=sid_b, project_path="proj-b", cost=2.0)
+
+    real_view = mod._lib_view_models.SessionsView(
+        rows=(),
+        aggregated=(sess_b, sess_a),
+        total_sessions=2,
+        total_cost_usd=3.0,
+    )
+    monkeypatch.setattr(mod, "get_claude_session_entries",
+                        lambda start, end: [])
+    monkeypatch.setattr(mod, "build_sessions_view",
+                        lambda *a, **kw: real_view)
+    monkeypatch.setattr(mod, "_share_validate_args", lambda args: None)
+    monkeypatch.setattr(
+        mod, "_command_as_of",
+        lambda: dt.datetime(2026, 2, 1, 12, 0, tzinfo=dt.timezone.utc),
+    )
+
+    captured = {}
+
+    def fake_build_session_snapshot(view, **kwargs):
+        captured["aggregated"] = tuple(view.aggregated)
+        return SimpleNamespace()  # value only forwarded to the stubbed emitter
+
+    monkeypatch.setattr(mod, "_build_session_snapshot",
+                        fake_build_session_snapshot)
+    monkeypatch.setattr(mod, "_share_render_and_emit", lambda snap, args: None)
+
+    args = _make_args(mod, id=sid_a, format="md")
+    rc, _, stderr = _capture(lambda: mod.cmd_session(args))
+    assert rc == 0, stderr
+    # The builder must see ONLY the filtered session.
+    assert "aggregated" in captured, "snapshot builder was not invoked"
+    agg = captured["aggregated"]
+    assert len(agg) == 1
+    assert agg[0].session_id == sid_a
+
+
 def test_id_subprocess_short_flag_parses(tmp_path, monkeypatch):
     """Smoke: `cctally session -i <unknown> --json` on an empty home
     parses cleanly and exits 0 with an empty sessions list.
