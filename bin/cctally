@@ -909,6 +909,17 @@ def _migrate_legacy_data_dir() -> None:
     Removable in a future major version once early users have been on
     cctally long enough that the legacy dir is gone everywhere.
     """
+    # Dev-instance isolation (F2): the legacy ccusage-subscription rename is a
+    # PROD-only concern. Skip it whenever the data dir was relocated away from
+    # the canonical prod path — i.e. dev-checkout auto-detect (DEV_MODE) or an
+    # explicit CCTALLY_DATA_DIR override — so a dev run (APP_DIR = cctally-dev)
+    # or a per-branch override never hijacks the one-shot move into the wrong
+    # dir. "not DEV_MODE and not CCTALLY_DATA_DIR" is exactly the prod-default
+    # resolution branch, i.e. APP_DIR == ~/.local/share/cctally. Under the test
+    # suppressor DEV_MODE is False and the existing migration tests (which pin
+    # APP_DIR directly, no override) still exercise the move.
+    if _cctally_core.DEV_MODE or os.environ.get("CCTALLY_DATA_DIR", "").strip():
+        return
     if _cctally_core.APP_DIR.exists():
         return  # already migrated, or fresh install at the new path
     if not _cctally_core.LEGACY_APP_DIR.exists():
@@ -11457,6 +11468,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip confirmations")
     sp.add_argument("--json", action="store_true",
                     help="Emit machine-readable output")
+    sp.add_argument("--force-dev", action="store_true", dest="force_dev",
+                    help="Allow setup to run from a dev checkout (writes "
+                         "dev-pointing hooks into ~/.claude/settings.json)")
     # Legacy bespoke-hook migration flags (install-mode only — see cmd_setup
     # post-parse validation). Spec Section 2 mode×flag matrix.
     mig_group = sp.add_mutually_exclusive_group()
@@ -13504,10 +13518,12 @@ def main(argv: list[str] | None = None) -> int:
     # works without a subcommand (`cctally --version`).
     if getattr(args, "version", False):
         v = _lib_changelog._read_latest_changelog_version()
-        if v is None:
-            print("cctally unknown")
-        else:
-            print(f"cctally {v[0]}")
+        base = "cctally unknown" if v is None else f"cctally {v[0]}"
+        # Dev-instance isolation (§4): append the dev marker + resolved data
+        # dir when DEV_MODE is set. Prod output is unchanged.
+        if _cctally_core.DEV_MODE:
+            base += f" (dev — {_cctally_core.APP_DIR})"
+        print(base)
         return 0
     if not getattr(args, "func", None):
         parser.error("a subcommand is required")

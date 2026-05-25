@@ -825,3 +825,91 @@ class TestLegacyMigrationE2EBackupDirFail:
 # ``TestSetupArgparseMutex.test_mutex_rejects_both_migrate_flags`` above
 # (subprocess invocation, exit 2, stderr matches argparse's mutex
 # message). No new test added — keeping this one source of truth.
+
+
+def _make_repo_with_git(tmp_path):
+    """A fake repo root whose .git is a directory (main checkout).
+
+    Idempotent: _repo_root is invoked on every _is_dev_checkout() call, so
+    this lambda body may run several times per test — exist_ok avoids a
+    FileExistsError on the 2nd+ invocation."""
+    root = tmp_path / "repo"
+    (root / ".git").mkdir(parents=True, exist_ok=True)
+    return root
+
+
+class TestSetupDevCheckoutGuard:
+    """Dev-instance isolation §3: cmd_setup refuses to run from a git
+    checkout (install AND uninstall) unless --force-dev. Keyed on
+    _is_dev_checkout(), NOT DEV_MODE — so a CCTALLY_DATA_DIR override
+    relocates the data dir but does NOT disarm the hook-write guard (F1).
+    """
+
+    def _arrange_checkout(self, monkeypatch, tmp_path):
+        """Clear the suppressor + point _repo_root at a .git dir so
+        _is_dev_checkout() reads True. Returns the seeded fake HOME."""
+        monkeypatch.delenv("CCTALLY_DISABLE_DEV_AUTODETECT", raising=False)
+        monkeypatch.setattr(_cctally_core, "_repo_root",
+                            lambda: _make_repo_with_git(tmp_path))
+        home = tmp_path / "home"
+        _e2e_seed_legacy_state(home)
+        return home
+
+    def test_install_refused_in_dev_checkout(self, ns, monkeypatch, tmp_path):
+        home = self._arrange_checkout(monkeypatch, tmp_path)
+        _e2e_pin_paths(ns, monkeypatch, home)
+        assert _cctally_core._is_dev_checkout() is True
+        settings_path = home / ".claude" / "settings.json"
+        before = settings_path.read_text()
+        err_buf = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", err_buf)
+
+        rc = ns["cmd_setup"](_e2e_install_args(force_dev=False))
+
+        assert rc == 2
+        assert "refusing to run from a dev checkout" in err_buf.getvalue()
+        assert settings_path.read_text() == before  # byte-unchanged
+
+    def test_install_refusal_not_disarmed_by_data_dir_override(
+        self, ns, monkeypatch, tmp_path
+    ):
+        """F1 regression: CCTALLY_DATA_DIR relocates the data dir (DEV_MODE
+        False) but the guard still fires because it keys on the checkout."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("CCTALLY_DATA_DIR", str(tmp_path / "branch-x"))
+        home = self._arrange_checkout(monkeypatch, tmp_path)
+        _e2e_pin_paths(ns, monkeypatch, home)
+        _cctally_core._init_paths_from_env()
+        assert _cctally_core.DEV_MODE is False            # override won
+        assert _cctally_core._is_dev_checkout() is True   # still a checkout
+        settings_path = home / ".claude" / "settings.json"
+        before = settings_path.read_text()
+
+        rc = ns["cmd_setup"](_e2e_install_args(force_dev=False))
+
+        assert rc == 2
+        assert settings_path.read_text() == before
+
+    def test_uninstall_refused_in_dev_checkout(self, ns, monkeypatch, tmp_path):
+        home = self._arrange_checkout(monkeypatch, tmp_path)
+        _e2e_pin_paths(ns, monkeypatch, home)
+        settings_path = home / ".claude" / "settings.json"
+        before = settings_path.read_text()
+
+        rc = ns["cmd_setup"](_e2e_install_args(uninstall=True, force_dev=False))
+
+        assert rc == 2
+        assert settings_path.read_text() == before  # uninstall did not strip
+
+    def test_force_dev_bypasses_guard(self, ns, monkeypatch, tmp_path):
+        """--force-dev lets setup proceed from a checkout. Use --dry-run so
+        the proceed path is observable (rc 0) without mutating settings."""
+        home = self._arrange_checkout(monkeypatch, tmp_path)
+        _e2e_pin_paths(ns, monkeypatch, home)
+        assert _cctally_core._is_dev_checkout() is True
+
+        rc = ns["cmd_setup"](
+            _e2e_install_args(dry_run=True, force_dev=True)
+        )
+
+        assert rc == 0  # guard bypassed; dry-run reports without refusing

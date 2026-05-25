@@ -82,3 +82,31 @@ def test_suppressor_beats_git(core, monkeypatch, tmp_path):
     core._init_paths_from_env()
     assert core.APP_DIR == tmp_path / ".local" / "share" / "cctally"
     assert core.DEV_MODE is False
+
+
+def test_version_marker_in_dev_mode(core, monkeypatch, tmp_path, capsys):
+    from conftest import load_script
+    ns = load_script()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CCTALLY_DISABLE_DEV_AUTODETECT", raising=False)
+    monkeypatch.setattr(core, "_repo_root", lambda: _git_dir(tmp_path))
+    core._init_paths_from_env()
+    assert core.DEV_MODE is True
+    rc = ns["main"](["--version"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "(dev" in out and "cctally-dev" in out
+
+
+def test_version_marker_absent_in_prod(core, monkeypatch, tmp_path, capsys):
+    from conftest import load_script
+    ns = load_script()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CCTALLY_DISABLE_DEV_AUTODETECT", "1")
+    monkeypatch.setattr(core, "_repo_root", lambda: _git_dir(tmp_path))
+    core._init_paths_from_env()
+    assert core.DEV_MODE is False
+    rc = ns["main"](["--version"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "(dev" not in out and "cctally-dev" not in out

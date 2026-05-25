@@ -84,3 +84,80 @@ def test_atomicity_with_nested_files(tmp_path, monkeypatch):
     assert (new / "config.json").read_text() == '{"ws":"monday"}'
     assert (new / "stats.db").read_text() == "db-bytes"
     assert (new / "logs" / "out.log").read_text() == "logline"
+
+
+def _make_repo_with_git(tmp_path):
+    """A fake repo root whose .git is a directory (main checkout).
+
+    Idempotent (exist_ok): _repo_root is invoked on every _is_dev_checkout()
+    call, so this lambda body may run more than once per test."""
+    root = tmp_path / "repo"
+    (root / ".git").mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def test_legacy_migration_skipped_in_dev_mode(monkeypatch, tmp_path):
+    """In dev mode the legacy ccusage-subscription dir must NOT be renamed
+    into cctally-dev — the rename only targets the canonical prod path (F2)."""
+    ns = load_script()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CCTALLY_DISABLE_DEV_AUTODETECT", raising=False)
+    monkeypatch.delenv("CCTALLY_DATA_DIR", raising=False)
+    monkeypatch.setattr(_cctally_core, "_repo_root",
+                        lambda: _make_repo_with_git(tmp_path))  # .git present
+    _cctally_core._init_paths_from_env()
+    assert _cctally_core.DEV_MODE is True
+    assert _cctally_core.APP_DIR == tmp_path / ".local" / "share" / "cctally-dev"
+    legacy = tmp_path / ".local" / "share" / "ccusage-subscription"
+    legacy.mkdir(parents=True)
+    (legacy / "stats.db").write_text("x")
+
+    ns["_migrate_legacy_data_dir"]()
+
+    assert legacy.exists()                       # NOT moved
+    assert not _cctally_core.APP_DIR.exists()    # cctally-dev not created from it
+
+
+def test_legacy_migration_skipped_with_data_dir_override(monkeypatch, tmp_path):
+    """An explicit CCTALLY_DATA_DIR must also skip the legacy rename — the
+    one-shot move targets only the canonical prod path."""
+    ns = load_script()
+    target = tmp_path / "custom" / "dir"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CCTALLY_DATA_DIR", str(target))
+    monkeypatch.delenv("CCTALLY_DISABLE_DEV_AUTODETECT", raising=False)
+    monkeypatch.setattr(_cctally_core, "_repo_root",
+                        lambda: _make_repo_with_git(tmp_path))
+    _cctally_core._init_paths_from_env()
+    assert _cctally_core.APP_DIR == target
+    assert _cctally_core.DEV_MODE is False
+    legacy = tmp_path / ".local" / "share" / "ccusage-subscription"
+    legacy.mkdir(parents=True)
+    (legacy / "stats.db").write_text("x")
+
+    ns["_migrate_legacy_data_dir"]()
+
+    assert legacy.exists()           # NOT moved
+    assert not target.exists()       # custom dir not created from legacy
+
+
+def test_legacy_migration_fires_at_canonical_prod_path(monkeypatch, tmp_path):
+    """Sanity: with suppressor on (prod layout under fake HOME) the rename
+    still fires — APP_DIR equals the canonical prod path."""
+    ns = load_script()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CCTALLY_DISABLE_DEV_AUTODETECT", "1")
+    monkeypatch.delenv("CCTALLY_DATA_DIR", raising=False)
+    monkeypatch.setattr(_cctally_core, "_repo_root",
+                        lambda: _make_repo_with_git(tmp_path))
+    _cctally_core._init_paths_from_env()
+    assert _cctally_core.APP_DIR == tmp_path / ".local" / "share" / "cctally"
+    assert _cctally_core.DEV_MODE is False
+    legacy = tmp_path / ".local" / "share" / "ccusage-subscription"
+    legacy.mkdir(parents=True)
+    (legacy / "stats.db").write_text("x")
+
+    ns["_migrate_legacy_data_dir"]()
+
+    assert not legacy.exists()                       # moved
+    assert (_cctally_core.APP_DIR / "stats.db").read_text() == "x"

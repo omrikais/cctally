@@ -77,6 +77,19 @@ from _cctally_core import (
 )
 
 
+# Dev-instance isolation (§3): refusal message when `cctally setup` is run
+# from a git checkout without --force-dev. {data_dir} is the resolved
+# APP_DIR for context (cctally-dev in plain dev mode, the override path if
+# CCTALLY_DATA_DIR was set — the guard keys on _is_dev_checkout(), not the
+# data dir, so the override still cannot rewrite prod's hooks).
+_DEV_SETUP_REFUSAL_MSG = (
+    "cctally setup: refusing to run from a dev checkout (data dir: {data_dir}).\n"
+    "This would rewrite the hooks in ~/.claude/settings.json that point at your\n"
+    "installed (prod) cctally. Run setup from the installed binary instead, or\n"
+    "pass --force-dev to override (e.g. to install dev-pointing hooks on purpose)."
+)
+
+
 # ── settings.json hook surgery ─────────────────────────────────────────
 
 
@@ -1818,6 +1831,18 @@ def _setup_install(args: argparse.Namespace) -> int:
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
+    # Dev-instance isolation (§3): refuse BOTH install and uninstall when run
+    # from a git checkout, unless --force-dev. setup rewrites ~/.claude/
+    # settings.json (prod's hooks), which is NOT under APP_DIR — from the dev
+    # checkout this would repoint prod's hooks at the dev binary or remove
+    # them. Keyed on _is_dev_checkout() (NOT DEV_MODE / the cctally-dev path
+    # string), so a per-branch CCTALLY_DATA_DIR override relocates the data
+    # dir but still cannot rewrite prod's hooks (the F1 fix). The test
+    # suppressor forces _is_dev_checkout() False, so the setup tests +
+    # golden harness behave exactly like prod.
+    if _cctally_core._is_dev_checkout() and not getattr(args, "force_dev", False):
+        eprint(_DEV_SETUP_REFUSAL_MSG.format(data_dir=_cctally_core.APP_DIR))
+        return 2
     # Migration flags are install-mode-only. Reject combinations with
     # --status or --uninstall (per spec Section 2 mode×flag matrix). The
     # mutex group on the parser already prevents both flags being set
