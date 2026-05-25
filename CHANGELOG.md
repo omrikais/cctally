@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **`cctally session` `totalTokens` (the table column, the `--breakdown` per-model sub-rows, and the `--json` per-session + `totals` fields) now sums all four token components — input + output + cache create + cache read — matching `daily`/`monthly` and upstream `ccusage` v20.** Previously it counted input + output only (the original Spec A2.8 convention), which left the session roll-up ~99% below `ccusage` v20 even though the four component token fields and cost already matched within rounding. The `--json` `totalTokens` field name and shape are unchanged — only the value widened to include cache, so a consumer that previously read it as input+output will now see the cache-inclusive figure. `codex-session` deliberately keeps input + output because Codex `inputTokens` is already cache-inclusive (LiteLLM convention), so it already reports the same "all tokens processed" total. (#104)
+
+### Fixed
+- **`cctally codex-session` no longer misaligns its table on narrow terminals (including the default 120-column width) or under `--compact`.** On any terminal narrower than the table's natural width the scale-down branch could shrink a column below its header-label width, and headers like `Reasoning`, `Cache Read`, `Total Tokens` and `Last Activity` are padded — never truncated — in the header render, so the header row grew wider than the box border and the grid broke. Column widths now mirror the `session` and `project` tables via the shared scale-down policy: numeric columns keep their full value (never ellipsis-truncated), header and text labels ellipsize to fit, and every box-drawing line shares one width. (#99)
+
 ## [1.13.0] - 2026-05-25
 
 ### Added
