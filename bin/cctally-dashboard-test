@@ -43,6 +43,16 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$REPO_ROOT/bin/cctally"
 FIX_DIR="$REPO_ROOT/tests/fixtures/dashboard"
 
+# Robust golden comparison (issue #106/#107): ONE `diff` over real files
+# drives both the verdict and the displayed bytes — no `<(process
+# substitution)`, whose transient /dev/fd setup failure under heavy
+# parallel CI load made `diff` exit 2. (This harness piped the diff to
+# `>&2` *before* the FAIL line; the helper also fixes that ordering by
+# printing the FAIL line first, then the diff.) export -f'd below so the
+# xargs `bash -c` workers resolve the helpers.
+# shellcheck source=bin/_lib-golden-diff.sh
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
 default_jobs() {
     local n
     n=$(sysctl -n hw.ncpu 2>/dev/null) || n=$(nproc 2>/dev/null) || n=4
@@ -200,6 +210,9 @@ _run_scenario_inner () {
     local scratch_home="$SCRATCH_ROOT/$name"
     mkdir -p "$scratch_home"
     cp -R "$dir/.local" "$scratch_home/"
+    # Golden-diff helpers materialize temp compare files here; cleaned with
+    # $SCRATCH_ROOT on harness exit.
+    local GOLDEN_DIFF_TMPDIR="$scratch_home"
     # shellcheck disable=SC2086
     CCTALLY_AS_OF="$as_of" HOME="$scratch_home" TZ=Etc/UTC \
         "$BIN" dashboard --port 0 --no-browser --no-sync \
@@ -300,10 +313,11 @@ _run_scenario_inner () {
             printf '%s\n' "$actual" > "$golden"
             echo "WROTE $name golden: $golden"
         else
-            if ! diff -u "$golden" <(printf '%s\n' "$actual") >&2; then
-                echo "FAIL $name: /api/data diverged from golden"
-                ok=0
-            fi
+            # golden-data.json ends in \n (written via `printf '%s\n'`); the
+            # helper materializes the actual the same way. 5000-line cap keeps
+            # the prior effectively-unlimited full-diff behavior (largest
+            # golden is ~2.5k lines) while still surfacing the whole divergence.
+            _golden_diff_str "/api/data" "$golden" "$actual" 5000 || ok=0
         fi
     fi
 
@@ -372,10 +386,9 @@ _run_scenario_inner () {
                 printf '%s\n' "$sess_actual" > "$session_golden"
                 echo "WROTE $name session golden: $session_golden"
             else
-                if ! diff -u "$session_golden" <(printf '%s\n' "$sess_actual") >&2; then
-                    echo "FAIL $name: /api/session diverged from golden"
-                    ok=0
-                fi
+                # golden-session.json ends in \n (written via `printf '%s\n'`);
+                # the helper materializes the actual the same way.
+                _golden_diff_str "/api/session" "$session_golden" "$sess_actual" 5000 || ok=0
             fi
         fi
     fi
@@ -483,6 +496,8 @@ run_scenario () {
 # to the old sequential version.
 fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override)
 export -f _run_scenario_inner run_scenario normalize_json normalize_session_json
+# Golden-diff helpers must reach the xargs `bash -c` subshells too.
+export -f _golden_diff_files _golden_diff_str _golden_diff_two_str
 export FIX_DIR BIN SCRATCH_ROOT
 
 printf '%s\n' "${fixture_scenarios[@]}" \
