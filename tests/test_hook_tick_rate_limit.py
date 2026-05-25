@@ -69,6 +69,33 @@ def test_hook_tick_fetches_when_snapshot_older_than_throttle(ns, monkeypatch, tm
     assert payload == api
 
 
+def test_hook_tick_five_hour_inactive_null_resets(ns, monkeypatch, tmp_path):
+    """Inactive 5h window (`five_hour.resets_at: null`) must not crash the hook
+    OAuth path with AttributeError from _iso_to_epoch(None); 5h is dropped and
+    the 7d record still lands. Parallel to the _refresh_usage_inproc regression."""
+    from conftest import redirect_paths
+    redirect_paths(ns, monkeypatch, tmp_path)
+    monkeypatch.setitem(ns, "load_config", lambda: {})
+    monkeypatch.setitem(ns, "_resolve_oauth_token", lambda *a, **kw: "tok")
+    monkeypatch.setitem(ns, "_newest_snapshot_age_seconds", lambda: 30.0)
+
+    captured = {}
+    monkeypatch.setitem(ns, "cmd_record_usage",
+                        lambda args: captured.update(vars(args)) or 0)
+
+    api = {
+        "seven_day": {"utilization": 22.0, "resets_at": "2026-05-02T12:00:00Z"},
+        "five_hour": {"utilization": 0, "resets_at": None},
+    }
+    monkeypatch.setitem(ns, "_fetch_oauth_usage",
+                        lambda token, timeout_seconds: api)
+
+    status, payload = ns["_hook_tick_oauth_refresh"]()
+    assert status == "ok(7d=22)"
+    assert captured["five_hour_percent"] is None
+    assert captured["five_hour_resets_at"] is None
+
+
 def test_hook_tick_fetches_when_no_snapshot_exists(ns, monkeypatch, tmp_path):
     """_newest_snapshot_age_seconds returning None -> fetch attempted
     (no skip, since we have no fresh data to gate on)."""

@@ -577,7 +577,12 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
     five_resets_iso = None
     five_resets_epoch = None
     warnings: list = []
-    if five is not None and "utilization" in five and "resets_at" in five:
+    # An inactive 5h window arrives as `resets_at: null` (key present, value
+    # null). Require a string here — mirrors the seven_day guard in
+    # _fetch_oauth_usage — so _iso_to_epoch(None) can't raise AttributeError;
+    # a malformed (non-null) string still degrades via the except below.
+    if (five is not None and "utilization" in five
+            and isinstance(five.get("resets_at"), str)):
         try:
             five_pct = c._normalize_percent(float(five["utilization"]))
             five_resets_iso = five["resets_at"]
@@ -778,7 +783,12 @@ def _hook_tick_oauth_refresh(
     five = api.get("five_hour") if isinstance(api.get("five_hour"), dict) else None
     five_pct: float | None = None
     five_resets_epoch: int | None = None
-    if five is not None and "utilization" in five and "resets_at" in five:
+    # An inactive 5h window arrives as `resets_at: null` (key present, value
+    # null). Require a string here — mirrors the seven_day guard in
+    # _fetch_oauth_usage — so _iso_to_epoch(None) can't raise AttributeError;
+    # a malformed (non-null) string still degrades via the except below.
+    if (five is not None and "utilization" in five
+            and isinstance(five.get("resets_at"), str)):
         try:
             five_pct = c._normalize_percent(float(five["utilization"]))
             five_resets_epoch = _iso_to_epoch(five["resets_at"])
