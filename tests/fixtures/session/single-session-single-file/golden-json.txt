@@ -16,7 +16,7 @@
       "cacheCreationTokens": 0,
       "cacheReadTokens": 50000,
       "outputTokens": 70000,
-      "totalTokens": 770000,
+      "totalTokens": 820000,
       "totalCost": 4.9750000000000005,
       "modelBreakdowns": [
         {
@@ -43,7 +43,7 @@
     "cacheCreationTokens": 0,
     "cacheReadTokens": 50000,
     "outputTokens": 70000,
-    "totalTokens": 770000,
+    "totalTokens": 820000,
     "totalCost": 4.9750000000000005
   }
 }

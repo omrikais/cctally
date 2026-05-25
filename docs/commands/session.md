@@ -47,6 +47,22 @@ The `Directory` column shows the most-recent project if the resume
 crossed `cwd`s. The JSON output's `sourcePaths` array preserves the
 full list of files.
 
+## Token totals
+
+`Total Tokens` (the table column, the per-model `--breakdown` sub-rows,
+and the JSON `totalTokens` field — both per-session and the `totals`
+roll-up) sums **all four** token components: `input + output +
+cacheCreation + cacheRead`. This matches [`daily`](daily.md) /
+[`monthly`](monthly.md) and upstream `ccusage` v20 (issue #104). The
+JSON field name and shape are unchanged — only the value widened to
+include cache, so a consumer that previously read `totalTokens` as
+input+output will now see the cache-inclusive figure.
+
+[`codex-session`](codex-session.md) reports the same "all tokens
+processed" semantic, but its surface formula stays `input + output`
+because Codex `inputTokens` is already cache-inclusive (LiteLLM
+convention) — adding cache there would double-count.
+
 ## Gotchas
 
 - **`session_files` is populated lazily.** On the first command run

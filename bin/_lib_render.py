@@ -1006,12 +1006,17 @@ def _codex_sessions_to_json(sessions: list[CodexSessionUsage]) -> str:
 
 
 def _claude_sessions_to_json(sessions: list[ClaudeSessionUsage]) -> str:
-    """Serialize Claude sessions to JSON per spec A2.8.
+    """Serialize Claude sessions to JSON (spec A2.8, amended by issue #104).
 
     Per-session: sessionId, projectPath, sourcePaths (list), firstActivity
     / lastActivity ISO strings, modelsUsed, token counts
     (input/cacheCreation/cacheRead/output/total), totalCost, modelBreakdowns
     (camelCased token field names, cost).
+
+    `totalTokens` (per-session + totals) sums ALL four token components
+    (input + output + cacheCreation + cacheRead) per issue #104 — matching
+    `daily`/`monthly` and ccusage v20. (The field name/shape is unchanged;
+    only the value definition widened to include cache.)
 
     totals: same 6 numeric fields aggregated across sessions.
     """
@@ -2281,9 +2286,10 @@ def _render_claude_session_table(
     for s in sessions:
         short_models = sorted({_short_model_name(m) for m in s.models})
         models_text = "\n".join(f"- {m}" for m in short_models) if short_models else ""
-        # Spec A2.8: Total Tokens = input + output (cache shown separately,
-        # not summed). Parallels `_render_codex_session_table` line ~4644.
-        session_total = s.input_tokens + s.output_tokens
+        # Issue #104: Total Tokens = all four components (input + output +
+        # cache), matching daily/monthly + ccusage v20. Read the single
+        # source of truth on the aggregate rather than recomputing.
+        session_total = s.total_tokens
         data_cells = [
             (_date_cell(s.last_activity), None),
             (s.project_path, None),
@@ -2306,8 +2312,8 @@ def _render_claude_session_table(
                 mb_cc = int(mb["cache_create"])
                 mb_cr = int(mb["cache_read"])
                 mb_output = int(mb["output"])
-                # Spec A2.8: Total Tokens = input + output only.
-                mb_total = mb_input + mb_output
+                # Issue #104: per-model Total Tokens sums all four components.
+                mb_total = mb_input + mb_output + mb_cc + mb_cr
                 mb_cost = float(mb["cost"])
                 bd_cells = [
                     (f"{arrow} {name}", _gray),
@@ -2328,8 +2334,8 @@ def _render_claude_session_table(
     tot_cc = sum(s.cache_creation_tokens for s in sessions)
     tot_cr = sum(s.cache_read_tokens for s in sessions)
     tot_output = sum(s.output_tokens for s in sessions)
-    # Spec A2.8: Total Tokens = input + output only.
-    tot_tokens = tot_input + tot_output
+    # Issue #104: Total Tokens footer sums all four components.
+    tot_tokens = sum(s.total_tokens for s in sessions)
     tot_cost = sum(s.cost_usd for s in sessions)
     footer_cells = [
         ("Total", _yellow),

@@ -590,7 +590,13 @@ def _aggregate_codex_sessions(entries: list[CodexEntry]) -> list[CodexSessionUsa
             cached_input_tokens=s["cached_input"],
             output_tokens=s["output"],
             reasoning_output_tokens=s["reasoning"],
-            total_tokens=s["input"] + s["output"],  # derived, matches upstream
+            # Codex `input` is cache-inclusive (LiteLLM convention; see the
+            # "Codex token semantics" gotcha in CLAUDE.md) and `output`
+            # subsumes reasoning, so `input + output` already counts ALL
+            # tokens processed — the same "all tokens" semantic the Claude
+            # session roll-up reaches via input+output+cache (issue #104).
+            # Adding cache here would double-count. Matches upstream.
+            total_tokens=s["input"] + s["output"],
             cost_usd=s["cost"],
             models=list(s["models_order"]),
             model_breakdowns=model_breakdowns,
@@ -695,10 +701,17 @@ def _aggregate_claude_sessions(
             [sess["models"][m] for m in sess["models_order"]],
             key=lambda mb: -mb["cost"],
         )
-        # Spec A2.8 (design.md:422): Total Tokens = input + output only;
-        # cache tokens shown separately but not summed — parallels
-        # `codex-session` (see `_codex_sessions_to_json`, line ~3603).
-        total_tokens = sess["input"] + sess["output"]
+        # Issue #104: Total Tokens sums ALL four components (input + output
+        # + cache create + cache read), matching `daily`/`monthly` and
+        # upstream ccusage v20. (Supersedes the original Spec A2.8
+        # input+output-only convention.) The `codex-session` parallel is
+        # preserved at the SEMANTIC level — both report "all tokens
+        # processed" — even though its surface formula stays `input+output`
+        # (Codex `input_tokens` is already cache-inclusive; see line ~593).
+        total_tokens = (
+            sess["input"] + sess["output"]
+            + sess["cache_create"] + sess["cache_read"]
+        )
         results.append(ClaudeSessionUsage(
             session_id=sess["session_id"],
             project_path=sess["project_path"],

@@ -51,6 +51,12 @@ for dir in "$HARNESS_FIXTURES_DIR"/*/; do
     if [ -f "$dir/golden-desc.txt" ]; then
         run_mode "$name" "desc" "--order desc" "desc"
     fi
+    # Opt-in per-fixture --breakdown mode (issue #104): asserts the
+    # per-model sub-row Total Tokens column sums all four components
+    # (input + output + cache). Only fixtures with golden-breakdown.txt.
+    if [ -f "$dir/golden-breakdown.txt" ]; then
+        run_mode "$name" "breakdown" "--breakdown" "breakdown"
+    fi
 done
 
 echo "----"
