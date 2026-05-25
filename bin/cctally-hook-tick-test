@@ -16,6 +16,9 @@
 # file. Works identically on macOS and Linux.
 set -uo pipefail
 
+# Dev-instance isolation: force prod data-dir layout under fake HOME.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+
 HARNESS_BIN="$(cd "$(dirname "$0")" && pwd)/cctally"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FIXTURES_DIR="$REPO_ROOT/tests/fixtures/hook-tick"

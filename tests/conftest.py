@@ -4,11 +4,20 @@ Loads the main script (which has no .py extension and is not a
 package) into a throwaway namespace so tests can exercise its
 internals without running the CLI.
 """
+import os
 import pathlib
 import sys
 import types
 
 import pytest
+
+# Dev-instance isolation (2026-05-26): force dev-checkout auto-detect OFF
+# for the whole pytest process. Set at conftest import — earlier than any
+# fixture — so the import-time _init_paths_from_env() in _cctally_core and
+# every load_script() reload resolve the prod data-dir layout under the
+# per-test fake HOME, not the cctally-dev layout. setdefault so an explicit
+# env value (a test that WANTS to exercise auto-detect) still wins.
+os.environ.setdefault("CCTALLY_DISABLE_DEV_AUTODETECT", "1")
 
 
 def _script_path() -> pathlib.Path:

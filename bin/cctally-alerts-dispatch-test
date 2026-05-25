@@ -17,6 +17,9 @@
 
 set -uo pipefail
 
+# Dev-instance isolation: force prod data-dir layout under fake HOME.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+
 cd "$(dirname "$0")/.."
 
 pass_count=0

@@ -14,6 +14,9 @@
 
 set -uo pipefail
 
+# Dev-instance isolation: force prod data-dir layout under fake HOME.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Absolute path: the python3 -c subshells below pass $BIN to
 # SourceFileLoader, which resolves relative paths against the subshell's

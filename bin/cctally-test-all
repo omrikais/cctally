@@ -24,6 +24,12 @@ default_jobs() {
 }
 JOBS=${CCTALLY_TEST_JOBS:-$(default_jobs)}
 
+# Backstop: also export for the whole suite run so any harness that somehow
+# lacks the preamble still behaves. NOT a substitute for per-harness
+# sourcing — tests/test_harness_dev_autodetect_coverage.py enforces that,
+# because this backstop would otherwise mask a missing source on direct runs.
+export CCTALLY_DISABLE_DEV_AUTODETECT=1
+
 # Phase 2: must run after parallel_harnesses (reads cross-harness state).
 final_harnesses=(reconcile)
 

@@ -25,6 +25,9 @@
 
 set -uo pipefail
 
+# Dev-instance isolation: force prod data-dir layout under fake HOME.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+
 # Robust golden comparison (issue #106/#107): ONE `diff` over real files
 # drives both the verdict and the displayed bytes — no `<(process
 # substitution)`, whose transient /dev/fd setup failure under heavy

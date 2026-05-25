@@ -58,7 +58,7 @@ def _init_paths_from_env() -> None:
     break tests that cached the module object via a top-level
     `import _cctally_core`).
     """
-    global APP_DIR, LEGACY_APP_DIR, LOG_DIR
+    global APP_DIR, LEGACY_APP_DIR, LOG_DIR, DEV_MODE
     global DB_PATH, CACHE_DB_PATH
     global CACHE_LOCK_PATH, CACHE_LOCK_CODEX_PATH, CONFIG_LOCK_PATH
     global CONFIG_PATH, MIGRATION_ERROR_LOG_PATH, CHANGELOG_PATH
@@ -70,7 +70,23 @@ def _init_paths_from_env() -> None:
     global CLAUDE_PROJECTS_DIR
 
     home = pathlib.Path.home()
-    APP_DIR = home / ".local" / "share" / "cctally"
+
+    # Dev-instance isolation (docs/superpowers/specs/2026-05-26-dev-instance-
+    # isolation-design.md). Resolve the APP_DIR base first; all other path
+    # constants derive from it. First match wins:
+    #   1. explicit CCTALLY_DATA_DIR override (also the test/harness pin)
+    #   2. auto-detected dev checkout -> cctally-dev (sets DEV_MODE)
+    #   3. prod default (byte-identical to pre-feature behavior)
+    _data_dir_override = os.environ.get("CCTALLY_DATA_DIR", "").strip()
+    if _data_dir_override:
+        APP_DIR = pathlib.Path(_data_dir_override).expanduser()
+        DEV_MODE = False
+    elif _is_dev_checkout():
+        APP_DIR = home / ".local" / "share" / "cctally-dev"
+        DEV_MODE = True
+    else:
+        APP_DIR = home / ".local" / "share" / "cctally"
+        DEV_MODE = False
     LEGACY_APP_DIR = home / ".local" / "share" / "ccusage-subscription"
     LOG_DIR = APP_DIR / "logs"
 
@@ -120,6 +136,27 @@ def _init_paths_from_env() -> None:
     # callers want. For multi-root, env-aware resolution (mirroring
     # `_get_claude_data_dirs`), use `_resolve_claude_projects_dirs()`.
     CLAUDE_PROJECTS_DIR = home / ".claude" / "projects"
+
+
+def _repo_root() -> pathlib.Path:
+    """Repo root when running from a source checkout: this file lives at
+    ``<repo>/bin/_cctally_core.py``, so the root is two parents up. Factored
+    out as the single monkeypatch seam for the dev-mode tests."""
+    return pathlib.Path(__file__).resolve().parent.parent
+
+
+def _is_dev_checkout() -> bool:
+    """True iff running from a git checkout (a ``.git`` entry at the repo
+    root — a directory for a main checkout, a file for a worktree) AND the
+    test/harness suppressor ``CCTALLY_DISABLE_DEV_AUTODETECT`` is unset.
+
+    Deliberately INDEPENDENT of ``CCTALLY_DATA_DIR``: this predicate gates
+    the ``setup`` guard (which protects WHICH BINARY gets wired into
+    ~/.claude/settings.json), not the data-dir relocation. The npm/brew
+    install copies ship without ``.git`` so they never read True."""
+    if os.environ.get("CCTALLY_DISABLE_DEV_AUTODETECT"):
+        return False
+    return (_repo_root() / ".git").exists()
 
 
 _init_paths_from_env()

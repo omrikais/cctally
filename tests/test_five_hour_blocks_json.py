@@ -51,7 +51,12 @@ def _run(home, *args):
     # Invoke cctally via the test-runner's Python rather than the shebang to
     # avoid PATH-driven version mismatches (the macOS system python3 in
     # /usr/bin is 3.9; cctally requires 3.11+).
-    env = {"HOME": str(home), "TZ": "Etc/UTC", "PATH": "/usr/bin:/bin"}
+    # Suppressor: this fresh env dict omits os.environ, so it does NOT inherit
+    # conftest's process-level CCTALLY_DISABLE_DEV_AUTODETECT. Set it here so
+    # the subprocess resolves the PROD data-dir layout (…/cctally) and reads
+    # the stats.db this fixture seeded, not an empty …/cctally-dev DB.
+    env = {"HOME": str(home), "TZ": "Etc/UTC", "PATH": "/usr/bin:/bin",
+           "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
     out = subprocess.run(
         [sys.executable, str(BIN), "five-hour-blocks", *args, "--json"],
         check=True, capture_output=True, env=env, text=True,
