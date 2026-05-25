@@ -17,8 +17,22 @@ Install cctally into Claude Code. Symlinks user-facing binaries into
 
 - `--yes` / `-y` — skip confirmations
 - `--json` — emit machine-readable output
+- `--force-dev` — allow setup to run from a git checkout (see Dev-checkout refusal)
 - `--migrate-legacy-hooks` — auto-accept the legacy-hook migration prompt (install-mode only)
 - `--no-migrate-legacy-hooks` — auto-decline the legacy-hook migration prompt (install-mode only)
+
+## Dev-checkout refusal
+
+When run from a git checkout (a `.git` entry at the repo root), `cctally
+setup` — both install and `--uninstall` — refuses with exit code `2` and
+prints a message explaining why, without touching `~/.claude/settings.json`.
+The hooks in `settings.json` point at your installed (npm/brew) cctally;
+rewriting them from a dev checkout would repoint them at the dev binary (or
+remove them), breaking the installed instance. Run setup from the installed
+binary instead, or pass `--force-dev` to override when you intend to install
+dev-pointing hooks. The refusal is independent of `CCTALLY_DATA_DIR`: setting
+that env var relocates the dev data dir but still does not let setup rewrite
+the prod hooks.
 
 ## Hook events installed
 
