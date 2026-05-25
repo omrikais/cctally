@@ -1,7 +1,7 @@
 """Concurrency regressions for the migration upgrade gate / cache 001
 (cctally-dev#93, spec D6, plan Task 7 Step 4 / test 5e).
 
-Two cases:
+Three cases:
 
   * **D6a — 001-vs-001 single wipe.** Two concurrent openers can BOTH
     classify cache 001 as pending (the dispatcher snapshots the applied
@@ -19,12 +19,22 @@ Two cases:
     covered by
     ``tests/test_migration_gate_sentinel.py::test_marker_withheld_when_001_not_applied_at_start``
     — cross-referenced here (see ``test_d6b_cross_reference``) rather than
-    duplicated. The COMPOUND straddle is an out-of-scope documented
-    residual deferred to #105 (spec D6b / Risk R2; re-homed from #87 when
-    #87 closed as the stats.db locking fix).
+    duplicated.
+
+  * **D6b COMPOUND straddle — CLOSED by #105.** The compound false-pass
+    (a straddling walk commits a full-size ``session_files`` row whose
+    pre-wipe prefix 001 deleted; a later clean walk certifies it complete)
+    was a deferred residual until #105. It is now closed by mutual
+    exclusion: cache 001 acquires the SAME ``cache.db.lock`` fcntl flock
+    ``sync_cache`` holds, BEFORE its ``BEGIN IMMEDIATE`` (one consistent
+    fcntl->SQLite order, no opposite-order deadlock). With the lock held
+    across the wipe the straddle interleave is structurally impossible.
+    Covered by ``test_d6b_compound_straddle_001_defers_under_sync_lock``
+    (+ the ``CACHE_LOCK_PATH`` sibling-identity guard the derive relies on).
 """
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import pathlib
 import sqlite3
@@ -206,6 +216,99 @@ def test_d6a_handler_is_idempotent_on_already_applied(tmp_path):
     )
 
 
+def test_d6b_compound_straddle_001_defers_under_sync_lock(tmp_path):
+    """#105 — the COMPOUND straddle is CLOSED by mutual exclusion, not
+    merely deferred-and-documented.
+
+    cache 001 now acquires the SAME ``cache.db.lock`` fcntl flock that
+    ``sync_cache`` holds for its entire walk, BEFORE its
+    ``BEGIN IMMEDIATE`` — a single consistent fcntl->SQLite acquisition
+    order (matching ``sync_cache``), so there is no opposite-order
+    deadlock. The consequence: 001's destructive wipe can never interleave
+    a ``sync_cache`` walk. While a sync holds the lock, 001 finds it
+    contended and DEFERS (``MigrationGateNotMet``) *before touching any
+    data* — no wipe, no stamp, no marker-clear. The straddle interleave
+    (sync reads ``existing`` pre-wipe, then commits a full-size
+    ``session_files`` row whose prefix 001 wiped) is therefore
+    structurally impossible: a sync either runs entirely before 001 (and
+    001 then wipes ``session_files`` so the next sync re-ingests from
+    offset 0) or entirely after (and reads an empty post-wipe baseline).
+
+    This drives the wipe side of the interleave: with the sync lock held,
+    assert 001 does NOT write the wipe (which a later clean walk would
+    otherwise certify with the walk-complete marker over an incomplete
+    cache).
+    """
+    db = _load_db()
+    cache_path = tmp_path / "cache.db"
+    conn = _seed_cache_file(db, cache_path)
+
+    # Simulate an in-flight sync_cache by holding the cache.db.lock flock
+    # for the whole walk. 001 derives the SAME path from the connection's
+    # own database file (``<main-db>.lock``), so this is the exact lock it
+    # contends on.
+    lock_path = pathlib.Path(str(cache_path) + ".lock")
+    lock_fh = open(lock_path, "w")
+    fcntl.flock(lock_fh, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(db.MigrationGateNotMet):
+            db._001_dedup_highest_wins(conn)
+
+        # DEFER == nothing touched. The handler must raise after failing to
+        # acquire the lock but BEFORE its BEGIN IMMEDIATE / DELETEs.
+        assert conn.execute(
+            "SELECT 1 FROM session_entries LIMIT 1"
+        ).fetchone() is not None, (
+            "001 must NOT wipe session_entries while a sync holds the lock"
+        )
+        assert conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name='001_dedup_highest_wins'"
+        ).fetchone() is None, "a deferred 001 must NOT stamp itself applied"
+        assert conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?", (MARKER,)
+        ).fetchone() is not None, (
+            "a deferred 001 must NOT clear the walk-complete marker"
+        )
+    finally:
+        fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        lock_fh.close()
+
+    # Lock released -> the next attempt acquires it and applies normally:
+    # wipes session_entries, clears the marker, stamps 001. (Proves the
+    # defer is purely lock-driven, not a regression in the apply path.)
+    db._001_dedup_highest_wins(conn)
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM session_entries LIMIT 1"
+        ).fetchone() is None, "001 must wipe once the sync lock is free"
+        assert conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name='001_dedup_highest_wins'"
+        ).fetchone() is not None, "001 must stamp itself once it applies"
+        assert conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?", (MARKER,)
+        ).fetchone() is None, "001 must clear the walk-complete marker on apply"
+    finally:
+        conn.close()
+
+
+def test_cache_lock_path_matches_cache_db_sibling():
+    """#105 invariant: 001 derives its lock from the connection's own
+    cache.db file (``<db>.lock``). For that derived path to be the SAME
+    lock ``sync_cache`` acquires via the ``CACHE_LOCK_PATH`` constant, the
+    constant MUST equal ``<CACHE_DB_PATH>.lock``. If this relationship ever
+    drifts, 001 and ``sync_cache`` would lock different files and the
+    mutual exclusion that closes #105 would silently break.
+    """
+    import _cctally_core
+
+    assert str(_cctally_core.CACHE_LOCK_PATH) == (
+        str(_cctally_core.CACHE_DB_PATH) + ".lock"
+    ), (
+        "CACHE_LOCK_PATH must be the cache.db sibling lock; 001's "
+        "derive-from-connection lock relies on this identity"
+    )
+
+
 def test_d6b_cross_reference():
     """D6b (simple straddle marker-withhold) is covered by
     ``tests/test_migration_gate_sentinel.py::test_marker_withheld_when_001_not_applied_at_start``.
@@ -214,9 +317,10 @@ def test_d6b_cross_reference():
     duplicated: that test drives ``sync_cache`` end-to-end through the
     full namespace and asserts the walk-complete marker is withheld when
     ``applied_at_start`` is False even on a clean walk. The COMPOUND
-    straddle false-pass is an out-of-scope documented residual deferred
-    to #105 (Risk R2; re-homed from #87 when #87 closed as the stats.db
-    locking fix). This stub fails loudly if the referenced test is
+    straddle false-pass (formerly a deferred residual, Risk R2) is now
+    CLOSED by #105 and covered directly by
+    ``test_d6b_compound_straddle_001_defers_under_sync_lock`` above. This
+    stub fails loudly if the referenced simple-straddle test is
     renamed/removed so the cross-reference can't silently rot.
     """
     sentinel = _ROOT / "tests" / "test_migration_gate_sentinel.py"

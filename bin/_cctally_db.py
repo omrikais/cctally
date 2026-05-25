@@ -62,6 +62,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import enum
+import fcntl
 import json
 import os
 import pathlib
@@ -2416,6 +2417,35 @@ def _001_banner_should_emit(conn: sqlite3.Connection) -> bool:
     return _recompute_banner_should_emit(data_present=row is not None)
 
 
+def _cache_db_lock_path_for_conn(conn: sqlite3.Connection) -> "pathlib.Path | None":
+    """Return the fcntl lock-file path for the cache.db a connection is
+    attached to — ``<main-db-file>.lock`` — or ``None`` for a path-less
+    (``:memory:`` / temp) connection.
+
+    Derived from the LIVE connection (``PRAGMA database_list``) rather than
+    the ``CACHE_LOCK_PATH`` constant so it tracks whatever cache.db the
+    handler was handed: production uses ``APP_DIR/cache.db`` whose sibling
+    is exactly ``CACHE_LOCK_PATH`` (the lock ``sync_cache`` opens — the
+    ``CACHE_LOCK_PATH == <CACHE_DB_PATH>.lock`` identity is asserted by
+    ``tests/test_migration_gate_concurrency.py``), while tests follow their
+    tmp cache.db so no real-home lock is ever touched. A path-less
+    connection has no sibling lock file and no cross-process concurrency to
+    guard, so the caller skips locking.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    for row in rows:
+        # cache.db connection has no row_factory -> tuple (seq, name, file).
+        if row[1] == "main":
+            db_file = row[2]
+            if not db_file:
+                return None  # :memory: / temp -> no sibling lock file
+            return pathlib.Path(str(db_file) + ".lock")
+    return None
+
+
 @cache_migration("001_dedup_highest_wins")
 def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
     """One-time re-ingest of session_entries with corrected msg_id+req_id dedup.
@@ -2464,6 +2494,55 @@ def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
           handler time anyway. Interactive surfaces (``report``,
           ``weekly``, ``percent-breakdown``, etc.) still see it once.
     """
+    # #105 — mutual exclusion with ``sync_cache``. Acquire the SAME
+    # ``cache.db.lock`` fcntl flock ``sync_cache`` holds for its entire
+    # walk, BEFORE the ``BEGIN IMMEDIATE`` below. Both paths therefore
+    # acquire fcntl -> SQLite write lock in ONE consistent order, so there
+    # is no opposite-order deadlock (the hazard that deferred this fix:
+    # SQLite-then-fcntl in 001 vs fcntl-then-SQLite in sync_cache). With
+    # the lock held across the wipe, 001's destructive DELETEs can never
+    # interleave a ``sync_cache`` walk: a sync runs entirely before 001
+    # (then 001 wipes ``session_files`` so the next sync re-ingests from
+    # offset 0) or entirely after (reading an empty post-wipe baseline).
+    # That makes the compound straddle — a sync reading its ``existing``
+    # baseline pre-wipe, then committing a full-size ``session_files`` row
+    # whose pre-wipe prefix 001 just deleted — structurally impossible.
+    #
+    # On contention (a sync is mid-walk) we DEFER via ``MigrationGateNotMet``
+    # BEFORE touching any data: the cache stays fully consistent, the
+    # dispatcher records 001 as still-pending (no error log, no banner) and
+    # retries it on the next open — matching ``sync_cache``'s own
+    # non-blocking LOCK_NB-and-bail and the framework's "defer is the safe
+    # side" contract. 008/009/010 already defer while 001 is pending, so the
+    # system stays safe until a non-contended instant applies it.
+    lock_path = _cache_db_lock_path_for_conn(conn)
+    lock_fh = None
+    if lock_path is not None:
+        lock_fh = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_fh.close()
+            raise MigrationGateNotMet(
+                "cache.db.lock held by a concurrent sync_cache; deferring "
+                "cache 001 dedup wipe (#105)"
+            )
+    try:
+        _001_dedup_highest_wins_locked(conn)
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_fh.close()
+
+
+def _001_dedup_highest_wins_locked(conn: sqlite3.Connection) -> None:
+    """Body of cache 001, run with the ``cache.db.lock`` flock already held
+    (or skipped for a path-less connection). Split from the public handler
+    so the lock acquire/release wraps the whole wipe (#105); see
+    ``_001_dedup_highest_wins`` for the lock-ordering rationale."""
     if _001_banner_should_emit(conn):
         eprint(
             "[cctally] Re-ingesting Claude session history with "
