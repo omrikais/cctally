@@ -25,6 +25,16 @@
 
 set -uo pipefail
 
+# Robust golden comparison (issue #106/#107): ONE `diff` over real files
+# drives both the verdict and the displayed bytes — no `<(process
+# substitution)`, whose transient /dev/fd setup failure under heavy
+# parallel CI load made `diff` exit 2 and the old `diff …>/dev/null`
+# detection swallow it as a phantom FAIL with no diff to show. Sourcing
+# it here covers every harness that sources this lib (forecast, project,
+# diff, blocks, session, weekly, cache-report, codex-*).
+# shellcheck source=bin/_lib-golden-diff.sh
+. "$(dirname "${BASH_SOURCE[0]}")/_lib-golden-diff.sh"
+
 # run_mode NAME LABEL FLAGS GOLDEN_SUFFIX
 #   NAME          : fixture directory basename
 #   LABEL         : human-readable mode label for PASS/FAIL lines
@@ -133,12 +143,15 @@ PY
         fail_count=$((fail_count + 1))
         return 1
     fi
-    if ! diff -u <(echo "$actual") "$golden" >/dev/null; then
-        echo "FAIL $name/$label"
-        # Print up to 200 lines of diff so multi-row tables surface their full
-        # diff on CI (each session row in `session` renders as 5 wrapped lines,
-        # so 4-session tables can blow past a 40-line cap and hide the smoking gun).
-        diff -u "$golden" <(echo "$actual") | head -200
+    # Robust golden compare via _lib-golden-diff.sh (issue #106/#107): the
+    # `echo "$actual"` golden was written with a trailing newline, so the
+    # `printf '%s\n'`-materializing _golden_diff_str matches it byte-for-byte.
+    # Up to 200 diff lines surface so multi-row tables show their full diff on
+    # CI (each `session` row wraps to 5 lines, so 4-session tables blow past a
+    # 40-line cap and hide the smoking gun). Temp compare files land in the
+    # scratch base (or $TMPDIR for the legacy in-tree FAKE_HOME path).
+    local GOLDEN_DIFF_TMPDIR="${HARNESS_FAKE_HOME_BASE:-${TMPDIR:-/tmp}}"
+    if ! _golden_diff_str "$label" "$golden" "$actual" 200; then
         fail_count=$((fail_count + 1))
         return 1
     fi
