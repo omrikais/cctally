@@ -17,9 +17,18 @@
 set -uo pipefail
 
 HARNESS_BIN="$(cd "$(dirname "$0")" && pwd)/cctally"
-FIXTURES_DIR="$(cd "$(dirname "$0")/.." && pwd)/tests/fixtures/hook-tick"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+FIXTURES_DIR="$REPO_ROOT/tests/fixtures/hook-tick"
 pass_count=0
 fail_count=0
+
+# Robust golden comparison (issue #106/#107): ONE `diff` over real files
+# drives both the verdict and the displayed bytes — no `<(process
+# substitution)`, whose transient /dev/fd setup failure under heavy
+# parallel CI load made `diff` exit 2 and the old `diff …>/dev/null`
+# detection swallow it as a phantom FAIL with no diff to show.
+# shellcheck source=bin/_lib-golden-diff.sh
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
 
 run_scenario () {
     local name="$1"
@@ -71,10 +80,10 @@ run_scenario () {
         -e "s|$fake|/FAKE|g")
 
     local fail_local=0
-    if ! diff -u "$dir/golden-stdout.txt" <(printf '%s\n' "$norm") > /dev/null; then
-        diff -u "$dir/golden-stdout.txt" <(printf '%s\n' "$norm") | head -40
-        fail_local=1
-    fi
+    # golden-stdout.txt ends in \n; _golden_diff_str materializes the actual
+    # via `printf '%s\n'`, matching the old comparison byte-for-byte.
+    local GOLDEN_DIFF_TMPDIR="$fake"
+    _golden_diff_str "stdout" "$dir/golden-stdout.txt" "$norm" 40 || fail_local=1
 
     # Optional exit-code golden. When present, the run's actual exit
     # code is compared against it — used by scenarios that exercise the
