@@ -159,6 +159,45 @@ def test_tty_stdout_no_flag_enables(cctally_mod, monkeypatch):
     )
 
 
+def test_ci_with_piped_stdout_stays_uncolored(cctally_mod, monkeypatch):
+    """Issue #100: ``CI`` set + a piped/redirected stdout → plain text.
+
+    The CI rung is gated behind ``sys.stdout.isatty()`` so that
+    ``cctally diff … | cat`` (or ``> out.txt``) on a CI runner does NOT
+    write ANSI into the pipe — preserving diff/project's pre-Session-A
+    plain-text-on-pipe contract. ``NO_COLOR=1`` is no longer the only
+    escape hatch for CI consumers.
+    """
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True, raising=False)
+    assert (
+        cctally_mod._resolve_color_enabled(_ns(color=False, no_color=False))
+        is False
+    )
+
+
+def test_ci_with_tty_stdout_enables(cctally_mod, monkeypatch):
+    """Issue #100: ``CI`` set + a real TTY stdout → color enabled.
+
+    CI still forces color (over a dumb TERM, matching picocolors) — the
+    #100 fix only suppresses color when stdout is NOT a TTY (piped).
+    """
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setenv("TERM", "dumb")  # CI wins over dumb TERM (picocolors)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
+    assert (
+        cctally_mod._resolve_color_enabled(_ns(color=False, no_color=False))
+        is True
+    )
+
+
 # ─── End-to-end subprocess tests on project + diff ─────────────────────
 
 

@@ -8,6 +8,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - **`codex-daily` / `codex-monthly` / `codex-weekly` / `codex-session` now accept `-d/--debug` + `--debug-samples N`**, extending the Claude-side `--debug` diagnostic surface to the Codex commands. Because Codex JSONL records no `costUSD` to diff against, the report is a Codex variant — a "Codex Pricing Debug Report" on stderr with totals (entries processed, models seen, total computed cost) plus a "Sample Top Entries" block of the N highest computed-cost entries (`Recorded cost: (none)` per sample; `gpt-5`-fallback models tagged `(fallback→gpt-5)`). `--debug-samples` caps the sample block (default 5; `N=0` prints totals only). (#92)
 
+### Fixed
+- **`diff` and `project` no longer emit ANSI color into a piped or redirected stdout when `CI` is set.** The `--color` resolver placed its `CI` rung above the `stdout.isatty()` check, so on a CI runner `cctally diff … | cat` (or `> out.txt`) wrote raw escape sequences into the capture — a behavior change from the pre-Session-A contract, which keyed color on `sys.stdout.isatty()` alone and always produced clean text on a pipe. The `CI` rung is now gated behind `sys.stdout.isatty()`: CI still forces color on a real terminal (over a dumb `TERM`, matching picocolors), but a non-TTY stdout stays plain text regardless of `CI`. `FORCE_COLOR` / `NO_COLOR` / `--color` / `--no-color` precedence is unchanged. Regression: `tests/test_color_resolution.py::test_ci_with_piped_stdout_stays_uncolored` + `::test_ci_with_tty_stdout_enables`. (#100)
+
 ## [1.12.0] - 2026-05-24
 
 ### Fixed

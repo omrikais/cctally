@@ -2005,9 +2005,13 @@ def _resolve_color_enabled(args: argparse.Namespace) -> bool:
       2. ``args.color``     → True (overrides ``NO_COLOR`` env).
       3. ``FORCE_COLOR``    → True.
       4. ``NO_COLOR``       → False.
-      5. ``isatty(stdout)`` with non-dumb TERM → True (the diff/project
-                            auto-detect; CI=True still enables).
-      6. else               → False.
+      5. ``CI`` env with a TTY stdout → True (CI forces color, but only
+                            when stdout is itself a terminal — a piped /
+                            redirected stdout under CI stays plain text,
+                            issue #100); else ``isatty(stdout)`` with
+                            non-dumb TERM → True (the diff/project
+                            auto-detect).
+      6. else               → False (incl. a piped stdout under CI).
 
     The helper is consumed by ``cmd_project`` and ``cmd_diff`` — the only
     two in-scope Claude cmds whose renderers honor color. The other 8
@@ -2035,14 +2039,17 @@ def _resolve_color_enabled(args: argparse.Namespace) -> bool:
     # Rung 4 — NO_COLOR env always disables (any value).
     if "NO_COLOR" in os.environ:
         return False
-    # Rung 5 — CI gets color; else stdout-only isatty with non-dumb TERM.
-    # Deliberately stdout-only so a piped stdout (stderr still a TTY) stays
-    # uncolored, preserving diff/project's pre-Session-A plain-text contract.
-    if "CI" in os.environ:
-        return True
+    # Rung 5 — CI forces color, but ONLY with a TTY stdout; else stdout-only
+    # isatty with non-dumb TERM. Both branches key on sys.stdout.isatty()
+    # (NOT the stdout-OR-stderr _supports_color_stdout) so a piped stdout —
+    # under CI or otherwise — stays uncolored, preserving diff/project's
+    # pre-Session-A plain-text-on-pipe contract (issue #100). CI still wins
+    # over a dumb TERM when stdout is a real terminal (picocolors parity).
     if sys.stdout.isatty():
+        if "CI" in os.environ:
+            return True
         return os.environ.get("TERM", "").lower() != "dumb"
-    # Rung 6 — no flag, no env, non-tty stdout.
+    # Rung 6 — no flag, no env, non-tty stdout (incl. a piped stdout under CI).
     return False
 
 
