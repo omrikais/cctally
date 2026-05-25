@@ -42,6 +42,14 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$REPO_ROOT/bin/cctally"
 FIX_DIR="$REPO_ROOT/tests/fixtures/update"
 
+# Robust golden comparison (issue #106): ONE diff over real files drives
+# both the verdict and the displayed bytes — no `<(process substitution)`,
+# whose transient /dev/fd setup failure under heavy parallel CI load made
+# `diff` exit 2 and the old `diff …>/dev/null 2>&1` detection swallow it as
+# a phantom "stderr diverged" with no diff to show.
+# shellcheck source=bin/_lib-golden-diff.sh
+source "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
 default_jobs() {
     local n
     n=$(sysctl -n hw.ncpu 2>/dev/null) || n=$(nproc 2>/dev/null) || n=4
@@ -498,6 +506,9 @@ LOCKBODY
 
     # ----- Diff against goldens.
     local ok=1
+    # Temp scratch for the golden-diff string variants (materialized
+    # compare files); within the per-scenario scratch so cleanup is free.
+    local GOLDEN_DIFF_TMPDIR="$scratch"
     local g_stdout="$fix/golden/stdout.txt"
     local g_stderr="$fix/golden/stderr.txt"
     local g_rc="$fix/golden/exit_code.txt"
@@ -530,22 +541,14 @@ LOCKBODY
         printf '%s\n' "$actual_stdout_redacted" > "$g_stdout"
         echo "WROTE $name golden/stdout.txt"
     fi
-    if ! diff -u <(printf '%s\n' "$actual_stdout_redacted") "$g_stdout" >/dev/null 2>&1; then
-        echo "FAIL $name: stdout diverged"
-        diff -u "$g_stdout" <(printf '%s\n' "$actual_stdout_redacted") | head -200
-        ok=0
-    fi
+    _golden_diff_str "stdout" "$g_stdout" "$actual_stdout_redacted" 200 || ok=0
 
     # stderr
     if [ ! -f "$g_stderr" ] || [ "$regen" = "1" ]; then
         printf '%s\n' "$actual_stderr_redacted" > "$g_stderr"
         echo "WROTE $name golden/stderr.txt"
     fi
-    if ! diff -u <(printf '%s\n' "$actual_stderr_redacted") "$g_stderr" >/dev/null 2>&1; then
-        echo "FAIL $name: stderr diverged"
-        diff -u "$g_stderr" <(printf '%s\n' "$actual_stderr_redacted") | head -200
-        ok=0
-    fi
+    _golden_diff_str "stderr" "$g_stderr" "$actual_stderr_redacted" 200 || ok=0
 
     # post/.local/share/cctally — optional state file diffs.
     if [ -d "$fix/post/.local/share/cctally" ]; then
@@ -574,18 +577,10 @@ LOCKBODY
                         ok=0
                         continue
                     }
-                    if ! diff -u <(printf '%s' "$actual_norm") <(printf '%s' "$golden_norm") >/dev/null 2>&1; then
-                        echo "FAIL $name: post/$base diverged"
-                        diff -u <(printf '%s' "$golden_norm") <(printf '%s' "$actual_norm") | head -100
-                        ok=0
-                    fi
+                    _golden_diff_two_str "post/$base" "$golden_norm" "$actual_norm" 100 || ok=0
                     ;;
                 *)
-                    if ! diff -u "$golden" "$actual" >/dev/null 2>&1; then
-                        echo "FAIL $name: post/$base diverged"
-                        diff -u "$golden" "$actual" | head -100
-                        ok=0
-                    fi
+                    _golden_diff_files "post/$base" "$golden" "$actual" 100 || ok=0
                     ;;
             esac
         done
@@ -613,6 +608,8 @@ run_scenario () {
 }
 
 export -f _run_scenario_inner run_scenario normalize_json redact_state
+# Golden-diff helpers must reach the xargs `bash -c` subshells too.
+export -f _golden_diff_files _golden_diff_str _golden_diff_two_str
 export REPO_ROOT BIN FIX_DIR SCRATCH_ROOT
 
 # Dispatch in parallel. Buffered output flushed in scenario order.
