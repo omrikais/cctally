@@ -446,3 +446,86 @@ def test_compact_changes_diff_rendering(ns):
     compact = _render(compact=True)
 
     assert wide != compact, "compact kwarg had no effect on diff section render"
+
+
+# ── issue #102: numeric protection + sub-fit overflow on narrow terminals ─
+
+
+def _max_box_width(ns, rendered: str) -> int:
+    widths = _box_line_widths(ns, rendered)
+    return max(widths) if widths else 0
+
+
+def test_compact_session_numeric_never_truncated_on_narrow_terminal(
+    ns, narrow_terminal
+):
+    """Issue #102 (b): a wide token count must render in full under
+    `--compact` on an 80-col terminal — never `12,345,…` (a silently wrong
+    number). Numeric (right-aligned) columns are floored at their value
+    width and the row render never ellipsizes them."""
+    render = ns["_render_claude_session_table"]
+    sessions = [
+        _claude_session(
+            ns,
+            sid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            project="/Users/alice/very/long/project/path/that/will/widen/this",
+            tokens=123_456_789,
+        ),
+    ]
+    rendered = _strip_ansi(render(sessions, compact=True))
+    # _fmt_num(123_456_789) == "123,456,789"; total = 2*tokens.
+    assert "123,456,789" in rendered, rendered
+    assert "246,913,578" in rendered, rendered  # Total Tokens = input+output
+    # And no numeric value was clipped to an ellipsis tail.
+    assert "123,456,…" not in rendered and "123,45…" not in rendered, rendered
+
+
+def test_compact_project_numeric_never_truncated_on_narrow_terminal(
+    ns, narrow_terminal
+):
+    """Issue #102 (b): same numeric protection in the project renderer."""
+    render = ns["_render_project_table"]
+    rows = [
+        _project_row(ns, display_key="alpha", bucket="/Users/a/alpha",
+                     tokens=123_456_789, cost=4.21),
+    ]
+    rendered = _strip_ansi(render(rows, title="Project Usage", compact=True))
+    assert "123,456,789" in rendered, rendered
+    # cache_read = tokens * 3 (see _project_row) → 370,370,367, also intact.
+    assert "370,370,367" in rendered, rendered
+
+
+def test_compact_session_box_fits_terminal_when_values_fit(ns, narrow_terminal):
+    """Issue #102 (b)/(B): when the protected numeric widths can fit, the
+    box no longer overflows the terminal. Small values + 80 cols leave room
+    for the text columns to shrink, so every box line is <= COLUMNS."""
+    render = ns["_render_claude_session_table"]
+    sessions = [
+        _claude_session(
+            ns,
+            sid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            project="/Users/alice/p",
+            tokens=100,
+        ),
+    ]
+    rendered = render(sessions, compact=True)
+    assert _max_box_width(ns, rendered) <= 80, (
+        f"compact session box overflowed 80 cols: "
+        f"{sorted(set(_box_line_widths(ns, rendered)))}\n{rendered}"
+    )
+
+
+def test_scale_down_protects_numeric_and_reclaims_text(ns):
+    """Unit: `_scale_down_col_widths` floors numeric (right) columns at
+    their data width, squeezes text (left) columns to reclaim overflow, and
+    never returns a numeric column narrower than its number."""
+    scale = ns["_lib_render"]._scale_down_col_widths
+    # 1 text col (nat 20) + 1 numeric col (nat 10, value width 8); only 15
+    # cells available → must shrink. Numeric stays >= 8; text absorbs.
+    widths = scale([20, 10], ["left", "right"], [5, 8], 15, grow_idx=0)
+    assert widths[1] >= 8, widths            # number never clipped
+    assert sum(widths) <= 15, widths         # fits when feasible
+    # When numeric floors alone exceed available, accept honest overflow
+    # rather than shrink the number.
+    widths = scale([10, 10], ["left", "right"], [4, 9], 6, grow_idx=0)
+    assert widths[1] >= 9, widths            # full number preserved

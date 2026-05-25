@@ -134,6 +134,94 @@ def _format_block_start(*args, **kwargs):
     return sys.modules["cctally"]._format_block_start(*args, **kwargs)
 
 
+def _ellipsize(content: str, width: int, unicode_ok: bool) -> str:
+    """Truncate ``content`` to ``width`` cells, marking the cut with an
+    ellipsis. Returns ``content`` unchanged when it already fits.
+
+    Used for BOTH header and (text) data cells so a column scaled below
+    its header-label width stays aligned with the border row (issue #102
+    (a)) — the header render previously padded without truncating, so a
+    label wider than its scaled column overflowed the box."""
+    if len(content) <= width:
+        return content
+    ell = "…" if unicode_ok else "..."
+    return content[: max(0, width - len(ell))] + ell
+
+
+def _scale_down_col_widths(
+    nat_widths: list[int],
+    aligns: list[str],
+    data_widths: list[int],
+    available: int,
+    *,
+    grow_idx: int,
+    min_text: int = 4,
+) -> list[int]:
+    """Allocate the per-column widths for the ``--compact`` / auto-overflow
+    scale-down branch of the project + Claude-session renderers.
+
+    Policy (issue #102 — recommendation (a) + (b)):
+
+      * **Numeric (right-aligned) columns are protected.** Their hard floor
+        is the widest DATA value (``data_widths[i]``), so the full number
+        always shows; the row render must never ellipsis-truncate a
+        right-aligned cell. A silently-wrong figure (``12,345,…``) is worse
+        than honest overflow.
+      * **Text (left-aligned) columns absorb the squeeze** and may truncate
+        — including their header label, which the header render ellipsizes
+        the same way (so a column may drop below header width while staying
+        box-aligned).
+      * When the natural widths fit, they are used verbatim and the slack
+        goes to ``grow_idx``. When shrinking is required, widths scale
+        proportionally, clamped to ``[floor, natural]``; any residual after
+        reclaiming all text slack is accepted as honest overflow rather than
+        corrupting a number.
+
+    ``data_widths[i]`` is the widest cell EXCLUDING the header, so a numeric
+    column is sized to its number — its (possibly wider, truncatable) header
+    label does not inflate the protected floor.
+    """
+    num_cols = len(nat_widths)
+    floors = [
+        min(max(data_widths[i], 1), nat_widths[i]) if aligns[i] == "right"
+        else min(min_text, nat_widths[i])
+        for i in range(num_cols)
+    ]
+    total_nat = sum(nat_widths)
+    if total_nat <= available:
+        widths = list(nat_widths)
+        slack = available - total_nat
+        if slack > 0 and 0 <= grow_idx < num_cols:
+            widths[grow_idx] += slack
+        return widths
+
+    scale = available / total_nat if total_nat > 0 else 1.0
+    widths = [
+        min(nat_widths[i], max(int(nat_widths[i] * scale), floors[i]))
+        for i in range(num_cols)
+    ]
+    overflow = sum(widths) - available
+    if overflow > 0:
+        # Reclaim from text columns (most slack above floor first); numeric
+        # columns are immovable. Residual overflow is honest (issue #102 (b)).
+        text_idx = sorted(
+            (i for i in range(num_cols) if aligns[i] != "right"),
+            key=lambda i: widths[i] - floors[i],
+            reverse=True,
+        )
+        for i in text_idx:
+            if overflow <= 0:
+                break
+            take = min(widths[i] - floors[i], overflow)
+            widths[i] -= take
+            overflow -= take
+    else:
+        slack = available - sum(widths)
+        if slack > 0 and 0 <= grow_idx < num_cols:
+            widths[grow_idx] += slack
+    return widths
+
+
 # Optional dependency: zoneinfo.ZoneInfo is referenced only as a string
 # annotation in moved code; no runtime import needed.
 
@@ -2293,22 +2381,17 @@ def _render_claude_session_table(
     # while preserving the explicit-compact override.
     if compact:
         available = term_width - border_overhead
-        total_col = sum(col_widths)
-        scale = available / total_col if total_col > 0 else 1.0
-        # Floor each column at its HEADER width, never a bare 8. Header
-        # cells are single-line unsplittable labels ("Cache Create",
-        # "Cost (USD)", "Last Activity") that the header render below pads
-        # with `_pad_cell` (no truncation, unlike data cells). Scaling a
-        # column below `len(header)` left the header wider than the border
-        # row's `H * (w + 2)`, so the box drawing misaligned under
-        # `--compact` on narrow terminals — defeating the flag's purpose.
-        col_floors = [max(8, len(h)) for h in headers]
-        col_widths = [
-            max(int(w * scale), col_floors[i]) for i, w in enumerate(col_widths)
-        ]
-        remainder = available - sum(col_widths)
-        if remainder > 0:
-            col_widths[1] += remainder  # grow Directory column
+        # Per-column widest DATA value (excludes the header row), so numeric
+        # columns are protected at their number width while header labels may
+        # truncate (issue #102). data_cells/footer carry the values; the
+        # header is added separately below.
+        data_widths = [0] * num_cols
+        for cells, _rt in raw_rows:
+            for i, (text, _c) in enumerate(cells):
+                data_widths[i] = max(data_widths[i], _max_line_width(text))
+        col_widths = _scale_down_col_widths(
+            col_widths, aligns, data_widths, available, grow_idx=1,
+        )
 
     def _split_cell(text: str) -> list[str]:
         return text.split("\n") if text else [""]
@@ -2350,13 +2433,15 @@ def _render_claude_session_table(
 
     out.append(_border_row(TL, T_DOWN, TR))
 
-    # Header
+    # Header — labels ellipsize like data cells so a column scaled below
+    # its header width stays box-aligned (issue #102 (a)).
     header_cells = [_split_cell(h) for h in headers]
     max_h = max(len(c) for c in header_cells)
     for li in range(max_h):
         parts = [_dim(V)]
         for i, cell in enumerate(header_cells):
             content = cell[li] if li < len(cell) else ""
+            content = _ellipsize(content, col_widths[i], unicode_ok)
             parts.append(f" {_cyan(_pad_cell(content, col_widths[i], aligns[i]))} ")
             parts.append(_dim(V))
         out.append("".join(parts))
@@ -2372,13 +2457,14 @@ def _render_claude_session_table(
             parts = [_dim(V)]
             for i, (text, cfn) in enumerate(cells):
                 content = split_cells[i][li] if li < len(split_cells[i]) else ""
-                # Truncate with ellipsis if content exceeds column width
-                # (relevant under --compact when widths scale down below
-                # content). Mirrors _render_codex_session_table line ~2100.
+                # Ellipsis-truncate only TEXT cells under --compact. Numeric
+                # (right-aligned) cells are NEVER truncated — a wrong number
+                # is worse than honest overflow (issue #102 (b)); the column
+                # is floored at its full number width so this normally never
+                # overflows. Mirrors _render_codex_session_table.
                 w = col_widths[i]
-                if len(content) > w:
-                    ell = "…" if unicode_ok else "..."
-                    content = content[: max(0, w - len(ell))] + ell
+                if aligns[i] != "right":
+                    content = _ellipsize(content, w, unicode_ok)
                 padded = _pad_cell(content, w, aligns[i])
                 if cfn is not None:
                     padded = cfn(padded)
@@ -2611,20 +2697,16 @@ def _render_project_table(
     # trigger the same path as before.
     if compact or (sum(col_widths) + border_overhead > term_width):
         available = term_width - border_overhead
-        total_col = sum(col_widths)
-        scale = available / total_col if total_col > 0 else 1.0
-        # Floor each column at its HEADER width, never a bare 8 — headers
-        # ("First Seen", "Cache Create", "Cost (USD)") are single-line
-        # unsplittable labels the header render pads without truncation, so
-        # scaling below `len(header)` overflowed the border and misaligned
-        # the box on narrow / --compact terminals.
-        col_floors = [max(8, len(h)) for h in headers]
-        col_widths = [
-            max(int(w * scale), col_floors[i]) for i, w in enumerate(col_widths)
-        ]
-        remainder = available - sum(col_widths)
-        if remainder > 0:
-            col_widths[0] += remainder  # grow Project column
+        # Per-column widest DATA value (excludes the header row): numeric
+        # columns are protected at their number width while header labels may
+        # truncate (issue #102 (a) + (b)).
+        data_widths = [0] * num_cols
+        for cells, _rt in raw_rows:
+            for i, (text, _c) in enumerate(cells):
+                data_widths[i] = max(data_widths[i], _max_line_width(text))
+        col_widths = _scale_down_col_widths(
+            col_widths, aligns, data_widths, available, grow_idx=0,
+        )
 
     def _split_cell(text: str) -> list[str]:
         return text.split("\n") if text else [""]
@@ -2671,6 +2753,7 @@ def _render_project_table(
         parts = [_dim(V)]
         for i, cell in enumerate(header_cells):
             content = cell[li] if li < len(cell) else ""
+            content = _ellipsize(content, col_widths[i], unicode_ok)
             parts.append(f" {_cyan(_pad_cell(content, col_widths[i], aligns[i]))} ")
             parts.append(_dim(V))
         out.append("".join(parts))
@@ -2685,10 +2768,12 @@ def _render_project_table(
             parts = [_dim(V)]
             for i, (text, cfn) in enumerate(cells):
                 content = split_cells[i][li] if li < len(split_cells[i]) else ""
+                # Numeric (right-aligned) cells are never ellipsized \u2014 a
+                # wrong number is worse than honest overflow (issue #102 (b));
+                # text cells truncate so the column can shrink (a).
                 w = col_widths[i]
-                if len(content) > w:
-                    ell = "\u2026" if unicode_ok else "..."
-                    content = content[: max(0, w - len(ell))] + ell
+                if aligns[i] != "right":
+                    content = _ellipsize(content, w, unicode_ok)
                 padded = _pad_cell(content, w, aligns[i])
                 if cfn is not None:
                     padded = cfn(padded)

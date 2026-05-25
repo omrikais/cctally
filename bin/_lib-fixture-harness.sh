@@ -115,6 +115,18 @@ PY
                  "$HARNESS_BIN" "$HARNESS_SUBCOMMAND" $merged_flags 2>&1)
     fi
 
+    # Bless mode: write the captured output back as the golden instead of
+    # diffing. Opt-in via HARNESS_REGEN=1 so an intentional renderer change
+    # (e.g. issue #102's --compact width policy) regenerates goldens through
+    # the SAME capture path used to check them — no drift between regen and
+    # verify. Always re-run the harness WITHOUT the flag afterward to confirm.
+    if [ -n "${HARNESS_REGEN:-}" ]; then
+        echo "$actual" > "$golden"
+        echo "REGEN $name/$label"
+        pass_count=$((pass_count + 1))
+        return 0
+    fi
+
     if [ ! -f "$golden" ]; then
         echo "MISSING GOLDEN $name/$label — actual output:"
         echo "$actual" | sed 's/^/    /'
