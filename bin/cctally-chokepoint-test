@@ -19,11 +19,20 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$REPO_ROOT/bin/cctally"
 FIXTURES="$REPO_ROOT/tests/fixtures/chokepoint"
 
+# Robust golden comparison (issue #106/#107). The prior verdict here was
+# already a robust string compare, but the display-only diff ran over
+# process substitutions whose transient /dev/fd setup failure under heavy
+# parallel CI load could garble the shown output. Route both the verdict
+# and the display through ONE `diff` over real files.
+# shellcheck source=bin/_lib-golden-diff.sh
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
 pass_count=0
 fail_count=0
 
 run_case () {
     local label="$1" script="$2" golden_path="$3"
+    local name="$label"   # consumed by _golden_diff_two_str's FAIL line
     local actual expected
     if [ ! -f "$golden_path" ]; then
         echo "MISSING GOLDEN $label ($golden_path)"
@@ -32,12 +41,14 @@ run_case () {
     fi
     actual=$(TZ=Etc/UTC python3 -c "$script" 2>&1)
     expected=$(cat "$golden_path")
-    if [ "$actual" = "$expected" ]; then
+    # _golden_diff_two_str materializes both $()-captured strings via
+    # `printf '%s'`, so the verdict is byte-identical to the old
+    # `[ "$actual" = "$expected" ]`; on mismatch it prints the FAIL line +
+    # unified diff itself (no process substitution).
+    if _golden_diff_two_str "output" "$expected" "$actual" 200; then
         echo "PASS $label"
         pass_count=$((pass_count + 1))
     else
-        echo "FAIL $label"
-        diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") | sed 's/^/  /'
         fail_count=$((fail_count + 1))
     fi
 }
