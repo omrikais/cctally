@@ -29,6 +29,14 @@ FIXTURES_DIR="$REPO_ROOT/tests/fixtures/setup"
 pass_count=0
 fail_count=0
 
+# Robust golden comparison (issue #106/#107): ONE `diff` over real files
+# drives both the verdict and the displayed bytes — no `<(process
+# substitution)`, whose transient /dev/fd setup failure under heavy
+# parallel CI load made `diff` exit 2 and the old `diff …>/dev/null`
+# detection swallow it as a phantom FAIL with no diff to show.
+# shellcheck source=bin/_lib-golden-diff.sh
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
 # Cross-platform, locale-stable listing of ~/.local/bin/ contents.
 # Emits one line per entry: "<name> -> <target>" for symlinks,
 # "<name> [file]" for regular files, "<name> [dir]" otherwise.
@@ -61,6 +69,9 @@ run_scenario () {
     [ -f "$dir/cmd.txt" ] || { echo "SKIP $name: no cmd.txt"; return 0; }
 
     local fake; fake=$(mktemp -d)
+    # Temp compare files for the golden-diff helpers land in the scratch
+    # HOME, cleaned with the `rm -rf "$fake"` at scenario end.
+    local GOLDEN_DIFF_TMPDIR="$fake"
     if [ -d "$dir/input" ]; then
         cp -R "$dir/input/." "$fake/"
     fi
@@ -196,10 +207,13 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
     local fail_local=0
 
     if [ -f "$dir/golden-stdout.txt" ]; then
-        if ! diff -u "$dir/golden-stdout.txt" <(printf '%s' "$norm") >/dev/null; then
-            fail_local=1
-            diff -u "$dir/golden-stdout.txt" <(printf '%s' "$norm") | head -60
-        fi
+        # $norm and golden-stdout.txt both carry NO trailing newline (the
+        # harness has always compared via `printf '%s'`), so materialize
+        # $norm the same way and diff the two real files — byte-exact.
+        local stdout_tmp; stdout_tmp=$(mktemp "$GOLDEN_DIFF_TMPDIR/golden-diff-stdout.XXXXXX")
+        printf '%s' "$norm" > "$stdout_tmp"
+        _golden_diff_files "stdout" "$dir/golden-stdout.txt" "$stdout_tmp" 60 || fail_local=1
+        rm -f "$stdout_tmp"
     else
         # Missing goldens are FAILURES, not auto-blessed. The test-all
         # aggregator greps for `^MISSING GOLDEN` to surface failures —
@@ -227,10 +241,9 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
             else
                 actual_settings=$(sed -E -e "s|$REPO_ROOT|/REPO|g" -e 's|cctally-legacy-hook-backup-[0-9]{8}-[0-9]{6}|cctally-legacy-hook-backup-TIMESTAMP|g' "$fake/.claude/settings.json")
             fi
-            if ! diff -u "$dir/golden-settings.json" <(printf '%s\n' "$actual_settings") >/dev/null; then
-                diff -u "$dir/golden-settings.json" <(printf '%s\n' "$actual_settings") | head -50
-                fail_local=1
-            fi
+            # golden-settings.json ends in \n; _golden_diff_str materializes
+            # the actual via `printf '%s\n'`, matching the old comparison.
+            _golden_diff_str "settings.json" "$dir/golden-settings.json" "$actual_settings" 50 || fail_local=1
         else
             echo "settings.json missing; expected golden present ($name)"
             fail_local=1
@@ -245,10 +258,9 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
         else
             norm_listing=$(printf '%s' "$listing" | sed -E "s|$REPO_ROOT|/REPO|g")
         fi
-        if ! diff -u "$dir/golden-symlinks.txt" <(printf '%s\n' "$norm_listing") >/dev/null; then
-            diff -u "$dir/golden-symlinks.txt" <(printf '%s\n' "$norm_listing") | head -50
-            fail_local=1
-        fi
+        # golden-symlinks.txt ends in \n; _golden_diff_str materializes the
+        # actual via `printf '%s\n'`, matching the old comparison.
+        _golden_diff_str "symlinks" "$dir/golden-symlinks.txt" "$norm_listing" 50 || fail_local=1
     fi
 
     # Scenario-specific post-run checks (e.g. data dir absence after purge).
