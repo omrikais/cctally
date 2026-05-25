@@ -2123,12 +2123,23 @@ def _render_codex_session_table(
     # auto-detect so the narrow layout renders regardless of terminal width.
     if force_compact or (sum(col_widths) + border_overhead > term_width):
         available = term_width - border_overhead
-        total_col = sum(col_widths)
-        scale = available / total_col if total_col > 0 else 1.0
-        col_widths = [max(int(w * scale), 8) for w in col_widths]
-        remainder = available - sum(col_widths)
-        if remainder > 0:
-            col_widths[3] += remainder  # grow Models column
+        # Issue #99 / #102: the prior bare-`8` floor could scale a column
+        # below its header label, and headers are padded (never truncated)
+        # in the header render — so the header row grew wider than the box
+        # border and the grid misaligned on narrow terminals. Mirror the
+        # sibling renderers (`_render_claude_session_table` + the project
+        # renderer) via the shared `_scale_down_col_widths` chokepoint:
+        # numeric columns are protected at their widest DATA value while
+        # text columns (incl. header labels) absorb the squeeze and may
+        # truncate, keeping every box line the same width. Grows the Models
+        # column (index 3) with any slack, preserving prior behavior.
+        data_widths = [0] * num_cols
+        for cells, _rt in raw_rows:
+            for i, (text, _c) in enumerate(cells):
+                data_widths[i] = max(data_widths[i], _max_line_width(text))
+        col_widths = _scale_down_col_widths(
+            col_widths, aligns, data_widths, available, grow_idx=3,
+        )
 
     def _split_cell(text: str) -> list[str]:
         return text.split("\n") if text else [""]
@@ -2170,13 +2181,17 @@ def _render_codex_session_table(
 
     out.append(_border_row(TL, T_DOWN, TR))
 
-    # Header
+    # Header — labels ellipsize like data cells so a column scaled below
+    # its header width stays box-aligned (issue #99 / #102 (a)). Previously
+    # the header padded without truncating, so a label wider than its
+    # scaled column overflowed the box border.
     header_cells = [_split_cell(h) for h in headers]
     max_h = max(len(c) for c in header_cells)
     for li in range(max_h):
         parts = [_dim(V)]
         for i, cell in enumerate(header_cells):
             content = cell[li] if li < len(cell) else ""
+            content = _ellipsize(content, col_widths[i], unicode_ok)
             parts.append(f" {_cyan(_pad_cell(content, col_widths[i], aligns[i]))} ")
             parts.append(_dim(V))
         out.append("".join(parts))
@@ -2192,11 +2207,14 @@ def _render_codex_session_table(
             parts = [_dim(V)]
             for i, (text, cfn) in enumerate(cells):
                 content = split_cells[i][li] if li < len(split_cells[i]) else ""
-                # Truncate with ellipsis if cell content exceeds column width
+                # Ellipsis-truncate only TEXT cells. Numeric (right-aligned)
+                # cells are NEVER truncated \u2014 a wrong number is worse than
+                # honest overflow (issue #102 (b)); _scale_down_col_widths
+                # floors numeric columns at their full number width so this
+                # normally never overflows. Mirrors the sibling renderers.
                 w = col_widths[i]
-                if len(content) > w:
-                    ell = "\u2026" if unicode_ok else "..."
-                    content = content[: max(0, w - len(ell))] + ell
+                if aligns[i] != "right":
+                    content = _ellipsize(content, w, unicode_ok)
                 padded = _pad_cell(content, w, aligns[i])
                 if cfn is not None:
                     padded = cfn(padded)

@@ -529,3 +529,102 @@ def test_scale_down_protects_numeric_and_reclaims_text(ns):
     # rather than shrink the number.
     widths = scale([10, 10], ["left", "right"], [4, 9], 6, grow_idx=0)
     assert widths[1] >= 9, widths            # full number preserved
+
+
+# ── issue #99: codex session renderer (latent twin of d63b6835 / #102) ────
+
+
+def _codex_session(ns, *, sid: str, directory: str, input_tokens: int,
+                   output_tokens: int):
+    CodexSessionUsage = ns["CodexSessionUsage"]
+    last = dt.datetime(2026, 4, 23, 14, 30, tzinfo=dt.timezone.utc)
+    return CodexSessionUsage(
+        session_id=sid,
+        session_id_path=f"2026/04/23/rollout-{sid}",
+        session_file=f"rollout-{sid}",
+        directory=directory,
+        input_tokens=input_tokens,
+        cached_input_tokens=0,
+        output_tokens=output_tokens,
+        reasoning_output_tokens=0,
+        total_tokens=input_tokens + output_tokens,
+        cost_usd=0.42,
+        models=["gpt-5-codex"],
+        model_breakdowns=[],
+        last_activity=last,
+    )
+
+
+def test_compact_codex_session_border_alignment_on_narrow_terminal(
+    ns, narrow_terminal
+):
+    """Issue #99: `_render_codex_session_table` floored compact-scaled
+    columns at a bare 8, the exact latent twin of the session/project
+    bug fixed in d63b6835 / #102. Headers like "Reasoning" (9),
+    "Cache Read" (10), "Total Tokens" (12), "Cost (USD)" (10) and
+    "Last Activity" (13) are padded — never split — in the header render,
+    so a column floored below its header width pushed the header row past
+    the box border. After mirroring the sibling `_scale_down_col_widths`
+    chokepoint + header ellipsize, every box-drawing line must share one
+    display width."""
+    render = ns["_render_codex_session_table"]
+    sessions = [
+        _codex_session(
+            ns,
+            sid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            directory="/Users/alice/very/long/project/path/that/will/widen/this",
+            input_tokens=12345,
+            output_tokens=6789,
+        ),
+    ]
+    rendered = render(sessions, title="Codex", force_compact=True)
+    widths = _box_line_widths(ns, rendered)
+    assert widths, "no box-drawing lines found in compact codex session render"
+    assert len(set(widths)) == 1, (
+        f"compact codex session table misaligned: distinct box-line widths "
+        f"{sorted(set(widths))}\n{rendered}"
+    )
+
+
+def test_compact_codex_session_numeric_never_truncated_on_narrow_terminal(
+    ns, narrow_terminal
+):
+    """Issue #102 (b) carried to the codex renderer: a wide token count
+    renders in full under `--compact` on 80 cols — never `123,456,…`."""
+    render = ns["_render_codex_session_table"]
+    sessions = [
+        _codex_session(
+            ns,
+            sid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            directory="/Users/alice/very/long/project/path/that/will/widen/this",
+            input_tokens=123_456_789,
+            output_tokens=98_765_432,
+        ),
+    ]
+    rendered = _strip_ansi(render(sessions, title="Codex", force_compact=True))
+    assert "123,456,789" in rendered, rendered      # Input (non-cached)
+    assert "98,765,432" in rendered, rendered        # Output
+    assert "222,222,221" in rendered, rendered       # Total Tokens = in + out
+    assert "123,456,…" not in rendered and "123,45…" not in rendered, rendered
+
+
+def test_compact_codex_session_box_fits_terminal_when_values_fit(
+    ns, narrow_terminal
+):
+    """Issue #102 (b)/(B): small values + 80 cols leave room for the text
+    columns to shrink, so every codex box line is <= COLUMNS."""
+    render = ns["_render_codex_session_table"]
+    sessions = [
+        _codex_session(
+            ns,
+            sid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            directory="/Users/alice/p",
+            input_tokens=100,
+            output_tokens=50,
+        ),
+    ]
+    rendered = render(sessions, title="Codex", force_compact=True)
+    assert _max_box_width(ns, rendered) <= 80, (
+        f"compact codex session box overflowed 80 cols: "
+        f"{sorted(set(_box_line_widths(ns, rendered)))}\n{rendered}"
+    )
