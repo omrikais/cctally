@@ -994,6 +994,72 @@ class TestDiffDebugSamples:
         for _, _, kwargs in captured_calls:
             assert kwargs.get("skip_sync") is False
 
+    def test_priced_joined_entries_render_without_crash(self, monkeypatch):
+        """Regression (code-review P0): `_emit_diff_debug_samples` feeds the
+        raw `_JoinedClaudeEntry` objects yielded by `_diff_iter_claude_entries`
+        straight into `_compute_pricing_mismatch_stats`, which reads
+        `entry.usage`. `_JoinedClaudeEntry` has NO `.usage` attribute, so any
+        priced, known-model entry raised AttributeError — crashing
+        `diff --debug` on real data (every other test in this class stubs the
+        cache reader to [] so the helper short-circuits before `.usage`). The
+        fix adapts via `_usage_entry_from_joined`, mirroring cmd_project /
+        cmd_session. Pre-fix this test raises AttributeError; post-fix it
+        renders the long-form report.
+        """
+        import datetime as dt
+        mod = _load_cctally_module()
+        monkeypatch.setattr(mod, "_DEBUG_REPORT_EMITTED", False)
+
+        def _je():
+            # cost_usd far from the computed cost → guaranteed mismatch, so the
+            # discrepancy path (`usage=dict(entry.usage)`) also executes.
+            return mod._JoinedClaudeEntry(
+                timestamp=dt.datetime(2026, 5, 2, tzinfo=dt.timezone.utc),
+                model="claude-opus-4-7",
+                input_tokens=1000, output_tokens=500,
+                cache_creation_tokens=0, cache_read_tokens=0,
+                source_path="/p/sess.jsonl",
+                session_id="sess-A", project_path="/p",
+                cost_usd=999.0,
+            )
+
+        # Both windows yield a priced, known-model joined entry. Pre-fix this
+        # reaches `entry.usage` in `_compute_pricing_mismatch_stats` → crash.
+        monkeypatch.setattr(
+            mod, "get_claude_session_entries",
+            lambda start, end, **kw: [_je()],
+        )
+        wa = mod.ParsedWindow(
+            label="last-week",
+            start_utc=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc),
+            end_utc=dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
+            length_days=7.0, kind="week", week_aligned=True, full_weeks_count=1,
+        )
+        wb = mod.ParsedWindow(
+            label="this-week",
+            start_utc=dt.datetime(2026, 5, 8, tzinfo=dt.timezone.utc),
+            end_utc=dt.datetime(2026, 5, 15, tzinfo=dt.timezone.utc),
+            length_days=7.0, kind="week", week_aligned=True, full_weeks_count=1,
+        )
+        ns = argparse.Namespace(
+            debug=True, debug_samples=5, sync=False,
+            a="last-week", b="this-week",
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            mod._emit_diff_debug_samples(ns, wa, wb)  # must NOT raise
+        text = buf.getvalue()
+        # Long-form report (entries_with_both > 0), one per window, with the
+        # window-labeled Command line — NOT the empty short form.
+        assert text.count("=== Pricing Mismatch Debug Report ===") == 2, text
+        assert "Command: cctally diff (Window A: last-week)" in text, text
+        assert "Command: cctally diff (Window B: this-week)" in text, text
+        # The discrepancy path (`usage=dict(entry.usage)`) executed for each
+        # window's single mismatching entry — proven by the per-window sample
+        # block + the 0% match rate.
+        assert text.count("=== Sample Discrepancies (first 5) ===") == 2, text
+        assert text.count("Match rate: 0.00%") == 2, text
+
 
 # Review-loop tests (issue #89 review round, all P1/P2/P3 + SR-P2 gaps)
 class TestSyntheticFiltering:

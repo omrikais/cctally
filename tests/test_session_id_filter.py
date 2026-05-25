@@ -190,6 +190,21 @@ def test_id_without_args_returns_all(patched_session):
     assert len(sessions) == 2
 
 
+def test_empty_string_id_filters_to_empty_not_all(patched_session):
+    # Regression (code-review): an explicit `--id ''` must ENGAGE the filter
+    # (no session matches the empty id → empty render), NOT fall through to
+    # "show all sessions". The pre-fix truthiness guard
+    # (`if getattr(args, "id", None):`) treated '' as falsy → no filter →
+    # both sessions rendered. The fix uses `is not None`.
+    mod, sid_a, sid_b = patched_session
+    args = _make_args(mod, id="", json=True)
+    rc, stdout, _ = _capture(lambda: mod.cmd_session(args))
+    assert rc == 0
+    payload = json.loads(stdout)
+    sessions = payload.get("sessions") if isinstance(payload, dict) else payload
+    assert sessions == []
+
+
 def test_filter_applies_to_share_export(cctally_mod, monkeypatch):
     """Codex review (round 1): `session --id X --format ...` must export
     ONLY the matching session. The terminal/JSON paths filter the local

@@ -1621,7 +1621,16 @@ def _emit_diff_debug_samples(args, window_a, window_b) -> None:
                     f"unavailable: {exc}"
                 )
                 continue
-            stats = _compute_pricing_mismatch_stats(entries)
+            # `_diff_iter_claude_entries` yields `_JoinedClaudeEntry`, which
+            # has no `.usage` attribute; adapt to `UsageEntry` before the
+            # mismatch compute, mirroring cmd_project / cmd_session. The stats
+            # helper reads `entry.usage`, so passing raw joined entries here
+            # crashed every priced entry with AttributeError — and the inner
+            # `try/except` only catches DatabaseError/OSError, so the crash
+            # escaped to main()'s generic handler (exit 1, zero diff output).
+            stats = _compute_pricing_mismatch_stats(
+                _usage_entry_from_joined(je) for je in entries
+            )
             stats.command_label = f"diff (Window {label_letter}: {token})"
             for line in _render_pricing_mismatch_report(stats, sample_limit):
                 eprint(line)
@@ -5891,7 +5900,11 @@ def cmd_session(args: argparse.Namespace) -> int:
     # Issue #89: --debug report describes the joined-entry list filtered
     # by --id (post-fallback session_id resolution) when set, matching
     # the rendered scope of `sessions`.
-    if getattr(args, "id", None):
+    # `is not None`, not truthiness: an explicit empty `--id ''` must still
+    # engage the filter (→ empty render), not silently fall through to
+    # "describe/show all sessions" (code-review finding). Mirrored on the
+    # post-aggregation filter below.
+    if getattr(args, "id", None) is not None:
         joined_for_report = [
             je for je in entries
             if _resolve_session_id_for_filter(je) == args.id
@@ -5926,7 +5939,7 @@ def cmd_session(args: argparse.Namespace) -> int:
     # branches. Unknown id → empty `sessions` list, which falls through
     # to the existing "no sessions" branch (table: "No Claude session
     # data found."; JSON: `{"sessions": []}`).
-    if getattr(args, "id", None):
+    if getattr(args, "id", None) is not None:  # explicit '' still filters
         sessions = [s for s in sessions if s.session_id == args.id]
 
     # Shareable-reports gate: --format short-circuits the JSON / table
