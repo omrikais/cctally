@@ -1,6 +1,10 @@
 cctally doctor — 2026-05-13 14:22:31 UTC
 
 Install
+  ✓ Mode                     installed
+      details:
+        dev_mode: False
+        app_dir: $HOME/.local/share/cctally
   ✓ Symlinks                 12/12 present
       details:
         present: 12
@@ -80,4 +84,4 @@ Safety
         current_version: None
         latest_version: None
 
-Summary: 17 OK · 5 WARN · 0 FAIL
+Summary: 18 OK · 5 WARN · 0 FAIL

@@ -94,6 +94,10 @@ class DoctorState:
     # Meta
     now_utc: dt.datetime
     cctally_version: str
+    # Dev-instance isolation (2026-05-26): which data dir this process
+    # resolved, and whether it was via dev-checkout auto-detect.
+    dev_mode: bool
+    app_dir: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -209,6 +213,21 @@ def _check_install_legacy_bespoke(s: DoctorState) -> CheckResult:
         summary=f"detected ({n_entries} entries, {n_files} files)",
         remediation="Run `cctally setup --migrate-legacy-hooks`",
         details={"entries": n_entries, "files": n_files},
+    )
+
+
+def _check_install_dev_mode(s: DoctorState) -> CheckResult:
+    """Always-present, always-ok: reports the resolved data dir and whether
+    this process is a dev-checkout (DEV mode) or the installed binary.
+    Dev-instance isolation (§4)."""
+    if s.dev_mode:
+        summary = "DEV (auto-detected git checkout)"
+    else:
+        summary = "installed"
+    return CheckResult(
+        id="install.mode", title="Mode",
+        severity="ok", summary=summary, remediation=None,
+        details={"dev_mode": s.dev_mode, "app_dir": s.app_dir},
     )
 
 
@@ -840,6 +859,7 @@ def _check_safety_update_available(s: DoctorState) -> CheckResult:
 # success-vs-raise transitions.
 _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = (
     ("install", "Install", (
+        ("install.mode", "_check_install_dev_mode"),
         ("install.symlinks", "_check_install_symlinks"),
         ("install.path", "_check_install_path"),
         ("install.legacy_snippet", "_check_install_legacy_snippet"),

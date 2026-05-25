@@ -26,4 +26,4 @@ Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
 
-Summary: 12 OK · 7 WARN · 3 FAIL
+Summary: 13 OK · 7 WARN · 3 FAIL

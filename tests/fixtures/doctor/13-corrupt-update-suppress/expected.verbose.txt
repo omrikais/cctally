@@ -1,6 +1,10 @@
 cctally doctor — 2026-05-13 14:22:31 UTC
 
 Install
+  ✓ Mode                     installed
+      details:
+        dev_mode: False
+        app_dir: $HOME/.local/share/cctally
   ⚠ Symlinks                 0/12 present; missing cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-sync-week, cctally-tui, cctally-update
       → Run `cctally setup`
       details:
@@ -81,4 +85,4 @@ Safety
         current_version: None
         latest_version: None
 
-Summary: 15 OK · 6 WARN · 1 FAIL
+Summary: 16 OK · 6 WARN · 1 FAIL

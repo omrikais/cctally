@@ -9735,6 +9735,9 @@ def doctor_gather_state(
         effective_update_reason=effective_update_reason,
         now_utc=now_utc,
         cctally_version=cctally_version,
+        # Dev-instance isolation (§4): which data dir resolved + how.
+        dev_mode=_cctally_core.DEV_MODE,
+        app_dir=str(_cctally_core.APP_DIR),
     )
 
 

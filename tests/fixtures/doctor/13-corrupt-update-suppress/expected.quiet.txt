@@ -20,4 +20,4 @@ Safety
   ✗ update-suppress.json     unreadable: UpdateError: update-suppress.json is not valid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
       → `rm ~/.local/share/cctally/update-suppress.json`
 
-Summary: 15 OK · 6 WARN · 1 FAIL
+Summary: 16 OK · 6 WARN · 1 FAIL

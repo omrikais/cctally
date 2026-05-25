@@ -4,6 +4,16 @@
             "checks": [
                 {
                     "details": {
+                        "app_dir": "$HOME/.local/share/cctally",
+                        "dev_mode": false
+                    },
+                    "id": "install.mode",
+                    "severity": "ok",
+                    "summary": "installed",
+                    "title": "Mode"
+                },
+                {
+                    "details": {
                         "missing": [
                             "cctally",
                             "cctally-alerts",
@@ -354,7 +364,7 @@
     "overall": {
         "counts": {
             "fail": 3,
-            "ok": 12,
+            "ok": 13,
             "warn": 7
         },
         "severity": "fail"

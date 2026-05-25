@@ -30,6 +30,7 @@ def test_doctor_state_has_required_fields():
         "now_utc", "cctally_version",
         "forked_bucket_counts",
         "credited_weeks",
+        "dev_mode", "app_dir",
     }
     assert fields == expected, fields ^ expected
 
@@ -102,6 +103,9 @@ def _state(**overrides) -> L.DoctorState:
         effective_update_reason="no_newer",
         now_utc=dt.datetime(2026, 5, 13, 14, 22, 31, tzinfo=dt.timezone.utc),
         cctally_version="1.6.3",
+        # Dev-instance isolation: happy path is the installed (prod) instance.
+        dev_mode=False,
+        app_dir="/home/u/.local/share/cctally",
     )
     base.update(overrides)
     return L.DoctorState(**base)
@@ -142,6 +146,42 @@ def test_install_legacy_bespoke_warn():
     r = L._check_install_legacy_bespoke(s)
     assert r.severity == "warn"
     assert r.remediation == "Run `cctally setup --migrate-legacy-hooks`"
+
+
+def _find_check(report, check_id):
+    for cat in report.categories:
+        for c in cat.checks:
+            if c.id == check_id:
+                return c
+    raise AssertionError(f"check {check_id!r} not in report")
+
+
+def test_install_mode_check_dev():
+    s = _state(dev_mode=True, app_dir="/h/.local/share/cctally-dev")
+    r = L._check_install_dev_mode(s)
+    assert r.id == "install.mode"
+    assert r.severity == "ok"
+    assert "DEV" in r.summary
+    assert r.details["dev_mode"] is True
+    assert r.details["app_dir"] == "/h/.local/share/cctally-dev"
+
+
+def test_install_mode_check_prod():
+    s = _state(dev_mode=False, app_dir="/h/.local/share/cctally")
+    r = L._check_install_dev_mode(s)
+    assert r.id == "install.mode"
+    assert r.severity == "ok"
+    assert "installed" in r.summary
+    assert r.details["dev_mode"] is False
+    assert r.details["app_dir"] == "/h/.local/share/cctally"
+
+
+def test_install_mode_registered_first_in_install_category():
+    rep = L.run_checks(_state())
+    check = _find_check(rep, "install.mode")
+    assert check.severity == "ok"
+    install_cat = next(c for c in rep.categories if c.id == "install")
+    assert install_cat.checks[0].id == "install.mode"
 
 
 def test_hooks_installed_all_present():

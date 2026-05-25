@@ -1,6 +1,7 @@
 cctally doctor — 2026-05-13 14:22:31 UTC
 
 Install
+  ✓ Mode                     installed
   ⚠ Symlinks                 0/12 present; missing cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-sync-week, cctally-tui, cctally-update
       → Run `cctally setup`
   ✓ PATH                     ~/.local/bin on $PATH
@@ -38,4 +39,4 @@ Safety
   ✓ update-suppress.json     parses cleanly
   ✓ Update available         no
 
-Summary: 12 OK · 7 WARN · 3 FAIL
+Summary: 13 OK · 7 WARN · 3 FAIL
