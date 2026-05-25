@@ -4358,6 +4358,25 @@ def _maybe_swap_active_block_to_canonical(
     blocks[active_idx] = rebuilt
 
 
+def _try_dual_form_date(raw: str) -> dt.datetime | None:
+    """Parse ``YYYY-MM-DD`` / ``YYYYMMDD`` WITHOUT emitting an error.
+
+    Returns the parsed naive datetime, or ``None`` when ``raw`` matches
+    neither form. The non-eprinting core of ``_parse_dual_form_date``:
+    callers that have their own fallback for a non-dual-form input must
+    use this, because ``_parse_dual_form_date`` eprints before it raises
+    — so a successful fallback parse would otherwise leak a spurious
+    "must be YYYY-MM-DD" line to stderr (cache-report's ``parse_iso_datetime``
+    second-chance, issue #101).
+    """
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return dt.datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _parse_dual_form_date(raw: str, flag: str) -> dt.datetime:
     """Parse a CLI date arg accepting both ``YYYY-MM-DD`` and ``YYYYMMDD``.
 
@@ -4371,11 +4390,9 @@ def _parse_dual_form_date(raw: str, flag: str) -> dt.datetime:
     Session A, spec §7.1.1). Centralizes the error message so the eight
     in-scope date-taking commands all surface the same diagnostic.
     """
-    for fmt in ("%Y-%m-%d", "%Y%m%d"):
-        try:
-            return dt.datetime.strptime(raw, fmt)
-        except ValueError:
-            continue
+    naive = _try_dual_form_date(raw)
+    if naive is not None:
+        return naive
     eprint(f"Error: {flag} must be YYYY-MM-DD or YYYYMMDD format, got '{raw}'")
     raise ValueError
 
@@ -8819,14 +8836,25 @@ def _resolve_cache_report_window(
         # Date-only: route through the centralized dual-form helper
         # (spec §7.1.1) so YYYY-MM-DD / YYYYMMDD parsing and the error
         # message stay consistent with cmd_blocks / cmd_daily / etc.
-        try:
-            naive = _parse_dual_form_date(raw, flag)
-        except ValueError:
-            # Not a date-only form either — surface the centralized
-            # helper's error (already eprinted) by raising. Callers
-            # propagate the failure rather than fall through to
-            # parse_iso_datetime's secondary message.
-            raise
+        naive = _try_dual_form_date(raw)
+        if naive is None:
+            # Second-chance (issue #101): the pre-Session-A code fell
+            # through to parse_iso_datetime here, so space-separated
+            # datetimes (`2026-05-01 12:30:00`) and ISO week-dates
+            # (`2026-W18-1`) — both accepted by datetime.fromisoformat but
+            # rejected by the dual-form parser — kept working. cache-report
+            # is the only date-taking command with this fallthrough; the
+            # other commands accept YYYY-MM-DD / YYYYMMDD only. Returned
+            # verbatim: a full datetime carries its own time component, so
+            # the is_upper_bound end-of-day expansion is NOT applied (it's
+            # for bare date-only forms). On TOTAL failure (neither dual-form
+            # nor ISO), fall back to the centralized dual-form diagnostic
+            # rather than parse_iso_datetime's more generic message.
+            try:
+                return parse_iso_datetime(raw, flag)
+            except ValueError:
+                _parse_dual_form_date(raw, flag)  # eprints + raises ValueError
+                raise  # unreachable — the call above always raises here
         if is_upper_bound:
             naive = naive.replace(
                 hour=23, minute=59, second=59, microsecond=999999,

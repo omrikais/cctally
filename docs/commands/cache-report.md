@@ -69,6 +69,13 @@ cctally cache-report --json
   full-ISO (`2026-04-10T10:00:00Z`). Mixed-format same-day windows
   collapse to empty (e.g. `--since 20260418 --until 2026-04-18`) — fix:
   use the same format on both ends.
+- As a `cache-report`-only convenience, any other form accepted by
+  Python's `datetime.fromisoformat` also parses — notably
+  space-separated datetimes (`'2026-04-10 10:00:00'`) and ISO week-dates
+  (`2026-W18-1`). A full datetime carries its own time component, so it
+  is used verbatim (no end-of-day rounding on `--until`). The sibling
+  date commands (`daily` / `monthly` / `weekly` / `blocks`) accept only
+  the two forms above.
 - `--by-session` collapses Claude `--resume` chains into one row using
   the `session_files.session_id` mapping.
 - Per-model child rows are always rendered. There is no flag to suppress
