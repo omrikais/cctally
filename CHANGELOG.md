@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-05-25
+
 ### Added
 - **Every Claude reporting command now accepts the `ccusage` flag surface, so `ccusage <cmd> [flags]` invocations paste into `cctally` unchanged.** Across all 10 reporting subcommands (`daily`, `monthly`, `weekly`, `session`, `blocks`, `five-hour-blocks`, `project`, `diff`, `range-cost`, `cache-report`): `-z`/`--timezone` aliases the existing `--tz`; the 8 date-taking commands accept `--since`/`--until` in both `YYYY-MM-DD` and `YYYYMMDD` forms; `--compact` forces compact table layout; `--color`/`--no-color` (plus the `NO_COLOR` / `FORCE_COLOR` env vars) control ANSI on the color-emitting commands (`project`, `diff`) and are accepted-but-inert elsewhere; and `-O`/`--offline`, `--single-thread`, `-d`/`--debug`, and `--config` are accepted as documented no-ops where cctally has no divergent behavior. A top-level `-v` short alias for `--version` is also added. The pass is purely additive — no existing output changes. (#86)
 - **`cctally session` gains `-i`/`--id <session-id>` to filter to a single session.** Exact-string match against the post-resume-merge `sessionId`; an unknown id renders empty and exits 0. (#86)
