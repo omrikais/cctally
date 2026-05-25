@@ -3369,7 +3369,16 @@ def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> int:
         now_iso = now_utc_iso()
         now_dt = parse_iso_datetime(now_iso, "now")
 
-        conn.execute("BEGIN")
+        # BEGIN IMMEDIATE (not deferred): this transaction's first DML is a
+        # READ (min_row/max_row below), so a plain deferred BEGIN takes a read
+        # snapshot and only tries to upgrade to the write lock at the first
+        # INSERT OR IGNORE. Under concurrent first-run openers, a competing
+        # commit landing between that read and the first write makes the upgrade
+        # fail with SQLITE_BUSY_SNAPSHOT *immediately* — busy_timeout cannot
+        # absorb it, and the whole backfill rolls back. Acquiring the write lock
+        # up front serializes the backfill cleanly behind busy_timeout instead.
+        # See cctally-dev#87.
+        conn.execute("BEGIN IMMEDIATE")
         try:
             for key in keys:
                 # MIN-captured row defines the immutable block boundary

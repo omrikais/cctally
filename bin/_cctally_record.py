@@ -799,7 +799,13 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
         # mid-sequence failure doesn't leave the prior block closed
         # without the current block opened/updated.
         now_iso = now_utc_iso()
-        conn.execute("BEGIN")
+        # BEGIN IMMEDIATE (not deferred): the first DML below is a write (the
+        # close-older UPDATE), so this transaction already takes the write lock
+        # up front today. Stating IMMEDIATE makes that the explicit contract —
+        # a future edit that slips a SELECT before the first write here cannot
+        # silently reintroduce a SQLITE_BUSY_SNAPSHOT crash (busy_timeout does
+        # not absorb that). See cctally-dev#87.
+        conn.execute("BEGIN IMMEDIATE")
         try:
             # Step 5: close any STRICTLY OLDER open block. `<` not `!=`
             # — record-usage runs in parallel via background hook-tick &

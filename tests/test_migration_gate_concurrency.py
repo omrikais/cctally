@@ -20,7 +20,8 @@ Two cases:
     ``tests/test_migration_gate_sentinel.py::test_marker_withheld_when_001_not_applied_at_start``
     — cross-referenced here (see ``test_d6b_cross_reference``) rather than
     duplicated. The COMPOUND straddle is an out-of-scope documented
-    residual deferred to #87 (spec D6b / Risk R2).
+    residual deferred to #105 (spec D6b / Risk R2; re-homed from #87 when
+    #87 closed as the stats.db locking fix).
 """
 from __future__ import annotations
 
@@ -214,7 +215,8 @@ def test_d6b_cross_reference():
     full namespace and asserts the walk-complete marker is withheld when
     ``applied_at_start`` is False even on a clean walk. The COMPOUND
     straddle false-pass is an out-of-scope documented residual deferred
-    to #87 (Risk R2). This stub fails loudly if the referenced test is
+    to #105 (Risk R2; re-homed from #87 when #87 closed as the stats.db
+    locking fix). This stub fails loudly if the referenced test is
     renamed/removed so the cross-reference can't silently rot.
     """
     sentinel = _ROOT / "tests" / "test_migration_gate_sentinel.py"
