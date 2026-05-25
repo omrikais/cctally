@@ -34,6 +34,14 @@ REGENERATE="${CCTALLY_DOCTOR_REGENERATE:-}"
 pass_count=0
 fail_count=0
 
+# Robust golden comparison (issue #106/#107): ONE `diff` over real files
+# drives both the verdict and the displayed bytes — no `<(process
+# substitution)`, whose transient /dev/fd setup failure under heavy
+# parallel CI load made `diff` exit 2 and the old `diff …>/dev/null`
+# detection swallow it as a phantom FAIL with no diff to show.
+# shellcheck source=bin/_lib-golden-diff.sh
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
 # Per-run scratch root for ALL scenarios. Each scenario gets its own
 # subdir under here so concurrent harnesses don't collide.
 SCRATCH_ROOT=$(mktemp -d -t cctally-doctor-fixtures-XXXXXX)
@@ -116,12 +124,18 @@ run_mode () {
         return 1
     fi
 
-    if ! diff -u <(printf '%s' "$actual") "$golden" >/dev/null; then
-        echo "FAIL $name/$label"
-        diff -u "$golden" <(printf '%s' "$actual") | head -200
+    # The golden was written with `printf '%s'` (no trailing newline) and
+    # $actual likewise carries none, so materialize $actual the same way and
+    # diff the two real files — byte-exact, golden→actual display order.
+    local GOLDEN_DIFF_TMPDIR="$scratch"
+    local actual_tmp; actual_tmp=$(mktemp "$scratch/golden-diff-actual.XXXXXX")
+    printf '%s' "$actual" > "$actual_tmp"
+    if ! _golden_diff_files "$label" "$golden" "$actual_tmp" 200; then
+        rm -f "$actual_tmp"
         fail_count=$((fail_count + 1))
         return 1
     fi
+    rm -f "$actual_tmp"
     echo "PASS $name/$label"
     pass_count=$((pass_count + 1))
     return 0
