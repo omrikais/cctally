@@ -1831,16 +1831,28 @@ def _setup_install(args: argparse.Namespace) -> int:
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    # Dev-instance isolation (§3): refuse BOTH install and uninstall when run
-    # from a git checkout, unless --force-dev. setup rewrites ~/.claude/
-    # settings.json (prod's hooks), which is NOT under APP_DIR — from the dev
-    # checkout this would repoint prod's hooks at the dev binary or remove
-    # them. Keyed on _is_dev_checkout() (NOT DEV_MODE / the cctally-dev path
+    # Dev-instance isolation (§3): refuse the MUTATING modes (install +
+    # uninstall) when run from a git checkout, unless --force-dev. Those
+    # rewrite ~/.claude/settings.json (prod's hooks), which is NOT under
+    # APP_DIR — from the dev checkout this would repoint prod's hooks at the
+    # dev binary or remove them. --status / --dry-run are read-only previews
+    # (they never write settings.json) and stay usable from a checkout, so
+    # the guard is scoped to the write modes only. The three mode flags are a
+    # mutually-exclusive argparse group, so the write modes (uninstall +
+    # default install) are exactly the complement of {status, dry_run}.
+    # Keyed on _is_dev_checkout() (NOT DEV_MODE / the cctally-dev path
     # string), so a per-branch CCTALLY_DATA_DIR override relocates the data
     # dir but still cannot rewrite prod's hooks (the F1 fix). The test
     # suppressor forces _is_dev_checkout() False, so the setup tests +
     # golden harness behave exactly like prod.
-    if _cctally_core._is_dev_checkout() and not getattr(args, "force_dev", False):
+    mode_is_mutating = not (
+        getattr(args, "status", False) or getattr(args, "dry_run", False)
+    )
+    if (
+        mode_is_mutating
+        and _cctally_core._is_dev_checkout()
+        and not getattr(args, "force_dev", False)
+    ):
         eprint(_DEV_SETUP_REFUSAL_MSG.format(data_dir=_cctally_core.APP_DIR))
         return 2
     # Migration flags are install-mode-only. Reject combinations with

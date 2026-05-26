@@ -840,8 +840,10 @@ def _make_repo_with_git(tmp_path):
 
 class TestSetupDevCheckoutGuard:
     """Dev-instance isolation §3: cmd_setup refuses to run from a git
-    checkout (install AND uninstall) unless --force-dev. Keyed on
-    _is_dev_checkout(), NOT DEV_MODE — so a CCTALLY_DATA_DIR override
+    checkout for the MUTATING modes (install AND uninstall) unless
+    --force-dev. The read-only modes (--status / --dry-run) stay usable from
+    a checkout WITHOUT --force-dev — they never rewrite settings.json. Keyed
+    on _is_dev_checkout(), NOT DEV_MODE — so a CCTALLY_DATA_DIR override
     relocates the data dir but does NOT disarm the hook-write guard (F1).
     """
 
@@ -901,15 +903,57 @@ class TestSetupDevCheckoutGuard:
         assert rc == 2
         assert settings_path.read_text() == before  # uninstall did not strip
 
-    def test_force_dev_bypasses_guard(self, ns, monkeypatch, tmp_path):
-        """--force-dev lets setup proceed from a checkout. Use --dry-run so
-        the proceed path is observable (rc 0) without mutating settings."""
+    def test_status_allowed_in_dev_checkout(self, ns, monkeypatch, tmp_path):
+        """Read-only --status is NOT a write mode, so it stays usable from a
+        checkout WITHOUT --force-dev (it never rewrites settings.json). The
+        guard is scoped to install + uninstall only — refusing --status would
+        regress the inspection path on a dev box."""
         home = self._arrange_checkout(monkeypatch, tmp_path)
         _e2e_pin_paths(ns, monkeypatch, home)
         assert _cctally_core._is_dev_checkout() is True
+        settings_path = home / ".claude" / "settings.json"
+        before = settings_path.read_text()
+        err_buf = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", err_buf)
+
+        rc = ns["cmd_setup"](_e2e_install_args(status=True, force_dev=False))
+
+        assert rc == 0
+        assert "refusing to run from a dev checkout" not in err_buf.getvalue()
+        assert settings_path.read_text() == before  # read-only
+
+    def test_dry_run_allowed_in_dev_checkout(self, ns, monkeypatch, tmp_path):
+        """Read-only --dry-run (preview, modifies nothing) stays usable from a
+        checkout WITHOUT --force-dev — sibling of --status above."""
+        home = self._arrange_checkout(monkeypatch, tmp_path)
+        _e2e_pin_paths(ns, monkeypatch, home)
+        assert _cctally_core._is_dev_checkout() is True
+        settings_path = home / ".claude" / "settings.json"
+        before = settings_path.read_text()
+        err_buf = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", err_buf)
+
+        rc = ns["cmd_setup"](_e2e_install_args(dry_run=True, force_dev=False))
+
+        assert rc == 0
+        assert "refusing to run from a dev checkout" not in err_buf.getvalue()
+        assert settings_path.read_text() == before  # preview only
+
+    def test_force_dev_bypasses_guard(self, ns, monkeypatch, tmp_path):
+        """--force-dev lets setup proceed from a checkout for a MUTATING mode.
+        Uses --uninstall (a write mode) so the test genuinely isolates
+        --force-dev as the cause of the bypass: without the fix's mode gating,
+        --dry-run/--status would proceed regardless of --force-dev, so a
+        read-only mode could not prove the flag does anything."""
+        home = self._arrange_checkout(monkeypatch, tmp_path)
+        _e2e_pin_paths(ns, monkeypatch, home)
+        assert _cctally_core._is_dev_checkout() is True
+        err_buf = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", err_buf)
 
         rc = ns["cmd_setup"](
-            _e2e_install_args(dry_run=True, force_dev=True)
+            _e2e_install_args(uninstall=True, force_dev=True)
         )
 
-        assert rc == 0  # guard bypassed; dry-run reports without refusing
+        assert rc == 0  # guard bypassed; uninstall proceeds
+        assert "refusing to run from a dev checkout" not in err_buf.getvalue()
