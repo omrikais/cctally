@@ -4360,11 +4360,10 @@ def _maybe_swap_active_block_to_canonical(
     if block_end_utc <= now.astimezone(dt.timezone.utc):
         return
     # Re-aggregate entries over the canonical interval. Build a fresh
-    # Block via ``_build_activity_block`` (threading the caller's ``mode``
-    # so the active block's cost honors --mode just like the main grouping
-    # — Session C / Codex F1) so every total stays in one code path — no
-    # field-by-field assignment that could drift if the dataclass grows
-    # new fields.
+    # Block via ``_build_activity_block`` so every total stays in one code
+    # path — no field-by-field assignment that could drift if the dataclass
+    # grows new fields. Thread the caller's ``mode`` so the active block's
+    # cost honors --mode like the main grouping (Session C / Codex F1).
     canonical_entries = [
         e for e in all_entries
         if block_start_utc <= e.timestamp < block_end_utc
