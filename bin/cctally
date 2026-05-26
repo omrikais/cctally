@@ -9887,6 +9887,70 @@ def _add_ccusage_alias_args(parser, *, ansi_emit: bool) -> None:
         )
 
 
+def _add_codex_shared_args(parser: argparse.ArgumentParser) -> None:
+    """Register upstream `ccusage-codex sharedArgs` on a codex subparser.
+
+    Upstream sharedArgs (node_modules/@ccusage/codex/dist/index.js):
+      --timezone/-z, --locale/-l, --compact, --color, --noColor,
+      --offline/--no-offline.
+
+    Honored here: --timezone (dates + aggregation buckets) and
+    --compact (table layout). Accepted-but-no-op (stored on the
+    namespace for drop-in parity with upstream scripts): --locale
+    (we don't locale-format dates), --color / --noColor (we don't
+    emit ANSI codes today). --offline is accepted as a no-op too
+    (we are always offline); it uses BooleanOptionalAction so
+    `--no-offline` also parses cleanly. `-O` is kept as the short
+    form for offline for backward compat with earlier builds.
+    """
+    parser.add_argument(
+        "-z", "--timezone", default=None, metavar="TZ",
+        help="IANA timezone for date bucketing and Date/Last Activity cells.",
+    )
+    parser.add_argument(
+        "-l", "--locale", default=None, metavar="LOCALE",
+        help="Accepted for drop-in compat; no-op (dates are not locale-formatted).",
+    )
+    parser.add_argument(
+        "--compact", action="store_true",
+        help="Force compact table layout regardless of terminal width.",
+    )
+    parser.add_argument(
+        "--color", action="store_true",
+        help="Accepted for drop-in compat; no-op today (no ANSI escapes are emitted).",
+    )
+    parser.add_argument(
+        "--noColor", action="store_true", dest="no_color",
+        help="Accepted for drop-in compat; no-op today (no ANSI escapes are emitted).",
+    )
+    parser.add_argument(
+        "-O", "--offline", action=argparse.BooleanOptionalAction, default=False,
+        help="Accepted for drop-in compat with ccusage-codex; we are always offline.",
+    )
+    parser.add_argument(
+        "--tz", default=None, type=_argparse_tz, metavar="TZ",
+        help="Display timezone: local, utc, or IANA name. Overrides "
+             "config display.tz for this call. Takes precedence over "
+             "upstream's --timezone for drop-in parity.",
+    )
+    # Issue #92: codex parity for the #89 --debug surface. Codex JSONL
+    # has no recorded costUSD to diff against, so the report is the
+    # codex variant ("Codex Pricing Debug Report": totals + top-N
+    # highest computed-cost entries), wired via
+    # _emit_codex_debug_samples_if_set in each cmd_codex_* body.
+    parser.add_argument(
+        "-d", "--debug", action="store_true",
+        help="Emit a stderr 'Codex Pricing Debug Report' (totals + "
+             "the N highest computed-cost sample entries).",
+    )
+    parser.add_argument(
+        "--debug-samples", type=_nonneg_int, default=5, metavar="N",
+        help="Cap on top-entry sample rows in the --debug report "
+             "(default 5; N=0 suppresses the sample block; "
+             "negatives rejected at parse time).",
+    )
+
+
 def _add_share_args(parser, *, has_status_line: bool = False) -> None:
     """Attach shareable-reports flags + format/json mutex to a subparser.
 
@@ -10013,6 +10077,394 @@ def _share_validate_args(args) -> None:
             "cctally: --open is incompatible with --output - (no file to open)\n"
         )
         sys.exit(2)
+
+
+def _build_daily_parser(subparsers, name, *, help_text, xref):
+    """Build the `daily` leaf parser (issue #86 Session B; routes to cmd_daily).
+
+    Build-once, register-twice: this body is the verbatim former inline `daily`
+    construction, parameterized only by `name`, the parent-list `help_text`, and
+    the `xref` appended to `description` (renders on `cctally <name> --help`).
+    """
+    p = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description="Show usage grouped by date, matching upstream ccusage daily output."
+                    "\n\n" + xref,
+        epilog=textwrap.dedent("""\
+            Examples:
+              cctally daily --since 20260414
+              cctally daily --since 20260410 --until 20260416
+              cctally daily --since 20260414 --breakdown
+              cctally daily --since 20260414 --json
+              cctally daily --order desc
+        """),
+    )
+    p.add_argument(
+        "-s", "--since",
+        default=None,
+        metavar="YYYYMMDD",
+        help="Filter from date (inclusive).",
+    )
+    p.add_argument(
+        "-u", "--until",
+        default=None,
+        metavar="YYYYMMDD",
+        help="Filter until date (inclusive).",
+    )
+    p.add_argument(
+        "-b", "--breakdown",
+        action="store_true",
+        help="Show per-model cost breakdown sub-rows.",
+    )
+    p.add_argument(
+        "-o", "--order",
+        choices=("asc", "desc"),
+        default="asc",
+        help="Sort direction by date (default: asc).",
+    )
+    p.add_argument(
+        "--reveal-projects",
+        action="store_true",
+        dest="reveal_projects",
+        help="In --format output, show real project basenames instead of "
+             "the default project-1, project-2, ... anonymization.",
+    )
+    p.add_argument(
+        "--tz", default=None, type=_argparse_tz, metavar="TZ",
+        help="Display timezone: local, utc, or IANA name. "
+             "Overrides config display.tz for this call.",
+    )
+    _add_ccusage_alias_args(p, ansi_emit=False)
+    _add_share_args(p)
+    p.set_defaults(func=cmd_daily)
+    return p
+
+
+def _build_monthly_parser(subparsers, name, *, help_text, xref):
+    """Build the `monthly` leaf parser (issue #86 Session B; routes to cmd_monthly)."""
+    p = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description="Show usage grouped by calendar month, matching upstream ccusage monthly output."
+                    "\n\n" + xref,
+        epilog=textwrap.dedent("""\
+            Examples:
+              cctally monthly --since 20260101
+              cctally monthly --since 20260101 --until 20260331
+              cctally monthly --since 20260101 --breakdown
+              cctally monthly --since 20260101 --json
+              cctally monthly --order desc
+        """),
+    )
+    p.add_argument(
+        "-s", "--since",
+        default=None,
+        metavar="YYYYMMDD",
+        help="Filter from date (inclusive).",
+    )
+    p.add_argument(
+        "-u", "--until",
+        default=None,
+        metavar="YYYYMMDD",
+        help="Filter until date (inclusive).",
+    )
+    p.add_argument(
+        "-b", "--breakdown",
+        action="store_true",
+        help="Show per-model cost breakdown sub-rows.",
+    )
+    p.add_argument(
+        "-o", "--order",
+        choices=("asc", "desc"),
+        default="asc",
+        help="Sort direction by month (default: asc).",
+    )
+    p.add_argument(
+        "--reveal-projects",
+        action="store_true",
+        dest="reveal_projects",
+        help="In --format output, show real project basenames instead of "
+             "the default project-1, project-2, ... anonymization.",
+    )
+    p.add_argument(
+        "--tz", default=None, type=_argparse_tz, metavar="TZ",
+        help="Display timezone: local, utc, or IANA name. "
+             "Overrides config display.tz for this call.",
+    )
+    _add_ccusage_alias_args(p, ansi_emit=False)
+    _add_share_args(p)
+    p.set_defaults(func=cmd_monthly)
+    return p
+
+
+def _build_weekly_parser(subparsers, name, *, help_text, xref):
+    """Build the `weekly` leaf parser (issue #86 Session B; routes to cmd_weekly)."""
+    p = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description="Show Claude usage grouped by subscription week. Boundaries are anchored "
+                    "to weekly_usage_snapshots.week_start_at with 7-day-cadence extrapolation "
+                    "for pre-snapshot history. Columns extend daily/monthly's set with Used % "
+                    "and $/1%."
+                    "\n\n" + xref,
+        epilog=textwrap.dedent("""\
+            Examples:
+              cctally weekly
+              cctally weekly --since 20260101
+              cctally weekly --breakdown
+              cctally weekly --json
+              cctally weekly --order desc
+        """),
+    )
+    p.add_argument("-s", "--since", default=None, metavar="YYYYMMDD",
+                   help="Filter from date (inclusive).")
+    p.add_argument("-u", "--until", default=None, metavar="YYYYMMDD",
+                   help="Filter until date (inclusive).")
+    p.add_argument("-b", "--breakdown", action="store_true",
+                   help="Show per-model cost breakdown sub-rows.")
+    p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
+                   help="Sort direction by week (default: asc).")
+    p.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
+                   help="In --format output, show real project basenames instead of "
+                        "the default project-1, project-2, ... anonymization.")
+    p.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
+                   help="Display timezone: local, utc, or IANA name. "
+                        "Overrides config display.tz for this call.")
+    _add_ccusage_alias_args(p, ansi_emit=False)
+    _add_share_args(p)
+    p.set_defaults(func=cmd_weekly)
+    return p
+
+
+def _build_session_parser(subparsers, name, *, help_text, xref):
+    """Build the `session` leaf parser (issue #86 Session B; routes to cmd_session)."""
+    p = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description="Show Claude usage grouped by JSONL sessionId. Resumed sessions (same "
+                    "sessionId across multiple files) collapse into one row. 11-column "
+                    "layout paralleling codex-session."
+                    "\n\n" + xref,
+        epilog=textwrap.dedent("""\
+            Examples:
+              cctally session
+              cctally session --since 20260401
+              cctally session --since 20260401 --breakdown
+              cctally session --json
+              cctally session --order desc
+        """),
+    )
+    p.add_argument("-s", "--since", default=None, metavar="YYYYMMDD",
+                   help="Filter from date (inclusive).")
+    p.add_argument("-u", "--until", default=None, metavar="YYYYMMDD",
+                   help="Filter until date (inclusive).")
+    p.add_argument("-b", "--breakdown", action="store_true",
+                   help="Show per-model cost breakdown sub-rows.")
+    p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
+                   help="Sort direction by last activity (default: asc — earliest first).")
+    p.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
+                   help="In --format output, show real project basenames instead of "
+                        "the default project-1, project-2, ... anonymization.")
+    p.add_argument("--top-n", type=int, default=15, dest="top_n",
+                   metavar="N",
+                   help="In --format output, cap rows to top N by cost (default: 15). "
+                        "Must be >= 1; values above 50 emit a readability warning. "
+                        "Has no effect on terminal/JSON output.")
+    p.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
+                   help="Display timezone: local, utc, or IANA name. "
+                        "Overrides config display.tz for this call.")
+    p.add_argument(
+        "-i", "--id", default=None, metavar="SESSION_ID", dest="id",
+        help="Filter to a single session by exact-string sessionId. "
+             "Match is against the post-resume-merge id (sessions "
+             "resumed across multiple JSONL files collapse to one id). "
+             "Unknown id → exit 0 with the empty-render branch.",
+    )
+    _add_ccusage_alias_args(p, ansi_emit=False)
+    _add_share_args(p)
+    p.set_defaults(func=cmd_session)
+    return p
+
+
+def _build_blocks_parser(subparsers, name, *, help_text, xref):
+    """Build the `blocks` leaf parser (issue #86 Session B; routes to cmd_blocks).
+
+    Note: `blocks` intentionally has NO `_add_share_args` (matches the former
+    inline block — it is not part of the shareable-output flag surface).
+    """
+    p = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description="Show usage grouped by 5-hour session blocks, matching upstream ccusage blocks output."
+                    "\n\n" + xref,
+        epilog=textwrap.dedent("""\
+            Examples:
+              cctally blocks --since 20260414
+              cctally blocks --since 20260410 --until 20260416
+              cctally blocks --since 20260414 --breakdown
+              cctally blocks --since 20260414 --json
+        """),
+    )
+    p.add_argument(
+        "-s", "--since",
+        default=None,
+        metavar="YYYYMMDD",
+        help="Filter from date (inclusive).",
+    )
+    p.add_argument(
+        "-u", "--until",
+        default=None,
+        metavar="YYYYMMDD",
+        help="Filter until date (inclusive).",
+    )
+    p.add_argument(
+        "-b", "--breakdown",
+        action="store_true",
+        help="Show per-model cost breakdown.",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        dest="json",
+        help="Output JSON matching upstream ccusage blocks format.",
+    )
+    p.add_argument(
+        "--tz", default=None, type=_argparse_tz, metavar="TZ",
+        help="Display timezone: local, utc, or IANA name. "
+             "Overrides config display.tz for this call.",
+    )
+    _add_ccusage_alias_args(p, ansi_emit=False)
+    p.set_defaults(func=cmd_blocks)
+    return p
+
+
+def _build_codex_daily_parser(subparsers, name, *, help_text, xref):
+    """Build the `codex-daily` leaf parser (issue #86 Session B; routes to cmd_codex_daily)."""
+    p = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description="Show Codex usage grouped by date, matching upstream ccusage-codex daily output."
+                    "\n\n" + xref,
+        epilog=textwrap.dedent("""\
+            Examples:
+              cctally codex-daily --since 20260401
+              cctally codex-daily --since 20260401 --breakdown
+              cctally codex-daily --since 20260401 --json
+              cctally codex-daily --order desc
+        """),
+    )
+    p.add_argument("-s", "--since", default=None, metavar="YYYY-MM-DD",
+                   help="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
+    p.add_argument("-u", "--until", default=None, metavar="YYYY-MM-DD",
+                   help="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
+    p.add_argument("-b", "--breakdown", action="store_true",
+                   help="Show per-model cost breakdown sub-rows.")
+    p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
+                   help="Sort direction by date (default: asc).")
+    p.add_argument("--json", action="store_true", dest="json",
+                   help="Output JSON matching upstream ccusage-codex daily format.")
+    _add_codex_shared_args(p)
+    p.set_defaults(func=cmd_codex_daily)
+    return p
+
+
+def _build_codex_monthly_parser(subparsers, name, *, help_text, xref):
+    """Build the `codex-monthly` leaf parser (issue #86 Session B; routes to cmd_codex_monthly)."""
+    p = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description="Show Codex usage grouped by calendar month, matching upstream ccusage-codex monthly output."
+                    "\n\n" + xref,
+        epilog=textwrap.dedent("""\
+            Examples:
+              cctally codex-monthly --since 20260101
+              cctally codex-monthly --breakdown
+              cctally codex-monthly --json
+        """),
+    )
+    p.add_argument("-s", "--since", default=None, metavar="YYYY-MM-DD",
+                   help="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
+    p.add_argument("-u", "--until", default=None, metavar="YYYY-MM-DD",
+                   help="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
+    p.add_argument("-b", "--breakdown", action="store_true",
+                   help="Show per-model cost breakdown sub-rows.")
+    p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
+                   help="Sort direction by month (default: asc).")
+    p.add_argument("--json", action="store_true", dest="json",
+                   help="Output JSON matching upstream ccusage-codex monthly format.")
+    _add_codex_shared_args(p)
+    p.set_defaults(func=cmd_codex_monthly)
+    return p
+
+
+def _build_codex_weekly_parser(subparsers, name, *, help_text, xref):
+    """Build the `codex-weekly` leaf parser (issue #86 Session B; routes to cmd_codex_weekly)."""
+    p = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description="Show Codex usage grouped by week. Week-start day is read from config.json "
+                    "(collector.week_start, Monday default). Not a ccusage-codex drop-in — "
+                    "upstream has no `codex weekly` command."
+                    "\n\n" + xref,
+        epilog=textwrap.dedent("""\
+            Examples:
+              cctally codex-weekly
+              cctally codex-weekly --since 20260301
+              cctally codex-weekly --breakdown
+              cctally codex-weekly --json
+              cctally codex-weekly --order desc
+        """),
+    )
+    p.add_argument("-s", "--since", default=None, metavar="YYYY-MM-DD",
+                   help="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
+    p.add_argument("-u", "--until", default=None, metavar="YYYY-MM-DD",
+                   help="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
+    p.add_argument("-b", "--breakdown", action="store_true",
+                   help="Show per-model cost breakdown sub-rows.")
+    p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
+                   help="Sort direction by week (default: asc).")
+    p.add_argument("--json", action="store_true", dest="json",
+                   help="Output JSON.")
+    _add_codex_shared_args(p)
+    p.set_defaults(func=cmd_codex_weekly)
+    return p
+
+
+def _build_codex_session_parser(subparsers, name, *, help_text, xref):
+    """Build the `codex-session` leaf parser (issue #86 Session B; routes to cmd_codex_session)."""
+    p = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description="Show Codex usage grouped by session, matching upstream ccusage-codex session output."
+                    "\n\n" + xref,
+        epilog=textwrap.dedent("""\
+            Examples:
+              cctally codex-session
+              cctally codex-session --since 20260401
+              cctally codex-session --json
+        """),
+    )
+    p.add_argument("-s", "--since", default=None, metavar="YYYY-MM-DD",
+                   help="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
+    p.add_argument("-u", "--until", default=None, metavar="YYYY-MM-DD",
+                   help="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
+    p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
+                   help="Sort direction by last activity (default: asc — earliest first).")
+    p.add_argument("--json", action="store_true", dest="json",
+                   help="Output JSON matching upstream ccusage-codex session format.")
+    _add_codex_shared_args(p)
+    p.set_defaults(func=cmd_codex_session)
+    return p
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -10747,49 +11199,10 @@ def build_parser() -> argparse.ArgumentParser:
     rc.set_defaults(func=cmd_range_cost)
 
     # -- blocks --
-    bl = sub.add_parser(
-        "blocks",
-        help="Show usage report grouped by 5-hour session blocks",
-        formatter_class=CLIHelpFormatter,
-        description="Show usage grouped by 5-hour session blocks, matching upstream ccusage blocks output.",
-        epilog=textwrap.dedent("""\
-            Examples:
-              cctally blocks --since 20260414
-              cctally blocks --since 20260410 --until 20260416
-              cctally blocks --since 20260414 --breakdown
-              cctally blocks --since 20260414 --json
-        """),
-    )
-    bl.add_argument(
-        "-s", "--since",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter from date (inclusive).",
-    )
-    bl.add_argument(
-        "-u", "--until",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter until date (inclusive).",
-    )
-    bl.add_argument(
-        "-b", "--breakdown",
-        action="store_true",
-        help="Show per-model cost breakdown.",
-    )
-    bl.add_argument(
-        "--json",
-        action="store_true",
-        dest="json",
-        help="Output JSON matching upstream ccusage blocks format.",
-    )
-    bl.add_argument(
-        "--tz", default=None, type=_argparse_tz, metavar="TZ",
-        help="Display timezone: local, utc, or IANA name. "
-             "Overrides config display.tz for this call.",
-    )
-    _add_ccusage_alias_args(bl, ansi_emit=False)
-    bl.set_defaults(func=cmd_blocks)
+    _build_blocks_parser(
+        sub, "blocks",
+        help_text="Show usage report grouped by 5-hour session blocks",
+        xref="Alias of `cctally claude blocks` (the canonical form).")
 
     # -- five-hour-blocks --
     fhb = sub.add_parser(
@@ -10875,319 +11288,46 @@ def build_parser() -> argparse.ArgumentParser:
     p_cache_sync.set_defaults(func=cmd_cache_sync)
 
     # -- daily --
-    dy = sub.add_parser(
-        "daily",
-        help="Show usage report grouped by date",
-        formatter_class=CLIHelpFormatter,
-        description="Show usage grouped by date, matching upstream ccusage daily output.",
-        epilog=textwrap.dedent("""\
-            Examples:
-              cctally daily --since 20260414
-              cctally daily --since 20260410 --until 20260416
-              cctally daily --since 20260414 --breakdown
-              cctally daily --since 20260414 --json
-              cctally daily --order desc
-        """),
-    )
-    dy.add_argument(
-        "-s", "--since",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter from date (inclusive).",
-    )
-    dy.add_argument(
-        "-u", "--until",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter until date (inclusive).",
-    )
-    dy.add_argument(
-        "-b", "--breakdown",
-        action="store_true",
-        help="Show per-model cost breakdown sub-rows.",
-    )
-    dy.add_argument(
-        "-o", "--order",
-        choices=("asc", "desc"),
-        default="asc",
-        help="Sort direction by date (default: asc).",
-    )
-    dy.add_argument(
-        "--reveal-projects",
-        action="store_true",
-        dest="reveal_projects",
-        help="In --format output, show real project basenames instead of "
-             "the default project-1, project-2, ... anonymization.",
-    )
-    dy.add_argument(
-        "--tz", default=None, type=_argparse_tz, metavar="TZ",
-        help="Display timezone: local, utc, or IANA name. "
-             "Overrides config display.tz for this call.",
-    )
-    _add_ccusage_alias_args(dy, ansi_emit=False)
-    _add_share_args(dy)
-    dy.set_defaults(func=cmd_daily)
+    _build_daily_parser(
+        sub, "daily",
+        help_text="Show usage report grouped by date",
+        xref="Alias of `cctally claude daily` (the canonical form).")
 
     # -- monthly --
-    mo = sub.add_parser(
-        "monthly",
-        help="Show usage report grouped by month",
-        formatter_class=CLIHelpFormatter,
-        description="Show usage grouped by calendar month, matching upstream ccusage monthly output.",
-        epilog=textwrap.dedent("""\
-            Examples:
-              cctally monthly --since 20260101
-              cctally monthly --since 20260101 --until 20260331
-              cctally monthly --since 20260101 --breakdown
-              cctally monthly --since 20260101 --json
-              cctally monthly --order desc
-        """),
-    )
-    mo.add_argument(
-        "-s", "--since",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter from date (inclusive).",
-    )
-    mo.add_argument(
-        "-u", "--until",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter until date (inclusive).",
-    )
-    mo.add_argument(
-        "-b", "--breakdown",
-        action="store_true",
-        help="Show per-model cost breakdown sub-rows.",
-    )
-    mo.add_argument(
-        "-o", "--order",
-        choices=("asc", "desc"),
-        default="asc",
-        help="Sort direction by month (default: asc).",
-    )
-    mo.add_argument(
-        "--reveal-projects",
-        action="store_true",
-        dest="reveal_projects",
-        help="In --format output, show real project basenames instead of "
-             "the default project-1, project-2, ... anonymization.",
-    )
-    mo.add_argument(
-        "--tz", default=None, type=_argparse_tz, metavar="TZ",
-        help="Display timezone: local, utc, or IANA name. "
-             "Overrides config display.tz for this call.",
-    )
-    _add_ccusage_alias_args(mo, ansi_emit=False)
-    _add_share_args(mo)
-    mo.set_defaults(func=cmd_monthly)
+    _build_monthly_parser(
+        sub, "monthly",
+        help_text="Show usage report grouped by month",
+        xref="Alias of `cctally claude monthly` (the canonical form).")
 
     # -- weekly --
-    we = sub.add_parser(
-        "weekly",
-        help="Show usage grouped by subscription week (with Used %% and $/1%%)",
-        formatter_class=CLIHelpFormatter,
-        description="Show Claude usage grouped by subscription week. Boundaries are anchored "
-                    "to weekly_usage_snapshots.week_start_at with 7-day-cadence extrapolation "
-                    "for pre-snapshot history. Columns extend daily/monthly's set with Used % "
-                    "and $/1%.",
-        epilog=textwrap.dedent("""\
-            Examples:
-              cctally weekly
-              cctally weekly --since 20260101
-              cctally weekly --breakdown
-              cctally weekly --json
-              cctally weekly --order desc
-        """),
-    )
-    we.add_argument("-s", "--since", default=None, metavar="YYYYMMDD",
-                    help="Filter from date (inclusive).")
-    we.add_argument("-u", "--until", default=None, metavar="YYYYMMDD",
-                    help="Filter until date (inclusive).")
-    we.add_argument("-b", "--breakdown", action="store_true",
-                    help="Show per-model cost breakdown sub-rows.")
-    we.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
-                    help="Sort direction by week (default: asc).")
-    we.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
-                    help="In --format output, show real project basenames instead of "
-                         "the default project-1, project-2, ... anonymization.")
-    we.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
-                    help="Display timezone: local, utc, or IANA name. "
-                         "Overrides config display.tz for this call.")
-    _add_ccusage_alias_args(we, ansi_emit=False)
-    _add_share_args(we)
-    we.set_defaults(func=cmd_weekly)
-
-    # -- codex shared args helper --
-    def _add_codex_shared_args(parser: argparse.ArgumentParser) -> None:
-        """Register upstream `ccusage-codex sharedArgs` on a codex subparser.
-
-        Upstream sharedArgs (node_modules/@ccusage/codex/dist/index.js):
-          --timezone/-z, --locale/-l, --compact, --color, --noColor,
-          --offline/--no-offline.
-
-        Honored here: --timezone (dates + aggregation buckets) and
-        --compact (table layout). Accepted-but-no-op (stored on the
-        namespace for drop-in parity with upstream scripts): --locale
-        (we don't locale-format dates), --color / --noColor (we don't
-        emit ANSI codes today). --offline is accepted as a no-op too
-        (we are always offline); it uses BooleanOptionalAction so
-        `--no-offline` also parses cleanly. `-O` is kept as the short
-        form for offline for backward compat with earlier builds.
-        """
-        parser.add_argument(
-            "-z", "--timezone", default=None, metavar="TZ",
-            help="IANA timezone for date bucketing and Date/Last Activity cells.",
-        )
-        parser.add_argument(
-            "-l", "--locale", default=None, metavar="LOCALE",
-            help="Accepted for drop-in compat; no-op (dates are not locale-formatted).",
-        )
-        parser.add_argument(
-            "--compact", action="store_true",
-            help="Force compact table layout regardless of terminal width.",
-        )
-        parser.add_argument(
-            "--color", action="store_true",
-            help="Accepted for drop-in compat; no-op today (no ANSI escapes are emitted).",
-        )
-        parser.add_argument(
-            "--noColor", action="store_true", dest="no_color",
-            help="Accepted for drop-in compat; no-op today (no ANSI escapes are emitted).",
-        )
-        parser.add_argument(
-            "-O", "--offline", action=argparse.BooleanOptionalAction, default=False,
-            help="Accepted for drop-in compat with ccusage-codex; we are always offline.",
-        )
-        parser.add_argument(
-            "--tz", default=None, type=_argparse_tz, metavar="TZ",
-            help="Display timezone: local, utc, or IANA name. Overrides "
-                 "config display.tz for this call. Takes precedence over "
-                 "upstream's --timezone for drop-in parity.",
-        )
-        # Issue #92: codex parity for the #89 --debug surface. Codex JSONL
-        # has no recorded costUSD to diff against, so the report is the
-        # codex variant ("Codex Pricing Debug Report": totals + top-N
-        # highest computed-cost entries), wired via
-        # _emit_codex_debug_samples_if_set in each cmd_codex_* body.
-        parser.add_argument(
-            "-d", "--debug", action="store_true",
-            help="Emit a stderr 'Codex Pricing Debug Report' (totals + "
-                 "the N highest computed-cost sample entries).",
-        )
-        parser.add_argument(
-            "--debug-samples", type=_nonneg_int, default=5, metavar="N",
-            help="Cap on top-entry sample rows in the --debug report "
-                 "(default 5; N=0 suppresses the sample block; "
-                 "negatives rejected at parse time).",
-        )
+    _build_weekly_parser(
+        sub, "weekly",
+        help_text="Show usage grouped by subscription week (with Used %% and $/1%%)",
+        xref="Alias of `cctally claude weekly` (the canonical form).")
 
     # -- codex-daily --
-    cd = sub.add_parser(
-        "codex-daily",
-        help="Show Codex usage report grouped by date (drop-in for `ccusage-codex daily`)",
-        formatter_class=CLIHelpFormatter,
-        description="Show Codex usage grouped by date, matching upstream ccusage-codex daily output.",
-        epilog=textwrap.dedent("""\
-            Examples:
-              cctally codex-daily --since 20260401
-              cctally codex-daily --since 20260401 --breakdown
-              cctally codex-daily --since 20260401 --json
-              cctally codex-daily --order desc
-        """),
-    )
-    cd.add_argument("-s", "--since", default=None, metavar="YYYY-MM-DD",
-                    help="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
-    cd.add_argument("-u", "--until", default=None, metavar="YYYY-MM-DD",
-                    help="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
-    cd.add_argument("-b", "--breakdown", action="store_true",
-                    help="Show per-model cost breakdown sub-rows.")
-    cd.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
-                    help="Sort direction by date (default: asc).")
-    cd.add_argument("--json", action="store_true", dest="json",
-                    help="Output JSON matching upstream ccusage-codex daily format.")
-    _add_codex_shared_args(cd)
-    cd.set_defaults(func=cmd_codex_daily)
+    _build_codex_daily_parser(
+        sub, "codex-daily",
+        help_text="Show Codex usage report grouped by date (drop-in for `ccusage-codex daily`)",
+        xref="Alias of `cctally codex daily` (the canonical form).")
 
     # -- codex-monthly --
-    cmn = sub.add_parser(
-        "codex-monthly",
-        help="Show Codex usage grouped by month (drop-in for `ccusage-codex monthly`)",
-        formatter_class=CLIHelpFormatter,
-        description="Show Codex usage grouped by calendar month, matching upstream ccusage-codex monthly output.",
-        epilog=textwrap.dedent("""\
-            Examples:
-              cctally codex-monthly --since 20260101
-              cctally codex-monthly --breakdown
-              cctally codex-monthly --json
-        """),
-    )
-    cmn.add_argument("-s", "--since", default=None, metavar="YYYY-MM-DD",
-                     help="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
-    cmn.add_argument("-u", "--until", default=None, metavar="YYYY-MM-DD",
-                     help="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
-    cmn.add_argument("-b", "--breakdown", action="store_true",
-                     help="Show per-model cost breakdown sub-rows.")
-    cmn.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
-                     help="Sort direction by month (default: asc).")
-    cmn.add_argument("--json", action="store_true", dest="json",
-                     help="Output JSON matching upstream ccusage-codex monthly format.")
-    _add_codex_shared_args(cmn)
-    cmn.set_defaults(func=cmd_codex_monthly)
+    _build_codex_monthly_parser(
+        sub, "codex-monthly",
+        help_text="Show Codex usage grouped by month (drop-in for `ccusage-codex monthly`)",
+        xref="Alias of `cctally codex monthly` (the canonical form).")
 
     # -- codex-weekly --
-    cw = sub.add_parser(
-        "codex-weekly",
-        help="Show Codex usage grouped by week (week-start from config.json)",
-        formatter_class=CLIHelpFormatter,
-        description="Show Codex usage grouped by week. Week-start day is read from config.json "
-                    "(collector.week_start, Monday default). Not a ccusage-codex drop-in — "
-                    "upstream has no `codex weekly` command.",
-        epilog=textwrap.dedent("""\
-            Examples:
-              cctally codex-weekly
-              cctally codex-weekly --since 20260301
-              cctally codex-weekly --breakdown
-              cctally codex-weekly --json
-              cctally codex-weekly --order desc
-        """),
-    )
-    cw.add_argument("-s", "--since", default=None, metavar="YYYY-MM-DD",
-                    help="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
-    cw.add_argument("-u", "--until", default=None, metavar="YYYY-MM-DD",
-                    help="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
-    cw.add_argument("-b", "--breakdown", action="store_true",
-                    help="Show per-model cost breakdown sub-rows.")
-    cw.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
-                    help="Sort direction by week (default: asc).")
-    cw.add_argument("--json", action="store_true", dest="json",
-                    help="Output JSON.")
-    _add_codex_shared_args(cw)
-    cw.set_defaults(func=cmd_codex_weekly)
+    _build_codex_weekly_parser(
+        sub, "codex-weekly",
+        help_text="Show Codex usage grouped by week (week-start from config.json)",
+        xref="Alias of `cctally codex weekly` (the canonical form).")
 
     # -- codex-session --
-    cs = sub.add_parser(
-        "codex-session",
-        help="Show Codex usage grouped by session (drop-in for `ccusage-codex session`)",
-        formatter_class=CLIHelpFormatter,
-        description="Show Codex usage grouped by session, matching upstream ccusage-codex session output.",
-        epilog=textwrap.dedent("""\
-            Examples:
-              cctally codex-session
-              cctally codex-session --since 20260401
-              cctally codex-session --json
-        """),
-    )
-    cs.add_argument("-s", "--since", default=None, metavar="YYYY-MM-DD",
-                    help="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
-    cs.add_argument("-u", "--until", default=None, metavar="YYYY-MM-DD",
-                    help="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
-    cs.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
-                    help="Sort direction by last activity (default: asc — earliest first).")
-    cs.add_argument("--json", action="store_true", dest="json",
-                    help="Output JSON matching upstream ccusage-codex session format.")
-    _add_codex_shared_args(cs)
-    cs.set_defaults(func=cmd_codex_session)
+    _build_codex_session_parser(
+        sub, "codex-session",
+        help_text="Show Codex usage grouped by session (drop-in for `ccusage-codex session`)",
+        xref="Alias of `cctally codex session` (the canonical form).")
 
     # -- project --
     p_project = sub.add_parser(
@@ -11285,51 +11425,62 @@ def build_parser() -> argparse.ArgumentParser:
     diff_p.set_defaults(func=cmd_diff)
 
     # -- session --
-    se = sub.add_parser(
-        "session",
-        help="Show Claude usage grouped by sessionId (merges resumed-across-files sessions)",
+    _build_session_parser(
+        sub, "session",
+        help_text="Show Claude usage grouped by sessionId (merges resumed-across-files sessions)",
+        xref="Alias of `cctally claude session` (the canonical form).")
+
+    # --- `claude` subgroup (drop-in for `ccusage claude …`); issue #86 Session B ---
+    # Build-once, register-twice: these reuse the same nine builders as the flat
+    # forms above. Nested subparsers reuse dest="command" so args.command resolves
+    # to the leaf name (e.g. "blocks"), keeping banner suppression byte-identical
+    # to the flat form with zero hook-path changes.
+    claude_p = sub.add_parser(
+        "claude",
+        help="Claude-source reports (drop-in for `ccusage claude …`)",
         formatter_class=CLIHelpFormatter,
-        description="Show Claude usage grouped by JSONL sessionId. Resumed sessions (same "
-                    "sessionId across multiple files) collapse into one row. 11-column "
-                    "layout paralleling codex-session.",
-        epilog=textwrap.dedent("""\
-            Examples:
-              cctally session
-              cctally session --since 20260401
-              cctally session --since 20260401 --breakdown
-              cctally session --json
-              cctally session --order desc
-        """),
-    )
-    se.add_argument("-s", "--since", default=None, metavar="YYYYMMDD",
-                    help="Filter from date (inclusive).")
-    se.add_argument("-u", "--until", default=None, metavar="YYYYMMDD",
-                    help="Filter until date (inclusive).")
-    se.add_argument("-b", "--breakdown", action="store_true",
-                    help="Show per-model cost breakdown sub-rows.")
-    se.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
-                    help="Sort direction by last activity (default: asc — earliest first).")
-    se.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
-                    help="In --format output, show real project basenames instead of "
-                         "the default project-1, project-2, ... anonymization.")
-    se.add_argument("--top-n", type=int, default=15, dest="top_n",
-                    metavar="N",
-                    help="In --format output, cap rows to top N by cost (default: 15). "
-                         "Must be >= 1; values above 50 emit a readability warning. "
-                         "Has no effect on terminal/JSON output.")
-    se.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
-                    help="Display timezone: local, utc, or IANA name. "
-                         "Overrides config display.tz for this call.")
-    se.add_argument(
-        "-i", "--id", default=None, metavar="SESSION_ID", dest="id",
-        help="Filter to a single session by exact-string sessionId. "
-             "Match is against the post-resume-merge id (sessions "
-             "resumed across multiple JSONL files collapse to one id). "
-             "Unknown id → exit 0 with the empty-render branch.",
-    )
-    _add_ccusage_alias_args(se, ansi_emit=False)
-    _add_share_args(se)
-    se.set_defaults(func=cmd_session)
+        description="Claude-source usage reports. Each subcommand is a drop-in for the "
+                    "matching `ccusage claude <cmd>` and shares its engine with the "
+                    "top-level `cctally <cmd>` alias.")
+    claude_sub = claude_p.add_subparsers(dest="command", required=True, metavar="<command>")
+    _build_daily_parser(claude_sub, "daily",
+        help_text="Show usage grouped by date",
+        xref="Drop-in for `ccusage claude daily`. Same engine as `cctally daily`.")
+    _build_monthly_parser(claude_sub, "monthly",
+        help_text="Show usage grouped by month",
+        xref="Drop-in for `ccusage claude monthly`. Same engine as `cctally monthly`.")
+    _build_weekly_parser(claude_sub, "weekly",
+        help_text="Show usage grouped by subscription week",
+        xref="Drop-in for `ccusage claude weekly`. Same engine as `cctally weekly`.")
+    _build_session_parser(claude_sub, "session",
+        help_text="Show usage grouped by session",
+        xref="Drop-in for `ccusage claude session`. Same engine as `cctally session`.")
+    _build_blocks_parser(claude_sub, "blocks",
+        help_text="Show usage grouped by 5-hour session blocks",
+        xref="Drop-in for `ccusage claude blocks`. Same engine as `cctally blocks`.")
+
+    # --- `codex` subgroup (drop-in for `ccusage codex …`); issue #86 Session B ---
+    codex_p = sub.add_parser(
+        "codex",
+        help="Codex-source reports (drop-in for `ccusage codex …`)",
+        formatter_class=CLIHelpFormatter,
+        description="Codex-source usage reports. daily/monthly/session are drop-ins for "
+                    "`ccusage codex <cmd>`; weekly is a cctally extension. Each shares its "
+                    "engine with the matching `cctally codex-<cmd>` alias.")
+    codex_sub = codex_p.add_subparsers(dest="command", required=True, metavar="<command>")
+    _build_codex_daily_parser(codex_sub, "daily",
+        help_text="Show Codex usage grouped by date",
+        xref="Drop-in for `ccusage codex daily`. Same engine as `cctally codex-daily`.")
+    _build_codex_monthly_parser(codex_sub, "monthly",
+        help_text="Show Codex usage grouped by month",
+        xref="Drop-in for `ccusage codex monthly`. Same engine as `cctally codex-monthly`.")
+    _build_codex_session_parser(codex_sub, "session",
+        help_text="Show Codex usage grouped by session",
+        xref="Drop-in for `ccusage codex session`. Same engine as `cctally codex-session`.")
+    _build_codex_weekly_parser(codex_sub, "weekly",
+        help_text="Show Codex usage grouped by week",
+        xref="cctally extension (no upstream `ccusage codex weekly`). Same engine as "
+             "`cctally codex-weekly`.")
 
     # ---- config (persisted user preferences) ----
     cfg_p = sub.add_parser(

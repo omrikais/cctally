@@ -3,6 +3,8 @@
 Claude usage grouped by date. Drop-in replacement for `ccusage daily`,
 offline.
 
+> Canonical form: [`cctally claude daily`](claude.md) (this flat form remains as an alias).
+
 ## Synopsis
 
 ```

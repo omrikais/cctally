@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Self-checking equivalence harness for the `cctally claude|codex` subgroups
+# (issue #86 Session B). Asserts each subgroup form is byte-identical to its
+# flat alias across stdout + stderr + exit code; that the subgroup --help
+# surfaces enumerate the right leaves and carry the per-leaf xref; and that
+# the migration-error banner (stdout, NOT isatty-gated) is shown/suppressed
+# identically through both forms. No golden files — flat behavior is the
+# single source of truth, so the subgroup inherits correctness transitively.
+#
+# Parallelism: this harness runs serially (all checks share one scratch dir +
+# two pinned fixture HOMEs). It's cheap (no fixture rebuild beyond the two
+# builder invocations) so it stays in test-all's Phase 1 pool without inner
+# concurrency. Output is line-buffered and emitted in declaration order.
+set -uo pipefail
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN="$REPO_ROOT/bin/cctally"
+SCRATCH=$(mktemp -d -t cctally-subgroup-XXXXXX)
+trap 'rm -rf "$SCRATCH"' EXIT
+# Dev-instance isolation preamble (exports CCTALLY_DISABLE_DEV_AUTODETECT=1 so
+# bin/cctally resolves the PROD data-dir layout under our fake HOMEs, not the
+# cctally-dev checkout layout). Enforced by
+# tests/test_harness_dev_autodetect_coverage.py.
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+export GOLDEN_DIFF_TMPDIR="$SCRATCH"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
+pass=0; fail=0
+
+# --- seed Claude + Codex fixture data into pinned data dirs ---
+"$REPO_ROOT/bin/build-blocks-fixtures.py" --out "$SCRATCH/claude" >/dev/null || { echo "FAIL: blocks builder"; exit 1; }
+"$REPO_ROOT/bin/build-codex-fixtures.py"  --out "$SCRATCH/codex"  >/dev/null || { echo "FAIL: codex builder"; exit 1; }
+
+# Both builders write one fixture HOME per scenario, laid out as
+#   <out>/[<cmd>/]<scenario>/{.local/share/cctally/cache.db, .claude|.codex/...}
+# so the scenario HOME is FOUR `dirname`s up from its cache.db (strip
+# cache.db -> cctally -> share -> .local -> HOME). We pin to one scenario per
+# source that carries rich source data: the blocks 'mixed' scenario (Claude
+# session_entries for daily/monthly/weekly/session/blocks) and a codex
+# 'token-count-dedup' scenario (.codex/sessions JSONL the four codex commands
+# re-ingest). Equivalence is what's asserted, so any populated HOME suffices.
+_home_from_cachedb() { dirname "$(dirname "$(dirname "$(dirname "$1")")")"; }
+CLAUDE_CACHE=$(find "$SCRATCH/claude" -path '*/mixed/.local/share/cctally/cache.db' | head -1)
+CODEX_CACHE=$(find "$SCRATCH/codex" -path '*codex-daily/token-count-dedup/.local/share/cctally/cache.db' | head -1)
+[ -n "$CLAUDE_CACHE" ] || { echo "FAIL: could not locate Claude fixture cache.db"; exit 1; }
+[ -n "$CODEX_CACHE" ]  || { echo "FAIL: could not locate Codex fixture cache.db"; exit 1; }
+CLAUDE_HOME=$(_home_from_cachedb "$CLAUDE_CACHE")
+CODEX_HOME=$(_home_from_cachedb "$CODEX_CACHE")
+
+# compare_forms <label> <home> <flat-argline> <subgroup-argline>
+# Runs both, diffs stdout, stderr, and exit code.
+compare_forms() {
+    local label="$1" home="$2" flat="$3" sub="$4"
+    local name="$label"  # _golden_diff_two_str uses $name in FAIL lines
+    local o1 o2 e1 e2 r1 r2
+    # word-split arglines intentionally (flags); disable SC2086 locally
+    # shellcheck disable=SC2086
+    o1=$(HOME="$home" CCTALLY_DATA_DIR="$home/.local/share/cctally" TZ=Etc/UTC NO_COLOR=1 "$BIN" $flat 2>"$SCRATCH/e1"); r1=$?
+    # shellcheck disable=SC2086
+    o2=$(HOME="$home" CCTALLY_DATA_DIR="$home/.local/share/cctally" TZ=Etc/UTC NO_COLOR=1 "$BIN" $sub 2>"$SCRATCH/e2"); r2=$?
+    e1=$(cat "$SCRATCH/e1"); e2=$(cat "$SCRATCH/e2")
+    local ok=1
+    _golden_diff_two_str "stdout" "$o1" "$o2" || { ok=0; }
+    _golden_diff_two_str "stderr" "$e1" "$e2" || { ok=0; }
+    [ "$r1" -eq "$r2" ] || { echo "FAIL[$label] exit code $r1 != $r2"; ok=0; }
+    if [ "$ok" -eq 1 ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+}
+
+# --- Claude commands: flat `<cmd>` == subgroup `claude <cmd>` ---
+for cmd in daily monthly weekly session blocks; do
+    compare_forms "claude-$cmd-table" "$CLAUDE_HOME" "$cmd"        "claude $cmd"
+    compare_forms "claude-$cmd-json"  "$CLAUDE_HOME" "$cmd --json" "claude $cmd --json"
+    compare_forms "claude-$cmd-debug" "$CLAUDE_HOME" "$cmd --debug" "claude $cmd --debug"
+done
+# breakdown passthrough (daily/monthly/weekly/blocks/session support -b)
+compare_forms "claude-daily-breakdown" "$CLAUDE_HOME" "daily --breakdown" "claude daily --breakdown"
+
+# --- Codex commands: flat `codex-<cmd>` == subgroup `codex <cmd>` ---
+for cmd in daily monthly session weekly; do
+    compare_forms "codex-$cmd-table" "$CODEX_HOME" "codex-$cmd"        "codex $cmd"
+    compare_forms "codex-$cmd-json"  "$CODEX_HOME" "codex-$cmd --json" "codex $cmd --json"
+    compare_forms "codex-$cmd-debug" "$CODEX_HOME" "codex-$cmd --debug" "codex $cmd --debug"
+done
+
+# --- help surfaces ---
+check_help() {  # check_help <label> <argline> <grep-extended-regex>
+    local label="$1" argline="$2" pat="$3"
+    # shellcheck disable=SC2086
+    if HOME="$SCRATCH" CCTALLY_DATA_DIR="$SCRATCH/.local/share/cctally" "$BIN" $argline 2>&1 | grep -qE "$pat"; then
+        pass=$((pass+1)); else echo "FAIL[$label] help missing /$pat/"; fail=$((fail+1)); fi
+}
+check_help "claude-help-lists" "claude --help" 'daily.*|.*monthly|.*weekly|.*session|.*blocks'
+check_help "codex-help-lists"  "codex --help"  'daily|monthly|session|weekly'
+# xref on ALL nine leaf pairs (not sampled). Flat → "Alias of …"; subgroup → its xref.
+for cmd in daily monthly weekly session blocks; do
+    check_help "flat-$cmd-xref"  "$cmd --help"        "Alias of .cctally claude $cmd."
+    check_help "claude-$cmd-xref" "claude $cmd --help" "Drop-in for .ccusage claude $cmd."
+done
+for cmd in daily monthly session; do
+    check_help "flat-codex-$cmd-xref" "codex-$cmd --help" "Alias of .cctally codex $cmd."
+    check_help "codex-$cmd-xref"      "codex $cmd --help"  "Drop-in for .ccusage codex $cmd."
+done
+check_help "flat-codex-weekly-xref" "codex-weekly --help" "Alias of .cctally codex weekly."
+check_help "codex-weekly-xref"      "codex weekly --help" "no upstream .ccusage codex weekly."
+
+# --- bare subgroups require a command (exit non-zero) ---
+for grp in claude codex; do
+    if HOME="$SCRATCH" CCTALLY_DATA_DIR="$SCRATCH/.local/share/cctally" "$BIN" "$grp" >/dev/null 2>&1; then
+        echo "FAIL[bare-$grp] expected non-zero exit"; fail=$((fail+1)); else pass=$((pass+1)); fi
+done
+
+# --- migration-error banner parity (stdout in table mode, NOT isatty-gated) ---
+# Seed the log under the Claude data dir, then: non-suppressed leaf (daily) must
+# SHOW the banner identically through flat+subgroup; suppressed leaf (blocks ∈
+# _BANNER_SUPPRESSED_COMMANDS) must SUPPRESS it identically.
+MIG_LOG="$CLAUDE_HOME/.local/share/cctally/logs/migration-errors.log"
+mkdir -p "$(dirname "$MIG_LOG")"
+printf '[2026-05-01T12:34:56Z] seed_subgroup_test\nseeded failure body\n' > "$MIG_LOG"
+# daily: banner appears on stdout, identically in both forms
+compare_forms "banner-daily-show" "$CLAUDE_HOME" "daily" "claude daily"
+if HOME="$CLAUDE_HOME" CCTALLY_DATA_DIR="$CLAUDE_HOME/.local/share/cctally" TZ=Etc/UTC NO_COLOR=1 "$BIN" daily 2>/dev/null | grep -qi "migration"; then
+    pass=$((pass+1)); else echo "FAIL[banner-daily-show] banner not on stdout"; fail=$((fail+1)); fi
+# blocks: suppressed in both forms
+compare_forms "banner-blocks-suppress" "$CLAUDE_HOME" "blocks" "claude blocks"
+if HOME="$CLAUDE_HOME" CCTALLY_DATA_DIR="$CLAUDE_HOME/.local/share/cctally" TZ=Etc/UTC NO_COLOR=1 "$BIN" blocks 2>/dev/null | grep -qi "migration"; then
+    echo "FAIL[banner-blocks-suppress] banner leaked into suppressed cmd"; fail=$((fail+1)); else pass=$((pass+1)); fi
+: > "$MIG_LOG"  # clear
+
+echo "----"
+echo "passed: $pass   failed: $fail"
+[ "$fail" -eq 0 ]

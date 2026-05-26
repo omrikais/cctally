@@ -2,6 +2,8 @@
 
 Claude usage grouped by 5-hour session block.
 
+> Canonical form: [`cctally claude blocks`](claude.md) (this flat form remains as an alias).
+
 `cctally blocks` aims for parity with `ccusage blocks`'s output shape but
 implements two intentional improvements over upstream:
 

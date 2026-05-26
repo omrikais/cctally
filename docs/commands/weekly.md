@@ -3,6 +3,8 @@
 Claude usage grouped by **subscription week** (anchored to `--resets-at`),
 with `Used %` and `$/1%` columns daily/monthly don't have.
 
+> Canonical form: [`cctally claude weekly`](claude.md) (this flat form remains as an alias).
+
 ## Synopsis
 
 ```

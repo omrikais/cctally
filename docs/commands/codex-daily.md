@@ -4,6 +4,8 @@ Codex (OpenAI) usage grouped by date. Drop-in replacement for
 upstream [`ccusage-codex`](../../README.md#acknowledgments) `daily`,
 offline.
 
+> Canonical form: [`cctally codex daily`](codex.md) (this flat form remains as an alias).
+
 ## Synopsis
 
 ```

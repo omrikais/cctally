@@ -5,6 +5,8 @@ Codex (OpenAI) usage grouped by week (week-start day from `config.json`).
 > Not a drop-in for upstream [`ccusage-codex`](../../README.md#acknowledgments)
 > — upstream has no `codex weekly` command. This is an addition.
 
+> Canonical form: [`cctally codex weekly`](codex.md) (this flat form remains as an alias).
+
 ## Synopsis
 
 ```

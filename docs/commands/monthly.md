@@ -3,6 +3,8 @@
 Claude usage grouped by calendar month. Drop-in replacement for
 `ccusage monthly`, offline.
 
+> Canonical form: [`cctally claude monthly`](claude.md) (this flat form remains as an alias).
+
 ## Synopsis
 
 ```

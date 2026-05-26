@@ -113,7 +113,7 @@ For status-line integration, alerts, and configuration, see [docs/installation.m
 
 ## What cctally adds
 
-`cctally` started as a local-first replacement for [`ccusage`](https://github.com/ryoppippi/ccusage), and it stays compatible at the level of common CLI flows (`daily`, `monthly`, `weekly`, `session`, `blocks`). Beyond that, it adds:
+`cctally` started as a local-first replacement for [`ccusage`](https://github.com/ryoppippi/ccusage), and it stays compatible at the level of common CLI flows (`daily`, `monthly`, `weekly`, `session`, `blocks`). Paste from ccusage verbatim: `cctally claude <cmd>` is a drop-in for `ccusage claude <cmd>` (and `cctally codex <cmd>` for `ccusage codex <cmd>`), with the flat forms (`cctally daily`, `cctally codex-daily`, …) kept as aliases. Beyond that, it adds:
 
 - **Live web dashboard.** Nine-panel SSE-driven view at `localhost:8789` (current week, forecast, trend, sessions, weekly, monthly, blocks, daily, recent alerts), with per-panel modals, a mobile layout, threshold alerts, and a settings drawer.
 - **TUI live mode.** The same data inside your terminal (`cctally tui`; requires the optional `rich` package).
@@ -123,7 +123,7 @@ For status-line integration, alerts, and configuration, see [docs/installation.m
 - **5-hour block analytics.** Per-block usage with model and project breakdowns (`cctally five-hour-blocks --breakdown=model`).
 - **Time-window diff.** Compare two windows with model and project decomposition (`cctally diff`).
 - **Project rollup.** Usage by Git project (`cctally project`).
-- **Codex parity.** Drop-in replacements for `ccusage-codex daily / monthly / session`, plus an added `cctally codex-weekly` rollup (upstream has no `codex weekly`).
+- **Codex parity.** `cctally codex daily / monthly / session` are drop-ins for `ccusage codex daily / monthly / session`; the flat `codex-*` forms (drop-ins for the standalone `ccusage-codex` binary) remain as aliases, plus an added `cctally codex weekly` / `cctally codex-weekly` rollup (upstream has no `codex weekly`).
 - **Persistent SQLite.** Week-over-week comparisons survive across runs.
 
 **On speed.** Pricing is embedded and computed at query time from a delta-tail SQLite cache (`~/.local/share/cctally/cache.db`), with no shell-outs. First-table latency on 30 days of session data: **~2.6s (cctally) vs ~31s (ccusage)**, about 12× faster. Measured by `bench/cctally-vs-ccusage.sh` on macOS arm64, 2026-05-05; your numbers will vary.[^bench]

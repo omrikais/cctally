@@ -27,6 +27,13 @@ One page per subcommand. Pages follow a consistent shape:
 | `doctor` | [doctor.md](doctor.md) — read-only health report (install / hooks / OAuth / DB / freshness / safety) |
 | `range-cost` | [range-cost.md](range-cost.md) |
 
+## Subgroups (ccusage hierarchical syntax)
+
+| Command | Page |
+| --- | --- |
+| `claude <cmd>` | [claude.md](claude.md) — drop-in for `ccusage claude …`; canonical form of the flat `daily`/`monthly`/`weekly`/`session`/`blocks` aliases |
+| `codex <cmd>` | [codex.md](codex.md) — drop-in for `ccusage codex …`; canonical form of the flat `codex-*` aliases |
+
 ## Claude usage rollups
 
 | Command | Page |

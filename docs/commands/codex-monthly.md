@@ -4,6 +4,8 @@ Codex (OpenAI) usage grouped by calendar month. Drop-in replacement for
 upstream [`ccusage-codex`](../../README.md#acknowledgments) `monthly`,
 offline.
 
+> Canonical form: [`cctally codex monthly`](codex.md) (this flat form remains as an alias).
+
 ## Synopsis
 
 ```

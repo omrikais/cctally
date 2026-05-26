@@ -3,6 +3,8 @@
 Codex (OpenAI) usage grouped by session. Drop-in replacement for
 `ccusage-codex session`, offline.
 
+> Canonical form: [`cctally codex session`](codex.md) (this flat form remains as an alias).
+
 ## Synopsis
 
 ```

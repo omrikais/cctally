@@ -43,6 +43,8 @@ final_harnesses=(reconcile)
 # work in both the private repo (which has cctally-mirror-public-test)
 # and the public mirror (which doesn't, since the mirror-public tooling
 # is private-only). A glob picks up exactly what's present in each clone.
+# New harnesses (e.g. cctally-subgroup-test, issue #86) are auto-discovered
+# here once `chmod +x`'d — no edit to this list is needed.
 parallel_harnesses=()
 final_set=" ${final_harnesses[*]} "
 for path in "$REPO_ROOT"/bin/cctally-*-test; do
