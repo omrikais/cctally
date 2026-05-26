@@ -12,6 +12,7 @@ row. 11-column layout that parallels [`codex-session`](codex-session.md).
 cctally session
     [-s YYYYMMDD] [-u YYYYMMDD]
     [-b] [-o {asc,desc}]
+    [-m {auto,calculate,display}]
     [--json]
 ```
 
@@ -23,6 +24,7 @@ cctally session
 | `-u, --until YYYYMMDD` | Filter until date (inclusive). |
 | `-b, --breakdown` | Show per-model cost breakdown sub-rows. |
 | `-o, --order {asc,desc}` | Sort direction by last activity (default `asc` — earliest first). |
+| `-m, --mode {auto,calculate,display}` | Cost source (drop-in for `ccusage session --mode`). `auto` (default) uses the recorded `costUSD` from JSONL when present, else computes from embedded pricing — this is the pre-Session-C behavior. `calculate` always computes from embedded pricing, ignoring any recorded `costUSD`. `display` shows the recorded `costUSD` only, rendering `$0.00` when a session has none (ccusage-faithful). Most modern Claude Code JSONL omits `costUSD`, so under `display` near-everything reports `$0`. |
 | `--tz TZ` | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). |
 | `--json` | Output JSON. |
 

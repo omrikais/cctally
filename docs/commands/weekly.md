@@ -11,6 +11,7 @@ with `Used %` and `$/1%` columns daily/monthly don't have.
 cctally weekly
     [-s YYYYMMDD] [-u YYYYMMDD]
     [-b] [-o {asc,desc}]
+    [-m {auto,calculate,display}]
     [--json]
 ```
 
@@ -28,6 +29,7 @@ so `Used %` and `$/1%` are directly meaningful.
 | `-u, --until YYYYMMDD` | Filter until date (inclusive). |
 | `-b, --breakdown` | Show per-model cost breakdown sub-rows. |
 | `-o, --order {asc,desc}` | Sort direction by week (default `asc`). |
+| `-m, --mode {auto,calculate,display}` | Cost source (drop-in for `ccusage weekly --mode`). `auto` (default) uses the recorded `costUSD` from JSONL when present, else computes from embedded pricing — this is the pre-Session-C behavior. `calculate` always computes from embedded pricing, ignoring any recorded `costUSD`. `display` shows the recorded `costUSD` only, rendering `$0.00` when a row has none (ccusage-faithful). Most modern Claude Code JSONL omits `costUSD`, so under `display` near-everything reports `$0`. The pre-snapshot extrapolation tail carries no entries, so its weeks contribute `$0` regardless of mode. |
 | `--tz TZ` | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). |
 | `--json` | Output JSON. |
 

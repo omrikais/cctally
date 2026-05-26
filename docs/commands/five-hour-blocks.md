@@ -8,6 +8,7 @@ List API-anchored 5-hour blocks with rollup totals plus 7d-drift columns.
 cctally five-hour-blocks
     [-s YYYYMMDD] [-u YYYYMMDD]
     [--breakdown {model,project}]
+    [-m {auto,calculate,display}]
     [--json] [--no-color] [--tz TZ]
 ```
 
@@ -25,6 +26,7 @@ only, and adds 7d-drift columns plus a `⚡` reset-crossing marker.
 | `-s, --since YYYYMMDD` | Filter from date (inclusive). |
 | `-u, --until YYYYMMDD` | Filter until date (inclusive). |
 | `--breakdown {model,project}` | Add per-model OR per-project rollup-child rows under each parent block (single value, not multi). |
+| `-m, --mode {auto,calculate,display}` | **Accepted as a no-op** for surface parity with the sibling `cctally blocks --mode`. Unlike `blocks`/`daily`/etc. — which recompute per-entry cost from `session_entries` at query time and so honor the mode — `five-hour-blocks` reports the **authoritative materialized** `five_hour_blocks.total_cost_usd`, computed at record-time (always `auto` semantics) by `_compute_block_totals`. There is no query-time per-entry cost path to re-source, so the flag changes nothing. Output is byte-identical across `auto`/`calculate`/`display`. |
 | `--json` | Emit camelCase JSON (`schemaVersion: 1`). |
 | `--no-color` | Disable ANSI color (currently a no-op — table is plain text). |
 | `--tz TZ` | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). |

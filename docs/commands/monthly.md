@@ -11,6 +11,7 @@ Claude usage grouped by calendar month. Drop-in replacement for
 cctally monthly
     [-s YYYYMMDD] [-u YYYYMMDD]
     [-b] [-o {asc,desc}]
+    [-m {auto,calculate,display}]
     [--json]
 ```
 
@@ -22,6 +23,7 @@ cctally monthly
 | `-u, --until YYYYMMDD` | Filter until date (inclusive). |
 | `-b, --breakdown` | Show per-model cost breakdown sub-rows. |
 | `-o, --order {asc,desc}` | Sort direction by month (default `asc`). |
+| `-m, --mode {auto,calculate,display}` | Cost source (drop-in for `ccusage monthly --mode`). `auto` (default) uses the recorded `costUSD` from JSONL when present, else computes from embedded pricing — this is the pre-Session-C behavior. `calculate` always computes from embedded pricing, ignoring any recorded `costUSD`. `display` shows the recorded `costUSD` only, rendering `$0.00` when a row has none (ccusage-faithful). Most modern Claude Code JSONL omits `costUSD`, so under `display` near-everything reports `$0`. |
 | `--tz TZ` | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). |
 | `--json` | Output JSON matching `ccusage monthly` format. |
 

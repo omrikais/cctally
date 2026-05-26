@@ -22,7 +22,7 @@ implements two intentional improvements over upstream:
 ```
 cctally blocks
     [-s YYYYMMDD] [-u YYYYMMDD]
-    [-b] [--json]
+    [-b] [-m {auto,calculate,display}] [--json]
 ```
 
 ## Purpose
@@ -37,6 +37,7 @@ makes them visible without round-tripping to `ccusage`'s network calls.
 | `-s, --since YYYYMMDD` | Filter from date (inclusive). |
 | `-u, --until YYYYMMDD` | Filter until date (inclusive). |
 | `-b, --breakdown` | Show per-model cost breakdown. |
+| `-m, --mode {auto,calculate,display}` | Cost source (drop-in for `ccusage blocks --mode`). `auto` (default) uses the recorded `costUSD` from JSONL when present, else computes from embedded pricing — this is the pre-Session-C behavior. `calculate` always computes from embedded pricing, ignoring any recorded `costUSD`. `display` shows the recorded `costUSD` only, rendering `$0.00` when an entry has none (ccusage-faithful). The mode is honored on both the main grouping AND the active canonical-swapped block. Most modern Claude Code JSONL omits `costUSD`, so under `display` near-everything reports `$0`. (Note: `cctally five-hour-blocks` accepts `--mode` only as a no-op — see that page.) |
 | `--tz TZ` | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). Note: `--since`/`--until` keep upstream-parity host-local parsing (documented divergence). |
 | `--json` | Output JSON matching `ccusage blocks` format. |
 
