@@ -41,6 +41,9 @@ pass=0; fail=0
 # 'token-count-dedup' scenario (.codex/sessions JSONL the four codex commands
 # re-ingest). Equivalence is what's asserted, so any populated HOME suffices.
 _home_from_cachedb() { dirname "$(dirname "$(dirname "$(dirname "$1")")")"; }
+# NOTE: the scenario names below ('mixed', 'token-count-dedup') are hardcoded
+# from the fixture builders — renaming a builder scenario requires updating
+# these two find paths or the harness fails to locate the fixture cache.db.
 CLAUDE_CACHE=$(find "$SCRATCH/claude" -path '*/mixed/.local/share/cctally/cache.db' | head -1)
 CODEX_CACHE=$(find "$SCRATCH/codex" -path '*codex-daily/token-count-dedup/.local/share/cctally/cache.db' | head -1)
 [ -n "$CLAUDE_CACHE" ] || { echo "FAIL: could not locate Claude fixture cache.db"; exit 1; }
@@ -90,8 +93,22 @@ check_help() {  # check_help <label> <argline> <grep-extended-regex>
     if HOME="$SCRATCH" CCTALLY_DATA_DIR="$SCRATCH/.local/share/cctally" "$BIN" $argline 2>&1 | grep -qE "$pat"; then
         pass=$((pass+1)); else echo "FAIL[$label] help missing /$pat/"; fail=$((fail+1)); fi
 }
-check_help "claude-help-lists" "claude --help" 'daily.*|.*monthly|.*weekly|.*session|.*blocks'
-check_help "codex-help-lists"  "codex --help"  'daily|monthly|session|weekly'
+# check_help_lists <label> <argline> <leaf...>: the subgroup --help must
+# enumerate EVERY expected leaf (not just any one). A loose alternation regex
+# passed when a single leaf appeared; this asserts each leaf via its own
+# grep -q so a dropped member fails the harness.
+check_help_lists() {
+    local label="$1" argline="$2"; shift 2
+    local out leaf missing=""
+    # shellcheck disable=SC2086
+    out=$(HOME="$SCRATCH" CCTALLY_DATA_DIR="$SCRATCH/.local/share/cctally" "$BIN" $argline 2>&1)
+    for leaf in "$@"; do
+        printf '%s\n' "$out" | grep -qw "$leaf" || missing="$missing $leaf"
+    done
+    if [ -z "$missing" ]; then pass=$((pass+1)); else echo "FAIL[$label] help missing leaves:$missing"; fail=$((fail+1)); fi
+}
+check_help_lists "claude-help-lists" "claude --help" daily monthly weekly session blocks
+check_help_lists "codex-help-lists"  "codex --help"  daily monthly session weekly
 # xref on ALL nine leaf pairs (not sampled). Flat → "Alias of …"; subgroup → its xref.
 for cmd in daily monthly weekly session blocks; do
     check_help "flat-$cmd-xref"  "$cmd --help"        "Alias of .cctally claude $cmd."

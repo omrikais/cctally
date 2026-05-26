@@ -2371,6 +2371,10 @@ def _recompute_banner_should_emit(
           confuses scripted pipelines. Banner still lands on the
           next interactive non-report command (``report``,
           ``weekly``, ``percent-breakdown``, etc.) once on upgrade.
+          Subgroup forms (``cctally claude/codex <cmd>``, issue #86
+          Session B) carry the source group in ``argv[1]`` and the
+          leaf in ``argv[2]``; we resolve the leaf so suppression is
+          byte-identical to the flat alias.
 
     Returns True iff the banner should be printed. Defensive: any
     error reading ``sys.argv`` falls back to "don't print" — silence
@@ -2388,6 +2392,14 @@ def _recompute_banner_should_emit(
         return False
     try:
         argv1 = sys.argv[1] if len(sys.argv) > 1 else None
+        # Subgroup forms (`cctally claude <cmd>` / `cctally codex <cmd>`) carry
+        # the source group in argv[1]; the suppression key is the leaf command
+        # in argv[2]. Resolve it so the recompute banner suppresses identically
+        # to the flat alias (issue #86 Session B; matches the args.command leaf
+        # resolution used by the error-sentinel banner). Purely additive — flat
+        # invocations (argv1 not in {claude,codex}) are byte-identical to before.
+        if argv1 in ("claude", "codex") and len(sys.argv) > 2:
+            argv1 = sys.argv[2]
     except Exception:
         argv1 = None
     if argv1 in _BANNER_SUPPRESSED_COMMANDS:

@@ -63,3 +63,24 @@ def test_flat_forms_still_route():
     assert _parse(["codex-monthly"]).func is _NS["cmd_codex_monthly"]
     assert _parse(["codex-session"]).func is _NS["cmd_codex_session"]
     assert _parse(["codex-weekly"]).func is _NS["cmd_codex_weekly"]
+
+
+def test_recompute_banner_suppression_parity_flat_vs_subgroup(monkeypatch):
+    """The recompute-migration banner gate (`_recompute_banner_should_emit` in
+    the `_cctally_db` sibling) reads `sys.argv` directly because migration
+    handlers don't receive `args`. Before issue #86 Session B's leaf resolution
+    it keyed off `sys.argv[1]` only, so `cctally claude blocks` (argv[1] ==
+    "claude", not suppressed) would emit the banner while flat `cctally blocks`
+    (argv[1] == "blocks", suppressed) would not — diverging from the spec §3
+    parity invariant. This asserts both forms suppress/emit identically.
+    """
+    db = _NS["_cctally_db"]
+    cases = [
+        (["cctally", "blocks"], False),           # suppressed (flat)
+        (["cctally", "claude", "blocks"], False),  # MUST also be suppressed (subgroup)
+        (["cctally", "daily"], True),             # not suppressed (flat)
+        (["cctally", "claude", "daily"], True),    # not suppressed (subgroup)
+    ]
+    for argv, expected in cases:
+        monkeypatch.setattr(db.sys, "argv", argv)
+        assert db._recompute_banner_should_emit(data_present=True) is expected, argv
