@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-05-26
+
 ### Added
 - **`-m/--mode {auto,calculate,display}` cost-source selector on `cctally daily`, `monthly`, `weekly`, `session`, and `blocks`** — a drop-in for `ccusage <cmd> --mode`. `auto` (the default) uses the recorded `costUSD` from JSONL when present and otherwise computes from embedded pricing; `calculate` always computes from pricing, ignoring any recorded `costUSD`; `display` shows the recorded `costUSD` only and renders `$0.00` when an entry has none (ccusage-faithful — and because most modern Claude Code JSONL omits `costUSD`, `display` reports `$0` for nearly everything). On `blocks` the mode is honored on both the main grouping and the active canonical-swapped block. `cctally five-hour-blocks` also accepts `--mode` but as a documented no-op, since its cost is the authoritative per-block value materialized at record-time. The default-`auto` output is byte-identical to before for `daily`, `monthly`, `weekly`, and `blocks`, and no `mode` key is added to any JSON shape (see the Changed note below for the one `session` exception). (#86)
 
