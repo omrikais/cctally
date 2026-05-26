@@ -76,6 +76,9 @@ def _make_args(mod, **overrides):
         offline=False, compact=False, config=None, color=False,
         no_color=False,
         id=None,
+        # Session C (#86): cmd_session now threads args.mode into
+        # build_sessions_view; the real parser defaults it to "auto".
+        mode="auto",
     )
     for k, v in overrides.items():
         setattr(ns, k, v)

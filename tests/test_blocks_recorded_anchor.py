@@ -317,7 +317,10 @@ def test_cmd_blocks_reads_recorded_windows_from_db(ns, tmp_path, monkeypatch):
 
     # Invoke cmd_blocks --json.
     import argparse
-    args = argparse.Namespace(since=None, until=None, breakdown=False, json=True)
+    # Session C (#86): cmd_blocks now threads args.mode into
+    # build_blocks_view + the active canonical-swap; parser defaults "auto".
+    args = argparse.Namespace(since=None, until=None, breakdown=False, json=True,
+                              mode="auto")
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         rc = ns["cmd_blocks"](args)
