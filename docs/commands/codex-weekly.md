@@ -13,6 +13,7 @@ Codex (OpenAI) usage grouped by week (week-start day from `config.json`).
 cctally codex-weekly
     [-s YYYY-MM-DD] [-u YYYY-MM-DD]
     [-b] [-o {asc,desc}]
+    [--speed {auto,standard,fast}]
     [--json]
     [-z TZ] [-l LOCALE]
     [--compact] [--color] [--noColor]
@@ -28,6 +29,7 @@ cctally codex-weekly
 | `-u, --until YYYY-MM-DD` | Filter until date (inclusive). |
 | `-b, --breakdown` | Show per-model cost breakdown sub-rows. |
 | `-o, --order {asc,desc}` | Sort direction by week (default `asc`). |
+| `--speed {auto,standard,fast}` | Codex pricing tier. `auto` (default) reads `service_tier` from `~/.codex/config.toml`; `fast`\|`priority` there selects fast-tier pricing. `fast`/`standard` force the tier. |
 | `--json` | Output JSON. |
 | `-z, --timezone TZ` | IANA timezone for date bucketing. |
 | `-l, --locale LOCALE` | No-op; accepted for drop-in compat. |
@@ -46,6 +48,23 @@ cctally codex-weekly --breakdown
 cctally codex-weekly --json
 cctally codex-weekly --order desc
 ```
+
+## Pricing tier (`--speed`)
+
+`--speed` selects the Codex cost tier, matching `ccusage codex --speed`:
+
+- `auto` (default) — scans `~/.codex/config.toml`; if any `service_tier = "fast"` or `service_tier = "priority"` line is present, fast-tier pricing applies, otherwise standard.
+- `fast` — force fast-tier pricing.
+- `standard` — force base pricing.
+
+Fast-tier multiplies the per-model cost by a fixed factor: `gpt-5.5` ×2.5, all
+other Codex models ×2.0. Detection is a line-scan (a `service_tier` line in any
+table counts). `--json` gains no new field — only the `costUSD` figures reflect
+the tier.
+
+> `--speed` is a cctally extension on the flat `codex-*` form — the standalone
+> `ccusage-codex` binary has no `--speed`. The canonical `cctally codex <cmd>`
+> subgroup mirrors `ccusage codex <cmd>`, which does.
 
 ## How week boundaries are picked
 

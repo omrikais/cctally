@@ -4813,8 +4813,8 @@ def cmd_weekly(args: argparse.Namespace) -> int:
 def _detect_codex_fast_service_tier() -> bool:
     """True iff ``~/.codex/config.toml`` requests the fast/priority tier.
 
-    Reads from ``~/.codex`` only (single root; ``$CODEX_HOME`` multi-root is a
-    deferred follow-up). Tolerates an absent/unreadable config (→ False →
+    Reads from ``~/.codex`` only (single root; ``$CODEX_HOME`` multi-root is
+    deferred — see #108). Tolerates an absent/unreadable config (→ False →
     standard tier).
     """
     cfg = pathlib.Path.home() / ".codex" / "config.toml"

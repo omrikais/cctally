@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **`--speed {auto,standard,fast}` on `cctally codex-daily`, `codex-monthly`, `codex-weekly`, and `codex-session` (and their `cctally codex <cmd>` subgroup forms)** — a drop-in for `ccusage codex --speed`. `auto` (the default) reads `service_tier` from `~/.codex/config.toml` and applies fast-tier pricing when it is `fast` or `priority`; `fast`/`standard` force the tier. Fast-tier multiplies the per-model Codex cost by a fixed factor (`gpt-5.5` ×2.5, all other models ×2.0). `--json` gains no new field; only the `costUSD` figures change. On the flat `codex-*` forms this is a cctally extension (the standalone `ccusage-codex` binary has no `--speed`); the subgroup form mirrors `ccusage codex`. (#86)
+
+### Changed
+- **`cctally codex-*` now applies fast-tier (≥2×) Codex pricing by default when `~/.codex/config.toml` sets `service_tier = "fast"` or `"priority"`.** Previously cctally always priced Codex usage at the standard tier, under-reporting cost for workstations on the fast/priority tier (who pay the premium). With the new `--speed auto` default, those costs now match what was actually billed; pass `--speed standard` to force the old behavior. Users without a fast/priority `service_tier` see identical numbers. (#86)
+
 ## [1.16.0] - 2026-05-26
 
 ### Added

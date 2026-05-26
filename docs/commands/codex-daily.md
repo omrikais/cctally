@@ -12,6 +12,7 @@ offline.
 cctally codex-daily
     [-s YYYY-MM-DD] [-u YYYY-MM-DD]
     [-b] [-o {asc,desc}]
+    [--speed {auto,standard,fast}]
     [--json]
     [-z TZ] [-l LOCALE]
     [--compact] [--color] [--noColor]
@@ -27,6 +28,7 @@ cctally codex-daily
 | `-u, --until YYYY-MM-DD` | Filter until date (inclusive). |
 | `-b, --breakdown` | Show per-model cost breakdown sub-rows. |
 | `-o, --order {asc,desc}` | Sort direction (default `asc`). |
+| `--speed {auto,standard,fast}` | Codex pricing tier. `auto` (default) reads `service_tier` from `~/.codex/config.toml`; `fast`\|`priority` there selects fast-tier pricing. `fast`/`standard` force the tier. |
 | `--json` | Output JSON matching `ccusage-codex daily` format. |
 | `-z, --timezone TZ` | IANA timezone for date bucketing and Date / Last Activity cells. |
 | `-l, --locale LOCALE` | No-op; accepted for drop-in compat. |
@@ -44,6 +46,23 @@ cctally codex-daily --since 20260401 --breakdown
 cctally codex-daily --since 20260401 --json
 cctally codex-daily --order desc
 ```
+
+## Pricing tier (`--speed`)
+
+`--speed` selects the Codex cost tier, matching `ccusage codex --speed`:
+
+- `auto` (default) — scans `~/.codex/config.toml`; if any `service_tier = "fast"` or `service_tier = "priority"` line is present, fast-tier pricing applies, otherwise standard.
+- `fast` — force fast-tier pricing.
+- `standard` — force base pricing.
+
+Fast-tier multiplies the per-model cost by a fixed factor: `gpt-5.5` ×2.5, all
+other Codex models ×2.0. Detection is a line-scan (a `service_tier` line in any
+table counts). `--json` gains no new field — only the `costUSD` figures reflect
+the tier.
+
+> `--speed` is a cctally extension on the flat `codex-*` form — the standalone
+> `ccusage-codex` binary has no `--speed`. The canonical `cctally codex <cmd>`
+> subgroup mirrors `ccusage codex <cmd>`, which does.
 
 ## Notes — diverges from upstream `ccusage-codex` on duplicate events
 

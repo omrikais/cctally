@@ -49,6 +49,12 @@ cctally codex weekly
   upstream's own dual surface one-to-one.
 - `cctally codex weekly` (and the flat `cctally codex-weekly`) have no upstream
   counterpart — week-start day is read from `config.json`.
+- `--speed {auto,standard,fast}` is shared across every codex leaf (it rides the
+  common Codex arg helper). On the subgroup forms this is faithful to
+  `ccusage codex <cmd> --speed`; on the flat `codex-*` aliases it is a cctally
+  extension (the standalone `ccusage-codex` binary has no `--speed`). `auto`
+  (the default) reads `service_tier` from `~/.codex/config.toml`. See any leaf
+  page's "Pricing tier (`--speed`)" section for details.
 - Bare `cctally codex` (no subcommand) exits non-zero with a command-required
   error.
 - No runtime deprecation warning is emitted by the flat forms; they are

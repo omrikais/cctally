@@ -124,6 +124,10 @@ Cost formula:
 
 Reasoning is **not** added separately.
 
+When `--speed fast` is in effect (or `--speed auto` resolves to fast from
+`~/.codex/config.toml`'s `service_tier`), the whole per-entry cost is multiplied
+by a per-model fast-tier factor (`gpt-5.5` ×2.5, otherwise ×2.0).
+
 ## Intentional divergence from upstream `ccusage-codex`
 
 Older Codex rollouts re-emit `event_msg.token_count` with the same
