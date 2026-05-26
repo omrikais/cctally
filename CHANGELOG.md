@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-05-26
+
 ### Added
 - **Running `cctally` from a git checkout now uses a separate `~/.local/share/cctally-dev/` data dir instead of the installed copy's `~/.local/share/cctally/`, so developing against the source tree can no longer corrupt the production instance.** Previously both the source checkout and the npm/brew-installed copy resolved every runtime path from `~/.local/share/cctally/`, so a single dev run that advanced the schema would trip a version mismatch on the still-installed prod binary (and on its background Claude Code hooks) — and vice versa. A checkout is now auto-detected (its `bin/` parent contains a `.git` directory or file, which also covers worktrees) and transparently relocated to `cctally-dev/`; the npm and brew copies ship without `.git`, so installed users are byte-for-byte unaffected. The real Claude session JSONL, `~/.claude/settings.json`, and OAuth credentials stay shared read-only, so dev cost numbers remain real. `cctally doctor` now reports whether it is the installed copy or a dev checkout plus the resolved data dir, `cctally --version` shows a dev-mode marker, and `cctally setup` refuses to wire a dev checkout into `~/.claude/settings.json` (read-only `--status`/`--dry-run` still work) unless given `--force-dev`. Set `CCTALLY_DATA_DIR` to point the data dir somewhere explicit (e.g. a distinct dir per feature branch).
 
