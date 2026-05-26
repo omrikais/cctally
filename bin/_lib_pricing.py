@@ -346,6 +346,44 @@ _unknown_codex_model_warnings: set[str] = set()
 # directly comparable.
 CODEX_LEGACY_FALLBACK_MODEL = "gpt-5"
 
+# Per-model fast-tier price multipliers, ported from ryoppippi/ccusage
+# fast-multiplier-overrides.json ("exact" map — Codex/gpt entries only; the
+# upstream claude-opus-* entries are for ccusage's Claude adapter and never
+# price Codex models). Any fast-tier model NOT listed falls back to
+# CODEX_FAST_MULTIPLIER_FALLBACK — upstream's `fast_multiplier == 1.0 → 2.0`
+# rule in adapter/codex/report.rs:calculate_codex_model_cost.
+CODEX_FAST_MULTIPLIER_OVERRIDES: dict[str, float] = {
+    "gpt-5.5": 2.5,
+    "gpt-5.4": 2.0,
+    "gpt-5.3-codex": 2.0,
+}
+CODEX_FAST_MULTIPLIER_FALLBACK = 2.0
+
+
+def _codex_fast_multiplier(model: str) -> float:
+    """Fast-tier price multiplier for a Codex model (standard tier = 1.0)."""
+    return CODEX_FAST_MULTIPLIER_OVERRIDES.get(model, CODEX_FAST_MULTIPLIER_FALLBACK)
+
+
+def _codex_config_requests_fast_service_tier(content: str) -> bool:
+    """True iff any line sets ``service_tier = "fast"|"priority"``.
+
+    Naive line-scan ported from ryoppippi/ccusage adapter/codex/speed.rs
+    (NOT a TOML parse): strip the trailing ``#``-comment, split on the first
+    ``=``, the key must be exactly ``service_tier``, and the quote-stripped
+    value must be ``fast`` or ``priority``. Matches a ``service_tier`` line in
+    ANY table; ignores ``service_tier_override`` and substrings like
+    ``"breakfast"``.
+    """
+    for line in content.splitlines():
+        setting = line.split("#", 1)[0].strip()
+        key, sep, value = setting.partition("=")
+        if not sep or key.strip() != "service_tier":
+            continue
+        if value.strip().strip("\"'") in ("fast", "priority"):
+            return True
+    return False
+
 
 def _resolve_codex_pricing(model: str) -> tuple[dict[str, Any] | None, bool]:
     """Return (pricing_dict, is_fallback).
@@ -450,6 +488,7 @@ def _calculate_codex_entry_cost(
     cached_input_tokens: int,
     output_tokens: int,
     reasoning_output_tokens: int,
+    speed: str = "standard",
 ) -> float:
     """Compute USD cost for one Codex `token_count` event.
 
@@ -505,7 +544,10 @@ def _calculate_codex_entry_cost(
         "output_cost_per_token",
         "output_cost_per_token_above_272k_tokens",
     )
-    return input_cost + cached_input_cost + output_cost
+    base = input_cost + cached_input_cost + output_cost
+    if speed == "fast":
+        base *= _codex_fast_multiplier(model)
+    return base
 
 
 def _short_model_name(model: str) -> str:

@@ -363,6 +363,7 @@ class ClaudeSessionUsage:
 def _aggregate_codex_buckets(
     entries: list[CodexEntry],
     key_fn: Callable[[CodexEntry], str],
+    speed: str = "standard",
 ) -> list[CodexBucketUsage]:
     """Group CodexEntry list into per-bucket records sorted by key ascending.
 
@@ -386,6 +387,7 @@ def _aggregate_codex_buckets(
             entry.cached_input_tokens,
             entry.output_tokens,
             entry.reasoning_output_tokens,
+            speed=speed,
         )
 
         bucket["input"] += entry.input_tokens
@@ -441,6 +443,7 @@ def _aggregate_codex_buckets(
 
 def _aggregate_codex_daily(
     entries: list[CodexEntry], *, tz_name: str | None = None,
+    speed: str = "standard",
 ) -> list[CodexBucketUsage]:
     """Daily grouping. Default: local tz. With ``tz_name``: that IANA zone."""
     tz = _resolve_tz(tz_name)
@@ -448,11 +451,12 @@ def _aggregate_codex_daily(
         key_fn = lambda e: e.timestamp.astimezone(tz).strftime("%Y-%m-%d")  # noqa: E731
     else:
         key_fn = lambda e: e.timestamp.astimezone().strftime("%Y-%m-%d")    # noqa: E731
-    return _aggregate_codex_buckets(entries, key_fn=key_fn)
+    return _aggregate_codex_buckets(entries, key_fn=key_fn, speed=speed)
 
 
 def _aggregate_codex_monthly(
     entries: list[CodexEntry], *, tz_name: str | None = None,
+    speed: str = "standard",
 ) -> list[CodexBucketUsage]:
     """Monthly grouping. Default: local tz. With ``tz_name``: that IANA zone."""
     tz = _resolve_tz(tz_name)
@@ -460,13 +464,14 @@ def _aggregate_codex_monthly(
         key_fn = lambda e: e.timestamp.astimezone(tz).strftime("%Y-%m")  # noqa: E731
     else:
         key_fn = lambda e: e.timestamp.astimezone().strftime("%Y-%m")    # noqa: E731
-    return _aggregate_codex_buckets(entries, key_fn=key_fn)
+    return _aggregate_codex_buckets(entries, key_fn=key_fn, speed=speed)
 
 
 def _aggregate_codex_weekly(
     entries: list[CodexEntry],
     tz_name: str | None,
     week_start_idx: int,
+    speed: str = "standard",
 ) -> list[CodexBucketUsage]:
     """Group Codex entries by calendar week.
 
@@ -485,7 +490,7 @@ def _aggregate_codex_weekly(
         week_start = local_date - dt.timedelta(days=diff)
         return week_start.isoformat()
 
-    return _aggregate_codex_buckets(entries, key_fn=_week_key)
+    return _aggregate_codex_buckets(entries, key_fn=_week_key, speed=speed)
 
 
 def _session_path_parts(source_path: str) -> tuple[str, str, str]:
@@ -520,7 +525,7 @@ def _session_path_parts(source_path: str) -> tuple[str, str, str]:
     return str(stem), stem.name, str(stem.parent)
 
 
-def _aggregate_codex_sessions(entries: list[CodexEntry]) -> list[CodexSessionUsage]:
+def _aggregate_codex_sessions(entries: list[CodexEntry], speed: str = "standard") -> list[CodexSessionUsage]:
     """Group by session file path (upstream-compatible).
 
     Sessions are keyed by the full relative-path-without-.jsonl rather than
@@ -543,7 +548,7 @@ def _aggregate_codex_sessions(entries: list[CodexEntry]) -> list[CodexSessionUsa
         })
         cost = _calculate_codex_entry_cost(
             entry.model, entry.input_tokens, entry.cached_input_tokens,
-            entry.output_tokens, entry.reasoning_output_tokens,
+            entry.output_tokens, entry.reasoning_output_tokens, speed=speed,
         )
         sess["input"] += entry.input_tokens
         sess["cached_input"] += entry.cached_input_tokens

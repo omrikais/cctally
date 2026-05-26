@@ -268,6 +268,10 @@ _resolve_model_pricing = _lib_pricing._resolve_model_pricing
 _calculate_entry_cost = _lib_pricing._calculate_entry_cost
 _warn_unknown_codex_model = _lib_pricing._warn_unknown_codex_model
 _calculate_codex_entry_cost = _lib_pricing._calculate_codex_entry_cost
+_codex_fast_multiplier = _lib_pricing._codex_fast_multiplier
+CODEX_FAST_MULTIPLIER_OVERRIDES = _lib_pricing.CODEX_FAST_MULTIPLIER_OVERRIDES
+CODEX_FAST_MULTIPLIER_FALLBACK = _lib_pricing.CODEX_FAST_MULTIPLIER_FALLBACK
+_codex_config_requests_fast_service_tier = _lib_pricing._codex_config_requests_fast_service_tier
 _short_model_name = _lib_pricing._short_model_name
 
 _lib_display_tz = _load_sibling("_lib_display_tz")
@@ -1383,7 +1387,7 @@ class _CodexCostStats:
     samples: list = field(default_factory=list)
 
 
-def _compute_codex_cost_stats(entries):
+def _compute_codex_cost_stats(entries, speed: str = "standard"):
     """Walk ``entries: Iterable[CodexEntry]`` and compute the totals +
     per-entry computed-cost samples that ``_render_codex_cost_report``
     consumes (issue #92).
@@ -1414,6 +1418,7 @@ def _compute_codex_cost_stats(entries):
             entry.cached_input_tokens,
             entry.output_tokens,
             entry.reasoning_output_tokens,
+            speed=speed,
         )
         stats.total_cost += cost
         stats.samples.append(_CodexCostSample(
@@ -1500,6 +1505,7 @@ def _emit_codex_debug_samples_if_set(
     entries,
     *,
     command_label: str,
+    speed: str = "standard",
 ) -> None:
     """Emit the codex --debug report once per process when ``args.debug``
     is True (issue #92).
@@ -1517,7 +1523,7 @@ def _emit_codex_debug_samples_if_set(
     if not getattr(args, "debug", False):
         return
     sample_limit = int(getattr(args, "debug_samples", 5))
-    stats = _compute_codex_cost_stats(entries)
+    stats = _compute_codex_cost_stats(entries, speed=speed)
     stats.command_label = command_label
     for line in _render_codex_cost_report(stats, sample_limit):
         eprint(line)
@@ -4804,6 +4810,32 @@ def cmd_weekly(args: argparse.Namespace) -> int:
     return 0
 
 
+def _detect_codex_fast_service_tier() -> bool:
+    """True iff ``~/.codex/config.toml`` requests the fast/priority tier.
+
+    Reads from ``~/.codex`` only (single root; ``$CODEX_HOME`` multi-root is a
+    deferred follow-up). Tolerates an absent/unreadable config (→ False →
+    standard tier).
+    """
+    cfg = pathlib.Path.home() / ".codex" / "config.toml"
+    try:
+        content = cfg.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return _codex_config_requests_fast_service_tier(content)
+
+
+def _resolve_codex_speed(requested: str) -> str:
+    """Resolve a ``--speed`` value to an effective tier.
+
+    ``auto`` → ``fast`` iff ``~/.codex/config.toml`` requests it, else
+    ``standard``. ``fast``/``standard`` pass through unchanged.
+    """
+    if requested == "auto":
+        return "fast" if _detect_codex_fast_service_tier() else "standard"
+    return requested
+
+
 def cmd_codex_daily(args: argparse.Namespace) -> int:
     """Show Codex usage report grouped by date (display tz, --tz, or --timezone)."""
     config = load_config()
@@ -4823,13 +4855,14 @@ def cmd_codex_daily(args: argparse.Namespace) -> int:
     range_start, range_end = range
 
     entries = get_codex_entries(range_start, range_end)
-    _emit_codex_debug_samples_if_set(args, entries, command_label="codex-daily")
+    speed = _resolve_codex_speed(args.speed)
+    _emit_codex_debug_samples_if_set(args, entries, command_label="codex-daily", speed=speed)
     # Route through ``build_codex_daily_view`` (issue #58). The View
     # wraps ``_aggregate_codex_daily`` without changing it — preserves
     # LiteLLM token semantics, intentional dedup vs upstream, and
     # ``CODEX_LEGACY_FALLBACK_MODEL`` warning end-to-end.
     view = build_codex_daily_view(
-        entries, now_utc=_command_as_of(), tz_name=tz_name,
+        entries, now_utc=_command_as_of(), tz_name=tz_name, speed=speed,
     )
     days = list(view.rows)                  # asc — matches aggregator default
     if args.order == "desc":
@@ -4883,10 +4916,11 @@ def cmd_codex_monthly(args: argparse.Namespace) -> int:
     range_start, range_end = range
 
     entries = get_codex_entries(range_start, range_end)
-    _emit_codex_debug_samples_if_set(args, entries, command_label="codex-monthly")
+    speed = _resolve_codex_speed(args.speed)
+    _emit_codex_debug_samples_if_set(args, entries, command_label="codex-monthly", speed=speed)
     # Route through ``build_codex_monthly_view`` (issue #58).
     view = build_codex_monthly_view(
-        entries, now_utc=_command_as_of(), tz_name=tz_name,
+        entries, now_utc=_command_as_of(), tz_name=tz_name, speed=speed,
     )
     months = list(view.rows)
     if args.order == "desc":
@@ -4943,11 +4977,12 @@ def cmd_codex_weekly(args: argparse.Namespace) -> int:
     week_start_idx = WEEKDAY_MAP[week_start_name]
 
     entries = get_codex_entries(range_start, range_end)
-    _emit_codex_debug_samples_if_set(args, entries, command_label="codex-weekly")
+    speed = _resolve_codex_speed(args.speed)
+    _emit_codex_debug_samples_if_set(args, entries, command_label="codex-weekly", speed=speed)
     # Route through ``build_codex_weekly_view`` (issue #58).
     view = build_codex_weekly_view(
         entries, now_utc=now_utc, tz_name=tz_name,
-        week_start_idx=week_start_idx,
+        week_start_idx=week_start_idx, speed=speed,
     )
     weeks = list(view.rows)
     if args.order == "desc":
@@ -5004,12 +5039,13 @@ def cmd_codex_session(args: argparse.Namespace) -> int:
     range_start, range_end = range
 
     entries = get_codex_entries(range_start, range_end)
-    _emit_codex_debug_samples_if_set(args, entries, command_label="codex-session")
+    speed = _resolve_codex_speed(args.speed)
+    _emit_codex_debug_samples_if_set(args, entries, command_label="codex-session", speed=speed)
     # Route through ``build_codex_session_view`` (issue #58). View rows
     # come descending by last_activity (aggregator default + upstream
     # parity); --order asc reverses.
     view = build_codex_session_view(
-        entries, now_utc=_command_as_of(), tz_name=tz_name,
+        entries, now_utc=_command_as_of(), tz_name=tz_name, speed=speed,
     )
     sessions = list(view.rows)
     if args.order == "asc":
@@ -9958,6 +9994,12 @@ def _add_codex_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "-O", "--offline", action=argparse.BooleanOptionalAction, default=False,
         help="Accepted for drop-in compat with ccusage-codex; we are always offline.",
+    )
+    parser.add_argument(
+        "--speed", choices=("auto", "standard", "fast"), default="auto",
+        help="Codex pricing tier. auto (default) reads service_tier from "
+             "~/.codex/config.toml (fast|priority -> fast pricing); fast "
+             "forces the fast-tier multiplier; standard forces base pricing.",
     )
     parser.add_argument(
         "--tz", default=None, type=_argparse_tz, metavar="TZ",

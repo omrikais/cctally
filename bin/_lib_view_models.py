@@ -1703,7 +1703,7 @@ def _codex_period_start_from_month_bucket(buckets) -> "dt.datetime | None":
         return None
 
 
-def build_codex_daily_view(entries, *, now_utc, tz_name=None):
+def build_codex_daily_view(entries, *, now_utc, tz_name=None, speed="standard"):
     """Build a ``CodexDailyView`` from a list of ``CodexEntry`` (issue #58).
 
     Delegates bucketing to ``_aggregate_codex_daily`` (LiteLLM-snapshot
@@ -1712,7 +1712,7 @@ def build_codex_daily_view(entries, *, now_utc, tz_name=None):
     (None → host-local fallback inside the aggregator).
     """
     _agg = _load_lib("_lib_aggregators")
-    buckets = _agg._aggregate_codex_daily(entries, tz_name=tz_name)
+    buckets = _agg._aggregate_codex_daily(entries, tz_name=tz_name, speed=speed)
     total_cost, total_tok = _codex_bucket_totals(buckets)
     return CodexDailyView(
         rows=tuple(buckets),
@@ -1724,7 +1724,7 @@ def build_codex_daily_view(entries, *, now_utc, tz_name=None):
     )
 
 
-def build_codex_monthly_view(entries, *, now_utc, tz_name=None):
+def build_codex_monthly_view(entries, *, now_utc, tz_name=None, speed="standard"):
     """Build a ``CodexMonthlyView`` from a list of ``CodexEntry`` (issue #58).
 
     Same wrap-the-kernel posture as ``build_codex_daily_view``; bucket
@@ -1732,7 +1732,7 @@ def build_codex_monthly_view(entries, *, now_utc, tz_name=None):
     earliest visible month at UTC midnight.
     """
     _agg = _load_lib("_lib_aggregators")
-    buckets = _agg._aggregate_codex_monthly(entries, tz_name=tz_name)
+    buckets = _agg._aggregate_codex_monthly(entries, tz_name=tz_name, speed=speed)
     total_cost, total_tok = _codex_bucket_totals(buckets)
     return CodexMonthlyView(
         rows=tuple(buckets),
@@ -1745,7 +1745,7 @@ def build_codex_monthly_view(entries, *, now_utc, tz_name=None):
 
 
 def build_codex_weekly_view(entries, *, now_utc, tz_name=None,
-                            week_start_idx=0):
+                            week_start_idx=0, speed="standard"):
     """Build a ``CodexWeeklyView`` from a list of ``CodexEntry`` (issue #58).
 
     ``week_start_idx`` is the resolved Mon=0..Sun=6 index the caller
@@ -1754,7 +1754,7 @@ def build_codex_weekly_view(entries, *, now_utc, tz_name=None,
     timezone (matches ``_aggregate_codex_weekly`` contract).
     """
     _agg = _load_lib("_lib_aggregators")
-    buckets = _agg._aggregate_codex_weekly(entries, tz_name, week_start_idx)
+    buckets = _agg._aggregate_codex_weekly(entries, tz_name, week_start_idx, speed=speed)
     total_cost, total_tok = _codex_bucket_totals(buckets)
     return CodexWeeklyView(
         rows=tuple(buckets),
@@ -1766,7 +1766,7 @@ def build_codex_weekly_view(entries, *, now_utc, tz_name=None,
     )
 
 
-def build_codex_session_view(entries, *, now_utc, tz_name=None):
+def build_codex_session_view(entries, *, now_utc, tz_name=None, speed="standard"):
     """Build a ``CodexSessionView`` from a list of ``CodexEntry`` (issue #58).
 
     ``rows`` order mirrors the aggregator: descending by
@@ -1779,7 +1779,7 @@ def build_codex_session_view(entries, *, now_utc, tz_name=None):
     aggregator only tracks ``last`` per session). ``None`` on empty.
     """
     _agg = _load_lib("_lib_aggregators")
-    sessions = _agg._aggregate_codex_sessions(entries)
+    sessions = _agg._aggregate_codex_sessions(entries, speed=speed)
     total_cost = 0.0
     total_tok = 0
     earliest = None
