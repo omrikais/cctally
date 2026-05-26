@@ -318,7 +318,7 @@ class DailyView:
     display_tz_label: str = ""
 
 
-def build_daily_view(entries, *, now_utc, display_tz=None):
+def build_daily_view(entries, *, now_utc, display_tz=None, mode="auto"):
     """Build a ``DailyView`` from raw ``UsageEntry`` list (spec §5.1).
 
     Gap-free: only days with entries appear in ``view.rows`` /
@@ -336,7 +336,7 @@ def build_daily_view(entries, *, now_utc, display_tz=None):
     share consumers ignore them and read ``view.aggregated`` instead.
     """
     _agg = _load_lib("_lib_aggregators")
-    buckets = _agg._aggregate_daily(entries, mode="auto", tz=display_tz)
+    buckets = _agg._aggregate_daily(entries, mode=mode, tz=display_tz)
     if not buckets:
         return DailyView(
             rows=(),
@@ -427,7 +427,7 @@ class MonthlyView:
     display_tz_label: str = ""
 
 
-def build_monthly_view(entries, *, now_utc, n=12, display_tz=None):
+def build_monthly_view(entries, *, now_utc, n=12, display_tz=None, mode="auto"):
     """Build a ``MonthlyView`` for the trailing ``n`` calendar months
     (spec §5.2).
 
@@ -440,7 +440,7 @@ def build_monthly_view(entries, *, now_utc, n=12, display_tz=None):
     CLI table footer would.
     """
     _agg = _load_lib("_lib_aggregators")
-    buckets = _agg._aggregate_monthly(entries, mode="auto", tz=display_tz)
+    buckets = _agg._aggregate_monthly(entries, mode=mode, tz=display_tz)
     if not buckets:
         return MonthlyView(
             rows=(), aggregated=(),
@@ -528,7 +528,7 @@ class WeeklyView:
 
 
 def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
-                      as_of_utc=None):
+                      as_of_utc=None, mode="auto"):
     """Build a ``WeeklyView`` from subscription-week boundaries
     (spec §5.3).
 
@@ -548,7 +548,7 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
     """
     _agg = _load_lib("_lib_aggregators")
     _cct_core = _load_lib("_cctally_core")
-    buckets_asc = _agg._aggregate_weekly(entries, weeks)
+    buckets_asc = _agg._aggregate_weekly(entries, weeks, mode=mode)
     if not buckets_asc:
         return WeeklyView(
             rows=(), aggregated=(), overlay=(),
@@ -1022,7 +1022,7 @@ class SessionsView:
     display_tz_label: str = ""
 
 
-def build_sessions_view(entries, *, now_utc, limit=None, display_tz=None):
+def build_sessions_view(entries, *, now_utc, limit=None, display_tz=None, mode="auto"):
     """Build a ``SessionsView`` from joined Claude session entries
     (spec §5.5).
 
@@ -1053,7 +1053,7 @@ def build_sessions_view(entries, *, now_utc, limit=None, display_tz=None):
     """
     import os as _os                # late: keep top-level imports lean.
     _agg = _load_lib("_lib_aggregators")
-    aggregated = _agg._aggregate_claude_sessions(entries)
+    aggregated = _agg._aggregate_claude_sessions(entries, mode=mode)
     # Apply limit truncation up front so `rows` and `aggregated` stay
     # in lockstep (spec §4.3 invariant: `total_sessions == len(rows)
     # == len(aggregated)`). limit=None → keep everything.

@@ -144,6 +144,67 @@ class TestDailyView:
         assert all(r.intensity_bucket == 0 for r in view.rows)
 
 
+# Session C (T1.7) — the view builders must thread `mode` through to the
+# per-entry cost kernel. Two entries on the same day: one with a recorded
+# costUSD deliberately != its computed cost, one without any recorded cost.
+# auto/calculate/display must diverge accordingly. Default `auto` is the
+# pre-Session-C behavior.
+def _mode_entries(vm):
+    if str(BIN_DIR) not in sys.path:
+        sys.path.insert(0, str(BIN_DIR))
+    from _lib_aggregators import UsageEntry  # noqa: WPS433
+
+    ts = dt.datetime(2026, 4, 20, 9, 0, tzinfo=dt.timezone.utc)
+    usage = {"input_tokens": 1000, "output_tokens": 500,
+             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    # Entry A: recorded costUSD deliberately != computed-from-pricing.
+    a = UsageEntry(timestamp=ts, model="claude-opus-4-7", usage=usage,
+                   cost_usd=9.99, source_path="/tmp/a.jsonl")
+    # Entry B: no recorded costUSD.
+    b = UsageEntry(timestamp=ts, model="claude-opus-4-7", usage=usage,
+                   cost_usd=None, source_path="/tmp/b.jsonl")
+    return [a, b]
+
+
+def test_build_daily_view_threads_mode(vm):
+    now = dt.datetime(2026, 4, 20, 12, 0, tzinfo=dt.timezone.utc)
+    entries = _mode_entries(vm)
+
+    def total(mode):
+        v = vm.build_daily_view(entries, now_utc=now, mode=mode)
+        return sum(r.cost_usd for r in v.aggregated)
+
+    auto = total("auto")
+    calc = total("calculate")
+    disp = total("display")
+    # display: A contributes its recorded 9.99, B contributes 0.
+    assert abs(disp - 9.99) < 1e-9, disp
+    # auto: A uses recorded 9.99; B computes from pricing (> 0).
+    assert auto > 9.99, auto
+    # calculate: both compute from pricing, ignoring A's recorded value.
+    assert abs(calc - 2 * (auto - 9.99)) < 1e-6, (calc, auto)
+    # auto and calculate differ because A's recorded != A's computed.
+    assert abs(auto - calc) > 1e-9, (auto, calc)
+
+
+def test_build_monthly_view_threads_mode(vm):
+    now = dt.datetime(2026, 4, 20, 12, 0, tzinfo=dt.timezone.utc)
+    entries = _mode_entries(vm)
+
+    def total(mode):
+        # n large so the boundary-spillover bucket is not dropped.
+        v = vm.build_monthly_view(entries, now_utc=now, n=10 ** 6, mode=mode)
+        return sum(r.cost_usd for r in v.aggregated)
+
+    auto = total("auto")
+    calc = total("calculate")
+    disp = total("display")
+    assert abs(disp - 9.99) < 1e-9, disp
+    assert auto > 9.99, auto
+    assert abs(calc - 2 * (auto - 9.99)) < 1e-6, (calc, auto)
+    assert abs(auto - calc) > 1e-9, (auto, calc)
+
+
 class TestMonthlyView:
     def test_empty_entries_returns_empty_view(self, vm):
         view = vm.build_monthly_view([], now_utc=_now(), display_tz=None)
@@ -668,7 +729,7 @@ class TestSessionsView:
             models=[],
             model_breakdowns=[],
         )
-        _agg._aggregate_claude_sessions = lambda _entries: [fake]
+        _agg._aggregate_claude_sessions = lambda _entries, mode="auto": [fake]
         try:
             view = vm.build_sessions_view(
                 [], now_utc=_now(), limit=100, display_tz=None,

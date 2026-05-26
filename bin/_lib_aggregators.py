@@ -608,6 +608,7 @@ def _aggregate_codex_sessions(entries: list[CodexEntry]) -> list[CodexSessionUsa
 
 def _aggregate_claude_sessions(
     entries: list["_JoinedClaudeEntry"],
+    mode: str = "auto",
 ) -> list[ClaudeSessionUsage]:
     """Group entries by session_id, collapsing resumed-across-files sessions.
 
@@ -666,7 +667,7 @@ def _aggregate_claude_sessions(
             "cache_creation_input_tokens": entry.cache_creation_tokens,
             "cache_read_input_tokens": entry.cache_read_tokens,
         }
-        cost = _calculate_entry_cost(entry.model, usage)
+        cost = _calculate_entry_cost(entry.model, usage, mode=mode, cost_usd=entry.cost_usd)
 
         sess["input"] += entry.input_tokens
         sess["cache_create"] += entry.cache_creation_tokens

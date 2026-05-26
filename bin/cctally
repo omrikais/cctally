@@ -4541,7 +4541,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
     # fields live on BucketUsage, not on DailyPanelRow. The builder's
     # `_aggregate_daily` call is the same one we used inline.
     view = build_daily_view(all_entries, now_utc=_command_as_of(),
-                            display_tz=tz)
+                            display_tz=tz, mode=args.mode)
     # `_aggregate_daily` returned ascending order; build_daily_view stores
     # `aggregated` newest-first. CLI's default order is ascending, so
     # re-reverse to match the prior on-the-wire shape.
@@ -4628,7 +4628,7 @@ def cmd_monthly(args: argparse.Namespace) -> int:
     # Pass a large `n` so the CLI's `--since`/`--until` window controls
     # how many months render (the dashboard caps at n=12; CLI doesn't).
     view = build_monthly_view(all_entries, now_utc=_command_as_of(),
-                              n=10**6, display_tz=tz)
+                              n=10**6, display_tz=tz, mode=args.mode)
     # The view stores `aggregated` newest-first; CLI default is asc.
     months = list(reversed(view.aggregated))
 
@@ -4745,7 +4745,7 @@ def cmd_weekly(args: argparse.Namespace) -> int:
     # assertions stay aligned.
     view = build_weekly_view(
         conn, all_entries, weeks=weeks, now_utc=now_utc,
-        display_tz=args._resolved_tz, as_of_utc=as_of_utc,
+        display_tz=args._resolved_tz, as_of_utc=as_of_utc, mode=args.mode,
     )
     buckets = list(reversed(view.aggregated))
     overlay = list(reversed(view.overlay))
@@ -5973,6 +5973,7 @@ def cmd_session(args: argparse.Namespace) -> int:
     # files collapses to ONE entry in BOTH tuples).
     view = build_sessions_view(
         entries, now_utc=_command_as_of(), limit=None, display_tz=tz,
+        mode=args.mode,
     )
     sessions = list(view.aggregated)
 
