@@ -85,6 +85,10 @@ for cmd in daily monthly session weekly; do
     compare_forms "codex-$cmd-json"  "$CODEX_HOME" "codex-$cmd --json" "codex $cmd --json"
     compare_forms "codex-$cmd-debug" "$CODEX_HOME" "codex-$cmd --debug" "codex $cmd --debug"
 done
+# --speed fast (issue #86 Session D): the flag rides the shared
+# _add_codex_shared_args, so flat `codex-<cmd> --speed fast` must be
+# byte-identical to subgroup `codex <cmd> --speed fast`.
+compare_forms "codex-daily-speed-fast" "$CODEX_HOME" "codex-daily --speed fast" "codex daily --speed fast"
 
 # --- help surfaces ---
 check_help() {  # check_help <label> <argline> <grep-extended-regex>

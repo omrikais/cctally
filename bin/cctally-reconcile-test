@@ -42,6 +42,7 @@ FIXTURES="$SCRATCH_DIR"
 "$REPO_ROOT/bin/build-codex-fixtures.py"        --out "$SCRATCH_DIR"              >/dev/null
 "$REPO_ROOT/bin/build-diff-fixtures.py"         --out "$SCRATCH_DIR/diff"         >/dev/null
 "$REPO_ROOT/bin/build-mode-fixtures.py"         --out "$SCRATCH_DIR/mode"         >/dev/null
+"$REPO_ROOT/bin/build-speed-fixtures.py"        --out "$SCRATCH_DIR/speed"        >/dev/null
 
 pass_count=0
 fail_count=0
@@ -414,6 +415,60 @@ reconcile_invariant "codex_session_eq_sum_codex_daily" \
     "codex-session --json" \
     "codex-daily --json" \
     "$INVARIANT_6_PY"
+
+# Invariants 4f/5f/6f: the same three Codex cross-command grouping-invariance
+# checks, but with --speed fast on BOTH sides. Reuses the SAME assertion bodies
+# (INVARIANT_4_PY / 5_PY / 6_PY) — proves grouping-invariance still holds under
+# the fast-tier multiplier (the per-entry scale factor is identical across
+# grouping paths, so monthly/weekly/Σsession == Σdaily must remain exact).
+# Issue #86 Session D.
+reconcile_invariant "codex_monthly_eq_sum_codex_daily_fast" \
+    "$FIXTURES/codex-daily/multi-week-rollup" \
+    "codex-monthly --speed fast --json" \
+    "codex-daily --speed fast --json" \
+    "$INVARIANT_4_PY"
+
+reconcile_invariant "codex_weekly_eq_sum_codex_daily_fast" \
+    "$FIXTURES/codex-daily/multi-week-rollup" \
+    "codex-weekly --speed fast --json" \
+    "codex-daily --speed fast --json" \
+    "$INVARIANT_5_PY"
+
+reconcile_invariant "codex_session_eq_sum_codex_daily_fast" \
+    "$FIXTURES/codex-session/cross-day-session" \
+    "codex-session --speed fast --json" \
+    "codex-daily --speed fast --json" \
+    "$INVARIANT_6_PY"
+
+# Speed scalar-multiplier invariants (issue #86 Session D): on a single-model
+# fixture, Σ(--speed fast) == Σ(--speed standard) × per-model multiplier. Two
+# scenarios pin the override (gpt-5.5 → ×2.5) and fallback (gpt-5 → ×2.0)
+# branches of _codex_fast_multiplier exactly. The fixture HOME carries no
+# ~/.codex/config.toml, so the standard/fast values are unambiguous (auto would
+# resolve to standard, but we force the tiers explicitly here).
+reconcile_invariant "speed_override_2_5x" \
+    "$FIXTURES/speed/override-model" \
+    "codex-daily --speed fast --json" \
+    "codex-daily --speed standard --json" \
+    '
+import json, os
+fast = json.loads(os.environ["RECONCILE_A"])["totals"]["costUSD"]
+std  = json.loads(os.environ["RECONCILE_B"])["totals"]["costUSD"]
+assert std > 0, f"std={std}"
+assert abs(fast - std * 2.5) < 1e-9, f"fast={fast} std*2.5={std*2.5}"
+'
+
+reconcile_invariant "speed_fallback_2_0x" \
+    "$FIXTURES/speed/fallback-model" \
+    "codex-daily --speed fast --json" \
+    "codex-daily --speed standard --json" \
+    '
+import json, os
+fast = json.loads(os.environ["RECONCILE_A"])["totals"]["costUSD"]
+std  = json.loads(os.environ["RECONCILE_B"])["totals"]["costUSD"]
+assert std > 0, f"std={std}"
+assert abs(fast - std * 2.0) < 1e-9, f"fast={fast} std*2.0={std*2.0}"
+'
 
 # Invariant D1: diff overall window-A cost == Σ daily.totalCost over the same
 # date range. The same-length-week fixture's window A spans

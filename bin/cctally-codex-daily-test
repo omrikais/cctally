@@ -44,8 +44,13 @@ fail_count=0
 
 for dir in "$HARNESS_FIXTURES_DIR"/*/; do
     name=$(basename "$dir")
-    run_mode "$name" "terminal" ""       "terminal"
-    run_mode "$name" "json"     "--json" "json"
+    run_mode "$name" "terminal"   ""             "terminal"
+    run_mode "$name" "json"       "--json"       "json"
+    # --speed fast full-render path (issue #86 Session D). The scratch HOMEs
+    # carry NO ~/.codex/config.toml, so terminal/json above stay `auto`==
+    # `standard` (no drift); this mode forces the fast-tier multiplier so the
+    # render path is exercised end-to-end.
+    run_mode "$name" "speed-fast" "--speed fast" "speed-fast"
 done
 
 echo "----"

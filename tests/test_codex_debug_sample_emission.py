@@ -168,6 +168,37 @@ class TestComputeCodexCostStats:
         assert stats.fallback_models == set()
         assert stats.samples[0].is_fallback is False
 
+    def test_total_cost_honors_fast_speed(self):
+        """Issue #86 Session D (F3): the --debug walker scales by the per-model
+        fast multiplier just like the report aggregators. gpt-5.5 → ×2.5."""
+        mod = _load_cctally_module()
+        entries = [_make_codex_entry(mod, model="gpt-5.5",
+                                     input_tokens=1_000, cached_input_tokens=0,
+                                     output_tokens=500, reasoning_output_tokens=0)]
+        std = mod._compute_codex_cost_stats(entries, speed="standard").total_cost
+        fast = mod._compute_codex_cost_stats(entries, speed="fast").total_cost
+        assert std > 0
+        assert abs(fast - std * 2.5) < 1e-9
+
+    def test_default_speed_is_standard(self):
+        """No speed arg == speed='standard' (preserves every existing caller)."""
+        mod = _load_cctally_module()
+        entries = [_make_codex_entry(mod, model="gpt-5.5")]
+        assert (mod._compute_codex_cost_stats(entries).total_cost
+                == mod._compute_codex_cost_stats(entries, speed="standard").total_cost)
+
+    def test_samples_scale_with_fast_speed(self):
+        """The per-entry sample costs (not just the total) scale under fast."""
+        mod = _load_cctally_module()
+        e = _make_codex_entry(mod, model="gpt-5.5",
+                              input_tokens=1_000, cached_input_tokens=0,
+                              output_tokens=500, reasoning_output_tokens=0)
+        std_sample = mod._compute_codex_cost_stats([e], speed="standard").samples[0]
+        fast_sample = mod._compute_codex_cost_stats([e], speed="fast").samples[0]
+        assert std_sample.calculated_cost > 0
+        assert abs(fast_sample.calculated_cost
+                   - std_sample.calculated_cost * 2.5) < 1e-9
+
 
 # Issue #92 §render — _render_codex_cost_report shape tests
 class TestRenderCodexCostReport:
@@ -476,3 +507,35 @@ def test_e2e_no_debug_flag_no_report(tmp_path):
     )
     assert r.returncode == 0, (r.returncode, r.stderr)
     assert "Codex Pricing Debug Report" not in r.stderr, r.stderr
+
+
+def _debug_total_cost(stderr: str) -> float:
+    """Parse the 'Total computed cost: $X.XXXXXX' line from a debug report."""
+    import re
+    m = re.search(r"Total computed cost: \$([\d.]+)", stderr)
+    assert m, f"no 'Total computed cost' line in:\n{stderr}"
+    return float(m.group(1))
+
+
+def test_e2e_debug_total_cost_honors_fast_speed(tmp_path):
+    """Issue #86 Session D (F3): `codex-daily --debug --speed fast` reports a
+    larger 'Total computed cost' than `--speed standard`, end-to-end."""
+    home = tmp_path / "home"
+    home.mkdir()
+    _stage_codex_session(home, model="gpt-5.5")  # gpt-5.5 → fast ×2.5
+    env = {"HOME": str(home), "PATH": __import__("os").environ.get("PATH", ""),
+           "TZ": "Etc/UTC", "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
+
+    def _run(speed):
+        r = subprocess.run(
+            [sys.executable, str(CCTALLY), "codex-daily", "--debug",
+             "--speed", speed],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert r.returncode == 0, (r.returncode, r.stderr)
+        return _debug_total_cost(r.stderr)
+
+    std = _run("standard")
+    fast = _run("fast")
+    assert std > 0
+    assert abs(fast - std * 2.5) < 1e-6
