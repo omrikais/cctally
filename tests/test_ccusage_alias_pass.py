@@ -447,3 +447,37 @@ class TestDualDateForm:
         r = _run(cmd, "--since", "26-01-01")
         assert r.returncode != 0
         assert "must be YYYY-MM-DD or YYYYMMDD" in r.stderr, r.stderr
+
+
+# Session C (T1.7): the six reporting commands that gain -m/--mode.
+# five-hour-blocks accepts it as a documented no-op; the other five thread it.
+INSCOPE_CMDS_MODE = [
+    "daily", "monthly", "weekly", "session", "blocks", "five-hour-blocks",
+]
+
+
+@pytest.mark.parametrize("cmd", INSCOPE_CMDS_MODE)
+class TestModeFlag:
+    """Session C — every mode-scope cmd exposes -m/--mode {auto,calculate,
+    display} with default auto, accepts all three values, rejects invalid."""
+
+    def test_help_lists_mode_flag(self, cmd, fake_home):
+        r = _run(cmd, "--help")
+        assert r.returncode == 0, r.stderr
+        assert "--mode" in r.stdout, r.stdout
+        assert "{auto,calculate,display}" in r.stdout, r.stdout
+
+    @pytest.mark.parametrize("val", ["auto", "calculate", "display"])
+    def test_mode_value_parses(self, cmd, val, fake_home):
+        r = _run(cmd, *_window_args(cmd), "--mode", val)
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+        assert "invalid choice" not in r.stderr, r.stderr
+
+    def test_mode_short_flag_parses(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "-m", "calculate")
+        assert "unrecognized arguments" not in r.stderr, r.stderr
+
+    def test_invalid_mode_rejected(self, cmd, fake_home):
+        r = _run(cmd, *_window_args(cmd), "--mode", "bogus")
+        assert r.returncode == 2, (r.returncode, r.stderr)
+        assert "invalid choice" in r.stderr, r.stderr

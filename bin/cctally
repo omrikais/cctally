@@ -9783,6 +9783,36 @@ def _argparse_has_arg(parser, option_string: str) -> bool:
     return False
 
 
+def _add_mode_arg(parser, *, noop: bool = False) -> None:
+    """Add ccusage's -m/--mode {auto,calculate,display} cost-source flag.
+
+    Standalone (not folded into _add_ccusage_alias_args) so it lands only
+    on the six Session-C reporting commands and never collides with
+    range-cost, which defines its own -m/--mode.
+
+    noop=True (five-hour-blocks only): the flag is accepted for surface
+    parity with `blocks` but does not alter numbers — that command's cost
+    is the authoritative materialized five_hour_blocks.total_cost_usd
+    computed at record-time (always auto semantics).
+    """
+    help_real = (
+        "Cost source: auto (recorded costUSD when present, else computed), "
+        "calculate (always compute from embedded pricing), display "
+        "(recorded costUSD only; $0 when absent). Default: auto."
+    )
+    help_noop = (
+        "Accepted for ccusage drop-in compat; no-op here — five-hour-blocks "
+        "cost is the authoritative materialized per-block value computed at "
+        "record-time. Default: auto."
+    )
+    parser.add_argument(
+        "-m", "--mode",
+        default="auto",
+        choices=["auto", "calculate", "display"],
+        help=help_noop if noop else help_real,
+    )
+
+
 def _add_ccusage_alias_args(parser, *, ansi_emit: bool) -> None:
     """Attach the Session A ccusage alias surface to a Claude-cmd subparser.
 
@@ -10137,6 +10167,7 @@ def _build_daily_parser(subparsers, name, *, help_text, xref):
              "Overrides config display.tz for this call.",
     )
     _add_ccusage_alias_args(p, ansi_emit=False)
+    _add_mode_arg(p)
     _add_share_args(p)
     p.set_defaults(func=cmd_daily)
     return p
@@ -10195,6 +10226,7 @@ def _build_monthly_parser(subparsers, name, *, help_text, xref):
              "Overrides config display.tz for this call.",
     )
     _add_ccusage_alias_args(p, ansi_emit=False)
+    _add_mode_arg(p)
     _add_share_args(p)
     p.set_defaults(func=cmd_monthly)
     return p
@@ -10235,6 +10267,7 @@ def _build_weekly_parser(subparsers, name, *, help_text, xref):
                    help="Display timezone: local, utc, or IANA name. "
                         "Overrides config display.tz for this call.")
     _add_ccusage_alias_args(p, ansi_emit=False)
+    _add_mode_arg(p)
     _add_share_args(p)
     p.set_defaults(func=cmd_weekly)
     return p
@@ -10286,6 +10319,7 @@ def _build_session_parser(subparsers, name, *, help_text, xref):
              "Unknown id → exit 0 with the empty-render branch.",
     )
     _add_ccusage_alias_args(p, ansi_emit=False)
+    _add_mode_arg(p)
     _add_share_args(p)
     p.set_defaults(func=cmd_session)
     return p
@@ -10340,6 +10374,7 @@ def _build_blocks_parser(subparsers, name, *, help_text, xref):
              "Overrides config display.tz for this call.",
     )
     _add_ccusage_alias_args(p, ansi_emit=False)
+    _add_mode_arg(p)
     p.set_defaults(func=cmd_blocks)
     return p
 
@@ -11266,6 +11301,7 @@ def build_parser() -> argparse.ArgumentParser:
     # guard. The helper's --color add lands as a parsed-and-ignored
     # no-op (the renderer emits plain text).
     _add_ccusage_alias_args(fhb, ansi_emit=False)
+    _add_mode_arg(fhb, noop=True)
     _add_share_args(fhb)
     fhb.set_defaults(func=cmd_five_hour_blocks)
 
