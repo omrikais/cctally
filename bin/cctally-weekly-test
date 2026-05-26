@@ -51,6 +51,17 @@ for dir in "$HARNESS_FIXTURES_DIR"/*/; do
     if [ -f "$dir/golden-desc.txt" ]; then
         run_mode "$name" "desc" "--order desc" "desc"
     fi
+    # Session C (issue #86): -m/--mode cost-source coverage. These
+    # fixtures carry NO recorded costUSD (cache.db session_entries.
+    # cost_usd_raw is all NULL), so the three modes split cleanly:
+    #   * --mode calculate ≡ default auto (every cost is computed from
+    #     pricing either way) → reuse golden-terminal.txt byte-for-byte.
+    #     Proves the command threads mode without altering computed totals.
+    #   * --mode display drops every (cost-less) entry to $0 → a distinct
+    #     golden-mode-display.txt where all Cost (USD) / $/1% cells zero.
+    #     Proves the flag actually reaches the per-entry cost path.
+    run_mode "$name" "mode-calculate" "--mode calculate" "terminal"
+    run_mode "$name" "mode-display"   "--mode display"   "mode-display"
 done
 
 echo "----"

@@ -1971,6 +1971,63 @@ INSERT INTO weekly_usage_snapshots (
 }
 fhb_banner_status_line_suppressed
 
+# ─── Scenario fhb-mode-noop: -m/--mode is a documented no-op ────────────
+# Session C (issue #86, spec §3 / §4.3). `five-hour-blocks` accepts
+# -m/--mode {auto,calculate,display} for surface parity with `blocks`,
+# but its cost is the authoritative materialized
+# five_hour_blocks.total_cost_usd (computed at record-time, always auto
+# semantics). There is NO query-time per-entry cost path to re-source,
+# so the flag MUST NOT alter any rendered number. This scenario seeds a
+# block with a non-zero total_cost_usd and asserts the table output is
+# BYTE-IDENTICAL across no-flag / --mode calculate / --mode display.
+#
+# String-equality of three in-memory captures via the harness's own
+# assert_eq idiom (NOT a golden file, NOT a process-substitution diff) —
+# so the #106/#107 inline-diff regression guard stays zero. A regression where
+# five-hour-blocks ever wired --mode into a cost recompute would flip the
+# $12.34 / $50.00 cells under display/calculate and fail here.
+fhb_mode_noop () {
+    local name="fhb-mode-noop"
+    begin_scenario "$name"
+
+    run_cctally "$home" weekly >/dev/null 2>&1 || true
+
+    # One closed block carrying a materialized non-zero cost. If --mode
+    # ever re-sourced cost from (absent) entries, display would zero this
+    # and calculate would recompute it — either diverges from no-flag.
+    sql "$home" "
+INSERT INTO five_hour_blocks (
+    five_hour_window_key, five_hour_resets_at, block_start_at,
+    first_observed_at_utc, last_observed_at_utc,
+    final_five_hour_percent, total_cost_usd,
+    seven_day_pct_at_block_start, seven_day_pct_at_block_end,
+    crossed_seven_day_reset, is_closed,
+    created_at_utc, last_updated_at_utc
+) VALUES (1777563000, '2026-04-30T15:30:00+00:00', '2026-04-30T10:30:00+00:00',
+          '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00',
+          80.0, 50.00, 5.0, 30.0, 0, 1,
+          '2026-04-30T10:30:00+00:00', '2026-04-30T15:30:00+00:00');
+"
+
+    local out_none out_calc out_disp
+    out_none=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-blocks 2>&1)
+    out_calc=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-blocks --mode calculate 2>&1)
+    out_disp=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-blocks --mode display 2>&1)
+
+    # Guard against a silently-empty render (would make the equality
+    # vacuously true): the seeded block's materialized cost MUST appear.
+    case "$out_none" in
+        *'$50.00'*) ;;
+        *) _err="${_err:+$_err; }no-flag render missing materialized \$50.00 cost (empty? selector changed?)" ;;
+    esac
+
+    assert_eq "$out_calc" "$out_none" "five-hour-blocks --mode calculate byte-identical to no-flag"
+    assert_eq "$out_disp" "$out_none" "five-hour-blocks --mode display byte-identical to no-flag"
+
+    finish_scenario "$name"
+}
+fhb_mode_noop
+
 echo
 echo "passed: $pass_count   failed: $fail_count"
 exit $fail_count

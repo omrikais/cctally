@@ -45,6 +45,19 @@ for dir in "$HARNESS_FIXTURES_DIR"/*/; do
     name=$(basename "$dir")
     run_mode "$name" "terminal" ""       "terminal"
     run_mode "$name" "json"     "--json" "json"
+    # Session C (issue #86): -m/--mode cost-source coverage. These
+    # fixtures carry NO recorded costUSD (cache.db session_entries.
+    # cost_usd_raw is all NULL; the streaming-pair-dedup JSONL likewise
+    # has no costUSD field), so the three modes split cleanly:
+    #   * --mode calculate ≡ default auto (every cost is computed from
+    #     pricing either way) → reuse golden-terminal.txt byte-for-byte.
+    #     This also exercises the active canonical-swap path, which threads
+    #     mode through _maybe_swap_active_block_to_canonical.
+    #   * --mode display drops every (cost-less) entry to $0 → a distinct
+    #     golden-mode-display.txt where the Cost column zeros. Proves the
+    #     flag reaches the per-entry cost path (both main grouping + swap).
+    run_mode "$name" "mode-calculate" "--mode calculate" "terminal"
+    run_mode "$name" "mode-display"   "--mode display"   "mode-display"
 done
 
 echo "----"
