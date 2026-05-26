@@ -1,0 +1,15 @@
+# Runtime artifacts generated when bin/build-mode-fixtures.py runs WITHOUT
+# --out (the default writes here). The reconcile harness
+# (bin/cctally-reconcile-test) always rebuilds this fixture fresh into a
+# --out scratch dir, so the seeded SQLite DBs are NOT committed in-tree —
+# only this .gitignore is. Anything the builder or a CLI run writes here
+# stays out of the working tree.
+*.db
+*.db-wal
+*.db-shm
+*.log
+input.env
+.local/
+.claude/
+config.json
+.local/share/cctally/cache.db*.lock

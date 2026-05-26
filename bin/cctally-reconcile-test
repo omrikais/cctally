@@ -41,6 +41,7 @@ FIXTURES="$SCRATCH_DIR"
 "$REPO_ROOT/bin/build-cache-report-fixtures.py" --out "$SCRATCH_DIR/cache-report" >/dev/null
 "$REPO_ROOT/bin/build-codex-fixtures.py"        --out "$SCRATCH_DIR"              >/dev/null
 "$REPO_ROOT/bin/build-diff-fixtures.py"         --out "$SCRATCH_DIR/diff"         >/dev/null
+"$REPO_ROOT/bin/build-mode-fixtures.py"         --out "$SCRATCH_DIR/mode"         >/dev/null
 
 pass_count=0
 fail_count=0
@@ -2766,6 +2767,110 @@ PYDEDUP
     pass_count=$((pass_count + 1))
 }
 dedup_invariants
+
+# ─── Invariant MODE-*: -m/--mode cost-source cross-command equality + ───
+# kernel identities (issue #86 Session C, spec §4.1).
+#
+# Fixture: tests/fixtures/mode/mixed-cost — one subscription week, two
+# days, two models; each day mixes one entry WITH a recorded costUSD
+# (cache.db session_entries.cost_usd_raw, deliberately != computed) and
+# one entry WITHOUT (NULL). The three modes therefore visibly diverge:
+#   auto      = recorded-when-present, else computed
+#   calculate = always computed from embedded pricing (ignores recorded)
+#   display   = recorded-only ($0 when absent)
+#
+# MODE-A/B/C (per mode): Σ(daily.totalCost) == Σ(monthly.totalCost) ==
+#   Σ(weekly.totalCost) == range-cost.totalCostUSD over the same window,
+#   within 1e-9 USD. Catches any of the five recompute-from-entries
+#   commands silently NOT threading mode (they would disagree).
+# MODE-KERNEL: auto Σ > display Σ (display drops the NULL-cost entries to
+#   $0) AND auto Σ != calculate Σ (recorded != computed on the WITH-cost
+#   entries). These are the kernel identities that prove the modes are
+#   semantically distinct over this fixture, not just plumbed.
+
+MODE_FX="$FIXTURES/mode/mixed-cost"
+
+# daily Σ == monthly Σ (per mode).
+INVARIANT_MODE_DAILY_EQ_MONTHLY_PY='
+import json, os
+a = json.loads(os.environ["RECONCILE_A"])
+b = json.loads(os.environ["RECONCILE_B"])
+sum_daily = sum(r["totalCost"] for r in a.get("daily", []))
+sum_monthly = sum(r["totalCost"] for r in b.get("monthly", []))
+assert abs(sum_daily - sum_monthly) < 1e-9, \
+    f"Σdaily.totalCost={sum_daily} Σmonthly.totalCost={sum_monthly}"
+'
+# daily Σ == weekly Σ (per mode).
+INVARIANT_MODE_DAILY_EQ_WEEKLY_PY='
+import json, os
+a = json.loads(os.environ["RECONCILE_A"])
+b = json.loads(os.environ["RECONCILE_B"])
+sum_daily = sum(r["totalCost"] for r in a.get("daily", []))
+sum_weekly = sum(r["totalCost"] for r in b.get("weekly", []))
+assert abs(sum_daily - sum_weekly) < 1e-9, \
+    f"Σdaily.totalCost={sum_daily} Σweekly.totalCost={sum_weekly}"
+'
+# daily Σ == range-cost.totalCostUSD over the same week window (per mode).
+INVARIANT_MODE_DAILY_EQ_RANGE_COST_PY='
+import json, os
+a = json.loads(os.environ["RECONCILE_A"])
+b = json.loads(os.environ["RECONCILE_B"])
+sum_daily = sum(r["totalCost"] for r in a.get("daily", []))
+range_total = b["totalCostUSD"]
+assert abs(sum_daily - range_total) < 1e-9, \
+    f"Σdaily.totalCost={sum_daily} range-cost.totalCostUSD={range_total}"
+'
+
+# The mixed-cost week spans 2026-04-20 → 2026-04-27; range-cost is given
+# the same window so it sums exactly the seeded entries.
+MODE_RANGE_START="2026-04-20T00:00:00Z"
+MODE_RANGE_END="2026-04-27T00:00:00Z"
+
+for mode in auto calculate display; do
+    reconcile_invariant "mode_${mode}_daily_eq_monthly" "$MODE_FX" \
+        "daily --json --mode $mode" \
+        "monthly --json --mode $mode" \
+        "$INVARIANT_MODE_DAILY_EQ_MONTHLY_PY"
+    reconcile_invariant "mode_${mode}_daily_eq_weekly" "$MODE_FX" \
+        "daily --json --mode $mode" \
+        "weekly --json --mode $mode" \
+        "$INVARIANT_MODE_DAILY_EQ_WEEKLY_PY"
+    reconcile_invariant "mode_${mode}_daily_eq_range_cost" "$MODE_FX" \
+        "daily --json --mode $mode" \
+        "range-cost -s $MODE_RANGE_START -e $MODE_RANGE_END --mode $mode --json" \
+        "$INVARIANT_MODE_DAILY_EQ_RANGE_COST_PY"
+done
+
+# Kernel identity: auto Σ > display Σ (NULL-cost entries drop to $0).
+INVARIANT_MODE_AUTO_GT_DISPLAY_PY='
+import json, os
+a = json.loads(os.environ["RECONCILE_A"])
+b = json.loads(os.environ["RECONCILE_B"])
+sum_auto = sum(r["totalCost"] for r in a.get("daily", []))
+sum_display = sum(r["totalCost"] for r in b.get("daily", []))
+assert sum_auto > sum_display + 1e-9, \
+    f"expected auto Σ > display Σ; auto={sum_auto} display={sum_display}"
+'
+reconcile_invariant "mode_kernel_auto_gt_display" "$MODE_FX" \
+    "daily --json --mode auto" \
+    "daily --json --mode display" \
+    "$INVARIANT_MODE_AUTO_GT_DISPLAY_PY"
+
+# Kernel identity: auto Σ != calculate Σ (recorded != computed on the
+# WITH-cost entries, so auto reuses recorded while calculate recomputes).
+INVARIANT_MODE_AUTO_NE_CALCULATE_PY='
+import json, os
+a = json.loads(os.environ["RECONCILE_A"])
+b = json.loads(os.environ["RECONCILE_B"])
+sum_auto = sum(r["totalCost"] for r in a.get("daily", []))
+sum_calc = sum(r["totalCost"] for r in b.get("daily", []))
+assert abs(sum_auto - sum_calc) > 1e-9, \
+    f"expected auto Σ != calculate Σ; auto={sum_auto} calculate={sum_calc}"
+'
+reconcile_invariant "mode_kernel_auto_ne_calculate" "$MODE_FX" \
+    "daily --json --mode auto" \
+    "daily --json --mode calculate" \
+    "$INVARIANT_MODE_AUTO_NE_CALCULATE_PY"
 
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
