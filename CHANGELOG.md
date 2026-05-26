@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-05-26
+
 ### Added
 - **`cctally claude <cmd>` and `cctally codex <cmd>` subgroup commands** let you paste ccusage's hierarchical syntax verbatim — `cctally claude {daily,monthly,weekly,session,blocks}` is a drop-in for `ccusage claude <cmd>`, and `cctally codex {daily,monthly,session,weekly}` for `ccusage codex <cmd>` (`codex weekly` is a cctally extension; upstream has none). Each subgroup leaf routes to the exact same engine as its flat form, so the table / `--json` / exit code are byte-identical — only `--help` adds a one-line alias/canonical cross-reference. The flat forms (`cctally daily`, `cctally codex-daily`, …) remain fully supported as back-compat aliases, with no deprecation warning. (#86)
 
