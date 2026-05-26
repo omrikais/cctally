@@ -110,3 +110,29 @@ def test_version_marker_absent_in_prod(core, monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "(dev" not in out and "cctally-dev" not in out
+
+
+def test_version_marker_in_override_on_checkout(core, monkeypatch, tmp_path, capsys):
+    """P3: CCTALLY_DATA_DIR override on a checkout — DEV_MODE is False but the
+    binary is a checkout, so --version must still mark it (keyed on
+    _is_dev_checkout, not DEV_MODE) and surface the explicit data dir, rather
+    than printing the bare prod-looking version."""
+    from conftest import load_script
+    ns = load_script()
+    override = tmp_path / "branch-x"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CCTALLY_DISABLE_DEV_AUTODETECT", raising=False)
+    monkeypatch.setenv("CCTALLY_DATA_DIR", str(override))
+    # _git_dir mkdir's .git non-idempotently; DEV_MODE False means --version
+    # re-evaluates _is_dev_checkout(), so build the repo once and return it.
+    repo = _git_dir(tmp_path)
+    monkeypatch.setattr(core, "_repo_root", lambda: repo)
+    core._init_paths_from_env()
+    assert core.DEV_MODE is False
+    assert core._is_dev_checkout() is True
+    rc = ns["main"](["--version"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "dev checkout, custom data dir" in out
+    assert str(override) in out
+    assert "cctally-dev" not in out  # the auto-detect dir is NOT used here

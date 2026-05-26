@@ -90,6 +90,26 @@ _DEV_SETUP_REFUSAL_MSG = (
 )
 
 
+# Dev-instance isolation (§3, P2): warning when `--force-dev` installs hooks
+# while CCTALLY_DATA_DIR is set. The hook command saved into settings.json is
+# just `<binary> hook-tick` — it does NOT carry the override env. A hook fire
+# that doesn't inherit the override (GUI-launched Claude, a different shell)
+# resolves APP_DIR via dev-checkout auto-detect ({autodetect_dir}), while
+# interactive runs in this shell use {override_dir} — silently splitting one
+# intended instance across two DBs. CCTALLY_DATA_DIR is an interactive-only
+# hatch (spec "Out of scope / accepted"); baking it into the global hook
+# command would persist a transient path machine-wide, so we warn instead.
+_DEV_SETUP_FORCE_DEV_OVERRIDE_WARNING = (
+    "cctally setup: warning: installing hooks with --force-dev while "
+    "CCTALLY_DATA_DIR is set.\n"
+    "  Interactive runs in this shell use: {override_dir}\n"
+    "  Background hook fires (no env inherited) will use: {autodetect_dir}\n"
+    "The hook command can't carry CCTALLY_DATA_DIR, so these two paths split "
+    "your\ndata across separate DBs. CCTALLY_DATA_DIR is an interactive-only "
+    "override."
+)
+
+
 # ── settings.json hook surgery ─────────────────────────────────────────
 
 
@@ -1855,6 +1875,29 @@ def cmd_setup(args: argparse.Namespace) -> int:
     ):
         eprint(_DEV_SETUP_REFUSAL_MSG.format(data_dir=_cctally_core.APP_DIR))
         return 2
+    # P2: --force-dev install on a checkout with CCTALLY_DATA_DIR set splits
+    # interactive runs (override dir) from background hook fires (auto-detect
+    # dir, since the saved hook command can't carry the override env). Only
+    # the install path writes hooks, so scope the warning to it (uninstall
+    # removes hooks; --status/--dry-run don't write). Fires only on the
+    # doubly-rare --force-dev + CCTALLY_DATA_DIR combination.
+    is_install = not (
+        getattr(args, "status", False)
+        or getattr(args, "dry_run", False)
+        or getattr(args, "uninstall", False)
+    )
+    override_dir = os.environ.get("CCTALLY_DATA_DIR", "").strip()
+    if (
+        is_install
+        and _cctally_core._is_dev_checkout()
+        and getattr(args, "force_dev", False)
+        and override_dir
+    ):
+        autodetect_dir = pathlib.Path.home() / ".local" / "share" / "cctally-dev"
+        eprint(_DEV_SETUP_FORCE_DEV_OVERRIDE_WARNING.format(
+            override_dir=pathlib.Path(override_dir).expanduser(),
+            autodetect_dir=autodetect_dir,
+        ))
     # Migration flags are install-mode-only. Reject combinations with
     # --status or --uninstall (per spec Section 2 mode×flag matrix). The
     # mutex group on the parser already prevents both flags being set

@@ -9738,6 +9738,7 @@ def doctor_gather_state(
         # Dev-instance isolation (§4): which data dir resolved + how.
         dev_mode=_cctally_core.DEV_MODE,
         app_dir=str(_cctally_core.APP_DIR),
+        is_dev_checkout=_cctally_core._is_dev_checkout(),
     )
 
 
@@ -13522,10 +13523,17 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "version", False):
         v = _lib_changelog._read_latest_changelog_version()
         base = "cctally unknown" if v is None else f"cctally {v[0]}"
-        # Dev-instance isolation (§4): append the dev marker + resolved data
-        # dir when DEV_MODE is set. Prod output is unchanged.
+        # Dev-instance isolation (§4, P3): append the dev marker + resolved
+        # data dir whenever running from a checkout — keyed on
+        # _is_dev_checkout(), NOT DEV_MODE, so the CCTALLY_DATA_DIR
+        # override-on-checkout case (DEV_MODE False) still shows the marker
+        # instead of masquerading as the installed binary. Prod (no .git)
+        # output is unchanged. The override case is labelled distinctly so
+        # the user can tell auto-detect (cctally-dev) from an explicit dir.
         if _cctally_core.DEV_MODE:
             base += f" (dev — {_cctally_core.APP_DIR})"
+        elif _cctally_core._is_dev_checkout():
+            base += f" (dev checkout, custom data dir — {_cctally_core.APP_DIR})"
         print(base)
         return 0
     if not getattr(args, "func", None):

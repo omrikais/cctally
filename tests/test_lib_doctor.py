@@ -30,7 +30,7 @@ def test_doctor_state_has_required_fields():
         "now_utc", "cctally_version",
         "forked_bucket_counts",
         "credited_weeks",
-        "dev_mode", "app_dir",
+        "dev_mode", "app_dir", "is_dev_checkout",
     }
     assert fields == expected, fields ^ expected
 
@@ -173,7 +173,24 @@ def test_install_mode_check_prod():
     assert r.severity == "ok"
     assert "installed" in r.summary
     assert r.details["dev_mode"] is False
+    assert r.details["is_dev_checkout"] is False
     assert r.details["app_dir"] == "/h/.local/share/cctally"
+
+
+def test_install_mode_check_override_on_checkout():
+    """P3: CCTALLY_DATA_DIR override on a git checkout — DEV_MODE is False
+    (the override won at step 1) but the binary IS a checkout. Must NOT report
+    "installed"; surfaces the custom data dir distinctly from auto-detect."""
+    s = _state(dev_mode=False, is_dev_checkout=True, app_dir="/tmp/branch-x")
+    r = L._check_install_dev_mode(s)
+    assert r.id == "install.mode"
+    assert r.severity == "ok"
+    assert "DEV" in r.summary
+    assert "custom data dir" in r.summary
+    assert "installed" not in r.summary
+    assert r.details["dev_mode"] is False
+    assert r.details["is_dev_checkout"] is True
+    assert r.details["app_dir"] == "/tmp/branch-x"
 
 
 def test_install_mode_registered_first_in_install_category():

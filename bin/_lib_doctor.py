@@ -96,8 +96,13 @@ class DoctorState:
     cctally_version: str
     # Dev-instance isolation (2026-05-26): which data dir this process
     # resolved, and whether it was via dev-checkout auto-detect.
+    # `is_dev_checkout` is the binary-location fact (running from a git
+    # checkout), independent of `dev_mode` (which is False when an explicit
+    # CCTALLY_DATA_DIR override won at step 1). The override-on-checkout case
+    # is `is_dev_checkout=True, dev_mode=False` — distinct from installed.
     dev_mode: bool
     app_dir: str
+    is_dev_checkout: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,16 +223,30 @@ def _check_install_legacy_bespoke(s: DoctorState) -> CheckResult:
 
 def _check_install_dev_mode(s: DoctorState) -> CheckResult:
     """Always-present, always-ok: reports the resolved data dir and whether
-    this process is a dev-checkout (DEV mode) or the installed binary.
-    Dev-instance isolation (§4)."""
+    this process is a dev-checkout or the installed binary.
+    Dev-instance isolation (§4, P3).
+
+    Three states, not two — `dev_mode` alone collapses the override case:
+      - dev_mode                       → auto-detected checkout (cctally-dev)
+      - is_dev_checkout, not dev_mode  → checkout + CCTALLY_DATA_DIR override
+      - neither                        → installed (prod)
+    Reporting the override case as "installed" was misleading exactly when a
+    user runs the per-branch hatch and wants to confirm which instance they
+    are on (the binary IS a checkout; setup still refuses it as one)."""
     if s.dev_mode:
         summary = "DEV (auto-detected git checkout)"
+    elif s.is_dev_checkout:
+        summary = "DEV (git checkout, custom data dir via CCTALLY_DATA_DIR)"
     else:
         summary = "installed"
     return CheckResult(
         id="install.mode", title="Mode",
         severity="ok", summary=summary, remediation=None,
-        details={"dev_mode": s.dev_mode, "app_dir": s.app_dir},
+        details={
+            "dev_mode": s.dev_mode,
+            "is_dev_checkout": s.is_dev_checkout,
+            "app_dir": s.app_dir,
+        },
     )
 
 

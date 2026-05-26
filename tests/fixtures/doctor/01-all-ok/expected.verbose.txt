@@ -4,6 +4,7 @@ Install
   ✓ Mode                     installed
       details:
         dev_mode: False
+        is_dev_checkout: False
         app_dir: $HOME/.local/share/cctally
   ✓ Symlinks                 12/12 present
       details:

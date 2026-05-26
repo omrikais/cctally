@@ -957,3 +957,63 @@ class TestSetupDevCheckoutGuard:
 
         assert rc == 0  # guard bypassed; uninstall proceeds
         assert "refusing to run from a dev checkout" not in err_buf.getvalue()
+
+    def test_force_dev_install_with_data_dir_override_warns(
+        self, ns, monkeypatch, tmp_path
+    ):
+        """P2: a --force-dev install on a checkout while CCTALLY_DATA_DIR is
+        set warns that hooks can't carry the override — interactive runs use
+        the override dir but background hook fires resolve via auto-detect, so
+        the two split across separate DBs. Install proceeds (we don't block
+        the deliberate --force-dev path); the warning is the mitigation. The
+        real install writes only into the pinned fake HOME; stdout (the JSON
+        envelope) is captured separately so we assert on the stderr warning."""
+        home = self._arrange_checkout(monkeypatch, tmp_path)
+        _e2e_pin_paths(ns, monkeypatch, home)
+        monkeypatch.setenv("CCTALLY_DATA_DIR", "/tmp/branch-x")
+        monkeypatch.setattr(sys, "stdout", io.StringIO())   # swallow envelope
+        err_buf = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", err_buf)
+
+        rc = ns["cmd_setup"](_e2e_install_args(force_dev=True))
+
+        assert rc == 0
+        err = err_buf.getvalue()
+        assert "installing hooks with --force-dev while CCTALLY_DATA_DIR is set" in err
+        assert "/tmp/branch-x" in err           # the override dir is surfaced
+        assert "cctally-dev" in err             # the auto-detect dir is surfaced
+
+    def test_force_dev_install_without_override_no_warning(
+        self, ns, monkeypatch, tmp_path
+    ):
+        """P2 negative: plain --force-dev install (no CCTALLY_DATA_DIR) does
+        NOT warn — interactive runs and hook fires both resolve to the
+        auto-detect dev dir, so there is no split."""
+        home = self._arrange_checkout(monkeypatch, tmp_path)
+        _e2e_pin_paths(ns, monkeypatch, home)
+        monkeypatch.delenv("CCTALLY_DATA_DIR", raising=False)
+        monkeypatch.setattr(sys, "stdout", io.StringIO())
+        err_buf = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", err_buf)
+
+        rc = ns["cmd_setup"](_e2e_install_args(force_dev=True))
+
+        assert rc == 0
+        assert "CCTALLY_DATA_DIR is set" not in err_buf.getvalue()
+
+    def test_force_dev_uninstall_with_override_no_warning(
+        self, ns, monkeypatch, tmp_path
+    ):
+        """P2 scope: the split-DB warning is install-only. --uninstall removes
+        hooks, so a stale override in the hook command is moot — no warning."""
+        home = self._arrange_checkout(monkeypatch, tmp_path)
+        _e2e_pin_paths(ns, monkeypatch, home)
+        monkeypatch.setenv("CCTALLY_DATA_DIR", "/tmp/branch-x")
+        monkeypatch.setattr(sys, "stdout", io.StringIO())
+        err_buf = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", err_buf)
+
+        rc = ns["cmd_setup"](_e2e_install_args(uninstall=True, force_dev=True))
+
+        assert rc == 0
+        assert "CCTALLY_DATA_DIR is set" not in err_buf.getvalue()

@@ -5,7 +5,8 @@
                 {
                     "details": {
                         "app_dir": "$HOME/.local/share/cctally",
-                        "dev_mode": false
+                        "dev_mode": false,
+                        "is_dev_checkout": false
                     },
                     "id": "install.mode",
                     "severity": "ok",
