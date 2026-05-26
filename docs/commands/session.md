@@ -24,9 +24,20 @@ cctally session
 | `-u, --until YYYYMMDD` | Filter until date (inclusive). |
 | `-b, --breakdown` | Show per-model cost breakdown sub-rows. |
 | `-o, --order {asc,desc}` | Sort direction by last activity (default `asc` — earliest first). |
-| `-m, --mode {auto,calculate,display}` | Cost source (drop-in for `ccusage session --mode`). `auto` (default) uses the recorded `costUSD` from JSONL when present, else computes from embedded pricing — this is the pre-Session-C behavior. `calculate` always computes from embedded pricing, ignoring any recorded `costUSD`. `display` shows the recorded `costUSD` only, rendering `$0.00` when a session has none (ccusage-faithful). Most modern Claude Code JSONL omits `costUSD`, so under `display` near-everything reports `$0`. |
+| `-m, --mode {auto,calculate,display}` | Cost source (drop-in for `ccusage session --mode`). `auto` (default) uses the recorded `costUSD` from JSONL when present, else computes from embedded pricing. `calculate` always computes from embedded pricing, ignoring any recorded `costUSD`. `display` shows the recorded `costUSD` only, rendering `$0.00` when a session has none (ccusage-faithful). Most modern Claude Code JSONL omits `costUSD`, so under `display` near-everything reports `$0`. |
 | `--tz TZ` | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). |
 | `--json` | Output JSON. |
+
+> **Behavior note (`auto`, sessions with legacy `costUSD`).** Before the
+> `--mode` work, `session` was the one report that always recomputed cost from
+> embedded pricing and ignored any recorded `costUSD` — even though `daily`,
+> `monthly`, `weekly`, and the dashboard already preferred the recorded value.
+> The default `auto` mode now aligns `session` (and the TUI session views, which
+> have no `--mode` flag) with those reports: for sessions whose JSONL carries
+> `costUSD`, default totals reflect the recorded cost rather than a recomputed
+> one. Only the ~3.9% of historical files that still carry `costUSD` are
+> affected; everything else is unchanged. Pass `--mode calculate` to force the
+> old always-recompute behavior.
 
 ## Examples
 

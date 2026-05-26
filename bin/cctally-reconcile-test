@@ -2780,9 +2780,12 @@ dedup_invariants
 #   display   = recorded-only ($0 when absent)
 #
 # MODE-A/B/C (per mode): Σ(daily.totalCost) == Σ(monthly.totalCost) ==
-#   Σ(weekly.totalCost) == range-cost.totalCostUSD over the same window,
-#   within 1e-9 USD. Catches any of the five recompute-from-entries
-#   commands silently NOT threading mode (they would disagree).
+#   Σ(weekly.totalCost) == Σ(session.totalCost) == range-cost.totalCostUSD
+#   over the same window, within 1e-9 USD. Catches any of the five
+#   recompute-from-entries commands silently NOT threading mode (they would
+#   disagree). The session leg is the critical one: `session` was the lone
+#   pre-Session-C aggregator that ignored recorded costUSD, so its auto-mode
+#   total used to UNDER/OVER-count vs daily on this mixed fixture.
 # MODE-KERNEL: auto Σ > display Σ (display drops the NULL-cost entries to
 #   $0) AND auto Σ != calculate Σ (recorded != computed on the WITH-cost
 #   entries). These are the kernel identities that prove the modes are
@@ -2820,6 +2823,22 @@ range_total = b["totalCostUSD"]
 assert abs(sum_daily - range_total) < 1e-9, \
     f"Σdaily.totalCost={sum_daily} range-cost.totalCostUSD={range_total}"
 '
+# daily Σ == session Σ (per mode). `_aggregate_claude_sessions` was the lone
+# pre-Session-C aggregator that ignored recorded costUSD (it passed no
+# cost_usd, so auto collapsed to calculate). This leg proves it now threads
+# mode like every sibling — i.e. on costUSD-bearing data `session` default
+# (auto) totals match `daily`, and `--mode calculate|display` track too. The
+# session/ goldens carry no costUSD, so ONLY this mixed-cost fixture exercises
+# the divergence (spec §4.1).
+INVARIANT_MODE_DAILY_EQ_SESSION_PY='
+import json, os
+a = json.loads(os.environ["RECONCILE_A"])
+b = json.loads(os.environ["RECONCILE_B"])
+sum_daily = sum(r["totalCost"] for r in a.get("daily", []))
+sum_session = sum(r["totalCost"] for r in b.get("sessions", []))
+assert abs(sum_daily - sum_session) < 1e-9, \
+    f"Σdaily.totalCost={sum_daily} Σsession.totalCost={sum_session}"
+'
 
 # The mixed-cost week spans 2026-04-20 → 2026-04-27; range-cost is given
 # the same window so it sums exactly the seeded entries.
@@ -2839,6 +2858,10 @@ for mode in auto calculate display; do
         "daily --json --mode $mode" \
         "range-cost -s $MODE_RANGE_START -e $MODE_RANGE_END --mode $mode --json" \
         "$INVARIANT_MODE_DAILY_EQ_RANGE_COST_PY"
+    reconcile_invariant "mode_${mode}_daily_eq_session" "$MODE_FX" \
+        "daily --json --mode $mode" \
+        "session --json --mode $mode" \
+        "$INVARIANT_MODE_DAILY_EQ_SESSION_PY"
 done
 
 # Kernel identity: auto Σ > display Σ (NULL-cost entries drop to $0).
