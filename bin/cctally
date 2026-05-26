@@ -4238,7 +4238,7 @@ def cmd_blocks(args: argparse.Namespace) -> int:
         range_start=range_start,
         range_end=range_end,
         display_tz=tz,
-        mode="auto",
+        mode=args.mode,
         skip_rows=True,
     )
     blocks = list(view.aggregated)
@@ -4263,7 +4263,7 @@ def cmd_blocks(args: argparse.Namespace) -> int:
     # additional entries. Without re-aggregation the displayed window
     # said one thing and the cost said another (live data: window
     # 20:50→01:50 with $45 cost vs the real $128).
-    _maybe_swap_active_block_to_canonical(blocks, all_entries, now=now_utc)
+    _maybe_swap_active_block_to_canonical(blocks, all_entries, now=now_utc, mode=args.mode)
 
     if args.json:
         print(_blocks_to_json(blocks))
@@ -4284,6 +4284,7 @@ def _maybe_swap_active_block_to_canonical(
     all_entries: list[Any],
     *,
     now: dt.datetime,
+    mode: str = "auto",
 ) -> None:
     """In-place swap of an ACTIVE heuristic block to its API-anchored
     canonical window — timestamps AND token/cost totals.
@@ -4359,10 +4360,11 @@ def _maybe_swap_active_block_to_canonical(
     if block_end_utc <= now.astimezone(dt.timezone.utc):
         return
     # Re-aggregate entries over the canonical interval. Build a fresh
-    # Block via ``_build_activity_block`` (mode="auto" matches
-    # ``_group_entries_into_blocks``'s default) so every total stays in
-    # one code path — no field-by-field assignment that could drift if
-    # the dataclass grows new fields.
+    # Block via ``_build_activity_block`` (threading the caller's ``mode``
+    # so the active block's cost honors --mode just like the main grouping
+    # — Session C / Codex F1) so every total stays in one code path — no
+    # field-by-field assignment that could drift if the dataclass grows
+    # new fields.
     canonical_entries = [
         e for e in all_entries
         if block_start_utc <= e.timestamp < block_end_utc
@@ -4372,7 +4374,7 @@ def _maybe_swap_active_block_to_canonical(
         block_start_utc,
         block_end_utc,
         now.astimezone(dt.timezone.utc),
-        "auto",
+        mode,
         anchor="recorded",
     )
     blocks[active_idx] = rebuilt

@@ -2663,6 +2663,75 @@ def test_blocks_active_swap_recomputes_totals_over_canonical_interval(
     assert active.entries_count == 2
 
 
+def test_blocks_active_swap_threads_mode(ns, monkeypatch):
+    """Session C (Codex F1): the active canonical-swap must honor --mode.
+    The swap rebuilds the active block via _build_activity_block; pre-fix it
+    hardcoded "auto", so calculate/display were ignored on the active block."""
+    canonical_block_start = "2026-05-15T17:50:00+00:00"
+    canonical_resets_at = "2026-05-15T22:50:00+00:00"
+    canonical_key = int(dt.datetime.fromisoformat(canonical_resets_at).timestamp())
+    now_utc = dt.datetime(2026, 5, 15, 21, 30, 0, tzinfo=dt.timezone.utc)
+    monkeypatch.setenv("CCTALLY_AS_OF", now_utc.isoformat(timespec="seconds"))
+
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+            " week_end_at, weekly_percent, source, payload_json, "
+            " five_hour_percent, five_hour_resets_at, five_hour_window_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (now_utc.isoformat(timespec="seconds"), "2026-05-09", "2026-05-16",
+             "2026-05-09T17:00:00+00:00", "2026-05-16T17:00:00+00:00", 5.0,
+             "test", "{}", 25.0, canonical_resets_at, canonical_key),
+        )
+        conn.execute(
+            "INSERT INTO five_hour_blocks "
+            "(five_hour_window_key, five_hour_resets_at, block_start_at, "
+            " first_observed_at_utc, last_observed_at_utc, "
+            " final_five_hour_percent, is_closed, created_at_utc, "
+            " last_updated_at_utc) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            (canonical_key, canonical_resets_at, canonical_block_start,
+             canonical_block_start, canonical_block_start, 25.0,
+             canonical_block_start, canonical_block_start),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    UsageEntry = ns["UsageEntry"]
+    usage = {"input_tokens": 2000, "output_tokens": 1000,
+             "cache_creation_input_tokens": 400, "cache_read_input_tokens": 100}
+    # One entry WITH a recorded costUSD that != its computed cost, one WITHOUT.
+    recorded = UsageEntry(
+        timestamp=dt.datetime(2026, 5, 15, 18, 0, 0, tzinfo=dt.timezone.utc),
+        model="claude-opus-4-7", usage=usage, cost_usd=42.0,
+        source_path="/tmp/synth.jsonl")
+    unrecorded = UsageEntry(
+        timestamp=dt.datetime(2026, 5, 15, 20, 30, 0, tzinfo=dt.timezone.utc),
+        model="claude-opus-4-7", usage=usage, cost_usd=None,
+        source_path="/tmp/synth.jsonl")
+    all_entries = [recorded, unrecorded]
+
+    Block = ns["Block"]            # noqa: F841 (kept for parity with sibling test)
+    _build = ns["_build_activity_block"]
+    heuristic_start = dt.datetime(2026, 5, 15, 20, 0, 0, tzinfo=dt.timezone.utc)
+    heuristic_end = heuristic_start + dt.timedelta(hours=5)
+    swap = ns["_maybe_swap_active_block_to_canonical"]
+
+    def swapped_cost(mode):
+        hb = _build([unrecorded], heuristic_start, heuristic_end, now_utc,
+                    "auto", anchor="heuristic")
+        blocks = [hb]
+        swap(blocks, all_entries, now=now_utc, mode=mode)
+        return blocks[0].cost_usd
+
+    disp = swapped_cost("display")      # recorded 42.0 + 0 for the unrecorded
+    calc = swapped_cost("calculate")    # both computed from pricing, ignore 42.0
+    assert abs(disp - 42.0) < 1e-9, disp
+    assert abs(calc - disp) > 1e-9, (calc, disp)
+
+
 # ── Round-5 Bug G: dashboard trend pre-credit row ────────────────────
 
 
