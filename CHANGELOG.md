@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-05-27
+
 ### Added
 - **Project-axis flags on `cctally daily` (and `cctally claude daily`): `-i/--instances`, `-p/--project`, and `--project-aliases`** — a drop-in for `ccusage daily`. `-i/--instances` groups the daily report by project (git-root), rendering a `Project: <label>` section per project with one global Total (`--json` becomes `{projects: {...}, totals}`); `-p/--project PATTERN` filters to matching projects by case-insensitive substring of the project label or path, and is repeatable with OR semantics; `--project-aliases key=Label,...` overrides project display labels (table headers only — never the JSON keys). Two distinct git-roots that share a basename stay separate (`app (work)` / `app (personal)`), null-project entries collect under `(unknown)`, and under `--format` shareable output `-i` is a no-op while `-p` is honored (the filter survives into the artifact). (#86)
 
