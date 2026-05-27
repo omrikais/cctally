@@ -5023,25 +5023,32 @@ def cmd_weekly(args: argparse.Namespace) -> int:
 
 
 def _detect_codex_fast_service_tier() -> bool:
-    """True iff ``~/.codex/config.toml`` requests the fast/priority tier.
+    """True iff any $CODEX_HOME root's config.toml requests fast/priority tier.
 
-    Reads from ``~/.codex`` only (single root; ``$CODEX_HOME`` multi-root is
-    deferred — see #108). Tolerates an absent/unreadable config (→ False →
-    standard tier).
+    Reads <root>/config.toml for EVERY entry in _codex_home_roots() (comma-
+    separated $CODEX_HOME, else ~/.codex) — including direct-JSONL entries,
+    which usually have no config.toml (read → absent → skipped) but DO count
+    if one is present. Returns on the first root that requests it (any-root
+    semantics, matching upstream ccusage). Tolerates absent/unreadable config
+    (→ that root contributes nothing).
     """
-    cfg = pathlib.Path.home() / ".codex" / "config.toml"
-    try:
-        content = cfg.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    return _codex_config_requests_fast_service_tier(content)
+    for root in _codex_home_roots():
+        cfg = root / "config.toml"
+        try:
+            content = cfg.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _codex_config_requests_fast_service_tier(content):
+            return True
+    return False
 
 
 def _resolve_codex_speed(requested: str) -> str:
     """Resolve a ``--speed`` value to an effective tier.
 
-    ``auto`` → ``fast`` iff ``~/.codex/config.toml`` requests it, else
-    ``standard``. ``fast``/``standard`` pass through unchanged.
+    ``auto`` → ``fast`` iff any ``$CODEX_HOME`` root's ``config.toml``
+    requests it, else ``standard``. ``fast``/``standard`` pass through
+    unchanged.
     """
     if requested == "auto":
         return "fast" if _detect_codex_fast_service_tier() else "standard"

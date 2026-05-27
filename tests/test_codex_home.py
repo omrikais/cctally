@@ -101,3 +101,38 @@ def test_session_roots_mixed_ordered_and_deduped(cc, tmp_path, monkeypatch):
         tmp_path / "h" / "sessions",
         tmp_path / "logs",
     ]
+
+
+# ── _detect_codex_fast_service_tier() any-root ────────────────────────────
+def _write_cfg(root: Path, tier: str | None) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    if tier is not None:
+        (root / "config.toml").write_text(f'service_tier = "{tier}"\n')
+
+
+def test_detect_fast_any_root_true(cc, tmp_path, monkeypatch):
+    _write_cfg(tmp_path / "a", "standard")
+    _write_cfg(tmp_path / "b", "fast")
+    monkeypatch.setenv("CODEX_HOME", f"{tmp_path}/a,{tmp_path}/b")
+    assert cc._detect_codex_fast_service_tier() is True
+
+
+def test_detect_fast_all_clean_false(cc, tmp_path, monkeypatch):
+    _write_cfg(tmp_path / "a", "standard")
+    _write_cfg(tmp_path / "b", None)  # no config.toml at all
+    monkeypatch.setenv("CODEX_HOME", f"{tmp_path}/a,{tmp_path}/b")
+    assert cc._detect_codex_fast_service_tier() is False
+
+
+def test_detect_fast_priority_in_direct_dir(cc, tmp_path, monkeypatch):
+    # A direct-JSONL entry (no sessions/) that nonetheless carries a fast
+    # config.toml MUST count — config is read from every entry.
+    _write_cfg(tmp_path / "logs", "priority")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "logs"))
+    assert cc._detect_codex_fast_service_tier() is True
+
+
+def test_detect_fast_missing_root_skipped(cc, tmp_path, monkeypatch):
+    _write_cfg(tmp_path / "b", "fast")
+    monkeypatch.setenv("CODEX_HOME", f"{tmp_path}/missing,{tmp_path}/b")
+    assert cc._detect_codex_fast_service_tier() is True

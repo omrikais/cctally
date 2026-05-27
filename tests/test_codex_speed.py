@@ -92,6 +92,7 @@ def test_kernel_default_is_standard(cc):
 
 # ── resolver auto-detection (HOME-scoped) ─────────────────────────────────
 def test_resolve_auto_fast_with_config(cc, tmp_path, monkeypatch):
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     (tmp_path / ".codex").mkdir()
     (tmp_path / ".codex" / "config.toml").write_text('service_tier = "fast"\n')
     monkeypatch.setattr(cc.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
@@ -99,12 +100,14 @@ def test_resolve_auto_fast_with_config(cc, tmp_path, monkeypatch):
 
 
 def test_resolve_auto_standard_without_config(cc, tmp_path, monkeypatch):
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setattr(cc.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     assert cc._resolve_codex_speed("auto") == "standard"
 
 
 @pytest.mark.parametrize("requested", ["fast", "standard"])
 def test_resolve_passthrough(cc, requested, tmp_path, monkeypatch):
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setattr(cc.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     assert cc._resolve_codex_speed(requested) == requested
 
