@@ -136,3 +136,71 @@ def test_detect_fast_missing_root_skipped(cc, tmp_path, monkeypatch):
     _write_cfg(tmp_path / "b", "fast")
     monkeypatch.setenv("CODEX_HOME", f"{tmp_path}/missing,{tmp_path}/b")
     assert cc._detect_codex_fast_service_tier() is True
+
+
+# ── multi-root ingestion (real JSONL walked by sync_codex_cache) ──────────
+def _iso_ms(y, mo, d, h, mi, s):
+    return f"{y:04d}-{mo:02d}-{d:02d}T{h:02d}:{mi:02d}:{s:02d}.000Z"
+
+
+def _write_rollout(jsonl_path: Path, session_id: str, model: str,
+                   inp: int, cached: int, out: int) -> None:
+    """Write a minimal real Codex rollout JSONL (schema the ingest iterator
+    expects: session_meta → turn_context → one yielded token_count event)."""
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    records = [
+        {"timestamp": _iso_ms(2026, 4, 17, 10, 0, 0), "type": "session_meta",
+         "payload": {"id": session_id}},
+        {"timestamp": _iso_ms(2026, 4, 17, 10, 0, 1), "type": "turn_context",
+         "payload": {"model": model}},
+        {"timestamp": _iso_ms(2026, 4, 17, 10, 1, 0), "type": "event_msg",
+         "payload": {"type": "token_count", "info": {
+             "last_token_usage": {
+                 "input_tokens": inp, "cached_input_tokens": cached,
+                 "output_tokens": out, "reasoning_output_tokens": 0,
+                 "total_tokens": inp + out},
+             "total_token_usage": {"total_tokens": inp + out}}}},
+    ]
+    with open(jsonl_path, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(_json.dumps(rec, separators=(",", ":")) + "\n")
+
+
+def _run_codex(args, *, home, data_dir, codex_home):
+    env = dict(os.environ)
+    env.pop("CODEX_HOME", None)
+    env.update({
+        "HOME": str(home), "TZ": "Etc/UTC", "NO_COLOR": "1",
+        "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+        "CCTALLY_DATA_DIR": str(data_dir),
+        "CCTALLY_AS_OF": "2026-04-20T00:00:00Z",
+    })
+    if codex_home is not None:
+        env["CODEX_HOME"] = codex_home
+    return subprocess.run([sys.executable, str(CCTALLY), *args],
+                          capture_output=True, text=True, env=env, check=True).stdout
+
+
+def test_multiroot_ingestion_union_totals(cc, tmp_path):
+    home = tmp_path / "home"; home.mkdir()
+    data = tmp_path / "data"
+    a = tmp_path / "rootA"; b = tmp_path / "rootB"
+    _write_rollout(a / ".codex" / "sessions" / "2026" / "04" / "17" / "rollout-aaaa.jsonl",
+                   "aaaa", "gpt-5", 1000, 0, 500)
+    _write_rollout(b / ".codex" / "sessions" / "2026" / "04" / "17" / "rollout-bbbb.jsonl",
+                   "bbbb", "gpt-5", 2000, 0, 700)
+
+    def total(codex_home):
+        # fresh cache per run
+        import shutil
+        if data.exists():
+            shutil.rmtree(data)
+        out = _run_codex(["codex-daily", "--json"], home=home, data_dir=data,
+                         codex_home=codex_home)
+        return _json.loads(out)["totals"]["costUSD"]
+
+    only_a = total(str(a / ".codex"))
+    only_b = total(str(b / ".codex"))
+    both = total(f"{a / '.codex'},{b / '.codex'}")
+    assert only_a > 0 and only_b > 0
+    assert both == pytest.approx(only_a + only_b)

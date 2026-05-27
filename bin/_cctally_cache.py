@@ -276,23 +276,35 @@ def _get_codex_sessions_dir() -> pathlib.Path | None:
 def _discover_codex_session_files(
     range_start: dt.datetime,
 ) -> list[pathlib.Path]:
-    """Glob ~/.codex/sessions/**/*.jsonl, filtering by mtime >= range_start."""
-    root = _get_codex_sessions_dir()
-    if root is None:
-        eprint("[codex] no ~/.codex/sessions directory found")
+    """Glob each $CODEX_HOME session root's **/*.jsonl, mtime >= range_start.
+
+    Iterates _cctally()._codex_session_roots() (multi-root). The "none found"
+    notice fires ONLY when there are zero session-root directories at all (the
+    multi-root analogue of the old single-dir-missing check) — NOT when roots
+    exist but the mtime filter leaves the set empty (that stays silent, as
+    today, so narrow-range queries gain no new stderr).
+    """
+    roots = _cctally()._codex_session_roots()
+    if not roots:
+        eprint("[codex] no Codex session directory found")
         return []
     start_ts = range_start.timestamp()
+    seen: set[pathlib.Path] = set()
     result: list[pathlib.Path] = []
-    for jp in root.glob("**/*.jsonl"):
-        if not jp.is_file():
-            continue
-        try:
-            mtime = jp.stat().st_mtime
-        except OSError:
-            continue
-        if mtime < start_ts:
-            continue
-        result.append(jp)
+    for root in roots:
+        for jp in root.glob("**/*.jsonl"):
+            if jp in seen:
+                continue
+            seen.add(jp)
+            if not jp.is_file():
+                continue
+            try:
+                mtime = jp.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < start_ts:
+                continue
+            result.append(jp)
     return result
 
 
@@ -1243,12 +1255,15 @@ def sync_codex_cache(
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Codex cached entries")
 
-        root = _get_codex_sessions_dir()
+        roots = _cctally()._codex_session_roots()
         paths: list[pathlib.Path] = []
-        if root is not None:
+        seen: set[pathlib.Path] = set()
+        for root in roots:
             for jp in root.glob("**/*.jsonl"):
-                if jp.is_file():
-                    paths.append(jp)
+                if jp in seen or not jp.is_file():
+                    continue
+                seen.add(jp)
+                paths.append(jp)
         stats.files_total = len(paths)
 
         # This SELECT does NOT open an implicit transaction (Python's
