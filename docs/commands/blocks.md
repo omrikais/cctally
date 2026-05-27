@@ -111,7 +111,7 @@ Token Limit Status:
 - **Heuristic active block.** If no Anthropic 5h reset was recorded for the
   live window, the block start is approximate: the `Block Started` line is
   `~`-prefixed and a legend
-  (`~ = approximate start (no Anthropic 5h reset recorded for this window)`)
+  (`~ = approximate start (no recorded Anthropic reset for this window)`)
   is appended below `Time Remaining` — the box equivalent of the table's `~`
   prefix + footer legend.
 
