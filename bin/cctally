@@ -875,6 +875,58 @@ LEGACY_STATUSLINE_NEEDLE = "cctally record-usage"
 
 CODEX_SESSIONS_DIR = pathlib.Path.home() / ".codex" / "sessions"
 
+
+def _codex_home_roots() -> list[pathlib.Path]:
+    """ALL raw $CODEX_HOME entries (comma-split), else [~/.codex].
+
+    These are the entries upstream calls "CODEX_HOME roots" — the full
+    comma-split list, BEFORE the sessions/-subdir rule decides home-vs-direct.
+    The config reader (_detect_codex_fast_service_tier) reads <entry>/config.toml
+    for EVERY entry returned here, including ones that turn out to be direct
+    JSONL dirs; only _codex_session_roots() applies the sessions/-subdir
+    narrowing. Blank/whitespace entries are dropped; each is expanduser'd
+    (literal '~'; the shell already expands $VAR before we see the value).
+    Order is preserved (first-match-wins downstream).
+    """
+    raw = os.environ.get("CODEX_HOME", "").strip()
+    if not raw:
+        return [pathlib.Path.home() / ".codex"]
+    roots: list[pathlib.Path] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            roots.append(pathlib.Path(part).expanduser())
+    return roots or [pathlib.Path.home() / ".codex"]
+
+
+def _codex_session_roots() -> list[pathlib.Path]:
+    """Directories to walk for *.jsonl, applying the sessions/-subdir rule.
+
+    For each home root r (in $CODEX_HOME order):
+      (r / "sessions").is_dir()  -> r / "sessions"   (Codex home)
+      elif r.is_dir()            -> r                 (direct JSONL dir)
+      else                       -> skipped
+    Exact-duplicate roots are de-duped (first occurrence kept). File-level
+    de-dup for overlapping/prefix roots happens in the discovery walkers
+    (set of absolute paths); this function only collapses identical roots.
+    """
+    out: list[pathlib.Path] = []
+    seen: set[pathlib.Path] = set()
+    for r in _codex_home_roots():
+        sess = r / "sessions"
+        if sess.is_dir():
+            cand = sess
+        elif r.is_dir():
+            cand = r
+        else:
+            continue
+        if cand in seen:
+            continue
+        seen.add(cand)
+        out.append(cand)
+    return out
+
+
 # Note: `_cctally_db` reads its four path constants
 # (`LOG_DIR`/`MIGRATION_ERROR_LOG_PATH`/`DB_PATH`/`CACHE_DB_PATH`) via
 # `_cctally_core.X` at call time — the canonical sibling pattern after
