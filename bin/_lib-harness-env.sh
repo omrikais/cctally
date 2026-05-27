@@ -11,3 +11,8 @@
 #
 # Coverage is enforced by tests/test_harness_dev_autodetect_coverage.py.
 export CCTALLY_DISABLE_DEV_AUTODETECT=1
+
+# Issue #108: cctally now honors $CODEX_HOME. Neutralize a dev's exported
+# value so it can't leak into codex-* goldens (the codex harnesses pin HOME
+# to a fake tree whose .codex/sessions the fixtures populate).
+unset CODEX_HOME

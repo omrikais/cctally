@@ -133,6 +133,18 @@ the totals header). Models priced via the `gpt-5` fallback are tagged
 `(fallback→gpt-5)` in both "Models seen" and the per-sample `Model:`
 line.
 
+## Environment
+
+### `$CODEX_HOME`
+
+Codex commands read session JSONL and `config.toml` from `$CODEX_HOME` — a
+single directory or a **comma-separated** list (default `~/.codex`). Each
+entry with a `sessions/` subdirectory is treated as a Codex home (sessions
+under `<entry>/sessions`, config at `<entry>/config.toml`); an entry without
+`sessions/` is read directly as a JSONL directory. `--speed auto` resolves to
+fast pricing if **any** root's `config.toml` sets `service_tier = "fast"` or
+`"priority"`.
+
 ## See also
 
 - [`codex-monthly`](codex-monthly.md), [`codex-weekly`](codex-weekly.md), [`codex-session`](codex-session.md)

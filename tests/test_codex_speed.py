@@ -120,6 +120,7 @@ def test_resolve_passthrough(cc, requested, tmp_path, monkeypatch):
 # harness has no per-mode HOME-mutation hook, so this lives here.
 def _run_codex_daily(home, speed, as_of="2026-04-20T00:00:00Z"):
     env = dict(os.environ)
+    env.pop("CODEX_HOME", None)  # issue #108: don't inherit a dev's $CODEX_HOME
     env.update({
         "HOME": str(home),
         "TZ": "Etc/UTC",
