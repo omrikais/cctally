@@ -5,7 +5,7 @@
  ╰────────────────────────────────╯
 Block Started: ~2026-04-23, 11:00:00 a.m. (1h 00m ago)
 Time Remaining: 4h 00m
-~ = approximate start (no Anthropic 5h reset recorded for this window)
+~ = approximate start (no recorded Anthropic reset for this window)
 
 Current Usage:
   Input Tokens:     3,500

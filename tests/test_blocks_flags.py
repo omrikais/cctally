@@ -141,10 +141,6 @@ def test_recent_filter_drops_old_keeps_recent_and_active(tmp_path):
     env = {"HOME": str(home), "PATH": "/usr/bin:/bin",
            "CCTALLY_DISABLE_DEV_AUTODETECT": "1", "TZ": "Etc/UTC",
            "NO_COLOR": "1", "CCTALLY_AS_OF": env_vars["AS_OF"]}
-    # First (cold) invocation primes the cache / runs the codex migration;
-    # the second is the deterministic read.
-    subprocess.run([sys.executable, str(BIN), "blocks", "-r"],
-                   capture_output=True, text=True, env=env)
     r = subprocess.run([sys.executable, str(BIN), "blocks", "-r"],
                        capture_output=True, text=True, env=env)
     assert r.returncode == 0, r.stderr

@@ -301,8 +301,9 @@ def _render_active_block_box(
                  f"({_fmt_block_duration_hm(elapsed)} ago)")
     lines.append(f"Time Remaining: {_fmt_block_duration_hm(remaining)}")
     if approx:
+        # Keep this wording in sync with the table footer legend below.
         lines.append("~ = approximate start "
-                     "(no Anthropic 5h reset recorded for this window)")
+                     "(no recorded Anthropic reset for this window)")
 
     lines += ["", _b("Current Usage:"),
               f"  Input Tokens:     {_fmt_num(block.input_tokens)}",
