@@ -531,24 +531,30 @@ def _aggregate_codex_weekly(
 def _session_path_parts(source_path: str) -> tuple[str, str, str]:
     """Return (session_id_path, session_file, directory) from a full path.
 
-    session_id_path = relative path under CODEX_SESSIONS_DIR with .jsonl
-                      stripped (e.g. "2025/12/25/rollout-...").
+    session_id_path = relative path under the matched $CODEX_HOME session
+                      root with .jsonl stripped (e.g. "2025/12/25/rollout-...").
     session_file    = basename without .jsonl extension.
-    directory       = relative parent path under CODEX_SESSIONS_DIR.
+    directory       = relative parent path under the matched root.
 
-    Accepts three input shapes:
-      1. Absolute path under CODEX_SESSIONS_DIR (the runtime sync path).
-      2. Bare-relative path starting with ".codex/sessions/..." — the form
-         emitted by build-codex-fixtures.py so committed fixture cache.db
-         files stay free of maintainer absolute paths (public-mirror safe).
-      3. Anything else — falls back to basename-only.
+    Tries each root in _codex_session_roots() order (the same list/order the
+    discovery walkers use, so overlapping/prefix roots resolve to the FIRST
+    matching root deterministically); first relative_to() that succeeds wins.
+    Falls back to the bare-relative ".codex/sessions/<rest>" fixture form (the
+    shape emitted by build-codex-fixtures.py so committed fixture cache.db
+    files stay free of maintainer absolute paths), then basename. Direct-JSONL
+    roots yield an id relative to <entry> itself (no sessions/ prefix).
     """
-    CODEX_SESSIONS_DIR = _cctally().CODEX_SESSIONS_DIR
+    roots = _cctally()._codex_session_roots()
     p = pathlib.Path(source_path)
-    try:
-        rel = p.relative_to(CODEX_SESSIONS_DIR)
-    except ValueError:
-        # Try bare-relative ".codex/sessions/<rest>" before basename fallback.
+    rel: pathlib.PurePath | None = None
+    for root in roots:
+        try:
+            rel = p.relative_to(root)
+            break
+        except ValueError:
+            continue
+    if rel is None:
+        # Bare-relative ".codex/sessions/<rest>" (fixture form), else basename.
         # Use PurePosixPath to avoid Windows-style drive parsing on unusual
         # inputs; fixture-emitted paths are always POSIX.
         parts = pathlib.PurePosixPath(source_path).parts

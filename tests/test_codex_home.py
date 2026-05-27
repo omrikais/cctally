@@ -204,3 +204,53 @@ def test_multiroot_ingestion_union_totals(cc, tmp_path):
     both = total(f"{a / '.codex'},{b / '.codex'}")
     assert only_a > 0 and only_b > 0
     assert both == pytest.approx(only_a + only_b)
+
+
+# ── _session_path_parts() multi-root ──────────────────────────────────────
+def test_path_parts_under_second_root(cc, tmp_path, monkeypatch):
+    (tmp_path / "h" / "sessions").mkdir(parents=True)
+    (tmp_path / "logs").mkdir()
+    monkeypatch.setenv("CODEX_HOME", f"{tmp_path}/h,{tmp_path}/logs")
+    agg = cc._load_sibling("_lib_aggregators")
+    src = str(tmp_path / "logs" / "2026" / "04" / "x.jsonl")
+    id_path, fname, directory = agg._session_path_parts(src)
+    assert id_path == "2026/04/x"
+    assert fname == "x"
+    assert directory == "2026/04"
+
+
+def test_path_parts_home_sessions_relative(cc, tmp_path, monkeypatch):
+    (tmp_path / "h" / "sessions").mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "h"))
+    agg = cc._load_sibling("_lib_aggregators")
+    src = str(tmp_path / "h" / "sessions" / "2026" / "04" / "y.jsonl")
+    id_path, _, _ = agg._session_path_parts(src)
+    assert id_path == "2026/04/y"
+
+
+def test_path_parts_bare_relative_fixture_form_unchanged(cc, monkeypatch):
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    agg = cc._load_sibling("_lib_aggregators")
+    id_path, fname, directory = agg._session_path_parts(
+        ".codex/sessions/proj/rollout-z.jsonl")
+    assert id_path == "proj/rollout-z"
+    assert directory == "proj"
+
+
+def test_multiroot_session_ids_end_to_end(cc, tmp_path):
+    home = tmp_path / "home"; home.mkdir()
+    data = tmp_path / "data"
+    a = tmp_path / "rootA"; b = tmp_path / "rootB"
+    _write_rollout(a / ".codex" / "sessions" / "2026" / "04" / "17" / "rollout-aaaa.jsonl",
+                   "aaaa", "gpt-5", 1000, 0, 500)
+    # direct-JSONL root: no sessions/ subdir, jsonl sits directly under <entry>.
+    _write_rollout(b / "2026" / "04" / "17" / "rollout-bbbb.jsonl",
+                   "bbbb", "gpt-5", 2000, 0, 700)
+    out = _run_codex(["codex-session", "--json"], home=home, data_dir=data,
+                     codex_home=f"{a / '.codex'},{b}")
+    sessions = _json.loads(out)["sessions"]
+    ids = {s["sessionId"] for s in sessions}
+    # root A is a Codex home → id relative to <A>/.codex/sessions.
+    # root B is a direct-JSONL dir → id relative to <B> itself.
+    assert "2026/04/17/rollout-aaaa" in ids
+    assert "2026/04/17/rollout-bbbb" in ids
