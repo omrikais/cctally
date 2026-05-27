@@ -1,0 +1,130 @@
+{
+  "projects": {
+    "app (personal)": [
+      {
+        "date": "2026-05-20",
+        "inputTokens": 600000,
+        "outputTokens": 120000,
+        "cacheCreationTokens": 0,
+        "cacheReadTokens": 0,
+        "totalTokens": 720000,
+        "totalCost": 18.0,
+        "modelsUsed": [
+          "claude-opus-4-1"
+        ],
+        "modelBreakdowns": [
+          {
+            "modelName": "claude-opus-4-1",
+            "inputTokens": 600000,
+            "outputTokens": 120000,
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 0,
+            "cost": 18.0
+          }
+        ]
+      }
+    ],
+    "app (work)": [
+      {
+        "date": "2026-05-20",
+        "inputTokens": 400000,
+        "outputTokens": 80000,
+        "cacheCreationTokens": 0,
+        "cacheReadTokens": 0,
+        "totalTokens": 480000,
+        "totalCost": 3.0,
+        "modelsUsed": [
+          "claude-sonnet-4-5"
+        ],
+        "modelBreakdowns": [
+          {
+            "modelName": "claude-sonnet-4-5",
+            "inputTokens": 400000,
+            "outputTokens": 80000,
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 0,
+            "cost": 3.0
+          }
+        ]
+      },
+      {
+        "date": "2026-05-21",
+        "inputTokens": 300000,
+        "outputTokens": 60000,
+        "cacheCreationTokens": 0,
+        "cacheReadTokens": 0,
+        "totalTokens": 360000,
+        "totalCost": 2.1,
+        "modelsUsed": [
+          "claude-sonnet-4-5"
+        ],
+        "modelBreakdowns": [
+          {
+            "modelName": "claude-sonnet-4-5",
+            "inputTokens": 300000,
+            "outputTokens": 60000,
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 0,
+            "cost": 2.1
+          }
+        ]
+      }
+    ],
+    "(unknown)": [
+      {
+        "date": "2026-05-20",
+        "inputTokens": 100000,
+        "outputTokens": 20000,
+        "cacheCreationTokens": 0,
+        "cacheReadTokens": 0,
+        "totalTokens": 120000,
+        "totalCost": 0.6,
+        "modelsUsed": [
+          "claude-sonnet-4-5"
+        ],
+        "modelBreakdowns": [
+          {
+            "modelName": "claude-sonnet-4-5",
+            "inputTokens": 100000,
+            "outputTokens": 20000,
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 0,
+            "cost": 0.6
+          }
+        ]
+      }
+    ],
+    "lib": [
+      {
+        "date": "2026-05-20",
+        "inputTokens": 200000,
+        "outputTokens": 40000,
+        "cacheCreationTokens": 0,
+        "cacheReadTokens": 0,
+        "totalTokens": 240000,
+        "totalCost": 0.4,
+        "modelsUsed": [
+          "claude-haiku-4-5"
+        ],
+        "modelBreakdowns": [
+          {
+            "modelName": "claude-haiku-4-5",
+            "inputTokens": 200000,
+            "outputTokens": 40000,
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 0,
+            "cost": 0.4
+          }
+        ]
+      }
+    ]
+  },
+  "totals": {
+    "inputTokens": 1600000,
+    "outputTokens": 320000,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 0,
+    "totalCost": 24.1,
+    "totalTokens": 1920000
+  }
+}

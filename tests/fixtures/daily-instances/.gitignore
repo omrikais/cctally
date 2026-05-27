@@ -1,0 +1,14 @@
+# Only input.env + golden-*.txt are committed. Everything the builder
+# materializes at (re)build time — the seeded cache.db (+ WAL/SHM sidecars),
+# the fake HOME's .local data dir, and the real per-project .git roots used to
+# exercise the git-root walk in _resolve_project_key — is regenerated into a
+# scratch dir by bin/cctally-daily-instances-test / bin/cctally-reconcile-test
+# and must never land in the tree (would leak absolute paths + dirty on every
+# rebuild). Goldens show only project LABELS, so they stay location-stable.
+*.db
+*.db-wal
+*.db-shm
+*/.local/
+*/work/
+*/personal/
+*/repos/

@@ -43,6 +43,7 @@ FIXTURES="$SCRATCH_DIR"
 "$REPO_ROOT/bin/build-diff-fixtures.py"         --out "$SCRATCH_DIR/diff"         >/dev/null
 "$REPO_ROOT/bin/build-mode-fixtures.py"         --out "$SCRATCH_DIR/mode"         >/dev/null
 "$REPO_ROOT/bin/build-speed-fixtures.py"        --out "$SCRATCH_DIR/speed"        >/dev/null
+"$REPO_ROOT/bin/build-daily-instances-fixtures.py" --out "$SCRATCH_DIR/daily-instances" >/dev/null
 
 pass_count=0
 fail_count=0
@@ -132,6 +133,44 @@ for fx in weekly/multi-week-anchored weekly/current-week-partial; do
         "daily --json" \
         "$INVARIANT_1_PY"
 done
+
+# Invariant DI1: grouping by project conserves cost. Σ over projects Σ over
+# dates of projects[*][*].totalCost (daily --instances) == Σ daily[*].totalCost
+# (default, same fixture/window). Uses the daily-instances fixture, whose two
+# same-basename git-roots (app (work) / app (personal)) + a NULL-project
+# (unknown) bucket stress the disambiguation + (unknown)-collection paths.
+INVARIANT_DI1_PY='
+import json, os
+inst = json.loads(os.environ["RECONCILE_A"])
+base = json.loads(os.environ["RECONCILE_B"])
+inst_sum = sum(r["totalCost"] for rows in inst["projects"].values() for r in rows)
+base_sum = sum(r["totalCost"] for r in base.get("daily", []))
+assert abs(inst_sum - base_sum) < 1e-9, f"Σprojects.totalCost={inst_sum} Σdaily.totalCost={base_sum}"
+'
+reconcile_invariant "daily_instances_sum_eq_daily" \
+    "$FIXTURES/daily-instances/multi-project" \
+    "daily --instances --json --since 20260520 --until 20260521" \
+    "daily --json --since 20260520 --until 20260521" \
+    "$INVARIANT_DI1_PY"
+
+# Invariant DI2: {projects}.totals == default {daily}.totals per field (1e-9).
+# The grouped path's footer aggregate must match the ungrouped daily totals
+# field-for-field (input/output/cache/total tokens + totalCost).
+INVARIANT_DI2_PY='
+import json, os
+inst = json.loads(os.environ["RECONCILE_A"])["totals"]
+base = json.loads(os.environ["RECONCILE_B"])["totals"]
+diffs = []
+for k in base:
+    if abs(inst[k] - base[k]) >= 1e-9:
+        diffs.append(f"{k}: instances={inst[k]} daily={base[k]}")
+assert not diffs, "; ".join(diffs)
+'
+reconcile_invariant "daily_instances_totals_eq_daily" \
+    "$FIXTURES/daily-instances/multi-project" \
+    "daily --instances --json --since 20260520 --until 20260521" \
+    "daily --json --since 20260520 --until 20260521" \
+    "$INVARIANT_DI2_PY"
 
 # Invariant 2: Σ session.totalCost == Σ daily.totalCost for the full range.
 INVARIANT_2_PY='

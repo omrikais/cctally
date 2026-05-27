@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# Fixture-based validation harness for `cctally daily --instances` / `-p`
+# (issue #86 Session E / T1.11).
+#
+# Rebuilds the single `multi-project` fixture into a per-run scratch dir
+# (the builder materializes real .git roots + a seeded cache.db there), then
+# drives the project-axis flag matrix over that one dataset and diffs each
+# stdout against a committed golden via bin/_lib-golden-diff.sh (#106/#107 —
+# never inline `diff <(...)`).
+#
+# Parallelism: all scenarios are sequential. They share one rebuilt fixture
+# HOME and the per-scenario runtimes are sub-second; there is no benefit to
+# the xargs -P fan-out other harnesses use, and serial keeps the PASS/FAIL
+# log strictly ordered. bin/cctally-test-all runs THIS harness concurrently
+# with the others in its Phase-1 pool, so cross-harness parallelism is
+# already covered.
+#
+# Why a custom harness (not _lib-fixture-harness.sh's run_mode): each
+# scenario uses a DIFFERENT flag set, and two scenarios assert on a
+# generated share artifact (--format + -p / -i no-op) rather than a stdout
+# golden — neither fits run_mode's one-flag-set-per-fixture shape.
+#
+# Determinism: HOME points at the rebuilt scratch fixture; CCTALLY_AS_OF +
+# COLUMNS come from the fixture's input.env; TZ=Etc/UTC (never bare UTC).
+# _lib-harness-env.sh exports CCTALLY_DISABLE_DEV_AUTODETECT=1 so bin/cctally
+# resolves the prod data-dir layout (…/cctally) under the fake HOME, not the
+# dev layout (…/cctally-dev) — without it the seeded cache.db is invisible.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN="$REPO_ROOT/bin/cctally"
+FIXTURES_DIR="$REPO_ROOT/tests/fixtures/daily-instances"
+SCENARIO="multi-project"
+
+# Dev-instance isolation + robust golden compare.
+# shellcheck source=bin/_lib-harness-env.sh
+. "$REPO_ROOT/bin/_lib-harness-env.sh"
+# shellcheck source=bin/_lib-golden-diff.sh
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
+# Per-run scratch dir for the regenerated fixture (cache.db + real .git roots
+# + any test-process SQLite writes). Keeps the in-tree fixture byte-stable
+# across runs; the committed tree holds only input.env + golden-*.txt.
+SCRATCH_DIR=$(mktemp -d -t cctally-daily-instances-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+export GOLDEN_DIFF_TMPDIR="$SCRATCH_DIR"
+
+"$REPO_ROOT/bin/build-daily-instances-fixtures.py" --out "$SCRATCH_DIR" >/dev/null || {
+    echo "FAIL: build-daily-instances-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+FAKE_HOME="$SCRATCH_DIR/$SCENARIO"
+
+# Source AS_OF / COLUMNS_OVERRIDE from the committed fixture's input.env
+# (rebuilt copy carries the same values).
+AS_OF=""
+COLUMNS_OVERRIDE=""
+# shellcheck disable=SC1091
+. "$FIXTURES_DIR/$SCENARIO/input.env"
+if [ -z "${AS_OF:-}" ]; then
+    echo "FAIL: input.env missing AS_OF" >&2
+    exit 1
+fi
+
+pass_count=0
+fail_count=0
+
+# run_scenario NAME GOLDEN_SUFFIX FLAGS...
+#   Captures `cctally daily <FLAGS>` stdout (+stderr) under the fixture HOME
+#   and diffs it against tests/fixtures/daily-instances/<SCENARIO>/golden-<SUFFIX>.txt.
+run_scenario () {
+    local name="$1" golden_suffix="$2"; shift 2
+    local golden="$FIXTURES_DIR/$SCENARIO/golden-$golden_suffix.txt"
+    local actual
+    actual=$(HOME="$FAKE_HOME" NO_COLOR=1 TZ=Etc/UTC \
+             COLUMNS="${COLUMNS_OVERRIDE:-200}" CCTALLY_AS_OF="$AS_OF" \
+             "$BIN" daily "$@" 2>&1)
+
+    if [ -n "${HARNESS_REGEN:-}" ]; then
+        printf '%s\n' "$actual" > "$golden"
+        echo "REGEN $name"
+        pass_count=$((pass_count + 1))
+        return 0
+    fi
+    if [ ! -f "$golden" ]; then
+        echo "MISSING GOLDEN $name — actual output:"
+        printf '%s\n' "$actual" | sed 's/^/    /'
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    if ! _golden_diff_str "$name" "$golden" "$actual" 200; then
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    echo "PASS $name"
+    pass_count=$((pass_count + 1))
+    return 0
+}
+
+# ── Golden scenarios (over the one multi-project dataset) ──────────────────
+run_scenario "instances-table" "instances" \
+    --instances --since 20260520 --until 20260521
+run_scenario "instances-json" "instances-json" \
+    --instances --json --since 20260520 --until 20260521
+run_scenario "instances-breakdown" "instances-breakdown" \
+    --instances --breakdown --since 20260520 --until 20260521
+# Alias key matches the project's display_key (git-root basename), so `lib`
+# uniquely relabels the lib root's header to "Library"; the same-basename
+# `app` roots have display_key "app" (not their parent segment), so a
+# `work=...` key can NOT target the work root — `lib=Library` is the
+# location-independent single-root alias. The JSON-key-stays-unaliased
+# assertion runs separately below (alias-json-keys-stable).
+run_scenario "instances-aliases" "instances-aliases" \
+    --instances --project-aliases lib=Library --since 20260520 --until 20260521
+run_scenario "instances-order-desc" "instances-desc" \
+    --instances --order desc --since 20260520 --until 20260521
+run_scenario "project-filter-lib" "project-filter" \
+    -p lib --since 20260520 --until 20260521
+run_scenario "project-filter-app-json" "project-filter-app-json" \
+    -p app --json --since 20260520 --until 20260521
+
+# ── Alias is display-only: JSON keys never carry the alias ─────────────────
+# `--project-aliases lib=Library` must NOT change the {projects} JSON keys
+# (the lib group's key stays "lib"); aliases are a table-header concern only.
+alias_json_keys_stable () {
+    local name="alias-json-keys-stable"
+    local keys
+    keys=$(HOME="$FAKE_HOME" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+           "$BIN" daily --instances --json --project-aliases lib=Library \
+           --since 20260520 --until 20260521 2>/dev/null \
+           | python3 -c "import json,sys; print(','.join(json.load(sys.stdin)['projects'].keys()))")
+    local expected="app (personal),app (work),(unknown),lib"
+    if [ "$keys" = "$expected" ]; then
+        echo "PASS $name"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $name: JSON keys=$keys expected=$expected (alias leaked into keys?)"
+        fail_count=$((fail_count + 1))
+    fi
+}
+alias_json_keys_stable
+
+# ── --format + -p: the -p filter survives into the share artifact ──────────
+# `daily -p lib --format md` must produce an artifact whose headline total
+# equals the lib-only filtered total (NOT the all-projects total). We compare
+# the artifact's "**Sum:** $X" against `daily -p lib --json | .totals.totalCost`
+# — asserting on the total sidesteps share version/hash churn while proving
+# the filter reached the snapshot.
+format_p_filter_survives () {
+    local name="format-p-filter-survives"
+    local out_md="$SCRATCH_DIR/out-lib.md"
+    HOME="$FAKE_HOME" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" daily -p lib --format md --output "$out_md" \
+        --since 20260520 --until 20260521 >/dev/null 2>&1
+    if [ ! -f "$out_md" ]; then
+        echo "FAIL $name: artifact not written"
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    # Filtered total from the JSON path (authoritative).
+    local lib_total
+    lib_total=$(HOME="$FAKE_HOME" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" daily -p lib --json --since 20260520 --until 20260521 2>/dev/null \
+        | python3 -c "import json,sys; print(f\"{json.load(sys.stdin)['totals']['totalCost']:.2f}\")")
+    # Headline "**Sum:** $X" from the markdown artifact.
+    local art_sum
+    art_sum=$(python3 - "$out_md" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"\*\*Sum:\*\*\s*\$([0-9]+\.[0-9]{2})", text)
+print(m.group(1) if m else "MISSING")
+PY
+)
+    if [ "$art_sum" = "$lib_total" ] && [ "$lib_total" != "0.00" ]; then
+        echo "PASS $name (artifact sum=\$$art_sum == lib-only total=\$$lib_total)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $name: artifact sum=\$$art_sum vs lib-only total=\$$lib_total"
+        fail_count=$((fail_count + 1))
+    fi
+}
+format_p_filter_survives
+
+# ── -i under --format is a NO-OP (byte-equal to the plain --format) ────────
+format_i_noop () {
+    local name="format-i-noop"
+    local i_md="$SCRATCH_DIR/i.md" plain_md="$SCRATCH_DIR/plain.md"
+    HOME="$FAKE_HOME" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" daily -i --format md --output "$i_md" \
+        --since 20260520 --until 20260521 >/dev/null 2>&1
+    HOME="$FAKE_HOME" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" daily --format md --output "$plain_md" \
+        --since 20260520 --until 20260521 >/dev/null 2>&1
+    if [ ! -f "$i_md" ] || [ ! -f "$plain_md" ]; then
+        echo "FAIL $name: one or both artifacts missing"
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    if _golden_diff_files "$name" "$plain_md" "$i_md" 80; then
+        echo "PASS $name (-i --format byte-equal to plain --format)"
+        pass_count=$((pass_count + 1))
+    else
+        # _golden_diff_files already printed the FAIL + diff.
+        fail_count=$((fail_count + 1))
+    fi
+}
+format_i_noop
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]
