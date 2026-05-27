@@ -71,6 +71,14 @@ the tier.
 - Each row corresponds to one Codex session file at
   `~/.codex/sessions/...`. Codex doesn't have a Claude-style
   `--resume`-across-files concept, so no merging happens here.
+- **Cross-root collisions** (multi-root `$CODEX_HOME`): two distinct session
+  files sharing the same relative path under different roots stay separate
+  rows (counts are never merged). Since `sessionId` is the upstream-compatible
+  relative path, both rows would otherwise carry the same label — so cctally
+  disambiguates *only* the colliding rows: `--json` adds a `codexRoot` field
+  (the matched root) alongside the unchanged `sessionId`, and the table appends
+  a short root segment to the Session column (e.g. `…1a2b… (rootA)`).
+  Single-root output is unchanged.
 - Same dedup, token-semantics, and unknown-model behavior as
   [`codex-daily`](codex-daily.md#notes--diverges-from-upstream-ccusage-codex-on-duplicate-events).
 - `--debug` emits the same "Codex Pricing Debug Report" shape — see

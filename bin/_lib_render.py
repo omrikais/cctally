@@ -979,6 +979,57 @@ def _codex_bucket_to_json(
     return json.dumps({list_key: bucket_list, "totals": totals}, indent=2)
 
 
+def _codex_root_short_labels(roots: list[str]) -> list[str]:
+    """Given >=2 distinct root paths, return a short distinguishing label per
+    root: the first path segment after their longest common ancestor — e.g.
+    {".../rootA/.codex", ".../rootB/.codex"} -> ["rootA", "rootB"]. If a single
+    segment isn't unique, fall back to the full post-ancestor tail, then to the
+    whole path, so the returned labels are always pairwise distinct.
+
+    Order-preserving: labels[i] corresponds to roots[i].
+    """
+    parts = [pathlib.PurePosixPath(r).parts for r in roots]
+    common = 0
+    for seg in zip(*parts):
+        if len(set(seg)) == 1:
+            common += 1
+        else:
+            break
+    singles = [pr[common] if common < len(pr) else (pr[-1] if pr else "")
+               for pr in parts]
+    if len(set(singles)) == len(singles):
+        return singles
+    tails = ["/".join(pr[common:]) or (pr[-1] if pr else "") for pr in parts]
+    if len(set(tails)) == len(tails):
+        return tails
+    return list(roots)
+
+
+def _codex_session_disambiguate(sessions: list[CodexSessionUsage]) -> dict[int, str]:
+    """Return ``{row_index: " (label)"}`` for codex-session rows whose
+    ``session_id_path`` collides with another row's — a genuine
+    cross-$CODEX_HOME-root collision (issue #110). Non-colliding rows are absent
+    from the dict; callers render them byte-identically (single-root data never
+    collides, so this returns ``{}`` and output is unchanged).
+
+    ``label`` is a short distinguishing segment of the matched $CODEX_HOME root
+    (see ``_codex_root_short_labels``). Mirrors ``_project_disambiguate_labels``.
+    """
+    path_counts: dict[str, int] = {}
+    for s in sessions:
+        path_counts[s.session_id_path] = path_counts.get(s.session_id_path, 0) + 1
+    groups: dict[str, list[int]] = {}
+    for idx, s in enumerate(sessions):
+        if path_counts[s.session_id_path] > 1:
+            groups.setdefault(s.session_id_path, []).append(idx)
+    out: dict[int, str] = {}
+    for idxs in groups.values():
+        labels = _codex_root_short_labels([sessions[i].codex_root for i in idxs])
+        for i, label in zip(idxs, labels):
+            out[i] = f" ({label})"
+    return out
+
+
 def _codex_sessions_to_json(sessions: list[CodexSessionUsage]) -> str:
     """Serialize Codex session aggregates to JSON matching upstream exactly.
 
@@ -990,9 +1041,13 @@ def _codex_sessions_to_json(sessions: list[CodexSessionUsage]) -> str:
     session_list: list[dict[str, Any]] = []
     tot_input = tot_cached = tot_output = tot_reasoning = tot_tokens = 0
     tot_cost = 0.0
-    for s in sessions:
+    # Issue #110: only when two cross-root sessions share `sessionId` (the
+    # relative path) does this map a colliding row to a label; otherwise empty,
+    # so the per-session shape stays upstream-byte-identical (no `codexRoot`).
+    disambig = _codex_session_disambiguate(sessions)
+    for idx, s in enumerate(sessions):
         session_total = s.input_tokens + s.output_tokens
-        session_list.append({
+        entry = {
             "sessionId": s.session_id_path,
             "lastActivity": _codex_last_activity_iso(s.last_activity),
             "sessionFile": s.session_file,
@@ -1004,7 +1059,13 @@ def _codex_sessions_to_json(sessions: list[CodexSessionUsage]) -> str:
             "totalTokens": session_total,
             "costUSD": s.cost_usd,
             "models": _codex_models_dict(s.model_breakdowns),
-        })
+        }
+        if idx in disambig:
+            # Additive disambiguator — `sessionId` keeps its upstream-compatible
+            # relative-path value; consumers key off `codexRoot` to tell the
+            # (correctly separate) colliding rows apart.
+            entry["codexRoot"] = s.codex_root
+        session_list.append(entry)
         tot_input += s.input_tokens
         tot_cached += s.cached_input_tokens
         tot_output += s.output_tokens
@@ -2095,14 +2156,18 @@ def _render_codex_session_table(
     ROW_DATA, ROW_FOOTER = "data", "footer"
     raw_rows: list[tuple[list[tuple[str, Any]], str]] = []
 
-    for s in sessions:
+    # Issue #110: suffix the Session cell with the matched $CODEX_HOME root
+    # ONLY for cross-root collisions (two rows sharing session_id_path); empty
+    # for single-root data, so the table stays byte-identical.
+    disambig = _codex_session_disambiguate(sessions)
+    for idx, s in enumerate(sessions):
         models_text = "\n".join(f"- {m}" for m in s.models) if s.models else ""
         non_cached = max(0, s.input_tokens - s.cached_input_tokens)
         session_total = s.input_tokens + s.output_tokens
         data_cells = [
             (_date_cell(s.last_activity), None),
             (s.directory, None),
-            (_session_cell(s.session_id), None),
+            (_session_cell(s.session_id) + disambig.get(idx, ""), None),
             (models_text, None),
             (_fmt_num(non_cached), None),
             (_fmt_num(s.output_tokens), None),

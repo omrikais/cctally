@@ -201,7 +201,7 @@ def _write_rollout(jsonl_path: Path, session_id: str, model: str,
             fh.write(_json.dumps(rec, separators=(",", ":")) + "\n")
 
 
-def _run_codex(args, *, home, data_dir, codex_home, cwd=None):
+def _run_codex(args, *, home, data_dir, codex_home, cwd=None, columns=None):
     env = dict(os.environ)
     env.pop("CODEX_HOME", None)
     env.update({
@@ -212,6 +212,10 @@ def _run_codex(args, *, home, data_dir, codex_home, cwd=None):
     })
     if codex_home is not None:
         env["CODEX_HOME"] = codex_home
+    if columns is not None:
+        # Widen the table so the cross-root disambiguator suffix renders in
+        # full rather than ellipsizing under the no-TTY narrow fallback.
+        env["COLUMNS"] = str(columns)
     return subprocess.run([sys.executable, str(CCTALLY), *args],
                           capture_output=True, text=True, env=env,
                           cwd=cwd, check=True).stdout
@@ -384,16 +388,48 @@ def test_codex_session_no_merge_across_roots_same_relpath(cc, tmp_path):
     _write_rollout(a.joinpath(".codex", *rel), "aaaa", "gpt-5", 1000, 0, 500)
     _write_rollout(b.joinpath(".codex", *rel), "bbbb", "gpt-5", 2000, 0, 700)
 
+    codex_home = f"{a / '.codex'},{b / '.codex'}"
     out = _run_codex(["codex-session", "--json"], home=home, data_dir=data,
-                     codex_home=f"{a / '.codex'},{b / '.codex'}")
+                     codex_home=codex_home)
     payload = _json.loads(out)
     sessions = payload["sessions"]
-    # Two distinct sessions, NOT one merged row. (JSON `sessionId` is the
-    # upstream-compatible relative PATH, so both rows share the same label —
-    # the accepted display ambiguity; no-merge is proven by the row count +
-    # the two distinct per-session token totals, never summed into one.)
+    # Two distinct sessions, NOT one merged row.
     assert len(sessions) == 2, f"cross-root sessions collapsed: {sessions}"
     assert sorted(s["totalTokens"] for s in sessions) == [1500, 2700]
+    # `sessionId` keeps its upstream-compatible relative-PATH value (unchanged),
+    # so both rows still share it...
     assert {s["sessionId"] for s in sessions} == {"2026/04/17/rollout-same"}
+    # ...but issue #110 adds an additive `codexRoot` discriminator on the
+    # (only) colliding rows, present on BOTH and DISTINCT, mapping each row to
+    # its matched $CODEX_HOME root.
+    assert all("codexRoot" in s for s in sessions), sessions
+    roots = {s["codexRoot"] for s in sessions}
+    assert roots == {str(a / ".codex"), str(b / ".codex")}, roots
+    by_root = {s["codexRoot"]: s["totalTokens"] for s in sessions}
+    assert by_root[str(a / ".codex")] == 1500
+    assert by_root[str(b / ".codex")] == 2700
     # Both sessions are counted in the report totals (A + B), not just one.
     assert payload["totals"]["totalTokens"] == 1500 + 2700
+
+    # Table render (wide, so the suffix isn't ellipsized): the Session column
+    # carries a short root discriminator — distinct per row.
+    table = _run_codex(["codex-session"], home=home, data_dir=data,
+                       codex_home=codex_home, columns=300)
+    assert "(rootA)" in table, table
+    assert "(rootB)" in table, table
+
+
+def test_codex_root_short_labels_disambiguator():
+    """Unit-test the cross-root label helper (issue #110): first differing
+    segment after the longest common ancestor, with full-path fallback."""
+    _load_cctally_module()  # side effect: loads _lib_render into sys.modules
+    render = sys.modules["_lib_render"]
+    # Canonical ~/.codex layout under distinct parents → parent segment wins.
+    assert render._codex_root_short_labels(
+        ["/tmp/x/rootA/.codex", "/tmp/x/rootB/.codex"]) == ["rootA", "rootB"]
+    # Roots differing only at the leaf → leaf segment wins.
+    assert render._codex_root_short_labels(
+        ["/home/.codex", "/home/.codexbackup"]) == [".codex", ".codexbackup"]
+    # No common ancestor → first segments already distinct.
+    assert render._codex_root_short_labels(
+        ["/aaa/.codex", "/bbb/.codex"]) == ["aaa", "bbb"]

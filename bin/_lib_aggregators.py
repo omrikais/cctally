@@ -375,6 +375,14 @@ class CodexSessionUsage:
     models: list[str]
     model_breakdowns: list[dict[str, Any]]
     last_activity: dt.datetime
+    # Issue #110: the matched $CODEX_HOME root in home-root form
+    # (e.g. "<root>/.codex", or "<root>" for a direct-JSONL root). Used ONLY
+    # to disambiguate the displayed / JSON label when two cross-root sessions
+    # share the same relative `session_id_path`. "" for the bare-relative
+    # fixture form (which cannot collide cross-root). Single-root data leaves
+    # every row's `codex_root` constant, so the renderers' collision check
+    # never fires and output stays byte-identical.
+    codex_root: str = ""
 
 
 @dataclass
@@ -566,6 +574,22 @@ def _session_path_parts(source_path: str) -> tuple[str, str, str]:
     return str(stem), stem.name, str(stem.parent)
 
 
+def _codex_home_root_from_prefix(root_prefix: str) -> str:
+    """Normalize the aggregator's `root_prefix` to the matched $CODEX_HOME entry.
+
+    `root_prefix` is `source_path` with the relative `id_path` tail removed, so a
+    Codex-home match looks like "<root>/.codex/sessions/" and a direct-JSONL
+    match like "<root>/". Strip the trailing slash and any "/sessions" tail to
+    recover the home root the user configured — the unit the issue #110
+    disambiguator labels by. The bare-relative fixture prefix ".codex/sessions/"
+    normalizes to ".codex" (constant across fixtures, so it never collides).
+    """
+    s = root_prefix.rstrip("/")
+    if s.endswith("/sessions"):
+        s = s[: -len("/sessions")]
+    return s
+
+
 def _aggregate_codex_sessions(entries: list[CodexEntry], speed: str = "standard") -> list[CodexSessionUsage]:
     """Group by session file path (upstream-compatible).
 
@@ -597,6 +621,10 @@ def _aggregate_codex_sessions(entries: list[CodexEntry], speed: str = "standard"
             "session_id_path": id_path,
             "session_file": file_name,
             "directory": directory,
+            # Matched $CODEX_HOME root (home-root form) — issue #110 display
+            # disambiguator. Derived from the same root_prefix that keys the
+            # group, so it's constant per group.
+            "codex_root": _codex_home_root_from_prefix(root_prefix),
             "input": 0, "cached_input": 0, "output": 0, "reasoning": 0,
             "cost": 0.0, "models": {}, "models_order": [],
             "last": entry.timestamp,
@@ -661,6 +689,7 @@ def _aggregate_codex_sessions(entries: list[CodexEntry], speed: str = "standard"
             models=list(s["models_order"]),
             model_breakdowns=model_breakdowns,
             last_activity=s["last"],
+            codex_root=s["codex_root"],
         ))
     result.sort(key=lambda x: x.last_activity, reverse=True)
     return result
