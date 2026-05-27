@@ -94,6 +94,19 @@ def test_home_roots_all_invalid_tilde_no_fallback(cc, tmp_path, monkeypatch):
     assert cc._codex_home_roots() == []
 
 
+def test_home_roots_relative_made_absolute(cc, tmp_path, monkeypatch):
+    # P2 (issue #108): a relative $CODEX_HOME must canonicalize to absolute so
+    # real ingested source_paths are absolute — otherwise the cache-prune's
+    # isabs() fixture carve-out cannot distinguish a real relative-root row
+    # from a synthetic baked-fixture row, and a relative-root switch leaks
+    # stale totals. .absolute() resolves against cwd.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_HOME", "codexA")
+    roots = cc._codex_home_roots()
+    assert roots == [tmp_path / "codexA"]
+    assert roots[0].is_absolute()
+
+
 # ── _codex_session_roots() ────────────────────────────────────────────────
 def test_session_roots_home_with_sessions(cc, tmp_path, monkeypatch):
     (tmp_path / "h" / "sessions").mkdir(parents=True)
@@ -188,7 +201,7 @@ def _write_rollout(jsonl_path: Path, session_id: str, model: str,
             fh.write(_json.dumps(rec, separators=(",", ":")) + "\n")
 
 
-def _run_codex(args, *, home, data_dir, codex_home):
+def _run_codex(args, *, home, data_dir, codex_home, cwd=None):
     env = dict(os.environ)
     env.pop("CODEX_HOME", None)
     env.update({
@@ -200,7 +213,8 @@ def _run_codex(args, *, home, data_dir, codex_home):
     if codex_home is not None:
         env["CODEX_HOME"] = codex_home
     return subprocess.run([sys.executable, str(CCTALLY), *args],
-                          capture_output=True, text=True, env=env, check=True).stdout
+                          capture_output=True, text=True, env=env,
+                          cwd=cwd, check=True).stdout
 
 
 def test_multiroot_ingestion_union_totals(cc, tmp_path):
@@ -328,3 +342,58 @@ def test_codex_home_switch_purges_prior_root(cc, tmp_path):
                                data_dir=data, codex_home=str(b / ".codex")))
     assert switched == pytest.approx(only_b)
     assert switched != pytest.approx(only_a + only_b)
+
+
+def test_relative_codex_home_switch_purges_prior_root(cc, tmp_path):
+    # P2 (issue #108): the prior-root purge must also work for a RELATIVE
+    # $CODEX_HOME (e.g. `codexA`). _codex_home_roots canonicalizes to absolute
+    # so the row is stored absolute and the prune's isabs guard prunes it.
+    # Run with cwd=tmp_path so the relative roots resolve there.
+    home = tmp_path / "home"; home.mkdir()
+    data = tmp_path / "data"           # SHARED across both runs (no rmtree)
+    _write_rollout(tmp_path / "codexA" / ".codex" / "sessions" / "2026" / "04" / "17" / "rollout-aaaa.jsonl",
+                   "aaaa", "gpt-5", 1000, 0, 500)
+    _write_rollout(tmp_path / "codexB" / ".codex" / "sessions" / "2026" / "04" / "17" / "rollout-bbbb.jsonl",
+                   "bbbb", "gpt-5", 2000, 0, 700)
+
+    def cost(out):
+        return _json.loads(out)["totals"]["costUSD"]
+
+    only_b = cost(_run_codex(["codex-daily", "--json"], home=home,
+                             data_dir=tmp_path / "data_b_only",
+                             codex_home="codexB/.codex", cwd=tmp_path))
+    assert only_b > 0
+    only_a = cost(_run_codex(["codex-daily", "--json"], home=home,
+                             data_dir=data, codex_home="codexA/.codex", cwd=tmp_path))
+    assert only_a > 0
+    switched = cost(_run_codex(["codex-daily", "--json"], home=home,
+                               data_dir=data, codex_home="codexB/.codex", cwd=tmp_path))
+    assert switched == pytest.approx(only_b)
+    assert switched != pytest.approx(only_a + only_b)
+
+
+def test_codex_session_no_merge_across_roots_same_relpath(cc, tmp_path):
+    # P3 (issue #108): two DISTINCT files sharing a relative path under
+    # different $CODEX_HOME roots must NOT collapse into one codex-session row.
+    # _session_path_parts strips the matched root, so both yield id_path
+    # "2026/04/17/rollout-same"; the aggregator must disambiguate by root.
+    home = tmp_path / "home"; home.mkdir()
+    data = tmp_path / "data"
+    a = tmp_path / "rootA"; b = tmp_path / "rootB"
+    rel = ("sessions", "2026", "04", "17", "rollout-same.jsonl")
+    _write_rollout(a.joinpath(".codex", *rel), "aaaa", "gpt-5", 1000, 0, 500)
+    _write_rollout(b.joinpath(".codex", *rel), "bbbb", "gpt-5", 2000, 0, 700)
+
+    out = _run_codex(["codex-session", "--json"], home=home, data_dir=data,
+                     codex_home=f"{a / '.codex'},{b / '.codex'}")
+    payload = _json.loads(out)
+    sessions = payload["sessions"]
+    # Two distinct sessions, NOT one merged row. (JSON `sessionId` is the
+    # upstream-compatible relative PATH, so both rows share the same label —
+    # the accepted display ambiguity; no-merge is proven by the row count +
+    # the two distinct per-session token totals, never summed into one.)
+    assert len(sessions) == 2, f"cross-root sessions collapsed: {sessions}"
+    assert sorted(s["totalTokens"] for s in sessions) == [1500, 2700]
+    assert {s["sessionId"] for s in sessions} == {"2026/04/17/rollout-same"}
+    # Both sessions are counted in the report totals (A + B), not just one.
+    assert payload["totals"]["totalTokens"] == 1500 + 2700

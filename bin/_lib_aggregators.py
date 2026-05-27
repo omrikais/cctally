@@ -576,11 +576,25 @@ def _aggregate_codex_sessions(entries: list[CodexEntry], speed: str = "standard"
     Per-model breakdowns include `isFallback: bool` — true when the model is
     absent from CODEX_MODEL_PRICING.
     """
-    by_session: dict[str, dict[str, Any]] = {}
+    by_session: dict[tuple[str, str], dict[str, Any]] = {}
     for entry in entries:
         id_path, file_name, directory = _session_path_parts(entry.source_path)
-        sess = by_session.setdefault(id_path, {
+        # Disambiguate identical relative paths under DIFFERENT $CODEX_HOME
+        # roots (issue #108). _session_path_parts strips the matched root, so
+        # <rootA>/sessions/2026/04/17/rollout-x.jsonl and the same relative
+        # path under <rootB> both yield id_path "2026/04/17/rollout-x";
+        # grouping on id_path alone would silently merge two distinct sessions
+        # (summed tokens, one UUID). Key on (root_prefix, id_path), where
+        # root_prefix is source_path with the id_path tail removed. Single-root
+        # data — and the bare-relative fixture form — has a constant prefix, so
+        # the grouping, insertion order, and every golden stay byte-identical;
+        # only a genuine cross-root collision splits into separate rows.
+        suffix = id_path + ".jsonl"
+        sp = entry.source_path
+        root_prefix = sp[: -len(suffix)] if sp.endswith(suffix) else sp
+        sess = by_session.setdefault((root_prefix, id_path), {
             "session_id_uuid": entry.session_id,
+            "session_id_path": id_path,
             "session_file": file_name,
             "directory": directory,
             "input": 0, "cached_input": 0, "output": 0, "reasoning": 0,
@@ -612,7 +626,7 @@ def _aggregate_codex_sessions(entries: list[CodexEntry], speed: str = "standard"
             sess["last"] = entry.timestamp
 
     result: list[CodexSessionUsage] = []
-    for id_path, s in by_session.items():
+    for _group_key, s in by_session.items():
         model_breakdowns = [
             {
                 "modelName": model,
@@ -629,7 +643,7 @@ def _aggregate_codex_sessions(entries: list[CodexEntry], speed: str = "standard"
         model_breakdowns.sort(key=lambda m: m["cost"], reverse=True)
         result.append(CodexSessionUsage(
             session_id=s["session_id_uuid"],
-            session_id_path=id_path,
+            session_id_path=s["session_id_path"],
             session_file=s["session_file"],
             directory=s["directory"],
             input_tokens=s["input"],

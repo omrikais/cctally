@@ -884,7 +884,13 @@ def _codex_home_roots() -> list[pathlib.Path]:
     for EVERY entry returned here, including ones that turn out to be direct
     JSONL dirs; only _codex_session_roots() applies the sessions/-subdir
     narrowing. Blank/whitespace entries are dropped; each is expanduser'd
-    (literal '~'; the shell already expands $VAR before we see the value).
+    (literal '~'; the shell already expands $VAR before we see the value)
+    then made ABSOLUTE via .absolute() — a relative $CODEX_HOME (e.g.
+    `./codexA`) would otherwise glob and store relative source_paths, which
+    the cache-prune step cannot distinguish from synthetic relative-path
+    fixture rows (issue #108; see the prune guard in _cctally_cache.py).
+    Canonicalizing here makes every REAL ingested source_path absolute, so
+    the prune's `isabs` fixture carve-out is correct by construction.
     Order is preserved (first-match-wins downstream).
     """
     raw = os.environ.get("CODEX_HOME", "").strip()
@@ -901,8 +907,10 @@ def _codex_home_roots() -> list[pathlib.Path]:
             # expanduser() raises RuntimeError on a malformed `~user` entry
             # (e.g. `~nonexistentuser/x` — the user doesn't exist). Drop the
             # bad entry rather than aborting the whole command, so valid
-            # roots beside it survive.
-            roots.append(pathlib.Path(part).expanduser())
+            # roots beside it survive. .absolute() canonicalizes a relative
+            # entry (e.g. `./codexA`) against cwd so real ingested source_paths
+            # are always absolute (issue #108 — keeps the cache-prune correct).
+            roots.append(pathlib.Path(part).expanduser().absolute())
         except (RuntimeError, OSError, ValueError):
             continue
     # Fall back to the default home ONLY when the variable is unset or carries

@@ -1294,11 +1294,14 @@ def sync_codex_cache(
         # flock serializes them and that is a pathological configuration.
         if not rebuild:  # --rebuild already cleared both tables above
             current_paths = {str(p) for p in paths}
-            # Only prune ABSOLUTE source_paths. A real ingested row always
-            # stores str(jp) from globbing an absolute root, so a relative
-            # path is — by construction — a synthetic baked-cache fixture row
-            # (e.g. build-speed-fixtures.py) with no on-disk JSONL to scope
-            # against; pruning it would wipe a cache meant to be read as-is.
+            # Only prune ABSOLUTE source_paths. _codex_home_roots() makes
+            # every real root absolute (via .absolute()), so a real ingested
+            # row always stores an absolute str(jp) — INCLUDING a relative
+            # $CODEX_HOME like `./codexA`, which is canonicalized before the
+            # glob. A relative path here is therefore — by construction — a
+            # synthetic baked-cache fixture row (e.g. build-speed-fixtures.py)
+            # with no on-disk JSONL to scope against; pruning it would wipe a
+            # cache meant to be read as-is (issue #108).
             orphan_paths = [
                 row[0]
                 for row in conn.execute("SELECT path FROM codex_session_files")
