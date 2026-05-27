@@ -232,6 +232,41 @@ def _aggregate_monthly(
     )
 
 
+def _aggregate_daily_by_project(
+    keyed_entries: list[tuple[Any, UsageEntry]],
+    *,
+    tz: "Any | None" = None,
+    mode: str = "auto",
+) -> list[tuple[Any, list[BucketUsage]]]:
+    """Group ``(project_key, UsageEntry)`` pairs into per-project daily buckets.
+
+    Returns ``[(project_key, [BucketUsage date-asc]), ...]`` ordered by each
+    project's total cost descending, ties broken by ``project_key.display_key``
+    ascending. ``project_key`` is opaque/hashable (a ``ProjectKey``); resolution
+    happened in the caller, so this stays pure (no filesystem).
+
+    Reuses ``_aggregate_daily`` per group, so per-model breakdowns, token sums,
+    and ``mode``/``cost_usd`` threading are identical to the non-instances path.
+    """
+    grouped: dict[Any, list[UsageEntry]] = {}
+    order: list[Any] = []
+    for key, entry in keyed_entries:
+        bucket = grouped.get(key)
+        if bucket is None:
+            grouped[key] = bucket = []
+            order.append(key)
+        bucket.append(entry)
+
+    ranked: list[tuple[Any, list[BucketUsage], float]] = []
+    for key in order:
+        buckets = _aggregate_daily(grouped[key], mode=mode, tz=tz)  # date-asc
+        total = sum(b.cost_usd for b in buckets)
+        ranked.append((key, buckets, total))
+
+    ranked.sort(key=lambda t: (-t[2], t[0].display_key))
+    return [(key, buckets) for key, buckets, _ in ranked]
+
+
 def _aggregate_weekly(
     entries: list[UsageEntry],
     weeks: list[SubWeek],

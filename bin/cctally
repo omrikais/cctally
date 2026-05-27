@@ -368,6 +368,7 @@ CodexSessionUsage = _lib_aggregators.CodexSessionUsage
 ClaudeSessionUsage = _lib_aggregators.ClaudeSessionUsage
 _aggregate_buckets = _lib_aggregators._aggregate_buckets
 _aggregate_daily = _lib_aggregators._aggregate_daily
+_aggregate_daily_by_project = _lib_aggregators._aggregate_daily_by_project
 _aggregate_monthly = _lib_aggregators._aggregate_monthly
 _aggregate_weekly = _lib_aggregators._aggregate_weekly
 _aggregate_codex_buckets = _lib_aggregators._aggregate_codex_buckets
@@ -408,7 +409,10 @@ build_codex_session_view = _lib_view_models.build_codex_session_view
 _lib_render = _load_sibling("_lib_render")
 _CODEX_MONTHS = _lib_render._CODEX_MONTHS
 _render_blocks_table = _lib_render._render_blocks_table
+_daily_row_dict = _lib_render._daily_row_dict
+_bucket_totals_dict = _lib_render._bucket_totals_dict
 _bucket_to_json = _lib_render._bucket_to_json
+_bucket_by_project_to_json = _lib_render._bucket_by_project_to_json
 _weekly_to_json = _lib_render._weekly_to_json
 _daily_compact_split = _lib_render._daily_compact_split
 _monthly_compact_split = _lib_render._monthly_compact_split
@@ -1584,6 +1588,42 @@ def _project_filter_matches(key, project_patterns):
     dname = key.display_key.lower()
     pname = (key.git_root or key.bucket_path or "").lower()
     return any((p in dname) or (p in pname) for p in project_patterns)
+
+
+def _parse_project_aliases(raw):
+    """Parse a ``--project-aliases`` value into ``{key: label}``.
+
+    Form: comma-separated ``key=Label`` pairs. Whitespace around keys, labels,
+    and pairs is stripped; segments without ``=`` or with an empty key/label are
+    dropped (ported from ccusage's tolerant parser). ``None``/"" → ``{}``.
+    """
+    result: dict[str, str] = {}
+    if not raw:
+        return result
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        k, _, v = pair.partition("=")
+        k = k.strip()
+        v = v.strip()
+        if k and v:
+            result[k] = v
+    return result
+
+
+def _alias_for(key, aliases):
+    """Return the alias label for a ProjectKey, or None.
+
+    Looks up ``aliases`` by ``display_key``, then ``git_root``, then
+    ``bucket_path`` (first hit). Display-only — never alters JSON keys.
+    """
+    if not aliases:
+        return None
+    for cand in (key.display_key, key.git_root, key.bucket_path):
+        if cand and cand in aliases:
+            return aliases[cand]
+    return None
 
 
 def _emit_diff_debug_samples(args, window_a, window_b) -> None:
@@ -4533,6 +4573,90 @@ def cmd_daily(args: argparse.Namespace) -> int:
         return range
     range_start, range_end = range
 
+    # ── Project-axis path (issue #86 Session E / T1.11) ────────────────────
+    # Gated by -i/--instances or -p/--project; the default path below is
+    # untouched/byte-stable. Mirrors cmd_project's I/O-layer git-root
+    # resolution + substring-OR-path filter.
+    aliases = _parse_project_aliases(getattr(args, "project_aliases", None))
+    project_patterns = [p.lower() for p in (getattr(args, "project", None) or [])]
+
+    if getattr(args, "instances", False) or project_patterns:
+        joined = list(get_claude_session_entries(range_start, range_end))
+        resolver_cache: dict = {}
+        keyed: list = []              # [(ProjectKey, UsageEntry)] — for -i grouping
+        filtered_uentries: list = []  # UsageEntry — for -p-only / --format / debug
+        for je in joined:
+            if je.model == "<synthetic>":
+                continue
+            key = _resolve_project_key(je.project_path, "git-root", resolver_cache)
+            if project_patterns and not _project_filter_matches(key, project_patterns):
+                continue
+            ue = _usage_entry_from_joined(je)
+            keyed.append((key, ue))
+            filtered_uentries.append(ue)
+
+        # Debug scope = the filtered entries (mirrors cmd_project).
+        _emit_debug_samples_if_set(args, filtered_uentries, command_label="daily")
+
+        # --format share gate: -i is a no-op (no project-section share render),
+        # but -p IS honored by building the snapshot from the filtered view.
+        if getattr(args, "format", None):
+            view = build_daily_view(filtered_uentries, now_utc=_command_as_of(),
+                                    display_tz=tz, mode=args.mode)
+            display_tz_str = _share_display_tz_label(tz)
+            snap = _build_daily_snapshot(
+                view, period_start=range_start, period_end=range_end,
+                display_tz=display_tz_str, version=_share_resolve_version(),
+                theme=args.theme, reveal_projects=args.reveal_projects,
+            )
+            if args.order == "desc":
+                snap = dataclasses.replace(snap, rows=tuple(reversed(snap.rows)))
+            _share_render_and_emit(snap, args)
+            return 0
+
+        if getattr(args, "instances", False):
+            groups = _aggregate_daily_by_project(keyed, tz=tz, mode=args.mode)
+            aug = _project_disambiguate_labels(
+                [{"key": k, "cost_usd": sum(b.cost_usd for b in bl)}
+                 for k, bl in groups]
+            )
+            json_groups: list = []
+            table_groups: list = []
+            for i, (k, bl) in enumerate(groups):
+                ordered = list(reversed(bl)) if args.order == "desc" else bl
+                json_label = aug.get(i, k.display_key)
+                table_label = _alias_for(k, aliases) or json_label
+                json_groups.append((json_label, ordered))
+                table_groups.append((table_label, ordered))
+            if args.json:
+                print(_bucket_by_project_to_json(json_groups, date_key="date"))
+                return 0
+            print(_render_bucket_table(
+                [], first_col_name="Date", title_suffix="Daily",
+                compact_split_fn=_daily_compact_split,
+                breakdown=args.breakdown,
+                compact=getattr(args, "compact", False),
+                project_groups=table_groups,
+            ))
+            return 0
+
+        # -p only (no -i): filter-only → normal date-aggregated daily output.
+        view = build_daily_view(filtered_uentries, now_utc=_command_as_of(),
+                                display_tz=tz, mode=args.mode)
+        days = list(reversed(view.aggregated))
+        if args.order == "desc":
+            days = list(reversed(days))
+        if args.json:
+            print(_bucket_to_json(days, list_key="daily", date_key="date"))
+            return 0
+        print(_render_bucket_table(
+            days, first_col_name="Date", title_suffix="Daily",
+            compact_split_fn=_daily_compact_split, breakdown=args.breakdown,
+            compact=getattr(args, "compact", False),
+        ))
+        return 0
+
+    # ── Default path (UNCHANGED) ───────────────────────────────────────────
     # Collect entries.
     all_entries = get_entries(range_start, range_end)
 
@@ -10173,6 +10297,8 @@ def _build_daily_parser(subparsers, name, *, help_text, xref):
               cctally daily --since 20260414 --breakdown
               cctally daily --since 20260414 --json
               cctally daily --order desc
+              cctally daily --instances
+              cctally daily -i --project-aliases repos=Repos
         """),
     )
     p.add_argument(
@@ -10209,6 +10335,28 @@ def _build_daily_parser(subparsers, name, *, help_text, xref):
         "--tz", default=None, type=_argparse_tz, metavar="TZ",
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
+    )
+    p.add_argument(
+        "-i", "--instances",
+        action="store_true",
+        default=False,
+        help="Group the report by project (git-root).",
+    )
+    p.add_argument(
+        "-p", "--project",
+        action="append",
+        default=None,
+        metavar="PATTERN",
+        help="Filter to projects matching PATTERN (substring of the project "
+             "label or path; repeatable, OR semantics).",
+    )
+    p.add_argument(
+        "--project-aliases",
+        dest="project_aliases",
+        default=None,
+        metavar="PAIRS",
+        help="Comma-separated key=Label pairs overriding project display "
+             "labels (e.g. cctally-dev=Tracker). Display-only.",
     )
     _add_ccusage_alias_args(p, ansi_emit=False)
     _add_mode_arg(p)

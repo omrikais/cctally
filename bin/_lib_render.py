@@ -680,6 +680,40 @@ def _render_blocks_table(
     return rendered
 
 
+def _daily_row_dict(d: BucketUsage, *, date_key: str) -> dict[str, Any]:
+    """Single bucket → upstream-shaped row dict.
+
+    Shared by `_bucket_to_json` and `_bucket_by_project_to_json` so the per-row
+    shape (field set + order) can never drift. Key order matches ccusage:
+      date_key, inputTokens, outputTokens, cacheCreationTokens,
+      cacheReadTokens, totalTokens, totalCost, modelsUsed, modelBreakdowns.
+    """
+    return {
+        date_key: d.bucket,
+        "inputTokens": d.input_tokens,
+        "outputTokens": d.output_tokens,
+        "cacheCreationTokens": d.cache_creation_tokens,
+        "cacheReadTokens": d.cache_read_tokens,
+        "totalTokens": d.total_tokens,
+        "totalCost": d.cost_usd,
+        "modelsUsed": list(d.models),
+        "modelBreakdowns": list(d.model_breakdowns),
+    }
+
+
+def _bucket_totals_dict(buckets) -> dict[str, Any]:
+    """Aggregate totals across buckets (key order matches ccusage; note
+    totalCost BEFORE totalTokens)."""
+    return {
+        "inputTokens": sum(b.input_tokens for b in buckets),
+        "outputTokens": sum(b.output_tokens for b in buckets),
+        "cacheCreationTokens": sum(b.cache_creation_tokens for b in buckets),
+        "cacheReadTokens": sum(b.cache_read_tokens for b in buckets),
+        "totalCost": sum(b.cost_usd for b in buckets),
+        "totalTokens": sum(b.total_tokens for b in buckets),
+    }
+
+
 def _bucket_to_json(
     buckets: list[BucketUsage],
     *,
@@ -696,41 +730,25 @@ def _bucket_to_json(
       cacheReadTokens, totalTokens, totalCost, modelsUsed, modelBreakdowns.
     Totals key order (note: totalCost BEFORE totalTokens, per ccusage).
     """
-    bucket_list: list[dict[str, Any]] = []
-    tot_input = 0
-    tot_output = 0
-    tot_cc = 0
-    tot_cr = 0
-    tot_cost = 0.0
-    tot_tokens = 0
-    for d in buckets:
-        bucket_list.append({
-            date_key: d.bucket,
-            "inputTokens": d.input_tokens,
-            "outputTokens": d.output_tokens,
-            "cacheCreationTokens": d.cache_creation_tokens,
-            "cacheReadTokens": d.cache_read_tokens,
-            "totalTokens": d.total_tokens,
-            "totalCost": d.cost_usd,
-            "modelsUsed": list(d.models),
-            "modelBreakdowns": list(d.model_breakdowns),
-        })
-        tot_input += d.input_tokens
-        tot_output += d.output_tokens
-        tot_cc += d.cache_creation_tokens
-        tot_cr += d.cache_read_tokens
-        tot_cost += d.cost_usd
-        tot_tokens += d.total_tokens
-
-    totals = {
-        "inputTokens": tot_input,
-        "outputTokens": tot_output,
-        "cacheCreationTokens": tot_cc,
-        "cacheReadTokens": tot_cr,
-        "totalCost": tot_cost,
-        "totalTokens": tot_tokens,
-    }
+    bucket_list = [_daily_row_dict(d, date_key=date_key) for d in buckets]
+    totals = _bucket_totals_dict(buckets)
     return json.dumps({list_key: bucket_list, "totals": totals}, indent=2)
+
+
+def _bucket_by_project_to_json(project_groups, *, date_key: str = "date") -> str:
+    """Serialize ``[(label, [BucketUsage]), ...]`` to ``{projects:{label:[rows]},
+    totals}`` (upstream ccusage daily --instances shape). Caller passes the
+    disambiguated (unique, non-aliased) label per group; insertion order is
+    preserved as the JSON key order."""
+    projects: dict[str, Any] = {}
+    all_buckets: list = []
+    for label, buckets in project_groups:
+        projects[label] = [_daily_row_dict(b, date_key=date_key) for b in buckets]
+        all_buckets.extend(buckets)
+    return json.dumps(
+        {"projects": projects, "totals": _bucket_totals_dict(all_buckets)},
+        indent=2,
+    )
 
 
 def _weekly_to_json(
@@ -1079,6 +1097,7 @@ def _render_bucket_table(
     compact_split_fn: Callable[[str], str],
     breakdown: bool = False,
     compact: bool = False,
+    project_groups=None,
 ) -> str:
     """Render bucket aggregates as a ccusage-style ANSI table.
 
@@ -1126,10 +1145,10 @@ def _render_bucket_table(
     # ── Build raw rows: each is (cells, row_type) where a cell is the
     #    tuple (text, color_fn_or_none). `text` may contain '\n' for
     #    multi-line cells (Models list, compact Date).
-    ROW_DATA, ROW_BREAKDOWN, ROW_FOOTER = "data", "breakdown", "footer"
+    ROW_DATA, ROW_BREAKDOWN, ROW_FOOTER, ROW_PROJECT = "data", "breakdown", "footer", "project"
     raw_rows: list[tuple[list[tuple[str, Any]], str]] = []
 
-    for d in buckets:
+    def _emit_data_and_breakdown(d):
         # ccusage formatModelsDisplayMultiline: uniq → sort alphabetical
         short_models = sorted({_short_model_name(m) for m in d.models})
         models_text = "\n".join(f"- {m}" for m in short_models) if short_models else ""
@@ -1166,13 +1185,30 @@ def _render_bucket_table(
                 ]
                 raw_rows.append((bd_cells, ROW_BREAKDOWN))
 
+    if project_groups is not None:
+        # Project-aware section layout (daily --instances): one cyan
+        # `Project: <label>` header per group, then that group's normal
+        # ROW_DATA (+ ROW_BREAKDOWN children); the single footer is computed
+        # by flattening all groups' buckets.
+        footer_buckets: list = []
+        for label, group_buckets in project_groups:
+            header_cells = [(f"Project: {label}", _cyan)] + [("", None)] * (num_cols - 1)
+            raw_rows.append((header_cells, ROW_PROJECT))
+            for d in group_buckets:
+                _emit_data_and_breakdown(d)
+                footer_buckets.append(d)
+    else:
+        for d in buckets:
+            _emit_data_and_breakdown(d)
+        footer_buckets = buckets
+
     # Total footer row — yellow on all populated cells.
-    tot_input = sum(d.input_tokens for d in buckets)
-    tot_output = sum(d.output_tokens for d in buckets)
-    tot_cc = sum(d.cache_creation_tokens for d in buckets)
-    tot_cr = sum(d.cache_read_tokens for d in buckets)
-    tot_tokens = sum(d.total_tokens for d in buckets)
-    tot_cost = sum(d.cost_usd for d in buckets)
+    tot_input = sum(d.input_tokens for d in footer_buckets)
+    tot_output = sum(d.output_tokens for d in footer_buckets)
+    tot_cc = sum(d.cache_creation_tokens for d in footer_buckets)
+    tot_cr = sum(d.cache_read_tokens for d in footer_buckets)
+    tot_tokens = sum(d.total_tokens for d in footer_buckets)
+    tot_cost = sum(d.cost_usd for d in footer_buckets)
     footer_cells = [
         ("Total", _yellow),
         ("", None),
