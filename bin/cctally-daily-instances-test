@@ -114,6 +114,14 @@ run_scenario "instances-breakdown" "instances-breakdown" \
 # assertion runs separately below (alias-json-keys-stable).
 run_scenario "instances-aliases" "instances-aliases" \
     --instances --project-aliases lib=Library --since 20260520 --until 20260521
+# Alias keyed on the SHARED basename `app` matches BOTH same-basename git-roots
+# (display_key "app"). The table-label `(#N)` counter must keep the two
+# distinct-total sections tellable apart — headers read "Alias" / "Alias (#2)"
+# (NOT two identical "Alias" headers). JSON keys stay the disambiguated,
+# non-aliased labels (asserted by alias-json-keys-stable above). Regression
+# guard for the alias-collapses-disambiguation bug.
+run_scenario "instances-alias-collision" "instances-alias-collision" \
+    --instances --project-aliases app=Alias --since 20260520 --until 20260521
 run_scenario "instances-order-desc" "instances-desc" \
     --instances --order desc --since 20260520 --until 20260521
 run_scenario "project-filter-lib" "project-filter" \

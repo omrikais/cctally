@@ -1542,16 +1542,27 @@ def _usage_entry_from_joined(je) -> "UsageEntry":
     The joined-entry shape already carries ``source_path``, ``cost_usd``,
     and the per-token integers; this adapter is pure shape conversion
     with no cache re-read.
+
+    Non-token ``usage`` extras (``je.usage_extra``) — notably ``speed`` —
+    are merged AFTER the four token keys, mirroring ``iter_entries``'
+    ``usage.update(json.loads(...))``. Without this, the project-axis
+    ``daily`` path (and the diff/report joined-entry consumers) would
+    drop the fast-tier flag and render ``<model>`` where the normal path
+    renders ``<model>-fast``. The write-side strips the four token keys
+    from ``usage_extra_json`` so the merge never shadows the integers.
     """
+    usage = {
+        "input_tokens": je.input_tokens,
+        "output_tokens": je.output_tokens,
+        "cache_creation_input_tokens": je.cache_creation_tokens,
+        "cache_read_input_tokens": je.cache_read_tokens,
+    }
+    if je.usage_extra:
+        usage.update(je.usage_extra)
     return UsageEntry(
         timestamp=je.timestamp,
         model=je.model,
-        usage={
-            "input_tokens": je.input_tokens,
-            "output_tokens": je.output_tokens,
-            "cache_creation_input_tokens": je.cache_creation_tokens,
-            "cache_read_input_tokens": je.cache_read_tokens,
-        },
+        usage=usage,
         cost_usd=je.cost_usd,
         source_path=je.source_path,
     )
@@ -4653,7 +4664,16 @@ def cmd_daily(args: argparse.Namespace) -> int:
             # `projects[label] = ...` silently overwrites the earlier group
             # (data loss in --json). The table_label derives from the now-
             # unique json_label, so section headers stay distinct too.
+            # `json_label`s are unique by construction (the `(#N)` counter
+            # above). Table labels, however, can re-collide: `_alias_for`
+            # matches on `display_key` first, so a basename alias like
+            # `--project-aliases app=Alias` maps BOTH same-basename git-roots
+            # to "Alias" — re-merging the exact sections this feature
+            # disambiguates. Apply the SAME `(#N)` counter to table labels so
+            # the two distinct-total sections stay tellable apart (JSON keys
+            # are untouched — they use the non-aliased `json_label`).
             seen_json_labels: dict[str, int] = {}
+            seen_table_labels: dict[str, int] = {}
             for i, (k, bl) in enumerate(groups):
                 ordered = list(reversed(bl)) if args.order == "desc" else bl
                 base_json_label = aug.get(i, k.display_key)
@@ -4662,7 +4682,13 @@ def cmd_daily(args: argparse.Namespace) -> int:
                 json_label = (
                     base_json_label if n == 1 else f"{base_json_label} (#{n})"
                 )
-                table_label = _alias_for(k, aliases) or json_label
+                base_table_label = _alias_for(k, aliases) or json_label
+                nt = seen_table_labels.get(base_table_label, 0) + 1
+                seen_table_labels[base_table_label] = nt
+                table_label = (
+                    base_table_label if nt == 1
+                    else f"{base_table_label} (#{nt})"
+                )
                 json_groups.append((json_label, ordered))
                 table_groups.append((table_label, ordered))
             if args.json:

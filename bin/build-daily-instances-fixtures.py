@@ -121,7 +121,14 @@ def build_multi_project(out_dir: Path) -> None:
             input_tokens=600_000, output_tokens=120_000,
         )
 
-        # repos/lib — one day, claude-haiku-4-5 (low cost).
+        # repos/lib — one day, claude-haiku-4-5 (low cost), FAST tier.
+        # The `usage_extra_json` `speed=fast` flag must survive the joined-entry
+        # path (`get_claude_session_entries` → `_usage_entry_from_joined`) so the
+        # project-axis renderer labels this `claude-haiku-4-5-fast`, matching the
+        # normal `daily` path. Claude cost is speed-independent (only Codex
+        # pricing multiplies on fast), so this changes the LABEL only — token
+        # sums + cost + every reconcile invariant stay byte-stable. Regression
+        # guard for the dropped-`usage.speed` bug under `daily -i`/`-p`.
         src = "/fake/jsonl/repos-lib-0.jsonl"
         seed_session_file(conn, path=src, session_id="lib-s1",
                           project_path=repos_lib)
@@ -130,6 +137,7 @@ def build_multi_project(out_dir: Path) -> None:
             timestamp_utc=_iso(dt.datetime(2026, 5, 20, 8, 0, 0, tzinfo=dt.timezone.utc)),
             model="claude-haiku-4-5",
             input_tokens=200_000, output_tokens=40_000,
+            usage_extra_json='{"speed": "fast"}',
         )
 
         # NULL project_path → (unknown) bucket under -i.

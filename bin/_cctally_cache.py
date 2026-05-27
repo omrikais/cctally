@@ -937,6 +937,13 @@ class _JoinedClaudeEntry:
     # reconciles with daily/range-cost paths that already pass
     # `entry.cost_usd` into `_calculate_entry_cost`.
     cost_usd: float | None = None
+    # Non-token `usage` extras (parsed `usage_extra_json`) — notably
+    # `speed`, which `_aggregate_buckets` reads to render `<model>-fast`.
+    # `iter_entries` merges these into its `UsageEntry.usage`; the joined
+    # path must carry them too so `_usage_entry_from_joined` can restore
+    # them (else `daily -i`/`-p` lose fast-tier model labels). None when
+    # the row has no extras.
+    usage_extra: dict | None = None
 
 
 def get_claude_session_entries(
@@ -996,7 +1003,7 @@ def get_claude_session_entries(
         "  se.cache_create_tokens, se.cache_read_tokens, "
         "  se.source_path, "
         "  sf.session_id, sf.project_path, "
-        "  se.cost_usd_raw "
+        "  se.cost_usd_raw, se.usage_extra_json "
         "FROM session_entries se "
         "LEFT JOIN session_files sf ON sf.path = se.source_path "
         "WHERE se.timestamp_utc >= ? AND se.timestamp_utc <= ?"
@@ -1024,6 +1031,7 @@ def get_claude_session_entries(
             session_id=row[7],
             project_path=row[8],
             cost_usd=row[9],
+            usage_extra=(json.loads(row[10]) if row[10] else None),
         )
         for row in rows
     ]
@@ -1135,9 +1143,16 @@ def _direct_parse_claude_session_entries(
     results: list[_JoinedClaudeEntry] = []
     flat: list[tuple[UsageEntry, str]] = list(dedupe_map.values()) + no_key_with_meta
     flat.sort(key=lambda pair: pair[0].timestamp)
+    _token_keys = {
+        "input_tokens", "output_tokens",
+        "cache_creation_input_tokens", "cache_read_input_tokens",
+    }
     for entry, source_path in flat:
         usage = entry.usage
         sid, cwd = meta_by_path[source_path]
+        # Mirror the cache-backed path: carry non-token `usage` extras
+        # (e.g. `speed`) so `_usage_entry_from_joined` can restore them.
+        extras = {k: v for k, v in usage.items() if k not in _token_keys}
         results.append(_JoinedClaudeEntry(
             timestamp=entry.timestamp,
             model=entry.model,
@@ -1153,6 +1168,7 @@ def _direct_parse_claude_session_entries(
             session_id=sid,
             project_path=cwd,
             cost_usd=entry.cost_usd,
+            usage_extra=(extras or None),
         ))
 
     return results

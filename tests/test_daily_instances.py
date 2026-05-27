@@ -58,6 +58,46 @@ def _key(bucket_path, display_key, git_root=None):
                       git_root=git_root or bucket_path)
 
 
+def _je(ts_iso, model, inp, out, *, usage_extra=None):
+    return cache._JoinedClaudeEntry(
+        timestamp=dt.datetime.fromisoformat(ts_iso),
+        model=model,
+        input_tokens=inp, output_tokens=out,
+        cache_creation_tokens=0, cache_read_tokens=0,
+        source_path="/x.jsonl", session_id="s1", project_path="/r/app",
+        cost_usd=None, usage_extra=usage_extra,
+    )
+
+
+def test_usage_entry_from_joined_carries_speed_extra():
+    # The joined-entry adapter must restore non-token `usage` extras (notably
+    # `speed`) so the project-axis daily path renders `<model>-fast` like the
+    # normal path. Token keys stay intact; absent extras → no speed key.
+    f = cctally._usage_entry_from_joined
+    fast = f(_je("2026-05-20T08:00:00+00:00", "claude-haiku-4-5", 100, 20,
+                 usage_extra={"speed": "fast"}))
+    assert fast.usage["speed"] == "fast"
+    assert fast.usage["input_tokens"] == 100 and fast.usage["output_tokens"] == 20
+    plain = f(_je("2026-05-20T08:00:00+00:00", "claude-haiku-4-5", 100, 20))
+    assert "speed" not in plain.usage
+
+
+def test_aggregate_daily_by_project_renders_fast_model_from_speed_extra():
+    # End-to-end of the P2 fix: a fast-tier joined entry, once adapted, must
+    # surface as `<model>-fast` in the group's models / model_breakdowns —
+    # identical to the non-instances path (`_aggregate_buckets` reads
+    # `usage["speed"]`). A plain entry stays the bare model name.
+    k = _key("/r/lib", "lib")
+    fast_ue = cctally._usage_entry_from_joined(
+        _je("2026-05-20T08:00:00+00:00", "claude-haiku-4-5", 200, 40,
+            usage_extra={"speed": "fast"})
+    )
+    groups = agg._aggregate_daily_by_project([(k, fast_ue)], tz=None, mode="auto")
+    bucket = groups[0][1][0]
+    assert bucket.models == ["claude-haiku-4-5-fast"]
+    assert [m["modelName"] for m in bucket.model_breakdowns] == ["claude-haiku-4-5-fast"]
+
+
 def test_aggregate_daily_by_project_groups_orders_and_keeps_same_basename_distinct():
     # Two distinct git-roots that share the basename "app".
     work = _key("/r/work/app", "app", "/r/work/app")
@@ -157,6 +197,32 @@ def test_json_labels_dedupe_residual_collision_no_data_loss():
     assert out["projects"]["app (x) (#2)"][0]["totalCost"] == 1.0
     # Totals sum both groups.
     assert out["totals"]["totalCost"] == 10.0
+
+
+def test_table_labels_dedupe_alias_collision_keeps_sections_distinct():
+    # A basename alias (`app=Alias`) matches BOTH same-basename git-roots via
+    # `_alias_for`'s display_key lookup, so the raw aliased table label collides.
+    # cmd_daily's table-label `(#N)` counter must keep the two distinct-total
+    # sections tellable apart — replicate that loop (the P3 fix under test).
+    a = _key("/a/work/app", "app", "/a/work/app")
+    b = _key("/b/personal/app", "app", "/b/personal/app")
+    aliases = {"app": "Alias"}
+    # json_labels are already disambiguated/unique upstream (see the json-dedup
+    # test); only the alias-collapsed table labels need the extra counter.
+    json_labels = ["app (work)", "app (personal)"]
+
+    seen_table: dict = {}
+    table_labels = []
+    for k, jl in zip((a, b), json_labels):
+        base = cctally._alias_for(k, aliases) or jl
+        nt = seen_table.get(base, 0) + 1
+        seen_table[base] = nt
+        table_labels.append(base if nt == 1 else f"{base} (#{nt})")
+
+    # Both map to "Alias" pre-counter; the counter makes them distinct.
+    assert table_labels == ["Alias", "Alias (#2)"]
+    # No alias → table label falls back to the (already-distinct) json_label.
+    assert (cctally._alias_for(a, {}) or json_labels[0]) == "app (work)"
 
 
 def test_render_bucket_table_section_layout_has_project_headers_and_one_total():

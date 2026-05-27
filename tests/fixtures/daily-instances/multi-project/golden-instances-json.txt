@@ -104,11 +104,11 @@
         "totalTokens": 240000,
         "totalCost": 0.4,
         "modelsUsed": [
-          "claude-haiku-4-5"
+          "claude-haiku-4-5-fast"
         ],
         "modelBreakdowns": [
           {
-            "modelName": "claude-haiku-4-5",
+            "modelName": "claude-haiku-4-5-fast",
             "inputTokens": 200000,
             "outputTokens": 40000,
             "cacheCreationTokens": 0,
