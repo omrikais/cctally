@@ -618,7 +618,6 @@ cmd_db_unskip = _cctally_db.cmd_db_unskip
 _cctally_cache = _load_sibling("_cctally_cache")
 ProjectKey = _cctally_cache.ProjectKey
 _resolve_project_key = _cctally_cache._resolve_project_key
-_get_codex_sessions_dir = _cctally_cache._get_codex_sessions_dir
 _discover_codex_session_files = _cctally_cache._discover_codex_session_files
 IngestStats = _cctally_cache.IngestStats
 _progress_stderr = _cctally_cache._progress_stderr
@@ -894,8 +893,16 @@ def _codex_home_roots() -> list[pathlib.Path]:
     roots: list[pathlib.Path] = []
     for part in raw.split(","):
         part = part.strip()
-        if part:
+        if not part:
+            continue
+        try:
+            # expanduser() raises RuntimeError on a malformed `~user` entry
+            # (e.g. `~nonexistentuser/x` — the user doesn't exist). Drop the
+            # bad entry rather than aborting the whole command, so valid
+            # roots beside it survive.
             roots.append(pathlib.Path(part).expanduser())
+        except (RuntimeError, OSError, ValueError):
+            continue
     return roots or [pathlib.Path.home() / ".codex"]
 
 

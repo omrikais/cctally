@@ -72,6 +72,17 @@ def test_home_roots_expands_tilde(cc, tmp_path, monkeypatch):
     assert cc._codex_home_roots() == [tmp_path / "codexdir"]
 
 
+def test_home_roots_malformed_tilde_user_skipped(cc, tmp_path, monkeypatch):
+    # A `~baduser` entry (the user does not exist) makes expanduser() raise
+    # RuntimeError; the bad entry must be dropped, not abort the whole list —
+    # the valid sibling root beside it survives. No exception escapes.
+    monkeypatch.setenv("CODEX_HOME", f"~cctally_nonexistent_user_zz/x,{tmp_path}/good")
+    roots = cc._codex_home_roots()
+    assert tmp_path / "good" in roots
+    # The malformed entry left no residue: only the valid root remains.
+    assert roots == [tmp_path / "good"]
+
+
 # ── _codex_session_roots() ────────────────────────────────────────────────
 def test_session_roots_home_with_sessions(cc, tmp_path, monkeypatch):
     (tmp_path / "h" / "sessions").mkdir(parents=True)

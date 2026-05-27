@@ -11,8 +11,8 @@ pipeline.
 Holds:
 - ``ProjectKey`` (frozen dataclass) + ``_resolve_project_key`` —
   canonical project bucket identity for the ``project`` subcommand.
-- ``_get_codex_sessions_dir`` / ``_discover_codex_session_files`` —
-  Codex JSONL discovery primitives.
+- ``_discover_codex_session_files`` / ``_iter_codex_jsonl_paths`` —
+  Codex JSONL discovery primitives (multi-root $CODEX_HOME walk).
 - ``IngestStats`` / ``CodexIngestStats`` (dataclasses), ``_progress_stderr``
   / ``_progress_codex_stderr`` — ingest progress + per-call telemetry.
 - ``_ensure_session_files_row`` — idempotent backfill of
@@ -82,7 +82,7 @@ in the sibling graph):
 ``get_entries``, ``get_claude_session_entries``, ``get_codex_entries``,
 ``_resolve_project_key``, ``ProjectKey``, ``IngestStats``,
 ``CodexIngestStats``, ``_JoinedClaudeEntry``, ``_ensure_session_files_row``,
-``_discover_codex_session_files``, ``_get_codex_sessions_dir``,
+``_discover_codex_session_files``,
 ``cmd_cache_sync``, ``_progress_stderr``, ``_progress_codex_stderr``,
 ``_collect_entries_direct``, ``_collect_codex_entries_direct``,
 ``_direct_parse_claude_session_entries``, ``iter_codex_entries``)
@@ -107,7 +107,7 @@ import pathlib
 import sqlite3
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 
 def _cctally():
@@ -265,12 +265,22 @@ def _resolve_project_key(
 # === Region 2: Codex sessions-dir helpers (was bin/cctally:2072-2099) ===
 
 
-def _get_codex_sessions_dir() -> pathlib.Path | None:
-    """Return the Codex sessions directory if present, else None."""
-    c = _cctally()
-    if c.CODEX_SESSIONS_DIR.is_dir():
-        return c.CODEX_SESSIONS_DIR
-    return None
+def _iter_codex_jsonl_paths(roots: list[pathlib.Path]) -> Iterator[pathlib.Path]:
+    """Yield each existing *.jsonl under the given roots, de-duped by absolute
+    path (first occurrence wins — collapses overlapping/prefix roots).
+
+    Pure read: globs + is_file() only, no DB access. Shared by both Codex
+    walkers (_discover_codex_session_files and sync_codex_cache) so they stay
+    in lock-step on dedup + is_file() ordering.
+    """
+    seen: set[pathlib.Path] = set()
+    for root in roots:
+        for jp in root.glob("**/*.jsonl"):
+            if jp in seen:
+                continue
+            seen.add(jp)
+            if jp.is_file():
+                yield jp
 
 
 def _discover_codex_session_files(
@@ -289,22 +299,15 @@ def _discover_codex_session_files(
         eprint("[codex] no Codex session directory found")
         return []
     start_ts = range_start.timestamp()
-    seen: set[pathlib.Path] = set()
     result: list[pathlib.Path] = []
-    for root in roots:
-        for jp in root.glob("**/*.jsonl"):
-            if jp in seen:
-                continue
-            seen.add(jp)
-            if not jp.is_file():
-                continue
-            try:
-                mtime = jp.stat().st_mtime
-            except OSError:
-                continue
-            if mtime < start_ts:
-                continue
-            result.append(jp)
+    for jp in _iter_codex_jsonl_paths(roots):
+        try:
+            mtime = jp.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < start_ts:
+            continue
+        result.append(jp)
     return result
 
 
@@ -1256,14 +1259,9 @@ def sync_codex_cache(
             eprint("[cache-sync] rebuild: cleared Codex cached entries")
 
         roots = _cctally()._codex_session_roots()
-        paths: list[pathlib.Path] = []
-        seen: set[pathlib.Path] = set()
-        for root in roots:
-            for jp in root.glob("**/*.jsonl"):
-                if jp in seen or not jp.is_file():
-                    continue
-                seen.add(jp)
-                paths.append(jp)
+        # Pure read (glob + is_file only); safe to run before the SELECT and
+        # the per-file loop, where no cache.db write lock may be held.
+        paths: list[pathlib.Path] = list(_iter_codex_jsonl_paths(roots))
         stats.files_total = len(paths)
 
         # This SELECT does NOT open an implicit transaction (Python's
