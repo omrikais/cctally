@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **`cctally blocks` (and `cctally claude blocks`) gain the ccusage drop-in flags `-a/--active`, `-r/--recent`, `-t/--token-limit N|max`, and `-n/--session-length N`.** `-a` filters to the single live block and renders it as a "Current Session Block Status" detail box — Block Started (+ "Xh Ym ago" / approximate-start `~` cue when the window has no recorded Anthropic reset), Time Remaining, Current Usage, Burn Rate and Projected Usage (when available), and — only when `-t` is passed explicitly — a Token Limit Status block whose `OK`/`WARNING`/`EXCEEDS LIMIT` color tracks the projected percent; with no active block it prints `No active session block found.` to stdout (JSON: `{"blocks": [], "message": "No active block"}`) and exits 0. `-r` keeps only blocks from the last 3 days plus the active block. `-t N` keys the table's `%`/REMAINING/PROJECTED surface (and the `-a` box's Token Limit Status) to an explicit limit even with no completed history, while `-t max` (the default) derives it from the largest completed block and prints `Using max tokens from previous sessions: N` to stdout (suppressed under `--json`); `--json` additionally gains an additive `tokenLimitStatus` key on active blocks under an explicit positive `-t`. `-n` is accepted for drop-in compatibility but is a no-op — cctally blocks follow Anthropic's real 5-hour resets and are not re-sizable — except `-n <= 0`, which errors (exit 1). cctally's block projection keeps its real-reset formula (a documented third intentional divergence from upstream's entry-span model). (#86)
+
 ## [1.18.0] - 2026-05-27
 
 ### Added

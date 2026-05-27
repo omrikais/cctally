@@ -79,6 +79,14 @@ done
 # breakdown passthrough (daily/monthly/weekly/blocks/session support -b)
 compare_forms "claude-daily-breakdown" "$CLAUDE_HOME" "daily --breakdown" "claude daily --breakdown"
 
+# blocks flag surface (issue #86 Session F): -a/-r/-t/-n all live on the
+# single build-once/register-twice _build_blocks_parser, so flat `blocks <flag>`
+# must be byte-identical to subgroup `claude blocks <flag>` (stdout/stderr/rc).
+compare_forms "claude-blocks-active"    "$CLAUDE_HOME" "blocks -a"        "claude blocks -a"
+compare_forms "claude-blocks-recent"    "$CLAUDE_HOME" "blocks -r"        "claude blocks -r"
+compare_forms "claude-blocks-tokenlim"  "$CLAUDE_HOME" "blocks -t 500000" "claude blocks -t 500000"
+compare_forms "claude-blocks-sesslen"   "$CLAUDE_HOME" "blocks -n 3"      "claude blocks -n 3"
+
 # --- Codex commands: flat `codex-<cmd>` == subgroup `codex <cmd>` ---
 for cmd in daily monthly session weekly; do
     compare_forms "codex-$cmd-table" "$CODEX_HOME" "codex-$cmd"        "codex $cmd"

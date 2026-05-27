@@ -81,8 +81,18 @@ def _fixture_tree(name: str) -> tuple[Path, Path, Path]:
     return base, share, projects
 
 
-def _write_input_env(base: Path, as_of: str) -> None:
-    (base / "input.env").write_text(f"AS_OF={as_of}\n")
+def _write_input_env(base: Path, as_of: str, *, flags: str | None = None) -> None:
+    lines = [f"AS_OF={as_of}\n"]
+    if flags:
+        # The shared `_lib-fixture-harness.sh` reads FLAGS and merges it into
+        # every run_mode call (`merged_flags="$flags $FLAGS"`), so the flags
+        # apply to BOTH the terminal and --json modes of this fixture.
+        # Quote the value (matching the cache-report/codex-daily/diff fixtures'
+        # convention) so a multi-token FLAGS like `-a -t 100000` survives the
+        # `. input.env` source — an unquoted `FLAGS=-a -t 100000` would assign
+        # only `FLAGS=-a` and then try to run `-t` as a command.
+        lines.append(f'FLAGS="{flags}"\n')
+    (base / "input.env").write_text("".join(lines))
     (base / ".gitignore").write_text(GITIGNORE_BODY)
 
 
@@ -507,6 +517,152 @@ def build_streaming_pair_dedup() -> None:
     )
 
 
+# -- Scenario 8: active-box (issue #86 Session F, FLAGS=-a) ---------------
+def build_active_box() -> None:
+    """`blocks -a` over a recorded (API-anchored) active block + completed
+    history.
+
+    AS_OF sits inside a recorded 5h window so the active block resolves to
+    `anchor="recorded"` (no `~`). An earlier completed block supplies the
+    auto-max baseline. The `-a` flag (via FLAGS in input.env) makes
+    `cmd_blocks` filter to the single active block and render the
+    "Current Session Block Status" box.
+    """
+    base, share, _ = _fixture_tree("active-box")
+    R = dt.datetime(2026, 4, 23, 14, 0, tzinfo=dt.timezone.utc)
+    as_of = R - dt.timedelta(hours=1, minutes=15)  # mid-session
+    _write_input_env(base, _iso(as_of), flags="-a")
+    create_stats_db(share / "stats.db")
+    create_cache_db(share / "cache.db")
+    with sqlite3.connect(share / "stats.db") as sc:
+        _seed_week_snapshot(
+            sc,
+            R=R,
+            captured_at=R - dt.timedelta(hours=1, minutes=50),
+            weekly_percent=55.0,
+            five_hour_percent=45.0,
+        )
+    with sqlite3.connect(share / "cache.db") as cc:
+        _seed_entries(cc, [
+            (R - dt.timedelta(hours=7), 5000, 8000),        # completed block
+            (R - dt.timedelta(hours=2), 2000, 3000),        # active window
+            (R - dt.timedelta(hours=1, minutes=30), 1500, 2500),
+        ])
+
+
+# -- Scenario 9: active-box-heuristic (Session F, FLAGS=-a) ---------------
+def build_active_box_heuristic() -> None:
+    """`blocks -a` over a heuristic-anchored active block (Codex F2).
+
+    NO weekly_usage_snapshot is seeded, so there is no canonical 5h window
+    for the live block. `_maybe_swap_active_block_to_canonical` finds no
+    canonical row and the active block stays `anchor="heuristic"` — the box
+    must show the `~`-prefixed Block Started + the approximate-start legend.
+    """
+    base, share, _ = _fixture_tree("active-box-heuristic")
+    now = dt.datetime(2026, 4, 23, 12, 0, tzinfo=dt.timezone.utc)
+    _write_input_env(base, _iso(now), flags="-a")
+    create_stats_db(share / "stats.db")  # empty snapshots table
+    create_cache_db(share / "cache.db")
+    with sqlite3.connect(share / "cache.db") as cc:
+        _seed_entries(cc, [
+            (now - dt.timedelta(hours=1), 2000, 3000),
+            (now - dt.timedelta(minutes=20), 1500, 2500),
+        ])
+    # No _seed_week_snapshot → no canonical window → active block stays
+    # heuristic (the `~`/approximate-start cue path).
+
+
+# -- Scenario 10: active-box-token-limit (Session F, FLAGS=-a -t N) -------
+def build_active_box_token_limit() -> None:
+    """`blocks -a -t <N>` with a projection that exceeds N.
+
+    A recorded active block with a strong burn rate projects past the
+    explicit 100,000-token limit, so the box renders the Token Limit Status
+    sub-block with `EXCEEDS LIMIT`; the JSON path emits
+    `tokenLimitStatus.status = "exceeds"`.
+    """
+    base, share, _ = _fixture_tree("active-box-token-limit")
+    R = dt.datetime(2026, 4, 23, 14, 0, tzinfo=dt.timezone.utc)
+    as_of = R - dt.timedelta(hours=1)
+    _write_input_env(base, _iso(as_of), flags="-a -t 100000")
+    create_stats_db(share / "stats.db")
+    create_cache_db(share / "cache.db")
+    with sqlite3.connect(share / "stats.db") as sc:
+        _seed_week_snapshot(
+            sc,
+            R=R,
+            captured_at=R - dt.timedelta(hours=3),
+            weekly_percent=55.0,
+            five_hour_percent=45.0,
+        )
+    with sqlite3.connect(share / "cache.db") as cc:
+        _seed_entries(cc, [
+            (R - dt.timedelta(hours=4), 30000, 50000),   # drives projection >100k
+            (R - dt.timedelta(hours=3, minutes=30), 20000, 40000),
+        ])
+
+
+# -- Scenario 11: recent-filter (Session F, FLAGS=-r) --------------------
+def build_recent_filter() -> None:
+    """`blocks -r` over an OLD (>3d) block, a recent block, and an active
+    block.
+
+    The `-r/--recent` filter keeps blocks where `start_time >= now - 3d OR
+    is_active`, so the 10-day-old block is dropped while the recent + active
+    blocks survive.
+    """
+    base, share, _ = _fixture_tree("recent-filter")
+    R = dt.datetime(2026, 4, 23, 14, 0, tzinfo=dt.timezone.utc)
+    as_of = R - dt.timedelta(hours=1)
+    _write_input_env(base, _iso(as_of), flags="-r")
+    create_stats_db(share / "stats.db")
+    create_cache_db(share / "cache.db")
+    with sqlite3.connect(share / "stats.db") as sc:
+        _seed_week_snapshot(
+            sc,
+            R=R,
+            captured_at=R - dt.timedelta(hours=3),
+            weekly_percent=55.0,
+            five_hour_percent=45.0,
+        )
+    with sqlite3.connect(share / "cache.db") as cc:
+        _seed_entries(cc, [
+            (R - dt.timedelta(days=10), 5000, 8000),   # OLD → filtered out by -r
+            (R - dt.timedelta(days=1), 4000, 6000),    # recent → kept
+            (R - dt.timedelta(hours=2), 2000, 3000),   # active → kept
+        ])
+
+
+# -- Scenario 12: token-limit-table (Session F, FLAGS=-t N) --------------
+def build_token_limit_table() -> None:
+    """`blocks -t <N>` (no `-a`) → table `%`/REMAINING/PROJECTED keyed to N.
+
+    An explicit token limit forces the `%` column on even when the table
+    would otherwise auto-derive a different baseline from the completed
+    block; the REMAINING `(assuming N token limit)` label reflects N.
+    """
+    base, share, _ = _fixture_tree("token-limit-table")
+    R = dt.datetime(2026, 4, 23, 14, 0, tzinfo=dt.timezone.utc)
+    as_of = R - dt.timedelta(hours=1)
+    _write_input_env(base, _iso(as_of), flags="-t 80000")
+    create_stats_db(share / "stats.db")
+    create_cache_db(share / "cache.db")
+    with sqlite3.connect(share / "stats.db") as sc:
+        _seed_week_snapshot(
+            sc,
+            R=R,
+            captured_at=R - dt.timedelta(hours=3),
+            weekly_percent=55.0,
+            five_hour_percent=45.0,
+        )
+    with sqlite3.connect(share / "cache.db") as cc:
+        _seed_entries(cc, [
+            (R - dt.timedelta(hours=7), 15000, 25000),   # completed block
+            (R - dt.timedelta(hours=2), 8000, 12000),    # active
+        ])
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -532,6 +688,11 @@ if __name__ == "__main__":
         build_active_window,
         build_floor_band_trap,
         build_streaming_pair_dedup,
+        build_active_box,
+        build_active_box_heuristic,
+        build_active_box_token_limit,
+        build_recent_filter,
+        build_token_limit_table,
     ):
         builder()
     print(f"Built fixtures under {FIXTURES_DIR}")

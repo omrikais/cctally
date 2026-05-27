@@ -1,0 +1,63 @@
+{
+  "blocks": [
+    {
+      "id": "2026-04-23T07:00:00.000Z",
+      "startTime": "2026-04-23T07:00:00.000Z",
+      "endTime": "2026-04-23T09:00:00.000Z",
+      "actualEndTime": "2026-04-23T07:00:00.000Z",
+      "isActive": false,
+      "isGap": false,
+      "anchor": "heuristic",
+      "entries": 1,
+      "tokenCounts": {
+        "inputTokens": 15000,
+        "outputTokens": 25000,
+        "cacheCreationInputTokens": 0,
+        "cacheReadInputTokens": 0
+      },
+      "totalTokens": 40000,
+      "costUSD": 0.42,
+      "models": [
+        "claude-sonnet-4-6"
+      ],
+      "burnRate": null,
+      "projection": null
+    },
+    {
+      "id": "2026-04-23T09:00:00.000Z",
+      "startTime": "2026-04-23T09:00:00.000Z",
+      "endTime": "2026-04-23T14:00:00.000Z",
+      "actualEndTime": "2026-04-23T12:00:00.000Z",
+      "isActive": true,
+      "isGap": false,
+      "anchor": "recorded",
+      "entries": 1,
+      "tokenCounts": {
+        "inputTokens": 8000,
+        "outputTokens": 12000,
+        "cacheCreationInputTokens": 0,
+        "cacheReadInputTokens": 0
+      },
+      "totalTokens": 20000,
+      "costUSD": 0.204,
+      "models": [
+        "claude-sonnet-4-6"
+      ],
+      "burnRate": {
+        "tokensPerMinute": 83.33333333333333,
+        "costPerHour": 0.051
+      },
+      "projection": {
+        "totalTokens": 25000,
+        "totalCost": 0.26,
+        "remainingMinutes": 60
+      },
+      "tokenLimitStatus": {
+        "limit": 80000,
+        "projectedUsage": 25000,
+        "percentUsed": 31.25,
+        "status": "ok"
+      }
+    }
+  ]
+}

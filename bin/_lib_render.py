@@ -295,7 +295,7 @@ def _render_active_block_box(
     approx = block.anchor == "heuristic"
     if approx:
         started = f"~{started}"
-    elapsed = (now - block.start_time).total_seconds()
+    elapsed = max((now - block.start_time).total_seconds(), 0)
     remaining = max((block.end_time - now).total_seconds(), 0)
     lines.append(f"Block Started: {started} "
                  f"({_fmt_block_duration_hm(elapsed)} ago)")
@@ -326,6 +326,8 @@ def _render_active_block_box(
             remaining_tokens = max(limit - current, 0)
             pct_used = (proj["totalTokens"] / limit) * 100.0
             cur_pct = (current / limit) * 100.0
+            # Keep the EXCEEDS/WARNING/OK thresholds (>100 / >80) in sync with
+            # the JSON status ladder in _lib_blocks._blocks_to_json.
             if pct_used > 100:
                 status = _style_ansi("EXCEEDS LIMIT", "31", color)
             elif pct_used > 80:

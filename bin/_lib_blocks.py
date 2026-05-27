@@ -513,6 +513,8 @@ def _blocks_to_json(
             limit = token_limit_status_limit
             proj_tokens = block.projection["totalTokens"]
             pct = (proj_tokens / limit) * 100.0
+            # Keep the exceeds/warning/ok thresholds (>100% / >80%) in sync with
+            # the box status ladder in _lib_render._render_active_block_box.
             status = ("exceeds" if proj_tokens > limit
                       else "warning" if proj_tokens > limit * 0.8
                       else "ok")

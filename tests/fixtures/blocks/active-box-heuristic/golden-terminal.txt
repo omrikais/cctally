@@ -1,0 +1,21 @@
+ ╭────────────────────────────────╮
+ │                                │
+ │  Current Session Block Status  │
+ │                                │
+ ╰────────────────────────────────╯
+Block Started: ~2026-04-23, 11:00:00 a.m. (1h 00m ago)
+Time Remaining: 4h 00m
+~ = approximate start (no Anthropic 5h reset recorded for this window)
+
+Current Usage:
+  Input Tokens:     3,500
+  Output Tokens:    5,500
+  Total Cost:       $0.09
+
+Burn Rate:
+  Tokens/minute:    150
+  Cost/hour:        $0.09
+
+Projected Usage (if current rate continues):
+  Total Tokens:     45,000
+  Total Cost:       $0.46

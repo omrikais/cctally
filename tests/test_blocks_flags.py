@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -86,7 +87,8 @@ def test_blocks_session_length_validation(tmp_path, val, rc):
     r = subprocess.run([sys.executable, str(BIN), "blocks", "-n", val],
                        capture_output=True, text=True,
                        env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin",
-                            "CCTALLY_DISABLE_DEV_AUTODETECT": "1"})
+                            "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+                            "TZ": "Etc/UTC"})
     assert r.returncode == rc, r.stderr
 
 
@@ -105,6 +107,53 @@ def test_active_no_block_message_on_stdout(tmp_path):
                         capture_output=True, text=True, env=env)
     assert rj.returncode == 0
     assert '"message": "No active block"' in rj.stdout
+
+
+# ── Task 8: -r behavioral assertion against the recent-filter fixture ────
+
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "blocks"
+
+
+def _read_input_env(fixture_dir: pathlib.Path) -> dict[str, str]:
+    """Parse AS_OF / FLAGS out of a fixture's input.env (shell `KEY=value`,
+    optionally double-quoted — matching the builder's quoting)."""
+    out: dict[str, str] = {}
+    for line in (fixture_dir / "input.env").read_text().splitlines():
+        if "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        out[k.strip()] = v.strip().strip('"')
+    return out
+
+
+def test_recent_filter_drops_old_keeps_recent_and_active(tmp_path):
+    """`-r` drops the >3d-old block and keeps the recent + active blocks.
+
+    Seeded `recent-filter` fixture: an old block (R-10d), a recent block
+    (R-1d), and an active block. The old block's start date (2026-04-13)
+    must be absent; the recent (2026-04-22) and active (2026-04-23) blocks
+    must be present.
+    """
+    src = FIXTURES / "recent-filter"
+    home = tmp_path / "home"
+    shutil.copytree(src, home)
+    env_vars = _read_input_env(src)
+    env = {"HOME": str(home), "PATH": "/usr/bin:/bin",
+           "CCTALLY_DISABLE_DEV_AUTODETECT": "1", "TZ": "Etc/UTC",
+           "NO_COLOR": "1", "CCTALLY_AS_OF": env_vars["AS_OF"]}
+    # First (cold) invocation primes the cache / runs the codex migration;
+    # the second is the deterministic read.
+    subprocess.run([sys.executable, str(BIN), "blocks", "-r"],
+                   capture_output=True, text=True, env=env)
+    r = subprocess.run([sys.executable, str(BIN), "blocks", "-r"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    # Old block (2026-04-13) filtered out by -r.
+    assert "2026-04-13" not in r.stdout
+    # Recent block (2026-04-22) and active block (2026-04-23) survive.
+    assert "2026-04-22" in r.stdout
+    assert "2026-04-23" in r.stdout
+    assert "ACTIVE" in r.stdout
 
 
 # ── Task 5: -t table threading ──────────────────────────────────────────
@@ -196,6 +245,31 @@ def test_box_omits_burn_when_none():
         color=False, unicode_ok=True)
     assert "Burn Rate:" not in out
     assert "Projected Usage" not in out
+
+
+def test_box_omits_token_limit_status_when_explicit_zero():
+    # token_limit_explicit == 0 (distinct from None) must still suppress the
+    # Token Limit Status sub-block — the `> 0` gate, not just `is not None`.
+    import _lib_render, datetime as dt
+    now = dt.datetime(2026, 4, 23, 11, 15, tzinfo=dt.timezone.utc)
+    out = _lib_render._render_active_block_box(
+        _make_active_block("recorded"), now=now, tz=None,
+        token_limit_explicit=0, color=False, unicode_ok=True)
+    assert "Token Limit Status" not in out
+    # Projected Usage section (non-limit) still renders.
+    assert "Projected Usage (if current rate continues):" in out
+
+
+def test_box_token_limit_status_renders_current_usage_pct():
+    # The Current Usage: line inside Token Limit Status shows cur_pct =
+    # current / limit. total_tokens=1,090,000 over limit=2,000,000 → 54.5%.
+    import _lib_render, datetime as dt
+    now = dt.datetime(2026, 4, 23, 11, 15, tzinfo=dt.timezone.utc)
+    out = _lib_render._render_active_block_box(
+        _make_active_block("recorded"), now=now, tz=None,
+        token_limit_explicit=2_000_000, color=False, unicode_ok=True)
+    assert "Token Limit Status" in out
+    assert "Current Usage:    1,090,000 (54.5%)" in out
 
 
 # ── Task 7: JSON tokenLimitStatus ───────────────────────────────────────

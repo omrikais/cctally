@@ -1,0 +1,21 @@
+Using max tokens from previous sessions: 13,000
+ ╭────────────────────────────────╮
+ │                                │
+ │  Current Session Block Status  │
+ │                                │
+ ╰────────────────────────────────╯
+Block Started: 2026-04-23, 9:00:00 a.m. (3h 45m ago)
+Time Remaining: 1h 15m
+
+Current Usage:
+  Input Tokens:     3,500
+  Output Tokens:    5,500
+  Total Cost:       $0.09
+
+Burn Rate:
+  Tokens/minute:    40
+  Cost/hour:        $0.02
+
+Projected Usage (if current rate continues):
+  Total Tokens:     12,000
+  Total Cost:       $0.12
