@@ -266,8 +266,9 @@ def _resolve_project_key(
 
 
 def _iter_codex_jsonl_paths(roots: list[pathlib.Path]) -> Iterator[pathlib.Path]:
-    """Yield each existing *.jsonl under the given roots, de-duped by absolute
-    path (first occurrence wins — collapses overlapping/prefix roots).
+    """Yield each existing *.jsonl under the given roots, de-duped by RESOLVED
+    path (first occurrence wins — collapses overlapping/prefix roots and
+    symlink/`..` aliases of the same physical file).
 
     Pure read: globs + is_file() only, no DB access. Shared by both Codex
     walkers (_discover_codex_session_files and sync_codex_cache) so they stay
@@ -276,9 +277,20 @@ def _iter_codex_jsonl_paths(roots: list[pathlib.Path]) -> Iterator[pathlib.Path]
     seen: set[pathlib.Path] = set()
     for root in roots:
         for jp in root.glob("**/*.jsonl"):
-            if jp in seen:
+            # Dedup on the RESOLVED path, not the raw spelling. A symlinked
+            # $CODEX_HOME root or an alias entry (`.../.codex`,
+            # `.../sub/../.codex`) can glob the same physical file under
+            # different spellings; UNIQUE(source_path, line_offset) keys on the
+            # string, so distinct spellings would double-ingest (2-3x tokens /
+            # cost) on a fresh walk. resolve() collapses the aliases (issue
+            # #108). First spelling still wins for the yielded source_path.
+            try:
+                key = jp.resolve()
+            except OSError:
+                key = jp  # unresolvable (broken symlink, perms) — key on raw
+            if key in seen:
                 continue
-            seen.add(jp)
+            seen.add(key)
             if jp.is_file():
                 yield jp
 
@@ -1205,6 +1217,9 @@ class CodexIngestStats:
     # ``IngestStats`` (Claude path) which carries an UPSERT and
     # therefore counts both new INSERTs and DO UPDATE replacements.
     rows_changed: int = 0
+    # Count of cached files dropped because they fall outside the CURRENT
+    # $CODEX_HOME root set (issue #108 — a prior-root purge, not a delta).
+    files_pruned: int = 0
     lock_contended: bool = False
 
 
@@ -1263,6 +1278,43 @@ def sync_codex_cache(
         # the per-file loop, where no cache.db write lock may be held.
         paths: list[pathlib.Path] = list(_iter_codex_jsonl_paths(roots))
         stats.files_total = len(paths)
+
+        # Scope the cache to the CURRENT root set: drop rows ingested under a
+        # prior $CODEX_HOME (issue #108). iter_codex_entries() has NO root
+        # predicate — it reads every row in range — so without this, reusing
+        # the same cache.db across `CODEX_HOME=/A` then `CODEX_HOME=/B` runs
+        # returns A+B instead of just B. Prune every real (absolute) row
+        # outside the current set, even when that set is empty (an empty
+        # current root then prunes the cache to empty): the cache is fully
+        # re-derivable, so honoring the override beats retaining unreachable
+        # rows. Done INSIDE the lock and committed BEFORE the existing-SELECT
+        # + parse loop so no cache.db write lock is held across the read-heavy
+        # ingest (same invariant as the --rebuild clear above). Concurrent
+        # processes with different $CODEX_HOME would prune each other; the
+        # flock serializes them and that is a pathological configuration.
+        if not rebuild:  # --rebuild already cleared both tables above
+            current_paths = {str(p) for p in paths}
+            # Only prune ABSOLUTE source_paths. A real ingested row always
+            # stores str(jp) from globbing an absolute root, so a relative
+            # path is — by construction — a synthetic baked-cache fixture row
+            # (e.g. build-speed-fixtures.py) with no on-disk JSONL to scope
+            # against; pruning it would wipe a cache meant to be read as-is.
+            orphan_paths = [
+                row[0]
+                for row in conn.execute("SELECT path FROM codex_session_files")
+                if row[0] not in current_paths and os.path.isabs(row[0])
+            ]
+            if orphan_paths:
+                conn.executemany(
+                    "DELETE FROM codex_session_entries WHERE source_path = ?",
+                    [(p,) for p in orphan_paths],
+                )
+                conn.executemany(
+                    "DELETE FROM codex_session_files WHERE path = ?",
+                    [(p,) for p in orphan_paths],
+                )
+                conn.commit()
+                stats.files_pruned = len(orphan_paths)
 
         # This SELECT does NOT open an implicit transaction (Python's
         # sqlite3 module only BEGINs on DML). Do NOT add any INSERT/

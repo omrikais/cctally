@@ -83,6 +83,17 @@ def test_home_roots_malformed_tilde_user_skipped(cc, tmp_path, monkeypatch):
     assert roots == [tmp_path / "good"]
 
 
+def test_home_roots_all_invalid_tilde_no_fallback(cc, tmp_path, monkeypatch):
+    # P3 (issue #108): $CODEX_HOME set to a SINGLE all-invalid `~user` entry.
+    # The variable IS explicitly set, so we must respect the override and
+    # yield [] — NOT silently fall back to the default ~/.codex account.
+    # (Contrast test_home_roots_all_blank_falls_back, where no non-blank entry
+    # was given at all, so the default still applies.)
+    monkeypatch.setenv("CODEX_HOME", "~cctally_nonexistent_user_zz")
+    monkeypatch.setattr(cc.pathlib.Path, "home", classmethod(lambda c: tmp_path))
+    assert cc._codex_home_roots() == []
+
+
 # ── _codex_session_roots() ────────────────────────────────────────────────
 def test_session_roots_home_with_sessions(cc, tmp_path, monkeypatch):
     (tmp_path / "h" / "sessions").mkdir(parents=True)
@@ -265,3 +276,55 @@ def test_multiroot_session_ids_end_to_end(cc, tmp_path):
     # root B is a direct-JSONL dir → id relative to <B> itself.
     assert "2026/04/17/rollout-aaaa" in ids
     assert "2026/04/17/rollout-bbbb" in ids
+
+
+# ── P2: alias/symlink dedup in the file walker ────────────────────────────
+def test_walker_dedups_symlinked_root_alias(cc, tmp_path):
+    # P2 (issue #108): the same physical rollout reachable via two root
+    # spellings (canonical + symlink) must ingest ONCE. The walker dedups on
+    # the RESOLVED path; UNIQUE(source_path, line_offset) keys on the string,
+    # so a raw-spelling dedup would double-count tokens/cost on a fresh walk.
+    cache = cc._load_sibling("_cctally_cache")
+    real = tmp_path / "real" / "sessions"
+    real.mkdir(parents=True)
+    _write_rollout(real / "2026" / "04" / "17" / "rollout-x.jsonl",
+                   "xxxx", "gpt-5", 1000, 0, 500)
+    link = tmp_path / "linked"
+    os.symlink(tmp_path / "real", link)
+    # List both spellings (canonical + via the symlink) as if comma-listed.
+    roots = [real, link / "sessions"]
+    found = list(cache._iter_codex_jsonl_paths(roots))
+    assert len(found) == 1, f"alias double-glob not deduped: {found}"
+
+
+# ── P1: cache scoped to current $CODEX_HOME (prior-root purge) ────────────
+def test_codex_home_switch_purges_prior_root(cc, tmp_path):
+    # P1 (issue #108): reusing one cache.db across `CODEX_HOME=/A` then
+    # `CODEX_HOME=/B` must return B's totals ONLY, not A+B. iter_codex_entries
+    # has no root predicate, so sync_codex_cache must purge prior-root rows.
+    home = tmp_path / "home"; home.mkdir()
+    data = tmp_path / "data"           # SHARED across both runs (no rmtree)
+    a = tmp_path / "rootA"; b = tmp_path / "rootB"
+    _write_rollout(a / ".codex" / "sessions" / "2026" / "04" / "17" / "rollout-aaaa.jsonl",
+                   "aaaa", "gpt-5", 1000, 0, 500)
+    _write_rollout(b / ".codex" / "sessions" / "2026" / "04" / "17" / "rollout-bbbb.jsonl",
+                   "bbbb", "gpt-5", 2000, 0, 700)
+
+    def cost(out):
+        return _json.loads(out)["totals"]["costUSD"]
+
+    # Baseline B-only total from a pristine cache dir.
+    only_b = cost(_run_codex(["codex-daily", "--json"], home=home,
+                             data_dir=tmp_path / "data_b_only",
+                             codex_home=str(b / ".codex")))
+    assert only_b > 0
+
+    # Run A first (populates the SHARED cache), then switch to B against the
+    # same cache. The switched run must equal only_b, never only_a + only_b.
+    only_a = cost(_run_codex(["codex-daily", "--json"], home=home,
+                             data_dir=data, codex_home=str(a / ".codex")))
+    assert only_a > 0
+    switched = cost(_run_codex(["codex-daily", "--json"], home=home,
+                               data_dir=data, codex_home=str(b / ".codex")))
+    assert switched == pytest.approx(only_b)
+    assert switched != pytest.approx(only_a + only_b)

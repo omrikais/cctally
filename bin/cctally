@@ -891,10 +891,12 @@ def _codex_home_roots() -> list[pathlib.Path]:
     if not raw:
         return [pathlib.Path.home() / ".codex"]
     roots: list[pathlib.Path] = []
+    saw_part = False
     for part in raw.split(","):
         part = part.strip()
         if not part:
             continue
+        saw_part = True
         try:
             # expanduser() raises RuntimeError on a malformed `~user` entry
             # (e.g. `~nonexistentuser/x` — the user doesn't exist). Drop the
@@ -903,7 +905,15 @@ def _codex_home_roots() -> list[pathlib.Path]:
             roots.append(pathlib.Path(part).expanduser())
         except (RuntimeError, OSError, ValueError):
             continue
-    return roots or [pathlib.Path.home() / ".codex"]
+    # Fall back to the default home ONLY when the variable is unset or carries
+    # no non-blank entry at all. An explicit-but-all-invalid value (e.g. a lone
+    # `~baduser` that expanduser() drops) yields [] — respect the override and
+    # read nothing rather than silently reading the default account (issue
+    # #108). A plain dead path like `/typo` already reaches [] via the is_dir()
+    # filter in _codex_session_roots(); this aligns the `~user` flavor with it.
+    if not saw_part:
+        return [pathlib.Path.home() / ".codex"]
+    return roots
 
 
 def _codex_session_roots() -> list[pathlib.Path]:
