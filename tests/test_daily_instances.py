@@ -120,6 +120,45 @@ def test_bucket_by_project_to_json_shape_and_order():
     assert out["totals"]["totalTokens"] == 60
 
 
+def test_json_labels_dedupe_residual_collision_no_data_loss():
+    # Two distinct git-roots that collide AFTER disambiguation: same basename
+    # ("app") AND same immediate-parent basename ("x") → both disambiguate to
+    # "app (x)". `_project_disambiguate_labels` alone can't tell them apart;
+    # cmd_daily's label-resolution must counter-suffix the second so the JSON
+    # `projects` dict keeps BOTH groups (no silent overwrite / data loss).
+    a = _key("/a/x/app", "app", "/a/x/app")
+    b = _key("/b/x/app", "app", "/b/x/app")
+    groups = [(a, [_bucket("2026-05-20", 9.0)]),
+              (b, [_bucket("2026-05-20", 1.0)])]
+
+    # Sanity: the bare disambiguation helper DOES collide on these two.
+    aug = render._project_disambiguate_labels(
+        [{"key": k, "cost_usd": sum(x.cost_usd for x in bl)} for k, bl in groups]
+    )
+    assert aug.get(0) == "app (x)" and aug.get(1) == "app (x)"
+
+    # Replicate cmd_daily's json_label resolution loop (the fix under test).
+    seen: dict = {}
+    json_groups = []
+    for i, (k, bl) in enumerate(groups):
+        base = aug.get(i, k.display_key)
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        json_label = base if n == 1 else f"{base} (#{n})"
+        json_groups.append((json_label, bl))
+
+    out = json.loads(render._bucket_by_project_to_json(json_groups, date_key="date"))
+    keys = list(out["projects"].keys())
+    # BOTH groups survive with distinct keys — second counter-suffixed.
+    assert keys == ["app (x)", "app (x) (#2)"]
+    assert len(out["projects"]) == 2
+    # Each group's distinct cost is preserved (no overwrite).
+    assert out["projects"]["app (x)"][0]["totalCost"] == 9.0
+    assert out["projects"]["app (x) (#2)"][0]["totalCost"] == 1.0
+    # Totals sum both groups.
+    assert out["totals"]["totalCost"] == 10.0
+
+
 def test_render_bucket_table_section_layout_has_project_headers_and_one_total():
     groups = [("app (work)", [_bucket("2026-05-20", 9.0)]),
               ("app (personal)", [_bucket("2026-05-20", 1.0)])]

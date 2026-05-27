@@ -1108,6 +1108,12 @@ def _render_bucket_table(
                          "YYYY\\n..." for compact-mode two-line display.
       compact         — force compact layout regardless of terminal width
                         (Session A `--compact` flag; spec §7.6.1).
+      project_groups  — when provided as ``[(label, [BucketUsage]), ...]``,
+                        render section layout: a ``Project: <label>`` header
+                        per group with one global Total footer summed across
+                        all groups (`daily -i/--instances`; issue #86 Session
+                        E). Default ``None`` = today's flat single-table
+                        behavior driven by ``buckets``.
 
     Mirrors ccusage's ResponsiveTable behavior: single-line headers and dates
     when content fits the terminal; falls back to two-line compact headers

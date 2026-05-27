@@ -4552,6 +4552,29 @@ def _parse_cli_date_range(
     return range_start, range_end
 
 
+def _emit_daily_view_table_or_json(view, args):
+    """Order + emit a DailyView as the flat daily table or {daily} JSON.
+
+    Shared by cmd_daily's default path and its -p-only (filter, no grouping)
+    path so the two cannot drift. Body is exactly the default path's order +
+    emit tail; callers keep their own --format share gate upstream of this.
+    """
+    days = list(reversed(view.aggregated))
+    if args.order == "desc":
+        days = list(reversed(days))
+    if args.json:
+        print(_bucket_to_json(days, list_key="daily", date_key="date"))
+        return
+    print(_render_bucket_table(
+        days,
+        first_col_name="Date",
+        title_suffix="Daily",
+        compact_split_fn=_daily_compact_split,
+        breakdown=args.breakdown,
+        compact=getattr(args, "compact", False),
+    ))
+
+
 def cmd_daily(args: argparse.Namespace) -> int:
     """Show usage report grouped by display-timezone date."""
     _share_validate_args(args)
@@ -4622,9 +4645,23 @@ def cmd_daily(args: argparse.Namespace) -> int:
             )
             json_groups: list = []
             table_groups: list = []
+            # `_project_disambiguate_labels` only suffixes the immediate
+            # parent-dir basename, so two distinct git-roots like
+            # `/a/x/app` + `/b/x/app` both resolve to `app (x)`. Guarantee
+            # per-group JSON-key uniqueness with a counter suffix on any
+            # residual collision — otherwise `_bucket_by_project_to_json`'s
+            # `projects[label] = ...` silently overwrites the earlier group
+            # (data loss in --json). The table_label derives from the now-
+            # unique json_label, so section headers stay distinct too.
+            seen_json_labels: dict[str, int] = {}
             for i, (k, bl) in enumerate(groups):
                 ordered = list(reversed(bl)) if args.order == "desc" else bl
-                json_label = aug.get(i, k.display_key)
+                base_json_label = aug.get(i, k.display_key)
+                n = seen_json_labels.get(base_json_label, 0) + 1
+                seen_json_labels[base_json_label] = n
+                json_label = (
+                    base_json_label if n == 1 else f"{base_json_label} (#{n})"
+                )
                 table_label = _alias_for(k, aliases) or json_label
                 json_groups.append((json_label, ordered))
                 table_groups.append((table_label, ordered))
@@ -4643,17 +4680,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
         # -p only (no -i): filter-only → normal date-aggregated daily output.
         view = build_daily_view(filtered_uentries, now_utc=_command_as_of(),
                                 display_tz=tz, mode=args.mode)
-        days = list(reversed(view.aggregated))
-        if args.order == "desc":
-            days = list(reversed(days))
-        if args.json:
-            print(_bucket_to_json(days, list_key="daily", date_key="date"))
-            return 0
-        print(_render_bucket_table(
-            days, first_col_name="Date", title_suffix="Daily",
-            compact_split_fn=_daily_compact_split, breakdown=args.breakdown,
-            compact=getattr(args, "compact", False),
-        ))
+        _emit_daily_view_table_or_json(view, args)
         return 0
 
     # ── Default path (UNCHANGED) ───────────────────────────────────────────
@@ -4673,10 +4700,6 @@ def cmd_daily(args: argparse.Namespace) -> int:
     # `_aggregate_daily` call is the same one we used inline.
     view = build_daily_view(all_entries, now_utc=_command_as_of(),
                             display_tz=tz, mode=args.mode)
-    # `_aggregate_daily` returned ascending order; build_daily_view stores
-    # `aggregated` newest-first. CLI's default order is ascending, so
-    # re-reverse to match the prior on-the-wire shape.
-    days = list(reversed(view.aggregated))
 
     # Shareable-reports gate: --format short-circuits the JSON / table
     # dispatch via `_share_render_and_emit`. The mutex in
@@ -4707,23 +4730,10 @@ def cmd_daily(args: argparse.Namespace) -> int:
         _share_render_and_emit(snap, args)
         return 0
 
-    # Apply sort order.
-    if args.order == "desc":
-        days = list(reversed(days))
-
-    if args.json:
-        print(_bucket_to_json(days, list_key="daily", date_key="date"))
-        return 0
-
-    # Table output.
-    print(_render_bucket_table(
-        days,
-        first_col_name="Date",
-        title_suffix="Daily",
-        compact_split_fn=_daily_compact_split,
-        breakdown=args.breakdown,
-        compact=getattr(args, "compact", False),
-    ))
+    # Order + emit the flat daily table / {daily} JSON. Extracted into
+    # `_emit_daily_view_table_or_json` so this default path and the
+    # -p-only (filter, no grouping) path above stay byte-identical.
+    _emit_daily_view_table_or_json(view, args)
     return 0
 
 
