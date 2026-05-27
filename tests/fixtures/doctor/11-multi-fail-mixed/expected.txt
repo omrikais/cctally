@@ -28,7 +28,7 @@ Data
   ✗ Latest snapshot          7200s ago
       → No snapshot in >1h. Hooks may be broken — check `cctally setup --status`.
   ✓ Claude cache             0 entries (no JSONL corpus)
-  ✓ Codex cache              none (no ~/.codex/sessions/)
+  ✓ Codex cache              none (no Codex session JSONL found)
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
 Safety

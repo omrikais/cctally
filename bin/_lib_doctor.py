@@ -530,7 +530,7 @@ def _check_data_codex_cache(s: DoctorState) -> CheckResult:
     if count == 0 and not s.codex_jsonl_present:
         return CheckResult(
             id="data.codex_cache", title="Codex cache",
-            severity="ok", summary="none (no ~/.codex/sessions/)",
+            severity="ok", summary="none (no Codex session JSONL found)",
             remediation=None,
             details={"entries": 0, "codex_jsonl_present": False},
         )

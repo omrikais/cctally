@@ -59,6 +59,10 @@ def _run_gather(home: pathlib.Path, *, runtime_bind: "str | None" = None,
     env = os.environ.copy()
     env["HOME"] = str(home)
     env["TZ"] = "Etc/UTC"
+    # Issue #109: the codex_jsonl_present probe now reads $CODEX_HOME. Neutralize
+    # a dev's exported value so the default-root probe resolves to <home>/.codex;
+    # tests that exercise multi-root opt in by passing CODEX_HOME via env_extra.
+    env.pop("CODEX_HOME", None)
     if env_extra:
         env.update(env_extra)
     res = subprocess.run([sys.executable, "-c", driver],
@@ -74,6 +78,39 @@ def test_gather_state_fresh_home_returns_state(tmp_path):
     assert st["dashboard_bind_stored"] in ("loopback", "127.0.0.1")
     assert st["runtime_bind"] is None
     assert st["claude_jsonl_present"] is False
+    assert st["codex_jsonl_present"] is False
+
+
+def test_gather_state_codex_present_default_root(tmp_path):
+    # JSONL under the default ~/.codex/sessions root → present, no $CODEX_HOME.
+    sess = tmp_path / ".codex" / "sessions" / "a"
+    sess.mkdir(parents=True)
+    (sess / "sess-1.jsonl").write_text("{}\n")
+    st = _run_gather(tmp_path)
+    assert st["codex_jsonl_present"] is True
+
+
+def test_gather_state_codex_present_via_codex_home_multiroot(tmp_path):
+    # Issue #109: with a multi-root $CODEX_HOME, the probe is true when ANY
+    # root carries session JSONL — here only the SECOND (non-default) root does.
+    empty_root = tmp_path / "root-a"
+    (empty_root / "sessions").mkdir(parents=True)
+    data_root = tmp_path / "root-b"
+    sess = data_root / "sessions" / "p"
+    sess.mkdir(parents=True)
+    (sess / "sess-2.jsonl").write_text("{}\n")
+    # tmp_path/.codex (the default fallback) intentionally absent — proving the
+    # probe followed $CODEX_HOME rather than the hardcoded home dir.
+    st = _run_gather(tmp_path, env_extra={"CODEX_HOME": f"{empty_root},{data_root}"})
+    assert st["codex_jsonl_present"] is True
+
+
+def test_gather_state_codex_absent_under_custom_codex_home(tmp_path):
+    # $CODEX_HOME points at a root with NO session JSONL → absent (the bug:
+    # the old probe glob'd ~/.codex/sessions and could miss/misreport this).
+    custom = tmp_path / "custom-codex"
+    (custom / "sessions").mkdir(parents=True)
+    st = _run_gather(tmp_path, env_extra={"CODEX_HOME": str(custom)})
     assert st["codex_jsonl_present"] is False
 
 

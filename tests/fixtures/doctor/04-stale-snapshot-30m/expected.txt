@@ -25,7 +25,7 @@ Data
   ⚠ Latest snapshot          1800s ago
       → Recent but not current. Check Claude Code session is active.
   ✓ Claude cache             0 entries (no JSONL corpus)
-  ✓ Codex cache              none (no ~/.codex/sessions/)
+  ✓ Codex cache              none (no Codex session JSONL found)
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
 Safety

@@ -9914,11 +9914,16 @@ def doctor_gather_state(
     except Exception:
         pass
 
+    # Issue #109: probe every $CODEX_HOME session root (not the single
+    # hardcoded ~/.codex/sessions), matching the multi-root ingestion path
+    # from #108. _codex_session_roots() already applies the sessions/-subdir
+    # rule and filters to existing dirs, so a bare glob per root suffices.
     codex_jsonl_present = False
     try:
-        codex_dir = pathlib.Path.home() / ".codex" / "sessions"
-        if codex_dir.exists():
-            codex_jsonl_present = next(codex_dir.glob("**/*.jsonl"), None) is not None
+        for codex_dir in _codex_session_roots():
+            if next(codex_dir.glob("**/*.jsonl"), None) is not None:
+                codex_jsonl_present = True
+                break
     except Exception:
         pass
 

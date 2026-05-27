@@ -24,7 +24,7 @@ Database
 Data
   ✓ Latest snapshot          2s ago
   ✓ Claude cache             0 entries (no JSONL corpus)
-  ✓ Codex cache              none (no ~/.codex/sessions/)
+  ✓ Codex cache              none (no Codex session JSONL found)
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
 Safety

@@ -279,7 +279,7 @@
                     },
                     "id": "data.codex_cache",
                     "severity": "ok",
-                    "summary": "none (no ~/.codex/sessions/)",
+                    "summary": "none (no Codex session JSONL found)",
                     "title": "Codex cache"
                 },
                 {

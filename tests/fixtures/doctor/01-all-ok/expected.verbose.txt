@@ -56,7 +56,7 @@ Data
       details:
         entries: 0
         claude_jsonl_present: False
-  ✓ Codex cache              none (no ~/.codex/sessions/)
+  ✓ Codex cache              none (no Codex session JSONL found)
       details:
         entries: 0
         codex_jsonl_present: False
