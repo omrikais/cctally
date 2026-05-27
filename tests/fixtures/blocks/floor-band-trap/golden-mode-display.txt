@@ -1,3 +1,4 @@
+Using max tokens from previous sessions: 6,800
  ╭───────────────────────────────────────────────────╮
  │                                                   │
  │  Claude Code Token Usage Report - Session Blocks  │

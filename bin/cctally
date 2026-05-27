@@ -349,6 +349,8 @@ _group_entries_into_blocks = _lib_blocks._group_entries_into_blocks
 _aggregate_block = _lib_blocks._aggregate_block
 _build_activity_block = _lib_blocks._build_activity_block
 _blocks_to_json = _lib_blocks._blocks_to_json
+_max_completed_block_tokens = _lib_blocks._max_completed_block_tokens
+_parse_blocks_token_limit = _lib_blocks._parse_blocks_token_limit
 
 _lib_changelog = _load_sibling("_lib_changelog")
 # Backward-compat re-export: callers and tests reach the helper through
@@ -409,6 +411,7 @@ build_codex_session_view = _lib_view_models.build_codex_session_view
 _lib_render = _load_sibling("_lib_render")
 _CODEX_MONTHS = _lib_render._CODEX_MONTHS
 _render_blocks_table = _lib_render._render_blocks_table
+_render_active_block_box = _lib_render._render_active_block_box
 _daily_row_dict = _lib_render._daily_row_dict
 _bucket_totals_dict = _lib_render._bucket_totals_dict
 _bucket_to_json = _lib_render._bucket_to_json
@@ -4300,6 +4303,15 @@ def _load_recorded_five_hour_windows(
 
 def cmd_blocks(args: argparse.Namespace) -> int:
     """Show usage report grouped by 5-hour session blocks."""
+    # -n/--session-length guard (#86 Session F). The flag is a documented
+    # no-op (cctally blocks anchor to Anthropic's real 5h resets and are not
+    # re-sizable), but a non-positive value still errors for drop-in fidelity
+    # with ccusage's "Session length must be a positive number". Runs first,
+    # before any data load — matches ccusage's command-flow ordering.
+    if getattr(args, "session_length", 5.0) <= 0:
+        eprint("blocks: session length must be a positive number")
+        return 1
+
     config = _load_claude_config_for_args(args)
     _bridge_z_into_tz(args, config)
     tz = resolve_display_tz(args, config)
@@ -4399,16 +4411,60 @@ def cmd_blocks(args: argparse.Namespace) -> int:
     # 20:50→01:50 with $45 cost vs the real $128).
     _maybe_swap_active_block_to_canonical(blocks, all_entries, now=now_utc, mode=args.mode)
 
+    # ── Session F (#86): resolve token limit, then filter ────────────────
+    # Auto-max baseline over ALL blocks (before --recent/--active filtering),
+    # matching ccusage's maxTokensFromAll.
+    max_completed = _max_completed_block_tokens(blocks)
+    token_limit = _parse_blocks_token_limit(
+        getattr(args, "token_limit", None), max_completed
+    )
+    # ``token_limit_explicit`` is the resolved limit ONLY when -t was passed
+    # (any value incl. "max"); the implicit default leaves it None so the
+    # box's Token Limit Status sub-block + the JSON tokenLimitStatus key are
+    # omitted (ccusage `if (tokenLimit != null)` gate).
+    token_limit_explicit = (
+        token_limit if getattr(args, "token_limit", None) is not None else None
+    )
+    auto_max = getattr(args, "token_limit", None) in (None, "", "max")
+    if auto_max and token_limit and not args.json:
+        # ccusage parity: logger.info → stdout (Codex F1). Suppressed under
+        # --json (ccusage sets logger.level=0), so --json goldens stay stable.
+        print(f"Using max tokens from previous sessions: {_fmt_num(token_limit)}")
+
+    if getattr(args, "recent", False):
+        cutoff = now_utc - dt.timedelta(days=3)
+        blocks = [b for b in blocks if b.start_time >= cutoff or b.is_active]
+
+    if getattr(args, "active", False):
+        blocks = [b for b in blocks if b.is_active and not b.is_gap]
+        if not blocks:
+            if args.json:
+                print('{\n  "blocks": [],\n  "message": "No active block"\n}')
+            else:
+                print("No active session block found.")
+            return 0
+
     if args.json:
-        print(_blocks_to_json(blocks))
+        print(_blocks_to_json(blocks, token_limit_status_limit=token_limit_explicit))
+        return 0
+
+    if getattr(args, "active", False) and len(blocks) == 1:
+        print(_render_active_block_box(
+            blocks[0], now=now_utc, tz=tz,
+            token_limit_explicit=token_limit_explicit,
+            color=_supports_color_stdout(), unicode_ok=_supports_unicode_stdout(),
+        ))
         return 0
 
     # Table output. Session A (spec §7.6.1; Review-A P2-B): thread
     # --compact through so the renderer's scale-down branch fires
-    # regardless of terminal width when the flag is set.
+    # regardless of terminal width when the flag is set. Session F: thread
+    # the resolved token_limit so an explicit -t keys the %/REMAINING/
+    # PROJECTED surface (the default path passes the same auto-max the
+    # renderer computed internally, so it stays byte-identical).
     print(_render_blocks_table(
         blocks, breakdown=args.breakdown, now=now_utc, tz=tz,
-        compact=getattr(args, "compact", False),
+        compact=getattr(args, "compact", False), token_limit=token_limit,
     ))
     return 0
 
@@ -10689,6 +10745,29 @@ def _build_blocks_parser(subparsers, name, *, help_text, xref):
         "--tz", default=None, type=_argparse_tz, metavar="TZ",
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
+    )
+    p.add_argument(
+        "-a", "--active", action="store_true",
+        help="Show only the active block, with burn-rate + projection "
+             "(ccusage drop-in).",
+    )
+    p.add_argument(
+        "-r", "--recent", action="store_true",
+        help="Show only blocks from the last 3 days (plus the active block).",
+    )
+    p.add_argument(
+        "-t", "--token-limit", dest="token_limit", default=None,
+        metavar="N|max",
+        help="Token limit for the quota %% column / projection warnings. "
+             "An integer, or 'max' (default) to derive from the largest "
+             "completed block.",
+    )
+    p.add_argument(
+        "-n", "--session-length", dest="session_length", type=float,
+        default=5.0, metavar="N",
+        help="Accepted for ccusage drop-in compat; no-op — cctally blocks "
+             "follow Anthropic's real 5-hour resets and are not re-sizable. "
+             "A value <= 0 is rejected.",
     )
     _add_ccusage_alias_args(p, ansi_emit=False)
     _add_mode_arg(p)

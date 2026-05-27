@@ -36,6 +36,7 @@ import bisect
 import datetime as dt
 import json
 import pathlib
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any
@@ -432,7 +433,42 @@ def _build_activity_block(
     )
 
 
-def _blocks_to_json(blocks: list[Block]) -> str:
+def _max_completed_block_tokens(blocks: list["Block"]) -> int:
+    """Largest total_tokens among completed (non-gap, non-active) blocks.
+
+    The auto-derived token-limit baseline for the `%`/REMAINING/PROJECTED
+    surface — matches ccusage's `maxTokensFromAll` (computed over all blocks
+    before any --recent/--active filtering). Returns 0 when there is no
+    completed block with tokens.
+    """
+    best = 0
+    for b in blocks:
+        if not b.is_gap and not b.is_active and b.total_tokens > best:
+            best = b.total_tokens
+    return best
+
+
+def _parse_blocks_token_limit(
+    raw: "str | None", max_from_completed: int
+) -> "int | None":
+    """Resolve the `-t/--token-limit` value to an int limit or None.
+
+    Mirrors ccusage `parseTokenLimit`: `None`/`""`/`"max"` → the auto-derived
+    `max_from_completed` (or None when it is 0); otherwise replicate JS
+    `Number.parseInt(raw, 10)` — leading optional sign + run of digits, stop at
+    the first non-digit (`"123abc"`→123, `"12.5"`→12, `"abc"`/`""`→None). A
+    non-positive result still returns the int; the caller's `limit > 0` gate
+    suppresses the `%` column (same observable result as upstream).
+    """
+    if raw is None or raw in ("", "max"):
+        return max_from_completed if max_from_completed > 0 else None
+    m = re.match(r"\s*([+-]?\d+)", raw)
+    return int(m.group(1)) if m else None
+
+
+def _blocks_to_json(
+    blocks: list[Block], *, token_limit_status_limit: int | None = None
+) -> str:
     """Serialize blocks to JSON matching upstream ccusage's output structure."""
 
     def _iso_utc(ts: dt.datetime) -> str:
@@ -470,6 +506,22 @@ def _blocks_to_json(blocks: list[Block]) -> str:
             "burnRate": block.burn_rate,
             "projection": block.projection,
         })
+        if (token_limit_status_limit is not None
+                and token_limit_status_limit > 0
+                and not block.is_gap
+                and block.is_active and block.projection):
+            limit = token_limit_status_limit
+            proj_tokens = block.projection["totalTokens"]
+            pct = (proj_tokens / limit) * 100.0
+            status = ("exceeds" if proj_tokens > limit
+                      else "warning" if proj_tokens > limit * 0.8
+                      else "ok")
+            obj["tokenLimitStatus"] = {
+                "limit": limit,
+                "projectedUsage": proj_tokens,
+                "percentUsed": pct,
+                "status": status,
+            }
         result.append(obj)
 
     return json.dumps({"blocks": result}, indent=2)

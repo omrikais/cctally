@@ -225,6 +225,121 @@ def _scale_down_col_widths(
 # Optional dependency: zoneinfo.ZoneInfo is referenced only as a string
 # annotation in moved code; no runtime import needed.
 
+
+def _render_title_banner(title: str, *, unicode_ok: bool, color: bool) -> str:
+    """ccusage-style rounded title banner (the box around a report title).
+
+    Returns the multi-line banner WITHOUT a trailing blank line; callers add
+    spacing. Shared by `_render_blocks_table` and `_render_active_block_box`.
+    """
+    def _bold(s: str) -> str:
+        return _style_ansi(s, "1", color)
+    title_padded = f"  {title}  "
+    tw = len(title_padded)
+    dash = "─" if unicode_ok else "-"
+    vb = "│" if unicode_ok else "|"
+    if unicode_ok:
+        top = f" ╭{dash * tw}╮"
+        bot = f" ╰{dash * tw}╯"
+    else:
+        top = f" +{'-' * tw}+"
+        bot = f" +{'-' * tw}+"
+    return "\n".join([
+        top,
+        f" {vb}" + " " * tw + vb,
+        f" {vb}" + _bold(title_padded) + vb,
+        f" {vb}" + " " * tw + vb,
+        bot,
+    ])
+
+
+def _fmt_block_time_local(ts: dt.datetime, tz: "ZoneInfo | None") -> str:
+    """Block-start timestamp in display tz, ccusage `toLocaleString`-style."""
+    local = ts.astimezone(tz)
+    hour_12 = local.hour % 12 or 12
+    ampm = "a.m." if local.hour < 12 else "p.m."
+    return (
+        f"{local.year}-{local.month:02d}-{local.day:02d}, "
+        f"{hour_12}:{local.minute:02d}:{local.second:02d} {ampm}"
+    )
+
+
+def _fmt_block_duration_hm(total_seconds: float) -> str:
+    total_minutes = int(total_seconds / 60)
+    return f"{total_minutes // 60}h {total_minutes % 60:02d}m"
+
+
+def _render_active_block_box(
+    block: "Block",
+    *,
+    now: dt.datetime,
+    tz: "ZoneInfo | None",
+    token_limit_explicit: int | None,
+    color: bool,
+    unicode_ok: bool,
+) -> str:
+    """ccusage `-a` 'Current Session Block Status' box (#86 Session F).
+
+    Token Limit Status sub-block appears only when `-t` was explicitly passed
+    (`token_limit_explicit` not None and > 0). Heuristic-anchored active blocks
+    get a `~`-prefixed start + approximate-start legend (Codex F2).
+    """
+    def _b(s: str) -> str:
+        return _style_ansi(s, "1", color)
+
+    lines: list[str] = [
+        _render_title_banner("Current Session Block Status",
+                             unicode_ok=unicode_ok, color=color),
+    ]
+    started = _fmt_block_time_local(block.start_time, tz)
+    approx = block.anchor == "heuristic"
+    if approx:
+        started = f"~{started}"
+    elapsed = (now - block.start_time).total_seconds()
+    remaining = max((block.end_time - now).total_seconds(), 0)
+    lines.append(f"Block Started: {started} "
+                 f"({_fmt_block_duration_hm(elapsed)} ago)")
+    lines.append(f"Time Remaining: {_fmt_block_duration_hm(remaining)}")
+    if approx:
+        lines.append("~ = approximate start "
+                     "(no Anthropic 5h reset recorded for this window)")
+
+    lines += ["", _b("Current Usage:"),
+              f"  Input Tokens:     {_fmt_num(block.input_tokens)}",
+              f"  Output Tokens:    {_fmt_num(block.output_tokens)}",
+              f"  Total Cost:       ${block.cost_usd:.2f}"]
+
+    if block.burn_rate:
+        lines += ["", _b("Burn Rate:"),
+                  f"  Tokens/minute:    "
+                  f"{_fmt_num(int(block.burn_rate['tokensPerMinute']))}",
+                  f"  Cost/hour:        ${block.burn_rate['costPerHour']:.2f}"]
+
+    if block.projection:
+        proj = block.projection
+        lines += ["", _b("Projected Usage (if current rate continues):"),
+                  f"  Total Tokens:     {_fmt_num(proj['totalTokens'])}",
+                  f"  Total Cost:       ${proj['totalCost']:.2f}"]
+        if token_limit_explicit is not None and token_limit_explicit > 0:
+            limit = token_limit_explicit
+            current = block.total_tokens
+            remaining_tokens = max(limit - current, 0)
+            pct_used = (proj["totalTokens"] / limit) * 100.0
+            cur_pct = (current / limit) * 100.0
+            if pct_used > 100:
+                status = _style_ansi("EXCEEDS LIMIT", "31", color)
+            elif pct_used > 80:
+                status = _style_ansi("WARNING", "33", color)
+            else:
+                status = _style_ansi("OK", "32", color)
+            lines += ["", _b("Token Limit Status:"),
+                      f"  Limit:            {_fmt_num(limit)} tokens",
+                      f"  Current Usage:    {_fmt_num(current)} ({cur_pct:.1f}%)",
+                      f"  Remaining:        {_fmt_num(remaining_tokens)} tokens",
+                      f"  Projected Usage:  {pct_used:.1f}% {status}"]
+    return "\n".join(lines)
+
+
 def _render_blocks_table(
     blocks: list[Block],
     breakdown: bool = False,
@@ -232,6 +347,7 @@ def _render_blocks_table(
     now: dt.datetime | None = None,
     tz: "ZoneInfo | None" = None,
     compact: bool = False,
+    token_limit: int | None = None,
 ) -> str:
     """Render blocks as a ccusage-style ANSI table with box-drawing borders.
 
@@ -268,9 +384,6 @@ def _render_blocks_table(
     def _cyan(s: str) -> str:
         return _style_ansi(s, "36", color)
 
-    def _bold(s: str) -> str:
-        return _style_ansi(s, "1", color)
-
     def _green(s: str) -> str:
         return _style_ansi(s, "32", color)
 
@@ -283,21 +396,10 @@ def _render_blocks_table(
     # ── time formatting ─────────────────────────────────────────────────
 
     def _fmt_time_local(ts: dt.datetime) -> str:
-        local = ts.astimezone(tz)
-        hour_12 = local.hour % 12
-        if hour_12 == 0:
-            hour_12 = 12
-        ampm = "a.m." if local.hour < 12 else "p.m."
-        return (
-            f"{local.year}-{local.month:02d}-{local.day:02d}, "
-            f"{hour_12}:{local.minute:02d}:{local.second:02d} {ampm}"
-        )
+        return _fmt_block_time_local(ts, tz)
 
     def _fmt_duration_hm(total_seconds: float) -> str:
-        total_minutes = int(total_seconds / 60)
-        h = total_minutes // 60
-        m = total_minutes % 60
-        return f"{h}h {m:02d}m"
+        return _fmt_block_duration_hm(total_seconds)
 
     def _fmt_gap_duration(total_seconds: float) -> str:
         total_minutes = int(total_seconds / 60)
@@ -307,19 +409,23 @@ def _render_blocks_table(
         return f"{h}h {m:02d}m gap" if m else f"{h}h gap"
 
     # ── determine if % column is needed ─────────────────────────────────
-    max_completed_tokens = 0
-    for b in blocks:
-        if not b.is_gap and not b.is_active and b.total_tokens > 0:
-            if b.total_tokens > max_completed_tokens:
-                max_completed_tokens = b.total_tokens
-    token_limit = 0
+    max_completed_tokens = _lib_blocks._max_completed_block_tokens(blocks)
     active_block: Block | None = None
     for b in blocks:
         if b.is_active and not b.is_gap:
             active_block = b
-    show_pct = max_completed_tokens > 0
-    if show_pct:
-        token_limit = max_completed_tokens
+    # ``token_limit`` param (#86 Session F): when caller passes an explicit
+    # limit, honor it directly (forces the %/REMAINING/PROJECTED surface even
+    # with no completed history, suppressed only when <= 0). When None, fall
+    # back to the internal auto-max recompute so the renderer stays
+    # standalone-callable and the default ``cmd_blocks`` path (which passes the
+    # resolved auto-max) is byte-identical.
+    if token_limit is not None:
+        show_pct = token_limit > 0
+        eff_limit = token_limit if token_limit > 0 else 0
+    else:
+        show_pct = max_completed_tokens > 0
+        eff_limit = max_completed_tokens if show_pct else 0
 
     # ── column layout ───────────────────────────────────────────────────
     headers = ["Block Start", "Duration/\u2026", "Models", "Tokens"]
@@ -405,8 +511,8 @@ def _render_blocks_table(
                 short_models = [""]
 
             pct_str = ""
-            if show_pct and token_limit > 0:
-                pct_val = (block.total_tokens / token_limit) * 100.0
+            if show_pct and eff_limit > 0:
+                pct_val = (block.total_tokens / eff_limit) * 100.0
                 pct_str = f"{pct_val:.1f}%"
 
             tokens_str = _fmt_num(block.total_tokens)
@@ -436,11 +542,11 @@ def _render_blocks_table(
 
     # Footer rows (REMAINING, PROJECTED)
     footer_rows: list[tuple[list[list[str]], str]] = []
-    if show_pct and token_limit > 0:
+    if show_pct and eff_limit > 0:
         active_tokens = active_block.total_tokens if active_block else 0
-        remaining_tokens = max(token_limit - active_tokens, 0)
-        remaining_pct = (remaining_tokens / token_limit) * 100.0
-        rem_label = f"(assuming {_fmt_num(token_limit)} token limit)"
+        remaining_tokens = max(eff_limit - active_tokens, 0)
+        remaining_pct = (remaining_tokens / eff_limit) * 100.0
+        rem_label = f"(assuming {_fmt_num(eff_limit)} token limit)"
 
         rem_cells = _empty_cells()
         rem_cells[0] = rem_label
@@ -456,7 +562,7 @@ def _render_blocks_table(
             proj = active_block.projection
             proj_tokens = proj.get("totalTokens", 0)
             proj_pct = (
-                (proj_tokens / token_limit) * 100.0 if token_limit > 0 else 0
+                (proj_tokens / eff_limit) * 100.0 if eff_limit > 0 else 0
             )
             proj_cost = proj.get("totalCost", 0.0)
 
@@ -600,23 +706,8 @@ def _render_blocks_table(
 
     # Title banner
     title = "Claude Code Token Usage Report - Session Blocks"
-    title_padded = f"  {title}  "
-    tw = len(title_padded)
-    dash = "\u2500" if unicode_ok else "-"
-    vb = "\u2502" if unicode_ok else "|"
-    if unicode_ok:
-        banner_top = f" \u256d{dash * tw}\u256e"
-        banner_bot = f" \u2570{dash * tw}\u256f"
-    else:
-        banner_top = f" +{'-' * tw}+"
-        banner_bot = f" +{'-' * tw}+"
-
     lines: list[str] = []
-    lines.append(banner_top)
-    lines.append(f" {vb}" + " " * tw + vb)
-    lines.append(f" {vb}" + _bold(title_padded) + vb)
-    lines.append(f" {vb}" + " " * tw + vb)
-    lines.append(banner_bot)
+    lines.append(_render_title_banner(title, unicode_ok=unicode_ok, color=color))
     lines.append("")
 
     # Header
