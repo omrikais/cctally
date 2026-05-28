@@ -84,6 +84,24 @@ def test_additive_leaves_wrong_and_nonsymlink_alone(tmp_path, monkeypatch):
     assert (dst / "cctally-beta").read_text() == "hand-rolled\n"        # untouched
 
 
+def test_failed_when_source_missing(tmp_path, monkeypatch):
+    """A name whose bin/<name> source is absent surfaces in `failed` (not
+    `created`) — this is what makes cmd_repair_symlinks exit 1, the only
+    user-visible failure surface."""
+    s = _load_setup_module()
+    names = ("cctally", "cctally-ghost")  # the repo will lack the ghost's source
+    monkeypatch.setattr(s._cctally(), "SETUP_SYMLINK_NAMES", names, raising=False)
+    repo = _seed_repo(tmp_path, ("cctally",))  # only cctally has a source file
+    dst = tmp_path / "localbin"
+    dst.mkdir()
+    os.symlink(repo / "bin" / "cctally", dst / "cctally")  # existing install -> gate open
+    res = s._setup_repair_symlinks(repo, dst)
+    assert res.gated is False
+    assert res.created == []
+    assert [n for n, _ in res.failed] == ["cctally-ghost"]
+    assert "source not found" in res.failed[0][1]
+
+
 def _run_cli(args, *, home, extra_env=None):
     env = dict(os.environ)
     env["HOME"] = str(home)
