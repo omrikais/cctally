@@ -16,6 +16,20 @@ if (process.env.CCTALLY_NPM_POSTINSTALL_QUIET === '1') {
   process.exit(0);
 }
 
+// Best-effort symlink self-heal on upgrade (issue #114): additively
+// create ~/.local/bin/ symlinks for any new cctally-* subcommands so an
+// upgrade doesn't strand them until the user re-runs `cctally setup`.
+// MUST NOT fail the npm install — swallow every error, ignore exit code.
+try {
+  const { spawnSync } = require('child_process');
+  const path = require('path');
+  const python = process.env.CCTALLY_PYTHON || 'python3';
+  const scriptPath = path.join(__dirname, 'cctally');
+  spawnSync(python, [scriptPath, 'repair-symlinks'], { stdio: 'inherit' });
+} catch (_) {
+  // best-effort only
+}
+
 process.stdout.write(
   '\ncctally installed.\n' +
   '\nTo finish setup, run:\n' +

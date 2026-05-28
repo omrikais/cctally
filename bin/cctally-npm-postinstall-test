@@ -1,81 +1,72 @@
 #!/usr/bin/env bash
-# Fixture-based harness for bin/cctally-npm-postinstall.js.
+# Fixture-based harness for bin/cctally-npm-postinstall.js (issue #114).
 #
 # Each scenario lives at tests/fixtures/npm-postinstall/<name>/ with:
-#   golden-exit.txt               : single integer (required).
-#   golden-stdout-substr.txt      : substring assertion (required, may be empty).
-#   golden-stdout-not-substr.txt  : optional. If non-empty, stdout MUST NOT
-#                                   contain this substring.
-#   env.sh                        : optional. Sourced before the run; can set
-#                                   NPM_CONFIG_GLOBAL, QUIET.
-
+#   golden-exit.txt              : single integer (required).
+#   golden-stdout-substr.txt     : substring assertion (required, may be empty).
+#   golden-stdout-not-substr.txt : optional; stdout MUST NOT contain it.
+#   env.sh                       : optional; may set GLOBAL (npm_config_global),
+#                                  QUIET (CCTALLY_NPM_POSTINSTALL_QUIET),
+#                                  FAKE_PYTHON_EXIT, NO_PYTHON, BAD_CCTALLY_PYTHON.
+#
+# Scratch per scenario:
+#   bin/cctally-npm-postinstall.js : copy under test.
+#   bin/cctally                    : marker file (package-local script path).
+#   PATH/python3                   : fake python3 echoing argv (unless NO_PYTHON).
+#   CCTALLY_PYTHON is pointed at that fake python3 so the postinstall's
+#   `python <pkgdir>/bin/cctally repair-symlinks` call is observable.
 set -uo pipefail
-
-# Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-SCRIPT_PATH="$REPO_ROOT/bin/cctally-npm-postinstall.js"
+SCRIPT="$REPO_ROOT/bin/cctally-npm-postinstall.js"
 FIXTURES_DIR="$REPO_ROOT/tests/fixtures/npm-postinstall"
-
-if [ ! -f "$SCRIPT_PATH" ]; then
-    echo "FAIL: postinstall script not found: $SCRIPT_PATH" >&2
-    exit 1
-fi
-
 NODE_BIN=$(command -v node 2>/dev/null || true)
-if [ -z "$NODE_BIN" ]; then
-    echo "FAIL: node not found on PATH; install Node.js to run this harness" >&2
-    exit 1
-fi
+[ -z "$NODE_BIN" ] && { echo "FAIL: node not found on PATH" >&2; exit 1; }
 
 SCRATCH_DIR=$(mktemp -d -t cctally-npm-postinstall-XXXXXX)
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
-
-pass_count=0
-fail_count=0
+pass_count=0; fail_count=0
 
 shopt -s nullglob
-scenario_dirs=( "$FIXTURES_DIR"/*/ )
-shopt -u nullglob
-
-for dir in "${scenario_dirs[@]}"; do
+for dir in "$FIXTURES_DIR"/*/; do
     name=$(basename "$dir")
-    expected_exit=$(cat "$dir/golden-exit.txt" | tr -d '\n')
+    expected_exit=$(tr -d '\n' < "$dir/golden-exit.txt")
     expected_stdout=$(cat "$dir/golden-stdout-substr.txt")
     expected_not_stdout=""
-    if [ -f "$dir/golden-stdout-not-substr.txt" ]; then
-        expected_not_stdout=$(cat "$dir/golden-stdout-not-substr.txt")
-    fi
+    [ -f "$dir/golden-stdout-not-substr.txt" ] && expected_not_stdout=$(cat "$dir/golden-stdout-not-substr.txt")
 
-    work="$SCRATCH_DIR/$name"
-    mkdir -p "$work"
+    work="$SCRATCH_DIR/$name"; mkdir -p "$work/bin" "$work/PATH"
+    cp "$SCRIPT" "$work/bin/cctally-npm-postinstall.js"
+    : > "$work/bin/cctally"
 
-    NPM_CONFIG_GLOBAL=""
-    QUIET=""
-    if [ -f "$dir/env.sh" ]; then
-        # shellcheck disable=SC1090
-        . "$dir/env.sh"
+    GLOBAL=1; QUIET=0; FAKE_PYTHON_EXIT=0; NO_PYTHON=0; BAD_CCTALLY_PYTHON=0
+    [ -f "$dir/env.sh" ] && . "$dir/env.sh"
+
+    cctally_python=""
+    if [ "$NO_PYTHON" != "1" ] && [ "$BAD_CCTALLY_PYTHON" != "1" ]; then
+        cat > "$work/PATH/python3" <<EOF
+#!/usr/bin/env bash
+echo "fake-python: \$@"
+exit $FAKE_PYTHON_EXIT
+EOF
+        chmod +x "$work/PATH/python3"
+        cctally_python="$work/PATH/python3"
     fi
+    [ "$BAD_CCTALLY_PYTHON" = "1" ] && cctally_python="$work/PATH/does-not-exist"
 
     stdout_file="$work/_stdout.txt"
-    stderr_file="$work/_stderr.txt"
-    env -i \
-        HOME="$HOME" \
-        PATH="/usr/bin:/bin" \
-        ${NPM_CONFIG_GLOBAL:+npm_config_global="$NPM_CONFIG_GLOBAL"} \
-        ${QUIET:+CCTALLY_NPM_POSTINSTALL_QUIET="$QUIET"} \
-        "$NODE_BIN" "$SCRIPT_PATH" \
-        > "$stdout_file" 2> "$stderr_file"
+    env -i HOME="$HOME" PATH="/usr/bin:/bin" \
+        ${GLOBAL:+npm_config_global="$([ "$GLOBAL" = 1 ] && echo true || echo false)"} \
+        ${QUIET:+CCTALLY_NPM_POSTINSTALL_QUIET="$([ "$QUIET" = 1 ] && echo 1 || echo 0)"} \
+        ${cctally_python:+CCTALLY_PYTHON="$cctally_python"} \
+        "$NODE_BIN" "$work/bin/cctally-npm-postinstall.js" \
+        > "$stdout_file" 2>&1
     actual_exit=$?
-
     actual_stdout=$(cat "$stdout_file")
 
-    fail=0
-    msg=""
-    if [ "$actual_exit" != "$expected_exit" ]; then
-        fail=1; msg="exit ${actual_exit} != ${expected_exit}"
-    fi
+    fail=0; msg=""
+    [ "$actual_exit" != "$expected_exit" ] && { fail=1; msg="exit ${actual_exit} != ${expected_exit}"; }
     if [ -n "$expected_stdout" ] && ! grep -qF "$expected_stdout" <<<"$actual_stdout"; then
         fail=1; msg="${msg:+$msg; }stdout missing '$expected_stdout'"
     fi
@@ -84,14 +75,11 @@ for dir in "${scenario_dirs[@]}"; do
     fi
 
     if [ "$fail" = "1" ]; then
-        echo "FAIL [$name]: $msg"
-        echo "  stdout:"; sed 's/^/    /' "$stdout_file"
-        echo "  stderr:"; sed 's/^/    /' "$stderr_file"
-        fail_count=$((fail_count + 1))
+        echo "FAIL [$name]: $msg"; sed 's/^/    /' "$stdout_file"; fail_count=$((fail_count+1))
     else
-        pass_count=$((pass_count + 1))
+        pass_count=$((pass_count+1))
     fi
 done
-
+shopt -u nullglob
 printf 'passed: %d   failed: %d\n' "$pass_count" "$fail_count"
 [ "$fail_count" = "0" ]
