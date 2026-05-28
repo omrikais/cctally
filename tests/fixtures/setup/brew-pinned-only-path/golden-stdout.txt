@@ -1,0 +1,21 @@
+✓ Detected Claude Code at /FAKE/.claude
+✓ Brew install detected — commands are on PATH via /FAKE/opt/homebrew/bin/; skipping ~/.local/bin/ symlinks
+⚠ cctally is reachable only via a legacy ~/.local/bin link. Put /FAKE/opt/homebrew/bin on your PATH (eval "$(brew shellenv)"), then re-run cctally setup to clean it.
+✓ Wrote 3 hook entries to /FAKE/.claude/settings.json
+⚠ No Claude OAuth token detected.
+  Run `claude` once to authenticate. After that, the next assistant
+  message in any Claude Code session will start collecting data
+  automatically — no need to re-run `cctally setup`.
+✓ Synced session cache (N new entries)
+
+cctally is ready (with 2 warning(s) above).
+
+⚠ Restart Claude Code for the new hooks to take effect in any currently
+  open sessions. New sessions launched after this point pick them up
+  automatically. (settings.json is cached at session start.)
+
+  Try:
+    cctally daily              # last 30 days
+    cctally dashboard          # live web dashboard
+    cctally tui                # terminal dashboard
+    cctally setup --status     # verify install state

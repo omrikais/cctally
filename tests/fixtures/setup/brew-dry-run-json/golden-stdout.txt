@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "mode": "dry-run",
+  "symlinks": {
+    "skipped": true,
+    "reason": "brew",
+    "would_create": 0,
+    "already": 0,
+    "blocked": [],
+    "destination": "/FAKE/.local/bin",
+    "total": 0,
+    "would_remove_stale": []
+  },
+  "hooks": {
+    "would_add": [
+      {
+        "event": "PostToolBatch",
+        "matcher": "*",
+        "command": "/FAKE/opt/homebrew/bin/cctally hook-tick"
+      },
+      {
+        "event": "Stop",
+        "matcher": "",
+        "command": "/FAKE/opt/homebrew/bin/cctally hook-tick"
+      },
+      {
+        "event": "SubagentStop",
+        "matcher": "",
+        "command": "/FAKE/opt/homebrew/bin/cctally hook-tick"
+      }
+    ],
+    "settings_path": "/FAKE/.claude/settings.json"
+  },
+  "legacy": {
+    "statusline_snippet": null,
+    "bespoke_hooks": {
+      "detected": false,
+      "settings_entries": [],
+      "files": []
+    }
+  },
+  "migration_preview": {
+    "detected": false,
+    "decision": "not_detected",
+    "would_remove_entries": [],
+    "would_move_files": []
+  },
+  "exit_code": 0
+}

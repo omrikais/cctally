@@ -1,0 +1,1 @@
+cctally -> /FAKE/opt/homebrew/Cellar/cctally/1.21.0/libexec/bin/cctally

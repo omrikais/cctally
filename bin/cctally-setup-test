@@ -20,6 +20,27 @@
 # Per-scenario input.env knobs (all optional):
 #   INCLUDE_LOCAL_BIN=1   prepend $fake/.local/bin to PATH (so
 #                         _setup_path_includes_local_bin returns True)
+#   INCLUDE_BREW_PREFIX_BIN=1
+#                         prepend $fake/opt/homebrew/bin to PATH (issue #119).
+#                         Brew scenarios put the formula's stable
+#                         <prefix>/bin on PATH so `_reachable_elsewhere`
+#                         (shutil.which over PATH minus ~/.local/bin)
+#                         resolves deterministically. A scenario that wants
+#                         the pinned-only-path case (<prefix>/bin OFF PATH)
+#                         simply leaves this unset.
+#
+# Brew keg layout (issue #119): a brew install must run a REAL COPY of the
+# binary from a fake Homebrew keg — `_setup_resolve_repo_root()` calls
+# `Path(__file__).resolve()`, so a symlink would resolve back to the live
+# source checkout and brew detection (`/Cellar/cctally/` in repo_root)
+# would never fire. The existing `presetup.sh` + repo-scratch + launcher
+# swap path is the extension point: a presetup.sh reshapes the scratch
+# `bin/` copy into `$fake/opt/homebrew/Cellar/cctally/<ver>/libexec/bin/`
+# and writes the keg's `cctally` path to a `$REPO_SCRATCH/.harness-launcher`
+# sentinel that this harness honors (overriding the default launcher). The
+# scenario also drops the formula's stable `<prefix>/bin/cctally` symlink so
+# the brew hook target resolves to a fixture-stable path. Goldens normalize
+# `$fake` (and its `/private/var` realpath form on macOS) to /FAKE.
 
 set -uo pipefail
 
@@ -96,6 +117,7 @@ STUB
 
     # Per-scenario knobs.
     local INCLUDE_LOCAL_BIN=""
+    local INCLUDE_BREW_PREFIX_BIN=""
     if [ -f "$dir/input.env" ]; then
         # shellcheck disable=SC1091
         . "$dir/input.env"
@@ -103,6 +125,13 @@ STUB
     local path_pre=""
     if [ "$INCLUDE_LOCAL_BIN" = "1" ]; then
         path_pre="$fake/.local/bin:"
+    fi
+    # Issue #119: a brew scenario opts in to the formula's stable
+    # <prefix>/bin on PATH so `_reachable_elsewhere` resolves the keg copy
+    # deterministically. Leaving this unset models the pathological
+    # pinned-only-path box (<prefix>/bin off PATH).
+    if [ "$INCLUDE_BREW_PREFIX_BIN" = "1" ]; then
+        path_pre="${path_pre}$fake/opt/homebrew/bin:"
     fi
 
     # Template-expand /REPO -> actual REPO_ROOT in any copied input
@@ -147,8 +176,16 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
         # the scratch must be a self-sufficient checkout for `bin/cctally`
         # to run, and bash wrappers / shim file need their exec bit.
         cp -R "$REPO_ROOT/bin/." "$repo_scratch/bin/"
-        REPO_SCRATCH="$repo_scratch" bash "$dir/presetup.sh"
+        REPO_SCRATCH="$repo_scratch" FAKE_HOME="$fake" bash "$dir/presetup.sh"
         launcher="$repo_scratch/bin/cctally"
+        # Issue #119 (brew): a presetup.sh that reshapes the scratch into a
+        # Homebrew keg writes the keg's `cctally` path to this sentinel so
+        # the launcher resolves (`__file__.resolve()`) INTO the keg, firing
+        # brew detection. Absent sentinel = default repo-scratch launcher
+        # (every pre-#119 presetup scenario unchanged).
+        if [ -f "$repo_scratch/.harness-launcher" ]; then
+            launcher="$(cat "$repo_scratch/.harness-launcher")"
+        fi
         # `_setup_resolve_repo_root` calls `pathlib.Path(__file__).resolve()`;
         # on macOS that resolves `/var/folders/...` to `/private/var/...`.
         # Use the realpath form for sed substitution so symlink targets
@@ -205,11 +242,24 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
     if [ -n "$repo_scratch" ]; then
         scratch_sed="-e s|$repo_scratch|/REPO|g"
     fi
+    # Issue #119 (brew): the brew hook target is derived from the
+    # `.resolve()`d keg repo_root, so on macOS it carries the `/private/var`
+    # realpath form of $fake (e.g. the stable <prefix>/bin/cctally hook
+    # command). Substitute the realpath form FIRST — it is a superstring of
+    # the bare $fake (`/private/var/...` contains `/var/...`), so the
+    # `$fake → /FAKE` rule must not run before it. Harmless no-op when
+    # $fake_real == $fake (host without /private symlink).
+    local fake_real; fake_real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$fake")
+    local fake_real_sed=""
+    if [ "$fake_real" != "$fake" ]; then
+        fake_real_sed="-e s|$fake_real|/FAKE|g"
+    fi
     local norm
     norm=$(printf '%s' "$out" \
         | grep -v '^\[cache\] migrated' \
         | sed -E \
             $scratch_sed \
+            $fake_real_sed \
             -e "s|$fake|/FAKE|g" \
             -e "s|$REPO_ROOT|/REPO|g" \
             -e 's/\(([0-9]+) newly created\)/(N newly created)/g' \
@@ -250,11 +300,18 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
     if [ -f "$dir/golden-settings.json" ]; then
         if [ -f "$fake/.claude/settings.json" ]; then
             local actual_settings
-            if [ -n "$repo_scratch" ]; then
-                actual_settings=$(sed -E -e "s|$repo_scratch|/REPO|g" -e "s|$REPO_ROOT|/REPO|g" -e 's|cctally-legacy-hook-backup-[0-9]{8}-[0-9]{6}|cctally-legacy-hook-backup-TIMESTAMP|g' "$fake/.claude/settings.json")
-            else
-                actual_settings=$(sed -E -e "s|$REPO_ROOT|/REPO|g" -e 's|cctally-legacy-hook-backup-[0-9]{8}-[0-9]{6}|cctally-legacy-hook-backup-TIMESTAMP|g' "$fake/.claude/settings.json")
-            fi
+            # Issue #119 (brew): the recorded hook command is the stable
+            # <prefix>/bin/cctally, derived from the .resolve()d keg root, so
+            # it carries the /private/var realpath form of $fake on macOS.
+            # Normalize $fake_real FIRST (superstring of bare $fake), then the
+            # bare $fake, alongside the existing repo/REPO substitutions.
+            actual_settings=$(sed -E \
+                $scratch_sed \
+                $fake_real_sed \
+                -e "s|$fake|/FAKE|g" \
+                -e "s|$REPO_ROOT|/REPO|g" \
+                -e 's|cctally-legacy-hook-backup-[0-9]{8}-[0-9]{6}|cctally-legacy-hook-backup-TIMESTAMP|g' \
+                "$fake/.claude/settings.json")
             # golden-settings.json ends in \n; _golden_diff_str materializes
             # the actual via `printf '%s\n'`, matching the old comparison.
             _golden_diff_str "settings.json" "$dir/golden-settings.json" "$actual_settings" 50 || fail_local=1
@@ -267,11 +324,14 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
     if [ -f "$dir/golden-symlinks.txt" ]; then
         local listing; listing=$(list_local_bin "$fake/.local/bin")
         local norm_listing
-        if [ -n "$repo_scratch" ]; then
-            norm_listing=$(printf '%s' "$listing" | sed -E -e "s|$repo_scratch|/REPO|g" -e "s|$REPO_ROOT|/REPO|g")
-        else
-            norm_listing=$(printf '%s' "$listing" | sed -E "s|$REPO_ROOT|/REPO|g")
-        fi
+        # $fake_real/$fake normalization (issue #119): a pinned-only-path
+        # brew fixture seeds a ~/.local/bin/cctally link whose target is the
+        # keg under $fake; normalize it like the stdout/settings paths.
+        norm_listing=$(printf '%s' "$listing" | sed -E \
+            $scratch_sed \
+            $fake_real_sed \
+            -e "s|$fake|/FAKE|g" \
+            -e "s|$REPO_ROOT|/REPO|g")
         # golden-symlinks.txt ends in \n; _golden_diff_str materializes the
         # actual via `printf '%s\n'`, matching the old comparison.
         _golden_diff_str "symlinks" "$dir/golden-symlinks.txt" "$norm_listing" 50 || fail_local=1

@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "mode": "install",
+  "result": "warn",
+  "symlinks": {
+    "created": 0,
+    "already": 0,
+    "replaced": 0,
+    "total": 0,
+    "destination": "/FAKE/.local/bin",
+    "skipped": true,
+    "reason": "brew",
+    "stale_removed": []
+  },
+  "hooks": {
+    "events_added": [
+      "PostToolBatch",
+      "Stop",
+      "SubagentStop"
+    ],
+    "settings_path": "/FAKE/.claude/settings.json"
+  },
+  "auth": {
+    "oauth_token_present": false
+  },
+  "path_includes_local_bin": false,
+  "legacy": {
+    "statusline_snippet_path": null,
+    "bespoke_hooks": {
+      "detected": false,
+      "settings_entries": [],
+      "files": []
+    }
+  },
+  "migration": {
+    "performed": false,
+    "reason": "not_detected"
+  },
+  "bootstrap": {
+    "session_cache_rows": 0,
+    "oauth_status": null
+  },
+  "warnings_count": 1,
+  "exit_code": 0
+}

@@ -33,6 +33,13 @@ SCENARIOS = {
     "12-corrupt-config-json":    "corrupt_config_json",
     "13-corrupt-update-suppress": "corrupt_update_suppress",
     "14-legacy-snippet-in-comment-ignored": "legacy_snippet_in_comment",
+    # Issue #119: brew ~/.local/bin policy + availability-aware install
+    # checks. These rely on the harness's per-scenario input.env PATH knobs
+    # (DOCTOR_INCLUDE_PREFIX_BIN / DOCTOR_OMIT_LOCAL_BIN_FROM_PATH); see
+    # bin/cctally-doctor-test::compute_fake_path.
+    "15-brew-stale-links":       "brew_stale_links",
+    "16-path-ok-local-bin-off":  "path_ok_local_bin_off",
+    "17-brew-pinned-only-path":  "brew_pinned_only_path",
 }
 
 
@@ -274,7 +281,101 @@ def _scenario_body(slug: str) -> str:
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
                 "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
             """)
+    # ── Issue #119 brew scenarios ─────────────────────────────────────
+    # A faithful Homebrew install symlinks every USER_FACING_BIN into
+    # <prefix>/bin (cctally.rb.template: `bin.install_symlink`). The
+    # _setup_symlink_is_retired predicate keys off the symlink TARGET
+    # containing `/Cellar/cctally/`, NOT off repo_root — so doctor fixtures
+    # only need a ~/.local/bin link whose target carries that token, plus a
+    # <prefix>/bin on PATH (via input.env) for reachability. No keg COPY is
+    # required (unlike the setup harness): doctor runs the dev binary.
+    if slug == "brew_stale_links":
+        # spec §5.3 b: dangling AND live Cellar ~/.local/bin links → the
+        # `stale` symlink state. <prefix>/bin (all 13 cmds) on PATH makes
+        # every command reachable elsewhere, so the leftover keg links are
+        # cleanable cruft (`stale`), not broken (`wrong`). Expect:
+        # "13/13 available; 2 stale link(s) to clean" (cctally + cctally-tui).
+        return textwrap.dedent("""\
+            # Faithful brew: <prefix>/bin holds all USER_FACING_BINS.
+            # Reachability source for the empty ~/.local/bin slots → `ok`.
+            mkdir -p "$HARNESS_FAKE_HOME/opt/homebrew/bin"
+            for name in cctally cctally-alerts cctally-dashboard \\
+                       cctally-dollar-per-percent cctally-five-hour-blocks \\
+                       cctally-five-hour-breakdown cctally-forecast cctally-project \\
+                       cctally-refresh-usage cctally-statusline cctally-sync-week \\
+                       cctally-tui cctally-update; do
+                ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/opt/homebrew/bin/$name"
+            done
+            # A LIVE old-keg file + a ~/.local/bin link pointing at it (the
+            # dangerous shadow case): target exists AND carries /Cellar/cctally/.
+            KEG="$HARNESS_FAKE_HOME/opt/homebrew/Cellar/cctally/1.20.0/libexec/bin"
+            mkdir -p "$KEG"
+            cp "$REPO_ROOT/bin/cctally" "$KEG/cctally"
+            ln -sf "$KEG/cctally" "$HARNESS_FAKE_HOME/.local/bin/cctally"
+            # A DANGLING keg link (older keg already `brew cleanup`-ed away):
+            # target does not exist → retired via the dangling branch.
+            ln -sf "$HARNESS_FAKE_HOME/opt/homebrew/Cellar/cctally/1.19.0/libexec/bin/cctally-tui" \\
+                "$HARNESS_FAKE_HOME/.local/bin/cctally-tui"
+            write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
+            write_oauth_credentials
+            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
+                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
+            """)
+    if slug == "path_ok_local_bin_off":
+        # spec §5.3 c: install.path OK when cctally is reachable on PATH but
+        # ~/.local/bin is OFF PATH (DOCTOR_OMIT_LOCAL_BIN_FROM_PATH=1 +
+        # DOCTOR_INCLUDE_PREFIX_BIN=1). cctally lives on <prefix>/bin only;
+        # path_includes_local_bin is False yet cctally_reachable_on_path is
+        # True → install.path passes ("cctally reachable on $PATH"). All 13
+        # cmds on <prefix>/bin so install.symlinks is a clean "13/13 available"
+        # (empty ~/.local/bin slots reachable-elsewhere → ok).
+        return textwrap.dedent("""\
+            mkdir -p "$HARNESS_FAKE_HOME/opt/homebrew/bin"
+            for name in cctally cctally-alerts cctally-dashboard \\
+                       cctally-dollar-per-percent cctally-five-hour-blocks \\
+                       cctally-five-hour-breakdown cctally-forecast cctally-project \\
+                       cctally-refresh-usage cctally-statusline cctally-sync-week \\
+                       cctally-tui cctally-update; do
+                ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/opt/homebrew/bin/$name"
+            done
+            write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
+            write_oauth_credentials
+            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
+                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
+            """)
+    if slug == "brew_pinned_only_path":
+        # spec §5.3 g (doctor half): the ONLY path to cctally is a LIVE
+        # Cellar ~/.local/bin link; <prefix>/bin is OFF the scrubbed PATH
+        # (input.env has NEITHER knob set → default PATH keeps ~/.local/bin
+        # but no <prefix>/bin). _reachable_elsewhere(cctally) is False, so the
+        # slot classes `wrong` and symlinks_path_pinned is True → doctor emits
+        # the PATH-fix remediation (NOT the generic "Run `cctally setup`").
+        # The keg file MUST exist (a dangling link would also be `wrong` but
+        # would NOT set symlinks_path_pinned, which requires a LIVE retired
+        # link). The 12 other slots are empty + not-reachable → `missing`.
+        return textwrap.dedent("""\
+            KEG="$HARNESS_FAKE_HOME/opt/homebrew/Cellar/cctally/1.20.0/libexec/bin"
+            mkdir -p "$KEG"
+            cp "$REPO_ROOT/bin/cctally" "$KEG/cctally"
+            ln -sf "$KEG/cctally" "$HARNESS_FAKE_HOME/.local/bin/cctally"
+            write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
+            write_oauth_credentials
+            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
+                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
+            """)
     raise SystemExit(f"unknown scenario slug: {slug}")
+
+
+# Per-scenario PATH-shape knobs for the harness (issue #119). Mirrors the
+# setup harness's input.env convention. Only scenarios needing a non-default
+# PATH appear here; absent → default scrubbed PATH.
+INPUT_ENV = {
+    "15-brew-stale-links":      "DOCTOR_INCLUDE_PREFIX_BIN=1\n",
+    "16-path-ok-local-bin-off": ("DOCTOR_INCLUDE_PREFIX_BIN=1\n"
+                                 "DOCTOR_OMIT_LOCAL_BIN_FROM_PATH=1\n"),
+    # 17-brew-pinned-only-path: NO knobs — ~/.local/bin on PATH (default),
+    # <prefix>/bin OFF PATH, so the keg link is the only reachable copy.
+}
 
 
 def _gitignore() -> str:
@@ -318,6 +419,14 @@ def main():
         (d / "setup.sh").write_text(_common_setup_preamble() + _scenario_body(slug))
         (d / "setup.sh").chmod(0o755)
         (d / ".gitignore").write_text(_gitignore())
+        # Issue #119: emit the per-scenario PATH-shape knobs the harness
+        # reads (compute_fake_path). Idempotent — overwrite or remove so a
+        # rename never strands a stale input.env.
+        env_path = d / "input.env"
+        if dir_name in INPUT_ENV:
+            env_path.write_text(INPUT_ENV[dir_name])
+        elif env_path.exists():
+            env_path.unlink()
     print(f"Scaffolded {len(SCENARIOS)} scenarios under {ROOT}")
 
 

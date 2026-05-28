@@ -1,0 +1,9 @@
+Brew install — would skip ~/.local/bin/ symlinks (commands on PATH via /FAKE/opt/homebrew/bin/)
+Would add 3 hook entries to /FAKE/.claude/settings.json:
+  hooks.PostToolBatch[*] += { matcher: "*", command: "/FAKE/opt/homebrew/bin/cctally hook-tick" }
+  hooks.Stop[*] += { matcher: "", command: "/FAKE/opt/homebrew/bin/cctally hook-tick" }
+  hooks.SubagentStop[*] += { matcher: "", command: "/FAKE/opt/homebrew/bin/cctally hook-tick" }
+Would not modify ~/.claude/statusline-command.sh
+Would not delete any data
+
+Re-run without --dry-run to apply.

@@ -61,6 +61,37 @@ PY_CLEAN_BIN="$SCRATCH_ROOT/.py-clean-bin"
 mkdir -p "$PY_CLEAN_BIN"
 ln -sf "$(command -v python3)" "$PY_CLEAN_BIN/python3"
 
+# Per-scenario PATH shape (issue #119). Default scrubbed PATH puts
+# $scratch/.local/bin first (so install.path passes) + $PY_CLEAN_BIN
+# (python3 only). The brew scenarios need to vary which channels are on
+# PATH so the availability-aware install.path / symlinks `stale` / pinned
+# checks resolve deterministically. Two optional knobs in a scenario's
+# `input.env` (sourced in a subshell so they can't leak across scenarios):
+#   DOCTOR_INCLUDE_PREFIX_BIN=1       prepend $scratch/opt/homebrew/bin
+#                                     (a faithful brew <prefix>/bin); makes
+#                                     `cctally` reachable off ~/.local/bin so
+#                                     leftover keg links class as `stale`.
+#   DOCTOR_OMIT_LOCAL_BIN_FROM_PATH=1 drop $scratch/.local/bin from PATH
+#                                     (cctally reachable, ~/.local/bin off
+#                                     PATH — the install.path-OK case).
+# Absent input.env = unchanged default PATH for every pre-#119 scenario.
+compute_fake_path () {
+    local scratch="$1" dir="$2"
+    local include_prefix_bin="" omit_local_bin=""
+    if [ -f "$dir/input.env" ]; then
+        # shellcheck disable=SC1091
+        . "$dir/input.env"
+        include_prefix_bin="${DOCTOR_INCLUDE_PREFIX_BIN:-}"
+        omit_local_bin="${DOCTOR_OMIT_LOCAL_BIN_FROM_PATH:-}"
+    fi
+    local p=""
+    [ "$include_prefix_bin" = "1" ] && p="$scratch/opt/homebrew/bin:"
+    if [ "$omit_local_bin" != "1" ]; then
+        p="${p}$scratch/.local/bin:"
+    fi
+    printf '%s' "${p}$PY_CLEAN_BIN:/usr/bin:/bin"
+}
+
 # Refresh setup.sh + .gitignore from the builder so harness output
 # reflects current scaffold (parallels build-forecast-fixtures.py
 # invocation in cctally-forecast-test).
@@ -107,7 +138,8 @@ run_mode () {
     # scenarios to "ok". $PY_CLEAN_BIN holds only a python3 symlink so the
     # CLI still runs without leaking any cctally* binary onto PATH; /usr/bin
     # keeps security/osascript reachable for the OAuth/alert checks.
-    local fake_path="$scratch/.local/bin:$PY_CLEAN_BIN:/usr/bin:/bin"
+    # Per-scenario shaping (issue #119) via optional input.env knobs.
+    local fake_path; fake_path=$(compute_fake_path "$scratch" "$dir")
 
     # Capture stdout only. The post-command hook (which fires AFTER
     # cmd_doctor returns) calls load_config(); for the corrupt-config
@@ -174,7 +206,8 @@ run_exit_code () {
         return 1
     }
     # Scrubbed PATH (issue #114): see run_mode for rationale.
-    local fake_path="$scratch/.local/bin:$PY_CLEAN_BIN:/usr/bin:/bin"
+    # Per-scenario shaping (issue #119) via optional input.env knobs.
+    local fake_path; fake_path=$(compute_fake_path "$scratch" "$dir")
     local exit_file="$dir/expected.exit"
     local actual_exit
 
