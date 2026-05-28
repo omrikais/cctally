@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-05-28
+
 ### Added
 - **Claude Opus 4.8 pricing.** `claude-opus-4-8` is now in the embedded `CLAUDE_MODEL_PRICING` table at the standard Opus 4.x rates ($5/MTok input · $6.25/MTok 5-minute cache write · $0.50/MTok cache read · $25/MTok output — identical to Opus 4.5/4.6/4.7), so every cost-computing command (`daily`, `weekly`, `session`, `blocks`, `report`, …) prices Opus 4.8 sessions correctly instead of warning "unknown model, treating cost as $0". The 1M-context variant `claude-opus-4-8[1m]` is added to `CLAUDE_MODEL_CONTEXT_WINDOWS` so `cctally statusline`'s 🧠 context-% segment measures against the real 1,000,000-token window rather than silently falling through to the 200K "opus" family default. Only the bare model id is added (matching how Opus 4.6/4.7 appear in real session JSONL); no dated `claude-opus-4-8-YYYYMMDD` twin is included since Anthropic's published id for this model is the bare alias.
 
