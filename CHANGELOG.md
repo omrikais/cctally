@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.20.1] - 2026-05-28
+
 ### Fixed
 - **`cctally statusline` now computes the `today` segment over your *local* calendar day, matching every other reporting command (`daily`, `monthly`, `weekly`, …).** Previously the statusline hardcoded the bottom rung of its `display.tz` precedence ladder to `"UTC"` when neither `--timezone` nor `display.tz` was set in config, while every sibling command defaulted to `"local"`. For any UTC-offset user (i.e. nearly everyone) this meant the statusline's `today` cost dropped any entries that fell in the post-local-midnight / pre-UTC-midnight band — typically several dollars at the start of each local day — and the statusline silently disagreed with `cctally daily --since today --until today`. The fix matches the default that every other command already uses; users who had explicitly set `display.tz = "UTC"` see no behavior change. (#86 G follow-up)
 
