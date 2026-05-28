@@ -271,6 +271,73 @@ def build_extensions_hwm_clamp(out: pathlib.Path) -> None:
     conn.close()
 
 
+def build_extensions_hwm_7d_post_reset(out: pathlib.Path) -> None:
+    """Reset-aware 7d HWM clamp (regression for the post-reset stale-clamp).
+
+    Anthropic mid-week reset / in-place credit leaves the pre-reset peak
+    snapshots in the SAME `week_start_date` bucket (the boundary the
+    snapshots carry does not change). The 7d HWM clamp must NOT pull the
+    post-reset percent up to that stale peak — it has to floor the MAX to
+    snapshots captured at/after the latest reset effective within the
+    window (mirroring the CLI/dashboard `_apply_reset_events_to_subweeks`
+    segmentation). 5h is immune (a 5h reset mints a new window key).
+
+    Seed two snapshots in week_start_date=2026-05-28 (week ends at
+    SEVEN_D_RESETS_EPOCH = 2026-06-04T02:00:00Z):
+      - pre-reset peak  weekly_percent=41.0  captured 09:00Z (before reset)
+      - post-reset      weekly_percent= 2.0  captured 11:00Z (after  reset)
+    plus a week_reset_events row with effective_reset_at_utc=10:00Z (inside
+    the window). Stdin carries seven_day 2.0 / five_hour 8.0. A naive
+    bucket-wide MAX would clamp 7d up to 41%; the reset-aware clamp keeps
+    it at 2%. Five-hour clamp resolves to 8% (single window key).
+    """
+    fix = out / "extensions-hwm-7d-post-reset" / "seeds"
+    fix.mkdir(parents=True, exist_ok=True)
+    db = fix / "stats.db"
+    conn = _open_stats_db(db)
+    canonical_5h = (FIVE_H_RESETS_EPOCH // 600) * 600
+    common = dict(
+        week_start_date="2026-05-28",
+        week_end_date="2026-06-04",
+        week_start_at="2026-05-28T02:00:00Z",
+        week_end_at="2026-06-04T02:00:00Z",
+        five_hour_percent=8.0,
+        five_hour_resets_at="2026-05-28T15:22:00Z",
+        five_hour_window_key=canonical_5h,
+        source="statusline-fixture",
+    )
+    # Pre-reset peak — captured BEFORE the effective reset moment.
+    fb.seed_weekly_usage_snapshot(
+        conn,
+        captured_at_utc="2026-05-28T09:00:00Z",
+        weekly_percent=41.0,
+        **common,
+    )
+    # Post-reset value — captured AFTER the effective reset moment.
+    fb.seed_weekly_usage_snapshot(
+        conn,
+        captured_at_utc="2026-05-28T11:00:00Z",
+        weekly_percent=2.0,
+        **common,
+    )
+    # Reset event: effective moment sits inside the current window
+    # [2026-05-28T02:00:00Z, 2026-06-04T02:00:00Z). Mixed offset spelling
+    # (+00:00) vs the snapshots' `Z` — the clamp normalizes via unixepoch().
+    conn.execute(
+        "INSERT INTO week_reset_events "
+        "(detected_at_utc, old_week_end_at, new_week_end_at, "
+        " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+        (
+            "2026-05-28T10:05:00Z",
+            "2026-05-30T02:00:00+00:00",
+            "2026-06-04T02:00:00+00:00",
+            "2026-05-28T10:00:00+00:00",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
 def build_extensions_no_stdin_db_fallback(out: pathlib.Path) -> None:
     """Stdin lacks rate_limits entirely; statusline must read the latest
     weekly_usage_snapshots row from stats.db. Seed:
@@ -448,6 +515,7 @@ def main() -> int:
     build_resumed_session(out)
     build_tz_display_utc(out)
     build_extensions_hwm_clamp(out)
+    build_extensions_hwm_7d_post_reset(out)
     build_extensions_no_stdin_db_fallback(out)
     build_context_band_transcripts(out)
     build_context_1m_window(out)
