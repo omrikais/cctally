@@ -3951,11 +3951,21 @@ def _resolve_block_selector(
     return dict(row) if row else None
 
 
+# Items in `_select_non_overlapping_recorded_windows` whose weight is
+# >= this threshold are treated as canonical (sourced from
+# ``five_hour_blocks``) and bypass the 5h non-overlap constraint. Must
+# stay in sync with the ``counts[snapped] = counts.get(snapped, 0) + 1000``
+# overlay in ``_load_recorded_five_hour_windows`` — same constant, same
+# meaning. Issue #116.
+_CANONICAL_WEIGHT_THRESHOLD = 1000
+
+
 def _select_non_overlapping_recorded_windows(
     items: list[tuple[dt.datetime, int]],
 ) -> list[dt.datetime]:
     """Pick the max-weight subset of recorded ``R`` values that respect
-    the 5h non-overlap constraint.
+    the 5h non-overlap constraint, with canonical anchors guaranteed
+    to survive.
 
     Anthropic 5h windows cannot truly overlap: the next window only
     opens once the previous one resets, so consecutive real ``R``
@@ -3967,6 +3977,23 @@ def _select_non_overlapping_recorded_windows(
     its preceding 5h window and the weight is the number of supporting
     snapshots: the subset that maximizes total support wins. Tie-break
     in the take branch favors including more ``R`` values.
+
+    Canonical bypass (issue #116): any item with weight at least
+    ``_CANONICAL_WEIGHT_THRESHOLD`` came from the authoritative
+    ``five_hour_blocks`` rollup (the caller overlays at +1000).
+    ``maybe_update_five_hour_block`` already deduped via
+    ``_canonical_5h_window_key`` pre-insert, so two canonical rows are
+    by definition non-overlapping physically — they only appear "in
+    conflict" here when their 10-min-floored keys land less than
+    ``BLOCK_DURATION`` apart, which happens at every real reset
+    boundary when Anthropic's ``resets_at`` jitters sub-second across
+    the boundary (e.g. OLD ``R=09:00:01Z`` floors to ``09:00``, NEW
+    ``R=13:59:59Z`` floors to ``13:50`` — 4h 50m floored-distance for
+    a genuinely-adjacent block pair). The DP still runs over the full
+    item set so non-canonical phantoms next to a canonical anchor get
+    dropped by weight comparison; the canonical-bypass only force-
+    restores canonical items the DP dropped, never adds back a raw-
+    only phantom.
 
     Args:
       items: ``(R, support_count)`` pairs.
@@ -4012,6 +4039,11 @@ def _select_non_overlapping_recorded_windows(
         else:
             i -= 1
     chosen.reverse()
+    # Canonical bypass: force-restore any canonical-weight anchor the DP
+    # dropped (issue #116). Keep the result sorted ascending.
+    canonical = {R for R, w in items_sorted if w >= _CANONICAL_WEIGHT_THRESHOLD}
+    if canonical and not canonical.issubset(chosen):
+        return sorted(set(chosen) | canonical)
     return chosen
 
 
@@ -4297,7 +4329,7 @@ def _load_recorded_five_hour_windows(
         # (only credit-truncated entries land there).
         if snapped in block_start_overrides:
             truncated_anchors.add(snapped)
-        counts[snapped] = counts.get(snapped, 0) + 1000
+        counts[snapped] = counts.get(snapped, 0) + _CANONICAL_WEIGHT_THRESHOLD
 
     non_truncated_items = [
         (a, w) for a, w in counts.items() if a not in truncated_anchors

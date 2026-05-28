@@ -583,6 +583,58 @@ def test_select_non_overlapping_recorded_windows_handles_empty(ns):
     assert select([]) == []
 
 
+def test_select_non_overlapping_recorded_windows_keeps_both_canonical_when_floors_within_5h(ns):
+    """Issue #116: two canonical (weight ≥ 1000) R values both survive.
+
+    Production scenario from 2026-05-28: OLD canonical block closed at
+    09:00:01Z (floored to 09:00), NEW canonical block opened immediately
+    after with resets_at=13:59:59Z (floored to 13:50). The two floored
+    keys are 4h 50m apart — within the BLOCK_DURATION cutoff — but they
+    represent two distinct, physical, Anthropic-confirmed 5h windows
+    that overlap by only 2 seconds (pure sub-second boundary jitter).
+
+    Pre-fix: the weighted DP treats them as conflicting and drops the
+    lower-weighted one. Both have canonical weight ≥ 1000, so the dashboard
+    rendered the just-started NEW block as a heuristic `~` anchor, and
+    after the NEW block's snapshots accumulated the OLD block would
+    silently disappear from the Blocks panel.
+
+    Fix: any item with canonical weight (≥ 1000) bypasses the DP's 5h
+    overlap constraint and survives unconditionally — the canonical
+    `five_hour_blocks` table is the authoritative source for window
+    boundaries (`_canonical_5h_window_key` already deduped pre-insert).
+    """
+    select = ns["_select_non_overlapping_recorded_windows"]
+    # Floored 10-min keys: OLD=09:00, NEW=13:50 → 4h 50m apart.
+    R_old = dt.datetime(2026, 5, 28, 9, 0, tzinfo=dt.timezone.utc)
+    R_new = dt.datetime(2026, 5, 28, 13, 50, tzinfo=dt.timezone.utc)
+    items = [
+        (R_old, 1032),  # 1000 canonical + 32 raw snapshots
+        (R_new, 1001),  # 1000 canonical + 1 raw snapshot (just opened)
+    ]
+    assert select(items) == [R_old, R_new]
+
+
+def test_select_non_overlapping_recorded_windows_phantom_near_canonical_still_dropped(ns):
+    """Issue #116 guardrail: a non-canonical phantom near a canonical R
+    still gets dropped.
+
+    Mixed scenario: one canonical anchor (1000+ weight) with a transient
+    raw-only phantom R captured 2h before it (only 5 supporting rows).
+    The phantom is not in `five_hour_blocks` — it's a status-line glitch.
+    The fix MUST keep canonical-survival without re-introducing phantoms.
+    """
+    select = ns["_select_non_overlapping_recorded_windows"]
+    R_canonical = dt.datetime(2026, 5, 28, 9, 0, tzinfo=dt.timezone.utc)
+    R_phantom = dt.datetime(2026, 5, 28, 7, 0, tzinfo=dt.timezone.utc)
+    items = [
+        (R_phantom, 5),         # raw-only phantom, low weight
+        (R_canonical, 1000),    # canonical (no raw support)
+    ]
+    # Canonical survives; raw-only phantom <5h before is dropped by DP.
+    assert select(items) == [R_canonical]
+
+
 def test_load_recorded_five_hour_windows_collapses_jittery_pairs(
     ns, tmp_path, monkeypatch,
 ):
@@ -713,3 +765,163 @@ def test_load_recorded_five_hour_windows_drops_phantom_in_real_window(
     assert result == expected, (
         f"Phantom 08:28 R should be dropped; got {result!r}"
     )
+
+
+def test_load_recorded_five_hour_windows_keeps_adjacent_canonical_pair(
+    ns, tmp_path, monkeypatch,
+):
+    """Issue #116 e2e: two adjacent canonical 5h blocks both anchor.
+
+    Reproduces 2026-05-28 production state: an OLD canonical block in
+    `five_hour_blocks` ending at 09:00:01Z and a NEW canonical block
+    starting at 08:59:59Z (2-second sub-second-jitter overlap on the
+    boundary). The 10-min-floored keys (09:00 and 13:50) are 4h 50m apart
+    — within BLOCK_DURATION — but both are real Anthropic windows.
+
+    Loader must:
+      * Return both R anchors in `selected`.
+      * Carry both in `canonical_intervals` with their exact
+        (block_start_at, five_hour_resets_at) pairs so the partitioner
+        and Phase 1.5 block-construction render the canonical
+        `block_start_at` instead of falling back to floor-to-hour.
+    """
+    share = tmp_path / ".local" / "share" / "cctally"
+    share.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(_cctally_core, "APP_DIR", share)
+    monkeypatch.setattr(_cctally_core, "DB_PATH", share / "stats.db")
+    monkeypatch.setattr(_cctally_core, "CACHE_DB_PATH", share / "cache.db")
+    monkeypatch.setattr(_cctally_core, "CACHE_LOCK_PATH", share / "cache.db.lock")
+    monkeypatch.setattr(_cctally_core, "CACHE_LOCK_CODEX_PATH", share / "cache.db.codex.lock")
+    monkeypatch.setattr(_cctally_core, "CONFIG_PATH", share / "config.json")
+    monkeypatch.setattr(_cctally_core, "LOG_DIR", share / "logs")
+
+    R_old_iso = "2026-05-28T09:00:01+00:00"
+    bs_old_iso = "2026-05-28T04:00:01+00:00"
+    R_new_iso = "2026-05-28T13:59:59+00:00"
+    bs_new_iso = "2026-05-28T08:59:59+00:00"
+
+    open_db = ns["open_db"]
+    with open_db() as conn:
+        # Seed 32 raw snapshots supporting the OLD reset and 1 supporting
+        # the NEW one — matches the production weight ratio at t=0 after
+        # the reset (NEW has only 1 captured snapshot so far).
+        for i in range(32):
+            conn.execute(
+                "INSERT INTO weekly_usage_snapshots "
+                "(captured_at_utc, week_start_date, week_end_date, "
+                " weekly_percent, source, payload_json, "
+                " five_hour_percent, five_hour_resets_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"2026-05-28T08:0{i//10}:{i%10:02d}Z",
+                 "2026-05-22", "2026-05-29",
+                 60.0, "test", "{}", 80.0, R_old_iso),
+            )
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " weekly_percent, source, payload_json, "
+            " five_hour_percent, five_hour_resets_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-05-28T09:00:30Z", "2026-05-22", "2026-05-29",
+             61.0, "test", "{}", 1.0, R_new_iso),
+        )
+        # Seed canonical rows in five_hour_blocks for both windows.
+        # (Bare-bones — the loader only reads block_start_at + resets_at.)
+        canon = ns["_canonical_5h_window_key"]
+        for bs_iso, R_iso in (
+            (bs_old_iso, R_old_iso),
+            (bs_new_iso, R_new_iso),
+        ):
+            ts_epoch = int(dt.datetime.fromisoformat(R_iso).timestamp())
+            conn.execute(
+                "INSERT INTO five_hour_blocks "
+                "(five_hour_window_key, five_hour_resets_at, block_start_at, "
+                " first_observed_at_utc, last_observed_at_utc, "
+                " final_five_hour_percent, is_closed, "
+                " created_at_utc, last_updated_at_utc) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                (canon(ts_epoch), R_iso, bs_iso,
+                 bs_iso, bs_iso, 50.0, bs_iso, bs_iso),
+            )
+        conn.commit()
+
+    load = ns["_load_recorded_five_hour_windows"]
+    range_start = dt.datetime(2026, 5, 27, 0, 0, tzinfo=dt.timezone.utc)
+    range_end = dt.datetime(2026, 5, 29, 0, 0, tzinfo=dt.timezone.utc)
+    selected, _overrides, canonical_intervals = load(range_start, range_end)
+
+    R_old_floored = dt.datetime(2026, 5, 28, 9, 0, tzinfo=dt.timezone.utc)
+    R_new_floored = dt.datetime(2026, 5, 28, 13, 50, tzinfo=dt.timezone.utc)
+    assert selected == [R_old_floored, R_new_floored], (
+        f"Both canonical anchors must survive; got {selected!r}"
+    )
+    # Canonical intervals must carry the EXACT block_start_at + resets_at
+    # for each anchor (not the floored values) — the partitioner reads
+    # this map to decide which entries land in which bucket.
+    assert R_old_floored in canonical_intervals, (
+        f"OLD canonical missing from canonical_intervals: "
+        f"{canonical_intervals!r}"
+    )
+    assert R_new_floored in canonical_intervals, (
+        f"NEW canonical missing from canonical_intervals: "
+        f"{canonical_intervals!r}"
+    )
+    bs_new_actual, rs_new_actual = canonical_intervals[R_new_floored]
+    assert bs_new_actual == dt.datetime(
+        2026, 5, 28, 8, 59, 59, tzinfo=dt.timezone.utc
+    ), f"NEW block_start_at jitter not preserved: {bs_new_actual!r}"
+    assert rs_new_actual == dt.datetime(
+        2026, 5, 28, 13, 59, 59, tzinfo=dt.timezone.utc
+    ), f"NEW resets_at jitter not preserved: {rs_new_actual!r}"
+
+
+def test_group_entries_into_blocks_anchors_new_window_to_recorded(ns):
+    """Issue #116 acceptance bullet 3: entries inside the NEW canonical
+    window land in its recorded bucket, not the heuristic leftover.
+
+    Drives `_group_entries_into_blocks` directly with the bug scenario's
+    recorded_windows + canonical_intervals. Pre-fix, the loader dropped
+    the NEW canonical anchor and the renderer floor-to-hour'd its
+    entries into a phantom heuristic block; this test pins the desired
+    post-fix shape (anchor='recorded', start_time=canonical bs).
+    """
+    group = ns["_group_entries_into_blocks"]
+    R_old = dt.datetime(2026, 5, 28, 9, 0, tzinfo=dt.timezone.utc)
+    R_new = dt.datetime(2026, 5, 28, 13, 50, tzinfo=dt.timezone.utc)
+    bs_old = dt.datetime(2026, 5, 28, 4, 0, 1, tzinfo=dt.timezone.utc)
+    rs_old = dt.datetime(2026, 5, 28, 9, 0, 1, tzinfo=dt.timezone.utc)
+    bs_new = dt.datetime(2026, 5, 28, 8, 59, 59, tzinfo=dt.timezone.utc)
+    rs_new = dt.datetime(2026, 5, 28, 13, 59, 59, tzinfo=dt.timezone.utc)
+
+    # One entry in each canonical window. The NEW entry's timestamp is
+    # AFTER rs_old (sub-second jitter would otherwise still bucket it
+    # into OLD — choosing 09:30:00 makes intent unambiguous).
+    entries = [
+        _entry(ns, dt.datetime(2026, 5, 28, 6, 0, tzinfo=dt.timezone.utc)),
+        _entry(ns, dt.datetime(2026, 5, 28, 9, 30, tzinfo=dt.timezone.utc)),
+    ]
+    blocks = group(
+        entries,
+        mode="auto",
+        now=dt.datetime(2026, 5, 28, 10, 0, tzinfo=dt.timezone.utc),
+        recorded_windows=[R_old, R_new],
+        canonical_intervals={R_old: (bs_old, rs_old), R_new: (bs_new, rs_new)},
+    )
+
+    # Expect 2 blocks, both anchor='recorded', using canonical bs/rs.
+    real_blocks = [b for b in blocks if not b.is_gap]
+    assert len(real_blocks) == 2, (
+        f"Expected 2 recorded blocks; got {[(b.anchor, b.start_time) for b in blocks]!r}"
+    )
+    assert real_blocks[0].anchor == "recorded"
+    assert real_blocks[0].start_time == bs_old
+    assert real_blocks[0].end_time == rs_old
+    assert real_blocks[1].anchor == "recorded", (
+        f"NEW block must anchor='recorded'; got {real_blocks[1].anchor!r}"
+    )
+    assert real_blocks[1].start_time == bs_new, (
+        f"NEW block start must be canonical bs; got {real_blocks[1].start_time!r}"
+    )
+    assert real_blocks[1].end_time == rs_new
