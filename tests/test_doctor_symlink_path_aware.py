@@ -21,7 +21,11 @@ NAMES = ("cctally", "cctally-alpha")
 
 def _state(s, dst, monkeypatch, which_map):
     monkeypatch.setattr(s._cctally(), "SETUP_SYMLINK_NAMES", NAMES, raising=False)
-    monkeypatch.setattr(s.shutil, "which", lambda n: which_map.get(n))
+    # Issue #119: _setup_compute_symlink_state now routes reachability
+    # through _reachable_elsewhere -> shutil.which(name, path=...), so the
+    # stub must accept (and ignore) the `path` kwarg. which_map still
+    # models "is <name> reachable via another channel?".
+    monkeypatch.setattr(s.shutil, "which", lambda n, path=None: which_map.get(n))
     return dict(s._setup_compute_symlink_state(dst, dst))
 
 

@@ -293,6 +293,12 @@ _SETUP_STALE_SYMLINK_NAMES = (
 )
 
 
+# The npm package ships a Node shim as the `cctally` entry point. Its
+# basename differs from the command name, so any code matching a
+# symlink's readlink target by basename must special-case it.
+_CCTALLY_NPM_SHIM_BASENAME = "cctally-npm-shim.js"
+
+
 def _setup_resolve_symlink_source(repo_root: pathlib.Path, name: str) -> pathlib.Path:
     """Resolve the symlink target for a given PATH-name.
 
@@ -310,27 +316,27 @@ def _setup_resolve_symlink_source(repo_root: pathlib.Path, name: str) -> pathlib
     documented. All other names map directly to ``bin/<name>``.
     """
     if name == "cctally" and "node_modules" in repo_root.parts:
-        shim = repo_root / "bin" / "cctally-npm-shim.js"
+        shim = repo_root / "bin" / _CCTALLY_NPM_SHIM_BASENAME
         if shim.exists():
             return shim
     return repo_root / "bin" / name
 
 
 def _setup_resolve_hook_target(repo_root: pathlib.Path) -> pathlib.Path:
-    """Resolve the absolute path that goes into Claude Code hook entries.
+    """Absolute path recorded in Claude Code hook entries.
 
-    Single chokepoint shared by ``_setup_install``, ``_setup_dry_run``
-    (text + JSON envelopes), and any other site that emits a hook
-    command. Routes through :func:`_setup_resolve_symlink_source` so
-    npm-layout installs point hooks at the Node shim instead of the
-    Python script directly — without this, the shim's
-    ``CCTALLY_PYTHON`` honoring works for interactive ``cctally`` calls
-    but every hook fire bypasses it via ``/usr/bin/env python3`` and
-    silently fails when the user's ``python3`` doesn't meet the version
-    floor. The returned path is fully resolved (symlinks followed) so
-    the recorded hook entry survives later filesystem rearrangements
-    of the source clone or the npm install root.
+    Brew installs: return the version-stable `<prefix>/bin/cctally` (the
+    formula's symlink, which self-heals on `brew upgrade`) WITHOUT
+    `.resolve()` — resolving would pin the hook to the versioned keg and
+    dangle after `brew cleanup` (issue #119). Source/npm: keep the
+    `.resolve()` semantics (survives clone/node_modules rearrangement and
+    the npm-shim branch in `_setup_resolve_symlink_source`).
     """
+    if _setup_is_brew_install(repo_root):
+        prefix = _setup_brew_prefix(repo_root)
+        stable = pathlib.Path(prefix) / "bin" / "cctally"
+        if stable.exists():
+            return stable
     return _setup_resolve_symlink_source(repo_root, "cctally").resolve()
 
 
@@ -446,19 +452,23 @@ def _setup_cleanup_stale_symlinks(
     """
     results: list[_SetupSymlinkResult] = []
     repo_root = _setup_resolve_repo_root()
-    for name in _SETUP_STALE_SYMLINK_NAMES:
+    retired_names = set(_SETUP_STALE_SYMLINK_NAMES)
+    for name in dict.fromkeys(_SETUP_STALE_SYMLINK_NAMES + tuple(_cctally().SETUP_SYMLINK_NAMES)):
         dst = dst_dir / name
         if not _setup_symlink_is_retired(dst, name, repo_root):
             continue
+        if name in retired_names:
+            should_remove = True                       # retired command: unconditional
+        else:                                           # active name: reachability-gated
+            is_dangling = not dst.resolve(strict=False).exists() if dst.is_symlink() else False
+            should_remove = is_dangling or _reachable_elsewhere(name)
+        if not should_remove:
+            continue
         try:
             dst.unlink()
-            results.append(
-                _SetupSymlinkResult(name, "removed-stale", "stale (from prior version)")
-            )
+            results.append(_SetupSymlinkResult(name, "removed-stale", "stale (issue #119 cleanup)"))
         except OSError as exc:
-            results.append(
-                _SetupSymlinkResult(name, "failed", f"unlink failed: {exc}")
-            )
+            results.append(_SetupSymlinkResult(name, "failed", f"unlink failed: {exc}"))
     return results
 
 
@@ -522,7 +532,11 @@ def _setup_symlink_is_retired(
         target = os.readlink(dst)
     except OSError:
         return False
-    if pathlib.Path(target).name != name:
+    target_basename = pathlib.Path(target).name
+    accepted = {name}
+    if name == "cctally":
+        accepted.add(_CCTALLY_NPM_SHIM_BASENAME)
+    if target_basename not in accepted:
         # User-managed symlink that happens to share the name; leave alone.
         return False
     # Resolve target relative to the symlink's parent so relative
@@ -546,9 +560,30 @@ def _setup_symlink_is_retired(
     # *from* an npm/brew install doesn't classify its own siblings as
     # foreign — that's the active-symlinks loop's job.
     target_str = str(target_path)
+    # "Same install root" means the target lives UNDER the current
+    # ``repo_root`` tree. Use a separator-anchored prefix check rather
+    # than a bare substring of the token: a same-``repo_root`` npm install
+    # has ``repo_root == <…>/node_modules/cctally`` (no trailing slash),
+    # so the raw ``"/node_modules/cctally/" in repo_root_str`` test would
+    # spuriously miss and classify the live channel's own link as foreign
+    # (issue #119 finding #7 — the npm `cctally` shim under its own
+    # ``node_modules/cctally`` must be preserved, not retired).
     repo_root_str = str(repo_root)
+    repo_root_prefix = repo_root_str.rstrip(os.sep) + os.sep
+    target_under_repo_root = (
+        target_str == repo_root_str or target_str.startswith(repo_root_prefix)
+    )
     for token in _SETUP_FOREIGN_INSTALL_ROOT_TOKENS:
-        if token in target_str and token not in repo_root_str:
+        if token not in target_str:
+            continue
+        # Homebrew keg links are NEVER owned by ~/.local/bin under the
+        # issue-#119 policy, so retire them regardless of which keg /
+        # whether repo_root is itself a keg. Other foreign roots
+        # (node_modules) retire only when the target is NOT under the
+        # current install root.
+        if token == _SETUP_FOREIGN_INSTALL_ROOT_TOKENS[0]:   # "/Cellar/cctally/"
+            return True
+        if not target_under_repo_root:
             return True
     return False
 
@@ -556,6 +591,44 @@ def _setup_symlink_is_retired(
 def _setup_path_includes_local_bin() -> bool:
     local_bin = str(_setup_local_bin_dir())
     return local_bin in os.environ.get("PATH", "").split(os.pathsep)
+
+
+def _setup_is_brew_install(repo_root: pathlib.Path) -> bool:
+    """True when this cctally runs from a Homebrew keg.
+
+    `_setup_resolve_repo_root()` `.resolve()`s `__file__`, so a brew
+    install reliably carries the `/Cellar/cctally/` token (Apple Silicon,
+    Intel, Linuxbrew all funnel through it). Reuses the single token
+    source in `_SETUP_FOREIGN_INSTALL_ROOT_TOKENS[0]`. Cheap — no
+    `npm prefix` subprocess; we only need the brew yes/no.
+    """
+    return _SETUP_FOREIGN_INSTALL_ROOT_TOKENS[0] in str(repo_root)
+
+
+def _setup_brew_prefix(repo_root: pathlib.Path) -> str:
+    """The Homebrew `<prefix>` (e.g. `/opt/homebrew`) for a brew keg
+    `repo_root`. Splits on the single-source brew token so we never spell
+    the Cellar path a third way. Callers must guard with
+    `_setup_is_brew_install(repo_root)` first; off a keg this returns the
+    unchanged string."""
+    return str(repo_root).split(_SETUP_FOREIGN_INSTALL_ROOT_TOKENS[0])[0]
+
+
+def _reachable_elsewhere(name: str) -> bool:
+    """Would `<name>` still be found on PATH if the ~/.local/bin slot
+    didn't exist? Excludes the ~/.local/bin directory (realpath-compared)
+    so a stale link can't satisfy its own reachability check (issue #119
+    finding #6)."""
+    local_bin = _setup_local_bin_dir()
+    try:
+        local_real = os.path.realpath(local_bin)
+    except OSError:
+        local_real = str(local_bin)
+    dirs = [
+        d for d in os.environ.get("PATH", "").split(os.pathsep)
+        if d and os.path.realpath(d) != local_real
+    ]
+    return shutil.which(name, path=os.pathsep.join(dirs)) is not None
 
 
 def _setup_shell_rc_hint() -> str:
@@ -1017,35 +1090,25 @@ def _setup_compute_symlink_state(
 ) -> "list[tuple[str, str]]":
     """Per-symlink (name, state) for `_setup_status` + `doctor_gather_state`.
 
-    state ∈ {"ok", "wrong", "missing"}:
-      - "ok": ``dst_dir/name`` is a symlink whose target is reachable.
-        The target is NOT required to match ``repo_root/bin/<name>`` —
-        power users routinely have the symlinks installed by one
-        cctally channel (npm/brew) while running ``doctor`` from a
-        parallel source clone, which would otherwise produce a 0/N
-        false negative on a perfectly healthy install. The diagnostic
-        question is "is `cctally-X` invokable from PATH?", not "did
-        THIS checkout install the symlink?". ``_setup_create_symlinks``
-        keeps its own strict equality check for install-management
-        (replace-vs-already).
-      - "wrong": a non-symlink file occupies the slot, or the symlink
-        target is dangling. Unchanged by the PATH-aware fallback below —
-        a dangling/occupied slot stays "wrong" even if the command is
-        reachable elsewhere (that's the §9 brew-cleanup follow-up's job).
-      - "missing": nothing at ``dst_dir/name`` AND the command is not
-        reachable on ``$PATH`` via another channel. When the slot is
-        empty but ``shutil.which(name)`` resolves (e.g. a brew
-        ``<prefix>/bin`` install), the state is "ok" instead — the
-        diagnostic question is "is cctally-X invokable?" (issue #114).
-
-    ``repo_root`` is unused here — retained on the signature for
-    call-site stability across `_setup_status` and `doctor_gather_state`.
+    state ∈ {"ok", "stale", "wrong", "missing"}.
+      - ok:      resolvable non-retired link, OR empty slot reachable elsewhere.
+      - stale:   retired link (Cellar/foreign/dangling) AND command reachable
+                 via a non-~/.local/bin dir (safely cleanable). Issue #119.
+      - wrong:   non-symlink file in slot; dangling non-retired link; OR a
+                 retired link with no reachable_elsewhere fallback (broken, or
+                 the pathological only-path-live-Cellar case).
+      - missing: empty slot, not reachable elsewhere.
+    Retired check precedes the resolve()->ok branch so a LIVE Cellar link is
+    classed stale, not masked as ok.
     """
-    del repo_root  # unused; see docstring
     out: list[tuple[str, str]] = []
     for name in _cctally().SETUP_SYMLINK_NAMES:
         dst = dst_dir / name
+        reachable = _reachable_elsewhere(name)
         if dst.is_symlink():
+            if _setup_symlink_is_retired(dst, name, repo_root):
+                out.append((name, "stale" if reachable else "wrong"))
+                continue
             try:
                 dst.resolve(strict=True)
                 out.append((name, "ok"))
@@ -1053,11 +1116,7 @@ def _setup_compute_symlink_state(
                 out.append((name, "wrong"))
         elif dst.exists():
             out.append((name, "wrong"))
-        elif shutil.which(name):
-            # Slot empty in dst_dir but the command is reachable on PATH
-            # via another channel (e.g. brew's <prefix>/bin). The
-            # diagnostic question is "is cctally-X invokable?", so treat
-            # as ok rather than false-warning. (Issue #114.)
+        elif reachable:
             out.append((name, "ok"))
         else:
             out.append((name, "missing"))
@@ -1094,8 +1153,11 @@ def _setup_status(args: argparse.Namespace) -> int:
     repo_root = _setup_resolve_repo_root()
     dst_dir = _setup_local_bin_dir()
     sym_state = _setup_compute_symlink_state(repo_root, dst_dir)
-    sym_ok = sum(1 for _, s in sym_state if s == "ok")
-    stale_syms = _setup_detect_stale_symlinks(dst_dir)
+    sym_ok = sum(1 for _, s in sym_state if s in ("ok", "stale"))     # available = ok + stale
+    active_stale = [n for n, s in sym_state if s == "stale"]
+    retired_stale = _setup_detect_stale_symlinks(dst_dir)
+    stale_syms = list(dict.fromkeys(active_stale + retired_stale))    # union, order-stable
+    is_brew = _setup_is_brew_install(repo_root)
     on_path = _setup_path_includes_local_bin()
     try:
         settings = c._load_claude_settings()
@@ -1149,8 +1211,12 @@ def _setup_status(args: argparse.Namespace) -> int:
             f"  Stale symlinks {len(stale_syms)} from prior version: {', '.join(stale_syms)}  ⚠"
         )
         out.append("                 run `cctally setup` to remove")
-    out.append(f"  PATH includes  {'yes' if on_path else 'no'}                                   "
-               f"{'✓' if on_path else '⚠'}")
+    if is_brew and (on_path or any(s in ("ok", "stale") for _, s in sym_state)):
+        prefix = _setup_brew_prefix(repo_root)
+        out.append(f"  PATH           brew: commands via {prefix}/bin                 ✓")
+    else:
+        out.append(f"  PATH includes  {'yes' if on_path else 'no'}                                   "
+                   f"{'✓' if on_path else '⚠'}")
     out.append(f"Hooks ({_cctally_core.CLAUDE_SETTINGS_PATH})")
     for ev in c.SETUP_HOOK_EVENTS:
         marker = "✓" if hook_counts[ev] >= 1 else "✗"
@@ -1390,14 +1456,20 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
     new = sum(1 for _, s in sym_results if s == "would-create")
     same = sum(1 for _, s in sym_results if s == "already")
     blocked = [name for name, s in sym_results if s == "blocked"]
+    is_brew = _setup_is_brew_install(repo_root)
     out: list[str] = []
-    out.append(
-        f"Would symlink {len(c.SETUP_SYMLINK_NAMES)} files to {dst_dir}/ "
-        f"({same} already correct, {new} new)"
-    )
-    if blocked:
-        out.append(f"⚠ Blocked (non-symlink files exist): {', '.join(blocked)}")
-        out.append("  Remove them manually then re-run.")
+    if is_brew:
+        prefix = _setup_brew_prefix(repo_root)
+        out.append(f"Brew install — would skip ~/.local/bin/ symlinks "
+                   f"(commands on PATH via {prefix}/bin/)")
+    else:
+        out.append(
+            f"Would symlink {len(c.SETUP_SYMLINK_NAMES)} files to {dst_dir}/ "
+            f"({same} already correct, {new} new)"
+        )
+        if blocked:
+            out.append(f"⚠ Blocked (non-symlink files exist): {', '.join(blocked)}")
+            out.append("  Remove them manually then re-run.")
 
     out.append(f"Would add {len(c.SETUP_HOOK_EVENTS)} hook entries to {_cctally_core.CLAUDE_SETTINGS_PATH}:")
     abs_path = str(_setup_resolve_hook_target(repo_root))
@@ -1469,13 +1541,18 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
         envelope = {
             "schema_version": 1,
             "mode": "dry-run",
-            "symlinks": {
-                "would_create": new,
-                "already": same,
-                "blocked": blocked,
-                "destination": str(dst_dir),
-                "total": len(c.SETUP_SYMLINK_NAMES),
-            },
+            "symlinks": (
+                {"skipped": True, "reason": "brew", "would_create": 0,
+                 "already": 0, "blocked": [], "destination": str(dst_dir),
+                 "total": 0,
+                 "would_remove_stale": [
+                     n for n, s in _setup_compute_symlink_state(repo_root, dst_dir)
+                     if s == "stale"
+                 ]}
+                if is_brew else
+                {"would_create": new, "already": same, "blocked": blocked,
+                 "destination": str(dst_dir), "total": len(c.SETUP_SYMLINK_NAMES)}
+            ),
             "hooks": {
                 "would_add": [
                     {
@@ -1667,24 +1744,40 @@ def _setup_install(args: argparse.Namespace) -> int:
     # disturbs a user's hand-rolled symlink sharing the name.
     stale_results = _setup_cleanup_stale_symlinks(dst_dir)
 
-    sym_results = _setup_create_symlinks(repo_root, dst_dir)
-    failed = [r for r in sym_results if r.status == "failed"]
-    if failed:
-        for r in failed:
-            eprint(f"setup: symlink {r.name} failed: {r.detail}")
-        return 1
-    new_count = sum(1 for r in sym_results if r.status == "created")
-    same_count = sum(1 for r in sym_results if r.status == "already")
-    repl_count = sum(1 for r in sym_results if r.status == "replaced")
-    detail_parts = []
-    if new_count:
-        detail_parts.append(f"{new_count} newly created")
-    if same_count:
-        detail_parts.append(f"{same_count} already correct")
-    if repl_count:
-        detail_parts.append(f"{repl_count} re-pointed")
-    detail = ", ".join(detail_parts) or "no changes"
-    out.append(f"✓ Symlinks at {dst_dir}/: {len(sym_results)}/{len(sym_results)} ({detail})")
+    # Issue #119: brew owns <prefix>/bin/, never ~/.local/bin/. On a brew
+    # install, skip symlink CREATION entirely (commands reach PATH via the
+    # formula's <prefix>/bin/) but keep everything else — cleanup, hook
+    # wiring, cache bootstrap. The new/same/repl counts are initialized to
+    # 0 here so the install JSON envelope references are always bound on
+    # the brew branch (sym_results stays empty).
+    is_brew = _setup_is_brew_install(repo_root)
+    new_count = same_count = repl_count = 0
+    if is_brew:
+        prefix = _setup_brew_prefix(repo_root)
+        out.append(
+            f"✓ Brew install detected — commands are on PATH via {prefix}/bin/; "
+            f"skipping ~/.local/bin/ symlinks"
+        )
+        sym_results = []
+    else:
+        sym_results = _setup_create_symlinks(repo_root, dst_dir)
+        failed = [r for r in sym_results if r.status == "failed"]
+        if failed:
+            for r in failed:
+                eprint(f"setup: symlink {r.name} failed: {r.detail}")
+            return 1
+        new_count = sum(1 for r in sym_results if r.status == "created")
+        same_count = sum(1 for r in sym_results if r.status == "already")
+        repl_count = sum(1 for r in sym_results if r.status == "replaced")
+        detail_parts = []
+        if new_count:
+            detail_parts.append(f"{new_count} newly created")
+        if same_count:
+            detail_parts.append(f"{same_count} already correct")
+        if repl_count:
+            detail_parts.append(f"{repl_count} re-pointed")
+        detail = ", ".join(detail_parts) or "no changes"
+        out.append(f"✓ Symlinks at {dst_dir}/: {len(sym_results)}/{len(sym_results)} ({detail})")
     removed_stale = [r for r in stale_results if r.status == "removed-stale"]
     failed_stale = [r for r in stale_results if r.status == "failed"]
     if removed_stale:
@@ -1696,13 +1789,32 @@ def _setup_install(args: argparse.Namespace) -> int:
         out.append(f"⚠ Could not remove stale {r.name}: {r.detail}")
         warnings += 1
 
-    if not _setup_path_includes_local_bin():
+    if not is_brew and not _setup_path_includes_local_bin():
         warnings += 1
         rc = _setup_shell_rc_hint()
         out.append(f"⚠ {dst_dir} is not on your PATH. Add to {rc}:")
         out.append(f"    export PATH=\"$HOME/.local/bin:$PATH\"")
         out.append("  Then reload (`source ...`) or open a new terminal.")
         out.append("  (Hooks still work — we used absolute paths in settings.json.)")
+
+    # Pinned-only-path guidance (issue #119 finding #10): if any active
+    # name's slot is a live retired link with no reachable_elsewhere
+    # fallback, setup deliberately won't remove it (would break the only
+    # reachable copy) — surface the actionable PATH fix instead of silence.
+    pinned = [
+        n for n, s in _setup_compute_symlink_state(repo_root, dst_dir)
+        if s == "wrong" and (dst_dir / n).is_symlink()
+        and _setup_symlink_is_retired(dst_dir / n, n, repo_root)
+        and (dst_dir / n).resolve(strict=False).exists()
+    ]
+    if pinned:
+        prefix = _setup_brew_prefix(repo_root) if is_brew else "<prefix>"
+        out.append(
+            f"⚠ cctally is reachable only via a legacy ~/.local/bin link. "
+            f"Put {prefix}/bin on your PATH (eval \"$(brew shellenv)\"), then "
+            f"re-run cctally setup to clean it."
+        )
+        warnings += 1
 
     c._backup_claude_settings()
     try:
@@ -1872,8 +1984,11 @@ def _setup_install(args: argparse.Namespace) -> int:
                 "created": new_count,
                 "already": same_count,
                 "replaced": repl_count,
-                "total": len(sym_results),
+                "total": len(sym_results),          # 0 on brew (sym_results == [])
                 "destination": str(dst_dir),
+                **({"skipped": True, "reason": "brew",
+                    "stale_removed": [r.name for r in stale_results if r.status == "removed-stale"]}
+                   if is_brew else {}),
             },
             "hooks": {
                 "events_added": list(c.SETUP_HOOK_EVENTS),

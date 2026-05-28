@@ -481,6 +481,7 @@ _setup_resolve_hook_target = _cctally_setup._setup_resolve_hook_target
 _setup_create_symlinks = _cctally_setup._setup_create_symlinks
 _setup_repair_symlinks = _cctally_setup._setup_repair_symlinks
 _setup_path_includes_local_bin = _cctally_setup._setup_path_includes_local_bin
+_setup_is_brew_install = _cctally_setup._setup_is_brew_install
 _setup_shell_rc_hint = _cctally_setup._setup_shell_rc_hint
 _setup_detect_legacy_snippet = _cctally_setup._setup_detect_legacy_snippet
 _setup_detect_legacy_bespoke_hooks = _cctally_setup._setup_detect_legacy_bespoke_hooks
