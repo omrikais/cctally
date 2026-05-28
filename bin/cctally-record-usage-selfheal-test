@@ -49,7 +49,8 @@ assert_eq () {
 SCRATCH="$(mktemp -d -t cctally-selfheal.XXXXXX)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
-out=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$SCRATCH" TZ=Etc/UTC python3 - <<'PY'
+out=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$SCRATCH" TZ=Etc/UTC \
+      CCTALLY_AS_OF="2026-05-08T23:00:00Z" python3 - <<'PY'
 import importlib.util
 import os
 import pathlib

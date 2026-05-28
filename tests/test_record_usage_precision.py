@@ -21,6 +21,7 @@ and the five_hour_blocks rollup.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import pathlib
 
 import pytest
@@ -28,11 +29,25 @@ import pytest
 from conftest import load_script, redirect_paths
 
 
+# Pinned wall-clock for this whole file. Picked so the test epochs
+# below sit inside the issue #112 plausibility band (week ∈ [now-30d,
+# now+8d]; 5h ∈ [now-30min, now+6h]).
+_AS_OF_ISO = "2026-05-12T00:00:00Z"
+_AS_OF_EPOCH = int(
+    dt.datetime.fromisoformat(_AS_OF_ISO.replace("Z", "+00:00")).timestamp()
+)
+_WEEK_RESETS_EPOCH = _AS_OF_EPOCH + 5 * 86400       # +5 days, inside 8d future band
+_FIVE_HOUR_RESETS_EPOCH = _AS_OF_EPOCH + 3 * 3600   # +3 hours, inside 6h future band
+
+
 @pytest.fixture
 def ns(monkeypatch, tmp_path):
-    """Fresh script namespace with all path constants pinned to tmp_path."""
+    """Fresh script namespace with all path constants pinned to tmp_path,
+    wall-clock pinned via CCTALLY_AS_OF so the issue #112 plausibility
+    guard accepts the test epochs deterministically."""
     n = load_script()
     redirect_paths(n, monkeypatch, tmp_path)
+    monkeypatch.setenv("CCTALLY_AS_OF", _AS_OF_ISO)
     return n
 
 
@@ -98,9 +113,9 @@ def test_hwm_5h_file_is_clean_after_ulp_noisy_input(ns, tmp_path):
     rc = _run_record_usage(
         ns,
         percent=42.0,
-        resets_at=1_778_494_800,    # arbitrary future epoch
+        resets_at=_WEEK_RESETS_EPOCH,   # +5d, inside issue #112 band
         five_hour_percent=0.07 * 100,  # 7.000000000000001
-        five_hour_resets_at=1_746_014_400,
+        five_hour_resets_at=_FIVE_HOUR_RESETS_EPOCH,
     )
     assert rc == 0
 
@@ -120,7 +135,7 @@ def test_hwm_7d_file_is_clean_after_ulp_noisy_input(ns, tmp_path):
     rc = _run_record_usage(
         ns,
         percent=0.29 * 100,   # 29.000000000000004
-        resets_at=1_778_494_800,
+        resets_at=_WEEK_RESETS_EPOCH,
     )
     assert rc == 0
     hwm7 = (ns["APP_DIR"] / "hwm-7d").read_text().strip()
@@ -136,9 +151,9 @@ def test_db_row_five_hour_percent_is_normalized(ns):
     _run_record_usage(
         ns,
         percent=42.0,
-        resets_at=1_778_494_800,
+        resets_at=_WEEK_RESETS_EPOCH,
         five_hour_percent=0.07 * 100,
-        five_hour_resets_at=1_746_014_400,
+        five_hour_resets_at=_FIVE_HOUR_RESETS_EPOCH,
     )
     with ns["open_db"]() as conn:
         row = conn.execute(
@@ -157,7 +172,7 @@ def test_db_row_weekly_percent_is_normalized(ns):
     _run_record_usage(
         ns,
         percent=0.58 * 100,   # 57.99999999999999
-        resets_at=1_778_494_800,
+        resets_at=_WEEK_RESETS_EPOCH,
     )
     with ns["open_db"]() as conn:
         row = conn.execute(
@@ -174,9 +189,9 @@ def test_hwm_monotonicity_survives_normalization(ns):
     _run_record_usage(
         ns,
         percent=42.0,
-        resets_at=1_778_494_800,
+        resets_at=_WEEK_RESETS_EPOCH,
         five_hour_percent=0.07 * 100,
-        five_hour_resets_at=1_746_014_400,
+        five_hour_resets_at=_FIVE_HOUR_RESETS_EPOCH,
     )
     hwm5_first = (ns["APP_DIR"] / "hwm-5h").read_text()
 
@@ -184,9 +199,9 @@ def test_hwm_monotonicity_survives_normalization(ns):
     _run_record_usage(
         ns,
         percent=42.0,
-        resets_at=1_778_494_800,
+        resets_at=_WEEK_RESETS_EPOCH,
         five_hour_percent=0.07 * 100,  # same intent, same noisy float
-        five_hour_resets_at=1_746_014_400,
+        five_hour_resets_at=_FIVE_HOUR_RESETS_EPOCH,
     )
     hwm5_second = (ns["APP_DIR"] / "hwm-5h").read_text()
     assert hwm5_first == hwm5_second, (
@@ -201,14 +216,16 @@ def test_oauth_refresh_payload_is_clean(ns, monkeypatch):
     # Stub the OAuth fetch with a noisy utilization value (mirrors the
     # real Anthropic response when `tokens/cap*100 == 7.000000000000001`).
     def _fake_fetch(token: str, timeout_seconds: float) -> dict:
+        # resets_at values must sit inside the issue #112 plausibility
+        # band relative to the file's _AS_OF_ISO (2026-05-12T00:00:00Z).
         return {
             "seven_day": {
                 "utilization": 0.42 * 100,    # 42.0 noisy variant
-                "resets_at": "2026-05-16T05:00:00+00:00",
+                "resets_at": "2026-05-16T05:00:00+00:00",   # +4d 5h, inside 8d future band
             },
             "five_hour": {
                 "utilization": 0.07 * 100,    # 7.000000000000001
-                "resets_at": "2026-05-11T10:20:00+00:00",
+                "resets_at": "2026-05-12T03:00:00+00:00",   # +3h, inside 6h future band
             },
         }
     monkeypatch.setitem(ns, "_fetch_oauth_usage", _fake_fetch)

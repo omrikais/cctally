@@ -171,6 +171,7 @@ from _cctally_core import (
     make_week_ref,
     _get_alerts_config,
     _AlertsConfigError,
+    _command_as_of,
 )
 from _lib_five_hour import _canonical_5h_window_key
 from _lib_pricing import _calculate_entry_cost
@@ -299,6 +300,21 @@ def _hook_tick_make_mock_refresh(*args, **kwargs):
 # `c.X`-routed) because they're pure literals — no monkeypatch surface
 # and no dependency on cctally's module instance.
 _PERCENT_NORMALIZE_DECIMALS = 10
+
+# Plausibility band for --resets-at / --five-hour-resets-at (issue #112).
+# Out-of-band epochs are rejected at cmd_record_usage ingress before any
+# datetime.fromtimestamp() call, so absurd values (ms-epochs, year-off
+# bugs) can't crash the call or stamp phantom-week rows. Past slack on
+# --resets-at is 30 days so the documented manual-snapshot-replay use
+# case (docs/commands/record-usage.md:54-57) keeps working. Past slack
+# on --five-hour-resets-at is 6 hours so a naturally-expired window that
+# hasn't yet rolled to the next anchor (transient state when statusline
+# upstream lags up to one period) still gets accepted — year-off bugs
+# are still caught with ~70× margin.
+_RECORD_USAGE_WEEK_PAST_SLACK_S = 30 * 86400
+_RECORD_USAGE_WEEK_FUTURE_BAND_S = 8 * 86400
+_RECORD_USAGE_5H_PAST_SLACK_S = 6 * 3600
+_RECORD_USAGE_5H_FUTURE_BAND_S = 6 * 3600
 
 
 # One-shot guard so a misbehaving caller passing a non-int
@@ -1273,6 +1289,24 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
     weekly_percent = _normalize_percent(args.percent)
     resets_at = int(args.resets_at)
 
+    # Plausibility guard (issue #112). Band-check epochs BEFORE any
+    # dt.datetime.fromtimestamp() call so absurd values (ms-epoch,
+    # year-off bugs, negative) reject gracefully instead of raising
+    # OverflowError. Reject path returns exit 2 so
+    # _refresh_usage_inproc maps it to status="record_failed" instead
+    # of silently reporting success on a dropped payload.
+    now_dt = _command_as_of()
+    now_epoch = int(now_dt.timestamp())
+    if not (now_epoch - _RECORD_USAGE_WEEK_PAST_SLACK_S
+            <= resets_at
+            <= now_epoch + _RECORD_USAGE_WEEK_FUTURE_BAND_S):
+        eprint(
+            f"[record-usage] rejecting --resets-at={resets_at}: outside "
+            f"plausibility band [now-30d, now+8d]; "
+            f"now={now_epoch} ({now_dt.isoformat()}). No row written."
+        )
+        return 2
+
     five_hour_percent: float | None = None
     five_hour_resets_at_str: str | None = None
     five_hour_window_key: int | None = None
@@ -1281,6 +1315,17 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         five_hour_percent = _normalize_percent(args.five_hour_percent)
     if args.five_hour_resets_at is not None:
         five_hour_resets_at_epoch = int(args.five_hour_resets_at)
+        # Band-check BEFORE fromtimestamp (issue #112).
+        if not (now_epoch - _RECORD_USAGE_5H_PAST_SLACK_S
+                <= five_hour_resets_at_epoch
+                <= now_epoch + _RECORD_USAGE_5H_FUTURE_BAND_S):
+            eprint(
+                f"[record-usage] rejecting --five-hour-resets-at="
+                f"{five_hour_resets_at_epoch}: outside plausibility band "
+                f"[now-6h, now+6h]; now={now_epoch} "
+                f"({now_dt.isoformat()}). No row written."
+            )
+            return 2
         five_hour_resets_at_str = dt.datetime.fromtimestamp(
             five_hour_resets_at_epoch, tz=dt.timezone.utc
         ).isoformat(timespec="seconds")
@@ -1406,7 +1451,12 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                     prior["week_end_at"], "record.prior"
                 )
                 prior_pct = prior["weekly_percent"]
-                now_utc = dt.datetime.now(dt.timezone.utc)
+                # Use _command_as_of() so CCTALLY_AS_OF pins the predicate
+                # for tests (no behavior change in production — falls back
+                # to wall-clock when the env hook is unset). This makes
+                # mid-week-reset detection deterministic against fixtures
+                # whose `prior_end` is a fixed historical instant.
+                now_utc = _command_as_of()
                 if prior_end_canon and prior_end_canon != cur_end_canon:
                     prior_end_dt = parse_iso_datetime(prior_end_canon, "prior.week_end_at")
                     # Fire only when (a) prior window was still in the FUTURE

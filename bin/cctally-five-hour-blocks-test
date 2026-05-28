@@ -63,9 +63,13 @@ finish_scenario () {
 }
 
 # Run `cctally record-usage` in an isolated HOME, suppressing output.
+# CCTALLY_AS_OF is pinned to 1h before BASE so the seeded BASE epoch
+# (2025-04-30T12:00:00Z) sits inside the issue #112 plausibility band
+# regardless of actual wall-clock.
 record_usage () {
     local home="$1"; shift
-    HOME="$home" TZ=Etc/UTC "$BIN" record-usage "$@" \
+    HOME="$home" TZ=Etc/UTC CCTALLY_AS_OF="2025-04-30T17:00:00Z" \
+        "$BIN" record-usage "$@" \
         >>"$home/cctally-stdout.log" 2>>"$home/cctally-stderr.log"
 }
 
@@ -74,7 +78,8 @@ record_usage () {
 # parse_iso_datetime (e.g. block_start_at stored with a non-UTC offset).
 record_usage_tz () {
     local home="$1"; local tz="$2"; shift 2
-    HOME="$home" TZ="$tz" "$BIN" record-usage "$@" \
+    HOME="$home" TZ="$tz" CCTALLY_AS_OF="2025-04-30T17:00:00Z" \
+        "$BIN" record-usage "$@" \
         >>"$home/cctally-stdout.log" 2>>"$home/cctally-stderr.log"
 }
 
@@ -161,7 +166,7 @@ BASE=1746014400
 # guards don't interfere across scenarios. Must be > now_utc so scenario G's
 # mid-week reset detection (prior_end_dt > now_utc gate) actually fires.
 # 2100000000 = 2036-07-18 (well into the future, won't go stale soon).
-RESETS_7D=2100000000
+RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d of CCTALLY_AS_OF=2025-04-30T17Z; RESETS_7D+7d still inside 8d future band)
 
 # ─── Scenario A: schema migration creates both tables ─────────────────
 {

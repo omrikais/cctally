@@ -147,9 +147,13 @@ finish_scenario () {
 # Run a `cctally record-usage` invocation in an isolated HOME.
 # Stdout and stderr are appended to per-home log files so a future
 # debugger can inspect what cctally said when a regression hits.
+# CCTALLY_AS_OF is pinned to 1h before BASE so the seeded BASE epoch
+# (2025-04-30T12:00:00Z) sits inside the issue #112 plausibility band
+# regardless of actual wall-clock.
 record_usage () {
     local home="$1"; shift
-    HOME="$home" TZ=Etc/UTC "$BIN" record-usage "$@" \
+    HOME="$home" TZ=Etc/UTC CCTALLY_AS_OF="2025-04-30T11:00:00Z" \
+        "$BIN" record-usage "$@" \
         >>"$home/cctally-stdout.log" 2>>"$home/cctally-stderr.log"
 }
 
@@ -169,7 +173,7 @@ BASE=1746014400
 
     # Call 1: 5h_pct=57, resets=BASE.
     record_usage "$home" \
-        --percent 30 --resets-at 1700000000 \
+        --percent 30 --resets-at 1746273600 \
         --five-hour-percent 57 --five-hour-resets-at "$BASE"
 
     # Call 2: 5h_pct=56 (LOWER), resets=BASE+3 (3 s jitter, same bucket).
@@ -177,7 +181,7 @@ BASE=1746014400
     # swallows the second row when both weekly_percent and
     # five_hour_percent equal the most recent row.
     record_usage "$home" \
-        --percent 31 --resets-at 1700000000 \
+        --percent 31 --resets-at 1746273600 \
         --five-hour-percent 56 --five-hour-resets-at "$((BASE + 3))"
 
     hwm_file="$home/.local/share/cctally/hwm-5h"
@@ -203,13 +207,13 @@ BASE=1746014400
 
     # Call 1: weekly=30, 5h=57, resets=BASE.
     record_usage "$home" \
-        --percent 30 --resets-at 1700000000 \
+        --percent 30 --resets-at 1746273600 \
         --five-hour-percent 57 --five-hour-resets-at "$BASE"
 
     # Call 2: weekly=31 (varied to bypass dedup), 5h=56 (LOWER),
     # resets=BASE+3 (same canonical bucket).
     record_usage "$home" \
-        --percent 31 --resets-at 1700000000 \
+        --percent 31 --resets-at 1746273600 \
         --five-hour-percent 56 --five-hour-resets-at "$((BASE + 3))"
 
     # Two rows in weekly_usage_snapshots.
@@ -242,12 +246,12 @@ BASE=1746014400
 
     # Call 1: 5h=57 in BASE window.
     record_usage "$home" \
-        --percent 30 --resets-at 1700000000 \
+        --percent 30 --resets-at 1746273600 \
         --five-hour-percent 57 --five-hour-resets-at "$BASE"
 
     # Call 2: 5h=10 (much lower) in NEXT window.
     record_usage "$home" \
-        --percent 31 --resets-at 1700000000 \
+        --percent 31 --resets-at 1746273600 \
         --five-hour-percent 10 --five-hour-resets-at "$NEXT"
 
     # Two distinct window keys.
@@ -343,7 +347,7 @@ test_epochs = [
     1746014999,  #   +599s       still same bucket
     1746015000,  #   +600s       next bucket
     1746014401,  #   +1s         mid-bucket
-    1700000000,  #              random non-aligned
+    1746273600,  #              random non-aligned
     1700000599,  #              edge of bucket
     1700000600,  #              start of next bucket
     1234560000,  #              older epoch, 600-aligned
@@ -383,7 +387,7 @@ PY
     begin_scenario F
 
     record_usage "$home" \
-        --percent 30 --resets-at 1700000000 \
+        --percent 30 --resets-at 1746273600 \
         --five-hour-percent 57 --five-hour-resets-at "$BASE"
 
     pre_count=$(sql "$home" \
@@ -429,13 +433,13 @@ PY
     # Call 1: 5h_pct=57, resets=BOUND_NEAR. Stores row with
     # five_hour_window_key=1746014400.
     record_usage "$home" \
-        --percent 30 --resets-at 1700000000 \
+        --percent 30 --resets-at 1746273600 \
         --five-hour-percent 57 --five-hour-resets-at "$BOUND_NEAR"
 
     # Call 2: 5h_pct=56 (LOWER), resets=BOUND_PAST (1 s later, across
     # the 600-second boundary). Anchor logic must reuse 1746014400.
     record_usage "$home" \
-        --percent 31 --resets-at 1700000000 \
+        --percent 31 --resets-at 1746273600 \
         --five-hour-percent 56 --five-hour-resets-at "$BOUND_PAST"
 
     hwm_file="$home/.local/share/cctally/hwm-5h"
@@ -468,14 +472,14 @@ PY
 
     # Call 1: weekly=30, 5h=57, resets=BOUND_NEAR.
     record_usage "$home" \
-        --percent 30 --resets-at 1700000000 \
+        --percent 30 --resets-at 1746273600 \
         --five-hour-percent 57 --five-hour-resets-at "$BOUND_NEAR"
 
     # Call 2: weekly=31 (varied to bypass dedup), 5h=56 (LOWER),
     # resets=BOUND_PAST. Anchor logic must keep both rows in the same
     # window_key bucket so the clamp can fire.
     record_usage "$home" \
-        --percent 31 --resets-at 1700000000 \
+        --percent 31 --resets-at 1746273600 \
         --five-hour-percent 56 --five-hour-resets-at "$BOUND_PAST"
 
     row_count=$(sql "$home" "SELECT COUNT(*) FROM weekly_usage_snapshots;")
@@ -520,21 +524,21 @@ PY
     # Call 1: 5h_pct=20 in window A (1746014400). Materializes a row in
     # five_hour_blocks via maybe_update_five_hour_block.
     record_usage "$home" \
-        --percent 30 --resets-at 1700000000 \
+        --percent 30 --resets-at 1746273600 \
         --five-hour-percent 20 --five-hour-resets-at "$BOUND_NEAR"
 
     # Call 2: 5h_pct=85 with an OLD resets_at (different physical
     # window). Pre-fix, this snapshot would become the prior-anchor for
     # call 3.
     record_usage "$home" \
-        --percent 31 --resets-at 1700000000 \
+        --percent 31 --resets-at 1746273600 \
         --five-hour-percent 85 --five-hour-resets-at "$OLD"
 
     # Call 3: 5h_pct=21, resets=BOUND_PAST (1 s past the boundary,
     # SAME physical window as call 1). Tier 1 anchor lookup hits call
     # 1's block row (within ±1800s) and reuses key 1746014400.
     record_usage "$home" \
-        --percent 32 --resets-at 1700000000 \
+        --percent 32 --resets-at 1746273600 \
         --five-hour-percent 21 --five-hour-resets-at "$BOUND_PAST"
 
     # The latest snapshot must collapse to window A's key, not fork.
