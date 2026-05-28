@@ -42,8 +42,8 @@ JSON key), a one-line summary, and a remediation hint shown when
 severity != `OK`.
 
 ### Install
-- `install.symlinks` — WARN when any cctally-* symlink is missing or wrong.
-- `install.path` — WARN when `~/.local/bin` is not on `$PATH`.
+- `install.symlinks` — WARN when any cctally-* command is unavailable. Reports "N/M available". PATH-aware: a command is counted available when its `~/.local/bin/` symlink is present, **or** when the command is reachable on `$PATH` via another install channel (e.g. a Homebrew `<prefix>/bin/` install), so it no longer false-warns purely because `~/.local/bin/` lacks the link. A wrong-target / dangling / non-symlink slot still counts as missing (`wrong`), even when the command is reachable elsewhere. The `--json` `details` keys (`present` / `total` / `missing`) are unchanged.
+- `install.path` — WARN when `~/.local/bin` is not on `$PATH`. (Separate from `install.symlinks`; unchanged — still PATH-presence only.)
 - `install.legacy_snippet` — WARN when an old status-line snippet is detected.
 - `install.legacy_bespoke_hooks` — WARN when the legacy hand-installed hooks are present.
 
@@ -88,7 +88,7 @@ Stable contract at `schema_version: 1`. Top-level fields:
       "id": "install", "title": "Install", "severity": "ok",
       "checks": [
         { "id": "install.symlinks", "title": "Symlinks",
-          "severity": "ok", "summary": "9/9 present",
+          "severity": "ok", "summary": "9/9 available",
           "details": { "present": 9, "total": 9, "missing": [] } }
       ]
     }

@@ -34,6 +34,33 @@ dev-pointing hooks. The refusal is independent of `CCTALLY_DATA_DIR`: setting
 that env var relocates the dev data dir but still does not let setup rewrite
 the prod hooks.
 
+## Upgrade self-heal (new symlinks)
+
+When you upgrade via `npm install -g cctally@<newer>` and that release ships a
+new `cctally-<subcmd>` binary, its `~/.local/bin/` symlink would normally be
+missing until you re-ran `cctally setup` (`doctor` would warn about the missing
+link in the meantime). The npm postinstall now best-effort runs an internal
+`repair-symlinks` pass to close that gap: it additively creates `~/.local/bin/`
+symlinks for any newly added subcommands, so they become reachable immediately
+after the upgrade with no manual step.
+
+The pass is strictly additive and gated to existing installs:
+
+- It only fills genuinely-empty `~/.local/bin/` slots; present, wrong-target,
+  dangling, and hand-rolled non-symlink slots are left untouched.
+- It is gated to *existing* installs — it acts only when at least one cctally
+  symlink is already present, so a fresh install stays hands-off and still
+  prints the "run `cctally setup`" hint (which is also where the additive hooks
+  and SQLite cache get bootstrapped).
+- It touches only `~/.local/bin/` symlinks — never hooks, `settings.json`, or
+  the cache.
+- It can never fail the npm install: if python is missing or the pass errors,
+  it is silently skipped and the standard setup hint still prints.
+
+`repair-symlinks` is internal plumbing — hidden from `cctally --help`, invoked
+by the postinstall — and refuses to run from a dev checkout. You should not need
+to invoke it directly.
+
 ## Hook events installed
 
 `PostToolBatch`, `Stop`, `SubagentStop`. Together they cover every
