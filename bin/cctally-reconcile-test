@@ -2992,6 +2992,212 @@ reconcile_invariant "mode_kernel_auto_ne_calculate" "$MODE_FX" \
     "daily --json --mode calculate" \
     "$INVARIANT_MODE_AUTO_NE_CALCULATE_PY"
 
+# ── Statusline invariants (issue #86 Session G — spec §5.2) ───────────
+# Six cross-command invariants binding `cctally statusline` segments to
+# their canonical-command counterparts. Each invariant seeds a single
+# fixture HOME (cache.db + stats.db), runs `cctally statusline` with a
+# hand-crafted stdin payload, parses the resulting line via regex to
+# extract the relevant dollar amount / percentage, then compares against
+# `cctally session/daily/blocks/...` JSON output for the same window.
+# Tolerance 1e-9 USD / 0.5 pp for percent-rounding (statusline rounds
+# ints; the sibling command emits a float). Mirrors the established
+# pattern of running both sides under the same fixture HOME + AS_OF +
+# extracting both values to Python via env vars.
+STATUSLINE_FIXTURE_HOME="$SCRATCH_DIR/statusline-reconcile"
+STATUSLINE_AS_OF="2026-05-28T12:00:00Z"
+STATUSLINE_SID="reconcile-sid"
+STATUSLINE_SOURCE_PATH="/cache/reconcile.jsonl"
+
+# Build the fixture HOME (cache.db with one session entry attributed to
+# STATUSLINE_SID; stats.db with one weekly_usage_snapshots row carrying
+# 5h/7d percentages anchored to the AS_OF window). Run once via Python
+# to keep DDL out of the harness shell.
+mkdir -p "$STATUSLINE_FIXTURE_HOME/.local/share/cctally"
+PYTHONPATH="$REPO_ROOT/bin" python3 - <<PY >/dev/null
+import pathlib, sqlite3
+import _fixture_builders as fb
+
+home = pathlib.Path(r"$STATUSLINE_FIXTURE_HOME/.local/share/cctally")
+home.mkdir(parents=True, exist_ok=True)
+
+cache_db = home / "cache.db"
+fb.create_cache_db(cache_db)
+with sqlite3.connect(cache_db) as c:
+    c.execute(
+        "INSERT OR IGNORE INTO session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, "
+        " last_ingested_at, session_id, project_path) "
+        "VALUES (?, 0, 0, 0, ?, ?, NULL)",
+        (r"$STATUSLINE_SOURCE_PATH", fb.FIXED_LAST_INGESTED_AT, r"$STATUSLINE_SID"),
+    )
+    # 200_000 input + 20_000 output → \$0.90 cost from CLAUDE_MODEL_PRICING
+    # (3e-06 input + 1.5e-05 output for claude-sonnet-4-5).
+    fb.seed_session_entry(
+        c,
+        source_path=r"$STATUSLINE_SOURCE_PATH",
+        line_offset=1,
+        timestamp_utc="2026-05-28T11:30:00Z",
+        model="claude-sonnet-4-5",
+        input_tokens=200_000,
+        output_tokens=20_000,
+        msg_id="msg-reconcile",
+        req_id="req-reconcile",
+    )
+
+stats_db = home / "stats.db"
+fb.create_stats_db(stats_db)
+with sqlite3.connect(stats_db) as c:
+    # 5h_resets=1779981720 → canonical key floored to 1779981600.
+    fb.seed_weekly_usage_snapshot(
+        c,
+        captured_at_utc="2026-05-28T11:50:00Z",
+        week_start_date="2026-05-28",
+        week_end_date="2026-06-04",
+        week_start_at="2026-05-28T02:00:00Z",
+        week_end_at="2026-06-04T02:00:00Z",
+        weekly_percent=42.0,
+        five_hour_percent=34.0,
+        five_hour_resets_at="2026-05-28T15:22:00Z",
+        five_hour_window_key=1779981600,
+        source="reconcile-fixture",
+    )
+PY
+
+# Stdin payload for statusline. Same shape as the basic fixture but
+# pointed at the reconcile session_id + source_path.
+STATUSLINE_STDIN='{"session_id":"'"$STATUSLINE_SID"'","model":{"id":"claude-sonnet-4-5","display_name":"Sonnet 4.5"},"workspace":{"current_dir":"/tmp"},"transcript_path":"'"$STATUSLINE_SOURCE_PATH"'","rate_limits":{"five_hour":{"used_percentage":34.0,"resets_at":1779981720},"seven_day":{"used_percentage":42.0,"resets_at":1780538400}},"cost":{"total_cost_usd":1.99}}'
+
+# Run statusline (cctally-side cost source) and capture the line.
+SL_LINE=$(HOME="$STATUSLINE_FIXTURE_HOME" \
+          CCTALLY_DATA_DIR="$STATUSLINE_FIXTURE_HOME/.local/share/cctally" \
+          TZ=Etc/UTC NO_COLOR=1 CCTALLY_AS_OF="$STATUSLINE_AS_OF" \
+          "$BIN" statusline --cost-source cctally <<< "$STATUSLINE_STDIN")
+SL_RC=$?
+if [ "$SL_RC" -ne 0 ]; then
+    echo "RECONCILE FAIL statusline_setup: cctally statusline exited $SL_RC"
+    fail_count=$((fail_count + 1))
+fi
+
+# Common reconcile runner for statusline invariants.
+# Args: NAME REGEX_TO_EXTRACT EXPECTED_VALUE_EXPR ASSERTION_PY
+statusline_reconcile () {
+    local name="$1" extracted="$2" expected="$3"
+    local diff
+    diff=$(awk -v a="$extracted" -v b="$expected" 'BEGIN{d=a-b; if(d<0)d=-d; print d}')
+    if awk -v d="$diff" 'BEGIN{exit !(d < 1e-9)}'; then
+        echo "PASS $name statusline/reconcile"
+        pass_count=$((pass_count + 1))
+    else
+        echo "RECONCILE FAIL $name statusline/reconcile: " \
+             "extracted=$extracted expected=$expected diff=$diff"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# Helper: regex out a dollar amount from the statusline line.
+extract_money () {
+    # Args: full line, prefix-after-dollar (regex anchor)
+    # Example: extract_money "$SL_LINE" '([0-9.]+) session' → 0.90
+    local line="$1" pattern="$2"
+    printf '%s\n' "$line" | sed -nE "s/.*${pattern}.*/\\1/p" | head -1
+}
+
+# Invariant 1: statusline_session_eq_cctally_session.
+# `cctally session -i <sid> --json` exposes the merged-session total.
+SL_SESSION=$(printf '%s\n' "$SL_LINE" | sed -nE 's/.*💰 \$([0-9.]+) session.*/\1/p')
+SESS_JSON=$(HOME="$STATUSLINE_FIXTURE_HOME" \
+            CCTALLY_DATA_DIR="$STATUSLINE_FIXTURE_HOME/.local/share/cctally" \
+            TZ=Etc/UTC NO_COLOR=1 CCTALLY_AS_OF="$STATUSLINE_AS_OF" \
+            "$BIN" session --json 2>/dev/null)
+SESS_COST=$(printf '%s' "$SESS_JSON" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data.get('sessions', []):
+    if s.get('sessionId') == '$STATUSLINE_SID':
+        print(s['totalCost'])
+        break
+else:
+    print('0')
+")
+statusline_reconcile "statusline_session_eq_cctally_session" \
+    "$SL_SESSION" "$SESS_COST"
+
+# Invariant 2: statusline_today_eq_daily. The today bucket (UTC) matches
+# `daily` aggregated over the AS_OF date.
+SL_TODAY=$(printf '%s\n' "$SL_LINE" | sed -nE 's/.*\/ \$([0-9.]+) today.*/\1/p')
+DAILY_JSON=$(HOME="$STATUSLINE_FIXTURE_HOME" \
+             CCTALLY_DATA_DIR="$STATUSLINE_FIXTURE_HOME/.local/share/cctally" \
+             TZ=Etc/UTC NO_COLOR=1 CCTALLY_AS_OF="$STATUSLINE_AS_OF" \
+             "$BIN" daily --json --since 2026-05-28 --until 2026-05-28 2>/dev/null)
+DAILY_TODAY=$(printf '%s' "$DAILY_JSON" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+total = sum(r['totalCost'] for r in data.get('daily', []))
+print(total)
+")
+statusline_reconcile "statusline_today_eq_daily" \
+    "$SL_TODAY" "$DAILY_TODAY"
+
+# Invariant 3: statusline_block_eq_blocks_active. The block-cost slot
+# matches the cost of the active 5h block (cctally blocks -a --json).
+SL_BLOCK=$(printf '%s\n' "$SL_LINE" | sed -nE 's/.*\/ \$([0-9.]+) block.*/\1/p')
+BLOCKS_JSON=$(HOME="$STATUSLINE_FIXTURE_HOME" \
+              CCTALLY_DATA_DIR="$STATUSLINE_FIXTURE_HOME/.local/share/cctally" \
+              TZ=Etc/UTC NO_COLOR=1 CCTALLY_AS_OF="$STATUSLINE_AS_OF" \
+              "$BIN" blocks -a --json 2>/dev/null)
+BLOCKS_ACTIVE_COST=$(printf '%s' "$BLOCKS_JSON" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+blocks = data.get('blocks', [])
+active = [b for b in blocks if b.get('isActive')]
+print(active[0]['costUSD'] if active else 0)
+")
+statusline_reconcile "statusline_block_eq_blocks_active" \
+    "$SL_BLOCK" "$BLOCKS_ACTIVE_COST"
+
+# Invariant 4: statusline_burn_rate_eq_blocks_active. Same source data,
+# burn formula (cost / elapsed_seconds * 3600).
+SL_BURN=$(printf '%s\n' "$SL_LINE" | sed -nE 's/.*🔥 \$([0-9.]+)\/hr.*/\1/p')
+EXPECTED_BURN=$(printf '%s' "$BLOCKS_JSON" | python3 -c "
+import json, sys, datetime as dt
+data = json.load(sys.stdin)
+blocks = data.get('blocks', [])
+active = [b for b in blocks if b.get('isActive')]
+if not active:
+    print(0)
+else:
+    b = active[0]
+    start = dt.datetime.fromisoformat(b['startTime'].replace('Z', '+00:00'))
+    now = dt.datetime.fromisoformat('$STATUSLINE_AS_OF'.replace('Z', '+00:00'))
+    elapsed_s = max(int((now - start).total_seconds()), 1)
+    cost = b.get('costUSD', 0)
+    burn = cost / elapsed_s * 3600.0
+    print(f'{burn:.2f}')
+")
+statusline_reconcile "statusline_burn_rate_eq_blocks_active" \
+    "$SL_BURN" "$EXPECTED_BURN"
+
+# Invariant 5: statusline_5h_eq_record_usage_latest. The rendered 5h %
+# matches the latest weekly_usage_snapshots.five_hour_percent for the
+# canonical window (post HWM clamp). Stdin already carries 34.0%, no
+# higher HWM stored → renders 34%.
+SL_5H=$(printf '%s\n' "$SL_LINE" | sed -nE 's/.*5h ([0-9]+)%.*/\1/p')
+EXPECTED_5H=$(sqlite3 "$STATUSLINE_FIXTURE_HOME/.local/share/cctally/stats.db" \
+    "SELECT five_hour_percent FROM weekly_usage_snapshots ORDER BY captured_at_utc DESC LIMIT 1" \
+    2>/dev/null)
+EXPECTED_5H_ROUNDED=$(awk -v p="$EXPECTED_5H" 'BEGIN{print int(p + 0.5)}')
+statusline_reconcile "statusline_5h_eq_record_usage_latest" \
+    "$SL_5H" "$EXPECTED_5H_ROUNDED"
+
+# Invariant 6: statusline_7d_eq_record_usage_latest. Same shape.
+SL_7D=$(printf '%s\n' "$SL_LINE" | sed -nE 's/.*7d ([0-9]+)%.*/\1/p')
+EXPECTED_7D=$(sqlite3 "$STATUSLINE_FIXTURE_HOME/.local/share/cctally/stats.db" \
+    "SELECT weekly_percent FROM weekly_usage_snapshots ORDER BY captured_at_utc DESC LIMIT 1" \
+    2>/dev/null)
+EXPECTED_7D_ROUNDED=$(awk -v p="$EXPECTED_7D" 'BEGIN{print int(p + 0.5)}')
+statusline_reconcile "statusline_7d_eq_record_usage_latest" \
+    "$SL_7D" "$EXPECTED_7D_ROUNDED"
+
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]
