@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# Golden harness for `cctally statusline` (issue #86 Session G).
+#
+# Bespoke — does NOT source `bin/_lib-fixture-harness.sh`. That shared lib
+# reads `input.env` + argv only; `statusline` is stdin-driven (the CC hook
+# pipes its JSON payload to the subcommand). Per-fixture layout:
+#
+#   tests/fixtures/statusline/<name>/
+#     input.json              — hook stdin (required)
+#     flags.txt               — optional CLI flags (one line, shell-split)
+#     input.env               — optional KEY=VALUE lines (AS_OF, NO_COLOR, ...)
+#     seeds/                  — optional pre-populated cache.db / stats.db /
+#                                config.json / transcripts/ to drop under
+#                                the scratch HOME's data dir before invoke
+#     golden.txt              — expected stdout (required)
+#     golden.err              — expected stderr (optional; default ⇒ empty)
+#     golden.rc               — expected exit code (optional; default 0)
+#
+# `{HOME}` literal in `input.json` is substituted with the per-fixture
+# scratch HOME before being piped — so a fixture's `transcript_path` can
+# point at `{HOME}/.local/share/cctally/transcripts/<name>.jsonl` and the
+# corresponding file (dropped via `seeds/transcripts/`) resolves correctly.
+#
+# Golden compares go through `bin/_lib-golden-diff.sh::_golden_diff_files`
+# (per issue #106/#107 — never inline `diff -u <(printf …)`). Each fixture
+# runs in its own `mktemp -d` HOME so in-tree fixtures stay byte-stable.
+#
+# Parallelism: serial. Each fixture is cheap (<200 ms) and the harness
+# rebuilds its seeds via `bin/build-statusline-fixtures.py` once at the
+# top into a scratch tree, then iterates. Output is line-buffered and
+# emitted in fixture-order so logs stay coherent under `xargs -P`.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+BIN="$REPO/bin/cctally"
+
+# Dev-instance isolation: force prod data-dir layout under fake HOME.
+# shellcheck disable=SC1091
+. "$HERE/_lib-harness-env.sh"
+# shellcheck disable=SC1091
+. "$HERE/_lib-golden-diff.sh"
+
+# Per-run scratch root. `bin/build-statusline-fixtures.py` writes its
+# generated seeds here so in-tree fixture dirs stay byte-stable; the
+# in-tree fixture dir still owns input.json / golden.* / flags.txt /
+# input.env, with the builder filling in seeds/.
+SCRATCH_ROOT="$(mktemp -d -t cctally-statusline-XXXXXX)"
+# 2>/dev/null swallows "Directory not empty" races on macOS APFS when WAL/
+# shm sidecar files are flushed concurrently with rm.
+trap 'rm -rf "$SCRATCH_ROOT" 2>/dev/null' EXIT
+export GOLDEN_DIFF_TMPDIR="$SCRATCH_ROOT"
+
+# Rebuild seeded fixtures into a scratch overlay. The overlay mirrors
+# tests/fixtures/statusline/<name>/seeds/ and is layered onto the in-tree
+# fixture at run-time (in-tree seeds, if any are checked in, win because
+# we copy in-tree last).
+SCRATCH_FIXTURES="$SCRATCH_ROOT/fixtures"
+mkdir -p "$SCRATCH_FIXTURES"
+if [ -x "$REPO/bin/build-statusline-fixtures.py" ]; then
+    python3 "$REPO/bin/build-statusline-fixtures.py" --out "$SCRATCH_FIXTURES" >/dev/null 2>&1 || {
+        echo "FAIL: build-statusline-fixtures.py exited non-zero"
+        exit 1
+    }
+fi
+
+FIXDIR="$REPO/tests/fixtures/statusline"
+if [ ! -d "$FIXDIR" ]; then
+    echo "statusline-test: no fixture directory at $FIXDIR; skipping"
+    exit 0
+fi
+
+pass=0
+fail=0
+
+# Enumerate in-tree fixture dirs (alphabetical via shell glob).
+for fix_dir in "$FIXDIR"/*/; do
+    [ -d "$fix_dir" ] || continue
+    name="$(basename "$fix_dir")"
+    # Skip hidden / cache dirs.
+    case "$name" in
+        .*) continue ;;
+    esac
+
+    if [ ! -f "$fix_dir/input.json" ]; then
+        echo "SKIP[$name] no input.json"
+        continue
+    fi
+    if [ ! -f "$fix_dir/golden.txt" ]; then
+        echo "SKIP[$name] no golden.txt"
+        continue
+    fi
+
+    # Per-fixture scratch HOME under the per-run scratch root.
+    scratch="$SCRATCH_ROOT/$name"
+    mkdir -p "$scratch/.local/share/cctally"
+
+    # Drop builder-generated seeds first (if any) then in-tree seeds last.
+    # In-tree wins on overlap. Copy contents (cp -a <src>/. <dst>/) so we
+    # don't get a nested `seeds/` directory.
+    if [ -d "$SCRATCH_FIXTURES/$name/seeds" ]; then
+        cp -a "$SCRATCH_FIXTURES/$name/seeds/." "$scratch/.local/share/cctally/" 2>/dev/null || true
+    fi
+    if [ -d "$fix_dir/seeds" ]; then
+        cp -a "$fix_dir/seeds/." "$scratch/.local/share/cctally/" 2>/dev/null || true
+    fi
+
+    # Pre-create empty cache.db with the full migration set applied so a
+    # first-open by `cctally statusline` doesn't emit the one-shot
+    # `[cache] migrated codex cache — re-ingesting` stderr message into a
+    # fresh fixture HOME. The builder helper writes the post-migration
+    # state matching what production's `open_cache_db` would produce.
+    if [ ! -f "$scratch/.local/share/cctally/cache.db" ]; then
+        PYTHONPATH="$REPO/bin" python3 -c "import _fixture_builders as fb, pathlib; fb.create_cache_db(pathlib.Path('$scratch/.local/share/cctally/cache.db'))" >/dev/null 2>&1 || true
+    fi
+
+    # Per-fixture env overrides (KEY=VALUE lines, # = comment, blanks ok).
+    AS_OF=""
+    NO_COLOR_VAL="1"
+    if [ -f "$fix_dir/input.env" ]; then
+        # Read line-by-line so we tolerate quoted values like FOO="bar baz".
+        while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            case "$line" in
+                \#*) continue ;;
+            esac
+            key="${line%%=*}"
+            val="${line#*=}"
+            # Strip surrounding double-quotes if present.
+            val="${val%\"}"
+            val="${val#\"}"
+            case "$key" in
+                AS_OF) AS_OF="$val" ;;
+                NO_COLOR) NO_COLOR_VAL="$val" ;;
+            esac
+        done < "$fix_dir/input.env"
+    fi
+
+    # Per-fixture CLI flags (single line; shell-split). `{HOME}` literal
+    # is substituted with the per-fixture scratch HOME so flag arguments
+    # like `--config {HOME}/path/to/file.json` resolve to absolute paths
+    # under the scratch tree.
+    flags_arr=()
+    if [ -f "$fix_dir/flags.txt" ]; then
+        flags_line=$(sed "s|{HOME}|$scratch|g" "$fix_dir/flags.txt")
+        # shellcheck disable=SC2207,SC2046,SC2086
+        flags_arr=( $flags_line )
+    fi
+
+    # Expected stderr / rc.
+    want_rc="$(cat "$fix_dir/golden.rc" 2>/dev/null || echo 0)"
+    want_err_file="$fix_dir/golden.err"
+
+    # Substitute {HOME} → scratch HOME in input.json if the literal is
+    # present. The substitution targets transcript_path entries that
+    # reference seeded transcript JSONL files under the data dir.
+    rendered_input="$scratch/input.json"
+    if grep -q '{HOME}' "$fix_dir/input.json" 2>/dev/null; then
+        sed "s|{HOME}|$scratch|g" "$fix_dir/input.json" > "$rendered_input"
+    else
+        cp "$fix_dir/input.json" "$rendered_input"
+    fi
+
+    actual_out="$scratch/actual.txt"
+    actual_err="$scratch/actual.err"
+
+    # Invocation. `TZ=Etc/UTC` per the fixture-determinism rule
+    # (`TZ=UTC` falls back to host-local since `_local_tz_name` gates
+    # on IANA "/"). `CCTALLY_DISABLE_DEV_AUTODETECT=1` already exported
+    # via _lib-harness-env.sh.
+    HOME="$scratch" \
+        CCTALLY_DATA_DIR="$scratch/.local/share/cctally" \
+        NO_COLOR="$NO_COLOR_VAL" \
+        TZ=Etc/UTC \
+        CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" statusline "${flags_arr[@]+"${flags_arr[@]}"}" \
+            < "$rendered_input" \
+            > "$actual_out" \
+            2> "$actual_err"
+    actual_rc=$?
+
+    ok=1
+    name="$name" _golden_diff_files "stdout" "$fix_dir/golden.txt" "$actual_out" || ok=0
+    if [ -f "$want_err_file" ]; then
+        name="$name" _golden_diff_files "stderr" "$want_err_file" "$actual_err" || ok=0
+    else
+        if [ -s "$actual_err" ]; then
+            echo "FAIL[$name] unexpected stderr (no golden.err):"
+            head -n 20 "$actual_err" >&2 || true
+            ok=0
+        fi
+    fi
+    if [ "$actual_rc" != "$want_rc" ]; then
+        echo "FAIL[$name] exit code $actual_rc != $want_rc"
+        ok=0
+    fi
+
+    if [ "$ok" -eq 1 ]; then
+        pass=$((pass + 1))
+        echo "PASS[$name]"
+    else
+        fail=$((fail + 1))
+    fi
+done
+
+echo "----"
+echo "statusline-test: $pass passed, $fail failed"
+# Aggregator parser (`bin/cctally-test-all`) tails the log for a line
+# matching `^passed: <N>   failed: <N>`; emit one so this harness shows
+# up in the test-all roll-up alongside the other golden harnesses.
+echo "passed: $pass   failed: $fail"
+[ "$fail" -eq 0 ]

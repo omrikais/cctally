@@ -1,0 +1,7 @@
+{
+  "session_id": "ctx-1m",
+  "model": {"id": "claude-opus-4-7[1m]", "display_name": "Opus 4.7 [1m]"},
+  "workspace": {"current_dir": "/tmp"},
+  "transcript_path": "{HOME}/.local/share/cctally/transcripts/sess-1m.jsonl",
+  "cost": {"total_cost_usd": 0.0}
+}

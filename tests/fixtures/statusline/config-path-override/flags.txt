@@ -1,0 +1,1 @@
+--config {HOME}/.local/share/cctally/custom-config.json

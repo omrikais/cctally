@@ -1,0 +1,11 @@
+{
+  "session_id": "cs-cc",
+  "model": {"id": "claude-sonnet-4-5", "display_name": "Sonnet 4.5"},
+  "workspace": {"current_dir": "/tmp"},
+  "transcript_path": "/nonexistent/cs-cc.jsonl",
+  "rate_limits": {
+    "five_hour": {"used_percentage": 34.0, "resets_at": 1779981720},
+    "seven_day": {"used_percentage": 42.0, "resets_at": 1780538400}
+  },
+  "cost": {"total_cost_usd": 2.50}
+}

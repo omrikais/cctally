@@ -1,0 +1,7 @@
+{
+  "session_id": "u",
+  "model": {"id": "future-model-xyz", "display_name": "Future Model"},
+  "workspace": {"current_dir": "/tmp"},
+  "transcript_path": "/nonexistent/u.jsonl",
+  "cost": {"total_cost_usd": 0.0}
+}

@@ -4643,7 +4643,10 @@ def cmd_statusline(args: argparse.Namespace) -> int:
     # Build injections (DB + transcript file IO).
     inj = _build_statusline_injections(warn_once)
 
-    now = dt.datetime.now(dt.timezone.utc)
+    # `_command_as_of()` honors the `CCTALLY_AS_OF` testing hook so the
+    # golden harness can pin "now" for deterministic block-remaining and
+    # 5h/7d countdown numbers. Falls back to wall-clock UTC otherwise.
+    now = _command_as_of()
     try:
         line = _lib_statusline.render_statusline(inp, sargs, inj, now)
     except Exception as exc:  # pragma: no cover — defensive

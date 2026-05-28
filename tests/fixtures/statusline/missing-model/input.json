@@ -1,0 +1,10 @@
+{
+  "session_id": "mm",
+  "workspace": {"current_dir": "/tmp"},
+  "transcript_path": "/nonexistent/mm.jsonl",
+  "rate_limits": {
+    "five_hour": {"used_percentage": 34.0, "resets_at": 1779981720},
+    "seven_day": {"used_percentage": 42.0, "resets_at": 1780538400}
+  },
+  "cost": {"total_cost_usd": 1.50}
+}

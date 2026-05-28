@@ -1,0 +1,7 @@
+{
+  "session_id": "ctx-green",
+  "model": {"id": "claude-sonnet-4-5", "display_name": "Sonnet 4.5"},
+  "workspace": {"current_dir": "/tmp"},
+  "transcript_path": "{HOME}/.local/share/cctally/transcripts/sess-green.jsonl",
+  "cost": {"total_cost_usd": 0.0}
+}

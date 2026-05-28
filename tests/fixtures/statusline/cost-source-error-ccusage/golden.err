@@ -1,0 +1,9 @@
+usage: cctally statusline [-h] [-B {off,emoji,text,emoji-text}]
+                          [--cost-source {auto,cctally,cc,both}] [--cache]
+                          [--no-cache] [--refresh-interval N]
+                          [--context-low-threshold N]
+                          [--context-medium-threshold N] [-z TZ] [-O]
+                          [--no-offline] [--color] [--no-color]
+                          [--cctally-extensions] [--no-cctally-extensions]
+                          [--config PATH] [--single-thread] [-d]
+cctally statusline: error: argument --cost-source: invalid choice: 'ccusage' — cctally renamed it; try --cost-source cctally

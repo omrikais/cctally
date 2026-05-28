@@ -70,6 +70,27 @@ compare_forms() {
     if [ "$ok" -eq 1 ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
 }
 
+# compare_forms_stdin <label> <home> <flat-argline> <subgroup-argline> <input.json>
+# Like compare_forms but pipes a fixture input.json to BOTH invocations.
+# Used by stdin-driven subcommands (cctally statusline; the CC hook
+# pipes JSON in). Same byte-equivalence contract: stdout + stderr + exit
+# code must match between the flat alias and the subgroup leaf.
+compare_forms_stdin() {
+    local label="$1" home="$2" flat="$3" sub="$4" input="$5"
+    local name="$label"
+    local o1 o2 e1 e2 r1 r2
+    # shellcheck disable=SC2086
+    o1=$(HOME="$home" CCTALLY_DATA_DIR="$home/.local/share/cctally" TZ=Etc/UTC NO_COLOR=1 CCTALLY_AS_OF="2026-05-28T12:00:00Z" "$BIN" $flat < "$input" 2>"$SCRATCH/e1"); r1=$?
+    # shellcheck disable=SC2086
+    o2=$(HOME="$home" CCTALLY_DATA_DIR="$home/.local/share/cctally" TZ=Etc/UTC NO_COLOR=1 CCTALLY_AS_OF="2026-05-28T12:00:00Z" "$BIN" $sub < "$input" 2>"$SCRATCH/e2"); r2=$?
+    e1=$(cat "$SCRATCH/e1"); e2=$(cat "$SCRATCH/e2")
+    local ok=1
+    _golden_diff_two_str "stdout" "$o1" "$o2" || { ok=0; }
+    _golden_diff_two_str "stderr" "$e1" "$e2" || { ok=0; }
+    [ "$r1" -eq "$r2" ] || { echo "FAIL[$label] exit code $r1 != $r2"; ok=0; }
+    if [ "$ok" -eq 1 ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+}
+
 # --- Claude commands: flat `<cmd>` == subgroup `claude <cmd>` ---
 for cmd in daily monthly weekly session blocks; do
     compare_forms "claude-$cmd-table" "$CLAUDE_HOME" "$cmd"        "claude $cmd"
@@ -86,6 +107,22 @@ compare_forms "claude-blocks-active"    "$CLAUDE_HOME" "blocks -a"        "claud
 compare_forms "claude-blocks-recent"    "$CLAUDE_HOME" "blocks -r"        "claude blocks -r"
 compare_forms "claude-blocks-tokenlim"  "$CLAUDE_HOME" "blocks -t 500000" "claude blocks -t 500000"
 compare_forms "claude-blocks-sesslen"   "$CLAUDE_HOME" "blocks -n 3"      "claude blocks -n 3"
+
+# claude statusline (issue #86 Session G): the only stdin-driven leaf in
+# the subgroup. Uses the subgroup-parity fixture's input.json + the
+# CLAUDE_HOME (which has cache.db seeded by build-blocks-fixtures so
+# `today`/`block` aggregations resolve). Two flag-surface variants
+# parallel the blocks coverage above so any future kernel-glue drift
+# between flat and subgroup forms surfaces in CI.
+SL_INPUT="$REPO_ROOT/tests/fixtures/statusline/subgroup-parity/input.json"
+if [ -f "$SL_INPUT" ]; then
+    compare_forms_stdin "claude-statusline-table"          "$CLAUDE_HOME" "statusline"                       "claude statusline"                       "$SL_INPUT"
+    compare_forms_stdin "claude-statusline-extensions-off" "$CLAUDE_HOME" "statusline --no-cctally-extensions" "claude statusline --no-cctally-extensions" "$SL_INPUT"
+    compare_forms_stdin "claude-statusline-cost-source"    "$CLAUDE_HOME" "statusline --cost-source cc"       "claude statusline --cost-source cc"      "$SL_INPUT"
+    compare_forms_stdin "claude-statusline-burn-emoji"     "$CLAUDE_HOME" "statusline -B emoji-text"          "claude statusline -B emoji-text"         "$SL_INPUT"
+else
+    echo "SKIP[claude-statusline-*] no fixture at tests/fixtures/statusline/subgroup-parity/input.json"
+fi
 
 # --- Codex commands: flat `codex-<cmd>` == subgroup `codex <cmd>` ---
 for cmd in daily monthly session weekly; do
