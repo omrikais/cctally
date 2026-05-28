@@ -4954,17 +4954,56 @@ def _build_statusline_injections(warn_once):
                     pass
             if seven_resets is not None:
                 try:
-                    # Seven-day window: derive week_start_date from the
-                    # resets_at epoch (reset - 7 days, UTC date).
-                    week_start_date = dt.datetime.fromtimestamp(
-                        int(seven_resets) - 7 * 86400, tz=dt.timezone.utc,
-                    ).date().isoformat()
-                    row = conn.execute(
-                        "SELECT MAX(weekly_percent) "
-                        "FROM weekly_usage_snapshots "
-                        "WHERE week_start_date = ?",
-                        (week_start_date,),
+                    # Seven-day window bounds from the resets_at epoch:
+                    # week_end = reset; week_start = reset - 7 days. The
+                    # date form is the snapshot lookup key (week_start_date
+                    # is deliberately NOT re-anchored across a mid-week
+                    # reset — see _apply_reset_events_to_subweeks).
+                    week_end_dt = dt.datetime.fromtimestamp(
+                        int(seven_resets), tz=dt.timezone.utc,
+                    )
+                    week_start_dt = week_end_dt - dt.timedelta(days=7)
+                    week_start_date = week_start_dt.date().isoformat()
+                    # Reset-aware floor. An Anthropic mid-week reset / in-
+                    # place credit leaves the pre-reset peak snapshots in
+                    # this SAME week_start_date bucket (the boundary the
+                    # snapshots carry does not change). A naive bucket-wide
+                    # MAX(weekly_percent) would clamp the post-reset value
+                    # UP to that stale peak — the statusline would show the
+                    # pre-reset 7d %. Mirror the CLI/dashboard segmentation
+                    # (_apply_reset_events_to_subweeks: post-reset window
+                    # start_ts := effective_reset_at_utc) by flooring the
+                    # MAX to snapshots captured at/after the latest reset
+                    # effective WITHIN this window. unixepoch() on both
+                    # sides — reset rows carry mixed offset spellings
+                    # (+00:00 / +03:00) while captured_at_utc uses 'Z', so a
+                    # lexical compare would misorder them (same rule as the
+                    # 5h-block cross-reset flag).
+                    floor_row = conn.execute(
+                        "SELECT MAX(effective_reset_at_utc) "
+                        "FROM week_reset_events "
+                        "WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?) "
+                        "  AND unixepoch(effective_reset_at_utc) <  unixepoch(?)",
+                        (week_start_dt.isoformat(), week_end_dt.isoformat()),
                     ).fetchone()
+                    floor_iso = (
+                        floor_row[0] if floor_row and floor_row[0] else None
+                    )
+                    if floor_iso is not None:
+                        row = conn.execute(
+                            "SELECT MAX(weekly_percent) "
+                            "FROM weekly_usage_snapshots "
+                            "WHERE week_start_date = ? "
+                            "  AND unixepoch(captured_at_utc) >= unixepoch(?)",
+                            (week_start_date, floor_iso),
+                        ).fetchone()
+                    else:
+                        row = conn.execute(
+                            "SELECT MAX(weekly_percent) "
+                            "FROM weekly_usage_snapshots "
+                            "WHERE week_start_date = ?",
+                            (week_start_date,),
+                        ).fetchone()
                     if row and row[0] is not None:
                         seven_hwm = float(row[0])
                 except Exception:
