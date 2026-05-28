@@ -14,7 +14,7 @@ runs offline.
 ```
 cctally claude <command> [flags]
 
-<command> ∈ { daily, monthly, weekly, session, blocks }
+<command> ∈ { daily, monthly, weekly, session, blocks, statusline }
 ```
 
 ## Subcommands
@@ -26,6 +26,7 @@ cctally claude <command> [flags]
 | `cctally claude weekly` | `cctally weekly` | [weekly.md](weekly.md) |
 | `cctally claude session` | `cctally session` | [session.md](session.md) |
 | `cctally claude blocks` | `cctally blocks` | [blocks.md](blocks.md) |
+| `cctally claude statusline` | `cctally statusline` | [statusline.md](statusline.md) |
 
 Every flag, exit code, and output shape is exactly that of the linked flat
 page — there are no behavior differences. See each page for the full option
@@ -55,4 +56,5 @@ cctally claude session --breakdown
 
 - [`codex`](codex.md) — the Codex-source subgroup (`ccusage codex …`)
 - The flat aliases: [`daily`](daily.md), [`monthly`](monthly.md),
-  [`weekly`](weekly.md), [`session`](session.md), [`blocks`](blocks.md)
+  [`weekly`](weekly.md), [`session`](session.md), [`blocks`](blocks.md),
+  [`statusline`](statusline.md)
