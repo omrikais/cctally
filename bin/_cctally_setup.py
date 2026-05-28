@@ -580,7 +580,16 @@ def _setup_detect_legacy_snippet() -> tuple[pathlib.Path, list[int]] | None:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        hits = [i + 1 for i, ln in enumerate(text.splitlines()) if c.LEGACY_STATUSLINE_NEEDLE in ln]
+        # Skip lines whose first non-whitespace char is `#`: a shell comment
+        # that merely references the legacy command in prose (e.g. a NOTE
+        # documenting its removal) is not an executing snippet (issue #115).
+        # POSIX shell only treats `#` as a comment marker at start-of-token,
+        # so this covers natural-language comments without parsing the shell.
+        hits = [
+            i + 1
+            for i, ln in enumerate(text.splitlines())
+            if c.LEGACY_STATUSLINE_NEEDLE in ln and not ln.lstrip().startswith("#")
+        ]
         if hits:
             return (path, hits)
     return None

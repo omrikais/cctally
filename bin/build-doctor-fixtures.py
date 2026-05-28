@@ -32,6 +32,7 @@ SCENARIOS = {
     "11-multi-fail-mixed":       "multi_fail_mixed",
     "12-corrupt-config-json":    "corrupt_config_json",
     "13-corrupt-update-suppress": "corrupt_update_suppress",
+    "14-legacy-snippet-in-comment-ignored": "legacy_snippet_in_comment",
 }
 
 
@@ -224,6 +225,23 @@ def _scenario_body(slug: str) -> str:
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
                 "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
             """)
+    if slug == "legacy_snippet_in_comment":
+        # Issue #115: reuse the clean all_ok seed verbatim (single source of
+        # truth for the symlink/hooks/oauth/snapshot baseline), then drop in a
+        # statusline-command.sh whose only `cctally record-usage` references
+        # live inside shell comments. The detector must NOT flag it — doctor
+        # stays fully OK. The heredoc body mirrors the real-world trigger: the
+        # lean #86 Session G script that pipes to `cctally statusline` with a
+        # trailing NOTE comment documenting the removed `cctally record-usage`.
+        statusline = textwrap.dedent("""\
+            cat > "$HARNESS_FAKE_HOME/.claude/statusline-command.sh" <<'SH'
+            #!/bin/bash
+            # NOTE: the prior `cctally record-usage` background invocation was removed.
+            # Persistence now flows via `cctally hook-tick` from the PostToolBatch hook.
+            exec cctally statusline "$@"
+            SH
+            """)
+        return _scenario_body("all_ok") + statusline
     if slug == "multi_fail_mixed":
         return textwrap.dedent("""\
             mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally/logs"

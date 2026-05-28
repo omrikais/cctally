@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- `cctally doctor` no longer warns about a "legacy status-line snippet" when your `~/.claude/statusline-command.sh` merely *mentions* `cctally record-usage` inside a shell comment — e.g. a trailing `# NOTE:` documenting that the old background invocation was removed. The detector (`_setup_detect_legacy_snippet`) tested only `"cctally record-usage" in line` with no comment-stripping, so a `#`-prefixed prose reference was reported identically to a line that actually executes it, and the WARN surfaced in terminal `doctor` output, the dashboard freshness chip + doctor modal, and the TUI hero card — nudging users to delete a harmless comment of their own. It now skips any line whose first non-whitespace character is `#` (POSIX shell only treats `#` as a comment marker at start-of-token, so natural-language comments are excluded without trying to parse the shell); actually-executing legacy lines like `exec cctally record-usage "$@"` still fire exactly as before. Regression: new `tests/test_setup_legacy_snippet.py` unit coverage (comment-only / indented-comment / real-line / mixed cases) plus a new `bin/cctally-doctor-test` scenario `14-legacy-snippet-in-comment-ignored` that asserts a clean install carrying the needle only in comments stays fully OK. (#115)
+
 ## [1.21.2] - 2026-05-28
 
 ### Fixed
