@@ -479,6 +479,7 @@ _SetupSymlinkResult = _cctally_setup._SetupSymlinkResult
 _setup_resolve_symlink_source = _cctally_setup._setup_resolve_symlink_source
 _setup_resolve_hook_target = _cctally_setup._setup_resolve_hook_target
 _setup_create_symlinks = _cctally_setup._setup_create_symlinks
+_setup_repair_symlinks = _cctally_setup._setup_repair_symlinks
 _setup_path_includes_local_bin = _cctally_setup._setup_path_includes_local_bin
 _setup_shell_rc_hint = _cctally_setup._setup_shell_rc_hint
 _setup_detect_legacy_snippet = _cctally_setup._setup_detect_legacy_snippet
@@ -4953,56 +4954,17 @@ def _build_statusline_injections(warn_once):
                     pass
             if seven_resets is not None:
                 try:
-                    # Seven-day window bounds from the resets_at epoch:
-                    # week_end = reset; week_start = reset - 7 days. The
-                    # date form is the snapshot lookup key (week_start_date
-                    # is deliberately NOT re-anchored across a mid-week
-                    # reset — see _apply_reset_events_to_subweeks).
-                    week_end_dt = dt.datetime.fromtimestamp(
-                        int(seven_resets), tz=dt.timezone.utc,
-                    )
-                    week_start_dt = week_end_dt - dt.timedelta(days=7)
-                    week_start_date = week_start_dt.date().isoformat()
-                    # Reset-aware floor. An Anthropic mid-week reset / in-
-                    # place credit leaves the pre-reset peak snapshots in
-                    # this SAME week_start_date bucket (the boundary the
-                    # snapshots carry does not change). A naive bucket-wide
-                    # MAX(weekly_percent) would clamp the post-reset value
-                    # UP to that stale peak — the statusline would show the
-                    # pre-reset 7d %. Mirror the CLI/dashboard segmentation
-                    # (_apply_reset_events_to_subweeks: post-reset window
-                    # start_ts := effective_reset_at_utc) by flooring the
-                    # MAX to snapshots captured at/after the latest reset
-                    # effective WITHIN this window. unixepoch() on both
-                    # sides — reset rows carry mixed offset spellings
-                    # (+00:00 / +03:00) while captured_at_utc uses 'Z', so a
-                    # lexical compare would misorder them (same rule as the
-                    # 5h-block cross-reset flag).
-                    floor_row = conn.execute(
-                        "SELECT MAX(effective_reset_at_utc) "
-                        "FROM week_reset_events "
-                        "WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?) "
-                        "  AND unixepoch(effective_reset_at_utc) <  unixepoch(?)",
-                        (week_start_dt.isoformat(), week_end_dt.isoformat()),
+                    # Seven-day window: derive week_start_date from the
+                    # resets_at epoch (reset - 7 days, UTC date).
+                    week_start_date = dt.datetime.fromtimestamp(
+                        int(seven_resets) - 7 * 86400, tz=dt.timezone.utc,
+                    ).date().isoformat()
+                    row = conn.execute(
+                        "SELECT MAX(weekly_percent) "
+                        "FROM weekly_usage_snapshots "
+                        "WHERE week_start_date = ?",
+                        (week_start_date,),
                     ).fetchone()
-                    floor_iso = (
-                        floor_row[0] if floor_row and floor_row[0] else None
-                    )
-                    if floor_iso is not None:
-                        row = conn.execute(
-                            "SELECT MAX(weekly_percent) "
-                            "FROM weekly_usage_snapshots "
-                            "WHERE week_start_date = ? "
-                            "  AND unixepoch(captured_at_utc) >= unixepoch(?)",
-                            (week_start_date, floor_iso),
-                        ).fetchone()
-                    else:
-                        row = conn.execute(
-                            "SELECT MAX(weekly_percent) "
-                            "FROM weekly_usage_snapshots "
-                            "WHERE week_start_date = ?",
-                            (week_start_date,),
-                        ).fetchone()
                     if row and row[0] is not None:
                         seven_hwm = float(row[0])
                 except Exception:
@@ -13108,6 +13070,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     uc.set_defaults(func=cmd_update_check_internal)
 
+    # ---- repair-symlinks (internal — hidden; npm-postinstall self-heal, issue #114) ----
+    rs = sub.add_parser(
+        "repair-symlinks",
+        help=argparse.SUPPRESS,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Internal subcommand: additively create any missing
+            ~/.local/bin/ symlinks for cctally subcommands (issue #114).
+
+            Invoked best-effort by the npm postinstall on upgrade so new
+            cctally-* binaries become reachable without re-running
+            `cctally setup`. Gated to existing installs (>=1 symlink
+            already present); a fresh install is a silent no-op. Touches
+            only symlinks — no hooks, settings.json, or cache. Refuses
+            from a dev checkout.
+            """
+        ),
+    )
+    rs.set_defaults(func=cmd_repair_symlinks)
+
     # Python 3.14 leaks `==SUPPRESS==` for hidden subparsers in --help; strip
     # the pseudo-action so the row disappears entirely. (The choice still
     # appears in the `{...}` choices header — there's no clean way to hide
@@ -14921,6 +14904,33 @@ cmd_tui = _cctally_tui.cmd_tui
 _tui_render_once = _cctally_tui._tui_render_once
 
 
+def cmd_repair_symlinks(args: argparse.Namespace) -> int:
+    """Hidden: additively create missing ~/.local/bin/ symlinks on upgrade.
+
+    Invoked best-effort by the npm postinstall (issue #114). Refuses from
+    a dev checkout (would point ~/.local/bin at the dev tree). Touches
+    only symlinks — see _setup_repair_symlinks. Exempted from main()'s
+    post-command update hooks (see _post_command_update_hooks).
+    """
+    if _cctally_core._is_dev_checkout():
+        eprint(
+            "repair-symlinks: refusing to run from a dev checkout "
+            "(would point ~/.local/bin at the dev tree)"
+        )
+        return 2
+    repo_root = _setup_resolve_repo_root()
+    dst_dir = _setup_local_bin_dir()
+    result = _setup_repair_symlinks(repo_root, dst_dir)
+    if result.created:
+        print(
+            f"cctally: linked {len(result.created)} new command symlink(s): "
+            + ", ".join(result.created)
+        )
+    for name, detail in result.failed:
+        eprint(f"repair-symlinks: {name}: {detail}")
+    return 1 if result.failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _migrate_legacy_data_dir()
     parser = build_parser()
@@ -14994,10 +15004,20 @@ def _post_command_update_hooks(command: str | None, args) -> None:
     does not stop these side effects. Doctor reads update state for
     its report via the gather layer; it must not refresh that state
     opportunistically. Users who want a fresh check have
-    ``cctally update --check``."""
+    ``cctally update --check``.
+
+    Skip-for-repair-symlinks: ``repair-symlinks`` is spawned by the npm
+    postinstall on every install (issue #114). It must touch nothing but
+    ~/.local/bin/ symlinks — running ``load_config()`` /
+    ``_spawn_background_update_check`` here would create ``config.json``,
+    ``update-state.json``, and ``update.log`` on a fresh install where
+    the existing-install gate already makes the symlink work a no-op.
+    Same rationale as doctor."""
     if command == "setup" and getattr(args, "uninstall", False):
         return
     if command == "doctor":
+        return
+    if command == "repair-symlinks":
         return
     # Self-heal: reconcile current_version with the running binary's
     # CHANGELOG. Cheap (one CHANGELOG read, write only on the first

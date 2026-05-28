@@ -373,6 +373,44 @@ def _setup_create_symlinks(
     return results
 
 
+@dataclasses.dataclass
+class _RepairResult:
+    gated: bool
+    created: list[str]
+    failed: list[tuple[str, str]]  # (name, detail)
+
+
+def _setup_repair_symlinks(
+    repo_root: pathlib.Path, dst_dir: pathlib.Path,
+) -> _RepairResult:
+    """Additively reconcile ``dst_dir`` to ``SETUP_SYMLINK_NAMES`` (issue #114).
+
+    Existing-install gate: acts only when at least one
+    ``SETUP_SYMLINK_NAMES`` symlink is already present in ``dst_dir`` — a
+    fresh install (zero links) is left untouched so onboarding stays
+    opt-in. Strictly additive: creates only *genuinely empty* slots and
+    leaves present / wrong-target / dangling / non-symlink slots alone.
+    Touches nothing but ``~/.local/bin/`` symlinks (no hooks /
+    settings.json / cache). Filesystem-only — deliberately NOT PATH-aware
+    (unlike :func:`_setup_compute_symlink_state`), so it stays
+    deterministic regardless of the live ``PATH``.
+    """
+    names = _cctally().SETUP_SYMLINK_NAMES
+    present = [n for n in names if (dst_dir / n).is_symlink()]
+    if not present:
+        return _RepairResult(gated=True, created=[], failed=[])
+    missing = [
+        n for n in names
+        if not (dst_dir / n).is_symlink() and not (dst_dir / n).exists()
+    ]
+    if not missing:
+        return _RepairResult(gated=False, created=[], failed=[])
+    results = _setup_create_symlinks(repo_root, dst_dir, names=tuple(missing))
+    created = [r.name for r in results if r.status == "created"]
+    failed = [(r.name, r.detail) for r in results if r.status == "failed"]
+    return _RepairResult(gated=False, created=created, failed=failed)
+
+
 def _setup_cleanup_stale_symlinks(
     dst_dir: pathlib.Path,
 ) -> list[_SetupSymlinkResult]:
