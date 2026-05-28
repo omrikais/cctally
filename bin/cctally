@@ -281,6 +281,7 @@ _short_model_name = _lib_pricing._short_model_name
 # Unknown model id → segment renders `🧠 N/A` + one-shot stderr warn.
 CLAUDE_MODEL_CONTEXT_WINDOWS = {
     # 1M-token variants (explicit IDs override the family default).
+    "claude-opus-4-8[1m]": 1_000_000,
     "claude-opus-4-7[1m]": 1_000_000,
     "claude-sonnet-4-5[1m]": 1_000_000,
     # Default 200K for every other Sonnet/Opus/Haiku family member.

@@ -194,6 +194,12 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "cache_creation_input_token_cost": 6.25e-06,
         "cache_read_input_token_cost": 5e-07,
     },
+    "claude-opus-4-8": {
+        "input_cost_per_token": 5e-06,
+        "output_cost_per_token": 2.5e-05,
+        "cache_creation_input_token_cost": 6.25e-06,
+        "cache_read_input_token_cost": 5e-07,
+    },
     "claude-sonnet-4-20250514": {
         "input_cost_per_token": 3e-06,
         "output_cost_per_token": 1.5e-05,
