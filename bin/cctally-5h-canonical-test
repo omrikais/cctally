@@ -147,12 +147,15 @@ finish_scenario () {
 # Run a `cctally record-usage` invocation in an isolated HOME.
 # Stdout and stderr are appended to per-home log files so a future
 # debugger can inspect what cctally said when a regression hits.
-# CCTALLY_AS_OF is pinned to 1h before BASE so the seeded BASE epoch
-# (2025-04-30T12:00:00Z) sits inside the issue #112 plausibility band
-# regardless of actual wall-clock.
+# Default CCTALLY_AS_OF pins wall-clock to BASE+5min so the seeded 5h
+# epochs ($BASE, $BOUND_NEAR, $BOUND_PAST, $NEXT=BASE+5h) all sit
+# inside the issue #112 10m-past / 6h-future plausibility band.
+# Scenarios that simulate an out-of-order older glitch sample (e.g.
+# scenario I's $OLD tick) override via $_CCTALLY_TICK_AS_OF per call.
 record_usage () {
     local home="$1"; shift
-    HOME="$home" TZ=Etc/UTC CCTALLY_AS_OF="2025-04-30T11:00:00Z" \
+    local as_of="${_CCTALLY_TICK_AS_OF:-2025-04-30T12:05:00Z}"
+    HOME="$home" TZ=Etc/UTC CCTALLY_AS_OF="$as_of" \
         "$BIN" record-usage "$@" \
         >>"$home/cctally-stdout.log" 2>>"$home/cctally-stderr.log"
 }
@@ -529,8 +532,14 @@ PY
 
     # Call 2: 5h_pct=85 with an OLD resets_at (different physical
     # window). Pre-fix, this snapshot would become the prior-anchor for
-    # call 3.
-    record_usage "$home" \
+    # call 3. The status-line tick is simulated as having occurred at
+    # OLD-time itself (5h earlier than the rest of the scenario), so
+    # the 5h epoch sits within the new 10m-past band. The point of
+    # the test is that the older block-row materializes (window B) and
+    # then call 3 (back at the original AS_OF) must NOT pick it as the
+    # prior-anchor for window A — issue #112's band check doesn't
+    # change that test's intent.
+    _CCTALLY_TICK_AS_OF="2025-04-30T07:05:00Z" record_usage "$home" \
         --percent 31 --resets-at 1746273600 \
         --five-hour-percent 85 --five-hour-resets-at "$OLD"
 

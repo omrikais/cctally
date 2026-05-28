@@ -110,21 +110,40 @@ def test_a3_common_case_accepted(ns, capsys):
     assert "rejecting" not in err
 
 
-# --- A4: valid weekly + year-off 5h → 5h-specific rejection -----------------
+# --- A4: valid weekly + year-off 5h → drop 5h fields, write weekly ----------
 
-def test_a4_year_off_5h_only_rejected(ns, capsys):
+def test_a4_year_off_5h_drops_5h_keeps_weekly(ns, capsys):
+    """Out-of-band 5h is non-fatal: drop the 5h portion and still write
+    the weekly snapshot row. Tightening the 5h past band addresses the
+    cross-block-pollution gap (entries past the real reset getting
+    charged to the previous block via _compute_block_totals); switching
+    from `return 2` to drop-and-continue preserves the documented
+    manual-replay path (record-usage.md), whose snippet includes the
+    5h flags whenever they were present at capture."""
     rc = _run(
         ns,
         resets_at=_GOOD_WEEK_RESETS_EPOCH,
         five_hour_percent=10.0,
         five_hour_resets_at=_PHANTOM_YEAR_EPOCH,
     )
-    assert rc == 2
-    assert _snapshot_row_count(ns) == 0
+    assert rc == 0
+    assert _snapshot_row_count(ns) == 1
     err = capsys.readouterr().err
-    assert "[record-usage] rejecting --five-hour-resets-at=" in err
+    assert "[record-usage] dropping --five-hour-resets-at=" in err
+    assert "Weekly snapshot still written" in err
     # Must NOT name --resets-at (that one was valid).
+    assert "dropping --resets-at=" not in err
     assert "rejecting --resets-at=" not in err
+    # 5h fields on the written row must be NULL.
+    with ns["open_db"]() as conn:
+        row = conn.execute(
+            "SELECT five_hour_percent, five_hour_resets_at, "
+            "       five_hour_window_key "
+            "  FROM weekly_usage_snapshots"
+        ).fetchone()
+        assert row["five_hour_percent"] is None
+        assert row["five_hour_resets_at"] is None
+        assert row["five_hour_window_key"] is None
 
 
 # --- A5: 14-day-old replay inside 30d slack accepted ------------------------
@@ -155,10 +174,12 @@ def test_a6_ms_epoch_rejects_without_crash(ns, capsys):
     assert str(ms_epoch) in err
 
 
-def test_a6_ms_epoch_on_5h_rejects_without_crash(ns, capsys):
+def test_a6_ms_epoch_on_5h_drops_5h_keeps_weekly(ns, capsys):
     """Same as A6 but for --five-hour-resets-at — the original spec
     placement would have crashed on the fromtimestamp() at line 1284
-    before the guard ran."""
+    before the guard ran. ms-epoch on 5h is non-fatal under the
+    drop-and-continue contract: weekly row still writes, 5h fields are
+    NULL."""
     ms_epoch = _PHANTOM_YEAR_EPOCH * 1000
     rc = _run(
         ns,
@@ -166,10 +187,15 @@ def test_a6_ms_epoch_on_5h_rejects_without_crash(ns, capsys):
         five_hour_percent=10.0,
         five_hour_resets_at=ms_epoch,
     )
-    assert rc == 2
-    assert _snapshot_row_count(ns) == 0
+    assert rc == 0
+    assert _snapshot_row_count(ns) == 1
     err = capsys.readouterr().err
-    assert "[record-usage] rejecting --five-hour-resets-at=" in err
+    assert "[record-usage] dropping --five-hour-resets-at=" in err
+    with ns["open_db"]() as conn:
+        row = conn.execute(
+            "SELECT five_hour_resets_at FROM weekly_usage_snapshots"
+        ).fetchone()
+        assert row["five_hour_resets_at"] is None
 
 
 # --- A7: refresh-layer boundary maps reject to record_failed ----------------
@@ -237,14 +263,15 @@ def test_band_just_past_upper_edge_week_resets_rejected(ns, capsys):
 
 
 def test_band_lower_edge_5h_resets_accepted(ns):
-    """At now - 6h the 5h epoch is INSIDE the band (closed lower bound).
-    Covers the naturally-expired-window scenario where the upstream
-    statusline lags by up to one period."""
+    """At now - 10m the 5h epoch is INSIDE the band (closed lower bound).
+    10 minutes matches _FIVE_HOUR_JITTER_FLOOR_SECONDS — enough to absorb
+    boundary jitter / clock skew without leaving the next-block-pollution
+    gap that a wider past-slack would open in maybe_update_five_hour_block."""
     rc = _run(
         ns,
         resets_at=_GOOD_WEEK_RESETS_EPOCH,
         five_hour_percent=10.0,
-        five_hour_resets_at=_AS_OF_EPOCH - 6 * 3600,
+        five_hour_resets_at=_AS_OF_EPOCH - 600,
     )
     assert rc == 0
 
@@ -259,17 +286,55 @@ def test_band_upper_edge_5h_resets_accepted(ns):
     assert rc == 0
 
 
-def test_band_just_past_lower_edge_5h_resets_rejected(ns, capsys):
-    """At now - 6h - 1s the 5h epoch is OUTSIDE the band."""
+def test_band_just_past_lower_edge_5h_resets_drops_5h(ns, capsys):
+    """At now - 10m - 1s the 5h epoch is OUTSIDE the band. Drop the 5h
+    fields and continue (drop-and-continue contract); weekly snapshot
+    still writes."""
     rc = _run(
         ns,
         resets_at=_GOOD_WEEK_RESETS_EPOCH,
         five_hour_percent=10.0,
-        five_hour_resets_at=_AS_OF_EPOCH - 6 * 3600 - 1,
+        five_hour_resets_at=_AS_OF_EPOCH - 600 - 1,
     )
-    assert rc == 2
+    assert rc == 0
+    assert _snapshot_row_count(ns) == 1
     err = capsys.readouterr().err
-    assert "[record-usage] rejecting --five-hour-resets-at=" in err
+    assert "[record-usage] dropping --five-hour-resets-at=" in err
+    with ns["open_db"]() as conn:
+        row = conn.execute(
+            "SELECT five_hour_resets_at FROM weekly_usage_snapshots"
+        ).fetchone()
+        assert row["five_hour_resets_at"] is None
+
+
+def test_manual_replay_with_stale_5h_writes_weekly(ns, capsys):
+    """Documented manual-replay path (record-usage.md). The status-line
+    snippet emits `--five-hour-percent` + `--five-hour-resets-at`
+    alongside the weekly flags whenever the upstream payload had a 5h
+    block; a 14-day-old replay's 5h epoch is unrecoverably stale, but
+    we must still write the weekly snapshot row (the whole point of
+    the wider 30d weekly past-slack)."""
+    fourteen_days_old = _AS_OF_EPOCH - 14 * 86400
+    rc = _run(
+        ns,
+        resets_at=fourteen_days_old,
+        five_hour_percent=10.0,
+        five_hour_resets_at=fourteen_days_old + 3 * 3600,
+    )
+    assert rc == 0
+    assert _snapshot_row_count(ns) == 1
+    err = capsys.readouterr().err
+    assert "[record-usage] dropping --five-hour-resets-at=" in err
+    assert "rejecting --resets-at=" not in err
+    with ns["open_db"]() as conn:
+        row = conn.execute(
+            "SELECT week_start_date, five_hour_percent, five_hour_resets_at "
+            "  FROM weekly_usage_snapshots"
+        ).fetchone()
+        # Weekly fields land normally; 5h fields are NULL.
+        assert row["week_start_date"] is not None
+        assert row["five_hour_percent"] is None
+        assert row["five_hour_resets_at"] is None
 
 
 # --- Negative epoch (very old past, well outside band) -----------------------

@@ -302,18 +302,32 @@ def _hook_tick_make_mock_refresh(*args, **kwargs):
 _PERCENT_NORMALIZE_DECIMALS = 10
 
 # Plausibility band for --resets-at / --five-hour-resets-at (issue #112).
-# Out-of-band epochs are rejected at cmd_record_usage ingress before any
+# Out-of-band epochs are guarded at cmd_record_usage ingress before any
 # datetime.fromtimestamp() call, so absurd values (ms-epochs, year-off
-# bugs) can't crash the call or stamp phantom-week rows. Past slack on
-# --resets-at is 30 days so the documented manual-snapshot-replay use
-# case (docs/commands/record-usage.md:54-57) keeps working. Past slack
-# on --five-hour-resets-at is 6 hours so a naturally-expired window that
-# hasn't yet rolled to the next anchor (transient state when statusline
-# upstream lags up to one period) still gets accepted — year-off bugs
-# are still caught with ~70× margin.
+# bugs) can't crash the call or stamp phantom-week rows.
+#
+# The two bands are deliberately asymmetric and reject differently:
+#
+#   --resets-at: 30d past / 8d future. Wide past slack preserves the
+#       documented "manually replay a missed snapshot" use case
+#       (docs/commands/record-usage.md). Out-of-band → return 2
+#       (entire call rejected, no weekly row written).
+#
+#   --five-hour-resets-at: 10m past / 6h future. Tight past slack is
+#       intentional: maybe_update_five_hour_block computes
+#       _compute_block_totals(block_start_at, captured_at_dt) where
+#       captured_at_dt ≈ now and block_start_at = resets_at - 5h, so
+#       accepting an already-expired 5h resets_at pollutes the prior
+#       block with session_entries that belong to the NEXT block. 10m
+#       matches _FIVE_HOUR_JITTER_FLOOR_SECONDS (the canonical-window-key
+#       jitter floor) — enough for boundary jitter / clock skew, not
+#       enough for cross-block pollution. Out-of-band → drop the 5h
+#       fields and continue (the weekly snapshot still writes), so a
+#       manual replay with stale 5h flags doesn't fail-close on a
+#       documented recovery path.
 _RECORD_USAGE_WEEK_PAST_SLACK_S = 30 * 86400
 _RECORD_USAGE_WEEK_FUTURE_BAND_S = 8 * 86400
-_RECORD_USAGE_5H_PAST_SLACK_S = 6 * 3600
+_RECORD_USAGE_5H_PAST_SLACK_S = 600  # 10 min; matches _FIVE_HOUR_JITTER_FLOOR_SECONDS
 _RECORD_USAGE_5H_FUTURE_BAND_S = 6 * 3600
 
 
@@ -1316,19 +1330,34 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
     if args.five_hour_resets_at is not None:
         five_hour_resets_at_epoch = int(args.five_hour_resets_at)
         # Band-check BEFORE fromtimestamp (issue #112).
+        #
+        # Out-of-band 5h is non-fatal: drop the 5h fields and continue
+        # so the weekly snapshot still writes. Two motivating cases:
+        #   (a) docs' manual-replay path (record-usage.md) emits the
+        #       original status-line args verbatim, including stale 5h
+        #       flags — rejecting the whole call there contradicts the
+        #       wider 30d weekly past slack.
+        #   (b) An already-expired 5h resets_at would pollute the prior
+        #       block's totals (block_start_at = resets_at - 5h →
+        #       _compute_block_totals charges entries past the real
+        #       reset to this block). Dropping the 5h portion here
+        #       skips maybe_update_five_hour_block entirely.
         if not (now_epoch - _RECORD_USAGE_5H_PAST_SLACK_S
                 <= five_hour_resets_at_epoch
                 <= now_epoch + _RECORD_USAGE_5H_FUTURE_BAND_S):
             eprint(
-                f"[record-usage] rejecting --five-hour-resets-at="
+                f"[record-usage] dropping --five-hour-resets-at="
                 f"{five_hour_resets_at_epoch}: outside plausibility band "
-                f"[now-6h, now+6h]; now={now_epoch} "
-                f"({now_dt.isoformat()}). No row written."
+                f"[now-10m, now+6h]; now={now_epoch} "
+                f"({now_dt.isoformat()}). Weekly snapshot still written; "
+                f"5h fields will be NULL."
             )
-            return 2
-        five_hour_resets_at_str = dt.datetime.fromtimestamp(
-            five_hour_resets_at_epoch, tz=dt.timezone.utc
-        ).isoformat(timespec="seconds")
+            five_hour_percent = None
+            five_hour_resets_at_epoch = None
+        else:
+            five_hour_resets_at_str = dt.datetime.fromtimestamp(
+                five_hour_resets_at_epoch, tz=dt.timezone.utc
+            ).isoformat(timespec="seconds")
         # five_hour_window_key derivation is deferred until after open_db()
         # so we can pass the most-recent stored sample as the prior anchor.
         # See _canonical_5h_window_key docstring (spec invariant #3:
