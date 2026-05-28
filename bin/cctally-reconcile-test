@@ -3081,8 +3081,6 @@ statusline_reconcile () {
     local name="$1" extracted="$2" expected="$3"
     local diff
     diff=$(awk -v a="$extracted" -v b="$expected" 'BEGIN{d=a-b; if(d<0)d=-d; print d}')
-    local ok
-    ok=$(awk -v d="$diff" 'BEGIN{exit !(d < 1e-9)}')
     if awk -v d="$diff" 'BEGIN{exit !(d < 1e-9)}'; then
         echo "PASS $name statusline/reconcile"
         pass_count=$((pass_count + 1))

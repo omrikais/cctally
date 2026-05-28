@@ -18,11 +18,15 @@ subset that needs:
     ``config-persistence`` / ``cli-overrides-config`` /
     ``config-path-override``).
 
-Default ``--out`` writes a scratch overlay tree mirroring the in-tree
-fixture layout (``<out>/<scenario>/seeds/...``); the harness drops the
-contents into each fixture's scratch HOME before invoking. Byte-stability
-is guaranteed via ``_fixture_builders.register_fixture_db()`` (zeros the
-SQLite writer-version header bytes at process exit).
+Default ``--out`` is the in-tree fixture directory at
+``tests/fixtures/statusline``, which writes ``<scenario>/seeds/...``
+directly into the repo tree. The harness overrides ``--out`` with a
+per-run scratch path so in-tree fixtures stay byte-stable; invoking
+this builder manually with no args ALSO regenerates the in-tree seeds,
+which is intentional for the ad-hoc "rebuild the committed fixtures
+in place" workflow. Byte-stability is guaranteed via
+``_fixture_builders.register_fixture_db()`` (zeros the SQLite
+writer-version header bytes at process exit).
 
 Stdlib only.
 """

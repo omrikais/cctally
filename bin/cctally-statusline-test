@@ -58,10 +58,13 @@ export GOLDEN_DIFF_TMPDIR="$SCRATCH_ROOT"
 SCRATCH_FIXTURES="$SCRATCH_ROOT/fixtures"
 mkdir -p "$SCRATCH_FIXTURES"
 if [ -x "$REPO/bin/build-statusline-fixtures.py" ]; then
-    python3 "$REPO/bin/build-statusline-fixtures.py" --out "$SCRATCH_FIXTURES" >/dev/null 2>&1 || {
+    builder_log="$SCRATCH_ROOT/builder.log"
+    if ! python3 "$REPO/bin/build-statusline-fixtures.py" \
+            --out "$SCRATCH_FIXTURES" >"$builder_log" 2>&1; then
         echo "FAIL: build-statusline-fixtures.py exited non-zero"
+        cat "$builder_log" >&2
         exit 1
-    }
+    fi
 fi
 
 FIXDIR="$REPO/tests/fixtures/statusline"
