@@ -50,6 +50,17 @@ fail_count=0
 SCRATCH_ROOT=$(mktemp -d -t cctally-doctor-fixtures-XXXXXX)
 trap 'rm -rf "$SCRATCH_ROOT"' EXIT
 
+# Clean python-only bin for the scrubbed PATH (issue #114).
+# _setup_compute_symlink_state is now shutil.which-aware, so the scrubbed
+# PATH must keep python3 reachable WITHOUT exposing a real `cctally` (or
+# any cctally-* sibling). Adding the raw `dirname python3` would leak them
+# on hosts where python3 lives in a Homebrew/npm bin that also holds the
+# user's installed cctally (the symptom: a "0/13" scenario flips to
+# "1/13"). A dir containing only a python3 symlink isolates that.
+PY_CLEAN_BIN="$SCRATCH_ROOT/.py-clean-bin"
+mkdir -p "$PY_CLEAN_BIN"
+ln -sf "$(command -v python3)" "$PY_CLEAN_BIN/python3"
+
 # Refresh setup.sh + .gitignore from the builder so harness output
 # reflects current scaffold (parallels build-forecast-fixtures.py
 # invocation in cctally-forecast-test).
@@ -89,7 +100,14 @@ run_mode () {
     }
 
     # Build PATH so install.path check passes ($scratch/.local/bin first).
-    local fake_path="$scratch/.local/bin:$PATH"
+    # Scrubbed (issue #114): _setup_compute_symlink_state is now
+    # shutil.which-aware, so inheriting the real $PATH (which exposes the
+    # host's real ~/.local/bin — and a Homebrew/npm bin that holds a real
+    # `cctally`) would non-deterministically flip the "0/13" missing-symlink
+    # scenarios to "ok". $PY_CLEAN_BIN holds only a python3 symlink so the
+    # CLI still runs without leaking any cctally* binary onto PATH; /usr/bin
+    # keeps security/osascript reachable for the OAuth/alert checks.
+    local fake_path="$scratch/.local/bin:$PY_CLEAN_BIN:/usr/bin:/bin"
 
     # Capture stdout only. The post-command hook (which fires AFTER
     # cmd_doctor returns) calls load_config(); for the corrupt-config
@@ -155,7 +173,8 @@ run_exit_code () {
         fail_count=$((fail_count + 1))
         return 1
     }
-    local fake_path="$scratch/.local/bin:$PATH"
+    # Scrubbed PATH (issue #114): see run_mode for rationale.
+    local fake_path="$scratch/.local/bin:$PY_CLEAN_BIN:/usr/bin:/bin"
     local exit_file="$dir/expected.exit"
     local actual_exit
 

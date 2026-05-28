@@ -21,7 +21,7 @@
                     },
                     "id": "install.symlinks",
                     "severity": "ok",
-                    "summary": "13/13 present",
+                    "summary": "13/13 available",
                     "title": "Symlinks"
                 },
                 {

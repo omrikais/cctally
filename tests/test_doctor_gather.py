@@ -195,6 +195,16 @@ def test_setup_compute_symlink_state_helper(tmp_path):
     env = os.environ.copy()
     env["HOME"] = str(tmp_path / "home")
     env["TZ"] = "Etc/UTC"
+    # Scrub PATH (issue #114): _setup_compute_symlink_state now falls back
+    # to shutil.which(name) for an empty slot. The driver runs via
+    # sys.executable (absolute), so it needs nothing on PATH — but an
+    # inherited real PATH would let which() find the host's installed
+    # `cctally`, flipping the "missing"-only assertions to "ok". Point
+    # PATH at an empty dir so every empty slot stays deterministically
+    # "missing".
+    empty_path_dir = tmp_path / "empty-bin"
+    empty_path_dir.mkdir()
+    env["PATH"] = str(empty_path_dir)
     (tmp_path / "home").mkdir()
     res = subprocess.run([sys.executable, "-c", driver],
                          env=env, capture_output=True, text=True, check=True)

@@ -6,7 +6,7 @@ Install
         dev_mode: False
         is_dev_checkout: False
         app_dir: $HOME/.local/share/cctally
-  ✓ Symlinks                 13/13 present
+  ✓ Symlinks                 13/13 available
       details:
         present: 13
         total: 13

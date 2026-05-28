@@ -6,7 +6,7 @@ Install
         dev_mode: False
         is_dev_checkout: False
         app_dir: $HOME/.local/share/cctally
-  ⚠ Symlinks                 0/13 present; missing cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-tui, cctally-update
+  ⚠ Symlinks                 0/13 available; missing cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-tui, cctally-update
       → Run `cctally setup`
       details:
         present: 0

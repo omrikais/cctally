@@ -157,14 +157,14 @@ def _check_install_symlinks(s: DoctorState) -> CheckResult:
     if not missing:
         return CheckResult(
             id="install.symlinks", title="Symlinks",
-            severity="ok", summary=f"{ok_count}/{total} present",
+            severity="ok", summary=f"{ok_count}/{total} available",
             remediation=None,
             details={"present": ok_count, "total": total, "missing": []},
         )
     return CheckResult(
         id="install.symlinks", title="Symlinks",
         severity="warn",
-        summary=f"{ok_count}/{total} present; missing {', '.join(missing)}",
+        summary=f"{ok_count}/{total} available; missing {', '.join(missing)}",
         remediation="Run `cctally setup`",
         details={"present": ok_count, "total": total, "missing": missing},
     )

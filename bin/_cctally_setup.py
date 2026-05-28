@@ -1020,8 +1020,14 @@ def _setup_compute_symlink_state(
         keeps its own strict equality check for install-management
         (replace-vs-already).
       - "wrong": a non-symlink file occupies the slot, or the symlink
-        target is dangling.
-      - "missing": nothing at ``dst_dir/name``.
+        target is dangling. Unchanged by the PATH-aware fallback below —
+        a dangling/occupied slot stays "wrong" even if the command is
+        reachable elsewhere (that's the §9 brew-cleanup follow-up's job).
+      - "missing": nothing at ``dst_dir/name`` AND the command is not
+        reachable on ``$PATH`` via another channel. When the slot is
+        empty but ``shutil.which(name)`` resolves (e.g. a brew
+        ``<prefix>/bin`` install), the state is "ok" instead — the
+        diagnostic question is "is cctally-X invokable?" (issue #114).
 
     ``repo_root`` is unused here — retained on the signature for
     call-site stability across `_setup_status` and `doctor_gather_state`.
@@ -1038,6 +1044,12 @@ def _setup_compute_symlink_state(
                 out.append((name, "wrong"))
         elif dst.exists():
             out.append((name, "wrong"))
+        elif shutil.which(name):
+            # Slot empty in dst_dir but the command is reachable on PATH
+            # via another channel (e.g. brew's <prefix>/bin). The
+            # diagnostic question is "is cctally-X invokable?", so treat
+            # as ok rather than false-warning. (Issue #114.)
+            out.append((name, "ok"))
         else:
             out.append((name, "missing"))
     return out
@@ -1122,7 +1134,7 @@ def _setup_status(args: argparse.Namespace) -> int:
     out: list[str] = []
     out.append("Install")
     sym_marker = "✓" if sym_ok == len(c.SETUP_SYMLINK_NAMES) else "✗"
-    out.append(f"  Symlinks       {sym_ok}/{len(c.SETUP_SYMLINK_NAMES)} present at {dst_dir}/  {sym_marker}")
+    out.append(f"  Symlinks       {sym_ok}/{len(c.SETUP_SYMLINK_NAMES)} available at {dst_dir}/  {sym_marker}")
     if stale_syms:
         out.append(
             f"  Stale symlinks {len(stale_syms)} from prior version: {', '.join(stale_syms)}  ⚠"

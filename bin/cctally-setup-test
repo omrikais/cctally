@@ -86,6 +86,13 @@ run_scenario () {
 exit 1
 STUB
     chmod +x "$fake/.fake-bin/security"
+    # Provide python3 in .fake-bin (issue #114). _setup_compute_symlink_state
+    # is now shutil.which-aware, so the scrubbed PATH must keep python3
+    # reachable WITHOUT exposing the real `cctally` that lives in the same
+    # Homebrew/npm bin as the ambient python3 (which `${py3_dir}` would have
+    # leaked, flipping a "0/13"/--status slot to "available"). A python3
+    # symlink here lets the CLI run while .fake-bin stays cctally-free.
+    ln -sf "$(command -v python3)" "$fake/.fake-bin/python3"
 
     # Per-scenario knobs.
     local INCLUDE_LOCAL_BIN=""
@@ -113,7 +120,11 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
     # The cctally shebang is `/usr/bin/env python3`; we want the harness's
     # ambient `python3` (tied to the test runner / Python 3.11+ on CI),
     # not the macOS system python3 in /usr/bin (3.9, below cctally's floor).
-    local py3_dir; py3_dir=$(dirname "$(command -v python3)")
+    # Exposed via the `python3` symlink in `$fake/.fake-bin` (already first
+    # on PATH below) rather than the raw `dirname python3` — see issue #114
+    # note at the .fake-bin python3 symlink: a Homebrew/npm bin holding the
+    # ambient python3 also holds a real `cctally`, which the now
+    # shutil.which-aware symlink check would otherwise pick up.
 
     # Per-scenario scratch repo: when `presetup.sh` exists, copy the
     # repo's `bin/` into `$fake/repo-scratch/bin/` and let the scenario
@@ -153,7 +164,7 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
         local pre; pre=$(cat "$dir/pre-cmd.txt")
         # shellcheck disable=SC2086
         HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh \
-            PATH="${path_pre}$fake/.fake-bin:${py3_dir}:/usr/bin:/bin" \
+            PATH="${path_pre}$fake/.fake-bin:/usr/bin:/bin" \
             "$launcher" $pre >/dev/null 2>&1 || true
     fi
 
@@ -172,12 +183,12 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
         # scenario.
         # shellcheck disable=SC2086
         raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_AS_OF="${CCTALLY_AS_OF:-}" \
-              PATH="${path_pre}$fake/.fake-bin:${py3_dir}:/usr/bin:/bin" \
+              PATH="${path_pre}$fake/.fake-bin:/usr/bin:/bin" \
               "$launcher" $cmd < "$dir/stdin.txt" 2>&1; echo "EXIT=$?")
     else
         # shellcheck disable=SC2086
         raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_AS_OF="${CCTALLY_AS_OF:-}" \
-              PATH="${path_pre}$fake/.fake-bin:${py3_dir}:/usr/bin:/bin" \
+              PATH="${path_pre}$fake/.fake-bin:/usr/bin:/bin" \
               "$launcher" $cmd 2>&1; echo "EXIT=$?")
     fi
     local rc=${raw##*EXIT=}
