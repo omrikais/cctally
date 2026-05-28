@@ -481,6 +481,7 @@ _setup_resolve_hook_target = _cctally_setup._setup_resolve_hook_target
 _setup_create_symlinks = _cctally_setup._setup_create_symlinks
 _setup_repair_symlinks = _cctally_setup._setup_repair_symlinks
 _setup_path_includes_local_bin = _cctally_setup._setup_path_includes_local_bin
+_setup_symlink_is_retired = _cctally_setup._setup_symlink_is_retired
 _setup_is_brew_install = _cctally_setup._setup_is_brew_install
 _setup_shell_rc_hint = _cctally_setup._setup_shell_rc_hint
 _setup_detect_legacy_snippet = _cctally_setup._setup_detect_legacy_snippet
@@ -10407,6 +10408,31 @@ def doctor_gather_state(
         path_includes = _setup_path_includes_local_bin()
     except Exception:
         path_includes = None
+    # Issue #119: availability-aware install checks. Precomputed here (the
+    # I/O layer) so the kernel stays pure — `shutil.which` and the on-disk
+    # legacy-link probe never run in _lib_doctor.
+    #   * cctally_reachable_on_path — channel-agnostic "is the command on
+    #     $PATH at all?" (brew <prefix>/bin, npm prefix, source ~/.local/bin
+    #     all satisfy it). Lets install.path pass without a ~/.local/bin
+    #     membership check.
+    #   * symlinks_path_pinned — true iff cctally runs ONLY through a legacy
+    #     ~/.local/bin link to a retired/foreign install (live retired link
+    #     with no reachable_elsewhere fallback). Mirrors the pinned-only-path
+    #     predicate in _setup_status so doctor + setup agree on the fix.
+    try:
+        cctally_reachable_on_path = shutil.which("cctally") is not None
+    except Exception:
+        cctally_reachable_on_path = None
+    try:
+        symlinks_path_pinned = any(
+            s == "wrong"
+            and (dst_dir / n).is_symlink()
+            and _setup_symlink_is_retired(dst_dir / n, n, repo_root)
+            and (dst_dir / n).resolve(strict=False).exists()
+            for n, s in (symlink_state or [])
+        )
+    except Exception:
+        symlinks_path_pinned = False
     try:
         legacy_snippet = _setup_detect_legacy_snippet()
     except Exception:
@@ -10689,6 +10715,9 @@ def doctor_gather_state(
     return _lib_doctor.DoctorState(
         symlink_state=symlink_state,
         path_includes_local_bin=path_includes,
+        # Issue #119: availability-aware install checks (precomputed above).
+        cctally_reachable_on_path=cctally_reachable_on_path,
+        symlinks_path_pinned=symlinks_path_pinned,
         legacy_snippet=legacy_snippet,
         legacy_bespoke=legacy_bespoke,
         claude_settings=settings,

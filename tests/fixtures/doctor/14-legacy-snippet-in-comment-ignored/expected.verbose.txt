@@ -11,7 +11,8 @@ Install
         present: 13
         total: 13
         missing: []
-  ✓ PATH                     ~/.local/bin on $PATH
+        stale: []
+  ✓ PATH                     cctally reachable on $PATH
   ✓ Legacy status-line snippet not detected
   ✓ Legacy bespoke hooks     not detected
 Hooks

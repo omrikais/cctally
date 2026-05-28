@@ -103,6 +103,26 @@ class DoctorState:
     dev_mode: bool
     app_dir: str
     is_dev_checkout: bool = False
+    # Issue #119: availability-aware install checks. Both precomputed by
+    # `doctor_gather_state` (the I/O layer) so the kernel stays pure —
+    # `shutil.which` and the on-disk legacy-link probe never run here.
+    # Defaulted (and placed last, after `is_dev_checkout`) so existing
+    # constructors that don't pass them still work and the dataclass's
+    # non-default-then-default field ordering stays valid.
+    #   * cctally_reachable_on_path — `shutil.which("cctally") is not None`;
+    #     channel-agnostic (brew `<prefix>/bin`, npm prefix, source
+    #     `~/.local/bin` all satisfy it). Lets `_check_install_path` pass
+    #     whenever the command is reachable, not only when `~/.local/bin`
+    #     is on PATH.
+    #   * symlinks_path_pinned — true iff cctally is reachable ONLY through
+    #     a legacy `~/.local/bin` link to a retired/foreign (e.g. Homebrew
+    #     keg) install (a live retired link with no `reachable_elsewhere`
+    #     fallback). The kernel can't tell this `wrong`-mode apart from an
+    #     ordinary occupied slot from `(name, state)` alone, so it's
+    #     precomputed; drives the PATH-fix remediation in
+    #     `_check_install_symlinks`.
+    cctally_reachable_on_path: Optional[bool] = None
+    symlinks_path_pinned: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,6 +165,11 @@ def _max_severity(severities: list[str]) -> str:
 
 
 def _check_install_symlinks(s: DoctorState) -> CheckResult:
+    # Issue #119: the symlink state grew a fourth value, `stale` — a
+    # retired/foreign (e.g. Homebrew keg) link whose command IS still
+    # reachable elsewhere, so the link is safely-cleanable cruft, not a
+    # broken slot. Count `available = ok + stale` (both ⟹ reachable);
+    # `bad = wrong + missing` is what is genuinely actionable.
     if s.symlink_state is None:
         return CheckResult(
             id="install.symlinks", title="Symlinks",
@@ -152,35 +177,66 @@ def _check_install_symlinks(s: DoctorState) -> CheckResult:
             remediation="See logs", details={"reason": "gather returned None"},
         )
     total = len(s.symlink_state)
-    missing = [n for n, st in s.symlink_state if st != "ok"]
-    ok_count = total - len(missing)
-    if not missing:
+    stale = [n for n, st in s.symlink_state if st == "stale"]
+    bad = [n for n, st in s.symlink_state if st in ("wrong", "missing")]
+    available = total - len(bad)            # available = ok + stale
+    # "missing" carries the full `bad` list (wrong + missing); the key name is
+    # kept for JSON-schema stability even though it now spans both states.
+    details = {"present": available, "total": total,
+               "missing": bad, "stale": stale}
+    if not bad and not stale:
         return CheckResult(
             id="install.symlinks", title="Symlinks",
-            severity="ok", summary=f"{ok_count}/{total} available",
-            remediation=None,
-            details={"present": ok_count, "total": total, "missing": []},
+            severity="ok", summary=f"{available}/{total} available",
+            remediation=None, details=details,
         )
+    if not bad:   # stale only
+        return CheckResult(
+            id="install.symlinks", title="Symlinks",
+            severity="warn",
+            summary=f"{available}/{total} available; {len(stale)} stale link(s) to clean",
+            remediation="Run `cctally setup` to clean stale links",
+            details=details,
+        )
+    # bad present
+    if s.symlinks_path_pinned:
+        # Pinned-only-path (finding #2/#10): cctally runs ONLY through a
+        # legacy ~/.local/bin link to a keg, so its slot classes `wrong`
+        # but the command works. `cctally setup` deliberately won't remove
+        # the only reachable copy — the actionable fix is a PATH change.
+        # Keep this message in sync with the pinned guidance in _setup_status
+        # / _setup_install (bin/_cctally_setup.py).
+        remediation = (
+            "cctally is reachable only through a legacy ~/.local/bin link to a "
+            "Homebrew keg. Put <prefix>/bin on your PATH (e.g. `eval \"$(brew shellenv)\"`), "
+            "then run `cctally setup` to remove the legacy link."
+        )
+    else:
+        remediation = "Run `cctally setup`"
+    summary = f"{available}/{total} available; missing/broken {', '.join(bad)}"
+    if stale:
+        summary += f"; {len(stale)} stale"
     return CheckResult(
         id="install.symlinks", title="Symlinks",
-        severity="warn",
-        summary=f"{ok_count}/{total} available; missing {', '.join(missing)}",
-        remediation="Run `cctally setup`",
-        details={"present": ok_count, "total": total, "missing": missing},
+        severity="warn", summary=summary, remediation=remediation, details=details,
     )
 
 
 def _check_install_path(s: DoctorState) -> CheckResult:
-    if s.path_includes_local_bin:
+    # Issue #119: availability-aware. OK whenever cctally is reachable on
+    # $PATH via ANY channel — brew `<prefix>/bin`, npm prefix, or source
+    # `~/.local/bin`. `path_includes_local_bin` is retained only so the
+    # WARN remediation stays precise (it is no longer the OK predicate).
+    if s.path_includes_local_bin or s.cctally_reachable_on_path:
         return CheckResult(
             id="install.path", title="PATH",
-            severity="ok", summary="~/.local/bin on $PATH",
+            severity="ok", summary="cctally reachable on $PATH",
             remediation=None, details={},
         )
     return CheckResult(
         id="install.path", title="PATH",
-        severity="warn", summary="~/.local/bin not on $PATH",
-        remediation="Append `export PATH=\"$HOME/.local/bin:$PATH\"` to your shell rc",
+        severity="warn", summary="cctally not reachable on $PATH",
+        remediation="Append `export PATH=\"$HOME/.local/bin:$PATH\"` to your shell rc, or run `cctally setup`",
         details={},
     )
 

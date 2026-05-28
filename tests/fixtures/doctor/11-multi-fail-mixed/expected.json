@@ -31,19 +31,20 @@
                             "cctally-update"
                         ],
                         "present": 0,
+                        "stale": [],
                         "total": 13
                     },
                     "id": "install.symlinks",
                     "remediation": "Run `cctally setup`",
                     "severity": "warn",
-                    "summary": "0/13 available; missing cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-tui, cctally-update",
+                    "summary": "0/13 available; missing/broken cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-tui, cctally-update",
                     "title": "Symlinks"
                 },
                 {
                     "details": {},
                     "id": "install.path",
                     "severity": "ok",
-                    "summary": "~/.local/bin on $PATH",
+                    "summary": "cctally reachable on $PATH",
                     "title": "PATH"
                 },
                 {

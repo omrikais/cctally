@@ -38,6 +38,7 @@ addition trips every gate if any layer is misconfigured.
 import importlib.util
 import json
 import pathlib
+import re
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -150,4 +151,27 @@ def test_package_files_paths_are_public_in_mirror_allowlist():
         f"from the public clone, so any file the mirror filters out is "
         f"absent from the tarball even if files[] lists it. Promote the "
         f"path in .mirror-allowlist, or drop it from files[]."
+    )
+
+
+def test_setup_symlink_names_subset_of_brew_user_facing_bins():
+    """Issue #119: brew installs stop maintaining ~/.local/bin symlinks —
+    a brew user reaches every cctally-* command via `<prefix>/bin`, which
+    the formula populates from `USER_FACING_BINS`. If a name lands in
+    `SETUP_SYMLINK_NAMES` (what source/npm installs link) but NOT in the
+    brew formula's `USER_FACING_BINS`, a brew user would be stranded
+    without that command once ~/.local/bin is skipped. The two lists must
+    not drift apart in that direction.
+    """
+    from conftest import load_script
+    ns = load_script()
+    setup_names = set(ns["SETUP_SYMLINK_NAMES"])
+    rb = (REPO_ROOT / "homebrew" / "cctally.rb.template").read_text()
+    m = re.search(r"USER_FACING_BINS\s*=\s*%w\[(.*?)\]", rb, re.S)
+    assert m, "USER_FACING_BINS block not found in formula template"
+    brew_bins = set(m.group(1).split())
+    missing = setup_names - brew_bins
+    assert not missing, (
+        f"SETUP_SYMLINK_NAMES not in brew USER_FACING_BINS: {sorted(missing)} — "
+        f"a brew install would strand these commands once ~/.local/bin is skipped (#119)"
     )

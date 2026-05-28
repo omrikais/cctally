@@ -70,6 +70,29 @@ def _run_gather(home: pathlib.Path, *, runtime_bind: "str | None" = None,
     return json.loads(res.stdout)
 
 
+def test_gather_sets_reachable_and_pinned(tmp_path):
+    """Issue #119: doctor_gather_state precomputes two availability
+    booleans for the kernel — `cctally_reachable_on_path`
+    (`shutil.which("cctally") is not None`) and `symlinks_path_pinned`
+    (true iff cctally runs ONLY through a legacy ~/.local/bin link).
+
+    The gather harness scrubs PATH to an empty dir below, so `cctally`
+    is not reachable on $PATH and no legacy link exists → reachable is
+    False and pinned is False. Both fields must be present with the
+    right types regardless."""
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "projects").mkdir()
+    empty_path_dir = tmp_path / "empty-bin"
+    empty_path_dir.mkdir()
+    st = _run_gather(tmp_path, env_extra={"PATH": str(empty_path_dir)})
+    assert "cctally_reachable_on_path" in st
+    assert "symlinks_path_pinned" in st
+    assert isinstance(st["symlinks_path_pinned"], bool)
+    # Empty scrubbed PATH + no legacy link → both False.
+    assert st["cctally_reachable_on_path"] is False
+    assert st["symlinks_path_pinned"] is False
+
+
 def test_gather_state_fresh_home_returns_state(tmp_path):
     (tmp_path / ".claude").mkdir()
     (tmp_path / ".claude" / "projects").mkdir()

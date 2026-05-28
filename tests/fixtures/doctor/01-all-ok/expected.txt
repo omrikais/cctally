@@ -3,7 +3,7 @@ cctally doctor — 2026-05-13 14:22:31 UTC
 Install
   ✓ Mode                     installed
   ✓ Symlinks                 13/13 available
-  ✓ PATH                     ~/.local/bin on $PATH
+  ✓ PATH                     cctally reachable on $PATH
   ✓ Legacy status-line snippet not detected
   ✓ Legacy bespoke hooks     not detected
 Hooks

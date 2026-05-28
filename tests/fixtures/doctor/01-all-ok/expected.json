@@ -17,6 +17,7 @@
                     "details": {
                         "missing": [],
                         "present": 13,
+                        "stale": [],
                         "total": 13
                     },
                     "id": "install.symlinks",
@@ -28,7 +29,7 @@
                     "details": {},
                     "id": "install.path",
                     "severity": "ok",
-                    "summary": "~/.local/bin on $PATH",
+                    "summary": "cctally reachable on $PATH",
                     "title": "PATH"
                 },
                 {

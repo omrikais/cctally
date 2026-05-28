@@ -31,6 +31,8 @@ def test_doctor_state_has_required_fields():
         "forked_bucket_counts",
         "credited_weeks",
         "dev_mode", "app_dir", "is_dev_checkout",
+        # Issue #119: availability-aware install checks.
+        "cctally_reachable_on_path", "symlinks_path_pinned",
     }
     assert fields == expected, fields ^ expected
 
@@ -130,6 +132,41 @@ def test_install_symlinks_missing_warns():
 def test_install_path_ok_and_warn():
     assert L._check_install_path(_state()).severity == "ok"
     assert L._check_install_path(_state(path_includes_local_bin=False)).severity == "warn"
+
+
+# ── Issue #119: availability-aware install.path ──────────────────────
+
+
+def test_install_path_ok_when_reachable_even_if_local_bin_off_path():
+    s = _state(path_includes_local_bin=False, cctally_reachable_on_path=True)
+    r = L._check_install_path(s)
+    assert r.severity == "ok"
+
+
+def test_install_path_warns_when_unreachable():
+    s = _state(path_includes_local_bin=False, cctally_reachable_on_path=False)
+    r = L._check_install_path(s)
+    assert r.severity == "warn"
+
+
+# ── Issue #119: install.symlinks consumes the `stale` state ──────────
+
+
+def test_symlinks_stale_only_is_warn_counts_available():
+    s = _state(symlink_state=[("cctally", "stale"), ("cctally-tui", "ok")],
+               symlinks_path_pinned=False)
+    r = L._check_install_symlinks(s)
+    assert r.severity == "warn"
+    assert "2/2 available" in r.summary
+    assert "stale" in r.summary
+    assert r.details.get("stale") == ["cctally"]
+
+
+def test_symlinks_pinned_gives_path_remediation():
+    s = _state(symlink_state=[("cctally", "wrong")], symlinks_path_pinned=True)
+    r = L._check_install_symlinks(s)
+    assert "PATH" in r.remediation and "setup" in r.remediation
+    assert r.remediation != "Run `cctally setup`"
 
 
 def test_install_legacy_snippet_warn():
