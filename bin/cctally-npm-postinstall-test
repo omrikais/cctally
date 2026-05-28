@@ -5,22 +5,30 @@
 #   golden-exit.txt              : single integer (required).
 #   golden-stdout-substr.txt     : substring assertion (required, may be empty).
 #   golden-stdout-not-substr.txt : optional; stdout MUST NOT contain it.
+#   golden-stderr-substr.txt     : optional; stderr MUST contain it.
+#   golden-stderr-not-substr.txt : optional; stderr MUST NOT contain it.
 #   env.sh                       : optional; may set GLOBAL (npm_config_global),
 #                                  QUIET (CCTALLY_NPM_POSTINSTALL_QUIET),
-#                                  FAKE_PYTHON_EXIT, NO_PYTHON, BAD_CCTALLY_PYTHON.
+#                                  FAKE_PYTHON_EXIT, BAD_CCTALLY_PYTHON.
 #
 # Scratch per scenario:
 #   bin/cctally-npm-postinstall.js : copy under test.
-#   bin/cctally                    : marker file (package-local script path).
-#   PATH/python3                   : fake python3 echoing argv (unless NO_PYTHON).
-#   CCTALLY_PYTHON is pointed at that fake python3 so the postinstall's
-#   `python <pkgdir>/bin/cctally repair-symlinks` call is observable.
+#   bin/cctally                    : marker file (the package-local script path
+#                                    the postinstall passes to python).
+#   PATH/python3                   : fake python3 echoing argv (skipped when
+#                                    BAD_CCTALLY_PYTHON=1).
+#   CCTALLY_PYTHON is pointed at that fake python3 (or, for BAD_CCTALLY_PYTHON,
+#   a nonexistent path) so the postinstall's `python <pkgdir>/bin/cctally
+#   repair-symlinks` call is observable — a `cctally`-on-PATH stub would NOT be,
+#   because the postinstall invokes the script via the interpreter, not a PATH
+#   lookup (spec §7.4).
 set -uo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SCRIPT="$REPO_ROOT/bin/cctally-npm-postinstall.js"
 FIXTURES_DIR="$REPO_ROOT/tests/fixtures/npm-postinstall"
+[ -f "$SCRIPT" ] || { echo "FAIL: postinstall script not found: $SCRIPT" >&2; exit 1; }
 NODE_BIN=$(command -v node 2>/dev/null || true)
 [ -z "$NODE_BIN" ] && { echo "FAIL: node not found on PATH" >&2; exit 1; }
 
@@ -33,18 +41,24 @@ for dir in "$FIXTURES_DIR"/*/; do
     name=$(basename "$dir")
     expected_exit=$(tr -d '\n' < "$dir/golden-exit.txt")
     expected_stdout=$(cat "$dir/golden-stdout-substr.txt")
-    expected_not_stdout=""
+    expected_not_stdout=""; expected_stderr=""; expected_not_stderr=""
     [ -f "$dir/golden-stdout-not-substr.txt" ] && expected_not_stdout=$(cat "$dir/golden-stdout-not-substr.txt")
+    [ -f "$dir/golden-stderr-substr.txt" ] && expected_stderr=$(cat "$dir/golden-stderr-substr.txt")
+    [ -f "$dir/golden-stderr-not-substr.txt" ] && expected_not_stderr=$(cat "$dir/golden-stderr-not-substr.txt")
 
     work="$SCRATCH_DIR/$name"; mkdir -p "$work/bin" "$work/PATH"
     cp "$SCRIPT" "$work/bin/cctally-npm-postinstall.js"
     : > "$work/bin/cctally"
 
-    GLOBAL=1; QUIET=0; FAKE_PYTHON_EXIT=0; NO_PYTHON=0; BAD_CCTALLY_PYTHON=0
+    GLOBAL=1; QUIET=0; FAKE_PYTHON_EXIT=0; BAD_CCTALLY_PYTHON=0
     [ -f "$dir/env.sh" ] && . "$dir/env.sh"
 
-    cctally_python=""
-    if [ "$NO_PYTHON" != "1" ] && [ "$BAD_CCTALLY_PYTHON" != "1" ]; then
+    # CCTALLY_PYTHON is always set: a recording fake python3 (so the spawn is
+    # observable), or — for BAD_CCTALLY_PYTHON — a nonexistent path that drives
+    # spawnSync into the ENOENT branch the postinstall must swallow.
+    if [ "$BAD_CCTALLY_PYTHON" = "1" ]; then
+        cctally_python="$work/PATH/does-not-exist"
+    else
         cat > "$work/PATH/python3" <<EOF
 #!/usr/bin/env bash
 echo "fake-python: \$@"
@@ -53,17 +67,19 @@ EOF
         chmod +x "$work/PATH/python3"
         cctally_python="$work/PATH/python3"
     fi
-    [ "$BAD_CCTALLY_PYTHON" = "1" ] && cctally_python="$work/PATH/does-not-exist"
 
-    stdout_file="$work/_stdout.txt"
+    [ "$GLOBAL" = "1" ] && global_val=true || global_val=false
+    [ "$QUIET" = "1" ] && quiet_val=1 || quiet_val=0
+
+    stdout_file="$work/_stdout.txt"; stderr_file="$work/_stderr.txt"
     env -i HOME="$HOME" PATH="/usr/bin:/bin" \
-        ${GLOBAL:+npm_config_global="$([ "$GLOBAL" = 1 ] && echo true || echo false)"} \
-        ${QUIET:+CCTALLY_NPM_POSTINSTALL_QUIET="$([ "$QUIET" = 1 ] && echo 1 || echo 0)"} \
-        ${cctally_python:+CCTALLY_PYTHON="$cctally_python"} \
+        npm_config_global="$global_val" \
+        CCTALLY_NPM_POSTINSTALL_QUIET="$quiet_val" \
+        CCTALLY_PYTHON="$cctally_python" \
         "$NODE_BIN" "$work/bin/cctally-npm-postinstall.js" \
-        > "$stdout_file" 2>&1
+        > "$stdout_file" 2> "$stderr_file"
     actual_exit=$?
-    actual_stdout=$(cat "$stdout_file")
+    actual_stdout=$(cat "$stdout_file"); actual_stderr=$(cat "$stderr_file")
 
     fail=0; msg=""
     [ "$actual_exit" != "$expected_exit" ] && { fail=1; msg="exit ${actual_exit} != ${expected_exit}"; }
@@ -73,9 +89,18 @@ EOF
     if [ -n "$expected_not_stdout" ] && grep -qF "$expected_not_stdout" <<<"$actual_stdout"; then
         fail=1; msg="${msg:+$msg; }stdout unexpectedly contains '$expected_not_stdout'"
     fi
+    if [ -n "$expected_stderr" ] && ! grep -qF "$expected_stderr" <<<"$actual_stderr"; then
+        fail=1; msg="${msg:+$msg; }stderr missing '$expected_stderr'"
+    fi
+    if [ -n "$expected_not_stderr" ] && grep -qF "$expected_not_stderr" <<<"$actual_stderr"; then
+        fail=1; msg="${msg:+$msg; }stderr unexpectedly contains '$expected_not_stderr'"
+    fi
 
     if [ "$fail" = "1" ]; then
-        echo "FAIL [$name]: $msg"; sed 's/^/    /' "$stdout_file"; fail_count=$((fail_count+1))
+        echo "FAIL [$name]: $msg"
+        echo "  stdout:"; sed 's/^/    /' "$stdout_file"
+        echo "  stderr:"; sed 's/^/    /' "$stderr_file"
+        fail_count=$((fail_count+1))
     else
         pass_count=$((pass_count+1))
     fi
