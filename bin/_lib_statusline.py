@@ -55,7 +55,12 @@ class StatuslineArgs:
     context_medium_threshold: int
     cctally_extensions: bool
     color: bool  # ANSI on/off after auto-detect resolved
-    display_tz_name: str  # IANA name; "UTC" if config absent
+    display_tz_name: str  # IANA name; resolved upstream via
+                          # get_display_tz_pref(cfg) — defaults to
+                          # DISPLAY_TZ_DEFAULT ("local") when no config
+                          # nor CLI override, then converted to a real
+                          # IANA via _local_tz_name() before reaching
+                          # the kernel.
     debug: bool
 
 

@@ -102,10 +102,11 @@ def _scenario_body(slug: str) -> str:
         return textwrap.dedent("""\
             # Seed install + hooks + OAuth + valid update-state + 1 fresh snapshot.
             # Symlink every cctally-* binary so install.symlinks is OK.
+            # Keep this list aligned with SETUP_SYMLINK_NAMES in bin/cctally.
             for name in cctally cctally-alerts cctally-dashboard \\
                        cctally-dollar-per-percent cctally-five-hour-blocks \\
                        cctally-five-hour-breakdown cctally-forecast cctally-project \\
-                       cctally-refresh-usage cctally-release cctally-sync-week \\
+                       cctally-refresh-usage cctally-statusline cctally-sync-week \\
                        cctally-tui cctally-update; do
                 ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/.local/bin/$name"
             done

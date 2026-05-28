@@ -4493,6 +4493,41 @@ def cmd_blocks(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_statusline_tz(cli_tz, cfg, warn_once):
+    """Resolve the IANA tz_name for cmd_statusline using the same 3-rung
+    precedence as every other reporting command:
+
+        CLI ``--timezone`` > ``config.display.tz`` > DISPLAY_TZ_DEFAULT ("local")
+
+    "local" is converted to a real IANA via ``_local_tz_name()`` before
+    returning. Unknown IANA names emit a one-shot warning and fall back
+    to ``"UTC"``. Returns a real IANA name (or ``"UTC"``) — never the
+    literal sentinel ``"local"``.
+
+    Prior to #86 G follow-up, this defaulted to ``"UTC"`` when no config
+    was set, so ``today`` computed on the UTC calendar day while
+    ``cctally daily`` (and every other reporting command) used the local
+    day — UTC-offset users saw a multi-hour lag between statusline and
+    daily. Regression: tests/test_statusline.py::TestTzResolution.
+    """
+    tz_name = cli_tz
+    if not tz_name:
+        tz_name = get_display_tz_pref(cfg)
+    if tz_name in ("local", "LOCAL"):
+        try:
+            tz_name = _local_tz_name() or "UTC"
+        except Exception:
+            tz_name = "UTC"
+    try:
+        ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, Exception):
+        warn_once(
+            f"cctally statusline: invalid timezone {tz_name!r}; using 'UTC'"
+        )
+        tz_name = "UTC"
+    return tz_name
+
+
 def cmd_statusline(args: argparse.Namespace) -> int:
     """`cctally statusline` — one-line status summary for CC hooks.
 
@@ -4601,27 +4636,7 @@ def cmd_statusline(args: argparse.Namespace) -> int:
         )
         ext_on = True
 
-    # Display tz: CLI -z/--timezone > display.tz config > "UTC".
-    tz_name = getattr(args, "timezone", None)
-    if not tz_name:
-        display_block = cfg.get("display") if isinstance(cfg, dict) else None
-        if isinstance(display_block, dict):
-            tz_name = display_block.get("tz")
-    if not tz_name:
-        tz_name = "UTC"
-    if tz_name in ("local", "LOCAL"):
-        try:
-            tz_name = _local_tz_name() or "UTC"
-        except Exception:
-            tz_name = "UTC"
-    # Validate the IANA name; fall back to UTC with a one-shot warning.
-    try:
-        ZoneInfo(tz_name)
-    except (ZoneInfoNotFoundError, Exception):
-        warn_once(
-            f"cctally statusline: invalid timezone {tz_name!r}; using 'UTC'"
-        )
-        tz_name = "UTC"
+    tz_name = _resolve_statusline_tz(getattr(args, "timezone", None), cfg, warn_once)
 
     # Color: explicit CLI > NO_COLOR env > TTY detect.
     if args.color is True or args.color is False:

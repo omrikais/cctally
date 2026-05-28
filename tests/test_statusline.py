@@ -634,6 +634,83 @@ _MIN_STDIN = json.dumps({
 })
 
 
+class TestTzResolution:
+    """Regression for #86 G follow-up — cmd_statusline previously defaulted
+    display.tz to "UTC" when no config was set, so `today` computed on the
+    UTC calendar day while `cctally daily` (which defaults via
+    DISPLAY_TZ_DEFAULT = "local") used the local day. The mismatch made
+    statusline lag daily by a multi-hour band for any UTC-offset user.
+    These tests load bin/cctally as a module and pin the resolver's
+    output for the five interesting inputs.
+    """
+
+    @staticmethod
+    def _load():
+        from importlib.machinery import SourceFileLoader
+        import importlib.util as _u
+
+        loader = SourceFileLoader("cctally", str(REPO_ROOT / "bin" / "cctally"))
+        spec = _u.spec_from_loader("cctally", loader)
+        mod = _u.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod
+
+    def test_cli_overrides_config_and_default(self, monkeypatch):
+        mod = self._load()
+        cfg = {"display": {"tz": "Asia/Jerusalem"}}
+        warnings = []
+        out = mod._resolve_statusline_tz("Europe/Berlin", cfg, warnings.append)
+        assert out == "Europe/Berlin"
+        assert warnings == []
+
+    def test_config_explicit_iana(self, monkeypatch):
+        mod = self._load()
+        cfg = {"display": {"tz": "Asia/Jerusalem"}}
+        warnings = []
+        out = mod._resolve_statusline_tz(None, cfg, warnings.append)
+        assert out == "Asia/Jerusalem"
+        assert warnings == []
+
+    def test_config_explicit_local_resolves_to_iana(self, monkeypatch):
+        """`display.tz = "local"` must NOT pass the literal string down to
+        the kernel; `_local_tz_name()` converts to a real IANA."""
+        mod = self._load()
+        monkeypatch.setattr(mod, "_local_tz_name", lambda: "Asia/Tokyo")
+        cfg = {"display": {"tz": "local"}}
+        warnings = []
+        out = mod._resolve_statusline_tz(None, cfg, warnings.append)
+        assert out == "Asia/Tokyo"
+        assert warnings == []
+
+    def test_no_config_defaults_to_local_not_utc(self, monkeypatch):
+        """The regression. An empty config (no display block at all) MUST
+        default to DISPLAY_TZ_DEFAULT = "local", then resolve via
+        `_local_tz_name()` to the host IANA. Pre-fix this returned "UTC"
+        unconditionally — the heart of the today/daily divergence."""
+        mod = self._load()
+        monkeypatch.setattr(mod, "_local_tz_name", lambda: "Asia/Jerusalem")
+        cfg = {}  # no display key whatsoever
+        warnings = []
+        out = mod._resolve_statusline_tz(None, cfg, warnings.append)
+        assert out == "Asia/Jerusalem", (
+            "Pre-#86-G-followup this returned 'UTC' (cmd_statusline default), "
+            "causing today/daily divergence for UTC-offset users."
+        )
+        assert warnings == []
+
+    def test_invalid_cli_tz_warns_and_falls_back_to_utc(self):
+        """A bad --timezone value bypasses config validation and hits the
+        local-IANA check at the end of _resolve_statusline_tz — should
+        emit a one-shot warn and clamp to "UTC"."""
+        mod = self._load()
+        warnings = []
+        out = mod._resolve_statusline_tz("Not/A_Zone", {}, warnings.append)
+        assert out == "UTC"
+        assert len(warnings) == 1
+        assert "invalid timezone" in warnings[0]
+
+
 class TestConfigPrecedence:
     def test_cli_overrides_config(self, tmp_path):
         """CLI flag wins over config.json key."""

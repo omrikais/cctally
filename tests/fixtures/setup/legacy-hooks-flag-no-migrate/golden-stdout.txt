@@ -1,5 +1,5 @@
 ✓ Detected Claude Code at /FAKE/.claude
-✓ Symlinks at /FAKE/.local/bin/: 12/12 (N newly created)
+✓ Symlinks at /FAKE/.local/bin/: 13/13 (N newly created)
 ✓ Wrote 3 hook entries to /FAKE/.claude/settings.json
 ⚠ Legacy bespoke hooks detected (predate `cctally setup`; failing silently on this system). Skipped at your request. Re-run `cctally setup --migrate-legacy-hooks` later, or remove them yourself. The four `.py` files are at ~/.claude/hooks/{record-usage-stop,usage-poller{,-start,-stop}}.py.
 ⚠ No Claude OAuth token detected.

@@ -1,5 +1,5 @@
 Install
-  Symlinks       0/12 present at /FAKE/.local/bin/  ✗
+  Symlinks       0/13 present at /FAKE/.local/bin/  ✗
   PATH includes  yes                                   ✓
 Hooks (/FAKE/.claude/settings.json)
   PostToolBatch  missing                  ✗

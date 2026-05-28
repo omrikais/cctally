@@ -6,10 +6,10 @@ Install
         dev_mode: False
         is_dev_checkout: False
         app_dir: $HOME/.local/share/cctally
-  ✓ Symlinks                 12/12 present
+  ✓ Symlinks                 13/13 present
       details:
-        present: 12
-        total: 12
+        present: 13
+        total: 13
         missing: []
   ✓ PATH                     ~/.local/bin on $PATH
   ✓ Legacy status-line snippet not detected
