@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# cctally-statusline — thin wrapper. Mirrors bin/cctally-<cmd> siblings.
+exec "$(dirname "$0")/cctally" statusline "$@"

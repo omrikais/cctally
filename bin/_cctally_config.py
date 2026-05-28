@@ -298,7 +298,69 @@ ALLOWED_CONFIG_KEYS = (
     "dashboard.bind",
     "update.check.enabled",
     "update.check.ttl_hours",
+    "statusline.visual_burn_rate",
+    "statusline.cost_source",
+    "statusline.cctally_extensions",
 )
+
+
+# === statusline config validators (issue #86 Session G) ===================
+
+_STATUSLINE_VBR_VALUES = ("off", "emoji", "text", "emoji-text")
+_STATUSLINE_COST_SOURCE_VALUES = ("auto", "cctally", "cc", "both")
+
+
+def _validate_statusline_visual_burn_rate(value):
+    """Validate ``statusline.visual_burn_rate``.
+
+    Accepts any of ``off`` / ``emoji`` / ``text`` / ``emoji-text``. Other
+    strings raise ``ValueError`` with a hint listing the valid values.
+    """
+    if isinstance(value, str) and value in _STATUSLINE_VBR_VALUES:
+        return value
+    raise ValueError(
+        f"statusline.visual_burn_rate must be one of "
+        f"{', '.join(_STATUSLINE_VBR_VALUES)} (got {value!r})"
+    )
+
+
+def _validate_statusline_cost_source(value):
+    """Validate ``statusline.cost_source``.
+
+    Accepts ``auto`` / ``cctally`` / ``cc`` / ``both``. The ``ccusage``
+    value name is rejected at config set time too — the rename hint
+    is surfaced both here AND at flag-parse time by the argparse choice
+    rejection inside ``cmd_statusline``.
+    """
+    if isinstance(value, str) and value in _STATUSLINE_COST_SOURCE_VALUES:
+        return value
+    if value == "ccusage":
+        raise ValueError(
+            "statusline.cost_source 'ccusage' was renamed; use 'cctally'"
+        )
+    raise ValueError(
+        f"statusline.cost_source must be one of "
+        f"{', '.join(_STATUSLINE_COST_SOURCE_VALUES)} (got {value!r})"
+    )
+
+
+def _validate_statusline_cctally_extensions(value):
+    """Validate ``statusline.cctally_extensions``.
+
+    Accepts booleans (preferred) or canonical truthy/falsy strings
+    (``true``/``false``/``yes``/``no``/``on``/``off``/``1``/``0``).
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lo = value.strip().lower()
+        if lo in ("true", "yes", "on", "1"):
+            return True
+        if lo in ("false", "no", "off", "0"):
+            return False
+    raise ValueError(
+        f"statusline.cctally_extensions must be boolean (got {value!r})"
+    )
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -374,6 +436,33 @@ def _config_known_value(config: dict, key: str) -> "object":
             return c._validate_update_check_ttl_hours_value(stored)
         except ValueError:
             return c.UPDATE_DEFAULT_TTL_HOURS
+    if key in (
+        "statusline.visual_burn_rate",
+        "statusline.cost_source",
+        "statusline.cctally_extensions",
+    ):
+        sl_block = config.get("statusline") if isinstance(config, dict) else None
+        if not isinstance(sl_block, dict):
+            sl_block = {}
+        inner = key.split(".", 1)[1]
+        stored = sl_block.get(inner)
+        defaults = {
+            "visual_burn_rate": "off",
+            "cost_source": "auto",
+            "cctally_extensions": True,
+        }
+        if stored is None:
+            return defaults[inner]
+        validator = {
+            "visual_burn_rate": _validate_statusline_visual_burn_rate,
+            "cost_source": _validate_statusline_cost_source,
+            "cctally_extensions": _validate_statusline_cctally_extensions,
+        }[inner]
+        try:
+            return validator(stored)
+        except ValueError:
+            # Hand-edited junk: surface the default — mirrors dashboard.bind.
+            return defaults[inner]
     return None
 
 
@@ -509,6 +598,44 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         else:
             print(f"dashboard.bind={canonical}")
         return 0
+    if key in (
+        "statusline.visual_burn_rate",
+        "statusline.cost_source",
+        "statusline.cctally_extensions",
+    ):
+        inner_key = key.split(".", 1)[1]
+        validator = {
+            "visual_burn_rate": _validate_statusline_visual_burn_rate,
+            "cost_source": _validate_statusline_cost_source,
+            "cctally_extensions": _validate_statusline_cctally_extensions,
+        }[inner_key]
+        try:
+            normalized = validator(raw)
+        except ValueError as exc:
+            print(f"cctally: {exc}", file=sys.stderr)
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing = config.get("statusline")
+            if existing is not None and not isinstance(existing, dict):
+                print(
+                    "cctally: statusline config error: statusline must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            block = dict(existing or {})
+            block[inner_key] = normalized
+            config["statusline"] = block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(json.dumps({"statusline": {inner_key: normalized}}, indent=2))
+        else:
+            if isinstance(normalized, bool):
+                rendered = "true" if normalized else "false"
+            else:
+                rendered = str(normalized)
+            print(f"{key}={rendered}")
+        return 0
     if key in ("update.check.enabled", "update.check.ttl_hours"):
         # Validate first; rejection short-circuits before lock acquisition.
         if key == "update.check.enabled":
@@ -604,6 +731,22 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                 del block["bind"]
                 if not block:
                     config.pop("dashboard", None)
+                save_config(config)
+            # idempotent: silent on missing key
+        return 0
+    if key in (
+        "statusline.visual_burn_rate",
+        "statusline.cost_source",
+        "statusline.cctally_extensions",
+    ):
+        inner_key = key.split(".", 1)[1]
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            block = config.get("statusline")
+            if isinstance(block, dict) and inner_key in block:
+                del block[inner_key]
+                if not block:
+                    config.pop("statusline", None)
                 save_config(config)
             # idempotent: silent on missing key
         return 0
