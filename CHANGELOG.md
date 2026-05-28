@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **`cctally record-usage` now rejects implausibly-dated `--resets-at` epochs before they can poison the SQLite stats history, and refuses to charge already-expired 5h windows against the previous block.** A real 366-day-off statusline payload silently wrote a phantom-year row that displaced subsequent weeks in `cctally report` / `cctally-dollar-per-percent`. The new guard validates both arguments before any `datetime.fromtimestamp()` call (so ms-epochs, year-off bugs, and negative epochs reject gracefully instead of crashing): `--resets-at ∈ [now − 30d, now + 8d]` exits 2 on miss (preserving the documented "manually replay a missed snapshot" path within 30d), and `--five-hour-resets-at ∈ [now − 10m, now + 6h]` drops the 5h fields and continues with the weekly snapshot on miss (so a stale-5h replay still writes its weekly row). The 10-minute past slack matches `_FIVE_HOUR_JITTER_FLOOR_SECONDS` — wide enough for boundary jitter / clock skew, tight enough that lagged status-line responses around a 5h rollover can no longer pollute the prior block's `_compute_block_totals` with entries that belong to the new window. The refresh-layer wrapper (`_refresh_usage_inproc`) surfaces guard misses as `status="record_failed"` so the dashboard / CLI don't silently report success on a dropped payload. (#112)
+
 ## [1.20.1] - 2026-05-28
 
 ### Fixed
