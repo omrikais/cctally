@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.21.2] - 2026-05-28
+
 ### Fixed
 - npm upgrades now self-heal `~/.local/bin/` symlinks for newly added subcommands: the postinstall best-effort runs an internal additive `repair-symlinks` pass (gated to existing installs), so a new `cctally-*` binary is reachable immediately after `npm install -g cctally@<newer>` without re-running `cctally setup` (#114).
 
