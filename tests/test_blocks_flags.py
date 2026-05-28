@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import pathlib
-import shutil
 import subprocess
 import sys
 
@@ -133,11 +132,21 @@ def test_recent_filter_drops_old_keeps_recent_and_active(tmp_path):
     (R-1d), and an active block. The old block's start date (2026-04-13)
     must be absent; the recent (2026-04-22) and active (2026-04-23) blocks
     must be present.
+
+    Invokes `build-blocks-fixtures.py --out <tmp>` so the seeded SQLite DBs
+    exist under HOME's `.local/share/cctally/`. The in-tree fixture dir
+    only ships goldens + input.env — the `*.db` files are gitignored
+    (scratch class per [[project_fixture_consumption_two_classes]]).
     """
-    src = FIXTURES / "recent-filter"
-    home = tmp_path / "home"
-    shutil.copytree(src, home)
-    env_vars = _read_input_env(src)
+    build_out = tmp_path / "build"
+    builder = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "bin" / "build-blocks-fixtures.py"
+    )
+    subprocess.run([sys.executable, str(builder), "--out", str(build_out)],
+                   check=True, capture_output=True)
+    home = build_out / "recent-filter"
+    env_vars = _read_input_env(home)
     env = {"HOME": str(home), "PATH": "/usr/bin:/bin",
            "CCTALLY_DISABLE_DEV_AUTODETECT": "1", "TZ": "Etc/UTC",
            "NO_COLOR": "1", "CCTALLY_AS_OF": env_vars["AS_OF"]}
