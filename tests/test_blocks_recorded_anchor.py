@@ -612,7 +612,7 @@ def test_select_non_overlapping_recorded_windows_keeps_both_canonical_when_floor
         (R_old, 1032),  # 1000 canonical + 32 raw snapshots
         (R_new, 1001),  # 1000 canonical + 1 raw snapshot (just opened)
     ]
-    assert select(items) == [R_old, R_new]
+    assert select(items, canonical_anchors={R_old, R_new}) == [R_old, R_new]
 
 
 def test_select_non_overlapping_recorded_windows_phantom_near_canonical_still_dropped(ns):
@@ -632,7 +632,43 @@ def test_select_non_overlapping_recorded_windows_phantom_near_canonical_still_dr
         (R_canonical, 1000),    # canonical (no raw support)
     ]
     # Canonical survives; raw-only phantom <5h before is dropped by DP.
-    assert select(items) == [R_canonical]
+    assert select(items, canonical_anchors={R_canonical}) == [R_canonical]
+
+
+def test_select_non_overlapping_recorded_windows_high_weight_raw_does_not_bypass(ns):
+    """Issue #116 review follow-up: a raw-only anchor whose weight happens
+    to land >= 1000 must NOT trigger the canonical bypass.
+
+    The v1.20.3 fix used `w >= _CANONICAL_WEIGHT_THRESHOLD` to identify
+    canonical items, conflating raw support count with canonical
+    provenance. A bulk-imported history or a future high-frequency
+    record-usage path could push raw weights past 1000; without explicit
+    provenance, two such buckets <5h apart would both force-restore and
+    render as overlapping blocks.
+
+    Post-fix: `canonical_anchors=None` (or empty) means pure DP — the
+    weighted-interval-scheduler arbitrates by weight, and only one of
+    two adjacent high-weight raw anchors survives.
+    """
+    select = ns["_select_non_overlapping_recorded_windows"]
+    R1 = dt.datetime(2026, 5, 28, 9, 0, tzinfo=dt.timezone.utc)
+    R2 = dt.datetime(2026, 5, 28, 13, 50, tzinfo=dt.timezone.utc)  # 4h 50m later
+    items = [
+        (R1, 1500),  # raw-only, but high weight (e.g. hypothetical bulk-import)
+        (R2, 1200),  # raw-only, also high weight, adjacent floored
+    ]
+    # No canonical_anchors → pure DP. R1 and R2 conflict (floored distance
+    # < 5h); DP keeps R1 (higher weight), drops R2.
+    result = select(items, canonical_anchors=None)
+    assert result == [R1], (
+        f"High-weight raw anchors must arbitrate via DP, not force-restore "
+        f"both as if canonical; got {result!r}"
+    )
+    # Empty set behaves identically to None.
+    assert select(items, canonical_anchors=set()) == [R1]
+    # Sanity: passing R1 as canonical force-restores it (already chosen here
+    # so no change), R2 still drops because it is not in canonical_anchors.
+    assert select(items, canonical_anchors={R1}) == [R1]
 
 
 def test_load_recorded_five_hour_windows_collapses_jittery_pairs(

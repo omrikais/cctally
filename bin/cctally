@@ -3951,17 +3951,23 @@ def _resolve_block_selector(
     return dict(row) if row else None
 
 
-# Items in `_select_non_overlapping_recorded_windows` whose weight is
-# >= this threshold are treated as canonical (sourced from
-# ``five_hour_blocks``) and bypass the 5h non-overlap constraint. Must
-# stay in sync with the ``counts[snapped] = counts.get(snapped, 0) + 1000``
-# overlay in ``_load_recorded_five_hour_windows`` — same constant, same
-# meaning. Issue #116.
+# Weight overlay applied per canonical (``five_hour_blocks``) row by
+# ``_load_recorded_five_hour_windows``: ``counts[snapped] += _CANONICAL_WEIGHT_THRESHOLD``.
+# Gives canonical anchors dominant weight inside the
+# ``_select_non_overlapping_recorded_windows`` DP, so any non-canonical
+# phantom adjacent to a canonical anchor loses on weight comparison. NOT
+# used as a provenance check — the selector takes an explicit
+# ``canonical_anchors`` set from the loader for the force-restore bypass
+# (issue #116 review follow-up: raw-only buckets with bulk-imported /
+# high-frequency snapshot histories can also accumulate >= 1000 weight,
+# so the threshold conflates provenance with support count).
 _CANONICAL_WEIGHT_THRESHOLD = 1000
 
 
 def _select_non_overlapping_recorded_windows(
     items: list[tuple[dt.datetime, int]],
+    *,
+    canonical_anchors: set[dt.datetime] | None = None,
 ) -> list[dt.datetime]:
     """Pick the max-weight subset of recorded ``R`` values that respect
     the 5h non-overlap constraint, with canonical anchors guaranteed
@@ -3978,9 +3984,8 @@ def _select_non_overlapping_recorded_windows(
     snapshots: the subset that maximizes total support wins. Tie-break
     in the take branch favors including more ``R`` values.
 
-    Canonical bypass (issue #116): any item with weight at least
-    ``_CANONICAL_WEIGHT_THRESHOLD`` came from the authoritative
-    ``five_hour_blocks`` rollup (the caller overlays at +1000).
+    Canonical bypass (issue #116): any ``R`` passed in ``canonical_anchors``
+    came from the authoritative ``five_hour_blocks`` rollup.
     ``maybe_update_five_hour_block`` already deduped via
     ``_canonical_5h_window_key`` pre-insert, so two canonical rows are
     by definition non-overlapping physically — they only appear "in
@@ -3992,11 +3997,18 @@ def _select_non_overlapping_recorded_windows(
     a genuinely-adjacent block pair). The DP still runs over the full
     item set so non-canonical phantoms next to a canonical anchor get
     dropped by weight comparison; the canonical-bypass only force-
-    restores canonical items the DP dropped, never adds back a raw-
-    only phantom.
+    restores anchors the caller marked canonical, never adds back a
+    raw-only phantom (even one whose raw weight ≥ ``_CANONICAL_WEIGHT_THRESHOLD``
+    — the v1.20.3 fix used weight as a provenance proxy, which the
+    review correctly flagged as conflating support count with provenance).
 
     Args:
       items: ``(R, support_count)`` pairs.
+      canonical_anchors: explicit set of ``R`` values sourced from
+        ``five_hour_blocks``. Any present in ``items`` is guaranteed to
+        appear in the result, even if the DP dropped it on the 5h
+        non-overlap constraint. ``None`` / empty set = pure DP behavior
+        (no bypass).
 
     Returns:
       Sorted ascending list of selected ``R`` values.
@@ -4039,11 +4051,14 @@ def _select_non_overlapping_recorded_windows(
         else:
             i -= 1
     chosen.reverse()
-    # Canonical bypass: force-restore any canonical-weight anchor the DP
-    # dropped (issue #116). Keep the result sorted ascending.
-    canonical = {R for R, w in items_sorted if w >= _CANONICAL_WEIGHT_THRESHOLD}
-    if canonical and not canonical.issubset(chosen):
-        return sorted(set(chosen) | canonical)
+    # Canonical bypass: force-restore any canonical anchor the DP dropped
+    # (issue #116). Intersect with items' keys so a caller passing anchors
+    # outside the item set can't corrupt the result.
+    if canonical_anchors:
+        items_keys = {R for R, _ in items_sorted}
+        present_canonical = canonical_anchors & items_keys
+        if present_canonical and not present_canonical.issubset(chosen):
+            return sorted(set(chosen) | present_canonical)
     return chosen
 
 
@@ -4334,8 +4349,16 @@ def _load_recorded_five_hour_windows(
     non_truncated_items = [
         (a, w) for a, w in counts.items() if a not in truncated_anchors
     ]
+    # Pass canonical provenance explicitly: every key currently in
+    # canonical_intervals came from a `five_hour_blocks` row (raw-only
+    # buckets never land in this map). Subtract truncated_anchors because
+    # those bypass the DP via the separate merge below — keeping them
+    # out of canonical_anchors here is a no-op for correctness but
+    # mirrors the same scope as non_truncated_items for clarity.
+    canonical_anchors_for_dp = set(canonical_intervals.keys()) - truncated_anchors
     selected_non_truncated = _select_non_overlapping_recorded_windows(
-        non_truncated_items
+        non_truncated_items,
+        canonical_anchors=canonical_anchors_for_dp,
     )
     # Merge truncated anchors back in, sorted ascending. Their non-
     # overlap with the surrounding canonical blocks is guaranteed by
