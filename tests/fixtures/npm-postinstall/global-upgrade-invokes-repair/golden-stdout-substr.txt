@@ -1,1 +1,1 @@
-repair-symlinks
+bin/cctally repair-symlinks
