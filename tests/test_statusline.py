@@ -257,8 +257,28 @@ class TestTodayCost:
         inp = ls.StatuslineInput()
         out = ls.resolve_today_cost(inp, "America/New_York", _FIXED_NOW, inj)
         assert out == "$46.36 today"
+        assert "$" in out
+        assert "today" in out
         assert called["tz"] == "America/New_York"
         assert called["now"] == _FIXED_NOW
+
+    def test_zero_cost_today(self):
+        # Zero-cost case: today_cost returns 0.0 → "$0.00 today".
+        inj = _make_inj(today_cost=lambda tz, now: 0.0)
+        inp = ls.StatuslineInput()
+        out = ls.resolve_today_cost(inp, "UTC", _FIXED_NOW, inj)
+        assert out == "$0.00 today"
+        assert "$" in out
+        assert "today" in out
+
+    def test_typical_day_format(self):
+        # Typical day: explicit assertion that format includes `$` and `today`.
+        inj = _make_inj(today_cost=lambda tz, now: 46.36)
+        inp = ls.StatuslineInput()
+        out = ls.resolve_today_cost(inp, "UTC", _FIXED_NOW, inj)
+        assert out == "$46.36 today"
+        assert out.startswith("$")
+        assert out.endswith("today")
 
 
 # ---- TestBlockCost ---------------------------------------------------------

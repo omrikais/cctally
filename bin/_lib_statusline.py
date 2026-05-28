@@ -218,6 +218,12 @@ def resolve_session_cost(
     `both`: side-by-side `($X cc / $Y cctally) session`
     """
     def _cctally_usable() -> Optional[float]:
+        # We require BOTH session_id (for the cache lookup key) AND
+        # transcript_path (proxy for "we trust the local cache" — its
+        # presence means CC believes a local transcript exists, so the
+        # session-entry cache should have ingested it). Future readers:
+        # don't drop the transcript guard without re-thinking that
+        # invariant.
         if not inp.session_id or not inp.transcript_path:
             return None
         return inj.cctally_session_cost(inp.session_id)

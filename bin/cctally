@@ -4505,13 +4505,42 @@ def cmd_statusline(args: argparse.Namespace) -> int:
         2  argparse rejected a flag (e.g. --cost-source ccusage), OR
            --config PATH unreadable
     """
-    # Reject the 'ccusage' cost-source value with a rename hint.
-    if args.cost_source == "ccusage":
+    # NOTE: `--cost-source ccusage` is rejected at argparse-time by
+    # `_CostSourceAction` in `_build_statusline_parser`; it exits 2 with
+    # the rename hint before we get here, so no explicit re-check is
+    # needed in this function.
+
+    # Validate `--context-{low,medium}-threshold` BEFORE reading stdin
+    # so a misconfigured invocation fails fast without consuming the
+    # CC hook's stdin payload.
+    low = args.context_low_threshold
+    med = args.context_medium_threshold
+    if not isinstance(low, int) or low < 0 or low > 100:
         eprint(
-            "cctally statusline: unknown choice 'ccusage' "
-            "(cctally renamed it; try --cost-source cctally)"
+            "cctally statusline: --context-low-threshold must be in [0, 100]"
         )
         return 2
+    if not isinstance(med, int) or med < 0 or med > 100:
+        eprint(
+            "cctally statusline: --context-medium-threshold must be in [0, 100]"
+        )
+        return 2
+    if low >= med:
+        eprint(
+            "cctally statusline: --context-low-threshold must be < "
+            "--context-medium-threshold"
+        )
+        return 2
+
+    # Silently clamp `--refresh-interval` to [0, 600]. The flag is a
+    # no-op alias for ccusage drop-in compat; users never observe the
+    # effect, but the spec mandates the clamp for forward-compat (when
+    # we promote it to a real flag, the clamped value should be the one
+    # propagated downstream).
+    try:
+        args.refresh_interval = max(0, min(600, int(args.refresh_interval)))
+    except (TypeError, ValueError):
+        args.refresh_interval = 1
 
     # Read stdin once.
     raw = sys.stdin.buffer.read()
@@ -4765,6 +4794,13 @@ def _build_statusline_injections(warn_once):
         day_end_local = day_start_local + dt.timedelta(days=1)
         range_start = day_start_local.astimezone(dt.timezone.utc)
         range_end = day_end_local.astimezone(dt.timezone.utc)
+        # Two-filter pattern (UTC half-open + display-tz date check):
+        # the UTC range fetches the candidate window cheaply via the
+        # cache's indexed `timestamp` column; the display-tz date check
+        # then trims any entries that fall outside today's local
+        # calendar day (the UTC window straddles two local dates when
+        # the display tz has any UTC offset, so the SQL range alone is
+        # slightly wider than the local day).
         try:
             entries = get_entries(range_start, range_end, skip_sync=True)
         except Exception:
@@ -4772,7 +4808,7 @@ def _build_statusline_injections(warn_once):
         total = 0.0
         for e in entries:
             try:
-                # Filter to today in display tz.
+                # Filter to today in display tz (second-pass trim).
                 ts_local = e.timestamp.astimezone(tz)
                 if ts_local.date() != local_now.date():
                     continue
@@ -4871,9 +4907,14 @@ def _build_statusline_injections(warn_once):
         except Exception:
             return None
         try:
+            # Prefer `week_end_at` (ISO timestamp; sub-day precision) over
+            # `week_end_date` (date-only; UTC-midnight). Older snapshots
+            # may have `week_end_at` NULL — fall back to the date column
+            # in that case. See the neighbor query in `pick_week_selection`
+            # (bin/cctally:3849) for the precedent.
             row = conn.execute(
                 "SELECT five_hour_percent, five_hour_window_key, "
-                "  weekly_percent, week_end_date "
+                "  weekly_percent, week_end_at, week_end_date "
                 "FROM weekly_usage_snapshots "
                 "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
             ).fetchone()
@@ -4883,15 +4924,29 @@ def _build_statusline_injections(warn_once):
             five_resets = int(row[1]) if row[1] is not None else None
             seven_pct = float(row[2]) if row[2] is not None else None
             seven_resets = None
-            if row[3]:
+            week_end_at = row[3]
+            week_end_date = row[4]
+            if week_end_at:
                 try:
-                    week_end_date = dt.datetime.fromisoformat(row[3])
-                    if week_end_date.tzinfo is None:
-                        week_end_date = week_end_date.replace(
-                            tzinfo=dt.timezone.utc,
-                        )
+                    # `datetime.fromisoformat` accepts the trailing `Z`
+                    # only on Python 3.11+; normalize to `+00:00` so 3.10
+                    # checkouts (and any odd Z-suffixed snapshot) parse.
+                    raw_iso = str(week_end_at)
+                    if raw_iso.endswith("Z"):
+                        raw_iso = raw_iso[:-1] + "+00:00"
+                    end_dt = dt.datetime.fromisoformat(raw_iso)
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=dt.timezone.utc)
+                    seven_resets = int(end_dt.timestamp())
+                except Exception:
+                    seven_resets = None
+            if seven_resets is None and week_end_date:
+                try:
+                    end_dt = dt.datetime.fromisoformat(str(week_end_date))
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=dt.timezone.utc)
                     # week_end_date is exclusive — that's the reset moment.
-                    seven_resets = int(week_end_date.timestamp())
+                    seven_resets = int(end_dt.timestamp())
                 except Exception:
                     seven_resets = None
             return (five_pct, five_resets, seven_pct, seven_resets)
@@ -11271,11 +11326,41 @@ def _build_statusline_parser(subparsers, name, *, help_text, xref):
         help="Burn-rate visualization (default: off; config key "
              "statusline.visual_burn_rate).",
     )
+    # NOTE: `ccusage` is intentionally NOT in `choices=` so it doesn't
+    # appear in `--help` advertised options. Argparse runs the `choices`
+    # check BEFORE the action's `__call__`, so we cannot list `ccusage`
+    # in `choices=` AND catch it in the action. Instead we omit `choices=`
+    # entirely, manually validate inside the action, and re-raise the
+    # spec's rename hint via `parser.error` for `ccusage` specifically.
+    # Help text below hardcodes the legal set so users still see it in
+    # `--help`. A typo like `ccussage` falls through to a standard
+    # argparse-style "invalid choice" error from `parser.error`.
+    class _CostSourceAction(argparse.Action):
+        _ACCEPTED = ("auto", "cctally", "cc", "both")
+        _RENAMED = "ccusage"
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            if values == self._RENAMED:
+                parser.error(
+                    f"argument {option_string}: invalid choice: "
+                    f"{values!r} — cctally renamed it; try "
+                    f"--cost-source cctally"
+                )
+            if values not in self._ACCEPTED:
+                parser.error(
+                    f"argument {option_string}: invalid choice: "
+                    f"{values!r} (choose from "
+                    + ", ".join(repr(c) for c in self._ACCEPTED)
+                    + ")"
+                )
+            setattr(namespace, self.dest, values)
+
     p.add_argument(
         "--cost-source",
         dest="cost_source",
         default=None,
-        choices=["auto", "cctally", "cc", "both", "ccusage"],
+        action=_CostSourceAction,
+        metavar="{auto,cctally,cc,both}",
         help="Session cost source (default: auto; config key "
              "statusline.cost_source). Note: 'ccusage' errors with a "
              "rename hint — use 'cctally' instead.",
