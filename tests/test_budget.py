@@ -100,10 +100,20 @@ def test_f1_structural_budget_uses_project_linear():
     import inspect
     src = inspect.getsource(compute_budget_status)
     assert "project_linear(" in src
-    # And must NOT re-implement the primitive inline.
-    assert "rate_low * remaining" not in src.replace(
-        "return (current + rate_low * remaining", ""  # the primitive's own body
+    # And must NOT re-implement the primitive's `current + rate*remaining`
+    # math inline — that body lives only in project_linear.
+    assert "rate_low * remaining" not in src
+
+
+def test_get_budget_config_ignores_unknown_keys():
+    """Unknown budget sub-keys are warn-and-ignored, not fatal (forward compat)."""
+    cctally = _load("cctally", REPO / "bin" / "cctally")
+    out = cctally._get_budget_config(
+        {"budget": {"weekly_usd": 300.0, "alerts_enabled": False, "bogus": 1}}
     )
+    assert out["weekly_usd"] == 300.0
+    assert out["alerts_enabled"] is False
+    assert "bogus" not in out
 
 
 def test_f1_structural_forecast_uses_project_linear():

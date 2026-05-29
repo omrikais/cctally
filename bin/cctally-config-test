@@ -734,7 +734,7 @@ assert_contains "budget.alert_thresholds out-of-range stderr" "in [1, 100]" "$er
 # 38. budget.alert_thresholds sort + dedup on set
 HOME="$home" TZ=Etc/UTC "$BIN" config set budget.alert_thresholds 100,90,90 >/dev/null
 out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get budget.alert_thresholds)
-assert_eq "budget.alert_thresholds sort/dedup" "budget.alert_thresholds=[90, 100]" "$out"
+assert_eq "budget.alert_thresholds sort/dedup" "budget.alert_thresholds=90,100" "$out"
 
 # 39. budget.alerts_enabled boolean set/get
 HOME="$home" TZ=Etc/UTC "$BIN" config set budget.alerts_enabled false >/dev/null
@@ -744,7 +744,7 @@ assert_eq "budget.alerts_enabled false" "budget.alerts_enabled=false" "$out"
 # 40. unset budget.weekly_usd preserves sibling alert_thresholds
 HOME="$home" TZ=Etc/UTC "$BIN" config unset budget.weekly_usd >/dev/null
 out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get budget.alert_thresholds)
-assert_eq "budget unset preserves thresholds" "budget.alert_thresholds=[90, 100]" "$out"
+assert_eq "budget unset preserves thresholds" "budget.alert_thresholds=90,100" "$out"
 out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get budget.weekly_usd)
 assert_eq "budget unset clears weekly_usd" "budget.weekly_usd=" "$out"
 rm -rf "$home"

@@ -77,7 +77,6 @@ def compute_budget_status(inputs: BudgetInputs) -> BudgetStatus:
 
     elapsed_hours = elapsed_seconds / 3600.0
     remaining_hours = remaining_seconds / 3600.0
-    elapsed_days = elapsed_hours / 24.0
     remaining_days = remaining_hours / 24.0
 
     consumption_pct = (spent / target * 100.0) if target > 0 else 0.0

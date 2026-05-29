@@ -12,6 +12,7 @@ below. See docs/superpowers/specs/2026-05-22-cctally-core-data-globals.md.
 """
 from __future__ import annotations
 import datetime as dt
+import math
 import os
 import pathlib
 import re
@@ -523,11 +524,10 @@ _BUDGET_CONFIG_VALID_KEYS = {"weekly_usd", "alerts_enabled", "alert_thresholds"}
 def _get_budget_config(cfg: dict) -> dict:
     """Return the validated, defaults-filled budget block.
 
-    Raises _BudgetConfigError on invalid values. Unknown sub-keys are ignored
-    (forward compatibility). Mirrors _get_alerts_config / _get_oauth_usage_config.
+    Raises _BudgetConfigError on invalid values. Unknown sub-keys emit a
+    one-line warn-and-ignore (mirrors _get_alerts_config / the display.tz
+    posture for forward compatibility).
     """
-    import math
-
     out = dict(_BUDGET_DEFAULTS)
     out["alert_thresholds"] = list(_BUDGET_DEFAULTS["alert_thresholds"])
     block = cfg.get("budget") if isinstance(cfg, dict) else None
@@ -537,6 +537,13 @@ def _get_budget_config(cfg: dict) -> dict:
         raise _BudgetConfigError(
             f"budget must be an object, got {type(block).__name__}"
         )
+    # warn-and-ignore unknown keys (forward compat; matches _get_alerts_config)
+    for k in block.keys():
+        if k not in _BUDGET_CONFIG_VALID_KEYS:
+            print(
+                f"warning: ignoring unknown budget config key: {k}",
+                file=sys.stderr,
+            )
 
     if "weekly_usd" in block:
         v = block["weekly_usd"]

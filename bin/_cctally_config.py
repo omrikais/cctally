@@ -524,6 +524,10 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
             # round-trips via `config set alerts.enabled <plain-text>` work.
             if isinstance(v, bool):
                 rendered = "true" if v else "false"
+            elif isinstance(v, list):
+                # Comma-joined so `config get budget.alert_thresholds` output
+                # round-trips through `config set budget.alert_thresholds`.
+                rendered = ",".join(str(x) for x in v)
             else:
                 rendered = str(v)
             print(f"{k}={rendered}")
