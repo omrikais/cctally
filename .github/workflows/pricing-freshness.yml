@@ -1,0 +1,70 @@
+name: pricing-freshness
+
+# Weekly proactive pricing-drift check (spec 2026-05-29 §5.4). Runs
+# `cctally pricing-check --json` and maintains exactly one auto-managed
+# `pricing-drift`-labeled tracking issue (create / update / close-on-clean).
+#
+# The zero-lag `/v1/models` existence leg is NEVER exercised here — the
+# cron has no OAuth bearer, so it auto-degrades to LiteLLM value-drift +
+# missing-from-us only. The local guard (`doctor pricing.coverage`) and
+# the maintainer's release pre-flight are the day-0 existence backstop.
+
+on:
+  schedule:
+    # Weekly, Monday 09:17 UTC. Odd minute to dodge the top-of-hour
+    # scheduler congestion GitHub warns about for cron workflows.
+    - cron: "17 9 * * 1"
+  workflow_dispatch: {}
+
+# Least-privilege: read the checkout, write issues. No other scopes.
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    # Mirror-safe (spec §5.4): `.github/workflows/**` is allowlisted public,
+    # so this file is mirrored to omrikais/cctally verbatim. This guard keeps
+    # the scheduled, issue-mutating job from ever firing on the public mirror
+    # — it runs ONLY in the private repo. (Analogue of the self-hosted-runner
+    # push-only guard in ci.yml.)
+    if: github.repository == 'omrikais/cctally-dev'
+    runs-on: ubuntu-latest
+    env:
+      # Pin gh's target repo so issue ops can never accidentally hit the
+      # public mirror, and supply the token in the env — `permissions:`
+      # only SCOPES the token; gh reads its auth from GH_TOKEN.
+      GH_REPO: omrikais/cctally-dev
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # bin/cctally hard-exits below 3.13 (__min_python_version__);
+          # ubuntu-latest's default python3 is older.
+          python-version: "3.13"
+
+      - name: Run pricing-check (capture rc — exit 1 = drift, not failure)
+        id: check
+        run: |
+          # `pricing-check` exits 1 on the exact drift case this job exists
+          # to handle, and an Actions `run:` step fails the job on any
+          # nonzero exit. Capture stdout + rc WITHOUT aborting, then continue
+          # for rc in {0,1} and fail the job only for rc >= 2 (true
+          # usage/internal error). The exit-code precedence (§5.2) guarantees
+          # rc 1 always carries the actionable findings in OUT.
+          set +e
+          OUT=$(python3 bin/cctally pricing-check --json)
+          rc=$?
+          set -e
+          if [ "$rc" -ge 2 ]; then
+            echo "::error::pricing-check internal error (rc=$rc)"
+            printf '%s\n' "$OUT"
+            exit "$rc"
+          fi
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$OUT" > /tmp/pricing.json
+
+      - name: Manage the pricing-drift issue
+        run: python3 .github/scripts/pricing_issue.py /tmp/pricing.json

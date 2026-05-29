@@ -588,3 +588,73 @@ def test_pricing_check_human_render_runs(tmp_path):
 def test_pricing_check_bad_arg_exit2(tmp_path):
     r = _run_cctally(["pricing-check", "--bogus-flag"], home=tmp_path)
     assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+
+
+# --- Issue-manager script glue (.github/scripts/pricing_issue.py) ---------
+# The load-bearing decision (pricing_issue_action) is unit-tested above; these
+# cover the script's own glue: drift_present derivation and the --dry-run
+# action mapping (which exercises the kernel-import path the cron uses).
+
+_ISSUE_SCRIPT = (pathlib.Path(__file__).resolve().parents[1]
+                 / ".github" / "scripts" / "pricing_issue.py")
+
+
+def _load_issue_script():
+    spec = importlib.util.spec_from_file_location("pricing_issue", _ISSUE_SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["pricing_issue"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_issue_script_drift_present_predicate():
+    pi = _load_issue_script()
+    assert pi._drift_present({"drift": {"value_drift": [{"model": "x"}],
+                                        "missing_from_us": []}}) is True
+    assert pi._drift_present({"drift": {"value_drift": [],
+                                        "missing_from_us": ["claude-new"]}}) is True
+    # ahead_of_litellm is informational only — never drift (invariant #2).
+    assert pi._drift_present({"drift": {"value_drift": [], "missing_from_us": [],
+                                        "ahead_of_litellm": ["claude-lead"]}}) is False
+    assert pi._drift_present({"drift": {"value_drift": [], "missing_from_us": []}}) is False
+    assert pi._drift_present({}) is False
+
+
+def test_issue_script_build_body_renders():
+    pi = _load_issue_script()
+    body = pi._build_body({
+        "snapshotDate": "2026-05-04", "litellmSource": "ll", "status": "ok",
+        "degraded_components": [],
+        "drift": {"value_drift": [{"model": "claude-a", "field": "input_cost_per_token",
+                                   "ours": 1e-6, "theirs": 2e-6}],
+                  "missing_from_us": ["claude-new"], "ahead_of_litellm": []},
+    })
+    assert "claude-a" in body and "input_cost_per_token" in body
+    assert "claude-new" in body
+    assert "Remediation checklist" in body
+    assert "PRICING_SNAPSHOT_DATE" in body
+
+
+import subprocess as _sp  # noqa: E402
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"drift": {"value_drift": [{"model": "x"}], "missing_from_us": []}}, "create"),
+    ({"drift": {"value_drift": [], "missing_from_us": []}}, "noop"),
+])
+def test_issue_script_dry_run_action_mapping(tmp_path, payload, expected):
+    import json as _j
+    f = tmp_path / "p.json"
+    f.write_text(_j.dumps(payload))
+    r = _sp.run([sys.executable, str(_ISSUE_SCRIPT), "--dry-run", str(f)],
+                capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert f"action={expected}" in r.stdout, r.stdout
+
+
+def test_issue_script_bad_payload_exit2(tmp_path):
+    f = tmp_path / "bad.json"
+    f.write_text("not json")
+    r = _sp.run([sys.executable, str(_ISSUE_SCRIPT), "--dry-run", str(f)],
+                capture_output=True, text=True)
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
