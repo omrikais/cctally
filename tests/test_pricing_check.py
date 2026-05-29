@@ -173,3 +173,36 @@ def test_check_table_shapes_provider_specific_and_sentinel_aware():
 ])
 def test_pricing_issue_action(drift, open_, expected):
     assert pc.pricing_issue_action(drift, open_) == expected
+
+
+def test_allowlist_is_non_vacuous_against_committed_snapshot():
+    import json
+    snap = json.loads((pathlib.Path(__file__).resolve().parent
+                       / "fixtures" / "pricing" / "litellm_scoped.json").read_text())
+    scoped = pc.scope_litellm(snap)
+    stale = pc.stale_allowlist_entries(
+        pricing.PRICING_DRIFT_ALLOWLIST,
+        pricing.CLAUDE_MODEL_PRICING, pricing.CODEX_MODEL_PRICING, scoped)
+    assert stale == [], f"stale allowlist entries (divergence resolved upstream): {stale}"
+
+
+def test_committed_snapshot_matches_live_tables():
+    # The committed fixture must carry every model we price at its current
+    # value, so a real PRICING_DRIFT_ALLOWLIST entry is required to diverge.
+    import json
+    snap = json.loads((pathlib.Path(__file__).resolve().parent
+                       / "fixtures" / "pricing" / "litellm_scoped.json").read_text())
+    scoped = pc.scope_litellm(snap)
+    res = pc.diff_pricing(
+        pricing.CLAUDE_MODEL_PRICING, pricing.CODEX_MODEL_PRICING,
+        scoped, pricing.PRICING_DRIFT_ALLOWLIST)
+    assert res.value_drift == [], res.value_drift
+    assert res.missing_from_us == [], res.missing_from_us
+
+
+def test_table_shapes_clean_on_live_tables():
+    # gpt-5.3-codex-spark is the one documented all-zero sentinel.
+    problems = pc.check_table_shapes(
+        pricing.CLAUDE_MODEL_PRICING, pricing.CODEX_MODEL_PRICING,
+        zero_sentinels={"gpt-5.3-codex-spark"})
+    assert problems == [], problems
