@@ -46,9 +46,28 @@ def _chip_for_model(name: str) -> str:
     return "other"
 
 
+# Date the embedded pricing snapshots below were last verified against
+# vendor sources. Bump whenever CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING
+# is synced. Read by `pricing-check` + the release pre-flight staleness nudge.
+PRICING_SNAPSHOT_DATE = "2026-05-04"
+PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
+
+# Canonical machine-readable pricing source (Claude values + Codex values).
+LITELLM_PRICES_URL = (
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+    "model_prices_and_context_window.json"
+)
+
+# Deliberate divergences from LiteLLM the drift check must NOT flag. Each
+# entry suppresses either a specific value mismatch ({"model","field","reason"})
+# or an intentionally-omitted in-scope model ({"model","reason"} — no field).
+# Guarded by `stale_allowlist_entries` (tests/test_pricing_check.py): an entry
+# that no longer corresponds to a real divergence fails the suite.
+PRICING_DRIFT_ALLOWLIST: list[dict] = []
+
 # Anthropic API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured: 2026-05-04
+# - Captured: 2026-05-04 (see PRICING_SNAPSHOT_DATE)
 # - Verified by maintainer against docs.claude.com/en/docs/about-claude/pricing;
 #   update in PRs touching this table.
 CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
@@ -246,7 +265,7 @@ _unknown_model_warnings: set[str] = set()
 #
 # Codex (OpenAI) API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured: 2026-05-04
+# - Captured: 2026-05-04 (see PRICING_SNAPSHOT_DATE)
 # - Models listed are those observed in ~/.codex/sessions/ at implementation
 #   time plus common Codex/GPT-5 variants. Models absent from this table fall
 #   back to `gpt-5` pricing with isFallback=true (matches upstream's
