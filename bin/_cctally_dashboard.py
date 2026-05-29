@@ -332,6 +332,10 @@ def _build_alert_payload_five_hour(*args, **kwargs):
     return sys.modules["cctally"]._build_alert_payload_five_hour(*args, **kwargs)
 
 
+def _build_alert_payload_budget(*args, **kwargs):
+    return sys.modules["cctally"]._build_alert_payload_budget(*args, **kwargs)
+
+
 def _dispatch_alert_notification(*args, **kwargs):
     return sys.modules["cctally"]._dispatch_alert_notification(*args, **kwargs)
 
@@ -5576,7 +5580,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if "budget" in payload:
             # Echo the full validated budget block (defaults filled) so the
             # SettingsOverlay can repaint without a follow-up GET.
-            out["budget"] = _get_budget_config(merged)
+            validated_budget = _get_budget_config(merged)
+            out["budget"] = validated_budget
+            # Forward-only reconcile (mirrors `budget set` / `config set
+            # budget.*`): enabling/raising a budget while already past a
+            # threshold records the crossed thresholds as already-alerted so
+            # the next record-usage tick does NOT dispatch retroactive alerts.
+            # Runs AFTER save_config (config persisted first); best-effort —
+            # never breaks the 200 response. Config write already left the
+            # config_writer_lock, so the helper's open_db never nests.
+            _cctally()._reconcile_budget_on_config_write(validated_budget)
         if update_check_validated is not None:
             # Echo the full merged check block (cooked defaults included)
             # so the SettingsOverlay can repaint without a follow-up GET.
@@ -5627,8 +5640,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         ``_dispatch_alert_notification(..., mode="test")``, returns the
         dispatch status string in the JSON response.
 
-        Body (all fields optional): ``{"axis": "weekly"|"five_hour",
-        "threshold": 1..100}``. Defaults: axis="weekly", threshold=90.
+        Body (all fields optional): ``{"axis":
+        "weekly"|"five_hour"|"budget", "threshold": 1..100}``. Defaults:
+        axis="weekly", threshold=90.
 
         IMPORTANT: ``axis`` uses the underscore form (``"five_hour"``)
         in the JSON API to match the dispatch payload's internal axis
@@ -5667,11 +5681,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 return
 
         axis = body.get("axis", "weekly")
-        if axis not in ("weekly", "five_hour"):
+        if axis not in ("weekly", "five_hour", "budget"):
             self._respond_json(
                 400,
                 {"error": (
-                    f"axis must be 'weekly' or 'five_hour', got {axis!r}"
+                    "axis must be 'weekly', 'five_hour' or 'budget', "
+                    f"got {axis!r}"
                 )},
             )
             return
@@ -5695,6 +5710,19 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 week_start_date=dt.date.today().isoformat(),
                 cumulative_cost_usd=1.23,
                 dollars_per_percent=0.01,
+            )
+        elif axis == "budget":
+            # Synthetic budget payload — mirrors the CLI cmd_alerts_test
+            # budget branch (NO DB writes, test/real divergence contract).
+            # spent scaled to the threshold so the body reads plausibly
+            # (e.g. 100% → $300 of $300).
+            payload = _build_alert_payload_budget(
+                threshold=threshold,
+                crossed_at_utc=now_utc_iso(),
+                week_start_at=dt.date.today().isoformat(),
+                budget_usd=300.0,
+                spent_usd=300.0 * threshold / 100.0,
+                consumption_pct=float(threshold),
             )
         else:
             payload = _build_alert_payload_five_hour(

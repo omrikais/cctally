@@ -221,3 +221,65 @@ def test_http_budget_combined_save_with_display(monkeypatch, tmp_path):
         assert body["display"]["resolved_tz"] == "Etc/UTC"
     finally:
         srv.shutdown()
+
+
+# ── Fix #3: POST /api/alerts/test accepts the `budget` axis (mirrors CLI) ──
+#
+# The endpoint previously rejected any axis not in ("weekly", "five_hour")
+# with a 400, even though the CLI `cctally alerts test` handles budget and the
+# React client is budget-aware. It now mirrors the CLI's budget branch,
+# building the payload via `_build_alert_payload_budget` with the same
+# synthetic values, and returns 200 with a budget payload + dispatch status.
+
+
+def test_http_alerts_test_budget_axis_returns_200_payload(monkeypatch, tmp_path):
+    """{"axis":"budget","threshold":100} → 200 with a budget payload + a
+    dispatch status (osascript stubbed so the test is host-independent)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _wire_handlers(ns)
+    # Stub dispatch so no osascript is spawned; the dashboard shim resolves
+    # _dispatch_alert_notification via sys.modules["cctally"] at call time.
+    monkeypatch.setitem(
+        ns, "_dispatch_alert_notification",
+        lambda payload, *, mode="real", **kw: "queued",
+    )
+    srv, t, port = _serve(ns)
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/alerts/test",
+            {"axis": "budget", "threshold": 100},
+        )
+        assert status == 200, body
+        assert body is not None
+        assert "alert" in body and "dispatch" in body
+        payload = body["alert"]
+        assert payload["axis"] == "budget"
+        assert payload["threshold"] == 100
+        # Synthetic values mirror the CLI budget branch: $300 budget, spent
+        # scaled to the threshold (100% → $300 of $300). Budget context is
+        # nested under "context" (see _build_alert_payload_budget).
+        ctx = payload["context"]
+        assert abs(ctx["budget_usd"] - 300.0) < 1e-9
+        assert abs(ctx["spent_usd"] - 300.0) < 1e-9
+        assert abs(ctx["consumption_pct"] - 100.0) < 1e-9
+        assert body["dispatch"] == "queued"
+    finally:
+        srv.shutdown()
+
+
+def test_http_alerts_test_invalid_axis_400_message_lists_budget(monkeypatch, tmp_path):
+    """An unknown axis still 400s, and the message now enumerates `budget`."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _wire_handlers(ns)
+    srv, t, port = _serve(ns)
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/alerts/test",
+            {"axis": "bogus", "threshold": 90},
+        )
+        assert status == 400, body
+        assert "budget" in body.get("error", "")
+    finally:
+        srv.shutdown()

@@ -780,6 +780,14 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
             block[inner_key] = validated[inner_key]
             config["budget"] = block
             save_config(config)
+        # Forward-only reconcile (mirrors `budget set`): enabling/raising a
+        # budget while already past a threshold must record the crossed
+        # thresholds as already-alerted so the next record-usage tick does NOT
+        # dispatch retroactive alerts. Runs OUTSIDE config_writer_lock — the
+        # helper opens stats.db and must not nest under the config lock
+        # (fcntl.flock is per-fd; the helper has its own open_db locking).
+        c = _cctally()
+        c._reconcile_budget_on_config_write(validated)
         out_val = validated[inner_key]
         if getattr(args, "emit_json", False):
             print(json.dumps({"budget": {inner_key: out_val}}, indent=2))

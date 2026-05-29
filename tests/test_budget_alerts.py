@@ -21,8 +21,11 @@ Covered cases:
 """
 from __future__ import annotations
 
+import argparse
 import datetime as dt
+import http.client
 import json
+import threading
 
 import pytest
 
@@ -387,3 +390,179 @@ def test_reconcile_idempotent_on_rerun(ns, monkeypatch):
     assert [r["threshold"] for r in rows_second] == [90]  # no duplicate
     assert rows_second[0]["alerted_at"] == stamp_first  # not re-stamped
     assert captured == []  # reconcile never dispatches
+
+
+# ── Fix #1: the TWO non-canonical write paths also reconcile forward-only ──
+#
+# `_reconcile_budget_milestones_on_set` used to run ONLY from `budget set`.
+# `config set budget.*` and the dashboard POST /api/settings budget write
+# persisted config but skipped the reconcile, so enabling/raising a budget
+# while already past a threshold dispatched RETROACTIVE alerts on the next
+# record-usage tick. Both paths now route through the shared helper
+# `_reconcile_budget_on_config_write`. The smoking-gun assertion mirrors the
+# `budget set` reconcile test (case c): the write records the already-crossed
+# threshold with alerted_at SET but WITHOUT dispatch, so a subsequent
+# `maybe_record_budget_milestone` tick does NOT re-fire it.
+
+
+def test_config_set_path_reconciles_forward_only(ns, monkeypatch):
+    """`config set budget.weekly_usd 300` while already at 95% spend records
+    the crossed 90 threshold as already-alerted (no dispatch); the later
+    record-usage tick at 100% then fires ONLY 100."""
+    _seed_window(ns)
+    # No budget block on disk yet — the `config set` write installs weekly_usd
+    # 300 and the read-time defaults fill alerts_enabled True + the default
+    # thresholds. Pin thresholds explicitly so the crossing math is stable.
+    import _cctally_core
+    _cctally_core.CONFIG_PATH.write_text(
+        json.dumps({"budget": {"alert_thresholds": [90, 100]}}) + "\n"
+    )
+    # 95% spend ($285 on $300): 90 already crossed, 100 not yet.
+    _patch_spend(ns, monkeypatch, value=285.0)
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    args = argparse.Namespace(
+        key="budget.weekly_usd", value="300", emit_json=False,
+    )
+    rc = ns["_cmd_config_set"](args)
+    assert rc == 0
+
+    # Forward-only reconcile recorded 90 with alerted_at SET, NO dispatch.
+    rows = _milestone_rows(ns)
+    assert [r["threshold"] for r in rows] == [90]
+    assert rows[0]["alerted_at"] is not None
+    assert captured == []  # the config set did NOT instant-popup
+
+    # A later record-usage tick at 100% fires ONLY the still-pending 100 —
+    # the reconciled 90 is deduped, NOT re-dispatched retroactively.
+    _patch_spend(ns, monkeypatch, value=300.0)
+    ns["maybe_record_budget_milestone"]({})
+    rows = _milestone_rows(ns)
+    assert [r["threshold"] for r in rows] == [90, 100]
+    assert [p["threshold"] for p, _ in captured] == [100]
+
+
+# ---- dashboard POST /api/settings budget-write reconcile ------------------
+
+
+def _wire_dashboard_handlers(ns):
+    """Minimal handler wiring (mirrors tests/test_config_budget_settings.py)
+    so the POST /api/settings handler can run in a server thread."""
+    ns["DashboardHTTPHandler"].hub = ns["SSEHub"]()
+    ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](
+        ns["_empty_dashboard_snapshot"]()
+    )
+    ns["DashboardHTTPHandler"].static_dir = ns["STATIC_DIR"]
+    ns["DashboardHTTPHandler"].sync_lock = threading.Lock()
+    ns["DashboardHTTPHandler"].run_sync_now = staticmethod(lambda: None)
+    ns["DashboardHTTPHandler"].run_sync_now_locked = staticmethod(lambda: None)
+    ns["DashboardHTTPHandler"].no_sync = False
+    ns["DashboardHTTPHandler"].display_tz_pref_override = None
+
+
+def _post_json(host, port, path, body):
+    """POST a JSON body with matched Host + Origin (loopback CSRF contract)."""
+    c = http.client.HTTPConnection(host, port, timeout=2)
+    raw = json.dumps(body).encode()
+    host_header = f"{host}:{port}"
+    c.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
+    c.putheader("Content-Type", "application/json")
+    c.putheader("Content-Length", str(len(raw)))
+    c.putheader("Host", host_header)
+    c.putheader("Origin", f"http://{host_header}")
+    c.endheaders()
+    c.send(raw)
+    r = c.getresponse()
+    payload = r.read().decode("utf-8", errors="replace")
+    parsed = json.loads(payload) if payload else None
+    return r.status, parsed
+
+
+def test_dashboard_post_settings_reconciles_forward_only(ns, monkeypatch):
+    """`POST /api/settings {"budget": {weekly_usd:300, thresholds:[90,100]}}`
+    while already at 95% spend records the crossed 90 threshold as
+    already-alerted (no dispatch); the later record-usage tick fires only 100.
+    """
+    _seed_window(ns)
+    # 95% spend ($285 on $300): 90 already crossed, 100 not yet. The reconcile
+    # helper resolves _sum_cost_for_range via sys.modules["cctally"] at call
+    # time, so this monkeypatch is visible in the server thread.
+    _patch_spend(ns, monkeypatch, value=285.0)
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    _wire_dashboard_handlers(ns)
+    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    port = srv.server_address[1]
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"budget": {"weekly_usd": 300, "alert_thresholds": [90, 100]}},
+        )
+        assert status == 200, body
+        assert body["budget"]["weekly_usd"] == 300.0
+    finally:
+        srv.shutdown()
+
+    # Reconcile recorded 90 with alerted_at SET, NO dispatch (the 200 response
+    # must not have triggered a retroactive popup).
+    rows = _milestone_rows(ns)
+    assert [r["threshold"] for r in rows] == [90]
+    assert rows[0]["alerted_at"] is not None
+    assert captured == []
+
+    # Later record-usage tick at 100% fires ONLY the pending 100.
+    _patch_spend(ns, monkeypatch, value=300.0)
+    ns["maybe_record_budget_milestone"]({})
+    rows = _milestone_rows(ns)
+    assert [r["threshold"] for r in rows] == [90, 100]
+    assert [p["threshold"] for p, _ in captured] == [100]
+
+
+# ── Fix #2: recent-rate window clamps to the budget week (no last-week leak) ──
+#
+# `recent_24h_usd` is NOT display-only — it feeds rate_recent → rate_high →
+# projected_high → projected → the ok/warn/over verdict. `recent_start` is now
+# clamped at the week start (max(week_start, now-24h)), so a heavy spend just
+# before reset can't leak last week's dollars into a brand-new week's verdict.
+#
+# Smoking-gun: a fresh week (now = week_start + 3h) with a tiny this-week spend
+# but a heavy burn in the trailing 24h that PRECEDES the reset. Without the
+# clamp the trailing-24h window reaches ~21h back into last week, pulling a
+# huge rate_recent that projects WAY over budget → false "over". With the clamp
+# recent_24h only sees this-week spend → verdict "ok".
+
+
+def test_recent_rate_clamped_to_week_no_last_week_leak(ns, monkeypatch):
+    # Fresh week, 3h in.
+    now_utc = WEEK_START + dt.timedelta(hours=3)
+    _seed_window(ns)
+
+    # Window-aware spend: any range whose START precedes the week boundary is
+    # last week's pre-reset burn ($300 of heavy spend). Ranges that start AT
+    # the week boundary (both the `spent` call and the CLAMPED recent call)
+    # see only this week's tiny $2. The unclamped (buggy) recent call would
+    # start at now-24h < week_start and so pick up the $300.
+    def fake_sum(start, end, mode="auto", project=None, *, skip_sync=False):
+        if start < WEEK_START:
+            return 300.0  # last week's pre-reset burn — must NOT leak in
+        return 2.0        # this week so far
+    monkeypatch.setitem(ns, "_sum_cost_for_range", fake_sum)
+
+    conn = ns["open_db"]()
+    try:
+        inputs = ns["_build_budget_status_inputs"](
+            conn, target_usd=300.0, now_utc=now_utc, alert_thresholds=(90, 100),
+        )
+    finally:
+        conn.close()
+
+    assert inputs is not None
+    # The clamp pinned recent_24h to this-week spend ($2), NOT last week's $300.
+    assert abs(inputs.recent_24h_usd - 2.0) < 1e-9
+    assert abs(inputs.spent_usd - 2.0) < 1e-9
+
+    status = ns["compute_budget_status"](inputs)
+    # Without the clamp this would project ~$2k EOW → "over". Clamped: "ok".
+    assert status.verdict == "ok"

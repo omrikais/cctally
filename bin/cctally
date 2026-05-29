@@ -3643,6 +3643,30 @@ def _reconcile_budget_milestones_on_set(conn, *, target, thresholds, now_utc):
     conn.commit()
 
 
+def _reconcile_budget_on_config_write(validated_budget):
+    """Forward-only reconcile shared by all three budget-config write
+    paths (`budget set`, `config set budget.*`, dashboard POST
+    /api/settings). Gated + best-effort: a budget with alerts off or no
+    thresholds records nothing; a stats.db failure never fails the write.
+    Runs OUTSIDE any config_writer_lock (open_db has its own locking)."""
+    thresholds = validated_budget.get("alert_thresholds") or []
+    if not (_budget_alerts_active(validated_budget) and thresholds):
+        return
+    try:
+        conn = open_db()
+        try:
+            _reconcile_budget_milestones_on_set(
+                conn,
+                target=validated_budget["weekly_usd"],
+                thresholds=thresholds,
+                now_utc=_command_as_of(),
+            )
+        finally:
+            conn.close()
+    except Exception as exc:  # best-effort; never fail the write
+        eprint(f"[budget-milestone] reconcile on set failed: {exc}")
+
+
 def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> int:
     """One-shot historical backfill of five_hour_blocks from existing
     weekly_usage_snapshots data. Idempotent via UNIQUE(five_hour_window_key)
@@ -7807,15 +7831,24 @@ def _build_budget_status_inputs(conn, *, target_usd, now_utc, alert_thresholds):
     Spend is recomputed live via ``_sum_cost_for_range(..., mode="auto")``
     (the same path ``weekly`` / ``forecast`` use — pricing edits take effect
     immediately; F3's reconcile invariant is pinned here, NOT to snapshot
-    ``report``). ``recent_24h_usd`` is a second trailing-24h call used only
-    for the display projection band.
+    ``report``). ``recent_24h_usd`` is a second trailing-24h call that is NOT
+    display-only: in ``_lib_budget.compute_budget_status`` it feeds
+    ``rate_recent → rate_high → projected_high → projected``, which drives the
+    ok/warn/over verdict. It is therefore clamped to the current budget week
+    (``max(week_start_at, now - 24h)``) so a heavy spend just before reset
+    can't leak last week's dollars into a fresh week's verdict (false
+    WARN/OVER).
     """
     window = _resolve_current_budget_window(conn, now_utc)
     if window is None:
         return None
     week_start_at, week_end_at = window
     spent = _sum_cost_for_range(week_start_at, now_utc, mode="auto")
-    recent_start = now_utc - dt.timedelta(hours=24)
+    # Clamp the recent-rate window at the week start: both bounds are tz-aware
+    # so max() is well-defined. Without this, a brand-new week (now < week
+    # start + 24h) would pull pre-reset spend into rate_recent and flip a
+    # fresh verdict to warn/over.
+    recent_start = max(week_start_at, now_utc - dt.timedelta(hours=24))
     recent_24h = _sum_cost_for_range(recent_start, now_utc, mode="auto")
     return BudgetInputs(
         target_usd=float(target_usd),
@@ -9172,22 +9205,10 @@ def _cmd_budget_set(args: argparse.Namespace) -> int:
     # budget mid-week doesn't instant-popup; only LATER crossings fire. Runs
     # OUTSIDE the config_writer_lock (open_db has its own locking; reusing the
     # config lock here would needlessly serialize a stats.db write behind it).
-    # Gated on _budget_alerts_active — a budget with alerts off (or no
-    # thresholds) records nothing.
-    if _budget_alerts_active(validated) and thresholds:
-        try:
-            conn = open_db()
-            try:
-                _reconcile_budget_milestones_on_set(
-                    conn,
-                    target=weekly_usd,
-                    thresholds=thresholds,
-                    now_utc=_command_as_of(),
-                )
-            finally:
-                conn.close()
-        except Exception as exc:  # reconcile is best-effort; never fail the set
-            eprint(f"[budget-milestone] reconcile on set failed: {exc}")
+    # Shared with `config set budget.*` + dashboard POST /api/settings via
+    # _reconcile_budget_on_config_write (gated on _budget_alerts_active — a
+    # budget with alerts off or no thresholds records nothing).
+    _reconcile_budget_on_config_write(validated)
     if getattr(args, "json", False):
         print(json.dumps({
             "status": "set",
