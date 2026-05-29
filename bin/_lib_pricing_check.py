@@ -128,3 +128,57 @@ def diff_pricing(claude_tbl, codex_tbl, litellm_scoped, allowlist=None) -> "Drif
             ahead.append(model)
 
     return DriftResult(value_drift=value_drift, missing_from_us=missing, ahead_of_litellm=ahead)
+
+
+def stale_allowlist_entries(allowlist, claude_tbl, codex_tbl, litellm_scoped) -> list:
+    """Return allowlist entries that NO LONGER correspond to a real divergence.
+
+    An entry is stale if, with it removed, diff_pricing reports nothing it would
+    have suppressed (i.e. the value now matches / the model is now present)."""
+    ours = {**claude_tbl, **codex_tbl}
+    stale: list = []
+    for e in allowlist or []:
+        model = e["model"]
+        if e.get("field"):
+            theirs = (litellm_scoped.get(model) or {}).get(e["field"])
+            mine = (ours.get(model) or {}).get(e["field"])
+            real = (theirs is not None and mine is not None
+                    and abs(float(mine) - float(theirs)) > _DRIFT_EPS)
+        else:
+            # model-suppress entry: real only if litellm has it AND we don't
+            real = (model in litellm_scoped and model not in ours)
+        if not real:
+            stale.append(e)
+    return stale
+
+
+_CLAUDE_REQUIRED = ("input_cost_per_token", "output_cost_per_token",
+                    "cache_creation_input_token_cost", "cache_read_input_token_cost")
+_CODEX_REQUIRED = ("input_cost_per_token", "cache_read_input_token_cost",
+                   "output_cost_per_token")
+
+
+def check_table_shapes(claude_tbl, codex_tbl, zero_sentinels) -> list:
+    """Provider-specific well-formedness. Claude entries need the 4 required
+    fields; Codex entries need the 3 base fields (NO cache_creation) and may
+    carry optional *_above_272k_tokens tiered fields. All present cost fields
+    must be >= 0. An all-zero Codex entry is allowed ONLY if its model is in
+    `zero_sentinels` (e.g. gpt-5.3-codex-spark mirroring upstream $0)."""
+    problems: list = []
+
+    def _check(model, body, required, allow_zero):
+        for f in required:
+            if f not in body:
+                problems.append(f"{model}: missing required field {f}")
+        cost_fields = {k: v for k, v in body.items() if "cost" in k}
+        for k, v in cost_fields.items():
+            if not isinstance(v, (int, float)) or v < 0:
+                problems.append(f"{model}: field {k} not a non-negative number ({v!r})")
+        if cost_fields and all(float(v) == 0.0 for v in cost_fields.values()) and not allow_zero:
+            problems.append(f"{model}: all cost fields zero but not a documented sentinel")
+
+    for model, body in claude_tbl.items():
+        _check(model, body, _CLAUDE_REQUIRED, allow_zero=False)
+    for model, body in codex_tbl.items():
+        _check(model, body, _CODEX_REQUIRED, allow_zero=model in zero_sentinels)
+    return problems

@@ -122,3 +122,42 @@ def test_diff_pricing_allowlist_suppresses_value_and_missing():
     res = pc.diff_pricing(claude, {}, litellm, allowlist=allow)
     assert res.value_drift == []
     assert res.missing_from_us == []
+
+
+def test_stale_allowlist_entries_flags_resolved_divergence():
+    claude = {"claude-b": {"input_cost_per_token": 3e-6}}  # now MATCHES litellm
+    litellm = {"claude-b": {"input_cost_per_token": 3e-6}}
+    allow = [{"model": "claude-b", "field": "input_cost_per_token", "reason": "was deliberate"}]
+    stale = pc.stale_allowlist_entries(allow, claude, {}, litellm)
+    assert len(stale) == 1 and stale[0]["model"] == "claude-b"
+
+
+def test_stale_allowlist_entries_empty_when_divergence_real():
+    claude = {"claude-b": {"input_cost_per_token": 2e-6}}  # still differs
+    litellm = {"claude-b": {"input_cost_per_token": 3e-6}}
+    allow = [{"model": "claude-b", "field": "input_cost_per_token", "reason": "deliberate"}]
+    assert pc.stale_allowlist_entries(allow, claude, {}, litellm) == []
+
+
+def test_check_table_shapes_provider_specific_and_sentinel_aware():
+    claude_ok = {"c": {"input_cost_per_token": 1e-6, "output_cost_per_token": 5e-6,
+                       "cache_creation_input_token_cost": 1e-6, "cache_read_input_token_cost": 1e-7}}
+    codex_ok = {"gpt-5": {"input_cost_per_token": 1.25e-6, "cache_read_input_token_cost": 1.25e-7,
+                          "output_cost_per_token": 1e-5}}
+    problems = pc.check_table_shapes(claude_ok, codex_ok, zero_sentinels=set())
+    assert problems == []
+
+    # Codex sentinel all-zero is allowed only when whitelisted
+    codex_sentinel = {"gpt-x-spark": {"input_cost_per_token": 0.0,
+                      "cache_read_input_token_cost": 0.0, "output_cost_per_token": 0.0}}
+    assert pc.check_table_shapes({}, codex_sentinel, zero_sentinels={"gpt-x-spark"}) == []
+    assert pc.check_table_shapes({}, codex_sentinel, zero_sentinels=set()) != []
+
+    # Claude missing a required field is a problem
+    claude_bad = {"c": {"input_cost_per_token": 1e-6}}
+    assert pc.check_table_shapes(claude_bad, {}, zero_sentinels=set()) != []
+
+    # Negative cost is always a problem
+    codex_neg = {"gpt-5": {"input_cost_per_token": -1e-6,
+                 "cache_read_input_token_cost": 1e-7, "output_cost_per_token": 1e-5}}
+    assert pc.check_table_shapes({}, codex_neg, zero_sentinels=set()) != []
