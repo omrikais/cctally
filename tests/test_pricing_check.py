@@ -66,3 +66,21 @@ def test_classify_coverage_flags_unpriced_claude_and_codex_fallback():
 def test_classify_coverage_empty_when_all_priced():
     observed = [("claude", "claude-known", 1, 1), ("codex", "gpt-5", 1, 1)]
     assert pc.classify_coverage(observed, _resolve_claude, _is_codex_fallback) == []
+
+
+def test_scope_litellm_keeps_only_claude_and_codex_set():
+    litellm = {
+        "claude-3-5-haiku-latest": {"litellm_provider": "anthropic", "input_cost_per_token": 1e-6},
+        "claude-opus-4-8":         {"litellm_provider": "anthropic", "input_cost_per_token": 5e-6},
+        "gpt-5.4":                 {"litellm_provider": "openai",    "input_cost_per_token": 2.5e-6},
+        "gpt-4o":                  {"litellm_provider": "openai",    "input_cost_per_token": 2.5e-6},  # decoy: not codex
+        "gemini-2.0":              {"litellm_provider": "vertex_ai", "input_cost_per_token": 1e-6},     # decoy
+        "sample_spec":             {"max_tokens": 1},  # decoy: no provider
+    }
+    scoped = pc.scope_litellm(litellm)
+    assert "claude-3-5-haiku-latest" in scoped
+    assert "claude-opus-4-8" in scoped
+    assert "gpt-5.4" in scoped
+    assert "gpt-4o" not in scoped       # openai but not a codex/gpt-5 model we track
+    assert "gemini-2.0" not in scoped
+    assert "sample_spec" not in scoped
