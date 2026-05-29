@@ -362,3 +362,28 @@ def test_dry_run_brew_json(ns, tmp_path, monkeypatch, capsys):
     assert env["symlinks"]["reason"] == "brew"
     assert env["symlinks"]["would_create"] == 0
     assert "would_remove_stale" in env["symlinks"]
+
+
+def test_dry_run_brew_json_populates_would_remove_stale(ns, tmp_path, monkeypatch, capsys):
+    # The empty-array path is covered by test_dry_run_brew_json; pin the
+    # POPULATED path too so the documented `would_remove_stale` JSON key can't
+    # silently regress to always-[] (#119 cross-branch review).
+    setup = ns["_cctally_setup"]
+    local_bin, other = _seed_state_env(setup, monkeypatch, tmp_path)
+    keg = tmp_path / "Cellar" / "cctally" / "1.20" / "libexec" / "bin"
+    keg.mkdir(parents=True)
+    name = "cctally-forecast"
+    (keg / name).write_text("x")
+    (other / name).write_text("#!/bin/sh\n"); (other / name).chmod(0o755)
+    _link(local_bin, name, keg / name)            # live Cellar link...
+    # ...reachable via `other` (PATH minus ~/.local/bin) -> classes `stale`.
+    monkeypatch.setenv("PATH", os.pathsep.join([str(local_bin), str(other)]))
+    monkeypatch.setattr(setup, "_setup_is_brew_install", lambda repo_root: True)
+    monkeypatch.setattr(
+        setup, "_setup_resolve_repo_root",
+        lambda: pathlib.Path("/opt/homebrew/Cellar/cctally/1.21.0/libexec"),
+    )
+    rc = ns["_setup_dry_run"](argparse.Namespace(json=True, **_dry_run_flag_defaults()))
+    env = _json.loads(capsys.readouterr().out)
+    assert env["symlinks"]["skipped"] is True
+    assert name in env["symlinks"]["would_remove_stale"]

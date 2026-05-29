@@ -204,8 +204,8 @@ def _check_install_symlinks(s: DoctorState) -> CheckResult:
         # legacy ~/.local/bin link to a keg, so its slot classes `wrong`
         # but the command works. `cctally setup` deliberately won't remove
         # the only reachable copy — the actionable fix is a PATH change.
-        # Keep this message in sync with the pinned guidance in _setup_status
-        # / _setup_install (bin/_cctally_setup.py).
+        # Keep this message in sync with the pinned guidance in _setup_install
+        # (bin/_cctally_setup.py).
         remediation = (
             "cctally is reachable only through a legacy ~/.local/bin link to a "
             "Homebrew keg. Put <prefix>/bin on your PATH (e.g. `eval \"$(brew shellenv)\"`), "

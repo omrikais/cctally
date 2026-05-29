@@ -10418,7 +10418,7 @@ def doctor_gather_state(
     #   * symlinks_path_pinned — true iff cctally runs ONLY through a legacy
     #     ~/.local/bin link to a retired/foreign install (live retired link
     #     with no reachable_elsewhere fallback). Mirrors the pinned-only-path
-    #     predicate in _setup_status so doctor + setup agree on the fix.
+    #     predicate in _setup_install so doctor + setup agree on the fix.
     try:
         cctally_reachable_on_path = shutil.which("cctally") is not None
     except Exception:
