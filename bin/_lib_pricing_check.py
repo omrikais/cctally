@@ -23,15 +23,15 @@ class CoverageGap:
 class DriftRow:
     model: str
     field: str           # "" for whole-model categories
-    ours: "float | None"
-    theirs: "float | None"
+    ours: float | None
+    theirs: float | None
 
 
 @dataclasses.dataclass(frozen=True)
 class DriftResult:
-    value_drift: list          # list[DriftRow]
-    missing_from_us: list      # list[str]
-    ahead_of_litellm: list     # list[str] — informational; never actionable
+    value_drift: list[DriftRow]
+    missing_from_us: list[str]
+    ahead_of_litellm: list[str]   # informational; never actionable
 
 
 def classify_coverage(observed, resolve_claude, is_codex_fallback) -> list[CoverageGap]:
@@ -88,7 +88,7 @@ def _allow_index(allowlist):
     return field_suppress, model_suppress
 
 
-def diff_pricing(claude_tbl, codex_tbl, litellm_scoped, allowlist=None) -> "DriftResult":
+def diff_pricing(claude_tbl, codex_tbl, litellm_scoped, allowlist=None) -> DriftResult:
     """Direction-aware drift between our embedded tables and the scoped LiteLLM
     snapshot.
 
@@ -98,19 +98,29 @@ def diff_pricing(claude_tbl, codex_tbl, litellm_scoped, allowlist=None) -> "Drif
                       (actionable, unless allowlisted by model with no field).
     ahead_of_litellm — model we price that scoped LiteLLM lacks (informational;
                       NEVER actionable — we may legitimately lead the source).
+
+    Value-drift is one-directional: it only compares fields LiteLLM carries, so
+    a cost field present in our table but absent upstream is not value-compared
+    (ahead_of_litellm reports at model granularity only). That matches the
+    feature's intent — catch vendor price moves on fields we track.
     """
     field_suppress, model_suppress = _allow_index(allowlist)
     ours = {**claude_tbl, **codex_tbl}
-    value_drift: list = []
-    missing: list = []
-    ahead: list = []
+    value_drift: list[DriftRow] = []
+    missing: list[str] = []
+    ahead: list[str] = []
 
     for model, body in litellm_scoped.items():
         if model in ours:
             for field, theirs in body.items():
+                # Broad cost-field filter; the `mine is None` guard below is what
+                # keeps it safe (skips any upstream cost field we don't carry), so
+                # don't remove that guard thinking this filter is precise.
                 if not field.endswith("_cost_per_token") and "cost" not in field:
                     continue
-                if not isinstance(theirs, (int, float)):
+                # bool is an int subclass — exclude it so a non-numeric "cost" flag
+                # can never be read as a 0/1 price.
+                if isinstance(theirs, bool) or not isinstance(theirs, (int, float)):
                     continue
                 if (model, field) in field_suppress:
                     continue
