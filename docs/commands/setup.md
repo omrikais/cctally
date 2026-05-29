@@ -61,6 +61,47 @@ The pass is strictly additive and gated to existing installs:
 by the postinstall — and refuses to run from a dev checkout. You should not need
 to invoke it directly.
 
+## Homebrew installs
+
+On a Homebrew install, the policy is: **brew owns `<prefix>/bin/`; it never
+owns `~/.local/bin/`.** The formula already symlinks `cctally` (and every
+`cctally-*` subcommand) into `<prefix>/bin/`, which is version-stable and
+self-heals on `brew upgrade`. So `cctally setup` on a brew install:
+
+- **Skips creating `~/.local/bin/` symlinks entirely.** Commands reach your
+  PATH through the formula's `<prefix>/bin/`, so a second set of links would
+  only dangle after `brew cleanup` removes the old keg. `cctally setup` prints
+  a line like `✓ Brew install detected — commands are on PATH via <prefix>/bin/;
+  skipping ~/.local/bin/ symlinks`, and suppresses the usual "not on your
+  PATH" warning.
+- **Points Claude Code hooks at the stable `<prefix>/bin/cctally`** — not the
+  versioned keg path under `<prefix>/Cellar/cctally/<version>/` — so the hook
+  entries in `~/.claude/settings.json` survive `brew cleanup`.
+- **Cleans up leftover links.** Legacy `~/.local/bin/` links from a prior
+  install pattern are removed when safe: links to an old keg
+  (`<prefix>/Cellar/cctally/`) or the npm `cctally` shim are removed when the
+  command is still reachable elsewhere or the link is dangling; retired
+  command names (e.g. `cctally-release`, which went private) are removed
+  unconditionally. A hand-rolled link pointing somewhere unrelated is left
+  untouched.
+
+If cctally is reachable *only* through a legacy `~/.local/bin/` link to an old
+keg (so removing it would break your only working copy), setup deliberately
+leaves the link in place and instead prints a PATH-fix hint: put `<prefix>/bin`
+on your PATH (e.g. `eval "$(brew shellenv)"`), then re-run `cctally setup` to
+clean the link.
+
+`cctally setup --status` and `cctally setup --dry-run` reflect the skip. In
+`--status` the PATH row reads `brew: commands via <prefix>/bin`; in `--dry-run`
+the symlink line reads `Brew install — would skip ~/.local/bin/ symlinks
+(commands on PATH via <prefix>/bin/)`. The `--json` envelopes gain brew-specific
+keys under `symlinks`:
+
+| Mode | `symlinks` keys (brew only) |
+|---|---|
+| `cctally setup --json` (install) | `skipped: true`, `reason: "brew"`, `stale_removed: [<names cleaned up>]` (alongside the usual `created`/`already`/`replaced`/`total: 0`/`destination`) |
+| `cctally setup --dry-run --json` | `skipped: true`, `reason: "brew"`, `would_create: 0`, `would_remove_stale: [<names that would be cleaned up>]` (alongside `already: 0`/`blocked: []`/`destination`/`total: 0`) |
+
 ## Hook events installed
 
 `PostToolBatch`, `Stop`, `SubagentStop`. Together they cover every
