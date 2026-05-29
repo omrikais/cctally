@@ -7,14 +7,25 @@ the leaf name (so banner-suppression keys match the flat forms), bare subgroups
 require a command, and the flat forms still route (guards the extract-to-builder
 refactor).
 """
+import sys
+
 import pytest
 from conftest import load_script
 
 # Loaded once; build_parser() is pure (no I/O), so a single namespace suffices.
 _NS = load_script()
+# Capture the cctally module object backing _NS. After the parser extraction
+# (2026-05-30), build_parser lives in the _cctally_parser sibling and resolves
+# the staying cmd_* handlers via the call-time `_cctally()` accessor
+# (`sys.modules["cctally"]`). A later test module's `load_script()` rebinds
+# `sys.modules["cctally"]` to a fresh instance, so we re-pin it to _NS's module
+# before parsing — restoring the pre-extraction invariant that `args.func` is
+# identically _NS's cmd_* object regardless of collection order.
+_MOD = sys.modules["cctally"]
 
 
 def _parse(argv):
+    sys.modules["cctally"] = _MOD
     return _NS["build_parser"]().parse_args(argv)
 
 
