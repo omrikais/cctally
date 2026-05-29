@@ -2,8 +2,8 @@
 
 Read-only diagnostic. Answers the question: "why is my cctally data
 stale or broken?" by running every passive check across install,
-hooks, OAuth, database, data freshness, and safety config, then
-emitting a severity-ranked report.
+hooks, OAuth, database, data freshness, pricing coverage, and safety
+config, then emitting a severity-ranked report.
 
 ## Modes
 
@@ -37,7 +37,7 @@ usable as a healthcheck without false-positive noise:
 
 ## Check inventory
 
-Six categories, 20 checks. Each check has a stable `id` (used as the
+Seven categories. Each check has a stable `id` (used as the
 JSON key), a one-line summary, and a remediation hint shown when
 severity != `OK`.
 
@@ -65,6 +65,9 @@ severity != `OK`.
 - `data.latest_snapshot_age` — WARN at 5min-1h, FAIL >1h or never.
 - `data.cache_sync_state` — WARN when the cache is empty despite JSONL files, or last entry > 24h old.
 - `data.codex_cache` — same shape for `codex_session_entries`; OK with summary "none" when no Codex sessions exist.
+
+### Pricing
+- `pricing.coverage` — WARN when your **recent (trailing 30-day)** session data contains a model cctally cannot price exactly: a Claude model that resolves to `$0` (`unpriced` — silent undercount) or a Codex model approximated via the `gpt-5` fallback (`fallback`). `details` lists each offending model ID + entry count + token volume; remediation points at [`pricing-check`](pricing-check.md) and the embedded pricing tables. OK when every observed model is priced, or when the cache is absent (no usage to assess). Read-only — the scan never creates the data dir on a fresh HOME. This is the offline counterpart to [`pricing-check`](pricing-check.md)'s coverage leg (which scans *all* history, not just the last 30 days), and it rolls into the dashboard health chip/modal for free.
 
 ### Safety
 - `safety.dashboard_bind` — WARN when stored config is non-loopback OR (when invoked from inside the dashboard server) when the runtime bind is non-loopback.

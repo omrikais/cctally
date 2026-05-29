@@ -24,7 +24,8 @@ One page per subcommand. Pages follow a consistent shape:
 | --- | --- |
 | `cache-report` | [cache-report.md](cache-report.md) |
 | `cache-sync` | [cache-sync.md](cache-sync.md) |
-| `doctor` | [doctor.md](doctor.md) — read-only health report (install / hooks / OAuth / DB / freshness / safety) |
+| `doctor` | [doctor.md](doctor.md) — read-only health report (install / hooks / OAuth / DB / freshness / pricing / safety) |
+| `pricing-check` | [pricing-check.md](pricing-check.md) — detect stale/missing embedded model pricing (coverage / LiteLLM drift / `/v1/models` existence) |
 | `range-cost` | [range-cost.md](range-cost.md) |
 
 ## Subgroups (ccusage hierarchical syntax)
