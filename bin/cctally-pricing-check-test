@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# bin/cctally-pricing-check-test — golden-file harness for `cctally
+# pricing-check`.
+#
+# For each scenario it:
+#   1. Creates a scratch HOME (mktemp -d, isolated per scenario).
+#   2. Copies the scenario's committed cache.db (if any) into
+#      <scratch>/.local/share/cctally/cache.db.
+#   3. Runs `cctally pricing-check --json` with the scenario's flags + the
+#      hidden env hooks (CCTALLY_PRICING_LITELLM_FILE /
+#      CCTALLY_PRICING_MODELS_FILE) injecting local snapshots — NO test
+#      hits the network (spec invariant #4).
+#   4. Asserts the exit code explicitly (set +e; …; rc=$?) against the
+#      scenario's expected rc — the load-bearing precedence contract.
+#   5. Diffs the --json output against the per-scenario golden via
+#      bin/_lib-golden-diff.sh (NEVER inline `diff <(…)` — issue #106/#107).
+#
+# Scenarios (rc / status):
+#   offline_clean           rc 0  status ok        coverage []
+#   offline_finding         rc 1  status ok        unpriced Claude in coverage
+#   drift_found             rc 1  status ok        value_drift via inject
+#   degraded_clean          rc 0  status degraded  both legs unreachable, quiet
+#   finding_while_degraded  rc 1  status degraded  drift + /v1/models degraded
+#                                                   (PRECEDENCE: finding wins)
+#
+# Run: bin/cctally-pricing-check-test
+# Regenerate goldens: CCTALLY_PRICING_CHECK_REGENERATE=1 bin/cctally-pricing-check-test
+#
+# No path/version canonicalization is needed: pricing-check --json carries
+# no host-specific paths, and snapshotDate/litellmSource are deterministic
+# constants (a snapshot bump deliberately updates the golden).
+
+set -uo pipefail
+
+# Dev-instance isolation: force prod data-dir layout under fake HOME.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+CCTALLY="$REPO_ROOT/bin/cctally"
+FIXTURES="$REPO_ROOT/tests/fixtures/pricing-check"
+REGENERATE="${CCTALLY_PRICING_CHECK_REGENERATE:-}"
+
+pass_count=0
+fail_count=0
+
+# Robust golden comparison (issue #106/#107): ONE `diff` over real files.
+# shellcheck source=bin/_lib-golden-diff.sh
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
+SCRATCH_ROOT=$(mktemp -d -t cctally-pricing-check-XXXXXX)
+trap 'rm -rf "$SCRATCH_ROOT"' EXIT
+
+# python3-only clean bin so the CLI runs without leaking a real cctally onto
+# PATH (mirrors the doctor harness rationale).
+PY_CLEAN_BIN="$SCRATCH_ROOT/.py-clean-bin"
+mkdir -p "$PY_CLEAN_BIN"
+ln -sf "$(command -v python3)" "$PY_CLEAN_BIN/python3"
+CLEAN_PATH="$PY_CLEAN_BIN:/usr/bin:/bin"
+
+# Rebuild fixtures so harness output reflects the current builder.
+"$REPO_ROOT/bin/build-pricing-check-fixtures.py" >/dev/null || {
+    echo "FAIL: build-pricing-check-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+# run_scenario <name> <expected_rc> [extra env+flags...]
+#   The remaining args are passed verbatim to the cctally invocation env +
+#   argv via a small dispatch below. To keep it simple each scenario has an
+#   explicit branch that sets ENV_ARGS (env assignments) and CLI_FLAGS.
+run_scenario () {
+    local name="$1" expected_rc="$2"
+    local dir="$FIXTURES/$name"
+    local golden="$dir/expected.json"
+    local scratch="$SCRATCH_ROOT/$name"
+    mkdir -p "$scratch/.local/share/cctally"
+
+    # Seed cache.db from the committed fixture (every scenario has one).
+    if [ -f "$dir/cache.db" ]; then
+        cp "$dir/cache.db" "$scratch/.local/share/cctally/cache.db"
+    fi
+
+    # Per-scenario env-hook values + flags. Default both hooks empty so an
+    # inherited dev-shell value can't leak; scenarios that need them override.
+    local litellm_file="" models_file=""
+    local -a flags=()
+    case "$name" in
+        offline_clean|offline_finding)
+            flags=(--offline --json)
+            ;;
+        drift_found)
+            flags=(--json)
+            litellm_file="$dir/litellm.json"
+            models_file="$dir/models.json"
+            ;;
+        degraded_clean)
+            flags=(--json)
+            # Unreachable paths -> both network legs degrade. Nothing
+            # actionable -> exit 0, status degraded.
+            litellm_file="$scratch/nonexistent-litellm.json"
+            models_file="$scratch/nonexistent-models.json"
+            ;;
+        finding_while_degraded)
+            flags=(--json)
+            # Diverging LiteLLM (drift finding) + unreachable /v1/models
+            # (existence degraded). PRECEDENCE: exit 1 + status degraded.
+            litellm_file="$dir/litellm.json"
+            models_file="$scratch/nonexistent-models.json"
+            ;;
+        *)
+            echo "FAIL $name: unknown scenario"
+            fail_count=$((fail_count + 1))
+            return 1
+            ;;
+    esac
+
+    local raw rc
+    set +e
+    raw=$(HOME="$scratch" \
+          TZ=Etc/UTC \
+          PATH="$CLEAN_PATH" \
+          NO_COLOR=1 \
+          CCTALLY_DISABLE_DEV_AUTODETECT=1 \
+          CCTALLY_PRICING_LITELLM_FILE="$litellm_file" \
+          CCTALLY_PRICING_MODELS_FILE="$models_file" \
+          "$CCTALLY" pricing-check "${flags[@]}" 2>/dev/null)
+    rc=$?
+    set -e
+
+    # Exit-code assertion (the load-bearing precedence contract).
+    if [ -n "$REGENERATE" ]; then
+        echo "$rc" > "$dir/expected.exit"
+    else
+        local want_exit
+        want_exit=$(cat "$dir/expected.exit" 2>/dev/null || echo "$expected_rc")
+        if [ "$rc" != "$want_exit" ]; then
+            echo "FAIL $name/exit  expected=$want_exit  actual=$rc"
+            printf '%s\n' "$raw" | head -40 | sed 's/^/    /'
+            fail_count=$((fail_count + 1))
+            return 1
+        fi
+        echo "PASS $name/exit"
+        pass_count=$((pass_count + 1))
+    fi
+
+    # JSON golden (sorted keys for byte-stability across dict ordering).
+    local actual
+    actual=$(printf '%s\n' "$raw" | python3 -m json.tool --sort-keys 2>/dev/null)
+    if [ -z "$actual" ]; then
+        echo "FAIL $name/json  (output was not valid JSON)"
+        printf '%s\n' "$raw" | head -40 | sed 's/^/    /'
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+
+    if [ -n "$REGENERATE" ]; then
+        printf '%s' "$actual" > "$golden"
+        echo "REGEN $name (rc=$rc)"
+        return 0
+    fi
+
+    if [ ! -f "$golden" ]; then
+        echo "MISSING GOLDEN $name/json — actual output:"
+        printf '%s\n' "$actual" | sed 's/^/    /'
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+
+    local GOLDEN_DIFF_TMPDIR="$scratch"
+    local actual_tmp; actual_tmp=$(mktemp "$scratch/golden-diff-actual.XXXXXX")
+    printf '%s' "$actual" > "$actual_tmp"
+    # $name (the scenario name, the run_scenario param) is what
+    # _lib-golden-diff.sh's FAIL line reads via ${name:-?}.
+    if ! _golden_diff_files "json" "$golden" "$actual_tmp" 200; then
+        rm -f "$actual_tmp"
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    rm -f "$actual_tmp"
+    echo "PASS $name/json"
+    pass_count=$((pass_count + 1))
+    return 0
+}
+
+if [ ! -d "$FIXTURES" ]; then
+    echo "cctally-pricing-check-test: fixtures dir missing: $FIXTURES" >&2
+    exit 1
+fi
+
+echo "cctally-pricing-check-test: running scenarios under $FIXTURES"
+
+run_scenario offline_clean          0
+run_scenario offline_finding        1
+run_scenario drift_found            1
+run_scenario degraded_clean         0
+run_scenario finding_while_degraded 1
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

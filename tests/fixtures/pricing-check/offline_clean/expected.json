@@ -1,0 +1,17 @@
+{
+    "coverage": [],
+    "degraded_components": [],
+    "drift": {
+        "ahead_of_litellm": [],
+        "missing_from_us": [],
+        "value_drift": []
+    },
+    "existence": {
+        "status": "skipped",
+        "unpriced_vendor_models": []
+    },
+    "litellmSource": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+    "schemaVersion": 1,
+    "snapshotDate": "2026-05-04",
+    "status": "ok"
+}

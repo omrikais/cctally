@@ -1,0 +1,6 @@
+{
+  "claude-3-5-haiku-20241022": {
+    "input_cost_per_token": 9.99e-07,
+    "litellm_provider": "anthropic"
+  }
+}
