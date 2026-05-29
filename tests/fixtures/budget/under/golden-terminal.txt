@@ -1,0 +1,9 @@
+Weekly budget: $300.00   (subscription week 2026-05-26 → 2026-06-02)
+
+  Spent so far    $126.00    42.0% of budget
+  Remaining       $174.00
+  Pace            $31.50/day  ·  4.0 d elapsed
+  Daily budget    $58.00/day for the 3.0 d left to stay under
+  Projected EOW   $180–$220   →   ✓ OK
+
+  Alerts: on · thresholds 90% · 100% · (none crossed yet)

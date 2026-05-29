@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Fixture-based validation harness for `budget`.
+#
+# Walks tests/fixtures/budget/*/input.env and runs each scenario through
+# the shared run_mode helper (bin/_lib-fixture-harness.sh):
+#   - terminal  (bare `cctally budget`)
+#   - --json
+# plus, for the `under` scenario, the full share-output surface:
+#   - --format md   (light + dark)
+#   - --format html --output -  (light + dark)
+#   - --format svg  --output -  (light + dark)
+# diffing each against the corresponding golden file via the golden-diff
+# helpers (NEVER an inline `diff -u <(…)`). Exits 0 on all-pass, 1 on any diff.
+#
+# Determinism: NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF=<fixed> (injected by the
+# shared lib's env block). Each fixture's config.json pins display.tz=utc so
+# datetime suffixes render UTC regardless of host zone.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+HARNESS_SUBCOMMAND="budget"
+HARNESS_FIXTURES_DIR="$REPO_ROOT/tests/fixtures/budget"
+HARNESS_BIN="$REPO_ROOT/bin/cctally"
+
+# Per-run scratch dir for the regenerated fixture DBs + any test-process
+# SQLite writes — keeps in-tree fixture .db files byte-stable across runs.
+# HARNESS_FAKE_HOME_BASE redirects FAKE_HOME in _lib-fixture-harness.sh;
+# input.env / golden-*.txt are still read from the in-tree HARNESS_FIXTURES_DIR.
+SCRATCH_DIR=$(mktemp -d -t cctally-budget-fixtures-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR"
+
+# Regenerate seeded fixture DBs (+ config.json + input.env) into the scratch
+# dir so goldens always check against reproducible state without dirtying the
+# tree.
+"$REPO_ROOT/bin/build-budget-fixtures.py" --out "$SCRATCH_DIR" >/dev/null || {
+    echo "FAIL: build-budget-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+# shellcheck disable=SC1091
+. "$REPO_ROOT/bin/_lib-fixture-harness.sh"
+
+pass_count=0
+fail_count=0
+
+for dir in "$HARNESS_FIXTURES_DIR"/*/; do
+    name=$(basename "$dir")
+    run_mode "$name" "terminal" ""       "terminal"
+    run_mode "$name" "json"     "--json" "json"
+done
+
+# ── Share-output surface ────────────────────────────────────────────────
+# Exercise md/html/svg in both themes against the representative `under`
+# scenario. The artifact embeds the live CHANGELOG version (e.g. "v1.21.3"),
+# which churns on every release — so we normalize the version token to a
+# fixed `VERSION` placeholder BEFORE diffing, keeping full golden coverage
+# without re-blessing on every version bump (the daily-instances harness
+# sidesteps the same churn by asserting on totals; here we keep the full
+# artifact under golden but neutralize the one non-deterministic field).
+# `generated_at` is already deterministic via CCTALLY_AS_OF.
+GOLDEN_DIFF_TMPDIR="$SCRATCH_DIR"
+
+# Resolve the live version once so the sed normalizer targets the exact token.
+# Use the binary's own `--version` (module-loaded path) rather than importing
+# _lib_changelog directly — that helper reaches for sys.modules["cctally"] via
+# the accessor pattern, which a bare `import _lib_changelog` never populates.
+# `cctally --version` prints "cctally X.Y.Z"; both it and the share footer's
+# _share_resolve_version() source the same CHANGELOG header.
+LIVE_VERSION=$("$HARNESS_BIN" --version 2>/dev/null | awk '{print $2}')
+
+run_format_mode () {
+    local label="$1" flags="$2" golden_suffix="$3"
+    local fx_home="$SCRATCH_DIR/under"
+    local as_of=""
+    # shellcheck disable=SC1091
+    . "$HARNESS_FIXTURES_DIR/under/input.env"
+    as_of="$AS_OF"
+    local golden="$HARNESS_FIXTURES_DIR/under/golden-$golden_suffix.txt"
+    local raw actual
+    # shellcheck disable=SC2086
+    raw=$(HOME="$fx_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$as_of" \
+          "$HARNESS_BIN" budget $flags 2>&1)
+    # Normalize the live version token (both `cctally_version: X` and `vX`).
+    if [ -n "$LIVE_VERSION" ]; then
+        actual=$(printf '%s' "$raw" \
+            | sed "s/cctally_version: ${LIVE_VERSION}/cctally_version: VERSION/g" \
+            | sed "s/v${LIVE_VERSION}/vVERSION/g")
+    else
+        actual="$raw"
+    fi
+    if [ -n "${HARNESS_REGEN:-}" ]; then
+        printf '%s\n' "$actual" > "$golden"
+        echo "REGEN under/$label"
+        pass_count=$((pass_count + 1))
+        return 0
+    fi
+    if [ ! -f "$golden" ]; then
+        echo "MISSING GOLDEN under/$label"
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    local name="$label"
+    if ! _golden_diff_str "$label" "$golden" "$actual" 200; then
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    echo "PASS under/$label"
+    pass_count=$((pass_count + 1))
+    return 0
+}
+
+run_format_mode "fmt-md-light"   "--format md"                            "fmt-md-light"
+run_format_mode "fmt-md-dark"    "--format md --theme dark"               "fmt-md-dark"
+run_format_mode "fmt-html-light" "--format html --output -"               "fmt-html-light"
+run_format_mode "fmt-html-dark"  "--format html --theme dark --output -"  "fmt-html-dark"
+run_format_mode "fmt-svg-light"  "--format svg --output -"                "fmt-svg-light"
+run_format_mode "fmt-svg-dark"   "--format svg --theme dark --output -"   "fmt-svg-dark"
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

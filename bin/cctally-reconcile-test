@@ -44,6 +44,7 @@ FIXTURES="$SCRATCH_DIR"
 "$REPO_ROOT/bin/build-mode-fixtures.py"         --out "$SCRATCH_DIR/mode"         >/dev/null
 "$REPO_ROOT/bin/build-speed-fixtures.py"        --out "$SCRATCH_DIR/speed"        >/dev/null
 "$REPO_ROOT/bin/build-daily-instances-fixtures.py" --out "$SCRATCH_DIR/daily-instances" >/dev/null
+"$REPO_ROOT/bin/build-budget-fixtures.py"          --out "$SCRATCH_DIR/budget"          >/dev/null
 
 pass_count=0
 fail_count=0
@@ -3301,6 +3302,98 @@ EXPECTED_7D=$(sqlite3 "$STATUSLINE_FIXTURE_HOME/.local/share/cctally/stats.db" \
 EXPECTED_7D_ROUNDED=$(awk -v p="$EXPECTED_7D" 'BEGIN{print int(p + 0.5)}')
 statusline_reconcile "statusline_7d_eq_record_usage_latest" \
     "$SL_7D" "$EXPECTED_7D_ROUNDED"
+
+# ─── Invariant BUDGET1: budget.spent_usd == independent raw re-derivation ──
+# (F3, spec §6) `cctally budget --json .spent_usd` must equal an INDEPENDENT
+# raw re-derivation of the same window's live cost within 1e-9 USD. The
+# re-derivation scans the fixture's cache.db `session_entries` directly and
+# reimplements the per-token cost formula from _lib_pricing.CLAUDE_MODEL_PRICING
+# inline — it never calls `_sum_cost_for_range`, so the invariant stays
+# non-vacuous (a different code path + summation order than budget's, exactly
+# like the reconciliation-testing project memory prescribes). Pinned to the
+# LIVE path (budget calls `_sum_cost_for_range`, the same helper `weekly`/
+# `forecast` use), NOT snapshot-based `report`.
+BUDGET1_PY='
+import json, os, sqlite3, sys, datetime as dt
+sys.path.insert(0, os.environ["BUDGET_BIN_DIR"])
+import _lib_pricing as P
+
+budget = json.loads(os.environ["RECONCILE_A"])
+spent_budget = budget["spent_usd"]
+week_start = dt.datetime.fromisoformat(budget["week_start_at"].replace("Z", "+00:00"))
+as_of = dt.datetime.fromisoformat(budget["as_of"].replace("Z", "+00:00"))
+
+# Independent raw scan: sum cost over session_entries in [week_start, as_of],
+# reimplementing the per-token formula from the embedded pricing dict. This is
+# deliberately NOT _sum_cost_for_range / _calculate_entry_cost.
+conn = sqlite3.connect(os.environ["BUDGET_CACHE_DB"])
+rows = conn.execute(
+    "SELECT timestamp_utc, model, input_tokens, output_tokens, "
+    "cache_create_tokens, cache_read_tokens, cost_usd_raw FROM session_entries"
+).fetchall()
+conn.close()
+
+def rate(pricing, key):
+    return pricing.get(key, 0.0)
+
+total = 0.0
+counted = 0
+for ts_s, model, it, ot, cc, cr, cost_raw in rows:
+    ts = dt.datetime.fromisoformat(ts_s.replace("Z", "+00:00"))
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    if not (week_start <= ts <= as_of):
+        continue
+    counted += 1
+    # mode="auto": if a materialized cost is present, use it; else compute.
+    if cost_raw is not None:
+        total += float(cost_raw)
+        continue
+    pricing = P.CLAUDE_MODEL_PRICING.get(model)
+    if pricing is None:
+        # fixtures use known-priced models; a None here is a fixture bug.
+        raise SystemExit(f"unpriced model in fixture: {model!r}")
+    total += (
+        (it or 0) * rate(pricing, "input_cost_per_token")
+        + (ot or 0) * rate(pricing, "output_cost_per_token")
+        + (cc or 0) * rate(pricing, "cache_creation_input_token_cost")
+        + (cr or 0) * rate(pricing, "cache_read_input_token_cost")
+    )
+
+# Non-vacuity: a window that summed zero entries would make the equality
+# trivially true. Assert the independent scan actually counted spend.
+assert counted > 0, "BUDGET1 vacuous: no session_entries fell in the window"
+assert total > 0.0, "BUDGET1 vacuous: independent re-derivation summed $0"
+assert abs(spent_budget - total) < 1e-9, (
+    f"budget.spent_usd={spent_budget} independent_raw_sum={total} "
+    f"(counted {counted} entries in [{week_start}, {as_of}])"
+)
+'
+for fx in under warn over; do
+    fixture_home="$FIXTURES/budget/$fx"
+    [ -f "$fixture_home/input.env" ] || continue
+    AS_OF=""
+    # shellcheck disable=SC1091
+    . "$fixture_home/input.env"
+    budget_json=$(HOME="$fixture_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" budget --json 2>/dev/null); rc_b=$?
+    if [ $rc_b -ne 0 ]; then
+        echo "RECONCILE FAIL budget_spent_eq_raw_scan budget/$fx: budget --json rc=$rc_b"
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+    result=$(RECONCILE_A="$budget_json" \
+        BUDGET_BIN_DIR="$REPO_ROOT/bin" \
+        BUDGET_CACHE_DB="$fixture_home/.local/share/cctally/cache.db" \
+        python3 -c "$BUDGET1_PY" 2>&1); rc_py=$?
+    if [ $rc_py -ne 0 ]; then
+        echo "RECONCILE FAIL budget_spent_eq_raw_scan budget/$fx: $result"
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+    echo "PASS budget_spent_eq_raw_scan budget/$fx"
+    pass_count=$((pass_count + 1))
+done
 
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"

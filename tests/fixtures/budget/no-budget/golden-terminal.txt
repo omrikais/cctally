@@ -1,0 +1,1 @@
+No weekly budget set. Set one with: cctally budget set <amount>.

@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Build seeded SQLite fixtures for `cctally budget`.
+
+Writes one fixture tree per scenario under
+`tests/fixtures/budget/<scenario>/` (or a `--out` scratch dir for the
+golden harness). Each tree has:
+  - `.local/share/cctally/stats.db`   (weekly_usage_snapshots — the window anchor)
+  - `.local/share/cctally/cache.db`   (session_entries — drives live spend)
+  - `.local/share/cctally/config.json`(the `budget` block under test)
+  - `input.env`                       (AS_OF for the deterministic clock)
+
+Spend is driven entirely by `session_entries`, NOT by snapshot percent —
+`cctally budget` recomputes live cost via `_sum_cost_for_range`. Each entry
+is 100k input + 100k output tokens on `claude-sonnet-4-6`, which costs
+exactly $1.80 (100k * $3/M + 100k * $15/M = $0.30 + $1.50). So a scenario's
+target dollar spend is `n_entries * $1.80`, with `n_recent` of those placed
+inside the trailing 24h so the recent-rate projection band is deterministic.
+
+Verdict shapes (target $300, default thresholds 90/100) confirmed against
+the kernel before committing:
+  under   : 96h elapsed, 70 entries → $126 (42%), projection ≤ 270 → ok
+  warn    : 120h elapsed, 112 entries → $201.60, projection in [270,300) → warn
+  over    : 120h elapsed, 185 entries → $333 (>target) → over
+  low-conf: 12h elapsed, 10 entries → $18, elapsed_fraction < 0.15 → low_confidence
+  no-budget: config carries no weekly_usd → friendly no-budget status
+
+Run: `bin/build-budget-fixtures.py` (idempotent — overwrites existing DBs).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+# Make _fixture_builders importable when run directly (bin/ is not on sys.path).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _fixture_builders import (  # noqa: E402
+    create_cache_db,
+    create_stats_db,
+    seed_session_entry,
+    seed_weekly_usage_snapshot,
+)
+
+FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests/fixtures/budget"
+
+# Subscription-week window shared by every scenario. 7-day window anchored
+# on a Tuesday 14:00 UTC (matches the forecast fixtures' anchor style).
+WEEK_START = dt.datetime(2026, 5, 26, 14, 0, 0, tzinfo=dt.timezone.utc)
+WEEK_END = WEEK_START + dt.timedelta(days=7)
+
+# Per-entry cost: 100k input + 100k output on claude-sonnet-4-6 == $1.80.
+_ENTRY_INPUT = 100_000
+_ENTRY_OUTPUT = 100_000
+ENTRY_USD = 1.80
+
+
+def _iso(d: dt.datetime) -> str:
+    return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _seed_window_snapshot(stats_conn, *, weekly_percent: float, as_of: dt.datetime) -> None:
+    """Seed one boundary-aware weekly_usage_snapshots row so
+    `_fetch_current_week_snapshots` resolves the window. The percent value is
+    irrelevant to budget spend (spend comes from session_entries) but must be
+    present for the window to anchor."""
+    captured = min(as_of, WEEK_START + dt.timedelta(hours=6))
+    seed_weekly_usage_snapshot(
+        stats_conn,
+        captured_at_utc=_iso(captured),
+        week_start_date=WEEK_START.date().isoformat(),
+        week_end_date=(WEEK_END - dt.timedelta(seconds=1)).date().isoformat(),
+        week_start_at=_iso(WEEK_START),
+        week_end_at=_iso(WEEK_END),
+        weekly_percent=weekly_percent,
+        source="fixture",
+        payload_json=json.dumps({"fixture": True}),
+    )
+
+
+def _seed_entries(cache_conn, *, n_total: int, n_recent: int, as_of: dt.datetime) -> None:
+    """Seed `n_total` session_entries summing to `n_total * $1.80`.
+
+    `n_recent` of them land inside the trailing 24h before `as_of` (driving
+    `recent_24h_usd`); the remainder are spread across the earlier part of the
+    window. Each is 100k input + 100k output on claude-sonnet-4-6 ($1.80)."""
+    recent_anchor = as_of - dt.timedelta(hours=12)  # mid trailing-24h
+    early_anchor = WEEK_START + dt.timedelta(hours=3)
+    idx = 0
+    for _ in range(n_recent):
+        seed_session_entry(
+            cache_conn,
+            source_path=f"/fx/budget-session-{idx}.jsonl",
+            line_offset=idx,
+            timestamp_utc=_iso(recent_anchor),
+            model="claude-sonnet-4-6",
+            input_tokens=_ENTRY_INPUT,
+            output_tokens=_ENTRY_OUTPUT,
+        )
+        idx += 1
+    for _ in range(max(0, n_total - n_recent)):
+        seed_session_entry(
+            cache_conn,
+            source_path=f"/fx/budget-session-{idx}.jsonl",
+            line_offset=idx,
+            timestamp_utc=_iso(early_anchor),
+            model="claude-sonnet-4-6",
+            input_tokens=_ENTRY_INPUT,
+            output_tokens=_ENTRY_OUTPUT,
+        )
+        idx += 1
+
+
+def _build(name: str, *, as_of: dt.datetime, budget_block: dict,
+           n_total: int, n_recent: int, weekly_percent: float,
+           seed_data: bool = True) -> None:
+    out_dir = FIXTURES_DIR / name
+    app_dir = out_dir / ".local" / "share" / "cctally"
+    app_dir.mkdir(parents=True, exist_ok=True)
+
+    stats_path = app_dir / "stats.db"
+    cache_path = app_dir / "cache.db"
+    # Full production schema + WAL via the shared builders (they also call
+    # register_fixture_db() so the atexit writer-version zero-out runs).
+    create_stats_db(stats_path)
+    create_cache_db(cache_path)
+
+    stats_conn = sqlite3.connect(stats_path)
+    cache_conn = sqlite3.connect(cache_path)
+    if seed_data:
+        _seed_window_snapshot(stats_conn, weekly_percent=weekly_percent, as_of=as_of)
+        _seed_entries(cache_conn, n_total=n_total, n_recent=n_recent, as_of=as_of)
+    stats_conn.commit(); stats_conn.close()
+    cache_conn.commit(); cache_conn.close()
+
+    # config.json carries the budget block under test + display.tz=utc so
+    # goldens render UTC suffixes regardless of host TZ.
+    cfg = {"display": {"tz": "utc"}}
+    if budget_block is not None:
+        cfg["budget"] = budget_block
+    (app_dir / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
+
+    # input.env carries only AS_OF; FAKE_HOME is derived from the fixture dir
+    # at harness time, so absolute paths stay out of the committed file.
+    (out_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+
+
+SCENARIOS = {
+    # 96h elapsed (~57% of week), $126 spent (42% of $300) → ok.
+    "under": dict(
+        as_of=WEEK_START + dt.timedelta(hours=96),
+        budget_block={"weekly_usd": 300.0, "alerts_enabled": True,
+                      "alert_thresholds": [90, 100]},
+        n_total=70, n_recent=10, weekly_percent=40.0,
+    ),
+    # 120h elapsed (~71% of week), $201.60 spent (67%) → projection [270,300) → warn.
+    "warn": dict(
+        as_of=WEEK_START + dt.timedelta(hours=120),
+        budget_block={"weekly_usd": 300.0, "alerts_enabled": True,
+                      "alert_thresholds": [90, 100]},
+        n_total=112, n_recent=12, weekly_percent=68.0,
+    ),
+    # 120h elapsed, $333 spent (>target) → over; both thresholds crossed.
+    "over": dict(
+        as_of=WEEK_START + dt.timedelta(hours=120),
+        budget_block={"weekly_usd": 300.0, "alerts_enabled": True,
+                      "alert_thresholds": [90, 100]},
+        n_total=185, n_recent=20, weekly_percent=95.0,
+    ),
+    # 12h elapsed (<15% → low_confidence), $18 spent.
+    "low-conf": dict(
+        as_of=WEEK_START + dt.timedelta(hours=12),
+        budget_block={"weekly_usd": 300.0, "alerts_enabled": True,
+                      "alert_thresholds": [90, 100]},
+        n_total=10, n_recent=10, weekly_percent=5.0,
+    ),
+    # No weekly_usd → friendly "no budget set" status. Window/entries still
+    # seeded so the no-budget path is exercised independent of data presence.
+    "no-budget": dict(
+        as_of=WEEK_START + dt.timedelta(hours=96),
+        budget_block={"alerts_enabled": True, "alert_thresholds": [90, 100]},
+        n_total=20, n_recent=5, weekly_percent=20.0,
+    ),
+}
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--out", type=Path, default=None,
+        help="Override output directory (defaults to tests/fixtures/budget/). "
+             "cctally-budget-test writes into a per-run scratch dir so the "
+             "in-tree fixtures stay byte-stable.",
+    )
+    args = parser.parse_args()
+    if args.out is not None:
+        FIXTURES_DIR = args.out
+    for sc_name, sc_kwargs in SCENARIOS.items():
+        _build(sc_name, **sc_kwargs)
+        print(f"built: {sc_name}")

@@ -1,0 +1,14 @@
+# Only input.env + golden-*.txt are committed per scenario. Everything the
+# builder materializes at (re)build time — the seeded stats.db / cache.db
+# (+ WAL/SHM sidecars) and the fake HOME's .local data dir (config.json
+# included) — is regenerated into a scratch dir by bin/cctally-budget-test
+# and bin/cctally-reconcile-test, and must never land in the tree (would leak
+# host-dependent SQLite bytes + dirty on every rebuild). This is the
+# `--out` scratch consumption class: the committed DBs are never read, so
+# committing them only invites stale drift. Goldens carry only rendered
+# text + the VERSION-normalized share artifacts, so they stay location- and
+# release-stable.
+*.db
+*.db-wal
+*.db-shm
+*/.local/

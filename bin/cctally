@@ -7677,6 +7677,58 @@ def _apply_midweek_reset_override(
     return week_start_at, samples
 
 
+def _resolve_current_budget_window(conn, now_utc):
+    """Return ``(effective_week_start_dt, week_end_dt)`` for the subscription
+    week containing ``now_utc``, honoring a mid-week reset re-anchor; or
+    ``None`` if no snapshot exists yet.
+
+    Reuses the SAME reset-aware resolution forecast/weekly use
+    (``_fetch_current_week_snapshots`` + ``_apply_midweek_reset_override``)
+    so the budget display window and the alert-firing window (Task 3) agree.
+    Unlike forecast's ``_load_forecast_inputs``, this does NOT short-circuit
+    on an empty samples list — budget computes live spend from
+    ``session_entries`` regardless of whether a usage snapshot landed inside
+    the window, so the worst case is ``spent_usd = 0`` (spec §6), not a
+    no-window outcome.
+    """
+    fetched = _fetch_current_week_snapshots(conn, now_utc)
+    if fetched is None:
+        return None
+    week_start_at, week_end_at, samples = fetched
+    week_start_at, _samples = _apply_midweek_reset_override(
+        conn, week_start_at, week_end_at, samples
+    )
+    return (week_start_at, week_end_at)
+
+
+def _build_budget_status_inputs(conn, *, target_usd, now_utc, alert_thresholds):
+    """Gather live spend over the current subscription week and build a
+    :class:`BudgetInputs`. Returns ``None`` when no week window resolves.
+
+    Spend is recomputed live via ``_sum_cost_for_range(..., mode="auto")``
+    (the same path ``weekly`` / ``forecast`` use — pricing edits take effect
+    immediately; F3's reconcile invariant is pinned here, NOT to snapshot
+    ``report``). ``recent_24h_usd`` is a second trailing-24h call used only
+    for the display projection band.
+    """
+    window = _resolve_current_budget_window(conn, now_utc)
+    if window is None:
+        return None
+    week_start_at, week_end_at = window
+    spent = _sum_cost_for_range(week_start_at, now_utc, mode="auto")
+    recent_start = now_utc - dt.timedelta(hours=24)
+    recent_24h = _sum_cost_for_range(recent_start, now_utc, mode="auto")
+    return BudgetInputs(
+        target_usd=float(target_usd),
+        spent_usd=float(spent),
+        recent_24h_usd=float(recent_24h),
+        week_start_at=week_start_at,
+        week_end_at=week_end_at,
+        now=now_utc,
+        alert_thresholds=tuple(alert_thresholds),
+    )
+
+
 def _select_dollars_per_percent(
     conn: sqlite3.Connection,
     now_utc: dt.datetime,
@@ -8892,6 +8944,440 @@ def cmd_forecast(args: argparse.Namespace) -> int:
     color = _forecast_color_enabled(args.color, sys.stdout)
     print(_render_forecast_terminal(output, args, color))
     return 0
+
+
+# ── budget ──────────────────────────────────────────────────────────────
+# `cctally budget` — weekly equivalent-$ budget + pace + spend alerts.
+# cctally-original (NOT a ccusage drop-in) → flat surface only, no
+# claude/codex subgroup. Status reads live spend; `set`/`unset` write the
+# DEFAULT config (F4 — the path the alert firing in Task 3 reads). See
+# docs/commands/budget.md + spec §4/§6.
+
+_BUDGET_JSON_SCHEMA_VERSION = 1
+
+
+def cmd_budget(args: argparse.Namespace) -> int:
+    """Dispatch `cctally budget [set AMOUNT | unset]`. See docs/commands/budget.md."""
+    action = getattr(args, "action", None)
+
+    # F4: mutations always target the DEFAULT config; --config is read-only.
+    # --format is a status-only render surface — reject it on set/unset.
+    if action in {"set", "unset"} and getattr(args, "config", None):
+        eprint(
+            "cctally budget: --config is read-only; "
+            "set/unset always write the default config"
+        )
+        return 2
+    if action in {"set", "unset"} and getattr(args, "format", None):
+        eprint("cctally budget: --format is not valid with set/unset")
+        return 2
+
+    if action == "set":
+        return _cmd_budget_set(args)
+    if action == "unset":
+        return _cmd_budget_unset(args)
+
+    # ── bare status ──
+    # Early reject of bad share-flag combos BEFORE any DB/sync work
+    # (mirrors cmd_forecast; calls sys.exit(2) directly inside).
+    _share_validate_args(args)
+    config = _load_claude_config_for_args(args)  # honors --config read-only
+    args._resolved_tz = resolve_display_tz(args, config)
+    try:
+        budget_cfg = _get_budget_config(config)
+    except _BudgetConfigError as exc:
+        eprint(f"cctally budget: {exc}")
+        return 2
+    target = budget_cfg["weekly_usd"]
+    if target is None:
+        return _budget_render_unset(args)  # exit 0, friendly message
+
+    now_utc = _command_as_of()  # honors the CCTALLY_AS_OF testing hook
+    conn = open_db()
+    inputs = _build_budget_status_inputs(
+        conn,
+        target_usd=target,
+        now_utc=now_utc,
+        alert_thresholds=budget_cfg["alert_thresholds"],
+    )
+    if inputs is None:
+        # No usage snapshot yet → no resolvable week window (spec §6 worst case).
+        if getattr(args, "format", None):
+            snap = _build_budget_no_data_snapshot(args, budget_cfg, now_utc)
+            _share_render_and_emit(snap, args)
+            return 0
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
+                "status": "no_data",
+                "weekly_usd": target,
+            }))
+            return 0
+        print(f"Weekly budget: ${target:,.2f} — no usage data yet this week.")
+        return 0
+
+    status = compute_budget_status(inputs)
+    if getattr(args, "format", None):
+        snap = _build_budget_snapshot(args, budget_cfg, inputs, status)
+        _share_render_and_emit(snap, args)
+        return 0
+    if getattr(args, "json", False):
+        return _budget_emit_json(budget_cfg, inputs, status)
+    return _budget_render_terminal(args, budget_cfg, inputs, status)
+
+
+def _cmd_budget_set(args: argparse.Namespace) -> int:
+    """`cctally budget set AMOUNT` — write `budget.weekly_usd`, preserving the
+    other budget keys. Writes the DEFAULT config (F4). Task 3 appends the
+    forward-only milestone reconcile here."""
+    raw = getattr(args, "amount", None)
+    if raw is None:
+        eprint("cctally budget: `set` requires an amount, e.g. cctally budget set 300")
+        return 2
+    try:
+        amount = float(raw)
+    except (TypeError, ValueError):
+        eprint(f"cctally budget: amount must be a positive number, got {raw!r}")
+        return 2
+    if not math.isfinite(amount) or amount <= 0:
+        eprint(f"cctally budget: amount must be a positive finite number, got {raw!r}")
+        return 2
+
+    # Read-modify-write under config_writer_lock + _load_config_unlocked
+    # (load_config inside the lock self-deadlocks — fcntl.flock is per-fd).
+    # Re-validate the merged block via _get_budget_config before persisting.
+    with config_writer_lock():
+        config = _load_config_unlocked()
+        existing = config.get("budget")
+        if existing is not None and not isinstance(existing, dict):
+            eprint("cctally budget: budget config must be an object")
+            return 2
+        block = dict(existing or {})
+        block["weekly_usd"] = amount
+        config["budget"] = block
+        try:
+            validated = _get_budget_config(config)
+        except _BudgetConfigError as exc:
+            eprint(f"cctally budget: {exc}")
+            return 2
+        block["weekly_usd"] = validated["weekly_usd"]
+        config["budget"] = block
+        save_config(config)
+
+    weekly_usd = validated["weekly_usd"]
+    alerts_enabled = validated["alerts_enabled"]
+    thresholds = validated["alert_thresholds"]
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "status": "set",
+            "weekly_usd": weekly_usd,
+            "alerts_enabled": alerts_enabled,
+            "alert_thresholds": list(thresholds),
+        }))
+        return 0
+    alerts_part = "alerts on" if alerts_enabled else "alerts off"
+    if thresholds:
+        thr_part = " · thresholds " + " ".join(f"{t}%" for t in thresholds)
+    else:
+        thr_part = " · no thresholds"
+    print(f"Weekly budget set to ${weekly_usd:,.2f} · {alerts_part}{thr_part}")
+    return 0
+
+
+def _cmd_budget_unset(args: argparse.Namespace) -> int:
+    """`cctally budget unset` — clear `budget.weekly_usd` (preserve
+    alerts_enabled / alert_thresholds). Idempotent."""
+    with config_writer_lock():
+        config = _load_config_unlocked()
+        existing = config.get("budget")
+        if existing is not None and not isinstance(existing, dict):
+            eprint("cctally budget: budget config must be an object")
+            return 2
+        block = dict(existing or {})
+        block["weekly_usd"] = None
+        config["budget"] = block
+        save_config(config)
+
+    if getattr(args, "json", False):
+        print(json.dumps({"status": "unset", "weekly_usd": None}))
+        return 0
+    print("Weekly budget cleared")
+    return 0
+
+
+def _budget_render_unset(args: argparse.Namespace) -> int:
+    """No budget set → friendly stdout message, exit 0 (NOT an error)."""
+    if getattr(args, "format", None):
+        snap = _build_budget_no_budget_snapshot(args)
+        _share_render_and_emit(snap, args)
+        return 0
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
+            "status": "unset",
+            "weekly_usd": None,
+        }))
+        return 0
+    print("No weekly budget set. Set one with: cctally budget set <amount>.")
+    return 0
+
+
+def _budget_verdict_ansi_code(verdict: str) -> str:
+    """ANSI color code for a budget verdict: ok→green, warn→amber, over→red."""
+    return {"ok": "32", "warn": "33", "over": "31"}.get(verdict, "32")
+
+
+def _budget_render_terminal(args, budget_cfg, inputs, status) -> int:
+    """Render the §4 status block to stdout. Datetimes via format_display_dt
+    (honors display.tz). Verdict color ok→green / warn→amber / over→red."""
+    color = _supports_color_stdout()
+    tz_render = getattr(args, "_resolved_tz", None)
+
+    elapsed_days = status.elapsed_fraction * (
+        (inputs.week_end_at - inputs.week_start_at).total_seconds() / 86400.0
+    )
+    total_seconds = (inputs.week_end_at - inputs.week_start_at).total_seconds()
+    remaining_days = max(
+        0.0,
+        (total_seconds - status.elapsed_fraction * total_seconds) / 86400.0,
+    )
+
+    ws = format_display_dt(inputs.week_start_at, tz_render, fmt="%Y-%m-%d", suffix=False)
+    we = format_display_dt(inputs.week_end_at, tz_render, fmt="%Y-%m-%d", suffix=False)
+
+    lines = []
+    lines.append(
+        f"Weekly budget: ${inputs.target_usd:,.2f}   "
+        f"(subscription week {ws} → {we})"
+    )
+    lines.append("")
+    lines.append(
+        f"  Spent so far    ${status.spent_usd:,.2f}    "
+        f"{status.consumption_pct:.1f}% of budget"
+    )
+    lines.append(f"  Remaining       ${status.remaining_usd:,.2f}")
+    lines.append(
+        f"  Pace            ${status.daily_pace_usd:,.2f}/day  ·  "
+        f"{elapsed_days:.1f} d elapsed"
+    )
+    lines.append(
+        f"  Daily budget    ${status.daily_budget_remaining_usd:,.2f}/day for the "
+        f"{remaining_days:.1f} d left to stay under"
+    )
+    verdict_label = {"ok": "OK", "warn": "WARN", "over": "OVER"}.get(
+        status.verdict, status.verdict.upper()
+    )
+    verdict_glyph = {"ok": "✓", "warn": "⚠", "over": "✗"}.get(status.verdict, "")
+    verdict_text = _style_ansi(
+        f"{verdict_glyph} {verdict_label}".strip(),
+        _budget_verdict_ansi_code(status.verdict),
+        color,
+    )
+    proj_line = (
+        f"  Projected EOW   ${status.projected_eow_low_usd:,.0f}"
+        f"–${status.projected_eow_high_usd:,.0f}   →   {verdict_text}"
+    )
+    if status.low_confidence:
+        proj_line += "   (LOW CONF — early in week)"
+    lines.append(proj_line)
+    lines.append("")
+    lines.append(_budget_alerts_line(budget_cfg, status))
+
+    print("\n".join(lines))
+    return 0
+
+
+def _budget_alerts_line(budget_cfg, status) -> str:
+    """Render the "Alerts: ..." footer line: on/off + thresholds + crossed."""
+    enabled = budget_cfg["alerts_enabled"]
+    thresholds = budget_cfg["alert_thresholds"]
+    if not enabled:
+        return "  Alerts: off"
+    if not thresholds:
+        return "  Alerts: on · no thresholds configured"
+    thr_str = " · ".join(f"{t}%" for t in thresholds)
+    crossed = status.crossed_thresholds
+    if crossed:
+        crossed_str = ", ".join(f"{t}%" for t in crossed)
+        tail = f"({crossed_str} crossed)"
+    else:
+        tail = "(none crossed yet)"
+    return f"  Alerts: on · thresholds {thr_str} · {tail}"
+
+
+def _budget_emit_json(budget_cfg, inputs, status) -> int:
+    """Emit the full BudgetStatus + config echo + window as JSON (schemaVersion 1).
+    Window timestamps are `…Z`, ignoring display.tz (every --json is UTC)."""
+    payload = {
+        "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
+        "status": "ok",
+        "weekly_usd": inputs.target_usd,
+        "alerts_enabled": budget_cfg["alerts_enabled"],
+        "alert_thresholds": list(budget_cfg["alert_thresholds"]),
+        "week_start_at": _iso_z(inputs.week_start_at),
+        "week_end_at": _iso_z(inputs.week_end_at),
+        "as_of": _iso_z(inputs.now),
+        "spent_usd": status.spent_usd,
+        "remaining_usd": status.remaining_usd,
+        "consumption_pct": status.consumption_pct,
+        "elapsed_fraction": status.elapsed_fraction,
+        "projected_eow_low_usd": status.projected_eow_low_usd,
+        "projected_eow_high_usd": status.projected_eow_high_usd,
+        "daily_pace_usd": status.daily_pace_usd,
+        "daily_budget_remaining_usd": status.daily_budget_remaining_usd,
+        "verdict": status.verdict,
+        "low_confidence": status.low_confidence,
+        "crossed_thresholds": list(status.crossed_thresholds),
+    }
+    print(json.dumps(payload))
+    return 0
+
+
+def _build_budget_snapshot(args, budget_cfg, inputs, status):
+    """Build a `_lib_share.ShareSnapshot` (cmd="budget") for `--format` output.
+
+    `--reveal-projects` is inert for budget — there are no ProjectCells, so
+    `_scrub` returns the snapshot unchanged. No parallel renderer; the gate
+    calls `_share_render_and_emit(snap, args)`."""
+    _lib_share = _share_load_lib()
+    tz_label = _share_display_tz_label(getattr(args, "_resolved_tz", None))
+    period_label = _share_period_label(
+        inputs.week_start_at, inputs.week_end_at, tz_label
+    )
+    period = _lib_share.PeriodSpec(
+        start=inputs.week_start_at, end=inputs.week_end_at,
+        display_tz=tz_label, label=period_label,
+    )
+    columns = (
+        _lib_share.ColumnSpec(key="metric", label="Metric", align="left"),
+        _lib_share.ColumnSpec(key="value", label="Value", align="right",
+                              emphasis=True),
+    )
+    rows = (
+        _lib_share.Row(cells={"metric": _lib_share.TextCell("Spent so far"),
+                              "value": _lib_share.MoneyCell(status.spent_usd)}),
+        _lib_share.Row(cells={"metric": _lib_share.TextCell("Consumption"),
+                              "value": _lib_share.PercentCell(status.consumption_pct)}),
+        _lib_share.Row(cells={"metric": _lib_share.TextCell("Remaining"),
+                              "value": _lib_share.MoneyCell(status.remaining_usd)}),
+        _lib_share.Row(cells={"metric": _lib_share.TextCell("Daily pace"),
+                              "value": _lib_share.MoneyCell(status.daily_pace_usd)}),
+        _lib_share.Row(cells={"metric": _lib_share.TextCell("Projected EOW (low)"),
+                              "value": _lib_share.MoneyCell(status.projected_eow_low_usd)}),
+        _lib_share.Row(cells={"metric": _lib_share.TextCell("Projected EOW (high)"),
+                              "value": _lib_share.MoneyCell(status.projected_eow_high_usd)}),
+    )
+    notes = ("LOW CONF — early in week",) if status.low_confidence else ()
+    subtitle = " · ".join([
+        period_label,
+        args.theme,
+        "real projects" if args.reveal_projects else "projects anonymized",
+    ])
+    return _lib_share.ShareSnapshot(
+        cmd="budget",
+        title=f"Budget — week of {inputs.week_start_at.strftime('%b %d')}",
+        subtitle=subtitle,
+        period=period,
+        columns=columns,
+        rows=rows,
+        chart=None,
+        totals=(
+            _lib_share.Totalled(label="Verdict", value=status.verdict.upper()),
+            _lib_share.Totalled(label="Budget", value=f"${inputs.target_usd:,.2f}"),
+        ),
+        notes=notes,
+        generated_at=_share_now_utc(),
+        version=_share_resolve_version(),
+    )
+
+
+def _build_budget_no_data_snapshot(args, budget_cfg, now_utc):
+    """Share snapshot for "budget set but no usage data yet this week" — a
+    uniformly-shaped artifact rather than free-form text. Computes the real
+    subscription-week boundaries from config so the period label is meaningful."""
+    _lib_share = _share_load_lib()
+    config = _load_claude_config_for_args(args)
+    tz = getattr(args, "_resolved_tz", None)
+    tz_label = _share_display_tz_label(tz)
+    week_start_name = get_week_start_name(
+        config, getattr(args, "week_start_name", None)
+    )
+    ws_date, we_date = compute_week_bounds(now_utc, week_start_name)
+    # internal fallback: host-local intentional
+    local_tz = dt.datetime.now().astimezone().tzinfo
+    week_start_dt = dt.datetime.combine(ws_date, dt.time.min, tzinfo=local_tz)
+    week_end_dt = dt.datetime.combine(
+        we_date + dt.timedelta(days=1), dt.time.min, tzinfo=local_tz
+    )
+    period_label = _share_period_label(week_start_dt, week_end_dt, tz_label)
+    target = budget_cfg["weekly_usd"]
+    subtitle = " · ".join([
+        period_label, args.theme,
+        "real projects" if args.reveal_projects else "projects anonymized",
+    ])
+    return _lib_share.ShareSnapshot(
+        cmd="budget",
+        title=f"Budget — week of {week_start_dt.strftime('%b %d')}",
+        subtitle=subtitle,
+        period=_lib_share.PeriodSpec(
+            start=week_start_dt, end=week_end_dt,
+            display_tz=tz_label, label=period_label,
+        ),
+        columns=(
+            _lib_share.ColumnSpec(key="metric", label="Metric", align="left"),
+            _lib_share.ColumnSpec(key="value", label="Value", align="right",
+                                  emphasis=True),
+        ),
+        rows=(
+            _lib_share.Row(cells={
+                "metric": _lib_share.TextCell("Weekly budget"),
+                "value": _lib_share.MoneyCell(float(target)),
+            }),
+        ),
+        chart=None,
+        totals=(),
+        notes=("No usage data recorded for this week yet — run "
+               "cctally record-usage to populate.",),
+        generated_at=_share_now_utc(),
+        version=_share_resolve_version(),
+    )
+
+
+def _build_budget_no_budget_snapshot(args):
+    """Share snapshot for the "no budget set" status — a uniform artifact."""
+    _lib_share = _share_load_lib()
+    now_utc = _command_as_of()
+    tz = getattr(args, "_resolved_tz", None)
+    if tz is None:
+        # _budget_render_unset reaches this before resolve_display_tz on the
+        # --config path; resolve here defensively so the artifact has a label.
+        config = _load_claude_config_for_args(args)
+        tz = resolve_display_tz(args, config)
+    tz_label = _share_display_tz_label(tz)
+    period_label = _share_period_label(now_utc, now_utc, tz_label)
+    subtitle = " · ".join([
+        period_label, args.theme,
+        "real projects" if args.reveal_projects else "projects anonymized",
+    ])
+    return _lib_share.ShareSnapshot(
+        cmd="budget",
+        title="Budget — no budget set",
+        subtitle=subtitle,
+        period=_lib_share.PeriodSpec(
+            start=now_utc, end=now_utc, display_tz=tz_label, label=period_label,
+        ),
+        columns=(
+            _lib_share.ColumnSpec(key="metric", label="Metric", align="left"),
+            _lib_share.ColumnSpec(key="value", label="Value", align="right",
+                                  emphasis=True),
+        ),
+        rows=(),
+        chart=None,
+        totals=(),
+        notes=("No weekly budget set. Set one with: cctally budget set <amount>.",),
+        generated_at=_share_now_utc(),
+        version=_share_resolve_version(),
+    )
 
 
 def cmd_percent_breakdown(args: argparse.Namespace) -> int:
@@ -12386,6 +12872,51 @@ def build_parser() -> argparse.ArgumentParser:
     fc.add_argument("--as-of", dest="as_of", default=None, help=argparse.SUPPRESS)
     _add_share_args(fc, has_status_line=True)
     fc.set_defaults(func=cmd_forecast)
+
+    # budget — cctally-original (NOT a ccusage drop-in), so flat surface only;
+    # no claude/codex subgroup. `--config` is honored read-only on bare status
+    # but rejected on set/unset (F4). `--reveal-projects` is accepted for share
+    # surface parity but inert (no per-project axis). `--tz` follows the sibling
+    # reporting commands' precedence.
+    bg = sub.add_parser(
+        "budget",
+        help="Weekly equivalent-$ budget + pace + spend alerts",
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Track Claude equivalent-$ spend for the current subscription week
+            against a weekly budget. Shows spend, pace, projected end-of-week,
+            and a verdict (ok / warn / over). `budget set <amount>` and
+            `budget unset` manage the budget; spend-crossing alerts fire from
+            record-usage (see `cctally alerts`).
+            """
+        ),
+        epilog=textwrap.dedent(
+            """\
+            Examples:
+              cctally budget
+              cctally budget set 300
+              cctally budget unset
+              cctally budget --json
+              cctally budget --format md
+            """
+        ),
+    )
+    bg.add_argument("action", nargs="?", choices=["set", "unset"], default=None,
+                    help="`set <amount>` to set the weekly budget, `unset` to clear it.")
+    bg.add_argument("amount", nargs="?", default=None,
+                    help="Target USD for `budget set` (e.g. 300).")
+    bg.add_argument("--config", default=None,
+                    help="Read status from this config file (read-only; "
+                         "rejected on set/unset).")
+    bg.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
+                    help="Accepted for --format surface parity; inert for budget "
+                         "(no per-project axis).")
+    bg.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
+                    help="Display timezone: local, utc, or IANA name. "
+                         "Overrides config display.tz for this call.")
+    _add_share_args(bg)
+    bg.set_defaults(func=cmd_budget)
 
     pb = sub.add_parser(
         "percent-breakdown",
