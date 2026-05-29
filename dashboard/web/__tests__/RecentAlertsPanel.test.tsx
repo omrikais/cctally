@@ -30,7 +30,25 @@ const DEFAULT_ALERTS_SETTINGS = {
   enabled: false,
   weekly_thresholds: [90, 95],
   five_hour_thresholds: [90, 95],
+  budget_thresholds: [90, 100],
+  budget_enabled: false,
 };
+
+function mkBudgetAlert(idx: number, threshold: 90 | 100 = 90): AlertEntry {
+  return {
+    id: `budget:2026-04-21T00:00:00Z:${idx}-${threshold}`,
+    axis: 'budget',
+    threshold,
+    crossed_at: `2026-04-23T12:00:00Z`,
+    alerted_at: `2026-04-23T12:0${idx % 10}:00Z`,
+    context: {
+      week_start_at: '2026-04-21T00:00:00Z',
+      budget_usd: 300,
+      spent_usd: 270 + idx,
+      consumption_pct: threshold,
+    },
+  };
+}
 
 function mkFiveHourAlert(idx: number, threshold: 90 | 95 = 95): AlertEntry {
   return {
@@ -94,6 +112,20 @@ describe('<RecentAlertsPanel />', () => {
     // panel renders newest-first directly from store).
     expect(classNames[0]).toContain('amber');
     expect(classNames[1]).toContain('red');
+  });
+
+  it('renders a BUDGET chip for budget-axis alerts (issue #19)', () => {
+    dispatch({
+      type: 'INGEST_SNAPSHOT_ALERTS',
+      alerts: [mkBudgetAlert(1, 90)],
+      alertsSettings: DEFAULT_ALERTS_SETTINGS,
+      isFirstTick: true,
+    });
+    render(<RecentAlertsPanel />);
+    const chip = document.querySelector('.chip--budget');
+    expect(chip).not.toBeNull();
+    expect(chip).toHaveTextContent('BUDGET');
+    expect(screen.queryByText(/No alerts yet/i)).toBeNull();
   });
 
   it('chevron toggle dispatches SAVE_PREFS to flip alertsCollapsed', async () => {

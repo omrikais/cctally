@@ -3,6 +3,7 @@ import { Modal } from '../modals/Modal';
 import { getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt } from '../lib/fmt';
+import { AXIS_CHIP_LABEL } from '../lib/alertAxis';
 import type { AlertEntry } from '../types/envelope';
 
 // Recent alerts modal — full history (last 100). ESC and backdrop
@@ -44,6 +45,29 @@ function ContextCell({
       </span>
     );
   }
+  if (alert.axis === 'budget') {
+    // Budget axis (issue #19): the week anchor is `week_start_at` (the
+    // effective post-reset ISO *timestamp*), distinct from weekly's
+    // `week_start_date` (a date-only string). `fmt.weekStart` renders a
+    // calendar `YYYY-MM-DD`, so slice the date prefix off the timestamp
+    // before routing through it. Show consumption-of-budget as the
+    // secondary.
+    const weekStart = alert.context.week_start_at
+      ? fmt.weekStart(alert.context.week_start_at.slice(0, 10), ctx)
+      : null;
+    const pct = alert.context.consumption_pct;
+    return (
+      <span className="alert-context alert-context--budget">
+        {weekStart ? `Week of ${weekStart}` : 'Week —'}
+        {pct != null && (
+          <>
+            {' · '}
+            <span className="num">{Math.round(pct)}% of budget</span>
+          </>
+        )}
+      </span>
+    );
+  }
   // axis === 'five_hour' — render block start time only. Do NOT
   // append any model token here (see header comment).
   const t = alert.context.block_start_at
@@ -57,10 +81,15 @@ function ContextCell({
 }
 
 function CostCell({ alert }: { alert: AlertEntry }): JSX.Element {
-  const v =
-    alert.axis === 'weekly'
-      ? alert.context.cumulative_cost_usd
-      : alert.context.block_cost_usd;
+  let v: number | undefined;
+  if (alert.axis === 'weekly') {
+    v = alert.context.cumulative_cost_usd;
+  } else if (alert.axis === 'budget') {
+    // Budget axis (issue #19): the Cost column shows actual spend.
+    v = alert.context.spent_usd;
+  } else {
+    v = alert.context.block_cost_usd;
+  }
   return <span className="num">{fmt.usd2(v ?? null)}</span>;
 }
 
@@ -108,7 +137,7 @@ export function RecentAlertsModal(): JSX.Element {
                   </td>
                   <td>
                     <span className={`chip chip--${a.axis}`}>
-                      {a.axis === 'weekly' ? 'WEEKLY' : '5H-BLOCK'}
+                      {AXIS_CHIP_LABEL[a.axis]}
                     </span>
                   </td>
                   <td className="num">

@@ -46,7 +46,7 @@ function baseEnvelope(): Envelope {
     },
     alerts: [],
     alerts_settings: {
-      enabled: true, weekly_thresholds: [], five_hour_thresholds: [],
+      enabled: true, weekly_thresholds: [], five_hour_thresholds: [], budget_thresholds: [],
     },
   };
 }

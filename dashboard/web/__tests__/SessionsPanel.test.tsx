@@ -324,7 +324,7 @@ describe('<SessionsPanel /> Sessions → Projects cross-nav', () => {
       projects: null,
       display: { tz: 'local', resolved_tz: 'Etc/UTC', offset_label: 'UTC', offset_seconds: 0 },
       alerts: [],
-      alerts_settings: { enabled: true, weekly_thresholds: [], five_hour_thresholds: [] },
+      alerts_settings: { enabled: true, weekly_thresholds: [], five_hour_thresholds: [], budget_thresholds: [] },
     };
   }
 

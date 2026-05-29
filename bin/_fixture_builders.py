@@ -298,6 +298,26 @@ def create_stats_db(path: Path) -> None:
             CREATE INDEX idx_five_hour_milestones_block
                 ON five_hour_milestones(block_id);
 
+            -- budget_milestones: equiv-$ budget threshold crossings (issue
+            -- #19). Plain CREATE TABLE IF NOT EXISTS in bin/_cctally_core.py
+            -- (no migration handler — write-once, forward-only, same posture
+            -- as five_hour_milestones); mirrored here so fixture stats.db
+            -- files don't trigger an inline CREATE at open time. A mid-week
+            -- reset re-anchors week_start_at, so fresh windows get fresh rows
+            -- under UNIQUE(week_start_at, threshold) — no reset_event_id
+            -- segment.
+            CREATE TABLE budget_milestones (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_at   TEXT    NOT NULL,
+                threshold       INTEGER NOT NULL,
+                budget_usd      REAL    NOT NULL,
+                spent_usd       REAL    NOT NULL,
+                consumption_pct REAL    NOT NULL,
+                crossed_at_utc  TEXT    NOT NULL,
+                alerted_at      TEXT,
+                UNIQUE(week_start_at, threshold)
+            );
+
             -- five_hour_reset_events: parallel to week_reset_events for the
             -- 5h dimension. Added by issue #43 (live DDL in bin/cctally
             -- mirrored here so fixture stats.db files don't trigger inline
@@ -378,6 +398,7 @@ def _self_test_create_stats_db() -> None:
             "weekly_usage_snapshots", "weekly_cost_snapshots",
             "percent_milestones", "week_reset_events",
             "five_hour_blocks", "five_hour_milestones",
+            "budget_milestones",
             "five_hour_reset_events",
             "five_hour_block_models", "five_hour_block_projects",
             "schema_migrations",

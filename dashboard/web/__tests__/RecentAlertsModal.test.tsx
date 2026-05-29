@@ -35,7 +35,25 @@ const DEFAULT_ALERTS_SETTINGS = {
   enabled: false,
   weekly_thresholds: [90, 95],
   five_hour_thresholds: [90, 95],
+  budget_thresholds: [90, 100],
+  budget_enabled: false,
 };
+
+function mkBudgetAlert(idx: number, threshold: 90 | 100 = 90): AlertEntry {
+  return {
+    id: `budget:2026-04-21T00:00:00Z:${idx}-${threshold}`,
+    axis: 'budget',
+    threshold,
+    crossed_at: `2026-04-23T12:00:00Z`,
+    alerted_at: `2026-04-23T12:0${idx % 10}:00Z`,
+    context: {
+      week_start_at: '2026-04-21T00:00:00Z',
+      budget_usd: 300,
+      spent_usd: 270.5,
+      consumption_pct: threshold,
+    },
+  };
+}
 
 function mkFiveHourAlert(idx: number, threshold: 90 | 95 = 95): AlertEntry {
   return {
@@ -138,6 +156,32 @@ describe('<RecentAlertsModal />', () => {
     const tbody = document.querySelector('tbody')!;
     expect(tbody.textContent ?? '').toMatch(/Week of/);
     expect(tbody.textContent ?? '').toMatch(/\$0\.53\/1%/);
+  });
+
+  it('renders a budget-axis row end-to-end: BUDGET chip + spend cost + context (issue #19)', () => {
+    // Parent-modal integration test (per the *modal-level integration
+    // test* memory): drives a budget alert through the full
+    // RecentAlertsModal render — chip label, CostCell (→ spent_usd), and
+    // ContextCell ("Week of …" + "% of budget").
+    dispatch({
+      type: 'INGEST_SNAPSHOT_ALERTS',
+      alerts: [mkBudgetAlert(1, 90)],
+      alertsSettings: DEFAULT_ALERTS_SETTINGS,
+      isFirstTick: true,
+    });
+    render(<RecentAlertsModal />);
+    const row = document.querySelector('tbody tr')!;
+    // Axis chip.
+    const chip = row.querySelector('.chip--budget');
+    expect(chip).not.toBeNull();
+    expect(chip).toHaveTextContent('BUDGET');
+    // Cost column shows actual spend ($270.50), NOT the budget total.
+    expect(row.textContent ?? '').toMatch(/\$270\.50/);
+    // Context column: week-of + consumption-of-budget.
+    const context = row.querySelector('.alert-context--budget');
+    expect(context).not.toBeNull();
+    expect(context!.textContent ?? '').toMatch(/Week of/);
+    expect(context!.textContent ?? '').toMatch(/90% of budget/);
   });
 
   it('renders empty state when no alerts', () => {

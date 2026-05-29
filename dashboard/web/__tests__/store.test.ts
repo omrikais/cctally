@@ -37,7 +37,7 @@ function mkSnap(generated_at: string, used_pct = 10): Envelope {
     projects: null,
     display: { tz: 'local', resolved_tz: 'Etc/UTC', offset_label: 'UTC', offset_seconds: 0 },
     alerts: [],
-    alerts_settings: { enabled: true, weekly_thresholds: [], five_hour_thresholds: [] },
+    alerts_settings: { enabled: true, weekly_thresholds: [], five_hour_thresholds: [], budget_thresholds: [] },
   };
 }
 
@@ -260,6 +260,7 @@ const DEFAULT_ALERTS_SETTINGS = {
   enabled: false,
   weekly_thresholds: [90, 95],
   five_hour_thresholds: [90, 95],
+  budget_thresholds: [90, 100],
 };
 
 describe('alerts store (T8)', () => {
@@ -289,6 +290,8 @@ describe('alerts store (T8)', () => {
       enabled: false,
       weekly_thresholds: [90, 95],
       five_hour_thresholds: [90, 95],
+      budget_thresholds: [90, 100],
+      budget_enabled: false,
     });
   });
 
@@ -302,6 +305,8 @@ describe('alerts store (T8)', () => {
       enabled: true,
       weekly_thresholds: [80, 90],
       five_hour_thresholds: [85],
+      budget_thresholds: [80, 100],
+      budget_enabled: true,
     };
     dispatch({
       type: 'INGEST_SNAPSHOT_ALERTS',
@@ -317,6 +322,8 @@ describe('alerts store (T8)', () => {
       enabled: false,
       weekly_thresholds: [50, 75, 99],
       five_hour_thresholds: [60],
+      budget_thresholds: [70],
+      budget_enabled: false,
     };
     dispatch({
       type: 'INGEST_SNAPSHOT_ALERTS',

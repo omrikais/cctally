@@ -1,6 +1,25 @@
 {
-  "alerts": [],
+  "alerts": [
+    {
+      "alerted_at": "2026-04-16T12:00:00Z",
+      "axis": "budget",
+      "context": {
+        "budget_usd": 50.0,
+        "consumption_pct": 90.0,
+        "spent_usd": 45.0,
+        "week_start_at": "2026-04-13T14:00:00Z"
+      },
+      "crossed_at": "2026-04-16T12:00:00Z",
+      "id": "budget:2026-04-13T14:00:00Z:90",
+      "threshold": 90
+    }
+  ],
   "alerts_settings": {
+    "budget_enabled": true,
+    "budget_thresholds": [
+      90,
+      100
+    ],
     "enabled": false,
     "five_hour_thresholds": [
       90,

@@ -5,6 +5,7 @@ const DEFAULT_ALERTS_SETTINGS = {
   enabled: false,
   weekly_thresholds: [90, 95],
   five_hour_thresholds: [90, 95],
+  budget_thresholds: [90, 100],
 };
 
 beforeEach(() => {

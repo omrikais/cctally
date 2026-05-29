@@ -233,6 +233,8 @@ describe('<SettingsOverlay />', () => {
           enabled: false,
           weekly_thresholds: [80, 90, 95],
           five_hour_thresholds: [85, 95],
+          budget_thresholds: [90, 100],
+          budget_enabled: true,
         },
         isFirstTick: true,
       });
@@ -244,6 +246,7 @@ describe('<SettingsOverlay />', () => {
       const txt = summary.textContent ?? '';
       expect(txt).toContain('Weekly: 80%, 90%, 95%');
       expect(txt).toContain('5h-block: 85%, 95%');
+      expect(txt).toContain('Budget: 90%, 100%');
       uninstallGlobalKeydown();
     });
 

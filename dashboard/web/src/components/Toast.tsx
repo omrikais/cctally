@@ -3,6 +3,7 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { OnboardingToast } from './OnboardingToast';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt } from '../lib/fmt';
+import { AXIS_CHIP_LABEL, AXIS_TITLE_LABEL } from '../lib/alertAxis';
 
 // Toast variant pattern (T8). The `status` shape is the legacy
 // transient message (2.5s auto-dismiss); the `alert` shape is a
@@ -42,7 +43,7 @@ export function Toast() {
         >
           <div className="toast--alert-head">
             <span className={`chip chip--${toast.payload.axis}`}>
-              {toast.payload.axis === 'weekly' ? 'WEEKLY' : '5H-BLOCK'}
+              {AXIS_CHIP_LABEL[toast.payload.axis]}
             </span>
             <span className="toast--alert-threshold num">
               {toast.payload.threshold}%
@@ -50,7 +51,7 @@ export function Toast() {
             <span className="toast--alert-dismiss-hint">click to dismiss</span>
           </div>
           <div className="toast--alert-title">
-            {toast.payload.axis === 'weekly' ? 'Weekly' : '5h-block'} usage{' '}
+            {AXIS_TITLE_LABEL[toast.payload.axis]} usage{' '}
             {toast.payload.threshold}% reached
           </div>
           {toast.payload.context.week_start_date && (
@@ -64,6 +65,18 @@ export function Toast() {
               Block started {fmt.timeOnly(toast.payload.context.block_start_at, ctx)}
             </div>
           )}
+          {toast.payload.axis === 'budget' &&
+            toast.payload.context.week_start_at && (
+              <div className="toast--alert-sub">
+                Week starting{' '}
+                {/* week_start_at is a full ISO timestamp; fmt.weekStart
+                    expects a date-only YYYY-MM-DD, so slice the prefix. */}
+                {fmt.weekStart(
+                  toast.payload.context.week_start_at.slice(0, 10),
+                  ctx,
+                ) ?? '—'}
+              </div>
+            )}
           <div className="toast--alert-body">
             {toast.payload.context.cumulative_cost_usd != null && (
               <>
@@ -93,6 +106,20 @@ export function Toast() {
                 )}
               </>
             )}
+            {toast.payload.axis === 'budget' &&
+              toast.payload.context.spent_usd != null &&
+              toast.payload.context.budget_usd != null && (
+                <>
+                  <span className="num">
+                    ${toast.payload.context.spent_usd.toFixed(2)}
+                  </span>{' '}
+                  of{' '}
+                  <span className="num">
+                    ${toast.payload.context.budget_usd.toFixed(2)}
+                  </span>{' '}
+                  budget
+                </>
+              )}
           </div>
         </div>
       )}

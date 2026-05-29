@@ -2,6 +2,7 @@ import { useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt } from '../lib/fmt';
+import { AXIS_CHIP_LABEL } from '../lib/alertAxis';
 import { PANEL_REGISTRY } from '../lib/panelRegistry';
 import { PanelGrip } from './PanelGrip';
 
@@ -112,7 +113,7 @@ export function RecentAlertsPanel(): JSX.Element {
                     {a.threshold}%
                   </span>
                   <span className={`chip chip--${a.axis}`}>
-                    {a.axis === 'weekly' ? 'WEEKLY' : '5H-BLOCK'}
+                    {AXIS_CHIP_LABEL[a.axis]}
                   </span>
                   <span className="alert-when">
                     {fmt.relativeOrAbsolute(a.alerted_at, ctx)}

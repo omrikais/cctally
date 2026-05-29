@@ -1,6 +1,11 @@
 {
   "alerts": [],
   "alerts_settings": {
+    "budget_enabled": false,
+    "budget_thresholds": [
+      90,
+      100
+    ],
     "enabled": false,
     "five_hour_thresholds": [
       90,

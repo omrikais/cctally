@@ -87,6 +87,37 @@ describe('<Toast />', () => {
       expect(t!.classList.contains('toast--severity-red')).toBe(false);
     });
 
+    it('renders BUDGET chip + "$spent of $budget" body on budget axis (issue #19)', () => {
+      render(<Toast />);
+      act(() => {
+        dispatch({
+          type: 'SHOW_ALERT_TOAST',
+          alert: {
+            id: 'budget:2026-04-27T00:00:00Z:90',
+            axis: 'budget',
+            threshold: 90,
+            crossed_at: '2026-04-29T14:32:11Z',
+            alerted_at: '2026-04-29T14:32:11Z',
+            context: {
+              week_start_at: '2026-04-27T00:00:00Z',
+              budget_usd: 300,
+              spent_usd: 270,
+              consumption_pct: 90,
+            },
+          },
+        });
+      });
+      const t = transientToast();
+      expect(t).not.toBeNull();
+      expect(t).toHaveTextContent('BUDGET');
+      expect(t).toHaveTextContent('90%');
+      expect(t!.querySelector('.chip--budget')).not.toBeNull();
+      // "$270.00 of $300.00 budget"
+      expect(t).toHaveTextContent('$270.00');
+      expect(t).toHaveTextContent('$300.00');
+      expect(t).toHaveTextContent('budget');
+    });
+
     it('renders 5H-BLOCK chip on five_hour axis', () => {
       render(<Toast />);
       act(() => {

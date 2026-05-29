@@ -2459,6 +2459,7 @@ mark.current {
 .chip { font-size: 10px; font-weight: 800; letter-spacing: 1px; padding: 2px 7px; border-radius: 3px; font-family: var(--font-mono); }
 .chip--weekly    { background: rgba(192,132,252,0.16); color: var(--accent-purple); }
 .chip--five_hour { background: rgba(34,211,238,0.16);  color: var(--accent-cyan); }
+.chip--budget    { background: rgba(61,220,132,0.16);  color: var(--accent-green); }
 
 /* -------- Alert row inside the panel -------- */
 .alert-row { display: flex; align-items: baseline; gap: 14px; padding: 8px 0; border-bottom: 1px solid var(--border-soft); }

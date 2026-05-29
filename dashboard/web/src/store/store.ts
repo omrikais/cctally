@@ -226,6 +226,10 @@ export interface AlertsConfig {
   enabled: boolean;
   weekly_thresholds: number[];
   five_hour_thresholds: number[];
+  // Budget is its own config block (issue #19); the envelope flattens
+  // its thresholds + enabled-reflection into alerts_settings.
+  budget_thresholds: number[];
+  budget_enabled?: boolean;
 }
 
 export interface UIState {
@@ -368,7 +372,13 @@ function defaultAlertsConfig(): AlertsConfig {
   // these don't agree, a brand-new user with no `alerts.*` config keys
   // would briefly see a UI claiming alerts are ON while the server has
   // them OFF (toggle lies for the ~100ms before bootstrap).
-  return { enabled: false, weekly_thresholds: [90, 95], five_hour_thresholds: [90, 95] };
+  return {
+    enabled: false,
+    weekly_thresholds: [90, 95],
+    five_hour_thresholds: [90, 95],
+    budget_thresholds: [90, 100],
+    budget_enabled: false,
+  };
 }
 
 function loadInitial(): UIState {

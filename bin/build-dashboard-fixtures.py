@@ -217,6 +217,40 @@ def _insert_milestones(
         )
 
 
+def _seed_budget_milestone(
+    stats_conn: sqlite3.Connection,
+    *,
+    week_start: dt.datetime,
+    threshold: int,
+    budget_usd: float,
+    spent_usd: float,
+    crossed_at: dt.datetime,
+    alerted: bool = True,
+) -> None:
+    """Seed one ``budget_milestones`` row (issue #19). ``week_start_at``
+    is the effective (post-reset) ISO timestamp the resolver returns,
+    matching the dispatch payload's ``budget:<week_start_at>:<threshold>``
+    id. ``alerted_at`` is set to ``crossed_at`` (set-then-dispatch) when
+    ``alerted`` so the dashboard envelope's budget leg
+    (``WHERE alerted_at IS NOT NULL``) picks it up; left NULL otherwise."""
+    consumption_pct = (spent_usd / budget_usd * 100.0) if budget_usd else 0.0
+    stats_conn.execute(
+        """INSERT INTO budget_milestones
+           (week_start_at, threshold, budget_usd, spent_usd,
+            consumption_pct, crossed_at_utc, alerted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            _iso(week_start),
+            int(threshold),
+            float(budget_usd),
+            float(spent_usd),
+            float(consumption_pct),
+            _iso(crossed_at),
+            _iso(crossed_at) if alerted else None,
+        ),
+    )
+
+
 def _seed_session(
     cache_conn: sqlite3.Connection,
     *,
@@ -508,12 +542,44 @@ def build_ok(as_of: dt.datetime) -> None:
             first_crossed_at=week_start + dt.timedelta(hours=6),
             per_percent_spacing=dt.timedelta(minutes=99),  # (66h span)/(40 crossings) ≈ 99min
         )
+        # Budget axis (issue #19): one alerted budget crossing so the
+        # dashboard envelope's third (budget) alert leg + alerts_settings
+        # budget mirror are asserted by the golden. budget_usd=$50;
+        # spent $45 = 90% crossing. week_start_at matches the effective
+        # week-start ISO the resolver returns (no mid-week reset here).
+        _seed_budget_milestone(
+            stats_conn,
+            week_start=week_start,
+            threshold=90,
+            budget_usd=50.0,
+            spent_usd=45.0,
+            crossed_at=week_start + dt.timedelta(hours=70),
+            alerted=True,
+        )
         _stamp_and_verify(stats_conn)
         stats_conn.commit()
         cache_conn.commit()
     finally:
         stats_conn.close()
         cache_conn.close()
+
+    # Persist a `budget` config block so the envelope's alerts_settings
+    # carries budget_thresholds + budget_enabled=True (issue #19). Budget
+    # is its OWN config block, sourced from `_get_budget_config`.
+    config_path = app_dir / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "budget": {
+                    "weekly_usd": 50.0,
+                    "alerts_enabled": True,
+                    "alert_thresholds": [90, 100],
+                }
+            },
+            indent=2,
+        )
+        + "\n"
+    )
 
     (scenario_dir / "input.env").write_text(
         f"AS_OF={_iso(as_of)}\n"

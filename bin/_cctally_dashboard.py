@@ -268,6 +268,9 @@ from _cctally_core import (
     make_week_ref,
     _get_alerts_config,
     _AlertsConfigError,
+    _get_budget_config,
+    _budget_alerts_active,
+    _BudgetConfigError,
 )
 from _lib_display_tz import (
     format_display_dt,
@@ -4064,16 +4067,17 @@ def _build_alerts_envelope_array(
 ) -> list[dict]:
     """Return the ``alerts`` array for the SSE snapshot envelope.
 
-    Union of ``percent_milestones`` and ``five_hour_milestones`` rows
-    with ``alerted_at IS NOT NULL``, ordered newest-first by
-    ``alerted_at``, capped at ``limit`` (default 100). Single source of
-    truth for both the dashboard panel (slices to 10 client-side) and
-    the modal (renders all 100). Forward-only semantics: only rows the
-    alert-dispatch path stamped get included; pre-deploy crossings stay
-    NULL and are intentionally invisible (spec §4.3).
+    Union of ``percent_milestones``, ``five_hour_milestones``, and
+    ``budget_milestones`` rows with ``alerted_at IS NOT NULL``, ordered
+    newest-first by ``alerted_at``, capped at ``limit`` (default 100).
+    Single source of truth for both the dashboard panel (slices to 10
+    client-side) and the modal (renders all 100). Forward-only
+    semantics: only rows the alert-dispatch path stamped get included;
+    pre-deploy crossings stay NULL and are intentionally invisible
+    (spec §4.3).
 
-    Both axes share the same envelope schema; the ``axis`` field
-    discriminates.
+    All three axes share the same envelope schema; the ``axis`` field
+    (``weekly`` / ``five_hour`` / ``budget``) discriminates.
 
     Per-axis ``LIMIT`` is applied at the SQL level (each query may yield
     up to ``limit``) and the union is re-sorted + sliced — important for
@@ -4164,11 +4168,45 @@ def _build_alerts_envelope_array(
             },
         })
 
+    # Third axis (issue #19): equiv-$ budget threshold crossings. Budget
+    # alerts are keyed by the effective (post-reset) week_start_at + the
+    # integer threshold; the envelope id mirrors the dispatch payload's
+    # ``budget:<week_start_at>:<threshold>`` shape
+    # (``_build_alert_payload_budget``). No ``reset_event_id`` segment —
+    # a mid-week reset re-anchors ``week_start_at`` so the new window
+    # naturally gets fresh rows under ``UNIQUE(week_start_at, threshold)``.
+    budget_rows = conn.execute(
+        """
+        SELECT week_start_at, threshold, crossed_at_utc, alerted_at,
+               budget_usd, spent_usd, consumption_pct
+        FROM budget_milestones
+        WHERE alerted_at IS NOT NULL
+        ORDER BY alerted_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    for r in budget_rows:
+        threshold = int(r["threshold"])
+        out.append({
+            "id":         f"budget:{r['week_start_at']}:{threshold}",
+            "axis":       "budget",
+            "threshold":  threshold,
+            "crossed_at": r["crossed_at_utc"],
+            "alerted_at": r["alerted_at"],
+            "context": {
+                "week_start_at":   r["week_start_at"],
+                "budget_usd":      float(r["budget_usd"]),
+                "spent_usd":       float(r["spent_usd"]),
+                "consumption_pct": float(r["consumption_pct"]),
+            },
+        })
+
     # Python's list.sort is stable. When two alerts share the same
-    # `alerted_at` ISO string (rare; both axes firing within the same
-    # millisecond), the union order (weekly first, then 5h) determines
-    # the tiebreaker — no extra deterministic key is added because the
-    # spec doesn't require one.
+    # `alerted_at` ISO string (rare; multiple axes firing within the same
+    # millisecond), the union order (weekly, then 5h, then budget)
+    # determines the tiebreaker — no extra deterministic key is added
+    # because the spec doesn't require one.
     out.sort(key=lambda a: a["alerted_at"], reverse=True)
     return out[:limit]
 
@@ -4532,8 +4570,9 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     # the entire snapshot — fall back to safe defaults and rely on
     # `_warn_alerts_bad_config_once` for the user-visible signal.
     alerts_array = list(getattr(snap, "alerts", []) or [])
+    _cfg_for_alerts = load_config()
     try:
-        _alerts_cfg = _get_alerts_config(load_config())
+        _alerts_cfg = _get_alerts_config(_cfg_for_alerts)
     except _AlertsConfigError as exc:
         _warn_alerts_bad_config_once(exc)
         _alerts_cfg = {
@@ -4541,10 +4580,21 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
             "weekly_thresholds": [],
             "five_hour_thresholds": [],
         }
+    # Budget is its OWN config block (issue #19) — source budget fields
+    # from ``_get_budget_config`` (the validated ``budget`` block), NOT
+    # the ``alerts`` block. Defensive: a corrupt budget block must not
+    # 500 the whole snapshot — fall back to "no budget / disabled".
+    try:
+        _budget_cfg = _get_budget_config(_cfg_for_alerts)
+    except _BudgetConfigError:
+        _budget_cfg = {"weekly_usd": None, "alerts_enabled": True,
+                       "alert_thresholds": []}
     alerts_settings = {
         "enabled":              _alerts_cfg["enabled"],
         "weekly_thresholds":    list(_alerts_cfg["weekly_thresholds"]),
         "five_hour_thresholds": list(_alerts_cfg["five_hour_thresholds"]),
+        "budget_thresholds":    list(_budget_cfg["alert_thresholds"]),
+        "budget_enabled":       _budget_alerts_active(_budget_cfg),
     }
 
     # Mirror update-state.json + update-suppress.json into the envelope
@@ -5126,9 +5176,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
         Body shape: ``{"display"?: {"tz": "..."}, "alerts"?: {...},
         "update"?: {"check"?: {"enabled"?: bool, "ttl_hours"?: int}},
-        "cache_report"?: {"anomaly_threshold_pp"?: int}}`` — every
-        top-level key is optional; any subset may be sent together
-        (combined save). Unknown top-level keys are rejected with 400.
+        "cache_report"?: {"anomaly_threshold_pp"?: int},
+        "budget"?: {"weekly_usd"?: number|null, "alerts_enabled"?: bool,
+        "alert_thresholds"?: int[]}}`` — every top-level key is optional;
+        any subset may be sent together (combined save). Unknown
+        top-level keys are rejected with 400.
 
         Per-block validation:
           * ``display.tz`` — "local", "utc", or a valid IANA zone (via
@@ -5147,6 +5199,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             ``{error, field: "anomaly_threshold_pp"}`` on out-of-range
             or non-int. Spec §6.1 hardcodes ``anomaly_window_days``;
             F10 tracks lifting that.
+          * ``budget`` — must be a dict; merged onto the persisted
+            ``budget`` block and validated via ``_get_budget_config(merged)``
+            (issue #19); ``_BudgetConfigError`` → 400. Budget is its OWN
+            config block, distinct from ``alerts``.
 
         Atomic merged write: if all touched blocks validate, the merged
         config is persisted in a single ``save_config`` call inside the
@@ -5198,7 +5254,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             return
 
         # Reject unknown top-level keys (forward-compat hygiene).
-        allowed_top_keys = {"display", "alerts", "update", "cache_report"}
+        allowed_top_keys = {
+            "display", "alerts", "update", "cache_report", "budget",
+        }
         for k in payload.keys():
             if k not in allowed_top_keys:
                 self._respond_json(
@@ -5212,12 +5270,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             and "alerts" not in payload
             and "update" not in payload
             and "cache_report" not in payload
+            and "budget" not in payload
         ):
             self._respond_json(
                 400,
                 {"error": (
                     "body must contain at least one of: "
-                    "display, alerts, update, cache_report"
+                    "display, alerts, update, cache_report, budget"
                 )},
             )
             return
@@ -5302,6 +5361,18 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 self._respond_json(
                     400,
                     {"error": "alerts.enabled must be a JSON boolean"},
+                )
+                return
+
+        # Pre-validate budget shape (the structural type check; full
+        # cross-key validation runs inside the lock via
+        # ``_get_budget_config(merged)``). Budget is its OWN config block
+        # (issue #19), not part of ``alerts``.
+        if "budget" in payload:
+            budget_block = payload["budget"]
+            if not isinstance(budget_block, dict):
+                self._respond_json(
+                    400, {"error": "budget must be an object"}
                 )
                 return
 
@@ -5413,6 +5484,35 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     self._respond_json(400, {"error": str(exc)})
                     return
 
+            if "budget" in payload:
+                # Same hand-edited-junk guard as alerts: a non-dict stored
+                # ``budget`` block in config.json should surface as a
+                # recoverable 400, not a 500. Budget is its OWN config
+                # block (issue #19); the inbound keys are
+                # ``weekly_usd`` / ``alerts_enabled`` / ``alert_thresholds``.
+                existing_budget = merged.get("budget")
+                if existing_budget is not None and not isinstance(
+                    existing_budget, dict
+                ):
+                    self._respond_json(
+                        400, {"error": "budget must be an object"}
+                    )
+                    return
+                merged_budget = dict(existing_budget or {})
+                budget_in = payload["budget"]
+                for leaf in ("weekly_usd", "alerts_enabled", "alert_thresholds"):
+                    if leaf in budget_in:
+                        merged_budget[leaf] = budget_in[leaf]
+                merged["budget"] = merged_budget
+                # Final validation against the merged block.
+                # _BudgetConfigError → 400 (no partial write — save_config
+                # has not yet been called).
+                try:
+                    _get_budget_config(merged)
+                except _BudgetConfigError as exc:
+                    self._respond_json(400, {"error": str(exc)})
+                    return
+
             if update_check_validated is not None:
                 # Same hand-edited-junk guard as alerts: a non-dict
                 # `update` or `update.check` block in config.json should
@@ -5473,6 +5573,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             )
         if "alerts" in payload:
             out["alerts"] = _get_alerts_config(merged)
+        if "budget" in payload:
+            # Echo the full validated budget block (defaults filled) so the
+            # SettingsOverlay can repaint without a follow-up GET.
+            out["budget"] = _get_budget_config(merged)
         if update_check_validated is not None:
             # Echo the full merged check block (cooked defaults included)
             # so the SettingsOverlay can repaint without a follow-up GET.

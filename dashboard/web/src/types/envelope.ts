@@ -138,7 +138,7 @@ export interface UpdateEnvelope {
 
 // ---- Threshold-actions alerts (T5/T8) --------------------------------
 
-export type AlertAxis = 'weekly' | 'five_hour';
+export type AlertAxis = 'weekly' | 'five_hour' | 'budget';
 
 export interface AlertEntry {
   id: string;                    // "axis:window_key:threshold"
@@ -154,6 +154,11 @@ export interface AlertEntry {
     block_start_at?: string;
     block_cost_usd?: number;
     primary_model?: string | null;
+    // Budget axis (issue #19): equiv-$ budget threshold crossings.
+    week_start_at?: string;
+    budget_usd?: number;
+    spent_usd?: number;
+    consumption_pct?: number;
   };
 }
 
@@ -161,6 +166,11 @@ export interface AlertsSettingsEnvelope {
   enabled: boolean;
   weekly_thresholds: number[];
   five_hour_thresholds: number[];
+  // Budget is its OWN config block (issue #19), sourced from
+  // `_get_budget_config`, not the `alerts` block. `budget_enabled`
+  // reflects `_budget_alerts_active` (a budget set AND alerts on).
+  budget_thresholds: number[];
+  budget_enabled?: boolean;
 }
 
 export interface DisplayEnvelope {

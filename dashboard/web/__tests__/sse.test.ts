@@ -230,6 +230,8 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
       enabled: true,
       weekly_thresholds: [80, 90],
       five_hour_thresholds: [85],
+      budget_thresholds: [90, 100],
+      budget_enabled: true,
     };
     (globalThis as any).fetch = vi.fn().mockResolvedValue({
       json: () =>
@@ -255,6 +257,8 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
       enabled: true,
       weekly_thresholds: [80, 90],
       five_hour_thresholds: [85, 95],
+      budget_thresholds: [90, 100],
+      budget_enabled: true,
     };
     const freshAlert = alert('weekly:2026-04-27:90');
     // Bootstrap initially returns the fresh snapshot.
@@ -290,6 +294,8 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
       enabled: false,
       weekly_thresholds: [50],
       five_hour_thresholds: [],
+      budget_thresholds: [],
+      budget_enabled: false,
     };
     const staleAlert = alert('weekly:2026-04-20:60');
     MockEventSource.instances[0].emit('update', {

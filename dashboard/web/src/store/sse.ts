@@ -115,6 +115,10 @@ const FALLBACK_ALERTS_SETTINGS = {
   enabled: false,
   weekly_thresholds: [90, 95],
   five_hour_thresholds: [90, 95],
+  // Budget axis (issue #19) — a stale Python without the budget leg
+  // won't carry these; default to "no thresholds / disabled".
+  budget_thresholds: [] as number[],
+  budget_enabled: false,
 };
 
 function ingestAlerts(snap: Envelope): void {

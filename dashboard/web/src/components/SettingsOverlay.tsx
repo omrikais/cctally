@@ -311,17 +311,23 @@ export function SettingsOverlay() {
             </label>
             {/*
               Spec §8.1 — read-only summary of the active threshold lists.
-              Sourced from `state.alertsConfig.{weekly,five_hour}_thresholds`,
+              Sourced from
+              `state.alertsConfig.{weekly,five_hour,budget}_thresholds`,
               which the SSE handler keeps mirrored from the envelope each
               tick (INGEST_SNAPSHOT_ALERTS reducer). v1 has no editor; the
               user mutates these via `cctally config set
-              alerts.weekly_thresholds …` and the new values flow back
-              through this line on the next snapshot.
+              alerts.weekly_thresholds …` (and `budget.alert_thresholds`
+              for the budget axis) and the new values flow back through
+              this line on the next snapshot. Budget is its OWN config
+              block (issue #19), so its thresholds come from
+              `alertsConfig.budget_thresholds`, not the alerts block.
             */}
             <p className="alerts-summary settings-hint">
               Weekly: {alertsConfig.weekly_thresholds.map((t) => `${t}%`).join(', ')}
               {' · '}
               5h-block: {alertsConfig.five_hour_thresholds.map((t) => `${t}%`).join(', ')}
+              {' · '}
+              Budget: {(alertsConfig.budget_thresholds ?? []).map((t) => `${t}%`).join(', ') || '—'}
             </p>
             <div className="alerts-test-row">
               <button
