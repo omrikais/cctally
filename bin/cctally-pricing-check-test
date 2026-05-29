@@ -143,8 +143,23 @@ run_scenario () {
     fi
 
     # JSON golden (sorted keys for byte-stability across dict ordering).
+    # `drift.ahead_of_litellm` enumerates every tracked model absent from the
+    # injected snapshot — it's informational and NEVER actionable (invariant #2),
+    # so byte-pinning it would rot the golden on every pricing-table addition
+    # (the routine action this feature exists to support). Normalize a non-empty
+    # list to a stable sentinel; keep an empty [] as-is (empty IS a real signal).
     local actual
-    actual=$(printf '%s\n' "$raw" | python3 -m json.tool --sort-keys 2>/dev/null)
+    actual=$(printf '%s\n' "$raw" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+drift = d.get("drift")
+if isinstance(drift, dict) and drift.get("ahead_of_litellm"):
+    drift["ahead_of_litellm"] = ["<normalized: non-empty, informational, not pinned>"]
+print(json.dumps(d, indent=4, sort_keys=True))
+' 2>/dev/null)
     if [ -z "$actual" ]; then
         echo "FAIL $name/json  (output was not valid JSON)"
         printf '%s\n' "$raw" | head -40 | sed 's/^/    /'

@@ -10578,7 +10578,7 @@ def _pricing_existence_check() -> dict:
     hidden ``CCTALLY_PRICING_MODELS_FILE`` env hook.
 
     Codex existence is intentionally out of scope (no OpenAI credentials —
-    spec §4 non-goals); the caller marks Codex `skipped: no credentials`.
+    spec §4 non-goals); the payload's existence block is Anthropic-only.
     """
     inject = os.environ.get(_ENV_PRICING_MODELS_FILE, "").strip()
     if inject:
@@ -10684,12 +10684,12 @@ def cmd_pricing_check(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
-        _render_pricing_check_text(payload, offline=args.offline)
+        _render_pricing_check_text(payload, offline=args.offline, actionable=actionable)
 
     return 1 if actionable else 0
 
 
-def _render_pricing_check_text(payload: dict, *, offline: bool) -> None:
+def _render_pricing_check_text(payload: dict, *, offline: bool, actionable: bool) -> None:
     """Human-readable render of the pricing-check payload. JSON is the
     machine contract; this is a readable summary for interactive use."""
     out = sys.stdout.write
@@ -10707,8 +10707,10 @@ def _render_pricing_check_text(payload: dict, *, offline: bool) -> None:
         for g in cov:
             kind = ("unpriced ($0)" if g["kind"] == "unpriced"
                     else "approximated via gpt-5")
-            out(f"    • {g['model']} ({g['provider']}): {g['entry_count']} "
-                f"entries / {g['token_total']} tokens — {kind}\n")
+            entries = g["entry_count"]
+            noun = "entry" if entries == 1 else "entries"
+            out(f"    • {g['model']} ({g['provider']}): {entries} "
+                f"{noun} / {g['token_total']} tokens — {kind}\n")
     else:
         out("\n  Coverage: all observed models priced.\n")
 
@@ -10740,9 +10742,9 @@ def _render_pricing_check_text(payload: dict, *, offline: bool) -> None:
         elif ex["status"] == "degraded":
             out("\n  Existence: /v1/models unavailable (skipped).\n")
 
-    if payload["coverage"] or payload["drift"]["value_drift"] or \
-            payload["drift"]["missing_from_us"] or \
-            payload["existence"]["unpriced_vendor_models"]:
+    # Single-sourced from cmd_pricing_check's exit-code predicate (don't
+    # recompute the four-clause boolean here — it would drift).
+    if actionable:
         out("\n  Action: review CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING; "
             "bump PRICING_SNAPSHOT_DATE on sync.\n")
 
