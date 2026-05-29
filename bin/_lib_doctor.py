@@ -223,11 +223,19 @@ def _check_install_symlinks(s: DoctorState) -> CheckResult:
 
 
 def _check_install_path(s: DoctorState) -> CheckResult:
-    # Issue #119: availability-aware. OK whenever cctally is reachable on
-    # $PATH via ANY channel — brew `<prefix>/bin`, npm prefix, or source
-    # `~/.local/bin`. `path_includes_local_bin` is retained only so the
-    # WARN remediation stays precise (it is no longer the OK predicate).
-    if s.path_includes_local_bin or s.cctally_reachable_on_path:
+    # Issue #119: availability-aware. OK iff cctally is ACTUALLY reachable
+    # on $PATH via ANY channel — brew `<prefix>/bin`, npm prefix, or source
+    # `~/.local/bin` (`shutil.which`, precomputed in the I/O layer). Mere
+    # `~/.local/bin` membership is NOT sufficient: doctor can be launched by
+    # absolute path or from another UI with `~/.local/bin` on $PATH yet no
+    # `cctally` installed there (the brew-only #119 case), which must WARN.
+    # `path_includes_local_bin` is only a fail-soft fallback for when the
+    # reachability probe could not run (None), so a gather failure never
+    # hard-WARNs an otherwise-working install.
+    reachable = s.cctally_reachable_on_path
+    if reachable is None:
+        reachable = bool(s.path_includes_local_bin)
+    if reachable:
         return CheckResult(
             id="install.path", title="PATH",
             severity="ok", summary="cctally reachable on $PATH",

@@ -13,7 +13,8 @@ Install
         total: 13
         missing: ['cctally', 'cctally-alerts', 'cctally-dashboard', 'cctally-dollar-per-percent', 'cctally-five-hour-blocks', 'cctally-five-hour-breakdown', 'cctally-forecast', 'cctally-project', 'cctally-refresh-usage', 'cctally-statusline', 'cctally-sync-week', 'cctally-tui', 'cctally-update']
         stale: []
-  ✓ PATH                     cctally reachable on $PATH
+  ⚠ PATH                     cctally not reachable on $PATH
+      → Append `export PATH="$HOME/.local/bin:$PATH"` to your shell rc, or run `cctally setup`
   ✓ Legacy status-line snippet not detected
   ✓ Legacy bespoke hooks     not detected
 Hooks
@@ -88,4 +89,4 @@ Safety
         current_version: None
         latest_version: None
 
-Summary: 16 OK · 7 WARN · 0 FAIL
+Summary: 15 OK · 8 WARN · 0 FAIL

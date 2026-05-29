@@ -149,6 +149,29 @@ def test_install_path_warns_when_unreachable():
     assert r.severity == "warn"
 
 
+def test_install_path_warns_when_local_bin_on_path_but_unreachable():
+    # The false-OK: `~/.local/bin` is on $PATH (e.g. doctor launched by
+    # absolute path / from another UI, or a brew-only install per #119)
+    # but no `cctally` executable is actually reachable there. Membership
+    # in $PATH must NOT alone satisfy the OK predicate — reachability must.
+    s = _state(path_includes_local_bin=True, cctally_reachable_on_path=False)
+    r = L._check_install_path(s)
+    assert r.severity == "warn"
+    assert r.summary == "cctally not reachable on $PATH"
+
+
+def test_install_path_fail_soft_to_local_bin_when_probe_unavailable():
+    # When the reachability probe could not run (`shutil.which` raised →
+    # None), fall back to the ~/.local/bin membership proxy so a gather
+    # failure never hard-WARNs an otherwise-working install.
+    assert L._check_install_path(
+        _state(path_includes_local_bin=True, cctally_reachable_on_path=None)
+    ).severity == "ok"
+    assert L._check_install_path(
+        _state(path_includes_local_bin=False, cctally_reachable_on_path=None)
+    ).severity == "warn"
+
+
 # ── Issue #119: install.symlinks consumes the `stale` state ──────────
 
 

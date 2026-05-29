@@ -4,7 +4,8 @@ Install
   ✓ Mode                     installed
   ⚠ Symlinks                 0/13 available; missing/broken cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-tui, cctally-update
       → Run `cctally setup`
-  ✓ PATH                     cctally reachable on $PATH
+  ⚠ PATH                     cctally not reachable on $PATH
+      → Append `export PATH="$HOME/.local/bin:$PATH"` to your shell rc, or run `cctally setup`
   ✓ Legacy status-line snippet not detected
   ✓ Legacy bespoke hooks     not detected
 Hooks
@@ -35,4 +36,4 @@ Safety
   ✓ update-suppress.json     parses cleanly
   ✓ Update available         no
 
-Summary: 18 OK · 5 WARN · 0 FAIL
+Summary: 17 OK · 6 WARN · 0 FAIL
