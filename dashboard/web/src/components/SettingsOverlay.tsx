@@ -8,6 +8,8 @@ import {
 } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useKeymap } from '../hooks/useKeymap';
+import type { AlertAxis } from '../types/envelope';
+import { AXIS_TITLE_LABEL } from '../lib/alertAxis';
 
 // IANA-zone validator. `Intl.DateTimeFormat` throws RangeError on
 // unknown zones; we treat that as the negative answer rather than
@@ -85,6 +87,7 @@ export function SettingsOverlay() {
   const [alertsEnabled, setAlertsEnabled] = useState<boolean>(alertsConfig.enabled);
   const [testSubmitting, setTestSubmitting] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
+  const [testAxis, setTestAxis] = useState<AlertAxis>('weekly');
 
   // Re-seed the local form whenever the server-side display.tz changes
   // (an SSE tick from another tab's Save, or a `cctally config` write
@@ -139,6 +142,7 @@ export function SettingsOverlay() {
       setFilter(filterTerm);
       setAlertsEnabled(alertsConfig.enabled);
       setTestError(null);
+      setTestAxis('weekly');
     }
   }, [open, prefs.sortDefault, prefs.sessionsPerPage, filterTerm, alertsConfig.enabled]);
 
@@ -330,6 +334,22 @@ export function SettingsOverlay() {
               Budget: {(alertsConfig.budget_thresholds ?? []).map((t) => `${t}%`).join(', ') || '—'}
             </p>
             <div className="alerts-test-row">
+              <label>
+                Axis{' '}
+                <select
+                  className="settings-btn settings-select"
+                  value={testAxis}
+                  disabled={testSubmitting}
+                  aria-label="Test alert axis"
+                  onChange={(e) => setTestAxis(e.target.value as AlertAxis)}
+                >
+                  {(Object.keys(AXIS_TITLE_LABEL) as AlertAxis[]).map((ax) => (
+                    <option key={ax} value={ax}>
+                      {AXIS_TITLE_LABEL[ax]}
+                    </option>
+                  ))}
+                </select>
+              </label>{' '}
               <button
                 className="settings-btn"
                 type="button"
@@ -341,7 +361,7 @@ export function SettingsOverlay() {
                     const res = await fetch('/api/alerts/test', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ axis: 'weekly', threshold: 90 }),
+                      body: JSON.stringify({ axis: testAxis, threshold: 90 }),
                     });
                     const body = (await res.json().catch(() => ({}))) as {
                       dispatch?: string;

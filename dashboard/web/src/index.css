@@ -1649,6 +1649,10 @@ mark.current {
   outline-offset: 2px;
 }
 #settings-save { border-color: var(--accent-orange); }
+/* Axis picker for the "Send test alert" control — reuses .settings-btn
+   chrome with a slightly tighter inline footprint so it sits beside the
+   button on the alerts-test row. */
+.settings-select { padding: 6px 8px; vertical-align: middle; }
 
 /* ----- Toast (Phase 13) ----- */
 /* Used by quit.js when window.close() is blocked on user-opened tabs.
