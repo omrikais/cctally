@@ -10381,6 +10381,77 @@ _LEGACY_BACKUP_DIR_PREFIX = "cctally-legacy-hook-backup-"
 _LEGACY_POLLER_SIGTERM_GRACE_S = 0.250
 
 
+# Private sentinel so `_pricing_observed_models` can tell "default 30-day
+# window" apart from an explicit `since=None` all-history scan.
+_PRICING_SCAN_DEFAULT_WINDOW = object()
+
+
+def _pricing_observed_models(now_utc, *, since=_PRICING_SCAN_DEFAULT_WINDOW):
+    """Read-only scan of the session-entry cache for observed models.
+
+    Returns a list of ``(provider, model, entry_count, token_total)`` tuples,
+    one per DISTINCT model seen in ``cache.db`` (Claude ``session_entries`` +
+    Codex ``codex_session_entries``). By default it scans the trailing 30-day
+    window relative to ``now_utc`` (the `doctor` coverage signal — recent =
+    actionable). Pass ``since=<datetime>`` to widen/narrow the window, or
+    ``since=None`` explicitly for an all-history scan (used by `pricing-check`).
+
+    Read-only / no-mutation contract (spec §5.1): mirrors the freshness read
+    in this same function — guard on ``CACHE_DB_PATH.exists()``, raw
+    ``sqlite3.connect`` (NEVER ``open_cache_db()`` / ``sync_cache()`` /
+    ``load_config()`` / ``ensure_dirs()``), and treat a missing table/column as
+    "no observed models" rather than crashing. ``doctor --json`` on a virgin
+    HOME must not create ``APP_DIR`` — regression
+    ``test_pricing_observed_models_no_mutation_on_fresh_home``.
+    """
+    out: list = []
+    if not _cctally_core.CACHE_DB_PATH.exists():
+        return out
+    # Sentinel: the 30-day window is the default; `since=False` is not a
+    # supported value, so distinguish "caller wants all-history" (None) from
+    # "caller did not pass since" via a private marker.
+    if since is _PRICING_SCAN_DEFAULT_WINDOW:
+        cutoff_iso = (now_utc - dt.timedelta(days=30)).isoformat()
+    elif since is None:
+        cutoff_iso = None  # all-history
+    else:
+        cutoff_iso = since.isoformat()
+    try:
+        conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+    except sqlite3.Error:
+        return out
+    try:
+        # Token-sum expressions use the ACTUAL cache column names from
+        # bin/_cctally_db.py::_apply_cache_schema (verified — Claude uses
+        # cache_create_tokens, NOT cache_creation_tokens; Codex carries a
+        # materialized total_tokens covering input/cache/output/reasoning).
+        for provider, table, tok_expr in (
+            ("claude", "session_entries",
+             "COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+"
+             "COALESCE(cache_create_tokens,0)+COALESCE(cache_read_tokens,0)"),
+            ("codex", "codex_session_entries",
+             "COALESCE(total_tokens,0)"),
+        ):
+            where = "model IS NOT NULL"
+            params: tuple = ()
+            if cutoff_iso is not None:
+                where = "timestamp_utc >= ? AND " + where
+                params = (cutoff_iso,)
+            try:
+                rows = conn.execute(
+                    f"SELECT model, COUNT(*), SUM({tok_expr}) FROM {table} "
+                    f"WHERE {where} GROUP BY model",
+                    params,
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []  # table/column missing — treat as none
+            for model, cnt, toks in rows:
+                out.append((provider, model, int(cnt or 0), int(toks or 0)))
+    finally:
+        conn.close()
+    return out
+
+
 def doctor_gather_state(
     *,
     now_utc: "dt.datetime | None" = None,

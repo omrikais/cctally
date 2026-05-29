@@ -206,3 +206,99 @@ def test_table_shapes_clean_on_live_tables():
         pricing.CLAUDE_MODEL_PRICING, pricing.CODEX_MODEL_PRICING,
         zero_sentinels={"gpt-5.3-codex-spark"})
     assert problems == [], problems
+
+
+# ── Phase B: doctor pricing.coverage (read-only scan + check fn + wiring) ──
+
+import os
+import subprocess
+import json as _json
+
+_CCTALLY = pathlib.Path(__file__).resolve().parents[1] / "bin" / "cctally"
+
+
+def _run_cctally(args, home):
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["TZ"] = "Etc/UTC"
+    # Force prod data-dir layout under the fake HOME (never touch the dev
+    # checkout's own data dir) — mirrors the harness's _lib-harness-env.sh.
+    env["CCTALLY_DISABLE_DEV_AUTODETECT"] = "1"
+    return subprocess.run(
+        [sys.executable, str(_CCTALLY), *args],
+        capture_output=True, text=True, env=env,
+    )
+
+
+def _seed_cache_with_models(home, claude_models=(), codex_models=(), age_days=1):
+    """Create a minimal cache.db under <home>/.local/share/cctally with the
+    SAME schema + WAL the app uses, seeded with one entry per model at
+    `age_days` before now. `claude_models` / `codex_models` are iterables of
+    (model, input_tokens) tuples (token total drives the WARN detail)."""
+    import sqlite3
+    cache_path = home / ".local" / "share" / "cctally" / "cache.db"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=age_days))
+    ts_iso = ts.isoformat().replace("+00:00", "Z")
+    conn = sqlite3.connect(str(cache_path))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Columns mirror bin/_cctally_db.py's _apply_cache_schema exactly.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS session_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                line_offset INTEGER NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                model TEXT NOT NULL,
+                msg_id TEXT, req_id TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                usage_extra_json TEXT, cost_usd_raw REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS codex_session_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                line_offset INTEGER NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        for i, (model, toks) in enumerate(claude_models):
+            conn.execute(
+                "INSERT INTO session_entries(source_path, line_offset, "
+                "timestamp_utc, model, input_tokens) VALUES (?, ?, ?, ?, ?)",
+                (f"/fake/{model}.jsonl", i, ts_iso, model, int(toks)),
+            )
+        for i, (model, toks) in enumerate(codex_models):
+            conn.execute(
+                "INSERT INTO codex_session_entries(source_path, line_offset, "
+                "timestamp_utc, session_id, model, input_tokens, total_tokens) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (f"/fake/{model}.jsonl", i, ts_iso, "s1", model,
+                 int(toks), int(toks)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_pricing_observed_models_no_mutation_on_fresh_home(tmp_path):
+    # doctor --json drives doctor_gather_state -> _pricing_observed_models;
+    # a virgin HOME must not create APP_DIR (read-only contract, spec §5.1).
+    r = _run_cctally(["doctor", "--json"], home=tmp_path)
+    assert r.returncode in (0, 2), r.stderr
+    app_dir = tmp_path / ".local" / "share" / "cctally"
+    assert not app_dir.exists(), (
+        f"doctor mutated APP_DIR: {sorted(p.name for p in app_dir.rglob('*'))}"
+    )
