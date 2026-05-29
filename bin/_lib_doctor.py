@@ -121,8 +121,15 @@ class DoctorState:
     #     ordinary occupied slot from `(name, state)` alone, so it's
     #     precomputed; drives the PATH-fix remediation in
     #     `_check_install_symlinks`.
+    #   * install_is_brew — true iff this cctally runs from a Homebrew keg
+    #     (`_setup_is_brew_install(repo_root)`). Channel knowledge the
+    #     kernel can't derive from `repo_root` (it does no I/O); drives the
+    #     channel-aware `_check_install_path` WARN remediation so a brew
+    #     install isn't told to fix a `~/.local/bin` it deliberately
+    #     doesn't use (#119 made brew `~/.local/bin`-free).
     cctally_reachable_on_path: Optional[bool] = None
     symlinks_path_pinned: bool = False
+    install_is_brew: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -241,10 +248,25 @@ def _check_install_path(s: DoctorState) -> CheckResult:
             severity="ok", summary="cctally reachable on $PATH",
             remediation=None, details={},
         )
+    # Channel-aware remediation: a Homebrew keg keeps cctally on
+    # `<prefix>/bin` and deliberately owns no `~/.local/bin` symlinks
+    # (#119), so the `~/.local/bin` / `cctally setup` hint would be wrong
+    # for it — point brew users at `brew shellenv` instead (matching the
+    # pinned-only-path remediation in `_check_install_symlinks`). Source /
+    # npm installs keep the `~/.local/bin` + `cctally setup` guidance.
+    if s.install_is_brew:
+        remediation = (
+            "Put `<prefix>/bin` on your PATH (e.g. `eval \"$(brew shellenv)\"`)"
+        )
+    else:
+        remediation = (
+            "Append `export PATH=\"$HOME/.local/bin:$PATH\"` to your shell rc, "
+            "or run `cctally setup`"
+        )
     return CheckResult(
         id="install.path", title="PATH",
         severity="warn", summary="cctally not reachable on $PATH",
-        remediation="Append `export PATH=\"$HOME/.local/bin:$PATH\"` to your shell rc, or run `cctally setup`",
+        remediation=remediation,
         details={},
     )
 

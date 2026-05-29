@@ -33,6 +33,7 @@ def test_doctor_state_has_required_fields():
         "dev_mode", "app_dir", "is_dev_checkout",
         # Issue #119: availability-aware install checks.
         "cctally_reachable_on_path", "symlinks_path_pinned",
+        "install_is_brew",
     }
     assert fields == expected, fields ^ expected
 
@@ -170,6 +171,26 @@ def test_install_path_fail_soft_to_local_bin_when_probe_unavailable():
     assert L._check_install_path(
         _state(path_includes_local_bin=False, cctally_reachable_on_path=None)
     ).severity == "warn"
+
+
+def test_install_path_warn_remediation_is_channel_aware():
+    # Brew kegs own no ~/.local/bin symlinks (#119), so the WARN
+    # remediation must point them at `brew shellenv`, not ~/.local/bin.
+    brew = L._check_install_path(
+        _state(path_includes_local_bin=False, cctally_reachable_on_path=False,
+               install_is_brew=True)
+    )
+    assert brew.severity == "warn"
+    assert "brew shellenv" in brew.remediation
+    assert ".local/bin" not in brew.remediation
+    # Source / npm installs keep the ~/.local/bin + `cctally setup` hint.
+    src = L._check_install_path(
+        _state(path_includes_local_bin=False, cctally_reachable_on_path=False,
+               install_is_brew=False)
+    )
+    assert src.severity == "warn"
+    assert ".local/bin" in src.remediation
+    assert "cctally setup" in src.remediation
 
 
 # ── Issue #119: install.symlinks consumes the `stale` state ──────────

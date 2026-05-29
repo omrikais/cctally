@@ -10433,6 +10433,14 @@ def doctor_gather_state(
         )
     except Exception:
         symlinks_path_pinned = False
+    # install_is_brew — channel knowledge for the install.path WARN
+    # remediation. Brew kegs own no ~/.local/bin symlinks (#119), so the
+    # ~/.local/bin / `cctally setup` hint is wrong for them; the kernel
+    # can't derive this from repo_root (no I/O), so precompute it here.
+    try:
+        install_is_brew = _setup_is_brew_install(repo_root)
+    except Exception:
+        install_is_brew = False
     try:
         legacy_snippet = _setup_detect_legacy_snippet()
     except Exception:
@@ -10718,6 +10726,7 @@ def doctor_gather_state(
         # Issue #119: availability-aware install checks (precomputed above).
         cctally_reachable_on_path=cctally_reachable_on_path,
         symlinks_path_pinned=symlinks_path_pinned,
+        install_is_brew=install_is_brew,
         legacy_snippet=legacy_snippet,
         legacy_bespoke=legacy_bespoke,
         claude_settings=settings,

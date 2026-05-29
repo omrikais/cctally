@@ -17,11 +17,16 @@ CCTALLY = REPO / "bin" / "cctally"
 
 def _run_gather(home: pathlib.Path, *, runtime_bind: "str | None" = None,
                 now_iso: "str | None" = "2026-05-13T14:22:31+00:00",
-                env_extra: "dict | None" = None) -> dict:
+                env_extra: "dict | None" = None,
+                pre_call: str = "") -> dict:
     """Invoke the in-process gather via a one-liner driver script.
 
     If now_iso is None, the driver passes now_utc=None — exercising the
     env-fallback path (CCTALLY_AS_OF or wall-clock) inside the gather.
+
+    pre_call is python source injected after the module loads but before
+    doctor_gather_state runs — used to monkeypatch module-level helpers
+    (e.g. force `_setup_is_brew_install` to True without a keg copy).
     """
     if now_iso is None:
         now_arg = "None"
@@ -38,6 +43,7 @@ def _run_gather(home: pathlib.Path, *, runtime_bind: "str | None" = None,
         # sys.modules[cls.__module__].__dict__, which would NPE otherwise.
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        {pre_call}
         st = mod.doctor_gather_state(
             now_utc={now_arg},
             runtime_bind={runtime_bind!r},
@@ -91,6 +97,24 @@ def test_gather_sets_reachable_and_pinned(tmp_path):
     # Empty scrubbed PATH + no legacy link → both False.
     assert st["cctally_reachable_on_path"] is False
     assert st["symlinks_path_pinned"] is False
+    # install_is_brew flows from _setup_is_brew_install(repo_root); the test
+    # runs the worktree binary (not a keg), so it is present and False.
+    assert "install_is_brew" in st
+    assert st["install_is_brew"] is False
+
+
+def test_gather_install_is_brew_true_when_keg(tmp_path):
+    """install_is_brew reads `_setup_is_brew_install(repo_root)`. The gather
+    subprocess runs the worktree binary (never a keg copy), so force the
+    helper True to prove the wiring populates the field rather than
+    hardcoding False."""
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "projects").mkdir()
+    st = _run_gather(
+        tmp_path,
+        pre_call="mod._setup_is_brew_install = lambda *a, **k: True",
+    )
+    assert st["install_is_brew"] is True
 
 
 def test_gather_state_fresh_home_returns_state(tmp_path):
