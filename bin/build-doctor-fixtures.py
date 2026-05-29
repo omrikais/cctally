@@ -40,6 +40,9 @@ SCENARIOS = {
     "15-brew-stale-links":       "brew_stale_links",
     "16-path-ok-local-bin-off":  "path_ok_local_bin_off",
     "17-brew-pinned-only-path":  "brew_pinned_only_path",
+    # Pricing-freshness check (spec 2026-05-29): an in-window unpriced
+    # Claude model seeds the cache so `pricing.coverage` WARNs.
+    "18-pricing-unpriced-model": "pricing_unpriced_model",
 }
 
 
@@ -204,6 +207,15 @@ def _scenario_body(slug: str) -> str:
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-codex-cache \\
                 "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
             """)
+    if slug == "pricing_unpriced_model":
+        # Reuse the clean all_ok baseline (install/hooks/oauth/snapshot all
+        # OK), then seed cache.db with one in-window Claude model cctally
+        # cannot price → the only WARN is pricing.coverage.
+        pricing_cache = textwrap.dedent("""\
+            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-pricing-cache \\
+                "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
+            """)
+        return _scenario_body("all_ok") + pricing_cache
     if slug == "legacy_hooks_detected":
         return textwrap.dedent("""\
             mkdir -p "$HARNESS_FAKE_HOME/.claude/hooks"
@@ -401,6 +413,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--emit-snapshot", choices=["all_ok", "stale_1h", "stale_30m"])
     p.add_argument("--emit-codex-cache", action="store_true")
+    p.add_argument("--emit-pricing-cache", action="store_true")
     p.add_argument("path", nargs="?")
     args = p.parse_args()
 
@@ -409,6 +422,9 @@ def main():
         return
     if args.emit_codex_cache and args.path:
         _emit_codex_cache(pathlib.Path(args.path))
+        return
+    if args.emit_pricing_cache and args.path:
+        _emit_pricing_cache(pathlib.Path(args.path))
         return
 
     # Plain mode: scaffold every scenario directory.
@@ -453,6 +469,46 @@ def _emit_snapshot(slug: str, db_path: pathlib.Path) -> None:
     conn.execute(
         "INSERT INTO weekly_usage_snapshots(captured_at_utc, week_start_date, used_percent) VALUES (?, ?, ?)",
         (captured.isoformat().replace("+00:00", "Z"), "2026-05-11", 12.5),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _emit_pricing_cache(db_path: pathlib.Path) -> None:
+    """Seed cache.db with ONE Claude session entry for a model cctally does
+    not price (resolves to $0), timestamped inside the 30-day coverage window.
+    Drives the `pricing.coverage` WARN. Columns mirror
+    bin/_cctally_db.py::_apply_cache_schema (cache_create_tokens, NOT
+    cache_creation_tokens)."""
+    import sqlite3
+    import os, datetime as dt
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS session_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path TEXT NOT NULL,
+            line_offset INTEGER NOT NULL,
+            timestamp_utc TEXT NOT NULL,
+            model TEXT NOT NULL,
+            msg_id TEXT, req_id TEXT,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            usage_extra_json TEXT, cost_usd_raw REAL
+        )
+    """)
+    as_of = os.environ.get("CCTALLY_AS_OF", "2026-05-13T14:22:31+00:00")
+    # 2 days before CCTALLY_AS_OF — comfortably inside the trailing-30d window.
+    now = dt.datetime.fromisoformat(as_of).astimezone(dt.timezone.utc) - dt.timedelta(days=2)
+    conn.execute(
+        "INSERT INTO session_entries(source_path, line_offset, timestamp_utc, "
+        "model, input_tokens, output_tokens, cache_create_tokens, "
+        "cache_read_tokens) VALUES (?, 0, ?, ?, ?, ?, ?, ?)",
+        ("/fixture/unpriced.jsonl", now.isoformat().replace("+00:00", "Z"),
+         "claude-fixture-unpriced-9000", 1000, 200, 50, 10),
     )
     conn.commit()
     conn.close()

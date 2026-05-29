@@ -1,0 +1,23 @@
+cctally doctor — 2026-05-13 14:22:31 UTC
+
+Install
+Hooks
+  ⚠ Recent activity (24h)    0 fires
+      → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
+  ⚠ Last hook fire           never
+      → No hook has fired yet. Restart Claude Code.
+Auth
+Database
+  ⚠ Pending migrations       11 pending
+      → Run any cctally command — opens the DB and applies pending migrations
+Data
+  ⚠ Claude cache             1 entries; last sync 172800s ago (>24h)
+      → Run `cctally cache-sync --rebuild`
+Pricing
+  ⚠ Coverage                 1 unpriced (Claude $0)
+      → Run `cctally pricing-check`, then update CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING in bin/_lib_pricing.py
+Safety
+  ⚠ update-state.json        absent (first run)
+      → Run `cctally update --check` to populate
+
+Summary: 18 OK · 6 WARN · 0 FAIL

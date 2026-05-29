@@ -366,3 +366,52 @@ def test_pricing_category_registered():
     pricing_cat = next(c for c in doctor._CATEGORY_DEFINITIONS if c[0] == "pricing")
     check_ids = {cid for cid, _fn in pricing_cat[2]}
     assert "pricing.coverage" in check_ids
+
+
+def _doctor_check(payload, check_id):
+    for cat in payload["categories"]:
+        for c in cat["checks"]:
+            if c["id"] == check_id:
+                return c
+    raise AssertionError(f"check {check_id!r} not in doctor --json")
+
+
+def test_doctor_warns_with_seeded_unpriced_model(tmp_path):
+    # Seed a cache.db with an UNPRICED Claude model in-window, then doctor
+    # --json must include pricing.coverage WARN naming that model.
+    _seed_cache_with_models(
+        tmp_path,
+        claude_models=[("claude-totally-made-up-9000", 12345)],
+        age_days=1,
+    )
+    r = _run_cctally(["doctor", "--json"], home=tmp_path)
+    assert r.returncode in (0, 2), r.stderr
+    payload = _json.loads(r.stdout)
+    c = _doctor_check(payload, "pricing.coverage")
+    assert c["severity"] == "warn", c
+    models = [g["model"] for g in c["details"]["unpriced"]]
+    assert "claude-totally-made-up-9000" in models
+    assert c["details"]["unpriced"][0]["token_total"] == 12345
+
+
+def test_doctor_ok_with_seeded_priced_model(tmp_path):
+    # A model cctally DOES price must not trip the WARN.
+    priced = next(iter(pricing.CLAUDE_MODEL_PRICING))
+    _seed_cache_with_models(tmp_path, claude_models=[(priced, 1000)], age_days=1)
+    r = _run_cctally(["doctor", "--json"], home=tmp_path)
+    payload = _json.loads(r.stdout)
+    c = _doctor_check(payload, "pricing.coverage")
+    assert c["severity"] == "ok", c
+
+
+def test_doctor_pricing_ignores_out_of_window_models(tmp_path):
+    # An unpriced model OLDER than the 30-day window must NOT WARN.
+    _seed_cache_with_models(
+        tmp_path,
+        claude_models=[("claude-old-unpriced", 999)],
+        age_days=45,
+    )
+    r = _run_cctally(["doctor", "--json"], home=tmp_path)
+    payload = _json.loads(r.stdout)
+    c = _doctor_check(payload, "pricing.coverage")
+    assert c["severity"] == "ok", c
