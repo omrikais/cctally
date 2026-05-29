@@ -327,3 +327,63 @@ def test_snap_up_crosses_threshold(ns, monkeypatch):
 
     assert [r["threshold"] for r in _milestone_rows(ns)] == [90]
     assert [p["threshold"] for p, _ in captured] == [90]
+
+
+# ── malformed budget config is a quiet warn-once no-op (hot-path safety) ──
+
+
+def test_malformed_budget_config_is_quiet_noop(ns, monkeypatch, capsys):
+    """A hand-edited invalid budget block must NOT crash record-usage nor spam
+    stderr every tick: maybe_record_budget_milestone warns once at the config
+    gate and no-ops (no rows, no SUM, no dispatch, no raise)."""
+    _seed_window(ns)  # creates the schema (incl. budget_milestones)
+    import _cctally_core
+    # weekly_usd <= 0 fails _get_budget_config -> _BudgetConfigError.
+    _cctally_core.CONFIG_PATH.write_text(
+        json.dumps({"budget": {"weekly_usd": -5.0,
+                               "alert_thresholds": [90, 100]}}) + "\n"
+    )
+    spy: list = []
+    _patch_spend(ns, monkeypatch, value=300.0, spy=spy)
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    ns["maybe_record_budget_milestone"]({})  # must not raise
+
+    assert _milestone_rows(ns) == []
+    assert captured == []
+    assert spy == []  # returned at the config gate, before the SUM
+    assert "[budget] invalid config" in capsys.readouterr().err
+
+
+# ── reconcile is idempotent across a mid-week re-run (no dup / no re-stamp) ──
+
+
+def test_reconcile_idempotent_on_rerun(ns, monkeypatch):
+    """A mid-week target change re-runs the reconcile; UNIQUE(week_start_at,
+    threshold) + the `alerted_at IS NULL` UPDATE guard keep it idempotent —
+    no duplicate row, no re-stamp, never a dispatch."""
+    _seed_window(ns)
+    _write_budget_config(ns, weekly_usd=300.0, thresholds=(90, 100))
+    captured = _patch_dispatch(ns, monkeypatch)
+    _patch_spend(ns, monkeypatch, value=285.0)  # 95% → 90 crossed, 100 not
+    now_utc = ns["_command_as_of"]()
+
+    def _reconcile():
+        conn = ns["open_db"]()
+        try:
+            ns["_reconcile_budget_milestones_on_set"](
+                conn, target=300.0, thresholds=(90, 100), now_utc=now_utc,
+            )
+        finally:
+            conn.close()
+
+    _reconcile()
+    rows_first = _milestone_rows(ns)
+    assert [r["threshold"] for r in rows_first] == [90]
+    stamp_first = rows_first[0]["alerted_at"]
+
+    _reconcile()  # second run (simulates a mid-week target change)
+    rows_second = _milestone_rows(ns)
+    assert [r["threshold"] for r in rows_second] == [90]  # no duplicate
+    assert rows_second[0]["alerted_at"] == stamp_first  # not re-stamped
+    assert captured == []  # reconcile never dispatches

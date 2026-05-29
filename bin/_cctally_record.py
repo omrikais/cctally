@@ -171,6 +171,7 @@ from _cctally_core import (
     make_week_ref,
     _get_alerts_config,
     _AlertsConfigError,
+    _BudgetConfigError,
     _command_as_of,
 )
 from _lib_five_hour import _canonical_5h_window_key
@@ -288,6 +289,10 @@ def _dispatch_alert_notification(*args, **kwargs):
 
 def _warn_alerts_bad_config_once(*args, **kwargs):
     return sys.modules["cctally"]._warn_alerts_bad_config_once(*args, **kwargs)
+
+
+def _warn_budget_bad_config_once(*args, **kwargs):
+    return sys.modules["cctally"]._warn_budget_bad_config_once(*args, **kwargs)
 
 
 def _get_oauth_usage_config(*args, **kwargs):
@@ -682,9 +687,14 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
     """
     # Gate FIRST (hot-path discipline): no budget or alerts off → zero
     # overhead for non-budget users. `load_config()` is safe outside any
-    # writer lock — atomic-rename guarantees whole-byte reads.
-    cfg = load_config()
-    budget_cfg = _get_budget_config(cfg)
+    # writer lock — atomic-rename guarantees whole-byte reads. A malformed
+    # budget block is a quiet warn-once no-op (mirrors weekly/5h), NOT an
+    # unthrottled per-tick stderr via the caller's wrapper.
+    try:
+        budget_cfg = _get_budget_config(load_config())
+    except _BudgetConfigError as exc:
+        _warn_budget_bad_config_once(exc)
+        return
     if not _budget_alerts_active(budget_cfg):
         return
     target = budget_cfg["weekly_usd"]
@@ -719,6 +729,8 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
             return  # nothing left to cross this week → skip the cost SUM
 
         spent = _sum_cost_for_range(week_start_at, now_utc, mode="auto")
+        # target > 0 is guaranteed by _get_budget_config (weekly_usd None is
+        # excluded by _budget_alerts_active above); the else is belt-and-suspenders.
         consumption_pct = (spent / target * 100.0) if target > 0 else 0.0
         for t in pending:
             # +1e-9 snap-up: spent/target*100 can land one ULP below an

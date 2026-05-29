@@ -2103,6 +2103,22 @@ def _warn_alerts_bad_config_once(exc: Exception) -> None:
     eprint(f"[alerts] invalid config, skipping dispatch: {exc}")
 
 
+_BUDGET_BAD_CONFIG_WARNED = False  # one-shot warn flag for malformed budget block
+
+
+def _warn_budget_bad_config_once(exc: Exception) -> None:
+    """Emit a single stderr warning per process when the budget config block
+    is malformed, so a hand-edited bad block becomes a quiet no-op on the
+    record-usage hot path instead of unthrottled per-tick stderr. Mirrors
+    `_warn_alerts_bad_config_once`.
+    """
+    global _BUDGET_BAD_CONFIG_WARNED
+    if _BUDGET_BAD_CONFIG_WARNED:
+        return
+    _BUDGET_BAD_CONFIG_WARNED = True
+    eprint(f"[budget] invalid config, skipping dispatch: {exc}")
+
+
 # === Update subsystem main body (state/lock/log, install-method
 # detection, version-check pipeline, install execution, dashboard
 # UpdateWorker + _DashboardUpdateCheckThread, cmd_update,
@@ -3605,6 +3621,8 @@ def _reconcile_budget_milestones_on_set(conn, *, target, thresholds, now_utc):
     week_start_at, _week_end_at = window
     week_key = week_start_at.isoformat(timespec="seconds")
     spent = _sum_cost_for_range(week_start_at, now_utc, mode="auto")
+    # target > 0 guaranteed by the caller (_cmd_budget_set passes the validated
+    # weekly_usd); the else is belt-and-suspenders.
     consumption_pct = (spent / target * 100.0) if target > 0 else 0.0
     for t in sorted(thresholds):
         if consumption_pct + 1e-9 >= t:

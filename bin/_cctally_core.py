@@ -999,7 +999,12 @@ def open_db() -> sqlite3.Connection:
     # fresh rows under UNIQUE(week_start_at, threshold) — no `reset_event_id`
     # segment column needed (unlike the percent/5h tables). `week_start_at`
     # stores the effective/re-anchored ISO string from the resolver
-    # (`isoformat(timespec="seconds")`). `alerted_at` is stamped BEFORE the
+    # (`isoformat(timespec="seconds")`); the resolver's `parse_iso_datetime`
+    # returns a HOST-LOCAL tz-aware datetime, so this dedup key carries the
+    # host's UTC offset (e.g. `…T07:00:00-07:00`) — host-consistent, NOT
+    # portable across hosts, same posture as `five_hour_blocks.block_start_at`.
+    # Firing + reconcile + the dashboard envelope all read/write the identical
+    # string on a given host, so the UNIQUE dedup is exact. `alerted_at` is stamped BEFORE the
     # osascript Popen (set-then-dispatch invariant); NULL = "recorded without
     # dispatch" (the forward-only-from-set reconcile path) OR "not yet
     # dispatched", never "delivery failed". Lives BEFORE the migration
