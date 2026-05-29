@@ -250,12 +250,17 @@ def _write_gitignore(scenario_dir: Path) -> None:
 
 
 def _write_config(app_dir: Path, *, alerts_block: "dict | None" = None,
+                  budget_block: "dict | None" = None,
                   display_tz: str = "utc") -> None:
     """Write a deterministic config.json. ``alerts_block`` if provided
-    becomes the top-level ``alerts`` key (deep-merged with display.tz)."""
+    becomes the top-level ``alerts`` key; ``budget_block`` becomes the
+    top-level ``budget`` key (its OWN block, not under ``alerts``). Both
+    are deep-merged with display.tz."""
     cfg: dict = {"display": {"tz": display_tz}}
     if alerts_block is not None:
         cfg["alerts"] = alerts_block
+    if budget_block is not None:
+        cfg["budget"] = budget_block
     (app_dir / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
 
 
@@ -706,6 +711,62 @@ def _build_osascript_missing(out: Path) -> None:
     _write_gitignore(scenario_dir)
 
 
+def _build_budget_100(out: Path) -> None:
+    """Scenario 11 (budget axis): a $10 weekly budget with the seeded ~$15
+    of session_entries → consumption ~150% → crosses BOTH 90 and 100.
+
+    The budget firing path (``maybe_record_budget_milestone``) is gated on
+    a ``budget`` config block + a resolvable week window. ``_seed_active_-
+    week_baseline`` provides the boundary-aware ``weekly_usage_snapshots``
+    row (the window anchor) AND the ~$15 of ``session_entries`` that drive
+    ``_sum_cost_for_range``. No pre-seeded ``budget_milestones`` row →
+    every configured threshold is pending → both fire.
+
+    Asserts (in the harness): two ``budget_milestones`` rows armed, and the
+    ``alerts.log`` line carries ``budget|<threshold>|real|queued``.
+    """
+    name = "budget-100"
+    scenario_dir, app_dir, _ = _scenario_paths(out, name)
+    stats_path, cache_path = _baseline_dbs(app_dir)
+    with sqlite3.connect(stats_path) as sc, sqlite3.connect(cache_path) as cc:
+        _seed_active_week_baseline(sc, cc)
+        sc.commit()
+        cc.commit()
+    _write_config(app_dir, budget_block={
+        "weekly_usd": 10.0, "alerts_enabled": True,
+        "alert_thresholds": [90, 100],
+    })
+    _write_input_env(scenario_dir, percent=89.0)  # weekly axis doesn't fire
+    _write_gitignore(scenario_dir)
+
+
+def _build_budget_osascript_missing(out: Path) -> None:
+    """Scenario 12 (budget axis, graceful spawn-error): same $10-budget /
+    ~$15-spend crossing as budget-100, but CCTALLY_TEST_POPEN_FACTORY=
+    raise_filenotfound flips the dispatch Popen factory to raise
+    FileNotFoundError. Asserts the budget milestone is STILL committed with
+    alerted_at SET (set-then-dispatch: the row is durable BEFORE the Popen),
+    the alerts.log line carries a spawn_error status, and record-usage exits
+    0 (a dispatch failure never fails the parent / rolls back the row)."""
+    name = "budget-osascript-missing"
+    scenario_dir, app_dir, _ = _scenario_paths(out, name)
+    stats_path, cache_path = _baseline_dbs(app_dir)
+    with sqlite3.connect(stats_path) as sc, sqlite3.connect(cache_path) as cc:
+        _seed_active_week_baseline(sc, cc)
+        sc.commit()
+        cc.commit()
+    _write_config(app_dir, budget_block={
+        "weekly_usd": 10.0, "alerts_enabled": True,
+        "alert_thresholds": [90, 100],
+    })
+    _write_input_env(
+        scenario_dir,
+        percent=89.0,
+        extra={"EXTRA_ENV_CCTALLY_TEST_POPEN_FACTORY": "raise_filenotfound"},
+    )
+    _write_gitignore(scenario_dir)
+
+
 SCENARIOS = (
     ("disabled", _build_disabled),
     ("enabled-no-crossing", _build_enabled_no_crossing),
@@ -717,6 +778,8 @@ SCENARIOS = (
     ("concurrent-record-usage", _build_concurrent_record_usage),
     ("unknown-config-key", _build_unknown_config_key),
     ("osascript-missing", _build_osascript_missing),
+    ("budget-100", _build_budget_100),
+    ("budget-osascript-missing", _build_budget_osascript_missing),
 )
 
 

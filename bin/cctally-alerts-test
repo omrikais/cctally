@@ -193,6 +193,27 @@ with sqlite3.connect(stats) as conn:
         "SELECT alerted_at FROM percent_milestones WHERE percent_threshold = 90"
     ).fetchone()
     pinned_str = pinned["alerted_at"] if pinned else ""
+    # Budget axis (Task 3). budget_milestones has no reset_event_id; armed =
+    # alerted_at IS NOT NULL (set-then-dispatch). Tolerate the table's
+    # absence (older fixture DBs) so non-budget scenarios stay green.
+    try:
+        bm_total = conn.execute(
+            "SELECT COUNT(*) FROM budget_milestones"
+        ).fetchone()[0]
+        bm_armed = conn.execute(
+            "SELECT COUNT(*) FROM budget_milestones WHERE alerted_at IS NOT NULL"
+        ).fetchone()[0]
+        armed_budget_pcts = ",".join(
+            str(int(r["threshold"]))
+            for r in conn.execute(
+                "SELECT threshold FROM budget_milestones "
+                "WHERE alerted_at IS NOT NULL ORDER BY threshold ASC"
+            )
+        )
+    except sqlite3.OperationalError:
+        bm_total = 0
+        bm_armed = 0
+        armed_budget_pcts = ""
 
 print(f"pm_total={pm_total}")
 print(f"pm_armed={pm_armed}")
@@ -201,6 +222,9 @@ print(f"fhm_armed={fhm_armed}")
 print(f"armed_pcts={armed_pcts}")
 print(f"armed_5h_pcts={armed_5h_pcts}")
 print(f"pinned_alerted_at_90={pinned_str}")
+print(f"bm_total={bm_total}")
+print(f"bm_armed={bm_armed}")
+print(f"armed_budget_pcts={armed_budget_pcts}")
 
 if log_path.exists():
     lines = log_path.read_text().splitlines()
@@ -380,6 +404,48 @@ assert_eq "osascript-missing: log_lines == 1" "1" "$(get_state log_lines)"
 assert_contains "osascript-missing: log line carries spawn_error status" \
     "spawn_error" "$(get_state log_0)"
 
+# ─── Scenario 11: budget-100 (budget axis crossing) ──────────────────
+# Same macOS-osascript rationale as scenarios 3/5: the real popup-dispatch
+# path writes `mode=real|queued` only when osascript spawns. Gate on uname
+# so Linux CI keeps the structural (alerted_at) assertions but skips the
+# queued-log assertion.
+run_record_usage budget-100
+assert_eq "budget-100: record-usage exit 0" "0" "$RU_EC"
+STATE_OUT="$(inspect_state budget-100)"
+# $10 budget, ~$15 spend → ~150% → crosses BOTH 90 and 100. Structural
+# assertions (row arming) are OS-independent.
+assert_eq "budget-100: armed_budget_pcts == '90,100'" "90,100" \
+    "$(get_state armed_budget_pcts)"
+assert_eq "budget-100: bm_armed == 2" "2" "$(get_state bm_armed)"
+# Weekly/5h axes didn't cross (89% weekly, no 5h) → their armed counts 0.
+assert_eq "budget-100: pm_armed == 0" "0" "$(get_state pm_armed)"
+assert_eq "budget-100: fhm_armed == 0" "0" "$(get_state fhm_armed)"
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "SKIP budget-100 log assertions: require macOS osascript"
+else
+    assert_eq "budget-100: log_lines == 2" "2" "$(get_state log_lines)"
+    assert_contains "budget-100: log 0 = budget|90|real|queued" \
+        "budget|90|real|queued" "$(get_state log_0)"
+    assert_contains "budget-100: log 1 = budget|100|real|queued" \
+        "budget|100|real|queued" "$(get_state log_1)"
+fi
+
+# ─── Scenario 12: budget-osascript-missing (graceful spawn-error) ────
+# Spawn-error MUST NOT fail record-usage NOR roll back the budget milestone
+# (set-then-dispatch invariant — alerted_at is committed BEFORE the Popen).
+run_record_usage budget-osascript-missing
+assert_eq "budget-osascript-missing: record-usage exit 0 (spawn-error swallowed)" \
+    "0" "$RU_EC"
+STATE_OUT="$(inspect_state budget-osascript-missing)"
+# Milestones committed + armed even though osascript Popen raised.
+assert_eq "budget-osascript-missing: armed_budget_pcts == '90,100'" "90,100" \
+    "$(get_state armed_budget_pcts)"
+assert_eq "budget-osascript-missing: log_lines == 2" "2" "$(get_state log_lines)"
+assert_contains "budget-osascript-missing: log 0 carries budget + spawn_error" \
+    "budget|90|" "$(get_state log_0)"
+assert_contains "budget-osascript-missing: log 0 status spawn_error" \
+    "|spawn_error" "$(get_state log_0)"
+
 # ─── Sanity: in-tree fixtures stay clean ─────────────────────────────
 # Verify every per-scenario .gitignore covers ALL the spawned WAL/SHM/log
 # files (CLAUDE.md fixture-scoped convention; subagent must not silently
@@ -396,7 +462,8 @@ required_gitignore_patterns=(
 )
 for scenario in disabled enabled-no-crossing enabled-weekly-90 enabled-five-hour-95 \
                 multi-threshold-jump disabled-then-enabled mid-week-reset \
-                concurrent-record-usage unknown-config-key osascript-missing; do
+                concurrent-record-usage unknown-config-key osascript-missing \
+                budget-100 budget-osascript-missing; do
     gi="$FIXTURES_DIR/$scenario/.gitignore"
     if [ ! -f "$gi" ]; then
         echo "FAIL $scenario: .gitignore missing at $gi"

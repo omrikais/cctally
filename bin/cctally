@@ -371,9 +371,11 @@ def _nonneg_int(raw: str) -> int:
 _lib_alerts_payload = _load_sibling("_lib_alerts_payload")
 _alert_text_weekly = _lib_alerts_payload._alert_text_weekly
 _alert_text_five_hour = _lib_alerts_payload._alert_text_five_hour
+_alert_text_budget = _lib_alerts_payload._alert_text_budget
 _escape_applescript_string = _lib_alerts_payload._escape_applescript_string
 _build_alert_payload_weekly = _lib_alerts_payload._build_alert_payload_weekly
 _build_alert_payload_five_hour = _lib_alerts_payload._build_alert_payload_five_hour
+_build_alert_payload_budget = _lib_alerts_payload._build_alert_payload_budget
 
 _lib_five_hour = _load_sibling("_lib_five_hour")
 _FIVE_HOUR_JITTER_FLOOR_SECONDS = _lib_five_hour._FIVE_HOUR_JITTER_FLOOR_SECONDS
@@ -726,6 +728,7 @@ _cctally_record = _load_sibling("_cctally_record")
 _PERCENT_NORMALIZE_DECIMALS = _cctally_record._PERCENT_NORMALIZE_DECIMALS
 _normalize_percent = _cctally_record._normalize_percent
 maybe_record_milestone = _cctally_record.maybe_record_milestone
+maybe_record_budget_milestone = _cctally_record.maybe_record_budget_milestone
 _compute_block_totals = _cctally_record._compute_block_totals
 maybe_update_five_hour_block = _cctally_record.maybe_update_five_hour_block
 cmd_record_usage = _cctally_record.cmd_record_usage
@@ -3542,6 +3545,84 @@ def insert_percent_milestone(
     if commit:
         conn.commit()
     return int(cur.rowcount)
+
+
+def insert_budget_milestone(
+    conn: sqlite3.Connection,
+    *,
+    week_start_at: str,
+    threshold: int,
+    budget_usd: float,
+    spent_usd: float,
+    consumption_pct: float,
+    commit: bool = True,
+) -> int:
+    """INSERT OR IGNORE a budget threshold crossing. Returns ``cur.rowcount``
+    (1 = genuinely new crossing, 0 = INSERT OR IGNORE no-op on a pre-existing
+    ``(week_start_at, threshold)`` row).
+
+    Mirrors :func:`insert_percent_milestone`'s rowcount contract so the
+    alert-fire predicate (`if inserted == 1`) is race-safe without a
+    follow-up SELECT. ``alerted_at`` is left NULL — the caller stamps it in
+    the SAME transaction BEFORE dispatching (set-then-dispatch invariant,
+    CLAUDE.md Alerts gotcha). ``commit=False`` lets the caller bundle the
+    INSERT with the follow-up ``alerted_at`` UPDATE in one transaction so a
+    crash between them can't strand ``alerted_at`` NULL forever.
+    """
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO budget_milestones "
+        "(week_start_at, threshold, budget_usd, spent_usd, consumption_pct, "
+        " crossed_at_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            week_start_at,
+            int(threshold),
+            float(budget_usd),
+            float(spent_usd),
+            float(consumption_pct),
+            now_utc_iso(),
+        ),
+    )
+    if commit:
+        conn.commit()
+    return int(cur.rowcount)
+
+
+def _reconcile_budget_milestones_on_set(conn, *, target, thresholds, now_utc):
+    """Forward-only-from-set reconcile (spec §5): on `budget set`, every
+    threshold ALREADY crossed for the current week is recorded with
+    ``alerted_at`` SET but WITHOUT dispatch — so setting a budget when you're
+    already at 95% does NOT instant-popup. Thresholds not yet crossed get NO
+    row, so they fire later via :func:`maybe_record_budget_milestone`.
+
+    A mid-week target change re-runs this; thresholds already alerted stay
+    deduped via UNIQUE(week_start_at, threshold) + the ``alerted_at IS NULL``
+    guard on the UPDATE (so an existing alerted row is never re-stamped).
+    """
+    window = _resolve_current_budget_window(conn, now_utc)
+    if window is None:
+        return
+    week_start_at, _week_end_at = window
+    week_key = week_start_at.isoformat(timespec="seconds")
+    spent = _sum_cost_for_range(week_start_at, now_utc, mode="auto")
+    consumption_pct = (spent / target * 100.0) if target > 0 else 0.0
+    for t in sorted(thresholds):
+        if consumption_pct + 1e-9 >= t:
+            insert_budget_milestone(
+                conn,
+                week_start_at=week_key,
+                threshold=t,
+                budget_usd=target,
+                spent_usd=spent,
+                consumption_pct=consumption_pct,
+                commit=False,
+            )
+            conn.execute(
+                "UPDATE budget_milestones SET alerted_at = ? "
+                "WHERE week_start_at = ? AND threshold = ? AND alerted_at IS NULL",
+                (now_utc_iso(), week_key, t),
+            )
+    conn.commit()
 
 
 def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> int:
@@ -9067,6 +9148,28 @@ def _cmd_budget_set(args: argparse.Namespace) -> int:
     weekly_usd = validated["weekly_usd"]
     alerts_enabled = validated["alerts_enabled"]
     thresholds = validated["alert_thresholds"]
+
+    # Forward-only-from-set reconcile (Task 3, spec §5): record thresholds
+    # ALREADY crossed with alerted_at set but WITHOUT dispatch, so setting a
+    # budget mid-week doesn't instant-popup; only LATER crossings fire. Runs
+    # OUTSIDE the config_writer_lock (open_db has its own locking; reusing the
+    # config lock here would needlessly serialize a stats.db write behind it).
+    # Gated on _budget_alerts_active — a budget with alerts off (or no
+    # thresholds) records nothing.
+    if _budget_alerts_active(validated) and thresholds:
+        try:
+            conn = open_db()
+            try:
+                _reconcile_budget_milestones_on_set(
+                    conn,
+                    target=weekly_usd,
+                    thresholds=thresholds,
+                    now_utc=_command_as_of(),
+                )
+            finally:
+                conn.close()
+        except Exception as exc:  # reconcile is best-effort; never fail the set
+            eprint(f"[budget-milestone] reconcile on set failed: {exc}")
     if getattr(args, "json", False):
         print(json.dumps({
             "status": "set",
@@ -13807,14 +13910,15 @@ def build_parser() -> argparse.ArgumentParser:
             Examples:
               cctally alerts test
               cctally alerts test --axis five-hour --threshold 95
+              cctally alerts test --axis budget --threshold 100
         """),
     )
     p_alerts_test.add_argument(
         "--axis",
-        choices=["weekly", "five-hour"],
+        choices=["weekly", "five-hour", "budget"],
         default="weekly",
-        help="Alert axis to simulate: weekly subscription window or 5h block "
-             "(default: weekly).",
+        help="Alert axis to simulate: weekly subscription window, 5h block, "
+             "or equiv-$ budget (default: weekly).",
     )
     p_alerts_test.add_argument(
         "--threshold",

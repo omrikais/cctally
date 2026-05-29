@@ -68,9 +68,11 @@ def _load_lib(name: str):
 _lib_alerts_payload = _load_lib("_lib_alerts_payload")
 _alert_text_weekly = _lib_alerts_payload._alert_text_weekly
 _alert_text_five_hour = _lib_alerts_payload._alert_text_five_hour
+_alert_text_budget = _lib_alerts_payload._alert_text_budget
 _escape_applescript_string = _lib_alerts_payload._escape_applescript_string
 _build_alert_payload_weekly = _lib_alerts_payload._build_alert_payload_weekly
 _build_alert_payload_five_hour = _lib_alerts_payload._build_alert_payload_five_hour
+_build_alert_payload_budget = _lib_alerts_payload._build_alert_payload_budget
 
 
 # === Honest imports from extracted homes ===================================
@@ -134,6 +136,8 @@ def _dispatch_alert_notification(
         title, subtitle, body = _alert_text_weekly(payload, tz)
     elif axis == "five_hour":
         title, subtitle, body = _alert_text_five_hour(payload, tz)
+    elif axis == "budget":
+        title, subtitle, body = _alert_text_budget(payload, tz)
     else:
         title, subtitle, body = (
             "cctally - alert",
@@ -168,6 +172,7 @@ def _dispatch_alert_notification(
         window_key = (
             ctx.get("week_start_date")
             or ctx.get("five_hour_window_key")
+            or ctx.get("week_start_at")
             or ""
         )
         line = (
@@ -198,8 +203,16 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
       2  --threshold out of [1, 100] range
       3  other spawn error (PermissionError, OSError, ...)
     """
-    axis = "weekly" if args.axis == "weekly" else "five_hour"
+    if args.axis == "weekly":
+        axis = "weekly"
+    elif args.axis == "budget":
+        axis = "budget"
+    else:
+        axis = "five_hour"
     threshold = int(args.threshold)
+    # --threshold range stays [1, 100] (F5): the cap is axis-uniform with the
+    # existing weekly/5h thresholds. Over-budget tiers (>100%) are a v2
+    # deferral, not an oversight — see spec §2 (F5).
     if not (1 <= threshold <= 100):
         print(
             f"cctally: --threshold must be in [1, 100], got {threshold}",
@@ -213,6 +226,18 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
             week_start_date=dt.date.today().isoformat(),
             cumulative_cost_usd=1.23,
             dollars_per_percent=0.01,
+        )
+    elif axis == "budget":
+        # Synthetic budget payload — NO DB writes (test/real divergence
+        # contract). spent scaled to the threshold so the body line reads
+        # plausibly (e.g. 100% → $300 of $300).
+        payload = _build_alert_payload_budget(
+            threshold=threshold,
+            crossed_at_utc=now_utc_iso(),
+            week_start_at=dt.date.today().isoformat(),
+            budget_usd=300.0,
+            spent_usd=300.0 * threshold / 100.0,
+            consumption_pct=float(threshold),
         )
     else:
         payload = _build_alert_payload_five_hour(

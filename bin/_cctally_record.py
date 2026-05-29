@@ -258,6 +258,30 @@ def _build_alert_payload_five_hour(*args, **kwargs):
     return sys.modules["cctally"]._build_alert_payload_five_hour(*args, **kwargs)
 
 
+def _build_alert_payload_budget(*args, **kwargs):
+    return sys.modules["cctally"]._build_alert_payload_budget(*args, **kwargs)
+
+
+def _get_budget_config(*args, **kwargs):
+    return sys.modules["cctally"]._get_budget_config(*args, **kwargs)
+
+
+def _budget_alerts_active(*args, **kwargs):
+    return sys.modules["cctally"]._budget_alerts_active(*args, **kwargs)
+
+
+def _resolve_current_budget_window(*args, **kwargs):
+    return sys.modules["cctally"]._resolve_current_budget_window(*args, **kwargs)
+
+
+def _sum_cost_for_range(*args, **kwargs):
+    return sys.modules["cctally"]._sum_cost_for_range(*args, **kwargs)
+
+
+def insert_budget_milestone(*args, **kwargs):
+    return sys.modules["cctally"].insert_budget_milestone(*args, **kwargs)
+
+
 def _dispatch_alert_notification(*args, **kwargs):
     return sys.modules["cctally"]._dispatch_alert_notification(*args, **kwargs)
 
@@ -642,6 +666,111 @@ def maybe_record_milestone(
         eprint(f"[milestone] error recording milestone: {exc}")
     finally:
         conn.close()
+
+
+def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
+    """Fire equiv-$ budget alerts on ACTUAL-spend threshold crossings
+    (Approach A — called from ``cmd_record_usage`` alongside the weekly-% /
+    5h-% milestone helpers). Gated, hot-path-cheap, set-then-dispatch,
+    fire-once. Errors are logged, not raised (the caller also wraps).
+
+    ``saved`` is accepted for call-site symmetry with
+    ``maybe_record_milestone`` / ``maybe_update_five_hour_block`` but is
+    unused: the budget window + live spend are resolved from the DB +
+    ``session_entries`` independently (a budget crossing depends on
+    cumulative equiv-$ spend, not on the just-recorded 7d-% snapshot).
+    """
+    # Gate FIRST (hot-path discipline): no budget or alerts off → zero
+    # overhead for non-budget users. `load_config()` is safe outside any
+    # writer lock — atomic-rename guarantees whole-byte reads.
+    cfg = load_config()
+    budget_cfg = _get_budget_config(cfg)
+    if not _budget_alerts_active(budget_cfg):
+        return
+    target = budget_cfg["weekly_usd"]
+    thresholds = budget_cfg["alert_thresholds"]
+    if not thresholds:
+        return
+
+    now_utc = _command_as_of()
+    pending_alerts: list[dict[str, Any]] = []
+    conn = open_db()
+    try:
+        window = _resolve_current_budget_window(conn, now_utc)
+        if window is None:
+            return  # no resolvable week window yet (spec §6 worst case)
+        week_start_at, _week_end_at = window
+        week_key = week_start_at.isoformat(timespec="seconds")
+
+        # Pre-probe (hot-path discipline + [Dedup mustn't gate side effects]):
+        # which configured thresholds are STILL un-recorded for this week?
+        # The cost SUM is skipped ONLY when every threshold already has a row
+        # — so a partial prior run that recorded some-but-not-all thresholds
+        # still gets the remaining ones a SUM + crossing-check. The skip never
+        # owes a crossing: an un-recorded threshold always forces the SUM.
+        present = {
+            int(r[0]) for r in conn.execute(
+                "SELECT threshold FROM budget_milestones WHERE week_start_at = ?",
+                (week_key,),
+            )
+        }
+        pending = [t for t in sorted(thresholds) if t not in present]
+        if not pending:
+            return  # nothing left to cross this week → skip the cost SUM
+
+        spent = _sum_cost_for_range(week_start_at, now_utc, mode="auto")
+        consumption_pct = (spent / target * 100.0) if target > 0 else 0.0
+        for t in pending:
+            # +1e-9 snap-up: spent/target*100 can land one ULP below an
+            # integer threshold (CLAUDE.md float-floor gotcha).
+            if consumption_pct + 1e-9 >= t:
+                inserted = insert_budget_milestone(
+                    conn,
+                    week_start_at=week_key,
+                    threshold=t,
+                    budget_usd=target,
+                    spent_usd=spent,
+                    consumption_pct=consumption_pct,
+                    commit=False,
+                )
+                # Only the genuine-new-crossing winner (rowcount==1) dispatches;
+                # a racing record-usage instance gets rowcount==0 and skips.
+                if inserted == 1:
+                    crossed_at = now_utc_iso()
+                    # set-then-dispatch: alerted_at lands on the row BEFORE
+                    # the osascript Popen, sharing this transaction with the
+                    # INSERT (commit=False) so a crash between them is
+                    # impossible. `alerted_at IS NULL` guard is write-once
+                    # defense-in-depth.
+                    conn.execute(
+                        "UPDATE budget_milestones SET alerted_at = ? "
+                        "WHERE week_start_at = ? AND threshold = ? "
+                        "  AND alerted_at IS NULL",
+                        (crossed_at, week_key, t),
+                    )
+                    pending_alerts.append(_build_alert_payload_budget(
+                        threshold=t,
+                        crossed_at_utc=crossed_at,
+                        week_start_at=week_key,
+                        budget_usd=target,
+                        spent_usd=spent,
+                        consumption_pct=consumption_pct,
+                    ))
+        # Single commit: every INSERT + its alerted_at marker durable together.
+        conn.commit()
+    except Exception as exc:
+        eprint(f"[budget-milestone] error recording budget milestone: {exc}")
+    finally:
+        conn.close()
+
+    # Dispatch AFTER commit; a dispatch failure NEVER rolls back the milestone
+    # (set-then-dispatch invariant — one queue attempt per crossing, deduped
+    # on the alerted_at column).
+    for payload in pending_alerts:
+        try:
+            _dispatch_alert_notification(payload, mode="real")
+        except Exception as dispatch_exc:
+            eprint(f"[budget-alerts] dispatch failed: {dispatch_exc}")
 
 
 def _compute_block_totals(
@@ -2177,6 +2306,13 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         maybe_update_five_hour_block(saved)
     except Exception as exc:
         eprint(f"[5h-block] unexpected error: {exc}")
+
+    # NEW: equiv-$ budget alert firing (Approach A, issue #19). Gated on a
+    # set budget + alerts_enabled FIRST — non-budget users pay zero overhead.
+    try:
+        maybe_record_budget_milestone(saved)
+    except Exception as exc:
+        eprint(f"[budget-milestone] unexpected error: {exc}")
 
     # Write high-water mark so the status line never displays a regression.
     # The file contains "week_start_date weekly_percent" on one line.

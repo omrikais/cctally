@@ -991,6 +991,37 @@ def open_db() -> sqlite3.Connection:
         """
     )
 
+    # ── budget_milestones (equiv-$ budget threshold crossings — issue #19) ──
+    # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / backfill — the
+    # exact posture of `five_hour_milestones` (write-once, forward-only). A
+    # mid-week quota reset re-anchors `week_start_at` (see
+    # `_resolve_current_budget_window`), so the new window naturally gets
+    # fresh rows under UNIQUE(week_start_at, threshold) — no `reset_event_id`
+    # segment column needed (unlike the percent/5h tables). `week_start_at`
+    # stores the effective/re-anchored ISO string from the resolver
+    # (`isoformat(timespec="seconds")`). `alerted_at` is stamped BEFORE the
+    # osascript Popen (set-then-dispatch invariant); NULL = "recorded without
+    # dispatch" (the forward-only-from-set reconcile path) OR "not yet
+    # dispatched", never "delivery failed". Lives BEFORE the migration
+    # dispatcher: a plain CREATE on a framework-untracked table never touches
+    # `schema_migrations`, so the dispatcher's fresh-install snapshot is
+    # unaffected.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS budget_milestones (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            week_start_at   TEXT    NOT NULL,
+            threshold       INTEGER NOT NULL,
+            budget_usd      REAL    NOT NULL,
+            spent_usd       REAL    NOT NULL,
+            consumption_pct REAL    NOT NULL,
+            crossed_at_utc  TEXT    NOT NULL,
+            alerted_at      TEXT,
+            UNIQUE(week_start_at, threshold)
+        )
+        """
+    )
+
     # Migration framework dispatcher. Replaces the prior inline gate stack
     # (has_blocks + _migration_done) with the framework's _run_pending_-
     # migrations entry point. See spec §2.3, §5.2 + the migration handlers

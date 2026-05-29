@@ -192,3 +192,53 @@ def _build_alert_payload_five_hour(
             "primary_model": primary_model,
         },
     }
+
+
+def _alert_text_budget(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, str]:
+    """Build (title, subtitle, body) for an equiv-$ budget threshold alert.
+
+    ``week_start_at`` is an instant, but the budget alert text doesn't render
+    it (the subtitle is the threshold, the body the dollar progress) — so no
+    ``format_display_dt`` call is needed here. ``tz`` is accepted for
+    signature parity with peer ``_alert_text_*`` builders and intentionally
+    unused.
+    """
+    threshold = int(payload["threshold"])
+    title = "cctally - budget"
+    subtitle = f"{threshold}% of budget"
+    ctx = payload.get("context") or {}
+    spent = float(ctx.get("spent_usd") or 0.0)
+    budget = float(ctx.get("budget_usd") or 0.0)
+    consumption = float(ctx.get("consumption_pct") or 0.0)
+    body = f"${spent:,.2f} of ${budget:,.2f} ({consumption:.0f}% of budget)"
+    return title, subtitle, body
+
+
+def _build_alert_payload_budget(
+    *,
+    threshold: int,
+    crossed_at_utc: str,
+    week_start_at: str,
+    budget_usd: float,
+    spent_usd: float,
+    consumption_pct: float,
+) -> dict:
+    """Build the alert payload for an equiv-$ budget threshold crossing.
+
+    See ``_build_alert_payload_weekly`` for the ``alerted_at == crossed_at``
+    rationale (set-then-dispatch invariant). ``axis: "budget"`` is the third
+    alert axis (Task 4 surfaces it in the dashboard Recent-alerts panel).
+    """
+    return {
+        "id": f"budget:{week_start_at}:{threshold}",
+        "axis": "budget",
+        "threshold": int(threshold),
+        "crossed_at": crossed_at_utc,
+        "alerted_at": crossed_at_utc,  # set-then-dispatch
+        "context": {
+            "week_start_at": week_start_at,
+            "budget_usd": float(budget_usd),
+            "spent_usd": float(spent_usd),
+            "consumption_pct": float(consumption_pct),
+        },
+    }
