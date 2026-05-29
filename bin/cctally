@@ -9133,13 +9133,10 @@ def _budget_render_terminal(args, budget_cfg, inputs, status) -> int:
     color = _supports_color_stdout()
     tz_render = getattr(args, "_resolved_tz", None)
 
-    elapsed_days = status.elapsed_fraction * (
-        (inputs.week_end_at - inputs.week_start_at).total_seconds() / 86400.0
-    )
     total_seconds = (inputs.week_end_at - inputs.week_start_at).total_seconds()
+    elapsed_days = status.elapsed_fraction * total_seconds / 86400.0
     remaining_days = max(
-        0.0,
-        (total_seconds - status.elapsed_fraction * total_seconds) / 86400.0,
+        0.0, total_seconds * (1.0 - status.elapsed_fraction) / 86400.0
     )
 
     ws = format_display_dt(inputs.week_start_at, tz_render, fmt="%Y-%m-%d", suffix=False)
@@ -9349,8 +9346,9 @@ def _build_budget_no_budget_snapshot(args):
     now_utc = _command_as_of()
     tz = getattr(args, "_resolved_tz", None)
     if tz is None:
-        # _budget_render_unset reaches this before resolve_display_tz on the
-        # --config path; resolve here defensively so the artifact has a label.
+        # Purely defensive: the sole caller (_budget_render_unset) already
+        # resolves args._resolved_tz before dispatch, so this rarely fires —
+        # resolve here anyway so the artifact always carries a tz label.
         config = _load_claude_config_for_args(args)
         tz = resolve_display_tz(args, config)
     tz_label = _share_display_tz_label(tz)

@@ -51,6 +51,7 @@
     "bin/_lib_view_models.py",
     "bin/cctally",
     "bin/cctally-alerts",
+    "bin/cctally-budget",
     "bin/cctally-dashboard",
     "bin/cctally-dollar-per-percent",
     "bin/cctally-five-hour-blocks",
