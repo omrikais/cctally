@@ -430,8 +430,16 @@ def _is_codex_fallback(model: str) -> bool:
     return model not in CODEX_MODEL_PRICING
 
 
-def _resolve_model_pricing(model: str) -> dict[str, Any] | None:
-    """Look up pricing for a model name. Returns None if unknown."""
+def _resolve_model_pricing(model: str, warn: bool = True) -> dict[str, Any] | None:
+    """Look up pricing for a model name. Returns None if unknown.
+
+    `warn=True` (default) emits a one-shot `[cost] unknown model` stderr warning
+    on a miss — correct for cost computation. Detection-only callers (e.g. the
+    doctor pricing-coverage scan, whose whole job is to find unpriced models)
+    pass `warn=False` so they don't fire the cost-engine warning as a side
+    effect, and don't poison `_unknown_model_warnings` (which would suppress a
+    later genuine cost-path warning for the same model).
+    """
     pricing = CLAUDE_MODEL_PRICING.get(model)
     if pricing is not None:
         return pricing
@@ -441,7 +449,7 @@ def _resolve_model_pricing(model: str) -> dict[str, Any] | None:
             pricing = CLAUDE_MODEL_PRICING.get(stripped)
             if pricing is not None:
                 return pricing
-    if model not in _unknown_model_warnings:
+    if warn and model not in _unknown_model_warnings:
         _unknown_model_warnings.add(model)
         _eprint(f"[cost] unknown model, treating cost as $0: {model}")
     return None

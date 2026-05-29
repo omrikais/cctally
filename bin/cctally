@@ -10812,8 +10812,14 @@ def doctor_gather_state(
     pricing_coverage = None
     try:
         observed = _pricing_observed_models(now_utc)
+        # Detection-only: pass warn=False so finding an unpriced model here does
+        # NOT fire the cost-engine's `[cost] unknown model` stderr warning (this
+        # is a read-only diagnostic, and the warning would also poison the
+        # dedup set, suppressing a later genuine cost-path warning).
         pricing_coverage = classify_coverage(
-            observed, _resolve_model_pricing, _is_codex_fallback,
+            observed,
+            lambda m: _resolve_model_pricing(m, warn=False),
+            _is_codex_fallback,
         )
     except Exception:
         pricing_coverage = None

@@ -394,6 +394,24 @@ def test_doctor_warns_with_seeded_unpriced_model(tmp_path):
     assert c["details"]["unpriced"][0]["token_total"] == 12345
 
 
+def test_doctor_coverage_scan_emits_no_cost_warning_on_stderr(tmp_path):
+    # The read-only coverage scan must DETECT unpriced models without firing the
+    # cost engine's `[cost] unknown model` stderr warning (warn=False path). If
+    # this regresses, the diagnostic spams stderr just by doing its job and
+    # poisons the dedup set. (Goldens discard stderr, so pin it here.)
+    _seed_cache_with_models(
+        tmp_path,
+        claude_models=[("claude-totally-made-up-9000", 12345)],
+        age_days=1,
+    )
+    r = _run_cctally(["doctor", "--json"], home=tmp_path)
+    assert "[cost] unknown model" not in r.stderr, r.stderr
+    # Sanity: the WARN still fired (so the test isn't vacuously passing because
+    # detection silently broke).
+    c = _doctor_check(_json.loads(r.stdout), "pricing.coverage")
+    assert c["severity"] == "warn", c
+
+
 def test_doctor_ok_with_seeded_priced_model(tmp_path):
     # A model cctally DOES price must not trip the WARN.
     priced = next(iter(pricing.CLAUDE_MODEL_PRICING))
