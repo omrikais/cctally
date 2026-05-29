@@ -19,6 +19,21 @@ class CoverageGap:
     token_total: int
 
 
+@dataclasses.dataclass(frozen=True)
+class DriftRow:
+    model: str
+    field: str           # "" for whole-model categories
+    ours: "float | None"
+    theirs: "float | None"
+
+
+@dataclasses.dataclass(frozen=True)
+class DriftResult:
+    value_drift: list          # list[DriftRow]
+    missing_from_us: list      # list[str]
+    ahead_of_litellm: list     # list[str] — informational; never actionable
+
+
 def classify_coverage(observed, resolve_claude, is_codex_fallback) -> list[CoverageGap]:
     """observed: iterable of (provider, model, entry_count, token_total).
 
@@ -57,3 +72,59 @@ def scope_litellm(litellm: dict) -> dict[str, dict]:
         elif provider == "openai" and _is_codex_scope(name):
             scoped[name] = body
     return scoped
+
+
+_DRIFT_EPS = 1e-12  # cost-per-token values are tiny; compare with a small abs epsilon
+
+
+def _allow_index(allowlist):
+    field_suppress = set()   # (model, field)
+    model_suppress = set()   # model (no field -> suppresses missing_from_us)
+    for e in allowlist or []:
+        if e.get("field"):
+            field_suppress.add((e["model"], e["field"]))
+        else:
+            model_suppress.add(e["model"])
+    return field_suppress, model_suppress
+
+
+def diff_pricing(claude_tbl, codex_tbl, litellm_scoped, allowlist=None) -> "DriftResult":
+    """Direction-aware drift between our embedded tables and the scoped LiteLLM
+    snapshot.
+
+    value_drift     — shared model, a cost field differs beyond _DRIFT_EPS
+                      (actionable, unless allowlisted by model+field).
+    missing_from_us — scoped LiteLLM model absent from our tables
+                      (actionable, unless allowlisted by model with no field).
+    ahead_of_litellm — model we price that scoped LiteLLM lacks (informational;
+                      NEVER actionable — we may legitimately lead the source).
+    """
+    field_suppress, model_suppress = _allow_index(allowlist)
+    ours = {**claude_tbl, **codex_tbl}
+    value_drift: list = []
+    missing: list = []
+    ahead: list = []
+
+    for model, body in litellm_scoped.items():
+        if model in ours:
+            for field, theirs in body.items():
+                if not field.endswith("_cost_per_token") and "cost" not in field:
+                    continue
+                if not isinstance(theirs, (int, float)):
+                    continue
+                if (model, field) in field_suppress:
+                    continue
+                mine = ours[model].get(field)
+                if mine is None:
+                    continue  # we don't carry this field; not a value-drift signal
+                if abs(float(mine) - float(theirs)) > _DRIFT_EPS:
+                    value_drift.append(DriftRow(model, field, float(mine), float(theirs)))
+        else:
+            if model not in model_suppress:
+                missing.append(model)
+
+    for model in ours:
+        if model not in litellm_scoped:
+            ahead.append(model)
+
+    return DriftResult(value_drift=value_drift, missing_from_us=missing, ahead_of_litellm=ahead)

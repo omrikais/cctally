@@ -84,3 +84,41 @@ def test_scope_litellm_keeps_only_claude_and_codex_set():
     assert "gpt-4o" not in scoped       # openai but not a codex/gpt-5 model we track
     assert "gemini-2.0" not in scoped
     assert "sample_spec" not in scoped
+
+
+_FIELDS = ("input_cost_per_token", "output_cost_per_token", "cache_read_input_token_cost")
+
+
+def test_diff_pricing_categories_and_allowlist():
+    claude = {
+        "claude-a": {"input_cost_per_token": 1e-6, "output_cost_per_token": 5e-6},  # matches
+        "claude-b": {"input_cost_per_token": 2e-6},                                  # value drift
+        "claude-lead": {"input_cost_per_token": 9e-6},                               # ahead of litellm
+    }
+    codex = {}
+    litellm = {
+        "claude-a": {"input_cost_per_token": 1e-6, "output_cost_per_token": 5e-6},
+        "claude-b": {"input_cost_per_token": 3e-6},        # theirs != ours -> drift
+        "claude-new": {"input_cost_per_token": 7e-6},      # missing from us
+    }
+    res = pc.diff_pricing(claude, codex, litellm, allowlist=[])
+    assert [r.model for r in res.value_drift] == ["claude-b"]
+    drow = res.value_drift[0]
+    assert drow.field == "input_cost_per_token" and drow.ours == 2e-6 and drow.theirs == 3e-6
+    assert res.missing_from_us == ["claude-new"]
+    assert res.ahead_of_litellm == ["claude-lead"]   # informational only
+
+
+def test_diff_pricing_allowlist_suppresses_value_and_missing():
+    claude = {"claude-b": {"input_cost_per_token": 2e-6}}
+    litellm = {
+        "claude-b": {"input_cost_per_token": 3e-6},
+        "claude-new": {"input_cost_per_token": 7e-6},
+    }
+    allow = [
+        {"model": "claude-b", "field": "input_cost_per_token", "reason": "deliberate"},
+        {"model": "claude-new", "reason": "intentionally omitted"},
+    ]
+    res = pc.diff_pricing(claude, {}, litellm, allowlist=allow)
+    assert res.value_drift == []
+    assert res.missing_from_us == []
