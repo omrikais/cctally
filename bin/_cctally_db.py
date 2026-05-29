@@ -1023,6 +1023,9 @@ _BANNER_SUPPRESSED_COMMANDS = frozenset({
     "doctor",          # consolidates migration + update banner state into its
                        # own report; double-printing the banner would duplicate
                        # findings doctor already surfaces structurally.
+    "pricing-check",   # read-only diagnostic emitting structured (often JSON)
+                       # output; banner noise pollutes the report + scripted
+                       # `--json` pipelines. Same posture as doctor.
     "repair-symlinks", # invoked by npm postinstall; no banner during install
     "blocks",          # stdout-formatted table replacing `ccusage blocks`;
                        # stderr noise pollutes the visually-aligned report and

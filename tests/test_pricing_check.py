@@ -433,3 +433,158 @@ def test_doctor_pricing_ignores_out_of_window_models(tmp_path):
     payload = _json.loads(r.stdout)
     c = _doctor_check(payload, "pricing.coverage")
     assert c["severity"] == "ok", c
+
+
+# ==========================================================================
+# Phase C — `cctally pricing-check` subcommand (C1/C2 integration via
+# subprocess; the golden harness `bin/cctally-pricing-check-test` covers the
+# byte-stable JSON, this pins the load-bearing exit-code + degraded contracts).
+# ==========================================================================
+
+
+def test_pricing_check_offline_clean_exit0(tmp_path):
+    # Fresh HOME, no cache: offline coverage is empty -> nothing actionable.
+    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
+    assert r.returncode == 0, r.stderr
+    doc = _json.loads(r.stdout)
+    assert doc["schemaVersion"] == 1
+    assert doc["coverage"] == []
+    assert doc["status"] in ("ok", "degraded")
+    # --offline must not even attempt the network legs.
+    assert doc["existence"]["status"] == "skipped"
+
+
+def test_pricing_check_offline_does_not_mutate_fresh_home(tmp_path):
+    # Read-only contract (spec §5.1/§5.2): a virgin HOME must not create APP_DIR.
+    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
+    assert r.returncode == 0, r.stderr
+    app_dir = tmp_path / ".local" / "share" / "cctally"
+    assert not app_dir.exists(), (
+        f"pricing-check mutated APP_DIR: {sorted(p.name for p in app_dir.rglob('*'))}"
+    )
+
+
+def test_pricing_check_offline_finding_exit1(tmp_path):
+    # Seed an UNPRICED Claude model -> offline coverage gap -> exit 1.
+    _seed_cache_with_models(
+        tmp_path,
+        claude_models=[("claude-totally-made-up-9000", 12345)],
+        age_days=1,
+    )
+    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    doc = _json.loads(r.stdout)
+    assert any(g["kind"] == "unpriced" and g["model"] == "claude-totally-made-up-9000"
+               for g in doc["coverage"]), doc
+
+
+def test_pricing_check_offline_all_history_ignores_window(tmp_path):
+    # The subcommand's coverage is ALL-HISTORY (vs doctor's 30-day). An
+    # unpriced model 45 days old (out of doctor's window) STILL trips it.
+    _seed_cache_with_models(
+        tmp_path,
+        claude_models=[("claude-ancient-unpriced", 777)],
+        age_days=45,
+    )
+    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    doc = _json.loads(r.stdout)
+    assert any(g["model"] == "claude-ancient-unpriced" for g in doc["coverage"]), doc
+
+
+def _write_litellm(tmp_path, body):
+    f = tmp_path / "ll.json"
+    f.write_text(_json.dumps(body))
+    return f
+
+
+def _models_file(tmp_path, ids, name="models.json"):
+    f = tmp_path / name
+    f.write_text(_json.dumps({"data": [{"id": i} for i in ids]}))
+    return f
+
+
+def test_pricing_check_drift_via_injected_litellm_exit1(tmp_path):
+    # Inject a LiteLLM snapshot that diverges from our table on one value.
+    snap = {"claude-3-5-haiku-20241022": {"litellm_provider": "anthropic",
+            "input_cost_per_token": 9.99e-07}}  # embedded is 8e-07
+    f = _write_litellm(tmp_path, snap)
+    env = dict(os.environ, HOME=str(tmp_path), TZ="Etc/UTC",
+               CCTALLY_DISABLE_DEV_AUTODETECT="1",
+               CCTALLY_PRICING_LITELLM_FILE=str(f),
+               # Inject an empty (but valid) /v1/models response so the
+               # existence leg succeeds and only the drift triggers exit 1.
+               CCTALLY_PRICING_MODELS_FILE=str(_models_file(tmp_path, [])))
+    r = subprocess.run([sys.executable, str(_CCTALLY), "pricing-check", "--json"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    doc = _json.loads(r.stdout)
+    assert doc["status"] == "ok"  # both legs succeeded
+    assert any(d["model"] == "claude-3-5-haiku-20241022"
+               and d["field"] == "input_cost_per_token"
+               for d in doc["drift"]["value_drift"]), doc
+
+
+def test_pricing_check_degraded_clean_exit0(tmp_path):
+    # LiteLLM unreachable (bad file) + no finding -> exit 0, status degraded.
+    env = dict(os.environ, HOME=str(tmp_path), TZ="Etc/UTC",
+               CCTALLY_DISABLE_DEV_AUTODETECT="1",
+               CCTALLY_PRICING_LITELLM_FILE="/nonexistent/litellm.json",
+               CCTALLY_PRICING_MODELS_FILE="/nonexistent/models.json")
+    r = subprocess.run([sys.executable, str(_CCTALLY), "pricing-check", "--json"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0, (r.returncode, r.stderr)
+    doc = _json.loads(r.stdout)
+    assert doc["status"] == "degraded"
+    assert "litellm" in doc["degraded_components"]
+    assert "models_api" in doc["degraded_components"]
+    assert doc["drift"]["value_drift"] == []
+    assert doc["coverage"] == []
+
+
+def test_pricing_check_finding_while_degraded_exit1(tmp_path):
+    # PRECEDENCE: a real drift on the LiteLLM leg + the /v1/models leg
+    # degraded -> exit 1 (finding wins) but status stays degraded.
+    snap = {"claude-3-5-haiku-20241022": {"litellm_provider": "anthropic",
+            "input_cost_per_token": 9.99e-07}}
+    f = _write_litellm(tmp_path, snap)
+    env = dict(os.environ, HOME=str(tmp_path), TZ="Etc/UTC",
+               CCTALLY_DISABLE_DEV_AUTODETECT="1",
+               CCTALLY_PRICING_LITELLM_FILE=str(f),
+               CCTALLY_PRICING_MODELS_FILE="/nonexistent")  # forces degraded
+    r = subprocess.run([sys.executable, str(_CCTALLY), "pricing-check", "--json"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 1, (r.returncode, r.stderr)  # finding wins
+    doc = _json.loads(r.stdout)
+    assert doc["status"] == "degraded"  # models_api leg degraded
+    assert "models_api" in doc["degraded_components"]
+    assert any(d["model"] == "claude-3-5-haiku-20241022"
+               for d in doc["drift"]["value_drift"]), doc
+
+
+def test_pricing_check_existence_gap_is_actionable_exit1(tmp_path):
+    # The /v1/models leg surfaces a vendor model we don't price -> actionable.
+    env = dict(os.environ, HOME=str(tmp_path), TZ="Etc/UTC",
+               CCTALLY_DISABLE_DEV_AUTODETECT="1",
+               # LiteLLM clean (empty scoped set -> no drift).
+               CCTALLY_PRICING_LITELLM_FILE=str(_write_litellm(tmp_path, {})),
+               CCTALLY_PRICING_MODELS_FILE=str(
+                   _models_file(tmp_path, ["claude-brand-new-vendor-model"])))
+    r = subprocess.run([sys.executable, str(_CCTALLY), "pricing-check", "--json"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    doc = _json.loads(r.stdout)
+    assert doc["status"] == "ok"
+    assert "claude-brand-new-vendor-model" in doc["existence"]["unpriced_vendor_models"]
+
+
+def test_pricing_check_human_render_runs(tmp_path):
+    # Non-JSON render must not crash and must mention pricing.
+    r = _run_cctally(["pricing-check", "--offline"], home=tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "pricing" in r.stdout.lower()
+
+
+def test_pricing_check_bad_arg_exit2(tmp_path):
+    r = _run_cctally(["pricing-check", "--bogus-flag"], home=tmp_path)
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
