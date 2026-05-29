@@ -28,6 +28,8 @@ Data
   ✓ Codex cache              1 entries; last sync 60s ago
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
+Pricing
+  ✓ Coverage                 all observed models priced
 Safety
   ✓ Dashboard bind           config: loopback
   ✓ config.json              absent or parses cleanly
@@ -36,4 +38,4 @@ Safety
   ✓ update-suppress.json     parses cleanly
   ✓ Update available         no
 
-Summary: 17 OK · 6 WARN · 0 FAIL
+Summary: 18 OK · 6 WARN · 0 FAIL

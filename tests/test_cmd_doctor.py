@@ -36,7 +36,7 @@ def test_doctor_json_mode_valid_schema(tmp_path):
     payload = json.loads(r.stdout)
     assert payload["schema_version"] == 1
     assert {c["id"] for c in payload["categories"]} == {
-        "install", "hooks", "auth", "db", "data", "safety"
+        "install", "hooks", "auth", "db", "data", "pricing", "safety"
     }
 
 

@@ -18,8 +18,9 @@ Database
 Data
   ⚠ Latest snapshot          1800s ago
       → Recent but not current. Check Claude Code session is active.
+Pricing
 Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
 
-Summary: 15 OK · 8 WARN · 0 FAIL
+Summary: 16 OK · 8 WARN · 0 FAIL

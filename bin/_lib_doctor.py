@@ -130,6 +130,16 @@ class DoctorState:
     cctally_reachable_on_path: Optional[bool] = None
     symlinks_path_pinned: bool = False
     install_is_brew: bool = False
+    # Pricing coverage (spec §5.1): the list[CoverageGap] of unpriced (Claude
+    # $0) / fallback (Codex gpt-5) models observed in the trailing 30-day
+    # window, populated by `doctor_gather_state` via `_pricing_observed_models`
+    # + `classify_coverage`. None means the cache could not be read (or the
+    # classification raised) — the check degrades to OK ("no cached usage to
+    # assess"), consistent with the kernel's degradation posture. Each element
+    # is a `_lib_pricing_check.CoverageGap` (provider/model/kind/entry_count/
+    # token_total); the kernel only reads `.kind`/`.model`/`.entry_count`/
+    # `.token_total`, so any duck-typed equivalent works for tests.
+    pricing_coverage: Optional[list] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -761,6 +771,67 @@ def _check_data_post_credit_milestones(s: DoctorState) -> CheckResult:
     )
 
 
+def _check_pricing_coverage(s: DoctorState) -> CheckResult:
+    """WARN when recent (30-day) session data contains a model cctally cannot
+    price exactly (spec §5.1).
+
+    Two gap kinds (classified upstream in `_lib_pricing_check.classify_coverage`,
+    populated by `doctor_gather_state`):
+      * ``unpriced`` — a Claude model `_resolve_model_pricing` returns None for;
+        it silently contributes $0 (the serious undercount failure mode).
+      * ``fallback`` — a Codex model approximated via `gpt-5` pricing.
+
+    ``s.pricing_coverage is None`` means the cache could not be read (or the
+    classification raised) → OK ("no cached usage to assess"), matching the
+    rest of the kernel's degradation posture. An empty list → OK. Any gap →
+    WARN (a data-quality signal, deliberately NOT FAIL — doctor FAIL exits 2;
+    consistent with the other WARN-family Data checks).
+
+    ``details`` is a structured dict (sibling-check convention): two lists of
+    ``{model, entry_count, token_total}`` keyed by gap kind, so a `--json`
+    consumer can machine-read each gap. The human summary + remediation point
+    at `cctally pricing-check` and the pricing tables.
+    """
+    gaps = s.pricing_coverage
+    if not gaps:
+        return CheckResult(
+            id="pricing.coverage", title="Coverage",
+            severity="ok",
+            summary="all observed models priced",
+            remediation=None,
+            details={"unpriced": [], "fallback": []},
+        )
+
+    def _row(g) -> dict:
+        return {
+            "model": g.model,
+            "entry_count": g.entry_count,
+            "token_total": g.token_total,
+        }
+
+    unpriced = [_row(g) for g in gaps if g.kind == "unpriced"]
+    fallback = [_row(g) for g in gaps if g.kind == "fallback"]
+
+    parts: list[str] = []
+    if unpriced:
+        parts.append(f"{len(unpriced)} unpriced (Claude $0)")
+    if fallback:
+        parts.append(f"{len(fallback)} fallback (Codex gpt-5)")
+    # Defensive: a gap whose kind is neither (shouldn't happen) still WARNs.
+    summary = "; ".join(parts) if parts else f"{len(gaps)} coverage gaps"
+
+    return CheckResult(
+        id="pricing.coverage", title="Coverage",
+        severity="warn",
+        summary=summary,
+        remediation=(
+            "Run `cctally pricing-check`, then update CLAUDE_MODEL_PRICING / "
+            "CODEX_MODEL_PRICING in bin/_lib_pricing.py"
+        ),
+        details={"unpriced": unpriced, "fallback": fallback},
+    )
+
+
 _LOOPBACK_HOSTS = frozenset({"loopback", "127.0.0.1", "::1", "localhost"})
 
 
@@ -990,6 +1061,9 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("data.codex_cache", "_check_data_codex_cache"),
         ("data.forked_buckets", "_check_data_forked_buckets"),
         ("data.post_credit_milestones", "_check_data_post_credit_milestones"),
+    )),
+    ("pricing", "Pricing", (
+        ("pricing.coverage", "_check_pricing_coverage"),
     )),
     ("safety", "Safety", (
         ("safety.dashboard_bind", "_check_safety_dashboard_bind"),

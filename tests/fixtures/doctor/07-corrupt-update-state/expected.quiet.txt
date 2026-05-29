@@ -16,8 +16,9 @@ Database
   ⚠ Pending migrations       11 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
+Pricing
 Safety
   ✗ update-state.json        unreadable: UpdateError: update-state.json is not valid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
       → `rm ~/.local/share/cctally/update-state.json` (will be regenerated)
 
-Summary: 16 OK · 6 WARN · 1 FAIL
+Summary: 17 OK · 6 WARN · 1 FAIL

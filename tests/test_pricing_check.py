@@ -302,3 +302,67 @@ def test_pricing_observed_models_no_mutation_on_fresh_home(tmp_path):
     assert not app_dir.exists(), (
         f"doctor mutated APP_DIR: {sorted(p.name for p in app_dir.rglob('*'))}"
     )
+
+
+doctor = _load("_lib_doctor")
+
+
+def _mk_state(**over):
+    import dataclasses as dc
+    # Minimal DoctorState: every field None (with the handful of
+    # non-Optional bools defaulted False), then override.
+    fields = {}
+    for f in dc.fields(doctor.DoctorState):
+        if f.default is not dc.MISSING or f.default_factory is not dc.MISSING:  # type: ignore[attr-defined]
+            continue  # has a default — let the dataclass supply it
+        fields[f.name] = None
+    fields["claude_jsonl_present"] = False
+    fields["codex_jsonl_present"] = False
+    fields["dashboard_bind_stored"] = "loopback"
+    fields["dev_mode"] = False
+    fields["app_dir"] = "/tmp/cctally"
+    fields["now_utc"] = dt.datetime(2026, 5, 29, tzinfo=dt.timezone.utc)
+    fields["cctally_version"] = "test"
+    fields.update(over)
+    return doctor.DoctorState(**fields)
+
+
+def test_check_pricing_coverage_warns_on_unpriced_claude():
+    gaps = [pc.CoverageGap("claude", "claude-mystery", "unpriced", 3, 5000)]
+    res = doctor._check_pricing_coverage(_mk_state(pricing_coverage=gaps))
+    assert res.severity == "warn"
+    assert res.id == "pricing.coverage"
+    # details is a structured dict (sibling-check convention), not a string.
+    assert isinstance(res.details, dict)
+    assert "claude-mystery" in [g["model"] for g in res.details["unpriced"]]
+    assert res.details["unpriced"][0]["entry_count"] == 3
+    assert res.details["unpriced"][0]["token_total"] == 5000
+    # The human-facing summary still names the gap kind.
+    assert "unpriced" in res.summary
+
+
+def test_check_pricing_coverage_warns_on_codex_fallback():
+    gaps = [pc.CoverageGap("codex", "gpt-7-new", "fallback", 2, 900)]
+    res = doctor._check_pricing_coverage(_mk_state(pricing_coverage=gaps))
+    assert res.severity == "warn"
+    assert "gpt-7-new" in [g["model"] for g in res.details["fallback"]]
+    assert "fallback" in res.summary
+
+
+def test_check_pricing_coverage_ok_when_empty():
+    res = doctor._check_pricing_coverage(_mk_state(pricing_coverage=[]))
+    assert res.severity == "ok"
+
+
+def test_check_pricing_coverage_ok_when_none():  # cache absent / unreadable
+    res = doctor._check_pricing_coverage(_mk_state(pricing_coverage=None))
+    assert res.severity == "ok"
+
+
+def test_pricing_category_registered():
+    # Adding the category must surface "pricing" in every doctor report.
+    cat_ids = {c[0] for c in doctor._CATEGORY_DEFINITIONS}
+    assert "pricing" in cat_ids
+    pricing_cat = next(c for c in doctor._CATEGORY_DEFINITIONS if c[0] == "pricing")
+    check_ids = {cid for cid, _fn in pricing_cat[2]}
+    assert "pricing.coverage" in check_ids

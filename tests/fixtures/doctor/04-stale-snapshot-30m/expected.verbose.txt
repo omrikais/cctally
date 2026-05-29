@@ -72,6 +72,11 @@ Data
   ✓ Post-credit milestones   no credited weeks
       details:
         credited_weeks: 0
+Pricing
+  ✓ Coverage                 all observed models priced
+      details:
+        unpriced: []
+        fallback: []
 Safety
   ✓ Dashboard bind           config: loopback
       details:
@@ -89,4 +94,4 @@ Safety
         current_version: None
         latest_version: None
 
-Summary: 15 OK · 8 WARN · 0 FAIL
+Summary: 16 OK · 8 WARN · 0 FAIL

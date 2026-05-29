@@ -302,6 +302,23 @@
             "checks": [
                 {
                     "details": {
+                        "fallback": [],
+                        "unpriced": []
+                    },
+                    "id": "pricing.coverage",
+                    "severity": "ok",
+                    "summary": "all observed models priced",
+                    "title": "Coverage"
+                }
+            ],
+            "id": "pricing",
+            "severity": "ok",
+            "title": "Pricing"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
                         "config": "loopback",
                         "runtime_bind": null
                     },
@@ -358,7 +375,7 @@
     "overall": {
         "counts": {
             "fail": 1,
-            "ok": 16,
+            "ok": 17,
             "warn": 6
         },
         "severity": "fail"

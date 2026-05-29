@@ -24,8 +24,9 @@ Database
 Data
   ✗ Latest snapshot          7200s ago
       → No snapshot in >1h. Hooks may be broken — check `cctally setup --status`.
+Pricing
 Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
 
-Summary: 12 OK · 8 WARN · 3 FAIL
+Summary: 13 OK · 8 WARN · 3 FAIL
