@@ -304,10 +304,18 @@ post_tries=0
 matched_new_tz=0
 final_count=$seed_count
 while [ $post_tries -lt 25 ]; do
-    final_count=$( { grep -c 'event: update' "$sse_log" 2>/dev/null || true; } | head -1)
-    final_count="${final_count:-0}"
     if grep -q '"resolved_tz": "Asia/Jerusalem"' "$sse_log" 2>/dev/null; then
         matched_new_tz=1
+        # Sample the frame count AFTER the broadcast's data line is observed.
+        # SSE serializes `event: update` before its `data:` payload, so once
+        # the new resolved_tz is present, the matched frame's `event: update`
+        # line is guaranteed counted. Sampling at the top of the loop (before
+        # this content check) raced the incremental SSE write and could read a
+        # stale pre-broadcast count even though the data line had landed
+        # (gotcha: count-based SSE polling — drive off content, not frame
+        # count). Flaked under parallel test-all load; never under isolation.
+        final_count=$( { grep -c 'event: update' "$sse_log" 2>/dev/null || true; } | head -1)
+        final_count="${final_count:-0}"
         break
     fi
     sleep 0.1
