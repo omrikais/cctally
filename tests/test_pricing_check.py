@@ -1,6 +1,8 @@
 import importlib.util, pathlib, sys
 import datetime as dt
 
+import pytest
+
 _BIN = pathlib.Path(__file__).resolve().parents[1] / "bin"
 
 
@@ -161,3 +163,13 @@ def test_check_table_shapes_provider_specific_and_sentinel_aware():
     codex_neg = {"gpt-5": {"input_cost_per_token": -1e-6,
                  "cache_read_input_token_cost": 1e-7, "output_cost_per_token": 1e-5}}
     assert pc.check_table_shapes({}, codex_neg, zero_sentinels=set()) != []
+
+
+@pytest.mark.parametrize("drift,open_,expected", [
+    (True, False, "create"),
+    (True, True, "update"),
+    (False, True, "close"),
+    (False, False, "noop"),
+])
+def test_pricing_issue_action(drift, open_, expected):
+    assert pc.pricing_issue_action(drift, open_) == expected
