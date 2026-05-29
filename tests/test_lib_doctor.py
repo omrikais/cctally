@@ -34,6 +34,8 @@ def test_doctor_state_has_required_fields():
         # Issue #119: availability-aware install checks.
         "cctally_reachable_on_path", "symlinks_path_pinned",
         "install_is_brew",
+        # Pricing-freshness check (spec 2026-05-29).
+        "pricing_coverage",
     }
     assert fields == expected, fields ^ expected
 
@@ -779,10 +781,10 @@ def test_safety_update_available_details_omit_suppressed_when_irrelevant():
     assert "suppression_reason" not in r.details
 
 
-def test_run_checks_returns_six_categories():
+def test_run_checks_returns_all_categories():
     rep = L.run_checks(_state())
     assert {c.id for c in rep.categories} == {
-        "install", "hooks", "auth", "db", "data", "safety"
+        "install", "hooks", "auth", "db", "data", "pricing", "safety"
     }
 
 
@@ -856,7 +858,7 @@ def test_serialize_json_top_level_shape():
     assert payload["generated_at"].endswith("Z")
     assert payload["cctally_version"] == "1.6.3"
     cat_ids = [c["id"] for c in payload["categories"]]
-    assert cat_ids == ["install", "hooks", "auth", "db", "data", "safety"]
+    assert cat_ids == ["install", "hooks", "auth", "db", "data", "pricing", "safety"]
 
 
 def test_serialize_json_remediation_only_when_not_ok():
