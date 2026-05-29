@@ -697,6 +697,73 @@ assert_eq "update.check.* --json (get-all) nested shape" "False,168" "$shape"
 
 rm -rf "$home"
 
+# ---------------------------------------------------------------------------
+# budget.* config keys (spec 2026-05-29 Task 1). Validates set/get/unset for
+# weekly_usd / alerts_enabled / alert_thresholds: round-trip, rejection of
+# bad values (no partial write), threshold sort/dedup, sibling-preservation
+# on unset, and validator-rejection when reading drives a write.
+# ---------------------------------------------------------------------------
+
+# 34. budget.weekly_usd set/get round-trip (float-coerced)
+home=$(mktemp -d)
+HOME="$home" TZ=Etc/UTC "$BIN" config set budget.weekly_usd 300 >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get budget.weekly_usd)
+assert_eq "budget.weekly_usd round-trip" "budget.weekly_usd=300.0" "$out"
+
+# 35. budget.weekly_usd <= 0 rejected (exit 2, config unchanged)
+before=$(cat "$home/.local/share/cctally/config.json")
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set budget.weekly_usd -5 2>&1 >/dev/null)
+ec=$?
+after=$(cat "$home/.local/share/cctally/config.json")
+assert_eq "budget.weekly_usd negative exit" "2" "$ec"
+assert_contains "budget.weekly_usd negative stderr" "> 0" "$err"
+assert_eq "budget.weekly_usd negative no write" "$before" "$after"
+
+# 36. non-numeric budget.weekly_usd rejected
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set budget.weekly_usd abc 2>&1 >/dev/null)
+ec=$?
+assert_eq "budget.weekly_usd non-numeric exit" "2" "$ec"
+assert_contains "budget.weekly_usd non-numeric stderr" "must be a number or null" "$err"
+
+# 37. budget.alert_thresholds out-of-range (150 > 100) rejected
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set budget.alert_thresholds 90,150 2>&1 >/dev/null)
+ec=$?
+assert_eq "budget.alert_thresholds out-of-range exit" "2" "$ec"
+assert_contains "budget.alert_thresholds out-of-range stderr" "in [1, 100]" "$err"
+
+# 38. budget.alert_thresholds sort + dedup on set
+HOME="$home" TZ=Etc/UTC "$BIN" config set budget.alert_thresholds 100,90,90 >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get budget.alert_thresholds)
+assert_eq "budget.alert_thresholds sort/dedup" "budget.alert_thresholds=[90, 100]" "$out"
+
+# 39. budget.alerts_enabled boolean set/get
+HOME="$home" TZ=Etc/UTC "$BIN" config set budget.alerts_enabled false >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get budget.alerts_enabled)
+assert_eq "budget.alerts_enabled false" "budget.alerts_enabled=false" "$out"
+
+# 40. unset budget.weekly_usd preserves sibling alert_thresholds
+HOME="$home" TZ=Etc/UTC "$BIN" config unset budget.weekly_usd >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get budget.alert_thresholds)
+assert_eq "budget unset preserves thresholds" "budget.alert_thresholds=[90, 100]" "$out"
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get budget.weekly_usd)
+assert_eq "budget unset clears weekly_usd" "budget.weekly_usd=" "$out"
+rm -rf "$home"
+
+# 41. invalid stored budget block: a write that re-validates the block exits 2
+home=$(mktemp -d)
+mkdir -p "$home/.local/share/cctally"
+cat > "$home/.local/share/cctally/config.json" <<'JSON'
+{"budget": "bad"}
+JSON
+before=$(cat "$home/.local/share/cctally/config.json")
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set budget.weekly_usd 300 2>&1 >/dev/null)
+ec=$?
+after=$(cat "$home/.local/share/cctally/config.json")
+assert_eq "invalid budget block set exit" "2" "$ec"
+assert_contains "invalid budget block stderr" "budget must be an object" "$err"
+assert_eq "invalid budget block no partial write" "$before" "$after"
+rm -rf "$home"
+
 echo
 echo "passed: $pass_count   failed: $fail_count"
 [ $fail_count -eq 0 ]

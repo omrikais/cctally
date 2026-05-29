@@ -505,6 +505,83 @@ def _get_alerts_config(cfg: "dict | None") -> dict:
     }
 
 
+# === Budget validation cluster ======================================
+
+
+class _BudgetConfigError(ValueError):
+    """Raised by _get_budget_config on an invalid budget block."""
+
+
+_BUDGET_DEFAULTS = {
+    "weekly_usd": None,            # None = no budget (default)
+    "alerts_enabled": True,        # "on when set"
+    "alert_thresholds": [90, 100],
+}
+_BUDGET_CONFIG_VALID_KEYS = {"weekly_usd", "alerts_enabled", "alert_thresholds"}
+
+
+def _get_budget_config(cfg: dict) -> dict:
+    """Return the validated, defaults-filled budget block.
+
+    Raises _BudgetConfigError on invalid values. Unknown sub-keys are ignored
+    (forward compatibility). Mirrors _get_alerts_config / _get_oauth_usage_config.
+    """
+    import math
+
+    out = dict(_BUDGET_DEFAULTS)
+    out["alert_thresholds"] = list(_BUDGET_DEFAULTS["alert_thresholds"])
+    block = cfg.get("budget") if isinstance(cfg, dict) else None
+    if block is None:
+        return out
+    if not isinstance(block, dict):
+        raise _BudgetConfigError(
+            f"budget must be an object, got {type(block).__name__}"
+        )
+
+    if "weekly_usd" in block:
+        v = block["weekly_usd"]
+        if v is None:
+            out["weekly_usd"] = None
+        elif isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise _BudgetConfigError("budget.weekly_usd must be a number or null")
+        elif not math.isfinite(float(v)) or float(v) <= 0:
+            raise _BudgetConfigError("budget.weekly_usd must be a finite number > 0")
+        else:
+            out["weekly_usd"] = float(v)
+
+    if "alerts_enabled" in block:
+        v = block["alerts_enabled"]
+        if not isinstance(v, bool):
+            raise _BudgetConfigError("budget.alerts_enabled must be a boolean")
+        out["alerts_enabled"] = v
+
+    if "alert_thresholds" in block:
+        v = block["alert_thresholds"]
+        if not isinstance(v, list):
+            raise _BudgetConfigError("budget.alert_thresholds must be a list of ints")
+        cleaned = []
+        for t in v:
+            if isinstance(t, bool) or not isinstance(t, int):
+                raise _BudgetConfigError(
+                    "budget.alert_thresholds entries must be integers"
+                )
+            if t < 1 or t > 100:
+                raise _BudgetConfigError(
+                    "budget.alert_thresholds entries must be in [1, 100]"
+                )
+            cleaned.append(t)
+        out["alert_thresholds"] = sorted(set(cleaned))  # empty list allowed (silenced)
+
+    return out
+
+
+def _budget_alerts_active(budget_cfg: dict) -> bool:
+    """True iff a budget is set AND alerts are enabled."""
+    return budget_cfg.get("weekly_usd") is not None and bool(
+        budget_cfg.get("alerts_enabled")
+    )
+
+
 # === DB primitive ===================================================
 
 

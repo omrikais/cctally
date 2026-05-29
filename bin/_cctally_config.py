@@ -73,6 +73,8 @@ from _cctally_core import (
     DEFAULT_WEEK_START,
     _get_alerts_config,
     _AlertsConfigError,
+    _get_budget_config,
+    _BudgetConfigError,
 )
 from _lib_display_tz import normalize_display_tz_value
 
@@ -301,6 +303,9 @@ ALLOWED_CONFIG_KEYS = (
     "statusline.visual_burn_rate",
     "statusline.cost_source",
     "statusline.cctally_extensions",
+    "budget.weekly_usd",
+    "budget.alerts_enabled",
+    "budget.alert_thresholds",
 )
 
 
@@ -463,6 +468,25 @@ def _config_known_value(config: dict, key: str) -> "object":
         except ValueError:
             # Hand-edited junk: surface the default — mirrors dashboard.bind.
             return defaults[inner]
+    if key in (
+        "budget.weekly_usd",
+        "budget.alerts_enabled",
+        "budget.alert_thresholds",
+    ):
+        inner = key.split(".", 1)[1]
+        # Read the validated, defaults-filled block. A corrupt block falls
+        # back to the canonical default leaf (mirrors alerts.enabled /
+        # dashboard.bind, which surface the default on a hand-edited junk
+        # block rather than erroring out of a plain `config get`).
+        try:
+            return _get_budget_config(config)[inner]
+        except _BudgetConfigError:
+            from _cctally_core import _BUDGET_DEFAULTS
+
+            default = _BUDGET_DEFAULTS[inner]
+            if isinstance(default, list):
+                return list(default)
+            return default
     return None
 
 
@@ -683,6 +707,85 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                 rendered = str(normalized)
             print(f"{key}={rendered}")
         return 0
+    if key in (
+        "budget.weekly_usd",
+        "budget.alerts_enabled",
+        "budget.alert_thresholds",
+    ):
+        inner_key = key.split(".", 1)[1]
+        # Parse + normalize the raw value per key BEFORE acquiring the lock so
+        # rejection short-circuits. The whole merged block is re-validated via
+        # _get_budget_config under the lock so we never persist a config that
+        # fails subsequent reads. _load_config_unlocked is mandatory inside the
+        # writer lock (load_config would self-deadlock on the same fcntl fd).
+        if inner_key == "weekly_usd":
+            if raw.strip().lower() in {"null", "none", ""}:
+                new_val: object = None
+            else:
+                try:
+                    new_val = float(raw)
+                except ValueError:
+                    eprint(
+                        "cctally config: budget.weekly_usd must be a number or "
+                        f"null, got {raw!r}"
+                    )
+                    return 2
+        elif inner_key == "alerts_enabled":
+            lo = raw.strip().lower()
+            if lo in ("true", "yes", "on", "1"):
+                new_val = True
+            elif lo in ("false", "no", "off", "0"):
+                new_val = False
+            else:
+                eprint(
+                    "cctally config: budget.alerts_enabled must be a boolean, "
+                    f"got {raw!r}"
+                )
+                return 2
+        else:  # alert_thresholds — comma-separated int list (empty = silenced)
+            stripped = raw.strip()
+            parsed: "list[int]" = []
+            if stripped:
+                for part in stripped.split(","):
+                    tok = part.strip()
+                    try:
+                        parsed.append(int(tok))
+                    except ValueError:
+                        eprint(
+                            "cctally config: budget.alert_thresholds must be a "
+                            f"comma-separated list of integers, got {raw!r}"
+                        )
+                        return 2
+            new_val = parsed
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing = config.get("budget")
+            if existing is not None and not isinstance(existing, dict):
+                eprint("cctally config: budget must be an object")
+                return 2
+            block = dict(existing or {})
+            block[inner_key] = new_val
+            config["budget"] = block
+            try:
+                validated = _get_budget_config(config)
+            except _BudgetConfigError as exc:
+                eprint(f"cctally config: {exc}")
+                return 2
+            # Persist the canonicalized leaf (e.g. sorted/deduped thresholds,
+            # float-coerced weekly_usd) so config.json matches what reads apply.
+            block[inner_key] = validated[inner_key]
+            config["budget"] = block
+            save_config(config)
+        out_val = validated[inner_key]
+        if getattr(args, "emit_json", False):
+            print(json.dumps({"budget": {inner_key: out_val}}, indent=2))
+        else:
+            if isinstance(out_val, bool):
+                rendered = "true" if out_val else "false"
+            else:
+                rendered = str(out_val)
+            print(f"{key}={rendered}")
+        return 0
     return 2  # unreachable given the gate above
 
 
@@ -768,6 +871,26 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                     if not update_block:
                         config.pop("update", None)
                     save_config(config)
+            # idempotent: silent on missing key
+        return 0
+    if key in (
+        "budget.weekly_usd",
+        "budget.alerts_enabled",
+        "budget.alert_thresholds",
+    ):
+        # Drop only the named leaf; preserve sibling budget.* keys (e.g.
+        # unsetting weekly_usd keeps a customized alert_thresholds). If the
+        # `budget` block ends up empty, drop the parent so config.json stays
+        # tidy. Mirrors the alerts.enabled / dashboard.bind unset branches.
+        inner_key = key.split(".", 1)[1]
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            block = config.get("budget")
+            if isinstance(block, dict) and inner_key in block:
+                del block[inner_key]
+                if not block:
+                    config.pop("budget", None)
+                save_config(config)
             # idempotent: silent on missing key
         return 0
     return 2  # unreachable given the gate above

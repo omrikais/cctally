@@ -204,6 +204,11 @@ _AlertsConfigError = _cctally_core._AlertsConfigError
 _ALERTS_CONFIG_VALID_KEYS = _cctally_core._ALERTS_CONFIG_VALID_KEYS
 _validate_threshold_list = _cctally_core._validate_threshold_list
 _get_alerts_config = _cctally_core._get_alerts_config
+_BudgetConfigError = _cctally_core._BudgetConfigError
+_BUDGET_DEFAULTS = _cctally_core._BUDGET_DEFAULTS
+_BUDGET_CONFIG_VALID_KEYS = _cctally_core._BUDGET_CONFIG_VALID_KEYS
+_get_budget_config = _cctally_core._get_budget_config
+_budget_alerts_active = _cctally_core._budget_alerts_active
 open_db = _cctally_core.open_db
 WeekRef = _cctally_core.WeekRef
 _canonicalize_optional_iso = _cctally_core._canonicalize_optional_iso
@@ -293,6 +298,16 @@ PRICING_SNAPSHOT_DATE = _lib_pricing.PRICING_SNAPSHOT_DATE
 PRICING_STALENESS_DAYS = _lib_pricing.PRICING_STALENESS_DAYS
 PRICING_DRIFT_ALLOWLIST = _lib_pricing.PRICING_DRIFT_ALLOWLIST
 LITELLM_PRICES_URL = _lib_pricing.LITELLM_PRICES_URL
+
+# Budget kernel (spec 2026-05-29): pure-fn kernel re-exported here like the
+# other _lib_* kernels. `project_linear` is the shared projection primitive
+# (forecast routes its EOW % projection through it too — spec F1). The I/O
+# glue (spend gather, the `budget` subcommand) lives in bin/cctally.
+_lib_budget = _load_sibling("_lib_budget")
+BudgetInputs = _lib_budget.BudgetInputs
+BudgetStatus = _lib_budget.BudgetStatus
+compute_budget_status = _lib_budget.compute_budget_status
+project_linear = _lib_budget.project_linear
 
 # Per-model context window (used by `cctally statusline` segment 4).
 # Keep in sync with Anthropic's docs:
@@ -7870,15 +7885,17 @@ def _compute_forecast(inputs: ForecastInputs, targets: list[int]) -> ForecastOut
     else:
         r_recent = None
 
-    # Projected final %
+    # Projected final % — routed through the shared project_linear primitive
+    # (spec F1). r_recent is None ⇒ collapse to the average projection.
     if r_recent is None:
-        p_final_avg = inputs.p_now + r_avg * inputs.remaining_hours
-        final_low = final_high = p_final_avg
+        final_low, final_high = project_linear(
+            inputs.p_now, inputs.remaining_hours, r_avg, r_avg
+        )
     else:
-        p_final_avg = inputs.p_now + r_avg * inputs.remaining_hours
-        p_final_recent = inputs.p_now + r_recent * inputs.remaining_hours
-        final_low = min(p_final_avg, p_final_recent)
-        final_high = max(p_final_avg, p_final_recent)
+        a, b = project_linear(
+            inputs.p_now, inputs.remaining_hours, r_avg, r_recent
+        )
+        final_low, final_high = min(a, b), max(a, b)
 
     already_capped = inputs.p_now >= 100.0
     projected_cap = already_capped or final_high >= 100.0
