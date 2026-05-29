@@ -40,7 +40,13 @@ ISSUE_TITLE = "Pricing drift: embedded tables diverge from LiteLLM"
 
 
 def _drift_present(payload: dict) -> bool:
-    """True iff the payload carries an actionable LiteLLM-drift finding."""
+    """True iff the payload carries an actionable LiteLLM-drift finding.
+
+    Deliberately ignores `existence.unpriced_vendor_models`: the cron has no
+    OAuth, so the `/v1/models` existence leg always auto-degrades and reports
+    nothing here. If CI is ever granted an OAuth bearer, revisit this — an
+    existence-only finding would otherwise go un-tracked by the drift issue.
+    """
     drift = payload.get("drift") or {}
     return bool(drift.get("value_drift")) or bool(drift.get("missing_from_us"))
 
@@ -190,6 +196,15 @@ def _act(action: str, payload: dict, issue_number: int | None, *, dry_run: bool)
 
     if action == "create":
         body = _build_body(payload)
+        # Ensure the label exists first — `gh issue create --label X` hard-fails
+        # if X is absent, and `pricing-drift` is a machine-owned label that
+        # nothing else creates. `--force` upserts (no-op if it already exists),
+        # so this is idempotent across every run.
+        _run_gh([
+            "label", "create", ISSUE_LABEL, "--force",
+            "--description", "Embedded pricing diverged from LiteLLM",
+            "--color", "D93F0B",
+        ])
         _run_gh([
             "issue", "create",
             "--title", ISSUE_TITLE,
