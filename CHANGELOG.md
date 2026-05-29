@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Documentation
+- Clarified why `cctally codex <cmd>` (`daily`/`monthly`/`weekly`/`session`) reports lower token totals and cost than upstream `ccusage-codex` on older sessions — and that **cctally, not `ccusage-codex`, is the accurate one.** Older Codex CLI versions re-emit duplicate `event_msg.token_count` records (identical `last_token_usage` while the cumulative `info.total_token_usage.total_tokens` ledger stays flat); `ccusage-codex` sums every emission (up to ~2× overcount on the oldest sessions) while cctally dedups by only counting events whose cumulative advances, exactly reconstructing the Codex CLI's own authoritative total. Recent sessions don't re-emit and match upstream byte-for-byte, so a per-month comparison trends from ~0.5× on old months toward ~1.0× on recent ones. The canonical divergence note in `docs/commands/codex-daily.md` now states which tool is correct and how to verify it per session, with a discoverability pointer added to the `codex` subgroup overview (`docs/commands/codex.md`). This reconciliation is now locked by a new `bin/cctally-reconcile-test` invariant `codex_dedup_eq_codex_ground_truth`: it asserts `codex-daily`'s reported `totalTokens` equals the sum of each fixture session's final `total_token_usage.total_tokens` (an independent raw-JSONL scan that shares no aggregation code with the CLI) and carries a non-vacuity guard requiring the naive all-events sum to strictly exceed the deduped ground truth, so a regression that silently disabled the dedup guard would fail the suite.
+
 ## [1.21.3] - 2026-05-29
 
 ### Fixed

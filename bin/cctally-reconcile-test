@@ -479,6 +479,110 @@ reconcile_invariant "codex_session_eq_sum_codex_daily_fast" \
     "codex-daily --speed fast --json" \
     "$INVARIANT_6_PY"
 
+# Invariant 7: Codex token totals reconcile to Codex's OWN ground-truth cumulative
+# counter. cctally dedups re-emitted token_count events (see CLAUDE.md "Intentional
+# divergence from upstream on duplicate token_count events"); the authoritative
+# per-session total is the FINAL info.total_token_usage.total_tokens that Codex
+# itself maintains and does NOT advance on a UI re-emit. Summing that across
+# sessions must equal codex-daily's reported totalTokens.
+#
+# The second path here is NOT another cctally subcommand — it is a raw, independent
+# scan of the fixture JSONL (Σ per-file max total_token_usage.total_tokens), so the
+# two paths share no aggregation code. Non-vacuity guard: the naive sum of ALL
+# last_token_usage.total_tokens (the ccusage-codex method) must STRICTLY EXCEED the
+# deduped ground truth — proving the fixture actually contains re-emitted events, so
+# a regression that disabled the dedup guard (bin/_lib_jsonl.py "cumulative <=
+# last_total_tokens: continue") would report the inflated naive sum and FAIL here.
+# This codifies the manual ground-truth reconciliation that confirmed cctally — not
+# upstream ccusage — matches Codex's internal bookkeeping to the token.
+INVARIANT_7_PY='
+import json, os, glob
+a = json.loads(os.environ["RECONCILE_A"])
+reported_total = (a.get("totals") or {}).get("totalTokens")
+
+ground_truth = 0   # Σ per-session final total_token_usage.total_tokens (Codex truth)
+naive_all = 0      # Σ last_token_usage.total_tokens over EVERY event (ccusage method)
+sessions_dir = os.environ["RECONCILE_SESSIONS_DIR"]
+jsonls = glob.glob(os.path.join(sessions_dir, "**", "*.jsonl"), recursive=True)
+for f in jsonls:
+    file_max = 0
+    for line in open(f, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        p = o.get("payload") if isinstance(o.get("payload"), dict) else {}
+        if p.get("type") != "token_count":
+            continue
+        info = p.get("info")
+        if not isinstance(info, dict):
+            continue
+        ltu = info.get("last_token_usage")
+        if isinstance(ltu, dict):
+            naive_all += int(ltu.get("total_tokens") or 0)
+        ttu = info.get("total_token_usage")
+        if isinstance(ttu, dict) and ttu.get("total_tokens") is not None:
+            file_max = max(file_max, int(ttu.get("total_tokens") or 0))
+    ground_truth += file_max
+
+errs = []
+if not jsonls:
+    errs.append("no fixture JSONL found under RECONCILE_SESSIONS_DIR")
+if reported_total != ground_truth:
+    errs.append(
+        f"codex-daily.totalTokens={reported_total} != Codex ground truth "
+        f"(Sigma final total_token_usage.total_tokens)={ground_truth}"
+    )
+if not (naive_all > ground_truth):
+    errs.append(
+        f"NON-VACUITY VIOLATION: naive all-events sum={naive_all} must exceed "
+        f"deduped ground truth={ground_truth} (fixture has no re-emitted events?)"
+    )
+assert not errs, "; ".join(errs)
+'
+# Custom invariant (command-output vs raw-JSONL ground truth), mirroring the
+# statusline_reconcile precedent below — reconcile_invariant only does
+# command-vs-command, so this one is bespoke but shares the PASS/FAIL format
+# and the pass_count / fail_count counters.
+codex_ground_truth_invariant () {
+    local name="codex_dedup_eq_codex_ground_truth"
+    local fixture_home="$FIXTURES/codex-daily/token-count-dedup"
+    local fixture_label
+    fixture_label=$(basename "$(dirname "$fixture_home")")/$(basename "$fixture_home")
+    local FAKE_HOME="${fixture_home%/}"
+    local AS_OF=""
+    if [ ! -f "$fixture_home/input.env" ]; then
+        echo "RECONCILE FAIL $name $fixture_label: no input.env"
+        fail_count=$((fail_count + 1)); return 1
+    fi
+    # shellcheck disable=SC1091
+    . "$fixture_home/input.env"
+    if [ -z "$AS_OF" ]; then
+        echo "RECONCILE FAIL $name $fixture_label: input.env missing AS_OF"
+        fail_count=$((fail_count + 1)); return 1
+    fi
+    local json_a rc_a
+    json_a=$(HOME="$FAKE_HOME" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+             "$BIN" codex-daily --json 2>/dev/null); rc_a=$?
+    if [ $rc_a -ne 0 ]; then
+        echo "RECONCILE FAIL $name $fixture_label: subcommand exit rc=$rc_a"
+        fail_count=$((fail_count + 1)); return 1
+    fi
+    local result rc_py
+    result=$(RECONCILE_A="$json_a" RECONCILE_SESSIONS_DIR="$FAKE_HOME/.codex/sessions" \
+             python3 -c "$INVARIANT_7_PY" 2>&1); rc_py=$?
+    if [ $rc_py -ne 0 ]; then
+        echo "RECONCILE FAIL $name $fixture_label: $result"
+        fail_count=$((fail_count + 1)); return 1
+    fi
+    echo "PASS $name $fixture_label"
+    pass_count=$((pass_count + 1)); return 0
+}
+codex_ground_truth_invariant
+
 # Speed scalar-multiplier invariants (issue #86 Session D): on a single-model
 # fixture, Σ(--speed fast) == Σ(--speed standard) × per-model multiplier. Two
 # scenarios pin the override (gpt-5.5 → ×2.5) and fallback (gpt-5 → ×2.0)

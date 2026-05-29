@@ -76,6 +76,17 @@ on historical data, but matches the Codex CLI's own authoritative
 counter. Fresh sessions don't re-emit, so new data matches upstream
 byte-exactly. **Don't "fix" this back to upstream parity.**
 
+**Which tool is right? cctally.** Its totals reconstruct the Codex CLI's own
+cumulative `total_token_usage.total_tokens` ledger to the token; `ccusage-codex`
+over-reports by counting each re-emitted event again (up to ~2× on the oldest
+sessions). The divergence is largest on old history and shrinks toward parity on
+recent sessions as the re-emission was fixed in newer Codex releases — so a
+per-month comparison trends from ~0.5× upstream on old months to ~1.0× on recent
+ones. You can confirm it yourself: for any session, cctally's contribution
+equals the final `total_token_usage.total_tokens` in that rollout's JSONL. A
+regression test (the `codex_dedup_eq_codex_ground_truth` reconcile invariant)
+locks cctally's totals to that ledger so the dedup can't silently regress.
+
 ### Token semantics (LiteLLM convention)
 
 In Codex JSONL `last_token_usage`:

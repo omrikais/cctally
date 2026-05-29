@@ -55,6 +55,11 @@ cctally codex weekly
   extension (the standalone `ccusage-codex` binary has no `--speed`). `auto`
   (the default) reads `service_tier` from `~/.codex/config.toml`. See any leaf
   page's "Pricing tier (`--speed`)" section for details.
+- **Totals lower than `ccusage-codex`?** Expected on older sessions, and
+  cctally is the accurate one — older Codex CLI versions re-emit duplicate
+  `token_count` events, which `ccusage-codex` double-counts (up to ~2×) while
+  cctally dedups to match Codex's own ledger. Recent sessions match byte-for-byte.
+  See [codex-daily · duplicate-event divergence](codex-daily.md#notes--diverges-from-upstream-ccusage-codex-on-duplicate-events).
 - Bare `cctally codex` (no subcommand) exits non-zero with a command-required
   error.
 - No runtime deprecation warning is emitted by the flat forms; they are
