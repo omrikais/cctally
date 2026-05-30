@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Internal refactor (no user-facing change): extracted the CLI argument-parser construction and the shareable-output construction out of the `bin/cctally` single-file program into two new stdlib-only sibling modules, `bin/_cctally_parser.py` and `bin/_cctally_share.py` (batch 2 of the ongoing `bin/cctally` split).** This trims the main script by ~4,130 lines (16,246 → 12,112) with no change to any command's behavior, flags, output, or exit codes — every one of the 1,329 harness + pytest checks passes unchanged — and both modules ship in the npm/brew/public packages (promoted to the mirror allowlist). Purely a maintainability / code-organization change; nothing to do on upgrade.
+
 ## [1.22.0] - 2026-05-29
 
 ### Added
