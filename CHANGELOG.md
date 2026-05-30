@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Internal refactor (no user-facing change): extracted the two read-only diagnostics commands — `doctor` (`doctor_gather_state` + `cmd_doctor`) and `pricing-check` (the LiteLLM/Anthropic fetchers + `cmd_pricing_check` + its text renderer) — out of the `bin/cctally` single-file program into two new stdlib-only sibling modules, `bin/_cctally_doctor.py` and `bin/_cctally_pricing_check.py` (continuing the ongoing `bin/cctally` split).** This trims the main script by ~700 lines (11,441 → 10,744) with no change to either command's behavior, flags, output, or exit codes — every `doctor` and `pricing-check` golden test is unchanged and the full harness + pytest suite passes — and both modules ship in the npm/brew/public packages (promoted to the mirror allowlist). Purely a maintainability / code-organization change; nothing to do on upgrade.
+
 ## [1.22.2] - 2026-05-30
 
 ### Changed

@@ -1,0 +1,479 @@
+"""`cctally doctor` subcommand entry point.
+
+I/O gather sibling: holds `doctor_gather_state` (reads install / hooks /
+OAuth / DB / freshness / pricing / safety state) + `cmd_doctor` (thin
+wrapper over the pure `_lib_doctor` kernel).
+
+Honest *name* imports are KERNEL-ONLY (`_cctally_core`). `_lib_changelog`
+is a qualified, eagerly-preloaded library kernel (bin/cctally:419) used
+for `_lib_changelog._read_latest_changelog_version()`. **`_lib_doctor` is
+imported CALL-TIME inside the functions (F1)** — NOT module-top — to
+preserve the live lazy-load and avoid an unconditional ~1,239-line import
+on every startup. Every other sibling-homed symbol (the whole `_setup_*`
+family, `_db_status_for`, the update/refresh/config/pricing helpers, the
+`_pricing_observed_models` seam) is reached via the call-time `_cctally()`
+accessor so monkeypatches through `cctally`'s namespace are preserved —
+see spec §3.1.
+
+bin/cctally re-exports `cmd_doctor` AND `doctor_gather_state` (eager): the
+parser resolves `c.cmd_doctor`, and the dashboard + tests reach
+`sys.modules["cctally"].doctor_gather_state` (patchable binding).
+
+Spec: docs/superpowers/specs/2026-05-30-extract-diagnostics-cmd-design.md
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import pathlib
+import shutil
+import sqlite3
+import sys
+
+import _cctally_core
+import _lib_changelog
+from _cctally_core import _now_utc, eprint, now_utc_iso, parse_iso_datetime
+
+
+def _cctally():
+    """Resolve the current `cctally` module at call-time (spec §3.1)."""
+    return sys.modules["cctally"]
+
+
+def doctor_gather_state(
+    *,
+    now_utc: "dt.datetime | None" = None,
+    runtime_bind: "str | None" = None,
+):
+    """I/O chokepoint for `cctally doctor` (spec §7.2).
+
+    H1 invariant: config.json is read RAW (NOT via load_config), since
+    load_config auto-creates the file on first run — a read-only
+    diagnostic command must never mutate user state.
+    """
+    import _lib_doctor
+
+    c = _cctally()
+    if now_utc is None:
+        now_utc = _now_utc()
+
+    # ── Install ──────────────────────────────────────────────────────
+    repo_root = c._setup_resolve_repo_root()
+    dst_dir = c._setup_local_bin_dir()
+    try:
+        symlink_state = c._setup_compute_symlink_state(repo_root, dst_dir)
+    except Exception:
+        symlink_state = None
+    try:
+        path_includes = c._setup_path_includes_local_bin()
+    except Exception:
+        path_includes = None
+    # Issue #119: availability-aware install checks. Precomputed here (the
+    # I/O layer) so the kernel stays pure — `shutil.which` and the on-disk
+    # legacy-link probe never run in _lib_doctor.
+    #   * cctally_reachable_on_path — channel-agnostic "is the command on
+    #     $PATH at all?" (brew <prefix>/bin, npm prefix, source ~/.local/bin
+    #     all satisfy it). Lets install.path pass without a ~/.local/bin
+    #     membership check.
+    #   * symlinks_path_pinned — true iff cctally runs ONLY through a legacy
+    #     ~/.local/bin link to a retired/foreign install (live retired link
+    #     with no reachable_elsewhere fallback). Mirrors the pinned-only-path
+    #     predicate in _setup_install so doctor + setup agree on the fix.
+    try:
+        cctally_reachable_on_path = shutil.which("cctally") is not None
+    except Exception:
+        cctally_reachable_on_path = None
+    try:
+        symlinks_path_pinned = any(
+            s == "wrong"
+            and (dst_dir / n).is_symlink()
+            and c._setup_symlink_is_retired(dst_dir / n, n, repo_root)
+            and (dst_dir / n).resolve(strict=False).exists()
+            for n, s in (symlink_state or [])
+        )
+    except Exception:
+        symlinks_path_pinned = False
+    # install_is_brew — channel knowledge for the install.path WARN
+    # remediation. Brew kegs own no ~/.local/bin symlinks (#119), so the
+    # ~/.local/bin / `cctally setup` hint is wrong for them; the kernel
+    # can't derive this from repo_root (no I/O), so precompute it here.
+    try:
+        install_is_brew = c._setup_is_brew_install(repo_root)
+    except Exception:
+        install_is_brew = False
+    try:
+        legacy_snippet = c._setup_detect_legacy_snippet()
+    except Exception:
+        legacy_snippet = None
+
+    # ── Hooks ────────────────────────────────────────────────────────
+    try:
+        settings = c._load_claude_settings()
+    except c.SetupError:
+        settings = None
+    # Below: fail-soft posture for the diagnostic — any unexpected error
+    # in a sub-probe degrades that field to None rather than aborting the
+    # whole report.
+    try:
+        hook_counts = c._setup_count_hook_entries(settings or {})
+    except Exception:
+        hook_counts = None
+    try:
+        legacy_bespoke = c._setup_detect_legacy_bespoke_hooks(settings or {})
+    except Exception:
+        legacy_bespoke = None
+    try:
+        activity = c._setup_recent_log_stats()
+    except Exception:
+        activity = None
+
+    # ── Auth ─────────────────────────────────────────────────────────
+    try:
+        oauth_token_present = c._setup_oauth_token_present()
+    except OSError:
+        oauth_token_present = None
+
+    # ── DB ───────────────────────────────────────────────────────────
+    try:
+        stats_db_status = c._db_status_for(_cctally_core.DB_PATH, c._STATS_MIGRATIONS, "stats.db")
+        if not _cctally_core.DB_PATH.exists():
+            stats_db_status["_file_exists"] = False
+    except sqlite3.Error as exc:
+        stats_db_status = {"path": str(_cctally_core.DB_PATH), "user_version": 0,
+                           "registry_size": len(c._STATS_MIGRATIONS),
+                           "migrations": [], "_open_error": str(exc)}
+    try:
+        cache_db_status = c._db_status_for(_cctally_core.CACHE_DB_PATH, c._CACHE_MIGRATIONS, "cache.db")
+        if not _cctally_core.CACHE_DB_PATH.exists():
+            cache_db_status["_file_exists"] = False
+    except sqlite3.Error as exc:
+        cache_db_status = {"path": str(_cctally_core.CACHE_DB_PATH), "user_version": 0,
+                           "registry_size": len(c._CACHE_MIGRATIONS),
+                           "migrations": [], "_open_error": str(exc)}
+
+    # ── Data freshness ───────────────────────────────────────────────
+    latest_snapshot_at = None
+    forked_bucket_counts: dict | None = None
+    credited_weeks: list[dict] | None = None
+    try:
+        if _cctally_core.DB_PATH.exists():
+            conn = sqlite3.connect(str(_cctally_core.DB_PATH))
+            try:
+                try:
+                    row = conn.execute(
+                        "SELECT MAX(captured_at_utc) FROM weekly_usage_snapshots"
+                    ).fetchone()
+                    if row and row[0]:
+                        latest_snapshot_at = parse_iso_datetime(
+                            row[0], "weekly_usage_snapshots.captured_at_utc",
+                        ).astimezone(dt.timezone.utc)
+                except sqlite3.OperationalError:
+                    pass  # table missing — treat as no snapshots yet
+                # Forked-bucket invariant probe. Each fork count is
+                # a raw SELECT against the already-open connection —
+                # no bonus open_db() recursion. Tables missing →
+                # count 0 (legacy DBs without one of these tables
+                # are intact by definition for that table).
+                forked_bucket_counts = {}
+                for table, key in (
+                    ("weekly_usage_snapshots", "usage"),
+                    ("weekly_cost_snapshots", "cost"),
+                    ("percent_milestones", "milestones"),
+                ):
+                    try:
+                        row = conn.execute(
+                            f"SELECT COUNT(*) FROM {table} "
+                            f" WHERE week_start_at IS NOT NULL "
+                            f"   AND week_start_date != substr(week_start_at, 1, 10)"
+                        ).fetchone()
+                        forked_bucket_counts[key] = (
+                            int(row[0]) if row and row[0] else 0
+                        )
+                    except sqlite3.OperationalError:
+                        forked_bucket_counts[key] = 0
+                # v1.7.2 credited-week tracking. For each week with a
+                # past-effective ``week_reset_events`` row, gather the
+                # latest weekly_percent + count of post-credit milestones.
+                # The check warns when latest_percent >= 1.0 AND
+                # post_credit_milestone_count == 0.
+                # unixepoch() normalizes the cross-offset comparison.
+                try:
+                    credit_rows = conn.execute(
+                        """
+                        SELECT wre.id AS event_id,
+                               wre.new_week_end_at AS end_at,
+                               wre.effective_reset_at_utc AS effective
+                          FROM week_reset_events wre
+                         WHERE unixepoch(wre.effective_reset_at_utc)
+                               <= unixepoch(?)
+                        """,
+                        (now_utc_iso(),),
+                    ).fetchall()
+                    credited_weeks = []
+                    for cr in credit_rows:
+                        end_at = cr[1]
+                        evt_id = cr[0]
+                        latest = conn.execute(
+                            """
+                            SELECT week_start_date, weekly_percent
+                              FROM weekly_usage_snapshots
+                             WHERE week_end_at = ?
+                             ORDER BY captured_at_utc DESC, id DESC
+                             LIMIT 1
+                            """,
+                            (end_at,),
+                        ).fetchone()
+                        if latest is None or latest[0] is None:
+                            continue
+                        ws = latest[0]
+                        lp = float(latest[1] or 0.0)
+                        try:
+                            mc_row = conn.execute(
+                                "SELECT COUNT(*) FROM percent_milestones "
+                                "WHERE week_start_date = ? AND reset_event_id = ?",
+                                (ws, evt_id),
+                            ).fetchone()
+                            mc = int(mc_row[0]) if mc_row and mc_row[0] else 0
+                        except sqlite3.OperationalError:
+                            mc = 0
+                        credited_weeks.append({
+                            "week_start_date": ws,
+                            "latest_weekly_percent": lp,
+                            "post_credit_milestone_count": mc,
+                            "event_id": evt_id,
+                        })
+                except sqlite3.OperationalError:
+                    # week_reset_events table missing — treat as no
+                    # credited weeks (pre-feature DB).
+                    credited_weeks = []
+            finally:
+                conn.close()
+    except Exception:
+        pass
+
+    cache_entries_count = None
+    cache_last_entry_at = None
+    try:
+        if _cctally_core.CACHE_DB_PATH.exists():
+            conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*), MAX(timestamp_utc) FROM session_entries"
+                ).fetchone()
+                if row:
+                    cache_entries_count = int(row[0]) if row[0] is not None else 0
+                    if row[1]:
+                        cache_last_entry_at = parse_iso_datetime(
+                            row[1], "session_entries.timestamp_utc",
+                        ).astimezone(dt.timezone.utc)
+            except sqlite3.OperationalError:
+                pass  # table missing — treat as zero
+            finally:
+                conn.close()
+    except Exception:
+        pass
+
+    claude_jsonl_present = False
+    try:
+        claude_dir = pathlib.Path.home() / ".claude" / "projects"
+        if claude_dir.exists():
+            claude_jsonl_present = next(claude_dir.glob("**/*.jsonl"), None) is not None
+    except Exception:
+        pass
+
+    codex_entries_count = None
+    codex_last_entry_at = None
+    try:
+        if _cctally_core.CACHE_DB_PATH.exists():
+            conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*), MAX(timestamp_utc) FROM codex_session_entries"
+                ).fetchone()
+                if row:
+                    codex_entries_count = int(row[0]) if row[0] is not None else 0
+                    if row[1]:
+                        codex_last_entry_at = parse_iso_datetime(
+                            row[1], "codex_session_entries.timestamp_utc",
+                        ).astimezone(dt.timezone.utc)
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                conn.close()
+    except Exception:
+        pass
+
+    # Issue #109: probe every $CODEX_HOME session root (not the single
+    # hardcoded ~/.codex/sessions), matching the multi-root ingestion path
+    # from #108. _codex_session_roots() already applies the sessions/-subdir
+    # rule and filters to existing dirs, so a bare glob per root suffices.
+    codex_jsonl_present = False
+    try:
+        for codex_dir in c._codex_session_roots():
+            if next(codex_dir.glob("**/*.jsonl"), None) is not None:
+                codex_jsonl_present = True
+                break
+    except Exception:
+        pass
+
+    # ── Safety ───────────────────────────────────────────────────────
+    # `dashboard.bind` is read via the same chokepoint that powers
+    # `cctally config get dashboard.bind` — `_config_known_value`
+    # normalizes hand-edited junk back to "loopback", matching the
+    # value cmd_dashboard would actually bind to.
+    #
+    # Raw JSON read (NOT load_config or _load_config_unlocked): both
+    # call `ensure_dirs()`, which creates `~/.local/share/cctally/`
+    # and `logs/` on a fresh HOME. Doctor is a read-only diagnostic
+    # (H1 invariant) — it must never mutate user state, even by
+    # creating an empty directory tree. Corrupt JSON yields
+    # `dashboard_bind_stored = "loopback"` (the same fallback the
+    # original try/except gave); the dedicated `config_json_valid`
+    # check surfaces the corruption separately.
+    dashboard_bind_stored = "loopback"
+    try:
+        if _cctally_core.CONFIG_PATH.exists():
+            raw_cfg = json.loads(_cctally_core.CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw_cfg, dict):
+                dashboard_bind_stored = (
+                    c._config_known_value(raw_cfg, "dashboard.bind") or "loopback"
+                )
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    # config.json — RAW READ, never load_config(). load_config()
+    # auto-creates on first run AND silently falls back to defaults
+    # on corruption — both behaviors would hide diagnostic state
+    # (codex H1).
+    config_json_error = None
+    try:
+        if _cctally_core.CONFIG_PATH.exists():
+            json.loads(_cctally_core.CONFIG_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        config_json_error = f"{type(exc).__name__}: {exc}"
+    except OSError as exc:
+        config_json_error = f"OSError: {exc}"
+
+    update_state = None
+    update_state_error = None
+    try:
+        update_state = c._load_update_state()
+    except Exception as exc:
+        update_state_error = f"{type(exc).__name__}: {exc}"
+
+    update_suppress = None
+    update_suppress_error = None
+    try:
+        update_suppress = c._load_update_suppress()
+    except Exception as exc:
+        update_suppress_error = f"{type(exc).__name__}: {exc}"
+
+    # Same predicate the update banner uses; doctor must not warn about
+    # updates the user has already skipped or deferred.
+    effective_update_available, effective_update_reason = (
+        c._compute_effective_update_available(update_state, update_suppress, now_utc)
+    )
+
+    # ── Pricing coverage (spec §5.1) ─────────────────────────────────
+    # Read-only trailing-30d scan + classification via the pure-fn kernel.
+    # Any failure degrades to None so the check renders OK (never FAIL) and
+    # the rest of the report is unaffected — same posture as the cache reads
+    # above. `_pricing_observed_models` honors the no-mutation contract.
+    pricing_coverage = None
+    try:
+        observed = c._pricing_observed_models(now_utc)
+        # Detection-only: pass warn=False so finding an unpriced model here does
+        # NOT fire the cost-engine's `[cost] unknown model` stderr warning (this
+        # is a read-only diagnostic, and the warning would also poison the
+        # dedup set, suppressing a later genuine cost-path warning).
+        pricing_coverage = c.classify_coverage(
+            observed,
+            lambda m: c._resolve_model_pricing(m, warn=False),
+            c._is_codex_fallback,
+        )
+    except Exception:
+        pricing_coverage = None
+
+    # ── Meta ─────────────────────────────────────────────────────────
+    cctally_version_tuple = _lib_changelog._read_latest_changelog_version()
+    cctally_version = (
+        cctally_version_tuple[0] if cctally_version_tuple else "unknown"
+    )
+
+    return _lib_doctor.DoctorState(
+        symlink_state=symlink_state,
+        path_includes_local_bin=path_includes,
+        # Issue #119: availability-aware install checks (precomputed above).
+        cctally_reachable_on_path=cctally_reachable_on_path,
+        symlinks_path_pinned=symlinks_path_pinned,
+        install_is_brew=install_is_brew,
+        legacy_snippet=legacy_snippet,
+        legacy_bespoke=legacy_bespoke,
+        claude_settings=settings,
+        hook_counts=hook_counts,
+        log_activity_24h=activity,
+        oauth_token_present=oauth_token_present,
+        stats_db_status=stats_db_status,
+        cache_db_status=cache_db_status,
+        latest_snapshot_at=latest_snapshot_at,
+        cache_entries_count=cache_entries_count,
+        cache_last_entry_at=cache_last_entry_at,
+        claude_jsonl_present=claude_jsonl_present,
+        forked_bucket_counts=forked_bucket_counts,
+        credited_weeks=credited_weeks,
+        codex_entries_count=codex_entries_count,
+        codex_last_entry_at=codex_last_entry_at,
+        codex_jsonl_present=codex_jsonl_present,
+        dashboard_bind_stored=dashboard_bind_stored,
+        runtime_bind=runtime_bind,
+        config_json_error=config_json_error,
+        update_state=update_state,
+        update_state_error=update_state_error,
+        update_suppress=update_suppress,
+        update_suppress_error=update_suppress_error,
+        effective_update_available=effective_update_available,
+        effective_update_reason=effective_update_reason,
+        now_utc=now_utc,
+        cctally_version=cctally_version,
+        # Dev-instance isolation (§4): which data dir resolved + how.
+        dev_mode=_cctally_core.DEV_MODE,
+        app_dir=str(_cctally_core.APP_DIR),
+        is_dev_checkout=_cctally_core._is_dev_checkout(),
+        # Pricing-freshness check (spec §5.1): trailing-30d coverage gaps.
+        pricing_coverage=pricing_coverage,
+    )
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Run all doctor checks and emit the report. Spec §4, §7.3.
+
+    Calls the I/O chokepoint (doctor_gather_state) → pure kernel
+    (_lib_doctor.run_checks) → renderer (render_text or
+    serialize_json). The argparse `add_mutually_exclusive_group`
+    handles the --quiet/--verbose collision at parse time; the
+    defense-in-depth check here covers programmatic invocation that
+    bypasses argparse.
+
+    Exit code follows the loose mapping in spec §4.5: 0 unless
+    overall_severity == "fail", then 2. Note that warn → 0; doctor
+    is read-only and warn-class findings are advisories, not errors.
+    """
+    import _lib_doctor
+    c = _cctally()
+    quiet = bool(getattr(args, "quiet", False))
+    verbose = bool(getattr(args, "verbose", False))
+    if quiet and verbose:
+        eprint("doctor: --quiet and --verbose are mutually exclusive")
+        return 2
+    state = c.doctor_gather_state()
+    report = _lib_doctor.run_checks(state)
+    if getattr(args, "json", False):
+        print(json.dumps(
+            _lib_doctor.serialize_json(report), indent=2, sort_keys=True,
+        ))
+    else:
+        sys.stdout.write(_lib_doctor.render_text(
+            report, quiet=quiet, verbose=verbose,
+        ))
+    return 2 if report.overall_severity == "fail" else 0
