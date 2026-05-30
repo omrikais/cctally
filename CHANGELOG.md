@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Internal refactor (no user-facing change): extracted the `project` subcommand (`cmd_project` plus its four dedicated helpers) out of the `bin/cctally` single-file program into a new stdlib-only sibling module, `bin/_cctally_project.py` (continuing the ongoing `bin/cctally` split).** This trims the main script by ~680 lines (12,112 → 11,441) with no change to the command's behavior, flags, output, or exit codes — every `project` golden test is unchanged and the full harness + pytest suite (1,328 checks) passes — and the new module ships in the npm/brew/public packages (promoted to the mirror allowlist). A new namespace-binding regression test guards the module-boundary wiring against future regressions. Purely a maintainability / code-organization change; nothing to do on upgrade.
+
 ## [1.22.1] - 2026-05-30
 
 ### Changed
