@@ -65,7 +65,7 @@ only and does not affect the exit code.
   "schemaVersion": 1,
   "status": "ok",
   "degraded_components": [],
-  "snapshotDate": "2026-05-04",
+  "snapshotDate": "2026-05-30",
   "litellmSource": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
   "coverage": [
     {

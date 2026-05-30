@@ -49,7 +49,7 @@ def _chip_for_model(name: str) -> str:
 # Date the embedded pricing snapshots below were last verified against
 # vendor sources. Bump whenever CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING
 # is synced. Read by `pricing-check` + the release pre-flight staleness nudge.
-PRICING_SNAPSHOT_DATE = "2026-05-04"
+PRICING_SNAPSHOT_DATE = "2026-05-30"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 # Canonical machine-readable pricing source (Claude values + Codex values).
@@ -67,7 +67,7 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = []
 
 # Anthropic API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured: 2026-05-04 (see PRICING_SNAPSHOT_DATE)
+# - Captured: 2026-05-30 (see PRICING_SNAPSHOT_DATE)
 # - Verified by maintainer against docs.claude.com/en/docs/about-claude/pricing;
 #   update in PRs touching this table.
 CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
@@ -265,12 +265,12 @@ _unknown_model_warnings: set[str] = set()
 #
 # Codex (OpenAI) API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured: 2026-05-04 (see PRICING_SNAPSHOT_DATE)
-# - Models listed are those observed in ~/.codex/sessions/ at implementation
-#   time plus common Codex/GPT-5 variants. Models absent from this table fall
-#   back to `gpt-5` pricing with isFallback=true (matches upstream's
-#   LEGACY_FALLBACK_MODEL behavior); a one-shot stderr warning is emitted per
-#   unknown model name.
+# - Captured: 2026-05-30 (see PRICING_SNAPSHOT_DATE)
+# - As of the 2026-05-30 sync (issue #123) this carries every openai-provider
+#   gpt-5* model the LiteLLM snapshot lists, so `pricing-check`'s scope finds
+#   nothing missing. Models absent from this table still fall back to `gpt-5`
+#   pricing with isFallback=true (matches upstream's LEGACY_FALLBACK_MODEL
+#   behavior); a one-shot stderr warning is emitted per unknown model name.
 #
 # Billing rules:
 # - reasoning_output_tokens is billed at the *output* rate (matches
@@ -352,12 +352,185 @@ CODEX_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "output_cost_per_token": 4.5e-06,
     },
     "gpt-5.5": {
-        # Source: OpenAI published pricing (announced 2026-04-23). Input
-        # $5.00/M, cached $0.50/M, output $30.00/M. No above-272k tier
-        # announced. Add tiered fields here when LiteLLM publishes them.
+        # Source: LiteLLM model_prices_and_context_window.json (announced
+        # 2026-04-23). Input $5.00/M, cached $0.50/M, output $30.00/M. The
+        # above-272k tier ($10.00/M / $1.00/M / $45.00/M) was published in the
+        # 2026-05-30 sync (issue #123) and matches the dated alias below.
         "input_cost_per_token": 5e-06,
         "cache_read_input_token_cost": 5e-07,
         "output_cost_per_token": 3e-05,
+        "input_cost_per_token_above_272k_tokens": 1e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 1e-06,
+        "output_cost_per_token_above_272k_tokens": 4.5e-05,
+    },
+    # ── Issue #123: full gpt-5.x LiteLLM sync (2026-05-30 snapshot) ──
+    # Exact model_prices_and_context_window.json values for every
+    # openai-provider gpt-5* model `pricing-check`'s scope flags but the
+    # curated set above didn't carry (bare/dated/-chat/-pro/-mini/-nano/
+    # -search variants). The four *-pro models omit cache_read upstream; we
+    # set it to input_cost_per_token / 4 (the documented LiteLLM cache
+    # fallback) so the table stays well-formed and cached-input turns price.
+    "gpt-5-2025-08-07": {
+        "input_cost_per_token": 1.25e-06,
+        "cache_read_input_token_cost": 1.25e-07,
+        "output_cost_per_token": 1e-05,
+    },
+    "gpt-5-chat": {
+        "input_cost_per_token": 1.25e-06,
+        "cache_read_input_token_cost": 1.25e-07,
+        "output_cost_per_token": 1e-05,
+    },
+    "gpt-5-chat-latest": {
+        "input_cost_per_token": 1.25e-06,
+        "cache_read_input_token_cost": 1.25e-07,
+        "output_cost_per_token": 1e-05,
+    },
+    "gpt-5-mini": {
+        "input_cost_per_token": 2.5e-07,
+        "cache_read_input_token_cost": 2.5e-08,
+        "output_cost_per_token": 2e-06,
+    },
+    "gpt-5-mini-2025-08-07": {
+        "input_cost_per_token": 2.5e-07,
+        "cache_read_input_token_cost": 2.5e-08,
+        "output_cost_per_token": 2e-06,
+    },
+    "gpt-5-nano": {
+        "input_cost_per_token": 5e-08,
+        "cache_read_input_token_cost": 5e-09,
+        "output_cost_per_token": 4e-07,
+    },
+    "gpt-5-nano-2025-08-07": {
+        "input_cost_per_token": 5e-08,
+        "cache_read_input_token_cost": 5e-09,
+        "output_cost_per_token": 4e-07,
+    },
+    "gpt-5-pro": {
+        # *-pro: LiteLLM omits cache_read; input/4 documented fallback.
+        "input_cost_per_token": 1.5e-05,
+        "cache_read_input_token_cost": 3.75e-06,
+        "output_cost_per_token": 0.00012,
+    },
+    "gpt-5-pro-2025-10-06": {
+        # *-pro: LiteLLM omits cache_read; input/4 documented fallback.
+        "input_cost_per_token": 1.5e-05,
+        "cache_read_input_token_cost": 3.75e-06,
+        "output_cost_per_token": 0.00012,
+    },
+    "gpt-5-search-api": {
+        "input_cost_per_token": 1.25e-06,
+        "cache_read_input_token_cost": 1.25e-07,
+        "output_cost_per_token": 1e-05,
+    },
+    "gpt-5-search-api-2025-10-14": {
+        "input_cost_per_token": 1.25e-06,
+        "cache_read_input_token_cost": 1.25e-07,
+        "output_cost_per_token": 1e-05,
+    },
+    "gpt-5.1": {
+        "input_cost_per_token": 1.25e-06,
+        "cache_read_input_token_cost": 1.25e-07,
+        "output_cost_per_token": 1e-05,
+    },
+    "gpt-5.1-2025-11-13": {
+        "input_cost_per_token": 1.25e-06,
+        "cache_read_input_token_cost": 1.25e-07,
+        "output_cost_per_token": 1e-05,
+    },
+    "gpt-5.1-chat-latest": {
+        "input_cost_per_token": 1.25e-06,
+        "cache_read_input_token_cost": 1.25e-07,
+        "output_cost_per_token": 1e-05,
+    },
+    "gpt-5.2-2025-12-11": {
+        "input_cost_per_token": 1.75e-06,
+        "cache_read_input_token_cost": 1.75e-07,
+        "output_cost_per_token": 1.4e-05,
+    },
+    "gpt-5.2-chat-latest": {
+        "input_cost_per_token": 1.75e-06,
+        "cache_read_input_token_cost": 1.75e-07,
+        "output_cost_per_token": 1.4e-05,
+    },
+    "gpt-5.2-pro": {
+        # *-pro: LiteLLM omits cache_read; input/4 documented fallback.
+        "input_cost_per_token": 2.1e-05,
+        "cache_read_input_token_cost": 5.25e-06,
+        "output_cost_per_token": 0.000168,
+    },
+    "gpt-5.2-pro-2025-12-11": {
+        # *-pro: LiteLLM omits cache_read; input/4 documented fallback.
+        "input_cost_per_token": 2.1e-05,
+        "cache_read_input_token_cost": 5.25e-06,
+        "output_cost_per_token": 0.000168,
+    },
+    "gpt-5.3-chat-latest": {
+        "input_cost_per_token": 1.75e-06,
+        "cache_read_input_token_cost": 1.75e-07,
+        "output_cost_per_token": 1.4e-05,
+    },
+    "gpt-5.4-2026-03-05": {
+        "input_cost_per_token": 2.5e-06,
+        "cache_read_input_token_cost": 2.5e-07,
+        "output_cost_per_token": 1.5e-05,
+        "input_cost_per_token_above_272k_tokens": 5e-06,
+        "cache_read_input_token_cost_above_272k_tokens": 5e-07,
+        "output_cost_per_token_above_272k_tokens": 2.25e-05,
+    },
+    "gpt-5.4-mini-2026-03-17": {
+        "input_cost_per_token": 7.5e-07,
+        "cache_read_input_token_cost": 7.5e-08,
+        "output_cost_per_token": 4.5e-06,
+    },
+    "gpt-5.4-nano": {
+        "input_cost_per_token": 2e-07,
+        "cache_read_input_token_cost": 2e-08,
+        "output_cost_per_token": 1.25e-06,
+    },
+    "gpt-5.4-nano-2026-03-17": {
+        "input_cost_per_token": 2e-07,
+        "cache_read_input_token_cost": 2e-08,
+        "output_cost_per_token": 1.25e-06,
+    },
+    "gpt-5.4-pro": {
+        "input_cost_per_token": 3e-05,
+        "cache_read_input_token_cost": 3e-06,
+        "output_cost_per_token": 0.00018,
+        "input_cost_per_token_above_272k_tokens": 6e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 6e-06,
+        "output_cost_per_token_above_272k_tokens": 0.00027,
+    },
+    "gpt-5.4-pro-2026-03-05": {
+        "input_cost_per_token": 3e-05,
+        "cache_read_input_token_cost": 3e-06,
+        "output_cost_per_token": 0.00018,
+        "input_cost_per_token_above_272k_tokens": 6e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 6e-06,
+        "output_cost_per_token_above_272k_tokens": 0.00027,
+    },
+    "gpt-5.5-2026-04-23": {
+        "input_cost_per_token": 5e-06,
+        "cache_read_input_token_cost": 5e-07,
+        "output_cost_per_token": 3e-05,
+        "input_cost_per_token_above_272k_tokens": 1e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 1e-06,
+        "output_cost_per_token_above_272k_tokens": 4.5e-05,
+    },
+    "gpt-5.5-pro": {
+        "input_cost_per_token": 3e-05,
+        "cache_read_input_token_cost": 3e-06,
+        "output_cost_per_token": 0.00018,
+        "input_cost_per_token_above_272k_tokens": 6e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 6e-06,
+        "output_cost_per_token_above_272k_tokens": 0.00027,
+    },
+    "gpt-5.5-pro-2026-04-23": {
+        "input_cost_per_token": 3e-05,
+        "cache_read_input_token_cost": 3e-06,
+        "output_cost_per_token": 0.00018,
+        "input_cost_per_token_above_272k_tokens": 6e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 6e-06,
+        "output_cost_per_token_above_272k_tokens": 0.00027,
     },
 }
 
