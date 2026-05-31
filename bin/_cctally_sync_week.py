@@ -6,11 +6,12 @@ JSONL-aggregates the week's cost + inserts a `weekly_cost_snapshots`
 row + emits the success line (or `--json` envelope).
 
 Every helper this command calls — `load_config`, `get_week_start_name`,
-`open_db`, `pick_week_selection`, `compute_week_cost`,
-`format_local_iso`, `insert_cost_snapshot`, `make_week_ref`,
+`open_db`, `pick_week_selection`, `format_local_iso`, `make_week_ref`,
 `get_latest_usage_for_week` — stays in `bin/cctally` (they're shared
-with the rest of the subcommand surface), reached via the `_cctally()`
-call-time accessor (spec §5.2 / §5.5 pattern).
+with the rest of the subcommand surface); `compute_week_cost` /
+`insert_cost_snapshot` now live in `_cctally_milestones.py` (re-exported on
+the ns). All are reached via the `_cctally()` call-time accessor (spec
+§5.2 / §5.5 pattern).
 
 bin/cctally re-exports `cmd_sync_week` so the two non-extracted internal
 callers (`cmd_record_usage`'s milestone-cost-sync path and the
