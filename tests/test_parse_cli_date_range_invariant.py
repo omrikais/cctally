@@ -19,13 +19,25 @@ import ast
 import pathlib
 
 
-_SCRIPT_PATH = pathlib.Path(__file__).resolve().parent.parent / "bin" / "cctally"
+_BIN = pathlib.Path(__file__).resolve().parent.parent / "bin"
+_SCRIPT_PATH = _BIN / "cctally"
 _HELPER_NAME = "_parse_cli_date_range"
+
+# `def _parse_cli_date_range` STAYS in bin/cctally, but the cmd_* callers were
+# extracted into command-sibling modules (issue #124 — codex/reporting; the
+# `project` sibling predates this). They reach the helper via the call-time
+# accessor (`c = _cctally(); c._parse_cli_date_range(...)`), so this invariant
+# scans bin/cctally PLUS every `_cctally_*.py` sibling and recognizes both the
+# bare-name and `<obj>._parse_cli_date_range(...)` attribute call forms.
+_CALLER_PATHS = [_SCRIPT_PATH] + sorted(_BIN.glob("_cctally_*.py"))
 
 
 def _find_callers(tree: ast.AST) -> list[tuple[str, int, list[str]]]:
     """Return (enclosing_function, lineno, kw_names) per direct call site.
 
+    Recognizes both the bare-name form (`_parse_cli_date_range(...)`, the
+    in-monolith caller shape) and the accessor/attribute form
+    (`c._parse_cli_date_range(...)`, the extracted-sibling caller shape).
     Skips the helper definition itself so the function's own signature
     (which is a `FunctionDef`, not a `Call`, but we filter defensively)
     can't accidentally satisfy the search.
@@ -50,7 +62,11 @@ def _find_callers(tree: ast.AST) -> list[tuple[str, int, list[str]]]:
 
         def visit_Call(self, node: ast.Call) -> None:
             func = node.func
-            if isinstance(func, ast.Name) and func.id == _HELPER_NAME:
+            is_bare = isinstance(func, ast.Name) and func.id == _HELPER_NAME
+            is_attr = (
+                isinstance(func, ast.Attribute) and func.attr == _HELPER_NAME
+            )
+            if is_bare or is_attr:
                 enclosing = self._stack[-1] if self._stack else "<module>"
                 if enclosing != _HELPER_NAME:
                     sites.append(
@@ -92,21 +108,26 @@ def test_every_caller_threads_now_utc():
     wall-clock time and silently break `CCTALLY_AS_OF`-pinned fixture
     goldens the day the harness host's UTC date rolls over (issue #31).
     """
-    tree = ast.parse(_SCRIPT_PATH.read_text())
-    sites = _find_callers(tree)
+    sites: list[tuple[str, str, int, list[str]]] = []
+    for path in _CALLER_PATHS:
+        tree = ast.parse(path.read_text())
+        for fn, lineno, kws in _find_callers(tree):
+            sites.append((f"bin/{path.name}", fn, lineno, kws))
     assert sites, (
-        f"AST walk found zero calls to `{_HELPER_NAME}`; either the "
-        f"helper was removed or the test's search is broken."
+        f"AST walk found zero calls to `{_HELPER_NAME}` across "
+        f"{[p.name for p in _CALLER_PATHS]}; either the helper was removed "
+        f"or the test's search is broken."
     )
     missing = [
-        (fn, lineno) for (fn, lineno, kws) in sites if "now_utc" not in kws
+        (src, fn, lineno) for (src, fn, lineno, kws) in sites
+        if "now_utc" not in kws
     ]
     assert not missing, (
         f"{len(missing)} `_parse_cli_date_range` call site(s) do not "
         f"thread `now_utc=` — they will default `range_end` to wall-clock "
         f"time and break `CCTALLY_AS_OF`-pinned fixtures on day rollover:\n"
-        + "\n".join(f"  - {fn} (bin/cctally:{ln})" for fn, ln in missing)
+        + "\n".join(f"  - {fn} ({src}:{ln})" for src, fn, ln in missing)
         + "\n\nFix: add `now_utc=_command_as_of()` (or thread an existing "
-        f"local) to the call. See issue #31 and bin/cctally:15920 "
-        f"(`_parse_cli_date_range` signature)."
+        f"local) to the call. See issue #31 and the `_parse_cli_date_range` "
+        f"signature in bin/cctally."
     )
