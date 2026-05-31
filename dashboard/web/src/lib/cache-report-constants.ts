@@ -1,4 +1,4 @@
-// CACHE_REPORT_MIN_BASELINE_DAYS mirrors bin/_cctally_cache_report.py —
+// CACHE_REPORT_MIN_BASELINE_DAYS mirrors bin/_lib_cache_report.py —
 // keep in sync. CACHE_REPORT_BAND_PP is TS-only: it's the modal's
 // display band for the daily hit-% highlight (rows below baseline by
 // more than this many points render hit-bad), distinct from the

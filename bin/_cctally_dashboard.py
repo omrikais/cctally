@@ -1916,11 +1916,11 @@ class CacheReportSnapshot:
 # synthetic entries on the same project.
 
 def _cache_report_load_kernel():
-    """Lazy-load ``_cctally_cache_report`` via the cctally ``_load_sibling``
+    """Lazy-load ``_lib_cache_report`` via the cctally ``_load_sibling``
     bridge so monkeypatch-driven test reloads of cctally see the same
     kernel module instance (matches the late-load pattern used by share /
     doctor helpers in this file)."""
-    return sys.modules["cctally"]._load_sibling("_cctally_cache_report")
+    return sys.modules["cctally"]._load_sibling("_lib_cache_report")
 
 
 def build_cache_report_snapshot(
@@ -1936,7 +1936,7 @@ def build_cache_report_snapshot(
     Pulls entries via ``get_claude_session_entries`` (uses the cache when
     warm, falls back to direct-JSONL parse on cache miss / lock
     contention — same chain the CLI uses). Delegates aggregation +
-    anomaly classification to ``_cctally_cache_report._build_cache_report``;
+    anomaly classification to ``_lib_cache_report._build_cache_report``;
     shapes the result into a frozen ``CacheReportSnapshot``.
 
     ``window_days`` is hardcoded at 14 in v1 (spec §6.1 hardcodes

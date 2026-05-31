@@ -1,19 +1,19 @@
-"""Unit tests for bin/_cctally_cache_report kernel.
+"""Unit tests for bin/_lib_cache_report kernel.
 
 Loads the kernel as a sibling module (matches the project pattern used
-by other tests targeting bin/_cctally_*.py).
+by other tests targeting bin/_lib_*.py).
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-# Allow ``import _cctally_cache_report`` (the bin/ siblings convention).
+# Allow ``import _lib_cache_report`` (the bin/ siblings convention).
 _BIN = Path(__file__).resolve().parent.parent / "bin"
 if str(_BIN) not in sys.path:
     sys.path.insert(0, str(_BIN))
 
-import _cctally_cache_report as crk  # noqa: E402
+import _lib_cache_report as crk  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
