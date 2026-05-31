@@ -2465,8 +2465,6 @@ def _trend_row_recency_seconds(row: dict[str, Any]) -> float:
 # ``CacheModelBreakdown`` / ``_compute_cache_hit_percent`` /
 # ``_filename_uuid_stem`` by bare name on the cctally ns (and tests via
 # ``ns[...]``); per-symbol re-export here preserves those call sites unchanged.
-# The CLI-compat ``_compute_entry_cache_dollars`` wrapper now lives in the
-# render+cmd glue (bin/_cctally_cache_report.py) alongside its sole call path.
 #
 # Spec: docs/superpowers/specs/2026-05-21-cache-report-panel-design.md §5.2
 _lib_cache_report = _load_sibling("_lib_cache_report")

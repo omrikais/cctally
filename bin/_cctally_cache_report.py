@@ -672,28 +672,6 @@ def _render_cache_report_table(
     return _render_cache_day_rows(rows, title, compact=compact)
 
 
-def _compute_entry_cache_dollars(
-    model: str,
-    cache_creation_tokens: int,
-    cache_read_tokens: int,
-) -> tuple[float, float, float]:
-    """Compatibility wrapper — pre-extraction signature.
-
-    The kernel function takes ``pricing`` explicitly so it stays pure;
-    bin/cctally callers inject the embedded ``CLAUDE_MODEL_PRICING``.
-    ``_lookup_pricing`` inside the kernel handles the ``anthropic/`` /
-    ``anthropic.`` alias-stripping that the legacy ``_resolve_model_pricing``
-    did, but without the stderr warning (the warning is the CLI's concern
-    and already fires elsewhere via ``_calculate_entry_cost``).
-    """
-    c = _cctally()
-    return crk._compute_entry_cache_dollars(
-        model, cache_creation_tokens, cache_read_tokens,
-        pricing=c.CLAUDE_MODEL_PRICING,
-        tiered_threshold=c.TIERED_THRESHOLD,
-    )
-
-
 def _aggregate_cache_by_day(
     since: dt.datetime,
     until: dt.datetime,
