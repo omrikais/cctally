@@ -297,6 +297,7 @@ def save_config(data: dict[str, Any]) -> None:
 ALLOWED_CONFIG_KEYS = (
     "display.tz",
     "alerts.enabled",
+    "alerts.projected_enabled",
     "dashboard.bind",
     "update.check.enabled",
     "update.check.ttl_hours",
@@ -306,6 +307,7 @@ ALLOWED_CONFIG_KEYS = (
     "budget.weekly_usd",
     "budget.alerts_enabled",
     "budget.alert_thresholds",
+    "budget.projected_enabled",
 )
 
 
@@ -405,6 +407,13 @@ def _config_known_value(config: dict, key: str) -> "object":
         return c.get_display_tz_pref(config)
     if key == "alerts.enabled":
         return bool(_get_alerts_config(config)["enabled"])
+    if key == "alerts.projected_enabled":
+        # Validated boolean (defaults to False when unset). A corrupt alerts
+        # block surfaces the default — mirrors alerts.enabled.
+        try:
+            return bool(_get_alerts_config(config)["projected_enabled"])
+        except c._AlertsConfigError:
+            return False
     if key == "dashboard.bind":
         # Default semantic alias is 'loopback' (resolves to 127.0.0.1 at
         # bind time). LAN exposure is opt-in via `set dashboard.bind lan`
@@ -472,6 +481,7 @@ def _config_known_value(config: dict, key: str) -> "object":
         "budget.weekly_usd",
         "budget.alerts_enabled",
         "budget.alert_thresholds",
+        "budget.projected_enabled",
     ):
         inner = key.split(".", 1)[1]
         # Read the validated, defaults-filled block. A corrupt block falls
@@ -598,6 +608,43 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         else:
             print(f"alerts.enabled={'true' if normalized else 'false'}")
         return 0
+    if key == "alerts.projected_enabled":
+        # Projected-pace opt-in (#121). Same bool-normalizer + read-modify-write
+        # posture as alerts.enabled (preserves sibling alerts.* keys).
+        try:
+            normalized = c._normalize_alerts_enabled_value(raw)
+        except ValueError as exc:
+            print(f"cctally: {exc}", file=sys.stderr)
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing_alerts = config.get("alerts")
+            if existing_alerts is not None and not isinstance(
+                existing_alerts, dict
+            ):
+                print(
+                    "cctally: alerts config error: alerts must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            alerts_block = dict(existing_alerts or {})
+            alerts_block["projected_enabled"] = normalized
+            try:
+                _get_alerts_config({**config, "alerts": alerts_block})
+            except _AlertsConfigError as exc:
+                print(f"cctally: alerts config error: {exc}", file=sys.stderr)
+                return 2
+            config["alerts"] = alerts_block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(
+                json.dumps({"alerts": {"projected_enabled": normalized}}, indent=2)
+            )
+        else:
+            print(
+                f"alerts.projected_enabled={'true' if normalized else 'false'}"
+            )
+        return 0
     if key == "dashboard.bind":
         # Validation rejects whitespace / empty / non-string up front;
         # write proceeds under config_writer_lock with _load_config_unlocked
@@ -715,6 +762,7 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         "budget.weekly_usd",
         "budget.alerts_enabled",
         "budget.alert_thresholds",
+        "budget.projected_enabled",
     ):
         inner_key = key.split(".", 1)[1]
         # Parse + normalize the raw value per key BEFORE acquiring the lock so
@@ -734,7 +782,7 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                         f"null, got {raw!r}"
                     )
                     return 2
-        elif inner_key == "alerts_enabled":
+        elif inner_key in ("alerts_enabled", "projected_enabled"):
             lo = raw.strip().lower()
             if lo in ("true", "yes", "on", "1"):
                 new_val = True
@@ -742,7 +790,7 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                 new_val = False
             else:
                 eprint(
-                    "cctally config: budget.alerts_enabled must be a boolean, "
+                    f"cctally config: budget.{inner_key} must be a boolean, "
                     f"got {raw!r}"
                 )
                 return 2
@@ -817,19 +865,21 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                 save_config(config)
             # idempotent: silent on missing key
         return 0
-    if key == "alerts.enabled":
+    if key in ("alerts.enabled", "alerts.projected_enabled"):
         # Mirror the display.tz branch: writer-lock + _load_config_unlocked
         # (NOT load_config — fcntl.flock is per-fd so re-entry would
         # self-deadlock per the gotcha in CLAUDE.md). Unsetting just the
-        # `enabled` key preserves any user-customized threshold lists
-        # (`weekly_thresholds`, `five_hour_thresholds`); the read-time
-        # validator (`_get_alerts_config`) re-applies the canonical
-        # default of `enabled = False` for the missing key on next get.
+        # named key preserves any user-customized threshold lists
+        # (`weekly_thresholds`, `five_hour_thresholds`) and the sibling
+        # enabled/projected_enabled toggle; the read-time validator
+        # (`_get_alerts_config`) re-applies the canonical default of `False`
+        # for the missing key on next get.
+        inner_key = key.split(".", 1)[1]
         with config_writer_lock():
             config = _load_config_unlocked()
             block = config.get("alerts")
-            if isinstance(block, dict) and "enabled" in block:
-                del block["enabled"]
+            if isinstance(block, dict) and inner_key in block:
+                del block[inner_key]
                 if not block:
                     config.pop("alerts", None)
                 save_config(config)
@@ -889,6 +939,7 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
         "budget.weekly_usd",
         "budget.alerts_enabled",
         "budget.alert_thresholds",
+        "budget.projected_enabled",
     ):
         # Drop only the named leaf; preserve sibling budget.* keys (e.g.
         # unsetting weekly_usd keeps a customized alert_thresholds). If the

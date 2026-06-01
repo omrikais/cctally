@@ -509,3 +509,80 @@ def test_pre_probe_skips_cost_when_all_budget_levels_latched(ns, monkeypatch):
     spy.clear()
     ns["maybe_record_projected_alert"]({})
     assert spy == []
+
+
+# ── budget_usd band discrimination (the P0-1 guard, budget leg) ──────────
+
+
+def test_budget_usd_does_not_fire_when_week_average_below_threshold(ns, monkeypatch):
+    """Hot trailing-24h rate but a below-threshold WEEK-AVERAGE projection must
+    NOT fire (parallels the weekly_pct band-discrimination case). The firing
+    value is ``spent + rate_avg*remaining`` (cumulative-driven); the recent-24h
+    rate only feeds the displayed high-end verdict, never the alert trigger.
+
+    spent=50 at 84h elapsed → rate_avg=50/84, week_avg_projection_usd
+    = 50 + (50/84)*84 = 100 << 90% of $300 ($270). recent-24h is jacked to
+    $200 (which would push the displayed HIGH-end verdict over) — yet nothing
+    fires, proving the trigger binds to the week-average, not the band end.
+    """
+    _seed_snapshots(ns, _high_conf_samples(50.0))
+    _write_config(
+        ns,
+        budget={"weekly_usd": 300.0, "alerts_enabled": True,
+                "alert_thresholds": [90, 100], "projected_enabled": True},
+    )
+    _patch_spend(ns, monkeypatch, value=50.0, recent=200.0)
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    ns["maybe_record_projected_alert"]({})
+
+    assert [r for r in _rows(ns) if r["metric"] == "budget_usd"] == []
+    assert captured == []
+
+
+def test_budget_usd_fires_when_week_average_crosses_even_if_recent_below(ns, monkeypatch):
+    """Inverse band-discrimination: a COLD trailing-24h rate still fires when
+    the WEEK-AVERAGE projection crosses. spent=150 at 84h → week-average
+    projection = $300 (crosses 90%/$270 and 100%/$300), even though recent-24h
+    is only $10 (which would keep the high-end verdict comfortable)."""
+    _seed_snapshots(ns, _high_conf_samples(50.0))
+    _write_config(
+        ns,
+        budget={"weekly_usd": 300.0, "alerts_enabled": True,
+                "alert_thresholds": [90, 100], "projected_enabled": True},
+    )
+    _patch_spend(ns, monkeypatch, value=150.0, recent=10.0)
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    ns["maybe_record_projected_alert"]({})
+
+    rows = [r for r in _rows(ns) if r["metric"] == "budget_usd"]
+    assert [r["threshold"] for r in rows] == [90, 100]
+    assert all(abs(r["projected_value"] - 300.0) < 1e-6 for r in rows)
+    assert {p["threshold"] for p, _ in captured} == {90, 100}
+
+
+# ── carry-forward MUST-FIX #1: no "unknown config key" warning on the tick ──
+
+
+def test_projected_record_tick_emits_no_unknown_config_key_warning(ns, monkeypatch, capsys):
+    """With projected_enabled set on BOTH blocks, a record tick must NOT emit a
+    'warning: ignoring unknown alerts/budget config key: projected_enabled' on
+    stderr — the detector reads the validated getter dicts, where the key is a
+    recognized valid key (carry-forward MUST-FIX #1)."""
+    _seed_snapshots(ns, _high_conf_samples(60.0))
+    _write_config(
+        ns,
+        alerts={"enabled": True, "projected_enabled": True},
+        budget={"weekly_usd": 300.0, "alerts_enabled": True,
+                "alert_thresholds": [90, 100], "projected_enabled": True},
+    )
+    _patch_spend(ns, monkeypatch, value=150.0)
+    _patch_dispatch(ns, monkeypatch)
+
+    ns["maybe_record_projected_alert"]({})
+
+    err = capsys.readouterr().err
+    assert "unknown alerts config key" not in err
+    assert "unknown budget config key" not in err
+    assert "projected_enabled" not in err

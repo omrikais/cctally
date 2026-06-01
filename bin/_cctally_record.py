@@ -909,39 +909,29 @@ def maybe_record_projected_alert(saved: dict[str, Any]) -> None:
     SUM this same tick, so this is not a second aggregation pass; the pre-probe
     additionally skips it entirely when all budget levels are latched.
     """
-    # Read config blocks directly (not via the validated getter dicts) so this
-    # detector is forward-compatible with the later config implementer that
-    # adds `projected_enabled` to _get_{alerts,budget}_config: until then the
-    # getter dicts omit the key, but the raw block carries whatever the user
-    # set. Master gates still route through _get_*_config / _budget_alerts_active
-    # for the parent-axis predicates.
+    # The `projected_enabled` toggles are validated keys on the alerts/budget
+    # blocks (bool-validated; default OFF), so read them straight off the
+    # validated getter dicts — no raw-block fallback (which would re-emit the
+    # "unknown alerts config key" warning every tick and bypass bool
+    # validation). Master gates still compose with the parent-axis predicates.
     cfg = load_config()
     try:
         alerts_cfg = _get_alerts_config(cfg)
     except sys.modules["cctally"]._AlertsConfigError as exc:
         _warn_alerts_bad_config_once(exc)
-        alerts_cfg = {"enabled": False}
+        alerts_cfg = {"enabled": False, "projected_enabled": False}
     try:
         budget_cfg = _get_budget_config(cfg)
     except sys.modules["cctally"]._BudgetConfigError as exc:
         _warn_budget_bad_config_once(exc)
         budget_cfg = {}
 
-    alerts_block = (cfg or {}).get("alerts") if isinstance(cfg, dict) else None
-    budget_block = (cfg or {}).get("budget") if isinstance(cfg, dict) else None
-    alerts_projected_on = bool(
-        (alerts_block or {}).get("projected_enabled")
-        if isinstance(alerts_block, dict)
-        else alerts_cfg.get("projected_enabled")
+    weekly_on = bool(alerts_cfg.get("enabled")) and bool(
+        alerts_cfg.get("projected_enabled")
     )
-    budget_projected_on = bool(
-        (budget_block or {}).get("projected_enabled")
-        if isinstance(budget_block, dict)
-        else budget_cfg.get("projected_enabled")
+    budget_on = _budget_alerts_active(budget_cfg) and bool(
+        budget_cfg.get("projected_enabled")
     )
-
-    weekly_on = bool(alerts_cfg.get("enabled")) and alerts_projected_on
-    budget_on = _budget_alerts_active(budget_cfg) and budget_projected_on
     if not (weekly_on or budget_on):
         return  # cheap config-only path — non-projected users pay nothing
 
@@ -990,9 +980,13 @@ def maybe_record_projected_alert(saved: dict[str, Any]) -> None:
                     conn, week_start_at=b_week_key, metric="budget_usd",
                     levels=thresholds,
                 ):
+                    # skip_sync=True: the actual-budget axis
+                    # (maybe_record_budget_milestone) already ran a
+                    # _sum_cost_for_range this same tick, warming the cache.
+                    # Avoids a redundant JSONL ingest pass here.
                     inputs = _build_budget_status_inputs(
                         conn, target_usd=target, now_utc=now_utc,
-                        alert_thresholds=thresholds,
+                        alert_thresholds=thresholds, skip_sync=True,
                     )
                     if inputs is not None:
                         status = compute_budget_status(inputs)

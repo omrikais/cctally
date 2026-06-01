@@ -427,7 +427,12 @@ class _AlertsConfigError(ValueError):
     """Raised by _get_alerts_config on invalid alerts block."""
 
 
-_ALERTS_CONFIG_VALID_KEYS = {"enabled", "weekly_thresholds", "five_hour_thresholds"}
+_ALERTS_CONFIG_VALID_KEYS = {
+    "enabled",
+    "weekly_thresholds",
+    "five_hour_thresholds",
+    "projected_enabled",
+}
 
 
 def _validate_threshold_list(name: str, value: object) -> "list[int]":
@@ -499,10 +504,20 @@ def _get_alerts_config(cfg: "dict | None") -> dict:
     five_hour = _validate_threshold_list(
         "five_hour_thresholds", block.get("five_hour_thresholds", [90, 95])
     )
+    # projected-pace opt-in (#121); default OFF so upgrades fire no surprise
+    # notifications. Bool-validated (NOT coerced) so a non-bool is a config
+    # error, not silently truthy.
+    projected_enabled = block.get("projected_enabled", False)
+    if not isinstance(projected_enabled, bool):
+        raise _AlertsConfigError(
+            f"alerts.projected_enabled must be a JSON boolean, got "
+            f"{type(projected_enabled).__name__}: {projected_enabled!r}"
+        )
     return {
         "enabled": enabled,
         "weekly_thresholds": weekly,
         "five_hour_thresholds": five_hour,
+        "projected_enabled": projected_enabled,
     }
 
 
@@ -517,8 +532,14 @@ _BUDGET_DEFAULTS = {
     "weekly_usd": None,            # None = no budget (default)
     "alerts_enabled": True,        # "on when set"
     "alert_thresholds": [90, 100],
+    "projected_enabled": False,    # projected-pace opt-in (#121); default OFF
 }
-_BUDGET_CONFIG_VALID_KEYS = {"weekly_usd", "alerts_enabled", "alert_thresholds"}
+_BUDGET_CONFIG_VALID_KEYS = {
+    "weekly_usd",
+    "alerts_enabled",
+    "alert_thresholds",
+    "projected_enabled",
+}
 
 
 def _get_budget_config(cfg: dict) -> dict:
@@ -578,6 +599,12 @@ def _get_budget_config(cfg: dict) -> dict:
                 )
             cleaned.append(t)
         out["alert_thresholds"] = sorted(set(cleaned))  # empty list allowed (silenced)
+
+    if "projected_enabled" in block:
+        v = block["projected_enabled"]
+        if not isinstance(v, bool):
+            raise _BudgetConfigError("budget.projected_enabled must be a boolean")
+        out["projected_enabled"] = v
 
     return out
 

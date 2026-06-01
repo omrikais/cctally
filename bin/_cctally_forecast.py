@@ -266,7 +266,9 @@ def _resolve_current_budget_window(conn, now_utc):
     return (week_start_at, week_end_at)
 
 
-def _build_budget_status_inputs(conn, *, target_usd, now_utc, alert_thresholds):
+def _build_budget_status_inputs(
+    conn, *, target_usd, now_utc, alert_thresholds, skip_sync=False
+):
     """Gather live spend over the current subscription week and build a
     :class:`BudgetInputs`. Returns ``None`` when no week window resolves.
 
@@ -280,19 +282,29 @@ def _build_budget_status_inputs(conn, *, target_usd, now_utc, alert_thresholds):
     (``max(week_start_at, now - 24h)``) so a heavy spend just before reset
     can't leak last week's dollars into a fresh week's verdict (false
     WARN/OVER).
+
+    ``skip_sync`` skips the JSONL ingest pass inside ``get_entries`` for BOTH
+    cost SUMs — used by the projected-pace record path, where the actual-budget
+    axis already ran ``_sum_cost_for_range`` (warming the cache) earlier in the
+    same ``cmd_record_usage`` tick. The default ``False`` preserves the
+    standalone ``budget`` command's sync-on-read behavior unchanged.
     """
     c = _cctally()
     window = _resolve_current_budget_window(conn, now_utc)
     if window is None:
         return None
     week_start_at, week_end_at = window
-    spent = c._sum_cost_for_range(week_start_at, now_utc, mode="auto")
+    spent = c._sum_cost_for_range(
+        week_start_at, now_utc, mode="auto", skip_sync=skip_sync
+    )
     # Clamp the recent-rate window at the week start: both bounds are tz-aware
     # so max() is well-defined. Without this, a brand-new week (now < week
     # start + 24h) would pull pre-reset spend into rate_recent and flip a
     # fresh verdict to warn/over.
     recent_start = max(week_start_at, now_utc - dt.timedelta(hours=24))
-    recent_24h = c._sum_cost_for_range(recent_start, now_utc, mode="auto")
+    recent_24h = c._sum_cost_for_range(
+        recent_start, now_utc, mode="auto", skip_sync=skip_sync
+    )
     return c.BudgetInputs(
         target_usd=float(target_usd),
         spent_usd=float(spent),
