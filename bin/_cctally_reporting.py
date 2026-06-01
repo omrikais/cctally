@@ -28,9 +28,11 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import json
 import sys
+from typing import Any
 
-from _cctally_core import _command_as_of, open_db, parse_iso_datetime
+from _cctally_core import _command_as_of, eprint, open_db, parse_iso_datetime
 
 
 def _cctally():
@@ -593,4 +595,154 @@ def cmd_session(args: argparse.Namespace) -> int:
         tz=tz,
         compact=getattr(args, "compact", False),
     ))
+    return 0
+
+
+def cmd_range_cost(args: argparse.Namespace) -> int:
+    c = _cctally()
+    # Session A (spec §7.2 / §7.6 row note): range-cost has no --tz of
+    # its own — start/end carry their own zone via ISO 8601. Calling the
+    # bridge keeps the alias-surface contract uniform across the 10
+    # in-scope cmds: -z/--timezone lands on args.tz unchanged (no
+    # downstream consumer), so this is a documented no-op for this
+    # command. The bridge still runs _resolve_claude_tz_name so the §9.2a
+    # production-path coverage is exercised here too.
+    config = c._load_claude_config_for_args(args)
+    c._bridge_z_into_tz(args, config)
+    start_dt = parse_iso_datetime(args.start, "--start")
+    if args.end:
+        end_dt = parse_iso_datetime(args.end, "--end")
+    else:
+        # internal fallback: host-local intentional
+        end_dt = dt.datetime.now().astimezone()
+    if end_dt < start_dt:
+        eprint("Error: --end must be after --start")
+        return 1
+
+    total_cost = 0.0
+    matched_entries = 0
+    first_match: dt.datetime | None = None
+    last_match: dt.datetime | None = None
+    model_buckets: dict[str, dict[str, Any]] = {}
+
+    # Issue #89: keep the loaded list around so the --debug report can
+    # describe the same dataset as the rendered output. Project filter is
+    # applied at the loader (SELECT-time), so the scope is the same.
+    # P2.2 (issue #89 review-loop): get_entries already returns
+    # list[UsageEntry] per bin/_cctally_cache.py:1224 — no list() wrap.
+    entries_list = c.get_entries(start_dt, end_dt, project=args.project)
+    c._emit_debug_samples_if_set(
+        args, entries_list, command_label="range-cost",
+    )
+
+    for entry in entries_list:
+        cost = c._calculate_entry_cost(
+            entry.model, entry.usage, mode=args.mode, cost_usd=entry.cost_usd,
+        )
+        total_cost += cost
+        matched_entries += 1
+
+        if first_match is None or entry.timestamp < first_match:
+            first_match = entry.timestamp
+        if last_match is None or entry.timestamp > last_match:
+            last_match = entry.timestamp
+
+        if entry.model not in model_buckets:
+            model_buckets[entry.model] = {
+                "entries": 0, "inputTokens": 0, "outputTokens": 0,
+                "cacheCreationTokens": 0, "cacheReadTokens": 0, "costUSD": 0.0,
+            }
+        b = model_buckets[entry.model]
+        b["entries"] += 1
+        b["inputTokens"] += entry.usage.get("input_tokens", 0)
+        b["outputTokens"] += entry.usage.get("output_tokens", 0)
+        b["cacheCreationTokens"] += entry.usage.get("cache_creation_input_tokens", 0)
+        b["cacheReadTokens"] += entry.usage.get("cache_read_input_tokens", 0)
+        b["costUSD"] += cost
+
+    if args.total_only:
+        print(f"{total_cost:.9f}")
+        return 0
+
+    if args.json:
+        breakdowns = []
+        for model in sorted(model_buckets, key=lambda m: -model_buckets[m]["costUSD"]):
+            b = model_buckets[model]
+            total_tokens = (
+                b["inputTokens"] + b["outputTokens"]
+                + b["cacheCreationTokens"] + b["cacheReadTokens"]
+            )
+            breakdowns.append({
+                "model": model,
+                "entries": b["entries"],
+                "inputTokens": b["inputTokens"],
+                "outputTokens": b["outputTokens"],
+                "cacheCreationTokens": b["cacheCreationTokens"],
+                "cacheReadTokens": b["cacheReadTokens"],
+                "totalTokens": total_tokens,
+                "costUSD": round(b["costUSD"], 9),
+            })
+        output = {
+            "start": start_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "end": end_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "mode": args.mode,
+            "project": args.project,
+            "matchedEntries": matched_entries,
+            "totalCostUSD": round(total_cost, 9),
+            "firstMatchedEntry": (
+                first_match.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                if first_match else None
+            ),
+            "lastMatchedEntry": (
+                last_match.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                if last_match else None
+            ),
+            "modelBreakdowns": breakdowns,
+        }
+        print(json.dumps(output, indent=2))
+        return 0
+
+    if args.breakdown:
+        headers = ["Model", "Entries", "Input", "Output", "Cache Create", "Cache Read", "Total Tokens", "Cost (USD)"]
+        rows: list[list[str]] = []
+        for model in sorted(model_buckets, key=lambda m: -model_buckets[m]["costUSD"]):
+            b = model_buckets[model]
+            total_tokens = (
+                b["inputTokens"] + b["outputTokens"]
+                + b["cacheCreationTokens"] + b["cacheReadTokens"]
+            )
+            rows.append([
+                model,
+                f"{b['entries']:,}",
+                f"{b['inputTokens']:,}",
+                f"{b['outputTokens']:,}",
+                f"{b['cacheCreationTokens']:,}",
+                f"{b['cacheReadTokens']:,}",
+                f"{total_tokens:,}",
+                f"${b['costUSD']:.9f}",
+            ])
+        # Total row
+        tot_entries = matched_entries
+        tot_inp = sum(b["inputTokens"] for b in model_buckets.values())
+        tot_out = sum(b["outputTokens"] for b in model_buckets.values())
+        tot_cc = sum(b["cacheCreationTokens"] for b in model_buckets.values())
+        tot_cr = sum(b["cacheReadTokens"] for b in model_buckets.values())
+        tot_tokens = tot_inp + tot_out + tot_cc + tot_cr
+        rows.append([
+            "Total",
+            f"{tot_entries:,}",
+            f"{tot_inp:,}",
+            f"{tot_out:,}",
+            f"{tot_cc:,}",
+            f"{tot_cr:,}",
+            f"{tot_tokens:,}",
+            f"${total_cost:.9f}",
+        ])
+
+        aligns = ["left"] + ["right"] * (len(headers) - 1)
+        print(c._boxed_table(headers, rows, aligns, compact=args.compact))
+        return 0
+
+    # Default: print cost
+    print(f"${total_cost:.9f}")
     return 0

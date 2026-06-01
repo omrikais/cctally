@@ -25,6 +25,7 @@
     "bin/_cctally_core.py",
     "bin/_cctally_dashboard.py",
     "bin/_cctally_db.py",
+    "bin/_cctally_diff.py",
     "bin/_cctally_doctor.py",
     "bin/_cctally_five_hour.py",
     "bin/_cctally_forecast.py",
