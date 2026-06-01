@@ -85,6 +85,15 @@ export function SettingsOverlay() {
     () => getState().alertsConfig,
   );
   const [alertsEnabled, setAlertsEnabled] = useState<boolean>(alertsConfig.enabled);
+  // Projected axis (issue #121): two opt-in toggles. `projected_weekly`
+  // routes to `alerts.projected_enabled`; `projected_budget` routes to
+  // `budget.projected_enabled` in the POST /api/settings body.
+  const [projectedWeekly, setProjectedWeekly] = useState<boolean>(
+    alertsConfig.projected_weekly_enabled ?? false,
+  );
+  const [projectedBudget, setProjectedBudget] = useState<boolean>(
+    alertsConfig.projected_budget_enabled ?? false,
+  );
   const [testSubmitting, setTestSubmitting] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
   const [testAxis, setTestAxis] = useState<AlertAxis>('weekly');
@@ -105,7 +114,13 @@ export function SettingsOverlay() {
   // the TZ re-seed above: without it the toggle would appear stuck.
   useEffect(() => {
     setAlertsEnabled(alertsConfig.enabled);
-  }, [alertsConfig.enabled]);
+    setProjectedWeekly(alertsConfig.projected_weekly_enabled ?? false);
+    setProjectedBudget(alertsConfig.projected_budget_enabled ?? false);
+  }, [
+    alertsConfig.enabled,
+    alertsConfig.projected_weekly_enabled,
+    alertsConfig.projected_budget_enabled,
+  ]);
 
   useKeymap([
     // Parity with main's settings.js#152: don't stack Settings under an
@@ -141,10 +156,20 @@ export function SettingsOverlay() {
       setPerPage(prefs.sessionsPerPage);
       setFilter(filterTerm);
       setAlertsEnabled(alertsConfig.enabled);
+      setProjectedWeekly(alertsConfig.projected_weekly_enabled ?? false);
+      setProjectedBudget(alertsConfig.projected_budget_enabled ?? false);
       setTestError(null);
       setTestAxis('weekly');
     }
-  }, [open, prefs.sortDefault, prefs.sessionsPerPage, filterTerm, alertsConfig.enabled]);
+  }, [
+    open,
+    prefs.sortDefault,
+    prefs.sessionsPerPage,
+    filterTerm,
+    alertsConfig.enabled,
+    alertsConfig.projected_weekly_enabled,
+    alertsConfig.projected_budget_enabled,
+  ]);
 
   if (!open) return null;
 
@@ -155,6 +180,12 @@ export function SettingsOverlay() {
   const tzCustomValid = tzMode !== 'custom' || isValidIANA(tzCustom.trim());
   const tzDirty = tzTargetValue !== display.tz;
   const alertsDirty = alertsEnabled !== alertsConfig.enabled;
+  // Projected toggles dirty independently — `alerts.projected_enabled`
+  // travels in the `alerts` block, `budget.projected_enabled` in `budget`.
+  const projectedWeeklyDirty =
+    projectedWeekly !== (alertsConfig.projected_weekly_enabled ?? false);
+  const projectedBudgetDirty =
+    projectedBudget !== (alertsConfig.projected_budget_enabled ?? false);
   // Save is gated when TZ is dirty-but-invalid (custom mode with
   // unparseable zone) or while a server-side POST is in flight. Non-TZ
   // dispatches are synchronous local-state updates and can't fail, so
@@ -177,8 +208,18 @@ export function SettingsOverlay() {
       }
       body.display = { tz: tzTargetValue };
     }
-    if (alertsDirty) {
-      body.alerts = { enabled: alertsEnabled };
+    // The `alerts` block carries `enabled` (master) and the weekly-projected
+    // toggle (`alerts.projected_enabled`); send only the dirty sub-keys.
+    if (alertsDirty || projectedWeeklyDirty) {
+      const alertsBlock: Record<string, unknown> = {};
+      if (alertsDirty) alertsBlock.enabled = alertsEnabled;
+      if (projectedWeeklyDirty) alertsBlock.projected_enabled = projectedWeekly;
+      body.alerts = alertsBlock;
+    }
+    // The budget-projected toggle lives in its OWN config block
+    // (`budget.projected_enabled`) — separate from `alerts` (issue #19/#121).
+    if (projectedBudgetDirty) {
+      body.budget = { projected_enabled: projectedBudget };
     }
     if (Object.keys(body).length > 0) {
       setTzSubmitting(true);
@@ -333,6 +374,31 @@ export function SettingsOverlay() {
               {' · '}
               Budget: {(alertsConfig.budget_thresholds ?? []).map((t) => `${t}%`).join(', ') || '—'}
             </p>
+            {/*
+              Projected-pace toggles (issue #121). Two independent opt-ins,
+              both default OFF, each gated server-side behind its parent
+              axis's master switch. `projected_weekly` → `alerts.projected_enabled`;
+              `projected_budget` → `budget.projected_enabled` (its own config
+              block). Values mirror from alerts_settings each tick.
+            */}
+            <label>
+              <input
+                type="checkbox"
+                name="projected-weekly-enabled"
+                checked={projectedWeekly}
+                onChange={(e) => setProjectedWeekly(e.target.checked)}
+              />{' '}
+              Projected weekly-% pace alerts
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                name="projected-budget-enabled"
+                checked={projectedBudget}
+                onChange={(e) => setProjectedBudget(e.target.checked)}
+              />{' '}
+              Projected budget-$ pace alerts
+            </label>
             <div className="alerts-test-row">
               <label>
                 Axis{' '}

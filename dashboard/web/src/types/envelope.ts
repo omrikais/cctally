@@ -138,7 +138,13 @@ export interface UpdateEnvelope {
 
 // ---- Threshold-actions alerts (T5/T8) --------------------------------
 
-export type AlertAxis = 'weekly' | 'five_hour' | 'budget';
+export type AlertAxis = 'weekly' | 'five_hour' | 'budget' | 'projected';
+
+// Projected axis (issue #121): the `metric` discriminator selects which
+// week-average projection fired (weekly-% against the cap vs budget-$
+// against the target). Top-level on the envelope row AND mirrored inside
+// `context` so the metric-aware renderer can read either.
+export type ProjectedMetric = 'weekly_pct' | 'budget_usd';
 
 export interface AlertEntry {
   id: string;                    // "axis:window_key:threshold"
@@ -146,6 +152,9 @@ export interface AlertEntry {
   threshold: number;             // integer in [1, 100]
   crossed_at: string;            // ISO-8601 UTC
   alerted_at: string;            // ISO-8601 UTC
+  // Projected axis (issue #121): top-level metric discriminator. Absent on
+  // the weekly/five_hour/budget axes.
+  metric?: ProjectedMetric;
   context: {
     week_start_date?: string;
     cumulative_cost_usd?: number;
@@ -159,6 +168,13 @@ export interface AlertEntry {
     budget_usd?: number;
     spent_usd?: number;
     consumption_pct?: number;
+    // Projected axis (issue #121): rendered FROM THE ROW (not live config —
+    // Codex P0-4). `projected_value` is the week-average projection (% for
+    // weekly_pct, $ for budget_usd); `denominator` is the cap (100.0) or the
+    // budget target ($). `metric` repeats the top-level discriminator.
+    metric?: ProjectedMetric;
+    projected_value?: number;
+    denominator?: number;
   };
 }
 
@@ -171,6 +187,12 @@ export interface AlertsSettingsEnvelope {
   // reflects `_budget_alerts_active` (a budget set AND alerts on).
   budget_thresholds: number[];
   budget_enabled?: boolean;
+  // Projected axis (issue #121): the two opt-in toggles, mirrored from
+  // `_get_alerts_config(...)["projected_enabled"]` (weekly leg) and
+  // `_get_budget_config(...)["projected_enabled"]` (budget leg). Both
+  // default false; gated behind their parent axis master switch server-side.
+  projected_weekly_enabled?: boolean;
+  projected_budget_enabled?: boolean;
 }
 
 export interface DisplayEnvelope {

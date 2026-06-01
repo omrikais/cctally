@@ -118,6 +118,63 @@ describe('<Toast />', () => {
       expect(t).toHaveTextContent('budget');
     });
 
+    it('renders PROJECTED chip + "projected …% of cap" on projected weekly_pct axis (issue #121)', () => {
+      render(<Toast />);
+      act(() => {
+        dispatch({
+          type: 'SHOW_ALERT_TOAST',
+          alert: {
+            id: 'projected:2026-04-27T00:00:00Z:weekly_pct:100',
+            axis: 'projected',
+            metric: 'weekly_pct',
+            threshold: 100,
+            crossed_at: '2026-04-29T14:32:11Z',
+            alerted_at: '2026-04-29T14:32:11Z',
+            context: {
+              week_start_at: '2026-04-27T00:00:00Z',
+              metric: 'weekly_pct',
+              projected_value: 102,
+              denominator: 100,
+            },
+          },
+        });
+      });
+      const t = transientToast();
+      expect(t).not.toBeNull();
+      expect(t).toHaveTextContent('PROJECTED');
+      expect(t!.querySelector('.chip--projected')).not.toBeNull();
+      expect(t).toHaveTextContent('projected 102% of cap');
+      // Threshold >= 95 is red.
+      expect(t!.classList.contains('toast--severity-red')).toBe(true);
+    });
+
+    it('renders "projected $312 of $300" on projected budget_usd axis (issue #121)', () => {
+      render(<Toast />);
+      act(() => {
+        dispatch({
+          type: 'SHOW_ALERT_TOAST',
+          alert: {
+            id: 'projected:2026-04-27T00:00:00Z:budget_usd:100',
+            axis: 'projected',
+            metric: 'budget_usd',
+            threshold: 100,
+            crossed_at: '2026-04-29T14:32:11Z',
+            alerted_at: '2026-04-29T14:32:11Z',
+            context: {
+              week_start_at: '2026-04-27T00:00:00Z',
+              metric: 'budget_usd',
+              projected_value: 312,
+              denominator: 300,
+            },
+          },
+        });
+      });
+      const t = transientToast();
+      expect(t).not.toBeNull();
+      expect(t!.querySelector('.chip--projected')).not.toBeNull();
+      expect(t).toHaveTextContent('projected $312 of $300');
+    });
+
     it('renders 5H-BLOCK chip on five_hour axis', () => {
       render(<Toast />);
       act(() => {

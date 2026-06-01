@@ -292,6 +292,9 @@ describe('alerts store (T8)', () => {
       five_hour_thresholds: [90, 95],
       budget_thresholds: [90, 100],
       budget_enabled: false,
+      // Projected axis (issue #121): both opt-in toggles default OFF.
+      projected_weekly_enabled: false,
+      projected_budget_enabled: false,
     });
   });
 

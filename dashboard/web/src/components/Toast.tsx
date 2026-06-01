@@ -3,7 +3,11 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { OnboardingToast } from './OnboardingToast';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt } from '../lib/fmt';
-import { AXIS_CHIP_LABEL, AXIS_TITLE_LABEL } from '../lib/alertAxis';
+import {
+  AXIS_CHIP_LABEL,
+  AXIS_TITLE_LABEL,
+  projectedContextText,
+} from '../lib/alertAxis';
 
 // Toast variant pattern (T8). The `status` shape is the legacy
 // transient message (2.5s auto-dismiss); the `alert` shape is a
@@ -51,8 +55,17 @@ export function Toast() {
             <span className="toast--alert-dismiss-hint">click to dismiss</span>
           </div>
           <div className="toast--alert-title">
-            {AXIS_TITLE_LABEL[toast.payload.axis]} usage{' '}
-            {toast.payload.threshold}% reached
+            {toast.payload.axis === 'projected' ? (
+              <>
+                {AXIS_TITLE_LABEL.projected} to reach{' '}
+                {toast.payload.threshold}%
+              </>
+            ) : (
+              <>
+                {AXIS_TITLE_LABEL[toast.payload.axis]} usage{' '}
+                {toast.payload.threshold}% reached
+              </>
+            )}
           </div>
           {toast.payload.context.week_start_date && (
             <div className="toast--alert-sub">
@@ -120,6 +133,14 @@ export function Toast() {
                   budget
                 </>
               )}
+            {toast.payload.axis === 'projected' && (
+              // Projected axis (issue #121): metric-aware body via the
+              // shared helper ("projected 102% of cap" / "projected $312
+              // of $300"). Read from the row, not live config (Codex P0-4).
+              <span className="num">
+                {projectedContextText(toast.payload) ?? '—'}
+              </span>
+            )}
           </div>
         </div>
       )}

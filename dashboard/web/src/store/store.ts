@@ -230,6 +230,10 @@ export interface AlertsConfig {
   // its thresholds + enabled-reflection into alerts_settings.
   budget_thresholds: number[];
   budget_enabled?: boolean;
+  // Projected axis (issue #121): the two opt-in toggles mirrored from the
+  // envelope's alerts_settings block. Both default false.
+  projected_weekly_enabled?: boolean;
+  projected_budget_enabled?: boolean;
 }
 
 export interface UIState {
@@ -378,6 +382,8 @@ function defaultAlertsConfig(): AlertsConfig {
     five_hour_thresholds: [90, 95],
     budget_thresholds: [90, 100],
     budget_enabled: false,
+    projected_weekly_enabled: false,
+    projected_budget_enabled: false,
   };
 }
 

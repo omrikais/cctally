@@ -37,7 +37,43 @@ const DEFAULT_ALERTS_SETTINGS = {
   five_hour_thresholds: [90, 95],
   budget_thresholds: [90, 100],
   budget_enabled: false,
+  projected_weekly_enabled: false,
+  projected_budget_enabled: false,
 };
+
+function mkProjectedWeeklyAlert(threshold: 90 | 100 = 100): AlertEntry {
+  return {
+    id: `projected:2026-04-21T00:00:00Z:weekly_pct:${threshold}`,
+    axis: 'projected',
+    metric: 'weekly_pct',
+    threshold,
+    crossed_at: '2026-04-23T13:00:00Z',
+    alerted_at: '2026-04-23T13:00:00Z',
+    context: {
+      week_start_at: '2026-04-21T00:00:00Z',
+      metric: 'weekly_pct',
+      projected_value: 102,
+      denominator: 100,
+    },
+  };
+}
+
+function mkProjectedBudgetAlert(threshold: 90 | 100 = 100): AlertEntry {
+  return {
+    id: `projected:2026-04-21T00:00:00Z:budget_usd:${threshold}`,
+    axis: 'projected',
+    metric: 'budget_usd',
+    threshold,
+    crossed_at: '2026-04-23T14:00:00Z',
+    alerted_at: '2026-04-23T14:00:00Z',
+    context: {
+      week_start_at: '2026-04-21T00:00:00Z',
+      metric: 'budget_usd',
+      projected_value: 312,
+      denominator: 300,
+    },
+  };
+}
 
 function mkBudgetAlert(idx: number, threshold: 90 | 100 = 90): AlertEntry {
   return {
@@ -182,6 +218,40 @@ describe('<RecentAlertsModal />', () => {
     expect(context).not.toBeNull();
     expect(context!.textContent ?? '').toMatch(/Week of/);
     expect(context!.textContent ?? '').toMatch(/90% of budget/);
+  });
+
+  it('renders a projected weekly_pct row end-to-end: PROJECTED chip + "projected …% of cap" (issue #121)', () => {
+    // Modal-level integration: drives a projected weekly_pct alert through
+    // the full RecentAlertsModal render — chip label + metric-aware
+    // ContextCell ("projected 102% of cap").
+    dispatch({
+      type: 'INGEST_SNAPSHOT_ALERTS',
+      alerts: [mkProjectedWeeklyAlert(100)],
+      alertsSettings: DEFAULT_ALERTS_SETTINGS,
+      isFirstTick: true,
+    });
+    render(<RecentAlertsModal />);
+    const row = document.querySelector('tbody tr')!;
+    const chip = row.querySelector('.chip--projected');
+    expect(chip).not.toBeNull();
+    expect(chip).toHaveTextContent('PROJECTED');
+    const context = row.querySelector('.alert-context--projected');
+    expect(context).not.toBeNull();
+    expect(context!.textContent ?? '').toMatch(/projected 102% of cap/);
+  });
+
+  it('renders a projected budget_usd row: "projected $312 of $300" (issue #121)', () => {
+    dispatch({
+      type: 'INGEST_SNAPSHOT_ALERTS',
+      alerts: [mkProjectedBudgetAlert(100)],
+      alertsSettings: DEFAULT_ALERTS_SETTINGS,
+      isFirstTick: true,
+    });
+    render(<RecentAlertsModal />);
+    const row = document.querySelector('tbody tr')!;
+    expect(row.querySelector('.chip--projected')).toHaveTextContent('PROJECTED');
+    const context = row.querySelector('.alert-context--projected');
+    expect(context!.textContent ?? '').toMatch(/projected \$312 of \$300/);
   });
 
   it('renders empty state when no alerts', () => {

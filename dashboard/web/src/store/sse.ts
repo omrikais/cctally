@@ -119,6 +119,10 @@ const FALLBACK_ALERTS_SETTINGS = {
   // won't carry these; default to "no thresholds / disabled".
   budget_thresholds: [] as number[],
   budget_enabled: false,
+  // Projected axis (issue #121) — a stale Python without the projected leg
+  // won't carry these; default to "disabled".
+  projected_weekly_enabled: false,
+  projected_budget_enabled: false,
 };
 
 function ingestAlerts(snap: Envelope): void {

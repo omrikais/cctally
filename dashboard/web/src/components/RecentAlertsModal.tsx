@@ -3,7 +3,7 @@ import { Modal } from '../modals/Modal';
 import { getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt } from '../lib/fmt';
-import { AXIS_CHIP_LABEL } from '../lib/alertAxis';
+import { AXIS_CHIP_LABEL, projectedContextText } from '../lib/alertAxis';
 import type { AlertEntry } from '../types/envelope';
 
 // Recent alerts modal — full history (last 100). ESC and backdrop
@@ -68,6 +68,17 @@ function ContextCell({
       </span>
     );
   }
+  if (alert.axis === 'projected') {
+    // Projected axis (issue #121): metric-aware context, read from the row
+    // (Codex P0-4). The `metric` discriminator drives a single helper
+    // (alertAxis.projectedContextText) rather than nested axis/metric arms.
+    const text = projectedContextText(alert);
+    return (
+      <span className="alert-context alert-context--projected">
+        {text ?? 'Projected —'}
+      </span>
+    );
+  }
   // axis === 'five_hour' — render block start time only. Do NOT
   // append any model token here (see header comment).
   const t = alert.context.block_start_at
@@ -81,6 +92,12 @@ function ContextCell({
 }
 
 function CostCell({ alert }: { alert: AlertEntry }): JSX.Element {
+  if (alert.axis === 'projected') {
+    // Projected axis (issue #121): there is no realized spend — the
+    // projection lives in the Context column (metric-aware). The Cost
+    // column has nothing to show, so render an em-dash placeholder.
+    return <span className="num">—</span>;
+  }
   let v: number | undefined;
   if (alert.axis === 'weekly') {
     v = alert.context.cumulative_cost_usd;

@@ -263,6 +263,124 @@ describe('<SettingsOverlay />', () => {
       uninstallGlobalKeydown();
     });
 
+    it('projected toggles render unchecked by default (issue #121)', async () => {
+      render(<SettingsOverlay />);
+      const user = userEvent.setup();
+      await user.keyboard('s');
+      const weekly = document.querySelector(
+        'input[type="checkbox"][name="projected-weekly-enabled"]',
+      ) as HTMLInputElement;
+      const budget = document.querySelector(
+        'input[type="checkbox"][name="projected-budget-enabled"]',
+      ) as HTMLInputElement;
+      expect(weekly).toBeTruthy();
+      expect(budget).toBeTruthy();
+      expect(weekly.checked).toBe(false);
+      expect(budget.checked).toBe(false);
+      uninstallGlobalKeydown();
+    });
+
+    it('projected-weekly toggle POSTs {alerts: {projected_enabled: true}} (issue #121)', async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({}),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      render(<SettingsOverlay />);
+      const user = userEvent.setup();
+      await user.keyboard('s');
+      const weekly = document.querySelector(
+        'input[type="checkbox"][name="projected-weekly-enabled"]',
+      ) as HTMLInputElement;
+      await user.click(weekly);
+      await user.click(screen.getByText('Save'));
+      await waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledWith(
+          '/api/settings',
+          expect.objectContaining({ method: 'POST' }),
+        );
+      });
+      const call = fetchMock.mock.calls.find((c) => c[0] === '/api/settings')!;
+      const body = JSON.parse(call[1].body as string);
+      expect(body).toEqual({ alerts: { projected_enabled: true } });
+      uninstallGlobalKeydown();
+    });
+
+    it('projected-budget toggle POSTs {budget: {projected_enabled: true}} in its own block (issue #121)', async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({}),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      render(<SettingsOverlay />);
+      const user = userEvent.setup();
+      await user.keyboard('s');
+      const budget = document.querySelector(
+        'input[type="checkbox"][name="projected-budget-enabled"]',
+      ) as HTMLInputElement;
+      await user.click(budget);
+      await user.click(screen.getByText('Save'));
+      await waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledWith(
+          '/api/settings',
+          expect.objectContaining({ method: 'POST' }),
+        );
+      });
+      const call = fetchMock.mock.calls.find((c) => c[0] === '/api/settings')!;
+      const body = JSON.parse(call[1].body as string);
+      expect(body).toEqual({ budget: { projected_enabled: true } });
+      uninstallGlobalKeydown();
+    });
+
+    it('master alerts + projected-weekly both dirty → one alerts block with both keys (issue #121)', async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({}),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      render(<SettingsOverlay />);
+      const user = userEvent.setup();
+      await user.keyboard('s');
+      await user.click(
+        document.querySelector(
+          'input[type="checkbox"][name="alerts-enabled"]',
+        ) as HTMLInputElement,
+      );
+      await user.click(
+        document.querySelector(
+          'input[type="checkbox"][name="projected-weekly-enabled"]',
+        ) as HTMLInputElement,
+      );
+      await user.click(screen.getByText('Save'));
+      await waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledWith(
+          '/api/settings',
+          expect.objectContaining({ method: 'POST' }),
+        );
+      });
+      const call = fetchMock.mock.calls.find((c) => c[0] === '/api/settings')!;
+      const body = JSON.parse(call[1].body as string);
+      expect(body).toEqual({
+        alerts: { enabled: true, projected_enabled: true },
+      });
+      uninstallGlobalKeydown();
+    });
+
+    it('projected test axis option appears in the Send-test-alert axis select (issue #121)', async () => {
+      render(<SettingsOverlay />);
+      const user = userEvent.setup();
+      await user.keyboard('s');
+      const select = document.querySelector(
+        'select[aria-label="Test alert axis"]',
+      ) as HTMLSelectElement;
+      const options = Array.from(select.options).map((o) => o.value);
+      expect(options).toContain('projected');
+      uninstallGlobalKeydown();
+    });
+
     it('combined save: tz dirty + alerts dirty → single POST with both blocks', async () => {
       const fetchMock = vi.fn().mockResolvedValue({
         ok: true,
