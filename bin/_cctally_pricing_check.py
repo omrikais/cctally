@@ -1,9 +1,11 @@
 """`cctally pricing-check` subcommand entry point.
 
 I/O sibling: holds the network/existence fetchers + `cmd_pricing_check`
-+ the text renderer, plus the two `_ENV_PRICING_*` test-injection env-var
-name constants (module-private here). The pure decision kernel lives in
-`_lib_pricing_check` (imported qualified, module-top).
++ the text renderer + `_pricing_observed_models` (the offline cache-scan
+coverage leg, #125 Batch E C7), plus the two `_ENV_PRICING_*`
+test-injection env-var name constants (module-private here). The pure
+decision kernel lives in `_lib_pricing_check` (imported qualified,
+module-top).
 
 Honest *name* imports are KERNEL-ONLY (`_cctally_core`). The qualified
 `_lib_pricing_check` import is the eagerly-preloaded library kernel
@@ -20,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime as dt
 import json
 import os
 import pathlib
+import sqlite3
 import sys
 import urllib.request
 
@@ -167,6 +171,77 @@ def _pricing_existence_check() -> dict:
     return {"status": "ok", "unpriced_vendor_models": gap}
 
 
+# Private sentinel so `_pricing_observed_models` can tell "default 30-day
+# window" apart from an explicit `since=None` all-history scan.
+_PRICING_SCAN_DEFAULT_WINDOW = object()
+
+
+def _pricing_observed_models(now_utc, *, since=_PRICING_SCAN_DEFAULT_WINDOW):
+    """Read-only scan of the session-entry cache for observed models.
+
+    Returns a list of ``(provider, model, entry_count, token_total)`` tuples,
+    one per DISTINCT model seen in ``cache.db`` (Claude ``session_entries`` +
+    Codex ``codex_session_entries``). By default it scans the trailing 30-day
+    window relative to ``now_utc`` (the `doctor` coverage signal — recent =
+    actionable). Pass ``since=<datetime>`` to widen/narrow the window, or
+    ``since=None`` explicitly for an all-history scan (used by `pricing-check`).
+
+    Read-only / no-mutation contract (spec §5.1): mirrors the freshness read
+    in this same function — guard on ``CACHE_DB_PATH.exists()``, raw
+    ``sqlite3.connect`` (NEVER ``open_cache_db()`` / ``sync_cache()`` /
+    ``load_config()`` / ``ensure_dirs()``), and treat a missing table/column as
+    "no observed models" rather than crashing. ``doctor --json`` on a virgin
+    HOME must not create ``APP_DIR`` — regression
+    ``test_pricing_observed_models_no_mutation_on_fresh_home``.
+    """
+    out: list = []
+    if not _cctally_core.CACHE_DB_PATH.exists():
+        return out
+    # Sentinel: the 30-day window is the default; `since=False` is not a
+    # supported value, so distinguish "caller wants all-history" (None) from
+    # "caller did not pass since" via a private marker.
+    if since is _PRICING_SCAN_DEFAULT_WINDOW:
+        cutoff_iso = (now_utc - dt.timedelta(days=30)).isoformat()
+    elif since is None:
+        cutoff_iso = None  # all-history
+    else:
+        cutoff_iso = since.isoformat()
+    try:
+        conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+    except sqlite3.Error:
+        return out
+    try:
+        # Token-sum expressions use the ACTUAL cache column names from
+        # bin/_cctally_db.py::_apply_cache_schema (verified — Claude uses
+        # cache_create_tokens, NOT cache_creation_tokens; Codex carries a
+        # materialized total_tokens covering input/cache/output/reasoning).
+        for provider, table, tok_expr in (
+            ("claude", "session_entries",
+             "COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+"
+             "COALESCE(cache_create_tokens,0)+COALESCE(cache_read_tokens,0)"),
+            ("codex", "codex_session_entries",
+             "COALESCE(total_tokens,0)"),
+        ):
+            where = "model IS NOT NULL"
+            params: tuple = ()
+            if cutoff_iso is not None:
+                where = "timestamp_utc >= ? AND " + where
+                params = (cutoff_iso,)
+            try:
+                rows = conn.execute(
+                    f"SELECT model, COUNT(*), SUM({tok_expr}) FROM {table} "
+                    f"WHERE {where} GROUP BY model",
+                    params,
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []  # table/column missing — treat as none
+            for model, cnt, toks in rows:
+                out.append((provider, model, int(cnt or 0), int(toks or 0)))
+    finally:
+        conn.close()
+    return out
+
+
 def cmd_pricing_check(args: argparse.Namespace) -> int:
     """`cctally pricing-check` — detect stale/missing embedded pricing.
 
@@ -197,7 +272,7 @@ def cmd_pricing_check(args: argparse.Namespace) -> int:
     # 1. Coverage — offline, all-history (since=None). Read-only scan; any
     #    failure degrades to [] (the scan itself swallows DB errors).
     try:
-        observed = c._pricing_observed_models(now_utc, since=None)
+        observed = _pricing_observed_models(now_utc, since=None)
         coverage = _lib_pricing_check.classify_coverage(
             observed,
             lambda m: c._resolve_model_pricing(m, warn=False),

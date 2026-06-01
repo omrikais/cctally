@@ -10,15 +10,22 @@ legacy bespoke hooks), the prompt / decision helpers, the four
 and the `cmd_setup` entry point.
 
 The settings.json I/O primitives (`_load_claude_settings`,
-`_write_claude_settings_atomic`, `_backup_claude_settings`),
-`CLAUDE_SETTINGS_PATH`, `SetupError`, `_is_cctally_hook_command`, and the
-`_LEGACY_*` constants stay in `bin/cctally` per spec §5.6 option A —
-preserves the existing `_e2e_pin_paths` test workaround verbatim (§5.4),
-plus keeps the monkeypatch-sensitive `_LEGACY_BESPOKE_HOOKS_DIR` /
-`_LEGACY_POLLER_PID_FILE` / `_LEGACY_POLLER_COUNT_FILE` constants on
-`cctally` where `monkeypatch.setitem(ns, ...)` lands. Helpers in this
-module reach them via `_cctally().<NAME>` (call-time lookup, monkeypatch
-propagates).
+`_write_claude_settings_atomic`, `_backup_claude_settings`), `SetupError`,
+`_is_cctally_hook_command`, and `cmd_repair_symlinks` now LIVE HERE
+(#125 Batch E, C10 — relocated from `bin/cctally`). bin/cctally
+eager-re-exports each so doctor's `except c.SetupError`, the parser's
+`set_defaults(func=c.cmd_repair_symlinks)`, and the setup tests'
+`monkeypatch.setitem(ns, "_load_claude_settings", …)` resolve unchanged.
+The `_LEGACY_*` constants and `CLAUDE_SETTINGS_PATH` stay in
+`bin/cctally` / `_cctally_core` — preserves the existing `_e2e_pin_paths`
+test workaround verbatim (§5.4), plus keeps the monkeypatch-sensitive
+`_LEGACY_BESPOKE_HOOKS_DIR` / `_LEGACY_POLLER_PID_FILE` /
+`_LEGACY_POLLER_COUNT_FILE` constants on `cctally` where
+`monkeypatch.setitem(ns, ...)` lands. Helpers in this module reach the
+`_LEGACY_*` constants via `_cctally().<NAME>` (call-time lookup,
+monkeypatch propagates); the C10 helpers above are same-module locals but
+THIS module's existing call sites deliberately keep reaching them via
+`c.<NAME>` so ns-level `setitem` patches stay visible (Codex round-1 P1).
 
 bin/cctally back-references via `_cctally()` (spec §5.5 pattern, same as
 `bin/_lib_subscription_weeks.py` and `bin/_lib_aggregators.py`):
@@ -30,12 +37,14 @@ bin/cctally back-references via `_cctally()` (spec §5.5 pattern, same as
   `_LEGACY_BESPOKE_FILENAMES`, `_LEGACY_POLLER_PID_FILE`,
   `_LEGACY_POLLER_COUNT_FILE`, `_LEGACY_BACKUP_DIR_PREFIX`,
   `_LEGACY_POLLER_SIGTERM_GRACE_S`.
-- Shared helpers: `eprint`, `SetupError`, `_is_cctally_hook_command`,
-  `_load_claude_settings`, `_write_claude_settings_atomic`,
-  `_backup_claude_settings`, `_resolve_oauth_token`,
+- Shared helpers: `eprint`, `_resolve_oauth_token`,
   `_hook_tick_throttle_age_seconds`, `_hook_tick_oauth_refresh`,
   `_hook_tick_throttle_touch`, `_command_as_of`, `open_cache_db`,
-  `sync_cache`.
+  `sync_cache`. (`SetupError`, `_is_cctally_hook_command`,
+  `_load_claude_settings`, `_write_claude_settings_atomic`,
+  `_backup_claude_settings` are now LOCAL to this module — C10 — but the
+  call sites here still reach them via `c.<NAME>` for the monkeypatch
+  contract, so functionally they read like the back-references above.)
 
 bin/cctally re-exports every public symbol below so tests that drive
 `cmd_setup` and the legacy-migration helpers via `ns["X"](...)` resolve
@@ -108,6 +117,129 @@ _DEV_SETUP_FORCE_DEV_OVERRIDE_WARNING = (
     "your\ndata across separate DBs. CCTALLY_DATA_DIR is an interactive-only "
     "override."
 )
+
+
+# ── settings/hook glue (#125 Batch E, C10) ─────────────────────────────
+# Moved here from bin/cctally. bin/cctally re-exports each via the
+# _cctally_setup load site so doctor's `except c.SetupError`, the parser's
+# `set_defaults(func=c.cmd_repair_symlinks)`, and the setup tests'
+# `monkeypatch.setitem(ns, "_load_claude_settings", …)` all resolve to
+# these objects. The sibling's OWN reaches to these helpers deliberately
+# STAY `c.<name>` (NOT local) so ns-level monkeypatches propagate.
+
+
+def _is_cctally_hook_command(cmd: str) -> bool:
+    """Return True if `cmd` is one of OUR hook entries (Section 4 of spec).
+
+    Identification is shlex-aware so quoted absolute paths (with spaces)
+    and bare names both match. The discriminator is the LAST TWO tokens
+    after stripping any trailing `&` and surrounding whitespace:
+
+      tokens[-2] = a path whose basename is ``cctally`` or
+                   the npm shim (``_CCTALLY_NPM_SHIM_BASENAME``; npm install
+                   layout — the hook command points at the Node shim so
+                   ``CCTALLY_PYTHON`` propagates from the user's shell env
+                   into hook fires)
+      tokens[-1] = "hook-tick"
+
+    Examples that match:
+        cctally hook-tick
+        cctally hook-tick &
+        /Users/me/.local/bin/cctally hook-tick &
+        '/Users/My Name/.local/bin/cctally' hook-tick &
+        /usr/local/lib/node_modules/cctally/bin/<npm-shim> hook-tick
+    """
+    import shlex
+    if not isinstance(cmd, str) or not cmd.strip():
+        return False
+    stripped = cmd.strip()
+    # Strip trailing &; allow whitespace before it.
+    while stripped.endswith("&"):
+        stripped = stripped[:-1].rstrip()
+        if not stripped:
+            return False
+    try:
+        tokens = shlex.split(stripped)
+    except ValueError:
+        return False
+    if len(tokens) < 2:
+        return False
+    last = tokens[-1]
+    prev = tokens[-2]
+    if last != "hook-tick":
+        return False
+    return pathlib.PurePosixPath(prev).name in (
+        "cctally", _CCTALLY_NPM_SHIM_BASENAME,
+    )
+
+
+class SetupError(RuntimeError):
+    """Raised when setup hits a hard prerequisite failure (Section 2 of spec)."""
+
+
+def _load_claude_settings(path: pathlib.Path | None = None) -> dict:
+    """Read ~/.claude/settings.json. Empty/missing → {}. Malformed → SetupError.
+
+    ``path`` resolves to ``_cctally_core.CLAUDE_SETTINGS_PATH`` at CALL
+    TIME when omitted, so ``monkeypatch.setattr(_cctally_core,
+    "CLAUDE_SETTINGS_PATH", tmp)`` propagates without needing to swap
+    out this callable. Capturing the default at def-time would silently
+    pin the maintainer's real ``~/.claude/settings.json``.
+    """
+    if path is None:
+        path = _cctally_core.CLAUDE_SETTINGS_PATH
+    if not path.exists():
+        return {}
+    raw = path.read_text(encoding="utf-8")
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SetupError(
+            f"settings.json at {path} is not valid JSON: {exc}. Fix it and re-run."
+        ) from exc
+    if not isinstance(data, dict):
+        raise SetupError(f"settings.json at {path} is not a JSON object — fix and re-run.")
+    return data
+
+
+def _backup_claude_settings(path: pathlib.Path | None = None) -> pathlib.Path | None:
+    """Best-effort daily backup; return backup path or None.
+
+    ``path`` resolves to ``_cctally_core.CLAUDE_SETTINGS_PATH`` at CALL
+    TIME when omitted (see ``_load_claude_settings`` for rationale).
+    """
+    if path is None:
+        path = _cctally_core.CLAUDE_SETTINGS_PATH
+    if not path.exists():
+        return None
+    today = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
+    backup = path.with_name(path.name + f".cctally-backup-{today}")
+    if backup.exists():
+        return backup
+    try:
+        shutil.copy2(path, backup)
+    except OSError as exc:
+        eprint(f"[setup] backup failed (continuing): {exc}")
+        return None
+    return backup
+
+
+def _write_claude_settings_atomic(
+    settings: dict, path: pathlib.Path | None = None
+) -> None:
+    """Atomic write with 2-space indent, trailing newline.
+
+    ``path`` resolves to ``_cctally_core.CLAUDE_SETTINGS_PATH`` at CALL
+    TIME when omitted (see ``_load_claude_settings`` for rationale).
+    """
+    if path is None:
+        path = _cctally_core.CLAUDE_SETTINGS_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
 # ── settings.json hook surgery ─────────────────────────────────────────
@@ -415,6 +547,33 @@ def _setup_repair_symlinks(
     created = [r.name for r in results if r.status == "created"]
     failed = [(r.name, r.detail) for r in results if r.status == "failed"]
     return _RepairResult(gated=False, created=created, failed=failed)
+
+
+def cmd_repair_symlinks(args: argparse.Namespace) -> int:
+    """Hidden: additively create missing ~/.local/bin/ symlinks on upgrade.
+
+    Invoked best-effort by the npm postinstall (issue #114). Refuses from
+    a dev checkout (would point ~/.local/bin at the dev tree). Touches
+    only symlinks — see _setup_repair_symlinks. Exempted from main()'s
+    post-command update hooks (see _post_command_update_hooks).
+    """
+    if _cctally_core._is_dev_checkout():
+        eprint(
+            "repair-symlinks: refusing to run from a dev checkout "
+            "(would point ~/.local/bin at the dev tree)"
+        )
+        return 2
+    repo_root = _setup_resolve_repo_root()
+    dst_dir = _setup_local_bin_dir()
+    result = _setup_repair_symlinks(repo_root, dst_dir)
+    if result.created:
+        print(
+            f"cctally: linked {len(result.created)} new command symlink(s): "
+            + ", ".join(result.created)
+        )
+    for name, detail in result.failed:
+        eprint(f"repair-symlinks: {name}: {detail}")
+    return 1 if result.failed else 0
 
 
 def _setup_cleanup_stale_symlinks(

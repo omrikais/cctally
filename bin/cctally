@@ -560,6 +560,17 @@ _setup_emit_text = _cctally_setup._setup_emit_text
 _setup_render_legacy_prompt = _cctally_setup._setup_render_legacy_prompt
 _setup_install = _cctally_setup._setup_install
 cmd_setup = _cctally_setup.cmd_setup
+# C10 (#125 Batch E): settings/hook glue moved into _cctally_setup.py.
+# Eager re-exports: SetupError class-identity for doctor's `except c.SetupError`;
+# cmd_repair_symlinks for the parser's set_defaults(func=c.cmd_repair_symlinks);
+# the 3 settings helpers + _is_cctally_hook_command for doctor + the
+# setitem(ns, ...) test contract (setup keeps reaching these via c.).
+SetupError = _cctally_setup.SetupError
+_is_cctally_hook_command = _cctally_setup._is_cctally_hook_command
+_load_claude_settings = _cctally_setup._load_claude_settings
+_backup_claude_settings = _cctally_setup._backup_claude_settings
+_write_claude_settings_atomic = _cctally_setup._write_claude_settings_atomic
+cmd_repair_symlinks = _cctally_setup.cmd_repair_symlinks
 
 # Eager re-export of bin/_cctally_alerts.py — the dispatch I/O peers
 # (`_alerts_log_path`, `_dispatch_alert_notification`) are called by
@@ -595,6 +606,10 @@ cmd_project = _cctally_project.cmd_project
 # which resolves through cctally's namespace, so it must live here.
 _cctally_pricing_check = _load_sibling("_cctally_pricing_check")
 cmd_pricing_check = _cctally_pricing_check.cmd_pricing_check
+# _pricing_observed_models moved to bin/_cctally_pricing_check.py (#125
+# Batch E, C7). Re-exported so doctor (c._pricing_observed_models) resolves.
+_pricing_observed_models = _cctally_pricing_check._pricing_observed_models
+_PRICING_SCAN_DEFAULT_WINDOW = _cctally_pricing_check._PRICING_SCAN_DEFAULT_WINDOW
 
 # Eager re-export of bin/_cctally_doctor.py — `cmd_doctor` is the parser's
 # `set_defaults(func=c.cmd_doctor)` target; `doctor_gather_state` is a
@@ -1443,167 +1458,20 @@ def _resolve_claude_tz_name(args: argparse.Namespace,
 # Replaces the §7.6.2 placeholder note with a real ccusage-parity
 # "Pricing Mismatch Debug Report" on stderr.
 
-@dataclass
-class _MismatchModelStat:
-    total: int = 0
-    matches: int = 0
-    mismatches: int = 0
-    avg_percent_diff: float = 0.0
-
-
-@dataclass
-class _MismatchSample:
-    file: str
-    timestamp: str
-    model: str
-    original_cost: float
-    calculated_cost: float
-    difference: float
-    percent_diff: float
-    usage: dict
-
-
-@dataclass
-class _MismatchStats:
-    command_label: str | None = None
-    total_entries: int = 0
-    entries_with_both: int = 0
-    matches: int = 0
-    mismatches: int = 0
-    model_stats: dict = field(default_factory=dict)
-    discrepancies: list = field(default_factory=list)
-
-
-def _compute_pricing_mismatch_stats(entries):
-    """Walk ``entries: Iterable[UsageEntry]`` and compute the mismatch stats
-    that ``_render_pricing_mismatch_report`` consumes.
-
-    Mirrors ccusage upstream's ``detectMismatches``
-    (``~/.npm/_npx/.../node_modules/ccusage/dist/debug-DvI5DUKR.js:6-95``):
-
-    - An entry counts toward ``entries_with_both`` iff its ``cost_usd``
-      is not None AND the model has pricing in ``CLAUDE_MODEL_PRICING``.
-    - Threshold: ``percent_diff < 0.1`` is a match; anything else is a
-      mismatch and gets appended to ``discrepancies`` in iteration order.
-    - ``percent_diff`` is ``0.0`` when recorded cost is zero (parity with
-      upstream's divide-by-zero guard).
-    - Per-model ``avg_percent_diff`` updated by streaming mean recurrence
-      to match upstream's per-row accumulation.
-    """
-    stats = _MismatchStats()
-    for entry in entries:
-        # P1.1 (issue #89 review-loop): mirror ccusage upstream's
-        # ``detectMismatches`` precondition filter at debug-DvI5DUKR.js:42
-        # — synthetic entries are excluded from total_entries AND skip the
-        # _resolve_model_pricing call (which would otherwise emit a
-        # ``[cost] unknown model: <synthetic>`` warning and mutate the
-        # module-level _unknown_model_warnings set, suppressing future
-        # legitimate emissions).
-        if entry.model == "<synthetic>":
-            continue
-        stats.total_entries += 1
-        if entry.cost_usd is None:
-            continue
-        if _resolve_model_pricing(entry.model) is None:
-            continue
-        stats.entries_with_both += 1
-        calculated = _calculate_entry_cost(
-            entry.model, entry.usage, mode="calculate",
-        )
-        original = float(entry.cost_usd)
-        difference = abs(original - calculated)
-        percent_diff = (difference / original * 100) if original > 0 else 0.0
-        ms = stats.model_stats.setdefault(entry.model, _MismatchModelStat())
-        ms.total += 1
-        if percent_diff < 0.1:
-            stats.matches += 1
-            ms.matches += 1
-        else:
-            stats.mismatches += 1
-            ms.mismatches += 1
-            stats.discrepancies.append(_MismatchSample(
-                file=os.path.basename(entry.source_path),
-                timestamp=entry.timestamp.isoformat(),
-                model=entry.model,
-                original_cost=original,
-                calculated_cost=calculated,
-                difference=difference,
-                percent_diff=percent_diff,
-                usage=dict(entry.usage),
-            ))
-        # Streaming-mean update for avg_percent_diff (matches upstream).
-        ms.avg_percent_diff = (
-            ms.avg_percent_diff * (ms.total - 1) + percent_diff
-        ) / ms.total
-    return stats
-
-
-def _render_pricing_mismatch_report(stats, sample_limit):
-    """Return the report as a list of stderr lines (caller prints \\n-joined).
-
-    Matches ccusage upstream's ``printMismatchReport``
-    (debug-DvI5DUKR.js:97-145) including:
-      - Early-return ``"No pricing data found to analyze."`` when
-        ``entries_with_both == 0``.
-      - Model Statistics + Sample Discrepancies sections omitted when
-        ``mismatches == 0``.
-      - Models with ``mismatches == 0`` omitted from Model Statistics.
-      - Sample header prints the requested ``sample_limit`` (not min with
-        discrepancies length).
-    Adds ONE intentional non-upstream line: ``Command: cctally <label>``
-    under the header so the report self-identifies (issue #89 acceptance
-    re: "command in each sample's context").
-    """
-    out = []
-    if stats.entries_with_both == 0:
-        out.append("No pricing data found to analyze.")
-        return out
-
-    match_rate = stats.matches / stats.entries_with_both * 100
-    out.append("")
-    out.append("=== Pricing Mismatch Debug Report ===")
-    if stats.command_label:
-        out.append(f"Command: cctally {stats.command_label}")
-    out.append(f"Total entries processed: {stats.total_entries:,}")
-    out.append(
-        f"Entries with both costUSD and model: {stats.entries_with_both:,}"
-    )
-    out.append(f"Matches (within 0.1%): {stats.matches:,}")
-    out.append(f"Mismatches: {stats.mismatches:,}")
-    out.append(f"Match rate: {match_rate:.2f}%")
-
-    if stats.mismatches > 0 and stats.model_stats:
-        out.append("")
-        out.append("=== Model Statistics ===")
-        sorted_models = sorted(
-            stats.model_stats.items(),
-            key=lambda kv: -kv[1].mismatches,
-        )
-        for model, ms in sorted_models:
-            if ms.mismatches == 0:
-                continue
-            rate = ms.matches / ms.total * 100
-            out.append(f"{model}:")
-            out.append(f"  Total entries: {ms.total:,}")
-            out.append(f"  Matches: {ms.matches:,} ({rate:.1f}%)")
-            out.append(f"  Mismatches: {ms.mismatches:,}")
-            out.append(f"  Avg % difference: {ms.avg_percent_diff:.1f}%")
-
-    if stats.discrepancies and sample_limit > 0:
-        out.append("")
-        out.append(f"=== Sample Discrepancies (first {sample_limit}) ===")
-        for d in stats.discrepancies[:sample_limit]:
-            out.append(f"File: {d.file}")
-            out.append(f"Timestamp: {d.timestamp}")
-            out.append(f"Model: {d.model}")
-            out.append(f"Original cost: ${d.original_cost:.6f}")
-            out.append(f"Calculated cost: ${d.calculated_cost:.6f}")
-            out.append(
-                f"Difference: ${d.difference:.6f} ({d.percent_diff:.2f}%)"
-            )
-            out.append(f"Tokens: {json.dumps(d.usage)}")
-            out.append("---")
-    return out
+# Pricing-mismatch debug kernel extracted to bin/_lib_pricing_debug.py
+# (#125 Batch E, C9). _lib_pricing is already loaded above, so its
+# `from _lib_pricing import ...` resolves. The 5 symbols are eager-
+# re-exported here so `_emit_debug_samples_if_set` (below, stays inline)
+# and `_cctally_diff.py` (c._compute_pricing_mismatch_stats /
+# c._render_pricing_mismatch_report) + the mod.X unit tests resolve to the
+# same objects. The shared `_DEBUG_REPORT_EMITTED` guard + the impure
+# emitter intentionally STAY inline (codex/diff write the guard via c.).
+_lib_pricing_debug = _load_sibling("_lib_pricing_debug")
+_MismatchModelStat = _lib_pricing_debug._MismatchModelStat
+_MismatchSample = _lib_pricing_debug._MismatchSample
+_MismatchStats = _lib_pricing_debug._MismatchStats
+_compute_pricing_mismatch_stats = _lib_pricing_debug._compute_pricing_mismatch_stats
+_render_pricing_mismatch_report = _lib_pricing_debug._render_pricing_mismatch_report
 
 
 _DEBUG_REPORT_EMITTED = False
@@ -2790,117 +2658,13 @@ _cctally_percent_breakdown = _load_sibling("_cctally_percent_breakdown")
 cmd_percent_breakdown = _cctally_percent_breakdown.cmd_percent_breakdown
 
 
-def _is_cctally_hook_command(cmd: str) -> bool:
-    """Return True if `cmd` is one of OUR hook entries (Section 4 of spec).
-
-    Identification is shlex-aware so quoted absolute paths (with spaces)
-    and bare names both match. The discriminator is the LAST TWO tokens
-    after stripping any trailing `&` and surrounding whitespace:
-
-      tokens[-2] = a path whose basename is "cctally" or
-                   "cctally-npm-shim.js" (npm install layout — the hook
-                   command points at the Node shim so ``CCTALLY_PYTHON``
-                   propagates from the user's shell env into hook fires)
-      tokens[-1] = "hook-tick"
-
-    Examples that match:
-        "cctally hook-tick"
-        "cctally hook-tick &"
-        "/Users/me/.local/bin/cctally hook-tick &"
-        "'/Users/My Name/.local/bin/cctally' hook-tick &"
-        "/usr/local/lib/node_modules/cctally/bin/cctally-npm-shim.js hook-tick"
-    """
-    import shlex
-    if not isinstance(cmd, str) or not cmd.strip():
-        return False
-    stripped = cmd.strip()
-    # Strip trailing &; allow whitespace before it.
-    while stripped.endswith("&"):
-        stripped = stripped[:-1].rstrip()
-        if not stripped:
-            return False
-    try:
-        tokens = shlex.split(stripped)
-    except ValueError:
-        return False
-    if len(tokens) < 2:
-        return False
-    last = tokens[-1]
-    prev = tokens[-2]
-    if last != "hook-tick":
-        return False
-    return pathlib.PurePosixPath(prev).name in (
-        "cctally", "cctally-npm-shim.js",
-    )
-
-
-class SetupError(RuntimeError):
-    """Raised when setup hits a hard prerequisite failure (Section 2 of spec)."""
-
-
-def _load_claude_settings(path: pathlib.Path | None = None) -> dict:
-    """Read ~/.claude/settings.json. Empty/missing → {}. Malformed → SetupError.
-
-    ``path`` resolves to ``_cctally_core.CLAUDE_SETTINGS_PATH`` at CALL
-    TIME when omitted, so ``monkeypatch.setattr(_cctally_core,
-    "CLAUDE_SETTINGS_PATH", tmp)`` propagates without needing to swap
-    out this callable. Capturing the default at def-time would silently
-    pin the maintainer's real ``~/.claude/settings.json``.
-    """
-    if path is None:
-        path = _cctally_core.CLAUDE_SETTINGS_PATH
-    if not path.exists():
-        return {}
-    raw = path.read_text(encoding="utf-8")
-    if not raw.strip():
-        return {}
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise SetupError(
-            f"settings.json at {path} is not valid JSON: {exc}. Fix it and re-run."
-        ) from exc
-    if not isinstance(data, dict):
-        raise SetupError(f"settings.json at {path} is not a JSON object — fix and re-run.")
-    return data
-
-
-def _backup_claude_settings(path: pathlib.Path | None = None) -> pathlib.Path | None:
-    """Best-effort daily backup; return backup path or None.
-
-    ``path`` resolves to ``_cctally_core.CLAUDE_SETTINGS_PATH`` at CALL
-    TIME when omitted (see ``_load_claude_settings`` for rationale).
-    """
-    if path is None:
-        path = _cctally_core.CLAUDE_SETTINGS_PATH
-    if not path.exists():
-        return None
-    today = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
-    backup = path.with_name(path.name + f".cctally-backup-{today}")
-    if backup.exists():
-        return backup
-    try:
-        shutil.copy2(path, backup)
-    except OSError as exc:
-        eprint(f"[setup] backup failed (continuing): {exc}")
-        return None
-    return backup
-
-
-def _write_claude_settings_atomic(
-    settings: dict, path: pathlib.Path | None = None
-) -> None:
-    """Atomic write with 2-space indent, trailing newline.
-
-    ``path`` resolves to ``_cctally_core.CLAUDE_SETTINGS_PATH`` at CALL
-    TIME when omitted (see ``_load_claude_settings`` for rationale).
-    """
-    if path is None:
-        path = _cctally_core.CLAUDE_SETTINGS_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+# _is_cctally_hook_command, SetupError, _load_claude_settings,
+# _backup_claude_settings, _write_claude_settings_atomic moved to
+# bin/_cctally_setup.py (#125 Batch E, C10). Re-exported at the
+# _cctally_setup load site below so doctor (except c.SetupError) + the
+# setup tests' setitem(ns, …) patches resolve to the moved objects.
+# _seconds_since_iso / _newest_snapshot_age_seconds (refresh-domain) and
+# the _LEGACY_* constants intentionally STAY inline here.
 
 
 def _seconds_since_iso(iso_s: str) -> float | None:
@@ -2966,75 +2730,9 @@ _LEGACY_BACKUP_DIR_PREFIX = "cctally-legacy-hook-backup-"
 _LEGACY_POLLER_SIGTERM_GRACE_S = 0.250
 
 
-# Private sentinel so `_pricing_observed_models` can tell "default 30-day
-# window" apart from an explicit `since=None` all-history scan.
-_PRICING_SCAN_DEFAULT_WINDOW = object()
-
-
-def _pricing_observed_models(now_utc, *, since=_PRICING_SCAN_DEFAULT_WINDOW):
-    """Read-only scan of the session-entry cache for observed models.
-
-    Returns a list of ``(provider, model, entry_count, token_total)`` tuples,
-    one per DISTINCT model seen in ``cache.db`` (Claude ``session_entries`` +
-    Codex ``codex_session_entries``). By default it scans the trailing 30-day
-    window relative to ``now_utc`` (the `doctor` coverage signal — recent =
-    actionable). Pass ``since=<datetime>`` to widen/narrow the window, or
-    ``since=None`` explicitly for an all-history scan (used by `pricing-check`).
-
-    Read-only / no-mutation contract (spec §5.1): mirrors the freshness read
-    in this same function — guard on ``CACHE_DB_PATH.exists()``, raw
-    ``sqlite3.connect`` (NEVER ``open_cache_db()`` / ``sync_cache()`` /
-    ``load_config()`` / ``ensure_dirs()``), and treat a missing table/column as
-    "no observed models" rather than crashing. ``doctor --json`` on a virgin
-    HOME must not create ``APP_DIR`` — regression
-    ``test_pricing_observed_models_no_mutation_on_fresh_home``.
-    """
-    out: list = []
-    if not _cctally_core.CACHE_DB_PATH.exists():
-        return out
-    # Sentinel: the 30-day window is the default; `since=False` is not a
-    # supported value, so distinguish "caller wants all-history" (None) from
-    # "caller did not pass since" via a private marker.
-    if since is _PRICING_SCAN_DEFAULT_WINDOW:
-        cutoff_iso = (now_utc - dt.timedelta(days=30)).isoformat()
-    elif since is None:
-        cutoff_iso = None  # all-history
-    else:
-        cutoff_iso = since.isoformat()
-    try:
-        conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
-    except sqlite3.Error:
-        return out
-    try:
-        # Token-sum expressions use the ACTUAL cache column names from
-        # bin/_cctally_db.py::_apply_cache_schema (verified — Claude uses
-        # cache_create_tokens, NOT cache_creation_tokens; Codex carries a
-        # materialized total_tokens covering input/cache/output/reasoning).
-        for provider, table, tok_expr in (
-            ("claude", "session_entries",
-             "COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+"
-             "COALESCE(cache_create_tokens,0)+COALESCE(cache_read_tokens,0)"),
-            ("codex", "codex_session_entries",
-             "COALESCE(total_tokens,0)"),
-        ):
-            where = "model IS NOT NULL"
-            params: tuple = ()
-            if cutoff_iso is not None:
-                where = "timestamp_utc >= ? AND " + where
-                params = (cutoff_iso,)
-            try:
-                rows = conn.execute(
-                    f"SELECT model, COUNT(*), SUM({tok_expr}) FROM {table} "
-                    f"WHERE {where} GROUP BY model",
-                    params,
-                ).fetchall()
-            except sqlite3.OperationalError:
-                rows = []  # table/column missing — treat as none
-            for model, cnt, toks in rows:
-                out.append((provider, model, int(cnt or 0), int(toks or 0)))
-    finally:
-        conn.close()
-    return out
+# _pricing_observed_models + _PRICING_SCAN_DEFAULT_WINDOW moved to
+# bin/_cctally_pricing_check.py (#125 Batch E, C7). Re-exported below at the
+# pricing-check load site so doctor (c._pricing_observed_models) resolves.
 
 
 # Phase F #23 (the FINAL Phase F extraction): ``bin/_cctally_tui.py`` is
@@ -3153,31 +2851,9 @@ cmd_tui = _cctally_tui.cmd_tui
 _tui_render_once = _cctally_tui._tui_render_once
 
 
-def cmd_repair_symlinks(args: argparse.Namespace) -> int:
-    """Hidden: additively create missing ~/.local/bin/ symlinks on upgrade.
-
-    Invoked best-effort by the npm postinstall (issue #114). Refuses from
-    a dev checkout (would point ~/.local/bin at the dev tree). Touches
-    only symlinks — see _setup_repair_symlinks. Exempted from main()'s
-    post-command update hooks (see _post_command_update_hooks).
-    """
-    if _cctally_core._is_dev_checkout():
-        eprint(
-            "repair-symlinks: refusing to run from a dev checkout "
-            "(would point ~/.local/bin at the dev tree)"
-        )
-        return 2
-    repo_root = _setup_resolve_repo_root()
-    dst_dir = _setup_local_bin_dir()
-    result = _setup_repair_symlinks(repo_root, dst_dir)
-    if result.created:
-        print(
-            f"cctally: linked {len(result.created)} new command symlink(s): "
-            + ", ".join(result.created)
-        )
-    for name, detail in result.failed:
-        eprint(f"repair-symlinks: {name}: {detail}")
-    return 1 if result.failed else 0
+# cmd_repair_symlinks moved to bin/_cctally_setup.py (#125 Batch E, C10).
+# Re-exported at the _cctally_setup load site so the parser's
+# set_defaults(func=c.cmd_repair_symlinks) resolves unchanged.
 
 
 def main(argv: list[str] | None = None) -> int:
