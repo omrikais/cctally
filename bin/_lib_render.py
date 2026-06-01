@@ -100,36 +100,21 @@ _short_model_name = _lib_pricing._short_model_name
 _lib_display_tz = _load_lib("_lib_display_tz")
 _resolve_tz = _lib_display_tz._resolve_tz
 
+# fmt/color/table primitives honest-imported from _lib_fmt (#126 C11)
+_lib_fmt = _load_lib("_lib_fmt")
+_supports_color_stdout = _lib_fmt._supports_color_stdout
+_supports_unicode_stdout = _lib_fmt._supports_unicode_stdout
+_style_ansi = _lib_fmt._style_ansi
+_fmt_num = _lib_fmt._fmt_num
+_truncate_num = _lib_fmt._truncate_num
+_boxed_table = _lib_fmt._boxed_table
+
 
 # Module-level back-ref shims. Each shim resolves
 # ``sys.modules['cctally'].X`` at CALL TIME (not bind time), so
 # monkeypatches on cctally's namespace propagate into the moved code
 # unchanged. Mirrors the precedent established in
 # ``bin/_cctally_record.py`` / ``bin/_cctally_cache.py``.
-def _supports_color_stdout(*args, **kwargs):
-    return sys.modules["cctally"]._supports_color_stdout(*args, **kwargs)
-
-
-def _supports_unicode_stdout(*args, **kwargs):
-    return sys.modules["cctally"]._supports_unicode_stdout(*args, **kwargs)
-
-
-def _style_ansi(*args, **kwargs):
-    return sys.modules["cctally"]._style_ansi(*args, **kwargs)
-
-
-def _fmt_num(*args, **kwargs):
-    return sys.modules["cctally"]._fmt_num(*args, **kwargs)
-
-
-def _truncate_num(*args, **kwargs):
-    return sys.modules["cctally"]._truncate_num(*args, **kwargs)
-
-
-def _boxed_table(*args, **kwargs):
-    return sys.modules["cctally"]._boxed_table(*args, **kwargs)
-
-
 def _format_block_start(*args, **kwargs):
     return sys.modules["cctally"]._format_block_start(*args, **kwargs)
 

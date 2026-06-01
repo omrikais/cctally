@@ -115,6 +115,11 @@ _lib_display_tz = _load_lib("_lib_display_tz")
 _resolve_tz = _lib_display_tz._resolve_tz
 format_display_dt = _lib_display_tz.format_display_dt
 
+# fmt/color/table primitives honest-imported from _lib_fmt (#126 C11)
+_lib_fmt = _load_lib("_lib_fmt")
+_style_ansi = _lib_fmt._style_ansi
+_supports_unicode_stdout = _lib_fmt._supports_unicode_stdout
+
 
 # === Honest imports from extracted homes ===================================
 # Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
@@ -145,14 +150,6 @@ def _resolve_project_key(*args, **kwargs):
 
 def _iso_z(*args, **kwargs):
     return sys.modules["cctally"]._iso_z(*args, **kwargs)
-
-
-def _supports_unicode_stdout(*args, **kwargs):
-    return sys.modules["cctally"]._supports_unicode_stdout(*args, **kwargs)
-
-
-def _style_ansi(*args, **kwargs):
-    return sys.modules["cctally"]._style_ansi(*args, **kwargs)
 
 
 # Private eprint shim per spec §5.3 (pure layer does not back-import
