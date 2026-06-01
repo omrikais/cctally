@@ -91,14 +91,16 @@ def test_cmd_forecast_resolves_view_and_share_through_namespace(cctally_mod, mon
 
 def test_cmd_report_resolves_view_and_share_through_namespace(cctally_mod, monkeypatch):
     """report --format md: build_trend_view sits behind `if not weeks:` where
-    weeks = get_recent_weeks(...). get_recent_weeks STAYS (accessor-routed) → patch
-    it non-empty to reach build_trend_view, then assert the view + share spies fire."""
+    weeks = get_recent_weeks(...). get_recent_weeks is accessor-routed (lives in
+    _cctally_weekrefs.py, re-exported on the cctally ns) → patch it non-empty to
+    reach build_trend_view, then assert the view + share spies fire."""
     mod = cctally_mod
     calls = {"weeks": 0, "view": 0, "snap": 0, "emit": 0}
 
-    # get_recent_weeks STAYS in bin/cctally → namespace-patchable (NOT a moved
-    # helper). Return a minimal non-empty list of the real WeekRef so the
-    # `if not weeks:` guard is passed and the path reaches build_trend_view.
+    # get_recent_weeks lives in _cctally_weekrefs.py, re-exported on the cctally
+    # ns → namespace-patchable (accessor-routed). Return a minimal non-empty list
+    # of the real WeekRef so the `if not weeks:` guard is passed and the path
+    # reaches build_trend_view.
     def spy_weeks(conn, limit):
         calls["weeks"] += 1
         return [mod.make_week_ref(

@@ -109,8 +109,10 @@ What stays in bin/cctally:
   ``_build_alert_payload_five_hour``, ``eprint``,
   ``get_claude_session_entries``, ``_FIVE_HOUR_JITTER_FLOOR_SECONDS``,
   ``_RESET_PCT_DROP_THRESHOLD`` — boundary helpers, already-extracted
-  subsystems, or constants that belong in bin/cctally. All accessed
-  via the same shim/``c.X`` pattern.
+  subsystems, or constants reached through the cctally namespace
+  (``_RESET_PCT_DROP_THRESHOLD`` now lives in ``bin/_cctally_weekrefs.py``,
+  re-exported on the cctally ns). All accessed via the same shim/``c.X``
+  pattern.
 
 §5.6 audit on this extraction's monkeypatch surface:
 - ``cmd_record_usage`` — patched via ``monkeypatch.setitem(ns, …)``
@@ -381,7 +383,7 @@ _logged_window_key_coerce_failure = False
 #   _cctally_core.HOOK_TICK_LOG_DIR / _PATH / _ROTATED_PATH / _ROTATE_BYTES
 #   _cctally_core.HOOK_TICK_THROTTLE_PATH / _LOCK_PATH
 #   c._FIVE_HOUR_JITTER_FLOOR_SECONDS — _lib_five_hour.* re-export
-#   c._RESET_PCT_DROP_THRESHOLD       — bin/cctally module-level constant
+#   c._RESET_PCT_DROP_THRESHOLD       — bin/_cctally_weekrefs.py constant (re-exported on cctally ns)
 #   c.HOOK_TICK_DEFAULT_THROTTLE_SECONDS
 
 

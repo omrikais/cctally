@@ -26,8 +26,8 @@ implicit), and `_compute_subscription_weeks` calls
 Moving both keeps the subscription-week domain self-contained and avoids
 inventing a call-time back-reference to `_apply_reset_events_to_subweeks`.
 `_apply_overlap_clamp_to_weekrefs` (operates on `WeekRef`, NOT `SubWeek`)
-stays in `bin/cctally` and reaches `_clamp_end_ats_to_next_start` through
-the re-export block.
+lives in `bin/_cctally_weekrefs.py` and reaches `_clamp_end_ats_to_next_start`
+through the cctally namespace (the re-export block + its call-time `c.` accessor).
 
 `bin/cctally` re-exports every public symbol below so the ~50 internal
 call sites + SourceFileLoader-based tests (`tests/test_subweek_display_dates`,

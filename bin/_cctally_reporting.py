@@ -13,9 +13,10 @@ qualified `_lib_*` import is required; every such name is reached via the
 call-time `_cctally()` accessor so test monkeypatches through `cctally`'s
 namespace are preserved (spec §3.2). The shared join/filter helpers
 (`_usage_entry_from_joined`, `_project_filter_matches`, `_parse_project_aliases`,
-`_alias_for`, `_resolve_session_id_for_filter`, …) and the week-boundary
-infra (`get_recent_weeks`, `_apply_reset_events_to_weekrefs`,
-`_get_canonical_boundary_for_date`) STAY in bin/cctally and are reached via `c.`.
+`_alias_for`, `_resolve_session_id_for_filter`, …) STAY in bin/cctally; the
+week-boundary infra (`get_recent_weeks`, `_apply_reset_events_to_weekrefs`,
+`_get_canonical_boundary_for_date`) lives in `_cctally_weekrefs.py`
+(re-exported on the cctally ns). Both groups are reached via `c.`.
 
 bin/cctally re-exports EVERY moved symbol (eager): the parser resolves
 `c.cmd_daily` / `c.cmd_monthly` / `c.cmd_weekly` / `c.cmd_session`; tests

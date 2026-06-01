@@ -15,7 +15,8 @@ The budget WRITE-PATH cluster (insert_budget_milestone,
 _reconcile_budget_milestones_on_set, _reconcile_budget_on_config_write) lives in
 _cctally_milestones.py (re-exported on the cctally ns), and the WeekRef JOIN
 cluster (get_recent_weeks, _apply_reset_events_to_weekrefs,
-_get_canonical_boundary_for_date) stays in bin/cctally; both are reached via c.
+_get_canonical_boundary_for_date) lives in _cctally_weekrefs.py (re-exported on
+the cctally ns); both are reached via c.
 
 _iso_z is defined HERE (intra-module) and re-exported in bin/cctally AFTER the
 dashboard _iso_z binding so cctally._iso_z stays the forecast version

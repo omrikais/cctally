@@ -358,7 +358,7 @@ def test_live_write_paths_use_begin_immediate():
 
     bin_dir = pathlib.Path(__file__).resolve().parents[1] / "bin"
 
-    backfill = _function_source(bin_dir / "cctally", "_backfill_five_hour_blocks")
+    backfill = _function_source(bin_dir / "_cctally_five_hour.py", "_backfill_five_hour_blocks")
     assert 'conn.execute("BEGIN IMMEDIATE")' in backfill, (
         "_backfill_five_hour_blocks must use BEGIN IMMEDIATE (#87): it reads "
         "min/max rows before its first INSERT, so a deferred BEGIN is exposed "

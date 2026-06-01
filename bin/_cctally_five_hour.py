@@ -1,10 +1,15 @@
 """5-hour-window command family.
 
 Holds the three 5h commands — `cmd_blocks`, `cmd_five_hour_blocks`,
-`cmd_five_hour_breakdown` — their family-local helpers, AND the shared 5h
+`cmd_five_hour_breakdown` — their family-local helpers, the shared 5h
 recorded-window resolution layer (`_load_recorded_five_hour_windows`,
 `_select_non_overlapping_recorded_windows`, `_maybe_swap_active_block_to_canonical`,
-`_resolve_block_selector`, `_CANONICAL_WEIGHT_THRESHOLD`).
+`_resolve_block_selector`, `_CANONICAL_WEIGHT_THRESHOLD`), AND
+`_backfill_five_hour_blocks` — the one-shot historical backfill of
+`five_hour_blocks` from `weekly_usage_snapshots` (idempotent via
+`UNIQUE(five_hour_window_key)` + `INSERT OR IGNORE`, `BEGIN IMMEDIATE` per
+#87 — `tests/test_stats_db_busy_timeout.py` reads its source from this file;
+`five_hour_milestones` is never backfilled, write-once gotcha).
 
 Honest *name* imports are KERNEL-ONLY (`_cctally_core`). This module
 references the bin/cctally RE-EXPORTED names of every library kernel it
@@ -38,7 +43,7 @@ import json
 import sqlite3
 import sys
 
-from _cctally_core import _command_as_of, eprint, open_db, parse_iso_datetime
+from _cctally_core import _command_as_of, eprint, now_utc_iso, open_db, parse_iso_datetime
 
 
 def _cctally():
@@ -1415,5 +1420,269 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
         return 0
     finally:
         conn.close()
+
+
+def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> int:
+    """One-shot historical backfill of five_hour_blocks from existing
+    weekly_usage_snapshots data. Idempotent via UNIQUE(five_hour_window_key)
+    + INSERT OR IGNORE. Per spec §4.3, five_hour_milestones is NEVER
+    backfilled (write-once gotcha).
+
+    Returns the count of newly-inserted parent rows (sum of INSERT OR IGNORE
+    rowcounts). Caller uses this to decide whether to re-run the
+    003_merge_5h_block_duplicates_v1 handler post-backfill — the dispatcher
+    walks the registry BEFORE this backfill, so a fresh run against an
+    empty five_hour_blocks no-ops the dedup migration even when the
+    snapshot keys we're about to insert are jitter-forked. On failure,
+    rolls back and returns 0; gate fires again on next open_db() so
+    partial state is recoverable.
+    """
+    _c = _cctally()
+    inserted = 0
+    try:
+        # Iterate distinct windows that have BOTH a canonical key AND a
+        # 5h percent. The percent guard is critical: MAX(five_hour_percent)
+        # over a NULL-only window is NULL, which would trip the
+        # final_five_hour_percent NOT NULL constraint at insert time.
+        keys = [
+            int(r[0]) for r in conn.execute(
+                """
+                SELECT DISTINCT five_hour_window_key
+                  FROM weekly_usage_snapshots
+                 WHERE five_hour_window_key IS NOT NULL
+                   AND five_hour_percent     IS NOT NULL
+                """
+            ).fetchall()
+        ]
+
+        now_iso = now_utc_iso()
+        now_dt = parse_iso_datetime(now_iso, "now")
+
+        # BEGIN IMMEDIATE (not deferred): this transaction's first DML is a
+        # READ (min_row/max_row below), so a plain deferred BEGIN takes a read
+        # snapshot and only tries to upgrade to the write lock at the first
+        # INSERT OR IGNORE. Under concurrent first-run openers, a competing
+        # commit landing between that read and the first write makes the upgrade
+        # fail with SQLITE_BUSY_SNAPSHOT *immediately* — busy_timeout cannot
+        # absorb it, and the whole backfill rolls back. Acquiring the write lock
+        # up front serializes the backfill cleanly behind busy_timeout instead.
+        # See cctally-dev#87.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for key in keys:
+                # MIN-captured row defines the immutable block boundary
+                # values (deterministic — picking "any in-window row"
+                # would be nondeterministic under seconds-level Anthropic
+                # ISO jitter that the canonical key collapses).
+                min_row = conn.execute(
+                    """
+                    SELECT five_hour_resets_at, captured_at_utc, weekly_percent
+                      FROM weekly_usage_snapshots
+                     WHERE five_hour_window_key = ?
+                       AND five_hour_percent IS NOT NULL
+                     ORDER BY captured_at_utc ASC, id ASC LIMIT 1
+                    """,
+                    (key,),
+                ).fetchone()
+                max_row = conn.execute(
+                    """
+                    SELECT captured_at_utc, weekly_percent, five_hour_percent
+                      FROM weekly_usage_snapshots
+                     WHERE five_hour_window_key = ?
+                       AND five_hour_percent IS NOT NULL
+                     ORDER BY captured_at_utc DESC, id DESC LIMIT 1
+                    """,
+                    (key,),
+                ).fetchone()
+                if min_row is None or max_row is None:
+                    continue   # defensive — should be unreachable per the keys query
+
+                resets_at = min_row["five_hour_resets_at"]
+                first_obs = min_row["captured_at_utc"]
+                last_obs  = max_row["captured_at_utc"]
+                pct_start_7d = min_row["weekly_percent"]
+                pct_end_7d   = max_row["weekly_percent"]
+                final_5h     = float(max_row["five_hour_percent"])
+
+                resets_dt = parse_iso_datetime(resets_at, "resets_at backfill")
+                block_start_dt = resets_dt - dt.timedelta(hours=5)
+                block_start_at = block_start_dt.isoformat(timespec="seconds")
+                last_obs_dt = parse_iso_datetime(last_obs, "last_obs backfill")
+
+                # Cross-reset detection (interval predicate, symmetric with
+                # the live path's UPDATE in T4). Two sources:
+                #   (a) week_reset_events — Anthropic-shifted mid-week resets.
+                #   (b) weekly_usage_snapshots.week_start_at — natural week
+                #       boundaries (no event row for these).
+                # Strict ``>`` on the lower bound for (b) so a block whose
+                # block_start_at coincides with a week boundary is not flagged.
+                # ``unixepoch()`` normalizes the comparison across mixed tz
+                # suffixes (block_start_at is host-local; week_start_at /
+                # effective_reset_at_utc are ``+00:00``); see the live-path
+                # comment for rationale.
+                cross_row = conn.execute(
+                    """
+                    SELECT 1 FROM week_reset_events
+                     WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?)
+                       AND unixepoch(effective_reset_at_utc) <= unixepoch(?)
+                     LIMIT 1
+                    """,
+                    (block_start_at, last_obs),
+                ).fetchone()
+                if cross_row is None:
+                    cross_row = conn.execute(
+                        """
+                        SELECT 1 FROM weekly_usage_snapshots
+                         WHERE week_start_at IS NOT NULL
+                           AND unixepoch(week_start_at) >  unixepoch(?)
+                           AND unixepoch(week_start_at) <= unixepoch(?)
+                         LIMIT 1
+                        """,
+                        (block_start_at, last_obs),
+                    ).fetchone()
+                crossed = 1 if cross_row is not None else 0
+
+                # is_closed: 1 if the canonical reset moment is already past.
+                is_closed = 1 if resets_dt < now_dt else 0
+
+                # Token + cost totals — recomputed via the shared helper,
+                # which routes through get_entries() and falls back to
+                # JSONL if cache.db is unreadable.
+                # skip_sync=True: backfill runs inside open_db(); a sync_cache
+                # cascade here would reopen cache.db recursively.
+                totals = _c._compute_block_totals(
+                    block_start_dt, last_obs_dt, skip_sync=True,
+                )
+
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO five_hour_blocks (
+                      five_hour_window_key,
+                      five_hour_resets_at,
+                      block_start_at,
+                      first_observed_at_utc,
+                      last_observed_at_utc,
+                      final_five_hour_percent,
+                      seven_day_pct_at_block_start,
+                      seven_day_pct_at_block_end,
+                      crossed_seven_day_reset,
+                      total_input_tokens,
+                      total_output_tokens,
+                      total_cache_create_tokens,
+                      total_cache_read_tokens,
+                      total_cost_usd,
+                      is_closed,
+                      created_at_utc,
+                      last_updated_at_utc
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        resets_at,
+                        block_start_at,
+                        first_obs,
+                        last_obs,
+                        final_5h,
+                        pct_start_7d,
+                        pct_end_7d,
+                        crossed,
+                        totals["input_tokens"],
+                        totals["output_tokens"],
+                        totals["cache_create_tokens"],
+                        totals["cache_read_tokens"],
+                        totals["cost_usd"],
+                        is_closed,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+                inserted += cur.rowcount or 0
+
+                # ── Write per-(block, model) and per-(block, project) child
+                # rows for this window. INSERT OR IGNORE handles partial-fail
+                # re-runs (UNIQUE(five_hour_window_key, model|project_path)).
+                # Same transaction as the parent INSERT.
+                parent_id_row = conn.execute(
+                    "SELECT id FROM five_hour_blocks WHERE five_hour_window_key = ?",
+                    (key,),
+                ).fetchone()
+                if parent_id_row is not None:
+                    parent_id = int(parent_id_row["id"])
+                    if totals.get("by_model"):
+                        conn.executemany(
+                            """
+                            INSERT OR IGNORE INTO five_hour_block_models (
+                              block_id, five_hour_window_key, model,
+                              input_tokens, output_tokens,
+                              cache_create_tokens, cache_read_tokens,
+                              cost_usd, entry_count
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            [
+                                (
+                                    parent_id,
+                                    key,
+                                    model,
+                                    b["input_tokens"],
+                                    b["output_tokens"],
+                                    b["cache_create_tokens"],
+                                    b["cache_read_tokens"],
+                                    b["cost_usd"],
+                                    b["entry_count"],
+                                )
+                                for model, b in totals["by_model"].items()
+                            ],
+                        )
+                    if totals.get("by_project"):
+                        conn.executemany(
+                            """
+                            INSERT OR IGNORE INTO five_hour_block_projects (
+                              block_id, five_hour_window_key, project_path,
+                              input_tokens, output_tokens,
+                              cache_create_tokens, cache_read_tokens,
+                              cost_usd, entry_count
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            [
+                                (
+                                    parent_id,
+                                    key,
+                                    project_path,
+                                    b["input_tokens"],
+                                    b["output_tokens"],
+                                    b["cache_create_tokens"],
+                                    b["cache_read_tokens"],
+                                    b["cost_usd"],
+                                    b["entry_count"],
+                                )
+                                for project_path, b in totals["by_project"].items()
+                            ],
+                        )
+
+            # Mark child-table migrations done so the upgrade-user gates in
+            # open_db() don't re-fire on next open. Inside the same
+            # transaction as the per-window inserts so partial-fail leaves
+            # both the data AND the markers absent — gates re-fire cleanly.
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc)
+                VALUES (?, ?)
+                """,
+                [
+                    ("001_five_hour_block_models_backfill_v1",   now_iso),
+                    ("002_five_hour_block_projects_backfill_v1", now_iso),
+                ],
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    except Exception as exc:
+        eprint(f"[5h-block backfill] failed: {exc}")
+        return 0
+    return inserted
 
 
