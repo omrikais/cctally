@@ -481,6 +481,70 @@ for scenario in disabled enabled-no-crossing enabled-weekly-90 enabled-five-hour
     done
 done
 
+# ─── Projected-pace alert text goldens (axis `projected`, #121) ──────
+# Unlike the structural record-usage scenarios above, the projected axis
+# is previewed via `alerts test --axis projected --metric ...`, whose
+# rendered title/subtitle/body come from `_alert_text_projected`. We
+# render the exact production builder (loaded from the live script) and
+# assert the captured strings — both metrics × warn(90)/over(100). The
+# goldens were captured from real output (NOT hand-written casing): the
+# weekly title is lowercase ("projected to reach ..."), matching the
+# shipped builder.
+render_projected () {
+    # $1=metric  $2=threshold  $3=projected_value  $4=denominator
+    python3 - "$REPO_ROOT" "$1" "$2" "$3" "$4" <<'PYEOF'
+import importlib.util, pathlib, sys
+from importlib.machinery import SourceFileLoader
+repo, metric, t, proj, denom = sys.argv[1:6]
+binp = pathlib.Path(repo) / "bin" / "_lib_alerts_payload.py"
+loader = SourceFileLoader("_lib_alerts_payload", str(binp))
+spec = importlib.util.spec_from_loader("_lib_alerts_payload", loader)
+m = importlib.util.module_from_spec(spec)
+sys.modules["_lib_alerts_payload"] = m
+loader.exec_module(m)
+p = m._build_alert_payload_projected(
+    metric=metric, threshold=int(t), projected_value=float(proj),
+    denominator=float(denom), week_start_at="2026-06-01T00:00:00Z",
+)
+title, subtitle, body = m._alert_text_projected(p, None)
+print(f"TITLE\t{title}")
+print(f"SUB\t{subtitle}")
+print(f"BODY\t{body}")
+PYEOF
+}
+
+# weekly_pct @ 90 (warn)
+out="$(render_projected weekly_pct 90 95.0 100.0)"
+assert_contains "projected-text weekly_pct-90 title" \
+    "TITLE	cctally - projected to reach 90% this week" "$out"
+assert_contains "projected-text weekly_pct-90 subtitle" \
+    "SUB	On current pace (projection)" "$out"
+assert_contains "projected-text weekly_pct-90 body" \
+    "BODY	Projected ~95% of cap by reset (week-average pace)" "$out"
+
+# weekly_pct @ 100 (over)
+out="$(render_projected weekly_pct 100 108.0 100.0)"
+assert_contains "projected-text weekly_pct-100 title" \
+    "TITLE	cctally - projected to reach 100% this week" "$out"
+assert_contains "projected-text weekly_pct-100 body" \
+    "BODY	Projected ~108% of cap by reset (week-average pace)" "$out"
+
+# budget_usd @ 90 (warn)
+out="$(render_projected budget_usd 90 285.0 300.0)"
+assert_contains "projected-text budget_usd-90 title" \
+    "TITLE	cctally - projected to exceed budget" "$out"
+assert_contains "projected-text budget_usd-90 subtitle" \
+    "SUB	On current pace (projection) - 90% of budget" "$out"
+assert_contains "projected-text budget_usd-90 body" \
+    "BODY	Projected \$285.00 of \$300.00 budget (week-average pace)" "$out"
+
+# budget_usd @ 100 (over)
+out="$(render_projected budget_usd 100 312.0 300.0)"
+assert_contains "projected-text budget_usd-100 subtitle" \
+    "SUB	On current pace (projection) - 100% of budget" "$out"
+assert_contains "projected-text budget_usd-100 body" \
+    "BODY	Projected \$312.00 of \$300.00 budget (week-average pace)" "$out"
+
 echo
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

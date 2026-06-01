@@ -69,10 +69,12 @@ _lib_alerts_payload = _load_lib("_lib_alerts_payload")
 _alert_text_weekly = _lib_alerts_payload._alert_text_weekly
 _alert_text_five_hour = _lib_alerts_payload._alert_text_five_hour
 _alert_text_budget = _lib_alerts_payload._alert_text_budget
+_alert_text_projected = _lib_alerts_payload._alert_text_projected
 _escape_applescript_string = _lib_alerts_payload._escape_applescript_string
 _build_alert_payload_weekly = _lib_alerts_payload._build_alert_payload_weekly
 _build_alert_payload_five_hour = _lib_alerts_payload._build_alert_payload_five_hour
 _build_alert_payload_budget = _lib_alerts_payload._build_alert_payload_budget
+_build_alert_payload_projected = _lib_alerts_payload._build_alert_payload_projected
 
 
 # === Honest imports from extracted homes ===================================
@@ -138,6 +140,8 @@ def _dispatch_alert_notification(
         title, subtitle, body = _alert_text_five_hour(payload, tz)
     elif axis == "budget":
         title, subtitle, body = _alert_text_budget(payload, tz)
+    elif axis == "projected":
+        title, subtitle, body = _alert_text_projected(payload, tz)
     else:
         title, subtitle, body = (
             "cctally - alert",
@@ -207,6 +211,8 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
         axis = "weekly"
     elif args.axis == "budget":
         axis = "budget"
+    elif args.axis == "projected":
+        axis = "projected"
     else:
         axis = "five_hour"
     threshold = int(args.threshold)
@@ -238,6 +244,27 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
             budget_usd=300.0,
             spent_usd=300.0 * threshold / 100.0,
             consumption_pct=float(threshold),
+        )
+    elif axis == "projected":
+        # Synthetic projected-pace payload — NO DB writes (test/real divergence
+        # contract). The metric discriminator picks the wiring; projected_value
+        # is the threshold's denominator-relative value (so the body reads
+        # plausibly, e.g. weekly 100% → "~100% of cap", budget 100% → "$300 of
+        # $300"). denominator is the at-crossing target the row would carry
+        # (Codex P0-4): 100.0 for weekly_pct, $300 for budget_usd.
+        metric = getattr(args, "metric", "weekly_pct")
+        if metric == "budget_usd":
+            denominator = 300.0
+            projected_value = 300.0 * threshold / 100.0
+        else:  # weekly_pct
+            denominator = 100.0
+            projected_value = float(threshold)
+        payload = _build_alert_payload_projected(
+            metric=metric,
+            threshold=threshold,
+            projected_value=projected_value,
+            denominator=denominator,
+            week_start_at=dt.date.today().isoformat(),
         )
     else:
         payload = _build_alert_payload_five_hour(
