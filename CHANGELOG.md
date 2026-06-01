@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.22.4] - 2026-06-01
+
 ### Fixed
 - **A surprise mid-week Anthropic usage reset is now reflected in the 7d percentage even when you were below ~25% usage.** When Anthropic zeroes the weekly counter mid-window (same reset timestamp, usage drops to ~0 — e.g. the 2026-06-01 incident), the reset detector previously only fired when the drop was at least 25 percentage points, so any account reset from a lower base (the observed 14% → 0%) slipped through: no `week_reset_events` row was written, the monotonic high-water-mark clamp kept reporting the stale pre-reset percentage across the statusline, `weekly`/`report`, and the dashboard, and post-reset 0% reads were silently dropped at the write site. The detector now ALSO fires on a reset-to-zero — when the post-reset value collapses to ~0 (≤ 1%) with at least a 3pp drop — independently of the 25pp magnitude gate, since a clean drop to zero is an unambiguous reset regardless of size (a lagging API replica reports a slightly-lower number, never a clean 0 against real usage), while the 3pp floor rejects 1%→0% replica jitter that would otherwise spuriously segment the week. The new discriminator is a single shared `_is_reset_drop()` helper wired into all four 7d detection sites (live + backfill, boundary-advance + in-place-credit branches) so they stay byte-identical; the 25pp partial-credit path and the separate 5h detector are unchanged. Regression: three new cases in `tests/test_in_place_credit_detection.py` (live reset-to-zero fires below 25pp, the 3pp floor rejects 1%→0% jitter, and backfill parity).
 
