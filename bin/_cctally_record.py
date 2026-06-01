@@ -917,12 +917,12 @@ def maybe_record_projected_alert(saved: dict[str, Any]) -> None:
     cfg = load_config()
     try:
         alerts_cfg = _get_alerts_config(cfg)
-    except sys.modules["cctally"]._AlertsConfigError as exc:
+    except _AlertsConfigError as exc:
         _warn_alerts_bad_config_once(exc)
         alerts_cfg = {"enabled": False, "projected_enabled": False}
     try:
         budget_cfg = _get_budget_config(cfg)
-    except sys.modules["cctally"]._BudgetConfigError as exc:
+    except _BudgetConfigError as exc:
         _warn_budget_bad_config_once(exc)
         budget_cfg = {}
 

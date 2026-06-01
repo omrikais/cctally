@@ -171,6 +171,23 @@ SCENARIOS = {
                       "alert_thresholds": [90, 100]},
         n_total=185, n_recent=20, weekly_percent=95.0,
     ),
+    # 120h elapsed (~71% of week, remaining 48h), $180 spent (60% of $300),
+    # but 40 of the 100 entries land in the trailing 24h so the RECENT rate
+    # ($3.00/h) runs hotter than the WEEK-AVERAGE rate ($1.50/h). This makes
+    # the displayed verdict band high end (projected_eow_high == spent +
+    # rate_recent*remaining = $324) diverge from the week-average projection
+    # (week_avg_projection_usd == spent + rate_avg*remaining = $252). It is the
+    # non-vacuity fixture for the reconcile invariant
+    # `projected_alert_eq_displayed_week_avg`: the projected-pace alert fires on
+    # $252, NOT the displayed $324, so a regression that bound the alert/output
+    # field to the verdict high end would fail the invariant here. Not
+    # low-confidence (elapsed_fraction ~0.71 ≥ 0.15, spent > 0).
+    "recent-hot": dict(
+        as_of=WEEK_START + dt.timedelta(hours=120),
+        budget_block={"weekly_usd": 300.0, "alerts_enabled": True,
+                      "alert_thresholds": [90, 100]},
+        n_total=100, n_recent=40, weekly_percent=60.0,
+    ),
     # 12h elapsed (<15% → low_confidence), $18 spent.
     "low-conf": dict(
         as_of=WEEK_START + dt.timedelta(hours=12),

@@ -45,6 +45,7 @@ FIXTURES="$SCRATCH_DIR"
 "$REPO_ROOT/bin/build-speed-fixtures.py"        --out "$SCRATCH_DIR/speed"        >/dev/null
 "$REPO_ROOT/bin/build-daily-instances-fixtures.py" --out "$SCRATCH_DIR/daily-instances" >/dev/null
 "$REPO_ROOT/bin/build-budget-fixtures.py"          --out "$SCRATCH_DIR/budget"          >/dev/null
+"$REPO_ROOT/bin/build-forecast-fixtures.py"        --out "$SCRATCH_DIR/forecast"        >/dev/null
 
 pass_count=0
 fail_count=0
@@ -3394,6 +3395,206 @@ for fx in under warn over; do
     echo "PASS budget_spent_eq_raw_scan budget/$fx"
     pass_count=$((pass_count + 1))
 done
+
+# ─── Invariant PROJECTED1: projected-pace alert == displayed week-avg field ──
+# (#121, spec §4 "Reconcile invariant") The projected-pace alert axis fires on
+# the WEEK-AVERAGE projection — `p_now + r_avg*remaining` (weekly_pct) and
+# `spent + rate_avg*remaining` (budget_usd). That SAME number is surfaced as the
+# additive `week_avg_projection_pct` (forecast --json) / `week_avg_projection_usd`
+# (budget --json) output fields. This invariant pins the two together within
+# 1e-9 so neither call path can drift from the other.
+#
+# Binding choice (load-bearing for non-vacuity):
+#   1. The "alert value" side is the ACTUAL detector projection path, not a
+#      re-derivation: we import bin/cctally and call
+#      `_weekly_pct_week_avg_projection(conn, now)` (the exact helper
+#      `maybe_record_projected_alert`'s weekly leg fires on) and the budget
+#      detector path `_build_budget_status_inputs(..., skip_sync=True)` →
+#      `compute_budget_status(...).week_avg_projection_usd` (the exact value its
+#      budget leg fires on). So the assertion binds the firing value, not a
+#      look-alike formula.
+#   2. The "displayed field" side is the REAL emitted JSON key, parsed straight
+#      out of `forecast --json` / `budget --json`.
+#   3. Non-vacuity guard (the core of spec §4): both fixtures are deliberately
+#      recent≠average, so the DISPLAYED VERDICT HIGH END diverges from the
+#      week-average — forecast `projected-cap` has final_percent_high (178.6) >
+#      week_avg_projection_pct (122.5); budget `recent-hot` has
+#      projected_eow_high_usd (324) > week_avg_projection_usd (252). The
+#      invariant asserts the bound value equals the week-average AND is strictly
+#      NOT the high end, so a regression that wired the alert (or the output
+#      field) to the displayed high-end verdict band fails here rather than
+#      passing by accident. (The 1e-9 equality alone would be vacuous if the two
+#      week-average numbers were the same by construction with no distinct
+#      high-end to mis-bind to — these fixtures supply that distinct high end.)
+
+# ── Weekly_pct leg: forecast --json week_avg_projection_pct ↔ detector ──
+PROJECTED1_WEEKLY_PY='
+import json, os, sys, importlib.util
+from importlib.machinery import SourceFileLoader
+
+fc = json.loads(os.environ["RECONCILE_A"])
+emitted = fc["forecast"]["week_avg_projection_pct"]   # JSON-rounded to 3 dp
+high_end = fc["forecast"]["final_percent_high"]
+
+# Bind to the ACTUAL detector helper the projected weekly leg fires on
+# (full precision; the JSON field is round(detector_value, 3)).
+bin_dir = os.environ["PROJECTED_BIN_DIR"]
+sys.path.insert(0, bin_dir)
+loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
+spec = importlib.util.spec_from_loader("cctally", loader)
+c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
+loader.exec_module(c)
+conn = c.open_db()
+now = c._command_as_of()
+proj = c._weekly_pct_week_avg_projection(conn, now)
+assert proj is not None, "PROJECTED1 weekly: detector returned None (no current-week snapshot)"
+detector_value, low_conf = proj
+assert not low_conf, "PROJECTED1 weekly: fixture is LOW CONF (detector would not fire here)"
+
+# Reconcile contract: the emitted forecast field is the detector value, rounded
+# to the JSON surface precision (3 dp) — equal within 1e-9 of that round().
+# This is THE bind: the alert and forecast --json share the week-average number.
+assert abs(emitted - round(detector_value, 3)) < 1e-9, (
+    f"forecast week_avg_projection_pct={emitted} != round(detector,3)="
+    f"{round(detector_value, 3)} (detector full value {detector_value}; the "
+    f"value maybe_record_projected_alert weekly leg fires on)"
+)
+
+# Independent cross-check from forecast --json'\''s OWN published rates/window
+# (a path that does not touch the detector): p_now + r_avg*remaining. The
+# published rate is rounded to 6 dp, so this is a coarse sanity bound (not the
+# 1e-9 contract above), guarding against a grossly wrong formula.
+p_now = fc["current"]["weekly_percent"]
+r_avg = fc["rates"]["week_average_pct_per_hour"]
+remaining_h = fc["week"]["remaining_hours"]
+rederived = p_now + r_avg * remaining_h
+assert abs(emitted - rederived) < 1e-3, (
+    f"forecast week_avg_projection_pct={emitted} far from published-rate "
+    f"re-derivation {rederived}"
+)
+
+# Non-vacuity: the displayed verdict high end must DIFFER from the week-average,
+# so binding to final_percent_high (the band the verdict keys off) would fail.
+assert abs(high_end - emitted) > 1.0, (
+    f"PROJECTED1 weekly VACUOUS: final_percent_high={high_end} ~= "
+    f"week_avg_projection_pct={emitted}; fixture is not recent!=average so a "
+    f"wrong binding to the displayed high end could pass by accident"
+)
+'
+fc_home="$FIXTURES/forecast/projected-cap"
+if [ -f "$fc_home/input.env" ]; then
+    AS_OF=""
+    # shellcheck disable=SC1091
+    . "$fc_home/input.env"
+    fc_json=$(HOME="$fc_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" forecast --json 2>/dev/null); rc_f=$?
+    if [ $rc_f -ne 0 ]; then
+        echo "RECONCILE FAIL projected_alert_eq_displayed_week_avg forecast/projected-cap: forecast --json rc=$rc_f"
+        fail_count=$((fail_count + 1))
+    else
+        result=$(RECONCILE_A="$fc_json" \
+            PROJECTED_BIN_DIR="$REPO_ROOT/bin" \
+            HOME="$fc_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+            CCTALLY_DISABLE_DEV_AUTODETECT=1 \
+            python3 -c "$PROJECTED1_WEEKLY_PY" 2>&1); rc_py=$?
+        if [ $rc_py -ne 0 ]; then
+            echo "RECONCILE FAIL projected_alert_eq_displayed_week_avg forecast/projected-cap: $result"
+            fail_count=$((fail_count + 1))
+        else
+            echo "PASS projected_alert_eq_displayed_week_avg forecast/projected-cap"
+            pass_count=$((pass_count + 1))
+        fi
+    fi
+else
+    echo "RECONCILE FAIL projected_alert_eq_displayed_week_avg forecast/projected-cap: fixture missing"
+    fail_count=$((fail_count + 1))
+fi
+
+# ── Budget_usd leg: budget --json week_avg_projection_usd ↔ detector ──
+PROJECTED1_BUDGET_PY='
+import json, os, sys, importlib.util, datetime as dt
+from importlib.machinery import SourceFileLoader
+
+b = json.loads(os.environ["RECONCILE_B"])
+emitted = b["week_avg_projection_usd"]
+high_end = b["projected_eow_high_usd"]
+target = b["weekly_usd"]
+spent = b["spent_usd"]
+
+# Re-derive from budget --json'\''s own published spend/window (independent of the
+# kernel): rate_avg = spent/elapsed_hours; week_avg = spent + rate_avg*remaining.
+ws = dt.datetime.fromisoformat(b["week_start_at"].replace("Z", "+00:00"))
+we = dt.datetime.fromisoformat(b["week_end_at"].replace("Z", "+00:00"))
+now = dt.datetime.fromisoformat(b["as_of"].replace("Z", "+00:00"))
+total_s = (we - ws).total_seconds()
+elapsed_s = max(0.0, min((now - ws).total_seconds(), total_s))
+remaining_h = max(0.0, (total_s - elapsed_s)) / 3600.0
+elapsed_h = elapsed_s / 3600.0
+rate_avg = (spent / elapsed_h) if elapsed_h > 0 else 0.0
+rederived = spent + rate_avg * remaining_h
+
+# Bind to the ACTUAL detector path the projected budget leg fires on.
+bin_dir = os.environ["PROJECTED_BIN_DIR"]
+sys.path.insert(0, bin_dir)
+loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
+spec = importlib.util.spec_from_loader("cctally", loader)
+c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
+loader.exec_module(c)
+conn = c.open_db()
+now_dt = c._command_as_of()
+inputs = c._build_budget_status_inputs(
+    conn, target_usd=target, now_utc=now_dt,
+    alert_thresholds=(90, 100), skip_sync=False,
+)
+assert inputs is not None, "PROJECTED1 budget: _build_budget_status_inputs returned None"
+status = c.compute_budget_status(inputs)
+assert not status.low_confidence, "PROJECTED1 budget: fixture is low-confidence (detector would not fire)"
+detector_value = status.week_avg_projection_usd
+
+# Equality (the reconcile contract): emitted == re-derivation == detector.
+assert abs(emitted - rederived) < 1e-9, (
+    f"budget week_avg_projection_usd={emitted} != rederived {rederived}"
+)
+assert abs(emitted - detector_value) < 1e-9, (
+    f"budget week_avg_projection_usd={emitted} != detector {detector_value} "
+    f"(the value maybe_record_projected_alert budget leg fires on)"
+)
+
+# Non-vacuity: displayed verdict high end must DIFFER from the week-average.
+assert abs(high_end - emitted) > 1.0, (
+    f"PROJECTED1 budget VACUOUS: projected_eow_high_usd={high_end} ~= "
+    f"week_avg_projection_usd={emitted}; fixture is not recent!=average so a "
+    f"wrong binding to the displayed high end could pass by accident"
+)
+'
+b_home="$FIXTURES/budget/recent-hot"
+if [ -f "$b_home/input.env" ]; then
+    AS_OF=""
+    # shellcheck disable=SC1091
+    . "$b_home/input.env"
+    b_json=$(HOME="$b_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" budget --json 2>/dev/null); rc_b=$?
+    if [ $rc_b -ne 0 ]; then
+        echo "RECONCILE FAIL projected_alert_eq_displayed_week_avg budget/recent-hot: budget --json rc=$rc_b"
+        fail_count=$((fail_count + 1))
+    else
+        result=$(RECONCILE_B="$b_json" \
+            PROJECTED_BIN_DIR="$REPO_ROOT/bin" \
+            HOME="$b_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+            CCTALLY_DISABLE_DEV_AUTODETECT=1 \
+            python3 -c "$PROJECTED1_BUDGET_PY" 2>&1); rc_py=$?
+        if [ $rc_py -ne 0 ]; then
+            echo "RECONCILE FAIL projected_alert_eq_displayed_week_avg budget/recent-hot: $result"
+            fail_count=$((fail_count + 1))
+        else
+            echo "PASS projected_alert_eq_displayed_week_avg budget/recent-hot"
+            pass_count=$((pass_count + 1))
+        fi
+    fi
+else
+    echo "RECONCILE FAIL projected_alert_eq_displayed_week_avg budget/recent-hot: fixture missing"
+    fail_count=$((fail_count + 1))
+fi
 
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
