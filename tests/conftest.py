@@ -213,6 +213,32 @@ def redirect_paths(ns, monkeypatch, tmp_path):
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
 
 
+def load_isolated_cctally_module(tmp_path, monkeypatch):
+    """Load bin/cctally as a real module under the canonical isolated data dir.
+
+    Shared by the ``*_ns_patch.py`` ``cctally_mod`` fixtures. These fixtures
+    patch ``cctally_mod.<X>`` and assert the handler reaches those names via
+    the ``_cctally()`` accessor, so they need the module OBJECT (not just the
+    globals dict) — but they ALSO need the same ``_cctally_core`` path
+    redirection every other test gets.
+
+    Issue #127: the previous bespoke loader only ``setenv("HOME", …)`` and
+    relied on ``_cctally_core``'s import-time ``_init_paths_from_env()`` to
+    pick up the tmp HOME. That holds ONLY when ``_cctally_core`` is imported
+    fresh (test run in isolation). Once any prior test has cached
+    ``_cctally_core`` in ``sys.modules`` (every ``load_script()`` user does),
+    the bespoke loader skipped re-derivation and the handler read the
+    developer's REAL ``~/.local/share/cctally/stats.db`` — intermittently
+    failing once that DB held a ``week_reset_events`` row matching the current
+    week. Going through ``load_script() + redirect_paths()`` pins
+    ``_cctally_core``'s path constants to ``tmp_path`` deterministically,
+    independent of import order.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    return sys.modules["cctally"]
+
+
 @pytest.fixture(scope="session")
 def cctally_module():
     """Expose bin/cctally as an attribute-accessible namespace.

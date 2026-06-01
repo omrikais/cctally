@@ -17,13 +17,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import importlib.util
 import json
-import sys
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
+
+from conftest import load_isolated_cctally_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CCTALLY = REPO_ROOT / "bin" / "cctally"
@@ -31,18 +30,13 @@ CCTALLY = REPO_ROOT / "bin" / "cctally"
 
 @pytest.fixture
 def cctally_mod(tmp_path, monkeypatch):
-    """Load bin/cctally as a module under an isolated, empty data dir."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
-    loader = SourceFileLoader("cctally", str(CCTALLY))
-    spec = importlib.util.spec_from_loader("cctally", loader)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
-    return mod
+    """Load bin/cctally under the canonical isolated data dir (#127).
+
+    Via the shared ``load_isolated_cctally_module`` helper so the loader
+    gets ``_cctally_core`` path redirection — without it, a cached
+    ``_cctally_core`` made these tests read the real prod DB (#127).
+    """
+    return load_isolated_cctally_module(tmp_path, monkeypatch)
 
 
 def test_iso_z_is_the_forecast_version(cctally_mod):

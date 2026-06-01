@@ -26,12 +26,12 @@ asserts RED, reverts, asserts GREEN — feedback_prove_test_non_vacuous).
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import sys
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
+
+from conftest import load_isolated_cctally_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CCTALLY = REPO_ROOT / "bin" / "cctally"
@@ -39,18 +39,39 @@ CCTALLY = REPO_ROOT / "bin" / "cctally"
 
 @pytest.fixture
 def cctally_mod(tmp_path, monkeypatch):
-    """Load bin/cctally as a module under an isolated, empty data dir."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
-    loader = SourceFileLoader("cctally", str(CCTALLY))
-    spec = importlib.util.spec_from_loader("cctally", loader)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
-    return mod
+    """Load bin/cctally under the canonical isolated data dir (#127).
+
+    Goes through the shared ``load_isolated_cctally_module`` helper so the
+    loader gets ``_cctally_core`` path redirection — without it, a cached
+    ``_cctally_core`` made these tests read the real prod DB (#127).
+    """
+    return load_isolated_cctally_module(tmp_path, monkeypatch)
+
+
+def test_ns_patch_loader_isolates_db_when_core_cached(tmp_path, monkeypatch):
+    """#127 regression: the shared loader must isolate ``_cctally_core``'s
+    ``DB_PATH`` to the per-test tmp dir EVEN WHEN ``_cctally_core`` is already
+    cached pointing at a non-tmp (real prod) DB.
+
+    Pre-#127 the bespoke loader only ``setenv("HOME", …)``; a cached
+    ``_cctally_core`` kept its real ``~/.local/share/cctally/stats.db`` and
+    ``cmd_percent_breakdown`` read the developer's actual database (which
+    intermittently failed the accessor-reach tests once that DB held a
+    ``week_reset_events`` row for the current week — the original symptom).
+    """
+    import _cctally_core
+    from pathlib import Path as _Path
+    # Simulate a prior test having cached _cctally_core with the real prod DB.
+    monkeypatch.setattr(
+        _cctally_core, "DB_PATH",
+        _Path("/Users/dev/.local/share/cctally/stats.db"),
+    )
+    mod = load_isolated_cctally_module(tmp_path, monkeypatch)
+    assert mod is sys.modules["cctally"]
+    assert str(_cctally_core.DB_PATH).startswith(str(tmp_path)), (
+        f"#127: loader must re-isolate DB_PATH under tmp, got "
+        f"{_cctally_core.DB_PATH}"
+    )
 
 
 def _fake_milestone_row():

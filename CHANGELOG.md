@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Test-suite isolation (no shipped-code change): the `*_ns_patch.py` binding-regression tests no longer read the developer's real `~/.local/share/cctally` database (#127).** Their shared `cctally_mod` fixture loaded `bin/cctally` with a bespoke loader that only set `HOME` and relied on `_cctally_core`'s import-time path derivation — which silently no-ops once any earlier test has cached `_cctally_core` in `sys.modules` (every `load_script()` user does), so the handler under test fell back to the real prod DB. That stayed invisible until the prod DB happened to hold a `week_reset_events` row for the current week, at which point `test_percent_breakdown_md_reaches_all_accessors_via_ns` flipped to a failure that only reproduced under certain test orderings (it filters milestones by the DB's active segment, so the seeded fake milestone was dropped and the table never rendered). The five `*_ns_patch.py` fixtures now route through a shared `conftest.load_isolated_cctally_module()` helper built on `load_script()` + `redirect_paths()`, pinning `_cctally_core`'s path constants to the per-test tmp dir deterministically regardless of import order. A new order-independent regression (`test_ns_patch_loader_isolates_db_when_core_cached`) asserts the loader re-isolates `DB_PATH` even when `_cctally_core` is pre-cached pointing at a real prod path.
+
 ## [1.22.4] - 2026-06-01
 
 ### Fixed
