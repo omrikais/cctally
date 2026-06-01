@@ -2395,6 +2395,9 @@ _compute_cost_for_weekref           = _cctally_weekrefs._compute_cost_for_weekre
 _apply_overlap_clamp_to_weekrefs    = _cctally_weekrefs._apply_overlap_clamp_to_weekrefs
 _RESET_PCT_DROP_THRESHOLD           = _cctally_weekrefs._RESET_PCT_DROP_THRESHOLD
 _FIVE_HOUR_RESET_PCT_DROP_THRESHOLD = _cctally_weekrefs._FIVE_HOUR_RESET_PCT_DROP_THRESHOLD
+_RESET_ZERO_FLOOR_PCT               = _cctally_weekrefs._RESET_ZERO_FLOOR_PCT
+_RESET_ZERO_MIN_DROP_PCT            = _cctally_weekrefs._RESET_ZERO_MIN_DROP_PCT
+_is_reset_drop                      = _cctally_weekrefs._is_reset_drop
 
 
 # Eager re-export of bin/_cctally_percent_breakdown.py — the percent-breakdown

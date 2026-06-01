@@ -278,7 +278,7 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
             if (
                 captured_dt < prior_end_dt
                 and prior_pct is not None and cur_pct is not None
-                and (float(prior_pct) - float(cur_pct)) >= _RESET_PCT_DROP_THRESHOLD
+                and _is_reset_drop(prior_pct, cur_pct)
             ):
                 # Floor to the hour so the display boundary lands on the
                 # natural hour mark (Anthropic's reset times are always
@@ -309,7 +309,7 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
             if (
                 captured_dt < prior_end_dt
                 and prior_pct is not None and cur_pct is not None
-                and (float(prior_pct) - float(cur_pct)) >= _RESET_PCT_DROP_THRESHOLD
+                and _is_reset_drop(prior_pct, cur_pct)
             ):
                 # Pre-check on ``new_week_end_at`` (mirrors the live
                 # detection path's pre-check). Necessary because the
@@ -378,6 +378,40 @@ _RESET_PCT_DROP_THRESHOLD = 25.0
 # See spec docs/superpowers/specs/2026-05-16-5h-in-place-credit-detection.md
 # §2.1 (Q1) for rationale.
 _FIVE_HOUR_RESET_PCT_DROP_THRESHOLD = 5.0
+
+# Reset-to-zero discriminator (2026-06-01 surprise-reset fix). Anthropic's
+# weekly reset zeroes the counter mid-window, but the 25pp magnitude gate
+# above silently masks it for any user below ~25% usage (e.g. the observed
+# 14→0). A reset-to-zero is unambiguous REGARDLESS of magnitude: a lagging
+# API replica reports a slightly-lower number, never a clean 0 against real
+# usage. So the detector ALSO fires when the post value collapses to ~0
+# (<= _RESET_ZERO_FLOOR_PCT) with a drop clearing a small min-drop floor.
+# The floor rejects 1%→0% stale-replica jitter, which would otherwise write
+# a spurious week_reset_events row and segment the week.
+_RESET_ZERO_FLOOR_PCT = 1.0
+_RESET_ZERO_MIN_DROP_PCT = 3.0
+
+
+def _is_reset_drop(prior_pct: float, cur_pct: float) -> bool:
+    """True when ``prior_pct → cur_pct`` is a genuine weekly reset/credit.
+
+    Two independent percent-shape signals (OR):
+
+    * **Partial credit** — drop ``>= _RESET_PCT_DROP_THRESHOLD`` (25pp).
+    * **Reset-to-zero** — ``cur_pct`` collapses to ~0
+      (``<= _RESET_ZERO_FLOOR_PCT``) with a drop clearing
+      ``_RESET_ZERO_MIN_DROP_PCT``.
+
+    Callers retain the boundary predicates (same/advanced ``week_end_at``
+    AND ``prior_end_dt > now``); this helper owns ONLY the percent-shape
+    discrimination so all four 7d detection sites (live advance, live
+    in-place, backfill advance, backfill in-place) stay byte-identical.
+    """
+    cur = float(cur_pct)
+    drop = float(prior_pct) - cur
+    if drop >= _RESET_PCT_DROP_THRESHOLD:
+        return True
+    return cur <= _RESET_ZERO_FLOOR_PCT and drop >= _RESET_ZERO_MIN_DROP_PCT
 
 
 def _week_ref_has_reset_event(

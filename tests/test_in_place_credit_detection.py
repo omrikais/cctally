@@ -359,6 +359,104 @@ def test_detection_does_not_fire_below_threshold(ns, tmp_path):
     assert parts == [week_start_date, "26.0"], parts
 
 
+def test_detection_fires_on_reset_to_zero_below_threshold(ns, tmp_path):
+    """prior=14, cur=0 (drop 14pp < 25pp threshold) BUT the post value
+    collapses to ~0 with the SAME week_end_at: an Anthropic surprise
+    reset, not stale-replica noise. The reset-to-zero branch fires below
+    the 25pp gate — writes an event row, lands the 0% seed via the
+    reset-aware clamp, and force-writes hwm-7d.
+
+    Regression for the 2026-06-01 surprise reset: a light user at 14%
+    was reset to 0 and the 25pp-only gate silently masked it (the
+    monotonic clamp kept reporting the stale 14%).
+    """
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=14.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    hwm_path = ns["APP_DIR"] / "hwm-7d"
+    hwm_path.write_text(f"{week_start_date} 14.0\n")
+
+    args = _record_usage_args(percent=0.0, resets_at=end_epoch)
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute(
+            "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
+            "FROM week_reset_events"
+        ).fetchall()
+        assert len(events) == 1, events
+        # Same in-place credit row shape as the ≥25pp path: old ==
+        # effective, new == cur_end_canon (DISTINCT).
+        assert events[0]["new_week_end_at"] == end_iso
+        assert events[0]["old_week_end_at"] == events[0]["effective_reset_at_utc"]
+        assert events[0]["old_week_end_at"] != events[0]["new_week_end_at"]
+
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE weekly_percent = 0.0"
+        ).fetchone()[0]
+        assert cnt == 1, "post-reset 0% reading should have landed"
+    finally:
+        conn.close()
+
+    parts = hwm_path.read_text().strip().split()
+    assert parts == [week_start_date, "0.0"], parts
+
+
+def test_reset_to_zero_respects_min_drop_floor(ns, tmp_path):
+    """prior=1, cur=0 (drop 1pp): below the reset-to-zero min-drop floor.
+    A 1%→0% blip is stale-replica noise, NOT a reset — no event row, no
+    seed (legacy clamp blocks the lower percent), hwm unchanged. Guards
+    against spuriously segmenting a week on sub-floor jitter.
+    """
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=1.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    hwm_path = ns["APP_DIR"] / "hwm-7d"
+    hwm_path.write_text(f"{week_start_date} 1.0\n")
+
+    args = _record_usage_args(percent=0.0, resets_at=end_epoch)
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0]
+        assert events == 0, "sub-floor 1pp drop must not fire reset-to-zero"
+    finally:
+        conn.close()
+
+    parts = hwm_path.read_text().strip().split()
+    assert parts == [week_start_date, "1.0"], parts
+
+
 def test_detection_skipped_when_window_expired(ns, tmp_path):
     """prior=67, cur=2 BUT prior_end_dt <= now_utc: no event row.
     This is the natural-rollover case (the old week's end has actually
@@ -528,6 +626,50 @@ def test_backfill_detects_historical_in_place_credit(ns):
         # hour-aligned). Compare as UTC moment to absorb the host-tz
         # rendering quirk in ``parse_iso_datetime`` — see project
         # gotcha ``unixepoch_for_cross_offset_compare``.
+        eff_dt = dt.datetime.fromisoformat(events[0]["effective_reset_at_utc"])
+        assert eff_dt.astimezone(dt.timezone.utc) == dt.datetime(
+            2026, 5, 14, 17, 0, 0, tzinfo=dt.timezone.utc
+        )
+    finally:
+        conn.close()
+
+
+def test_backfill_detects_historical_reset_to_zero(ns):
+    """Backfill parity for the reset-to-zero branch: snapshots showing
+    14→0 with the SAME week_end on consecutive in-window captures. Drop
+    is 14pp (< 25pp) but the post value is ~0, so backfill synthesizes
+    the in-place event the live detector would have written.
+    """
+    end_iso, _ = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-13T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=14.0,
+        )
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T17:30:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=0.0,
+        )
+        conn.commit()
+        ns["_backfill_week_reset_events"](conn)
+
+        events = conn.execute(
+            "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
+            "FROM week_reset_events"
+        ).fetchall()
+        assert len(events) == 1, events
+        assert events[0]["new_week_end_at"] == end_iso
+        assert events[0]["old_week_end_at"] == events[0]["effective_reset_at_utc"]
+        assert events[0]["old_week_end_at"] != events[0]["new_week_end_at"]
         eff_dt = dt.datetime.fromisoformat(events[0]["effective_reset_at_utc"])
         assert eff_dt.astimezone(dt.timezone.utc) == dt.datetime(
             2026, 5, 14, 17, 0, 0, tzinfo=dt.timezone.utc

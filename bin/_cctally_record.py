@@ -384,6 +384,7 @@ _logged_window_key_coerce_failure = False
 #   _cctally_core.HOOK_TICK_THROTTLE_PATH / _LOCK_PATH
 #   c._FIVE_HOUR_JITTER_FLOOR_SECONDS — _lib_five_hour.* re-export
 #   c._RESET_PCT_DROP_THRESHOLD       — bin/_cctally_weekrefs.py constant (re-exported on cctally ns)
+#   c._is_reset_drop                  — bin/_cctally_weekrefs.py helper (re-exported on cctally ns)
 #   c.HOOK_TICK_DEFAULT_THROTTLE_SECONDS
 
 
@@ -1639,7 +1640,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                     if (
                         prior_end_dt > now_utc
                         and prior_pct is not None
-                        and (float(prior_pct) - float(weekly_percent)) >= c._RESET_PCT_DROP_THRESHOLD
+                        and c._is_reset_drop(prior_pct, weekly_percent)
                     ):
                         # See _backfill_week_reset_events for why we floor
                         # the reset moment to the hour (natural display
@@ -1667,7 +1668,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                     if (
                         prior_end_dt > now_utc
                         and prior_pct is not None
-                        and (float(prior_pct) - float(weekly_percent)) >= c._RESET_PCT_DROP_THRESHOLD
+                        and c._is_reset_drop(prior_pct, weekly_percent)
                     ):
                         # Pre-check (Q5 belt-and-suspenders): suppress duplicate
                         # event rows for the same new_week_end_at across
