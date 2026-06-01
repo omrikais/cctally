@@ -251,6 +251,42 @@ def _seed_budget_milestone(
     )
 
 
+def _seed_projected_milestone(
+    stats_conn: sqlite3.Connection,
+    *,
+    week_start: dt.datetime,
+    metric: str,
+    threshold: int,
+    projected_value: float,
+    denominator: float,
+    crossed_at: dt.datetime,
+    alerted: bool = True,
+) -> None:
+    """Seed one ``projected_milestones`` row (issue #121). ``week_start_at``
+    is the effective (post-reset) ISO timestamp the resolver returns,
+    matching the dispatch payload's
+    ``projected:<week_start_at>:<metric>:<threshold>`` id. ``alerted_at`` is
+    set to ``crossed_at`` (set-then-dispatch) when ``alerted`` so the dashboard
+    envelope's projected leg (``WHERE alerted_at IS NOT NULL``) picks it up;
+    left NULL otherwise. ``denominator`` is the at-crossing target the envelope
+    renders from the ROW (100.0 for weekly_pct, target_usd for budget_usd)."""
+    stats_conn.execute(
+        """INSERT INTO projected_milestones
+           (week_start_at, metric, threshold, projected_value, denominator,
+            crossed_at_utc, alerted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            _iso(week_start),
+            str(metric),
+            int(threshold),
+            float(projected_value),
+            float(denominator),
+            _iso(crossed_at),
+            _iso(crossed_at) if alerted else None,
+        ),
+    )
+
+
 def _seed_session(
     cache_conn: sqlite3.Connection,
     *,
@@ -1140,6 +1176,117 @@ def build_utc_tz(as_of: dt.datetime) -> None:
     (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
 
 
+def build_projected_alerts(as_of: dt.datetime) -> None:
+    """Projected-pace alert axis (issue #121). Seeds two alerted
+    ``projected_milestones`` rows — one ``weekly_pct`` (100% of cap) and one
+    ``budget_usd`` (100% of a $50 budget) — plus a budget config block with
+    BOTH projected toggles on, so the dashboard envelope's fourth (projected)
+    alert leg and the ``alerts_settings`` projected mirror
+    (``projected_weekly_enabled`` / ``projected_budget_enabled``) are asserted
+    by the golden. A budget milestone is also seeded so the projected + budget
+    legs coexist (envelope union ordering). Minimal world otherwise (one week
+    anchor + one session) — this scenario exists to lock the projected
+    surface, not the panels.
+
+    No ``FIXED_SESSION_ID`` in input.env → the harness skips the
+    ``/api/session/:id`` golden leg (same as ``no-data`` / ``utc-tz``).
+    """
+    scenario_dir, app_dir = _scenario_dirs("projected-alerts")
+    stats_path = app_dir / "stats.db"
+    cache_path = app_dir / "cache.db"
+    create_stats_db(stats_path)
+    create_cache_db(cache_path)
+
+    # AS_OF = 2026-04-16T14:00Z → 72h into the week (~day 4 of 7).
+    week_start = dt.datetime(2026, 4, 13, 14, 0, 0, tzinfo=dt.timezone.utc)
+    week_end = week_start + dt.timedelta(days=7)
+
+    stats_conn = sqlite3.connect(stats_path)
+    cache_conn = sqlite3.connect(cache_path)
+    try:
+        # A few current-week snapshots so the week window resolves and the
+        # forecast/current-week panels render a non-empty envelope.
+        for hrs_in, pct in [(6, 5.0), (36, 25.0), (72, 50.0)]:
+            _insert_usage_snapshot(
+                stats_conn,
+                captured_at=week_start + dt.timedelta(hours=hrs_in),
+                week_start=week_start, week_end=week_end, pct=pct,
+            )
+        _seed_session(
+            cache_conn,
+            session_id="projected-alerts-cur-000000000000000000",
+            project_path="/fake/repos/fixture-projected",
+            model="claude-sonnet-4-6",
+            entries=[(week_start + dt.timedelta(hours=70), 120_000, 18_000, 0, 0)],
+        )
+
+        # Budget axis (issue #19): one alerted crossing so projected + budget
+        # legs coexist in the envelope union.
+        _seed_budget_milestone(
+            stats_conn,
+            week_start=week_start,
+            threshold=90,
+            budget_usd=50.0,
+            spent_usd=45.0,
+            crossed_at=week_start + dt.timedelta(hours=68),
+            alerted=True,
+        )
+        # Projected axis (issue #121): one weekly_pct row (denominator 100.0)
+        # and one budget_usd row (denominator = $50 target). alerted_at set so
+        # the envelope's `WHERE alerted_at IS NOT NULL` leg picks them up.
+        _seed_projected_milestone(
+            stats_conn,
+            week_start=week_start,
+            metric="weekly_pct",
+            threshold=100,
+            projected_value=104.0,
+            denominator=100.0,
+            crossed_at=week_start + dt.timedelta(hours=71),
+            alerted=True,
+        )
+        _seed_projected_milestone(
+            stats_conn,
+            week_start=week_start,
+            metric="budget_usd",
+            threshold=100,
+            projected_value=52.0,
+            denominator=50.0,
+            crossed_at=week_start + dt.timedelta(hours=72),
+            alerted=True,
+        )
+        _stamp_and_verify(stats_conn)
+        stats_conn.commit()
+        cache_conn.commit()
+    finally:
+        stats_conn.close()
+        cache_conn.close()
+
+    # Budget config with BOTH projected toggles ON so alerts_settings carries
+    # projected_weekly_enabled=True (via alerts.projected_enabled) and
+    # projected_budget_enabled=True (via budget.projected_enabled).
+    config_path = app_dir / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "alerts": {
+                    "enabled": True,
+                    "projected_enabled": True,
+                },
+                "budget": {
+                    "weekly_usd": 50.0,
+                    "alerts_enabled": True,
+                    "alert_thresholds": [90, 100],
+                    "projected_enabled": True,
+                },
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+    (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+
+
 SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "ok": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
@@ -1168,6 +1315,10 @@ SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "tz-override": (
         dt.datetime(2026, 4, 20, 12, 0, 0, tzinfo=dt.timezone.utc),
         build_tz_override,
+    ),
+    "projected-alerts": (
+        dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_projected_alerts,
     ),
 }
 

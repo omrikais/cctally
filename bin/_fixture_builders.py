@@ -318,6 +318,27 @@ def create_stats_db(path: Path) -> None:
                 UNIQUE(week_start_at, threshold)
             );
 
+            -- projected_milestones: projected-pace threshold crossings (issue
+            -- #121). Plain CREATE TABLE IF NOT EXISTS in bin/_cctally_core.py
+            -- (no migration handler — write-once, forward-only, same posture
+            -- as budget_milestones); mirrored here so fixture stats.db files
+            -- don't trigger an inline CREATE at open time. metric discriminates
+            -- weekly_pct (denominator 100.0) from budget_usd (denominator =
+            -- target_usd). A mid-week reset re-anchors week_start_at, so fresh
+            -- windows get fresh rows under UNIQUE(week_start_at, metric,
+            -- threshold) — no reset_event_id segment (budget pattern).
+            CREATE TABLE projected_milestones (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_at   TEXT    NOT NULL,
+                metric          TEXT    NOT NULL,
+                threshold       INTEGER NOT NULL,
+                projected_value REAL    NOT NULL,
+                denominator     REAL    NOT NULL,
+                crossed_at_utc  TEXT    NOT NULL,
+                alerted_at      TEXT,
+                UNIQUE(week_start_at, metric, threshold)
+            );
+
             -- five_hour_reset_events: parallel to week_reset_events for the
             -- 5h dimension. Added by issue #43 (live DDL in bin/cctally
             -- mirrored here so fixture stats.db files don't trigger inline
@@ -398,7 +419,7 @@ def _self_test_create_stats_db() -> None:
             "weekly_usage_snapshots", "weekly_cost_snapshots",
             "percent_milestones", "week_reset_events",
             "five_hour_blocks", "five_hour_milestones",
-            "budget_milestones",
+            "budget_milestones", "projected_milestones",
             "five_hour_reset_events",
             "five_hour_block_models", "five_hour_block_projects",
             "schema_migrations",

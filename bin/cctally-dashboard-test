@@ -24,8 +24,9 @@
 # Exits non-zero if any scenario fails. A trap ensures stray server PIDs die
 # on harness exit / Ctrl-C.
 #
-# The seven fixture scenarios (ok, warn, over, reset-week, no-data,
-# utc-tz, tz-override) run in parallel via `xargs -P` — each scenario
+# The eight fixture scenarios (ok, warn, over, reset-week, no-data,
+# utc-tz, tz-override, projected-alerts) run in parallel via `xargs -P`
+# — each scenario
 # already has its own scratch HOME under $SCRATCH_ROOT/<name> and
 # binds its dashboard server to an ephemeral port (`--port 0`), so
 # they're fully isolated. Cap with CCTALLY_TEST_JOBS (default = host
@@ -324,6 +325,93 @@ _run_scenario_inner () {
         fi
     fi
 
+    # Projected-pace axis (#121): for the dedicated `projected-alerts`
+    # scenario, assert the envelope's fourth alert leg + the alerts_settings
+    # projected mirror explicitly (in addition to the full golden-diff above),
+    # so a future regression that drops the projected leg fails loudly with a
+    # readable message rather than a buried golden diff.
+    if [ "$name" = "projected-alerts" ] && [ -n "${raw:-}" ]; then
+        local proj_check
+        proj_check=$(printf '%s' "$raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+errs = []
+alerts = d.get("alerts") or []
+proj = [a for a in alerts if a.get("axis") == "projected"]
+if not proj:
+    errs.append("no projected alert in envelope")
+metrics = {a.get("metric") for a in proj}
+if "weekly_pct" not in metrics:
+    errs.append("missing weekly_pct projected alert")
+if "budget_usd" not in metrics:
+    errs.append("missing budget_usd projected alert")
+for a in proj:
+    ctx = a.get("context") or {}
+    for k in ("metric", "denominator", "projected_value"):
+        if k not in ctx:
+            errs.append(f"projected context missing {k}: {a}")
+    if "metric" not in a:
+        errs.append(f"projected alert missing top-level metric: {a}")
+s = d.get("alerts_settings") or {}
+pw = s.get("projected_weekly_enabled")
+pb = s.get("projected_budget_enabled")
+if pw is not True:
+    errs.append("projected_weekly_enabled != True: %r" % (pw,))
+if pb is not True:
+    errs.append("projected_budget_enabled != True: %r" % (pb,))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+        if [ "$proj_check" != "ok" ]; then
+            echo "FAIL $name: projected envelope/settings assertion: $proj_check"
+            ok=0
+        fi
+    fi
+
+    # POST /api/settings round-trip for the projected toggles (#121): a
+    # combined alerts+budget settings PUT persists both projected_enabled
+    # flags and echoes them back. Only on the projected-alerts scenario
+    # (it has no --tz pin, so settings stay writable).
+    if [ "$name" = "projected-alerts" ]; then
+        local set_raw set_check
+        set_raw=$(curl -s --max-time 5 \
+            -X POST -H "Origin: http://127.0.0.1:$port" \
+            -H "Content-Type: application/json" \
+            -d '{"alerts":{"projected_enabled":false},"budget":{"projected_enabled":false}}' \
+            "$base/api/settings")
+        set_check=$(printf '%s' "$set_raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+a = d.get("alerts") or {}
+b = d.get("budget") or {}
+errs = []
+ap = a.get("projected_enabled")
+bp = b.get("projected_enabled")
+if ap is not False:
+    errs.append("echo alerts.projected_enabled != False: %r" % (ap,))
+if bp is not False:
+    errs.append("echo budget.projected_enabled != False: %r" % (bp,))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+        if [ "$set_check" != "ok" ]; then
+            echo "FAIL $name: POST /api/settings projected round-trip: $set_check (raw: $set_raw)"
+            ok=0
+        fi
+        # Reject a non-bool projected toggle with 400 (no partial write).
+        local bad_code
+        bad_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+            -X POST -H "Origin: http://127.0.0.1:$port" \
+            -H "Content-Type: application/json" \
+            -d '{"alerts":{"projected_enabled":"yes"}}' "$base/api/settings")
+        if [ "$bad_code" != "400" ]; then
+            echo "FAIL $name: POST /api/settings non-bool projected returned $bad_code (expected 400)"
+            ok=0
+        fi
+    fi
+
     # /api/events: grab the first update frame. --max-time keeps the
     # connection from blocking forever on an idle server; the header
     # flush + first publish should land well under 3s.
@@ -493,11 +581,11 @@ run_scenario () {
     fi
 }
 
-# Dispatch the seven fixture scenarios in parallel. Each scenario's
+# Dispatch the eight fixture scenarios in parallel. Each scenario's
 # output goes to its own _output.log; the loop after `xargs` flushes
 # them in fixed scenario order so the harness output reads identically
 # to the old sequential version.
-fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override)
+fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts)
 export -f _run_scenario_inner run_scenario normalize_json normalize_session_json
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.
 export -f _golden_diff_files _golden_diff_str _golden_diff_two_str

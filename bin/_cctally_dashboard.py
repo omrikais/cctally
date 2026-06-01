@@ -4071,17 +4071,20 @@ def _build_alerts_envelope_array(
 ) -> list[dict]:
     """Return the ``alerts`` array for the SSE snapshot envelope.
 
-    Union of ``percent_milestones``, ``five_hour_milestones``, and
-    ``budget_milestones`` rows with ``alerted_at IS NOT NULL``, ordered
-    newest-first by ``alerted_at``, capped at ``limit`` (default 100).
-    Single source of truth for both the dashboard panel (slices to 10
-    client-side) and the modal (renders all 100). Forward-only
-    semantics: only rows the alert-dispatch path stamped get included;
-    pre-deploy crossings stay NULL and are intentionally invisible
-    (spec §4.3).
+    Union of ``percent_milestones``, ``five_hour_milestones``,
+    ``budget_milestones``, and ``projected_milestones`` rows with
+    ``alerted_at IS NOT NULL``, ordered newest-first by ``alerted_at``,
+    capped at ``limit`` (default 100). Single source of truth for both the
+    dashboard panel (slices to 10 client-side) and the modal (renders all
+    100). Forward-only semantics: only rows the alert-dispatch path stamped
+    get included; pre-deploy crossings stay NULL and are intentionally
+    invisible (spec §4.3).
 
-    All three axes share the same envelope schema; the ``axis`` field
-    (``weekly`` / ``five_hour`` / ``budget``) discriminates.
+    All four axes share the same envelope schema; the ``axis`` field
+    (``weekly`` / ``five_hour`` / ``budget`` / ``projected``) discriminates.
+    The ``projected`` axis additionally carries a top-level ``metric``
+    (``weekly_pct`` | ``budget_usd``) so the frontend can pick its
+    metric-aware context renderer.
 
     Per-axis ``LIMIT`` is applied at the SQL level (each query may yield
     up to ``limit``) and the union is re-sorted + sliced — important for
@@ -4206,11 +4209,50 @@ def _build_alerts_envelope_array(
             },
         })
 
+    # Fourth axis (issue #121): projected-pace threshold crossings. Like
+    # budget, projected alerts re-anchor ``week_start_at`` on a mid-week
+    # reset, so there is NO ``reset_event_id`` segment — the new window gets
+    # fresh rows under ``UNIQUE(week_start_at, metric, threshold)``. The
+    # ``metric`` discriminator (``weekly_pct`` | ``budget_usd``) drives the
+    # frontend's metric-aware context renderer; ``denominator`` +
+    # ``projected_value`` are rendered FROM THE ROW (the values snapshotted at
+    # crossing), never live config that may have changed since (Codex P0-4).
+    # The envelope id mirrors the dispatch payload's
+    # ``projected:<week_start_at>:<metric>:<threshold>`` shape.
+    projected_rows = conn.execute(
+        """
+        SELECT week_start_at, metric, threshold, projected_value,
+               denominator, crossed_at_utc, alerted_at
+        FROM projected_milestones
+        WHERE alerted_at IS NOT NULL
+        ORDER BY alerted_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    for r in projected_rows:
+        threshold = int(r["threshold"])
+        metric = str(r["metric"])
+        out.append({
+            "id":         f"projected:{r['week_start_at']}:{metric}:{threshold}",
+            "axis":       "projected",
+            "metric":     metric,
+            "threshold":  threshold,
+            "crossed_at": r["crossed_at_utc"],
+            "alerted_at": r["alerted_at"],
+            "context": {
+                "week_start_at":   r["week_start_at"],
+                "metric":          metric,
+                "projected_value": float(r["projected_value"]),
+                "denominator":     float(r["denominator"]),
+            },
+        })
+
     # Python's list.sort is stable. When two alerts share the same
     # `alerted_at` ISO string (rare; multiple axes firing within the same
-    # millisecond), the union order (weekly, then 5h, then budget)
-    # determines the tiebreaker — no extra deterministic key is added
-    # because the spec doesn't require one.
+    # millisecond), the union order (weekly, then 5h, then budget, then
+    # projected) determines the tiebreaker — no extra deterministic key is
+    # added because the spec doesn't require one.
     out.sort(key=lambda a: a["alerted_at"], reverse=True)
     return out[:limit]
 
@@ -4583,6 +4625,7 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
             "enabled": False,
             "weekly_thresholds": [],
             "five_hour_thresholds": [],
+            "projected_enabled": False,
         }
     # Budget is its OWN config block (issue #19) — source budget fields
     # from ``_get_budget_config`` (the validated ``budget`` block), NOT
@@ -4592,13 +4635,18 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         _budget_cfg = _get_budget_config(_cfg_for_alerts)
     except _BudgetConfigError:
         _budget_cfg = {"weekly_usd": None, "alerts_enabled": True,
-                       "alert_thresholds": []}
+                       "alert_thresholds": [], "projected_enabled": False}
     alerts_settings = {
         "enabled":              _alerts_cfg["enabled"],
         "weekly_thresholds":    list(_alerts_cfg["weekly_thresholds"]),
         "five_hour_thresholds": list(_alerts_cfg["five_hour_thresholds"]),
         "budget_thresholds":    list(_budget_cfg["alert_thresholds"]),
         "budget_enabled":       _budget_alerts_active(_budget_cfg),
+        # Projected-pace opt-in mirrors (#121). Two flags, one per parent
+        # axis — the frontend SettingsOverlay seeds two toggles. Sourced
+        # from the validated getters' ``projected_enabled`` (default False).
+        "projected_weekly_enabled": bool(_alerts_cfg.get("projected_enabled")),
+        "projected_budget_enabled": bool(_budget_cfg.get("projected_enabled")),
     }
 
     # Mirror update-state.json + update-suppress.json into the envelope
@@ -5182,16 +5230,17 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         "update"?: {"check"?: {"enabled"?: bool, "ttl_hours"?: int}},
         "cache_report"?: {"anomaly_threshold_pp"?: int},
         "budget"?: {"weekly_usd"?: number|null, "alerts_enabled"?: bool,
-        "alert_thresholds"?: int[]}}`` — every top-level key is optional;
-        any subset may be sent together (combined save). Unknown
-        top-level keys are rejected with 400.
+        "alert_thresholds"?: int[], "projected_enabled"?: bool}}`` — every
+        top-level key is optional; any subset may be sent together
+        (combined save). Unknown top-level keys are rejected with 400.
 
         Per-block validation:
           * ``display.tz`` — "local", "utc", or a valid IANA zone (via
             ``normalize_display_tz_value``); 400 on invalid.
-          * ``alerts`` — must be a dict; ``alerts.enabled`` must be a
-            JSON boolean (string "yes"/"true" rejected, per spec). Merged
-            block is validated via ``_get_alerts_config(merged)``;
+          * ``alerts`` — must be a dict; ``alerts.enabled`` and
+            ``alerts.projected_enabled`` must each be a JSON boolean
+            (string "yes"/"true" rejected, per spec). Merged block is
+            validated via ``_get_alerts_config(merged)``;
             ``_AlertsConfigError`` → 400.
           * ``update.check.enabled`` — JSON bool; 400 on type mismatch.
           * ``update.check.ttl_hours`` — JSON int (NOT string), in
@@ -5203,10 +5252,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             ``{error, field: "anomaly_threshold_pp"}`` on out-of-range
             or non-int. Spec §6.1 hardcodes ``anomaly_window_days``;
             F10 tracks lifting that.
-          * ``budget`` — must be a dict; merged onto the persisted
-            ``budget`` block and validated via ``_get_budget_config(merged)``
-            (issue #19); ``_BudgetConfigError`` → 400. Budget is its OWN
-            config block, distinct from ``alerts``.
+          * ``budget`` — must be a dict; the inbound leaves
+            (``weekly_usd`` / ``alerts_enabled`` / ``alert_thresholds`` /
+            ``projected_enabled``) are merged onto the persisted ``budget``
+            block and validated via ``_get_budget_config(merged)`` (issue
+            #19, projected toggle #121); ``_BudgetConfigError`` → 400.
+            Budget is its OWN config block, distinct from ``alerts``.
 
         Atomic merged write: if all touched blocks validate, the merged
         config is persisted in a single ``save_config`` call inside the
@@ -5367,6 +5418,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     {"error": "alerts.enabled must be a JSON boolean"},
                 )
                 return
+            if "projected_enabled" in alerts_block and not isinstance(
+                alerts_block["projected_enabled"], bool
+            ):
+                self._respond_json(
+                    400,
+                    {"error": "alerts.projected_enabled must be a JSON boolean"},
+                )
+                return
 
         # Pre-validate budget shape (the structural type check; full
         # cross-key validation runs inside the lock via
@@ -5478,6 +5537,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 alerts_in = payload["alerts"]
                 if "enabled" in alerts_in:
                     merged_alerts["enabled"] = alerts_in["enabled"]
+                if "projected_enabled" in alerts_in:
+                    merged_alerts["projected_enabled"] = (
+                        alerts_in["projected_enabled"]
+                    )
                 merged["alerts"] = merged_alerts
                 # Final cross-field validation against the merged block.
                 # _AlertsConfigError → 400 (no partial write since
@@ -5504,7 +5567,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     return
                 merged_budget = dict(existing_budget or {})
                 budget_in = payload["budget"]
-                for leaf in ("weekly_usd", "alerts_enabled", "alert_thresholds"):
+                for leaf in (
+                    "weekly_usd", "alerts_enabled", "alert_thresholds",
+                    "projected_enabled",
+                ):
                     if leaf in budget_in:
                         merged_budget[leaf] = budget_in[leaf]
                 merged["budget"] = merged_budget

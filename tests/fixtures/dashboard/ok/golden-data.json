@@ -25,6 +25,8 @@
       90,
       95
     ],
+    "projected_budget_enabled": false,
+    "projected_weekly_enabled": false,
     "weekly_thresholds": [
       90,
       95
