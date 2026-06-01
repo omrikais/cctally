@@ -23,6 +23,7 @@
   "forecast": {
     "final_percent_low": 57.6,
     "final_percent_high": 65.739,
+    "week_avg_projection_pct": 65.739,
     "projected_cap": false,
     "cap_at": null,
     "already_capped": false,

@@ -52,6 +52,7 @@ class BudgetStatus:
     elapsed_fraction: float             # [0, 1]
     projected_eow_low_usd: float
     projected_eow_high_usd: float
+    week_avg_projection_usd: float      # spent + rate_avg*remaining (smooth estimator)
     verdict: str                        # "ok" | "warn" | "over"
     daily_budget_remaining_usd: float   # remaining / remaining-days
     daily_pace_usd: float               # current burn $/day (week-average)
@@ -93,6 +94,12 @@ def compute_budget_status(inputs: BudgetInputs) -> BudgetStatus:
         spent, remaining_hours, rate_low, rate_high
     )
 
+    # Smooth week-average end-of-week projection (additive surface field).
+    # Distinct from the displayed band (which keys off the high end): this is
+    # the conservative week-average value the projected-pace alert axis fires
+    # on. spent + rate_avg*remaining (== project_linear collapsed to one rate).
+    week_avg_projection_usd = spent + rate_avg * remaining_hours
+
     daily_pace_usd = rate_avg * 24.0
     daily_budget_remaining_usd = (
         (remaining_usd / remaining_days) if remaining_days > 0 else remaining_usd
@@ -125,6 +132,7 @@ def compute_budget_status(inputs: BudgetInputs) -> BudgetStatus:
         elapsed_fraction=elapsed_fraction,
         projected_eow_low_usd=projected_low,
         projected_eow_high_usd=projected_high,
+        week_avg_projection_usd=week_avg_projection_usd,
         verdict=verdict,
         daily_budget_remaining_usd=daily_budget_remaining_usd,
         daily_pace_usd=daily_pace_usd,

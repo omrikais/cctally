@@ -497,6 +497,7 @@ class ForecastOutput:
     r_recent: float | None         # pct per hour, 24h recent; None if no prior sample
     final_percent_low: float
     final_percent_high: float
+    week_avg_projection_pct: float  # p_now + r_avg*remaining (smooth estimator)
     projected_cap: bool
     already_capped: bool
     cap_at: dt.datetime | None
@@ -526,6 +527,12 @@ def _compute_forecast(inputs: ForecastInputs, targets: list[int]) -> ForecastOut
             inputs.p_now, inputs.remaining_hours, r_avg, r_recent
         )
         final_low, final_high = min(a, b), max(a, b)
+
+    # Smooth week-average projection (additive surface field). Distinct from
+    # the displayed band (which keys off final_high): this is the conservative
+    # week-average value the projected-pace alert axis fires on.
+    # p_now + r_avg*remaining (== project_linear collapsed to the single rate).
+    week_avg_projection_pct = inputs.p_now + r_avg * inputs.remaining_hours
 
     already_capped = inputs.p_now >= 100.0
     projected_cap = already_capped or final_high >= 100.0
@@ -562,6 +569,7 @@ def _compute_forecast(inputs: ForecastInputs, targets: list[int]) -> ForecastOut
         r_recent=r_recent,
         final_percent_low=final_low,
         final_percent_high=final_high,
+        week_avg_projection_pct=week_avg_projection_pct,
         projected_cap=projected_cap,
         already_capped=already_capped,
         cap_at=cap_at,
@@ -628,6 +636,7 @@ def _build_forecast_json_payload(out: ForecastOutput) -> dict:
         "forecast": {
             "final_percent_low":  round(out.final_percent_low, 3),
             "final_percent_high": round(out.final_percent_high, 3),
+            "week_avg_projection_pct": round(out.week_avg_projection_pct, 3),
             "projected_cap":      out.projected_cap,
             "cap_at":             (None if out.cap_at is None else _iso_z(out.cap_at)),
             "already_capped":     out.already_capped,
@@ -1818,6 +1827,7 @@ def _budget_emit_json(budget_cfg, inputs, status) -> int:
         "elapsed_fraction": status.elapsed_fraction,
         "projected_eow_low_usd": status.projected_eow_low_usd,
         "projected_eow_high_usd": status.projected_eow_high_usd,
+        "week_avg_projection_usd": status.week_avg_projection_usd,
         "daily_pace_usd": status.daily_pace_usd,
         "daily_budget_remaining_usd": status.daily_budget_remaining_usd,
         "verdict": status.verdict,

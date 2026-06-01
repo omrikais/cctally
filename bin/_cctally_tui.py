@@ -1193,6 +1193,7 @@ class DataSnapshot:
             r_recent=r_recent,
             final_percent_low=final_low,
             final_percent_high=final_high,
+            week_avg_projection_pct=used_pct + r_avg * remaining_hours,
             projected_cap=final_high >= 100.0,
             already_capped=False,
             cap_at=None,

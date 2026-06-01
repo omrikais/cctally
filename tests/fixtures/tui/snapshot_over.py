@@ -68,6 +68,7 @@ _FC = m.ForecastOutput(
     r_recent=_R_REC,
     final_percent_low=min(_P_FIN_AVG, _P_FIN_REC),
     final_percent_high=max(_P_FIN_AVG, _P_FIN_REC),
+    week_avg_projection_pct=_P_FIN_AVG,
     projected_cap=True,
     already_capped=False,
     cap_at=_CAP_AT,

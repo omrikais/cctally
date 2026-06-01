@@ -135,7 +135,8 @@
           "snapshots<3",
           "no_sample_ge_24h"
         ],
-        "projected_cap": false
+        "projected_cap": false,
+        "week_avg_projection_pct": 12.145
       },
       "meta": {
         "generated_at": "2026-04-20T12:00:00Z",

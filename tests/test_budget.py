@@ -105,6 +105,27 @@ def test_f1_structural_budget_uses_project_linear():
     assert "rate_low * remaining" not in src
 
 
+def test_budget_status_exposes_week_average_projection():
+    # now_days=3.5 over a 168h week => elapsed 84h, remaining 84h.
+    # rate_avg = spent/84 ($/h); week-average projection over full window =
+    # spent + rate_avg*84 = 2*spent. With spent=100 => 200.
+    st = compute_budget_status(_mk(spent=100.0, recent_24h=48.0, now_days=3.5))
+    assert abs(st.week_avg_projection_usd - 200.0) < 1e-9
+    # Must equal spent + rate_avg*remaining, NOT max(low, high). With a recent
+    # rate distinct from the week-average, the high-end band differs from the
+    # week-average projection — guards against binding to the wrong field.
+    assert (
+        st.week_avg_projection_usd != st.projected_eow_high_usd
+        or st.projected_eow_low_usd == st.projected_eow_high_usd
+    )
+
+
+def test_week_avg_projection_zero_elapsed_collapses_to_spent():
+    # now == week_start => elapsed 0h, rate_avg 0 => projection == spent.
+    st = compute_budget_status(_mk(spent=42.0, recent_24h=0.0, now_days=0.0))
+    assert abs(st.week_avg_projection_usd - 42.0) < 1e-9
+
+
 def test_get_budget_config_ignores_unknown_keys():
     """Unknown budget sub-keys are warn-and-ignored, not fatal (forward compat)."""
     cctally = _load("cctally", REPO / "bin" / "cctally")

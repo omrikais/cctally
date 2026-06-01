@@ -769,7 +769,8 @@
         "final_percent_high": 14.6,
         "final_percent_low": 14.6,
         "low_confidence_reasons": [],
-        "projected_cap": false
+        "projected_cap": false,
+        "week_avg_projection_pct": 14.6
       },
       "meta": {
         "generated_at": "2026-04-18T14:00:00Z",
