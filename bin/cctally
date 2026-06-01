@@ -366,6 +366,12 @@ _build_codex_weekly_parser = _cctally_parser._build_codex_weekly_parser
 _build_codex_session_parser = _cctally_parser._build_codex_session_parser
 
 
+_lib_alert_axes = _load_sibling("_lib_alert_axes")
+severity_for = _lib_alert_axes.severity_for
+AlertAxisDescriptor = _lib_alert_axes.AlertAxisDescriptor
+AXIS_REGISTRY = _lib_alert_axes.AXIS_REGISTRY
+AXIS_BY_ID = _lib_alert_axes.AXIS_BY_ID
+
 _lib_alerts_payload = _load_sibling("_lib_alerts_payload")
 _alert_text_weekly = _lib_alerts_payload._alert_text_weekly
 _alert_text_five_hour = _lib_alerts_payload._alert_text_five_hour
