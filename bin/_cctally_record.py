@@ -285,6 +285,38 @@ def insert_budget_milestone(*args, **kwargs):
     return sys.modules["cctally"].insert_budget_milestone(*args, **kwargs)
 
 
+def insert_projected_milestone(*args, **kwargs):
+    return sys.modules["cctally"].insert_projected_milestone(*args, **kwargs)
+
+
+def _projected_levels_already_latched(*args, **kwargs):
+    return sys.modules["cctally"]._projected_levels_already_latched(*args, **kwargs)
+
+
+def _build_alert_payload_projected(*args, **kwargs):
+    return sys.modules["cctally"]._build_alert_payload_projected(*args, **kwargs)
+
+
+def _fetch_current_week_snapshots(*args, **kwargs):
+    return sys.modules["cctally"]._fetch_current_week_snapshots(*args, **kwargs)
+
+
+def _apply_midweek_reset_override(*args, **kwargs):
+    return sys.modules["cctally"]._apply_midweek_reset_override(*args, **kwargs)
+
+
+def _assess_forecast_confidence(*args, **kwargs):
+    return sys.modules["cctally"]._assess_forecast_confidence(*args, **kwargs)
+
+
+def _build_budget_status_inputs(*args, **kwargs):
+    return sys.modules["cctally"]._build_budget_status_inputs(*args, **kwargs)
+
+
+def compute_budget_status(*args, **kwargs):
+    return sys.modules["cctally"].compute_budget_status(*args, **kwargs)
+
+
 def _dispatch_alert_notification(*args, **kwargs):
     return sys.modules["cctally"]._dispatch_alert_notification(*args, **kwargs)
 
@@ -786,6 +818,241 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
             _dispatch_alert_notification(payload, mode="real")
         except Exception as dispatch_exc:
             eprint(f"[budget-alerts] dispatch failed: {dispatch_exc}")
+
+
+def _weekly_pct_week_avg_projection(conn, now_utc):
+    """Compute the week-AVERAGE weekly-% projection for the current
+    subscription week, snapshot-only (CHEAP — no cost SUM, no ``sync_cache``).
+
+    Returns ``(projected_pct, low_conf)`` or ``None`` when no current-week
+    snapshot resolves. The value is computed by the IDENTICAL formula +
+    IDENTICAL inputs that produce ``ForecastOutput.week_avg_projection_pct``
+    (``_load_forecast_inputs`` → ``_compute_forecast``): ``p_now`` / elapsed /
+    remaining come from ``_fetch_current_week_snapshots`` +
+    ``_apply_midweek_reset_override`` (the same reset-aware window resolution
+    forecast uses), ``r_avg = p_now / elapsed_hours`` (``p_week_start`` treated
+    as 0, matching the forecast kernel), and
+    ``projected = p_now + r_avg * remaining_hours``. The reconcile invariant
+    binds the fired value to forecast's ``week_avg_projection_pct`` within
+    1e-9, so the two MUST share the formula by construction.
+
+    LOW CONF mirrors the displayed forecast confidence: the binary
+    ``_assess_forecast_confidence(elapsed_hours, p_now, len(samples))`` plus the
+    ``no_sample_ge_24h`` clause ``_load_forecast_inputs`` appends — so a thin
+    early-week window that forecast renders ``LOW CONF`` never fires a
+    projected alert.
+
+    Deliberately does NOT call ``_sum_cost_for_range`` (the weekly-% projection
+    needs no spend; the forecast kernel's ``week_avg_projection_pct`` is also
+    spend-free).
+    """
+    fetched = _fetch_current_week_snapshots(conn, now_utc)
+    if fetched is None:
+        return None
+    week_start_at, week_end_at, samples = fetched
+    week_start_at, samples = _apply_midweek_reset_override(
+        conn, week_start_at, week_end_at, samples
+    )
+    if not samples:
+        return None
+    p_now = samples[-1][1]
+    elapsed_hours = (now_utc - week_start_at).total_seconds() / 3600.0
+    remaining_hours = max(0.0, (week_end_at - now_utc).total_seconds() / 3600.0)
+    r_avg = p_now / elapsed_hours if elapsed_hours > 0 else 0.0
+    projected_pct = p_now + r_avg * remaining_hours
+
+    # Confidence: same predicate + the same no_sample_ge_24h augmentation that
+    # _load_forecast_inputs applies, so this LOW CONF gate == forecast's.
+    confidence, _reasons = _assess_forecast_confidence(
+        elapsed_hours, p_now, len(samples)
+    )
+    target_24h = now_utc - dt.timedelta(hours=24)
+    has_sample_ge_24h = any(s[0] <= target_24h for s in samples)
+    if not has_sample_ge_24h:
+        confidence = "low"
+    return (projected_pct, confidence == "low")
+
+
+def maybe_record_projected_alert(saved: dict[str, Any]) -> None:
+    """Projected-pace detect-and-arm (axis ``projected``, #121).
+
+    Fires on the WEEK-AVERAGE projection (never the displayed high-end verdict
+    band) for ``weekly_pct`` and/or ``budget_usd``. Its OWN detect-and-arm —
+    NOT folded into ``maybe_record_milestone`` (Section 1 / Codex P0-3) — called
+    from ``cmd_record_usage`` in its own ``try`` after the weekly/5h/budget
+    blocks.
+
+    Master gates (Codex P1-2): ``weekly_pct`` fires only under
+    ``alerts.enabled && alerts.projected_enabled``; ``budget_usd`` only under
+    ``_budget_alerts_active(budget_cfg) && budget.projected_enabled``. Both
+    toggles default OFF (no surprise notifications on upgrade). When NEITHER is
+    on, returns after only a cheap config read — no projection math, no cost
+    work.
+
+    Pre-probe (Codex P1-1): a metric whose levels are ALL already latched is
+    skipped BEFORE any projection / cost work.
+
+    Snap-up (Codex P2-1): a level fires when ``projected + 1e-9 >= threshold``.
+    Latch / fire-once: ``UNIQUE(week_start_at, metric, threshold)`` + the
+    rowcount==1 predicate — a later recovery neither un-fires nor re-fires.
+    Mid-week reset re-anchors ``week_start_at`` (budget pattern; no
+    ``reset_event_id``).
+
+    Set-then-dispatch: INSERT ``commit=False``, stamp ``alerted_at`` in the same
+    txn, commit, THEN best-effort dispatch. A dispatch failure never rolls back
+    the milestone.
+
+    The ``budget_usd`` leg reuses the SAME ``_build_budget_status_inputs`` +
+    ``compute_budget_status`` path that produces ``budget --json``'s
+    ``week_avg_projection_usd`` (the reconcile-bound field) — value-exact by
+    construction. The cache is already warm from the actual-budget axis's spend
+    SUM this same tick, so this is not a second aggregation pass; the pre-probe
+    additionally skips it entirely when all budget levels are latched.
+    """
+    # Read config blocks directly (not via the validated getter dicts) so this
+    # detector is forward-compatible with the later config implementer that
+    # adds `projected_enabled` to _get_{alerts,budget}_config: until then the
+    # getter dicts omit the key, but the raw block carries whatever the user
+    # set. Master gates still route through _get_*_config / _budget_alerts_active
+    # for the parent-axis predicates.
+    cfg = load_config()
+    try:
+        alerts_cfg = _get_alerts_config(cfg)
+    except sys.modules["cctally"]._AlertsConfigError as exc:
+        _warn_alerts_bad_config_once(exc)
+        alerts_cfg = {"enabled": False}
+    try:
+        budget_cfg = _get_budget_config(cfg)
+    except sys.modules["cctally"]._BudgetConfigError as exc:
+        _warn_budget_bad_config_once(exc)
+        budget_cfg = {}
+
+    alerts_block = (cfg or {}).get("alerts") if isinstance(cfg, dict) else None
+    budget_block = (cfg or {}).get("budget") if isinstance(cfg, dict) else None
+    alerts_projected_on = bool(
+        (alerts_block or {}).get("projected_enabled")
+        if isinstance(alerts_block, dict)
+        else alerts_cfg.get("projected_enabled")
+    )
+    budget_projected_on = bool(
+        (budget_block or {}).get("projected_enabled")
+        if isinstance(budget_block, dict)
+        else budget_cfg.get("projected_enabled")
+    )
+
+    weekly_on = bool(alerts_cfg.get("enabled")) and alerts_projected_on
+    budget_on = _budget_alerts_active(budget_cfg) and budget_projected_on
+    if not (weekly_on or budget_on):
+        return  # cheap config-only path — non-projected users pay nothing
+
+    now_utc = _command_as_of()
+    pending: list[dict[str, Any]] = []
+    conn = open_db()
+    try:
+        # ── weekly_pct leg (snapshot-only, cheap) ───────────────────────────
+        if weekly_on:
+            w_window = _fetch_current_week_snapshots(conn, now_utc)
+            if w_window is not None:
+                ws_at, we_at, samples = w_window
+                ws_at, _ = _apply_midweek_reset_override(
+                    conn, ws_at, we_at, samples
+                )
+                week_key = ws_at.isoformat(timespec="seconds")
+                levels = (90, 100)
+                if not _projected_levels_already_latched(
+                    conn, week_start_at=week_key, metric="weekly_pct",
+                    levels=levels,
+                ):
+                    proj = _weekly_pct_week_avg_projection(conn, now_utc)
+                    if proj is not None and not proj[1]:
+                        value = proj[0]
+                        for t in levels:
+                            if value + 1e-9 >= t:
+                                pending.append(dict(
+                                    week_start_at=week_key,
+                                    metric="weekly_pct",
+                                    threshold=t,
+                                    projected_value=value,
+                                    denominator=100.0,
+                                ))
+
+        # ── budget_usd leg (reuses the tick's spend via the shared path) ─────
+        if budget_on:
+            target = budget_cfg["weekly_usd"]
+            thresholds = tuple(
+                sorted(set(int(t) for t in budget_cfg["alert_thresholds"]))
+            )
+            window = _resolve_current_budget_window(conn, now_utc)
+            if window is not None and thresholds:
+                b_ws_at, _b_we_at = window
+                b_week_key = b_ws_at.isoformat(timespec="seconds")
+                if not _projected_levels_already_latched(
+                    conn, week_start_at=b_week_key, metric="budget_usd",
+                    levels=thresholds,
+                ):
+                    inputs = _build_budget_status_inputs(
+                        conn, target_usd=target, now_utc=now_utc,
+                        alert_thresholds=thresholds,
+                    )
+                    if inputs is not None:
+                        status = compute_budget_status(inputs)
+                        if not status.low_confidence:
+                            value = status.week_avg_projection_usd
+                            for t in thresholds:
+                                if value + 1e-9 >= (t / 100.0) * float(target):
+                                    pending.append(dict(
+                                        week_start_at=b_week_key,
+                                        metric="budget_usd",
+                                        threshold=t,
+                                        projected_value=value,
+                                        denominator=float(target),
+                                    ))
+
+        # ── arm (set-then-dispatch): INSERT + stamp alerted_at in one txn ────
+        fired: list[dict[str, Any]] = []
+        for p in pending:
+            inserted = insert_projected_milestone(
+                conn,
+                week_start_at=p["week_start_at"],
+                metric=p["metric"],
+                threshold=p["threshold"],
+                projected_value=p["projected_value"],
+                denominator=p["denominator"],
+                commit=False,
+            )
+            # Only the genuine-new-crossing winner (rowcount==1) arms+dispatches;
+            # a racing record-usage instance gets rowcount==0 and skips.
+            if inserted == 1:
+                conn.execute(
+                    "UPDATE projected_milestones SET alerted_at = ? "
+                    "WHERE week_start_at = ? AND metric = ? AND threshold = ? "
+                    "  AND alerted_at IS NULL",
+                    (now_utc_iso(), p["week_start_at"], p["metric"],
+                     p["threshold"]),
+                )
+                fired.append(p)
+        # Single commit: every INSERT + its alerted_at marker durable together.
+        conn.commit()
+    except Exception as exc:
+        eprint(f"[projected-alert] error recording projected milestone: {exc}")
+        fired = []
+    finally:
+        conn.close()
+
+    # Dispatch AFTER commit; a dispatch failure NEVER rolls back the milestone
+    # (set-then-dispatch invariant).
+    for p in fired:
+        try:
+            payload = _build_alert_payload_projected(
+                metric=p["metric"],
+                threshold=p["threshold"],
+                projected_value=p["projected_value"],
+                denominator=p["denominator"],
+                week_start_at=p["week_start_at"],
+            )
+            _dispatch_alert_notification(payload, mode="real")
+        except Exception as dispatch_exc:
+            eprint(f"[projected-alert] dispatch failed: {dispatch_exc}")
 
 
 def _compute_block_totals(
@@ -2328,6 +2595,16 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         maybe_record_budget_milestone(saved)
     except Exception as exc:
         eprint(f"[budget-milestone] unexpected error: {exc}")
+
+    # NEW: projected-pace alert firing (axis `projected`, #121). Runs in its
+    # OWN detect-and-arm AFTER the weekly/5h/budget blocks; gated up front on
+    # (alerts.enabled && alerts.projected_enabled) ||
+    # (_budget_alerts_active && budget.projected_enabled) — both toggles
+    # default OFF, so non-projected users pay only a cheap config read.
+    try:
+        maybe_record_projected_alert(saved)
+    except Exception as exc:
+        eprint(f"[projected-alert] unexpected error: {exc}")
 
     # Write high-water mark so the status line never displays a regression.
     # The file contains "week_start_date weekly_percent" on one line.

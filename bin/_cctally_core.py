@@ -1027,6 +1027,37 @@ def open_db() -> sqlite3.Connection:
         """
     )
 
+    # ── projected_milestones (week-average-pace projection crossings — #121) ──
+    # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / backfill — same
+    # posture as `budget_milestones` (write-once, forward-only, no
+    # `reset_event_id` segment column). Two metrics share the table, keyed by
+    # `metric` ('weekly_pct' | 'budget_usd'); a level fires once the
+    # WEEK-AVERAGE projection (not the displayed high-end verdict) crosses
+    # `threshold`. `denominator` snapshots the target AT crossing (target_usd
+    # for budget_usd, 100.0 for weekly_pct) so the dashboard envelope renders
+    # context "$312 of $300" / "102% of cap" from the ROW, not from live config
+    # that may have changed since (Codex P0-4). A mid-week reset re-anchors
+    # `week_start_at` (new window → fresh rows under the UNIQUE key), the
+    # budget-pattern reset handling — hence NO `reset_event_id` column.
+    # `alerted_at` is stamped BEFORE the osascript Popen (set-then-dispatch).
+    # Lives BEFORE the migration dispatcher: a plain CREATE on a
+    # framework-untracked table never touches `schema_migrations`.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS projected_milestones (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            week_start_at   TEXT    NOT NULL,
+            metric          TEXT    NOT NULL,   -- 'weekly_pct' | 'budget_usd'
+            threshold       INTEGER NOT NULL,   -- 90 | 100
+            projected_value REAL    NOT NULL,
+            denominator     REAL    NOT NULL,   -- target_usd (budget) | 100.0 (weekly)
+            crossed_at_utc  TEXT    NOT NULL,
+            alerted_at      TEXT,
+            UNIQUE(week_start_at, metric, threshold)
+        )
+        """
+    )
+
     # Migration framework dispatcher. Replaces the prior inline gate stack
     # (has_blocks + _migration_done) with the framework's _run_pending_-
     # migrations entry point. See spec §2.3, §5.2 + the migration handlers

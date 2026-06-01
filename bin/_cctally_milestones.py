@@ -369,6 +369,74 @@ def insert_budget_milestone(
     return int(cur.rowcount)
 
 
+def insert_projected_milestone(
+    conn: sqlite3.Connection,
+    *,
+    week_start_at: str,
+    metric: str,
+    threshold: int,
+    projected_value: float,
+    denominator: float,
+    commit: bool = True,
+) -> int:
+    """INSERT OR IGNORE a projected-pace crossing. Returns ``cur.rowcount``
+    (1 = genuinely new crossing, 0 = INSERT OR IGNORE no-op on a pre-existing
+    ``(week_start_at, metric, threshold)`` row).
+
+    Mirrors :func:`insert_budget_milestone`'s rowcount contract so the
+    alert-fire predicate (`if inserted == 1`) is race-safe without a follow-up
+    SELECT. ``alerted_at`` is left NULL — the caller stamps it in the SAME
+    transaction BEFORE dispatching (set-then-dispatch invariant, CLAUDE.md
+    Alerts gotcha). ``commit=False`` lets the caller bundle the INSERT with the
+    follow-up ``alerted_at`` UPDATE in one transaction so a crash between them
+    can't strand ``alerted_at`` NULL forever.
+    """
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO projected_milestones "
+        "(week_start_at, metric, threshold, projected_value, denominator, "
+        " crossed_at_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            week_start_at,
+            str(metric),
+            int(threshold),
+            float(projected_value),
+            float(denominator),
+            now_utc_iso(),
+        ),
+    )
+    if commit:
+        conn.commit()
+    return int(cur.rowcount)
+
+
+def _projected_levels_already_latched(
+    conn: sqlite3.Connection,
+    *,
+    week_start_at: str,
+    metric: str,
+    levels: "tuple[int, ...]",
+) -> bool:
+    """True iff EVERY level in ``levels`` already has a row for
+    ``(week_start_at, metric)``.
+
+    Cheap indexed SELECT used as the pre-probe gate BEFORE any projection math
+    / cost work ([Pre-probe before sync_cache]). Empty ``levels`` → True
+    (nothing owed). When False, at least one level is still un-recorded and the
+    caller must do the projection. Mirrors the per-week pre-probe SELECT in
+    :func:`maybe_record_budget_milestone`.
+    """
+    if not levels:
+        return True
+    rows = conn.execute(
+        "SELECT threshold FROM projected_milestones "
+        "WHERE week_start_at = ? AND metric = ?",
+        (week_start_at, str(metric)),
+    ).fetchall()
+    have = {int(r[0]) for r in rows}
+    return all(int(level) in have for level in levels)
+
+
 def _reconcile_budget_milestones_on_set(conn, *, target, thresholds, now_utc):
     """Forward-only-from-set reconcile (spec §5): on `budget set`, every
     threshold ALREADY crossed for the current week is recorded with

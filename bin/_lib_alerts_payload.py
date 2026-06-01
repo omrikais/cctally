@@ -242,3 +242,70 @@ def _build_alert_payload_budget(
             "consumption_pct": float(consumption_pct),
         },
     }
+
+
+def _alert_text_projected(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, str]:
+    """Build (title, subtitle, body) for a projected-pace alert (#121).
+
+    These fire on the WEEK-AVERAGE projection — what you're tracking toward at
+    the current week-average pace — NOT on an actual crossing. The text carries
+    an explicit "(projection)" / "on current pace" cue so a user never confuses
+    a projected alert with an actual-crossing one (which the weekly/budget
+    builders render). The rendered numbers come from the payload (the values
+    snapshotted at crossing), never from live config (Codex P0-4). ``tz`` is
+    accepted for signature parity with peer ``_alert_text_*`` builders and
+    intentionally unused (no instant is rendered, same as ``_alert_text_budget``).
+    """
+    metric = payload["metric"]
+    t = int(payload["threshold"])
+    proj = float(payload["projected_value"])
+    denom = float(payload["denominator"])
+    if metric == "weekly_pct":
+        title = f"cctally - projected to reach {t}% this week"
+        subtitle = "On current pace (projection)"
+        body = f"Projected ~{proj:.0f}% of cap by reset (week-average pace)"
+    else:  # budget_usd
+        title = "cctally - projected to exceed budget"
+        subtitle = f"On current pace (projection) - {t}% of budget"
+        body = (
+            f"Projected ${proj:,.2f} of ${denom:,.2f} budget "
+            f"(week-average pace)"
+        )
+    return title, subtitle, body
+
+
+def _build_alert_payload_projected(
+    *,
+    metric: str,
+    threshold: int,
+    projected_value: float,
+    denominator: float,
+    week_start_at: str,
+) -> dict:
+    """Build the alert payload for a projected-pace threshold crossing (#121).
+
+    ``axis: "projected"`` is the fourth alert axis; ``metric`` discriminates
+    ``weekly_pct`` (denominator 100.0, "% of cap") from ``budget_usd``
+    (denominator = target_usd, "$ of budget"). The frontend renders context
+    FROM these row-sourced fields (``metric`` / ``projected_value`` /
+    ``denominator``), not from live config that may have changed since crossing
+    (Codex P0-4). No ``crossed_at``/``alerted_at`` keys here: the projected
+    detector stamps ``alerted_at`` on the DB row itself in the same txn before
+    dispatch (set-then-dispatch), and the dashboard envelope reads it from the
+    row — mirroring ``_build_alert_payload_budget``'s context-only shape minus
+    the redundant timestamp echo.
+    """
+    return {
+        "id": f"projected:{week_start_at}:{metric}:{int(threshold)}",
+        "axis": "projected",
+        "metric": str(metric),
+        "threshold": int(threshold),
+        "projected_value": float(projected_value),
+        "denominator": float(denominator),
+        "context": {
+            "week_start_at": week_start_at,
+            "metric": str(metric),
+            "projected_value": float(projected_value),
+            "denominator": float(denominator),
+        },
+    }
