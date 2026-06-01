@@ -278,7 +278,7 @@ m = importlib.util.module_from_spec(spec)
 sys.modules['cctally'] = m
 loader.exec_module(m)
 got = m._get_alerts_config({})
-expected = {'enabled': False, 'weekly_thresholds': [90, 95], 'five_hour_thresholds': [90, 95]}
+expected = {'enabled': False, 'weekly_thresholds': [90, 95], 'five_hour_thresholds': [90, 95], 'projected_enabled': False}
 if got != expected:
     print(f"MISMATCH got={got!r} expected={expected!r}")
     sys.exit(1)

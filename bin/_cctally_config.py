@@ -611,10 +611,18 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
     if key == "alerts.projected_enabled":
         # Projected-pace opt-in (#121). Same bool-normalizer + read-modify-write
         # posture as alerts.enabled (preserves sibling alerts.* keys).
+        # _normalize_alerts_enabled_value hardcodes "alerts.enabled" in its
+        # ValueError text, so catch + re-message with the actual key name
+        # (mirrors _normalize_update_check_enabled_value's precedent) — the
+        # budget side already names its own key correctly.
         try:
             normalized = c._normalize_alerts_enabled_value(raw)
-        except ValueError as exc:
-            print(f"cctally: {exc}", file=sys.stderr)
+        except ValueError:
+            print(
+                f"cctally: invalid boolean value for alerts.projected_enabled: "
+                f"{raw!r} (expected true|false|yes|no|1|0|on|off)",
+                file=sys.stderr,
+            )
             return 2
         with config_writer_lock():
             config = _load_config_unlocked()

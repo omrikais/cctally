@@ -157,3 +157,13 @@ def test_config_set_get_budget_projected_enabled_round_trip(tmp_path):
     get_res = _run_cli(tmp_path, "config", "get", "budget.projected_enabled")
     assert get_res.returncode == 0, get_res.stderr
     assert "true" in get_res.stdout
+
+
+def test_config_set_alerts_projected_enabled_non_bool_names_the_right_key(tmp_path):
+    # Regression: the set path reuses _normalize_alerts_enabled_value, whose
+    # ValueError hardcodes "alerts.enabled"; the error message must name the
+    # ACTUAL key (alerts.projected_enabled), not the sibling it borrowed from.
+    res = _run_cli(tmp_path, "config", "set", "alerts.projected_enabled", "maybe")
+    assert res.returncode == 2
+    assert "alerts.projected_enabled" in res.stderr
+    assert "alerts.enabled:" not in res.stderr
