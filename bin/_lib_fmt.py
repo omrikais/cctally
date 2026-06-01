@@ -16,11 +16,13 @@ Spec: docs/superpowers/specs/2026-06-01-extract-fmt-color-table-primitives-desig
 """
 from __future__ import annotations
 
+import datetime as dt
 import os
 import pathlib
 import re
 import sys
 import unicodedata
+from typing import Any
 
 # parse_iso_datetime: bare import matches the established _lib_* convention
 # (_lib_aggregators.py:86, _lib_diff_kernel.py:123 do the same).
