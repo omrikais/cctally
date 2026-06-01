@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Internal refactor (no user-facing change): extracted the shared formatting/color/table render primitives — the boxed-table renderer, the color/unicode capability detectors, the ANSI styling + display-width helpers, the integer/width-budget number formatters, the compact timestamp/week-window formatters, and the `_ANSI_ESC_RE` regex (plus the small `_parse_iso_datetime_optional` helper they depend on) — out of the `bin/cctally` single-file program into a new stdlib-only pure-function sibling module, `bin/_lib_fmt.py` (#126, the final tranche of the `bin/cctally` split).** This trims the main script by ~250 lines (2,969 → 2,715), and additionally converts the eight back-references these primitives had in `bin/_lib_render.py` and `bin/_lib_diff_kernel.py` from `cctally`-namespace shims into honest direct imports of the new kernel — with no change to any command's behavior, flags, output, or exit codes: every reporting/`diff`/`project`/`cache-report`/`forecast`/`blocks`/`percent-breakdown`/`five-hour-blocks` golden test is byte-identical and the full harness + pytest suite (1,329 checks) passes, a new `tests/test_lib_fmt_extraction_invariants.py` locks the extraction's import discipline, and the new module ships in the npm/brew/public packages (promoted to the mirror allowlist). Purely a maintainability / code-organization change; nothing to do on upgrade.
+
 ## [1.22.3] - 2026-06-01
 
 ### Changed
