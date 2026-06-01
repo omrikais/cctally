@@ -54,6 +54,7 @@
     "bin/_lib_display_tz.py",
     "bin/_lib_doctor.py",
     "bin/_lib_five_hour.py",
+    "bin/_lib_fmt.py",
     "bin/_lib_jsonl.py",
     "bin/_lib_pricing.py",
     "bin/_lib_pricing_check.py",
