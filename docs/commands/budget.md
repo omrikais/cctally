@@ -269,7 +269,7 @@ The alert is a fifth axis (`project_budget`) alongside `weekly` / `five_hour` /
 `budget` / `projected`:
 
 - **Notification text** carries the project basename:
-  *"Project foo — $26.00 of $25.00 (104% of budget)"*.
+  *"Project foo - $26.00 of $25.00 (104% of budget)"*.
 - **Dashboard** — fired project alerts appear in the existing "Recent alerts"
   panel/modal with a distinct **"PROJECT"** chip (vs the global "BUDGET" chip)
   and the project basename + `$spent of $budget` context. The Settings overlay

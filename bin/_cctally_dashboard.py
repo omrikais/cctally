@@ -6011,7 +6011,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 crossed_at_utc=now_utc_iso(),
                 week_start_at=dt.date.today().isoformat(),
                 project="example-project",
-                project_key="/example/example-project",
+                project_key="/example/repos/example-project",
                 budget_usd=25.0,
                 spent_usd=26.0,
                 consumption_pct=104.0,

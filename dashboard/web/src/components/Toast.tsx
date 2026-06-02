@@ -63,7 +63,7 @@ export function Toast() {
               </>
             ) : toast.payload.axis === 'project_budget' ? (
               <>
-                {toast.payload.context.project ?? AXIS_TITLE_LABEL.project_budget}{' '}
+                {toast.payload.context.project ?? 'Project'}{' '}
                 budget {toast.payload.threshold}% reached
               </>
             ) : (

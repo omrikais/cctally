@@ -262,7 +262,7 @@ def _alert_text_project_budget(
     threshold = int(payload["threshold"])
     ctx = payload.get("context") or {}
     project = ctx.get("project") or "(project)"
-    title = f"cctally - project budget"
+    title = "cctally - project budget"
     subtitle = f"{project} - {threshold}% of budget"
     spent = float(ctx.get("spent_usd") or 0.0)
     budget = float(ctx.get("budget_usd") or 0.0)
