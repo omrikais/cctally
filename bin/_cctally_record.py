@@ -1759,6 +1759,70 @@ def _read_reset_zero_marker():
     return (week_start_date, cur_end_canon, baseline_pct, first_zero_iso)
 
 
+def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
+                          *, observed_pre_credit_pct, effective_dt):
+    """Emit/refresh the in-place weekly-credit artifacts (issue #19 + #128).
+    Shared by the immediate >=25pp path and the debounced reset-to-zero
+    confirmation path.
+
+    Side-effect ordering is load-bearing: the event-row INSERT is dedup-gated
+    on a pre-check, but the hwm force-write and stale-replica DELETE run
+    UNCONDITIONALLY — a prior run may have committed the event then died before
+    the pivots (memory: project_dedup_must_not_gate_side_effects). The pivots
+    are individually idempotent (file overwrite + DELETE on a stable predicate).
+
+    ``effective_dt`` is the (already-resolved) reset moment; the immediate path
+    passes ``_floor_to_hour(now_utc)``, the debounced path passes the floored
+    first-zero instant from the marker."""
+    effective_iso = effective_dt.isoformat(timespec="seconds")
+    # Pre-check keyed on new_week_end_at: suppress a duplicate event row across
+    # ticks. UNIQUE(old, new) also dedups, but the pre-check avoids a useless
+    # write attempt and keeps logs clean.
+    already = conn.execute(
+        "SELECT 1 FROM week_reset_events WHERE new_week_end_at = ? LIMIT 1",
+        (cur_end_canon,),
+    ).fetchone()
+    if already is None:
+        # Row shape: old=effective_iso, new=cur_end_canon (DISTINCT) so only
+        # post_map fires on the credited week in _apply_reset_events_to_weekrefs
+        # (old==new collapses it to a zero-width window). observed_pre_credit_pct
+        # stamps the pre-credit baseline (issue #45).
+        conn.execute(
+            "INSERT OR IGNORE INTO week_reset_events "
+            "(detected_at_utc, old_week_end_at, new_week_end_at, "
+            " effective_reset_at_utc, observed_pre_credit_pct) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (now_utc_iso(), effective_iso, cur_end_canon,
+             effective_iso, float(observed_pre_credit_pct)),
+        )
+        conn.commit()
+    # Unconditional pivot 1: force-write hwm-7d so the next status-line render
+    # reflects the post-credit value (the monotonic guard at the normal write
+    # site would refuse to decrease the file).
+    try:
+        (_cctally_core.APP_DIR / "hwm-7d").write_text(
+            f"{week_start_date} {weekly_percent}\n"
+        )
+    except OSError:
+        pass
+    # Unconditional pivot 2: race-defensive cleanup of stale pre-credit replays
+    # (external claude-statusline can replay pre-credit --percent values that
+    # land captured_at >= effective with pct ~= baseline and dominate the
+    # reset-aware clamp). 1.0pp tolerance band absorbs rounding drift; both
+    # sides wrapped in unixepoch() for offset robustness.
+    try:
+        conn.execute(
+            "DELETE FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+            "  AND ABS(weekly_percent - ?) < 1.0",
+            (week_start_date, effective_iso, float(observed_pre_credit_pct)),
+        )
+        conn.commit()
+    except sqlite3.DatabaseError as exc:
+        eprint(f"[record-usage] post-credit cleanup failed: {exc}")
+
+
 def cmd_record_usage(args: argparse.Namespace) -> int:
     """Record usage data from Claude Code status line rate_limits."""
     c = _cctally()
@@ -1981,146 +2045,20 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                         )
                         conn.commit()
                 elif prior_end_canon and prior_end_canon == cur_end_canon:
-                    # In-place credit branch (v1.7.2). When `resets_at` stays
-                    # unchanged but `weekly_percent` drops by RESET_PCT_DROP_THRESHOLD
-                    # or more, Anthropic has issued a goodwill in-place weekly
-                    # credit. Emit one week_reset_events row keyed on the
-                    # current end_at (old == new) so the reset-aware clamp
-                    # above and the milestone segment writer can pivot to
-                    # the post-credit segment. The seed snapshot lands via
-                    # the now-reset-aware clamp on this same call.
+                    # In-place credit branch (v1.7.2). Same end_at across two
+                    # captures + >=25pp drop (or reset-to-zero) in weekly_percent
+                    # → Anthropic-issued in-place weekly credit / reset.
                     prior_end_dt = parse_iso_datetime(prior_end_canon, "prior.week_end_at")
                     if (
                         prior_end_dt > now_utc
                         and prior_pct is not None
                         and c._is_reset_drop(prior_pct, weekly_percent)
                     ):
-                        # Pre-check (Q5 belt-and-suspenders): suppress duplicate
-                        # event rows for the same new_week_end_at across
-                        # consecutive ticks. UNIQUE(old, new) at the DDL
-                        # also catches the duplicate in the (old == new) case,
-                        # but the pre-check avoids a useless write attempt
-                        # and keeps the log clean. After the seed lands at
-                        # post-credit %, the next tick's `prior_pct` will be
-                        # the post-credit value so the drop predicate alone
-                        # also suffices — pre-check is belt-and-suspenders.
-                        already = conn.execute(
-                            "SELECT 1 FROM week_reset_events "
-                            "WHERE new_week_end_at = ? LIMIT 1",
-                            (cur_end_canon,),
-                        ).fetchone()
-                        effective_dt = _floor_to_hour(now_utc)
-                        effective_iso = effective_dt.isoformat(timespec="seconds")
-                        if already is None:
-                            # Row shape: old=effective_iso, new=cur_end_canon
-                            # (distinct values). The previous shape stored
-                            # old==new==cur_end_canon, which let BOTH
-                            # _apply_reset_events_to_weekrefs maps
-                            # (pre_map[old] and post_map[new]) fire on the
-                            # SAME WeekRef — pre_map rewrote week_end_at to
-                            # effective, post_map rewrote week_start_at to
-                            # effective, collapsing the credited week to a
-                            # zero-width window in downstream renders. With
-                            # old==effective and new==cur_end_canon, only
-                            # post_map fires on the credited week (setting
-                            # week_start_at = effective, the intended
-                            # behavior); pre_map keys on effective_iso and
-                            # finds no matching WeekRef in practice. The
-                            # UNIQUE(old, new) constraint permits this
-                            # row, and the pre-check above keys on
-                            # new_week_end_at so dedup still works.
-                            # Stamp ``observed_pre_credit_pct = prior_pct``
-                            # (issue #45): durable record of the pre-credit
-                            # baseline we observed at write time. Decouples
-                            # any future cleanup tooling from re-deriving
-                            # prior_pct via SELECT. Existing rows from
-                            # migration 007 carry NULL.
-                            conn.execute(
-                                "INSERT OR IGNORE INTO week_reset_events "
-                                "(detected_at_utc, old_week_end_at, new_week_end_at, "
-                                " effective_reset_at_utc, observed_pre_credit_pct) "
-                                "VALUES (?, ?, ?, ?, ?)",
-                                (now_utc_iso(), effective_iso, cur_end_canon,
-                                 effective_iso, float(prior_pct)),
-                            )
-                            conn.commit()
-                        # Pivots fire UNCONDITIONALLY whenever a credit
-                        # is detected — they're NOT gated on
-                        # ``already is None``. Memory
-                        # ``project_dedup_must_not_gate_side_effects.md``:
-                        # "Skipping a no-op INSERT must NOT skip
-                        # milestones/rollups/alerts; prior run may have
-                        # died mid-flight." Crash scenario: tick N
-                        # committed the event row, then died before
-                        # HWM + DELETE. Tick N+1's pre-check sees
-                        # ``already`` non-None (the row IS in the
-                        # table) and would skip the pivots, leaving
-                        # the system wedged on pre-credit HWM + stale-
-                        # replica rows. Pivots are individually
-                        # idempotent (file overwrite + DELETE on stable
-                        # predicate), so re-running them is safe.
-                        # ``effective_iso`` is resolved above; on a
-                        # recovery tick it lands on the SAME 10-min
-                        # slot as the original (now_utc has drifted
-                        # only seconds), so the DELETE predicate's
-                        # ``unixepoch(captured_at_utc) >= unixepoch(?)``
-                        # still matches every stale-replica row.
-                        #
-                        # Force-write hwm-7d so the next status-line
-                        # render reflects the post-credit value. The
-                        # monotonic guard at the normal write site
-                        # (below) would refuse to decrease the file;
-                        # this write is the credit-only escape hatch.
-                        # Lands AFTER the conn.commit() so a concurrent
-                        # record-usage reader doesn't see the new HWM
-                        # before the event row is durable.
-                        try:
-                            (_cctally_core.APP_DIR / "hwm-7d").write_text(
-                                f"{week_start_date} {weekly_percent}\n"
-                            )
-                        except OSError:
-                            pass
-
-                        # Race-defensive cleanup. Between the moment
-                        # Anthropic credited the user (effective_iso)
-                        # and this code firing, the EXTERNAL
-                        # claude-statusline tool can replay stale
-                        # pre-credit `--percent` values (it has its
-                        # own in-memory HWM cache and re-runs us once
-                        # per status-line tick). Those replays land
-                        # captured_at_utc >= effective_iso with
-                        # weekly_percent near prior_pct (the pre-credit
-                        # value), and they dominate the reset-aware
-                        # clamp's MAX over the post-credit segment so
-                        # legitimate fresh OAuth values are rejected.
-                        # 1.0pp tolerance band (issue #45) around the
-                        # observed pre-credit baseline absorbs any
-                        # rounding drift between cctally's OAuth read
-                        # and statusline's --percent payload (today
-                        # they match byte-identically, but the band
-                        # future-proofs against Anthropic or statusline
-                        # changing rounding). The band stays well below
-                        # the 25pp in-place credit detection threshold,
-                        # so legitimate post-credit values are never
-                        # caught. Bind is the in-scope ``prior_pct``,
-                        # which equals the just-stamped
-                        # ``observed_pre_credit_pct`` on the event row.
-                        try:
-                            conn.execute(
-                                "DELETE FROM weekly_usage_snapshots "
-                                "WHERE week_start_date = ? "
-                                "  AND unixepoch(captured_at_utc) >= "
-                                "      unixepoch(?) "
-                                "  AND ABS(weekly_percent - ?) < 1.0",
-                                (week_start_date, effective_iso,
-                                 float(prior_pct)),
-                            )
-                            conn.commit()
-                        except sqlite3.DatabaseError as exc:
-                            eprint(
-                                "[record-usage] post-credit cleanup "
-                                f"failed: {exc}"
-                            )
+                        _fire_in_place_credit(
+                            conn, week_start_date, cur_end_canon, weekly_percent,
+                            observed_pre_credit_pct=float(prior_pct),
+                            effective_dt=_floor_to_hour(now_utc),
+                        )
 
             # ── 5h in-place credit detection (parallel to weekly above) ──
             # Spec §2.2 of
