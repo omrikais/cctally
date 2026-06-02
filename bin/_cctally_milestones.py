@@ -545,3 +545,18 @@ def _reconcile_budget_on_config_write(validated_budget):
             conn.close()
     except Exception as exc:  # best-effort; never fail the write
         eprint(f"[budget-milestone] reconcile on set failed: {exc}")
+
+
+def _reconcile_project_budget_milestones_on_write(_validated_budget):
+    """Forward-only-from-write reconcile for PER-PROJECT budgets (spec §6.8).
+
+    Task 2 ships this as a NO-OP stub so the call sites in
+    ``_cmd_budget_set_project`` / ``_cmd_budget_unset_project`` (and, later,
+    ``config set budget.*`` + the dashboard toggle) exist and are exercised.
+    Task 3 fills in the body: for each configured project, compute current-week
+    spend (the shared ``_sum_cost_by_project`` scan), and for each
+    already-crossed ``(project, threshold)`` INSERT OR IGNORE a milestone with
+    ``alerted_at`` stamped and NO dispatch — gated on per-project alerts being
+    active, best-effort, run OUTSIDE any ``config_writer_lock``.
+    """
+    return  # Task 3

@@ -81,6 +81,57 @@ def _load_week_snapshots(
         conn.close()
 
 
+def _sum_cost_by_project(
+    start: dt.datetime,
+    now: dt.datetime,
+    mode: str = "auto",
+    skip_sync: bool = False,
+) -> dict[str, float]:
+    """Return ``{canonical_git_root: spent_usd}`` over ``[start, now]``.
+
+    ONE scan over the joined session entries (the same iterator
+    ``cmd_project`` walks), bucketed in Python by each entry's resolved
+    git-root (``_resolve_project_key`` — a filesystem ``.git`` walk, NOT a
+    SQL ``GROUP BY``), with per-entry cost computed via the same
+    ``_calculate_entry_cost(model, usage, mode=...)`` path ``cmd_project``
+    uses (so pricing edits flow through uniformly). Keys are the resolved
+    ``ProjectKey.bucket_path`` (the canonical git-root when a ``.git`` is
+    found, else the normalized path) — identical to how ``cmd_project``
+    keys its rows, so configured ``budget.projects`` keys match by string
+    equality.
+
+    Synthetic entries (Claude Code internal markers) are skipped, mirroring
+    ``cmd_project`` / the other ``_JoinedClaudeEntry`` aggregators. A
+    configured project with no in-range entry simply never appears in the
+    returned map (the caller renders it as a ``$0`` row — spec §7.2).
+
+    Shared by the per-project budget display (§7.2, ``cmd_budget``) and the
+    alert-firing path (§6.4); ``skip_sync`` threads through to
+    ``get_claude_session_entries`` so the record-tick caller can reuse a
+    cache already warmed earlier in the same tick.
+    """
+    c = _cctally()
+    resolver_cache: dict[str, ProjectKey] = {}
+    out: dict[str, float] = {}
+    for entry in c.get_claude_session_entries(start, now, skip_sync=skip_sync):
+        if entry.model == "<synthetic>":
+            continue
+        cost = c._calculate_entry_cost(
+            entry.model,
+            {
+                "input_tokens": entry.input_tokens,
+                "output_tokens": entry.output_tokens,
+                "cache_creation_input_tokens": entry.cache_creation_tokens,
+                "cache_read_input_tokens": entry.cache_read_tokens,
+            },
+            mode=mode,
+            cost_usd=entry.cost_usd,
+        )
+        key = c._resolve_project_key(entry.project_path, "git-root", resolver_cache)
+        out[key.bucket_path] = out.get(key.bucket_path, 0.0) + cost
+    return out
+
+
 def _accumulate_entry_into_bucket(
     b: dict,
     entry: "_JoinedClaudeEntry",

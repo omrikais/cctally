@@ -628,6 +628,10 @@ cmd_sync_week = _cctally_sync_week.cmd_sync_week
 # module-private (no external caller).
 _cctally_project = _load_sibling("_cctally_project")
 cmd_project = _cctally_project.cmd_project
+# Shared per-project cost compute (#19/#121, spec §7.1). Re-exported so the
+# per-project budget display (cmd_budget) and the Task 3 firing path reach it
+# via the cctally namespace.
+_sum_cost_by_project = _cctally_project._sum_cost_by_project
 
 # Eager re-export of bin/_cctally_pricing_check.py — `cmd_pricing_check`
 # is invoked via the parser's `set_defaults(func=c.cmd_pricing_check)`,
@@ -1107,6 +1111,11 @@ _render_forecast_terminal = _cctally_forecast._render_forecast_terminal
 _BUDGET_JSON_SCHEMA_VERSION = _cctally_forecast._BUDGET_JSON_SCHEMA_VERSION
 _cmd_budget_set = _cctally_forecast._cmd_budget_set
 _cmd_budget_unset = _cctally_forecast._cmd_budget_unset
+# Per-project budget set/unset (#19/#121, spec §4.3 / §7).
+_resolve_project_budget_target = _cctally_forecast._resolve_project_budget_target
+_cmd_budget_set_project = _cctally_forecast._cmd_budget_set_project
+_cmd_budget_unset_project = _cctally_forecast._cmd_budget_unset_project
+_build_project_budget_rows = _cctally_forecast._build_project_budget_rows
 _budget_render_unset = _cctally_forecast._budget_render_unset
 _budget_verdict_ansi_code = _cctally_forecast._budget_verdict_ansi_code
 _budget_render_terminal = _cctally_forecast._budget_render_terminal
@@ -2073,6 +2082,7 @@ insert_projected_milestone          = _cctally_milestones.insert_projected_miles
 _projected_levels_already_latched   = _cctally_milestones._projected_levels_already_latched   # record shim
 _reconcile_budget_milestones_on_set = _cctally_milestones._reconcile_budget_milestones_on_set # test_budget_alerts ns[]
 _reconcile_budget_on_config_write   = _cctally_milestones._reconcile_budget_on_config_write   # forecast/config/dashboard c.; test_forecast_ns_patch mod. patch
+_reconcile_project_budget_milestones_on_write = _cctally_milestones._reconcile_project_budget_milestones_on_write  # forecast/config/dashboard c. (Task 2 no-op stub; Task 3 fills)
 
 
 # === Update-banner predicate (spec §4.2) extracted to

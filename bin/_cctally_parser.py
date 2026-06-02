@@ -1285,6 +1285,10 @@ def build_parser() -> argparse.ArgumentParser:
     bg.add_argument("--config", default=None,
                     help="Read status from this config file (read-only; "
                          "rejected on set/unset).")
+    bg.add_argument(
+        "--project", nargs="?", const="__CWD__", default=None,
+        help="Set/unset a per-project budget for this git repo "
+             "(bare = current directory's git-root; or pass a path).")
     bg.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
                     help="Accepted for --format surface parity; inert for budget "
                          "(no per-project axis).")

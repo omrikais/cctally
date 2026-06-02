@@ -1,11 +1,26 @@
 """Unit tests for the pure budget kernel (bin/_lib_budget.py) + F1 structural
-invariant that forecast and budget share project_linear."""
+invariant that forecast and budget share project_linear.
+
+Also covers the Task 2 per-project budget surface (#19/#121, spec §7):
+``budget set/unset --project`` config writes, the per-project display
+section, the project-only render path, and the additive ``--json``
+``projects[]`` array.
+"""
+import argparse
 import datetime as dt
 import importlib.util
+import json
+import os
 import pathlib
 import sys
 
+import pytest
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
+
+_BIN = REPO / "bin"
+if str(_BIN) not in sys.path:
+    sys.path.insert(0, str(_BIN))
 
 
 def _load(name, path):
@@ -143,3 +158,344 @@ def test_f1_structural_forecast_uses_project_linear():
     cctally = _load("cctally", REPO / "bin" / "cctally")
     src = inspect.getsource(cctally._compute_forecast)
     assert "project_linear(" in src
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Task 2: per-project budgets — CLI set/unset + display section (spec §7)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Driven through load_script() + redirect_paths() so the kernel's path
+# constants point at the per-test tmp dir, NOT the developer's real
+# ~/.local/share/cctally ([HOME-only test loader reads prod DB] gotcha).
+
+from conftest import load_script, redirect_paths  # noqa: E402
+from _fixture_builders import (  # noqa: E402
+    seed_session_entry,
+    seed_session_file,
+)
+
+UTC = dt.timezone.utc
+PJ_WEEK_START = dt.datetime(2026, 5, 26, 14, 0, 0, tzinfo=UTC)
+PJ_WEEK_END = PJ_WEEK_START + dt.timedelta(days=7)
+PJ_AS_OF = PJ_WEEK_START + dt.timedelta(hours=96)
+ENTRY_USD = 1.80  # 100k in + 100k out on claude-sonnet-4-6
+
+
+def _pj_iso(d: dt.datetime) -> str:
+    return d.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@pytest.fixture
+def pjns(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    monkeypatch.setenv("CCTALLY_AS_OF", _pj_iso(PJ_AS_OF))
+    return ns
+
+
+def _pj_budget_args(**overrides):
+    """Build a budget Namespace with every field cmd_budget reads."""
+    base = dict(
+        action=None, amount=None, project=None,
+        config=None, reveal_projects=False, tz=None,
+        json=False, format=None, theme="light", no_branding=False,
+        output=None, copy=False, open_after_write=False,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def _pj_seed_window(ns):
+    """Seed one boundary-aware weekly_usage_snapshots row so the budget window
+    resolves to [PJ_WEEK_START, PJ_WEEK_END)."""
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, weekly_percent, "
+            " page_url, source, payload_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _pj_iso(PJ_WEEK_START + dt.timedelta(hours=1)),
+                PJ_WEEK_START.date().isoformat(),
+                (PJ_WEEK_END - dt.timedelta(seconds=1)).date().isoformat(),
+                _pj_iso(PJ_WEEK_START),
+                _pj_iso(PJ_WEEK_END),
+                40.0, None, "fixture", json.dumps({"fixture": True}),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _pj_seed_entries(ns, root_to_count):
+    """Seed entries: {project_root: n_entries}. Each entry == $1.80."""
+    conn = ns["open_cache_db"]()
+    try:
+        for i, (root, n) in enumerate(root_to_count.items()):
+            src = f"/fx/pj-{i}.jsonl"
+            seed_session_file(
+                conn, path=src, session_id=f"s-{i}", project_path=root,
+            )
+            for j in range(n):
+                seed_session_entry(
+                    conn, source_path=src, line_offset=j,
+                    timestamp_utc=_pj_iso(PJ_WEEK_START + dt.timedelta(hours=3)),
+                    model="claude-sonnet-4-6",
+                    input_tokens=100_000, output_tokens=100_000,
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _pj_write_config(ns, budget_block):
+    import _cctally_core
+    _cctally_core.CONFIG_PATH.write_text(
+        json.dumps({"display": {"tz": "utc"}, "budget": budget_block}) + "\n"
+    )
+
+
+def _pj_read_projects(ns):
+    import _cctally_core
+    if not _cctally_core.CONFIG_PATH.exists():
+        return {}
+    cfg = json.loads(_cctally_core.CONFIG_PATH.read_text())
+    return cfg.get("budget", {}).get("projects", {})
+
+
+# ── set/unset --project CLI ─────────────────────────────────────────────────
+
+
+def test_budget_set_project_cwd_resolves_git_root(pjns, monkeypatch, tmp_path):
+    """`budget set 25 --project` (bare) inside a git repo writes
+    budget.projects[<repo_root>] == 25.0."""
+    repo = tmp_path / "myrepo"
+    (repo / ".git").mkdir(parents=True)
+    monkeypatch.chdir(repo)
+    rc = pjns["cmd_budget"](
+        _pj_budget_args(action="set", amount="25", project="__CWD__")
+    )
+    assert rc == 0
+    projects = _pj_read_projects(pjns)
+    expected_key = os.path.realpath(str(repo))
+    assert projects.get(expected_key) == 25.0
+
+
+def test_budget_set_project_outside_repo_exit_2(pjns, monkeypatch, tmp_path):
+    """`budget set 25 --project` (bare) outside any git repo → exit 2."""
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    monkeypatch.chdir(plain)
+    rc = pjns["cmd_budget"](
+        _pj_budget_args(action="set", amount="25", project="__CWD__")
+    )
+    assert rc == 2
+    assert _pj_read_projects(pjns) == {}
+
+
+def test_budget_set_project_explicit_path(pjns):
+    """`budget set 10 --project /tmp/some/root` writes that explicit key
+    (realpath-normalized)."""
+    rc = pjns["cmd_budget"](
+        _pj_budget_args(action="set", amount="10", project="/tmp/some/root")
+    )
+    assert rc == 0
+    projects = _pj_read_projects(pjns)
+    key = os.path.realpath(os.path.expanduser("/tmp/some/root"))
+    assert projects.get(key) == 10.0
+
+
+def test_budget_unset_project_removes_key(pjns):
+    """`budget unset --project /tmp/x` removes the configured key; idempotent."""
+    pjns["cmd_budget"](
+        _pj_budget_args(action="set", amount="10", project="/tmp/x")
+    )
+    key = os.path.realpath(os.path.expanduser("/tmp/x"))
+    assert key in _pj_read_projects(pjns)
+    rc = pjns["cmd_budget"](
+        _pj_budget_args(action="unset", project="/tmp/x")
+    )
+    assert rc == 0
+    assert key not in _pj_read_projects(pjns)
+    # idempotent: unsetting again is a no-op success.
+    rc2 = pjns["cmd_budget"](
+        _pj_budget_args(action="unset", project="/tmp/x")
+    )
+    assert rc2 == 0
+
+
+# ── display section (terminal + project-only + --json) ──────────────────────
+
+
+def test_budget_terminal_renders_project_section(pjns, capsys):
+    """With budget.projects populated, bare `cctally budget` renders the
+    per-project section (basename + budget + spent + used% + verdict)."""
+    _pj_seed_window(pjns)
+    root_a = os.path.realpath("/fake/repos/alpha")
+    root_b = os.path.realpath("/fake/repos/beta")
+    _pj_seed_entries(pjns, {root_a: 10, root_b: 5})  # $18.00, $9.00
+    _pj_write_config(pjns, {
+        "weekly_usd": 300.0, "alerts_enabled": True,
+        "alert_thresholds": [90, 100],
+        "projects": {root_a: 15.0, root_b: 20.0},
+    })
+    rc = pjns["cmd_budget"](_pj_budget_args())
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "alpha" in out
+    assert "beta" in out
+    # alpha is over budget ($18 / $15 = 120%), beta is under ($9 / $20 = 45%).
+    # Sorted by used% desc → alpha appears before beta.
+    assert out.index("alpha") < out.index("beta")
+
+
+def test_budget_project_only_renders_without_global(pjns, capsys):
+    """budget.weekly_usd unset but budget.projects populated → bare
+    `cctally budget` STILL renders the per-project section."""
+    _pj_seed_window(pjns)
+    root_a = os.path.realpath("/fake/repos/alpha")
+    _pj_seed_entries(pjns, {root_a: 10})  # $18.00
+    _pj_write_config(pjns, {
+        "alerts_enabled": True, "alert_thresholds": [90, 100],
+        "projects": {root_a: 15.0},
+    })
+    rc = pjns["cmd_budget"](_pj_budget_args())
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The global unset message still prints…
+    assert "No weekly budget set" in out
+    # …AND the per-project section renders.
+    assert "alpha" in out
+
+
+def test_budget_project_only_json(pjns, capsys):
+    """Project-only --json emits status:"unset" AND a non-empty projects[]."""
+    _pj_seed_window(pjns)
+    root_a = os.path.realpath("/fake/repos/alpha")
+    _pj_seed_entries(pjns, {root_a: 10})  # $18.00
+    _pj_write_config(pjns, {
+        "alerts_enabled": True, "alert_thresholds": [90, 100],
+        "projects": {root_a: 15.0},
+    })
+    rc = pjns["cmd_budget"](_pj_budget_args(json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "unset"
+    assert payload["weekly_usd"] is None
+    assert len(payload["projects"]) == 1
+    p = payload["projects"][0]
+    assert set(p) >= {
+        "project", "project_key", "budget_usd", "spent_usd",
+        "consumption_pct", "verdict", "low_confidence",
+    }
+    assert p["project_key"] == root_a
+    assert p["budget_usd"] == 15.0
+    assert p["spent_usd"] == pytest.approx(18.0, abs=1e-9)
+
+
+def test_budget_json_projects_keys_and_sort(pjns, capsys):
+    """Full-status --json carries projects[] sorted by consumption_pct desc
+    with the documented key set."""
+    _pj_seed_window(pjns)
+    root_a = os.path.realpath("/fake/repos/alpha")
+    root_b = os.path.realpath("/fake/repos/beta")
+    _pj_seed_entries(pjns, {root_a: 10, root_b: 5})  # $18.00, $9.00
+    _pj_write_config(pjns, {
+        "weekly_usd": 300.0, "alerts_enabled": True,
+        "alert_thresholds": [90, 100],
+        "projects": {root_a: 15.0, root_b: 20.0},
+    })
+    rc = pjns["cmd_budget"](_pj_budget_args(json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    pcts = [p["consumption_pct"] for p in payload["projects"]]
+    assert pcts == sorted(pcts, reverse=True)  # desc
+    # alpha (120%) before beta (45%).
+    assert payload["projects"][0]["project_key"] == root_a
+
+
+def test_budget_json_deleted_project_zero_row(pjns, capsys):
+    """A configured project_key with NO matching entry renders $0 / 0% / ok,
+    never an error (deleted/moved/never-matched repo, spec §7.2)."""
+    _pj_seed_window(pjns)
+    root_a = os.path.realpath("/fake/repos/alpha")
+    _pj_seed_entries(pjns, {root_a: 10})  # only alpha has spend
+    ghost = os.path.realpath("/fake/repos/ghost")  # configured but no entries
+    _pj_write_config(pjns, {
+        "weekly_usd": 300.0, "alerts_enabled": True,
+        "alert_thresholds": [90, 100],
+        "projects": {root_a: 15.0, ghost: 50.0},
+    })
+    rc = pjns["cmd_budget"](_pj_budget_args(json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    by_key = {p["project_key"]: p for p in payload["projects"]}
+    g = by_key[ghost]
+    assert g["spent_usd"] == 0.0
+    assert g["consumption_pct"] == 0.0
+    assert g["verdict"] == "ok"
+
+
+def test_budget_empty_projects_baseline_unchanged(pjns, capsys):
+    """Empty budget.projects → NO per-project section appended; the unset
+    baseline string is byte-identical."""
+    _pj_write_config(pjns, {"alerts_enabled": True, "alert_thresholds": [90, 100]})
+    rc = pjns["cmd_budget"](_pj_budget_args())
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out == "No weekly budget set. Set one with: cctally budget set <amount>.\n"
+
+
+def test_budget_empty_projects_json_baseline_unchanged(pjns, capsys):
+    """Empty budget.projects, no global budget → --json baseline is
+    byte-identical (no projects[] key)."""
+    _pj_write_config(pjns, {"alerts_enabled": True, "alert_thresholds": [90, 100]})
+    rc = pjns["cmd_budget"](_pj_budget_args(json=True))
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    assert out == '{"schemaVersion": 1, "status": "unset", "weekly_usd": null}'
+
+
+# ── share-output anonymization (spec §7.5) ──────────────────────────────────
+
+
+def test_budget_share_anonymizes_project_names(pjns, capsys):
+    """Default share output anonymizes project basenames (project-1, …) via
+    the _lib_share._scrub chokepoint; the real names never appear."""
+    _pj_seed_window(pjns)
+    root_a = os.path.realpath("/fake/repos/alpha")
+    _pj_seed_entries(pjns, {root_a: 10})  # $18.00
+    _pj_write_config(pjns, {
+        "weekly_usd": 300.0, "alerts_enabled": True,
+        "alert_thresholds": [90, 100],
+        "projects": {root_a: 15.0},
+    })
+    rc = pjns["cmd_budget"](
+        _pj_budget_args(format="md", output="-", reveal_projects=False)
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "alpha" not in out  # anonymized — real basename absent
+    assert "project-1" in out  # the scrubbed label
+
+
+def test_budget_share_reveal_projects_shows_real_names(pjns, capsys):
+    """`--reveal-projects` opts back into real basenames in share output."""
+    _pj_seed_window(pjns)
+    root_a = os.path.realpath("/fake/repos/alpha")
+    _pj_seed_entries(pjns, {root_a: 10})  # $18.00
+    _pj_write_config(pjns, {
+        "weekly_usd": 300.0, "alerts_enabled": True,
+        "alert_thresholds": [90, 100],
+        "projects": {root_a: 15.0},
+    })
+    rc = pjns["cmd_budget"](
+        _pj_budget_args(format="md", output="-", reveal_projects=True)
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "alpha" in out

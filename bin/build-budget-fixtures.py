@@ -43,6 +43,7 @@ from _fixture_builders import (  # noqa: E402
     create_cache_db,
     create_stats_db,
     seed_session_entry,
+    seed_session_file,
     seed_weekly_usage_snapshot,
 )
 
@@ -115,9 +116,39 @@ def _seed_entries(cache_conn, *, n_total: int, n_recent: int, as_of: dt.datetime
         idx += 1
 
 
+def _seed_project_entries(cache_conn, *, projects: dict, as_of: dt.datetime) -> None:
+    """Seed per-project session entries for the per-project budget scenario.
+
+    ``projects`` maps a canonical git-root path → entry count. Each project's
+    entries share one ``session_files`` row carrying ``project_path`` (the
+    git-root), so ``get_claude_session_entries``' LEFT JOIN surfaces it and
+    ``_resolve_project_key`` buckets the entry under that root. Each entry is
+    100k input + 100k output on claude-sonnet-4-6 ($1.80) placed early in the
+    week — the per-project verdict is projection-based but with all spend early
+    the recent-rate band stays modest, keeping verdicts deterministic."""
+    early_anchor = WEEK_START + dt.timedelta(hours=3)
+    idx = 0
+    for i, (root, n) in enumerate(projects.items()):
+        src = f"/fx/budget-project-{i}.jsonl"
+        seed_session_file(
+            cache_conn, path=src, session_id=f"proj-s{i}", project_path=root,
+        )
+        for _ in range(n):
+            seed_session_entry(
+                cache_conn,
+                source_path=src,
+                line_offset=idx,
+                timestamp_utc=_iso(early_anchor),
+                model="claude-sonnet-4-6",
+                input_tokens=_ENTRY_INPUT,
+                output_tokens=_ENTRY_OUTPUT,
+            )
+            idx += 1
+
+
 def _build(name: str, *, as_of: dt.datetime, budget_block: dict,
            n_total: int, n_recent: int, weekly_percent: float,
-           seed_data: bool = True) -> None:
+           seed_data: bool = True, project_entries: dict | None = None) -> None:
     out_dir = FIXTURES_DIR / name
     app_dir = out_dir / ".local" / "share" / "cctally"
     app_dir.mkdir(parents=True, exist_ok=True)
@@ -133,7 +164,10 @@ def _build(name: str, *, as_of: dt.datetime, budget_block: dict,
     cache_conn = sqlite3.connect(cache_path)
     if seed_data:
         _seed_window_snapshot(stats_conn, weekly_percent=weekly_percent, as_of=as_of)
-        _seed_entries(cache_conn, n_total=n_total, n_recent=n_recent, as_of=as_of)
+        if project_entries is not None:
+            _seed_project_entries(cache_conn, projects=project_entries, as_of=as_of)
+        else:
+            _seed_entries(cache_conn, n_total=n_total, n_recent=n_recent, as_of=as_of)
     stats_conn.commit(); stats_conn.close()
     cache_conn.commit(); cache_conn.close()
 
@@ -201,6 +235,32 @@ SCENARIOS = {
         as_of=WEEK_START + dt.timedelta(hours=96),
         budget_block={"alerts_enabled": True, "alert_thresholds": [90, 100]},
         n_total=20, n_recent=5, weekly_percent=20.0,
+    ),
+    # Per-project budgets (#19/#121, spec §7). Three git-roots:
+    #   alpha — 10 entries → $18.00 on a $15 budget → 120% → over
+    #   beta  —  5 entries → $9.00  on a $20 budget → 45%  → ok
+    #   gamma —  0 entries → $0.00  on a $50 budget → 0%   → ok (LOW CONF)
+    # gamma exercises the deleted/moved/never-matched no-spend row (spec §7.2).
+    # A global weekly_usd is set too so the per-project section renders BELOW
+    # the global status block. 96h elapsed so the section is well past LOW CONF
+    # for the projects that have spend. Sorted by Used % desc → alpha, beta, gamma.
+    "per-project": dict(
+        as_of=WEEK_START + dt.timedelta(hours=96),
+        budget_block={
+            "weekly_usd": 300.0, "alerts_enabled": True,
+            "alert_thresholds": [90, 100],
+            "projects": {
+                "/fake/repos/alpha": 15.0,
+                "/fake/repos/beta": 20.0,
+                "/fake/repos/gamma": 50.0,
+            },
+        },
+        n_total=0, n_recent=0, weekly_percent=40.0,
+        project_entries={
+            "/fake/repos/alpha": 10,
+            "/fake/repos/beta": 5,
+            "/fake/repos/gamma": 0,
+        },
     ),
 }
 

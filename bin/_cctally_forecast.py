@@ -1578,8 +1578,12 @@ def cmd_budget(args: argparse.Namespace) -> int:
         return 2
 
     if action == "set":
+        if getattr(args, "project", None) is not None:
+            return _cmd_budget_set_project(args)
         return _cmd_budget_set(args)
     if action == "unset":
+        if getattr(args, "project", None) is not None:
+            return _cmd_budget_unset_project(args)
         return _cmd_budget_unset(args)
 
     # ── bare status ──
@@ -1593,11 +1597,42 @@ def cmd_budget(args: argparse.Namespace) -> int:
     except _BudgetConfigError as exc:
         eprint(f"cctally budget: {exc}")
         return 2
-    target = budget_cfg["weekly_usd"]
-    if target is None:
-        return _budget_render_unset(args)  # exit 0, friendly message
 
+    # Per-project section is appended to WHICHEVER global path runs (unset,
+    # no-data, full status) — gated on budget.projects being non-empty. When
+    # empty, NOTHING is appended → the existing global render paths stay
+    # byte-identical (spec §7.3a). It needs the budget window, so the work
+    # happens after we have a conn / now_utc below.
+    has_projects = bool(budget_cfg["projects"])
+
+    target = budget_cfg["weekly_usd"]
+
+    # Resolve the window-dependent per-project rows once (only when configured).
+    # `project_rows` is None when no window resolves (no snapshot yet) — the
+    # render paths degrade to the no-data note for the section. When projects
+    # are unconfigured, we never open a connection just for them: the
+    # individual global paths open their own.
     now_utc = _command_as_of()  # honors the CCTALLY_AS_OF testing hook
+    project_rows = None
+    project_window_resolved = False
+    if has_projects:
+        pj_conn = open_db()
+        try:
+            project_rows = _build_project_budget_rows(pj_conn, budget_cfg, now_utc)
+        finally:
+            pj_conn.close()
+        project_window_resolved = project_rows is not None
+
+    if target is None:
+        # Global budget unset → friendly message, then (if configured) the
+        # per-project section. --json carries status:"unset" + projects[].
+        return _budget_render_unset(
+            args,
+            project_rows=project_rows,
+            has_projects=has_projects,
+            project_window_resolved=project_window_resolved,
+        )
+
     conn = open_db()
     inputs = _build_budget_status_inputs(
         conn,
@@ -1609,26 +1644,179 @@ def cmd_budget(args: argparse.Namespace) -> int:
         # No usage snapshot yet → no resolvable week window (spec §6 worst case).
         if getattr(args, "format", None):
             snap = _build_budget_no_data_snapshot(args, budget_cfg, now_utc)
+            snap = _append_project_share_rows(snap, project_rows, has_projects)
             c._share_render_and_emit(snap, args)
             return 0
         if getattr(args, "json", False):
-            print(json.dumps({
+            payload = {
                 "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
                 "status": "no_data",
                 "weekly_usd": target,
-            }))
+            }
+            if has_projects:
+                payload["projects"] = (
+                    _project_rows_json(project_rows) if project_rows else []
+                )
+            print(json.dumps(payload))
             return 0
         print(f"Weekly budget: ${target:,.2f} — no usage data yet this week.")
+        _print_project_section_or_note(
+            project_rows, has_projects, project_window_resolved, args
+        )
         return 0
 
     status = c.compute_budget_status(inputs)
     if getattr(args, "format", None):
         snap = _build_budget_snapshot(args, budget_cfg, inputs, status)
+        snap = _append_project_share_rows(snap, project_rows, has_projects)
         c._share_render_and_emit(snap, args)
         return 0
     if getattr(args, "json", False):
-        return _budget_emit_json(budget_cfg, inputs, status)
-    return _budget_render_terminal(args, budget_cfg, inputs, status)
+        return _budget_emit_json(
+            budget_cfg, inputs, status,
+            project_rows=project_rows, has_projects=has_projects,
+        )
+    rc = _budget_render_terminal(args, budget_cfg, inputs, status)
+    _print_project_section_or_note(
+        project_rows, has_projects, project_window_resolved, args
+    )
+    return rc
+
+
+def _resolve_project_budget_target(raw: str):
+    """Resolve the ``--project`` value to a canonical git-root path.
+
+    ``__CWD__`` (the bare-flag sentinel) → resolve ``os.getcwd()`` to its
+    ``.git`` root via ``_resolve_project_key``; a result that is
+    ``is_no_git``/``is_unknown`` means we're not inside a git repo → return
+    ``None`` (the caller emits the "not inside a git repository" error +
+    exit 2). An explicit path is realpath-normalized (mirrors
+    ``_resolve_project_key``'s normalization so the key matches what
+    ``_sum_cost_by_project`` buckets entries under). Returns the canonical
+    path string, or ``None`` for the not-a-repo case.
+    """
+    c = _cctally()
+    if raw == "__CWD__":
+        key = c._resolve_project_key(os.getcwd(), "git-root", {})
+        if key.is_no_git or key.is_unknown or not key.git_root:
+            return None
+        return key.git_root
+    return os.path.realpath(os.path.expanduser(raw))
+
+
+def _cmd_budget_set_project(args: argparse.Namespace) -> int:
+    """`cctally budget set AMOUNT --project[=PATH]` — write one entry into
+    `budget.projects`, keyed by the resolved canonical git-root. Writes the
+    DEFAULT config (F4); Task 3's forward-only reconcile runs after the write."""
+    c = _cctally()
+    raw_amount = getattr(args, "amount", None)
+    if raw_amount is None:
+        eprint(
+            "cctally budget: `set --project` requires an amount, e.g. "
+            "cctally budget set 25 --project"
+        )
+        return 2
+    try:
+        amount = float(raw_amount)
+    except (TypeError, ValueError):
+        eprint(f"cctally budget: amount must be a positive number, got {raw_amount!r}")
+        return 2
+    if not math.isfinite(amount) or amount <= 0:
+        eprint(
+            f"cctally budget: amount must be a positive finite number, "
+            f"got {raw_amount!r}"
+        )
+        return 2
+
+    root = _resolve_project_budget_target(args.project)
+    if root is None:
+        eprint("cctally budget: not inside a git repository")
+        return 2
+
+    with c.config_writer_lock():
+        config = c._load_config_unlocked()
+        existing = config.get("budget")
+        if existing is not None and not isinstance(existing, dict):
+            eprint("cctally budget: budget config must be an object")
+            return 2
+        block = dict(existing or {})
+        projects = dict(block.get("projects") or {})
+        projects[root] = amount
+        block["projects"] = projects
+        config["budget"] = block
+        try:
+            validated = _get_budget_config(config)
+        except _BudgetConfigError as exc:
+            eprint(f"cctally budget: {exc}")
+            return 2
+        block["projects"] = dict(validated["projects"])
+        config["budget"] = block
+        c.save_config(config)
+
+    # Forward-only reconcile (Task 3 no-op stub for now; spec §6.8): record
+    # already-crossed (project, threshold) pairs alerted_at-set WITHOUT
+    # dispatch, so setting a budget mid-week (already over) doesn't storm.
+    c._reconcile_project_budget_milestones_on_write(validated)
+
+    basename = os.path.basename(root) or root
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "status": "set",
+            "project_key": root,
+            "budget_usd": amount,
+        }))
+        return 0
+    print(f"Project budget set: {basename} ${amount:,.2f}")
+    return 0
+
+
+def _cmd_budget_unset_project(args: argparse.Namespace) -> int:
+    """`cctally budget unset --project[=PATH]` — remove one `budget.projects`
+    entry. Idempotent (message-only when absent)."""
+    c = _cctally()
+    root = _resolve_project_budget_target(args.project)
+    if root is None:
+        eprint("cctally budget: not inside a git repository")
+        return 2
+
+    removed = False
+    with c.config_writer_lock():
+        config = c._load_config_unlocked()
+        existing = config.get("budget")
+        if existing is not None and not isinstance(existing, dict):
+            eprint("cctally budget: budget config must be an object")
+            return 2
+        block = dict(existing or {})
+        projects = dict(block.get("projects") or {})
+        if root in projects:
+            projects.pop(root)
+            removed = True
+        block["projects"] = projects
+        config["budget"] = block
+        try:
+            validated = _get_budget_config(config)
+        except _BudgetConfigError as exc:
+            eprint(f"cctally budget: {exc}")
+            return 2
+        c.save_config(config)
+
+    # Reconcile after an unset too — the remaining configured projects' state
+    # is unaffected, but keeping all four write surfaces symmetric (spec §6.8)
+    # means a re-add later behaves predictably.
+    c._reconcile_project_budget_milestones_on_write(validated)
+
+    basename = os.path.basename(root) or root
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "status": "unset" if removed else "noop",
+            "project_key": root,
+        }))
+        return 0
+    if removed:
+        print(f"Project budget cleared: {basename}")
+    else:
+        print(f"No project budget set for: {basename}")
+    return 0
 
 
 def _cmd_budget_set(args: argparse.Namespace) -> int:
@@ -1722,21 +1910,43 @@ def _cmd_budget_unset(args: argparse.Namespace) -> int:
     return 0
 
 
-def _budget_render_unset(args: argparse.Namespace) -> int:
-    """No budget set → friendly stdout message, exit 0 (NOT an error)."""
+def _budget_render_unset(
+    args: argparse.Namespace,
+    *,
+    project_rows=None,
+    has_projects: bool = False,
+    project_window_resolved: bool = False,
+) -> int:
+    """No GLOBAL budget set → friendly stdout message, exit 0 (NOT an error).
+
+    When per-project budgets ARE configured (``has_projects``), the
+    per-project section is STILL rendered below the unset message (spec
+    §7.3a) — a project-only configuration is fully supported. When
+    ``has_projects`` is False, every output mode is byte-identical to the
+    pre-feature behavior (no ``projects`` key in --json, no extra lines).
+    """
     c = _cctally()
     if getattr(args, "format", None):
         snap = _build_budget_no_budget_snapshot(args)
+        snap = _append_project_share_rows(snap, project_rows, has_projects)
         c._share_render_and_emit(snap, args)
         return 0
     if getattr(args, "json", False):
-        print(json.dumps({
+        payload = {
             "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
             "status": "unset",
             "weekly_usd": None,
-        }))
+        }
+        if has_projects:
+            payload["projects"] = (
+                _project_rows_json(project_rows) if project_rows else []
+            )
+        print(json.dumps(payload))
         return 0
     print("No weekly budget set. Set one with: cctally budget set <amount>.")
+    _print_project_section_or_note(
+        project_rows, has_projects, project_window_resolved, args
+    )
     return 0
 
 
@@ -1821,9 +2031,16 @@ def _budget_alerts_line(budget_cfg, status) -> str:
     return f"  Alerts: on · thresholds {thr_str} · {tail}"
 
 
-def _budget_emit_json(budget_cfg, inputs, status) -> int:
+def _budget_emit_json(
+    budget_cfg, inputs, status, *, project_rows=None, has_projects=False
+) -> int:
     """Emit the full BudgetStatus + config echo + window as JSON (schemaVersion 1).
-    Window timestamps are `…Z`, ignoring display.tz (every --json is UTC)."""
+    Window timestamps are `…Z`, ignoring display.tz (every --json is UTC).
+
+    When per-project budgets are configured (``has_projects``), an additive
+    ``projects: [...]`` array is appended — ADDITIVE only, NO schemaVersion
+    bump (spec §7.4). Absent when projects are empty so the global --json stays
+    byte-identical."""
     payload = {
         "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
         "status": "ok",
@@ -1846,8 +2063,186 @@ def _budget_emit_json(budget_cfg, inputs, status) -> int:
         "low_confidence": status.low_confidence,
         "crossed_thresholds": list(status.crossed_thresholds),
     }
+    if has_projects:
+        payload["projects"] = (
+            _project_rows_json(project_rows) if project_rows else []
+        )
     print(json.dumps(payload))
     return 0
+
+
+def _build_project_budget_rows(conn, budget_cfg, now_utc):
+    """Build per-project budget status dicts for the configured projects.
+
+    Returns ``None`` when no budget week window resolves (no usage snapshot
+    yet) — the caller renders the "no usage data yet this week" note instead
+    of a table. Otherwise a list of dicts (one per configured project),
+    SORTED by ``consumption_pct`` descending, each carrying the same verdict
+    fields as the global status (from one ``compute_budget_status`` codepath).
+
+    Spend is the shared ``_sum_cost_by_project`` scan over the current week
+    ``[week_start_at, now]``; the recent-rate input is a SECOND scan over the
+    CLAMPED trailing-24h window ``[max(week_start_at, now-24h), now]``. The
+    clamp at ``week_start_at`` is MANDATORY (spec §7.1): without it a fresh
+    week (``now < week_start + 24h``) pulls pre-reset spend into
+    ``rate_recent`` and false-WARN/OVERs a project. Mirrors the global
+    ``_build_budget_status_inputs`` (forecast.py) exactly.
+
+    A configured ``project_key`` with no matching entry this week (deleted /
+    moved / never-matched repo, spec §7.2) is absent from both scan maps →
+    ``spent=0`` / ``recent_24h=0`` → a ``$0 / 0% / ok`` row, never an error.
+    """
+    c = _cctally()
+    window = _resolve_current_budget_window(conn, now_utc)
+    if window is None:
+        return None
+    week_start_at, week_end_at = window
+    week = c._sum_cost_by_project(week_start_at, now_utc, mode="auto")
+    recent_start = max(week_start_at, now_utc - dt.timedelta(hours=24))
+    last24h = c._sum_cost_by_project(recent_start, now_utc, mode="auto")
+    thresholds = tuple(budget_cfg["alert_thresholds"])
+
+    rows = []
+    for key, target in budget_cfg["projects"].items():
+        inputs = c.BudgetInputs(
+            target_usd=float(target),
+            spent_usd=float(week.get(key, 0.0)),
+            recent_24h_usd=float(last24h.get(key, 0.0)),
+            week_start_at=week_start_at,
+            week_end_at=week_end_at,
+            now=now_utc,
+            alert_thresholds=thresholds,
+        )
+        status = c.compute_budget_status(inputs)
+        # Basename (collision-disambiguation handled by display_key).
+        pk = c._resolve_project_key(key, "git-root", {})
+        rows.append({
+            "project": pk.display_key,
+            "project_key": key,
+            "budget_usd": float(target),
+            "spent_usd": status.spent_usd,
+            "consumption_pct": status.consumption_pct,
+            "verdict": status.verdict,
+            "low_confidence": status.low_confidence,
+        })
+    rows.sort(key=lambda r: r["consumption_pct"], reverse=True)
+    return rows
+
+
+def _render_project_budget_section(rows, *, color: bool) -> str:
+    """Render the per-project budget table as plain aligned text below the
+    global status block (spec §7.3). Columns:
+    ``Project · Budget · Spent · Used % · Verdict`` (LOW CONF cue), already
+    sorted by Used % desc by ``_build_project_budget_rows``."""
+    c = _cctally()
+    headers = ["Project", "Budget", "Spent", "Used %", "Verdict"]
+    body = []
+    for r in rows:
+        verdict_label = {"ok": "OK", "warn": "WARN", "over": "OVER"}.get(
+            r["verdict"], r["verdict"].upper()
+        )
+        if r["low_confidence"]:
+            verdict_label += " (LOW CONF)"
+        body.append([
+            r["project"],
+            f"${r['budget_usd']:,.2f}",
+            f"${r['spent_usd']:,.2f}",
+            f"{r['consumption_pct']:.1f}%",
+            verdict_label,
+        ])
+    # Column widths sized to content (header + every cell).
+    widths = [len(h) for h in headers]
+    for cells in body:
+        for i, cell in enumerate(cells):
+            widths[i] = max(widths[i], len(cell))
+    # Project + Verdict left-aligned; the three money/percent columns right.
+    aligns = ["<", ">", ">", ">", "<"]
+
+    def _fmt_row(cells):
+        return "  ".join(
+            f"{cell:{aligns[i]}{widths[i]}}" for i, cell in enumerate(cells)
+        )
+
+    lines = ["", "Per-project budgets:", "", ("  " + _fmt_row(headers)).rstrip()]
+    for cells, r in zip(body, rows):
+        rendered = ("  " + _fmt_row(cells)).rstrip()
+        if color:
+            code = _budget_verdict_ansi_code(r["verdict"])
+            rendered = c._style_ansi(rendered, code, color)
+        lines.append(rendered)
+    return "\n".join(lines)
+
+
+def _print_project_section_or_note(rows, has_projects, window_resolved, args):
+    """Terminal helper: when projects are configured, print either the
+    per-project table (window resolved) or a brief no-data note (parallel to
+    the global no-data text, spec §7.3a). No-op when projects are empty so the
+    existing global terminal output stays byte-identical."""
+    if not has_projects:
+        return
+    c = _cctally()
+    if not window_resolved:
+        print("\nPer-project budgets: no usage data yet this week.")
+        return
+    print(_render_project_budget_section(rows, color=c._supports_color_stdout()))
+
+
+def _append_project_share_rows(snap, rows, has_projects):
+    """Append per-project ProjectCell rows to a budget ShareSnapshot so the
+    share-output anonymization chokepoint (``_lib_share._scrub``) rewrites the
+    basenames under default output and reveals them under ``--reveal-projects``
+    (spec §7.5). No-op when projects are empty → existing share goldens stay
+    byte-identical. Project names go through ``ProjectCell`` (the single
+    anonymization chokepoint); the [Anonymization fails closed] invariant
+    applies."""
+    if not has_projects or not rows:
+        return snap
+    c = _cctally()
+    _lib_share = c._share_load_lib()
+    new_columns = snap.columns
+    # Reuse the snapshot's 2-col (Metric/Value) shape but render each project
+    # as a ProjectCell in the metric column + its consumption in the value.
+    extra_rows = []
+    # A header-ish separator row keeps the per-project block visually distinct
+    # without changing the column schema.
+    extra_rows.append(_lib_share.Row(cells={
+        "metric": _lib_share.TextCell("— Per-project budgets —"),
+        "value": _lib_share.TextCell(""),
+    }))
+    for r in rows:
+        verdict = r["verdict"].upper()
+        extra_rows.append(_lib_share.Row(cells={
+            "metric": _lib_share.ProjectCell(r["project"]),
+            "value": _lib_share.TextCell(
+                f"${r['spent_usd']:,.2f} / ${r['budget_usd']:,.2f} "
+                f"({r['consumption_pct']:.0f}%) {verdict}"
+            ),
+        }))
+    return _replace_snapshot_rows(snap, tuple(snap.rows) + tuple(extra_rows))
+
+
+def _replace_snapshot_rows(snap, rows):
+    """Return a copy of ``snap`` with ``rows`` replaced (frozen dataclass)."""
+    import dataclasses
+    return dataclasses.replace(snap, rows=rows)
+
+
+def _project_rows_json(rows) -> list:
+    """Project the per-project status dicts onto the additive ``projects[]``
+    JSON shape (spec §7.4): real paths, no anonymization (every --json emits
+    real values, like ``project --json``)."""
+    return [
+        {
+            "project": r["project"],
+            "project_key": r["project_key"],
+            "budget_usd": r["budget_usd"],
+            "spent_usd": r["spent_usd"],
+            "consumption_pct": r["consumption_pct"],
+            "verdict": r["verdict"],
+            "low_confidence": r["low_confidence"],
+        }
+        for r in rows
+    ]
 
 
 def _build_budget_snapshot(args, budget_cfg, inputs, status):

@@ -1,0 +1,16 @@
+Weekly budget: $300.00   (subscription week 2026-05-26 → 2026-06-02)
+
+  Spent so far    $27.00    9.0% of budget
+  Remaining       $273.00
+  Pace            $6.75/day  ·  4.0 d elapsed
+  Daily budget    $91.00/day for the 3.0 d left to stay under
+  Projected EOW   $27–$47   →   ✓ OK
+
+  Alerts: on · thresholds 90% · 100% · (none crossed yet)
+
+Per-project budgets:
+
+  Project  Budget   Spent  Used %  Verdict
+  alpha    $15.00  $18.00  120.0%  OVER
+  beta     $20.00   $9.00   45.0%  OK
+  gamma    $50.00   $0.00    0.0%  OK (LOW CONF)
