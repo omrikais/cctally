@@ -150,11 +150,14 @@ export interface AlertEntry {
   id: string;                    // "axis:window_key:threshold"
   axis: AlertAxis;
   threshold: number;             // integer in [1, 100]
-  // Severity color authority (Task F): emitted by the Python kernel's
-  // `severity_for(threshold)` (amber <95 / red >=95). Optional so a stale
-  // envelope (older server) still renders — consumers fall back to deriving
-  // it from `threshold` when absent. See lib/alertAxis.ts `alertSeverity`.
-  severity?: 'amber' | 'red';
+  // Severity tier authority (Phase B): emitted by the Python kernel's
+  // `severity_for(threshold)` as a 3-tier token — `info` (<90) / `warn`
+  // (90-99) / `critical` (>=100). Optional so a stale envelope (older
+  // server) still renders — `alertSeverity` falls back to deriving it from
+  // `threshold` when absent, and normalizes the legacy `amber`/`red` tokens
+  // a pre-Phase-B backend might still emit. See lib/alertAxis.ts
+  // `alertSeverity`.
+  severity?: 'info' | 'warn' | 'critical';
   crossed_at: string;            // ISO-8601 UTC
   alerted_at: string;            // ISO-8601 UTC
   // Projected axis (issue #121): top-level metric discriminator. Absent on
@@ -198,6 +201,16 @@ export interface AlertsSettingsEnvelope {
   // default false; gated behind their parent axis master switch server-side.
   projected_weekly_enabled?: boolean;
   projected_budget_enabled?: boolean;
+  // Notifier dispatch backend (Phase B): the configured `alerts.notifier`
+  // mirrored from the server so SettingsOverlay can seed the dropdown
+  // without a separate GET. Optional so a pre-Phase-B envelope keeps the
+  // type contract; SettingsOverlay defaults to 'auto' when absent.
+  notifier?: 'auto' | 'osascript' | 'notify-send' | 'command' | 'none';
+  // Whether `alerts.command_template` is set on the server. The raw
+  // template is NEVER sent to the client (it can carry secrets); only this
+  // boolean is mirrored so the UI can enable/disable the "Custom command"
+  // option. Optional + defaults false.
+  command_configured?: boolean;
 }
 
 export interface DisplayEnvelope {

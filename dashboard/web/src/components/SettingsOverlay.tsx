@@ -8,8 +8,18 @@ import {
 } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useKeymap } from '../hooks/useKeymap';
-import type { AlertAxis, ProjectedMetric } from '../types/envelope';
+import type {
+  AlertAxis,
+  AlertsSettingsEnvelope,
+  ProjectedMetric,
+} from '../types/envelope';
 import { AXIS_TITLE_LABEL } from '../lib/alertAxis';
+
+// Notifier dispatch backends (Phase B). The union mirrors
+// `AlertsSettingsEnvelope.notifier` (single source of truth) so the dropdown
+// can't drift from the wire contract. `NonNullable` strips the `?` so the
+// local `useState` defaults cleanly to 'auto'.
+type NotifierKind = NonNullable<AlertsSettingsEnvelope['notifier']>;
 
 // Projected-axis metric sub-select labels (issue #121). The projected test
 // alert mirrors the CLI's `--metric {weekly_pct,budget_usd}`: a single
@@ -103,6 +113,14 @@ export function SettingsOverlay() {
   const [projectedBudget, setProjectedBudget] = useState<boolean>(
     alertsConfig.projected_budget_enabled ?? false,
   );
+  // Notifier dispatch backend (Phase B). Seeds from the SSE-mirrored
+  // `alerts_settings.notifier` (default 'auto' when the envelope predates
+  // the field). `command_configured` is a server-side boolean — the raw
+  // `command_template` is NEVER sent to the client, so the "Custom command"
+  // option is only selectable when the server reports a template is set.
+  const [notifier, setNotifier] = useState<NotifierKind>(
+    alertsConfig.notifier ?? 'auto',
+  );
   const [testSubmitting, setTestSubmitting] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
   const [testAxis, setTestAxis] = useState<AlertAxis>('weekly');
@@ -128,10 +146,12 @@ export function SettingsOverlay() {
     setAlertsEnabled(alertsConfig.enabled);
     setProjectedWeekly(alertsConfig.projected_weekly_enabled ?? false);
     setProjectedBudget(alertsConfig.projected_budget_enabled ?? false);
+    setNotifier(alertsConfig.notifier ?? 'auto');
   }, [
     alertsConfig.enabled,
     alertsConfig.projected_weekly_enabled,
     alertsConfig.projected_budget_enabled,
+    alertsConfig.notifier,
   ]);
 
   useKeymap([
@@ -170,6 +190,7 @@ export function SettingsOverlay() {
       setAlertsEnabled(alertsConfig.enabled);
       setProjectedWeekly(alertsConfig.projected_weekly_enabled ?? false);
       setProjectedBudget(alertsConfig.projected_budget_enabled ?? false);
+      setNotifier(alertsConfig.notifier ?? 'auto');
       setTestError(null);
       setTestAxis('weekly');
     }
@@ -181,6 +202,7 @@ export function SettingsOverlay() {
     alertsConfig.enabled,
     alertsConfig.projected_weekly_enabled,
     alertsConfig.projected_budget_enabled,
+    alertsConfig.notifier,
   ]);
 
   if (!open) return null;
@@ -198,6 +220,12 @@ export function SettingsOverlay() {
     projectedWeekly !== (alertsConfig.projected_weekly_enabled ?? false);
   const projectedBudgetDirty =
     projectedBudget !== (alertsConfig.projected_budget_enabled ?? false);
+  // Notifier (Phase B): dirty against the mirrored value (default 'auto').
+  // `commandConfigured` gates the "Custom command" option — when the server
+  // has no `command_template`, picking 'command' would dispatch nothing, so
+  // the option is disabled.
+  const notifierDirty = notifier !== (alertsConfig.notifier ?? 'auto');
+  const commandConfigured = alertsConfig.command_configured ?? false;
   // Save is gated when TZ is dirty-but-invalid (custom mode with
   // unparseable zone) or while a server-side POST is in flight. Non-TZ
   // dispatches are synchronous local-state updates and can't fail, so
@@ -220,12 +248,14 @@ export function SettingsOverlay() {
       }
       body.display = { tz: tzTargetValue };
     }
-    // The `alerts` block carries `enabled` (master) and the weekly-projected
-    // toggle (`alerts.projected_enabled`); send only the dirty sub-keys.
-    if (alertsDirty || projectedWeeklyDirty) {
+    // The `alerts` block carries `enabled` (master), the weekly-projected
+    // toggle (`alerts.projected_enabled`), and the notifier backend
+    // (`alerts.notifier`); send only the dirty sub-keys.
+    if (alertsDirty || projectedWeeklyDirty || notifierDirty) {
       const alertsBlock: Record<string, unknown> = {};
       if (alertsDirty) alertsBlock.enabled = alertsEnabled;
       if (projectedWeeklyDirty) alertsBlock.projected_enabled = projectedWeekly;
+      if (notifierDirty) alertsBlock.notifier = notifier;
       body.alerts = alertsBlock;
     }
     // The budget-projected toggle lives in its OWN config block
@@ -366,6 +396,37 @@ export function SettingsOverlay() {
               />{' '}
               Enable threshold alerts
             </label>
+            {/*
+              Notifier backend selector (Phase B). Seeded from the
+              SSE-mirrored `alerts_settings.notifier`. The "Custom command"
+              option is disabled unless the server reports a configured
+              `command_template` (`command_configured`) — the raw template is
+              never sent to the client, so the dashboard can only SELECT the
+              command notifier, not author it. The hint line surfaces that
+              the template is edited via the CLI.
+            */}
+            <label className="settings-row">
+              Notifier{' '}
+              <select
+                className="settings-btn settings-select"
+                value={notifier}
+                aria-label="Alert notifier"
+                onChange={(e) => setNotifier(e.target.value as NotifierKind)}
+              >
+                <option value="auto">Auto-detect</option>
+                <option value="osascript">macOS (osascript)</option>
+                <option value="notify-send">Linux (notify-send)</option>
+                <option value="command" disabled={!commandConfigured}>
+                  Custom command{commandConfigured ? '' : ' (set via CLI)'}
+                </option>
+                <option value="none">None (log only)</option>
+              </select>
+            </label>
+            {commandConfigured && (
+              <p className="settings-hint">
+                Custom command configured (edit via CLI).
+              </p>
+            )}
             {/*
               Spec §8.1 — read-only summary of the active threshold lists.
               Sourced from

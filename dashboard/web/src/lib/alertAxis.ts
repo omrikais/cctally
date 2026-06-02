@@ -23,15 +23,27 @@ export const AXIS_TITLE_LABEL: Record<AlertAxis, string> = {
   projected: 'Projected',
 };
 
-// Single severity authority (Task F). The Python kernel
-// `bin/_lib_alert_axes.py::severity_for` emits `alert.severity`
-// ('amber' | 'red') on every envelope item; this helper consumes it so the
-// frontend never recomputes the amber<95 / red>=95 split independently. The
-// `threshold` fallback keeps rendering safe when the envelope predates the
-// `severity` field (stale server) — it reproduces the EXACT same rule, so the
-// rendered color is byte-identical either way.
-export function alertSeverity(alert: AlertEntry): 'amber' | 'red' {
-  return alert.severity ?? (alert.threshold >= 95 ? 'red' : 'amber');
+// Single severity authority (Phase B 3-tier). The Python kernel
+// `bin/_lib_alert_axes.py::severity_for` emits the 3-tier `alert.severity`
+// token on every envelope item — `info` (<90) / `warn` (90-99) / `critical`
+// (>=100) — and this helper consumes it so the frontend never recomputes the
+// band split independently. Three safety nets keep rendering correct against
+// older backends:
+//   1. A pre-Phase-B server that still emits the legacy `amber`/`red` tokens
+//      is normalized onto the closest new tier (amber→warn, red→critical) so
+//      the rendered class is always a known `.alert-threshold.{tier}` rule.
+//   2. An envelope that predates the `severity` field entirely (no token)
+//      falls back to deriving the tier from `threshold` — byte-identical with
+//      the Python kernel bands.
+//   3. Any other unexpected string also lands on the threshold fallback.
+export function alertSeverity(alert: AlertEntry): 'info' | 'warn' | 'critical' {
+  const s = alert.severity as string | undefined;
+  if (s === 'info' || s === 'warn' || s === 'critical') return s;
+  if (s === 'amber') return 'warn'; // legacy token from a stale backend
+  if (s === 'red') return 'critical'; // legacy token from a stale backend
+  // threshold fallback — byte-identical with the Python kernel bands
+  // (info <90 / warn 90-99 / critical >=100).
+  return alert.threshold >= 100 ? 'critical' : alert.threshold >= 90 ? 'warn' : 'info';
 }
 
 // Metric-aware renderer for the `projected` axis (Codex P2-2). The

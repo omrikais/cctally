@@ -234,6 +234,12 @@ export interface AlertsConfig {
   // envelope's alerts_settings block. Both default false.
   projected_weekly_enabled?: boolean;
   projected_budget_enabled?: boolean;
+  // Notifier dispatch backend (Phase B): mirrored from the envelope so
+  // SettingsOverlay can seed the dropdown. Optional; defaults to 'auto'.
+  // The raw `command_template` is NEVER mirrored — only `command_configured`
+  // (a boolean) reaches the client.
+  notifier?: 'auto' | 'osascript' | 'notify-send' | 'command' | 'none';
+  command_configured?: boolean;
 }
 
 export interface UIState {

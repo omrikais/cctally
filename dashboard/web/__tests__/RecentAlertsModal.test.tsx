@@ -258,4 +258,39 @@ describe('<RecentAlertsModal />', () => {
     render(<RecentAlertsModal />);
     expect(screen.getByText(/No alerts yet/i)).toBeInTheDocument();
   });
+
+  // Phase B 3-tier severity: the % cell class is keyed off `alertSeverity`,
+  // which consumes the kernel's `info|warn|critical` token. Modal-level
+  // integration (per the *modal-level integration test* convention): drive a
+  // critical and a warn alert through the full modal render and assert the
+  // parent wiring lands the right tier class — not just the helper.
+  it('applies the critical tier class to a critical alert', () => {
+    dispatch({
+      type: 'INGEST_SNAPSHOT_ALERTS',
+      // severity:'critical' on a threshold (90) that would otherwise derive
+      // 'warn' — proves consumption, not recompute.
+      alerts: [{ ...mkAlert(1, 90), severity: 'critical' }],
+      alertsSettings: DEFAULT_ALERTS_SETTINGS,
+      isFirstTick: true,
+    });
+    render(<RecentAlertsModal />);
+    const cell = document.querySelector('td.alert-threshold')!;
+    expect(cell.className).toContain('severity-critical');
+    expect(cell.className).toContain('critical');
+    expect(cell.className).not.toContain('severity-warn');
+  });
+
+  it('applies the warn tier class to a warn alert', () => {
+    dispatch({
+      type: 'INGEST_SNAPSHOT_ALERTS',
+      alerts: [{ ...mkAlert(1, 90), severity: 'warn' }],
+      alertsSettings: DEFAULT_ALERTS_SETTINGS,
+      isFirstTick: true,
+    });
+    render(<RecentAlertsModal />);
+    const cell = document.querySelector('td.alert-threshold')!;
+    expect(cell.className).toContain('severity-warn');
+    expect(cell.className).toContain('warn');
+    expect(cell.className).not.toContain('severity-critical');
+  });
 });

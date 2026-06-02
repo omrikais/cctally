@@ -48,19 +48,26 @@ beforeEach(() => {
 
 describe('RecentAlertsPanel severity', () => {
   it('renders the class from alert.severity, not recomputed from threshold', () => {
-    // severity:'red' but threshold 50 ⇒ if the panel recomputed it would be
-    // 'amber'. Consuming severity ⇒ red class present, amber absent.
-    ingest([entry({ id: 'x:1', severity: 'red', threshold: 50 })]);
+    // severity:'critical' but threshold 50 ⇒ if the panel recomputed it would
+    // be 'info'. Consuming severity ⇒ critical class present, info absent.
+    ingest([entry({ id: 'x:1', severity: 'critical', threshold: 50 })]);
     render(<RecentAlertsPanel />);
     const cell = screen.getByText('50%');
-    expect(cell.className).toContain('severity-red');
-    expect(cell.className).not.toContain('severity-amber');
+    expect(cell.className).toContain('severity-critical');
+    expect(cell.className).not.toContain('severity-info');
   });
 
-  it('falls back to threshold derivation when severity is absent', () => {
-    ingest([entry({ id: 'y:1', threshold: 95 })]); // no severity field
+  it('falls back to threshold bands when severity is absent', () => {
+    // threshold 90 ⇒ warn (no severity field).
+    ingest([entry({ id: 'y:1', threshold: 90 })]);
     render(<RecentAlertsPanel />);
-    const cell = screen.getByText('95%');
-    expect(cell.className).toContain('severity-red');
+    const cell = screen.getByText('90%');
+    expect(cell.className).toContain('severity-warn');
+    // threshold 100 ⇒ critical.
+    _resetForTests();
+    ingest([entry({ id: 'z:1', threshold: 100 })]);
+    render(<RecentAlertsPanel />);
+    const critCell = screen.getByText('100%');
+    expect(critCell.className).toContain('severity-critical');
   });
 });

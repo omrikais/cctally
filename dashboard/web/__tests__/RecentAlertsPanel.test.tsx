@@ -97,21 +97,26 @@ describe('<RecentAlertsPanel />', () => {
     expect(screen.queryByText(/No alerts yet/i)).toBeNull();
   });
 
-  it('severity color: 90 → amber class, 95 → red class', () => {
+  it('severity tier: 90/95 → warn class, 100 → critical class', () => {
+    // Phase B 3-tier bands: 90-99 ⇒ warn, >=100 ⇒ critical. (95 is no longer
+    // a distinct "red" tier — it sits in the warn band alongside 90.) The tier
+    // class is axis-agnostic (weekly / five_hour / budget all go through
+    // alertSeverity), so exercise all three axes here.
     dispatch({
       type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [mkAlert(1, 90), mkFiveHourAlert(2, 95)],
+      alerts: [mkAlert(1, 90), mkFiveHourAlert(2, 95), mkBudgetAlert(3, 100)],
       alertsSettings: DEFAULT_ALERTS_SETTINGS,
       isFirstTick: true,
     });
     render(<RecentAlertsPanel />);
     const cells = document.querySelectorAll('.alert-threshold');
-    expect(cells.length).toBe(2);
+    expect(cells.length).toBe(3);
     const classNames = Array.from(cells).map((c) => c.className);
-    // First row is the 90-amber alert (alerts list ordered as supplied;
-    // panel renders newest-first directly from store).
-    expect(classNames[0]).toContain('amber');
-    expect(classNames[1]).toContain('red');
+    // List ordered as supplied; panel renders newest-first directly from store.
+    expect(classNames[0]).toContain('warn'); // 90 → warn
+    expect(classNames[1]).toContain('warn'); // 95 → warn (no longer red)
+    expect(classNames[1]).not.toContain('critical');
+    expect(classNames[2]).toContain('critical'); // 100 → critical
   });
 
   it('renders a BUDGET chip for budget-axis alerts (issue #19)', () => {

@@ -81,10 +81,10 @@ describe('<Toast />', () => {
       expect(t).not.toBeNull();
       expect(t).toHaveTextContent('90%');
       expect(t).toHaveTextContent('WEEKLY');
-      // Severity below 95 is amber.
+      // Phase B 3-tier: threshold 90 is in the 90-99 band ⇒ warn.
       expect(t!.classList.contains('toast--alert')).toBe(true);
-      expect(t!.classList.contains('toast--severity-amber')).toBe(true);
-      expect(t!.classList.contains('toast--severity-red')).toBe(false);
+      expect(t!.classList.contains('toast--severity-warn')).toBe(true);
+      expect(t!.classList.contains('toast--severity-critical')).toBe(false);
     });
 
     it('renders BUDGET chip + "$spent of $budget" body on budget axis (issue #19)', () => {
@@ -144,8 +144,8 @@ describe('<Toast />', () => {
       expect(t).toHaveTextContent('PROJECTED');
       expect(t!.querySelector('.chip--projected')).not.toBeNull();
       expect(t).toHaveTextContent('projected 102% of cap');
-      // Threshold >= 95 is red.
-      expect(t!.classList.contains('toast--severity-red')).toBe(true);
+      // Threshold 100 is in the >=100 band ⇒ critical.
+      expect(t!.classList.contains('toast--severity-critical')).toBe(true);
     });
 
     it('renders "projected $312 of $300" on projected budget_usd axis (issue #121)', () => {
@@ -199,14 +199,39 @@ describe('<Toast />', () => {
       expect(t).toHaveTextContent('80%');
     });
 
-    it('uses red severity at threshold >= 95', () => {
+    it('uses the warn tier in the 90-99 band (threshold 95)', () => {
       render(<Toast />);
       act(() => {
         dispatch({ type: 'SHOW_ALERT_TOAST', alert: mkAlert(95, 'weekly') });
       });
       const t = transientToast();
-      expect(t!.classList.contains('toast--severity-red')).toBe(true);
-      expect(t!.classList.contains('toast--severity-amber')).toBe(false);
+      // Phase B: 95 is in the 90-99 warn band (no longer "red at >=95").
+      expect(t!.classList.contains('toast--severity-warn')).toBe(true);
+      expect(t!.classList.contains('toast--severity-critical')).toBe(false);
+    });
+
+    it('uses the critical tier at threshold >= 100', () => {
+      render(<Toast />);
+      act(() => {
+        dispatch({ type: 'SHOW_ALERT_TOAST', alert: mkAlert(100, 'weekly') });
+      });
+      const t = transientToast();
+      expect(t!.classList.contains('toast--severity-critical')).toBe(true);
+      expect(t!.classList.contains('toast--severity-warn')).toBe(false);
+    });
+
+    it('consumes the kernel severity token over the threshold band', () => {
+      render(<Toast />);
+      act(() => {
+        // severity:'critical' on a threshold (90) that would derive 'warn'.
+        dispatch({
+          type: 'SHOW_ALERT_TOAST',
+          alert: { ...mkAlert(90, 'weekly'), severity: 'critical' },
+        });
+      });
+      const t = transientToast();
+      expect(t!.classList.contains('toast--severity-critical')).toBe(true);
+      expect(t!.classList.contains('toast--severity-warn')).toBe(false);
     });
 
     it('alert toast auto-dismisses after the longer 8s window', () => {
