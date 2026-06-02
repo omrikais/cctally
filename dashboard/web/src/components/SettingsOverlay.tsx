@@ -113,6 +113,12 @@ export function SettingsOverlay() {
   const [projectedBudget, setProjectedBudget] = useState<boolean>(
     alertsConfig.projected_budget_enabled ?? false,
   );
+  // Per-project budget axis (issue #19/#121): single opt-in toggle that
+  // routes to `budget.project_alerts_enabled` in the POST /api/settings body
+  // (its own config block, same as the budget-projected toggle).
+  const [projectAlerts, setProjectAlerts] = useState<boolean>(
+    alertsConfig.project_alerts_enabled ?? false,
+  );
   // Notifier dispatch backend (Phase B). Seeds from the SSE-mirrored
   // `alerts_settings.notifier` (default 'auto' when the envelope predates
   // the field). `command_configured` is a server-side boolean — the raw
@@ -146,11 +152,13 @@ export function SettingsOverlay() {
     setAlertsEnabled(alertsConfig.enabled);
     setProjectedWeekly(alertsConfig.projected_weekly_enabled ?? false);
     setProjectedBudget(alertsConfig.projected_budget_enabled ?? false);
+    setProjectAlerts(alertsConfig.project_alerts_enabled ?? false);
     setNotifier(alertsConfig.notifier ?? 'auto');
   }, [
     alertsConfig.enabled,
     alertsConfig.projected_weekly_enabled,
     alertsConfig.projected_budget_enabled,
+    alertsConfig.project_alerts_enabled,
     alertsConfig.notifier,
   ]);
 
@@ -190,6 +198,7 @@ export function SettingsOverlay() {
       setAlertsEnabled(alertsConfig.enabled);
       setProjectedWeekly(alertsConfig.projected_weekly_enabled ?? false);
       setProjectedBudget(alertsConfig.projected_budget_enabled ?? false);
+      setProjectAlerts(alertsConfig.project_alerts_enabled ?? false);
       setNotifier(alertsConfig.notifier ?? 'auto');
       setTestError(null);
       setTestAxis('weekly');
@@ -202,6 +211,7 @@ export function SettingsOverlay() {
     alertsConfig.enabled,
     alertsConfig.projected_weekly_enabled,
     alertsConfig.projected_budget_enabled,
+    alertsConfig.project_alerts_enabled,
     alertsConfig.notifier,
   ]);
 
@@ -220,6 +230,11 @@ export function SettingsOverlay() {
     projectedWeekly !== (alertsConfig.projected_weekly_enabled ?? false);
   const projectedBudgetDirty =
     projectedBudget !== (alertsConfig.projected_budget_enabled ?? false);
+  // Per-project budget toggle dirty — `budget.project_alerts_enabled` travels
+  // in the `budget` block (issue #19/#121), alongside the budget-projected
+  // toggle.
+  const projectAlertsDirty =
+    projectAlerts !== (alertsConfig.project_alerts_enabled ?? false);
   // Notifier (Phase B): dirty against the mirrored value (default 'auto').
   // `commandConfigured` gates the "Custom command" option — when the server
   // has no `command_template`, picking 'command' would dispatch nothing, so
@@ -258,10 +273,17 @@ export function SettingsOverlay() {
       if (notifierDirty) alertsBlock.notifier = notifier;
       body.alerts = alertsBlock;
     }
-    // The budget-projected toggle lives in its OWN config block
-    // (`budget.projected_enabled`) — separate from `alerts` (issue #19/#121).
-    if (projectedBudgetDirty) {
-      body.budget = { projected_enabled: projectedBudget };
+    // The budget-projected toggle AND the per-project budget toggle both live
+    // in the OWN `budget` config block — separate from `alerts` (issue
+    // #19/#121). Merge whichever are dirty into a single `budget` block so the
+    // server applies them in one atomic write (and a single reconcile pass).
+    if (projectedBudgetDirty || projectAlertsDirty) {
+      const budgetBlock: Record<string, unknown> = {};
+      if (projectedBudgetDirty) budgetBlock.projected_enabled = projectedBudget;
+      if (projectAlertsDirty) {
+        budgetBlock.project_alerts_enabled = projectAlerts;
+      }
+      body.budget = budgetBlock;
     }
     if (Object.keys(body).length > 0) {
       setTzSubmitting(true);
@@ -471,6 +493,23 @@ export function SettingsOverlay() {
                 onChange={(e) => setProjectedBudget(e.target.checked)}
               />{' '}
               Projected budget-$ pace alerts
+            </label>
+            {/*
+              Per-project budget alerts (issue #19/#121). A single opt-in,
+              default OFF, routing to `budget.project_alerts_enabled` (its own
+              config block). Gates push alerts only — the per-project display
+              section in `cctally budget` always renders configured projects.
+              Per-project budget AMOUNTS stay CLI-only (cwd-resolved); the
+              dashboard only toggles the axis on/off.
+            */}
+            <label>
+              <input
+                type="checkbox"
+                name="project-alerts-enabled"
+                checked={projectAlerts}
+                onChange={(e) => setProjectAlerts(e.target.checked)}
+              />{' '}
+              Per-project budget alerts
             </label>
             <div className="alerts-test-row">
               <label>

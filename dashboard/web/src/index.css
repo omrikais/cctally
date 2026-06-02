@@ -2474,6 +2474,9 @@ mark.current {
 /* Projected axis (issue #121): distinct blue/violet "forecast" accent —
    reads apart from budget's green and weekly's purple. */
 .chip--projected { background: rgba(129,140,248,0.16); color: var(--accent-indigo); }
+/* Per-project budget axis (issue #19/#121): teal — a budget-family hue
+   (sibling to budget's green) that still reads apart from it at a glance. */
+.chip--project_budget { background: rgba(45,212,191,0.16); color: var(--accent-teal); }
 
 /* -------- Alert row inside the panel -------- */
 .alert-row { display: flex; align-items: baseline; gap: 14px; padding: 8px 0; border-bottom: 1px solid var(--border-soft); }

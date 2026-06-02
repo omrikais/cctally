@@ -295,6 +295,8 @@ describe('alerts store (T8)', () => {
       // Projected axis (issue #121): both opt-in toggles default OFF.
       projected_weekly_enabled: false,
       projected_budget_enabled: false,
+      // Per-project budget axis (issue #19/#121): the opt-in toggle defaults OFF.
+      project_alerts_enabled: false,
     });
   });
 

@@ -87,6 +87,7 @@ set/unset` or directly via `cctally config`:
 - `budget.weekly_usd` — the weekly budget in USD (a number, or `null` for "no budget").
 - `budget.alerts_enabled` — whether spend-crossing alerts fire (boolean; default `true`).
 - `budget.alert_thresholds` — comma-separated integer percents of the budget that fire an alert when crossed (default `90,100`; an empty list silences alerts while keeping the verdict).
+- `budget.projects` / `budget.project_alerts_enabled` — per-project budgets + their opt-in alert toggle. See [Per-project budgets](#per-project-budgets).
 
 ```bash
 cctally config set budget.weekly_usd 300
@@ -112,7 +113,7 @@ the mutating forms (see below).
 - `--output PATH` — write `--format` output to `PATH` (`-` for stdout); default destination is stdout for `md`, `~/Downloads/cctally-budget-<utcdate>.<ext>` for `html`/`svg`.
 - `--copy` — pipe `--format md` to the clipboard (rejected for html/svg).
 - `--open` — open the written `--format html`/`svg` file (rejected for md).
-- `--reveal-projects` — **inert for budget** (accepted only for share-surface parity; budget has no per-project axis, so it has no effect).
+- `--reveal-projects` — show real project basenames in the per-project share section instead of the default anonymized `Project A/B/…` labels (see [Per-project budgets](#per-project-budgets)). Inert when no projects are configured.
 
 `--format` is a status-only render surface; passing it with `set`/`unset`
 exits 2.
@@ -166,10 +167,123 @@ mid-week quota reset starts a fresh window). The status report's `Alerts:` line
 shows the on/off state, the configured thresholds, and which (if any) have been
 crossed this week.
 
+## Per-project budgets
+
+Beyond the single global weekly budget, you can set a separate weekly
+equivalent-$ budget **per project** (keyed by canonical git-root). Per-project
+budgets are independent of the global budget — you can configure projects with
+no global `budget.weekly_usd` set at all.
+
+### Managing per-project budgets
+
+`budget set`/`unset` take an optional `--project` flag:
+
+```bash
+cd ~/repos/foo
+cctally budget set 25 --project          # budget the cwd's git-root at $25/week
+cctally budget set 25 --project /abs/path # budget an explicit git-root path
+cctally budget unset --project            # clear the cwd's git-root budget
+cctally budget unset --project /abs/path  # clear an explicit path
+```
+
+- Bare `--project` resolves the **current working directory** to its canonical
+  git-root. Outside a git repo it exits 2.
+- `--project <path>` resolves the given path to its git-root (so you can budget
+  any repo without `cd`-ing into it).
+- Same-basename repos stay distinct: the identity is the full git-root path
+  (`ProjectKey.bucket_path`), not the basename, so `~/a/foo` and `~/b/foo` are
+  two independent budgets that render with disambiguated `Project` labels.
+
+### Per-project display section
+
+`cctally budget` (bare) prints a compact per-project table **below** the global
+status, one row per configured project, sorted by `Used %` descending:
+
+```
+Per-project budgets
+
+  Project      Budget    Spent     Used %   Verdict
+  foo          $25.00    $26.00     104%    ⚠ OVER
+  bar          $50.00    $12.30      25%    ok
+```
+
+- Only configured projects appear; an empty `budget.projects` omits the section.
+- The section renders even when the global `budget.weekly_usd` is unset (and
+  even on the "no budget set" / "no usage data yet" paths — it degrades to a
+  brief note when no usage window has resolved yet).
+- A configured project whose repo was deleted/moved (or that never matched any
+  session entry this week) shows a `$0 / 0% / ok` row — never an error.
+- The displayed verdict is **projection-based** (same `ok`/`warn`/`over` ladder
+  + `LOW CONF` cue as the global status); the per-project **push alerts** below
+  fire on actual-spend crossings — the same split the global budget uses.
+
+`--json` carries an additive `projects[]` array (no `schemaVersion` bump),
+present even when the global budget is unset:
+
+```json
+"projects": [
+  {"project": "foo", "project_key": "/Users/me/repos/foo", "budget_usd": 25.0,
+   "spent_usd": 26.0, "consumption_pct": 104.0, "verdict": "over",
+   "low_confidence": false}
+]
+```
+
+`--json` emits real git-root paths (like `project --json`). Share output
+(`--format`) routes per-project names through the anonymization chokepoint:
+`--reveal-projects` shows real basenames, the default anonymizes to
+`Project A/B/…`.
+
+### Per-project config keys
+
+- `budget.projects` — a flat map `{ "<canonical-git-root>": <usd> }` (default
+  `{}`). Values are positive finite numbers. Primary management is
+  `budget set/unset --project`; for direct config edits it round-trips as JSON
+  (`config get budget.projects` emits JSON; `config set budget.projects '<json-object>'`
+  JSON-parses + validates).
+- `budget.project_alerts_enabled` — boolean, **default `false`** (opt-in). Gates
+  per-project push **alerts** only; the display section always renders
+  configured projects regardless. Follows the `projected`-axis precedent
+  (opt-in, default OFF) rather than the global budget's "alerts on when set".
+
+```bash
+cctally config get budget.projects                 # emits JSON
+cctally config set budget.projects '{"/abs/repo": 40}'
+cctally config set budget.project_alerts_enabled true
+cctally config unset budget.projects
+```
+
+Per-project alerts reuse the global `budget.alert_thresholds` and the shared
+3-tier severity — there is no separate per-project threshold config in v1.
+
+### The `project_budget` alert axis
+
+When `budget.project_alerts_enabled` is on, `record-usage` fires a desktop
+alert once per `(project, threshold)` as a project's **actual spend** crosses
+that percent of its own budget — the same forward-only / fire-once / set-then-
+dispatch contract as the global budget axis, scaled to a project dimension.
+Setting a project budget mid-week when already over records the crossed
+thresholds as already-alerted **without** an instant popup (forward-only-from-
+write reconcile); only later crossings fire.
+
+The alert is a fifth axis (`project_budget`) alongside `weekly` / `five_hour` /
+`budget` / `projected`:
+
+- **Notification text** carries the project basename:
+  *"Project foo — $26.00 of $25.00 (104% of budget)"*.
+- **Dashboard** — fired project alerts appear in the existing "Recent alerts"
+  panel/modal with a distinct **"PROJECT"** chip (vs the global "BUDGET" chip)
+  and the project basename + `$spent of $budget` context. The Settings overlay
+  (`s`) has a **"Per-project budget alerts"** on/off toggle that persists
+  `budget.project_alerts_enabled`. (Editing per-project budget *amounts* stays
+  CLI-only — the dashboard only views fired alerts and toggles the axis.)
+- **Test it** — `cctally alerts test --axis project-budget` (CLI) or the
+  dashboard Settings "Send test alert" picker (axis "Project budget") dispatch a
+  synthetic example ($26 of $25) without needing a real `budget.projects` entry.
+
 ## Exit codes
 
 - `0` — normal (status rendered, including the "no budget set" case; `set`/`unset` succeeded).
-- `2` — usage error: a non-positive or non-numeric amount on `set`; `--config` on `set`/`unset`; `--format` on `set`/`unset`; an invalid share-flag combination; or a malformed `budget` config block.
+- `2` — usage error: a non-positive or non-numeric amount on `set`; `--config` on `set`/`unset`; `--format` on `set`/`unset`; an invalid share-flag combination; a malformed `budget` config block; or `--project` (bare) outside a git repo.
 
 ## Related
 

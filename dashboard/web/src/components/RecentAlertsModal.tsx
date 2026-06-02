@@ -71,6 +71,25 @@ function ContextCell({
       </span>
     );
   }
+  if (alert.axis === 'project_budget') {
+    // Per-project budget axis (issue #19/#121): like budget, but the context
+    // leads with the project basename so the user knows WHICH project crossed.
+    // `week_start_at` is the effective post-reset ISO timestamp (slice the
+    // date prefix for fmt.weekStart); `consumption_pct` is read from the row.
+    const project = alert.context.project ?? '(project)';
+    const pct = alert.context.consumption_pct;
+    return (
+      <span className="alert-context alert-context--project_budget">
+        {project}
+        {pct != null && (
+          <>
+            {' · '}
+            <span className="num">{Math.round(pct)}% of budget</span>
+          </>
+        )}
+      </span>
+    );
+  }
   if (alert.axis === 'projected') {
     // Projected axis (issue #121): metric-aware context, read from the row
     // (Codex P0-4). The `metric` discriminator drives a single helper
@@ -104,8 +123,9 @@ function CostCell({ alert }: { alert: AlertEntry }): JSX.Element {
   let v: number | undefined;
   if (alert.axis === 'weekly') {
     v = alert.context.cumulative_cost_usd;
-  } else if (alert.axis === 'budget') {
-    // Budget axis (issue #19): the Cost column shows actual spend.
+  } else if (alert.axis === 'budget' || alert.axis === 'project_budget') {
+    // Budget + per-project budget axes (issue #19/#121): the Cost column
+    // shows actual spend (the project's spend for project_budget).
     v = alert.context.spent_usd;
   } else {
     v = alert.context.block_cost_usd;

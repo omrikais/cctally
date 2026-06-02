@@ -61,6 +61,11 @@ export function Toast() {
                 {AXIS_TITLE_LABEL.projected} to reach{' '}
                 {toast.payload.threshold}%
               </>
+            ) : toast.payload.axis === 'project_budget' ? (
+              <>
+                {toast.payload.context.project ?? AXIS_TITLE_LABEL.project_budget}{' '}
+                budget {toast.payload.threshold}% reached
+              </>
             ) : (
               <>
                 {AXIS_TITLE_LABEL[toast.payload.axis]} usage{' '}
@@ -79,7 +84,8 @@ export function Toast() {
               Block started {fmt.timeOnly(toast.payload.context.block_start_at, ctx)}
             </div>
           )}
-          {toast.payload.axis === 'budget' &&
+          {(toast.payload.axis === 'budget' ||
+            toast.payload.axis === 'project_budget') &&
             toast.payload.context.week_start_at && (
               <div className="toast--alert-sub">
                 Week starting{' '}
@@ -142,6 +148,27 @@ export function Toast() {
                 {projectedContextText(toast.payload) ?? '—'}
               </span>
             )}
+            {toast.payload.axis === 'project_budget' &&
+              toast.payload.context.spent_usd != null &&
+              toast.payload.context.budget_usd != null && (
+                // Per-project budget axis (issue #19/#121): "<project>: $spent
+                // of $budget". The project basename leads so the user knows
+                // WHICH project crossed; numbers come from the row (snapshotted
+                // at crossing), not live config (Codex P0-4).
+                <>
+                  {toast.payload.context.project && (
+                    <>{toast.payload.context.project}: </>
+                  )}
+                  <span className="num">
+                    ${toast.payload.context.spent_usd.toFixed(2)}
+                  </span>{' '}
+                  of{' '}
+                  <span className="num">
+                    ${toast.payload.context.budget_usd.toFixed(2)}
+                  </span>{' '}
+                  budget
+                </>
+              )}
           </div>
         </div>
       )}

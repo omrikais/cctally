@@ -138,7 +138,12 @@ export interface UpdateEnvelope {
 
 // ---- Threshold-actions alerts (T5/T8) --------------------------------
 
-export type AlertAxis = 'weekly' | 'five_hour' | 'budget' | 'projected';
+export type AlertAxis =
+  | 'weekly'
+  | 'five_hour'
+  | 'budget'
+  | 'projected'
+  | 'project_budget';
 
 // Projected axis (issue #121): the `metric` discriminator selects which
 // week-average projection fired (weekly-% against the cap vs budget-$
@@ -171,11 +176,18 @@ export interface AlertEntry {
     block_start_at?: string;
     block_cost_usd?: number;
     primary_model?: string | null;
-    // Budget axis (issue #19): equiv-$ budget threshold crossings.
+    // Budget axis (issue #19): equiv-$ budget threshold crossings. The
+    // `project_budget` axis (issue #19/#121) reuses budget_usd / spent_usd /
+    // consumption_pct and adds the project dimension below.
     week_start_at?: string;
     budget_usd?: number;
     spent_usd?: number;
     consumption_pct?: number;
+    // Project-budget axis (issue #19/#121): `project` is the collision-
+    // disambiguated basename (rendered in the chip context), `project_key`
+    // the canonical git-root identity. Both absent on the other axes.
+    project?: string;
+    project_key?: string;
     // Projected axis (issue #121): rendered FROM THE ROW (not live config —
     // Codex P0-4). `projected_value` is the week-average projection (% for
     // weekly_pct, $ for budget_usd); `denominator` is the cap (100.0) or the
@@ -201,6 +213,11 @@ export interface AlertsSettingsEnvelope {
   // default false; gated behind their parent axis master switch server-side.
   projected_weekly_enabled?: boolean;
   projected_budget_enabled?: boolean;
+  // Per-project budget axis (issue #19/#121): the single opt-in toggle,
+  // mirrored from `_get_budget_config(...)["project_alerts_enabled"]`.
+  // Defaults false; gates the `project_budget` axis dispatch only (the
+  // per-project display section always renders configured projects).
+  project_alerts_enabled?: boolean;
   // Notifier dispatch backend (Phase B): the configured `alerts.notifier`
   // mirrored from the server so SettingsOverlay can seed the dropdown
   // without a separate GET. Optional so a pre-Phase-B envelope keeps the

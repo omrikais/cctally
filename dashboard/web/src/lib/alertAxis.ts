@@ -2,18 +2,21 @@ import type { AlertAxis, AlertEntry } from '../types/envelope';
 
 // Shared alert-axis labels (issue #19 widened the binary weekly|five_hour
 // union with a third `budget` axis; issue #121 adds the fourth `projected`
-// axis). Single source of truth so Toast / RecentAlertsPanel /
-// RecentAlertsModal never drift on the chip text. The chip uses the SHOUT
-// form; the title uses the sentence-case form.
+// axis; issue #19/#121 adds the fifth `project_budget` axis). Single source of
+// truth so Toast / RecentAlertsPanel / RecentAlertsModal never drift on the
+// chip text. The chip uses the SHOUT form; the title uses the sentence-case
+// form.
 //
 // These MUST stay byte-identical with the Python kernel
 // bin/_lib_alert_axes.py AXIS_REGISTRY chip_label / title_label fields
-// (`PROJECTED` / `Projected`, etc.).
+// (`PROJECTED` / `Projected`, etc.). A Python↔TS parity test
+// (tests/test_alert_axes_chip_parity.py) asserts byte-equality for all axes.
 export const AXIS_CHIP_LABEL: Record<AlertAxis, string> = {
   weekly: 'WEEKLY',
   five_hour: '5H-BLOCK',
   budget: 'BUDGET',
   projected: 'PROJECTED',
+  project_budget: 'PROJECT',
 };
 
 export const AXIS_TITLE_LABEL: Record<AlertAxis, string> = {
@@ -21,6 +24,7 @@ export const AXIS_TITLE_LABEL: Record<AlertAxis, string> = {
   five_hour: '5h-block',
   budget: 'Budget',
   projected: 'Projected',
+  project_budget: 'Project budget',
 };
 
 // Single severity authority (Phase B 3-tier). The Python kernel

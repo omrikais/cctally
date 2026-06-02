@@ -2289,9 +2289,11 @@ def _project_rows_json(rows) -> list:
 def _build_budget_snapshot(args, budget_cfg, inputs, status):
     """Build a `_lib_share.ShareSnapshot` (cmd="budget") for `--format` output.
 
-    `--reveal-projects` is inert for budget — there are no ProjectCells, so
-    `_scrub` returns the snapshot unchanged. No parallel renderer; the gate
-    calls `_share_render_and_emit(snap, args)`."""
+    This builds the GLOBAL budget rows only; when per-project budgets are
+    configured, `_append_project_share_rows` appends ProjectCell rows so
+    `--reveal-projects` reveals (or `_scrub` anonymizes) the per-project
+    basenames via the share chokepoint. No parallel renderer; the gate calls
+    `_share_render_and_emit(snap, args)`."""
     c = _cctally()
     _lib_share = c._share_load_lib()
     tz_label = c._share_display_tz_label(getattr(args, "_resolved_tz", None))

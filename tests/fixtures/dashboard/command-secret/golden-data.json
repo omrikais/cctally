@@ -13,6 +13,7 @@
       95
     ],
     "notifier": "command",
+    "project_alerts_enabled": false,
     "projected_budget_enabled": false,
     "projected_weekly_enabled": false,
     "weekly_thresholds": [

@@ -234,6 +234,9 @@ export interface AlertsConfig {
   // envelope's alerts_settings block. Both default false.
   projected_weekly_enabled?: boolean;
   projected_budget_enabled?: boolean;
+  // Per-project budget axis (issue #19/#121): single opt-in toggle mirrored
+  // from the envelope's alerts_settings block. Defaults false.
+  project_alerts_enabled?: boolean;
   // Notifier dispatch backend (Phase B): mirrored from the envelope so
   // SettingsOverlay can seed the dropdown. Optional; defaults to 'auto'.
   // The raw `command_template` is NEVER mirrored — only `command_configured`
@@ -390,6 +393,7 @@ function defaultAlertsConfig(): AlertsConfig {
     budget_enabled: false,
     projected_weekly_enabled: false,
     projected_budget_enabled: false,
+    project_alerts_enabled: false,
   };
 }
 

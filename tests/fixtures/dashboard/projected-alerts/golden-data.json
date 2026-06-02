@@ -58,6 +58,7 @@
       95
     ],
     "notifier": "auto",
+    "project_alerts_enabled": false,
     "projected_budget_enabled": true,
     "projected_weekly_enabled": true,
     "weekly_thresholds": [

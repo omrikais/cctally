@@ -123,6 +123,9 @@ const FALLBACK_ALERTS_SETTINGS = {
   // won't carry these; default to "disabled".
   projected_weekly_enabled: false,
   projected_budget_enabled: false,
+  // Per-project budget axis (issue #19/#121) — a stale Python without the
+  // per-project leg won't carry this; default to "disabled".
+  project_alerts_enabled: false,
 };
 
 function ingestAlerts(snap: Envelope): void {

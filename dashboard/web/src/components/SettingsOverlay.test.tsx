@@ -303,3 +303,82 @@ describe('<SettingsOverlay /> notifier dropdown', () => {
     expect(settingsCall).toBeUndefined();
   });
 });
+
+// Per-project budget alerts toggle (issue #19/#121). The toggle lives in the
+// `budget` config block (`budget.project_alerts_enabled`), alongside the
+// budget-projected toggle. Parent-modal integration tests: mount the real
+// SettingsOverlay, seed `alerts_settings.project_alerts_enabled`, open via the
+// `s` keymap, flip the checkbox, and assert the POST body carries
+// `budget.project_alerts_enabled`.
+describe('<SettingsOverlay /> per-project budget alerts toggle', () => {
+  it('renders the toggle seeded from project_alerts_enabled', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ project_alerts_enabled: true });
+    openSettings();
+
+    const toggle = screen.getByRole('checkbox', {
+      name: /Per-project budget alerts/,
+    }) as HTMLInputElement;
+    // Seeded ON from the envelope's alerts_settings block.
+    expect(toggle.checked).toBe(true);
+  });
+
+  it('POSTs budget.project_alerts_enabled when toggled on', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    // Server reports the axis OFF; the user opts in.
+    seedAlertsConfig({ project_alerts_enabled: false });
+    openSettings();
+
+    const toggle = screen.getByRole('checkbox', {
+      name: /Per-project budget alerts/,
+    }) as HTMLInputElement;
+    expect(toggle.checked).toBe(false); // seeded default
+    fireEvent.click(toggle);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
+    expect(call).toBeTruthy();
+    const [, init] = call as [string, RequestInit];
+    expect(init.method).toBe('POST');
+    const parsed = JSON.parse(init.body as string) as {
+      budget?: { project_alerts_enabled?: boolean };
+    };
+    // Binding assertion: the toggle travels in the `budget` block. Against a
+    // Save handler that ignored projectAlertsDirty this fails with `budget`
+    // undefined.
+    expect(parsed.budget?.project_alerts_enabled).toBe(true);
+  });
+
+  it('does NOT POST when the per-project toggle is unchanged', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ project_alerts_enabled: true });
+    openSettings();
+
+    // Touch nothing — the toggle matches the server, so Save makes no POST.
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    const settingsCall = fetchMock.mock.calls.find(
+      ([url]) => url === '/api/settings',
+    );
+    expect(settingsCall).toBeUndefined();
+  });
+});

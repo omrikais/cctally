@@ -340,6 +340,12 @@ def _build_alert_payload_projected(*args, **kwargs):
     return sys.modules["cctally"]._build_alert_payload_projected(*args, **kwargs)
 
 
+def _build_alert_payload_project_budget(*args, **kwargs):
+    return sys.modules["cctally"]._build_alert_payload_project_budget(
+        *args, **kwargs
+    )
+
+
 def _dispatch_alert_notification(*args, **kwargs):
     return sys.modules["cctally"]._dispatch_alert_notification(*args, **kwargs)
 
@@ -4252,6 +4258,61 @@ def _envelope_rows_projected(conn, descriptor, limit, severity_for) -> list[dict
     return out
 
 
+def _envelope_rows_project_budget(conn, descriptor, limit, severity_for) -> list[dict]:
+    # Fifth axis (issue #19 / #121): PER-PROJECT equiv-$ budget threshold
+    # crossings. Like the global budget axis, project-budget alerts re-anchor
+    # ``week_start_at`` on a mid-week reset, so there is NO ``reset_event_id``
+    # segment — the new window gets fresh rows under
+    # ``UNIQUE(week_start_at, project_key, threshold)``. ``project_key`` is the
+    # canonical git-root (``ProjectKey.bucket_path``); the human-readable chip
+    # context carries the project BASENAME, resolved through the production
+    # ``_resolve_project_key`` (git-root mode) so a moved/deleted repo still
+    # renders its basename from the snapshotted path (no FS dependency on a
+    # live ``.git``). ``budget_usd`` / ``spent_usd`` / ``consumption_pct`` are
+    # rendered FROM THE ROW (snapshotted at crossing), never live config that
+    # may have changed since (Codex P0-4). The envelope id mirrors the dispatch
+    # payload's ``project_budget:<week_start_at>:<project_key>:<threshold>``
+    # shape (``_build_alert_payload_project_budget``).
+    rows = conn.execute(
+        f"""
+        SELECT week_start_at, project_key, threshold, budget_usd, spent_usd,
+               consumption_pct, crossed_at_utc, alerted_at
+        FROM {descriptor.milestone_table}
+        WHERE alerted_at IS NOT NULL
+        ORDER BY alerted_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    c = _cctally()
+    resolve = c._resolve_project_key
+    resolver_cache: dict = {}
+    out: list[dict] = []
+    for r in rows:
+        threshold = int(r["threshold"])
+        project_key = r["project_key"]
+        pkey = resolve(project_key, "git-root", resolver_cache)
+        out.append({
+            "id": (
+                f"project_budget:{r['week_start_at']}:{project_key}:{threshold}"
+            ),
+            "axis":       descriptor.id,
+            "threshold":  threshold,
+            "severity":   severity_for(threshold),
+            "crossed_at": r["crossed_at_utc"],
+            "alerted_at": r["alerted_at"],
+            "context": {
+                "week_start_at":   r["week_start_at"],
+                "project":         pkey.display_key,
+                "project_key":     project_key,
+                "budget_usd":      float(r["budget_usd"]),
+                "spent_usd":       float(r["spent_usd"]),
+                "consumption_pct": float(r["consumption_pct"]),
+            },
+        })
+    return out
+
+
 # Keyed by ``AlertAxisDescriptor.id`` — the registry decides which axes run,
 # in what order; this table supplies the bespoke heterogeneous row-mapper.
 _ENVELOPE_AXIS_MAPPERS = {
@@ -4259,6 +4320,7 @@ _ENVELOPE_AXIS_MAPPERS = {
     "five_hour": _envelope_rows_five_hour,
     "budget": _envelope_rows_budget,
     "projected": _envelope_rows_projected,
+    "project_budget": _envelope_rows_project_budget,
 }
 
 
@@ -4269,19 +4331,20 @@ def _build_alerts_envelope_array(
     """Return the ``alerts`` array for the SSE snapshot envelope.
 
     Union of ``percent_milestones``, ``five_hour_milestones``,
-    ``budget_milestones``, and ``projected_milestones`` rows with
-    ``alerted_at IS NOT NULL``, ordered newest-first by ``alerted_at``,
-    capped at ``limit`` (default 100). Single source of truth for both the
-    dashboard panel (slices to 10 client-side) and the modal (renders all
-    100). Forward-only semantics: only rows the alert-dispatch path stamped
-    get included; pre-deploy crossings stay NULL and are intentionally
-    invisible (spec §4.3).
+    ``budget_milestones``, ``projected_milestones``, and
+    ``project_budget_milestones`` rows with ``alerted_at IS NOT NULL``,
+    ordered newest-first by ``alerted_at``, capped at ``limit`` (default 100).
+    Single source of truth for both the dashboard panel (slices to 10
+    client-side) and the modal (renders all 100). Forward-only semantics: only
+    rows the alert-dispatch path stamped get included; pre-deploy crossings
+    stay NULL and are intentionally invisible (spec §4.3).
 
-    All four axes share the same envelope schema; the ``axis`` field
-    (``weekly`` / ``five_hour`` / ``budget`` / ``projected``) discriminates.
-    The ``projected`` axis additionally carries a top-level ``metric``
-    (``weekly_pct`` | ``budget_usd``) so the frontend can pick its
-    metric-aware context renderer.
+    All five axes share the same envelope schema; the ``axis`` field
+    (``weekly`` / ``five_hour`` / ``budget`` / ``projected`` /
+    ``project_budget``) discriminates. The ``projected`` axis additionally
+    carries a top-level ``metric`` (``weekly_pct`` | ``budget_usd``) so the
+    frontend can pick its metric-aware context renderer; ``project_budget``
+    carries the project basename + ``$spent of $budget`` in its context.
 
     Per-axis ``LIMIT`` is applied at the SQL level (each query may yield
     up to ``limit``) and the union is re-sorted + sliced — important for
@@ -4702,7 +4765,8 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         _budget_cfg = _get_budget_config(_cfg_for_alerts)
     except _BudgetConfigError:
         _budget_cfg = {"weekly_usd": None, "alerts_enabled": True,
-                       "alert_thresholds": [], "projected_enabled": False}
+                       "alert_thresholds": [], "projected_enabled": False,
+                       "projects": {}, "project_alerts_enabled": False}
     alerts_settings = {
         "enabled":              _alerts_cfg["enabled"],
         "weekly_thresholds":    list(_alerts_cfg["weekly_thresholds"]),
@@ -4714,6 +4778,12 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # from the validated getters' ``projected_enabled`` (default False).
         "projected_weekly_enabled": bool(_alerts_cfg.get("projected_enabled")),
         "projected_budget_enabled": bool(_budget_cfg.get("projected_enabled")),
+        # Per-project budget alerts opt-in mirror (issue #19 / #121). Gates the
+        # ``project_budget`` axis dispatch only (the display section always
+        # renders configured projects). Sourced from the validated budget
+        # getter's ``project_alerts_enabled`` (default False) — the frontend
+        # SettingsOverlay seeds a single on/off toggle from it.
+        "project_alerts_enabled": bool(_budget_cfg.get("project_alerts_enabled")),
         # Alert-dispatch notifier mirror (Phase B). `notifier` is the
         # validated backend selector ("auto"/"command"/etc.). The raw
         # `command_template` is NEVER mirrored — it routinely holds secrets
@@ -5673,7 +5743,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 budget_in = payload["budget"]
                 for leaf in (
                     "weekly_usd", "alerts_enabled", "alert_thresholds",
-                    "projected_enabled",
+                    "projected_enabled", "project_alerts_enabled",
                 ):
                     if leaf in budget_in:
                         merged_budget[leaf] = budget_in[leaf]
@@ -5767,6 +5837,15 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # never breaks the 200 response. Config write already left the
             # config_writer_lock, so the helper's open_db never nests.
             _cctally()._reconcile_budget_on_config_write(validated_budget)
+            # Per-project budgets: the 4th reconcile surface (spec §6.8).
+            # Toggling ``project_alerts_enabled`` on mid-week (already over a
+            # threshold) latches the crossed (project, threshold) rows as
+            # already-alerted so the next record-usage tick does NOT storm
+            # retroactive alerts. Same forward-only-from-write contract as the
+            # global reconcile above; gated + best-effort.
+            _cctally()._reconcile_project_budget_milestones_on_write(
+                validated_budget
+            )
         if update_check_validated is not None:
             # Echo the full merged check block (cooked defaults included)
             # so the SettingsOverlay can repaint without a follow-up GET.
@@ -5818,11 +5897,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         dispatch status string in the JSON response.
 
         Body (all fields optional): ``{"axis":
-        "weekly"|"five_hour"|"budget"|"projected", "threshold": 1..100,
-        "metric": "weekly_pct"|"budget_usd"}``. Defaults: axis="weekly",
-        threshold=90, metric="weekly_pct". ``metric`` is only consulted for
-        the ``projected`` axis (mirrors the CLI ``alerts test --axis
-        projected --metric`` surface); it is ignored for the other axes.
+        "weekly"|"five_hour"|"budget"|"projected"|"project_budget",
+        "threshold": 1..100, "metric": "weekly_pct"|"budget_usd"}``. Defaults:
+        axis="weekly", threshold=90, metric="weekly_pct". ``metric`` is only
+        consulted for the ``projected`` axis (mirrors the CLI ``alerts test
+        --axis projected --metric`` surface); it is ignored for the other
+        axes. The ``project_budget`` axis dispatches a synthetic example
+        project ($26 of $25) — no real ``budget.projects`` entry required.
 
         IMPORTANT: ``axis`` uses the underscore form (``"five_hour"``)
         in the JSON API to match the dispatch payload's internal axis
@@ -5861,12 +5942,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 return
 
         axis = body.get("axis", "weekly")
-        if axis not in ("weekly", "five_hour", "budget", "projected"):
+        if axis not in (
+            "weekly", "five_hour", "budget", "projected", "project_budget",
+        ):
             self._respond_json(
                 400,
                 {"error": (
-                    "axis must be 'weekly', 'five_hour', 'budget' or "
-                    f"'projected', got {axis!r}"
+                    "axis must be 'weekly', 'five_hour', 'budget', "
+                    f"'projected' or 'project_budget', got {axis!r}"
                 )},
             )
             return
@@ -5916,6 +5999,22 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 budget_usd=300.0,
                 spent_usd=300.0 * threshold / 100.0,
                 consumption_pct=float(threshold),
+            )
+        elif axis == "project_budget":
+            # Synthetic per-project budget payload — mirrors the CLI
+            # ``alerts test --axis project_budget`` branch (NO DB writes,
+            # test/real divergence contract). Uses a fixed example project
+            # ($26 of $25 = 104%) so no real ``budget.projects`` entry is
+            # required; ``project_key`` is a placeholder canonical path.
+            payload = _build_alert_payload_project_budget(
+                threshold=threshold,
+                crossed_at_utc=now_utc_iso(),
+                week_start_at=dt.date.today().isoformat(),
+                project="example-project",
+                project_key="/example/example-project",
+                budget_usd=25.0,
+                spent_usd=26.0,
+                consumption_pct=104.0,
             )
         elif axis == "projected":
             # Synthetic projected-pace payload — mirrors the CLI
