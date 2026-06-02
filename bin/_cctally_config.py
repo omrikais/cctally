@@ -298,6 +298,8 @@ ALLOWED_CONFIG_KEYS = (
     "display.tz",
     "alerts.enabled",
     "alerts.projected_enabled",
+    "alerts.notifier",
+    "alerts.command_template",
     "dashboard.bind",
     "update.check.enabled",
     "update.check.ttl_hours",
@@ -414,6 +416,21 @@ def _config_known_value(config: dict, key: str) -> "object":
             return bool(_get_alerts_config(config)["projected_enabled"])
         except c._AlertsConfigError:
             return False
+    if key == "alerts.notifier":
+        # Validated dispatch backend (defaults to 'auto' when unset). A corrupt
+        # alerts block surfaces the default — mirrors alerts.enabled.
+        try:
+            return _get_alerts_config(config)["notifier"]
+        except c._AlertsConfigError:
+            return "auto"
+    if key == "alerts.command_template":
+        # Validated argv list or None (defaults to None when unset). A corrupt
+        # alerts block surfaces the default. The plain-text render path JSON-
+        # encodes this so `config get` round-trips through `config set`.
+        try:
+            return _get_alerts_config(config)["command_template"]
+        except c._AlertsConfigError:
+            return None
     if key == "dashboard.bind":
         # Default semantic alias is 'loopback' (resolves to 127.0.0.1 at
         # bind time). LAN exposure is opt-in via `set dashboard.bind lan`
@@ -505,14 +522,20 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
     if key is not None and key not in ALLOWED_CONFIG_KEYS:
         eprint(f"cctally config: unknown config key {key!r}")
         return 2
+    # `alerts.command_template` is JSON-shaped (a list of strings or null), so
+    # its real value (including None) must survive into the render layer — the
+    # generic None->"" coercion below would break the JSON shape / round-trip.
+    def _coerce(k: str, v: "object") -> "object":
+        if k == "alerts.command_template":
+            return v
+        return v if v is not None else ""
+
     pairs: "list[tuple[str, object]]" = []
     if key is None:
         for k in ALLOWED_CONFIG_KEYS:
-            v = _config_known_value(config, k)
-            pairs.append((k, v if v is not None else ""))
+            pairs.append((k, _coerce(k, _config_known_value(config, k))))
     else:
-        v = _config_known_value(config, key)
-        pairs.append((key, v if v is not None else ""))
+        pairs.append((key, _coerce(key, _config_known_value(config, key))))
 
     if getattr(args, "emit_json", False):
         # Walk every dot-delimited segment so keys deeper than two
@@ -532,7 +555,12 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
         for k, v in pairs:
             # Preserve canonical bool stringification (true/false) so
             # round-trips via `config set alerts.enabled <plain-text>` work.
-            if isinstance(v, bool):
+            if k == "alerts.command_template":
+                # JSON-encoded (list of strings or null) so `config get` output
+                # round-trips through `config set alerts.command_template`
+                # (which JSON-parses its value).
+                rendered = json.dumps(v)
+            elif isinstance(v, bool):
                 rendered = "true" if v else "false"
             elif isinstance(v, list):
                 # Comma-joined so `config get budget.alert_thresholds` output
@@ -652,6 +680,76 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
             print(
                 f"alerts.projected_enabled={'true' if normalized else 'false'}"
             )
+        return 0
+    if key == "alerts.notifier":
+        # Dispatch backend (Phase B). Plain string; the enum constraint is
+        # enforced by the pre-persist _get_alerts_config validation (so we never
+        # write a config that fails subsequent reads). Same read-modify-write
+        # posture as alerts.enabled (preserves sibling alerts.* keys).
+        normalized = raw.strip()
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing_alerts = config.get("alerts")
+            if existing_alerts is not None and not isinstance(
+                existing_alerts, dict
+            ):
+                print(
+                    "cctally: alerts config error: alerts must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            alerts_block = dict(existing_alerts or {})
+            alerts_block["notifier"] = normalized
+            try:
+                _get_alerts_config({**config, "alerts": alerts_block})
+            except _AlertsConfigError as exc:
+                print(f"cctally: alerts config error: {exc}", file=sys.stderr)
+                return 2
+            config["alerts"] = alerts_block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(json.dumps({"alerts": {"notifier": normalized}}, indent=2))
+        else:
+            print(f"alerts.notifier={normalized}")
+        return 0
+    if key == "alerts.command_template":
+        # Dispatch argv template (Phase B). JSON-parsed value (a list of strings
+        # or null to clear it); the shape + cross-field constraints are enforced
+        # by the pre-persist _get_alerts_config validation. Same read-modify-
+        # write posture as alerts.enabled (preserves sibling alerts.* keys).
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            print(
+                f"cctally: alerts.command_template must be JSON (a list of "
+                f"strings or null): {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing_alerts = config.get("alerts")
+            if existing_alerts is not None and not isinstance(
+                existing_alerts, dict
+            ):
+                print(
+                    "cctally: alerts config error: alerts must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            alerts_block = dict(existing_alerts or {})
+            alerts_block["command_template"] = parsed
+            try:
+                _get_alerts_config({**config, "alerts": alerts_block})
+            except _AlertsConfigError as exc:
+                print(f"cctally: alerts config error: {exc}", file=sys.stderr)
+                return 2
+            config["alerts"] = alerts_block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(json.dumps({"alerts": {"command_template": parsed}}, indent=2))
+        else:
+            print(f"alerts.command_template={json.dumps(parsed)}")
         return 0
     if key == "dashboard.bind":
         # Validation rejects whitespace / empty / non-string up front;
@@ -873,15 +971,20 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                 save_config(config)
             # idempotent: silent on missing key
         return 0
-    if key in ("alerts.enabled", "alerts.projected_enabled"):
+    if key in (
+        "alerts.enabled",
+        "alerts.projected_enabled",
+        "alerts.notifier",
+        "alerts.command_template",
+    ):
         # Mirror the display.tz branch: writer-lock + _load_config_unlocked
         # (NOT load_config — fcntl.flock is per-fd so re-entry would
         # self-deadlock per the gotcha in CLAUDE.md). Unsetting just the
         # named key preserves any user-customized threshold lists
         # (`weekly_thresholds`, `five_hour_thresholds`) and the sibling
-        # enabled/projected_enabled toggle; the read-time validator
-        # (`_get_alerts_config`) re-applies the canonical default of `False`
-        # for the missing key on next get.
+        # enabled/projected_enabled/notifier/command_template keys; the
+        # read-time validator (`_get_alerts_config`) re-applies the canonical
+        # default (`False` / `"auto"` / `None`) for the missing key on next get.
         inner_key = key.split(".", 1)[1]
         with config_writer_lock():
             config = _load_config_unlocked()

@@ -432,7 +432,13 @@ _ALERTS_CONFIG_VALID_KEYS = {
     "weekly_thresholds",
     "five_hour_thresholds",
     "projected_enabled",
+    "notifier",
+    "command_template",
 }
+
+# Dispatch backends (Phase B). "auto" picks a platform default; "command"
+# routes through alerts.command_template (which it then requires).
+_ALERTS_VALID_NOTIFIERS = ("auto", "osascript", "notify-send", "command", "none")
 
 
 def _validate_threshold_list(name: str, value: object) -> "list[int]":
@@ -513,11 +519,47 @@ def _get_alerts_config(cfg: "dict | None") -> dict:
             f"alerts.projected_enabled must be a JSON boolean, got "
             f"{type(projected_enabled).__name__}: {projected_enabled!r}"
         )
+    # Dispatch-global keys (Phase B). `notifier` selects the backend;
+    # `command_template` is an argv list for the `command` backend (and may be
+    # set ahead of switching the backend). The cross-field constraint
+    # (notifier='command' requires a template) is enforced last.
+    notifier = block.get("notifier", "auto")
+    if notifier not in _ALERTS_VALID_NOTIFIERS:
+        raise _AlertsConfigError(
+            f"alerts.notifier must be one of {list(_ALERTS_VALID_NOTIFIERS)}, "
+            f"got {notifier!r}"
+        )
+    command_template = block.get("command_template", None)
+    if command_template is not None:
+        if not isinstance(command_template, list) or not command_template:
+            raise _AlertsConfigError(
+                "alerts.command_template must be null or a non-empty list of strings"
+            )
+        for el in command_template:
+            if not isinstance(el, str):
+                raise _AlertsConfigError(
+                    f"alerts.command_template elements must be strings, "
+                    f"got {type(el).__name__}: {el!r}"
+                )
+            if "\x00" in el:
+                raise _AlertsConfigError(
+                    "alerts.command_template elements must not contain a NUL byte"
+                )
+        if not command_template[0].strip():
+            raise _AlertsConfigError(
+                "alerts.command_template[0] (the program) must not be empty/whitespace"
+            )
+    if notifier == "command" and command_template is None:
+        raise _AlertsConfigError(
+            "alerts.notifier='command' requires alerts.command_template to be set"
+        )
     return {
         "enabled": enabled,
         "weekly_thresholds": weekly,
         "five_hour_thresholds": five_hour,
         "projected_enabled": projected_enabled,
+        "notifier": notifier,
+        "command_template": command_template,
     }
 
 
