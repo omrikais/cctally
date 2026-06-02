@@ -16,6 +16,8 @@ cctally config unset <key>
 |-----|--------|---------|
 | `dashboard.bind` | `loopback` (= `127.0.0.1`, default), `lan` (= `0.0.0.0`), or any literal host string (IPv4, IPv6, hostname). Resolution order: `--host` flag > config > default. Applies only at server startup. | `loopback` |
 | `display.tz` | `local`, `utc`, or any IANA name (e.g. `America/New_York`) | `local` |
+| `alerts.notifier` | `auto`, `osascript`, `notify-send`, `command`, `none` — the OS-popup backend for threshold alerts. See [Alerts dispatch keys](#alerts-dispatch-keys). | `auto` |
+| `alerts.command_template` | JSON: a non-empty list of argv strings (e.g. `["notify-send","{title}","{body}"]`) or `null` to clear. See [Alerts dispatch keys](#alerts-dispatch-keys). | `null` |
 
 ## Examples
 
@@ -29,6 +31,73 @@ cctally config get display.tz
 
 cctally config unset display.tz
 ```
+
+## Alerts dispatch keys
+
+Two keys select how threshold alerts fire their OS popup. Both live in
+the `alerts` config block and are settable via `config set`; full alert
+behavior is in [`alerts.md`](alerts.md).
+
+### `alerts.notifier`
+
+The dispatch backend. Resolved per host + config at fire time:
+
+| Value | Effect |
+|-------|--------|
+| `auto` (default) | `command_template` (if set, on **any** OS) → `osascript` on macOS → `notify-send` on Linux → `none`. |
+| `osascript` | macOS `display notification`; downgrades to `none` off macOS. |
+| `notify-send` | Linux `notify-send`; downgrades to `none` if not Linux or the binary is missing. |
+| `command` | Spawn `alerts.command_template` (which it then **requires** to be set). |
+| `none` | No OS popup; the log line and dashboard surfaces still fire. |
+
+```bash
+cctally config set alerts.notifier notify-send
+cctally config get alerts.notifier   # alerts.notifier=notify-send
+```
+
+**Precedence cue:** under `auto`, a set `command_template` overrides the
+native backend on every platform — set it to take over dispatch
+regardless of OS. An explicitly-selected native notifier that is
+unavailable on this host downgrades to `none` (it is never
+spawned-and-failed).
+
+### `alerts.command_template`
+
+A custom argv list spawned for the `command` backend (and for `auto`
+when set). The value is JSON — a non-empty list of strings, or `null` to
+clear it:
+
+```bash
+cctally config set alerts.command_template '["notify-send","-u","{urgency}","{title}","{body}"]'
+cctally config unset alerts.command_template   # back to null
+```
+
+**Substitution tokens** (one-pass, left-to-right; substituted values are
+NOT re-scanned; unmatched `{…}` and any non-token braces stay literal; a
+missing/None key substitutes as `""`):
+
+`{title}`, `{subtitle}`, `{body}`, `{severity}` (`info`/`warn`/`critical`),
+`{urgency}` (`low`/`normal`/`critical`), `{axis}`, `{threshold}`,
+`{metric}`.
+
+**Safety / trust model.** `alerts.command_template` is **trusted local
+command execution** — you own `config.json`, so the template's program is
+whatever you put there. The spawn is `shell=False` with the arg-list form
+(never a shell string), so alert text containing `$(...)`, `;`, or `&&`
+is passed as one literal argument and cannot inject a shell command. The
+native `notify-send` path additionally inserts a `--` end-of-options
+delimiter so a title/body starting with `-` can't be parsed as a flag.
+
+**Validation** (enforced before the value is persisted, so a written
+config never fails a later read):
+
+- `null`, or a non-empty list of strings (empty list rejected).
+- Every element is a string; no NUL bytes.
+- `command_template[0]` (the program) must not be empty/whitespace.
+- `alerts.notifier='command'` requires `command_template` to be set.
+
+An invalid value exits 2 with `cctally: alerts config error: …` and
+leaves the stored config untouched.
 
 ## How `display.tz` interacts with subcommands
 
@@ -114,5 +183,11 @@ For the parse-time tz rules on `--since`/`--until` and friends, see the per-subc
 - `cctally config: invalid IANA zone '<X>'` (exit 2) — the value is
   neither `local` nor `utc` nor a recognized IANA name.
 - `cctally config: unknown config key '<X>'` (exit 2) — the key is not
-  in the allowlist (currently `display.tz`, `alerts.enabled`,
-  `dashboard.bind`).
+  in the allowlist (`display.tz`, `dashboard.bind`, the `alerts.*` keys
+  including `alerts.notifier` / `alerts.command_template`, the
+  `statusline.*` keys, the `budget.*` keys, and the `update.check.*`
+  keys).
+- `cctally: alerts config error: <detail>` (exit 2) — an
+  `alerts.notifier` / `alerts.command_template` value failed validation
+  (bad enum, malformed template, or `notifier='command'` with no
+  template). The stored config is left untouched.

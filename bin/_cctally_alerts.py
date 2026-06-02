@@ -343,6 +343,20 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
             block_cost_usd=1.23,
             primary_model="claude-sonnet-4-6",
         )
+    # Resolve and report the active notifier for display BEFORE dispatch — the
+    # config read is guarded the same way `_dispatch_alert_notification` guards
+    # its own (so a malformed config never crashes `alerts test`). This is
+    # purely informational; the dispatch path re-resolves independently.
+    try:
+        alerts_cfg = _cctally_core._get_alerts_config(load_config())
+    except Exception:
+        alerts_cfg = {"notifier": "auto", "command_template": None}
+    notifier = resolve_notifier(
+        alerts_cfg,
+        platform=sys.platform,
+        which_on_path=lambda name: shutil.which(name) is not None,
+    )
+    print(f"notifier: {notifier}")
     status = _dispatch_alert_notification(payload, mode="test")
     if status == "queued":
         print("Test alert dispatched (mode=test). Check Notification Center.")
