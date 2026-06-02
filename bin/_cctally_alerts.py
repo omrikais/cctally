@@ -184,7 +184,10 @@ def _dispatch_alert_notification(
     # trailing log column. A missing threshold (defensive — shouldn't happen for
     # a real crossing) floors at "info".
     threshold = payload.get("threshold")
-    severity = severity_for(int(threshold)) if threshold is not None else "info"
+    try:
+        severity = severity_for(int(threshold)) if threshold is not None else "info"
+    except (TypeError, ValueError):
+        severity = "info"
     urgency = severity_to_urgency(severity)
 
     if platform is None:

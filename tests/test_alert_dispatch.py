@@ -147,6 +147,15 @@ def test_build_none_returns_none():
                            severity="info", urgency="low", payload={}, command_template=None) is None
 
 
+def test_build_command_with_none_template_is_total():
+    # Kernel totality: notifier="command" with no template must return None,
+    # not raise TypeError on the `for a in command_template` iteration.
+    # (Unreachable via resolve->build, but a pure kernel must be total.)
+    d = _load("_lib_alert_dispatch")
+    assert d.build_command("command", title="T", subtitle="", body="B",
+                           severity="info", urgency="low", payload={}, command_template=None) is None
+
+
 # ── Glue: full dispatch path, cross-platform (Step 7) ─────────────────────────
 
 
@@ -290,3 +299,32 @@ def test_glue_load_config_raising_does_not_raise(tmp_path, monkeypatch):
     )
     assert status == "queued"       # fell back to auto, still dispatched
     assert (tmp_path / "alerts.log").read_text().strip().endswith("\twarn")
+
+
+def test_glue_non_int_threshold_does_not_raise(tmp_path, monkeypatch):
+    # Never-raise contract: a present-but-non-int-coercible threshold must NOT
+    # raise out of the severity derivation (the `severity_for(int(threshold))`
+    # line, which runs OUTSIDE the function's only try/except). It floors at
+    # "info" (the fallback). Use an UNKNOWN axis: the typed-axis text builders
+    # (weekly/five_hour/budget/projected) themselves coerce `int(threshold)`
+    # and would raise BEFORE the severity line, so they can't isolate this gap.
+    # The unknown-axis else-branch renders threshold via an uncoerced f-string,
+    # letting execution reach the severity derivation with a non-int threshold.
+    # (Unreachable from production builders today, but the `is not None` guard
+    # already signals defensive intent — keep the coercion infallible too.)
+    core = _load("_cctally_core")
+    monkeypatch.setattr(core, "LOG_DIR", tmp_path)
+    alerts = _load("_cctally_alerts")
+    monkeypatch.setattr(alerts, "load_config", lambda *a, **k: {"alerts": {"enabled": True}})
+    sink = []
+    payload = {"axis": "mystery", "threshold": "abc", "context": {}}
+    status = alerts._dispatch_alert_notification(
+        payload, popen_factory=_capturing_factory(sink),
+        mode="real", platform="linux", which_on_path=lambda n: n == "notify-send",
+    )
+    assert status == "queued"                           # dispatched, never raised
+    assert sink and sink[0][0] == "notify-send"
+    assert "-u" in sink[0] and "low" in sink[0]         # info severity -> "low" urgency
+    log = (tmp_path / "alerts.log").read_text().strip().split("\t")
+    assert log[-1] == "info"                            # fallback severity column
+    assert log[-2] == "queued"                          # status column unchanged

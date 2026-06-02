@@ -122,6 +122,8 @@ def build_command(
         folded = f"{subtitle}\n{body}" if subtitle.strip() else body
         return ["notify-send", "-u", urgency, "--", title, folded]
     if notifier == "command":
+        if not command_template:
+            return None
         # A payload key present-but-None (e.g. a weekly payload's metric=None)
         # substitutes as "" — same surface as an absent key.
         def _pv(key):
