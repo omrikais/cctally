@@ -982,9 +982,14 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
         # self-deadlock per the gotcha in CLAUDE.md). Unsetting just the
         # named key preserves any user-customized threshold lists
         # (`weekly_thresholds`, `five_hour_thresholds`) and the sibling
-        # enabled/projected_enabled/notifier/command_template keys; the
-        # read-time validator (`_get_alerts_config`) re-applies the canonical
-        # default (`False` / `"auto"` / `None`) for the missing key on next get.
+        # enabled/projected_enabled/notifier/command_template keys. For
+        # enabled/projected_enabled/notifier the read-time validator
+        # (`_get_alerts_config`) re-applies the canonical default
+        # (`False` / `"auto"`) for the missing key on next get. NOT so for
+        # command_template when notifier == "command": the cross-field
+        # constraint makes notifier="command" REQUIRE a template, so dropping
+        # the template would leave a config that _get_alerts_config REJECTS on
+        # the next read. The pre-persist guard below catches exactly that case.
         inner_key = key.split(".", 1)[1]
         with config_writer_lock():
             config = _load_config_unlocked()
@@ -993,6 +998,20 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                 del block[inner_key]
                 if not block:
                     config.pop("alerts", None)
+                # Pre-persist guard (mirrors the set branches): unsetting a key
+                # that participates in a cross-field constraint
+                # (alerts.command_template while alerts.notifier == "command")
+                # would leave a config that _get_alerts_config rejects on the
+                # next read. Validate the TOP-LEVEL config (so a pruned/empty
+                # alerts block correctly validates to defaults) and refuse
+                # rather than persist an unreadable config.
+                try:
+                    _get_alerts_config(config)
+                except _AlertsConfigError as exc:
+                    print(
+                        f"cctally: alerts config error: {exc}", file=sys.stderr
+                    )
+                    return 2
                 save_config(config)
             # idempotent: silent on missing key
         return 0

@@ -141,3 +141,51 @@ def test_config_set_alerts_command_template_invalid_json_exits_2(tmp_path):
     res = _run_cli(tmp_path, "config", "set", "alerts.command_template", "not json")
     assert res.returncode == 2
     assert "alerts.command_template" in res.stderr
+
+
+def test_config_unset_command_template_refused_when_notifier_command(tmp_path):
+    """Unsetting alerts.command_template while alerts.notifier == "command" would
+    leave a config that _get_alerts_config rejects on the next read (the
+    cross-field constraint: notifier "command" REQUIRES a template). The set
+    path already pre-persist-validates and rejects ``set command_template null``
+    in this state with rc 2; the unset path must mirror that — refuse rather
+    than persist an unreadable config."""
+    import json
+
+    set_tmpl = _run_cli(
+        tmp_path, "config", "set", "alerts.command_template", '["beep"]'
+    )
+    assert set_tmpl.returncode == 0, set_tmpl.stderr
+    set_notifier = _run_cli(tmp_path, "config", "set", "alerts.notifier", "command")
+    assert set_notifier.returncode == 0, set_notifier.stderr
+
+    # The unset is refused (rc 2) because it would orphan notifier=command.
+    unset_res = _run_cli(
+        tmp_path, "config", "unset", "alerts.command_template"
+    )
+    assert unset_res.returncode == 2, (
+        f"expected rc 2, got {unset_res.returncode}; "
+        f"stdout={unset_res.stdout!r} stderr={unset_res.stderr!r}"
+    )
+
+    # The on-disk config is UNCHANGED — command_template still present, so a
+    # subsequent _get_alerts_config read still succeeds (no broken config
+    # was persisted).
+    on_disk = json.loads((tmp_path / "config.json").read_text())
+    assert on_disk["alerts"]["command_template"] == ["beep"]
+    core = _load("_cctally_core")
+    parsed = core._get_alerts_config(on_disk)
+    assert parsed["notifier"] == "command"
+    assert parsed["command_template"] == ["beep"]
+
+    # Sanity: once notifier no longer participates in the constraint (back to
+    # "auto"), the same unset succeeds (rc 0) — the key is unsettable.
+    set_auto = _run_cli(tmp_path, "config", "set", "alerts.notifier", "auto")
+    assert set_auto.returncode == 0, set_auto.stderr
+    unset_ok = _run_cli(
+        tmp_path, "config", "unset", "alerts.command_template"
+    )
+    assert unset_ok.returncode == 0, unset_ok.stderr
+    get_back = _run_cli(tmp_path, "config", "get", "alerts.command_template")
+    assert get_back.returncode == 0, get_back.stderr
+    assert "alerts.command_template=null" in get_back.stdout
