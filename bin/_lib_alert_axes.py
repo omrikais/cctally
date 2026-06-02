@@ -3,7 +3,7 @@
 Single source of truth for axis *metadata* — id, chip/title labels (kept
 byte-identical with dashboard/web/src/lib/alertAxis.ts), the milestone-table
 name used by the dashboard envelope, and the axis-uniform severity policy
-(amber <95 / red >=95). This kernel does NOT own the write/transaction path:
+(info <90 / warn 90-99 / critical >=100). This kernel does NOT own the write/transaction path:
 each axis keeps its own detect-and-arm code in bin/_cctally_record.py. The
 descriptor is the metadata/render contract, not the write engine.
 
@@ -14,14 +14,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Severity boundary: thresholds at or above this render red, below it amber.
-# Mirrors the legacy hardcoded amber<95 / red>=95 split (axis-uniform v1).
-_SEVERITY_RED_FLOOR = 95
+# Severity bands (Phase B): info < warn floor <= warn < critical floor <= critical.
+# The top tier means "hit the ceiling" (100% weekly = rate-limited, budget 100% =
+# over). Maps onto notify-send's low/normal/critical urgency levels.
+_SEVERITY_WARN_FLOOR = 90
+_SEVERITY_CRITICAL_FLOOR = 100
 
 
 def severity_for(threshold: int) -> str:
-    """Map a crossed integer threshold to a severity color ('amber' | 'red')."""
-    return "red" if int(threshold) >= _SEVERITY_RED_FLOOR else "amber"
+    """Map a crossed integer threshold to a 3-tier severity
+    ('info' | 'warn' | 'critical'). Axis-uniform; the single authority kept
+    byte-identical with dashboard/web/src/lib/alertAxis.ts::alertSeverity."""
+    t = int(threshold)
+    if t >= _SEVERITY_CRITICAL_FLOOR:
+        return "critical"
+    if t >= _SEVERITY_WARN_FLOOR:
+        return "warn"
+    return "info"
 
 
 @dataclass(frozen=True)

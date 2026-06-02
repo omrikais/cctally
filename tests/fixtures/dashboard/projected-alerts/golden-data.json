@@ -12,7 +12,7 @@
       "crossed_at": "2026-04-16T14:00:00Z",
       "id": "projected:2026-04-13T14:00:00Z:budget_usd:100",
       "metric": "budget_usd",
-      "severity": "red",
+      "severity": "critical",
       "threshold": 100
     },
     {
@@ -27,7 +27,7 @@
       "crossed_at": "2026-04-16T13:00:00Z",
       "id": "projected:2026-04-13T14:00:00Z:weekly_pct:100",
       "metric": "weekly_pct",
-      "severity": "red",
+      "severity": "critical",
       "threshold": 100
     },
     {
@@ -41,7 +41,7 @@
       },
       "crossed_at": "2026-04-16T10:00:00Z",
       "id": "budget:2026-04-13T14:00:00Z:90",
-      "severity": "amber",
+      "severity": "warn",
       "threshold": 90
     }
   ],

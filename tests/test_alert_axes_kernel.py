@@ -46,13 +46,15 @@ def test_registry_has_four_axes_in_order():
     ]
 
 
-def test_severity_policy_matches_legacy_amber_red_split():
+def test_severity_for_three_tier_bands():
     m = _load("_lib_alert_axes")
-    # Legacy hardcoded rule: <95 amber, >=95 red (axis-uniform).
-    assert m.severity_for(90) == "amber"
-    assert m.severity_for(94) == "amber"
-    assert m.severity_for(95) == "red"
-    assert m.severity_for(100) == "red"
+    assert m.severity_for(0) == "info"
+    assert m.severity_for(89) == "info"
+    assert m.severity_for(90) == "warn"
+    assert m.severity_for(95) == "warn"
+    assert m.severity_for(99) == "warn"      # non-vacuity: just below the floor
+    assert m.severity_for(100) == "critical" # the >=100 floor
+    assert m.severity_for(150) == "critical"
 
 
 def test_descriptor_exposes_chip_and_table_metadata():

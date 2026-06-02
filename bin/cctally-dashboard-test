@@ -352,14 +352,14 @@ for a in proj:
             errs.append(f"projected context missing {k}: {a}")
     if "metric" not in a:
         errs.append(f"projected alert missing top-level metric: {a}")
-# Task F: every envelope alert (all axes) carries the additive `severity`
-# field from the kernel `severity_for` (amber <95 / red >=95), the single
-# severity authority the frontend now consumes instead of recomputing.
+# Phase B: every envelope alert carries the 3-tier `severity` from the kernel
+# severity_for (info <90 / warn 90-99 / critical >=100).
 for a in alerts:
     sev = a.get("severity")
-    if sev not in ("amber", "red"):
+    if sev not in ("info", "warn", "critical"):
         errs.append(f"alert missing/invalid severity: {a}")
-    expected = "red" if int(a.get("threshold", 0)) >= 95 else "amber"
+    t = int(a.get("threshold", 0))
+    expected = "critical" if t >= 100 else ("warn" if t >= 90 else "info")
     if sev != expected:
         errs.append(f"severity {sev!r} != expected {expected!r}: {a}")
 s = d.get("alerts_settings") or {}
