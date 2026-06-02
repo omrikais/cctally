@@ -1273,6 +1273,7 @@ def build_parser() -> argparse.ArgumentParser:
               cctally budget
               cctally budget set 300
               cctally budget unset
+              cctally budget set 25 --project
               cctally budget --json
               cctally budget --format md
             """
@@ -1290,8 +1291,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set/unset a per-project budget for this git repo "
              "(bare = current directory's git-root; or pass a path).")
     bg.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
-                    help="Accepted for --format surface parity; inert for budget "
-                         "(no per-project axis).")
+                    help="Show real project basenames in the per-project section "
+                         "of --format output (default anonymizes to project-1/…).")
     bg.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
                     help="Display timezone: local, utc, or IANA name. "
                          "Overrides config display.tz for this call.")

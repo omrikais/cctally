@@ -308,23 +308,54 @@ def test_budget_set_project_explicit_path(pjns):
     assert projects.get(key) == 10.0
 
 
-def test_budget_unset_project_removes_key(pjns):
-    """`budget unset --project /tmp/x` removes the configured key; idempotent."""
+def test_budget_set_project_explicit_subdir_resolves_to_git_root(pjns, tmp_path):
+    """IMPORTANT-2 regression: `budget set 25 --project <monorepo>/packages/foo`
+    (a SUB-DIRECTORY of a git-root) stores the GIT-ROOT key, not the sub-dir —
+    so `_sum_cost_by_project` (which buckets entries under the git-root) can
+    ever match it. Without git-root resolution on the explicit-path branch the
+    stored sub-dir key never matches → permanent $0."""
+    monorepo = tmp_path / "monorepo"
+    (monorepo / ".git").mkdir(parents=True)
+    subdir = monorepo / "packages" / "foo"
+    subdir.mkdir(parents=True)
+    rc = pjns["cmd_budget"](
+        _pj_budget_args(action="set", amount="25", project=str(subdir))
+    )
+    assert rc == 0
+    projects = _pj_read_projects(pjns)
+    git_root = os.path.realpath(str(monorepo))
+    sub_key = os.path.realpath(str(subdir))
+    # Stored under the git-root, NOT the sub-dir path.
+    assert projects.get(git_root) == 25.0
+    assert sub_key not in projects
+
+
+def test_budget_unset_project_removes_key(pjns, capsys):
+    """`budget unset --project /tmp/x` removes the configured key; idempotent.
+
+    The FIRST unset reports ``status:"unset"``; a SECOND unset of the
+    already-absent key is an idempotent no-op success reporting
+    ``status:"noop"`` (still exit 0)."""
     pjns["cmd_budget"](
         _pj_budget_args(action="set", amount="10", project="/tmp/x")
     )
     key = os.path.realpath(os.path.expanduser("/tmp/x"))
     assert key in _pj_read_projects(pjns)
+    capsys.readouterr()  # drain the `set` stdout so the unset JSON reads clean
     rc = pjns["cmd_budget"](
-        _pj_budget_args(action="unset", project="/tmp/x")
+        _pj_budget_args(action="unset", project="/tmp/x", json=True)
     )
     assert rc == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first == {"status": "unset", "project_key": key}
     assert key not in _pj_read_projects(pjns)
-    # idempotent: unsetting again is a no-op success.
+    # idempotent: unsetting again is a no-op success with status "noop".
     rc2 = pjns["cmd_budget"](
-        _pj_budget_args(action="unset", project="/tmp/x")
+        _pj_budget_args(action="unset", project="/tmp/x", json=True)
     )
     assert rc2 == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second == {"status": "noop", "project_key": key}
 
 
 # ── display section (terminal + project-only + --json) ──────────────────────
@@ -499,3 +530,85 @@ def test_budget_share_reveal_projects_shows_real_names(pjns, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "alpha" in out
+
+
+# ── same-basename collision (IMPORTANT-1 regression) ────────────────────────
+#
+# Two DISTINCT git-roots sharing a basename (`app`) must NOT render as two
+# bare `app` rows (terminal/JSON), and must NOT collapse to a single
+# `project-1` in anonymized share. Routing labels through
+# `_project_disambiguate_labels` suffixes the parent-dir segment
+# ("app (work)" / "app (personal)"). The pre-existing per-project fixtures use
+# three DISTINCT basenames (alpha/beta/gamma) so this gap was untested.
+
+
+def _pj_collision_setup(pjns):
+    """Seed two same-basename git-roots: /fake/work/app ($16.20) and
+    /fake/personal/app ($7.20), both budgeted. Returns (root_work, root_home)."""
+    _pj_seed_window(pjns)
+    root_work = os.path.realpath("/fake/work/app")
+    root_home = os.path.realpath("/fake/personal/app")
+    # 9 entries → $16.20 (work), 4 entries → $7.20 (personal).
+    _pj_seed_entries(pjns, {root_work: 9, root_home: 4})
+    _pj_write_config(pjns, {
+        "weekly_usd": 300.0, "alerts_enabled": True,
+        "alert_thresholds": [90, 100],
+        "projects": {root_work: 15.0, root_home: 20.0},
+    })
+    return root_work, root_home
+
+
+def test_budget_same_basename_json_rows_distinguishable(pjns, capsys):
+    """Two same-basename git-roots get DISTINCT `project` labels in --json
+    (not two bare `app`), each carrying its own project_key + spend."""
+    root_work, root_home = _pj_collision_setup(pjns)
+    rc = pjns["cmd_budget"](_pj_budget_args(json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    labels = [p["project"] for p in payload["projects"]]
+    # Both rows are present, and their display labels are NOT both bare `app`.
+    assert len(payload["projects"]) == 2
+    assert len(set(labels)) == 2, f"labels collided: {labels!r}"
+    assert "app" not in labels, f"bare `app` leaked (no disambiguation): {labels!r}"
+    by_key = {p["project_key"]: p["project"] for p in payload["projects"]}
+    # Disambiguated by parent-dir segment.
+    assert by_key[root_work] == "app (work)"
+    assert by_key[root_home] == "app (personal)"
+
+
+def test_budget_same_basename_terminal_distinguishable(pjns, capsys):
+    """The terminal per-project table shows BOTH disambiguated labels."""
+    _pj_collision_setup(pjns)
+    rc = pjns["cmd_budget"](_pj_budget_args())
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "app (work)" in out
+    assert "app (personal)" in out
+
+
+def test_budget_same_basename_share_anon_not_collapsed(pjns, capsys):
+    """Anonymized share gives the two same-basename projects DISTINCT anon
+    labels (project-1/project-2), spend-RANKED (work $16.20 > personal $7.20
+    → work=project-1) — NOT a single collapsed project-1. Proves both the
+    disambiguation (distinct ProjectCell labels survive into _collect) AND the
+    MoneyCell spend-ranking (MINOR-4) together."""
+    _pj_collision_setup(pjns)
+    rc = pjns["cmd_budget"](
+        _pj_budget_args(format="md", output="-", reveal_projects=False)
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Two distinct anon labels — never collapsed to one.
+    assert "project-1" in out
+    assert "project-2" in out
+    # The real basename never leaks under default (anonymized) output.
+    assert "app (work)" not in out
+    assert "app (personal)" not in out
+    # Spend-ranked: the higher-spend project ($16.20) is project-1, so its
+    # spend line ($16.20) sits on the project-1 row and the lower ($7.20) on
+    # project-2. A lexical (non-spend) fallback would still number them, but
+    # the MoneyCell makes the RANK deterministic by spend.
+    p1_line = next(ln for ln in out.splitlines() if "project-1" in ln)
+    p2_line = next(ln for ln in out.splitlines() if "project-2" in ln)
+    assert "$16.20" in p1_line, f"project-1 not the high-spend row: {p1_line!r}"
+    assert "$7.20" in p2_line, f"project-2 not the low-spend row: {p2_line!r}"

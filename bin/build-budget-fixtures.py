@@ -262,6 +262,32 @@ SCENARIOS = {
             "/fake/repos/gamma": 0,
         },
     ),
+    # Same-basename collision (IMPORTANT-1 regression). Two DISTINCT git-roots
+    # share the basename `app`:
+    #   /fake/work/app     —  9 entries → $16.20 on a $15 budget → 108% → over
+    #   /fake/personal/app —  4 entries → $7.20  on a $20 budget → 36%  → ok
+    # A bare `display_key` renders BOTH as `app` (terminal/JSON indistinct) and
+    # collapses BOTH to a single `project-1` in anonymized share. Routing the
+    # labels through `_project_disambiguate_labels` suffixes the parent-dir
+    # segment → `app (work)` / `app (personal)`, so terminal/JSON rows are
+    # distinguishable AND anon share gives each its own project-N number,
+    # spend-ranked (work $16.20 → project-1, personal $7.20 → project-2).
+    "per-project-collision": dict(
+        as_of=WEEK_START + dt.timedelta(hours=96),
+        budget_block={
+            "weekly_usd": 300.0, "alerts_enabled": True,
+            "alert_thresholds": [90, 100],
+            "projects": {
+                "/fake/work/app": 15.0,
+                "/fake/personal/app": 20.0,
+            },
+        },
+        n_total=0, n_recent=0, weekly_percent=40.0,
+        project_entries={
+            "/fake/work/app": 9,
+            "/fake/personal/app": 4,
+        },
+    ),
 }
 
 

@@ -33,7 +33,7 @@ import math
 import os
 import sqlite3
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from _cctally_core import (
     _command_as_of, _normalize_week_boundary_dt, compute_week_bounds,
@@ -1654,9 +1654,7 @@ def cmd_budget(args: argparse.Namespace) -> int:
                 "weekly_usd": target,
             }
             if has_projects:
-                payload["projects"] = (
-                    _project_rows_json(project_rows) if project_rows else []
-                )
+                _append_project_json(payload, project_rows)
             print(json.dumps(payload))
             return 0
         print(f"Weekly budget: ${target:,.2f} — no usage data yet this week.")
@@ -1686,14 +1684,22 @@ def cmd_budget(args: argparse.Namespace) -> int:
 def _resolve_project_budget_target(raw: str):
     """Resolve the ``--project`` value to a canonical git-root path.
 
+    BOTH branches route through ``_resolve_project_key(..., "git-root", {})``
+    so the stored key is the SAME canonical bucket ``_sum_cost_by_project``
+    buckets entries under — otherwise a sub-directory path (e.g.
+    ``~/code/monorepo/packages/foo`` under a monorepo git-root) would store
+    a key that never matches any entry, permanently rendering ``$0``.
+
     ``__CWD__`` (the bare-flag sentinel) → resolve ``os.getcwd()`` to its
-    ``.git`` root via ``_resolve_project_key``; a result that is
-    ``is_no_git``/``is_unknown`` means we're not inside a git repo → return
-    ``None`` (the caller emits the "not inside a git repository" error +
-    exit 2). An explicit path is realpath-normalized (mirrors
-    ``_resolve_project_key``'s normalization so the key matches what
-    ``_sum_cost_by_project`` buckets entries under). Returns the canonical
-    path string, or ``None`` for the not-a-repo case.
+    ``.git`` root; a result that is ``is_no_git``/``is_unknown`` (not inside
+    a git repo) → return ``None`` (the caller emits the "not inside a git
+    repository" error + exit 2).
+
+    An explicit path → resolve the same way: take ``.git_root`` when a ``.git``
+    is found (so a sub-dir path collapses onto its monorepo root), else the
+    normalized ``bucket_path`` (a path that is itself a git-root resolves to
+    itself; a genuinely non-git path keeps its normalized form). Explicit
+    paths never return ``None`` — they always resolve to a usable key.
     """
     c = _cctally()
     if raw == "__CWD__":
@@ -1701,7 +1707,8 @@ def _resolve_project_budget_target(raw: str):
         if key.is_no_git or key.is_unknown or not key.git_root:
             return None
         return key.git_root
-    return os.path.realpath(os.path.expanduser(raw))
+    key = c._resolve_project_key(raw, "git-root", {})
+    return key.git_root or key.bucket_path
 
 
 def _cmd_budget_set_project(args: argparse.Namespace) -> int:
@@ -1938,9 +1945,7 @@ def _budget_render_unset(
             "weekly_usd": None,
         }
         if has_projects:
-            payload["projects"] = (
-                _project_rows_json(project_rows) if project_rows else []
-            )
+            _append_project_json(payload, project_rows)
         print(json.dumps(payload))
         return 0
     print("No weekly budget set. Set one with: cctally budget set <amount>.")
@@ -2064,9 +2069,7 @@ def _budget_emit_json(
         "crossed_thresholds": list(status.crossed_thresholds),
     }
     if has_projects:
-        payload["projects"] = (
-            _project_rows_json(project_rows) if project_rows else []
-        )
+        _append_project_json(payload, project_rows)
     print(json.dumps(payload))
     return 0
 
@@ -2102,8 +2105,26 @@ def _build_project_budget_rows(conn, budget_cfg, now_utc):
     last24h = c._sum_cost_by_project(recent_start, now_utc, mode="auto")
     thresholds = tuple(budget_cfg["alert_thresholds"])
 
+    # Resolve every configured key to its ProjectKey ONCE, then route the
+    # display labels through the shared collision-disambiguation primitive
+    # (`_project_disambiguate_labels`, the SAME one cmd_project's table and
+    # `_build_project_snapshot` use). A bare `display_key` is just the
+    # basename, so two distinct git-roots sharing a basename (e.g.
+    # `/work/app` + `/personal/app`) would BOTH render as `app` — and in
+    # anonymized share BOTH collapse to a single `project-1`. The primitive
+    # suffixes the colliding rows with their parent-dir segment
+    # ("app (work)" / "app (personal)"); non-colliding rows keep `display_key`.
+    resolver_cache: dict = {}
+    pkeys = [
+        c._resolve_project_key(key, "git-root", resolver_cache)
+        for key in budget_cfg["projects"]
+    ]
+    disambig = c._project_disambiguate_labels(
+        [{"key": pk} for pk in pkeys]
+    )
+
     rows = []
-    for key, target in budget_cfg["projects"].items():
+    for idx, (key, target) in enumerate(budget_cfg["projects"].items()):
         inputs = c.BudgetInputs(
             target_usd=float(target),
             spent_usd=float(week.get(key, 0.0)),
@@ -2114,10 +2135,9 @@ def _build_project_budget_rows(conn, budget_cfg, now_utc):
             alert_thresholds=thresholds,
         )
         status = c.compute_budget_status(inputs)
-        # Basename (collision-disambiguation handled by display_key).
-        pk = c._resolve_project_key(key, "git-root", {})
+        label = disambig.get(idx, pkeys[idx].display_key)
         rows.append({
-            "project": pk.display_key,
+            "project": label,
             "project_key": key,
             "budget_usd": float(target),
             "spent_usd": status.spent_usd,
@@ -2199,9 +2219,8 @@ def _append_project_share_rows(snap, rows, has_projects):
         return snap
     c = _cctally()
     _lib_share = c._share_load_lib()
-    new_columns = snap.columns
     # Reuse the snapshot's 2-col (Metric/Value) shape but render each project
-    # as a ProjectCell in the metric column + its consumption in the value.
+    # as a ProjectCell in the metric column + its spend in the value.
     extra_rows = []
     # A header-ish separator row keeps the per-project block visually distinct
     # without changing the column schema.
@@ -2211,8 +2230,19 @@ def _append_project_share_rows(snap, rows, has_projects):
     }))
     for r in rows:
         verdict = r["verdict"].upper()
+        # `spent` is the ONLY MoneyCell in the row so
+        # `_lib_share._collect_project_costs` (which SUMS every MoneyCell in a
+        # ProjectCell row) spend-RANKs the anonymized labels by spend alone —
+        # matching the `project` share convention. A TextCell here would leave
+        # every project at cost=0, falling back to lexical ordering. Budget /
+        # consumption / verdict stay in the visible `value` TextCell (NOT a
+        # second MoneyCell — that would inflate the rank key to spent+budget).
+        # The 2-col Metric/Value table renders only `metric` + `value`, so the
+        # extra `spent` cell is invisible in the artifact while the Value
+        # column keeps the full "spent / budget (pct) VERDICT" string.
         extra_rows.append(_lib_share.Row(cells={
             "metric": _lib_share.ProjectCell(r["project"]),
+            "spent": _lib_share.MoneyCell(r["spent_usd"]),
             "value": _lib_share.TextCell(
                 f"${r['spent_usd']:,.2f} / ${r['budget_usd']:,.2f} "
                 f"({r['consumption_pct']:.0f}%) {verdict}"
@@ -2223,8 +2253,19 @@ def _append_project_share_rows(snap, rows, has_projects):
 
 def _replace_snapshot_rows(snap, rows):
     """Return a copy of ``snap`` with ``rows`` replaced (frozen dataclass)."""
-    import dataclasses
-    return dataclasses.replace(snap, rows=rows)
+    return replace(snap, rows=rows)
+
+
+def _append_project_json(payload: dict, project_rows) -> None:
+    """Attach the additive ``projects[]`` array to a budget ``--json`` payload
+    (spec §7.4). Always present when this helper is called (the caller has
+    already gated on ``has_projects``); empty ``project_rows`` → ``[]`` so a
+    project-only configuration with no resolvable rows still emits the key.
+    Single chokepoint for the three ``--json`` paths (full status / no-data /
+    unset) so the append shape stays identical across them."""
+    payload["projects"] = (
+        _project_rows_json(project_rows) if project_rows else []
+    )
 
 
 def _project_rows_json(rows) -> list:

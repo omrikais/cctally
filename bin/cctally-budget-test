@@ -124,13 +124,13 @@ run_format_mode "fmt-svg-dark"   "--format svg --theme dark --output -"   "fmt-s
 # anonymization chokepoint: default anonymizes (project-1/…), --reveal-projects
 # shows real basenames. Cover BOTH so the scrubber path stays golden.
 run_project_format_mode () {
-    local label="$1" flags="$2" golden_suffix="$3"
-    local fx_home="$SCRATCH_DIR/per-project"
+    local fixture="$1" label="$2" flags="$3" golden_suffix="$4"
+    local fx_home="$SCRATCH_DIR/$fixture"
     local as_of=""
     # shellcheck disable=SC1091
-    . "$HARNESS_FIXTURES_DIR/per-project/input.env"
+    . "$HARNESS_FIXTURES_DIR/$fixture/input.env"
     as_of="$AS_OF"
-    local golden="$HARNESS_FIXTURES_DIR/per-project/golden-$golden_suffix.txt"
+    local golden="$HARNESS_FIXTURES_DIR/$fixture/golden-$golden_suffix.txt"
     local raw actual
     # shellcheck disable=SC2086
     raw=$(HOME="$fx_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$as_of" \
@@ -144,12 +144,12 @@ run_project_format_mode () {
     fi
     if [ -n "${HARNESS_REGEN:-}" ]; then
         printf '%s\n' "$actual" > "$golden"
-        echo "REGEN per-project/$label"
+        echo "REGEN $fixture/$label"
         pass_count=$((pass_count + 1))
         return 0
     fi
     if [ ! -f "$golden" ]; then
-        echo "MISSING GOLDEN per-project/$label"
+        echo "MISSING GOLDEN $fixture/$label"
         fail_count=$((fail_count + 1))
         return 1
     fi
@@ -157,13 +157,19 @@ run_project_format_mode () {
         fail_count=$((fail_count + 1))
         return 1
     fi
-    echo "PASS per-project/$label"
+    echo "PASS $fixture/$label"
     pass_count=$((pass_count + 1))
     return 0
 }
 
-run_project_format_mode "fmt-md-anon"   "--format md"                  "fmt-md-anon"
-run_project_format_mode "fmt-md-reveal" "--format md --reveal-projects" "fmt-md-reveal"
+run_project_format_mode "per-project" "fmt-md-anon"   "--format md"                  "fmt-md-anon"
+run_project_format_mode "per-project" "fmt-md-reveal" "--format md --reveal-projects" "fmt-md-reveal"
+
+# Same-basename collision (IMPORTANT-1 regression): two distinct git-roots
+# named `app` must NOT collapse to one `project-1` after anonymization, and
+# must show their disambiguated parent-dir suffix under --reveal-projects.
+run_project_format_mode "per-project-collision" "fmt-md-anon"   "--format md"                  "fmt-md-anon"
+run_project_format_mode "per-project-collision" "fmt-md-reveal" "--format md --reveal-projects" "fmt-md-reveal"
 
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
