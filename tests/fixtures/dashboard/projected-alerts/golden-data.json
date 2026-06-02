@@ -51,11 +51,13 @@
       90,
       100
     ],
+    "command_configured": false,
     "enabled": true,
     "five_hour_thresholds": [
       90,
       95
     ],
+    "notifier": "auto",
     "projected_budget_enabled": true,
     "projected_weekly_enabled": true,
     "weekly_thresholds": [

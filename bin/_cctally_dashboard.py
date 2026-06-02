@@ -4687,6 +4687,12 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
             "weekly_thresholds": [],
             "five_hour_thresholds": [],
             "projected_enabled": False,
+            # Mirror the dispatch keys so the new alerts_settings lines
+            # (`notifier` / `command_configured`) don't KeyError on a
+            # corrupt config. Safe defaults: no notifier override, no
+            # configured command.
+            "notifier": "auto",
+            "command_template": None,
         }
     # Budget is its OWN config block (issue #19) — source budget fields
     # from ``_get_budget_config`` (the validated ``budget`` block), NOT
@@ -4708,6 +4714,15 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # from the validated getters' ``projected_enabled`` (default False).
         "projected_weekly_enabled": bool(_alerts_cfg.get("projected_enabled")),
         "projected_budget_enabled": bool(_budget_cfg.get("projected_enabled")),
+        # Alert-dispatch notifier mirror (Phase B). `notifier` is the
+        # validated backend selector ("auto"/"command"/etc.). The raw
+        # `command_template` is NEVER mirrored — it routinely holds secrets
+        # (webhook URLs, bearer tokens) and the SSE snapshot is broadcast to
+        # every connected client. We expose only a boolean: is a custom
+        # command configured? (the CLI/config remains the sole writer of the
+        # template itself).
+        "notifier":           _alerts_cfg["notifier"],
+        "command_configured": _alerts_cfg.get("command_template") is not None,
     }
 
     # Mirror update-state.json + update-suppress.json into the envelope
@@ -5487,6 +5502,27 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     {"error": "alerts.projected_enabled must be a JSON boolean"},
                 )
                 return
+            # The dispatch command template is CLI/config-only — never
+            # settable via the dashboard (it routinely holds secrets and the
+            # dashboard echoes settings to the client). Reject it explicitly
+            # rather than silently dropping it.
+            if "command_template" in alerts_block:
+                self._respond_json(
+                    400,
+                    {"error": "alerts.command_template is CLI/config-only "
+                              "(not settable via the dashboard)"},
+                )
+                return
+            # `notifier` is settable (the backend selector). Structural type
+            # check only; the enum + cross-field rule (command needs a stored
+            # template) is enforced free by `_get_alerts_config(merged)` below.
+            if "notifier" in alerts_block and not isinstance(
+                alerts_block["notifier"], str
+            ):
+                self._respond_json(
+                    400, {"error": "alerts.notifier must be a string"}
+                )
+                return
 
         # Pre-validate budget shape (the structural type check; full
         # cross-key validation runs inside the lock via
@@ -5602,6 +5638,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     merged_alerts["projected_enabled"] = (
                         alerts_in["projected_enabled"]
                     )
+                if "notifier" in alerts_in:
+                    merged_alerts["notifier"] = alerts_in["notifier"]
                 merged["alerts"] = merged_alerts
                 # Final cross-field validation against the merged block.
                 # _AlertsConfigError → 400 (no partial write since
@@ -5703,7 +5741,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 merged, dt.datetime.now(dt.timezone.utc)
             )
         if "alerts" in payload:
-            out["alerts"] = _get_alerts_config(merged)
+            # Echo the full validated alerts block (defaults filled) so the
+            # SettingsOverlay can repaint without a follow-up GET — but
+            # redact the raw `command_template` (secrets) the same way the
+            # SSE snapshot mirror does: replace it with a boolean
+            # `command_configured`.
+            _a = dict(_get_alerts_config(merged))
+            _a["command_configured"] = _a.pop("command_template", None) is not None
+            out["alerts"] = _a
         if "budget" in payload:
             # Echo the full validated budget block (defaults filled) so the
             # SettingsOverlay can repaint without a follow-up GET.

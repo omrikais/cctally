@@ -369,6 +369,21 @@ if pw is not True:
     errs.append("projected_weekly_enabled != True: %r" % (pw,))
 if pb is not True:
     errs.append("projected_budget_enabled != True: %r" % (pb,))
+# Phase B (Task 4): the alert notifier is mirrored into alerts_settings as
+# a plain string; the raw command_template is NEVER mirrored (secret-leak
+# guard) -- only a boolean command_configured. This fixture config sets
+# no notifier, so the default auto must surface; with no command_template
+# stored, command_configured is False.
+if s.get("notifier") != "auto":
+    errs.append("alerts_settings.notifier != auto: %r" % (s.get("notifier"),))
+if "command_configured" not in s:
+    errs.append("alerts_settings missing command_configured")
+if s.get("command_configured") is not False:
+    errs.append("alerts_settings.command_configured != False: %r"
+                % (s.get("command_configured"),))
+if "command_template" in s:
+    errs.append("alerts_settings leaks raw command_template: %r"
+                % (s.get("command_template"),))
 if errs:
     sys.exit("; ".join(errs))
 print("ok")
@@ -418,6 +433,75 @@ print("ok")
             -d '{"alerts":{"projected_enabled":"yes"}}' "$base/api/settings")
         if [ "$bad_code" != "400" ]; then
             echo "FAIL $name: POST /api/settings non-bool projected returned $bad_code (expected 400)"
+            ok=0
+        fi
+
+        # Phase B (Task 4): notifier round-trip. Setting a valid notifier
+        # persists + echoes it back, and the echo carries command_configured
+        # (never the raw command_template). This fixture stores no template,
+        # so command_configured stays False.
+        local notif_raw notif_check
+        notif_raw=$(curl -s --max-time 5 \
+            -X POST -H "Origin: http://127.0.0.1:$port" \
+            -H "Content-Type: application/json" \
+            -d '{"alerts":{"notifier":"notify-send"}}' "$base/api/settings")
+        notif_check=$(printf '%s' "$notif_raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+a = d.get("alerts") or {}
+errs = []
+if a.get("notifier") != "notify-send":
+    errs.append("echo alerts.notifier != notify-send: %r" % (a.get("notifier"),))
+if "command_configured" not in a:
+    errs.append("echo alerts missing command_configured")
+if a.get("command_configured") is not False:
+    errs.append("echo alerts.command_configured != False: %r"
+                % (a.get("command_configured"),))
+if "command_template" in a:
+    errs.append("echo leaks raw command_template: %r" % (a.get("command_template"),))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+        if [ "$notif_check" != "ok" ]; then
+            echo "FAIL $name: POST /api/settings notifier round-trip: $notif_check (raw: $notif_raw)"
+            ok=0
+        fi
+
+        # Reject an invalid notifier enum with 400 (enforced free by
+        # _get_alerts_config(merged) inside the lock; no partial write).
+        local bad_notif_code
+        bad_notif_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+            -X POST -H "Origin: http://127.0.0.1:$port" \
+            -H "Content-Type: application/json" \
+            -d '{"alerts":{"notifier":"bogus"}}' "$base/api/settings")
+        if [ "$bad_notif_code" != "400" ]; then
+            echo "FAIL $name: POST /api/settings bogus notifier returned $bad_notif_code (expected 400)"
+            ok=0
+        fi
+
+        # Reject attempts to set the raw command_template via the dashboard
+        # (CLI/config-only — secret-leak guard) with 400.
+        local tmpl_code
+        tmpl_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+            -X POST -H "Origin: http://127.0.0.1:$port" \
+            -H "Content-Type: application/json" \
+            -d '{"alerts":{"command_template":["x"]}}' "$base/api/settings")
+        if [ "$tmpl_code" != "400" ]; then
+            echo "FAIL $name: POST /api/settings command_template returned $tmpl_code (expected 400)"
+            ok=0
+        fi
+
+        # Cross-field: notifier=command with no stored command_template must
+        # 400 (this fixture config has no template). Enforced free by
+        # _get_alerts_config(merged).
+        local cross_code
+        cross_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+            -X POST -H "Origin: http://127.0.0.1:$port" \
+            -H "Content-Type: application/json" \
+            -d '{"alerts":{"notifier":"command"}}' "$base/api/settings")
+        if [ "$cross_code" != "400" ]; then
+            echo "FAIL $name: POST /api/settings notifier=command (no template) returned $cross_code (expected 400)"
             ok=0
         fi
     fi
