@@ -359,40 +359,73 @@ def test_detection_does_not_fire_below_threshold(ns, tmp_path):
     assert parts == [week_start_date, "26.0"], parts
 
 
-def test_detection_fires_on_reset_to_zero_below_threshold(ns, tmp_path):
-    """prior=14, cur=0 (drop 14pp < 25pp threshold) BUT the post value
-    collapses to ~0 with the SAME week_end_at: an Anthropic surprise
-    reset, not stale-replica noise. The reset-to-zero branch fires below
-    the 25pp gate — writes an event row, lands the 0% seed via the
-    reset-aware clamp, and force-writes hwm-7d.
-
-    Regression for the 2026-06-01 surprise reset: a light user at 14%
-    was reset to 0 and the 25pp-only gate silently masked it (the
-    monotonic clamp kept reporting the stale 14%).
-    """
+def test_reset_to_zero_lone_zero_arms_no_fire(ns, tmp_path):
+    """#128: a LONE transient ~0 (14→0) ARMS the marker but does NOT fire.
+    No event row, hwm unchanged (clamp holds the suppressed 0), marker present
+    with the end boundary + baseline. This is the non-vacuity anchor: under the
+    pre-debounce code this single zero fired immediately."""
     end_iso, end_epoch = _future_week_end_iso()
     week_start_date, _ = _week_start_for(end_iso)
 
     conn = ns["open_db"]()
     try:
         _seed_usage_snapshot(
-            conn,
-            captured_at_utc="2026-05-14T10:00:00Z",
-            week_start_date=week_start_date,
-            week_end_at=end_iso,
+            conn, captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date, week_end_at=end_iso,
             weekly_percent=14.0,
         )
         conn.commit()
     finally:
         conn.close()
+    (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
 
-    hwm_path = ns["APP_DIR"] / "hwm-7d"
-    hwm_path.write_text(f"{week_start_date} 14.0\n")
-
-    args = _record_usage_args(percent=0.0, resets_at=end_epoch)
-    rc = ns["cmd_record_usage"](args)
+    rc = ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch))
     assert rc == 0
 
+    conn = ns["open_db"]()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert (ns["APP_DIR"] / "hwm-7d").read_text().strip().split() == [week_start_date, "14.0"]
+
+    import _cctally_record as rec
+    marker = rec._read_reset_zero_marker()
+    assert marker is not None
+    assert marker[0] == week_start_date          # week
+    assert marker[2] == 14.0                      # baseline
+
+
+def test_detection_fires_on_reset_to_zero_below_threshold(ns, tmp_path):
+    """#128 (rewritten): two consecutive ~0 readings (14→0→0) CONFIRM and fire.
+    Drop 14pp < 25pp, so this exercises the debounced reset-to-zero path, not
+    the 25pp path. After the second zero: one event row (old==effective,
+    new==end, distinct), the post-reset 0 lands, hwm=0, marker cleared."""
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn, captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date, week_end_at=end_iso,
+            weekly_percent=14.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
+
+    # Tick 1: arm.
+    assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0
+    conn = ns["open_db"]()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    # Tick 2: confirm + fire.
+    assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0
     conn = ns["open_db"]()
     try:
         events = conn.execute(
@@ -400,21 +433,245 @@ def test_detection_fires_on_reset_to_zero_below_threshold(ns, tmp_path):
             "FROM week_reset_events"
         ).fetchall()
         assert len(events) == 1, events
-        # Same in-place credit row shape as the ≥25pp path: old ==
-        # effective, new == cur_end_canon (DISTINCT).
         assert events[0]["new_week_end_at"] == end_iso
         assert events[0]["old_week_end_at"] == events[0]["effective_reset_at_utc"]
         assert events[0]["old_week_end_at"] != events[0]["new_week_end_at"]
-
-        cnt = conn.execute(
+        assert conn.execute(
             "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE weekly_percent = 0.0"
-        ).fetchone()[0]
-        assert cnt == 1, "post-reset 0% reading should have landed"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+    assert (ns["APP_DIR"] / "hwm-7d").read_text().strip().split() == [week_start_date, "0.0"]
+
+    import _cctally_record as rec
+    assert rec._read_reset_zero_marker() is None    # cleared after fire
+
+
+def test_reset_to_zero_stayed_low_confirms(ns, tmp_path):
+    """#128 §2.1 regression guard: 14→0→2. The second reading 2 (<= 14/2) is a
+    real reset that started climbing — it CONFIRMS (fires) so the display
+    corrects to 2 instead of being stuck at 14."""
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn, captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date, week_end_at=end_iso, weekly_percent=14.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
+
+    assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0  # arm
+    assert ns["cmd_record_usage"](_record_usage_args(percent=2.0, resets_at=end_epoch)) == 0  # confirm
+    conn = ns["open_db"]()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 1
+    finally:
+        conn.close()
+    assert (ns["APP_DIR"] / "hwm-7d").read_text().strip().split() == [week_start_date, "2.0"]
+
+
+def test_reset_to_zero_recovery_clears(ns, tmp_path):
+    """#128: 14→0→14 (transient zero recovered to baseline). The marker arms on
+    the 0 then CLEARS on the 14 (> 14/2): no event ever, hwm stays 14, marker
+    gone. This is the transient-API-zero case the debounce exists to suppress."""
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn, captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date, week_end_at=end_iso, weekly_percent=14.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
+
+    assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0   # arm
+    assert ns["cmd_record_usage"](_record_usage_args(percent=14.0, resets_at=end_epoch)) == 0  # recover
+    conn = ns["open_db"]()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert (ns["APP_DIR"] / "hwm-7d").read_text().strip().split() == [week_start_date, "14.0"]
+    import _cctally_record as rec
+    assert rec._read_reset_zero_marker() is None    # cleared on recovery
+
+
+def test_reset_to_zero_near_recovery_clears(ns, tmp_path):
+    """#128 midpoint boundary: 14→0→13 (13 > 14/2=7) CLEARS — recovered to
+    within the baseline band, no fire. Pairs with the 14→0→2 case to pin the
+    midpoint threshold from both sides."""
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn, captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date, week_end_at=end_iso, weekly_percent=14.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
+
+    assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0   # arm
+    assert ns["cmd_record_usage"](_record_usage_args(percent=13.0, resets_at=end_epoch)) == 0  # near-recover
+    conn = ns["open_db"]()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 0
     finally:
         conn.close()
 
-    parts = hwm_path.read_text().strip().split()
-    assert parts == [week_start_date, "0.0"], parts
+
+def test_reset_to_zero_anchor_is_first_zero(ns, tmp_path, monkeypatch):
+    """#128: the effective_reset_at_utc is floored from the FIRST-zero instant
+    (stored in the marker), not the confirmation tick. Pin the two ticks an hour
+    apart via CCTALLY_AS_OF; assert the event anchors to the first hour."""
+    # Build an end well after both pinned instants so prior_end_dt > now_utc.
+    first_zero = "2026-06-02T18:00:35+00:00"
+    confirm    = "2026-06-02T19:00:05+00:00"
+    end_dt = dt.datetime.fromisoformat("2026-06-05T18:00:00+00:00")
+    end_iso = end_dt.isoformat(timespec="seconds")
+    end_epoch = int(end_dt.timestamp())
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn, captured_at_utc="2026-06-01T10:00:00Z",
+            week_start_date=week_start_date, week_end_at=end_iso, weekly_percent=14.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
+
+    monkeypatch.setenv("CCTALLY_AS_OF", first_zero)
+    assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0  # arm
+    monkeypatch.setenv("CCTALLY_AS_OF", confirm)
+    assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0  # confirm
+
+    conn = ns["open_db"]()
+    try:
+        eff = conn.execute(
+            "SELECT effective_reset_at_utc FROM week_reset_events"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    # Floored to the FIRST-zero hour (18:00), not the confirmation hour (19:00).
+    assert eff.startswith("2026-06-02T18:00:00")
+
+
+def test_reset_to_zero_big_drop_still_fires_immediately(ns, tmp_path):
+    """#128: a ≥25pp drop to zero (30→0) takes the un-debounced big_drop path —
+    fires on the FIRST tick, no marker dependency. Proves the 25pp path is
+    untouched."""
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn, captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date, week_end_at=end_iso, weekly_percent=30.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 30.0\n")
+
+    assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0
+    conn = ns["open_db"]()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 1
+    finally:
+        conn.close()
+    assert (ns["APP_DIR"] / "hwm-7d").read_text().strip().split() == [week_start_date, "0.0"]
+
+
+def test_reset_to_zero_crash_recovery_reruns_pivots(ns, tmp_path):
+    """#128 P2a: simulate a tick that committed the event row then died before
+    clearing the marker. The next confirming zero re-runs the idempotent pivots
+    (hwm=0) and the INSERT OR IGNORE no-ops — exactly one event row, marker
+    cleared."""
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn, captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date, week_end_at=end_iso, weekly_percent=14.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
+
+    # Pre-seed the mid-fire crash state: an armed marker for this end PLUS a
+    # matching event row (the prior tick committed the event then died before
+    # clearing the marker).
+    import _cctally_record as rec
+    rec._arm_reset_zero_marker(
+        week_start_date, end_iso, baseline_pct=14.0,
+        first_zero_iso="2026-05-14T10:30:00+00:00",
+    )
+    conn = ns["open_db"]()
+    try:
+        _seed_reset_event(
+            conn, new_week_end_at=end_iso,
+            effective="2026-05-14T10:00:00+00:00",
+        )
+    finally:
+        conn.close()
+
+    # Confirming zero: pivots re-run, no duplicate event, marker cleared.
+    assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0
+    conn = ns["open_db"]()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 1
+    finally:
+        conn.close()
+    assert (ns["APP_DIR"] / "hwm-7d").read_text().strip().split() == [week_start_date, "0.0"]
+    assert rec._read_reset_zero_marker() is None
+
+
+def test_reset_to_zero_stale_marker_boundary_mismatch(ns, tmp_path):
+    """#128 P2b: a marker armed for end E1 must NOT confirm against a tick whose
+    canonical end is E2. With a mismatched end, `armed` is False, so the tick
+    re-arms a fresh E2 marker instead of firing — no event row."""
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn, captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date, week_end_at=end_iso, weekly_percent=14.0,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
+
+    # Armed marker carries a DIFFERENT end boundary than the current tick's.
+    import _cctally_record as rec
+    rec._arm_reset_zero_marker(
+        week_start_date, "2025-01-01T00:00:00+00:00", baseline_pct=14.0,
+        first_zero_iso="2026-05-14T10:30:00+00:00",
+    )
+    assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0
+    conn = ns["open_db"]()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 0
+    finally:
+        conn.close()
+    # Re-armed against the real end (E2 = this tick's canonical end).
+    marker = rec._read_reset_zero_marker()
+    assert marker is not None and marker[1] == end_iso
 
 
 def test_reset_to_zero_respects_min_drop_floor(ns, tmp_path):

@@ -2045,20 +2045,80 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                         )
                         conn.commit()
                 elif prior_end_canon and prior_end_canon == cur_end_canon:
-                    # In-place credit branch (v1.7.2). Same end_at across two
-                    # captures + >=25pp drop (or reset-to-zero) in weekly_percent
-                    # → Anthropic-issued in-place weekly credit / reset.
+                    # In-place credit branch (v1.7.2) + reset-to-zero debounce
+                    # (issue #128). Same end_at across two captures. A >=25pp drop
+                    # is a goodwill credit and fires immediately; a reset-to-zero
+                    # (post <= floor, 3..25pp drop) is debounced against a
+                    # transient API zero — armed on the first ~0, confirmed only
+                    # if the next reading stays low (<= half the pre-zero
+                    # baseline), cleared on recovery toward baseline. The gate
+                    # drops the _is_reset_drop term so the recovery-clear path is
+                    # reachable. See the spec for the midpoint rationale.
                     prior_end_dt = parse_iso_datetime(prior_end_canon, "prior.week_end_at")
-                    if (
-                        prior_end_dt > now_utc
-                        and prior_pct is not None
-                        and c._is_reset_drop(prior_pct, weekly_percent)
-                    ):
-                        _fire_in_place_credit(
-                            conn, week_start_date, cur_end_canon, weekly_percent,
-                            observed_pre_credit_pct=float(prior_pct),
-                            effective_dt=_floor_to_hour(now_utc),
+                    if prior_end_dt > now_utc and prior_pct is not None:
+                        drop = float(prior_pct) - float(weekly_percent)
+                        big_drop = drop >= c._RESET_PCT_DROP_THRESHOLD
+                        zero_only = (
+                            (not big_drop)
+                            and float(weekly_percent) <= c._RESET_ZERO_FLOOR_PCT
+                            and drop >= c._RESET_ZERO_MIN_DROP_PCT
                         )
+                        if big_drop:
+                            # >=25pp goodwill credit — fire immediately, never
+                            # debounced. Clear any pending arm (now moot).
+                            _clear_reset_zero_marker()
+                            _fire_in_place_credit(
+                                conn, week_start_date, cur_end_canon, weekly_percent,
+                                observed_pre_credit_pct=float(prior_pct),
+                                effective_dt=_floor_to_hour(now_utc),
+                            )
+                        else:
+                            marker = _read_reset_zero_marker()
+                            armed = (
+                                marker is not None
+                                and marker[0] == week_start_date
+                                and marker[1] == cur_end_canon
+                            )
+                            if armed:
+                                baseline_pct = marker[2]
+                                if float(weekly_percent) <= baseline_pct / 2.0:
+                                    # Second reading stayed low → confirm. Anchor
+                                    # the reset at the FIRST-zero instant from the
+                                    # marker (UTC-normalized like the backfill
+                                    # in-place path).
+                                    first_zero_dt = parse_iso_datetime(
+                                        marker[3], "reset_zero_marker.first_zero"
+                                    ).astimezone(dt.timezone.utc)
+                                    _fire_in_place_credit(
+                                        conn, week_start_date, cur_end_canon,
+                                        weekly_percent,
+                                        observed_pre_credit_pct=baseline_pct,
+                                        effective_dt=_floor_to_hour(first_zero_dt),
+                                    )
+                                    # Clear ONLY after the fire completes (P2a):
+                                    # a mid-fire crash leaves the marker armed so
+                                    # the next zero re-confirms + re-runs the
+                                    # idempotent pivots.
+                                    _clear_reset_zero_marker()
+                                else:
+                                    # Recovered toward baseline → transient zero,
+                                    # not a reset. Clear, do not fire.
+                                    _clear_reset_zero_marker()
+                            elif zero_only:
+                                # First ~0 → arm; do NOT fire. The write clamp
+                                # suppresses this 0 (no event row yet), so the
+                                # prior snapshot stays at the baseline and this
+                                # shape re-evaluates next tick. first_zero_iso is
+                                # the _command_as_of() value (now_utc), NOT
+                                # wall-clock — it becomes the effective anchor.
+                                _arm_reset_zero_marker(
+                                    week_start_date, cur_end_canon,
+                                    baseline_pct=float(prior_pct),
+                                    first_zero_iso=now_utc.isoformat(timespec="seconds"),
+                                )
+                            # else: not a reset shape and not armed → nothing.
+                            #       A non-matching stale marker is inert (ignored
+                            #       on key mismatch, overwritten by the next arm).
 
             # ── 5h in-place credit detection (parallel to weekly above) ──
             # Spec §2.2 of
