@@ -3544,7 +3544,7 @@ conn = c.open_db()
 now_dt = c._command_as_of()
 inputs = c._build_budget_status_inputs(
     conn, target_usd=target, now_utc=now_dt,
-    alert_thresholds=(90, 100), skip_sync=False,
+    alert_thresholds=(90, 100), skip_sync=True,
 )
 assert inputs is not None, "PROJECTED1 budget: _build_budget_status_inputs returned None"
 status = c.compute_budget_status(inputs)

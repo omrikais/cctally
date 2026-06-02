@@ -3,7 +3,7 @@ import { Modal } from '../modals/Modal';
 import { getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt } from '../lib/fmt';
-import { AXIS_CHIP_LABEL, projectedContextText } from '../lib/alertAxis';
+import { alertSeverity, AXIS_CHIP_LABEL, projectedContextText } from '../lib/alertAxis';
 import type { AlertEntry } from '../types/envelope';
 
 // Recent alerts modal — full history (last 100). ESC and backdrop
@@ -17,7 +17,9 @@ import type { AlertEntry } from '../types/envelope';
 // `context.primary_model` happens to be present — the rule is
 // "never depend on primary_model for envelope-sourced 5h rows."
 //
-// Threshold severity is amber<95, red>=95 (chip-class on the % cell).
+// Severity (chip-class on the % cell) comes from the kernel via
+// `alertSeverity(a)` — consumes `alert.severity` (amber<95/red>=95), with a
+// threshold-derivation fallback for stale envelopes. See lib/alertAxis.ts.
 
 const ALERTS_MODAL_CAP = 100;
 
@@ -144,7 +146,7 @@ export function RecentAlertsModal(): JSX.Element {
           </thead>
           <tbody>
             {alerts.map((a) => {
-              const severity = a.threshold >= 95 ? 'red' : 'amber';
+              const severity = alertSeverity(a);
               return (
                 <tr key={a.id} className="alert-modal-row">
                   <td

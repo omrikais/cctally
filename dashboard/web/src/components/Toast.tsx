@@ -4,6 +4,7 @@ import { OnboardingToast } from './OnboardingToast';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt } from '../lib/fmt';
 import {
+  alertSeverity,
   AXIS_CHIP_LABEL,
   AXIS_TITLE_LABEL,
   projectedContextText,
@@ -41,7 +42,7 @@ export function Toast() {
       )}
       {toast?.kind === 'alert' && (
         <div
-          className={`toast toast--alert toast--severity-${toast.payload.threshold >= 95 ? 'red' : 'amber'}`}
+          className={`toast toast--alert toast--severity-${alertSeverity(toast.payload)}`}
           role="alert"
           onClick={() => dispatch({ type: 'HIDE_TOAST' })}
         >

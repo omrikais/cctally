@@ -150,6 +150,11 @@ export interface AlertEntry {
   id: string;                    // "axis:window_key:threshold"
   axis: AlertAxis;
   threshold: number;             // integer in [1, 100]
+  // Severity color authority (Task F): emitted by the Python kernel's
+  // `severity_for(threshold)` (amber <95 / red >=95). Optional so a stale
+  // envelope (older server) still renders — consumers fall back to deriving
+  // it from `threshold` when absent. See lib/alertAxis.ts `alertSeverity`.
+  severity?: 'amber' | 'red';
   crossed_at: string;            // ISO-8601 UTC
   alerted_at: string;            // ISO-8601 UTC
   // Projected axis (issue #121): top-level metric discriminator. Absent on

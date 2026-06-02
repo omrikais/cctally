@@ -11,6 +11,7 @@
       },
       "crossed_at": "2026-04-16T12:00:00Z",
       "id": "budget:2026-04-13T14:00:00Z:90",
+      "severity": "amber",
       "threshold": 90
     }
   ],

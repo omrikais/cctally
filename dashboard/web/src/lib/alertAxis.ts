@@ -23,6 +23,17 @@ export const AXIS_TITLE_LABEL: Record<AlertAxis, string> = {
   projected: 'Projected',
 };
 
+// Single severity authority (Task F). The Python kernel
+// `bin/_lib_alert_axes.py::severity_for` emits `alert.severity`
+// ('amber' | 'red') on every envelope item; this helper consumes it so the
+// frontend never recomputes the amber<95 / red>=95 split independently. The
+// `threshold` fallback keeps rendering safe when the envelope predates the
+// `severity` field (stale server) — it reproduces the EXACT same rule, so the
+// rendered color is byte-identical either way.
+export function alertSeverity(alert: AlertEntry): 'amber' | 'red' {
+  return alert.severity ?? (alert.threshold >= 95 ? 'red' : 'amber');
+}
+
 // Metric-aware renderer for the `projected` axis (Codex P2-2). The
 // chip/title maps above are text-only; they don't cover the context + cost
 // cells, which the modal and toast still branch by axis to build. Rather

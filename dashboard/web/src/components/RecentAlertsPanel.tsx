@@ -2,7 +2,7 @@ import { useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt } from '../lib/fmt';
-import { AXIS_CHIP_LABEL } from '../lib/alertAxis';
+import { alertSeverity, AXIS_CHIP_LABEL } from '../lib/alertAxis';
 import { PANEL_REGISTRY } from '../lib/panelRegistry';
 import { PanelGrip } from './PanelGrip';
 
@@ -104,7 +104,7 @@ export function RecentAlertsPanel(): JSX.Element {
         ) : (
           <ul className="alerts-list">
             {alerts.map((a) => {
-              const severity = a.threshold >= 95 ? 'red' : 'amber';
+              const severity = alertSeverity(a);
               return (
                 <li key={a.id} className="alert-row">
                   <span

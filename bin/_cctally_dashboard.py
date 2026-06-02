@@ -4065,6 +4065,199 @@ def _select_current_block_for_envelope(
     }
 
 
+# === Alerts-envelope per-axis row-mappers (Task F) =========================
+# Each mapper turns one axis's ``alerted_at IS NOT NULL`` milestone rows into
+# the shared envelope-item dicts. The SQL is genuinely heterogeneous per axis
+# (Codex P0-3: distinct columns, JOINs, id shapes), so the registry unifies the
+# *set* of axes + their ``milestone_table`` + the shared ``severity_for``
+# authority, not the query itself. ``descriptor.milestone_table`` drives each
+# ``FROM`` clause so the table name lives in the registry, not inlined here.
+
+
+def _envelope_rows_weekly(conn, descriptor, limit, severity_for) -> list[dict]:
+    # ``reset_event_id`` (v1.7.2) segments the same (week, threshold)
+    # across pre-credit (0) and post-credit (event.id) cohorts, both
+    # of which can be alerted. The envelope id must include the
+    # segment so React's <li key={a.id}> / <tr key={a.id}> doesn't
+    # collide on the duplicate (week, threshold) pair. Older clients
+    # tolerate longer ids — the id is opaque to them; only the React
+    # key uniqueness invariant matters.
+    rows = conn.execute(
+        f"""
+        SELECT week_start_date, percent_threshold, captured_at_utc,
+               alerted_at, cumulative_cost_usd, reset_event_id
+        FROM {descriptor.milestone_table}
+        WHERE alerted_at IS NOT NULL
+        ORDER BY alerted_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        threshold = int(r["percent_threshold"])
+        cumulative = float(r["cumulative_cost_usd"])
+        dpp = (cumulative / threshold) if threshold else None
+        out.append({
+            "id": f"weekly:{r['week_start_date']}:{threshold}:{r['reset_event_id']}",
+            "axis": descriptor.id,
+            "threshold": threshold,
+            "severity": severity_for(threshold),
+            "crossed_at": r["captured_at_utc"],
+            "alerted_at": r["alerted_at"],
+            "context": {
+                "week_start_date":     r["week_start_date"],
+                "cumulative_cost_usd": cumulative,
+                "dollars_per_percent": dpp,
+                # Round-3: parallel to the 5h context block below — both
+                # axes now expose ``reset_event_id`` so downstream
+                # clients (panel, modal, third-party consumers) can
+                # discriminate pre- vs post-credit crossings of the
+                # same (week, threshold) without scraping the
+                # envelope ``id`` string. 0 = pre-credit / no-event;
+                # event.id = post-credit segment.
+                "reset_event_id":      int(r["reset_event_id"]),
+            },
+        })
+    return out
+
+
+def _envelope_rows_five_hour(conn, descriptor, limit, severity_for) -> list[dict]:
+    # Site F (spec §3.2 bucket C / §3.3): widen the row identity to
+    # include ``reset_event_id`` so post-credit (seg=event.id) crossings
+    # of the same (window_key, threshold) don't collide with pre-credit
+    # (seg=0) crossings on the React row key. Older clients tolerate
+    # longer ids — the id is opaque to them; only the React key
+    # uniqueness invariant matters. Mirrors the weekly precedent.
+    rows = conn.execute(
+        f"""
+        SELECT m.five_hour_window_key, m.percent_threshold, m.captured_at_utc,
+               m.alerted_at, m.block_cost_usd, m.reset_event_id,
+               b.block_start_at
+        FROM {descriptor.milestone_table} m
+        LEFT JOIN five_hour_blocks b ON b.five_hour_window_key = m.five_hour_window_key
+        WHERE m.alerted_at IS NOT NULL
+        ORDER BY m.alerted_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        threshold = int(r["percent_threshold"])
+        out.append({
+            "id":          (
+                f"five_hour:{int(r['five_hour_window_key'])}:"
+                f"{threshold}:{int(r['reset_event_id'])}"
+            ),
+            "axis":        descriptor.id,
+            "threshold":   threshold,
+            "severity":    severity_for(threshold),
+            "crossed_at":  r["captured_at_utc"],
+            "alerted_at":  r["alerted_at"],
+            "context": {
+                "five_hour_window_key": int(r["five_hour_window_key"]),
+                "block_start_at":       r["block_start_at"] or "",
+                "block_cost_usd":       float(r["block_cost_usd"] or 0.0),
+                "reset_event_id":       int(r["reset_event_id"]),
+            },
+        })
+    return out
+
+
+def _envelope_rows_budget(conn, descriptor, limit, severity_for) -> list[dict]:
+    # Third axis (issue #19): equiv-$ budget threshold crossings. Budget
+    # alerts are keyed by the effective (post-reset) week_start_at + the
+    # integer threshold; the envelope id mirrors the dispatch payload's
+    # ``budget:<week_start_at>:<threshold>`` shape
+    # (``_build_alert_payload_budget``). No ``reset_event_id`` segment —
+    # a mid-week reset re-anchors ``week_start_at`` so the new window
+    # naturally gets fresh rows under ``UNIQUE(week_start_at, threshold)``.
+    rows = conn.execute(
+        f"""
+        SELECT week_start_at, threshold, crossed_at_utc, alerted_at,
+               budget_usd, spent_usd, consumption_pct
+        FROM {descriptor.milestone_table}
+        WHERE alerted_at IS NOT NULL
+        ORDER BY alerted_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        threshold = int(r["threshold"])
+        out.append({
+            "id":         f"budget:{r['week_start_at']}:{threshold}",
+            "axis":       descriptor.id,
+            "threshold":  threshold,
+            "severity":   severity_for(threshold),
+            "crossed_at": r["crossed_at_utc"],
+            "alerted_at": r["alerted_at"],
+            "context": {
+                "week_start_at":   r["week_start_at"],
+                "budget_usd":      float(r["budget_usd"]),
+                "spent_usd":       float(r["spent_usd"]),
+                "consumption_pct": float(r["consumption_pct"]),
+            },
+        })
+    return out
+
+
+def _envelope_rows_projected(conn, descriptor, limit, severity_for) -> list[dict]:
+    # Fourth axis (issue #121): projected-pace threshold crossings. Like
+    # budget, projected alerts re-anchor ``week_start_at`` on a mid-week
+    # reset, so there is NO ``reset_event_id`` segment — the new window gets
+    # fresh rows under ``UNIQUE(week_start_at, metric, threshold)``. The
+    # ``metric`` discriminator (``weekly_pct`` | ``budget_usd``) drives the
+    # frontend's metric-aware context renderer; ``denominator`` +
+    # ``projected_value`` are rendered FROM THE ROW (the values snapshotted at
+    # crossing), never live config that may have changed since (Codex P0-4).
+    # The envelope id mirrors the dispatch payload's
+    # ``projected:<week_start_at>:<metric>:<threshold>`` shape.
+    rows = conn.execute(
+        f"""
+        SELECT week_start_at, metric, threshold, projected_value,
+               denominator, crossed_at_utc, alerted_at
+        FROM {descriptor.milestone_table}
+        WHERE alerted_at IS NOT NULL
+        ORDER BY alerted_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        threshold = int(r["threshold"])
+        metric = str(r["metric"])
+        out.append({
+            "id":         f"projected:{r['week_start_at']}:{metric}:{threshold}",
+            "axis":       descriptor.id,
+            "metric":     metric,
+            "threshold":  threshold,
+            "severity":   severity_for(threshold),
+            "crossed_at": r["crossed_at_utc"],
+            "alerted_at": r["alerted_at"],
+            "context": {
+                "week_start_at":   r["week_start_at"],
+                "metric":          metric,
+                "projected_value": float(r["projected_value"]),
+                "denominator":     float(r["denominator"]),
+            },
+        })
+    return out
+
+
+# Keyed by ``AlertAxisDescriptor.id`` — the registry decides which axes run,
+# in what order; this table supplies the bespoke heterogeneous row-mapper.
+_ENVELOPE_AXIS_MAPPERS = {
+    "weekly": _envelope_rows_weekly,
+    "five_hour": _envelope_rows_five_hour,
+    "budget": _envelope_rows_budget,
+    "projected": _envelope_rows_projected,
+}
+
+
 def _build_alerts_envelope_array(
     conn: sqlite3.Connection,
     limit: int = 100,
@@ -4091,162 +4284,26 @@ def _build_alerts_envelope_array(
     the boundary case where one axis has ``limit`` rows and the other
     has more recent ones that would otherwise be dropped before the
     final sort.
+
+    **Registry-driven (Task F).** The *set* of axes, their union *order*,
+    and each axis's ``milestone_table`` come from
+    ``_lib_alert_axes.AXIS_REGISTRY`` — adding a future axis is "register a
+    descriptor + add a row-mapper", not "hand-roll a parallel branch". The
+    SQL stays genuinely heterogeneous per axis (Codex P0-3: different
+    columns, JOINs, id shapes), so each descriptor pairs with a bespoke
+    row-mapper keyed by ``descriptor.id`` in ``_ENVELOPE_AXIS_MAPPERS``. The
+    shared ``severity_for`` kernel stamps the additive ``severity`` field on
+    every item (single severity authority, consumed by the frontend too).
     """
+    c = _cctally()
+    registry = c.AXIS_REGISTRY
+    severity_for = c.severity_for
     out: list[dict] = []
-    # ``reset_event_id`` (v1.7.2) segments the same (week, threshold)
-    # across pre-credit (0) and post-credit (event.id) cohorts, both
-    # of which can be alerted. The envelope id must include the
-    # segment so React's <li key={a.id}> / <tr key={a.id}> doesn't
-    # collide on the duplicate (week, threshold) pair. Older clients
-    # tolerate longer ids — the id is opaque to them; only the React
-    # key uniqueness invariant matters.
-    weekly_rows = conn.execute(
-        """
-        SELECT week_start_date, percent_threshold, captured_at_utc,
-               alerted_at, cumulative_cost_usd, reset_event_id
-        FROM percent_milestones
-        WHERE alerted_at IS NOT NULL
-        ORDER BY alerted_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-    for r in weekly_rows:
-        threshold = int(r["percent_threshold"])
-        cumulative = float(r["cumulative_cost_usd"])
-        dpp = (cumulative / threshold) if threshold else None
-        out.append({
-            "id": f"weekly:{r['week_start_date']}:{threshold}:{r['reset_event_id']}",
-            "axis": "weekly",
-            "threshold": threshold,
-            "crossed_at": r["captured_at_utc"],
-            "alerted_at": r["alerted_at"],
-            "context": {
-                "week_start_date":     r["week_start_date"],
-                "cumulative_cost_usd": cumulative,
-                "dollars_per_percent": dpp,
-                # Round-3: parallel to the 5h context block below — both
-                # axes now expose ``reset_event_id`` so downstream
-                # clients (panel, modal, third-party consumers) can
-                # discriminate pre- vs post-credit crossings of the
-                # same (week, threshold) without scraping the
-                # envelope ``id`` string. 0 = pre-credit / no-event;
-                # event.id = post-credit segment.
-                "reset_event_id":      int(r["reset_event_id"]),
-            },
-        })
-
-    # Site F (spec §3.2 bucket C / §3.3): widen the row identity to
-    # include ``reset_event_id`` so post-credit (seg=event.id) crossings
-    # of the same (window_key, threshold) don't collide with pre-credit
-    # (seg=0) crossings on the React row key. Older clients tolerate
-    # longer ids — the id is opaque to them; only the React key
-    # uniqueness invariant matters. Mirrors the weekly precedent at
-    # line ~2597.
-    fh_rows = conn.execute(
-        """
-        SELECT m.five_hour_window_key, m.percent_threshold, m.captured_at_utc,
-               m.alerted_at, m.block_cost_usd, m.reset_event_id,
-               b.block_start_at
-        FROM five_hour_milestones m
-        LEFT JOIN five_hour_blocks b ON b.five_hour_window_key = m.five_hour_window_key
-        WHERE m.alerted_at IS NOT NULL
-        ORDER BY m.alerted_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-    for r in fh_rows:
-        threshold = int(r["percent_threshold"])
-        out.append({
-            "id":          (
-                f"five_hour:{int(r['five_hour_window_key'])}:"
-                f"{threshold}:{int(r['reset_event_id'])}"
-            ),
-            "axis":        "five_hour",
-            "threshold":   threshold,
-            "crossed_at":  r["captured_at_utc"],
-            "alerted_at":  r["alerted_at"],
-            "context": {
-                "five_hour_window_key": int(r["five_hour_window_key"]),
-                "block_start_at":       r["block_start_at"] or "",
-                "block_cost_usd":       float(r["block_cost_usd"] or 0.0),
-                "reset_event_id":       int(r["reset_event_id"]),
-            },
-        })
-
-    # Third axis (issue #19): equiv-$ budget threshold crossings. Budget
-    # alerts are keyed by the effective (post-reset) week_start_at + the
-    # integer threshold; the envelope id mirrors the dispatch payload's
-    # ``budget:<week_start_at>:<threshold>`` shape
-    # (``_build_alert_payload_budget``). No ``reset_event_id`` segment —
-    # a mid-week reset re-anchors ``week_start_at`` so the new window
-    # naturally gets fresh rows under ``UNIQUE(week_start_at, threshold)``.
-    budget_rows = conn.execute(
-        """
-        SELECT week_start_at, threshold, crossed_at_utc, alerted_at,
-               budget_usd, spent_usd, consumption_pct
-        FROM budget_milestones
-        WHERE alerted_at IS NOT NULL
-        ORDER BY alerted_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-    for r in budget_rows:
-        threshold = int(r["threshold"])
-        out.append({
-            "id":         f"budget:{r['week_start_at']}:{threshold}",
-            "axis":       "budget",
-            "threshold":  threshold,
-            "crossed_at": r["crossed_at_utc"],
-            "alerted_at": r["alerted_at"],
-            "context": {
-                "week_start_at":   r["week_start_at"],
-                "budget_usd":      float(r["budget_usd"]),
-                "spent_usd":       float(r["spent_usd"]),
-                "consumption_pct": float(r["consumption_pct"]),
-            },
-        })
-
-    # Fourth axis (issue #121): projected-pace threshold crossings. Like
-    # budget, projected alerts re-anchor ``week_start_at`` on a mid-week
-    # reset, so there is NO ``reset_event_id`` segment — the new window gets
-    # fresh rows under ``UNIQUE(week_start_at, metric, threshold)``. The
-    # ``metric`` discriminator (``weekly_pct`` | ``budget_usd``) drives the
-    # frontend's metric-aware context renderer; ``denominator`` +
-    # ``projected_value`` are rendered FROM THE ROW (the values snapshotted at
-    # crossing), never live config that may have changed since (Codex P0-4).
-    # The envelope id mirrors the dispatch payload's
-    # ``projected:<week_start_at>:<metric>:<threshold>`` shape.
-    projected_rows = conn.execute(
-        """
-        SELECT week_start_at, metric, threshold, projected_value,
-               denominator, crossed_at_utc, alerted_at
-        FROM projected_milestones
-        WHERE alerted_at IS NOT NULL
-        ORDER BY alerted_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-    for r in projected_rows:
-        threshold = int(r["threshold"])
-        metric = str(r["metric"])
-        out.append({
-            "id":         f"projected:{r['week_start_at']}:{metric}:{threshold}",
-            "axis":       "projected",
-            "metric":     metric,
-            "threshold":  threshold,
-            "crossed_at": r["crossed_at_utc"],
-            "alerted_at": r["alerted_at"],
-            "context": {
-                "week_start_at":   r["week_start_at"],
-                "metric":          metric,
-                "projected_value": float(r["projected_value"]),
-                "denominator":     float(r["denominator"]),
-            },
-        })
+    for descriptor in registry:
+        mapper = _ENVELOPE_AXIS_MAPPERS.get(descriptor.id)
+        if mapper is None:  # pragma: no cover - registry/mapper drift guard
+            continue
+        out.extend(mapper(conn, descriptor, limit, severity_for))
 
     # Python's list.sort is stable. When two alerts share the same
     # `alerted_at` ISO string (rare; multiple axes firing within the same
