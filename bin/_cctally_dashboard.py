@@ -4721,7 +4721,7 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # every connected client. We expose only a boolean: is a custom
         # command configured? (the CLI/config remains the sole writer of the
         # template itself).
-        "notifier":           _alerts_cfg["notifier"],
+        "notifier":           _alerts_cfg.get("notifier", "auto"),
         "command_configured": _alerts_cfg.get("command_template") is not None,
     }
 
@@ -5362,7 +5362,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         sent) is the full computed block from ``_compute_display_block``
         (preserves ``tz`` / ``resolved_tz`` / ``offset_label`` /
         ``offset_seconds`` shape consumers rely on). ``alerts`` (when
-        sent) is the full validated block from ``_get_alerts_config``.
+        sent) is the full validated block from ``_get_alerts_config``,
+        except the raw ``command_template`` is redacted to the boolean
+        ``command_configured`` (it routinely holds secrets — webhook URLs
+        / bearer tokens — and the echo is returned to the client; the
+        SSE ``alerts_settings`` mirror redacts identically). Do NOT
+        re-add the raw template to the echo.
         ``saved_at`` is included for backward compat.
         """
         if not self._check_origin_csrf():

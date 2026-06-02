@@ -24,8 +24,9 @@
 # Exits non-zero if any scenario fails. A trap ensures stray server PIDs die
 # on harness exit / Ctrl-C.
 #
-# The eight fixture scenarios (ok, warn, over, reset-week, no-data,
-# utc-tz, tz-override, projected-alerts) run in parallel via `xargs -P`
+# The nine fixture scenarios (ok, warn, over, reset-week, no-data,
+# utc-tz, tz-override, projected-alerts, command-secret) run in parallel
+# via `xargs -P`
 # — each scenario
 # already has its own scratch HOME under $SCRATCH_ROOT/<name> and
 # binds its dashboard server to an ephemeral port (`--port 0`), so
@@ -506,6 +507,82 @@ print("ok")
         fi
     fi
 
+    # Phase B (Task 4) secret-redaction guard. The `command-secret`
+    # scenario seeds a CONFIGURED, secret-bearing `alerts.command_template`
+    # (a webhook curl carrying a bearer token `SECRETXYZ`) + notifier=command.
+    # This is the ONLY scenario whose stored template is non-None, so it is
+    # the one that makes the dashboard's two redaction sites load-bearing:
+    # the raw template (and the `SECRETXYZ` canary) must NEVER reach a client
+    # through either the SSE `alerts_settings` snapshot or the POST echo —
+    # only the boolean `command_configured: true`.
+    if [ "$name" = "command-secret" ]; then
+        # (1) SSE /api/data snapshot: command_configured true, notifier command,
+        # no raw command_template key, and `SECRETXYZ` absent from the entire
+        # raw serialized snapshot.
+        local snap_check
+        snap_check=$(printf '%s' "$raw" | python3 -c '
+import json, sys
+blob = sys.stdin.read()
+errs = []
+if "SECRETXYZ" in blob:
+    errs.append("raw /api/data snapshot leaks SECRETXYZ secret")
+d = json.loads(blob)
+s = d.get("alerts_settings") or {}
+if s.get("notifier") != "command":
+    errs.append("alerts_settings.notifier != command: %r" % (s.get("notifier"),))
+if s.get("command_configured") is not True:
+    errs.append("alerts_settings.command_configured != True: %r"
+                % (s.get("command_configured"),))
+if "command_template" in s:
+    errs.append("alerts_settings leaks raw command_template: %r"
+                % (s.get("command_template"),))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+        if [ "$snap_check" != "ok" ]; then
+            echo "FAIL $name: SSE alerts_settings secret-redaction assertion: $snap_check"
+            ok=0
+        fi
+
+        # (2) POST /api/settings round-trip. A valid no-op re-set of the
+        # notifier (a template is already stored, so notifier=command passes
+        # the cross-field rule) returns 200; the echo carries
+        # command_configured=true and NEVER the raw command_template, and
+        # `SECRETXYZ` must not appear anywhere in the raw response body. This
+        # is the assertion that binds the POST-echo redaction line
+        # (`_a.pop("command_template", ...)`) — a regression that drops it
+        # leaks the bearer token into the echo and trips the substring check.
+        local sec_raw sec_check
+        sec_raw=$(curl -s --max-time 5 \
+            -X POST -H "Origin: http://127.0.0.1:$port" \
+            -H "Content-Type: application/json" \
+            -d '{"alerts":{"notifier":"command"}}' "$base/api/settings")
+        sec_check=$(printf '%s' "$sec_raw" | python3 -c '
+import json, sys
+blob = sys.stdin.read()
+errs = []
+if "SECRETXYZ" in blob:
+    errs.append("POST echo leaks SECRETXYZ secret")
+d = json.loads(blob)
+a = d.get("alerts") or {}
+if a.get("notifier") != "command":
+    errs.append("echo alerts.notifier != command: %r" % (a.get("notifier"),))
+if a.get("command_configured") is not True:
+    errs.append("echo alerts.command_configured != True: %r"
+                % (a.get("command_configured"),))
+if "command_template" in a:
+    errs.append("echo leaks raw command_template: %r" % (a.get("command_template"),))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+        if [ "$sec_check" != "ok" ]; then
+            echo "FAIL $name: POST /api/settings secret-redaction round-trip: $sec_check (raw: $sec_raw)"
+            ok=0
+        fi
+    fi
+
     # /api/events: grab the first update frame. --max-time keeps the
     # connection from blocking forever on an idle server; the header
     # flush + first publish should land well under 3s.
@@ -675,11 +752,11 @@ run_scenario () {
     fi
 }
 
-# Dispatch the eight fixture scenarios in parallel. Each scenario's
+# Dispatch the nine fixture scenarios in parallel. Each scenario's
 # output goes to its own _output.log; the loop after `xargs` flushes
 # them in fixed scenario order so the harness output reads identically
 # to the old sequential version.
-fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts)
+fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret)
 export -f _run_scenario_inner run_scenario normalize_json normalize_session_json
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.
 export -f _golden_diff_files _golden_diff_str _golden_diff_two_str

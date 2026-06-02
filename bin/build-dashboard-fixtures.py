@@ -6,7 +6,7 @@ Writes one pair of (stats.db, cache.db) per scenario under
 All schema/seeding goes through ``bin/_fixture_builders.py`` — do not
 duplicate schema here. Idempotent: each builder overwrites existing DBs.
 
-Seven scenarios:
+Ten scenarios:
   * ``ok``         — current week at ~40% with 8 weeks of history; forecast
                      verdict ``"ok"`` (renders as GOOD in the browser).
   * ``warn``       — current week at ~67% with a heavy recent-24h burn that
@@ -30,6 +30,18 @@ Seven scenarios:
   * ``tz-override``— persisted ``display.tz: "Asia/Tokyo"`` but launched with
                      ``--tz utc`` (F3 override regression); also seeds a 5h
                      block the harness fetches via ``GET /api/block/<start>``.
+  * ``projected-alerts`` — projected-pace alert axis (#121): two alerted
+                     ``projected_milestones`` rows + a budget config with both
+                     projected toggles on, so the envelope's fourth (projected)
+                     alert leg and the ``alerts_settings`` projected mirror are
+                     asserted.
+  * ``command-secret`` — config stores a CONFIGURED, secret-bearing
+                     ``alerts.command_template`` (a webhook ``curl`` with a
+                     bearer token) + ``notifier="command"``. Makes the
+                     dashboard's secret-redaction line load-bearing: both the
+                     SSE ``alerts_settings`` mirror and the POST echo must
+                     surface only ``command_configured: true`` and never leak
+                     the raw template / ``SECRETXYZ`` token to a client.
 
 Each scenario writes ``input.env`` containing a single line
 ``AS_OF=<iso-utc>`` consumed by the dashboard harness via
@@ -1287,6 +1299,87 @@ def build_projected_alerts(as_of: dt.datetime) -> None:
     (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
 
 
+def build_command_secret(as_of: dt.datetime) -> None:
+    """Secret-redaction guard (Phase B Task 4). Seeds a config whose
+    ``alerts`` block stores a CONFIGURED, secret-bearing
+    ``command_template`` (a webhook ``curl`` carrying a bearer token) and
+    ``alerts.notifier = "command"``. The point of this scenario is to make
+    the dashboard's secret-redaction line load-bearing in the suite: the
+    SSE ``alerts_settings`` mirror and the ``POST /api/settings`` 200 echo
+    must BOTH surface only ``command_configured: true`` (a boolean) and
+    must NEVER leak the raw ``command_template`` array — nor the literal
+    ``SECRETXYZ`` token it carries — to any client.
+
+    The whole suite otherwise only ever exercises configs where
+    ``command_template`` is ``None``, so a regression that deleted the
+    POST-echo redaction (``_a.pop("command_template", ...)``) would stay
+    green. This fixture closes that gap (see the matching harness
+    assertions in ``bin/cctally-dashboard-test``).
+
+    Minimal world otherwise (one week anchor + one session) so the
+    envelope resolves cleanly; no ``FIXED_SESSION_ID`` in input.env, so
+    the harness skips the ``/api/session/:id`` golden leg (same as
+    ``no-data`` / ``utc-tz`` / ``projected-alerts``).
+    """
+    scenario_dir, app_dir = _scenario_dirs("command-secret")
+    stats_path = app_dir / "stats.db"
+    cache_path = app_dir / "cache.db"
+    create_stats_db(stats_path)
+    create_cache_db(cache_path)
+
+    # AS_OF = 2026-04-16T14:00Z → 72h into the week (~day 4 of 7).
+    week_start = dt.datetime(2026, 4, 13, 14, 0, 0, tzinfo=dt.timezone.utc)
+    week_end = week_start + dt.timedelta(days=7)
+
+    stats_conn = sqlite3.connect(stats_path)
+    cache_conn = sqlite3.connect(cache_path)
+    try:
+        for hrs_in, pct in [(6, 5.0), (36, 25.0), (72, 50.0)]:
+            _insert_usage_snapshot(
+                stats_conn,
+                captured_at=week_start + dt.timedelta(hours=hrs_in),
+                week_start=week_start, week_end=week_end, pct=pct,
+            )
+        _seed_session(
+            cache_conn,
+            session_id="command-secret-cur-0000000000000000000",
+            project_path="/fake/repos/fixture-command-secret",
+            model="claude-sonnet-4-6",
+            entries=[(week_start + dt.timedelta(hours=70), 120_000, 18_000, 0, 0)],
+        )
+        _stamp_and_verify(stats_conn)
+        stats_conn.commit()
+        cache_conn.commit()
+    finally:
+        stats_conn.close()
+        cache_conn.close()
+
+    # Configured, secret-bearing command_template + notifier=command. The
+    # bearer token (``SECRETXYZ``) is the canary the harness asserts never
+    # reaches a client through either the SSE mirror or the POST echo.
+    config_path = app_dir / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "alerts": {
+                    "enabled": True,
+                    "notifier": "command",
+                    "command_template": [
+                        "curl",
+                        "-H",
+                        "Authorization: Bearer SECRETXYZ",
+                        "https://hook.example/x",
+                    ],
+                }
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+    (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+
+
 SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "ok": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
@@ -1319,6 +1412,10 @@ SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "projected-alerts": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
         build_projected_alerts,
+    ),
+    "command-secret": (
+        dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_command_secret,
     ),
 }
 
