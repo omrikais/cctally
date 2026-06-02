@@ -1695,6 +1695,70 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
         conn.close()
 
 
+# ── Reset-to-zero debounce marker (issue #128) ─────────────────────────────
+# A transient Anthropic OAuth zero (cold replica / outage) against non-trivial
+# usage would otherwise mis-fire the live in-place reset-to-zero detector. We
+# debounce: the first ~0 ARMS this marker (it does not fire); the next reading
+# CONFIRMS (fires) only if usage stayed low, or CLEARS on recovery toward the
+# baseline. The marker is needed because the write-site clamp suppresses the
+# deferred first zero, so it leaves no DB trace. Losing the marker is always
+# safe (a real reset re-arms and fires one tick later). Best-effort file I/O —
+# the detector must never crash on a marker hiccup. See
+# docs/superpowers/specs/2026-06-02-reset-zero-debounce-design.md.
+_RESET_ZERO_MARKER_NAME = "pending-reset-zero-7d"
+
+
+def _reset_zero_marker_path():
+    return _cctally_core.APP_DIR / _RESET_ZERO_MARKER_NAME
+
+
+def _arm_reset_zero_marker(week_start_date, cur_end_canon, *,
+                           baseline_pct, first_zero_iso):
+    """Persist the pending reset-to-zero candidate. ``first_zero_iso`` MUST be
+    the ``_command_as_of()`` clock value (it becomes the effective anchor on
+    confirm), NOT wall-clock."""
+    try:
+        _reset_zero_marker_path().write_text(
+            f"{week_start_date} {cur_end_canon} "
+            f"{float(baseline_pct)} {first_zero_iso}\n"
+        )
+    except OSError:
+        pass
+
+
+def _clear_reset_zero_marker():
+    try:
+        _reset_zero_marker_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _read_reset_zero_marker():
+    """Return ``(week_start_date, cur_end_canon, baseline_pct, first_zero_iso)``
+    or ``None`` when missing / empty / garbled. Validates ALL fields (arity,
+    float baseline, parseable timestamp) so a malformed marker re-arms cleanly
+    rather than wedging the confirm path."""
+    try:
+        raw = _reset_zero_marker_path().read_text().strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    parts = raw.split()
+    if len(parts) != 4:
+        return None
+    week_start_date, cur_end_canon, baseline_raw, first_zero_iso = parts
+    try:
+        baseline_pct = float(baseline_raw)
+    except ValueError:
+        return None
+    try:
+        parse_iso_datetime(first_zero_iso, "reset_zero_marker.first_zero")
+    except ValueError:
+        return None
+    return (week_start_date, cur_end_canon, baseline_pct, first_zero_iso)
+
+
 def cmd_record_usage(args: argparse.Namespace) -> int:
     """Record usage data from Claude Code status line rate_limits."""
     c = _cctally()

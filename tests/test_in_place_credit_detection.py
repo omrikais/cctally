@@ -3400,3 +3400,41 @@ def test_weekly_pivots_run_when_event_row_already_committed(ns, tmp_path):
         assert original == 1
     finally:
         conn.close()
+
+
+# ── Issue #128: reset-to-zero debounce marker helpers ────────────────────
+
+
+def test_reset_zero_marker_roundtrip_and_failsoft(ns):
+    """The marker helpers round-trip a 4-field line and fail soft (return
+    None) on every malformed shape, so a garbled marker re-arms cleanly
+    instead of wedging the confirm path. APP_DIR is redirected to tmp by
+    the `ns` fixture, so the marker lands in the scratch dir."""
+    import _cctally_record as rec
+
+    marker_path = ns["APP_DIR"] / "pending-reset-zero-7d"
+
+    # Round-trip.
+    rec._arm_reset_zero_marker(
+        "2026-05-25", "2026-06-08T18:00:00+00:00",
+        baseline_pct=14.0, first_zero_iso="2026-06-01T18:00:35+00:00",
+    )
+    assert rec._read_reset_zero_marker() == (
+        "2026-05-25", "2026-06-08T18:00:00+00:00", 14.0,
+        "2026-06-01T18:00:35+00:00",
+    )
+
+    # Clear.
+    rec._clear_reset_zero_marker()
+    assert rec._read_reset_zero_marker() is None
+    assert not marker_path.exists()
+
+    # Fail-soft: every malformed shape → None.
+    for bad in (
+        "",                                              # empty
+        "2026-05-25 2026-06-08T18:00:00+00:00 14.0",     # wrong arity (3)
+        "2026-05-25 end notafloat 2026-06-01T18:00:35+00:00",  # bad baseline
+        "2026-05-25 end 14.0 not-a-timestamp",           # bad first_zero_iso
+    ):
+        marker_path.write_text(bad + "\n")
+        assert rec._read_reset_zero_marker() is None, bad
