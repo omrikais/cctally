@@ -8,8 +8,17 @@ import {
 } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useKeymap } from '../hooks/useKeymap';
-import type { AlertAxis } from '../types/envelope';
+import type { AlertAxis, ProjectedMetric } from '../types/envelope';
 import { AXIS_TITLE_LABEL } from '../lib/alertAxis';
+
+// Projected-axis metric sub-select labels (issue #121). The projected test
+// alert mirrors the CLI's `--metric {weekly_pct,budget_usd}`: a single
+// "Projected" axis option can't say WHICH projection to fire, so when that
+// axis is picked we surface this secondary chooser and post `metric` too.
+const PROJECTED_METRIC_LABEL: Record<ProjectedMetric, string> = {
+  weekly_pct: 'Weekly %',
+  budget_usd: 'Budget $',
+};
 
 // IANA-zone validator. `Intl.DateTimeFormat` throws RangeError on
 // unknown zones; we treat that as the negative answer rather than
@@ -97,6 +106,9 @@ export function SettingsOverlay() {
   const [testSubmitting, setTestSubmitting] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
   const [testAxis, setTestAxis] = useState<AlertAxis>('weekly');
+  // Only consulted when testAxis === 'projected' (mirrors the CLI's
+  // `alerts test --axis projected --metric`); ignored for other axes.
+  const [testMetric, setTestMetric] = useState<ProjectedMetric>('weekly_pct');
 
   // Re-seed the local form whenever the server-side display.tz changes
   // (an SSE tick from another tab's Save, or a `cctally config` write
@@ -416,6 +428,28 @@ export function SettingsOverlay() {
                   ))}
                 </select>
               </label>{' '}
+              {testAxis === 'projected' && (
+                <label>
+                  Metric{' '}
+                  <select
+                    className="settings-btn settings-select"
+                    value={testMetric}
+                    disabled={testSubmitting}
+                    aria-label="Test alert projected metric"
+                    onChange={(e) =>
+                      setTestMetric(e.target.value as ProjectedMetric)
+                    }
+                  >
+                    {(Object.keys(PROJECTED_METRIC_LABEL) as ProjectedMetric[]).map(
+                      (m) => (
+                        <option key={m} value={m}>
+                          {PROJECTED_METRIC_LABEL[m]}
+                        </option>
+                      ),
+                    )}
+                  </select>
+                </label>
+              )}{' '}
               <button
                 className="settings-btn"
                 type="button"
@@ -427,7 +461,16 @@ export function SettingsOverlay() {
                     const res = await fetch('/api/alerts/test', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ axis: testAxis, threshold: 90 }),
+                      body: JSON.stringify({
+                        axis: testAxis,
+                        threshold: 90,
+                        // metric only matters for the projected axis; the
+                        // endpoint ignores it elsewhere, but keep the wire
+                        // minimal and send it only when it applies.
+                        ...(testAxis === 'projected'
+                          ? { metric: testMetric }
+                          : {}),
+                      }),
                     });
                     const body = (await res.json().catch(() => ({}))) as {
                       dispatch?: string;

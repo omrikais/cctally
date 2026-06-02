@@ -87,4 +87,92 @@ describe('<SettingsOverlay /> test-alert axis picker', () => {
     expect(parsed.axis).toBe('budget');
     expect(parsed.threshold).toBe(90);
   });
+
+  // Issue #121: the projected axis is metric-aware. Picking it must reveal a
+  // metric sub-select and carry the chosen `metric` to the wire — otherwise
+  // the budget_usd projection is untestable and (before the endpoint fix) the
+  // POST 400'd. Binding assertion: axis === 'projected' AND metric ===
+  // 'budget_usd'. Against the prior no-metric body this fails on the missing
+  // `metric` key.
+  it('reveals a metric sub-select for projected and POSTs the chosen metric', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(
+          JSON.stringify({
+            alert: {
+              axis: 'projected',
+              metric: 'budget_usd',
+              threshold: 90,
+              context: {},
+            },
+            dispatch: 'queued',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    openSettings();
+
+    // The metric sub-select is hidden until the projected axis is chosen.
+    expect(screen.queryByLabelText('Test alert projected metric')).toBeNull();
+
+    const select = screen.getByLabelText('Test alert axis') as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: 'projected' } });
+
+    // Now the metric chooser appears; pick the budget_usd variant.
+    const metricSelect = screen.getByLabelText(
+      'Test alert projected metric',
+    ) as HTMLSelectElement;
+    expect(metricSelect.value).toBe('weekly_pct'); // default seeded
+    fireEvent.change(metricSelect, { target: { value: 'budget_usd' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send test alert' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const call = fetchMock.mock.calls.find(
+      ([url]) => url === '/api/alerts/test',
+    );
+    expect(call).toBeTruthy();
+    const [, init] = call as [string, RequestInit];
+    const parsed = JSON.parse(init.body as string) as {
+      axis: string;
+      threshold: number;
+      metric?: string;
+    };
+    expect(parsed.axis).toBe('projected');
+    expect(parsed.threshold).toBe(90);
+    expect(parsed.metric).toBe('budget_usd');
+  });
+
+  // The metric key must NOT ride along for non-projected axes — the endpoint
+  // ignores it, but a leaking key would muddy the wire contract.
+  it('omits metric from the body for non-projected axes', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(
+          JSON.stringify({
+            alert: { axis: 'weekly', threshold: 90, context: {} },
+            dispatch: 'queued',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    openSettings();
+    // Default axis is 'weekly'; fire without touching the select.
+    fireEvent.click(screen.getByRole('button', { name: 'Send test alert' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const call = fetchMock.mock.calls.find(
+      ([url]) => url === '/api/alerts/test',
+    );
+    const [, init] = call as [string, RequestInit];
+    const parsed = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(parsed.axis).toBe('weekly');
+    expect('metric' in parsed).toBe(false);
+  });
 });

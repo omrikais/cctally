@@ -336,6 +336,10 @@ def _build_alert_payload_budget(*args, **kwargs):
     return sys.modules["cctally"]._build_alert_payload_budget(*args, **kwargs)
 
 
+def _build_alert_payload_projected(*args, **kwargs):
+    return sys.modules["cctally"]._build_alert_payload_projected(*args, **kwargs)
+
+
 def _dispatch_alert_notification(*args, **kwargs):
     return sys.modules["cctally"]._dispatch_alert_notification(*args, **kwargs)
 
@@ -5764,8 +5768,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         dispatch status string in the JSON response.
 
         Body (all fields optional): ``{"axis":
-        "weekly"|"five_hour"|"budget", "threshold": 1..100}``. Defaults:
-        axis="weekly", threshold=90.
+        "weekly"|"five_hour"|"budget"|"projected", "threshold": 1..100,
+        "metric": "weekly_pct"|"budget_usd"}``. Defaults: axis="weekly",
+        threshold=90, metric="weekly_pct". ``metric`` is only consulted for
+        the ``projected`` axis (mirrors the CLI ``alerts test --axis
+        projected --metric`` surface); it is ignored for the other axes.
 
         IMPORTANT: ``axis`` uses the underscore form (``"five_hour"``)
         in the JSON API to match the dispatch payload's internal axis
@@ -5804,12 +5811,25 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 return
 
         axis = body.get("axis", "weekly")
-        if axis not in ("weekly", "five_hour", "budget"):
+        if axis not in ("weekly", "five_hour", "budget", "projected"):
             self._respond_json(
                 400,
                 {"error": (
-                    "axis must be 'weekly', 'five_hour' or 'budget', "
-                    f"got {axis!r}"
+                    "axis must be 'weekly', 'five_hour', 'budget' or "
+                    f"'projected', got {axis!r}"
+                )},
+            )
+            return
+        # ``metric`` discriminates the projected axis (weekly_pct vs
+        # budget_usd); the other axes ignore it. Validate only when it
+        # matters so a stray metric on a weekly/budget test isn't a 400.
+        metric = body.get("metric", "weekly_pct")
+        if axis == "projected" and metric not in ("weekly_pct", "budget_usd"):
+            self._respond_json(
+                400,
+                {"error": (
+                    "metric must be 'weekly_pct' or 'budget_usd', "
+                    f"got {metric!r}"
                 )},
             )
             return
@@ -5846,6 +5866,28 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 budget_usd=300.0,
                 spent_usd=300.0 * threshold / 100.0,
                 consumption_pct=float(threshold),
+            )
+        elif axis == "projected":
+            # Synthetic projected-pace payload — mirrors the CLI
+            # cmd_alerts_test projected branch (NO DB writes, test/real
+            # divergence contract). The metric discriminator picks the
+            # wiring; projected_value is the threshold's denominator-relative
+            # value (so the body reads plausibly, e.g. weekly 100% → "~100% of
+            # cap", budget 100% → "$300 of $300"). denominator is the
+            # at-crossing target the row would carry (Codex P0-4): 100.0 for
+            # weekly_pct, $300 for budget_usd.
+            if metric == "budget_usd":
+                denominator = 300.0
+                projected_value = 300.0 * threshold / 100.0
+            else:  # weekly_pct
+                denominator = 100.0
+                projected_value = float(threshold)
+            payload = _build_alert_payload_projected(
+                metric=metric,
+                threshold=threshold,
+                projected_value=projected_value,
+                denominator=denominator,
+                week_start_at=dt.date.today().isoformat(),
             )
         else:
             payload = _build_alert_payload_five_hour(

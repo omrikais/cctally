@@ -441,6 +441,30 @@ raw=$(curl -s -X POST "$base/api/alerts/test" \
 split_post_response "$raw"
 assert_eq        "200 alerts/test five_hour code"     "200" "$code"
 assert_contains  "200 alerts/test five_hour axis"     '"axis": "five_hour"' "$body"
+
+# Projected axis (#121): mirrors the CLI `alerts test --axis projected
+# --metric`. metric defaults to weekly_pct; the dashboard test selector
+# derives projected from AXIS_TITLE_LABEL, so this path must not 400.
+raw=$(curl -s -X POST "$base/api/alerts/test" \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    -H "Content-Type: application/json" \
+    -w '\n@HTTP@\n%{http_code}\n' \
+    -d '{"axis":"projected","threshold":90}')
+split_post_response "$raw"
+assert_eq        "200 alerts/test projected code"        "200" "$code"
+assert_contains  "200 alerts/test projected axis"        '"axis": "projected"' "$body"
+assert_contains  "200 alerts/test projected default metric" '"metric": "weekly_pct"' "$body"
+
+# Explicit budget_usd metric reaches the payload (otherwise that projection
+# variant is untestable from the dashboard).
+raw=$(curl -s -X POST "$base/api/alerts/test" \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    -H "Content-Type: application/json" \
+    -w '\n@HTTP@\n%{http_code}\n' \
+    -d '{"axis":"projected","threshold":90,"metric":"budget_usd"}')
+split_post_response "$raw"
+assert_eq        "200 alerts/test projected budget_usd code"   "200" "$code"
+assert_contains  "200 alerts/test projected budget_usd metric" '"metric": "budget_usd"' "$body"
 stop_server
 
 # --- Case 14 (T7): /api/alerts/test invalid axis -> 400 ---------------------
@@ -462,6 +486,16 @@ raw=$(curl -s -X POST "$base/api/alerts/test" \
     -d '{"axis":"weekly","threshold":0}')
 split_post_response "$raw"
 assert_eq        "400 alerts/test threshold OOR" "400" "$code"
+
+# Bad projected metric rejected with 400 (only validated for projected).
+raw=$(curl -s -X POST "$base/api/alerts/test" \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    -H "Content-Type: application/json" \
+    -w '\n@HTTP@\n%{http_code}\n' \
+    -d '{"axis":"projected","threshold":90,"metric":"nope"}')
+split_post_response "$raw"
+assert_eq        "400 alerts/test bad metric"     "400" "$code"
+assert_contains  "400 alerts/test bad metric err" '"error"' "$body"
 stop_server
 
 # --- Case 15 (T7): /api/alerts/test cross-origin -> 403 ---------------------
