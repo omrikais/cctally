@@ -2,6 +2,8 @@ import importlib.util
 import pathlib
 import sys
 
+import pytest
+
 BIN = pathlib.Path(__file__).resolve().parent.parent / "bin"
 
 
@@ -17,6 +19,24 @@ def _load(name):
     sys.modules[name] = mod
     loader.exec_module(mod)
     return mod
+
+
+@pytest.fixture(autouse=True)
+def _restore_sys_modules():
+    """``_load`` clobbers ``sys.modules[name]`` with a fresh instance (needed
+    for the ``@dataclass`` introspection during exec). Restore afterwards so a
+    clobbered sibling never leaks into the shared module cache and pollutes
+    later tests under a single-process (non-xdist) run. ``_lib_alert_axes`` is
+    pure (no path constants) so the risk here is lower than the ``_cctally_core``
+    case, but the discipline is uniform."""
+    saved = dict(sys.modules)
+    yield
+    for name in list(sys.modules):
+        if name not in saved:
+            del sys.modules[name]
+    for name, mod in saved.items():
+        if sys.modules.get(name) is not mod:
+            sys.modules[name] = mod
 
 
 def test_registry_has_four_axes_in_order():

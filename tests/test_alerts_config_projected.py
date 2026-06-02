@@ -20,6 +20,8 @@ import subprocess
 import sys
 from contextlib import redirect_stderr
 
+import pytest
+
 _BIN = pathlib.Path(__file__).resolve().parent.parent / "bin"
 if str(_BIN) not in sys.path:
     sys.path.insert(0, str(_BIN))
@@ -36,6 +38,25 @@ def _load(name):
     sys.modules[name] = mod
     loader.exec_module(mod)
     return mod
+
+
+@pytest.fixture(autouse=True)
+def _restore_sys_modules():
+    """`_load` clobbers ``sys.modules[name]`` with a fresh sibling instance
+    (needed so the ``@dataclass`` ``sys.modules[cls.__module__]`` lookup
+    resolves during exec on 3.14). For ``_cctally_core`` that fresh instance
+    resolves its path constants at import to the *real* data dir, so leaving
+    it in the cache pollutes later DB-touching tests under a single-process
+    (non-xdist) run — a regression that's invisible under ``pytest -n`` but
+    cascades serially. Snapshot + restore keeps the clobber test-local."""
+    saved = dict(sys.modules)
+    yield
+    for name in list(sys.modules):
+        if name not in saved:
+            del sys.modules[name]
+    for name, mod in saved.items():
+        if sys.modules.get(name) is not mod:
+            sys.modules[name] = mod
 
 
 # ── defaults ────────────────────────────────────────────────────────────────
