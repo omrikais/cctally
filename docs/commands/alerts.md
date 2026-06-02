@@ -73,10 +73,12 @@ the dashboard can render a toast even if no native notifier is available.
 Exit codes for the CLI form:
 
 - `0` — alert queued (notifier spawned successfully).
-- `1` — the native notifier binary is missing on this host (e.g. not
-  macOS, or `osascript` unavailable).
+- `1` — the spawned native notifier raised `FileNotFoundError` (e.g.
+  `osascript` is selected but missing from `PATH`).
 - `2` — `--threshold` out of `[1, 100]`.
-- `3` — other spawn error (PermissionError, OSError, etc.).
+- `3` — any other non-queued outcome: a spawn error (`PermissionError`,
+  `OSError`), or no popup fired — `none` selected, or an explicitly chosen
+  native notifier unavailable on this host (status `no_notifier:*`).
 
 ## Surfaces
 
