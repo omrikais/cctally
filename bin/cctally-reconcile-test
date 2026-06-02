@@ -3397,6 +3397,11 @@ for fx in under warn over; do
 done
 
 # ─── Invariant PROJECTED1: projected-pace alert == displayed week-avg field ──
+# NAMESPACE NOTE: `PROJECTED*` invariants here are the projected-pace ALERT
+# axis (#121). They are unrelated to the `R-PROJ1..R-PROJ6` family above
+# (~line 1936), which reconciles the projects PANEL aggregation. Both
+# abbreviate to "PROJ" under a casual grep — the prefixes are deliberately
+# distinct (`PROJECTED` vs `R-PROJ`); keep them that way.
 # (#121, spec §4 "Reconcile invariant") The projected-pace alert axis fires on
 # the WEEK-AVERAGE projection — `p_now + r_avg*remaining` (weekly_pct) and
 # `spent + rate_avg*remaining` (budget_usd). That SAME number is surfaced as the
