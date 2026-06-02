@@ -16,7 +16,9 @@
     "weekly_thresholds": [
       90,
       95
-    ]
+    ],
+    "notifier": "auto",
+    "command_configured": false
   },
   "blocks": {
     "rows": [
