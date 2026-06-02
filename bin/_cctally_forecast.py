@@ -1760,9 +1760,9 @@ def _cmd_budget_set_project(args: argparse.Namespace) -> int:
         config["budget"] = block
         c.save_config(config)
 
-    # Forward-only reconcile (Task 3 no-op stub for now; spec §6.8): record
-    # already-crossed (project, threshold) pairs alerted_at-set WITHOUT
-    # dispatch, so setting a budget mid-week (already over) doesn't storm.
+    # Forward-only reconcile (spec §6.8): record already-crossed
+    # (project, threshold) pairs alerted_at-set WITHOUT dispatch, so setting a
+    # budget mid-week (already over) doesn't storm.
     c._reconcile_project_budget_milestones_on_write(validated)
 
     basename = os.path.basename(root) or root

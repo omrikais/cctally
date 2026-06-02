@@ -191,6 +191,12 @@ def test_crossing_records_rows_and_dispatches(ns, monkeypatch):
     }
     assert all(p["axis"] == "project_budget" for p, _ in captured)
     assert all(mode == "real" for _, mode in captured)
+    # Notification label disambiguates same-basename git-roots with a
+    # parent-dir segment (spec §5.3, mirrors `_project_disambiguate_labels`):
+    # PROJ_A = "/fake/repos/a" → "a (repos)".
+    assert all(
+        p["context"]["project"] == "a (repos)" for p, _ in captured
+    )
 
 
 def test_fire_once_second_run_is_noop(ns, monkeypatch):

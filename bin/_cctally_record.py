@@ -909,11 +909,14 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
             return  # nothing left to cross this week → skip the cost scan
 
         # ONE grouped scan over the week's session entries, bucketed by
-        # canonical git-root. skip_sync=True: an earlier axis this same tick
-        # (maybe_record_budget_milestone) already ran _sum_cost_for_range and
-        # warmed the cache; avoid a redundant JSONL ingest pass (Codex P2-4).
+        # canonical git-root. skip_sync=False (self-sufficient): the global
+        # budget axis only warms the cache when `budget.weekly_usd` is set, so a
+        # project-only user (no global budget) reaches here with a cold cache on
+        # a no-5h-anchor tick — sync here or a crossing fires a tick late. The
+        # pre-probe above already gated this scan to the rare pending-crossing
+        # tick, so the self-sufficient sync is near-free.
         by_proj = _sum_cost_by_project(
-            week_start_at, now_utc, mode="auto", skip_sync=True
+            week_start_at, now_utc, mode="auto", skip_sync=False
         )
         for project_key, t in pending:
             spent = float(by_proj.get(project_key, 0.0))
@@ -946,7 +949,16 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
                         "  AND threshold = ? AND alerted_at IS NULL",
                         (crossed_at, week_key, project_key, t),
                     )
-                    project_label = os.path.basename(project_key) or project_key
+                    # Disambiguate same-basename git-roots with a parent-dir
+                    # segment, matching the display surface's `(parent)` shape
+                    # (`_lib_render._project_disambiguate_labels`, spec §5.3) so
+                    # two "app" roots notify as `app (foo)` / `app (bar)`.
+                    basename = os.path.basename(project_key)
+                    parent = os.path.basename(os.path.dirname(project_key))
+                    if basename and parent:
+                        project_label = f"{basename} ({parent})"
+                    else:
+                        project_label = basename or project_key
                     pending_alerts.append(_build_alert_payload_project_budget(
                         threshold=t,
                         crossed_at_utc=crossed_at,

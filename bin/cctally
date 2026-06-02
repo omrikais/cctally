@@ -2085,7 +2085,7 @@ insert_projected_milestone          = _cctally_milestones.insert_projected_miles
 _projected_levels_already_latched   = _cctally_milestones._projected_levels_already_latched   # record shim
 _reconcile_budget_milestones_on_set = _cctally_milestones._reconcile_budget_milestones_on_set # test_budget_alerts ns[]
 _reconcile_budget_on_config_write   = _cctally_milestones._reconcile_budget_on_config_write   # forecast/config/dashboard c.; test_forecast_ns_patch mod. patch
-_reconcile_project_budget_milestones_on_write = _cctally_milestones._reconcile_project_budget_milestones_on_write  # forecast/config/dashboard c. (Task 2 no-op stub; Task 3 fills)
+_reconcile_project_budget_milestones_on_write = _cctally_milestones._reconcile_project_budget_milestones_on_write  # forecast/config/dashboard c. (forward-only project-budget reconcile)
 
 
 # === Update-banner predicate (spec §4.2) extracted to
