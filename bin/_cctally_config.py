@@ -310,6 +310,8 @@ ALLOWED_CONFIG_KEYS = (
     "budget.alerts_enabled",
     "budget.alert_thresholds",
     "budget.projected_enabled",
+    "budget.projects",
+    "budget.project_alerts_enabled",
 )
 
 
@@ -499,6 +501,8 @@ def _config_known_value(config: dict, key: str) -> "object":
         "budget.alerts_enabled",
         "budget.alert_thresholds",
         "budget.projected_enabled",
+        "budget.projects",
+        "budget.project_alerts_enabled",
     ):
         inner = key.split(".", 1)[1]
         # Read the validated, defaults-filled block. A corrupt block falls
@@ -513,6 +517,8 @@ def _config_known_value(config: dict, key: str) -> "object":
             default = _BUDGET_DEFAULTS[inner]
             if isinstance(default, list):
                 return list(default)
+            if isinstance(default, dict):
+                return dict(default)
             return default
     return None
 
@@ -522,11 +528,12 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
     if key is not None and key not in ALLOWED_CONFIG_KEYS:
         eprint(f"cctally config: unknown config key {key!r}")
         return 2
-    # `alerts.command_template` is JSON-shaped (a list of strings or null), so
-    # its real value (including None) must survive into the render layer — the
-    # generic None->"" coercion below would break the JSON shape / round-trip.
+    # `alerts.command_template` is JSON-shaped (a list of strings or null), and
+    # `budget.projects` is JSON-shaped (an object), so their real values
+    # (including None) must survive into the render layer — the generic
+    # None->"" coercion below would break the JSON shape / round-trip.
     def _coerce(k: str, v: "object") -> "object":
-        if k == "alerts.command_template":
+        if k in ("alerts.command_template", "budget.projects"):
             return v
         return v if v is not None else ""
 
@@ -555,10 +562,11 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
         for k, v in pairs:
             # Preserve canonical bool stringification (true/false) so
             # round-trips via `config set alerts.enabled <plain-text>` work.
-            if k == "alerts.command_template":
-                # JSON-encoded (list of strings or null) so `config get` output
-                # round-trips through `config set alerts.command_template`
-                # (which JSON-parses its value).
+            if k in ("alerts.command_template", "budget.projects"):
+                # JSON-encoded so `config get` output round-trips through the
+                # matching `config set` branch (both JSON-parse their value).
+                # `alerts.command_template` is a list-of-strings|null;
+                # `budget.projects` is an object {git-root: usd}.
                 rendered = json.dumps(v)
             elif isinstance(v, bool):
                 rendered = "true" if v else "false"
@@ -869,6 +877,8 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         "budget.alerts_enabled",
         "budget.alert_thresholds",
         "budget.projected_enabled",
+        "budget.projects",
+        "budget.project_alerts_enabled",
     ):
         inner_key = key.split(".", 1)[1]
         # Parse + normalize the raw value per key BEFORE acquiring the lock so
@@ -888,7 +898,9 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                         f"null, got {raw!r}"
                     )
                     return 2
-        elif inner_key in ("alerts_enabled", "projected_enabled"):
+        elif inner_key in (
+            "alerts_enabled", "projected_enabled", "project_alerts_enabled"
+        ):
             lo = raw.strip().lower()
             if lo in ("true", "yes", "on", "1"):
                 new_val = True
@@ -900,6 +912,24 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                     f"got {raw!r}"
                 )
                 return 2
+        elif inner_key == "projects":
+            # `budget.projects` is a dict {git-root: usd}, which the plain
+            # number/bool/list leaves can't round-trip — JSON-parse it (mirrors
+            # the alerts.command_template branch). The per-value numeric rule is
+            # enforced by _get_budget_config under the lock below; here we only
+            # reject non-JSON / non-object shape.
+            try:
+                parsed_obj = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                eprint(
+                    "cctally config: budget.projects must be a JSON object, "
+                    f"got {raw!r}"
+                )
+                return 2
+            if not isinstance(parsed_obj, dict):
+                eprint("cctally config: budget.projects must be a JSON object")
+                return 2
+            new_val = parsed_obj
         else:  # alert_thresholds — comma-separated int list (empty = silenced)
             stripped = raw.strip()
             parsed: "list[int]" = []
@@ -948,6 +978,10 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         else:
             if isinstance(out_val, bool):
                 rendered = "true" if out_val else "false"
+            elif inner_key == "projects":
+                # JSON so `config get budget.projects` round-trips back through
+                # this branch (str(dict) is not valid JSON).
+                rendered = json.dumps(out_val)
             else:
                 rendered = str(out_val)
             print(f"{key}={rendered}")
@@ -1070,6 +1104,8 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
         "budget.alerts_enabled",
         "budget.alert_thresholds",
         "budget.projected_enabled",
+        "budget.projects",
+        "budget.project_alerts_enabled",
     ):
         # Drop only the named leaf; preserve sibling budget.* keys (e.g.
         # unsetting weekly_usd keeps a customized alert_thresholds). If the

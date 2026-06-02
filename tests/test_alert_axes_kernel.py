@@ -39,10 +39,10 @@ def _restore_sys_modules():
             sys.modules[name] = mod
 
 
-def test_registry_has_four_axes_in_order():
+def test_registry_has_five_axes_in_order():
     m = _load("_lib_alert_axes")
     assert [d.id for d in m.AXIS_REGISTRY] == [
-        "weekly", "five_hour", "budget", "projected"
+        "weekly", "five_hour", "budget", "projected", "project_budget"
     ]
 
 
@@ -66,3 +66,17 @@ def test_descriptor_exposes_chip_and_table_metadata():
     assert by_id["projected"].chip_label == "PROJECTED"
     assert by_id["budget"].milestone_table == "budget_milestones"
     assert by_id["projected"].milestone_table == "projected_milestones"
+
+
+def test_project_budget_axis_registered():
+    """The per-project budget axis (5th) is registered with the PROJECT chip,
+    its own milestone table, and the axis-uniform 3-tier severity policy."""
+    m = _load("_lib_alert_axes")
+    by_id = {d.id: d for d in m.AXIS_REGISTRY}
+    assert by_id["project_budget"].chip_label == "PROJECT"
+    assert by_id["project_budget"].title_label == "Project budget"
+    assert by_id["project_budget"].milestone_table == "project_budget_milestones"
+    # Severity reuses the shared 3-tier policy unchanged.
+    assert m.severity_for(89) == "info"
+    assert m.severity_for(90) == "warn"
+    assert m.severity_for(100) == "critical"

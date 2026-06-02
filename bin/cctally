@@ -2068,6 +2068,7 @@ get_milestone_cost_for_week         = _cctally_milestones.get_milestone_cost_for
 get_milestones_for_week             = _cctally_milestones.get_milestones_for_week             # forecast c.; tui shim; percent-breakdown c.
 insert_percent_milestone            = _cctally_milestones.insert_percent_milestone            # record shim; idempotency-test mod.
 insert_budget_milestone             = _cctally_milestones.insert_budget_milestone             # record shim
+insert_project_budget_milestone     = _cctally_milestones.insert_project_budget_milestone     # record shim; project-budget-config-test ns[]
 insert_projected_milestone          = _cctally_milestones.insert_projected_milestone          # record shim
 _projected_levels_already_latched   = _cctally_milestones._projected_levels_already_latched   # record shim
 _reconcile_budget_milestones_on_set = _cctally_milestones._reconcile_budget_milestones_on_set # test_budget_alerts ns[]

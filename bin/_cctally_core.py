@@ -575,12 +575,16 @@ _BUDGET_DEFAULTS = {
     "alerts_enabled": True,        # "on when set"
     "alert_thresholds": [90, 100],
     "projected_enabled": False,    # projected-pace opt-in (#121); default OFF
+    "projects": {},               # per-project weekly $ budgets, keyed by git-root
+    "project_alerts_enabled": False,  # per-project alerts opt-in (#19/#121); default OFF
 }
 _BUDGET_CONFIG_VALID_KEYS = {
     "weekly_usd",
     "alerts_enabled",
     "alert_thresholds",
     "projected_enabled",
+    "projects",
+    "project_alerts_enabled",
 }
 
 
@@ -593,6 +597,7 @@ def _get_budget_config(cfg: dict) -> dict:
     """
     out = dict(_BUDGET_DEFAULTS)
     out["alert_thresholds"] = list(_BUDGET_DEFAULTS["alert_thresholds"])
+    out["projects"] = dict(_BUDGET_DEFAULTS["projects"])
     block = cfg.get("budget") if isinstance(cfg, dict) else None
     if block is None:
         return out
@@ -647,6 +652,41 @@ def _get_budget_config(cfg: dict) -> dict:
         if not isinstance(v, bool):
             raise _BudgetConfigError("budget.projected_enabled must be a boolean")
         out["projected_enabled"] = v
+
+    if "projects" in block:
+        v = block["projects"]
+        if not isinstance(v, dict):
+            raise _BudgetConfigError(
+                f"budget.projects must be an object, got {type(v).__name__}"
+            )
+        cleaned: "dict[str, float]" = {}
+        for proj_key, proj_val in v.items():
+            if not isinstance(proj_key, str):
+                raise _BudgetConfigError(
+                    "budget.projects keys must be strings (canonical git-root paths)"
+                )
+            # Reuse the weekly_usd numeric rule per value: a non-bool finite
+            # number > 0 (bool is an int subclass, so reject it explicitly).
+            if isinstance(proj_val, bool) or not isinstance(proj_val, (int, float)):
+                raise _BudgetConfigError(
+                    f"budget.projects values must be numbers, "
+                    f"got {type(proj_val).__name__} for key {proj_key!r}"
+                )
+            if not math.isfinite(float(proj_val)) or float(proj_val) <= 0:
+                raise _BudgetConfigError(
+                    f"budget.projects values must be finite numbers > 0, "
+                    f"got {proj_val!r} for key {proj_key!r}"
+                )
+            cleaned[proj_key] = float(proj_val)
+        out["projects"] = cleaned
+
+    if "project_alerts_enabled" in block:
+        v = block["project_alerts_enabled"]
+        if not isinstance(v, bool):
+            raise _BudgetConfigError(
+                "budget.project_alerts_enabled must be a boolean"
+            )
+        out["project_alerts_enabled"] = v
 
     return out
 
@@ -1123,6 +1163,42 @@ def open_db() -> sqlite3.Connection:
             crossed_at_utc  TEXT    NOT NULL,
             alerted_at      TEXT,
             UNIQUE(week_start_at, metric, threshold)
+        )
+        """
+    )
+
+    # ── project_budget_milestones (per-project equiv-$ budget crossings) ──────
+    # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / backfill — the
+    # same posture as `budget_milestones` / `projected_milestones` (write-once,
+    # forward-only, framework-untracked). `project_key` is the NEW dimension in
+    # the UNIQUE key: each project crosses each threshold once per week,
+    # independently of every other project (issue #19 / #121, spec §5.1). It
+    # stores the canonical git-root (`ProjectKey.bucket_path`), matched by string
+    # equality against each session entry's resolved git-root. `budget_usd`
+    # snapshots the project's target AT crossing time so the dashboard renders
+    # "$26 of $25" from the ROW, not from live config that may have changed since
+    # (the Codex P0-4 lesson, already baked into `budget_milestones` /
+    # `projected_milestones`). A mid-week quota reset re-anchors `week_start_at`
+    # (new window → fresh rows under the UNIQUE key) — budget-pattern reset
+    # handling, hence NO `reset_event_id` segment column. `alerted_at` is stamped
+    # BEFORE dispatch (set-then-dispatch invariant); NULL = "recorded without
+    # dispatch" (forward-only-from-set reconcile) OR "not yet dispatched", never
+    # "delivery failed". Lives BEFORE the migration dispatcher: a plain CREATE on
+    # a framework-untracked table never touches `schema_migrations`, so the
+    # dispatcher's fresh-install snapshot is unaffected.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS project_budget_milestones (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            week_start_at   TEXT    NOT NULL,
+            project_key     TEXT    NOT NULL,   -- canonical git-root (bucket_path)
+            threshold       INTEGER NOT NULL,
+            budget_usd      REAL    NOT NULL,   -- project's target snapshotted AT crossing
+            spent_usd       REAL    NOT NULL,
+            consumption_pct REAL    NOT NULL,
+            crossed_at_utc  TEXT    NOT NULL,
+            alerted_at      TEXT,
+            UNIQUE(week_start_at, project_key, threshold)
         )
         """
     )

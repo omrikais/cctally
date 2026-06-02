@@ -85,12 +85,15 @@ def test_http_budget_valid_round_trip(monkeypatch, tmp_path):
         assert status == 200, body
         assert body is not None
         # Echo is the full validated block (defaults filled: alerts_enabled
-        # True; projected_enabled False — projected-pace opt-in, #121).
+        # True; projected_enabled False — projected-pace opt-in, #121; and the
+        # per-project leaves projects {} / project_alerts_enabled False — #19).
         assert body["budget"] == {
             "weekly_usd": 300.0,
             "alerts_enabled": True,
             "alert_thresholds": [90, 100],
             "projected_enabled": False,
+            "projects": {},
+            "project_alerts_enabled": False,
         }
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg.get("budget", {}).get("weekly_usd") == 300.0

@@ -369,6 +369,52 @@ def insert_budget_milestone(
     return int(cur.rowcount)
 
 
+def insert_project_budget_milestone(
+    conn: sqlite3.Connection,
+    *,
+    week_start_at: str,
+    project_key: str,
+    threshold: int,
+    budget_usd: float,
+    spent_usd: float,
+    consumption_pct: float,
+    commit: bool = True,
+) -> int:
+    """INSERT OR IGNORE a per-project budget threshold crossing. Returns
+    ``cur.rowcount`` (1 = genuinely new crossing, 0 = INSERT OR IGNORE no-op on a
+    pre-existing ``(week_start_at, project_key, threshold)`` row).
+
+    Mirrors :func:`insert_budget_milestone` EXACTLY, with ``project_key`` added
+    as the per-project dimension of the UNIQUE dedup key (spec §5.1) — each
+    project crosses each threshold once per week, independently. The rowcount
+    contract matches :func:`insert_percent_milestone` so the alert-fire predicate
+    (`if inserted == 1`) is race-safe without a follow-up SELECT. ``alerted_at``
+    is left NULL — the caller stamps it in the SAME transaction BEFORE
+    dispatching (set-then-dispatch invariant, CLAUDE.md Alerts gotcha).
+    ``commit=False`` lets the caller bundle the INSERT with the follow-up
+    ``alerted_at`` UPDATE in one transaction so a crash between them can't strand
+    ``alerted_at`` NULL forever.
+    """
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO project_budget_milestones "
+        "(week_start_at, project_key, threshold, budget_usd, spent_usd, "
+        " consumption_pct, crossed_at_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            week_start_at,
+            str(project_key),
+            int(threshold),
+            float(budget_usd),
+            float(spent_usd),
+            float(consumption_pct),
+            now_utc_iso(),
+        ),
+    )
+    if commit:
+        conn.commit()
+    return int(cur.rowcount)
+
+
 def insert_projected_milestone(
     conn: sqlite3.Connection,
     *,
