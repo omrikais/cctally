@@ -191,12 +191,48 @@ def test_crossing_records_rows_and_dispatches(ns, monkeypatch):
     }
     assert all(p["axis"] == "project_budget" for p, _ in captured)
     assert all(mode == "real" for _, mode in captured)
-    # Notification label disambiguates same-basename git-roots with a
-    # parent-dir segment (spec §5.3, mirrors `_project_disambiguate_labels`):
-    # PROJ_A = "/fake/repos/a" → "a (repos)".
+    # Notification label is collision-aware, byte-matching the display
+    # (`_project_disambiguate_labels`, spec §5.3): PROJ_A's basename `a` is
+    # UNIQUE among the configured set ({a, b}), so the label is the bare
+    # basename `a` — NOT over-qualified with the parent dir. The collision
+    # path (which DOES append `(parent)`) is proved by
+    # `test_crossing_label_disambiguates_same_basename_roots` below.
     assert all(
-        p["context"]["project"] == "a (repos)" for p, _ in captured
+        p["context"]["project"] == "a" for p, _ in captured
     )
+
+
+def test_crossing_label_disambiguates_same_basename_roots(ns, monkeypatch):
+    """Two configured roots sharing a basename (`/fake/work/app` +
+    `/fake/personal/app`) BOTH cross — the notifications must carry distinct,
+    parent-dir-disambiguated labels (`app (work)` / `app (personal)`), proving
+    the collision path still qualifies the label exactly as the display does
+    (`_project_disambiguate_labels`, spec §5.3). The companion
+    `test_crossing_records_rows_and_dispatches` proves a uniquely-named project
+    keeps its BARE basename — together they pin both branches of the map."""
+    _seed_window(ns)
+    work_app = "/fake/work/app"
+    personal_app = "/fake/personal/app"
+    _write_config(ns, projects={work_app: 25.0, personal_app: 25.0},
+                  thresholds=(100,))
+    # Both over budget → both cross 100.
+    _patch_spend(ns, monkeypatch,
+                 by_proj={work_app: 26.0, personal_app: 30.0})
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    ns["maybe_record_project_budget_milestone"]({})
+
+    # One crossing per root, each carrying its project_key + the disambiguated
+    # label keyed off the PARENT dir (collision-only — the bare basename `app`
+    # would be ambiguous across the two roots).
+    label_by_key = {
+        p["context"]["project_key"]: p["context"]["project"]
+        for p, _ in captured
+    }
+    assert label_by_key == {
+        work_app: "app (work)",
+        personal_app: "app (personal)",
+    }
 
 
 def test_fire_once_second_run_is_noop(ns, monkeypatch):

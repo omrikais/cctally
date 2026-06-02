@@ -281,6 +281,10 @@ def _resolve_project_key(*args, **kwargs):
     return sys.modules["cctally"]._resolve_project_key(*args, **kwargs)
 
 
+def _project_disambiguate_labels(*args, **kwargs):
+    return sys.modules["cctally"]._project_disambiguate_labels(*args, **kwargs)
+
+
 def _get_budget_config(*args, **kwargs):
     return sys.modules["cctally"]._get_budget_config(*args, **kwargs)
 
@@ -908,6 +912,29 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
         if not pending:
             return  # nothing left to cross this week → skip the cost scan
 
+        # Resolve every configured key to its ProjectKey ONCE, then route the
+        # firing-path labels through the SAME collision-disambiguation primitive
+        # the display uses (`_build_project_budget_rows` → `cmd_project`'s table
+        # / share snapshot). A bare `display_key` is just the basename, so a
+        # uniquely-named project keeps its bare basename in the notification —
+        # byte-matching the table + dashboard chip — and only same-basename
+        # roots (`/work/app` + `/personal/app`) get the `(parent)` segment
+        # ("app (work)" / "app (personal)"). The configured set is small + the
+        # resolver caches, so this is near-free on the rare crossing tick.
+        resolver_cache: dict = {}
+        proj_keys = sorted(projects)
+        pkeys = [
+            _resolve_project_key(p, "git-root", resolver_cache)
+            for p in proj_keys
+        ]
+        disambig = _project_disambiguate_labels(
+            [{"key": pk} for pk in pkeys]
+        )
+        label_by_key = {
+            proj_keys[i]: disambig.get(i, pkeys[i].display_key)
+            for i in range(len(proj_keys))
+        }
+
         # ONE grouped scan over the week's session entries, bucketed by
         # canonical git-root. skip_sync=False (self-sufficient): the global
         # budget axis only warms the cache when `budget.weekly_usd` is set, so a
@@ -949,16 +976,14 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
                         "  AND threshold = ? AND alerted_at IS NULL",
                         (crossed_at, week_key, project_key, t),
                     )
-                    # Disambiguate same-basename git-roots with a parent-dir
-                    # segment, matching the display surface's `(parent)` shape
-                    # (`_lib_render._project_disambiguate_labels`, spec §5.3) so
-                    # two "app" roots notify as `app (foo)` / `app (bar)`.
-                    basename = os.path.basename(project_key)
-                    parent = os.path.basename(os.path.dirname(project_key))
-                    if basename and parent:
-                        project_label = f"{basename} ({parent})"
-                    else:
-                        project_label = basename or project_key
+                    # Label is collision-aware, byte-matching the display: a
+                    # uniquely-named project notifies as its bare basename,
+                    # only same-basename roots get the `(parent)` segment (the
+                    # `label_by_key` map built above via the shared
+                    # `_project_disambiguate_labels` primitive, spec §5.3).
+                    project_label = label_by_key.get(
+                        project_key, os.path.basename(project_key) or project_key
+                    )
                     pending_alerts.append(_build_alert_payload_project_budget(
                         threshold=t,
                         crossed_at_utc=crossed_at,
@@ -2822,8 +2847,9 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         eprint(f"[budget-milestone] unexpected error: {exc}")
 
     # NEW: per-project equiv-$ budget alert firing (axis `project_budget`,
-    # #19/#121). Runs AFTER the global budget axis so the _sum_cost_for_range
-    # above has warmed the cache (the per-project scan passes skip_sync=True).
+    # #19/#121). Runs AFTER the global budget axis, but the per-project scan is
+    # self-sufficient — it passes skip_sync=False so a project-only user (no
+    # global budget warming the cache) still resolves live spend on this tick.
     # Gated FIRST on a non-empty budget.projects + project_alerts_enabled — non-
     # users pay only one config read.
     try:
