@@ -136,10 +136,20 @@ class RaisingPopen:
     def __init__(self, cmd, **kw):
         raise FileNotFoundError("no osascript")
 
-status_ok = m._dispatch_alert_notification(weekly_payload, popen_factory=FakePopen, mode="real")
+# Pin platform="darwin" so this osascript-focused harness resolves a real
+# notifier (and thus actually spawns through FakePopen -> "queued") regardless
+# of the host OS. Without the pin, a Linux CI host with no notify-send would
+# resolve to "none" and never reach the popen_factory. The full cross-platform
+# matrix (notify-send / no-notifier / command_template) is proven in
+# tests/test_alert_dispatch.py via injected platform/which_on_path.
+status_ok = m._dispatch_alert_notification(
+    weekly_payload, popen_factory=FakePopen, mode="real", platform="darwin"
+)
 emit("dispatch.queued.status", status_ok)
 
-status_err = m._dispatch_alert_notification(weekly_payload, popen_factory=RaisingPopen, mode="real")
+status_err = m._dispatch_alert_notification(
+    weekly_payload, popen_factory=RaisingPopen, mode="real", platform="darwin"
+)
 emit("dispatch.spawn_error.status", status_err)
 
 # ---------------------------------------------------------------- log

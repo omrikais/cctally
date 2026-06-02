@@ -46,6 +46,7 @@
     "bin/_cctally_weekrefs.py",
     "bin/_lib_aggregators.py",
     "bin/_lib_alert_axes.py",
+    "bin/_lib_alert_dispatch.py",
     "bin/_lib_alerts_payload.py",
     "bin/_lib_blocks.py",
     "bin/_lib_budget.py",

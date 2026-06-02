@@ -230,16 +230,19 @@ if log_path.exists():
     lines = log_path.read_text().splitlines()
     print(f"log_lines={len(lines)}")
     for i, ln in enumerate(lines):
-        # Tab-delimited: ts, axis, threshold, window_key, mode, status
-        # Print just the (axis, threshold, mode, status_kind) tuple so
-        # the bash side can assert without dealing with timestamps.
+        # Tab-delimited: ts, axis, threshold, window_key, mode, status, severity
+        # Print the (axis, threshold, mode, status_kind, severity) tuple so the
+        # bash side can assert without dealing with timestamps. severity is the
+        # Phase B 7th column ('info'|'warn'|'critical'); "" when an older line
+        # predates the column.
         parts = ln.split("\t")
         if len(parts) >= 6:
             axis, thr, mode, status = parts[1], parts[2], parts[4], parts[5]
+            severity = parts[6] if len(parts) >= 7 else ""
             status_kind = "queued" if status == "queued" else (
                 "spawn_error" if status.startswith("spawn_error") else "other"
             )
-            print(f"log_{i}={axis}|{thr}|{mode}|{status_kind}")
+            print(f"log_{i}={axis}|{thr}|{mode}|{status_kind}|{severity}")
 else:
     print("log_lines=0")
 PY
@@ -303,6 +306,9 @@ else
     assert_eq "enabled-weekly-90: log_lines == 1" "1" "$(get_state log_lines)"
     assert_contains "enabled-weekly-90: log line 0 carries weekly|90|real|queued" \
         "weekly|90|real|queued" "$(get_state log_0)"
+    # Phase B: the 7th log column is the crossing's 3-tier severity (90 -> warn).
+    assert_contains "enabled-weekly-90: log line carries severity warn" \
+        "real|queued|warn" "$(get_state log_0)"
 fi
 
 # ─── Scenario 4: enabled-five-hour-95 ────────────────────────────────

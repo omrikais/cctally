@@ -383,6 +383,11 @@ _build_alert_payload_five_hour = _lib_alerts_payload._build_alert_payload_five_h
 _build_alert_payload_budget = _lib_alerts_payload._build_alert_payload_budget
 _build_alert_payload_projected = _lib_alerts_payload._build_alert_payload_projected
 
+_lib_alert_dispatch = _load_sibling("_lib_alert_dispatch")
+resolve_notifier = _lib_alert_dispatch.resolve_notifier
+build_command = _lib_alert_dispatch.build_command
+severity_to_urgency = _lib_alert_dispatch.severity_to_urgency
+
 _lib_five_hour = _load_sibling("_lib_five_hour")
 _FIVE_HOUR_JITTER_FLOOR_SECONDS = _lib_five_hour._FIVE_HOUR_JITTER_FLOOR_SECONDS
 _floor_to_ten_minutes = _lib_five_hour._floor_to_ten_minutes

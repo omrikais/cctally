@@ -47,6 +47,7 @@ import datetime as dt
 import importlib.util as _ilu
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -76,6 +77,24 @@ _build_alert_payload_five_hour = _lib_alerts_payload._build_alert_payload_five_h
 _build_alert_payload_budget = _lib_alerts_payload._build_alert_payload_budget
 _build_alert_payload_projected = _lib_alerts_payload._build_alert_payload_projected
 
+# Phase B: severity policy + the cross-platform dispatch kernel. The kernel is
+# pure (parameterized on platform + which_on_path); this module is the I/O glue
+# that injects the real sys.platform / shutil.which and spawns with shell=False.
+_lib_alert_axes = _load_lib("_lib_alert_axes")
+severity_for = _lib_alert_axes.severity_for
+_lib_alert_dispatch = _load_lib("_lib_alert_dispatch")
+resolve_notifier = _lib_alert_dispatch.resolve_notifier
+build_command = _lib_alert_dispatch.build_command
+severity_to_urgency = _lib_alert_dispatch.severity_to_urgency
+
+
+# `load_config` STAYS a shim that bounces through cctally's namespace (mirrors
+# bin/_cctally_record.py): production monkeypatches `cctally.load_config`, and
+# the dispatch tests patch this module-level name directly. Its natural home is
+# _cctally_config; a direct import would silently bypass those patches.
+def load_config(*args, **kwargs):
+    return sys.modules["cctally"].load_config(*args, **kwargs)
+
 
 # === Honest imports from extracted homes ===================================
 # Spec 2026-05-17 §3.3: kernel symbols import from _cctally_core.
@@ -103,14 +122,26 @@ def _dispatch_alert_notification(
     popen_factory=subprocess.Popen,
     mode: str = "real",
     tz: "object | None" = None,
+    platform: "str | None" = None,
+    which_on_path=None,
 ) -> str:
-    """Spawn osascript to display a macOS notification (non-blocking, best-effort).
+    """Dispatch a notification for a crossed threshold (non-blocking, best-effort).
 
-    Returns ``"queued"`` on successful Popen, ``"spawn_error: <ExcType>: <msg>"``
-    on failure. Writes EXACTLY ONE line to ``alerts.log`` with the terminal
-    status (no contradictory pre-/post-Popen log pair). Never raises:
-    Popen-spawn failures and log-write failures are both swallowed so the
-    dispatch contract stays independent of the OS / FS state.
+    Picks the active notifier (osascript / notify-send / a config-driven
+    command_template / none) via the pure ``_lib_alert_dispatch`` kernel, builds
+    its exact arg-list, and spawns it with ``shell=False``. Returns one of:
+      ``"queued"``                  Popen succeeded
+      ``"no_notifier:none"``        auto/none resolved to no popup on this host
+      ``"no_notifier:unavailable"`` an explicit osascript/notify-send is missing
+      ``"spawn_error: <ExcType>: <msg>"`` Popen raised
+    Writes EXACTLY ONE line to ``alerts.log`` with the terminal status PLUS the
+    crossing's 3-tier severity as a trailing column. Never raises: the config
+    read, Popen-spawn failures, and log-write failures are all swallowed so the
+    dispatch contract stays independent of the OS / FS / user-config state.
+
+    ``platform`` (sys.platform-style) and ``which_on_path`` (name -> bool) are
+    injectable so every OS branch + the no-notifier paths are testable from any
+    host; both default to the real ``sys.platform`` / ``shutil.which``.
 
     Production callers ignore the return value (fire-and-forget); test
     callers assert on it via an injected ``popen_factory``.
@@ -149,27 +180,61 @@ def _dispatch_alert_notification(
             f"axis={axis} threshold={payload.get('threshold')}",
         )
 
-    script = (
-        f'display notification "{_escape_applescript_string(body)}"'
-        f' with title "{_escape_applescript_string(title)}"'
-        f' subtitle "{_escape_applescript_string(subtitle)}"'
+    # Severity (3-tier) drives both the notify-send urgency token and the
+    # trailing log column. A missing threshold (defensive — shouldn't happen for
+    # a real crossing) floors at "info".
+    threshold = payload.get("threshold")
+    severity = severity_for(int(threshold)) if threshold is not None else "info"
+    urgency = severity_to_urgency(severity)
+
+    if platform is None:
+        platform = sys.platform
+    if which_on_path is None:
+        which_on_path = lambda name: shutil.which(name) is not None
+
+    # Guarded so a malformed user config (or a load_config raise) never breaks
+    # the never-raise contract: fall back to auto-detect / no custom command.
+    try:
+        alerts_cfg = _cctally_core._get_alerts_config(load_config())
+    except Exception:
+        alerts_cfg = {"notifier": "auto", "command_template": None}
+
+    notifier = resolve_notifier(
+        alerts_cfg, platform=platform, which_on_path=which_on_path
+    )
+    args = build_command(
+        notifier,
+        title=title,
+        subtitle=subtitle,
+        body=body,
+        severity=severity,
+        urgency=urgency,
+        payload=payload,
+        command_template=alerts_cfg.get("command_template"),
     )
 
     status: str
-    try:
-        popen_factory(
-            ["osascript", "-e", script],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            start_new_session=True,
-        )
-        status = "queued"
-    except (FileNotFoundError, PermissionError, OSError) as exc:
-        status = f"spawn_error: {exc.__class__.__name__}: {exc}"
+    if args is None:
+        # 'none' (auto resolved to no popup, or notifier='none') vs an
+        # explicitly-selected native backend that is unavailable on this host.
+        selector = alerts_cfg.get("notifier", "auto")
+        reason = "unavailable" if selector in ("osascript", "notify-send") else "none"
+        status = f"no_notifier:{reason}"
+    else:
+        try:
+            popen_factory(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
+            status = "queued"
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            status = f"spawn_error: {exc.__class__.__name__}: {exc}"
 
-    # SINGLE log line per dispatch attempt (Codex P1#2 fix: no
-    # contradictory "queued" + "spawn_error" pair for the same call).
+    # SINGLE log line per dispatch attempt (Codex P1#2 fix: no contradictory
+    # "queued" + "spawn_error" pair). Severity is appended as the 7th column.
     try:
         log_path = _alerts_log_path()
         ctx = payload.get("context") or {}
@@ -181,7 +246,7 @@ def _dispatch_alert_notification(
         )
         line = (
             f"{now_utc_iso()}\t{axis}\t{payload.get('threshold')}\t{window_key}"
-            f"\t{mode}\t{status}\n"
+            f"\t{mode}\t{status}\t{severity}\n"
         )
         with open(log_path, "a") as f:
             f.write(line)
