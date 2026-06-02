@@ -551,6 +551,53 @@ assert_contains "projected-text budget_usd-100 subtitle" \
 assert_contains "projected-text budget_usd-100 body" \
     "BODY	Projected \$312.00 of \$300.00 budget (week-average pace)" "$out"
 
+# ─── Per-project budget alert text goldens (axis `project_budget`, #19) ──
+# Mirrors the projected-text block above: render the exact production builder
+# (`_alert_text_project_budget`) from the live script and assert the captured
+# triple. The text MUST be project-specific (basename + $spent/$budget) — NOT
+# the generic `axis=...` fallback that `_dispatch_alert_notification` emits for
+# an unrecognized axis (spec §5.3). Goldens captured from real builder output.
+render_project_budget () {
+    # $1=project  $2=threshold  $3=spent_usd  $4=budget_usd  $5=consumption_pct
+    python3 - "$REPO_ROOT" "$1" "$2" "$3" "$4" "$5" <<'PYEOF'
+import importlib.util, pathlib, sys
+from importlib.machinery import SourceFileLoader
+repo, project, t, spent, budget, cons = sys.argv[1:7]
+binp = pathlib.Path(repo) / "bin" / "_lib_alerts_payload.py"
+loader = SourceFileLoader("_lib_alerts_payload", str(binp))
+spec = importlib.util.spec_from_loader("_lib_alerts_payload", loader)
+m = importlib.util.module_from_spec(spec)
+sys.modules["_lib_alerts_payload"] = m
+loader.exec_module(m)
+p = m._build_alert_payload_project_budget(
+    threshold=int(t), crossed_at_utc="2026-06-01T00:00:00Z",
+    week_start_at="2026-06-01T00:00:00Z", project=project,
+    project_key=f"/fake/repos/{project}", budget_usd=float(budget),
+    spent_usd=float(spent), consumption_pct=float(cons),
+)
+title, subtitle, body = m._alert_text_project_budget(p, None)
+print(f"TITLE\t{title}")
+print(f"SUB\t{subtitle}")
+print(f"BODY\t{body}")
+PYEOF
+}
+
+# foo @ 100 (over budget: $26 of $25 = 104%)
+out="$(render_project_budget foo 100 26.0 25.0 104.0)"
+assert_contains "project-budget-text foo-100 title" \
+    "TITLE	cctally - project budget" "$out"
+assert_contains "project-budget-text foo-100 subtitle (project + threshold)" \
+    "SUB	foo - 100% of budget" "$out"
+assert_contains "project-budget-text foo-100 body (project + \$spent/\$budget)" \
+    "BODY	Project foo - \$26.00 of \$25.00 (104% of budget)" "$out"
+
+# bar @ 90 (warn: $18 of $20 = 90%)
+out="$(render_project_budget bar 90 18.0 20.0 90.0)"
+assert_contains "project-budget-text bar-90 subtitle" \
+    "SUB	bar - 90% of budget" "$out"
+assert_contains "project-budget-text bar-90 body" \
+    "BODY	Project bar - \$18.00 of \$20.00 (90% of budget)" "$out"
+
 echo
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

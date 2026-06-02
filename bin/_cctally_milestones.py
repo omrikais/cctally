@@ -547,16 +547,82 @@ def _reconcile_budget_on_config_write(validated_budget):
         eprint(f"[budget-milestone] reconcile on set failed: {exc}")
 
 
-def _reconcile_project_budget_milestones_on_write(_validated_budget):
+def _reconcile_project_budget_milestones_on_write(validated_budget):
     """Forward-only-from-write reconcile for PER-PROJECT budgets (spec §6.8).
 
-    Task 2 ships this as a NO-OP stub so the call sites in
-    ``_cmd_budget_set_project`` / ``_cmd_budget_unset_project`` (and, later,
-    ``config set budget.*`` + the dashboard toggle) exist and are exercised.
-    Task 3 fills in the body: for each configured project, compute current-week
-    spend (the shared ``_sum_cost_by_project`` scan), and for each
-    already-crossed ``(project, threshold)`` INSERT OR IGNORE a milestone with
-    ``alerted_at`` stamped and NO dispatch — gated on per-project alerts being
-    active, best-effort, run OUTSIDE any ``config_writer_lock``.
+    Shared by all four per-project write surfaces: ``budget set --project`` /
+    ``unset --project`` (call sites in ``_cmd_budget_set_project`` /
+    ``_cmd_budget_unset_project``), ``config set budget.projects`` /
+    ``config set budget.project_alerts_enabled`` (call site in
+    ``_cmd_config_set``), and the dashboard ``project_alerts_enabled`` toggle
+    (POST /api/settings, Task 4). Mirrors :func:`_reconcile_budget_on_config_write`.
+
+    Mechanic: for each configured project, compute current-week spend (the
+    shared ``_sum_cost_by_project`` scan), and for each ALREADY-crossed
+    ``(project, threshold)`` ``INSERT OR IGNORE`` a milestone with ``alerted_at``
+    stamped and **NO dispatch** — so setting a project budget mid-week (already
+    over) records the crossed thresholds as already-alerted without an
+    instant-popup; only LATER crossings fire via
+    :func:`maybe_record_project_budget_milestone`.
+
+    Dedup via ``UNIQUE(week_start_at, project_key, threshold)`` + the
+    ``alerted_at IS NULL`` UPDATE guard, so a mid-week TARGET change never
+    re-stamps an already-alerted row (mirrors the global reconcile's
+    target-change semantics).
+
+    Gated: runs ONLY when per-project alerts are active (``projects`` non-empty
+    **and** ``project_alerts_enabled`` **and** ``alert_thresholds`` non-empty);
+    else records nothing. Best-effort — a stats.db failure never fails the config
+    write. Runs OUTSIDE any ``config_writer_lock`` (``open_db`` has its own
+    locking).
     """
-    return  # Task 3
+    projects = (validated_budget or {}).get("projects") or {}
+    thresholds = validated_budget.get("alert_thresholds") or []
+    if not (
+        projects
+        and validated_budget.get("project_alerts_enabled")
+        and thresholds
+    ):
+        return
+    c = _cctally()
+    try:
+        conn = open_db()
+        try:
+            now_utc = _command_as_of()
+            window = c._resolve_current_budget_window(conn, now_utc)
+            if window is None:
+                return
+            week_start_at, _week_end_at = window
+            week_key = week_start_at.isoformat(timespec="seconds")
+            by_proj = c._sum_cost_by_project(week_start_at, now_utc, mode="auto")
+            for project_key, target in projects.items():
+                spent = float(by_proj.get(project_key, 0.0))
+                target = float(target)
+                consumption_pct = (
+                    (spent / target * 100.0) if target > 0 else 0.0
+                )
+                for t in sorted(thresholds):
+                    if consumption_pct + 1e-9 >= t:
+                        insert_project_budget_milestone(
+                            conn,
+                            week_start_at=week_key,
+                            project_key=project_key,
+                            threshold=t,
+                            budget_usd=target,
+                            spent_usd=spent,
+                            consumption_pct=consumption_pct,
+                            commit=False,
+                        )
+                        conn.execute(
+                            "UPDATE project_budget_milestones SET alerted_at = ? "
+                            "WHERE week_start_at = ? AND project_key = ? "
+                            "  AND threshold = ? AND alerted_at IS NULL",
+                            (now_utc_iso(), week_key, project_key, t),
+                        )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:  # best-effort; never fail the write
+        eprint(
+            f"[project-budget-milestone] reconcile on write failed: {exc}"
+        )

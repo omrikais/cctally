@@ -972,6 +972,13 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         # (fcntl.flock is per-fd; the helper has its own open_db locking).
         c = _cctally()
         c._reconcile_budget_on_config_write(validated)
+        # Per-project forward-only reconcile (spec §6.8): enabling
+        # `budget.project_alerts_enabled` or installing a `budget.projects`
+        # entry while a project is already past a threshold must record the
+        # crossed (project, threshold) pairs as already-alerted so the next
+        # record-usage tick does NOT dispatch retroactive alerts. Self-gated +
+        # best-effort; runs OUTSIDE config_writer_lock (its own open_db lock).
+        c._reconcile_project_budget_milestones_on_write(validated)
         out_val = validated[inner_key]
         if getattr(args, "emit_json", False):
             print(json.dumps({"budget": {inner_key: out_val}}, indent=2))

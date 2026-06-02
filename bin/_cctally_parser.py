@@ -2191,15 +2191,17 @@ def build_parser() -> argparse.ArgumentParser:
               cctally alerts test
               cctally alerts test --axis five-hour --threshold 95
               cctally alerts test --axis budget --threshold 100
+              cctally alerts test --axis project-budget --threshold 100
               cctally alerts test --axis projected --metric budget_usd
         """),
     )
     p_alerts_test.add_argument(
         "--axis",
-        choices=["weekly", "five-hour", "budget", "projected"],
+        choices=["weekly", "five-hour", "budget", "project-budget", "projected"],
         default="weekly",
         help="Alert axis to simulate: weekly subscription window, 5h block, "
-             "equiv-$ budget, or projected-pace (default: weekly).",
+             "equiv-$ budget, per-project equiv-$ budget, or projected-pace "
+             "(default: weekly).",
     )
     p_alerts_test.add_argument(
         "--threshold",

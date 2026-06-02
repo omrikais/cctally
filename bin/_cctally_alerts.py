@@ -70,11 +70,13 @@ _lib_alerts_payload = _load_lib("_lib_alerts_payload")
 _alert_text_weekly = _lib_alerts_payload._alert_text_weekly
 _alert_text_five_hour = _lib_alerts_payload._alert_text_five_hour
 _alert_text_budget = _lib_alerts_payload._alert_text_budget
+_alert_text_project_budget = _lib_alerts_payload._alert_text_project_budget
 _alert_text_projected = _lib_alerts_payload._alert_text_projected
 _escape_applescript_string = _lib_alerts_payload._escape_applescript_string
 _build_alert_payload_weekly = _lib_alerts_payload._build_alert_payload_weekly
 _build_alert_payload_five_hour = _lib_alerts_payload._build_alert_payload_five_hour
 _build_alert_payload_budget = _lib_alerts_payload._build_alert_payload_budget
+_build_alert_payload_project_budget = _lib_alerts_payload._build_alert_payload_project_budget
 _build_alert_payload_projected = _lib_alerts_payload._build_alert_payload_projected
 
 # Phase B: severity policy + the cross-platform dispatch kernel. The kernel is
@@ -171,6 +173,8 @@ def _dispatch_alert_notification(
         title, subtitle, body = _alert_text_five_hour(payload, tz)
     elif axis == "budget":
         title, subtitle, body = _alert_text_budget(payload, tz)
+    elif axis == "project_budget":
+        title, subtitle, body = _alert_text_project_budget(payload, tz)
     elif axis == "projected":
         title, subtitle, body = _alert_text_projected(payload, tz)
     else:
@@ -279,6 +283,8 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
         axis = "weekly"
     elif args.axis == "budget":
         axis = "budget"
+    elif args.axis == "project-budget":
+        axis = "project_budget"
     elif args.axis == "projected":
         axis = "projected"
     else:
@@ -312,6 +318,22 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
             budget_usd=300.0,
             spent_usd=300.0 * threshold / 100.0,
             consumption_pct=float(threshold),
+        )
+    elif axis == "project_budget":
+        # Synthetic per-project budget payload — NO DB writes (test/real
+        # divergence contract), NO real budget.projects entry required. A small
+        # $25 budget at $26 spent (104%) reads plausibly regardless of the
+        # --threshold (the body line shows the at-crossing snapshot the dashboard
+        # would render).
+        payload = _build_alert_payload_project_budget(
+            threshold=threshold,
+            crossed_at_utc=now_utc_iso(),
+            week_start_at=dt.date.today().isoformat(),
+            project="example-project",
+            project_key="/example/repos/example-project",
+            budget_usd=25.0,
+            spent_usd=26.0,
+            consumption_pct=104.0,
         )
     elif axis == "projected":
         # Synthetic projected-pace payload — NO DB writes (test/real divergence

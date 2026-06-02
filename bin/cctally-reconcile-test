@@ -3601,6 +3601,121 @@ else
     fail_count=$((fail_count + 1))
 fi
 
+# ─── Invariant PROJBUDGET1: per-project budget spend + fired consumption_pct ──
+# (Task 3, spec §9.4) TWO independent paths reconcile within 1e-9 over the
+# seeded `per-project` window:
+#   (A) Σ `budget --json .projects[].spent_usd` ≡ the SAME per-project costs
+#       `project --json .projects[].costUsd` reports for the matching
+#       projectPath. Two different commands, two different aggregation entry
+#       points, one underlying `_sum_cost_by_project` truth — so a drift in
+#       either consumer is caught.
+#   (B) The alert-fire `consumption_pct` (written into `project_budget_milestones`
+#       by the ACTUAL reconcile path `_reconcile_project_budget_milestones_on_write`)
+#       ≡ the displayed `budget --json .projects[].consumption_pct` for the same
+#       project. We DRIVE the real reconcile (not a re-derivation) so the fired
+#       value is bound to the displayed value by construction — exactly how the
+#       PROJECTED1 invariant binds the projected detector to the displayed
+#       week-avg field.
+# Mirrors the BUDGET1 / PROJECTED1 structure (load `bin/cctally`, drive the real
+# path, assert against the published JSON within 1e-9).
+PROJBUDGET1_PY='
+import json, os, sys, importlib.util
+from importlib.machinery import SourceFileLoader
+
+budget = json.loads(os.environ["RECONCILE_A"])   # budget --json
+project = json.loads(os.environ["RECONCILE_B"])   # project --json
+
+# ── (A) per-project spend reconciliation: budget.projects[].spent_usd ≡
+#        project.projects[].costUsd for the matching projectPath ─────────────
+proj_cost = {p["projectPath"]: p["costUsd"] for p in project["projects"]}
+bproj = {p["project_key"]: p for p in budget.get("projects", [])}
+assert bproj, "PROJBUDGET1 vacuous: budget --json carried no projects[]"
+matched = 0
+for key, row in bproj.items():
+    spent_budget = row["spent_usd"]
+    # A configured project with no spend this window is absent from project
+    # --json (it renders a $0 budget row); skip it from the spend-equality leg.
+    if key not in proj_cost:
+        assert abs(spent_budget) < 1e-9, (
+            f"PROJBUDGET1: {key} has budget spent_usd={spent_budget} but no "
+            f"project --json row"
+        )
+        continue
+    matched += 1
+    assert abs(spent_budget - proj_cost[key]) < 1e-9, (
+        f"PROJBUDGET1 (A): budget.spent_usd={spent_budget} != "
+        f"project.costUsd={proj_cost[key]} for {key}"
+    )
+assert matched > 0, "PROJBUDGET1 (A) vacuous: no configured project matched a project --json row"
+
+# ── (B) fired consumption_pct ≡ displayed consumption_pct ──────────────────
+bin_dir = os.environ["PROJBUDGET_BIN_DIR"]
+sys.path.insert(0, bin_dir)
+loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
+spec = importlib.util.spec_from_loader("cctally", loader)
+c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
+loader.exec_module(c)
+
+# Drive the REAL reconcile path (record without dispatch) with project alerts
+# forced active over the SAME projects + thresholds the displayed status used.
+thresholds = list(budget.get("alert_thresholds") or [90, 100])
+validated = {
+    "projects": {row["project_key"]: row["budget_usd"] for row in budget["projects"]},
+    "project_alerts_enabled": True,
+    "alert_thresholds": thresholds,
+}
+c._reconcile_project_budget_milestones_on_write(validated)
+
+conn = c.open_db()
+fired = {}
+for r in conn.execute(
+    "SELECT project_key, consumption_pct FROM project_budget_milestones"
+):
+    fired[r["project_key"]] = float(r["consumption_pct"])
+conn.close()
+
+# Non-vacuity: at least one project must be over a threshold so a row was fired.
+assert fired, "PROJBUDGET1 (B) vacuous: no project_budget_milestones rows were fired"
+displayed = {p["project_key"]: p["consumption_pct"] for p in budget["projects"]}
+for key, fired_pct in fired.items():
+    disp = displayed.get(key)
+    assert disp is not None, f"PROJBUDGET1 (B): fired {key} not in displayed projects[]"
+    assert abs(fired_pct - disp) < 1e-9, (
+        f"PROJBUDGET1 (B): fired consumption_pct={fired_pct} != "
+        f"displayed consumption_pct={disp} for {key}"
+    )
+'
+pb_home="$FIXTURES/budget/per-project"
+if [ -f "$pb_home/input.env" ]; then
+    AS_OF=""
+    # shellcheck disable=SC1091
+    . "$pb_home/input.env"
+    pb_budget=$(HOME="$pb_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" budget --json 2>/dev/null); rc_b=$?
+    pb_project=$(HOME="$pb_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" project --json 2>/dev/null); rc_p=$?
+    if [ $rc_b -ne 0 ] || [ $rc_p -ne 0 ]; then
+        echo "RECONCILE FAIL project_budget_spend_and_fired_pct budget/per-project: budget rc=$rc_b project rc=$rc_p"
+        fail_count=$((fail_count + 1))
+    else
+        result=$(RECONCILE_A="$pb_budget" RECONCILE_B="$pb_project" \
+            PROJBUDGET_BIN_DIR="$REPO_ROOT/bin" \
+            HOME="$pb_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+            CCTALLY_DISABLE_DEV_AUTODETECT=1 \
+            python3 -c "$PROJBUDGET1_PY" 2>&1); rc_py=$?
+        if [ $rc_py -ne 0 ]; then
+            echo "RECONCILE FAIL project_budget_spend_and_fired_pct budget/per-project: $result"
+            fail_count=$((fail_count + 1))
+        else
+            echo "PASS project_budget_spend_and_fired_pct budget/per-project"
+            pass_count=$((pass_count + 1))
+        fi
+    fi
+else
+    echo "RECONCILE FAIL project_budget_spend_and_fired_pct budget/per-project: fixture missing"
+    fail_count=$((fail_count + 1))
+fi
+
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

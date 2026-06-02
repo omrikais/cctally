@@ -244,6 +244,76 @@ def _build_alert_payload_budget(
     }
 
 
+def _alert_text_project_budget(
+    payload: dict, tz: "ZoneInfo | None"
+) -> tuple[str, str, str]:
+    """Build (title, subtitle, body) for a PER-PROJECT equiv-$ budget threshold
+    alert (axis ``project_budget``, spec §5.3).
+
+    Mirrors :func:`_alert_text_budget` but prefixed with the project's basename
+    so a user reading the notification knows WHICH project crossed (e.g.
+    *"Project foo - $26.00 of $25.00 (104% of budget)"*). The rendered numbers
+    come from the payload (snapshotted at crossing), never live config that may
+    have changed since (Codex P0-4). ``week_start_at`` is an instant but the
+    text doesn't render it, so no ``format_display_dt`` call is needed; ``tz`` is
+    accepted for signature parity with peer ``_alert_text_*`` builders and
+    intentionally unused (same as ``_alert_text_budget``).
+    """
+    threshold = int(payload["threshold"])
+    ctx = payload.get("context") or {}
+    project = ctx.get("project") or "(project)"
+    title = f"cctally - project budget"
+    subtitle = f"{project} - {threshold}% of budget"
+    spent = float(ctx.get("spent_usd") or 0.0)
+    budget = float(ctx.get("budget_usd") or 0.0)
+    consumption = float(ctx.get("consumption_pct") or 0.0)
+    body = (
+        f"Project {project} - ${spent:,.2f} of ${budget:,.2f} "
+        f"({consumption:.0f}% of budget)"
+    )
+    return title, subtitle, body
+
+
+def _build_alert_payload_project_budget(
+    *,
+    threshold: int,
+    crossed_at_utc: str,
+    week_start_at: str,
+    project: str,
+    project_key: str,
+    budget_usd: float,
+    spent_usd: float,
+    consumption_pct: float,
+) -> dict:
+    """Build the alert payload for a PER-PROJECT equiv-$ budget threshold
+    crossing (axis ``project_budget``, the fifth alert axis; spec §5.3).
+
+    Mirrors :func:`_build_alert_payload_budget` with the project dimension
+    added: ``project`` is the collision-disambiguated basename
+    (``ProjectKey.display_key``, for human-readable notification text) and
+    ``project_key`` is the canonical git-root (``ProjectKey.bucket_path``, the
+    stable identity dimension of the UNIQUE dedup key). See
+    :func:`_build_alert_payload_weekly` for the ``alerted_at == crossed_at``
+    rationale (set-then-dispatch invariant). The dashboard envelope (Task 4)
+    surfaces this axis in the Recent-alerts panel from the row-sourced context.
+    """
+    return {
+        "id": f"project_budget:{week_start_at}:{project_key}:{int(threshold)}",
+        "axis": "project_budget",
+        "threshold": int(threshold),
+        "crossed_at": crossed_at_utc,
+        "alerted_at": crossed_at_utc,  # set-then-dispatch
+        "context": {
+            "week_start_at": week_start_at,
+            "project": project,
+            "project_key": project_key,
+            "budget_usd": float(budget_usd),
+            "spent_usd": float(spent_usd),
+            "consumption_pct": float(consumption_pct),
+        },
+    }
+
+
 def _alert_text_projected(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, str]:
     """Build (title, subtitle, body) for a projected-pace alert (#121).
 

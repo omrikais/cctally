@@ -265,6 +265,22 @@ def _build_alert_payload_budget(*args, **kwargs):
     return sys.modules["cctally"]._build_alert_payload_budget(*args, **kwargs)
 
 
+def _build_alert_payload_project_budget(*args, **kwargs):
+    return sys.modules["cctally"]._build_alert_payload_project_budget(*args, **kwargs)
+
+
+def _sum_cost_by_project(*args, **kwargs):
+    return sys.modules["cctally"]._sum_cost_by_project(*args, **kwargs)
+
+
+def insert_project_budget_milestone(*args, **kwargs):
+    return sys.modules["cctally"].insert_project_budget_milestone(*args, **kwargs)
+
+
+def _resolve_project_key(*args, **kwargs):
+    return sys.modules["cctally"]._resolve_project_key(*args, **kwargs)
+
+
 def _get_budget_config(*args, **kwargs):
     return sys.modules["cctally"]._get_budget_config(*args, **kwargs)
 
@@ -818,6 +834,147 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
             _dispatch_alert_notification(payload, mode="real")
         except Exception as dispatch_exc:
             eprint(f"[budget-alerts] dispatch failed: {dispatch_exc}")
+
+
+def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
+    """Fire PER-PROJECT equiv-$ budget alerts on ACTUAL-spend threshold
+    crossings (spec §6 — called from ``cmd_record_usage`` alongside the
+    weekly-% / 5h-% / budget / projected milestone helpers). An independent
+    helper (its own ``load_config()`` / ``open_db()``), matching the existing
+    per-axis structure — NOT fused into ``maybe_record_budget_milestone``.
+
+    Gated, hot-path-cheap, pre-probed, set-then-dispatch, fire-once. Errors are
+    logged, not raised (the caller also wraps).
+
+    ``saved`` is accepted for call-site symmetry with the sibling helpers but is
+    unused: each project's live spend is resolved from ``session_entries`` via
+    the shared ``_sum_cost_by_project`` scan, independent of the just-recorded
+    7d-% snapshot.
+
+    Invariants preserved byte-for-byte with the global budget path: gate-first,
+    pre-probe-before-the-cost-scan, ``rowcount==1`` race guard, set-then-dispatch.
+    The cost source is ``_sum_cost_by_project`` (NOT ``_sum_cost_for_range``): it
+    skips ``<synthetic>`` entries + buckets by canonical git-root, matching
+    ``cmd_project`` and the per-project DISPLAY — so the firing path reconciles
+    exactly with the displayed ``consumption_pct``.
+    """
+    # Gate FIRST (hot-path discipline): no per-project budget OR per-project
+    # alerts off → zero overhead for non-users. `load_config()` is safe outside
+    # any writer lock (atomic-rename). A malformed budget block is a quiet
+    # warn-once no-op (mirrors maybe_record_budget_milestone).
+    try:
+        budget_cfg = _get_budget_config(load_config())
+    except _BudgetConfigError as exc:
+        _warn_budget_bad_config_once(exc)
+        return
+    projects = budget_cfg.get("projects") or {}
+    if not projects or not budget_cfg.get("project_alerts_enabled"):
+        return
+    thresholds = budget_cfg["alert_thresholds"]
+    if not thresholds:
+        return
+
+    now_utc = _command_as_of()
+    pending_alerts: list[dict[str, Any]] = []
+    conn = open_db()
+    try:
+        window = _resolve_current_budget_window(conn, now_utc)
+        if window is None:
+            return  # no resolvable week window yet
+        week_start_at, _week_end_at = window
+        week_key = week_start_at.isoformat(timespec="seconds")
+
+        # Pre-probe (hot-path discipline + [Dedup mustn't gate side effects]):
+        # which configured (project, threshold) pairs are STILL un-recorded for
+        # this week? The cost scan is skipped ONLY when EVERY pair already has a
+        # row — so a partial prior run (some-but-not-all pairs) still scans for
+        # the remainder. The skip never owes a crossing: an un-recorded pair
+        # always forces the scan.
+        recorded = {
+            (str(r[0]), int(r[1]))
+            for r in conn.execute(
+                "SELECT project_key, threshold "
+                "FROM project_budget_milestones WHERE week_start_at = ?",
+                (week_key,),
+            )
+        }
+        sorted_thresholds = sorted(thresholds)
+        pending = [
+            (p, t)
+            for p in projects
+            for t in sorted_thresholds
+            if (p, t) not in recorded
+        ]
+        if not pending:
+            return  # nothing left to cross this week → skip the cost scan
+
+        # ONE grouped scan over the week's session entries, bucketed by
+        # canonical git-root. skip_sync=True: an earlier axis this same tick
+        # (maybe_record_budget_milestone) already ran _sum_cost_for_range and
+        # warmed the cache; avoid a redundant JSONL ingest pass (Codex P2-4).
+        by_proj = _sum_cost_by_project(
+            week_start_at, now_utc, mode="auto", skip_sync=True
+        )
+        for project_key, t in pending:
+            spent = float(by_proj.get(project_key, 0.0))
+            target = float(projects[project_key])
+            # +1e-9 snap-up: spent/target*100 can land one ULP below an integer
+            # threshold (CLAUDE.md float-floor gotcha).
+            consumption_pct = (spent / target * 100.0) if target > 0 else 0.0
+            if consumption_pct + 1e-9 >= t:
+                inserted = insert_project_budget_milestone(
+                    conn,
+                    week_start_at=week_key,
+                    project_key=project_key,
+                    threshold=t,
+                    budget_usd=target,
+                    spent_usd=spent,
+                    consumption_pct=consumption_pct,
+                    commit=False,
+                )
+                # Only the genuine-new-crossing winner (rowcount==1) dispatches;
+                # a racing record-usage instance gets rowcount==0 and skips.
+                if inserted == 1:
+                    crossed_at = now_utc_iso()
+                    # set-then-dispatch: alerted_at lands on the row BEFORE the
+                    # Popen, sharing this transaction with the INSERT
+                    # (commit=False). `alerted_at IS NULL` is write-once
+                    # defense-in-depth.
+                    conn.execute(
+                        "UPDATE project_budget_milestones SET alerted_at = ? "
+                        "WHERE week_start_at = ? AND project_key = ? "
+                        "  AND threshold = ? AND alerted_at IS NULL",
+                        (crossed_at, week_key, project_key, t),
+                    )
+                    project_label = os.path.basename(project_key) or project_key
+                    pending_alerts.append(_build_alert_payload_project_budget(
+                        threshold=t,
+                        crossed_at_utc=crossed_at,
+                        week_start_at=week_key,
+                        project=project_label,
+                        project_key=project_key,
+                        budget_usd=target,
+                        spent_usd=spent,
+                        consumption_pct=consumption_pct,
+                    ))
+        # Single commit: every INSERT + its alerted_at marker durable together.
+        conn.commit()
+    except Exception as exc:
+        eprint(
+            f"[project-budget-milestone] error recording project budget "
+            f"milestone: {exc}"
+        )
+    finally:
+        conn.close()
+
+    # Dispatch AFTER commit; a dispatch failure NEVER rolls back the milestone
+    # (set-then-dispatch invariant — one queue attempt per crossing, deduped on
+    # the alerted_at column).
+    for payload in pending_alerts:
+        try:
+            _dispatch_alert_notification(payload, mode="real")
+        except Exception as dispatch_exc:
+            eprint(f"[project-budget-alerts] dispatch failed: {dispatch_exc}")
 
 
 def _weekly_pct_week_avg_projection(conn, now_utc):
@@ -2651,6 +2808,16 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         maybe_record_budget_milestone(saved)
     except Exception as exc:
         eprint(f"[budget-milestone] unexpected error: {exc}")
+
+    # NEW: per-project equiv-$ budget alert firing (axis `project_budget`,
+    # #19/#121). Runs AFTER the global budget axis so the _sum_cost_for_range
+    # above has warmed the cache (the per-project scan passes skip_sync=True).
+    # Gated FIRST on a non-empty budget.projects + project_alerts_enabled — non-
+    # users pay only one config read.
+    try:
+        maybe_record_project_budget_milestone(saved)
+    except Exception as exc:
+        eprint(f"[project-budget-milestone] unexpected error: {exc}")
 
     # NEW: projected-pace alert firing (axis `projected`, #121). Runs in its
     # OWN detect-and-arm AFTER the weekly/5h/budget blocks; gated up front on
