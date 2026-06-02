@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.23.0] - 2026-06-02
+
 ### Added
 - **Projected-pace alerts: a new opt-in `projected` alert axis that warns you *before* you cross a ceiling, firing on your week-average pace rather than waiting for the actual crossing.** It tracks two metrics — `weekly_pct` (projected to reach 90% / 100% of your subscription cap by the week's reset) and `budget_usd` (projected to reach your `budget.alert_thresholds` of the weekly $ budget) — using the smooth week-average projection (`now + average-rate × time-remaining`), the same conservative number `forecast`/`budget` already display; it deliberately ignores the hotter trailing-24h estimate so a brief spike doesn't trigger a false alarm. Each level fires once per week (no re-fire, no recovery alert), is suppressed while the forecast is `LOW CONF` (too early in the week / too few samples), and re-anchors cleanly across a mid-week reset.
 - **Both projected toggles default OFF, gated behind their parent axis** — enable weekly-% projected alerts with `cctally config set alerts.projected_enabled true` (requires `alerts.enabled`) and budget-$ projected alerts with `cctally config set budget.projected_enabled true` (requires a configured `budget.weekly_usd` + `budget.alerts_enabled`); preview either without writing any data via `cctally alerts test --axis projected --metric weekly_pct` (or `--metric budget_usd`). The local web dashboard surfaces fired projected alerts with a dedicated **Projected** chip and forecast-aware context, and exposes both enable/disable toggles in its settings panel.
