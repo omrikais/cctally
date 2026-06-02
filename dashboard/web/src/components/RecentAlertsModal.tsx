@@ -18,8 +18,9 @@ import type { AlertEntry } from '../types/envelope';
 // "never depend on primary_model for envelope-sourced 5h rows."
 //
 // Severity (chip-class on the % cell) comes from the kernel via
-// `alertSeverity(a)` — consumes `alert.severity` (amber<95/red>=95), with a
-// threshold-derivation fallback for stale envelopes. See lib/alertAxis.ts.
+// `alertSeverity(a)` — consumes `alert.severity` (info <90 / warn 90-99 /
+// critical >=100), with a threshold-derivation fallback for stale envelopes
+// (and legacy amber/red normalization). See lib/alertAxis.ts.
 
 const ALERTS_MODAL_CAP = 100;
 
