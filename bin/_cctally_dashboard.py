@@ -4285,20 +4285,14 @@ def _envelope_rows_project_budget(conn, descriptor, limit, severity_for) -> list
         (limit,),
     ).fetchall()
     c = _cctally()
-    resolve = c._resolve_project_key
-    resolver_cache: dict = {}
-    # Collision-aware labels ACROSS the distinct project_keys in these rows so
-    # two same-basename roots (/work/app + /personal/app) don't both render
-    # "app" — byte-matching the live notification + budget table via the shared
-    # `_project_disambiguate_labels`. Disambiguated across the ROWS (not live
-    # config) to preserve the render-from-the-snapshotted-row invariant above.
-    distinct_keys = sorted({r["project_key"] for r in rows})
-    pkeys = [resolve(k, "git-root", resolver_cache) for k in distinct_keys]
-    disambig = c._project_disambiguate_labels([{"key": pk} for pk in pkeys])
-    label_by_key = {
-        distinct_keys[i]: disambig.get(i, pkeys[i].display_key)
-        for i in range(len(distinct_keys))
-    }
+    # Collision-aware labels via the shared primitive (#130), disambiguated
+    # across the alerted ROWS (NOT live config) to preserve the
+    # render-from-the-snapshotted-row invariant above — so a deleted/renamed
+    # config key still renders. This is intentionally a different feed than the
+    # table/notification (full config); see spec §1 Goals (Codex F1).
+    label_by_key = c._project_budget_labels(
+        sorted({r["project_key"] for r in rows})
+    )
     out: list[dict] = []
     for r in rows:
         threshold = int(r["threshold"])

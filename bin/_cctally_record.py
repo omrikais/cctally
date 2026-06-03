@@ -916,28 +916,12 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
         if not pending:
             return  # nothing left to cross this week → skip the cost scan
 
-        # Resolve every configured key to its ProjectKey ONCE, then route the
-        # firing-path labels through the SAME collision-disambiguation primitive
-        # the display uses (`_build_project_budget_rows` → `cmd_project`'s table
-        # / share snapshot). A bare `display_key` is just the basename, so a
-        # uniquely-named project keeps its bare basename in the notification —
-        # byte-matching the table + dashboard chip — and only same-basename
-        # roots (`/work/app` + `/personal/app`) get the `(parent)` segment
-        # ("app (work)" / "app (personal)"). The configured set is small + the
-        # resolver caches, so this is near-free on the rare crossing tick.
-        resolver_cache: dict = {}
-        proj_keys = sorted(projects)
-        pkeys = [
-            _resolve_project_key(p, "git-root", resolver_cache)
-            for p in proj_keys
-        ]
-        disambig = _project_disambiguate_labels(
-            [{"key": pk} for pk in pkeys]
-        )
-        label_by_key = {
-            proj_keys[i]: disambig.get(i, pkeys[i].display_key)
-            for i in range(len(proj_keys))
-        }
+        # Collision-aware labels via the shared primitive (#130) — byte-matching
+        # the display table + dashboard chip for the same key feed. A
+        # uniquely-named project keeps its bare basename in the notification;
+        # only same-basename roots (`/work/app` + `/personal/app`) get the
+        # `(parent)` segment ("app (work)" / "app (personal)").
+        label_by_key = _project_budget_labels(sorted(projects))
 
         # ONE grouped scan over the week's session entries, bucketed by
         # canonical git-root. skip_sync=False (self-sufficient): the global

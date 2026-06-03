@@ -2131,26 +2131,13 @@ def _build_project_budget_rows(conn, budget_cfg, now_utc):
     last24h = c._sum_cost_by_project(recent_start, now_utc, mode="auto")
     thresholds = tuple(budget_cfg["alert_thresholds"])
 
-    # Resolve every configured key to its ProjectKey ONCE, then route the
-    # display labels through the shared collision-disambiguation primitive
-    # (`_project_disambiguate_labels`, the SAME one cmd_project's table and
-    # `_build_project_snapshot` use). A bare `display_key` is just the
-    # basename, so two distinct git-roots sharing a basename (e.g.
-    # `/work/app` + `/personal/app`) would BOTH render as `app` — and in
-    # anonymized share BOTH collapse to a single `project-1`. The primitive
-    # suffixes the colliding rows with their parent-dir segment
-    # ("app (work)" / "app (personal)"); non-colliding rows keep `display_key`.
-    resolver_cache: dict = {}
-    pkeys = [
-        c._resolve_project_key(key, "git-root", resolver_cache)
-        for key in budget_cfg["projects"]
-    ]
-    disambig = c._project_disambiguate_labels(
-        [{"key": pk} for pk in pkeys]
-    )
+    # Collision-aware labels via the shared primitive (#130). Same-basename
+    # roots (/work/app + /personal/app) get a parent segment ("app (work)");
+    # uniquely-named roots keep their bare display_key.
+    labels = c._project_budget_labels(budget_cfg["projects"])
 
     rows = []
-    for idx, (key, target) in enumerate(budget_cfg["projects"].items()):
+    for key, target in budget_cfg["projects"].items():
         inputs = c.BudgetInputs(
             target_usd=float(target),
             spent_usd=float(week.get(key, 0.0)),
@@ -2161,7 +2148,7 @@ def _build_project_budget_rows(conn, budget_cfg, now_utc):
             alert_thresholds=thresholds,
         )
         status = c.compute_budget_status(inputs)
-        label = disambig.get(idx, pkeys[idx].display_key)
+        label = labels[key]
         rows.append({
             "project": label,
             "project_key": key,
