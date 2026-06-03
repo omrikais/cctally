@@ -157,8 +157,9 @@ _LS = _import_share_lib()
 
 def _import_stable_sum():
     """Path-load ``_lib_fmt.stable_sum`` without requiring ``bin/`` on
-    ``sys.path`` (same rationale as ``_import_share_lib``). ``_lib_fmt`` is a
-    stdlib-only leaf kernel, so this is acyclic. Returns the interpreter-stable
+    ``sys.path`` (same rationale as ``_import_share_lib``). ``_lib_fmt``'s only
+    intra-repo deps are the leaf kernels ``_cctally_core`` + ``_lib_display_tz``
+    (neither imports back), so this is acyclic. Returns the interpreter-stable
     float-summation chokepoint (math.fsum) used for output-bound cost totals.
     """
     import sys

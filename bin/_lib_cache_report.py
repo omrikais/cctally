@@ -24,8 +24,9 @@ from zoneinfo import ZoneInfo
 def _import_stable_sum():
     """Path-load ``_lib_fmt.stable_sum`` without requiring ``bin/`` on
     ``sys.path`` (this kernel is loaded by file path from both ``bin/cctally``
-    and the test harness). ``_lib_fmt`` is a stdlib-only leaf, so this is
-    acyclic. Returns the interpreter-stable float-summation chokepoint
+    and the test harness). ``_lib_fmt``'s only intra-repo deps are the leaf
+    kernels ``_cctally_core`` + ``_lib_display_tz`` (neither imports back), so
+    this is acyclic. Returns the interpreter-stable float-summation chokepoint
     (math.fsum) used for output-bound cost totals.
     """
     import sys

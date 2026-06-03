@@ -102,8 +102,9 @@ def _load_lib(name: str):
     return mod
 
 
-# ``_lib_fmt`` is a stdlib-only leaf kernel (no intra-repo imports), so
-# loading it here is acyclic. ``stable_sum`` is the interpreter-stable
+# ``_lib_fmt``'s only intra-repo deps are the leaf kernels ``_cctally_core`` +
+# ``_lib_display_tz`` (neither imports back), so loading it here is acyclic.
+# ``stable_sum`` is the interpreter-stable
 # float-summation chokepoint (math.fsum) used for output-bound totals.
 stable_sum = _load_lib("_lib_fmt").stable_sum
 
