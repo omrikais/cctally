@@ -330,8 +330,11 @@ def test_budget_set_project_explicit_subdir_resolves_to_git_root(pjns, tmp_path)
     assert sub_key not in projects
 
 
-def test_set_project_numeric_value_emits_hint(pjns, capsys):
+def test_set_project_numeric_value_emits_hint(pjns, capsys, monkeypatch, tmp_path):
     # `budget set --project 25` → argparse binds 25 to --project, amount=None.
+    # chdir to a dir with no `./25` so the numeric value is NOT a real path and
+    # the misplaced-amount hint fires (deterministic vs the host cwd).
+    monkeypatch.chdir(tmp_path)
     rc = pjns["cmd_budget"](
         _pj_budget_args(action="set", amount=None, project="25")
     )
@@ -339,6 +342,23 @@ def test_set_project_numeric_value_emits_hint(pjns, capsys):
     err = capsys.readouterr().err
     assert "looks like an amount" in err
     assert "budget set 25 --project" in err
+
+
+def test_set_project_numeric_named_dir_keeps_requires_amount(
+    pjns, capsys, monkeypatch, tmp_path
+):
+    # A real directory whose name is a bare number (e.g. a repo `./2025`): the
+    # user has the PATH right and just omitted the amount — the misplaced-amount
+    # hint must NOT fire (it would misdirect). `os.path.isdir` guard excludes it.
+    (tmp_path / "2025").mkdir()
+    monkeypatch.chdir(tmp_path)
+    rc = pjns["cmd_budget"](
+        _pj_budget_args(action="set", amount=None, project="2025")
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "requires an amount" in err
+    assert "looks like an amount" not in err
 
 
 def test_set_project_real_path_keeps_requires_amount(pjns, capsys):

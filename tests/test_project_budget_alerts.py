@@ -389,6 +389,60 @@ def test_snap_up_crosses_threshold(ns, monkeypatch):
     assert [p["threshold"] for p, _ in captured] == [90]
 
 
+# ── lazy label resolution: only resolve when a crossing actually dispatches ──
+
+
+def _spy_labels(ns, monkeypatch):
+    """Count calls into the shared ``_project_budget_labels`` primitive — the
+    firing path resolves it LAZILY (#130 follow-up), only on a genuine
+    crossing. Delegates to the real impl so dispatched labels stay correct."""
+    calls: list = []
+    real = ns["_project_budget_labels"]
+
+    def spy(keys):
+        calls.append(list(keys))
+        return real(keys)
+    monkeypatch.setitem(ns, "_project_budget_labels", spy)
+    return calls
+
+
+def test_no_crossing_skips_label_resolution(ns, monkeypatch):
+    # A pending-but-uncrossed tick (spend below every threshold) still SCANS,
+    # but must NOT resolve labels — the per-key git-root work is wasted when no
+    # crossing dispatches. Pins the lazy placement: the OLD eager call resolved
+    # labels here unconditionally, so `label_calls == []` is non-vacuous.
+    _seed_window(ns)
+    _write_config(ns, projects={PROJ_A: 25.0}, thresholds=(90, 100))
+    scan_spy: list = []
+    _patch_spend(ns, monkeypatch, by_proj={PROJ_A: 10.0}, spy=scan_spy)  # 40%
+    label_calls = _spy_labels(ns, monkeypatch)
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    ns["maybe_record_project_budget_milestone"]({})
+
+    assert _rows(ns) == []      # nothing crossed
+    assert captured == []       # nothing dispatched
+    assert scan_spy != []       # but the cost scan DID run (not an early bail)
+    assert label_calls == []    # …and labels were NOT resolved
+
+
+def test_label_resolved_once_across_multiple_crossings(ns, monkeypatch):
+    # Two thresholds cross on the same tick (90 AND 100). Labels resolve lazily
+    # on the FIRST dispatch and are reused for the second — exactly ONE
+    # resolution (guards against re-resolving per-dispatch inside the loop).
+    _seed_window(ns)
+    _write_config(ns, projects={PROJ_A: 25.0}, thresholds=(90, 100))
+    _patch_spend(ns, monkeypatch, by_proj={PROJ_A: 26.0})  # 104% → 90 + 100
+    label_calls = _spy_labels(ns, monkeypatch)
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    ns["maybe_record_project_budget_milestone"]({})
+
+    assert _pairs(_rows(ns)) == [(PROJ_A, 90), (PROJ_A, 100)]  # both crossed
+    assert len(captured) == 2                                  # both dispatched
+    assert len(label_calls) == 1                               # resolved once, reused
+
+
 # ── malformed budget config is a quiet warn-once no-op (hot-path safety) ─────
 
 

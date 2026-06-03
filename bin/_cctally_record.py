@@ -916,8 +916,13 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
         # the display table + dashboard chip for the same key feed. A
         # uniquely-named project keeps its bare basename in the notification;
         # only same-basename roots (`/work/app` + `/personal/app`) get the
-        # `(parent)` segment ("app (work)" / "app (personal)").
-        label_by_key = _project_budget_labels(sorted(projects))
+        # `(parent)` segment ("app (work)" / "app (personal)"). Resolved LAZILY
+        # (just-in-time on the first genuine crossing below): the map does
+        # per-key git-root resolution but is consumed ONLY when a new crossing
+        # dispatches, and most pending ticks scan without crossing — so we skip
+        # the resolution entirely on the common no-dispatch tick. Same map,
+        # same labels; only the timing moves.
+        label_by_key = None
 
         # ONE grouped scan over the week's session entries, bucketed by
         # canonical git-root. skip_sync=False (self-sufficient): the global
@@ -962,8 +967,11 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
                     "  AND threshold = ? AND alerted_at IS NULL",
                     (crossed_at, week_key, project_key, t),
                 )
-                # Collision-aware label (shared primitive, #130); kept defensive
-                # fallback (F4).
+                # Collision-aware label (shared primitive, #130); resolved once
+                # on the first dispatch and reused for the rest of this tick.
+                # Kept defensive fallback (F4).
+                if label_by_key is None:
+                    label_by_key = _project_budget_labels(sorted(projects))
                 project_label = label_by_key.get(
                     project_key, os.path.basename(project_key) or project_key
                 )

@@ -1729,9 +1729,15 @@ def _cmd_budget_set_project(args: argparse.Namespace) -> int:
     raw_amount = getattr(args, "amount", None)
     if raw_amount is None:
         proj = getattr(args, "project", None)
-        if proj and proj != "__CWD__" and _looks_numeric(proj):
+        if proj and proj != "__CWD__" and _looks_numeric(proj) and not os.path.isdir(proj):
             # `budget set --project 25` → argparse bound 25 to --project,
-            # leaving amount=None (#130). Point at the right ordering.
+            # leaving amount=None (#130). A bare numeric value is almost always
+            # the amount in the wrong slot — but NOT when it names a real
+            # directory (e.g. a repo literally called `./2025`), which the
+            # `not os.path.isdir(proj)` guard excludes so a numeric-named path
+            # falls through to the generic "requires an amount" message below
+            # instead of being misread as a misplaced amount. Point at the
+            # right ordering.
             eprint(
                 f"cctally budget: '{proj}' looks like an amount, not a "
                 f"project path. Did you mean: cctally budget set {proj} "

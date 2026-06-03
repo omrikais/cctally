@@ -15,7 +15,18 @@ if str(_BIN) not in sys.path:
 
 def _ns():
     # Canonical loader (mirrors tests/test_budget.py::_load for bin/cctally).
+    # Drop cached _cctally_* siblings (except _cctally_core) before re-exec so
+    # each re-binds its `import cctally` to THIS fresh module — the isolation
+    # conftest.load_script() documents. Skipping the drop leaves a sibling
+    # pinned to a prior test's cctally; harmless today (every sibling reaches
+    # cctally via the call-time _cctally() accessor), but a latent footgun the
+    # moment one adds an eager `from cctally import X`.
     from importlib.machinery import SourceFileLoader
+    for _name in [
+        n for n in sys.modules
+        if n.startswith("_cctally_") and n != "_cctally_core"
+    ]:
+        del sys.modules[_name]
     loader = SourceFileLoader("cctally", str(_BIN / "cctally"))
     spec = importlib.util.spec_from_loader("cctally", loader)
     mod = importlib.util.module_from_spec(spec)
