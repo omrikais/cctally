@@ -185,6 +185,33 @@ def test_config_projects_json_round_trip(tmp_path):
     assert json.loads(rhs) == {"/a": 25.0}
 
 
+def test_config_projects_keys_canonicalized(tmp_path):
+    """`config set budget.projects` resolves each key to its canonical git-root
+    (mirroring the `budget set --project` CLI path), so a non-canonical key
+    (here a trailing slash) is stored realpath'd. `_sum_cost_by_project` buckets
+    spend under the realpath'd `ProjectKey.bucket_path`; a verbatim non-canonical
+    key would NEVER match → a silent permanent $0 row that never alerts.
+
+    Non-vacuous: the `canonical != raw_key` guard proves the input genuinely
+    differs from its canonical form, and the final assertion proves the STORED
+    key is canonical (against the pre-fix verbatim store this fails)."""
+    import os
+
+    raw_key = "/a/"  # trailing slash → realpath strips it to "/a"
+    canonical = os.path.realpath(os.path.expanduser(raw_key))
+    assert canonical != raw_key  # the test input is genuinely non-canonical
+    set_res = _run_cli(
+        tmp_path, "config", "set", "budget.projects", json.dumps({raw_key: 25})
+    )
+    assert set_res.returncode == 0, set_res.stderr
+    get_res = _run_cli(tmp_path, "config", "get", "budget.projects")
+    assert get_res.returncode == 0, get_res.stderr
+    rhs = get_res.stdout.strip().split("=", 1)[1]
+    stored = json.loads(rhs)
+    assert stored == {canonical: 25.0}
+    assert raw_key not in stored
+
+
 def test_config_project_alerts_enabled_bool_round_trip(tmp_path):
     """`config set budget.project_alerts_enabled true` round-trips as the
     canonical boolean leaf (`true`)."""

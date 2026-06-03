@@ -929,7 +929,25 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
             if not isinstance(parsed_obj, dict):
                 eprint("cctally config: budget.projects must be a JSON object")
                 return 2
-            new_val = parsed_obj
+            # Canonicalize each project key to its resolved git-root, mirroring
+            # the `budget set --project` CLI path (`_resolve_project_budget_-
+            # target`). `_sum_cost_by_project` buckets spend under the realpath'd
+            # `ProjectKey.bucket_path`, so a `~`/relative/sub-dir/trailing-slash
+            # key stored verbatim would NEVER match → a permanent $0 row that
+            # silently never alerts. Resolving here makes the JSON-object surface
+            # match the per-project CLI surface. Non-string keys (impossible from
+            # json.loads, defensive) and the `__CWD__`-non-git None case fall
+            # back to the raw key for `_get_budget_config` to handle.
+            c = _cctally()
+            new_val = {
+                (
+                    c._resolve_project_budget_target(pk)
+                    if isinstance(pk, str)
+                    else pk
+                )
+                or pk: pv
+                for pk, pv in parsed_obj.items()
+            }
         else:  # alert_thresholds — comma-separated int list (empty = silenced)
             stripped = raw.strip()
             parsed: "list[int]" = []
