@@ -1770,10 +1770,14 @@ def _cmd_budget_set_project(args: argparse.Namespace) -> int:
         config["budget"] = block
         c.save_config(config)
 
-    # Forward-only reconcile (spec §6.8): record already-crossed
+    # Forward-only reconcile (spec §6.8): record `root`'s already-crossed
     # (project, threshold) pairs alerted_at-set WITHOUT dispatch, so setting a
-    # budget mid-week (already over) doesn't storm.
-    c._reconcile_project_budget_milestones_on_write(validated)
+    # budget mid-week (already over) doesn't storm. Scoped to the TOUCHED
+    # project so it never latches a sibling's already-crossed-but-not-yet-
+    # dispatched threshold (which would permanently suppress that alert).
+    c._reconcile_project_budget_milestones_on_write(
+        validated, touched_projects={root}
+    )
 
     basename = os.path.basename(root) or root
     if getattr(args, "json", False):
@@ -1826,10 +1830,13 @@ def _cmd_budget_unset_project(args: argparse.Namespace) -> int:
             return 2
         c.save_config(config)
 
-    # Reconcile after an unset too — the remaining configured projects' state
-    # is unaffected, but keeping all four write surfaces symmetric (spec §6.8)
-    # means a re-add later behaves predictably.
-    c._reconcile_project_budget_milestones_on_write(validated)
+    # Reconcile scoped to the TOUCHED project. The unset removed `root` from
+    # the map, so this is a no-op for `root` — and it must NOT scan the
+    # remaining projects: scanning them would latch a sibling's already-crossed-
+    # but-not-yet-dispatched threshold, permanently suppressing its real alert.
+    c._reconcile_project_budget_milestones_on_write(
+        validated, touched_projects={root}
+    )
 
     basename = os.path.basename(root) or root
     if getattr(args, "json", False):

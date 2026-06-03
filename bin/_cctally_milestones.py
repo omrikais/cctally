@@ -547,7 +547,9 @@ def _reconcile_budget_on_config_write(validated_budget):
         eprint(f"[budget-milestone] reconcile on set failed: {exc}")
 
 
-def _reconcile_project_budget_milestones_on_write(validated_budget):
+def _reconcile_project_budget_milestones_on_write(
+    validated_budget, touched_projects=None
+):
     """Forward-only-from-write reconcile for PER-PROJECT budgets (spec §6.8).
 
     Shared by all four per-project write surfaces: ``budget set --project`` /
@@ -575,6 +577,15 @@ def _reconcile_project_budget_milestones_on_write(validated_budget):
     else records nothing. Best-effort — a stats.db failure never fails the config
     write. Runs OUTSIDE any ``config_writer_lock`` (``open_db`` has its own
     locking).
+
+    ``touched_projects``: when not ``None``, reconcile ONLY these project keys.
+    The single-project CLI writes (``budget set/unset --project``) pass
+    ``{root}`` so touching project A never latches a sibling project B's
+    already-crossed-but-not-yet-dispatched threshold — which would permanently
+    suppress B's real alert. ``None`` (config-set / dashboard toggle / wholesale
+    ``budget.projects`` set) reconciles every configured project: the intended
+    "axis enabled / map redefined → suppress the retroactive storm for all
+    currently-over projects" semantics.
     """
     projects = (validated_budget or {}).get("projects") or {}
     thresholds = validated_budget.get("alert_thresholds") or []
@@ -595,7 +606,15 @@ def _reconcile_project_budget_milestones_on_write(validated_budget):
             week_start_at, _week_end_at = window
             week_key = week_start_at.isoformat(timespec="seconds")
             by_proj = c._sum_cost_by_project(week_start_at, now_utc, mode="auto")
-            for project_key, target in projects.items():
+            items = (
+                projects.items()
+                if touched_projects is None
+                else [
+                    (k, v) for k, v in projects.items()
+                    if k in touched_projects
+                ]
+            )
+            for project_key, target in items:
                 spent = float(by_proj.get(project_key, 0.0))
                 target = float(target)
                 consumption_pct = (

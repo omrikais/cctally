@@ -623,6 +623,40 @@ def test_budget_unset_project_malformed_map_is_controlled_error(ns, capsys):
     assert "budget.projects must be an object" in capsys.readouterr().err
 
 
+def test_single_project_set_does_not_latch_sibling(ns, monkeypatch):
+    """`budget set --project A` must reconcile ONLY A. A sibling B that is
+    already over a threshold but whose dispatch tick has not run must NOT be
+    latched as already-alerted — that would permanently suppress B's real
+    alert. Regression for the [check-review P2] reconcile over-reach (the
+    helper looped over EVERY configured project, not just the touched one)."""
+    _seed_window(ns)
+    import _cctally_core
+    # Start with ONLY B configured + alerts on. B is over 100 (116%), pending
+    # (no record-usage tick has dispatched it yet → no row).
+    _cctally_core.CONFIG_PATH.write_text(json.dumps({"budget": {
+        "project_alerts_enabled": True,
+        "alert_thresholds": [100],
+        "projects": {PROJ_B: 30.0},
+    }}) + "\n")
+    # A is over the $25 it's about to be set to; B is over its $30 (35/30=116%).
+    _patch_spend(ns, monkeypatch, by_proj={PROJ_A: 26.0, PROJ_B: 35.0})
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    # `budget set 25 --project=/fake/repos/a` touches ONLY A.
+    args = argparse.Namespace(amount="25", project=PROJ_A, json=False)
+    assert ns["_cmd_budget_set_project"](args) == 0
+
+    pairs = _pairs(_rows(ns))
+    assert (PROJ_A, 100) in pairs       # A latched (just set, already over)...
+    assert (PROJ_B, 100) not in pairs   # ...but B NOT suppressed by A's write
+    assert captured == []               # reconcile never dispatches
+
+    # B's real crossing still fires on the next record-usage tick.
+    ns["maybe_record_project_budget_milestone"]({})
+    assert (PROJ_B, 100) in _pairs(_rows(ns))
+    assert [p["context"]["project_key"] for p, _ in captured] == [PROJ_B]
+
+
 # ── (f) alert text + test-alert surface ─────────────────────────────────────
 
 

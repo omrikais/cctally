@@ -146,6 +146,36 @@ def test_envelope_emits_project_budget_axis(ns):
     assert crit["id"] == "project_budget:2026-05-26T14:00:00+00:00:/repos/foo:100"
 
 
+def test_envelope_disambiguates_same_basename_projects(ns):
+    """Two configured roots sharing a basename (/fake/work/app +
+    /fake/personal/app) that both cross must render DISTINCT context.project
+    labels — `app (work)` / `app (personal)` — not both collapse to `app`.
+    Mirrors the live notification + budget table via _project_disambiguate_labels.
+    Regression for the [check-review P2] envelope identity-collapse."""
+    _seed_project_milestone(
+        ns, project_key="/fake/work/app", threshold=100,
+        budget_usd=25.0, spent_usd=26.0, consumption_pct=104.0,
+    )
+    _seed_project_milestone(
+        ns, project_key="/fake/personal/app", threshold=100,
+        budget_usd=25.0, spent_usd=30.0, consumption_pct=120.0,
+    )
+    conn = ns["open_db"]()
+    try:
+        envelope = ns["_cctally_dashboard"]._build_alerts_envelope_array(conn)
+    finally:
+        conn.close()
+
+    items = [a for a in envelope if a.get("axis") == "project_budget"]
+    label_by_key = {
+        a["context"]["project_key"]: a["context"]["project"] for a in items
+    }
+    assert label_by_key == {
+        "/fake/work/app": "app (work)",
+        "/fake/personal/app": "app (personal)",
+    }
+
+
 def test_envelope_omits_unalerted_project_rows(ns):
     # A row with alerted_at NULL must NOT surface (forward-only semantics).
     _seed_project_milestone(
