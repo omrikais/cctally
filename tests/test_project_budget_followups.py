@@ -111,10 +111,18 @@ def test_project_crossings_missing_key_is_zero_spent():
 
 
 def _share():
+    # Get-or-load: reuse an already-registered _lib_share if a peer test file
+    # loaded one — otherwise the LAST loader wins for sys.modules["_lib_share"]
+    # and class identity splits across module copies, breaking isinstance checks
+    # (_lib_share_templates._LS, the cctally API handler's _share_load_lib())
+    # for unrelated tests under serial execution. Mirrors tests/test_lib_share.py.
+    if "_lib_share" in sys.modules:
+        return sys.modules["_lib_share"]
     from importlib.machinery import SourceFileLoader
     loader = SourceFileLoader("_lib_share", str(_BIN / "_lib_share.py"))
     spec = importlib.util.spec_from_loader("_lib_share", loader)
     mod = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec_module (Python 3.14 dataclass __module__ lookup).
     sys.modules["_lib_share"] = mod
     loader.exec_module(mod)
     return mod
