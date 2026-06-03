@@ -17,6 +17,7 @@ Spec: docs/superpowers/specs/2026-06-01-extract-fmt-color-table-primitives-desig
 from __future__ import annotations
 
 import datetime as dt
+import math
 import os
 import pathlib
 import re
@@ -273,6 +274,17 @@ def _boxed_table(
             out_lines.append(mid)
     out_lines.append(bottom)
     return "\n".join(out_lines)
+
+
+def stable_sum(values):
+    """Exactly-rounded, interpreter-stable sum of float addends.
+
+    math.fsum (Shewchuk) returns a single correctly-rounded result that is
+    byte-identical across all CPython versions, unlike the built-in sum(),
+    which switched to Neumaier compensated summation for floats in 3.12. Use at
+    every float sum() whose result reaches byte-compared output.
+    """
+    return math.fsum(values)
 
 
 def _fmt_num(n: int) -> str:
