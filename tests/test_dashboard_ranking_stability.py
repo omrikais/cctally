@@ -60,6 +60,7 @@ from conftest import load_script  # noqa: E402
 _NS = load_script()
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
 import _cctally_dashboard  # noqa: E402
+import _lib_fmt  # noqa: E402  (the stable_sum chokepoint the dashboard imports)
 
 
 # --- The near-tie vectors (see module docstring for the construction) ------
@@ -132,11 +133,32 @@ def test_naive_sum_would_flip_the_ranking():
 
 
 def test_production_module_uses_stable_sum_for_ranking():
-    """Belt-and-suspenders: the production module must expose ``stable_sum``
-    (the math.fsum chokepoint) — the symbol the ranking key resolves at call
-    time. If the import were reverted to the built-in ``sum``, this fails.
+    """Belt-and-suspenders against a revert to the built-in ``sum``.
+
+    A near-tie unit test cannot drive the real ``_build_projects_envelope``:
+    its ``weekly_cost`` comes from DB-derived token costs, not injectable to the
+    ULP. And the cross-version CI matrix can't catch a dashboard-ranking revert
+    either — realistic ranking data is never a ULP near-tie, so the golden order
+    wouldn't move. So this is the ONLY guard, and it needs two independent pins:
+
+    1. **Symbol identity** — the imported chokepoint IS the kernel's
+       ``stable_sum``. NOT a value-equality check: on CPython 3.12+ the built-in
+       ``sum`` uses Neumaier summation and equals ``fsum`` on these vectors, so a
+       value check would silently pass an import reverted to the built-in ``sum``.
+    2. **Source of the sort key** — the production ranking key still calls
+       ``stable_sum``. This catches the realistic regression the reimplemented
+       ``_production_sort_key`` above cannot: the sort *call site* at
+       ``_build_projects_envelope`` being changed from ``stable_sum(`` to ``sum(``.
     """
-    assert _cctally_dashboard.stable_sum is math.fsum or (
-        _cctally_dashboard.stable_sum(_PROJ_HI["weekly_cost"])
-        == math.fsum(_PROJ_HI["weekly_cost"])
+    import inspect
+
+    # Pin 1: the dashboard's stable_sum is the kernel's, not the built-in sum.
+    assert _cctally_dashboard.stable_sum is _lib_fmt.stable_sum
+
+    # Pin 2: the production sort key still routes through stable_sum.
+    src = inspect.getsource(_cctally_dashboard._build_projects_envelope)
+    assert 'stable_sum(p["weekly_cost"])' in src, (
+        "the _build_projects_envelope ranking key no longer routes through "
+        "stable_sum — a revert to the built-in sum reintroduces the 3.11-vs-3.12+ "
+        "ULP divergence this fixture guards against"
     )
