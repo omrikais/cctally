@@ -59,7 +59,7 @@ for the details and the new `--migrate-legacy-hooks` /
 
 ## Requirements
 
-- Python 3.13+ (stdlib only, no `pip install` needed).
+- Python 3.11+ (stdlib only, no `pip install` needed).
 - macOS or Linux. Tested primarily on macOS (zsh).
 - Claude Code installed and run at least once (`~/.claude/` must exist).
 

@@ -24,7 +24,7 @@ If you're using `ccusage` to watch Claude Code spend, `cctally` covers the same 
 
 ## Installation
 
-**Requirements:** Python 3.13+, macOS or Linux, Claude Code installed and run at least once.
+**Requirements:** Python 3.11+, macOS or Linux, Claude Code installed and run at least once.
 
 ### Homebrew (macOS / Linux)
 

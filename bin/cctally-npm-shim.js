@@ -25,7 +25,7 @@ const result = spawnSync(python, [scriptPath, ...process.argv.slice(2)], {
 if (result.error) {
   if (result.error.code === 'ENOENT') {
     console.error(
-      `cctally: cannot find ${python}. Install Python 3.13+ ` +
+      `cctally: cannot find ${python}. Install Python 3.11+ ` +
       'or set CCTALLY_PYTHON to its path.'
     );
     process.exit(1);

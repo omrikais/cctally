@@ -2066,7 +2066,7 @@ def _is_no_such_table_error(exc: sqlite3.OperationalError) -> bool:
 
       * Substring match on the lowercased message (stable for ~20 years).
       * ``exc.sqlite_errorcode == SQLITE_ERROR (1)`` (Python 3.11+;
-        cctally's floor is 3.13 per ``__min_python_version__``). The
+        cctally's floor is 3.11 per ``__min_python_version__``). The
         ``getattr(..., None) in (None, 1)`` form degrades gracefully if
         the attribute is ever missing — substring-only on legacy Python.
 

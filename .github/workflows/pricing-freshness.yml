@@ -41,7 +41,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          # bin/cctally hard-exits below 3.13 (__min_python_version__);
+          # bin/cctally hard-exits below 3.11 (__min_python_version__);
           # ubuntu-latest's default python3 is older.
           python-version: "3.13"
 
