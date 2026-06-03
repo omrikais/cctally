@@ -2243,19 +2243,12 @@ def _append_project_share_rows(snap, rows, has_projects):
     }))
     for r in rows:
         verdict = r["verdict"].upper()
-        # `spent` is the ONLY MoneyCell in the row so
-        # `_lib_share._collect_project_costs` (which SUMS every MoneyCell in a
-        # ProjectCell row) spend-RANKs the anonymized labels by spend alone —
-        # matching the `project` share convention. A TextCell here would leave
-        # every project at cost=0, falling back to lexical ordering. Budget /
-        # consumption / verdict stay in the visible `value` TextCell (NOT a
-        # second MoneyCell — that would inflate the rank key to spent+budget).
-        # The 2-col Metric/Value table renders only `metric` + `value`, so the
-        # extra `spent` cell is invisible in the artifact while the Value
-        # column keeps the full "spent / budget (pct) VERDICT" string.
+        # Explicit rank via ProjectCell.rank_cost (#130) — spend-ranks the
+        # anonymized labels (matching the `project` share convention) without a
+        # hidden MoneyCell. Budget / consumption / verdict stay in the visible
+        # `value` TextCell.
         extra_rows.append(_lib_share.Row(cells={
-            "metric": _lib_share.ProjectCell(r["project"]),
-            "spent": _lib_share.MoneyCell(r["spent_usd"]),
+            "metric": _lib_share.ProjectCell(r["project"], rank_cost=r["spent_usd"]),
             "value": _lib_share.TextCell(
                 f"${r['spent_usd']:,.2f} / ${r['budget_usd']:,.2f} "
                 f"({r['consumption_pct']:.0f}%) {verdict}"

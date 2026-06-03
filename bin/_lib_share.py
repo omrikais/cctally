@@ -66,8 +66,14 @@ class DeltaCell:
 
 @dataclass(frozen=True)
 class ProjectCell:
-    """Anonymization chokepoint — scrubber rewrites the `label` field."""
+    """Anonymization chokepoint — scrubber rewrites the `label` field.
+
+    `rank_cost` (#130): an explicit spend value used by
+    `_collect_project_costs` to rank anonymized labels, replacing the old
+    hidden-MoneyCell hack. When None, ranking falls back to summing sibling
+    MoneyCells (back-compat for every non-budget construction site)."""
     label: str
+    rank_cost: float | None = None
 
 Cell = TextCell | MoneyCell | PercentCell | DateCell | DeltaCell | ProjectCell
 
@@ -744,13 +750,16 @@ def _collect_project_costs(snap: ShareSnapshot) -> dict[str, float]:
     for row in snap.rows:
         proj_label: str | None = None
         money = 0.0
+        explicit_rank: float | None = None
         for cell in row.cells.values():
             if isinstance(cell, ProjectCell):
                 proj_label = cell.label
+                explicit_rank = cell.rank_cost
             elif isinstance(cell, MoneyCell):
                 money += cell.usd
         if proj_label is not None:
-            costs[proj_label] = costs.get(proj_label, 0.0) + money
+            contribution = explicit_rank if explicit_rank is not None else money
+            costs[proj_label] = costs.get(proj_label, 0.0) + contribution
 
     if snap.chart is not None:
         chart_pts: list[ChartPoint] = []
@@ -825,7 +834,9 @@ def _apply_anon_mapping(
         new_cells: dict[str, Cell] = {}
         for key, cell in row.cells.items():
             if isinstance(cell, ProjectCell) and cell.label in mapping:
-                new_cells[key] = ProjectCell(mapping[cell.label])
+                new_cells[key] = ProjectCell(
+                    mapping[cell.label], rank_cost=cell.rank_cost
+                )
             else:
                 new_cells[key] = cell
         new_rows.append(Row(cells=new_cells))

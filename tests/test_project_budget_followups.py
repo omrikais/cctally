@@ -108,3 +108,62 @@ def test_project_crossings_missing_key_is_zero_spent():
     c = _ns()
     out = list(c._project_crossings([("/p", 100.0)], [25], {}))
     assert out == []  # spent defaults to 0 → 0% → no cross
+
+
+def _share():
+    from importlib.machinery import SourceFileLoader
+    loader = SourceFileLoader("_lib_share", str(_BIN / "_lib_share.py"))
+    spec = importlib.util.spec_from_loader("_lib_share", loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_lib_share"] = mod
+    loader.exec_module(mod)
+    return mod
+
+
+def _min_snapshot(s, rows):
+    # Build a minimal ShareSnapshot with the given rows (other fields dummy).
+    # `_collect_project_costs` / `_apply_anon_mapping` only read rows + columns,
+    # so the period fields are filler — but PeriodSpec is a 4-field frozen
+    # dataclass (start, end, display_tz, label), so all four must be supplied.
+    import datetime as dt
+    now = dt.datetime(2026, 6, 3, tzinfo=dt.timezone.utc)
+    return s.ShareSnapshot(
+        cmd="budget", title="t", subtitle=None,
+        period=s.PeriodSpec(start=now, end=now, display_tz="UTC", label="p"),
+        columns=(s.ColumnSpec(key="metric", label="Metric"),
+                 s.ColumnSpec(key="value", label="Value")),
+        rows=tuple(rows), chart=None, totals=(), notes=(),
+        generated_at=now,
+        version="1",
+    )
+
+
+def test_rank_cost_overrides_money_cell_sum():
+    s = _share()
+    # rank_cost set → that value is the project's cost, sibling MoneyCells ignored.
+    row = s.Row(cells={
+        "metric": s.ProjectCell("alpha", rank_cost=99.0),
+        "value": s.MoneyCell(1.0),  # would be summed in the legacy path
+    })
+    costs = s._collect_project_costs(_min_snapshot(s, [row]))
+    assert costs["alpha"] == 99.0
+
+
+def test_rank_cost_none_falls_back_to_money_sum():
+    s = _share()
+    row = s.Row(cells={
+        "metric": s.ProjectCell("beta"),  # rank_cost defaults None
+        "value": s.MoneyCell(7.5),
+    })
+    costs = s._collect_project_costs(_min_snapshot(s, [row]))
+    assert costs["beta"] == 7.5
+
+
+def test_apply_anon_mapping_preserves_rank_cost():
+    s = _share()
+    row = s.Row(cells={"metric": s.ProjectCell("secret-proj", rank_cost=42.0)})
+    snap = _min_snapshot(s, [row])
+    scrubbed = s._apply_anon_mapping(snap, {"secret-proj": "project-1"})
+    cell = scrubbed.rows[0].cells["metric"]
+    assert cell.label == "project-1"
+    assert cell.rank_cost == 42.0  # rank survives the scrub (Codex F3)
