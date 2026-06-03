@@ -132,6 +132,27 @@ def _sum_cost_by_project(
     return out
 
 
+def _project_budget_labels(keys):
+    """Collision-aware ``{project_key: label}`` for a set of budget project
+    keys. Single source of the resolve+disambiguate primitive used by the
+    budget table (`_build_project_budget_rows`), the alert payload
+    (`maybe_record_project_budget_milestone`), and the dashboard SSE envelope
+    (`_envelope_rows_project_budget`) — issue #130. Each caller passes its own
+    key feed; the label for a key is identical across callers only when they
+    feed the same key set (the dashboard intentionally feeds its alerted-row
+    subset). Output is order-independent (disambiguation keys off basename
+    collisions, not position)."""
+    c = _cctally()
+    keys = list(keys)
+    resolver_cache: dict = {}
+    pkeys = [c._resolve_project_key(k, "git-root", resolver_cache) for k in keys]
+    disambig = c._project_disambiguate_labels([{"key": pk} for pk in pkeys])
+    return {
+        keys[i]: disambig.get(i, pkeys[i].display_key)
+        for i in range(len(keys))
+    }
+
+
 def _accumulate_entry_into_bucket(
     b: dict,
     entry: "_JoinedClaudeEntry",

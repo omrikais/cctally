@@ -634,6 +634,9 @@ cmd_project = _cctally_project.cmd_project
 # per-project budget display (cmd_budget) and the Task 3 firing path reach it
 # via the cctally namespace.
 _sum_cost_by_project = _cctally_project._sum_cost_by_project
+# Shared per-project label disambiguation (#130). Re-exported so the budget
+# display, firing path, and dashboard SSE envelope reach the SAME primitive.
+_project_budget_labels = _cctally_project._project_budget_labels
 
 # Eager re-export of bin/_cctally_pricing_check.py — `cmd_pricing_check`
 # is invoked via the parser's `set_defaults(func=c.cmd_pricing_check)`,
