@@ -547,6 +547,23 @@ def _reconcile_budget_on_config_write(validated_budget):
         eprint(f"[budget-milestone] reconcile on set failed: {exc}")
 
 
+def _project_crossings(items, thresholds, by_proj):
+    """Yield ``(project_key, threshold, spent, target, consumption_pct)`` for
+    every crossed (project, threshold) pair (#130). Shared by the firing path
+    (record-usage) and the reconcile path (config write) so they differ ONLY in
+    the dispatch tail. Pure arithmetic — no DB, no I/O. Applies the +1e-9
+    float-floor snap (CLAUDE.md gotcha) and yields thresholds in sorted order.
+    ``items`` is an iterable of ``(project_key, target)`` pairs."""
+    sorted_thresholds = sorted(thresholds)
+    for project_key, target in items:
+        spent = float(by_proj.get(project_key, 0.0))
+        target = float(target)
+        consumption_pct = (spent / target * 100.0) if target > 0 else 0.0
+        for t in sorted_thresholds:
+            if consumption_pct + 1e-9 >= t:
+                yield (project_key, t, spent, target, consumption_pct)
+
+
 def _reconcile_project_budget_milestones_on_write(
     validated_budget, touched_projects=None
 ):

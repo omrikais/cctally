@@ -66,3 +66,44 @@ def test_project_budget_labels_returns_every_input_key(tmp_path):
     beta = _mkroot(tmp_path, "beta")
     labels = c._project_budget_labels([alpha, beta])
     assert set(labels.keys()) == {alpha, beta}
+
+
+def test_project_crossings_basic_and_sorted_order():
+    c = _ns()
+    by_proj = {"/p": 80.0}
+    # target 100 → 80% → crosses 25,50,75 (not 90/100), yielded in sorted order.
+    out = list(c._project_crossings([("/p", 100.0)], [90, 25, 75, 50], by_proj))
+    thresholds = [t for (_pk, t, *_rest) in out]
+    assert thresholds == [25, 50, 75]
+    pk, t, spent, target, pct = out[0]
+    assert pk == "/p" and t == 25 and spent == 80.0 and target == 100.0
+    assert abs(pct - 80.0) < 1e-9
+
+
+def test_project_crossings_one_ulp_below_integer_threshold_still_crosses():
+    c = _ns()
+    # 0.57 * something → classic float-floor case; construct spent/target so
+    # consumption_pct lands one ULP below 50.
+    # 50.0 * 99 / 99 == 50.0 but use a value that underflows: 28.5/57*100.
+    by_proj = {"/p": 28.5}
+    out = list(c._project_crossings([("/p", 57.0)], [50], by_proj))
+    # 28.5/57*100 == 50.0 (may be 49.99999999999999) → +1e-9 snap must cross.
+    assert [t for (_pk, t, *_r) in out] == [50]
+
+
+def test_project_crossings_zero_target_never_crosses():
+    c = _ns()
+    out = list(c._project_crossings([("/p", 0.0)], [25, 50], {"/p": 999.0}))
+    assert out == []
+
+
+def test_project_crossings_below_threshold_no_yield():
+    c = _ns()
+    out = list(c._project_crossings([("/p", 100.0)], [90], {"/p": 10.0}))
+    assert out == []
+
+
+def test_project_crossings_missing_key_is_zero_spent():
+    c = _ns()
+    out = list(c._project_crossings([("/p", 100.0)], [25], {}))
+    assert out == []  # spent defaults to 0 → 0% → no cross

@@ -289,6 +289,10 @@ def _project_budget_labels(*args, **kwargs):
     return sys.modules["cctally"]._project_budget_labels(*args, **kwargs)
 
 
+def _project_crossings(*args, **kwargs):
+    return sys.modules["cctally"]._project_crossings(*args, **kwargs)
+
+
 def _get_budget_config(*args, **kwargs):
     return sys.modules["cctally"]._get_budget_config(*args, **kwargs)
 
