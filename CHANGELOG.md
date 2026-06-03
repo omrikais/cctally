@@ -6,7 +6,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
-- **cctally now supports Python 3.11 and 3.12, not just 3.13.** The supported floor is lowered from 3.13 to 3.11 (Debian 12, Ubuntu 24.04, and other distros whose system `python3` is 3.11/3.12 can now run cctally without a newer interpreter). This was previously blocked by a one-cent floating-point rounding difference between Python versions in a rendered cost Total; rendered cost/percent totals now route through a `math.fsum`-backed exact-summation chokepoint, so every figure is byte-identical on 3.11/3.12/3.13. Homebrew installs are unaffected (the formula still bundles its own modern Python). A new GitHub Actions matrix runs the full suite across all three versions to keep them in lockstep. No action needed on upgrade.
+- **cctally now supports Python 3.11 and 3.12, not just 3.13.** The supported floor is lowered from 3.13 to 3.11 (Debian 12, Ubuntu 24.04, and other distros whose system `python3` is 3.11/3.12 can now run cctally without a newer interpreter). This was previously blocked by a one-cent floating-point rounding difference between Python versions in a rendered cost Total; rendered cost/percent totals now route through a `math.fsum`-backed exact-summation chokepoint, so every figure is byte-identical on 3.11/3.12/3.13 (verified by running the reporting suite on all three interpreters). Homebrew installs are unaffected (the formula still bundles its own modern Python). No action needed on upgrade.
 
 ## [1.26.0] - 2026-06-03
 
