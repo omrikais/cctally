@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **`cctally budget set --project` now hints the correct argument order when you put the amount after the flag.** Writing the flag-first form `cctally budget set --project 25` binds `25` to the `--project` value (argparse `nargs='?'`) and leaves the amount unset; instead of the generic "`set --project` requires an amount" error, cctally now points you at the supported `cctally budget set 25 --project` ordering. A bare numeric value that names a real directory (e.g. a repo literally called `2025`) is treated as a project path rather than a misplaced amount, so the hint never misfires on a numeric-named repo. The exit code is unchanged (2, a safe no-write failure) and valid invocations are unaffected.
+
+### Changed
+- **Internal refactor (no user-facing change): consolidated the per-project budget label-disambiguation and threshold-crossing arithmetic onto two shared helpers (`_project_budget_labels`, `_project_crossings`), used by the budget table, the alert firing path, the config-write reconcile, and the dashboard SSE envelope, and replaced the share-ranking hidden-`MoneyCell` hack with an explicit `ProjectCell.rank_cost` field.** The firing-path label resolution is now lazy (resolved only when a crossing actually dispatches, off the common no-dispatch tick). Output is byte-identical — the per-project budget reconcile invariants (61/61), the budget/share goldens (26/26), and the full pytest suite are unchanged; nothing to do on upgrade.
+
 ## [1.25.0] - 2026-06-03
 
 ### Added
