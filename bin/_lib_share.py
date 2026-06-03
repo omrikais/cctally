@@ -741,7 +741,8 @@ def _render_svg_footer(snap: ShareSnapshot, *, palette: dict,
 
 def _collect_project_costs(snap: ShareSnapshot) -> dict[str, float]:
     """Walk rows: for each row containing a ProjectCell, sum MoneyCell values
-    in the same row under the project label.
+    in the same row under the project label — unless the ProjectCell carries an
+    explicit ``rank_cost``, which takes precedence over the MoneyCell sum (#130).
 
     Charts also contribute via ChartPoint.project_label + y_value (when y_value
     is in $). For consistency we union both sources; rows take precedence on

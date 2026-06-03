@@ -1711,7 +1711,7 @@ def _resolve_project_budget_target(raw: str):
     return key.git_root or key.bucket_path
 
 
-def _looks_numeric(s):
+def _looks_numeric(s) -> bool:
     """True iff `s` parses as a positive finite number — used to detect the
     `budget set --project 25` footgun (#130)."""
     try:
