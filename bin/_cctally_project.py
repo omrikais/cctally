@@ -27,6 +27,7 @@ import os
 import sys
 
 from _cctally_core import _command_as_of, eprint, open_db, parse_iso_datetime
+from _lib_fmt import stable_sum
 
 
 def _cctally():
@@ -243,11 +244,11 @@ def _project_json_output(
     denominator used by per-project attribution). `models[]` is included
     per-project only when `--breakdown` is requested to avoid payload bloat.
     """
-    total_cost = sum(r["cost_usd"] for r in rows)
+    total_cost = stable_sum(r["cost_usd"] for r in rows)
     # Aggregate used % across all weeks with snapshots in the range.
     total_used_pct: float | None
     if week_snapshots:
-        total_used_pct = sum(week_snapshots.values())
+        total_used_pct = stable_sum(week_snapshots.values())
     else:
         total_used_pct = None
 

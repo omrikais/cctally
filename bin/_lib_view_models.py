@@ -102,6 +102,12 @@ def _load_lib(name: str):
     return mod
 
 
+# ``_lib_fmt`` is a stdlib-only leaf kernel (no intra-repo imports), so
+# loading it here is acyclic. ``stable_sum`` is the interpreter-stable
+# float-summation chokepoint (math.fsum) used for output-bound totals.
+stable_sum = _load_lib("_lib_fmt").stable_sum
+
+
 # === Row dataclasses (Task 2: moved verbatim from _cctally_tui.py) =========
 # Field order, types, and defaults match the originals byte-stable.
 
@@ -928,7 +934,7 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None):
     # least 3 samples qualify.
     valid_dpps = [r.dollars_per_percent for r in rows
                   if r.dollars_per_percent is not None]
-    avg = (sum(valid_dpps) / len(valid_dpps)) if len(valid_dpps) >= 3 else None
+    avg = (stable_sum(valid_dpps) / len(valid_dpps)) if len(valid_dpps) >= 3 else None
 
     # Issue #59 — pre-compute the 4-week-median-non-current dpp scalar
     # the dashboard's Trend modal hero KV displays. Rule mirrors
@@ -1290,7 +1296,7 @@ def build_blocks_view_from_table_rows(
     (``cmd_five_hour_blocks`` produces newest-first DESC).
     """
     rows_seq = list(block_dicts)
-    total_cost = sum(
+    total_cost = stable_sum(
         float(d.get("total_cost_usd") or 0.0) for d in rows_seq
     )
     total_tok = sum(

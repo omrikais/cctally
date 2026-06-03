@@ -19,6 +19,7 @@ import sys
 
 import _lib_changelog  # module-qualified: _lib_changelog._read_latest_changelog_version()
 from _lib_display_tz import format_display_dt
+from _lib_fmt import stable_sum
 from _lib_render import _project_disambiguate_labels
 
 
@@ -406,7 +407,7 @@ def _build_report_snapshot(
         avg_dpp = view.avg_dollars_per_pct
     else:
         avg_dpp = (
-            sum(p.y_value for p in chart_pts) / len(chart_pts)
+            stable_sum(p.y_value for p in chart_pts) / len(chart_pts)
             if chart_pts else 0.0
         )
     totals = (
@@ -627,7 +628,7 @@ def _build_monthly_snapshot(
         _lib_share.BarChart(points=tuple(chart_pts), y_label="$")
         if chart_pts else None
     )
-    sum_cost = sum(p.y_value for p in chart_pts)
+    sum_cost = stable_sum(p.y_value for p in chart_pts)
     avg_cost = (sum_cost / len(chart_pts)) if chart_pts else 0.0
     totals = (
         _lib_share.Totalled(label="Sum", value=f"${sum_cost:,.2f}"),
@@ -811,12 +812,12 @@ def _build_weekly_snapshot(
         )
         if chart_pts else None
     )
-    sum_cost = sum(p.y_value for p in chart_pts)
+    sum_cost = stable_sum(p.y_value for p in chart_pts)
     pct_values = [
         float(o[0]) for o in overlay
         if o is not None and o[0] is not None
     ]
-    avg_pct = (sum(pct_values) / len(pct_values)) if pct_values else 0.0
+    avg_pct = (stable_sum(pct_values) / len(pct_values)) if pct_values else 0.0
     peak_pct = max(pct_values, default=0.0)
     totals = (
         _lib_share.Totalled(label="Sum", value=f"${sum_cost:,.2f}"),
@@ -1144,7 +1145,7 @@ def _build_project_snapshot(
         notes = (
             f"Showing top 12 in chart; table includes all {len(chart_pts)}.",
         )
-    sum_cost = sum(p.y_value for p in chart_pts)
+    sum_cost = stable_sum(p.y_value for p in chart_pts)
     totals = (
         _lib_share.Totalled(label="Sum", value=f"${sum_cost:,.2f}"),
         _lib_share.Totalled(label="Projects", value=str(len(chart_pts))),
@@ -1541,7 +1542,7 @@ def _build_session_snapshot(
         notes = (
             f"Showing top 15 in chart; table includes all {len(chart_pts)}.",
         )
-    sum_cost = sum(p.y_value for p in chart_pts)
+    sum_cost = stable_sum(p.y_value for p in chart_pts)
     totals = (
         _lib_share.Totalled(label="Sum", value=f"${sum_cost:,.2f}"),
         _lib_share.Totalled(label="Sessions", value=str(len(chart_pts))),

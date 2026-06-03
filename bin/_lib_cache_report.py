@@ -21,6 +21,33 @@ from typing import Any, Callable, Iterable, Literal, Optional
 from zoneinfo import ZoneInfo
 
 
+def _import_stable_sum():
+    """Path-load ``_lib_fmt.stable_sum`` without requiring ``bin/`` on
+    ``sys.path`` (this kernel is loaded by file path from both ``bin/cctally``
+    and the test harness). ``_lib_fmt`` is a stdlib-only leaf, so this is
+    acyclic. Returns the interpreter-stable float-summation chokepoint
+    (math.fsum) used for output-bound cost totals.
+    """
+    import sys
+    if "_lib_fmt" in sys.modules:
+        return sys.modules["_lib_fmt"].stable_sum
+    from pathlib import Path
+    import importlib.util
+    p = Path(__file__).resolve().parent / "_lib_fmt.py"
+    spec = importlib.util.spec_from_file_location("_lib_fmt", p)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["_lib_fmt"] = m
+    try:
+        spec.loader.exec_module(m)
+    except Exception:
+        sys.modules.pop("_lib_fmt", None)
+        raise
+    return m.stable_sum
+
+
+stable_sum = _import_stable_sum()
+
+
 # Anthropic's per-call >200K-tokens tier — kept in sync with bin/_lib_pricing.
 # Callers may override via the ``tiered_threshold`` kwarg.
 DEFAULT_TIERED_THRESHOLD = 200_000
@@ -732,7 +759,7 @@ def _aggregate_cache_breakdown(
         return tuple(out)
     head = out[:top_n]
     tail = out[top_n:]
-    other_net = sum(r.net_usd for r in tail)
+    other_net = stable_sum(r.net_usd for r in tail)
     # True aggregate hit % over the tail buckets — sum directly from the
     # CacheBreakdownRow token fields (EFF-4 — avoids the previous triple
     # walk over ``buckets.items()``).
@@ -800,7 +827,7 @@ def _aggregate_cache_breakdown_from_rows(
         return tuple(out)
     head = out[:top_n]
     tail = out[top_n:]
-    other_net = sum(r.net_usd for r in tail)
+    other_net = stable_sum(r.net_usd for r in tail)
     tail_input = sum(r.input_tokens for r in tail)
     tail_creation = sum(r.cache_creation_tokens for r in tail)
     tail_read = sum(r.cache_read_tokens for r in tail)

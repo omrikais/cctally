@@ -279,6 +279,7 @@ from _lib_display_tz import (
     _compute_display_block,
 )
 from _lib_aggregators import _aggregate_daily, _aggregate_monthly, _aggregate_weekly
+from _lib_fmt import stable_sum
 from _lib_pricing import _calculate_entry_cost, _chip_for_model, _short_model_name
 from _lib_five_hour import _canonical_5h_window_key
 from _lib_subscription_weeks import _compute_subscription_weeks
@@ -1319,7 +1320,7 @@ def _build_daily_share_panel_data(options: dict,
     # 7 and reverse to oldest→newest so the Recap template's days[-1]
     # anchor lands on today.
     last_7 = list(reversed(daily[:7]))
-    total = sum(float(getattr(r, "cost_usd", 0.0) or 0.0) for r in last_7) or 1.0
+    total = stable_sum(float(getattr(r, "cost_usd", 0.0) or 0.0) for r in last_7) or 1.0
     days: list[dict] = []
     for r in last_7:
         cost = float(getattr(r, "cost_usd", 0.0) or 0.0)
@@ -1721,10 +1722,10 @@ def _build_projects_share_panel_data(options: dict,
             wc = (tp.get("weekly_cost") or [])[-take:]
             wp = (tp.get("weekly_pct") or [])[-take:]
             ws = (tp.get("sessions_per_week") or [])[-take:]
-            cost = float(sum(wc))
+            cost = float(stable_sum(wc))
             running_total += cost
             valid_pct = [float(p) for p in wp if p is not None]
-            attributed = sum(valid_pct) if valid_pct else None
+            attributed = stable_sum(valid_pct) if valid_pct else None
             # Sum per-week distinct session counts. Slight over-count when a
             # single session spans a week boundary; the envelope's per-week
             # bucketing has no session-id sets to union, so this is the
@@ -2193,14 +2194,14 @@ def build_cache_report_snapshot(
     # 7-day rollup: today + 6 prior. Walk by string date; ``days_newest_first``
     # is already in the right order.
     seven_day_rows = days[:7]
-    seven_day_net_usd = sum(r.net_usd for r in seven_day_rows)
+    seven_day_net_usd = stable_sum(r.net_usd for r in seven_day_rows)
     seven_day_anomaly_count = sum(
         1 for r in seven_day_rows if r.anomaly_triggered
     )
 
     # 14-day counterfactual: sum(saved_usd) across the window.
-    fourteen_day_counterfactual_usd = sum(r.saved_usd for r in days)
-    fourteen_day_wasted_usd = sum(r.wasted_usd for r in days)
+    fourteen_day_counterfactual_usd = stable_sum(r.saved_usd for r in days)
+    fourteen_day_wasted_usd = stable_sum(r.wasted_usd for r in days)
     denom = fourteen_day_counterfactual_usd + abs(fourteen_day_wasted_usd)
     fourteen_day_efficiency_ratio = (
         (fourteen_day_counterfactual_usd / denom) if denom > 1e-9 else 0.0
@@ -3431,7 +3432,7 @@ def _build_projects_envelope(
         })
     # Stable sort: desc by total window cost, ties broken by key.
     trend_projects.sort(
-        key=lambda p: (-sum(p["weekly_cost"]), p["key"]),
+        key=lambda p: (-stable_sum(p["weekly_cost"]), p["key"]),
     )
 
     trend_block = {
@@ -3762,7 +3763,7 @@ def _project_detail_for_window(
         sliced = weekly_pct_arr[-take:] if take > 0 else []
         wp = [p for p in sliced if p is not None]
         if wp:
-            win_pct = sum(wp)
+            win_pct = stable_sum(wp)
 
     # Best-effort cleanup of the per-call TEMP TABLE so a reused conn
     # doesn't carry path state into the next drill (tests share conns;

@@ -77,6 +77,8 @@ _resolve_tz = _lib_display_tz._resolve_tz
 
 _lib_subscription_weeks = _load_lib("_lib_subscription_weeks")
 SubWeek = _lib_subscription_weeks.SubWeek
+_lib_fmt = _load_lib("_lib_fmt")
+stable_sum = _lib_fmt.stable_sum
 
 
 # === Honest imports from extracted homes ===================================
@@ -260,7 +262,7 @@ def _aggregate_daily_by_project(
     ranked: list[tuple[Any, list[BucketUsage], float]] = []
     for key in order:
         buckets = _aggregate_daily(grouped[key], mode=mode, tz=tz)  # date-asc
-        total = sum(b.cost_usd for b in buckets)
+        total = stable_sum(b.cost_usd for b in buckets)
         ranked.append((key, buckets, total))
 
     ranked.sort(key=lambda t: (-t[2], t[0].display_key))

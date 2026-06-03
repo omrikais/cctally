@@ -4,7 +4,7 @@
   "weeksInRange": 1,
   "groupMode": "git-root",
   "totals": {
-    "costUsd": 0,
+    "costUsd": 0.0,
     "usedPercent": null,
     "weeklyAttributionAvailable": false
   },

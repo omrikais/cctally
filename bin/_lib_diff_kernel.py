@@ -119,6 +119,7 @@ format_display_dt = _lib_display_tz.format_display_dt
 _lib_fmt = _load_lib("_lib_fmt")
 _style_ansi = _lib_fmt._style_ansi
 _supports_unicode_stdout = _lib_fmt._supports_unicode_stdout
+stable_sum = _lib_fmt.stable_sum
 
 
 # === Honest imports from extracted homes ===================================
@@ -706,7 +707,7 @@ def _diff_resolve_used_pct(window: ParsedWindow) -> tuple:
                 return None, "n/a"
             if not vals:
                 return None, "n/a"
-            return sum(vals) / len(vals), "avg"
+            return stable_sum(vals) / len(vals), "avg"
         finally:
             conn.close()
     return None, "n/a"
@@ -855,7 +856,7 @@ def _sum_metric_bundles(bundles) -> "MetricBundle | None":
     bundles = list(bundles)
     if not bundles:
         return None
-    cost = sum(b.cost_usd for b in bundles)
+    cost = stable_sum(b.cost_usd for b in bundles)
     ti = sum(b.tokens_input or 0 for b in bundles)
     to = sum(b.tokens_output or 0 for b in bundles)
     tcr = sum(b.tokens_cache_read or 0 for b in bundles)

@@ -19,6 +19,7 @@ from typing import Any, Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from _cctally_core import eprint, now_utc_iso, parse_iso_datetime, _command_as_of
+from _lib_fmt import stable_sum
 import _lib_cache_report as crk
 
 
@@ -467,10 +468,10 @@ def _render_cache_day_rows(
     tot_cc = sum(row.cache_creation_tokens for row in rows)
     tot_cr = sum(row.cache_read_tokens for row in rows)
     tot_tokens = sum(row.total_tokens for row in rows)
-    tot_cost = sum(row.cost for row in rows)
-    tot_saved = sum(row.saved_usd for row in rows)
-    tot_wasted = sum(row.wasted_usd for row in rows)
-    tot_net = sum(row.net_usd for row in rows)
+    tot_cost = stable_sum(row.cost for row in rows)
+    tot_saved = stable_sum(row.saved_usd for row in rows)
+    tot_wasted = stable_sum(row.wasted_usd for row in rows)
+    tot_net = stable_sum(row.net_usd for row in rows)
     tot_hit = crk._compute_cache_hit_percent(tot_inp, tot_cc, tot_cr)
     footer_cells = [
         ("Total", _yellow),
@@ -616,10 +617,10 @@ def _render_cache_session_rows(
     tot_cc = sum(r.cache_creation_tokens for r in rows)
     tot_cr = sum(r.cache_read_tokens for r in rows)
     tot_tokens = sum(r.total_tokens for r in rows)
-    tot_cost = sum(r.cost for r in rows)
-    tot_saved = sum(r.saved_usd for r in rows)
-    tot_wasted = sum(r.wasted_usd for r in rows)
-    tot_net = sum(r.net_usd for r in rows)
+    tot_cost = stable_sum(r.cost for r in rows)
+    tot_saved = stable_sum(r.saved_usd for r in rows)
+    tot_wasted = stable_sum(r.wasted_usd for r in rows)
+    tot_net = stable_sum(r.net_usd for r in rows)
     tot_hit = crk._compute_cache_hit_percent(tot_inp, tot_cc, tot_cr)
 
     footer_cells = [
@@ -991,13 +992,13 @@ def _emit_cache_report_json(
             "cacheCreationTokens": tot_cc,
             "cacheReadTokens": tot_cr,
             "totalTokens": sum(r.total_tokens for r in rows),
-            "cost": round(sum(r.cost for r in rows), 6),
+            "cost": round(stable_sum(r.cost for r in rows), 6),
             "cacheHitPercent": round(
                 crk._compute_cache_hit_percent(tot_inp, tot_cc, tot_cr), 2
             ),
-            "savedUsd": round(sum(r.saved_usd for r in rows), 6),
-            "wastedUsd": round(sum(r.wasted_usd for r in rows), 6),
-            "netUsd": round(sum(r.net_usd for r in rows), 6),
+            "savedUsd": round(stable_sum(r.saved_usd for r in rows), 6),
+            "wastedUsd": round(stable_sum(r.wasted_usd for r in rows), 6),
+            "netUsd": round(stable_sum(r.net_usd for r in rows), 6),
         },
         "generatedAt": now_utc_iso(now_utc=now_utc),
     }

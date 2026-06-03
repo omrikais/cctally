@@ -34,6 +34,7 @@ import sys
 from typing import Any
 
 from _cctally_core import _command_as_of, eprint, open_db, parse_iso_datetime
+from _lib_fmt import stable_sum
 
 
 def _cctally():
@@ -134,7 +135,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
         if getattr(args, "instances", False):
             groups = c._aggregate_daily_by_project(keyed, tz=tz, mode=args.mode)
             aug = c._project_disambiguate_labels(
-                [{"key": k, "cost_usd": sum(b.cost_usd for b in bl)}
+                [{"key": k, "cost_usd": stable_sum(b.cost_usd for b in bl)}
                  for k, bl in groups]
             )
             json_groups: list = []

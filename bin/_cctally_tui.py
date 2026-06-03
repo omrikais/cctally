@@ -221,6 +221,7 @@ from _lib_display_tz import (
     _compute_display_block,
 )
 from _lib_aggregators import _aggregate_monthly
+from _lib_fmt import stable_sum
 
 
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
@@ -1926,11 +1927,11 @@ def _tui_build_snapshot(
             weekly_periods = _dashboard_build_weekly_periods(
                 conn, now_utc, n=12, skip_sync=skip_sync
             )
-            # ``sum(..., 0.0)`` pins the type to ``float`` on empty rows so
-            # the envelope stays byte-stable with the pre-fix ``0.0`` shape
+            # ``stable_sum`` (math.fsum) returns float ``0.0`` on empty rows,
+            # so the envelope stays byte-stable with the pre-fix ``0.0`` shape
             # (the dashboard fixture goldens assert exact JSON match).
-            weekly_total_cost_usd = sum(
-                (r.cost_usd for r in weekly_periods), 0.0,
+            weekly_total_cost_usd = stable_sum(
+                r.cost_usd for r in weekly_periods
             )
             weekly_total_tokens = sum(
                 (r.total_tokens for r in weekly_periods), 0,
@@ -1949,8 +1950,8 @@ def _tui_build_snapshot(
                 conn, now_utc, n=12, skip_sync=skip_sync,
                 display_tz=_build_display_tz,
             )
-            monthly_total_cost_usd = sum(
-                (r.cost_usd for r in monthly_periods), 0.0,
+            monthly_total_cost_usd = stable_sum(
+                r.cost_usd for r in monthly_periods
             )
             monthly_total_tokens = sum(
                 (r.total_tokens for r in monthly_periods), 0,
@@ -1992,8 +1993,8 @@ def _tui_build_snapshot(
                 conn, now_utc, n=30, skip_sync=skip_sync,
                 display_tz=_build_display_tz,
             )
-            daily_total_cost_usd = sum(
-                (r.cost_usd for r in daily_panel), 0.0,
+            daily_total_cost_usd = stable_sum(
+                r.cost_usd for r in daily_panel
             )
             daily_total_tokens = sum(
                 (r.total_tokens for r in daily_panel), 0,
@@ -4183,7 +4184,7 @@ def _tui_modal_trend(snap, runtime, width):
     show_age = bucket != "narrow"
     # Header
     valid = [h for h in history if h.dollars_per_percent is not None]
-    avg_dpp = sum(h.dollars_per_percent for h in valid) / len(valid) if valid else 0.0
+    avg_dpp = stable_sum(h.dollars_per_percent for h in valid) / len(valid) if valid else 0.0
     if len(valid) >= 2:
         first_dpp = valid[0].dollars_per_percent
         last_dpp = valid[-1].dollars_per_percent

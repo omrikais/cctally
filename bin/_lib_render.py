@@ -108,6 +108,7 @@ _style_ansi = _lib_fmt._style_ansi
 _fmt_num = _lib_fmt._fmt_num
 _truncate_num = _lib_fmt._truncate_num
 _boxed_table = _lib_fmt._boxed_table
+stable_sum = _lib_fmt.stable_sum
 
 
 # Module-level back-ref shims. Each shim resolves
@@ -788,7 +789,7 @@ def _bucket_totals_dict(buckets) -> dict[str, Any]:
         "outputTokens": sum(b.output_tokens for b in buckets),
         "cacheCreationTokens": sum(b.cache_creation_tokens for b in buckets),
         "cacheReadTokens": sum(b.cache_read_tokens for b in buckets),
-        "totalCost": sum(b.cost_usd for b in buckets),
+        "totalCost": stable_sum(b.cost_usd for b in buckets),
         "totalTokens": sum(b.total_tokens for b in buckets),
     }
 
@@ -1354,7 +1355,7 @@ def _render_bucket_table(
     tot_cc = sum(d.cache_creation_tokens for d in footer_buckets)
     tot_cr = sum(d.cache_read_tokens for d in footer_buckets)
     tot_tokens = sum(d.total_tokens for d in footer_buckets)
-    tot_cost = sum(d.cost_usd for d in footer_buckets)
+    tot_cost = stable_sum(d.cost_usd for d in footer_buckets)
     footer_cells = [
         ("Total", _yellow),
         ("", None),
@@ -1695,7 +1696,7 @@ def _render_weekly_table(
     tot_cc = sum(d.cache_creation_tokens for d in buckets)
     tot_cr = sum(d.cache_read_tokens for d in buckets)
     tot_tokens = sum(d.total_tokens for d in buckets)
-    tot_cost = sum(d.cost_usd for d in buckets)
+    tot_cost = stable_sum(d.cost_usd for d in buckets)
     footer_cells = [
         ("Total", _yellow),
         ("", None),
@@ -1984,7 +1985,7 @@ def _render_codex_bucket_table(
     tot_reasoning = sum(b.reasoning_output_tokens for b in buckets)
     tot_non_cached = max(0, tot_input_inclusive - tot_cached)
     tot_tokens = tot_input_inclusive + tot_output
-    tot_cost = sum(b.cost_usd for b in buckets)
+    tot_cost = stable_sum(b.cost_usd for b in buckets)
     footer_cells = [
         ("Total", _yellow),
         ("", None),
@@ -2264,7 +2265,7 @@ def _render_codex_session_table(
     tot_reasoning = sum(s.reasoning_output_tokens for s in sessions)
     tot_non_cached = max(0, tot_input_inclusive - tot_cached)
     tot_tokens = tot_input_inclusive + tot_output
-    tot_cost = sum(s.cost_usd for s in sessions)
+    tot_cost = stable_sum(s.cost_usd for s in sessions)
     footer_cells = [
         ("Total", _yellow),
         ("", None), ("", None), ("", None),
@@ -2540,7 +2541,7 @@ def _render_claude_session_table(
     tot_output = sum(s.output_tokens for s in sessions)
     # Issue #104: Total Tokens footer sums all four components.
     tot_tokens = sum(s.total_tokens for s in sessions)
-    tot_cost = sum(s.cost_usd for s in sessions)
+    tot_cost = stable_sum(s.cost_usd for s in sessions)
     footer_cells = [
         ("Total", _yellow),
         ("", None), ("", None), ("", None),

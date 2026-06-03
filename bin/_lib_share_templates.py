@@ -155,6 +155,32 @@ def _import_share_lib():
 _LS = _import_share_lib()
 
 
+def _import_stable_sum():
+    """Path-load ``_lib_fmt.stable_sum`` without requiring ``bin/`` on
+    ``sys.path`` (same rationale as ``_import_share_lib``). ``_lib_fmt`` is a
+    stdlib-only leaf kernel, so this is acyclic. Returns the interpreter-stable
+    float-summation chokepoint (math.fsum) used for output-bound cost totals.
+    """
+    import sys
+    if "_lib_fmt" in sys.modules:
+        return sys.modules["_lib_fmt"].stable_sum
+    from pathlib import Path
+    import importlib.util
+    p = Path(__file__).resolve().parent / "_lib_fmt.py"
+    spec = importlib.util.spec_from_file_location("_lib_fmt", p)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["_lib_fmt"] = m
+    try:
+        spec.loader.exec_module(m)
+    except Exception:
+        sys.modules.pop("_lib_fmt", None)
+        raise
+    return m.stable_sum
+
+
+stable_sum = _import_stable_sum()
+
+
 def _kpi_strip(*items: tuple[str, str]) -> tuple:
     """Generic KPI strip → tuple of `Totalled`."""
     return tuple(_LS.Totalled(label=lbl, value=val) for lbl, val in items)
@@ -280,7 +306,7 @@ def _detect_residual(
     `has_other_residual` in `_cross_tab_columns`.
     """
     for row_total, breakdown in rows_and_breakdowns:
-        top_k_sum = sum(float(breakdown.get(lbl, 0.0)) for lbl in top_k_labels)
+        top_k_sum = stable_sum(float(breakdown.get(lbl, 0.0)) for lbl in top_k_labels)
         if abs(row_total - top_k_sum) > epsilon:
             return True
     return False
@@ -537,7 +563,7 @@ def _build_daily_recap(*, panel_data, options):
     start = _parse_iso_utc(days[0]["date"]) if days else _utc_now()
     end_anchor = _parse_iso_utc(days[-1]["date"]) if days else start
     end = end_anchor + _dt.timedelta(days=1)
-    sum_cost = sum(float(d["cost_usd"]) for d in days)
+    sum_cost = stable_sum(float(d["cost_usd"]) for d in days)
     return _LS.ShareSnapshot(
         cmd="daily",
         title=f"Daily — last {len(days)} day{'s' if len(days) != 1 else ''}",
@@ -591,7 +617,7 @@ def _build_monthly_recap(*, panel_data, options):
         end = end_anchor.replace(day=1) - _dt.timedelta(days=1)
     else:
         end = start
-    sum_cost = sum(float(m["cost_usd"]) for m in months)
+    sum_cost = stable_sum(float(m["cost_usd"]) for m in months)
     return _LS.ShareSnapshot(
         cmd="monthly",
         title=f"Monthly — last {len(months)} month{'s' if len(months) != 1 else ''}",
@@ -761,7 +787,7 @@ def _build_sessions_recap(*, panel_data, options):
     sessions = panel_data.get("sessions") or []
     cap = options.get("top_n", 15)
     rows_iter = sessions[:cap]
-    sum_cost = sum(float(s.get("cost_usd") or 0.0) for s in rows_iter)
+    sum_cost = stable_sum(float(s.get("cost_usd") or 0.0) for s in rows_iter)
     starts = [_parse_iso_utc(s["started_at"]) for s in rows_iter if s.get("started_at")]
     start = min(starts) if starts else _utc_now()
     end = max(starts) if starts else start
@@ -1067,7 +1093,7 @@ def _build_daily_visual(*, panel_data, options):
     start = _parse_iso_utc(days[0]["date"]) if days else _utc_now()
     end_anchor = _parse_iso_utc(days[-1]["date"]) if days else start
     end = end_anchor + _dt.timedelta(days=1)
-    sum_cost = sum(float(d["cost_usd"]) for d in days)
+    sum_cost = stable_sum(float(d["cost_usd"]) for d in days)
     return _LS.ShareSnapshot(
         cmd="daily",
         title=f"Daily visual — last {len(days)} day{'s' if len(days) != 1 else ''}",
@@ -1103,7 +1129,7 @@ def _build_daily_detail(*, panel_data, options):
     start = _parse_iso_utc(days[0]["date"]) if days else _utc_now()
     end_anchor = _parse_iso_utc(days[-1]["date"]) if days else start
     end = end_anchor + _dt.timedelta(days=1)
-    sum_cost = sum(float(d["cost_usd"]) for d in days)
+    sum_cost = stable_sum(float(d["cost_usd"]) for d in days)
     top_n = max(int(options.get("top_n", 5)), 1)
 
     breakdowns = [dict(d.get("projects") or {}) for d in days]
@@ -1170,7 +1196,7 @@ def _build_monthly_visual(*, panel_data, options):
         end = end_anchor.replace(day=1) - _dt.timedelta(days=1)
     else:
         end = start
-    sum_cost = sum(float(m["cost_usd"]) for m in months)
+    sum_cost = stable_sum(float(m["cost_usd"]) for m in months)
     return _LS.ShareSnapshot(
         cmd="monthly",
         title=f"Monthly visual — last {len(months)} month{'s' if len(months) != 1 else ''}",
@@ -1211,7 +1237,7 @@ def _build_monthly_detail(*, panel_data, options):
         end = end_anchor.replace(day=1) - _dt.timedelta(days=1)
     else:
         end = start
-    sum_cost = sum(float(m["cost_usd"]) for m in months)
+    sum_cost = stable_sum(float(m["cost_usd"]) for m in months)
     top_n = max(int(options.get("top_n", 5)), 1)
 
     breakdowns = [dict(m.get("models") or {}) for m in months]
@@ -1476,7 +1502,7 @@ def _build_sessions_visual(*, panel_data, options):
     sessions = panel_data.get("sessions") or []
     cap = int(options.get("top_n", 8))
     rows_iter = sessions[:cap]
-    sum_cost = sum(float(s.get("cost_usd") or 0.0) for s in rows_iter)
+    sum_cost = stable_sum(float(s.get("cost_usd") or 0.0) for s in rows_iter)
     starts = [_parse_iso_utc(s["started_at"]) for s in rows_iter if s.get("started_at")]
     start = min(starts) if starts else _utc_now()
     end = max(starts) if starts else start
@@ -1522,7 +1548,7 @@ def _build_sessions_detail(*, panel_data, options):
     sessions = panel_data.get("sessions") or []
     cap = options.get("top_n", 50)
     rows_iter = sessions[:cap]
-    sum_cost = sum(float(s.get("cost_usd") or 0.0) for s in rows_iter)
+    sum_cost = stable_sum(float(s.get("cost_usd") or 0.0) for s in rows_iter)
     starts = [_parse_iso_utc(s["started_at"]) for s in rows_iter if s.get("started_at")]
     start = min(starts) if starts else _utc_now()
     end = max(starts) if starts else start
