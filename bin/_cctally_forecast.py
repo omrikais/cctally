@@ -1711,6 +1711,16 @@ def _resolve_project_budget_target(raw: str):
     return key.git_root or key.bucket_path
 
 
+def _looks_numeric(s):
+    """True iff `s` parses as a positive finite number — used to detect the
+    `budget set --project 25` footgun (#130)."""
+    try:
+        v = float(s)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(v) and v > 0
+
+
 def _cmd_budget_set_project(args: argparse.Namespace) -> int:
     """`cctally budget set AMOUNT --project[=PATH]` — write one entry into
     `budget.projects`, keyed by the resolved canonical git-root. Writes the
@@ -1718,10 +1728,20 @@ def _cmd_budget_set_project(args: argparse.Namespace) -> int:
     c = _cctally()
     raw_amount = getattr(args, "amount", None)
     if raw_amount is None:
-        eprint(
-            "cctally budget: `set --project` requires an amount, e.g. "
-            "cctally budget set 25 --project"
-        )
+        proj = getattr(args, "project", None)
+        if proj and proj != "__CWD__" and _looks_numeric(proj):
+            # `budget set --project 25` → argparse bound 25 to --project,
+            # leaving amount=None (#130). Point at the right ordering.
+            eprint(
+                f"cctally budget: '{proj}' looks like an amount, not a "
+                f"project path. Did you mean: cctally budget set {proj} "
+                f"--project"
+            )
+        else:
+            eprint(
+                "cctally budget: `set --project` requires an amount, e.g. "
+                "cctally budget set 25 --project"
+            )
         return 2
     try:
         amount = float(raw_amount)

@@ -330,6 +330,37 @@ def test_budget_set_project_explicit_subdir_resolves_to_git_root(pjns, tmp_path)
     assert sub_key not in projects
 
 
+def test_set_project_numeric_value_emits_hint(pjns, capsys):
+    # `budget set --project 25` → argparse binds 25 to --project, amount=None.
+    rc = pjns["cmd_budget"](
+        _pj_budget_args(action="set", amount=None, project="25")
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "looks like an amount" in err
+    assert "budget set 25 --project" in err
+
+
+def test_set_project_real_path_keeps_requires_amount(pjns, capsys):
+    rc = pjns["cmd_budget"](
+        _pj_budget_args(action="set", amount=None, project="/abs/path")
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "requires an amount" in err
+    assert "looks like an amount" not in err  # hint must NOT steal real paths
+
+
+def test_set_project_bare_flag_keeps_requires_amount(pjns, capsys):
+    rc = pjns["cmd_budget"](
+        _pj_budget_args(action="set", amount=None, project="__CWD__")
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "requires an amount" in err
+    assert "looks like an amount" not in err
+
+
 def test_budget_unset_project_removes_key(pjns, capsys):
     """`budget unset --project /tmp/x` removes the configured key; idempotent.
 

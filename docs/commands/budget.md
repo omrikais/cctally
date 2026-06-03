@@ -194,6 +194,11 @@ cctally budget unset --project /abs/path  # clear an explicit path
   (`ProjectKey.bucket_path`), not the basename, so `~/a/foo` and `~/b/foo` are
   two independent budgets that render with disambiguated `Project` labels.
 
+> **Argument order:** put the amount **before** `--project`
+> (`cctally budget set 25 --project`). The flag-first form
+> (`cctally budget set --project 25`) binds `25` to `--project` and is
+> rejected with a hint pointing at the correct ordering.
+
 ### Per-project display section
 
 `cctally budget` (bare) prints a compact per-project table **below** the global
