@@ -937,55 +937,54 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
         by_proj = _sum_cost_by_project(
             week_start_at, now_utc, mode="auto", skip_sync=False
         )
-        for project_key, t in pending:
-            spent = float(by_proj.get(project_key, 0.0))
-            target = float(projects[project_key])
-            # +1e-9 snap-up: spent/target*100 can land one ULP below an integer
-            # threshold (CLAUDE.md float-floor gotcha).
-            consumption_pct = (spent / target * 100.0) if target > 0 else 0.0
-            if consumption_pct + 1e-9 >= t:
-                inserted = insert_project_budget_milestone(
-                    conn,
-                    week_start_at=week_key,
-                    project_key=project_key,
+        # Crossing arithmetic via the shared generator (#130). Feed ALL
+        # configured (project, threshold) pairs; dispatch is gated SOLELY by
+        # INSERT-OR-IGNORE rowcount==1 (genuine new crossing). The pending
+        # pre-probe above stays as the scan-skip optimization, NOT a write gate
+        # — already-recorded pairs get rowcount==0 here and silently skip
+        # ([Dedup mustn't gate side effects]).
+        for project_key, t, spent, target, consumption_pct in _project_crossings(
+            projects.items(), sorted_thresholds, by_proj
+        ):
+            inserted = insert_project_budget_milestone(
+                conn,
+                week_start_at=week_key,
+                project_key=project_key,
+                threshold=t,
+                budget_usd=target,
+                spent_usd=spent,
+                consumption_pct=consumption_pct,
+                commit=False,
+            )
+            # Only the genuine-new-crossing winner (rowcount==1) dispatches; a
+            # racing record-usage instance OR an already-recorded pair gets
+            # rowcount==0 and skips.
+            if inserted == 1:
+                crossed_at = now_utc_iso()
+                # set-then-dispatch: alerted_at lands on the row BEFORE the
+                # Popen, sharing this transaction with the INSERT (commit=False).
+                # `alerted_at IS NULL` is write-once defense-in-depth.
+                conn.execute(
+                    "UPDATE project_budget_milestones SET alerted_at = ? "
+                    "WHERE week_start_at = ? AND project_key = ? "
+                    "  AND threshold = ? AND alerted_at IS NULL",
+                    (crossed_at, week_key, project_key, t),
+                )
+                # Collision-aware label (shared primitive, #130); kept defensive
+                # fallback (F4).
+                project_label = label_by_key.get(
+                    project_key, os.path.basename(project_key) or project_key
+                )
+                pending_alerts.append(_build_alert_payload_project_budget(
                     threshold=t,
+                    crossed_at_utc=crossed_at,
+                    week_start_at=week_key,
+                    project=project_label,
+                    project_key=project_key,
                     budget_usd=target,
                     spent_usd=spent,
                     consumption_pct=consumption_pct,
-                    commit=False,
-                )
-                # Only the genuine-new-crossing winner (rowcount==1) dispatches;
-                # a racing record-usage instance gets rowcount==0 and skips.
-                if inserted == 1:
-                    crossed_at = now_utc_iso()
-                    # set-then-dispatch: alerted_at lands on the row BEFORE the
-                    # Popen, sharing this transaction with the INSERT
-                    # (commit=False). `alerted_at IS NULL` is write-once
-                    # defense-in-depth.
-                    conn.execute(
-                        "UPDATE project_budget_milestones SET alerted_at = ? "
-                        "WHERE week_start_at = ? AND project_key = ? "
-                        "  AND threshold = ? AND alerted_at IS NULL",
-                        (crossed_at, week_key, project_key, t),
-                    )
-                    # Label is collision-aware, byte-matching the display: a
-                    # uniquely-named project notifies as its bare basename,
-                    # only same-basename roots get the `(parent)` segment (the
-                    # `label_by_key` map built above via the shared
-                    # `_project_disambiguate_labels` primitive, spec §5.3).
-                    project_label = label_by_key.get(
-                        project_key, os.path.basename(project_key) or project_key
-                    )
-                    pending_alerts.append(_build_alert_payload_project_budget(
-                        threshold=t,
-                        crossed_at_utc=crossed_at,
-                        week_start_at=week_key,
-                        project=project_label,
-                        project_key=project_key,
-                        budget_usd=target,
-                        spent_usd=spent,
-                        consumption_pct=consumption_pct,
-                    ))
+                ))
         # Single commit: every INSERT + its alerted_at marker durable together.
         conn.commit()
     except Exception as exc:

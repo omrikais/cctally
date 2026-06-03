@@ -631,30 +631,29 @@ def _reconcile_project_budget_milestones_on_write(
                     if k in touched_projects
                 ]
             )
-            for project_key, target in items:
-                spent = float(by_proj.get(project_key, 0.0))
-                target = float(target)
-                consumption_pct = (
-                    (spent / target * 100.0) if target > 0 else 0.0
+            # Same crossing arithmetic as firing, via the shared generator
+            # (#130). Reconcile differs ONLY in the tail: UPDATE alerted_at with
+            # NO dispatch (retroactive-storm suppression). `items` already
+            # honors touched_projects filtering above.
+            for project_key, t, spent, target, consumption_pct in c._project_crossings(
+                items, thresholds, by_proj
+            ):
+                insert_project_budget_milestone(
+                    conn,
+                    week_start_at=week_key,
+                    project_key=project_key,
+                    threshold=t,
+                    budget_usd=target,
+                    spent_usd=spent,
+                    consumption_pct=consumption_pct,
+                    commit=False,
                 )
-                for t in sorted(thresholds):
-                    if consumption_pct + 1e-9 >= t:
-                        insert_project_budget_milestone(
-                            conn,
-                            week_start_at=week_key,
-                            project_key=project_key,
-                            threshold=t,
-                            budget_usd=target,
-                            spent_usd=spent,
-                            consumption_pct=consumption_pct,
-                            commit=False,
-                        )
-                        conn.execute(
-                            "UPDATE project_budget_milestones SET alerted_at = ? "
-                            "WHERE week_start_at = ? AND project_key = ? "
-                            "  AND threshold = ? AND alerted_at IS NULL",
-                            (now_utc_iso(), week_key, project_key, t),
-                        )
+                conn.execute(
+                    "UPDATE project_budget_milestones SET alerted_at = ? "
+                    "WHERE week_start_at = ? AND project_key = ? "
+                    "  AND threshold = ? AND alerted_at IS NULL",
+                    (now_utc_iso(), week_key, project_key, t),
+                )
             conn.commit()
         finally:
             conn.close()
