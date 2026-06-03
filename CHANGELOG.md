@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.26.0] - 2026-06-03
+
 ### Added
 - **`cctally budget set --project` now hints the correct argument order when you put the amount after the flag.** Writing the flag-first form `cctally budget set --project 25` binds `25` to the `--project` value (argparse `nargs='?'`) and leaves the amount unset; instead of the generic "`set --project` requires an amount" error, cctally now points you at the supported `cctally budget set 25 --project` ordering. A bare numeric value that names a real directory (e.g. a repo literally called `2025`) is treated as a project path rather than a misplaced amount, so the hint never misfires on a numeric-named repo. The exit code is unchanged (2, a safe no-write failure) and valid invocations are unaffected.
 
