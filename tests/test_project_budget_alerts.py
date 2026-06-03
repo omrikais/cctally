@@ -523,6 +523,106 @@ def test_config_set_project_alerts_enabled_reconciles(ns, monkeypatch):
     assert [p["threshold"] for p, _ in captured] == [100]
 
 
+# ── (g) check-review P2 regressions: dedup self-heal · gating · malformed ────
+
+
+def _snapshot_count(ns):
+    conn = ns["open_db"]()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_dedup_tick_self_heals_project_budget(ns, monkeypatch):
+    """A record-usage tick that DEDUPS (weekly + 5h percent unchanged from the
+    latest row) must STILL fire a per-project $ crossing — USD spend is
+    decoupled from the Anthropic percent. Pre-fix the dedup branch returned
+    before the project-budget axis, so the alert never fired until the next
+    percent change. [Dedup mustn't gate side effects]"""
+    # _seed_window writes one row at weekly_percent=40, five_hour_percent=NULL —
+    # it is BOTH the budget-window anchor AND the row the dedup compares to.
+    _seed_window(ns)
+    _write_config(ns, projects={PROJ_A: 25.0}, thresholds=(90, 100))
+    _patch_spend(ns, monkeypatch, by_proj={PROJ_A: 26.0})  # 104% → 90 + 100
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    before = _snapshot_count(ns)
+    # Same weekly_percent (40.0) + no 5h → should_insert is False (dedup).
+    args = argparse.Namespace(
+        percent=40.0,
+        resets_at=int(WEEK_END.timestamp()),
+        five_hour_percent=None,
+        five_hour_resets_at=None,
+    )
+    rc = ns["cmd_record_usage"](args)
+    assert rc == 0
+    assert _snapshot_count(ns) == before  # dedup swallowed the snapshot
+    # ...yet the project-budget axis still fired via the dedup self-heal loop.
+    assert _pairs(_rows(ns)) == [(PROJ_A, 90), (PROJ_A, 100)]
+    assert {p["threshold"] for p, _ in captured} == {90, 100}
+
+
+def test_config_set_unrelated_budget_key_does_not_reconcile_projects(
+    ns, monkeypatch
+):
+    """`config set budget.weekly_usd` (a GLOBAL-axis key) must NOT run the
+    per-project reconcile. Otherwise a currently-over-but-not-yet-dispatched
+    project threshold gets latched as already-alerted, permanently suppressing
+    the next record-usage tick's dispatch. Pre-fix the reconcile ran on EVERY
+    budget.* write."""
+    _seed_window(ns)
+    import _cctally_core
+    _cctally_core.CONFIG_PATH.write_text(
+        json.dumps({"budget": {
+            "project_alerts_enabled": True,
+            "alert_thresholds": [90, 100],
+            "projects": {PROJ_A: 25.0},
+        }}) + "\n"
+    )
+    spy: list = []
+    _patch_spend(ns, monkeypatch, by_proj={PROJ_A: 24.0}, spy=spy)  # 96%, > 90
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    args = argparse.Namespace(
+        key="budget.weekly_usd", value="50", emit_json=False,
+    )
+    assert ns["_cmd_config_set"](args) == 0
+    assert spy == []        # project reconcile gated out → no scan
+    assert _rows(ns) == []  # nothing latched in the per-project ledger
+    assert captured == []
+
+    # The crossing is still pending → a real record-usage tick fires (/a, 90).
+    ns["maybe_record_project_budget_milestone"]({})
+    assert _pairs(_rows(ns)) == [(PROJ_A, 90)]
+    assert [p["threshold"] for p, _ in captured] == [90]
+
+
+def test_budget_set_project_malformed_map_is_controlled_error(ns, capsys):
+    """A hand-edited non-dict `budget.projects` yields a controlled exit 2 (not
+    a `dict(...)` traceback) — the guard runs before _get_budget_config."""
+    import _cctally_core
+    _cctally_core.CONFIG_PATH.write_text(
+        json.dumps({"budget": {"projects": "garbage"}}) + "\n"
+    )
+    args = argparse.Namespace(amount="25", project="/tmp/foo-repo", json=False)
+    assert ns["_cmd_budget_set_project"](args) == 2
+    assert "budget.projects must be an object" in capsys.readouterr().err
+
+
+def test_budget_unset_project_malformed_map_is_controlled_error(ns, capsys):
+    """The unset path carries the same guard (non-pair list → exit 2)."""
+    import _cctally_core
+    _cctally_core.CONFIG_PATH.write_text(
+        json.dumps({"budget": {"projects": ["not", "pairs"]}}) + "\n"
+    )
+    args = argparse.Namespace(project="/tmp/foo-repo", json=False)
+    assert ns["_cmd_budget_unset_project"](args) == 2
+    assert "budget.projects must be an object" in capsys.readouterr().err
+
+
 # ── (f) alert text + test-alert surface ─────────────────────────────────────
 
 

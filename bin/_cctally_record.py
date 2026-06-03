@@ -2680,6 +2680,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                 ).fetchone()
                 if latest_row is None:
                     return 0
+                latest_saved = _saved_dict_from_usage_row(latest_row)
 
                 # Probe 1: do we owe a percent milestone? Snap up before
                 # floor (status-line API returns 0.N*100 which can fall
@@ -2793,7 +2794,6 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                 heal_conn.close()
 
             if need_milestone_heal or need_5h_heal:
-                latest_saved = _saved_dict_from_usage_row(latest_row)
                 if need_milestone_heal:
                     try:
                         maybe_record_milestone(latest_saved)
@@ -2804,6 +2804,27 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                         maybe_update_five_hour_block(latest_saved)
                     except Exception as exc:
                         eprint(f"[5h-block] self-heal error: {exc}")
+
+            # Dollar-decoupled axes (budget / project-budget / projected) heal on
+            # EVERY dedup tick — USD spend can cross a $ threshold while the
+            # weekly/5h percent is flat (so should_insert is False), and a prior
+            # run may have died after insert_usage_snapshot but before the
+            # post-insert axis block. Each helper gates first on config (a cheap
+            # read for non-users) and pre-probes its recorded set before any cost
+            # scan, so non-budget users pay ~nothing here. Order matches the
+            # post-insert block so the projected budget_usd leg's skip_sync=True
+            # cache-warming dependency on the actual-budget axis still holds.
+            # [Dedup mustn't gate side effects]
+            for _heal_fn, _heal_tag in (
+                (maybe_record_budget_milestone, "budget-milestone"),
+                (maybe_record_project_budget_milestone,
+                 "project-budget-milestone"),
+                (maybe_record_projected_alert, "projected-alert"),
+            ):
+                try:
+                    _heal_fn(latest_saved)
+                except Exception as exc:
+                    eprint(f"[{_heal_tag}] self-heal error: {exc}")
         except Exception as exc:
             eprint(f"[record-usage] self-heal lookup failed: {exc}")
         return 0

@@ -5836,16 +5836,23 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # Runs AFTER save_config (config persisted first); best-effort —
             # never breaks the 200 response. Config write already left the
             # config_writer_lock, so the helper's open_db never nests.
-            _cctally()._reconcile_budget_on_config_write(validated_budget)
-            # Per-project budgets: the 4th reconcile surface (spec §6.8).
-            # Toggling ``project_alerts_enabled`` on mid-week (already over a
-            # threshold) latches the crossed (project, threshold) rows as
-            # already-alerted so the next record-usage tick does NOT storm
-            # retroactive alerts. Same forward-only-from-write contract as the
-            # global reconcile above; gated + best-effort.
-            _cctally()._reconcile_project_budget_milestones_on_write(
-                validated_budget
+            #
+            # Gate each axis on the touched leaves (parity with `config set`):
+            # running on an unrelated leaf would latch a currently-over-but-
+            # not-yet-dispatched threshold, permanently suppressing the next
+            # tick's dispatch. The dashboard accepts no `projects` leaf (the
+            # map is CLI-only), so the per-project axis keys on
+            # project_alerts_enabled/alert_thresholds.
+            budget_in = payload["budget"]
+            touched = (
+                set(budget_in.keys()) if isinstance(budget_in, dict) else set()
             )
+            if touched & {"weekly_usd", "alerts_enabled", "alert_thresholds"}:
+                _cctally()._reconcile_budget_on_config_write(validated_budget)
+            if touched & {"project_alerts_enabled", "alert_thresholds"}:
+                _cctally()._reconcile_project_budget_milestones_on_write(
+                    validated_budget
+                )
         if update_check_validated is not None:
             # Echo the full merged check block (cooked defaults included)
             # so the SettingsOverlay can repaint without a follow-up GET.

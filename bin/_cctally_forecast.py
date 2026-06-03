@@ -1747,7 +1747,17 @@ def _cmd_budget_set_project(args: argparse.Namespace) -> int:
             eprint("cctally budget: budget config must be an object")
             return 2
         block = dict(existing or {})
-        projects = dict(block.get("projects") or {})
+        # Guard the merge-copy: a hand-edited non-dict `budget.projects`
+        # (string / non-pair list) would traceback on `dict(...)` BEFORE
+        # `_get_budget_config` can raise a controlled _BudgetConfigError.
+        # Mirror the `existing` budget-block guard above → clean exit 2.
+        existing_projects = block.get("projects")
+        if existing_projects is not None and not isinstance(
+            existing_projects, dict
+        ):
+            eprint("cctally budget: budget.projects must be an object")
+            return 2
+        projects = dict(existing_projects or {})
         projects[root] = amount
         block["projects"] = projects
         config["budget"] = block
@@ -1794,7 +1804,16 @@ def _cmd_budget_unset_project(args: argparse.Namespace) -> int:
             eprint("cctally budget: budget config must be an object")
             return 2
         block = dict(existing or {})
-        projects = dict(block.get("projects") or {})
+        # Guard the merge-copy: a hand-edited non-dict `budget.projects`
+        # would traceback on `dict(...)` before the validator can report a
+        # controlled error (mirrors `_cmd_budget_set_project`).
+        existing_projects = block.get("projects")
+        if existing_projects is not None and not isinstance(
+            existing_projects, dict
+        ):
+            eprint("cctally budget: budget.projects must be an object")
+            return 2
+        projects = dict(existing_projects or {})
         if root in projects:
             projects.pop(root)
             removed = True
