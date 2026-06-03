@@ -277,14 +277,6 @@ def insert_project_budget_milestone(*args, **kwargs):
     return sys.modules["cctally"].insert_project_budget_milestone(*args, **kwargs)
 
 
-def _resolve_project_key(*args, **kwargs):
-    return sys.modules["cctally"]._resolve_project_key(*args, **kwargs)
-
-
-def _project_disambiguate_labels(*args, **kwargs):
-    return sys.modules["cctally"]._project_disambiguate_labels(*args, **kwargs)
-
-
 def _project_budget_labels(*args, **kwargs):
     return sys.modules["cctally"]._project_budget_labels(*args, **kwargs)
 

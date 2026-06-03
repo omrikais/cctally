@@ -82,13 +82,14 @@ def test_project_crossings_basic_and_sorted_order():
 
 def test_project_crossings_one_ulp_below_integer_threshold_still_crosses():
     c = _ns()
-    # 0.57 * something → classic float-floor case; construct spent/target so
-    # consumption_pct lands one ULP below 50.
-    # 50.0 * 99 / 99 == 50.0 but use a value that underflows: 28.5/57*100.
-    by_proj = {"/p": 28.5}
-    out = list(c._project_crossings([("/p", 57.0)], [50], by_proj))
-    # 28.5/57*100 == 50.0 (may be 49.99999999999999) → +1e-9 snap must cross.
-    assert [t for (_pk, t, *_r) in out] == [50]
+    # Classic float-floor case (CLAUDE.md gotcha): 0.57 * 100 is
+    # 56.99999999999999 — strictly below the integer 57. Without the +1e-9 snap
+    # the 57% crossing is silently MISSED; the snap rescues it. This guards BOTH
+    # mutations: removing the snap (56.999... >= 57 is False) AND flipping it to
+    # -1e-9 — unlike an exact-50.0 fixture, which only catches the flip.
+    by_proj = {"/p": 0.57}
+    out = list(c._project_crossings([("/p", 1.0)], [57], by_proj))
+    assert [t for (_pk, t, *_r) in out] == [57]
 
 
 def test_project_crossings_zero_target_never_crosses():
