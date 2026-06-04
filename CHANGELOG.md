@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.27.1] - 2026-06-04
+
 ### Fixed
 - **Three Linux-only bugs, surfaced by running the full test suite on Linux for the first time** (cctally is developed on macOS, whose case-insensitive filesystem and BSD tooling had masked them): (1) `cctally statusline` with `display.tz = utc` no longer prints a spurious `invalid timezone 'utc'; using 'UTC'` warning on Linux — the lowercase `utc` preference is now normalized to the portable IANA key `UTC` before resolution (Linux's case-sensitive zoneinfo rejects `"utc"` where macOS silently accepts it); (2) the local web dashboard's background update-check thread no longer crashes with `TypeError: 'Event' object is not callable` when the dashboard shuts down — its internal stop-event field was shadowing `threading.Thread._stop`, which `Thread.join()` invokes during teardown; (3) `cctally setup --uninstall` now reliably terminates a running legacy usage-poller on Linux even when it was launched from a long filesystem path — the process-identity check passes `ps -ww` (unlimited-width output) so Linux's default ~80-column truncation can't drop the identifying token and mis-read the live daemon as a dead PID. No action needed on upgrade.
 
