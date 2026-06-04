@@ -1,13 +1,25 @@
 name: CI (Linux multi-version)
 on:
   push:
-    tags: ['v*']            # post-tag validation + release-ledger record
+    tags: ['v*']            # post-tag validation of the shipped artifact (fires on the public mirror; #131)
   schedule:
-    - cron: '29 7 * * 4'    # weekly Thu 07:29 UTC — offset off pricing-freshness's Mon 09:17
-  workflow_dispatch: {}     # the real pre-cut gate (dispatch before cctally-release)
+    - cron: '29 7 * * 4'    # weekly Thu 07:29 UTC (public mirror) — offset off pricing-freshness's Mon 09:17
+  workflow_dispatch: {}     # manual pre-cut/pre-merge gate (private source — validates an unpublished branch)
 jobs:
   test-linux:
-    if: github.repository == 'omrikais/cctally-dev'   # never on the public mirror
+    # Free Actions minutes, split by repo (#131):
+    #   * public mirror (omrikais/cctally) — runs on ALL triggers (tags +
+    #     weekly cron + dispatch). GH-hosted minutes are free on public repos,
+    #     and this validates exactly the shipped artifact users npm/brew-install.
+    #   * private source (omrikais/cctally-dev) — runs ONLY on a manual
+    #     workflow_dispatch (the pre-cut/pre-merge gate for an UNPUBLISHED branch
+    #     the public mirror can't see). Tag pushes + the weekly cron skip here
+    #     (job `if` false → 0 billable minutes), so they accrue no paid private
+    #     Actions cost. The private superset (release/mirror harnesses) stays
+    #     covered by the self-hosted macOS push-CI in ci.yml.
+    if: >-
+      github.repository == 'omrikais/cctally' ||
+      (github.repository == 'omrikais/cctally-dev' && github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false                                 # see all three results
