@@ -30,15 +30,15 @@ jobs:
       LC_ALL: "C.UTF-8"                                 # deterministic encoding/collation
       TZ: "Etc/UTC"                                     # repo gotcha: Etc/UTC, not UTC
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '${{ matrix.python-version }}'
       # Required (NOT dead weight): cctally-test-all glob-runs every bin/cctally-*-test,
       # and cctally-npm-shim-test / cctally-npm-postinstall-test hard-fail (exit 1) without
       # the `node` binary. We do NOT run `npm ci` — the vitest share smoke is OS-agnostic and
       # covered on the macOS push gate; this matrix's value is the Python-interpreter axis.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version-file: 'dashboard/web/.nvmrc'
       - name: Assert required CLI tools present

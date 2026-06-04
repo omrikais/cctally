@@ -32,7 +32,7 @@ jobs:
     if: github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
     runs-on: [self-hosted, macOS, cctally]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # `bin/cctally-share-v2-test` runs a Vitest-based GUI smoke
       # (`dashboard/web/src/share/ShareManualSmoke.test.tsx`) via
@@ -43,7 +43,7 @@ jobs:
       # failure). Mirrors the setup-node + `npm ci` pair the
       # `dashboard-build-stability` job already uses.
       - name: Setup Node (per .nvmrc)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version-file: dashboard/web/.nvmrc
           cache: npm
@@ -89,10 +89,10 @@ jobs:
     if: github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
     runs-on: [self-hosted, macOS, cctally]  # committed bytes were generated on macOS; native bindings vary by OS
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Node (per .nvmrc)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version-file: dashboard/web/.nvmrc
           cache: npm

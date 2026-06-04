@@ -37,9 +37,9 @@ jobs:
       GH_REPO: omrikais/cctally-dev
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           # bin/cctally hard-exits below 3.11 (__min_python_version__);
           # ubuntu-latest's default python3 is older.
