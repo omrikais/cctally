@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -10,7 +12,10 @@ def _read(p):
 
 def test_runtime_gate_is_311():
     assert "__min_python_version__ = (3, 11)" in _read("bin/cctally")
-    assert "__min_python_version__ = (3, 11)" in _read("bin/cctally-release")
+    # bin/cctally-release is maintainer-only (not mirrored to the public
+    # clone, issue #131); assert its floor only where the file exists.
+    if (ROOT / "bin/cctally-release").exists():
+        assert "__min_python_version__ = (3, 11)" in _read("bin/cctally-release")
 
 
 def test_user_facing_declarations_agree_on_311():
@@ -22,6 +27,10 @@ def test_user_facing_declarations_agree_on_311():
     assert "Python 3.13+" not in _read("docs/installation.md")
 
 
+@pytest.mark.skipif(
+    not (ROOT / "homebrew/cctally.rb.template").exists(),
+    reason="brew template is maintainer-only (not mirrored to the public clone, issue #131)",
+)
 def test_brew_template_still_pins_313():
     # Deliberately unchanged: brew bundles its own interpreter.
     assert 'python@3.13' in _read("homebrew/cctally.rb.template")

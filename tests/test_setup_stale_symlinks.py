@@ -35,6 +35,15 @@ import _cctally_core
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
+# bin/cctally-release is maintainer-only (not mirrored to the public clone,
+# issue #131). The three cases below need it as a real, existing symlink
+# target / test premise; skip them where the file is absent. The remaining
+# cases use synthetic tmp_path / old-keg / old-npm targets and run anywhere.
+_requires_release_bin = pytest.mark.skipif(
+    not (REPO_ROOT / "bin" / "cctally-release").exists(),
+    reason="bin/cctally-release is maintainer-only (not mirrored to the public clone)",
+)
+
 
 @pytest.fixture
 def ns():
@@ -57,6 +66,7 @@ class TestCleanupStaleSymlinksRespectsManualLinks:
     must not delete that link.
     """
 
+    @_requires_release_bin
     def test_manual_link_to_existing_target_preserved(self, ns, monkeypatch, tmp_path):
         redirect_paths(ns, monkeypatch, tmp_path)
         local_bin = _make_local_bin(tmp_path)
@@ -197,6 +207,7 @@ class TestDetectStaleSymlinksMatchesCleanup:
     as stale in the status output.
     """
 
+    @_requires_release_bin
     def test_manual_link_not_flagged_as_stale(self, ns, monkeypatch, tmp_path):
         redirect_paths(ns, monkeypatch, tmp_path)
         local_bin = _make_local_bin(tmp_path)
@@ -288,6 +299,7 @@ class TestUninstallRemovesLegacyAutoSymlinks:
             lambda path=pinned: real_backup(path),
         )
 
+    @_requires_release_bin
     def test_uninstall_removes_legacy_release_symlink(self, ns, monkeypatch, tmp_path, capsys):
         redirect_paths(ns, monkeypatch, tmp_path)
         self._pin_settings_io(ns, monkeypatch, tmp_path)
