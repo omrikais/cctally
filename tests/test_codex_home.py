@@ -209,6 +209,13 @@ def _run_codex(args, *, home, data_dir, codex_home, cwd=None, columns=None):
         "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
         "CCTALLY_DATA_DIR": str(data_dir),
         "CCTALLY_AS_OF": "2026-04-20T00:00:00Z",
+        # Suppress the detached background update-check (main()'s post-command
+        # hook). It mkdir's APP_DIR (= CCTALLY_DATA_DIR) to write
+        # update-state.json / update.log asynchronously after codex-daily
+        # returns; test_multiroot_ingestion_union_totals does
+        # `shutil.rmtree(data)` between sub-runs, which races that detached
+        # writer under full-suite IO load and flaked ~15% on Linux CI.
+        "CCTALLY_DISABLE_UPDATE_CHECK": "1",
     })
     if codex_home is not None:
         env["CODEX_HOME"] = codex_home

@@ -48,6 +48,37 @@ if _BIN_DIR not in sys.path:
     sys.path.insert(0, _BIN_DIR)
 
 
+@pytest.fixture(autouse=True)
+def _restore_process_timezone():
+    """Immunize the whole suite against cross-test timezone leaks.
+
+    Several tests pin a non-UTC host tz with ``monkeypatch.setenv("TZ", ...)``
+    followed by ``time.tzset()`` so ``datetime.astimezone()`` observes that
+    zone (e.g. test_derive_week_utc_anchor and test_dashboard_period_builders
+    use ``America/Los_Angeles``). ``monkeypatch`` restores the TZ *env var* at
+    teardown but NOT the process-global libc tz state that ``tzset()`` mutated
+    — so the leaked zone persists for every later test sharing the same
+    pytest-xdist worker, flipping tz-derived date/bucket boundaries by a day.
+    That surfaced on Linux CI as flaky, scheduling-dependent failures in
+    test_share_top_projects / test_share_period_resolver / test_project_budget_alerts.
+    Snapshot TZ at setup, then re-apply it + re-run tzset() at teardown so libc
+    always reverts — independent of which test leaked or monkeypatch's
+    finalization order. tzset() is a no-op on the rare non-POSIX host.
+    """
+    import time
+
+    saved_tz = os.environ.get("TZ")
+    try:
+        yield
+    finally:
+        if saved_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = saved_tz
+        if hasattr(time, "tzset"):
+            time.tzset()
+
+
 def load_script():
     """Execute the main script and return its globals dict.
 

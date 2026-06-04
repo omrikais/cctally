@@ -411,12 +411,15 @@ LOCKBODY
     # shellcheck disable=SC2086
     set +u
     if [ "$TTY_SIM" = "1" ]; then
-        # Banner predicate gates on sys.stderr.isatty(). Wrap via BSD
-        # `script` to allocate a PTY (interleaves stdout+stderr but
-        # banner-only goldens already drop stdout via STDOUT_DISCARD).
-        # The leading ^D and trailing CR characters from the PTY are
-        # redacted out below.
-        script -q /dev/null \
+        # Banner predicate gates on sys.stderr.isatty(). Allocate a PTY
+        # via Python's stdlib `pty.spawn` — portable across macOS + Linux.
+        # (A direct `script` call is NOT portable: BSD `script -q /dev/null
+        # cmd...` and util-linux `script -q -c "cmd" /dev/null` take
+        # incompatible argument orders, so the BSD form errors out on Linux
+        # with "unexpected number of arguments".) Interleaves stdout+stderr
+        # but banner-only goldens already drop stdout via STDOUT_DISCARD;
+        # the trailing CRs the PTY appends are redacted out below.
+        python3 -c 'import os,pty,sys; raise SystemExit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' \
             env \
             HOME="$scratch" \
             TZ="$PRE_TZ" \

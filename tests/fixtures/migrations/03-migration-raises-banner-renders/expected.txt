@@ -25,7 +25,6 @@ stats.db:
   Traceback (most recent call last):
     File "<CCTALLY_BIN>", line <N>, in _run_pending_migrations
       m.handler(conn)
-      ~~~~~~~~~^^^^^^
     File "<CCTALLY_BIN>", line <N>, in _test_migration_failure_injection
       raise RuntimeError("test failure injected")
   RuntimeError: test failure injected

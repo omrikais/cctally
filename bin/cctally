@@ -2720,7 +2720,19 @@ def _post_command_update_hooks(command: str | None, args) -> None:
     ``_spawn_background_update_check`` here would create ``config.json``,
     ``update-state.json``, and ``update.log`` on a fresh install where
     the existing-install gate already makes the symlink work a no-op.
-    Same rationale as doctor."""
+    Same rationale as doctor.
+
+    Test/CI seam: ``CCTALLY_DISABLE_UPDATE_CHECK`` short-circuits the whole
+    hook (mirrors ``CCTALLY_DISABLE_DEV_AUTODETECT``). The background
+    ``_spawn_background_update_check`` is a DETACHED process that
+    ``mkdir``s APP_DIR to write ``update-state.json`` / ``update.log``; a
+    fixture harness that runs a command and then asserts on APP_DIR (e.g.
+    ``cctally-setup-test``'s uninstall-purge "data dir is gone" check)
+    otherwise races that detached writer re-creating the dir after the
+    command returns. Setting this env var makes such harnesses
+    deterministic without disabling the feature for real users."""
+    if os.environ.get("CCTALLY_DISABLE_UPDATE_CHECK"):
+        return
     if command == "setup" and getattr(args, "uninstall", False):
         return
     if command == "doctor":

@@ -401,8 +401,11 @@ assert_contains  "400 unknown key message"       'unknown settings key: foo' "$b
 stop_server
 
 # --- Case 13 (T7): /api/alerts/test happy path ------------------------------
-# osascript may or may not be present on the host. Both outcomes are 200;
-# the dispatch field carries "queued" or "spawn_error: ...".
+# The resolved notifier depends on the host: macOS auto-resolves to
+# `osascript` (-> "queued" if it spawns, "spawn_error: ..." if not), while a
+# notifier-less Linux CI host auto-resolves to `none` (-> "no_notifier:none").
+# All three are valid 200 dispatch shapes — the endpoint contract is "200 +
+# a recognized dispatch token", not a specific backend.
 start_server || exit 1
 raw=$(curl -s -X POST "$base/api/alerts/test" \
     -H "Origin: http://127.0.0.1:$PORT" \
@@ -413,11 +416,12 @@ split_post_response "$raw"
 assert_eq        "200 alerts/test code"          "200" "$code"
 assert_contains  "200 alerts/test alert key"     '"alert"' "$body"
 assert_contains  "200 alerts/test dispatch key"  '"dispatch"' "$body"
-# `dispatch` value must be "queued" or start with "spawn_error:".
+# `dispatch` value must be "queued", start with "spawn_error:", or be a
+# "no_notifier:*" token (host has no usable notifier, e.g. Linux CI).
 dispatch_val=$(printf '%s' "$body" \
     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("dispatch",""))')
 case "$dispatch_val" in
-    queued|spawn_error:*)
+    queued|spawn_error:*|no_notifier:*)
         echo "PASS 200 alerts/test dispatch shape ($dispatch_val)"
         pass_count=$((pass_count + 1))
         ;;

@@ -1,0 +1,54 @@
+name: CI (Linux multi-version)
+on:
+  push:
+    tags: ['v*']            # post-tag validation + release-ledger record
+  schedule:
+    - cron: '29 7 * * 4'    # weekly Thu 07:29 UTC — offset off pricing-freshness's Mon 09:17
+  workflow_dispatch: {}     # the real pre-cut gate (dispatch before cctally-release)
+jobs:
+  test-linux:
+    if: github.repository == 'omrikais/cctally-dev'   # never on the public mirror
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false                                 # see all three results
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    env:
+      CCTALLY_TEST_JOBS: "2"                            # dashboard fixture servers need port-print headroom
+      LC_ALL: "C.UTF-8"                                 # deterministic encoding/collation
+      TZ: "Etc/UTC"                                     # repo gotcha: Etc/UTC, not UTC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '${{ matrix.python-version }}'
+      # Required (NOT dead weight): cctally-test-all glob-runs every bin/cctally-*-test,
+      # and cctally-npm-shim-test / cctally-npm-postinstall-test hard-fail (exit 1) without
+      # the `node` binary. We do NOT run `npm ci` — the vitest share smoke is OS-agnostic and
+      # covered on the macOS push gate; this matrix's value is the Python-interpreter axis.
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: 'dashboard/web/.nvmrc'
+      - name: Assert required CLI tools present
+        run: |
+          # Harnesses shell out to these (jq: dashboard/migrations goldens;
+          # column: table renders; ps: legacy-poller ownership probe; bc:
+          # arithmetic; sqlite3: 5h/migrations state dumps). ubuntu-latest
+          # ships them all — assert (with a best-effort install fallback) so a
+          # future image dropping one FAILS LOUDLY here rather than surfacing
+          # as a confusing golden mismatch deep in the suite (issue #132: a
+          # missing `jq` masqueraded as 36 phantom dashboard failures locally).
+          missing=""
+          for t in sqlite3 jq column ps bc; do
+            command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::missing CLI tools$missing — installing"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq sqlite3 jq bsdmainutils procps bc
+          fi
+          sqlite3 --version
+      - name: Install Python test deps
+        run: python -m pip install --upgrade pip pytest pytest-xdist rich
+      - name: Run the suite
+        run: bin/cctally-test-all

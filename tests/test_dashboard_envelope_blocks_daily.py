@@ -59,6 +59,15 @@ def _pin_update_envelope_loaders(ns):
         "remind_after": None,
     }
 
+    # Pin config to empty so the envelope's config-derived fields use defaults
+    # rather than the host's ~/.local/share/cctally/config.json. On a dev
+    # machine that file carries e.g. ``alerts.notifier = "osascript"``, which
+    # the envelope mirrors verbatim into ``alerts_settings.notifier`` —
+    # diverging the golden ("auto") on macOS while a config-less CI host
+    # passes. An empty config yields the documented defaults the golden froze
+    # (notifier "auto", display.tz "local", default thresholds), host-agnostic.
+    ns["load_config"] = lambda *a, **k: {}
+
     def _raise_doctor(**_kw):
         raise RuntimeError("pinned: doctor disabled for envelope golden")
     ns["doctor_gather_state"] = _raise_doctor

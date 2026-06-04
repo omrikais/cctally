@@ -688,6 +688,16 @@ def _build_osascript_missing(out: Path) -> None:
       * milestone INSERT committed (alerted_at SET — set-then-dispatch)
       * alerts.log line written with status "spawn_error: FileNotFoundError: ..."
       * record-usage exit 0 (spawn errors must NOT fail the parent)
+
+    Notifier is pinned to ``command`` (with a template) rather than left at
+    ``auto`` so the spawn-error path is exercised IDENTICALLY on every OS.
+    Under ``auto``, resolve_notifier picks ``osascript`` only on macOS and
+    ``none`` on a notifier-less Linux CI host — and the ``none`` path returns
+    ``no_notifier:none`` BEFORE any Popen, so the injected
+    raise_filenotfound factory never fires and the spawn_error assertion
+    can't be reached. ``command`` resolves to a real argv on all platforms,
+    so the injected factory raises and the spawn_error branch runs anywhere
+    (the template binary is never actually exec'd — the factory raises first).
     """
     name = "osascript-missing"
     scenario_dir, app_dir, _ = _scenario_paths(out, name)
@@ -701,8 +711,12 @@ def _build_osascript_missing(out: Path) -> None:
         )
         sc.commit()
         cc.commit()
-    _write_config(app_dir, alerts_block={"enabled": True,
-                                          "weekly_thresholds": [90, 95]})
+    _write_config(app_dir, alerts_block={
+        "enabled": True,
+        "weekly_thresholds": [90, 95],
+        "notifier": "command",
+        "command_template": ["cctally-notify-missing", "{title}"],
+    })
     _write_input_env(
         scenario_dir,
         percent=91.0,
@@ -747,7 +761,13 @@ def _build_budget_osascript_missing(out: Path) -> None:
     FileNotFoundError. Asserts the budget milestone is STILL committed with
     alerted_at SET (set-then-dispatch: the row is durable BEFORE the Popen),
     the alerts.log line carries a spawn_error status, and record-usage exits
-    0 (a dispatch failure never fails the parent / rolls back the row)."""
+    0 (a dispatch failure never fails the parent / rolls back the row).
+
+    Notifier pinned to ``command`` for the same cross-OS reason as scenario 10
+    (``_build_osascript_missing``): under ``auto`` a notifier-less Linux host
+    resolves to ``none`` and returns ``no_notifier:none`` before any Popen,
+    so the injected raise_filenotfound factory never reaches the spawn_error
+    branch. ``command`` resolves to a real argv everywhere."""
     name = "budget-osascript-missing"
     scenario_dir, app_dir, _ = _scenario_paths(out, name)
     stats_path, cache_path = _baseline_dbs(app_dir)
@@ -758,6 +778,9 @@ def _build_budget_osascript_missing(out: Path) -> None:
     _write_config(app_dir, budget_block={
         "weekly_usd": 10.0, "alerts_enabled": True,
         "alert_thresholds": [90, 100],
+    }, alerts_block={
+        "notifier": "command",
+        "command_template": ["cctally-notify-missing", "{title}"],
     })
     _write_input_env(
         scenario_dir,

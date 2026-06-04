@@ -13,6 +13,7 @@ Two surfaces under test:
 from __future__ import annotations
 
 import datetime as dt
+import os
 
 import pytest
 
@@ -22,6 +23,27 @@ from conftest import load_script
 @pytest.fixture(scope="module")
 def ns():
     return load_script()
+
+
+@pytest.fixture(autouse=True)
+def _pin_wide_terminal(monkeypatch):
+    """Pin a wide render width so the gap-row tests are width-independent.
+
+    `_render_blocks_table` derives its width from `os.get_terminal_size()`,
+    falling back to the `COLUMNS` env var (default 120) when there is no
+    tty. Under pytest-xdist the worker processes inherit `COLUMNS=80`
+    (execnet sets it), which narrows the table enough that the `(Xm gap)`
+    annotation is ellipsized off the gap row — so these assertions flake
+    depending on whether the suite runs serially or sharded. Force the
+    terminal-size probe to raise and pin a wide `COLUMNS` so the column
+    that carries the gap label always has room, regardless of the
+    ambient `COLUMNS` or tty state.
+    """
+    def _no_tty(*_a, **_k):
+        raise OSError("no tty (pinned for deterministic render width)")
+
+    monkeypatch.setattr(os, "get_terminal_size", _no_tty)
+    monkeypatch.setenv("COLUMNS", "200")
 
 
 def _entry(ns, ts: dt.datetime, *, model: str = "claude-sonnet-4-6", tokens: int = 100):

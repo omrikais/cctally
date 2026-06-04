@@ -91,6 +91,14 @@ def _resolve_statusline_tz(cli_tz, cfg, warn_once):
             tz_name = c._local_tz_name() or "UTC"
         except Exception:
             tz_name = "UTC"
+    elif tz_name and tz_name.lower() == "utc":
+        # Canonical "utc" (the value get_display_tz_pref / normalize_display_tz_value
+        # emit) -> the portable IANA key "UTC". macOS's case-insensitive
+        # filesystem resolves ZoneInfo("utc") to UTC, but Linux's case-sensitive
+        # /usr/share/zoneinfo raises ZoneInfoNotFoundError, which would emit a
+        # spurious "invalid timezone 'utc'" warning below. Mirrors
+        # resolve_display_tz, which maps canonical "utc" -> ZoneInfo("Etc/UTC").
+        tz_name = "UTC"
     try:
         ZoneInfo(tz_name)
     except (ZoneInfoNotFoundError, Exception):

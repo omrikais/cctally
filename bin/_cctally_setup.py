@@ -998,11 +998,15 @@ def _legacy_stop_active_poller() -> str:
     # Ownership probe: the PID file is at a predictable /tmp path that
     # outlives the daemon on uncleanly exit, and macOS PIDs cycle in a
     # narrow space — verify the live process is actually our legacy
-    # poller before signaling. ps's `-o command=` emits the full cmdline
-    # with no header on both macOS BSD ps and Linux util-linux ps.
+    # poller before signaling. `-o command=` emits the cmdline with no
+    # header on both macOS BSD ps and Linux util-linux ps; `-ww` forces
+    # UNLIMITED width so the cmdline is never truncated. Without it,
+    # Linux util-linux ps clamps the column to ~80 chars (macOS BSD ps
+    # does not), so a poller launched from a long path drops the
+    # "usage-poller.py" token off the end → a false "stale-pid".
     try:
         probe = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
             capture_output=True, text=True, timeout=2.0,
         )
     except (OSError, subprocess.TimeoutExpired):

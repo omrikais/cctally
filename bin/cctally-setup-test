@@ -199,8 +199,14 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
     # post-install state (symlinks, etc.) that we can't ship in git.
     if [ -f "$dir/pre-cmd.txt" ]; then
         local pre; pre=$(cat "$dir/pre-cmd.txt")
+        # CCTALLY_DISABLE_UPDATE_CHECK: a `setup` install otherwise fires a
+        # DETACHED background `_update-check` worker (main()'s post-command
+        # hook) that mkdir's APP_DIR to write update-state.json — racing a
+        # later cmd that wipes/asserts on APP_DIR (the uninstall-purge
+        # "data dir gone" post-check flaked ~50-75% on Linux 3.12/3.13 from
+        # exactly this). The seam keeps every scenario deterministic.
         # shellcheck disable=SC2086
-        HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh \
+        HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_DISABLE_UPDATE_CHECK=1 \
             PATH="${path_pre}$fake/.fake-bin:/usr/bin:/bin" \
             "$launcher" $pre >/dev/null 2>&1 || true
     fi
@@ -220,11 +226,13 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
         # scenario.
         # shellcheck disable=SC2086
         raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_AS_OF="${CCTALLY_AS_OF:-}" \
+              CCTALLY_DISABLE_UPDATE_CHECK=1 \
               PATH="${path_pre}$fake/.fake-bin:/usr/bin:/bin" \
               "$launcher" $cmd < "$dir/stdin.txt" 2>&1; echo "EXIT=$?")
     else
         # shellcheck disable=SC2086
         raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_AS_OF="${CCTALLY_AS_OF:-}" \
+              CCTALLY_DISABLE_UPDATE_CHECK=1 \
               PATH="${path_pre}$fake/.fake-bin:/usr/bin:/bin" \
               "$launcher" $cmd 2>&1; echo "EXIT=$?")
     fi

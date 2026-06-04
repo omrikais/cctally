@@ -1890,13 +1890,13 @@ class _DashboardUpdateCheckThread(threading.Thread):
         snapshot_ref: "_SnapshotRef | None" = None,
     ) -> None:
         super().__init__(name="cctally-update-check")
-        self._stop = stop_event
+        self._stop_event = stop_event
         self._hub = hub
         self._ref = snapshot_ref
 
     def run(self) -> None:
         c = _cctally()
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 # Self-heal runs every tick (every 30 min by default),
                 # NOT gated by `_is_update_check_due`'s 24h TTL. Catches
@@ -1938,7 +1938,7 @@ class _DashboardUpdateCheckThread(threading.Thread):
                         )
                 except Exception:
                     pass
-            self._stop.wait(c.UPDATE_DASHBOARD_CHECK_POLL_S)
+            self._stop_event.wait(c.UPDATE_DASHBOARD_CHECK_POLL_S)
 
 
 def cmd_update(args) -> int:
