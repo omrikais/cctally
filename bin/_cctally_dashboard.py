@@ -1736,6 +1736,8 @@ def _build_projects_share_panel_data(options: dict,
                 "bucket_path":    tp["bucket_path"],
                 "cost_usd":       cost,
                 "attributed_pct": attributed,
+                # Integer session counts — bare sum() is exact (NOT a
+                # stable_sum float-output site; see test_stable_sum_chokepoint).
                 "sessions_count": int(sum(ws)),
             })
         rows.sort(key=lambda r: (-r["cost_usd"], r["key"]))

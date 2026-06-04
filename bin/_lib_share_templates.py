@@ -156,19 +156,26 @@ _LS = _import_share_lib()
 
 
 def _import_stable_sum():
-    """Path-load ``_lib_fmt.stable_sum`` without requiring ``bin/`` on
-    ``sys.path`` (same rationale as ``_import_share_lib``). ``_lib_fmt``'s only
-    intra-repo deps are the leaf kernels ``_cctally_core`` + ``_lib_display_tz``
-    (neither imports back), so this is acyclic. Returns the interpreter-stable
-    float-summation chokepoint (math.fsum) used for output-bound cost totals.
+    """Resolve ``_lib_fmt.stable_sum`` — the interpreter-stable float-summation
+    chokepoint (math.fsum) used for output-bound cost totals.
+
+    The ``sys.modules`` fast path is what runs in practice (``_lib_fmt`` is a
+    foundational kernel already imported by ``bin/cctally`` and the test
+    harness). The path-load fallback differs from ``_import_share_lib``'s:
+    ``_lib_share`` is dep-free, but ``_lib_fmt`` imports the leaf kernels
+    ``_cctally_core`` + ``_lib_display_tz`` *by name*, so the fallback must put
+    ``bin/`` on ``sys.path`` before executing it or those imports raise
+    ModuleNotFoundError. The leaves never import back, so this stays acyclic.
     """
     import sys
     if "_lib_fmt" in sys.modules:
         return sys.modules["_lib_fmt"].stable_sum
     from pathlib import Path
     import importlib.util
-    p = Path(__file__).resolve().parent / "_lib_fmt.py"
-    spec = importlib.util.spec_from_file_location("_lib_fmt", p)
+    bin_dir = Path(__file__).resolve().parent
+    if str(bin_dir) not in sys.path:
+        sys.path.insert(0, str(bin_dir))
+    spec = importlib.util.spec_from_file_location("_lib_fmt", bin_dir / "_lib_fmt.py")
     m = importlib.util.module_from_spec(spec)
     sys.modules["_lib_fmt"] = m
     try:
