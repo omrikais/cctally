@@ -5228,6 +5228,19 @@ def _qs_int(q: dict, key: str, default: int) -> int:
         return default
 
 
+def _qs_str(q: dict, key: str, default: str | None) -> str | None:
+    """Parse a single query-string value with a fallback.
+
+    ``q`` is a ``urllib.parse.parse_qs`` mapping (list-valued). A missing key
+    or an empty list falls back to ``default``. The string sibling of
+    ``_qs_int`` — collapses the ``(q.get(key, [default]) or [default])[0]``
+    idiom the conversation handlers hand-respelled (a ``None`` default is fine,
+    so the reader's ``after`` cursor routes through it too).
+    """
+    vals = q.get(key, [default])
+    return vals[0] if vals else default
+
+
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
     """Routes:
         GET /                       → dashboard.html
@@ -7247,6 +7260,34 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         """Lazy-load the pure conversation query kernel (Plan 2, §3)."""
         return sys.modules["cctally"]._load_sibling("_lib_conversation_query")
 
+    def _run_conversation_query(self, kernel_call, log_label):
+        """Open cache.db, run ``kernel_call(conn)``, close — with the uniform
+        500 envelopes the three conversation routes share (#151).
+
+        Collapses the triplicated open-cache → try/except/finally → 500
+        scaffold to one site. Returns ``(ok, body)``: ``ok=False`` means a 500
+        has ALREADY been sent and the caller must just ``return``; ``ok=True``
+        carries the kernel result (which may itself be ``None`` — the reader's
+        404 sentinel — so the explicit flag, not ``body is None``, signals
+        failure). An ``open_cache_db`` failure is a ``cache unavailable:`` 500;
+        a kernel exception is logged as ``<log_label> failed: %r`` and returned
+        as a ``{type}: {msg}`` 500 — byte-identical to the inlined handlers.
+        """
+        try:
+            conn = open_cache_db()
+        except (sqlite3.DatabaseError, OSError) as exc:
+            self._respond_json(500, {"error": f"cache unavailable: {exc}"})
+            return False, None
+        try:
+            body = kernel_call(conn)
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("%s failed: %r", log_label, exc)
+            self._respond_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+            return False, None
+        finally:
+            conn.close()
+        return True, body
+
     def _handle_get_conversations(self) -> None:
         """``GET /api/conversations`` — the browse rail (spec §3.1).
 
@@ -7258,23 +7299,15 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             return
         import urllib.parse as _u
         q = _u.parse_qs(self.path.partition("?")[2])
-        sort = (q.get("sort", ["recent"]) or ["recent"])[0]
+        sort = _qs_str(q, "sort", "recent")
         limit = _qs_int(q, "limit", 50)
         offset = _qs_int(q, "offset", 0)
-        try:
-            conn = open_cache_db()
-        except (sqlite3.DatabaseError, OSError) as exc:
-            self._respond_json(500, {"error": f"cache unavailable: {exc}"})
+        ok, body = self._run_conversation_query(
+            lambda conn: self._conversation_query().list_conversations(
+                conn, sort=sort, limit=limit, offset=offset),
+            "/api/conversations")
+        if not ok:
             return
-        try:
-            body = self._conversation_query().list_conversations(
-                conn, sort=sort, limit=limit, offset=offset)
-        except Exception as exc:  # noqa: BLE001
-            self.log_error("/api/conversations failed: %r", exc)
-            self._respond_json(500, {"error": f"{type(exc).__name__}: {exc}"})
-            return
-        finally:
-            conn.close()
         self._respond_json(200, body)
 
     def _handle_get_conversation_detail(self, path: str) -> None:
@@ -7296,22 +7329,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(404, "conversation not found")
             return
         q = _u.parse_qs(query_str)
-        after = (q.get("after", [None]) or [None])[0]
+        after = _qs_str(q, "after", None)
         limit = _qs_int(q, "limit", 500)
-        try:
-            conn = open_cache_db()
-        except (sqlite3.DatabaseError, OSError) as exc:
-            self._respond_json(500, {"error": f"cache unavailable: {exc}"})
+        ok, body = self._run_conversation_query(
+            lambda conn: self._conversation_query().get_conversation(
+                conn, session_id, after=after, limit=limit),
+            "/api/conversation")
+        if not ok:
             return
-        try:
-            body = self._conversation_query().get_conversation(
-                conn, session_id, after=after, limit=limit)
-        except Exception as exc:  # noqa: BLE001
-            self.log_error("/api/conversation failed: %r", exc)
-            self._respond_json(500, {"error": f"{type(exc).__name__}: {exc}"})
-            return
-        finally:
-            conn.close()
         if body is None:
             self.send_error(404, "conversation not found")
             return
@@ -7325,23 +7350,15 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             return
         import urllib.parse as _u
         q = _u.parse_qs(self.path.partition("?")[2])
-        query = (q.get("q", [""]) or [""])[0]
+        query = _qs_str(q, "q", "")
         limit = _qs_int(q, "limit", 50)
         offset = _qs_int(q, "offset", 0)
-        try:
-            conn = open_cache_db()
-        except (sqlite3.DatabaseError, OSError) as exc:
-            self._respond_json(500, {"error": f"cache unavailable: {exc}"})
+        ok, body = self._run_conversation_query(
+            lambda conn: self._conversation_query().search_conversations(
+                conn, query, limit=limit, offset=offset),
+            "/api/conversation/search")
+        if not ok:
             return
-        try:
-            body = self._conversation_query().search_conversations(
-                conn, query, limit=limit, offset=offset)
-        except Exception as exc:  # noqa: BLE001
-            self.log_error("/api/conversation/search failed: %r", exc)
-            self._respond_json(500, {"error": f"{type(exc).__name__}: {exc}"})
-            return
-        finally:
-            conn.close()
         self._respond_json(200, body)
 
     def _handle_get_project_detail(self) -> None:

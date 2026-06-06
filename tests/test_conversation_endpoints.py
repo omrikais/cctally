@@ -292,6 +292,42 @@ def test_kernel_exception_returns_clean_500(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def test_cache_open_failure_returns_500(tmp_path, monkeypatch):
+    """A failure at ``open_cache_db()`` itself (BEFORE the query) must surface
+    as a clean HTTP 500 with ``{"error": "cache unavailable: ..."}`` on all
+    three conversation routes. Distinct from ``test_kernel_exception_…``: this
+    fires at connection time, not mid-query, exercising the FIRST try/except of
+    the shared scaffold. Characterizes the open-failure branch the #151
+    scaffold-collapse must preserve byte-for-byte (without the
+    ``except (DatabaseError, OSError)`` the OSError propagates out of
+    ``do_GET`` and the client sees a reset, not a 500 — so this is
+    non-vacuous)."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        import _cctally_dashboard as _dash
+
+        def _boom():
+            raise OSError("disk gone")
+
+        # Patch the binding the handler resolves at request time
+        # (LOAD_GLOBAL in _cctally_dashboard's namespace). Seeding already
+        # happened in _boot via ns["open_cache_db"], so this only affects
+        # the live request path.
+        monkeypatch.setattr(_dash, "open_cache_db", _boom)
+        for route in ("/api/conversations",
+                      "/api/conversation/s1",
+                      "/api/conversation/search?q=token"):
+            status, body = _get(port, route)
+            assert status == 500, (route, status, body)
+            payload = json.loads(body)
+            assert payload.get("error", "").startswith("cache unavailable:"), \
+                (route, payload)
+    finally:
+        srv.shutdown()
+
+
 def test_api_data_transcripts_enabled_is_host_aware(tmp_path, monkeypatch):
     """``/api/data.transcriptsEnabled`` is computed per-request from the Host
     header: loopback → True; LAN hostname + expose=False → False."""
