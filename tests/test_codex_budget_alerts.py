@@ -2,8 +2,9 @@
 
 Exercises ``maybe_record_codex_budget_milestone`` (record-usage firing /
 opportunistic ``cctally budget`` firing share the same helper) and
-``_reconcile_codex_budget_milestones_on_set`` (forward-only-from-set) against a
-redirected tmp stats.db.
+``_reconcile_budget_milestones_on_set(vendor="codex", …)`` (forward-only-from-set)
+against a redirected tmp stats.db. Codex rows now live in the unified
+vendor-tagged ``budget_milestones`` table (``vendor='codex'``, #143).
 
 Unlike the Claude budget axis, the Codex axis has NO subscription week: the
 period window is derived purely from ``now`` + the configured calendar period
@@ -72,8 +73,9 @@ def ns(monkeypatch, tmp_path):
 
 
 def _ensure_schema(ns):
-    """Open + close the DB once so the schema (incl. codex_budget_milestones)
-    is created before the firing helper runs."""
+    """Open + close the DB once so the schema (incl. the unified
+    vendor-tagged budget_milestones table, #143) is created before the firing
+    helper runs."""
     ns["open_db"]().close()
 
 
@@ -121,10 +123,13 @@ def _patch_dispatch(ns, monkeypatch):
 def _rows(ns):
     conn = ns["open_db"]()
     try:
+        # Unified vendor-tagged table (#143): filter to the Codex axis so a
+        # stray Claude row never pollutes the Codex firing assertions.
         return conn.execute(
-            "SELECT period_start_at, threshold, budget_usd, spent_usd, "
+            "SELECT vendor, period_start_at, threshold, budget_usd, spent_usd, "
             "       consumption_pct, alerted_at "
-            "FROM codex_budget_milestones ORDER BY period_start_at, threshold"
+            "FROM budget_milestones WHERE vendor = 'codex' "
+            "ORDER BY period_start_at, threshold"
         ).fetchall()
     finally:
         conn.close()
@@ -147,8 +152,9 @@ def test_reconcile_on_set_records_without_dispatch_then_later_fires(ns, monkeypa
         import argparse
         config = ns["load_config"]()
         tz = ns["resolve_display_tz"](argparse.Namespace(tz=None), config)
-        ns["_reconcile_codex_budget_milestones_on_set"](
+        ns["_reconcile_budget_milestones_on_set"](
             conn,
+            vendor="codex",
             target=200.0,
             thresholds=(90, 100),
             now_utc=now_utc,
@@ -162,6 +168,7 @@ def test_reconcile_on_set_records_without_dispatch_then_later_fires(ns, monkeypa
     rows = _rows(ns)
     assert [r["threshold"] for r in rows] == [90]
     assert rows[0]["period_start_at"] == JUNE_KEY
+    assert rows[0]["vendor"] == "codex"
     assert rows[0]["alerted_at"] is not None  # recorded
     assert captured == []  # but NOT dispatched (no instant popup)
 
@@ -192,6 +199,8 @@ def test_crossing_fires_once_no_refire(ns, monkeypatch):
     assert [r["threshold"] for r in rows] == [90, 100]
     assert all(r["alerted_at"] is not None for r in rows)
     assert all(r["period_start_at"] == JUNE_KEY for r in rows)
+    # Each fired row carries the Codex vendor tag (#143 unified table).
+    assert all(r["vendor"] == "codex" for r in rows)
     assert all(abs(r["budget_usd"] - 200.0) < 1e-9 for r in rows)
     assert {p["threshold"] for p, _ in captured} == {90, 100}
     assert all(p["axis"] == "codex_budget" for p, _ in captured)
@@ -325,18 +334,21 @@ def test_calendar_week_to_month_switch_no_collision(ns):
     X = JUNE_KEY
     conn = ns["open_db"]()
     try:
-        assert ns["insert_codex_budget_milestone"](
-            conn, period_start_at=X, period="calendar-week", threshold=90,
-            budget_usd=100.0, spent_usd=92.0, consumption_pct=92.0, commit=True,
+        assert ns["insert_budget_milestone"](
+            conn, vendor="codex", period_start_at=X, period="calendar-week",
+            threshold=90, budget_usd=100.0, spent_usd=92.0,
+            consumption_pct=92.0, commit=True,
         ) == 1
-        assert ns["insert_codex_budget_milestone"](
-            conn, period_start_at=X, period="calendar-month", threshold=90,
-            budget_usd=200.0, spent_usd=190.0, consumption_pct=95.0, commit=True,
+        assert ns["insert_budget_milestone"](
+            conn, vendor="codex", period_start_at=X, period="calendar-month",
+            threshold=90, budget_usd=200.0, spent_usd=190.0,
+            consumption_pct=95.0, commit=True,
         ) == 1
         periods = [
             r[0] for r in conn.execute(
-                "SELECT period FROM codex_budget_milestones "
-                "WHERE period_start_at=? AND threshold=90 ORDER BY period", (X,)
+                "SELECT period FROM budget_milestones "
+                "WHERE vendor='codex' AND period_start_at=? AND threshold=90 "
+                "ORDER BY period", (X,)
             )
         ]
         assert periods == ["calendar-month", "calendar-week"]
@@ -356,9 +368,10 @@ def test_null_period_row_does_not_refire(ns, monkeypatch):
     conn = ns["open_db"]()
     try:
         conn.execute(
-            "INSERT INTO codex_budget_milestones (period_start_at, period, "
+            "INSERT INTO budget_milestones (vendor, period_start_at, period, "
             "threshold, budget_usd, spent_usd, consumption_pct, crossed_at_utc, "
-            "alerted_at) VALUES (?, NULL, 90, 200.0, 190.0, 95.0, ?, ?)",
+            "alerted_at) "
+            "VALUES ('codex', ?, NULL, 90, 200.0, 190.0, 95.0, ?, ?)",
             (JUNE_KEY, "2026-06-15T00:00:00Z", "2026-06-15T00:00:00Z"),
         )
         conn.commit()

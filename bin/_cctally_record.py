@@ -273,12 +273,16 @@ def _build_alert_payload_codex_budget(*args, **kwargs):
     return sys.modules["cctally"]._build_alert_payload_codex_budget(*args, **kwargs)
 
 
-def insert_codex_budget_milestone(*args, **kwargs):
-    return sys.modules["cctally"].insert_codex_budget_milestone(*args, **kwargs)
+def _budget_crossings(*args, **kwargs):
+    return sys.modules["cctally"]._budget_crossings(*args, **kwargs)
 
 
-def _codex_budget_crossings(*args, **kwargs):
-    return sys.modules["cctally"]._codex_budget_crossings(*args, **kwargs)
+def _resolve_budget_window(*args, **kwargs):
+    return sys.modules["cctally"]._resolve_budget_window(*args, **kwargs)
+
+
+def _budget_spend_for_vendor(*args, **kwargs):
+    return sys.modules["cctally"]._budget_spend_for_vendor(*args, **kwargs)
 
 
 def _resolve_codex_budget_period_window(*args, **kwargs):
@@ -756,10 +760,103 @@ def maybe_record_milestone(
         conn.close()
 
 
+def _record_budget_milestone_for_vendor(
+    *, vendor, target, thresholds, period, config, tz, build_payload
+) -> None:
+    """Shared budget-milestone firing core for both vendors (#143).
+
+    Hot-path ordering is preserved verbatim (spec §4.2 / [Pre-probe before
+    sync_cache]): ``open_db`` → cheap ``_resolve_budget_window(vendor=…)`` →
+    unified pre-probe (which configured thresholds are STILL un-recorded for this
+    window/period) → **skip the cost SUM entirely when nothing is pending** →
+    ``_budget_spend_for_vendor(vendor=…)`` (the costly leg) →
+    ``_budget_crossings(vendor=…)`` (INSERT-and-arm, set-then-dispatch,
+    fire-once via rowcount) → single durable commit → post-commit dispatch.
+
+    The pre-probe's ``period = ? OR period IS NULL`` arm (#137) makes a pre-011
+    NULL-period row for this window count as already-recorded (no spurious
+    upgrade re-fire); a row under the SAME concrete ``period`` also counts
+    (fire-once). The cost SUM is skipped ONLY when every threshold already has a
+    row — a partial prior run still forces the SUM for the remaining thresholds
+    ([Dedup mustn't gate side effects]).
+
+    ``build_payload`` is the vendor's at-fire payload adapter (keeps the dispatch
+    ``id`` byte-stable per vendor); it is invoked with
+    ``threshold`` / ``crossed_at_utc`` / ``period_key`` / ``period`` /
+    ``budget_usd`` / ``spent_usd`` / ``consumption_pct`` keyword args.
+    """
+    now_utc = _command_as_of()
+    pending_alerts: list[dict[str, Any]] = []
+    conn = open_db()
+    try:
+        start_at = _resolve_budget_window(
+            conn, vendor=vendor, now_utc=now_utc, period=period,
+            config=config, tz=tz,
+        )
+        if start_at is None:
+            return  # no resolvable window yet (claude subscription-week pre-snapshot)
+        period_key = start_at.isoformat(timespec="seconds")
+
+        present = {
+            int(r[0]) for r in conn.execute(
+                "SELECT threshold FROM budget_milestones "
+                "WHERE vendor = ? AND period_start_at = ? "
+                "  AND (period = ? OR period IS NULL)",
+                (vendor, period_key, period),
+            )
+        }
+        pending = [t for t in sorted(thresholds) if t not in present]
+        if not pending:
+            return  # nothing left this window → skip the cost SUM
+
+        spent = _budget_spend_for_vendor(
+            conn, vendor=vendor, start_at=start_at, now_utc=now_utc
+        )
+        # Shared INSERT-and-arm core (set-then-dispatch, fire-once via rowcount);
+        # commit=False inside, so this conn owns the single durable commit below.
+        for t, crossed_at, sp, tg, pct in _budget_crossings(
+            conn,
+            vendor=vendor,
+            period_key=period_key,
+            period=period,
+            thresholds=pending,
+            target=target,
+            spent=spent,
+            now_utc=now_utc,
+        ):
+            pending_alerts.append(build_payload(
+                threshold=t,
+                crossed_at_utc=crossed_at,
+                period_key=period_key,
+                period=period,
+                budget_usd=tg,
+                spent_usd=sp,
+                consumption_pct=pct,
+            ))
+        # Single commit: every INSERT + its alerted_at marker durable together.
+        conn.commit()
+    except Exception as exc:
+        eprint(f"[budget-milestone:{vendor}] error recording budget milestone: {exc}")
+    finally:
+        conn.close()
+
+    # Dispatch AFTER commit; a dispatch failure NEVER rolls back the milestone
+    # (set-then-dispatch invariant — one queue attempt per crossing, deduped on
+    # the alerted_at column).
+    for payload in pending_alerts:
+        try:
+            _dispatch_alert_notification(payload, mode="real")
+        except Exception as dispatch_exc:
+            eprint(f"[budget-alerts:{vendor}] dispatch failed: {dispatch_exc}")
+
+
 def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
-    """Fire equiv-$ budget alerts on ACTUAL-spend threshold crossings
-    (Approach A — called from ``cmd_record_usage`` alongside the weekly-% /
-    5h-% milestone helpers). Gated, hot-path-cheap, set-then-dispatch,
+    """Fire Claude equiv-$ budget alerts on ACTUAL-spend threshold crossings
+    (axis ``budget`` — called from ``cmd_record_usage`` alongside the weekly-% /
+    5h-% milestone helpers). Thin vendor adapter over
+    :func:`_record_budget_milestone_for_vendor` (#143): reads the Claude budget
+    config block, gates, resolves ``target`` / ``thresholds`` / ``period``, and
+    passes the Claude payload builder. Gated, hot-path-cheap, set-then-dispatch,
     fire-once. Errors are logged, not raised (the caller also wraps).
 
     ``saved`` is accepted for call-site symmetry with
@@ -782,109 +879,35 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
         return
     if not _budget_alerts_active(budget_cfg):
         return
-    target = budget_cfg["weekly_usd"]
     thresholds = budget_cfg["alert_thresholds"]
     if not thresholds:
         return
     # Period generalization (spec §6): subscription-week resolves the snapshot-
     # anchored window; a calendar period (calendar-week / calendar-month)
-    # resolves the window purely from `now` + the period and stores the
-    # period-start instant in the SAME `week_start_at` key column (back-compat
-    # misnomer). config/tz are resolved once for the calendar branch.
+    # resolves the window purely from `now` + the period. config/tz are
+    # resolved once for the calendar branch.
     period = budget_cfg.get("period", "subscription-week")
-
     tz = resolve_display_tz(argparse.Namespace(tz=None), config)
-    now_utc = _command_as_of()
-    pending_alerts: list[dict[str, Any]] = []
-    conn = open_db()
-    try:
-        window = _resolve_claude_budget_window(
-            conn, now_utc, period=period, config=config, tz=tz
-        )
-        if window is None:
-            return  # no resolvable week window yet (spec §6 worst case)
-        week_start_at, _week_end_at = window
-        week_key = week_start_at.isoformat(timespec="seconds")
-
-        # Pre-probe (hot-path discipline + [Dedup mustn't gate side effects]):
-        # which configured thresholds are STILL un-recorded for this week?
-        # The cost SUM is skipped ONLY when every threshold already has a row
-        # — so a partial prior run that recorded some-but-not-all thresholds
-        # still gets the remaining ones a SUM + crossing-check. The skip never
-        # owes a crossing: an un-recorded threshold always forces the SUM.
-        # The `period IS NULL` arm (#137) makes a pre-011 NULL-period row for
-        # this window count as already-recorded, so an upgrading user never
-        # re-fires a spurious alert against a historical crossing; a row stored
-        # under the SAME concrete `period` also counts (fire-once).
-        present = {
-            int(r[0]) for r in conn.execute(
-                "SELECT threshold FROM budget_milestones "
-                "WHERE week_start_at = ? AND (period = ? OR period IS NULL)",
-                (week_key, period),
-            )
-        }
-        pending = [t for t in sorted(thresholds) if t not in present]
-        if not pending:
-            return  # nothing left to cross this week → skip the cost SUM
-
-        spent = _sum_cost_for_range(week_start_at, now_utc, mode="auto")
-        # target > 0 is guaranteed by _get_budget_config (weekly_usd None is
-        # excluded by _budget_alerts_active above); the else is belt-and-suspenders.
-        consumption_pct = (spent / target * 100.0) if target > 0 else 0.0
-        for t in pending:
-            # +1e-9 snap-up: spent/target*100 can land one ULP below an
-            # integer threshold (CLAUDE.md float-floor gotcha).
-            if consumption_pct + 1e-9 >= t:
-                inserted = insert_budget_milestone(
-                    conn,
-                    week_start_at=week_key,
-                    period=period,
-                    threshold=t,
-                    budget_usd=target,
-                    spent_usd=spent,
-                    consumption_pct=consumption_pct,
-                    commit=False,
-                )
-                # Only the genuine-new-crossing winner (rowcount==1) dispatches;
-                # a racing record-usage instance gets rowcount==0 and skips.
-                if inserted == 1:
-                    crossed_at = now_utc_iso()
-                    # set-then-dispatch: alerted_at lands on the row BEFORE
-                    # the osascript Popen, sharing this transaction with the
-                    # INSERT (commit=False) so a crash between them is
-                    # impossible. The UPDATE keys on the CONCRETE `period` (#137)
-                    # — never a NULL-period sibling. `alerted_at IS NULL` guard
-                    # is write-once defense-in-depth.
-                    conn.execute(
-                        "UPDATE budget_milestones SET alerted_at = ? "
-                        "WHERE week_start_at = ? AND period = ? AND threshold = ? "
-                        "  AND alerted_at IS NULL",
-                        (crossed_at, week_key, period, t),
-                    )
-                    pending_alerts.append(_build_alert_payload_budget(
-                        threshold=t,
-                        crossed_at_utc=crossed_at,
-                        week_start_at=week_key,
-                        budget_usd=target,
-                        spent_usd=spent,
-                        consumption_pct=consumption_pct,
-                        period=period,
-                    ))
-        # Single commit: every INSERT + its alerted_at marker durable together.
-        conn.commit()
-    except Exception as exc:
-        eprint(f"[budget-milestone] error recording budget milestone: {exc}")
-    finally:
-        conn.close()
-
-    # Dispatch AFTER commit; a dispatch failure NEVER rolls back the milestone
-    # (set-then-dispatch invariant — one queue attempt per crossing, deduped
-    # on the alerted_at column).
-    for payload in pending_alerts:
-        try:
-            _dispatch_alert_notification(payload, mode="real")
-        except Exception as dispatch_exc:
-            eprint(f"[budget-alerts] dispatch failed: {dispatch_exc}")
+    _record_budget_milestone_for_vendor(
+        vendor="claude",
+        target=budget_cfg["weekly_usd"],
+        thresholds=thresholds,
+        period=period,
+        config=config,
+        tz=tz,
+        # The Claude payload builder takes the legacy `week_start_at=` kwarg
+        # (its value is the resolved period-start instant, == period_key), so
+        # the at-fire dispatch id stays byte-stable `budget:<period_start_at>:<t>`.
+        build_payload=lambda **kw: _build_alert_payload_budget(
+            threshold=kw["threshold"],
+            crossed_at_utc=kw["crossed_at_utc"],
+            week_start_at=kw["period_key"],
+            budget_usd=kw["budget_usd"],
+            spent_usd=kw["spent_usd"],
+            consumption_pct=kw["consumption_pct"],
+            period=kw["period"],
+        ),
+    )
 
 
 def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
@@ -1056,24 +1079,26 @@ def maybe_record_codex_budget_milestone(saved: dict[str, Any]) -> None:
     """Fire Codex budget alerts on ACTUAL-Codex-spend threshold crossings (axis
     ``codex_budget``, calendar-period-codex-budgets spec §6 — the gap the Codex
     spec review flagged: Codex usage never flows through ``record-usage``, so the
-    Claude budget axes can't catch it). Called from ``cmd_record_usage``
-    alongside the weekly-% / 5h-% / budget / project-budget milestone helpers AND
-    opportunistically from ``cmd_budget`` (the Codex section already resolves
-    spend + crossings). Forward-only / fire-once, so the double-trigger never
-    double-fires. Gated, hot-path-cheap, set-then-dispatch. Errors are logged,
-    not raised (the caller also wraps).
+    Claude budget axes can't catch it). Thin vendor adapter over
+    :func:`_record_budget_milestone_for_vendor` (#143): reads the ``budget.codex``
+    config block, gates, resolves ``target`` / ``thresholds`` / ``period``, and
+    passes the Codex payload builder.
+
+    Called from ``cmd_record_usage`` alongside the weekly-% / 5h-% / budget /
+    project-budget milestone helpers AND opportunistically from ``cmd_budget``
+    (the public name is kept so that call site is unchanged). Forward-only /
+    fire-once, so the double-trigger never double-fires. Gated, hot-path-cheap,
+    set-then-dispatch. Errors are logged, not raised (the caller also wraps).
 
     Unlike the Claude budget axis, Codex has NO subscription week: the period
     window is resolved purely from ``now`` + the configured calendar period
-    (calendar-week / calendar-month) via the pure ``calendar_*_window``
-    functions — it NEVER touches ``weekly_usage_snapshots``. The crossing +
-    set-then-dispatch arithmetic is factored into the shared
-    ``_codex_budget_crossings`` helper so this firing path and the
-    ``cctally budget`` opportunistic path stay byte-identical (plan §3.6).
+    (calendar-week / calendar-month) — it NEVER touches
+    ``weekly_usage_snapshots`` (the shared core's ``_resolve_budget_window``
+    dispatches to the pure calendar window for ``vendor='codex'``).
 
     ``saved`` is accepted for call-site symmetry with the sibling helpers but is
-    unused: Codex spend is resolved from the cache DB (``_sum_codex_cost_for_range``)
-    independent of the just-recorded 7d-% snapshot.
+    unused: Codex spend is resolved from the cache DB independent of the
+    just-recorded 7d-% snapshot.
     """
     # Gate FIRST (hot-path discipline): no Codex budget OR alerts off → zero
     # overhead for non-Codex-budget users. `load_config()` is safe outside any
@@ -1093,71 +1118,27 @@ def maybe_record_codex_budget_milestone(saved: dict[str, Any]) -> None:
     thresholds = codex_cfg.get("alert_thresholds") or []
     if target is None or not thresholds:
         return
-    period = codex_cfg["period"]
-
     tz = resolve_display_tz(argparse.Namespace(tz=None), config)
-    now_utc = _command_as_of()
-    pending_alerts: list[dict[str, Any]] = []
-    conn = open_db()
-    try:
-        start_at, _end_at = _resolve_codex_budget_period_window(
-            period, now_utc, config, tz
-        )
-        period_key = start_at.isoformat(timespec="seconds")
-
-        # Pre-probe (hot-path discipline + [Dedup mustn't gate side effects]):
-        # which configured thresholds are STILL un-recorded for this period? The
-        # Codex cost SUM is skipped ONLY when every threshold already has a row.
-        # The `period IS NULL` arm (#137) makes a pre-011 NULL-period row for
-        # this period count as already-recorded (no spurious upgrade re-fire); a
-        # row under the SAME concrete `period` also counts (fire-once).
-        present = {
-            int(r[0]) for r in conn.execute(
-                "SELECT threshold FROM codex_budget_milestones "
-                "WHERE period_start_at = ? AND (period = ? OR period IS NULL)",
-                (period_key, period),
-            )
-        }
-        pending = [t for t in sorted(thresholds) if t not in present]
-        if not pending:
-            return  # nothing left to cross this period → skip the cost SUM
-
-        spent = _sum_codex_cost_for_range(start_at, now_utc)
-        # Shared INSERT-and-arm core (set-then-dispatch, fire-once via rowcount);
-        # commit=False inside, so this conn owns the single durable commit below.
-        for t, crossed_at, sp, tg, pct in _codex_budget_crossings(
-            conn,
-            period_key=period_key,
-            period=period,
-            thresholds=pending,
-            target=target,
-            spent=spent,
-            now_utc=now_utc,
-        ):
-            pending_alerts.append(_build_alert_payload_codex_budget(
-                threshold=t,
-                crossed_at_utc=crossed_at,
-                period_start_at=period_key,
-                period=period,
-                budget_usd=tg,
-                spent_usd=sp,
-                consumption_pct=pct,
-            ))
-        # Single commit: every INSERT + its alerted_at marker durable together.
-        conn.commit()
-    except Exception as exc:
-        eprint(f"[codex-budget-milestone] error recording codex budget milestone: {exc}")
-    finally:
-        conn.close()
-
-    # Dispatch AFTER commit; a dispatch failure NEVER rolls back the milestone
-    # (set-then-dispatch invariant — one queue attempt per crossing, deduped on
-    # the alerted_at column).
-    for payload in pending_alerts:
-        try:
-            _dispatch_alert_notification(payload, mode="real")
-        except Exception as dispatch_exc:
-            eprint(f"[codex-budget-alerts] dispatch failed: {dispatch_exc}")
+    _record_budget_milestone_for_vendor(
+        vendor="codex",
+        target=target,
+        thresholds=thresholds,
+        period=codex_cfg["period"],
+        config=config,
+        tz=tz,
+        # The Codex payload builder takes `period_start_at=` directly (== the
+        # resolved period-start instant, == period_key), so the at-fire dispatch
+        # id stays byte-stable `codex_budget:<period_start_at>:<threshold>`.
+        build_payload=lambda **kw: _build_alert_payload_codex_budget(
+            threshold=kw["threshold"],
+            crossed_at_utc=kw["crossed_at_utc"],
+            period_start_at=kw["period_key"],
+            period=kw["period"],
+            budget_usd=kw["budget_usd"],
+            spent_usd=kw["spent_usd"],
+            consumption_pct=kw["consumption_pct"],
+        ),
+    )
 
 
 def _weekly_pct_week_avg_projection(conn, now_utc):

@@ -44,7 +44,8 @@ def _iso(d: dt.datetime) -> str:
 
 
 def _expected_week_key():
-    """The exact ``week_start_at`` key the production code writes.
+    """The exact ``period_start_at`` key the production code writes (the
+    subscription-week start instant for ``vendor='claude'``, #143).
 
     ``_resolve_current_budget_window`` runs the seeded ISO timestamp through
     ``parse_iso_datetime`` (which returns a HOST-LOCAL datetime) and then
@@ -138,10 +139,12 @@ def _patch_dispatch(ns, monkeypatch):
 def _milestone_rows(ns):
     conn = ns["open_db"]()
     try:
+        # Unified vendor-tagged table (#143): filter to the Claude axis so a
+        # stray Codex row never pollutes the Claude firing assertions.
         return conn.execute(
-            "SELECT week_start_at, threshold, budget_usd, spent_usd, "
+            "SELECT vendor, period_start_at, threshold, budget_usd, spent_usd, "
             "       consumption_pct, alerted_at "
-            "FROM budget_milestones ORDER BY threshold"
+            "FROM budget_milestones WHERE vendor = 'claude' ORDER BY threshold"
         ).fetchall()
     finally:
         conn.close()
@@ -163,7 +166,9 @@ def test_crossing_records_rows_and_dispatches(ns, monkeypatch):
     assert [r["threshold"] for r in rows] == [90, 100]
     # Every recorded row carries a set alerted_at (set-then-dispatch).
     assert all(r["alerted_at"] is not None for r in rows)
-    assert all(r["week_start_at"] == WEEK_KEY for r in rows)
+    assert all(r["period_start_at"] == WEEK_KEY for r in rows)
+    # Each fired row carries the Claude vendor tag (#143 unified table).
+    assert all(r["vendor"] == "claude" for r in rows)
     assert all(abs(r["budget_usd"] - 300.0) < 1e-9 for r in rows)
     assert all(abs(r["spent_usd"] - 300.0) < 1e-9 for r in rows)
     # Both crossings dispatched, mode=real, axis=budget.
@@ -208,7 +213,8 @@ def test_reconcile_on_set_records_without_dispatch_then_later_fires(ns, monkeypa
     conn = ns["open_db"]()
     try:
         ns["_reconcile_budget_milestones_on_set"](
-            conn, target=300.0, thresholds=(90, 100), now_utc=now_utc,
+            conn, vendor="claude", target=300.0, thresholds=(90, 100),
+            now_utc=now_utc, period="subscription-week",
         )
     finally:
         conn.close()
@@ -216,6 +222,7 @@ def test_reconcile_on_set_records_without_dispatch_then_later_fires(ns, monkeypa
     rows = _milestone_rows(ns)
     assert [r["threshold"] for r in rows] == [90]
     assert rows[0]["alerted_at"] is not None  # recorded
+    assert rows[0]["vendor"] == "claude"
     assert captured == []  # but NOT dispatched (no instant popup)
 
     # Later record-usage tick at 100% spend: 90 already a row (skip), 100 is
@@ -295,10 +302,10 @@ def test_preprobe_does_not_skip_when_one_threshold_pending(ns, monkeypatch):
     try:
         conn.execute(
             "INSERT INTO budget_milestones "
-            "(week_start_at, threshold, budget_usd, spent_usd, "
+            "(vendor, period_start_at, threshold, budget_usd, spent_usd, "
             " consumption_pct, crossed_at_utc, alerted_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (WEEK_KEY, 90, 300.0, 270.0, 90.0, _iso(AS_OF), _iso(AS_OF)),
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("claude", WEEK_KEY, 90, 300.0, 270.0, 90.0, _iso(AS_OF), _iso(AS_OF)),
         )
         conn.commit()
     finally:
@@ -362,9 +369,9 @@ def test_malformed_budget_config_is_quiet_noop(ns, monkeypatch, capsys):
 
 
 def test_reconcile_idempotent_on_rerun(ns, monkeypatch):
-    """A mid-week target change re-runs the reconcile; UNIQUE(week_start_at,
-    threshold) + the `alerted_at IS NULL` UPDATE guard keep it idempotent —
-    no duplicate row, no re-stamp, never a dispatch."""
+    """A mid-week target change re-runs the reconcile; UNIQUE(vendor,
+    period_start_at, period, threshold) + the `alerted_at IS NULL` UPDATE guard
+    keep it idempotent — no duplicate row, no re-stamp, never a dispatch."""
     _seed_window(ns)
     _write_budget_config(ns, weekly_usd=300.0, thresholds=(90, 100))
     captured = _patch_dispatch(ns, monkeypatch)
@@ -375,7 +382,8 @@ def test_reconcile_idempotent_on_rerun(ns, monkeypatch):
         conn = ns["open_db"]()
         try:
             ns["_reconcile_budget_milestones_on_set"](
-                conn, target=300.0, thresholds=(90, 100), now_utc=now_utc,
+                conn, vendor="claude", target=300.0, thresholds=(90, 100),
+                now_utc=now_utc, period="subscription-week",
             )
         finally:
             conn.close()
@@ -575,8 +583,9 @@ def _milestone_rows_with_period(ns):
     conn = ns["open_db"]()
     try:
         return conn.execute(
-            "SELECT week_start_at, period, threshold "
-            "FROM budget_milestones ORDER BY threshold, period"
+            "SELECT period_start_at, period, threshold "
+            "FROM budget_milestones WHERE vendor = 'claude' "
+            "ORDER BY threshold, period"
         ).fetchall()
     finally:
         conn.close()
@@ -590,16 +599,19 @@ def test_calendar_week_to_month_switch_no_collision(ns):
     conn = ns["open_db"]()
     try:
         assert ns["insert_budget_milestone"](
-            conn, week_start_at=X, period="calendar-week", threshold=90,
-            budget_usd=100.0, spent_usd=92.0, consumption_pct=92.0, commit=True,
+            conn, vendor="claude", period_start_at=X, period="calendar-week",
+            threshold=90, budget_usd=100.0, spent_usd=92.0,
+            consumption_pct=92.0, commit=True,
         ) == 1
         # Same instant, same threshold, DIFFERENT period → must NOT collide.
         assert ns["insert_budget_milestone"](
-            conn, week_start_at=X, period="calendar-month", threshold=90,
-            budget_usd=300.0, spent_usd=280.0, consumption_pct=93.3, commit=True,
+            conn, vendor="claude", period_start_at=X, period="calendar-month",
+            threshold=90, budget_usd=300.0, spent_usd=280.0,
+            consumption_pct=93.3, commit=True,
         ) == 1
         rows = conn.execute(
-            "SELECT period FROM budget_milestones WHERE week_start_at=? "
+            "SELECT period FROM budget_milestones "
+            "WHERE vendor='claude' AND period_start_at=? "
             "AND threshold=90 ORDER BY period", (X,)
         ).fetchall()
         assert [r[0] for r in rows] == ["calendar-month", "calendar-week"]
@@ -621,9 +633,10 @@ def test_null_period_row_does_not_refire(ns, monkeypatch):
     conn = ns["open_db"]()
     try:
         conn.execute(
-            "INSERT INTO budget_milestones (week_start_at, period, threshold, "
-            "budget_usd, spent_usd, consumption_pct, crossed_at_utc, alerted_at) "
-            "VALUES (?, NULL, 90, 300.0, 280.0, 93.3, ?, ?)",
+            "INSERT INTO budget_milestones (vendor, period_start_at, period, "
+            "threshold, budget_usd, spent_usd, consumption_pct, crossed_at_utc, "
+            "alerted_at) "
+            "VALUES ('claude', ?, NULL, 90, 300.0, 280.0, 93.3, ?, ?)",
             (WEEK_KEY, "2026-06-05T00:00:00Z", "2026-06-05T00:00:00Z"),
         )
         conn.commit()
