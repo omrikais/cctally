@@ -1,11 +1,8 @@
 """Unit tests for stats migration 012_unify_budget_milestones_vendor (#143)."""
 from __future__ import annotations
 
-import shutil
 import sqlite3
 from pathlib import Path
-
-import pytest
 
 from conftest import load_script
 
