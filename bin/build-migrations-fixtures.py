@@ -731,6 +731,147 @@ def build_per_migration_011_budget_milestone_period_keys(
     _build_post(pre, post)
 
 
+def build_per_migration_012_unify_budget_milestones_vendor(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for stats migration
+    ``012_unify_budget_milestones_vendor`` (#143).
+
+    Emits two stats.db files:
+      * pre.sqlite  — through-011 stats.db: v011-shape ``budget_milestones`` +
+        ``codex_budget_milestones`` (period column, period-inclusive UNIQUE) +
+        ``projected_milestones``, one seeded crossing in budget (vendor-to-be
+        'claude'), one in codex (vendor-to-be 'codex'), and one projected row.
+        ``schema_migrations`` carries every production migration THROUGH 011
+        (012 absent), so the fixture represents a fully-migrated pre-012
+        stats.db.
+      * post.sqlite — same DB after running the production 012 handler: unified
+        vendor-tagged ``budget_milestones`` (claude+codex rows), the Codex table
+        dropped. (The 012 marker is NOT stamped by the handler — the dispatcher
+        owns the central stamp per #140; the per-migration test does not assert
+        it, matching the 011 golden.)
+
+    Loaded by ``tests/test_migration_012_per_migration_goldens.py``.
+    Spec: docs/superpowers/specs/2026-06-06-unify-budget-milestones-vendor-design.md.
+    """
+    # Note: like the 011 builder, post.sqlite's schema_migrations.applied_at_utc
+    # is a wall-clock stamp on rebuild and SQLite stamps a writer-version in
+    # bytes 96-99 on every write — register_fixture_db() zeroes the latter at
+    # exit; the per-migration test deliberately does not assert applied_at_utc.
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(
+                """
+                CREATE TABLE schema_migrations (
+                    name           TEXT PRIMARY KEY,
+                    applied_at_utc TEXT NOT NULL
+                );
+                CREATE TABLE budget_milestones (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    week_start_at   TEXT    NOT NULL,
+                    period          TEXT,
+                    threshold       INTEGER NOT NULL,
+                    budget_usd      REAL    NOT NULL,
+                    spent_usd       REAL    NOT NULL,
+                    consumption_pct REAL    NOT NULL,
+                    crossed_at_utc  TEXT    NOT NULL,
+                    alerted_at      TEXT,
+                    UNIQUE(week_start_at, period, threshold)
+                );
+                CREATE TABLE codex_budget_milestones (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    period_start_at TEXT    NOT NULL,
+                    period          TEXT,
+                    threshold       INTEGER NOT NULL,
+                    budget_usd      REAL    NOT NULL,
+                    spent_usd       REAL    NOT NULL,
+                    consumption_pct REAL    NOT NULL,
+                    crossed_at_utc  TEXT    NOT NULL,
+                    alerted_at      TEXT,
+                    UNIQUE(period_start_at, period, threshold)
+                );
+                CREATE TABLE projected_milestones (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    week_start_at   TEXT    NOT NULL,
+                    period          TEXT,
+                    metric          TEXT    NOT NULL,
+                    threshold       INTEGER NOT NULL,
+                    projected_value REAL    NOT NULL,
+                    denominator     REAL    NOT NULL,
+                    crossed_at_utc  TEXT    NOT NULL,
+                    alerted_at      TEXT,
+                    UNIQUE(week_start_at, period, metric, threshold)
+                );
+                """
+            )
+            # Seed schema_migrations with every production migration THROUGH
+            # 011 (012 absent), so the pre.sqlite is a fully-migrated pre-012
+            # stats.db. Imported from the real registry to avoid drift.
+            for name in _THROUGH_011_PRODUCTION_MIGRATION_NAMES():
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations "
+                    "(name, applied_at_utc) VALUES (?, ?)",
+                    (name, "2026-06-06T00:00:00Z"),
+                )
+            conn.execute(
+                "INSERT INTO budget_milestones (week_start_at, period, "
+                "threshold, budget_usd, spent_usd, consumption_pct, "
+                "crossed_at_utc, alerted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("2026-06-01T00:00:00+00:00", "subscription-week", 90, 100.0,
+                 95.0, 95.0, "2026-06-02T00:00:00Z", "2026-06-02T00:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO codex_budget_milestones (period_start_at, period, "
+                "threshold, budget_usd, spent_usd, consumption_pct, "
+                "crossed_at_utc, alerted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("2026-06-01T00:00:00+00:00", "calendar-month", 100, 200.0,
+                 210.0, 105.0, "2026-06-03T00:00:00Z", "2026-06-03T00:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO projected_milestones (week_start_at, period, "
+                "metric, threshold, projected_value, denominator, "
+                "crossed_at_utc, alerted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("2026-06-01T00:00:00+00:00", "subscription-week",
+                 "codex_budget_usd", 90, 195.0, 200.0, "2026-06-03T00:00:00Z",
+                 "2026-06-03T00:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        handler = None
+        for m in _load_cctally_db_module()._STATS_MIGRATIONS:
+            if m.name == "012_unify_budget_milestones_vendor":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit("012_unify_budget_milestones_vendor not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def _load_cctally_db_module():
     """Import the real ``_cctally_db`` module so fixture builders exercise the
     exact production migration handlers (no copy-paste drift)."""
@@ -753,6 +894,18 @@ def _PRE_011_PRODUCTION_MIGRATION_NAMES():
         m.name
         for m in _load_cctally_db_module()._STATS_MIGRATIONS
         if m.name != "011_budget_milestone_period_keys"
+        and not m.name.endswith("_test_failure_injection")
+    ]
+
+
+def _THROUGH_011_PRODUCTION_MIGRATION_NAMES():
+    """Names of every production stats migration through 011 (012 excluded) —
+    read from the real registry to stay drift-free. Used to seed the 012
+    per-migration pre.sqlite as a fully-migrated pre-012 stats.db (#143)."""
+    return [
+        m.name
+        for m in _load_cctally_db_module()._STATS_MIGRATIONS
+        if m.name != "012_unify_budget_milestones_vendor"
         and not m.name.endswith("_test_failure_injection")
     ]
 
@@ -1238,6 +1391,9 @@ def main() -> int:
     )
     build_per_migration_011_budget_milestone_period_keys(
         FIXTURES_ROOT / "per-migration" / "011_budget_milestone_period_keys"
+    )
+    build_per_migration_012_unify_budget_milestones_vendor(
+        FIXTURES_ROOT / "per-migration" / "012_unify_budget_milestones_vendor"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0
