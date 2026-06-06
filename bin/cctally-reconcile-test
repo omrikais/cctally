@@ -4001,6 +4001,9 @@ import json, os, sys, importlib.util
 from importlib.machinery import SourceFileLoader
 
 budget = json.loads(os.environ["RECONCILE_A"])   # budget --json
+# Vendor passed in via env (sibling PROJECTED3 convention) so the SQL value
+# binds as a parameter and this body needs no nested shell-quote escaping.
+vendor = os.environ["RECONCILE_VENDOR"]
 codex = budget.get("codex")
 assert codex is not None, "CODEXBUDGET2 vacuous: budget --json carried no codex block"
 displayed_spent = float(codex["spent_usd"])
@@ -4038,7 +4041,8 @@ run_reconcile()
 conn = c.open_db()
 rows = conn.execute(
     "SELECT vendor, threshold, period, consumption_pct, alerted_at "
-    "FROM budget_milestones WHERE vendor = '"'"'codex'"'"' ORDER BY threshold"
+    "FROM budget_milestones WHERE vendor = ? ORDER BY threshold",
+    (vendor,),
 ).fetchall()
 n_after_first = len(rows)
 conn.close()
@@ -4047,9 +4051,9 @@ assert rows, "CODEXBUDGET2 (non-vacuity): no codex budget_milestones rows fired"
 # (A) fired consumption_pct binds to the displayed Codex spend / forced target.
 for r in rows:
     # Every fired row carries the Codex vendor tag in the unified table (#143).
-    assert r["vendor"] == "codex", (
-        "CODEXBUDGET2 (vendor): threshold %s tagged vendor=%r != '"'"'codex'"'"'"
-        % (r["threshold"], r["vendor"])
+    assert r["vendor"] == vendor, (
+        "CODEXBUDGET2 (vendor): threshold %s tagged vendor=%r != %r"
+        % (r["threshold"], r["vendor"], vendor)
     )
     fired_pct = float(r["consumption_pct"])
     assert abs(fired_pct - expected_pct) < 1e-9, (
@@ -4071,7 +4075,7 @@ for r in rows:
 run_reconcile()
 conn = c.open_db()
 n_after_second = conn.execute(
-    "SELECT COUNT(*) FROM budget_milestones WHERE vendor = '"'"'codex'"'"'"
+    "SELECT COUNT(*) FROM budget_milestones WHERE vendor = ?", (vendor,)
 ).fetchone()[0]
 conn.close()
 assert n_after_second == n_after_first, (
@@ -4090,7 +4094,7 @@ if [ -f "$cb_home/input.env" ]; then
         echo "RECONCILE FAIL codex_budget_latching_eq_displayed_spend budget/both-vendors: budget rc=$rc_b"
         fail_count=$((fail_count + 1))
     else
-        result=$(RECONCILE_A="$cb_budget" \
+        result=$(RECONCILE_A="$cb_budget" RECONCILE_VENDOR="codex" \
             CODEXBUDGET_BIN_DIR="$REPO_ROOT/bin" \
             HOME="$cb_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
             CCTALLY_DISABLE_DEV_AUTODETECT=1 \
@@ -4108,36 +4112,53 @@ else
     fail_count=$((fail_count + 1))
 fi
 
-# ─── Invariant BUDGETCOEXIST: claude + codex rows coexist in one table (#143) ──
-# The vendor-tagged merge's defining invariant: BOTH vendors fire their REAL
-# forward-only-from-set reconcile (`_reconcile_budget_milestones_on_set`) into
-# the SAME `budget_milestones` table over the `both-vendors` fixture, and the
-# rows COEXIST with no UNIQUE collision — the generalized period-row-consistency
-# check the issue calls for. We force a small per-vendor target so each vendor's
-# seeded spend (Claude subscription-week + Codex calendar-month) crosses 90/100,
-# then assert:
+# ─── Invariant BUDGETCOEXIST: claude + codex coexist on an IDENTICAL key (#143) ─
+# The vendor-tagged merge's defining invariant — and the SOLE reason `vendor`
+# leads the UNIQUE(vendor, period_start_at, period, threshold) key: a Claude
+# crossing and a Codex crossing that land on an IDENTICAL
+# (period_start_at, period, threshold) must BOTH survive in the merged table.
+# Without `vendor` in the key the INSERT OR IGNORE would drop the second writer's
+# row (3-tuple collision). The earlier form of this test only fired the seeded
+# `both-vendors` budgets (Claude subscription-week vs Codex calendar-month) —
+# whose keys differ on BOTH period_start_at AND period independently, so they
+# could never collide even WITHOUT the vendor column: the coexistence assertion
+# was tautological and never exercised the vendor-in-key requirement.
+#
+# We now FORCE the collision: drive BOTH vendors through the SAME calendar-month
+# period over the `both-vendors` fixture. `_resolve_budget_window` then yields the
+# IDENTICAL period_start_at (2026-05-01T00:00:00+00:00) and the same
+# period='calendar-month' for each vendor, and both seeded spends (Claude $72,
+# Codex $15) cross the same forced 90/100 thresholds — so each (90, 100) threshold
+# is written ONCE per vendor on a byte-identical 3-tuple. We fire both vendors'
+# REAL forward-only-from-set reconcile
+# (`_reconcile_budget_milestones_on_set(vendor=…, period='calendar-month', …)`)
+# into one DB, then assert:
 #   (1) each fired row's `vendor` matches its writer (claude rows tagged
 #       'claude', codex rows tagged 'codex') — the row-level split that lets one
 #       physical table serve both axes;
-#   (2) the claude + codex rows COEXIST: total == claude_count + codex_count, so
-#       no row was dropped to a cross-vendor UNIQUE(vendor, period_start_at,
-#       period, threshold) collision;
-#   (3) non-vacuity: claude_count > 0 AND codex_count > 0 (both writers fired).
+#   (2) SAME-KEY COEXISTENCE (load-bearing): for every (period_start_at, period,
+#       threshold) 3-tuple that BOTH vendors crossed, EXACTLY 2 rows exist — one
+#       vendor='claude' and one vendor='codex'. Drop `vendor` from the UNIQUE key
+#       and the second INSERT OR IGNORE is dropped → 1 row → this assertion goes
+#       RED (proven non-vacuous below);
+#   (3) non-vacuity: claude_count > 0 AND codex_count > 0 (both writers fired) AND
+#       at least one shared 3-tuple actually collided across vendors.
 BUDGETCOEXIST_PY='
 import json, os, sys, importlib.util
+from collections import Counter
 from importlib.machinery import SourceFileLoader
 
 budget = json.loads(os.environ["RECONCILE_A"])   # budget --json
-# Claude budget is top-level; Codex budget nests under .codex.
-claude_spent = float(budget["spent_usd"])
-claude_period = budget["period"]
+# Claude budget is top-level; Codex budget nests under .codex. We re-resolve both
+# vendors over a SHARED calendar-month window below (NOT the displayed periods) so
+# the keys genuinely collide; the displayed spends only gate non-vacuity.
 codex = budget.get("codex")
 assert codex is not None, "BUDGETCOEXIST vacuous: budget --json carried no codex block"
-codex_spent = float(codex["spent_usd"])
-codex_period = codex["period"]
-assert claude_spent > 0, "BUDGETCOEXIST vacuous: displayed Claude spend is 0"
-assert codex_spent > 0, "BUDGETCOEXIST vacuous: displayed Codex spend is 0"
+assert float(budget["spent_usd"]) > 0, "BUDGETCOEXIST vacuous: displayed Claude spend is 0"
+assert float(codex["spent_usd"]) > 0, "BUDGETCOEXIST vacuous: displayed Codex spend is 0"
 thresholds = [90, 100]
+# Force BOTH vendors onto the SAME period so their resolved keys collide.
+shared_period = "calendar-month"
 
 bin_dir = os.environ["CODEXBUDGET_BIN_DIR"]
 sys.path.insert(0, bin_dir)
@@ -4151,20 +4172,60 @@ config = c.load_config()
 tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)
 now_utc = c._command_as_of()
 
-# Force a small per-vendor target so each vendor crosses BOTH 90 and 100
-# (~150% consumption against the seeded spend).
-claude_target = claude_spent / 1.5
-codex_target = codex_spent / 1.5
+# Resolve the SHARED calendar-month window per vendor + its real spend over that
+# window (the costly leg), so we can force a target that crosses both thresholds.
+conn = c.open_db()
+try:
+    spend = {}
+    for vendor in ("claude", "codex"):
+        win = c._cctally_milestones._resolve_budget_window(
+            conn, vendor=vendor, now_utc=now_utc, period=shared_period,
+            config=config, tz=tz,
+        )
+        assert win is not None, (
+            "BUDGETCOEXIST: %s resolved no calendar-month window" % vendor
+        )
+        spend[vendor] = (
+            win,
+            c._cctally_milestones._budget_spend_for_vendor(
+                conn, vendor=vendor, start_at=win, now_utc=now_utc
+            ),
+        )
+finally:
+    conn.close()
 
+# Both vendors MUST resolve the IDENTICAL period-start instant on calendar-month
+# — that identity is the whole premise of the collision test.
+claude_start, claude_spend = spend["claude"]
+codex_start, codex_spend = spend["codex"]
+assert claude_start == codex_start, (
+    "BUDGETCOEXIST: calendar-month period-start diverged across vendors "
+    "(claude=%s codex=%s) — same-key collision premise broken"
+    % (claude_start.isoformat(), codex_start.isoformat())
+)
+assert claude_spend > 0 and codex_spend > 0, (
+    "BUDGETCOEXIST vacuous: a vendor has $0 spend over the shared calendar-month "
+    "window (claude=%s codex=%s)" % (claude_spend, codex_spend)
+)
+shared_key = claude_start.isoformat(timespec="seconds")
+
+# Force a small per-vendor target so each vendor crosses BOTH 90 and 100
+# (~150% consumption against its real shared-window spend).
+claude_target = claude_spend / 1.5
+codex_target = codex_spend / 1.5
+
+# Fire BOTH vendors REAL forward-only-from-set reconcile on the SAME period into
+# ONE DB. Each (90, 100) threshold is now a byte-identical
+# (period_start_at, period, threshold) 3-tuple differing ONLY by vendor.
 conn = c.open_db()
 try:
     c._reconcile_budget_milestones_on_set(
         conn, vendor="claude", target=claude_target, thresholds=thresholds,
-        now_utc=now_utc, period=claude_period, config=config, tz=tz,
+        now_utc=now_utc, period=shared_period, config=config, tz=tz,
     )
     c._reconcile_budget_milestones_on_set(
         conn, vendor="codex", target=codex_target, thresholds=thresholds,
-        now_utc=now_utc, period=codex_period, config=config, tz=tz,
+        now_utc=now_utc, period=shared_period, config=config, tz=tz,
     )
 finally:
     conn.close()
@@ -4187,12 +4248,39 @@ assert codex_count > 0, "BUDGETCOEXIST: no codex rows fired (forced target shoul
 assert all(r["vendor"] in ("claude", "codex") for r in rows), (
     "BUDGETCOEXIST: a fired row carries an unexpected vendor tag"
 )
-# (2) coexistence: total == claude + codex — no row dropped to a cross-vendor
-# UNIQUE collision (claude + codex would collide on (period_start_at, period,
-# threshold) WITHOUT the vendor column in the key).
-assert len(rows) == claude_count + codex_count, (
-    f"BUDGETCOEXIST: total rows {len(rows)} != claude {claude_count} + "
-    f"codex {codex_count} — a cross-vendor UNIQUE collision dropped a row"
+
+# (2) SAME-KEY COEXISTENCE (load-bearing). For every (period_start_at, period,
+# threshold) 3-tuple, count the surviving rows by vendor. Each tuple that BOTH
+# vendors crossed must hold EXACTLY 2 rows — one claude, one codex. WITHOUT
+# `vendor` in the UNIQUE key the second INSERT OR IGNORE is dropped → 1 row →
+# this assertion goes RED (see the non-vacuity proof in the commit body).
+by_tuple = {}
+for r in rows:
+    key = (r["period_start_at"], r["period"], r["threshold"])
+    by_tuple.setdefault(key, Counter())[r["vendor"]] += 1
+
+shared_tuples = [
+    (st, pd, th) for st in (shared_key,) for pd in (shared_period,)
+    for th in thresholds
+]
+collided = 0
+for key in shared_tuples:
+    vendors = by_tuple.get(key)
+    assert vendors is not None, (
+        "BUDGETCOEXIST: expected both vendors at %r but found no rows" % (key,)
+    )
+    assert vendors.get("claude", 0) == 1 and vendors.get("codex", 0) == 1 \
+        and sum(vendors.values()) == 2, (
+        "BUDGETCOEXIST (same-key): %r holds %r rows != exactly one claude + one "
+        "codex — a cross-vendor UNIQUE collision dropped a row (the vendor column "
+        "is what keeps both)" % (key, dict(vendors))
+    )
+    collided += 1
+# Non-vacuity for (2): at least one shared 3-tuple actually had a cross-vendor
+# collision to resolve (otherwise the EXACTLY-2 assertion never ran).
+assert collided > 0, (
+    "BUDGETCOEXIST (same-key) vacuous: no shared (period_start_at, period, "
+    "threshold) tuple was crossed by BOTH vendors"
 )
 '
 co_home="$FIXTURES/budget/both-vendors"
