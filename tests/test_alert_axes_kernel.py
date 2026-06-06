@@ -67,6 +67,10 @@ def test_descriptor_exposes_chip_and_table_metadata():
     assert by_id["projected"].chip_label == "PROJECTED"
     assert by_id["budget"].milestone_table == "budget_milestones"
     assert by_id["projected"].milestone_table == "projected_milestones"
+    assert by_id["budget"].vendor == "claude"
+    assert by_id["codex_budget"].vendor == "codex"
+    for ax in ("weekly", "five_hour", "projected", "project_budget"):
+        assert by_id[ax].vendor is None
 
 
 def test_project_budget_axis_registered():
@@ -96,7 +100,8 @@ def test_codex_budget_axis_registered():
     by_id = {d.id: d for d in m.AXIS_REGISTRY}
     assert by_id["codex_budget"].chip_label == "CODEX"
     assert by_id["codex_budget"].title_label == "Codex budget"
-    assert by_id["codex_budget"].milestone_table == "codex_budget_milestones"
+    assert by_id["codex_budget"].milestone_table == "budget_milestones"
+    assert by_id["codex_budget"].vendor == "codex"
     # Severity reuses the shared 3-tier policy unchanged.
     assert m.severity_for(89) == "info"
     assert m.severity_for(90) == "warn"

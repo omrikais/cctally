@@ -41,12 +41,13 @@ class AlertAxisDescriptor:
     chip_label: str    # SHOUT form, byte-identical with alertAxis.ts AXIS_CHIP_LABEL
     title_label: str   # sentence-case form, byte-identical with AXIS_TITLE_LABEL
     milestone_table: str  # SQLite table the dashboard envelope SELECTs from
+    vendor: "str | None" = None  # 'claude'|'codex' for budget-family axes; None otherwise (#143)
 
 
 AXIS_REGISTRY: "tuple[AlertAxisDescriptor, ...]" = (
     AlertAxisDescriptor("weekly", "WEEKLY", "Weekly", "percent_milestones"),
     AlertAxisDescriptor("five_hour", "5H-BLOCK", "5h-block", "five_hour_milestones"),
-    AlertAxisDescriptor("budget", "BUDGET", "Budget", "budget_milestones"),
+    AlertAxisDescriptor("budget", "BUDGET", "Budget", "budget_milestones", vendor="claude"),
     AlertAxisDescriptor("projected", "PROJECTED", "Projected", "projected_milestones"),
     # Per-project weekly budget alerts (issue #19 / #121). Distinct "PROJECT"
     # chip vs the global "BUDGET" chip; its own forward-only table.
@@ -55,10 +56,12 @@ AXIS_REGISTRY: "tuple[AlertAxisDescriptor, ...]" = (
     ),
     # Per-vendor Codex budget alerts (calendar-period; calendar-period-codex-budgets
     # feature). Distinct "CODEX" chip vs the global "BUDGET" / per-project
-    # "PROJECT" chips; its own forward-only `codex_budget_milestones` table keyed
-    # on the resolved period-window start instant (period_start_at, threshold).
+    # "PROJECT" chips. As of #143 it shares the unified vendor-tagged
+    # `budget_milestones` table with the Claude `budget` axis; the envelope
+    # mapper's `WHERE vendor=?` filter does the row-level split (keyed on the
+    # resolved period-window start instant period_start_at, threshold).
     AlertAxisDescriptor(
-        "codex_budget", "CODEX", "Codex budget", "codex_budget_milestones"
+        "codex_budget", "CODEX", "Codex budget", "budget_milestones", vendor="codex"
     ),
 )
 
