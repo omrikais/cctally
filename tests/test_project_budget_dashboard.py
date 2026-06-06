@@ -509,6 +509,94 @@ def test_post_settings_codex_alerts_toggle_does_latch(ns, monkeypatch):
     assert _count_codex_milestones(ns) == 2
 
 
+# ── 2B′: dashboard settings `period` reconcile trigger (#143 §5.4) ─────────
+
+
+def _write_claude_budget_config(
+    ns, *, weekly_usd, period, alerts_enabled=True, alert_thresholds=(90, 100),
+):
+    """Persist a Claude ``budget`` block (no nested ``codex``). Mirrors
+    ``_write_codex_budget_config`` but for the top-level Claude axis."""
+    import _cctally_core
+    block = {
+        "weekly_usd": weekly_usd,
+        "period": period,
+        "alerts_enabled": alerts_enabled,
+        "alert_thresholds": list(alert_thresholds),
+        "projects": {},
+        "project_alerts_enabled": False,
+    }
+    _cctally_core.CONFIG_PATH.write_text(json.dumps({"budget": block}) + "\n")
+
+
+def _count_claude_milestones(ns):
+    conn = ns["open_db"]()
+    try:
+        # Unified vendor-tagged table (#143): count only the Claude rows.
+        return conn.execute(
+            "SELECT COUNT(*) FROM budget_milestones WHERE vendor = 'claude'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_post_settings_budget_period_change_triggers_reconcile(ns, monkeypatch):
+    """A ``budget.period`` change via POST /api/settings MUST run the
+    forward-only Claude reconcile (#143 §5.4 fold-in fix): when the ``period``
+    leaf is touched while already over a threshold, the crossed thresholds are
+    latched as already-alerted so the NEXT record-usage tick does not
+    instant-popup retroactive alerts — exactly the asymmetry the CLI `config set
+    budget.period` path already guards (and which the dashboard previously
+    omitted from its trigger set).
+
+    The trigger keys on the RAW inbound ``budget`` leaves
+    (``touched = set(payload["budget"].keys())``), so ``period`` is the ONLY
+    leaf in the payload here — isolating the ``period`` token. (The dashboard
+    merge allow-list keeps ``period`` itself CLI-only, so the persisted value is
+    unchanged; the reconcile still fires under the configured period, which is
+    the behavior the fix restores.)
+
+    NON-VACUITY: removing ``"period"`` from the dashboard trigger set (the
+    Task 6 / §5.4 one-line change at ``_cctally_dashboard.py`` ~L6052) leaves
+    ``touched & {weekly_usd, alerts_enabled, alert_thresholds}`` empty → the
+    reconcile never fires → 0 rows → this assertion goes RED (verified by
+    reverting that line).
+
+    The forced spend ($500 vs a $200 budget = 250%) crosses BOTH 90 and 100;
+    ``calendar-week`` resolves a pure calendar window (never None, no snapshot
+    needed), so the reconcile binds without seeding usage rows.
+    """
+    # Claude budget already configured; alerts ON; nothing latched yet.
+    _write_claude_budget_config(
+        ns, weekly_usd=200.0, period="calendar-week",
+        alerts_enabled=True, alert_thresholds=(90, 100),
+    )
+    # Stub the Claude spend SUM WAY over budget so both thresholds cross — makes
+    # the latch assertion non-vacuous (a real crossing exists to record).
+    monkeypatch.setitem(
+        ns, "_sum_cost_for_range",
+        lambda start, now, **kw: 500.0,  # 250% of $200 — crosses 90 + 100
+    )
+    _wire_dashboard_handlers(ns)
+    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    port = srv.server_address[1]
+    try:
+        # ONLY the period leaf is touched — isolates the `period` trigger token.
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"budget": {"period": "calendar-month"}},
+        )
+    finally:
+        srv.shutdown()
+
+    assert status == 200, body
+    # Both thresholds latched (alerted_at set, no dispatch) — the reconcile fired
+    # because `period` is in the trigger set. Without the §5.4 fix → 0.
+    assert _count_claude_milestones(ns) == 2
+
+
 # ── 2C: SSE alerts_settings exposes the three Codex fields ────────────────
 
 

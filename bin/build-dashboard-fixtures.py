@@ -238,26 +238,30 @@ def _seed_budget_milestone(
     spent_usd: float,
     crossed_at: dt.datetime,
     period: str = "subscription-week",
+    vendor: str = "claude",
     alerted: bool = True,
 ) -> None:
-    """Seed one ``budget_milestones`` row (issue #19). ``week_start_at``
-    is the effective (post-reset) ISO timestamp the resolver returns,
-    matching the dispatch payload's ``budget:<week_start_at>:<threshold>``
-    id. ``period`` (#137) is the write-once period discriminator the envelope
-    now reads FROM THE ROW (default ``subscription-week`` — the legacy
-    scenarios this builder depicts); it is part of the
-    ``UNIQUE(week_start_at, period, threshold)`` key and the envelope id's
-    ``budget:<week_start_at>:<period>:<threshold>`` shape. ``alerted_at`` is set
-    to ``crossed_at`` (set-then-dispatch) when ``alerted`` so the dashboard
+    """Seed one ``budget_milestones`` row (issue #19) in the unified
+    vendor-tagged table (#143). ``vendor`` ∈ ``'claude'|'codex'`` (default
+    ``'claude'`` — the scenarios this builder depicts are the Claude axis).
+    ``week_start`` is the effective (post-reset) ISO timestamp the resolver
+    returns, written to the renamed ``period_start_at`` column, matching the
+    dispatch payload's ``budget:<period_start_at>:<threshold>`` id. ``period``
+    (#137) is the write-once period discriminator the envelope now reads FROM THE
+    ROW (default ``subscription-week``); it is part of the ``UNIQUE(vendor,
+    period_start_at, period, threshold)`` key and the envelope id's
+    ``budget:<period_start_at>:<period>:<threshold>`` shape. ``alerted_at`` is
+    set to ``crossed_at`` (set-then-dispatch) when ``alerted`` so the dashboard
     envelope's budget leg (``WHERE alerted_at IS NOT NULL``) picks it up; left
     NULL otherwise."""
     consumption_pct = (spent_usd / budget_usd * 100.0) if budget_usd else 0.0
     stats_conn.execute(
         """INSERT INTO budget_milestones
-           (week_start_at, period, threshold, budget_usd, spent_usd,
+           (vendor, period_start_at, period, threshold, budget_usd, spent_usd,
             consumption_pct, crossed_at_utc, alerted_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
+            str(vendor),
             _iso(week_start),
             str(period),
             int(threshold),

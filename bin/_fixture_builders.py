@@ -299,16 +299,21 @@ def create_stats_db(path: Path) -> None:
                 ON five_hour_milestones(block_id);
 
             -- budget_milestones: equiv-$ budget threshold crossings (issue
-            -- #19). Schema owned by migration 011_budget_milestone_period_keys
-            -- (#137): nullable `period` column + period-inclusive UNIQUE. This
-            -- mirrors the post-011 live shape so fixtures whose stamp helper
-            -- marks 011 applied (fast-pathing the dispatcher) carry the new
-            -- shape — a stale narrow shape would break any `SELECT period`
-            -- read. A mid-week reset re-anchors week_start_at, so fresh windows
-            -- get fresh rows — no reset_event_id segment.
+            -- #19). Unified vendor-tagged table owned by migration
+            -- 012_unify_budget_milestones_vendor (#143): one row per (vendor,
+            -- period_start_at, period, threshold), `vendor` ∈ 'claude'|'codex',
+            -- the renamed `period_start_at` key (the subscription-week start OR
+            -- the calendar period-start). This mirrors the post-012 live shape
+            -- so fixtures whose stamp helper marks 012 applied (fast-pathing the
+            -- dispatcher) carry the new shape — a stale shape would break any
+            -- `SELECT vendor`/`SELECT period_start_at` read. `period` (#137) is
+            -- the configured period at crossing; NULL = pre-012 unknown. A
+            -- mid-window reset re-anchors period_start_at, so fresh windows get
+            -- fresh rows — no reset_event_id segment.
             CREATE TABLE budget_milestones (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                week_start_at   TEXT    NOT NULL,
+                vendor          TEXT    NOT NULL,
+                period_start_at TEXT    NOT NULL,
                 period          TEXT,
                 threshold       INTEGER NOT NULL,
                 budget_usd      REAL    NOT NULL,
@@ -316,7 +321,7 @@ def create_stats_db(path: Path) -> None:
                 consumption_pct REAL    NOT NULL,
                 crossed_at_utc  TEXT    NOT NULL,
                 alerted_at      TEXT,
-                UNIQUE(week_start_at, period, threshold)
+                UNIQUE(vendor, period_start_at, period, threshold)
             );
 
             -- projected_milestones: projected-pace threshold crossings (issue

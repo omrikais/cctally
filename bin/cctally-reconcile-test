@@ -3974,21 +3974,25 @@ reconcile_invariant "codex_budget_spend_eq_sum_codex_daily" \
     "$CODEXBUDGET1_PY"
 
 # ─── Invariant CODEXBUDGET2: codex_budget latching == displayed Codex spend ──
-# (calendar-period + Codex budgets, spec §6) Parallels PROJBUDGET1 (B) for the
-# Codex axis: DRIVE the REAL forward-only-from-set reconcile
-# (`_reconcile_codex_budget_milestones_on_set`) and assert the fired
-# `consumption_pct` row binds — by construction, not re-derivation — to the
+# (calendar-period + Codex budgets, spec §6; unified vendor-tagged table #143)
+# Parallels PROJBUDGET1 (B) for the Codex axis: DRIVE the REAL
+# forward-only-from-set reconcile against the merged table
+# (`_reconcile_budget_milestones_on_set(vendor="codex", …)`) and assert the
+# fired `consumption_pct` row binds — by construction, not re-derivation — to the
 # displayed `budget --json .codex.spent_usd` over the same resolved period
 # window. We force a small Codex target so the seeded Codex spend ($15) crosses
 # the 90/100 thresholds (the seeded `both-vendors` Codex budget is at 7.5%, far
-# below any threshold), then assert:
+# below any threshold), then assert (reading `budget_milestones WHERE
+# vendor='codex'`):
 #   (A) each fired row's consumption_pct == displayed_spent / forced_target * 100
 #       within 1e-9 (binds the reconcile path's _sum_codex_cost_for_range to the
 #       displayed .codex.spent_usd);
 #   (B) every row carries alerted_at SET (forward-only-from-set: recorded WITHOUT
 #       dispatch — no instant popup on a mid-period set already over);
 #   (C) a SECOND reconcile run inserts NO new rows (fire-once / latching via
-#       UNIQUE(period_start_at, threshold) + the alerted_at IS NULL UPDATE guard).
+#       UNIQUE(vendor, period_start_at, period, threshold) + the alerted_at IS
+#       NULL UPDATE guard);
+#   (D) every row carries the CONFIGURED period (#137 period-row consistency).
 # Non-vacuity: assert at least one row fired (the forced target guarantees a
 # crossing) — a regression that stopped recording would trip (A)'s row-count or
 # the explicit `fired` guard.
@@ -4023,8 +4027,8 @@ expected_pct = displayed_spent / forced_target * 100.0
 def run_reconcile():
     conn = c.open_db()
     try:
-        c._reconcile_codex_budget_milestones_on_set(
-            conn, target=forced_target, thresholds=thresholds,
+        c._reconcile_budget_milestones_on_set(
+            conn, vendor="codex", target=forced_target, thresholds=thresholds,
             now_utc=now_utc, period=period, config=config, tz=tz,
         )
     finally:
@@ -4033,15 +4037,20 @@ def run_reconcile():
 run_reconcile()
 conn = c.open_db()
 rows = conn.execute(
-    "SELECT threshold, period, consumption_pct, alerted_at "
-    "FROM codex_budget_milestones ORDER BY threshold"
+    "SELECT vendor, threshold, period, consumption_pct, alerted_at "
+    "FROM budget_milestones WHERE vendor = '"'"'codex'"'"' ORDER BY threshold"
 ).fetchall()
 n_after_first = len(rows)
 conn.close()
 
-assert rows, "CODEXBUDGET2 (non-vacuity): no codex_budget_milestones rows fired"
+assert rows, "CODEXBUDGET2 (non-vacuity): no codex budget_milestones rows fired"
 # (A) fired consumption_pct binds to the displayed Codex spend / forced target.
 for r in rows:
+    # Every fired row carries the Codex vendor tag in the unified table (#143).
+    assert r["vendor"] == "codex", (
+        "CODEXBUDGET2 (vendor): threshold %s tagged vendor=%r != '"'"'codex'"'"'"
+        % (r["threshold"], r["vendor"])
+    )
     fired_pct = float(r["consumption_pct"])
     assert abs(fired_pct - expected_pct) < 1e-9, (
         f"CODEXBUDGET2 (A): fired consumption_pct={fired_pct} != "
@@ -4062,7 +4071,7 @@ for r in rows:
 run_reconcile()
 conn = c.open_db()
 n_after_second = conn.execute(
-    "SELECT COUNT(*) FROM codex_budget_milestones"
+    "SELECT COUNT(*) FROM budget_milestones WHERE vendor = '"'"'codex'"'"'"
 ).fetchone()[0]
 conn.close()
 assert n_after_second == n_after_first, (
@@ -4096,6 +4105,122 @@ if [ -f "$cb_home/input.env" ]; then
     fi
 else
     echo "RECONCILE FAIL codex_budget_latching_eq_displayed_spend budget/both-vendors: fixture missing"
+    fail_count=$((fail_count + 1))
+fi
+
+# ─── Invariant BUDGETCOEXIST: claude + codex rows coexist in one table (#143) ──
+# The vendor-tagged merge's defining invariant: BOTH vendors fire their REAL
+# forward-only-from-set reconcile (`_reconcile_budget_milestones_on_set`) into
+# the SAME `budget_milestones` table over the `both-vendors` fixture, and the
+# rows COEXIST with no UNIQUE collision — the generalized period-row-consistency
+# check the issue calls for. We force a small per-vendor target so each vendor's
+# seeded spend (Claude subscription-week + Codex calendar-month) crosses 90/100,
+# then assert:
+#   (1) each fired row's `vendor` matches its writer (claude rows tagged
+#       'claude', codex rows tagged 'codex') — the row-level split that lets one
+#       physical table serve both axes;
+#   (2) the claude + codex rows COEXIST: total == claude_count + codex_count, so
+#       no row was dropped to a cross-vendor UNIQUE(vendor, period_start_at,
+#       period, threshold) collision;
+#   (3) non-vacuity: claude_count > 0 AND codex_count > 0 (both writers fired).
+BUDGETCOEXIST_PY='
+import json, os, sys, importlib.util
+from importlib.machinery import SourceFileLoader
+
+budget = json.loads(os.environ["RECONCILE_A"])   # budget --json
+# Claude budget is top-level; Codex budget nests under .codex.
+claude_spent = float(budget["spent_usd"])
+claude_period = budget["period"]
+codex = budget.get("codex")
+assert codex is not None, "BUDGETCOEXIST vacuous: budget --json carried no codex block"
+codex_spent = float(codex["spent_usd"])
+codex_period = codex["period"]
+assert claude_spent > 0, "BUDGETCOEXIST vacuous: displayed Claude spend is 0"
+assert codex_spent > 0, "BUDGETCOEXIST vacuous: displayed Codex spend is 0"
+thresholds = [90, 100]
+
+bin_dir = os.environ["CODEXBUDGET_BIN_DIR"]
+sys.path.insert(0, bin_dir)
+loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
+spec = importlib.util.spec_from_loader("cctally", loader)
+c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
+loader.exec_module(c)
+
+import argparse
+config = c.load_config()
+tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)
+now_utc = c._command_as_of()
+
+# Force a small per-vendor target so each vendor crosses BOTH 90 and 100
+# (~150% consumption against the seeded spend).
+claude_target = claude_spent / 1.5
+codex_target = codex_spent / 1.5
+
+conn = c.open_db()
+try:
+    c._reconcile_budget_milestones_on_set(
+        conn, vendor="claude", target=claude_target, thresholds=thresholds,
+        now_utc=now_utc, period=claude_period, config=config, tz=tz,
+    )
+    c._reconcile_budget_milestones_on_set(
+        conn, vendor="codex", target=codex_target, thresholds=thresholds,
+        now_utc=now_utc, period=codex_period, config=config, tz=tz,
+    )
+finally:
+    conn.close()
+
+conn = c.open_db()
+rows = conn.execute(
+    "SELECT vendor, period_start_at, period, threshold FROM budget_milestones"
+).fetchall()
+conn.close()
+
+claude_rows = [r for r in rows if r["vendor"] == "claude"]
+codex_rows = [r for r in rows if r["vendor"] == "codex"]
+claude_count = len(claude_rows)
+codex_count = len(codex_rows)
+
+# (3) non-vacuity: both writers fired.
+assert claude_count > 0, "BUDGETCOEXIST: no claude rows fired (forced target should cross)"
+assert codex_count > 0, "BUDGETCOEXIST: no codex rows fired (forced target should cross)"
+# (1) every row carries the vendor tag of its writer (no foreign-vendor rows).
+assert all(r["vendor"] in ("claude", "codex") for r in rows), (
+    "BUDGETCOEXIST: a fired row carries an unexpected vendor tag"
+)
+# (2) coexistence: total == claude + codex — no row dropped to a cross-vendor
+# UNIQUE collision (claude + codex would collide on (period_start_at, period,
+# threshold) WITHOUT the vendor column in the key).
+assert len(rows) == claude_count + codex_count, (
+    f"BUDGETCOEXIST: total rows {len(rows)} != claude {claude_count} + "
+    f"codex {codex_count} — a cross-vendor UNIQUE collision dropped a row"
+)
+'
+co_home="$FIXTURES/budget/both-vendors"
+if [ -f "$co_home/input.env" ]; then
+    AS_OF=""
+    # shellcheck disable=SC1091
+    . "$co_home/input.env"
+    co_budget=$(HOME="$co_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" budget --json 2>/dev/null); rc_b=$?
+    if [ $rc_b -ne 0 ]; then
+        echo "RECONCILE FAIL budget_vendors_coexist budget/both-vendors: budget rc=$rc_b"
+        fail_count=$((fail_count + 1))
+    else
+        result=$(RECONCILE_A="$co_budget" \
+            CODEXBUDGET_BIN_DIR="$REPO_ROOT/bin" \
+            HOME="$co_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+            CCTALLY_DISABLE_DEV_AUTODETECT=1 \
+            python3 -c "$BUDGETCOEXIST_PY" 2>&1); rc_py=$?
+        if [ $rc_py -ne 0 ]; then
+            echo "RECONCILE FAIL budget_vendors_coexist budget/both-vendors: $result"
+            fail_count=$((fail_count + 1))
+        else
+            echo "PASS budget_vendors_coexist budget/both-vendors"
+            pass_count=$((pass_count + 1))
+        fi
+    fi
+else
+    echo "RECONCILE FAIL budget_vendors_coexist budget/both-vendors: fixture missing"
     fail_count=$((fail_count + 1))
 fi
 

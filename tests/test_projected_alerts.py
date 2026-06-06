@@ -919,12 +919,16 @@ def test_codex_projected_counts_with_cold_cache(ns, monkeypatch, tmp_path):
 
     # Pre-latch the codex_budget ACTUAL axis for all thresholds at the June
     # period key, so maybe_record_codex_budget_milestone short-circuits BEFORE
-    # its SUM (the cache stays cold — exactly the R5 hazard scenario).
+    # its SUM (the cache stays cold — exactly the R5 hazard scenario). The
+    # ACTUAL axis now lives in the unified vendor-tagged table (#143): seed via
+    # the shared helper with `vendor="codex"` (period left NULL — the record
+    # path's pre-probe matches `period = ? OR period IS NULL`, so the
+    # short-circuit fires regardless of the configured period noun).
     conn = ns["open_db"]()
     try:
         for t in (90, 100):
-            ns["insert_codex_budget_milestone"](
-                conn, period_start_at=JUNE_KEY, threshold=t,
+            ns["insert_budget_milestone"](
+                conn, vendor="codex", period_start_at=JUNE_KEY, threshold=t,
                 budget_usd=200.0, spent_usd=200.0, consumption_pct=100.0,
                 commit=True,
             )

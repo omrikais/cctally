@@ -113,12 +113,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/stats.db",
-                        "registry_size": 11,
+                        "registry_size": 12,
                         "user_version": 99
                     },
                     "id": "db.stats.file",
                     "severity": "ok",
-                    "summary": "version 99 / 11 known",
+                    "summary": "version 99 / 12 known",
                     "title": "stats.db"
                 },
                 {
@@ -139,14 +139,14 @@
                         },
                         "stats.db": {
                             "ahead": true,
-                            "registry_size": 11,
+                            "registry_size": 12,
                             "user_version": 99
                         }
                     },
                     "id": "db.version_ahead",
                     "remediation": "Run `cctally db recover --db stats --yes` (or restore from backup)",
                     "severity": "fail",
-                    "summary": "stats.db ahead (v99 > known v11)",
+                    "summary": "stats.db ahead (v99 > known v12)",
                     "title": "Version ahead"
                 },
                 {
@@ -175,7 +175,8 @@
                                     "008_recompute_weekly_cost_snapshots_dedup_fix",
                                     "009_recompute_five_hour_blocks_dedup_fix",
                                     "010_recompute_percent_milestones_dedup_fix",
-                                    "011_budget_milestone_period_keys"
+                                    "011_budget_milestone_period_keys",
+                                    "012_unify_budget_milestones_vendor"
                                 ],
                                 "skipped": []
                             }
@@ -183,7 +184,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/13 applied",
+                    "summary": "0/14 applied",
                     "title": "Migrations"
                 },
                 {
@@ -234,6 +235,10 @@
                                 "011_budget_milestone_period_keys"
                             ],
                             [
+                                "stats.db",
+                                "012_unify_budget_milestones_vendor"
+                            ],
+                            [
                                 "cache.db",
                                 "001_dedup_highest_wins"
                             ],
@@ -246,7 +251,7 @@
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "13 pending",
+                    "summary": "14 pending",
                     "title": "Pending migrations"
                 }
             ],

@@ -195,19 +195,25 @@ with sqlite3.connect(stats) as conn:
     pinned_str = pinned["alerted_at"] if pinned else ""
     # Budget axis (Task 3). budget_milestones has no reset_event_id; armed =
     # alerted_at IS NOT NULL (set-then-dispatch). Tolerate the table's
-    # absence (older fixture DBs) so non-budget scenarios stay green.
+    # absence (older fixture DBs) so non-budget scenarios stay green. The
+    # table is now the unified vendor-tagged table (#143) shared by both the
+    # Claude (`budget`) and Codex (`codex_budget`) axes — scope these counts to
+    # `vendor='claude'` so a Codex fixture row never pollutes the Claude-budget
+    # assertions (a future Codex-budget harness check splits onto vendor='codex').
     try:
         bm_total = conn.execute(
-            "SELECT COUNT(*) FROM budget_milestones"
+            "SELECT COUNT(*) FROM budget_milestones WHERE vendor = 'claude'"
         ).fetchone()[0]
         bm_armed = conn.execute(
-            "SELECT COUNT(*) FROM budget_milestones WHERE alerted_at IS NOT NULL"
+            "SELECT COUNT(*) FROM budget_milestones "
+            "WHERE vendor = 'claude' AND alerted_at IS NOT NULL"
         ).fetchone()[0]
         armed_budget_pcts = ",".join(
             str(int(r["threshold"]))
             for r in conn.execute(
                 "SELECT threshold FROM budget_milestones "
-                "WHERE alerted_at IS NOT NULL ORDER BY threshold ASC"
+                "WHERE vendor = 'claude' AND alerted_at IS NOT NULL "
+                "ORDER BY threshold ASC"
             )
         )
     except sqlite3.OperationalError:
