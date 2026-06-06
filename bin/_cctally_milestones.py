@@ -513,9 +513,9 @@ def _resolve_claude_budget_window(conn, now_utc, *, period, config, tz):
     §6). Subscription-week → the existing ``_resolve_current_budget_window``
     (snapshot-anchored; may return ``None`` when no usage snapshot has landed
     yet). Calendar period → the pure ``_resolve_calendar_window`` (derived purely
-    from ``now`` + the period; NEVER ``None``). The dedup key column stays
-    ``week_start_at`` — for a calendar period it carries the resolved PERIOD-start
-    instant (a back-compat misnomer)."""
+    from ``now`` + the period; NEVER ``None``). The dedup key column is now
+    ``period_start_at`` (#143) — it carries the resolved PERIOD-start instant
+    (subscription-week OR calendar period-start)."""
     c = _cctally()
     if period == "subscription-week":
         return c._resolve_current_budget_window(conn, now_utc)
