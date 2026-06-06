@@ -4184,58 +4184,85 @@ def _envelope_rows_five_hour(conn, descriptor, limit, severity_for) -> list[dict
     return out
 
 
-def _envelope_rows_budget(conn, descriptor, limit, severity_for) -> list[dict]:
-    # Third axis (issue #19): equiv-$ budget threshold crossings. Budget
-    # alerts are keyed by the effective (post-reset) week_start_at + the
-    # write-once ``period`` discriminator + the integer threshold; the envelope
-    # id mirrors the dispatch payload's
-    # ``budget:<week_start_at>:<period>:<threshold>`` shape
-    # (``_build_alert_payload_budget``). No ``reset_event_id`` segment —
-    # a mid-week reset re-anchors ``week_start_at`` so the new window
-    # naturally gets fresh rows under
-    # ``UNIQUE(week_start_at, period, threshold)``.
+def _envelope_rows_budget_family(conn, descriptor, limit, severity_for) -> list[dict]:
+    # Unified vendor-tagged budget axis (#143). ONE mapper backs BOTH the
+    # ``budget`` (``vendor='claude'``, issue #19) and ``codex_budget``
+    # (``vendor='codex'``, calendar-period-codex-budgets spec §6) axes —
+    # ``descriptor.vendor`` drives the ``WHERE vendor=?`` row filter + the
+    # ``COALESCE(period, <vendor-default-noun>)`` default, ``descriptor.id`` the
+    # envelope id prefix, ``descriptor.milestone_table`` (now ``budget_milestones``
+    # for both) the source table.
     #
-    # Period generalization (calendar-period-codex-budgets, spec §5/§6): the
-    # ``week_start_at`` key column carries either a subscription-week instant
-    # OR a calendar period-start instant (back-compat misnomer, like
-    # ``weekly_usd``); the ``period`` discriminator (#137) tells them apart.
-    # ``period`` is read FROM THE ROW (snapshotted at crossing), never live
-    # config that may have changed since (the Codex P0-4 lesson) — so a user who
-    # fires subscription-week alerts then switches ``budget.period`` keeps the
-    # historical row's noun (Symptom 1 fix). ``COALESCE(period,
-    # 'subscription-week')`` renders a pre-011 NULL-sentinel row with the
-    # vendor-default noun and keeps the ``id`` non-``None``.
+    # Budget alerts are keyed by ``period_start_at`` (the resolved period-window
+    # start instant — a subscription-week start for claude OR a calendar
+    # period-start for codex) + the write-once ``period`` discriminator (#137) +
+    # the integer threshold. No ``reset_event_id`` segment: a mid-week reset
+    # (claude) or a period rollover (codex) re-anchors ``period_start_at`` so the
+    # new window naturally gets fresh rows under
+    # ``UNIQUE(vendor, period_start_at, period, threshold)``.
+    #
+    # All numbers + the ``period`` noun are read FROM THE ROW (snapshotted at
+    # crossing), never live config that may have changed since (the Codex P0-4
+    # lesson; Symptom 1 fix) — a user who fires alerts then switches
+    # ``budget.period`` keeps the historical row's noun. ``COALESCE(period, …)``
+    # renders a pre-011 NULL-sentinel row with the vendor-default noun and keeps
+    # the ``id`` non-``None``; the id's ``period`` segment gives a calendar-week ↔
+    # calendar-month coinciding-instant collision (now distinct coexisting rows)
+    # distinct React keys.
+    #
+    # Byte-stable identity: the envelope id ==
+    # ``f"{descriptor.id}:{period_start_at}:{period}:{threshold}"`` matches the
+    # pre-#143 ``budget:…`` / ``codex_budget:…`` strings exactly (same instant
+    # value, renamed key column). The per-vendor context dict KEY ORDER matches
+    # the pre-#143 envelopes verbatim: the claude/``budget`` axis still emits BOTH
+    # the legacy ``week_start_at`` AND ``period_start_at`` (same instant value) so
+    # no existing TS consumer of ``context.week_start_at`` breaks; the
+    # codex/``codex_budget`` axis emits ``period_start_at`` only.
+    vendor = descriptor.vendor
+    default_noun = "subscription-week" if vendor == "claude" else "calendar-month"
     rows = conn.execute(
         f"""
-        SELECT week_start_at,
-               COALESCE(period, 'subscription-week') AS period,
+        SELECT period_start_at,
+               COALESCE(period, ?) AS period,
                threshold, crossed_at_utc, alerted_at,
                budget_usd, spent_usd, consumption_pct
         FROM {descriptor.milestone_table}
-        WHERE alerted_at IS NOT NULL
+        WHERE vendor = ? AND alerted_at IS NOT NULL
         ORDER BY alerted_at DESC
         LIMIT ?
         """,
-        (limit,),
+        (default_noun, vendor, limit),
     ).fetchall()
     out: list[dict] = []
     for r in rows:
         threshold = int(r["threshold"])
+        if vendor == "claude":
+            ctx = {  # key order byte-stable with the pre-#143 budget envelope
+                "week_start_at":   r["period_start_at"],
+                "period":          r["period"],
+                "period_start_at": r["period_start_at"],
+                "budget_usd":      float(r["budget_usd"]),
+                "spent_usd":       float(r["spent_usd"]),
+                "consumption_pct": float(r["consumption_pct"]),
+            }
+        else:
+            ctx = {  # key order byte-stable with the pre-#143 codex_budget envelope
+                "period":          r["period"],
+                "period_start_at": r["period_start_at"],
+                "budget_usd":      float(r["budget_usd"]),
+                "spent_usd":       float(r["spent_usd"]),
+                "consumption_pct": float(r["consumption_pct"]),
+            }
         out.append({
-            "id":         f"budget:{r['week_start_at']}:{r['period']}:{threshold}",
+            "id": (
+                f"{descriptor.id}:{r['period_start_at']}:{r['period']}:{threshold}"
+            ),
             "axis":       descriptor.id,
             "threshold":  threshold,
             "severity":   severity_for(threshold),
             "crossed_at": r["crossed_at_utc"],
             "alerted_at": r["alerted_at"],
-            "context": {
-                "week_start_at":   r["week_start_at"],
-                "period":          r["period"],
-                "period_start_at": r["week_start_at"],
-                "budget_usd":      float(r["budget_usd"]),
-                "spent_usd":       float(r["spent_usd"]),
-                "consumption_pct": float(r["consumption_pct"]),
-            },
+            "context":    ctx,
         })
     return out
 
@@ -4354,75 +4381,19 @@ def _envelope_rows_project_budget(conn, descriptor, limit, severity_for) -> list
     return out
 
 
-def _envelope_rows_codex_budget(conn, descriptor, limit, severity_for) -> list[dict]:
-    # Sixth axis (calendar-period-codex-budgets, spec §6): per-vendor Codex
-    # equiv-actual-$ budget threshold crossings over a CALENDAR period
-    # (calendar-week / calendar-month — Codex has no Anthropic subscription
-    # week). Keyed on ``period_start_at`` (the resolved period-window start
-    # instant, stored as the ``isoformat(timespec="seconds")`` ``+00:00`` offset
-    # form, NOT a ``Z`` suffix) + the integer threshold; the envelope id mirrors
-    # the dispatch payload's ``codex_budget:<period_start_at>:<threshold>`` shape
-    # (``_build_alert_payload_codex_budget``). NO ``reset_event_id`` segment —
-    # rolling to the next period yields a fresh ``period_start_at`` so the new
-    # window naturally gets fresh rows under ``UNIQUE(period_start_at,
-    # threshold)``. ``budget_usd`` / ``spent_usd`` / ``consumption_pct`` are
-    # rendered FROM THE ROW (snapshotted at crossing), never live config that may
-    # have changed since (the Codex P0-4 lesson). The ``period`` discriminator is
-    # the write-once ``period`` discriminator (#137) is read FROM THE ROW
-    # (snapshotted at crossing) — mirroring how the dispatched payload sourced it
-    # from config-at-fire-time — never live ``budget.codex.period`` that may have
-    # changed since (the Codex P0-4 lesson; Symptom 1 fix). ``COALESCE(period,
-    # 'calendar-month')`` renders a pre-011 NULL-sentinel row with the
-    # vendor-default civil-period noun (Codex has no subscription week) and keeps
-    # the ``id`` non-``None``. The id gains the ``period`` segment so a
-    # calendar-week ↔ calendar-month coinciding-instant collision (now distinct
-    # coexisting rows under ``UNIQUE(period_start_at, period, threshold)``) gets
-    # distinct React keys.
-    rows = conn.execute(
-        f"""
-        SELECT period_start_at,
-               COALESCE(period, 'calendar-month') AS period,
-               threshold, crossed_at_utc, alerted_at,
-               budget_usd, spent_usd, consumption_pct
-        FROM {descriptor.milestone_table}
-        WHERE alerted_at IS NOT NULL
-        ORDER BY alerted_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-    out: list[dict] = []
-    for r in rows:
-        threshold = int(r["threshold"])
-        out.append({
-            "id": (
-                f"codex_budget:{r['period_start_at']}:{r['period']}:{threshold}"
-            ),
-            "axis":       descriptor.id,
-            "threshold":  threshold,
-            "severity":   severity_for(threshold),
-            "crossed_at": r["crossed_at_utc"],
-            "alerted_at": r["alerted_at"],
-            "context": {
-                "period":          r["period"],
-                "period_start_at": r["period_start_at"],
-                "budget_usd":      float(r["budget_usd"]),
-                "spent_usd":       float(r["spent_usd"]),
-                "consumption_pct": float(r["consumption_pct"]),
-            },
-        })
-    return out
-
-
 # Keyed by ``AlertAxisDescriptor.id`` — the registry decides which axes run,
 # in what order; this table supplies the bespoke heterogeneous row-mapper.
+# ``budget`` (vendor='claude') and ``codex_budget`` (vendor='codex') share the
+# one ``_envelope_rows_budget_family`` mapper (#143) — it reads
+# ``descriptor.vendor`` for the row filter + default noun and ``descriptor.id``
+# for the envelope id prefix, so the two axes stay distinct on the wire.
 _ENVELOPE_AXIS_MAPPERS = {
     "weekly": _envelope_rows_weekly,
     "five_hour": _envelope_rows_five_hour,
-    "budget": _envelope_rows_budget,
+    "budget": _envelope_rows_budget_family,
     "projected": _envelope_rows_projected,
     "project_budget": _envelope_rows_project_budget,
-    "codex_budget": _envelope_rows_codex_budget,
+    "codex_budget": _envelope_rows_budget_family,
 }
 
 
@@ -6072,7 +6043,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             touched = (
                 set(budget_in.keys()) if isinstance(budget_in, dict) else set()
             )
-            if touched & {"weekly_usd", "alerts_enabled", "alert_thresholds"}:
+            # ``period`` included (#143 §5.4 fold-in): switching budget.period
+            # via the dashboard while already over a threshold must reconcile
+            # forward-only, exactly like the CLI `config set budget.period` path
+            # (`_cctally_config.py`) — else the next record-usage tick would
+            # instant-popup retroactive alerts under the new period window.
+            if touched & {"weekly_usd", "alerts_enabled", "alert_thresholds", "period"}:
                 _cctally()._reconcile_budget_on_config_write(validated_budget)
             if touched & {"project_alerts_enabled", "alert_thresholds"}:
                 _cctally()._reconcile_project_budget_milestones_on_write(

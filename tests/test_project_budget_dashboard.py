@@ -424,8 +424,9 @@ def test_post_settings_codex_not_object_400(ns):
 def _count_codex_milestones(ns):
     conn = ns["open_db"]()
     try:
+        # Unified vendor-tagged table (#143): count only the Codex rows.
         return conn.execute(
-            "SELECT COUNT(*) FROM codex_budget_milestones"
+            "SELECT COUNT(*) FROM budget_milestones WHERE vendor = 'codex'"
         ).fetchone()[0]
     finally:
         conn.close()
@@ -608,11 +609,15 @@ def test_alerts_test_endpoint_accepts_projected_codex_metric(ns, monkeypatch):
 def _seed_budget_milestone(ns, *, week_start_at, period, threshold,
                            budget_usd=300.0, spent_usd=290.0,
                            consumption_pct=96.0, alerted=True):
+    # Claude rows in the unified vendor-tagged table (#143): the seed param
+    # keeps the legacy `week_start_at` NAME (the instant), routed to the
+    # `period_start_at` column with `vendor='claude'`.
     conn = ns["open_db"]()
     try:
         ns["insert_budget_milestone"](
             conn,
-            week_start_at=week_start_at,
+            vendor="claude",
+            period_start_at=week_start_at,
             period=period,
             threshold=threshold,
             budget_usd=budget_usd,
@@ -623,7 +628,8 @@ def _seed_budget_milestone(ns, *, week_start_at, period, threshold,
         if alerted:
             conn.execute(
                 "UPDATE budget_milestones SET alerted_at = ? "
-                "WHERE week_start_at = ? AND threshold = ?",
+                "WHERE vendor = 'claude' AND period_start_at = ? "
+                "  AND threshold = ?",
                 ("2026-06-01T15:00:00Z", week_start_at, threshold),
             )
         conn.commit()
@@ -634,10 +640,13 @@ def _seed_budget_milestone(ns, *, week_start_at, period, threshold,
 def _seed_codex_budget_milestone(ns, *, period_start_at, period, threshold,
                                  budget_usd=200.0, spent_usd=195.0,
                                  consumption_pct=97.5, alerted=True):
+    # Codex rows in the unified vendor-tagged table (#143): same helper with
+    # `vendor='codex'`.
     conn = ns["open_db"]()
     try:
-        ns["insert_codex_budget_milestone"](
+        ns["insert_budget_milestone"](
             conn,
+            vendor="codex",
             period_start_at=period_start_at,
             period=period,
             threshold=threshold,
@@ -648,8 +657,9 @@ def _seed_codex_budget_milestone(ns, *, period_start_at, period, threshold,
         )
         if alerted:
             conn.execute(
-                "UPDATE codex_budget_milestones SET alerted_at = ? "
-                "WHERE period_start_at = ? AND threshold = ?",
+                "UPDATE budget_milestones SET alerted_at = ? "
+                "WHERE vendor = 'codex' AND period_start_at = ? "
+                "  AND threshold = ?",
                 ("2026-06-01T15:00:00Z", period_start_at, threshold),
             )
         conn.commit()
