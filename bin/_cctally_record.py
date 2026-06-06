@@ -289,10 +289,6 @@ def _resolve_codex_budget_period_window(*args, **kwargs):
     return sys.modules["cctally"]._resolve_codex_budget_period_window(*args, **kwargs)
 
 
-def _sum_codex_cost_for_range(*args, **kwargs):
-    return sys.modules["cctally"]._sum_codex_cost_for_range(*args, **kwargs)
-
-
 def resolve_display_tz(*args, **kwargs):
     return sys.modules["cctally"].resolve_display_tz(*args, **kwargs)
 
@@ -327,14 +323,6 @@ def _resolve_current_budget_window(*args, **kwargs):
 
 def _resolve_claude_budget_window(*args, **kwargs):
     return sys.modules["cctally"]._resolve_claude_budget_window(*args, **kwargs)
-
-
-def _sum_cost_for_range(*args, **kwargs):
-    return sys.modules["cctally"]._sum_cost_for_range(*args, **kwargs)
-
-
-def insert_budget_milestone(*args, **kwargs):
-    return sys.modules["cctally"].insert_budget_milestone(*args, **kwargs)
 
 
 def insert_projected_milestone(*args, **kwargs):

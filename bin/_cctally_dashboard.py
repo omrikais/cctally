@@ -4404,8 +4404,9 @@ def _build_alerts_envelope_array(
     """Return the ``alerts`` array for the SSE snapshot envelope.
 
     Union of ``percent_milestones``, ``five_hour_milestones``,
-    ``budget_milestones``, ``projected_milestones``,
-    ``project_budget_milestones``, and ``codex_budget_milestones`` rows with
+    ``budget_milestones`` (vendor-tagged — backs BOTH the ``budget`` and
+    ``codex_budget`` axes since #143), ``projected_milestones``, and
+    ``project_budget_milestones`` rows with
     ``alerted_at IS NOT NULL``, ordered newest-first by ``alerted_at``, capped at
     ``limit`` (default 100). Single source of truth for both the dashboard panel
     (slices to 10 client-side) and the modal (renders all 100). Forward-only
