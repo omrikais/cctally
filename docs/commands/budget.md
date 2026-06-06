@@ -244,9 +244,9 @@ amount under `amount_usd` and window under `period_start_at` / `period_end_at`:
 Both `period` and the `codex` block are **additive** — no `schemaVersion` bump.
 The `codex` key is present **only** when a Codex budget is configured. Window
 timestamps are always UTC (`…Z`), ignoring `display.tz`, like every other
-cctally `--json`. (The `codex_budget_milestones` table internally stores
-`period_start_at` as the `+00:00` offset form; the `--json` view normalizes to
-`…Z`.) Other status shapes:
+cctally `--json`. (The unified `budget_milestones` table — Codex rows tagged
+`vendor='codex'` — internally stores `period_start_at` as the `+00:00` offset
+form; the `--json` view normalizes to `…Z`.) Other status shapes:
 
 - No Claude budget set → `{"schemaVersion":1,"status":"unset","weekly_usd":null}` (plus a `codex` block if one is configured).
 - Budget set but no usage window resolvable yet → `{"schemaVersion":1,"status":"no_data","weekly_usd":<budget>}`.
