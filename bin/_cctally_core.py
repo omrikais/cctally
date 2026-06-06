@@ -436,6 +436,16 @@ def compute_week_bounds(anchor_dt: dt.datetime, week_start_name: str) -> tuple[d
 def ensure_dirs() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # cache.db holds plaintext conversation prose at rest (Plan 2, spec §5), so
+    # the data dir must be 0700. Hardening it here in the shared primitive means
+    # a stats-first cold start — open_db() materializing APP_DIR before any
+    # cache.db open (e.g. record-usage) — is covered, not only the
+    # open_cache_db backstop (which keeps its own chmod). Best-effort and
+    # idempotent: swallow OSError + continue (issue #150).
+    try:
+        os.chmod(APP_DIR, 0o700)
+    except OSError as exc:
+        eprint(f"[core] could not chmod data dir 0700 ({exc}); continuing")
 
 
 # === Alerts validation cluster ======================================

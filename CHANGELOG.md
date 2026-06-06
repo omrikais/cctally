@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **The `0700` data-dir hardening now also covers a stats-first cold start.** The owner-only data-dir permission shipped in 1.28.0 was applied when `cache.db` was opened, but a cold start that opened `stats.db` first (e.g. `record-usage` on a fresh machine) materialized the directory at the default umask and left it that way until the next `cache.db` open. The `0700` chmod now lives in the shared `ensure_dirs()` primitive (best-effort, swallowing `OSError`) that every `stats.db` open runs through, with the `cache.db` open keeping its own chmod as a backstop — so the data dir is owner-only regardless of which database is touched first. Posture-only; no action needed on upgrade (#150).
+
 ## [1.28.0] - 2026-06-06
 
 ### Added
