@@ -331,54 +331,7 @@ def insert_percent_milestone(
 def insert_budget_milestone(
     conn: sqlite3.Connection,
     *,
-    week_start_at: str,
-    period: "str | None" = None,
-    threshold: int,
-    budget_usd: float,
-    spent_usd: float,
-    consumption_pct: float,
-    commit: bool = True,
-) -> int:
-    """INSERT OR IGNORE a budget threshold crossing. Returns ``cur.rowcount``
-    (1 = genuinely new crossing, 0 = INSERT OR IGNORE no-op on a pre-existing
-    ``(week_start_at, period, threshold)`` row).
-
-    Mirrors :func:`insert_percent_milestone`'s rowcount contract so the
-    alert-fire predicate (`if inserted == 1`) is race-safe without a
-    follow-up SELECT. ``period`` (#137) is the configured period noun at
-    crossing ('calendar-week'|'calendar-month'|'subscription-week'); it
-    discriminates the UNIQUE key so calendar-week and calendar-month windows
-    that share a start instant don't collide. A NULL ``period`` is the pre-011
-    "unknown" sentinel (only seeded migration rows carry it). ``alerted_at`` is
-    left NULL — the caller stamps it in the SAME transaction BEFORE dispatching
-    (set-then-dispatch invariant, CLAUDE.md Alerts gotcha). ``commit=False``
-    lets the caller bundle the INSERT with the follow-up ``alerted_at`` UPDATE
-    in one transaction so a crash between them can't strand ``alerted_at`` NULL
-    forever.
-    """
-    cur = conn.execute(
-        "INSERT OR IGNORE INTO budget_milestones "
-        "(week_start_at, period, threshold, budget_usd, spent_usd, "
-        " consumption_pct, crossed_at_utc) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (
-            week_start_at,
-            period,
-            int(threshold),
-            float(budget_usd),
-            float(spent_usd),
-            float(consumption_pct),
-            now_utc_iso(),
-        ),
-    )
-    if commit:
-        conn.commit()
-    return int(cur.rowcount)
-
-
-def insert_codex_budget_milestone(
-    conn: sqlite3.Connection,
-    *,
+    vendor: str,
     period_start_at: str,
     period: "str | None" = None,
     threshold: int,
@@ -387,29 +340,34 @@ def insert_codex_budget_milestone(
     consumption_pct: float,
     commit: bool = True,
 ) -> int:
-    """INSERT OR IGNORE a Codex budget threshold crossing. Returns
-    ``cur.rowcount`` (1 = genuinely new crossing, 0 = INSERT OR IGNORE no-op on a
-    pre-existing ``(period_start_at, period, threshold)`` row).
+    """INSERT OR IGNORE a budget threshold crossing into the unified vendor-tagged
+    table (#143). Returns ``cur.rowcount`` (1 = genuinely new crossing, 0 =
+    INSERT OR IGNORE no-op on a pre-existing ``(vendor, period_start_at, period,
+    threshold)`` row).
 
-    Mirrors :func:`insert_budget_milestone` byte-for-byte but keyed on
-    ``period_start_at`` (the resolved CALENDAR-period window start instant) in
-    place of ``week_start_at`` — Codex has no Anthropic subscription week, so the
-    budget runs over a calendar period (spec §6). ``period`` (#137) is the
-    configured Codex period noun at crossing ('calendar-week'|'calendar-month');
-    NULL is the pre-011 unknown sentinel. Same rowcount contract so the
-    alert-fire predicate (`if inserted == 1`) is race-safe without a follow-up
-    SELECT. ``alerted_at`` is left NULL — the caller stamps it in the SAME
-    transaction BEFORE dispatching (set-then-dispatch invariant, CLAUDE.md
-    Alerts gotcha). ``commit=False`` lets the caller bundle the INSERT with the
-    follow-up ``alerted_at`` UPDATE in one transaction so a crash between them
-    can't strand ``alerted_at`` NULL forever.
+    The merged ``budget_milestones`` table (migration 012) carries a ``vendor``
+    column (``'claude'``|``'codex'``) and the renamed ``period_start_at`` key
+    (the Claude subscription-week start OR the Codex calendar-period start —
+    Codex has no Anthropic subscription week, spec §6). Mirrors
+    :func:`insert_percent_milestone`'s rowcount contract so the alert-fire
+    predicate (`if inserted == 1`) is race-safe without a follow-up SELECT.
+    ``period`` (#137) is the configured period noun at crossing
+    ('calendar-week'|'calendar-month'|'subscription-week'); it discriminates the
+    UNIQUE key so calendar-week and calendar-month windows that share a start
+    instant don't collide. A NULL ``period`` is the pre-011 "unknown" sentinel
+    (only seeded migration rows carry it). ``alerted_at`` is left NULL — the
+    caller stamps it in the SAME transaction BEFORE dispatching (set-then-dispatch
+    invariant, CLAUDE.md Alerts gotcha). ``commit=False`` lets the caller bundle
+    the INSERT with the follow-up ``alerted_at`` UPDATE in one transaction so a
+    crash between them can't strand ``alerted_at`` NULL forever.
     """
     cur = conn.execute(
-        "INSERT OR IGNORE INTO codex_budget_milestones "
-        "(period_start_at, period, threshold, budget_usd, spent_usd, "
+        "INSERT OR IGNORE INTO budget_milestones "
+        "(vendor, period_start_at, period, threshold, budget_usd, spent_usd, "
         " consumption_pct, crossed_at_utc) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
+            str(vendor),
             period_start_at,
             period,
             int(threshold),
@@ -564,41 +522,83 @@ def _resolve_claude_budget_window(conn, now_utc, *, period, config, tz):
     return c._resolve_calendar_window(period, now_utc, config, tz)
 
 
-def _reconcile_budget_milestones_on_set(
-    conn, *, target, thresholds, now_utc, period="subscription-week",
-    config=None, tz=None,
-):
-    """Forward-only-from-set reconcile (spec §5): on `budget set`, every
-    threshold ALREADY crossed for the current week/period is recorded with
-    ``alerted_at`` SET but WITHOUT dispatch — so setting a budget when you're
-    already at 95% does NOT instant-popup. Thresholds not yet crossed get NO
-    row, so they fire later via :func:`maybe_record_budget_milestone`.
+def _resolve_budget_window(conn, *, vendor, now_utc, period, config, tz):
+    """Resolve the budget period-start instant for ``vendor`` (#143). CHEAP — does
+    NO cost SUM, preserving the pre-probe-before-spend hot path (spec §4.2): the
+    firing paths resolve this cheap window, pre-probe which thresholds are already
+    latched, and skip the cost SUM entirely when nothing is pending.
 
-    A mid-week target change re-runs this; thresholds already alerted stay
-    deduped via UNIQUE(week_start_at, period, threshold) + the ``alerted_at IS
-    NULL`` guard on the UPDATE (so an existing alerted row is never re-stamped).
+    Dispatches to the per-vendor window primitive:
+      * claude → :func:`_resolve_claude_budget_window` (snapshot-anchored for
+        subscription-week → may be ``None`` pre-snapshot; calendar period → the
+        pure calendar window, never ``None``).
+      * codex  → :func:`_resolve_codex_budget_period_window` (pure calendar window;
+        never ``None``).
 
-    ``period`` defaults to subscription-week (byte-stable legacy behavior); a
-    calendar period resolves the window from ``now`` + the period instead of the
-    snapshot anchor (calendar-period-codex-budgets generalization, spec §6).
-    """
-    c = _cctally()
-    window = _resolve_claude_budget_window(
-        conn, now_utc, period=period, config=config, tz=tz
-    )
+    Returns the period-start ``datetime`` or ``None`` (claude subscription-week
+    pre-snapshot)."""
+    if vendor == "claude":
+        window = _resolve_claude_budget_window(
+            conn, now_utc, period=period, config=config, tz=tz
+        )
+    else:
+        window = _resolve_codex_budget_period_window(period, now_utc, config, tz)
     if window is None:
+        return None
+    start_at, _end_at = window
+    return start_at
+
+
+def _budget_spend_for_vendor(conn, *, vendor, start_at, now_utc) -> float:
+    """Spend over ``[start_at, now]`` for ``vendor`` (#143) — the COSTLY leg,
+    called only after the pre-probe finds pending thresholds (spec §4.2). claude
+    routes through the Claude cost SUM (``mode="auto"``); codex through the Codex
+    cost SUM."""
+    c = _cctally()
+    if vendor == "claude":
+        return c._sum_cost_for_range(start_at, now_utc, mode="auto")
+    return c._sum_codex_cost_for_range(start_at, now_utc)
+
+
+def _reconcile_budget_milestones_on_set(
+    conn, *, vendor, target, thresholds, now_utc, period, config=None, tz=None,
+):
+    """Forward-only-from-set reconcile for the budget axis (both vendors, #143):
+    on `budget set`, every threshold ALREADY crossed for the current
+    window/period is recorded with ``alerted_at`` SET but WITHOUT dispatch — so
+    setting a budget when you're already at 95% does NOT instant-popup. Thresholds
+    not yet crossed get NO row, so they fire later via the firing path
+    (:func:`maybe_record_budget_milestone` / :func:`maybe_record_codex_budget_milestone`).
+
+    A mid-window target change re-runs this; thresholds already alerted stay
+    deduped via UNIQUE(vendor, period_start_at, period, threshold) + the
+    ``alerted_at IS NULL`` guard on the UPDATE (so an existing alerted row is never
+    re-stamped).
+
+    Cold path — no pre-probe; resolves the cheap window then computes spend right
+    after (spec §4.2 ordering). ``vendor`` selects the window + spend dispatcher;
+    claude subscription-week may resolve ``None`` pre-snapshot (early return).
+    Keeps its own stamp-no-dispatch tail (distinct from :func:`_budget_crossings`,
+    which dispatches) — that asymmetry is intrinsic, not duplication.
+    """
+    start_at = _resolve_budget_window(
+        conn, vendor=vendor, now_utc=now_utc, period=period, config=config, tz=tz
+    )
+    if start_at is None:
         return
-    week_start_at, _week_end_at = window
-    week_key = week_start_at.isoformat(timespec="seconds")
-    spent = c._sum_cost_for_range(week_start_at, now_utc, mode="auto")
-    # target > 0 guaranteed by the caller (_cmd_budget_set passes the validated
-    # weekly_usd); the else is belt-and-suspenders.
+    period_key = start_at.isoformat(timespec="seconds")
+    spent = _budget_spend_for_vendor(
+        conn, vendor=vendor, start_at=start_at, now_utc=now_utc
+    )
+    # target > 0 guaranteed by the caller (validated weekly_usd / amount_usd);
+    # the else is belt-and-suspenders.
     consumption_pct = (spent / target * 100.0) if target > 0 else 0.0
     for t in sorted(thresholds):
         if consumption_pct + 1e-9 >= t:
             insert_budget_milestone(
                 conn,
-                week_start_at=week_key,
+                vendor=vendor,
+                period_start_at=period_key,
                 period=period,
                 threshold=t,
                 budget_usd=target,
@@ -606,14 +606,14 @@ def _reconcile_budget_milestones_on_set(
                 consumption_pct=consumption_pct,
                 commit=False,
             )
-            # alerted_at UPDATE keys on the CONCRETE period (not the wildcard):
-            # only the row we just inserted under `period` is stamped, never a
-            # pre-011 NULL-period sibling (#137).
+            # alerted_at UPDATE keys on the CONCRETE (vendor, period) (not the
+            # wildcard): only the row we just inserted is stamped, never a
+            # pre-011 NULL-period sibling (#137) or another vendor's row (#143).
             conn.execute(
                 "UPDATE budget_milestones SET alerted_at = ? "
-                "WHERE week_start_at = ? AND period = ? AND threshold = ? "
-                "  AND alerted_at IS NULL",
-                (now_utc_iso(), week_key, period, t),
+                "WHERE vendor = ? AND period_start_at = ? AND period = ? "
+                "  AND threshold = ? AND alerted_at IS NULL",
+                (now_utc_iso(), vendor, period_key, period, t),
             )
     conn.commit()
 
@@ -630,34 +630,36 @@ def _resolve_codex_budget_period_window(period, now_utc, config, tz):
     return c._resolve_calendar_window(period, now_utc, config, tz)
 
 
-def _codex_budget_crossings(
-    conn, *, period_key, period=None, thresholds, target, spent, now_utc
+def _budget_crossings(
+    conn, *, vendor, period_key, period=None, thresholds, target, spent, now_utc
 ):
-    """Shared INSERT-and-arm core for the Codex budget axis: for every
-    STILL-pending threshold that's been crossed at ``spent``, ``INSERT OR
-    IGNORE`` a milestone (commit=False) and — on the genuine-new-crossing winner
-    (rowcount==1) — stamp ``alerted_at`` in the SAME transaction (set-then-
-    dispatch), returning the list of crossings the caller must dispatch.
+    """Shared INSERT-and-arm core for the budget axis (both vendors, #143): for
+    every STILL-pending threshold that's been crossed at ``spent``, ``INSERT OR
+    IGNORE`` a milestone (commit=False) into the unified vendor-tagged table and —
+    on the genuine-new-crossing winner (rowcount==1) — stamp ``alerted_at`` in the
+    SAME transaction (set-then-dispatch), returning the list of crossings the
+    caller must dispatch.
 
     Pure of config/window resolution: both firing sites (record-usage +
-    opportunistic ``cctally budget``) feed the already-resolved ``period_key`` /
-    ``target`` / ``spent`` here, so the crossing arithmetic + the set-then-
-    dispatch invariant live in ONE place (plan §3.6 "one shared helper"). Does
-    NOT commit — the caller owns the single durable commit that bundles every
+    opportunistic ``cctally budget``), for either vendor, feed the
+    already-resolved ``vendor`` / ``period_key`` / ``target`` / ``spent`` here, so
+    the crossing arithmetic + the set-then-dispatch invariant live in ONE place.
+    Does NOT commit — the caller owns the single durable commit that bundles every
     INSERT with its ``alerted_at`` UPDATE. Applies the +1e-9 float-floor snap
     (CLAUDE.md gotcha). Returns ``[(threshold, crossed_at, spent, target,
     consumption_pct), ...]`` for the rowcount==1 winners only.
 
     Forward-only / fire-once is enforced by INSERT OR IGNORE's rowcount on the
-    UNIQUE(period_start_at, period, threshold) key; a racing record-usage
+    UNIQUE(vendor, period_start_at, period, threshold) key; a racing record-usage
     instance OR an already-recorded threshold gets rowcount==0 and is skipped
     ([Dedup mustn't gate side effects])."""
     consumption_pct = (spent / target * 100.0) if target > 0 else 0.0
     fired: "list" = []
     for t in sorted(thresholds):
         if consumption_pct + 1e-9 >= t:
-            inserted = insert_codex_budget_milestone(
+            inserted = insert_budget_milestone(
                 conn,
+                vendor=vendor,
                 period_start_at=period_key,
                 period=period,
                 threshold=t,
@@ -668,61 +670,17 @@ def _codex_budget_crossings(
             )
             if inserted == 1:
                 crossed_at = now_utc_iso()
-                # alerted_at UPDATE keys on the CONCRETE period (#137): only the
-                # row just inserted under `period` is stamped, never a pre-011
-                # NULL-period sibling.
+                # alerted_at UPDATE keys on the CONCRETE (vendor, period) (#137 /
+                # #143): only the row just inserted is stamped, never a pre-011
+                # NULL-period sibling or another vendor's row.
                 conn.execute(
-                    "UPDATE codex_budget_milestones SET alerted_at = ? "
-                    "WHERE period_start_at = ? AND period = ? AND threshold = ? "
-                    "  AND alerted_at IS NULL",
-                    (crossed_at, period_key, period, t),
+                    "UPDATE budget_milestones SET alerted_at = ? "
+                    "WHERE vendor = ? AND period_start_at = ? AND period = ? "
+                    "  AND threshold = ? AND alerted_at IS NULL",
+                    (crossed_at, vendor, period_key, period, t),
                 )
                 fired.append((t, crossed_at, spent, target, consumption_pct))
     return fired
-
-
-def _reconcile_codex_budget_milestones_on_set(
-    conn, *, target, thresholds, now_utc, period, config, tz
-):
-    """Forward-only-from-set reconcile for the Codex budget axis (spec §6),
-    mirroring :func:`_reconcile_budget_milestones_on_set` but keyed on the
-    resolved CALENDAR period window instead of the subscription week.
-
-    On a Codex `budget set` (or `config set budget.codex`), every threshold
-    ALREADY crossed for the current period is recorded with ``alerted_at`` SET
-    but WITHOUT dispatch — so setting a Codex budget mid-month while already over
-    does NOT instant-popup; a mid-period amount change never re-alerts an
-    already-fired threshold (deduped via UNIQUE(period_start_at, period,
-    threshold) + the ``alerted_at IS NULL`` UPDATE guard). Thresholds not yet
-    crossed get NO row, so they fire later via
-    :func:`maybe_record_codex_budget_milestone`."""
-    c = _cctally()
-    start_at, _end_at = _resolve_codex_budget_period_window(
-        period, now_utc, config, tz
-    )
-    period_key = start_at.isoformat(timespec="seconds")
-    spent = c._sum_codex_cost_for_range(start_at, now_utc)
-    consumption_pct = (spent / target * 100.0) if target > 0 else 0.0
-    for t in sorted(thresholds):
-        if consumption_pct + 1e-9 >= t:
-            insert_codex_budget_milestone(
-                conn,
-                period_start_at=period_key,
-                period=period,
-                threshold=t,
-                budget_usd=target,
-                spent_usd=spent,
-                consumption_pct=consumption_pct,
-                commit=False,
-            )
-            # alerted_at UPDATE keys on the CONCRETE period (#137).
-            conn.execute(
-                "UPDATE codex_budget_milestones SET alerted_at = ? "
-                "WHERE period_start_at = ? AND period = ? AND threshold = ? "
-                "  AND alerted_at IS NULL",
-                (now_utc_iso(), period_key, period, t),
-            )
-    conn.commit()
 
 
 def _reconcile_codex_budget_on_config_write(validated_budget):
@@ -745,8 +703,9 @@ def _reconcile_codex_budget_on_config_write(validated_budget):
         tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)
         conn = open_db()
         try:
-            _reconcile_codex_budget_milestones_on_set(
+            _reconcile_budget_milestones_on_set(
                 conn,
+                vendor="codex",
                 target=codex["amount_usd"],
                 thresholds=thresholds,
                 now_utc=_command_as_of(),
@@ -779,6 +738,7 @@ def _reconcile_budget_on_config_write(validated_budget):
         try:
             _reconcile_budget_milestones_on_set(
                 conn,
+                vendor="claude",
                 target=validated_budget["weekly_usd"],
                 thresholds=thresholds,
                 now_utc=_command_as_of(),
