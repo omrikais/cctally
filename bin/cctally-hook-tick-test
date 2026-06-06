@@ -151,10 +151,21 @@ mkdir -p "$shell_test_fake/.claude" "$shell_test_fake/.local/share/cctally"
 printf '{"hook_event_name":"PostToolBatch","session_id":"shellasynctest"}' \
     | HOME="$shell_test_fake" TZ=Etc/UTC /bin/sh -c "$HARNESS_BIN hook-tick --no-oauth"
 log_file="$shell_test_fake/.local/share/cctally/logs/hook-tick.log"
-# hook-tick forks; poll up to ~2s for the child to write the log line.
-# Replaces a fixed `sleep 0.5` that flaked on slow runners.
-for _ in $(seq 1 20); do
-    if [ -s "$log_file" ]; then break; fi
+# hook-tick forks; poll up to ~5s for the child to write the EVENT line.
+# Poll for the actual tokens, NOT bare file non-emptiness: the child may
+# write a `[cache] migrated codex cache — re-ingesting` diagnostic line to
+# hook-tick.log BEFORE the event line (a fresh temp-HOME cache.db migrates
+# every run). Breaking on `[ -s ]` then grepping raced — under parallel CI
+# load (jobs=4 on the self-hosted runner) the poll broke on the cache line
+# and the grep missed the not-yet-written event line, flaking this scenario.
+# Polling for the tokens themselves is race-free and waiting longer is
+# harmless (the loop exits the instant the event line lands).
+for _ in $(seq 1 50); do
+    if [ -s "$log_file" ] \
+       && grep -q "event=PostToolBatch" "$log_file" \
+       && grep -q "session=shellasy" "$log_file"; then
+        break
+    fi
     sleep 0.1
 done
 if [ -s "$log_file" ] && grep -q "event=PostToolBatch" "$log_file" && grep -q "session=shellasy" "$log_file"; then
