@@ -58,6 +58,12 @@ FIX_DIR="$REPO_ROOT/tests/fixtures/dashboard"
 # shellcheck source=bin/_lib-golden-diff.sh
 . "$REPO_ROOT/bin/_lib-golden-diff.sh"
 
+# Bounded server teardown (issue #153): SIGTERM -> grace poll -> SIGKILL, so a
+# server that drops a single SIGTERM (CPython signal/Event lost-wakeup race)
+# can't hang the suite on an unbounded `wait`. export -f'd below for the xargs
+# `bash -c` workers. shellcheck source=bin/_lib-kill-server.sh
+. "$REPO_ROOT/bin/_lib-kill-server.sh"
+
 default_jobs() {
     local n
     n=$(sysctl -n hw.ncpu 2>/dev/null) || n=$(nproc 2>/dev/null) || n=4
@@ -80,10 +86,7 @@ fail_count=0
 declare -a BG_PIDS=()
 cleanup () {
     for p in "${BG_PIDS[@]:-}"; do
-        [ -n "$p" ] && kill "$p" 2>/dev/null || true
-    done
-    for p in "${BG_PIDS[@]:-}"; do
-        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+        [ -n "$p" ] && kill_server_bounded "$p"
     done
     rm -rf "$SCRATCH_ROOT"
 }
@@ -256,8 +259,7 @@ _run_scenario_inner () {
     if [ -z "$port" ]; then
         echo "FAIL $name: could not discover port (log: $log)"
         sed 's/^/    /' "$log" || true
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
+        kill_server_bounded "$pid"
         return 1
     fi
 
@@ -723,8 +725,7 @@ print(label)
         ok=0
     fi
 
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    kill_server_bounded "$pid"
     rm -f "$log"
 
     if [ "$ok" = "1" ]; then
@@ -758,6 +759,7 @@ run_scenario () {
 # to the old sequential version.
 fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret)
 export -f _run_scenario_inner run_scenario normalize_json normalize_session_json
+export -f kill_server_bounded
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.
 export -f _golden_diff_files _golden_diff_str _golden_diff_two_str
 export FIX_DIR BIN SCRATCH_ROOT
@@ -809,8 +811,7 @@ wait_for_banner_then_kill () {
         fi
         sleep 0.1
     done
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    kill_server_bounded "$pid"
 }
 
 # Banner scenarios (Task 2). Each launches the dashboard against an

@@ -43,6 +43,10 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$REPO_ROOT/bin/cctally"
+# Bounded server teardown (issue #153): SIGTERM -> grace poll -> SIGKILL, so a
+# dropped single SIGTERM (CPython signal/Event lost-wakeup race) can't hang the
+# suite on an unbounded `wait`. shellcheck source=bin/_lib-kill-server.sh
+. "$REPO_ROOT/bin/_lib-kill-server.sh"
 # Each case binds an ephemeral port (--port 0) and parses the actual
 # port from the "serving …" banner. Avoids EADDRINUSE flakes between
 # rapid case-to-case restarts (TIME_WAIT after kill, or stale daemon
@@ -57,10 +61,7 @@ declare -a BG_PIDS=()
 declare -a SCRATCH_HOMES=()
 cleanup () {
     for p in "${BG_PIDS[@]:-}"; do
-        [ -n "$p" ] && kill "$p" 2>/dev/null || true
-    done
-    for p in "${BG_PIDS[@]:-}"; do
-        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+        [ -n "$p" ] && kill_server_bounded "$p"
     done
     for h in "${SCRATCH_HOMES[@]:-}"; do
         [ -n "$h" ] && rm -rf "$h"
@@ -152,8 +153,7 @@ stop_server () {
     idx=$((n - 1))
     pid="${BG_PIDS[$idx]}"
     [ -z "$pid" ] && return 0
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    kill_server_bounded "$pid"
     # Brief settle so the next case's bind doesn't EADDRINUSE on
     # rapid case-to-case restart (TIME_WAIT after kill).
     sleep 0.5

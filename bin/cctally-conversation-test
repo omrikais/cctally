@@ -45,6 +45,11 @@ FIX_DIR="$REPO_ROOT/tests/fixtures/conversation"
 # shellcheck source=bin/_lib-golden-diff.sh
 . "$REPO_ROOT/bin/_lib-golden-diff.sh"
 
+# Bounded server teardown (issue #153): SIGTERM -> grace poll -> SIGKILL, so a
+# dropped single SIGTERM (CPython signal/Event lost-wakeup race) can't hang the
+# suite on an unbounded `wait`. shellcheck source=bin/_lib-kill-server.sh
+. "$REPO_ROOT/bin/_lib-kill-server.sh"
+
 # Per-run scratch root. The scenario's HOME is a clone of the in-tree fixture's
 # .local tree, so the dashboard server's startup writes (e.g. SQLite WAL) never
 # dirty the committed fixture.
@@ -57,10 +62,7 @@ fail_count=0
 declare -a BG_PIDS=()
 cleanup () {
     for p in "${BG_PIDS[@]:-}"; do
-        [ -n "$p" ] && kill "$p" 2>/dev/null || true
-    done
-    for p in "${BG_PIDS[@]:-}"; do
-        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+        [ -n "$p" ] && kill_server_bounded "$p"
     done
     rm -rf "$SCRATCH_ROOT"
 }
@@ -184,8 +186,7 @@ run_scenario () {
     if [ -z "$port" ]; then
         fail "could not discover port (log: $log)"
         sed 's/^/    /' "$log" 2>/dev/null || true
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
+        kill_server_bounded "$pid"
         return 1
     fi
 
@@ -349,8 +350,7 @@ print("ok")
         fail "gate: LAN-hostname Host /api/conversation/search returned $lan_search_code (expected 403)"
     fi
 
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    kill_server_bounded "$pid"
 
     if [ "$ok" = "1" ]; then
         echo "PASS $name"

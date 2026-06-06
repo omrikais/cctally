@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# Regression harness for the shared bounded-teardown helper
+# `kill_server_bounded` in bin/_lib-kill-server.sh (issue #153).
+#
+# Why this exists: cctally-dashboard-test / -conversation-test /
+# -settings-api-test all background a real `cctally dashboard` server and
+# tore it down with an UNBOUNDED `kill "$pid"; wait "$pid"`. CPython can
+# lose a single SIGTERM that races the main thread's `threading.Event.wait()`
+# (~0.04-0.07% per signal — proven during #153 triage), leaving a server
+# that a *single* SIGTERM never reaps. The unbounded `wait` then hangs the
+# whole suite forever (the symptom reported in #153). The fix is a shared
+# helper that escalates SIGTERM -> bounded poll -> SIGKILL (uncatchable),
+# guaranteeing teardown regardless of the server's signal-handling state.
+#
+# This harness drives the helper against two stub processes:
+#   - a SIGTERM-IGNORING stub (SIG_IGN) — models the lost-wakeup / wedged
+#     server. The helper MUST escalate to SIGKILL, reap it, return within
+#     ~grace, and emit a WARN. A watchdog force-kills the stub after a hard
+#     ceiling so a regressed (unbounded) helper FAILS LOUDLY instead of
+#     hanging this test.
+#   - a cooperative stub (default SIGTERM disposition = terminate) — the
+#     helper MUST reap it near-instantly, well under grace, with NO WARN
+#     and NO SIGKILL escalation.
+#
+# Emits the standard `passed: N   failed: M` summary so bin/cctally-test-all
+# aggregates it like every other harness.
+
+set -uo pipefail
+
+# Shared harness preamble (dev-instance isolation). This harness never invokes
+# the cctally binary — it drives the helper against python stubs — but every
+# bin/cctally-*-test must source it (enforced by
+# tests/test_harness_dev_autodetect_coverage.py).
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=bin/_lib-kill-server.sh
+. "$REPO_ROOT/bin/_lib-kill-server.sh"
+
+pass_count=0
+fail_count=0
+pass () { echo "PASS $1"; pass_count=$((pass_count + 1)); }
+fail () { echo "FAIL $1"; fail_count=$((fail_count + 1)); }
+
+SCRATCH=$(mktemp -d -t cctally-kill-server-test.XXXXXX)
+trap 'rm -rf "$SCRATCH"' EXIT
+
+# A stub that installs SIG_IGN for SIGTERM (cannot be killed by SIGTERM),
+# prints READY, then idles. Models a wedged/lost-wakeup dashboard server.
+# Sets STUB_PID in the CURRENT shell so the stub is a direct child and
+# `wait "$STUB_PID"` (inside the helper under test) is valid — spawning via
+# `$(...)` would make it a command-substitution-subshell child instead.
+spawn_ignore_term () {
+    python3 -c '
+import signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+sys.stdout.write("READY\n"); sys.stdout.flush()
+while True:
+    time.sleep(0.2)
+' >/dev/null 2>&1 &
+    STUB_PID=$!
+}
+
+# A stub with the default SIGTERM disposition (terminate). SIGTERM reaps it
+# immediately at the kernel level — no Python-level handler, so no
+# lost-wakeup window.
+spawn_cooperative () {
+    python3 -c '
+import sys, time
+sys.stdout.write("READY\n"); sys.stdout.flush()
+while True:
+    time.sleep(0.2)
+' >/dev/null 2>&1 &
+    STUB_PID=$!
+}
+
+wait_ready () {  # wait until the stub has printed READY (armed its handler)
+    local pid="$1" t=0
+    while [ $t -lt 100 ]; do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.05
+        t=$((t + 1))
+    done
+}
+
+now_ms () { python3 -c 'import time; print(int(time.time()*1000))'; }
+
+# ---------------------------------------------------------------------------
+# Test 1: SIGTERM-ignoring stub is reaped via SIGKILL escalation, bounded,
+#         with a WARN — and the helper returns before the hard ceiling.
+# ---------------------------------------------------------------------------
+test_wedged_server_escalates () {
+    local grace=2 ceiling=8
+    local errlog="$SCRATCH/warn1.txt"
+    local pid; spawn_ignore_term; pid=$STUB_PID
+    sleep 0.3  # let SIG_IGN install
+
+    # Hard-ceiling watchdog: if the helper hasn't returned by $ceiling, force
+    # the stub dead (so even an unbounded `wait` unblocks) and mark a timeout.
+    local timeout_marker="$SCRATCH/timed_out_1"
+    ( sleep "$ceiling"; : > "$timeout_marker"; kill -KILL "$pid" 2>/dev/null ) &
+    local wd=$!
+
+    local t0 t1
+    t0=$(now_ms)
+    kill_server_bounded "$pid" "$grace" 2>"$errlog"
+    t1=$(now_ms)
+    kill "$wd" 2>/dev/null || true
+    wait "$wd" 2>/dev/null || true
+
+    local elapsed=$((t1 - t0))
+
+    if [ -f "$timeout_marker" ]; then
+        fail "wedged: helper did not return within ${ceiling}s (unbounded teardown regression; elapsed=${elapsed}ms)"
+        return
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        fail "wedged: stub pid $pid still alive after helper returned"
+        kill -KILL "$pid" 2>/dev/null || true
+    else
+        pass "wedged: SIGTERM-ignoring server reaped (no hang)"
+    fi
+    # Bounded: should land near grace, comfortably under the ceiling.
+    if [ "$elapsed" -lt $((ceiling * 1000)) ]; then
+        pass "wedged: helper returned in ${elapsed}ms (< ${ceiling}s ceiling)"
+    else
+        fail "wedged: helper took ${elapsed}ms (>= ${ceiling}s ceiling)"
+    fi
+    if grep -qi "SIGKILL" "$errlog"; then
+        pass "wedged: emitted SIGKILL-escalation WARN"
+    else
+        fail "wedged: no SIGKILL-escalation WARN emitted (got: $(cat "$errlog"))"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Test 2: cooperative stub is reaped fast, well under grace, with NO WARN
+#         and NO needless SIGKILL wait.
+# ---------------------------------------------------------------------------
+test_cooperative_server_is_fast_and_quiet () {
+    local grace=5
+    local errlog="$SCRATCH/warn2.txt"
+    local pid; spawn_cooperative; pid=$STUB_PID
+    wait_ready "$pid"
+
+    local t0 t1
+    t0=$(now_ms)
+    kill_server_bounded "$pid" "$grace" 2>"$errlog"
+    t1=$(now_ms)
+    local elapsed=$((t1 - t0))
+
+    if kill -0 "$pid" 2>/dev/null; then
+        fail "cooperative: stub pid $pid still alive after helper returned"
+        kill -KILL "$pid" 2>/dev/null || true
+    else
+        pass "cooperative: server reaped"
+    fi
+    # Should be near-instant (<< grace). Allow generous 2s for CI jitter.
+    if [ "$elapsed" -lt 2000 ]; then
+        pass "cooperative: reaped fast (${elapsed}ms, did not burn the ${grace}s grace)"
+    else
+        fail "cooperative: took ${elapsed}ms (expected << ${grace}s grace)"
+    fi
+    if [ -s "$errlog" ]; then
+        fail "cooperative: emitted unexpected output: $(cat "$errlog")"
+    else
+        pass "cooperative: no WARN for a clean shutdown"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Test 3: empty / already-dead pid is a no-op that returns promptly.
+# ---------------------------------------------------------------------------
+test_empty_and_dead_pid_noop () {
+    kill_server_bounded "" 2 2>/dev/null
+    if [ $? -eq 0 ]; then pass "empty pid: no-op returns 0"; else fail "empty pid: non-zero return"; fi
+
+    local pid; spawn_cooperative; pid=$STUB_PID
+    wait_ready "$pid"
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true   # reap so it's truly gone
+    local t0 t1
+    t0=$(now_ms)
+    kill_server_bounded "$pid" 5 2>/dev/null
+    t1=$(now_ms)
+    if [ $(( t1 - t0 )) -lt 1500 ]; then
+        pass "dead pid: returns promptly (no grace burn)"
+    else
+        fail "dead pid: took $(( t1 - t0 ))ms"
+    fi
+}
+
+test_wedged_server_escalates
+test_cooperative_server_is_fast_and_quiet
+test_empty_and_dead_pid_noop
+
+echo
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" = "0" ]
