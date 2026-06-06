@@ -2,12 +2,27 @@
 TuiCurrentWeek.latest_snapshot_at."""
 import datetime as dt
 import pytest
-from conftest import load_script
+from conftest import load_script, redirect_paths
 
 
-@pytest.fixture(scope="module")
-def ns():
-    return load_script()
+@pytest.fixture
+def ns(monkeypatch, tmp_path):
+    """Isolated namespace (issue #144).
+
+    ``snapshot_to_envelope`` opens ``cache.db`` + ``stats.db`` for the
+    ``last_sync_at`` / freshness read even when handed a hand-built snapshot.
+    Pin the kernel path constants to ``tmp_path`` via ``redirect_paths`` so
+    those reads never touch the real ``~/.local/share/cctally`` (which leaks
+    and, on a dev checkout lagging the migration registry, trips the #142
+    prod-migration guard). Function-scoped — ``redirect_paths`` needs the
+    per-test ``monkeypatch`` / ``tmp_path`` fixtures, which can't bind to a
+    module-scoped fixture; the freshness assertions depend only on the
+    hand-built ``latest_snapshot_at`` vs ``now``, so a fresh empty tmp DB is
+    equivalent.
+    """
+    _ns = load_script()
+    redirect_paths(_ns, monkeypatch, tmp_path)
+    return _ns
 
 
 def _build_snap(ns, latest_at):

@@ -6,6 +6,9 @@
       90,
       100
     ],
+    "codex_budget_alerts_enabled": false,
+    "codex_budget_configured": false,
+    "codex_projected_enabled": false,
     "command_configured": false,
     "enabled": false,
     "five_hour_thresholds": [
@@ -112,6 +115,7 @@
     "total": 0
   },
   "sync_age_s": null,
+  "transcriptsEnabled": true,
   "trend": null,
   "update": "__UPDATE_BLOCK__",
   "weekly": {

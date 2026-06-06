@@ -1,5 +1,5 @@
 ## stdout
-stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 11 known
+stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 12 known
   · 001_five_hour_block_models_backfill_v1         pending
   · 002_five_hour_block_projects_backfill_v1       pending
   · 003_merge_5h_block_duplicates_v1               pending
@@ -10,11 +10,13 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 11 known
   · 008_recompute_weekly_cost_snapshots_dedup_fix  pending
   · 009_recompute_five_hour_blocks_dedup_fix       pending
   · 010_recompute_percent_milestones_dedup_fix     pending
-  · 011_test_failure_injection                     pending
+  · 011_budget_milestone_period_keys               pending
+  · 012_test_failure_injection                     pending
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 2 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 3 known
   · 001_dedup_highest_wins                         pending
-  · 002_test_cache_migration                       pending
+  · 002_conversation_messages_backfill             pending
+  · 003_test_cache_migration                       pending
 ## stderr
 
 ## exit

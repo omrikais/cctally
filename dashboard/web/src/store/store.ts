@@ -237,6 +237,13 @@ export interface AlertsConfig {
   // Per-project budget axis (issue #19/#121): single opt-in toggle mirrored
   // from the envelope's alerts_settings block. Defaults false.
   project_alerts_enabled?: boolean;
+  // Codex budget toggles (#134): mirrored from the persisted `budget.codex`
+  // block. `codex_budget_configured` gates the two dashboard-writable
+  // toggles (disabled-with-hint when no Codex budget exists); the two
+  // `*_enabled` fields seed them. All default false.
+  codex_budget_configured?: boolean;
+  codex_budget_alerts_enabled?: boolean;
+  codex_projected_enabled?: boolean;
   // Notifier dispatch backend (Phase B): mirrored from the envelope so
   // SettingsOverlay can seed the dropdown. Optional; defaults to 'auto'.
   // The raw `command_template` is NEVER mirrored — only `command_configured`
@@ -394,6 +401,9 @@ function defaultAlertsConfig(): AlertsConfig {
     projected_weekly_enabled: false,
     projected_budget_enabled: false,
     project_alerts_enabled: false,
+    codex_budget_configured: false,
+    codex_budget_alerts_enabled: false,
+    codex_projected_enabled: false,
   };
 }
 

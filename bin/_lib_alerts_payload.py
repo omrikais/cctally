@@ -222,13 +222,23 @@ def _build_alert_payload_budget(
     budget_usd: float,
     spent_usd: float,
     consumption_pct: float,
+    period: str = "subscription-week",
 ) -> dict:
     """Build the alert payload for an equiv-$ budget threshold crossing.
 
     See ``_build_alert_payload_weekly`` for the ``alerted_at == crossed_at``
     rationale (set-then-dispatch invariant). ``axis: "budget"`` is the third
     alert axis (Task 4 surfaces it in the dashboard Recent-alerts panel).
-    """
+
+    ``period`` defaults to ``subscription-week`` (the existing behavior — a
+    calendar-period-codex-budgets generalization, spec §6). The ``week_start_at``
+    key column carries the resolved PERIOD-start instant for a calendar period
+    (the name stays a back-compat misnomer, like ``weekly_usd``); the
+    additive ``period`` + ``period_start_at`` context fields let the dashboard
+    (Task 4) label "Month" / "Calendar week" instead of the hardcoded "Week".
+    The legacy subscription-week case is byte-stable on the rendered text — the
+    new context keys are purely additive and consumed only by the period-aware
+    label fix."""
     return {
         "id": f"budget:{week_start_at}:{threshold}",
         "axis": "budget",
@@ -237,6 +247,8 @@ def _build_alert_payload_budget(
         "alerted_at": crossed_at_utc,  # set-then-dispatch
         "context": {
             "week_start_at": week_start_at,
+            "period": str(period),
+            "period_start_at": week_start_at,
             "budget_usd": float(budget_usd),
             "spent_usd": float(spent_usd),
             "consumption_pct": float(consumption_pct),
@@ -314,6 +326,78 @@ def _build_alert_payload_project_budget(
     }
 
 
+def _alert_text_codex_budget(
+    payload: dict, tz: "ZoneInfo | None"
+) -> tuple[str, str, str]:
+    """Build (title, subtitle, body) for a Codex budget threshold alert (axis
+    ``codex_budget``, the sixth alert axis; calendar-period-codex-budgets spec
+    §6).
+
+    Mirrors :func:`_alert_text_budget` but labels the vendor (Codex) and the
+    civil period (Month / Calendar week) read from the period context so the
+    notification reads apart from a Claude budget alert. The rendered numbers
+    come from the payload (snapshotted at crossing), never live config that may
+    have changed since. ``period_start_at`` is an instant but the text doesn't
+    render it as a clock time, so no ``format_display_dt`` call is needed; ``tz``
+    is accepted for signature parity with peer ``_alert_text_*`` builders and
+    intentionally unused (same as ``_alert_text_budget``)."""
+    threshold = int(payload["threshold"])
+    ctx = payload.get("context") or {}
+    period = ctx.get("period")
+    period_label = {
+        "calendar-month": "this month",
+        "calendar-week": "this week",
+    }.get(period, "this period")
+    title = "cctally - Codex budget"
+    subtitle = f"{threshold}% of Codex budget ({period_label})"
+    spent = float(ctx.get("spent_usd") or 0.0)
+    budget = float(ctx.get("budget_usd") or 0.0)
+    consumption = float(ctx.get("consumption_pct") or 0.0)
+    body = (
+        f"Codex - ${spent:,.2f} of ${budget:,.2f} "
+        f"({consumption:.0f}% of budget)"
+    )
+    return title, subtitle, body
+
+
+def _build_alert_payload_codex_budget(
+    *,
+    threshold: int,
+    crossed_at_utc: str,
+    period_start_at: str,
+    period: str,
+    budget_usd: float,
+    spent_usd: float,
+    consumption_pct: float,
+) -> dict:
+    """Build the alert payload for a Codex budget threshold crossing (axis
+    ``codex_budget``, the sixth alert axis; spec §6).
+
+    Mirrors :func:`_build_alert_payload_budget` but keyed on the resolved
+    CALENDAR-period window (``period_start_at`` in place of ``week_start_at``)
+    and carrying the period DISCRIMINATOR (``period`` = calendar-week /
+    calendar-month) in the context so the dashboard (Task 4) labels Month /
+    Calendar week instead of the hardcoded "Week". See
+    :func:`_build_alert_payload_weekly` for the ``alerted_at == crossed_at``
+    rationale (set-then-dispatch invariant). The dashboard envelope (Task 4)
+    surfaces this axis in the Recent-alerts panel from the row-sourced context.
+    """
+    return {
+        "id": f"codex_budget:{period_start_at}:{threshold}",
+        "axis": "codex_budget",
+        "threshold": int(threshold),
+        "crossed_at": crossed_at_utc,
+        "alerted_at": crossed_at_utc,  # set-then-dispatch
+        "context": {
+            "period": str(period),
+            "period_start_at": period_start_at,
+            "budget_usd": float(budget_usd),
+            "spent_usd": float(spent_usd),
+            "consumption_pct": float(consumption_pct),
+        },
+    }
+
+
 def _alert_text_projected(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, str]:
     """Build (title, subtitle, body) for a projected-pace alert (#121).
 
@@ -334,6 +418,13 @@ def _alert_text_projected(payload: dict, tz: "ZoneInfo | None") -> tuple[str, st
         title = f"cctally - projected to reach {t}% this week"
         subtitle = "On current pace (projection)"
         body = f"Projected ~{proj:.0f}% of cap by reset (week-average pace)"
+    elif metric == "codex_budget_usd":
+        title = "cctally - Codex projected to exceed budget"
+        subtitle = f"On current pace (projection) - {t}% of Codex budget"
+        body = (
+            f"Projected ${proj:,.2f} of ${denom:,.2f} Codex budget "
+            f"(period-average pace)"
+        )
     else:  # budget_usd
         title = "cctally - projected to exceed budget"
         subtitle = f"On current pace (projection) - {t}% of budget"
@@ -355,8 +446,9 @@ def _build_alert_payload_projected(
     """Build the alert payload for a projected-pace threshold crossing (#121).
 
     ``axis: "projected"`` is the fourth alert axis; ``metric`` discriminates
-    ``weekly_pct`` (denominator 100.0, "% of cap") from ``budget_usd``
-    (denominator = target_usd, "$ of budget"). The frontend renders context
+    ``weekly_pct`` (denominator 100.0, "% of cap") from ``budget_usd`` and
+    ``codex_budget_usd`` (denominator = target_usd, "$ of budget"; the codex
+    variant renders Codex-flavored text). The frontend renders context
     FROM these row-sourced fields (``metric`` / ``projected_value`` /
     ``denominator``), not from live config that may have changed since crossing
     (Codex P0-4). No ``crossed_at``/``alerted_at`` keys here: the projected

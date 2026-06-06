@@ -566,3 +566,75 @@ def test_recent_rate_clamped_to_week_no_last_week_leak(ns, monkeypatch):
     status = ns["compute_budget_status"](inputs)
     # Without the clamp this would project ~$2k EOW → "over". Clamped: "ok".
     assert status.verdict == "ok"
+
+
+# ── (#137) period column: collision-free key + NULL-row no-re-fire ────────
+
+
+def _milestone_rows_with_period(ns):
+    conn = ns["open_db"]()
+    try:
+        return conn.execute(
+            "SELECT week_start_at, period, threshold "
+            "FROM budget_milestones ORDER BY threshold, period"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_calendar_week_to_month_switch_no_collision(ns):
+    """Symptom 2: a calendar-week crossing at instant X must not block a later
+    calendar-month crossing at the SAME instant X (the period now discriminates
+    the UNIQUE key, so the second INSERT OR IGNORE returns rowcount 1)."""
+    X = "2026-06-01T00:00:00+00:00"
+    conn = ns["open_db"]()
+    try:
+        assert ns["insert_budget_milestone"](
+            conn, week_start_at=X, period="calendar-week", threshold=90,
+            budget_usd=100.0, spent_usd=92.0, consumption_pct=92.0, commit=True,
+        ) == 1
+        # Same instant, same threshold, DIFFERENT period → must NOT collide.
+        assert ns["insert_budget_milestone"](
+            conn, week_start_at=X, period="calendar-month", threshold=90,
+            budget_usd=300.0, spent_usd=280.0, consumption_pct=93.3, commit=True,
+        ) == 1
+        rows = conn.execute(
+            "SELECT period FROM budget_milestones WHERE week_start_at=? "
+            "AND threshold=90 ORDER BY period", (X,)
+        ).fetchall()
+        assert [r[0] for r in rows] == ["calendar-month", "calendar-week"]
+    finally:
+        conn.close()
+
+
+def test_null_period_row_does_not_refire(ns, monkeypatch):
+    """P1-1: a pre-011 NULL-period crossing for the CURRENT window must be read
+    as present by the firing pre-probe (``period = ? OR period IS NULL``) — no
+    spurious upgrade alert, no second row."""
+    _seed_window(ns)
+    _write_budget_config(ns, weekly_usd=300.0, thresholds=(90, 100))
+    captured = _patch_dispatch(ns, monkeypatch)
+    _patch_spend(ns, monkeypatch, value=280.0)  # 93.3% — would cross 90
+
+    # Seed a pre-011 NULL-period row at the SAME window key + threshold the
+    # firing path will resolve, so the wildcard pre-probe must mask the re-cross.
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO budget_milestones (week_start_at, period, threshold, "
+            "budget_usd, spent_usd, consumption_pct, crossed_at_utc, alerted_at) "
+            "VALUES (?, NULL, 90, 300.0, 280.0, 93.3, ?, ?)",
+            (WEEK_KEY, "2026-06-05T00:00:00Z", "2026-06-05T00:00:00Z"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ns["maybe_record_budget_milestone"]({})
+
+    # The NULL row masks the 90 re-cross: no dispatch for 90, exactly one row.
+    assert all(p["threshold"] != 90 for p, _ in captured), captured
+    rows = _milestone_rows_with_period(ns)
+    threshold90 = [r for r in rows if r["threshold"] == 90]
+    assert len(threshold90) == 1, rows
+    assert threshold90[0]["period"] is None  # still the original NULL row

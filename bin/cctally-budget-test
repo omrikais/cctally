@@ -171,6 +171,19 @@ run_project_format_mode "per-project" "fmt-md-reveal" "--format md --reveal-proj
 run_project_format_mode "per-project-collision" "fmt-md-anon"   "--format md"                  "fmt-md-anon"
 run_project_format_mode "per-project-collision" "fmt-md-reveal" "--format md --reveal-projects" "fmt-md-reveal"
 
+# ── Codex share section (calendar-period + Codex budgets, spec §5) ──────────
+# The both-vendors fixture exercises the Codex budget share section (vendor-
+# level → nothing to anonymize) alongside the Claude block, in md/html/svg.
+run_project_format_mode "both-vendors" "fmt-md-light"   "--format md"               "fmt-md-light"
+run_project_format_mode "both-vendors" "fmt-html-light" "--format html --output -"  "fmt-html-light"
+run_project_format_mode "both-vendors" "fmt-svg-light"  "--format svg --output -"   "fmt-svg-light"
+
+# ── Claude calendar-period share label (code-review #3) ─────────────────────
+# A Claude calendar-MONTH share must title + label the CIVIL period
+# ("calendar month 2026-06") off the display-tz boundary — NOT the UTC-instant
+# "week of <month-1st>" date-range. Locks the latent share-label fix.
+run_project_format_mode "claude-calendar-month" "fmt-md-light" "--format md" "fmt-md-light"
+
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

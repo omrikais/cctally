@@ -211,6 +211,7 @@ def test_migration_handler_recomputes_parents_and_replace_all_children(
     conn = sqlite3.connect(work_stats)
     try:
         handler(conn)
+        db_module._stamp_applied(conn, "009_recompute_five_hour_blocks_dedup_fix")  # dispatcher now owns the stamp (#140)
 
         # Parent recompute: both blocks downward to real totals.
         rows = _block_rows(conn)
@@ -275,7 +276,9 @@ def test_migration_handler_idempotent_against_marker(
     conn = sqlite3.connect(work_stats)
     try:
         handler(conn)
+        db_module._stamp_applied(conn, "009_recompute_five_hour_blocks_dedup_fix")  # dispatcher now owns the stamp (#140)
         handler(conn)
+        db_module._stamp_applied(conn, "009_recompute_five_hour_blocks_dedup_fix")
         cnt = conn.execute(
             "SELECT COUNT(*) FROM schema_migrations "
             "WHERE name = '009_recompute_five_hour_blocks_dedup_fix'"

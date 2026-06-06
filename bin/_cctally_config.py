@@ -301,6 +301,7 @@ ALLOWED_CONFIG_KEYS = (
     "alerts.notifier",
     "alerts.command_template",
     "dashboard.bind",
+    "dashboard.expose_transcripts",
     "update.check.enabled",
     "update.check.ttl_hours",
     "statusline.visual_burn_rate",
@@ -310,8 +311,10 @@ ALLOWED_CONFIG_KEYS = (
     "budget.alerts_enabled",
     "budget.alert_thresholds",
     "budget.projected_enabled",
+    "budget.period",
     "budget.projects",
     "budget.project_alerts_enabled",
+    "budget.codex",
 )
 
 
@@ -449,6 +452,32 @@ def _config_known_value(config: dict, key: str) -> "object":
             # Hand-edited junk: surface the default rather than the bad value;
             # `cmd_dashboard` warns at server-start when it hits the same path.
             return "loopback"
+    if key == "dashboard.expose_transcripts":
+        # Boolean opt-in (Plan 2, spec §5). Default False — transcript
+        # endpoints are served only over loopback unless this is true (LAN
+        # exposure). A hand-edited junk value surfaces the default, mirroring
+        # dashboard.bind.
+        block = config.get("dashboard") if isinstance(config, dict) else None
+        if not isinstance(block, dict):
+            block = {}
+        stored = block.get("expose_transcripts")
+        if stored is None:
+            return False
+        # Config stores a JSON bool; the shared string-normalizer
+        # (_normalize_alerts_enabled_value) only tolerates str spellings,
+        # so short-circuit a real bool here rather than re-forking it.
+        if isinstance(stored, bool):
+            return stored
+        # Only str spellings are normalizable. Any other JSON scalar/container
+        # (int/float/list/dict) must surface the default — NOT crash: the shared
+        # normalizer does ``(raw or "").strip()``, which raises AttributeError
+        # (uncaught by ``except ValueError``) on e.g. a hand-edited bare ``1``.
+        if isinstance(stored, str):
+            try:
+                return c._normalize_alerts_enabled_value(stored)
+            except ValueError:
+                return False
+        return False
     if key in ("update.check.enabled", "update.check.ttl_hours"):
         # Defaults mirror `_is_update_check_due` (True / 24 hours).
         # Hand-edited junk surfaces as the default — matches dashboard.bind.
@@ -501,8 +530,10 @@ def _config_known_value(config: dict, key: str) -> "object":
         "budget.alerts_enabled",
         "budget.alert_thresholds",
         "budget.projected_enabled",
+        "budget.period",
         "budget.projects",
         "budget.project_alerts_enabled",
+        "budget.codex",
     ):
         inner = key.split(".", 1)[1]
         # Read the validated, defaults-filled block. A corrupt block falls
@@ -533,7 +564,7 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
     # (including None) must survive into the render layer — the generic
     # None->"" coercion below would break the JSON shape / round-trip.
     def _coerce(k: str, v: "object") -> "object":
-        if k in ("alerts.command_template", "budget.projects"):
+        if k in ("alerts.command_template", "budget.projects", "budget.codex"):
             return v
         return v if v is not None else ""
 
@@ -562,11 +593,14 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
         for k, v in pairs:
             # Preserve canonical bool stringification (true/false) so
             # round-trips via `config set alerts.enabled <plain-text>` work.
-            if k in ("alerts.command_template", "budget.projects"):
+            if k in (
+                "alerts.command_template", "budget.projects", "budget.codex"
+            ):
                 # JSON-encoded so `config get` output round-trips through the
                 # matching `config set` branch (both JSON-parse their value).
                 # `alerts.command_template` is a list-of-strings|null;
-                # `budget.projects` is an object {git-root: usd}.
+                # `budget.projects` is an object {git-root: usd};
+                # `budget.codex` is an object|null (the no-budget sentinel).
                 rendered = json.dumps(v)
             elif isinstance(v, bool):
                 rendered = "true" if v else "false"
@@ -787,6 +821,49 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         else:
             print(f"dashboard.bind={canonical}")
         return 0
+    if key == "dashboard.expose_transcripts":
+        # Same read-modify-write posture as dashboard.bind: validate first,
+        # then write under config_writer_lock with _load_config_unlocked
+        # (calling load_config inside the writer-lock self-deadlocks per the
+        # CLAUDE.md gotcha — fcntl.flock is per-fd, not per-process). Preserves
+        # a sibling dashboard.bind in the same parent block.
+        # Reuse the shared bool-normalizer (DRY with alerts.enabled); it
+        # hardcodes "alerts.enabled" in its ValueError text, so catch +
+        # re-message with the actual key name (mirrors alerts.projected_enabled).
+        try:
+            canonical = c._normalize_alerts_enabled_value(raw)
+        except ValueError:
+            print(
+                f"cctally: invalid boolean value for dashboard.expose_transcripts: "
+                f"{raw!r} (expected true|false|yes|no|1|0|on|off)",
+                file=sys.stderr,
+            )
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing = config.get("dashboard")
+            if existing is not None and not isinstance(existing, dict):
+                print(
+                    "cctally: dashboard config error: dashboard must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            block = dict(existing or {})
+            block["expose_transcripts"] = canonical
+            config["dashboard"] = block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(
+                json.dumps(
+                    {"dashboard": {"expose_transcripts": canonical}}, indent=2
+                )
+            )
+        else:
+            print(
+                f"dashboard.expose_transcripts="
+                f"{'true' if canonical else 'false'}"
+            )
+        return 0
     if key in (
         "statusline.visual_burn_rate",
         "statusline.cost_source",
@@ -877,8 +954,10 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         "budget.alerts_enabled",
         "budget.alert_thresholds",
         "budget.projected_enabled",
+        "budget.period",
         "budget.projects",
         "budget.project_alerts_enabled",
+        "budget.codex",
     ):
         inner_key = key.split(".", 1)[1]
         # Parse + normalize the raw value per key BEFORE acquiring the lock so
@@ -912,6 +991,36 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                     f"got {raw!r}"
                 )
                 return 2
+        elif inner_key == "period":
+            # `budget.period` is a plain string leaf. The enum check lives in
+            # _get_budget_config under the lock below (so a bad value is a
+            # clean exit-2 with the canonical message); here we just pass the
+            # raw token through.
+            new_val = raw.strip()
+        elif inner_key == "codex":
+            # `budget.codex` is a nested object (or null = no Codex budget),
+            # which the plain leaves can't round-trip — JSON-parse it (mirrors
+            # the budget.projects branch). The shape/period/amount rules are
+            # enforced by _get_budget_config under the lock below; here we only
+            # reject non-JSON and coerce the null sentinel.
+            if raw.strip().lower() in {"null", "none"}:
+                new_val = None
+            else:
+                try:
+                    parsed_codex = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    eprint(
+                        "cctally config: budget.codex must be a JSON object or "
+                        f"null, got {raw!r}"
+                    )
+                    return 2
+                if parsed_codex is not None and not isinstance(parsed_codex, dict):
+                    eprint(
+                        "cctally config: budget.codex must be a JSON object or "
+                        "null"
+                    )
+                    return 2
+                new_val = parsed_codex
         elif inner_key == "projects":
             # `budget.projects` is a dict {git-root: usd}, which the plain
             # number/bool/list leaves can't round-trip — JSON-parse it (mirrors
@@ -995,25 +1104,41 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         # on `budget.weekly_usd` — would latch a currently-over-but-not-yet-
         # dispatched threshold as already-alerted, permanently suppressing the
         # next record-usage tick's dispatch. The global axis feeds on
-        # weekly_usd/alerts_enabled/alert_thresholds; the per-project axis on
-        # projects/project_alerts_enabled/alert_thresholds (alert_thresholds is
-        # shared; projected_enabled belongs to neither reconcile). Both run
-        # OUTSIDE config_writer_lock (each helper has its own open_db lock).
-        if inner_key in ("weekly_usd", "alerts_enabled", "alert_thresholds"):
+        # weekly_usd/alerts_enabled/alert_thresholds/period; the per-project axis
+        # on projects/project_alerts_enabled/alert_thresholds (alert_thresholds
+        # is shared; projected_enabled belongs to neither reconcile). `period` is
+        # in the global set because changing it re-keys the milestone window
+        # (calendar period-start instant vs subscription-week); without the
+        # reconcile, switching period while already over a threshold would
+        # instant-popup on the next record-usage tick — the exact case the
+        # forward-only-from-set reconcile prevents (`budget set --period` already
+        # reconciles via the same helper). Both run OUTSIDE config_writer_lock
+        # (each helper has its own open_db lock).
+        if inner_key in (
+            "weekly_usd", "alerts_enabled", "alert_thresholds", "period"
+        ):
             c._reconcile_budget_on_config_write(validated)
         if inner_key in (
             "projects", "project_alerts_enabled", "alert_thresholds"
         ):
             c._reconcile_project_budget_milestones_on_write(validated)
+        # Codex budget axis (spec §6): the nested budget.codex block is set
+        # wholesale via `config set budget.codex '<json>'`, so the only key that
+        # touches it is `codex` itself. Gated on the codex block carrying
+        # alerts_enabled + thresholds (the helper re-checks); records nothing
+        # otherwise.
+        if inner_key == "codex":
+            c._reconcile_codex_budget_on_config_write(validated)
         out_val = validated[inner_key]
         if getattr(args, "emit_json", False):
             print(json.dumps({"budget": {inner_key: out_val}}, indent=2))
         else:
             if isinstance(out_val, bool):
                 rendered = "true" if out_val else "false"
-            elif inner_key == "projects":
-                # JSON so `config get budget.projects` round-trips back through
-                # this branch (str(dict) is not valid JSON).
+            elif inner_key in ("projects", "codex"):
+                # JSON so `config get budget.{projects,codex}` round-trips back
+                # through this branch (str(dict)/None is not valid JSON; the
+                # codex no-budget sentinel renders as `null`).
                 rendered = json.dumps(out_val)
             else:
                 rendered = str(out_val)
@@ -1096,6 +1221,21 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                 save_config(config)
             # idempotent: silent on missing key
         return 0
+    if key == "dashboard.expose_transcripts":
+        # Mirror the dashboard.bind unset branch: drop only the
+        # expose_transcripts leaf; if the dashboard block ends up empty, drop
+        # the parent too so config.json stays tidy. A sibling dashboard.bind
+        # survives.
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            block = config.get("dashboard")
+            if isinstance(block, dict) and "expose_transcripts" in block:
+                del block["expose_transcripts"]
+                if not block:
+                    config.pop("dashboard", None)
+                save_config(config)
+            # idempotent: silent on missing key
+        return 0
     if key in (
         "statusline.visual_burn_rate",
         "statusline.cost_source",
@@ -1137,8 +1277,10 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
         "budget.alerts_enabled",
         "budget.alert_thresholds",
         "budget.projected_enabled",
+        "budget.period",
         "budget.projects",
         "budget.project_alerts_enabled",
+        "budget.codex",
     ):
         # Drop only the named leaf; preserve sibling budget.* keys (e.g.
         # unsetting weekly_usd keeps a customized alert_thresholds). If the

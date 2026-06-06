@@ -1,0 +1,14 @@
+# Conversation-viewer endpoint fixtures (Plan 2, §6.8).
+#
+# The committed per-scenario tree is ONLY:
+#   <scenario>/input.env
+#   <scenario>/golden-*.json
+#
+# The seeded SQLite DBs are rebuilt by bin/build-conversation-fixtures.py on
+# every harness run (bin/cctally-conversation-test), so they are NOT committed —
+# ignore the cache.db / stats.db + their WAL/SHM sidecars + any fake-HOME .local
+# tree the harness clones into scratch. Keeps the working tree clean after a run.
+*.db
+*.db-wal
+*.db-shm
+*/.local/

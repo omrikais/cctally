@@ -33,6 +33,54 @@ def project_linear(
     return (current + rate_low * remaining, current + rate_high * remaining)
 
 
+def calendar_month_window(
+    now: dt.datetime, tz: dt.tzinfo
+) -> tuple[dt.datetime, dt.datetime]:
+    """Civil month window in ``tz``, returned as UTC-normalized instants.
+
+    Pure; no I/O. ``now`` is a tz-aware datetime and ``tz`` a tzinfo. Returns
+    ``(start_utc, end_utc)`` where ``start`` = the 1st of ``now``'s civil month
+    at 00:00 local and ``end`` = the 1st of the *next* month at 00:00 local
+    (civil rollover via ``(year, month + 1)`` with year carry — NEVER a fixed
+    ``timedelta(days=30)``, so 28/29/30/31-day months and Dec→Jan are exact),
+    both converted to UTC so the kernel's elapsed-seconds math stays single-tz.
+    """
+    local = now.astimezone(tz)
+    start_local = local.replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    if start_local.month == 12:
+        end_local = start_local.replace(year=start_local.year + 1, month=1)
+    else:
+        end_local = start_local.replace(month=start_local.month + 1)
+    return (
+        start_local.astimezone(dt.timezone.utc),
+        end_local.astimezone(dt.timezone.utc),
+    )
+
+
+def calendar_week_window(
+    now: dt.datetime, tz: dt.tzinfo, week_start_idx: int
+) -> tuple[dt.datetime, dt.datetime]:
+    """Civil week window in ``tz`` anchored on ``week_start_idx`` (Mon=0..Sun=6),
+    returned as UTC-normalized instants.
+
+    Pure; no I/O. Snaps ``now``'s local date back to the most recent
+    ``week_start_idx`` weekday at 00:00 local via ``(weekday − start_idx) % 7``,
+    then adds the 7-day delta to the *aware local* start so a DST week is a true
+    167h/169h span before normalizing both ends to UTC.
+    """
+    local = now.astimezone(tz)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    diff = (midnight.weekday() - week_start_idx) % 7
+    start_local = midnight - dt.timedelta(days=diff)
+    end_local = start_local + dt.timedelta(days=7)
+    return (
+        start_local.astimezone(dt.timezone.utc),
+        end_local.astimezone(dt.timezone.utc),
+    )
+
+
 @dataclass(frozen=True)
 class BudgetInputs:
     target_usd: float

@@ -13,7 +13,7 @@ axis landed (``tests/test_alert_axes_kernel.py`` is Python-only; spec §5.5 /
 Codex P2-3). This test parses the TS maps out of ``alertAxis.ts`` (a light
 regex parse — the dashboard build is the only Node surface in the repo and we
 do not want a Node dependency in the Python suite) and asserts byte-equality
-with the Python registry for ALL FIVE axes. A future axis that drifts the chip
+with the Python registry for ALL SIX axes. A future axis that drifts the chip
 text on one side fails here.
 """
 from __future__ import annotations
@@ -76,6 +76,18 @@ def _parse_ts_record(source: str, const_name: str) -> dict[str, str]:
     return {k: v for k, v in pairs}
 
 
+# Axes whose chip/title labels exist on BOTH the Python and TS sides. As of
+# Task 4 (dashboard) this is the FULL registry: `codex_budget` landed in the
+# Python registry in Task 3 (alert axis) and its TS entry (alertAxis.ts) landed
+# in Task 4, so the cross-language byte-equality assertion below now covers every
+# axis (including codex_budget). A future axis that drifts the chip text on one
+# side — or lands on only one side — fails here.
+_TS_PRESENT_AXES = {
+    "weekly", "five_hour", "budget", "projected", "project_budget",
+    "codex_budget",
+}
+
+
 def test_chip_and_title_labels_match_python_registry():
     m = _load("_lib_alert_axes")
     py_chip = {d.id: d.chip_label for d in m.AXIS_REGISTRY}
@@ -85,13 +97,14 @@ def test_chip_and_title_labels_match_python_registry():
     ts_chip = _parse_ts_record(source, "AXIS_CHIP_LABEL")
     ts_title = _parse_ts_record(source, "AXIS_TITLE_LABEL")
 
-    # All five axes present on both sides — guards against a one-sided add.
-    assert set(py_chip) == set(ts_chip) == {
-        "weekly", "five_hour", "budget", "projected", "project_budget",
-    }
-    # Byte-identical chip + title labels for every axis.
-    assert py_chip == ts_chip, (py_chip, ts_chip)
-    assert py_title == ts_title, (py_title, ts_title)
+    # The TS side carries exactly the cross-language-shared axes (a one-sided
+    # add on EITHER side fails here). As of Task 4 this is the full registry, so
+    # the two sides are now equal sets (not Python-superset).
+    assert set(ts_chip) == _TS_PRESENT_AXES
+    assert set(py_chip) == _TS_PRESENT_AXES
+    # Byte-identical chip + title labels for every axis present on BOTH sides.
+    assert {k: py_chip[k] for k in _TS_PRESENT_AXES} == ts_chip, (py_chip, ts_chip)
+    assert {k: py_title[k] for k in _TS_PRESENT_AXES} == ts_title, (py_title, ts_title)
 
 
 def test_project_budget_axis_chip_is_PROJECT():

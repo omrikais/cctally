@@ -306,6 +306,8 @@ BudgetInputs = _lib_budget.BudgetInputs
 BudgetStatus = _lib_budget.BudgetStatus
 compute_budget_status = _lib_budget.compute_budget_status
 project_linear = _lib_budget.project_linear
+calendar_month_window = _lib_budget.calendar_month_window
+calendar_week_window = _lib_budget.calendar_week_window
 
 # CLAUDE_MODEL_CONTEXT_WINDOWS / …_DEFAULT_FAMILY moved to _cctally_statusline.py (re-exported below).
 
@@ -377,12 +379,14 @@ _alert_text_weekly = _lib_alerts_payload._alert_text_weekly
 _alert_text_five_hour = _lib_alerts_payload._alert_text_five_hour
 _alert_text_budget = _lib_alerts_payload._alert_text_budget
 _alert_text_project_budget = _lib_alerts_payload._alert_text_project_budget
+_alert_text_codex_budget = _lib_alerts_payload._alert_text_codex_budget
 _alert_text_projected = _lib_alerts_payload._alert_text_projected
 _escape_applescript_string = _lib_alerts_payload._escape_applescript_string
 _build_alert_payload_weekly = _lib_alerts_payload._build_alert_payload_weekly
 _build_alert_payload_five_hour = _lib_alerts_payload._build_alert_payload_five_hour
 _build_alert_payload_budget = _lib_alerts_payload._build_alert_payload_budget
 _build_alert_payload_project_budget = _lib_alerts_payload._build_alert_payload_project_budget
+_build_alert_payload_codex_budget = _lib_alerts_payload._build_alert_payload_codex_budget
 _build_alert_payload_projected = _lib_alerts_payload._build_alert_payload_projected
 
 _lib_alert_dispatch = _load_sibling("_lib_alert_dispatch")
@@ -736,6 +740,7 @@ add_column_if_missing = _cctally_db.add_column_if_missing
 _MIGRATION_NAME_RE = _cctally_db._MIGRATION_NAME_RE
 Migration = _cctally_db.Migration
 DowngradeDetected = _cctally_db.DowngradeDetected
+ProdMigrationRefused = _cctally_db.ProdMigrationRefused
 _STATS_MIGRATIONS = _cctally_db._STATS_MIGRATIONS
 _CACHE_MIGRATIONS = _cctally_db._CACHE_MIGRATIONS
 _make_migration_decorator = _cctally_db._make_migration_decorator
@@ -743,7 +748,9 @@ stats_migration = _cctally_db.stats_migration
 cache_migration = _cctally_db.cache_migration
 _LEGACY_MARKER_ALIASES_BY_DB = _cctally_db._LEGACY_MARKER_ALIASES_BY_DB
 _bootstrap_rename_legacy_markers = _cctally_db._bootstrap_rename_legacy_markers
+_stamp_applied = _cctally_db._stamp_applied
 _run_pending_migrations = _cctally_db._run_pending_migrations
+_recover_version_ahead = _cctally_db._recover_version_ahead
 _log_migration_error = _cctally_db._log_migration_error
 _clear_migration_error_log_entries = _cctally_db._clear_migration_error_log_entries
 _render_migration_error_banner = _cctally_db._render_migration_error_banner
@@ -757,6 +764,7 @@ _db_resolve_migration_name = _cctally_db._db_resolve_migration_name
 _db_path_for_label = _cctally_db._db_path_for_label
 cmd_db_skip = _cctally_db.cmd_db_skip
 cmd_db_unskip = _cctally_db.cmd_db_unskip
+cmd_db_recover = _cctally_db.cmd_db_recover
 
 
 # Session-entry cache subsystem (Claude + Codex) — read-through delta
@@ -782,6 +790,7 @@ IngestStats = _cctally_cache.IngestStats
 _progress_stderr = _cctally_cache._progress_stderr
 _ensure_session_files_row = _cctally_cache._ensure_session_files_row
 sync_cache = _cctally_cache.sync_cache
+backfill_conversation_messages = _cctally_cache.backfill_conversation_messages
 iter_entries = _cctally_cache.iter_entries
 _collect_entries_direct = _cctally_cache._collect_entries_direct
 _JoinedClaudeEntry = _cctally_cache._JoinedClaudeEntry
@@ -793,6 +802,7 @@ sync_codex_cache = _cctally_cache.sync_codex_cache
 iter_codex_entries = _cctally_cache.iter_codex_entries
 _collect_codex_entries_direct = _cctally_cache._collect_codex_entries_direct
 get_codex_entries = _cctally_cache.get_codex_entries
+_sum_codex_cost_for_range = _cctally_cache._sum_codex_cost_for_range
 get_entries = _cctally_cache.get_entries
 open_cache_db = _cctally_cache.open_cache_db
 cmd_cache_sync = _cctally_cache.cmd_cache_sync
@@ -822,6 +832,7 @@ _normalize_percent = _cctally_record._normalize_percent
 maybe_record_milestone = _cctally_record.maybe_record_milestone
 maybe_record_budget_milestone = _cctally_record.maybe_record_budget_milestone
 maybe_record_project_budget_milestone = _cctally_record.maybe_record_project_budget_milestone
+maybe_record_codex_budget_milestone = _cctally_record.maybe_record_codex_budget_milestone
 maybe_record_projected_alert = _cctally_record.maybe_record_projected_alert
 _weekly_pct_week_avg_projection = _cctally_record._weekly_pct_week_avg_projection
 _compute_block_totals = _cctally_record._compute_block_totals
@@ -1101,6 +1112,7 @@ _fetch_current_week_snapshots = _cctally_forecast._fetch_current_week_snapshots
 _apply_midweek_reset_override = _cctally_forecast._apply_midweek_reset_override
 _resolve_current_budget_window = _cctally_forecast._resolve_current_budget_window
 _build_budget_status_inputs = _cctally_forecast._build_budget_status_inputs
+_build_vendor_budget_inputs = _cctally_forecast._build_vendor_budget_inputs
 _select_dollars_per_percent = _cctally_forecast._select_dollars_per_percent
 _assess_forecast_confidence = _cctally_forecast._assess_forecast_confidence
 _pick_p_24h_ago = _cctally_forecast._pick_p_24h_ago
@@ -1115,6 +1127,12 @@ _forecast_color_enabled = _cctally_forecast._forecast_color_enabled
 _render_forecast_progress_bar = _cctally_forecast._render_forecast_progress_bar
 _render_forecast_terminal = _cctally_forecast._render_forecast_terminal
 _BUDGET_JSON_SCHEMA_VERSION = _cctally_forecast._BUDGET_JSON_SCHEMA_VERSION
+# Single-sourced `--period` spellings (code-review #5): the parser's `choices=`
+# derives from the same map the handler normalizer uses, so they can't drift.
+_BUDGET_PERIOD_ALIASES = _cctally_forecast._BUDGET_PERIOD_ALIASES
+_BUDGET_PERIOD_CHOICES = _cctally_forecast._BUDGET_PERIOD_CHOICES
+_normalize_budget_period = _cctally_forecast._normalize_budget_period
+_resolve_calendar_window = _cctally_forecast._resolve_calendar_window
 _cmd_budget_set = _cctally_forecast._cmd_budget_set
 _cmd_budget_unset = _cctally_forecast._cmd_budget_unset
 # Per-project budget set/unset (#19/#121, spec §4.3 / §7).
@@ -2084,6 +2102,12 @@ get_milestones_for_week             = _cctally_milestones.get_milestones_for_wee
 insert_percent_milestone            = _cctally_milestones.insert_percent_milestone            # record shim; idempotency-test mod.
 insert_budget_milestone             = _cctally_milestones.insert_budget_milestone             # record shim
 insert_project_budget_milestone     = _cctally_milestones.insert_project_budget_milestone     # record shim; project-budget-config-test ns[]
+insert_codex_budget_milestone       = _cctally_milestones.insert_codex_budget_milestone       # record shim; test_codex_budget_alerts ns[]
+_codex_budget_crossings             = _cctally_milestones._codex_budget_crossings             # record shim (shared INSERT-and-arm core for the codex_budget axis)
+_resolve_codex_budget_period_window = _cctally_milestones._resolve_codex_budget_period_window # record shim; milestones c. (codex period window)
+_reconcile_codex_budget_milestones_on_set = _cctally_milestones._reconcile_codex_budget_milestones_on_set  # test_codex_budget_alerts ns[]; forecast set/reconcile
+_reconcile_codex_budget_on_config_write = _cctally_milestones._reconcile_codex_budget_on_config_write  # forecast/config c. (forward-only codex-budget reconcile)
+_resolve_claude_budget_window       = _cctally_milestones._resolve_claude_budget_window       # record shim; milestones c. (period-aware Claude budget window)
 _project_crossings                  = _cctally_milestones._project_crossings                  # record shim; milestones c. (#130 firing/reconcile shared crossing arithmetic)
 insert_projected_milestone          = _cctally_milestones.insert_projected_milestone          # record shim
 _projected_levels_already_latched   = _cctally_milestones._projected_levels_already_latched   # record shim
@@ -2671,6 +2695,9 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     except DowngradeDetected as exc:
         eprint(f"cctally: {exc}")
+        return 2
+    except ProdMigrationRefused as exc:
+        eprint(f"{exc}")  # message already carries the 'cctally:' prefix
         return 2
     except Exception as exc:  # pragma: no cover
         eprint(f"Error: {exc}")

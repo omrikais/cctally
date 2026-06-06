@@ -43,7 +43,18 @@ SCENARIOS = {
     # Pricing-freshness check (spec 2026-05-29): an in-window unpriced
     # Claude model seeds the cache so `pricing.coverage` WARNs.
     "18-pricing-unpriced-model": "pricing_unpriced_model",
+    # Version-ahead check (issue #145): a DB whose user_version exceeds the
+    # running binary's registry head. cache.db ahead auto-heals → WARN (exit
+    # 0); stats.db ahead bricks → FAIL (exit 2). doctor reads raw
+    # user_version (no dispatcher), so it reports without healing/bricking.
+    "19-cache-version-ahead":    "cache_version_ahead",
+    "20-stats-version-ahead":    "stats_version_ahead",
 }
+
+# user_version sentinel bumped well past either registry head so the
+# version-ahead check fires regardless of how many migrations ship later
+# (mirrors the migrations scenario-07 fixture's PRAGMA user_version = 99).
+_VERSION_AHEAD_SENTINEL = 99
 
 
 def _common_setup_preamble() -> str:
@@ -375,6 +386,37 @@ def _scenario_body(slug: str) -> str:
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
                 "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
             """)
+    if slug == "cache_version_ahead":
+        # Issue #145: reuse the clean all_ok baseline (stats.db at-head, no
+        # version-ahead there), then seed a cache.db whose user_version is
+        # pushed past the cache registry head. doctor's raw status read sees
+        # cache.db ahead → WARN row, but overall exit stays 0 (auto-heals on
+        # next open). stats.db stays NOT ahead so the worst-of-both is WARN.
+        bump = textwrap.dedent(f"""\
+            python3 - "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db" <<'PY'
+            import sqlite3, sys
+            conn = sqlite3.connect(sys.argv[1])
+            conn.execute("PRAGMA user_version = {_VERSION_AHEAD_SENTINEL}")
+            conn.commit()
+            conn.close()
+            PY
+            """)
+        return _scenario_body("all_ok") + bump
+    if slug == "stats_version_ahead":
+        # Issue #145: reuse the all_ok baseline, then push stats.db's
+        # user_version past the stats registry head. doctor's raw status read
+        # sees stats.db ahead → FAIL row + overall exit 2 (bricks commands;
+        # not re-derivable). cache.db absent → not ahead.
+        bump = textwrap.dedent(f"""\
+            python3 - "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db" <<'PY'
+            import sqlite3, sys
+            conn = sqlite3.connect(sys.argv[1])
+            conn.execute("PRAGMA user_version = {_VERSION_AHEAD_SENTINEL}")
+            conn.commit()
+            conn.close()
+            PY
+            """)
+        return _scenario_body("all_ok") + bump
     raise SystemExit(f"unknown scenario slug: {slug}")
 
 

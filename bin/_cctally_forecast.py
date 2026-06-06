@@ -36,9 +36,9 @@ import sys
 from dataclasses import dataclass, replace
 
 from _cctally_core import (
-    _command_as_of, _normalize_week_boundary_dt, compute_week_bounds,
-    eprint, get_week_start_name, make_week_ref, now_utc_iso,
-    open_db, parse_iso_datetime,
+    WEEKDAY_MAP, _command_as_of, _normalize_week_boundary_dt,
+    compute_week_bounds, eprint, get_week_start_name, make_week_ref,
+    now_utc_iso, open_db, parse_iso_datetime,
 )
 # Non-kernel _cctally_core re-exports used by the moved code. Verified NOT
 # ns-patched (§5.A gate); honest-import permitted (the §8.1b gate allows any
@@ -46,7 +46,10 @@ from _cctally_core import (
 # kernel-invariant tests are unaffected). _BudgetConfigError is an exception
 # class — honest-import avoids the except-over-accessor foot-gun
 # (gotcha_except_over_callable_shim_typeerrors).
-from _cctally_core import _BudgetConfigError, _get_budget_config
+from _cctally_core import (
+    _BudgetConfigError, _get_budget_config,
+    BUDGET_PERIODS as _CCTALLY_BUDGET_PERIODS,
+)
 
 
 def _cctally():
@@ -1559,6 +1562,232 @@ def cmd_forecast(args: argparse.Namespace) -> int:
 
 _BUDGET_JSON_SCHEMA_VERSION = 1
 
+# Calendar-period + Codex budgets (spec §2/§3): single-source the short→canonical
+# `--period` spellings so the parser choices and the handler normalizer never
+# drift. The SHORT aliases live here, keyed canonical → its short spelling;
+# `_BUDGET_PERIOD_ALIASES` (the normalizer's lookup) and `_BUDGET_PERIOD_CHOICES`
+# (the parser's `choices=`) are BOTH derived from this map + the canonical
+# `BUDGET_PERIODS` tuple in _cctally_core, so adding a period (or renaming a
+# spelling) touches exactly one place (code-review #5).
+_BUDGET_PERIOD_SHORT = {
+    "subscription-week": "sub-week",
+    "calendar-week": "week",
+    "calendar-month": "month",
+}
+
+# short → canonical (the handler normalizer's lookup), plus identity entries so
+# canonical spellings pass through unchanged.
+_BUDGET_PERIOD_ALIASES = {
+    **{short: canonical for canonical, short in _BUDGET_PERIOD_SHORT.items()},
+    **{canonical: canonical for canonical in _CCTALLY_BUDGET_PERIODS},
+}
+
+# The parser's `choices=` — canonical-first within each period group, matching
+# the prior hardcoded order so `--help` stays byte-stable.
+_BUDGET_PERIOD_CHOICES = [
+    spelling
+    for canonical in _CCTALLY_BUDGET_PERIODS
+    for spelling in (canonical, _BUDGET_PERIOD_SHORT[canonical])
+]
+
+
+def _normalize_budget_period(raw):
+    """Map a `--period` flag value (short or canonical) to the canonical enum.
+
+    ``None`` (flag omitted) passes through so the set/unset semantics can
+    distinguish "preserve stored / per-vendor default" from an explicit choice.
+    An unknown value passes through unchanged so the per-vendor config validator
+    raises the canonical _BudgetConfigError (single error surface).
+    """
+    if raw is None:
+        return None
+    return _BUDGET_PERIOD_ALIASES.get(raw, raw)
+
+
+def _resolve_local_calendar_window(period, now_utc, week_start_idx=None):
+    """DST-correct ``(start_utc, end_utc)`` for the ``display.tz=local`` case
+    (issue #136).
+
+    The explicit-tz path feeds a real DST-aware ``ZoneInfo`` to the pure
+    kernels, which is correct. But ``display.tz=local`` has no clean stdlib
+    IANA-name handle — ``datetime.now().astimezone().tzinfo`` is only a
+    *fixed-offset* ``datetime.timezone`` snapped at one instant. Feeding that to
+    the kernel converts the period-start local midnight to UTC at the wrong
+    offset whenever the period straddles a DST transition, so the same civil
+    period resolves to two different ``period_start_at`` instants before vs
+    after the boundary — shifting the ``[start, now]`` spend window AND drifting
+    the ``UNIQUE(period_start_at, threshold)`` milestone key into a re-fire.
+
+    Instead, mirror ``_period_label_local``: build the NAIVE local civil
+    boundaries, then convert each via a bare ``astimezone()`` so each boundary
+    picks up the offset in effect at ITS OWN wall-clock instant — stable across
+    an in-period transition and with NO dependency on the real wall clock.
+    Period boundaries sit at 00:00 local, which is never inside a US/EU
+    spring-forward gap (those land at 01:00–03:00), so the naive→aware
+    conversion is unambiguous. Impure (it reads the process zone, like
+    ``_period_label_local``); kept in the forecast layer so ``_lib_budget``
+    stays a pure, dependency-injected kernel.
+    """
+    # internal fallback: host-local intentional (per-instant DST-correct)
+    now_local = now_utc.astimezone()
+    if period == "calendar-month":
+        start_naive = now_local.replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+        )
+        if start_naive.month == 12:
+            end_naive = start_naive.replace(year=start_naive.year + 1, month=1)
+        else:
+            end_naive = start_naive.replace(month=start_naive.month + 1)
+    else:  # calendar-week
+        midnight_naive = now_local.replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+        )
+        diff = (midnight_naive.weekday() - week_start_idx) % 7
+        start_naive = midnight_naive - dt.timedelta(days=diff)
+        end_naive = start_naive + dt.timedelta(days=7)
+    return (
+        start_naive.astimezone(dt.timezone.utc),
+        end_naive.astimezone(dt.timezone.utc),
+    )
+
+
+def _resolve_calendar_window(period, now_utc, config, tz):
+    """Resolve a calendar period's ``(start_utc, end_utc)`` (spec §3). ``period``
+    is canonical (calendar-week / calendar-month). Reuses the existing
+    ``collector.week_start`` config for the week-start index — no new config key.
+
+    Two paths (issue #136). An explicit ``display.tz`` (``utc`` / IANA) resolves
+    to a real DST-aware ``ZoneInfo``, so it goes straight to the pure kernels —
+    already DST-correct (proven by ``test_budget_periods.py``). ``display.tz=
+    local`` (``tz is None``) has no DST-aware stdlib handle, so it takes
+    ``_resolve_local_calendar_window``'s per-instant path instead of collapsing
+    the zone to a single fixed offset."""
+    c = _cctally()
+    if period == "calendar-month":
+        if tz is None:
+            return _resolve_local_calendar_window("calendar-month", now_utc)
+        return c.calendar_month_window(now_utc, tz)
+    # calendar-week
+    week_start_idx = WEEKDAY_MAP[get_week_start_name(config)]
+    if tz is None:
+        return _resolve_local_calendar_window(
+            "calendar-week", now_utc, week_start_idx
+        )
+    return c.calendar_week_window(now_utc, tz, week_start_idx)
+
+
+def _period_label_local(instant, tz):
+    """Render ``instant`` (a UTC-aware datetime) into the DISPLAY-TZ civil
+    wall-clock, PER INSTANT (code-review #4).
+
+    For an explicit ``tz`` (utc / IANA) the offset is uniform, so this is just
+    ``instant.astimezone(tz)``. For the ``display.tz=local`` case (``tz is
+    None``) it does a BARE ``instant.astimezone()`` so EACH instant picks up its
+    OWN host-local offset — matching the prior ``format_display_dt(..., tz=None)``
+    behavior. Window RESOLUTION (``_resolve_local_calendar_window``) applies the
+    same per-instant conversion for ``display.tz=local`` (issue #136); a single
+    fixed offset captured at ``now()`` would shift a boundary that straddles a
+    DST transition by an hour (and so a day, at midnight)."""
+    if tz is not None:
+        return instant.astimezone(tz)
+    # internal fallback: host-local intentional
+    return instant.astimezone()
+
+
+def _civil_period_label(period, start_utc, end_utc, tz):
+    """Build the terminal header period label from the DISPLAY-TZ civil
+    boundary (NOT the UTC instant — spec §3). Returns e.g.
+    ``subscription week 2026-05-26 → 2026-06-02`` /
+    ``calendar month 2026-06`` / ``calendar week 2026-06-01 → 06-08``.
+
+    The start/end are converted PER INSTANT (code-review #4) so a window
+    straddling a DST transition renders each boundary at its own local offset."""
+    s_local = _period_label_local(start_utc, tz)
+    e_local = _period_label_local(end_utc, tz)
+    if period == "calendar-month":
+        return f"calendar month {s_local.strftime('%Y-%m')}"
+    if period == "calendar-week":
+        return (
+            f"calendar week {s_local.strftime('%Y-%m-%d')} → "
+            f"{e_local.strftime('%m-%d')}"
+        )
+    # subscription-week
+    return (
+        f"subscription week {s_local.strftime('%Y-%m-%d')} → "
+        f"{e_local.strftime('%Y-%m-%d')}"
+    )
+
+
+def _build_vendor_budget_inputs(
+    *, vendor, period, target_usd, alert_thresholds, now_utc, config, tz,
+    skip_sync=False,
+):
+    """Resolve the window + live spend for one (vendor, period) budget and
+    return a :class:`BudgetInputs` (or ``None`` only for the Claude /
+    subscription-week case where no usage snapshot has landed yet).
+
+    Decoupled from ``weekly_usage_snapshots`` for every calendar period (spec
+    §4 review #5): the calendar/Codex path resolves the window from the pure
+    ``calendar_*_window`` functions and renders ``$0`` / ``0%`` when entries are
+    empty — it NEVER short-circuits to the no-data note. Only the legacy
+    Claude + subscription-week path can return ``None`` (no resolvable week
+    window yet), preserving the existing byte-identical no-data behavior.
+
+    The stats DB is opened LAZILY and ONLY on the Claude + subscription-week
+    branch (the sole reader of ``weekly_usage_snapshots`` via
+    ``_resolve_current_budget_window``). Codex spend and Claude calendar-period
+    spend come from the cache DB / pure window functions, so a Codex-only or
+    calendar-period budget never opens a stats connection (code-review #2).
+
+    Spend: Claude → ``_sum_cost_for_range``; Codex → ``_sum_codex_cost_for_range``
+    (cache DB; spec §4). ``recent_24h_usd`` is the same helper over the CLAMPED
+    trailing-24h window ``[max(start, now-24h), now]`` so a heavy spend just
+    before the window start can't leak into a fresh window's verdict. The
+    returned dataclass keeps the ``week_*`` field names (a deliberate
+    back-compat misnomer — they back documented ``--json`` fields, spec §9).
+    """
+    c = _cctally()
+    if vendor == "claude" and period == "subscription-week":
+        conn = open_db()
+        try:
+            window = _resolve_current_budget_window(conn, now_utc)
+        finally:
+            conn.close()
+        if window is None:
+            return None
+        start_at, end_at = window
+    else:
+        start_at, end_at = _resolve_calendar_window(period, now_utc, config, tz)
+
+    recent_start = max(start_at, now_utc - dt.timedelta(hours=24))
+    # The full-window sum (first call) honors the caller's ``skip_sync`` (render
+    # callers default False; the Claude record/projected leg passes True because
+    # other record-usage work already warmed the cache; the Codex projected leg
+    # passes False — R5 — since Codex has no other record-path warmer). Either
+    # way the recent-24h window is a SUBSET of the full window already fetched,
+    # so ``skip_sync=True`` on the second call avoids a redundant JSONL walk.
+    if vendor == "codex":
+        spent = c._sum_codex_cost_for_range(start_at, now_utc, skip_sync=skip_sync)
+        recent_24h = c._sum_codex_cost_for_range(
+            recent_start, now_utc, skip_sync=True
+        )
+    else:
+        spent = c._sum_cost_for_range(
+            start_at, now_utc, mode="auto", skip_sync=skip_sync
+        )
+        recent_24h = c._sum_cost_for_range(
+            recent_start, now_utc, mode="auto", skip_sync=True
+        )
+    return c.BudgetInputs(
+        target_usd=float(target_usd),
+        spent_usd=float(spent),
+        recent_24h_usd=float(recent_24h),
+        week_start_at=start_at,
+        week_end_at=end_at,
+        now=now_utc,
+        alert_thresholds=tuple(alert_thresholds),
+    )
+
 
 def cmd_budget(args: argparse.Namespace) -> int:
     """Dispatch `cctally budget [set AMOUNT | unset]`. See docs/commands/budget.md."""
@@ -1577,13 +1806,40 @@ def cmd_budget(args: argparse.Namespace) -> int:
         eprint("cctally budget: --format is not valid with set/unset")
         return 2
 
+    # Per-vendor calendar-period budgets (spec §2): `--vendor`/`--period`
+    # normalize + validate in the handler so the error is a clean exit 2 with a
+    # message (not an argparse usage error). `--project` is Claude/subscription-
+    # week-only (spec Q5), so reject combining it with --vendor codex / --period.
+    vendor = getattr(args, "vendor", "claude") or "claude"
+    raw_period = getattr(args, "period", None)
+    period = _normalize_budget_period(raw_period)
+    if action in {"set", "unset"}:
+        if getattr(args, "project", None) is not None and (
+            vendor != "claude" or period is not None
+        ):
+            eprint(
+                "cctally budget: --project budgets are Claude / subscription-week "
+                "only; drop --vendor/--period"
+            )
+            return 2
+        if vendor == "codex" and period in {"subscription-week"}:
+            eprint(
+                "cctally budget: Codex has no subscription week; use "
+                "--period calendar-week or --period calendar-month"
+            )
+            return 2
+
     if action == "set":
         if getattr(args, "project", None) is not None:
             return _cmd_budget_set_project(args)
-        return _cmd_budget_set(args)
+        if vendor == "codex":
+            return _cmd_budget_set_codex(args, period)
+        return _cmd_budget_set(args, period)
     if action == "unset":
         if getattr(args, "project", None) is not None:
             return _cmd_budget_unset_project(args)
+        if vendor == "codex":
+            return _cmd_budget_unset_codex(args)
         return _cmd_budget_unset(args)
 
     # ── bare status ──
@@ -1592,6 +1848,7 @@ def cmd_budget(args: argparse.Namespace) -> int:
     c._share_validate_args(args)
     config = c._load_claude_config_for_args(args)  # honors --config read-only
     args._resolved_tz = c.resolve_display_tz(args, config)
+    tz = args._resolved_tz
     try:
         budget_cfg = _get_budget_config(config)
     except _BudgetConfigError as exc:
@@ -1602,10 +1859,20 @@ def cmd_budget(args: argparse.Namespace) -> int:
     # no-data, full status) — gated on budget.projects being non-empty. When
     # empty, NOTHING is appended → the existing global render paths stay
     # byte-identical (spec §7.3a). It needs the budget window, so the work
-    # happens after we have a conn / now_utc below.
+    # happens after we have now_utc below (project rows open their own conn).
     has_projects = bool(budget_cfg["projects"])
 
     target = budget_cfg["weekly_usd"]
+    claude_period = budget_cfg["period"]
+    codex_cfg = budget_cfg["codex"]
+    has_codex = codex_cfg is not None
+    # Vendor labels / equivalent-$ vs actual-$ cues appear in the TERMINAL block
+    # ONLY once a Codex budget exists OR the Claude period is non-default — so a
+    # legacy Claude/subscription-week + no-Codex render stays byte-identical
+    # (spec §5/§10.1). `coexists` gates the terminal header relabel; the share
+    # artifact keys its period label off `claude_period` directly (code-review
+    # #3), so it doesn't need `coexists`.
+    coexists = has_codex or claude_period != "subscription-week"
 
     # Resolve the window-dependent per-project rows once (only when configured).
     # `project_rows` is None when no window resolves (no snapshot yet) — the
@@ -1623,28 +1890,82 @@ def cmd_budget(args: argparse.Namespace) -> int:
             pj_conn.close()
         project_window_resolved = project_rows is not None
 
+    # Build the Codex sibling inputs/status once (when configured) so every
+    # render path (terminal / --json / share) can reuse them. Decoupled from
+    # weekly snapshots — always resolves a calendar window (spec §4 review #5).
+    codex_inputs = None
+    codex_status = None
+    if has_codex:
+        # Codex spend reads the cache DB — no stats connection needed here;
+        # _build_vendor_budget_inputs opens one lazily only for the
+        # Claude+subscription-week branch (code-review #2).
+        codex_inputs = _build_vendor_budget_inputs(
+            vendor="codex", period=codex_cfg["period"],
+            target_usd=codex_cfg["amount_usd"],
+            alert_thresholds=codex_cfg["alert_thresholds"],
+            now_utc=now_utc, config=config, tz=tz,
+        )
+        codex_status = c.compute_budget_status(codex_inputs)
+        # Opportunistic Codex-budget alert firing (spec §6 trigger 2) — the
+        # INTERACTIVE backstop for spend that crosses a threshold BETWEEN
+        # record-usage ticks. Gated to the plain terminal status render:
+        #   * never under `--config PATH` (documented read-only — firing would
+        #     write milestones into the DEFAULT stats.db + dispatch off an
+        #     alternate config), and
+        #   * never under the machine-readable `--json` / artifact `--format`
+        #     surfaces (a scripted/automated read must not pop a desktop
+        #     notification).
+        # Routes through the SAME record-path helper as the automated trigger so
+        # the dedup key is resolved in CONFIG tz (like record-usage), NOT the
+        # display `--tz`: a `cctally budget --tz X` near a period boundary must
+        # not fork `period_start_at` and double-fire. The helper pre-probes,
+        # forward-only/fire-once via UNIQUE(period_start_at, threshold), and is
+        # best-effort (it never raises into the status render).
+        interactive_status = not (
+            getattr(args, "config", None)
+            or getattr(args, "json", False)
+            or getattr(args, "format", None)
+        )
+        if interactive_status and codex_cfg.get("alerts_enabled"):
+            c.maybe_record_codex_budget_milestone({})
+            # #135: the opportunistic Codex PROJECTED-pace backstop, scoped to
+            # the codex_budget_usd metric so it never pops a weekly_pct / Claude
+            # budget_usd notification from a bare `cctally budget`. The projected
+            # leg self-syncs (skip_sync=False); since codex_inputs was just
+            # built above, that delta-sync is a no-op here — correct and cheap.
+            if codex_cfg.get("projected_enabled"):
+                c.maybe_record_projected_alert(
+                    {}, only_metrics={"codex_budget_usd"}
+                )
+
     if target is None:
-        # Global budget unset → friendly message, then (if configured) the
-        # per-project section. --json carries status:"unset" + projects[].
+        # Global Claude budget unset → friendly message, then (if configured)
+        # the per-project section + the Codex sibling. --json carries
+        # status:"unset" + projects[] + the gated codex block.
         return _budget_render_unset(
             args,
+            claude_period=claude_period,
             project_rows=project_rows,
             has_projects=has_projects,
             project_window_resolved=project_window_resolved,
+            codex_cfg=codex_cfg, codex_inputs=codex_inputs,
+            codex_status=codex_status, tz=tz,
         )
 
-    conn = open_db()
-    inputs = _build_budget_status_inputs(
-        conn,
-        target_usd=target,
-        now_utc=now_utc,
-        alert_thresholds=budget_cfg["alert_thresholds"],
+    inputs = _build_vendor_budget_inputs(
+        vendor="claude", period=claude_period,
+        target_usd=target, alert_thresholds=budget_cfg["alert_thresholds"],
+        now_utc=now_utc, config=config, tz=tz,
     )
     if inputs is None:
-        # No usage snapshot yet → no resolvable week window (spec §6 worst case).
+        # Claude/subscription-week with no usage snapshot yet → no resolvable
+        # week window (spec §6 worst case). Calendar periods never reach here.
         if getattr(args, "format", None):
             snap = _build_budget_no_data_snapshot(args, budget_cfg, now_utc)
             snap = _append_project_share_rows(snap, project_rows, has_projects)
+            snap = _append_codex_share_rows(
+                snap, codex_cfg, codex_inputs, codex_status, tz
+            )
             c._share_render_and_emit(snap, args)
             return 0
         if getattr(args, "json", False):
@@ -1652,12 +1973,16 @@ def cmd_budget(args: argparse.Namespace) -> int:
                 "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
                 "status": "no_data",
                 "weekly_usd": target,
+                "period": claude_period,
             }
+            if has_codex:
+                _append_codex_json(payload, codex_cfg, codex_inputs, codex_status)
             if has_projects:
                 _append_project_json(payload, project_rows)
             print(json.dumps(payload))
             return 0
         print(f"Weekly budget: ${target:,.2f} — no usage data yet this week.")
+        _print_codex_section(codex_cfg, codex_inputs, codex_status, tz, args)
         _print_project_section_or_note(
             project_rows, has_projects, project_window_resolved, args
         )
@@ -1665,16 +1990,29 @@ def cmd_budget(args: argparse.Namespace) -> int:
 
     status = c.compute_budget_status(inputs)
     if getattr(args, "format", None):
-        snap = _build_budget_snapshot(args, budget_cfg, inputs, status)
+        snap = _build_budget_snapshot(
+            args, budget_cfg, inputs, status,
+            period=claude_period, tz=tz,
+        )
         snap = _append_project_share_rows(snap, project_rows, has_projects)
+        snap = _append_codex_share_rows(
+            snap, codex_cfg, codex_inputs, codex_status, tz
+        )
         c._share_render_and_emit(snap, args)
         return 0
     if getattr(args, "json", False):
         return _budget_emit_json(
             budget_cfg, inputs, status,
             project_rows=project_rows, has_projects=has_projects,
+            period=claude_period,
+            codex_cfg=codex_cfg, codex_inputs=codex_inputs,
+            codex_status=codex_status,
         )
-    rc = _budget_render_terminal(args, budget_cfg, inputs, status)
+    rc = _budget_render_terminal(
+        args, budget_cfg, inputs, status,
+        period=claude_period, coexists=coexists, tz=tz,
+    )
+    _print_codex_section(codex_cfg, codex_inputs, codex_status, tz, args)
     _print_project_section_or_note(
         project_rows, has_projects, project_window_resolved, args
     )
@@ -1878,10 +2216,15 @@ def _cmd_budget_unset_project(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_budget_set(args: argparse.Namespace) -> int:
-    """`cctally budget set AMOUNT` — write `budget.weekly_usd`, preserving the
-    other budget keys. Writes the DEFAULT config (F4). Task 3 appends the
-    forward-only milestone reconcile here."""
+def _cmd_budget_set(args: argparse.Namespace, period=None) -> int:
+    """`cctally budget set AMOUNT [--period P]` — write `budget.weekly_usd`,
+    preserving the other budget keys. Writes the DEFAULT config (F4). Task 3
+    appends the forward-only milestone reconcile here.
+
+    ``period`` is the canonical-normalized ``--period`` (or ``None`` = omitted).
+    When omitted, the stored period is preserved (a pre-existing budget keeps
+    its chosen period; first-create defaults to ``subscription-week`` via the
+    validator). When supplied, it's written as ``budget.period`` (spec §2)."""
     c = _cctally()
     raw = getattr(args, "amount", None)
     if raw is None:
@@ -1907,6 +2250,8 @@ def _cmd_budget_set(args: argparse.Namespace) -> int:
             return 2
         block = dict(existing or {})
         block["weekly_usd"] = amount
+        if period is not None:
+            block["period"] = period
         config["budget"] = block
         try:
             validated = _get_budget_config(config)
@@ -1914,12 +2259,14 @@ def _cmd_budget_set(args: argparse.Namespace) -> int:
             eprint(f"cctally budget: {exc}")
             return 2
         block["weekly_usd"] = validated["weekly_usd"]
+        block["period"] = validated["period"]
         config["budget"] = block
         c.save_config(config)
 
     weekly_usd = validated["weekly_usd"]
     alerts_enabled = validated["alerts_enabled"]
     thresholds = validated["alert_thresholds"]
+    stored_period = validated["period"]
 
     # Forward-only-from-set reconcile (Task 3, spec §5): record thresholds
     # ALREADY crossed with alerted_at set but WITHOUT dispatch, so setting a
@@ -1934,6 +2281,7 @@ def _cmd_budget_set(args: argparse.Namespace) -> int:
         print(json.dumps({
             "status": "set",
             "weekly_usd": weekly_usd,
+            "period": stored_period,
             "alerts_enabled": alerts_enabled,
             "alert_thresholds": list(thresholds),
         }))
@@ -1943,13 +2291,19 @@ def _cmd_budget_set(args: argparse.Namespace) -> int:
         thr_part = " · thresholds " + " ".join(f"{t}%" for t in thresholds)
     else:
         thr_part = " · no thresholds"
-    print(f"Weekly budget set to ${weekly_usd:,.2f} · {alerts_part}{thr_part}")
+    # Back-compat: the subscription-week confirmation stays byte-identical; a
+    # non-default period appends a ` · <period>` segment (spec §5).
+    period_part = "" if stored_period == "subscription-week" else f" · {stored_period}"
+    print(
+        f"Weekly budget set to ${weekly_usd:,.2f}{period_part} · "
+        f"{alerts_part}{thr_part}"
+    )
     return 0
 
 
 def _cmd_budget_unset(args: argparse.Namespace) -> int:
     """`cctally budget unset` — clear `budget.weekly_usd` (preserve
-    alerts_enabled / alert_thresholds). Idempotent."""
+    alerts_enabled / alert_thresholds / period). Idempotent."""
     c = _cctally()
     with c.config_writer_lock():
         config = c._load_config_unlocked()
@@ -1969,25 +2323,151 @@ def _cmd_budget_unset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_budget_set_codex(args: argparse.Namespace, period=None) -> int:
+    """`cctally budget set AMOUNT --vendor codex [--period P]` — write the
+    nested ``budget.codex`` block (spec §2). ``period`` is the canonical-
+    normalized ``--period`` (or ``None`` = omitted → preserve the stored period
+    on an existing Codex budget, else the per-vendor default calendar-month)."""
+    c = _cctally()
+    raw = getattr(args, "amount", None)
+    if raw is None:
+        eprint(
+            "cctally budget: `set --vendor codex` requires an amount, e.g. "
+            "cctally budget set 200 --vendor codex --period month"
+        )
+        return 2
+    try:
+        amount = float(raw)
+    except (TypeError, ValueError):
+        eprint(f"cctally budget: amount must be a positive number, got {raw!r}")
+        return 2
+    if not math.isfinite(amount) or amount <= 0:
+        eprint(f"cctally budget: amount must be a positive finite number, got {raw!r}")
+        return 2
+
+    with c.config_writer_lock():
+        config = c._load_config_unlocked()
+        existing = config.get("budget")
+        if existing is not None and not isinstance(existing, dict):
+            eprint("cctally budget: budget config must be an object")
+            return 2
+        block = dict(existing or {})
+        existing_codex = block.get("codex")
+        if existing_codex is not None and not isinstance(existing_codex, dict):
+            eprint("cctally budget: budget.codex must be an object")
+            return 2
+        codex_block = dict(existing_codex or {})
+        codex_block["amount_usd"] = amount
+        if period is not None:
+            codex_block["period"] = period
+        # First create with no period → the validator fills calendar-month.
+        block["codex"] = codex_block
+        config["budget"] = block
+        try:
+            validated = _get_budget_config(config)
+        except _BudgetConfigError as exc:
+            eprint(f"cctally budget: {exc}")
+            return 2
+        block["codex"] = dict(validated["codex"])
+        config["budget"] = block
+        c.save_config(config)
+
+    # Forward-only-from-set reconcile (spec §6): record Codex thresholds ALREADY
+    # crossed this period with alerted_at set but WITHOUT dispatch, so setting a
+    # Codex budget mid-period doesn't instant-popup; only LATER crossings fire.
+    # Runs OUTSIDE the config_writer_lock (open_db has its own locking). Gated on
+    # codex alerts_enabled + thresholds — a Codex budget with alerts off records
+    # nothing.
+    c._reconcile_codex_budget_on_config_write(validated)
+
+    codex = validated["codex"]
+    amount_usd = codex["amount_usd"]
+    stored_period = codex["period"]
+    alerts_enabled = codex["alerts_enabled"]
+    thresholds = codex["alert_thresholds"]
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "status": "set",
+            "vendor": "codex",
+            "amount_usd": amount_usd,
+            "period": stored_period,
+            "alerts_enabled": alerts_enabled,
+            "alert_thresholds": list(thresholds),
+        }))
+        return 0
+    alerts_part = "alerts on" if alerts_enabled else "alerts off"
+    if thresholds:
+        thr_part = " · thresholds " + " ".join(f"{t}%" for t in thresholds)
+    else:
+        thr_part = " · no thresholds"
+    print(
+        f"Codex budget set to ${amount_usd:,.2f} · {stored_period} · "
+        f"{alerts_part}{thr_part}"
+    )
+    return 0
+
+
+def _cmd_budget_unset_codex(args: argparse.Namespace) -> int:
+    """`cctally budget unset --vendor codex` — remove the ``budget.codex``
+    block entirely (spec §2). Idempotent."""
+    c = _cctally()
+    removed = False
+    with c.config_writer_lock():
+        config = c._load_config_unlocked()
+        existing = config.get("budget")
+        if existing is not None and not isinstance(existing, dict):
+            eprint("cctally budget: budget config must be an object")
+            return 2
+        block = dict(existing or {})
+        if block.get("codex") is not None:
+            removed = True
+        block["codex"] = None
+        config["budget"] = block
+        c.save_config(config)
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "status": "unset" if removed else "noop", "vendor": "codex",
+        }))
+        return 0
+    if removed:
+        print("Codex budget cleared")
+    else:
+        print("No Codex budget set")
+    return 0
+
+
 def _budget_render_unset(
     args: argparse.Namespace,
     *,
+    claude_period: str = "subscription-week",
     project_rows=None,
     has_projects: bool = False,
     project_window_resolved: bool = False,
+    codex_cfg=None,
+    codex_inputs=None,
+    codex_status=None,
+    tz=None,
 ) -> int:
-    """No GLOBAL budget set → friendly stdout message, exit 0 (NOT an error).
+    """No GLOBAL Claude budget set → friendly stdout message, exit 0 (NOT an
+    error).
 
     When per-project budgets ARE configured (``has_projects``), the
     per-project section is STILL rendered below the unset message (spec
-    §7.3a) — a project-only configuration is fully supported. When
-    ``has_projects`` is False, every output mode is byte-identical to the
-    pre-feature behavior (no ``projects`` key in --json, no extra lines).
+    §7.3a) — a project-only configuration is fully supported. A configured
+    Codex budget likewise renders as a sibling section (a Codex-only
+    configuration is supported). When neither is configured, every output mode
+    is byte-identical to the pre-feature behavior (no ``projects``/``codex`` key
+    in --json, no extra lines).
     """
     c = _cctally()
+    has_codex = codex_cfg is not None
     if getattr(args, "format", None):
         snap = _build_budget_no_budget_snapshot(args)
         snap = _append_project_share_rows(snap, project_rows, has_projects)
+        snap = _append_codex_share_rows(
+            snap, codex_cfg, codex_inputs, codex_status, tz
+        )
         c._share_render_and_emit(snap, args)
         return 0
     if getattr(args, "json", False):
@@ -1995,12 +2475,19 @@ def _budget_render_unset(
             "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
             "status": "unset",
             "weekly_usd": None,
+            # `period` is ALWAYS present (spec §5/§10.8) — even with no global
+            # Claude budget, the configured/default Claude period rides along so
+            # consumers never have to special-case an absent key.
+            "period": claude_period,
         }
+        if has_codex:
+            _append_codex_json(payload, codex_cfg, codex_inputs, codex_status)
         if has_projects:
             _append_project_json(payload, project_rows)
         print(json.dumps(payload))
         return 0
     print("No weekly budget set. Set one with: cctally budget set <amount>.")
+    _print_codex_section(codex_cfg, codex_inputs, codex_status, tz, args)
     _print_project_section_or_note(
         project_rows, has_projects, project_window_resolved, args
     )
@@ -2012,28 +2499,21 @@ def _budget_verdict_ansi_code(verdict: str) -> str:
     return {"ok": "32", "warn": "33", "over": "31"}.get(verdict, "32")
 
 
-def _budget_render_terminal(args, budget_cfg, inputs, status) -> int:
-    """Render the §4 status block to stdout. Datetimes via format_display_dt
-    (honors display.tz). Verdict color ok→green / warn→amber / over→red."""
+def _budget_block_lines(
+    inputs, status, *, header_label, alerts_line, color
+) -> list:
+    """Render one budget block (header + spent/remaining/pace/projected + the
+    alerts footer) as a list of lines. Shared by the Claude top block and the
+    Codex sibling so their layout is identical (spec §5). ``header_label`` is
+    the fully-formed first line (already carries the period/equivalent-$ cue);
+    ``alerts_line`` is the pre-rendered footer."""
     c = _cctally()
-    color = c._supports_color_stdout()
-    tz_render = getattr(args, "_resolved_tz", None)
-
     total_seconds = (inputs.week_end_at - inputs.week_start_at).total_seconds()
     elapsed_days = status.elapsed_fraction * total_seconds / 86400.0
     remaining_days = max(
         0.0, total_seconds * (1.0 - status.elapsed_fraction) / 86400.0
     )
-
-    ws = c.format_display_dt(inputs.week_start_at, tz_render, fmt="%Y-%m-%d", suffix=False)
-    we = c.format_display_dt(inputs.week_end_at, tz_render, fmt="%Y-%m-%d", suffix=False)
-
-    lines = []
-    lines.append(
-        f"Weekly budget: ${inputs.target_usd:,.2f}   "
-        f"(subscription week {ws} → {we})"
-    )
-    lines.append("")
+    lines = [header_label, ""]
     lines.append(
         f"  Spent so far    ${status.spent_usd:,.2f}    "
         f"{status.consumption_pct:.1f}% of budget"
@@ -2064,10 +2544,78 @@ def _budget_render_terminal(args, budget_cfg, inputs, status) -> int:
         proj_line += "   (LOW CONF — early in week)"
     lines.append(proj_line)
     lines.append("")
-    lines.append(_budget_alerts_line(budget_cfg, status))
+    lines.append(alerts_line)
+    return lines
 
+
+def _claude_budget_header(inputs, period, coexists, tz):
+    """The Claude block's header line. Byte-identical to the legacy
+    ``Weekly budget: $X   (subscription week WS → WE)`` for the
+    subscription-week + no-Codex case; switches to the civil-period label (and
+    an `equivalent-$` cue) once a Codex budget coexists or the period is
+    non-default (spec §5)."""
+    period_label = _civil_period_label(
+        period, inputs.week_start_at, inputs.week_end_at, tz
+    )
+    if not coexists:
+        # Legacy byte-identical path (subscription-week, no Codex).
+        return f"Weekly budget: ${inputs.target_usd:,.2f}   ({period_label})"
+    return (
+        f"Claude budget: ${inputs.target_usd:,.2f}   ({period_label})"
+        f"   — equivalent-$"
+    )
+
+
+def _budget_render_terminal(
+    args, budget_cfg, inputs, status, *,
+    period="subscription-week", coexists=False, tz=None,
+) -> int:
+    """Render the §4 Claude status block to stdout. The period header is derived
+    from the DISPLAY-TZ civil boundary (spec §3); ``coexists`` switches in the
+    vendor label + equivalent-$ cue only when a Codex budget exists or the
+    period is non-default (byte-identical legacy render otherwise)."""
+    color = _cctally()._supports_color_stdout()
+    header = _claude_budget_header(inputs, period, coexists, tz)
+    lines = _budget_block_lines(
+        inputs, status,
+        header_label=header,
+        alerts_line=_budget_alerts_line(budget_cfg, status),
+        color=color,
+    )
     print("\n".join(lines))
     return 0
+
+
+def _print_codex_section(codex_cfg, codex_inputs, codex_status, tz, args) -> None:
+    """Print the Codex budget sibling section below the Claude block (spec §5).
+    No-op when no Codex budget is configured so the existing terminal output
+    stays byte-identical. Layout mirrors the Claude block; the header carries an
+    `actual API $` cue (vs Claude's equivalent-$)."""
+    if codex_cfg is None or codex_inputs is None:
+        return
+    c = _cctally()
+    color = c._supports_color_stdout()
+    period_label = _civil_period_label(
+        codex_cfg["period"], codex_inputs.week_start_at,
+        codex_inputs.week_end_at, tz,
+    )
+    header = (
+        f"Codex budget: ${codex_inputs.target_usd:,.2f}   ({period_label})"
+        f"   — actual API $"
+    )
+    # The Codex alerts footer reads the codex block's own enabled/thresholds.
+    alerts_line = _budget_alerts_line(
+        {
+            "alerts_enabled": codex_cfg["alerts_enabled"],
+            "alert_thresholds": codex_cfg["alert_thresholds"],
+        },
+        codex_status,
+    )
+    lines = _budget_block_lines(
+        codex_inputs, codex_status,
+        header_label=header, alerts_line=alerts_line, color=color,
+    )
+    print("\n" + "\n".join(lines))
 
 
 def _budget_alerts_line(budget_cfg, status) -> str:
@@ -2089,19 +2637,24 @@ def _budget_alerts_line(budget_cfg, status) -> str:
 
 
 def _budget_emit_json(
-    budget_cfg, inputs, status, *, project_rows=None, has_projects=False
+    budget_cfg, inputs, status, *, project_rows=None, has_projects=False,
+    period="subscription-week", codex_cfg=None, codex_inputs=None,
+    codex_status=None,
 ) -> int:
     """Emit the full BudgetStatus + config echo + window as JSON (schemaVersion 1).
     Window timestamps are `…Z`, ignoring display.tz (every --json is UTC).
 
-    When per-project budgets are configured (``has_projects``), an additive
-    ``projects: [...]`` array is appended — ADDITIVE only, NO schemaVersion
-    bump (spec §7.4). Absent when projects are empty so the global --json stays
-    byte-identical."""
+    Additive (no schemaVersion bump — spec §5/§10.8): a ``period`` string
+    (ALWAYS present) + a gated ``codex`` sibling object (only when a Codex
+    budget is configured, like ``projects``). When per-project budgets are
+    configured (``has_projects``), an additive ``projects: [...]`` array is
+    appended. The terminal output stays byte-identical for the legacy case;
+    the --json golden is regenerated to carry ``period``."""
     payload = {
         "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
         "status": "ok",
         "weekly_usd": inputs.target_usd,
+        "period": period,
         "alerts_enabled": budget_cfg["alerts_enabled"],
         "alert_thresholds": list(budget_cfg["alert_thresholds"]),
         "week_start_at": _iso_z(inputs.week_start_at),
@@ -2120,10 +2673,41 @@ def _budget_emit_json(
         "low_confidence": status.low_confidence,
         "crossed_thresholds": list(status.crossed_thresholds),
     }
+    if codex_cfg is not None:
+        _append_codex_json(payload, codex_cfg, codex_inputs, codex_status)
     if has_projects:
         _append_project_json(payload, project_rows)
     print(json.dumps(payload))
     return 0
+
+
+def _append_codex_json(payload, codex_cfg, codex_inputs, codex_status) -> None:
+    """Attach the additive, gated ``codex`` sibling object to a budget --json
+    payload (spec §5). Gated exactly like ``projects`` — only emitted when a
+    Codex budget is configured, so unconfigured users keep the smaller payload.
+    The amount key is ``amount_usd`` (NOT ``weekly_usd`` — a misnomer inside a
+    monthly Codex block); the status fields mirror the Claude top level."""
+    payload["codex"] = {
+        "amount_usd": codex_inputs.target_usd,
+        "period": codex_cfg["period"],
+        "alerts_enabled": codex_cfg["alerts_enabled"],
+        "alert_thresholds": list(codex_cfg["alert_thresholds"]),
+        "period_start_at": _iso_z(codex_inputs.week_start_at),
+        "period_end_at": _iso_z(codex_inputs.week_end_at),
+        "as_of": _iso_z(codex_inputs.now),
+        "spent_usd": codex_status.spent_usd,
+        "remaining_usd": codex_status.remaining_usd,
+        "consumption_pct": codex_status.consumption_pct,
+        "elapsed_fraction": codex_status.elapsed_fraction,
+        "projected_eow_low_usd": codex_status.projected_eow_low_usd,
+        "projected_eow_high_usd": codex_status.projected_eow_high_usd,
+        "week_avg_projection_usd": codex_status.week_avg_projection_usd,
+        "daily_pace_usd": codex_status.daily_pace_usd,
+        "daily_budget_remaining_usd": codex_status.daily_budget_remaining_usd,
+        "verdict": codex_status.verdict,
+        "low_confidence": codex_status.low_confidence,
+        "crossed_thresholds": list(codex_status.crossed_thresholds),
+    }
 
 
 def _build_project_budget_rows(conn, budget_cfg, now_utc):
@@ -2318,21 +2902,80 @@ def _project_rows_json(rows) -> list:
     ]
 
 
-def _build_budget_snapshot(args, budget_cfg, inputs, status):
+def _append_codex_share_rows(snap, codex_cfg, codex_inputs, codex_status, tz):
+    """Append the Codex budget section to a budget ShareSnapshot (spec §5). The
+    Codex figures are vendor-level (no project names) → nothing new to
+    anonymize. No-op when no Codex budget is configured so existing share
+    goldens stay byte-identical."""
+    if codex_cfg is None or codex_inputs is None:
+        return snap
+    c = _cctally()
+    _lib_share = c._share_load_lib()
+    extra_rows = [
+        _lib_share.Row(cells={
+            "metric": _lib_share.TextCell("— Codex budget (actual API $) —"),
+            "value": _lib_share.TextCell(""),
+        }),
+        _lib_share.Row(cells={
+            "metric": _lib_share.TextCell("Codex budget"),
+            "value": _lib_share.MoneyCell(codex_inputs.target_usd),
+        }),
+        _lib_share.Row(cells={
+            "metric": _lib_share.TextCell("Codex spent so far"),
+            "value": _lib_share.MoneyCell(codex_status.spent_usd),
+        }),
+        _lib_share.Row(cells={
+            "metric": _lib_share.TextCell("Codex consumption"),
+            "value": _lib_share.PercentCell(codex_status.consumption_pct),
+        }),
+        _lib_share.Row(cells={
+            "metric": _lib_share.TextCell("Codex remaining"),
+            "value": _lib_share.MoneyCell(codex_status.remaining_usd),
+        }),
+        _lib_share.Row(cells={
+            "metric": _lib_share.TextCell("Codex verdict"),
+            "value": _lib_share.TextCell(codex_status.verdict.upper()),
+        }),
+    ]
+    return _replace_snapshot_rows(snap, tuple(snap.rows) + tuple(extra_rows))
+
+
+def _build_budget_snapshot(
+    args, budget_cfg, inputs, status, *,
+    period="subscription-week", tz=None,
+):
     """Build a `_lib_share.ShareSnapshot` (cmd="budget") for `--format` output.
 
     This builds the GLOBAL budget rows only; when per-project budgets are
     configured, `_append_project_share_rows` appends ProjectCell rows so
     `--reveal-projects` reveals (or `_scrub` anonymizes) the per-project
     basenames via the share chokepoint. No parallel renderer; the gate calls
-    `_share_render_and_emit(snap, args)`."""
+    `_share_render_and_emit(snap, args)`.
+
+    ``period`` selects the artifact's period label + title (code-review #3):
+    a Claude *calendar* period (calendar-week / calendar-month) renders the
+    DISPLAY-TZ civil label (e.g. ``calendar month 2026-06``) — matching the
+    terminal header — instead of the UTC-instant ``week of <month-1st>``
+    date-range. The legacy subscription-week artifact stays byte-identical."""
     c = _cctally()
     _lib_share = c._share_load_lib()
     tz_label = c._share_display_tz_label(getattr(args, "_resolved_tz", None))
-    period_label = c._share_period_label(
-        inputs.week_start_at, inputs.week_end_at, tz_label
-    )
-    period = _lib_share.PeriodSpec(
+    if period in {"calendar-week", "calendar-month"}:
+        # Civil period label off the display-tz boundary (NOT the UTC instant),
+        # so a month/week artifact reads "calendar month 2026-06" / "calendar
+        # week 2026-06-08 → 06-15" — the same label the terminal header uses.
+        period_label = _civil_period_label(
+            period, inputs.week_start_at, inputs.week_end_at, tz
+        )
+        title = f"Budget — {period_label}"
+    else:
+        # subscription-week: legacy date-range label + "week of …" title
+        # (byte-identical to the pre-feature artifact).
+        period_label = c._share_period_label(
+            inputs.week_start_at, inputs.week_end_at, tz_label
+        )
+        title = f"Budget — week of {inputs.week_start_at.strftime('%b %d')}"
+    period_spec = _lib_share.PeriodSpec(
         start=inputs.week_start_at, end=inputs.week_end_at,
         display_tz=tz_label, label=period_label,
     )
@@ -2363,9 +3006,9 @@ def _build_budget_snapshot(args, budget_cfg, inputs, status):
     ])
     return _lib_share.ShareSnapshot(
         cmd="budget",
-        title=f"Budget — week of {inputs.week_start_at.strftime('%b %d')}",
+        title=title,
         subtitle=subtitle,
-        period=period,
+        period=period_spec,
         columns=columns,
         rows=rows,
         chart=None,

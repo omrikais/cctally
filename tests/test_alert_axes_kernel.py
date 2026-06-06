@@ -39,10 +39,11 @@ def _restore_sys_modules():
             sys.modules[name] = mod
 
 
-def test_registry_has_five_axes_in_order():
+def test_registry_has_six_axes_in_order():
     m = _load("_lib_alert_axes")
     assert [d.id for d in m.AXIS_REGISTRY] == [
-        "weekly", "five_hour", "budget", "projected", "project_budget"
+        "weekly", "five_hour", "budget", "projected", "project_budget",
+        "codex_budget",
     ]
 
 
@@ -76,6 +77,26 @@ def test_project_budget_axis_registered():
     assert by_id["project_budget"].chip_label == "PROJECT"
     assert by_id["project_budget"].title_label == "Project budget"
     assert by_id["project_budget"].milestone_table == "project_budget_milestones"
+    # Severity reuses the shared 3-tier policy unchanged.
+    assert m.severity_for(89) == "info"
+    assert m.severity_for(90) == "warn"
+    assert m.severity_for(100) == "critical"
+
+
+def test_codex_budget_axis_registered():
+    """The per-vendor Codex budget axis (6th) is registered with the CODEX
+    chip, its own milestone table, and the axis-uniform 3-tier severity policy.
+
+    NOTE: the cross-language Python↔alertAxis.ts chip parity for this axis is
+    completed in Task 4 (the TS side gains `codex_budget` there). This task
+    asserts only the Python-side descriptor shape; the chip-parity test
+    (tests/test_alert_axes_chip_parity.py) deliberately scopes its equality to
+    the TS-present axes until then so Task 3 commits green."""
+    m = _load("_lib_alert_axes")
+    by_id = {d.id: d for d in m.AXIS_REGISTRY}
+    assert by_id["codex_budget"].chip_label == "CODEX"
+    assert by_id["codex_budget"].title_label == "Codex budget"
+    assert by_id["codex_budget"].milestone_table == "codex_budget_milestones"
     # Severity reuses the shared 3-tier policy unchanged.
     assert m.severity_for(89) == "info"
     assert m.severity_for(90) == "warn"

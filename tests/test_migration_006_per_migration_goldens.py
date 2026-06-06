@@ -94,6 +94,7 @@ def test_migration_handler_adds_column_and_constraint(ns, tmp_path):
     conn.row_factory = sqlite3.Row
     try:
         _migration_handler(ns)(conn)
+        ns["_stamp_applied"](conn, "006_five_hour_milestones_reset_event_id")  # dispatcher now owns the stamp (#140)
 
         # Column present.
         cols = {r[0] for r in _table_schema(conn, "five_hour_milestones")}
@@ -150,9 +151,11 @@ def test_migration_handler_idempotent_on_rerun(ns, tmp_path):
     conn.row_factory = sqlite3.Row
     try:
         _migration_handler(ns)(conn)
+        ns["_stamp_applied"](conn, "006_five_hour_milestones_reset_event_id")  # dispatcher now owns the stamp (#140)
         # Second call: should be a no-op (fast-path probe stamps marker
         # but doesn't rename or recreate).
         _migration_handler(ns)(conn)
+        ns["_stamp_applied"](conn, "006_five_hour_milestones_reset_event_id")
         # Marker still exists exactly once.
         cnt = conn.execute(
             "SELECT COUNT(*) FROM schema_migrations "
@@ -198,6 +201,7 @@ def test_migration_handler_fast_path_when_column_present(ns, tmp_path):
             );
         """)
         _migration_handler(ns)(conn)
+        ns["_stamp_applied"](conn, "006_five_hour_milestones_reset_event_id")  # dispatcher now owns the stamp (#140)
         marker = conn.execute(
             "SELECT 1 FROM schema_migrations "
             "WHERE name='006_five_hour_milestones_reset_event_id'"

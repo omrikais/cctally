@@ -2,10 +2,11 @@ import type { AlertAxis, AlertEntry } from '../types/envelope';
 
 // Shared alert-axis labels (issue #19 widened the binary weekly|five_hour
 // union with a third `budget` axis; issue #121 adds the fourth `projected`
-// axis; issue #19/#121 adds the fifth `project_budget` axis). Single source of
-// truth so Toast / RecentAlertsPanel / RecentAlertsModal never drift on the
-// chip text. The chip uses the SHOUT form; the title uses the sentence-case
-// form.
+// axis; issue #19/#121 adds the fifth `project_budget` axis; the
+// calendar-period-codex-budgets feature adds the sixth `codex_budget` axis).
+// Single source of truth so Toast / RecentAlertsPanel / RecentAlertsModal never
+// drift on the chip text. The chip uses the SHOUT form; the title uses the
+// sentence-case form.
 //
 // These MUST stay byte-identical with the Python kernel
 // bin/_lib_alert_axes.py AXIS_REGISTRY chip_label / title_label fields
@@ -17,6 +18,7 @@ export const AXIS_CHIP_LABEL: Record<AlertAxis, string> = {
   budget: 'BUDGET',
   projected: 'PROJECTED',
   project_budget: 'PROJECT',
+  codex_budget: 'CODEX',
 };
 
 export const AXIS_TITLE_LABEL: Record<AlertAxis, string> = {
@@ -25,7 +27,27 @@ export const AXIS_TITLE_LABEL: Record<AlertAxis, string> = {
   budget: 'Budget',
   projected: 'Projected',
   project_budget: 'Project budget',
+  codex_budget: 'Codex budget',
 };
+
+// Period-aware label for the `budget` + `codex_budget` axes
+// (calendar-period-codex-budgets, spec §6). The milestone tables key the window
+// on a single `week_start_at` / `period_start_at` column whose VALUE is either a
+// subscription-week instant or a calendar period-start instant; the alert
+// `context.period` discriminator (sourced from config-at-fire-time on the
+// server) tells the two apart. RecentAlertsModal + Toast hardcoded
+// "Week of/starting"; for a calendar period that mislabels, so this helper maps
+// the discriminator onto the human noun the surfaces prefix with the date:
+//   subscription-week → "Week"          (legacy, byte-stable default)
+//   calendar-week     → "Calendar week"
+//   calendar-month    → "Month"
+// Defaults to "Week" when `period` is absent (a stale envelope that predates the
+// generalization), keeping the legacy rendering intact.
+export function budgetPeriodNoun(period: string | undefined): string {
+  if (period === 'calendar-month') return 'Month';
+  if (period === 'calendar-week') return 'Calendar week';
+  return 'Week';
+}
 
 // Single severity authority (Phase B 3-tier). The Python kernel
 // `bin/_lib_alert_axes.py::severity_for` emits the 3-tier `alert.severity`
@@ -58,8 +80,9 @@ export function alertSeverity(alert: AlertEntry): 'info' | 'warn' | 'critical' {
 // read FROM THE ROW (`context.projected_value` / `context.denominator`),
 // never from live config (Codex P0-4).
 //
-//   weekly_pct  → "projected 102% of cap"
-//   budget_usd  → "projected $312 of $300"
+//   weekly_pct       → "projected 102% of cap"
+//   budget_usd       → "projected $312 of $300"
+//   codex_budget_usd → "projected $230 of $200 · Codex"
 //
 // Returns `null` when the row is not a projected alert or lacks the
 // projection fields, so callers can fall through to their existing axis
@@ -71,6 +94,14 @@ export function projectedContextText(alert: AlertEntry): string | null {
   if (metric == null || proj == null) return null;
   if (metric === 'weekly_pct') {
     return `projected ${Math.round(proj)}% of cap`;
+  }
+  if (metric === 'codex_budget_usd') {
+    // Codex projected (#135 / Q5): same budget-$ wording as `budget_usd`,
+    // tagged with the Codex vendor. The PROJECTED chip is reused; only the
+    // context string distinguishes the vendor.
+    const denom = alert.context.denominator;
+    if (denom == null) return null;
+    return `projected $${Math.round(proj)} of $${Math.round(denom)} · Codex`;
   }
   // budget_usd
   const denom = alert.context.denominator;

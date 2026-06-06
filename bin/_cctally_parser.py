@@ -1290,6 +1290,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--project", nargs="?", const="__CWD__", default=None,
         help="Set/unset a per-project budget for this git repo "
              "(bare = current directory's git-root; or pass a path).")
+    bg.add_argument(
+        "--vendor", choices=["claude", "codex"], default="claude",
+        help="Which vendor budget to set/unset (default claude). Codex "
+             "budgets are calendar-period only.")
+    bg.add_argument(
+        "--period",
+        # Accept both canonical and short spellings; the command handler
+        # normalizes short->canonical and rejects `--vendor codex
+        # --period subscription-week` (Codex has no Anthropic week). The choices
+        # are single-sourced from `_BUDGET_PERIOD_CHOICES` (derived from the same
+        # short→canonical map the normalizer uses), so they can't drift from the
+        # handler (code-review #5).
+        choices=c._BUDGET_PERIOD_CHOICES,
+        default=None,
+        help="Budget period: subscription-week (claude only) / calendar-week "
+             "/ calendar-month. Default: preserve the stored period, else the "
+             "per-vendor default (claude=subscription-week, codex="
+             "calendar-month).")
     bg.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
                     help="Show real project basenames in the per-project section "
                          "of --format output (default anonymizes to project-1/…).")
@@ -2192,16 +2210,21 @@ def build_parser() -> argparse.ArgumentParser:
               cctally alerts test --axis five-hour --threshold 95
               cctally alerts test --axis budget --threshold 100
               cctally alerts test --axis project-budget --threshold 100
+              cctally alerts test --axis codex-budget --threshold 100
               cctally alerts test --axis projected --metric budget_usd
+              cctally alerts test --axis projected --metric codex_budget_usd
         """),
     )
     p_alerts_test.add_argument(
         "--axis",
-        choices=["weekly", "five-hour", "budget", "project-budget", "projected"],
+        choices=[
+            "weekly", "five-hour", "budget", "project-budget", "codex-budget",
+            "projected",
+        ],
         default="weekly",
         help="Alert axis to simulate: weekly subscription window, 5h block, "
-             "equiv-$ budget, per-project equiv-$ budget, or projected-pace "
-             "(default: weekly).",
+             "equiv-$ budget, per-project equiv-$ budget, Codex budget, or "
+             "projected-pace (default: weekly).",
     )
     p_alerts_test.add_argument(
         "--threshold",
@@ -2211,7 +2234,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_alerts_test.add_argument(
         "--metric",
-        choices=["weekly_pct", "budget_usd"],
+        choices=["weekly_pct", "budget_usd", "codex_budget_usd"],
         default="weekly_pct",
         help="For --axis projected: which projected metric to preview "
              "(default: weekly_pct).",
@@ -2333,6 +2356,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Migration name (NNN_… or qualified)",
     )
     db_unskip.set_defaults(func=c.cmd_db_unskip)
+
+    db_recover = db_sub.add_parser(
+        "recover",
+        help="Revert a version-ahead DB to the known schema head (#145)",
+    )
+    db_recover.add_argument(
+        "--db",
+        required=True,
+        choices=("cache", "stats"),
+        help="Which DB to recover",
+    )
+    db_recover.add_argument(
+        "--yes",
+        action="store_true",
+        help="Required for --db stats (non-re-derivable; may need a re-record)",
+    )
+    db_recover.set_defaults(func=c.cmd_db_recover)
 
     # ─── doctor (Diagnostics) ───────────────────────────────────────────
     doctor_p = sub.add_parser(

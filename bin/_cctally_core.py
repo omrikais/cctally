@@ -160,6 +160,24 @@ def _is_dev_checkout() -> bool:
     return (_repo_root() / ".git").exists()
 
 
+def _real_prod_data_dir() -> pathlib.Path:
+    """The REAL user's prod data dir (~/.local/share/cctally), resolved from
+    the password database rather than $HOME so it is immune to a faked HOME.
+
+    The prod-migration guard (bin/_cctally_db.py, issue #142) compares the
+    connection's DB directory against this to tell a fake-HOME test 'prod'
+    (e.g. a golden harness's /tmp/scratch/.local/share/cctally) apart from
+    the actual prod dir. Monkeypatchable seam: tests point it at a tmp dir to
+    exercise the guard's fire path without touching real prod. Falls back to
+    Path.home() only if `pwd` is unavailable (cctally targets Unix only)."""
+    try:
+        import pwd
+        home = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except Exception:
+        home = pathlib.Path.home()
+    return home / ".local" / "share" / "cctally"
+
+
 _init_paths_from_env()
 
 
@@ -570,21 +588,49 @@ class _BudgetConfigError(ValueError):
     """Raised by _get_budget_config on an invalid budget block."""
 
 
+def _validate_positive_budget_amount(v: object, label: str) -> float:
+    """Validate a budget *amount* value: a non-bool finite number > 0.
+
+    Single-sources the rule shared by ``budget.weekly_usd``,
+    ``budget.codex.amount_usd``, and each ``budget.projects`` value (code-review
+    #5). ``bool`` is an ``int`` subclass, so it's rejected explicitly. ``label``
+    is the human field name used in the raised message (e.g.
+    ``"budget.weekly_usd"``). Null handling stays at the call site — this helper
+    only validates a value the caller has already decided must be a number.
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise _BudgetConfigError(f"{label} must be a number")
+    if not math.isfinite(float(v)) or float(v) <= 0:
+        raise _BudgetConfigError(f"{label} must be a finite number > 0")
+    return float(v)
+
+
+# Per-vendor budget period enums (calendar-period + Codex budgets feature).
+# Claude budgets may use any of the three (default subscription-week, the
+# existing reset-aware behavior); Codex budgets may NOT use subscription-week
+# (it's an Anthropic-only concept), so Codex defaults to calendar-month. These
+# are reused by the parser (`--period` choices) and the config layer.
+BUDGET_PERIODS = ("subscription-week", "calendar-week", "calendar-month")
+CODEX_BUDGET_PERIODS = ("calendar-week", "calendar-month")
 _BUDGET_DEFAULTS = {
     "weekly_usd": None,            # None = no budget (default)
     "alerts_enabled": True,        # "on when set"
     "alert_thresholds": [90, 100],
     "projected_enabled": False,    # projected-pace opt-in (#121); default OFF
+    "period": "subscription-week",  # Claude period; default = existing behavior
     "projects": {},               # per-project weekly $ budgets, keyed by git-root
     "project_alerts_enabled": False,  # per-project alerts opt-in (#19/#121); default OFF
+    "codex": None,                # None = no Codex budget (nested block when set)
 }
 _BUDGET_CONFIG_VALID_KEYS = {
     "weekly_usd",
     "alerts_enabled",
     "alert_thresholds",
     "projected_enabled",
+    "period",
     "projects",
     "project_alerts_enabled",
+    "codex",
 }
 
 
@@ -631,21 +677,18 @@ def _get_budget_config(cfg: dict) -> dict:
         out["alerts_enabled"] = v
 
     if "alert_thresholds" in block:
-        v = block["alert_thresholds"]
-        if not isinstance(v, list):
-            raise _BudgetConfigError("budget.alert_thresholds must be a list of ints")
-        cleaned = []
-        for t in v:
-            if isinstance(t, bool) or not isinstance(t, int):
-                raise _BudgetConfigError(
-                    "budget.alert_thresholds entries must be integers"
-                )
-            if t < 1 or t > 100:
-                raise _BudgetConfigError(
-                    "budget.alert_thresholds entries must be in [1, 100]"
-                )
-            cleaned.append(t)
-        out["alert_thresholds"] = sorted(set(cleaned))  # empty list allowed (silenced)
+        out["alert_thresholds"] = _validate_budget_thresholds(
+            block["alert_thresholds"], "budget.alert_thresholds"
+        )
+
+    if "period" in block:
+        v = block["period"]
+        if not isinstance(v, str) or v not in BUDGET_PERIODS:
+            raise _BudgetConfigError(
+                "budget.period must be one of "
+                f"{', '.join(BUDGET_PERIODS)}, got {v!r}"
+            )
+        out["period"] = v
 
     if "projected_enabled" in block:
         v = block["projected_enabled"]
@@ -687,6 +730,107 @@ def _get_budget_config(cfg: dict) -> dict:
                 "budget.project_alerts_enabled must be a boolean"
             )
         out["project_alerts_enabled"] = v
+
+    if "codex" in block:
+        out["codex"] = _validate_codex_budget_block(block["codex"])
+
+    return out
+
+
+def _validate_budget_thresholds(v: object, label: str) -> "list[int]":
+    """Validate + canonicalize a budget alert-thresholds list.
+
+    Shared by the top-level ``budget.alert_thresholds`` and the nested
+    ``budget.codex.alert_thresholds`` leaves. Entries must be ints in [1, 100]
+    (bool is an int subclass and is rejected). Returns a sorted, deduped list;
+    an empty list is allowed (alerts silenced).
+    """
+    if not isinstance(v, list):
+        raise _BudgetConfigError(f"{label} must be a list of ints")
+    cleaned: "list[int]" = []
+    for t in v:
+        if isinstance(t, bool) or not isinstance(t, int):
+            raise _BudgetConfigError(f"{label} entries must be integers")
+        if t < 1 or t > 100:
+            raise _BudgetConfigError(f"{label} entries must be in [1, 100]")
+        cleaned.append(t)
+    return sorted(set(cleaned))  # empty list allowed (silenced)
+
+
+def _validate_codex_budget_block(v: object) -> "dict | None":
+    """Validate the nested ``budget.codex`` block (Codex per-vendor budget).
+
+    ``None`` is the no-Codex-budget sentinel. When set, it's an object with a
+    finite ``amount_usd`` > 0, a ``period`` in CODEX_BUDGET_PERIODS (NOT
+    subscription-week — Anthropic-only), ``alerts_enabled`` bool (default
+    False — opt-in, like every alert axis), ``alert_thresholds`` validated like
+    the top-level budget thresholds (default [90, 100]), and
+    ``projected_enabled`` bool (default False). Returns a defaults-filled copy.
+    """
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise _BudgetConfigError(
+            f"budget.codex must be an object or null, got {type(v).__name__}"
+        )
+    # warn-and-ignore unknown sub-keys (forward compat, like the parent block)
+    _codex_valid = {
+        "amount_usd", "period", "alerts_enabled", "alert_thresholds",
+        "projected_enabled",
+    }
+    for k in v.keys():
+        if k not in _codex_valid:
+            print(
+                f"warning: ignoring unknown budget.codex config key: {k}",
+                file=sys.stderr,
+            )
+    out: "dict" = {
+        "amount_usd": None,
+        "period": "calendar-month",     # Codex default (NO subscription-week)
+        "alerts_enabled": False,        # opt-in, like every alert axis
+        "alert_thresholds": [90, 100],
+        "projected_enabled": False,
+    }
+    # amount_usd — required (a Codex block must define a budget) finite > 0.
+    # Shares the positive-amount rule with weekly_usd / projects via the helper;
+    # the message form ("must be a number" / "must be a finite number > 0") is
+    # byte-identical to the prior inline checks (code-review #5).
+    if "amount_usd" not in v:
+        raise _BudgetConfigError("budget.codex.amount_usd is required")
+    out["amount_usd"] = _validate_positive_budget_amount(
+        v["amount_usd"], "budget.codex.amount_usd"
+    )
+
+    if "period" in v:
+        p = v["period"]
+        if not isinstance(p, str) or p not in CODEX_BUDGET_PERIODS:
+            raise _BudgetConfigError(
+                "budget.codex.period must be one of "
+                f"{', '.join(CODEX_BUDGET_PERIODS)} (NOT subscription-week), "
+                f"got {p!r}"
+            )
+        out["period"] = p
+
+    if "alerts_enabled" in v:
+        ae = v["alerts_enabled"]
+        if not isinstance(ae, bool):
+            raise _BudgetConfigError(
+                "budget.codex.alerts_enabled must be a boolean"
+            )
+        out["alerts_enabled"] = ae
+
+    if "alert_thresholds" in v:
+        out["alert_thresholds"] = _validate_budget_thresholds(
+            v["alert_thresholds"], "budget.codex.alert_thresholds"
+        )
+
+    if "projected_enabled" in v:
+        pe = v["projected_enabled"]
+        if not isinstance(pe, bool):
+            raise _BudgetConfigError(
+                "budget.codex.projected_enabled must be a boolean"
+            )
+        out["projected_enabled"] = pe
 
     return out
 
@@ -1101,44 +1245,47 @@ def open_db() -> sqlite3.Connection:
     )
 
     # ── budget_milestones (equiv-$ budget threshold crossings — issue #19) ──
-    # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / backfill — the
-    # exact posture of `five_hour_milestones` (write-once, forward-only). A
+    # Write-once, forward-only (the exact posture of `five_hour_milestones`). A
     # mid-week quota reset re-anchors `week_start_at` (see
     # `_resolve_current_budget_window`), so the new window naturally gets
-    # fresh rows under UNIQUE(week_start_at, threshold) — no `reset_event_id`
-    # segment column needed (unlike the percent/5h tables). `week_start_at`
-    # stores the effective/re-anchored ISO string from the resolver
-    # (`isoformat(timespec="seconds")`); the resolver's `parse_iso_datetime`
-    # returns a HOST-LOCAL tz-aware datetime, so this dedup key carries the
-    # host's UTC offset (e.g. `…T07:00:00-07:00`) — host-consistent, NOT
-    # portable across hosts, same posture as `five_hour_blocks.block_start_at`.
-    # Firing + reconcile + the dashboard envelope all read/write the identical
-    # string on a given host, so the UNIQUE dedup is exact. `alerted_at` is stamped BEFORE the
-    # osascript Popen (set-then-dispatch invariant); NULL = "recorded without
-    # dispatch" (the forward-only-from-set reconcile path) OR "not yet
-    # dispatched", never "delivery failed". Lives BEFORE the migration
-    # dispatcher: a plain CREATE on a framework-untracked table never touches
-    # `schema_migrations`, so the dispatcher's fresh-install snapshot is
-    # unaffected.
+    # fresh rows under UNIQUE(week_start_at, period, threshold) — no
+    # `reset_event_id` segment column needed (unlike the percent/5h tables).
+    # `week_start_at` stores the effective/re-anchored ISO string from the
+    # resolver (`isoformat(timespec="seconds")`); the resolver's
+    # `parse_iso_datetime` returns a HOST-LOCAL tz-aware datetime, so this
+    # dedup key carries the host's UTC offset (e.g. `…T07:00:00-07:00`) —
+    # host-consistent, NOT portable across hosts, same posture as
+    # `five_hour_blocks.block_start_at`. Firing + reconcile + the dashboard
+    # envelope all read/write the identical string on a given host, so the
+    # UNIQUE dedup is exact. `alerted_at` is stamped BEFORE the osascript Popen
+    # (set-then-dispatch invariant); NULL = "recorded without dispatch" (the
+    # forward-only-from-set reconcile path) OR "not yet dispatched", never
+    # "delivery failed".
+    # Schema owned by migration 011_budget_milestone_period_keys (the `period`
+    # column + the period-inclusive UNIQUE; see _cctally_db.py). The live CREATE
+    # below makes the new shape on fresh installs (dispatcher fast-stamps 011);
+    # pre-011 DBs trip the migration's rename-recreate-copy. `period` is the
+    # configured period noun at crossing ('calendar-week'|'calendar-month'|
+    # 'subscription-week'); NULL = pre-011 unknown.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS budget_milestones (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             week_start_at   TEXT    NOT NULL,
+            period          TEXT,                 -- configured period at crossing; NULL = pre-011 unknown (migration 011)
             threshold       INTEGER NOT NULL,
             budget_usd      REAL    NOT NULL,
             spent_usd       REAL    NOT NULL,
             consumption_pct REAL    NOT NULL,
             crossed_at_utc  TEXT    NOT NULL,
             alerted_at      TEXT,
-            UNIQUE(week_start_at, threshold)
+            UNIQUE(week_start_at, period, threshold)
         )
         """
     )
 
     # ── projected_milestones (week-average-pace projection crossings — #121) ──
-    # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / backfill — same
-    # posture as `budget_milestones` (write-once, forward-only, no
+    # Write-once, forward-only — same posture as `budget_milestones` (no
     # `reset_event_id` segment column). Two metrics share the table, keyed by
     # `metric` ('weekly_pct' | 'budget_usd'); a level fires once the
     # WEEK-AVERAGE projection (not the displayed high-end verdict) crosses
@@ -1149,20 +1296,22 @@ def open_db() -> sqlite3.Connection:
     # `week_start_at` (new window → fresh rows under the UNIQUE key), the
     # budget-pattern reset handling — hence NO `reset_event_id` column.
     # `alerted_at` is stamped BEFORE the osascript Popen (set-then-dispatch).
-    # Lives BEFORE the migration dispatcher: a plain CREATE on a
-    # framework-untracked table never touches `schema_migrations`.
+    # Schema owned by migration 011_budget_milestone_period_keys (the `period`
+    # column + the period-inclusive UNIQUE; see _cctally_db.py). `period` is
+    # NULL for pre-011 rows.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS projected_milestones (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            week_start_at   TEXT    NOT NULL,
-            metric          TEXT    NOT NULL,   -- 'weekly_pct' | 'budget_usd'
+            week_start_at   TEXT    NOT NULL,   -- period-start instant (subscription-week OR calendar period-start; back-compat name)
+            period          TEXT,               -- configured period at crossing; NULL = pre-011 unknown (migration 011)
+            metric          TEXT    NOT NULL,   -- 'weekly_pct' | 'budget_usd' | 'codex_budget_usd'
             threshold       INTEGER NOT NULL,   -- 90 | 100
             projected_value REAL    NOT NULL,
-            denominator     REAL    NOT NULL,   -- target_usd (budget) | 100.0 (weekly)
+            denominator     REAL    NOT NULL,   -- target_usd (budget / codex_budget) | 100.0 (weekly)
             crossed_at_utc  TEXT    NOT NULL,
             alerted_at      TEXT,
-            UNIQUE(week_start_at, metric, threshold)
+            UNIQUE(week_start_at, period, metric, threshold)
         )
         """
     )
@@ -1199,6 +1348,46 @@ def open_db() -> sqlite3.Connection:
             crossed_at_utc  TEXT    NOT NULL,
             alerted_at      TEXT,
             UNIQUE(week_start_at, project_key, threshold)
+        )
+        """
+    )
+
+    # ── codex_budget_milestones (per-vendor Codex budget crossings) ──────────
+    # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / backfill — the
+    # same posture as `budget_milestones` / `projected_milestones` /
+    # `project_budget_milestones` (write-once, forward-only, framework-untracked;
+    # calendar-period-codex-budgets feature, spec §6). The dedup key is keyed on
+    # `period_start_at` — the resolved period-window START instant stored as the
+    # `isoformat(timespec="seconds")` `+00:00` offset form (NOT a `Z` suffix),
+    # e.g. calendar-month June → `2026-06-01T00:00:00+00:00` — NOT a subscription
+    # week:
+    # Codex has no Anthropic week, so the budget runs over a calendar period
+    # (calendar-week / calendar-month). Rolling to the next period yields a fresh
+    # `period_start_at` → fresh crossings under UNIQUE(period_start_at, period,
+    # threshold) (the budget-pattern reset handling — hence NO `reset_event_id`
+    # segment column). `budget_usd` snapshots the Codex target AT crossing so the
+    # dashboard renders "$210 of $200" from the ROW, not from live config that
+    # may have changed since (the Codex P0-4 lesson, baked into the sibling
+    # tables). `alerted_at` is stamped BEFORE the osascript Popen (set-then-
+    # dispatch invariant); NULL = "recorded without dispatch" (the forward-only-
+    # from-set reconcile path) OR "not yet dispatched", never "delivery failed".
+    # Schema owned by migration 011_budget_milestone_period_keys (the `period`
+    # column + the period-inclusive UNIQUE; see _cctally_db.py). `period` is the
+    # configured Codex period noun at crossing ('calendar-week'|'calendar-
+    # month'); NULL = pre-011 unknown.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS codex_budget_milestones (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            period_start_at TEXT    NOT NULL,   -- resolved period-window start instant (+00:00 offset form, NOT Z)
+            period          TEXT,               -- configured period at crossing; NULL = pre-011 unknown (migration 011)
+            threshold       INTEGER NOT NULL,
+            budget_usd      REAL    NOT NULL,   -- Codex target snapshotted AT crossing
+            spent_usd       REAL    NOT NULL,
+            consumption_pct REAL    NOT NULL,
+            crossed_at_utc  TEXT    NOT NULL,
+            alerted_at      TEXT,
+            UNIQUE(period_start_at, period, threshold)
         )
         """
     )

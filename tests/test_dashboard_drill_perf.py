@@ -21,7 +21,7 @@ import sys
 
 import pytest
 
-from conftest import load_script  # noqa: E402
+from conftest import load_script, redirect_paths  # noqa: E402
 
 _NS = load_script()
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
@@ -182,27 +182,52 @@ def test_session_detail_indexed_lookup_exists():
     )
 
 
-def test_session_detail_fast_path_runs_before_fallback():
-    """Patch the bulk-scan path so it raises if reached. A real
-    session id in the cache must resolve via the fast path alone."""
-    # Reach the real cctally module via sys.modules — _NS is just the
-    # globals dict and rebinding entries there doesn't affect the
-    # function closures inside _cctally_tui.
-    cct = sys.modules.get("cctally")
-    if cct is None:
-        pytest.skip("cctally module not yet loaded; load_script() didn't register it")
-    cache_db_path = pathlib.Path.home() / ".local/share/cctally/cache.db"
-    if not cache_db_path.exists():
-        pytest.skip("real cache.db not present — fast-path runtime check skipped")
-    conn = sqlite3.connect(cache_db_path)
-    row = conn.execute(
-        "SELECT session_id FROM session_files "
-        "WHERE session_id IS NOT NULL LIMIT 1"
-    ).fetchone()
-    conn.close()
-    if row is None:
-        pytest.skip("no session_files rows with session_id — skip")
-    sid = row[0]
+def test_session_detail_fast_path_runs_before_fallback(monkeypatch, tmp_path):
+    """A seeded session id must resolve via the indexed fast path alone —
+    patch the bulk-scan path so it tripwires if reached.
+
+    Issue #144: this previously opened the developer's REAL prod
+    ``~/.local/share/cctally/cache.db`` (``Path.home() / …`` + an un-isolated
+    ``_tui_build_session_detail`` → ``open_cache_db()``). That both leaked test
+    reads onto the real machine AND — from a dev checkout carrying a cache
+    migration ahead of prod — tripped the #142 prod-migration guard, forcing a
+    guard-aware ``pytest.skip`` stopgap. We now build an ISOLATED tmp cache.db
+    (``redirect_paths`` + ``open_cache_db()`` for the full fast-path schema,
+    then seed one ``session_files`` row keyed by ``session_id`` plus one in-range
+    ``session_entries`` row) so the runtime check runs deterministically without
+    ever touching real prod — and the stopgap skip is gone.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    cct = sys.modules["cctally"]
+
+    sid = "test-session-fastpath-144"
+    src = str(tmp_path / "proj" / "sess.jsonl")
+    entry_ts = (NOW_UTC - dt.timedelta(days=1)).isoformat()
+    # open_cache_db() applies the full live schema, including the ALTER-added
+    # session_files.session_id / project_path columns + idx_session_files_session_id
+    # that the indexed fast path queries (bin/_cctally_db.py:_apply_cache_schema).
+    conn = cct.open_cache_db()
+    try:
+        conn.execute(
+            "INSERT INTO session_files "
+            "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+            " session_id, project_path) "
+            "VALUES (?, 0, 0, 0, ?, ?, ?)",
+            (src, NOW_UTC.isoformat(), sid, "/proj"),
+        )
+        conn.execute(
+            "INSERT INTO session_entries "
+            "(source_path, line_offset, timestamp_utc, model, "
+            " input_tokens, output_tokens, cache_create_tokens, "
+            " cache_read_tokens, cost_usd_raw) "
+            "VALUES (?, 0, ?, ?, 100, 50, 0, 0, 0.01)",
+            (src, entry_ts, "claude-sonnet-4-5"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
     # Tripwire the fallback path. The _cctally_tui shim resolves
     # `get_claude_session_entries` lazily via sys.modules["cctally"],
     # so monkeypatching on the cctally namespace propagates correctly.
@@ -219,7 +244,7 @@ def test_session_detail_fast_path_runs_before_fallback():
     finally:
         cct.get_claude_session_entries = original_get
     assert detail is not None, (
-        "Known session_id must resolve via fast OR slow path."
+        "Seeded session_id must resolve via the indexed fast path."
     )
     assert fallback_calls["n"] == 0, (
         f"Fast path missed for a session_id present in session_files; "

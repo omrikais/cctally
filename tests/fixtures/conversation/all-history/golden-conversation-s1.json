@@ -1,0 +1,59 @@
+{
+  "cost_usd": 0.0175,
+  "git_branch": "main",
+  "items": [
+    {
+      "anchor": {
+        "id": 1,
+        "session_id": "s1",
+        "uuid": "h1"
+      },
+      "blocks": [],
+      "is_sidechain": false,
+      "kind": "human",
+      "member_uuids": [
+        "h1"
+      ],
+      "text": "how does the reset work",
+      "ts": "2026-06-01T00:00:00Z"
+    },
+    {
+      "anchor": {
+        "id": 3,
+        "session_id": "s1",
+        "uuid": "a1b"
+      },
+      "blocks": [
+        {
+          "kind": "thinking",
+          "text": "let me think"
+        },
+        {
+          "kind": "text",
+          "text": "the token limit window resets every five hours"
+        }
+      ],
+      "cost_usd": 0.0175,
+      "is_sidechain": false,
+      "kind": "assistant",
+      "member_uuids": [
+        "a1a",
+        "a1b"
+      ],
+      "model": "claude-opus-4-8",
+      "text": "the token limit window resets every five hours",
+      "ts": "2026-06-01T00:00:04Z"
+    }
+  ],
+  "last_activity_utc": "2026-06-01T00:00:05Z",
+  "models": [
+    "claude-opus-4-8"
+  ],
+  "page": {
+    "has_more": false,
+    "next_after": null
+  },
+  "project_label": "proj",
+  "session_id": "s1",
+  "started_utc": "2026-06-01T00:00:00Z"
+}

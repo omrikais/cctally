@@ -3,7 +3,12 @@ import { Modal } from '../modals/Modal';
 import { getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt } from '../lib/fmt';
-import { alertSeverity, AXIS_CHIP_LABEL, projectedContextText } from '../lib/alertAxis';
+import {
+  alertSeverity,
+  AXIS_CHIP_LABEL,
+  budgetPeriodNoun,
+  projectedContextText,
+} from '../lib/alertAxis';
 import type { AlertEntry } from '../types/envelope';
 
 // Recent alerts modal — full history (last 100). ESC and backdrop
@@ -49,19 +54,45 @@ function ContextCell({
     );
   }
   if (alert.axis === 'budget') {
-    // Budget axis (issue #19): the week anchor is `week_start_at` (the
+    // Budget axis (issue #19): the window anchor is `week_start_at` (the
     // effective post-reset ISO *timestamp*), distinct from weekly's
     // `week_start_date` (a date-only string). `fmt.weekStart` renders a
     // calendar `YYYY-MM-DD`, so slice the date prefix off the timestamp
-    // before routing through it. Show consumption-of-budget as the
-    // secondary.
-    const weekStart = alert.context.week_start_at
-      ? fmt.weekStart(alert.context.week_start_at.slice(0, 10), ctx)
-      : null;
+    // before routing through it. Period generalization
+    // (calendar-period-codex-budgets, spec §6): the noun is period-aware
+    // ("Month" / "Calendar week" / "Week") from `context.period`, so a
+    // calendar budget no longer mislabels as "Week"; the subscription-week
+    // default keeps the legacy "Week of …" rendering byte-stable. Show
+    // consumption-of-budget as the secondary.
+    const noun = budgetPeriodNoun(alert.context.period);
+    const start = alert.context.period_start_at ?? alert.context.week_start_at;
+    const startLabel = start ? fmt.weekStart(start.slice(0, 10), ctx) : null;
     const pct = alert.context.consumption_pct;
     return (
       <span className="alert-context alert-context--budget">
-        {weekStart ? `Week of ${weekStart}` : 'Week —'}
+        {startLabel ? `${noun} of ${startLabel}` : `${noun} —`}
+        {pct != null && (
+          <>
+            {' · '}
+            <span className="num">{Math.round(pct)}% of budget</span>
+          </>
+        )}
+      </span>
+    );
+  }
+  if (alert.axis === 'codex_budget') {
+    // Codex budget axis (calendar-period-codex-budgets, spec §6): per-vendor
+    // Codex budget over a CALENDAR period. The window anchor is
+    // `period_start_at` (the resolved period-window start instant); the noun is
+    // period-aware ("Month" / "Calendar week") from `context.period`.
+    // `consumption_pct` is read from the row (snapshotted at crossing).
+    const noun = budgetPeriodNoun(alert.context.period);
+    const start = alert.context.period_start_at;
+    const startLabel = start ? fmt.weekStart(start.slice(0, 10), ctx) : null;
+    const pct = alert.context.consumption_pct;
+    return (
+      <span className="alert-context alert-context--codex_budget">
+        {startLabel ? `${noun} of ${startLabel}` : `${noun} —`}
         {pct != null && (
           <>
             {' · '}
@@ -123,9 +154,15 @@ function CostCell({ alert }: { alert: AlertEntry }): JSX.Element {
   let v: number | undefined;
   if (alert.axis === 'weekly') {
     v = alert.context.cumulative_cost_usd;
-  } else if (alert.axis === 'budget' || alert.axis === 'project_budget') {
-    // Budget + per-project budget axes (issue #19/#121): the Cost column
-    // shows actual spend (the project's spend for project_budget).
+  } else if (
+    alert.axis === 'budget' ||
+    alert.axis === 'project_budget' ||
+    alert.axis === 'codex_budget'
+  ) {
+    // Budget / per-project / Codex budget axes (issue #19/#121 +
+    // calendar-period-codex-budgets): the Cost column shows actual spend
+    // (the project's spend for project_budget, the Codex API $ for
+    // codex_budget).
     v = alert.context.spent_usd;
   } else {
     v = alert.context.block_cost_usd;

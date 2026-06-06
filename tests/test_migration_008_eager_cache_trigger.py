@@ -477,6 +477,7 @@ def test_v4_recompute_correct_after_eager_trigger_and_post_001_ingest(
     try:
         # Runs to completion in the same invocation.
         db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+        db._stamp_applied(stats, "008_recompute_weekly_cost_snapshots_dedup_fix")  # dispatcher now owns the stamp (#140)
 
         # Snapshot recomputed from the seeded session_entry.
         cost = stats.execute(

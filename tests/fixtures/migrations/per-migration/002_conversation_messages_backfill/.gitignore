@@ -1,0 +1,6 @@
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.lock
+_fake_claude/

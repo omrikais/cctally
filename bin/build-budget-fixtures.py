@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _fixture_builders import (  # noqa: E402
     create_cache_db,
     create_stats_db,
+    seed_codex_session_entry,
     seed_session_entry,
     seed_session_file,
     seed_weekly_usage_snapshot,
@@ -58,6 +59,14 @@ WEEK_END = WEEK_START + dt.timedelta(days=7)
 _ENTRY_INPUT = 100_000
 _ENTRY_OUTPUT = 100_000
 ENTRY_USD = 1.80
+
+# Calendar-period anchor (calendar-period + Codex budgets feature). A June
+# AS_OF puts the calendar-month window at [2026-06-01, 2026-07-01) and the
+# calendar-week window (Monday start) at [2026-06-08, 2026-06-15) for the
+# Wed 2026-06-10 12:00 UTC clock. display.tz=utc so the civil boundary == UTC.
+CAL_AS_OF = dt.datetime(2026, 6, 10, 12, 0, 0, tzinfo=dt.timezone.utc)
+CAL_MONTH_START = dt.datetime(2026, 6, 1, 0, 0, 0, tzinfo=dt.timezone.utc)
+CAL_WEEK_START = dt.datetime(2026, 6, 8, 0, 0, 0, tzinfo=dt.timezone.utc)  # Mon
 
 
 def _iso(d: dt.datetime) -> str:
@@ -146,9 +155,51 @@ def _seed_project_entries(cache_conn, *, projects: dict, as_of: dt.datetime) -> 
             idx += 1
 
 
+def _seed_calendar_claude_entries(cache_conn, *, anchor: dt.datetime, n: int) -> None:
+    """Seed ``n`` Claude session_entries at ``anchor`` (one timestamp) for the
+    calendar-period scenarios. Each is 100k in + 100k out on claude-sonnet-4-6
+    ($1.80). No weekly_usage_snapshots row is needed — calendar budgets resolve
+    the window from the pure calendar fns (spec §4 review #5)."""
+    src = "/fx/budget-calendar.jsonl"
+    seed_session_file(cache_conn, path=src, session_id="cal-s", project_path="/fx/repo")
+    for j in range(n):
+        seed_session_entry(
+            cache_conn,
+            source_path=src,
+            line_offset=j,
+            timestamp_utc=_iso(anchor),
+            model="claude-sonnet-4-6",
+            input_tokens=_ENTRY_INPUT,
+            output_tokens=_ENTRY_OUTPUT,
+        )
+
+
+def _seed_codex_entries(cache_conn, *, anchor: dt.datetime, n: int) -> None:
+    """Seed ``n`` Codex codex_session_entries at ``anchor`` for the Codex
+    budget scenarios. Each is 100k input + 50k output on gpt-5 (a known,
+    non-fallback model), so the Codex spend is deterministic."""
+    for j in range(n):
+        seed_codex_session_entry(
+            cache_conn,
+            source_path=f"/fx/codex-budget-{j}.jsonl",
+            line_offset=j,
+            timestamp_utc=_iso(anchor),
+            session_id=f"cx-s{j}",
+            model="gpt-5",
+            input_tokens=100_000,
+            cached_input_tokens=0,
+            output_tokens=50_000,
+            reasoning_output_tokens=0,
+            total_tokens=150_000,
+        )
+
+
 def _build(name: str, *, as_of: dt.datetime, budget_block: dict,
            n_total: int, n_recent: int, weekly_percent: float,
-           seed_data: bool = True, project_entries: dict | None = None) -> None:
+           seed_data: bool = True, project_entries: dict | None = None,
+           seed_snapshot: bool = True,
+           calendar_claude: tuple | None = None,
+           codex_entries: tuple | None = None) -> None:
     out_dir = FIXTURES_DIR / name
     app_dir = out_dir / ".local" / "share" / "cctally"
     app_dir.mkdir(parents=True, exist_ok=True)
@@ -163,10 +214,28 @@ def _build(name: str, *, as_of: dt.datetime, budget_block: dict,
     stats_conn = sqlite3.connect(stats_path)
     cache_conn = sqlite3.connect(cache_path)
     if seed_data:
-        _seed_window_snapshot(stats_conn, weekly_percent=weekly_percent, as_of=as_of)
+        # Calendar/Codex budgets are DECOUPLED from weekly snapshots — those
+        # scenarios pass seed_snapshot=False to prove the window resolves
+        # without one (spec §4 review #5, §10.9).
+        if seed_snapshot:
+            _seed_window_snapshot(
+                stats_conn, weekly_percent=weekly_percent, as_of=as_of
+            )
+        if calendar_claude is not None:
+            _seed_calendar_claude_entries(
+                cache_conn, anchor=calendar_claude[0], n=calendar_claude[1]
+            )
+        if codex_entries is not None:
+            _seed_codex_entries(
+                cache_conn, anchor=codex_entries[0], n=codex_entries[1]
+            )
         if project_entries is not None:
             _seed_project_entries(cache_conn, projects=project_entries, as_of=as_of)
-        else:
+        elif calendar_claude is None:
+            # Default Claude subscription-week spend path. Runs even when Codex
+            # entries are ALSO seeded (the both-vendors scenario) so the Claude
+            # block has its own spend; skipped only when the Claude side is a
+            # calendar-window seed.
             _seed_entries(cache_conn, n_total=n_total, n_recent=n_recent, as_of=as_of)
     stats_conn.commit(); stats_conn.close()
     cache_conn.commit(); cache_conn.close()
@@ -287,6 +356,58 @@ SCENARIOS = {
             "/fake/work/app": 9,
             "/fake/personal/app": 4,
         },
+    ),
+    # ── Calendar-period + Codex budgets (spec §4/§5/§10) ────────────────────
+    # Claude calendar-month budget. NO weekly_usage_snapshots row is seeded
+    # (seed_snapshot=False) — calendar budgets resolve their window from the
+    # pure calendar fns, NOT a snapshot (spec §4 review #5). 20 entries → $36
+    # on a $300 month → 12% → ok. Header reads `(calendar month 2026-06)`.
+    "claude-calendar-month": dict(
+        as_of=CAL_AS_OF,
+        budget_block={"weekly_usd": 300.0, "period": "calendar-month",
+                      "alerts_enabled": True, "alert_thresholds": [90, 100]},
+        n_total=0, n_recent=0, weekly_percent=0.0,
+        seed_snapshot=False,
+        calendar_claude=(CAL_MONTH_START + dt.timedelta(days=2), 20),
+    ),
+    # Claude calendar-week budget (Monday start → [2026-06-08, 06-15)). 10
+    # entries → $18 on a $100 week → 18% → ok. Header reads
+    # `(calendar week 2026-06-08 → 06-15)`.
+    "claude-calendar-week": dict(
+        as_of=CAL_AS_OF,
+        budget_block={"weekly_usd": 100.0, "period": "calendar-week",
+                      "alerts_enabled": True, "alert_thresholds": [90, 100]},
+        n_total=0, n_recent=0, weekly_percent=0.0,
+        seed_snapshot=False,
+        calendar_claude=(CAL_WEEK_START + dt.timedelta(hours=6), 10),
+    ),
+    # Codex-only calendar-month budget (no Claude budget). 16 codex gpt-5
+    # entries → $10.00 on a $200 month → 5% → ok. Bare `cctally budget` shows
+    # the no-Claude-budget message + the Codex sibling section.
+    "codex-only": dict(
+        as_of=CAL_AS_OF,
+        budget_block={"codex": {"amount_usd": 200.0, "period": "calendar-month",
+                                "alerts_enabled": True,
+                                "alert_thresholds": [90, 100]}},
+        n_total=0, n_recent=0, weekly_percent=0.0,
+        seed_snapshot=False,
+        codex_entries=(CAL_MONTH_START + dt.timedelta(days=3), 16),
+    ),
+    # Both vendors: Claude subscription-week + Codex calendar-month. The
+    # Claude block relabels to `Claude budget … — equivalent-$` (coexists), the
+    # Codex sibling renders below. A weekly snapshot IS seeded so the Claude
+    # subscription-week window resolves; the WEEK_START anchor is reused.
+    # Claude: 40 entries → $72 on a $300 week → 24%. Codex: 24 gpt-5 entries →
+    # $15.00 on a $200 month → 7.5%.
+    "both-vendors": dict(
+        as_of=WEEK_START + dt.timedelta(hours=96),
+        budget_block={"weekly_usd": 300.0, "alerts_enabled": True,
+                      "alert_thresholds": [90, 100],
+                      "codex": {"amount_usd": 200.0, "period": "calendar-month",
+                                "alerts_enabled": True,
+                                "alert_thresholds": [90, 100]}},
+        n_total=40, n_recent=10, weekly_percent=40.0,
+        codex_entries=(WEEK_START + dt.timedelta(hours=12), 24),
     ),
 }
 

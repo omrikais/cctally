@@ -891,11 +891,19 @@ def test_backfill_detects_historical_in_place_credit(ns):
         conn.close()
 
 
-def test_backfill_detects_historical_reset_to_zero(ns):
-    """Backfill parity for the reset-to-zero branch: snapshots showing
-    14→0 with the SAME week_end on consecutive in-window captures. Drop
-    is 14pp (< 25pp) but the post value is ~0, so backfill synthesizes
-    the in-place event the live detector would have written.
+def test_backfill_skips_historical_reset_to_zero(ns):
+    """Backfill is STRICT (>=25pp only): a sub-25pp reset-to-zero
+    (14→0 on the SAME week_end) must NOT synthesize an event.
+
+    The lenient reset-to-zero discriminator (``cur <= 1pp and drop >= 3pp``)
+    is scoped to LIVE current-week detection, where the #128 debounce
+    filters transient API zeros. The historical one-shot
+    ``_backfill_week_reset_events`` scan has NO debounce, so applying
+    reset-to-zero there mis-read a single stale-replica 0% reading as a
+    goodwill credit and segmented the week into a degenerate zero-width
+    window (the Feb-27 prod regression). Backfill now defers sub-25pp
+    resets to the live path. A genuine ≥25pp credit still backfills — see
+    ``test_backfill_detects_historical_in_place_credit``.
     """
     end_iso, _ = _future_week_end_iso()
     week_start_date, _ = _week_start_for(end_iso)
@@ -919,18 +927,55 @@ def test_backfill_detects_historical_reset_to_zero(ns):
         conn.commit()
         ns["_backfill_week_reset_events"](conn)
 
-        events = conn.execute(
-            "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
-            "FROM week_reset_events"
-        ).fetchall()
-        assert len(events) == 1, events
-        assert events[0]["new_week_end_at"] == end_iso
-        assert events[0]["old_week_end_at"] == events[0]["effective_reset_at_utc"]
-        assert events[0]["old_week_end_at"] != events[0]["new_week_end_at"]
-        eff_dt = dt.datetime.fromisoformat(events[0]["effective_reset_at_utc"])
-        assert eff_dt.astimezone(dt.timezone.utc) == dt.datetime(
-            2026, 5, 14, 17, 0, 0, tzinfo=dt.timezone.utc
+        cnt = conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0]
+        assert cnt == 0, "sub-25pp reset-to-zero must NOT backfill (live-only)"
+    finally:
+        conn.close()
+
+
+def test_backfill_skips_stale_replica_zero_blip(ns):
+    """Regression for the Feb-27 prod false positive.
+
+    A transient stale-replica 0% reading mid-week — usage climbs
+    ``6% → 0% → 1%`` on the SAME (future) week_end — must NOT synthesize a
+    reset event in backfill. This is the exact shape that segmented the
+    ``2026-02-27 → 2026-03-06`` week into a degenerate zero-width window in
+    ``get_recent_weeks``: backfill's in-place branch fired on ``6→0`` via
+    the lenient reset-to-zero discriminator, and (unlike the live path) had
+    no debounce to clear it when usage recovered to ``1%``. With the strict
+    >=25pp backfill gate the ``6pp`` drop is ignored.
+    """
+    end_iso, _ = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-13T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=6.0,
         )
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T07:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=0.0,
+        )
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T08:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=1.0,
+        )
+        conn.commit()
+        ns["_backfill_week_reset_events"](conn)
+
+        cnt = conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0]
+        assert cnt == 0, "stale-replica 0% blip must not backfill a reset event"
     finally:
         conn.close()
 

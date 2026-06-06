@@ -58,6 +58,7 @@ severity != `OK`.
 ### Database
 - `db.stats.file` — WARN when stats.db is absent (fresh install); FAIL when present but cannot open.
 - `db.cache.file` — WARN when cache.db is absent; FAIL when present but cannot open.
+- `db.version_ahead` — flags a DB whose `user_version` exceeds this binary's migration-registry head (a newer/unreleased cctally touched the data dir; issue #145). FAIL when **stats.db** is ahead — it bricks every stats-opening command and is not re-derivable; remediation: `cctally db recover --db stats --yes` (or restore from backup). WARN when only **cache.db** is ahead — it auto-heals on the next open (cache is re-derivable); remediation: it heals automatically, or run `cctally db recover --db cache`. OK ("none ahead") otherwise. `doctor` reads the raw `user_version` (no migration dispatcher), so it can report version-ahead without itself healing or bricking.
 - `db.migrations.applied` — WARN on `skipped` rows; FAIL on `failed` rows.
 - `db.migrations.pending` — WARN when any migration is pending.
 

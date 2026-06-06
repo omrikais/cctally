@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# Golden-file harness for the conversation-viewer endpoints (Plan 2, §3 / §6.8).
+#
+# Boots `cctally dashboard` against the seeded fixture cache.db and drives the
+# three conversation GET routes + the loopback/Host privacy gate end-to-end:
+#
+#   - Rebuilds the fixture (cache.db + stats.db) via build-conversation-fixtures.
+#   - Starts the server on an ephemeral port (--port 0) with --no-sync
+#     --no-browser, pinned to HOME=<scratch> and a LOOPBACK bind (127.0.0.1).
+#   - GET /api/conversations (loopback Host)         → all-history rail, >=2
+#     sessions; pagination probe `?limit=1&offset=0` → has_more:true + a
+#     next_offset.
+#   - GET /api/conversation/s1 (loopback Host)        → resume-merged, deduped
+#     items, the (m1,r1) turn ONCE with cost ONCE, sum(items.cost)==cost_usd,
+#     cursor shape present.
+#   - GET /api/conversation/search?q=token (loopback) → the prose-fragment hit
+#     deduped across the replay to ONE, (session_id,uuid) anchor present, the
+#     multi-fragment turn resolves to a single turn item.
+#   - GATE: the SAME GET /api/conversations but with a LAN-hostname `Host`
+#     header (expose unset → default false) → 403 (the anti-DNS-rebinding gate
+#     rejects a hostname Host even on a loopback bind). A default (loopback
+#     Host) request to the same route returns 200 — proving the 403 is the Host
+#     gate, not a broken route.
+#
+# Each JSON body is normalized (wall-clock fields → sentinels) and diffed
+# against tests/fixtures/conversation/<scenario>/golden-*.json. First run writes
+# each golden; steady-state is a byte-stable diff. Every compare routes through
+# bin/_lib-golden-diff.sh (NEVER inline `diff -u <(…)` — #106/#107). A trap
+# kills any stray server PID on exit / Ctrl-C.
+#
+# Single scenario, run sequentially (the gate truth-table is driven by Host
+# headers, not by separate fixture trees), so no xargs fan-out here.
+
+set -uo pipefail
+
+# Dev-instance isolation: force prod data-dir layout under fake HOME.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN="$REPO_ROOT/bin/cctally"
+FIX_DIR="$REPO_ROOT/tests/fixtures/conversation"
+
+# Robust golden comparison (#106/#107): ONE `diff` over real files drives both
+# the verdict and the displayed bytes — no `<(process substitution)`.
+# shellcheck source=bin/_lib-golden-diff.sh
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
+# Per-run scratch root. The scenario's HOME is a clone of the in-tree fixture's
+# .local tree, so the dashboard server's startup writes (e.g. SQLite WAL) never
+# dirty the committed fixture.
+SCRATCH_ROOT=$(mktemp -d -t cctally-conversation-test.XXXXXX)
+GOLDEN_DIFF_TMPDIR="$SCRATCH_ROOT"
+
+pass_count=0
+fail_count=0
+
+declare -a BG_PIDS=()
+cleanup () {
+    for p in "${BG_PIDS[@]:-}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${BG_PIDS[@]:-}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+    rm -rf "$SCRATCH_ROOT"
+}
+trap cleanup EXIT INT TERM
+
+echo ">> rebuilding fixtures"
+"$REPO_ROOT/bin/build-conversation-fixtures.py" >/dev/null || {
+    echo "FAIL: build-conversation-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+# The search golden's `mode:"fts"` + bracketed `[token]` snippet are FTS5-
+# specific (SQLite's snippet()); on a build lacking FTS5 the kernel falls back
+# to LIKE + a manual snippet, so the byte-exact search-golden diff would
+# diverge. Probe once and gate ONLY the search-golden byte-compare on FTS5 —
+# the structural search asserts (dedup-to-one / anchor / cost) are mode-agnostic
+# and always run. Mirrors tests/test_conversation_query.py's FTS5 skip.
+FTS5_AVAILABLE=$(python3 -c '
+import sqlite3
+c = sqlite3.connect(":memory:")
+try:
+    c.execute("CREATE VIRTUAL TABLE _p USING fts5(x)")
+    print("1")
+except sqlite3.OperationalError:
+    print("0")
+')
+
+# Normalize a conversation JSON body so re-runs are byte-stable. The payloads
+# are already wall-clock-independent (every timestamp is fixture-pinned and
+# anchor ids are deterministic insert order), but normalize defensively the
+# same way bin/cctally-dashboard-test does, so a future field addition that
+# leaks wall time into the golden trips here instead of flaking. Stdin: raw
+# JSON. Stdout: sorted-key, 2-space-indent JSON.
+normalize_json () {
+    python3 -c '
+import json, sys
+body = json.load(sys.stdin)
+# No wall-clock fields exist in the conversation payloads today; re-serialize
+# with sorted keys + 2-space indent so the golden is canonical and stable.
+print(json.dumps(body, indent=2, sort_keys=True))
+'
+}
+
+fail () {
+    echo "FAIL ${name:-?}: $1"
+    ok=0
+}
+
+# fetch_and_diff <label> <golden-basename> <url> [extra curl args...]
+#   GET the url, normalize, diff against the named golden (writing it on first
+#   run). Marks `ok=0` on any failure. Uses the golden-diff chokepoint.
+fetch_and_diff () {
+    local label="$1" golden_base="$2" url="$3"; shift 3
+    local golden="$dir/$golden_base"
+    local raw actual
+    raw=$(curl -s --max-time 5 "$@" "$url")
+    if [ -z "$raw" ]; then
+        fail "$label: empty body ($url)"
+        return
+    fi
+    actual=$(printf '%s' "$raw" | normalize_json)
+    if [ $? -ne 0 ] || [ -z "$actual" ]; then
+        fail "$label: JSON could not be normalized (raw: $raw)"
+        return
+    fi
+    if [ ! -f "$golden" ]; then
+        printf '%s\n' "$actual" > "$golden"
+        echo "WROTE $name golden: $golden"
+    else
+        _golden_diff_str "$label" "$golden" "$actual" 5000 || ok=0
+    fi
+}
+
+run_scenario () {
+    name="$1"
+    dir="$FIX_DIR/$name"
+    ok=1
+
+    if [ ! -f "$dir/input.env" ]; then
+        fail "no input.env at $dir/input.env"
+        return 1
+    fi
+
+    local loopback_host lan_host search_q
+    loopback_host=$(grep '^LOOPBACK_HOST=' "$dir/input.env" | head -1 | cut -d= -f2-)
+    lan_host=$(grep '^LAN_HOSTNAME_HOST=' "$dir/input.env" | head -1 | cut -d= -f2-)
+    search_q=$(grep '^SEARCH_QUERY=' "$dir/input.env" | head -1 | cut -d= -f2-)
+    : "${loopback_host:=127.0.0.1}"
+    : "${lan_host:=lan-host.example.com}"
+    : "${search_q:=token}"
+
+    # Clone the in-tree fixture's .local tree into scratch HOME so server
+    # startup writes (SQLite WAL etc.) can't dirty the committed fixture.
+    local scratch_home="$SCRATCH_ROOT/$name"
+    mkdir -p "$scratch_home"
+    cp -R "$dir/.local" "$scratch_home/"
+
+    local log="$scratch_home/server.log"
+    # Loopback bind + default expose (unset → false). The gate's 403 leg below
+    # rejects a LAN-hostname Host even on this loopback bind.
+    HOME="$scratch_home" TZ=Etc/UTC \
+        "$BIN" dashboard --port 0 --no-browser --no-sync \
+        --sync-interval 9999 --host 127.0.0.1 >"$log" 2>&1 &
+    local pid=$!
+    BG_PIDS+=("$pid")
+
+    # Discover the ephemeral port from the banner (up to ~15s for cold runners).
+    local port="" tries=0
+    while [ $tries -lt 150 ]; do
+        if [ -s "$log" ]; then
+            port=$(grep -Eo 'http://(127\.0\.0\.1|localhost):[0-9]+' "$log" | head -1 | sed 's#.*:##')
+            [ -n "$port" ] && break
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+
+    if [ -z "$port" ]; then
+        fail "could not discover port (log: $log)"
+        sed 's/^/    /' "$log" 2>/dev/null || true
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        return 1
+    fi
+
+    local base="http://127.0.0.1:$port"
+    # Loopback Host header pinned on the 200-path requests. (curl's default Host
+    # would be 127.0.0.1:<port> — a loopback IP literal, which the gate also
+    # allows — but pin it explicitly so the contract is legible.)
+    local LOOP=(-H "Host: ${loopback_host}:${port}")
+
+    # --- 1) Rail: full page + pagination probe ---------------------------
+    fetch_and_diff "GET /api/conversations" "golden-conversations.json" \
+        "$base/api/conversations" "${LOOP[@]}"
+
+    # Pagination: limit=1&offset=0 must page (>=2 sessions seeded).
+    local page_raw page_check
+    page_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversations?limit=1&offset=0")
+    page_check=$(printf '%s' "$page_raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+errs = []
+convs = d.get("conversations")
+if not isinstance(convs, list) or len(convs) != 1:
+    errs.append("limit=1 did not return exactly 1 conversation: %r" % (convs,))
+page = d.get("page") or {}
+if page.get("has_more") is not True:
+    errs.append("page.has_more != True under limit=1: %r" % (page.get("has_more"),))
+if page.get("next_offset") != 1:
+    errs.append("page.next_offset != 1: %r" % (page.get("next_offset"),))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+    if [ "$page_check" != "ok" ]; then
+        fail "rail pagination: $page_check (raw: $page_raw)"
+    fi
+
+    # --- 2) Reader: resume-merged, deduped, cost-once --------------------
+    fetch_and_diff "GET /api/conversation/s1" "golden-conversation-s1.json" \
+        "$base/api/conversation/s1" "${LOOP[@]}"
+
+    # Non-golden structural asserts: the (m1,r1) turn appears ONCE, cost ONCE,
+    # sum(items.cost)==header cost_usd, cursor shape present.
+    local reader_raw reader_check
+    reader_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s1")
+    reader_check=$(printf '%s' "$reader_raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+errs = []
+items = d.get("items") or []
+kinds = [it.get("kind") for it in items]
+if kinds != ["human", "assistant"]:
+    errs.append("items kinds != [human, assistant] (replay/fragments not deduped): %r" % (kinds,))
+assistants = [it for it in items if it.get("kind") == "assistant"]
+if len(assistants) != 1:
+    errs.append("turn not collapsed to ONE assistant item: %d" % (len(assistants),))
+else:
+    turn = assistants[0]
+    if set(turn.get("member_uuids") or []) != {"a1a", "a1b"}:
+        errs.append("member_uuids != {a1a,a1b}: %r" % (turn.get("member_uuids"),))
+    anc = turn.get("anchor") or {}
+    if anc.get("session_id") != "s1" or anc.get("uuid") != "a1b":
+        errs.append("turn anchor != (s1, a1b): %r" % (anc,))
+    if not (turn.get("cost_usd", 0.0) > 0):
+        errs.append("turn cost_usd not > 0: %r" % (turn.get("cost_usd"),))
+# Cost counted exactly once despite the cross-file replay.
+s = sum(it.get("cost_usd", 0.0) for it in items)
+if abs(s - d.get("cost_usd", 0.0)) >= 1e-9:
+    errs.append("sum(items.cost_usd)=%r != header cost_usd=%r" % (s, d.get("cost_usd")))
+page = d.get("page") or {}
+if "next_after" not in page or "has_more" not in page:
+    errs.append("cursor shape missing (next_after/has_more): %r" % (page,))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+    if [ "$reader_check" != "ok" ]; then
+        fail "reader dedup/cost-once: $reader_check (raw: $reader_raw)"
+    fi
+
+    # --- 3) Search: deduped across replay to ONE hit ---------------------
+    # Byte-exact golden only when FTS5 is present (the golden is FTS-shaped);
+    # the structural asserts below run unconditionally.
+    if [ "$FTS5_AVAILABLE" = "1" ]; then
+        fetch_and_diff "GET /api/conversation/search" "golden-search.json" \
+            "$base/api/conversation/search?q=$search_q" "${LOOP[@]}"
+    else
+        echo "SKIP $name search golden-diff: sqlite build lacks FTS5 (structural asserts still run)"
+    fi
+
+    local search_raw search_check
+    search_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/search?q=$search_q")
+    search_check=$(printf '%s' "$search_raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+errs = []
+hits = d.get("hits") or []
+# The prose fragment is replayed across two source_paths — the multi-fragment
+# turn must resolve to exactly ONE hit on (session_id, uuid).
+if len(hits) != 1:
+    errs.append("replay not deduped to ONE hit: %d" % (len(hits),))
+else:
+    h = hits[0]
+    if h.get("session_id") != "s1" or h.get("uuid") != "a1b":
+        errs.append("hit anchor != (s1, a1b): %r" % ((h.get("session_id"), h.get("uuid")),))
+    if not (h.get("cost_usd", 0.0) > 0):
+        errs.append("hit cost_usd not > 0: %r" % (h.get("cost_usd"),))
+if d.get("total") != 1:
+    errs.append("total != 1: %r" % (d.get("total"),))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+    if [ "$search_check" != "ok" ]; then
+        fail "search dedup: $search_check (raw: $search_raw)"
+    fi
+
+    # --- 4) Gate: LAN-hostname Host → 403 on a loopback bind -------------
+    # Default request (loopback Host) returns 200 — proving the route works and
+    # the 403 below is the Host gate, not a broken route.
+    local loop_code
+    loop_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        "${LOOP[@]}" "$base/api/conversations")
+    if [ "$loop_code" != "200" ]; then
+        fail "gate: loopback-Host /api/conversations returned $loop_code (expected 200)"
+    fi
+    # LAN-hostname Host with expose unset (default false) → anti-DNS-rebinding
+    # gate rejects with 403 EVEN on a loopback bind.
+    local lan_code
+    lan_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        -H "Host: $lan_host" "$base/api/conversations")
+    if [ "$lan_code" != "403" ]; then
+        fail "gate: LAN-hostname Host /api/conversations returned $lan_code (expected 403)"
+    fi
+    # The 403 body is the JSON gate shape, not a route 404.
+    local lan_body lan_body_check
+    lan_body=$(curl -s --max-time 5 -H "Host: $lan_host" "$base/api/conversations")
+    lan_body_check=$(printf '%s' "$lan_body" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception as exc:
+    sys.exit("403 body not JSON: %s" % (exc,))
+if "error" not in d:
+    sys.exit("403 body missing error key: %r" % (d,))
+print("ok")
+' 2>&1)
+    if [ "$lan_body_check" != "ok" ]; then
+        fail "gate: 403 body shape: $lan_body_check (raw: $lan_body)"
+    fi
+
+    # The gate also covers the reader + search routes (same _require helper).
+    local lan_reader_code lan_search_code
+    lan_reader_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        -H "Host: $lan_host" "$base/api/conversation/s1")
+    if [ "$lan_reader_code" != "403" ]; then
+        fail "gate: LAN-hostname Host /api/conversation/s1 returned $lan_reader_code (expected 403)"
+    fi
+    lan_search_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        -H "Host: $lan_host" "$base/api/conversation/search?q=$search_q")
+    if [ "$lan_search_code" != "403" ]; then
+        fail "gate: LAN-hostname Host /api/conversation/search returned $lan_search_code (expected 403)"
+    fi
+
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+
+    if [ "$ok" = "1" ]; then
+        echo "PASS $name"
+        return 0
+    fi
+    return 1
+}
+
+# Single scenario, sequential.
+for scenario in all-history; do
+    if run_scenario "$scenario"; then
+        pass_count=$((pass_count + 1))
+    else
+        fail_count=$((fail_count + 1))
+    fi
+done
+
+echo
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" = "0" ]

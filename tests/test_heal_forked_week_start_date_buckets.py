@@ -116,6 +116,7 @@ def test_usage_snapshot_forked_row_is_rekeyed(ns):
     conn.commit()
 
     _migration_handler(ns)(conn)
+    ns["_stamp_applied"](conn, "004_heal_forked_week_start_date_buckets")  # dispatcher now owns the stamp (#140)
 
     dates = [r["week_start_date"] for r in conn.execute(
         "SELECT week_start_date FROM weekly_usage_snapshots ORDER BY id"
@@ -260,8 +261,9 @@ def test_rerun_is_noop(ns):
 
 
 def test_empty_fork_fast_path_just_stamps_marker(ns):
-    """When no forked rows exist, the migration stamps the marker
-    without touching any data rows."""
+    """When no forked rows exist, the migration's no-fork early return
+    leaves data rows untouched; the dispatcher central-stamps the marker
+    on the clean return (#140)."""
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     _seed_schema(conn)
@@ -275,6 +277,7 @@ def test_empty_fork_fast_path_just_stamps_marker(ns):
     conn.commit()
 
     _migration_handler(ns)(conn)
+    ns["_stamp_applied"](conn, "004_heal_forked_week_start_date_buckets")  # dispatcher now owns the stamp (#140)
 
     # Marker present.
     assert conn.execute(

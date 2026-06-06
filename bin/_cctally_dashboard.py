@@ -286,7 +286,7 @@ from _lib_subscription_weeks import _compute_subscription_weeks
 from _lib_blocks import _group_entries_into_blocks
 from _cctally_config import save_config, _load_config_unlocked
 from _cctally_db import _render_migration_error_banner
-from _cctally_cache import get_entries
+from _cctally_cache import get_entries, open_cache_db
 
 
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
@@ -343,6 +343,12 @@ def _build_alert_payload_projected(*args, **kwargs):
 
 def _build_alert_payload_project_budget(*args, **kwargs):
     return sys.modules["cctally"]._build_alert_payload_project_budget(
+        *args, **kwargs
+    )
+
+
+def _build_alert_payload_codex_budget(*args, **kwargs):
+    return sys.modules["cctally"]._build_alert_payload_codex_budget(
         *args, **kwargs
     )
 
@@ -4181,14 +4187,29 @@ def _envelope_rows_five_hour(conn, descriptor, limit, severity_for) -> list[dict
 def _envelope_rows_budget(conn, descriptor, limit, severity_for) -> list[dict]:
     # Third axis (issue #19): equiv-$ budget threshold crossings. Budget
     # alerts are keyed by the effective (post-reset) week_start_at + the
-    # integer threshold; the envelope id mirrors the dispatch payload's
-    # ``budget:<week_start_at>:<threshold>`` shape
+    # write-once ``period`` discriminator + the integer threshold; the envelope
+    # id mirrors the dispatch payload's
+    # ``budget:<week_start_at>:<period>:<threshold>`` shape
     # (``_build_alert_payload_budget``). No ``reset_event_id`` segment —
     # a mid-week reset re-anchors ``week_start_at`` so the new window
-    # naturally gets fresh rows under ``UNIQUE(week_start_at, threshold)``.
+    # naturally gets fresh rows under
+    # ``UNIQUE(week_start_at, period, threshold)``.
+    #
+    # Period generalization (calendar-period-codex-budgets, spec §5/§6): the
+    # ``week_start_at`` key column carries either a subscription-week instant
+    # OR a calendar period-start instant (back-compat misnomer, like
+    # ``weekly_usd``); the ``period`` discriminator (#137) tells them apart.
+    # ``period`` is read FROM THE ROW (snapshotted at crossing), never live
+    # config that may have changed since (the Codex P0-4 lesson) — so a user who
+    # fires subscription-week alerts then switches ``budget.period`` keeps the
+    # historical row's noun (Symptom 1 fix). ``COALESCE(period,
+    # 'subscription-week')`` renders a pre-011 NULL-sentinel row with the
+    # vendor-default noun and keeps the ``id`` non-``None``.
     rows = conn.execute(
         f"""
-        SELECT week_start_at, threshold, crossed_at_utc, alerted_at,
+        SELECT week_start_at,
+               COALESCE(period, 'subscription-week') AS period,
+               threshold, crossed_at_utc, alerted_at,
                budget_usd, spent_usd, consumption_pct
         FROM {descriptor.milestone_table}
         WHERE alerted_at IS NOT NULL
@@ -4201,7 +4222,7 @@ def _envelope_rows_budget(conn, descriptor, limit, severity_for) -> list[dict]:
     for r in rows:
         threshold = int(r["threshold"])
         out.append({
-            "id":         f"budget:{r['week_start_at']}:{threshold}",
+            "id":         f"budget:{r['week_start_at']}:{r['period']}:{threshold}",
             "axis":       descriptor.id,
             "threshold":  threshold,
             "severity":   severity_for(threshold),
@@ -4209,6 +4230,8 @@ def _envelope_rows_budget(conn, descriptor, limit, severity_for) -> list[dict]:
             "alerted_at": r["alerted_at"],
             "context": {
                 "week_start_at":   r["week_start_at"],
+                "period":          r["period"],
+                "period_start_at": r["week_start_at"],
                 "budget_usd":      float(r["budget_usd"]),
                 "spent_usd":       float(r["spent_usd"]),
                 "consumption_pct": float(r["consumption_pct"]),
@@ -4221,16 +4244,23 @@ def _envelope_rows_projected(conn, descriptor, limit, severity_for) -> list[dict
     # Fourth axis (issue #121): projected-pace threshold crossings. Like
     # budget, projected alerts re-anchor ``week_start_at`` on a mid-week
     # reset, so there is NO ``reset_event_id`` segment — the new window gets
-    # fresh rows under ``UNIQUE(week_start_at, metric, threshold)``. The
-    # ``metric`` discriminator (``weekly_pct`` | ``budget_usd``) drives the
-    # frontend's metric-aware context renderer; ``denominator`` +
-    # ``projected_value`` are rendered FROM THE ROW (the values snapshotted at
-    # crossing), never live config that may have changed since (Codex P0-4).
-    # The envelope id mirrors the dispatch payload's
-    # ``projected:<week_start_at>:<metric>:<threshold>`` shape.
+    # fresh rows under ``UNIQUE(week_start_at, period, metric, threshold)``. The
+    # ``metric`` discriminator (``weekly_pct`` | ``budget_usd`` |
+    # ``codex_budget_usd``) drives the frontend's metric-aware context renderer;
+    # ``denominator`` + ``projected_value`` are rendered FROM THE ROW (the values
+    # snapshotted at crossing), never live config that may have changed since
+    # (Codex P0-4). The envelope id mirrors the dispatch payload's
+    # ``projected:<week_start_at>:<period>:<metric>:<threshold>`` shape. The
+    # write-once ``period`` discriminator (#137) carries no symptom-1 label here
+    # — projected's ``context`` is metric-driven, never a live-config period
+    # noun — so ``COALESCE(period, 'subscription-week')`` is purely for a stable
+    # non-``None`` id segment on a pre-011 NULL-sentinel row (the calendar-week ↔
+    # calendar-month within-metric collision otherwise shares a React key).
     rows = conn.execute(
         f"""
-        SELECT week_start_at, metric, threshold, projected_value,
+        SELECT week_start_at,
+               COALESCE(period, 'subscription-week') AS period,
+               metric, threshold, projected_value,
                denominator, crossed_at_utc, alerted_at
         FROM {descriptor.milestone_table}
         WHERE alerted_at IS NOT NULL
@@ -4244,7 +4274,10 @@ def _envelope_rows_projected(conn, descriptor, limit, severity_for) -> list[dict
         threshold = int(r["threshold"])
         metric = str(r["metric"])
         out.append({
-            "id":         f"projected:{r['week_start_at']}:{metric}:{threshold}",
+            "id": (
+                f"projected:{r['week_start_at']}:{r['period']}"
+                f":{metric}:{threshold}"
+            ),
             "axis":       descriptor.id,
             "metric":     metric,
             "threshold":  threshold,
@@ -4321,6 +4354,66 @@ def _envelope_rows_project_budget(conn, descriptor, limit, severity_for) -> list
     return out
 
 
+def _envelope_rows_codex_budget(conn, descriptor, limit, severity_for) -> list[dict]:
+    # Sixth axis (calendar-period-codex-budgets, spec §6): per-vendor Codex
+    # equiv-actual-$ budget threshold crossings over a CALENDAR period
+    # (calendar-week / calendar-month — Codex has no Anthropic subscription
+    # week). Keyed on ``period_start_at`` (the resolved period-window start
+    # instant, stored as the ``isoformat(timespec="seconds")`` ``+00:00`` offset
+    # form, NOT a ``Z`` suffix) + the integer threshold; the envelope id mirrors
+    # the dispatch payload's ``codex_budget:<period_start_at>:<threshold>`` shape
+    # (``_build_alert_payload_codex_budget``). NO ``reset_event_id`` segment —
+    # rolling to the next period yields a fresh ``period_start_at`` so the new
+    # window naturally gets fresh rows under ``UNIQUE(period_start_at,
+    # threshold)``. ``budget_usd`` / ``spent_usd`` / ``consumption_pct`` are
+    # rendered FROM THE ROW (snapshotted at crossing), never live config that may
+    # have changed since (the Codex P0-4 lesson). The ``period`` discriminator is
+    # the write-once ``period`` discriminator (#137) is read FROM THE ROW
+    # (snapshotted at crossing) — mirroring how the dispatched payload sourced it
+    # from config-at-fire-time — never live ``budget.codex.period`` that may have
+    # changed since (the Codex P0-4 lesson; Symptom 1 fix). ``COALESCE(period,
+    # 'calendar-month')`` renders a pre-011 NULL-sentinel row with the
+    # vendor-default civil-period noun (Codex has no subscription week) and keeps
+    # the ``id`` non-``None``. The id gains the ``period`` segment so a
+    # calendar-week ↔ calendar-month coinciding-instant collision (now distinct
+    # coexisting rows under ``UNIQUE(period_start_at, period, threshold)``) gets
+    # distinct React keys.
+    rows = conn.execute(
+        f"""
+        SELECT period_start_at,
+               COALESCE(period, 'calendar-month') AS period,
+               threshold, crossed_at_utc, alerted_at,
+               budget_usd, spent_usd, consumption_pct
+        FROM {descriptor.milestone_table}
+        WHERE alerted_at IS NOT NULL
+        ORDER BY alerted_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        threshold = int(r["threshold"])
+        out.append({
+            "id": (
+                f"codex_budget:{r['period_start_at']}:{r['period']}:{threshold}"
+            ),
+            "axis":       descriptor.id,
+            "threshold":  threshold,
+            "severity":   severity_for(threshold),
+            "crossed_at": r["crossed_at_utc"],
+            "alerted_at": r["alerted_at"],
+            "context": {
+                "period":          r["period"],
+                "period_start_at": r["period_start_at"],
+                "budget_usd":      float(r["budget_usd"]),
+                "spent_usd":       float(r["spent_usd"]),
+                "consumption_pct": float(r["consumption_pct"]),
+            },
+        })
+    return out
+
+
 # Keyed by ``AlertAxisDescriptor.id`` — the registry decides which axes run,
 # in what order; this table supplies the bespoke heterogeneous row-mapper.
 _ENVELOPE_AXIS_MAPPERS = {
@@ -4329,6 +4422,7 @@ _ENVELOPE_AXIS_MAPPERS = {
     "budget": _envelope_rows_budget,
     "projected": _envelope_rows_projected,
     "project_budget": _envelope_rows_project_budget,
+    "codex_budget": _envelope_rows_codex_budget,
 }
 
 
@@ -4339,20 +4433,24 @@ def _build_alerts_envelope_array(
     """Return the ``alerts`` array for the SSE snapshot envelope.
 
     Union of ``percent_milestones``, ``five_hour_milestones``,
-    ``budget_milestones``, ``projected_milestones``, and
-    ``project_budget_milestones`` rows with ``alerted_at IS NOT NULL``,
-    ordered newest-first by ``alerted_at``, capped at ``limit`` (default 100).
-    Single source of truth for both the dashboard panel (slices to 10
-    client-side) and the modal (renders all 100). Forward-only semantics: only
-    rows the alert-dispatch path stamped get included; pre-deploy crossings
-    stay NULL and are intentionally invisible (spec §4.3).
+    ``budget_milestones``, ``projected_milestones``,
+    ``project_budget_milestones``, and ``codex_budget_milestones`` rows with
+    ``alerted_at IS NOT NULL``, ordered newest-first by ``alerted_at``, capped at
+    ``limit`` (default 100). Single source of truth for both the dashboard panel
+    (slices to 10 client-side) and the modal (renders all 100). Forward-only
+    semantics: only rows the alert-dispatch path stamped get included; pre-deploy
+    crossings stay NULL and are intentionally invisible (spec §4.3).
 
-    All five axes share the same envelope schema; the ``axis`` field
+    All six axes share the same envelope schema; the ``axis`` field
     (``weekly`` / ``five_hour`` / ``budget`` / ``projected`` /
-    ``project_budget``) discriminates. The ``projected`` axis additionally
-    carries a top-level ``metric`` (``weekly_pct`` | ``budget_usd``) so the
-    frontend can pick its metric-aware context renderer; ``project_budget``
-    carries the project basename + ``$spent of $budget`` in its context.
+    ``project_budget`` / ``codex_budget``) discriminates. The ``projected`` axis
+    additionally carries a top-level ``metric`` (``weekly_pct`` | ``budget_usd``
+    | ``codex_budget_usd``) so the frontend can pick its metric-aware context
+    renderer; ``project_budget``
+    carries the project basename + ``$spent of $budget`` in its context;
+    ``budget`` + ``codex_budget`` carry a ``period`` discriminator
+    (subscription-week / calendar-week / calendar-month) so the frontend renders
+    a period-aware "Month" / "Calendar week" / "Week" label.
 
     Per-axis ``LIMIT`` is applied at the SQL level (each query may yield
     up to ``limit``) and the union is re-sorted + sliced — important for
@@ -4792,6 +4890,15 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # getter's ``project_alerts_enabled`` (default False) — the frontend
         # SettingsOverlay seeds a single on/off toggle from it.
         "project_alerts_enabled": bool(_budget_cfg.get("project_alerts_enabled")),
+        # Codex budget toggle mirrors (#134). The frontend SettingsOverlay
+        # seeds two toggles (alerts + projected) + a disabled-with-hint empty
+        # state from these three flags. ``_budget_cfg["codex"]`` is ``None`` by
+        # default (no Codex budget) → all three default false/absent safely;
+        # the ``_BudgetConfigError`` fallback dict above lacks a ``codex`` key,
+        # so ``.get("codex")`` → ``None`` is likewise safe.
+        "codex_budget_configured":     _budget_cfg.get("codex") is not None,
+        "codex_budget_alerts_enabled": bool((_budget_cfg.get("codex") or {}).get("alerts_enabled")),
+        "codex_projected_enabled":     bool((_budget_cfg.get("codex") or {}).get("projected_enabled")),
         # Alert-dispatch notifier mirror (Phase B). `notifier` is the
         # validated backend selector ("auto"/"command"/etc.). The raw
         # `command_template` is NEVER mirrored — it routinely holds secrets
@@ -5106,6 +5213,21 @@ _DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS = 2.0
 # Pre-extract location: bin/cctally L17694.
 
 
+def _qs_int(q: dict, key: str, default: int) -> int:
+    """Parse a single query-string int with a fallback.
+
+    ``q`` is a ``urllib.parse.parse_qs`` mapping (list-valued). A missing key,
+    an empty value, or a non-integer spelling all fall back to ``default`` —
+    the kernels clamp bounds, so this only needs to be permissive, not strict.
+    """
+    vals = q.get(key, [None])
+    raw = vals[0] if vals else None
+    try:
+        return int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
     """Routes:
         GET /                       → dashboard.html
@@ -5146,6 +5268,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     # path leaves this None and only sees the `config.json` view, which
     # is the Codex H4 finding. Set by cmd_dashboard before serve_forever.
     cctally_host: "str | None" = None
+    # Conversation viewer (Plan 2, spec §5): the resolved
+    # `dashboard.expose_transcripts` opt-in. False = transcript endpoints
+    # are served only over loopback; True = LAN devices reach them at the
+    # bind's IP literal (anti-DNS-rebinding still rejects hostnames). Set by
+    # cmd_dashboard before serve_forever; the per-request gate
+    # (`_require_transcripts_allowed`) ANDs this with the request Host.
+    cctally_expose_transcripts: bool = False
 
     # Silence the default per-request access log — noisy in the parent
     # terminal, and we pipe it through our own logger in cmd_dashboard.
@@ -5218,6 +5347,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_share_history_get()
         elif path == "/api/doctor":
             self._handle_get_doctor()
+        elif path == "/api/conversations":
+            self._handle_get_conversations()
+        elif path == "/api/conversation/search":
+            self._handle_get_conversation_search()
+        elif path.startswith("/api/conversation/"):
+            self._handle_get_conversation_detail(path)
         else:
             self.send_error(404, "not found")
 
@@ -5377,6 +5512,37 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         else:
             self._respond_json(403, {"error": reason})
 
+    @staticmethod
+    def _transcript_gate():
+        """Lazy-load the pure transcript-access gate kernel (Plan 2, §5)."""
+        return sys.modules["cctally"]._load_sibling("_lib_transcript_access")
+
+    def _transcripts_visible_to_request(self) -> bool:
+        """Single source of truth for "may transcripts be served to THIS
+        request?" Composes the bind gate (`transcripts_allowed`) with the
+        per-request Host allowlist (`host_allowed_for_transcripts`,
+        anti-DNS-rebinding). Spec §5.
+
+        Both `_require_transcripts_allowed` (the GET-route 403 gate) and the
+        `transcriptsEnabled` client signal in `_serve_api_data` route through
+        this predicate so the two are contractually identical — a future
+        one-line drift can never re-introduce the enabled-then-403 desync.
+        """
+        ta = self._transcript_gate()
+        expose = bool(type(self).cctally_expose_transcripts)
+        return (ta.transcripts_allowed(type(self).cctally_host, expose)
+                and ta.host_allowed_for_transcripts(
+                    self.headers.get("Host", ""), expose))
+
+    def _require_transcripts_allowed(self) -> bool:
+        """True if transcripts may be served to THIS request; else emit 403 and
+        return False. Spec §5.
+        """
+        if not self._transcripts_visible_to_request():
+            self._respond_403("transcripts not exposed")
+            return False
+        return True
+
     def _handle_post_settings(self) -> None:
         """Persist a settings update and trigger an immediate SSE broadcast.
 
@@ -5384,8 +5550,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         "update"?: {"check"?: {"enabled"?: bool, "ttl_hours"?: int}},
         "cache_report"?: {"anomaly_threshold_pp"?: int},
         "budget"?: {"weekly_usd"?: number|null, "alerts_enabled"?: bool,
-        "alert_thresholds"?: int[], "projected_enabled"?: bool}}`` — every
-        top-level key is optional; any subset may be sent together
+        "alert_thresholds"?: int[], "projected_enabled"?: bool,
+        "codex"?: {"alerts_enabled"?: bool, "projected_enabled"?: bool}}}``
+        — every top-level key is optional; any subset may be sent together
         (combined save). Unknown top-level keys are rejected with 400.
 
         Per-block validation:
@@ -5412,6 +5579,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             block and validated via ``_get_budget_config(merged)`` (issue
             #19, projected toggle #121); ``_BudgetConfigError`` → 400.
             Budget is its OWN config block, distinct from ``alerts``.
+            ``budget.codex`` (#134) is a nested partial-merge: only the two
+            toggles (``alerts_enabled`` / ``projected_enabled``) are
+            dashboard-writable — ``amount_usd`` / ``period`` /
+            ``alert_thresholds`` stay CLI-only and are preserved from the
+            persisted block. A non-dict ``budget.codex`` → 400; toggling
+            ``budget.codex.*`` when no Codex budget is configured → 400
+            (fail-closed; amounts are never invented from the dashboard).
 
         Atomic merged write: if all touched blocks validate, the merged
         config is persisted in a single ``save_config`` call inside the
@@ -5755,6 +5929,36 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 ):
                     if leaf in budget_in:
                         merged_budget[leaf] = budget_in[leaf]
+                # Nested partial-merge for the Codex sub-block (#134). Mirrors
+                # the ``update.check`` nested-dict merge below: only the two
+                # alert toggles (``alerts_enabled`` / ``projected_enabled``) are
+                # dashboard-writable — ``amount_usd`` / ``period`` /
+                # ``alert_thresholds`` stay CLI-only (ignored if sent), and the
+                # merge preserves them from the persisted block rather than
+                # replacing the whole ``codex`` dict (the clobber regression).
+                if "codex" in budget_in:
+                    incoming_codex = budget_in["codex"]
+                    if not isinstance(incoming_codex, dict):
+                        self._respond_json(
+                            400, {"error": "budget.codex must be an object"}
+                        )
+                        return
+                    existing_codex = merged_budget.get("codex")
+                    if existing_codex is None:
+                        # Fail closed: the dashboard only TOGGLES an existing
+                        # Codex budget — amounts are CLI-only — so it must never
+                        # invent one. The frontend disables the toggle, this
+                        # backstops a direct POST.
+                        self._respond_json(400, {"error": (
+                            "no Codex budget configured — set one via the CLI "
+                            "first (cctally budget set <amount> --vendor codex)"
+                        )})
+                        return
+                    merged_codex = dict(existing_codex)
+                    for sub in ("alerts_enabled", "projected_enabled"):
+                        if sub in incoming_codex:
+                            merged_codex[sub] = bool(incoming_codex[sub])
+                    merged_budget["codex"] = merged_codex
                 merged["budget"] = merged_budget
                 # Final validation against the merged block.
                 # _BudgetConfigError → 400 (no partial write — save_config
@@ -5861,6 +6065,21 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 _cctally()._reconcile_project_budget_milestones_on_write(
                     validated_budget
                 )
+            # Codex actual-spend reconcile (#134). Key it on the ``alerts_enabled``
+            # SUB-leaf specifically — NOT ``"codex" in touched``. The helper
+            # (`_reconcile_codex_budget_on_config_write`) is itself gated on
+            # alerts_enabled && amount && thresholds, so a coarse "codex touched"
+            # check would run it whenever alerts is already True — meaning a
+            # ``projected_enabled``-only toggle would latch (silently suppress) a
+            # still-unfired actual-spend crossing. Keying on the sub-leaf means
+            # flipping alerts ON latches already-crossed thresholds (intended),
+            # while toggling projected reconciles nothing (projected stays
+            # live-pace, Q4).
+            codex_in = budget_in.get("codex")
+            if isinstance(codex_in, dict) and "alerts_enabled" in codex_in:
+                _cctally()._reconcile_codex_budget_on_config_write(
+                    validated_budget
+                )
         if update_check_validated is not None:
             # Echo the full merged check block (cooked defaults included)
             # so the SettingsOverlay can repaint without a follow-up GET.
@@ -5959,25 +6178,30 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         axis = body.get("axis", "weekly")
         if axis not in (
             "weekly", "five_hour", "budget", "projected", "project_budget",
+            "codex_budget",
         ):
             self._respond_json(
                 400,
                 {"error": (
                     "axis must be 'weekly', 'five_hour', 'budget', "
-                    f"'projected' or 'project_budget', got {axis!r}"
+                    "'projected', 'project_budget' or 'codex_budget', "
+                    f"got {axis!r}"
                 )},
             )
             return
         # ``metric`` discriminates the projected axis (weekly_pct vs
-        # budget_usd); the other axes ignore it. Validate only when it
-        # matters so a stray metric on a weekly/budget test isn't a 400.
+        # budget_usd vs codex_budget_usd); the other axes ignore it. Validate
+        # only when it matters so a stray metric on a weekly/budget test isn't
+        # a 400.
         metric = body.get("metric", "weekly_pct")
-        if axis == "projected" and metric not in ("weekly_pct", "budget_usd"):
+        if axis == "projected" and metric not in (
+            "weekly_pct", "budget_usd", "codex_budget_usd",
+        ):
             self._respond_json(
                 400,
                 {"error": (
-                    "metric must be 'weekly_pct' or 'budget_usd', "
-                    f"got {metric!r}"
+                    "metric must be 'weekly_pct', 'budget_usd' or "
+                    f"'codex_budget_usd', got {metric!r}"
                 )},
             )
             return
@@ -6031,6 +6255,22 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 spent_usd=26.0,
                 consumption_pct=104.0,
             )
+        elif axis == "codex_budget":
+            # Synthetic Codex budget payload — mirrors the CLI
+            # ``alerts test --axis codex-budget`` branch (NO DB writes,
+            # test/real divergence contract, NO real budget.codex entry
+            # required). A $200 calendar-month budget reads plausibly; spent
+            # scaled to the threshold so the body line reads as the
+            # at-crossing snapshot the dashboard would render (R4).
+            payload = _build_alert_payload_codex_budget(
+                threshold=threshold,
+                crossed_at_utc=now_utc_iso(),
+                period_start_at=dt.date.today().replace(day=1).isoformat(),
+                period="calendar-month",
+                budget_usd=200.0,
+                spent_usd=200.0 * threshold / 100.0,
+                consumption_pct=float(threshold),
+            )
         elif axis == "projected":
             # Synthetic projected-pace payload — mirrors the CLI
             # cmd_alerts_test projected branch (NO DB writes, test/real
@@ -6039,10 +6279,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # value (so the body reads plausibly, e.g. weekly 100% → "~100% of
             # cap", budget 100% → "$300 of $300"). denominator is the
             # at-crossing target the row would carry (Codex P0-4): 100.0 for
-            # weekly_pct, $300 for budget_usd.
+            # weekly_pct, $300 for budget_usd, $200 for codex_budget_usd
+            # (matching the codex_budget axis test-alert budget).
             if metric == "budget_usd":
                 denominator = 300.0
                 projected_value = 300.0 * threshold / 100.0
+            elif metric == "codex_budget_usd":
+                denominator = 200.0
+                projected_value = 200.0 * threshold / 100.0
             else:  # weekly_pct
                 denominator = 100.0
                 projected_value = float(threshold)
@@ -6901,6 +7145,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             display_tz_pref_override=type(self).display_tz_pref_override,
             runtime_bind=type(self).cctally_host,
         )
+        # Conversation viewer (Plan 2, spec §5): inject the client signal
+        # PER-REQUEST and Host-aware — NOT inside snapshot_to_envelope (the
+        # request-independent SSE snapshot has no Host header). Routes through
+        # the SAME predicate as the transcript GET-route gate so a LAN-hostname
+        # request that the transcript GETs would 403 shows
+        # transcriptsEnabled=false, never enabled-then-403 (the pass-2 P2
+        # finding) — one predicate, two consumers, desync impossible.
+        env["transcriptsEnabled"] = self._transcripts_visible_to_request()
         body = json.dumps(env, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -6989,6 +7241,108 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
+
+    @staticmethod
+    def _conversation_query():
+        """Lazy-load the pure conversation query kernel (Plan 2, §3)."""
+        return sys.modules["cctally"]._load_sibling("_lib_conversation_query")
+
+    def _handle_get_conversations(self) -> None:
+        """``GET /api/conversations`` — the browse rail (spec §3.1).
+
+        Gated first (loopback / Host allowlist). ``sort``/``limit``/``offset``
+        are read from the query string; the kernel clamps bounds. Cache-open
+        failures are 500s, never 5xx-with-stacktrace.
+        """
+        if not self._require_transcripts_allowed():
+            return
+        import urllib.parse as _u
+        q = _u.parse_qs(self.path.partition("?")[2])
+        sort = (q.get("sort", ["recent"]) or ["recent"])[0]
+        limit = _qs_int(q, "limit", 50)
+        offset = _qs_int(q, "offset", 0)
+        try:
+            conn = open_cache_db()
+        except (sqlite3.DatabaseError, OSError) as exc:
+            self._respond_json(500, {"error": f"cache unavailable: {exc}"})
+            return
+        try:
+            body = self._conversation_query().list_conversations(
+                conn, sort=sort, limit=limit, offset=offset)
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("/api/conversations failed: %r", exc)
+            self._respond_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        finally:
+            conn.close()
+        self._respond_json(200, body)
+
+    def _handle_get_conversation_detail(self, path: str) -> None:
+        """``GET /api/conversation/<session-id>`` — the reader (spec §3.2).
+
+        The id is percent-decoded so clients that encode reserved chars
+        round-trip. Unknown id → 404. ``after``/``limit`` page the items.
+        """
+        if not self._require_transcripts_allowed():
+            return
+        import urllib.parse as _u
+        # ``path`` is already query-stripped by ``do_GET`` (``self.path.split("?")``),
+        # so the cursor params (?after=/?limit=) live ONLY on the raw ``self.path``.
+        # Sibling handlers read ``self.path`` directly — the detail route must too,
+        # or every request re-serves the head and pagination is dead.
+        query_str = self.path.partition("?")[2]
+        session_id = _u.unquote(path[len("/api/conversation/"):])
+        if not session_id:
+            self.send_error(404, "conversation not found")
+            return
+        q = _u.parse_qs(query_str)
+        after = (q.get("after", [None]) or [None])[0]
+        limit = _qs_int(q, "limit", 500)
+        try:
+            conn = open_cache_db()
+        except (sqlite3.DatabaseError, OSError) as exc:
+            self._respond_json(500, {"error": f"cache unavailable: {exc}"})
+            return
+        try:
+            body = self._conversation_query().get_conversation(
+                conn, session_id, after=after, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("/api/conversation failed: %r", exc)
+            self._respond_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        finally:
+            conn.close()
+        if body is None:
+            self.send_error(404, "conversation not found")
+            return
+        self._respond_json(200, body)
+
+    def _handle_get_conversation_search(self) -> None:
+        """``GET /api/conversation/search?q=...`` — cross-session FTS/LIKE
+        search (spec §3.3). Matched BEFORE the ``<id>`` reader in ``do_GET``.
+        """
+        if not self._require_transcripts_allowed():
+            return
+        import urllib.parse as _u
+        q = _u.parse_qs(self.path.partition("?")[2])
+        query = (q.get("q", [""]) or [""])[0]
+        limit = _qs_int(q, "limit", 50)
+        offset = _qs_int(q, "offset", 0)
+        try:
+            conn = open_cache_db()
+        except (sqlite3.DatabaseError, OSError) as exc:
+            self._respond_json(500, {"error": f"cache unavailable: {exc}"})
+            return
+        try:
+            body = self._conversation_query().search_conversations(
+                conn, query, limit=limit, offset=offset)
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("/api/conversation/search failed: %r", exc)
+            self._respond_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        finally:
+            conn.close()
+        self._respond_json(200, body)
 
     def _handle_get_project_detail(self) -> None:
         """Return ProjectDetail JSON for ``GET /api/project/<key>?weeks=N``
@@ -7515,6 +7869,14 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # in the doctor SSE block + /api/doctor reflects the actual --host
     # the process is serving, not just the config-only view the CLI sees.
     DashboardHTTPHandler.cctally_host = args.host
+    # Conversation viewer (Plan 2, spec §5): the resolved
+    # `dashboard.expose_transcripts` opt-in. Read off the already-loaded
+    # `config` the same way `dashboard.bind` is resolved above (the
+    # `_config_known_value` shim surfaces the boolean default of False for
+    # an absent or hand-edited-junk value).
+    DashboardHTTPHandler.cctally_expose_transcripts = bool(
+        _config_known_value(config, "dashboard.expose_transcripts")
+    )
     DashboardHTTPHandler.run_sync_now = staticmethod(
         lambda: _run_sync_now(skip_sync=args.no_sync)
     )

@@ -167,6 +167,43 @@ _iter_codex_jsonl_entries_with_offsets = _lib_jsonl._iter_codex_jsonl_entries_wi
 _parse_usage_entries = _lib_jsonl._parse_usage_entries
 _should_replace = _lib_jsonl._should_replace
 
+# Conversation-message parser kernel (Plan 1). Pure leaf (stdlib-only), so
+# it loads at module-load time alongside _lib_jsonl. ``sync_cache``'s second
+# seek-and-walk and the backfill walker both call ``_iter_message_rows``.
+_lib_conversation = _load_lib("_lib_conversation")
+_iter_message_rows = _lib_conversation.iter_message_rows
+
+# Shared by sync_cache's second seek-and-walk AND backfill_conversation_messages
+# so the column list, placeholders, and tuple order live in ONE place — a column
+# add/reorder can't silently desync the two ingest paths (which would land
+# values in the wrong columns on whichever path was missed).
+_CONV_INSERT_SQL = (
+    "INSERT OR IGNORE INTO conversation_messages"
+    "(session_id,uuid,parent_uuid,source_path,byte_offset,"
+    " timestamp_utc,entry_type,text,blocks_json,model,msg_id,"
+    " req_id,cwd,git_branch,is_sidechain)"
+    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+
+
+def _conv_row_tuple(m, path_str):
+    """Flatten a ``MessageRow`` into the ``_CONV_INSERT_SQL`` column order."""
+    return (
+        m.session_id, m.uuid, m.parent_uuid, path_str, m.byte_offset,
+        m.timestamp_utc, m.entry_type, m.text, m.blocks_json, m.model,
+        m.msg_id, m.req_id, m.cwd, m.git_branch, m.is_sidechain,
+    )
+
+
+def _iter_claude_jsonl_files():
+    """Yield every Claude transcript ``*.jsonl`` under each data dir's
+    ``projects/`` tree. Shared by ``sync_cache`` and the conversation backfill
+    so both ingest paths enumerate the IDENTICAL file set."""
+    for claude_dir in _get_claude_data_dirs():
+        for jp in (claude_dir / "projects").glob("**/*.jsonl"):
+            if jp.is_file():
+                yield jp
+
 _cctally_db_sib = _load_lib("_cctally_db")
 add_column_if_missing = _cctally_db_sib.add_column_if_missing
 _run_pending_migrations = _cctally_db_sib._run_pending_migrations
@@ -502,20 +539,60 @@ def sync_cache(
             # empty baseline.
             conn.execute("DELETE FROM session_entries")
             conn.execute("DELETE FROM session_files")
+            # Plan 1: conversation_messages shares the cost path's lifecycle.
+            # A rebuild re-derives the whole cache from on-disk JSONL, so the
+            # message index is wiped here (inside the held lock) and the
+            # per-file second seek-and-walk repopulates it. The FTS delete
+            # trigger empties conversation_fts row-by-row in lockstep.
+            conn.execute("DELETE FROM conversation_messages")
             # Clear the walk-complete sentinel atomically with the wipe
             # (cctally-dev#93, D5/D2): a stale "complete" marker must never
             # survive a destructive rebuild. The end-of-loop write below
             # re-establishes it only after this rebuild's clean walk.
             conn.execute("DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'")
+            # Issue #139: a rebuild walks every file from offset 0, so the
+            # per-file second seek-and-walk below repopulates the whole message
+            # index — that satisfies any deferred existing-install backfill.
+            # Drop the pending flag here so the post-rebuild sync does not also
+            # run a redundant (idempotent but wasteful) offset-0 backfill pass.
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key='conversation_backfill_pending'")
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Claude cached entries")
 
-        claude_dirs = _get_claude_data_dirs()
-        paths: list[pathlib.Path] = []
-        for claude_dir in claude_dirs:
-            for jp in (claude_dir / "projects").glob("**/*.jsonl"):
-                if jp.is_file():
-                    paths.append(jp)
+        # Issue #139: consume the deferred conversation_messages backfill. On an
+        # existing-install upgrade, cache migration 002 sets
+        # ``conversation_backfill_pending`` instead of walking the whole JSONL
+        # history inline (which stalled the triggering command — even a
+        # stats-only ``cctally report`` that fires the cache dispatcher but never
+        # reads cache.db). sync_cache is the natural owner: it already holds the
+        # flock + owns the walker, so a cache-consuming command or the
+        # background hook-tick absorbs the one-time offset-0 walk. The backfill
+        # touches ONLY conversation_messages (never the session_files cost
+        # cursor), is idempotent on (source_path, byte_offset), and commits
+        # per-file — so a crash leaves the flag set and the next sync re-runs
+        # cleanly. It writes + commits, so it must land here, BEFORE the
+        # zero-write-lock read+parse region below (and never on the rebuild
+        # path, which already cleared the flag and repopulates via the normal
+        # walk). A path-less/:memory: conn has no cache_meta only if the schema
+        # was never applied; the try/except tolerates that.
+        if not rebuild:
+            try:
+                _pending = conn.execute(
+                    "SELECT 1 FROM cache_meta "
+                    "WHERE key='conversation_backfill_pending'"
+                ).fetchone() is not None
+            except sqlite3.OperationalError:
+                _pending = False
+            if _pending:
+                backfill_conversation_messages(conn)
+                conn.execute(
+                    "DELETE FROM cache_meta "
+                    "WHERE key='conversation_backfill_pending'"
+                )
+                conn.commit()
+
+        paths: list[pathlib.Path] = list(_iter_claude_jsonl_files())
         stats.files_total = len(paths)
 
         # This SELECT does NOT open an implicit transaction (Python's
@@ -614,6 +691,12 @@ def sync_cache(
                 f"dedup)"
             )
             conn.execute("DELETE FROM session_entries")
+            # Plan 1: truncation escalates to a full re-ingest of EVERY file,
+            # so conversation_messages is wiped here (parallel to the
+            # session_entries full-reset) and the per-file second seek-and-walk
+            # repopulates it from offset 0. Mirrors the cost path's lifecycle;
+            # the FTS delete trigger empties conversation_fts in lockstep.
+            conn.execute("DELETE FROM conversation_messages")
             # Clear the walk-complete sentinel atomically with the truncation
             # full-reset (cctally-dev#93, D5/D2): the cache is being wiped, so
             # any "complete" marker is now stale. The end-of-loop write below
@@ -684,6 +767,7 @@ def sync_cache(
             # Read + parse is a pure read; do it OUTSIDE the write transaction
             # so a slow JSONL doesn't hold a SQLite lock.
             rows: list[tuple[Any, ...]] = []
+            conv_rows: list[tuple[Any, ...]] = []
             final_offset = start_offset
             try:
                 with open(jp, "r", encoding="utf-8", errors="replace") as fh:
@@ -713,7 +797,29 @@ def sync_cache(
                             json.dumps(extras, sort_keys=True) if extras else None,
                             entry.cost_usd,
                         ))
+                    # ``final_offset`` is the cost walk's stop. Capture it into a
+                    # local int BEFORE the conversation walk below re-seeks the
+                    # handle — the value is what session_files.last_byte_offset
+                    # is written from, so it must reflect the COST walk's
+                    # position, never the conversation walk's. (#Plan1 Task 4
+                    # cursor-consistency invariant.)
                     final_offset = fh.tell()
+                    # --- conversation message ingest (Plan 1) ----------------
+                    # Second seek-and-walk over the SAME
+                    # [start_offset, final_offset] byte region as the
+                    # reconcile-guarded cost walk above, BEFORE the per-file
+                    # cursor advances. Independent of the cost walk: it touches
+                    # only conversation_messages, never session_entries or the
+                    # cost-row build. We re-seek to start_offset and stop the
+                    # moment a message row's byte_offset reaches the cost walk's
+                    # final_offset, so the two walks always cover the identical
+                    # span and a partial mid-write tail line (rewound by the
+                    # parser) is left for the next sync.
+                    fh.seek(start_offset)
+                    for mrow in _iter_message_rows(fh, path_str):
+                        if mrow.byte_offset >= final_offset:
+                            break
+                        conv_rows.append(_conv_row_tuple(mrow, path_str))
             except OSError as exc:
                 eprint(f"[cache] could not read {jp}: {exc}")
                 walk_clean = False  # skipped a file without ingesting (D5a)
@@ -793,6 +899,18 @@ def sync_cache(
                         rows,
                     )
                     stats.rows_changed += conn.total_changes - before
+                # Conversation message ingest (Plan 1). Lands in the SAME
+                # per-file write transaction as session_entries so the cost
+                # rows and message rows for a file commit atomically.
+                # INSERT OR IGNORE on UNIQUE(source_path, byte_offset): a
+                # resume-replayed line re-walked from a delta offset that
+                # already landed is a silent no-op, and the same physical line
+                # in two files (resume across JSONL) keeps BOTH rows. No
+                # per-file DELETE here — the only conversation_messages resets
+                # are the rebuild + truncation-escalation full-clears above
+                # (parallel to the cost path's lifecycle).
+                if conv_rows:
+                    conn.executemany(_CONV_INSERT_SQL, conv_rows)
                 # UPSERT preserves session_id / project_path columns populated
                 # by _ensure_session_files_row at the top of this loop. A plain
                 # INSERT OR REPLACE would wipe them on every changed-file sync.
@@ -839,6 +957,12 @@ def sync_cache(
                 (dt.datetime.now(dt.timezone.utc).isoformat(),),
             )
             conn.commit()
+        # At-rest hardening (Plan 2, spec §5). Runs here — at the end of the
+        # write transaction, while the cache.db.lock flock is still held (so a
+        # concurrent writer can't be mid-checkpoint) AND after at least one
+        # write has materialized the -wal/-shm sidecars. open_cache_db hardens
+        # cache.db + the data dir; this finishes the job for the sidecars.
+        _harden_cache_sidecars()
         return stats
     finally:
         try:
@@ -846,6 +970,56 @@ def sync_cache(
         except OSError:
             pass
         lock_fh.close()
+
+
+def backfill_conversation_messages(conn: sqlite3.Connection) -> int:
+    """One-time backfill of ``conversation_messages`` for existing installs
+    (Plan 1 Task 5). Walks EVERY Claude JSONL from offset 0 and inserts one
+    row per user/assistant line via ``_lib_conversation.iter_message_rows``.
+
+    Properties:
+      * Per-file commits — a short write transaction per JSONL file, never one
+        long transaction over the whole (potentially ~1M-line) history. The
+        backfill of a huge history can't hold the cache.db write lock for
+        minutes.
+      * Idempotent — ``INSERT OR IGNORE`` on ``UNIQUE(source_path,
+        byte_offset)``. A row already present (from a prior partial run or from
+        the live ``sync_cache`` ingest) is silently skipped.
+      * Crash-resumable — because each file commits independently and the
+        INSERT is idempotent, a re-run after a crash re-walks every file but
+        only the not-yet-committed rows actually land.
+      * Cursor-safe — touches ONLY ``conversation_messages``. It never reads or
+        writes ``session_files`` / ``session_entries``, so the cost delta
+        cursor is untouched: a later ``sync_cache`` still resumes the cost walk
+        from exactly where it left off.
+
+    Returns the number of rows inserted. Since issue #139 the caller is
+    ``sync_cache`` itself (consuming the ``conversation_backfill_pending`` flag),
+    which already holds the ``cache.db.lock`` flock for the duration — the same
+    serialization cache migration 001 relies on. The 002 migration handler no
+    longer walks inline; it only flags the work as pending.
+    """
+    inserted = 0
+    for jp in _iter_claude_jsonl_files():
+        path_str = str(jp)
+        rows: list[tuple[Any, ...]] = []
+        try:
+            with open(jp, "r", encoding="utf-8", errors="replace") as fh:
+                for m in _iter_message_rows(fh, path_str):
+                    rows.append(_conv_row_tuple(m, path_str))
+        except OSError as exc:
+            eprint(f"[conversation-backfill] could not read {jp}: {exc}")
+            continue
+        if rows:
+            # cursor.rowcount after an executemany INSERT OR IGNORE is the
+            # number of rows actually inserted (conflicts excluded), and —
+            # unlike conn.total_changes — it is NOT inflated by the FTS
+            # AFTER INSERT trigger's shadow-table writes.
+            cur = conn.executemany(_CONV_INSERT_SQL, rows)
+            conn.commit()  # per-file commit — no long write txn
+            if cur.rowcount and cur.rowcount > 0:
+                inserted += cur.rowcount
+    return inserted
 
 
 def iter_entries(
@@ -1561,17 +1735,27 @@ def _collect_codex_entries_direct(
 def get_codex_entries(
     range_start: dt.datetime,
     range_end: dt.datetime,
+    *,
+    skip_sync: bool = False,
 ) -> list[CodexEntry]:
     """Cache-first Codex entry fetch with transparent fallback.
 
     Every Codex-reading command must use this rather than touching
     open_cache_db directly.
+
+    ``skip_sync=True`` bypasses the ``sync_codex_cache`` ingest pass and serves
+    whatever is already cached — for a second read in the same process whose
+    range is a SUBSET of a range already fetched (the cache is already warm), so
+    a redundant full JSONL walk is wasted work (mirrors ``get_entries``'
+    ``skip_sync``).
     """
     try:
         conn = open_cache_db()
     except (sqlite3.DatabaseError, OSError) as exc:
         eprint(f"[cache] unavailable ({exc}); falling back to direct JSONL parse")
         return _collect_codex_entries_direct(range_start, range_end)
+    if skip_sync:
+        return iter_codex_entries(conn, range_start, range_end)
     stats = sync_codex_cache(conn)
     if stats.lock_contended:
         # Sync commits file-by-file, so contention on the ingest lock
@@ -1588,6 +1772,60 @@ def get_codex_entries(
         )
         return _collect_codex_entries_direct(range_start, range_end)
     return iter_codex_entries(conn, range_start, range_end)
+
+
+def _sum_codex_cost_for_range(
+    start: dt.datetime,
+    end: dt.datetime,
+    *,
+    speed: str = "auto",
+    skip_sync: bool = False,
+) -> float:
+    """Sum USD Codex cost of all `codex_session_entries` in ``[start, end)``.
+
+    The Codex analog of Claude's ``_sum_cost_for_range`` (bin/cctally), used by
+    `cctally budget`'s Codex-vendor path (calendar-period + Codex budgets
+    feature, spec §4). Reads the **cache DB** via ``get_codex_entries`` (which
+    opens ``cache.db``, runs the Codex sync, and carries the contention /
+    direct-parse fallback) — NEVER the budget's stats ``conn``, which has no
+    Codex tables.
+
+    Spend is computed per entry via the SAME ``_calculate_codex_entry_cost``
+    primitive the ``codex-*`` reports use (LiteLLM token semantics; unknown
+    model → ``gpt-5`` fallback), so a Codex budget and ``codex-weekly`` agree to
+    the cent. A lean sum — no per-entry sample collection (budgets don't need
+    ``_compute_codex_cost_stats``' samples list) — but routed through the same
+    cost primitive so there is no second pricing copy.
+
+    ``speed="auto"`` resolves to the SAME effective tier the ``codex-*`` reports
+    use under the current config (``_resolve_codex_speed`` reads the active
+    ``$CODEX_HOME``/``config.toml`` — fast multiplies cost at calc time), so the
+    figure matches what ``codex-weekly`` shows on this machine right now.
+
+    ``get_codex_entries`` filters on ``timestamp_utc <= end``; the budget window
+    is half-open ``[start, end)`` so an entry exactly at ``end`` is excluded
+    here (mirrors the kernel's half-open elapsed math). Empty cache / no entries
+    → ``0.0``.
+
+    ``skip_sync=True`` serves the already-warm cache without a fresh ingest —
+    for a second sum in the same process over a sub-range of one already fetched
+    (e.g. the recent-24h window after the full-period sum).
+    """
+    c = _cctally()
+    eff_speed = c._resolve_codex_speed(speed)
+    total = 0.0
+    for entry in c.get_codex_entries(start, end, skip_sync=skip_sync):
+        if entry.timestamp >= end:
+            continue
+        total += c._calculate_codex_entry_cost(
+            entry.model,
+            entry.input_tokens,
+            entry.cached_input_tokens,
+            entry.output_tokens,
+            entry.reasoning_output_tokens,
+            speed=eff_speed,
+        )
+    return total
 
 
 def get_entries(
@@ -1628,6 +1866,24 @@ def get_entries(
     return iter_entries(conn, range_start, range_end, project=project)
 
 
+def _harden_cache_sidecars() -> None:
+    """Best-effort 0600 on cache.db + its -wal/-shm sidecars (Plan 2, spec §5).
+
+    The -wal/-shm sidecars are created on the first WRITE (not on connect), so
+    this runs at the END of the sync_cache write transaction — under the held
+    cache.db.lock flock, where they exist — NOT in open_cache_db (where the
+    sidecars are absent → a silent no-op that would leave a 0644 WAL). All
+    chmod is best-effort: swallow OSError, log, continue.
+    """
+    base = str(_cctally_core.CACHE_DB_PATH)
+    for path in (base, base + "-wal", base + "-shm"):
+        try:
+            if os.path.exists(path):
+                os.chmod(path, 0o600)
+        except OSError as exc:
+            eprint(f"[cache] could not chmod {path} 0600 ({exc}); continuing")
+
+
 # === Region 6: open_cache_db (was bin/cctally:9040-9155) ===
 
 
@@ -1640,6 +1896,14 @@ def open_cache_db() -> sqlite3.Connection:
     """
     c = _cctally()
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # cache.db holds plaintext conversation prose at rest (Plan 2, spec §5).
+    # Harden the data dir to 0700 so the WAL window between connect and the
+    # first write (which materializes the -wal/-shm sidecars, hardened in
+    # sync_cache) is not world-readable. Best-effort: swallow OSError + continue.
+    try:
+        os.chmod(_cctally_core.APP_DIR, 0o700)
+    except OSError as exc:
+        eprint(f"[cache] could not chmod data dir 0700 ({exc}); continuing")
     try:
         conn = sqlite3.connect(_cctally_core.CACHE_DB_PATH)
         conn.execute("SELECT 1").fetchone()
@@ -1650,6 +1914,13 @@ def open_cache_db() -> sqlite3.Connection:
         except FileNotFoundError:
             pass
         conn = sqlite3.connect(_cctally_core.CACHE_DB_PATH)
+
+    # Best-effort 0600 on cache.db itself (the 0700 dir above backstops the
+    # sidecars until the first write hardens them in sync_cache).
+    try:
+        os.chmod(_cctally_core.CACHE_DB_PATH, 0o600)
+    except OSError as exc:
+        eprint(f"[cache] could not chmod cache.db 0600 ({exc}); continuing")
 
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
@@ -1682,6 +1953,7 @@ def open_cache_db() -> sqlite3.Connection:
     # §2.5, §3.3 + the @cache_migration decorator further down in this file.
     _run_pending_migrations(
         conn, registry=_CACHE_MIGRATIONS, db_label="cache.db",
+        recover_version_ahead=True,
     )
     return conn
 

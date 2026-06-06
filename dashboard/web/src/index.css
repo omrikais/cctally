@@ -2477,6 +2477,10 @@ mark.current {
 /* Per-project budget axis (issue #19/#121): teal — a budget-family hue
    (sibling to budget's green) that still reads apart from it at a glance. */
 .chip--project_budget { background: rgba(45,212,191,0.16); color: var(--accent-teal); }
+/* Codex budget axis (calendar-period-codex-budgets, spec §6): orange — a warm
+   budget-family hue that reads apart from budget's green, project_budget's teal,
+   and projected's indigo at a glance (the per-vendor Codex/OpenAI cue). */
+.chip--codex_budget { background: rgba(251,146,60,0.16); color: var(--accent-orange); }
 
 /* -------- Alert row inside the panel -------- */
 .alert-row { display: flex; align-items: baseline; gap: 14px; padding: 8px 0; border-bottom: 1px solid var(--border-soft); }

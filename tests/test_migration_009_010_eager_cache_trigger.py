@@ -368,6 +368,7 @@ def test_009_eager_apply_recomputes_when_walk_complete(tmp_path, monkeypatch):
     stats = sqlite3.connect(stats_path)
     try:
         db._009_recompute_five_hour_blocks_dedup_fix(stats)
+        db._stamp_applied(stats, "009_recompute_five_hour_blocks_dedup_fix")  # dispatcher now owns the stamp (#140)
         cost = stats.execute(
             "SELECT total_cost_usd FROM five_hour_blocks WHERE id = 1"
         ).fetchone()[0]
@@ -419,6 +420,7 @@ def test_010_eager_apply_evaluates_and_recomputes(tmp_path, monkeypatch):
     stats = sqlite3.connect(stats_path)
     try:
         db._010_recompute_percent_milestones_dedup_fix(stats)
+        db._stamp_applied(stats, "010_recompute_percent_milestones_dedup_fix")  # dispatcher now owns the stamp (#140)
         cum = stats.execute(
             "SELECT cumulative_cost_usd FROM percent_milestones WHERE id = 1"
         ).fetchone()[0]

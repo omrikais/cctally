@@ -1,0 +1,9 @@
+Claude budget: $100.00   (calendar week 2026-06-08 → 06-15)   — equivalent-$
+
+  Spent so far    $18.00    18.0% of budget
+  Remaining       $82.00
+  Pace            $7.20/day  ·  2.5 d elapsed
+  Daily budget    $18.22/day for the 4.5 d left to stay under
+  Projected EOW   $18–$50   →   ✓ OK
+
+  Alerts: on · thresholds 90% · 100% · (none crossed yet)

@@ -1,6 +1,7 @@
 # `cctally db`
 
-Migration / DB-management subcommand. Three actions: `status`, `skip`, `unskip`.
+Migration / DB-management subcommand. Four actions: `status`, `skip`,
+`unskip`, `recover`.
 
 ## Synopsis
 
@@ -8,6 +9,7 @@ Migration / DB-management subcommand. Three actions: `status`, `skip`, `unskip`.
 cctally db status [--json]
 cctally db skip <migration-name> [--reason "<text>"]
 cctally db unskip <migration-name>
+cctally db recover --db {cache,stats} [--yes]
 ```
 
 ## Description
@@ -90,6 +92,51 @@ walk.
 `0` success (including no-op when the migration wasn't skipped); `1`
 unknown name; `2` ambiguous bare name.
 
+## `cctally db recover --db {cache,stats} [--yes]`
+
+Reverts a **version-ahead** DB to this binary's known schema head
+(issue #145). A DB whose `PRAGMA user_version` exceeds the running
+binary's registry head was last touched by a newer/unreleased cctally
+(e.g. a `main`/dev checkout that carries an unreleased migration was
+run against the shared prod data dir). Without recovery every
+DB-opening command errors with `DowngradeDetected` and bricks.
+
+`recover` trims the unknown (ahead) markers from both
+`schema_migrations` and `schema_migrations_skipped`, then reconciles
+`user_version` to the known head (or to `0` when a known marker is
+missing, so the next open re-runs the still-pending known migrations
+idempotently). Any extra tables/columns the unknown migration created
+are left inert. It bypasses `open_db()` / `open_cache_db()` (raw
+`sqlite3.connect`) so it never re-triggers the dispatcher, and is a
+no-op when the DB is not ahead.
+
+| Flag | Description |
+| --- | --- |
+| `--db {cache,stats}` | **Required.** Which DB to recover. |
+| `--yes` | **Required for `--db stats`.** stats.db holds non-re-derivable snapshots/milestones; the revert may leave orphan schema behind and need a re-record/re-sync, so it refuses without explicit consent. |
+
+- **`--db cache`** heals **without** `--yes` — cache.db is fully
+  re-derivable (`cctally cache-sync --rebuild` rebuilds it). In normal
+  operation a version-ahead cache.db **auto-heals** on the next
+  cache-opening command (the dispatcher opts cache.db into in-place
+  recovery); `db recover --db cache` is the explicit, on-demand path.
+- **`--db stats`** without `--yes` prints the hazard and refuses
+  (exit 2); with `--yes` it trims the markers and reverts
+  `user_version`.
+- **Prod guard (issue #146).** `--db stats` also refuses (exit 2,
+  DB untouched) when a **dev/worktree checkout** binary is pointed at
+  the real prod data dir (`~/.local/share/cctally`) — trimming markers
+  on the installed release's non-re-derivable stats.db could corrupt
+  it. Run the installed binary instead, or override with
+  `CCTALLY_ALLOW_PROD_MIGRATION=1`. This mirrors the #142 migration
+  guard; `--db cache` is exempt (re-derivable).
+
+### Exit codes
+
+`0` heal or no-op (not ahead / file absent); `2` `--db stats` invoked
+without `--yes` while the DB is ahead, **or** the #146 prod guard
+refused a dev-checkout recovery of the real prod stats.db.
+
 ## Notes
 
 - **Failure recovery.** A failed migration writes a block to
@@ -101,10 +148,11 @@ unknown name; `2` ambiguous bare name.
 - **No `down()`.** This framework does not support rollback / down
   migrations. Per-migration transactional safety inside `BEGIN`/`COMMIT`
   handles partial-failure rollback; full reversibility is not a goal.
-- **Banner suppression.** `db status` / `db skip` / `db unskip`
-  self-suppress the migration-error banner (the `db` namespace shows
-  failure state in its own output or is mid-fix). Other interactive
-  commands continue to render the banner when failures are pending.
+- **Banner suppression.** `db status` / `db skip` / `db unskip` /
+  `db recover` self-suppress the migration-error banner (the `db`
+  namespace shows failure state in its own output or is mid-fix). Other
+  interactive commands continue to render the banner when failures are
+  pending.
 - **`db status` is read-only and uses raw `sqlite3.connect()`.** It
   does NOT go through `open_db()` / `open_cache_db()`, and therefore
   does NOT trigger the migration dispatcher on this invocation.

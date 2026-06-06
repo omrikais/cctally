@@ -297,6 +297,11 @@ describe('alerts store (T8)', () => {
       projected_budget_enabled: false,
       // Per-project budget axis (issue #19/#121): the opt-in toggle defaults OFF.
       project_alerts_enabled: false,
+      // Codex budget toggles (#134): no Codex budget + both toggles default OFF
+      // until the first SSE tick mirrors the persisted `budget.codex` block.
+      codex_budget_configured: false,
+      codex_budget_alerts_enabled: false,
+      codex_projected_enabled: false,
     });
   });
 

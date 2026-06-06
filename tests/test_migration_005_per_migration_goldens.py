@@ -87,6 +87,7 @@ def test_migration_handler_adds_column_and_constraint(ns, tmp_path):
     conn.row_factory = sqlite3.Row
     try:
         _migration_handler(ns)(conn)
+        ns["_stamp_applied"](conn, "005_percent_milestones_reset_event_id")  # dispatcher now owns the stamp (#140)
 
         # Column present.
         cols = {r[0] for r in _table_schema(conn, "percent_milestones")}
@@ -147,8 +148,10 @@ def test_migration_handler_idempotent_on_rerun(ns, tmp_path):
     conn.row_factory = sqlite3.Row
     try:
         _migration_handler(ns)(conn)
+        ns["_stamp_applied"](conn, "005_percent_milestones_reset_event_id")  # dispatcher now owns the stamp (#140)
         # Second call: should be a no-op (fast-path probe stamps marker).
         _migration_handler(ns)(conn)
+        ns["_stamp_applied"](conn, "005_percent_milestones_reset_event_id")
         # Marker still exists exactly once.
         cnt = conn.execute(
             "SELECT COUNT(*) FROM schema_migrations "

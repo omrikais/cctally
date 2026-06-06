@@ -1,0 +1,19 @@
+Claude budget: $300.00   (subscription week 2026-05-26 → 2026-06-02)   — equivalent-$
+
+  Spent so far    $72.00    24.0% of budget
+  Remaining       $228.00
+  Pace            $18.00/day  ·  4.0 d elapsed
+  Daily budget    $76.00/day for the 3.0 d left to stay under
+  Projected EOW   $126–$126   →   ✓ OK
+
+  Alerts: on · thresholds 90% · 100% · (none crossed yet)
+
+Codex budget: $200.00   (calendar month 2026-05)   — actual API $
+
+  Spent so far    $15.00    7.5% of budget
+  Remaining       $185.00
+  Pace            $0.51/day  ·  29.6 d elapsed
+  Daily budget    $130.59/day for the 1.4 d left to stay under
+  Projected EOW   $15–$16   →   ✓ OK
+
+  Alerts: on · thresholds 90% · 100% · (none crossed yet)

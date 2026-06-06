@@ -7,6 +7,7 @@ import {
   alertSeverity,
   AXIS_CHIP_LABEL,
   AXIS_TITLE_LABEL,
+  budgetPeriodNoun,
   projectedContextText,
 } from '../lib/alertAxis';
 
@@ -66,6 +67,14 @@ export function Toast() {
                 {toast.payload.context.project ?? 'Project'}{' '}
                 budget {toast.payload.threshold}% reached
               </>
+            ) : toast.payload.axis === 'codex_budget' ? (
+              // Codex budget axis (calendar-period-codex-budgets, spec §6):
+              // "Codex budget N% reached" so it reads apart from the Claude
+              // equiv-$ budget alert.
+              <>
+                {AXIS_TITLE_LABEL.codex_budget} {toast.payload.threshold}%
+                reached
+              </>
             ) : (
               <>
                 {AXIS_TITLE_LABEL[toast.payload.axis]} usage{' '}
@@ -85,14 +94,25 @@ export function Toast() {
             </div>
           )}
           {(toast.payload.axis === 'budget' ||
-            toast.payload.axis === 'project_budget') &&
-            toast.payload.context.week_start_at && (
+            toast.payload.axis === 'project_budget' ||
+            toast.payload.axis === 'codex_budget') &&
+            (toast.payload.context.period_start_at ??
+              toast.payload.context.week_start_at) && (
               <div className="toast--alert-sub">
-                Week starting{' '}
-                {/* week_start_at is a full ISO timestamp; fmt.weekStart
-                    expects a date-only YYYY-MM-DD, so slice the prefix. */}
+                {/* Period generalization (calendar-period-codex-budgets,
+                    spec §6): the noun is period-aware ("Month starting" /
+                    "Calendar week starting" / "Week starting") from
+                    `context.period`; the subscription-week default keeps the
+                    legacy "Week starting …" byte-stable. The anchor is a full
+                    ISO timestamp; fmt.weekStart expects a date-only
+                    YYYY-MM-DD, so slice the prefix. */}
+                {budgetPeriodNoun(toast.payload.context.period)} starting{' '}
                 {fmt.weekStart(
-                  toast.payload.context.week_start_at.slice(0, 10),
+                  (
+                    toast.payload.context.period_start_at ??
+                    toast.payload.context.week_start_at ??
+                    ''
+                  ).slice(0, 10),
                   ctx,
                 ) ?? '—'}
               </div>
@@ -126,9 +146,14 @@ export function Toast() {
                 )}
               </>
             )}
-            {toast.payload.axis === 'budget' &&
+            {(toast.payload.axis === 'budget' ||
+              toast.payload.axis === 'codex_budget') &&
               toast.payload.context.spent_usd != null &&
               toast.payload.context.budget_usd != null && (
+                // Budget + Codex budget axes: "$spent of $budget budget". The
+                // Codex budget renders the actual API $ (the per-vendor
+                // amount), the Claude budget the equivalent-$ — both come from
+                // the row (snapshotted at crossing), not live config.
                 <>
                   <span className="num">
                     ${toast.payload.context.spent_usd.toFixed(2)}

@@ -202,9 +202,38 @@ class DowngradeDetected(Exception):
         self.db_label = db_label
         self.db_version = db_version
         self.max_known = max_known
+        db_key = "cache" if db_label.startswith("cache") else "stats"
         super().__init__(
             f"{db_label} is at version {db_version} but this cctally "
-            f"only knows up to {max_known}."
+            f"only knows up to {max_known}. A newer/unreleased cctally likely "
+            f"touched this data dir. Run `cctally db recover --db {db_key}` to "
+            f"revert it to the known schema head (cache.db is re-derivable and "
+            f"recovers without --yes; stats.db needs --yes and may require a "
+            f"re-record afterward)."
+        )
+
+
+class ProdMigrationRefused(Exception):
+    """Raised by the dispatcher when a git-checkout binary would forward-migrate
+    the REAL prod data dir (~/.local/share/cctally), which would brick the
+    installed release with DowngradeDetected (issue #142).
+
+    Escape hatch: set CCTALLY_ALLOW_PROD_MIGRATION=1. The guard is
+    connection-scoped + password-DB-resolved (see _would_block_prod_migration
+    + _cctally_core._real_prod_data_dir) so it never fires on :memory:/temp/
+    fake-HOME test connections. Spec:
+    docs/superpowers/specs/2026-06-05-prod-migration-guard-design.md."""
+
+    def __init__(self, db_label: str, next_migration: str):
+        self.db_label = db_label
+        self.next_migration = next_migration
+        super().__init__(
+            f"cctally: refusing to apply migration '{next_migration}' "
+            f"({db_label}) to the prod data dir (~/.local/share/cctally) from "
+            f"a dev checkout — a checkout may carry migrations your installed "
+            f"cctally can't read, which would brick it (DowngradeDetected). "
+            f"Point CCTALLY_DATA_DIR at a scratch/dev dir, or run the installed "
+            f"binary. Override with CCTALLY_ALLOW_PROD_MIGRATION=1."
         )
 
 
@@ -430,11 +459,149 @@ def _bootstrap_rename_legacy_markers(conn: sqlite3.Connection, db_label: str) ->
         _clear_migration_error_log_entries(old)
 
 
+def _conn_db_dir(conn: sqlite3.Connection) -> "pathlib.Path | None":
+    """Resolved directory of the connection's `main` database file, or None for
+    an in-memory / no-file connection (PRAGMA database_list returns '' there).
+    Tuple-indexed so it works on the cache.db connection (no row_factory)."""
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if row[1] == "main":
+            db_file = row[2]
+            if not db_file:
+                return None
+            return pathlib.Path(db_file).resolve().parent
+    return None
+
+
+def _would_block_prod_migration(conn: sqlite3.Connection) -> bool:
+    """True iff a git-checkout binary is about to migrate a DB that physically
+    lives in the REAL prod data dir (issue #142).
+
+    Connection-scoped (NOT global APP_DIR) so :memory:/temp/scratch connections
+    never trip it; HOME-faking-immune via _real_prod_data_dir (password DB, not
+    $HOME); suppressor-INDEPENDENT raw .git check so it still fires under the
+    test-suite's CCTALLY_DISABLE_DEV_AUTODETECT. Escape: CCTALLY_ALLOW_PROD_MIGRATION."""
+    if os.environ.get("CCTALLY_ALLOW_PROD_MIGRATION"):
+        return False
+    if not (_cctally_core._repo_root() / ".git").exists():
+        return False
+    db_dir = _conn_db_dir(conn)
+    if db_dir is None:
+        return False
+    try:
+        return db_dir == _cctally_core._real_prod_data_dir().resolve()
+    except OSError:
+        return False
+
+
+def _first_pending_migration_name(
+    conn: sqlite3.Connection, registry: "list[Migration]", cur_version: int
+) -> str:
+    """Best-effort name of the first not-yet-applied migration, for the refusal
+    message. Marker-aware (handles skip-gaps + db-unskip's user_version=0) with
+    a raw-index fallback. Legacy unprefixed markers are an accepted imperfection
+    — the name is a human hint, not load-bearing."""
+    try:
+        applied = {r[0] for r in conn.execute(
+            "SELECT name FROM schema_migrations").fetchall()}
+    except sqlite3.OperationalError:
+        applied = set()
+    try:
+        skipped = {r[0] for r in conn.execute(
+            "SELECT name FROM schema_migrations_skipped").fetchall()}
+    except sqlite3.OperationalError:
+        skipped = set()
+    for m in registry:
+        if m.name not in applied and m.name not in skipped:
+            return m.name
+    return registry[cur_version].name
+
+
+def _recover_version_ahead(
+    conn: sqlite3.Connection,
+    registry: list[Migration],
+    db_label: str,
+) -> dict:
+    """Reconcile a version-ahead DB down to this binary's known head (issue #145).
+
+    A DB whose ``PRAGMA user_version`` exceeds ``len(registry)`` was last
+    touched by a newer/unreleased cctally. cache.db is fully re-derivable, so
+    we heal in place instead of bricking: trim the unknown (ahead) markers from
+    BOTH ledger tables, then reconcile ``user_version``.
+
+    We DELIBERATELY do not blind-set ``user_version = len(registry)``: the
+    dispatcher treats ``schema_migrations_skipped`` as authoritative and only
+    advances ``user_version`` when every known migration is applied-or-skipped.
+    So we trim unknown rows from both tables (Codex review P1 #1), then set
+    ``user_version = len(registry)`` only if every known migration is
+    applied-or-skipped; otherwise ``0`` so the dispatcher's normal walk re-runs
+    the still-pending known migrations idempotently (Codex review P1 #2) — never
+    cementing a fast-path past a genuinely-missing known migration.
+
+    Extra tables/columns the unknown migration created are left inert (SQLite
+    tolerates them; cache is re-derivable). Idempotent: no-op when not ahead.
+    Tolerates absent ledger tables (Codex review P2).
+
+    Returns ``{"reverted_from", "reverted_to", "trimmed"}`` for the caller's
+    breadcrumb / ``db recover`` report.
+    """
+    cur_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if cur_version <= len(registry):
+        return {"reverted_from": cur_version, "reverted_to": cur_version, "trimmed": 0}
+
+    aliases = _LEGACY_MARKER_ALIASES_BY_DB.get(db_label, {})
+    known = {m.name for m in registry} | set(aliases.keys()) | set(aliases.values())
+    placeholders = ",".join("?" for _ in known) if known else "''"
+    params = tuple(known)
+
+    trimmed = 0
+    for table in ("schema_migrations", "schema_migrations_skipped"):
+        try:
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE name NOT IN ({placeholders})", params
+            )
+            trimmed += max(cur.rowcount, 0)  # DELETE rowcount is always >= 0
+        except sqlite3.OperationalError:
+            pass  # table absent → nothing to trim there
+
+    applied: set[str] = set()
+    skipped: set[str] = set()
+    for table, dest in (("schema_migrations", applied),
+                        ("schema_migrations_skipped", skipped)):
+        try:
+            for row in conn.execute(f"SELECT name FROM {table}").fetchall():
+                dest.add(row[0])
+        except sqlite3.OperationalError:
+            pass
+
+    all_known_done = all((m.name in applied or m.name in skipped) for m in registry)
+    new_version = len(registry) if all_known_done else 0
+    conn.execute(f"PRAGMA user_version = {new_version}")
+    conn.commit()
+    return {"reverted_from": cur_version, "reverted_to": new_version, "trimmed": trimmed}
+
+
+def _stamp_applied(conn, name, applied_at_utc=None):
+    """Persist the schema_migrations marker for ``name``, then commit.
+
+    Central stamp owned by the dispatcher (issue #140). Handlers no longer
+    self-stamp — EXCEPT cache 001, whose stamp must stay atomic with its
+    destructive wipe; for that one this call is an idempotent no-op.
+    ``INSERT OR IGNORE`` so a pre-existing row (cache 001, or a concurrent
+    winner) never raises.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
+        (name, applied_at_utc or now_utc_iso()),
+    )
+    conn.commit()
+
+
 def _run_pending_migrations(
     conn: sqlite3.Connection,
     *,
     registry: list[Migration],
     db_label: str,
+    recover_version_ahead: bool = False,
 ) -> None:
     """Apply pending migrations from ``registry`` against ``conn``.
 
@@ -475,9 +642,31 @@ def _run_pending_migrations(
     """
     cur_version = conn.execute("PRAGMA user_version").fetchone()[0]
     if cur_version > len(registry):
-        raise DowngradeDetected(
-            db_label, db_version=cur_version, max_known=len(registry),
-        )
+        if recover_version_ahead:
+            # cache.db is re-derivable — heal in place instead of bricking (#145).
+            info = _recover_version_ahead(conn, registry, db_label)
+            eprint(
+                f"cctally: {db_label} was ahead (v{info['reverted_from']} > "
+                f"known v{len(registry)}); trimmed unknown migration state and "
+                f"reconciled to the known head (cache is re-derivable). Run "
+                f"'cctally cache-sync --rebuild' for a full rebuild."
+            )
+            cur_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            # common case: cur_version == len(registry) → fast-path below.
+            # adversarial (a known marker was missing): cur_version == 0 →
+            # falls through to the normal pending-loop, which reconciles.
+            # NOTE: on that adversarial fall-through against a prod cache.db,
+            # _recover_version_ahead has ALREADY committed user_version=0, so
+            # the prod-migration guard below ("user_version provably unchanged")
+            # is reached with user_version already lowered. That is acceptable
+            # ONLY because heal opts in for cache.db, which is re-derivable — a
+            # reset-to-0 then ProdMigrationRefused just makes the next legit
+            # open re-walk. The guard's "unchanged" invariant holds for stats.db
+            # (never heals) and for the non-heal path.
+        else:
+            raise DowngradeDetected(
+                db_label, db_version=cur_version, max_known=len(registry),
+            )
     if cur_version == len(registry):
         # When the registry is currently empty (today's cache.db case),
         # still leave the schema_migrations table behind so a later
@@ -503,6 +692,19 @@ def _run_pending_migrations(
             f"{db_label}:_bootstrap_rename_legacy_markers"
         )
         return  # fast path
+
+    # Prod-migration guard (issue #142): a git-checkout binary must not
+    # forward-migrate the real prod data dir — that bumps user_version past
+    # what the installed release knows and bricks it with DowngradeDetected.
+    # We are past the two early returns, so cur_version < len(registry): there
+    # ARE pending migrations that would advance user_version. Refuse BEFORE
+    # bootstrap-rename / fresh-install detection / any marker write, so
+    # user_version is provably unchanged. Connection-scoped so it only fires
+    # on the real prod DB files, never on :memory:/temp/scratch test conns.
+    if _would_block_prod_migration(conn):
+        raise ProdMigrationRefused(
+            db_label, _first_pending_migration_name(conn, registry, cur_version)
+        )
 
     # Track whether schema_migrations existed before this open so we can
     # detect the fresh-install path. After bootstrap, even a "first time
@@ -606,6 +808,11 @@ def _run_pending_migrations(
                 "weekly_cost_snapshots",
                 "five_hour_blocks",
                 "percent_milestones",
+                # budget milestone tables tracked by 011 (#137); empty on fresh
+                # installs, so this only guards a hand-dropped schema_migrations DB.
+                "budget_milestones",
+                "projected_milestones",
+                "codex_budget_milestones",
             ),
             "cache.db": ("session_entries",),
         }.get(db_label, ())
@@ -636,6 +843,7 @@ def _run_pending_migrations(
         qualified_name = f"{db_label}:{m.name}"
         try:
             m.handler(conn)
+            _stamp_applied(conn, m.name, now_iso)      # central stamp (#140)
             _clear_migration_error_log_entries(qualified_name)
             applied.add(m.name)
         except MigrationGateNotMet as gate_exc:
@@ -713,25 +921,18 @@ def _backfill_five_hour_block_models(conn: sqlite3.Connection) -> None:
     `DELETE FROM five_hour_blocks` followed by re-backfill doesn't
     leave duplicates.
 
-    Always inserts the schema_migrations marker at the end (inside the
-    same transaction) so the gate closes regardless of how many child
-    rows were written — empty `session_entries` for a block (real
-    users with API/web-only blocks) yields zero child rows but MUST
-    still close the gate (regression scenario Q2).
+    The gate closes regardless of how many child rows were written —
+    empty `session_entries` for a block (real users with API/web-only
+    blocks) yields zero child rows but MUST still be marked applied
+    (regression scenario Q2). The dispatcher central-stamps the
+    schema_migrations marker on this handler's clean return (#140).
     """
     # Empty-table fast path: with no parent five_hour_blocks rows, this
-    # backfill has nothing to do. We still must close the gate so the
-    # dispatcher sees us as applied. INSERT OR IGNORE the marker and
-    # return (replaces the prior `has_blocks` outer gate from the
-    # pre-framework era).
+    # backfill has nothing to do. Return cleanly so the dispatcher
+    # central-stamps us as applied (#140) — replaces the prior
+    # `has_blocks` outer gate from the pre-framework era.
     if not conn.execute("SELECT 1 FROM five_hour_blocks LIMIT 1").fetchone():
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
-            ("001_five_hour_block_models_backfill_v1", now_utc_iso()),
-        )
-        conn.commit()
         return
-    now_iso = now_utc_iso()
     conn.execute("BEGIN")
     try:
         # Defensive: clean up any orphans from a prior parent rebuild.
@@ -792,15 +993,6 @@ def _backfill_five_hour_block_models(conn: sqlite3.Connection) -> None:
                     ],
                 )
 
-        # Mark migration done — closes the gate even when zero rows
-        # were written (empty session_entries / API-only blocks).
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc)
-            VALUES (?, ?)
-            """,
-            ("001_five_hour_block_models_backfill_v1", now_iso),
-        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -814,24 +1006,17 @@ def _backfill_five_hour_block_projects(conn: sqlite3.Connection) -> None:
     """Upgrade-user backfill of five_hour_block_projects.
 
     Mirror of _backfill_five_hour_block_models but writes by_project
-    buckets and inserts the projects-side schema_migrations marker.
-    Cleans up orphan child rows defensively before the main loop.
-    Marker insert fires regardless of child-row count so the gate
-    closes for empty-row backfills too.
+    buckets. Cleans up orphan child rows defensively before the main
+    loop. The dispatcher central-stamps the projects-side
+    schema_migrations marker on clean return (#140), so the gate closes
+    for empty-row backfills too.
     """
     # Empty-table fast path: with no parent five_hour_blocks rows, this
-    # backfill has nothing to do. We still must close the gate so the
-    # dispatcher sees us as applied. INSERT OR IGNORE the marker and
-    # return (replaces the prior `has_blocks` outer gate from the
-    # pre-framework era).
+    # backfill has nothing to do. Return cleanly so the dispatcher
+    # central-stamps us as applied (#140) — replaces the prior
+    # `has_blocks` outer gate from the pre-framework era.
     if not conn.execute("SELECT 1 FROM five_hour_blocks LIMIT 1").fetchone():
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
-            ("002_five_hour_block_projects_backfill_v1", now_utc_iso()),
-        )
-        conn.commit()
         return
-    now_iso = now_utc_iso()
     conn.execute("BEGIN")
     try:
         conn.execute(
@@ -888,13 +1073,6 @@ def _backfill_five_hour_block_projects(conn: sqlite3.Connection) -> None:
                     ],
                 )
 
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc)
-            VALUES (?, ?)
-            """,
-            ("002_five_hour_block_projects_backfill_v1", now_iso),
-        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1428,13 +1606,6 @@ def _migration_merge_5h_block_duplicates_v1(conn: sqlite3.Connection) -> None:
                 dropped_ids,
             )
 
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc)
-            VALUES (?, ?)
-            """,
-            ("003_merge_5h_block_duplicates_v1", now_utc_iso()),
-        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1483,7 +1654,8 @@ def _migration_heal_forked_week_start_date_buckets(conn: sqlite3.Connection) -> 
     external state (no ``cache.db`` open, no JSONL walk).
 
     Empty-table fast path: when none of the three tables has a forked
-    row, INSERT the marker and return without opening a transaction.
+    row, return without opening a transaction (the dispatcher
+    central-stamps the marker on clean return, #140).
 
     Spec hook: paired regression test in
     ``tests/test_heal_forked_week_start_date_buckets.py``.
@@ -1491,7 +1663,7 @@ def _migration_heal_forked_week_start_date_buckets(conn: sqlite3.Connection) -> 
     # Empty-fork fast path. UNION ALL across the three tables; one
     # SELECT 1 / LIMIT 1 short-circuits on the first violator. When
     # zero rows are forked, skip the BEGIN/UPDATE block entirely and
-    # just stamp the marker.
+    # return (the dispatcher central-stamps the marker, #140).
     has_fork_row = conn.execute(
         """
         SELECT 1 FROM (
@@ -1510,12 +1682,6 @@ def _migration_heal_forked_week_start_date_buckets(conn: sqlite3.Connection) -> 
         """
     ).fetchone()
     if not has_fork_row:
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
-            "VALUES (?, ?)",
-            ("004_heal_forked_week_start_date_buckets", now_utc_iso()),
-        )
-        conn.commit()
         return
 
     conn.execute("BEGIN")
@@ -1571,13 +1737,6 @@ def _migration_heal_forked_week_start_date_buckets(conn: sqlite3.Connection) -> 
             """
         )
 
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc)
-            VALUES (?, ?)
-            """,
-            ("004_heal_forked_week_start_date_buckets", now_utc_iso()),
-        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1608,23 +1767,18 @@ def _migration_percent_milestones_reset_event_id(conn: sqlite3.Connection) -> No
 
     Idempotent: a second invocation finds the column already present
     and returns. Empty-table fast path: when the column is already
-    present the marker still gets stamped — no schema edit needed.
+    present this handler is a no-op — no schema edit needed (the
+    dispatcher central-stamps the marker on clean return, #140).
     """
     # Fast-path probe: column already present means a prior run of this
     # migration (or a fresh-install fast-stamp from the dispatcher that
     # already picked up the new live-schema CREATE TABLE) has done the
-    # work. Just stamp the marker and return.
+    # work. Return; the dispatcher central-stamps the marker (#140).
     cols = {
         str(r[1])
         for r in conn.execute("PRAGMA table_info(percent_milestones)").fetchall()
     }
     if "reset_event_id" in cols:
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
-            "VALUES (?, ?)",
-            ("005_percent_milestones_reset_event_id", now_utc_iso()),
-        )
-        conn.commit()
         return
 
     conn.execute("BEGIN")
@@ -1681,11 +1835,6 @@ def _migration_percent_milestones_reset_event_id(conn: sqlite3.Connection) -> No
             """
         )
         conn.execute("DROP TABLE percent_milestones_old_005")
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
-            "VALUES (?, ?)",
-            ("005_percent_milestones_reset_event_id", now_utc_iso()),
-        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1722,26 +1871,18 @@ def _migration_five_hour_milestones_reset_event_id(conn: sqlite3.Connection) -> 
     (fresh-install fast-stamp from the dispatcher because the live
     ``CREATE TABLE IF NOT EXISTS five_hour_milestones`` already carries
     the new shape — REQUIRED for fresh-install correctness per spec §3.2),
-    the marker still gets stamped — no schema edit needed.
+    this handler is a no-op — no schema edit needed (the dispatcher
+    central-stamps the marker on clean return, #140).
     """
     # Fast-path probe: column already present means a prior run of this
     # migration (or a fresh-install fast-stamp from the dispatcher that
     # already picked up the new live-schema CREATE TABLE) has done the
-    # work. Just stamp the marker and return. The marker INSERT runs in
-    # SQLite's implicit transaction (auto-opened by the write, closed by
-    # ``commit()`` — same shape as migration 005's fast path); no explicit
-    # ``BEGIN`` is needed for a single-statement DML.
+    # work. Return; the dispatcher central-stamps the marker (#140).
     cols = {
         str(r[1])
         for r in conn.execute("PRAGMA table_info(five_hour_milestones)").fetchall()
     }
     if "reset_event_id" in cols:
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
-            "VALUES (?, ?)",
-            ("006_five_hour_milestones_reset_event_id", now_utc_iso()),
-        )
-        conn.commit()
         return
 
     conn.execute("BEGIN")
@@ -1813,11 +1954,6 @@ def _migration_five_hour_milestones_reset_event_id(conn: sqlite3.Connection) -> 
             """
         )
         conn.execute("DROP TABLE five_hour_milestones_old_006")
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
-            "VALUES (?, ?)",
-            ("006_five_hour_milestones_reset_event_id", now_utc_iso()),
-        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1861,22 +1997,16 @@ def _migration_observed_pre_credit_pct(conn: sqlite3.Connection) -> None:
 
     Idempotent: a second invocation finds the column already present
     and returns. Empty-column fast path: when the live CREATE TABLE
-    already carries the column (fresh install), stamp the marker and
-    return without an ALTER. Simple ADD COLUMN — no UNIQUE constraint
-    change, so no rename-recreate-copy needed (contrast migrations
-    005 / 006).
+    already carries the column (fresh install), return without an ALTER
+    (the dispatcher central-stamps the marker on clean return, #140).
+    Simple ADD COLUMN — no UNIQUE constraint change, so no
+    rename-recreate-copy needed (contrast migrations 005 / 006).
     """
     cols = {
         str(r[1])
         for r in conn.execute("PRAGMA table_info(week_reset_events)").fetchall()
     }
     if "observed_pre_credit_pct" in cols:
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
-            "VALUES (?, ?)",
-            ("007_observed_pre_credit_pct", now_utc_iso()),
-        )
-        conn.commit()
         return
 
     conn.execute("BEGIN")
@@ -1884,11 +2014,6 @@ def _migration_observed_pre_credit_pct(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE week_reset_events "
             "ADD COLUMN observed_pre_credit_pct REAL"
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
-            "VALUES (?, ?)",
-            ("007_observed_pre_credit_pct", now_utc_iso()),
         )
         conn.commit()
     except Exception:
@@ -2182,6 +2307,34 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             ON session_entries(msg_id, req_id)
             WHERE msg_id IS NOT NULL AND req_id IS NOT NULL;
 
+        CREATE TABLE IF NOT EXISTS conversation_messages (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id    TEXT,
+            uuid          TEXT,
+            parent_uuid   TEXT,
+            source_path   TEXT    NOT NULL,
+            byte_offset   INTEGER NOT NULL,
+            timestamp_utc TEXT,
+            entry_type    TEXT    NOT NULL,
+            text          TEXT    NOT NULL DEFAULT '',
+            blocks_json   TEXT    NOT NULL DEFAULT '[]',
+            model         TEXT,
+            msg_id        TEXT,
+            req_id        TEXT,
+            cwd           TEXT,
+            git_branch    TEXT,
+            is_sidechain  INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(source_path, byte_offset)
+        );
+        CREATE INDEX IF NOT EXISTS idx_conv_session_ts
+            ON conversation_messages(session_id, timestamp_utc, id);
+        CREATE INDEX IF NOT EXISTS idx_conv_session_uuid
+            ON conversation_messages(session_id, uuid);
+        CREATE INDEX IF NOT EXISTS idx_conv_source
+            ON conversation_messages(source_path);
+        CREATE INDEX IF NOT EXISTS idx_conv_turnkey
+            ON conversation_messages(msg_id, req_id);
+
         CREATE TABLE IF NOT EXISTS codex_session_files (
             path             TEXT PRIMARY KEY,
             size_bytes       INTEGER NOT NULL,
@@ -2227,6 +2380,99 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
         "ON session_files(session_id)"
     )
+    # FTS5 is optional in the sqlite build. Create the external-content index +
+    # sync triggers as separate executes wrapped in one try; on failure create
+    # NEITHER the table NOR the triggers (a trigger referencing a missing table
+    # would itself error), set a persisted flag, and let search fall back to
+    # LIKE. Spec §1. Idempotent (IF NOT EXISTS).
+    if _fts5_available(conn):
+        try:
+            # Recovery (spec §1/P2): if a PRIOR run marked FTS unavailable,
+            # conversation_messages rows were ingested (by sync_cache / the
+            # backfill) WITHOUT the AFTER INSERT trigger ever indexing them —
+            # or a prior downgrade dropped the index while leaving the base
+            # rows. Detect that BEFORE clearing the flag so we can rebuild the
+            # external-content index from conversation_messages below. A fresh
+            # install never sets the flag, so this stays False and no rebuild
+            # runs (the triggers index rows incrementally as they arrive).
+            recovering = conn.execute(
+                "SELECT 1 FROM cache_meta WHERE key='fts5_unavailable'"
+            ).fetchone() is not None
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS conversation_fts "
+                "USING fts5(text, content='conversation_messages', content_rowid='id')")
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS conv_fts_ai AFTER INSERT ON conversation_messages "
+                "BEGIN INSERT INTO conversation_fts(rowid, text) VALUES (new.id, new.text); END")
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS conv_fts_ad AFTER DELETE ON conversation_messages "
+                "BEGIN INSERT INTO conversation_fts(conversation_fts, rowid, text) "
+                "VALUES('delete', old.id, old.text); END")
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS conv_fts_au AFTER UPDATE OF text ON conversation_messages "
+                "BEGIN INSERT INTO conversation_fts(conversation_fts, rowid, text) "
+                "VALUES('delete', old.id, old.text); "
+                "INSERT INTO conversation_fts(rowid, text) VALUES (new.id, new.text); END")
+            if recovering:
+                # Repopulate the freshly-(re)created index from the base table
+                # so pre-recovery history is searchable. Cheap no-op when
+                # conversation_messages is empty.
+                conn.execute(
+                    "INSERT INTO conversation_fts(conversation_fts) VALUES('rebuild')")
+            conn.execute("DELETE FROM cache_meta WHERE key='fts5_unavailable'")
+        except sqlite3.OperationalError:
+            # partial create cleanup, then mark unavailable
+            for stmt in ("DROP TRIGGER IF EXISTS conv_fts_au",
+                         "DROP TRIGGER IF EXISTS conv_fts_ad",
+                         "DROP TRIGGER IF EXISTS conv_fts_ai",
+                         "DROP TABLE IF EXISTS conversation_fts"):
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass
+            _set_cache_meta(conn, "fts5_unavailable", "1")
+    else:
+        # FTS5 is unavailable on THIS sqlite build. If a prior (FTS-capable)
+        # run created the sync triggers, they now reference an unusable
+        # conversation_fts and EVERY INSERT into conversation_messages would
+        # raise "no such module: fts5". Because the conversation INSERT shares
+        # sync_cache's per-file write transaction with session_entries, that
+        # rollback would discard COST ingest too. Drop the orphan triggers so
+        # writes succeed under the LIKE fallback. (The conversation_fts vtable
+        # itself can't be DROPped without the fts5 module, but with no triggers
+        # nothing writes to it.)
+        for stmt in ("DROP TRIGGER IF EXISTS conv_fts_au",
+                     "DROP TRIGGER IF EXISTS conv_fts_ad",
+                     "DROP TRIGGER IF EXISTS conv_fts_ai"):
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
+        _set_cache_meta(conn, "fts5_unavailable", "1")
+    # The FTS branch above issues DML (DELETE/INSERT on cache_meta) which opens
+    # an implicit transaction under sqlite3's legacy autocommit mode. Close it
+    # so the migration dispatcher's subsequent ``conn.execute("BEGIN")`` starts
+    # cleanly (mirrors the bootstrap-rename commit envelope rationale).
+    conn.commit()
+
+
+def _fts5_available(conn: sqlite3.Connection) -> bool:
+    """True if this sqlite build can create an FTS5 table. Cheap probe on a
+    temp table that is created then dropped. Hidden test seam: tests monkeypatch
+    this to False to exercise the LIKE fallback."""
+    try:
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _fts5_probe USING fts5(x)")
+        conn.execute("DROP TABLE IF EXISTS _fts5_probe")
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
+def _set_cache_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cache_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO cache_meta(key, value) VALUES(?, ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
 def _eagerly_apply_cache_migrations() -> None:
@@ -2338,6 +2584,7 @@ def _eagerly_apply_cache_migrations() -> None:
         # if 001 has already applied, this is a fast-path return.
         _run_pending_migrations(
             conn, registry=_CACHE_MIGRATIONS, db_label="cache.db",
+            recover_version_ahead=True,
         )
     finally:
         # Close immediately so the WAL writer lock (if any) is
@@ -2627,6 +2874,45 @@ def _001_dedup_highest_wins_locked(conn: sqlite3.Connection) -> None:
         raise
 
 
+# === Region 7c: Cache migration 002_conversation_messages_backfill ===
+
+@cache_migration("002_conversation_messages_backfill")
+def _002_conversation_messages_backfill(conn: sqlite3.Connection) -> None:
+    """Mark the ``conversation_messages`` backfill pending (Plan 1 Task 5; the
+    deferral is issue #139).
+
+    The table + indexes + FTS already live in ``_apply_cache_schema`` (so fresh
+    installs have them and the dispatcher stamps THIS migration without running
+    it — there is no history to populate). This handler runs only on an
+    EXISTING install (``session_entries`` non-empty), which needs the message
+    index populated from the full JSONL history.
+
+    Rather than walk that history INLINE — which blocked the triggering command
+    until the whole (potentially ~1M-line) backfill completed, including a
+    stats-only ``cctally report`` that fires the cache dispatcher via
+    ``_eagerly_apply_cache_migrations`` but never opens cache.db for reads
+    (issue #139) — this handler just sets the ``conversation_backfill_pending``
+    cache_meta flag and returns in microseconds. The actual offset-0 backfill
+    runs on the next ``sync_cache``, which already holds the ``cache.db.lock``
+    flock and owns the walker (see ``_cctally_cache.sync_cache``); a
+    cache-consuming command — or, most often, the background ``hook-tick`` —
+    absorbs the one-time walk where the latency is expected/invisible. Because
+    the handler no longer touches JSONL it needs no flock and cannot contend
+    with a concurrent sync, so the old non-blocking-flock +
+    ``MigrationGateNotMet`` defer dance is gone.
+
+    Does NOT self-stamp its ``schema_migrations`` marker: the dispatcher owns
+    the central stamp on the existing-install success path (issue #140), calling
+    ``_stamp_applied(conn, m.name)`` right after this handler returns cleanly —
+    so the migration persists and is never re-walked (re-setting the flag) on a
+    subsequent ``open_cache_db()``. This handler only commits the cache_meta
+    flag. The flag itself is consumed + cleared by the first ``sync_cache`` that
+    sees it (idempotent + crash-resumable there); a ``cache-sync --rebuild``
+    clears it directly since its normal offset-0 walk repopulates the index."""
+    _set_cache_meta(conn, "conversation_backfill_pending", "1")
+    conn.commit()
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")
@@ -2789,17 +3075,6 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
                     "SET cost_usd = ? WHERE id = ?",
                     (total, snap_id),
                 )
-            # D3 — INSERT OR IGNORE for race safety. Mirrors the
-            # convention applied to every other production migration
-            # and the matching change to cache migration 001.
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations "
-                "(name, applied_at_utc) VALUES (?, ?)",
-                (
-                    "008_recompute_weekly_cost_snapshots_dedup_fix",
-                    now_utc_iso(),
-                ),
-            )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -3217,14 +3492,6 @@ def _009_recompute_five_hour_blocks_dedup_fix(
                         ],
                     )
 
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations "
-                "(name, applied_at_utc) VALUES (?, ?)",
-                (
-                    "009_recompute_five_hour_blocks_dedup_fix",
-                    now_utc_iso(),
-                ),
-            )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -3407,20 +3674,130 @@ def _010_recompute_percent_milestones_dedup_fix(
                     (cumulative, marginal, mid),
                 )
 
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations "
-                "(name, applied_at_utc) VALUES (?, ?)",
-                (
-                    "010_recompute_percent_milestones_dedup_fix",
-                    now_utc_iso(),
-                ),
-            )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
     finally:
         cache_ro.close()
+
+
+@stats_migration("011_budget_milestone_period_keys")
+def _migration_budget_milestone_period_keys(conn: sqlite3.Connection) -> None:
+    """Add a write-once ``period`` column to the three budget milestone tables
+    and include it in each UNIQUE key (issue #137).
+
+    ``budget_milestones``     -> UNIQUE(week_start_at, period, threshold)
+    ``codex_budget_milestones`` -> UNIQUE(period_start_at, period, threshold)
+    ``projected_milestones``  -> UNIQUE(week_start_at, period, metric, threshold)
+
+    Fixes (1) stale dashboard period labels and (2) the calendar-week /
+    calendar-month dedup collision when the 1st of the month lands on the
+    configured week-start weekday.
+
+    Historical rows are backfilled to ``period = NULL`` (the "pre-011 unknown
+    period" sentinel) rather than a fabricated value, honoring write-once
+    milestones. The firing pre-probe matches ``period = ? OR period IS NULL``
+    so unknown-period rows never re-fire (no spurious upgrade alert), and the
+    dashboard COALESCEs NULL to the vendor-default noun.
+
+    SQLite cannot ALTER an inline UNIQUE in place -> rename-recreate-copy idiom
+    (same as migration 005). Idempotent: a table that already has ``period``
+    (fresh install where the live CREATE made the new shape, or a prior run) is
+    skipped; when all three are present the handler returns and the dispatcher
+    central-stamps the marker (#140).
+    """
+    specs = [
+        (
+            "budget_milestones",
+            """
+            CREATE TABLE budget_milestones (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_at   TEXT    NOT NULL,
+                period          TEXT,
+                threshold       INTEGER NOT NULL,
+                budget_usd      REAL    NOT NULL,
+                spent_usd       REAL    NOT NULL,
+                consumption_pct REAL    NOT NULL,
+                crossed_at_utc  TEXT    NOT NULL,
+                alerted_at      TEXT,
+                UNIQUE(week_start_at, period, threshold)
+            )
+            """,
+            # (cols copied target<-source) — period omitted from source => NULL
+            "id, week_start_at, threshold, budget_usd, spent_usd, "
+            "consumption_pct, crossed_at_utc, alerted_at",
+        ),
+        (
+            "codex_budget_milestones",
+            """
+            CREATE TABLE codex_budget_milestones (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                period_start_at TEXT    NOT NULL,
+                period          TEXT,
+                threshold       INTEGER NOT NULL,
+                budget_usd      REAL    NOT NULL,
+                spent_usd       REAL    NOT NULL,
+                consumption_pct REAL    NOT NULL,
+                crossed_at_utc  TEXT    NOT NULL,
+                alerted_at      TEXT,
+                UNIQUE(period_start_at, period, threshold)
+            )
+            """,
+            "id, period_start_at, threshold, budget_usd, spent_usd, "
+            "consumption_pct, crossed_at_utc, alerted_at",
+        ),
+        (
+            "projected_milestones",
+            """
+            CREATE TABLE projected_milestones (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_at   TEXT    NOT NULL,
+                period          TEXT,
+                metric          TEXT    NOT NULL,
+                threshold       INTEGER NOT NULL,
+                projected_value REAL    NOT NULL,
+                denominator     REAL    NOT NULL,
+                crossed_at_utc  TEXT    NOT NULL,
+                alerted_at      TEXT,
+                UNIQUE(week_start_at, period, metric, threshold)
+            )
+            """,
+            "id, week_start_at, metric, threshold, projected_value, "
+            "denominator, crossed_at_utc, alerted_at",
+        ),
+    ]
+
+    def _has_period(table: str) -> bool:
+        cols = {
+            str(r[1])
+            for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        return "period" in cols
+
+    # Compute needs-rebuild BEFORE any transaction (no deferred-BEGIN-then-read
+    # on stats.db — SQLITE_BUSY_SNAPSHOT, migrations-gotchas.md).
+    pending = [s for s in specs if not _has_period(s[0])]
+
+    if not pending:
+        # Fresh install (live CREATE already made the new shape) or prior run.
+        return
+
+    conn.execute("BEGIN IMMEDIATE")  # write-lock up front; DDL is first DML
+    try:
+        for table, create_sql, cols in pending:
+            old = f"{table}_old_011"
+            conn.execute(f"ALTER TABLE {table} RENAME TO {old}")
+            conn.execute(create_sql)
+            # period omitted from the SELECT => NULL for every historical row
+            conn.execute(
+                f"INSERT INTO {table} ({cols}) SELECT {cols} FROM {old}"
+            )
+            conn.execute(f"DROP TABLE {old}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 # === Region 8: Test-only migration registration (was bin/cctally:12086-12140) ===
@@ -3447,39 +3824,22 @@ if os.environ.get("CCTALLY_MIGRATION_TEST_MODE") == "1":
     @stats_migration(_stats_test_name)
     def _test_migration_failure_injection(conn):
         """Test-only migration: raises RuntimeError when test_failure_trigger
-        table is non-empty; otherwise inserts the marker and succeeds."""
+        table is non-empty; otherwise it is a no-op (the dispatcher stamps)."""
         if conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='test_failure_trigger'"
         ).fetchone() and conn.execute(
             "SELECT 1 FROM test_failure_trigger LIMIT 1"
         ).fetchone():
             raise RuntimeError("test failure injected")
-        conn.execute("BEGIN")
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
-                (_stats_test_name, now_utc_iso()),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+        return
 
     _cache_test_seq = len(_CACHE_MIGRATIONS) + 1
     _cache_test_name = f"{_cache_test_seq:03d}_test_cache_migration"
 
     @cache_migration(_cache_test_name)
     def _test_cache_migration(conn):
-        conn.execute("BEGIN")
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
-                (_cache_test_name, now_utc_iso()),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+        """Test-only cache migration: no-op body; the dispatcher stamps."""
+        return
 
 
 # === Region 9: db CLI subcommands (was bin/cctally:19707-20043) ===
@@ -3821,3 +4181,74 @@ def cmd_db_unskip(args: argparse.Namespace) -> int:
         conn.close()
     print(f"Unskipped: {name} (will run on next open).")
     return 0
+
+
+def cmd_db_recover(args: argparse.Namespace) -> int:
+    """Revert a version-ahead DB to this binary's known schema head (#145).
+
+    cache.db is fully re-derivable, so `--db cache` heals without --yes.
+    stats.db holds non-re-derivable snapshots/milestones, so `--db stats`
+    requires explicit --yes and may need a re-record afterward, AND honors the
+    #146 prod guard (a dev/worktree binary refuses to trim+revert the real prod
+    stats.db unless CCTALLY_ALLOW_PROD_MIGRATION=1). Bypasses
+    open_db()/open_cache_db() (raw connect) so it never re-triggers the
+    dispatcher. Idempotent: a no-op when the DB is not ahead.
+    """
+    which = args.db  # "cache" | "stats"
+    if which == "cache":
+        path, registry, label = _cctally_core.CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db"
+    else:
+        path, registry, label = _cctally_core.DB_PATH, _STATS_MIGRATIONS, "stats.db"
+
+    # Absent file → nothing to recover; do NOT connect (sqlite3.connect would
+    # create an empty DB file — mirrors cmd_db_unskip).
+    if not path.exists():
+        print(f"cctally: {label} not present; nothing to recover.")
+        return 0
+
+    conn = sqlite3.connect(path)
+    try:
+        cur_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        head = len(registry)
+        if cur_version <= head:
+            print(
+                f"cctally: {label} is at version {cur_version} "
+                f"(≤ known {head}); nothing to recover."
+            )
+            return 0
+        # Prod guard (issue #146): a dev/worktree binary must not trim the unknown
+        # migration markers + revert user_version on the installed release's
+        # NON-re-derivable prod stats.db — the destructive cousin of the #142
+        # forward-migration guard (trimmed markers can't be re-derived). Reuses
+        # the same connection-scoped predicate (git checkout AND the DB physically
+        # in the real prod dir, password-DB-resolved, honoring
+        # CCTALLY_ALLOW_PROD_MIGRATION). cache.db is re-derivable and intentionally
+        # exempt — it mirrors the dispatcher's opt-in auto-heal.
+        if which == "stats" and _would_block_prod_migration(conn):
+            eprint(
+                "cctally: refusing to recover stats.db in the prod data dir "
+                "(~/.local/share/cctally) from a dev checkout — trimming the "
+                "unknown migration markers and reverting user_version on the "
+                "installed release's non-re-derivable stats.db could corrupt it. "
+                "Run the installed binary, or override with "
+                "CCTALLY_ALLOW_PROD_MIGRATION=1."
+            )
+            return 2
+        if which == "stats" and not getattr(args, "yes", False):
+            eprint(
+                f"cctally: {label} is at version {cur_version} but this cctally "
+                f"only knows up to {head}. Recovering stats.db trims the unknown "
+                f"migration markers and reverts user_version, but any schema the "
+                f"unknown migration created is left in place and a re-record/"
+                f"re-sync may be needed. Re-run with --yes to proceed, or restore "
+                f"{label} from a backup."
+            )
+            return 2
+        info = _recover_version_ahead(conn, registry, label)
+        print(
+            f"cctally: reverted {label} v{info['reverted_from']} → "
+            f"v{info['reverted_to']}, dropped {info['trimmed']} unknown marker(s)."
+        )
+        return 0
+    finally:
+        conn.close()

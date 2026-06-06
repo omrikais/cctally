@@ -533,13 +533,20 @@ def test_budget_empty_projects_baseline_unchanged(pjns, capsys):
 
 
 def test_budget_empty_projects_json_baseline_unchanged(pjns, capsys):
-    """Empty budget.projects, no global budget → --json baseline is
-    byte-identical (no projects[] key)."""
+    """Empty budget.projects, no global budget → --json baseline carries NO
+    projects[] key (and no codex key). `period` is now ALWAYS present (spec
+    §5/§10.8, code-review #1) — additive, defaults to subscription-week."""
     _pj_write_config(pjns, {"alerts_enabled": True, "alert_thresholds": [90, 100]})
     rc = pjns["cmd_budget"](_pj_budget_args(json=True))
     assert rc == 0
     out = capsys.readouterr().out.strip()
-    assert out == '{"schemaVersion": 1, "status": "unset", "weekly_usd": null}'
+    assert out == (
+        '{"schemaVersion": 1, "status": "unset", "weekly_usd": null, '
+        '"period": "subscription-week"}'
+    )
+    payload = json.loads(out)
+    assert "projects" not in payload
+    assert "codex" not in payload
 
 
 # ── share-output anonymization (spec §7.5) ──────────────────────────────────
@@ -663,3 +670,487 @@ def test_budget_same_basename_share_anon_not_collapsed(pjns, capsys):
     p2_line = next(ln for ln in out.splitlines() if "project-2" in ln)
     assert "$16.20" in p1_line, f"project-1 not the high-spend row: {p1_line!r}"
     assert "$7.20" in p2_line, f"project-2 not the low-spend row: {p2_line!r}"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Task 1: calendar-period + per-vendor (Codex) budget config schema
+# (spec §2). Two coverage blocks:
+#   A. ``_get_budget_config`` validation of the two new leaves
+#      (``budget.period`` enum, ``budget.codex`` nested block) + the new
+#      defaults, exercised through the isolated kernel loader so a cached
+#      ``_cctally_core`` never reads the real prod DB.
+#   B. ``config get/set/unset`` round-trips for the new keys via the CLI
+#      (a real subprocess against a scratch ``CCTALLY_DATA_DIR`` — mirrors
+#      ``tests/test_project_budget_config.py::_run_cli``). ``budget.period``
+#      is a plain string leaf; ``budget.codex`` is a JSON object (like
+#      ``budget.projects``).
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def cpns(monkeypatch, tmp_path):
+    """Isolated kernel namespace for the calendar-period config tests."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    return ns
+
+
+# ── Block A: _get_budget_config validation of the new leaves ─────────────────
+
+
+def test_period_default_is_subscription_week(cpns):
+    """An absent budget block surfaces the new defaults: period
+    ``subscription-week`` (zero-migration back-compat) and codex None."""
+    cfg = cpns["_get_budget_config"]({})
+    assert cfg["period"] == "subscription-week"
+    assert cfg["codex"] is None
+
+
+def test_budget_periods_constants_exposed(cpns):
+    """The per-vendor period enums are module constants for the parser/config
+    layer to reuse — Codex may NOT use subscription-week."""
+    import _cctally_core
+
+    assert _cctally_core.BUDGET_PERIODS == (
+        "subscription-week", "calendar-week", "calendar-month",
+    )
+    assert _cctally_core.CODEX_BUDGET_PERIODS == (
+        "calendar-week", "calendar-month",
+    )
+    assert "subscription-week" not in _cctally_core.CODEX_BUDGET_PERIODS
+
+
+def test_period_valid_values_accepted(cpns):
+    for p in ("subscription-week", "calendar-week", "calendar-month"):
+        cfg = cpns["_get_budget_config"]({"budget": {"period": p}})
+        assert cfg["period"] == p
+
+
+def test_period_invalid_value_rejected(cpns):
+    with pytest.raises(cpns["_BudgetConfigError"]):
+        cpns["_get_budget_config"]({"budget": {"period": "foo"}})
+
+
+def test_period_non_string_rejected(cpns):
+    with pytest.raises(cpns["_BudgetConfigError"]):
+        cpns["_get_budget_config"]({"budget": {"period": 7}})
+
+
+def test_codex_valid_block_round_trips(cpns):
+    cfg = cpns["_get_budget_config"](
+        {"budget": {"codex": {"amount_usd": 200, "period": "calendar-month"}}}
+    )
+    codex = cfg["codex"]
+    assert codex["amount_usd"] == 200.0
+    assert isinstance(codex["amount_usd"], float)
+    assert codex["period"] == "calendar-month"
+    # Defaults filled for the unspecified leaves.
+    assert codex["alerts_enabled"] is False
+    assert codex["alert_thresholds"] == [90, 100]
+    assert codex["projected_enabled"] is False
+
+
+def test_codex_defaults_period_is_calendar_month(cpns):
+    """A codex block without an explicit period defaults to calendar-month."""
+    cfg = cpns["_get_budget_config"]({"budget": {"codex": {"amount_usd": 50}}})
+    assert cfg["codex"]["period"] == "calendar-month"
+
+
+def test_codex_rejects_subscription_week(cpns):
+    """Codex has no Anthropic subscription week — that period is rejected."""
+    with pytest.raises(cpns["_BudgetConfigError"]):
+        cpns["_get_budget_config"](
+            {"budget": {"codex": {"amount_usd": 200,
+                                  "period": "subscription-week"}}}
+        )
+
+
+def test_codex_must_be_object(cpns):
+    with pytest.raises(cpns["_BudgetConfigError"]):
+        cpns["_get_budget_config"]({"budget": {"codex": [1, 2]}})
+
+
+def test_codex_amount_must_be_positive_finite(cpns):
+    with pytest.raises(cpns["_BudgetConfigError"]):
+        cpns["_get_budget_config"](
+            {"budget": {"codex": {"amount_usd": -5, "period": "calendar-month"}}}
+        )
+    with pytest.raises(cpns["_BudgetConfigError"]):
+        cpns["_get_budget_config"](
+            {"budget": {"codex": {"amount_usd": 0, "period": "calendar-month"}}}
+        )
+
+
+def test_codex_amount_bool_rejected(cpns):
+    """A bool (int subclass) is not a valid amount — mirrors weekly_usd."""
+    with pytest.raises(cpns["_BudgetConfigError"]):
+        cpns["_get_budget_config"](
+            {"budget": {"codex": {"amount_usd": True,
+                                  "period": "calendar-month"}}}
+        )
+
+
+def test_codex_amount_required(cpns):
+    """A codex block with no amount_usd is invalid (it must define a budget)."""
+    with pytest.raises(cpns["_BudgetConfigError"]):
+        cpns["_get_budget_config"](
+            {"budget": {"codex": {"period": "calendar-month"}}}
+        )
+
+
+def test_codex_alerts_enabled_must_be_bool(cpns):
+    with pytest.raises(cpns["_BudgetConfigError"]):
+        cpns["_get_budget_config"](
+            {"budget": {"codex": {"amount_usd": 200, "period": "calendar-month",
+                                  "alerts_enabled": "yes"}}}
+        )
+
+
+def test_codex_alert_thresholds_validated(cpns):
+    """The Codex block's thresholds reuse the budget thresholds rule: ints in
+    [1,100], sorted/deduped; out-of-range rejected."""
+    cfg = cpns["_get_budget_config"](
+        {"budget": {"codex": {"amount_usd": 200, "period": "calendar-month",
+                              "alert_thresholds": [100, 90, 90]}}}
+    )
+    assert cfg["codex"]["alert_thresholds"] == [90, 100]
+    with pytest.raises(cpns["_BudgetConfigError"]):
+        cpns["_get_budget_config"](
+            {"budget": {"codex": {"amount_usd": 200, "period": "calendar-month",
+                                  "alert_thresholds": [0, 101]}}}
+        )
+
+
+def test_codex_none_is_no_budget(cpns):
+    """An explicit null codex value is the no-Codex-budget sentinel."""
+    cfg = cpns["_get_budget_config"]({"budget": {"codex": None}})
+    assert cfg["codex"] is None
+
+
+# ── Block B: config get/set/unset round-trip via the CLI ─────────────────────
+
+
+def _cp_run_cli(data_dir, *args):
+    import subprocess
+
+    env = dict(os.environ)
+    env["CCTALLY_DATA_DIR"] = str(data_dir)
+    env["CCTALLY_DISABLE_DEV_AUTODETECT"] = "1"
+    return subprocess.run(
+        [sys.executable, str(REPO / "bin" / "cctally"), *args],
+        capture_output=True, text=True, env=env,
+    )
+
+
+def test_config_period_string_round_trip(tmp_path):
+    """`config set budget.period calendar-month` persists and round-trips."""
+    set_res = _cp_run_cli(tmp_path, "config", "set", "budget.period",
+                          "calendar-month")
+    assert set_res.returncode == 0, set_res.stderr
+    get_res = _cp_run_cli(tmp_path, "config", "get", "budget.period")
+    assert get_res.returncode == 0, get_res.stderr
+    assert get_res.stdout.strip().endswith("=calendar-month")
+
+
+def test_config_period_invalid_exit_2(tmp_path):
+    """An out-of-enum period is rejected with exit 2, no write."""
+    res = _cp_run_cli(tmp_path, "config", "set", "budget.period", "foo")
+    assert res.returncode == 2, res.stdout + res.stderr
+
+
+def test_config_codex_json_round_trip(tmp_path):
+    """`config set budget.codex '<json-object>'` persists and `config get`
+    emits JSON that parses back to the defaults-filled block."""
+    set_res = _cp_run_cli(
+        tmp_path, "config", "set", "budget.codex",
+        '{"amount_usd": 200, "period": "calendar-month"}',
+    )
+    assert set_res.returncode == 0, set_res.stderr
+    get_res = _cp_run_cli(tmp_path, "config", "get", "budget.codex")
+    assert get_res.returncode == 0, get_res.stderr
+    rhs = get_res.stdout.strip().split("=", 1)[1]
+    parsed = json.loads(rhs)
+    assert parsed["amount_usd"] == 200.0
+    assert parsed["period"] == "calendar-month"
+
+
+def test_config_codex_subscription_week_exit_2(tmp_path):
+    """A Codex block with period subscription-week is rejected with exit 2."""
+    res = _cp_run_cli(
+        tmp_path, "config", "set", "budget.codex",
+        '{"amount_usd": 200, "period": "subscription-week"}',
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+
+
+def test_config_codex_non_object_exit_2(tmp_path):
+    """A JSON array (non-object) for budget.codex is rejected with exit 2."""
+    res = _cp_run_cli(tmp_path, "config", "set", "budget.codex", "[1,2]")
+    assert res.returncode == 2, res.stdout + res.stderr
+
+
+def test_config_unset_codex_clears_leaf(tmp_path):
+    """`config unset budget.codex` drops the leaf, restoring the None default."""
+    _cp_run_cli(
+        tmp_path, "config", "set", "budget.codex",
+        '{"amount_usd": 200, "period": "calendar-month"}',
+    )
+    unset_res = _cp_run_cli(tmp_path, "config", "unset", "budget.codex")
+    assert unset_res.returncode == 0, unset_res.stderr
+    get_res = _cp_run_cli(tmp_path, "config", "get", "budget.codex")
+    assert get_res.returncode == 0, get_res.stderr
+    rhs = get_res.stdout.strip().split("=", 1)[1]
+    # null is the no-Codex-budget sentinel.
+    assert json.loads(rhs) is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Task 2: Codex spend helper + per-(vendor,period) status decoupling
+# (spec §4/§5). `_sum_codex_cost_for_range` reads the CACHE DB via
+# `get_codex_entries` (NOT a stats conn), filters to [start, end), and sums
+# `_calculate_codex_entry_cost` per entry — so a Codex budget reconciles to
+# `codex-*` to the cent. The calendar/Codex status path must render `$0`/`0%`
+# when entries are empty and MUST NOT short-circuit to "no usage data yet
+# this week" just because a Claude weekly snapshot is absent (review #5).
+# ──────────────────────────────────────────────────────────────────────────
+
+from _fixture_builders import seed_codex_session_entry  # noqa: E402
+
+CX_MONTH_START = dt.datetime(2026, 6, 1, 0, 0, 0, tzinfo=UTC)
+CX_AS_OF = dt.datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def cxns(monkeypatch, tmp_path):
+    """Isolated kernel namespace pinned to a fixed June clock for the Codex
+    spend + calendar-month decoupling tests."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    monkeypatch.setenv("CCTALLY_AS_OF", _pj_iso(CX_AS_OF))
+    return ns
+
+
+def _cx_seed_codex_entries(ns, rows):
+    """Seed codex_session_entries. `rows` is a list of (timestamp, model,
+    input, cached, output) tuples. Returns the cache conn closed."""
+    conn = ns["open_cache_db"]()
+    try:
+        for i, (ts, model, inp, cached, out) in enumerate(rows):
+            seed_codex_session_entry(
+                conn,
+                source_path=f"/fx/codex-{i}.jsonl",
+                line_offset=i,
+                timestamp_utc=_pj_iso(ts),
+                session_id=f"cx-s{i}",
+                model=model,
+                input_tokens=inp,
+                cached_input_tokens=cached,
+                output_tokens=out,
+                reasoning_output_tokens=0,
+                total_tokens=inp + out,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_sum_codex_cost_for_range_sums_in_range(cxns):
+    """`_sum_codex_cost_for_range` sums `_calculate_codex_entry_cost` over the
+    in-range entries and excludes out-of-range ones."""
+    ns = cxns
+    in1 = CX_MONTH_START + dt.timedelta(days=2)
+    in2 = CX_MONTH_START + dt.timedelta(days=5)
+    before = CX_MONTH_START - dt.timedelta(days=1)   # excluded (< start)
+    after = CX_MONTH_START + dt.timedelta(days=40)    # excluded (>= end)
+    _cx_seed_codex_entries(ns, [
+        (in1, "gpt-5", 100_000, 0, 50_000),
+        (in2, "gpt-5", 200_000, 0, 80_000),
+        (before, "gpt-5", 999_999, 0, 999_999),
+        (after, "gpt-5", 999_999, 0, 999_999),
+    ])
+    start = CX_MONTH_START
+    end = CX_MONTH_START + dt.timedelta(days=30)  # 2026-07-01
+    got = ns["_sum_codex_cost_for_range"](start, end, speed="standard")
+    # Independent expected: the cost primitive over only the two in-range rows.
+    calc = ns["_calculate_codex_entry_cost"]
+    expected = (
+        calc("gpt-5", 100_000, 0, 50_000, 0, speed="standard")
+        + calc("gpt-5", 200_000, 0, 80_000, 0, speed="standard")
+    )
+    assert abs(got - expected) < 1e-9, f"got={got} expected={expected}"
+
+
+def test_sum_codex_cost_for_range_empty_is_zero(cxns):
+    """No Codex entries → $0.00, never an error."""
+    ns = cxns
+    start = CX_MONTH_START
+    end = CX_MONTH_START + dt.timedelta(days=30)
+    assert ns["_sum_codex_cost_for_range"](start, end) == 0.0
+
+
+def _cx_budget_args(**overrides):
+    base = dict(
+        action=None, amount=None, project=None, vendor="claude", period=None,
+        config=None, reveal_projects=False, tz=None,
+        json=False, format=None, theme="light", no_branding=False,
+        output=None, copy=False, open_after_write=False,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_codex_budget_renders_without_weekly_snapshot(cxns, capsys):
+    """A configured Codex calendar-month budget renders a `codex` JSON block
+    with spend from the entries even when NO weekly_usage_snapshots row exists,
+    and never emits the "no usage data yet this week" note (review #5)."""
+    ns = cxns
+    in1 = CX_MONTH_START + dt.timedelta(days=3)
+    _cx_seed_codex_entries(ns, [(in1, "gpt-5", 100_000, 0, 50_000)])
+    _pj_write_config(ns, {
+        "codex": {"amount_usd": 200.0, "period": "calendar-month"},
+    })
+    rc = ns["cmd_budget"](_cx_budget_args(json=True))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no usage data" not in out.lower()
+    payload = json.loads(out)
+    assert "codex" in payload
+    codex = payload["codex"]
+    assert codex["amount_usd"] == 200.0
+    assert codex["period"] == "calendar-month"
+    calc = ns["_calculate_codex_entry_cost"]
+    expected = calc("gpt-5", 100_000, 0, 50_000, 0, speed="standard")
+    # speed=auto resolves to standard with no config.toml fast tier present.
+    assert abs(codex["spent_usd"] - expected) < 1e-9
+
+
+def test_codex_budget_empty_renders_zero_without_snapshot(cxns, capsys):
+    """A Codex budget with NO entries and NO weekly snapshot renders $0/0%,
+    not a no-data short-circuit."""
+    ns = cxns
+    _pj_write_config(ns, {
+        "codex": {"amount_usd": 200.0, "period": "calendar-month"},
+    })
+    rc = ns["cmd_budget"](_cx_budget_args(json=True))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no usage data" not in out.lower()
+    payload = json.loads(out)
+    assert payload["codex"]["spent_usd"] == 0.0
+    assert payload["codex"]["consumption_pct"] == 0.0
+
+
+def test_budget_json_period_key_always_present(cxns, capsys):
+    """The Claude top-level `--json` carries an additive `period` key always,
+    and the `codex` sibling is absent when no Codex budget is configured."""
+    ns = cxns
+    # A Claude calendar-month budget with no weekly snapshot still renders.
+    in1 = CX_MONTH_START + dt.timedelta(days=3)
+    conn = ns["open_cache_db"]()
+    try:
+        seed_session_file(conn, path="/fx/c.jsonl", session_id="s", project_path="/r")
+        seed_session_entry(
+            conn, source_path="/fx/c.jsonl", line_offset=0,
+            timestamp_utc=_pj_iso(in1), model="claude-sonnet-4-6",
+            input_tokens=100_000, output_tokens=100_000,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _pj_write_config(ns, {
+        "weekly_usd": 300.0, "period": "calendar-month",
+        "alerts_enabled": True, "alert_thresholds": [90, 100],
+    })
+    rc = ns["cmd_budget"](_cx_budget_args(json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["period"] == "calendar-month"
+    assert "codex" not in payload  # gated like projects
+
+
+def test_vendor_codex_period_subscription_week_exit_2(cxns, capsys):
+    """`budget set 200 --vendor codex --period subscription-week` exits 2 with a
+    clear stderr message, no config write."""
+    ns = cxns
+    rc = ns["cmd_budget"](_cx_budget_args(
+        action="set", amount="200", vendor="codex", period="subscription-week",
+    ))
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "subscription-week" in err or "subscription week" in err
+
+
+def test_set_codex_budget_writes_codex_block(cxns, capsys):
+    """`budget set 200 --vendor codex --period month` writes budget.codex and
+    confirms vendor + period + amount."""
+    ns = cxns
+    rc = ns["cmd_budget"](_cx_budget_args(
+        action="set", amount="200", vendor="codex", period="month",
+    ))
+    assert rc == 0
+    import _cctally_core
+    cfg = json.loads(_cctally_core.CONFIG_PATH.read_text())
+    codex = cfg["budget"]["codex"]
+    assert codex["amount_usd"] == 200.0
+    assert codex["period"] == "calendar-month"
+    out = capsys.readouterr().out.lower()
+    assert "codex" in out
+    assert "200" in out
+
+
+def test_set_codex_budget_preserves_period_on_reset(cxns, capsys):
+    """`budget set` without `--period` preserves a previously-chosen period."""
+    ns = cxns
+    ns["cmd_budget"](_cx_budget_args(
+        action="set", amount="200", vendor="codex", period="calendar-week",
+    ))
+    capsys.readouterr()
+    rc = ns["cmd_budget"](_cx_budget_args(
+        action="set", amount="250", vendor="codex", period=None,
+    ))
+    assert rc == 0
+    import _cctally_core
+    cfg = json.loads(_cctally_core.CONFIG_PATH.read_text())
+    codex = cfg["budget"]["codex"]
+    assert codex["amount_usd"] == 250.0
+    assert codex["period"] == "calendar-week"  # preserved, not reset to default
+
+
+def test_unset_codex_budget_removes_block(cxns, capsys):
+    """`budget unset --vendor codex` removes budget.codex."""
+    ns = cxns
+    ns["cmd_budget"](_cx_budget_args(
+        action="set", amount="200", vendor="codex", period="month",
+    ))
+    capsys.readouterr()
+    rc = ns["cmd_budget"](_cx_budget_args(action="unset", vendor="codex"))
+    assert rc == 0
+    import _cctally_core
+    cfg = json.loads(_cctally_core.CONFIG_PATH.read_text())
+    assert cfg["budget"].get("codex") is None
+
+
+def test_set_claude_period_month_terminal_header(cxns, capsys):
+    """`budget set 300 --period month` then bare budget renders a
+    `(calendar month YYYY-MM)` header from the display-tz civil boundary."""
+    ns = cxns
+    in1 = CX_MONTH_START + dt.timedelta(days=3)
+    conn = ns["open_cache_db"]()
+    try:
+        seed_session_file(conn, path="/fx/c.jsonl", session_id="s", project_path="/r")
+        seed_session_entry(
+            conn, source_path="/fx/c.jsonl", line_offset=0,
+            timestamp_utc=_pj_iso(in1), model="claude-sonnet-4-6",
+            input_tokens=100_000, output_tokens=100_000,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    ns["cmd_budget"](_cx_budget_args(
+        action="set", amount="300", vendor="claude", period="month",
+    ))
+    capsys.readouterr()
+    rc = ns["cmd_budget"](_cx_budget_args())
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "calendar month 2026-06" in out

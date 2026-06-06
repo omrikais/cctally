@@ -15,7 +15,25 @@ import json
 import threading
 import time
 
+import pytest
+
 from conftest import load_script
+
+
+@pytest.fixture(autouse=True)
+def _isolate_prod_dbs(monkeypatch, tmp_path):
+    """Issue #144: the ``/api/events`` handler builds an envelope on subscribe,
+    which opens ``cache.db`` + ``stats.db`` for freshness. Redirect ``$HOME`` to
+    a tmp dir BEFORE the in-body ``load_script()`` (the conftest-blessed
+    ``setenv("HOME", tmp) + load_script()`` ordering) so those resolve under
+    ``tmp`` instead of the real ``~/.local/share/cctally`` — preventing the leak
+    and the #142 prod-migration-guard trip from a dev checkout. See
+    ``test_dashboard_api_data.py`` for the full rationale.
+    """
+    share = tmp_path / ".local" / "share" / "cctally"
+    share.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
 
 def test_events_headers_and_first_frame():

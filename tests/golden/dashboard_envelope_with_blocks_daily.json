@@ -14,6 +14,9 @@
     "projected_budget_enabled": false,
     "projected_weekly_enabled": false,
     "project_alerts_enabled": false,
+    "codex_budget_configured": false,
+    "codex_budget_alerts_enabled": false,
+    "codex_projected_enabled": false,
     "weekly_thresholds": [
       90,
       95

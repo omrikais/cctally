@@ -299,44 +299,45 @@ def create_stats_db(path: Path) -> None:
                 ON five_hour_milestones(block_id);
 
             -- budget_milestones: equiv-$ budget threshold crossings (issue
-            -- #19). Plain CREATE TABLE IF NOT EXISTS in bin/_cctally_core.py
-            -- (no migration handler — write-once, forward-only, same posture
-            -- as five_hour_milestones); mirrored here so fixture stats.db
-            -- files don't trigger an inline CREATE at open time. A mid-week
-            -- reset re-anchors week_start_at, so fresh windows get fresh rows
-            -- under UNIQUE(week_start_at, threshold) — no reset_event_id
-            -- segment.
+            -- #19). Schema owned by migration 011_budget_milestone_period_keys
+            -- (#137): nullable `period` column + period-inclusive UNIQUE. This
+            -- mirrors the post-011 live shape so fixtures whose stamp helper
+            -- marks 011 applied (fast-pathing the dispatcher) carry the new
+            -- shape — a stale narrow shape would break any `SELECT period`
+            -- read. A mid-week reset re-anchors week_start_at, so fresh windows
+            -- get fresh rows — no reset_event_id segment.
             CREATE TABLE budget_milestones (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 week_start_at   TEXT    NOT NULL,
+                period          TEXT,
                 threshold       INTEGER NOT NULL,
                 budget_usd      REAL    NOT NULL,
                 spent_usd       REAL    NOT NULL,
                 consumption_pct REAL    NOT NULL,
                 crossed_at_utc  TEXT    NOT NULL,
                 alerted_at      TEXT,
-                UNIQUE(week_start_at, threshold)
+                UNIQUE(week_start_at, period, threshold)
             );
 
             -- projected_milestones: projected-pace threshold crossings (issue
-            -- #121). Plain CREATE TABLE IF NOT EXISTS in bin/_cctally_core.py
-            -- (no migration handler — write-once, forward-only, same posture
-            -- as budget_milestones); mirrored here so fixture stats.db files
-            -- don't trigger an inline CREATE at open time. metric discriminates
-            -- weekly_pct (denominator 100.0) from budget_usd (denominator =
-            -- target_usd). A mid-week reset re-anchors week_start_at, so fresh
-            -- windows get fresh rows under UNIQUE(week_start_at, metric,
-            -- threshold) — no reset_event_id segment (budget pattern).
+            -- #121). Schema owned by migration 011_budget_milestone_period_keys
+            -- (#137): nullable `period` column + period-inclusive UNIQUE
+            -- (mirrors the post-011 live shape, see budget_milestones note).
+            -- metric discriminates weekly_pct (denominator 100.0) from
+            -- budget_usd / codex_budget_usd (denominator = target_usd). A
+            -- mid-week reset re-anchors week_start_at — no reset_event_id
+            -- segment (budget pattern).
             CREATE TABLE projected_milestones (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 week_start_at   TEXT    NOT NULL,
+                period          TEXT,
                 metric          TEXT    NOT NULL,
                 threshold       INTEGER NOT NULL,
                 projected_value REAL    NOT NULL,
                 denominator     REAL    NOT NULL,
                 crossed_at_utc  TEXT    NOT NULL,
                 alerted_at      TEXT,
-                UNIQUE(week_start_at, metric, threshold)
+                UNIQUE(week_start_at, period, metric, threshold)
             );
 
             -- five_hour_reset_events: parallel to week_reset_events for the

@@ -1,1 +1,1 @@
-{"schemaVersion": 1, "status": "unset", "weekly_usd": null}
+{"schemaVersion": 1, "status": "unset", "weekly_usd": null, "period": "subscription-week"}

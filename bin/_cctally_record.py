@@ -269,6 +269,30 @@ def _build_alert_payload_project_budget(*args, **kwargs):
     return sys.modules["cctally"]._build_alert_payload_project_budget(*args, **kwargs)
 
 
+def _build_alert_payload_codex_budget(*args, **kwargs):
+    return sys.modules["cctally"]._build_alert_payload_codex_budget(*args, **kwargs)
+
+
+def insert_codex_budget_milestone(*args, **kwargs):
+    return sys.modules["cctally"].insert_codex_budget_milestone(*args, **kwargs)
+
+
+def _codex_budget_crossings(*args, **kwargs):
+    return sys.modules["cctally"]._codex_budget_crossings(*args, **kwargs)
+
+
+def _resolve_codex_budget_period_window(*args, **kwargs):
+    return sys.modules["cctally"]._resolve_codex_budget_period_window(*args, **kwargs)
+
+
+def _sum_codex_cost_for_range(*args, **kwargs):
+    return sys.modules["cctally"]._sum_codex_cost_for_range(*args, **kwargs)
+
+
+def resolve_display_tz(*args, **kwargs):
+    return sys.modules["cctally"].resolve_display_tz(*args, **kwargs)
+
+
 def _sum_cost_by_project(*args, **kwargs):
     return sys.modules["cctally"]._sum_cost_by_project(*args, **kwargs)
 
@@ -295,6 +319,10 @@ def _budget_alerts_active(*args, **kwargs):
 
 def _resolve_current_budget_window(*args, **kwargs):
     return sys.modules["cctally"]._resolve_current_budget_window(*args, **kwargs)
+
+
+def _resolve_claude_budget_window(*args, **kwargs):
+    return sys.modules["cctally"]._resolve_claude_budget_window(*args, **kwargs)
 
 
 def _sum_cost_for_range(*args, **kwargs):
@@ -329,8 +357,8 @@ def _assess_forecast_confidence(*args, **kwargs):
     return sys.modules["cctally"]._assess_forecast_confidence(*args, **kwargs)
 
 
-def _build_budget_status_inputs(*args, **kwargs):
-    return sys.modules["cctally"]._build_budget_status_inputs(*args, **kwargs)
+def _build_vendor_budget_inputs(*args, **kwargs):
+    return sys.modules["cctally"]._build_vendor_budget_inputs(*args, **kwargs)
 
 
 def compute_budget_status(*args, **kwargs):
@@ -744,9 +772,11 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
     # overhead for non-budget users. `load_config()` is safe outside any
     # writer lock — atomic-rename guarantees whole-byte reads. A malformed
     # budget block is a quiet warn-once no-op (mirrors weekly/5h), NOT an
-    # unthrottled per-tick stderr via the caller's wrapper.
+    # unthrottled per-tick stderr via the caller's wrapper. One config read
+    # services both the gate and the calendar-window tz resolution.
+    config = load_config()
     try:
-        budget_cfg = _get_budget_config(load_config())
+        budget_cfg = _get_budget_config(config)
     except _BudgetConfigError as exc:
         _warn_budget_bad_config_once(exc)
         return
@@ -756,12 +786,21 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
     thresholds = budget_cfg["alert_thresholds"]
     if not thresholds:
         return
+    # Period generalization (spec §6): subscription-week resolves the snapshot-
+    # anchored window; a calendar period (calendar-week / calendar-month)
+    # resolves the window purely from `now` + the period and stores the
+    # period-start instant in the SAME `week_start_at` key column (back-compat
+    # misnomer). config/tz are resolved once for the calendar branch.
+    period = budget_cfg.get("period", "subscription-week")
 
+    tz = resolve_display_tz(argparse.Namespace(tz=None), config)
     now_utc = _command_as_of()
     pending_alerts: list[dict[str, Any]] = []
     conn = open_db()
     try:
-        window = _resolve_current_budget_window(conn, now_utc)
+        window = _resolve_claude_budget_window(
+            conn, now_utc, period=period, config=config, tz=tz
+        )
         if window is None:
             return  # no resolvable week window yet (spec §6 worst case)
         week_start_at, _week_end_at = window
@@ -773,10 +812,15 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
         # — so a partial prior run that recorded some-but-not-all thresholds
         # still gets the remaining ones a SUM + crossing-check. The skip never
         # owes a crossing: an un-recorded threshold always forces the SUM.
+        # The `period IS NULL` arm (#137) makes a pre-011 NULL-period row for
+        # this window count as already-recorded, so an upgrading user never
+        # re-fires a spurious alert against a historical crossing; a row stored
+        # under the SAME concrete `period` also counts (fire-once).
         present = {
             int(r[0]) for r in conn.execute(
-                "SELECT threshold FROM budget_milestones WHERE week_start_at = ?",
-                (week_key,),
+                "SELECT threshold FROM budget_milestones "
+                "WHERE week_start_at = ? AND (period = ? OR period IS NULL)",
+                (week_key, period),
             )
         }
         pending = [t for t in sorted(thresholds) if t not in present]
@@ -794,6 +838,7 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
                 inserted = insert_budget_milestone(
                     conn,
                     week_start_at=week_key,
+                    period=period,
                     threshold=t,
                     budget_usd=target,
                     spent_usd=spent,
@@ -807,13 +852,14 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
                     # set-then-dispatch: alerted_at lands on the row BEFORE
                     # the osascript Popen, sharing this transaction with the
                     # INSERT (commit=False) so a crash between them is
-                    # impossible. `alerted_at IS NULL` guard is write-once
-                    # defense-in-depth.
+                    # impossible. The UPDATE keys on the CONCRETE `period` (#137)
+                    # — never a NULL-period sibling. `alerted_at IS NULL` guard
+                    # is write-once defense-in-depth.
                     conn.execute(
                         "UPDATE budget_milestones SET alerted_at = ? "
-                        "WHERE week_start_at = ? AND threshold = ? "
+                        "WHERE week_start_at = ? AND period = ? AND threshold = ? "
                         "  AND alerted_at IS NULL",
-                        (crossed_at, week_key, t),
+                        (crossed_at, week_key, period, t),
                     )
                     pending_alerts.append(_build_alert_payload_budget(
                         threshold=t,
@@ -822,6 +868,7 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
                         budget_usd=target,
                         spent_usd=spent,
                         consumption_pct=consumption_pct,
+                        period=period,
                     ))
         # Single commit: every INSERT + its alerted_at marker durable together.
         conn.commit()
@@ -1005,6 +1052,114 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
             eprint(f"[project-budget-alerts] dispatch failed: {dispatch_exc}")
 
 
+def maybe_record_codex_budget_milestone(saved: dict[str, Any]) -> None:
+    """Fire Codex budget alerts on ACTUAL-Codex-spend threshold crossings (axis
+    ``codex_budget``, calendar-period-codex-budgets spec §6 — the gap the Codex
+    spec review flagged: Codex usage never flows through ``record-usage``, so the
+    Claude budget axes can't catch it). Called from ``cmd_record_usage``
+    alongside the weekly-% / 5h-% / budget / project-budget milestone helpers AND
+    opportunistically from ``cmd_budget`` (the Codex section already resolves
+    spend + crossings). Forward-only / fire-once, so the double-trigger never
+    double-fires. Gated, hot-path-cheap, set-then-dispatch. Errors are logged,
+    not raised (the caller also wraps).
+
+    Unlike the Claude budget axis, Codex has NO subscription week: the period
+    window is resolved purely from ``now`` + the configured calendar period
+    (calendar-week / calendar-month) via the pure ``calendar_*_window``
+    functions — it NEVER touches ``weekly_usage_snapshots``. The crossing +
+    set-then-dispatch arithmetic is factored into the shared
+    ``_codex_budget_crossings`` helper so this firing path and the
+    ``cctally budget`` opportunistic path stay byte-identical (plan §3.6).
+
+    ``saved`` is accepted for call-site symmetry with the sibling helpers but is
+    unused: Codex spend is resolved from the cache DB (``_sum_codex_cost_for_range``)
+    independent of the just-recorded 7d-% snapshot.
+    """
+    # Gate FIRST (hot-path discipline): no Codex budget OR alerts off → zero
+    # overhead for non-Codex-budget users. `load_config()` is safe outside any
+    # writer lock (atomic-rename). A malformed budget block is a quiet warn-once
+    # no-op (mirrors maybe_record_budget_milestone). One config read services
+    # both the gate and the calendar-window tz resolution.
+    config = load_config()
+    try:
+        budget_cfg = _get_budget_config(config)
+    except _BudgetConfigError as exc:
+        _warn_budget_bad_config_once(exc)
+        return
+    codex_cfg = budget_cfg.get("codex")
+    if not codex_cfg or not codex_cfg.get("alerts_enabled"):
+        return
+    target = codex_cfg.get("amount_usd")
+    thresholds = codex_cfg.get("alert_thresholds") or []
+    if target is None or not thresholds:
+        return
+    period = codex_cfg["period"]
+
+    tz = resolve_display_tz(argparse.Namespace(tz=None), config)
+    now_utc = _command_as_of()
+    pending_alerts: list[dict[str, Any]] = []
+    conn = open_db()
+    try:
+        start_at, _end_at = _resolve_codex_budget_period_window(
+            period, now_utc, config, tz
+        )
+        period_key = start_at.isoformat(timespec="seconds")
+
+        # Pre-probe (hot-path discipline + [Dedup mustn't gate side effects]):
+        # which configured thresholds are STILL un-recorded for this period? The
+        # Codex cost SUM is skipped ONLY when every threshold already has a row.
+        # The `period IS NULL` arm (#137) makes a pre-011 NULL-period row for
+        # this period count as already-recorded (no spurious upgrade re-fire); a
+        # row under the SAME concrete `period` also counts (fire-once).
+        present = {
+            int(r[0]) for r in conn.execute(
+                "SELECT threshold FROM codex_budget_milestones "
+                "WHERE period_start_at = ? AND (period = ? OR period IS NULL)",
+                (period_key, period),
+            )
+        }
+        pending = [t for t in sorted(thresholds) if t not in present]
+        if not pending:
+            return  # nothing left to cross this period → skip the cost SUM
+
+        spent = _sum_codex_cost_for_range(start_at, now_utc)
+        # Shared INSERT-and-arm core (set-then-dispatch, fire-once via rowcount);
+        # commit=False inside, so this conn owns the single durable commit below.
+        for t, crossed_at, sp, tg, pct in _codex_budget_crossings(
+            conn,
+            period_key=period_key,
+            period=period,
+            thresholds=pending,
+            target=target,
+            spent=spent,
+            now_utc=now_utc,
+        ):
+            pending_alerts.append(_build_alert_payload_codex_budget(
+                threshold=t,
+                crossed_at_utc=crossed_at,
+                period_start_at=period_key,
+                period=period,
+                budget_usd=tg,
+                spent_usd=sp,
+                consumption_pct=pct,
+            ))
+        # Single commit: every INSERT + its alerted_at marker durable together.
+        conn.commit()
+    except Exception as exc:
+        eprint(f"[codex-budget-milestone] error recording codex budget milestone: {exc}")
+    finally:
+        conn.close()
+
+    # Dispatch AFTER commit; a dispatch failure NEVER rolls back the milestone
+    # (set-then-dispatch invariant — one queue attempt per crossing, deduped on
+    # the alerted_at column).
+    for payload in pending_alerts:
+        try:
+            _dispatch_alert_notification(payload, mode="real")
+        except Exception as dispatch_exc:
+            eprint(f"[codex-budget-alerts] dispatch failed: {dispatch_exc}")
+
+
 def _weekly_pct_week_avg_projection(conn, now_utc):
     """Compute the week-AVERAGE weekly-% projection for the current
     subscription week, snapshot-only (CHEAP — no cost SUM, no ``sync_cache``).
@@ -1058,27 +1213,39 @@ def _weekly_pct_week_avg_projection(conn, now_utc):
     return (projected_pct, confidence == "low")
 
 
-def maybe_record_projected_alert(saved: dict[str, Any]) -> None:
-    """Projected-pace detect-and-arm (axis ``projected``, #121).
+def maybe_record_projected_alert(
+    saved: dict[str, Any], *, only_metrics=None
+) -> None:
+    """Projected-pace detect-and-arm (axis ``projected``, #121 / #135).
 
     Fires on the WEEK-AVERAGE projection (never the displayed high-end verdict
-    band) for ``weekly_pct`` and/or ``budget_usd``. Its OWN detect-and-arm —
-    NOT folded into ``maybe_record_milestone`` (Section 1 / Codex P0-3) — called
-    from ``cmd_record_usage`` in its own ``try`` after the weekly/5h/budget
-    blocks.
+    band) for ``weekly_pct``, ``budget_usd`` (any Claude period — #135) and/or
+    ``codex_budget_usd`` (#135). Its OWN detect-and-arm — NOT folded into
+    ``maybe_record_milestone`` (Section 1 / Codex P0-3) — called from
+    ``cmd_record_usage`` in its own ``try`` after the weekly/5h/budget blocks.
 
     Master gates (Codex P1-2): ``weekly_pct`` fires only under
     ``alerts.enabled && alerts.projected_enabled``; ``budget_usd`` only under
-    ``_budget_alerts_active(budget_cfg) && budget.projected_enabled``. Both
-    toggles default OFF (no surprise notifications on upgrade). When NEITHER is
-    on, returns after only a cheap config read — no projection math, no cost
-    work.
+    ``_budget_alerts_active(budget_cfg) && budget.projected_enabled`` (#135:
+    ALL Claude periods, not just subscription-week); ``codex_budget_usd`` only
+    under ``codex.alerts_enabled && codex.projected_enabled`` with a set
+    ``amount_usd`` + ``alert_thresholds`` (mirrors
+    ``maybe_record_codex_budget_milestone``'s gate — there is no
+    ``_codex_budget_alerts_active`` helper). All toggles default OFF (no
+    surprise notifications on upgrade). When NONE is on, returns after only a
+    cheap config read — no projection math, no cost work.
+
+    ``only_metrics`` (#135): when a set of metric names is passed (the
+    opportunistic ``cctally budget`` fire passes ``{"codex_budget_usd"}``), only
+    those legs run — so that interactive fire never pops a ``weekly_pct`` /
+    Claude-``budget_usd`` notification. ``None`` (the record path) = every
+    enabled leg.
 
     Pre-probe (Codex P1-1): a metric whose levels are ALL already latched is
     skipped BEFORE any projection / cost work.
 
     Snap-up (Codex P2-1): a level fires when ``projected + 1e-9 >= threshold``.
-    Latch / fire-once: ``UNIQUE(week_start_at, metric, threshold)`` + the
+    Latch / fire-once: ``UNIQUE(week_start_at, period, metric, threshold)`` + the
     rowcount==1 predicate — a later recovery neither un-fires nor re-fires.
     Mid-week reset re-anchors ``week_start_at`` (budget pattern; no
     ``reset_event_id``).
@@ -1087,12 +1254,17 @@ def maybe_record_projected_alert(saved: dict[str, Any]) -> None:
     txn, commit, THEN best-effort dispatch. A dispatch failure never rolls back
     the milestone.
 
-    The ``budget_usd`` leg reuses the SAME ``_build_budget_status_inputs`` +
+    Both budget legs reuse the SAME ``_build_vendor_budget_inputs`` +
     ``compute_budget_status`` path that produces ``budget --json``'s
     ``week_avg_projection_usd`` (the reconcile-bound field) — value-exact by
-    construction. The cache is already warm from the actual-budget axis's spend
-    SUM this same tick, so this is not a second aggregation pass; the pre-probe
-    additionally skips it entirely when all budget levels are latched.
+    construction, keyed on the calendar/subscription period-start instant in the
+    back-compat ``week_start_at`` column. The Claude leg passes ``skip_sync=True``
+    (the cache is warmed by the actual-budget axis's spend SUM this same tick);
+    the Codex leg passes ``skip_sync=False`` (R5: Codex has no other record-path
+    warmer — ``maybe_record_codex_budget_milestone`` short-circuits before its SUM
+    when all actual levels are latched, so a ``skip_sync=True`` Codex leg could
+    read a cold cache and under-count; the delta-sync is a near-no-op when warm).
+    The pre-probe skips each leg entirely when all its levels are already latched.
     """
     # The `projected_enabled` toggles are validated keys on the alerts/budget
     # blocks (bool-validated; default OFF), so read them straight off the
@@ -1114,11 +1286,43 @@ def maybe_record_projected_alert(saved: dict[str, Any]) -> None:
     weekly_on = bool(alerts_cfg.get("enabled")) and bool(
         alerts_cfg.get("projected_enabled")
     )
+    # #135: the Claude `budget_usd` leg now fires for ANY period (calendar-week /
+    # calendar-month / subscription-week). `_build_vendor_budget_inputs` resolves
+    # the correct window per period, and the milestone keys on that period-start
+    # instant (in the back-compat `week_start_at` column) — the same key the
+    # actual-budget axis uses — so there is no window/key mismatch any more.
     budget_on = _budget_alerts_active(budget_cfg) and bool(
         budget_cfg.get("projected_enabled")
     )
-    if not (weekly_on or budget_on):
+    # #135: the Codex `codex_budget_usd` leg. No `_codex_budget_alerts_active`
+    # helper exists, so inline the gate mirroring
+    # `maybe_record_codex_budget_milestone`: a Codex budget block with alerts +
+    # projected on and a set amount/thresholds. (Projected requires
+    # `alerts_enabled` too — same as the Claude leg, where `_budget_alerts_active`
+    # requires it — documented in budget.md, not UI-enforced.)
+    codex_cfg = budget_cfg.get("codex") or {}
+    codex_on = (
+        bool(codex_cfg)
+        and bool(codex_cfg.get("alerts_enabled"))
+        and bool(codex_cfg.get("projected_enabled"))
+        and codex_cfg.get("amount_usd") is not None
+        and bool(codex_cfg.get("alert_thresholds"))
+    )
+    # only_metrics scopes the opportunistic `cctally budget` fire to the Codex
+    # leg so it never pops a weekly_pct / Claude budget_usd notification.
+    if only_metrics is not None:
+        weekly_on = weekly_on and "weekly_pct" in only_metrics
+        budget_on = budget_on and "budget_usd" in only_metrics
+        codex_on = codex_on and "codex_budget_usd" in only_metrics
+    if not (weekly_on or budget_on or codex_on):
         return  # cheap config-only path — non-projected users pay nothing
+
+    # Both budget legs resolve their window via _build_vendor_budget_inputs in
+    # CONFIG tz (Namespace(tz=None)) — like maybe_record_codex_budget_milestone
+    # — so a `cctally budget --tz X` opportunistic fire near a period boundary
+    # resolves the SAME period_start_at dedup key as the record path and never
+    # forks / double-fires.
+    config_tz = resolve_display_tz(argparse.Namespace(tz=None), cfg)
 
     now_utc = _command_as_of()
     pending: list[dict[str, Any]] = []
@@ -1134,9 +1338,10 @@ def maybe_record_projected_alert(saved: dict[str, Any]) -> None:
                 )
                 week_key = ws_at.isoformat(timespec="seconds")
                 levels = (90, 100)
+                # weekly_pct is the Anthropic subscription week (#137).
                 if not _projected_levels_already_latched(
-                    conn, week_start_at=week_key, metric="weekly_pct",
-                    levels=levels,
+                    conn, week_start_at=week_key, period="subscription-week",
+                    metric="weekly_pct", levels=levels,
                 ):
                     proj = _weekly_pct_week_avg_projection(conn, now_utc)
                     if proj is not None and not proj[1]:
@@ -1145,33 +1350,40 @@ def maybe_record_projected_alert(saved: dict[str, Any]) -> None:
                             if value + 1e-9 >= t:
                                 pending.append(dict(
                                     week_start_at=week_key,
+                                    period="subscription-week",
                                     metric="weekly_pct",
                                     threshold=t,
                                     projected_value=value,
                                     denominator=100.0,
                                 ))
 
-        # ── budget_usd leg (reuses the tick's spend via the shared path) ─────
+        # ── budget_usd leg (any Claude period — #135; shared factory) ────────
         if budget_on:
             target = budget_cfg["weekly_usd"]
             thresholds = tuple(
                 sorted(set(int(t) for t in budget_cfg["alert_thresholds"]))
             )
-            window = _resolve_current_budget_window(conn, now_utc)
+            claude_period = budget_cfg.get("period", "subscription-week")
+            # Resolve the window key CHEAPLY first (SUM-free, same resolver the
+            # actual-budget axis uses) so the pre-probe can short-circuit BEFORE
+            # _build_vendor_budget_inputs runs any cost SUM / cache sync — the
+            # pre-probe-runs-first contract (spec §3.4; mirrors the actual axis).
+            window = _resolve_claude_budget_window(
+                conn, now_utc, period=claude_period, config=cfg, tz=config_tz
+            )
             if window is not None and thresholds:
                 b_ws_at, _b_we_at = window
                 b_week_key = b_ws_at.isoformat(timespec="seconds")
                 if not _projected_levels_already_latched(
-                    conn, week_start_at=b_week_key, metric="budget_usd",
-                    levels=thresholds,
+                    conn, week_start_at=b_week_key, period=claude_period,
+                    metric="budget_usd", levels=thresholds,
                 ):
-                    # skip_sync=True: the actual-budget axis
-                    # (maybe_record_budget_milestone) already ran a
+                    # skip_sync=True: the actual-budget axis already ran a
                     # _sum_cost_for_range this same tick, warming the cache.
-                    # Avoids a redundant JSONL ingest pass here.
-                    inputs = _build_budget_status_inputs(
-                        conn, target_usd=target, now_utc=now_utc,
-                        alert_thresholds=thresholds, skip_sync=True,
+                    inputs = _build_vendor_budget_inputs(
+                        vendor="claude", period=claude_period, target_usd=target,
+                        alert_thresholds=thresholds, now_utc=now_utc, config=cfg,
+                        tz=config_tz, skip_sync=True,
                     )
                     if inputs is not None:
                         status = compute_budget_status(inputs)
@@ -1181,10 +1393,57 @@ def maybe_record_projected_alert(saved: dict[str, Any]) -> None:
                                 if value + 1e-9 >= (t / 100.0) * float(target):
                                     pending.append(dict(
                                         week_start_at=b_week_key,
+                                        period=claude_period,
                                         metric="budget_usd",
                                         threshold=t,
                                         projected_value=value,
                                         denominator=float(target),
+                                    ))
+
+        # ── codex_budget_usd leg (#135; skip_sync=False — R5) ────────────────
+        if codex_on:
+            c_target = codex_cfg["amount_usd"]
+            c_thresholds = tuple(
+                sorted(set(int(t) for t in codex_cfg["alert_thresholds"]))
+            )
+            c_period = codex_cfg["period"]
+            # Cheap, SUM-free window key first (pure calendar resolution), so the
+            # pre-probe short-circuits BEFORE any Codex cache sync / cost SUM —
+            # spec §3.4 (pre-probe runs FIRST).
+            c_window = _resolve_codex_budget_period_window(
+                c_period, now_utc, cfg, config_tz
+            )
+            if c_window is not None and c_thresholds:
+                c_ws_at, _c_we_at = c_window
+                c_week_key = c_ws_at.isoformat(timespec="seconds")
+                if not _projected_levels_already_latched(
+                    conn, week_start_at=c_week_key, period=c_period,
+                    metric="codex_budget_usd", levels=c_thresholds,
+                ):
+                    # skip_sync=False (R5): Codex has no other record-path cache
+                    # warmer (maybe_record_codex_budget_milestone short-circuits
+                    # before its SUM when all actual levels are latched), so a
+                    # skip_sync=True leg could read a cold cache and under-count.
+                    # The pre-probe above already gated this, so a sync only runs
+                    # when a cross is genuinely owed; it's a near-no-op when warm.
+                    c_inputs = _build_vendor_budget_inputs(
+                        vendor="codex", period=c_period, target_usd=c_target,
+                        alert_thresholds=c_thresholds, now_utc=now_utc,
+                        config=cfg, tz=config_tz, skip_sync=False,
+                    )
+                    if c_inputs is not None:
+                        c_status = compute_budget_status(c_inputs)
+                        if not c_status.low_confidence:
+                            value = c_status.week_avg_projection_usd
+                            for t in c_thresholds:
+                                if value + 1e-9 >= (t / 100.0) * float(c_target):
+                                    pending.append(dict(
+                                        week_start_at=c_week_key,
+                                        period=c_period,
+                                        metric="codex_budget_usd",
+                                        threshold=t,
+                                        projected_value=value,
+                                        denominator=float(c_target),
                                     ))
 
         # ── arm (set-then-dispatch): INSERT + stamp alerted_at in one txn ────
@@ -1193,6 +1452,7 @@ def maybe_record_projected_alert(saved: dict[str, Any]) -> None:
             inserted = insert_projected_milestone(
                 conn,
                 week_start_at=p["week_start_at"],
+                period=p["period"],
                 metric=p["metric"],
                 threshold=p["threshold"],
                 projected_value=p["projected_value"],
@@ -1200,14 +1460,15 @@ def maybe_record_projected_alert(saved: dict[str, Any]) -> None:
                 commit=False,
             )
             # Only the genuine-new-crossing winner (rowcount==1) arms+dispatches;
-            # a racing record-usage instance gets rowcount==0 and skips.
+            # a racing record-usage instance gets rowcount==0 and skips. The
+            # alerted_at UPDATE keys on the CONCRETE `period` (#137).
             if inserted == 1:
                 conn.execute(
                     "UPDATE projected_milestones SET alerted_at = ? "
-                    "WHERE week_start_at = ? AND metric = ? AND threshold = ? "
-                    "  AND alerted_at IS NULL",
-                    (now_utc_iso(), p["week_start_at"], p["metric"],
-                     p["threshold"]),
+                    "WHERE week_start_at = ? AND period = ? AND metric = ? "
+                    "  AND threshold = ? AND alerted_at IS NULL",
+                    (now_utc_iso(), p["week_start_at"], p["period"],
+                     p["metric"], p["threshold"]),
                 )
                 fired.append(p)
         # Single commit: every INSERT + its alerted_at marker durable together.
@@ -2810,6 +3071,8 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                 (maybe_record_budget_milestone, "budget-milestone"),
                 (maybe_record_project_budget_milestone,
                  "project-budget-milestone"),
+                (maybe_record_codex_budget_milestone,
+                 "codex-budget-milestone"),
                 (maybe_record_projected_alert, "projected-alert"),
             ):
                 try:
@@ -2869,11 +3132,26 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
     except Exception as exc:
         eprint(f"[project-budget-milestone] unexpected error: {exc}")
 
-    # NEW: projected-pace alert firing (axis `projected`, #121). Runs in its
-    # OWN detect-and-arm AFTER the weekly/5h/budget blocks; gated up front on
-    # (alerts.enabled && alerts.projected_enabled) ||
-    # (_budget_alerts_active && budget.projected_enabled) — both toggles
-    # default OFF, so non-projected users pay only a cheap config read.
+    # NEW: Codex budget alert firing (axis `codex_budget`, calendar-period-codex-
+    # budgets). Gated FIRST on a configured budget.codex + alerts_enabled — non-
+    # Codex-budget users pay only one config read. Codex usage never flows through
+    # record-usage, so this is one of the two firing triggers (the other is the
+    # opportunistic fire on `cctally budget`); forward-only/fire-once means the
+    # double-trigger never double-fires.
+    try:
+        maybe_record_codex_budget_milestone(saved)
+    except Exception as exc:
+        eprint(f"[codex-budget-milestone] unexpected error: {exc}")
+
+    # NEW: projected-pace alert firing (axis `projected`, #121/#135). Runs in
+    # its OWN detect-and-arm AFTER the weekly/5h/budget/codex blocks; gated up
+    # front on (alerts.enabled && alerts.projected_enabled) ||
+    # (_budget_alerts_active && budget.projected_enabled — ANY Claude period,
+    # #135) || (codex.alerts_enabled && codex.projected_enabled, #135) — all
+    # toggles default OFF, so non-projected users pay only a cheap config read.
+    # No only_metrics on the record path: every enabled leg runs. The Codex leg
+    # relies on the codex-budget block above (:3129) having warmed the cache,
+    # but is robust even if it short-circuited (skip_sync=False self-syncs, R5).
     try:
         maybe_record_projected_alert(saved)
     except Exception as exc:

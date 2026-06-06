@@ -554,3 +554,189 @@ def test_dispatcher_tuple_safe_select_against_seeded_cache_db(cctally_module):
     )
     assert invoked == ["b"]  # 'a' skipped via tuple-safe applied set
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+
+
+# ── _recover_version_ahead (issue #145) ──────────────────────────────────
+
+def _mk_db_with_markers(tmp_path, *, user_version, applied=(), skipped=()):
+    import sqlite3
+    p = tmp_path / "x.db"
+    conn = sqlite3.connect(p)
+    conn.execute("CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)")
+    conn.execute("CREATE TABLE schema_migrations_skipped (name TEXT PRIMARY KEY, skipped_at_utc TEXT NOT NULL, reason TEXT)")
+    for n in applied:
+        conn.execute("INSERT INTO schema_migrations VALUES (?, '2026-01-01T00:00:00Z')", (n,))
+    for n in skipped:
+        conn.execute("INSERT INTO schema_migrations_skipped VALUES (?, '2026-01-01T00:00:00Z', 'x')", (n,))
+    conn.execute(f"PRAGMA user_version = {user_version}")
+    conn.commit()
+    return conn
+
+
+def _registry(cctally_module, *names):
+    Migration = cctally_module.Migration
+    return [Migration(seq=i + 1, name=n, handler=lambda c: None) for i, n in enumerate(names)]
+
+
+def test_recover_noop_when_not_ahead(cctally_module, tmp_path):
+    conn = _mk_db_with_markers(tmp_path, user_version=1, applied=["001_a"])
+    reg = _registry(cctally_module, "001_a", "002_b")  # head 2, db at 1 (behind)
+    info = cctally_module._recover_version_ahead(conn, reg, "cache.db")
+    assert info["reverted_from"] == 1 and info["reverted_to"] == 1 and info["trimmed"] == 0
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+def test_recover_trims_unknown_from_both_tables_common_case(cctally_module, tmp_path):
+    # Ahead: head=1 (knows 001_a), db at 2 with an unknown applied + unknown skipped.
+    conn = _mk_db_with_markers(
+        tmp_path, user_version=2, applied=["001_a", "002_unknown"], skipped=["003_unknown_skip"],
+    )
+    reg = _registry(cctally_module, "001_a")
+    info = cctally_module._recover_version_ahead(conn, reg, "cache.db")
+    applied = {r[0] for r in conn.execute("SELECT name FROM schema_migrations")}
+    skipped = {r[0] for r in conn.execute("SELECT name FROM schema_migrations_skipped")}
+    assert applied == {"001_a"}                 # unknown applied trimmed
+    assert skipped == set()                     # unknown skipped trimmed (P1#1)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1   # all known applied → head
+    assert info["reverted_from"] == 2 and info["reverted_to"] == 1 and info["trimmed"] == 2
+
+
+def test_recover_adversarial_missing_known_marker_resets_to_zero(cctally_module, tmp_path):
+    # Ahead AND a known marker is missing → must NOT cement a fast-path (P1#2).
+    conn = _mk_db_with_markers(tmp_path, user_version=2, applied=["002_unknown"])
+    reg = _registry(cctally_module, "001_a")   # 001_a NOT present
+    info = cctally_module._recover_version_ahead(conn, reg, "cache.db")
+    assert {r[0] for r in conn.execute("SELECT name FROM schema_migrations")} == set()
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 0   # reconcile, not fast-path
+    assert info["reverted_to"] == 0
+
+
+def test_recover_tolerates_absent_skipped_table(cctally_module, tmp_path):
+    import sqlite3
+    p = tmp_path / "y.db"
+    conn = sqlite3.connect(p)
+    conn.execute("CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)")
+    conn.execute("INSERT INTO schema_migrations VALUES ('001_a','t'), ('002_unknown','t')")
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    reg = _registry(cctally_module, "001_a")
+    info = cctally_module._recover_version_ahead(conn, reg, "cache.db")   # must not raise
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert info["reverted_to"] == 1
+
+
+# ── dispatcher recover_version_ahead opt-in (issue #145) ──────────────────
+
+def test_dispatcher_recovers_cache_when_opted_in(cctally_module, tmp_path, capsys):
+    conn = _mk_db_with_markers(tmp_path, user_version=5, applied=["001_z"])
+    reg = _registry(cctally_module, "001_z")  # head 1, db at 5 (ahead)
+    # Opted-in (cache.db semantics): heals instead of raising.
+    cctally_module._run_pending_migrations(
+        conn, registry=reg, db_label="cache.db", recover_version_ahead=True,
+    )
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    err = capsys.readouterr().err
+    assert "cache.db was ahead" in err and "cache-sync --rebuild" in err
+
+
+def test_dispatcher_raises_when_not_opted_in(cctally_module, tmp_path):
+    import pytest
+    conn = _mk_db_with_markers(tmp_path, user_version=5, applied=["001_z"])
+    reg = _registry(cctally_module, "001_z")
+    with pytest.raises(cctally_module.DowngradeDetected):
+        cctally_module._run_pending_migrations(
+            conn, registry=reg, db_label="stats.db",  # default recover_version_ahead=False
+        )
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 5  # untouched
+
+
+# ── enriched DowngradeDetected message (issue #145) ───────────────────────
+
+def test_downgrade_detected_message(cctally_module):
+    exc = cctally_module.DowngradeDetected("stats.db", db_version=9, max_known=7)
+    msg = str(exc)
+    assert "stats.db is at version 9 but this cctally only knows up to 7." in msg
+    assert "cctally db recover --db stats" in msg
+
+
+# ── central schema_migrations stamp owned by the dispatcher (issue #140) ──
+
+def test_stampless_migration_persists_and_is_not_rewalked(
+    cctally_module, tmp_path, monkeypatch
+):
+    """A handler that does NOT self-stamp must still get its schema_migrations
+    marker persisted by the dispatcher (issue #140), so it is not re-walked
+    when the registry later grows.
+
+    Why registry growth (Codex P1): the dispatcher advances PRAGMA
+    user_version from its IN-MEMORY ``applied`` set
+    (``applied.add(m.name)`` after any clean handler return, then
+    ``PRAGMA user_version = len(registry)``), so a fixed-registry two-call
+    test would pass even with no marker persisted — run 1 already set
+    user_version = len(registry) and run 2 fast-paths. The bug only
+    manifests when ``cur_version < len(registry)`` and ``applied`` is
+    reloaded from the persisted ``schema_migrations`` table — i.e. when the
+    registry GROWS between opens.
+    """
+    import _cctally_core
+    monkeypatch.setattr(
+        _cctally_core, "MIGRATION_ERROR_LOG_PATH",
+        tmp_path / "migration-errors.log",
+    )
+
+    db_path = tmp_path / "stats.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        # Existing install (NOT fresh): pre-create schema_migrations so the
+        # dispatcher takes the handler-running path, not the fresh-install
+        # stamp-without-running fast path.
+        conn.execute(
+            "CREATE TABLE schema_migrations "
+            "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+        )
+        conn.commit()
+
+        runs = []
+
+        def stampless(c):
+            c.execute("CREATE TABLE IF NOT EXISTS _probe(x)")
+            c.execute("INSERT INTO _probe VALUES (1)")
+            c.commit()                      # real data commit, NO self-stamp
+            runs.append("999")
+
+        def other(c):
+            c.commit()                      # trivial later migration
+            runs.append("1000")
+
+        m999 = cctally_module.Migration(
+            seq=1, name="999_stampless", handler=stampless
+        )
+        m1000 = cctally_module.Migration(
+            seq=2, name="1000_probe", handler=other
+        )
+
+        # Run 1 — registry = [999].
+        cctally_module._run_pending_migrations(
+            conn, registry=[m999], db_label="stats.db"
+        )
+        # ASSERTION A — marker persisted (RED without the central stamp:
+        # schema_migrations empty here even though user_version already
+        # advanced to 1 from the in-memory applied set).
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations "
+            "WHERE name='999_stampless'"
+        ).fetchone()[0] == 1
+
+        # Run 2 — registry GREW to [999, 1000]; cur_version(1) < len(2) ⇒
+        # the dispatcher reloads ``applied`` from the PERSISTED
+        # schema_migrations.
+        cctally_module._run_pending_migrations(
+            conn, registry=[m999, m1000], db_label="stats.db"
+        )
+        # ASSERTION B — 999 not re-walked (RED without stamp:
+        # runs == ["999", "999", "1000"]).
+        assert runs == ["999", "1000"]
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    finally:
+        conn.close()

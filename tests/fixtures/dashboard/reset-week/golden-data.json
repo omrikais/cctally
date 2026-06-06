@@ -6,6 +6,9 @@
       90,
       100
     ],
+    "codex_budget_alerts_enabled": false,
+    "codex_budget_configured": false,
+    "codex_projected_enabled": false,
     "command_configured": false,
     "enabled": false,
     "five_hour_thresholds": [
@@ -1131,6 +1134,7 @@
     "total": 9
   },
   "sync_age_s": null,
+  "transcriptsEnabled": true,
   "trend": {
     "avg_dollars_per_pct": 0.3157894736842105,
     "history": [

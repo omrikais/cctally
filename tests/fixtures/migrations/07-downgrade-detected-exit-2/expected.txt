@@ -1,6 +1,6 @@
 ## stdout
 
 ## stderr
-cctally: stats.db is at version 99 but this cctally only knows up to 11.
+cctally: stats.db is at version 99 but this cctally only knows up to 12. A newer/unreleased cctally likely touched this data dir. Run `cctally db recover --db stats` to revert it to the known schema head (cache.db is re-derivable and recovers without --yes; stats.db needs --yes and may require a re-record afterward).
 ## exit
 2

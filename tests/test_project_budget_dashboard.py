@@ -284,3 +284,521 @@ def test_post_settings_persists_project_alerts_enabled(ns, monkeypatch):
     import _cctally_core
     saved = json.loads(_cctally_core.CONFIG_PATH.read_text())
     assert saved["budget"]["project_alerts_enabled"] is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #134 — dashboard Codex budget toggles (nested partial-merge writer + SSE
+# fields + the broken codex_budget test-alert fix). Server-side only (Task 2).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _write_codex_budget_config(
+    ns, *, codex, alerts_enabled=True, alert_thresholds=(90, 100),
+):
+    """Persist a ``budget`` block carrying a nested ``codex`` sub-block.
+
+    ``codex`` is the literal nested dict to persist (or ``None`` to seed the
+    no-Codex-budget sentinel — the null-codex 400 case). The parent block keeps
+    a valid Claude side so ``_get_budget_config`` validates cleanly.
+    """
+    import _cctally_core
+    block = {
+        "alerts_enabled": alerts_enabled,
+        "alert_thresholds": list(alert_thresholds),
+        "projects": {},
+        "project_alerts_enabled": False,
+    }
+    if codex is not None:
+        block["codex"] = codex
+    _cctally_core.CONFIG_PATH.write_text(json.dumps({"budget": block}) + "\n")
+
+
+# ── 2A: nested partial-merge for budget.codex ────────────────────────────
+
+
+def test_post_settings_codex_nested_merge_no_clobber(ns, monkeypatch):
+    """Toggling budget.codex.alerts_enabled must NOT clobber the sibling
+    amount_usd/period/alert_thresholds (the nested partial-merge contract)."""
+    _write_codex_budget_config(
+        ns,
+        codex={
+            "amount_usd": 200,
+            "period": "calendar-month",
+            "alerts_enabled": False,
+            "alert_thresholds": [90, 100],
+            "projected_enabled": False,
+        },
+    )
+    # The reconcile helper (fired by flipping alerts_enabled) resolves the
+    # Codex cost SUM at call time; stub it so the server thread never scans
+    # the filesystem and no crossing is fabricated.
+    monkeypatch.setitem(
+        ns, "_sum_codex_cost_for_range",
+        lambda start, now, **kw: 0.0,
+    )
+    _wire_dashboard_handlers(ns)
+    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    port = srv.server_address[1]
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"budget": {"codex": {"alerts_enabled": True}}},
+        )
+    finally:
+        srv.shutdown()
+
+    assert status == 200, body
+    import _cctally_core
+    saved = json.loads(_cctally_core.CONFIG_PATH.read_text())
+    codex = saved["budget"]["codex"]
+    # Sibling fields preserved — the regression this guards against.
+    assert codex["amount_usd"] == 200
+    assert codex["period"] == "calendar-month"
+    assert codex["alert_thresholds"] == [90, 100]
+    # The toggled leaf flipped on.
+    assert codex["alerts_enabled"] is True
+    # The untouched projected_enabled stayed put.
+    assert codex["projected_enabled"] is False
+
+
+def test_post_settings_codex_null_budget_400(ns):
+    """POST budget.codex.* when no Codex budget is configured → 400 (the
+    server fails closed; the frontend disables the toggle but the writer
+    must not invent a Codex budget)."""
+    _write_codex_budget_config(ns, codex=None)
+    _wire_dashboard_handlers(ns)
+    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    port = srv.server_address[1]
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"budget": {"codex": {"alerts_enabled": True}}},
+        )
+    finally:
+        srv.shutdown()
+
+    assert status == 400, body
+    assert "Codex budget" in body["error"]
+    # Nothing persisted — the null sentinel survives.
+    import _cctally_core
+    saved = json.loads(_cctally_core.CONFIG_PATH.read_text())
+    assert "codex" not in saved["budget"]
+
+
+def test_post_settings_codex_not_object_400(ns):
+    """A non-dict budget.codex inbound block → 400 (hand-edited-junk guard)."""
+    _write_codex_budget_config(
+        ns,
+        codex={
+            "amount_usd": 200,
+            "period": "calendar-month",
+            "alerts_enabled": False,
+            "alert_thresholds": [90, 100],
+            "projected_enabled": False,
+        },
+    )
+    _wire_dashboard_handlers(ns)
+    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    port = srv.server_address[1]
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"budget": {"codex": ["not", "a", "dict"]}},
+        )
+    finally:
+        srv.shutdown()
+
+    assert status == 400, body
+    assert "must be an object" in body["error"]
+
+
+# ── 2B: reconcile dispatch keyed on the alerts_enabled sub-leaf ───────────
+
+
+def _count_codex_milestones(ns):
+    conn = ns["open_db"]()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM codex_budget_milestones"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_post_settings_codex_projected_toggle_does_not_latch(ns, monkeypatch):
+    """Toggling ONLY projected_enabled must NOT run the actual-spend reconcile
+    — keying the dispatch on the alerts_enabled sub-leaf (NOT "codex" in
+    touched) keeps projected live-pace and avoids silently latching a pending
+    actual-spend crossing (spec §4 critical note)."""
+    # Seed alerts already ON + a stubbed spend WAY over budget, so the
+    # actual-spend reconcile WOULD latch both thresholds if it ran. This makes
+    # the "no-latch" assertion non-vacuous.
+    _write_codex_budget_config(
+        ns,
+        codex={
+            "amount_usd": 200,
+            "period": "calendar-month",
+            "alerts_enabled": True,
+            "alert_thresholds": [90, 100],
+            "projected_enabled": False,
+        },
+    )
+    monkeypatch.setitem(
+        ns, "_sum_codex_cost_for_range",
+        lambda start, now, **kw: 500.0,  # 250% — crosses 90 + 100
+    )
+    _wire_dashboard_handlers(ns)
+    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    port = srv.server_address[1]
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"budget": {"codex": {"projected_enabled": True}}},
+        )
+    finally:
+        srv.shutdown()
+
+    assert status == 200, body
+    # Projected toggle alone reconciles NOTHING — no actual-spend rows latched.
+    assert _count_codex_milestones(ns) == 0
+
+
+def test_post_settings_codex_alerts_toggle_does_latch(ns, monkeypatch):
+    """Companion non-vacuity: flipping alerts_enabled ON DOES run the
+    actual-spend reconcile (latching already-crossed thresholds silently) —
+    proving the stub + seed actually produce crossings, so the projected-only
+    no-latch test above is meaningful."""
+    _write_codex_budget_config(
+        ns,
+        codex={
+            "amount_usd": 200,
+            "period": "calendar-month",
+            "alerts_enabled": False,
+            "alert_thresholds": [90, 100],
+            "projected_enabled": False,
+        },
+    )
+    monkeypatch.setitem(
+        ns, "_sum_codex_cost_for_range",
+        lambda start, now, **kw: 500.0,  # 250% — crosses 90 + 100
+    )
+    _wire_dashboard_handlers(ns)
+    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    port = srv.server_address[1]
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"budget": {"codex": {"alerts_enabled": True}}},
+        )
+    finally:
+        srv.shutdown()
+
+    assert status == 200, body
+    # Both thresholds latched (alerted_at set, no dispatch) — forward-only.
+    assert _count_codex_milestones(ns) == 2
+
+
+# ── 2C: SSE alerts_settings exposes the three Codex fields ────────────────
+
+
+def test_alerts_settings_exposes_codex_fields_when_configured(ns):
+    _write_codex_budget_config(
+        ns,
+        codex={
+            "amount_usd": 200,
+            "period": "calendar-month",
+            "alerts_enabled": True,
+            "alert_thresholds": [90, 100],
+            "projected_enabled": True,
+        },
+    )
+    now = dt.datetime(2026, 5, 26, 18, 0, 0, tzinfo=dt.timezone.utc)
+    env = ns["snapshot_to_envelope"](_empty_snap(ns, now), now_utc=now)
+    settings = env["alerts_settings"]
+    assert settings["codex_budget_configured"] is True
+    assert settings["codex_budget_alerts_enabled"] is True
+    assert settings["codex_projected_enabled"] is True
+
+
+def test_alerts_settings_codex_fields_default_off_when_absent(ns):
+    _write_budget_config(ns, projects={}, project_alerts_enabled=False)
+    now = dt.datetime(2026, 5, 26, 18, 0, 0, tzinfo=dt.timezone.utc)
+    env = ns["snapshot_to_envelope"](_empty_snap(ns, now), now_utc=now)
+    settings = env["alerts_settings"]
+    assert settings["codex_budget_configured"] is False
+    assert settings["codex_budget_alerts_enabled"] is False
+    assert settings["codex_projected_enabled"] is False
+
+
+# ── 2D: the broken codex_budget test-alert (R4) + projected metric (R2) ───
+
+
+def test_alerts_test_endpoint_accepts_codex_budget(ns, monkeypatch):
+    """POST {"axis": "codex_budget"} to /api/alerts/test must return 2xx +
+    dispatch a synthetic payload (currently 400 — R4)."""
+    monkeypatch.setitem(
+        ns, "_dispatch_alert_notification",
+        lambda payload, *, mode="real", **kw: "queued",
+    )
+    _wire_dashboard_handlers(ns)
+    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    port = srv.server_address[1]
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/alerts/test",
+            {"axis": "codex_budget", "threshold": 100},
+        )
+    finally:
+        srv.shutdown()
+
+    assert status == 200, body
+    assert body["alert"]["axis"] == "codex_budget"
+    assert abs(body["alert"]["context"]["budget_usd"] - 200.0) < 1e-9
+    assert abs(body["alert"]["context"]["spent_usd"] - 200.0) < 1e-9
+    assert body["alert"]["context"]["period"] == "calendar-month"
+    assert body["dispatch"] == "queued"
+
+
+def test_alerts_test_endpoint_accepts_projected_codex_metric(ns, monkeypatch):
+    """POST {"axis": "projected", "metric": "codex_budget_usd"} must return
+    2xx (currently 400 — the metric was rejected; R2)."""
+    monkeypatch.setitem(
+        ns, "_dispatch_alert_notification",
+        lambda payload, *, mode="real", **kw: "queued",
+    )
+    _wire_dashboard_handlers(ns)
+    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    port = srv.server_address[1]
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/alerts/test",
+            {"axis": "projected", "metric": "codex_budget_usd",
+             "threshold": 100},
+        )
+    finally:
+        srv.shutdown()
+
+    assert status == 200, body
+    assert body["alert"]["axis"] == "projected"
+    assert body["alert"]["context"]["metric"] == "codex_budget_usd"
+    assert body["dispatch"] == "queued"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #137 Task 2 — envelope mappers read ``period`` FROM THE ROW (Symptom 1) and
+# carry the period segment in the React-key ``id``. The historical pre-011
+# NULL-period sentinel COALESCEs to the vendor-default noun.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _seed_budget_milestone(ns, *, week_start_at, period, threshold,
+                           budget_usd=300.0, spent_usd=290.0,
+                           consumption_pct=96.0, alerted=True):
+    conn = ns["open_db"]()
+    try:
+        ns["insert_budget_milestone"](
+            conn,
+            week_start_at=week_start_at,
+            period=period,
+            threshold=threshold,
+            budget_usd=budget_usd,
+            spent_usd=spent_usd,
+            consumption_pct=consumption_pct,
+            commit=False,
+        )
+        if alerted:
+            conn.execute(
+                "UPDATE budget_milestones SET alerted_at = ? "
+                "WHERE week_start_at = ? AND threshold = ?",
+                ("2026-06-01T15:00:00Z", week_start_at, threshold),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_codex_budget_milestone(ns, *, period_start_at, period, threshold,
+                                 budget_usd=200.0, spent_usd=195.0,
+                                 consumption_pct=97.5, alerted=True):
+    conn = ns["open_db"]()
+    try:
+        ns["insert_codex_budget_milestone"](
+            conn,
+            period_start_at=period_start_at,
+            period=period,
+            threshold=threshold,
+            budget_usd=budget_usd,
+            spent_usd=spent_usd,
+            consumption_pct=consumption_pct,
+            commit=False,
+        )
+        if alerted:
+            conn.execute(
+                "UPDATE codex_budget_milestones SET alerted_at = ? "
+                "WHERE period_start_at = ? AND threshold = ?",
+                ("2026-06-01T15:00:00Z", period_start_at, threshold),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_projected_milestone(ns, *, week_start_at, period, metric, threshold,
+                              projected_value=110.0, denominator=100.0,
+                              alerted=True):
+    conn = ns["open_db"]()
+    try:
+        ns["insert_projected_milestone"](
+            conn,
+            week_start_at=week_start_at,
+            period=period,
+            metric=metric,
+            threshold=threshold,
+            projected_value=projected_value,
+            denominator=denominator,
+            commit=False,
+        )
+        if alerted:
+            conn.execute(
+                "UPDATE projected_milestones SET alerted_at = ? "
+                "WHERE week_start_at = ? AND metric = ? AND threshold = ?",
+                ("2026-06-01T15:00:00Z", week_start_at, metric, threshold),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _envelope_items(ns, axis):
+    conn = ns["open_db"]()
+    try:
+        envelope = ns["_cctally_dashboard"]._build_alerts_envelope_array(conn)
+    finally:
+        conn.close()
+    return [a for a in envelope if a.get("axis") == axis]
+
+
+def _set_config(ns, block):
+    import _cctally_core
+    _cctally_core.CONFIG_PATH.write_text(json.dumps(block) + "\n")
+
+
+# ── budget: period from the ROW, not live config (Symptom 1) ──────────────
+
+
+def test_budget_envelope_period_from_row_not_live_config(ns):
+    """A subscription-week row keeps its noun after the user switches
+    budget.period to calendar-month — the period comes FROM THE ROW."""
+    _seed_budget_milestone(
+        ns, week_start_at="2026-06-01T00:00:00+00:00",
+        period="subscription-week", threshold=90,
+    )
+    # Live config now says calendar-month — must NOT leak onto the historical row.
+    _set_config(ns, {"budget": {
+        "weekly_usd": 300.0, "period": "calendar-month", "alerts_enabled": True,
+    }})
+    items = _envelope_items(ns, "budget")
+    assert len(items) == 1, items
+    assert items[0]["context"]["period"] == "subscription-week"
+    assert items[0]["id"] == (
+        "budget:2026-06-01T00:00:00+00:00:subscription-week:90"
+    )
+
+
+def test_budget_envelope_null_period_coalesces_to_default(ns):
+    """A pre-011 NULL-period row renders the vendor-default noun via COALESCE
+    and never lands a literal 'None' in the id."""
+    _seed_budget_milestone(
+        ns, week_start_at="2026-05-01T00:00:00+00:00",
+        period=None, threshold=100,
+    )
+    items = _envelope_items(ns, "budget")
+    assert len(items) == 1, items
+    assert items[0]["context"]["period"] == "subscription-week"
+    assert "None" not in items[0]["id"]
+    assert items[0]["id"] == (
+        "budget:2026-05-01T00:00:00+00:00:subscription-week:100"
+    )
+
+
+# ── codex_budget: vendor default calendar-month ───────────────────────────
+
+
+def test_codex_budget_envelope_period_from_row_not_live_config(ns):
+    """A calendar-week Codex row keeps its noun after the user switches
+    budget.codex.period to calendar-month."""
+    _seed_codex_budget_milestone(
+        ns, period_start_at="2026-06-01T00:00:00+00:00",
+        period="calendar-week", threshold=90,
+    )
+    _set_config(ns, {"budget": {
+        "weekly_usd": 300.0, "alerts_enabled": True,
+        "codex": {"amount_usd": 200.0, "period": "calendar-month",
+                  "alerts_enabled": True},
+    }})
+    items = _envelope_items(ns, "codex_budget")
+    assert len(items) == 1, items
+    assert items[0]["context"]["period"] == "calendar-week"
+    assert items[0]["id"] == (
+        "codex_budget:2026-06-01T00:00:00+00:00:calendar-week:90"
+    )
+
+
+def test_codex_budget_envelope_null_period_coalesces_to_default(ns):
+    """A pre-011 NULL-period Codex row renders the vendor-default
+    (calendar-month) noun and a non-None id."""
+    _seed_codex_budget_milestone(
+        ns, period_start_at="2026-05-01T00:00:00+00:00",
+        period=None, threshold=100,
+    )
+    items = _envelope_items(ns, "codex_budget")
+    assert len(items) == 1, items
+    assert items[0]["context"]["period"] == "calendar-month"
+    assert "None" not in items[0]["id"]
+    assert items[0]["id"] == (
+        "codex_budget:2026-05-01T00:00:00+00:00:calendar-month:100"
+    )
+
+
+# ── projected: id gains the period segment (context stays metric-driven) ──
+
+
+def test_projected_envelope_id_carries_period_segment(ns):
+    _seed_projected_milestone(
+        ns, week_start_at="2026-06-01T00:00:00+00:00",
+        period="subscription-week", metric="weekly_pct", threshold=100,
+    )
+    items = _envelope_items(ns, "projected")
+    assert len(items) == 1, items
+    assert items[0]["id"] == (
+        "projected:2026-06-01T00:00:00+00:00:subscription-week:weekly_pct:100"
+    )
+    # Context stays metric-driven — no live-config period noun.
+    assert "period" not in items[0]["context"]
+
+
+def test_projected_envelope_null_period_coalesces_in_id(ns):
+    _seed_projected_milestone(
+        ns, week_start_at="2026-05-01T00:00:00+00:00",
+        period=None, metric="budget_usd", threshold=90,
+    )
+    items = _envelope_items(ns, "projected")
+    assert len(items) == 1, items
+    assert "None" not in items[0]["id"]
+    assert items[0]["id"] == (
+        "projected:2026-05-01T00:00:00+00:00:subscription-week:budget_usd:90"
+    )

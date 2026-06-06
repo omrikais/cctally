@@ -331,13 +331,22 @@ def doctor_gather_state(
     # `dashboard_bind_stored = "loopback"` (the same fallback the
     # original try/except gave); the dedicated `config_json_valid`
     # check surfaces the corruption separately.
+    #
+    # `dashboard.expose_transcripts` (Plan 2, spec §5) is read off the same raw
+    # JSON via the same chokepoint (defaults False; hand-edited junk → False).
+    # `_check_safety_dashboard_bind` only consults it when the bind is LAN, so
+    # a loopback report is byte-identical whether or not it's set.
     dashboard_bind_stored = "loopback"
+    expose_transcripts = False
     try:
         if _cctally_core.CONFIG_PATH.exists():
             raw_cfg = json.loads(_cctally_core.CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(raw_cfg, dict):
                 dashboard_bind_stored = (
                     c._config_known_value(raw_cfg, "dashboard.bind") or "loopback"
+                )
+                expose_transcripts = bool(
+                    c._config_known_value(raw_cfg, "dashboard.expose_transcripts")
                 )
     except (json.JSONDecodeError, OSError):
         pass
@@ -427,6 +436,8 @@ def doctor_gather_state(
         codex_jsonl_present=codex_jsonl_present,
         dashboard_bind_stored=dashboard_bind_stored,
         runtime_bind=runtime_bind,
+        # Conversation viewer (Plan 2, spec §5): only consulted on a LAN bind.
+        expose_transcripts=expose_transcripts,
         config_json_error=config_json_error,
         update_state=update_state,
         update_state_error=update_state_error,

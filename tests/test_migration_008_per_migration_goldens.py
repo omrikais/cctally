@@ -206,6 +206,7 @@ def test_migration_handler_recomputes_auto_rows_preserves_others(
     conn = sqlite3.connect(work_stats)
     try:
         handler(conn)
+        db_module._stamp_applied(conn, "008_recompute_weekly_cost_snapshots_dedup_fix")  # dispatcher now owns the stamp (#140)
 
         rows = _snapshot_rows(conn)
         assert rows[0][1:] == ("auto", None, pytest.approx(0.025, abs=1e-9))
@@ -254,8 +255,10 @@ def test_migration_handler_idempotent_against_marker(
     conn = sqlite3.connect(work_stats)
     try:
         handler(conn)
+        db_module._stamp_applied(conn, "008_recompute_weekly_cost_snapshots_dedup_fix")  # dispatcher now owns the stamp (#140)
         # Pre-fix this raised sqlite3.IntegrityError; post-fix it returns clean.
         handler(conn)
+        db_module._stamp_applied(conn, "008_recompute_weekly_cost_snapshots_dedup_fix")
         # Marker still present exactly once.
         cnt = conn.execute(
             "SELECT COUNT(*) FROM schema_migrations "

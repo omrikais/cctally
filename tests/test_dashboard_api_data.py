@@ -9,6 +9,31 @@ import pytest
 from conftest import load_script
 
 
+@pytest.fixture(autouse=True)
+def _isolate_prod_dbs(monkeypatch, tmp_path):
+    """Issue #144: ``snapshot_to_envelope`` / the ``/api/data`` + ``/api/events``
+    handlers open ``cache.db`` + ``stats.db`` (for ``last_sync_at`` / freshness)
+    even when fed a hand-built snapshot. Without HOME isolation those resolve to
+    the developer's REAL ``~/.local/share/cctally`` (conftest sets
+    ``CCTALLY_DISABLE_DEV_AUTODETECT=1`` process-wide, so ``_init_paths_from_env``
+    falls to the prod layout under ``$HOME``). That leaks test reads onto the
+    real machine and — from a dev checkout whose prod DB lags the migration
+    registry — trips the #142 prod-migration guard.
+
+    Every test here calls ``load_script()`` IN-BODY, and ``load_script`` re-runs
+    ``_cctally_core._init_paths_from_env()`` against the current ``$HOME`` (the
+    conftest-blessed ``setenv("HOME", tmp) + load_script()`` ordering). So
+    setting ``HOME`` to a fresh tmp dir BEFORE the body runs is sufficient to
+    redirect every path constant to ``tmp`` — no per-test signature change. The
+    pwd-resolved guard (``_real_prod_data_dir``) still points at real prod, so a
+    tmp-dir open can never be mistaken for prod.
+    """
+    share = tmp_path / ".local" / "share" / "cctally"
+    share.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+
 def test_envelope_has_all_top_level_keys():
     ns = load_script()
     snap = ns["_empty_dashboard_snapshot"]()

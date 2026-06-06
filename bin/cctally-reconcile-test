@@ -3601,6 +3601,143 @@ else
     fail_count=$((fail_count + 1))
 fi
 
+# ── PROJECTED2 (calendar-month Claude) + PROJECTED3 (Codex) — #135 ──────────
+# The #135 generalization extends the projected-pace axis to ANY Claude period
+# (calendar-week / calendar-month) and to Codex. Both fired budget legs now
+# route through the SAME `_build_vendor_budget_inputs` + `compute_budget_status`
+# factory that `cmd_budget` renders from, so the fired projected value
+# reconciles to `budget --json`'s `week_avg_projection_usd` (top-level for the
+# Claude leg; `.codex.week_avg_projection_usd` for the Codex leg) within 1e-9.
+#
+# Tz contract (R3): the firing path resolves CONFIG tz (`Namespace(tz=None)`),
+# so these invariants bind to the DEFAULT/config-tz `budget --json` with the
+# SAME `now` (NO `--tz` on the invocation). The fixtures pin `display.tz=utc`,
+# so the config-tz period start is deterministic.
+#
+# Non-vacuity: the "fired value" side is the REAL detector factory path (NOT a
+# re-derivation) — `_build_vendor_budget_inputs(vendor=..., skip_sync=False)` →
+# `compute_budget_status(...).week_avg_projection_usd`, the exact value the
+# `maybe_record_projected_alert` budget/codex legs fire on — so the equality
+# binds the firing value to the displayed field by construction, not a
+# look-alike formula. An independent re-derivation from the JSON's OWN published
+# spend/window adds a coarse formula guard. (Distinct from the PROJECTED1
+# recent≠average high-end guard: these calendar fixtures are pace-stable, so the
+# separate skip_sync non-vacuity proof lives in the cold-cache pytest.)
+PROJECTED_CALENDAR_PY='
+import json, os, sys, importlib.util, argparse, datetime as dt
+from importlib.machinery import SourceFileLoader
+
+raw = json.loads(os.environ["RECONCILE_A"])
+sub = os.environ.get("RECONCILE_SUBKEY", "")
+b = raw[sub] if sub else raw
+emitted = b["week_avg_projection_usd"]
+target = b["amount_usd"] if sub else b["weekly_usd"]
+spent = b["spent_usd"]
+vendor = os.environ["RECONCILE_VENDOR"]
+
+# Re-derive from budget --json'\''s OWN published spend/window (independent of the
+# kernel): rate_avg = spent/elapsed_hours; week_avg = spent + rate_avg*remaining.
+ws_key = "period_start_at" if sub else "week_start_at"
+we_key = "period_end_at" if sub else "week_end_at"
+ws = dt.datetime.fromisoformat(b[ws_key].replace("Z", "+00:00"))
+we = dt.datetime.fromisoformat(b[we_key].replace("Z", "+00:00"))
+now = dt.datetime.fromisoformat(b["as_of"].replace("Z", "+00:00"))
+total_s = (we - ws).total_seconds()
+elapsed_s = max(0.0, min((now - ws).total_seconds(), total_s))
+remaining_h = max(0.0, (total_s - elapsed_s)) / 3600.0
+elapsed_h = elapsed_s / 3600.0
+rate_avg = (spent / elapsed_h) if elapsed_h > 0 else 0.0
+rederived = spent + rate_avg * remaining_h
+
+# Bind to the ACTUAL detector factory the projected leg fires on.
+bin_dir = os.environ["PROJECTED_BIN_DIR"]
+sys.path.insert(0, bin_dir)
+loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
+spec = importlib.util.spec_from_loader("cctally", loader)
+c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
+loader.exec_module(c)
+config = c.load_config()
+tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)   # CONFIG tz (R3)
+now_dt = c._command_as_of()
+inputs = c._build_vendor_budget_inputs(
+    vendor=vendor, period="calendar-month", target_usd=target,
+    alert_thresholds=(90, 100), now_utc=now_dt, config=config, tz=tz,
+    skip_sync=False,
+)
+assert inputs is not None, "calendar projected: _build_vendor_budget_inputs returned None"
+status = c.compute_budget_status(inputs)
+assert not status.low_confidence, "calendar projected: fixture is low-confidence (detector would not fire)"
+detector_value = status.week_avg_projection_usd
+
+# Equality (the reconcile contract): emitted == re-derivation == detector.
+assert abs(emitted - rederived) < 1e-9, (
+    f"{vendor} week_avg_projection_usd={emitted} != rederived {rederived}"
+)
+assert abs(emitted - detector_value) < 1e-9, (
+    f"{vendor} week_avg_projection_usd={emitted} != detector {detector_value} "
+    f"(the value maybe_record_projected_alert {vendor} leg fires on)"
+)
+'
+# PROJECTED2: calendar-month Claude budget --period month --json
+cm_home="$FIXTURES/budget/claude-calendar-month"
+if [ -f "$cm_home/input.env" ]; then
+    AS_OF=""
+    # shellcheck disable=SC1091
+    . "$cm_home/input.env"
+    cm_json=$(HOME="$cm_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" budget --period month --json 2>/dev/null); rc_cm=$?
+    if [ $rc_cm -ne 0 ]; then
+        echo "RECONCILE FAIL projected_calendar_claude_eq_displayed budget/claude-calendar-month: budget --period month --json rc=$rc_cm"
+        fail_count=$((fail_count + 1))
+    else
+        result=$(RECONCILE_A="$cm_json" RECONCILE_VENDOR="claude" RECONCILE_SUBKEY="" \
+            PROJECTED_BIN_DIR="$REPO_ROOT/bin" \
+            HOME="$cm_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+            CCTALLY_DISABLE_DEV_AUTODETECT=1 \
+            python3 -c "$PROJECTED_CALENDAR_PY" 2>&1); rc_py=$?
+        if [ $rc_py -ne 0 ]; then
+            echo "RECONCILE FAIL projected_calendar_claude_eq_displayed budget/claude-calendar-month: $result"
+            fail_count=$((fail_count + 1))
+        else
+            echo "PASS projected_calendar_claude_eq_displayed budget/claude-calendar-month"
+            pass_count=$((pass_count + 1))
+        fi
+    fi
+else
+    echo "RECONCILE FAIL projected_calendar_claude_eq_displayed budget/claude-calendar-month: fixture missing"
+    fail_count=$((fail_count + 1))
+fi
+
+# PROJECTED3: Codex budget --vendor codex --json (nested .codex)
+cx_home="$FIXTURES/budget/codex-only"
+if [ -f "$cx_home/input.env" ]; then
+    AS_OF=""
+    # shellcheck disable=SC1091
+    . "$cx_home/input.env"
+    cx_json=$(HOME="$cx_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" budget --vendor codex --json 2>/dev/null); rc_cx=$?
+    if [ $rc_cx -ne 0 ]; then
+        echo "RECONCILE FAIL projected_codex_eq_displayed budget/codex-only: budget --vendor codex --json rc=$rc_cx"
+        fail_count=$((fail_count + 1))
+    else
+        result=$(RECONCILE_A="$cx_json" RECONCILE_VENDOR="codex" RECONCILE_SUBKEY="codex" \
+            PROJECTED_BIN_DIR="$REPO_ROOT/bin" \
+            HOME="$cx_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+            CCTALLY_DISABLE_DEV_AUTODETECT=1 \
+            python3 -c "$PROJECTED_CALENDAR_PY" 2>&1); rc_py=$?
+        if [ $rc_py -ne 0 ]; then
+            echo "RECONCILE FAIL projected_codex_eq_displayed budget/codex-only: $result"
+            fail_count=$((fail_count + 1))
+        else
+            echo "PASS projected_codex_eq_displayed budget/codex-only"
+            pass_count=$((pass_count + 1))
+        fi
+    fi
+else
+    echo "RECONCILE FAIL projected_codex_eq_displayed budget/codex-only: fixture missing"
+    fail_count=$((fail_count + 1))
+fi
+
 # ─── Invariant PROJBUDGET1: per-project budget spend + fired consumption_pct ──
 # (Task 3, spec §9.4) TWO independent paths reconcile within 1e-9 over the
 # seeded `per-project` window:
@@ -3713,6 +3850,252 @@ if [ -f "$pb_home/input.env" ]; then
     fi
 else
     echo "RECONCILE FAIL project_budget_spend_and_fired_pct budget/per-project: fixture missing"
+    fail_count=$((fail_count + 1))
+fi
+
+# ─── Invariant TRANSCRIPT1: /api/data.transcriptsEnabled == the gate ────
+# Conversation viewer (Plan 2, spec §5/§6.9). The dashboard injects a
+# per-request `transcriptsEnabled` into `/api/data` via
+# `_transcripts_visible_to_request`, whose body is exactly
+#
+#     transcripts_allowed(bind, expose)
+#         AND host_allowed_for_transcripts(Host, expose)
+#
+# over the two pure predicates in `bin/_lib_transcript_access.py`. The same
+# composition gates the three conversation GET routes (403 on false), so a
+# request that would 403 must show `transcriptsEnabled=false`, never
+# enabled-then-403. This invariant locks the injected value to the kernel
+# predicates DIRECTLY across the (bind, expose, Host) truth-table:
+#
+#   bind       expose  Host                  expected
+#   loopback   off     loopback              True
+#   loopback   off     LAN-hostname          False   (Host not loopback)
+#   LAN        off     *                     False   (bind gate closed)
+#   LAN        on      IP-literal            True    (can't be DNS-rebound)
+#   LAN        on      hostname              False   (rebinding vector)
+#
+# The dashboard glue (`_cctally_dashboard.py`) keeps a SINGLE definition of
+# this composition (`_transcripts_visible_to_request`) that both the GET-route
+# 403 gate and the `/api/data` client signal route through — so locking the
+# composition to the kernel predicates here pins both surfaces.
+transcripts_enabled_eq_gate_invariant () {
+    local name="transcripts_enabled_eq_gate"
+    local result rc_py
+    result=$(REPO_ROOT="$REPO_ROOT" python3 -c '
+import os
+import sys
+
+repo_root = os.environ["REPO_ROOT"]
+sys.path.insert(0, os.path.join(repo_root, "bin"))
+
+import _lib_transcript_access as ta
+
+
+def visible(bind, expose, host):
+    """Re-derivation of the endpoint composition (see
+    `_cctally_dashboard.DashboardHTTPHandler._transcripts_visible_to_request`):
+    the bind gate AND the per-request Host allowlist."""
+    return (ta.transcripts_allowed(bind, expose)
+            and ta.host_allowed_for_transcripts(host, expose))
+
+
+# (bind, expose, Host) -> expected transcriptsEnabled
+truth_table = [
+    ("127.0.0.1", False, "127.0.0.1:8789", True),
+    ("127.0.0.1", False, "dashboard.lan:8789", False),
+    ("0.0.0.0",   False, "192.168.0.9:8789", False),
+    ("0.0.0.0",   False, "127.0.0.1:8789",   False),
+    ("0.0.0.0",   True,  "192.168.0.9:8789", True),
+    ("0.0.0.0",   True,  "[fe80::1]:8789",   True),
+    ("0.0.0.0",   True,  "evil.attacker.com", False),
+    ("0.0.0.0",   True,  "machine.local:8789", False),
+]
+for bind, expose, host, expected in truth_table:
+    got = visible(bind, expose, host)
+    if bool(got) is not bool(expected):
+        sys.exit(
+            f"transcriptsEnabled mismatch for bind={bind!r} expose={expose} "
+            f"Host={host!r}: gate={got} expected={expected}"
+        )
+' 2>&1); rc_py=$?
+    if [ $rc_py -ne 0 ]; then
+        echo "RECONCILE FAIL $name: $result"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS $name (transcriptsEnabled == gate truth-table)"
+        pass_count=$((pass_count + 1))
+    fi
+}
+transcripts_enabled_eq_gate_invariant
+
+# ─── Invariant CODEXBUDGET1: Codex budget spend ≡ Σ codex-daily costUSD ──────
+# (calendar-period + Codex budgets, spec §7.2) TWO independent paths reconcile
+# within 1e-9 over the seeded `both-vendors` Codex calendar-month window:
+#   (A) `budget --json .codex.spent_usd` (computed via _sum_codex_cost_for_range
+#       over the cache DB) ≡ Σ `codex-daily --json .daily[].costUSD` for the
+#       days inside the resolved Codex period window [period_start_at, as_of).
+#   Two different commands, two different aggregation entry points, one
+#   underlying _calculate_codex_entry_cost truth — so a drift in either consumer
+#   is caught. Mirrors the codex_weekly_eq_sum_codex_daily structure.
+CODEXBUDGET1_PY='
+import json, os, datetime as dt
+b = json.loads(os.environ["RECONCILE_A"])   # budget --json
+d = json.loads(os.environ["RECONCILE_B"])   # codex-daily --json
+
+codex = b.get("codex")
+assert codex is not None, "CODEXBUDGET1 vacuous: budget --json carried no codex block"
+spent_budget = codex["spent_usd"]
+ps = dt.datetime.fromisoformat(codex["period_start_at"].replace("Z", "+00:00"))
+now = dt.datetime.fromisoformat(codex["as_of"].replace("Z", "+00:00"))
+ps_date = ps.date()
+now_date = now.date()
+
+def parse_date(s):
+    return dt.datetime.strptime(s, "%b %d, %Y").date()
+
+# Σ codex-daily costUSD for bucket-days inside [period_start, as_of]. The
+# fixture seeds all Codex entries on one day strictly inside the window, so the
+# whole-history codex-daily sum equals the budget spend; the date filter keeps
+# the invariant correct if the fixture ever spans the boundary.
+daily_sum = sum(
+    r["costUSD"] for r in d.get("daily", [])
+    if ps_date <= parse_date(r["date"]) <= now_date
+)
+assert daily_sum > 0, "CODEXBUDGET1 vacuous: codex-daily sum is 0 (no Codex spend seeded)"
+assert abs(spent_budget - daily_sum) < 1e-9, (
+    f"CODEXBUDGET1: budget.codex.spent_usd={spent_budget} != "
+    f"Σcodex_daily.costUSD={daily_sum}"
+)
+'
+reconcile_invariant "codex_budget_spend_eq_sum_codex_daily" \
+    "$FIXTURES/budget/both-vendors" \
+    "budget --json" \
+    "codex-daily --json" \
+    "$CODEXBUDGET1_PY"
+
+# ─── Invariant CODEXBUDGET2: codex_budget latching == displayed Codex spend ──
+# (calendar-period + Codex budgets, spec §6) Parallels PROJBUDGET1 (B) for the
+# Codex axis: DRIVE the REAL forward-only-from-set reconcile
+# (`_reconcile_codex_budget_milestones_on_set`) and assert the fired
+# `consumption_pct` row binds — by construction, not re-derivation — to the
+# displayed `budget --json .codex.spent_usd` over the same resolved period
+# window. We force a small Codex target so the seeded Codex spend ($15) crosses
+# the 90/100 thresholds (the seeded `both-vendors` Codex budget is at 7.5%, far
+# below any threshold), then assert:
+#   (A) each fired row's consumption_pct == displayed_spent / forced_target * 100
+#       within 1e-9 (binds the reconcile path's _sum_codex_cost_for_range to the
+#       displayed .codex.spent_usd);
+#   (B) every row carries alerted_at SET (forward-only-from-set: recorded WITHOUT
+#       dispatch — no instant popup on a mid-period set already over);
+#   (C) a SECOND reconcile run inserts NO new rows (fire-once / latching via
+#       UNIQUE(period_start_at, threshold) + the alerted_at IS NULL UPDATE guard).
+# Non-vacuity: assert at least one row fired (the forced target guarantees a
+# crossing) — a regression that stopped recording would trip (A)'s row-count or
+# the explicit `fired` guard.
+CODEXBUDGET2_PY='
+import json, os, sys, importlib.util
+from importlib.machinery import SourceFileLoader
+
+budget = json.loads(os.environ["RECONCILE_A"])   # budget --json
+codex = budget.get("codex")
+assert codex is not None, "CODEXBUDGET2 vacuous: budget --json carried no codex block"
+displayed_spent = float(codex["spent_usd"])
+assert displayed_spent > 0, "CODEXBUDGET2 vacuous: displayed Codex spend is 0"
+period = codex["period"]
+thresholds = list(codex.get("alert_thresholds") or [90, 100])
+
+bin_dir = os.environ["CODEXBUDGET_BIN_DIR"]
+sys.path.insert(0, bin_dir)
+loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
+spec = importlib.util.spec_from_loader("cctally", loader)
+c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
+loader.exec_module(c)
+
+import argparse
+config = c.load_config()
+tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)
+now_utc = c._command_as_of()
+
+# Force a small target so the seeded $15 Codex spend crosses 90 AND 100.
+forced_target = 15.0
+expected_pct = displayed_spent / forced_target * 100.0
+
+def run_reconcile():
+    conn = c.open_db()
+    try:
+        c._reconcile_codex_budget_milestones_on_set(
+            conn, target=forced_target, thresholds=thresholds,
+            now_utc=now_utc, period=period, config=config, tz=tz,
+        )
+    finally:
+        conn.close()
+
+run_reconcile()
+conn = c.open_db()
+rows = conn.execute(
+    "SELECT threshold, period, consumption_pct, alerted_at "
+    "FROM codex_budget_milestones ORDER BY threshold"
+).fetchall()
+n_after_first = len(rows)
+conn.close()
+
+assert rows, "CODEXBUDGET2 (non-vacuity): no codex_budget_milestones rows fired"
+# (A) fired consumption_pct binds to the displayed Codex spend / forced target.
+for r in rows:
+    fired_pct = float(r["consumption_pct"])
+    assert abs(fired_pct - expected_pct) < 1e-9, (
+        f"CODEXBUDGET2 (A): fired consumption_pct={fired_pct} != "
+        f"displayed_spent/target*100={expected_pct}"
+    )
+    # (B) forward-only-from-set: recorded WITH alerted_at, never dispatched.
+    assert r["alerted_at"] is not None, (
+        "CODEXBUDGET2 (B): threshold %s recorded without alerted_at" % r["threshold"]
+    )
+    # (D) period-row consistency (#137): the reconcile path stamps the
+    # CONFIGURED period into every fired row (never NULL, never a stale noun).
+    assert r["period"] == period, (
+        "CODEXBUDGET2 (D): threshold %s stored period=%r != configured %r"
+        % (r["threshold"], r["period"], period)
+    )
+
+# (C) fire-once / latching: a second reconcile inserts no new rows.
+run_reconcile()
+conn = c.open_db()
+n_after_second = conn.execute(
+    "SELECT COUNT(*) FROM codex_budget_milestones"
+).fetchone()[0]
+conn.close()
+assert n_after_second == n_after_first, (
+    f"CODEXBUDGET2 (C): re-run inserted rows ({n_after_first} -> {n_after_second}) "
+    f"— latching/fire-once broken"
+)
+'
+cb_home="$FIXTURES/budget/both-vendors"
+if [ -f "$cb_home/input.env" ]; then
+    AS_OF=""
+    # shellcheck disable=SC1091
+    . "$cb_home/input.env"
+    cb_budget=$(HOME="$cb_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$BIN" budget --json 2>/dev/null); rc_b=$?
+    if [ $rc_b -ne 0 ]; then
+        echo "RECONCILE FAIL codex_budget_latching_eq_displayed_spend budget/both-vendors: budget rc=$rc_b"
+        fail_count=$((fail_count + 1))
+    else
+        result=$(RECONCILE_A="$cb_budget" \
+            CODEXBUDGET_BIN_DIR="$REPO_ROOT/bin" \
+            HOME="$cb_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+            CCTALLY_DISABLE_DEV_AUTODETECT=1 \
+            python3 -c "$CODEXBUDGET2_PY" 2>&1); rc_py=$?
+        if [ $rc_py -ne 0 ]; then
+            echo "RECONCILE FAIL codex_budget_latching_eq_displayed_spend budget/both-vendors: $result"
+            fail_count=$((fail_count + 1))
+        else
+            echo "PASS codex_budget_latching_eq_displayed_spend budget/both-vendors"
+            pass_count=$((pass_count + 1))
+        fi
+    fi
+else
+    echo "RECONCILE FAIL codex_budget_latching_eq_displayed_spend budget/both-vendors: fixture missing"
     fail_count=$((fail_count + 1))
 fi
 

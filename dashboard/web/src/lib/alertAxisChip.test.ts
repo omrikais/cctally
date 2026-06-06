@@ -18,7 +18,13 @@ describe('AXIS_CHIP_LABEL / AXIS_TITLE_LABEL', () => {
     expect(AXIS_TITLE_LABEL[axis]).toBe('Project budget');
   });
 
-  it('covers all five axes with the expected chip + title labels', () => {
+  it('resolves the codex_budget axis to the CODEX chip', () => {
+    const axis: AlertAxis = 'codex_budget';
+    expect(AXIS_CHIP_LABEL[axis]).toBe('CODEX');
+    expect(AXIS_TITLE_LABEL[axis]).toBe('Codex budget');
+  });
+
+  it('covers all six axes with the expected chip + title labels', () => {
     // Byte-identical with bin/_lib_alert_axes.py AXIS_REGISTRY
     // (chip_label / title_label). The Python-side parity test asserts the
     // cross-language match; this freezes the TS values.
@@ -28,6 +34,7 @@ describe('AXIS_CHIP_LABEL / AXIS_TITLE_LABEL', () => {
       budget: 'BUDGET',
       projected: 'PROJECTED',
       project_budget: 'PROJECT',
+      codex_budget: 'CODEX',
     });
     expect(AXIS_TITLE_LABEL).toEqual({
       weekly: 'Weekly',
@@ -35,6 +42,7 @@ describe('AXIS_CHIP_LABEL / AXIS_TITLE_LABEL', () => {
       budget: 'Budget',
       projected: 'Projected',
       project_budget: 'Project budget',
+      codex_budget: 'Codex budget',
     });
   });
 });

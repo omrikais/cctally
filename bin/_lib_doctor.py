@@ -140,6 +140,14 @@ class DoctorState:
     # token_total); the kernel only reads `.kind`/`.model`/`.entry_count`/
     # `.token_total`, so any duck-typed equivalent works for tests.
     pricing_coverage: Optional[list] = None
+    # Conversation viewer (Plan 2, spec §5): the resolved
+    # `dashboard.expose_transcripts` opt-in. Only consequential when the bind
+    # is LAN — `_check_safety_dashboard_bind` then surfaces an extra
+    # "transcripts exposed on LAN" detail on top of the existing LAN-bind
+    # WARN. Defaulted False (placed last after the other defaulted fields) so
+    # existing constructors stay valid and a loopback bind is byte-identical
+    # whether or not expose is set.
+    expose_transcripts: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -556,6 +564,45 @@ def _check_db_migrations_pending(s: DoctorState) -> CheckResult:
     )
 
 
+def _check_db_version_ahead(s: DoctorState) -> CheckResult:
+    """FAIL/WARN when a DB's user_version exceeds the running binary's
+    registry head (issue #145). stats.db ahead bricks commands (FAIL);
+    cache.db ahead auto-heals on the next open (WARN). doctor reads raw
+    user_version (no dispatcher), so it can report without healing/bricking.
+    """
+    def _eval(status):
+        if not status:
+            return None
+        uv = status.get("user_version", 0) or 0
+        rs = status.get("registry_size", 0) or 0
+        return {"user_version": uv, "registry_size": rs, "ahead": uv > rs}
+
+    stats = _eval(s.stats_db_status)
+    cache = _eval(s.cache_db_status)
+    details = {"stats.db": stats, "cache.db": cache}
+    stats_ahead = bool(stats and stats["ahead"])
+    cache_ahead = bool(cache and cache["ahead"])
+
+    if stats_ahead:
+        return CheckResult(
+            id="db.version_ahead", title="Version ahead", severity="fail",
+            summary=f"stats.db ahead (v{stats['user_version']} > known v{stats['registry_size']})",
+            remediation="Run `cctally db recover --db stats --yes` (or restore from backup)",
+            details=details,
+        )
+    if cache_ahead:
+        return CheckResult(
+            id="db.version_ahead", title="Version ahead", severity="warn",
+            summary=f"cache.db ahead (v{cache['user_version']} > known v{cache['registry_size']}) — auto-heals",
+            remediation="Auto-heals on next command, or run `cctally db recover --db cache`",
+            details=details,
+        )
+    return CheckResult(
+        id="db.version_ahead", title="Version ahead", severity="ok",
+        summary="none ahead", remediation=None, details=details,
+    )
+
+
 def _check_data_latest_snapshot_age(s: DoctorState) -> CheckResult:
     if s.latest_snapshot_at is None:
         return CheckResult(
@@ -859,13 +906,24 @@ def _check_safety_dashboard_bind(s: DoctorState) -> CheckResult:
     rem += "."
     note = ("A separate running dashboard process may have overridden via --host; "
             "the CLI sees config only.") if s.runtime_bind is None else None
+    # Conversation viewer (Plan 2, spec §5): a LAN bind WITH the
+    # `dashboard.expose_transcripts` opt-in serves raw conversation prose to
+    # the LAN. Surface that ONLY here (the bind already WARNs and is
+    # non-loopback by construction), additively — a loopback bind never
+    # reaches this branch, so the loopback report stays byte-identical
+    # regardless of the expose flag.
+    extra = {}
+    if s.expose_transcripts:
+        notes.append("transcripts exposed on LAN")
+        extra["transcripts_exposed_on_lan"] = True
     return CheckResult(
         id="safety.dashboard_bind", title="Dashboard bind",
         severity="warn", summary="; ".join(notes),
         remediation=rem,
         details={"config": s.dashboard_bind_stored,
                  "runtime_bind": s.runtime_bind,
-                 **({"note": note} if note else {})},
+                 **({"note": note} if note else {}),
+                 **extra},
     )
 
 
@@ -1052,6 +1110,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
     ("db", "Database", (
         ("db.stats.file", "_check_db_stats_file"),
         ("db.cache.file", "_check_db_cache_file"),
+        ("db.version_ahead", "_check_db_version_ahead"),
         ("db.migrations.applied", "_check_db_migrations_applied"),
         ("db.migrations.pending", "_check_db_migrations_pending"),
     )),

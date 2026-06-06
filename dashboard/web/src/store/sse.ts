@@ -126,6 +126,12 @@ const FALLBACK_ALERTS_SETTINGS = {
   // Per-project budget axis (issue #19/#121) — a stale Python without the
   // per-project leg won't carry this; default to "disabled".
   project_alerts_enabled: false,
+  // Codex budget toggles (#134) — a stale Python without the Codex leg
+  // won't carry these; default to "no Codex budget / disabled" so a
+  // disconnected/initial UI never sees `undefined` toggle state (R7).
+  codex_budget_configured: false,
+  codex_budget_alerts_enabled: false,
+  codex_projected_enabled: false,
 };
 
 function ingestAlerts(snap: Envelope): void {

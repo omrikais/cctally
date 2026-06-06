@@ -28,6 +28,7 @@ type NotifierKind = NonNullable<AlertsSettingsEnvelope['notifier']>;
 const PROJECTED_METRIC_LABEL: Record<ProjectedMetric, string> = {
   weekly_pct: 'Weekly %',
   budget_usd: 'Budget $',
+  codex_budget_usd: 'Codex $',
 };
 
 // IANA-zone validator. `Intl.DateTimeFormat` throws RangeError on
@@ -119,6 +120,17 @@ export function SettingsOverlay() {
   const [projectAlerts, setProjectAlerts] = useState<boolean>(
     alertsConfig.project_alerts_enabled ?? false,
   );
+  // Codex budget toggles (#134): two dashboard-writable sub-leaves of the
+  // nested `budget.codex` block. `codexBudgetAlerts` → `budget.codex.alerts_enabled`;
+  // `codexProjected` → `budget.codex.projected_enabled`. Both disabled (and
+  // an empty-state hint shown) when no Codex budget exists
+  // (`codex_budget_configured`, Q2) — amounts stay CLI-only.
+  const [codexBudgetAlerts, setCodexBudgetAlerts] = useState<boolean>(
+    alertsConfig.codex_budget_alerts_enabled ?? false,
+  );
+  const [codexProjected, setCodexProjected] = useState<boolean>(
+    alertsConfig.codex_projected_enabled ?? false,
+  );
   // Notifier dispatch backend (Phase B). Seeds from the SSE-mirrored
   // `alerts_settings.notifier` (default 'auto' when the envelope predates
   // the field). `command_configured` is a server-side boolean — the raw
@@ -153,12 +165,16 @@ export function SettingsOverlay() {
     setProjectedWeekly(alertsConfig.projected_weekly_enabled ?? false);
     setProjectedBudget(alertsConfig.projected_budget_enabled ?? false);
     setProjectAlerts(alertsConfig.project_alerts_enabled ?? false);
+    setCodexBudgetAlerts(alertsConfig.codex_budget_alerts_enabled ?? false);
+    setCodexProjected(alertsConfig.codex_projected_enabled ?? false);
     setNotifier(alertsConfig.notifier ?? 'auto');
   }, [
     alertsConfig.enabled,
     alertsConfig.projected_weekly_enabled,
     alertsConfig.projected_budget_enabled,
     alertsConfig.project_alerts_enabled,
+    alertsConfig.codex_budget_alerts_enabled,
+    alertsConfig.codex_projected_enabled,
     alertsConfig.notifier,
   ]);
 
@@ -199,6 +215,8 @@ export function SettingsOverlay() {
       setProjectedWeekly(alertsConfig.projected_weekly_enabled ?? false);
       setProjectedBudget(alertsConfig.projected_budget_enabled ?? false);
       setProjectAlerts(alertsConfig.project_alerts_enabled ?? false);
+      setCodexBudgetAlerts(alertsConfig.codex_budget_alerts_enabled ?? false);
+      setCodexProjected(alertsConfig.codex_projected_enabled ?? false);
       setNotifier(alertsConfig.notifier ?? 'auto');
       setTestError(null);
       setTestAxis('weekly');
@@ -212,6 +230,8 @@ export function SettingsOverlay() {
     alertsConfig.projected_weekly_enabled,
     alertsConfig.projected_budget_enabled,
     alertsConfig.project_alerts_enabled,
+    alertsConfig.codex_budget_alerts_enabled,
+    alertsConfig.codex_projected_enabled,
     alertsConfig.notifier,
   ]);
 
@@ -235,6 +255,12 @@ export function SettingsOverlay() {
   // toggle.
   const projectAlertsDirty =
     projectAlerts !== (alertsConfig.project_alerts_enabled ?? false);
+  // Codex budget toggles (#134) dirty independently — both travel nested under
+  // `budget.codex` (partial-merge; only the dirty sub-leaf is sent).
+  const codexBudgetAlertsDirty =
+    codexBudgetAlerts !== (alertsConfig.codex_budget_alerts_enabled ?? false);
+  const codexProjectedDirty =
+    codexProjected !== (alertsConfig.codex_projected_enabled ?? false);
   // Notifier (Phase B): dirty against the mirrored value (default 'auto').
   // `commandConfigured` gates the "Custom command" option — when the server
   // has no `command_template`, picking 'command' would dispatch nothing, so
@@ -284,6 +310,21 @@ export function SettingsOverlay() {
         budgetBlock.project_alerts_enabled = projectAlerts;
       }
       body.budget = budgetBlock;
+    }
+    // Codex budget toggles (#134): the two dashboard-writable sub-leaves nest
+    // under `budget.codex` so the server's nested partial-merge writer updates
+    // them WITHOUT clobbering the sibling amount_usd/period/alert_thresholds.
+    // Send only the dirty sub-leaf(s); attach under the SAME `budget` block as
+    // any flat Claude leaves above (so a one-shot Save carries both). No POST
+    // when neither Codex toggle is dirty.
+    if (codexBudgetAlertsDirty || codexProjectedDirty) {
+      const codexBlock: Record<string, unknown> = {};
+      if (codexBudgetAlertsDirty) codexBlock.alerts_enabled = codexBudgetAlerts;
+      if (codexProjectedDirty) codexBlock.projected_enabled = codexProjected;
+      body.budget = {
+        ...((body.budget as Record<string, unknown> | undefined) ?? {}),
+        codex: codexBlock,
+      };
     }
     if (Object.keys(body).length > 0) {
       setTzSubmitting(true);
@@ -511,6 +552,43 @@ export function SettingsOverlay() {
               />{' '}
               Per-project budget alerts
             </label>
+            {/*
+              Codex budget toggles (#134). Two dashboard-writable sub-leaves of
+              the nested `budget.codex` block: `alerts_enabled` (actual-spend)
+              and `projected_enabled` (projected-pace). Both DISABLED, and an
+              empty-state hint shown, when no Codex budget exists
+              (`codex_budget_configured`, Q2) — amounts stay CLI-only, and the
+              disable structurally prevents the server's null-codex 400. The
+              two toggles are independent in the UI; server-side, Codex
+              projected requires alerts_enabled to fire (mirrors Claude), noted
+              in budget.md rather than enforced as a cross-toggle dependency.
+            */}
+            <label>
+              <input
+                type="checkbox"
+                name="codex-budget-alerts-enabled"
+                checked={codexBudgetAlerts}
+                disabled={!alertsConfig.codex_budget_configured}
+                onChange={(e) => setCodexBudgetAlerts(e.target.checked)}
+              />{' '}
+              Codex budget alerts
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                name="codex-projected-enabled"
+                checked={codexProjected}
+                disabled={!alertsConfig.codex_budget_configured}
+                onChange={(e) => setCodexProjected(e.target.checked)}
+              />{' '}
+              Codex projected-pace alerts
+            </label>
+            {!alertsConfig.codex_budget_configured && (
+              <p className="settings-hint">
+                Set a Codex budget via the CLI first:{' '}
+                <code>cctally budget set 200 --vendor codex</code>
+              </p>
+            )}
             <div className="alerts-test-row">
               <label>
                 Axis{' '}

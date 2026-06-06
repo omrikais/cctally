@@ -1,0 +1,11 @@
+No weekly budget set. Set one with: cctally budget set <amount>.
+
+Codex budget: $200.00   (calendar month 2026-06)   — actual API $
+
+  Spent so far    $10.00    5.0% of budget
+  Remaining       $190.00
+  Pace            $1.05/day  ·  9.5 d elapsed
+  Daily budget    $9.27/day for the 20.5 d left to stay under
+  Projected EOW   $10–$32   →   ✓ OK
+
+  Alerts: on · thresholds 90% · 100% · (none crossed yet)

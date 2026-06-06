@@ -15,6 +15,7 @@ cctally config unset <key>
 | Key | Values | Default |
 |-----|--------|---------|
 | `dashboard.bind` | `loopback` (= `127.0.0.1`, default), `lan` (= `0.0.0.0`), or any literal host string (IPv4, IPv6, hostname). Resolution order: `--host` flag > config > default. Applies only at server startup. | `loopback` |
+| `dashboard.expose_transcripts` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). The LAN opt-in for the conversation-viewer transcript endpoints. When `false` (default) those routes are served **only** over loopback; set `true` to also serve them on a LAN bind. Even then an anti-DNS-rebinding `Host` allowlist applies — see [`dashboard.md`](dashboard.md#conversation-viewer-endpoints-plan-2). | `false` |
 | `display.tz` | `local`, `utc`, or any IANA name (e.g. `America/New_York`) | `local` |
 | `alerts.notifier` | `auto`, `osascript`, `notify-send`, `command`, `none` — the OS-popup backend for threshold alerts. See [Alerts dispatch keys](#alerts-dispatch-keys). | `auto` |
 | `alerts.command_template` | JSON: a non-empty list of argv strings (e.g. `["notify-send","{title}","{body}"]`) or `null` to clear. See [Alerts dispatch keys](#alerts-dispatch-keys). | `null` |
@@ -183,10 +184,10 @@ For the parse-time tz rules on `--since`/`--until` and friends, see the per-subc
 - `cctally config: invalid IANA zone '<X>'` (exit 2) — the value is
   neither `local` nor `utc` nor a recognized IANA name.
 - `cctally config: unknown config key '<X>'` (exit 2) — the key is not
-  in the allowlist (`display.tz`, `dashboard.bind`, the `alerts.*` keys
-  including `alerts.notifier` / `alerts.command_template`, the
-  `statusline.*` keys, the `budget.*` keys, and the `update.check.*`
-  keys).
+  in the allowlist (`display.tz`, `dashboard.bind`,
+  `dashboard.expose_transcripts`, the `alerts.*` keys including
+  `alerts.notifier` / `alerts.command_template`, the `statusline.*` keys,
+  the `budget.*` keys, and the `update.check.*` keys).
 - `cctally: alerts config error: <detail>` (exit 2) — an
   `alerts.notifier` / `alerts.command_template` value failed validation
   (bad enum, malformed template, or `notifier='command'` with no

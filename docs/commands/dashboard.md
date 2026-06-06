@@ -182,11 +182,63 @@ Before merging or releasing v2 changes, run through:
 | `GET /api/data` | One-shot JSON snapshot (curl-friendly) |
 | `GET /api/events` | SSE stream — full snapshot on every sync tick |
 | `GET /api/session/:id` | Per-session detail (v2) — powers the Sessions modal |
+| `GET /api/conversations` | Conversation-viewer browse rail — all-history per-session rows with per-session cost. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). |
+| `GET /api/conversation/<id>` | Conversation-viewer reader — one session's deduped, turn-grouped messages with cost-once. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). |
+| `GET /api/conversation/search` | Conversation-viewer cross-session FTS search (`?q=…`; LIKE fallback when FTS5 is unavailable). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). |
 | `POST /api/sync` | OAuth refresh + snapshot rebuild (chip / `r`). 204 on clean success; 200 + `{warnings:[{code: ...}]}` when refresh-usage returned a non-`ok` status (`rate_limited`, `no_oauth_token`, `fetch_failed`, `parse_failed`, `record_failed`); 503 if another sync is in flight. Origin-vs-Host parity CSRF (see [Threat model](#threat-model)). |
+
+> `/api/conversation/search` is matched **before** the `/api/conversation/<id>`
+> reader, so `search` is never treated as a session id. `/api/data` carries a
+> per-request `transcriptsEnabled` boolean (the same gate value) so the client
+> only offers the conversation UI when the routes would actually serve.
 
 Sort-pill click (top-right of Sessions panel) cycles the session sort;
 the choice persists in `localStorage`. The Settings overlay (`s`) stores
 the default sort + remembered filter term in the same `localStorage` slot.
+
+## Conversation viewer endpoints (Plan 2)
+
+The three `/api/conversation*` routes serve **raw transcript prose** read from
+the local `cache.db`. Because that prose is far more sensitive than the
+aggregate usage numbers the rest of `/api/*` exposes, those routes sit behind a
+fail-closed privacy gate that is independent of the general LAN bind.
+
+**Loopback-default gate.** By default the conversation routes are served **only
+over loopback** — even when the dashboard itself is LAN-bound (`--host 0.0.0.0`
+/ `dashboard.bind lan`). A request whose `Host` header is not a loopback
+address gets `403`. To serve transcripts on the LAN you must additionally opt
+in:
+
+    cctally config set dashboard.expose_transcripts true
+
+(boolean key — see [`config.md`](config.md#allowed-keys); default `false`).
+
+**Host anti-DNS-rebinding allowlist.** The gate composes two checks: the bind
+must permit transcripts at all (loopback always; LAN only under the opt-in),
+**and** the request's `Host` header must pass an anti-DNS-rebinding allowlist:
+
+| Bind | `expose_transcripts` | Request `Host` | Result |
+|---|---|---|---|
+| loopback | (any) | loopback (`127.0.0.1` / `[::1]` / `localhost`) | served |
+| loopback | (any) | a hostname / LAN IP | `403` |
+| LAN | `false` (default) | anything | `403` |
+| LAN | `true` | an **IP literal** (`192.168.0.9`, `[fe80::1]`) | served |
+| LAN | `true` | a **hostname** (`box.local`, `evil.example.com`) | `403` |
+
+Under the opt-in only an **IP-literal** `Host` is accepted: a LAN device
+reaches the dashboard at its IP literal (which can't be DNS-rebound), while a
+rebinding *domain* (any hostname) is rejected. A missing/empty `Host` fails
+closed. `/api/data`'s `transcriptsEnabled` is computed with the **same**
+per-request predicate, so a request the conversation routes would `403` always
+reports `transcriptsEnabled=false` — the client never offers a button that
+would 403.
+
+**At-rest hardening.** Since `cache.db` now holds plaintext conversation prose,
+`open_cache_db` best-effort `chmod`s the data dir to `0700` and `cache.db` to
+`0600`; the `-wal` / `-shm` sidecars (materialized only on the first write) are
+hardened to `0600` at the end of the `sync_cache` write transaction. The chmod
+is best-effort: a failure (e.g. an exotic filesystem) logs and continues rather
+than aborting.
 
 ## Shutdown
 

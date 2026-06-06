@@ -177,6 +177,7 @@ def test_migration_handler_recomputes_cumulative_and_marginal(
     conn = sqlite3.connect(work_stats)
     try:
         handler(conn)
+        db_module._stamp_applied(conn, "010_recompute_percent_milestones_dedup_fix")  # dispatcher now owns the stamp (#140)
         rows = _milestone_rows(conn)
         # threshold=1: cumulative=0.025, marginal=cumulative.
         assert rows[0][0] == 1
@@ -222,7 +223,9 @@ def test_migration_handler_idempotent_against_marker(
     conn = sqlite3.connect(work_stats)
     try:
         handler(conn)
+        db_module._stamp_applied(conn, "010_recompute_percent_milestones_dedup_fix")  # dispatcher now owns the stamp (#140)
         handler(conn)
+        db_module._stamp_applied(conn, "010_recompute_percent_milestones_dedup_fix")
         cnt = conn.execute(
             "SELECT COUNT(*) FROM schema_migrations "
             "WHERE name = '010_recompute_percent_milestones_dedup_fix'"

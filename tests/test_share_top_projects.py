@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from conftest import load_script
+from conftest import load_script, redirect_paths
 
 
 def _now():
@@ -205,8 +205,14 @@ def test_current_week_builder_queries_week_to_date_range(monkeypatch):
     assert out["top_projects"] == [("/captured/project", 1.0)]
 
 
-def test_daily_builder_queries_seven_day_range(monkeypatch):
+def test_daily_builder_queries_seven_day_range(monkeypatch, tmp_path):
     ns = load_script()
+    # Pin DB/path constants to a tmp dir: the spy below covers
+    # `_share_top_projects_for_range`, but the daily builder ALSO reaches the
+    # DB through an un-spied per-day helper that opens the real prod cache.db
+    # (issue #144 leak, caught by the runtime tripwire). Redirection isolates
+    # that read to a fresh empty DB — mirrors the blocks test below.
+    redirect_paths(ns, monkeypatch, tmp_path)
     spy = _CallSpy()
     monkeypatch.setitem(ns, "_share_top_projects_for_range", spy)
 
@@ -290,8 +296,15 @@ def test_monthly_builder_year_boundary_carry(monkeypatch):
     assert rng_end.year == 2027 and rng_end.month == 1
 
 
-def test_blocks_builder_queries_recent_blocks_range(monkeypatch):
+def test_blocks_builder_queries_recent_blocks_range(monkeypatch, tmp_path):
     ns = load_script()
+    # Pin DB/path constants to a tmp dir: the spy below covers
+    # `_share_top_projects_for_range`, but the blocks builder ALSO calls the
+    # un-spied `_share_per_block_per_project`, which opens the real prod
+    # stats.db. On a dev checkout whose prod DB is behind the migration
+    # registry the #142 guard then refuses (issue #144 leak). Redirection
+    # isolates that read to a fresh empty DB.
+    redirect_paths(ns, monkeypatch, tmp_path)
     spy = _CallSpy()
     monkeypatch.setitem(ns, "_share_top_projects_for_range", spy)
 

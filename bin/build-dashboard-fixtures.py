@@ -237,22 +237,29 @@ def _seed_budget_milestone(
     budget_usd: float,
     spent_usd: float,
     crossed_at: dt.datetime,
+    period: str = "subscription-week",
     alerted: bool = True,
 ) -> None:
     """Seed one ``budget_milestones`` row (issue #19). ``week_start_at``
     is the effective (post-reset) ISO timestamp the resolver returns,
     matching the dispatch payload's ``budget:<week_start_at>:<threshold>``
-    id. ``alerted_at`` is set to ``crossed_at`` (set-then-dispatch) when
-    ``alerted`` so the dashboard envelope's budget leg
-    (``WHERE alerted_at IS NOT NULL``) picks it up; left NULL otherwise."""
+    id. ``period`` (#137) is the write-once period discriminator the envelope
+    now reads FROM THE ROW (default ``subscription-week`` — the legacy
+    scenarios this builder depicts); it is part of the
+    ``UNIQUE(week_start_at, period, threshold)`` key and the envelope id's
+    ``budget:<week_start_at>:<period>:<threshold>`` shape. ``alerted_at`` is set
+    to ``crossed_at`` (set-then-dispatch) when ``alerted`` so the dashboard
+    envelope's budget leg (``WHERE alerted_at IS NOT NULL``) picks it up; left
+    NULL otherwise."""
     consumption_pct = (spent_usd / budget_usd * 100.0) if budget_usd else 0.0
     stats_conn.execute(
         """INSERT INTO budget_milestones
-           (week_start_at, threshold, budget_usd, spent_usd,
+           (week_start_at, period, threshold, budget_usd, spent_usd,
             consumption_pct, crossed_at_utc, alerted_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             _iso(week_start),
+            str(period),
             int(threshold),
             float(budget_usd),
             float(spent_usd),
@@ -272,23 +279,31 @@ def _seed_projected_milestone(
     projected_value: float,
     denominator: float,
     crossed_at: dt.datetime,
+    period: str = "subscription-week",
     alerted: bool = True,
 ) -> None:
     """Seed one ``projected_milestones`` row (issue #121). ``week_start_at``
     is the effective (post-reset) ISO timestamp the resolver returns,
     matching the dispatch payload's
-    ``projected:<week_start_at>:<metric>:<threshold>`` id. ``alerted_at`` is
-    set to ``crossed_at`` (set-then-dispatch) when ``alerted`` so the dashboard
-    envelope's projected leg (``WHERE alerted_at IS NOT NULL``) picks it up;
-    left NULL otherwise. ``denominator`` is the at-crossing target the envelope
-    renders from the ROW (100.0 for weekly_pct, target_usd for budget_usd)."""
+    ``projected:<week_start_at>:<metric>:<threshold>`` id. ``period`` (#137) is
+    the write-once period discriminator now in the
+    ``UNIQUE(week_start_at, period, metric, threshold)`` key and the envelope
+    id's ``projected:<week_start_at>:<period>:<metric>:<threshold>`` shape
+    (default ``subscription-week`` — the legacy scenarios this builder depicts);
+    projected's ``context`` stays metric-driven, so ``period`` only segments the
+    id. ``alerted_at`` is set to ``crossed_at`` (set-then-dispatch) when
+    ``alerted`` so the dashboard envelope's projected leg
+    (``WHERE alerted_at IS NOT NULL``) picks it up; left NULL otherwise.
+    ``denominator`` is the at-crossing target the envelope renders from the ROW
+    (100.0 for weekly_pct, target_usd for budget_usd)."""
     stats_conn.execute(
         """INSERT INTO projected_milestones
-           (week_start_at, metric, threshold, projected_value, denominator,
-            crossed_at_utc, alerted_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           (week_start_at, period, metric, threshold, projected_value,
+            denominator, crossed_at_utc, alerted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             _iso(week_start),
+            str(period),
             str(metric),
             int(threshold),
             float(projected_value),

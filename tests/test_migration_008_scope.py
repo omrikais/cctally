@@ -314,6 +314,7 @@ def test_008_skips_rows_with_null_range_columns(tmp_path, monkeypatch):
     stats = sqlite3.connect(stats_path)
     try:
         db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+        db._stamp_applied(stats, "008_recompute_weekly_cost_snapshots_dedup_fix")  # dispatcher now owns the stamp (#140)
         row = stats.execute(
             "SELECT cost_usd FROM weekly_cost_snapshots"
         ).fetchone()
@@ -484,6 +485,7 @@ def test_008_gate_passes_with_zero_jsonl(tmp_path, monkeypatch):
     stats = sqlite3.connect(stats_path)
     try:
         db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+        db._stamp_applied(stats, "008_recompute_weekly_cost_snapshots_dedup_fix")  # dispatcher now owns the stamp (#140)
         marker = stats.execute(
             "SELECT name FROM schema_migrations "
             "WHERE name = '008_recompute_weekly_cost_snapshots_dedup_fix'"

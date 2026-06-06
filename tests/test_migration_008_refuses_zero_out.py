@@ -365,6 +365,7 @@ def test_008_safe_noop_when_no_snapshots_and_no_projects_dir(
         # ``[CLAUDE_PROJECTS_DIR]`` is itself empty, so `any(p.glob(...))`
         # returns False).
         db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+        db._stamp_applied(stats, "008_recompute_weekly_cost_snapshots_dedup_fix")  # dispatcher now owns the stamp (#140)
 
         # Marker stamped.
         marker = stats.execute(
@@ -423,6 +424,7 @@ def test_008_happy_path_preserved(tmp_path, monkeypatch):
     stats = sqlite3.connect(stats_path)
     try:
         db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+        db._stamp_applied(stats, "008_recompute_weekly_cost_snapshots_dedup_fix")  # dispatcher now owns the stamp (#140)
 
         # cost_usd recomputed: 1000 opus-4-7 output tokens at $25/Mtok
         # = $0.025.

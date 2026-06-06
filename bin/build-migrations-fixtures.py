@@ -14,6 +14,12 @@ bin/cctally-migrations-test:
 Per-migration goldens (lazy-adopted; one pair per migration that ships them):
   - per-migration/001_dedup_highest_wins/{pre,post}.sqlite — cache.db pre/post for
     the ccusage-parity dedup migration. Loaded by tests/test_migration_001_per_migration_goldens.py.
+  - per-migration/002_conversation_messages_backfill/{pre,post}.sqlite — cache.db
+    pre/post for the conversation-viewer backfill (Plan 1). pre = existing install
+    with empty conversation_messages; post = backfilled from a synthetic JSONL
+    history (pointed at via CLAUDE_CONFIG_DIR; source_path normalized to a stable
+    synthetic prefix so the committed golden is portable). Loaded by
+    tests/test_migration_002_per_migration_goldens.py.
   - per-migration/008_recompute_weekly_cost_snapshots_dedup_fix/{pre,pre-cache,post}.sqlite
     — paired stats+cache fixture for the ccusage-parity historical recompute.
     Loaded by tests/test_migration_008_per_migration_goldens.py.
@@ -592,6 +598,165 @@ def build_per_migration_001_dedup_highest_wins(scenario_dir: Path) -> None:
     _build_post(pre, post)
 
 
+def build_per_migration_011_budget_milestone_period_keys(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for stats migration
+    ``011_budget_milestone_period_keys`` (#137).
+
+    Emits two stats.db files:
+      * pre.sqlite  — OLD-shape ``budget_milestones`` / ``codex_budget_milestones``
+        / ``projected_milestones`` (no ``period`` column, narrow UNIQUE) +
+        one seeded crossing each + ``schema_migrations`` rows for every
+        production migration THROUGH 010 (so the fixture represents a
+        fully-migrated pre-011 stats.db). 011's marker is absent.
+      * post.sqlite — same DB after running the production 011 handler:
+        each table gains a nullable ``period`` (historical rows -> NULL), the
+        period-inclusive UNIQUE is in place, and the 011 marker is stamped.
+
+    Loaded by ``tests/test_migration_011_per_migration_goldens.py``.
+    Spec: docs/superpowers/specs/2026-06-05-budget-milestone-period-column-design.md.
+    """
+    # Note: post.sqlite's schema_migrations.applied_at_utc is a wall-clock
+    # now_utc_iso() stamped by the real migration handler, so a rebuild churns
+    # a few bytes there. The per-migration goldens test deliberately does NOT
+    # assert applied_at_utc — this is expected, not a phantom dirty fixture.
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(
+                """
+                CREATE TABLE schema_migrations (
+                    name           TEXT PRIMARY KEY,
+                    applied_at_utc TEXT NOT NULL
+                );
+                CREATE TABLE budget_milestones (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    week_start_at   TEXT    NOT NULL,
+                    threshold       INTEGER NOT NULL,
+                    budget_usd      REAL    NOT NULL,
+                    spent_usd       REAL    NOT NULL,
+                    consumption_pct REAL    NOT NULL,
+                    crossed_at_utc  TEXT    NOT NULL,
+                    alerted_at      TEXT,
+                    UNIQUE(week_start_at, threshold)
+                );
+                CREATE TABLE codex_budget_milestones (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    period_start_at TEXT    NOT NULL,
+                    threshold       INTEGER NOT NULL,
+                    budget_usd      REAL    NOT NULL,
+                    spent_usd       REAL    NOT NULL,
+                    consumption_pct REAL    NOT NULL,
+                    crossed_at_utc  TEXT    NOT NULL,
+                    alerted_at      TEXT,
+                    UNIQUE(period_start_at, threshold)
+                );
+                CREATE TABLE projected_milestones (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    week_start_at   TEXT    NOT NULL,
+                    metric          TEXT    NOT NULL,
+                    threshold       INTEGER NOT NULL,
+                    projected_value REAL    NOT NULL,
+                    denominator     REAL    NOT NULL,
+                    crossed_at_utc  TEXT    NOT NULL,
+                    alerted_at      TEXT,
+                    UNIQUE(week_start_at, metric, threshold)
+                );
+                """
+            )
+            # Seed schema_migrations with every production migration THROUGH
+            # 010 (011 absent), so the pre.sqlite is a fully-migrated pre-011
+            # stats.db. Imported from the real registry to avoid drift.
+            for name in _PRE_011_PRODUCTION_MIGRATION_NAMES():
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations "
+                    "(name, applied_at_utc) VALUES (?, ?)",
+                    (name, "2026-05-22T00:00:00Z"),
+                )
+            conn.execute(
+                "INSERT INTO budget_milestones (week_start_at, threshold, "
+                "budget_usd, spent_usd, consumption_pct, crossed_at_utc, "
+                "alerted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("2026-06-01T00:00:00+00:00", 90, 300.0, 271.0, 90.3,
+                 "2026-06-05T00:00:00Z", "2026-06-05T00:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO codex_budget_milestones (period_start_at, "
+                "threshold, budget_usd, spent_usd, consumption_pct, "
+                "crossed_at_utc, alerted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("2026-06-01T00:00:00+00:00", 100, 200.0, 210.0, 105.0,
+                 "2026-06-05T00:00:00Z", "2026-06-05T00:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO projected_milestones (week_start_at, metric, "
+                "threshold, projected_value, denominator, crossed_at_utc, "
+                "alerted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("2026-06-01T00:00:00+00:00", "codex_budget_usd", 90, 195.0,
+                 200.0, "2026-06-05T00:00:00Z", "2026-06-05T00:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        handler = None
+        for m in _load_cctally_db_module()._STATS_MIGRATIONS:
+            if m.name == "011_budget_milestone_period_keys":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit("011_budget_milestone_period_keys not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def _load_cctally_db_module():
+    """Import the real ``_cctally_db`` module so fixture builders exercise the
+    exact production migration handlers (no copy-paste drift)."""
+    import importlib.util as ilu
+
+    bin_dir = Path(__file__).resolve().parent
+    spec = ilu.spec_from_file_location("_cctally_db", bin_dir / "_cctally_db.py")
+    mod = ilu.module_from_spec(spec)
+    # Register in sys.modules BEFORE exec_module so the @dataclass decorator can
+    # resolve the module via cls.__module__ during _process_class.
+    sys.modules["_cctally_db"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _PRE_011_PRODUCTION_MIGRATION_NAMES():
+    """Names of every production stats migration through 010 (011 excluded) —
+    read from the real registry to stay drift-free."""
+    return [
+        m.name
+        for m in _load_cctally_db_module()._STATS_MIGRATIONS
+        if m.name != "011_budget_milestone_period_keys"
+        and not m.name.endswith("_test_failure_injection")
+    ]
+
+
 def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
     scenario_dir: Path,
 ) -> None:
@@ -850,6 +1015,203 @@ def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
     _build_post(pre_stats, pre_cache, post_stats)
 
 
+def build_per_migration_002_conversation_messages_backfill(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for cache migration
+    ``002_conversation_messages_backfill`` (Plan 1 Task 5).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — full production cache schema (via
+        ``_apply_cache_schema``, so it carries ``conversation_messages`` +
+        ``conversation_fts`` + triggers + indexes), 2 ``session_files`` rows at
+        EOF, 2 ``session_entries`` cost rows, the ``claude_ingest_walk_complete``
+        marker — but an EMPTY ``conversation_messages``. This is the
+        pre-feature shape of an existing install (cost already cached, no
+        message index yet). ``schema_migrations`` does NOT contain 002.
+      * ``post.sqlite`` — same DB after running the production 002 handler.
+        Issue #139 deferred the JSONL walk to ``sync_cache``, so the handler now
+        only sets the ``conversation_backfill_pending`` cache_meta flag and
+        stamps the ``002_conversation_messages_backfill`` marker:
+        ``conversation_messages`` stays EMPTY, the flag is set, the marker is
+        present. (The flag-consume / actual backfill is covered by
+        ``tests/test_conversation_ingest.py``, not this golden.)
+
+    Loaded by ``tests/test_migration_002_per_migration_goldens.py``.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    # Synthetic JSONL history. Two assistant turns + a human prompt across two
+    # files. Since issue #139 the 002 handler no longer walks JSONL, so these
+    # files only seed pre.sqlite's session_files ``size_bytes`` (their on-disk
+    # sizes) — the post.sqlite handler run does not read them.
+    import json as _json
+    a_line = _json.dumps({
+        "type": "assistant", "uuid": "a1", "sessionId": "s1",
+        "requestId": "r1", "timestamp": "2026-04-15T15:00:00Z",
+        "message": {"role": "assistant", "id": "m1",
+                    "model": "claude-opus-4-7",
+                    "content": [{"type": "text", "text": "answer one"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_creation_input_tokens": 0,
+                              "cache_read_input_tokens": 0}},
+    }) + "\n"
+    u_line = _json.dumps({
+        "type": "user", "uuid": "u2", "sessionId": "s1",
+        "timestamp": "2026-04-15T15:01:00Z",
+        "message": {"role": "user", "content": "next question"},
+    }) + "\n"
+    b_line = _json.dumps({
+        "type": "assistant", "uuid": "b1", "sessionId": "s2",
+        "requestId": "rb", "timestamp": "2026-04-15T15:02:00Z",
+        "message": {"role": "assistant", "id": "mb",
+                    "model": "claude-opus-4-7",
+                    "content": [{"type": "text", "text": "second session"}],
+                    "usage": {"input_tokens": 8, "output_tokens": 4,
+                              "cache_creation_input_tokens": 0,
+                              "cache_read_input_tokens": 0}},
+    }) + "\n"
+
+    # The synthetic Claude tree; only its file sizes feed pre.sqlite now (the
+    # handler no longer walks it — issue #139). Cleaned up after the build.
+    claude_dir = scenario_dir / "_fake_claude"
+    proj = claude_dir / "projects" / "-Users-u-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    file_a = proj / "sess-a.jsonl"
+    file_b = proj / "sess-b.jsonl"
+    file_a.write_text(a_line + u_line)
+    file_b.write_text(b_line)
+
+    # Stable synthetic source_path prefix written into the committed golden
+    # (the real build-time path embeds this checkout's absolute location, which
+    # is neither machine- nor rebuild-stable). The cost rows seeded in
+    # pre.sqlite and the message rows normalized in post.sqlite both use it.
+    _SYNTH_PROJ_PREFIX = "/fake/.claude/projects/-Users-u-proj/"
+
+    def _load_cctally():
+        """Load bin/cctally so sys.modules['cctally'] is populated (the
+        backfill's _get_claude_data_dirs delegates to it) and return the
+        cctally module + its _cctally_db sibling. bin/cctally has no .py
+        suffix, so an explicit SourceFileLoader is required."""
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _cctally, db = _load_cctally()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Production-parity cache schema (conversation_messages + FTS +
+            # indexes + session_* + cache_meta + codex tables).
+            db._apply_cache_schema(conn)
+            # The migration framework's schema_migrations table (normally
+            # created by the dispatcher). pre.sqlite must carry it (empty of
+            # 002) so the handler's marker stamp lands on a real table — same
+            # convention as the 001 golden.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            # Seed cost state at EOF — the pre-feature shape (cost ingested,
+            # message index empty). Paths use the stable synthetic prefix (NOT
+            # the absolute build path) so the committed golden is portable.
+            # (Since issue #139 the 002 handler doesn't walk JSONL at all, so
+            # these rows' paths never feed any walker.)
+            size_a = file_a.stat().st_size
+            size_b = file_b.stat().st_size
+            synth_a = _SYNTH_PROJ_PREFIX + "sess-a.jsonl"
+            synth_b = _SYNTH_PROJ_PREFIX + "sess-b.jsonl"
+            conn.executemany(
+                "INSERT INTO session_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, "
+                " last_ingested_at, session_id, project_path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (synth_a, size_a, 1_700_000_000_000_000_000, size_a,
+                     "2026-04-15T15:05:00Z", "s1", "-Users-u-proj"),
+                    (synth_b, size_b, 1_700_000_001_000_000_000, size_b,
+                     "2026-04-15T15:05:00Z", "s2", "-Users-u-proj"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO session_entries "
+                "(source_path, line_offset, timestamp_utc, model, msg_id, "
+                " req_id, input_tokens, output_tokens, cache_create_tokens, "
+                " cache_read_tokens, usage_extra_json, cost_usd_raw) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (synth_a, 0, "2026-04-15T15:00:00Z",
+                     "claude-opus-4-7", "m1", "r1", 10, 5, 0, 0, None, None),
+                    (synth_b, 0, "2026-04-15T15:02:00Z",
+                     "claude-opus-4-7", "mb", "rb", 8, 4, 0, 0, None, None),
+                ],
+            )
+            # Walk-complete marker present (a normal cached install).
+            conn.execute(
+                "INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+                (WALK_COMPLETE_MARKER, "2026-04-15T15:05:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _cctally, db = _load_cctally()
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "002_conversation_messages_backfill":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit("002_conversation_messages_backfill not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Issue #139: the handler no longer walks JSONL inline — it sets the
+            # ``conversation_backfill_pending`` cache_meta flag + self-stamps its
+            # marker, deferring the offset-0 walk to sync_cache. So post.sqlite
+            # carries an EMPTY conversation_messages + the flag + the marker
+            # (no CLAUDE_CONFIG_DIR / no JSONL needed by the handler anymore).
+            handler(conn)
+            # Pin the marker timestamp so the committed golden is
+            # rebuild-deterministic — the handler self-stamps with wall-clock
+            # now_utc_iso(), which would otherwise churn a few bytes per rebuild.
+            conn.execute(
+                "UPDATE schema_migrations SET applied_at_utc = ? WHERE name = ?",
+                ("2026-04-30T12:00:00Z",
+                 "002_conversation_messages_backfill"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+    # Clean up the synthetic Claude tree so the committed fixture dir holds only
+    # pre.sqlite / post.sqlite. (Since issue #139 the 002 handler no longer
+    # opens a flock sidecar, so there is no <post>.lock to remove.)
+    import shutil as _sh
+    _sh.rmtree(claude_dir, ignore_errors=True)
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -867,9 +1229,15 @@ def main() -> int:
     build_per_migration_001_dedup_highest_wins(
         FIXTURES_ROOT / "per-migration" / "001_dedup_highest_wins"
     )
+    build_per_migration_002_conversation_messages_backfill(
+        FIXTURES_ROOT / "per-migration" / "002_conversation_messages_backfill"
+    )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"
         / "008_recompute_weekly_cost_snapshots_dedup_fix"
+    )
+    build_per_migration_011_budget_milestone_period_keys(
+        FIXTURES_ROOT / "per-migration" / "011_budget_milestone_period_keys"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

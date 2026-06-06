@@ -37,7 +37,7 @@ def severity_for(threshold: int) -> str:
 class AlertAxisDescriptor:
     """Axis-agnostic metadata shared by the record path + dashboard envelope."""
 
-    id: str            # 'weekly' | 'five_hour' | 'budget' | 'projected' | 'project_budget'
+    id: str            # 'weekly' | 'five_hour' | 'budget' | 'projected' | 'project_budget' | 'codex_budget'
     chip_label: str    # SHOUT form, byte-identical with alertAxis.ts AXIS_CHIP_LABEL
     title_label: str   # sentence-case form, byte-identical with AXIS_TITLE_LABEL
     milestone_table: str  # SQLite table the dashboard envelope SELECTs from
@@ -52,6 +52,13 @@ AXIS_REGISTRY: "tuple[AlertAxisDescriptor, ...]" = (
     # chip vs the global "BUDGET" chip; its own forward-only table.
     AlertAxisDescriptor(
         "project_budget", "PROJECT", "Project budget", "project_budget_milestones"
+    ),
+    # Per-vendor Codex budget alerts (calendar-period; calendar-period-codex-budgets
+    # feature). Distinct "CODEX" chip vs the global "BUDGET" / per-project
+    # "PROJECT" chips; its own forward-only `codex_budget_milestones` table keyed
+    # on the resolved period-window start instant (period_start_at, threshold).
+    AlertAxisDescriptor(
+        "codex_budget", "CODEX", "Codex budget", "codex_budget_milestones"
     ),
 )
 

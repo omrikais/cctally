@@ -43,8 +43,9 @@ final_harnesses=(reconcile)
 # work in both the private repo (which has cctally-mirror-public-test)
 # and the public mirror (which doesn't, since the mirror-public tooling
 # is private-only). A glob picks up exactly what's present in each clone.
-# New harnesses (e.g. cctally-subgroup-test, issue #86) are auto-discovered
-# here once `chmod +x`'d — no edit to this list is needed.
+# New harnesses (e.g. cctally-subgroup-test, issue #86;
+# cctally-conversation-test, Plan 2 conversation endpoints) are
+# auto-discovered here once `chmod +x`'d — no edit to this list is needed.
 parallel_harnesses=()
 final_set=" ${final_harnesses[*]} "
 for path in "$REPO_ROOT"/bin/cctally-*-test; do
@@ -127,9 +128,18 @@ done
 # not installed — the suite still runs, just slower (~30s vs ~6s on
 # this machine).
 pytest_status="SKIPPED"
+pytest_failed_nodes=""
 if python3 -m pytest --version >/dev/null 2>&1; then
     pytest_log="$LOGDIR/pytest.log"
-    pytest_args=(tests/ -q)
+    # -rfE forces pytest's "short test summary info" section to emit the
+    # `FAILED path::test` / `ERROR path::test` node IDs on every run,
+    # independent of any future repo-level pytest `-r` config. Issue #141:
+    # a Phase-3 flake under `-n "$JOBS"` xdist parallelism is otherwise
+    # undiagnosable — the node ID lived only in the stderr dump below, which
+    # is interleaved with the 40+ harness streams and gets rm -rf'd on EXIT.
+    # We both keep the full stderr dump AND hoist the node IDs into the
+    # deterministic summary block (which survives `| tail`).
+    pytest_args=(tests/ -q -rfE)
     if python3 -c 'import xdist' >/dev/null 2>&1; then
         pytest_args+=(-n "$JOBS")
     fi
@@ -140,11 +150,25 @@ if python3 -m pytest --version >/dev/null 2>&1; then
         total_fail=$((total_fail + 1))
         echo "---- pytest FAIL details ----" >&2
         cat "$pytest_log" >&2
+        # Hoist the failing node IDs out of the (truncatable, interleaved)
+        # stderr dump so the deterministic summary block below names the
+        # exact test(s) that failed — the next flake is then filable.
+        pytest_failed_nodes=$(grep -E '^(FAILED|ERROR) ' "$pytest_log" || true)
     fi
 fi
 
 echo "----"
 for row in "${rows[@]}"; do echo "$row"; done
 printf '%5s   %s\n' "$pytest_status" "pytest"
+if [ "$pytest_status" = "FAIL" ]; then
+    # Name the failing test(s) right here in the always-printed summary so a
+    # flake is filable from the summary alone (issue #141).
+    if [ -n "$pytest_failed_nodes" ]; then
+        echo "pytest failing node ids:"
+        while IFS= read -r node; do echo "  $node"; done <<< "$pytest_failed_nodes"
+    else
+        echo "pytest failing node ids: (none parsed — likely a pytest INTERNALERROR or a truncated/missing log; see '---- pytest FAIL details ----' on stderr)"
+    fi
+fi
 echo "Total: passed=$total_pass   failed=$total_fail   pytest=$pytest_status   (jobs=$JOBS)"
 [ "$total_fail" -eq 0 ]

@@ -1,0 +1,15 @@
+{
+  "hits": [
+    {
+      "cost_usd": 0.0175,
+      "project_label": "proj",
+      "session_id": "s1",
+      "snippet": "the [token] limit window resets every five hours",
+      "ts": "2026-06-01T00:00:05Z",
+      "uuid": "a1b"
+    }
+  ],
+  "mode": "fts",
+  "query": "token",
+  "total": 1
+}

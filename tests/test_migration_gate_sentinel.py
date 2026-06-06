@@ -360,6 +360,7 @@ def test_selective_prune_recomputes_surviving_and_zeros_pruned(
     stats = sqlite3.connect(stats_path)
     try:
         db._008_recompute_weekly_cost_snapshots_dedup_fix(stats)
+        db._stamp_applied(stats, "008_recompute_weekly_cost_snapshots_dedup_fix")  # dispatcher now owns the stamp (#140)
 
         w1_cost = stats.execute(
             "SELECT cost_usd FROM weekly_cost_snapshots WHERE id=?", (w1_id,),

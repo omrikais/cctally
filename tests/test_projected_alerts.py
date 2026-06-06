@@ -163,15 +163,18 @@ def _rows(ns):
 def test_insert_projected_milestone_rowcount_contract(ns):
     conn = ns["open_db"]()
     try:
+        # A concrete period keys the UNIQUE (#137); NULL periods are distinct
+        # under SQLite UNIQUE semantics, so the fire-once contract is asserted
+        # with the same concrete period production always writes.
         n1 = ns["insert_projected_milestone"](
-            conn, week_start_at=WEEK_KEY, metric="weekly_pct",
-            threshold=100, projected_value=102.0, denominator=100.0,
-            commit=True,
+            conn, week_start_at=WEEK_KEY, period="subscription-week",
+            metric="weekly_pct", threshold=100, projected_value=102.0,
+            denominator=100.0, commit=True,
         )
         n2 = ns["insert_projected_milestone"](
-            conn, week_start_at=WEEK_KEY, metric="weekly_pct",
-            threshold=100, projected_value=105.0, denominator=100.0,
-            commit=True,
+            conn, week_start_at=WEEK_KEY, period="subscription-week",
+            metric="weekly_pct", threshold=100, projected_value=105.0,
+            denominator=100.0, commit=True,
         )
         assert n1 == 1   # genuinely new
         assert n2 == 0   # INSERT OR IGNORE no-op (fire-once)
@@ -183,25 +186,26 @@ def test_projected_levels_already_latched_predicate(ns):
     conn = ns["open_db"]()
     try:
         latched = ns["_projected_levels_already_latched"]
-        assert latched(conn, week_start_at=WEEK_KEY, metric="weekly_pct",
-                       levels=(90, 100)) is False
+        assert latched(conn, week_start_at=WEEK_KEY, period="subscription-week",
+                       metric="weekly_pct", levels=(90, 100)) is False
         ns["insert_projected_milestone"](
-            conn, week_start_at=WEEK_KEY, metric="weekly_pct",
-            threshold=90, projected_value=95.0, denominator=100.0, commit=True,
+            conn, week_start_at=WEEK_KEY, period="subscription-week",
+            metric="weekly_pct", threshold=90, projected_value=95.0,
+            denominator=100.0, commit=True,
         )
         # 90 present, 100 missing → not all latched.
-        assert latched(conn, week_start_at=WEEK_KEY, metric="weekly_pct",
-                       levels=(90, 100)) is False
+        assert latched(conn, week_start_at=WEEK_KEY, period="subscription-week",
+                       metric="weekly_pct", levels=(90, 100)) is False
         ns["insert_projected_milestone"](
-            conn, week_start_at=WEEK_KEY, metric="weekly_pct",
-            threshold=100, projected_value=105.0, denominator=100.0,
-            commit=True,
+            conn, week_start_at=WEEK_KEY, period="subscription-week",
+            metric="weekly_pct", threshold=100, projected_value=105.0,
+            denominator=100.0, commit=True,
         )
-        assert latched(conn, week_start_at=WEEK_KEY, metric="weekly_pct",
-                       levels=(90, 100)) is True
+        assert latched(conn, week_start_at=WEEK_KEY, period="subscription-week",
+                       metric="weekly_pct", levels=(90, 100)) is True
         # Empty levels → vacuously latched.
-        assert latched(conn, week_start_at=WEEK_KEY, metric="weekly_pct",
-                       levels=()) is True
+        assert latched(conn, week_start_at=WEEK_KEY, period="subscription-week",
+                       metric="weekly_pct", levels=()) is True
     finally:
         conn.close()
 
@@ -505,7 +509,7 @@ def test_pre_probe_skips_cost_when_all_budget_levels_latched(ns, monkeypatch):
     assert [r["threshold"] for r in rows] == [90, 100]
 
     # Second tick: all budget levels latched → pre-probe short-circuits BEFORE
-    # _build_budget_status_inputs → zero new cost calls.
+    # _build_vendor_budget_inputs → zero new cost calls.
     spy.clear()
     ns["maybe_record_projected_alert"]({})
     assert spy == []
@@ -586,3 +590,422 @@ def test_projected_record_tick_emits_no_unknown_config_key_warning(ns, monkeypat
     assert "unknown alerts config key" not in err
     assert "unknown budget config key" not in err
     assert "projected_enabled" not in err
+
+
+# ── codex_budget_usd payload text (R1) ───────────────────────────────────
+
+
+def test_projected_codex_text_is_codex_flavored(ns):
+    """The ``codex_budget_usd`` projected metric renders Codex-flavored text
+    (NOT the generic Claude ``budget_usd`` wording) — the real branch lives in
+    ``bin/_lib_alerts_payload.py::_alert_text_projected``, NOT the shim
+    (R1). ``_build_alert_payload_projected`` already threads ``metric`` into
+    context (no metric-specific change needed there)."""
+    payload = ns["_build_alert_payload_projected"](
+        metric="codex_budget_usd", threshold=100,
+        projected_value=230.0, denominator=200.0,
+        week_start_at="2026-06-01T00:00:00+00:00",
+    )
+    assert payload["metric"] == "codex_budget_usd"
+    assert payload["context"]["metric"] == "codex_budget_usd"
+    title, _subtitle, body = ns["_alert_text_projected"](payload, None)
+    assert "Codex" in title or "Codex" in body
+
+
+# ── calendar-period + Codex projected firing (#135) ──────────────────────
+#
+# Unlike the subscription-week tests above (which seed weekly_usage_snapshots),
+# the calendar/Codex legs resolve their window purely from `now` + a calendar
+# period and read spend via _build_vendor_budget_inputs (monkeypatched
+# _sum_cost_for_range / _sum_codex_cost_for_range). With display.tz pinned to
+# UTC and `now` placed exactly mid-month, elapsed_fraction == 0.5 so the
+# week-average projection (spent / elapsed_fraction) == 2*spent — $150 spent on
+# a $300/$200 budget projects to $300/$400, crossing 90% and 100%.
+
+# June 2026 has 30 days; 2026-06-16T00:00:00Z is exactly 15 days in (0.5
+# elapsed) so projection == 2*spent and elapsed_fraction (0.5) >= 0.15 so the
+# status is NOT low-confidence.
+CAL_AS_OF = dt.datetime(2026, 6, 16, 0, 0, 0, tzinfo=dt.timezone.utc)
+CAL_AS_OF_JULY = dt.datetime(2026, 7, 16, 0, 0, 0, tzinfo=dt.timezone.utc)
+JUNE_KEY = dt.datetime(
+    2026, 6, 1, 0, 0, 0, tzinfo=dt.timezone.utc
+).isoformat(timespec="seconds")
+JULY_KEY = dt.datetime(
+    2026, 7, 1, 0, 0, 0, tzinfo=dt.timezone.utc
+).isoformat(timespec="seconds")
+
+
+def _write_full_config(ns, cfg):
+    """Write an arbitrary config dict at the redirected CONFIG_PATH."""
+    import _cctally_core
+    _cctally_core.CONFIG_PATH.write_text(json.dumps(cfg) + "\n")
+
+
+def _patch_codex_spend(ns, monkeypatch, *, value=None, spy=None):
+    """Inject a deterministic ``_sum_codex_cost_for_range`` (the cctally
+    namespace function _build_vendor_budget_inputs resolves at call time). The
+    fake accepts ``skip_sync`` so the Codex projected leg's
+    ``skip_sync=False`` full-window call is honored."""
+    def fake_sum(start, end, *, speed="auto", skip_sync=False):
+        if spy is not None:
+            spy.append((start, end, speed, skip_sync))
+        return value
+    monkeypatch.setitem(ns, "_sum_codex_cost_for_range", fake_sum)
+
+
+def _codex_block(*, amount_usd=200.0, period="calendar-month",
+                 alerts_enabled=True, projected_enabled=True,
+                 thresholds=(90, 100)):
+    return {
+        "amount_usd": amount_usd,
+        "period": period,
+        "alerts_enabled": alerts_enabled,
+        "projected_enabled": projected_enabled,
+        "alert_thresholds": list(thresholds),
+    }
+
+
+# (a) calendar-month Claude projected fires once + rolls over ──────────────
+
+
+def test_calendar_month_claude_projected_fires_once_and_rolls_over(ns, monkeypatch):
+    monkeypatch.setenv("CCTALLY_AS_OF", _iso(CAL_AS_OF))
+    _write_full_config(ns, {
+        "display": {"tz": "utc"},
+        "budget": {
+            "weekly_usd": 300.0, "period": "calendar-month",
+            "alerts_enabled": True, "alert_thresholds": [90, 100],
+            "projected_enabled": True,
+        },
+    })
+    # spent=$150 on a $300 budget at 0.5 elapsed → projection $300 → crosses
+    # 90% ($270) and 100% ($300, snap-up).
+    _patch_spend(ns, monkeypatch, value=150.0)
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    ns["maybe_record_projected_alert"]({})
+
+    rows = [r for r in _rows(ns) if r["metric"] == "budget_usd"]
+    assert [r["threshold"] for r in rows] == [90, 100]
+    assert all(r["week_start_at"] == JUNE_KEY for r in rows)
+    assert all(abs(r["projected_value"] - 300.0) < 1e-6 for r in rows)
+    assert {p["threshold"] for p, _ in captured} == {90, 100}
+    assert all(p["metric"] == "budget_usd" for p, _ in captured)
+
+    # Second tick same month: all latched → no new rows / dispatch.
+    first = len(captured)
+    ns["maybe_record_projected_alert"]({})
+    assert len(captured) == first
+    assert len([r for r in _rows(ns) if r["metric"] == "budget_usd"]) == 2
+
+    # Roll over to July: a fresh period key re-arms.
+    monkeypatch.setenv("CCTALLY_AS_OF", _iso(CAL_AS_OF_JULY))
+    captured.clear()
+    ns["maybe_record_projected_alert"]({})
+    july = [r for r in _rows(ns) if r["metric"] == "budget_usd"
+            and r["week_start_at"] == JULY_KEY]
+    assert [r["threshold"] for r in july] == [90, 100]
+    assert {p["threshold"] for p, _ in captured} == {90, 100}
+
+
+# (b) Codex projected fires once + rolls over ─────────────────────────────
+
+
+def test_codex_projected_fires_once_and_rolls_over(ns, monkeypatch):
+    monkeypatch.setenv("CCTALLY_AS_OF", _iso(CAL_AS_OF))
+    _write_full_config(ns, {
+        "display": {"tz": "utc"},
+        "budget": {"codex": _codex_block(amount_usd=200.0)},
+    })
+    # spent=$100 on $200 at 0.5 elapsed → projection $200 → crosses 90/100.
+    _patch_codex_spend(ns, monkeypatch, value=100.0)
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    ns["maybe_record_projected_alert"]({})
+
+    rows = [r for r in _rows(ns) if r["metric"] == "codex_budget_usd"]
+    assert [r["threshold"] for r in rows] == [90, 100]
+    assert all(r["week_start_at"] == JUNE_KEY for r in rows)
+    assert all(abs(r["projected_value"] - 200.0) < 1e-6 for r in rows)
+    assert all(abs(r["denominator"] - 200.0) < 1e-9 for r in rows)
+    assert {p["threshold"] for p, _ in captured} == {90, 100}
+    assert all(p["metric"] == "codex_budget_usd" for p, _ in captured)
+    assert all(p["axis"] == "projected" for p, _ in captured)
+
+    # Second tick: no refire.
+    first = len(captured)
+    ns["maybe_record_projected_alert"]({})
+    assert len(captured) == first
+    assert len([r for r in _rows(ns) if r["metric"] == "codex_budget_usd"]) == 2
+
+    # Roll over: re-arm.
+    monkeypatch.setenv("CCTALLY_AS_OF", _iso(CAL_AS_OF_JULY))
+    captured.clear()
+    ns["maybe_record_projected_alert"]({})
+    july = [r for r in _rows(ns) if r["metric"] == "codex_budget_usd"
+            and r["week_start_at"] == JULY_KEY]
+    assert [r["threshold"] for r in july] == [90, 100]
+    assert {p["threshold"] for p, _ in captured} == {90, 100}
+
+
+# (c) only_metrics={"codex_budget_usd"} scopes the opportunistic fire ──────
+
+
+def test_only_metrics_codex_does_not_fire_claude_or_weekly(ns, monkeypatch):
+    monkeypatch.setenv("CCTALLY_AS_OF", _iso(CAL_AS_OF))
+    # Seed a current-week snapshot so weekly_pct would ALSO be eligible — at
+    # CAL_AS_OF the snapshot window is irrelevant for the calendar legs but the
+    # weekly_pct leg reads it; we make weekly eligible to prove it's suppressed.
+    _seed_snapshots(
+        ns, _high_conf_samples(60.0),
+        week_start=CAL_AS_OF - dt.timedelta(hours=84),
+        week_end=CAL_AS_OF + dt.timedelta(hours=84),
+    )
+    _write_full_config(ns, {
+        "display": {"tz": "utc"},
+        "alerts": {"enabled": True, "projected_enabled": True},
+        "budget": {
+            "weekly_usd": 300.0, "period": "calendar-month",
+            "alerts_enabled": True, "alert_thresholds": [90, 100],
+            "projected_enabled": True,
+            "codex": _codex_block(amount_usd=200.0),
+        },
+    })
+    _patch_spend(ns, monkeypatch, value=150.0)
+    _patch_codex_spend(ns, monkeypatch, value=100.0)
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    ns["maybe_record_projected_alert"]({}, only_metrics={"codex_budget_usd"})
+
+    rows = _rows(ns)
+    metrics = {r["metric"] for r in rows}
+    assert metrics == {"codex_budget_usd"}, metrics
+    assert all(p["metric"] == "codex_budget_usd" for p, _ in captured)
+    assert {p["threshold"] for p, _ in captured} == {90, 100}
+
+
+# (d) Claude calendar + Codex same period → two distinct rows, no collision ─
+
+
+def test_claude_and_codex_same_period_no_collision(ns, monkeypatch):
+    monkeypatch.setenv("CCTALLY_AS_OF", _iso(CAL_AS_OF))
+    _write_full_config(ns, {
+        "display": {"tz": "utc"},
+        "budget": {
+            "weekly_usd": 300.0, "period": "calendar-month",
+            "alerts_enabled": True, "alert_thresholds": [90, 100],
+            "projected_enabled": True,
+            "codex": _codex_block(amount_usd=200.0),
+        },
+    })
+    _patch_spend(ns, monkeypatch, value=150.0)        # Claude → $300 proj
+    _patch_codex_spend(ns, monkeypatch, value=100.0)  # Codex → $200 proj
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    ns["maybe_record_projected_alert"]({})
+
+    rows = _rows(ns)
+    # Both metrics share the SAME period-start key but are distinct rows.
+    claude = [r for r in rows if r["metric"] == "budget_usd"]
+    codex = [r for r in rows if r["metric"] == "codex_budget_usd"]
+    assert [r["threshold"] for r in claude] == [90, 100]
+    assert [r["threshold"] for r in codex] == [90, 100]
+    assert all(r["week_start_at"] == JUNE_KEY for r in claude)
+    assert all(r["week_start_at"] == JUNE_KEY for r in codex)
+    assert len(rows) == 4  # neither suppressed the other
+    assert {(p["metric"]) for p, _ in captured} == {"budget_usd", "codex_budget_usd"}
+
+
+# ── R3: config-tz key stability near a civil-month boundary ──────────────
+
+
+def test_codex_projected_key_is_config_tz_stable_near_month_boundary(ns, monkeypatch):
+    """The firing path resolves CONFIG tz (``Namespace(tz=None)``), never a
+    display ``--tz``. Near a civil-month boundary where two zones straddle the
+    month, the resolved ``period_start_at`` dedup key must be the CONFIG-tz
+    period start — so a `cctally budget --tz X` opportunistic fire can never fork
+    the key / double-fire (R3). We assert KEY stability (one row, config-tz key),
+    NOT value equality.
+
+    ``now`` = 2026-07-01T02:00:00Z. Config ``display.tz=America/New_York``
+    (UTC-4 in summer) places that instant at 2026-06-30T22:00 → the JUNE civil
+    month, whose start (2026-06-01T00:00 NY = 04:00 UTC) is the firing key. The
+    SAME UTC instant is in July under UTC — but the firing path ignores the host
+    zone / any display ``--tz`` and keys on the config-tz (NY) June period start.
+    Spend is pinned just over budget so the ~1.0-elapsed projection still
+    crosses; two fires at the same instant must NOT fork the key (one row each).
+    """
+    boundary = dt.datetime(2026, 7, 1, 2, 0, 0, tzinfo=dt.timezone.utc)
+    monkeypatch.setenv("CCTALLY_AS_OF", _iso(boundary))
+    _write_full_config(ns, {
+        "display": {"tz": "America/New_York"},
+        "budget": {"codex": _codex_block(amount_usd=200.0)},
+    })
+    # At ~1.0 elapsed the projection ≈ spent, so spend at budget crosses 90/100.
+    _patch_codex_spend(ns, monkeypatch, value=200.0)
+    _patch_dispatch(ns, monkeypatch)
+
+    # Fire twice (a second opportunistic fire at the same instant). A forked key
+    # would produce a SECOND set of rows under a different period start.
+    ns["maybe_record_projected_alert"]({}, only_metrics={"codex_budget_usd"})
+    ns["maybe_record_projected_alert"]({}, only_metrics={"codex_budget_usd"})
+
+    rows = [r for r in _rows(ns) if r["metric"] == "codex_budget_usd"]
+    keys = {r["week_start_at"] for r in rows}
+    # Config-tz (NY) June start = 2026-06-01T00:00 NY = 04:00 UTC.
+    config_tz_june_key = "2026-06-01T04:00:00+00:00"
+    utc_july_key = "2026-07-01T00:00:00+00:00"
+    assert keys == {config_tz_june_key}, keys
+    assert utc_july_key not in keys  # never the host-zone (UTC) civil month
+    # One key → no fork; thresholds latched once each (no double-fire).
+    assert sorted(r["threshold"] for r in rows) == [90, 100]
+
+
+# ── R5: cold-cache Codex projected counts (skip_sync=False self-syncs) ────
+
+
+def _write_codex_rollout(jsonl_path, session_id, model, inp, cached, out, ts):
+    """Write a minimal real Codex rollout JSONL (session_meta → turn_context →
+    one token_count event), mirroring tests/test_codex_home.py::_write_rollout
+    but with a caller-supplied timestamp so the entry lands in a chosen period.
+    """
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    iso = ts.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    records = [
+        {"timestamp": iso, "type": "session_meta", "payload": {"id": session_id}},
+        {"timestamp": iso, "type": "turn_context", "payload": {"model": model}},
+        {"timestamp": iso, "type": "event_msg", "payload": {
+            "type": "token_count", "info": {
+                "last_token_usage": {
+                    "input_tokens": inp, "cached_input_tokens": cached,
+                    "output_tokens": out, "reasoning_output_tokens": 0,
+                    "total_tokens": inp + out},
+                "total_token_usage": {"total_tokens": inp + out}}}},
+    ]
+    with open(jsonl_path, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+
+def test_codex_projected_counts_with_cold_cache(ns, monkeypatch, tmp_path):
+    """R5 non-vacuity: the Codex projected leg passes ``skip_sync=False`` so it
+    self-syncs from ``~/.codex/sessions`` even when no other record-path warmer
+    ran. We make the codex_budget ACTUAL axis all-latched (it short-circuits
+    BEFORE its cost SUM, leaving the cache cold) yet assert the PROJECTED leg
+    STILL fires the crossing — proving it does not depend on a pre-warmed cache.
+
+    The proof that this is non-vacuous (flip the leg to ``skip_sync=True`` →
+    RED) is cited in the commit body; here the production code is ``skip_sync=
+    False`` and the entries are NEVER synced before the projected fire, so a
+    pass means the leg's own sync ingested them.
+    """
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("CCTALLY_AS_OF", _iso(CAL_AS_OF))  # mid-June, 0.5 elapsed
+    # Real Codex entry timestamped inside June → one gpt-5.5 entry ≈ $134.56.
+    # 0.5 elapsed → projection ≈ 2×spent ≈ $269 → crosses 90%/100% of a $200
+    # Codex budget.
+    _write_codex_rollout(
+        tmp_path / ".codex" / "sessions" / "2026" / "06" / "10"
+        / "rollout-cold.jsonl",
+        session_id="cold-cache-sess", model="gpt-5.5",
+        inp=5_000_000, cached=0, out=2_000_000,
+        ts=dt.datetime(2026, 6, 10, 12, 0, 0),
+    )
+    _write_full_config(ns, {
+        "display": {"tz": "utc"},
+        "budget": {"codex": _codex_block(amount_usd=200.0)},
+    })
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    # Pre-latch the codex_budget ACTUAL axis for all thresholds at the June
+    # period key, so maybe_record_codex_budget_milestone short-circuits BEFORE
+    # its SUM (the cache stays cold — exactly the R5 hazard scenario).
+    conn = ns["open_db"]()
+    try:
+        for t in (90, 100):
+            ns["insert_codex_budget_milestone"](
+                conn, period_start_at=JUNE_KEY, threshold=t,
+                budget_usd=200.0, spent_usd=200.0, consumption_pct=100.0,
+                commit=True,
+            )
+    finally:
+        conn.close()
+    # Actual axis: confirms it short-circuits (no cache warm) — best-effort,
+    # never raises into the test.
+    ns["maybe_record_codex_budget_milestone"]({})
+
+    # The projected leg (NOT monkeypatched — real _sum_codex_cost_for_range)
+    # self-syncs via skip_sync=False and reads the real cost.
+    ns["maybe_record_projected_alert"]({}, only_metrics={"codex_budget_usd"})
+
+    rows = [r for r in _rows(ns) if r["metric"] == "codex_budget_usd"]
+    assert [r["threshold"] for r in rows] == [90, 100], rows
+    assert all(r["week_start_at"] == JUNE_KEY for r in rows)
+    # Projection ≈ 2 × $134.56 = $269.12 → comfortably over both thresholds.
+    assert all(r["projected_value"] > 200.0 for r in rows)
+    assert {p["threshold"] for p, _ in captured} == {90, 100}
+    assert all(p["metric"] == "codex_budget_usd" for p, _ in captured)
+
+
+# ── (#137) period column: collision-free key + NULL-row latched ───────────
+
+
+def test_budget_usd_calendar_week_to_month_switch_no_collision(ns):
+    """Symptom 2 (projected): a budget_usd crossing under calendar-week at
+    instant X must not block a budget_usd crossing under calendar-month at the
+    SAME X — period now discriminates UNIQUE(week_start_at, period, metric,
+    threshold), so the second INSERT returns rowcount 1."""
+    X = "2026-06-01T00:00:00+00:00"
+    conn = ns["open_db"]()
+    try:
+        assert ns["insert_projected_milestone"](
+            conn, week_start_at=X, period="calendar-week", metric="budget_usd",
+            threshold=90, projected_value=270.0, denominator=300.0, commit=True,
+        ) == 1
+        # Same instant, same metric+threshold, DIFFERENT period → no collision.
+        assert ns["insert_projected_milestone"](
+            conn, week_start_at=X, period="calendar-month", metric="budget_usd",
+            threshold=90, projected_value=290.0, denominator=300.0, commit=True,
+        ) == 1
+        periods = [
+            r[0] for r in conn.execute(
+                "SELECT period FROM projected_milestones "
+                "WHERE week_start_at=? AND metric='budget_usd' AND threshold=90 "
+                "ORDER BY period", (X,)
+            )
+        ]
+        assert periods == ["calendar-month", "calendar-week"]
+    finally:
+        conn.close()
+
+
+def test_latched_predicate_period_wildcard_matches_null(ns):
+    """P1-1 (projected): a pre-011 NULL-period row counts as latched for the
+    current window (period=? OR period IS NULL), so an upgrading user never
+    re-fires a spurious projected alert. A row under a DIFFERENT concrete period
+    does NOT mask a fresh period's crossing."""
+    X = "2026-06-01T00:00:00+00:00"
+    latched = ns["_projected_levels_already_latched"]
+    conn = ns["open_db"]()
+    try:
+        # Seed a pre-011 NULL-period budget_usd@90 row.
+        conn.execute(
+            "INSERT INTO projected_milestones (week_start_at, period, metric, "
+            "threshold, projected_value, denominator, crossed_at_utc, "
+            "alerted_at) VALUES (?, NULL, 'budget_usd', 90, 290.0, 300.0, ?, ?)",
+            (X, "2026-06-05T00:00:00Z", "2026-06-05T00:00:00Z"),
+        )
+        conn.commit()
+        # The wildcard treats the NULL row as latched for the live period.
+        assert latched(
+            conn, week_start_at=X, period="calendar-month",
+            metric="budget_usd", levels=(90,),
+        ) is True
+        # But a DIFFERENT concrete period that has its OWN row + a missing level
+        # is still not fully latched (sanity: the wildcard doesn't over-match).
+        assert latched(
+            conn, week_start_at=X, period="calendar-month",
+            metric="budget_usd", levels=(90, 100),
+        ) is False
+    finally:
+        conn.close()

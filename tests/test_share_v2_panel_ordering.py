@@ -16,11 +16,33 @@ from __future__ import annotations
 import datetime as dt
 import types
 
-from conftest import load_script
+from conftest import load_script, redirect_paths
 
 
-def _ns():
-    return types.SimpleNamespace(**load_script())
+def _ns_isolated(monkeypatch, tmp_path):
+    """Namespace with the kernel's DB/path constants pinned to ``tmp_path``.
+
+    EVERY share-panel builder in this file reaches the DB: each calls
+    ``_share_top_projects_for_range`` (per-period ``session_entries`` rollup),
+    and the blocks builder additionally calls ``_share_per_block_per_project``.
+    None of those are stubbed here, so without redirection they open the REAL
+    ``~/.local/share/cctally`` cache.db / stats.db (conftest sets
+    ``CCTALLY_DISABLE_DEV_AUTODETECT=1`` process-wide, so APP_DIR resolves to
+    prod, not the dev dir). That leaks test reads onto the real machine and, on
+    a dev checkout whose prod DB lags the checkout's migration registry, trips
+    the #142 prod-migration guard (``ProdMigrationRefused``); pre-guard it would
+    have silently forward-migrated real prod from a checkout.
+
+    Issue #144 note: an earlier fix isolated ONLY the two blocks tests on the
+    mistaken assumption that "the weekly/daily/monthly builders read only the
+    in-memory snapshot." A runtime sqlite tripwire proved that false — all five
+    of those builders open prod cache.db too — so every test here now routes
+    through this helper. The panel-ordering assertions depend only on the
+    in-memory snapshot, so a fresh empty tmp DB is equivalent.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    return types.SimpleNamespace(**ns)
 
 
 def _weekly_row(ns, *, weeks_ago: int, is_current: bool, cost: float):
@@ -114,8 +136,8 @@ def _snapshot(ns, *, weekly_periods=(), monthly_periods=(),
 # with current_week_index pointing at the actual current week.
 # ----------------------------------------------------------------------
 
-def test_weekly_share_panel_keeps_newest_8_weeks_oldest_first():
-    ns = _ns()
+def test_weekly_share_panel_keeps_newest_8_weeks_oldest_first(monkeypatch, tmp_path):
+    ns = _ns_isolated(monkeypatch, tmp_path)
     # 12 weeks, newest-first (mirrors _dashboard_build_weekly_periods).
     # Mark weeks_ago=0 (the newest) as the current week.
     rows = [
@@ -141,9 +163,9 @@ def test_weekly_share_panel_keeps_newest_8_weeks_oldest_first():
     assert out["current_week_index"] == len(out["weeks"]) - 1
 
 
-def test_weekly_share_panel_handles_fewer_than_8_weeks():
+def test_weekly_share_panel_handles_fewer_than_8_weeks(monkeypatch, tmp_path):
     """No clipping needed; still oldest→newest with correct current_idx."""
-    ns = _ns()
+    ns = _ns_isolated(monkeypatch, tmp_path)
     rows = [
         _weekly_row(ns, weeks_ago=i, is_current=(i == 0), cost=10.0 * (i + 1))
         for i in range(3)
@@ -160,8 +182,8 @@ def test_weekly_share_panel_handles_fewer_than_8_weeks():
 # Finding 2: daily share — must keep the most recent 7 days, oldest-first.
 # ----------------------------------------------------------------------
 
-def test_daily_share_panel_keeps_most_recent_7_days_oldest_first():
-    ns = _ns()
+def test_daily_share_panel_keeps_most_recent_7_days_oldest_first(monkeypatch, tmp_path):
+    ns = _ns_isolated(monkeypatch, tmp_path)
     # 30 days newest-first; days_ago=0 .. 29.
     rows = [_daily_row(ns, days_ago=i, cost=10.0 + i) for i in range(30)]
     snap = _snapshot(ns, daily_panel=rows)
@@ -186,8 +208,8 @@ def test_daily_share_panel_keeps_most_recent_7_days_oldest_first():
 # the template's `progression[-1]` is today, not the week's start day.
 # ----------------------------------------------------------------------
 
-def test_current_week_progression_is_chronological():
-    ns = _ns()
+def test_current_week_progression_is_chronological(monkeypatch, tmp_path):
+    ns = _ns_isolated(monkeypatch, tmp_path)
     # Week began 4 days ago (covers 5 of the 30 daily rows: days_ago 0..4).
     week_start = dt.datetime(2026, 5, 7, 0, 0, tzinfo=dt.timezone.utc)
     week_end = week_start + dt.timedelta(days=7)
@@ -226,8 +248,8 @@ def test_current_week_progression_is_chronological():
 # months[0] = period start and months[-1] = most recent month.
 # ----------------------------------------------------------------------
 
-def test_monthly_share_panel_is_oldest_first():
-    ns = _ns()
+def test_monthly_share_panel_is_oldest_first(monkeypatch, tmp_path):
+    ns = _ns_isolated(monkeypatch, tmp_path)
     # 12 months newest-first (months_ago=0 .. 11).
     rows = [_monthly_row(ns, months_ago=i, cost=10.0 + i) for i in range(12)]
     snap = _snapshot(ns, monthly_periods=rows)
@@ -252,8 +274,8 @@ def test_monthly_share_panel_is_oldest_first():
 # plots left→right time order.
 # ----------------------------------------------------------------------
 
-def test_blocks_share_panel_keeps_most_recent_8_blocks_oldest_first():
-    ns = _ns()
+def test_blocks_share_panel_keeps_most_recent_8_blocks_oldest_first(monkeypatch, tmp_path):
+    ns = _ns_isolated(monkeypatch, tmp_path)
     # 20 blocks newest-first; hours_ago = 0 .. 19 (5h apart). Mark the
     # newest as active.
     rows = [
@@ -282,9 +304,9 @@ def test_blocks_share_panel_keeps_most_recent_8_blocks_oldest_first():
     assert recent[0]["start_at"] == expected_oldest
 
 
-def test_blocks_share_panel_handles_fewer_than_8_blocks():
+def test_blocks_share_panel_handles_fewer_than_8_blocks(monkeypatch, tmp_path):
     """No clipping needed; still oldest→newest."""
-    ns = _ns()
+    ns = _ns_isolated(monkeypatch, tmp_path)
     rows = [
         _block_row(ns, hours_ago=i, cost=1.0 + i, is_active=(i == 0))
         for i in range(3)

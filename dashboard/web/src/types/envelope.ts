@@ -143,16 +143,20 @@ export type AlertAxis =
   | 'five_hour'
   | 'budget'
   | 'projected'
-  | 'project_budget';
+  | 'project_budget'
+  | 'codex_budget';
 
 // Projected axis (issue #121): the `metric` discriminator selects which
 // week-average projection fired (weekly-% against the cap vs budget-$
 // against the target). Top-level on the envelope row AND mirrored inside
 // `context` so the metric-aware renderer can read either.
-export type ProjectedMetric = 'weekly_pct' | 'budget_usd';
+export type ProjectedMetric = 'weekly_pct' | 'budget_usd' | 'codex_budget_usd';
 
 export interface AlertEntry {
-  id: string;                    // "axis:window_key:threshold"
+  id: string;                    // "axis:window_key:…:threshold" — budget/
+                                 // codex_budget/projected carry a "period"
+                                 // segment (#137: "axis:window_key:period:…");
+                                 // opaque React key, never parsed.
   axis: AlertAxis;
   threshold: number;             // integer in [1, 100]
   // Severity tier authority (Phase B): emitted by the Python kernel's
@@ -183,6 +187,15 @@ export interface AlertEntry {
     budget_usd?: number;
     spent_usd?: number;
     consumption_pct?: number;
+    // Period generalization (calendar-period-codex-budgets, spec §6): the
+    // `budget` axis (and the per-vendor `codex_budget` axis) carry a `period`
+    // discriminator — `subscription-week` | `calendar-week` | `calendar-month` —
+    // plus the resolved `period_start_at` window start instant. The frontend
+    // (RecentAlertsModal / Toast) renders a period-aware label ("Month" /
+    // "Calendar week" / "Week") from these. Absent on the other axes; the
+    // subscription-week default keeps the legacy "Week" label byte-stable.
+    period?: string;
+    period_start_at?: string;
     // Project-budget axis (issue #19/#121): `project` is the collision-
     // disambiguated basename (rendered in the chip context), `project_key`
     // the canonical git-root identity. Both absent on the other axes.
@@ -218,6 +231,15 @@ export interface AlertsSettingsEnvelope {
   // Defaults false; gates the `project_budget` axis dispatch only (the
   // per-project display section always renders configured projects).
   project_alerts_enabled?: boolean;
+  // Codex budget toggles (#134): mirrored from the persisted
+  // `budget.codex` block. `codex_budget_configured` is true when a Codex
+  // budget exists (gates the two toggles disabled-with-hint when absent);
+  // `codex_budget_alerts_enabled` / `codex_projected_enabled` seed the two
+  // dashboard-writable sub-leaves. All default false; the nested
+  // partial-merge writer only honors the two `*_enabled` leaves.
+  codex_budget_configured?: boolean;
+  codex_budget_alerts_enabled?: boolean;
+  codex_projected_enabled?: boolean;
   // Notifier dispatch backend (Phase B): the configured `alerts.notifier`
   // mirrored from the server so SettingsOverlay can seed the dropdown
   // without a separate GET. Optional so a pre-Phase-B envelope keeps the

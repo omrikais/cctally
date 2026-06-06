@@ -233,6 +233,15 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
     effective reset moment is floored to the hour via `_floor_to_hour`
     so minute/second-level Anthropic jitter ("in X hr Y min" relative-text
     drift) doesn't masquerade as a reset.
+
+    ONE deliberate divergence from the live rule: backfill passes
+    ``allow_reset_to_zero=False`` to ``_is_reset_drop``, so it fires only on
+    the unambiguous ``>=25pp`` drop. The lenient reset-to-zero signal is
+    live-only — the live path debounces a transient API zero (issue #128),
+    but this one-shot historical scan has no debounce and would otherwise
+    mis-read a stale-replica 0% blip (``6% → 0% → 1%`` on a still-future
+    week_end) as a credit, segmenting the week into a degenerate zero-width
+    window. See ``_is_reset_drop`` for the full rationale.
     """
     c = _cctally()
     try:
@@ -278,7 +287,7 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
             if (
                 captured_dt < prior_end_dt
                 and prior_pct is not None and cur_pct is not None
-                and _is_reset_drop(prior_pct, cur_pct)
+                and _is_reset_drop(prior_pct, cur_pct, allow_reset_to_zero=False)
             ):
                 # Floor to the hour so the display boundary lands on the
                 # natural hour mark (Anthropic's reset times are always
@@ -309,7 +318,7 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
             if (
                 captured_dt < prior_end_dt
                 and prior_pct is not None and cur_pct is not None
-                and _is_reset_drop(prior_pct, cur_pct)
+                and _is_reset_drop(prior_pct, cur_pct, allow_reset_to_zero=False)
             ):
                 # Pre-check on ``new_week_end_at`` (mirrors the live
                 # detection path's pre-check). Necessary because the
@@ -392,7 +401,9 @@ _RESET_ZERO_FLOOR_PCT = 1.0
 _RESET_ZERO_MIN_DROP_PCT = 3.0
 
 
-def _is_reset_drop(prior_pct: float, cur_pct: float) -> bool:
+def _is_reset_drop(
+    prior_pct: float, cur_pct: float, *, allow_reset_to_zero: bool = True
+) -> bool:
     """True when ``prior_pct → cur_pct`` is a genuine weekly reset/credit.
 
     Two independent percent-shape signals (OR):
@@ -400,17 +411,30 @@ def _is_reset_drop(prior_pct: float, cur_pct: float) -> bool:
     * **Partial credit** — drop ``>= _RESET_PCT_DROP_THRESHOLD`` (25pp).
     * **Reset-to-zero** — ``cur_pct`` collapses to ~0
       (``<= _RESET_ZERO_FLOOR_PCT``) with a drop clearing
-      ``_RESET_ZERO_MIN_DROP_PCT``.
+      ``_RESET_ZERO_MIN_DROP_PCT``. Gated on ``allow_reset_to_zero``.
+
+    ``allow_reset_to_zero`` scopes the lenient reset-to-zero signal to the
+    sites that can afford it. **Live** current-week detection passes the
+    default ``True``: the live in-place path debounces a transient API zero
+    (issue #128 — arm on the first ~0, confirm only if it stays low, clear
+    on recovery). The **historical backfill**
+    (``_backfill_week_reset_events``) passes ``False`` — it is a one-shot
+    scan with NO debounce, so a single stale-replica 0% reading on a
+    still-future ``week_end`` (e.g. a ``6% → 0% → 1%`` blip) would otherwise
+    be mis-read as a goodwill credit and segment the week into a degenerate
+    zero-width window. Backfill therefore fires only on the unambiguous
+    ``>=25pp`` drop and defers sub-25pp reset-to-zero to the live path.
 
     Callers retain the boundary predicates (same/advanced ``week_end_at``
     AND ``prior_end_dt > now``); this helper owns ONLY the percent-shape
-    discrimination so all four 7d detection sites (live advance, live
-    in-place, backfill advance, backfill in-place) stay byte-identical.
+    discrimination.
     """
     cur = float(cur_pct)
     drop = float(prior_pct) - cur
     if drop >= _RESET_PCT_DROP_THRESHOLD:
         return True
+    if not allow_reset_to_zero:
+        return False
     return cur <= _RESET_ZERO_FLOOR_PCT and drop >= _RESET_ZERO_MIN_DROP_PCT
 
 

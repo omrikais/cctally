@@ -36,6 +36,8 @@ def test_doctor_state_has_required_fields():
         "install_is_brew",
         # Pricing-freshness check (spec 2026-05-29).
         "pricing_coverage",
+        # Conversation viewer (Plan 2, spec §5): LAN transcript opt-in.
+        "expose_transcripts",
     }
     assert fields == expected, fields ^ expected
 
@@ -620,6 +622,54 @@ def test_safety_dashboard_bind_runtime_loopback_ok():
     s = _state(dashboard_bind_stored="loopback", runtime_bind="127.0.0.1")
     r = L._check_safety_dashboard_bind(s)
     assert r.severity == "ok"
+
+
+# ── Conversation viewer (Plan 2, spec §5): LAN + expose_transcripts ──
+
+
+def test_safety_dashboard_bind_lan_with_expose_surfaces_detail():
+    """A LAN bind WITH expose_transcripts serves raw transcript prose to the
+    LAN — surfaced additively on the existing LAN-bind WARN."""
+    s = _state(dashboard_bind_stored="lan", expose_transcripts=True)
+    r = L._check_safety_dashboard_bind(s)
+    assert r.severity == "warn"
+    assert r.details.get("transcripts_exposed_on_lan") is True
+    assert "transcripts exposed on LAN" in r.summary
+    # The pre-existing LAN-bind details are untouched.
+    assert r.details["config"] == "lan"
+
+
+def test_safety_dashboard_bind_lan_without_expose_no_detail():
+    """LAN bind, expose off (the default): the LAN-bind WARN is unchanged —
+    NO transcript detail, NO summary mention. This is the case the
+    `06-dashboard-bind-lan` golden pins, so the goldens stay byte-identical."""
+    s = _state(dashboard_bind_stored="lan")  # expose_transcripts defaults False
+    r = L._check_safety_dashboard_bind(s)
+    assert r.severity == "warn"
+    assert "transcripts_exposed_on_lan" not in r.details
+    assert "transcripts exposed on LAN" not in r.summary
+
+
+def test_safety_dashboard_bind_loopback_with_expose_is_byte_identical():
+    """A loopback bind never reaches the LAN branch — even with expose on, the
+    OK report is byte-identical to expose off (no detail, no summary churn).
+    This is why the loopback doctor goldens need no regen."""
+    off = L._check_safety_dashboard_bind(_state(expose_transcripts=False))
+    on = L._check_safety_dashboard_bind(_state(expose_transcripts=True))
+    assert off == on
+    assert on.severity == "ok"
+    assert "transcripts_exposed_on_lan" not in on.details
+
+
+def test_safety_dashboard_bind_runtime_lan_with_expose_surfaces_detail():
+    """A loopback config but a runtime --host LAN override, with expose on,
+    also surfaces the transcript detail (the bind that's actually serving is
+    non-loopback)."""
+    s = _state(dashboard_bind_stored="loopback", runtime_bind="0.0.0.0",
+               expose_transcripts=True)
+    r = L._check_safety_dashboard_bind(s)
+    assert r.severity == "warn"
+    assert r.details.get("transcripts_exposed_on_lan") is True
 
 
 def test_safety_config_json_ok_when_absent_or_parsed():

@@ -136,12 +136,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/stats.db",
-                        "registry_size": 10,
+                        "registry_size": 11,
                         "user_version": 0
                     },
                     "id": "db.stats.file",
                     "severity": "ok",
-                    "summary": "version 0 / 10 known",
+                    "summary": "version 0 / 11 known",
                     "title": "stats.db"
                 },
                 {
@@ -155,12 +155,31 @@
                 },
                 {
                     "details": {
+                        "cache.db": {
+                            "ahead": false,
+                            "registry_size": 2,
+                            "user_version": 0
+                        },
+                        "stats.db": {
+                            "ahead": false,
+                            "registry_size": 11,
+                            "user_version": 0
+                        }
+                    },
+                    "id": "db.version_ahead",
+                    "severity": "ok",
+                    "summary": "none ahead",
+                    "title": "Version ahead"
+                },
+                {
+                    "details": {
                         "by_db": {
                             "cache.db": {
                                 "applied": [],
                                 "failed": [],
                                 "pending": [
-                                    "001_dedup_highest_wins"
+                                    "001_dedup_highest_wins",
+                                    "002_conversation_messages_backfill"
                                 ],
                                 "skipped": []
                             },
@@ -178,7 +197,8 @@
                                     "007_observed_pre_credit_pct",
                                     "008_recompute_weekly_cost_snapshots_dedup_fix",
                                     "009_recompute_five_hour_blocks_dedup_fix",
-                                    "010_recompute_percent_milestones_dedup_fix"
+                                    "010_recompute_percent_milestones_dedup_fix",
+                                    "011_budget_milestone_period_keys"
                                 ],
                                 "skipped": []
                             }
@@ -236,15 +256,23 @@
                                 "010_recompute_percent_milestones_dedup_fix"
                             ],
                             [
+                                "stats.db",
+                                "011_budget_milestone_period_keys"
+                            ],
+                            [
                                 "cache.db",
                                 "001_dedup_highest_wins"
+                            ],
+                            [
+                                "cache.db",
+                                "002_conversation_messages_backfill"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "10 pending",
+                    "summary": "12 pending",
                     "title": "Pending migrations"
                 }
             ],
@@ -385,7 +413,7 @@
     "overall": {
         "counts": {
             "fail": 3,
-            "ok": 13,
+            "ok": 14,
             "warn": 8
         },
         "severity": "fail"

@@ -382,3 +382,227 @@ describe('<SettingsOverlay /> per-project budget alerts toggle', () => {
     expect(settingsCall).toBeUndefined();
   });
 });
+
+// Codex budget toggles (#134). Two dashboard-writable sub-leaves of the
+// nested `budget.codex` block: `alerts_enabled` and `projected_enabled`.
+// Both render DISABLED + a CLI hint when no Codex budget exists
+// (`codex_budget_configured:false`, Q2), and POST nested under
+// `budget.codex` (partial-merge — only the dirty sub-leaf travels). Parent-
+// modal integration tests mirror the per-project toggle block above.
+describe('<SettingsOverlay /> Codex budget toggles', () => {
+  it('renders both toggles disabled + a CLI hint when no Codex budget is configured', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ codex_budget_configured: false });
+    openSettings();
+
+    const alertsToggle = screen.getByRole('checkbox', {
+      name: /Codex budget alerts/,
+    }) as HTMLInputElement;
+    const projectedToggle = screen.getByRole('checkbox', {
+      name: /Codex projected-pace alerts/,
+    }) as HTMLInputElement;
+    expect(alertsToggle.disabled).toBe(true);
+    expect(projectedToggle.disabled).toBe(true);
+    // The empty-state hint points at the CLI set command.
+    expect(
+      screen.getByText(/Set a Codex budget via the CLI first/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/cctally budget set 200 --vendor codex/),
+    ).toBeInTheDocument();
+  });
+
+  it('enables + seeds both toggles when a Codex budget is configured', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({
+      codex_budget_configured: true,
+      codex_budget_alerts_enabled: true,
+      codex_projected_enabled: true,
+    });
+    openSettings();
+
+    const alertsToggle = screen.getByRole('checkbox', {
+      name: /Codex budget alerts/,
+    }) as HTMLInputElement;
+    const projectedToggle = screen.getByRole('checkbox', {
+      name: /Codex projected-pace alerts/,
+    }) as HTMLInputElement;
+    expect(alertsToggle.disabled).toBe(false);
+    expect(projectedToggle.disabled).toBe(false);
+    // Seeded ON from the envelope's alerts_settings block.
+    expect(alertsToggle.checked).toBe(true);
+    expect(projectedToggle.checked).toBe(true);
+    // No empty-state hint once a budget exists.
+    expect(screen.queryByText(/Set a Codex budget via the CLI first/)).toBeNull();
+  });
+
+  it('POSTs budget.codex.alerts_enabled (nested, no other codex keys) when toggled on', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    seedAlertsConfig({
+      codex_budget_configured: true,
+      codex_budget_alerts_enabled: false,
+      codex_projected_enabled: false,
+    });
+    openSettings();
+
+    const alertsToggle = screen.getByRole('checkbox', {
+      name: /Codex budget alerts/,
+    }) as HTMLInputElement;
+    expect(alertsToggle.checked).toBe(false); // seeded default
+    fireEvent.click(alertsToggle);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
+    expect(call).toBeTruthy();
+    const [, init] = call as [string, RequestInit];
+    expect(init.method).toBe('POST');
+    const parsed = JSON.parse(init.body as string) as {
+      budget?: { codex?: Record<string, unknown> };
+    };
+    // Binding assertion: the toggle travels nested under budget.codex, and
+    // ONLY the dirty sub-leaf is sent (no projected_enabled leak).
+    expect(parsed.budget?.codex?.alerts_enabled).toBe(true);
+    expect('projected_enabled' in (parsed.budget?.codex ?? {})).toBe(false);
+  });
+
+  it('POSTs budget.codex.projected_enabled when the projected toggle flips on', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    seedAlertsConfig({
+      codex_budget_configured: true,
+      codex_budget_alerts_enabled: true,
+      codex_projected_enabled: false,
+    });
+    openSettings();
+
+    const projectedToggle = screen.getByRole('checkbox', {
+      name: /Codex projected-pace alerts/,
+    }) as HTMLInputElement;
+    expect(projectedToggle.checked).toBe(false); // seeded default
+    fireEvent.click(projectedToggle);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
+    expect(call).toBeTruthy();
+    const [, init] = call as [string, RequestInit];
+    const parsed = JSON.parse(init.body as string) as {
+      budget?: { codex?: Record<string, unknown> };
+    };
+    // Only the dirty projected sub-leaf travels — alerts_enabled is unchanged.
+    expect(parsed.budget?.codex?.projected_enabled).toBe(true);
+    expect('alerts_enabled' in (parsed.budget?.codex ?? {})).toBe(false);
+  });
+
+  it('does NOT POST when neither Codex toggle is dirty', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    seedAlertsConfig({
+      codex_budget_configured: true,
+      codex_budget_alerts_enabled: true,
+      codex_projected_enabled: true,
+    });
+    openSettings();
+
+    // Touch nothing — both toggles match the server, so Save makes no POST.
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    const settingsCall = fetchMock.mock.calls.find(
+      ([url]) => url === '/api/settings',
+    );
+    expect(settingsCall).toBeUndefined();
+  });
+
+  // Co-dirty flat + Codex merge (#134, code-review Minor). Flip BOTH a flat
+  // Claude budget leaf (the per-project toggle → `budget.project_alerts_enabled`)
+  // AND a Codex toggle (→ `budget.codex.alerts_enabled`) in ONE Save. The
+  // production POST assembly spreads the pre-existing flat `body.budget` before
+  // attaching `codex`, so the SINGLE POST body must carry BOTH leaves. Against a
+  // naive `body.budget = { codex: codexBlock }` (no spread) the flat leaf is
+  // DROPPED and this fails — the RED→GREEN proof for the spread-preservation.
+  it('POSTs BOTH a flat Claude leaf and budget.codex when co-dirty in one Save', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    // A Codex budget exists (toggles enabled) AND both flat + Codex leaves are
+    // seeded OFF, so flipping each makes both blocks dirty.
+    seedAlertsConfig({
+      project_alerts_enabled: false,
+      codex_budget_configured: true,
+      codex_budget_alerts_enabled: false,
+      codex_projected_enabled: false,
+    });
+    openSettings();
+
+    // Flip the flat Claude leaf (per-project budget alerts → budget.project_alerts_enabled).
+    const projectToggle = screen.getByRole('checkbox', {
+      name: /Per-project budget alerts/,
+    }) as HTMLInputElement;
+    expect(projectToggle.checked).toBe(false); // seeded default
+    fireEvent.click(projectToggle);
+
+    // Flip the Codex leaf (Codex budget alerts → budget.codex.alerts_enabled).
+    const codexToggle = screen.getByRole('checkbox', {
+      name: /Codex budget alerts/,
+    }) as HTMLInputElement;
+    expect(codexToggle.checked).toBe(false); // seeded default
+    fireEvent.click(codexToggle);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
+    expect(call).toBeTruthy();
+    const [, init] = call as [string, RequestInit];
+    expect(init.method).toBe('POST');
+    // Exactly ONE settings POST — both blocks ride the same atomic round-trip.
+    const settingsCalls = fetchMock.mock.calls.filter(
+      ([url]) => url === '/api/settings',
+    );
+    expect(settingsCalls).toHaveLength(1);
+    const parsed = JSON.parse(init.body as string) as {
+      budget?: {
+        project_alerts_enabled?: boolean;
+        codex?: Record<string, unknown>;
+      };
+    };
+    // Binding assertion: the flat leaf is NOT dropped by the codex spread, AND
+    // `codex` is nested alongside it in the SAME `budget` block.
+    expect(parsed.budget?.project_alerts_enabled).toBe(true);
+    expect(parsed.budget?.codex?.alerts_enabled).toBe(true);
+  });
+});

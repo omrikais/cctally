@@ -71,12 +71,14 @@ _alert_text_weekly = _lib_alerts_payload._alert_text_weekly
 _alert_text_five_hour = _lib_alerts_payload._alert_text_five_hour
 _alert_text_budget = _lib_alerts_payload._alert_text_budget
 _alert_text_project_budget = _lib_alerts_payload._alert_text_project_budget
+_alert_text_codex_budget = _lib_alerts_payload._alert_text_codex_budget
 _alert_text_projected = _lib_alerts_payload._alert_text_projected
 _escape_applescript_string = _lib_alerts_payload._escape_applescript_string
 _build_alert_payload_weekly = _lib_alerts_payload._build_alert_payload_weekly
 _build_alert_payload_five_hour = _lib_alerts_payload._build_alert_payload_five_hour
 _build_alert_payload_budget = _lib_alerts_payload._build_alert_payload_budget
 _build_alert_payload_project_budget = _lib_alerts_payload._build_alert_payload_project_budget
+_build_alert_payload_codex_budget = _lib_alerts_payload._build_alert_payload_codex_budget
 _build_alert_payload_projected = _lib_alerts_payload._build_alert_payload_projected
 
 # Phase B: severity policy + the cross-platform dispatch kernel. The kernel is
@@ -175,6 +177,8 @@ def _dispatch_alert_notification(
         title, subtitle, body = _alert_text_budget(payload, tz)
     elif axis == "project_budget":
         title, subtitle, body = _alert_text_project_budget(payload, tz)
+    elif axis == "codex_budget":
+        title, subtitle, body = _alert_text_codex_budget(payload, tz)
     elif axis == "projected":
         title, subtitle, body = _alert_text_projected(payload, tz)
     else:
@@ -249,6 +253,7 @@ def _dispatch_alert_notification(
             ctx.get("week_start_date")
             or ctx.get("five_hour_window_key")
             or ctx.get("week_start_at")
+            or ctx.get("period_start_at")
             or ""
         )
         line = (
@@ -285,6 +290,8 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
         axis = "budget"
     elif args.axis == "project-budget":
         axis = "project_budget"
+    elif args.axis == "codex-budget":
+        axis = "codex_budget"
     elif args.axis == "projected":
         axis = "projected"
     else:
@@ -335,17 +342,35 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
             spent_usd=26.0,
             consumption_pct=104.0,
         )
+    elif axis == "codex_budget":
+        # Synthetic Codex budget payload — NO DB writes (test/real divergence
+        # contract), NO real budget.codex entry required. A $200 calendar-month
+        # budget reads plausibly; spent scaled to the threshold so the body line
+        # reads as the at-crossing snapshot the dashboard would render.
+        payload = _build_alert_payload_codex_budget(
+            threshold=threshold,
+            crossed_at_utc=now_utc_iso(),
+            period_start_at=dt.date.today().replace(day=1).isoformat(),
+            period="calendar-month",
+            budget_usd=200.0,
+            spent_usd=200.0 * threshold / 100.0,
+            consumption_pct=float(threshold),
+        )
     elif axis == "projected":
         # Synthetic projected-pace payload — NO DB writes (test/real divergence
         # contract). The metric discriminator picks the wiring; projected_value
         # is the threshold's denominator-relative value (so the body reads
         # plausibly, e.g. weekly 100% → "~100% of cap", budget 100% → "$300 of
         # $300"). denominator is the at-crossing target the row would carry
-        # (Codex P0-4): 100.0 for weekly_pct, $300 for budget_usd.
+        # (Codex P0-4): 100.0 for weekly_pct, $300 for budget_usd, $200 for
+        # codex_budget_usd (matching the codex_budget axis test-alert budget).
         metric = getattr(args, "metric", "weekly_pct")
         if metric == "budget_usd":
             denominator = 300.0
             projected_value = 300.0 * threshold / 100.0
+        elif metric == "codex_budget_usd":
+            denominator = 200.0
+            projected_value = 200.0 * threshold / 100.0
         else:  # weekly_pct
             denominator = 100.0
             projected_value = float(threshold)
