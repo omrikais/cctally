@@ -105,3 +105,40 @@ def test_tool_result_block_list_is_stringified_multiline():
     r = list(lc.iter_message_rows(fh, "f"))[0]
     assert r.entry_type == lc.TOOL_RESULT
     assert json.loads(r.blocks_json)[0]["text"] == "line1\nline2"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# parse_message_row — the pure per-line parser extracted in #138 so the fused
+# single-pass sync walker can share it. iter_message_rows now delegates to it.
+# ──────────────────────────────────────────────────────────────────────────
+
+def test_parse_message_row_user_with_uuid_returns_row():
+    obj = {"type": "user", "uuid": "u1", "sessionId": "s", "timestamp": "t",
+           "message": {"role": "user", "content": "hi there"}}
+    row = lc.parse_message_row(obj, 42)
+    assert row is not None
+    assert row.byte_offset == 42
+    assert row.uuid == "u1"
+    assert row.entry_type == lc.HUMAN
+    assert row.text == "hi there"
+
+
+def test_parse_message_row_assistant_carries_model_and_ids():
+    obj = {"type": "assistant", "uuid": "a1", "sessionId": "s", "requestId": "r1",
+           "timestamp": "t", "message": {"role": "assistant", "id": "m1",
+           "model": "claude-opus-4-7", "content": [{"type": "text", "text": "ans"}]}}
+    row = lc.parse_message_row(obj, 0)
+    assert row is not None
+    assert row.entry_type == lc.ASSISTANT
+    assert row.model == "claude-opus-4-7" and row.msg_id == "m1" and row.req_id == "r1"
+
+
+def test_parse_message_row_non_user_assistant_returns_none():
+    assert lc.parse_message_row({"type": "summary", "leafUuid": "l"}, 0) is None
+    assert lc.parse_message_row({"type": "file-history-snapshot"}, 0) is None
+
+
+def test_parse_message_row_missing_uuid_returns_none():
+    obj = {"type": "user", "sessionId": "s", "timestamp": "t",
+           "message": {"role": "user", "content": "x"}}
+    assert lc.parse_message_row(obj, 0) is None

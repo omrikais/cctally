@@ -151,6 +151,61 @@ def _conv_rows(conn):
     ).fetchall()
 
 
+def test_iter_sync_entries_parses_each_line_once(monkeypatch):
+    """#138 acceptance: the fused walker parses each JSONL line exactly once
+    (one json.loads per line), yielding a (offset, cost, msgrow) triple per
+    productive line. The pre-#138 design walked the delta byte range TWICE
+    (cost walk then conversation seek-and-walk), parsing every line twice."""
+    import io
+    import _cctally_cache as cache
+    body = (_asst_line("a1", "m1", "r1", "one")
+            + _user_line("u1", "two")
+            + _asst_line("a2", "m2", "r2", "three"))
+    fh = io.StringIO(body)
+
+    calls = {"n": 0}
+    real = cache.json.loads
+
+    def spy(s, *a, **k):
+        calls["n"] += 1
+        return real(s, *a, **k)
+
+    monkeypatch.setattr(cache.json, "loads", spy)
+    out = list(cache._iter_sync_entries(fh, "/p/a.jsonl"))
+
+    assert calls["n"] == 3, f"one json.loads per line expected, got {calls['n']}"
+    assert len(out) == 3
+    o0, c0, m0 = out[0]
+    o1, c1, m1 = out[1]
+    o2, c2, m2 = out[2]
+    # assistant lines yield BOTH a cost tuple and a message row; user line is
+    # a message row only.
+    assert c0 is not None and m0 is not None and m0.entry_type == "assistant"
+    assert c1 is None and m1 is not None and m1.entry_type == "human"
+    assert c2 is not None and m2 is not None
+    # cost tuple shape is (UsageEntry, msg_id, req_id)
+    assert c0[1] == "m1" and c0[2] == "r1"
+    # offsets are byte-accurate and strictly increasing; the triple's offset
+    # equals the message row's own byte_offset.
+    assert o0 == 0 and o1 == m1.byte_offset and o2 == m2.byte_offset
+    assert o0 < o1 < o2
+
+
+def test_iter_sync_entries_partial_tail_rewinds():
+    """A mid-write tail line (no trailing newline) rewinds the handle and stops,
+    so fh.tell() after the loop is the cost cursor's final_offset and the next
+    sync re-reads the line once complete — same discipline as the leaf walkers."""
+    import io
+    import _cctally_cache as cache
+    complete = _asst_line("a1", "m1", "r1", "ok")
+    partial = '{"type":"assistant","uuid":"a2"'  # no newline
+    fh = io.StringIO(complete + partial)
+    out = list(cache._iter_sync_entries(fh, "/p/a.jsonl"))
+    assert len(out) == 1
+    assert fh.tell() == len(complete)  # rewound to start of the partial line
+    assert fh.readline().startswith('{"type":"assistant","uuid":"a2"')
+
+
 def test_sync_ingests_messages_and_dedups_replay(isolated):
     """Two files: b.jsonl resumes a.jsonl, replaying a1's uuid. Both physical
     rows are stored (UNIQUE(source_path, byte_offset)); the uuid is only
@@ -546,3 +601,126 @@ def test_rebuild_clears_pending_flag_without_separate_backfill(isolated, monkeyp
     assert conn.execute(
         "SELECT 1 FROM cache_meta WHERE key='conversation_backfill_pending'"
     ).fetchone() is None, "rebuild must clear the pending flag directly"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #138 item 2: integrity-safe, storm-free FTS full-clear
+#   (clear_conversation_messages: drop triggers → truncate base → 'delete-all'
+#    on the FTS index → recreate triggers; NOT the per-row delete-trigger storm)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _insert_msg(conn, uuid, off, text, *, entry_type="assistant"):
+    conn.execute(
+        "INSERT INTO conversation_messages"
+        "(session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,text,blocks_json,is_sidechain)"
+        " VALUES('s',?,?,?, '2026-01-01T00:00:00Z',?,?,'[]',0)",
+        (uuid, f"f{off}", off, entry_type, text),
+    )
+
+
+def test_clear_conversation_messages_empties_both_and_keeps_integrity():
+    """The full-clear empties BOTH conversation_messages and conversation_fts,
+    leaves the triggers in place (a later insert is indexed again), and the FTS
+    index passes integrity-check — the load-bearing acceptance criterion. The
+    naive 'clear the index then let the per-row delete trigger fire' ordering
+    corrupts the external-content index ('database disk image is malformed')."""
+    conn = _fresh()
+    if not db._fts5_available(conn):
+        pytest.skip("sqlite build lacks FTS5")
+    for i in range(6):
+        _insert_msg(conn, f"u{i}", i, "alpha findme prose")
+    conn.commit()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'alpha'"
+    ).fetchone()[0] == 6
+
+    db.clear_conversation_messages(conn)
+    conn.commit()
+
+    assert conn.execute("SELECT COUNT(*) FROM conversation_messages").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'alpha'"
+    ).fetchone()[0] == 0
+    # Triggers restored: a fresh insert is indexed; old prose stays gone.
+    _insert_msg(conn, "fresh", 99, "beta brandnew")
+    conn.commit()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'beta'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'alpha'"
+    ).fetchone()[0] == 0
+    # Integrity-check must not raise (would raise on a corrupted index).
+    conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('integrity-check')")
+
+
+def test_clear_conversation_messages_fts_unavailable_plain_delete(monkeypatch):
+    """On an FTS5-unavailable build _apply_cache_schema sets the flag + creates
+    no triggers / no vtable. The full-clear must still empty the base table
+    without issuing a 'delete-all' against the absent conversation_fts."""
+    monkeypatch.setattr(db, "_fts5_available", lambda conn: False)
+    conn = sqlite3.connect(":memory:")
+    db._apply_cache_schema(conn)
+    for i in range(3):
+        _insert_msg(conn, f"u{i}", i, "x")
+    conn.commit()
+    db.clear_conversation_messages(conn)  # must not raise
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM conversation_messages").fetchone()[0] == 0
+
+
+def test_sync_rebuild_keeps_fts_integrity(isolated):
+    """A `cache-sync --rebuild` full-clears via the storm-free path and the FTS
+    index remains integrity-valid + correctly repopulated."""
+    ns, conn, projects, sync = isolated
+    if not db._fts5_available(conn):
+        pytest.skip("sqlite build lacks FTS5")
+    f = projects / "a.jsonl"
+    f.write_text(_asst_line("a1", "m1", "r1", "alpha old prose") + _user_line("u1", "alpha more"))
+    sync()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'alpha'"
+    ).fetchone()[0] >= 1
+
+    f.write_text(_asst_line("a9", "m9", "r9", "beta fresh prose"))
+    sync(rebuild=True)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'alpha'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'beta'"
+    ).fetchone()[0] == 1
+    conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('integrity-check')")
+
+
+def test_sync_truncation_keeps_fts_integrity(isolated):
+    """The truncation-escalation full-clear uses the same storm-free path; the
+    FTS index stays integrity-valid after a real reset + re-ingest."""
+    ns, conn, projects, sync = isolated
+    if not db._fts5_available(conn):
+        pytest.skip("sqlite build lacks FTS5")
+    fa = projects / "a.jsonl"
+    fb = projects / "b.jsonl"
+    fa.write_text(_asst_line("a1", "m1", "r1", "alpha gone") + _user_line("u1", "alpha gone2"))
+    fb.write_text(_asst_line("b1", "mb", "rb", "bravo kept"))
+    sync()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'alpha'"
+    ).fetchone()[0] >= 1
+
+    fa.write_text(_asst_line("a2", "m2", "r2", "gamma rewritten"))  # shrink → escalation
+    stats = sync()
+    assert stats.files_reset_truncated >= 1
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'alpha'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'gamma'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'bravo'"
+    ).fetchone()[0] == 1
+    conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('integrity-check')")

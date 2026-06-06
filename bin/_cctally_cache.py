@@ -168,13 +168,15 @@ _parse_usage_entries = _lib_jsonl._parse_usage_entries
 _should_replace = _lib_jsonl._should_replace
 
 # Conversation-message parser kernel (Plan 1). Pure leaf (stdlib-only), so
-# it loads at module-load time alongside _lib_jsonl. ``sync_cache``'s second
-# seek-and-walk and the backfill walker both call ``_iter_message_rows``.
+# it loads at module-load time alongside _lib_jsonl. Since #138 the per-file
+# sync ingest goes through the fused ``_iter_sync_entries`` walker (which calls
+# ``_lib_conversation.parse_message_row`` directly); ``_iter_message_rows`` is
+# now used only by ``backfill_conversation_messages``.
 _lib_conversation = _load_lib("_lib_conversation")
 _iter_message_rows = _lib_conversation.iter_message_rows
 
-# Shared by sync_cache's second seek-and-walk AND backfill_conversation_messages
-# so the column list, placeholders, and tuple order live in ONE place — a column
+# Shared by the fused per-file walk AND backfill_conversation_messages so the
+# column list, placeholders, and tuple order live in ONE place — a column
 # add/reorder can't silently desync the two ingest paths (which would land
 # values in the wrong columns on whichever path was missed).
 _CONV_INSERT_SQL = (
@@ -195,6 +197,52 @@ def _conv_row_tuple(m, path_str):
     )
 
 
+def _iter_sync_entries(fh, path_str):
+    """Fused single-pass sync walker (#138). Yields
+    ``(byte_offset, cost_or_None, msgrow_or_None)`` for each JSONL line from
+    ``fh``'s current position that produces a cost entry and/or a conversation
+    message row.
+
+    Each line is read once (readline()+tell()) and ``json.loads``-parsed ONCE,
+    then classified by both pure per-line parsers:
+
+      * ``cost_or_None`` is ``(UsageEntry, msg_id, req_id)`` when the line is a
+        billable assistant entry (``_lib_jsonl.parse_cost_entry``), else None.
+      * ``msgrow_or_None`` is a ``MessageRow`` when the line is a user/assistant
+        turn carrying a uuid (``_lib_conversation.parse_message_row``), else None.
+
+    The two are independent — a normal assistant line yields both. This replaces
+    the former cost walk + re-seek-and-walk over the identical byte span: with a
+    single walk the "identical span" invariant is structural (one stop point),
+    not a prose-enforced ``mrow.byte_offset >= final_offset`` runtime break. A
+    partial mid-write tail line (no trailing newline) rewinds the handle and
+    stops, so ``fh.tell()`` after the loop is the cost cursor's ``final_offset``
+    and the next sync re-reads the line once the newline lands.
+    """
+    while True:
+        offset = fh.tell()
+        line = fh.readline()
+        if not line:
+            return
+        if not line.endswith("\n"):
+            # Partial tail line — writer is mid-flight. Rewind so the next sync
+            # re-reads this line once the newline is in place (and so fh.tell()
+            # reports the cost cursor's stop, never past the partial).
+            fh.seek(offset)
+            return
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        cost = _lib_jsonl.parse_cost_entry(obj, path_str)
+        mrow = _lib_conversation.parse_message_row(obj, offset)
+        if cost is not None or mrow is not None:
+            yield offset, cost, mrow
+
+
 def _iter_claude_jsonl_files():
     """Yield every Claude transcript ``*.jsonl`` under each data dir's
     ``projects/`` tree. Shared by ``sync_cache`` and the conversation backfill
@@ -208,6 +256,10 @@ _cctally_db_sib = _load_lib("_cctally_db")
 add_column_if_missing = _cctally_db_sib.add_column_if_missing
 _run_pending_migrations = _cctally_db_sib._run_pending_migrations
 _CACHE_MIGRATIONS = _cctally_db_sib._CACHE_MIGRATIONS
+# Storm-free conversation_messages + FTS full-clear (#138). Owns the trigger
+# drop/recreate dance so the per-row delete trigger never fires O(rows) under
+# the held lock on a rebuild / truncation escalation.
+clear_conversation_messages = _cctally_db_sib.clear_conversation_messages
 
 
 # === BEGIN MOVED REGIONS ===
@@ -542,16 +594,19 @@ def sync_cache(
             # Plan 1: conversation_messages shares the cost path's lifecycle.
             # A rebuild re-derives the whole cache from on-disk JSONL, so the
             # message index is wiped here (inside the held lock) and the
-            # per-file second seek-and-walk repopulates it. The FTS delete
-            # trigger empties conversation_fts row-by-row in lockstep.
-            conn.execute("DELETE FROM conversation_messages")
+            # per-file fused walk repopulates it. clear_conversation_messages
+            # drops the FTS triggers, truncates, and clears the index via
+            # 'delete-all' so the per-row delete trigger never storms O(rows)
+            # under the lock (#138) — NOT a bare DELETE that fires conv_fts_ad
+            # per row.
+            clear_conversation_messages(conn)
             # Clear the walk-complete sentinel atomically with the wipe
             # (cctally-dev#93, D5/D2): a stale "complete" marker must never
             # survive a destructive rebuild. The end-of-loop write below
             # re-establishes it only after this rebuild's clean walk.
             conn.execute("DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'")
             # Issue #139: a rebuild walks every file from offset 0, so the
-            # per-file second seek-and-walk below repopulates the whole message
+            # per-file fused walk below repopulates the whole message
             # index — that satisfies any deferred existing-install backfill.
             # Drop the pending flag here so the post-rebuild sync does not also
             # run a redundant (idempotent but wasteful) offset-0 backfill pass.
@@ -693,10 +748,11 @@ def sync_cache(
             conn.execute("DELETE FROM session_entries")
             # Plan 1: truncation escalates to a full re-ingest of EVERY file,
             # so conversation_messages is wiped here (parallel to the
-            # session_entries full-reset) and the per-file second seek-and-walk
-            # repopulates it from offset 0. Mirrors the cost path's lifecycle;
-            # the FTS delete trigger empties conversation_fts in lockstep.
-            conn.execute("DELETE FROM conversation_messages")
+            # session_entries full-reset) and the per-file fused walk
+            # repopulates it from offset 0. Storm-free clear (#138): drop FTS
+            # triggers → truncate → 'delete-all' → recreate, so conv_fts_ad
+            # never fires O(rows) inside the held lock.
+            clear_conversation_messages(conn)
             # Clear the walk-complete sentinel atomically with the truncation
             # full-reset (cctally-dev#93, D5/D2): the cache is being wiped, so
             # any "complete" marker is now stale. The end-of-loop write below
@@ -772,54 +828,50 @@ def sync_cache(
             try:
                 with open(jp, "r", encoding="utf-8", errors="replace") as fh:
                     fh.seek(start_offset)
-                    for offset, entry, msg_id, req_id in _iter_jsonl_entries_with_offsets(fh, str(jp)):
-                        usage = entry.usage
-                        inp = int(usage.get("input_tokens", 0) or 0)
-                        out = int(usage.get("output_tokens", 0) or 0)
-                        cc = int(usage.get("cache_creation_input_tokens", 0) or 0)
-                        cr = int(usage.get("cache_read_input_tokens", 0) or 0)
-                        extras = {
-                            k: v for k, v in usage.items()
-                            if k not in (
-                                "input_tokens", "output_tokens",
-                                "cache_creation_input_tokens",
-                                "cache_read_input_tokens",
-                            )
-                        }
-                        rows.append((
-                            path_str,
-                            offset,
-                            entry.timestamp.astimezone(dt.timezone.utc).isoformat(),
-                            entry.model,
-                            msg_id,
-                            req_id,
-                            inp, out, cc, cr,
-                            json.dumps(extras, sort_keys=True) if extras else None,
-                            entry.cost_usd,
-                        ))
-                    # ``final_offset`` is the cost walk's stop. Capture it into a
-                    # local int BEFORE the conversation walk below re-seeks the
-                    # handle — the value is what session_files.last_byte_offset
-                    # is written from, so it must reflect the COST walk's
-                    # position, never the conversation walk's. (#Plan1 Task 4
-                    # cursor-consistency invariant.)
+                    # Fused single-pass walk (#138): cost rows AND conversation
+                    # message rows come from ONE parse of each line. An assistant
+                    # line yields both; a user line yields only a message row.
+                    # This replaces the former cost walk + re-seek conversation
+                    # walk over the identical span — the "identical span"
+                    # invariant is now structural (a single stop point) rather
+                    # than a prose-enforced ``>= final_offset`` runtime break.
+                    for offset, cost, mrow in _iter_sync_entries(fh, path_str):
+                        if cost is not None:
+                            entry, msg_id, req_id = cost
+                            usage = entry.usage
+                            inp = int(usage.get("input_tokens", 0) or 0)
+                            out = int(usage.get("output_tokens", 0) or 0)
+                            cc = int(usage.get("cache_creation_input_tokens", 0) or 0)
+                            cr = int(usage.get("cache_read_input_tokens", 0) or 0)
+                            extras = {
+                                k: v for k, v in usage.items()
+                                if k not in (
+                                    "input_tokens", "output_tokens",
+                                    "cache_creation_input_tokens",
+                                    "cache_read_input_tokens",
+                                )
+                            }
+                            rows.append((
+                                path_str,
+                                offset,
+                                entry.timestamp.astimezone(dt.timezone.utc).isoformat(),
+                                entry.model,
+                                msg_id,
+                                req_id,
+                                inp, out, cc, cr,
+                                json.dumps(extras, sort_keys=True) if extras else None,
+                                entry.cost_usd,
+                            ))
+                        if mrow is not None:
+                            conv_rows.append(_conv_row_tuple(mrow, path_str))
+                    # ``final_offset`` is the single walk's stop — captured AFTER
+                    # the loop drains (or rewinds a partial mid-write tail line).
+                    # It is what session_files.last_byte_offset is written from,
+                    # so it must reflect the cost cursor's position; with the
+                    # fused walk there is exactly one stop point shared by the
+                    # cost and conversation rows (#138 / #Plan1 Task 4
+                    # cursor-consistency invariant).
                     final_offset = fh.tell()
-                    # --- conversation message ingest (Plan 1) ----------------
-                    # Second seek-and-walk over the SAME
-                    # [start_offset, final_offset] byte region as the
-                    # reconcile-guarded cost walk above, BEFORE the per-file
-                    # cursor advances. Independent of the cost walk: it touches
-                    # only conversation_messages, never session_entries or the
-                    # cost-row build. We re-seek to start_offset and stop the
-                    # moment a message row's byte_offset reaches the cost walk's
-                    # final_offset, so the two walks always cover the identical
-                    # span and a partial mid-write tail line (rewound by the
-                    # parser) is left for the next sync.
-                    fh.seek(start_offset)
-                    for mrow in _iter_message_rows(fh, path_str):
-                        if mrow.byte_offset >= final_offset:
-                            break
-                        conv_rows.append(_conv_row_tuple(mrow, path_str))
             except OSError as exc:
                 eprint(f"[cache] could not read {jp}: {exc}")
                 walk_clean = False  # skipped a file without ingesting (D5a)

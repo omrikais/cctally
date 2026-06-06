@@ -201,6 +201,68 @@ def _parse_usage_entries(
     return no_key_entries
 
 
+def parse_cost_entry(obj, path_str: str):
+    """Pure per-line cost parser: given a parsed JSONL object, return
+    ``(UsageEntry, msg_id, req_id)`` when it is a billable assistant entry, or
+    ``None`` otherwise (non-assistant, missing/invalid usage, model, or
+    timestamp, or a ``<synthetic>`` placeholder). No I/O, no byte offset — the
+    caller owns the readline()+tell() loop.
+
+    Extracted (#138) so the streaming ``_iter_jsonl_entries_with_offsets`` reader
+    and the fused single-pass sync walker (``_cctally_cache._iter_sync_entries``)
+    share ONE gating implementation — each JSONL line is ``json.loads``-parsed
+    once and classified once, never re-parsed for a separate second walk.
+    """
+    if obj.get("type") != "assistant":
+        return None
+
+    ts_raw = obj.get("timestamp")
+    if not isinstance(ts_raw, str) or not ts_raw.strip():
+        return None
+
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        msg = obj
+
+    usage = msg.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    model = msg.get("model") or obj.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return None
+    model = model.strip()
+    if model == "<synthetic>":
+        # Matches ccusage's claude_loader.rs:454. Filtered here so the cache
+        # ingest path can't accidentally store these rows even if a downstream
+        # loop forgets to double-check (see `sync_cache` in _cctally_cache.py).
+        return None
+
+    try:
+        ts = dt.datetime.fromisoformat(ts_raw.strip().replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+
+    msg_id = msg.get("id")
+    req_id = obj.get("requestId")
+    cost_usd_raw = obj.get("costUSD")
+    cost_usd = float(cost_usd_raw) if cost_usd_raw is not None else None
+
+    return (
+        UsageEntry(
+            timestamp=ts,
+            model=model,
+            usage=usage,
+            cost_usd=cost_usd,
+            source_path=path_str,
+        ),
+        msg_id,
+        req_id,
+    )
+
+
 def _iter_jsonl_entries_with_offsets(fh, path_str: str):
     """Yield (byte_offset, UsageEntry, msg_id, req_id) for each assistant
     entry starting from fh's current position.
@@ -209,7 +271,9 @@ def _iter_jsonl_entries_with_offsets(fh, path_str: str):
     accurate for resume-from-offset after partial ingests. Malformed JSON
     and non-assistant lines are skipped, but the offset still advances past
     them so they are never re-read. Range filtering is intentionally NOT
-    done here — filters are applied at query time by iter_entries().
+    done here — filters are applied at query time by iter_entries(). The
+    per-line gating lives in ``parse_cost_entry`` (shared with the fused
+    single-pass sync walker, #138).
     """
     while True:
         offset = fh.tell()
@@ -230,56 +294,11 @@ def _iter_jsonl_entries_with_offsets(fh, path_str: str):
             obj = json.loads(stripped)
         except json.JSONDecodeError:
             continue
-        if obj.get("type") != "assistant":
+        parsed = parse_cost_entry(obj, path_str)
+        if parsed is None:
             continue
-
-        ts_raw = obj.get("timestamp")
-        if not isinstance(ts_raw, str) or not ts_raw.strip():
-            continue
-
-        msg = obj.get("message")
-        if not isinstance(msg, dict):
-            msg = obj
-
-        usage = msg.get("usage")
-        if not isinstance(usage, dict):
-            continue
-
-        model = msg.get("model") or obj.get("model")
-        if not isinstance(model, str) or not model.strip():
-            continue
-        model = model.strip()
-        if model == "<synthetic>":
-            # Matches ccusage's claude_loader.rs:454. Filtered at the
-            # iterator level so the cache ingest path can't accidentally
-            # store these rows even if a downstream loop forgets to
-            # double-check (see `sync_cache` in _cctally_cache.py).
-            continue
-
-        try:
-            ts = dt.datetime.fromisoformat(ts_raw.strip().replace("Z", "+00:00"))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=dt.timezone.utc)
-        except ValueError:
-            continue
-
-        msg_id = msg.get("id")
-        req_id = obj.get("requestId")
-        cost_usd_raw = obj.get("costUSD")
-        cost_usd = float(cost_usd_raw) if cost_usd_raw is not None else None
-
-        yield (
-            offset,
-            UsageEntry(
-                timestamp=ts,
-                model=model,
-                usage=usage,
-                cost_usd=cost_usd,
-                source_path=path_str,
-            ),
-            msg_id,
-            req_id,
-        )
+        entry, msg_id, req_id = parsed
+        yield (offset, entry, msg_id, req_id)
 
 
 _CODEX_FILENAME_UUID_RE = re.compile(

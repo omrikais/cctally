@@ -254,14 +254,16 @@ def test_truncation_simulated_crash_recovers_on_next_sync(isolated_cache, monkey
     ).fetchall())
     assert all(v > 0 for v in pre_offsets.values()), pre_offsets
 
-    # Truncate A. Now monkeypatch the per-file JSONL iterator to RAISE,
+    # Truncate A. Now monkeypatch the per-file fused sync walker to RAISE,
     # so the escalation commits (DELETE + UPDATE session_files) land but
     # the per-file ingest aborts before any session_files write commits
     # — simulating kill -9 right after the escalation commit, before any
-    # per-file `INSERT INTO session_files` runs.
+    # per-file `INSERT INTO session_files` runs. (#138 fused the cost +
+    # conversation walks into `_iter_sync_entries`, so it is the seam the
+    # per-file loop now consumes.)
     file_a.write_text("")
     cache_mod = sys.modules["_cctally_cache"]
-    real_iter = cache_mod._iter_jsonl_entries_with_offsets
+    real_iter = cache_mod._iter_sync_entries
 
     class _SimulatedCrash(Exception):
         pass
@@ -273,12 +275,12 @@ def test_truncation_simulated_crash_recovers_on_next_sync(isolated_cache, monkey
         yield  # pragma: no cover  (unreachable; makes this a generator)
 
     monkeypatch.setattr(
-        cache_mod, "_iter_jsonl_entries_with_offsets", crash_after_escalation
+        cache_mod, "_iter_sync_entries", crash_after_escalation
     )
     with pytest.raises(_SimulatedCrash):
         sync()
     monkeypatch.setattr(
-        cache_mod, "_iter_jsonl_entries_with_offsets", real_iter
+        cache_mod, "_iter_sync_entries", real_iter
     )
 
     # Post-"crash" state: session_entries empty, session_files offsets
@@ -347,13 +349,13 @@ def test_truncation_clears_then_rewrites_walk_complete_marker(isolated_cache, mo
     )
 
     # Truncate A (size shrinks) so the next sync's pre-scan detects it and
-    # runs the full-reset branch. Inject a raise in the per-file re-ingest
-    # iterator so the escalation commit (DELETE session_entries + DELETE
-    # marker + zero session_files) lands, but the end-of-loop marker rewrite
-    # never executes.
+    # runs the full-reset branch. Inject a raise in the per-file fused sync
+    # walker (#138's `_iter_sync_entries`) so the escalation commit (DELETE
+    # session_entries + DELETE marker + zero session_files) lands, but the
+    # end-of-loop marker rewrite never executes.
     file_a.write_text(_assistant_line("m1b", "r1b", out_tokens=150))
     cache_mod = sys.modules["_cctally_cache"]
-    real_iter = cache_mod._iter_jsonl_entries_with_offsets
+    real_iter = cache_mod._iter_sync_entries
 
     class _SimulatedCrash(Exception):
         pass
@@ -363,11 +365,11 @@ def test_truncation_clears_then_rewrites_walk_complete_marker(isolated_cache, mo
         yield  # pragma: no cover  (unreachable; makes this a generator)
 
     monkeypatch.setattr(
-        cache_mod, "_iter_jsonl_entries_with_offsets", crash_after_escalation
+        cache_mod, "_iter_sync_entries", crash_after_escalation
     )
     with pytest.raises(_SimulatedCrash):
         sync()
-    monkeypatch.setattr(cache_mod, "_iter_jsonl_entries_with_offsets", real_iter)
+    monkeypatch.setattr(cache_mod, "_iter_sync_entries", real_iter)
 
     # The escalation committed its DELETE FROM cache_meta; the end-of-loop
     # rewrite never ran. If the truncation branch did NOT clear the marker,

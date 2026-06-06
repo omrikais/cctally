@@ -2401,18 +2401,11 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS conversation_fts "
                 "USING fts5(text, content='conversation_messages', content_rowid='id')")
-            conn.execute(
-                "CREATE TRIGGER IF NOT EXISTS conv_fts_ai AFTER INSERT ON conversation_messages "
-                "BEGIN INSERT INTO conversation_fts(rowid, text) VALUES (new.id, new.text); END")
-            conn.execute(
-                "CREATE TRIGGER IF NOT EXISTS conv_fts_ad AFTER DELETE ON conversation_messages "
-                "BEGIN INSERT INTO conversation_fts(conversation_fts, rowid, text) "
-                "VALUES('delete', old.id, old.text); END")
-            conn.execute(
-                "CREATE TRIGGER IF NOT EXISTS conv_fts_au AFTER UPDATE OF text ON conversation_messages "
-                "BEGIN INSERT INTO conversation_fts(conversation_fts, rowid, text) "
-                "VALUES('delete', old.id, old.text); "
-                "INSERT INTO conversation_fts(rowid, text) VALUES (new.id, new.text); END")
+            # Trigger DDL lives in ONE place (_CONV_FTS_TRIGGER_DDL) so this
+            # initial create and the #138 storm-free full-clear
+            # (clear_conversation_messages, which drops + recreates the
+            # triggers) can never drift.
+            _create_conversation_fts_triggers(conn)
             if recovering:
                 # Repopulate the freshly-(re)created index from the base table
                 # so pre-recovery history is searchable. Cheap no-op when
@@ -2422,14 +2415,11 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             conn.execute("DELETE FROM cache_meta WHERE key='fts5_unavailable'")
         except sqlite3.OperationalError:
             # partial create cleanup, then mark unavailable
-            for stmt in ("DROP TRIGGER IF EXISTS conv_fts_au",
-                         "DROP TRIGGER IF EXISTS conv_fts_ad",
-                         "DROP TRIGGER IF EXISTS conv_fts_ai",
-                         "DROP TABLE IF EXISTS conversation_fts"):
-                try:
-                    conn.execute(stmt)
-                except sqlite3.OperationalError:
-                    pass
+            _drop_conversation_fts_triggers(conn)
+            try:
+                conn.execute("DROP TABLE IF EXISTS conversation_fts")
+            except sqlite3.OperationalError:
+                pass
             _set_cache_meta(conn, "fts5_unavailable", "1")
     else:
         # FTS5 is unavailable on THIS sqlite build. If a prior (FTS-capable)
@@ -2441,13 +2431,7 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         # writes succeed under the LIKE fallback. (The conversation_fts vtable
         # itself can't be DROPped without the fts5 module, but with no triggers
         # nothing writes to it.)
-        for stmt in ("DROP TRIGGER IF EXISTS conv_fts_au",
-                     "DROP TRIGGER IF EXISTS conv_fts_ad",
-                     "DROP TRIGGER IF EXISTS conv_fts_ai"):
-            try:
-                conn.execute(stmt)
-            except sqlite3.OperationalError:
-                pass
+        _drop_conversation_fts_triggers(conn)
         _set_cache_meta(conn, "fts5_unavailable", "1")
     # The FTS branch above issues DML (DELETE/INSERT on cache_meta) which opens
     # an implicit transaction under sqlite3's legacy autocommit mode. Close it
@@ -2473,6 +2457,93 @@ def _set_cache_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         "CREATE TABLE IF NOT EXISTS cache_meta (key TEXT PRIMARY KEY, value TEXT)")
     conn.execute("INSERT INTO cache_meta(key, value) VALUES(?, ?) "
                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+# Conversation FTS sync triggers (external-content FTS5). Defined ONCE here so
+# the initial create in _apply_cache_schema and the #138 storm-free full-clear
+# in clear_conversation_messages (which drops + recreates them) can never drift.
+# conv_fts_ad / conv_fts_au use the external-content `'delete'` idiom.
+_CONV_FTS_TRIGGER_DDL = (
+    "CREATE TRIGGER IF NOT EXISTS conv_fts_ai AFTER INSERT ON conversation_messages "
+    "BEGIN INSERT INTO conversation_fts(rowid, text) VALUES (new.id, new.text); END",
+    "CREATE TRIGGER IF NOT EXISTS conv_fts_ad AFTER DELETE ON conversation_messages "
+    "BEGIN INSERT INTO conversation_fts(conversation_fts, rowid, text) "
+    "VALUES('delete', old.id, old.text); END",
+    "CREATE TRIGGER IF NOT EXISTS conv_fts_au AFTER UPDATE OF text ON conversation_messages "
+    "BEGIN INSERT INTO conversation_fts(conversation_fts, rowid, text) "
+    "VALUES('delete', old.id, old.text); "
+    "INSERT INTO conversation_fts(rowid, text) VALUES (new.id, new.text); END",
+)
+# Drop by name (the body is irrelevant to DROP TRIGGER); reverse order is
+# cosmetic — order doesn't matter for independent triggers.
+_CONV_FTS_TRIGGER_NAMES = ("conv_fts_au", "conv_fts_ad", "conv_fts_ai")
+
+
+def _create_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Create the three external-content FTS5 sync triggers (idempotent —
+    each is ``IF NOT EXISTS``). Single source of truth for the trigger DDL,
+    shared by ``_apply_cache_schema`` and ``clear_conversation_messages``
+    (#138). The caller must have already created ``conversation_fts``."""
+    for stmt in _CONV_FTS_TRIGGER_DDL:
+        conn.execute(stmt)
+
+
+def _drop_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Drop the three FTS5 sync triggers (idempotent — ``IF EXISTS``). Swallows
+    ``OperationalError`` per statement so a partial/absent trigger set (e.g. an
+    FTS-unavailable build) is tolerated."""
+    for name in _CONV_FTS_TRIGGER_NAMES:
+        try:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        except sqlite3.OperationalError:
+            pass
+
+
+def clear_conversation_messages(conn: sqlite3.Connection) -> None:
+    """Full-clear ``conversation_messages`` + its FTS index WITHOUT firing the
+    per-row delete trigger O(rows) (#138).
+
+    A bulk ``DELETE FROM conversation_messages`` fires ``conv_fts_ad`` once per
+    row — each an FTS5 ``'delete'`` shadow-write — AND forfeits SQLite's
+    no-trigger truncate fast-path, stalling the held ``cache.db.lock`` far
+    longer than the ``session_entries`` clear alone. We suppress the triggers:
+
+        drop all 3 conv_fts triggers
+          → DELETE FROM conversation_messages   (true truncate fast-path now)
+          → INSERT INTO conversation_fts(conversation_fts) VALUES('delete-all')
+                                                (resets the external-content index)
+          → recreate all 3 triggers
+
+    Ordering is load-bearing: clearing the FTS index while the per-row delete
+    trigger is still live makes the base ``DELETE`` write ``'delete'`` postings
+    against already-gone rows and CORRUPTS the index (``database disk image is
+    malformed``; verified on SQLite 3.53.1). Dropping the triggers first makes
+    the base ``DELETE`` not touch the index at all; the explicit ``'delete-all'``
+    then resets it cleanly and ``integrity-check`` still passes.
+
+    Runs inside the caller's open transaction (the held ``cache.db.lock``); the
+    caller owns the commit. When FTS5 is unavailable
+    (``cache_meta.fts5_unavailable`` set → no triggers, no usable vtable),
+    falls back to a plain base ``DELETE`` — there are no triggers to storm and a
+    ``'delete-all'`` would error on the absent vtable."""
+    try:
+        fts_unavailable = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key='fts5_unavailable'"
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        # No cache_meta yet — only possible before the schema is applied, in
+        # which case there is no FTS vtable/triggers either. Bias to the plain
+        # DELETE: it can't storm what doesn't exist and won't touch a vtable.
+        fts_unavailable = True
+
+    if fts_unavailable:
+        conn.execute("DELETE FROM conversation_messages")
+        return
+
+    _drop_conversation_fts_triggers(conn)
+    conn.execute("DELETE FROM conversation_messages")
+    conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('delete-all')")
+    _create_conversation_fts_triggers(conn)
 
 
 def _eagerly_apply_cache_migrations() -> None:

@@ -59,12 +59,27 @@ def iter_message_rows(fh, path_str):
             obj = json.loads(s)
         except json.JSONDecodeError:
             continue
-        t = obj.get("type")
-        if t not in ("user", "assistant"):
-            continue
-        if not obj.get("uuid"):
-            continue
-        yield _normalize(obj, t, offset)
+        row = parse_message_row(obj, offset)
+        if row is not None:
+            yield row
+
+
+def parse_message_row(obj, offset):
+    """Pure per-line message parser: given a parsed JSONL object and its byte
+    offset, return a ``MessageRow`` when it is a user/assistant turn carrying a
+    ``uuid``, or ``None`` otherwise (summary / file-history-snapshot / uuid-less
+    lines). No I/O — the caller owns the readline()+tell() loop.
+
+    Extracted (#138) so ``iter_message_rows`` and the fused single-pass sync
+    walker (``_cctally_cache._iter_sync_entries``) share ONE classification —
+    each JSONL line is parsed once and the conversation index is no longer
+    populated by a separate second seek-and-walk over the same byte span."""
+    t = obj.get("type")
+    if t not in ("user", "assistant"):
+        return None
+    if not obj.get("uuid"):
+        return None
+    return _normalize(obj, t, offset)
 
 
 def _normalize(obj, t, offset):
