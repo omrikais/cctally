@@ -3846,9 +3846,16 @@ def _migration_budget_milestone_period_keys(conn: sqlite3.Connection) -> None:
         }
         return "period" in cols
 
-    # Compute needs-rebuild BEFORE any transaction (no deferred-BEGIN-then-read
-    # on stats.db — SQLITE_BUSY_SNAPSHOT, migrations-gotchas.md).
-    pending = [s for s in specs if not _has_period(s[0])]
+    def _table_exists(table: str) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone() is not None
+
+    # Compute needs-rebuild BEFORE any transaction (no deferred-BEGIN-then-read on
+    # stats.db — SQLITE_BUSY_SNAPSHOT, migrations-gotchas.md). A spec table that
+    # does not exist (e.g. codex_budget_milestones on a DB predating that feature,
+    # now that v012 no longer live-creates it — #143) needs no period column.
+    pending = [s for s in specs if _table_exists(s[0]) and not _has_period(s[0])]
 
     if not pending:
         # Fresh install (live CREATE already made the new shape) or prior run.
@@ -3865,6 +3872,83 @@ def _migration_budget_milestone_period_keys(conn: sqlite3.Connection) -> None:
                 f"INSERT INTO {table} ({cols}) SELECT {cols} FROM {old}"
             )
             conn.execute(f"DROP TABLE {old}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+@stats_migration("012_unify_budget_milestones_vendor")
+def _migration_unify_budget_milestones_vendor(conn: sqlite3.Connection) -> None:
+    """Merge ``codex_budget_milestones`` into a vendor-tagged ``budget_milestones``
+    (issue #143).
+
+    ``budget_milestones`` (Claude, keyed ``week_start_at``) and
+    ``codex_budget_milestones`` (Codex, keyed ``period_start_at``) are
+    structurally identical modulo vendor + key-column name. This migration
+    rebuilds ``budget_milestones`` with a ``vendor`` column and the renamed
+    ``period_start_at`` key, copies Claude rows (``week_start_at``->``period_start_at``,
+    ``vendor='claude'``) and Codex rows (``vendor='codex'``), and drops the Codex
+    table. History + ``alerted_at`` + ``period`` are preserved verbatim; the
+    write-once ``period`` NULL sentinel is carried as-is. ``id`` is NOT copied
+    (AUTOINCREMENT reassigns — the envelope/dispatch ids are composite strings,
+    never the row PK).
+
+    State machine (idempotent / partial-state safe): the Claude rebuild and the
+    Codex absorb are independently guarded, so a retry after a crash-before-stamp
+    (table already unified, Codex maybe gone) is a clean no-op or a Codex-only
+    absorb. Reads happen BEFORE BEGIN IMMEDIATE (SQLITE_BUSY_SNAPSHOT).
+    """
+    def _cols(table: str) -> set:
+        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _table_exists(table: str) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone() is not None
+
+    claude_needs_rebuild = "vendor" not in _cols("budget_milestones")
+    codex_present = _table_exists("codex_budget_milestones")
+    if not claude_needs_rebuild and not codex_present:
+        return  # already unified, no Codex leftover -> dispatcher fast-stamps
+
+    new_table = """
+        CREATE TABLE budget_milestones (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            vendor          TEXT    NOT NULL,
+            period_start_at TEXT    NOT NULL,
+            period          TEXT,
+            threshold       INTEGER NOT NULL,
+            budget_usd      REAL    NOT NULL,
+            spent_usd       REAL    NOT NULL,
+            consumption_pct REAL    NOT NULL,
+            crossed_at_utc  TEXT    NOT NULL,
+            alerted_at      TEXT,
+            UNIQUE(vendor, period_start_at, period, threshold)
+        )
+    """
+    cols = ("vendor, period_start_at, period, threshold, budget_usd, spent_usd, "
+            "consumption_pct, crossed_at_utc, alerted_at")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if claude_needs_rebuild:
+            conn.execute("ALTER TABLE budget_milestones RENAME TO budget_milestones_old_012")
+            conn.execute(new_table)
+            conn.execute(
+                f"INSERT INTO budget_milestones ({cols}) "
+                "SELECT 'claude', week_start_at, period, threshold, budget_usd, "
+                "spent_usd, consumption_pct, crossed_at_utc, alerted_at "
+                "FROM budget_milestones_old_012"
+            )
+            conn.execute("DROP TABLE budget_milestones_old_012")
+        if codex_present:
+            conn.execute(
+                f"INSERT INTO budget_milestones ({cols}) "
+                "SELECT 'codex', period_start_at, period, threshold, budget_usd, "
+                "spent_usd, consumption_pct, crossed_at_utc, alerted_at "
+                "FROM codex_budget_milestones"
+            )
+            conn.execute("DROP TABLE codex_budget_milestones")
         conn.commit()
     except Exception:
         conn.rollback()

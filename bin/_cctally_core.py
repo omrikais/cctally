@@ -1271,25 +1271,28 @@ def open_db() -> sqlite3.Connection:
     # (set-then-dispatch invariant); NULL = "recorded without dispatch" (the
     # forward-only-from-set reconcile path) OR "not yet dispatched", never
     # "delivery failed".
-    # Schema owned by migration 011_budget_milestone_period_keys (the `period`
-    # column + the period-inclusive UNIQUE; see _cctally_db.py). The live CREATE
-    # below makes the new shape on fresh installs (dispatcher fast-stamps 011);
-    # pre-011 DBs trip the migration's rename-recreate-copy. `period` is the
-    # configured period noun at crossing ('calendar-week'|'calendar-month'|
-    # 'subscription-week'); NULL = pre-011 unknown.
+    # Unified vendor-tagged table (#143): one row per (vendor, period_start_at,
+    # period, threshold). `vendor` ∈ 'claude'|'codex'. `period_start_at` is the
+    # resolved period-window start instant (subscription-week OR calendar
+    # period-start). `period` is the configured period at crossing; NULL = pre-012
+    # unknown. Owned by migration 012_unify_budget_milestones_vendor (merge of the
+    # former budget_milestones + codex_budget_milestones). The Codex table is NO
+    # LONGER live-created here — migration 012 drops it and this CREATE must not
+    # resurrect it; migration 011 is hardened to skip it when absent (#143).
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS budget_milestones (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            week_start_at   TEXT    NOT NULL,
-            period          TEXT,                 -- configured period at crossing; NULL = pre-011 unknown (migration 011)
+            vendor          TEXT    NOT NULL,
+            period_start_at TEXT    NOT NULL,
+            period          TEXT,
             threshold       INTEGER NOT NULL,
             budget_usd      REAL    NOT NULL,
             spent_usd       REAL    NOT NULL,
             consumption_pct REAL    NOT NULL,
             crossed_at_utc  TEXT    NOT NULL,
             alerted_at      TEXT,
-            UNIQUE(week_start_at, period, threshold)
+            UNIQUE(vendor, period_start_at, period, threshold)
         )
         """
     )
@@ -1358,46 +1361,6 @@ def open_db() -> sqlite3.Connection:
             crossed_at_utc  TEXT    NOT NULL,
             alerted_at      TEXT,
             UNIQUE(week_start_at, project_key, threshold)
-        )
-        """
-    )
-
-    # ── codex_budget_milestones (per-vendor Codex budget crossings) ──────────
-    # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / backfill — the
-    # same posture as `budget_milestones` / `projected_milestones` /
-    # `project_budget_milestones` (write-once, forward-only, framework-untracked;
-    # calendar-period-codex-budgets feature, spec §6). The dedup key is keyed on
-    # `period_start_at` — the resolved period-window START instant stored as the
-    # `isoformat(timespec="seconds")` `+00:00` offset form (NOT a `Z` suffix),
-    # e.g. calendar-month June → `2026-06-01T00:00:00+00:00` — NOT a subscription
-    # week:
-    # Codex has no Anthropic week, so the budget runs over a calendar period
-    # (calendar-week / calendar-month). Rolling to the next period yields a fresh
-    # `period_start_at` → fresh crossings under UNIQUE(period_start_at, period,
-    # threshold) (the budget-pattern reset handling — hence NO `reset_event_id`
-    # segment column). `budget_usd` snapshots the Codex target AT crossing so the
-    # dashboard renders "$210 of $200" from the ROW, not from live config that
-    # may have changed since (the Codex P0-4 lesson, baked into the sibling
-    # tables). `alerted_at` is stamped BEFORE the osascript Popen (set-then-
-    # dispatch invariant); NULL = "recorded without dispatch" (the forward-only-
-    # from-set reconcile path) OR "not yet dispatched", never "delivery failed".
-    # Schema owned by migration 011_budget_milestone_period_keys (the `period`
-    # column + the period-inclusive UNIQUE; see _cctally_db.py). `period` is the
-    # configured Codex period noun at crossing ('calendar-week'|'calendar-
-    # month'); NULL = pre-011 unknown.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS codex_budget_milestones (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            period_start_at TEXT    NOT NULL,   -- resolved period-window start instant (+00:00 offset form, NOT Z)
-            period          TEXT,               -- configured period at crossing; NULL = pre-011 unknown (migration 011)
-            threshold       INTEGER NOT NULL,
-            budget_usd      REAL    NOT NULL,   -- Codex target snapshotted AT crossing
-            spent_usd       REAL    NOT NULL,
-            consumption_pct REAL    NOT NULL,
-            crossed_at_utc  TEXT    NOT NULL,
-            alerted_at      TEXT,
-            UNIQUE(period_start_at, period, threshold)
         )
         """
     )
