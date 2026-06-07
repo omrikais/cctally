@@ -83,4 +83,55 @@ describe('useConversation', () => {
     // exhausted the cursor. The cap-bounded loop cannot fetch 20 times.
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(2);
   });
+
+  it('drops a stale cross-session page that resolves after the session changed', async () => {
+    // REGRESSION (cross-session clobber guard, useConversation.ts ~L76):
+    //   if (sessionRef.current !== sid) return false;
+    // Scenario: s1 page-1 loads (has a cursor). A loadMore() kicks off s1's
+    // page-2 fetch but we hold its resolver. We then switch the hook to s2,
+    // let s2's page-1 resolve, and ONLY THEN resolve s1's slow page-2. The
+    // late s1 page must NOT be appended onto s2's detail — the guard drops it.
+    //
+    // We drive fetch with per-URL deferred resolvers so the s1 page-2 promise
+    // stays pending across the session swap, deterministically.
+    const deferred: Record<string, { resolve: (body: unknown) => void }> = {};
+    const sN1 = { ...it1, anchor: { ...it1.anchor, session_id: 's2' }, member_uuids: ['s2-u1'] };
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation((url: string) => {
+      // Page-1 loads (no `after=`) resolve immediately; the s1 page-2 load
+      // (`after=`) is deferred so we control exactly when it lands.
+      if (url.includes('/api/conversation/s1') && !url.includes('after=')) {
+        return Promise.resolve({ ok: true, status: 200, json: async () => detail([it1], 2) } as Response);
+      }
+      if (url.includes('/api/conversation/s2')) {
+        return Promise.resolve({ ok: true, status: 200, json: async () => detail([sN1], null) } as Response);
+      }
+      // s1 page-2 (the slow one) — return a promise we resolve by hand.
+      return new Promise((resolve) => {
+        deferred[url] = { resolve: (body: unknown) => resolve({ ok: true, status: 200, json: async () => body } as Response) };
+      });
+    });
+
+    const { result, rerender } = renderHook(({ sid }) => useConversation(sid), { initialProps: { sid: 's1' } });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1));
+    expect(result.current.detail?.items[0].anchor.session_id).toBe('s');
+
+    // Kick off s1's page-2 (deferred — promise registered, not yet resolved).
+    let morePromise!: Promise<void>;
+    act(() => { morePromise = result.current.loadMore(); });
+    await waitFor(() => expect(Object.keys(deferred).some((u) => u.includes('after='))).toBe(true));
+
+    // Switch session to s2 while s1 page-2 is still in flight; let s2 page-1 land.
+    rerender({ sid: 's2' });
+    await waitFor(() => expect(result.current.detail?.items[0]?.anchor.session_id).toBe('s2'));
+    expect(result.current.detail?.items).toHaveLength(1);
+
+    // NOW resolve the stale s1 page-2. Without the guard this would append
+    // s1's items onto s2's detail; with it, the page is dropped.
+    const staleUrl = Object.keys(deferred).find((u) => u.includes('after='))!;
+    await act(async () => { deferred[staleUrl].resolve(detail([it2], null)); await morePromise; });
+
+    // s2's detail is untouched: still exactly s2's page-1, no s1 items appended.
+    expect(result.current.detail?.items).toHaveLength(1);
+    expect(result.current.detail?.items.map((i) => i.anchor.session_id)).toEqual(['s2']);
+  });
 });
