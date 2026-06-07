@@ -441,3 +441,70 @@ def test_search_snippet_generation_bounded_to_page_fts(monkeypatch):
     assert out["mode"] == "fts"
     assert len(out["hits"]) == 3 and out["total"] == 8
     assert len(seen["ids"]) == 3     # snippet batch covers only the page
+
+
+# ---------------------------------------------------------------------------
+# #155: subagent_key derivation + reader passthrough
+# ---------------------------------------------------------------------------
+def test_subagent_key_derivation():
+    assert cq._subagent_key("/p/agent-a34de77e.jsonl") == "a34de77e"
+    assert cq._subagent_key("/p/agent-acompact-a572884f.jsonl") == "acompact-a572884f"
+    assert cq._subagent_key("/p/16b00b55-2e61.jsonl") is None      # main session file
+    assert cq._subagent_key("") is None
+    assert cq._subagent_key(None) is None
+
+
+def test_get_conversation_exposes_subagent_key_and_parent_uuid_no_source_path():
+    c = _conn()
+    # main human (main file -> subagent_key None), then a sidechain human from an
+    # agent file (subagent_key derived), parented to the main item (cross-file).
+    _msg(c, session_id="s1", uuid="h1", parent_uuid=None,
+         source_path="/p/s1.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="main")
+    _msg(c, session_id="s1", uuid="g1", parent_uuid="h1",
+         source_path="/p/agent-aaaa1111.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="human",
+         text="subagent task", is_sidechain=1)
+    out = cq.get_conversation(c, "s1", after=None, limit=500)
+    items = out["items"]
+    by = {it["anchor"]["uuid"]: it for it in items}
+    # main item: subagent_key None, parent_uuid None
+    assert by["h1"]["subagent_key"] is None
+    assert by["h1"]["parent_uuid"] is None
+    # sidechain item: derived key + raw parent_uuid passthrough
+    assert by["g1"]["subagent_key"] == "aaaa1111"
+    assert by["g1"]["parent_uuid"] == "h1"
+    # NEGATIVE privacy guarantee: no raw source_path leaks on ANY item
+    for it in items:
+        assert "source_path" not in it
+        assert "subagent_key" in it and "parent_uuid" in it
+
+
+def test_get_conversation_turn_parent_uuid_is_seed_sourced_not_prose_anchor():
+    # Codex P1: a multi-fragment sidechain assistant turn whose SEED fragment
+    # parents to a MAIN uuid (the real entry point) and whose prose fragment
+    # parents intra-turn. The emitted turn item must carry the SEED parent_uuid,
+    # so cross-file nesting keys on the entry point — NOT the intra-turn link.
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", parent_uuid=None,
+         source_path="/p/s1.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="main")
+    # seed fragment (thinking-only): parent = main h1 (cross-file entry point)
+    _msg(c, session_id="s1", uuid="g1a", parent_uuid="h1",
+         source_path="/p/agent-bbbb2222.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant", text="",
+         blocks_json=_json.dumps([{"kind": "thinking", "text": "..."}]),
+         model=_MODEL, msg_id="mb", req_id="rb", is_sidechain=1)
+    # prose fragment: parent = g1a (intra-turn)
+    _msg(c, session_id="s1", uuid="g1b", parent_uuid="g1a",
+         source_path="/p/agent-bbbb2222.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:02Z", entry_type="assistant",
+         text="subagent answer",
+         blocks_json=_json.dumps([{"kind": "text", "text": "subagent answer"}]),
+         model=_MODEL, msg_id="mb", req_id="rb", is_sidechain=1)
+    out = cq.get_conversation(c, "s1", after=None, limit=500)
+    turn = next(it for it in out["items"] if it["kind"] == "assistant")
+    assert set(turn["member_uuids"]) == {"g1a", "g1b"}      # coalesced turn
+    assert turn["anchor"]["uuid"] == "g1b"                   # prose-bearing anchor
+    assert turn["subagent_key"] == "bbbb2222"
+    assert turn["parent_uuid"] == "h1"                       # SEED parent, not "g1a"
