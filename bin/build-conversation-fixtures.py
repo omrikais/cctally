@@ -23,6 +23,11 @@ load-bearing kernel invariants:
     dedup + cost-once join + search dedup all collapse it to one.
   * Session ``s2`` — human-only, so the rail has >=2 sessions and pagination
     is testable.
+  * Session ``s3`` — sidechain grouping (#155): a main turn + two PARALLEL
+    subagents whose rows interleave by timestamp (distinct ``agent-*.jsonl``
+    files -> distinct ``subagent_key``) + a multi-fragment sidechain turn whose
+    seed fragment parents to the main turn (cross-file nesting) while its prose
+    fragment parents intra-turn.
 
 No ``seed_conversation_message`` helper exists in ``_fixture_builders`` — the
 ``conversation_messages`` rows are INSERTed directly here. The cache.db is
@@ -142,6 +147,11 @@ def build(scenario: str) -> None:
     s2_file = "/fake/projects/other/s2.jsonl"
     s1_cwd = "/home/u/proj"
     s2_cwd = "/home/u/other"
+    s3_main = "/fake/projects/proj/s3.jsonl"
+    s3_agent_a = "/fake/projects/proj/agent-aaaa1111.jsonl"
+    s3_agent_b = "/fake/projects/proj/agent-bbbb2222.jsonl"
+    s3_agent_c = "/fake/projects/proj/agent-cccc3333.jsonl"
+    s3_cwd = "/home/u/proj"
 
     cache_conn = sqlite3.connect(cache_path)
     stats_conn = sqlite3.connect(stats_path)
@@ -153,6 +163,14 @@ def build(scenario: str) -> None:
                           project_path=s1_cwd)
         seed_session_file(cache_conn, path=s2_file, session_id="s2",
                           project_path=s2_cwd)
+        seed_session_file(cache_conn, path=s3_main, session_id="s3",
+                          project_path=s3_cwd)
+        seed_session_file(cache_conn, path=s3_agent_a, session_id="s3",
+                          project_path=s3_cwd)
+        seed_session_file(cache_conn, path=s3_agent_b, session_id="s3",
+                          project_path=s3_cwd)
+        seed_session_file(cache_conn, path=s3_agent_c, session_id="s3",
+                          project_path=s3_cwd)
 
         # --- session s1: human prompt + multi-fragment assistant turn --------
         # id=1: human prompt.
@@ -235,6 +253,93 @@ def build(scenario: str) -> None:
             entry_type="human", text="how do I set a weekly budget",
             cwd=s2_cwd, git_branch="dev",
         )
+
+        # --- session s3: sidechain grouping (#155) ---------------------------
+        # Main turn that "spawns" the subagents (cross-file nesting target).
+        _insert_message(
+            cache_conn,
+            session_id="s3", uuid="s3h1", parent_uuid=None,
+            source_path=s3_main, byte_offset=0,
+            timestamp_utc="2026-06-03T00:00:00Z",
+            entry_type="human", text="run the audits",
+            cwd=s3_cwd, git_branch="main",
+        )
+        _insert_message(
+            cache_conn,
+            session_id="s3", uuid="s3a1", parent_uuid="s3h1",
+            source_path=s3_main, byte_offset=1,
+            timestamp_utc="2026-06-03T00:00:01Z",
+            entry_type="assistant", text="spawning two audits in parallel",
+            blocks_json='[{"kind": "text", "text": "spawning two audits in parallel"}]',
+            model=MODEL, msg_id="m3", req_id="r3",
+            cwd=s3_cwd, git_branch="main",
+        )
+        # Two PARALLEL subagents whose rows INTERLEAVE by timestamp (A,B,A,B).
+        # Old contiguous-run grouping would fuse them into ONE group; the new
+        # subagent_key grouping must split them into TWO. Both roots have a null
+        # parent (matches real data: 61/64 subagent roots are null) -> document
+        # order, NOT nested.
+        _insert_message(
+            cache_conn, session_id="s3", uuid="a1", parent_uuid=None,
+            source_path=s3_agent_a, byte_offset=0,
+            timestamp_utc="2026-06-03T00:00:02Z",
+            entry_type="human", text="Audit module A", is_sidechain=1,
+        )
+        _insert_message(
+            cache_conn, session_id="s3", uuid="b1", parent_uuid=None,
+            source_path=s3_agent_b, byte_offset=0,
+            timestamp_utc="2026-06-03T00:00:03Z",
+            entry_type="human", text="Audit module B", is_sidechain=1,
+        )
+        _insert_message(
+            cache_conn, session_id="s3", uuid="a2", parent_uuid="a1",
+            source_path=s3_agent_a, byte_offset=1,
+            timestamp_utc="2026-06-03T00:00:04Z",
+            entry_type="assistant", text="module A clean",
+            blocks_json='[{"kind": "text", "text": "module A clean"}]',
+            model=MODEL, msg_id="ma", req_id="ra", is_sidechain=1,
+        )
+        _insert_message(
+            cache_conn, session_id="s3", uuid="b2", parent_uuid="b1",
+            source_path=s3_agent_b, byte_offset=1,
+            timestamp_utc="2026-06-03T00:00:05Z",
+            entry_type="assistant", text="module B clean",
+            blocks_json='[{"kind": "text", "text": "module B clean"}]',
+            model=MODEL, msg_id="mb", req_id="rb", is_sidechain=1,
+        )
+        # Subagent C: a MULTI-FRAGMENT sidechain turn whose SEED fragment parents
+        # to the MAIN turn s3a1 (cross-file entry point) and whose prose fragment
+        # parents intra-turn (c1 -> c2). The reader turn item must carry the SEED
+        # parent (s3a1), so the frontend can nest this group under the main turn.
+        _insert_message(
+            cache_conn, session_id="s3", uuid="c1", parent_uuid="s3a1",
+            source_path=s3_agent_c, byte_offset=0,
+            timestamp_utc="2026-06-03T00:00:06Z",
+            entry_type="assistant", text="",
+            blocks_json='[{"kind": "thinking", "text": "planning"}]',
+            model=MODEL, msg_id="mc", req_id="rc", is_sidechain=1,
+        )
+        _insert_message(
+            cache_conn, session_id="s3", uuid="c2", parent_uuid="c1",
+            source_path=s3_agent_c, byte_offset=1,
+            timestamp_utc="2026-06-03T00:00:07Z",
+            entry_type="assistant", text="module C needs a follow-up",
+            blocks_json='[{"kind": "text", "text": "module C needs a follow-up"}]',
+            model=MODEL, msg_id="mc", req_id="rc", is_sidechain=1,
+        )
+        # session_entries so the parallel + nested turns have non-zero cost.
+        seed_session_entry(cache_conn, source_path=s3_main, line_offset=1,
+                           timestamp_utc="2026-06-03T00:00:01Z", model=MODEL,
+                           msg_id="m3", req_id="r3", input_tokens=500, output_tokens=200)
+        seed_session_entry(cache_conn, source_path=s3_agent_a, line_offset=1,
+                           timestamp_utc="2026-06-03T00:00:04Z", model=MODEL,
+                           msg_id="ma", req_id="ra", input_tokens=400, output_tokens=100)
+        seed_session_entry(cache_conn, source_path=s3_agent_b, line_offset=1,
+                           timestamp_utc="2026-06-03T00:00:05Z", model=MODEL,
+                           msg_id="mb", req_id="rb", input_tokens=400, output_tokens=100)
+        seed_session_entry(cache_conn, source_path=s3_agent_c, line_offset=1,
+                           timestamp_utc="2026-06-03T00:00:07Z", model=MODEL,
+                           msg_id="mc", req_id="rc", input_tokens=300, output_tokens=150)
 
         # Empty stats.db stamped fully-migrated (dashboard-fixtures posture):
         # the dashboard server opens it at boot even though the conversation

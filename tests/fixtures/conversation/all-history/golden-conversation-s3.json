@@ -1,0 +1,169 @@
+{
+  "cost_usd": 0.02175,
+  "git_branch": "main",
+  "items": [
+    {
+      "anchor": {
+        "id": 6,
+        "session_id": "s3",
+        "uuid": "s3h1"
+      },
+      "blocks": [],
+      "is_sidechain": false,
+      "kind": "human",
+      "member_uuids": [
+        "s3h1"
+      ],
+      "parent_uuid": null,
+      "subagent_key": null,
+      "text": "run the audits",
+      "ts": "2026-06-03T00:00:00Z"
+    },
+    {
+      "anchor": {
+        "id": 7,
+        "session_id": "s3",
+        "uuid": "s3a1"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "spawning two audits in parallel"
+        }
+      ],
+      "cost_usd": 0.0075,
+      "is_sidechain": false,
+      "kind": "assistant",
+      "member_uuids": [
+        "s3a1"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s3h1",
+      "subagent_key": null,
+      "text": "spawning two audits in parallel",
+      "ts": "2026-06-03T00:00:01Z"
+    },
+    {
+      "anchor": {
+        "id": 8,
+        "session_id": "s3",
+        "uuid": "a1"
+      },
+      "blocks": [],
+      "is_sidechain": true,
+      "kind": "human",
+      "member_uuids": [
+        "a1"
+      ],
+      "parent_uuid": null,
+      "subagent_key": "aaaa1111",
+      "text": "Audit module A",
+      "ts": "2026-06-03T00:00:02Z"
+    },
+    {
+      "anchor": {
+        "id": 9,
+        "session_id": "s3",
+        "uuid": "b1"
+      },
+      "blocks": [],
+      "is_sidechain": true,
+      "kind": "human",
+      "member_uuids": [
+        "b1"
+      ],
+      "parent_uuid": null,
+      "subagent_key": "bbbb2222",
+      "text": "Audit module B",
+      "ts": "2026-06-03T00:00:03Z"
+    },
+    {
+      "anchor": {
+        "id": 10,
+        "session_id": "s3",
+        "uuid": "a2"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "module A clean"
+        }
+      ],
+      "cost_usd": 0.0045,
+      "is_sidechain": true,
+      "kind": "assistant",
+      "member_uuids": [
+        "a2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "a1",
+      "subagent_key": "aaaa1111",
+      "text": "module A clean",
+      "ts": "2026-06-03T00:00:04Z"
+    },
+    {
+      "anchor": {
+        "id": 11,
+        "session_id": "s3",
+        "uuid": "b2"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "module B clean"
+        }
+      ],
+      "cost_usd": 0.0045,
+      "is_sidechain": true,
+      "kind": "assistant",
+      "member_uuids": [
+        "b2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "b1",
+      "subagent_key": "bbbb2222",
+      "text": "module B clean",
+      "ts": "2026-06-03T00:00:05Z"
+    },
+    {
+      "anchor": {
+        "id": 13,
+        "session_id": "s3",
+        "uuid": "c2"
+      },
+      "blocks": [
+        {
+          "kind": "thinking",
+          "text": "planning"
+        },
+        {
+          "kind": "text",
+          "text": "module C needs a follow-up"
+        }
+      ],
+      "cost_usd": 0.00525,
+      "is_sidechain": true,
+      "kind": "assistant",
+      "member_uuids": [
+        "c1",
+        "c2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s3a1",
+      "subagent_key": "cccc3333",
+      "text": "module C needs a follow-up",
+      "ts": "2026-06-03T00:00:06Z"
+    }
+  ],
+  "last_activity_utc": "2026-06-03T00:00:07Z",
+  "models": [
+    "claude-opus-4-8"
+  ],
+  "page": {
+    "has_more": false,
+    "next_after": null
+  },
+  "project_label": "proj",
+  "session_id": "s3",
+  "started_utc": "2026-06-03T00:00:00Z"
+}

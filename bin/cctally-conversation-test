@@ -266,6 +266,48 @@ print("ok")
         fail "reader dedup/cost-once: $reader_check (raw: $reader_raw)"
     fi
 
+    # --- 2b) Reader: sidechain payload (#155) ----------------------------
+    fetch_and_diff "GET /api/conversation/s3" "golden-conversation-s3.json" \
+        "$base/api/conversation/s3" "${LOOP[@]}"
+
+    local sc_raw sc_check
+    sc_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s3")
+    sc_check=$(printf '%s' "$sc_raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+errs = []
+items = d.get("items") or []
+by = {it["anchor"]["uuid"]: it for it in items}
+# NEGATIVE privacy guarantee: no raw source_path on ANY item; both new fields present.
+for it in items:
+    if "source_path" in it:
+        errs.append("source_path leaked on item %r" % (it["anchor"].get("uuid"),))
+    if "subagent_key" not in it or "parent_uuid" not in it:
+        errs.append("missing subagent_key/parent_uuid on %r" % (it["anchor"].get("uuid"),))
+# main items -> subagent_key None; agent items -> derived hash.
+if by.get("s3h1", {}).get("subagent_key") is not None:
+    errs.append("main item s3h1 subagent_key != None: %r" % (by.get("s3h1", {}).get("subagent_key"),))
+if by.get("a1", {}).get("subagent_key") != "aaaa1111":
+    errs.append("a1 subagent_key != aaaa1111: %r" % (by.get("a1", {}).get("subagent_key"),))
+if by.get("b1", {}).get("subagent_key") != "bbbb2222":
+    errs.append("b1 subagent_key != bbbb2222: %r" % (by.get("b1", {}).get("subagent_key"),))
+# the multi-fragment subagent-C turn (anchor c2) carries the SEED parent (s3a1),
+# NOT the intra-turn prose parent (c1).
+cturn = by.get("c2") or {}
+if cturn.get("subagent_key") != "cccc3333":
+    errs.append("c-turn subagent_key != cccc3333: %r" % (cturn.get("subagent_key"),))
+if cturn.get("parent_uuid") != "s3a1":
+    errs.append("c-turn parent_uuid != s3a1 (seed): %r" % (cturn.get("parent_uuid"),))
+if set(cturn.get("member_uuids") or []) != {"c1", "c2"}:
+    errs.append("c-turn member_uuids != {c1,c2}: %r" % (cturn.get("member_uuids"),))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+    if [ "$sc_check" != "ok" ]; then
+        fail "reader sidechain payload (#155): $sc_check (raw: $sc_raw)"
+    fi
+
     # --- 3) Search: deduped across replay to ONE hit ---------------------
     # Byte-exact golden only when FTS5 is present (the golden is FTS-shaped);
     # the structural asserts below run unconditionally.

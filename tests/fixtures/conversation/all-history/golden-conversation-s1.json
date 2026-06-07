@@ -14,6 +14,8 @@
       "member_uuids": [
         "h1"
       ],
+      "parent_uuid": null,
+      "subagent_key": null,
       "text": "how does the reset work",
       "ts": "2026-06-01T00:00:00Z"
     },
@@ -41,6 +43,8 @@
         "a1b"
       ],
       "model": "claude-opus-4-8",
+      "parent_uuid": "h1",
+      "subagent_key": null,
       "text": "the token limit window resets every five hours",
       "ts": "2026-06-01T00:00:04Z"
     }
