@@ -671,6 +671,23 @@ export type Action =
   | { type: 'OPEN_DOCTOR_MODAL' }
   | { type: 'CLOSE_DOCTOR_MODAL' };
 
+// Transient-modal slots dismissed whenever the top-level workspace switches
+// (#158), so no panel modal floats over the destination body. Covers the panel
+// modal + its selection fields (mirroring CLOSE_MODAL) and both share v2 slots.
+// Both view-entry paths spread this in: SET_VIEW (ViewSwitcher) and
+// OPEN_CONVERSATION (the row/rail "open conversation" affordance, which sets
+// view='conversations' directly, bypassing SET_VIEW). The keymap's modal/overlay
+// Esc staying view-agnostic (#156) is the belt; clearing here is the suspenders.
+const DISMISSED_ON_VIEW_SWITCH = {
+  openModal: null,
+  openSessionId: null,
+  openBlockStartAt: null,
+  openDailyDate: null,
+  openProjectKey: null,
+  shareModal: null,
+  composerModal: null,
+} satisfies Partial<UIState>;
+
 export function dispatch(action: Action): void {
   switch (action.type) {
     case 'OPEN_MODAL':
@@ -696,19 +713,25 @@ export function dispatch(action: Action): void {
     case 'SET_VIEW':
       // Leaving the view clears the active selection AND the rail search so
       // re-entry starts clean; entering preserves any selection set by
-      // OPEN_CONVERSATION.
+      // OPEN_CONVERSATION. Switching the workspace also dismisses any transient
+      // modal (#158) — see DISMISSED_ON_VIEW_SWITCH.
       state = {
         ...state,
         view: action.view,
+        ...DISMISSED_ON_VIEW_SWITCH,
         ...(action.view === 'dashboard'
           ? { selectedConversationId: null, conversationJump: null, conversationSearch: '' }
           : {}),
       };
       break;
     case 'OPEN_CONVERSATION':
+      // A direct workspace switch into the conversations view (bypasses
+      // SET_VIEW), so it dismisses transient modals the same way (#158) before
+      // applying the selection it carries.
       state = {
         ...state,
         view: 'conversations',
+        ...DISMISSED_ON_VIEW_SWITCH,
         selectedConversationId: action.sessionId,
         conversationJump: action.jump ?? null,
       };

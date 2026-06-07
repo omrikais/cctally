@@ -26,9 +26,11 @@ const SCOPE_ORDER: Record<KeymapScope, number> = { overlay: 0, modal: 1, session
 // dashboard-bound unless a binding opts out — a forgotten `view` therefore
 // confines a binding to the dashboard and can never leak into the
 // conversations view. Layering scopes (overlay, modal) default to 'any': an
-// open modal/overlay owns its keys regardless of the view beneath it, so a
-// panel modal left mounted over the conversations body (SET_VIEW does not
-// clear openModal) stays closable. See docs/dashboard-gotchas.md.
+// open modal/overlay owns its keys regardless of the view beneath it. #158
+// made both view-entry reducers (SET_VIEW + OPEN_CONVERSATION) clear openModal
+// + the share/composer slots, so a panel modal no longer survives a workspace
+// switch — but the 'any' default stays as defense-in-depth, keeping any modal
+// closable regardless of the view beneath it. See docs/dashboard-gotchas.md.
 function defaultView(scope: KeymapScope): KeymapView {
   return scope === 'modal' || scope === 'overlay' ? 'any' : 'dashboard';
 }

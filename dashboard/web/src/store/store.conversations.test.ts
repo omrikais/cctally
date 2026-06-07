@@ -19,12 +19,66 @@ describe('conversation view state', () => {
     expect(getState().view).toBe('dashboard');
   });
 
+  it('SET_VIEW dismisses any open panel/share/composer modal (#158)', () => {
+    // A panel modal open on the dashboard, with the layered share + composer
+    // slots stacked on top — the exact state that would otherwise render a
+    // dashboard modal over the conversations body after the view switch.
+    dispatch({ type: 'OPEN_MODAL', kind: 'session', sessionId: 's1' });
+    dispatch({ type: 'OPEN_SHARE', panel: 'sessions', triggerId: 'btn-share' });
+    dispatch({ type: 'OPEN_COMPOSER' });
+    expect(getState().openModal).toBe('session');
+    expect(getState().openSessionId).toBe('s1');
+    expect(getState().shareModal).not.toBeNull();
+    expect(getState().composerModal).not.toBeNull();
+
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+
+    const s = getState();
+    expect(s.view).toBe('conversations');
+    expect(s.openModal).toBeNull();
+    expect(s.openSessionId).toBeNull();
+    expect(s.shareModal).toBeNull();
+    expect(s.composerModal).toBeNull();
+  });
+
+  it('SET_VIEW back to dashboard also clears a stray modal', () => {
+    // Symmetric: the reducer dismisses transient modals on every view switch,
+    // not just dashboard -> conversations.
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'forecast' });
+    dispatch({ type: 'SET_VIEW', view: 'dashboard' });
+    expect(getState().openModal).toBeNull();
+  });
+
   it('OPEN_CONVERSATION enters the view, selects, and stores the jump', () => {
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc', jump: { session_id: 'abc', uuid: 'u1' } });
     const s = getState();
     expect(s.view).toBe('conversations');
     expect(s.selectedConversationId).toBe('abc');
     expect(s.conversationJump).toEqual({ session_id: 'abc', uuid: 'u1' });
+  });
+
+  it('OPEN_CONVERSATION also dismisses any open panel/share/composer modal (#158)', () => {
+    // OPEN_CONVERSATION is the second workspace-entry path (it sets
+    // view='conversations' directly, bypassing SET_VIEW). It must enforce the
+    // same "switching the workspace dismisses transient modals" invariant so a
+    // future in-modal "open conversation" link can't strand a dashboard modal.
+    dispatch({ type: 'OPEN_MODAL', kind: 'session', sessionId: 's1' });
+    dispatch({ type: 'OPEN_SHARE', panel: 'sessions', triggerId: 'btn-share' });
+    dispatch({ type: 'OPEN_COMPOSER' });
+
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'conv-1', jump: { session_id: 'conv-1', uuid: 'u1' } });
+
+    const s = getState();
+    // The conversation selection it sets survives...
+    expect(s.view).toBe('conversations');
+    expect(s.selectedConversationId).toBe('conv-1');
+    expect(s.conversationJump).toEqual({ session_id: 'conv-1', uuid: 'u1' });
+    // ...while every transient modal slot is cleared.
+    expect(s.openModal).toBeNull();
+    expect(s.openSessionId).toBeNull();
+    expect(s.shareModal).toBeNull();
+    expect(s.composerModal).toBeNull();
   });
 
   it('OPEN_CONVERSATION without jump clears any prior jump', () => {
