@@ -5513,9 +5513,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         per-request Host allowlist (`host_allowed_for_transcripts`,
         anti-DNS-rebinding). Spec §5.
 
-        Both `_require_transcripts_allowed` (the GET-route 403 gate) and the
-        `transcriptsEnabled` client signal in `_serve_api_data` route through
-        this predicate so the two are contractually identical — a future
+        `_require_transcripts_allowed` (the GET-route 403 gate) and the
+        `transcriptsEnabled` client signal on BOTH the `/api/data` route
+        (`_serve_api_data`) and the SSE stream (`_serve_api_events`) route
+        through this predicate so they are contractually identical — a future
         one-line drift can never re-introduce the enabled-then-403 desync.
         """
         ta = self._transcript_gate()
@@ -7515,6 +7516,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         except OauthUsageConfigError:
             cfg_oauth = dict(sys.modules["cctally"]._OAUTH_USAGE_DEFAULTS)
 
+        # Conversation viewer (Plan 2, spec §5): resolve the transcript gate
+        # ONCE per SSE connection. `_transcripts_visible_to_request()` reads
+        # this client's `Host` header + the class-level expose flag — both
+        # constant for the connection's lifetime, so no per-tick FS/header
+        # reads. The SSE `update` envelope MUST carry `transcriptsEnabled`:
+        # the client replaces the whole snapshot on every tick, so without it
+        # the steady-state UI loses the gate (the ViewSwitcher disappears
+        # ~15s after bootstrap). Mirrors `/api/data`'s per-request injection.
+        transcripts_enabled = self._transcripts_visible_to_request()
+
         q = self.hub.subscribe()
         try:
             while True:
@@ -7534,6 +7545,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     display_tz_pref_override=type(self).display_tz_pref_override,
                     runtime_bind=type(self).cctally_host,
                 )
+                env["transcriptsEnabled"] = transcripts_enabled
                 msg = (
                     "event: update\n"
                     + "data: " + json.dumps(env, ensure_ascii=False) + "\n\n"

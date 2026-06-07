@@ -5000,7 +5000,11 @@ mark.current {
 .md img { max-width: 100%; }
 
 /* ---- Search-hit highlight (renderSnippet <mark>) ------------------ */
-mark {
+/* Scoped to .conv-view so the conversation snippet highlight does NOT
+   override the pre-existing global `mark` (the Sessions-panel search
+   highlight). A bare `mark {}` here would win by later source order at
+   equal specificity and restyle every <mark> on the page. */
+.conv-view mark {
   background: var(--accent-amber);
   color: #1a1400;
   padding: 0 2px;

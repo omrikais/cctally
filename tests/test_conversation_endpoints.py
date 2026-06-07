@@ -5,7 +5,7 @@ Boots a real ``DashboardHTTPHandler`` against a fixture cache.db (seeded with
 Plan 1's ``conversation_messages`` / ``session_entries``) and drives the three
 routes plus the per-request ``transcriptsEnabled`` injection. Mirrors the
 handler-boot pattern in ``tests/test_dashboard_api_block.py`` — ``load_script``
-+ ``redirect_paths`` + a booted ``socketserver.TCPServer``.
++ ``redirect_paths`` + a booted ``socketserver.ThreadingTCPServer``.
 
 The gate (anti-DNS-rebinding) is exercised by sending an explicit ``Host``
 header via ``HTTPConnection`` with ``skip_host=True``.
@@ -93,7 +93,7 @@ def _make_snapshot(ns):
 def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False):
     """Seed the cache and start a server with the given bind/expose posture.
 
-    Returns the running TCPServer; caller must ``srv.shutdown()``.
+    Returns the running ThreadingTCPServer; caller must ``srv.shutdown()``.
     """
     redirect_paths(ns, monkeypatch, tmp_path)
     sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
@@ -110,7 +110,10 @@ def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False):
     HandlerCls.cctally_host = bind
     HandlerCls.cctally_expose_transcripts = expose
 
-    srv = socketserver.TCPServer(("127.0.0.1", 0), HandlerCls)
+    # Threading server (mirrors production's ThreadingHTTPServer) so a
+    # long-lived SSE connection (`/api/events` blocks in a keep-alive loop)
+    # does not wedge the single accept thread and starve later requests.
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), HandlerCls)
     srv.daemon_threads = True
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
@@ -345,5 +348,87 @@ def test_api_data_transcripts_enabled_is_host_aware(tmp_path, monkeypatch):
         status, body = _get(port, "/api/data", host="machine.local:8789")
         assert status == 200, (status, body)
         assert json.loads(body)["transcriptsEnabled"] is False
+    finally:
+        srv.shutdown()
+
+
+def _first_sse_update_envelope(port, *, host=None, timeout=5.0):
+    """Open ``GET /api/events``, publish a snapshot, and return the parsed
+    JSON envelope from the first ``event: update`` block on the stream.
+
+    The SSE stream is a long-lived ``text/event-stream`` response, so we
+    drive it over a raw socket and parse the first ``event: update``/``data:``
+    pair. The caller is expected to have published a snapshot via
+    ``HandlerCls.hub.publish(...)`` (so the subscriber's queue has a frame).
+    """
+    import socket as _socket
+    s = _socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        s.settimeout(timeout)
+        authority = host if host is not None else f"127.0.0.1:{port}"
+        req = (
+            f"GET /api/events HTTP/1.1\r\n"
+            f"Host: {authority}\r\n"
+            f"Connection: keep-alive\r\n\r\n"
+        ).encode("utf-8")
+        s.sendall(req)
+
+        # Read until we see a full `event: update\ndata: {...}\n\n` block.
+        buf = b""
+        deadline = dt.datetime.now() + dt.timedelta(seconds=timeout)
+        while dt.datetime.now() < deadline:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            text = buf.decode("utf-8", "replace")
+            marker = "event: update\n"
+            idx = text.find(marker)
+            if idx == -1:
+                continue
+            rest = text[idx + len(marker):]
+            # The data line follows immediately; block ends at the blank line.
+            end = rest.find("\n\n")
+            if end == -1:
+                continue
+            block = rest[:end]
+            for line in block.split("\n"):
+                if line.startswith("data: "):
+                    return json.loads(line[len("data: "):])
+        raise AssertionError(
+            "no `event: update` SSE block arrived within the timeout; "
+            f"buffer={buf!r}"
+        )
+    finally:
+        s.close()
+
+
+def test_sse_update_envelope_carries_transcripts_enabled(tmp_path, monkeypatch):
+    """The SSE ``update`` envelope (``/api/events``) MUST carry
+    ``transcriptsEnabled`` equal to the per-connection gate value — the same
+    contract as ``/api/data``.
+
+    The client replaces the whole snapshot on every SSE tick, so if the
+    envelope omits this field the steady-state UI loses the gate (the
+    ViewSwitcher disappears ~15s after bootstrap). Loopback → True; LAN
+    hostname + expose=False → False (never enabled-then-403)."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        HandlerCls = ns["DashboardHTTPHandler"]
+
+        # Publish a frame so each fresh SSE subscriber gets an immediate tick.
+        HandlerCls.hub.publish(_make_snapshot(ns))
+
+        # Loopback connection → gate True.
+        env = _first_sse_update_envelope(port)
+        assert "transcriptsEnabled" in env, env
+        assert env["transcriptsEnabled"] is True
+
+        # LAN hostname Host, expose off → gate False (mirrors /api/data).
+        env = _first_sse_update_envelope(port, host="machine.local:8789")
+        assert "transcriptsEnabled" in env, env
+        assert env["transcriptsEnabled"] is False
     finally:
         srv.shutdown()

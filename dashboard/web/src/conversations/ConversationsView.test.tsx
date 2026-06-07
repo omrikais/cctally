@@ -14,6 +14,8 @@
 //   6. view-aware keymap — '1' in conversations view does NOT open a panel
 //      modal; Esc with empty search exits to dashboard
 //   7. mobile (stubMobileMedia(true)) — rail-only until select; Back returns
+//   8. SSE-tick regression — a snapshot carrying transcriptsEnabled keeps the
+//      switcher; one omitting it hides it (SSE envelopes must carry the gate)
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { App } from '../App';
@@ -70,10 +72,10 @@ function sessionRow(over: Partial<SessionRow> = {}): SessionRow {
   };
 }
 
-function baseEnvelope(transcriptsEnabled?: boolean): Envelope {
+function baseEnvelope(transcriptsEnabled?: boolean, generatedAt = '2026-05-13T10:00:00Z'): Envelope {
   return {
     envelope_version: 2,
-    generated_at: '2026-05-13T10:00:00Z',
+    generated_at: generatedAt,
     ...(transcriptsEnabled === undefined ? {} : { transcriptsEnabled }),
     last_sync_at: null,
     sync_age_s: null,
@@ -132,7 +134,7 @@ const searchResult = {
   total: 1,
 };
 
-function detail(opts: { withJumpTarget?: boolean } = {}) {
+function detail() {
   const items: unknown[] = [
     {
       kind: 'human',
@@ -146,7 +148,7 @@ function detail(opts: { withJumpTarget?: boolean } = {}) {
     {
       kind: 'assistant',
       anchor: { session_id: 'sess-1', uuid: 'a-uuid', id: 2 },
-      member_uuids: opts.withJumpTarget ? ['a-uuid'] : ['a-uuid'],
+      member_uuids: ['a-uuid'],
       ts: '2026-05-13T09:10:00Z',
       text: 'It uses an flock on cache.db.lock.',
       blocks: [],
@@ -339,5 +341,27 @@ describe('Conversations workspace integration', () => {
     fireEvent.click(back);
     expect(getState().selectedConversationId).toBeNull();
     await waitFor(() => expect(document.querySelector('.conv-rail')).not.toBeNull());
+  });
+
+  it('8: an SSE tick carrying transcriptsEnabled keeps the switcher; a tick omitting it hides it (SSE envelopes must carry the gate)', () => {
+    // Bootstrap (the /api/data shape): switcher shown.
+    updateSnapshot(baseEnvelope(true, '2026-05-13T10:00:00Z'));
+    render(<App />);
+    expect(screen.getByRole('tablist', { name: 'Workspace' })).not.toBeNull();
+
+    // A NEWER snapshot that ALSO carries the field (the FIXED SSE envelope —
+    // _serve_api_events now injects transcriptsEnabled per connection). The
+    // store replaces the whole snapshot on every tick, so the switcher must
+    // PERSIST rather than vanishing ~15s after bootstrap.
+    act(() => { updateSnapshot(baseEnvelope(true, '2026-05-13T10:00:15Z')); });
+    expect(screen.getByRole('tablist', { name: 'Workspace' })).not.toBeNull();
+
+    // Contract pin: a still-newer snapshot that OMITS the field hides the
+    // switcher. This is exactly the pre-fix SSE behavior — it documents that
+    // SSE envelopes MUST carry transcriptsEnabled or the steady-state UI
+    // loses the gate. The day the backend injection is dropped, this branch
+    // reproduces the regression (switcher gone after the first SSE tick).
+    act(() => { updateSnapshot(baseEnvelope(undefined, '2026-05-13T10:00:30Z')); });
+    expect(screen.queryByRole('tablist', { name: 'Workspace' })).toBeNull();
   });
 });
