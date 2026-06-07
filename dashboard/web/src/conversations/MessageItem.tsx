@@ -39,6 +39,9 @@ function MessageItemImpl(
         {item.text && <Markdown>{item.text}</Markdown>}
         <MessageBlocks blocks={item.blocks} />
         {hasCost && (
+          // toFixed(4), not fmt.usd2: per-turn costs are typically sub-cent,
+          // where 2-decimal formatting would read "$0.00" — 4 decimals keep
+          // the real figure legible. Intentional bypass of the usd2 helper.
           <div className="conv-item-cost">${(item.cost_usd as number).toFixed(4)}</div>
         )}
       </div>

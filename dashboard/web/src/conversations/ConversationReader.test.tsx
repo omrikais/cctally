@@ -1,7 +1,7 @@
 import { render, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationReader } from './ConversationReader';
-import { _resetForTests, dispatch } from '../store/store';
+import { _resetForTests, dispatch, getState } from '../store/store';
 import type { ConversationItem } from '../types/conversation';
 
 // jsdom lacks IntersectionObserver — install a minimal no-op so the
@@ -107,5 +107,42 @@ describe('ConversationReader', () => {
     await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
     const target = container.querySelector('[data-uuid="target"]')!;
     expect(target.classList.contains('conv-item--jumped')).toBe(true);
+  });
+
+  it('gives up on a jump when pagination exhausts on an empty terminal page (no infinite loop)', async () => {
+    // Page 1 returns h1 + a cursor (has_more true). Page 2 — the after=<id>
+    // fetch — is the empty terminal page: items: [], next_after: null. The
+    // target uuid never appears anywhere. With Fix 1 the give-up clear
+    // fires when hasMore transitions to false even though items.length never
+    // grew on the terminal page (the regression this pins).
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' })], 2));
+    mockFetchOnce({
+      session_id: 's',
+      project_label: 'proj',
+      git_branch: 'main',
+      started_utc: '2026-01-01T00:00:00Z',
+      last_activity_utc: '2026-01-01T02:00:00Z',
+      cost_usd: 3.5,
+      models: ['claude-opus-4'],
+      items: [],
+      page: { next_after: null, has_more: false },
+    });
+
+    const scrollSpy = vi
+      .spyOn(Element.prototype, 'scrollIntoView')
+      .mockImplementation(() => {});
+
+    // Jump targets a uuid that never lands in any item.
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'never-appears' } });
+
+    render(<ConversationReader sessionId="s" />);
+
+    // The jump clears via the give-up branch once paging is exhausted.
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+
+    // No target was ever found → no scroll, and fetch ran a bounded number
+    // of times (page 1 + page 2 = 2; allow a small constant for re-renders).
+    expect(scrollSpy).not.toHaveBeenCalled();
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBeLessThanOrEqual(4);
   });
 });

@@ -60,8 +60,14 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
       if (!hasMore) dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
     })();
     return () => { cancelled = true; };
+    // `hasMore` is in deps so the give-up clear still fires on the edge
+    // where the final page appends 0 items (items.length unchanged) but
+    // flips the cursor → hasMore goes false. No infinite loop: loadUntil/
+    // fetchNext serialize via loadingMoreRef, loadUntil returns once
+    // exhausted-or-found, and hasMore only transitions a bounded number of
+    // times.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jump, sessionId, detail?.items.length]);
+  }, [jump, sessionId, detail?.items.length, hasMore]);
 
   const setItemRef = (item: { member_uuids: string[] }) => (el: HTMLDivElement | null) => {
     // Map EVERY member uuid → this element so a search hit on any
