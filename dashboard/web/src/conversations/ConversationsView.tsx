@@ -49,19 +49,20 @@ export function ConversationsView() {
 }
 
 // Module-scoped stable identity (useKeymap re-registers on array identity
-// change). Guards: only in the view, no modal, not in text input.
-const inView = () => getState().view === 'conversations' && !getState().openModal && getState().inputMode === null;
+// change). View gating (#156) is declared via `view:'conversations'` and
+// enforced by the dispatcher; `when` carries only the transient guards.
+const inView = () => !getState().openModal && getState().inputMode === null;
 const CONVERSATIONS_BINDINGS = [
   {
-    key: '/', scope: 'global' as const, when: inView,
+    key: '/', scope: 'global' as const, view: 'conversations' as const, when: inView,
     action: () => {
       const el = document.querySelector<HTMLInputElement>('.conv-rail-search input');
       el?.focus(); el?.select();
     },
   },
   {
-    key: 'Escape', scope: 'global' as const,
-    when: () => getState().view === 'conversations' && !getState().openModal,
+    key: 'Escape', scope: 'global' as const, view: 'conversations' as const,
+    when: () => !getState().openModal,
     action: () => {
       if (getState().conversationSearch) { dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' }); return; }
       dispatch({ type: 'SET_VIEW', view: 'dashboard' });

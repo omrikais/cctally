@@ -61,8 +61,11 @@ export function HelpOverlay() {
   const isMobile = useIsMobile();
   const panelOrder = useSyncExternalStore(subscribeStore, () => getState().prefs.panelOrder);
   useKeymap([
-    { key: '?', scope: 'global', action: () => setOpen((o) => !o) },
-    { key: 'Escape', scope: 'global', action: () => setOpen(false), when: () => open },
+    // `?` is all-views chrome (#156).
+    { key: '?', scope: 'global', view: 'any', action: () => setOpen((o) => !o) },
+    // Esc at `overlay` scope (z-index 1000 = topmost): SCOPE_ORDER makes this
+    // beat the conversations-view `global` Esc deterministically (#156).
+    { key: 'Escape', scope: 'overlay', action: () => setOpen(false), when: () => open },
   ]);
   if (!open) return null;
   return (

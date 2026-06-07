@@ -107,19 +107,21 @@ describe('B keybinding (composer)', () => {
   it('does nothing in the conversations view (view-gated; no OPEN_COMPOSER)', () => {
     // Cross-view leak guard: the composer/share modal roots are mounted
     // unconditionally, so without the view gate `B` would open the
-    // dashboard composer over the read-only transcript reader. Removing
-    // the `if (s.view !== 'dashboard') return false` guard line in
-    // keyboardBasket.ts makes this assertion FAIL (composer opens).
+    // dashboard composer over the read-only transcript reader. The gate now
+    // lives in the keymap DISPATCHER (#156): `B` is scope:'global' → default
+    // 'dashboard', so the dispatcher skips it in the conversations view.
+    // Driving a real keydown through installGlobalKeydown is the production
+    // path; reverting the dispatcher filter makes this assertion FAIL
+    // (composer opens).
     dispatch({ type: 'SET_VIEW', view: 'conversations' });
-    expect(buildBasketKeyBinding().when?.()).toBe(false);
     fireB();
     expect(getState().composerModal).toBeNull();
   });
 
   it('still opens in the dashboard view (non-vacuity: guard is not over-broad)', () => {
-    // The default view IS 'dashboard'; assert the guard returns true so
-    // the conversations→false assertion above proves the new gate, not a
-    // blanket suppression.
+    // The default view IS 'dashboard'; assert the binding's transient guard
+    // returns true so the conversations→inert assertion above proves the new
+    // dispatcher gate, not a blanket suppression.
     expect(getState().view).toBe('dashboard');
     expect(buildBasketKeyBinding().when?.()).toBe(true);
     fireB();

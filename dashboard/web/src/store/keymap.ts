@@ -1,8 +1,14 @@
+import { getState } from './store';
+
 export type KeymapScope = 'overlay' | 'global' | 'sessions' | 'modal';
+export type KeymapView = 'dashboard' | 'conversations' | 'any';
 
 export interface Binding {
   key: string;
   scope: KeymapScope;
+  // View eligibility (#156). Omitted → `defaultView(scope)`. 'any' = the
+  // view-agnostic chrome (Settings/Help/Doctor + any open modal/overlay).
+  view?: KeymapView;
   action: () => void;
   when?: () => boolean;
 }
@@ -15,6 +21,17 @@ let handler: ((e: KeyboardEvent) => void) | null = null;
 // modal's Esc handler — preserving the spec §12.1 "Esc closes the
 // topmost overlay" invariant when both surfaces are open simultaneously.
 const SCOPE_ORDER: Record<KeymapScope, number> = { overlay: 0, modal: 1, sessions: 2, global: 3 };
+
+// Default view per scope (#156). Positional scopes (global, sessions) are
+// dashboard-bound unless a binding opts out — a forgotten `view` therefore
+// confines a binding to the dashboard and can never leak into the
+// conversations view. Layering scopes (overlay, modal) default to 'any': an
+// open modal/overlay owns its keys regardless of the view beneath it, so a
+// panel modal left mounted over the conversations body (SET_VIEW does not
+// clear openModal) stays closable. See docs/dashboard-gotchas.md.
+function defaultView(scope: KeymapScope): KeymapView {
+  return scope === 'modal' || scope === 'overlay' ? 'any' : 'dashboard';
+}
 
 function isTextInputFocused(target: EventTarget | null): boolean {
   if (!target || !(target instanceof Element)) return false;
@@ -46,9 +63,13 @@ export function installGlobalKeydown(): void {
     // pass through so modals/input-owners can close/confirm.
     if (isTextInputFocused(e.target) && e.key.length === 1) return;
 
+    const currentView = getState().view;
     const ordered = [...bindings].sort((a, b) => SCOPE_ORDER[a.scope] - SCOPE_ORDER[b.scope]);
     for (const b of ordered) {
       if (b.key !== e.key) continue;
+      // Central view gate (#156): a binding fires only in its view (or 'any').
+      const bv = b.view ?? defaultView(b.scope);
+      if (bv !== 'any' && bv !== currentView) continue;
       if (b.when && !b.when()) continue;
       b.action();
       e.preventDefault();

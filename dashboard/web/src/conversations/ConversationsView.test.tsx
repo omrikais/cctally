@@ -44,15 +44,15 @@ class IntersectionObserverStub {
   takeRecords(): IntersectionObserverEntry[] { return []; }
 }
 
-// Mirror of main.tsx's view-aware global panel-digit guard + binding.
-// Registered here (rather than importing main.tsx, which boots SSE +
-// createRoot against a #root that this test does not mount) so scenario 6
-// exercises the EXACT production guard predicate: a digit only opens a
-// panel modal while view==='dashboard'.
+// Mirror of main.tsx's view-aware global panel-digit binding. Registered
+// here (rather than importing main.tsx, which boots SSE + createRoot against
+// a #root this test does not mount) so scenario 6 exercises the production
+// shape: the binding is scope:'global' with NO per-binding view clause, and
+// the keymap DISPATCHER makes it inert when view!=='dashboard' (#156).
 function registerPanelDigitBindings(): void {
   const guard = (): boolean => {
     const s = getState();
-    return s.view === 'dashboard' && !s.update.modalOpen && !s.doctorModalOpen;
+    return !s.update.modalOpen && !s.doctorModalOpen;
   };
   registerKeymap([
     { key: '1', scope: 'global', when: guard, action: () => openPanelByPosition(1) },

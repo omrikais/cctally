@@ -186,14 +186,18 @@ export function SettingsOverlay() {
     {
       key: 's',
       scope: 'global',
+      view: 'any',     // all-views chrome (#156)
       action: () => setOpen(true),
       when: () => !getState().openModal,
     },
-    { key: 'Escape', scope: 'global', action: () => setOpen(false), when: () => open },
-    // While Settings is open, swallow the digit modal-openers so they
-    // don't mount a dashboard modal on top of the overlay (parity with
-    // main's settings.js #settings-root visibility guard). Modal scope
-    // beats global in SCOPE_ORDER, so these run first.
+    // Esc at `modal` scope (z-index 100): SCOPE_ORDER beats the conversations
+    // `global` Esc deterministically (#156).
+    { key: 'Escape', scope: 'modal', action: () => setOpen(false), when: () => open },
+    // While Settings is open, swallow the digit modal-openers so they don't
+    // mount a dashboard modal on top of the overlay. `0` (the 10th-panel
+    // opener) MUST be swallowed too (#156): otherwise it opens the alerts
+    // modal over Settings, and the modal-scope Esc tie strands it.
+    { key: '0', scope: 'modal', action: () => {}, when: () => open },
     { key: '1', scope: 'modal', action: () => {}, when: () => open },
     { key: '2', scope: 'modal', action: () => {}, when: () => open },
     { key: '3', scope: 'modal', action: () => {}, when: () => open },

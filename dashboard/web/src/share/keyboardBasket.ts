@@ -37,12 +37,8 @@ export function buildBasketKeyBinding(): Binding {
     scope: 'global',
     when: () => {
       const s = getState();
-      // View gate: the composer is a dashboard-panel-share feature with
-      // nothing to act on in the conversations view. The composer/share
-      // modal roots are mounted unconditionally (outside App's body
-      // conditional), so without this gate `B` would open the dashboard
-      // composer over the read-only transcript reader.
-      if (s.view !== 'dashboard') return false;
+      // View gate (#156) now lives in the keymap dispatcher: `B` is
+      // scope:'global' → default 'dashboard', inert in conversations view.
       if (isMobileViewport()) return false;
       if (s.shareModal !== null) return false;
       if (s.composerModal !== null) return false;

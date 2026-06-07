@@ -249,19 +249,21 @@ describe('S keybinding (share modal)', () => {
     // the conversations view the dashboard body is unmounted, so even a
     // focused-looking `[data-panel-kind]` must not surface the
     // panel-centric "focus a panel" toast over the transcript reader.
-    // Removing the `if (s.view !== 'dashboard') return false` guard line
-    // in keyboardShare.ts makes this assertion FAIL (the toast fires).
+    // The gate now lives in the keymap DISPATCHER (#156): `S` is
+    // scope:'global' → default 'dashboard', so the dispatcher skips it in
+    // the conversations view. Driving a real keydown through
+    // installGlobalKeydown is the production path; reverting the dispatcher
+    // filter makes this assertion FAIL (the toast fires).
     dispatch({ type: 'SET_VIEW', view: 'conversations' });
-    expect(buildShareKeyBinding().when?.()).toBe(false);
     fireS();
     expect(getState().shareModal).toBeNull();
     expect(getState().toast).toBeNull();
   });
 
   it('still fires in the dashboard view with a focused panel (non-vacuity: guard is not over-broad)', () => {
-    // The default view IS 'dashboard'; assert the guard returns true so
-    // the conversations→false assertion above proves the new gate, not a
-    // blanket suppression.
+    // The default view IS 'dashboard'; assert the binding's transient guard
+    // returns true so the conversations→inert assertion above proves the new
+    // dispatcher gate, not a blanket suppression.
     expect(getState().view).toBe('dashboard');
     focusPanel('weekly');
     expect(buildShareKeyBinding().when?.()).toBe(true);

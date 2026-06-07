@@ -40,12 +40,9 @@ installGlobalKeydown();
 // `gotcha: project_global_hotkeys_modal_guard`.
 const _globalKeyGuard = (): boolean => {
   const s = getState();
-  // Conversation viewer (spec §4): the dashboard panel grid is unmounted
-  // while view==='conversations', so panel digits / r / q / n / N must
-  // not fire over the conversations body. Header sync/settings/help still
-  // work — they call triggerSync() directly or are owned by the
-  // always-mounted overlays, not these global panel bindings.
-  return s.view === 'dashboard' && !s.update.modalOpen && !s.doctorModalOpen;
+  // Modal-layering guard only — the view gate (#156) now lives in the keymap
+  // dispatcher (these panel globals are scope:'global' → default 'dashboard').
+  return !s.update.modalOpen && !s.doctorModalOpen;
 };
 
 // Doctor key (`d`) uses a composite guard per spec §6.4 (Codex M5):
@@ -82,7 +79,9 @@ registerKeymap([
   { key: 'n', scope: 'global', when: _globalKeyGuard, action: () => stepMatch(1) },
   { key: 'N', scope: 'global', when: _globalKeyGuard, action: () => stepMatch(-1) },
   // Doctor modal — composite guard (see _doctorOpenGuard above).
-  { key: 'd', scope: 'global', when: _doctorOpenGuard, action: () => dispatch({ type: 'OPEN_DOCTOR_MODAL' }) },
+  // `view:'any'` (#156): all-views chrome; without it this scope:'global'
+  // binding would regress to dashboard-only.
+  { key: 'd', scope: 'global', view: 'any', when: _doctorOpenGuard, action: () => dispatch({ type: 'OPEN_DOCTOR_MODAL' }) },
   // Share v2 (spec §12.1). Opens the share modal for the focused panel.
   // Guards (composer/share/panel modals empty, no input mode, focus on a
   // share-capable panel, not mobile) live inside buildShareKeyBinding so
@@ -96,9 +95,8 @@ registerKeymap([
   {
     key: 'c',
     scope: 'sessions',
-    // Conversation viewer (spec §4): the Sessions panel is unmounted in
-    // conversations view, so the collapse toggle must not fire there.
-    when: () => getState().view === 'dashboard' && !getState().openModal,
+    // scope:'sessions' → default 'dashboard'; the dispatcher gates the view.
+    when: () => !getState().openModal,
     action: () => {
       const cur = getState().prefs.sessionsCollapsed;
       dispatch({ type: 'SAVE_PREFS', patch: { sessionsCollapsed: !cur } });

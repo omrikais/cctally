@@ -10,11 +10,12 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SettingsOverlay } from './SettingsOverlay';
-import { _resetForTests, dispatch } from '../store/store';
+import { _resetForTests, dispatch, getState } from '../store/store';
 import type { AlertsConfig } from '../store/store';
 import {
   installGlobalKeydown,
   uninstallGlobalKeydown,
+  registerKeymap,
   _resetForTests as _resetKeymapForTests,
 } from '../store/keymap';
 
@@ -604,5 +605,21 @@ describe('<SettingsOverlay /> Codex budget toggles', () => {
     // `codex` is nested alongside it in the SAME `budget` block.
     expect(parsed.budget?.project_alerts_enabled).toBe(true);
     expect(parsed.budget?.codex?.alerts_enabled).toBe(true);
+  });
+});
+
+describe('<SettingsOverlay /> swallows `0` while open (#156)', () => {
+  it('`0` does not reach the global 10th-panel opener while Settings is open', () => {
+    const opener = vi.fn();
+    // Stand-in for main.tsx's global `0` panel opener (scope:'global'). The
+    // Settings `0` no-op is scope:'modal' → fires first by SCOPE_ORDER and
+    // preventDefaults, so the opener never runs. (Non-vacuity: removing the
+    // `0` no-op from SettingsOverlay lets `opener` fire.)
+    registerKeymap([{ key: '0', scope: 'global', action: opener }]);
+    render(<SettingsOverlay />);
+    openSettings();            // 's' toggles it open
+    fireEvent.keyDown(document, { key: '0' });
+    expect(opener).not.toHaveBeenCalled();
+    expect(getState().openModal).toBeNull();
   });
 });

@@ -3,12 +3,13 @@
 // positions ≥ 11 have NO digit binding (the spec defers multi-key
 // chord support to F9) — render an em-dash instead of a literal "11".
 import { fireEvent, render, screen } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { HelpOverlay } from './HelpOverlay';
-import { _resetForTests } from '../store/store';
+import { _resetForTests, dispatch } from '../store/store';
 import {
   installGlobalKeydown,
   uninstallGlobalKeydown,
+  registerKeymap,
   _resetForTests as _resetKeymapForTests,
 } from '../store/keymap';
 
@@ -75,5 +76,26 @@ describe('<HelpOverlay /> positional hotkey rule', () => {
     // The cell should contain an em-dash and NOT a <kbd>.
     expect(firstCell?.querySelector('kbd')).toBeNull();
     expect(firstCell?.textContent).toBe('—');
+  });
+});
+
+describe('<HelpOverlay /> Esc layering is deterministic (#156)', () => {
+  it('Help Esc (overlay) beats a conversations-view global Esc registered earlier', () => {
+    const convEsc = vi.fn();
+    // Register a conversations-style global Esc BEFORE HelpOverlay mounts, so
+    // insertion order favours it. The fix must let HelpOverlay's overlay-scope
+    // Esc win anyway. (Non-vacuity: reverting HelpOverlay's Esc to scope
+    // 'global' makes convEsc win — both 'global', earlier insertion.)
+    registerKeymap([
+      { key: 'Escape', scope: 'global', view: 'conversations', when: () => true, action: convEsc },
+    ]);
+    render(<HelpOverlay />);
+    openHelp();                 // '?' toggles it open
+    expect(document.querySelector('#help-overlay')).not.toBeNull();
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+    fireEvent.keyDown(document, { key: 'Escape' });
+    // Help closed (overlay gone), conversations Esc never fired.
+    expect(document.querySelector('#help-overlay')).toBeNull();
+    expect(convEsc).not.toHaveBeenCalled();
   });
 });
