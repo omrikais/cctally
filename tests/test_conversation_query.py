@@ -308,25 +308,23 @@ def test_search_like_fallback_same_hit_set():
 
 
 def test_search_dedup_is_load_bearing():
-    # Non-vacuity proof (§6.12): WITHOUT the _dedup_hits step a replayed row
-    # double-counts. Temporarily stub _dedup_hits to a passthrough, confirm the
-    # replayed corpus yields 2 raw hits, restore, confirm dedup -> 1.
+    # Non-vacuity proof (#149): dedup now lives in the SQL window (PARTITION BY
+    # session_id, uuid), not a Python _dedup_hits pass. The corpus genuinely
+    # contains a replayed physical row (s1/a1 in BOTH a.jsonl and c.jsonl), so a
+    # naive query WOULD return 2 rows for that one logical message; the window
+    # dedup must collapse them to a single hit with total == 1.
     c = _conn()
     _seed_search_corpus(c)
-    real_dedup = cq._dedup_hits
-    try:
-        cq._dedup_hits = lambda hits, limit, offset: (hits[offset:offset + limit], len(hits))
-        leaky = cq.search_conversations(c, "token", limit=50, offset=0,
-                                        fts_available=False)
-        # a1 + its c.jsonl replay both LIKE-match -> 2 hits without dedup
-        assert len(leaky["hits"]) == 2
-        assert [(h["session_id"], h["uuid"]) for h in leaky["hits"]] == \
-               [("s1", "a1"), ("s1", "a1")]            # smoking gun: same logical msg twice
-    finally:
-        cq._dedup_hits = real_dedup
-    fixed = cq.search_conversations(c, "token", limit=50, offset=0,
-                                    fts_available=False)
-    assert len(fixed["hits"]) == 1                     # dedup restored
+    # smoking gun: two physical conversation_messages rows match for (s1, a1).
+    raw = c.execute(
+        "SELECT COUNT(*) FROM conversation_messages "
+        "WHERE text LIKE '%token%' AND session_id='s1' AND uuid='a1'"
+    ).fetchone()[0]
+    assert raw == 2
+    out = cq.search_conversations(c, "token", limit=50, offset=0,
+                                  fts_available=False)
+    assert len(out["hits"]) == 1 and out["total"] == 1        # collapsed in SQL
+    assert [(h["session_id"], h["uuid"]) for h in out["hits"]] == [("s1", "a1")]
 
 
 def test_search_empty_query_is_empty():
@@ -346,3 +344,100 @@ def test_search_fts_punctuation_does_not_error():
     for q in ('token AND', 'token "OR', 'token*', '"', '(token)'):
         res = cq.search_conversations(c, q, limit=50, offset=0)
         assert res["mode"] == "fts"   # did not raise / fall through to error
+
+
+# ---------------------------------------------------------------------------
+# #149: SQL-bounded search pagination — dedup + page + total all in SQL so the
+# Python side never materializes more than one page of hits/snippets.
+# ---------------------------------------------------------------------------
+def _seed_distinct_hits(c, n, *, term="needle"):
+    """n distinct logical hits (distinct session_id/uuid + source_path), each
+    matching `term`, with strictly descending-sortable timestamps."""
+    for i in range(n):
+        _msg(c, session_id=f"s{i}", uuid=f"u{i}", source_path=f"f{i}.jsonl",
+             byte_offset=0,
+             timestamp_utc=f"2026-06-01T00:{i // 60:02d}:{i % 60:02d}Z",
+             entry_type="human", text=f"row {i} has the {term} keyword here",
+             cwd="/home/u/proj")
+
+
+def _search_modes(c):
+    """Modes to exercise: always LIKE; FTS too when the build supports it."""
+    modes = [False]
+    if db._fts5_available(c):
+        modes.append(True)
+    return modes
+
+
+def test_search_pagination_disjoint_ordered_stable_total():
+    c = _conn()
+    n = 5
+    _seed_distinct_hits(c, n, term="needle")
+    for fa in _search_modes(c):
+        p1 = cq.search_conversations(c, "needle", limit=2, offset=0, fts_available=fa)
+        p2 = cq.search_conversations(c, "needle", limit=2, offset=2, fts_available=fa)
+        p3 = cq.search_conversations(c, "needle", limit=2, offset=4, fts_available=fa)
+        # total is the exact post-dedup count and stable across every page.
+        assert p1["total"] == p2["total"] == p3["total"] == n, fa
+        assert [len(p["hits"]) for p in (p1, p2, p3)] == [2, 2, 1], fa
+        keys = [(h["session_id"], h["uuid"])
+                for p in (p1, p2, p3) for h in p["hits"]]
+        assert len(set(keys)) == n, fa          # pages disjoint + fully covering
+        # deferred snippet attach is correct on every page (incl. offset > 0).
+        for p in (p1, p2, p3):
+            for h in p["hits"]:
+                assert "needle" in h["snippet"].lower(), fa
+    # LIKE order is deterministic (timestamp DESC) — assert the exact boundary.
+    like1 = cq.search_conversations(c, "needle", limit=2, offset=0, fts_available=False)
+    like2 = cq.search_conversations(c, "needle", limit=2, offset=2, fts_available=False)
+    assert [h["uuid"] for h in like1["hits"]] == ["u4", "u3"]
+    assert [h["uuid"] for h in like2["hits"]] == ["u2", "u1"]
+
+
+def test_search_total_is_post_dedup_logical_count():
+    c = _conn()
+    _seed_distinct_hits(c, 3, term="alpha")
+    # Two extra physical rows replaying the SAME logical message (s0, u0).
+    for dup in ("dup1.jsonl", "dup2.jsonl"):
+        _msg(c, session_id="s0", uuid="u0", source_path=dup, byte_offset=0,
+             timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+             text="row 0 has the alpha keyword here", cwd="/home/u/proj")
+    for fa in _search_modes(c):
+        out = cq.search_conversations(c, "alpha", limit=50, offset=0, fts_available=fa)
+        assert out["total"] == 3, fa                       # logical, not 5 physical
+        assert len({(h["session_id"], h["uuid"]) for h in out["hits"]}) == 3, fa
+
+
+def test_search_snippet_generation_bounded_to_page_like(monkeypatch):
+    # Non-vacuity for the bound (LIKE): _manual_snippet must run only for the
+    # page, not once per corpus match. Pre-fix it was called for every match.
+    c = _conn()
+    _seed_distinct_hits(c, 8, term="beta")
+    calls = {"n": 0}
+    real = cq._manual_snippet
+    def counting(text, q, width=80):
+        calls["n"] += 1
+        return real(text, q, width)
+    monkeypatch.setattr(cq, "_manual_snippet", counting)
+    out = cq.search_conversations(c, "beta", limit=3, offset=0, fts_available=False)
+    assert len(out["hits"]) == 3 and out["total"] == 8
+    assert calls["n"] <= 3            # snippet bounded to the page, not all 8
+
+
+def test_search_snippet_generation_bounded_to_page_fts(monkeypatch):
+    # Non-vacuity for the bound (FTS): the snippet batch must be issued for only
+    # the page's rowids, not every match.
+    c = _conn()
+    if not db._fts5_available(c):
+        import pytest; pytest.skip("sqlite build lacks FTS5")
+    _seed_distinct_hits(c, 8, term="beta")
+    seen = {}
+    real = cq._fts_snippets
+    def spy(conn, fts_q, ids):
+        seen["ids"] = list(ids)
+        return real(conn, fts_q, ids)
+    monkeypatch.setattr(cq, "_fts_snippets", spy)
+    out = cq.search_conversations(c, "beta", limit=3, offset=0)
+    assert out["mode"] == "fts"
+    assert len(out["hits"]) == 3 and out["total"] == 8
+    assert len(seen["ids"]) == 3     # snippet batch covers only the page

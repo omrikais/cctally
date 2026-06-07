@@ -440,19 +440,6 @@ def _row_to_hit(uuid_, sid, ts, cwd, snippet, msg_id, req_id):
     }
 
 
-def _dedup_hits(hits, limit, offset):
-    seen = set()
-    out = []
-    for h in hits:
-        key = (h["session_id"], h["uuid"])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(h)
-    total = len(out)
-    return out[offset:offset + limit], total
-
-
 def _attach_costs(conn, page):
     """Compute turn cost for the FINAL page's hits in ONE _turn_cost_map call,
     then map it onto each hit and drop the private `_turn_key`. Off-page and
@@ -465,45 +452,126 @@ def _attach_costs(conn, page):
     return page
 
 
-def _search_fts(conn, q, limit, offset):
-    sql = (
-        "SELECT cm.session_id, cm.uuid, cm.timestamp_utc, cm.cwd, "
-        "       cm.msg_id, cm.req_id, "
-        "       snippet(conversation_fts, 0, '[', ']', ' … ', 12) AS snip "
+def _like_pattern(q):
+    """Build the LIKE pattern for `q`. Escape the ESCAPE char (\\) FIRST, then
+    the wildcards — otherwise a query containing a backslash (incl. a trailing
+    one) mis-escapes the appended '%' and the LIKE silently matches nothing
+    (paired with ESCAPE '\\' in the queries below)."""
+    return ("%" + q.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+            + "%")
+
+
+def _fts_snippets(conn, fts_q, ids):
+    """{rowid: snippet} for the page rowids ONLY (#149). snippet() needs an
+    active MATCH, so it can't be deferred to an outer query over the page CTE;
+    a second bounded MATCH restricted to the page rowids generates snippets for
+    at most one page of hits instead of every corpus match."""
+    if not ids:
+        return {}
+    ph = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        "SELECT cm.id, snippet(conversation_fts, 0, '[', ']', ' … ', 12) "
         "FROM conversation_fts "
         "JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
-        "WHERE conversation_fts MATCH ? "
-        # cm.id is the final tiebreaker so equal (rank, timestamp) hits order
-        # deterministically — _dedup_hits keeps the FIRST occurrence, so without
-        # it the surviving snippet/cost (and page boundary) would flip run-to-run.
-        "ORDER BY bm25(conversation_fts), cm.timestamp_utc DESC, cm.id DESC"
-    )
-    raw = conn.execute(sql, (_fts_query(q),)).fetchall()
-    hits = [_row_to_hit(u, sid, ts, cwd, snip, mid, rqd)
-            for (sid, u, ts, cwd, mid, rqd, snip) in raw]
-    page, total = _dedup_hits(hits, limit, offset)
-    return {"query": q, "mode": "fts", "hits": _attach_costs(conn, page),
+        f"WHERE conversation_fts MATCH ? AND cm.id IN ({ph})",
+        (fts_q, *ids),
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def _texts_for_ids(conn, ids):
+    """{rowid: text} for the page rowids ONLY (#149) — the LIKE page query omits
+    `text` so we never pull every matched row's body into Python; this fetches
+    it for just the page so `_manual_snippet` runs at most `limit` times."""
+    if not ids:
+        return {}
+    ph = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT id, text FROM conversation_messages WHERE id IN ({ph})",
+        tuple(ids),
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def _search_fts(conn, q, limit, offset):
+    # All of dedup + paging + total live in SQL (#149) so Python never holds
+    # more than one page of hits/snippets, regardless of corpus match count.
+    fts_q = _fts_query(q)
+    # Exact post-dedup logical total — counted in C with no snippet generation
+    # and no Python row materialization.
+    total = conn.execute(
+        "SELECT COUNT(*) FROM ("
+        "  SELECT DISTINCT cm.session_id, cm.uuid "
+        "  FROM conversation_fts "
+        "  JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
+        "  WHERE conversation_fts MATCH ?)",
+        (fts_q,),
+    ).fetchone()[0]
+    # One row per logical (session_id, uuid): ROW_NUMBER()=1 keeps the SAME row
+    # the old Python dedup kept as its FIRST occurrence (order: bm25, ts DESC,
+    # id DESC — cm.id is the final deterministic tiebreaker), so the surviving
+    # snippet/cost and the page boundary stay byte-stable. bm25 still ranks
+    # across all matches (inherent to relevance ordering).
+    #
+    # bm25 is materialized as a plain `rank` column in the inner `matched` CTE
+    # before the window function runs: FTS5 auxiliary functions (bm25/snippet)
+    # may only be used directly against the MATCH query, NOT inside a window
+    # ORDER BY ("unable to use function bm25 in the requested context").
+    page = conn.execute(
+        "WITH matched AS ("
+        "  SELECT cm.id AS rid, cm.session_id AS sid, cm.uuid AS uuid, "
+        "         cm.timestamp_utc AS ts, cm.cwd AS cwd, "
+        "         cm.msg_id AS mid, cm.req_id AS rqd, "
+        "         bm25(conversation_fts) AS rank "
+        "  FROM conversation_fts "
+        "  JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
+        "  WHERE conversation_fts MATCH ?), "
+        "ranked AS ("
+        "  SELECT *, ROW_NUMBER() OVER ("
+        "             PARTITION BY sid, uuid ORDER BY rank, ts DESC, rid DESC"
+        "           ) AS rn "
+        "  FROM matched) "
+        "SELECT rid, sid, uuid, ts, cwd, mid, rqd FROM ranked WHERE rn = 1 "
+        "ORDER BY rank, ts DESC, rid DESC LIMIT ? OFFSET ?",
+        (fts_q, limit, offset),
+    ).fetchall()
+    snips = _fts_snippets(conn, fts_q, [r[0] for r in page])
+    hits = [_row_to_hit(uuid, sid, ts, cwd, snips.get(rid, ""), mid, rqd)
+            for (rid, sid, uuid, ts, cwd, mid, rqd) in page]
+    return {"query": q, "mode": "fts", "hits": _attach_costs(conn, hits),
             "total": total}
 
 
 def _search_like(conn, q, limit, offset):
-    # Escape the ESCAPE char (\) FIRST, then the wildcards — otherwise a query
-    # containing a backslash (incl. a trailing one) mis-escapes the appended
-    # '%' and the LIKE silently matches nothing (ESCAPE '\' below).
-    like = ("%" + q.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
-            + "%")
-    sql = (
-        "SELECT session_id, uuid, timestamp_utc, cwd, msg_id, req_id, text "
-        "FROM conversation_messages "
-        "WHERE text LIKE ? ESCAPE '\\' AND text != '' "
-        "ORDER BY timestamp_utc DESC, id DESC"
-    )
-    hits = []
-    for sid, u, ts, cwd, mid, rqd, text in conn.execute(sql, (like,)):
-        hits.append(_row_to_hit(u, sid, ts, cwd,
-                                _manual_snippet(text, q), mid, rqd))
-    page, total = _dedup_hits(hits, limit, offset)
-    return {"query": q, "mode": "like", "hits": _attach_costs(conn, page),
+    # SQL-bounded mirror of _search_fts for the no-FTS5 fallback (#149); the
+    # COUNT + page each scan the table once (the degraded path already lacks an
+    # index for the substring match).
+    like = _like_pattern(q)
+    total = conn.execute(
+        "SELECT COUNT(*) FROM ("
+        "  SELECT DISTINCT session_id, uuid FROM conversation_messages "
+        "  WHERE text LIKE ? ESCAPE '\\' AND text != '')",
+        (like,),
+    ).fetchone()[0]
+    page = conn.execute(
+        "WITH ranked AS ("
+        "  SELECT id AS rid, session_id AS sid, uuid AS uuid, "
+        "         timestamp_utc AS ts, cwd AS cwd, msg_id AS mid, req_id AS rqd, "
+        "         ROW_NUMBER() OVER ("
+        "           PARTITION BY session_id, uuid "
+        "           ORDER BY timestamp_utc DESC, id DESC"
+        "         ) AS rn "
+        "  FROM conversation_messages "
+        "  WHERE text LIKE ? ESCAPE '\\' AND text != '') "
+        "SELECT rid, sid, uuid, ts, cwd, mid, rqd FROM ranked WHERE rn = 1 "
+        "ORDER BY ts DESC, rid DESC LIMIT ? OFFSET ?",
+        (like, limit, offset),
+    ).fetchall()
+    texts = _texts_for_ids(conn, [r[0] for r in page])
+    hits = [_row_to_hit(uuid, sid, ts, cwd,
+                        _manual_snippet(texts.get(rid, ""), q), mid, rqd)
+            for (rid, sid, uuid, ts, cwd, mid, rqd) in page]
+    return {"query": q, "mode": "like", "hits": _attach_costs(conn, hits),
             "total": total}
 
 
