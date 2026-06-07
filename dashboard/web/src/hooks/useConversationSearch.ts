@@ -1,4 +1,3 @@
-// dashboard/web/src/hooks/useConversationSearch.ts
 import { useEffect, useRef, useState } from 'react';
 import { fetchJson, isAbortError } from '../lib/fetchJson';
 import { useDebouncedValue } from './useDebouncedValue';
@@ -23,41 +22,48 @@ export function useConversationSearch(query: string): UseConversationSearch {
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [mode, setMode] = useState<'fts' | 'like' | null>(null);
   const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(false);
+  const [fetching, setFetching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const q = query.trim();
   const debouncedQ = useDebouncedValue(q, DEBOUNCE_MS, '');
   const ctlRef = useRef<AbortController | null>(null);
 
-  // (1) Immediate, keyed on the raw needle: empty -> synchronous reset;
-  //     non-empty -> show loading. Cleanup aborts any in-flight fetch the
-  //     instant the needle changes (incl. clear), so a prior-needle response
-  //     can never commit late over the newer needle's state.
+  // Reset on an empty needle, and abort any in-flight fetch the instant the raw
+  // needle changes (incl. clear) — so a prior-needle response can never commit
+  // late over the newer needle's state.
   useEffect(() => {
-    if (!q) { setHits([]); setMode(null); setTotal(0); setLoading(false); setError(null); }
-    else { setLoading(true); }
+    if (!q) { setHits([]); setMode(null); setTotal(0); setError(null); }
     return () => { ctlRef.current?.abort(); };
   }, [q]);
 
-  // (2) Fetch, keyed on the settled needle.
+  // Fetch, keyed on the settled needle.
   useEffect(() => {
-    if (!debouncedQ) return;
+    if (!debouncedQ) { setFetching(false); return; }
     const ctl = new AbortController();
     ctlRef.current = ctl;
+    setFetching(true);
     fetchJson<ConversationSearchResult>(
       `/api/conversation/search?q=${encodeURIComponent(debouncedQ)}&limit=50&offset=0`,
       ctl.signal,
     )
       .then((body) => {
         setHits(body.hits); setMode(body.mode); setTotal(body.total);
-        setError(null); setLoading(false);
+        setError(null); setFetching(false);
       })
       .catch((e) => {
         if (isAbortError(e)) return;
-        setError('Search failed.'); setLoading(false);
+        setError('Search failed.'); setFetching(false);
       });
     return () => ctl.abort();
   }, [debouncedQ]);
+
+  // `loading` is DERIVED, not imperatively set: true while a non-empty needle's
+  // results aren't ready — either the debounce hasn't caught up to the typed
+  // needle (q !== debouncedQ, the immediate-feedback case) or the settled-needle
+  // fetch is in flight. Deriving it avoids a stuck-true state when the needle
+  // oscillates back to an already-settled value within the debounce window
+  // (debouncedQ never changes, so no fetch re-fires to clear an imperative flag).
+  const loading = q !== '' && (q !== debouncedQ || fetching);
 
   return { hits, mode, total, loading, error };
 }

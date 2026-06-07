@@ -106,4 +106,24 @@ describe('useConversationSearch', () => {
     expect(result.current.hits).toEqual([]);                   // stale 'old' never committed
     expect(result.current.mode).toBeNull();
   });
+
+  it('does not get stuck loading when the needle oscillates back to a settled value within the debounce window', async () => {
+    // 'a' settles + fetches (empty result) -> loading false. Then 'a' -> 'ab' -> 'a'
+    // within the window: debouncedQ never leaves 'a', so no re-fetch fires and
+    // loading must return to false (not stick true on the perpetual-spinner path).
+    mockFetchOnce({ query: 'a', mode: 'fts', hits: [], total: 0 });
+    const { result, rerender } = renderHook(({ q }) => useConversationSearch(q), { initialProps: { q: 'a' } });
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.loading).toBe(false);              // settled + idle
+
+    rerender({ q: 'ab' });
+    await act(async () => { vi.advanceTimersByTime(50); });   // within the window
+    rerender({ q: 'a' });
+    await act(async () => { vi.advanceTimersByTime(250); });  // debounce elapses; debouncedQ stays 'a'
+    await act(async () => { await Promise.resolve(); });
+
+    expect(result.current.loading).toBe(false);              // NOT stuck true
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);  // no redundant re-fetch
+  });
 });
