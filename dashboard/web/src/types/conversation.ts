@@ -14,6 +14,8 @@ export type ConversationItem =
       blocks: ConversationBlock[];
       model: string | null;
       is_sidechain: boolean;
+      subagent_key: string | null; // agent-file hash; null for the main session
+      parent_uuid: string | null;  // raw parent uuid (for cross-file nesting)
       cost_usd: number; // the TURN's cost, counted ONCE (0.0 for null msg_id)
     }
   | {
@@ -25,6 +27,8 @@ export type ConversationItem =
       text: string; // "" for tool_result rows
       blocks: ConversationBlock[];
       is_sidechain: boolean;
+      subagent_key: string | null;
+      parent_uuid: string | null;
       model?: string | null; // present only on the null-msg_id assistant case
       cost_usd?: number; // present (0.0) only on the null-msg_id assistant case
     };

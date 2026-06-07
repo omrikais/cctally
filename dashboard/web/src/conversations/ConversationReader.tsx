@@ -94,9 +94,9 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
         </div>
       </div>
       <div className="conv-reader-body">
-        {groups.map((g, i) =>
-          g.kind === 'sidechain'
-            ? <SidechainGroup key={`sc-${i}`} items={g.items} />
+        {groups.map((g) =>
+          g.kind === 'subagent'
+            ? <SidechainGroup key={`sc-${g.subagentKey}`} subagentKey={g.subagentKey} items={g.items} nested={g.nested} />
             : <MessageItem key={g.item.anchor.uuid} item={g.item} ref={setItemRef(g.item)} />,
         )}
         {hasMore && <div ref={sentinelRef} className="conv-load-sentinel">Loading more…</div>}

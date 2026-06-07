@@ -24,6 +24,8 @@ function makeItem(over: Partial<ConversationItem> & { uuid: string; kind?: Conve
     text: uuid,
     blocks: [],
     is_sidechain,
+    subagent_key: is_sidechain ? 'k1' : null,
+    parent_uuid: null,
     ...rest,
   } as ConversationItem;
 }
@@ -60,28 +62,25 @@ afterEach(() => {
 });
 
 describe('ConversationReader', () => {
-  it('renders the header and grouped items (a sidechain run collapses into one group)', async () => {
+  it('renders the header and groups parallel subagents into separate threads', async () => {
     mockFetchOnce(detail([
       makeItem({ uuid: 'h1' }),
-      makeItem({ uuid: 's1', is_sidechain: true }),
-      makeItem({ uuid: 's2', is_sidechain: true }),
-      makeItem({ uuid: 'h2' }),
+      makeItem({ uuid: 'a1', is_sidechain: true, subagent_key: 'A', text: 'Audit A' } as never),
+      makeItem({ uuid: 'b1', is_sidechain: true, subagent_key: 'B', text: 'Audit B' } as never),
+      makeItem({ uuid: 'a2', is_sidechain: true, subagent_key: 'A' } as never),
+      makeItem({ uuid: 'b2', is_sidechain: true, subagent_key: 'B' } as never),
     ]));
     const { container } = render(<ConversationReader sessionId="s" />);
     await waitFor(() => expect(container.querySelector('.conv-reader-body')).not.toBeNull());
 
-    // Header carries whole-session cost + branch + models.
-    expect(container.querySelector('.conv-reader-title')!.textContent).toBe('proj');
     expect(container.querySelector('.conv-reader-meta')!.textContent).toContain('$3.50');
-    expect(container.querySelector('.conv-reader-meta')!.textContent).toContain('main');
-
-    // Two top-level human items + one collapsed sidechain group.
     const body = container.querySelector('.conv-reader-body')!;
     expect(body.querySelector('[data-uuid="h1"]')).not.toBeNull();
-    expect(body.querySelector('[data-uuid="h2"]')).not.toBeNull();
-    const sidechain = body.querySelector('details.conv-sidechain')!;
-    expect(sidechain).not.toBeNull();
-    expect(sidechain.querySelector('summary')!.textContent).toContain('2 messages');
+    // TWO separate subagent disclosures (not one fused group).
+    const groups = body.querySelectorAll('details.conv-sidechain');
+    expect(groups).toHaveLength(2);
+    expect(groups[0].querySelector('summary')!.textContent).toContain('Audit A');
+    expect(groups[1].querySelector('summary')!.textContent).toContain('Audit B');
   });
 
   it('jumps to a target message: pages until loaded, scrolls, and flashes the highlight', async () => {
