@@ -66,6 +66,24 @@ describe('groupSidechains', () => {
     expect(g.items.map((i) => i.anchor.uuid)).toEqual(['c1', 'c2']);
   });
 
+  it('nests under a parent that appears AFTER the bucket in document order (nesting beats position)', () => {
+    // The subagent rows precede their parent main item in time, but a nested
+    // group emits UNDER its parent — not at the bucket's first-member position.
+    // Locks the "nesting wins over document position" placement invariant.
+    const out = groupSidechains([
+      mk('c1', { subagentKey: 'C', parentUuid: 'm1' }),
+      mk('c2', { subagentKey: 'C' }),
+      mk('m1'),
+    ]);
+    expect(out.map((n) => n.kind)).toEqual(['item', 'subagent']);
+    const first = out[0];
+    if (first.kind !== 'item') throw new Error('expected item node');
+    expect(first.item.anchor.uuid).toBe('m1');
+    const g = group(out[1]);
+    expect(g.nested).toBe(true);
+    expect(g.items.map((i) => i.anchor.uuid)).toEqual(['c1', 'c2']);
+  });
+
   it('does NOT nest when the root parent_uuid does not resolve to a loaded main item', () => {
     const out = groupSidechains([mk('h'), mk('c1', { subagentKey: 'C', parentUuid: 'missing' })]);
     expect(group(out[1]).nested).toBe(false);
