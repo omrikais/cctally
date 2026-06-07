@@ -1,10 +1,14 @@
-import { useEffect, useState } from 'react';
+// dashboard/web/src/hooks/useConversationSearch.ts
+import { useEffect, useRef, useState } from 'react';
+import { fetchJson, isAbortError } from '../lib/fetchJson';
+import { useDebouncedValue } from './useDebouncedValue';
 import type { ConversationSearchResult, SearchHit } from '../types/conversation';
 
-// Debounced cross-session search. Empty/whitespace needle → no fetch,
-// empty hits. 200ms debounce. v1 shows the first page (limit 50); the
-// rail's "load more" can extend via offset using `total`. `mode` (fts |
-// like) lets the rail show a subtle "(basic search)" hint on LIKE.
+// Debounced cross-session search. Empty/whitespace needle -> no fetch, empty
+// hits. 200ms debounce (even on the first keystroke: the rail mounts this hook
+// with a non-empty needle, so useDebouncedValue is seeded with '' to defer it).
+// v1 shows the first page (limit 50); `total` lets the rail extend via offset.
+// `mode` (fts | like) lets the rail show a subtle "(basic search)" hint on LIKE.
 export interface UseConversationSearch {
   hits: SearchHit[];
   mode: 'fts' | 'like' | null;
@@ -22,29 +26,38 @@ export function useConversationSearch(query: string): UseConversationSearch {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const q = query.trim();
+  const debouncedQ = useDebouncedValue(q, DEBOUNCE_MS, '');
+  const ctlRef = useRef<AbortController | null>(null);
 
+  // (1) Immediate, keyed on the raw needle: empty -> synchronous reset;
+  //     non-empty -> show loading. Cleanup aborts any in-flight fetch the
+  //     instant the needle changes (incl. clear), so a prior-needle response
+  //     can never commit late over the newer needle's state.
   useEffect(() => {
-    if (!q) {
-      setHits([]); setMode(null); setTotal(0); setLoading(false); setError(null);
-      return;
-    }
-    setLoading(true);
-    const ctl = new AbortController();
-    const t = setTimeout(() => {
-      fetch(`/api/conversation/search?q=${encodeURIComponent(q)}&limit=50&offset=0`, { signal: ctl.signal })
-        .then(async (r) => {
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          const body = (await r.json()) as ConversationSearchResult;
-          setHits(body.hits); setMode(body.mode); setTotal(body.total);
-          setError(null); setLoading(false);
-        })
-        .catch((e) => {
-          if ((e as DOMException)?.name === 'AbortError') return;
-          setError('Search failed.'); setLoading(false);
-        });
-    }, DEBOUNCE_MS);
-    return () => { clearTimeout(t); ctl.abort(); };
+    if (!q) { setHits([]); setMode(null); setTotal(0); setLoading(false); setError(null); }
+    else { setLoading(true); }
+    return () => { ctlRef.current?.abort(); };
   }, [q]);
+
+  // (2) Fetch, keyed on the settled needle.
+  useEffect(() => {
+    if (!debouncedQ) return;
+    const ctl = new AbortController();
+    ctlRef.current = ctl;
+    fetchJson<ConversationSearchResult>(
+      `/api/conversation/search?q=${encodeURIComponent(debouncedQ)}&limit=50&offset=0`,
+      ctl.signal,
+    )
+      .then((body) => {
+        setHits(body.hits); setMode(body.mode); setTotal(body.total);
+        setError(null); setLoading(false);
+      })
+      .catch((e) => {
+        if (isAbortError(e)) return;
+        setError('Search failed.'); setLoading(false);
+      });
+    return () => ctl.abort();
+  }, [debouncedQ]);
 
   return { hits, mode, total, loading, error };
 }

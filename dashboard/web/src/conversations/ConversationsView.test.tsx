@@ -32,17 +32,8 @@ import {
 } from '../store/keymap';
 import { openPanelByPosition } from '../lib/openPanelByPosition';
 import { stubMobileMedia } from '../test-utils/mobileMedia';
+import { installIntersectionObserverStub } from '../test-utils/intersectionObserver';
 import type { Envelope, SessionRow } from '../types/envelope';
-
-// jsdom lacks IntersectionObserver — the reader's lazy-load sentinel
-// effect constructs one. Install a minimal no-op so the reader mounts.
-class IntersectionObserverStub {
-  constructor(_cb: IntersectionObserverCallback) {}
-  observe(): void {}
-  unobserve(): void {}
-  disconnect(): void {}
-  takeRecords(): IntersectionObserverEntry[] { return []; }
-}
 
 // Mirror of main.tsx's view-aware global panel-digit binding. Registered
 // here (rather than importing main.tsx, which boots SSE + createRoot against
@@ -192,8 +183,7 @@ beforeEach(() => {
   installGlobalKeydown();
   registerPanelDigitBindings();
   installRoutedFetch();
-  (globalThis as unknown as { IntersectionObserver: typeof IntersectionObserverStub }).IntersectionObserver =
-    IntersectionObserverStub;
+  installIntersectionObserverStub();
 });
 
 afterEach(() => {

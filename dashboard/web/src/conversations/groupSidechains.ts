@@ -12,24 +12,23 @@ export type RenderNode =
   | { kind: 'subagent'; subagentKey: string; items: ConversationItem[]; nested: boolean };
 
 export function groupSidechains(items: ConversationItem[]): RenderNode[] {
-  // 1. Bucket sidechain items by subagent_key (document order; bucket[0] = root).
+  // 1. Single pass: bucket sidechain items by subagent_key (document order,
+  //    bucket[0] = root) AND index every main item's member uuid -> the main
+  //    item, for nest resolution.
   const buckets = new Map<string, ConversationItem[]>();
-  for (const it of items) {
-    const k = it.subagent_key;
-    if (k == null) continue;
-    const b = buckets.get(k);
-    if (b) b.push(it);
-    else buckets.set(k, [it]);
-  }
-
-  // 2. Map every main item's member uuid -> the main item, for nest resolution.
   const mainByUuid = new Map<string, ConversationItem>();
   for (const it of items) {
-    if (it.subagent_key != null) continue;
-    for (const u of it.member_uuids) mainByUuid.set(u, it);
+    const k = it.subagent_key;
+    if (k != null) {
+      const b = buckets.get(k);
+      if (b) b.push(it);
+      else buckets.set(k, [it]);
+    } else {
+      for (const u of it.member_uuids) mainByUuid.set(u, it);
+    }
   }
 
-  // 3. Classify each bucket: nested iff the root's parent_uuid resolves to a
+  // 2. Classify each bucket: nested iff the root's parent_uuid resolves to a
   //    loaded main item. nestedByParent maps that main item's anchor uuid ->
   //    the subagent keys to emit right after it.
   const nested = new Set<string>();
@@ -46,7 +45,7 @@ export function groupSidechains(items: ConversationItem[]): RenderNode[] {
     }
   }
 
-  // 4. Emit in render order.
+  // 3. Emit in render order.
   const out: RenderNode[] = [];
   const emitted = new Set<string>();
   const emit = (k: string) => {
@@ -64,7 +63,7 @@ export function groupSidechains(items: ConversationItem[]): RenderNode[] {
       emit(k); // non-nested: at the root's document position
     }
   }
-  // 5. Final sweep: any bucket not yet emitted (defensive — guarantees no
+  // 4. Final sweep: any bucket not yet emitted (defensive — guarantees no
   //    sidechain item is ever dropped).
   for (const k of buckets.keys()) if (!emitted.has(k)) emit(k);
   return out;

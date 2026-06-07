@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useConversation } from '../hooks/useConversation';
 import { useReducedMotion } from '../hooks/useReducedMotion';
@@ -6,6 +6,7 @@ import { groupSidechains } from './groupSidechains';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
 import { fmt } from '../lib/fmt';
+import type { ConversationItem } from '../types/conversation';
 
 // Paginated transcript reader (spec §4). Lazy-loads the next page when a
 // bottom sentinel scrolls into view (IntersectionObserver), and supports a
@@ -20,6 +21,9 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   const reduced = useReducedMotion();
   const sentinelRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  // Per-anchor-uuid memoized ref callbacks: a stable callback identity per item
+  // so the memo'd MessageItems don't detach/re-attach on every paged append.
+  const refCallbacks = useRef<Map<string, (el: HTMLDivElement | null) => void>>(new Map());
   // Tracks the pending highlight-removal timeout so it can be cancelled on
   // unmount (no classList.remove on a detached node, no leaked timer) and
   // superseded on a rapid re-jump (no two overlapping 2s timers racing).
@@ -41,7 +45,7 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   // page nowhere, and clear the jump prematurely. It re-runs when
   // detail?.items.length grows, so it engages once page 1 has landed.
   useEffect(() => {
-    if (!jump || jump.session_id !== sessionId || !detail) return;
+    if (!jump || jump.session_id !== sessionId || !detail || detail.session_id !== sessionId) return;
     let cancelled = false;
     void (async () => {
       await loadUntil(jump.uuid);
@@ -90,14 +94,27 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
     if (highlightTimerRef.current != null) window.clearTimeout(highlightTimerRef.current);
   }, []);
 
-  const setItemRef = (item: { member_uuids: string[] }) => (el: HTMLDivElement | null) => {
-    // Map EVERY member uuid → this element so a search hit on any
-    // fragment resolves (anchor uuid is a prose fragment, but the
-    // all-member map is belt-and-suspenders per spec §3).
-    for (const u of item.member_uuids) {
-      if (el) itemRefs.current.set(u, el); else itemRefs.current.delete(u);
+  // The reader is reused across session switches (ConversationsView mounts it at
+  // a fixed position), so drop stale ref callbacks when the session changes.
+  useEffect(() => () => { refCallbacks.current.clear(); }, [sessionId]);
+
+  const getItemRef = useCallback((item: ConversationItem) => {
+    const cache = refCallbacks.current;
+    const key = item.anchor.uuid;
+    let cb = cache.get(key);
+    if (!cb) {
+      cb = (el: HTMLDivElement | null) => {
+        // Map EVERY member uuid -> this element so a search hit on any folded
+        // fragment resolves (anchor uuid is one prose fragment; the all-member
+        // map is belt-and-suspenders per spec §3).
+        for (const u of item.member_uuids) {
+          if (el) itemRefs.current.set(u, el); else itemRefs.current.delete(u);
+        }
+      };
+      cache.set(key, cb);
     }
-  };
+    return cb;
+  }, []);
 
   if (loading && !detail) return <div className="conv-reader conv-reader--loading">Loading…</div>;
   if (error) return <div className="conv-reader conv-reader--error">{error}</div>;
@@ -118,7 +135,7 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
         {groups.map((g) =>
           g.kind === 'subagent'
             ? <SidechainGroup key={`sc-${g.subagentKey}`} subagentKey={g.subagentKey} items={g.items} nested={g.nested} />
-            : <MessageItem key={g.item.anchor.uuid} item={g.item} ref={setItemRef(g.item)} />,
+            : <MessageItem key={g.item.anchor.uuid} item={g.item} ref={getItemRef(g.item)} />,
         )}
         {hasMore && <div ref={sentinelRef} className="conv-load-sentinel">Loading more…</div>}
       </div>

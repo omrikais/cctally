@@ -73,4 +73,37 @@ describe('useConversationSearch', () => {
     expect(result.current.mode).toBe('like');                 // newer needle won
     expect(result.current.hits[0].uuid).toBe('new');
   });
+
+  it('aborts the in-flight fetch the instant the needle changes — a late prior-needle response cannot commit (ctlRef)', async () => {
+    // 'old' fetch is in flight when the needle advances to 'older'; effect (1)'s
+    // cleanup aborts 'old' IMMEDIATELY. Resolving the (now-aborted) 'old'
+    // response DURING the debounce window (before 'older' settles) must be
+    // ignored. Without the ctlRef abort, 'old' would still be in flight and its
+    // response would commit stale hits here.
+    const oldResult = {
+      query: 'old', mode: 'fts',
+      hits: [{ session_id: 'a', uuid: 'old', project_label: 'p', ts: '2026-01-01T00:00:00Z', snippet: 'old', cost_usd: 0.1 }],
+      total: 1,
+    };
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    let resolveOld: (v: unknown) => void = () => {};
+    fetchMock.mockImplementationOnce((_url: string, opts: { signal: AbortSignal }) =>
+      new Promise((res, rej) => {
+        opts.signal.addEventListener('abort', () => rej(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+        resolveOld = res;
+      }),
+    );
+
+    const { result, rerender } = renderHook(({ q }) => useConversationSearch(q), { initialProps: { q: 'old' } });
+    await act(async () => { vi.advanceTimersByTime(250); });   // 'old' debounce fires -> 'old' fetch in flight
+    rerender({ q: 'older' });                                  // raw-q change -> effect (1) cleanup aborts 'old' now
+    // Resolve 'old' DURING the window (before 'older' settles): must be ignored.
+    await act(async () => {
+      resolveOld({ ok: true, status: 200, json: async () => oldResult });
+      await Promise.resolve(); await Promise.resolve();
+    });
+
+    expect(result.current.hits).toEqual([]);                   // stale 'old' never committed
+    expect(result.current.mode).toBeNull();
+  });
 });

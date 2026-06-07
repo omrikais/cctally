@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { fetchJson, isAbortError } from '../lib/fetchJson';
 import { useSnapshot } from './useSnapshot';
 import type { ConversationSummary, ConversationsPage } from '../types/conversation';
 
@@ -36,17 +37,15 @@ export function useConversations(): UseConversations {
     // accumulated tail or rewind the cursor. A fresh load happens on remount.
     if (loadingMoreRef.current || rows.length > PAGE) return;
     const ctl = new AbortController();
-    fetch(`/api/conversations?sort=recent&limit=${PAGE}&offset=0`, { signal: ctl.signal })
-      .then(async (r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const body = (await r.json()) as ConversationsPage;
+    fetchJson<ConversationsPage>(`/api/conversations?sort=recent&limit=${PAGE}&offset=0`, ctl.signal)
+      .then((body) => {
         setRows(body.conversations);
         setNextOffset(body.page.next_offset);
         setError(null);
         setLoading(false);
       })
       .catch((e) => {
-        if ((e as DOMException)?.name === 'AbortError') return;
+        if (isAbortError(e)) return;
         setError("Couldn't load conversations.");
         setLoading(false);
       });
@@ -58,9 +57,7 @@ export function useConversations(): UseConversations {
     if (nextOffset == null || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
     try {
-      const r = await fetch(`/api/conversations?sort=recent&limit=${PAGE}&offset=${nextOffset}`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const body = (await r.json()) as ConversationsPage;
+      const body = await fetchJson<ConversationsPage>(`/api/conversations?sort=recent&limit=${PAGE}&offset=${nextOffset}`);
       setRows((prev) => [...prev, ...body.conversations]);
       setNextOffset(body.page.next_offset);
     } catch {

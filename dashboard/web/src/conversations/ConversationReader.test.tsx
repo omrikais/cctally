@@ -1,18 +1,9 @@
-import { render, waitFor } from '@testing-library/react';
+import { act, render, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationReader } from './ConversationReader';
 import { _resetForTests, dispatch, getState } from '../store/store';
+import { installIntersectionObserverStub } from '../test-utils/intersectionObserver';
 import type { ConversationItem } from '../types/conversation';
-
-// jsdom lacks IntersectionObserver — install a minimal no-op so the
-// lazy-load sentinel effect can mount without throwing.
-class IntersectionObserverStub {
-  constructor(_cb: IntersectionObserverCallback) {}
-  observe(): void {}
-  unobserve(): void {}
-  disconnect(): void {}
-  takeRecords(): IntersectionObserverEntry[] { return []; }
-}
 
 function makeItem(over: Partial<ConversationItem> & { uuid: string; kind?: ConversationItem['kind']; is_sidechain?: boolean }): ConversationItem {
   const { uuid, kind = 'human', is_sidechain = false, ...rest } = over;
@@ -53,8 +44,7 @@ function mockFetchOnce(body: unknown, status = 200) {
 beforeEach(() => {
   _resetForTests();
   globalThis.fetch = vi.fn();
-  (globalThis as unknown as { IntersectionObserver: typeof IntersectionObserverStub }).IntersectionObserver =
-    IntersectionObserverStub;
+  installIntersectionObserverStub();
 });
 afterEach(() => {
   _resetForTests();
@@ -143,5 +133,66 @@ describe('ConversationReader', () => {
     // of times (page 1 + page 2 = 2; allow a small constant for re-renders).
     expect(scrollSpy).not.toHaveBeenCalled();
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBeLessThanOrEqual(4);
+  });
+
+  it('does not clear a cross-session jump while detail still belongs to the prior session (cross-session guard)', async () => {
+    // The reader is reused across session switches (ConversationsView mounts it
+    // at a fixed position), so for one render pass it can hold the PRIOR
+    // session's detail while sessionId + jump already point at the NEW session.
+    // Modelled here as a stable window: the reader is asked for session 'B'
+    // (jump 'B/targetB'), but the loaded detail reports session 's' with no
+    // more pages and without targetB. Without the detail.session_id===sessionId
+    // guard the jump effect runs against the 's' detail, finds nothing, and
+    // (s having no more pages) clears the jump prematurely so 'B' never scrolls.
+    // With the guard it short-circuits and leaves the jump set, waiting for 'B'.
+    mockFetchOnce({
+      session_id: 's', project_label: 'proj', git_branch: 'main',
+      started_utc: '2026-01-01T00:00:00Z', last_activity_utc: '2026-01-01T02:00:00Z',
+      cost_usd: 1, models: ['claude-opus-4'],
+      items: [makeItem({ uuid: 'a1' })],
+      page: { next_after: null, has_more: false },   // s: fully loaded, no more pages
+    });
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'B', jump: { session_id: 'B', uuid: 'targetB' } });
+    render(<ConversationReader sessionId="B" />);
+    // Let the loaded-'s' detail land and the jump effect run to completion.
+    await act(async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); });
+
+    // The guard kept the jump alive (it would resolve once 'B' itself loads);
+    // the give-up branch did NOT fire against the cross-session 's' detail.
+    expect(getState().conversationJump).toEqual({ session_id: 'B', uuid: 'targetB' });
+    expect(scrollSpy).not.toHaveBeenCalled();
+  });
+
+  it('resolves a jump into a different session after the new session loads (cross-session guard, full flow)', async () => {
+    // Behavior-preservation guard: once the reused reader's detail catches up to
+    // the new session 'B' (which carries the jump target), the jump resolves —
+    // it scrolls + flashes 'B's target rather than staying stuck.
+    mockFetchOnce(detail([makeItem({ uuid: 'a1' })], null));   // session 's': one item, no more
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+
+    const { container, rerender } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="a1"]')).not.toBeNull());
+
+    // Queue 'B' page-1 (carries the jump target), then open the hit + switch.
+    mockFetchOnce({
+      session_id: 'B', project_label: 'proj', git_branch: 'main',
+      started_utc: '2026-01-01T00:00:00Z', last_activity_utc: '2026-01-01T02:00:00Z',
+      cost_usd: 1, models: ['claude-opus-4'],
+      items: [{
+        kind: 'human', anchor: { session_id: 'B', uuid: 'targetB', id: 0 },
+        member_uuids: ['targetB'], ts: 't', text: 'targetB', blocks: [],
+        is_sidechain: false, subagent_key: null, parent_uuid: null,
+      }],
+      page: { next_after: null, has_more: false },
+    });
+    act(() => { dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'B', jump: { session_id: 'B', uuid: 'targetB' } }); });
+    rerender(<ConversationReader sessionId="B" />);
+
+    // 'B' lands; the jump resolves against 'B' (scroll + flash), not cleared early.
+    await waitFor(() => expect(container.querySelector('[data-uuid="targetB"]')).not.toBeNull());
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    expect(container.querySelector('[data-uuid="targetB"]')!.classList.contains('conv-item--jumped')).toBe(true);
   });
 });

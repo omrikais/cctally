@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { fetchJson, HttpError, isAbortError } from '../lib/fetchJson';
 import type { ConversationDetail } from '../types/conversation';
 
 // Paginated reader. UNLIKE useProjectDetail/useConversations, this does
@@ -46,17 +47,15 @@ export function useConversation(sessionId: string | null): UseConversation {
     if (!sessionId) { setDetailSynced(null); setLoading(false); setError(null); nextAfterRef.current = null; return; }
     setLoading(true); setError(null); setDetailSynced(null); nextAfterRef.current = null;
     const ctl = new AbortController();
-    fetch(`/api/conversation/${encodeURIComponent(sessionId)}?limit=${PAGE}`, { signal: ctl.signal })
-      .then(async (r) => {
-        if (r.status === 404) { setError('Conversation not found.'); setLoading(false); return; }
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const body = (await r.json()) as ConversationDetail;
+    fetchJson<ConversationDetail>(`/api/conversation/${encodeURIComponent(sessionId)}?limit=${PAGE}`, ctl.signal)
+      .then((body) => {
         setDetailSynced(body);
         nextAfterRef.current = body.page.next_after;
         setLoading(false);
       })
       .catch((e) => {
-        if ((e as DOMException)?.name === 'AbortError') return;
+        if (isAbortError(e)) return;
+        if (e instanceof HttpError && e.status === 404) { setError('Conversation not found.'); setLoading(false); return; }
         setError("Couldn't load the conversation."); setLoading(false);
       });
     return () => ctl.abort();
@@ -70,15 +69,16 @@ export function useConversation(sessionId: string | null): UseConversation {
     if (after == null || sid == null || loadingMoreRef.current) return false;
     loadingMoreRef.current = true;
     try {
-      const r = await fetch(`/api/conversation/${encodeURIComponent(sid)}?limit=${PAGE}&after=${after}`);
-      if (!r.ok) return false;
-      const body = (await r.json()) as ConversationDetail;
+      let body: ConversationDetail;
+      try {
+        body = await fetchJson<ConversationDetail>(`/api/conversation/${encodeURIComponent(sid)}?limit=${PAGE}&after=${after}`);
+      } catch {
+        return false;
+      }
       if (sessionRef.current !== sid) return false;  // session changed mid-fetch — drop this stale page
       setDetailSynced((prev) => (prev ? { ...prev, items: [...prev.items, ...body.items], page: body.page } : body));
       nextAfterRef.current = body.page.next_after;
       return body.page.next_after != null;
-    } catch {
-      return false;
     } finally {
       loadingMoreRef.current = false;
     }
