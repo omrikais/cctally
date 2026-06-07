@@ -6,6 +6,10 @@ export type Verdict = 'ok' | 'cap' | 'capped';
 export interface Envelope {
   envelope_version: number;
   generated_at: string | null;
+  // Conversation viewer (spec §5): true only when the transcript GET
+  // routes would serve for THIS request (bind gate AND Host allowlist).
+  // Absent on envelopes from a Python without the feature → treat as false.
+  transcriptsEnabled?: boolean;
   last_sync_at: string | null;
   sync_age_s: number | null;
   last_sync_error: string | null;

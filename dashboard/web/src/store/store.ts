@@ -254,6 +254,14 @@ export interface AlertsConfig {
 
 export interface UIState {
   snapshot: Envelope | null;
+  // Conversation viewer (spec §4). Top-level view mode + the small
+  // cross-cutting reader/search state. Fetched list/reader DATA lives in
+  // hook state, not here (mirrors useProjectDetail). None of these persist
+  // — a reload always lands on the dashboard.
+  view: 'dashboard' | 'conversations';
+  selectedConversationId: string | null;
+  conversationSearch: string;
+  conversationJump: { session_id: string; uuid: string } | null;
   openModal: ModalKind | null;
   openSessionId: string | null;
   openBlockStartAt: string | null;
@@ -459,6 +467,10 @@ function loadInitial(): UIState {
   }
   return {
     snapshot: null,
+    view: 'dashboard',
+    selectedConversationId: null,
+    conversationSearch: '',
+    conversationJump: null,
     openModal: null,
     openSessionId: null,
     openBlockStartAt: null,
@@ -560,6 +572,13 @@ export function resetSnapshotOrdering(): void { lastGeneratedAt = ''; }
 export type Action =
   | { type: 'OPEN_MODAL'; kind: ModalKind; sessionId?: string; blockStartAt?: string; dailyDate?: string; projectKey?: string }
   | { type: 'CLOSE_MODAL' }
+  // Conversation viewer (spec §4). View-mode + reader/search cross-cutting
+  // state. None persist to localStorage (a reload lands on the dashboard).
+  | { type: 'SET_VIEW'; view: 'dashboard' | 'conversations' }
+  | { type: 'OPEN_CONVERSATION'; sessionId: string; jump?: { session_id: string; uuid: string } }
+  | { type: 'SELECT_CONVERSATION'; sessionId: string | null }
+  | { type: 'SET_CONVERSATION_SEARCH'; text: string }
+  | { type: 'CLEAR_CONVERSATION_JUMP' }
   | { type: 'SET_FILTER'; text: string }
   | { type: 'SET_SEARCH'; text: string }
   | { type: 'SET_SEARCH_MATCHES'; matches: number[]; index: number }
@@ -672,6 +691,38 @@ export function dispatch(action: Action): void {
         openDailyDate: null,
         openProjectKey: null,
       };
+      break;
+    case 'SET_VIEW':
+      // Leaving the view clears the active selection so re-entry starts
+      // clean; entering preserves any selection set by OPEN_CONVERSATION.
+      state = {
+        ...state,
+        view: action.view,
+        ...(action.view === 'dashboard'
+          ? { selectedConversationId: null, conversationJump: null }
+          : {}),
+      };
+      break;
+    case 'OPEN_CONVERSATION':
+      state = {
+        ...state,
+        view: 'conversations',
+        selectedConversationId: action.sessionId,
+        conversationJump: action.jump ?? null,
+      };
+      break;
+    case 'SELECT_CONVERSATION':
+      state = {
+        ...state,
+        selectedConversationId: action.sessionId,
+        conversationJump: null,
+      };
+      break;
+    case 'SET_CONVERSATION_SEARCH':
+      state = { ...state, conversationSearch: action.text };
+      break;
+    case 'CLEAR_CONVERSATION_JUMP':
+      state = { ...state, conversationJump: null };
       break;
     case 'SET_FILTER': {
       if (action.text) localStorage.setItem(FILTER_KEY, action.text);
