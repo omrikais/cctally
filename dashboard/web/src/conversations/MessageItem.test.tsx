@@ -12,6 +12,8 @@ const human: ConversationItem = {
   text: 'hello there',
   blocks: [],
   is_sidechain: false,
+  subagent_key: null,
+  parent_uuid: null,
 };
 
 const assistant: ConversationItem = {
@@ -23,6 +25,8 @@ const assistant: ConversationItem = {
   blocks: [{ kind: 'thinking', text: 'pondering' }],
   model: 'claude-opus-4',
   is_sidechain: false,
+  subagent_key: null,
+  parent_uuid: null,
   cost_usd: 0.1234,
 };
 
@@ -34,6 +38,8 @@ const toolResult: ConversationItem = {
   text: '',
   blocks: [{ kind: 'tool_result', text: 'output', truncated: false, is_error: false }],
   is_sidechain: false,
+  subagent_key: null,
+  parent_uuid: null,
 };
 
 describe('MessageItem', () => {
@@ -72,6 +78,8 @@ describe('MessageItem', () => {
       text: 'partial',
       blocks: [],
       is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
       // model present, cost_usd absent (the null-msg case)
       model: 'claude-opus-4',
     };
