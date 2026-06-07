@@ -20,6 +20,10 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   const reduced = useReducedMotion();
   const sentinelRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  // Tracks the pending highlight-removal timeout so it can be cancelled on
+  // unmount (no classList.remove on a detached node, no leaked timer) and
+  // superseded on a rapid re-jump (no two overlapping 2s timers racing).
+  const highlightTimerRef = useRef<number | null>(null);
 
   const groups = useMemo(() => groupSidechains(detail?.items ?? []), [detail?.items]);
 
@@ -46,18 +50,28 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
       if (el) {
         el.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'center' });
         el.classList.add('conv-item--jumped');
-        window.setTimeout(() => el.classList.remove('conv-item--jumped'), 2000);
+        if (highlightTimerRef.current != null) window.clearTimeout(highlightTimerRef.current);
+        highlightTimerRef.current = window.setTimeout(() => {
+          el.classList.remove('conv-item--jumped');
+          highlightTimerRef.current = null;
+        }, 2000);
         dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
         return;
       }
       // No ref yet. loadUntil may have just appended the target's page; its
       // MessageItem ref callback runs on React's NEXT commit, after this
       // microtask. Leave the jump set so the detail?.items.length re-fire
-      // re-runs this effect once the element is attached, and we scroll
-      // then. Only give up — clearing the jump — when paging is exhausted
-      // (hasMore === false) and the element still never appeared (e.g. the
-      // hit resolved into a collapsed sidechain member, which gets no ref).
-      if (!hasMore) dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
+      // re-runs this effect once the element is attached, and we scroll then.
+      // BUT give up now — rather than waiting for exhaustion — when the target
+      // is already loaded yet lives inside a collapsed sidechain group: those
+      // members are rendered without a ref (subagent_key != null), so no amount
+      // of further paging will ever produce an element to scroll to. Leaving the
+      // jump set there would strand it (items.length stops growing, the effect
+      // never re-fires) until the user happens to scroll to the very end.
+      const targetItem = detail.items.find((it) => it.member_uuids.includes(jump.uuid));
+      if ((targetItem && targetItem.subagent_key != null) || !hasMore) {
+        dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
+      }
     })();
     return () => { cancelled = true; };
     // `hasMore` is in deps so the give-up clear still fires on the edge
@@ -68,6 +82,13 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
     // times.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jump, sessionId, detail?.items.length, hasMore]);
+
+  // Cancel any pending highlight-removal timer on unmount only (NOT on every
+  // jump-effect re-run — that would strip the flash the instant the successful
+  // jump dispatches CLEAR_CONVERSATION_JUMP and re-fires the effect).
+  useEffect(() => () => {
+    if (highlightTimerRef.current != null) window.clearTimeout(highlightTimerRef.current);
+  }, []);
 
   const setItemRef = (item: { member_uuids: string[] }) => (el: HTMLDivElement | null) => {
     // Map EVERY member uuid → this element so a search hit on any

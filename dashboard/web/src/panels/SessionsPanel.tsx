@@ -16,6 +16,7 @@ import { SESSIONS_COLUMNS } from '../lib/sessionsColumns';
 import { fmt } from '../lib/fmt';
 import { modelChipClass } from '../lib/model';
 import { costClass } from '../lib/cost';
+import { transcriptsEnabled } from '../lib/transcripts';
 import { openShareModal } from '../store/shareSlice';
 
 export function SessionsPanel() {
@@ -55,9 +56,10 @@ export function SessionsPanel() {
   // Conversation viewer (spec §4 entry). The per-row "open conversation"
   // affordance is shown only when transcripts are enabled for THIS
   // request (loopback, or LAN with dashboard.expose_transcripts). Absent
-  // / false envelope flag → hide the button entirely so the feature
-  // stays invisible for users who can't reach the transcript routes.
-  const transcriptsEnabled = env?.transcriptsEnabled !== false;
+  // / false envelope flag → hide the button entirely (fail closed via the
+  // shared `transcriptsEnabled` selector) so the feature stays invisible
+  // for users who can't reach the transcript routes.
+  const transcriptsOn = transcriptsEnabled(env);
   const filtered = getRenderedRows();
   // Match indices (as produced by the store's _recomputeSearch) are
   // positions into `filtered` — the exact same array we paint below —
@@ -168,7 +170,7 @@ export function SessionsPanel() {
                   }
                 >
                   <td className="started">
-                    {transcriptsEnabled && r.session_id && (
+                    {transcriptsOn && r.session_id && (
                       <button
                         type="button"
                         className="sess-open-conv"

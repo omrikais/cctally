@@ -694,13 +694,14 @@ export function dispatch(action: Action): void {
       };
       break;
     case 'SET_VIEW':
-      // Leaving the view clears the active selection so re-entry starts
-      // clean; entering preserves any selection set by OPEN_CONVERSATION.
+      // Leaving the view clears the active selection AND the rail search so
+      // re-entry starts clean; entering preserves any selection set by
+      // OPEN_CONVERSATION.
       state = {
         ...state,
         view: action.view,
         ...(action.view === 'dashboard'
-          ? { selectedConversationId: null, conversationJump: null }
+          ? { selectedConversationId: null, conversationJump: null, conversationSearch: '' }
           : {}),
       };
       break;

@@ -88,6 +88,29 @@ describe('MessageItem', () => {
     expect(container.querySelector('.conv-item-model')!.textContent).toBe('claude-opus-4');
   });
 
+  it('omits the cost footer when cost_usd is present but 0.0 (the real backend null-msg payload)', () => {
+    // _build_simple emits cost_usd: 0.0 for an assistant-with-null-msg_id, so
+    // the field is PRESENT (not absent as the sibling test above hand-builds).
+    // A bare `typeof === 'number'` would render a misleading "$0.0000"; the
+    // `> 0` gate must drop the footer for this no-attributable-cost sentinel.
+    const zeroCost: ConversationItem = {
+      kind: 'assistant',
+      anchor: { session_id: 's', uuid: 'a3', id: 5 },
+      member_uuids: ['a3'],
+      ts: 't',
+      text: 'partial',
+      blocks: [],
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+      model: 'claude-opus-4',
+      cost_usd: 0.0,
+    };
+    const { container } = render(<MessageItem item={zeroCost} />);
+    expect(container.querySelectorAll('.conv-item-cost')).toHaveLength(0);
+    expect(container.textContent).not.toContain('$0.0000');
+  });
+
   it('renders a tool_result item as a single collapsed disclosure', () => {
     const { container } = render(<MessageItem item={toolResult} />);
     const root = container.querySelector('.conv-item--tool_result')!;

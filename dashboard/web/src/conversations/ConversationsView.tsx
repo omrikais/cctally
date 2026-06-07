@@ -3,6 +3,7 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useKeymap } from '../hooks/useKeymap';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { transcriptsEnabled } from '../lib/transcripts';
 import { ConversationRail } from './ConversationRail';
 import { ConversationReader } from './ConversationReader';
 
@@ -17,7 +18,7 @@ export function ConversationsView() {
 
   useKeymap(CONVERSATIONS_BINDINGS);
 
-  if (env?.transcriptsEnabled === false) {
+  if (!transcriptsEnabled(env)) {
     return (
       <div className="conv-disabled">
         Transcript viewing is disabled. Enable it with

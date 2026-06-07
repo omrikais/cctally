@@ -1,13 +1,14 @@
 import { useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSnapshot } from '../hooks/useSnapshot';
+import { transcriptsEnabled } from '../lib/transcripts';
 
 // Header segmented Dashboard｜Conversations control (spec §4 entry).
 // Hidden entirely when transcripts are not enabled for this request.
 export function ViewSwitcher() {
   const view = useSyncExternalStore(subscribeStore, () => getState().view);
   const env = useSnapshot();
-  if (env?.transcriptsEnabled === false || env?.transcriptsEnabled == null) return null;
+  if (!transcriptsEnabled(env)) return null;
   return (
     <div className="view-switcher" role="tablist" aria-label="Workspace">
       <button

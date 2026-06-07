@@ -29,7 +29,12 @@ function MessageItemImpl(
   }
 
   if (item.kind === 'assistant') {
-    const hasCost = typeof item.cost_usd === 'number';
+    // `> 0`, not just `typeof === 'number'`: the backend's _build_simple emits
+    // an explicit cost_usd of 0.0 for an assistant-with-null-msg_id row (and a
+    // real turn with no session_entries match also rounds to 0.0). Those are
+    // "no attributable cost" sentinels, not a genuine $0.0000 charge — showing
+    // the footer for them is misleading, so only render it for a positive cost.
+    const hasCost = typeof item.cost_usd === 'number' && item.cost_usd > 0;
     return (
       <div ref={ref} className="conv-item conv-item--assistant" data-uuid={item.anchor.uuid}>
         <div className="conv-item-head">
