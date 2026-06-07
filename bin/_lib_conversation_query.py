@@ -29,6 +29,25 @@ def _project_label(cwd) -> str:
     return os.path.basename(cwd.rstrip("/")) or cwd
 
 
+def _subagent_key(source_path):
+    """Privacy-safe subagent-thread identity for the reader. Each subagent (Task)
+    invocation writes its own ``agent-<hash>.jsonl``; the main session is
+    ``<session_id>.jsonl``. Returns the agent hash (``agent-`` prefix + ``.jsonl``
+    suffix stripped; an ``acompact-`` middle is kept), or ``None`` for the main
+    file / a non-agent path. We expose ONLY this derived key — never the raw
+    absolute ``source_path`` (which leaks home dir / username / encoded project,
+    and the conversation routes are LAN-exposable via dashboard.expose_transcripts)."""
+    if not source_path:
+        return None
+    base = os.path.basename(source_path)
+    if not base.startswith("agent-"):
+        return None
+    stem = base[len("agent-"):]
+    if stem.endswith(".jsonl"):
+        stem = stem[: -len(".jsonl")]
+    return stem or None
+
+
 def _entry_cost(model, inp, out, cc, cr, cost_usd_raw) -> float:
     """Cost for one session_entries row via the shared pricing helper. Tokens →
     the helper's usage dict. cost_usd_raw is passed as the optional override the
@@ -198,7 +217,7 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     # uuid, so the first occurrence in ascending order is canonical.
     raw = conn.execute(
         "SELECT id, uuid, timestamp_utc, entry_type, text, blocks_json, model, "
-        "       msg_id, req_id, is_sidechain, cwd, git_branch "
+        "       msg_id, req_id, is_sidechain, cwd, git_branch, source_path, parent_uuid "
         "FROM conversation_messages WHERE session_id=? "
         "ORDER BY timestamp_utc, id", (session_id,)).fetchall()
 
@@ -224,7 +243,7 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     turn_index = {}        # (msg_id, req_id) -> index into items
     for row in logical:
         (rid, u, ts, etype, text, blocks, model, msg_id, req_id,
-         is_sc, cwd, branch) = row
+         is_sc, cwd, branch, source_path, parent_uuid) = row
         if etype == "assistant" and msg_id is not None:
             key = (msg_id, req_id)
             idx = turn_index.get(key)
@@ -327,6 +346,12 @@ def _build_turn(members):
         "blocks": [],
         "model": first[6],
         "is_sidechain": bool(first[9]),
+        # subagent_key / parent_uuid are SEED-sourced (the first fragment, the
+        # turn's entry point) and NOT re-promoted in _fold_fragment — the prose
+        # anchor's parent_uuid is an intra-turn link, not the entry point (Codex
+        # P1). subagent_key is uniform across a turn's fragments (one file).
+        "subagent_key": _subagent_key(first[12]),
+        "parent_uuid": first[13],
         "_msg_id": first[7],
         "_req_id": first[8],
         "_has_prose": False,
@@ -374,7 +399,8 @@ def _build_simple(row):
     key → no session_entries join); it carries an explicit cost_usd of 0.0 and NO
     internal _msg_id/_req_id keys, so the cost loop's KeyError path can never fire
     (I2). The model is preserved for assistant rows."""
-    (rid, u, ts, etype, text, blocks, model, msg_id, req_id, is_sc, cwd, branch) = row
+    (rid, u, ts, etype, text, blocks, model, msg_id, req_id, is_sc, cwd, branch,
+     source_path, parent_uuid) = row
     try:
         parsed = _json.loads(blocks or "[]")
     except (ValueError, TypeError):
@@ -387,6 +413,8 @@ def _build_simple(row):
         "text": text,
         "blocks": parsed,
         "is_sidechain": bool(is_sc),
+        "subagent_key": _subagent_key(source_path),
+        "parent_uuid": parent_uuid,
     }
     if etype == "assistant":
         item["model"] = model
