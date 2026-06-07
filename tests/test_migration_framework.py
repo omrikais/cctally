@@ -625,6 +625,45 @@ def test_recover_tolerates_absent_skipped_table(cctally_module, tmp_path):
     assert info["reverted_to"] == 1
 
 
+def test_recover_recognizes_legacy_alias_markers_as_applied(cctally_module, tmp_path):
+    # Issue #148: a known migration whose marker exists ONLY under its legacy
+    # unprefixed alias must still count as applied. The alias union keeps the
+    # legacy row (so it is NOT trimmed), yet the all_known_done membership test
+    # compares against canonical m.name — so without normalizing alias→canonical
+    # it falsely sees the migration as missing, resets user_version to 0, and
+    # forces a needless full re-walk on the next open. Uses real stats.db
+    # aliases (the only DB with shipped legacy markers).
+    conn = _mk_db_with_markers(
+        tmp_path,
+        user_version=9,  # ahead of head=3
+        applied=[
+            "five_hour_block_models_backfill_v1",    # legacy alias of 001
+            "five_hour_block_projects_backfill_v1",  # legacy alias of 002
+            "merge_5h_block_duplicates_v1",          # legacy alias of 003
+            "099_unknown_ahead",                     # genuinely unknown → trimmed
+        ],
+    )
+    reg = _registry(
+        cctally_module,
+        "001_five_hour_block_models_backfill_v1",
+        "002_five_hour_block_projects_backfill_v1",
+        "003_merge_5h_block_duplicates_v1",
+    )
+    info = cctally_module._recover_version_ahead(conn, reg, "stats.db")
+    # Legacy markers preserved (covered by the known alias union); only the
+    # genuinely-unknown ahead marker is dropped.
+    applied = {r[0] for r in conn.execute("SELECT name FROM schema_migrations")}
+    assert applied == {
+        "five_hour_block_models_backfill_v1",
+        "five_hour_block_projects_backfill_v1",
+        "merge_5h_block_duplicates_v1",
+    }
+    # All known applied (via alias normalization) → fast-path to head, NOT 0.
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert info["reverted_from"] == 9 and info["reverted_to"] == 3
+    assert info["trimmed"] == 1  # only 099_unknown_ahead
+
+
 # ── dispatcher recover_version_ahead opt-in (issue #145) ──────────────────
 
 def test_dispatcher_recovers_cache_when_opted_in(cctally_module, tmp_path, capsys):

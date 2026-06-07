@@ -569,7 +569,14 @@ def _recover_version_ahead(
                         ("schema_migrations_skipped", skipped)):
         try:
             for row in conn.execute(f"SELECT name FROM {table}").fetchall():
-                dest.add(row[0])
+                # Normalize legacy unprefixed markers to their canonical NNN_
+                # name (issue #148). The alias union above keeps such a row from
+                # being trimmed; without this normalization the membership test
+                # below compares canonical m.name against the legacy alias and
+                # falsely concludes the migration is missing, resetting
+                # user_version to 0 and forcing a needless full re-walk. Mirrors
+                # the alias-aware read in cmd_db_status.
+                dest.add(aliases.get(row[0], row[0]))
         except sqlite3.OperationalError:
             pass
 
