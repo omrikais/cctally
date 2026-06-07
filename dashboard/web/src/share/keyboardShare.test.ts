@@ -243,4 +243,29 @@ describe('S keybinding (share modal)', () => {
     fireEvent.keyDown(document, { key: 's' });
     expect(getState().shareModal).toBeNull();
   });
+
+  it('does nothing in the conversations view (view-gated; no panel to share, no toast)', () => {
+    // Cross-view leak guard: `S` is a dashboard-panel-share feature. In
+    // the conversations view the dashboard body is unmounted, so even a
+    // focused-looking `[data-panel-kind]` must not surface the
+    // panel-centric "focus a panel" toast over the transcript reader.
+    // Removing the `if (s.view !== 'dashboard') return false` guard line
+    // in keyboardShare.ts makes this assertion FAIL (the toast fires).
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+    expect(buildShareKeyBinding().when?.()).toBe(false);
+    fireS();
+    expect(getState().shareModal).toBeNull();
+    expect(getState().toast).toBeNull();
+  });
+
+  it('still fires in the dashboard view with a focused panel (non-vacuity: guard is not over-broad)', () => {
+    // The default view IS 'dashboard'; assert the guard returns true so
+    // the conversations→false assertion above proves the new gate, not a
+    // blanket suppression.
+    expect(getState().view).toBe('dashboard');
+    focusPanel('weekly');
+    expect(buildShareKeyBinding().when?.()).toBe(true);
+    fireS();
+    expect(getState().shareModal?.panel).toBe('weekly');
+  });
 });

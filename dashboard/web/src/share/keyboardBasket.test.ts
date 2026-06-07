@@ -16,7 +16,7 @@ import {
 import {
   _resetForTests as _resetKeymap, installGlobalKeydown, registerKeymap,
 } from '../store/keymap';
-import { buildBasketKeyBindings } from './keyboardBasket';
+import { buildBasketKeyBinding, buildBasketKeyBindings } from './keyboardBasket';
 import { openShareModal, openComposer } from '../store/shareSlice';
 import { MOBILE_MEDIA_QUERY } from '../lib/breakpoints';
 
@@ -102,5 +102,27 @@ describe('B keybinding (composer)', () => {
   it('lowercase b does NOT trigger (uppercase-only, mirrors the S precedent)', () => {
     fireEvent.keyDown(document, { key: 'b' });
     expect(getState().composerModal).toBeNull();
+  });
+
+  it('does nothing in the conversations view (view-gated; no OPEN_COMPOSER)', () => {
+    // Cross-view leak guard: the composer/share modal roots are mounted
+    // unconditionally, so without the view gate `B` would open the
+    // dashboard composer over the read-only transcript reader. Removing
+    // the `if (s.view !== 'dashboard') return false` guard line in
+    // keyboardBasket.ts makes this assertion FAIL (composer opens).
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+    expect(buildBasketKeyBinding().when?.()).toBe(false);
+    fireB();
+    expect(getState().composerModal).toBeNull();
+  });
+
+  it('still opens in the dashboard view (non-vacuity: guard is not over-broad)', () => {
+    // The default view IS 'dashboard'; assert the guard returns true so
+    // the conversations→false assertion above proves the new gate, not a
+    // blanket suppression.
+    expect(getState().view).toBe('dashboard');
+    expect(buildBasketKeyBinding().when?.()).toBe(true);
+    fireB();
+    expect(getState().composerModal).not.toBeNull();
   });
 });

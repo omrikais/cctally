@@ -1,4 +1,5 @@
 import type { AlertEntry, Envelope, SessionRow } from '../types/envelope';
+import type { ConversationJump } from '../types/conversation';
 import {
   applySessionFilter,
   computeSearchMatches,
@@ -261,7 +262,7 @@ export interface UIState {
   view: 'dashboard' | 'conversations';
   selectedConversationId: string | null;
   conversationSearch: string;
-  conversationJump: { session_id: string; uuid: string } | null;
+  conversationJump: ConversationJump | null;
   openModal: ModalKind | null;
   openSessionId: string | null;
   openBlockStartAt: string | null;
@@ -575,7 +576,7 @@ export type Action =
   // Conversation viewer (spec §4). View-mode + reader/search cross-cutting
   // state. None persist to localStorage (a reload lands on the dashboard).
   | { type: 'SET_VIEW'; view: 'dashboard' | 'conversations' }
-  | { type: 'OPEN_CONVERSATION'; sessionId: string; jump?: { session_id: string; uuid: string } }
+  | { type: 'OPEN_CONVERSATION'; sessionId: string; jump?: ConversationJump }
   | { type: 'SELECT_CONVERSATION'; sessionId: string | null }
   | { type: 'SET_CONVERSATION_SEARCH'; text: string }
   | { type: 'CLEAR_CONVERSATION_JUMP' }

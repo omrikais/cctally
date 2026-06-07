@@ -70,6 +70,11 @@ export function buildShareKeyBinding(): Binding {
     scope: 'global',
     when: () => {
       const s = getState();
+      // View gate: `S` is a dashboard-panel-share feature (it resolves a
+      // focused `[data-panel-kind]`); there are no shareable panels in
+      // the conversations view, where firing it would surface the
+      // panel-centric "focus a panel" toast over the transcript reader.
+      if (s.view !== 'dashboard') return false;
       if (isMobileViewport()) return false;
       if (s.shareModal !== null) return false;
       if (s.composerModal !== null) return false;
