@@ -10,6 +10,7 @@ import { DoctorModal } from './components/DoctorModal';
 import { UpdateModal } from './components/UpdateModal';
 import { ModalRoot } from './modals/ModalRoot';
 import { ShareModalRoot } from './share/ShareModalRoot';
+import { ConversationsView } from './conversations/ConversationsView';
 import { getState, subscribeStore } from './store/store';
 
 export function App() {
@@ -22,16 +23,27 @@ export function App() {
     subscribeStore,
     () => getState().prefs.panelOrder,
   );
+  // Conversation viewer (spec §4). Swap the app BODY on the top-level
+  // view mode; Header/Footer/overlays/modals stay mounted outside the
+  // conditional so the always-on chrome (switcher, sync chip, settings,
+  // help, doctor, toasts) works in both views. ConversationsView mounts
+  // its own view-aware keymap bindings only while active, so the dashboard
+  // panel digits/letters can't fire over the unmounted grid.
+  const view = useSyncExternalStore(subscribeStore, () => getState().view);
   return (
     <>
       <Header />
-      <PanelGridDnd items={panelOrder}>
-        <div className="grid">
-          {panelOrder.map((id, index) => (
-            <PanelHost key={id} id={id} index={index} />
-          ))}
-        </div>
-      </PanelGridDnd>
+      {view === 'conversations' ? (
+        <ConversationsView />
+      ) : (
+        <PanelGridDnd items={panelOrder}>
+          <div className="grid">
+            {panelOrder.map((id, index) => (
+              <PanelHost key={id} id={id} index={index} />
+            ))}
+          </div>
+        </PanelGridDnd>
+      )}
       <Footer />
       <HelpOverlay />
       <SettingsOverlay />

@@ -3,6 +3,7 @@ import { BasketChip } from './BasketChip';
 import { DoctorChip } from './DoctorChip';
 import { SyncChip } from './SyncChip';
 import { UpdateBadge } from './UpdateBadge';
+import { ViewSwitcher } from '../conversations/ViewSwitcher';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { fmt } from '../lib/fmt';
 import { resolveVerdict } from '../lib/verdict';
@@ -41,6 +42,11 @@ export function Header() {
         ) : null}
         <UpdateBadge />
       </div>
+      {/* Conversation viewer (spec §4) — segmented Dashboard｜Conversations
+          workspace switcher. Self-hides until an envelope confirms
+          transcripts are enabled for this request, so the dashboard
+          chrome is identical for users without the feature. */}
+      <ViewSwitcher />
       <div className="stat" data-mobile-keep="primary" data-stat="week">
         <svg className="icon">
           <use href="/static/icons.svg#calendar" />

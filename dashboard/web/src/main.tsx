@@ -40,7 +40,12 @@ installGlobalKeydown();
 // `gotcha: project_global_hotkeys_modal_guard`.
 const _globalKeyGuard = (): boolean => {
   const s = getState();
-  return !s.update.modalOpen && !s.doctorModalOpen;
+  // Conversation viewer (spec §4): the dashboard panel grid is unmounted
+  // while view==='conversations', so panel digits / r / q / n / N must
+  // not fire over the conversations body. Header sync/settings/help still
+  // work — they call triggerSync() directly or are owned by the
+  // always-mounted overlays, not these global panel bindings.
+  return s.view === 'dashboard' && !s.update.modalOpen && !s.doctorModalOpen;
 };
 
 // Doctor key (`d`) uses a composite guard per spec §6.4 (Codex M5):
@@ -91,7 +96,9 @@ registerKeymap([
   {
     key: 'c',
     scope: 'sessions',
-    when: () => !getState().openModal,
+    // Conversation viewer (spec §4): the Sessions panel is unmounted in
+    // conversations view, so the collapse toggle must not fire there.
+    when: () => getState().view === 'dashboard' && !getState().openModal,
     action: () => {
       const cur = getState().prefs.sessionsCollapsed;
       dispatch({ type: 'SAVE_PREFS', patch: { sessionsCollapsed: !cur } });

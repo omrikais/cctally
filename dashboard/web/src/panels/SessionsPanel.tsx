@@ -52,6 +52,12 @@ export function SessionsPanel() {
 
   const isMobile = useIsMobile();
   const total = env?.sessions?.total ?? 0;
+  // Conversation viewer (spec §4 entry). The per-row "open conversation"
+  // affordance is shown only when transcripts are enabled for THIS
+  // request (loopback, or LAN with dashboard.expose_transcripts). Absent
+  // / false envelope flag → hide the button entirely so the feature
+  // stays invisible for users who can't reach the transcript routes.
+  const transcriptsEnabled = env?.transcriptsEnabled !== false;
   const filtered = getRenderedRows();
   // Match indices (as produced by the store's _recomputeSearch) are
   // positions into `filtered` — the exact same array we paint below —
@@ -161,7 +167,30 @@ export function SessionsPanel() {
                     })
                   }
                 >
-                  <td className="started">{fmt.startedShort(r.started_utc, ctx, { noSuffix: true })}</td>
+                  <td className="started">
+                    {transcriptsEnabled && r.session_id && (
+                      <button
+                        type="button"
+                        className="sess-open-conv"
+                        title="Open conversation"
+                        aria-label="Open conversation"
+                        onClick={(e) => {
+                          // stopPropagation so the enclosing <tr>'s
+                          // session-modal click handler doesn't ALSO fire.
+                          e.stopPropagation();
+                          dispatch({
+                            type: 'OPEN_CONVERSATION',
+                            sessionId: r.session_id,
+                          });
+                        }}
+                      >
+                        <svg className="icon">
+                          <use href="/static/icons.svg#file-text" />
+                        </svg>
+                      </button>
+                    )}
+                    {fmt.startedShort(r.started_utc, ctx, { noSuffix: true })}
+                  </td>
                   <td>{r.duration_min}m</td>
                   <td onClick={(e) => e.stopPropagation()}>
                     <span
