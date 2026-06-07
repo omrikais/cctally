@@ -73,6 +73,7 @@ export function useConversation(sessionId: string | null): UseConversation {
       const r = await fetch(`/api/conversation/${encodeURIComponent(sid)}?limit=${PAGE}&after=${after}`);
       if (!r.ok) return false;
       const body = (await r.json()) as ConversationDetail;
+      if (sessionRef.current !== sid) return false;  // session changed mid-fetch — drop this stale page
       setDetailSynced((prev) => (prev ? { ...prev, items: [...prev.items, ...body.items], page: body.page } : body));
       nextAfterRef.current = body.page.next_after;
       return body.page.next_after != null;
@@ -101,5 +102,5 @@ export function useConversation(sessionId: string | null): UseConversation {
     }
   }, [fetchNext]);
 
-  return { detail, loading, error, hasMore: nextAfterRef.current != null, loadMore, loadUntil };
+  return { detail, loading, error, hasMore: detail?.page?.next_after != null, loadMore, loadUntil };
 }

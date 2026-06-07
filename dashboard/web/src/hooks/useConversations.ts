@@ -4,9 +4,12 @@ import type { ConversationSummary, ConversationsPage } from '../types/conversati
 
 // Browse-rail list. Offset-paginated, accumulating. Revalidates the
 // FIRST page on every SSE tick (the list shifts as new sessions ingest)
-// — stale-while-revalidate: rows stay mounted across the refetch. A
-// fresh first-page load (mount, or sort change) resets the accumulator;
-// loadMore() appends. Sort is fixed to 'recent' in v1.
+// — stale-while-revalidate: rows stay mounted across the refetch — but
+// ONLY while the user is still on page 1. Once they've paged (a tail
+// beyond PAGE accumulated, or a loadMore is in flight), the tick reload
+// is suppressed so it can't clobber the accumulated tail or rewind the
+// cursor; a fresh page-1 load only happens on remount. loadMore()
+// appends. Sort is fixed to 'recent' in v1.
 export interface UseConversations {
   rows: ConversationSummary[];
   loading: boolean;
@@ -28,6 +31,10 @@ export function useConversations(): UseConversations {
 
   // First-page (re)load on mount + every SSE tick.
   useEffect(() => {
+    // Revalidate page 1 on SSE tick ONLY while the user is still on the first
+    // page; once they've paged (rows beyond PAGE) we must not clobber the
+    // accumulated tail or rewind the cursor. A fresh load happens on remount.
+    if (loadingMoreRef.current || rows.length > PAGE) return;
     const ctl = new AbortController();
     fetch(`/api/conversations?sort=recent&limit=${PAGE}&offset=0`, { signal: ctl.signal })
       .then(async (r) => {

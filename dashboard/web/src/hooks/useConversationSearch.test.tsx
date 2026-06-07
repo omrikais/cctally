@@ -37,4 +37,40 @@ describe('useConversationSearch', () => {
     expect(result.current.total).toBe(1);
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('/api/conversation/search?q=flock');
   });
+
+  it('a newer needle wins over an older in-flight response (abort path)', async () => {
+    // The first needle's debounce fires and its fetch is in flight when the
+    // needle changes; the effect cleanup aborts it (AbortError, swallowed),
+    // so the older response must NOT commit over the newer needle's hits.
+    const oldResult = {
+      query: 'old', mode: 'fts',
+      hits: [{ session_id: 'a', uuid: 'old', project_label: 'p', ts: '2026-01-01T00:00:00Z', snippet: 'old', cost_usd: 0.1 }],
+      total: 1,
+    };
+    const newResult = {
+      query: 'new', mode: 'like',
+      hits: [{ session_id: 'b', uuid: 'new', project_label: 'q', ts: '2026-01-02T00:00:00Z', snippet: 'new', cost_usd: 0.2 }],
+      total: 1,
+    };
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    // First (old) fetch never resolves until we let it — it'll be aborted.
+    let resolveOld: (v: unknown) => void = () => {};
+    fetchMock.mockImplementationOnce((_url: string, opts: { signal: AbortSignal }) =>
+      new Promise((res, rej) => {
+        opts.signal.addEventListener('abort', () => rej(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+        resolveOld = res;
+      }),
+    );
+    mockFetchOnce(newResult);
+
+    const { result, rerender } = renderHook(({ q }) => useConversationSearch(q), { initialProps: { q: 'old' } });
+    await act(async () => { vi.advanceTimersByTime(250); });   // fire old debounce → old fetch in flight
+    rerender({ q: 'new' });                                    // needle changes → cleanup aborts old fetch
+    await act(async () => { vi.advanceTimersByTime(250); });   // fire new debounce → new fetch
+    await act(async () => { resolveOld({ ok: true, status: 200, json: async () => oldResult }); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(result.current.mode).toBe('like');                 // newer needle won
+    expect(result.current.hits[0].uuid).toBe('new');
+  });
 });
