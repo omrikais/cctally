@@ -12,8 +12,13 @@ exposure:
   ``--host`` / ``dashboard.bind`` config / ``--tz`` overrides; binds
   the ``ThreadingHTTPServer``; spins up the snapshot sync thread, the
   update-check thread, and the SSE hub; opens a browser when
-  ``--open`` is set; handles ``SIGINT`` / ``SIGTERM`` for clean
-  shutdown.
+  ``--open`` is set; blocks on ``_dashboard_wait_for_signal`` for
+  ``SIGINT`` / ``SIGTERM`` (lost-wakeup-proof per #154) then runs
+  clean shutdown.
+- ``_dashboard_wait_for_signal`` — main-thread shutdown wait built on
+  ``signal.set_wakeup_fd`` + ``select`` so a single SIGINT/SIGTERM
+  always tears the server down, immune to the ``threading.Event.wait()``
+  lost-wakeup race (#154).
 - ``DashboardHTTPHandler`` — the stdlib ``BaseHTTPRequestHandler``
   subclass that serves the static React bundle plus the entire
   ``/api/*`` surface (``data``, ``events``, ``sync``, ``refresh``,
@@ -7736,6 +7741,82 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 # === cmd_dashboard (dashboard subcommand entry point) =====================
 # Pre-extract location: bin/cctally L21478.
 
+def _dashboard_wait_for_signal(
+    signals,
+    *,
+    on_signal=None,
+    timeout=None,
+):
+    """Block the calling (main) thread until one of ``signals`` is delivered.
+
+    The wait is driven by a self-pipe wakeup fd (``signal.set_wakeup_fd``)
+    rather than a ``threading.Event``: CPython's C-level signal trampoline
+    writes the signum to the pipe on EVERY delivery, *before* (and
+    independent of) the Python-level handler running, so the ``select``
+    below unblocks on the very first signal. This eliminates the lost-wakeup
+    that races ``threading.Event.wait()`` — a single SIGTERM that arrives as
+    the main thread enters the wait is dropped ~0.04-0.07% of the time,
+    never waking an Event-based loop, and recovery needs a *second* signal
+    (issue #154; surfaced during #153 triage). A timed-poll
+    (``while not stop.wait(0.5)``) does NOT fix it: on the miss the flag is
+    never set, so it polls forever — the pipe buffer is the fix, not the
+    timeout.
+
+    ``on_signal`` (optional) is invoked from the Python-level handler on each
+    delivery — a belt-and-suspenders secondary signal for callers that still
+    want one; the wakeup does NOT depend on it running. ``timeout`` is
+    ``None`` (block forever) in production; tests pass a finite bound so a
+    regressed mechanism fails loudly instead of hanging.
+
+    Returns ``True`` if woken by a signal, ``False`` if ``timeout`` elapsed.
+    MUST be called from the main thread (``set_wakeup_fd`` / ``signal.signal``
+    both require it). Restores the prior signal dispositions and wakeup fd on
+    return, so it is safe to call repeatedly and inside a test process.
+    """
+    import os
+    import selectors
+    import signal
+
+    prev_handlers = {sig: signal.getsignal(sig) for sig in signals}
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(read_fd, False)
+    os.set_blocking(write_fd, False)
+    # Arm the wakeup fd BEFORE installing the Python handlers: by the time a
+    # handler can fire, the C trampoline already has a pipe to write to, so a
+    # signal racing the setup can't slip through a gap and be lost. (A signal
+    # before this point still hits the prior disposition — pre-existing, not
+    # our shutdown wait.)
+    prev_wakeup_fd = signal.set_wakeup_fd(write_fd)
+
+    def _handler(signum, frame):
+        if on_signal is not None:
+            on_signal()
+
+    sel = selectors.DefaultSelector()
+    sel.register(read_fd, selectors.EVENT_READ)
+    try:
+        for sig in signals:
+            signal.signal(sig, _handler)
+        woke = bool(sel.select(timeout))
+        if woke:
+            # Drain the wakeup byte(s); the pipe is non-blocking so an empty
+            # read raises BlockingIOError rather than blocking.
+            try:
+                os.read(read_fd, 4096)
+            except BlockingIOError:
+                pass
+        return woke
+    finally:
+        # Order matters: restore the wakeup fd before closing write_fd so the
+        # signal machinery never points at a closed descriptor.
+        signal.set_wakeup_fd(prev_wakeup_fd)
+        for sig, handler in prev_handlers.items():
+            signal.signal(sig, handler)
+        sel.close()
+        os.close(read_fd)
+        os.close(write_fd)
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     """Launch the live web dashboard."""
     import signal as _signal
@@ -7975,14 +8056,14 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
-    stop = threading.Event()
-    def _handler(signum, frame):
-        stop.set()
-    _signal.signal(_signal.SIGINT, _handler)
-    _signal.signal(_signal.SIGTERM, _handler)
-
+    # Block the main thread until SIGINT/SIGTERM. The wait is driven by a
+    # self-pipe wakeup fd (signal.set_wakeup_fd) rather than a
+    # threading.Event, so a single signal unblocks it unconditionally — the
+    # C-level signal trampoline writes to the pipe before (and independent
+    # of) any Python-level handler running, so the wakeup can't be lost to
+    # the Event.wait() entry race (#154). timeout=None → block forever.
     try:
-        stop.wait()
+        _dashboard_wait_for_signal((_signal.SIGINT, _signal.SIGTERM))
     finally:
         if sync_thread is not None:
             sync_thread.stop()
