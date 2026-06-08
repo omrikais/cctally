@@ -5060,7 +5060,9 @@ mark.current {
   border-radius: 3px;
   font-size: 12px;
 }
+.md strong, .md b { font-weight: 600; }
 .md pre {
+  font-family: var(--font-mono);
   background: var(--panel-bg-2);
   border: 1px solid var(--border-soft);
   border-radius: 6px;

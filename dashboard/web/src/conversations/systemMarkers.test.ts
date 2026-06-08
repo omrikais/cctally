@@ -42,4 +42,17 @@ describe('isSystemMarker', () => {
   it('does NOT match an unrelated/unknown tag', () => {
     expect(isSystemMarker('<thinking>hmm</thinking>')).toBe(false);
   });
+
+  it('rejects a wrapper whose close tag is a different marker tag (the \\1 backreference is load-bearing)', () => {
+    expect(isSystemMarker('<command-name>x</command-args>')).toBe(false);
+  });
+
+  it('runs in linear time on a large valid-prefix + trailing-prose input (no catastrophic backtracking)', () => {
+    const pathological = '<command-name>x</command-name>'.repeat(2000) + ' trailing prose';
+    const start = performance.now();
+    const result = isSystemMarker(pathological);
+    const elapsed = performance.now() - start;
+    expect(result).toBe(false);
+    expect(elapsed).toBeLessThan(100); // the prior lazy-quantifier regex hung here
+  });
 });

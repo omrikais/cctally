@@ -19,10 +19,14 @@ const MARKER_TAGS = [
 ] as const;
 
 // ^\s* ... \s*$  -> anchored to the whole string (no leading/trailing prose).
-// (?:<(tag)>...</\1>\s*)+  -> one or more wrappers; the \1 backreference
-// forces each close tag to match its own open tag.
+// (?:<(tag)>(?:(?!</\1>)[\s\S])*</\1>\s*)+  -> one or more wrappers; the body
+// is the unrolled-lazy form (a greedy run of chars that are not the wrapper's
+// own close tag), which matches the same text as a lazy [\s\S]*? but in LINEAR
+// time — the prior lazy quantifier under the outer + backtracked
+// catastrophically (ReDoS) on a valid-prefix-then-trailing-prose input. The \1
+// backreference still forces each close tag to match its own open tag.
 const MARKER_RE = new RegExp(
-  `^\\s*(?:<(${MARKER_TAGS.join('|')})>[\\s\\S]*?</\\1>\\s*)+$`,
+  `^\\s*(?:<(${MARKER_TAGS.join('|')})>(?:(?!</\\1>)[\\s\\S])*</\\1>\\s*)+$`,
 );
 
 export function isSystemMarker(text: string): boolean {
