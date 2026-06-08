@@ -10,6 +10,10 @@ import { refreshUpdateState } from './store/update';
 import { openPanelByPosition } from './lib/openPanelByPosition';
 import { buildShareKeyBinding } from './share/keyboardShare';
 import { buildBasketKeyBindings } from './share/keyboardBasket';
+import '@fontsource/newsreader/400.css';
+import '@fontsource/newsreader/500.css';
+import '@fontsource/newsreader/600.css';
+import '@fontsource/newsreader/400-italic.css';
 import './index.css';
 
 // Boot SSE (module-scoped; StrictMode's double-mount cannot double-boot it).

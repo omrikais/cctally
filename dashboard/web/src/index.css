@@ -22,6 +22,7 @@
   --chip-haiku:  #1d4ed8;
   --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
                "DejaVu Sans Mono", monospace;
+  --font-prose: "Newsreader", Georgia, serif;
   /* Effective sticky-topbar height. Used as the scroll-margin-top floor
      so panel headers don't slide under the bar when scrollIntoView() or
      a hash-jump targets them. Mobile bumps this in the @media block. */
