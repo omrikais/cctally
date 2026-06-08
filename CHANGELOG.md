@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.29.0] - 2026-06-08
+
 ### Added
 - **Dashboard conversation viewer.** New full-screen Conversations workspace in `cctally dashboard`: a cost-aware transcript reader (rendered markdown, per-turn cost, collapsible thinking/tool/sidechain detail) plus cross-session full-text search that jumps to the highlighted message. Loopback-only by default; LAN needs `dashboard.expose_transcripts`. Backend shipped earlier; this adds the front end.
 
