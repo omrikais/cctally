@@ -36,7 +36,23 @@ export type ConversationItem =
 export type ConversationBlock =
   | { kind: 'text'; text: string }
   | { kind: 'thinking'; text: string }
+  // 'tool_use' is the id-less degradation fallback ONLY (pre-migration rows the
+  // kernel never paired): post-migration the kernel always emits 'tool_call'.
   | { kind: 'tool_use'; name: string | null; input_summary: string }
+  // 'tool_call' (#164) — a request paired with its matched result in one unit.
+  // Mirrors the kernel's Phase-3 sweep field-for-field
+  // (bin/_lib_conversation_query.py): result is the folded tool_result, or null
+  // when the request had no matched result (request-only).
+  | {
+      kind: 'tool_call';
+      name: string | null;
+      input_summary: string;
+      preview: string;
+      tool_use_id: string | null;
+      result: { text: string; truncated: boolean; is_error: boolean } | null;
+    }
+  // 'tool_result' BLOCK kind survives ONLY inside a standalone orphan
+  // tool_result ITEM (a result the kernel could not fold into a request).
   | { kind: 'tool_result'; text: string; truncated: boolean; is_error: boolean }
   | { kind: 'image'; media_type: string | null; bytes: number }
   | { kind: 'document'; media_type: string | null; bytes: number }
