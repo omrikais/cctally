@@ -4629,6 +4629,13 @@ mark.current {
   border-radius: 3px;
 }
 
+/* Reader-scoped tokens (kept off :root so global surfaces are untouched). */
+.conv-view {
+  --measure: 68ch;          /* prose line-length cap (comfort band 50–75ch) */
+  --reader-ink: #ece9e3;    /* warm prose ink */
+  --reader-faint: #a0a7b8;  /* reader faint text — ≥4.5:1 on panel bg (verify in §5) */
+}
+
 /* ---- Two-pane workspace shell ------------------------------------- */
 .conv-view {
   display: grid;
@@ -4871,6 +4878,9 @@ mark.current {
   0%   { box-shadow: 0 0 0 2px var(--accent-amber); background: rgba(251,191,36,0.12); }
   100% { box-shadow: 0 0 0 0 transparent; }
 }
+@media (prefers-reduced-motion: reduce) {
+  .conv-item--jumped { animation: none; }
+}
 
 /* ---- Block disclosures (thinking / tool / result / media / ref) --- */
 .conv-blocks {
@@ -4945,25 +4955,33 @@ mark.current {
 
 /* ---- Markdown prose ----------------------------------------------- */
 .md {
-  font-family: var(--font-mono);
-  font-size: 13px;
-  line-height: 1.55;
-  color: var(--text);
+  font-family: var(--font-prose);
+  font-size: 16.5px;
+  line-height: 1.62;
+  color: var(--reader-ink);
+  max-inline-size: var(--measure);
   word-break: break-word;
 }
+.conv-item--human .md { font-size: 15.5px; }
 .md p { margin: 0 0 8px; }
 .md p:last-child { margin-bottom: 0; }
 .md ul, .md ol { margin: 4px 0 8px; padding-left: 22px; }
 .md li { margin: 2px 0; }
 .md h1, .md h2, .md h3, .md h4 {
-  margin: 10px 0 6px;
-  font-weight: 700;
-  line-height: 1.3;
+  margin: 16px 0 6px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--reader-ink);
 }
-.md h1 { font-size: 17px; }
-.md h2 { font-size: 15px; }
-.md h3 { font-size: 14px; }
-.md a { color: var(--accent-blue); text-decoration: underline; }
+.md h1 { font-size: 22px; }
+.md h2 { font-size: 20px; }
+.md h3 { font-size: 17.5px; }
+.md h4 { font-size: 15.5px; }
+.md a {
+  color: var(--accent-blue);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 .md code {
   font-family: var(--font-mono);
   background: var(--panel-bg-2);
@@ -4992,9 +5010,12 @@ mark.current {
   color: var(--text-dim);
 }
 .md table {
+  display: block;          /* outer table becomes a scroll box; cells keep table layout */
+  max-inline-size: 100%;
+  overflow-x: auto;
   border-collapse: collapse;
-  margin: 6px 0 8px;
-  font-size: 12px;
+  margin: 8px 0;
+  font-size: 13.5px;
 }
 .md th, .md td {
   border: 1px solid var(--border-soft);
