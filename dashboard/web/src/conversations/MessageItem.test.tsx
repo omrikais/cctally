@@ -1,5 +1,5 @@
 import { createRef } from 'react';
-import { render } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { MessageItem } from './MessageItem';
 import type { ConversationItem } from '../types/conversation';
@@ -16,13 +16,19 @@ const human: ConversationItem = {
   parent_uuid: null,
 };
 
+// The assistant turn renders its prose from text BLOCKS in document order (the
+// joined `item.text` is no longer rendered separately) — so the prose arrives
+// as a {kind:'text'} block, matching the real backend payload.
 const assistant: ConversationItem = {
   kind: 'assistant',
   anchor: { session_id: 's', uuid: 'a1', id: 2 },
   member_uuids: ['a1'],
   ts: 't',
   text: 'hi back',
-  blocks: [{ kind: 'thinking', text: 'pondering' }],
+  blocks: [
+    { kind: 'thinking', text: 'pondering' },
+    { kind: 'text', text: 'hi back' },
+  ],
   model: 'claude-opus-4',
   is_sidechain: false,
   subagent_key: null,
@@ -190,5 +196,109 @@ describe('MessageItem', () => {
     expect(ref.current).not.toBeNull();
     expect(ref.current!.classList.contains('conv-item--human')).toBe(true);
     expect(ref.current!.getAttribute('data-uuid')).toBe('h1');
+  });
+
+  it('assistant renders blocks in document order (prose, then its tool run) (#164)', () => {
+    render(
+      <MessageItem
+        item={
+          {
+            kind: 'assistant',
+            anchor: { session_id: 's', uuid: 'a1', id: 1 },
+            member_uuids: ['a1'],
+            ts: '',
+            text: 'Reading the spec.',
+            model: 'claude-opus-4-8',
+            is_sidechain: false,
+            subagent_key: null,
+            parent_uuid: null,
+            cost_usd: 0,
+            blocks: [
+              { kind: 'text', text: 'Reading the spec.' },
+              {
+                kind: 'tool_call',
+                name: 'Read',
+                input_summary: '{}',
+                preview: '/spec.md',
+                tool_use_id: 't1',
+                result: { text: 'BODY', truncated: false, is_error: false },
+              },
+            ],
+          } as ConversationItem
+        }
+      />,
+    );
+    expect(screen.getByText('Reading the spec.')).toBeInTheDocument();
+    expect(screen.getByText('/spec.md')).toBeInTheDocument();
+  });
+
+  it('assistant does NOT double-render prose (text block + joined item.text)', () => {
+    const { container } = render(
+      <MessageItem
+        item={
+          {
+            kind: 'assistant',
+            anchor: { session_id: 's', uuid: 'a9', id: 9 },
+            member_uuids: ['a9'],
+            ts: '',
+            text: 'unique-prose-token',
+            model: 'claude-opus-4-8',
+            is_sidechain: false,
+            subagent_key: null,
+            parent_uuid: null,
+            cost_usd: 0,
+            blocks: [{ kind: 'text', text: 'unique-prose-token' }],
+          } as ConversationItem
+        }
+      />,
+    );
+    // Exactly one Markdown render of the prose (not duplicated by a separate
+    // item.text render alongside the block walk).
+    expect(container.querySelectorAll('.md')).toHaveLength(1);
+  });
+
+  it('human turn unchanged: system-marker fold still fires (keys on item.text)', () => {
+    render(
+      <MessageItem
+        item={
+          {
+            kind: 'human',
+            anchor: { session_id: 's', uuid: 'h1', id: 1 },
+            member_uuids: ['h1'],
+            ts: '',
+            text: '<command-name>/clear</command-name>',
+            blocks: [{ kind: 'text', text: '<command-name>/clear</command-name>' }],
+            is_sidechain: false,
+            subagent_key: null,
+            parent_uuid: null,
+          } as ConversationItem
+        }
+      />,
+    );
+    expect(screen.getByText(/System marker/i)).toBeInTheDocument();
+  });
+
+  it('human turn does NOT double-render prose', () => {
+    const { container } = render(
+      <MessageItem
+        item={
+          {
+            kind: 'human',
+            anchor: { session_id: 's', uuid: 'h7', id: 7 },
+            member_uuids: ['h7'],
+            ts: '',
+            text: 'plain human question',
+            blocks: [{ kind: 'text', text: 'plain human question' }],
+            is_sidechain: false,
+            subagent_key: null,
+            parent_uuid: null,
+          } as ConversationItem
+        }
+      />,
+    );
+    expect(container.querySelector('.conv-item--human')).not.toBeNull();
+    // Prose rendered once, not doubled by the block walk.
+    const matches = container.textContent!.match(/plain human question/g) ?? [];
+    expect(matches).toHaveLength(1);
   });
 });

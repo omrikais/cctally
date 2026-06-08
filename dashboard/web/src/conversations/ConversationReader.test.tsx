@@ -196,6 +196,48 @@ describe('ConversationReader', () => {
     expect(container.querySelector('[data-uuid="targetB"]')!.classList.contains('conv-item--jumped')).toBe(true);
   });
 
+  it('jumps to a FOLDED tool_result uuid: scrolls the owning assistant turn (#160 + #164)', async () => {
+    // The kernel folds a tool_result row's uuid ('u1') into its owning turn's
+    // member_uuids. A jump targeting 'u1' must resolve to the turn element
+    // (data-uuid = the turn's anchor 'a1'), since getItemRef maps every
+    // member_uuids entry — including the folded result uuid — to that element.
+    mockFetchOnce(detail([
+      {
+        kind: 'assistant',
+        anchor: { session_id: 's', uuid: 'a1', id: 1 },
+        member_uuids: ['a1', 'u1'], // u1 = the folded tool_result uuid
+        ts: 't',
+        text: 'paired turn',
+        model: 'claude-opus-4',
+        is_sidechain: false,
+        subagent_key: null,
+        parent_uuid: null,
+        cost_usd: 0.01,
+        blocks: [
+          { kind: 'text', text: 'paired turn' },
+          {
+            kind: 'tool_call',
+            name: 'Read',
+            input_summary: '{}',
+            preview: '/x.py',
+            tool_use_id: 't1',
+            result: { text: 'BODY', truncated: false, is_error: false },
+          },
+        ],
+      } as ConversationItem,
+    ]));
+
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'u1' } });
+    const { container } = render(<ConversationReader sessionId="s" />);
+
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    const turn = container.querySelector('[data-uuid="a1"]')!;
+    expect(turn).not.toBeNull();
+    expect(turn.classList.contains('conv-item--jumped')).toBe(true);
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+  });
+
   it('auto-expands a collapsed subagent thread, scrolls, and highlights when jumping to a member', async () => {
     // Page 1: a main item + a collapsed subagent thread 'A' (sa1 root, sa2 member).
     // No more pages. The jump targets sa2, which lives inside the collapsed thread.
