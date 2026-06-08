@@ -1,4 +1,5 @@
 import io, json, sys, pathlib
+import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _lib_conversation as lc
 
@@ -142,3 +143,73 @@ def test_parse_message_row_missing_uuid_returns_none():
     obj = {"type": "user", "sessionId": "s", "timestamp": "t",
            "message": {"role": "user", "content": "x"}}
     assert lc.parse_message_row(obj, 0) is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #164 Task A1: the parser keeps the tool_use.id / tool_result.tool_use_id
+# linkage ids (currently dropped) so the query kernel can pair request+result.
+# ──────────────────────────────────────────────────────────────────────────
+def test_tool_use_block_keeps_id():
+    from _lib_conversation import _blocks_and_text
+    content = [{"type": "tool_use", "id": "toolu_abc", "name": "Read",
+                "input": {"file_path": "/x/y.py"}}]
+    blocks, text = _blocks_and_text(content)
+    assert blocks[0]["kind"] == "tool_use"
+    assert blocks[0]["id"] == "toolu_abc"
+
+
+def test_tool_result_block_keeps_tool_use_id():
+    from _lib_conversation import _blocks_and_text
+    content = [{"type": "tool_result", "tool_use_id": "toolu_abc",
+                "content": "ok"}]
+    blocks, text = _blocks_and_text(content)
+    assert blocks[0]["kind"] == "tool_result"
+    assert blocks[0]["tool_use_id"] == "toolu_abc"
+
+
+def test_missing_ids_default_to_none_not_keyerror():
+    from _lib_conversation import _blocks_and_text
+    blocks, _ = _blocks_and_text([{"type": "tool_use", "name": "Bash",
+                                   "input": {"command": "ls"}}])
+    assert blocks[0]["id"] is None
+    blocks2, _ = _blocks_and_text([{"type": "tool_result", "content": "x"}])
+    assert blocks2[0]["tool_use_id"] is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #164 Task A2: parse-time tool_preview() — a faithful one-line preview built
+# from the RAW input dict (before _summarize truncates to 200 chars).
+# ──────────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("name,inp,expected", [
+    ("Read",      {"file_path": "/a/b.py", "limit": 10}, "/a/b.py"),
+    ("Write",     {"file_path": "/a/b.py", "content": "x"}, "/a/b.py"),
+    ("Edit",      {"file_path": "/a/b.py"}, "/a/b.py"),
+    ("MultiEdit", {"file_path": "/a/b.py"}, "/a/b.py"),
+    ("NotebookEdit", {"file_path": "/a/nb.ipynb"}, "/a/nb.ipynb"),
+    ("Bash",      {"command": "git status\n--porcelain"}, "git status"),
+    ("Grep",      {"pattern": "foo", "path": "src"}, "foo"),
+    ("Glob",      {"pattern": "**/*.py"}, "**/*.py"),
+    ("Task",      {"description": "do thing", "subagent_type": "x"}, "do thing"),
+    ("Task",      {"subagent_type": "x"}, "x"),
+    ("WebFetch",  {"url": "https://e.com"}, "https://e.com"),
+    ("WebSearch", {"query": "q"}, "q"),
+    ("mcp__srv__do", {"arg": "val"}, "val"),
+    ("Unknown",   {"alpha": 1, "beta": "bee"}, "bee"),  # first string-valued arg
+    ("Unknown",   {"alpha": 1}, "Unknown"),             # no string arg -> name
+])
+def test_tool_preview(name, inp, expected):
+    from _lib_conversation import tool_preview
+    assert tool_preview(name, inp) == expected
+
+
+def test_tool_preview_non_dict_input_is_empty():
+    from _lib_conversation import tool_preview
+    assert tool_preview("Read", None) == ""
+    assert tool_preview(None, {"file_path": "/x"}) == "/x"  # name None -> generic fallback
+
+
+def test_tool_use_block_keeps_preview():
+    from _lib_conversation import _blocks_and_text
+    blocks, _ = _blocks_and_text([{"type": "tool_use", "id": "t1", "name": "Read",
+                                   "input": {"file_path": "/a/b.py"}}])
+    assert blocks[0]["preview"] == "/a/b.py"

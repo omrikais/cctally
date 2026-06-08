@@ -136,12 +136,15 @@ def _blocks_and_text(content):
                 blocks.append({"kind": "thinking", "text": b.get("thinking", "") or ""})
             elif bt == "tool_use":
                 blocks.append({"kind": "tool_use", "name": b.get("name"),
-                               "input_summary": _summarize(b.get("input"))})
+                               "input_summary": _summarize(b.get("input")),
+                               "id": b.get("id"),
+                               "preview": tool_preview(b.get("name"), b.get("input"))})
             elif bt == "tool_result":
                 raw = _stringify(b.get("content"))
                 blocks.append({"kind": "tool_result", "text": raw[:_TOOL_RESULT_CAP],
                                "truncated": len(raw) > _TOOL_RESULT_CAP,
-                               "is_error": bool(b.get("is_error"))})
+                               "is_error": bool(b.get("is_error")),
+                               "tool_use_id": b.get("tool_use_id")})
             elif bt in ("image", "document"):
                 blocks.append({"kind": bt, **_media(b.get("source"))})
             elif bt == "tool_reference":
@@ -168,6 +171,39 @@ def _summarize(inp):
         return ""
     s = json.dumps(inp, separators=(",", ":"))
     return s[:200]
+
+
+_PREVIEW_FIELDS = {
+    "Read": "file_path", "Write": "file_path", "Edit": "file_path",
+    "MultiEdit": "file_path", "NotebookEdit": "file_path",
+    "Bash": "command", "Grep": "pattern", "Glob": "pattern",
+    "Task": "description", "WebFetch": "url", "WebSearch": "query",
+}
+
+
+def tool_preview(name, inp):
+    """One-line, full-fidelity preview for a tool call's collapsed chip (#164,
+    C5). Runs on the RAW input dict before _summarize truncates to 200 chars.
+    Known tools map to their primary arg; Bash takes the first command line;
+    Task falls back to subagent_type; unknown/mcp tools take the first
+    string-valued arg, else the tool name. Always returns a single-line str."""
+    if not isinstance(inp, dict):
+        return ""
+    field = _PREVIEW_FIELDS.get(name or "")
+    val = None
+    if field is not None:
+        val = inp.get(field)
+        if val is None and name == "Task":
+            val = inp.get("subagent_type")
+    if val is None:
+        # generic fallback: first string-valued arg, else the tool name
+        for v in inp.values():
+            if isinstance(v, str) and v:
+                val = v
+                break
+    if not isinstance(val, str) or not val:
+        return name or ""
+    return val.splitlines()[0] if val else (name or "")
 
 
 def _media(source):
