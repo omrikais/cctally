@@ -4967,17 +4967,54 @@ mark.current {
   font-size: 12px;
 }
 .conv-chip > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   cursor: pointer;
   padding: 5px 10px;
   color: var(--text-dim);
   list-style: none;
   user-select: none;
+  font-family: var(--font-mono);
 }
 .conv-chip > summary::-webkit-details-marker { display: none; }
 .conv-chip[open] > summary { color: var(--text); }
 .conv-chip--thinking > summary { color: var(--accent-indigo); }
 .conv-chip--tool > summary { color: var(--accent-cyan); }
 .conv-chip--result > summary { color: var(--accent-teal); }
+
+/* Chevron expand affordance (#164, C4): a rotated border triangle that
+   turns down when the disclosure opens. Cheap transform transition only —
+   no grid-template-rows open/close animation (that's Phase 7). */
+.conv-chev {
+  width: 8px;
+  height: 8px;
+  border-right: 1.6px solid currentColor;
+  border-bottom: 1.6px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 0.2s ease;
+  opacity: 0.7;
+  flex: 0 0 auto;
+}
+.conv-chip[open] > summary .conv-chev,
+.conv-toolresult-run[open] > summary .conv-chev { transform: rotate(45deg); }
+
+/* Summary parts: bold name, faint ellipsized one-line preview that flexes to
+   fill, and a fixed-width trailing status. */
+.conv-chip-name { font-weight: 600; flex: 0 0 auto; }
+.conv-chip-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+.conv-chip-status { flex: 0 0 auto; color: var(--text-faint); font-size: 11px; }
+.conv-chip--result .conv-chip-status,
+.conv-chip--tool .conv-chip-status { color: var(--accent-amber); }
+
 .conv-chip-body {
   padding: 8px 10px;
   border-top: 1px solid var(--border-soft);
@@ -4989,12 +5026,96 @@ mark.current {
   margin: 0;
   overflow-x: auto;
 }
+/* Paired request/result body: a non-pre container holding two tool-io blocks. */
+.conv-chip-body--io { white-space: normal; padding: 6px 10px 10px; }
 .conv-chip--media,
 .conv-chip--ref {
   display: inline-block;
   padding: 4px 10px;
   color: var(--text-dim);
   background: var(--panel-bg-2);
+}
+
+/* ---- Tool-run group (consecutive tool_call blocks) ---------------- */
+.conv-toolrun {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.conv-toolrun-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 6px 0 2px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.conv-toolrun-head::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border-soft);
+}
+
+/* ---- Paired tool-io request/result blocks ------------------------- */
+.conv-tool-io { margin-top: 6px; }
+.conv-tool-io:first-child { margin-top: 0; }
+.conv-tool-io-label {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin: 0 0 4px;
+}
+.conv-tool-io-label--none { font-style: italic; }
+.conv-code {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.conv-code--result {
+  color: var(--text-dim);
+  max-height: 220px;
+  overflow: auto;
+}
+
+/* ---- Orphan tool-result run (collapsed bare-result texture) -------- */
+.conv-toolresult-run {
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-bg-2);
+}
+.conv-toolresult-run > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  padding: 5px 10px;
+  color: var(--accent-teal);
+  list-style: none;
+  user-select: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.conv-toolresult-run > summary::-webkit-details-marker { display: none; }
+.conv-toolresult-run-body {
+  padding: 6px 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 /* ---- Sidechain (subagent thread) group ---------------------------- */
