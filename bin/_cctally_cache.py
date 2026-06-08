@@ -612,6 +612,12 @@ def sync_cache(
             # run a redundant (idempotent but wasteful) offset-0 backfill pass.
             conn.execute(
                 "DELETE FROM cache_meta WHERE key='conversation_backfill_pending'")
+            # Issue #164: a rebuild also clears + repopulates the message index
+            # id-aware via the normal offset-0 walk, so drop the 003 reingest
+            # flag too — the post-rebuild sync must not run a redundant
+            # (idempotent but wasteful) clear+backfill pass.
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key='conversation_reingest_pending'")
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Claude cached entries")
 
@@ -644,6 +650,36 @@ def sync_cache(
                 conn.execute(
                     "DELETE FROM cache_meta "
                     "WHERE key='conversation_backfill_pending'"
+                )
+                conn.commit()
+
+            # Issue #164: consume the deferred conversation_messages re-ingest.
+            # Cache migration 003 is flag-only — it sets
+            # ``conversation_reingest_pending`` rather than clearing inline
+            # (clearing in the handler would run WITHOUT this flock, racing a
+            # concurrent sync, and would empty the reader on stats-only /
+            # eager-migration opens or ``dashboard --no-sync``). The destructive
+            # clear + id-aware offset-0 re-derive live here, UNDER the held
+            # flock. Distinct from 002's backfill-without-clear: 003 is
+            # clear-then-backfill, re-deriving the WHOLE index id-aware so
+            # existing history pairs tool_use<->tool_result. The clear is
+            # storm-free (#138); the offset-0 backfill walks every JSONL from 0;
+            # the flag is dropped LAST so a crash mid-walk re-runs cleanly on the
+            # next sync. Never on the rebuild path (which already wipes +
+            # repopulates the index id-aware via the normal walk).
+            try:
+                _reingest = conn.execute(
+                    "SELECT 1 FROM cache_meta "
+                    "WHERE key='conversation_reingest_pending'"
+                ).fetchone() is not None
+            except sqlite3.OperationalError:
+                _reingest = False
+            if _reingest:
+                clear_conversation_messages(conn)
+                backfill_conversation_messages(conn)
+                conn.execute(
+                    "DELETE FROM cache_meta "
+                    "WHERE key='conversation_reingest_pending'"
                 )
                 conn.commit()
 

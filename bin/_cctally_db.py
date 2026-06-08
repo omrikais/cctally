@@ -2991,6 +2991,24 @@ def _002_conversation_messages_backfill(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@cache_migration("003_conversation_reingest_tool_ids")
+def _003_conversation_reingest_tool_ids(conn: sqlite3.Connection) -> None:
+    """Flag-only re-ingest of conversation_messages so tool_use.id /
+    tool_result.tool_use_id / preview land on existing history (#164).
+
+    The destructive clear + offset-0 backfill run in sync_cache UNDER the
+    cache.db.lock flock — NOT here. Clearing in the handler would violate the
+    lock discipline cache-001 follows and would empty the reader on
+    stats-only / eager-migration opens or ``dashboard --no-sync``. A distinct
+    flag from 002's conversation_backfill_pending: 002 = backfill-without-clear;
+    003 = clear-then-backfill. The dispatcher stamps this migration centrally
+    on the existing-install path (issue #140); a fresh install stamps it
+    without running (empty table), and the flag — if ever set — is a harmless
+    no-op there."""
+    _set_cache_meta(conn, "conversation_reingest_pending", "1")
+    conn.commit()
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")
