@@ -102,3 +102,52 @@ describe('groupSidechains', () => {
     expect(groupSidechains([])).toEqual([]);
   });
 });
+
+// #164: a run of >=2 consecutive top-level orphan tool_result items collapses
+// into one `tool_result_run` node (the residual bare-result texture). A lone
+// orphan stays a plain item node.
+function tr(uuid: string): ConversationItem {
+  return {
+    kind: 'tool_result',
+    anchor: { session_id: 's', uuid, id: 1 },
+    member_uuids: [uuid],
+    ts: '',
+    text: '',
+    blocks: [],
+    is_sidechain: false,
+    subagent_key: null,
+    parent_uuid: null,
+  };
+}
+
+describe('collapseToolResultRuns (orphan tool_result runs)', () => {
+  it('collapses a run of >=2 orphan tool_result items into one node', () => {
+    const nodes = groupSidechains([tr('u1'), tr('u2'), tr('u3')]);
+    const run = nodes.find((n) => n.kind === 'tool_result_run');
+    expect(run).toBeTruthy();
+    if (run!.kind !== 'tool_result_run') throw new Error('expected tool_result_run');
+    expect(run!.items.map((i) => i.anchor.uuid)).toEqual(['u1', 'u2', 'u3']);
+  });
+
+  it('a single orphan tool_result stays an item node', () => {
+    const nodes = groupSidechains([tr('u1')]);
+    expect(nodes.every((n) => n.kind !== 'tool_result_run')).toBe(true);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].kind).toBe('item');
+  });
+
+  it('a non-tool_result item between two orphans breaks the run', () => {
+    const nodes = groupSidechains([tr('u1'), mk('h'), tr('u2')]);
+    // No run of >=2 contiguous results → no run node; all three are items.
+    expect(nodes.every((n) => n.kind !== 'tool_result_run')).toBe(true);
+    expect(nodes.map((n) => n.kind)).toEqual(['item', 'item', 'item']);
+  });
+
+  it('collapses only the contiguous orphan run, leaving surrounding items intact', () => {
+    const nodes = groupSidechains([mk('h1'), tr('u1'), tr('u2'), mk('h2')]);
+    expect(nodes.map((n) => n.kind)).toEqual(['item', 'tool_result_run', 'item']);
+    const run = nodes[1];
+    if (run.kind !== 'tool_result_run') throw new Error('expected tool_result_run');
+    expect(run.items.map((i) => i.anchor.uuid)).toEqual(['u1', 'u2']);
+  });
+});

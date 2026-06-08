@@ -158,9 +158,10 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
       </div>
       <div className="conv-reader-body">
         <div className="conv-reader-thread">
-          {groups.map((g) =>
-            g.kind === 'subagent'
-              ? <SidechainGroup
+          {groups.map((g) => {
+            if (g.kind === 'subagent') {
+              return (
+                <SidechainGroup
                   key={`sc-${g.subagentKey}`}
                   subagentKey={g.subagentKey}
                   items={g.items}
@@ -168,8 +169,33 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
                   getItemRef={getItemRef}
                   forceOpen={detail.session_id === sessionId && g.subagentKey === forcedOpenKey}
                 />
-              : <MessageItem key={g.item.anchor.uuid} item={g.item} ref={getItemRef(g.item)} />,
-          )}
+              );
+            }
+            if (g.kind === 'tool_result_run') {
+              // Collapsed orphan-result run (#164). Members render their own
+              // MessageItem so each keeps its data-uuid + per-member ref for the
+              // #160 jump; the disclosure is open by default so a jump target
+              // inside it is reachable without a force-open dance.
+              return (
+                <details
+                  key={`trr-${g.items[0].anchor.uuid}`}
+                  className="conv-toolresult-run"
+                  open
+                >
+                  <summary>
+                    <span className="conv-chev" aria-hidden="true" />
+                    📤 {g.items.length} tool results
+                  </summary>
+                  <div className="conv-toolresult-run-body">
+                    {g.items.map((item) => (
+                      <MessageItem key={item.anchor.uuid} item={item} ref={getItemRef(item)} />
+                    ))}
+                  </div>
+                </details>
+              );
+            }
+            return <MessageItem key={g.item.anchor.uuid} item={g.item} ref={getItemRef(g.item)} />;
+          })}
         </div>
         {hasMore && <div ref={sentinelRef} className="conv-load-sentinel">Loading more…</div>}
       </div>

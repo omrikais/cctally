@@ -9,7 +9,36 @@ import type { ConversationItem } from '../types/conversation';
 // insertion order); recomputed by ConversationReader's useMemo as pages load.
 export type RenderNode =
   | { kind: 'item'; item: ConversationItem }
-  | { kind: 'subagent'; subagentKey: string; items: ConversationItem[]; nested: boolean };
+  | { kind: 'subagent'; subagentKey: string; items: ConversationItem[]; nested: boolean }
+  // #164: a run of >=2 consecutive top-level orphan tool_result items, collapsed
+  // from the bare-result texture into one disclosure. Each member still renders
+  // as its own MessageItem (per-member ref intact for #160).
+  | { kind: 'tool_result_run'; items: ConversationItem[] };
+
+// Post-pass over the render-tree: fold runs of >=2 consecutive top-level orphan
+// `tool_result` item nodes into one `tool_result_run` node; a lone orphan stays
+// an `item` node. Only top-level `item` nodes of kind tool_result are eligible —
+// a `subagent` node (or any non-tool_result item) breaks a run. Runs that fold
+// preserve member order; the surrounding nodes pass through unchanged.
+function collapseToolResultRuns(nodes: RenderNode[]): RenderNode[] {
+  const res: RenderNode[] = [];
+  let run: ConversationItem[] = [];
+  const flush = () => {
+    if (run.length >= 2) res.push({ kind: 'tool_result_run', items: run });
+    else if (run.length === 1) res.push({ kind: 'item', item: run[0] });
+    run = [];
+  };
+  for (const n of nodes) {
+    if (n.kind === 'item' && n.item.kind === 'tool_result') {
+      run.push(n.item);
+      continue;
+    }
+    flush();
+    res.push(n);
+  }
+  flush();
+  return res;
+}
 
 export function groupSidechains(items: ConversationItem[]): RenderNode[] {
   // 1. Single pass: bucket sidechain items by subagent_key (document order,
@@ -66,5 +95,6 @@ export function groupSidechains(items: ConversationItem[]): RenderNode[] {
   // 4. Final sweep: any bucket not yet emitted (defensive — guarantees no
   //    sidechain item is ever dropped).
   for (const k of buckets.keys()) if (!emitted.has(k)) emit(k);
-  return out;
+  // 5. Collapse residual orphan tool_result runs (#164) before returning.
+  return collapseToolResultRuns(out);
 }
