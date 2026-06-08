@@ -20,6 +20,12 @@ Per-migration goldens (lazy-adopted; one pair per migration that ships them):
     history (pointed at via CLAUDE_CONFIG_DIR; source_path normalized to a stable
     synthetic prefix so the committed golden is portable). Loaded by
     tests/test_migration_002_per_migration_goldens.py.
+  - per-migration/003_conversation_reingest_tool_ids/{pre,post}.sqlite — cache.db
+    pre/post for the #164 id-aware re-ingest. pre = existing install with an
+    id-less conversation_messages row; post = the row UNCHANGED plus the
+    conversation_reingest_pending flag + the 003 marker (flag-only handler — the
+    clear+backfill run later in sync_cache under the flock). Loaded by
+    tests/test_migration_003_per_migration_goldens.py.
   - per-migration/008_recompute_weekly_cost_snapshots_dedup_fix/{pre,pre-cache,post}.sqlite
     — paired stats+cache fixture for the ccusage-parity historical recompute.
     Loaded by tests/test_migration_008_per_migration_goldens.py.
@@ -1365,6 +1371,115 @@ def build_per_migration_002_conversation_messages_backfill(
     _sh.rmtree(claude_dir, ignore_errors=True)
 
 
+def build_per_migration_003_conversation_reingest_tool_ids(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for cache migration
+    ``003_conversation_reingest_tool_ids`` (#164).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — full production cache schema (via
+        ``_apply_cache_schema``), a ``schema_migrations`` table WITHOUT 003,
+        and a single id-LESS ``conversation_messages`` row (the pre-#164
+        shape: a tool_use block whose blocks_json carries no ``id`` /
+        ``preview``). This is the existing-install shape before the re-ingest.
+      * ``post.sqlite`` — same DB after running the production 003 handler.
+        Because 003 is FLAG-ONLY (the destructive clear + offset-0 re-ingest
+        run later in ``sync_cache`` under the ``cache.db.lock`` flock, NOT in
+        the handler), post.sqlite carries the row UNCHANGED, plus
+        ``cache_meta('conversation_reingest_pending','1')`` and the 003
+        marker stamped. The flag-consume / actual re-ingest is covered by
+        ``tests/test_migration_003_reingest.py``, not this golden.
+
+    Loaded by ``tests/test_migration_003_per_migration_goldens.py``. Mirrors
+    the 002 per-migration builder (flag-only handler, marker pinned).
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    # An id-LESS tool_use block — the pre-#164 stored shape (no "id"/"preview").
+    import json as _json
+    _IDLESS_BLOCKS = _json.dumps(
+        [{"kind": "tool_use", "name": "Read", "input_summary": "{}"}],
+        separators=(",", ":"),
+    )
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _cctally, db = _load_cctally()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            # One existing id-less conversation row (the pre-#164 shape).
+            conn.execute(
+                "INSERT INTO conversation_messages "
+                "(session_id,uuid,source_path,byte_offset,timestamp_utc,"
+                " entry_type,text,blocks_json,model,msg_id,req_id,is_sidechain) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("s1", "a1", "/fake/.claude/projects/-Users-u-proj/sess.jsonl",
+                 0, "2026-04-15T15:00:00Z", "assistant", "",
+                 _IDLESS_BLOCKS, "claude-opus-4-7", "m1", "r1", 0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _cctally, db = _load_cctally()
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "003_conversation_reingest_tool_ids":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit("003_conversation_reingest_tool_ids not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Flag-only handler: sets conversation_reingest_pending, leaves the
+            # conversation_messages row UNCHANGED (the clear is deferred to
+            # sync_cache). Then stamp the marker centrally (the dispatcher owns
+            # the stamp per #140) with a PINNED timestamp so the committed
+            # golden is rebuild-deterministic.
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("003_conversation_reingest_tool_ids", "2026-04-30T12:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -1384,6 +1499,9 @@ def main() -> int:
     )
     build_per_migration_002_conversation_messages_backfill(
         FIXTURES_ROOT / "per-migration" / "002_conversation_messages_backfill"
+    )
+    build_per_migration_003_conversation_reingest_tool_ids(
+        FIXTURES_ROOT / "per-migration" / "003_conversation_reingest_tool_ids"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

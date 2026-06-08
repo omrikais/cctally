@@ -14,10 +14,11 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 13 / 13 known
   ✓ 012_unify_budget_milestones_vendor             applied <REDACTED>
   ✓ 013_test_failure_injection                     applied <REDACTED>
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 3 / 3 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 4 / 4 known
   ✓ 001_dedup_highest_wins                         applied <REDACTED>
   ✓ 002_conversation_messages_backfill             applied <REDACTED>
-  ✓ 003_test_cache_migration                       applied <REDACTED>
+  ✓ 003_conversation_reingest_tool_ids             applied <REDACTED>
+  ✓ 004_test_cache_migration                       applied <REDACTED>
 ## stderr
 
 ## exit
@@ -41,11 +42,12 @@ stats.db:
     013_test_failure_injection
   schema_migrations_skipped:
 cache.db:
-  user_version: 3
+  user_version: 4
   schema_migrations:
     001_dedup_highest_wins
     002_conversation_messages_backfill
-    003_test_cache_migration
+    003_conversation_reingest_tool_ids
+    004_test_cache_migration
   schema_migrations_skipped:
 ## log
 <no migration-errors.log>
