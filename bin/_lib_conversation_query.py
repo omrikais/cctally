@@ -251,6 +251,10 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     tool_result_items = []         # placeholder items deferred to Phase 2
 
     def _index_tool_uses(item):
+        # Index every tool_use id -> its (item, block). Idempotent: re-scanning
+        # a turn's blocks re-maps the same id to the same (item, block). Anthropic
+        # tool_use ids are unique within a session; a collision would be
+        # last-writer-wins (a result then folds to one deterministic owner).
         for b in item["blocks"]:
             if b.get("kind") == "tool_use" and b.get("id") is not None:
                 tooluse_index[b["id"]] = (item, b)
@@ -268,7 +272,7 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                 _index_tool_uses(it)
             else:
                 _extend_turn(items[idx], row)
-                _index_tool_uses(items[idx])     # newly-folded fragment's uses
+                _index_tool_uses(items[idx])     # re-index the turn (idempotent; new fragment may add ids)
         elif etype == "tool_result":
             it = _build_simple(row)
             items.append(it)

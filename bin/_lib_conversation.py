@@ -203,7 +203,7 @@ def tool_preview(name, inp):
                 break
     if not isinstance(val, str) or not val:
         return name or ""
-    return val.splitlines()[0] if val else (name or "")
+    return val.splitlines()[0]
 
 
 def _media(source):
