@@ -239,8 +239,22 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     # item. A turn → exactly ONE item → cost counted exactly once. Humans,
     # tool_results, and assistant rows with a null msg_id emit as simple items at
     # their own position.
+    # ---- Phase 1: build items + index every assistant item's tool_use ids ----
+    # A tool_result is NOT guaranteed to sort after its tool_use (a grounded
+    # transcript scan found a matched result ordered BEFORE its use, plus orphan
+    # results with no in-session use), so this is a build-and-index-ALL pass
+    # FOLLOWED by a fold pass — never a single forward pass. None ids are never
+    # indexed (the id-less degradation guard).
     items = []
-    turn_index = {}        # (msg_id, req_id) -> index into items
+    turn_index = {}                # (msg_id, req_id) -> index into items
+    tooluse_index = {}             # tool_use id -> (item, block_dict)
+    tool_result_items = []         # placeholder items deferred to Phase 2
+
+    def _index_tool_uses(item):
+        for b in item["blocks"]:
+            if b.get("kind") == "tool_use" and b.get("id") is not None:
+                tooluse_index[b["id"]] = (item, b)
+
     for row in logical:
         (rid, u, ts, etype, text, blocks, model, msg_id, req_id,
          is_sc, cwd, branch, source_path, parent_uuid) = row
@@ -249,11 +263,64 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
             idx = turn_index.get(key)
             if idx is None:
                 turn_index[key] = len(items)
-                items.append(_build_turn([row]))
+                it = _build_turn([row])
+                items.append(it)
+                _index_tool_uses(it)
             else:
                 _extend_turn(items[idx], row)
+                _index_tool_uses(items[idx])     # newly-folded fragment's uses
+        elif etype == "tool_result":
+            it = _build_simple(row)
+            items.append(it)
+            tool_result_items.append(it)
         else:
-            items.append(_build_simple(row))
+            it = _build_simple(row)
+            items.append(it)
+            if etype == "assistant":             # null-msg_id assistant: index its uses too
+                _index_tool_uses(it)
+
+    # ---- Phase 2: fold each tool_result item into its owning assistant item ----
+    drop = set()                                 # id() of folded placeholder items
+    for tr in tool_result_items:
+        tr_blocks = [b for b in tr["blocks"] if b.get("kind") == "tool_result"]
+        non_result = [b for b in tr["blocks"] if b.get("kind") != "tool_result"]
+        owners = []
+        resolved = []
+        for b in tr_blocks:
+            tid = b.get("tool_use_id")
+            hit = tooluse_index.get(tid) if tid is not None else None
+            if hit is None:
+                owners = None                    # an unresolved block -> keep standalone
+                break
+            owners.append(hit[0])
+            resolved.append((hit[1], b))
+        # fold iff every result block resolved to exactly ONE owning item, no leftovers
+        owner_ids = {id(o) for o in owners} if owners is not None else set()
+        if owners and not non_result and len(owner_ids) == 1:
+            owner = owners[0]
+            for use_block, res_block in resolved:
+                use_block["result"] = {"text": res_block.get("text", ""),
+                                       "truncated": bool(res_block.get("truncated")),
+                                       "is_error": bool(res_block.get("is_error"))}
+            owner["member_uuids"].append(tr["anchor"]["uuid"])
+            drop.add(id(tr))
+        # else: leave tr standalone (orphan / multi-owner / mixed) — a folded
+        # row's uuid then joins EXACTLY ONE item's member_uuids (the #160 anchor).
+
+    if drop:
+        items = [it for it in items if id(it) not in drop]
+
+    # ---- Phase 3: sweep every assistant item's tool_use -> tool_call ----
+    # Covers turn items AND _build_simple null-msg_id assistant items. Matched
+    # requests already carry `result`; unmatched get `result: None`
+    # (request-only). Post-migration the client never receives a bare tool_use.
+    for it in items:
+        if it["kind"] == "assistant":
+            for b in it["blocks"]:
+                if b.get("kind") == "tool_use":
+                    b["kind"] = "tool_call"
+                    b["tool_use_id"] = b.pop("id", None)
+                    b.setdefault("result", None)
 
     costs = _turn_cost_map(conn, list(turn_index))
     # Stamp per-item cost first, then derive the header from the SUM of the

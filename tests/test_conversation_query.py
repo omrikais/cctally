@@ -128,27 +128,35 @@ def test_get_conversation_dedups_and_groups_turns_cost_once():
 
 
 def test_get_conversation_interleaved_tool_result_coalesces_one_turn_cost_once():
-    # C1 regression: a tool-using turn interleaves a tool_result (user) line
-    # BETWEEN two assistant fragments sharing the SAME (msg_id, req_id). The
-    # turn must coalesce to exactly ONE assistant item (grouping over the whole
-    # logical list, NOT by adjacency), the tool_result must be its own item, and
-    # cost must be counted ONCE — proven with MULTIPLE turns so the cardinality
-    # invariant sum(assistant item cost) == header cost is non-vacuous.
+    # C1 regression (#164-updated): a tool-using turn interleaves a tool_result
+    # (user) line BETWEEN two assistant fragments sharing the SAME (msg_id,
+    # req_id). The turn coalesces to exactly ONE assistant item (grouping over
+    # the whole logical list, NOT by adjacency). With the id-bearing tool pair
+    # the tool_result now FOLDS into that turn's tool_call.result (#164 Task A3)
+    # — it is NOT a standalone item — and its uuid joins the turn's
+    # member_uuids. Cost must be counted ONCE — proven with MULTIPLE turns so
+    # the cardinality invariant sum(assistant item cost) == header cost is
+    # non-vacuous.
     c = _conn()
     _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
          timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="do a thing",
          cwd="/home/u/proj", git_branch="main")
-    # turn 1 (m1,r1) fragment A: thinking + tool_use (no prose)
+    # turn 1 (m1,r1) fragment A: thinking + tool_use (no prose), id-bearing
     _msg(c, session_id="s1", uuid="t1a", source_path="a.jsonl", byte_offset=1,
          timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant", text="",
          blocks_json=_json.dumps([{"kind": "thinking", "text": "plan"},
-                                  {"kind": "tool_use", "name": "Bash"}]),
+                                  {"kind": "tool_use", "name": "Bash",
+                                   "input_summary": "{}", "id": "t1",
+                                   "preview": "ls"}]),
          model=_MODEL, msg_id="m1", req_id="r1")
-    # tool_result (user) BREAKS the adjacency run within turn 1
+    # tool_result (user) BREAKS the adjacency run within turn 1; its
+    # tool_use_id matches t1 so it folds into turn 1's tool_call.
     _msg(c, session_id="s1", uuid="tr1", source_path="a.jsonl", byte_offset=2,
          timestamp_utc="2026-06-01T00:00:02Z", entry_type="tool_result",
-         text="command output",
-         blocks_json=_json.dumps([{"kind": "tool_result", "text": "out"}]))
+         text="",
+         blocks_json=_json.dumps([{"kind": "tool_result", "text": "out",
+                                   "truncated": False, "is_error": False,
+                                   "tool_use_id": "t1"}]))
     # turn 1 (m1,r1) fragment B: SAME msg_id/req_id, carries the prose
     _msg(c, session_id="s1", uuid="t1b", source_path="a.jsonl", byte_offset=3,
          timestamp_utc="2026-06-01T00:00:03Z", entry_type="assistant", text="done",
@@ -166,19 +174,20 @@ def test_get_conversation_interleaved_tool_result_coalesces_one_turn_cost_once()
 
     out = cq.get_conversation(c, "s1", after=None, limit=500)
     items = out["items"]
-    # human, turn-1 (coalesced), tool_result, turn-2 — the tool_result sits
-    # AFTER the coalesced turn-1 item (positioned at its first fragment).
-    assert [it["kind"] for it in items] == \
-           ["human", "assistant", "tool_result", "assistant"]
+    # human, turn-1 (coalesced; the tool_result FOLDED in), turn-2. The
+    # tool_result is no longer a standalone item (#164).
+    assert [it["kind"] for it in items] == ["human", "assistant", "assistant"]
+    assert all(it["kind"] != "tool_result" for it in items)
     turn1 = items[1]
-    # exactly ONE assistant item for the interleaved turn, with ALL fragment uuids
-    assert set(turn1["member_uuids"]) == {"t1a", "t1b"}
+    # exactly ONE assistant item for the interleaved turn, with ALL fragment
+    # uuids PLUS the folded tool_result uuid (#160 anchor).
+    assert set(turn1["member_uuids"]) == {"t1a", "t1b", "tr1"}
     assert turn1["text"] == "done"                 # prose-bearing fragment
     assert turn1["anchor"]["uuid"] == "t1b"
-    # the in-between tool_result is its own separate item
-    assert items[2]["kind"] == "tool_result"
-    assert items[2]["anchor"]["uuid"] == "tr1"
-    assert items[2]["member_uuids"] == ["tr1"]
+    # the tool_use became a tool_call carrying the folded result.
+    call = next(b for b in turn1["blocks"] if b["kind"] == "tool_call")
+    assert call["tool_use_id"] == "t1"
+    assert call["result"]["text"] == "out"
     # exactly two distinct assistant items, each with its own non-zero cost
     asst = [it for it in items if it["kind"] == "assistant"]
     assert len(asst) == 2
@@ -258,6 +267,176 @@ def test_get_conversation_cursor_pagination():
     # no overlap
     seen = {it["anchor"]["uuid"] for it in p1["items"]} | {it["anchor"]["uuid"] for it in p2["items"]}
     assert len(seen) == 4
+
+
+# ---------------------------------------------------------------------------
+# #164 Task A3: two-phase tool_use<->tool_result pairing into merged tool_call
+# blocks. Pairing is by tool_use_id (robust to parallel + reordered results);
+# a folded tool_result row's uuid joins the owning turn's member_uuids; orphan
+# / multi-owner / mixed rows stay standalone; id-less rows degrade to
+# request-only (result:null) + standalone, never crash. Cost-once is preserved.
+# ---------------------------------------------------------------------------
+_TS = "2026-06-01T00:00:0{}Z"
+
+
+def _seed_assistant(conn, *, sid, uuid, msg_id, req_id, blocks,
+                    ts="2026-06-01T00:00:01Z", model=None, source_path="a.jsonl"):
+    """An assistant turn fragment carrying tool_use blocks (and optionally
+    prose). Mirrors the existing _msg INSERT shape."""
+    _msg(conn, session_id=sid, uuid=uuid, source_path=source_path, byte_offset=0,
+         timestamp_utc=ts, entry_type="assistant",
+         text="".join(b.get("text", "") for b in blocks if b.get("kind") == "text"),
+         blocks_json=_json.dumps(blocks), model=model, msg_id=msg_id, req_id=req_id)
+
+
+def _seed_tool_result(conn, *, sid, uuid, blocks,
+                      ts="2026-06-01T00:00:02Z", source_path="a.jsonl"):
+    """A user/tool_result row carrying one or more tool_result blocks."""
+    _msg(conn, session_id=sid, uuid=uuid, source_path=source_path, byte_offset=1,
+         timestamp_utc=ts, entry_type="tool_result", text="",
+         blocks_json=_json.dumps(blocks))
+
+
+def _seed_assistant_with_cost(conn, *, sid, uuid, msg_id, req_id, blocks, model,
+                              ts="2026-06-01T00:00:01Z", source_path="a.jsonl"):
+    """An assistant turn + its single deduped session_entries cost row."""
+    _seed_assistant(conn, sid=sid, uuid=uuid, msg_id=msg_id, req_id=req_id,
+                    blocks=blocks, ts=ts, model=model, source_path=source_path)
+    _entry(conn, source_path=source_path, line_offset=0, model=model,
+           msg_id=msg_id, req_id=req_id, inp=1000, out=500)
+
+
+def test_pairs_tool_use_with_result_by_id():
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}",
+                 "id": "t1", "preview": "/x.py"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "file body", "truncated": False,
+                 "is_error": False, "tool_use_id": "t1"}])
+    out = cq.get_conversation(conn, "s1")
+    items = out["items"]
+    assert all(it["kind"] != "tool_result" for it in items)
+    turn = next(it for it in items if it["kind"] == "assistant")
+    call = next(b for b in turn["blocks"] if b["kind"] == "tool_call")
+    assert call["tool_use_id"] == "t1"
+    assert call["preview"] == "/x.py"
+    assert call["result"]["text"] == "file body"
+    assert call["result"]["is_error"] is False
+
+
+def test_pairs_parallel_tools_reordered_results():
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}", "id": "t1", "preview": "a"},
+                {"kind": "tool_use", "name": "Read", "input_summary": "{}", "id": "t2", "preview": "b"}])
+    _seed_tool_result(conn, sid="s1", uuid="u2", ts="2026-06-01T00:00:02Z",
+        blocks=[{"kind": "tool_result", "text": "R2", "truncated": False, "is_error": False, "tool_use_id": "t2"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1", ts="2026-06-01T00:00:03Z", source_path="b.jsonl",
+        blocks=[{"kind": "tool_result", "text": "R1", "truncated": False, "is_error": False, "tool_use_id": "t1"}])
+    turn = next(it for it in cq.get_conversation(conn, "s1")["items"] if it["kind"] == "assistant")
+    calls = {b["tool_use_id"]: b["result"]["text"] for b in turn["blocks"] if b["kind"] == "tool_call"}
+    assert calls == {"t1": "R1", "t2": "R2"}   # paired by id, not by order
+
+
+def test_result_before_use_in_order_still_pairs():
+    # the empirical edge Codex found: a result row sorts BEFORE its use
+    conn = _conn()
+    _seed_tool_result(conn, sid="s1", uuid="u1", ts="2026-01-01T00:00:00Z",
+        blocks=[{"kind": "tool_result", "text": "R", "truncated": False, "is_error": False, "tool_use_id": "t1"}])
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1", ts="2026-01-01T00:00:01Z",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}", "id": "t1", "preview": "a"}])
+    turn = next(it for it in cq.get_conversation(conn, "s1")["items"] if it["kind"] == "assistant")
+    call = next(b for b in turn["blocks"] if b["kind"] == "tool_call")
+    assert call["result"]["text"] == "R"   # two-phase resolves regardless of order
+
+
+def test_folded_result_uuid_joins_owning_turn_member_uuids():
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}", "id": "t1", "preview": "a"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "R", "truncated": False, "is_error": False, "tool_use_id": "t1"}])
+    turn = next(it for it in cq.get_conversation(conn, "s1")["items"] if it["kind"] == "assistant")
+    assert "u1" in turn["member_uuids"]              # #160 anchor preserved
+    assert "a1" in turn["member_uuids"]
+
+
+def test_orphan_result_stays_standalone():
+    conn = _conn()
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "R", "truncated": False, "is_error": False, "tool_use_id": "NOPE"}])
+    items = cq.get_conversation(conn, "s1")["items"]
+    orphan = next(it for it in items if it["kind"] == "tool_result")
+    assert orphan["member_uuids"] == ["u1"]
+
+
+def test_idless_rows_degrade_request_only_and_standalone():
+    # pre-migration data: tool_use has no id, tool_result has no tool_use_id
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}", "id": None, "preview": "a"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "R", "truncated": False, "is_error": False, "tool_use_id": None}])
+    items = cq.get_conversation(conn, "s1")["items"]
+    turn = next(it for it in items if it["kind"] == "assistant")
+    call = next(b for b in turn["blocks"] if b["kind"] == "tool_call")
+    assert call["result"] is None                    # request-only, never crashes
+    assert any(it["kind"] == "tool_result" for it in items)  # result stays standalone
+
+
+def test_multi_owner_result_row_stays_standalone():
+    # a single tool_result row whose blocks resolve to TWO different turns must
+    # NOT fold (a uuid may join exactly one item's member_uuids).
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1", ts="2026-06-01T00:00:01Z",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}", "id": "t1", "preview": "a"}])
+    _seed_assistant(conn, sid="s1", uuid="a2", msg_id="m2", req_id="r2", ts="2026-06-01T00:00:02Z",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}", "id": "t2", "preview": "b"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1", ts="2026-06-01T00:00:03Z",
+        blocks=[{"kind": "tool_result", "text": "R1", "truncated": False, "is_error": False, "tool_use_id": "t1"},
+                {"kind": "tool_result", "text": "R2", "truncated": False, "is_error": False, "tool_use_id": "t2"}])
+    items = cq.get_conversation(conn, "s1")["items"]
+    assert any(it["kind"] == "tool_result" and it["member_uuids"] == ["u1"] for it in items)
+    # neither owning turn got a folded result (request-only)
+    for turn in (it for it in items if it["kind"] == "assistant"):
+        for b in turn["blocks"]:
+            if b["kind"] == "tool_call":
+                assert b["result"] is None
+
+
+def test_cost_once_unchanged_after_folding():
+    # one turn with a session_entries cost row + a folded result must keep
+    # header == sum of rounded per-item assistant costs.
+    conn = _conn()
+    _seed_assistant_with_cost(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}", "id": "t1", "preview": "a"}],
+        model=_MODEL)
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "R", "truncated": False, "is_error": False, "tool_use_id": "t1"}])
+    out = cq.get_conversation(conn, "s1")
+    summed = round(sum(it.get("cost_usd", 0.0) for it in out["items"]), 6)
+    assert summed == out["cost_usd"] and out["cost_usd"] > 0
+
+
+def test_null_msg_id_assistant_tool_use_paired_and_swept():
+    # Codex P2: a _build_simple assistant item (null msg_id) must ALSO have its
+    # tool_use indexed (Phase 1) + swept to tool_call (Phase 3), and pair.
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="anull", msg_id=None, req_id=None,
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}", "id": "tn", "preview": "p"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "RN", "truncated": False, "is_error": False, "tool_use_id": "tn"}])
+    items = cq.get_conversation(conn, "s1")["items"]
+    assert all(it["kind"] != "tool_result" for it in items)
+    null_item = next(it for it in items if it["anchor"]["uuid"] == "anull")
+    call = next(b for b in null_item["blocks"] if b["kind"] == "tool_call")
+    assert call["result"]["text"] == "RN"
+    assert "u1" in null_item["member_uuids"]
+    # no bare tool_use block survives the sweep on any assistant item
+    for it in items:
+        if it["kind"] == "assistant":
+            assert all(b["kind"] != "tool_use" for b in it["blocks"])
 
 
 # ---------------------------------------------------------------------------
