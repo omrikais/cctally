@@ -60,4 +60,32 @@ describe('SidechainGroup', () => {
     expect(container.querySelectorAll('.conv-sidechain-body .conv-item')).toHaveLength(2);
     expect(container.querySelector('[data-uuid="s1"]')).not.toBeNull();
   });
+
+  it('opens on forceOpen, registers member refs only while open, and latches open after the force drops', () => {
+    const refs = new Map<string, HTMLDivElement>();
+    const getItemRef = (item: ConversationItem) => (el: HTMLDivElement | null) => {
+      for (const u of item.member_uuids) {
+        if (el) refs.set(u, el);
+        else refs.delete(u);
+      }
+    };
+    const items = [member('s1'), member('s2')];
+    const base = { subagentKey: 'k1', items, nested: false, getItemRef };
+
+    const { container, rerender } = render(<SidechainGroup {...base} forceOpen={false} />);
+    const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    expect(det.open).toBe(false);
+    expect(refs.size).toBe(0); // collapsed → members are ref-less
+
+    // Force the thread open: it opens AND its members attach refs in that commit.
+    rerender(<SidechainGroup {...base} forceOpen={true} />);
+    expect(det.open).toBe(true);
+    expect(refs.get('s1')).toBeTruthy();
+    expect(refs.get('s2')).toBeTruthy();
+
+    // Drop the force: the latch keeps it open (user jumped there to read it).
+    rerender(<SidechainGroup {...base} forceOpen={false} />);
+    expect(det.open).toBe(true);
+    expect(refs.get('s1')).toBeTruthy();
+  });
 });

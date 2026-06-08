@@ -195,4 +195,28 @@ describe('ConversationReader', () => {
     await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
     expect(container.querySelector('[data-uuid="targetB"]')!.classList.contains('conv-item--jumped')).toBe(true);
   });
+
+  it('auto-expands a collapsed subagent thread, scrolls, and highlights when jumping to a member', async () => {
+    // Page 1: a main item + a collapsed subagent thread 'A' (sa1 root, sa2 member).
+    // No more pages. The jump targets sa2, which lives inside the collapsed thread.
+    mockFetchOnce(detail([
+      makeItem({ uuid: 'h1' }),
+      makeItem({ uuid: 'sa1', is_sidechain: true, subagent_key: 'A', text: 'Audit A' } as never),
+      makeItem({ uuid: 'sa2', is_sidechain: true, subagent_key: 'A' } as never),
+    ]));
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'sa2' } });
+    const { container } = render(<ConversationReader sessionId="s" />);
+
+    // The owning subagent thread auto-expands.
+    await waitFor(() => {
+      const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement | null;
+      expect(det?.open).toBe(true);
+    });
+    // The target member scrolls into view, flashes, and the jump clears.
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    expect(container.querySelector('[data-uuid="sa2"]')!.classList.contains('conv-item--jumped')).toBe(true);
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+  });
 });

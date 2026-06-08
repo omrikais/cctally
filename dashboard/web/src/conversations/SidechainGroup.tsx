@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { MessageItem } from './MessageItem';
 import { fmt } from '../lib/fmt';
 import type { ConversationItem } from '../types/conversation';
@@ -14,29 +15,64 @@ export function subagentSummaryLabel(items: ConversationItem[], subagentKey: str
   return firstLine.length > LABEL_MAX ? `${firstLine.slice(0, LABEL_MAX).trimEnd()}…` : firstLine;
 }
 
-// One subagent thread (one agent-*.jsonl file) as a collapsed disclosure
-// (#155). Summary = task-prompt line + message count + summed thread cost.
-// `nested` adds an indent class when the group hangs under a parent main item.
-// Members get no refs — a jump landing inside a collapsed thread no-ops (v1).
+// One subagent thread (one agent-*.jsonl file) as a disclosure (#155). Summary =
+// task-prompt line + message count + summed thread cost. `nested` adds an indent
+// class when the group hangs under a parent main item.
+//
+// Jump-to-message support (#160): the reader force-opens the owning thread when a
+// jump targets a collapsed member. `open` is DERIVED (`userOpen || forceOpen`) so a
+// force opens the group in the SAME render — the target member's ref then attaches
+// in that commit and the reader's jump effect can scroll to it. Members get a ref
+// ONLY while open: a collapsed <details> hides them (scrollIntoView on a hidden node
+// no-ops), and the ref-less state is exactly what tells the reader to force-open.
+// The latch effect pins `userOpen` true on a force so the thread stays expanded —
+// and manually collapsible — after the reader clears its force-key.
 export function SidechainGroup({
   subagentKey,
   items,
   nested,
+  getItemRef,
+  forceOpen = false,
 }: {
   subagentKey: string;
   items: ConversationItem[];
   nested: boolean;
+  getItemRef?: (item: ConversationItem) => (el: HTMLDivElement | null) => void;
+  forceOpen?: boolean;
 }) {
+  const [userOpen, setUserOpen] = useState(false);
+  const open = userOpen || forceOpen;
+  // Latch a force into userOpen so the thread stays open after forceOpen drops
+  // (independent of whether the browser/jsdom fires `toggle` on a programmatic
+  // `open` change). `open` is already true via the derivation this same render,
+  // so this causes no flicker and the member ref was already attached.
+  useEffect(() => {
+    if (forceOpen) setUserOpen(true);
+  }, [forceOpen]);
+
   const label = subagentSummaryLabel(items, subagentKey);
   const cost = items.reduce((acc, it) => acc + (it.cost_usd ?? 0), 0);
   return (
-    <details className={nested ? 'conv-sidechain conv-sidechain--nested' : 'conv-sidechain'}>
+    <details
+      className={nested ? 'conv-sidechain conv-sidechain--nested' : 'conv-sidechain'}
+      open={open}
+      onToggle={(e) => setUserOpen((e.currentTarget as HTMLDetailsElement).open)}
+    >
       <summary>
         🧵 {label} · {items.length} msgs · <span className="conv-sidechain-cost">{fmt.usd2(cost)}</span>
       </summary>
       <div className="conv-sidechain-body">
         {items.map((item) => (
-          <MessageItem key={item.anchor.uuid} item={item} />
+          <MessageItem
+            key={item.anchor.uuid}
+            item={item}
+            // Relies on getItemRef returning a STABLE callback per item (the
+            // reader memoizes them in refCallbacks): the value is identical
+            // across renders while open, so React doesn't detach/reattach and
+            // MessageItem's memo isn't thrashed. Toggling open swaps it to/from
+            // undefined, which is the intended detach/attach.
+            ref={open && getItemRef ? getItemRef(item) : undefined}
+          />
         ))}
       </div>
     </details>

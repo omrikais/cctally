@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useConversation } from '../hooks/useConversation';
 import { useReducedMotion } from '../hooks/useReducedMotion';
@@ -28,6 +28,11 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   // unmount (no classList.remove on a detached node, no leaked timer) and
   // superseded on a rapid re-jump (no two overlapping 2s timers racing).
   const highlightTimerRef = useRef<number | null>(null);
+  // The subagent_key of the thread being force-opened for the in-flight jump
+  // (#160). null when no force is active. Setting it opens that SidechainGroup in
+  // the same render (its `open` is derived), so the target member's ref attaches
+  // and the jump effect re-fires (forcedOpenKey dep) to scroll to it.
+  const [forcedOpenKey, setForcedOpenKey] = useState<string | null>(null);
 
   const groups = useMemo(() => groupSidechains(detail?.items ?? []), [detail?.items]);
 
@@ -40,12 +45,21 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   }, [hasMore, loadMore]);
 
   // Jump-to-message: page until the target is loaded, then scroll+highlight.
-  // Wait for the first page (`detail`) before attempting — otherwise the
-  // effect would fire while page 1 is still in flight (nextAfter unknown),
-  // page nowhere, and clear the jump prematurely. It re-runs when
-  // detail?.items.length grows, so it engages once page 1 has landed.
+  // Wait for the first page (`detail`) before attempting — otherwise the effect
+  // would fire while page 1 is still in flight (nextAfter unknown), page nowhere,
+  // and clear the jump prematurely. It re-runs when detail?.items.length grows
+  // (a paged-in target's ref attaches on the next commit) and when forcedOpenKey
+  // changes (a force-opened thread's member ref attaches in that commit).
   useEffect(() => {
-    if (!jump || jump.session_id !== sessionId || !detail || detail.session_id !== sessionId) return;
+    if (!jump || jump.session_id !== sessionId) {
+      // Jump cleared, or it now points at another session — release any force-pin
+      // so a thread we expanded for it isn't left pinned (the user regains
+      // collapse control). No loop: this re-fires on the forcedOpenKey dep,
+      // re-hits this guard with forcedOpenKey === null, and returns.
+      if (forcedOpenKey !== null) setForcedOpenKey(null);
+      return;
+    }
+    if (!detail || detail.session_id !== sessionId) return; // cross-session transient: keep the pin
     let cancelled = false;
     void (async () => {
       await loadUntil(jump.uuid);
@@ -60,32 +74,39 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
           highlightTimerRef.current = null;
         }, 2000);
         dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
+        setForcedOpenKey(null); // reset for the next jump (thread stays open via its latch)
         return;
       }
-      // No ref yet. loadUntil may have just appended the target's page; its
-      // MessageItem ref callback runs on React's NEXT commit, after this
-      // microtask. Leave the jump set so the detail?.items.length re-fire
-      // re-runs this effect once the element is attached, and we scroll then.
-      // BUT give up now — rather than waiting for exhaustion — when the target
-      // is already loaded yet lives inside a collapsed sidechain group: those
-      // members are rendered without a ref (subagent_key != null), so no amount
-      // of further paging will ever produce an element to scroll to. Leaving the
-      // jump set there would strand it (items.length stops growing, the effect
-      // never re-fires) until the user happens to scroll to the very end.
+      // No ref. Either the target just paged in (its MessageItem ref attaches on
+      // React's NEXT commit — the detail?.items.length re-fire handles that), OR
+      // it lives inside a COLLAPSED subagent thread (members are ref-less while
+      // closed). For the collapsed case, force the owning thread open: `open` is
+      // derived from forceOpen so it opens in the same commit, the member's ref
+      // attaches, and this effect re-fires on the forcedOpenKey dep to scroll via
+      // the branch above.
       const targetItem = detail.items.find((it) => it.member_uuids.includes(jump.uuid));
-      if ((targetItem && targetItem.subagent_key != null) || !hasMore) {
+      if (targetItem && targetItem.subagent_key != null) {
+        if (forcedOpenKey !== targetItem.subagent_key) {
+          setForcedOpenKey(targetItem.subagent_key);
+          return; // wait for the group to open + attach the ref, then re-fire
+        }
+        // Already forced open: the ref attaches in the forcedOpenKey commit (before
+        // this re-fire), so reaching here means it's genuinely absent — fall through
+        // to the exhaustion clear rather than spinning.
+      }
+      if (!hasMore) {
         dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
       }
     })();
     return () => { cancelled = true; };
-    // `hasMore` is in deps so the give-up clear still fires on the edge
-    // where the final page appends 0 items (items.length unchanged) but
-    // flips the cursor → hasMore goes false. No infinite loop: loadUntil/
-    // fetchNext serialize via loadingMoreRef, loadUntil returns once
-    // exhausted-or-found, and hasMore only transitions a bounded number of
-    // times.
+    // hasMore stays in deps so the give-up clear fires on the edge where the final
+    // page appends 0 items (items.length unchanged) but flips the cursor.
+    // forcedOpenKey re-fires the effect once a force-opened thread has attached the
+    // target's ref. No infinite loop: loadUntil/fetchNext serialize via
+    // loadingMoreRef, hasMore transitions a bounded number of times, and the
+    // forcedOpenKey path either resolves (clears) or settles to a stable key.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jump, sessionId, detail?.items.length, hasMore]);
+  }, [jump, sessionId, detail?.items.length, hasMore, forcedOpenKey]);
 
   // Cancel any pending highlight-removal timer on unmount only (NOT on every
   // jump-effect re-run — that would strip the flash the instant the successful
@@ -97,6 +118,10 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   // The reader is reused across session switches (ConversationsView mounts it at
   // a fixed position), so drop stale ref callbacks when the session changes.
   useEffect(() => () => { refCallbacks.current.clear(); }, [sessionId]);
+
+  // The reused reader must not carry a force-pin across sessions (subagent_key is
+  // only an agent-file hash). Reset on every session change; no-op on first mount.
+  useEffect(() => { setForcedOpenKey(null); }, [sessionId]);
 
   const getItemRef = useCallback((item: ConversationItem) => {
     const cache = refCallbacks.current;
@@ -134,7 +159,14 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
       <div className="conv-reader-body">
         {groups.map((g) =>
           g.kind === 'subagent'
-            ? <SidechainGroup key={`sc-${g.subagentKey}`} subagentKey={g.subagentKey} items={g.items} nested={g.nested} />
+            ? <SidechainGroup
+                key={`sc-${g.subagentKey}`}
+                subagentKey={g.subagentKey}
+                items={g.items}
+                nested={g.nested}
+                getItemRef={getItemRef}
+                forceOpen={detail.session_id === sessionId && g.subagentKey === forcedOpenKey}
+              />
             : <MessageItem key={g.item.anchor.uuid} item={g.item} ref={getItemRef(g.item)} />,
         )}
         {hasMore && <div ref={sentinelRef} className="conv-load-sentinel">Loading more…</div>}
