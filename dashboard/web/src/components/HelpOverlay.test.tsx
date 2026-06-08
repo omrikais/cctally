@@ -99,3 +99,24 @@ describe('<HelpOverlay /> Esc layering is deterministic (#156)', () => {
     expect(convEsc).not.toHaveBeenCalled();
   });
 });
+
+describe('<HelpOverlay /> Esc wins by layer, not registration order (#159)', () => {
+  it('Help (layer 1000) closes before a lower-layer overlay registered earlier', () => {
+    const shareLikeEsc = vi.fn();
+    // Stand-in for a share/composer overlay (z 200) already open underneath,
+    // registered BEFORE HelpOverlay so insertion order favours it. Opening
+    // Help via '?' re-registers Help's binding LAST (fresh non-memoized array
+    // -> useEffect re-run -> Set.delete+add), exactly as in production — so
+    // only layer:1000 can make Help win.
+    registerKeymap([
+      { key: 'Escape', scope: 'overlay', layer: 200, when: () => true, action: shareLikeEsc },
+    ]);
+    render(<HelpOverlay />);
+    openHelp();                 // '?' toggles it open (re-registers Help last)
+    expect(document.querySelector('#help-overlay')).not.toBeNull();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    // Help closed (overlay gone); the lower-layer overlay never fired.
+    expect(document.querySelector('#help-overlay')).toBeNull();
+    expect(shareLikeEsc).not.toHaveBeenCalled();
+  });
+});

@@ -9,6 +9,10 @@ export interface Binding {
   // View eligibility (#156). Omitted → `defaultView(scope)`. 'any' = the
   // view-agnostic chrome (Settings/Help/Doctor + any open modal/overlay).
   view?: KeymapView;
+  // Intra-scope tiebreaker (#159). Higher fires first, mirroring CSS z-index.
+  // Default 0; only consulted to break a same-scope, same-key tie (e.g. two
+  // overlay-scope Esc handlers open at once). SCOPE_ORDER stays primary.
+  layer?: number;
   action: () => void;
   when?: () => boolean;
 }
@@ -66,7 +70,13 @@ export function installGlobalKeydown(): void {
     if (isTextInputFocused(e.target) && e.key.length === 1) return;
 
     const currentView = getState().view;
-    const ordered = [...bindings].sort((a, b) => SCOPE_ORDER[a.scope] - SCOPE_ORDER[b.scope]);
+    const ordered = [...bindings].sort((a, b) => {
+      const byScope = SCOPE_ORDER[a.scope] - SCOPE_ORDER[b.scope];
+      if (byScope !== 0) return byScope;
+      // Same scope: higher layer (z-index) fires first (#159). Layerless
+      // bindings (default 0) tie here and keep stable-sort insertion order.
+      return (b.layer ?? 0) - (a.layer ?? 0);
+    });
     for (const b of ordered) {
       if (b.key !== e.key) continue;
       // Central view gate (#156): a binding fires only in its view (or 'any').

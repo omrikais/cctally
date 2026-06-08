@@ -148,6 +148,11 @@ export function ComposerModal() {
     () => [{
       key: 'Escape',
       scope: 'overlay' as const,
+      // Documentary (#159): mirrors `z-index: 210`. The composerModal cross-
+      // guard below already makes only one of Composer/Share match a given
+      // Esc, so this layer is never consulted today — it preserves the order
+      // if that guard is ever removed.
+      layer: 210,
       when: () => getState().composerModal !== null,
       action: () => dispatch(closeComposer()),
     }],

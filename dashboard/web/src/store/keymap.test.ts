@@ -96,3 +96,27 @@ describe('Esc layering is SCOPE_ORDER-driven, not insertion-order', () => {
     expect(convEsc).not.toHaveBeenCalled();
   });
 });
+
+describe('layer breaks same-scope ties (#159)', () => {
+  it('higher layer fires first even when registered later', () => {
+    const lower = vi.fn();
+    const higher = vi.fn();
+    // Register the LOWER layer FIRST so insertion order would favour it.
+    // The layer tiebreaker must pick the higher-layer binding anyway.
+    registerKeymap([{ key: 'Escape', scope: 'overlay', layer: 1, when: () => true, action: lower }]);
+    registerKeymap([{ key: 'Escape', scope: 'overlay', layer: 2, when: () => true, action: higher }]);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(higher).toHaveBeenCalledTimes(1);
+    expect(lower).not.toHaveBeenCalled();
+  });
+
+  it('layerless same-scope bindings keep insertion order (stable sort, no regression)', () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    registerKeymap([{ key: 'Escape', scope: 'overlay', when: () => true, action: first }]);
+    registerKeymap([{ key: 'Escape', scope: 'overlay', when: () => true, action: second }]);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).not.toHaveBeenCalled();
+  });
+});

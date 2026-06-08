@@ -126,6 +126,11 @@ export function ShareModal({ panel, onClose, initialParams }: Props) {
     () => [{
       key: 'Escape',
       scope: 'overlay' as const,
+      // Documentary (#159): mirrors `z-index: 200`. The when() guard already
+      // gates this out whenever the composer is layered on top, so the layer
+      // is never consulted today; it preserves the order if that guard is
+      // ever removed. (`!manageOpen` is a separate cross-scope correction.)
+      layer: 200,
       when: () => !manageOpen && getState().composerModal === null,
       action: onClose,
     }],

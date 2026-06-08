@@ -63,9 +63,11 @@ export function HelpOverlay() {
   useKeymap([
     // `?` is all-views chrome (#156).
     { key: '?', scope: 'global', view: 'any', action: () => setOpen((o) => !o) },
-    // Esc at `overlay` scope (z-index 1000 = topmost): SCOPE_ORDER makes this
-    // beat the conversations-view `global` Esc deterministically (#156).
-    { key: 'Escape', scope: 'overlay', action: () => setOpen(false), when: () => open },
+    // Esc at `overlay` scope (z-index 1000 = topmost): SCOPE_ORDER beats the
+    // conversations-view `global` Esc (#156); layer 1000 beats any lower
+    // overlay (share/composer) Esc on a same-scope tie, regardless of
+    // registration order (#159). Mirrors `#help-overlay { z-index: 1000 }`.
+    { key: 'Escape', scope: 'overlay', layer: 1000, action: () => setOpen(false), when: () => open },
   ]);
   if (!open) return null;
   return (
