@@ -182,23 +182,51 @@ def build(scenario: str) -> None:
             entry_type="human", text="how does the reset work",
             cwd=s1_cwd, git_branch="main",
         )
-        # id=2: assistant turn (m1,r1) — fragment 1, thinking-only (no prose).
+        # id=2: assistant turn (m1,r1) — fragment 1, thinking + an id-bearing
+        # tool_use (no prose). The tool_use carries an id (toolu_s1a) + a
+        # parse-time preview so the reader pairs it with the matching
+        # tool_result row below (#164) — exercising the kernel's two-phase fold
+        # + the member_uuids growth.
         _insert_message(
             cache_conn,
             session_id="s1", uuid="a1a", parent_uuid="h1",
             source_path=s1_file_a, byte_offset=1,
             timestamp_utc="2026-06-01T00:00:04Z",
             entry_type="assistant", text="",
-            blocks_json='[{"kind": "thinking", "text": "let me think"}]',
+            blocks_json=(
+                '[{"kind": "thinking", "text": "let me think"}, '
+                '{"kind": "tool_use", "name": "Read", "input_summary": '
+                '"{\\"file_path\\":\\"/home/u/proj/resets.py\\"}", '
+                '"id": "toolu_s1a", "preview": "/home/u/proj/resets.py"}]'
+            ),
             model=MODEL, msg_id="m1", req_id="r1",
             cwd=s1_cwd, git_branch="main",
         )
-        # id=3: assistant turn (m1,r1) — fragment 2, prose-bearing. Carries the
+        # id=3 (NEW): the user tool_result row for toolu_s1a. The kernel folds
+        # this into the (m1,r1) turn's tool_call.result and joins uuid 'tr1'
+        # into that turn's member_uuids — so the golden exercises pairing +
+        # folding + the #160 anchor. tool_result rows are not indexed as prose
+        # (text=""), so the search golden is unaffected.
+        _insert_message(
+            cache_conn,
+            session_id="s1", uuid="tr1", parent_uuid="a1a",
+            source_path=s1_file_a, byte_offset=2,
+            timestamp_utc="2026-06-01T00:00:04Z",
+            entry_type="tool_result", text="",
+            blocks_json=(
+                '[{"kind": "tool_result", "text": "def reset(): ...", '
+                '"truncated": false, "is_error": false, '
+                '"tool_use_id": "toolu_s1a"}]'
+            ),
+            cwd=s1_cwd, git_branch="main",
+        )
+        # id=4: assistant turn (m1,r1) — fragment 2, prose-bearing. Carries the
         # distinctive search term. This fragment is the turn's canonical anchor.
+        # byte_offset=3 (after the inserted tool_result at offset 2).
         _insert_message(
             cache_conn,
             session_id="s1", uuid="a1b", parent_uuid="a1a",
-            source_path=s1_file_a, byte_offset=2,
+            source_path=s1_file_a, byte_offset=3,
             timestamp_utc="2026-06-01T00:00:05Z",
             entry_type="assistant",
             text=f"the {SEARCH_TERM} resets every five hours",

@@ -21,7 +21,7 @@
     },
     {
       "anchor": {
-        "id": 3,
+        "id": 4,
         "session_id": "s1",
         "uuid": "a1b"
       },
@@ -29,6 +29,18 @@
         {
           "kind": "thinking",
           "text": "let me think"
+        },
+        {
+          "input_summary": "{\"file_path\":\"/home/u/proj/resets.py\"}",
+          "kind": "tool_call",
+          "name": "Read",
+          "preview": "/home/u/proj/resets.py",
+          "result": {
+            "is_error": false,
+            "text": "def reset(): ...",
+            "truncated": false
+          },
+          "tool_use_id": "toolu_s1a"
         },
         {
           "kind": "text",
@@ -40,7 +52,8 @@
       "kind": "assistant",
       "member_uuids": [
         "a1a",
-        "a1b"
+        "a1b",
+        "tr1"
       ],
       "model": "claude-opus-4-8",
       "parent_uuid": "h1",

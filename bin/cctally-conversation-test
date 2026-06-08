@@ -228,7 +228,9 @@ print("ok")
         "$base/api/conversation/s1" "${LOOP[@]}"
 
     # Non-golden structural asserts: the (m1,r1) turn appears ONCE, cost ONCE,
-    # sum(items.cost)==header cost_usd, cursor shape present.
+    # sum(items.cost)==header cost_usd, cursor shape present. Plus #164: the
+    # tool_result FOLDS into the turn's tool_call (no standalone tool_result
+    # item) and its uuid joins the turn's member_uuids.
     local reader_raw reader_check
     reader_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s1")
     reader_check=$(printf '%s' "$reader_raw" | python3 -c '
@@ -237,20 +239,42 @@ d = json.load(sys.stdin)
 errs = []
 items = d.get("items") or []
 kinds = [it.get("kind") for it in items]
+# #164: the tool_result FOLDED into the turn, so there is no standalone
+# tool_result item — only [human, assistant].
 if kinds != ["human", "assistant"]:
-    errs.append("items kinds != [human, assistant] (replay/fragments not deduped): %r" % (kinds,))
+    errs.append("items kinds != [human, assistant] (replay/fragments/result not folded): %r" % (kinds,))
+if any(k == "tool_result" for k in kinds):
+    errs.append("a standalone tool_result item survived folding: %r" % (kinds,))
 assistants = [it for it in items if it.get("kind") == "assistant"]
 if len(assistants) != 1:
     errs.append("turn not collapsed to ONE assistant item: %d" % (len(assistants),))
 else:
     turn = assistants[0]
-    if set(turn.get("member_uuids") or []) != {"a1a", "a1b"}:
-        errs.append("member_uuids != {a1a,a1b}: %r" % (turn.get("member_uuids"),))
+    # #164: the folded tool_result uuid (tr1) joins member_uuids (the #160 anchor).
+    if set(turn.get("member_uuids") or []) != {"a1a", "a1b", "tr1"}:
+        errs.append("member_uuids != {a1a,a1b,tr1}: %r" % (turn.get("member_uuids"),))
     anc = turn.get("anchor") or {}
     if anc.get("session_id") != "s1" or anc.get("uuid") != "a1b":
         errs.append("turn anchor != (s1, a1b): %r" % (anc,))
     if not (turn.get("cost_usd", 0.0) > 0):
         errs.append("turn cost_usd not > 0: %r" % (turn.get("cost_usd"),))
+    # #164: the tool_use became a tool_call carrying the paired result; no bare
+    # tool_use block survives the Phase-3 sweep.
+    blocks = turn.get("blocks") or []
+    if any(b.get("kind") == "tool_use" for b in blocks):
+        errs.append("a bare tool_use block survived the sweep: %r" % (blocks,))
+    calls = [b for b in blocks if b.get("kind") == "tool_call"]
+    if len(calls) != 1:
+        errs.append("expected ONE tool_call block, got %d" % (len(calls),))
+    else:
+        call = calls[0]
+        if call.get("tool_use_id") != "toolu_s1a":
+            errs.append("tool_call.tool_use_id != toolu_s1a: %r" % (call.get("tool_use_id"),))
+        if call.get("preview") != "/home/u/proj/resets.py":
+            errs.append("tool_call.preview wrong: %r" % (call.get("preview"),))
+        res = call.get("result") or {}
+        if res.get("text") != "def reset(): ...":
+            errs.append("tool_call.result.text wrong: %r" % (res.get("text"),))
 # Cost counted exactly once despite the cross-file replay.
 s = sum(it.get("cost_usd", 0.0) for it in items)
 if abs(s - d.get("cost_usd", 0.0)) >= 1e-9:
