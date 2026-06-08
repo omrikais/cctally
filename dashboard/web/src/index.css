@@ -4825,20 +4825,56 @@ mark.current {
   gap: 12px;
 }
 
+/* ---- Timeline spine (full scroll height via the thread wrapper) --- */
+.conv-reader-thread {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-left: 22px;   /* gutter the spine + markers live in */
+}
+.conv-reader-thread::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  background: var(--border-soft);
+}
+/* Role dots: ONLY top-level human/assistant turns (direct children of the
+   thread). tool_result rows and nested sidechain members are excluded — the
+   former aren't --human/--assistant, the latter aren't direct children. */
+.conv-reader-thread > .conv-item--human::before,
+.conv-reader-thread > .conv-item--assistant::before {
+  content: "";
+  position: absolute;
+  left: -17px;          /* sits the 9px dot centered on the spine (fine-tune in §5) */
+  top: 16px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 3px var(--panel-bg);  /* punch through the spine */
+}
+.conv-reader-thread > .conv-item--human::before { background: var(--accent-blue); }
+.conv-reader-thread > .conv-item--assistant::before { background: var(--accent-purple); }
+
 /* ---- Message bubbles ---------------------------------------------- */
 .conv-item {
+  position: relative;
   border-radius: 8px;
   padding: 10px 14px;
   scroll-margin-top: 12px;
 }
 .conv-item--human {
-  background: var(--panel-bg-2);
+  background: rgba(96,165,250,0.05);          /* recessed blue-tinted input */
   border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--accent-blue);
 }
 .conv-item--assistant {
-  background: var(--panel-bg);
-  border: 1px solid var(--border-soft);
-  border-left: 3px solid var(--accent-purple);
+  background: transparent;                     /* open reading column, no heavy box */
+  border: none;
+  padding-left: 0;
 }
 .conv-item--tool_result {
   background: transparent;
@@ -4851,22 +4887,27 @@ mark.current {
   margin-bottom: 6px;
 }
 .conv-item-label {
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.5px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
   text-transform: uppercase;
-  color: var(--text-faint);
+  color: var(--reader-faint);
 }
 .conv-item--assistant .conv-item-label { color: var(--accent-purple); }
+.conv-item--human .conv-item-label { color: var(--accent-blue); }
 .conv-item-model {
   font-size: 11px;
   color: var(--text-dim);
 }
 .conv-item-cost {
-  margin-top: 8px;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--accent-green);
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-soft);  /* the "rule" */
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-dim);                     /* de-emphasized, AA-passing */
   text-align: right;
 }
 
@@ -5094,6 +5135,13 @@ mark.current {
     padding: 10px 12px;
     gap: 10px;
   }
+  #root .conv-reader-thread {
+    padding-left: 0;
+    gap: 10px;
+  }
+  #root .conv-reader-thread::before { display: none; }
+  #root .conv-reader-thread > .conv-item--human::before,
+  #root .conv-reader-thread > .conv-item--assistant::before { display: none; }
   #root .conv-item {
     padding: 8px 11px;
     border-radius: 7px;

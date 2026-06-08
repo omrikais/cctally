@@ -157,18 +157,20 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
         </div>
       </div>
       <div className="conv-reader-body">
-        {groups.map((g) =>
-          g.kind === 'subagent'
-            ? <SidechainGroup
-                key={`sc-${g.subagentKey}`}
-                subagentKey={g.subagentKey}
-                items={g.items}
-                nested={g.nested}
-                getItemRef={getItemRef}
-                forceOpen={detail.session_id === sessionId && g.subagentKey === forcedOpenKey}
-              />
-            : <MessageItem key={g.item.anchor.uuid} item={g.item} ref={getItemRef(g.item)} />,
-        )}
+        <div className="conv-reader-thread">
+          {groups.map((g) =>
+            g.kind === 'subagent'
+              ? <SidechainGroup
+                  key={`sc-${g.subagentKey}`}
+                  subagentKey={g.subagentKey}
+                  items={g.items}
+                  nested={g.nested}
+                  getItemRef={getItemRef}
+                  forceOpen={detail.session_id === sessionId && g.subagentKey === forcedOpenKey}
+                />
+              : <MessageItem key={g.item.anchor.uuid} item={g.item} ref={getItemRef(g.item)} />,
+          )}
+        </div>
         {hasMore && <div ref={sentinelRef} className="conv-load-sentinel">Loading more…</div>}
       </div>
     </div>
