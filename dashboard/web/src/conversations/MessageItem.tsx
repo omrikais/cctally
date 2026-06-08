@@ -1,6 +1,7 @@
 import { forwardRef, memo } from 'react';
 import { Markdown } from '../components/Markdown';
 import { MessageBlocks } from './MessageBlocks';
+import { isSystemMarker } from './systemMarkers';
 import type { ConversationItem } from '../types/conversation';
 
 // A single reader message. forwardRef exposes the container div so the
@@ -53,7 +54,21 @@ function MessageItemImpl(
     );
   }
 
-  // human
+  // human: fold a pure system-marker turn (slash-command plumbing) into a
+  // compact expandable pill. Guard on NO non-text blocks (the prose also
+  // arrives as a {kind:'text'} block, so length===0 would never hold). The
+  // raw text is never destroyed — expanding the <details> restores it.
+  if (isSystemMarker(item.text) && item.blocks.every((b) => b.kind === 'text')) {
+    return (
+      <div ref={ref} className="conv-item conv-item--system" data-uuid={item.anchor.uuid}>
+        <details className="conv-system-marker">
+          <summary>⚙ System marker</summary>
+          <pre className="conv-system-marker-body">{item.text}</pre>
+        </details>
+      </div>
+    );
+  }
+
   return (
     <div ref={ref} className="conv-item conv-item--human" data-uuid={item.anchor.uuid}>
       <div className="conv-item-head">

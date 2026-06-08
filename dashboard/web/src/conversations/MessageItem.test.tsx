@@ -52,6 +52,71 @@ describe('MessageItem', () => {
     expect(container.textContent).toContain('You');
   });
 
+  it('folds a system-marker human turn into an expandable pill (raw text preserved)', () => {
+    const marker: ConversationItem = {
+      kind: 'human',
+      anchor: { session_id: 's', uuid: 'm1', id: 10 },
+      member_uuids: ['m1'],
+      ts: 't',
+      text: '<command-name>clear</command-name>',
+      blocks: [],
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+    };
+    const { container } = render(<MessageItem item={marker} />);
+    // Folded, not a normal human prose turn.
+    expect(container.querySelector('.conv-item--human')).toBeNull();
+    const pill = container.querySelector('.conv-item--system details.conv-system-marker');
+    expect(pill).not.toBeNull();
+    // data-uuid preserved on the container (the #160 jump relies on it).
+    expect(container.querySelector('[data-uuid="m1"]')).not.toBeNull();
+    // Raw text is reachable (never destroyed) — it is in the DOM, inside the disclosure.
+    expect(container.textContent).toContain('<command-name>clear</command-name>');
+  });
+
+  it('folds even when item.blocks carries a {kind:"text"} block (the real human payload)', () => {
+    const marker: ConversationItem = {
+      kind: 'human',
+      anchor: { session_id: 's', uuid: 'm2', id: 11 },
+      member_uuids: ['m2'],
+      ts: 't',
+      text: '<command-name>clear</command-name>',
+      // human prose arrives BOTH as text AND as a text block — the guard must
+      // be "no NON-text blocks", not "blocks.length === 0".
+      blocks: [{ kind: 'text', text: '<command-name>clear</command-name>' }],
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+    };
+    const { container } = render(<MessageItem item={marker} />);
+    expect(container.querySelector('.conv-item--system')).not.toBeNull();
+    expect(container.querySelector('.conv-item--human')).toBeNull();
+  });
+
+  it('does NOT fold a marker turn that also has a non-text block', () => {
+    const withTool: ConversationItem = {
+      kind: 'human',
+      anchor: { session_id: 's', uuid: 'm3', id: 12 },
+      member_uuids: ['m3'],
+      ts: 't',
+      text: '<command-name>clear</command-name>',
+      blocks: [{ kind: 'image', media_type: 'image/png', bytes: 10 }],
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+    };
+    const { container } = render(<MessageItem item={withTool} />);
+    expect(container.querySelector('.conv-item--system')).toBeNull();
+    expect(container.querySelector('.conv-item--human')).not.toBeNull();
+  });
+
+  it('does NOT fold an ordinary human turn', () => {
+    const { container } = render(<MessageItem item={human} />);
+    expect(container.querySelector('.conv-item--system')).toBeNull();
+    expect(container.querySelector('.conv-item--human')).not.toBeNull();
+  });
+
   it('renders an assistant message with model badge, prose, blocks, and cost', () => {
     const { container } = render(<MessageItem item={assistant} />);
     const root = container.querySelector('.conv-item--assistant')!;

@@ -4911,6 +4911,36 @@ mark.current {
   text-align: right;
 }
 
+/* ---- Folded system-marker pill (slash-command plumbing) ----------- */
+.conv-item--system { padding: 0; background: transparent; border: none; }
+.conv-system-marker {
+  border: 1px dashed var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-bg-2);
+}
+.conv-system-marker > summary {
+  cursor: pointer;
+  padding: 3px 10px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--reader-faint);
+  list-style: none;
+  user-select: none;
+}
+.conv-system-marker > summary::-webkit-details-marker { display: none; }
+.conv-system-marker[open] > summary { color: var(--text-dim); }
+.conv-system-marker-body {
+  margin: 0;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  overflow-x: auto;
+}
+
 /* ---- Jump flash (transient highlight after a search-hit scroll) --- */
 .conv-item--jumped {
   animation: conv-jump-flash 2s ease-out;
