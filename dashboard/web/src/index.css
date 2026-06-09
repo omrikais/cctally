@@ -4787,24 +4787,26 @@ mark.current {
   background: var(--panel-bg);
   overflow: hidden;
 }
+/* ---- Empty / loading / selection states (#161 F3) ---------------- */
 .conv-reader--empty,
 .conv-reader--loading,
-.conv-reader--error {
-  align-items: center;
-  justify-content: center;
-  color: var(--text-dim);
-  font-size: 13px;
-}
-.conv-reader--error { color: var(--accent-red); }
+.conv-reader--error { align-items: center; justify-content: center; }
+.conv-state { text-align: center; padding: 24px; max-width: 360px; }
+.conv-state-glyph { font-size: 30px; opacity: 0.55; display: block; margin-bottom: 12px; }
+.conv-state-title { font-family: var(--font-prose); font-size: 17px; color: var(--text); }
+.conv-state-hint { margin-top: 6px; font-family: var(--font-mono); font-size: 11.5px; color: var(--text-dim); }
+.conv-reader--error .conv-state-title { color: var(--accent-red); }
 .conv-reader-head {
   flex: 0 0 auto;
   padding: 12px 16px;
   border-bottom: 1px solid var(--border-soft);
   background: var(--panel-bg-2);
 }
+/* reader header title in serif (matches the rail anchor) */
 .conv-reader-title {
-  font-weight: 700;
-  font-size: 14px;
+  font-family: var(--font-prose);
+  font-weight: 600;
+  font-size: 16px;
   color: var(--text);
 }
 .conv-reader-meta {
