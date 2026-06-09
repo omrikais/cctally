@@ -52,14 +52,25 @@ export function SidechainGroup({
 
   const label = subagentSummaryLabel(items, subagentKey);
   const cost = items.reduce((acc, it) => acc + (it.cost_usd ?? 0), 0);
+  const models = [...new Set(items.map((it) => it.model).filter(Boolean))] as string[];
   return (
     <details
       className={nested ? 'conv-sidechain conv-sidechain--nested' : 'conv-sidechain'}
       open={open}
       onToggle={(e) => setUserOpen((e.currentTarget as HTMLDetailsElement).open)}
     >
-      <summary>
-        🧵 {label} · {items.length} msgs · <span className="conv-sidechain-cost">{fmt.usd2(cost)}</span>
+      <summary className="conv-sidechain-head">
+        <span className="conv-sidechain-glyph" aria-hidden="true">🧵</span>
+        <span className="conv-sidechain-headtext">
+          <span className="conv-sidechain-kind">Subagent</span>
+          <span className="conv-sidechain-title">{label}</span>
+        </span>
+        <span className="conv-sidechain-meta">
+          {models.length > 0 && <span className="conv-sidechain-model">{models.join(', ')}</span>}
+          <span>{items.length} msgs</span>
+          <span className="conv-sidechain-cost">{fmt.usd2(cost)}</span>
+          <span className="conv-chev" aria-hidden="true" />
+        </span>
       </summary>
       <div className="conv-sidechain-body">
         {items.map((item) => (

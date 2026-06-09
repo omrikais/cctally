@@ -1,4 +1,4 @@
-import { render } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { SidechainGroup, subagentSummaryLabel } from './SidechainGroup';
 import type { ConversationItem } from '../types/conversation';
@@ -59,6 +59,18 @@ describe('SidechainGroup', () => {
     const { container } = render(<SidechainGroup subagentKey="k1" items={[member('s1'), member('s2')]} nested={false} />);
     expect(container.querySelectorAll('.conv-sidechain-body .conv-item')).toHaveLength(2);
     expect(container.querySelector('[data-uuid="s1"]')).not.toBeNull();
+  });
+
+  it('renders the card header: glyph, static Subagent eyebrow, serif title, meta', () => {
+    const items = [
+      member('r', { kind: 'assistant', text: 'Audit module A', model: 'claude-opus-4', cost_usd: 0.30 } as Partial<ConversationItem>),
+      member('s2', { kind: 'assistant', text: '', model: 'claude-opus-4', cost_usd: 0.12 } as Partial<ConversationItem>),
+    ];
+    render(<SidechainGroup subagentKey="aaaa1111" items={items} nested={false} />);
+    expect(screen.getByText('Subagent')).toBeInTheDocument();      // static eyebrow (Q1)
+    expect(document.querySelector('.conv-sidechain-title')).toBeTruthy();
+    expect(document.querySelector('.conv-sidechain-head .conv-chev')).toBeTruthy();
+    expect(screen.getByText(`${items.length} msgs`)).toBeInTheDocument();
   });
 
   it('opens on forceOpen, registers member refs only while open, and latches open after the force drops', () => {
