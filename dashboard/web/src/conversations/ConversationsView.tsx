@@ -43,7 +43,11 @@ export function ConversationsView() {
       <ConversationRail />
       {selected != null
         ? <ConversationReader sessionId={selected} />
-        : <div className="conv-reader conv-reader--empty">Select a conversation.</div>}
+        : <div className="conv-reader conv-reader--empty">
+            <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true">💬</span>
+              <div className="conv-state-title">Select a conversation</div>
+              <div className="conv-state-hint">Choose one from the list to start reading.</div></div>
+          </div>}
     </div>
   );
 }

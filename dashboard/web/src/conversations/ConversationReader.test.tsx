@@ -1,4 +1,4 @@
-import { act, render, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationReader } from './ConversationReader';
 import { _resetForTests, dispatch, getState } from '../store/store';
@@ -236,6 +236,41 @@ describe('ConversationReader', () => {
     expect(turn).not.toBeNull();
     expect(turn.classList.contains('conv-item--jumped')).toBe(true);
     await waitFor(() => expect(getState().conversationJump).toBeNull());
+  });
+
+  it('header leads with the derived title, not project_label', async () => {
+    // First human item carries the prompt; project_label is "proj".
+    mockFetchOnce(detail([
+      makeItem({ uuid: 'h1', text: 'design the conversation reader\nsecond line' }),
+      makeItem({ uuid: 'a1', kind: 'assistant', text: 'sure', model: 'claude-opus-4', cost_usd: 0.01 } as never),
+    ]));
+    render(<ConversationReader sessionId="s" />);
+    expect(await screen.findByText('design the conversation reader')).toBeInTheDocument();
+    await waitFor(() =>
+      expect(document.querySelector('.conv-reader-title')!.textContent).toBe('design the conversation reader'),
+    );
+    // The project label is demoted into the meta line.
+    expect(document.querySelector('.conv-reader-meta')!.textContent).toContain('proj');
+  });
+
+  it('header falls back to project_label when the opening human is a system marker', async () => {
+    mockFetchOnce(detail([
+      makeItem({ uuid: 'm1', text: '<command-name>clear</command-name>' }),
+    ]));
+    render(<ConversationReader sessionId="s" />);
+    await waitFor(() =>
+      expect(document.querySelector('.conv-reader-title')!.textContent).toBe('proj'),
+    );
+  });
+
+  it('renders a styled selection-empty / loading state, not bare text', async () => {
+    // First page never resolves → the loading state shows the styled .conv-state.
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise(() => {}));
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('.conv-reader--loading')).not.toBeNull());
+    expect(container.querySelector('.conv-state')).not.toBeNull();
+    expect(container.querySelector('.conv-state-glyph')).not.toBeNull();
+    expect(container.querySelector('.conv-state-title')).not.toBeNull();
   });
 
   it('auto-expands a collapsed subagent thread, scrolls, and highlights when jumping to a member', async () => {

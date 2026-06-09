@@ -3,10 +3,24 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { useConversation } from '../hooks/useConversation';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { groupSidechains } from './groupSidechains';
+import { isSystemMarker } from './systemMarkers';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
 import { fmt } from '../lib/fmt';
 import type { ConversationItem } from '../types/conversation';
+
+// First non-blank line of the first MAIN-session, non-marker human message;
+// fallback project_label → session_id. Mirrors the kernel _session_titles_map
+// (#165 Q6). The opening human is always on page 1.
+function deriveReaderTitle(detail: { items: ConversationItem[]; project_label: string; session_id: string }): string {
+  for (const it of detail.items) {
+    if (it.kind === 'human' && !it.is_sidechain && it.text.trim() && !isSystemMarker(it.text)) {
+      const line = it.text.split('\n').map((s) => s.trim()).find(Boolean);
+      if (line) return line.length > 120 ? line.slice(0, 120).trimEnd() + '…' : line;
+    }
+  }
+  return detail.project_label || detail.session_id;
+}
 
 // Paginated transcript reader (spec §4). Lazy-loads the next page when a
 // bottom sentinel scrolls into view (IntersectionObserver), and supports a
@@ -35,6 +49,10 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   const [forcedOpenKey, setForcedOpenKey] = useState<string | null>(null);
 
   const groups = useMemo(() => groupSidechains(detail?.items ?? []), [detail?.items]);
+  const title = useMemo(
+    () => (detail ? deriveReaderTitle(detail) : ''),
+    [detail],
+  );
 
   // Lazy-load when the bottom sentinel scrolls into view.
   useEffect(() => {
@@ -141,9 +159,25 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
     return cb;
   }, []);
 
-  if (loading && !detail) return <div className="conv-reader conv-reader--loading">Loading…</div>;
-  if (error) return <div className="conv-reader conv-reader--error">{error}</div>;
-  if (!detail) return <div className="conv-reader conv-reader--empty">Select a conversation.</div>;
+  if (loading && !detail) return (
+    <div className="conv-reader conv-reader--loading">
+      <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true">⏳</span>
+        <div className="conv-state-title">Loading conversation…</div></div>
+    </div>
+  );
+  if (error) return (
+    <div className="conv-reader conv-reader--error">
+      <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true">⚠</span>
+        <div className="conv-state-title">{error}</div></div>
+    </div>
+  );
+  if (!detail) return (
+    <div className="conv-reader conv-reader--empty">
+      <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true">💬</span>
+        <div className="conv-state-title">Select a conversation</div>
+        <div className="conv-state-hint">Choose one from the list to start reading.</div></div>
+    </div>
+  );
 
   return (
     <div className="conv-reader">
@@ -151,9 +185,9 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
         {mobileBack && (
           <button type="button" className="conv-back" onClick={() => dispatch({ type: 'SELECT_CONVERSATION', sessionId: null })}>← Back</button>
         )}
-        <div className="conv-reader-title">{detail.project_label || detail.session_id}</div>
+        <div className="conv-reader-title">{title || detail.session_id}</div>
         <div className="conv-reader-meta">
-          {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {detail.models.join(', ')}
+          {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {detail.models.join(', ')}
         </div>
       </div>
       <div className="conv-reader-body">
