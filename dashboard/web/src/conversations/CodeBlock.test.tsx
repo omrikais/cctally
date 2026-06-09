@@ -1,6 +1,7 @@
 import { render } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { Markdown } from '../components/Markdown';
+import { highlightBody } from './CodeBlock';
 
 const md = (s: string) => render(<Markdown>{s}</Markdown>).container;
 
@@ -35,5 +36,18 @@ describe('CodeBlock / Markdown code rendering', () => {
     const c = md('```html\n<script>alert(1)</script>\n```');
     expect(c.querySelector('script')).toBeNull();               // not injected
     expect(c.textContent).toContain('<script>alert(1)</script>');// escaped text
+  });
+});
+
+describe('highlightBody (shared primitive)', () => {
+  it('emits token spans for a registered language', () => {
+    const { container } = render(<pre>{highlightBody('const x = 1;', 'ts')}</pre>);
+    expect(container.querySelector('.token')).toBeInTheDocument();
+  });
+
+  it('degrades to raw text for an unknown language', () => {
+    const { container } = render(<pre>{highlightBody('const x = 1;', 'nope')}</pre>);
+    expect(container.querySelector('.token')).toBeNull();
+    expect(container.textContent).toBe('const x = 1;');
   });
 });

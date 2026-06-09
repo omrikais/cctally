@@ -43,19 +43,25 @@ export function isRegistered(lang: string): boolean {
   return refractor.registered(l);
 }
 
-export function CodeBlock({ lang, filename, code }: { lang: string; filename?: string; code: string }) {
+// Shared refractor→React-elements primitive. refractor (Prism) → hast →
+// React ELEMENTS (never an HTML string), so the no-rehype-raw /
+// no-dangerouslySetInnerHTML posture holds. Unknown language or a refractor
+// throw degrades to the raw string. Used by CodeBlock (prose) AND the tool
+// I/O panels (REQUEST json, Read RESULT source) — one chokepoint.
+export function highlightBody(code: string, lang: string): React.ReactNode {
   const l = ALIASES[lang] ?? lang;
-  // refractor.highlight can throw on a grammar edge case; never let a code
-  // block crash the reader — fall back to the raw text on any failure.
-  let body: React.ReactNode = code;
   if (refractor.registered(l)) {
     try {
       const tree = refractor.highlight(code, l);
-      body = toJsxRuntime(tree, { Fragment, jsx: _jsx, jsxs: _jsxs });
+      return toJsxRuntime(tree, { Fragment, jsx: _jsx, jsxs: _jsxs });
     } catch {
-      body = code;
+      return code;
     }
   }
+  return code;
+}
+
+export function CodeBlock({ lang, filename, code }: { lang: string; filename?: string; code: string }) {
   return (
     <div className="codeblock">
       <div className="cb-head">
@@ -63,7 +69,7 @@ export function CodeBlock({ lang, filename, code }: { lang: string; filename?: s
         {filename && <span className="cb-file">{filename}</span>}
         <CopyButton text={code} className="cb-copy" />
       </div>
-      <pre className="conv-code conv-code--hl">{body}</pre>
+      <pre className="conv-code conv-code--hl">{highlightBody(code, lang)}</pre>
     </div>
   );
 }
