@@ -4991,9 +4991,13 @@ mark.current {
 
 /* ---- Keyboard focus ring + bulk-toggle suppression (G3) ----------- */
 /* A quiet persistent left-accent for the j/k focused turn (NOT the amber
-   2s flash — focus persists), composing cleanly with conv-item--jumped. */
-.conv-item--focused,
-.conv-sidechain--focused {
+   2s flash — focus persists). The focus cursor applies conv-item--focused to
+   every direct thread child (subagent disclosures included), so the ring rides
+   that class alone — no separate .conv-sidechain--focused selector is needed.
+   A focused+jumped element shows ONE box-shadow: both this rule and the
+   conv-jump-flash animation write box-shadow, so they don't compose — the
+   animation wins for its 2s, then the focus ring resumes. That's acceptable. */
+.conv-item--focused {
   box-shadow: -3px 0 0 0 var(--accent-blue);
   border-radius: 2px;
 }

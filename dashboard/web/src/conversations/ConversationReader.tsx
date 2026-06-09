@@ -56,10 +56,6 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   // post-commit effect AFTER the render-time classifier has read it, so the
   // decision is stable for that frame.
   const seenRef = useRef<Set<string>>(new Set());
-  // Whether THIS render is the first page (no prior paint). Drives the
-  // per-index `animationDelay` stagger — later first-appearances (paged in)
-  // fade without a stagger so the scroll position doesn't lurch.
-  const firstPaintRef = useRef(true);
 
   // G3 keyboard navigation. A focused-turn cursor over the DIRECT children of
   // `.conv-reader-thread` (the sentinel lives outside the thread). The
@@ -174,20 +170,24 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   useEffect(() => { setForcedOpenKey(null); }, [sessionId]);
 
   // Load-in stagger bookkeeping. On a session change the reused reader must
-  // forget which turns it has painted and treat the next render as a first
-  // paint, so the new conversation's opening page rises + staggers afresh.
+  // forget which turns it has painted, so the new conversation's opening page
+  // rises + staggers afresh — clearing seenRef alone resets "first page", which
+  // the render-time classifier reads as `seenRef.size === 0` (no commit-flipped
+  // flag to keep in sync).
   useEffect(() => {
     seenRef.current.clear();
-    firstPaintRef.current = true;
   }, [sessionId]);
 
-  // After each commit, mark every currently-rendered top-level group as seen
-  // and retire the first-paint flag. Runs AFTER the render-time rise
-  // classifier has read the prior state (refs/effects observe commit, the
-  // classifier observes render), so a turn animates on exactly the frame it
-  // first appears and never again (Codex P2: a render-time decision, not an
-  // effect-time mutation feeding back into the same frame). Keyed on the
-  // group list so paged appends re-run it.
+  // After each commit, mark every currently-rendered top-level group as seen.
+  // Runs AFTER the render-time rise classifier has read the prior state
+  // (refs/effects observe commit, the classifier observes render), so a turn
+  // animates on exactly the frame it first appears and never again (Codex P2: a
+  // render-time decision, not an effect-time mutation feeding back into the same
+  // frame). Marking the first content page seen here is also what retires "first
+  // page" for the stagger: the next render sees a non-empty seenRef. Keyed on
+  // the group list so paged appends re-run it. The loading branch renders with
+  // an empty `groups`, so this no-ops there and never consumes "first page"
+  // before any real content has painted.
   useEffect(() => {
     for (const g of groups) {
       const uuid = g.kind === 'subagent'
@@ -197,7 +197,6 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
           : g.item.anchor.uuid;
       if (uuid) seenRef.current.add(uuid);
     }
-    firstPaintRef.current = false;
   }, [groups]);
 
   // Render-time rise classifier (G1 §4b). Returns `['conv-rise', {style}]` for a
@@ -215,7 +214,16 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
       const isJumpTarget =
         jump != null && jump.session_id === sessionId && memberUuids.includes(jump.uuid);
       if (isJumpTarget) return ['', undefined];
-      const delay = firstPaintRef.current ? `${idx * 40}ms` : '0ms';
+      // "First page" is computed at RENDER time from the seen-Set being empty —
+      // NOT a commit-flipped flag. The populate effect runs AFTER this render
+      // commits, so on the first CONTENT render seenRef is still empty for every
+      // group and they all get the staggered `idx*40ms`. Any later first
+      // appearance (paged in) sees a populated seenRef and fades with no stagger
+      // so the scroll position doesn't lurch. The earlier loading branch renders
+      // empty `groups`, so it never marks anything seen and never consumes the
+      // first page before real content paints (the dead-stagger bug this fixes).
+      const firstPage = seenRef.current.size === 0;
+      const delay = firstPage ? `${idx * 40}ms` : '0ms';
       return ['conv-rise', { animationDelay: delay }];
     },
     [reduced, jump, sessionId],

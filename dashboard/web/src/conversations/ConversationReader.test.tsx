@@ -300,6 +300,25 @@ describe('ConversationReader', () => {
     expect(container.querySelector('[data-uuid="h1"]')!.className).not.toMatch(/conv-rise/);
   });
 
+  it('staggers the first content page with a per-index animationDelay (idx*40ms, G1 §4b)', async () => {
+    // The first CONTENT render (seen-Set still empty) must stagger; the loading
+    // branch that renders before `detail` resolves must NOT consume "first page".
+    // Three top-level items, no active jump → delays 0/40/80ms at indices 0/1/2.
+    mockFetchOnce(detail([
+      makeItem({ uuid: 'h1' }),
+      makeItem({ uuid: 'a1', kind: 'assistant', text: 'reply', model: 'claude-opus-4', cost_usd: 0.01 } as never),
+      makeItem({ uuid: 'h2' }),
+    ]));
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="h1"]')).not.toBeNull());
+
+    const delayOf = (uuid: string) =>
+      (container.querySelector(`[data-uuid="${uuid}"]`) as HTMLElement).style.animationDelay;
+    expect(delayOf('h1')).toBe('0ms');
+    expect(delayOf('a1')).toBe('40ms');
+    expect(delayOf('h2')).toBe('80ms');
+  });
+
   it('the active jump target gets conv-item--jumped WITHOUT conv-rise (Codex P2)', async () => {
     // Jump targets a page-1 uuid set BEFORE first paint; the render-time
     // classifier must deny it conv-rise so only the flash runs on that element.
