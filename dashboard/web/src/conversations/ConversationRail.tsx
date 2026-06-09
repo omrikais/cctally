@@ -64,10 +64,11 @@ function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailC
     <div className="conv-rail-list">
       {rows.map((r) => {
         const bucket = railDateBucket(r.started_utc, ctx.tz, now);
-        const sec = bucket !== lastBucket ? (lastBucket = bucket, bucket) : null;
+        const isNewBucket = bucket !== lastBucket;
+        if (isNewBucket) lastBucket = bucket;
         return (
           <Fragment key={r.session_id}>
-            {sec && <div className="conv-rail-sec">{sec}</div>}
+            {isNewBucket && <div className="conv-rail-sec">{bucket}</div>}
             <BrowseRow row={r} ctx={ctx} active={r.session_id === selectedId} />
           </Fragment>
         );

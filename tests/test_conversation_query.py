@@ -779,3 +779,24 @@ def test_search_hits_include_title():
     out = cq.search_conversations(c, "sliding token", fts_available=False)
     assert out["hits"], "expected at least one hit"
     assert out["hits"][0]["title"] == "how does the reset work"
+
+
+def test_search_hits_include_title_fts():
+    # Sibling of test_search_hits_include_title for the FTS branch: pins
+    # _attach_titles directly on the fts_available=True path (otherwise covered
+    # only transitively by the golden harness). Skips cleanly when the sqlite
+    # build lacks FTS5.
+    c = _conn()
+    if not db._fts5_available(c):
+        import pytest; pytest.skip("sqlite build lacks FTS5")
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="how does the reset work", cwd="/home/u/proj")
+    _msg(c, session_id="s1", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="assistant",
+         text="the reset uses a sliding token window", model=_MODEL,
+         msg_id="m1", req_id="r1", cwd="/home/u/proj")
+    out = cq.search_conversations(c, "sliding token")
+    assert out["mode"] == "fts"
+    assert out["hits"], "expected at least one hit"
+    assert out["hits"][0]["title"] == "how does the reset work"
