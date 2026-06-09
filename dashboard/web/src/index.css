@@ -4965,6 +4965,10 @@ mark.current {
   .conv-item--jumped { animation: none; }
 }
 
+/* ---- Inline-SVG icon system (C3 / H2) ----------------------------- */
+/* Stroke-only 24×24 glyphs inheriting the chip accent via currentColor. */
+.conv-ico { width: 14px; height: 14px; flex: 0 0 auto; display: inline-block; vertical-align: -2px; }
+
 /* ---- Block disclosures (thinking / tool / result / media / ref) --- */
 .conv-blocks {
   display: flex;
