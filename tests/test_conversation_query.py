@@ -714,3 +714,38 @@ def test_is_system_marker_parity():
     assert not M("how does the reset work")
     # ReDoS guard: a valid prefix then trailing prose terminates (no hang)
     assert not M("<command-name>x</command-name>" + "y" * 5000)
+
+
+# --- title derivation: _session_titles_map (#165 §4.1) --------------------
+def test_session_titles_basic_and_marker_skip():
+    c = _conn()
+    # s1: clean first human → title is its first non-blank line
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="how does the reset work\nsecond line", cwd="/home/u/proj")
+    # s2: marker-first → skip to the SECOND human
+    _msg(c, session_id="s2", uuid="h2a", source_path="b.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-02T00:00:00Z", entry_type="human",
+         text="<command-name>clear</command-name>", cwd="/home/u/proj")
+    _msg(c, session_id="s2", uuid="h2b", source_path="b.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-02T00:00:01Z", entry_type="human",
+         text="the real prompt", cwd="/home/u/proj")
+    # s3: a SIDECHAIN human (subagent Task line) must be ignored
+    _msg(c, session_id="s3", uuid="h3", source_path="agent-x.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-03T00:00:00Z", entry_type="human",
+         text="subagent task prompt", cwd="/home/u/proj", is_sidechain=1)
+    titles = cq._session_titles_map(c, ["s1", "s2", "s3"])
+    assert titles["s1"] == "how does the reset work"   # first non-blank LINE only
+    assert titles["s2"] == "the real prompt"            # marker skipped
+    assert "s3" not in titles                           # sidechain-only → no title
+
+def test_session_titles_truncation_with_ellipsis():
+    c = _conn()
+    long = "x" * 200
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text=long)
+    t = cq._session_titles_map(c, ["s1"])["s1"]
+    assert len(t) == 121 and t.endswith("…") and t[:120] == "x" * 120
+
+def test_session_titles_empty_for_unknown():
+    assert cq._session_titles_map(_conn(), []) == {}

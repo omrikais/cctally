@@ -41,6 +41,56 @@ def _is_system_marker(text) -> bool:
     return bool(text) and _MARKER_RE.fullmatch(text) is not None
 
 
+_TITLE_MAX = 120
+
+
+def _title_from_text(text) -> str:
+    """First non-blank LINE of `text`, trimmed, sliced to _TITLE_MAX with a
+    trailing '…' ONLY when truncated (rstrip before the ellipsis). '' if none.
+    Semantics IDENTICAL to the client deriveReaderTitle (#165 P2.5)."""
+    for line in (text or "").split("\n"):
+        s = line.strip()
+        if s:
+            return (s[:_TITLE_MAX].rstrip() + "…") if len(s) > _TITLE_MAX else s
+    return ""
+
+
+def _session_titles_map(conn, session_ids):
+    """{sid: title} for the first non-marker, non-blank MAIN-session human line
+    per session (read-time, no migration). Windowed to the earliest 12 human
+    rows/session (rides idx_conv_session_ts); Python skips system markers. A
+    session whose first 12 human rows are all markers/blank is simply absent
+    (caller falls back). NOTE (Codex P1.2): the window ranks the full per-session
+    human partition before rn<=12 — confirmed index-ordered + bounded by the page
+    (≤200 sessions); per-session human counts are modest. If EXPLAIN QUERY PLAN
+    ever shows a temp B-tree sort here, switch to a per-session correlated
+    LIMIT 12 candidate fetch."""
+    if not session_ids:
+        return {}
+    titles = {}
+    ph = ",".join("?" for _ in session_ids)
+    rows = conn.execute(
+        "SELECT session_id, text FROM ("
+        "  SELECT session_id, text, "
+        "         ROW_NUMBER() OVER (PARTITION BY session_id "
+        "                            ORDER BY timestamp_utc, id) AS rn "
+        f"  FROM conversation_messages "
+        f"  WHERE session_id IN ({ph}) AND entry_type='human' "
+        "        AND is_sidechain=0 AND COALESCE(text,'') <> ''"
+        ") WHERE rn <= 12 ORDER BY session_id, rn",
+        tuple(session_ids),
+    ).fetchall()
+    for sid, text in rows:
+        if sid in titles:
+            continue                 # already resolved to the first non-marker
+        if _is_system_marker(text):
+            continue
+        t = _title_from_text(text)
+        if t:
+            titles[sid] = t
+    return titles
+
+
 def _project_label(cwd) -> str:
     """Basename of the project cwd (dashboard label posture — no reveal). Falls
     back to the raw path for root-ish cwds, '' when absent."""
