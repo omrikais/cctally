@@ -48,6 +48,17 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   // the same render (its `open` is derived), so the target member's ref attaches
   // and the jump effect re-fires (forcedOpenKey dep) to scroll to it.
   const [forcedOpenKey, setForcedOpenKey] = useState<string | null>(null);
+  // G1 §4b load-in stagger. A Set of anchor uuids already painted at least
+  // once (the `daily-fade-in` seen-Set precedent, index.css:2032): each
+  // top-level group rises exactly once on first appearance, so paged appends
+  // and re-renders don't re-animate already-visible turns. Populated by a
+  // post-commit effect AFTER the render-time classifier has read it, so the
+  // decision is stable for that frame.
+  const seenRef = useRef<Set<string>>(new Set());
+  // Whether THIS render is the first page (no prior paint). Drives the
+  // per-index `animationDelay` stagger — later first-appearances (paged in)
+  // fade without a stagger so the scroll position doesn't lurch.
+  const firstPaintRef = useRef(true);
 
   const groups = useMemo(() => groupSidechains(detail?.items ?? []), [detail?.items]);
   const title = useMemo(
@@ -142,6 +153,54 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   // only an agent-file hash). Reset on every session change; no-op on first mount.
   useEffect(() => { setForcedOpenKey(null); }, [sessionId]);
 
+  // Load-in stagger bookkeeping. On a session change the reused reader must
+  // forget which turns it has painted and treat the next render as a first
+  // paint, so the new conversation's opening page rises + staggers afresh.
+  useEffect(() => {
+    seenRef.current.clear();
+    firstPaintRef.current = true;
+  }, [sessionId]);
+
+  // After each commit, mark every currently-rendered top-level group as seen
+  // and retire the first-paint flag. Runs AFTER the render-time rise
+  // classifier has read the prior state (refs/effects observe commit, the
+  // classifier observes render), so a turn animates on exactly the frame it
+  // first appears and never again (Codex P2: a render-time decision, not an
+  // effect-time mutation feeding back into the same frame). Keyed on the
+  // group list so paged appends re-run it.
+  useEffect(() => {
+    for (const g of groups) {
+      const uuid = g.kind === 'subagent'
+        ? g.items[0]?.anchor.uuid
+        : g.kind === 'tool_result_run'
+          ? g.items[0]?.anchor.uuid
+          : g.item.anchor.uuid;
+      if (uuid) seenRef.current.add(uuid);
+    }
+    firstPaintRef.current = false;
+  }, [groups]);
+
+  // Render-time rise classifier (G1 §4b). Returns `['conv-rise', {style}]` for a
+  // top-level group's FIRST appearance, or `['', undefined]` to suppress —
+  // when reduced-motion is on, when the group was already painted (seenRef),
+  // or when it OWNS the active jump target. The jump-target suppression MUST
+  // be render-time (Codex P2): refs attach at commit BEFORE the jump effect
+  // runs loadUntil/scroll/flash, so the rise/no-rise choice is made while
+  // rendering; the target then takes `conv-item--jumped` (the flash) WITHOUT
+  // `conv-rise`, and the two never run on one element.
+  const riseFor = useCallback(
+    (anchorUuid: string, memberUuids: string[], idx: number): [string, React.CSSProperties | undefined] => {
+      if (reduced) return ['', undefined];
+      if (seenRef.current.has(anchorUuid)) return ['', undefined];
+      const isJumpTarget =
+        jump != null && jump.session_id === sessionId && memberUuids.includes(jump.uuid);
+      if (isJumpTarget) return ['', undefined];
+      const delay = firstPaintRef.current ? `${idx * 40}ms` : '0ms';
+      return ['conv-rise', { animationDelay: delay }];
+    },
+    [reduced, jump, sessionId],
+  );
+
   const getItemRef = useCallback((item: ConversationItem) => {
     const cache = refCallbacks.current;
     const key = item.anchor.uuid;
@@ -193,8 +252,12 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
       </div>
       <div className="conv-reader-body">
         <div className="conv-reader-thread">
-          {groups.map((g) => {
+          {groups.map((g, idx) => {
             if (g.kind === 'subagent') {
+              // The thread's member_uuids (every fragment) decide jump-target
+              // suppression so a folded/sidechain jump target is covered.
+              const members = g.items.flatMap((it) => it.member_uuids);
+              const [riseClass, riseStyle] = riseFor(g.items[0].anchor.uuid, members, idx);
               return (
                 <SidechainGroup
                   key={`sc-${g.subagentKey}`}
@@ -203,6 +266,8 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
                   nested={g.nested}
                   getItemRef={getItemRef}
                   forceOpen={detail.session_id === sessionId && g.subagentKey === forcedOpenKey}
+                  riseClassName={riseClass}
+                  riseStyle={riseStyle}
                 />
               );
             }
@@ -211,10 +276,13 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
               // MessageItem so each keeps its data-uuid + per-member ref for the
               // #160 jump; the disclosure is open by default so a jump target
               // inside it is reachable without a force-open dance.
+              const members = g.items.flatMap((it) => it.member_uuids);
+              const [riseClass, riseStyle] = riseFor(g.items[0].anchor.uuid, members, idx);
               return (
                 <details
                   key={`trr-${g.items[0].anchor.uuid}`}
-                  className="conv-toolresult-run"
+                  className={['conv-toolresult-run', riseClass].filter(Boolean).join(' ')}
+                  style={riseStyle}
                   open
                 >
                   <summary>
@@ -229,7 +297,16 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
                 </details>
               );
             }
-            return <MessageItem key={g.item.anchor.uuid} item={g.item} ref={getItemRef(g.item)} />;
+            const [riseClass, riseStyle] = riseFor(g.item.anchor.uuid, g.item.member_uuids, idx);
+            return (
+              <MessageItem
+                key={g.item.anchor.uuid}
+                item={g.item}
+                ref={getItemRef(g.item)}
+                className={riseClass}
+                style={riseStyle}
+              />
+            );
           })}
         </div>
         {hasMore && <div ref={sentinelRef} className="conv-load-sentinel">Loading more…</div>}

@@ -4958,13 +4958,32 @@ mark.current {
   overflow-x: auto;
 }
 
+/* ---- Turn load-in stagger (G1 §4b) -------------------------------- */
+/* Each top-level turn rises once on first appearance (the reader's seen-Set
+   ref gates re-animation); the per-index animationDelay (inline style) staggers
+   the opening page. Reduced-motion gated here AND at the source (the classifier
+   skips the class when useReducedMotion() is true). */
+.conv-rise {
+  animation: conv-rise .5s cubic-bezier(.2,.7,.3,1) both;
+}
+@keyframes conv-rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .conv-rise { animation: none; }
+}
+
 /* ---- Jump flash (transient highlight after a search-hit scroll) --- */
+/* G1 §4c refined two-stop flash: amber ring + soft glow fading to none on the
+   rounded surface. The render-time classifier denies the jump target
+   `conv-rise`, so flash and rise never run on one element. */
 .conv-item--jumped {
   animation: conv-jump-flash 2s ease-out;
 }
 @keyframes conv-jump-flash {
-  0%   { box-shadow: 0 0 0 2px var(--accent-amber); background: rgba(251,191,36,0.12); }
-  100% { box-shadow: 0 0 0 0 transparent; }
+  0%   { box-shadow: 0 0 0 2px var(--accent-amber), 0 0 26px rgba(251,191,36,0.25); background: rgba(251,191,36,0.10); }
+  100% { box-shadow: 0 0 0 0 transparent; background: transparent; }
 }
 @media (prefers-reduced-motion: reduce) {
   .conv-item--jumped { animation: none; }

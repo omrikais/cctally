@@ -24,14 +24,19 @@ import type { ConversationItem } from '../types/conversation';
 // A top-level tool_result item (empty prose) collapses into a single disclosure
 // wrapping its blocks. Memoized for long transcripts.
 function MessageItemImpl(
-  { item }: { item: ConversationItem },
+  { item, className = '', style }: { item: ConversationItem; className?: string; style?: React.CSSProperties },
   ref: React.ForwardedRef<HTMLDivElement>,
 ) {
+  // Optional extra class/style (e.g. the G1 load-in `conv-rise` + per-index
+  // animationDelay) is merged onto the root `.conv-item` div so it stays a
+  // DIRECT child of the thread — the role-dot spine CSS keys on
+  // `.conv-reader-thread > .conv-item--human`, so wrapping is not an option.
+  const cls = (suffix: string) => `conv-item ${suffix}${className ? ` ${className}` : ''}`;
   // tool_result top-level kind: empty prose, render as a collapsed
   // disclosure wrapping the blocks.
   if (item.kind === 'tool_result') {
     return (
-      <div ref={ref} className="conv-item conv-item--tool_result" data-uuid={item.anchor.uuid}>
+      <div ref={ref} className={cls('conv-item--tool_result')} style={style} data-uuid={item.anchor.uuid}>
         <details className="conv-chip conv-chip--result">
           <summary>
             <span className="conv-chev" aria-hidden="true" />
@@ -51,7 +56,7 @@ function MessageItemImpl(
     // the footer for them is misleading, so only render it for a positive cost.
     const hasCost = typeof item.cost_usd === 'number' && item.cost_usd > 0;
     return (
-      <div ref={ref} className="conv-item conv-item--assistant" data-uuid={item.anchor.uuid}>
+      <div ref={ref} className={cls('conv-item--assistant')} style={style} data-uuid={item.anchor.uuid}>
         <div className="conv-item-head">
           <span className="conv-item-label">Assistant</span>
           <span className="conv-item-model">{item.model ?? '—'}</span>
@@ -82,7 +87,7 @@ function MessageItemImpl(
   // raw text is never destroyed — expanding the <details> restores it.
   if (isSystemMarker(item.text) && item.blocks.every((b) => b.kind === 'text')) {
     return (
-      <div ref={ref} className="conv-item conv-item--system" data-uuid={item.anchor.uuid}>
+      <div ref={ref} className={cls('conv-item--system')} style={style} data-uuid={item.anchor.uuid}>
         <details className="conv-system-marker">
           <summary>
             <span className="conv-chev" aria-hidden="true" />
@@ -95,7 +100,7 @@ function MessageItemImpl(
   }
 
   return (
-    <div ref={ref} className="conv-item conv-item--human" data-uuid={item.anchor.uuid}>
+    <div ref={ref} className={cls('conv-item--human')} style={style} data-uuid={item.anchor.uuid}>
       <div className="conv-item-head">
         <span className="conv-item-label">You</span>
       </div>
@@ -112,4 +117,8 @@ function MessageItemImpl(
   );
 }
 
-export const MessageItem = memo(forwardRef<HTMLDivElement, { item: ConversationItem }>(MessageItemImpl));
+export const MessageItem = memo(
+  forwardRef<HTMLDivElement, { item: ConversationItem; className?: string; style?: React.CSSProperties }>(
+    MessageItemImpl,
+  ),
+);

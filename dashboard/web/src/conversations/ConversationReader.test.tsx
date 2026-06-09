@@ -277,6 +277,40 @@ describe('ConversationReader', () => {
     expect(container.querySelector('.conv-state-title')).not.toBeNull();
   });
 
+  it('rise-animates each top-level item once on first appearance, not on re-render (G1 §4b)', async () => {
+    mockFetchOnce(detail([
+      makeItem({ uuid: 'h1' }),
+      makeItem({ uuid: 'a1', kind: 'assistant', text: 'reply', model: 'claude-opus-4', cost_usd: 0.01 } as never),
+    ]));
+    const { container, rerender } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="h1"]')).not.toBeNull());
+
+    const first = container.querySelector('[data-uuid="h1"]')!;
+    expect(first.className).toMatch(/conv-rise/);
+    // A re-render (same props) must NOT re-animate the already-painted item:
+    // the seen-Set ref marks it after commit.
+    rerender(<ConversationReader sessionId="s" />);
+    expect(container.querySelector('[data-uuid="h1"]')!.className).not.toMatch(/conv-rise/);
+  });
+
+  it('the active jump target gets conv-item--jumped WITHOUT conv-rise (Codex P2)', async () => {
+    // Jump targets a page-1 uuid set BEFORE first paint; the render-time
+    // classifier must deny it conv-rise so only the flash runs on that element.
+    mockFetchOnce(detail([
+      makeItem({ uuid: 'h1' }),
+      makeItem({ uuid: 'target', member_uuids: ['target', 'targetFrag'] } as never),
+    ], null));
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'targetFrag' } });
+
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    const el = container.querySelector('[data-uuid="target"]')!;
+    expect(el.classList.contains('conv-item--jumped')).toBe(true);
+    // The two animations never run on one element.
+    expect(el.className).not.toMatch(/conv-rise/);
+  });
+
   it('auto-expands a collapsed subagent thread, scrolls, and highlights when jumping to a member', async () => {
     // Page 1: a main item + a collapsed subagent thread 'A' (sa1 root, sa2 member).
     // No more pages. The jump targets sa2, which lives inside the collapsed thread.

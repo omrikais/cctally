@@ -34,12 +34,19 @@ export function SidechainGroup({
   nested,
   getItemRef,
   forceOpen = false,
+  riseClassName = '',
+  riseStyle,
 }: {
   subagentKey: string;
   items: ConversationItem[];
   nested: boolean;
   getItemRef?: (item: ConversationItem) => (el: HTMLDivElement | null) => void;
   forceOpen?: boolean;
+  // G1 §4b load-in: the reader's render-time classifier passes `conv-rise`
+  // (+ a per-index animationDelay) for a first-appearance top-level thread,
+  // or '' to suppress (already seen, or the active jump target).
+  riseClassName?: string;
+  riseStyle?: React.CSSProperties;
 }) {
   const [userOpen, setUserOpen] = useState(false);
   const open = userOpen || forceOpen;
@@ -63,7 +70,9 @@ export function SidechainGroup({
         // scrollIntoView lands. The class drops when the force releases, so
         // later user toggles animate.
         forceOpen ? 'conv-sidechain--force' : '',
+        riseClassName,
       ].filter(Boolean).join(' ')}
+      style={riseStyle}
       open={open}
       onToggle={(e) => setUserOpen((e.currentTarget as HTMLDetailsElement).open)}
     >
