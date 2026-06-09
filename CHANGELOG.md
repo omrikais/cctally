@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.31.0] - 2026-06-09
+
 ### Added
 - **Syntax-highlighted, line-numbered tool input/output in the dashboard conversation reader.** A tool call's REQUEST panel (its JSON arguments) and, for `Read` results, the RESULT panel (the file contents) are now syntax-highlighted — previously the dominant code surface in a tool-heavy transcript (a `Read` showing a Python file, a `Bash` invocation) rendered as flat uncolored text. `Read` results additionally get a dim line-number gutter in a separate column (so the numbers aren't mis-tokenized as code), with the language inferred in the browser from the file's extension; non-`Read` results (Bash stdout, Grep/Glob path lists, and the like) stay plain. Highlighting runs entirely client-side through the same refractor chokepoint as prose code fences and degrades to plain text on an unknown or unparseable language — no data-contract change and nothing to do on upgrade.
 
