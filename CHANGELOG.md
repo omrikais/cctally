@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.30.0] - 2026-06-09
+
 ### Added
 - **Keyboard navigation in the dashboard conversation reader.** With a conversation open, `j` / `k` move a focused-turn cursor between turns (scrolling each into view and auto-loading the next page when you reach the end), `[` / `]` collapse-all / expand-all the disclosure sections in the thread, and `g` jumps back to the top. The bindings are listed in the dashboard help overlay (`?`) under a new "Conversations" group and are inert while a modal or the rail search/filter input is active.
 - **Syntax-highlighted code blocks and copy buttons in the conversation reader.** Fenced code in transcripts is now syntax-highlighted with a language label, and one-click copy buttons appear on code blocks, tool output, and message text.
