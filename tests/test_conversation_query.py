@@ -765,3 +765,17 @@ def test_list_conversations_includes_title_with_fallback():
     s2 = next(r for r in rows if r["session_id"] == "s2")
     assert s1["title"] == "design the rail title"
     assert s2["title"] == "other"        # fallback → project_label basename
+
+
+def test_search_hits_include_title():
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="how does the reset work", cwd="/home/u/proj")
+    _msg(c, session_id="s1", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="assistant",
+         text="the reset uses a sliding token window", model=_MODEL,
+         msg_id="m1", req_id="r1", cwd="/home/u/proj")
+    out = cq.search_conversations(c, "sliding token", fts_available=False)
+    assert out["hits"], "expected at least one hit"
+    assert out["hits"][0]["title"] == "how does the reset work"

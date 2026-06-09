@@ -623,6 +623,19 @@ def _attach_costs(conn, page):
     return page
 
 
+def _attach_titles(conn, page):
+    """Stamp each final-page hit with its session's derived title — ONE batched
+    _session_titles_map over the distinct page session_ids (parallel to
+    _attach_costs). Fallback project_label → session_id, matching
+    list_conversations (#165 Q4)."""
+    sids = list({h["session_id"] for h in page})
+    titles = _session_titles_map(conn, sids)
+    for h in page:
+        sid = h["session_id"]
+        h["title"] = titles.get(sid) or h.get("project_label") or sid
+    return page
+
+
 def _like_pattern(q):
     """Build the LIKE pattern for `q`. Escape the ESCAPE char (\\) FIRST, then
     the wildcards — otherwise a query containing a backslash (incl. a trailing
@@ -709,7 +722,8 @@ def _search_fts(conn, q, limit, offset):
     snips = _fts_snippets(conn, fts_q, [r[0] for r in page])
     hits = [_row_to_hit(uuid, sid, ts, cwd, snips.get(rid, ""), mid, rqd)
             for (rid, sid, uuid, ts, cwd, mid, rqd) in page]
-    return {"query": q, "mode": "fts", "hits": _attach_costs(conn, hits),
+    return {"query": q, "mode": "fts",
+            "hits": _attach_titles(conn, _attach_costs(conn, hits)),
             "total": total}
 
 
@@ -742,7 +756,8 @@ def _search_like(conn, q, limit, offset):
     hits = [_row_to_hit(uuid, sid, ts, cwd,
                         _manual_snippet(texts.get(rid, ""), q), mid, rqd)
             for (rid, sid, uuid, ts, cwd, mid, rqd) in page]
-    return {"query": q, "mode": "like", "hits": _attach_costs(conn, hits),
+    return {"query": q, "mode": "like",
+            "hits": _attach_titles(conn, _attach_costs(conn, hits)),
             "total": total}
 
 
