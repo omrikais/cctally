@@ -5380,6 +5380,11 @@ mark.current {
   #root .conv-reader-thread::before { display: none; }
   #root .conv-reader-thread > .conv-item--human::before,
   #root .conv-reader-thread > .conv-item--assistant::before { display: none; }
+  /* The thread loses its left padding/spine on mobile, so suppress the
+     subagent card's outer spine dot too (it would float in negative
+     space). Re-prefixed with #root + respelled per the id-selector
+     specificity gotcha so it outranks the desktop dot rule. */
+  #root .conv-reader-thread > .conv-sidechain::before { display: none; }
   #root .conv-item {
     padding: 8px 11px;
     border-radius: 7px;
