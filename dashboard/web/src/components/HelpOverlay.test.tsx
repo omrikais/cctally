@@ -2,7 +2,7 @@
 // Positions 1..9 render <kbd>1..9</kbd>, position 10 renders <kbd>0</kbd>,
 // positions ≥ 11 have NO digit binding (the spec defers multi-key
 // chord support to F9) — render an em-dash instead of a literal "11".
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { HelpOverlay } from './HelpOverlay';
 import { _resetForTests, dispatch } from '../store/store';
@@ -76,6 +76,24 @@ describe('<HelpOverlay /> positional hotkey rule', () => {
     // The cell should contain an em-dash and NOT a <kbd>.
     expect(firstCell?.querySelector('kbd')).toBeNull();
     expect(firstCell?.textContent).toBe('—');
+  });
+});
+
+describe('<HelpOverlay /> Conversations key group (G3)', () => {
+  it('lists the reader keys (j/k, [ ], g) only in the conversations view', () => {
+    render(<HelpOverlay />);
+    openHelp();
+    // Dashboard view: no Conversations group / reader keys.
+    expect(screen.queryByText(/move turns/i)).toBeNull();
+    // Enter the conversations view: the group + reader keys appear.
+    act(() => { dispatch({ type: 'SET_VIEW', view: 'conversations' }); });
+    expect(screen.getByText('Conversations')).toBeInTheDocument();
+    expect(screen.getByText(/move turns/i)).toBeInTheDocument();
+    expect(screen.getByText(/collapse \/ expand all/i)).toBeInTheDocument();
+    expect(screen.getByText(/jump to top/i)).toBeInTheDocument();
+    // The reader-key kbds are present.
+    const kbds = screen.getAllByText((_, el) => el?.tagName === 'KBD').map((k) => k.textContent);
+    expect(kbds).toEqual(expect.arrayContaining(['j', 'k', '[', ']', 'g']));
   });
 });
 

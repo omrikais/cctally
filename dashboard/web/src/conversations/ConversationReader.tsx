@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useConversation } from '../hooks/useConversation';
+import { useKeymap } from '../hooks/useKeymap';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { groupSidechains } from './groupSidechains';
 import { isSystemMarker } from './systemMarkers';
@@ -59,6 +60,25 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   // per-index `animationDelay` stagger — later first-appearances (paged in)
   // fade without a stagger so the scroll position doesn't lurch.
   const firstPaintRef = useRef(true);
+
+  // G3 keyboard navigation. A focused-turn cursor over the DIRECT children of
+  // `.conv-reader-thread` (the sentinel lives outside the thread). The
+  // `conv-item--focused` class is moved imperatively (mirroring the jump
+  // flash) so the memoized MessageItems don't re-render on every step. The
+  // ref mirrors the state so the stable keymap action closures read the live
+  // cursor without re-registering on every move.
+  const [focusedIndex, setFocusedIndex] = useState(0);
+  const focusedIndexRef = useRef(0);
+  focusedIndexRef.current = focusedIndex;
+  const threadRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  // Stable mirrors so the `useMemo(() => [...], [])` keymap array never churns.
+  const hasMoreRef = useRef(hasMore);
+  hasMoreRef.current = hasMore;
+  const loadMoreRef = useRef(loadMore);
+  loadMoreRef.current = loadMore;
+  const reducedRef = useRef(reduced);
+  reducedRef.current = reduced;
 
   const groups = useMemo(() => groupSidechains(detail?.items ?? []), [detail?.items]);
   const title = useMemo(
@@ -219,6 +239,83 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
     return cb;
   }, []);
 
+  // Reset the focused-turn cursor to the top on a session switch (the reused
+  // reader carries no cursor across conversations).
+  useEffect(() => { setFocusedIndex(0); }, [sessionId]);
+
+  // Imperatively move the `conv-item--focused` class onto the cursor's child,
+  // off every other. Re-runs on a cursor step AND when the group list changes
+  // (paged appends grow `children`), so the ring tracks the right element.
+  // Imperative (not a render prop) so memoized MessageItems don't re-render.
+  useEffect(() => {
+    const thread = threadRef.current;
+    if (!thread) return;
+    const kids = thread.children;
+    for (let i = 0; i < kids.length; i++) {
+      kids[i].classList.toggle('conv-item--focused', i === focusedIndex);
+    }
+  }, [focusedIndex, groups]);
+
+  // G3 bindings. A `useMemo(() => [...], [])`-stable array (identity never
+  // churns) whose action closures read refs — so a cursor step or a pagination
+  // never re-registers the keymap. Each binding is conversations-view scoped
+  // and inert while a modal is open or input-mode (rail search/filter) is
+  // active; the keymap store already swallows single-char keys while a text
+  // input is focused.
+  const stepFocus = useCallback((delta: number) => {
+    const thread = threadRef.current;
+    if (!thread) return;
+    const last = thread.children.length - 1;
+    if (last < 0) return;
+    const cur = focusedIndexRef.current;
+    const next = Math.max(0, Math.min(last, cur + delta));
+    // At the last loaded group with more to come, kick a load; the cursor
+    // advances on the next press once the new child has mounted.
+    if (delta > 0 && cur === last && hasMoreRef.current) { void loadMoreRef.current(); return; }
+    if (next === cur) return;
+    setFocusedIndex(next);
+    const target = thread.children[next] as HTMLElement | undefined;
+    target?.scrollIntoView({ block: 'nearest', behavior: reducedRef.current ? 'auto' : 'smooth' });
+  }, []);
+
+  // Collapse-all / expand-all sweep. A transient bulk-suppression class on the
+  // thread sets `::details-content { transition: none }` for the frame so the
+  // N disclosures snap rather than cascade; removed next tick (§4d).
+  const sweepDetails = useCallback((open: boolean) => {
+    const thread = threadRef.current;
+    if (!thread) return;
+    thread.classList.add('conv-reader-thread--bulk');
+    thread.querySelectorAll('details').forEach((d) => { (d as HTMLDetailsElement).open = open; });
+    const drop = () => thread.classList.remove('conv-reader-thread--bulk');
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(drop); else drop();
+  }, []);
+
+  const jumpToTop = useCallback(() => {
+    const body = bodyRef.current;
+    body?.scrollTo({ top: 0, behavior: reducedRef.current ? 'auto' : 'smooth' });
+    setFocusedIndex(0);
+  }, []);
+
+  const keymapBindings = useMemo(
+    () => {
+      const guard = () => !getState().openModal && getState().inputMode === null;
+      const mk = (key: string, action: () => void) =>
+        ({ key, scope: 'global' as const, view: 'conversations' as const, when: guard, action });
+      return [
+        mk('j', () => stepFocus(1)),
+        mk('k', () => stepFocus(-1)),
+        mk('[', () => sweepDetails(false)),
+        mk(']', () => sweepDetails(true)),
+        mk('g', () => jumpToTop()),
+      ];
+    },
+    // Actions are stable (refs-only), so the array is built once. The lint
+    // disable mirrors the existing #160 effect's stable-closure rationale.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+  useKeymap(keymapBindings);
+
   if (loading && !detail) return (
     <div className="conv-reader conv-reader--loading">
       <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true"><LoadingIcon /></span>
@@ -250,8 +347,8 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
           {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {detail.models.join(', ')}
         </div>
       </div>
-      <div className="conv-reader-body">
-        <div className="conv-reader-thread">
+      <div className="conv-reader-body" ref={bodyRef}>
+        <div className="conv-reader-thread" ref={threadRef}>
           {groups.map((g, idx) => {
             if (g.kind === 'subagent') {
               // The thread's member_uuids (every fragment) decide jump-target

@@ -44,6 +44,23 @@ function KeyTable({ panelOrder }: KeyTableProps) {
   );
 }
 
+// G3 — the reader keys, shown only in the conversations view (mirrors how
+// the bindings themselves are `view:'conversations'`-scoped).
+function ConversationsKeyTable() {
+  return (
+    <table className="help-conversations">
+      <tbody>
+        <tr><td colSpan={2}><strong>Conversations</strong></td></tr>
+        <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>move turns</td></tr>
+        <tr><td><kbd>[</kbd> / <kbd>]</kbd></td><td>collapse / expand all</td></tr>
+        <tr><td><kbd>g</kbd></td><td>jump to top</td></tr>
+        <tr><td><kbd>/</kbd></td><td>search conversations</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>close</td></tr>
+      </tbody>
+    </table>
+  );
+}
+
 function GestureGuide() {
   return (
     <ul className="help-gesture-list">
@@ -60,6 +77,7 @@ export function HelpOverlay() {
   const [open, setOpen] = useState(false);
   const isMobile = useIsMobile();
   const panelOrder = useSyncExternalStore(subscribeStore, () => getState().prefs.panelOrder);
+  const view = useSyncExternalStore(subscribeStore, () => getState().view);
   useKeymap([
     // `?` is all-views chrome (#156).
     { key: '?', scope: 'global', view: 'any', action: () => setOpen((o) => !o) },
@@ -90,10 +108,14 @@ export function HelpOverlay() {
             <details className="help-keyboard-disclosure">
               <summary>Keyboard shortcuts ▾</summary>
               <KeyTable panelOrder={panelOrder} />
+              {view === 'conversations' && <ConversationsKeyTable />}
             </details>
           </>
         ) : (
-          <KeyTable panelOrder={panelOrder} />
+          <>
+            <KeyTable panelOrder={panelOrder} />
+            {view === 'conversations' && <ConversationsKeyTable />}
+          </>
         )}
         <p className="meta">
           cctally · <span id="help-server-url">{window.location.origin}</span>

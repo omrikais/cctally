@@ -4989,6 +4989,18 @@ mark.current {
   .conv-item--jumped { animation: none; }
 }
 
+/* ---- Keyboard focus ring + bulk-toggle suppression (G3) ----------- */
+/* A quiet persistent left-accent for the j/k focused turn (NOT the amber
+   2s flash — focus persists), composing cleanly with conv-item--jumped. */
+.conv-item--focused,
+.conv-sidechain--focused {
+  box-shadow: -3px 0 0 0 var(--accent-blue);
+  border-radius: 2px;
+}
+/* [ / ] collapse-all / expand-all snaps every disclosure in one frame
+   instead of cascading the §4a open animation (§4d). */
+.conv-reader-thread--bulk ::details-content { transition: none !important; }
+
 /* ---- Disclosure-open animation (G1 §4a) --------------------------- */
 /* Reader-scoped only: `interpolate-size: allow-keywords` enables a
    block-size:0→auto transition for the chips / tool-result run / subagent

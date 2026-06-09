@@ -1,7 +1,12 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationReader } from './ConversationReader';
 import { _resetForTests, dispatch, getState } from '../store/store';
+import {
+  installGlobalKeydown,
+  uninstallGlobalKeydown,
+  _resetForTests as _resetKeymapForTests,
+} from '../store/keymap';
 import { installIntersectionObserverStub } from '../test-utils/intersectionObserver';
 import type { ConversationItem } from '../types/conversation';
 
@@ -43,10 +48,12 @@ function mockFetchOnce(body: unknown, status = 200) {
 
 beforeEach(() => {
   _resetForTests();
+  _resetKeymapForTests();
   globalThis.fetch = vi.fn();
   installIntersectionObserverStub();
 });
 afterEach(() => {
+  uninstallGlobalKeydown();
   _resetForTests();
   vi.restoreAllMocks();
 });
@@ -333,5 +340,109 @@ describe('ConversationReader', () => {
     await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
     expect(container.querySelector('[data-uuid="sa2"]')!.classList.contains('conv-item--jumped')).toBe(true);
     await waitFor(() => expect(getState().conversationJump).toBeNull());
+  });
+});
+
+describe('ConversationReader keyboard navigation (G3)', () => {
+  // The reader's keymap is `view:'conversations'`-scoped; the conversations
+  // view is entered via OPEN_CONVERSATION (sets view + selection).
+  async function renderInConversations(items: ConversationItem[], next_after: number | null = null) {
+    mockFetchOnce(detail(items, next_after));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const utils = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-thread')).not.toBeNull());
+    const thread = utils.container.querySelector('.conv-reader-thread') as HTMLElement;
+    return { ...utils, thread };
+  }
+  const press = (key: string) => fireEvent.keyDown(document, { key });
+
+  it('j/k move the focused-turn cursor and clamp at both ends', async () => {
+    const { thread } = await renderInConversations([
+      makeItem({ uuid: 'h1' }),
+      makeItem({ uuid: 'a1', kind: 'assistant', text: 'r', model: 'm', cost_usd: 0.01 } as never),
+      makeItem({ uuid: 'h2' }),
+    ]);
+    // Starts at 0.
+    expect(thread.children[0]).toHaveClass('conv-item--focused');
+    press('j');
+    expect(thread.children[1]).toHaveClass('conv-item--focused');
+    expect(thread.children[0]).not.toHaveClass('conv-item--focused');
+    press('j');
+    expect(thread.children[2]).toHaveClass('conv-item--focused');
+    press('j'); // clamp at the last child
+    expect(thread.children[2]).toHaveClass('conv-item--focused');
+    press('k');
+    expect(thread.children[1]).toHaveClass('conv-item--focused');
+    press('k');
+    press('k'); // clamp at 0
+    expect(thread.children[0]).toHaveClass('conv-item--focused');
+  });
+
+  it('[ collapses and ] expands every <details> in the thread', async () => {
+    const { thread } = await renderInConversations([
+      makeItem({ uuid: 's1', is_sidechain: true, subagent_key: 'A', text: 'Audit A' } as never),
+      makeItem({ uuid: 's2', is_sidechain: true, subagent_key: 'A' } as never),
+    ]);
+    // The thread renders at least one <details> (the subagent disclosure).
+    const allDetails = () => Array.from(thread.querySelectorAll('details'));
+    expect(allDetails().length).toBeGreaterThan(0);
+    press(']');
+    allDetails().forEach((d) => expect((d as HTMLDetailsElement).open).toBe(true));
+    press('[');
+    allDetails().forEach((d) => expect((d as HTMLDetailsElement).open).toBe(false));
+  });
+
+  it('g scrolls the reader body to top and resets the cursor to 0', async () => {
+    const scrollTo = vi.fn();
+    const { container, thread } = await renderInConversations([
+      makeItem({ uuid: 'h1' }),
+      makeItem({ uuid: 'h2' }),
+      makeItem({ uuid: 'h3' }),
+    ]);
+    const body = container.querySelector('.conv-reader-body') as HTMLElement;
+    body.scrollTo = scrollTo as never;
+    press('j');
+    press('j');
+    expect(thread.children[2]).toHaveClass('conv-item--focused');
+    press('g');
+    expect(scrollTo).toHaveBeenCalled();
+    expect(thread.children[0]).toHaveClass('conv-item--focused');
+  });
+
+  it('bindings are inert while a modal is open', async () => {
+    const { thread } = await renderInConversations([
+      makeItem({ uuid: 'h1' }),
+      makeItem({ uuid: 'h2' }),
+    ]);
+    act(() => { dispatch({ type: 'OPEN_MODAL', kind: 'session' }); });
+    press('j');
+    // No move from index 0 while a modal owns the keys.
+    expect(thread.children[0]).toHaveClass('conv-item--focused');
+    expect(thread.children[1]).not.toHaveClass('conv-item--focused');
+  });
+
+  it('bindings are inert while input-mode is active', async () => {
+    const { thread } = await renderInConversations([
+      makeItem({ uuid: 'h1' }),
+      makeItem({ uuid: 'h2' }),
+    ]);
+    act(() => { dispatch({ type: 'SET_INPUT_MODE', mode: 'search' }); });
+    press('j');
+    expect(thread.children[0]).toHaveClass('conv-item--focused');
+    expect(thread.children[1]).not.toHaveClass('conv-item--focused');
+  });
+
+  it('does not fire on the dashboard view (view-scoped binding)', async () => {
+    // Mount in conversations, then leave to the dashboard: the binding is
+    // view:'conversations'-gated so j must not move the cursor.
+    const { thread } = await renderInConversations([
+      makeItem({ uuid: 'h1' }),
+      makeItem({ uuid: 'h2' }),
+    ]);
+    act(() => { dispatch({ type: 'SET_VIEW', view: 'dashboard' }); });
+    press('j');
+    expect(thread.children[0]).toHaveClass('conv-item--focused');
+    expect(thread.children[1]).not.toHaveClass('conv-item--focused');
   });
 });
