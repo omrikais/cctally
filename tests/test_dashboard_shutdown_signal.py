@@ -22,6 +22,20 @@ times out → `False` → fails; against the self-pipe it returns `True`.
 
 A finite `timeout` is passed everywhere so a regressed mechanism FAILS LOUDLY
 instead of hanging the suite.
+
+Harness note (#163): the fire-threads below do NOT use a fixed `sleep(delay)`
+to "land after the wait has armed". That assumption — "the main thread arms in
+microseconds, well before the delay" — breaks under heavy CPU contention (the
+full suite at `pytest -n16` with every core saturated): the main thread can be
+starved past the delay, so the thread raises a REAL `SIGTERM` while the
+disposition is still the saved default (`SIG_DFL`), terminating the pytest-xdist
+worker. Because xdist reports the worker crash against whatever test it was
+running, this surfaced as "a different test fails each run" — the worker-kill
+race in #163. `_fire_signal_when_armed` closes it: the thread spins until the
+helper has installed its own handler (the disposition moves off the saved one),
+so the signal can ONLY be delivered while a Python handler is armed — never at
+`SIG_DFL`. Callers JOIN the returned thread before the next iteration / before
+returning, so no straggler thread can survive to fire into a later test.
 """
 import signal
 import sys
@@ -39,16 +53,30 @@ def _wait_fn():
     return sys.modules["_cctally_dashboard"]._dashboard_wait_for_signal
 
 
-def _fire_signal_after(sig, delay):
-    """Background thread: deliver `sig` to this process after `delay` seconds.
+def _fire_signal_when_armed(sig, prior_disposition):
+    """Background thread: deliver `sig` once the wait helper has ARMED, not after
+    a fixed delay.
 
-    The main thread arms the wakeup fd + handler synchronously at the top of
-    `_dashboard_wait_for_signal` (microseconds), well before this delay, so
-    the signal always lands AFTER the fd is armed — even if it arrives before
-    `select`, the buffered byte still wakes it.
+    `prior_disposition` is `signal.getsignal(sig)` captured BEFORE the wait is
+    entered. `_dashboard_wait_for_signal` sets the wakeup fd and THEN installs
+    its own handler, so the moment `getsignal(sig)` differs from
+    `prior_disposition` the fd is guaranteed armed too. Raising only then means
+    the signal can never land on the bare default disposition (`SIG_DFL` →
+    process/worker kill) while the main thread is still being scheduled to arm
+    under CPU starvation (#163). The C-level wakeup byte is written by the
+    delivering thread regardless, so the helper's `select` still unblocks.
+
+    A generous deadline bounds the spin so a (hypothetically) never-arming
+    helper can't hang `join()` forever — the wait's own finite `timeout` then
+    fails the assertion loudly instead. Daemon so a stray thread never blocks
+    interpreter shutdown.
     """
     def _run():
-        time.sleep(delay)
+        deadline = time.monotonic() + 10.0
+        while signal.getsignal(sig) is prior_disposition:
+            if time.monotonic() > deadline:
+                return  # helper never armed → let the wait time out + assert
+            time.sleep(0.0005)
         signal.raise_signal(sig)
 
     t = threading.Thread(target=_run, daemon=True)
@@ -71,8 +99,9 @@ def test_wakeup_does_not_depend_on_handler_body():
     wait = _wait_fn()
     saved_term = signal.getsignal(signal.SIGTERM)
     try:
-        _fire_signal_after(signal.SIGTERM, 0.05)
+        t = _fire_signal_when_armed(signal.SIGTERM, saved_term)
         woke = wait((signal.SIGTERM,), on_signal=None, timeout=5.0)
+        t.join()
         assert woke is True
     finally:
         signal.signal(signal.SIGTERM, saved_term)
@@ -88,8 +117,9 @@ def test_secondary_on_signal_callback_still_fires():
     saved_term = signal.getsignal(signal.SIGTERM)
     fired = threading.Event()
     try:
-        _fire_signal_after(signal.SIGTERM, 0.05)
+        t = _fire_signal_when_armed(signal.SIGTERM, saved_term)
         woke = wait((signal.SIGTERM,), on_signal=fired.set, timeout=5.0)
+        t.join()
         assert woke is True
         # The Python-level handler ran in addition to the C-level wakeup.
         assert fired.wait(1.0) is True
@@ -155,14 +185,20 @@ def test_single_sigterm_stress():
     Cheap with the self-pipe (the buffered byte makes every cycle
     deterministic); the modest count keeps suite cost ~1s while exercising
     the end-to-end arm → fire → select → drain → restore loop repeatedly.
+
+    The arm-gated fire (`_fire_signal_when_armed`) + per-iteration `join` keep
+    this deterministic even under `pytest -n16` with every core saturated:
+    exactly one fire-thread is live at a time and it can only raise while the
+    helper's handler is armed, so no cycle can leak a `SIGTERM` onto `SIG_DFL`
+    and crash the worker (#163).
     """
     wait = _wait_fn()
     saved_term = signal.getsignal(signal.SIGTERM)
     try:
         for i in range(20):
-            _fire_signal_after(signal.SIGTERM, 0.01)
-            assert wait((signal.SIGTERM,), on_signal=None, timeout=5.0) is True, (
-                f"single SIGTERM lost on iteration {i}"
-            )
+            t = _fire_signal_when_armed(signal.SIGTERM, saved_term)
+            woke = wait((signal.SIGTERM,), on_signal=None, timeout=5.0)
+            t.join()
+            assert woke is True, f"single SIGTERM lost on iteration {i}"
     finally:
         signal.signal(signal.SIGTERM, saved_term)
