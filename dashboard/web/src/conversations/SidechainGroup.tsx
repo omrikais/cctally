@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { MessageItem } from './MessageItem';
+import { SubagentIcon } from './ConvIcons';
 import { fmt } from '../lib/fmt';
 import type { ConversationItem } from '../types/conversation';
 
@@ -60,7 +61,7 @@ export function SidechainGroup({
       onToggle={(e) => setUserOpen((e.currentTarget as HTMLDetailsElement).open)}
     >
       <summary className="conv-sidechain-head">
-        <span className="conv-sidechain-glyph" aria-hidden="true">🧵</span>
+        <span className="conv-sidechain-glyph" aria-hidden="true"><SubagentIcon /></span>
         <span className="conv-sidechain-headtext">
           <span className="conv-sidechain-kind">Subagent</span>
           <span className="conv-sidechain-title">{label}</span>

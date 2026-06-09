@@ -269,7 +269,11 @@ describe('ConversationReader', () => {
     const { container } = render(<ConversationReader sessionId="s" />);
     await waitFor(() => expect(container.querySelector('.conv-reader--loading')).not.toBeNull());
     expect(container.querySelector('.conv-state')).not.toBeNull();
-    expect(container.querySelector('.conv-state-glyph')).not.toBeNull();
+    const glyph = container.querySelector('.conv-state-glyph')!;
+    expect(glyph).not.toBeNull();
+    // C3: the loading state glyph is now an inline SVG (not the ⏳ emoji).
+    expect(glyph.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
+    expect(glyph.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
     expect(container.querySelector('.conv-state-title')).not.toBeNull();
   });
 

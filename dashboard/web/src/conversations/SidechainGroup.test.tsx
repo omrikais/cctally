@@ -71,6 +71,10 @@ describe('SidechainGroup', () => {
     expect(document.querySelector('.conv-sidechain-title')).toBeTruthy();
     expect(document.querySelector('.conv-sidechain-head .conv-chev')).toBeTruthy();
     expect(screen.getByText(`${items.length} msgs`)).toBeInTheDocument();
+    // C3: the glyph is now an inline SVG (not the 🧵 emoji).
+    const glyph = document.querySelector('.conv-sidechain-glyph')!;
+    expect(glyph.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
+    expect(glyph.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
   });
 
   it('opens on forceOpen, registers member refs only while open, and latches open after the force drops', () => {

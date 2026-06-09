@@ -4792,7 +4792,8 @@ mark.current {
 .conv-reader--loading,
 .conv-reader--error { align-items: center; justify-content: center; }
 .conv-state { text-align: center; padding: 24px; max-width: 360px; }
-.conv-state-glyph { font-size: 30px; opacity: 0.55; display: block; margin-bottom: 12px; }
+.conv-state-glyph { opacity: 0.55; display: block; margin-bottom: 12px; line-height: 0; }
+.conv-state-glyph .conv-ico { width: 30px; height: 30px; vertical-align: 0; }
 .conv-state-title { font-family: var(--font-prose); font-size: 17px; color: var(--text); }
 .conv-state-hint { margin-top: 6px; font-family: var(--font-mono); font-size: 11.5px; color: var(--text-dim); }
 .conv-reader--error .conv-state-title { color: var(--accent-red); }
@@ -4931,6 +4932,9 @@ mark.current {
   background: var(--panel-bg-2);
 }
 .conv-system-marker > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   cursor: pointer;
   padding: 3px 10px;
   font-family: var(--font-mono);
@@ -4941,6 +4945,7 @@ mark.current {
 }
 .conv-system-marker > summary::-webkit-details-marker { display: none; }
 .conv-system-marker[open] > summary { color: var(--text-dim); }
+.conv-system-marker[open] > summary .conv-chev { transform: rotate(45deg); }
 .conv-system-marker-body {
   margin: 0;
   padding: 8px 10px;
@@ -5173,7 +5178,9 @@ mark.current {
   background: rgba(217,70,239,0.10);
   border: 1px solid rgba(217,70,239,0.30);
   font-size: 14px;
+  color: var(--accent-magenta);
 }
+.conv-sidechain-glyph .conv-ico { width: 16px; height: 16px; vertical-align: 0; }
 .conv-sidechain-headtext { flex: 1 1 auto; min-width: 0; }
 .conv-sidechain-kind {
   display: block;

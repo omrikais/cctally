@@ -192,7 +192,7 @@ export function ChatIcon() {
 
 // Per-tool glyph dispatcher: case-insensitive family match, generic box as the
 // never-blank fallback. Used by the tool chip + the tool_use degradation chip.
-export function toolIcon(name?: string): ReactNode {
+export function toolIcon(name?: string | null): ReactNode {
   const n = (name ?? '').toLowerCase();
   if (n === 'read' || n === 'grep' || n === 'glob' || n === 'ls') return <FileSearchIcon />;
   if (n === 'edit' || n === 'write' || n === 'notebookedit' || n === 'multiedit') return <PencilIcon />;

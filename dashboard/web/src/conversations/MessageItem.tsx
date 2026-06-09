@@ -1,6 +1,7 @@
 import { forwardRef, memo } from 'react';
 import { Markdown } from '../components/Markdown';
 import { MessageBlocks } from './MessageBlocks';
+import { ResultIcon, SystemIcon } from './ConvIcons';
 import { isSystemMarker } from './systemMarkers';
 import type { ConversationItem } from '../types/conversation';
 
@@ -31,7 +32,10 @@ function MessageItemImpl(
     return (
       <div ref={ref} className="conv-item conv-item--tool_result" data-uuid={item.anchor.uuid}>
         <details className="conv-chip conv-chip--result">
-          <summary>📤 Tool result</summary>
+          <summary>
+            <span className="conv-chev" aria-hidden="true" />
+            <ResultIcon /> Tool result
+          </summary>
           <div className="conv-chip-body"><MessageBlocks blocks={item.blocks} /></div>
         </details>
       </div>
@@ -72,7 +76,10 @@ function MessageItemImpl(
     return (
       <div ref={ref} className="conv-item conv-item--system" data-uuid={item.anchor.uuid}>
         <details className="conv-system-marker">
-          <summary>⚙ System marker</summary>
+          <summary>
+            <span className="conv-chev" aria-hidden="true" />
+            <SystemIcon /> System marker
+          </summary>
           <pre className="conv-system-marker-body">{item.text}</pre>
         </details>
       </div>

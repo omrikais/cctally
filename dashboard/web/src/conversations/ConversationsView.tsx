@@ -6,6 +6,7 @@ import { useIsMobile } from '../hooks/useIsMobile';
 import { transcriptsEnabled } from '../lib/transcripts';
 import { ConversationRail } from './ConversationRail';
 import { ConversationReader } from './ConversationReader';
+import { ChatIcon } from './ConvIcons';
 
 // Two-pane Conversations workspace (spec §4). Mounted by App.tsx only
 // when view==='conversations', so its keymap bindings exist only while
@@ -44,7 +45,7 @@ export function ConversationsView() {
       {selected != null
         ? <ConversationReader sessionId={selected} />
         : <div className="conv-reader conv-reader--empty">
-            <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true">💬</span>
+            <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true"><ChatIcon /></span>
               <div className="conv-state-title">Select a conversation</div>
               <div className="conv-state-hint">Choose one from the list to start reading.</div></div>
           </div>}

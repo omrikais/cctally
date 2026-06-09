@@ -120,6 +120,20 @@ describe('MessageBlocks (ordered walk + tool-run grouping)', () => {
     const { container } = render(<MessageBlocks blocks={[{ kind: 'thinking', text: 'hm' }]} />);
     expect(container.querySelector('.conv-chev')).not.toBeNull();
   });
+
+  it('renders inline-SVG icons instead of emoji in chip summaries', () => {
+    render(
+      <MessageBlocks blocks={[{ kind: 'thinking', text: 'hm' }, call({ name: 'Read', preview: '/a' })]} />,
+    );
+    // Thinking chip: label still present, an aria-hidden svg in the summary, no emoji.
+    const thinking = screen.getByText('Thinking').closest('summary')!;
+    expect(thinking.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
+    expect(thinking.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
+    // Tool chip: name + svg, no emoji.
+    const tool = screen.getByText('Read').closest('summary')!;
+    expect(tool.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
+    expect(tool.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
+  });
 });
 
 describe('MessageBlocks (single-block kinds)', () => {
@@ -160,6 +174,8 @@ describe('MessageBlocks (single-block kinds)', () => {
     expect(summary.textContent).toContain('Result');
     expect(summary.textContent).toContain('error');
     expect(summary.textContent).toContain('truncated');
+    expect(summary.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
+    expect(summary.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
     expect(container.querySelector('pre')!.textContent).toBe('boom');
   });
 
@@ -170,6 +186,8 @@ describe('MessageBlocks (single-block kinds)', () => {
     const span = container.querySelector('.conv-chip--media')!;
     expect(span.textContent).toContain('image/png');
     expect(span.textContent).toContain('1234 B');
+    expect(span.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
+    expect(span.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
   });
 
   it('renders a document placeholder', () => {
@@ -178,6 +196,8 @@ describe('MessageBlocks (single-block kinds)', () => {
     const span = container.querySelector('.conv-chip--media')!;
     expect(span.textContent).toContain('application/pdf');
     expect(span.textContent).toContain('99 B');
+    expect(span.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
+    expect(span.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
   });
 
   it('renders a tool_reference span', () => {
@@ -185,5 +205,7 @@ describe('MessageBlocks (single-block kinds)', () => {
     const { container } = render(<MessageBlocks blocks={blocks} />);
     const span = container.querySelector('.conv-chip--ref')!;
     expect(span.textContent).toContain('WebFetch');
+    expect(span.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
+    expect(span.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
   });
 });

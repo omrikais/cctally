@@ -1,5 +1,13 @@
 import type { ReactNode } from 'react';
 import { Markdown } from '../components/Markdown';
+import {
+  toolIcon,
+  ThinkingIcon,
+  ResultIcon,
+  ImageIcon,
+  DocumentIcon,
+  ReferenceIcon,
+} from './ConvIcons';
 import type { ConversationBlock } from '../types/conversation';
 
 // Render a turn's blocks in DOCUMENT ORDER (#164): consecutive `text` coalesce
@@ -63,7 +71,7 @@ function ToolRun({ calls }: { calls: Extract<ConversationBlock, { kind: 'tool_ca
   );
 }
 
-// One paired request+result disclosure. Collapsed: chevron · 🔧 · name ·
+// One paired request+result disclosure. Collapsed: chevron · tool icon · name ·
 // one-line preview · status (· error / · truncated). Expanded: the request
 // (input_summary) plus the result body (result.text, scroll-capped) or a
 // "no result" note when the request was never matched (result === null).
@@ -77,7 +85,7 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
     <details className="conv-chip conv-chip--tool">
       <summary>
         <span className="conv-chev" aria-hidden="true" />
-        🔧 <span className="conv-chip-name">{call.name ?? 'tool'}</span>
+        {toolIcon(call.name)} <span className="conv-chip-name">{call.name ?? 'tool'}</span>
         <span className="conv-chip-preview">{call.preview}</span>
         {status && <span className="conv-chip-status">{status}</span>}
       </summary>
@@ -120,7 +128,7 @@ function BlockChip({ block }: { block: ConversationBlock }) {
         <details className="conv-chip conv-chip--thinking">
           <summary>
             <span className="conv-chev" aria-hidden="true" />
-            💭 <span className="conv-chip-name">Thinking</span>
+            <ThinkingIcon /> <span className="conv-chip-name">Thinking</span>
             <span className="conv-chip-preview">{firstLine(block.text)}</span>
           </summary>
           <div className="conv-chip-body">
@@ -133,7 +141,7 @@ function BlockChip({ block }: { block: ConversationBlock }) {
         <details className="conv-chip conv-chip--tool">
           <summary>
             <span className="conv-chev" aria-hidden="true" />
-            🔧 <span className="conv-chip-name">{block.name ?? 'tool'}</span>
+            {toolIcon(block.name)} <span className="conv-chip-name">{block.name ?? 'tool'}</span>
           </summary>
           <pre className="conv-chip-body conv-code">{block.input_summary}</pre>
         </details>
@@ -143,7 +151,7 @@ function BlockChip({ block }: { block: ConversationBlock }) {
         <details className="conv-chip conv-chip--result">
           <summary>
             <span className="conv-chev" aria-hidden="true" />
-            📤 <span className="conv-chip-name">Result</span>
+            <ResultIcon /> <span className="conv-chip-name">Result</span>
             <span className="conv-chip-preview">{firstLine(block.text)}</span>
             {block.is_error && <span className="conv-chip-status"> · error</span>}
             {block.truncated && <span className="conv-chip-status"> · truncated</span>}
@@ -154,17 +162,17 @@ function BlockChip({ block }: { block: ConversationBlock }) {
     case 'image':
       return (
         <span className="conv-chip conv-chip--media">
-          🖼 {block.media_type ?? 'image'} · {block.bytes} B
+          <ImageIcon /> {block.media_type ?? 'image'} · {block.bytes} B
         </span>
       );
     case 'document':
       return (
         <span className="conv-chip conv-chip--media">
-          📄 {block.media_type ?? 'document'} · {block.bytes} B
+          <DocumentIcon /> {block.media_type ?? 'document'} · {block.bytes} B
         </span>
       );
     case 'tool_reference':
-      return <span className="conv-chip conv-chip--ref">↪ {block.name ?? 'tool'}</span>;
+      return <span className="conv-chip conv-chip--ref"><ReferenceIcon /> {block.name ?? 'tool'}</span>;
     default:
       return null; // text + tool_call are handled by the walk above
   }

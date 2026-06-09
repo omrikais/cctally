@@ -75,6 +75,13 @@ describe('MessageItem', () => {
     expect(container.querySelector('.conv-item--human')).toBeNull();
     const pill = container.querySelector('.conv-item--system details.conv-system-marker');
     expect(pill).not.toBeNull();
+    // C3/H2: the system-marker summary now shows an SVG (not ⚙) and the chevron
+    // it previously lacked.
+    const summary = pill!.querySelector('summary')!;
+    expect(summary.textContent).toContain('System marker');
+    expect(summary.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
+    expect(summary.querySelector('.conv-chev')).not.toBeNull();
+    expect(summary.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
     // data-uuid preserved on the container (the #160 jump relies on it).
     expect(container.querySelector('[data-uuid="m1"]')).not.toBeNull();
     // Raw text is reachable (never destroyed) — it is in the DOM, inside the disclosure.
@@ -186,7 +193,13 @@ describe('MessageItem', () => {
     const { container } = render(<MessageItem item={toolResult} />);
     const root = container.querySelector('.conv-item--tool_result')!;
     expect(root).not.toBeNull();
-    expect(container.querySelector('details.conv-chip--result summary')!.textContent).toContain('Tool result');
+    const summary = container.querySelector('details.conv-chip--result summary')!;
+    expect(summary.textContent).toContain('Tool result');
+    // C3/H2: an inline SVG instead of the 📤 emoji, and the chevron the
+    // top-level tool_result disclosure was previously missing.
+    expect(summary.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
+    expect(summary.querySelector('.conv-chev')).not.toBeNull();
+    expect(summary.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
     expect(container.textContent).toContain('output');
   });
 
