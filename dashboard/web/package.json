@@ -17,10 +17,12 @@
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
     "@fontsource/newsreader": "^5.2.10",
+    "hast-util-to-jsx-runtime": "^2.3.6",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.1.0",
     "recharts": "^2.15.0",
+    "refractor": "^5.0.0",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {

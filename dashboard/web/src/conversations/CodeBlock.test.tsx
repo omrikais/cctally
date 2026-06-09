@@ -1,0 +1,39 @@
+import { render } from '@testing-library/react';
+import { describe, expect, it } from 'vitest';
+import { Markdown } from '../components/Markdown';
+
+const md = (s: string) => render(<Markdown>{s}</Markdown>).container;
+
+describe('CodeBlock / Markdown code rendering', () => {
+  it('inline code stays a bare <code> (no codeblock chrome)', () => {
+    const c = md('hello `inline` world');
+    expect(c.querySelector('.codeblock')).toBeNull();
+    expect(c.querySelector('code')).toBeInTheDocument();
+  });
+
+  it('a language fence renders the language tag + token spans', () => {
+    const c = md('```ts\nconst x = 1;\n```');
+    expect(c.querySelector('.codeblock')).toBeInTheDocument();
+    expect(c.textContent).toMatch(/typescript|ts/i);            // language tag
+    expect(c.querySelector('.token')).toBeInTheDocument();      // refractor tokens
+    expect(c.querySelectorAll('pre').length).toBe(1);           // NO <pre><pre>
+  });
+
+  it('a no-language fence renders exactly one plain <pre>', () => {
+    const c = md('```\nplain text\n```');
+    expect(c.querySelectorAll('pre').length).toBe(1);
+    expect(c.querySelector('.token')).toBeNull();
+  });
+
+  it('an unknown language falls back to a plain <pre>, no tokens', () => {
+    const c = md('```nope\nx\n```');
+    expect(c.querySelectorAll('pre').length).toBe(1);
+    expect(c.querySelector('.token')).toBeNull();
+  });
+
+  it('SECURITY: raw HTML in a fence stays escaped text, never markup', () => {
+    const c = md('```html\n<script>alert(1)</script>\n```');
+    expect(c.querySelector('script')).toBeNull();               // not injected
+    expect(c.textContent).toContain('<script>alert(1)</script>');// escaped text
+  });
+});

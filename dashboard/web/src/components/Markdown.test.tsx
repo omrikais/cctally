@@ -29,9 +29,17 @@ describe('Markdown', () => {
     expect(a.getAttribute('rel')).toBe('noopener noreferrer');
   });
 
-  it('renders fenced code as a plain <pre><code> block', () => {
+  it('renders a no-language fence as a plain <pre><code> block (no codeblock chrome)', () => {
     const { container } = render(<Markdown>{'```\nconst x = 1;\n```'}</Markdown>);
     expect(container.querySelector('pre code')).not.toBeNull();
+    expect(container.querySelector('.codeblock')).toBeNull();
+    expect(container.querySelectorAll('pre').length).toBe(1); // no <pre><pre> nesting
     expect(container.textContent).toContain('const x = 1;');
+  });
+
+  it('renders a registered-language fence through CodeBlock chrome', () => {
+    const { container } = render(<Markdown>{'```ts\nconst x = 1;\n```'}</Markdown>);
+    expect(container.querySelector('.codeblock')).not.toBeNull();
+    expect(container.querySelectorAll('pre').length).toBe(1); // no <pre><pre> nesting
   });
 });

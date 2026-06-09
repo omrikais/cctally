@@ -5113,6 +5113,47 @@ mark.current {
   overflow: auto;
 }
 
+/* ---- Syntax-highlighted code blocks (C6) -------------------------- */
+/* Markdown fenced code in reader prose gets a head strip (language tag +
+   optional filename + copy button) over a refractor-tokenized <pre>. The
+   tool-I/O request/result dumps stay plain mono (no language signal). */
+.codeblock {
+  margin: 12px 0;
+  max-width: var(--measure, 68ch);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg);
+}
+.cb-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--panel-bg-2);
+  border-bottom: 1px solid var(--border-soft);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+.cb-lang { text-transform: uppercase; letter-spacing: 0.1em; }
+.cb-file { color: var(--text-faint); }
+.cb-copy-slot, .cb-copy { margin-left: auto; }
+.codeblock > pre.conv-code { border: 0; border-radius: 0; margin: 0; }
+/* Token tint — Prism classes mapped onto the in-tree reader accents (no new
+   hexes), so highlighting stays native to cctally's palette. */
+.conv-code--hl .token.keyword { color: var(--accent-purple); }
+.conv-code--hl .token.string  { color: var(--accent-green); }
+.conv-code--hl .token.number  { color: var(--accent-amber); }
+.conv-code--hl .token.boolean { color: var(--accent-amber); }
+.conv-code--hl .token.comment { color: var(--text-faint); font-style: italic; }
+.conv-code--hl .token.function,
+.conv-code--hl .token.property,
+.conv-code--hl .token.tag,
+.conv-code--hl .token.attr-name { color: var(--accent-cyan); }
+.conv-code--hl .token.operator,
+.conv-code--hl .token.punctuation { color: var(--text-dim); }
+
 /* ---- Orphan tool-result run (collapsed bare-result texture) -------- */
 .conv-toolresult-run {
   border: 1px solid var(--border-soft);
