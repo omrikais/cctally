@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Embedded pricing for `claude-fable-5`.** Anthropic's Fable 5 model ships in the API but was absent from the embedded `CLAUDE_MODEL_PRICING` table, so any session run on it logged a one-shot "unrecognized model" warning and contributed **zero cost** to every cost computation (`report`, `daily`, `weekly`, `session`, `blocks`, `forecast`, the dashboard, etc.), silently undercounting spend for Fable 5 users. The model is now priced at $10 / $50 per million input / output tokens (cache-write and cache-read derived at the standard 1.25× / 0.1× multipliers; 1M context at standard pricing with no long-context premium), verified against the Anthropic pricing page. `cctally pricing-check` no longer reports `claude-fable-5` as an unpriced vendor model and `doctor pricing.coverage` stays clean; the pricing snapshot date was bumped to 2026-06-10 (#172).
+
 ## [1.31.0] - 2026-06-09
 
 ### Added

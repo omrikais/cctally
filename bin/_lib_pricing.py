@@ -49,7 +49,7 @@ def _chip_for_model(name: str) -> str:
 # Date the embedded pricing snapshots below were last verified against
 # vendor sources. Bump whenever CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING
 # is synced. Read by `pricing-check` + the release pre-flight staleness nudge.
-PRICING_SNAPSHOT_DATE = "2026-05-30"
+PRICING_SNAPSHOT_DATE = "2026-06-10"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 # Canonical machine-readable pricing source (Claude values + Codex values).
@@ -67,9 +67,11 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = []
 
 # Anthropic API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured: 2026-05-30 (see PRICING_SNAPSHOT_DATE)
+# - Captured: 2026-06-10 (see PRICING_SNAPSHOT_DATE)
 # - Verified by maintainer against docs.claude.com/en/docs/about-claude/pricing;
 #   update in PRs touching this table.
+#   2026-06-10: added claude-fable-5 ($10/$50 per MTok; 1M context, no
+#   long-context premium) — issue #172.
 CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
     "claude-3-5-haiku-20241022": {
         "input_cost_per_token": 8e-07,
@@ -146,6 +148,12 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "output_cost_per_token_above_200k_tokens": 2.25e-05,
         "cache_creation_input_token_cost_above_200k_tokens": 7.5e-06,
         "cache_read_input_token_cost_above_200k_tokens": 6e-07,
+    },
+    "claude-fable-5": {
+        "input_cost_per_token": 1e-05,
+        "output_cost_per_token": 5e-05,
+        "cache_creation_input_token_cost": 1.25e-05,
+        "cache_read_input_token_cost": 1e-06,
     },
     "claude-haiku-4-5": {
         "input_cost_per_token": 1e-06,
