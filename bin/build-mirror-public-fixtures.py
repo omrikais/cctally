@@ -251,6 +251,56 @@ SCENARIOS.append((
 ))
 
 
+# 2c. publish-empty-after-skip-revert: a publish whose projected diff is
+# empty because a `Public-Skip` revert BETWEEN two publishes was dropped
+# (skips never apply to the public side), leaving the public tree already
+# at this publish's target content. Concretely: publish A lands notes.md
+# = "final v2"; a Public-Skip revert B sets notes.md back to "draft v1"
+# (never reaches public); publish C re-adds "final v2" — but projected
+# onto the public clone the file is already "final v2", so C stages
+# nothing. Without the apply-pass empty-staged guard, `git commit` fails
+# with "nothing to commit" and the whole run rolls back (this is the
+# real-world #161 release-replay breakage on the conversation goldens).
+# The validation pass's empty guard is path-level (`not public_paths`),
+# so it can't see this content-level no-op; the guard lives in
+# `_apply_one_publish` and classifies C as skip-empty. Result: exit 0,
+# the no-op publish is skipped, and public HEAD stays on A's commit with
+# the tree byte-correct.
+SCENARIOS.append((
+    "publish-empty-after-skip-revert",
+    'mkdir -p docs\n'
+    'echo "final v2" > docs/notes.md\n'
+    'git add docs/notes.md\n'
+    + _commit_msg_heredoc(
+        "feat: add notes (final)\n"
+        "\n"
+        "--- public ---\n"
+        "docs: add notes\n",
+        sentinel="CCTALLY_MSG_EOF_A",
+    )
+    + 'echo "draft v1" > docs/notes.md\n'
+      'git add docs/notes.md\n'
+    + _commit_msg_heredoc(
+        "revert: roll notes back to draft (transient)\n"
+        "\n"
+        "Public-Skip: true\n",
+        sentinel="CCTALLY_MSG_EOF_B",
+    )
+    + 'echo "final v2" > docs/notes.md\n'
+      'git add docs/notes.md\n'
+    + _commit_msg_heredoc(
+        "feat: re-add notes (final, for the mirror)\n"
+        "\n"
+        "--- public ---\n"
+        "docs: re-add notes\n",
+        sentinel="CCTALLY_MSG_EOF_C",
+    ),
+    0, "mirror plan:", "skip-empty publish (already byte-identical",
+    "docs: add notes\n",
+    None,
+))
+
+
 # 3. private-only-silent: commit touches only private files (.githooks/);
 # the .mirror-allowlist puts .githooks/ as unmatched (no positive rule
 # matches), so it's treated as private. Mirror silently skips.
