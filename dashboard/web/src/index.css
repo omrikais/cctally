@@ -4631,7 +4631,6 @@ mark.current {
 
 /* Reader-scoped tokens (kept off :root so global surfaces are untouched). */
 .conv-view {
-  --measure: 68ch;          /* prose line-length cap (comfort band 50–75ch) */
   --reader-ink: #ece9e3;    /* warm prose ink */
   --reader-faint: #a0a7b8;  /* reader faint text — ≥4.5:1 on panel bg (verify in §5) */
 }
@@ -5183,7 +5182,6 @@ mark.current {
    tool-I/O request/result dumps stay plain mono (no language signal). */
 .codeblock {
   margin: 12px 0;
-  max-width: var(--measure, 68ch);
   border: 1px solid var(--border-soft);
   border-radius: 8px;
   overflow: hidden;
@@ -5393,7 +5391,6 @@ mark.current {
   font-size: 16.5px;
   line-height: 1.62;
   color: var(--reader-ink);
-  max-inline-size: var(--measure);
   word-break: break-word;
 }
 .conv-item--human .md { font-size: 15.5px; }
