@@ -210,6 +210,63 @@ describe('MessageBlocks (single-block kinds)', () => {
   });
 });
 
+describe('MessageBlocks — tool I/O syntax highlighting', () => {
+  const READ_PY = '1\timport os\n2\tprint(os.getcwd())';
+  const readCall = (over = {}) =>
+    call({ name: 'Read', preview: '/a/foo.py', input_summary: '{"file_path":"/a/foo.py"}',
+           result: { text: READ_PY, truncated: false, is_error: false }, ...over });
+
+  it('REQUEST is json-highlighted (Bash → result plain, so tokens prove the request)', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[call({ name: 'Bash', preview: 'ls', input_summary: '{"command":"ls -la"}',
+        result: { text: 'plain output', truncated: false, is_error: false } })]} />,
+    );
+    expect(container.querySelector('.conv-code--numbered')).toBeNull();
+    expect(container.querySelector('.token')).toBeInTheDocument(); // from the json REQUEST
+  });
+
+  it('Read .py RESULT renders a numbered gutter + token spans', () => {
+    const { container } = render(<MessageBlocks blocks={[readCall()]} />);
+    expect(container.querySelector('.conv-code--numbered .cb-gutter')?.textContent).toBe('1\n2');
+    expect(container.querySelector('.conv-code--numbered .token')).toBeInTheDocument();
+  });
+
+  it('Bash RESULT stays plain (no gutter)', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[call({ name: 'Bash', preview: 'ls', input_summary: '{"command":"ls"}',
+        result: { text: 'file1\nfile2', truncated: false, is_error: false } })]} />,
+    );
+    expect(container.querySelector('.conv-code--numbered')).toBeNull();
+    expect(container.querySelector('pre.conv-code--result')?.textContent).toBe('file1\nfile2');
+  });
+
+  it('an error Read stays on the plain path (no mis-highlight)', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[readCall({ result: { text: 'File does not exist.', truncated: false, is_error: true } })]} />,
+    );
+    expect(container.querySelector('.conv-code--numbered')).toBeNull();
+    expect(container.querySelector('pre.conv-code--result')?.textContent).toBe('File does not exist.');
+  });
+
+  it('Edit/Write/MultiEdit/NotebookEdit results stay plain (v1 scope)', () => {
+    for (const name of ['Edit', 'Write', 'MultiEdit', 'NotebookEdit']) {
+      const { container } = render(
+        <MessageBlocks blocks={[call({ name, preview: '/a/foo.py',
+          result: { text: '1\tedited line', truncated: false, is_error: false } })]} />,
+      );
+      expect(container.querySelector('.conv-code--numbered')).toBeNull();
+    }
+  });
+
+  it('SECURITY: raw HTML in a Read result stays escaped text', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[readCall({ result: { text: '1\t<script>alert(1)</script>', truncated: false, is_error: false } })]} />,
+    );
+    expect(container.querySelector('script')).toBeNull();
+    expect(container.textContent).toContain('<script>alert(1)</script>');
+  });
+});
+
 describe('MessageBlocks (copy affordances, G2)', () => {
   afterEach(() => {
     vi.restoreAllMocks();

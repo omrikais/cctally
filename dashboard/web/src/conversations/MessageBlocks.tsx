@@ -9,6 +9,9 @@ import {
   ReferenceIcon,
 } from './ConvIcons';
 import { CopyButton } from './CopyButton';
+import { highlightBody } from './CodeBlock';
+import { LineNumberedCode } from './LineNumberedCode';
+import { resultLang } from './toolLang';
 import type { ConversationBlock } from '../types/conversation';
 
 // Render a turn's blocks in DOCUMENT ORDER (#164): consecutive `text` coalesce
@@ -72,6 +75,16 @@ function ToolRun({ calls }: { calls: Extract<ConversationBlock, { kind: 'tool_ca
   );
 }
 
+type ToolResult = { text: string; truncated: boolean; is_error: boolean };
+
+// Pick the RESULT renderer: a non-error Read whose file resolves to a known
+// language → gutter + highlight; everything else → the existing plain pre.
+function ToolResultBody({ result, name, preview }: { result: ToolResult; name: string | null; preview: string }) {
+  const lang = name === 'Read' && !result.is_error ? resultLang('Read', preview) : '';
+  if (lang) return <LineNumberedCode code={result.text} lang={lang} />;
+  return <pre className="conv-code conv-code--result">{result.text}</pre>;
+}
+
 // One paired request+result disclosure. Collapsed: chevron · tool icon · name ·
 // one-line preview · status (· error / · truncated). Expanded: the request
 // (input_summary) plus the result body (result.text, scroll-capped) or a
@@ -94,7 +107,7 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
         <div className="conv-tool-io">
           <div className="conv-tool-io-label">request</div>
           <CopyButton text={call.input_summary} />
-          <pre className="conv-code">{call.input_summary}</pre>
+          <pre className="conv-code conv-code--hl">{highlightBody(call.input_summary, 'json')}</pre>
         </div>
         {call.result ? (
           <div className="conv-tool-io">
@@ -103,7 +116,7 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
               {call.result.truncated ? ' · truncated' : ''}
             </div>
             <CopyButton text={call.result.text} />
-            <pre className="conv-code conv-code--result">{call.result.text}</pre>
+            <ToolResultBody result={call.result} name={call.name} preview={call.preview} />
           </div>
         ) : (
           <div className="conv-tool-io">
