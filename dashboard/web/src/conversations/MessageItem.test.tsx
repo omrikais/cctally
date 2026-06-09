@@ -1,6 +1,6 @@
 import { createRef } from 'react';
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageItem } from './MessageItem';
 import type { ConversationItem } from '../types/conversation';
 
@@ -313,5 +313,56 @@ describe('MessageItem', () => {
     // Prose rendered once, not doubled by the block walk.
     const matches = container.textContent!.match(/plain human question/g) ?? [];
     expect(matches).toHaveLength(1);
+  });
+});
+
+describe('MessageItem (message-text copy, G2)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('a prose turn renders a copy button that copies item.text', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<MessageItem item={assistant} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
+    expect(writeText).toHaveBeenCalledWith(assistant.text);
+  });
+
+  it('a human prose turn renders a copy button that copies item.text', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<MessageItem item={human} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
+    expect(writeText).toHaveBeenCalledWith(human.text);
+  });
+
+  it('a tool-only assistant turn (empty item.text) renders no message-text copy', () => {
+    const toolOnly: ConversationItem = {
+      kind: 'assistant',
+      anchor: { session_id: 's', uuid: 'ao1', id: 20 },
+      member_uuids: ['ao1'],
+      ts: 't',
+      text: '',
+      blocks: [
+        {
+          kind: 'tool_call',
+          name: 'Read',
+          input_summary: '{}',
+          preview: '/x',
+          tool_use_id: 't1',
+          result: { text: 'X', truncated: false, is_error: false },
+        },
+      ],
+      model: 'claude-opus-4',
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+      cost_usd: 0,
+    };
+    const { container } = render(<MessageItem item={toolOnly} />);
+    // No .conv-item-actions wrapper (the collapsed chip is closed, so no I/O
+    // copy buttons either) → zero copy buttons at the message level.
+    expect(container.querySelector('.conv-item-actions')).toBeNull();
   });
 });

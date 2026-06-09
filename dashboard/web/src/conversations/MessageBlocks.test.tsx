@@ -1,5 +1,5 @@
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageBlocks } from './MessageBlocks';
 import type { ConversationBlock } from '../types/conversation';
 
@@ -207,5 +207,50 @@ describe('MessageBlocks (single-block kinds)', () => {
     expect(span.textContent).toContain('WebFetch');
     expect(span.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
     expect(span.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
+  });
+});
+
+describe('MessageBlocks (copy affordances, G2)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('an open ToolCallChip exposes copy buttons for the request + result', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const { container } = render(
+      <MessageBlocks
+        blocks={[
+          call({ input_summary: 'the-request', result: { text: 'the-result', truncated: false, is_error: false } }),
+        ]}
+      />,
+    );
+    // Open the disclosure so the I/O bodies (and their copy buttons) mount.
+    const details = container.querySelector('details.conv-chip--tool') as HTMLDetailsElement;
+    details.open = true;
+    const buttons = screen.getAllByRole('button', { name: 'Copy' });
+    expect(buttons.length).toBeGreaterThanOrEqual(2);
+    fireEvent.click(buttons[0]);
+    fireEvent.click(buttons[1]);
+    expect(writeText).toHaveBeenCalledWith('the-request');
+    expect(writeText).toHaveBeenCalledWith('the-result');
+  });
+
+  it('an orphan tool_result body has a copy button copying the result text', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(
+      <MessageBlocks blocks={[{ kind: 'tool_result', text: 'orphan-out', truncated: false, is_error: false }]} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
+    expect(writeText).toHaveBeenCalledWith('orphan-out');
+  });
+
+  it('a tool_use degradation body has a copy button copying the input summary', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<MessageBlocks blocks={[{ kind: 'tool_use', name: 'Bash', input_summary: 'ls -la' }]} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
+    expect(writeText).toHaveBeenCalledWith('ls -la');
   });
 });

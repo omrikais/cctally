@@ -2,6 +2,7 @@ import { forwardRef, memo } from 'react';
 import { Markdown } from '../components/Markdown';
 import { MessageBlocks } from './MessageBlocks';
 import { ResultIcon, SystemIcon } from './ConvIcons';
+import { CopyButton } from './CopyButton';
 import { isSystemMarker } from './systemMarkers';
 import type { ConversationItem } from '../types/conversation';
 
@@ -58,6 +59,13 @@ function MessageItemImpl(
         {/* Document-order walk renders prose (from text blocks) + thinking +
             tool runs in order — no separate item.text render (#164). */}
         <MessageBlocks blocks={item.blocks} />
+        {item.text && (
+          // Hover/focus-revealed action copying the turn's joined prose. Only
+          // when there IS prose — a tool-only assistant turn renders none.
+          <div className="conv-item-actions">
+            <CopyButton text={item.text} />
+          </div>
+        )}
         {hasCost && (
           // toFixed(4), not fmt.usd2: per-turn costs are typically sub-cent,
           // where 2-decimal formatting would read "$0.00" — 4 decimals keep
@@ -95,6 +103,11 @@ function MessageItemImpl(
       {/* Joined prose renders above via item.text; pass only NON-text blocks to
           the walk so it doesn't double the human's prose. */}
       <MessageBlocks blocks={item.blocks.filter((b) => b.kind !== 'text')} />
+      {item.text && (
+        <div className="conv-item-actions">
+          <CopyButton text={item.text} />
+        </div>
+      )}
     </div>
   );
 }

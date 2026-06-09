@@ -8,6 +8,7 @@ import {
   DocumentIcon,
   ReferenceIcon,
 } from './ConvIcons';
+import { CopyButton } from './CopyButton';
 import type { ConversationBlock } from '../types/conversation';
 
 // Render a turn's blocks in DOCUMENT ORDER (#164): consecutive `text` coalesce
@@ -92,6 +93,7 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
       <div className="conv-chip-body conv-chip-body--io">
         <div className="conv-tool-io">
           <div className="conv-tool-io-label">request</div>
+          <CopyButton text={call.input_summary} />
           <pre className="conv-code">{call.input_summary}</pre>
         </div>
         {call.result ? (
@@ -100,6 +102,7 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
               result{call.result.is_error ? ' · error' : ' · ok'}
               {call.result.truncated ? ' · truncated' : ''}
             </div>
+            <CopyButton text={call.result.text} />
             <pre className="conv-code conv-code--result">{call.result.text}</pre>
           </div>
         ) : (
@@ -143,7 +146,10 @@ function BlockChip({ block }: { block: ConversationBlock }) {
             <span className="conv-chev" aria-hidden="true" />
             {toolIcon(block.name)} <span className="conv-chip-name">{block.name ?? 'tool'}</span>
           </summary>
-          <pre className="conv-chip-body conv-code">{block.input_summary}</pre>
+          <div className="conv-chip-body conv-tool-io">
+            <CopyButton text={block.input_summary} />
+            <pre className="conv-code">{block.input_summary}</pre>
+          </div>
         </details>
       );
     case 'tool_result': // orphan items only
@@ -156,7 +162,10 @@ function BlockChip({ block }: { block: ConversationBlock }) {
             {block.is_error && <span className="conv-chip-status"> · error</span>}
             {block.truncated && <span className="conv-chip-status"> · truncated</span>}
           </summary>
-          <pre className="conv-chip-body conv-code">{block.text}</pre>
+          <div className="conv-chip-body conv-tool-io">
+            <CopyButton text={block.text} />
+            <pre className="conv-code">{block.text}</pre>
+          </div>
         </details>
       );
     case 'image':

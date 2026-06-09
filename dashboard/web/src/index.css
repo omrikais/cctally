@@ -5138,7 +5138,7 @@ mark.current {
 }
 .cb-lang { text-transform: uppercase; letter-spacing: 0.1em; }
 .cb-file { color: var(--text-faint); }
-.cb-copy-slot, .cb-copy { margin-left: auto; }
+.cb-copy { margin-left: auto; }
 .codeblock > pre.conv-code { border: 0; border-radius: 0; margin: 0; }
 /* Token tint — Prism classes mapped onto the in-tree reader accents (no new
    hexes), so highlighting stays native to cctally's palette. */
@@ -5153,6 +5153,47 @@ mark.current {
 .conv-code--hl .token.attr-name { color: var(--accent-cyan); }
 .conv-code--hl .token.operator,
 .conv-code--hl .token.punctuation { color: var(--text-dim); }
+
+/* ---- Copy affordances (G2) ---------------------------------------- */
+/* Compact icon-only copy button across code blocks, tool I/O, and message
+   text. The icon (clipboard → check) carries the state via aria-label. */
+.conv-copy-btn {
+  display: inline-grid;
+  place-items: center;
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 2px 4px;
+  color: var(--text-faint);
+  line-height: 0;
+}
+.conv-copy-btn:hover {
+  color: var(--text);
+  border-color: var(--border-soft);
+  background: var(--panel-bg-2);
+}
+.conv-copy-btn:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 1px;
+}
+/* Tool I/O bodies anchor a copy button top-right of each block. */
+.conv-tool-io { position: relative; }
+.conv-tool-io > .conv-copy-btn { position: absolute; top: 2px; right: 2px; z-index: 1; }
+/* Per-turn message-text copy: hover/focus/keyboard-cursor revealed. */
+.conv-item-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.conv-item:hover .conv-item-actions,
+.conv-item:focus-within .conv-item-actions,
+.conv-item--focused .conv-item-actions { opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  .conv-item-actions { transition: none; }
+}
 
 /* ---- Orphan tool-result run (collapsed bare-result texture) -------- */
 .conv-toolresult-run {

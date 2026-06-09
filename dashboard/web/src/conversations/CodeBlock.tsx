@@ -12,6 +12,7 @@ import markdown from 'refractor/markdown';
 import yaml from 'refractor/yaml';
 import { toJsxRuntime } from 'hast-util-to-jsx-runtime';
 import { Fragment, jsx as _jsx, jsxs as _jsxs } from 'react/jsx-runtime';
+import { CopyButton } from './CopyButton';
 
 // Syntax-highlighted fenced-code renderer (C6). refractor (the Prism
 // tokenizer) produces a hast tree; hast-util-to-jsx-runtime turns that tree
@@ -60,8 +61,7 @@ export function CodeBlock({ lang, filename, code }: { lang: string; filename?: s
       <div className="cb-head">
         <span className="cb-lang">{lang}</span>
         {filename && <span className="cb-file">{filename}</span>}
-        {/* Task 4 swaps this for <CopyButton text={code} />. */}
-        <span className="cb-copy-slot" aria-hidden="true" />
+        <CopyButton text={code} className="cb-copy" />
       </div>
       <pre className="conv-code conv-code--hl">{body}</pre>
     </div>
