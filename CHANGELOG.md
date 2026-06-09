@@ -5,6 +5,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Keyboard navigation in the dashboard conversation reader.** With a conversation open, `j` / `k` move a focused-turn cursor between turns (scrolling each into view and auto-loading the next page when you reach the end), `[` / `]` collapse-all / expand-all the disclosure sections in the thread, and `g` jumps back to the top. The bindings are listed in the dashboard help overlay (`?`) under a new "Conversations" group and are inert while a modal or the rail search/filter input is active.
+- **Syntax-highlighted code blocks and copy buttons in the conversation reader.** Fenced code in transcripts is now syntax-highlighted with a language label, and one-click copy buttons appear on code blocks, tool output, and message text.
+- **Derived conversation titles.** Each conversation now shows a short derived title in the sidebar rail, the reader header, and full-text search results — and cross-session search now matches on that title too; the rail also groups conversations under date dividers.
+- Jump-to-message now expands the owning collapsed subagent thread when the target message lands inside one, instead of silently scrolling to a hidden turn (#160).
+
+### Changed
+- **The dashboard conversation viewer (introduced in 1.29.0) has been redesigned end-to-end.** Transcripts now render as serif prose (self-hosted Newsreader) on a readable ~68-character measure with higher-contrast text, laid out along a timeline spine with role-differentiated turns; assistant turns are walked in document order so each tool call renders paired with its result as an inline tool-I/O chip (chevron + preview) and stray orphan tool-result runs are collapsed; subagent sidechains render as weighted thread cards; system-command messages fold into an expandable pill; and inline-SVG icons replace the previous emoji throughout, with disclosure sections opening on a smooth animation and turns staggering in on first load behind a refined jump-flash (#161, #162, #164, #165, #168).
+- Internal (no action needed on upgrade): a new cache migration (`003`) re-ingests existing conversation history id-aware so older transcripts pick up the tool-call linkage ids the paired tool-I/O view needs. The cache is fully re-derivable and the migration runs automatically on the next DB open.
+
 ## [1.29.0] - 2026-06-08
 
 ### Added
