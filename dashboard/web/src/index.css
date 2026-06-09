@@ -5176,6 +5176,26 @@ mark.current {
   overflow: auto;
 }
 
+/* Read-result line-number gutter (tool I/O syntax highlighting). ONE scroll
+   container so the gutter + code scroll together and stay row-aligned. */
+.conv-code--numbered {
+  display: grid; grid-template-columns: auto 1fr;
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5;
+  background: var(--bg); border: 1px solid var(--border-soft); border-radius: 6px;
+  max-height: 220px; overflow: auto;
+}
+.cb-gutter {
+  white-space: pre; text-align: right; padding: 8px 8px 8px 10px;
+  color: var(--text-faint); user-select: none; font-variant-numeric: tabular-nums;
+  border-right: 1px solid var(--border-soft);
+  position: sticky; left: 0; background: var(--bg);
+}
+.conv-code--numbered > pre.conv-code {
+  border: 0; border-radius: 0; margin: 0; background: transparent;
+  padding: 8px 10px 8px 8px; white-space: pre; overflow: visible;
+  word-break: normal; overflow-wrap: normal;   /* reset .conv-code's break-word */
+}
+
 /* ---- Syntax-highlighted code blocks (C6) -------------------------- */
 /* Markdown fenced code in reader prose gets a head strip (language tag +
    optional filename + copy button) over a refractor-tokenized <pre>. The
