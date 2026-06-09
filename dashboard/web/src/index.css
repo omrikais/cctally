@@ -4715,19 +4715,29 @@ mark.current {
   background: var(--panel-bg-2);
   border-color: var(--accent-blue);
 }
-.conv-rail-row-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 12.5px;
+.conv-rail-sec {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding: 12px 8px 4px;
 }
-.conv-rail-row-project {
-  font-weight: 700;
-  color: var(--accent-blue);
+.conv-rail-row-title {
+  font-family: var(--font-prose);
+  font-size: 14.5px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text);
+  margin-bottom: 5px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+}
+.conv-rail-row-project {            /* F2: content-sized, demoted (no longer the anchor) */
+  color: var(--text-dim);
+  font-weight: 400;
 }
 .conv-rail-row-branch,
 .conv-rail-row-when {
@@ -4737,9 +4747,9 @@ mark.current {
 }
 .conv-rail-row-meta {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 10px;
-  margin-top: 3px;
+  gap: 4px 8px;
   font-size: 11px;
   color: var(--text-dim);
 }
