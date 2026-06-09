@@ -13,12 +13,32 @@ deduped session_entries row (idx_entries_dedup), via the shared pricing helper
 from __future__ import annotations
 import json as _json
 import os
+import re
 import sqlite3
 
 # Public surface (Plan 2): shipped in the npm tarball + brew formula + public
 # mirror — imported by the dashboard's conversation endpoints at runtime.
 
 from _lib_pricing import _calculate_entry_cost
+
+
+# Mirror of dashboard/web/src/conversations/systemMarkers.ts::MARKER_RE — anchored
+# whole-string (fullmatch), unrolled-lazy body for linear time (no ReDoS), \1
+# backref forces each close tag to match its open tag. Used to SKIP slash-command
+# plumbing when deriving a conversation title (#165 Q2). MUST stay equivalent to
+# the TS predicate over ASCII whitespace (parity-tested); exotic Unicode/control
+# whitespace is an explicit non-goal. See docs/dashboard-gotchas.md.
+_MARKER_TAGS = ("command-name", "command-message", "command-args", "local-command-caveat")
+_MARKER_RE = re.compile(
+    r"\s*(?:<(" + "|".join(_MARKER_TAGS) + r")>(?:(?!</\1>)[\s\S])*</\1>\s*)+"
+)
+
+
+def _is_system_marker(text) -> bool:
+    """True iff `text` is ONLY concatenated command-marker wrappers (slash-command
+    plumbing) — the title-derivation skip predicate. `fullmatch` reproduces the TS
+    `^\\s*…\\s*$` anchor (no `$`-before-trailing-`\\n` foot-gun)."""
+    return bool(text) and _MARKER_RE.fullmatch(text) is not None
 
 
 def _project_label(cwd) -> str:

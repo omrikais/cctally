@@ -687,3 +687,30 @@ def test_get_conversation_turn_parent_uuid_is_seed_sourced_not_prose_anchor():
     assert turn["anchor"]["uuid"] == "g1b"                   # prose-bearing anchor
     assert turn["subagent_key"] == "bbbb2222"
     assert turn["parent_uuid"] == "h1"                       # SEED parent, not "g1a"
+
+
+# --- title derivation: _is_system_marker parity (#165 Q2) -----------------
+# Parity scoped to ASCII whitespace + the marker vectors, mirroring
+# dashboard/web/src/conversations/systemMarkers.test.ts. Exotic Unicode/control
+# whitespace (BOM, FS-US) is an explicit non-goal (spec §4.1 caveat).
+def test_is_system_marker_parity():
+    M = cq._is_system_marker
+    # positive: each single wrapper
+    assert M("<command-name>clear</command-name>")
+    assert M("<local-command-caveat>do not respond</local-command-caveat>")
+    # positive: concatenated wrappers (the /clear shape)
+    assert M("<command-name>clear</command-name>"
+             "<command-message>clear</command-message>"
+             "<command-args></command-args>")
+    # positive: ASCII-whitespace wrapped + between
+    assert M("  <command-name>clear</command-name>\n  ")
+    assert M("<command-name>a</command-name>\t<command-args>b</command-args>")
+    # negative: a sentence merely QUOTING a tag is not a marker
+    assert not M("See <command-name>clear</command-name> for details.")
+    # negative: a marker embedded in prose
+    assert not M("prefix <command-name>clear</command-name>")
+    # negative: empty / plain prose
+    assert not M("")
+    assert not M("how does the reset work")
+    # ReDoS guard: a valid prefix then trailing prose terminates (no hang)
+    assert not M("<command-name>x</command-name>" + "y" * 5000)
