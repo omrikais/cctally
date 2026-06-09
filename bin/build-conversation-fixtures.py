@@ -152,6 +152,8 @@ def build(scenario: str) -> None:
     s3_agent_b = "/fake/projects/proj/agent-bbbb2222.jsonl"
     s3_agent_c = "/fake/projects/proj/agent-cccc3333.jsonl"
     s3_cwd = "/home/u/proj"
+    s4_file = "/fake/projects/proj/s4.jsonl"
+    s4_cwd = "/home/u/proj"
 
     cache_conn = sqlite3.connect(cache_path)
     stats_conn = sqlite3.connect(stats_path)
@@ -171,6 +173,8 @@ def build(scenario: str) -> None:
                           project_path=s3_cwd)
         seed_session_file(cache_conn, path=s3_agent_c, session_id="s3",
                           project_path=s3_cwd)
+        seed_session_file(cache_conn, path=s4_file, session_id="s4",
+                          project_path=s4_cwd)
 
         # --- session s1: human prompt + multi-fragment assistant turn --------
         # id=1: human prompt.
@@ -368,6 +372,28 @@ def build(scenario: str) -> None:
         seed_session_entry(cache_conn, source_path=s3_agent_c, line_offset=1,
                            timestamp_utc="2026-06-03T00:00:07Z", model=MODEL,
                            msg_id="mc", req_id="rc", input_tokens=300, output_tokens=150)
+
+        # --- session s4: marker-first → title derivation must SKIP the
+        # /clear plumbing and pick the SECOND human (#165 Q2 end-to-end). ----
+        _insert_message(
+            cache_conn,
+            session_id="s4", uuid="h4m", parent_uuid=None,
+            source_path=s4_file, byte_offset=0,
+            timestamp_utc="2026-06-04T00:00:00Z",
+            entry_type="human",
+            text=("<command-name>clear</command-name>"
+                  "<command-message>clear</command-message>"
+                  "<command-args></command-args>"),
+            cwd=s4_cwd, git_branch="main",
+        )
+        _insert_message(
+            cache_conn,
+            session_id="s4", uuid="h4", parent_uuid="h4m",
+            source_path=s4_file, byte_offset=1,
+            timestamp_utc="2026-06-04T00:00:02Z",
+            entry_type="human", text="set up the marker-skip scenario",
+            cwd=s4_cwd, git_branch="main",
+        )
 
         # Empty stats.db stamped fully-migrated (dashboard-fixtures posture):
         # the dashboard server opens it at boot even though the conversation

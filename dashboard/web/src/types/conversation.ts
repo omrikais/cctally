@@ -60,6 +60,7 @@ export type ConversationBlock =
 
 export interface ConversationSummary {
   session_id: string;
+  title: string; // derived conversation title (first real user line; #165 Q-F1)
   project_label: string;
   git_branch: string | null;
   started_utc: string;
@@ -90,6 +91,7 @@ export interface SearchHit {
   session_id: string;
   uuid: string;
   project_label: string;
+  title: string; // derived conversation title for the hit's session (#165 Q4)
   ts: string;
   snippet: string;
   cost_usd: number;

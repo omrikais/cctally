@@ -1,6 +1,17 @@
 {
   "conversations": [
     {
+      "cost_usd": 0.0,
+      "git_branch": "main",
+      "last_activity_utc": "2026-06-04T00:00:02Z",
+      "models": [],
+      "msg_count": 2,
+      "project_label": "proj",
+      "session_id": "s4",
+      "started_utc": "2026-06-04T00:00:00Z",
+      "title": "set up the marker-skip scenario"
+    },
+    {
       "cost_usd": 0.02175,
       "git_branch": "main",
       "last_activity_utc": "2026-06-03T00:00:07Z",
@@ -10,7 +21,8 @@
       "msg_count": 8,
       "project_label": "proj",
       "session_id": "s3",
-      "started_utc": "2026-06-03T00:00:00Z"
+      "started_utc": "2026-06-03T00:00:00Z",
+      "title": "run the audits"
     },
     {
       "cost_usd": 0.0,
@@ -20,7 +32,8 @@
       "msg_count": 1,
       "project_label": "other",
       "session_id": "s2",
-      "started_utc": "2026-06-02T00:00:00Z"
+      "started_utc": "2026-06-02T00:00:00Z",
+      "title": "how do I set a weekly budget"
     },
     {
       "cost_usd": 0.0175,
@@ -32,7 +45,8 @@
       "msg_count": 5,
       "project_label": "proj",
       "session_id": "s1",
-      "started_utc": "2026-06-01T00:00:00Z"
+      "started_utc": "2026-06-01T00:00:00Z",
+      "title": "how does the reset work"
     }
   ],
   "page": {
