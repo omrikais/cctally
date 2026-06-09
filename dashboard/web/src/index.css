@@ -4970,6 +4970,35 @@ mark.current {
   .conv-item--jumped { animation: none; }
 }
 
+/* ---- Disclosure-open animation (G1 §4a) --------------------------- */
+/* Reader-scoped only: `interpolate-size: allow-keywords` enables a
+   block-size:0→auto transition for the chips / tool-result run / subagent
+   card / system marker. Purely presentational on `::details-content` — the
+   React <details>/derived-open/#160 ref-attach machinery is untouched.
+   Browsers without ::details-content / interpolate-size simply snap (today's
+   behavior), so this is strictly additive. */
+.conv-reader { interpolate-size: allow-keywords; }
+.conv-chip::details-content,
+.conv-sidechain::details-content,
+.conv-toolresult-run::details-content,
+.conv-system-marker::details-content {
+  block-size: 0;
+  overflow: hidden;
+  transition: block-size .24s ease, content-visibility .24s allow-discrete;
+}
+.conv-chip[open]::details-content,
+.conv-sidechain[open]::details-content,
+.conv-toolresult-run[open]::details-content,
+.conv-system-marker[open]::details-content { block-size: auto; }
+/* A #160 force-open snaps instantly so layout is final before the scroll
+   lands; the class drops afterward and later user toggles animate. */
+.conv-sidechain--force::details-content { transition: none; }
+@media (prefers-reduced-motion: reduce) {
+  .conv-reader ::details-content,
+  /* Codex P3: the chevron rotate transition (above) is gated here too. */
+  .conv-reader .conv-chev { transition: none; }
+}
+
 /* ---- Inline-SVG icon system (C3 / H2) ----------------------------- */
 /* Stroke-only 24×24 glyphs inheriting the chip accent via currentColor. */
 .conv-ico { width: 14px; height: 14px; flex: 0 0 auto; display: inline-block; vertical-align: -2px; }

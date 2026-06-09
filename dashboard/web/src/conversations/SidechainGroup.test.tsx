@@ -77,6 +77,17 @@ describe('SidechainGroup', () => {
     expect(glyph.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
   });
 
+  it('applies conv-sidechain--force only while forceOpen (G1 §4a #160 instant-open)', () => {
+    const items = [member('s1'), member('s2')];
+    const { container, rerender } = render(
+      <SidechainGroup subagentKey="k1" items={items} nested={false} forceOpen={false} />,
+    );
+    const details = container.querySelector('details.conv-sidechain')!;
+    expect(details).not.toHaveClass('conv-sidechain--force');
+    rerender(<SidechainGroup subagentKey="k1" items={items} nested={false} forceOpen={true} />);
+    expect(details).toHaveClass('conv-sidechain--force');
+  });
+
   it('opens on forceOpen, registers member refs only while open, and latches open after the force drops', () => {
     const refs = new Map<string, HTMLDivElement>();
     const getItemRef = (item: ConversationItem) => (el: HTMLDivElement | null) => {

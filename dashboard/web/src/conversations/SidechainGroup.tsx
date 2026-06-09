@@ -56,7 +56,14 @@ export function SidechainGroup({
   const models = [...new Set(items.map((it) => it.model).filter(Boolean))] as string[];
   return (
     <details
-      className={nested ? 'conv-sidechain conv-sidechain--nested' : 'conv-sidechain'}
+      className={[
+        nested ? 'conv-sidechain conv-sidechain--nested' : 'conv-sidechain',
+        // G1 §4a: while a #160 jump force-opens this thread, snap it open
+        // instantly (CSS `transition: none`) so layout is final before
+        // scrollIntoView lands. The class drops when the force releases, so
+        // later user toggles animate.
+        forceOpen ? 'conv-sidechain--force' : '',
+      ].filter(Boolean).join(' ')}
       open={open}
       onToggle={(e) => setUserOpen((e.currentTarget as HTMLDetailsElement).open)}
     >
