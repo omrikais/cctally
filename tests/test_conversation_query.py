@@ -749,3 +749,19 @@ def test_session_titles_truncation_with_ellipsis():
 
 def test_session_titles_empty_for_unknown():
     assert cq._session_titles_map(_conn(), []) == {}
+
+
+def test_list_conversations_includes_title_with_fallback():
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="design the rail title", cwd="/home/u/proj")
+    # s2: NO human (assistant-only) → title falls back to project_label
+    _msg(c, session_id="s2", uuid="a2", source_path="b.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-02T00:00:00Z", entry_type="assistant",
+         text="hi", model=_MODEL, msg_id="m2", req_id="r2", cwd="/home/u/other")
+    rows = cq.list_conversations(c)["conversations"]
+    s1 = next(r for r in rows if r["session_id"] == "s1")
+    s2 = next(r for r in rows if r["session_id"] == "s2")
+    assert s1["title"] == "design the rail title"
+    assert s2["title"] == "other"        # fallback → project_label basename

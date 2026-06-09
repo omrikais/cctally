@@ -225,9 +225,11 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0) -> dict:
     models = _session_models_map(conn, session_ids)
     # cwd/git_branch as the latest non-null (reader posture), NOT a lexical MAX().
     meta = _session_latest_meta_map(conn, session_ids)
+    titles = _session_titles_map(conn, session_ids)
     conversations = [
         {
             "session_id": sid,
+            "title": titles.get(sid) or _project_label(meta.get(sid, (None, None))[0]) or sid,
             "project_label": _project_label(meta.get(sid, (None, None))[0]),
             "git_branch": meta.get(sid, (None, None))[1],
             "started_utc": started,
