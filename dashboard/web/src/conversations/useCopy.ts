@@ -10,9 +10,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 export function useCopy(): { copied: boolean; copy: (text: string) => void } {
   const [copied, setCopied] = useState(false);
   const timer = useRef<number | null>(null);
+  const mountedRef = useRef(true);
 
   useEffect(
     () => () => {
+      mountedRef.current = false;
       if (timer.current != null) window.clearTimeout(timer.current);
     },
     [],
@@ -20,6 +22,10 @@ export function useCopy(): { copied: boolean; copy: (text: string) => void } {
 
   const copy = useCallback((text: string) => {
     const done = () => {
+      // Belt-and-suspenders: the clipboard promise may resolve after the
+      // component unmounts. Skip the state update + timer to avoid a setState
+      // on an unmounted component (a silent no-op under React 18, but airtight).
+      if (!mountedRef.current) return;
       setCopied(true);
       if (timer.current != null) window.clearTimeout(timer.current);
       timer.current = window.setTimeout(() => {
