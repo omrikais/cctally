@@ -1,9 +1,10 @@
-import { useRef, useSyncExternalStore } from 'react';
+import { Fragment, useRef, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useConversations } from '../hooks/useConversations';
 import { useConversationSearch } from '../hooks/useConversationSearch';
 import { renderSnippet } from '../lib/snippet';
+import { railDateBucket } from './railDateBucket';
 import { fmt } from '../lib/fmt';
 import type { ConversationSummary, SearchHit } from '../types/conversation';
 
@@ -56,11 +57,21 @@ function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailC
   if (error) return <div className="conv-rail-list"><div className="conv-rail-empty">{error}</div></div>;
   if (loading && rows.length === 0) return <div className="conv-rail-list"><div className="conv-rail-empty">Loading…</div></div>;
   if (rows.length === 0) return <div className="conv-rail-list"><div className="conv-rail-empty">No conversations.</div></div>;
+  // rows are date-desc; the bucket label changes monotonically as you scroll.
+  let lastBucket: string | null = null;
+  const now = Date.now();
   return (
     <div className="conv-rail-list">
-      {rows.map((r) => (
-        <BrowseRow key={r.session_id} row={r} ctx={ctx} active={r.session_id === selectedId} />
-      ))}
+      {rows.map((r) => {
+        const bucket = railDateBucket(r.started_utc, ctx.tz, now);
+        const sec = bucket !== lastBucket ? (lastBucket = bucket, bucket) : null;
+        return (
+          <Fragment key={r.session_id}>
+            {sec && <div className="conv-rail-sec">{sec}</div>}
+            <BrowseRow row={r} ctx={ctx} active={r.session_id === selectedId} />
+          </Fragment>
+        );
+      })}
       {hasMore && (
         <button type="button" className="conv-rail-more" onClick={() => void loadMore()}>
           Load more
@@ -77,11 +88,10 @@ function BrowseRow({ row, ctx, active }: { row: ConversationSummary; ctx: RailCt
       className={`conv-rail-row${active ? ' is-active' : ''}`}
       onClick={() => dispatch({ type: 'SELECT_CONVERSATION', sessionId: row.session_id })}
     >
-      <div className="conv-rail-row-head">
+      <div className="conv-rail-row-title">{row.title}</div>
+      <div className="conv-rail-row-meta">
         <span className="conv-rail-row-project">{row.project_label || '—'}</span>
         <span className="conv-rail-row-branch">{row.git_branch ?? '—'}</span>
-      </div>
-      <div className="conv-rail-row-meta">
         <span className="conv-rail-row-when">{fmt.startedShort(row.started_utc, ctx, { noSuffix: true })}</span>
         <span className="conv-rail-row-cost">{fmt.usd2(row.cost_usd)}</span>
         <span className="conv-rail-row-msgs">{row.msg_count} msgs</span>
@@ -118,7 +128,8 @@ function SearchRow({ hit, ctx }: { hit: SearchHit; ctx: RailCtx }) {
         })
       }
     >
-      <div className="conv-rail-row-head">
+      <div className="conv-rail-row-title">{hit.title}</div>
+      <div className="conv-rail-row-meta">
         <span className="conv-rail-row-project">{hit.project_label || '—'}</span>
         <span className="conv-rail-row-when">{fmt.startedShort(hit.ts, ctx, { noSuffix: true })}</span>
         <span className="conv-rail-row-cost">{fmt.usd2(hit.cost_usd)}</span>
