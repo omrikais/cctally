@@ -800,3 +800,77 @@ def test_search_hits_include_title_fts():
     assert out["mode"] == "fts"
     assert out["hits"], "expected at least one hit"
     assert out["hits"][0]["title"] == "how does the reset work"
+
+
+# ---------------------------------------------------------------------------
+# #166: subagent-kind correlation scan in get_conversation. Isolated kernel
+# units for the edge branches of the spawn<->result join that builds the
+# top-level `subagent_meta` map and pop-strips the parser-only block keys.
+# The blocks_json seeded here carries the POST-PARSER shape: `subagent_type`
+# on the tool_use block; `agent_id` + `subagent_meta` on the tool_result block
+# (i.e. what _lib_conversation.py would have emitted).
+# ---------------------------------------------------------------------------
+def test_subagent_meta_spawn_without_result_is_title_only():
+    # A spawn tool_use with a null `id` (so the spawn never enters spawn_kind):
+    # produces NO subagent_meta entry — the card degrades to title-only. Also
+    # covers the "result absent" arm: even a kept spawn would title-only when
+    # agent_link has no matching tool_use_id.
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Task", "input_summary": "{}",
+                 "id": None, "preview": "audit", "subagent_type": "Explore"}])
+    out = cq.get_conversation(conn, "s1")
+    assert out["subagent_meta"] == {}        # null id -> not keyed -> no entry
+
+
+def test_subagent_meta_empty_meta_kind_only():
+    # Spawn + result where the toolUseResult carried ONLY agentId (no metric
+    # fields). The `meta or {}` path keys the entry; the entry is just
+    # {kind: ...} with NO total_tokens/total_duration_ms/etc.
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Task", "input_summary": "{}",
+                 "id": "t1", "preview": "audit", "subagent_type": "Explore"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "done", "truncated": False,
+                 "is_error": False, "tool_use_id": "t1",
+                 "agent_id": "aaaa1111", "subagent_meta": {}}])
+    out = cq.get_conversation(conn, "s1")
+    assert out["subagent_meta"] == {"aaaa1111": {"kind": "Explore"}}
+    entry = out["subagent_meta"]["aaaa1111"]
+    assert "total_tokens" not in entry and "total_duration_ms" not in entry
+    assert "total_tool_use_count" not in entry and "status" not in entry
+
+
+def test_subagent_meta_happy_path_and_block_keys_stripped():
+    # Happy path: spawn + result with full meta. subagent_meta[<agent_id>]
+    # carries the kind + every present metric field. The returned items'
+    # tool_call/tool_result blocks must NOT leak the parser-only keys
+    # (subagent_type / agent_id / subagent_meta) — the pop-strip.
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Task", "input_summary": "{}",
+                 "id": "t1", "preview": "audit", "subagent_type": "Explore"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "done", "truncated": False,
+                 "is_error": False, "tool_use_id": "t1",
+                 "agent_id": "aaaa1111",
+                 "subagent_meta": {"total_tokens": 23285,
+                                   "total_duration_ms": 10668,
+                                   "total_tool_use_count": 1,
+                                   "status": "completed"}}])
+    out = cq.get_conversation(conn, "s1")
+    assert out["subagent_meta"] == {"aaaa1111": {
+        "kind": "Explore", "total_tokens": 23285, "total_duration_ms": 10668,
+        "total_tool_use_count": 1, "status": "completed"}}
+    # the spawn folded its result into a tool_call; NO parser-only keys leak on
+    # any block of any item.
+    items = out["items"]
+    turn = next(it for it in items if it["kind"] == "assistant")
+    call = next(b for b in turn["blocks"] if b["kind"] == "tool_call")
+    assert call["result"]["text"] == "done"      # result folded in
+    for it in items:
+        for b in it["blocks"]:
+            assert "subagent_type" not in b
+            assert "agent_id" not in b
+            assert "subagent_meta" not in b

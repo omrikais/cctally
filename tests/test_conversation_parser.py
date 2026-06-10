@@ -283,3 +283,19 @@ def test_empty_subagent_type_and_agentid_treated_absent():
     r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
     tr = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_result"][0]
     assert "agent_id" not in tr
+
+def test_empty_subagent_type_treated_absent():
+    # Directly exercises the SPAWN-side empty-string guard
+    # (`if isinstance(st, str) and st:` in _lib_conversation._blocks_and_text):
+    # an empty `input.subagent_type` must NOT add a subagent_type key to the
+    # tool_use block (the kernel then degrades that card to title-only).
+    fh = _jsonl({"type": "assistant", "uuid": "a1", "sessionId": "s1",
+                 "requestId": "r1", "timestamp": "t",
+                 "message": {"role": "assistant", "id": "m1", "model": "opus",
+                             "content": [{"type": "tool_use", "name": "Task", "id": "tu1",
+                                          "input": {"description": "audit",
+                                                    "subagent_type": ""}}]}})
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    tu = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_use"][0]
+    assert "subagent_type" not in tu
+    assert tu["id"] == "tu1"
