@@ -4,6 +4,7 @@ import { App } from './App';
 import { startSSE } from './store/sse';
 import { installGlobalKeydown, registerKeymap } from './store/keymap';
 import { dispatch, getState } from './store/store';
+import { installUrlRouting } from './store/urlRouting';
 import { triggerSync } from './store/sync';
 import { stepMatch, tryQuit } from './store/actions';
 import { refreshUpdateState } from './store/update';
@@ -35,6 +36,10 @@ refreshUpdateState();
 
 // Install the global keydown listener and the always-on bindings.
 installGlobalKeydown();
+// Install conversation URL deep-linking (#169): boot from the hash, then keep
+// the hash and the store in sync. Module-scoped like installGlobalKeydown, so
+// StrictMode's double-mount cannot double-install.
+installUrlRouting();
 // All digit/letter globals are guarded against modals layered in their
 // own root (`update.modalOpen`, `doctorModalOpen`) so a keystroke
 // behind one of those modals doesn't dispatch a parallel panel modal
