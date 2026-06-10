@@ -262,9 +262,10 @@ def build(scenario: str) -> None:
             ),
             cwd=s1_cwd, git_branch="main",
         )
-        # id=4: assistant turn (m1,r1) — fragment 2, prose-bearing. Carries the
+        # id=5: assistant turn (m1,r1) — fragment 2, prose-bearing. Carries the
         # distinctive search term. This fragment is the turn's canonical anchor.
-        # byte_offset=3 (after the inserted tool_result at offset 2).
+        # (byte_offset is arbitrary-but-unique per file; the reader orders by
+        # timestamp_utc, id — both tool_result rows tr1/tr_fx precede this row.)
         _insert_message(
             cache_conn,
             session_id="s1", uuid="a1b", parent_uuid="a1a",
@@ -280,7 +281,7 @@ def build(scenario: str) -> None:
             model=MODEL, msg_id="m1", req_id="r1",
             cwd=s1_cwd, git_branch="main",
         )
-        # id=4: REPLAY of the prose fragment in the resume file (b.jsonl). Same
+        # id=6: REPLAY of the prose fragment in the resume file (b.jsonl). Same
         # (session_id, uuid)=(s1, a1b) + same (msg_id, req_id)=(m1, r1) but a
         # distinct (source_path, byte_offset) so it does not collide. The
         # reader dedups it by uuid, the cost join counts it once, and search
