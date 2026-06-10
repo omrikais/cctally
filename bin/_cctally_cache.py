@@ -183,8 +183,8 @@ _CONV_INSERT_SQL = (
     "INSERT OR IGNORE INTO conversation_messages"
     "(session_id,uuid,parent_uuid,source_path,byte_offset,"
     " timestamp_utc,entry_type,text,blocks_json,model,msg_id,"
-    " req_id,cwd,git_branch,is_sidechain)"
-    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    " req_id,cwd,git_branch,is_sidechain,source_tool_use_id)"
+    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 
@@ -194,6 +194,7 @@ def _conv_row_tuple(m, path_str):
         m.session_id, m.uuid, m.parent_uuid, path_str, m.byte_offset,
         m.timestamp_utc, m.entry_type, m.text, m.blocks_json, m.model,
         m.msg_id, m.req_id, m.cwd, m.git_branch, m.is_sidechain,
+        m.source_tool_use_id,
     )
 
 

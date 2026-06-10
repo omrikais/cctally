@@ -2331,6 +2331,7 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             cwd           TEXT,
             git_branch    TEXT,
             is_sidechain  INTEGER NOT NULL DEFAULT 0,
+            source_tool_use_id TEXT,
             UNIQUE(source_path, byte_offset)
         );
         CREATE INDEX IF NOT EXISTS idx_conv_session_ts
@@ -2383,6 +2384,11 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     # populated lazily in sync_cache() / _ensure_session_files_row().
     add_column_if_missing(conn, "session_files", "session_id", "TEXT")
     add_column_if_missing(conn, "session_files", "project_path", "TEXT")
+    # Existing-DB guard for the skill-content fold link (cctally-dev
+    # skill-content-nesting): the message-level sourceToolUseID. Idempotent
+    # column-add (no marker, no version); cache migration 006 then re-ingests
+    # so the value actually lands on historical rows.
+    add_column_if_missing(conn, "conversation_messages", "source_tool_use_id", "TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
         "ON session_files(session_id)"
