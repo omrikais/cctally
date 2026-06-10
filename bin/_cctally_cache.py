@@ -619,9 +619,14 @@ def sync_cache(
             # (idempotent but wasteful) clear+backfill pass. #166 migration 004
             # also sets this same flag (to land the subagent kind/meta fields);
             # the rebuild re-derives those fields via the same offset-0 walk, so
-            # dropping the flag here covers the 004 reingest too.
+            # dropping the flag here covers the 004 reingest too. Migration 006
+            # sets the DISTINCT conversation_source_tool_use_reingest_pending
+            # flag (to land source_tool_use_id); the same offset-0 walk re-derives
+            # it, so drop that flag here as well to avoid a redundant pass.
             conn.execute(
-                "DELETE FROM cache_meta WHERE key='conversation_reingest_pending'")
+                "DELETE FROM cache_meta WHERE key IN "
+                "('conversation_reingest_pending',"
+                " 'conversation_source_tool_use_reingest_pending')")
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Claude cached entries")
 
