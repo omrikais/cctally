@@ -76,7 +76,11 @@ export function useConversation(sessionId: string | null): UseConversation {
         return false;
       }
       if (sessionRef.current !== sid) return false;  // session changed mid-fetch — drop this stale page
-      setDetailSynced((prev) => (prev ? { ...prev, items: [...prev.items, ...body.items], page: body.page } : body));
+      // #166: keep the whole-session subagent_meta map across paged appends —
+      // every page carries it, but fall back to the prior page's map so a later
+      // page never drops it. The first-load path stores the full body already.
+      setDetailSynced((prev) => (prev ? { ...prev, items: [...prev.items, ...body.items], page: body.page,
+        subagent_meta: body.subagent_meta ?? prev.subagent_meta } : body));
       nextAfterRef.current = body.page.next_after;
       return body.page.next_after != null;
     } finally {

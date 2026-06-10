@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Conversation reader: subagent thread cards now show the subagent's kind (`SUBAGENT · <kind>`) and its result meta (tokens, duration, tool count, status) on modern transcripts; old transcripts keep the title-only card (#166).
+
 ## [1.31.1] - 2026-06-09
 
 ### Added

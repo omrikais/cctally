@@ -369,6 +369,7 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
                   subagentKey={g.subagentKey}
                   items={g.items}
                   nested={g.nested}
+                  meta={detail.subagent_meta?.[g.subagentKey]}
                   getItemRef={getItemRef}
                   forceOpen={detail.session_id === sessionId && g.subagentKey === forcedOpenKey}
                   riseClassName={riseClass}

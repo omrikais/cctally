@@ -80,6 +80,25 @@ describe('ConversationReader', () => {
     expect(groups[1].querySelector('summary')!.textContent).toContain('Audit B');
   });
 
+  it('threads subagent_meta from the detail payload into the subagent card (#166)', async () => {
+    // A main human + one subagent thread keyed "aaaa1111", with a top-level
+    // subagent_meta map. The reader must hand the matching entry to the
+    // SidechainGroup, which surfaces the kind in the eyebrow — catching a broken
+    // ConversationReader → SidechainGroup hand-off, not just the child unit.
+    mockFetchOnce({
+      ...detail([
+        makeItem({ uuid: 'h1' }),
+        makeItem({ uuid: 'a1', is_sidechain: true, subagent_key: 'aaaa1111', text: 'Audit A' } as never),
+        makeItem({ uuid: 'a2', is_sidechain: true, subagent_key: 'aaaa1111' } as never),
+      ]),
+      subagent_meta: { aaaa1111: { kind: 'Explore', total_tokens: 1, status: 'completed' } },
+    });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('.conv-reader-body')).not.toBeNull());
+    await waitFor(() =>
+      expect(document.querySelector('.conv-sidechain-kindname')!.textContent).toContain('Explore'));
+  });
+
   it('jumps to a target message: pages until loaded, scrolls, and flashes the highlight', async () => {
     // Page 1 has h1 only, with more to come; page 2 carries the target.
     mockFetchOnce(detail([makeItem({ uuid: 'h1' })], 2));

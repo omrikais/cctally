@@ -5375,6 +5375,22 @@ mark.current {
   color: var(--text-dim);
 }
 .conv-sidechain-cost { color: var(--accent-green); }
+/* #166: the subagent kind in the eyebrow ("SUBAGENT · Explore") — the parent
+   eyebrow is uppercased, so reset the kind name to its natural case. */
+.conv-sidechain-kindname { text-transform: none; color: var(--accent-magenta); }
+/* #166: dim second meta line under the title — tokens / duration / tool count /
+   status, mono, spaced. */
+.conv-sidechain-submeta {
+  display: block;
+  margin-top: 3px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+.conv-sidechain-submeta > span { margin-right: 9px; }
+.conv-subagent-ok   { color: var(--accent-green); }
+.conv-subagent-err  { color: var(--accent-red, #f87171); }
+.conv-subagent-warn { color: var(--accent-amber, #fbbf24); }
 .conv-sidechain[open] > summary .conv-chev { transform: rotate(45deg); }
 
 /* nested turn stream — its OWN spine + small role dots (D3) */

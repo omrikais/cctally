@@ -254,6 +254,16 @@ export const fmt = {
     const m = ((v % 3600) / 60) | 0;
     return `${h}h ${pad2(m)}m`;
   },
+  // #166: subagent wall-clock. Sub-minute -> "10.7s"; >= 60s -> "2m 5s"
+  // (trailing "0s" dropped). Distinct from hhmm (seconds -> "Xh YYm").
+  durationMs(v: number | null | undefined): string {
+    if (v == null || !isFinite(v)) return '—';
+    const s = v / 1000;
+    if (s < 60) return `${s.toFixed(1)}s`;
+    const m = Math.floor(s / 60);
+    const rem = Math.round(s - m * 60);
+    return rem ? `${m}m ${rem}s` : `${m}m`;
+  },
   ddhh(v: number | null | undefined): string {
     if (v == null) return '—';
     const d = (v / 86400) | 0;

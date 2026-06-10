@@ -67,7 +67,10 @@ describe('SidechainGroup', () => {
       member('s2', { kind: 'assistant', text: '', model: 'claude-opus-4', cost_usd: 0.12 } as Partial<ConversationItem>),
     ];
     render(<SidechainGroup subagentKey="aaaa1111" items={items} nested={false} />);
-    expect(screen.getByText('Subagent')).toBeInTheDocument();      // static eyebrow (Q1)
+    // The eyebrow leads with the static "Subagent" word (Q1). With no meta it
+    // is the whole eyebrow text (no kindname child). Class-based, not getByText,
+    // since the kind span becomes a child when meta is present.
+    expect(document.querySelector('.conv-sidechain-kind')!.textContent).toBe('Subagent');
     expect(document.querySelector('.conv-sidechain-title')).toBeTruthy();
     expect(document.querySelector('.conv-sidechain-head .conv-chev')).toBeTruthy();
     expect(screen.getByText(`${items.length} msgs`)).toBeInTheDocument();
@@ -75,6 +78,52 @@ describe('SidechainGroup', () => {
     const glyph = document.querySelector('.conv-sidechain-glyph')!;
     expect(glyph.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
     expect(glyph.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
+  });
+
+  it('renders the kind in the eyebrow when meta.kind is present', () => {
+    const items = [member('r', { kind: 'assistant', text: 'Audit module A', cost_usd: 0.30 } as Partial<ConversationItem>)];
+    render(<SidechainGroup subagentKey="aaaa1111" items={items} nested={false}
+             meta={{ kind: 'Explore', total_tokens: 23285, total_duration_ms: 10668,
+                     total_tool_use_count: 1, status: 'completed' }} />);
+    expect(document.querySelector('.conv-sidechain-kindname')!.textContent).toContain('Explore');
+  });
+
+  it('renders the toolUseResult meta line', () => {
+    const items = [member('r', { kind: 'assistant', text: 'Audit module A', cost_usd: 0.30 } as Partial<ConversationItem>)];
+    render(<SidechainGroup subagentKey="aaaa1111" items={items} nested={false}
+             meta={{ kind: 'Explore', total_tokens: 23285, total_duration_ms: 10668,
+                     total_tool_use_count: 1, status: 'completed' }} />);
+    const sub = document.querySelector('.conv-sidechain-submeta')!;
+    expect(sub.textContent).toContain('23.3k tok');
+    expect(sub.textContent).toContain('10.7s');
+    expect(sub.textContent).toContain('1 tool');
+    expect(sub.querySelector('.conv-subagent-ok')).toBeTruthy();  // ✓ for completed
+  });
+
+  it('spells out a failure status with the error class', () => {
+    const items = [member('r', { kind: 'assistant', text: 'Audit module B', cost_usd: 0.30 } as Partial<ConversationItem>)];
+    render(<SidechainGroup subagentKey="bbbb2222" items={items} nested={false}
+             meta={{ kind: 'code-reviewer', status: 'error' }} />);
+    const err = document.querySelector('.conv-subagent-err')!;
+    expect(err.textContent).toContain('error');
+  });
+
+  it('falls back to title-only when meta is absent (no kind, no submeta line)', () => {
+    const items = [member('r', { kind: 'assistant', text: 'Audit module C', cost_usd: 0.30 } as Partial<ConversationItem>)];
+    render(<SidechainGroup subagentKey="cccc3333" items={items} nested={false} />);
+    expect(document.querySelector('.conv-sidechain-kindname')).toBeNull();
+    expect(document.querySelector('.conv-sidechain-submeta')).toBeNull();
+    expect(document.querySelector('.conv-sidechain-kind')!.textContent).toBe('Subagent');
+  });
+
+  it('pluralizes the tool count (0 tools / 2 tools)', () => {
+    const items = [member('r', { kind: 'assistant', text: 'x', cost_usd: 0 } as Partial<ConversationItem>)];
+    const { rerender } = render(<SidechainGroup subagentKey="k" items={items} nested={false}
+             meta={{ kind: 'Explore', total_tool_use_count: 0 }} />);
+    expect(document.querySelector('.conv-sidechain-submeta')!.textContent).toContain('0 tools');
+    rerender(<SidechainGroup subagentKey="k" items={items} nested={false}
+             meta={{ kind: 'Explore', total_tool_use_count: 2 }} />);
+    expect(document.querySelector('.conv-sidechain-submeta')!.textContent).toContain('2 tools');
   });
 
   it('applies conv-sidechain--force only while forceOpen (G1 §4a #160 instant-open)', () => {

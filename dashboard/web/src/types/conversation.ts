@@ -75,6 +75,18 @@ export interface ConversationsPage {
   page: { next_offset: number | null; has_more: boolean };
 }
 
+// #166: per-subagent kind + toolUseResult meta, keyed by subagent_key (the same
+// agent-file hash the reader groups subagent threads on). Whole-session, present
+// on every page (empty case is `{}`). Old transcripts produce no entry for a
+// given key → the card falls back to its title-only rendering.
+export interface SubagentMeta {
+  kind: string;
+  total_tokens?: number;
+  total_duration_ms?: number;
+  total_tool_use_count?: number;
+  status?: string;
+}
+
 export interface ConversationDetail {
   session_id: string;
   project_label: string;
@@ -85,6 +97,7 @@ export interface ConversationDetail {
   models: string[];
   items: ConversationItem[];
   page: { next_after: number | null; has_more: boolean };
+  subagent_meta?: Record<string, SubagentMeta>;  // keyed by subagent_key (#166)
 }
 
 export interface SearchHit {

@@ -240,6 +240,8 @@ hardened to `0600` at the end of the `sync_cache` write transaction. The chmod
 is best-effort: a failure (e.g. an exotic filesystem) logs and continues rather
 than aborting.
 
+**Subagent thread cards (#166).** On modern transcripts the reader surfaces a subagent's *kind* in the thread-card eyebrow (`SUBAGENT · <kind>`, e.g. `SUBAGENT · Explore`) and a dim second line with its result meta — tokens, wall-clock duration, tool-use count, and status (a bare `✓` on success; `✕ error` or `⚠ <status>` spelled out on failure). The kind and meta come from the spawn `Task`/`Agent` `subagent_type` joined to the record-level `toolUseResult` in the query kernel. Older transcripts that predate the capture lack the linkage, so their cards gracefully fall back to the title-only rendering.
+
 ## Shutdown
 
 `Ctrl-C` in the terminal where you launched the dashboard. The server

@@ -2,9 +2,22 @@ import { useEffect, useState } from 'react';
 import { MessageItem } from './MessageItem';
 import { SubagentIcon } from './ConvIcons';
 import { fmt } from '../lib/fmt';
-import type { ConversationItem } from '../types/conversation';
+import type { ConversationItem, SubagentMeta } from '../types/conversation';
 
 const LABEL_MAX = 60;
+
+// #166: subagent result status badge. Always a bare ✓ on the happy path (the
+// word "completed" would be noise); the word is spelled out only on failure
+// (✕ error) or any other non-completed terminal state (⚠ <status>). null when
+// the result carried no status field.
+function statusBadge(status?: string) {
+  if (status == null) return null;
+  if (status === 'completed')
+    return <span className="conv-subagent-ok" aria-label="completed" title="completed">✓</span>;
+  if (status === 'error')
+    return <span className="conv-subagent-err">✕ error</span>;
+  return <span className="conv-subagent-warn">⚠ {status}</span>;
+}
 
 // First non-blank line of the subagent's task prompt (its root message text),
 // trimmed + truncated; falls back to the subagent hash when the root has no
@@ -32,6 +45,7 @@ export function SidechainGroup({
   subagentKey,
   items,
   nested,
+  meta,
   getItemRef,
   forceOpen = false,
   riseClassName = '',
@@ -40,6 +54,9 @@ export function SidechainGroup({
   subagentKey: string;
   items: ConversationItem[];
   nested: boolean;
+  // #166: the subagent's kind + result meta, keyed off subagent_key by the
+  // reader. Absent on old transcripts → the card degrades to title-only.
+  meta?: SubagentMeta;
   getItemRef?: (item: ConversationItem) => (el: HTMLDivElement | null) => void;
   forceOpen?: boolean;
   // G1 §4b load-in: the reader's render-time classifier passes `conv-rise`
@@ -79,8 +96,21 @@ export function SidechainGroup({
       <summary className="conv-sidechain-head">
         <span className="conv-sidechain-glyph" aria-hidden="true"><SubagentIcon /></span>
         <span className="conv-sidechain-headtext">
-          <span className="conv-sidechain-kind">Subagent</span>
+          <span className="conv-sidechain-kind">
+            Subagent{meta?.kind ? <span className="conv-sidechain-kindname"> · {meta.kind}</span> : null}
+          </span>
           <span className="conv-sidechain-title">{label}</span>
+          {meta && (meta.total_tokens != null || meta.total_duration_ms != null
+                    || meta.total_tool_use_count != null || meta.status != null) && (
+            <span className="conv-sidechain-submeta">
+              {meta.total_tokens != null && <span>{fmt.compact(meta.total_tokens)} tok</span>}
+              {meta.total_duration_ms != null && <span>{fmt.durationMs(meta.total_duration_ms)}</span>}
+              {meta.total_tool_use_count != null && (
+                <span>{meta.total_tool_use_count} {meta.total_tool_use_count === 1 ? 'tool' : 'tools'}</span>
+              )}
+              {statusBadge(meta.status)}
+            </span>
+          )}
         </span>
         <span className="conv-sidechain-meta">
           {models.length > 0 && <span className="conv-sidechain-model">{models.join(', ')}</span>}
