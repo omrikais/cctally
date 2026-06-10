@@ -14,11 +14,12 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 13 known
   · 012_unify_budget_milestones_vendor             pending
   · 013_test_failure_injection                     pending
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 4 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 5 known
   · 001_dedup_highest_wins                         pending
   · 002_conversation_messages_backfill             pending
   · 003_conversation_reingest_tool_ids             pending
-  · 004_test_cache_migration                       pending
+  · 004_conversation_reingest_subagent_kind        pending
+  · 005_test_cache_migration                       pending
 ## stderr
 
 ## exit

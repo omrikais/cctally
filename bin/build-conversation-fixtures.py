@@ -58,6 +58,7 @@ Run: ``bin/build-conversation-fixtures.py`` (idempotent; overwrites).
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -302,7 +303,15 @@ def build(scenario: str) -> None:
             source_path=s3_main, byte_offset=1,
             timestamp_utc="2026-06-03T00:00:01Z",
             entry_type="assistant", text="spawning two audits in parallel",
-            blocks_json='[{"kind": "text", "text": "spawning two audits in parallel"}]',
+            blocks_json=json.dumps([
+                {"kind": "text", "text": "spawning two audits in parallel"},
+                {"kind": "tool_use", "name": "Task",
+                 "input_summary": '{"description":"Audit module A","subagent_type":"Explore"}',
+                 "id": "toolu_a", "preview": "Audit module A", "subagent_type": "Explore"},
+                {"kind": "tool_use", "name": "Agent",
+                 "input_summary": '{"description":"Audit module B","subagent_type":"code-reviewer"}',
+                 "id": "toolu_b", "preview": "Audit module B", "subagent_type": "code-reviewer"},
+            ]),
             model=MODEL, msg_id="m3", req_id="r3",
             cwd=s3_cwd, git_branch="main",
         )
@@ -358,6 +367,34 @@ def build(scenario: str) -> None:
             entry_type="assistant", text="module C needs a follow-up",
             blocks_json='[{"kind": "text", "text": "module C needs a follow-up"}]',
             model=MODEL, msg_id="mc", req_id="rc", is_sidechain=1,
+        )
+        # Two spawn-result tool_result rows on the MAIN file carrying the #166
+        # record-level toolUseResult linkage: tool_use_id matches s3a1's spawn
+        # ids; agent_id matches subagent_keys aaaa1111 / bbbb2222 (A completed,
+        # B error). Subagent C (cccc3333) gets NO linkage -> title-only fallback.
+        _insert_message(
+            cache_conn, session_id="s3", uuid="tr_a", parent_uuid="s3a1",
+            source_path=s3_main, byte_offset=2,
+            timestamp_utc="2026-06-03T00:00:08Z",
+            entry_type="tool_result",
+            blocks_json=json.dumps([{"kind": "tool_result", "text": "module A audited",
+                "truncated": False, "is_error": False, "tool_use_id": "toolu_a",
+                "agent_id": "aaaa1111",
+                "subagent_meta": {"total_tokens": 23285, "total_duration_ms": 10668,
+                                  "total_tool_use_count": 1, "status": "completed"}}]),
+            cwd=s3_cwd, git_branch="main",
+        )
+        _insert_message(
+            cache_conn, session_id="s3", uuid="tr_b", parent_uuid="s3a1",
+            source_path=s3_main, byte_offset=3,
+            timestamp_utc="2026-06-03T00:00:09Z",
+            entry_type="tool_result",
+            blocks_json=json.dumps([{"kind": "tool_result", "text": "module B FAILED",
+                "truncated": False, "is_error": True, "tool_use_id": "toolu_b",
+                "agent_id": "bbbb2222",
+                "subagent_meta": {"total_tokens": 5120, "total_duration_ms": 4200,
+                                  "total_tool_use_count": 0, "status": "error"}}]),
+            cwd=s3_cwd, git_branch="main",
         )
         # session_entries so the parallel + nested turns have non-zero cost.
         seed_session_entry(cache_conn, source_path=s3_main, line_offset=1,

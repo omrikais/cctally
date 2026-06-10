@@ -26,6 +26,13 @@ Per-migration goldens (lazy-adopted; one pair per migration that ships them):
     conversation_reingest_pending flag + the 003 marker (flag-only handler — the
     clear+backfill run later in sync_cache under the flock). Loaded by
     tests/test_migration_003_per_migration_goldens.py.
+  - per-migration/004_conversation_reingest_subagent_kind/{pre,post}.sqlite —
+    cache.db pre/post for the #166 subagent-kind re-ingest. pre = existing
+    install with 003 applied and an id-aware-but-kind-less conversation_messages
+    row; post = the row UNCHANGED plus the conversation_reingest_pending flag
+    (reused from 003) + the 004 marker (flag-only handler — the clear+backfill
+    run later in sync_cache under the flock). Loaded by
+    tests/test_migration_004_per_migration_goldens.py.
   - per-migration/008_recompute_weekly_cost_snapshots_dedup_fix/{pre,pre-cache,post}.sqlite
     — paired stats+cache fixture for the ccusage-parity historical recompute.
     Loaded by tests/test_migration_008_per_migration_goldens.py.
@@ -1480,6 +1487,125 @@ def build_per_migration_003_conversation_reingest_tool_ids(
     _build_post(pre, post)
 
 
+def build_per_migration_004_conversation_reingest_subagent_kind(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for cache migration
+    ``004_conversation_reingest_subagent_kind`` (#166).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — full production cache schema (via
+        ``_apply_cache_schema``), a ``schema_migrations`` table carrying the
+        ``003_conversation_reingest_tool_ids`` marker (003 already applied) but
+        NOT 004, and a single ``conversation_messages`` row carrying an id-aware
+        tool_use block but WITHOUT the #166 ``subagent_type`` field (the
+        post-#164/pre-#166 shape of an existing install). This is the
+        existing-install shape before the subagent-kind re-ingest.
+      * ``post.sqlite`` — same DB after running the production 004 handler.
+        Because 004 is FLAG-ONLY (it reuses 003's ``conversation_reingest_pending``
+        flag; the destructive clear + offset-0 re-ingest run later in
+        ``sync_cache`` under the ``cache.db.lock`` flock, NOT in the handler),
+        post.sqlite carries the row UNCHANGED, plus
+        ``cache_meta('conversation_reingest_pending','1')`` and the 004 marker
+        stamped.
+
+    Loaded by ``tests/test_migration_004_per_migration_goldens.py``. Mirrors
+    the 003 per-migration builder (flag-only handler, marker pinned).
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    # An id-aware tool_use block carrying NO subagent_type — the
+    # post-#164/pre-#166 stored shape (has "id"/"preview", lacks the #166 field).
+    import json as _json
+    _PRE166_BLOCKS = _json.dumps(
+        [{"kind": "tool_use", "name": "Read", "input_summary": "{}",
+          "id": "toolu_x", "preview": "/a/b.py"}],
+        separators=(",", ":"),
+    )
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _cctally, db = _load_cctally()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            # 003 already applied — this is an existing install that has the
+            # id-aware re-ingest but not yet the #166 subagent-kind one.
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) VALUES (?, ?)",
+                ("003_conversation_reingest_tool_ids", "2026-04-30T12:00:00Z"),
+            )
+            # One existing id-aware-but-kind-less conversation row.
+            conn.execute(
+                "INSERT INTO conversation_messages "
+                "(session_id,uuid,source_path,byte_offset,timestamp_utc,"
+                " entry_type,text,blocks_json,model,msg_id,req_id,is_sidechain) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("s1", "a1", "/fake/.claude/projects/-Users-u-proj/sess.jsonl",
+                 0, "2026-04-15T15:00:00Z", "assistant", "",
+                 _PRE166_BLOCKS, "claude-opus-4-7", "m1", "r1", 0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _cctally, db = _load_cctally()
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "004_conversation_reingest_subagent_kind":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit("004_conversation_reingest_subagent_kind not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Flag-only handler: sets conversation_reingest_pending, leaves the
+            # conversation_messages row UNCHANGED (the clear is deferred to
+            # sync_cache). Then stamp the marker centrally (the dispatcher owns
+            # the stamp per #140) with a PINNED timestamp so the committed
+            # golden is rebuild-deterministic.
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("004_conversation_reingest_subagent_kind", "2026-04-30T12:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -1502,6 +1628,9 @@ def main() -> int:
     )
     build_per_migration_003_conversation_reingest_tool_ids(
         FIXTURES_ROOT / "per-migration" / "003_conversation_reingest_tool_ids"
+    )
+    build_per_migration_004_conversation_reingest_subagent_kind(
+        FIXTURES_ROOT / "per-migration" / "004_conversation_reingest_subagent_kind"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

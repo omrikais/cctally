@@ -355,6 +355,37 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
             if etype == "assistant":             # null-msg_id assistant: index its uses too
                 _index_tool_uses(it)
 
+    # ---- Subagent-kind correlation (#166); MUST run before Phase 2 fold ----
+    # Reads AND strips (pop) the parser-only keys in one pass, so the returned
+    # tool_call/tool_result block shapes are unchanged — the only new output is
+    # the top-level subagent_meta map (no undocumented block keys leak). Join is
+    # spawn tool_use id <-> tool_result tool_use_id; agent_id == subagent_key.
+    spawn_kind = {}     # tool_use id -> subagent_type
+    agent_link = {}     # tool_use id -> (agent_id, raw_meta)
+    for it in items:
+        for b in it["blocks"]:
+            k = b.get("kind")
+            if k == "tool_use":
+                st = b.pop("subagent_type", None)
+                if st and b.get("id") is not None:
+                    spawn_kind[b["id"]] = st
+            elif k == "tool_result":
+                aid = b.pop("agent_id", None)
+                meta = b.pop("subagent_meta", None)
+                if aid and b.get("tool_use_id") is not None:
+                    agent_link[b["tool_use_id"]] = (aid, meta or {})
+    subagent_meta = {}
+    for _tuid, _kind in spawn_kind.items():
+        _link = agent_link.get(_tuid)
+        if _link is None:
+            continue                       # spawn with no (yet) result -> title-only
+        _aid, _raw = _link
+        _entry = {"kind": _kind}
+        for _f in ("total_tokens", "total_duration_ms", "total_tool_use_count", "status"):
+            if _raw.get(_f) is not None:
+                _entry[_f] = _raw[_f]
+        subagent_meta[_aid] = _entry       # agent_id == subagent_key
+
     # ---- Phase 2: fold each tool_result item into its owning assistant item ----
     drop = set()                                 # id() of folded placeholder items
     for tr in tool_result_items:
@@ -436,6 +467,7 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                 "cost_usd": header_cost,
                 "models": sorted({r[6] for r in logical if r[6]}),
                 "items": [],
+                "subagent_meta": subagent_meta,
                 "page": {"next_after": None, "has_more": False},
             }
     page = items[start:start + limit]
@@ -460,6 +492,7 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
         "cost_usd": header_cost,
         "models": models,
         "items": page,
+        "subagent_meta": subagent_meta,
         "page": {"next_after": next_after, "has_more": has_more},
     }
 

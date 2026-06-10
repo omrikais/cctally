@@ -615,7 +615,10 @@ def sync_cache(
             # Issue #164: a rebuild also clears + repopulates the message index
             # id-aware via the normal offset-0 walk, so drop the 003 reingest
             # flag too — the post-rebuild sync must not run a redundant
-            # (idempotent but wasteful) clear+backfill pass.
+            # (idempotent but wasteful) clear+backfill pass. #166 migration 004
+            # also sets this same flag (to land the subagent kind/meta fields);
+            # the rebuild re-derives those fields via the same offset-0 walk, so
+            # dropping the flag here covers the 004 reingest too.
             conn.execute(
                 "DELETE FROM cache_meta WHERE key='conversation_reingest_pending'")
             conn.commit()
@@ -666,7 +669,11 @@ def sync_cache(
             # storm-free (#138); the offset-0 backfill walks every JSONL from 0;
             # the flag is dropped LAST so a crash mid-walk re-runs cleanly on the
             # next sync. Never on the rebuild path (which already wipes +
-            # repopulates the index id-aware via the normal walk).
+            # repopulates the index id-aware via the normal walk). #166 migration
+            # 004 reuses this SAME flag (to land the spawn subagent_type + the
+            # record-level toolUseResult agentId/meta on existing history): the
+            # offset-0 backfill re-parses every JSONL through the current parser,
+            # so those fields land here with zero new consumption code.
             try:
                 _reingest = conn.execute(
                     "SELECT 1 FROM cache_meta "

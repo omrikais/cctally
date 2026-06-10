@@ -3009,6 +3009,23 @@ def _003_conversation_reingest_tool_ids(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@cache_migration("004_conversation_reingest_subagent_kind")
+def _004_conversation_reingest_subagent_kind(conn: sqlite3.Connection) -> None:
+    """Flag-only re-ingest of conversation_messages so the spawn ``subagent_type``
+    and the record-level ``toolUseResult`` agentId/meta land on existing history
+    (#166). REUSES 003's ``conversation_reingest_pending`` flag — sync_cache
+    already consumes it (clear + offset-0 backfill under the cache.db.lock flock),
+    and the offset-0 walk re-parses every JSONL through the current parser, so the
+    new fields land with zero new consumption code. A distinct ``schema_migrations``
+    marker is what triggers this reingest on an existing install that already has
+    003 applied; the flag is the generic 'conversation index needs a full
+    clear+reingest' signal. Central stamp via the dispatcher (issue #140); a fresh
+    install stamps it without running (empty table -> the flag, if ever set, is a
+    harmless no-op)."""
+    _set_cache_meta(conn, "conversation_reingest_pending", "1")
+    conn.commit()
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")

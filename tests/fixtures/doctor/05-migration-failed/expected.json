@@ -150,7 +150,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 3,
+                            "registry_size": 4,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -173,7 +173,8 @@
                                 "pending": [
                                     "001_dedup_highest_wins",
                                     "002_conversation_messages_backfill",
-                                    "003_conversation_reingest_tool_ids"
+                                    "003_conversation_reingest_tool_ids",
+                                    "004_conversation_reingest_subagent_kind"
                                 ],
                                 "skipped": []
                             },
@@ -269,13 +270,17 @@
                             [
                                 "cache.db",
                                 "003_conversation_reingest_tool_ids"
+                            ],
+                            [
+                                "cache.db",
+                                "004_conversation_reingest_subagent_kind"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "14 pending",
+                    "summary": "15 pending",
                     "title": "Pending migrations"
                 }
             ],

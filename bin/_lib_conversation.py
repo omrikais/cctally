@@ -91,6 +91,7 @@ def _normalize(obj, t, offset):
         entry_type = ASSISTANT
     elif any(b["kind"] == "tool_result" for b in blocks):
         entry_type = TOOL_RESULT
+        _attach_subagent_result(blocks, obj)   # #166: record-level toolUseResult
         # tool_result rows are stored but NOT indexed as prose (spec §2). A
         # user line that mixes a text block with a tool_result block must not
         # leak that text into the FTS index; the full content stays in
@@ -135,10 +136,15 @@ def _blocks_and_text(content):
             elif bt == "thinking":
                 blocks.append({"kind": "thinking", "text": b.get("thinking", "") or ""})
             elif bt == "tool_use":
-                blocks.append({"kind": "tool_use", "name": b.get("name"),
-                               "input_summary": _summarize(b.get("input")),
-                               "id": b.get("id"),
-                               "preview": tool_preview(b.get("name"), b.get("input"))})
+                block = {"kind": "tool_use", "name": b.get("name"),
+                         "input_summary": _summarize(b.get("input")),
+                         "id": b.get("id"),
+                         "preview": tool_preview(b.get("name"), b.get("input"))}
+                inp = b.get("input")
+                st = inp.get("subagent_type") if isinstance(inp, dict) else None
+                if isinstance(st, str) and st:        # #166: spawn kind (Agent/Task)
+                    block["subagent_type"] = st
+                blocks.append(block)
             elif bt == "tool_result":
                 raw = _stringify(b.get("content"))
                 blocks.append({"kind": "tool_result", "text": raw[:_TOOL_RESULT_CAP],
@@ -150,6 +156,43 @@ def _blocks_and_text(content):
             elif bt == "tool_reference":
                 blocks.append({"kind": "tool_reference", "name": b.get("name")})
     return blocks, "\n".join(t for t in texts if t)
+
+
+_SUBAGENT_META_KEYS = (
+    ("totalTokens", "total_tokens"),
+    ("totalDurationMs", "total_duration_ms"),
+    ("totalToolUseCount", "total_tool_use_count"),
+    ("status", "status"),
+)
+
+
+def _attach_subagent_result(blocks, obj):
+    """Attach the record-level ``toolUseResult`` agentId + meta (#166) onto the
+    tool_result block, but ONLY when the record carries exactly one tool_result
+    block — the unambiguous subagent-spawn result shape. Zero or >1 tool_result
+    blocks: no-op (the kernel then degrades that subagent card to title-only).
+    The kind (subagent_type) is captured separately on the spawn tool_use block;
+    the kernel joins the two on tool_use_id. ``agentId`` == the subagent file's
+    ``_subagent_key``. Meta keys are normalized to snake_case here so the kernel
+    stays a pure pass-through (same posture as is_error / tool_use_id)."""
+    tur = obj.get("toolUseResult")
+    if not isinstance(tur, dict):
+        return
+    agent_id = tur.get("agentId")
+    if not isinstance(agent_id, str) or not agent_id:
+        return
+    results = [b for b in blocks if b.get("kind") == "tool_result"]
+    if len(results) != 1:
+        return
+    block = results[0]
+    block["agent_id"] = agent_id
+    meta = {}
+    for src, dst in _SUBAGENT_META_KEYS:
+        v = tur.get(src)
+        if v is not None:
+            meta[dst] = v
+    if meta:
+        block["subagent_meta"] = meta
 
 
 def _stringify(c):

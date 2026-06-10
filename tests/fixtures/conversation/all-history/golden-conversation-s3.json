@@ -29,13 +29,39 @@
         {
           "kind": "text",
           "text": "spawning two audits in parallel"
+        },
+        {
+          "input_summary": "{\"description\":\"Audit module A\",\"subagent_type\":\"Explore\"}",
+          "kind": "tool_call",
+          "name": "Task",
+          "preview": "Audit module A",
+          "result": {
+            "is_error": false,
+            "text": "module A audited",
+            "truncated": false
+          },
+          "tool_use_id": "toolu_a"
+        },
+        {
+          "input_summary": "{\"description\":\"Audit module B\",\"subagent_type\":\"code-reviewer\"}",
+          "kind": "tool_call",
+          "name": "Agent",
+          "preview": "Audit module B",
+          "result": {
+            "is_error": true,
+            "text": "module B FAILED",
+            "truncated": false
+          },
+          "tool_use_id": "toolu_b"
         }
       ],
       "cost_usd": 0.0075,
       "is_sidechain": false,
       "kind": "assistant",
       "member_uuids": [
-        "s3a1"
+        "s3a1",
+        "tr_a",
+        "tr_b"
       ],
       "model": "claude-opus-4-8",
       "parent_uuid": "s3h1",
@@ -155,7 +181,7 @@
       "ts": "2026-06-03T00:00:06Z"
     }
   ],
-  "last_activity_utc": "2026-06-03T00:00:07Z",
+  "last_activity_utc": "2026-06-03T00:00:09Z",
   "models": [
     "claude-opus-4-8"
   ],
@@ -165,5 +191,21 @@
   },
   "project_label": "proj",
   "session_id": "s3",
-  "started_utc": "2026-06-03T00:00:00Z"
+  "started_utc": "2026-06-03T00:00:00Z",
+  "subagent_meta": {
+    "aaaa1111": {
+      "kind": "Explore",
+      "status": "completed",
+      "total_duration_ms": 10668,
+      "total_tokens": 23285,
+      "total_tool_use_count": 1
+    },
+    "bbbb2222": {
+      "kind": "code-reviewer",
+      "status": "error",
+      "total_duration_ms": 4200,
+      "total_tokens": 5120,
+      "total_tool_use_count": 0
+    }
+  }
 }

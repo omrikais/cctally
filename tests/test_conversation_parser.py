@@ -213,3 +213,73 @@ def test_tool_use_block_keeps_preview():
     blocks, _ = _blocks_and_text([{"type": "tool_use", "id": "t1", "name": "Read",
                                    "input": {"file_path": "/a/b.py"}}])
     assert blocks[0]["preview"] == "/a/b.py"
+
+
+# --- #166: subagent kind (subagent_type) + record-level toolUseResult meta ----
+
+def test_spawn_tool_use_captures_subagent_type():
+    fh = _jsonl({"type": "assistant", "uuid": "a1", "sessionId": "s1",
+                 "requestId": "r1", "timestamp": "t",
+                 "message": {"role": "assistant", "id": "m1", "model": "opus",
+                             "content": [{"type": "tool_use", "name": "Task", "id": "tu1",
+                                          "input": {"description": "audit",
+                                                    "subagent_type": "Explore"}}]}})
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    tu = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_use"][0]
+    assert tu["subagent_type"] == "Explore"
+    assert tu["id"] == "tu1"
+
+def test_tool_result_captures_agent_id_and_snake_meta():
+    fh = _jsonl({"type": "user", "uuid": "u1", "sessionId": "s1", "timestamp": "t",
+                 "toolUseResult": {"agentId": "aaaa1111", "status": "completed",
+                                   "totalTokens": 23285, "totalDurationMs": 10668,
+                                   "totalToolUseCount": 1, "prompt": "do it"},
+                 "message": {"role": "user",
+                             "content": [{"type": "tool_result", "content": "done",
+                                          "tool_use_id": "tu1", "is_error": False}]}})
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    tr = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_result"][0]
+    assert tr["agent_id"] == "aaaa1111"
+    assert tr["subagent_meta"] == {"total_tokens": 23285, "total_duration_ms": 10668,
+                                   "total_tool_use_count": 1, "status": "completed"}
+
+def test_tool_result_without_tooluseresult_has_no_agent_id():
+    fh = _jsonl({"type": "user", "uuid": "u1", "sessionId": "s1", "timestamp": "t",
+                 "message": {"role": "user",
+                             "content": [{"type": "tool_result", "content": "x",
+                                          "tool_use_id": "tu1"}]}})
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    tr = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_result"][0]
+    assert "agent_id" not in tr and "subagent_meta" not in tr
+
+def test_non_spawn_tool_use_has_no_subagent_type():
+    fh = _jsonl({"type": "assistant", "uuid": "a1", "sessionId": "s1", "requestId": "r1",
+                 "timestamp": "t",
+                 "message": {"role": "assistant", "id": "m1", "model": "opus",
+                             "content": [{"type": "tool_use", "name": "Bash", "id": "tu1",
+                                          "input": {"command": "ls"}}]}})
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    tu = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_use"][0]
+    assert "subagent_type" not in tu
+
+def test_multiple_tool_result_blocks_attach_nothing():
+    fh = _jsonl({"type": "user", "uuid": "u1", "sessionId": "s1", "timestamp": "t",
+                 "toolUseResult": {"agentId": "aaaa1111", "status": "completed"},
+                 "message": {"role": "user",
+                             "content": [{"type": "tool_result", "content": "a",
+                                          "tool_use_id": "tu1"},
+                                         {"type": "tool_result", "content": "b",
+                                          "tool_use_id": "tu2"}]}})
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    trs = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_result"]
+    assert all("agent_id" not in b for b in trs)
+
+def test_empty_subagent_type_and_agentid_treated_absent():
+    fh = _jsonl({"type": "user", "uuid": "u1", "sessionId": "s1", "timestamp": "t",
+                 "toolUseResult": {"agentId": "", "status": "completed"},
+                 "message": {"role": "user",
+                             "content": [{"type": "tool_result", "content": "x",
+                                          "tool_use_id": "tu1"}]}})
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    tr = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_result"][0]
+    assert "agent_id" not in tr
