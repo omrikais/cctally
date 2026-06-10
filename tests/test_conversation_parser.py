@@ -340,3 +340,30 @@ def test_empty_subagent_type_treated_absent():
     tu = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_use"][0]
     assert "subagent_type" not in tu
     assert tu["id"] == "tu1"
+
+
+# --- skill-content nesting: capture sourceToolUseID on the skill body ---------
+
+def test_normalize_captures_source_tool_use_id_on_skill_body():
+    # An isMeta skill body carries sourceToolUseID linking back to the Skill tool_use.
+    obj = {
+        "type": "user", "uuid": "u-skill", "parentUuid": "p1",
+        "isMeta": True, "sessionId": "s1", "timestamp": "2026-06-01T00:00:00Z",
+        "sourceToolUseID": "toolu_ABC",
+        "message": {"content": [{"type": "text",
+                                 "text": "Base directory for this skill: /x/skills/brainstorming"}]},
+    }
+    row = lc._normalize(obj, "user", 0)
+    assert row.entry_type == "meta"
+    assert row.source_tool_use_id == "toolu_ABC"
+
+
+def test_normalize_source_tool_use_id_null_without_field():
+    # A plain human turn has no sourceToolUseID.
+    obj = {
+        "type": "user", "uuid": "u-h", "sessionId": "s1",
+        "timestamp": "2026-06-01T00:00:00Z",
+        "message": {"content": [{"type": "text", "text": "hello"}]},
+    }
+    row = lc._normalize(obj, "user", 0)
+    assert row.source_tool_use_id is None

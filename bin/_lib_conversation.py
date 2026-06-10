@@ -34,6 +34,7 @@ class MessageRow:
     cwd: "str | None"
     git_branch: "str | None"
     is_sidechain: int
+    source_tool_use_id: "str | None" = None
 
 
 def iter_message_rows(fh, path_str):
@@ -130,6 +131,7 @@ def _normalize(obj, t, offset):
         cwd=obj.get("cwd"),
         git_branch=obj.get("gitBranch"),
         is_sidechain=1 if obj.get("isSidechain") else 0,
+        source_tool_use_id=obj.get("sourceToolUseID"),
     )
 
 
