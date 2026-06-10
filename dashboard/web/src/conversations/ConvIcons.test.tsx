@@ -1,7 +1,7 @@
 import { render } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import type { ReactNode } from 'react';
-import { toolIcon, ThinkingIcon, FileSearchIcon, TerminalIcon, ToolGenericIcon } from './ConvIcons';
+import { toolIcon, ThinkingIcon, FileSearchIcon, TerminalIcon, ToolGenericIcon, LinkIcon } from './ConvIcons';
 
 function svgOf(el: ReactNode) {
   const { container } = render(<>{el}</>);
@@ -26,5 +26,12 @@ describe('ConvIcons', () => {
   it('toolIcon falls back to the generic glyph for unknown tools', () => {
     expect(svgOf(toolIcon('Frobnicate'))!.outerHTML).toBe(svgOf(<ToolGenericIcon />)!.outerHTML);
     expect(svgOf(toolIcon(undefined))!.outerHTML).toBe(svgOf(<ToolGenericIcon />)!.outerHTML);
+  });
+
+  it('LinkIcon renders an aria-hidden conv-ico svg', () => {
+    const svg = svgOf(<LinkIcon />);
+    expect(svg).toBeInTheDocument();
+    expect(svg).toHaveAttribute('aria-hidden', 'true');
+    expect(svg).toHaveClass('conv-ico');
   });
 });
