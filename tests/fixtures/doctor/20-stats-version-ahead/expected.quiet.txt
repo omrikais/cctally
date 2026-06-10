@@ -11,7 +11,7 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ✗ Version ahead            stats.db ahead (v99 > known v12)
       → Run `cctally db recover --db stats --yes` (or restore from backup)
-  ⚠ Pending migrations       17 pending
+  ⚠ Pending migrations       18 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
 Pricing
