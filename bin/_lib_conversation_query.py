@@ -377,7 +377,8 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     # uuid, so the first occurrence in ascending order is canonical.
     raw = conn.execute(
         "SELECT id, uuid, timestamp_utc, entry_type, text, blocks_json, model, "
-        "       msg_id, req_id, is_sidechain, cwd, git_branch, source_path, parent_uuid "
+        "       msg_id, req_id, is_sidechain, cwd, git_branch, source_path, parent_uuid, "
+        "       source_tool_use_id "
         "FROM conversation_messages WHERE session_id=? "
         "ORDER BY timestamp_utc, id", (session_id,)).fetchall()
 
@@ -421,7 +422,7 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
 
     for row in logical:
         (rid, u, ts, etype, text, blocks, model, msg_id, req_id,
-         is_sc, cwd, branch, source_path, parent_uuid) = row
+         is_sc, cwd, branch, source_path, parent_uuid, source_tool_use_id) = row
         if etype == "assistant" and msg_id is not None:
             key = (msg_id, req_id)
             idx = turn_index.get(key)
@@ -535,6 +536,39 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                 it["skill_name"] = skill_name
                 it["text"] = body
 
+    # ---- Phase 4b: fold a Skill-invoked skill body into its Skill tool chip ----
+    # A Skill invocation's injected body (now meta_kind='skill') links to its
+    # Skill tool_use via source_tool_use_id (threaded as the internal
+    # _source_tool_use_id). Resolve it against the SAME tooluse_index the Phase 2
+    # tool_result fold uses (ids unique per session; last-writer-wins). The index
+    # value is (item, block) holding the LIVE block dict — Phase 3 mutated that
+    # same dict in place to a `tool_call`, so block["skill_body"]=… mutates the
+    # live chip. On a hit: the body becomes the chip's expandable content
+    # (skill_body/skill_name), the trivial "Launching skill" result is dropped
+    # (result=None), the body uuid joins the owner's member_uuids (#160 jump
+    # anchor), and the standalone item is removed. NO hit (SessionStart skills;
+    # pre-006 NULL column; orphan id) -> the standalone pill stays. NULL-driven
+    # and flag-INDEPENDENT (it does NOT key on _reingest_pending). Runs before
+    # pagination so a match never depends on page boundaries.
+    _skill_drop = set()
+    for it in items:
+        if it.get("meta_kind") != "skill":
+            continue
+        stid = it.get("_source_tool_use_id")
+        if not stid:
+            continue
+        hit = tooluse_index.get(stid)
+        if hit is None:
+            continue
+        owner, block = hit
+        block["skill_body"] = it["text"]
+        block["skill_name"] = it.get("skill_name")
+        block["result"] = None
+        owner["member_uuids"].append(it["anchor"]["uuid"])
+        _skill_drop.add(id(it))
+    if _skill_drop:
+        items = [it for it in items if id(it) not in _skill_drop]
+
     costs = _turn_cost_map(conn, list(turn_index))
     # Stamp per-item cost first, then derive the header from the SUM of the
     # ROUNDED per-item assistant costs (M2) — so the §6.5 invariant
@@ -552,6 +586,12 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
             del it["_req_id"]
             it.pop("_has_prose", None)
     header_cost = round(header_cost, 6)
+
+    # Strip the internal Phase-4b threading key from EVERY item (meta/human items
+    # carry it too, not just assistant turns) so it never surfaces in the public
+    # item JSON.
+    for it in items:
+        it.pop("_source_tool_use_id", None)
 
     # Cursor pagination over the item list (anchored to each item's canonical id).
     # A non-None `after` that matches no item's anchor (stale/deleted cursor)
@@ -636,6 +676,10 @@ def _build_turn(members):
         "parent_uuid": first[13],
         "_msg_id": first[7],
         "_req_id": first[8],
+        # Internal threading for the Phase 4b skill-body fold (analogous to
+        # _msg_id/_req_id); consumed + del'd before items are returned, never in
+        # the public JSON. Meaningful only on meta skill items, harmless here.
+        "_source_tool_use_id": first[14],
         "_has_prose": False,
     }
     _fold_fragment(item, first)
@@ -682,7 +726,7 @@ def _build_simple(row):
     internal _msg_id/_req_id keys, so the cost loop's KeyError path can never fire
     (I2). The model is preserved for assistant rows."""
     (rid, u, ts, etype, text, blocks, model, msg_id, req_id, is_sc, cwd, branch,
-     source_path, parent_uuid) = row
+     source_path, parent_uuid, source_tool_use_id) = row
     try:
         parsed = _json.loads(blocks or "[]")
     except (ValueError, TypeError):
@@ -697,6 +741,10 @@ def _build_simple(row):
         "is_sidechain": bool(is_sc),
         "subagent_key": _subagent_key(source_path),
         "parent_uuid": parent_uuid,
+        # Internal threading for the Phase 4b skill-body fold (consumed + del'd
+        # before return). Carried on every simple item; meaningful only on the
+        # meta skill body row.
+        "_source_tool_use_id": source_tool_use_id,
     }
     if etype == "assistant":
         item["model"] = model

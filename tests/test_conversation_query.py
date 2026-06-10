@@ -19,7 +19,8 @@ def _conn():
 def _msg(c, **kw):
     cols = ("session_id", "uuid", "parent_uuid", "source_path", "byte_offset",
             "timestamp_utc", "entry_type", "text", "blocks_json", "model",
-            "msg_id", "req_id", "cwd", "git_branch", "is_sidechain")
+            "msg_id", "req_id", "cwd", "git_branch", "is_sidechain",
+            "source_tool_use_id")
     row = {k: kw.get(k) for k in cols}
     row["blocks_json"] = kw.get("blocks_json", "[]")
     row["text"] = kw.get("text", "")
@@ -27,10 +28,11 @@ def _msg(c, **kw):
     c.execute(
         "INSERT OR IGNORE INTO conversation_messages "
         "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
-        " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,is_sidechain)"
+        " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,is_sidechain,"
+        " source_tool_use_id)"
         " VALUES(:session_id,:uuid,:parent_uuid,:source_path,:byte_offset,"
         ":timestamp_utc,:entry_type,:text,:blocks_json,:model,:msg_id,:req_id,"
-        ":cwd,:git_branch,:is_sidechain)", row)
+        ":cwd,:git_branch,:is_sidechain,:source_tool_use_id)", row)
 
 
 def _entry(c, *, source_path, line_offset, model, msg_id, req_id,
@@ -986,3 +988,108 @@ def test_pre_reingest_human_skill_body_skipped_as_title_while_pending():
          blocks_json=_meta_blocks("Resolve the cache bug"))
     title = cq.list_conversations(c)["conversations"][0]["title"]
     assert title == "Resolve the cache bug"
+
+
+# ---- skill-content nesting: fold a skill body into its Skill tool chip -------
+
+_SKILL_BODY = "Base directory for this skill: /x/skills/brainstorming\n\n# Brainstorming"
+
+
+def _seed_skill_triple(conn, *, sid="s1", tool_id="toolu_S",
+                       source_tool_use_id="toolu_S", body=_SKILL_BODY):
+    """A real Skill triple: an assistant turn with a Skill tool_use, its
+    "Launching skill" tool_result, and the isMeta skill body row linking back
+    via source_tool_use_id. Returns the body row's uuid."""
+    _seed_assistant(conn, sid=sid, uuid="a1", msg_id="m1", req_id="r1",
+        ts="2026-06-01T00:00:01Z",
+        blocks=[{"kind": "tool_use", "name": "Skill",
+                 "input_summary": '{"skill":"brainstorming"}',
+                 "id": tool_id, "preview": "brainstorming"}])
+    _seed_tool_result(conn, sid=sid, uuid="u-res", ts="2026-06-01T00:00:02Z",
+        blocks=[{"kind": "tool_result", "text": "Launching skill: brainstorming",
+                 "truncated": False, "is_error": False, "tool_use_id": tool_id}])
+    _msg(conn, session_id=sid, uuid="u-body", source_path="a.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-01T00:00:03Z", entry_type="meta", text="",
+         blocks_json=_meta_blocks(body), source_tool_use_id=source_tool_use_id)
+    return "u-body"
+
+
+def _find_skill_chip(items, tool_use_id):
+    for it in items:
+        if it["kind"] != "assistant":
+            continue
+        for b in it["blocks"]:
+            if b.get("kind") == "tool_call" and b.get("tool_use_id") == tool_use_id:
+                return it, b
+    return None, None
+
+
+def test_skill_body_folds_into_matching_tool_call():
+    conn = _conn()
+    body_uuid = _seed_skill_triple(conn)
+    out = cq.get_conversation(conn, "s1")
+    items = out["items"]
+    # the standalone skill meta item is GONE (folded into the chip)
+    assert not any(it["kind"] == "meta" and it.get("meta_kind") == "skill"
+                   for it in items)
+    # the Skill tool_call carries the body + skill name, "Launching" result cleared
+    owner, chip = _find_skill_chip(items, "toolu_S")
+    assert chip is not None
+    assert chip["skill_body"].startswith("Base directory for this skill:")
+    assert chip["skill_name"] == "brainstorming"
+    assert chip["result"] is None
+    # the body uuid joined the owner turn's member_uuids (jump anchor)
+    assert body_uuid in owner["member_uuids"]
+    # the internal threading field never leaks into the public item JSON
+    assert all("_source_tool_use_id" not in it for it in items)
+
+
+def test_unlinked_skill_body_stays_standalone():
+    # A SessionStart-injected skill body: a true meta skill row with NO
+    # source_tool_use_id -> no tooluse_index hit -> standalone pill (permanent).
+    conn = _conn()
+    _msg(conn, session_id="s1", uuid="m1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="t", entry_type="meta", text="",
+         blocks_json=_meta_blocks(_SKILL_BODY), source_tool_use_id=None)
+    items = cq.get_conversation(conn, "s1")["items"]
+    assert any(it["kind"] == "meta" and it.get("meta_kind") == "skill"
+               for it in items)
+    assert all("_source_tool_use_id" not in it for it in items)
+
+
+def test_skill_body_no_matching_tool_use_stays_standalone():
+    # source_tool_use_id present but resolves to no tool_use in the session
+    # (the id-collision / orphan posture) -> standalone pill, never crash.
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        ts="2026-06-01T00:00:01Z",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}",
+                 "id": "toolu_OTHER", "preview": "/x.py"}])
+    _msg(conn, session_id="s1", uuid="u-body", source_path="a.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-01T00:00:03Z", entry_type="meta", text="",
+         blocks_json=_meta_blocks(_SKILL_BODY), source_tool_use_id="toolu_MISSING")
+    items = cq.get_conversation(conn, "s1")["items"]
+    assert any(it["kind"] == "meta" and it.get("meta_kind") == "skill"
+               for it in items)
+
+
+def test_pre_reingest_null_column_skill_body_stays_standalone():
+    # Pre-006 steady state: a paired skill body still has NULL source_tool_use_id
+    # (the column add landed but the reingest hasn't run). It must fall back to
+    # the standalone pill purely on the NULL column (no flag gates this).
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        ts="2026-06-01T00:00:01Z",
+        blocks=[{"kind": "tool_use", "name": "Skill",
+                 "input_summary": '{"skill":"brainstorming"}',
+                 "id": "toolu_S", "preview": "brainstorming"}])
+    _msg(conn, session_id="s1", uuid="u-body", source_path="a.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-01T00:00:03Z", entry_type="meta", text="",
+         blocks_json=_meta_blocks(_SKILL_BODY), source_tool_use_id=None)
+    items = cq.get_conversation(conn, "s1")["items"]
+    assert any(it["kind"] == "meta" and it.get("meta_kind") == "skill"
+               for it in items)
+    # and the Skill chip keeps its own (request-only) shape, no skill_body
+    _owner, chip = _find_skill_chip(items, "toolu_S")
+    assert chip is not None
+    assert "skill_body" not in chip
