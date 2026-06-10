@@ -673,7 +673,10 @@ def sync_cache(
             # 004 reuses this SAME flag (to land the spawn subagent_type + the
             # record-level toolUseResult agentId/meta on existing history): the
             # offset-0 backfill re-parses every JSONL through the current parser,
-            # so those fields land here with zero new consumption code.
+            # so those fields land here with zero new consumption code. Migration
+            # 005 reuses it again to reclassify injected isMeta rows from
+            # entry_type='human' to 'meta' (so the reader stops attributing skill
+            # bodies / git-context to the user).
             try:
                 _reingest = conn.execute(
                     "SELECT 1 FROM cache_meta "

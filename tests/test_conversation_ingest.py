@@ -724,3 +724,56 @@ def test_sync_truncation_keeps_fts_integrity(isolated):
         "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'bravo'"
     ).fetchone()[0] == 1
     conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('integrity-check')")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Migration 005: isMeta reingest reclassifies stale 'human' rows to 'meta'
+# ──────────────────────────────────────────────────────────────────────────
+
+def _meta_skill_line(uuid, *, path="/x/skills/brainstorming", ts="2026-06-01T00:02:00Z"):
+    body = f"Base directory for this skill: {path}\n\n# Skill body"
+    return json.dumps({
+        "type": "user", "uuid": uuid, "sessionId": "s1", "timestamp": ts,
+        "isMeta": True, "sourceToolUseID": "toolu_x",
+        "message": {"role": "user", "content": [{"type": "text", "text": body}]},
+    }) + "\n"
+
+
+def test_migration_005_reingest_reclassifies_ismeta_rows_to_meta(isolated):
+    """005 is flag-only (sets conversation_reingest_pending); the offset-0
+    re-ingest then re-parses every JSONL through the meta-aware parser, so a
+    stale 'human' skill-body row (a pre-upgrade ingest) is reclassified to
+    entry_type='meta' with text='' and the flag is cleared (Codex P2.1)."""
+    ns, conn, projects, sync = isolated
+    (projects / "a.jsonl").write_text(
+        _asst_line("a1", "m1", "r1", "hello") + _meta_skill_line("u1")
+    )
+    sync()
+    # Simulate a PRE-upgrade ingest: the skill body stored as a 'human' prose row
+    # (entry_type='human', body in the indexed text column).
+    body = "Base directory for this skill: /x/skills/brainstorming\n\n# Skill body"
+    conn.execute(
+        "UPDATE conversation_messages SET entry_type='human', text=? WHERE uuid='u1'",
+        (body,))
+    conn.commit()
+    assert conn.execute(
+        "SELECT entry_type FROM conversation_messages WHERE uuid='u1'"
+    ).fetchone()[0] == "human"
+
+    # Run the real 005 handler (flag-only) then sync to consume it.
+    db._005_conversation_reingest_meta(conn)
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='conversation_reingest_pending'"
+    ).fetchone() is not None
+    sync()
+
+    row = conn.execute(
+        "SELECT entry_type, text, blocks_json FROM conversation_messages WHERE uuid='u1'"
+    ).fetchone()
+    assert row is not None, "the skill row survives the reingest"
+    assert row[0] == "meta"             # reclassified by the meta-aware parser
+    assert row[1] == ""                 # not FTS-indexed / not a title candidate
+    assert "Skill body" in row[2]       # blocks still carry the body for rendering
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='conversation_reingest_pending'"
+    ).fetchone() is None, "the reingest flag is dropped after consumption"

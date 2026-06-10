@@ -240,11 +240,24 @@ errs = []
 items = d.get("items") or []
 kinds = [it.get("kind") for it in items]
 # #164: the tool_result FOLDED into the turn, so there is no standalone
-# tool_result item — only [human, assistant].
-if kinds != ["human", "assistant"]:
-    errs.append("items kinds != [human, assistant] (replay/fragments/result not folded): %r" % (kinds,))
+# tool_result item — only [human, assistant]. The injected isMeta skill body
+# lands as a trailing `meta` item (NEVER a "human"/"You" prompt).
+if kinds != ["human", "assistant", "meta"]:
+    errs.append("items kinds != [human, assistant, meta] (replay/fragments/result not folded): %r" % (kinds,))
 if any(k == "tool_result" for k in kinds):
     errs.append("a standalone tool_result item survived folding: %r" % (kinds,))
+# The injected skill body is reclassified to a skill-meta item, not a "You" turn.
+metas = [it for it in items if it.get("kind") == "meta"]
+if len(metas) != 1:
+    errs.append("expected ONE meta item (the skill body), got %d" % (len(metas),))
+else:
+    meta = metas[0]
+    if meta.get("meta_kind") != "skill":
+        errs.append("meta_kind != skill: %r" % (meta.get("meta_kind"),))
+    if meta.get("skill_name") != "brainstorming":
+        errs.append("skill_name != brainstorming: %r" % (meta.get("skill_name"),))
+    if "Brainstorming Ideas" not in (meta.get("text") or ""):
+        errs.append("meta render text missing the skill body: %r" % (meta.get("text"),))
 assistants = [it for it in items if it.get("kind") == "assistant"]
 if len(assistants) != 1:
     errs.append("turn not collapsed to ONE assistant item: %d" % (len(assistants),))

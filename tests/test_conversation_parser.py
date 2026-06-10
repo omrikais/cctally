@@ -81,6 +81,47 @@ def test_partial_tail_line_rewinds():
     # cursor rewound to the start of the partial line
     assert buf.readline().startswith('{"type":"user","uuid":"partial"')
 
+
+def test_ismeta_user_line_classified_meta_text_empty_blocks_kept():
+    # a skill body arrives as a type:user, isMeta:true line with text blocks
+    body = "Base directory for this skill: /x/skills/brainstorming\n\n# Brainstorming"
+    fh = _jsonl({"type": "user", "uuid": "m1", "sessionId": "s", "timestamp": "t",
+                 "isMeta": True, "sourceToolUseID": "toolu_x",
+                 "message": {"role": "user", "content": [{"type": "text", "text": body}]}})
+    r = list(lc.iter_message_rows(fh, "f"))[0]
+    assert r.entry_type == lc.META
+    assert r.text == ""                                  # not FTS-indexed, not a title candidate
+    blocks = json.loads(r.blocks_json)
+    assert blocks and blocks[0]["kind"] == "text" and "Brainstorming" in blocks[0]["text"]
+
+
+def test_ismeta_with_tool_result_block_stays_tool_result():
+    # tool_result precedence is checked BEFORE isMeta
+    fh = _jsonl({"type": "user", "uuid": "m2", "sessionId": "s", "timestamp": "t",
+                 "isMeta": True,
+                 "message": {"role": "user",
+                             "content": [{"type": "tool_result", "content": "OUT"}]}})
+    r = list(lc.iter_message_rows(fh, "f"))[0]
+    assert r.entry_type == lc.TOOL_RESULT
+
+
+def test_ismeta_assistant_line_stays_assistant():
+    # only USER isMeta lines are reclassified; an isMeta assistant line is still
+    # an assistant turn (it is not attributed to the user either way)
+    fh = _jsonl({"type": "assistant", "uuid": "m3", "sessionId": "s", "requestId": "r",
+                 "timestamp": "t", "isMeta": True,
+                 "message": {"role": "assistant", "id": "msg", "model": "opus",
+                             "content": [{"type": "text", "text": "x"}]}})
+    r = list(lc.iter_message_rows(fh, "f"))[0]
+    assert r.entry_type == lc.ASSISTANT
+
+
+def test_non_meta_user_line_stays_human():
+    fh = _jsonl({"type": "user", "uuid": "m4", "sessionId": "s", "timestamp": "t",
+                 "message": {"role": "user", "content": "a real prompt"}})
+    r = list(lc.iter_message_rows(fh, "f"))[0]
+    assert r.entry_type == lc.HUMAN and r.text == "a real prompt"
+
 def test_non_scalar_content_yields_empty_text_and_no_blocks():
     # content that is neither str nor list (defensive) must not crash and must keep
     # text='' (the NOT NULL column) with blocks_json '[]'.

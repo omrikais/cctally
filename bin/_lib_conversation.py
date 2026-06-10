@@ -13,6 +13,7 @@ from dataclasses import dataclass
 HUMAN = "human"
 ASSISTANT = "assistant"
 TOOL_RESULT = "tool_result"
+META = "meta"
 
 _TOOL_RESULT_CAP = 4000  # chars; full text always re-derivable from JSONL
 
@@ -96,6 +97,20 @@ def _normalize(obj, t, offset):
         # user line that mixes a text block with a tool_result block must not
         # leak that text into the FTS index; the full content stays in
         # blocks_json for rendering.
+        text = ""
+    elif obj.get("isMeta"):
+        # Injected, harness-authored content carried as a user line: skill
+        # bodies (Skill tool + SessionStart), git-context blocks, "Continue
+        # from where you left off.", pasted-image placeholders, slash-command
+        # caveats, check-review "## Task" blocks. The user did NOT type these,
+        # so the reader must not render them as a "YOU" prompt. We classify
+        # them META here; text="" keeps the body out of the FTS index and out
+        # of title derivation (which filters entry_type='human'), exactly like
+        # tool_result. The body survives in blocks_json; the skill-vs-context
+        # discrimination is a read-time concern (the query kernel, keyed on the
+        # body). Ordered AFTER tool_result so an isMeta line that also carries a
+        # tool_result block still folds as a result.
+        entry_type = META
         text = ""
     else:
         entry_type = HUMAN

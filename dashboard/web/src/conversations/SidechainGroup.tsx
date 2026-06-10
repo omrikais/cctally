@@ -23,7 +23,12 @@ function statusBadge(status?: string) {
 // trimmed + truncated; falls back to the subagent hash when the root has no
 // prose. Exported for unit testing.
 export function subagentSummaryLabel(items: ConversationItem[], subagentKey: string): string {
-  const text = items[0]?.text ?? '';
+  // First NON-meta item, not items[0]: a subagent file can open with an
+  // injected `meta` row (skill body / SessionStart injection) whose text would
+  // otherwise leak "Base directory for this skill…" as the card title (Codex
+  // P1.3). Fall back to items[0] if every item is meta.
+  const root = items.find((it) => it.kind !== 'meta') ?? items[0];
+  const text = root?.text ?? '';
   const firstLine = text.split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? '';
   if (!firstLine) return `Subagent ${subagentKey}`;
   return firstLine.length > LABEL_MAX ? `${firstLine.slice(0, LABEL_MAX).trimEnd()}…` : firstLine;
@@ -76,8 +81,11 @@ export function SidechainGroup({
   }, [forceOpen]);
 
   const label = subagentSummaryLabel(items, subagentKey);
-  const cost = items.reduce((acc, it) => acc + (it.cost_usd ?? 0), 0);
-  const models = [...new Set(items.map((it) => it.model).filter(Boolean))] as string[];
+  // `in` narrows: the meta arm has neither cost_usd nor model (injected content
+  // carries no turn cost / model), so guard the access instead of summing/listing
+  // phantom fields.
+  const cost = items.reduce((acc, it) => acc + ('cost_usd' in it ? (it.cost_usd ?? 0) : 0), 0);
+  const models = [...new Set(items.map((it) => ('model' in it ? it.model : null)).filter(Boolean))] as string[];
   return (
     <details
       className={[

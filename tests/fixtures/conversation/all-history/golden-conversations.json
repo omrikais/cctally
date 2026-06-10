@@ -38,11 +38,11 @@
     {
       "cost_usd": 0.0175,
       "git_branch": "main",
-      "last_activity_utc": "2026-06-01T00:00:05Z",
+      "last_activity_utc": "2026-06-01T00:00:06Z",
       "models": [
         "claude-opus-4-8"
       ],
-      "msg_count": 5,
+      "msg_count": 6,
       "project_label": "proj",
       "session_id": "s1",
       "started_utc": "2026-06-01T00:00:00Z",

@@ -31,6 +31,26 @@ describe('subagentSummaryLabel', () => {
   it('falls back to "Subagent <hash>" when the root has no prose', () => {
     expect(subagentSummaryLabel([member('r', { text: '   ' })], 'abcd1234')).toBe('Subagent abcd1234');
   });
+
+  it('skips a leading meta item so an injected skill body never becomes the title (Codex P1.3)', () => {
+    const items = [
+      member('m', {
+        kind: 'meta',
+        text: 'Base directory for this skill: /x/skills/brainstorming\n\nbody',
+        meta_kind: 'skill',
+        skill_name: 'brainstorming',
+      } as Partial<ConversationItem>),
+      member('r', { text: 'Audit the cache layer' }),
+    ];
+    expect(subagentSummaryLabel(items, 'hash')).toBe('Audit the cache layer');
+  });
+
+  it('falls back to items[0] when EVERY item is meta', () => {
+    const items = [
+      member('m', { kind: 'meta', text: '## Git Context', meta_kind: 'context', skill_name: null } as Partial<ConversationItem>),
+    ];
+    expect(subagentSummaryLabel(items, 'h')).toBe('## Git Context');
+  });
 });
 
 describe('SidechainGroup', () => {

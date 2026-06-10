@@ -242,6 +242,8 @@ than aborting.
 
 **Subagent thread cards (#166).** On modern transcripts the reader surfaces a subagent's *kind* in the thread-card eyebrow (`SUBAGENT · <kind>`, e.g. `SUBAGENT · Explore`) and a dim second line with its result meta — tokens, wall-clock duration, tool-use count, and status (a bare `✓` on success; `✕ error` or `⚠ <status>` spelled out on failure). The kind and meta come from the spawn `Task`/`Agent` `subagent_type` joined to the record-level `toolUseResult` in the query kernel. Older transcripts that predate the capture lack the linkage, so their cards gracefully fall back to the title-only rendering.
 
+**Injected (`isMeta`) content.** Lines Claude Code injects into a transcript that you did not type — a skill's body (when an assistant turn invokes the `Skill` tool, or a `SessionStart` skill), git-context blocks, "Continue from where you left off.", pasted-image placeholders, slash-command plumbing — are never rendered as a "You" prompt. They collapse into quiet, collapsed-by-default disclosures: a skill body becomes a `Skill content · <name>` pill (the name is the skill's directory basename; its body still renders as full Markdown when expanded), slash-command plumbing keeps the `System marker` pill, and everything else becomes a neutral `Injected context` pill. Injected bodies are excluded from derived titles and full-text search. The classification lands on existing history the next time the cache syncs (a one-time, lossless re-ingest of the re-derivable conversation cache).
+
 ## Shutdown
 
 `Ctrl-C` in the terminal where you launched the dashboard. The server

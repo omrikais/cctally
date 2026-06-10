@@ -4957,6 +4957,60 @@ mark.current {
   overflow-x: auto;
 }
 
+/* ---- Folded injected-meta pill (skill body / context / command) ---- */
+/* isMeta lines the user did NOT type — collapsed-by-default disclosure, never
+   a "You" turn (no spine role-dot: that CSS targets --human/--assistant only).
+   Mirrors .conv-system-marker; the skill variant takes the cyan Skill-chip
+   accent so the "Skill content" pill reads as one unit with the Skill tool chip
+   right above it. */
+.conv-item--meta { padding: 0; background: transparent; border: none; }
+.conv-meta {
+  border: 1px dashed var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-bg-2);
+}
+.conv-meta > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  padding: 3px 10px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--reader-faint);
+  list-style: none;
+  user-select: none;
+}
+.conv-meta > summary::-webkit-details-marker { display: none; }
+.conv-meta[open] > summary { color: var(--text-dim); }
+.conv-meta[open] > summary .conv-chev { transform: rotate(45deg); }
+.conv-meta-label { font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; }
+.conv-meta-name { color: var(--text-dim); }
+.conv-meta-preview {
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+/* skill variant: cyan accent (matches .conv-chip--tool > summary). */
+.conv-meta--skill { border-color: color-mix(in srgb, var(--accent-cyan) 35%, var(--border-soft)); }
+.conv-meta--skill > summary,
+.conv-meta--skill[open] > summary { color: var(--accent-cyan); }
+.conv-meta-body {
+  padding: 8px 10px;
+  border-top: 1px solid var(--border-soft);
+}
+.conv-meta-body--pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  overflow-x: auto;
+}
+
 /* ---- Turn load-in stagger (G1 §4b) -------------------------------- */
 /* Each top-level turn rises once on first appearance (the reader's seen-Set
    ref gates re-animation); the per-index animationDelay (inline style) staggers
@@ -5015,7 +5069,8 @@ mark.current {
 .conv-chip::details-content,
 .conv-sidechain::details-content,
 .conv-toolresult-run::details-content,
-.conv-system-marker::details-content {
+.conv-system-marker::details-content,
+.conv-meta::details-content {
   block-size: 0;
   overflow: hidden;
   transition: block-size .24s ease, content-visibility .24s allow-discrete;
@@ -5023,7 +5078,8 @@ mark.current {
 .conv-chip[open]::details-content,
 .conv-sidechain[open]::details-content,
 .conv-toolresult-run[open]::details-content,
-.conv-system-marker[open]::details-content { block-size: auto; }
+.conv-system-marker[open]::details-content,
+.conv-meta[open]::details-content { block-size: auto; }
 /* A #160 force-open snaps instantly so layout is final before the scroll
    lands; the class drops afterward and later user toggles animate. */
 .conv-sidechain--force::details-content { transition: none; }

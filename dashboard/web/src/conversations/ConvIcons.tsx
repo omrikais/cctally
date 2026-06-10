@@ -64,6 +64,17 @@ export function SystemIcon() {
   );
 }
 
+// Puzzle piece — the skill glyph. Shared by the Skill tool chip (toolIcon)
+// and the folded "Skill content" meta pill so the two adjacent elements read
+// as one skill unit.
+export function SkillIcon() {
+  return (
+    <Svg>
+      <path d="M15.5 3.5a2 2 0 1 0-3.9.5H8a1 1 0 0 0-1 1v3.6a2 2 0 1 1 0 3.8V19a1 1 0 0 0 1 1h3.6a2 2 0 1 0 3.8 0H19a1 1 0 0 0 1-1v-3.6a2 2 0 1 1 0-3.8V5a1 1 0 0 0-1-1h-3.5Z" />
+    </Svg>
+  );
+}
+
 export function FileSearchIcon() {
   return (
     <Svg>
@@ -198,6 +209,7 @@ export function toolIcon(name?: string | null): ReactNode {
   if (n === 'edit' || n === 'write' || n === 'notebookedit' || n === 'multiedit') return <PencilIcon />;
   if (n === 'bash') return <TerminalIcon />;
   if (n === 'task' || n === 'agent') return <SubagentIcon />;
+  if (n === 'skill') return <SkillIcon />;
   if (n === 'webfetch' || n === 'websearch') return <GlobeIcon />;
   if (n === 'todowrite' || n === 'taskcreate') return <ChecklistIcon />;
   return <ToolGenericIcon />;

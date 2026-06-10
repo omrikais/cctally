@@ -63,7 +63,12 @@ export function groupSidechains(items: ConversationItem[]): RenderNode[] {
   const nested = new Set<string>();
   const nestedByParent = new Map<string, string[]>();
   for (const [k, b] of buckets) {
-    const parentUuid = b[0].parent_uuid;
+    // Nest on the first NON-meta item's parent (the logical task root), not
+    // bucket[0] — a subagent file can open with an injected `meta` row (a skill
+    // body / SessionStart injection) whose parent_uuid is an intra-file link,
+    // which must not drive cross-file nesting (Codex P1.3). Fallback to b[0].
+    const root = b.find((it) => it.kind !== 'meta') ?? b[0];
+    const parentUuid = root.parent_uuid;
     const parent = parentUuid != null ? mainByUuid.get(parentUuid) : undefined;
     if (parent) {
       nested.add(k);

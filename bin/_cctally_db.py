@@ -3026,6 +3026,24 @@ def _004_conversation_reingest_subagent_kind(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@cache_migration("005_conversation_reingest_meta")
+def _005_conversation_reingest_meta(conn: sqlite3.Connection) -> None:
+    """Flag-only re-ingest of conversation_messages so injected ``isMeta`` user
+    lines (skill bodies, git-context, "Continue…", image placeholders,
+    slash-command caveats) are reclassified from ``entry_type='human'`` to the
+    new ``'meta'`` value and stop rendering as "YOU" prompts in the reader.
+    REUSES 003's ``conversation_reingest_pending`` flag exactly like 004 — the
+    offset-0 walk in sync_cache (clear + backfill under the cache.db.lock flock)
+    re-parses every JSONL through the now-meta-aware parser, so the new
+    classification lands with zero new consumption code. A distinct
+    ``schema_migrations`` marker is what triggers this reingest on installs that
+    already have 003/004 applied. Central stamp via the dispatcher (issue #140);
+    a fresh install stamps it without running (empty table -> the flag, if ever
+    set, is a harmless no-op)."""
+    _set_cache_meta(conn, "conversation_reingest_pending", "1")
+    conn.commit()
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")

@@ -365,4 +365,88 @@ describe('MessageItem (message-text copy, G2)', () => {
     // copy buttons either) → zero copy buttons at the message level.
     expect(container.querySelector('.conv-item-actions')).toBeNull();
   });
+
+  // ---- meta (injected isMeta content) ----------------------------------
+  const metaSkill: ConversationItem = {
+    kind: 'meta',
+    anchor: { session_id: 's', uuid: 'm1', id: 9 },
+    member_uuids: ['m1'],
+    ts: 't',
+    text: 'Base directory for this skill: /x/skills/brainstorming\n\n# Brainstorming Ideas',
+    blocks: [{ kind: 'text', text: 'Base directory for this skill: /x/skills/brainstorming\n\n# Brainstorming Ideas' }],
+    is_sidechain: false,
+    subagent_key: null,
+    parent_uuid: null,
+    meta_kind: 'skill',
+    skill_name: 'brainstorming',
+  };
+
+  it('renders a skill meta row as a collapsed disclosure, NEVER a "You" prompt', () => {
+    const { container } = render(<MessageItem item={metaSkill} />);
+    expect(container.querySelector('.conv-item--human')).toBeNull();
+    expect(container.textContent).not.toContain('You');
+    const details = container.querySelector('details.conv-meta.conv-meta--skill')!;
+    expect(details).not.toBeNull();
+    expect((details as HTMLDetailsElement).open).toBe(false); // collapsed by default
+    expect(container.querySelector('.conv-item--meta')!.getAttribute('data-uuid')).toBe('m1');
+    expect(container.textContent).toContain('Skill content');
+    expect(container.textContent).toContain('brainstorming'); // the skill name
+    // body renders the markdown (the heading) inside the disclosure
+    expect(container.textContent).toContain('Brainstorming Ideas');
+  });
+
+  it('renders a skill meta row WITHOUT a skill_name as a name-less pill', () => {
+    const noName: ConversationItem = { ...metaSkill, anchor: { session_id: 's', uuid: 'm1b', id: 10 }, skill_name: null };
+    const { container } = render(<MessageItem item={noName} />);
+    expect(container.textContent).toContain('Skill content');
+    expect(container.querySelector('.conv-meta-name')).toBeNull();
+  });
+
+  it('renders a command meta row as the System marker pill (raw <pre>, not markdown)', () => {
+    const metaCommand: ConversationItem = {
+      kind: 'meta',
+      anchor: { session_id: 's', uuid: 'm2', id: 11 },
+      member_uuids: ['m2'],
+      ts: 't',
+      text: '<command-name>clear</command-name>',
+      blocks: [{ kind: 'text', text: '<command-name>clear</command-name>' }],
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+      meta_kind: 'command',
+      skill_name: null,
+    };
+    const { container } = render(<MessageItem item={metaCommand} />);
+    expect(container.querySelector('.conv-item--human')).toBeNull();
+    expect(container.querySelector('details.conv-meta--command')).not.toBeNull();
+    expect(container.querySelector('pre.conv-meta-body--pre')!.textContent).toContain('<command-name>clear</command-name>');
+  });
+
+  it('renders a context meta row as an Injected context pill with a preview', () => {
+    const metaContext: ConversationItem = {
+      kind: 'meta',
+      anchor: { session_id: 's', uuid: 'm3', id: 12 },
+      member_uuids: ['m3'],
+      ts: 't',
+      text: '## Git Context\n- branch: main',
+      blocks: [{ kind: 'text', text: '## Git Context\n- branch: main' }],
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+      meta_kind: 'context',
+      skill_name: null,
+    };
+    const { container } = render(<MessageItem item={metaContext} />);
+    expect(container.querySelector('.conv-item--human')).toBeNull();
+    expect(container.querySelector('details.conv-meta--context')).not.toBeNull();
+    expect(container.textContent).toContain('Injected context');
+    expect(container.querySelector('.conv-meta-preview')!.textContent).toContain('## Git Context');
+  });
+
+  it('gives a meta row no spine role-dot class (--human/--assistant only)', () => {
+    const { container } = render(<MessageItem item={metaSkill} />);
+    expect(container.querySelector('.conv-item--human')).toBeNull();
+    expect(container.querySelector('.conv-item--assistant')).toBeNull();
+    expect(container.querySelector('.conv-item--meta')).not.toBeNull();
+  });
 });

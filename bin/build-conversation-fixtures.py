@@ -264,6 +264,25 @@ def build(scenario: str) -> None:
             cwd=s1_cwd, git_branch="main",
         )
 
+        # id=5 (NEW): an injected isMeta skill body (the assistant invoked a
+        # Skill). entry_type='meta', text='' (not FTS-indexed, not a title
+        # candidate); the body lives in a text block. The reader renders a
+        # collapsed "Skill content · brainstorming" disclosure — NEVER a "You"
+        # prompt — exercising the kernel's meta_kind/skill_name derivation
+        # end-to-end through the GET route. No msg_id/req_id -> no cost join.
+        _insert_message(
+            cache_conn,
+            session_id="s1", uuid="sk1", parent_uuid="a1b",
+            source_path=s1_file_a, byte_offset=4,
+            timestamp_utc="2026-06-01T00:00:06Z",
+            entry_type="meta", text="",
+            blocks_json=(
+                '[{"kind": "text", "text": "Base directory for this skill: '
+                '/home/u/.claude/skills/brainstorming\\n\\n# Brainstorming Ideas"}]'
+            ),
+            cwd=s1_cwd, git_branch="main",
+        )
+
         # ONE session_entries row for the turn (m1,r1) — cost joins to THIS
         # single deduped row (idx_entries_dedup is UNIQUE on (msg_id,req_id)),
         # so the replay can never double the cost. claude-opus-4-8: input

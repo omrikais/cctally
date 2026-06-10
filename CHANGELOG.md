@@ -8,6 +8,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - Conversation reader: subagent thread cards now show the subagent's kind (`SUBAGENT · <kind>`) and its result meta (tokens, duration, tool count, status) on modern transcripts; old transcripts keep the title-only card (#166).
 
+### Fixed
+- **The dashboard conversation reader no longer attributes injected content to you.** When an assistant turn invoked a skill (via the `Skill` tool), the skill's full markdown body rendered as a large **"You"** prompt, as if you had typed the entire skill into the conversation — and the same applied to other harness-injected (`isMeta`) lines (git-context blocks, "Continue from where you left off.", pasted-image placeholders, slash-command plumbing). These now render as quiet, collapsed-by-default disclosures attributed correctly: a skill body becomes a `Skill content · <name>` pill (still rendered with full Markdown — headings, lists, syntax-highlighted code — when expanded), and other injected content becomes a neutral `Injected context` pill. Nothing injected is ever shown as a "You" turn, and these bodies no longer pollute conversation titles or full-text search. The fix lands on existing history automatically the next time the dashboard syncs the conversation cache (a one-time re-ingest); the cache is re-derivable, so nothing is lost.
+
 ## [1.31.1] - 2026-06-09
 
 ### Added

@@ -1,10 +1,17 @@
 import { forwardRef, memo } from 'react';
 import { Markdown } from '../components/Markdown';
 import { MessageBlocks } from './MessageBlocks';
-import { ResultIcon, SystemIcon } from './ConvIcons';
+import { ResultIcon, SystemIcon, SkillIcon } from './ConvIcons';
 import { CopyButton } from './CopyButton';
 import { isSystemMarker } from './systemMarkers';
 import type { ConversationItem } from '../types/conversation';
+
+// First non-blank line of a meta body, trimmed + capped — the context pill's
+// collapsed one-line preview (skill/command pills don't need it).
+function metaPreview(s: string): string {
+  const t = s.split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? '';
+  return t.length > 80 ? `${t.slice(0, 80).trimEnd()}…` : t;
+}
 
 // A single reader message. forwardRef exposes the container div so the
 // reader can scrollIntoView on a jump.
@@ -81,10 +88,61 @@ function MessageItemImpl(
     );
   }
 
+  // meta: injected harness content (skill bodies, slash-command plumbing,
+  // git-context / "Continue…" / placeholders) — NEVER a "You" prompt. A
+  // collapsed-by-default disclosure with a skill/system/context chrome; the
+  // body renders via <MessageBlocks> so any non-text injected block survives
+  // (Codex P1.1), except `command` which keeps the raw <pre> (its <command-*>
+  // plumbing must not be markdown-mangled). No spine role-dot: the CSS only
+  // targets --human/--assistant.
+  if (item.kind === 'meta') {
+    const mk = item.meta_kind;
+    const head =
+      mk === 'skill' ? (
+        <>
+          <SkillIcon /> <span className="conv-meta-label">Skill content</span>
+          {item.skill_name && <span className="conv-meta-name">· {item.skill_name}</span>}
+        </>
+      ) : mk === 'command' ? (
+        <>
+          <SystemIcon /> <span className="conv-meta-label">System marker</span>
+        </>
+      ) : (
+        <>
+          <SystemIcon /> <span className="conv-meta-label">Injected context</span>
+          <span className="conv-meta-preview">{metaPreview(item.text)}</span>
+        </>
+      );
+    return (
+      <div ref={ref} className={cls('conv-item--meta')} style={style} data-uuid={item.anchor.uuid}>
+        <details className={`conv-meta conv-meta--${mk}`}>
+          <summary>
+            <span className="conv-chev" aria-hidden="true" />
+            {head}
+          </summary>
+          {mk === 'command' ? (
+            <pre className="conv-meta-body conv-meta-body--pre">{item.text}</pre>
+          ) : (
+            <div className="conv-meta-body">
+              <MessageBlocks blocks={item.blocks} />
+              {mk === 'skill' && item.text && (
+                <div className="conv-item-actions">
+                  <CopyButton text={item.text} />
+                </div>
+              )}
+            </div>
+          )}
+        </details>
+      </div>
+    );
+  }
+
   // human: fold a pure system-marker turn (slash-command plumbing) into a
   // compact expandable pill. Guard on NO non-text blocks (the prose also
   // arrives as a {kind:'text'} block, so length===0 would never hold). The
   // raw text is never destroyed — expanding the <details> restores it.
+  // (For isMeta lines this is now handled by the meta branch above; this
+  // fallback still catches any non-isMeta legacy marker line.)
   if (isSystemMarker(item.text) && item.blocks.every((b) => b.kind === 'text')) {
     return (
       <div ref={ref} className={cls('conv-item--system')} style={style} data-uuid={item.anchor.uuid}>

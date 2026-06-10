@@ -31,6 +31,25 @@ export type ConversationItem =
       parent_uuid: string | null;
       model?: string | null; // present only on the null-msg_id assistant case
       cost_usd?: number; // present (0.0) only on the null-msg_id assistant case
+    }
+  | {
+      // Injected harness content (isMeta) the user did NOT type — rendered as a
+      // collapsed disclosure, never a "You" prompt. `meta_kind` picks the chrome:
+      // 'skill' (skill body, with skill_name) / 'command' (slash-command plumbing,
+      // raw <pre>) / 'context' (git-context, "Continue…", placeholders, "## Task").
+      // `text` is the rendered body (the kernel populates it from blocks; the DB
+      // text column stays '' so meta is not FTS-indexed).
+      kind: 'meta';
+      anchor: { session_id: string; uuid: string; id: number };
+      member_uuids: string[];
+      ts: string;
+      text: string;
+      blocks: ConversationBlock[];
+      is_sidechain: boolean;
+      subagent_key: string | null;
+      parent_uuid: string | null;
+      meta_kind: 'skill' | 'command' | 'context';
+      skill_name: string | null;
     };
 
 export type ConversationBlock =

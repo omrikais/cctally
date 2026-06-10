@@ -60,9 +60,33 @@
       "subagent_key": null,
       "text": "the token limit window resets every five hours",
       "ts": "2026-06-01T00:00:04Z"
+    },
+    {
+      "anchor": {
+        "id": 6,
+        "session_id": "s1",
+        "uuid": "sk1"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "Base directory for this skill: /home/u/.claude/skills/brainstorming\n\n# Brainstorming Ideas"
+        }
+      ],
+      "is_sidechain": false,
+      "kind": "meta",
+      "member_uuids": [
+        "sk1"
+      ],
+      "meta_kind": "skill",
+      "parent_uuid": "a1b",
+      "skill_name": "brainstorming",
+      "subagent_key": null,
+      "text": "Base directory for this skill: /home/u/.claude/skills/brainstorming\n\n# Brainstorming Ideas",
+      "ts": "2026-06-01T00:00:06Z"
     }
   ],
-  "last_activity_utc": "2026-06-01T00:00:05Z",
+  "last_activity_utc": "2026-06-01T00:00:06Z",
   "models": [
     "claude-opus-4-8"
   ],

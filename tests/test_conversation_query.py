@@ -874,3 +874,115 @@ def test_subagent_meta_happy_path_and_block_keys_stripped():
             assert "subagent_type" not in b
             assert "agent_id" not in b
             assert "subagent_meta" not in b
+
+
+# ---- injected-meta classification (skill / command / context) ------------
+
+def _meta_blocks(text):
+    return _json.dumps([{"kind": "text", "text": text}])
+
+
+def test_get_conversation_meta_skill_row_classified_with_name():
+    c = _conn()
+    body = "Base directory for this skill: /x/skills/brainstorming\n\n# Brainstorming Ideas"
+    # a true meta row: entry_type='meta', text='' (parser), body in blocks
+    _msg(c, session_id="s", uuid="m1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="t", entry_type="meta", text="", blocks_json=_meta_blocks(body))
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "meta"
+    assert it["meta_kind"] == "skill"
+    assert it["skill_name"] == "brainstorming"
+    assert "Brainstorming Ideas" in it["text"]            # render body populated from blocks
+
+
+def test_get_conversation_meta_command_and_context():
+    c = _conn()
+    _msg(c, session_id="s", uuid="m1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="t1", entry_type="meta", text="",
+         blocks_json=_meta_blocks("<command-name>clear</command-name>"))
+    _msg(c, session_id="s", uuid="m2", source_path="/p/s.jsonl", byte_offset=1,
+         timestamp_utc="t2", entry_type="meta", text="",
+         blocks_json=_meta_blocks("## Git Context\n- branch: main"))
+    items = cq.get_conversation(c, "s")["items"]
+    by_uuid = {it["anchor"]["uuid"]: it for it in items}
+    assert by_uuid["m1"]["meta_kind"] == "command" and by_uuid["m1"]["skill_name"] is None
+    assert by_uuid["m2"]["meta_kind"] == "context" and by_uuid["m2"]["skill_name"] is None
+
+
+def _set_reingest_pending(c):
+    c.execute("INSERT INTO cache_meta(key, value) VALUES('conversation_reingest_pending','1') "
+              "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+    c.commit()
+
+
+def test_get_conversation_human_skill_preamble_read_time_fallback_only_while_pending():
+    # A NOT-yet-reingested row: still entry_type='human' with the body in `text`.
+    # The read-time fallback renders it as skill-meta ONLY while the 005 reingest
+    # flag is pending (Codex code-review P1).
+    c = _conn()
+    _set_reingest_pending(c)
+    body = "Base directory for this skill: /a/b/systematic-debugging\n\nbody"
+    _msg(c, session_id="s", uuid="h1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="t", entry_type="human", text=body, blocks_json=_meta_blocks(body))
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "meta"
+    assert it["meta_kind"] == "skill" and it["skill_name"] == "systematic-debugging"
+
+
+def test_human_skill_preamble_stays_human_after_reingest_consumed():
+    # Flag NOT pending (post-reingest steady state): a genuine human prompt that
+    # merely STARTS WITH the skill preamble must stay a "You" turn, never a hidden
+    # collapsed skill pill (the Codex code-review P1 false-positive guard).
+    c = _conn()
+    body = "Base directory for this skill: is what I'd name the function — thoughts?"
+    _msg(c, session_id="s", uuid="h1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="t", entry_type="human", text=body, blocks_json=_meta_blocks(body))
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "human"
+    assert "meta_kind" not in it
+    # ...but a TRUE meta row still classifies even with the flag cleared.
+    c2 = _conn()
+    skill = "Base directory for this skill: /x/skills/brainstorming\n\nbody"
+    _msg(c2, session_id="s", uuid="m1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="t", entry_type="meta", text="", blocks_json=_meta_blocks(skill))
+    it2 = cq.get_conversation(c2, "s")["items"][0]
+    assert it2["kind"] == "meta" and it2["meta_kind"] == "skill"
+
+
+def test_get_conversation_human_non_skill_stays_human():
+    c = _conn()
+    _msg(c, session_id="s", uuid="h1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="t", entry_type="human", text="a real prompt",
+         blocks_json=_meta_blocks("a real prompt"))
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "human"
+    assert "meta_kind" not in it
+
+
+def test_meta_row_excluded_from_session_title():
+    # title derivation must skip a meta skill body even if it sorts first
+    c = _conn()
+    skill = "Base directory for this skill: /x/skills/brainstorming\n\nbody"
+    _msg(c, session_id="s", uuid="m1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="t1", entry_type="meta", text="", blocks_json=_meta_blocks(skill))
+    _msg(c, session_id="s", uuid="h1", source_path="/p/s.jsonl", byte_offset=1,
+         timestamp_utc="t2", entry_type="human", text="Resolve the cache bug",
+         blocks_json=_meta_blocks("Resolve the cache bug"))
+    title = cq.list_conversations(c)["conversations"][0]["title"]
+    assert title == "Resolve the cache bug"
+
+
+def test_pre_reingest_human_skill_body_skipped_as_title_while_pending():
+    # A not-yet-reingested skill body (still entry_type='human') that LEADS the
+    # transcript must not become the rail title while the 005 flag is pending
+    # (Codex code-review P2); derivation falls through to the real prompt.
+    c = _conn()
+    _set_reingest_pending(c)
+    skill = "Base directory for this skill: /x/skills/using-superpowers\n\nbody"
+    _msg(c, session_id="s", uuid="h0", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="t1", entry_type="human", text=skill, blocks_json=_meta_blocks(skill))
+    _msg(c, session_id="s", uuid="h1", source_path="/p/s.jsonl", byte_offset=1,
+         timestamp_utc="t2", entry_type="human", text="Resolve the cache bug",
+         blocks_json=_meta_blocks("Resolve the cache bug"))
+    title = cq.list_conversations(c)["conversations"][0]["title"]
+    assert title == "Resolve the cache bug"

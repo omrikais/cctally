@@ -55,6 +55,84 @@ def _title_from_text(text) -> str:
     return ""
 
 
+# Every Claude Code skill body (Skill-tool-invoked AND SessionStart-injected)
+# opens with this preamble line — the entry_type-independent skill discriminator.
+_SKILL_PREAMBLE = "Base directory for this skill:"
+
+
+def _first_nonblank_line(text) -> str:
+    """First non-blank, stripped line of `text` ('' if none). Skill detection
+    keys on this (NOT a strict body.startswith) so a leading blank text block
+    can't hide the preamble (Codex P2.2)."""
+    for line in (text or "").split("\n"):
+        s = line.strip()
+        if s:
+            return s
+    return ""
+
+
+def _skill_name_from_preamble(first_line) -> "str | None":
+    """`brainstorming` from `Base directory for this skill: …/skills/brainstorming`.
+    Basename of the path after the first ':'; None on an empty/degenerate path
+    (Codex P2.2) so the client renders a name-less 'Skill content' rather than a
+    dangling separator."""
+    _, _, rest = first_line.partition(":")
+    path = rest.strip().rstrip("/")
+    return os.path.basename(path) or None if path else None
+
+
+def _join_text_blocks(blocks) -> str:
+    """Rejoin a row's text-block bodies the way the parser's _blocks_and_text did
+    ('\\n'-joined). A true meta row carries text='' (parser) with the body here in
+    blocks; a not-yet-reingested human row carries the body in its text column —
+    _meta_classify reads whichever is populated."""
+    if not blocks:
+        return ""
+    return "\n".join(b.get("text", "") or "" for b in blocks if b.get("kind") == "text")
+
+
+def _reingest_pending(conn) -> bool:
+    """True iff migration 005's ``conversation_reingest_pending`` flag is still
+    set — i.e. existing history has NOT yet been re-ingested under the meta-aware
+    parser. While pending, a stale ``human`` row may actually be an injected
+    skill body, so the read-time skill fallback (rendering + title-skip) is
+    active. Once sync consumes the flag (skill bodies become true ``meta`` rows),
+    the fallback turns OFF — so a genuine human prompt that merely *starts with*
+    the skill preamble is never misclassified as a collapsed skill pill (Codex
+    code-review P1). Missing table / degraded DB -> treated as not pending."""
+    try:
+        return conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key='conversation_reingest_pending'"
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+
+
+def _meta_classify(item, allow_human_fallback):
+    """Classify an injected item by its BODY, returning ``(meta_kind, skill_name,
+    body)`` or ``None`` to leave it a genuine human turn.
+
+    - skill: first non-blank line is the skill preamble. Fires for a true 'meta'
+      row ALWAYS; for a 'human' row ONLY when ``allow_human_fallback`` is set (the
+      pre-reingest window — see _reingest_pending). After the reingest a 'human'
+      row keeping the preamble is a real user prompt, so it stays a "You" turn
+      rather than being hidden in a collapsed skill pill (Codex code-review P1).
+    - command/context: ONLY for a true 'meta' row (slash-command plumbing vs the
+      rest). A 'human' row that is not a skill body stays human — generic injected
+      context can't be recovered read-time without isMeta; it lands on the next
+      sync-triggered reingest."""
+    is_meta = item["kind"] == "meta"
+    body = item.get("text") or _join_text_blocks(item.get("blocks"))
+    first = _first_nonblank_line(body)
+    if first.startswith(_SKILL_PREAMBLE) and (is_meta or allow_human_fallback):
+        return ("skill", _skill_name_from_preamble(first), body)
+    if not is_meta:
+        return None
+    if _is_system_marker(body):
+        return ("command", None, body)
+    return ("context", None, body)
+
+
 def _session_titles_map(conn, session_ids):
     """{sid: title} for the first non-marker, non-blank MAIN-session human line
     per session (read-time, no migration). Windowed to the earliest 12 human
@@ -68,6 +146,14 @@ def _session_titles_map(conn, session_ids):
     if not session_ids:
         return {}
     titles = {}
+    # While 005's reingest is pending, a stale `human` row may actually be an
+    # injected skill body (a SessionStart skill can even lead the transcript) —
+    # skip those as title candidates so the rail never shows "Base directory for
+    # this skill: …" until the next sync reclassifies them to `meta` (which the
+    # entry_type='human' filter below then excludes). Gated on the flag for the
+    # same reason as the render fallback: a genuine post-reingest human prompt
+    # starting with the preamble stays a normal title (Codex code-review P2).
+    skip_skill_titles = _reingest_pending(conn)
     ph = ",".join("?" for _ in session_ids)
     rows = conn.execute(
         "SELECT session_id, text FROM ("
@@ -84,6 +170,8 @@ def _session_titles_map(conn, session_ids):
         if sid in titles:
             continue                 # already resolved to the first non-marker
         if _is_system_marker(text):
+            continue
+        if skip_skill_titles and _first_nonblank_line(text).startswith(_SKILL_PREAMBLE):
             continue
         t = _title_from_text(text)
         if t:
@@ -428,6 +516,24 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                     b["kind"] = "tool_call"
                     b["tool_use_id"] = b.pop("id", None)
                     b.setdefault("result", None)
+
+    # ---- Phase 4: classify injected meta items (skill / command / context) ----
+    # `meta` rows (the parser's isMeta classification) AND — only while the 005
+    # reingest is still pending — not-yet-reingested `human` rows whose body is a
+    # skill preamble (the read-time fallback) become kind='meta' with a meta_kind
+    # + skill_name, so the client renders a collapsed skill/system-marker/context
+    # disclosure instead of a "YOU" prompt. `text` is set to the rendered body
+    # (the DB text column stays '' for FTS); genuine human turns are untouched.
+    allow_human_fallback = _reingest_pending(conn)
+    for it in items:
+        if it["kind"] in ("meta", "human"):
+            cls = _meta_classify(it, allow_human_fallback)
+            if cls is not None:
+                meta_kind, skill_name, body = cls
+                it["kind"] = "meta"
+                it["meta_kind"] = meta_kind
+                it["skill_name"] = skill_name
+                it["text"] = body
 
     costs = _turn_cost_map(conn, list(turn_index))
     # Stamp per-item cost first, then derive the header from the SUM of the
