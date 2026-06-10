@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **The dashboard conversation reader now nests a skill's content inside its Skill tool call.** Previously a Skill invocation's loaded markdown body rendered as a separate collapsed "Skill content" pill below the assistant turn (visually detached from the Skill tool chip that produced it). The body now folds into the Skill tool chip itself as its expandable, rich-Markdown content (the redundant "Launching skill: <name>" line is dropped); SessionStart-injected skills, which have no Skill tool call, still render the standalone pill. The fix lands on existing history automatically the next time the dashboard syncs the conversation cache (a one-time re-ingest; the cache is re-derivable).
+
 ## [1.32.0] - 2026-06-10
 
 ### Added
