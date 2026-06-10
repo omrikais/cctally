@@ -244,6 +244,10 @@ than aborting.
 
 **Injected (`isMeta`) content.** Lines Claude Code injects into a transcript that you did not type — a skill's body (when an assistant turn invokes the `Skill` tool, or a `SessionStart` skill), git-context blocks, "Continue from where you left off.", pasted-image placeholders, slash-command plumbing — are never rendered as a "You" prompt. They collapse into quiet, collapsed-by-default disclosures: slash-command plumbing keeps the `System marker` pill, and everything else becomes a neutral `Injected context` pill. A skill body invoked via the `Skill` tool now **folds into its Skill tool chip** — the chip itself expands to the rich-Markdown body (the redundant "Launching skill: <name>" result is dropped), so the skill reads as one nested unit inside the turn rather than a detached pill below it. A `SessionStart` skill (no `Skill` tool call) keeps the standalone `Skill content · <name>` pill (the name is the skill's directory basename; its body still renders as full Markdown when expanded). Injected bodies are excluded from derived titles and full-text search. The classification — and the skill-body fold — land on existing history the next time the cache syncs (a one-time, lossless re-ingest of the re-derivable conversation cache).
 
+### Deep-linking & per-turn permalinks
+
+The conversation reader reflects its state into the URL hash: `#/conversations/<sessionId>` for an open conversation and `#/conversations/<sessionId>/<turnUuid>` for a specific turn. Reloading or using the browser Back/Forward buttons restores the conversation and re-lands the turn jump. Hovering any prose turn reveals a link button beside the copy button that copies a permalink straight to that turn and points the address bar at it. These links are local-first: a permalink is relative to your dashboard's origin and only resolves for someone who can already reach it (loopback, or your LAN when started with `--host 0.0.0.0`) — it is not a public, shareable-off-host URL.
+
 ## Shutdown
 
 `Ctrl-C` in the terminal where you launched the dashboard. The server
