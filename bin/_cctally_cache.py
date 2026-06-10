@@ -677,11 +677,18 @@ def sync_cache(
             # so those fields land here with zero new consumption code. Migration
             # 005 reuses it again to reclassify injected isMeta rows from
             # entry_type='human' to 'meta' (so the reader stops attributing skill
-            # bodies / git-context to the user).
+            # bodies / git-context to the user). Migration 006 uses a DISTINCT
+            # flag ``conversation_source_tool_use_reingest_pending`` (NOT the
+            # shared one) to land the message-level ``source_tool_use_id`` — the
+            # shared flag also gates the kernel's 005 human-fallback, so re-arming
+            # it for 006 could misclassify a genuine human prompt during the
+            # pre-reingest window. We trigger the SAME clear + offset-0 backfill on
+            # EITHER flag and clear BOTH atomically here under the held flock.
             try:
                 _reingest = conn.execute(
-                    "SELECT 1 FROM cache_meta "
-                    "WHERE key='conversation_reingest_pending'"
+                    "SELECT 1 FROM cache_meta WHERE key IN "
+                    "('conversation_reingest_pending',"
+                    " 'conversation_source_tool_use_reingest_pending')"
                 ).fetchone() is not None
             except sqlite3.OperationalError:
                 _reingest = False
@@ -689,8 +696,9 @@ def sync_cache(
                 clear_conversation_messages(conn)
                 backfill_conversation_messages(conn)
                 conn.execute(
-                    "DELETE FROM cache_meta "
-                    "WHERE key='conversation_reingest_pending'"
+                    "DELETE FROM cache_meta WHERE key IN "
+                    "('conversation_reingest_pending',"
+                    " 'conversation_source_tool_use_reingest_pending')"
                 )
                 conn.commit()
 

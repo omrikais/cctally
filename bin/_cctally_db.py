@@ -3050,6 +3050,30 @@ def _005_conversation_reingest_meta(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@cache_migration("006_conversation_reingest_source_tool_use_id")
+def _006_conversation_reingest_source_tool_use_id(conn: sqlite3.Connection) -> None:
+    """Flag-only re-ingest of conversation_messages so the message-level
+    ``sourceToolUseID`` lands on existing history as the new
+    ``source_tool_use_id`` column — the link the reader uses to fold a
+    Skill-invoked skill body into its Skill tool chip.
+
+    Sets a DISTINCT flag, ``conversation_source_tool_use_reingest_pending``,
+    NOT the shared ``conversation_reingest_pending``. The shared flag also gates
+    migration 005's read-time *human*-fallback (``_reingest_pending`` in the
+    query kernel); re-arming it here would re-enable that fallback after it was
+    consumed and could misclassify a genuine human prompt that happens to start
+    with the skill preamble as a collapsed skill pill during 006's pre-reingest
+    window. sync_cache consumes EITHER flag (clear + offset-0 backfill under the
+    cache.db.lock flock) and the offset-0 walk re-parses every JSONL through the
+    sourceToolUseID-aware parser, so the column lands with zero new consumption
+    code. A distinct ``schema_migrations`` marker is what triggers this reingest
+    on installs already at 005. Central stamp via the dispatcher (issue #140); a
+    fresh install stamps it without running (empty table -> the flag, if ever
+    set, is a harmless no-op)."""
+    _set_cache_meta(conn, "conversation_source_tool_use_reingest_pending", "1")
+    conn.commit()
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")
