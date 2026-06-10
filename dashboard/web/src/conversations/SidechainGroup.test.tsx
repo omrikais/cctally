@@ -108,6 +108,23 @@ describe('SidechainGroup', () => {
     expect(err.textContent).toContain('error');
   });
 
+  it('spells out a non-completed terminal status (⚠ <status>) with the warn class', () => {
+    const items = [member('r', { kind: 'assistant', text: 'Audit module D', cost_usd: 0.30 } as Partial<ConversationItem>)];
+    render(<SidechainGroup subagentKey="dddd4444" items={items} nested={false}
+             meta={{ kind: 'Explore', status: 'aborted' }} />);
+    const warn = document.querySelector('.conv-subagent-warn')!;
+    expect(warn.textContent).toContain('aborted');
+    expect(warn.textContent).toContain('⚠');
+  });
+
+  it('renders the kind eyebrow but no submeta line when only kind is present (no-blank-line guard)', () => {
+    const items = [member('r', { kind: 'assistant', text: 'Audit module E', cost_usd: 0.30 } as Partial<ConversationItem>)];
+    render(<SidechainGroup subagentKey="eeee5555" items={items} nested={false}
+             meta={{ kind: 'Explore' }} />);
+    expect(document.querySelector('.conv-sidechain-kindname')!.textContent).toContain('Explore');
+    expect(document.querySelector('.conv-sidechain-submeta')).toBeNull();
+  });
+
   it('falls back to title-only when meta is absent (no kind, no submeta line)', () => {
     const items = [member('r', { kind: 'assistant', text: 'Audit module C', cost_usd: 0.30 } as Partial<ConversationItem>)];
     render(<SidechainGroup subagentKey="cccc3333" items={items} nested={false} />);

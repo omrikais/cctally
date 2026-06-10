@@ -5377,7 +5377,7 @@ mark.current {
 .conv-sidechain-cost { color: var(--accent-green); }
 /* #166: the subagent kind in the eyebrow ("SUBAGENT · Explore") — the parent
    eyebrow is uppercased, so reset the kind name to its natural case. */
-.conv-sidechain-kindname { text-transform: none; color: var(--accent-magenta); }
+.conv-sidechain-kindname { text-transform: none; letter-spacing: 0; color: var(--accent-magenta); }
 /* #166: dim second meta line under the title — tokens / duration / tool count /
    status, mono, spaced. */
 .conv-sidechain-submeta {

@@ -10,6 +10,11 @@ describe('fmt.durationMs', () => {
     expect(fmt.durationMs(125000)).toBe('2m 5s');
     expect(fmt.durationMs(120000)).toBe('2m');
   });
+  it('carries 59.5s+ up to the next whole minute (no "Xm 60s")', () => {
+    expect(fmt.durationMs(119999)).toBe('2m');
+    expect(fmt.durationMs(179500)).toBe('3m');
+    expect(fmt.durationMs(59999)).toBe('1m');
+  });
   it('handles null/undefined', () => {
     expect(fmt.durationMs(null)).toBe('—');
     expect(fmt.durationMs(undefined)).toBe('—');

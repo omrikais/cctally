@@ -15,8 +15,8 @@ function statusBadge(status?: string) {
   if (status === 'completed')
     return <span className="conv-subagent-ok" aria-label="completed" title="completed">✓</span>;
   if (status === 'error')
-    return <span className="conv-subagent-err">✕ error</span>;
-  return <span className="conv-subagent-warn">⚠ {status}</span>;
+    return <span className="conv-subagent-err"><span aria-hidden="true">✕</span> error</span>;
+  return <span className="conv-subagent-warn"><span aria-hidden="true">⚠</span> {status}</span>;
 }
 
 // First non-blank line of the subagent's task prompt (its root message text),

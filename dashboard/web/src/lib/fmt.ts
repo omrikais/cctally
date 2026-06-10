@@ -258,10 +258,14 @@ export const fmt = {
   // (trailing "0s" dropped). Distinct from hhmm (seconds -> "Xh YYm").
   durationMs(v: number | null | undefined): string {
     if (v == null || !isFinite(v)) return '—';
-    const s = v / 1000;
-    if (s < 60) return `${s.toFixed(1)}s`;
-    const m = Math.floor(s / 60);
-    const rem = Math.round(s - m * 60);
+    // Round to whole seconds FIRST, then split into m/s — otherwise flooring
+    // minutes on the unrounded value while rounding the remainder carries a 60
+    // into the seconds slot (119999ms → "1m 60s" instead of "2m"). The
+    // sub-minute branch keys off the rounded total too, so 59999ms → "1m".
+    const total = Math.round(v / 1000);
+    if (total < 60) return `${(v / 1000).toFixed(1)}s`;
+    const m = Math.floor(total / 60);
+    const rem = total - m * 60;
     return rem ? `${m}m ${rem}s` : `${m}m`;
   },
   ddhh(v: number | null | undefined): string {
