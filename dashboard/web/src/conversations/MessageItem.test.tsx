@@ -542,17 +542,24 @@ describe('MessageItem (#174 permalink on tool-result & system-marker chips)', ()
     );
   });
 
-  it('clicking the summary permalink does not toggle the tool-result <details>', () => {
+  it('clicking the summary permalink does not propagate to an ancestor (stopPropagation contains it)', () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { clipboard: { writeText } });
-    const { container } = render(<MessageItem item={toolResult} />);
-    const details = container.querySelector('.conv-chip--result') as HTMLDetailsElement;
-    expect(details.open).toBe(false);
+    // PermalinkButton's stopPropagation must CONTAIN the click so it never reaches
+    // an ancestor handler (e.g. a row-level click-to-select). A click-spy wrapper
+    // proves that directly and is non-vacuous: drop stopPropagation and the spy
+    // fires. (We do NOT assert details.open: a <button> inside a <summary> never
+    // toggles the <details> in any engine — the button's own activation shadows the
+    // summary's, confirmed in real Chromium — so an open-state assertion would be
+    // vacuous and would NOT guard PermalinkButton's behavior.)
+    const onAncestorClick = vi.fn();
+    render(
+      <div onClick={onAncestorClick}>
+        <MessageItem item={toolResult} />
+      </div>,
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Copy link to this turn' }));
-    // jsdom DOES toggle details.open on a summary-area click (verified), so this
-    // is non-vacuous: PermalinkButton's stopPropagation is what keeps open=false
-    // for the summary-DESCENDANT button. Drop stopPropagation and this flips true.
-    expect(details.open).toBe(false);
+    expect(onAncestorClick).not.toHaveBeenCalled();
   });
 
   it('prose permalink buttons keep the exact class "conv-copy-btn" (no regression)', () => {
