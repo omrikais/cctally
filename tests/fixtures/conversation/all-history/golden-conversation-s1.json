@@ -21,7 +21,7 @@
     },
     {
       "anchor": {
-        "id": 4,
+        "id": 5,
         "session_id": "s1",
         "uuid": "a1b"
       },
@@ -43,6 +43,16 @@
           "tool_use_id": "toolu_s1a"
         },
         {
+          "input_summary": "{\"skill\":\"brainstorming\"}",
+          "kind": "tool_call",
+          "name": "Skill",
+          "preview": "brainstorming",
+          "result": null,
+          "skill_body": "Base directory for this skill: /home/u/.claude/skills/brainstorming\n\n# Brainstorming Ideas",
+          "skill_name": "brainstorming",
+          "tool_use_id": "toolu_FX"
+        },
+        {
           "kind": "text",
           "text": "the token limit window resets every five hours"
         }
@@ -53,7 +63,9 @@
       "member_uuids": [
         "a1a",
         "a1b",
-        "tr1"
+        "tr1",
+        "tr_fx",
+        "sk1"
       ],
       "model": "claude-opus-4-8",
       "parent_uuid": "h1",
@@ -63,30 +75,30 @@
     },
     {
       "anchor": {
-        "id": 6,
+        "id": 8,
         "session_id": "s1",
-        "uuid": "sk1"
+        "uuid": "sk2"
       },
       "blocks": [
         {
           "kind": "text",
-          "text": "Base directory for this skill: /home/u/.claude/skills/brainstorming\n\n# Brainstorming Ideas"
+          "text": "Base directory for this skill: /home/u/.claude/skills/using-superpowers\n\n# Using Superpowers"
         }
       ],
       "is_sidechain": false,
       "kind": "meta",
       "member_uuids": [
-        "sk1"
+        "sk2"
       ],
       "meta_kind": "skill",
       "parent_uuid": "a1b",
-      "skill_name": "brainstorming",
+      "skill_name": "using-superpowers",
       "subagent_key": null,
-      "text": "Base directory for this skill: /home/u/.claude/skills/brainstorming\n\n# Brainstorming Ideas",
-      "ts": "2026-06-01T00:00:06Z"
+      "text": "Base directory for this skill: /home/u/.claude/skills/using-superpowers\n\n# Using Superpowers",
+      "ts": "2026-06-01T00:00:07Z"
     }
   ],
-  "last_activity_utc": "2026-06-01T00:00:06Z",
+  "last_activity_utc": "2026-06-01T00:00:07Z",
   "models": [
     "claude-opus-4-8"
   ],

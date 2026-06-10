@@ -13,11 +13,17 @@ The cache.db holds Plan 1's ``conversation_messages`` (+ FTS, created by
 load-bearing kernel invariants:
 
   * Session ``s1`` — a human prompt + a MULTI-FRAGMENT assistant turn
-    ``(m1, r1)`` (a thinking-only fragment + a prose fragment) + ONE matching
-    ``session_entries`` row for ``(m1, r1)`` so per-turn cost is non-zero. The
-    model is ``claude-opus-4-8`` (a real id in ``CLAUDE_MODEL_PRICING`` — a
-    bare ``"opus"`` prices to $0). The prose carries the distinctive search
-    term "token limit window" for the search golden.
+    ``(m1, r1)`` (a thinking + two id-bearing tool_use fragment + a prose
+    fragment) + ONE matching ``session_entries`` row for ``(m1, r1)`` so
+    per-turn cost is non-zero. The model is ``claude-opus-4-8`` (a real id in
+    ``CLAUDE_MODEL_PRICING`` — a bare ``"opus"`` prices to $0). The prose
+    carries the distinctive search term "token limit window" for the search
+    golden. Two skill bodies exercise the skill-content nesting fold: a PAIRED
+    body (a real Skill TRIPLE — a ``Skill`` tool_use ``toolu_FX``, a "Launching
+    skill" tool_result for it, and an isMeta body carrying
+    ``source_tool_use_id=toolu_FX``) that folds INTO the Skill tool chip, and a
+    separate UNPAIRED skill body (no ``source_tool_use_id``, SessionStart-style)
+    that survives as the standalone "Skill content" pill.
   * A REPLAY of the prose fragment in a SECOND ``source_path`` (same
     ``(session_id, uuid)``, different ``byte_offset``) — proves the reader
     dedup + cost-once join + search dedup all collapse it to one.
@@ -108,6 +114,7 @@ def _insert_message(
     cwd: str | None = None,
     git_branch: str | None = None,
     is_sidechain: int = 0,
+    source_tool_use_id: str | None = None,
 ) -> None:
     """Insert one ``conversation_messages`` row (no shared helper exists).
 
@@ -116,17 +123,21 @@ def _insert_message(
     so it does not collide. The AFTER INSERT FTS trigger (created by
     ``_apply_cache_schema``) indexes ``text`` automatically when FTS5 is
     available.
+
+    ``source_tool_use_id`` is the message-level link an injected Skill body
+    carries (the transcript's ``sourceToolUseID``); the reader uses it to fold
+    the body into its owning Skill tool chip. NULL on every non-skill-body row.
     """
     conn.execute(
         "INSERT INTO conversation_messages "
         "(session_id, uuid, parent_uuid, source_path, byte_offset, "
         " timestamp_utc, entry_type, text, blocks_json, model, msg_id, req_id, "
-        " cwd, git_branch, is_sidechain) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " cwd, git_branch, is_sidechain, source_tool_use_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             session_id, uuid, parent_uuid, source_path, byte_offset,
             timestamp_utc, entry_type, text, blocks_json, model, msg_id, req_id,
-            cwd, git_branch, is_sidechain,
+            cwd, git_branch, is_sidechain, source_tool_use_id,
         ),
     )
 
@@ -191,7 +202,13 @@ def build(scenario: str) -> None:
         # tool_use (no prose). The tool_use carries an id (toolu_s1a) + a
         # parse-time preview so the reader pairs it with the matching
         # tool_result row below (#164) — exercising the kernel's two-phase fold
-        # + the member_uuids growth.
+        # + the member_uuids growth. The SECOND tool_use is a Skill invocation
+        # (id=toolu_FX, name="Skill") — the head of the Skill TRIPLE (tool_use +
+        # "Launching skill" tool_result + an isMeta body carrying
+        # source_tool_use_id=toolu_FX). The reader FOLDS that body into THIS
+        # Skill tool_call (skill_body/skill_name set, result cleared, body uuid
+        # joined to member_uuids), so the standalone skill pill disappears for
+        # the paired case.
         _insert_message(
             cache_conn,
             session_id="s1", uuid="a1a", parent_uuid="h1",
@@ -202,7 +219,10 @@ def build(scenario: str) -> None:
                 '[{"kind": "thinking", "text": "let me think"}, '
                 '{"kind": "tool_use", "name": "Read", "input_summary": '
                 '"{\\"file_path\\":\\"/home/u/proj/resets.py\\"}", '
-                '"id": "toolu_s1a", "preview": "/home/u/proj/resets.py"}]'
+                '"id": "toolu_s1a", "preview": "/home/u/proj/resets.py"}, '
+                '{"kind": "tool_use", "name": "Skill", "input_summary": '
+                '"{\\"skill\\":\\"brainstorming\\"}", '
+                '"id": "toolu_FX", "preview": "brainstorming"}]'
             ),
             model=MODEL, msg_id="m1", req_id="r1",
             cwd=s1_cwd, git_branch="main",
@@ -222,6 +242,23 @@ def build(scenario: str) -> None:
                 '[{"kind": "tool_result", "text": "def reset(): ...", '
                 '"truncated": false, "is_error": false, '
                 '"tool_use_id": "toolu_s1a"}]'
+            ),
+            cwd=s1_cwd, git_branch="main",
+        )
+        # The trivial "Launching skill" tool_result for toolu_FX (Skill triple,
+        # message 2 of 3). The Phase 4b skill-body fold REPLACES this result with
+        # the rich body and sets the chip's result to null, so this row's only
+        # job is to be the pre-fold pairing target the body supersedes.
+        _insert_message(
+            cache_conn,
+            session_id="s1", uuid="tr_fx", parent_uuid="a1a",
+            source_path=s1_file_a, byte_offset=5,
+            timestamp_utc="2026-06-01T00:00:04Z",
+            entry_type="tool_result", text="",
+            blocks_json=(
+                '[{"kind": "tool_result", "text": "Launching skill: brainstorming", '
+                '"truncated": false, "is_error": false, '
+                '"tool_use_id": "toolu_FX"}]'
             ),
             cwd=s1_cwd, git_branch="main",
         )
@@ -264,21 +301,43 @@ def build(scenario: str) -> None:
             cwd=s1_cwd, git_branch="main",
         )
 
-        # id=5 (NEW): an injected isMeta skill body (the assistant invoked a
-        # Skill). entry_type='meta', text='' (not FTS-indexed, not a title
-        # candidate); the body lives in a text block. The reader renders a
-        # collapsed "Skill content · brainstorming" disclosure — NEVER a "You"
-        # prompt — exercising the kernel's meta_kind/skill_name derivation
-        # end-to-end through the GET route. No msg_id/req_id -> no cost join.
+        # PAIRED skill body (Skill triple, message 3 of 3): an injected isMeta
+        # skill body carrying source_tool_use_id=toolu_FX — the explicit link
+        # back to the Skill tool_use in a1a. entry_type='meta', text='' (not
+        # FTS-indexed, not a title candidate); the body lives in a text block.
+        # The reader FOLDS this into the Skill tool_call (skill_body/skill_name
+        # set, result cleared, uuid sk1 joined to member_uuids) and DROPS the
+        # standalone item — so s1 has NO standalone skill pill. No msg_id/req_id
+        # -> no cost join.
         _insert_message(
             cache_conn,
-            session_id="s1", uuid="sk1", parent_uuid="a1b",
+            session_id="s1", uuid="sk1", parent_uuid="tr_fx",
             source_path=s1_file_a, byte_offset=4,
             timestamp_utc="2026-06-01T00:00:06Z",
             entry_type="meta", text="",
             blocks_json=(
                 '[{"kind": "text", "text": "Base directory for this skill: '
                 '/home/u/.claude/skills/brainstorming\\n\\n# Brainstorming Ideas"}]'
+            ),
+            cwd=s1_cwd, git_branch="main",
+            source_tool_use_id="toolu_FX",
+        )
+
+        # UNPAIRED skill body: an isMeta skill body with NO source_tool_use_id
+        # (a SessionStart-injected skill, e.g. using-superpowers — no Skill
+        # tool_use, no link). The reader CANNOT fold it, so it survives as the
+        # standalone "Skill content · using-superpowers" pill — the permanent
+        # fallback path. This is the SINGLE remaining meta item on s1 after the
+        # paired sk1 folds into its Skill chip.
+        _insert_message(
+            cache_conn,
+            session_id="s1", uuid="sk2", parent_uuid="a1b",
+            source_path=s1_file_a, byte_offset=6,
+            timestamp_utc="2026-06-01T00:00:07Z",
+            entry_type="meta", text="",
+            blocks_json=(
+                '[{"kind": "text", "text": "Base directory for this skill: '
+                '/home/u/.claude/skills/using-superpowers\\n\\n# Using Superpowers"}]'
             ),
             cwd=s1_cwd, git_branch="main",
         )
@@ -296,7 +355,6 @@ def build(scenario: str) -> None:
         )
 
         # --- session s2: human-only (rail >=2 + pagination) ------------------
-        # id=5.
         _insert_message(
             cache_conn,
             session_id="s2", uuid="h2", parent_uuid=None,

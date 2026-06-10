@@ -230,7 +230,11 @@ print("ok")
     # Non-golden structural asserts: the (m1,r1) turn appears ONCE, cost ONCE,
     # sum(items.cost)==header cost_usd, cursor shape present. Plus #164: the
     # tool_result FOLDS into the turn's tool_call (no standalone tool_result
-    # item) and its uuid joins the turn's member_uuids.
+    # item) and its uuid joins the turn's member_uuids. Plus skill-content
+    # nesting: the PAIRED skill body (sk1, source_tool_use_id=toolu_FX) folds
+    # INTO the Skill tool_call (skill_body/skill_name set, result null, sk1
+    # joined to member_uuids) and its standalone item DISAPPEARS, while the
+    # UNPAIRED skill body (sk2, no link) survives as the lone standalone pill.
     local reader_raw reader_check
     reader_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s1")
     reader_check=$(printf '%s' "$reader_raw" | python3 -c '
@@ -240,32 +244,41 @@ errs = []
 items = d.get("items") or []
 kinds = [it.get("kind") for it in items]
 # #164: the tool_result FOLDED into the turn, so there is no standalone
-# tool_result item — only [human, assistant]. The injected isMeta skill body
-# lands as a trailing `meta` item (NEVER a "human"/"You" prompt).
+# tool_result item — only [human, assistant]. The PAIRED skill body folded into
+# the Skill chip (dropped as an item); the UNPAIRED skill body (sk2) is the lone
+# trailing `meta` item (NEVER a "human"/"You" prompt).
 if kinds != ["human", "assistant", "meta"]:
-    errs.append("items kinds != [human, assistant, meta] (replay/fragments/result not folded): %r" % (kinds,))
+    errs.append("items kinds != [human, assistant, meta] (replay/fragments/result/skill-fold not applied): %r" % (kinds,))
 if any(k == "tool_result" for k in kinds):
     errs.append("a standalone tool_result item survived folding: %r" % (kinds,))
-# The injected skill body is reclassified to a skill-meta item, not a "You" turn.
+# The lone surviving meta item is the UNPAIRED skill (sk2), not the folded sk1.
 metas = [it for it in items if it.get("kind") == "meta"]
 if len(metas) != 1:
-    errs.append("expected ONE meta item (the skill body), got %d" % (len(metas),))
+    errs.append("expected ONE standalone meta item (the UNPAIRED skill body), got %d" % (len(metas),))
 else:
     meta = metas[0]
+    if meta.get("anchor", {}).get("uuid") != "sk2":
+        errs.append("standalone meta is not the UNPAIRED sk2 (paired sk1 should have folded away): %r" % (meta.get("anchor"),))
     if meta.get("meta_kind") != "skill":
         errs.append("meta_kind != skill: %r" % (meta.get("meta_kind"),))
-    if meta.get("skill_name") != "brainstorming":
-        errs.append("skill_name != brainstorming: %r" % (meta.get("skill_name"),))
-    if "Brainstorming Ideas" not in (meta.get("text") or ""):
-        errs.append("meta render text missing the skill body: %r" % (meta.get("text"),))
+    if meta.get("skill_name") != "using-superpowers":
+        errs.append("standalone skill_name != using-superpowers: %r" % (meta.get("skill_name"),))
+    if "Using Superpowers" not in (meta.get("text") or ""):
+        errs.append("standalone meta render text missing the unpaired skill body: %r" % (meta.get("text"),))
+# The PAIRED skill body (sk1) must NOT survive as a standalone item anywhere.
+if any(it.get("anchor", {}).get("uuid") == "sk1" for it in items):
+    errs.append("the PAIRED skill body sk1 survived as a standalone item (should have folded into the Skill chip)")
 assistants = [it for it in items if it.get("kind") == "assistant"]
 if len(assistants) != 1:
     errs.append("turn not collapsed to ONE assistant item: %d" % (len(assistants),))
 else:
     turn = assistants[0]
-    # #164: the folded tool_result uuid (tr1) joins member_uuids (the #160 anchor).
-    if set(turn.get("member_uuids") or []) != {"a1a", "a1b", "tr1"}:
-        errs.append("member_uuids != {a1a,a1b,tr1}: %r" % (turn.get("member_uuids"),))
+    # #164/#160: every folded uuid joins member_uuids (the jump anchor) — the two
+    # prose/seed fragments (a1a, a1b), the Read tool_result (tr1, Phase 2), the
+    # "Launching skill" tool_result (tr_fx, Phase 2 — folded BEFORE its result is
+    # superseded), and the skill body (sk1, Phase 4b).
+    if set(turn.get("member_uuids") or []) != {"a1a", "a1b", "tr1", "tr_fx", "sk1"}:
+        errs.append("member_uuids != {a1a,a1b,tr1,tr_fx,sk1}: %r" % (turn.get("member_uuids"),))
     anc = turn.get("anchor") or {}
     if anc.get("session_id") != "s1" or anc.get("uuid") != "a1b":
         errs.append("turn anchor != (s1, a1b): %r" % (anc,))
@@ -277,17 +290,35 @@ else:
     if any(b.get("kind") == "tool_use" for b in blocks):
         errs.append("a bare tool_use block survived the sweep: %r" % (blocks,))
     calls = [b for b in blocks if b.get("kind") == "tool_call"]
-    if len(calls) != 1:
-        errs.append("expected ONE tool_call block, got %d" % (len(calls),))
+    # TWO tool_calls now: the Read (toolu_s1a) + the Skill (toolu_FX).
+    if len(calls) != 2:
+        errs.append("expected TWO tool_call blocks (Read + Skill), got %d" % (len(calls),))
+    by_id = {c.get("tool_use_id"): c for c in calls}
+    read_call = by_id.get("toolu_s1a")
+    if read_call is None:
+        errs.append("the Read tool_call (toolu_s1a) is missing")
     else:
-        call = calls[0]
-        if call.get("tool_use_id") != "toolu_s1a":
-            errs.append("tool_call.tool_use_id != toolu_s1a: %r" % (call.get("tool_use_id"),))
-        if call.get("preview") != "/home/u/proj/resets.py":
-            errs.append("tool_call.preview wrong: %r" % (call.get("preview"),))
-        res = call.get("result") or {}
+        if read_call.get("preview") != "/home/u/proj/resets.py":
+            errs.append("Read tool_call.preview wrong: %r" % (read_call.get("preview"),))
+        res = read_call.get("result") or {}
         if res.get("text") != "def reset(): ...":
-            errs.append("tool_call.result.text wrong: %r" % (res.get("text"),))
+            errs.append("Read tool_call.result.text wrong: %r" % (res.get("text"),))
+        if "skill_body" in read_call:
+            errs.append("the Read tool_call wrongly carries a skill_body: %r" % (read_call.get("skill_body"),))
+    # Skill-content nesting: the Skill tool_call carries the folded body and a
+    # cleared result; the "Launching skill" tool_result was superseded.
+    skill_call = by_id.get("toolu_FX")
+    if skill_call is None:
+        errs.append("the Skill tool_call (toolu_FX) is missing")
+    else:
+        if skill_call.get("name") != "Skill":
+            errs.append("Skill tool_call.name != Skill: %r" % (skill_call.get("name"),))
+        if skill_call.get("skill_name") != "brainstorming":
+            errs.append("Skill tool_call.skill_name != brainstorming: %r" % (skill_call.get("skill_name"),))
+        if "Brainstorming Ideas" not in (skill_call.get("skill_body") or ""):
+            errs.append("Skill tool_call.skill_body missing the folded body: %r" % (skill_call.get("skill_body"),))
+        if skill_call.get("result") is not None:
+            errs.append("Skill tool_call.result not cleared on fold: %r" % (skill_call.get("result"),))
 # Cost counted exactly once despite the cross-file replay.
 s = sum(it.get("cost_usd", 0.0) for it in items)
 if abs(s - d.get("cost_usd", 0.0)) >= 1e-9:
