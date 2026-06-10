@@ -3,6 +3,7 @@ import { Markdown } from '../components/Markdown';
 import { MessageBlocks } from './MessageBlocks';
 import { ResultIcon, SystemIcon, SkillIcon } from './ConvIcons';
 import { CopyButton } from './CopyButton';
+import { PermalinkButton } from './PermalinkButton';
 import { isSystemMarker } from './systemMarkers';
 import type { ConversationItem } from '../types/conversation';
 
@@ -75,6 +76,7 @@ function MessageItemImpl(
           // Hover/focus-revealed action copying the turn's joined prose. Only
           // when there IS prose — a tool-only assistant turn renders none.
           <div className="conv-item-actions">
+            <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
             <CopyButton text={item.text} />
           </div>
         )}
@@ -127,6 +129,7 @@ function MessageItemImpl(
               <MessageBlocks blocks={item.blocks} />
               {mk === 'skill' && item.text && (
                 <div className="conv-item-actions">
+                  <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
                   <CopyButton text={item.text} />
                 </div>
               )}
@@ -168,6 +171,7 @@ function MessageItemImpl(
       <MessageBlocks blocks={item.blocks.filter((b) => b.kind !== 'text')} />
       {item.text && (
         <div className="conv-item-actions">
+          <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
           <CopyButton text={item.text} />
         </div>
       )}

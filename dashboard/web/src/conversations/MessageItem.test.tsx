@@ -337,6 +337,26 @@ describe('MessageItem (message-text copy, G2)', () => {
     expect(writeText).toHaveBeenCalledWith(human.text);
   });
 
+  it('a prose turn renders both a permalink and a copy button', () => {
+    render(<MessageItem item={assistant} />);
+    expect(
+      screen.getByRole('button', { name: 'Copy link to this turn' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy' })).toBeInTheDocument();
+  });
+
+  it('the permalink button copies the deep-link for the turn', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<MessageItem item={assistant} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy link to this turn' }));
+    // assistant.anchor = { session_id: 's', uuid: 'a1', id: 2 }. The origin is
+    // derived from the runtime so the assertion is robust to jsdom's default host.
+    expect(writeText).toHaveBeenCalledWith(
+      `${window.location.origin}/#/conversations/s/a1`,
+    );
+  });
+
   it('a tool-only assistant turn (empty item.text) renders no message-text copy', () => {
     const toolOnly: ConversationItem = {
       kind: 'assistant',
