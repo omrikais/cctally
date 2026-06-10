@@ -62,6 +62,13 @@ export type ConversationBlock =
   // Mirrors the kernel's Phase-3 sweep field-for-field
   // (bin/_lib_conversation_query.py): result is the folded tool_result, or null
   // when the request had no matched result (request-only).
+  //
+  // skill_body/skill_name (skill-content nesting): present ONLY on a Skill
+  // tool_call whose injected skill body the kernel folded into the chip
+  // (matching the body's source_tool_use_id). When skill_body != null the chip
+  // expands to the rich-markdown body itself (no request/result panels) and the
+  // kernel clears `result`. Absent on every non-folded tool_call (back-compat;
+  // consumers tolerate unknown keys).
   | {
       kind: 'tool_call';
       name: string | null;
@@ -69,6 +76,8 @@ export type ConversationBlock =
       preview: string;
       tool_use_id: string | null;
       result: { text: string; truncated: boolean; is_error: boolean } | null;
+      skill_body?: string;
+      skill_name?: string | null;
     }
   // 'tool_result' BLOCK kind survives ONLY inside a standalone orphan
   // tool_result ITEM (a result the kernel could not fold into a request).

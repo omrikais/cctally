@@ -4961,8 +4961,10 @@ mark.current {
 /* isMeta lines the user did NOT type — collapsed-by-default disclosure, never
    a "You" turn (no spine role-dot: that CSS targets --human/--assistant only).
    Mirrors .conv-system-marker; the skill variant takes the cyan Skill-chip
-   accent so the "Skill content" pill reads as one unit with the Skill tool chip
-   right above it. */
+   accent. A PAIRED skill body now folds into its Skill tool chip itself
+   (skill-content nesting); this standalone pill serves only UNPAIRED skills
+   (SessionStart injection, or the pre-reingest window), where the cyan accent
+   keeps it visually consistent with the Skill chip. */
 .conv-item--meta { padding: 0; background: transparent; border: none; }
 .conv-meta {
   border: 1px dashed var(--border-soft);

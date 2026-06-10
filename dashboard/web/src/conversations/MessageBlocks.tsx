@@ -89,7 +89,29 @@ function ToolResultBody({ result, name, preview }: { result: ToolResult; name: s
 // one-line preview · status (· error / · truncated). Expanded: the request
 // (input_summary) plus the result body (result.text, scroll-capped) or a
 // "no result" note when the request was never matched (result === null).
+//
+// Skill-content nesting: when the kernel folded an injected skill body into this
+// Skill chip (skill_body != null), the chip expands straight to the rich-markdown
+// body — NO request/result panels (the trivial "Launching skill" result was
+// dropped; args are a poor fidelity carrier). Header is identical to the
+// collapsed look the user already sees, so the chip simply becomes the thing
+// that expands. Collapsed by default.
 function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool_call' }> }) {
+  if (call.skill_body != null) {
+    return (
+      <details className="conv-chip conv-chip--tool conv-chip--skill">
+        <summary>
+          <span className="conv-chev" aria-hidden="true" />
+          {toolIcon(call.name)} <span className="conv-chip-name">{call.name ?? 'tool'}</span>
+          <span className="conv-chip-preview">{call.preview}</span>
+        </summary>
+        <div className="conv-chip-body">
+          <CopyButton text={call.skill_body} />
+          <Markdown>{call.skill_body}</Markdown>
+        </div>
+      </details>
+    );
+  }
   const status = call.result?.is_error
     ? ' · error'
     : call.result?.truncated

@@ -395,6 +395,20 @@ describe('MessageItem (message-text copy, G2)', () => {
     expect(container.textContent).toContain('Brainstorming Ideas');
   });
 
+  it('unpaired skill body (SessionStart / fold fallback) still renders the standalone "Skill content" pill', () => {
+    // Regression guard for skill-content nesting: paired skills fold into the
+    // Skill tool chip (in MessageBlocks), but an UNPAIRED skill body — a
+    // standalone meta_kind:'skill' ITEM the kernel could not fold (SessionStart
+    // injection, or the pre-reingest NULL-column window) — must keep rendering
+    // the standalone collapsed pill here.
+    const { container } = render(<MessageItem item={metaSkill} />);
+    const details = container.querySelector('details.conv-meta.conv-meta--skill')!;
+    expect(details).not.toBeNull();
+    expect((details as HTMLDetailsElement).open).toBe(false);
+    expect(container.textContent).toContain('Skill content');
+    expect(container.textContent).toContain('brainstorming');
+  });
+
   it('renders a skill meta row WITHOUT a skill_name as a name-less pill', () => {
     const noName: ConversationItem = { ...metaSkill, anchor: { session_id: 's', uuid: 'm1b', id: 10 }, skill_name: null };
     const { container } = render(<MessageItem item={noName} />);

@@ -267,6 +267,62 @@ describe('MessageBlocks — tool I/O syntax highlighting', () => {
   });
 });
 
+describe('MessageBlocks — Skill tool_call body (skill-content nesting)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const skillCall = (over: Partial<Extract<ConversationBlock, { kind: 'tool_call' }>> = {}) =>
+    call({
+      name: 'Skill',
+      input_summary: '{"skill":"brainstorming"}',
+      preview: 'brainstorming',
+      tool_use_id: 'toolu_S',
+      result: null,
+      skill_body: '# Heading\n\nsome **body** text',
+      skill_name: 'brainstorming',
+      ...over,
+    });
+
+  it('renders the skill body as rich markdown with no request/result panels, collapsed', () => {
+    const { container } = render(<MessageBlocks blocks={[skillCall()]} />);
+    // No request/result I/O panels for a skill chip.
+    expect(container.querySelector('.conv-tool-io-label')).toBeNull();
+    expect(container.querySelector('.conv-chip-body--io')).toBeNull();
+    // The markdown body rendered (heading text present, bold rendered to <strong>).
+    expect(container.textContent).toContain('Heading');
+    expect(container.querySelector('.md')).not.toBeNull();
+    expect(container.querySelector('strong')!.textContent).toBe('body');
+    // Collapsed by default.
+    expect((container.querySelector('details.conv-chip--tool') as HTMLDetailsElement).open).toBe(false);
+    // Header unchanged: Skill name + the skill-name preview.
+    const summary = container.querySelector('summary')!;
+    expect(summary.textContent).toContain('Skill');
+    expect(summary.textContent).toContain('brainstorming');
+    // No · error / · truncated / · ok status (result is dropped).
+    expect(container.querySelector('.conv-chip-status')).toBeNull();
+  });
+
+  it('exposes a copy button for the skill body', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const { container } = render(
+      <MessageBlocks blocks={[skillCall({ skill_body: 'the-skill-body' })]} />,
+    );
+    (container.querySelector('details.conv-chip--tool') as HTMLDetailsElement).open = true;
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
+    expect(writeText).toHaveBeenCalledWith('the-skill-body');
+  });
+
+  it('a normal tool_call (no skill_body) is unchanged — request/result panels render', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[call({ name: 'Bash', input_summary: 'ls', preview: 'ls' })]} />,
+    );
+    expect(container.querySelector('.conv-chip-body--io')).not.toBeNull();
+    expect(container.querySelector('.conv-tool-io-label')).not.toBeNull();
+  });
+});
+
 describe('MessageBlocks (copy affordances, G2)', () => {
   afterEach(() => {
     vi.restoreAllMocks();

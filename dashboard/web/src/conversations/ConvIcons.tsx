@@ -64,9 +64,11 @@ export function SystemIcon() {
   );
 }
 
-// Puzzle piece — the skill glyph. Shared by the Skill tool chip (toolIcon)
-// and the folded "Skill content" meta pill so the two adjacent elements read
-// as one skill unit.
+// Puzzle piece — the skill glyph. Shared by the Skill tool chip (toolIcon) and
+// the standalone "Skill content" meta pill. A paired skill body now folds into
+// the Skill tool chip itself (skill-content nesting); the standalone pill — and
+// this glyph on it — serves only UNPAIRED skills (SessionStart injection, or the
+// pre-reingest window), keeping the two cases visually consistent.
 export function SkillIcon() {
   return (
     <Svg>
