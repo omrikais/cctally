@@ -246,7 +246,7 @@ than aborting.
 
 ### Deep-linking & per-turn permalinks
 
-The conversation reader reflects its state into the URL hash: `#/conversations/<sessionId>` for an open conversation and `#/conversations/<sessionId>/<turnUuid>` for a specific turn. Reloading or using the browser Back/Forward buttons restores the conversation and re-lands the turn jump. Hovering any prose turn reveals a link button beside the copy button that copies a permalink straight to that turn and points the address bar at it. These links are local-first: a permalink is relative to your dashboard's origin and only resolves for someone who can already reach it (loopback, or your LAN when started with `--host 0.0.0.0`) — it is not a public, shareable-off-host URL.
+The conversation reader reflects its state into the URL hash: `#/conversations/<sessionId>` for an open conversation and `#/conversations/<sessionId>/<turnUuid>` for a specific turn. Reloading or using the browser Back/Forward buttons restores the conversation and re-lands the turn jump. Hovering any turn — prose, tool-result, or system-marker — reveals a link button that copies a permalink straight to that turn and points the address bar at it; on prose turns it sits beside the copy button, and on the collapsible tool-result and system-marker chips it sits in the summary row. These links are local-first: a permalink is relative to your dashboard's origin and only resolves for someone who can already reach it (loopback, or your LAN when started with `--host 0.0.0.0`) — it is not a public, shareable-off-host URL.
 
 ## Shutdown
 

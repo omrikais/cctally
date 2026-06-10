@@ -5336,6 +5336,21 @@ mark.current {
   .conv-item-actions { transition: none; }
 }
 
+/* Per-turn permalink on the tool-result / system-marker chip summary rows
+   (#174): right-aligned, hover/focus/keyboard-cursor revealed — same gate as
+   the prose .conv-item-actions row. */
+.conv-chip-permalink {
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.conv-item:hover .conv-chip-permalink,
+.conv-item:focus-within .conv-chip-permalink,
+.conv-item--focused .conv-chip-permalink { opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  .conv-chip-permalink { transition: none; }
+}
+
 /* ---- Orphan tool-result run (collapsed bare-result texture) -------- */
 .conv-toolresult-run {
   border: 1px solid var(--border-soft);

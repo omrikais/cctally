@@ -48,6 +48,18 @@ const toolResult: ConversationItem = {
   parent_uuid: null,
 };
 
+const systemMarker: ConversationItem = {
+  kind: 'human',
+  anchor: { session_id: 's', uuid: 'sm1', id: 4 },
+  member_uuids: ['sm1'],
+  ts: 't',
+  text: '<command-name>clear</command-name>',
+  blocks: [],
+  is_sidechain: false,
+  subagent_key: null,
+  parent_uuid: null,
+};
+
 describe('MessageItem', () => {
   it('renders a human message with prose and the data-uuid', () => {
     const { container } = render(<MessageItem item={human} />);
@@ -482,5 +494,70 @@ describe('MessageItem (message-text copy, G2)', () => {
     expect(container.querySelector('.conv-item--human')).toBeNull();
     expect(container.querySelector('.conv-item--assistant')).toBeNull();
     expect(container.querySelector('.conv-item--meta')).not.toBeNull();
+  });
+});
+
+describe('MessageItem (#174 permalink on tool-result & system-marker chips)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('tool-result chip renders a permalink in its summary', () => {
+    const { container } = render(<MessageItem item={toolResult} />);
+    const summary = container.querySelector('.conv-chip--result > summary')!;
+    expect(summary).not.toBeNull();
+    expect(
+      summary.querySelector('button[aria-label="Copy link to this turn"]'),
+    ).not.toBeNull();
+  });
+
+  it('tool-result permalink copies the deep-link for the turn', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<MessageItem item={toolResult} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy link to this turn' }));
+    // toolResult.anchor = { session_id: 's', uuid: 'tr1' }. Origin/pathname are
+    // derived from the runtime so the assertion is robust to jsdom's host.
+    expect(writeText).toHaveBeenCalledWith(
+      `${window.location.origin}/#/conversations/s/tr1`,
+    );
+  });
+
+  it('system-marker chip renders a permalink in its summary', () => {
+    const { container } = render(<MessageItem item={systemMarker} />);
+    const summary = container.querySelector('.conv-system-marker > summary')!;
+    expect(summary).not.toBeNull();
+    expect(
+      summary.querySelector('button[aria-label="Copy link to this turn"]'),
+    ).not.toBeNull();
+  });
+
+  it('system-marker permalink copies the deep-link for the turn', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<MessageItem item={systemMarker} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy link to this turn' }));
+    expect(writeText).toHaveBeenCalledWith(
+      `${window.location.origin}/#/conversations/s/sm1`,
+    );
+  });
+
+  it('clicking the summary permalink does not toggle the tool-result <details>', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const { container } = render(<MessageItem item={toolResult} />);
+    const details = container.querySelector('.conv-chip--result') as HTMLDetailsElement;
+    expect(details.open).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy link to this turn' }));
+    // jsdom DOES toggle details.open on a summary-area click (verified), so this
+    // is non-vacuous: PermalinkButton's stopPropagation is what keeps open=false
+    // for the summary-DESCENDANT button. Drop stopPropagation and this flips true.
+    expect(details.open).toBe(false);
+  });
+
+  it('prose permalink buttons keep the exact class "conv-copy-btn" (no regression)', () => {
+    render(<MessageItem item={assistant} />);
+    const btn = screen.getByRole('button', { name: 'Copy link to this turn' });
+    expect(btn.className).toBe('conv-copy-btn');
   });
 });

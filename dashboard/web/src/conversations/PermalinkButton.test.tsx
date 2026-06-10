@@ -58,4 +58,16 @@ describe('PermalinkButton', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Copy link to this turn' }));
     expect(onToggle).not.toHaveBeenCalled();
   });
+
+  it('appends an optional className alongside the base class', () => {
+    render(<PermalinkButton sessionId="s" uuid="u" className="conv-chip-permalink" />);
+    const btn = screen.getByRole('button', { name: 'Copy link to this turn' });
+    expect(btn.className).toBe('conv-copy-btn conv-chip-permalink');
+  });
+
+  it('renders the base class alone when no className is passed', () => {
+    render(<PermalinkButton sessionId="s" uuid="u" />);
+    const btn = screen.getByRole('button', { name: 'Copy link to this turn' });
+    expect(btn.className).toBe('conv-copy-btn');
+  });
 });

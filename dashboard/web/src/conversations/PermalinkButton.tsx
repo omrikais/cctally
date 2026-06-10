@@ -7,12 +7,12 @@ import { permalinkUrl, reflectTurnUrl } from '../store/urlRouting';
 // enclosing <details>. On click it copies the absolute deep-link AND reflects
 // the address bar to this turn (replaceState) — but does NOT dispatch a jump,
 // so the turn already under the cursor is not re-scrolled/flashed.
-export function PermalinkButton({ sessionId, uuid }: { sessionId: string; uuid: string }) {
+export function PermalinkButton({ sessionId, uuid, className }: { sessionId: string; uuid: string; className?: string }) {
   const { copied, copy } = useCopy();
   return (
     <button
       type="button"
-      className="conv-copy-btn"
+      className={`conv-copy-btn ${className ?? ''}`.trim()}
       aria-label={copied ? 'Link copied' : 'Copy link to this turn'}
       onClick={(e) => {
         e.stopPropagation();

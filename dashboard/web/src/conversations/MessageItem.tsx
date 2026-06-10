@@ -49,6 +49,7 @@ function MessageItemImpl(
           <summary>
             <span className="conv-chev" aria-hidden="true" />
             <ResultIcon /> Tool result
+            <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} className="conv-chip-permalink" />
           </summary>
           <div className="conv-chip-body"><MessageBlocks blocks={item.blocks} /></div>
         </details>
@@ -153,6 +154,7 @@ function MessageItemImpl(
           <summary>
             <span className="conv-chev" aria-hidden="true" />
             <SystemIcon /> System marker
+            <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} className="conv-chip-permalink" />
           </summary>
           <pre className="conv-system-marker-body">{item.text}</pre>
         </details>
