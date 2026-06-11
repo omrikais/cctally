@@ -13,7 +13,29 @@ import { highlightBody } from './CodeBlock';
 import { LineNumberedCode } from './LineNumberedCode';
 import { resultLang } from './toolLang';
 import { specialToolRenderer } from './specialTools';
+import { TaskChecklistCard } from './TaskChecklistCard';
 import type { ConversationBlock } from '../types/conversation';
+
+type ToolCall = Extract<ConversationBlock, { kind: 'tool_call' }>;
+
+// Claude Code's live to-do family. A run of these whose FIRST call carries a
+// kernel-stamped task_snapshot collapses to ONE checklist card (see
+// isTaskChecklistRun); anything else stays the generic tool-run group.
+const TASK_TRIO = new Set(['TaskCreate', 'TaskUpdate', 'TaskList']);
+
+// A Task* checklist run = the run's first call is a Task* tool AND carries a
+// task_snapshot array. The kernel stamps the snapshot on the run's first call
+// only, so checking the first call is sufficient and avoids mis-collapsing a
+// run that merely interleaves a Task* call after other tools.
+function isTaskChecklistRun(calls: ToolCall[]): boolean {
+  const first = calls[0];
+  return (
+    first != null &&
+    first.name != null &&
+    TASK_TRIO.has(first.name) &&
+    Array.isArray(first.task_snapshot)
+  );
+}
 
 // Render a turn's blocks in DOCUMENT ORDER (#164): consecutive `text` coalesce
 // into one <Markdown>; a maximal run of consecutive `tool_call` becomes one
@@ -64,6 +86,15 @@ export function MessageBlocks({ blocks }: { blocks: ConversationBlock[] }) {
 // "tool run · N actions" head (label + trailing rule via CSS); a single call
 // renders a bare chip with no head.
 function ToolRun({ calls }: { calls: Extract<ConversationBlock, { kind: 'tool_call' }>[] }) {
+  // A Task* checklist run collapses to ONE card showing the running to-do list
+  // snapshot, suppressing the N generic chips + the "tool run · N actions" head.
+  if (isTaskChecklistRun(calls)) {
+    return (
+      <div className="conv-toolrun">
+        <TaskChecklistCard call={calls[0]} />
+      </div>
+    );
+  }
   return (
     <div className="conv-toolrun">
       {calls.length >= 2 && (

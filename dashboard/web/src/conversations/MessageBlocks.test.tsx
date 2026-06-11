@@ -422,3 +422,64 @@ describe('MessageBlocks — Session 2 special tool dispatch', () => {
     expect(d.open).toBe(false);
   });
 });
+
+describe('MessageBlocks — Task* checklist run collapses to one card', () => {
+  const taskSnap = [
+    { content: 'Alpha', status: 'completed', activeForm: 'Alphaing' },
+    { content: 'Beta', status: 'in_progress', activeForm: 'Betaing' },
+    { content: 'Gamma', status: 'pending', activeForm: 'Gammaing' },
+  ];
+
+  it('a Task* run (first call carries task_snapshot) renders ONE Tasks card, no run head', () => {
+    // Two TaskCreate calls + a TaskUpdate; only the FIRST carries the snapshot
+    // (the kernel stamps the run's first call). The whole run collapses to one
+    // checklist card — NOT three generic chips with a "tool run · N actions" head.
+    const { container } = render(<MessageBlocks blocks={[
+      call({ name: 'TaskCreate', tool_use_id: 'c1', task_snapshot: taskSnap,
+             input: { subject: 'Alpha', activeForm: 'Alphaing' } }),
+      call({ name: 'TaskCreate', tool_use_id: 'c2',
+             input: { subject: 'Beta', activeForm: 'Betaing' } }),
+      call({ name: 'TaskUpdate', tool_use_id: 'u1',
+             input: { taskId: '1', status: 'in_progress' } }),
+    ]} />);
+    expect(container.querySelectorAll('.conv-todo')).toHaveLength(1);
+    expect(container.querySelector('.conv-chip-name')?.textContent).toBe('Tasks');
+    expect(container.querySelector('.conv-toolrun-head')).toBeNull();
+    // none of the individual Task* calls leaked as a generic tool chip
+    expect(container.querySelector('.conv-chip--tool')).toBeNull();
+    // the snapshot rendered (1 of 3 done)
+    expect(container.querySelector('.conv-todo-frac')?.textContent?.replace(/\s+/g, ' '))
+      .toContain('1 / 3');
+  });
+
+  it('a single Task* call carrying a snapshot also collapses to one Tasks card', () => {
+    const { container } = render(<MessageBlocks blocks={[
+      call({ name: 'TaskList', tool_use_id: 'l1', task_snapshot: taskSnap }),
+    ]} />);
+    expect(container.querySelectorAll('.conv-todo')).toHaveLength(1);
+    expect(container.querySelector('.conv-chip-name')?.textContent).toBe('Tasks');
+    expect(container.querySelector('.conv-toolrun-head')).toBeNull();
+  });
+
+  it('a Task* run whose first call lacks a snapshot stays a generic group (degrades)', () => {
+    // Legacy / non-folded rows have no task_snapshot on the first call → the
+    // checklist interception does not fire; the generic chips render.
+    const { container } = render(<MessageBlocks blocks={[
+      call({ name: 'TaskCreate', tool_use_id: 'c1', input: { subject: 'Alpha' } }),
+      call({ name: 'TaskCreate', tool_use_id: 'c2', input: { subject: 'Beta' } }),
+    ]} />);
+    expect(container.querySelector('.conv-todo')).toBeNull();
+    expect(container.querySelector('.conv-toolrun-head')).toBeTruthy(); // N>=2 head
+    expect(container.querySelectorAll('.conv-chip--tool').length).toBeGreaterThan(0);
+  });
+
+  it('a non-Task run still renders the generic tool-run group', () => {
+    const { container } = render(<MessageBlocks blocks={[
+      call({ name: 'Read', tool_use_id: 't1', preview: '/a' }),
+      call({ name: 'Read', tool_use_id: 't2', preview: '/b' }),
+    ]} />);
+    expect(container.querySelector('.conv-todo')).toBeNull();
+    expect(container.querySelector('.conv-toolrun-head')).toBeTruthy();
+    expect(container.querySelectorAll('.conv-chip--tool').length).toBe(2);
+  });
+});
