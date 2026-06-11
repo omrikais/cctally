@@ -640,7 +640,9 @@ def sync_cache(
                 "DELETE FROM cache_meta WHERE key IN "
                 "('conversation_reingest_pending',"
                 " 'conversation_source_tool_use_reingest_pending',"
-                " 'conversation_reingest_enrichment_pending')")
+                " 'conversation_reingest_enrichment_pending',"
+                " 'conversation_reingest_cursor',"
+                " 'conversation_reingest_cursor_gen')")
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Claude cached entries")
 
@@ -720,15 +722,12 @@ def sync_cache(
             except sqlite3.OperationalError:
                 _reingest = False
             if _reingest:
-                clear_conversation_messages(conn)
-                backfill_conversation_messages(conn)
-                conn.execute(
-                    "DELETE FROM cache_meta WHERE key IN "
-                    "('conversation_reingest_pending',"
-                    " 'conversation_source_tool_use_reingest_pending',"
-                    " 'conversation_reingest_enrichment_pending')"
-                )
-                conn.commit()
+                # #179: resumable per-file reingest (was a global clear_conversation_messages
+                # + offset-0 backfill that re-armed the entire ~2.5min rebuild on any
+                # interrupt). The helper checkpoints a sorted-path cursor and clears the
+                # three flags + cursor + gen atomically on completion. Never on the rebuild
+                # path (which already wipes + repopulates id-aware via the normal walk).
+                _resumable_reingest_conversation_messages(conn)
 
         paths: list[pathlib.Path] = list(_iter_claude_jsonl_files())
         stats.files_total = len(paths)
@@ -1155,6 +1154,97 @@ def backfill_conversation_messages(conn: sqlite3.Connection) -> int:
             if cur.rowcount and cur.rowcount > 0:
                 inserted += cur.rowcount
     return inserted
+
+
+_REINGEST_FLAG_KEYS = (
+    "conversation_reingest_pending",
+    "conversation_source_tool_use_reingest_pending",
+    "conversation_reingest_enrichment_pending",
+)
+
+
+def _reingest_parse_file(jp, path_str):
+    """Parse one Claude JSONL into enriched ``conversation_messages`` row tuples
+    (``_CONV_INSERT_SQL`` column order). Mirrors ``backfill_conversation_messages``'s
+    inner read+flatten, factored to a module-level seam so the resumable reingest
+    builds rows BEFORE any write (a parse failure does no DML) and tests can inject.
+    Raises ``OSError`` if the file can't be opened/read."""
+    rows = []
+    with open(jp, "r", encoding="utf-8", errors="replace") as fh:
+        for m in _iter_message_rows(fh, path_str):
+            rows.append(_conv_row_tuple(m, path_str))
+    return rows
+
+
+def _resumable_reingest_conversation_messages(conn):
+    """#179: resumable, lock-friendly replacement for the old global
+    ``clear_conversation_messages`` + offset-0 ``backfill_conversation_messages``
+    reingest, which re-armed the whole ~2.5min rebuild on any interrupt. Walks
+    every Claude JSONL in deterministic sorted-path order, re-enriching one file
+    per atomic transaction and checkpointing ``conversation_reingest_cursor`` so an
+    interrupt resumes instead of restarting. A ``conversation_reingest_cursor_gen``
+    fingerprint (the set of pending reingest flags) resets the cursor whenever the
+    pending-flag set changes, so a newly-armed flag forces a fresh pass. The caller
+    (``sync_cache``) already holds the cache.db flock; per-file commits bound only
+    the SQLite write transaction, not the flock. Clears the three flags + cursor +
+    gen atomically on completion."""
+    # 1. Generation guard: reset the cursor if the live pending-flag set differs.
+    set_flags = [k for k in _REINGEST_FLAG_KEYS
+                 if conn.execute("SELECT 1 FROM cache_meta WHERE key=?", (k,)).fetchone()]
+    gen = ",".join(sorted(set_flags))
+    grow = conn.execute(
+        "SELECT value FROM cache_meta WHERE key='conversation_reingest_cursor_gen'"
+    ).fetchone()
+    if (grow[0] if grow else None) != gen:
+        conn.execute("INSERT INTO cache_meta(key,value) "
+                     "VALUES('conversation_reingest_cursor_gen',?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (gen,))
+        conn.execute("DELETE FROM cache_meta WHERE key='conversation_reingest_cursor'")
+        conn.commit()
+        cursor = ""
+    else:
+        crow = conn.execute(
+            "SELECT value FROM cache_meta WHERE key='conversation_reingest_cursor'"
+        ).fetchone()
+        cursor = crow[0] if crow and crow[0] is not None else ""
+
+    # 2. Per-file resumable walk in deterministic sorted-path order.
+    for jp in sorted(_iter_claude_jsonl_files(), key=str):
+        path_str = str(jp)
+        if path_str <= cursor:
+            continue
+        try:
+            rows = _reingest_parse_file(jp, path_str)   # parse FIRST — no DML on failure
+        except OSError as exc:
+            eprint(f"[conversation-reingest] could not read {jp}: {exc}; "
+                   "preserving existing rows")
+            conn.execute("INSERT INTO cache_meta(key,value) "
+                         "VALUES('conversation_reingest_cursor',?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (path_str,))
+            conn.commit()
+            continue
+        try:
+            conn.execute("DELETE FROM conversation_messages WHERE source_path=?",
+                         (path_str,))
+            if rows:
+                conn.executemany(_CONV_INSERT_SQL, rows)
+            conn.execute("INSERT INTO cache_meta(key,value) "
+                         "VALUES('conversation_reingest_cursor',?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (path_str,))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    # 3. Completion: clear flags + cursor + gen atomically.
+    conn.execute(
+        "DELETE FROM cache_meta WHERE key IN "
+        "('conversation_reingest_pending',"
+        " 'conversation_source_tool_use_reingest_pending',"
+        " 'conversation_reingest_enrichment_pending',"
+        " 'conversation_reingest_cursor',"
+        " 'conversation_reingest_cursor_gen')")
+    conn.commit()
 
 
 def iter_entries(
