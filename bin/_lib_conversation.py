@@ -20,6 +20,7 @@ _INPUT_LEAF_CAP = 8000     # max chars per string leaf in a bounded tool input
 _INPUT_TOTAL_CAP = 32000   # honesty backstop on the serialized bounded input
 _INPUT_MAX_NODES = 2000    # max dict-values + list-elements kept before tail elision
 _INPUT_MAX_DEPTH = 12      # max nesting depth before subtree elision (RecursionError guard)
+_INPUT_KEY_CAP = 512       # max chars per dict key (else keys are stored verbatim, unbounded)
 _INPUT_ELISION = "…"       # sentinel for elided leaves / subtrees
 
 
@@ -158,7 +159,10 @@ def _blocks_and_text(content):
     Prose (``text``) = joined ``text`` blocks only (thinking / tool_use /
     tool_result excluded — those go to the prose FTS via the ``text`` column).
     ``search_aux`` (#177) = the non-prose searchable content: bounded tool-input
-    string leaves, the (capped) tool_result ``text``, and the thinking text —
+    string leaves, the (capped) tool_result ``text``, and the thinking text
+    capped at ``_TOOL_RESULT_CAP`` (code-review I2 — the FULL thinking still
+    lives in ``blocks_json`` for rendering; only this aux index entry is capped
+    so the second FTS index doesn't double the at-rest cost of large thinking) —
     indexed by the parallel ``conversation_fts_aux`` so tool content stays
     searchable without polluting prose FTS. Prose is deliberately excluded from
     aux (it is already in ``text``)."""
@@ -176,8 +180,8 @@ def _blocks_and_text(content):
                 texts.append(txt)
             elif bt == "thinking":
                 think = b.get("thinking", "") or ""
-                blocks.append({"kind": "thinking", "text": think})
-                aux_parts.append(think)
+                blocks.append({"kind": "thinking", "text": think})  # FULL text for render
+                aux_parts.append(think[:_TOOL_RESULT_CAP])          # aux index capped (I2)
             elif bt == "tool_use":
                 bounded, input_trunc = _bound_input(b.get("input"))
                 block = {"kind": "tool_use", "name": b.get("name"),
@@ -269,13 +273,15 @@ def _summarize(inp):
 def _bound_input(inp):
     """Return (bounded_structured_input, truncated) for a tool_use input dict, or
     (None, False) for a non-dict (the same non-dict contract as _summarize /
-    tool_preview). Hard-bounds the result on four axes so a pathological input
-    can't bloat blocks_json (Codex P1): string leaves clip to _INPUT_LEAF_CAP;
-    non-string scalars pass through; once _INPUT_MAX_NODES dict-values/list-
-    elements are kept the remainder elides to _INPUT_ELISION; recursion past
-    _INPUT_MAX_DEPTH elides the subtree (RecursionError guard). A final
-    _INPUT_TOTAL_CAP serialized-size check is the honesty backstop. Structure is
-    preserved for the kept prefix so downstream renderers can read tool params."""
+    tool_preview). Hard-bounds the result on five axes so a pathological input
+    can't bloat blocks_json (Codex P1 + code-review I1): string leaves clip to
+    _INPUT_LEAF_CAP; dict keys clip to _INPUT_KEY_CAP (keys were stored verbatim
+    otherwise — the last unbounded axis); non-string scalars pass through; once
+    _INPUT_MAX_NODES dict-values/list-elements are kept the remainder elides to
+    _INPUT_ELISION; recursion past _INPUT_MAX_DEPTH elides the subtree
+    (RecursionError guard). A final _INPUT_TOTAL_CAP serialized-size check is the
+    honesty backstop. Structure is preserved for the kept prefix so downstream
+    renderers can read tool params."""
     if not isinstance(inp, dict):
         return (None, False)
     state = {"nodes": 0, "truncated": False}
@@ -292,12 +298,16 @@ def _bound_input(inp):
         if isinstance(v, dict):
             out = {}
             for k, vv in v.items():
+                ks = str(k)
+                if len(ks) > _INPUT_KEY_CAP:   # clip pathological long keys (I1)
+                    state["truncated"] = True
+                    ks = ks[:_INPUT_KEY_CAP]
                 if state["nodes"] >= _INPUT_MAX_NODES:
                     state["truncated"] = True
-                    out[str(k)] = _INPUT_ELISION
+                    out[ks] = _INPUT_ELISION
                     break
                 state["nodes"] += 1
-                out[str(k)] = walk(vv, depth + 1)
+                out[ks] = walk(vv, depth + 1)
             return out
         if isinstance(v, list):
             out = []

@@ -399,6 +399,15 @@ def test_bound_input_node_budget_tail_elides():
     # serialized size is bounded
     assert len(json.dumps(obj)) <= lc._INPUT_TOTAL_CAP * 2
 
+def test_bound_input_clips_long_dict_key():
+    # code-review I1: keys were stored verbatim, so a pathological many-long-keys
+    # input was unbounded (~7× over _INPUT_TOTAL_CAP). The key axis is now clipped.
+    long_key = "K" * (lc._INPUT_KEY_CAP + 50)
+    obj, trunc = lc._bound_input({long_key: "v"})
+    (only_key,) = obj.keys()
+    assert len(only_key) == lc._INPUT_KEY_CAP
+    assert trunc is True
+
 def test_bound_input_depth_cap_no_recursion():
     node = {"leaf": "ok"}
     for _ in range(lc._INPUT_MAX_DEPTH + 20):
@@ -492,3 +501,18 @@ def test_search_aux_includes_tool_result_text():
     row = lc.parse_message_row(line, 0)
     assert "RESULT_TOKEN" in row.search_aux
     assert row.text == ""                             # tool_result zeroes prose, NOT aux
+
+def test_search_aux_caps_thinking_but_block_keeps_full():
+    # code-review I2: the aux index entry for a thinking block is capped at
+    # _TOOL_RESULT_CAP so the second FTS index doesn't double the at-rest cost of
+    # large thinking — but the blocks_json thinking block keeps the FULL text for
+    # rendering (Session 2+).
+    full = "T" * (lc._TOOL_RESULT_CAP + 500)
+    row = lc.parse_message_row(_asst_line([{"type": "thinking", "thinking": full}]), 0)
+    # aux contribution of the thinking run is capped at _TOOL_RESULT_CAP. The
+    # block is the sole aux source here, so search_aux is exactly the capped run.
+    assert len(row.search_aux) == lc._TOOL_RESULT_CAP
+    # the stored thinking block keeps the FULL text for rendering
+    blocks = json.loads(row.blocks_json)
+    think = [b for b in blocks if b["kind"] == "thinking"][0]
+    assert len(think["text"]) == lc._TOOL_RESULT_CAP + 500
