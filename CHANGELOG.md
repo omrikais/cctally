@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.37.0] - 2026-06-11
+
 ### Added
 - Conversation viewer: Claude Code's live to-do tools (`TaskCreate`/`TaskUpdate`/`TaskList`) now render as a single checklist card with a progress bar — the same card the retired `TodoWrite` used — reconstructed at read time from the create/update/delete stream so the task list evolves turn by turn, instead of separate raw JSON tool chips. Additive; the legacy `TodoWrite` path is unchanged and no database migration is required.
 
