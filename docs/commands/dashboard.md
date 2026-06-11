@@ -158,6 +158,10 @@ The periodic background sync runs every 5 seconds (configurable via
 the OAuth API, so Anthropic's rate limit is not affected by background
 ticks. Only chip clicks / `r` presses trigger OAuth fetches.
 
+## Startup sync
+
+The dashboard binds its HTTP port immediately and serves the current cached snapshot; the first full sync (and any pending one-time conversation-enrichment reingest) runs in the background and is pushed to the page over SSE when it completes. On a large transcript history the background reingest is resumable — interrupting the dashboard mid-sync and relaunching resumes where it left off rather than restarting. To start without any sync, use `--no-sync`; to consume a pending reingest in one foreground pass, run `cctally cache-sync` (or `cache-sync --rebuild`).
+
 ## Manual verification (post-v2)
 
 Before merging or releasing v2 changes, run through:
