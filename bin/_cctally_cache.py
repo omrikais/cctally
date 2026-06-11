@@ -268,6 +268,9 @@ _CACHE_MIGRATIONS = _cctally_db_sib._CACHE_MIGRATIONS
 # drop/recreate dance so the per-row delete trigger never fires O(rows) under
 # the held lock on a rebuild / truncation escalation.
 clear_conversation_messages = _cctally_db_sib.clear_conversation_messages
+# cache_meta key/value upsert helper — reused by the resumable reingest cursor
+# writes (#179) so the ON CONFLICT idiom lives in one place. Caller commits.
+_set_cache_meta = _cctally_db_sib._set_cache_meta
 
 
 # === BEGIN MOVED REGIONS ===
@@ -1192,13 +1195,11 @@ def _resumable_reingest_conversation_messages(conn):
     set_flags = [k for k in _REINGEST_FLAG_KEYS
                  if conn.execute("SELECT 1 FROM cache_meta WHERE key=?", (k,)).fetchone()]
     gen = ",".join(sorted(set_flags))
-    grow = conn.execute(
+    gen_row = conn.execute(
         "SELECT value FROM cache_meta WHERE key='conversation_reingest_cursor_gen'"
     ).fetchone()
-    if (grow[0] if grow else None) != gen:
-        conn.execute("INSERT INTO cache_meta(key,value) "
-                     "VALUES('conversation_reingest_cursor_gen',?) "
-                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (gen,))
+    if (gen_row[0] if gen_row else None) != gen:
+        _set_cache_meta(conn, "conversation_reingest_cursor_gen", gen)
         conn.execute("DELETE FROM cache_meta WHERE key='conversation_reingest_cursor'")
         conn.commit()
         cursor = ""
@@ -1216,11 +1217,13 @@ def _resumable_reingest_conversation_messages(conn):
         try:
             rows = _reingest_parse_file(jp, path_str)   # parse FIRST — no DML on failure
         except OSError as exc:
+            # Read/parse failed BEFORE any conversation_messages DML — the file's
+            # existing rows are untouched (preserved, not dropped). Only advance the
+            # cursor; this cursor-only write needs no rollback envelope (no message
+            # DML to undo, and an interrupt mid-commit just re-runs this file).
             eprint(f"[conversation-reingest] could not read {jp}: {exc}; "
                    "preserving existing rows")
-            conn.execute("INSERT INTO cache_meta(key,value) "
-                         "VALUES('conversation_reingest_cursor',?) "
-                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (path_str,))
+            _set_cache_meta(conn, "conversation_reingest_cursor", path_str)
             conn.commit()
             continue
         try:
@@ -1228,9 +1231,7 @@ def _resumable_reingest_conversation_messages(conn):
                          (path_str,))
             if rows:
                 conn.executemany(_CONV_INSERT_SQL, rows)
-            conn.execute("INSERT INTO cache_meta(key,value) "
-                         "VALUES('conversation_reingest_cursor',?) "
-                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (path_str,))
+            _set_cache_meta(conn, "conversation_reingest_cursor", path_str)
             conn.commit()
         except BaseException:
             conn.rollback()
