@@ -137,10 +137,15 @@ def test_distinct_flag_consumed_lands_source_tool_use_id(isolated):
         "WHERE key='conversation_source_tool_use_reingest_pending'"
     ).fetchone() is None
 
-    # the stale id-less row was wiped by the clear
+    # #179: the resumable per-file reingest replaced the old global
+    # clear_conversation_messages, so it no longer purges rows for JSONL files
+    # no longer on disk — the per-file walk only visits on-disk files. The
+    # /stale/path.jsonl orphan therefore SURVIVES until a `cache-sync --rebuild`
+    # (spec §3 item 3: deliberate, matching sync_cache's existing no-prune
+    # posture for orphans on the normal path).
     assert conn.execute(
         "SELECT COUNT(*) FROM conversation_messages WHERE uuid='old'"
-    ).fetchone()[0] == 0
+    ).fetchone()[0] == 1
 
     # the skill body row now carries source_tool_use_id
     row = conn.execute(
