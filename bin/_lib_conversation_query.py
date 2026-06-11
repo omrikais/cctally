@@ -711,24 +711,37 @@ _TASK_TRIO = ("TaskCreate", "TaskUpdate", "TaskList")
 def _fold_task_runs(items, task_link):
     """Reconstruct the running to-do list from the chronological Task* op stream
     and stamp the resulting todos[] snapshot onto the FIRST tool_call of each
-    Task* run. State spans the whole session; key on the explicit task id (never
-    reused). `deleted` drops a task; a TaskList result reseeds the whole snapshot.
+    Task* run. Key on the explicit task id (never reused). `deleted` drops a
+    task; a TaskList result reseeds the whole snapshot.
+
+    Scoped PER subagent thread (``subagent_key``): the main session (key None)
+    and each subagent keep INDEPENDENT running checklists, so parallel subagents
+    with disjoint task-id ranges never bleed into one another's cards. Within a
+    thread, state still spans the whole session.
+
+    Degradation guard: a thread's run is stamped only once that thread has
+    recognized a real create/list (``seen``). A Task* run with no recognizable
+    create — a future result shape we don't parse, or pre-fix legacy rows —
+    leaves ``task_snapshot`` ABSENT, so the frontend falls back to generic chips
+    instead of a misleading empty "0 / 0" card.
 
     Mirrors the ask_answers join: the parser stashed the record-level identity
     onto the tool_result block, the Phase-1 sweep popped it into ``task_link``
     keyed by tool_use_id, and this fold joins it back. The frontend stays a pure
     todos[] renderer — all running-list state lives here."""
-    order = []
-    state = {}
+    threads = {}      # subagent_key -> {"order": [...], "state": {...}, "seen": bool}
 
-    def snapshot():
-        return [dict(content=state[i]["content"], status=state[i]["status"],
-                     **({"activeForm": state[i]["activeForm"]} if state[i].get("activeForm") else {}))
-                for i in order if i in state]
+    def snapshot(th):
+        st, order = th["state"], th["order"]
+        return [dict(content=st[i]["content"], status=st[i]["status"],
+                     **({"activeForm": st[i]["activeForm"]} if st[i].get("activeForm") else {}))
+                for i in order if i in st]
 
     for it in items:
         if it.get("kind") != "assistant":
             continue
+        th = threads.setdefault(it.get("subagent_key"),
+                                {"order": [], "state": {}, "seen": False})
         first_task_call = None
         for b in it["blocks"]:
             if b.get("kind") != "tool_call" or b.get("name") not in _TASK_TRIO:
@@ -741,30 +754,32 @@ def _fold_task_runs(items, task_link):
             if name == "TaskCreate":
                 tid = link.get("task_id")
                 if tid is not None:
-                    if tid not in state:
-                        order.append(tid)
-                    state[tid] = {"content": inp.get("subject") or "", "status": "pending",
-                                  "activeForm": inp.get("activeForm") or ""}
+                    th["seen"] = True
+                    if tid not in th["state"]:
+                        th["order"].append(tid)
+                    th["state"][tid] = {"content": inp.get("subject") or "", "status": "pending",
+                                        "activeForm": inp.get("activeForm") or ""}
             elif name == "TaskUpdate":
                 tid = str(inp.get("taskId")) if inp.get("taskId") is not None else link.get("task_id")
                 status = inp.get("status")
                 if tid is not None:
                     if status == "deleted":
-                        state.pop(tid, None)
-                    elif tid in state and status:
-                        state[tid]["status"] = status
+                        th["state"].pop(tid, None)
+                    elif tid in th["state"] and status:
+                        th["state"][tid]["status"] = status
             elif name == "TaskList":
                 snap = link.get("task_list")
                 if snap is not None:
-                    order = []
-                    state = {}
+                    th["seen"] = True
+                    th["order"] = []
+                    th["state"] = {}
                     for t in snap:
                         tid = t["id"]
-                        order.append(tid)
-                        state[tid] = {"content": t.get("subject") or "",
-                                      "status": t.get("status") or "pending", "activeForm": ""}
-        if first_task_call is not None:
-            first_task_call["task_snapshot"] = snapshot()
+                        th["order"].append(tid)
+                        th["state"][tid] = {"content": t.get("subject") or "",
+                                            "status": t.get("status") or "pending", "activeForm": ""}
+        if first_task_call is not None and th["seen"]:
+            first_task_call["task_snapshot"] = snapshot(th)
 
 
 def _latest(logical, col):

@@ -1515,3 +1515,55 @@ def test_non_task_run_has_no_snapshot():
     call = [b for it in cq.get_conversation(c, "s1")["items"] if it["kind"] == "assistant"
             for b in it["blocks"] if b.get("kind") == "tool_call"][0]
     assert "task_snapshot" not in call
+
+
+def test_task_fold_scopes_per_subagent():
+    # Two parallel subagents each run their OWN checklist with DISJOINT task ids
+    # (the real shape: agent A creates #7..#8, agent B creates #1..#2). A single
+    # shared fold state would bleed one subagent's tasks into the other's card;
+    # scoping by subagent_key keeps each thread's snapshot to its own tasks.
+    c = _conn()
+    # subagent A (source_path agent-aaaa1111.jsonl -> subagent_key "aaaa1111")
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1", ts="t1",
+        source_path="agent-aaaa1111.jsonl",
+        blocks=[_task_use("TaskCreate", "ca7", subject="Alpha7"),
+                _task_use("TaskCreate", "ca8", subject="Alpha8")])
+    _seed_tool_result(c, sid="s1", uuid="ua7", ts="t2", source_path="ra7.jsonl", blocks=[_task_res("ca7", task_id="7")])
+    _seed_tool_result(c, sid="s1", uuid="ua8", ts="t3", source_path="ra8.jsonl", blocks=[_task_res("ca8", task_id="8")])
+    # subagent B (source_path agent-bbbb2222.jsonl -> subagent_key "bbbb2222")
+    _seed_assistant(c, sid="s1", uuid="b1", msg_id="m2", req_id="r2", ts="t4",
+        source_path="agent-bbbb2222.jsonl",
+        blocks=[_task_use("TaskCreate", "cb1", subject="Beta1"),
+                _task_use("TaskCreate", "cb2", subject="Beta2")])
+    _seed_tool_result(c, sid="s1", uuid="ub1", ts="t5", source_path="rb1.jsonl", blocks=[_task_res("cb1", task_id="1")])
+    _seed_tool_result(c, sid="s1", uuid="ub2", ts="t6", source_path="rb2.jsonl", blocks=[_task_res("cb2", task_id="2")])
+    items = cq.get_conversation(c, "s1")["items"]
+    snaps = {}
+    for it in items:
+        if it["kind"] != "assistant":
+            continue
+        for b in it["blocks"]:
+            if b.get("kind") == "tool_call" and "task_snapshot" in b:
+                snaps[it["subagent_key"]] = [t["content"] for t in b["task_snapshot"]]
+                break
+    assert snaps["aaaa1111"] == ["Alpha7", "Alpha8"]
+    assert snaps["bbbb2222"] == ["Beta1", "Beta2"]
+
+
+def test_task_fold_omits_snapshot_when_no_create_recognized():
+    # Degradation guard: a Task* run whose create results carry NO id (a future
+    # unhandled result shape, or pre-fix legacy rows) must NOT stamp an empty
+    # snapshot — the frontend then falls back to generic chips instead of a
+    # misleading "0 / 0" card. The tell is the ABSENCE of the task_snapshot key.
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1", ts="t1",
+        blocks=[_task_use("TaskCreate", "c1", subject="Alpha")])
+    # result row carries no task_id (unrecognized shape) -> empty task_link
+    _seed_tool_result(c, sid="s1", uuid="u1", ts="t2", source_path="r1.jsonl", blocks=[_task_res("c1")])
+    _seed_assistant(c, sid="s1", uuid="a2", msg_id="m2", req_id="r2", ts="t3", source_path="t2.jsonl",
+        blocks=[_task_use("TaskUpdate", "u2", taskId="1", status="completed")])
+    _seed_tool_result(c, sid="s1", uuid="u3", ts="t4", source_path="r3.jsonl", blocks=[_task_res("u2")])
+    calls = [b for it in cq.get_conversation(c, "s1")["items"] if it["kind"] == "assistant"
+             for b in it["blocks"] if b.get("kind") == "tool_call"]
+    assert calls, "expected the Task* tool_calls to survive"
+    assert all("task_snapshot" not in b for b in calls)

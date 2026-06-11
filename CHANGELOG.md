@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Conversation viewer: the `TaskCreate`/`TaskUpdate`/`TaskList` checklist card rendered an empty "0 / 0" for tasks created inside subagents. Subagent Task tools record their result as a plain string (`Task #N created successfully: …`) rather than the structured shape main-session tools use, so the reader couldn't recover the task ids; it now parses both shapes. The running checklist is also reconstructed per-subagent, so parallel subagents no longer bleed their tasks into one another's cards, and a Task run whose results can't be parsed now falls back to plain tool chips instead of a misleading empty card. Existing transcripts pick this up on the next `cache-sync --rebuild`.
+
 ## [1.37.0] - 2026-06-11
 
 ### Added

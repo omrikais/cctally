@@ -8,6 +8,7 @@ mid-write tail line. Spec §1, §2.
 """
 from __future__ import annotations
 import json
+import re
 from dataclasses import dataclass
 
 HUMAN = "human"
@@ -288,45 +289,68 @@ def _attach_ask_answers(blocks, obj):
         results[0]["ask_annotations"] = bounded_anno
 
 
+# Subagent Task tools record toolUseResult=null and put the identity in the
+# human-readable result text instead; the id is the only thing the fold needs
+# from the result (subject/status come from the call input). Anchored to the
+# line start so unrelated output mentioning a task id mid-sentence never matches.
+# Shapes verified against real subagent transcripts (Claude Code 2.1.173).
+_TASK_CREATE_RESULT_RE = re.compile(r"^Task #(\d+) created\b")
+_TASK_UPDATE_RESULT_RE = re.compile(r"^Updated task #(\d+)\b")
+
+
 def _attach_task_meta(blocks, obj):
     """Stash a Task* tool's record-level identity onto its single tool_result
-    block so the query-kernel fold has a robust id (NOT a result-string parse).
-    Task ids are monotonic + never reused, so the explicit id is the only stable
-    fold key. Self-identifying by toolUseResult shape:
+    block so the query-kernel fold has a robust id. Task ids are monotonic +
+    never reused, so the explicit id is the only stable fold key. Two result
+    shapes, both self-identifying off the single tool_result block:
+
+    Structured (MAIN-session Task tools) — toolUseResult carries the identity:
       TaskCreate -> {"task": {"id": ...}}            -> block["task_id"]
       TaskUpdate -> {"taskId": ...}                   -> block["task_id"]
       TaskList   -> {"tasks": [{id,subject,status}]}  -> block["task_list"]
+
+    String-content (SUBAGENT Task tools) — toolUseResult is null and the id
+    lives in the result text ("Task #7 created successfully: ..." / "Updated
+    task #3 status"); we recover the id from block["text"]. Subagent-driven
+    workflows make this the dominant shape, so missing it left every subagent
+    Task run rendering as an empty "0 / 0" card.
+
     Same exactly-one-result-block guard as _attach_subagent_result. Subjects
     bounded through _bound_input.
 
     The ``task.id`` (not ``task.task_id``) gate deliberately ignores the
     look-alike local_bash spawn result {"task": {"task_id": ..., ...}}, which is
     a different tool family and carries no checklist id."""
-    tur = obj.get("toolUseResult")
-    if not isinstance(tur, dict):
-        return
     results = [b for b in blocks if b.get("kind") == "tool_result"]
     if len(results) != 1:
         return
     block = results[0]
-    task = tur.get("task")
-    if isinstance(task, dict) and task.get("id") is not None:
-        block["task_id"] = str(task["id"])
-        return
-    if tur.get("taskId") is not None:
-        block["task_id"] = str(tur["taskId"])
-        return
-    tasks = tur.get("tasks")
-    if isinstance(tasks, list):
-        snap = []
-        for t in tasks:
-            if not isinstance(t, dict) or t.get("id") is None:
-                continue
-            bounded, _ = _bound_input({"subject": t.get("subject") or ""})
-            snap.append({"id": str(t["id"]),
-                         "subject": bounded.get("subject", ""),
-                         "status": t.get("status") or "pending"})
-        block["task_list"] = snap
+    tur = obj.get("toolUseResult")
+    if isinstance(tur, dict):
+        task = tur.get("task")
+        if isinstance(task, dict) and task.get("id") is not None:
+            block["task_id"] = str(task["id"])
+            return
+        if tur.get("taskId") is not None:
+            block["task_id"] = str(tur["taskId"])
+            return
+        tasks = tur.get("tasks")
+        if isinstance(tasks, list):
+            snap = []
+            for t in tasks:
+                if not isinstance(t, dict) or t.get("id") is None:
+                    continue
+                bounded, _ = _bound_input({"subject": t.get("subject") or ""})
+                snap.append({"id": str(t["id"]),
+                             "subject": bounded.get("subject", ""),
+                             "status": t.get("status") or "pending"})
+            block["task_list"] = snap
+            return
+    # String-content fallback (subagent Task tools): no structured identity.
+    m = (_TASK_CREATE_RESULT_RE.match(block.get("text") or "")
+         or _TASK_UPDATE_RESULT_RE.match(block.get("text") or ""))
+    if m:
+        block["task_id"] = m.group(1)
 
 
 def _stringify(c):

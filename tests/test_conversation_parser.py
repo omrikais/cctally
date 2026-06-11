@@ -608,3 +608,39 @@ def test_attach_task_meta_requires_single_result_block():
               {"kind": "tool_result", "tool_use_id": "b"}]
     lc._attach_task_meta(blocks, {"toolUseResult": {"task": {"id": "1"}}})
     assert all("task_id" not in b for b in blocks)
+
+
+# Subagent Task tools record toolUseResult=null and put the identity in the
+# human-readable result string ("Task #7 created successfully: ..." / "Updated
+# task #3 status"); the structured toolUseResult shape is main-session only. The
+# string-content fallback recovers the id from block["text"] (subject/status are
+# read from the call input at fold time). Shapes verified against real subagent
+# transcripts (Claude Code 2.1.173, e.g. bce455df-.../subagents/agent-*.jsonl).
+def test_attach_task_meta_create_string_shape_stashes_id():
+    blocks = [{"kind": "tool_result", "tool_use_id": "c7",
+               "text": "Task #7 created successfully: Read path: _turn_usage_map"}]
+    lc._attach_task_meta(blocks, {"toolUseResult": None})
+    assert blocks[0]["task_id"] == "7"
+    assert "task_list" not in blocks[0]
+
+
+def test_attach_task_meta_update_string_shape_stashes_id():
+    blocks = [{"kind": "tool_result", "tool_use_id": "u3", "text": "Updated task #3 status"}]
+    lc._attach_task_meta(blocks, {"toolUseResult": None})
+    assert blocks[0]["task_id"] == "3"
+
+
+def test_attach_task_meta_structured_precedes_string():
+    # When the structured shape is present it wins, even if the result text also
+    # looks like a string-shape line with a DIFFERENT id.
+    blocks = [{"kind": "tool_result", "tool_use_id": "c1",
+               "text": "Task #99 created successfully: decoy"}]
+    lc._attach_task_meta(blocks, {"toolUseResult": {"task": {"id": "5", "subject": "real"}}})
+    assert blocks[0]["task_id"] == "5"
+
+
+def test_attach_task_meta_string_shape_ignores_unrelated_text():
+    blocks = [{"kind": "tool_result", "tool_use_id": "x1",
+               "text": "Some unrelated tool output mentioning Task #7 mid-sentence"}]
+    lc._attach_task_meta(blocks, {"toolUseResult": None})
+    assert "task_id" not in blocks[0] and "task_list" not in blocks[0]
