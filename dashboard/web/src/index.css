@@ -4898,11 +4898,56 @@ mark.current {
   background: transparent;
   padding: 0;
 }
+/* The turn head is now a click-to-top <button> (#175 F2): reset the native
+   button chrome but keep the flex/gap/margin layout. The per-block sticky mask
+   rules below override `background` for the two pinned turn heads. */
 .conv-item-head {
   display: flex;
   align-items: baseline;
   gap: 10px;
   margin-bottom: 6px;
+  appearance: none;
+  border: 0;
+  padding: 0;
+  background: none;
+  border-radius: 0;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+/* A subtle "↑ jump to start" affordance, revealed on hover/focus. */
+.conv-item-head::after { content: '↑'; margin-left: auto; opacity: 0; font-size: 11px; }
+.conv-item-head:hover::after,
+.conv-item-head:focus-visible::after { opacity: 0.6; }
+
+/* ---- Sticky top-level block headers (#175 F2) --------------------------
+   Child-combinator scoped to DIRECT children of the thread so turn heads
+   nested inside a subagent body (under .conv-sidechain-body) never pin.
+   Subagent groups — including nested ones — are flat DOM siblings of the
+   thread, so their summaries pin without overlap (no :not(--nested) needed). */
+.conv-reader-thread > .conv-item > .conv-item-head,
+.conv-reader-thread > details.conv-toolresult-run > summary,
+.conv-reader-thread > details.conv-sidechain > summary.conv-sidechain-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+/* Per-block OPAQUE masks, each matching that block's resting background so a
+   pinned header hides content scrolling beneath it without a color mismatch:
+   - assistant rests on the reader's --panel-bg;
+   - human rests on a 5% blue tint, here stacked over an opaque --panel-bg;
+   - the tool-result run rests on the opaque --panel-bg-2;
+   - the subagent head rests on the .conv-sidechain 5% magenta tint, here
+     stacked over an opaque --panel-bg. */
+.conv-reader-thread > .conv-item--assistant > .conv-item-head { background: var(--panel-bg); }
+.conv-reader-thread > .conv-item--human > .conv-item-head {
+  background: linear-gradient(rgba(96,165,250,0.05), rgba(96,165,250,0.05)), var(--panel-bg);
+}
+.conv-reader-thread > details.conv-toolresult-run > summary { background: var(--panel-bg-2); }
+.conv-reader-thread > details.conv-sidechain > summary.conv-sidechain-head {
+  background: linear-gradient(rgba(217,70,239,0.05), rgba(217,70,239,0.05)), var(--panel-bg);
 }
 .conv-item-label {
   font-family: var(--font-mono);

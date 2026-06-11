@@ -234,6 +234,34 @@ describe('MessageItem', () => {
     expect(container.textContent).not.toContain('$0.0000');
   });
 
+  it('assistant & human heads are buttons that scroll the turn to its start (#175 F2)', () => {
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    const assistantTurn: ConversationItem = {
+      kind: 'assistant',
+      anchor: { session_id: 's', uuid: 'aJ', id: 40 },
+      member_uuids: ['aJ'],
+      ts: 't',
+      text: 'hi',
+      blocks: [{ kind: 'text', text: 'hi' }],
+      model: 'claude-sonnet-4-6',
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+      cost_usd: 0,
+    };
+    for (const item of [assistantTurn, human]) {
+      const { container, unmount } = render(<MessageItem item={item} />);
+      const head = container.querySelector('button.conv-item-head') as HTMLButtonElement;
+      expect(head).not.toBeNull();
+      expect(head.getAttribute('type')).toBe('button');
+      head.click();
+      expect(scrollSpy).toHaveBeenCalledWith(expect.objectContaining({ block: 'start' }));
+      scrollSpy.mockClear();
+      unmount();
+    }
+    scrollSpy.mockRestore();
+  });
+
   it('renders a tool_result item as a single collapsed disclosure', () => {
     const { container } = render(<MessageItem item={toolResult} />);
     const root = container.querySelector('.conv-item--tool_result')!;
