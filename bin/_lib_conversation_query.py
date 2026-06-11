@@ -483,6 +483,7 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     # spawn tool_use id <-> tool_result tool_use_id; agent_id == subagent_key.
     spawn_kind = {}     # tool_use id -> subagent_type
     agent_link = {}     # tool_use id -> (agent_id, raw_meta)
+    ask_link = {}       # tool_use id -> (answers, annotations)  (#177 S2)
     for it in items:
         for b in it["blocks"]:
             k = b.get("kind")
@@ -495,6 +496,10 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                 meta = b.pop("subagent_meta", None)
                 if aid and b.get("tool_use_id") is not None:
                     agent_link[b["tool_use_id"]] = (aid, meta or {})
+                ans = b.pop("ask_answers", None)            # #177 S2
+                anno = b.pop("ask_annotations", None)
+                if ans is not None and b.get("tool_use_id") is not None:
+                    ask_link[b["tool_use_id"]] = (ans, anno)
     subagent_meta = {}
     for _tuid, _kind in spawn_kind.items():
         _link = agent_link.get(_tuid)
@@ -553,6 +558,11 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                     b["kind"] = "tool_call"
                     b["tool_use_id"] = b.pop("id", None)
                     b.setdefault("result", None)
+                    link = ask_link.get(b["tool_use_id"])   # #177 S2
+                    if link is not None:
+                        b["answers"] = link[0]
+                        if link[1]:
+                            b["annotations"] = link[1]
 
     # ---- Phase 4: classify injected meta items (skill / command / context) ----
     # `meta` rows (the parser's isMeta classification) AND — only while the 005

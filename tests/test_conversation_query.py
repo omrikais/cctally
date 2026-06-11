@@ -1376,3 +1376,49 @@ def test_result_full_length_none_when_absent():
             for b in it["blocks"]
             if b.get("kind") == "tool_call" and b.get("result")][0]
     assert call["result"]["full_length"] is None
+
+
+def test_ask_answers_surface_on_tool_call():
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "AskUserQuestion", "input_summary": "{}",
+                 "input": {"questions": []}, "input_truncated": False,
+                 "id": "t1", "preview": "Q?"}])
+    _seed_tool_result(c, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "...", "is_error": False,
+                 "tool_use_id": "t1",
+                 "ask_answers": {"Q?": "Comprehensive"},
+                 "ask_annotations": {"Q?": {"notes": "n"}}}])
+    call = [b for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"
+            for b in it["blocks"] if b.get("kind") == "tool_call"][0]
+    assert call["answers"] == {"Q?": "Comprehensive"}
+    assert call["annotations"] == {"Q?": {"notes": "n"}}
+
+
+def test_ask_answers_never_leak_on_orphan_result():
+    # A tool_result whose tool_use_id matches NO request stays a standalone
+    # orphan item; its internal ask_* keys must be stripped from public JSON.
+    c = _conn()
+    _seed_tool_result(c, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "x", "is_error": False,
+                 "tool_use_id": "nomatch",
+                 "ask_answers": {"Q": "A"}}])
+    out = cq.get_conversation(c, "s1")
+    for it in out["items"]:
+        for b in it["blocks"]:
+            assert "ask_answers" not in b
+            assert "ask_annotations" not in b
+
+
+def test_tool_call_without_ask_answers_has_no_answers_key():
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}",
+                 "input": {"file_path": "/x"}, "input_truncated": False,
+                 "id": "t1", "preview": "/x"}])
+    call = [b for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"
+            for b in it["blocks"] if b.get("kind") == "tool_call"][0]
+    assert "answers" not in call
+    assert "annotations" not in call
