@@ -484,6 +484,7 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     spawn_kind = {}     # tool_use id -> subagent_type
     agent_link = {}     # tool_use id -> (agent_id, raw_meta)
     ask_link = {}       # tool_use id -> (answers, annotations)  (#177 S2)
+    task_link = {}      # tool_use id -> {"task_id", "task_list"}  (Task* checklist)
     for it in items:
         for b in it["blocks"]:
             k = b.get("kind")
@@ -500,6 +501,10 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                 anno = b.pop("ask_annotations", None)
                 if ans is not None and b.get("tool_use_id") is not None:
                     ask_link[b["tool_use_id"]] = (ans, anno)
+                tid_ = b.pop("task_id", None)               # Task* checklist
+                tlist_ = b.pop("task_list", None)
+                if b.get("tool_use_id") is not None and (tid_ is not None or tlist_ is not None):
+                    task_link[b["tool_use_id"]] = {"task_id": tid_, "task_list": tlist_}
     subagent_meta = {}
     for _tuid, _kind in spawn_kind.items():
         _link = agent_link.get(_tuid)
@@ -563,6 +568,9 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                         b["answers"] = link[0]
                         if link[1]:
                             b["annotations"] = link[1]
+
+    # ---- Phase 3b: fold the Task* op stream into per-run checklist snapshots ----
+    _fold_task_runs(items, task_link)
 
     # ---- Phase 4: classify injected meta items (skill / command / context) ----
     # `meta` rows (the parser's isMeta classification) AND — only while the 005
@@ -695,6 +703,68 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
         "subagent_meta": subagent_meta,
         "page": {"next_after": next_after, "has_more": has_more},
     }
+
+
+_TASK_TRIO = ("TaskCreate", "TaskUpdate", "TaskList")
+
+
+def _fold_task_runs(items, task_link):
+    """Reconstruct the running to-do list from the chronological Task* op stream
+    and stamp the resulting todos[] snapshot onto the FIRST tool_call of each
+    Task* run. State spans the whole session; key on the explicit task id (never
+    reused). `deleted` drops a task; a TaskList result reseeds the whole snapshot.
+
+    Mirrors the ask_answers join: the parser stashed the record-level identity
+    onto the tool_result block, the Phase-1 sweep popped it into ``task_link``
+    keyed by tool_use_id, and this fold joins it back. The frontend stays a pure
+    todos[] renderer — all running-list state lives here."""
+    order = []
+    state = {}
+
+    def snapshot():
+        return [dict(content=state[i]["content"], status=state[i]["status"],
+                     **({"activeForm": state[i]["activeForm"]} if state[i].get("activeForm") else {}))
+                for i in order if i in state]
+
+    for it in items:
+        if it.get("kind") != "assistant":
+            continue
+        first_task_call = None
+        for b in it["blocks"]:
+            if b.get("kind") != "tool_call" or b.get("name") not in _TASK_TRIO:
+                continue
+            if first_task_call is None:
+                first_task_call = b
+            link = task_link.get(b.get("tool_use_id")) or {}
+            inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+            name = b["name"]
+            if name == "TaskCreate":
+                tid = link.get("task_id")
+                if tid is not None:
+                    if tid not in state:
+                        order.append(tid)
+                    state[tid] = {"content": inp.get("subject") or "", "status": "pending",
+                                  "activeForm": inp.get("activeForm") or ""}
+            elif name == "TaskUpdate":
+                tid = str(inp.get("taskId")) if inp.get("taskId") is not None else link.get("task_id")
+                status = inp.get("status")
+                if tid is not None:
+                    if status == "deleted":
+                        state.pop(tid, None)
+                    elif tid in state and status:
+                        state[tid]["status"] = status
+            elif name == "TaskList":
+                snap = link.get("task_list")
+                if snap is not None:
+                    order = []
+                    state = {}
+                    for t in snap:
+                        tid = t["id"]
+                        order.append(tid)
+                        state[tid] = {"content": t.get("subject") or "",
+                                      "status": t.get("status") or "pending", "activeForm": ""}
+        if first_task_call is not None:
+            first_task_call["task_snapshot"] = snapshot()
 
 
 def _latest(logical, col):

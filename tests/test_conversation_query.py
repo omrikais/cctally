@@ -1422,3 +1422,96 @@ def test_tool_call_without_ask_answers_has_no_answers_key():
             for b in it["blocks"] if b.get("kind") == "tool_call"][0]
     assert "answers" not in call
     assert "annotations" not in call
+
+
+# ---------------------------------------------------------------------------
+# Task* checklist fold (_fold_task_runs): the live to-do mechanism. State spans
+# the whole session, keyed on the explicit (never-reused) task id; the running
+# todos[] snapshot is stamped onto each Task* run's FIRST tool_call.
+# ---------------------------------------------------------------------------
+def _task_use(name, tuid, **inp):
+    return {"kind": "tool_use", "name": name, "input_summary": "{}",
+            "input": inp, "input_truncated": False, "id": tuid,
+            "preview": inp.get("subject") or inp.get("status") or ""}
+
+
+def _task_res(tuid, **extra):
+    return {"kind": "tool_result", "text": "ok", "is_error": False,
+            "tool_use_id": tuid, **extra}
+
+
+def test_task_fold_stamps_snapshot_on_first_call_of_run():
+    # NOTE: conversation_messages has UNIQUE(source_path, byte_offset) and
+    # _seed_tool_result hardcodes byte_offset=1, so distinct result rows must
+    # carry distinct source_path values (same disambiguation the existing
+    # parallel-result test uses) or the second INSERT OR IGNORE silently drops.
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1", ts="t1",
+        blocks=[_task_use("TaskCreate", "c1", subject="Alpha", activeForm="Alphaing"),
+                _task_use("TaskCreate", "c2", subject="Beta", activeForm="Betaing")])
+    _seed_tool_result(c, sid="s1", uuid="u1", ts="t2", source_path="r1.jsonl", blocks=[_task_res("c1", task_id="1")])
+    _seed_tool_result(c, sid="s1", uuid="u2", ts="t3", source_path="r2.jsonl", blocks=[_task_res("c2", task_id="2")])
+    _seed_assistant(c, sid="s1", uuid="a2", msg_id="m2", req_id="r2", ts="t4", source_path="t2.jsonl",
+        blocks=[_task_use("TaskUpdate", "u3id", taskId="1", status="in_progress")])
+    _seed_tool_result(c, sid="s1", uuid="u3", ts="t5", source_path="r3.jsonl", blocks=[_task_res("u3id", task_id="1")])
+    items = cq.get_conversation(c, "s1")["items"]
+    calls = [b for it in items if it["kind"] == "assistant"
+             for b in it["blocks"] if b.get("kind") == "tool_call"]
+    snap1 = calls[0]["task_snapshot"]
+    assert [(t["content"], t["status"]) for t in snap1] == [("Alpha", "pending"), ("Beta", "pending")]
+    assert snap1[0]["activeForm"] == "Alphaing"
+    assert "task_snapshot" not in calls[1]
+    snap2 = calls[2]["task_snapshot"]
+    assert [(t["content"], t["status"]) for t in snap2] == [("Alpha", "in_progress"), ("Beta", "pending")]
+
+
+def test_task_fold_drops_deleted_tasks():
+    # distinct source_path per row to dodge UNIQUE(source_path, byte_offset).
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1", ts="t1",
+        blocks=[_task_use("TaskCreate", "c1", subject="Alpha", activeForm="A"),
+                _task_use("TaskCreate", "c2", subject="Beta", activeForm="B")])
+    _seed_tool_result(c, sid="s1", uuid="u1", ts="t2", source_path="r1.jsonl", blocks=[_task_res("c1", task_id="1")])
+    _seed_tool_result(c, sid="s1", uuid="u2", ts="t3", source_path="r2.jsonl", blocks=[_task_res("c2", task_id="2")])
+    _seed_assistant(c, sid="s1", uuid="a2", msg_id="m2", req_id="r2", ts="t4", source_path="t2.jsonl",
+        blocks=[_task_use("TaskUpdate", "d1", taskId="1", status="deleted")])
+    _seed_tool_result(c, sid="s1", uuid="u3", ts="t5", source_path="r3.jsonl", blocks=[_task_res("d1", task_id="1")])
+    calls = [b for it in cq.get_conversation(c, "s1")["items"] if it["kind"] == "assistant"
+             for b in it["blocks"] if b.get("kind") == "tool_call"]
+    assert [t["content"] for t in calls[-1]["task_snapshot"]] == ["Beta"]
+
+
+def test_task_fold_tasklist_seeds_snapshot_from_result():
+    # reviewer adj. 1: TaskList toolUseResult shape VERIFIED against real data
+    # ({"tasks":[{id,subject,status,blockedBy}]}); the reseed path is exercised
+    # here through the parser-stashed task_list link.
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1", ts="t1",
+        blocks=[_task_use("TaskList", "l1")])
+    _seed_tool_result(c, sid="s1", uuid="u1", ts="t2",
+        blocks=[_task_res("l1", task_list=[
+            {"id": "1", "subject": "X", "status": "completed"},
+            {"id": "2", "subject": "Y", "status": "pending"}])])
+    call = [b for it in cq.get_conversation(c, "s1")["items"] if it["kind"] == "assistant"
+            for b in it["blocks"] if b.get("kind") == "tool_call"][0]
+    assert [(t["content"], t["status"]) for t in call["task_snapshot"]] == [("X", "completed"), ("Y", "pending")]
+
+
+def test_task_internal_keys_never_leak():
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1", ts="t1",
+        blocks=[_task_use("TaskCreate", "c1", subject="Alpha", activeForm="A")])
+    _seed_tool_result(c, sid="s1", uuid="u1", ts="t2", blocks=[_task_res("c1", task_id="1")])
+    for it in cq.get_conversation(c, "s1")["items"]:
+        for b in it["blocks"]:
+            assert "task_id" not in b and "task_list" not in b
+
+
+def test_non_task_run_has_no_snapshot():
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1", ts="t1",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}",
+                 "input": {"file_path": "/x"}, "input_truncated": False, "id": "t1", "preview": "/x"}])
+    call = [b for it in cq.get_conversation(c, "s1")["items"] if it["kind"] == "assistant"
+            for b in it["blocks"] if b.get("kind") == "tool_call"][0]
+    assert "task_snapshot" not in call
