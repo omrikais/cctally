@@ -2507,9 +2507,17 @@ def _create_conversation_fts_aux_table(conn: sqlite3.Connection) -> None:
     later ``conversation_messages`` INSERT still commits (the cost write txn is
     not rolled back). Must run inside that envelope; idempotent
     (``IF NOT EXISTS``)."""
+    # The FTS column name MUST match the content table column (``search_aux``),
+    # exactly as the prose ``conversation_fts`` uses ``text``. An external-content
+    # FTS5 table resolves its columns through the content table by NAME, so a
+    # mismatched column (e.g. ``aux`` against a ``search_aux`` content column)
+    # leaves the index functional for MATCH but breaks any content-backed read of
+    # the column — notably ``sqlite3.Connection.iterdump`` (the dump emits
+    # ``SELECT quote(aux) FROM conversation_fts_aux`` → "no such column"). Aligning
+    # the names keeps the index dumpable and is the documented FTS5 posture.
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS conversation_fts_aux "
-        "USING fts5(aux, content='conversation_messages', content_rowid='id')")
+        "USING fts5(search_aux, content='conversation_messages', content_rowid='id')")
 
 
 # Conversation FTS sync triggers (external-content FTS5). Defined ONCE here so
@@ -2539,14 +2547,14 @@ _CONV_FTS_TRIGGER_NAMES = ("conv_fts_au", "conv_fts_ad", "conv_fts_ai")
 # prose AU's ``AFTER UPDATE OF text`` doesn't fire this one).
 _CONV_FTS_AUX_TRIGGER_DDL = (
     "CREATE TRIGGER IF NOT EXISTS conv_fts_aux_ai AFTER INSERT ON conversation_messages "
-    "BEGIN INSERT INTO conversation_fts_aux(rowid, aux) VALUES (new.id, new.search_aux); END",
+    "BEGIN INSERT INTO conversation_fts_aux(rowid, search_aux) VALUES (new.id, new.search_aux); END",
     "CREATE TRIGGER IF NOT EXISTS conv_fts_aux_ad AFTER DELETE ON conversation_messages "
-    "BEGIN INSERT INTO conversation_fts_aux(conversation_fts_aux, rowid, aux) "
+    "BEGIN INSERT INTO conversation_fts_aux(conversation_fts_aux, rowid, search_aux) "
     "VALUES('delete', old.id, old.search_aux); END",
     "CREATE TRIGGER IF NOT EXISTS conv_fts_aux_au AFTER UPDATE OF search_aux ON conversation_messages "
-    "BEGIN INSERT INTO conversation_fts_aux(conversation_fts_aux, rowid, aux) "
+    "BEGIN INSERT INTO conversation_fts_aux(conversation_fts_aux, rowid, search_aux) "
     "VALUES('delete', old.id, old.search_aux); "
-    "INSERT INTO conversation_fts_aux(rowid, aux) VALUES (new.id, new.search_aux); END",
+    "INSERT INTO conversation_fts_aux(rowid, search_aux) VALUES (new.id, new.search_aux); END",
 )
 _CONV_FTS_AUX_TRIGGER_NAMES = ("conv_fts_aux_au", "conv_fts_aux_ad", "conv_fts_aux_ai")
 

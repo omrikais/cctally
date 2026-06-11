@@ -358,6 +358,33 @@ def _turn_cost_map(conn, turn_keys):
     return costs
 
 
+def _turn_usage_map(conn, turn_keys):
+    """{(msg_id, req_id): {"input","output","cache_creation","cache_read"}} for
+    the given non-null turn keys, read from the SAME deduped session_entries row
+    cost is computed from (#177). This is a SEPARATE sibling of _turn_cost_map —
+    that one returns a float and is also consumed by the search path
+    (_attach_costs), so its shape must NOT change. Tokens here come from the same
+    source row as the cost, but they are NOT arithmetically equal to it: cost may
+    be the vendor-provided cost_usd_raw override (token math bypassed), so the
+    contract is "same source row," never cost == f(tokens). Keys absent from
+    session_entries are simply not present (the turn omits ``tokens``)."""
+    usage = {}
+    keys = [(m, r) for (m, r) in turn_keys if m is not None and r is not None]
+    if not keys:
+        return usage
+    for i in range(0, len(keys), 400):
+        chunk = keys[i:i + 400]
+        cond = " OR ".join("(msg_id=? AND req_id=?)" for _ in chunk)
+        params = [v for pair in chunk for v in pair]
+        sql = ("SELECT msg_id, req_id, input_tokens, output_tokens, "
+               "cache_create_tokens, cache_read_tokens "
+               "FROM session_entries WHERE " + cond)
+        for m, r, inp, out, cc, cr in conn.execute(sql, params):
+            usage[(m, r)] = {"input": inp or 0, "output": out or 0,
+                             "cache_creation": cc or 0, "cache_read": cr or 0}
+    return usage
+
+
 def get_conversation(conn, session_id, *, after=None, limit=500):
     """Reader payload for one session (spec §3.2). Returns None for an unknown
     session. Dedups logical messages by (session_id, uuid) (canonical = earliest
@@ -375,10 +402,14 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     # Pull the session ordered; dedup logical messages by (session_id, uuid),
     # canonical row = earliest (timestamp_utc, id). Replays carry the original
     # uuid, so the first occurrence in ascending order is canonical.
+    # #177: stop_reason / attribution_* are TAIL-APPENDED (indices 15/16/17)
+    # AFTER source_tool_use_id so the existing positional reads (incl.
+    # _latest(logical, 10/11) for cwd/git_branch, r[6] for model, [2] for ts)
+    # are all unchanged. Every unpacker below extends its tail in lockstep.
     raw = conn.execute(
         "SELECT id, uuid, timestamp_utc, entry_type, text, blocks_json, model, "
         "       msg_id, req_id, is_sidechain, cwd, git_branch, source_path, parent_uuid, "
-        "       source_tool_use_id "
+        "       source_tool_use_id, stop_reason, attribution_skill, attribution_plugin "
         "FROM conversation_messages WHERE session_id=? "
         "ORDER BY timestamp_utc, id", (session_id,)).fetchall()
 
@@ -422,7 +453,8 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
 
     for row in logical:
         (rid, u, ts, etype, text, blocks, model, msg_id, req_id,
-         is_sc, cwd, branch, source_path, parent_uuid, source_tool_use_id) = row
+         is_sc, cwd, branch, source_path, parent_uuid, source_tool_use_id,
+         stop_reason, attr_skill, attr_plugin) = row
         if etype == "assistant" and msg_id is not None:
             key = (msg_id, req_id)
             idx = turn_index.get(key)
@@ -495,8 +527,12 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
         if owners and not non_result and len(owner_ids) == 1:
             owner = owners[0]
             for use_block, res_block in resolved:
+                # #177: full_length (pre-clip char count) rides through the fold
+                # for the "showing X of Y" affordance; None on pre-enrichment
+                # rows that lack it (the .get default — never KeyErrors).
                 use_block["result"] = {"text": res_block.get("text", ""),
                                        "truncated": bool(res_block.get("truncated")),
+                                       "full_length": res_block.get("full_length"),
                                        "is_error": bool(res_block.get("is_error"))}
             owner["member_uuids"].append(tr["anchor"]["uuid"])
             drop.add(id(tr))
@@ -570,6 +606,9 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
         items = [it for it in items if id(it) not in _skill_drop]
 
     costs = _turn_cost_map(conn, list(turn_index))
+    # #177: per-turn token usage from the SAME deduped session_entries row cost
+    # uses (a separate map; _turn_cost_map is unchanged for the search path).
+    usage = _turn_usage_map(conn, list(turn_index))
     # Stamp per-item cost first, then derive the header from the SUM of the
     # ROUNDED per-item assistant costs (M2) — so the §6.5 invariant
     # sum(items.cost_usd) == header cost_usd holds EXACTLY to 1e-9 by
@@ -582,6 +621,11 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
             turn_cost = round(costs.get((it["_msg_id"], it["_req_id"]), 0.0), 6)
             it["cost_usd"] = turn_cost
             header_cost += turn_cost
+            # #177: stamp tokens from the same source row; absent when the turn
+            # key has no session_entries row (omitted, not zero-filled).
+            tok = usage.get((it["_msg_id"], it["_req_id"]))
+            if tok is not None:
+                it["tokens"] = tok
             del it["_msg_id"]
             del it["_req_id"]
             it.pop("_has_prose", None)
@@ -682,6 +726,16 @@ def _build_turn(members):
         "_source_tool_use_id": first[14],
         "_has_prose": False,
     }
+    # #177: stop_reason / attribution_* (tail-appended cols 15/16/17). Seed from
+    # the first fragment ONLY when non-null so a single-fragment turn is covered;
+    # _fold_fragment then keeps the last-non-null value across fragments. Omitted
+    # keys (never None) preserve the absent-when-absent contract.
+    if first[15] is not None:
+        item["stop_reason"] = first[15]
+    if first[16] is not None:
+        item["attribution_skill"] = first[16]
+    if first[17] is not None:
+        item["attribution_plugin"] = first[17]
     _fold_fragment(item, first)
     for m in members[1:]:
         _extend_turn(item, m)
@@ -717,6 +771,16 @@ def _fold_fragment(item, row):
             item["text"] = frag_text
         else:
             item["text"] = item["text"] + "\n" + frag_text
+    # #177: stop_reason = last-non-null fragment value (the terminal fragment
+    # carries the real reason); attribution_* = last-non-null (turn-level
+    # constant). A later null fragment must NOT blank an earlier value — hence
+    # the `is not None` guard rather than an unconditional assign.
+    if row[15] is not None:
+        item["stop_reason"] = row[15]
+    if row[16] is not None:
+        item["attribution_skill"] = row[16]
+    if row[17] is not None:
+        item["attribution_plugin"] = row[17]
 
 
 def _build_simple(row):
@@ -726,7 +790,8 @@ def _build_simple(row):
     internal _msg_id/_req_id keys, so the cost loop's KeyError path can never fire
     (I2). The model is preserved for assistant rows."""
     (rid, u, ts, etype, text, blocks, model, msg_id, req_id, is_sc, cwd, branch,
-     source_path, parent_uuid, source_tool_use_id) = row
+     source_path, parent_uuid, source_tool_use_id,
+     stop_reason, attr_skill, attr_plugin) = row
     try:
         parsed = _json.loads(blocks or "[]")
     except (ValueError, TypeError):
@@ -749,6 +814,15 @@ def _build_simple(row):
     if etype == "assistant":
         item["model"] = model
         item["cost_usd"] = 0.0
+        # #177: stop_reason / attribution are assistant-only — a null-msg_id
+        # assistant turn still carries them. Omitted when null (absent-when-
+        # absent). Human / tool_result simple items never get these keys.
+        if stop_reason is not None:
+            item["stop_reason"] = stop_reason
+        if attr_skill is not None:
+            item["attribution_skill"] = attr_skill
+        if attr_plugin is not None:
+            item["attribution_plugin"] = attr_plugin
     return item
 
 

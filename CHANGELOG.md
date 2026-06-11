@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Dashboard conversation reader: the transcript data contract now carries structured tool input (with an `input_truncated` flag), tool results with honest length accounting (`full_length` plus a raised result cap), per-turn token usage drawn from the same deduped session-entry row as the cost, and each turn's stop-reason and skill/plugin attribution — all additive (the existing reader renders unchanged), with a parallel tool-content search index built as groundwork. The new fields are re-derived across existing transcripts by a one-time cache migration (#177).
+
 ## [1.34.1] - 2026-06-11
 
 ### Fixed

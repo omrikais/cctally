@@ -17,32 +17,42 @@ def _conn():
 
 
 def _msg(c, **kw):
+    # The #177 enrichment columns (stop_reason / attribution_skill /
+    # attribution_plugin / search_aux) are TAIL-APPENDED, matching the
+    # production INSERT tuple. search_aux defaults to '' (the NOT NULL DEFAULT).
     cols = ("session_id", "uuid", "parent_uuid", "source_path", "byte_offset",
             "timestamp_utc", "entry_type", "text", "blocks_json", "model",
             "msg_id", "req_id", "cwd", "git_branch", "is_sidechain",
-            "source_tool_use_id")
+            "source_tool_use_id", "stop_reason", "attribution_skill",
+            "attribution_plugin")
     row = {k: kw.get(k) for k in cols}
     row["blocks_json"] = kw.get("blocks_json", "[]")
     row["text"] = kw.get("text", "")
     row["is_sidechain"] = kw.get("is_sidechain", 0)
+    row["search_aux"] = kw.get("search_aux", "")
     c.execute(
         "INSERT OR IGNORE INTO conversation_messages "
         "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
         " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,is_sidechain,"
-        " source_tool_use_id)"
+        " source_tool_use_id,stop_reason,attribution_skill,attribution_plugin,search_aux)"
         " VALUES(:session_id,:uuid,:parent_uuid,:source_path,:byte_offset,"
         ":timestamp_utc,:entry_type,:text,:blocks_json,:model,:msg_id,:req_id,"
-        ":cwd,:git_branch,:is_sidechain,:source_tool_use_id)", row)
+        ":cwd,:git_branch,:is_sidechain,:source_tool_use_id,:stop_reason,"
+        ":attribution_skill,:attribution_plugin,:search_aux)", row)
 
 
 def _entry(c, *, source_path, line_offset, model, msg_id, req_id,
-           inp=0, out=0, cc=0, cr=0):
+           inp=0, out=0, cc=0, cr=0, cost_usd_raw=None):
+    # cost_usd_raw is the vendor-provided override the cost helper honors when
+    # present (bypassing token-derived math) — the #177 "same source row, not
+    # same arithmetic" guard seeds it to prove tokens surface independently.
     c.execute(
         "INSERT OR IGNORE INTO session_entries "
         "(source_path,line_offset,timestamp_utc,model,msg_id,req_id,"
-        " input_tokens,output_tokens,cache_create_tokens,cache_read_tokens)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (source_path, line_offset, "t", model, msg_id, req_id, inp, out, cc, cr))
+        " input_tokens,output_tokens,cache_create_tokens,cache_read_tokens,cost_usd_raw)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (source_path, line_offset, "t", model, msg_id, req_id,
+         inp, out, cc, cr, cost_usd_raw))
 
 
 def test_list_conversations_groups_by_session_with_cost():
@@ -282,13 +292,19 @@ _TS = "2026-06-01T00:00:0{}Z"
 
 
 def _seed_assistant(conn, *, sid, uuid, msg_id, req_id, blocks,
-                    ts="2026-06-01T00:00:01Z", model=None, source_path="a.jsonl"):
+                    ts="2026-06-01T00:00:01Z", model=None, source_path="a.jsonl",
+                    byte_offset=0, stop_reason=None, attribution_skill=None,
+                    attribution_plugin=None):
     """An assistant turn fragment carrying tool_use blocks (and optionally
-    prose). Mirrors the existing _msg INSERT shape."""
-    _msg(conn, session_id=sid, uuid=uuid, source_path=source_path, byte_offset=0,
+    prose). Mirrors the existing _msg INSERT shape. The #177 enrichment fields
+    (stop_reason / attribution_*) are optional tail args."""
+    _msg(conn, session_id=sid, uuid=uuid, source_path=source_path,
+         byte_offset=byte_offset,
          timestamp_utc=ts, entry_type="assistant",
          text="".join(b.get("text", "") for b in blocks if b.get("kind") == "text"),
-         blocks_json=_json.dumps(blocks), model=model, msg_id=msg_id, req_id=req_id)
+         blocks_json=_json.dumps(blocks), model=model, msg_id=msg_id, req_id=req_id,
+         stop_reason=stop_reason, attribution_skill=attribution_skill,
+         attribution_plugin=attribution_plugin)
 
 
 def _seed_tool_result(conn, *, sid, uuid, blocks,
@@ -300,12 +316,20 @@ def _seed_tool_result(conn, *, sid, uuid, blocks,
 
 
 def _seed_assistant_with_cost(conn, *, sid, uuid, msg_id, req_id, blocks, model,
-                              ts="2026-06-01T00:00:01Z", source_path="a.jsonl"):
-    """An assistant turn + its single deduped session_entries cost row."""
+                              ts="2026-06-01T00:00:01Z", source_path="a.jsonl",
+                              inp=1000, out=500, cc=0, cr=0, cost_usd_raw=None,
+                              stop_reason=None, attribution_skill=None,
+                              attribution_plugin=None):
+    """An assistant turn + its single deduped session_entries cost row. The
+    token counts and the optional cost_usd_raw override are passed through so a
+    raw-cost-override turn can surface tokens AND the override cost (#177)."""
     _seed_assistant(conn, sid=sid, uuid=uuid, msg_id=msg_id, req_id=req_id,
-                    blocks=blocks, ts=ts, model=model, source_path=source_path)
+                    blocks=blocks, ts=ts, model=model, source_path=source_path,
+                    stop_reason=stop_reason, attribution_skill=attribution_skill,
+                    attribution_plugin=attribution_plugin)
     _entry(conn, source_path=source_path, line_offset=0, model=model,
-           msg_id=msg_id, req_id=req_id, inp=1000, out=500)
+           msg_id=msg_id, req_id=req_id, inp=inp, out=out, cc=cc, cr=cr,
+           cost_usd_raw=cost_usd_raw)
 
 
 def test_pairs_tool_use_with_result_by_id():
@@ -1093,3 +1117,262 @@ def test_pre_reingest_null_column_skill_body_stays_standalone():
     _owner, chip = _find_skill_chip(items, "toolu_S")
     assert chip is not None
     assert "skill_body" not in chip
+
+
+# ---------------------------------------------------------------------------
+# #177 Session 1: enriched data contract surfaced in the reader payload.
+# Per-turn token usage (a NEW _turn_usage_map, NOT touching _turn_cost_map),
+# stop_reason / attribution (tail-appended columns), structured tool input
+# pass-through, and result.full_length. All ADDITIVE — no existing key changes.
+# ---------------------------------------------------------------------------
+
+# ---- 2.1: _turn_usage_map + token stamping --------------------------------
+def test_turn_item_carries_tokens_from_session_entries():
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="q")
+    _msg(c, session_id="s1", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="answer", model=_MODEL, msg_id="m1", req_id="r1")
+    # the SAME deduped session_entries row cost is computed from
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=100, out=20, cc=5, cr=3)
+    out = cq.get_conversation(c, "s1")
+    turn = [it for it in out["items"]
+            if it["kind"] == "assistant" and "tokens" in it][0]
+    assert turn["tokens"] == {"input": 100, "output": 20,
+                              "cache_creation": 5, "cache_read": 3}
+
+
+def test_turn_without_session_entries_omits_tokens():
+    # An assistant turn whose (msg_id, req_id) has NO session_entries row: no
+    # tokens key (absent, not zero-filled), and cost_usd stays 0.0.
+    c = _conn()
+    _msg(c, session_id="s1", uuid="a1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="answer", model=_MODEL, msg_id="m1", req_id="r1")
+    out = cq.get_conversation(c, "s1")
+    turn = [it for it in out["items"] if it["kind"] == "assistant"][0]
+    assert "tokens" not in turn
+    assert turn["cost_usd"] == 0.0
+
+
+def test_null_msg_id_assistant_never_carries_tokens():
+    # A _build_simple assistant (null msg_id) has no turn key -> no usage join ->
+    # never a tokens key (the usage stamp lives only in the turn-cost loop).
+    c = _conn()
+    _msg(c, session_id="s1", uuid="anull", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="no turn key", model=_MODEL, msg_id=None, req_id=None)
+    out = cq.get_conversation(c, "s1")
+    turn = [it for it in out["items"] if it["kind"] == "assistant"][0]
+    assert "tokens" not in turn
+    assert turn["cost_usd"] == 0.0
+
+
+_RAW_COST_OVERRIDE = 0.4242
+
+
+def test_raw_cost_override_row_still_surfaces_tokens_and_raw_cost():
+    # The Codex P1 "same source row, NOT same arithmetic" guard: a
+    # session_entries row carrying cost_usd_raw AND token columns. tokens come
+    # from the row; cost_usd equals the raw override (token-derived math is
+    # bypassed by the helper) — so the two are deliberately NOT equal, and this
+    # test asserts NEITHER a token-derived cost NOR token==cost.
+    c = _conn()
+    _seed_assistant_with_cost(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "text", "text": "answer"}], model=_MODEL,
+        inp=100, out=20, cc=5, cr=3, cost_usd_raw=_RAW_COST_OVERRIDE)
+    out = cq.get_conversation(c, "s1")
+    turn = [it for it in out["items"]
+            if it["kind"] == "assistant" and "tokens" in it][0]
+    assert turn["tokens"]["input"] == 100 and turn["tokens"]["output"] == 20
+    assert turn["cost_usd"] == round(_RAW_COST_OVERRIDE, 6)   # the raw override, not f(tokens)
+
+
+def test_search_hit_still_returns_numeric_cost_usd():
+    # Sibling-map isolation (#177): _turn_usage_map is separate from
+    # _turn_cost_map, which the search path's _attach_costs still consumes for a
+    # numeric cost. A search hit must still carry a numeric cost_usd.
+    c = _conn()
+    _msg(c, session_id="s1", uuid="a1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="the token limit resets hourly", model=_MODEL,
+         msg_id="m1", req_id="r1", cwd="/home/u/proj")
+    _entry(c, source_path="a.jsonl", line_offset=0, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=1000, out=500)
+    out = cq.search_conversations(c, "token", fts_available=False)
+    assert out["hits"], "expected at least one hit"
+    hit = out["hits"][0]
+    assert isinstance(hit["cost_usd"], (int, float))
+    assert hit["cost_usd"] > 0
+
+
+# ---- 2.2: stop_reason / attribution threading (tail-appended) -------------
+def test_turn_surfaces_stop_reason_and_attribution():
+    c = _conn()
+    _seed_assistant_with_cost(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "text", "text": "answer"}], model=_MODEL,
+        stop_reason="end_turn", attribution_skill="superpowers:brainstorming",
+        attribution_plugin="superpowers")
+    turn = [it for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"][0]
+    assert turn["stop_reason"] == "end_turn"
+    assert turn["attribution_skill"] == "superpowers:brainstorming"
+    assert turn["attribution_plugin"] == "superpowers"
+
+
+def test_stop_reason_is_last_non_null_across_fragments():
+    # Two fragments share (m1,r1): the SEED fragment has stop_reason=None, the
+    # later (prose) fragment carries the terminal 'tool_use'. last-non-null wins.
+    c = _conn()
+    _msg(c, session_id="s1", uuid="a1a", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant", text="",
+         blocks_json=_json.dumps([{"kind": "thinking", "text": "..."}]),
+         model=_MODEL, msg_id="m1", req_id="r1", stop_reason=None)
+    _msg(c, session_id="s1", uuid="a1b", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:02Z", entry_type="assistant",
+         text="done",
+         blocks_json=_json.dumps([{"kind": "text", "text": "done"}]),
+         model=_MODEL, msg_id="m1", req_id="r1", stop_reason="tool_use")
+    turn = [it for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"][0]
+    assert turn["stop_reason"] == "tool_use"
+
+
+def test_stop_reason_last_non_null_keeps_earlier_when_later_is_null():
+    # Reverse ordering: the SEED fragment carries the reason; a LATER fragment is
+    # null. last-non-null must KEEP the seed value, never blank it.
+    c = _conn()
+    _msg(c, session_id="s1", uuid="a1a", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="first",
+         blocks_json=_json.dumps([{"kind": "text", "text": "first"}]),
+         model=_MODEL, msg_id="m1", req_id="r1", stop_reason="end_turn")
+    _msg(c, session_id="s1", uuid="a1b", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:02Z", entry_type="assistant", text="",
+         blocks_json=_json.dumps([{"kind": "thinking", "text": "..."}]),
+         model=_MODEL, msg_id="m1", req_id="r1", stop_reason=None)
+    turn = [it for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"][0]
+    assert turn["stop_reason"] == "end_turn"
+
+
+def test_stop_reason_and_attribution_absent_when_null():
+    # No stop_reason / attribution on the row -> the keys are omitted, never
+    # emitted as null (the absent-when-absent contract).
+    c = _conn()
+    _seed_assistant_with_cost(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "text", "text": "answer"}], model=_MODEL)
+    turn = [it for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"][0]
+    assert "stop_reason" not in turn
+    assert "attribution_skill" not in turn
+    assert "attribution_plugin" not in turn
+
+
+def test_build_simple_null_msg_id_assistant_surfaces_stop_reason():
+    # A null-msg_id assistant routes to _build_simple; its stop_reason /
+    # attribution must still surface (the _build_simple tail-unpack path).
+    c = _conn()
+    _msg(c, session_id="s1", uuid="anull", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="no turn key", model=_MODEL, msg_id=None, req_id=None,
+         stop_reason="max_tokens", attribution_skill="sk", attribution_plugin="pl")
+    turn = [it for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"][0]
+    assert turn["stop_reason"] == "max_tokens"
+    assert turn["attribution_skill"] == "sk"
+    assert turn["attribution_plugin"] == "pl"
+
+
+def test_human_item_never_carries_stop_reason():
+    # stop_reason / attribution are assistant-only — a human item must not carry
+    # them even if the columns were somehow populated.
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="hi",
+         stop_reason="end_turn")
+    item = cq.get_conversation(c, "s1")["items"][0]
+    assert item["kind"] == "human"
+    assert "stop_reason" not in item
+
+
+def test_tail_appended_columns_do_not_shift_cwd_branch_positions():
+    # The tail-append must NOT disturb _latest(logical, 10/11) (cwd/git_branch).
+    # A turn whose cwd/branch are populated must still surface project_label +
+    # git_branch correctly.
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="hi",
+         cwd="/home/u/myproj", git_branch="feature-x")
+    out = cq.get_conversation(c, "s1")
+    assert out["project_label"] == "myproj"
+    assert out["git_branch"] == "feature-x"
+
+
+# ---- 2.3: input / input_truncated pass-through + result.full_length -------
+def test_input_keys_survive_to_tool_call():
+    # input / input_truncated ride through blocks_json -> the Phase-3
+    # tool_use->tool_call sweep (renames kind, moves id) and Phase-4b (skill
+    # fold) must NOT strip them.
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Edit", "input_summary": "{}",
+                 "input": {"file_path": "/a.py", "old_string": "x"},
+                 "input_truncated": False, "id": "t1", "preview": "/a.py"}])
+    out = cq.get_conversation(c, "s1")
+    calls = [b for it in out["items"] if it["kind"] == "assistant"
+             for b in it["blocks"] if b.get("kind") == "tool_call"]
+    assert calls, "expected a tool_call block"
+    assert calls[0]["input"] == {"file_path": "/a.py", "old_string": "x"}
+    assert calls[0]["input_truncated"] is False
+
+
+def test_input_truncated_flag_survives():
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Write", "input_summary": "{}",
+                 "input": {"content": "clipped…"}, "input_truncated": True,
+                 "id": "t1", "preview": "x"}])
+    call = [b for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"
+            for b in it["blocks"] if b.get("kind") == "tool_call"][0]
+    assert call["input_truncated"] is True
+
+
+def test_result_carries_full_length():
+    # A tool_use + matching tool_result whose block carries full_length: the
+    # Phase-2 fold must copy full_length into use_block["result"].
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}",
+                 "input": {"file_path": "/x"}, "input_truncated": False,
+                 "id": "t1", "preview": "/x"}])
+    _seed_tool_result(c, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "BODY", "truncated": True,
+                 "full_length": 99999, "is_error": False, "tool_use_id": "t1"}])
+    call = [b for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"
+            for b in it["blocks"]
+            if b.get("kind") == "tool_call" and b.get("result")][0]
+    assert call["result"]["full_length"] == 99999
+    assert call["result"]["truncated"] is True
+    assert call["result"]["text"] == "BODY"
+
+
+def test_result_full_length_none_when_absent():
+    # A pre-enrichment tool_result block lacking full_length -> the folded
+    # result carries full_length: None (the .get default), never KeyErrors.
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}",
+                 "id": "t1", "preview": "/x"}])
+    _seed_tool_result(c, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "B", "truncated": False,
+                 "is_error": False, "tool_use_id": "t1"}])
+    call = [b for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"
+            for b in it["blocks"]
+            if b.get("kind") == "tool_call" and b.get("result")][0]
+    assert call["result"]["full_length"] is None

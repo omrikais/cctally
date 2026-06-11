@@ -36,6 +36,7 @@
           "name": "Task",
           "preview": "Audit module A",
           "result": {
+            "full_length": null,
             "is_error": false,
             "text": "module A audited",
             "truncated": false
@@ -48,6 +49,7 @@
           "name": "Agent",
           "preview": "Audit module B",
           "result": {
+            "full_length": null,
             "is_error": true,
             "text": "module B FAILED",
             "truncated": false
@@ -67,6 +69,12 @@
       "parent_uuid": "s3h1",
       "subagent_key": null,
       "text": "spawning two audits in parallel",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 500,
+        "output": 200
+      },
       "ts": "2026-06-03T00:00:01Z"
     },
     {
@@ -125,6 +133,12 @@
       "parent_uuid": "a1",
       "subagent_key": "aaaa1111",
       "text": "module A clean",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 400,
+        "output": 100
+      },
       "ts": "2026-06-03T00:00:04Z"
     },
     {
@@ -149,6 +163,12 @@
       "parent_uuid": "b1",
       "subagent_key": "bbbb2222",
       "text": "module B clean",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 400,
+        "output": 100
+      },
       "ts": "2026-06-03T00:00:05Z"
     },
     {
@@ -178,6 +198,12 @@
       "parent_uuid": "s3a1",
       "subagent_key": "cccc3333",
       "text": "module C needs a follow-up",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 300,
+        "output": 150
+      },
       "ts": "2026-06-03T00:00:06Z"
     }
   ],

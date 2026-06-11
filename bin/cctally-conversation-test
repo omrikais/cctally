@@ -376,6 +376,60 @@ print("ok")
         fail "reader sidechain payload (#155): $sc_check (raw: $sc_raw)"
     fi
 
+    # --- 2c) Reader: enriched data contract (#177) -----------------------
+    # The s5 turn pins every #177 surface in one payload: per-turn tokens drawn
+    # from the SAME session_entries row as cost, a vendor cost_usd_raw override
+    # (so cost != f(tokens)), stop_reason + skill/plugin attribution, structured
+    # input + input_truncated on the tool_call, and result.full_length on the
+    # truncated tool result.
+    fetch_and_diff "GET /api/conversation/s5" "golden-conversation-s5.json" \
+        "$base/api/conversation/s5" "${LOOP[@]}"
+
+    local enr_raw enr_check
+    enr_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s5")
+    enr_check=$(printf '%s' "$enr_raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+errs = []
+items = d.get("items") or []
+turn = next((it for it in items if it["kind"] == "assistant"), None)
+if turn is None:
+    sys.exit("no assistant turn on s5")
+# tokens from the same source row as cost.
+tok = turn.get("tokens")
+if tok != {"input": 1000, "output": 500, "cache_creation": 0, "cache_read": 0}:
+    errs.append("tokens wrong/absent: %r" % (tok,))
+# cost is the raw override ($0.99), NOT token-derived ($0.0175) — same source
+# row, NOT same arithmetic.
+if turn.get("cost_usd") != 0.99:
+    errs.append("cost_usd != raw override 0.99: %r" % (turn.get("cost_usd"),))
+if turn.get("stop_reason") != "tool_use":
+    errs.append("stop_reason wrong: %r" % (turn.get("stop_reason"),))
+if turn.get("attribution_skill") != "superpowers:test-driven-development":
+    errs.append("attribution_skill wrong: %r" % (turn.get("attribution_skill"),))
+if turn.get("attribution_plugin") != "superpowers":
+    errs.append("attribution_plugin wrong: %r" % (turn.get("attribution_plugin"),))
+call = next((b for b in turn["blocks"] if b.get("kind") == "tool_call"), None)
+if call is None:
+    errs.append("no tool_call block on s5 turn")
+else:
+    if call.get("input") != {"file_path": "/home/u/proj/resolve.py", "old_string": "clipped-leaf…"}:
+        errs.append("input did not survive to tool_call: %r" % (call.get("input"),))
+    if call.get("input_truncated") is not True:
+        errs.append("input_truncated wrong: %r" % (call.get("input_truncated"),))
+    res = call.get("result") or {}
+    if res.get("full_length") != 48213:
+        errs.append("result.full_length wrong/absent: %r" % (res.get("full_length"),))
+    if res.get("truncated") is not True:
+        errs.append("result.truncated wrong: %r" % (res.get("truncated"),))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+    if [ "$enr_check" != "ok" ]; then
+        fail "reader enriched data contract (#177): $enr_check (raw: $enr_raw)"
+    fi
+
     # --- 3) Search: deduped across replay to ONE hit ---------------------
     # Byte-exact golden only when FTS5 is present (the golden is FTS-shaped);
     # the structural asserts below run unconditionally.

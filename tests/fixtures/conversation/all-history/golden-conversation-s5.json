@@ -1,0 +1,87 @@
+{
+  "cost_usd": 0.99,
+  "git_branch": "main",
+  "items": [
+    {
+      "anchor": {
+        "id": 22,
+        "session_id": "s5",
+        "uuid": "s5h1"
+      },
+      "blocks": [],
+      "is_sidechain": false,
+      "kind": "human",
+      "member_uuids": [
+        "s5h1"
+      ],
+      "parent_uuid": null,
+      "subagent_key": null,
+      "text": "apply the patch and report the cost",
+      "ts": "2026-06-05T00:00:00Z"
+    },
+    {
+      "anchor": {
+        "id": 23,
+        "session_id": "s5",
+        "uuid": "s5a1"
+      },
+      "attribution_plugin": "superpowers",
+      "attribution_skill": "superpowers:test-driven-development",
+      "blocks": [
+        {
+          "input": {
+            "file_path": "/home/u/proj/resolve.py",
+            "old_string": "clipped-leaf\u2026"
+          },
+          "input_summary": "{\"file_path\":\"/home/u/proj/resolve.py\"}",
+          "input_truncated": true,
+          "kind": "tool_call",
+          "name": "Edit",
+          "preview": "/home/u/proj/resolve.py",
+          "result": {
+            "full_length": 48213,
+            "is_error": false,
+            "text": "applied 1 edit (truncated)",
+            "truncated": true
+          },
+          "tool_use_id": "toolu_s5"
+        },
+        {
+          "kind": "text",
+          "text": "patched the resolver"
+        }
+      ],
+      "cost_usd": 0.99,
+      "is_sidechain": false,
+      "kind": "assistant",
+      "member_uuids": [
+        "s5a1",
+        "s5tr"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s5h1",
+      "stop_reason": "tool_use",
+      "subagent_key": null,
+      "text": "patched the resolver",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 1000,
+        "output": 500
+      },
+      "ts": "2026-06-05T00:00:01Z"
+    }
+  ],
+  "last_activity_utc": "2026-06-05T00:00:02Z",
+  "models": [
+    "claude-opus-4-8"
+  ],
+  "page": {
+    "has_more": false,
+    "next_after": null
+  },
+  "project_label": "proj",
+  "session_id": "s5",
+  "started_utc": "2026-06-05T00:00:00Z",
+  "subagent_meta": {}
+}

@@ -25,17 +25,24 @@
         "session_id": "s1",
         "uuid": "a1b"
       },
+      "attribution_plugin": "superpowers",
+      "attribution_skill": "superpowers:brainstorming",
       "blocks": [
         {
           "kind": "thinking",
           "text": "let me think"
         },
         {
+          "input": {
+            "file_path": "/home/u/proj/resets.py"
+          },
           "input_summary": "{\"file_path\":\"/home/u/proj/resets.py\"}",
+          "input_truncated": false,
           "kind": "tool_call",
           "name": "Read",
           "preview": "/home/u/proj/resets.py",
           "result": {
+            "full_length": 16,
             "is_error": false,
             "text": "def reset(): ...",
             "truncated": false
@@ -43,7 +50,11 @@
           "tool_use_id": "toolu_s1a"
         },
         {
+          "input": {
+            "skill": "brainstorming"
+          },
           "input_summary": "{\"skill\":\"brainstorming\"}",
+          "input_truncated": false,
           "kind": "tool_call",
           "name": "Skill",
           "preview": "brainstorming",
@@ -69,8 +80,15 @@
       ],
       "model": "claude-opus-4-8",
       "parent_uuid": "h1",
+      "stop_reason": "end_turn",
       "subagent_key": null,
       "text": "the token limit window resets every five hours",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 1000,
+        "output": 500
+      },
       "ts": "2026-06-01T00:00:04Z"
     },
     {

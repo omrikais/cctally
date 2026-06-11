@@ -34,6 +34,14 @@ load-bearing kernel invariants:
     files -> distinct ``subagent_key``) + a multi-fragment sidechain turn whose
     seed fragment parents to the main turn (cross-file nesting) while its prose
     fragment parents intra-turn.
+  * Session ``s5`` (#177) — the raw-cost-override guard: a turn whose single
+    deduped ``session_entries`` row carries BOTH token columns AND a
+    ``cost_usd_raw`` override, so the reader surfaces ``tokens`` from that row
+    while ``cost_usd`` equals the override (token-derived math bypassed) — the
+    "same source row, NOT same arithmetic" contract (no consumer may assert
+    ``cost == f(tokens)``). The turn also pins ``input``/``input_truncated`` on
+    a tool_call, ``stop_reason``/``attribution_*`` on the item, and
+    ``result.full_length`` on a truncated tool result.
 
 No ``seed_conversation_message`` helper exists in ``_fixture_builders`` — the
 ``conversation_messages`` rows are INSERTed directly here. The cache.db is
@@ -115,6 +123,10 @@ def _insert_message(
     git_branch: str | None = None,
     is_sidechain: int = 0,
     source_tool_use_id: str | None = None,
+    stop_reason: str | None = None,
+    attribution_skill: str | None = None,
+    attribution_plugin: str | None = None,
+    search_aux: str = "",
 ) -> None:
     """Insert one ``conversation_messages`` row (no shared helper exists).
 
@@ -127,17 +139,25 @@ def _insert_message(
     ``source_tool_use_id`` is the message-level link an injected Skill body
     carries (the transcript's ``sourceToolUseID``); the reader uses it to fold
     the body into its owning Skill tool chip. NULL on every non-skill-body row.
+
+    ``stop_reason`` / ``attribution_skill`` / ``attribution_plugin`` /
+    ``search_aux`` are the #177-enriched message-level columns (tail-appended,
+    matching the production INSERT tuple). The reader surfaces stop_reason /
+    attribution on assistant items; search_aux backs the aux FTS index (no
+    query yet this session). All NULL/'' by default on rows that don't need them.
     """
     conn.execute(
         "INSERT INTO conversation_messages "
         "(session_id, uuid, parent_uuid, source_path, byte_offset, "
         " timestamp_utc, entry_type, text, blocks_json, model, msg_id, req_id, "
-        " cwd, git_branch, is_sidechain, source_tool_use_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " cwd, git_branch, is_sidechain, source_tool_use_id, "
+        " stop_reason, attribution_skill, attribution_plugin, search_aux) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             session_id, uuid, parent_uuid, source_path, byte_offset,
             timestamp_utc, entry_type, text, blocks_json, model, msg_id, req_id,
             cwd, git_branch, is_sidechain, source_tool_use_id,
+            stop_reason, attribution_skill, attribution_plugin, search_aux,
         ),
     )
 
@@ -166,6 +186,8 @@ def build(scenario: str) -> None:
     s3_cwd = "/home/u/proj"
     s4_file = "/fake/projects/proj/s4.jsonl"
     s4_cwd = "/home/u/proj"
+    s5_file = "/fake/projects/proj/s5.jsonl"
+    s5_cwd = "/home/u/proj"
 
     cache_conn = sqlite3.connect(cache_path)
     stats_conn = sqlite3.connect(stats_path)
@@ -187,6 +209,8 @@ def build(scenario: str) -> None:
                           project_path=s3_cwd)
         seed_session_file(cache_conn, path=s4_file, session_id="s4",
                           project_path=s4_cwd)
+        seed_session_file(cache_conn, path=s5_file, session_id="s5",
+                          project_path=s5_cwd)
 
         # --- session s1: human prompt + multi-fragment assistant turn --------
         # id=1: human prompt.
@@ -219,13 +243,17 @@ def build(scenario: str) -> None:
                 '[{"kind": "thinking", "text": "let me think"}, '
                 '{"kind": "tool_use", "name": "Read", "input_summary": '
                 '"{\\"file_path\\":\\"/home/u/proj/resets.py\\"}", '
+                '"input": {"file_path": "/home/u/proj/resets.py"}, '
+                '"input_truncated": false, '
                 '"id": "toolu_s1a", "preview": "/home/u/proj/resets.py"}, '
                 '{"kind": "tool_use", "name": "Skill", "input_summary": '
                 '"{\\"skill\\":\\"brainstorming\\"}", '
+                '"input": {"skill": "brainstorming"}, "input_truncated": false, '
                 '"id": "toolu_FX", "preview": "brainstorming"}]'
             ),
             model=MODEL, msg_id="m1", req_id="r1",
             cwd=s1_cwd, git_branch="main",
+            search_aux="/home/u/proj/resets.py\nbrainstorming\nlet me think",
         )
         # id=3 (NEW): the user tool_result row for toolu_s1a. The kernel folds
         # this into the (m1,r1) turn's tool_call.result and joins uuid 'tr1'
@@ -240,10 +268,11 @@ def build(scenario: str) -> None:
             entry_type="tool_result", text="",
             blocks_json=(
                 '[{"kind": "tool_result", "text": "def reset(): ...", '
-                '"truncated": false, "is_error": false, '
+                '"truncated": false, "full_length": 16, "is_error": false, '
                 '"tool_use_id": "toolu_s1a"}]'
             ),
             cwd=s1_cwd, git_branch="main",
+            search_aux="def reset(): ...",
         )
         # The trivial "Launching skill" tool_result for toolu_FX (Skill triple,
         # message 2 of 3). The Phase 4b skill-body fold REPLACES this result with
@@ -280,6 +309,11 @@ def build(scenario: str) -> None:
             ),
             model=MODEL, msg_id="m1", req_id="r1",
             cwd=s1_cwd, git_branch="main",
+            # #177: the terminal prose fragment carries the turn's stop_reason +
+            # skill/plugin attribution — the reader surfaces them on the turn item.
+            stop_reason="end_turn",
+            attribution_skill="superpowers:brainstorming",
+            attribution_plugin="superpowers",
         )
         # id=6: REPLAY of the prose fragment in the resume file (b.jsonl). Same
         # (session_id, uuid)=(s1, a1b) + same (msg_id, req_id)=(m1, r1) but a
@@ -508,6 +542,76 @@ def build(scenario: str) -> None:
             timestamp_utc="2026-06-04T00:00:02Z",
             entry_type="human", text="set up the marker-skip scenario",
             cwd=s4_cwd, git_branch="main",
+        )
+
+        # --- session s5: the #177 raw-cost-override guard (Codex P1 "same
+        # source row, NOT same arithmetic"). A human prompt + an assistant turn
+        # whose single deduped session_entries row carries BOTH token columns
+        # AND a vendor-provided ``cost_usd_raw`` override. The reader surfaces
+        # per-turn ``tokens`` from that row, but ``cost_usd`` equals the raw
+        # override (token-derived math bypassed) — so the two are deliberately
+        # NOT equal, and no consumer may assert cost == f(tokens). The turn also
+        # carries a truncated tool result (full_length >> capped text) and a
+        # structured-but-truncated tool input, so the s5 reader golden pins
+        # every #177 surface in one place. ----------------------------------
+        _insert_message(
+            cache_conn,
+            session_id="s5", uuid="s5h1", parent_uuid=None,
+            source_path=s5_file, byte_offset=0,
+            timestamp_utc="2026-06-05T00:00:00Z",
+            entry_type="human", text="apply the patch and report the cost",
+            cwd=s5_cwd, git_branch="main",
+        )
+        _insert_message(
+            cache_conn,
+            session_id="s5", uuid="s5a1", parent_uuid="s5h1",
+            source_path=s5_file, byte_offset=1,
+            timestamp_utc="2026-06-05T00:00:01Z",
+            entry_type="assistant", text="patched the resolver",
+            blocks_json=(
+                '[{"kind": "tool_use", "name": "Edit", "input_summary": '
+                '"{\\"file_path\\":\\"/home/u/proj/resolve.py\\"}", '
+                '"input": {"file_path": "/home/u/proj/resolve.py", '
+                '"old_string": "clipped-leaf…"}, "input_truncated": true, '
+                '"id": "toolu_s5", "preview": "/home/u/proj/resolve.py"}, '
+                '{"kind": "text", "text": "patched the resolver"}]'
+            ),
+            model=MODEL, msg_id="m5", req_id="r5",
+            cwd=s5_cwd, git_branch="main",
+            stop_reason="tool_use",
+            attribution_skill="superpowers:test-driven-development",
+            attribution_plugin="superpowers",
+            search_aux="/home/u/proj/resolve.py\nclipped-leaf…",
+        )
+        # A truncated tool_result for toolu_s5: capped ``text`` (a short stub)
+        # with ``full_length`` recording the true pre-clip size, ``truncated``
+        # honest. The reader folds this into s5a1's tool_call.result, exercising
+        # the result.full_length surface end-to-end.
+        _insert_message(
+            cache_conn,
+            session_id="s5", uuid="s5tr", parent_uuid="s5a1",
+            source_path=s5_file, byte_offset=2,
+            timestamp_utc="2026-06-05T00:00:02Z",
+            entry_type="tool_result", text="",
+            blocks_json=(
+                '[{"kind": "tool_result", "text": "applied 1 edit (truncated)", '
+                '"truncated": true, "full_length": 48213, "is_error": false, '
+                '"tool_use_id": "toolu_s5"}]'
+            ),
+            cwd=s5_cwd, git_branch="main",
+            search_aux="applied 1 edit (truncated)",
+        )
+        # ONE session_entries row for (m5,r5) carrying BOTH tokens AND a raw
+        # cost override. tokens surface on the turn; cost_usd == the override
+        # ($0.99), which is intentionally NOT token-derived ($0.0175 for these
+        # tokens) — the guard against a cost==f(tokens) assertion creeping in.
+        seed_session_entry(
+            cache_conn,
+            source_path=s5_file, line_offset=1,
+            timestamp_utc="2026-06-05T00:00:01Z",
+            model=MODEL, msg_id="m5", req_id="r5",
+            input_tokens=1000, output_tokens=500,
+            cost_usd_raw=0.99,
         )
 
         # Empty stats.db stamped fully-migrated (dashboard-fixtures posture):
