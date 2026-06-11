@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.36.0] - 2026-06-11
+
 ### Added
 - Conversation viewer: AskUserQuestion, TodoWrite, and ExitPlanMode now render as dedicated cards — the question-and-chosen-answer, a live checklist with progress, and the rendered plan with its approve/reject outcome — instead of raw JSON tool chips (#177 S2).
 
