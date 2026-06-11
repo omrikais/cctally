@@ -73,9 +73,13 @@ export type ConversationBlock =
       kind: 'tool_call';
       name: string | null;
       input_summary: string;
+      input?: Record<string, unknown> | null;  // #177 S1 — bounded structured input
+      input_truncated?: boolean;                // #177 S1
       preview: string;
       tool_use_id: string | null;
-      result: { text: string; truncated: boolean; is_error: boolean } | null;
+      result: { text: string; truncated: boolean; full_length?: number | null; is_error: boolean } | null;
+      answers?: Record<string, string>;         // #177 S2 — {question: chosen label(s)}
+      annotations?: Record<string, unknown>;    // #177 S2 — user notes keyed by question
       skill_body?: string;
       skill_name?: string | null;
     }

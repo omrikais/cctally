@@ -218,6 +218,29 @@ export function ChatIcon() {
   );
 }
 
+// Speech bubble with a "?" — the AskUserQuestion glyph. Distinct from ChatIcon
+// (the empty-state glyph) so one mark never carries two meanings.
+export function QuestionIcon() {
+  return (
+    <Svg>
+      <path d="M21 11.5a8 8 0 0 1-11.6 7.1L3 20.5l1.9-6.4A8 8 0 1 1 21 11.5Z" />
+      <path d="M9.6 9a2.4 2.4 0 0 1 4.4 1.3c0 1.6-2 1.9-2 3.2" />
+      <path d="M12 16.5v.5" />
+    </Svg>
+  );
+}
+
+// Clipboard with a check — the ExitPlanMode (plan) glyph.
+export function PlanIcon() {
+  return (
+    <Svg>
+      <path d="M9 4h6a1 1 0 0 1 1 1v1H8V5a1 1 0 0 1 1-1Z" />
+      <path d="M8 6H6a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1h-2" />
+      <path d="M9 13l2 2 4-4" />
+    </Svg>
+  );
+}
+
 // Per-tool glyph dispatcher: case-insensitive family match, generic box as the
 // never-blank fallback. Used by the tool chip + the tool_use degradation chip.
 export function toolIcon(name?: string | null): ReactNode {
@@ -228,6 +251,8 @@ export function toolIcon(name?: string | null): ReactNode {
   if (n === 'task' || n === 'agent') return <SubagentIcon />;
   if (n === 'skill') return <SkillIcon />;
   if (n === 'webfetch' || n === 'websearch') return <GlobeIcon />;
+  if (n === 'askuserquestion') return <QuestionIcon />;
+  if (n === 'exitplanmode') return <PlanIcon />;
   if (n === 'todowrite' || n === 'taskcreate') return <ChecklistIcon />;
   return <ToolGenericIcon />;
 }

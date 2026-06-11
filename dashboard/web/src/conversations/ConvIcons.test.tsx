@@ -1,7 +1,7 @@
 import { render } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import type { ReactNode } from 'react';
-import { toolIcon, ThinkingIcon, FileSearchIcon, TerminalIcon, ToolGenericIcon, LinkIcon, SpinnerIcon } from './ConvIcons';
+import { toolIcon, ThinkingIcon, FileSearchIcon, TerminalIcon, ToolGenericIcon, LinkIcon, SpinnerIcon, QuestionIcon, PlanIcon } from './ConvIcons';
 
 function svgOf(el: ReactNode) {
   const { container } = render(<>{el}</>);
@@ -40,5 +40,18 @@ describe('ConvIcons', () => {
     expect(svg).toBeInTheDocument();
     expect(svg).toHaveAttribute('aria-hidden', 'true');
     expect(svg).toHaveClass('conv-ico');
+  });
+});
+
+describe('ConvIcons — Session 2 tool glyphs', () => {
+  it('dispatches AskUserQuestion to QuestionIcon and ExitPlanMode to PlanIcon', () => {
+    const a = render(<>{toolIcon('AskUserQuestion')}</>).container.querySelector('svg');
+    const p = render(<>{toolIcon('ExitPlanMode')}</>).container.querySelector('svg');
+    expect(a).toBeTruthy();
+    expect(p).toBeTruthy();
+  });
+  it('QuestionIcon and PlanIcon render an svg', () => {
+    expect(render(<QuestionIcon />).container.querySelector('svg')).toBeTruthy();
+    expect(render(<PlanIcon />).container.querySelector('svg')).toBeTruthy();
   });
 });
