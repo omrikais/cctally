@@ -85,6 +85,134 @@ def test_update_text_reindexes_fts():
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# #177 Session 1: conversation_fts_aux parity with the prose FTS — present /
+# delete-propagates / update-reindexes — plus the all-or-nothing envelope and
+# the unavailable-drops-both assertions.
+# ──────────────────────────────────────────────────────────────────────────
+
+def _insert_aux(conn, uuid, off, aux, *, text="", entry_type="assistant"):
+    conn.execute(
+        "INSERT INTO conversation_messages"
+        "(session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,text,blocks_json,is_sidechain,search_aux)"
+        " VALUES('s',?,?,?, 't',?,?,'[]',0,?)",
+        (uuid, f"f{off}", off, entry_type, text, aux),
+    )
+
+
+def test_aux_fts_present_when_available_and_indexes_aux():
+    conn = _fresh()
+    if not db._fts5_available(conn):
+        pytest.skip("sqlite build lacks FTS5")
+    # tool/thinking content lives in search_aux; prose lives in text.
+    _insert_aux(conn, "u", 0, "AUXTOKEN command run", text="PROSETOKEN")
+    hits = conn.execute(
+        "SELECT rowid FROM conversation_fts_aux WHERE conversation_fts_aux MATCH 'AUXTOKEN'"
+    ).fetchall()
+    assert len(hits) == 1
+    # aux index does NOT carry prose; prose stays in conversation_fts.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts_aux WHERE conversation_fts_aux MATCH 'PROSETOKEN'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts WHERE conversation_fts MATCH 'PROSETOKEN'"
+    ).fetchone()[0] == 1
+
+
+def test_aux_delete_propagates_to_aux_fts():
+    conn = _fresh()
+    if not db._fts5_available(conn):
+        pytest.skip("sqlite build lacks FTS5")
+    _insert_aux(conn, "u", 0, "findaux")
+    conn.execute("DELETE FROM conversation_messages")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts_aux WHERE conversation_fts_aux MATCH 'findaux'"
+    ).fetchone()[0] == 0
+
+
+def test_aux_update_reindexes_aux_fts():
+    conn = _fresh()
+    if not db._fts5_available(conn):
+        pytest.skip("sqlite build lacks FTS5")
+    _insert_aux(conn, "u", 0, "alphaaux")
+    conn.execute("UPDATE conversation_messages SET search_aux='betaaux' WHERE uuid='u'")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts_aux WHERE conversation_fts_aux MATCH 'betaaux'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts_aux WHERE conversation_fts_aux MATCH 'alphaaux'"
+    ).fetchone()[0] == 0
+
+
+def test_aux_au_trigger_not_fired_by_text_only_update():
+    """The aux AU trigger is keyed AFTER UPDATE OF search_aux — a text-only
+    UPDATE must not touch the aux index (and vice-versa for the prose AU). If
+    the trigger fired on a text update the external-content shadow-write would
+    desync; integrity-check guards that."""
+    conn = _fresh()
+    if not db._fts5_available(conn):
+        pytest.skip("sqlite build lacks FTS5")
+    _insert_aux(conn, "u", 0, "auxword", text="proseold")
+    conn.execute("UPDATE conversation_messages SET text='prosenew' WHERE uuid='u'")
+    # aux content unchanged + still searchable; integrity intact.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_fts_aux WHERE conversation_fts_aux MATCH 'auxword'"
+    ).fetchone()[0] == 1
+    conn.execute("INSERT INTO conversation_fts_aux(conversation_fts_aux) VALUES('integrity-check')")
+
+
+def test_fts_unavailable_also_drops_aux_table_under_one_flag(monkeypatch):
+    """The single fts5_unavailable flag covers BOTH indexes — when FTS5 is
+    unavailable NEITHER conversation_fts NOR conversation_fts_aux exists and no
+    conv_fts_aux_* trigger survives."""
+    monkeypatch.setattr(db, "_fts5_available", lambda conn: False)
+    conn = sqlite3.connect(":memory:")
+    db._apply_cache_schema(conn)
+    flag = conn.execute("SELECT value FROM cache_meta WHERE key='fts5_unavailable'").fetchone()
+    assert flag is not None and flag[0] == "1"
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "conversation_fts" not in names
+    assert "conversation_fts_aux" not in names
+    trigs = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+    assert not any(t.startswith("conv_fts_") for t in trigs)  # covers conv_fts_aux_* too
+
+
+def test_aux_fts_create_failure_drops_both_and_insert_still_commits(monkeypatch):
+    """If the aux FTS create fails AFTER the prose FTS was created, the schema
+    apply must drop BOTH indexes + BOTH trigger sets, set the single
+    fts5_unavailable flag, and a later conversation_messages INSERT must still
+    commit (the shared write txn — which also carries session_entries cost
+    ingest — is NOT rolled back). Codex P1 all-or-nothing regression."""
+    conn = sqlite3.connect(":memory:")
+    if not db._fts5_available(conn):
+        pytest.skip("sqlite build lacks FTS5")
+
+    # Fail ONLY the aux create; the prose create has already succeeded by the
+    # time this seam runs, so this exercises the partial-failure cleanup path.
+    def _boom(c):
+        raise sqlite3.OperationalError("simulated aux fts create failure")
+
+    monkeypatch.setattr(db, "_create_conversation_fts_aux_table", _boom)
+    db._apply_cache_schema(conn)
+
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "conversation_fts" not in names, "prose FTS must be dropped on aux failure"
+    assert "conversation_fts_aux" not in names
+    trigs = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+    assert not any(t.startswith("conv_fts_") for t in trigs), "BOTH trigger sets dropped"
+    flag = conn.execute("SELECT value FROM cache_meta WHERE key='fts5_unavailable'").fetchone()
+    assert flag is not None and flag[0] == "1", "the single shared flag is set"
+
+    # The load-bearing assertion: a conversation_messages INSERT still commits —
+    # no orphan trigger over a missing aux table rolls back the shared write txn.
+    conn.execute(
+        "INSERT INTO conversation_messages"
+        "(session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,text,blocks_json,is_sidechain,search_aux)"
+        " VALUES('s','u','f',0,'t','assistant','x','[]',0,'a')")
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM conversation_messages").fetchone()[0] == 1
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Task 4: sync_cache second seek-and-walk ingest + lifecycle (real path)
 #
 # Driven against the real ``sync_cache`` via the established
@@ -571,9 +699,16 @@ def test_rebuild_clears_pending_flag_without_separate_backfill(isolated, monkeyp
         _asst_line("a1", "m1", "r1", "hello") + _user_line("u1", "q1")
     )
 
-    # Stand up the deferred-upgrade state: a pending flag set, index empty.
+    # Stand up the deferred-upgrade state: a pending flag set, index empty. Also
+    # arm the #177 enrichment reingest flag — the rebuild's normal offset-0 walk
+    # re-derives the enriched fields, so it must be cleared on the rebuild path
+    # too (else cache-sync --rebuild re-arms it every run).
     conn.execute(
         "INSERT INTO cache_meta(key, value) VALUES('conversation_backfill_pending','1') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES('conversation_reingest_enrichment_pending','1') "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
     )
     conn.commit()
@@ -601,6 +736,9 @@ def test_rebuild_clears_pending_flag_without_separate_backfill(isolated, monkeyp
     assert conn.execute(
         "SELECT 1 FROM cache_meta WHERE key='conversation_backfill_pending'"
     ).fetchone() is None, "rebuild must clear the pending flag directly"
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='conversation_reingest_enrichment_pending'"
+    ).fetchone() is None, "rebuild must also clear the #177 enrichment reingest flag"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -777,3 +915,85 @@ def test_migration_005_reingest_reclassifies_ismeta_rows_to_meta(isolated):
     assert conn.execute(
         "SELECT 1 FROM cache_meta WHERE key='conversation_reingest_pending'"
     ).fetchone() is None, "the reingest flag is dropped after consumption"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #177 Session 1: the enriched data contract lands through the real sync_cache
+# write path — the new columns are populated and the aux FTS indexes the tool
+# content. Plus migration 007's flag-only reingest cycle.
+# ──────────────────────────────────────────────────────────────────────────
+
+def _asst_tooluse_line(uuid, msg_id, req_id, *, cmd="enrichcmd",
+                       ts="2026-06-01T00:00:00Z"):
+    """An assistant JSONL line carrying a Bash tool_use (so search_aux is
+    non-empty) and a message-level stop_reason."""
+    return json.dumps({
+        "type": "assistant", "uuid": uuid, "sessionId": "s1",
+        "requestId": req_id, "timestamp": ts,
+        "message": {
+            "role": "assistant", "id": msg_id, "model": "claude-opus-4-7",
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "name": "Bash", "id": "tu1",
+                         "input": {"command": cmd}}],
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                      "cache_creation_input_tokens": 0,
+                      "cache_read_input_tokens": 0},
+        },
+    }) + "\n"
+
+
+def test_sync_lands_enriched_columns_and_aux_fts(isolated):
+    """A real sync_cache ingests the enriched fields: stop_reason on the row,
+    search_aux populated from the tool input, blocks_json carrying structured
+    input/input_truncated, and the aux FTS indexing the tool content."""
+    ns, conn, projects, sync = isolated
+    (projects / "a.jsonl").write_text(_asst_tooluse_line("a1", "m1", "r1"))
+    sync(rebuild=True)
+
+    row = conn.execute(
+        "SELECT stop_reason, search_aux, blocks_json FROM conversation_messages WHERE uuid='a1'"
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "tool_use"                 # stop_reason column populated
+    assert "enrichcmd" in row[1]                # search_aux carries the tool input
+    blocks = json.loads(row[2])
+    tu = [b for b in blocks if b["kind"] == "tool_use"][0]
+    assert tu["input"] == {"command": "enrichcmd"}
+    assert tu["input_truncated"] is False
+    if db._fts5_available(conn):
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_fts_aux WHERE conversation_fts_aux MATCH 'enrichcmd'"
+        ).fetchone()[0] == 1
+
+
+def test_migration_007_reingest_lands_enrichment_on_stale_row(isolated):
+    """007 is flag-only (sets conversation_reingest_enrichment_pending); the
+    offset-0 reingest then re-parses every JSONL through the enriched parser, so
+    a stale pre-upgrade row (enriched columns NULL/'') gets them backfilled, and
+    the flag is cleared after consumption."""
+    ns, conn, projects, sync = isolated
+    (projects / "a.jsonl").write_text(_asst_tooluse_line("a1", "m1", "r1"))
+    sync()
+    # Simulate a PRE-upgrade ingest: blank out the enriched columns.
+    conn.execute(
+        "UPDATE conversation_messages SET stop_reason=NULL, search_aux='' WHERE uuid='a1'")
+    conn.commit()
+    assert conn.execute(
+        "SELECT stop_reason, search_aux FROM conversation_messages WHERE uuid='a1'"
+    ).fetchone() == (None, "")
+
+    # Run the real 007 handler (flag-only) then sync to consume it.
+    db._007_conversation_reingest_enrichment(conn)
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='conversation_reingest_enrichment_pending'"
+    ).fetchone() is not None
+    sync()
+
+    row = conn.execute(
+        "SELECT stop_reason, search_aux FROM conversation_messages WHERE uuid='a1'"
+    ).fetchone()
+    assert row[0] == "tool_use", "stop_reason re-derived by the enriched parser"
+    assert "enrichcmd" in row[1], "search_aux re-derived from the tool input"
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='conversation_reingest_enrichment_pending'"
+    ).fetchone() is None, "the enrichment reingest flag is dropped after consumption"

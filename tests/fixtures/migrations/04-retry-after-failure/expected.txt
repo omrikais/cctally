@@ -14,14 +14,15 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 13 / 13 known
   ✓ 012_unify_budget_milestones_vendor             applied <REDACTED>
   ✓ 013_test_failure_injection                     applied <REDACTED>
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 7 / 7 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 8 / 8 known
   ✓ 001_dedup_highest_wins                         applied <REDACTED>
   ✓ 002_conversation_messages_backfill             applied <REDACTED>
   ✓ 003_conversation_reingest_tool_ids             applied <REDACTED>
   ✓ 004_conversation_reingest_subagent_kind        applied <REDACTED>
   ✓ 005_conversation_reingest_meta                 applied <REDACTED>
   ✓ 006_conversation_reingest_source_tool_use_id   applied <REDACTED>
-  ✓ 007_test_cache_migration                       applied <REDACTED>
+  ✓ 007_conversation_reingest_enrichment           applied <REDACTED>
+  ✓ 008_test_cache_migration                       applied <REDACTED>
 ## stderr
 
 ## exit

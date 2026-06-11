@@ -2389,6 +2389,15 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     # column-add (no marker, no version); cache migration 006 then re-ingests
     # so the value actually lands on historical rows.
     add_column_if_missing(conn, "conversation_messages", "source_tool_use_id", "TEXT")
+    # #177 Session 1: enriched data-contract columns. Idempotent column-adds (no
+    # marker, no version — exactly like source_tool_use_id); cache migration 007
+    # then re-ingests so the values actually land on historical rows. search_aux
+    # is the parser-populated non-prose blob the conversation_fts_aux index reads.
+    add_column_if_missing(conn, "conversation_messages", "stop_reason", "TEXT")
+    add_column_if_missing(conn, "conversation_messages", "attribution_skill", "TEXT")
+    add_column_if_missing(conn, "conversation_messages", "attribution_plugin", "TEXT")
+    add_column_if_missing(
+        conn, "conversation_messages", "search_aux", "TEXT NOT NULL DEFAULT ''")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
         "ON session_files(session_id)"
@@ -2414,23 +2423,40 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS conversation_fts "
                 "USING fts5(text, content='conversation_messages', content_rowid='id')")
-            # Trigger DDL lives in ONE place (_CONV_FTS_TRIGGER_DDL) so this
-            # initial create and the #138 storm-free full-clear
-            # (clear_conversation_messages, which drops + recreates the
-            # triggers) can never drift.
+            # #177: the aux external-content index is ALL-OR-NOTHING with the
+            # prose FTS under the SINGLE fts5_unavailable flag — created in this
+            # SAME try-envelope (via the _create_conversation_fts_aux_table seam,
+            # which tests monkeypatch to simulate an aux-create failure AFTER the
+            # prose create succeeded), so ANY OperationalError below drops BOTH
+            # tables + BOTH trigger sets (the except arm). A live aux trigger over
+            # a missing conversation_fts_aux would roll back the shared
+            # conversation_messages write transaction (which also carries cost
+            # ingest into session_entries). It is NOT given its own guarded block
+            # or its own flag.
+            _create_conversation_fts_aux_table(conn)
+            # Trigger DDL lives in ONE place (_CONV_FTS_TRIGGER_DDL +
+            # _CONV_FTS_AUX_TRIGGER_DDL) so this initial create and the #138
+            # storm-free full-clear (clear_conversation_messages, which drops +
+            # recreates BOTH trigger sets) can never drift.
             _create_conversation_fts_triggers(conn)
             if recovering:
-                # Repopulate the freshly-(re)created index from the base table
+                # Repopulate the freshly-(re)created indexes from the base table
                 # so pre-recovery history is searchable. Cheap no-op when
                 # conversation_messages is empty.
                 conn.execute(
                     "INSERT INTO conversation_fts(conversation_fts) VALUES('rebuild')")
+                conn.execute(
+                    "INSERT INTO conversation_fts_aux(conversation_fts_aux) VALUES('rebuild')")
             conn.execute("DELETE FROM cache_meta WHERE key='fts5_unavailable'")
         except sqlite3.OperationalError:
-            # partial create cleanup, then mark unavailable
+            # partial create cleanup, then mark unavailable. _drop drops BOTH
+            # prose + aux trigger sets (#177), and we drop BOTH vtables, so a
+            # failed aux create can't leave a live aux trigger over a missing
+            # table.
             _drop_conversation_fts_triggers(conn)
             try:
                 conn.execute("DROP TABLE IF EXISTS conversation_fts")
+                conn.execute("DROP TABLE IF EXISTS conversation_fts_aux")
             except sqlite3.OperationalError:
                 pass
             _set_cache_meta(conn, "fts5_unavailable", "1")
@@ -2472,6 +2498,20 @@ def _set_cache_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
+def _create_conversation_fts_aux_table(conn: sqlite3.Connection) -> None:
+    """Create the #177 aux external-content FTS5 index over the ``search_aux``
+    blob. A standalone module-level seam (NOT inlined in ``_apply_cache_schema``)
+    so the all-or-nothing regression test can monkeypatch it to raise
+    ``OperationalError`` AFTER the prose ``conversation_fts`` create succeeded —
+    proving the shared try-envelope drops BOTH indexes + BOTH trigger sets and a
+    later ``conversation_messages`` INSERT still commits (the cost write txn is
+    not rolled back). Must run inside that envelope; idempotent
+    (``IF NOT EXISTS``)."""
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS conversation_fts_aux "
+        "USING fts5(aux, content='conversation_messages', content_rowid='id')")
+
+
 # Conversation FTS sync triggers (external-content FTS5). Defined ONCE here so
 # the initial create in _apply_cache_schema and the #138 storm-free full-clear
 # in clear_conversation_messages (which drops + recreates them) can never drift.
@@ -2491,21 +2531,47 @@ _CONV_FTS_TRIGGER_DDL = (
 # cosmetic — order doesn't matter for independent triggers.
 _CONV_FTS_TRIGGER_NAMES = ("conv_fts_au", "conv_fts_ad", "conv_fts_ai")
 
+# #177: the parallel aux index (conversation_fts_aux) over the search_aux blob.
+# All-or-nothing with the prose FTS under the single fts5_unavailable flag — its
+# DDL lives beside the prose set and the SAME create/drop chokepoints handle
+# both, so the two trigger sets can never drift. The AU trigger is keyed on
+# ``AFTER UPDATE OF search_aux`` (a text-only update doesn't fire it, and the
+# prose AU's ``AFTER UPDATE OF text`` doesn't fire this one).
+_CONV_FTS_AUX_TRIGGER_DDL = (
+    "CREATE TRIGGER IF NOT EXISTS conv_fts_aux_ai AFTER INSERT ON conversation_messages "
+    "BEGIN INSERT INTO conversation_fts_aux(rowid, aux) VALUES (new.id, new.search_aux); END",
+    "CREATE TRIGGER IF NOT EXISTS conv_fts_aux_ad AFTER DELETE ON conversation_messages "
+    "BEGIN INSERT INTO conversation_fts_aux(conversation_fts_aux, rowid, aux) "
+    "VALUES('delete', old.id, old.search_aux); END",
+    "CREATE TRIGGER IF NOT EXISTS conv_fts_aux_au AFTER UPDATE OF search_aux ON conversation_messages "
+    "BEGIN INSERT INTO conversation_fts_aux(conversation_fts_aux, rowid, aux) "
+    "VALUES('delete', old.id, old.search_aux); "
+    "INSERT INTO conversation_fts_aux(rowid, aux) VALUES (new.id, new.search_aux); END",
+)
+_CONV_FTS_AUX_TRIGGER_NAMES = ("conv_fts_aux_au", "conv_fts_aux_ad", "conv_fts_aux_ai")
+
 
 def _create_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
-    """Create the three external-content FTS5 sync triggers (idempotent —
-    each is ``IF NOT EXISTS``). Single source of truth for the trigger DDL,
-    shared by ``_apply_cache_schema`` and ``clear_conversation_messages``
-    (#138). The caller must have already created ``conversation_fts``."""
+    """Create BOTH external-content FTS5 sync trigger sets — prose
+    (conversation_fts) + aux (conversation_fts_aux, #177) — idempotent (each is
+    ``IF NOT EXISTS``). Single source of truth for the trigger DDL, shared by
+    ``_apply_cache_schema`` and ``clear_conversation_messages`` (#138). The
+    caller must have already created both ``conversation_fts`` and
+    ``conversation_fts_aux``; one call site creates both sets so they can never
+    drift."""
     for stmt in _CONV_FTS_TRIGGER_DDL:
+        conn.execute(stmt)
+    for stmt in _CONV_FTS_AUX_TRIGGER_DDL:
         conn.execute(stmt)
 
 
 def _drop_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
-    """Drop the three FTS5 sync triggers (idempotent — ``IF EXISTS``). Swallows
-    ``OperationalError`` per statement so a partial/absent trigger set (e.g. an
-    FTS-unavailable build) is tolerated."""
-    for name in _CONV_FTS_TRIGGER_NAMES:
+    """Drop BOTH FTS5 sync trigger sets — prose + aux (#177) — idempotent
+    (``IF EXISTS``). Swallows ``OperationalError`` per statement so a
+    partial/absent trigger set (e.g. an FTS-unavailable build) is tolerated. One
+    call site drops both sets so a failed aux create can't strand a live aux
+    trigger over a missing conversation_fts_aux."""
+    for name in _CONV_FTS_TRIGGER_NAMES + _CONV_FTS_AUX_TRIGGER_NAMES:
         try:
             conn.execute(f"DROP TRIGGER IF EXISTS {name}")
         except sqlite3.OperationalError:
@@ -2556,6 +2622,10 @@ def clear_conversation_messages(conn: sqlite3.Connection) -> None:
     _drop_conversation_fts_triggers(conn)
     conn.execute("DELETE FROM conversation_messages")
     conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('delete-all')")
+    # #177: the aux index is created all-or-nothing with the prose FTS, so when
+    # fts_unavailable is False BOTH vtables exist — reset BOTH the same storm-free
+    # way (triggers already dropped above, so the base DELETE touched neither).
+    conn.execute("INSERT INTO conversation_fts_aux(conversation_fts_aux) VALUES('delete-all')")
     _create_conversation_fts_triggers(conn)
 
 
@@ -3071,6 +3141,25 @@ def _006_conversation_reingest_source_tool_use_id(conn: sqlite3.Connection) -> N
     fresh install stamps it without running (empty table -> the flag, if ever
     set, is a harmless no-op)."""
     _set_cache_meta(conn, "conversation_source_tool_use_reingest_pending", "1")
+    conn.commit()
+
+
+@cache_migration("007_conversation_reingest_enrichment")
+def _007_conversation_reingest_enrichment(conn: sqlite3.Connection) -> None:
+    """Flag-only re-ingest so the enriched data contract — structured tool
+    ``input`` + ``input_truncated``, the raised result cap + ``full_length``,
+    ``stop_reason``/``attribution_skill``/``attribution_plugin``, and the
+    ``search_aux`` FTS-aux blob — lands on existing history. Sets the DISTINCT
+    ``conversation_reingest_enrichment_pending`` flag (NOT the shared
+    ``conversation_reingest_pending``, which also gates migration 005's read-time
+    human-fallback in the query kernel — re-arming it could misclassify a genuine
+    human prompt during the pre-reingest window). sync_cache consumes the flag
+    under the cache.db.lock flock (clear + offset-0 backfill); the offset-0 walk
+    re-parses every JSONL through the enriched parser, so the new fields/columns
+    land with zero new consumption code. Central stamp via the dispatcher (#140);
+    a fresh install stamps it without running (empty table -> the flag, if ever
+    set, is a harmless no-op)."""
+    _set_cache_meta(conn, "conversation_reingest_enrichment_pending", "1")
     conn.commit()
 
 

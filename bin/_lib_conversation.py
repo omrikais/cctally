@@ -15,7 +15,12 @@ ASSISTANT = "assistant"
 TOOL_RESULT = "tool_result"
 META = "meta"
 
-_TOOL_RESULT_CAP = 4000  # chars; full text always re-derivable from JSONL
+_TOOL_RESULT_CAP = 16000   # was 4000; full text always re-derivable from JSONL
+_INPUT_LEAF_CAP = 8000     # max chars per string leaf in a bounded tool input
+_INPUT_TOTAL_CAP = 32000   # honesty backstop on the serialized bounded input
+_INPUT_MAX_NODES = 2000    # max dict-values + list-elements kept before tail elision
+_INPUT_MAX_DEPTH = 12      # max nesting depth before subtree elision (RecursionError guard)
+_INPUT_ELISION = "…"       # sentinel for elided leaves / subtrees
 
 
 @dataclass
@@ -35,6 +40,10 @@ class MessageRow:
     git_branch: "str | None"
     is_sidechain: int
     source_tool_use_id: "str | None" = None
+    stop_reason: "str | None" = None
+    attribution_skill: "str | None" = None
+    attribution_plugin: "str | None" = None
+    search_aux: str = ""
 
 
 def iter_message_rows(fh, path_str):
@@ -88,7 +97,7 @@ def _normalize(obj, t, offset):
     msg = obj.get("message")
     if not isinstance(msg, dict):
         msg = {}
-    blocks, text = _blocks_and_text(msg.get("content"))
+    blocks, text, aux = _blocks_and_text(msg.get("content"))
     if t == "assistant":
         entry_type = ASSISTANT
     elif any(b["kind"] == "tool_result" for b in blocks):
@@ -132,15 +141,30 @@ def _normalize(obj, t, offset):
         git_branch=obj.get("gitBranch"),
         is_sidechain=1 if obj.get("isSidechain") else 0,
         source_tool_use_id=obj.get("sourceToolUseID"),
+        # #177: message-level enrichment. stop_reason is assistant-only;
+        # attribution is top-level on the JSONL object. search_aux is kept even
+        # for tool_result/meta rows — only `text` is zeroed for prose FTS;
+        # search_aux is the non-prose index (tool content stays searchable).
+        stop_reason=msg.get("stop_reason") if is_asst else None,
+        attribution_skill=obj.get("attributionSkill"),
+        attribution_plugin=obj.get("attributionPlugin"),
+        search_aux=aux,
     )
 
 
 def _blocks_and_text(content):
-    """Return (normalized blocks list, indexed-prose string). Prose = joined
-    `text` blocks only (thinking / tool_use / tool_result excluded)."""
+    """Return (normalized blocks list, indexed-prose string, search_aux string).
+
+    Prose (``text``) = joined ``text`` blocks only (thinking / tool_use /
+    tool_result excluded — those go to the prose FTS via the ``text`` column).
+    ``search_aux`` (#177) = the non-prose searchable content: bounded tool-input
+    string leaves, the (capped) tool_result ``text``, and the thinking text —
+    indexed by the parallel ``conversation_fts_aux`` so tool content stays
+    searchable without polluting prose FTS. Prose is deliberately excluded from
+    aux (it is already in ``text``)."""
     if isinstance(content, str):
-        return ([{"kind": "text", "text": content}] if content else []), content
-    blocks, texts = [], []
+        return (([{"kind": "text", "text": content}] if content else []), content, "")
+    blocks, texts, aux_parts = [], [], []
     if isinstance(content, list):
         for b in content:
             if not isinstance(b, dict):
@@ -151,28 +175,37 @@ def _blocks_and_text(content):
                 blocks.append({"kind": "text", "text": txt})
                 texts.append(txt)
             elif bt == "thinking":
-                blocks.append({"kind": "thinking", "text": b.get("thinking", "") or ""})
+                think = b.get("thinking", "") or ""
+                blocks.append({"kind": "thinking", "text": think})
+                aux_parts.append(think)
             elif bt == "tool_use":
+                bounded, input_trunc = _bound_input(b.get("input"))
                 block = {"kind": "tool_use", "name": b.get("name"),
                          "input_summary": _summarize(b.get("input")),
+                         "input": bounded, "input_truncated": input_trunc,
                          "id": b.get("id"),
                          "preview": tool_preview(b.get("name"), b.get("input"))}
                 inp = b.get("input")
                 st = inp.get("subagent_type") if isinstance(inp, dict) else None
                 if isinstance(st, str) and st:        # #166: spawn kind (Agent/Task)
                     block["subagent_type"] = st
+                aux_parts.extend(_aux_strings(bounded))
                 blocks.append(block)
             elif bt == "tool_result":
                 raw = _stringify(b.get("content"))
-                blocks.append({"kind": "tool_result", "text": raw[:_TOOL_RESULT_CAP],
+                clipped = raw[:_TOOL_RESULT_CAP]
+                blocks.append({"kind": "tool_result", "text": clipped,
                                "truncated": len(raw) > _TOOL_RESULT_CAP,
+                               "full_length": len(raw),
                                "is_error": bool(b.get("is_error")),
                                "tool_use_id": b.get("tool_use_id")})
+                aux_parts.append(clipped)
             elif bt in ("image", "document"):
                 blocks.append({"kind": bt, **_media(b.get("source"))})
             elif bt == "tool_reference":
                 blocks.append({"kind": "tool_reference", "name": b.get("name")})
-    return blocks, "\n".join(t for t in texts if t)
+    return (blocks, "\n".join(t for t in texts if t),
+            "\n".join(a for a in aux_parts if a))
 
 
 _SUBAGENT_META_KEYS = (
@@ -231,6 +264,71 @@ def _summarize(inp):
         return ""
     s = json.dumps(inp, separators=(",", ":"))
     return s[:200]
+
+
+def _bound_input(inp):
+    """Return (bounded_structured_input, truncated) for a tool_use input dict, or
+    (None, False) for a non-dict (the same non-dict contract as _summarize /
+    tool_preview). Hard-bounds the result on four axes so a pathological input
+    can't bloat blocks_json (Codex P1): string leaves clip to _INPUT_LEAF_CAP;
+    non-string scalars pass through; once _INPUT_MAX_NODES dict-values/list-
+    elements are kept the remainder elides to _INPUT_ELISION; recursion past
+    _INPUT_MAX_DEPTH elides the subtree (RecursionError guard). A final
+    _INPUT_TOTAL_CAP serialized-size check is the honesty backstop. Structure is
+    preserved for the kept prefix so downstream renderers can read tool params."""
+    if not isinstance(inp, dict):
+        return (None, False)
+    state = {"nodes": 0, "truncated": False}
+
+    def walk(v, depth):
+        if depth > _INPUT_MAX_DEPTH:
+            state["truncated"] = True
+            return _INPUT_ELISION
+        if isinstance(v, str):
+            if len(v) > _INPUT_LEAF_CAP:
+                state["truncated"] = True
+                return v[:_INPUT_LEAF_CAP]
+            return v
+        if isinstance(v, dict):
+            out = {}
+            for k, vv in v.items():
+                if state["nodes"] >= _INPUT_MAX_NODES:
+                    state["truncated"] = True
+                    out[str(k)] = _INPUT_ELISION
+                    break
+                state["nodes"] += 1
+                out[str(k)] = walk(vv, depth + 1)
+            return out
+        if isinstance(v, list):
+            out = []
+            for vv in v:
+                if state["nodes"] >= _INPUT_MAX_NODES:
+                    state["truncated"] = True
+                    out.append(_INPUT_ELISION)
+                    break
+                state["nodes"] += 1
+                out.append(walk(vv, depth + 1))
+            return out
+        # int / float / bool / None — bounded-width scalars, pass through
+        return v
+
+    bounded = walk(inp, 0)
+    if len(json.dumps(bounded, separators=(",", ":"))) > _INPUT_TOTAL_CAP:
+        state["truncated"] = True
+    return (bounded, state["truncated"])
+
+
+def _aux_strings(v):
+    """Yield string leaves from a bounded input value (for the search_aux blob)."""
+    if isinstance(v, str):
+        if v:
+            yield v
+    elif isinstance(v, dict):
+        for vv in v.values():
+            yield from _aux_strings(vv)
+    elif isinstance(v, list):
+        for vv in v:
+            yield from _aux_strings(vv)
 
 
 _PREVIEW_FIELDS = {

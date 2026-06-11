@@ -183,18 +183,25 @@ _CONV_INSERT_SQL = (
     "INSERT OR IGNORE INTO conversation_messages"
     "(session_id,uuid,parent_uuid,source_path,byte_offset,"
     " timestamp_utc,entry_type,text,blocks_json,model,msg_id,"
-    " req_id,cwd,git_branch,is_sidechain,source_tool_use_id)"
-    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    " req_id,cwd,git_branch,is_sidechain,source_tool_use_id,"
+    " stop_reason,attribution_skill,attribution_plugin,search_aux)"
+    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 
 def _conv_row_tuple(m, path_str):
-    """Flatten a ``MessageRow`` into the ``_CONV_INSERT_SQL`` column order."""
+    """Flatten a ``MessageRow`` into the ``_CONV_INSERT_SQL`` column order.
+
+    The #177 enrichment fields (stop_reason / attribution_skill /
+    attribution_plugin / search_aux) are TAIL-APPENDED after source_tool_use_id
+    — same order as the SQL column list — so both ingest paths (fused per-file
+    walk + backfill_conversation_messages) carry them through this one tuple."""
     return (
         m.session_id, m.uuid, m.parent_uuid, path_str, m.byte_offset,
         m.timestamp_utc, m.entry_type, m.text, m.blocks_json, m.model,
         m.msg_id, m.req_id, m.cwd, m.git_branch, m.is_sidechain,
         m.source_tool_use_id,
+        m.stop_reason, m.attribution_skill, m.attribution_plugin, m.search_aux,
     )
 
 
@@ -622,11 +629,18 @@ def sync_cache(
             # dropping the flag here covers the 004 reingest too. Migration 006
             # sets the DISTINCT conversation_source_tool_use_reingest_pending
             # flag (to land source_tool_use_id); the same offset-0 walk re-derives
-            # it, so drop that flag here as well to avoid a redundant pass.
+            # it, so drop that flag here as well to avoid a redundant pass. #177
+            # migration 007 sets the DISTINCT
+            # conversation_reingest_enrichment_pending flag (to land structured
+            # input / full_length / stop_reason / attribution / search_aux); the
+            # same offset-0 walk re-derives those through the enriched parser, so
+            # drop that flag here too — MISSING this site re-arms the flag on
+            # every cache-sync --rebuild.
             conn.execute(
                 "DELETE FROM cache_meta WHERE key IN "
                 "('conversation_reingest_pending',"
-                " 'conversation_source_tool_use_reingest_pending')")
+                " 'conversation_source_tool_use_reingest_pending',"
+                " 'conversation_reingest_enrichment_pending')")
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Claude cached entries")
 
@@ -687,13 +701,21 @@ def sync_cache(
             # shared one) to land the message-level ``source_tool_use_id`` — the
             # shared flag also gates the kernel's 005 human-fallback, so re-arming
             # it for 006 could misclassify a genuine human prompt during the
-            # pre-reingest window. We trigger the SAME clear + offset-0 backfill on
-            # EITHER flag and clear BOTH atomically here under the held flock.
+            # pre-reingest window. #177 migration 007 uses ANOTHER distinct flag
+            # ``conversation_reingest_enrichment_pending`` (for the same shared-flag
+            # reason) to land the enriched data contract (structured input +
+            # input_truncated, the raised result cap + full_length, stop_reason /
+            # attribution_skill / attribution_plugin, and the search_aux FTS-aux
+            # blob); the offset-0 re-parse through the enriched parser lands them
+            # all with zero new consumption code. We trigger the SAME clear +
+            # offset-0 backfill on ANY of these flags and clear them ALL atomically
+            # here under the held flock.
             try:
                 _reingest = conn.execute(
                     "SELECT 1 FROM cache_meta WHERE key IN "
                     "('conversation_reingest_pending',"
-                    " 'conversation_source_tool_use_reingest_pending')"
+                    " 'conversation_source_tool_use_reingest_pending',"
+                    " 'conversation_reingest_enrichment_pending')"
                 ).fetchone() is not None
             except sqlite3.OperationalError:
                 _reingest = False
@@ -703,7 +725,8 @@ def sync_cache(
                 conn.execute(
                     "DELETE FROM cache_meta WHERE key IN "
                     "('conversation_reingest_pending',"
-                    " 'conversation_source_tool_use_reingest_pending')"
+                    " 'conversation_source_tool_use_reingest_pending',"
+                    " 'conversation_reingest_enrichment_pending')"
                 )
                 conn.commit()
 

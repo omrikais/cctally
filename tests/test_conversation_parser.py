@@ -194,7 +194,7 @@ def test_tool_use_block_keeps_id():
     from _lib_conversation import _blocks_and_text
     content = [{"type": "tool_use", "id": "toolu_abc", "name": "Read",
                 "input": {"file_path": "/x/y.py"}}]
-    blocks, text = _blocks_and_text(content)
+    blocks, text, aux = _blocks_and_text(content)
     assert blocks[0]["kind"] == "tool_use"
     assert blocks[0]["id"] == "toolu_abc"
 
@@ -203,17 +203,17 @@ def test_tool_result_block_keeps_tool_use_id():
     from _lib_conversation import _blocks_and_text
     content = [{"type": "tool_result", "tool_use_id": "toolu_abc",
                 "content": "ok"}]
-    blocks, text = _blocks_and_text(content)
+    blocks, text, aux = _blocks_and_text(content)
     assert blocks[0]["kind"] == "tool_result"
     assert blocks[0]["tool_use_id"] == "toolu_abc"
 
 
 def test_missing_ids_default_to_none_not_keyerror():
     from _lib_conversation import _blocks_and_text
-    blocks, _ = _blocks_and_text([{"type": "tool_use", "name": "Bash",
-                                   "input": {"command": "ls"}}])
+    blocks, _, _ = _blocks_and_text([{"type": "tool_use", "name": "Bash",
+                                      "input": {"command": "ls"}}])
     assert blocks[0]["id"] is None
-    blocks2, _ = _blocks_and_text([{"type": "tool_result", "content": "x"}])
+    blocks2, _, _ = _blocks_and_text([{"type": "tool_result", "content": "x"}])
     assert blocks2[0]["tool_use_id"] is None
 
 
@@ -251,8 +251,8 @@ def test_tool_preview_non_dict_input_is_empty():
 
 def test_tool_use_block_keeps_preview():
     from _lib_conversation import _blocks_and_text
-    blocks, _ = _blocks_and_text([{"type": "tool_use", "id": "t1", "name": "Read",
-                                   "input": {"file_path": "/a/b.py"}}])
+    blocks, _, _ = _blocks_and_text([{"type": "tool_use", "id": "t1", "name": "Read",
+                                      "input": {"file_path": "/a/b.py"}}])
     assert blocks[0]["preview"] == "/a/b.py"
 
 
@@ -367,3 +367,128 @@ def test_normalize_source_tool_use_id_null_without_field():
     }
     row = lc._normalize(obj, "user", 0)
     assert row.source_tool_use_id is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #177 Session 1: _bound_input — leaf-bounded structured tool input, hard-
+# bounded on FOUR axes (leaf clip / node budget / depth cap / total-size
+# backstop) so a pathological input can't bloat blocks_json (Codex P1).
+# ──────────────────────────────────────────────────────────────────────────
+
+def test_bound_input_small_dict_roundtrips_whole():
+    obj, trunc = lc._bound_input({"file_path": "/a/b.py", "limit": 10, "ok": True})
+    assert obj == {"file_path": "/a/b.py", "limit": 10, "ok": True}
+    assert trunc is False
+
+def test_bound_input_clips_long_string_leaf():
+    big = "x" * (lc._INPUT_LEAF_CAP + 500)
+    obj, trunc = lc._bound_input({"old_string": big})
+    assert len(obj["old_string"]) == lc._INPUT_LEAF_CAP
+    assert trunc is True
+
+def test_bound_input_non_string_leaves_pass_through():
+    obj, trunc = lc._bound_input({"n": 5, "f": 1.5, "b": False, "z": None})
+    assert obj == {"n": 5, "f": 1.5, "b": False, "z": None}
+    assert trunc is False
+
+def test_bound_input_node_budget_tail_elides():
+    many = {f"k{i}": "v" for i in range(lc._INPUT_MAX_NODES + 50)}
+    obj, trunc = lc._bound_input(many)
+    assert trunc is True
+    assert lc._INPUT_ELISION in obj.values()
+    # serialized size is bounded
+    assert len(json.dumps(obj)) <= lc._INPUT_TOTAL_CAP * 2
+
+def test_bound_input_depth_cap_no_recursion():
+    node = {"leaf": "ok"}
+    for _ in range(lc._INPUT_MAX_DEPTH + 20):
+        node = {"child": node}
+    obj, trunc = lc._bound_input(node)   # must NOT raise RecursionError
+    assert trunc is True
+
+def test_bound_input_nested_lists_and_dicts():
+    obj, trunc = lc._bound_input({"edits": [{"old": "a", "new": "b"}, {"old": "c"}]})
+    assert obj["edits"][0] == {"old": "a", "new": "b"}
+    assert trunc is False
+
+def test_bound_input_non_dict_returns_none():
+    assert lc._bound_input("just a string") == (None, False)
+    assert lc._bound_input(None) == (None, False)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #177 Session 1: enriched tool_use / tool_result blocks, message-level
+# stop_reason + attribution, and the search_aux non-prose index blob.
+# ──────────────────────────────────────────────────────────────────────────
+
+def _asst_line(content, **extra):
+    base = {"type": "assistant", "uuid": "u1", "sessionId": "s1",
+            "message": {"model": "claude", "stop_reason": "end_turn",
+                        "content": content}}
+    base.update(extra)
+    return base
+
+def test_tool_use_block_carries_structured_input_and_summary():
+    row = lc.parse_message_row(_asst_line([
+        {"type": "tool_use", "name": "Edit", "id": "t1",
+         "input": {"file_path": "/a.py", "old_string": "x", "new_string": "y"}}]), 0)
+    blocks = json.loads(row.blocks_json)
+    tu = [b for b in blocks if b["kind"] == "tool_use"][0]
+    assert tu["input"] == {"file_path": "/a.py", "old_string": "x", "new_string": "y"}
+    assert tu["input_truncated"] is False
+    assert tu["input_summary"]            # legacy field still present
+    assert tu["preview"] == "/a.py"       # preview still present
+
+def test_tool_use_input_truncated_flag_on_large_input():
+    big = "z" * (lc._INPUT_LEAF_CAP + 10)
+    row = lc.parse_message_row(_asst_line([
+        {"type": "tool_use", "name": "Write", "id": "t2",
+         "input": {"content": big}}]), 0)
+    tu = [b for b in json.loads(row.blocks_json) if b["kind"] == "tool_use"][0]
+    assert tu["input_truncated"] is True
+
+def test_tool_use_non_dict_input_yields_none_input():
+    # a tool_use whose input is not a dict keeps input=None, input_truncated=False
+    row = lc.parse_message_row(_asst_line([
+        {"type": "tool_use", "name": "X", "id": "t9", "input": "not a dict"}]), 0)
+    tu = [b for b in json.loads(row.blocks_json) if b["kind"] == "tool_use"][0]
+    assert tu["input"] is None and tu["input_truncated"] is False
+
+def test_tool_result_full_length_and_raised_cap():
+    big = "r" * (lc._TOOL_RESULT_CAP + 1234)
+    line = {"type": "user", "uuid": "u2", "sessionId": "s1",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": big}]}}
+    row = lc.parse_message_row(line, 0)
+    tr = [b for b in json.loads(row.blocks_json) if b["kind"] == "tool_result"][0]
+    assert len(tr["text"]) == lc._TOOL_RESULT_CAP
+    assert tr["truncated"] is True
+    assert tr["full_length"] == lc._TOOL_RESULT_CAP + 1234
+
+def test_message_level_fields_land_on_row():
+    row = lc.parse_message_row(_asst_line(
+        [{"type": "text", "text": "hi"}],
+        attributionSkill="superpowers:brainstorming",
+        attributionPlugin="superpowers"), 0)
+    assert row.stop_reason == "end_turn"
+    assert row.attribution_skill == "superpowers:brainstorming"
+    assert row.attribution_plugin == "superpowers"
+
+def test_search_aux_includes_tool_and_thinking_excludes_prose():
+    row = lc.parse_message_row(_asst_line([
+        {"type": "text", "text": "PROSE_ONLY_TOKEN"},
+        {"type": "thinking", "thinking": "THINK_TOKEN"},
+        {"type": "tool_use", "name": "Bash", "id": "t3",
+         "input": {"command": "CMD_TOKEN"}}]), 0)
+    assert "THINK_TOKEN" in row.search_aux
+    assert "CMD_TOKEN" in row.search_aux
+    assert "PROSE_ONLY_TOKEN" not in row.search_aux   # prose excluded
+    assert "PROSE_ONLY_TOKEN" in row.text             # prose still indexed via text
+
+def test_search_aux_includes_tool_result_text():
+    line = {"type": "user", "uuid": "u3", "sessionId": "s1",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "RESULT_TOKEN"}]}}
+    row = lc.parse_message_row(line, 0)
+    assert "RESULT_TOKEN" in row.search_aux
+    assert row.text == ""                             # tool_result zeroes prose, NOT aux
