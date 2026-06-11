@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useConversation } from '../hooks/useConversation';
 import { useKeymap } from '../hooks/useKeymap';
@@ -75,6 +75,59 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   loadMoreRef.current = loadMore;
   const reducedRef = useRef(reduced);
   reducedRef.current = reduced;
+
+  // #175 F4 — live-tail scroll behavior. `atBottomRef` tracks whether the user
+  // is parked at the bottom (updated on every scroll). `prevLenRef`/`prevHasMoreRef`
+  // drive the live-append discriminator: a growth is a LIVE append (not the final
+  // pagination page) only when the conversation was ALREADY fully paged before it
+  // — i.e. prevHasMoreRef.current === false. The final pagination page grows
+  // `items` AND flips hasMore false in the same update, so a naive `!hasMore`
+  // check would false-positive once on the last page (Codex P0). `newCount` feeds
+  // the floating "↓ N new" pill.
+  const atBottomRef = useRef(true);
+  const prevLenRef = useRef(0);
+  const prevHasMoreRef = useRef(false);
+  const [newCount, setNewCount] = useState(0);
+
+  const onBodyScroll = useCallback(() => {
+    const b = bodyRef.current;
+    if (!b) return;
+    const atBottom = b.scrollTop + b.clientHeight >= b.scrollHeight - 80;
+    atBottomRef.current = atBottom;
+    if (atBottom) setNewCount((n) => (n ? 0 : n));
+  }, []);
+
+  // Stick-if-at-bottom on a live append; otherwise preserve position + count the
+  // new turns. Keyed on items.length (+ hasMore so prevHasMoreRef tracks each
+  // commit). useLayoutEffect so atBottomRef reflects the PRE-append position and
+  // the stick happens before paint (no visible jump).
+  useLayoutEffect(() => {
+    const b = bodyRef.current;
+    const len = detail?.items.length ?? 0;
+    const prevLen = prevLenRef.current;
+    const added = len - prevLen;
+    // Live append (not the final pagination page): already fully paged before
+    // this growth, and not the very first page load (prevLen > 0).
+    const live = added > 0 && prevHasMoreRef.current === false && prevLen > 0;
+    if (b && live) {
+      if (atBottomRef.current) {
+        b.scrollTo({ top: b.scrollHeight });           // instant stick to the newest turn
+      } else {
+        // Capture `added` in a local const — the ref is mutated below, so the
+        // functional updater must not read prevLenRef.current lazily.
+        setNewCount((n) => n + added);                 // preserve position, surface the pill
+      }
+    }
+    prevLenRef.current = len;
+    prevHasMoreRef.current = hasMore;
+  }, [detail?.items.length, hasMore]);
+
+  const jumpToNew = useCallback(() => {
+    const b = bodyRef.current;
+    if (!b) return;
+    b.scrollTo({ top: b.scrollHeight, behavior: reducedRef.current ? 'auto' : 'smooth' });
+    setNewCount(0);
+  }, []);
 
   const groups = useMemo(() => groupSidechains(detail?.items ?? []), [detail?.items]);
   const title = useMemo(
@@ -355,7 +408,7 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
           {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {detail.models.join(', ')}
         </div>
       </div>
-      <div className="conv-reader-body" ref={bodyRef}>
+      <div className="conv-reader-body" ref={bodyRef} onScroll={onBodyScroll}>
         <div className="conv-reader-thread" ref={threadRef}>
           {groups.map((g, idx) => {
             if (g.kind === 'subagent') {
@@ -417,6 +470,13 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
         </div>
         {hasMore && <div ref={sentinelRef} className="conv-load-sentinel">Loading more…</div>}
       </div>
+      {/* #175 F4 — "↓ N new" pill. A child of .conv-reader (NOT the scrolling
+          .conv-reader-body), absolutely positioned so it floats over the body
+          without scrolling with it. Shown only while scrolled up with unseen
+          live-appended turns; clicking it scrolls to the newest turn. */}
+      {newCount > 0 && !atBottomRef.current && (
+        <button type="button" className="conv-new-pill" onClick={jumpToNew}>↓ {newCount} new</button>
+      )}
     </div>
   );
 }

@@ -1,7 +1,8 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationReader } from './ConversationReader';
-import { _resetForTests, dispatch, getState } from '../store/store';
+import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
+import type { Envelope } from '../types/envelope';
 import {
   installGlobalKeydown,
   uninstallGlobalKeydown,
@@ -44,6 +45,28 @@ function mockFetchOnce(body: unknown, status = 200) {
   (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
     ok: status < 400, status, json: async () => body,
   } as Response);
+}
+
+// ---- #175 F4 reader-scroll helpers ------------------------------------
+// jsdom doesn't lay out, so set the scroll metrics by hand. scrollTop is
+// writable on an element; clientHeight/scrollHeight are getters we override.
+function setScroll(el: HTMLElement, m: { scrollTop: number; clientHeight: number; scrollHeight: number }) {
+  el.scrollTop = m.scrollTop;
+  Object.defineProperty(el, 'clientHeight', { configurable: true, value: m.clientHeight });
+  Object.defineProperty(el, 'scrollHeight', { configurable: true, value: m.scrollHeight });
+}
+// Drive a live SSE tick: bump the store snapshot's generated_at so the
+// hook's tail-poll effect fires.
+function bumpSnapshot(tag: string) {
+  updateSnapshot({ generated_at: tag } as Envelope);
+}
+// jsdom doesn't implement Element.prototype.scrollTo, so vi.spyOn can't attach
+// to a missing property — define a no-op first, then spy on it.
+function spyScrollTo() {
+  if (typeof Element.prototype.scrollTo !== 'function') {
+    Element.prototype.scrollTo = () => {};
+  }
+  return vi.spyOn(Element.prototype, 'scrollTo').mockImplementation(() => {});
 }
 
 beforeEach(() => {
@@ -378,6 +401,127 @@ describe('ConversationReader', () => {
     await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
     expect(container.querySelector('[data-uuid="sa2"]')!.classList.contains('conv-item--jumped')).toBe(true);
     await waitFor(() => expect(getState().conversationJump).toBeNull());
+  });
+});
+
+describe('ConversationReader live-tail scroll (#175 F4)', () => {
+  // Render a fully-paged conversation (next_after null), then drive a live tail
+  // append by bumping the snapshot + queueing a tail fetch. Returns the body.
+  async function renderFullyPaged(items: ConversationItem[]) {
+    mockFetchOnce(detail(items, null));
+    const utils = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-body')).not.toBeNull());
+    await waitFor(() =>
+      expect(utils.container.querySelectorAll('.conv-reader-thread > *').length).toBe(items.length));
+    const body = utils.container.querySelector('.conv-reader-body') as HTMLElement;
+    return { ...utils, body };
+  }
+
+  // Append one new turn via the live tail (the tail response stays fully paged).
+  async function appendLiveItem(newUuid: string) {
+    mockFetchOnce(detail([makeItem({ uuid: newUuid })], null));
+    await act(async () => {
+      bumpSnapshot(`t-${newUuid}`);
+      // let the tail poll fetch + setState flush
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+  }
+
+  it('live append sticks to bottom when already at bottom', async () => {
+    const { body } = await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
+    setScroll(body, { scrollTop: 990, clientHeight: 10, scrollHeight: 1000 }); // at bottom
+    fireEvent.scroll(body);
+    const scrollToSpy = spyScrollTo();
+
+    await appendLiveItem('live1');
+    await waitFor(() => expect(scrollToSpy).toHaveBeenCalled());
+    // No pill while stuck to the bottom.
+    expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
+  });
+
+  it('live append while scrolled up preserves position and shows the pill', async () => {
+    const { body } = await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
+    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 }); // scrolled up
+    fireEvent.scroll(body);
+    const scrollToSpy = spyScrollTo();
+
+    await appendLiveItem('live1');
+    // Did not auto-scroll; surfaced the pill with a count.
+    expect(scrollToSpy).not.toHaveBeenCalled();
+    const pill = await screen.findByRole('button', { name: /new/i });
+    expect(pill).toBeInTheDocument();
+    expect(pill.textContent).toMatch(/1 new/);
+
+    // Clicking the pill scrolls to bottom and clears it.
+    fireEvent.click(pill);
+    expect(scrollToSpy).toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
+  });
+
+  it('the final PAGINATION append (was hasMore) shows no pill and no stick (P0 discriminator)', async () => {
+    // Page 1 has a cursor (hasMore true). Render in conversations view with the
+    // keymap installed so `j` at the last item triggers loadMore -> the FINAL
+    // pagination page (next_after null). prevHasMore was TRUE on that append, so
+    // it must NOT be treated as a live append.
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' })], 2));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="h1"]')).not.toBeNull());
+
+    const body = container.querySelector('.conv-reader-body') as HTMLElement;
+    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 }); // scrolled up
+    fireEvent.scroll(body);
+    const scrollToSpy = spyScrollTo();
+
+    // The final page lands via loadMore (j at the single, last item).
+    mockFetchOnce(detail([makeItem({ uuid: 'h2' })], null));
+    await act(async () => {
+      fireEvent.keyDown(document, { key: 'j' });
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="h2"]')).not.toBeNull());
+
+    // A pagination append must neither stick nor raise a pill.
+    expect(scrollToSpy).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
+  });
+
+  it('a pagination append followed by a live tail append shows the pill (sequence guard)', async () => {
+    // After the final pagination page lands (hasMore flips false), the NEXT
+    // growth — a live tail append — must be treated as live (pill appears).
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' })], 2));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="h1"]')).not.toBeNull());
+    const body = container.querySelector('.conv-reader-body') as HTMLElement;
+    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
+    fireEvent.scroll(body);
+    const scrollToSpy = spyScrollTo();
+
+    // Final pagination page → hasMore false; no pill yet.
+    mockFetchOnce(detail([makeItem({ uuid: 'h2' })], null));
+    await act(async () => {
+      fireEvent.keyDown(document, { key: 'j' });
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="h2"]')).not.toBeNull());
+    expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
+
+    // Now a live tail append — prevHasMore is false → pill.
+    mockFetchOnce(detail([makeItem({ uuid: 'live1' })], null));
+    // Re-pin the scroll metrics (jsdom append doesn't recompute them) so the
+    // layout effect still reads "scrolled up".
+    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
+    fireEvent.scroll(body);
+    await act(async () => {
+      bumpSnapshot('t-live1');
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    const pill = await screen.findByRole('button', { name: /new/i });
+    expect(pill).toBeInTheDocument();
+    expect(scrollToSpy).not.toHaveBeenCalled();
   });
 });
 

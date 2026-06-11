@@ -4785,7 +4785,30 @@ mark.current {
   border-radius: 6px;
   background: var(--panel-bg);
   overflow: hidden;
+  position: relative;   /* #175 F4: anchor the absolute .conv-new-pill */
 }
+/* #175 F4 — floating "↓ N new" pill (live-tail). A child of .conv-reader (not
+   the scroll body), anchored to the reader's bottom-center. Reuses the
+   chip/button accent tokens. */
+.conv-new-pill {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 18px;
+  z-index: 5;
+  appearance: none;
+  border: 1px solid var(--accent-blue);
+  background: var(--accent-blue);
+  color: #08111f;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 700;
+  padding: 5px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+}
+.conv-new-pill:hover { filter: brightness(1.08); }
 /* ---- Empty / loading / selection states (#161 F3) ---------------- */
 .conv-reader--empty,
 .conv-reader--loading,
