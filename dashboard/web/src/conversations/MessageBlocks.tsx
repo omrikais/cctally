@@ -12,6 +12,7 @@ import { CopyButton } from './CopyButton';
 import { highlightBody } from './CodeBlock';
 import { LineNumberedCode } from './LineNumberedCode';
 import { resultLang } from './toolLang';
+import { specialToolRenderer } from './specialTools';
 import type { ConversationBlock } from '../types/conversation';
 
 // Render a turn's blocks in DOCUMENT ORDER (#164): consecutive `text` coalesce
@@ -112,6 +113,8 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
       </details>
     );
   }
+  const special = specialToolRenderer(call);
+  if (special) return special;
   const status = call.result?.is_error
     ? ' · error'
     : call.result?.truncated

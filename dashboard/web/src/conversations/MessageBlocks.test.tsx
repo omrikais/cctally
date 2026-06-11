@@ -1,6 +1,7 @@
 import { render, screen, fireEvent } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageBlocks } from './MessageBlocks';
+import { AskUserQuestionCard } from './AskUserQuestionCard'; // ensure import resolves
 import type { ConversationBlock } from '../types/conversation';
 
 const call = (
@@ -365,5 +366,43 @@ describe('MessageBlocks (copy affordances, G2)', () => {
     render(<MessageBlocks blocks={[{ kind: 'tool_use', name: 'Bash', input_summary: 'ls -la' }]} />);
     fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
     expect(writeText).toHaveBeenCalledWith('ls -la');
+  });
+});
+
+describe('MessageBlocks — Session 2 special tool dispatch', () => {
+  it('the AskUserQuestion card component resolves', () => {
+    expect(AskUserQuestionCard).toBeTypeOf('function');
+  });
+  it('routes AskUserQuestion to the Q&A card (not the generic chip)', () => {
+    const { container } = render(<MessageBlocks blocks={[call({
+      name: 'AskUserQuestion',
+      input: { questions: [{ question: 'Pick?', header: 'H', multiSelect: false,
+        options: [{ label: 'X', description: 'd' }] }] },
+      answers: { 'Pick?': 'X' },
+    })]} />);
+    expect(container.querySelector('.conv-ask')).toBeTruthy();
+    expect(screen.getByText('Pick?')).toBeInTheDocument();
+  });
+  it('routes TodoWrite and ExitPlanMode to their cards', () => {
+    const { container: a } = render(<MessageBlocks blocks={[call({
+      name: 'TodoWrite', input: { todos: [{ content: 'c', status: 'pending', activeForm: 'c' }] } })]} />);
+    expect(a.querySelector('.conv-todo')).toBeTruthy();
+    const { container: b } = render(<MessageBlocks blocks={[call({
+      name: 'ExitPlanMode', input: { plan: '# P' }, result: null })]} />);
+    expect(b.querySelector('.conv-plan')).toBeTruthy();
+  });
+  it('leaves a non-special tool on the generic chip', () => {
+    const { container } = render(<MessageBlocks blocks={[call({ name: 'Read', preview: '/x' })]} />);
+    expect(container.querySelector('.conv-ask')).toBeNull();
+    expect(container.querySelector('.conv-chip--tool')).toBeTruthy();
+  });
+  it('AskUserQuestion card is a <details> so [ / ] collapse-all still reaches it', () => {
+    const { container } = render(<MessageBlocks blocks={[call({
+      name: 'AskUserQuestion',
+      input: { questions: [{ question: 'Pick?', header: 'H', multiSelect: false, options: [] }] } })]} />);
+    const d = container.querySelector('.conv-ask') as HTMLDetailsElement;
+    expect(d.tagName.toLowerCase()).toBe('details');
+    d.open = false; // the reader's [ sweep sets .open=false on every <details>
+    expect(d.open).toBe(false);
   });
 });
