@@ -1,23 +1,39 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useConversation } from './useConversation';
-import * as snapMod from './useSnapshot';
 
-function detail(items: unknown[], next_after: number | null) {
+// Mock the snapshot store so we can drive `generated_at` (the SSE-tick signal
+// the live-tail effect keys on) deterministically between renders. Mirrors the
+// useConversations test setup.
+let mockGeneratedAt = 't0';
+vi.mock('./useSnapshot', () => ({
+  useSnapshot: () => ({ generated_at: mockGeneratedAt }),
+}));
+
+function detail(items: unknown[], next_after: number | null, over: Record<string, unknown> = {}) {
   return {
     session_id: 's', project_label: 'p', git_branch: null,
     started_utc: '2026-01-01T00:00:00Z', last_activity_utc: '2026-01-01T02:00:00Z',
     cost_usd: 3, models: ['opus'], items, page: { next_after, has_more: next_after != null },
+    ...over,
   };
 }
 const it1 = { kind: 'human', anchor: { session_id: 's', uuid: 'u1', id: 1 }, member_uuids: ['u1'], ts: 't', text: 'hi', blocks: [], is_sidechain: false };
 const it2 = { kind: 'assistant', anchor: { session_id: 's', uuid: 'u2', id: 2 }, member_uuids: ['u2', 'u2b'], ts: 't', text: 'yo', blocks: [], model: 'opus', is_sidechain: false, cost_usd: 1 };
+const it3 = { kind: 'assistant', anchor: { session_id: 's', uuid: 'u3', id: 3 }, member_uuids: ['u3'], ts: 't', text: 'live', blocks: [], model: 'opus', is_sidechain: false, cost_usd: 1 };
+const it4 = { kind: 'human', anchor: { session_id: 's', uuid: 'u4', id: 4 }, member_uuids: ['u4'], ts: 't', text: 'more', blocks: [], is_sidechain: false };
 
 function mockOnce(body: unknown, status = 200) {
   (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: status < 400, status, json: async () => body } as Response);
 }
-beforeEach(() => { globalThis.fetch = vi.fn(); });
+beforeEach(() => { globalThis.fetch = vi.fn(); mockGeneratedAt = 't0'; });
 afterEach(() => vi.restoreAllMocks());
+
+// Bump generated_at + re-render to simulate one SSE tick reaching the hook.
+function bumpTick(rerender: () => void, tag: string) {
+  mockGeneratedAt = tag;
+  rerender();
+}
 
 describe('useConversation', () => {
   it('loads page 1 for a session', async () => {
@@ -39,18 +55,72 @@ describe('useConversation', () => {
     expect(result.current.hasMore).toBe(false);
   });
 
-  it('never subscribes to the snapshot, and is rerender-stable (no SSE refetch)', async () => {
-    // The hook deliberately does NOT live-tail: a past transcript is
-    // immutable. Assert it never even subscribes to the snapshot store —
-    // this fails the day someone wires in a useSnapshot()-driven refetch.
-    const spy = vi.spyOn(snapMod, 'useSnapshot');
+  it('tail-polls after a generated_at tick once fully paged, appending new turns + fresh header (#175 F4)', async () => {
+    // Page 1: two items, next_after null -> fully paged (hasMore false).
+    mockOnce(detail([it1, it2], null, { cost_usd: 1 }));
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    expect(result.current.hasMore).toBe(false);
+
+    // Next tick: the tail returns one new turn + a fresh whole-session cost.
+    // The tail response stays fully-paged (next_after null), so a single fetch
+    // drains it.
+    mockOnce(detail([it3], null, { cost_usd: 2 }));
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(3));
+
+    // The poll keyed off the LAST loaded item's anchor id (it2 -> id 2).
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0]).toContain('after=2');
+    // Header totals refreshed from the tail response.
+    expect(result.current.detail?.cost_usd).toBe(2);
+    // Still fully paged after a live append.
+    expect(result.current.hasMore).toBe(false);
+  });
+
+  it('drains a >PAGE tail burst within one tick (#175 F4)', async () => {
+    // Page 1: fully paged.
     mockOnce(detail([it1], null));
-    const { rerender } = renderHook(() => useConversation('s'));
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1));
-    rerender();                            // simulate a re-render (e.g. SSE tick elsewhere)
-    await Promise.resolve();
-    expect(spy).not.toHaveBeenCalled();    // no snapshot subscription at all
-    expect(globalThis.fetch).toHaveBeenCalledTimes(1);  // and no refetch
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1));
+
+    // One tick, two tail pages: the first carries a non-null next_after, so the
+    // bounded drain loop fetches again in the SAME tick; the second exhausts it.
+    mockOnce(detail([it3], 3));            // tail page A: more to come (next_after=3)
+    mockOnce(detail([it4], null));         // tail page B: exhausted
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(3));
+
+    // Two tail fetches in one tick: after=<it1.id=1> then after=<it3.id=3>.
+    const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls[calls.length - 2][0]).toContain('after=1');
+    expect(calls[calls.length - 1][0]).toContain('after=3');
+    // The stored cursor stays null while live-tailing (still fully paged).
+    expect(result.current.hasMore).toBe(false);
+  });
+
+  it('does not tail-poll while hasMore is true (#175 F4)', async () => {
+    mockOnce(detail([it1], 2));            // page 1 has a cursor -> hasMore true
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.hasMore).toBe(true));
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockClear();
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    // The tick fired but the tail poll is suppressed while still paginating.
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('refreshes the whole-session header even when the tail response is empty (#175 F4)', async () => {
+    mockOnce(detail([it1, it2], null, { cost_usd: 1, models: ['opus'] }));
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+
+    // Empty tail (no new turns) but fresh header totals (e.g. a re-priced turn).
+    mockOnce(detail([], null, { cost_usd: 5, models: ['opus', 'sonnet'] }));
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.detail?.cost_usd).toBe(5));
+
+    // No item growth, header merged.
+    expect(result.current.detail?.items).toHaveLength(2);
+    expect(result.current.detail?.models).toEqual(['opus', 'sonnet']);
   });
 
   it('surfaces a not-found error on 404 and leaves detail null', async () => {

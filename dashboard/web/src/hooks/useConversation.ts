@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchJson, HttpError, isAbortError } from '../lib/fetchJson';
+import { useSnapshot } from './useSnapshot';
 import type { ConversationDetail } from '../types/conversation';
 
-// Paginated reader. UNLIKE useProjectDetail/useConversations, this does
-// NOT revalidate on SSE tick: a past transcript is immutable history
-// (live-tailing is an explicit non-goal), and refetching page 1 each
-// tick would clobber the accumulated lazy-loaded pages. We fetch page 1
-// on sessionId change and APPEND on loadMore()/loadUntil(). Header
-// fields (cost_usd, models, …) are whole-session and come from any page;
-// we keep the first page's header and only grow `items`.
+// Paginated reader. We fetch page 1 on sessionId change and APPEND on
+// loadMore()/loadUntil(). Header fields (cost_usd, models, …) are
+// whole-session and come from any page.
+//
+// #175 F4 — live-tail the OPEN conversation at the tail: once history is
+// fully paged (hasMore === false), every new SSE `generated_at` tick
+// tail-polls `?after=<lastItemId>`, drains any burst, appends the new
+// turns, and refreshes the whole-session header totals (so live
+// cost/models update too). It deliberately does NOT revalidate page 1 on
+// a tick (that would clobber the accumulated pages); the tail-poll only
+// surfaces NEW turns past the last loaded item.
 export interface UseConversation {
   detail: ConversationDetail | null;
   loading: boolean;
@@ -27,6 +32,12 @@ export function useConversation(sessionId: string | null): UseConversation {
   const nextAfterRef = useRef<number | null>(null);
   const loadingMoreRef = useRef(false);
   const sessionRef = useRef<string | null>(null);
+  // #175 F4 live-tail bookkeeping. `hasMoreRef` mirrors hasMore so pollTail can
+  // read it synchronously; `pollingRef` serializes the tail poll; `pendingTickRef`
+  // records a tick that arrived mid-fetch so it can be replayed once.
+  const hasMoreRef = useRef(false);
+  const pollingRef = useRef(false);
+  const pendingTickRef = useRef(false);
   // Synchronous mirror of `detail` so loadUntil() can poll the latest
   // accumulated items without a re-render dependency or a stale closure
   // (the plan's sanctioned alternative to the setDetail((s)=>…) probe).
@@ -106,5 +117,58 @@ export function useConversation(sessionId: string | null): UseConversation {
     }
   }, [fetchNext]);
 
-  return { detail, loading, error, hasMore: detail?.page?.next_after != null, loadMore, loadUntil };
+  const hasMore = detail?.page?.next_after != null;
+  hasMoreRef.current = hasMore;
+
+  // #175 F4 — tail-poll the open conversation. Runs ONLY while already fully
+  // paged (hasMore false), so the conversation stays fully-paged and the cursor
+  // walks forward each tick. Drains a >PAGE burst within one tick (bounded loop
+  // until next_after is null or items empty), coalesces a tick that arrives
+  // mid-fetch (pendingTickRef replay after `finally`), and refreshes the
+  // whole-session header on EVERY response — including empty ones (no new turns,
+  // but cost/models may have changed). Stored page.next_after stays null while
+  // live-tailing so the reader never re-enters pagination.
+  const pollTail = useCallback(async () => {
+    if (pollingRef.current) { pendingTickRef.current = true; return; }  // coalesce a mid-fetch tick
+    const sid = sessionRef.current;
+    if (!sid || hasMoreRef.current || loadingMoreRef.current) return;   // only at the tail, never racing loadMore
+    pollingRef.current = true;
+    try {
+      for (let i = 0; i < 50; i++) {                                    // drain a >PAGE burst within one tick
+        const last = detailRef.current?.items.at(-1);
+        if (!last) break;
+        let body: ConversationDetail;
+        try {
+          body = await fetchJson<ConversationDetail>(
+            `/api/conversation/${encodeURIComponent(sid)}?limit=${PAGE}&after=${last.anchor.id}`);
+        } catch {
+          break;                                                        // transient blip — keep what we have
+        }
+        if (sessionRef.current !== sid) return;                         // session switched mid-fetch
+        setDetailSynced((prev) => (prev ? {
+          ...prev,
+          items: body.items.length ? [...prev.items, ...body.items] : prev.items,
+          cost_usd: body.cost_usd, models: body.models,                // refresh whole-session header even on empty
+          git_branch: body.git_branch, project_label: body.project_label,
+          subagent_meta: body.subagent_meta ?? prev.subagent_meta,
+          page: prev.page,                                             // stays fully-paged (next_after === null)
+        } : prev));
+        if (!body.items.length || body.page.next_after == null) break;  // empty (no new / stale cursor) or fully drained
+      }
+    } finally {
+      pollingRef.current = false;
+      if (pendingTickRef.current) { pendingTickRef.current = false; void pollTail(); }  // replay one coalesced tick
+    }
+  }, [setDetailSynced]);
+
+  // Trigger on each SSE tick, but only while fully paged.
+  const env = useSnapshot();
+  const generatedAt = env?.generated_at ?? '';
+  useEffect(() => {
+    if (detailRef.current && !hasMoreRef.current) void pollTail();
+    // generatedAt only — pollTail is stable (refs + setDetailSynced).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generatedAt]);
+
+  return { detail, loading, error, hasMore, loadMore, loadUntil };
 }
