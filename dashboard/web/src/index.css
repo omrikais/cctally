@@ -5748,6 +5748,8 @@ mark.current {
 .conv-ask-custom { border: 1px solid rgba(61,220,132,.5); background: rgba(61,220,132,.08);
   border-left: 3px solid var(--accent-green); border-radius: 8px; padding: 9px 11px; margin-top: 8px;
   font-size: 14px; }
+.conv-ask-note { margin-top: 6px; font-size: 12px; color: var(--text-dim);
+  font-style: italic; }
 .conv-ask-copy, .conv-plan-copy { display: flex; justify-content: flex-end; }
 
 /* TodoWrite */

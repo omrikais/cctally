@@ -391,6 +391,22 @@ describe('MessageBlocks — Session 2 special tool dispatch', () => {
       name: 'ExitPlanMode', input: { plan: '# P' }, result: null })]} />);
     expect(b.querySelector('.conv-plan')).toBeTruthy();
   });
+  it('an ExitPlanMode with an empty/missing plan falls through to the generic chip', () => {
+    // Empty plan string → generic chip (defensive), NOT the plan card.
+    const { container: empty } = render(<MessageBlocks blocks={[call({
+      name: 'ExitPlanMode', input: { plan: '' }, result: null })]} />);
+    expect(empty.querySelector('.conv-plan')).toBeNull();
+    expect(empty.querySelector('.conv-chip--tool')).toBeTruthy();
+    // No plan key at all → also the generic chip.
+    const { container: missing } = render(<MessageBlocks blocks={[call({
+      name: 'ExitPlanMode', input: {}, result: null })]} />);
+    expect(missing.querySelector('.conv-plan')).toBeNull();
+    expect(missing.querySelector('.conv-chip--tool')).toBeTruthy();
+    // Sanity: a non-empty plan still routes to the plan card.
+    const { container: present } = render(<MessageBlocks blocks={[call({
+      name: 'ExitPlanMode', input: { plan: '# P' }, result: null })]} />);
+    expect(present.querySelector('.conv-plan')).toBeTruthy();
+  });
   it('leaves a non-special tool on the generic chip', () => {
     const { container } = render(<MessageBlocks blocks={[call({ name: 'Read', preview: '/x' })]} />);
     expect(container.querySelector('.conv-ask')).toBeNull();

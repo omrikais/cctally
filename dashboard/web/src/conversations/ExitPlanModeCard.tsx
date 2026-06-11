@@ -11,6 +11,15 @@ function planOf(call: Call): string {
   const p = (call.input as { plan?: unknown } | null | undefined)?.plan;
   return typeof p === 'string' ? p : '';
 }
+
+// Cheap content-length proxy for "is this plan long enough to need clamping?".
+// A CSS-only clamp can't know the rendered height without JS (ResizeObserver /
+// scrollHeight) — measuring would couple this pure render to a layout pass — so
+// we approximate: many lines OR a lot of characters → clamp + a "Show full
+// plan" toggle; short plans render fully with no clamp and no button.
+function planIsLong(plan: string): boolean {
+  return plan.split('\n').length > 24 || plan.length > 1400;
+}
 // Three-state outcome — never default to "approved" on an ambiguous result.
 function outcomeOf(call: Call): Outcome {
   const r = call.result;
@@ -24,6 +33,10 @@ export function ExitPlanModeCard({ call }: { call: Call }) {
   const plan = planOf(call);
   const outcome = outcomeOf(call);
   const [expanded, setExpanded] = useState(false);
+  // Short plans render fully — no clamp, no toggle. Only a long plan is clamped
+  // (and gets the "Show full plan" button) until the user expands it.
+  const longPlan = planIsLong(plan);
+  const clamped = longPlan && !expanded;
 
   return (
     <details className="conv-chip conv-plan" open>
@@ -38,10 +51,10 @@ export function ExitPlanModeCard({ call }: { call: Call }) {
       <div className="conv-plan-body">
         {/* CopyButton in the body, not the summary (a summary-click toggles details). */}
         {plan && <div className="conv-plan-copy"><CopyButton text={plan} /></div>}
-        <div className={'conv-plan-md' + (expanded ? '' : ' conv-plan-md--clamp')}>
+        <div className={'conv-plan-md' + (clamped ? ' conv-plan-md--clamp' : '')}>
           <Markdown>{plan}</Markdown>
         </div>
-        {!expanded && (
+        {clamped && (
           <div className="conv-plan-more">
             <button type="button" onClick={() => setExpanded(true)}>Show full plan ↓</button>
           </div>

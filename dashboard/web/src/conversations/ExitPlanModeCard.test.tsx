@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { ExitPlanModeCard } from './ExitPlanModeCard';
 import type { ConversationBlock } from '../types/conversation';
@@ -10,6 +10,10 @@ const base = (over: Partial<Call> = {}): Call => ({
   result: { text: 'User has approved your plan.', truncated: false, is_error: false },
   input: { plan: '## Plan\n\n- step one\n- step two' }, ...over,
 });
+
+// A plan long enough to trip the clamp heuristic (>24 lines).
+const LONG_PLAN = '## Plan\n\n' + Array.from({ length: 30 }, (_, i) => `- step ${i + 1}`).join('\n');
+const long = (over: Partial<Call> = {}): Call => base({ input: { plan: LONG_PLAN }, ...over });
 
 describe('ExitPlanModeCard', () => {
   it('renders the plan markdown (heading + list) default-expanded', () => {
@@ -40,5 +44,26 @@ describe('ExitPlanModeCard', () => {
   it('shows the input_truncated hint', () => {
     render(<ExitPlanModeCard call={base({ input_truncated: true })} />);
     expect(screen.getByText(/plan input truncated/i)).toBeInTheDocument();
+  });
+
+  it('a SHORT plan renders with no clamp class and no "Show full plan" button', () => {
+    const { container } = render(<ExitPlanModeCard call={base()} />);
+    expect(screen.queryByRole('button', { name: /show full plan/i })).toBeNull();
+    const md = container.querySelector('.conv-plan-md');
+    expect(md).toBeTruthy();
+    expect(md?.className).not.toContain('conv-plan-md--clamp');
+  });
+
+  it('a LONG plan renders the clamp class and the "Show full plan" button', () => {
+    const { container } = render(<ExitPlanModeCard call={long()} />);
+    expect(screen.getByRole('button', { name: /show full plan/i })).toBeInTheDocument();
+    expect(container.querySelector('.conv-plan-md')?.className).toContain('conv-plan-md--clamp');
+  });
+
+  it('clicking "Show full plan" on a long plan removes the clamp and the button', () => {
+    const { container } = render(<ExitPlanModeCard call={long()} />);
+    fireEvent.click(screen.getByRole('button', { name: /show full plan/i }));
+    expect(container.querySelector('.conv-plan-md')?.className).not.toContain('conv-plan-md--clamp');
+    expect(screen.queryByRole('button', { name: /show full plan/i })).toBeNull();
   });
 });

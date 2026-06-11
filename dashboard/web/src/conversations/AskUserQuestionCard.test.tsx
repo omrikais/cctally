@@ -46,4 +46,26 @@ describe('AskUserQuestionCard', () => {
     expect(d).toBeTruthy();
     expect(d?.open).toBe(true);
   });
+
+  it('renders an annotation note under a question when annotations[q].notes is set', () => {
+    const { container } = render(<AskUserQuestionCard call={base({
+      answers: { 'Pick one?': 'Comprehensive' },
+      annotations: { 'Pick one?': { notes: 'because it covers everything' } },
+    })} />);
+    const note = container.querySelector('.conv-ask-note');
+    expect(note).toBeTruthy();
+    expect(note?.textContent).toContain('because it covers everything');
+  });
+
+  it('renders no annotation note when annotations are absent or malformed', () => {
+    // No annotations at all.
+    const { container: c1 } = render(<AskUserQuestionCard call={base({
+      answers: { 'Pick one?': 'Comprehensive' } })} />);
+    expect(c1.querySelector('.conv-ask-note')).toBeNull();
+    // Annotation present for the question but with no/blank notes string → nothing.
+    const { container: c2 } = render(<AskUserQuestionCard call={base({
+      answers: { 'Pick one?': 'Comprehensive' },
+      annotations: { 'Pick one?': { notes: '   ' }, Other: 'not-an-object' } })} />);
+    expect(c2.querySelector('.conv-ask-note')).toBeNull();
+  });
 });

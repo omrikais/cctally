@@ -19,6 +19,22 @@ function answersOf(call: Call): Record<string, string> {
   return {};
 }
 
+// A per-question annotation note (free text the user attached to their choice).
+// call.annotations is wire-typed Record<string, unknown>; in practice it's
+// { <question text>: { notes?: string, preview?: string } }. Guard defensively
+// (the value is unknown — never assume a shape, never throw) and return a
+// trimmed non-empty note string, else null.
+function noteForQuestion(call: Call, qText: string): string | null {
+  const anno = call.annotations;
+  if (!anno || typeof anno !== 'object') return null;
+  const entry = (anno as Record<string, unknown>)[qText];
+  if (!entry || typeof entry !== 'object') return null;
+  const notes = (entry as { notes?: unknown }).notes;
+  if (typeof notes !== 'string') return null;
+  const trimmed = notes.trim();
+  return trimmed.length ? trimmed : null;
+}
+
 export function AskUserQuestionCard({ call }: { call: Call }) {
   const questions = questionsOf(call);
   const answers = answersOf(call);
@@ -47,6 +63,7 @@ export function AskUserQuestionCard({ call }: { call: Call }) {
             ? matchSelectedLabels(answer, opts)
             : { selected: [] as string[], custom: null };
           const chosen = new Set(selected);
+          const note = noteForQuestion(call, q.question);
           return (
             <div className="conv-ask-q" key={qi}>
               <div className="conv-ask-qhead">
@@ -72,6 +89,9 @@ export function AskUserQuestionCard({ call }: { call: Call }) {
                 <div className="conv-ask-custom">
                   <span className="conv-ask-pick">your answer</span> {custom}
                 </div>
+              )}
+              {note != null && (
+                <div className="conv-ask-note">note: {note}</div>
               )}
             </div>
           );
