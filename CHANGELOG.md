@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Dashboard conversation reader: the sticky turn header introduced in 1.34.0 (which pinned the "ASSISTANT <model>" bar to the top while you scrolled a tall turn) overlapped and mingled with the prose scrolling beneath it — its razor-thin opaque mask only half-covered the text. It is replaced by an unobtrusive floating "↑ Top of turn" button that appears at the bottom-right of the reader only once a turn's start has scrolled off; clicking it returns to that turn's start (reduced-motion aware). Nothing floats over the reading column anymore, the button clears the bottom-center "↓ N new" pill, and it is hidden on a session switch. The model chip, spinner, and live-tail from 1.34.0 are unchanged (#176).
+
 ## [1.34.0] - 2026-06-11
 
 ### Added

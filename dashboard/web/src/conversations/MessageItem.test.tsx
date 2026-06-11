@@ -234,7 +234,11 @@ describe('MessageItem', () => {
     expect(container.textContent).not.toContain('$0.0000');
   });
 
-  it('assistant & human heads are buttons that scroll the turn to its start (#175 F2)', () => {
+  it('assistant & human heads are plain divs, NOT click-to-scroll buttons (#176 revert)', () => {
+    // #176 reverted the #175 sticky/click-to-top head: the head is a plain
+    // <div className="conv-item-head"> again — not a <button> — and clicking it
+    // scrolls nothing (the floating "↑ Top of turn" button on the reader owns
+    // jump-to-start now).
     const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
     const assistantTurn: ConversationItem = {
       kind: 'assistant',
@@ -251,12 +255,14 @@ describe('MessageItem', () => {
     };
     for (const item of [assistantTurn, human]) {
       const { container, unmount } = render(<MessageItem item={item} />);
-      const head = container.querySelector('button.conv-item-head') as HTMLButtonElement;
+      const head = container.querySelector('.conv-item-head')!;
       expect(head).not.toBeNull();
-      expect(head.getAttribute('type')).toBe('button');
-      head.click();
-      expect(scrollSpy).toHaveBeenCalledWith(expect.objectContaining({ block: 'start' }));
-      scrollSpy.mockClear();
+      // Plain div, not a button.
+      expect(head.tagName).toBe('DIV');
+      expect(container.querySelector('button.conv-item-head')).toBeNull();
+      // No click-to-scroll affordance on the head.
+      fireEvent.click(head);
+      expect(scrollSpy).not.toHaveBeenCalled();
       unmount();
     }
     scrollSpy.mockRestore();

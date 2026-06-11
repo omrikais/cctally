@@ -559,6 +559,123 @@ describe('ConversationReader live-tail scroll (#175 F4)', () => {
   });
 });
 
+describe('ConversationReader floating "↑ Top of turn" button (#176)', () => {
+  // jsdom never lays out, so getBoundingClientRect returns all-zeros. The
+  // visibility decision keys on rects, so stub each element's rect by hand:
+  // the body (the scroller) plus each top-level thread child (the turns). The
+  // helper installs a single prototype spy that dispatches on element identity.
+  function stubRects(
+    map: Map<Element, { top: number; bottom: number }>,
+  ) {
+    return vi
+      .spyOn(Element.prototype, 'getBoundingClientRect')
+      .mockImplementation(function (this: Element) {
+        const r = map.get(this) ?? { top: 0, bottom: 0 };
+        return {
+          top: r.top, bottom: r.bottom, left: 0, right: 0,
+          width: 0, height: r.bottom - r.top, x: 0, y: r.top, toJSON() {},
+        } as DOMRect;
+      });
+  }
+
+  async function renderFullyPaged(items: ConversationItem[]) {
+    mockFetchOnce(detail(items, null));
+    const utils = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-body')).not.toBeNull());
+    await waitFor(() =>
+      expect(utils.container.querySelectorAll('.conv-reader-thread > *').length).toBe(items.length));
+    const body = utils.container.querySelector('.conv-reader-body') as HTMLElement;
+    const thread = utils.container.querySelector('.conv-reader-thread') as HTMLElement;
+    return { ...utils, body, thread };
+  }
+
+  it('shows no button when the first turn is at the top of the viewport', async () => {
+    const { body, thread } = await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
+    // Body top at 0; the first turn's top is flush with it (not scrolled past).
+    stubRects(new Map<Element, { top: number; bottom: number }>([
+      [body, { top: 0, bottom: 600 }],
+      [thread.children[0], { top: 0, bottom: 1000 }],
+      [thread.children[1], { top: 1000, bottom: 1100 }],
+    ]));
+    fireEvent.scroll(body);
+    expect(screen.queryByRole('button', { name: /jump to the start of this turn/i })).toBeNull();
+  });
+
+  it('shows the button when scrolled deep into a tall first turn (top off by > 160px)', async () => {
+    const { body, thread } = await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
+    // Body top at 0; the first turn's top is 300px above the body top, so it's
+    // the block under the viewport top AND scrolled past the 160px threshold.
+    stubRects(new Map<Element, { top: number; bottom: number }>([
+      [body, { top: 0, bottom: 600 }],
+      [thread.children[0], { top: -300, bottom: 1000 }],
+      [thread.children[1], { top: 1000, bottom: 1100 }],
+    ]));
+    fireEvent.scroll(body);
+    expect(await screen.findByRole('button', { name: /jump to the start of this turn/i })).toBeInTheDocument();
+  });
+
+  it('does NOT show the button when the current turn is barely scrolled (under the threshold)', async () => {
+    const { body, thread } = await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
+    // First turn's top only 100px above the body top — under the 160px floor.
+    stubRects(new Map<Element, { top: number; bottom: number }>([
+      [body, { top: 0, bottom: 600 }],
+      [thread.children[0], { top: -100, bottom: 1000 }],
+      [thread.children[1], { top: 1000, bottom: 1100 }],
+    ]));
+    fireEvent.scroll(body);
+    expect(screen.queryByRole('button', { name: /jump to the start of this turn/i })).toBeNull();
+  });
+
+  it('clicking the button scrolls the current turn back to its start and hides it', async () => {
+    const { body, thread } = await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
+    stubRects(new Map<Element, { top: number; bottom: number }>([
+      [body, { top: 0, bottom: 600 }],
+      [thread.children[0], { top: -300, bottom: 1000 }],
+      [thread.children[1], { top: 1000, bottom: 1100 }],
+    ]));
+    fireEvent.scroll(body);
+    const btn = await screen.findByRole('button', { name: /jump to the start of this turn/i });
+
+    const scrollIntoViewSpy = vi
+      .spyOn(thread.children[0], 'scrollIntoView')
+      .mockImplementation(() => {});
+    fireEvent.click(btn);
+    // Scrolls the turn under the viewport top back to its start.
+    expect(scrollIntoViewSpy).toHaveBeenCalledWith(expect.objectContaining({ block: 'start' }));
+    // And the button hides immediately.
+    expect(screen.queryByRole('button', { name: /jump to the start of this turn/i })).toBeNull();
+  });
+
+  it('hides the button on a session switch (#176 reset)', async () => {
+    const { body, thread, rerender, container } =
+      await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
+    stubRects(new Map<Element, { top: number; bottom: number }>([
+      [body, { top: 0, bottom: 600 }],
+      [thread.children[0], { top: -300, bottom: 1000 }],
+      [thread.children[1], { top: 1000, bottom: 1100 }],
+    ]));
+    fireEvent.scroll(body);
+    expect(await screen.findByRole('button', { name: /jump to the start of this turn/i })).toBeInTheDocument();
+
+    // Switch the reused reader to convo B.
+    mockFetchOnce({
+      session_id: 'B', project_label: 'projB', git_branch: 'main',
+      started_utc: '2026-01-01T00:00:00Z', last_activity_utc: '2026-01-01T02:00:00Z',
+      cost_usd: 2, models: ['claude-opus-4'],
+      items: [makeItem({ uuid: 'b1' })],
+      page: { next_after: null, has_more: false },
+    });
+    await act(async () => {
+      rerender(<ConversationReader sessionId="B" />);
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="b1"]')).not.toBeNull());
+
+    // The stale jump-top button must be gone on B (per-session reset).
+    expect(screen.queryByRole('button', { name: /jump to the start of this turn/i })).toBeNull();
+  });
+});
+
 describe('ConversationReader keyboard navigation (G3)', () => {
   // The reader's keymap is `view:'conversations'`-scoped; the conversations
   // view is entered via OPEN_CONVERSATION (sets view + selection).

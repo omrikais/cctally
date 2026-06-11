@@ -4785,7 +4785,7 @@ mark.current {
   border-radius: 6px;
   background: var(--panel-bg);
   overflow: hidden;
-  position: relative;   /* #175 F4: anchor the absolute .conv-new-pill */
+  position: relative;   /* anchor the absolute .conv-new-pill (#175) + .conv-jump-top (#176) */
 }
 /* #175 F4 — floating "↓ N new" pill (live-tail). A child of .conv-reader (not
    the scroll body), anchored to the reader's bottom-center. Reuses the
@@ -4809,6 +4809,34 @@ mark.current {
   box-shadow: 0 4px 14px rgba(0,0,0,0.4);
 }
 .conv-new-pill:hover { filter: brightness(1.08); }
+/* #176 — floating "↑ Top of turn" button. A child of .conv-reader (NOT the
+   scroll body), anchored bottom-RIGHT so it clears the bottom-center "↓ N new"
+   pill. Shown only when the current top-level turn's start is scrolled off; a
+   click scrolls that turn back to its start. Replaces the #175 sticky turn
+   header that overlapped the prose (no opaque mask floats over the column).
+   Panel-ish chrome matching .conv-back, with the pill's soft drop shadow. */
+.conv-jump-top {
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+  z-index: 5;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg-2);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 16px;
+  line-height: 1;
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+}
+.conv-jump-top:hover { color: var(--text); border-color: var(--accent-blue); }
 /* ---- Empty / loading / selection states (#161 F3) ---------------- */
 .conv-reader--empty,
 .conv-reader--loading,
@@ -4921,56 +4949,11 @@ mark.current {
   background: transparent;
   padding: 0;
 }
-/* The turn head is now a click-to-top <button> (#175 F2): reset the native
-   button chrome but keep the flex/gap/margin layout. The per-block sticky mask
-   rules below override `background` for the two pinned turn heads. */
 .conv-item-head {
   display: flex;
   align-items: baseline;
   gap: 10px;
   margin-bottom: 6px;
-  appearance: none;
-  border: 0;
-  padding: 0;
-  background: none;
-  border-radius: 0;
-  width: 100%;
-  text-align: left;
-  font: inherit;
-  color: inherit;
-  cursor: pointer;
-}
-/* A subtle "↑ jump to start" affordance, revealed on hover/focus. */
-.conv-item-head::after { content: '↑'; margin-left: auto; opacity: 0; font-size: 11px; }
-.conv-item-head:hover::after,
-.conv-item-head:focus-visible::after { opacity: 0.6; }
-
-/* ---- Sticky top-level block headers (#175 F2) --------------------------
-   Child-combinator scoped to DIRECT children of the thread so turn heads
-   nested inside a subagent body (under .conv-sidechain-body) never pin.
-   Subagent groups — including nested ones — are flat DOM siblings of the
-   thread, so their summaries pin without overlap (no :not(--nested) needed). */
-.conv-reader-thread > .conv-item > .conv-item-head,
-.conv-reader-thread > details.conv-toolresult-run > summary,
-.conv-reader-thread > details.conv-sidechain > summary.conv-sidechain-head {
-  position: sticky;
-  top: 0;
-  z-index: 2;
-}
-/* Per-block OPAQUE masks, each matching that block's resting background so a
-   pinned header hides content scrolling beneath it without a color mismatch:
-   - assistant rests on the reader's --panel-bg;
-   - human rests on a 5% blue tint, here stacked over an opaque --panel-bg;
-   - the tool-result run rests on the opaque --panel-bg-2;
-   - the subagent head rests on the .conv-sidechain 5% magenta tint, here
-     stacked over an opaque --panel-bg. */
-.conv-reader-thread > .conv-item--assistant > .conv-item-head { background: var(--panel-bg); }
-.conv-reader-thread > .conv-item--human > .conv-item-head {
-  background: linear-gradient(rgba(96,165,250,0.05), rgba(96,165,250,0.05)), var(--panel-bg);
-}
-.conv-reader-thread > details.conv-toolresult-run > summary { background: var(--panel-bg-2); }
-.conv-reader-thread > details.conv-sidechain > summary.conv-sidechain-head {
-  background: linear-gradient(rgba(217,70,239,0.05), rgba(217,70,239,0.05)), var(--panel-bg);
 }
 .conv-item-label {
   font-family: var(--font-mono);

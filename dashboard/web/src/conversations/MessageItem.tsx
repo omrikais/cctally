@@ -41,14 +41,6 @@ function MessageItemImpl(
   // DIRECT child of the thread — the role-dot spine CSS keys on
   // `.conv-reader-thread > .conv-item--human`, so wrapping is not an option.
   const cls = (suffix: string) => `conv-item ${suffix}${className ? ` ${className}` : ''}`;
-  // #175 F2: clicking a top-level assistant/human turn head scrolls the turn
-  // back to its start (the head pins via position:sticky while you scroll a tall
-  // turn). Defined inside the impl (NOT a prop) so the memoization stays intact;
-  // reads reduced-motion synchronously so no per-turn hook subscription is added.
-  const onJumpToStart = (e: React.MouseEvent<HTMLButtonElement>) => {
-    const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-    e.currentTarget.closest('.conv-item')?.scrollIntoView({ block: 'start', behavior: reduce ? 'auto' : 'smooth' });
-  };
   // tool_result top-level kind: empty prose, render as a collapsed
   // disclosure wrapping the blocks.
   if (item.kind === 'tool_result') {
@@ -75,12 +67,12 @@ function MessageItemImpl(
     const hasCost = typeof item.cost_usd === 'number' && item.cost_usd > 0;
     return (
       <div ref={ref} className={cls('conv-item--assistant')} style={style} data-uuid={item.anchor.uuid}>
-        <button type="button" className="conv-item-head" title="Jump to the start of this turn" onClick={onJumpToStart}>
+        <div className="conv-item-head">
           <span className="conv-item-label">Assistant</span>
           {/* #175 F3: render the model through the shared .chip system (matching
               the rest of the dashboard). No chip — and no em dash — when null. */}
           {item.model && <span className={`chip ${modelChipClass(item.model)}`}>{item.model}</span>}
-        </button>
+        </div>
         {/* Document-order walk renders prose (from text blocks) + thinking +
             tool runs in order — no separate item.text render (#164). */}
         <MessageBlocks blocks={item.blocks} />
@@ -175,9 +167,9 @@ function MessageItemImpl(
 
   return (
     <div ref={ref} className={cls('conv-item--human')} style={style} data-uuid={item.anchor.uuid}>
-      <button type="button" className="conv-item-head" title="Jump to the start of this turn" onClick={onJumpToStart}>
+      <div className="conv-item-head">
         <span className="conv-item-label">You</span>
-      </button>
+      </div>
       {item.text && <Markdown>{item.text}</Markdown>}
       {/* Joined prose renders above via item.text; pass only NON-text blocks to
           the walk so it doesn't double the human's prose. */}

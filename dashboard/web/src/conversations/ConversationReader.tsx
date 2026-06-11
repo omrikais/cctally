@@ -89,12 +89,50 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   const prevHasMoreRef = useRef(false);
   const [newCount, setNewCount] = useState(0);
 
+  // #176 — floating "↑ Top of turn" button. Replaces the #175 sticky turn
+  // header (which floated an opaque mask over the prose). `jumpTopVisible` gates
+  // the button; `jumpTopTargetRef` holds the top-level block currently under the
+  // viewport top so a click can scroll it back to its start. Both are reset on a
+  // session switch (the reader is reused across conversations).
+  const [jumpTopVisible, setJumpTopVisible] = useState(false);
+  const jumpTopTargetRef = useRef<HTMLElement | null>(null);
+
   const onBodyScroll = useCallback(() => {
     const b = bodyRef.current;
     if (!b) return;
     const atBottom = b.scrollTop + b.clientHeight >= b.scrollHeight - 80;
     atBottomRef.current = atBottom;
     if (atBottom) setNewCount((n) => (n ? 0 : n));
+
+    // #176 — decide whether to surface the floating jump-to-top button. Find the
+    // top-level block straddling the viewport top, then show the button only once
+    // its start has scrolled meaningfully off (THRESHOLD). getBoundingClientRect
+    // is used over offsetTop/offsetParent chains: it's robust to the thread's
+    // transformed/relative ancestors and reads the live layout each scroll.
+    const thread = threadRef.current, body = bodyRef.current;
+    if (thread && body) {
+      const bodyTop = body.getBoundingClientRect().top;
+      let target: HTMLElement | null = null;
+      for (const child of Array.from(thread.children) as HTMLElement[]) {
+        const r = child.getBoundingClientRect();
+        if (r.top <= bodyTop + 1 && r.bottom > bodyTop + 1) { target = child; break; }
+      }
+      const THRESHOLD = 160; // only once you've scrolled meaningfully past the block's start
+      if (target && bodyTop - target.getBoundingClientRect().top > THRESHOLD) {
+        jumpTopTargetRef.current = target;
+        setJumpTopVisible(true);
+      } else {
+        jumpTopTargetRef.current = null;
+        setJumpTopVisible(false);
+      }
+    }
+  }, []);
+
+  // #176 — scroll the current top-level turn back to its start, then hide the
+  // button. reducedRef keeps the jump instant under prefers-reduced-motion.
+  const jumpToTurnTop = useCallback(() => {
+    jumpTopTargetRef.current?.scrollIntoView({ block: 'start', behavior: reducedRef.current ? 'auto' : 'smooth' });
+    setJumpTopVisible(false);
   }, []);
 
   // Stick-if-at-bottom on a live append; otherwise preserve position + count the
@@ -226,7 +264,14 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   // sessions. Clearing `newCount` drops a stale "↓ N new" pill the instant we switch
   // conversations, and resetting `atBottomRef` keeps the next session's first live
   // append on its default stick-to-bottom path (until the user scrolls it).
-  useEffect(() => { setNewCount(0); atBottomRef.current = true; }, [sessionId]);
+  // #176 — also drop a stale floating "↑ Top of turn" button + its target so the
+  // next conversation starts with the button hidden.
+  useEffect(() => {
+    setNewCount(0);
+    atBottomRef.current = true;
+    setJumpTopVisible(false);
+    jumpTopTargetRef.current = null;
+  }, [sessionId]);
 
   // Load-in stagger bookkeeping. On a session change the reused reader must
   // forget which turns it has painted, so the new conversation's opening page
@@ -482,6 +527,20 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
           live-appended turns; clicking it scrolls to the newest turn. */}
       {newCount > 0 && !atBottomRef.current && (
         <button type="button" className="conv-new-pill" onClick={jumpToNew}>↓ {newCount} new</button>
+      )}
+      {/* #176 — floating "↑ Top of turn" button. A child of .conv-reader (NOT the
+          scrolling .conv-reader-body), absolutely positioned bottom-right so it
+          floats over the body without scrolling with it and clears the
+          bottom-center "↓ N new" pill. Shown only when the current turn's start
+          is scrolled off; clicking it returns to that turn's start. */}
+      {jumpTopVisible && (
+        <button
+          type="button"
+          className="conv-jump-top"
+          onClick={jumpToTurnTop}
+          title="Jump to the start of this turn"
+          aria-label="Jump to the start of this turn"
+        >↑</button>
       )}
     </div>
   );
