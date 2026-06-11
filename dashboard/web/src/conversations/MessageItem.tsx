@@ -5,6 +5,7 @@ import { ResultIcon, SystemIcon, SkillIcon } from './ConvIcons';
 import { CopyButton } from './CopyButton';
 import { PermalinkButton } from './PermalinkButton';
 import { isSystemMarker } from './systemMarkers';
+import { modelChipClass } from '../lib/model';
 import type { ConversationItem } from '../types/conversation';
 
 // First non-blank line of a meta body, trimmed + capped — the context pill's
@@ -68,7 +69,9 @@ function MessageItemImpl(
       <div ref={ref} className={cls('conv-item--assistant')} style={style} data-uuid={item.anchor.uuid}>
         <div className="conv-item-head">
           <span className="conv-item-label">Assistant</span>
-          <span className="conv-item-model">{item.model ?? '—'}</span>
+          {/* #175 F3: render the model through the shared .chip system (matching
+              the rest of the dashboard). No chip — and no em dash — when null. */}
+          {item.model && <span className={`chip ${modelChipClass(item.model)}`}>{item.model}</span>}
         </div>
         {/* Document-order walk renders prose (from text blocks) + thinking +
             tool runs in order — no separate item.text render (#164). */}

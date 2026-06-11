@@ -4914,10 +4914,6 @@ mark.current {
 }
 .conv-item--assistant .conv-item-label { color: var(--accent-purple); }
 .conv-item--human .conv-item-label { color: var(--accent-blue); }
-.conv-item-model {
-  font-size: 11px;
-  color: var(--text-dim);
-}
 .conv-item-cost {
   margin-top: 10px;
   padding-top: 8px;

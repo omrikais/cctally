@@ -142,11 +142,16 @@ describe('MessageItem', () => {
     expect(container.querySelector('.conv-item--human')).not.toBeNull();
   });
 
-  it('renders an assistant message with model badge, prose, blocks, and cost', () => {
+  it('renders an assistant message with the model chip, prose, blocks, and cost', () => {
     const { container } = render(<MessageItem item={assistant} />);
     const root = container.querySelector('.conv-item--assistant')!;
     expect(root).not.toBeNull();
-    expect(container.querySelector('.conv-item-model')!.textContent).toBe('claude-opus-4');
+    // #175 F3: the model is rendered through the shared .chip system (opus
+    // here), not the old plain .conv-item-model text.
+    const chip = container.querySelector('.conv-item-head .chip')!;
+    expect(chip.textContent).toBe('claude-opus-4');
+    expect(chip.classList.contains('opus')).toBe(true);
+    expect(container.querySelector('.conv-item-model')).toBeNull();
     expect(container.textContent).toContain('hi back');
     expect(container.querySelector('details.conv-chip--thinking')).not.toBeNull();
     const cost = container.querySelectorAll('.conv-item-cost');
@@ -157,6 +162,34 @@ describe('MessageItem', () => {
   it('renders the assistant cost EXACTLY ONCE', () => {
     const { container } = render(<MessageItem item={assistant} />);
     expect(container.querySelectorAll('.conv-item-cost')).toHaveLength(1);
+  });
+
+  it('renders the assistant model as a .chip with the modelChipClass (#175 F3)', () => {
+    const opusItem: ConversationItem = { ...assistant, model: 'claude-opus-4-8' };
+    const { container } = render(<MessageItem item={opusItem} />);
+    const chip = container.querySelector('.conv-item-head .chip');
+    expect(chip?.textContent).toBe('claude-opus-4-8');
+    expect(chip?.classList.contains('opus')).toBe(true);
+    expect(container.querySelector('.conv-item-model')).toBeNull();
+  });
+
+  it('renders no chip and no em dash for a null-model assistant (#175 F3)', () => {
+    const nullModel: ConversationItem = {
+      kind: 'assistant',
+      anchor: { session_id: 's', uuid: 'an', id: 30 },
+      member_uuids: ['an'],
+      ts: 't',
+      text: 'partial',
+      blocks: [{ kind: 'text', text: 'partial' }],
+      model: null,
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+      cost_usd: 0,
+    };
+    const { container } = render(<MessageItem item={nullModel} />);
+    expect(container.querySelector('.conv-item-head .chip')).toBeNull();
+    expect(container.querySelector('.conv-item-head')?.textContent).not.toContain('—');
   });
 
   it('omits the cost footer on a null-msg_id assistant (no cost_usd)', () => {
@@ -175,7 +208,7 @@ describe('MessageItem', () => {
     };
     const { container } = render(<MessageItem item={nullMsg} />);
     expect(container.querySelectorAll('.conv-item-cost')).toHaveLength(0);
-    expect(container.querySelector('.conv-item-model')!.textContent).toBe('claude-opus-4');
+    expect(container.querySelector('.conv-item-head .chip')!.textContent).toBe('claude-opus-4');
   });
 
   it('omits the cost footer when cost_usd is present but 0.0 (the real backend null-msg payload)', () => {
