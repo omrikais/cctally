@@ -178,3 +178,26 @@ def test_sync_cache_consumes_reingest_and_rebuild_clears_cursor(env):
     _set_meta(conn, GEN_KEY, ENRICH_FLAG)
     cache_mod.sync_cache(conn, rebuild=True)
     assert _get_meta(conn, CURSOR_KEY) is None and _get_meta(conn, GEN_KEY) is None
+
+
+def test_dashboard_initial_snapshot_never_syncs(monkeypatch):
+    """Fix #1: the foreground initial snapshot must use skip_sync=True regardless
+    of args.no_sync, so binding the port never blocks on (or consumes) the heavy
+    sync / reingest — that work is owned by the background _DashboardSyncThread."""
+    import types
+    ns = load_script()
+    import cctally  # the loaded main module namespace
+    captured = {}
+
+    def fake_build(*a, **kw):
+        captured["skip_sync"] = kw.get("skip_sync")
+        return object()  # opaque snapshot; helper just returns it
+
+    monkeypatch.setattr(cctally, "_tui_build_snapshot", fake_build)
+    import _cctally_dashboard as dash
+    for no_sync in (False, True):
+        captured.clear()
+        args = types.SimpleNamespace(no_sync=no_sync)
+        dash._dashboard_initial_snapshot(
+            args, pinned_now=None, display_tz_pref_override=None)
+        assert captured["skip_sync"] is True, f"no_sync={no_sync} must still skip_sync"

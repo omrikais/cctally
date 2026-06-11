@@ -7829,6 +7829,21 @@ def _dashboard_wait_for_signal(
         os.close(write_fd)
 
 
+def _dashboard_initial_snapshot(args, *, pinned_now, display_tz_pref_override):
+    """#179: build the dashboard's first snapshot WITHOUT the heavy sync so the
+    HTTP port binds promptly. The background ``_DashboardSyncThread`` (started in
+    cmd_dashboard before the ThreadingHTTPServer bind) runs the first full
+    ``sync_cache`` — including any pending conversation reingest — and SSE-pushes
+    the populated snapshot on completion. ``--no-sync`` already passed
+    ``skip_sync=True`` here, so that path is byte-identical; only the normal launch
+    changes (its previously-redundant foreground sync is removed, not duplicated —
+    the background thread's first tick was always going to sync anyway)."""
+    return sys.modules["cctally"]._tui_build_snapshot(
+        now_utc=pinned_now, skip_sync=True,
+        display_tz_pref_override=display_tz_pref_override,
+    )
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     """Launch the live web dashboard."""
     import signal as _signal
@@ -7906,9 +7921,13 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # weekly, project, forecast subcommands already respect.
     pinned_now = _command_as_of() if os.environ.get("CCTALLY_AS_OF") else None
 
-    # Build initial snapshot — blocking, serves immediately.
-    initial = sys.modules["cctally"]._tui_build_snapshot(
-        now_utc=pinned_now, skip_sync=args.no_sync,
+    # #179: build the initial snapshot WITHOUT the heavy sync so the HTTP port
+    # binds promptly even on a heavy-history instance. The background
+    # _DashboardSyncThread (started below, before the bind) owns the first full
+    # sync_cache — including any pending conversation-enrichment reingest — and
+    # SSE-pushes the populated snapshot on completion.
+    initial = _dashboard_initial_snapshot(
+        args, pinned_now=pinned_now,
         display_tz_pref_override=display_tz_pref_override,
     )
     if args.no_sync:
