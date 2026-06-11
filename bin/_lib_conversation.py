@@ -105,6 +105,7 @@ def _normalize(obj, t, offset):
         entry_type = TOOL_RESULT
         _attach_subagent_result(blocks, obj)   # #166: record-level toolUseResult
         _attach_ask_answers(blocks, obj)       # #177 S2: AskUserQuestion answers
+        _attach_task_meta(blocks, obj)         # task checklist identity
         # tool_result rows are stored but NOT indexed as prose (spec §2). A
         # user line that mixes a text block with a tool_result block must not
         # leak that text into the FTS index; the full content stays in
@@ -285,6 +286,47 @@ def _attach_ask_answers(blocks, obj):
     if isinstance(anno, dict) and anno:
         bounded_anno, _ = _bound_input(anno)
         results[0]["ask_annotations"] = bounded_anno
+
+
+def _attach_task_meta(blocks, obj):
+    """Stash a Task* tool's record-level identity onto its single tool_result
+    block so the query-kernel fold has a robust id (NOT a result-string parse).
+    Task ids are monotonic + never reused, so the explicit id is the only stable
+    fold key. Self-identifying by toolUseResult shape:
+      TaskCreate -> {"task": {"id": ...}}            -> block["task_id"]
+      TaskUpdate -> {"taskId": ...}                   -> block["task_id"]
+      TaskList   -> {"tasks": [{id,subject,status}]}  -> block["task_list"]
+    Same exactly-one-result-block guard as _attach_subagent_result. Subjects
+    bounded through _bound_input.
+
+    The ``task.id`` (not ``task.task_id``) gate deliberately ignores the
+    look-alike local_bash spawn result {"task": {"task_id": ..., ...}}, which is
+    a different tool family and carries no checklist id."""
+    tur = obj.get("toolUseResult")
+    if not isinstance(tur, dict):
+        return
+    results = [b for b in blocks if b.get("kind") == "tool_result"]
+    if len(results) != 1:
+        return
+    block = results[0]
+    task = tur.get("task")
+    if isinstance(task, dict) and task.get("id") is not None:
+        block["task_id"] = str(task["id"])
+        return
+    if tur.get("taskId") is not None:
+        block["task_id"] = str(tur["taskId"])
+        return
+    tasks = tur.get("tasks")
+    if isinstance(tasks, list):
+        snap = []
+        for t in tasks:
+            if not isinstance(t, dict) or t.get("id") is None:
+                continue
+            bounded, _ = _bound_input({"subject": t.get("subject") or ""})
+            snap.append({"id": str(t["id"]),
+                         "subject": bounded.get("subject", ""),
+                         "status": t.get("status") or "pending"})
+        block["task_list"] = snap
 
 
 def _stringify(c):

@@ -565,3 +565,46 @@ def test_attach_ask_answers_keeps_nonempty_annotations():
     lc._attach_ask_answers(blocks, {"toolUseResult": {
         "answers": {"Q": "A"}, "annotations": {"Q": {"notes": "n"}}}})
     assert blocks[0]["ask_annotations"] == {"Q": {"notes": "n"}}
+
+
+def test_attach_task_meta_create_stashes_task_id():
+    blocks = [{"kind": "tool_result", "tool_use_id": "t1", "text": "Task #1 created"}]
+    obj = {"toolUseResult": {"task": {"id": "1", "subject": "Explore project context"}}}
+    lc._attach_task_meta(blocks, obj)
+    assert blocks[0]["task_id"] == "1"
+    assert "task_list" not in blocks[0]
+
+
+def test_attach_task_meta_update_stashes_task_id():
+    blocks = [{"kind": "tool_result", "tool_use_id": "t2", "text": "Updated task #1 status"}]
+    obj = {"toolUseResult": {"success": True, "taskId": "1",
+                             "statusChange": {"from": "pending", "to": "in_progress"}}}
+    lc._attach_task_meta(blocks, obj)
+    assert blocks[0]["task_id"] == "1"
+
+
+def test_attach_task_meta_list_stashes_snapshot():
+    # NOTE (reviewer adj. 1): TaskList toolUseResult shape VERIFIED against real
+    # transcripts (e.g. 82f63fb2-.../2a66a114-...): {"tasks":[{id,subject,status,
+    # blockedBy}]}, ids are strings, status in pending|in_progress|completed.
+    blocks = [{"kind": "tool_result", "tool_use_id": "t3", "text": "..."}]
+    obj = {"toolUseResult": {"tasks": [
+        {"id": "1", "subject": "A", "status": "completed", "blockedBy": []},
+        {"id": "2", "subject": "B", "status": "in_progress", "blockedBy": []}]}}
+    lc._attach_task_meta(blocks, obj)
+    assert blocks[0]["task_list"] == [
+        {"id": "1", "subject": "A", "status": "completed"},
+        {"id": "2", "subject": "B", "status": "in_progress"}]
+
+
+def test_attach_task_meta_noop_without_task_fields():
+    blocks = [{"kind": "tool_result", "tool_use_id": "t4"}]
+    lc._attach_task_meta(blocks, {"toolUseResult": {"foo": "bar"}})
+    assert "task_id" not in blocks[0] and "task_list" not in blocks[0]
+
+
+def test_attach_task_meta_requires_single_result_block():
+    blocks = [{"kind": "tool_result", "tool_use_id": "a"},
+              {"kind": "tool_result", "tool_use_id": "b"}]
+    lc._attach_task_meta(blocks, {"toolUseResult": {"task": {"id": "1"}}})
+    assert all("task_id" not in b for b in blocks)
