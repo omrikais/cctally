@@ -188,10 +188,15 @@ export function LinkIcon() {
   );
 }
 
-export function LoadingIcon() {
+// Loading spinner: a faint full ring plus a bright quarter-arc. The reader's
+// loading-container CSS selector rotates it (the `.conv-ico` shell hardcodes its
+// className, so the spin is driven by the container, not a prop); a
+// prefers-reduced-motion rule suppresses the rotation.
+export function SpinnerIcon() {
   return (
     <Svg>
-      <path d="M6 4h12M6 20h12M8 4c0 4 8 6 8 8s-8 4-8 8M16 4c0 4-8 6-8 8" />
+      <circle cx="12" cy="12" r="9" opacity="0.25" />
+      <path d="M21 12a9 9 0 0 0-9-9" />
     </Svg>
   );
 }

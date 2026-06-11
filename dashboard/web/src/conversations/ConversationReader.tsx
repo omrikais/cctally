@@ -7,7 +7,7 @@ import { groupSidechains } from './groupSidechains';
 import { isSystemMarker } from './systemMarkers';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
-import { ResultIcon, LoadingIcon, WarningIcon, ChatIcon } from './ConvIcons';
+import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon } from './ConvIcons';
 import { fmt } from '../lib/fmt';
 import type { ConversationItem } from '../types/conversation';
 
@@ -326,7 +326,7 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
 
   if (loading && !detail) return (
     <div className="conv-reader conv-reader--loading">
-      <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true"><LoadingIcon /></span>
+      <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true"><SpinnerIcon /></span>
         <div className="conv-state-title">Loading conversation…</div></div>
     </div>
   );

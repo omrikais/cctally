@@ -1,7 +1,7 @@
 import { render } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import type { ReactNode } from 'react';
-import { toolIcon, ThinkingIcon, FileSearchIcon, TerminalIcon, ToolGenericIcon, LinkIcon } from './ConvIcons';
+import { toolIcon, ThinkingIcon, FileSearchIcon, TerminalIcon, ToolGenericIcon, LinkIcon, SpinnerIcon } from './ConvIcons';
 
 function svgOf(el: ReactNode) {
   const { container } = render(<>{el}</>);
@@ -30,6 +30,13 @@ describe('ConvIcons', () => {
 
   it('LinkIcon renders an aria-hidden conv-ico svg', () => {
     const svg = svgOf(<LinkIcon />);
+    expect(svg).toBeInTheDocument();
+    expect(svg).toHaveAttribute('aria-hidden', 'true');
+    expect(svg).toHaveClass('conv-ico');
+  });
+
+  it('SpinnerIcon renders a conv-ico svg (the animated loading glyph)', () => {
+    const svg = svgOf(<SpinnerIcon />);
     expect(svg).toBeInTheDocument();
     expect(svg).toHaveAttribute('aria-hidden', 'true');
     expect(svg).toHaveClass('conv-ico');
