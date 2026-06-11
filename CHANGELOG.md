@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.34.0] - 2026-06-11
+
 ### Added
 - Dashboard conversation reader: the open conversation now updates live — once you've paged to the end, new turns from an active session appear on each refresh tick with no manual reload, sticking to the newest turn if you're already at the bottom or surfacing a floating "↓ N new" pill (click to jump to the latest) if you've scrolled up. The cost and model totals update along with the new turns (#175).
 
