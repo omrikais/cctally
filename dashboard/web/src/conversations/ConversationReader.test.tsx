@@ -487,6 +487,40 @@ describe('ConversationReader live-tail scroll (#175 F4)', () => {
     expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
   });
 
+  it('clears a stale "↓ N new" pill on a session switch (#175 P1)', async () => {
+    // Render convo A fully-paged, scroll up, drive a live append so the pill
+    // appears. Then switch the reused reader to convo B (new sessionId + B's
+    // detail). Without the per-session pill reset the stale pill survives the
+    // switch until the user scrolls B to the bottom; with it the pill is gone
+    // the moment B loads.
+    const { body, rerender, container } =
+      await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
+    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 }); // scrolled up
+    fireEvent.scroll(body);
+    spyScrollTo();
+
+    await appendLiveItem('live1');
+    // Pill is up on convo A.
+    expect(await screen.findByRole('button', { name: /new/i })).toBeInTheDocument();
+
+    // Switch the reused reader to convo B; queue B's page-1 detail.
+    mockFetchOnce({
+      session_id: 'B', project_label: 'projB', git_branch: 'main',
+      started_utc: '2026-01-01T00:00:00Z', last_activity_utc: '2026-01-01T02:00:00Z',
+      cost_usd: 2, models: ['claude-opus-4'],
+      items: [makeItem({ uuid: 'b1' })],
+      page: { next_after: null, has_more: false },
+    });
+    await act(async () => {
+      rerender(<ConversationReader sessionId="B" />);
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="b1"]')).not.toBeNull());
+
+    // The stale pill must be gone on B (per-session reset cleared newCount).
+    expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
+  });
+
   it('a pagination append followed by a live tail append shows the pill (sequence guard)', async () => {
     // After the final pagination page lands (hasMore flips false), the NEXT
     // growth — a live tail append — must be treated as live (pill appears).

@@ -222,6 +222,12 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
   // only an agent-file hash). Reset on every session change; no-op on first mount.
   useEffect(() => { setForcedOpenKey(null); }, [sessionId]);
 
+  // #175 — the reused reader must not carry the live-tail pill/scroll state across
+  // sessions. Clearing `newCount` drops a stale "↓ N new" pill the instant we switch
+  // conversations, and resetting `atBottomRef` keeps the next session's first live
+  // append on its default stick-to-bottom path (until the user scrolls it).
+  useEffect(() => { setNewCount(0); atBottomRef.current = true; }, [sessionId]);
+
   // Load-in stagger bookkeeping. On a session change the reused reader must
   // forget which turns it has painted, so the new conversation's opening page
   // rises + staggers afresh — clearing seenRef alone resets "first page", which

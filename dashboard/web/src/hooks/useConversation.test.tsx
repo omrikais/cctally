@@ -98,6 +98,55 @@ describe('useConversation', () => {
     expect(result.current.hasMore).toBe(false);
   });
 
+  it('replays a tick that arrives mid-fetch exactly once (coalesce, #175 F4)', async () => {
+    // Fully paged (hasMore false). The FIRST tail fetch is held pending via a
+    // deferred resolver while two more ticks arrive. pollTail sees pollingRef
+    // set on each and records pendingTickRef (coalesced — multiple ticks collapse
+    // into one pending flag). When the first fetch resolves, the `finally` replays
+    // exactly ONE additional `?after=` fetch — not zero, not two.
+    let resolveFirst!: (body: unknown) => void;
+    let tailCount = 0;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation((url: string) => {
+      if (!url.includes('after=')) {
+        // page-1 load resolves immediately (fully paged).
+        return Promise.resolve({ ok: true, status: 200, json: async () => detail([it1, it2], null) } as Response);
+      }
+      // Tail fetches. Hold the FIRST one pending; resolve later ones immediately.
+      tailCount += 1;
+      if (tailCount === 1) {
+        return new Promise((resolve) => {
+          resolveFirst = (body: unknown) => resolve({ ok: true, status: 200, json: async () => body } as Response);
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => detail([], null) } as Response);
+    });
+
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    expect(result.current.hasMore).toBe(false);
+
+    // Tick 1 kicks off the first tail fetch (held pending via resolveFirst).
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    await waitFor(() => expect(tailCount).toBe(1));
+
+    // Ticks 2 and 3 arrive while the first fetch is still pending. pollTail sees
+    // pollingRef set both times and only records pendingTickRef — no new fetch yet.
+    await act(async () => { bumpTick(rerender, 't2'); await Promise.resolve(); });
+    await act(async () => { bumpTick(rerender, 't3'); await Promise.resolve(); });
+    expect(tailCount).toBe(1); // still only the in-flight fetch
+
+    // Resolve the first fetch; the `finally` replays the single coalesced tick.
+    await act(async () => { resolveFirst(detail([it3], null)); for (let i = 0; i < 6; i++) await Promise.resolve(); });
+    await waitFor(() => expect(tailCount).toBe(2));
+
+    // Exactly ONE replay fetch — the two coalesced ticks did NOT each spawn one.
+    expect(tailCount).toBe(2);
+    // The replay's after= cursor advanced to the newly-appended it3 (id 3), since
+    // the first fetch's append landed before the replay reads the last item.
+    const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.filter((c) => String(c[0]).includes('after='));
+    expect(calls[calls.length - 1][0]).toContain('after=3');
+  });
+
   it('does not tail-poll while hasMore is true (#175 F4)', async () => {
     mockOnce(detail([it1], 2));            // page 1 has a cursor -> hasMore true
     const { result, rerender } = renderHook(() => useConversation('s'));
