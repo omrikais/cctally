@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.33.0] - 2026-06-11
+
 ### Added
 - Dashboard conversation reader: URL deep-linking — selecting a conversation or landing a turn jump now reflects into the address-bar hash (`#/conversations/<id>/<turn>`), reloads and Back/Forward restore that state, and every conversation turn gains a permalink button that copies a link straight to that turn (local-first; the link only resolves for someone who can already reach your dashboard). Closes #169, #174.
 
