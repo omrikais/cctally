@@ -262,14 +262,24 @@ def _attach_ask_answers(blocks, obj):
     free-form "Other" answer or a long annotation note is attacker-controlled
     free text, and every other free-text payload in this parser is capped
     before it reaches blocks_json. Reusing _bound_input applies the same
-    five-axis cap (leaf/key/node/depth/total)."""
+    five-axis cap (leaf/key/node/depth/total). The bound's truncation flag is
+    intentionally NOT surfaced (no answer-level "truncated" affordance — a
+    >8000-char option answer is not a realistic shape; the cap is a backstop).
+
+    An EMPTY answers dict is treated as no-capture (symmetric with the empty-
+    annotations drop below): emitting ``ask_answers={}`` would set a falsy
+    ``answers`` on the tool_call and suppress the client's result-text
+    fallback, so a degenerate empty payload must no-op here instead."""
     tur = obj.get("toolUseResult")
-    if not isinstance(tur, dict) or not isinstance(tur.get("answers"), dict):
+    if not isinstance(tur, dict):
+        return
+    answers = tur.get("answers")
+    if not isinstance(answers, dict) or not answers:   # require a non-empty dict
         return
     results = [b for b in blocks if b.get("kind") == "tool_result"]
     if len(results) != 1:
         return
-    bounded_ans, _ = _bound_input(tur["answers"])
+    bounded_ans, _ = _bound_input(answers)
     results[0]["ask_answers"] = bounded_ans
     anno = tur.get("annotations")
     if isinstance(anno, dict) and anno:

@@ -536,6 +536,15 @@ def test_attach_ask_answers_noop_without_answers_dict():
     assert "ask_answers" not in blocks[0]
 
 
+def test_attach_ask_answers_noop_on_empty_answers():
+    # An empty answers dict must NOT stash ask_answers={} — that would set a
+    # falsy `answers` on the tool_call and suppress the client's result-text
+    # fallback. Symmetric with the empty-annotations drop.
+    blocks = [{"kind": "tool_result", "tool_use_id": "t1", "is_error": False}]
+    lc._attach_ask_answers(blocks, {"toolUseResult": {"answers": {}}})
+    assert "ask_answers" not in blocks[0]
+
+
 def test_attach_ask_answers_requires_exactly_one_result_block():
     blocks = [{"kind": "tool_result", "tool_use_id": "t1"},
               {"kind": "tool_result", "tool_use_id": "t2"}]
