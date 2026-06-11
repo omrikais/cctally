@@ -726,16 +726,11 @@ def _build_turn(members):
         "_source_tool_use_id": first[14],
         "_has_prose": False,
     }
-    # #177: stop_reason / attribution_* (tail-appended cols 15/16/17). Seed from
-    # the first fragment ONLY when non-null so a single-fragment turn is covered;
-    # _fold_fragment then keeps the last-non-null value across fragments. Omitted
-    # keys (never None) preserve the absent-when-absent contract.
-    if first[15] is not None:
-        item["stop_reason"] = first[15]
-    if first[16] is not None:
-        item["attribution_skill"] = first[16]
-    if first[17] is not None:
-        item["attribution_plugin"] = first[17]
+    # #177: stop_reason / attribution_* (tail-appended cols 15/16/17) are seeded
+    # by the _fold_fragment(item, first) call below — the same seed-then-fold path
+    # model/text/is_sidechain already use. _fold_fragment applies the last-non-null
+    # guard, so a single-fragment turn is covered there and omitted keys (never
+    # None) preserve the absent-when-absent contract.
     _fold_fragment(item, first)
     for m in members[1:]:
         _extend_turn(item, m)
