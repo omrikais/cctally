@@ -52,6 +52,14 @@ export type ConversationItem =
       skill_name: string | null;
     };
 
+// One row of a checklist card (TodoWrite legacy + the live Task* family). The
+// shared ChecklistCard renderer normalizes an unknown `status` to 'pending'.
+export interface ChecklistTodo {
+  content: string;
+  status: string;
+  activeForm?: string;
+}
+
 export type ConversationBlock =
   | { kind: 'text'; text: string }
   | { kind: 'thinking'; text: string }
@@ -82,6 +90,12 @@ export type ConversationBlock =
       annotations?: Record<string, unknown>;    // #177 S2 — user notes keyed by question
       skill_body?: string;
       skill_name?: string | null;
+      // Task* checklist: the running to-do list snapshot at this point in the
+      // conversation, stamped by the kernel's _fold_task_runs onto the FIRST
+      // tool_call of a TaskCreate/TaskUpdate/TaskList run. Absent on non-Task
+      // runs and on legacy rows the fold never reached (consumers tolerate the
+      // missing key and degrade to generic chips).
+      task_snapshot?: ChecklistTodo[];
     }
   // 'tool_result' BLOCK kind survives ONLY inside a standalone orphan
   // tool_result ITEM (a result the kernel could not fold into a request).
