@@ -104,6 +104,7 @@ def _normalize(obj, t, offset):
     elif any(b["kind"] == "tool_result" for b in blocks):
         entry_type = TOOL_RESULT
         _attach_subagent_result(blocks, obj)   # #166: record-level toolUseResult
+        _attach_ask_answers(blocks, obj)       # #177 S2: AskUserQuestion answers
         # tool_result rows are stored but NOT indexed as prose (spec §2). A
         # user line that mixes a text block with a tool_result block must not
         # leak that text into the FTS index; the full content stays in
@@ -247,6 +248,33 @@ def _attach_subagent_result(blocks, obj):
             meta[dst] = v
     if meta:
         block["subagent_meta"] = meta
+
+
+def _attach_ask_answers(blocks, obj):
+    """Stash an AskUserQuestion's structured answers (+ annotations) onto its
+    single tool_result block (#177 S2), so the chosen option(s) have a robust
+    source the client can highlight without parsing the harness result string.
+    Self-identifying: fires only when toolUseResult carries an ``answers`` dict
+    (a key distinctive to AskUserQuestion), so no cross-record tool-name lookup
+    is needed. Same exactly-one-result-block guard as _attach_subagent_result.
+
+    answers/annotations are BOUNDED through _bound_input before storage — a
+    free-form "Other" answer or a long annotation note is attacker-controlled
+    free text, and every other free-text payload in this parser is capped
+    before it reaches blocks_json. Reusing _bound_input applies the same
+    five-axis cap (leaf/key/node/depth/total)."""
+    tur = obj.get("toolUseResult")
+    if not isinstance(tur, dict) or not isinstance(tur.get("answers"), dict):
+        return
+    results = [b for b in blocks if b.get("kind") == "tool_result"]
+    if len(results) != 1:
+        return
+    bounded_ans, _ = _bound_input(tur["answers"])
+    results[0]["ask_answers"] = bounded_ans
+    anno = tur.get("annotations")
+    if isinstance(anno, dict) and anno:
+        bounded_anno, _ = _bound_input(anno)
+        results[0]["ask_annotations"] = bounded_anno
 
 
 def _stringify(c):

@@ -516,3 +516,43 @@ def test_search_aux_caps_thinking_but_block_keeps_full():
     blocks = json.loads(row.blocks_json)
     think = [b for b in blocks if b["kind"] == "thinking"][0]
     assert len(think["text"]) == lc._TOOL_RESULT_CAP + 500
+
+
+def test_attach_ask_answers_stashes_bounded_answers():
+    blocks = [{"kind": "tool_result", "tool_use_id": "t1",
+               "text": "...", "is_error": False}]
+    obj = {"toolUseResult": {
+        "questions": [{"question": "Q?", "header": "H", "options": [], "multiSelect": False}],
+        "answers": {"Q?": "Comprehensive"},
+        "annotations": {}}}
+    lc._attach_ask_answers(blocks, obj)
+    assert blocks[0]["ask_answers"] == {"Q?": "Comprehensive"}
+    assert "ask_annotations" not in blocks[0]   # empty annotations dropped
+
+
+def test_attach_ask_answers_noop_without_answers_dict():
+    blocks = [{"kind": "tool_result", "tool_use_id": "t1", "is_error": False}]
+    lc._attach_ask_answers(blocks, {"toolUseResult": {"foo": "bar"}})
+    assert "ask_answers" not in blocks[0]
+
+
+def test_attach_ask_answers_requires_exactly_one_result_block():
+    blocks = [{"kind": "tool_result", "tool_use_id": "t1"},
+              {"kind": "tool_result", "tool_use_id": "t2"}]
+    lc._attach_ask_answers(blocks, {"toolUseResult": {"answers": {"Q": "A"}}})
+    assert all("ask_answers" not in b for b in blocks)   # ambiguous -> no-op
+
+
+def test_attach_ask_answers_bounds_pathological_value():
+    big = "x" * 50_000
+    blocks = [{"kind": "tool_result", "tool_use_id": "t1"}]
+    lc._attach_ask_answers(blocks, {"toolUseResult": {"answers": {"Q": big}}})
+    # _bound_input clips a string leaf to _INPUT_LEAF_CAP (8000)
+    assert len(blocks[0]["ask_answers"]["Q"]) == lc._INPUT_LEAF_CAP
+
+
+def test_attach_ask_answers_keeps_nonempty_annotations():
+    blocks = [{"kind": "tool_result", "tool_use_id": "t1"}]
+    lc._attach_ask_answers(blocks, {"toolUseResult": {
+        "answers": {"Q": "A"}, "annotations": {"Q": {"notes": "n"}}}})
+    assert blocks[0]["ask_annotations"] == {"Q": {"notes": "n"}}
