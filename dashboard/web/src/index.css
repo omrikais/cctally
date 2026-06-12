@@ -5242,6 +5242,39 @@ mark.current {
   color: var(--text-dim);                     /* de-emphasized, AA-passing */
   text-align: right;
 }
+/* #177 S5 §6 — eyebrow time `· HH:mm` at the end of an item head / summary.
+   Muted, monospace, sized to match the eyebrow label without crowding it. */
+.conv-item-time {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--reader-faint);
+  white-space: nowrap;
+}
+
+/* #177 S5 §6 — inter-turn time markers (gap / day / combined). A thin dashed
+   amber rule with centered monospace text; static (no animation, reduced-motion
+   safe). Real DOM text (role="separator") so it is screen-reader visible. */
+.conv-time-marker {
+  align-self: center;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0;
+  padding: 0 10px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  color: var(--accent-amber);
+  white-space: nowrap;
+}
+.conv-time-marker::before,
+.conv-time-marker::after {
+  content: '';
+  flex: 1 1 auto;
+  min-width: 18px;
+  border-top: 1px dashed rgba(251, 191, 36, 0.4);  /* amber, faint */
+}
 
 /* ---- Folded system-marker pill (slash-command plumbing) ----------- */
 .conv-item--system { padding: 0; background: transparent; border: none; }

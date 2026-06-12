@@ -10,8 +10,10 @@ import { SidechainGroup } from './SidechainGroup';
 import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon } from './ConvIcons';
 import { TranscriptContext } from './TranscriptContext';
 import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFocusMode';
+import { insertTimeMarkers } from './insertTimeMarkers';
 import { nextTarget } from './outlineNavigation';
 import { fmt } from '../lib/fmt';
+import { useDisplayTz } from '../hooks/useDisplayTz';
 import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
 
 // First non-blank line of the first MAIN-session, non-marker human message;
@@ -203,6 +205,16 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // reader renders + every effect that iterates the rendered thread children
   // keys on `visible`, not `groups`.
   const visible = useMemo(() => applyFocusMode(groups, focusMode), [groups, focusMode]);
+  // #177 S5 §6 — interleave gap/day time markers over the VISIBLE sequence (so
+  // they recompute per focus mode). Markers carry data-conv-marker (never a
+  // keyboard stop) and role="separator". The display-tz context drives the
+  // day-boundary + is the same source the dashboard panels use.
+  const display = useDisplayTz();
+  const fmtCtx = useMemo(
+    () => ({ tz: display.resolvedTz, offsetLabel: display.offsetLabel }),
+    [display.resolvedTz, display.offsetLabel],
+  );
+  const nodes = useMemo(() => insertTimeMarkers(visible, fmtCtx), [visible, fmtCtx]);
   // Live mirror of the unfiltered render-tree for the jump-to-next mode-hide
   // check (find the target node in `groups`, test nodeVisible under the mode).
   const groupsRef = useRef<RenderNode[]>(groups);
@@ -767,7 +779,22 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       <div className="conv-reader-body" ref={bodyRef} onScroll={onBodyScroll}>
         <TranscriptContext.Provider value={transcriptCtx}>
         <div className="conv-reader-thread" ref={threadRef}>
-          {visible.map((g, idx) => {
+          {nodes.map((g, idx) => {
+            // #177 S5 §6 — an inter-turn gap/day marker. Real DOM text
+            // (screen-reader visible), role="separator", data-conv-marker so j/k
+            // and the focus-class effect skip it (never a keyboard stop).
+            if (g.kind === 'time_marker') {
+              const gapTxt = g.gapSeconds != null ? `⏸ ${fmt.gapDuration(g.gapSeconds)} later` : null;
+              const text =
+                gapTxt && g.dayLabel ? `${gapTxt} · ${g.dayLabel}`
+                : gapTxt ? gapTxt
+                : `— ${g.dayLabel} —`;
+              return (
+                <div key={g.key} className="conv-time-marker" data-conv-marker="" role="separator">
+                  {text}
+                </div>
+              );
+            }
             // #177 S5 §5 — a coalesced run of focus-hidden nodes. Renders as a
             // marker button (data-conv-marker: never keyboard-focusable, never
             // gets conv-item--focused). Clicking it drops back to `all` and jumps

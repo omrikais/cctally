@@ -4,6 +4,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageItem } from './MessageItem';
 import type { ConversationItem } from '../types/conversation';
 
+// #177 S5 §6 — eyebrow times route through useDisplayTz. A mutable holder lets a
+// test flip the display tz (local vs utc FmtCtx) without re-mocking. Default is
+// Etc/UTC so the bulk of the existing tests render a deterministic clock.
+const displayTz = { tz: 'utc', resolvedTz: 'Etc/UTC', offsetLabel: 'UTC', offsetSeconds: 0, pinned: false };
+vi.mock('../hooks/useDisplayTz', () => ({
+  useDisplayTz: () => displayTz,
+}));
+
 const human: ConversationItem = {
   kind: 'human',
   anchor: { session_id: 's', uuid: 'h1', id: 1 },
@@ -633,5 +641,126 @@ describe('MessageItem (#174 permalink on tool-result & system-marker chips)', ()
     render(<MessageItem item={assistant} />);
     const btn = screen.getByRole('button', { name: 'Copy link to this turn' });
     expect(btn.className).toBe('conv-copy-btn');
+  });
+});
+
+// ---- #177 S5 §6 — eyebrow times + token footer --------------------------
+describe('MessageItem eyebrow time (#177 S5 §6)', () => {
+  afterEach(() => {
+    displayTz.resolvedTz = 'Etc/UTC';
+    displayTz.offsetLabel = 'UTC';
+  });
+
+  const withTs = (over: Partial<ConversationItem> & { uuid: string; kind: ConversationItem['kind'] }): ConversationItem => {
+    const { uuid, kind, ...rest } = over;
+    return {
+      kind,
+      anchor: { session_id: 's', uuid, id: 1 },
+      member_uuids: [uuid],
+      ts: '2026-06-12T14:02:31Z',
+      text: kind === 'tool_result' ? '' : 'body',
+      blocks: kind === 'tool_result' ? [{ kind: 'tool_result', text: 'out', truncated: false, is_error: false }] : [],
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+      ...rest,
+    } as ConversationItem;
+  };
+
+  it('renders `· 14:02` on a human head under Etc/UTC', () => {
+    const { container } = render(<MessageItem item={withTs({ uuid: 'h1', kind: 'human' })} />);
+    const time = container.querySelector('.conv-item-head .conv-item-time')!;
+    expect(time).not.toBeNull();
+    expect(time.textContent).toBe('· 14:02');
+    // The tooltip carries the full precise timestamp.
+    expect(time.getAttribute('title')).toBe('2026-06-12T14:02:31Z');
+  });
+
+  it('renders the eyebrow time on an assistant head', () => {
+    const { container } = render(
+      <MessageItem item={withTs({ uuid: 'a1', kind: 'assistant', model: 'claude-opus-4', cost_usd: 0.01 } as never)} />,
+    );
+    const time = container.querySelector('.conv-item-head .conv-item-time')!;
+    expect(time.textContent).toBe('· 14:02');
+  });
+
+  it('renders the eyebrow time at the END of a tool_result summary line', () => {
+    const { container } = render(<MessageItem item={withTs({ uuid: 'tr1', kind: 'tool_result' })} />);
+    const summary = container.querySelector('details.conv-chip--result > summary')!;
+    expect(summary.querySelector('.conv-item-time')!.textContent).toBe('· 14:02');
+  });
+
+  it('renders the eyebrow time at the END of a meta summary line', () => {
+    const meta = withTs({
+      uuid: 'm1', kind: 'meta', text: '## ctx',
+      blocks: [{ kind: 'text', text: '## ctx' }], meta_kind: 'context', skill_name: null,
+    } as never);
+    const { container } = render(<MessageItem item={meta} />);
+    const summary = container.querySelector('details.conv-meta > summary')!;
+    expect(summary.querySelector('.conv-item-time')!.textContent).toBe('· 14:02');
+  });
+
+  it('renders NO time span when ts is absent/null', () => {
+    const noTs = { ...withTs({ uuid: 'h2', kind: 'human' }), ts: null } as unknown as ConversationItem;
+    const { container } = render(<MessageItem item={noTs} />);
+    expect(container.querySelector('.conv-item-time')).toBeNull();
+  });
+
+  it('honors display.tz — the same instant renders a different wall clock under a non-UTC zone', () => {
+    // 14:02:31Z is 10:02 in America/New_York (EDT, -04 in June).
+    displayTz.resolvedTz = 'America/New_York';
+    displayTz.offsetLabel = 'EDT';
+    const { container } = render(<MessageItem item={withTs({ uuid: 'h3', kind: 'human' })} />);
+    expect(container.querySelector('.conv-item-time')!.textContent).toBe('· 10:02');
+  });
+});
+
+describe('MessageItem token footer (#177 S5 §6)', () => {
+  const assistantBase: ConversationItem = {
+    kind: 'assistant',
+    anchor: { session_id: 's', uuid: 'a1', id: 1 },
+    member_uuids: ['a1'],
+    ts: '2026-06-12T14:02:31Z',
+    text: 'hi',
+    blocks: [{ kind: 'text', text: 'hi' }],
+    model: 'claude-opus-4',
+    is_sidechain: false,
+    subagent_key: null,
+    parent_uuid: null,
+    cost_usd: 0.0214,
+  };
+  const tokens = { input: 1200, output: 4800, cache_creation: 10000, cache_read: 300000 };
+
+  it('cost-only footer when tokens are absent (graceful degradation)', () => {
+    const { container } = render(<MessageItem item={assistantBase} />);
+    const cost = container.querySelector('.conv-item-cost')!;
+    expect(cost.textContent).toBe('$0.0214');
+    expect(cost.getAttribute('title')).toBeNull();
+  });
+
+  it('tokens-only footer when cost is zero but tokens are present', () => {
+    const item = { ...assistantBase, cost_usd: 0, tokens } as ConversationItem;
+    const { container } = render(<MessageItem item={item} />);
+    const cost = container.querySelector('.conv-item-cost')!;
+    expect(cost).not.toBeNull();
+    // No leading "$..." and no leading " · " separator.
+    expect(cost.textContent).toBe('in 1.2k · out 4.8k · cache 310k');
+  });
+
+  it('combined cost + tokens footer with the exact-count tooltip', () => {
+    const item = { ...assistantBase, tokens } as ConversationItem;
+    const { container } = render(<MessageItem item={item} />);
+    const cost = container.querySelector('.conv-item-cost')!;
+    expect(cost.textContent).toBe('$0.0214 · in 1.2k · out 4.8k · cache 310k');
+    expect(cost.getAttribute('title')).toBe(
+      'input 1200 · output 4800 · cache create 10000 · cache read 300000',
+    );
+  });
+
+  it('omits the footer entirely when neither cost nor tokens are present', () => {
+    const item = { ...assistantBase, cost_usd: 0 } as ConversationItem;
+    delete (item as { tokens?: unknown }).tokens;
+    const { container } = render(<MessageItem item={item} />);
+    expect(container.querySelector('.conv-item-cost')).toBeNull();
   });
 });

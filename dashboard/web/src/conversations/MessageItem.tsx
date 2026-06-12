@@ -6,6 +6,8 @@ import { CopyButton } from './CopyButton';
 import { PermalinkButton } from './PermalinkButton';
 import { isSystemMarker } from './systemMarkers';
 import { modelChipClass } from '../lib/model';
+import { fmt } from '../lib/fmt';
+import { useDisplayTz } from '../hooks/useDisplayTz';
 import type { ConversationItem } from '../types/conversation';
 
 // First non-blank line of a meta body, trimmed + capped — the context pill's
@@ -41,6 +43,21 @@ function MessageItemImpl(
   // DIRECT child of the thread — the role-dot spine CSS keys on
   // `.conv-reader-thread > .conv-item--human`, so wrapping is not an option.
   const cls = (suffix: string) => `conv-item ${suffix}${className ? ` ${className}` : ''}`;
+  // #177 S5 §6 — eyebrow time `· HH:mm` on every item kind's head/summary line.
+  // Routed through fmt.timeHHmm with the display-tz context (the chokepoint
+  // rule); `noSuffix` drops the per-row tz abbrev (the tooltip carries the full
+  // precise timestamp). `ts` is nullable (Codex F6) — a null-ts item renders no
+  // time span at all.
+  const display = useDisplayTz();
+  // fmt.timeHHmm returns the "—" sentinel for a null/unparseable ts; suppress the
+  // eyebrow in that case (no real instant to show).
+  const eyebrowTimeRaw = item.ts
+    ? fmt.timeHHmm(item.ts, { tz: display.resolvedTz, offsetLabel: display.offsetLabel }, { noSuffix: true })
+    : null;
+  const eyebrowTime = eyebrowTimeRaw && eyebrowTimeRaw !== '—' ? eyebrowTimeRaw : null;
+  const eyebrow = eyebrowTime ? (
+    <span className="conv-item-time" title={item.ts ?? undefined}>· {eyebrowTime}</span>
+  ) : null;
   // tool_result top-level kind: empty prose, render as a collapsed
   // disclosure wrapping the blocks.
   if (item.kind === 'tool_result') {
@@ -51,6 +68,7 @@ function MessageItemImpl(
             <span className="conv-chev" aria-hidden="true" />
             <ResultIcon /> Tool result
             <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} className="conv-chip-permalink" />
+            {eyebrow}
           </summary>
           <div className="conv-chip-body"><MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} /></div>
         </details>
@@ -65,6 +83,10 @@ function MessageItemImpl(
     // "no attributable cost" sentinels, not a genuine $0.0000 charge — showing
     // the footer for them is misleading, so only render it for a positive cost.
     const hasCost = typeof item.cost_usd === 'number' && item.cost_usd > 0;
+    // #177 S5 §6 — per-turn token usage, present only when the turn key matched a
+    // session_entries row (absent → cost-only footer, the established
+    // graceful-degradation pattern). Narrowed off the assistant kind.
+    const tok = 'tokens' in item ? item.tokens : undefined;
     return (
       <div ref={ref} className={cls('conv-item--assistant')} style={style} data-uuid={item.anchor.uuid}>
         <div className="conv-item-head">
@@ -72,6 +94,7 @@ function MessageItemImpl(
           {/* #175 F3: render the model through the shared .chip system (matching
               the rest of the dashboard). No chip — and no em dash — when null. */}
           {item.model && <span className={`chip ${modelChipClass(item.model)}`}>{item.model}</span>}
+          {eyebrow}
         </div>
         {/* Document-order walk renders prose (from text blocks) + thinking +
             tool runs in order — no separate item.text render (#164). */}
@@ -84,11 +107,25 @@ function MessageItemImpl(
             <CopyButton text={item.text} />
           </div>
         )}
-        {hasCost && (
+        {(hasCost || tok) && (
+          // #177 S5 §6 — footer renders when `hasCost || tokens`: a zero-cost
+          // turn that carries tokens shows a tokens-only footer; an un-reingested
+          // turn without tokens keeps the cost-only footer. cache = creation +
+          // read summed for display; the `title` breaks out the four exact counts.
           // toFixed(4), not fmt.usd2: per-turn costs are typically sub-cent,
           // where 2-decimal formatting would read "$0.00" — 4 decimals keep
           // the real figure legible. Intentional bypass of the usd2 helper.
-          <div className="conv-item-cost">${(item.cost_usd as number).toFixed(4)}</div>
+          <div
+            className="conv-item-cost"
+            title={tok ? `input ${tok.input} · output ${tok.output} · cache create ${tok.cache_creation} · cache read ${tok.cache_read}` : undefined}
+          >
+            {hasCost && `$${(item.cost_usd as number).toFixed(4)}`}
+            {tok && (
+              <>
+                {hasCost ? ' · ' : ''}in {fmt.tokens(tok.input)} · out {fmt.tokens(tok.output)} · cache {fmt.tokens(tok.cache_creation + tok.cache_read)}
+              </>
+            )}
+          </div>
         )}
       </div>
     );
@@ -125,6 +162,7 @@ function MessageItemImpl(
           <summary>
             <span className="conv-chev" aria-hidden="true" />
             {head}
+            {eyebrow}
           </summary>
           {mk === 'command' ? (
             <pre className="conv-meta-body conv-meta-body--pre">{item.text}</pre>
@@ -169,6 +207,7 @@ function MessageItemImpl(
     <div ref={ref} className={cls('conv-item--human')} style={style} data-uuid={item.anchor.uuid}>
       <div className="conv-item-head">
         <span className="conv-item-label">You</span>
+        {eyebrow}
       </div>
       {item.text && <Markdown>{item.text}</Markdown>}
       {/* Joined prose renders above via item.text; pass only NON-text blocks to

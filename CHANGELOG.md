@@ -5,6 +5,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Conversation viewer: a full-session navigation layer — a collapsible outline sidebar (toggle `o`) listing every turn as a landmark with nested thinking entries and scroll-sync highlighting, a stats overview (turn counts, duration, tokens, cost, models, tool histogram, and an error row that jumps to the first error), jump-to-next keys with no wrap-around (`e`/`E` errors, `u`/`U` prompts, `b`/`B` subagents, `p`/`P` plans/questions) mirrored by a clickable glyph cluster with counts, and focus modes (`v` cycles All → Chat → Prompts → Errors; hidden turns coalesce into a clickable `· N hidden ·` marker, and a jump whose target the mode would hide resets to All before landing) (#177 Session 5).
+- Conversation viewer: per-turn timestamps and inter-turn markers — each turn header shows a quiet `· HH:mm` in your `display.tz` (precise instant in a tooltip), with a `⏸ 42 min later` gap rule between turns ten or more minutes apart, a `— Jun 13 —` rule when the calendar day changes, and a combined `⏸ 9.5 h later · Jun 13` when both apply — plus per-turn token footers that extend the assistant cost line to `$0.0214 · in 1.2k · out 4.8k · cache 310k` (tokens-only when a turn has usage but no attributable cost, cost-only for un-reingested turns) (#177 Session 5).
+
 ## [1.39.0] - 2026-06-12
 
 ### Added

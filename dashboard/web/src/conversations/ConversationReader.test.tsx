@@ -1064,3 +1064,83 @@ describe('ConversationReader jump-to-next focus-mode reset (#177 S5 §5)', () =>
     expect(getState().convFocusMode).toBe('all');
   });
 });
+
+// ---- #177 S5 §6 — inter-turn time markers in the reader -------------------
+describe('ConversationReader time markers (#177 S5 §6)', () => {
+  async function renderInConversations(items: ConversationItem[], outline?: ConversationOutline) {
+    mockFetchOnce(detail(items));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const utils = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-thread')).not.toBeNull());
+    return utils;
+  }
+
+  it('inserts one gap marker between two turns 42 minutes apart', async () => {
+    const { container } = await renderInConversations([
+      makeItem({ uuid: 'h1', ts: '2026-06-12T14:00:00Z' } as never),
+      makeItem({ uuid: 'h2', ts: '2026-06-12T14:42:00Z' } as never),
+    ]);
+    await waitFor(() => expect(container.querySelector('.conv-time-marker')).not.toBeNull());
+    const markers = container.querySelectorAll('.conv-time-marker');
+    expect(markers).toHaveLength(1);
+    expect(markers[0].textContent).toContain('42 min later');
+    // role="separator" + data-conv-marker → not a keyboard stop.
+    expect(markers[0].getAttribute('role')).toBe('separator');
+    expect((markers[0] as HTMLElement).dataset.convMarker).toBe('');
+  });
+
+  it('emits no marker when adjacent turns are under 10 minutes apart', async () => {
+    const { container } = await renderInConversations([
+      makeItem({ uuid: 'h1', ts: '2026-06-12T14:00:00Z' } as never),
+      makeItem({ uuid: 'h2', ts: '2026-06-12T14:05:00Z' } as never),
+    ]);
+    // Let the render settle, then assert no marker.
+    await waitFor(() => expect(container.querySelector('[data-uuid="h2"]')).not.toBeNull());
+    expect(container.querySelector('.conv-time-marker')).toBeNull();
+  });
+
+  it('recomputes markers over the visible sequence when the focus mode hides the middle turn', async () => {
+    // h1 @14:00, a1 (tool-only assistant, hidden in prompts) @14:05, h2 @14:50.
+    // ALL mode: h1→a1 = 5 min (no marker), a1→h2 = 45 min (one "45 min later").
+    // PROMPTS mode: a1 is hidden, so h1→h2 spans 50 min → one "50 min later".
+    const outline: ConversationOutline = {
+      session_id: 's',
+      stats: {
+        turns: { total: 3, human: 2, assistant: 1, tool_result: 0, meta: 0 },
+        tool_counts: {}, error_count: 0, models: {}, duration_seconds: null,
+        tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 }, cost_usd: 0,
+      },
+      turns: [
+        oTurn({ uuid: 'h1', kind: 'human' }),
+        oTurn({ uuid: 'a1', kind: 'assistant' }),
+        oTurn({ uuid: 'h2', kind: 'human' }),
+      ],
+    };
+    const { container } = await renderInConversations([
+      makeItem({ uuid: 'h1', kind: 'human', text: 'hi', ts: '2026-06-12T14:00:00Z' } as never),
+      makeItem({ uuid: 'a1', kind: 'assistant', text: '', model: 'm', cost_usd: 0,
+        ts: '2026-06-12T14:05:00Z',
+        blocks: [{ kind: 'tool_call', name: 'Read', input_summary: '{}', preview: '/a',
+          tool_use_id: 't', result: { text: 'ok', truncated: false, is_error: false } }] } as never),
+      makeItem({ uuid: 'h2', kind: 'human', text: 'bye', ts: '2026-06-12T14:50:00Z' } as never),
+    ], outline);
+
+    // ALL mode: a single "45 min later" marker between a1 and h2.
+    await waitFor(() => expect(container.querySelector('.conv-time-marker')).not.toBeNull());
+    let markers = container.querySelectorAll('.conv-time-marker');
+    expect(markers).toHaveLength(1);
+    expect(markers[0].textContent).toContain('45 min later');
+
+    // Switch to prompts: a1 vanishes (hidden_run takes its place); the gap now
+    // spans h1→h2 = 50 min, recomputed over the visible sequence.
+    act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' }); });
+    await waitFor(() => {
+      const m = container.querySelectorAll('.conv-time-marker');
+      return expect(m[0]?.textContent).toContain('50 min later');
+    });
+    markers = container.querySelectorAll('.conv-time-marker');
+    expect(markers).toHaveLength(1);
+    expect(markers[0].textContent).toContain('50 min later');
+  });
+});
