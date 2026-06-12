@@ -1,0 +1,68 @@
+{
+  "session_id": "s5",
+  "stats": {
+    "cost_usd": 0.99,
+    "duration_seconds": 2,
+    "error_count": 0,
+    "models": {
+      "claude-opus-4-8": 1
+    },
+    "tokens": {
+      "cache_creation": 0,
+      "cache_read": 0,
+      "input": 1000,
+      "output": 500
+    },
+    "tool_counts": {
+      "Edit": 1
+    },
+    "turns": {
+      "assistant": 1,
+      "human": 1,
+      "meta": 0,
+      "tool_result": 0,
+      "total": 2
+    }
+  },
+  "subagent_meta": {},
+  "turns": [
+    {
+      "is_sidechain": false,
+      "kind": "human",
+      "label": "apply the patch and report the cost",
+      "member_uuids": [
+        "s5h1"
+      ],
+      "parent_uuid": null,
+      "subagent_key": null,
+      "ts": "2026-06-05T00:00:00Z",
+      "uuid": "s5h1"
+    },
+    {
+      "is_sidechain": false,
+      "kind": "assistant",
+      "label": "patched the resolver",
+      "member_uuids": [
+        "s5a1",
+        "s5tr"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s5h1",
+      "subagent_key": null,
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 1000,
+        "output": 500
+      },
+      "tools": [
+        {
+          "is_error": false,
+          "name": "Edit"
+        }
+      ],
+      "ts": "2026-06-05T00:00:01Z",
+      "uuid": "s5a1"
+    }
+  ]
+}

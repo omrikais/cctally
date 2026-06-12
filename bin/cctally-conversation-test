@@ -16,6 +16,9 @@
 #   - GET /api/conversation/search?q=token (loopback) → the prose-fragment hit
 #     deduped across the replay to ONE, (session_id,uuid) anchor present, the
 #     multi-fragment turn resolves to a single turn item.
+#   - GET /api/conversation/s5/outline (loopback)     → #177 S5 full-session
+#     skeleton + stats; turns/stats keys present, stats.cost_usd == the reader's
+#     header cost_usd (shared assembly pass).
 #   - GATE: the SAME GET /api/conversations but with a LAN-hostname `Host`
 #     header (expose unset → default false) → 403 (the anti-DNS-rebinding gate
 #     rejects a hostname Host even on a loopback bind). A default (loopback
@@ -430,6 +433,38 @@ print("ok")
         fail "reader enriched data contract (#177): $enr_check (raw: $enr_raw)"
     fi
 
+    # --- 2d) Outline: full-session skeleton + stats (#177 S5) -------------
+    # The /outline route shares get_conversation's assembly pass, so its
+    # stats.cost_usd MUST equal the reader's header cost_usd byte-for-byte.
+    fetch_and_diff "GET /api/conversation/s5/outline" "golden-conversation-s5-outline.json" \
+        "$base/api/conversation/s5/outline" "${LOOP[@]}"
+
+    local outline_raw reader_s5_raw outline_check
+    outline_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s5/outline")
+    reader_s5_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s5")
+    outline_check=$(O="$outline_raw" R="$reader_s5_raw" python3 -c '
+import json, os, sys
+o = json.loads(os.environ["O"])
+r = json.loads(os.environ["R"])
+errs = []
+for key in ("session_id", "stats", "turns"):
+    if key not in o:
+        errs.append("outline missing %r key: %r" % (key, sorted(o)))
+turns = o.get("turns")
+if not isinstance(turns, list) or not turns:
+    errs.append("outline turns not a non-empty list: %r" % (turns,))
+stats = o.get("stats") or {}
+if stats.get("cost_usd") != r.get("cost_usd"):
+    errs.append("outline stats.cost_usd=%r != reader cost_usd=%r"
+                % (stats.get("cost_usd"), r.get("cost_usd")))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+    if [ "$outline_check" != "ok" ]; then
+        fail "outline route (#177 S5): $outline_check (raw: $outline_raw)"
+    fi
+
     # --- 3) Search: deduped across replay to ONE hit ---------------------
     # Byte-exact golden only when FTS5 is present (the golden is FTS-shaped);
     # the structural asserts below run unconditionally.
@@ -512,6 +547,13 @@ print("ok")
         -H "Host: $lan_host" "$base/api/conversation/search?q=$search_q")
     if [ "$lan_search_code" != "403" ]; then
         fail "gate: LAN-hostname Host /api/conversation/search returned $lan_search_code (expected 403)"
+    fi
+    # #177 S5: the /outline route shares the same _require_transcripts_allowed gate.
+    local lan_outline_code
+    lan_outline_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        -H "Host: $lan_host" "$base/api/conversation/s5/outline")
+    if [ "$lan_outline_code" != "403" ]; then
+        fail "gate: LAN-hostname Host /api/conversation/s5/outline returned $lan_outline_code (expected 403)"
     fi
 
     kill_server_bounded "$pid"

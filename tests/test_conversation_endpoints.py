@@ -218,6 +218,41 @@ def test_conversation_detail_and_search_routing(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def test_conversation_outline_route(tmp_path, monkeypatch):
+    """``/api/conversation/<sid>/outline`` (#177 S5): loopback 200 with the
+    outline shape (``session_id``/``stats``/``turns``), 404 on an unknown id,
+    403 under a LAN hostname Host (gate reused), and route-ordering proof that
+    the ``/outline`` suffix dispatches to the outline handler — NOT the detail
+    catch-all parsing ``s1/outline`` as a session id.
+    """
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+
+        # Happy path: 200 with the outline body shape.
+        status, body = _get(port, "/api/conversation/s1/outline")
+        assert status == 200, (status, body)
+        outline = json.loads(body)
+        assert outline["session_id"] == "s1"
+        assert "stats" in outline and "turns" in outline
+        # Precedence: this is the outline handler (has "turns"), not the detail
+        # catch-all (which carries "items"/"page" and would 404 on "s1/outline").
+        assert "turns" in outline and "items" not in outline
+        assert isinstance(outline["turns"], list) and outline["turns"]
+
+        # Unknown session → 404.
+        status, _ = _get(port, "/api/conversation/does-not-exist/outline")
+        assert status == 404
+
+        # Privacy gate reused verbatim: LAN hostname + expose=False → 403.
+        status, _ = _get(port, "/api/conversation/s1/outline",
+                         host="machine.local:8789")
+        assert status == 403
+    finally:
+        srv.shutdown()
+
+
 def test_conversation_detail_pagination_threads_query(tmp_path, monkeypatch):
     """The reader's ``?after=``/``?limit=`` cursor must thread through the HTTP
     route. Regression: ``do_GET`` strips the query before dispatch, so the

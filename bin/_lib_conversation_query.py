@@ -393,14 +393,15 @@ def _turn_usage_map(conn, turn_keys):
     return usage
 
 
-def get_conversation(conn, session_id, *, after=None, limit=500):
-    """Reader payload for one session (spec §3.2). Returns None for an unknown
-    session. Dedups logical messages by (session_id, uuid) (canonical = earliest
-    timestamp), groups assistant fragments into turn items by (msg_id, req_id),
-    joins cost once, anchors a turn on its prose-bearing fragment, and exposes
-    every member fragment uuid for jump resolution. Cursor over (timestamp_utc,
-    id); ~500 items/page."""
-    limit = max(1, min(int(limit), 1000))
+def _assemble_session(conn, session_id):
+    """Shared assembly for get_conversation / get_conversation_outline (#177 S5).
+
+    Runs the full dedup → turn-grouping → fold → sweep → meta-classify →
+    cost/usage-stamp pipeline over the WHOLE session and returns the
+    pre-pagination state, so the outline's turns match the reader's items 1:1
+    BY CONSTRUCTION (Codex F8 — one grouping pass, never two implementations).
+    Returns None for an unknown session.
+    """
     exists = conn.execute(
         "SELECT 1 FROM conversation_messages WHERE session_id=? LIMIT 1",
         (session_id,)).fetchone()
@@ -693,6 +694,26 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     for it in items:
         it.pop("_source_tool_use_id", None)
 
+    return {"items": items, "logical": logical,
+            "subagent_meta": subagent_meta, "header_cost": header_cost}
+
+
+def get_conversation(conn, session_id, *, after=None, limit=500):
+    """Reader payload for one session (spec §3.2). Returns None for an unknown
+    session. Dedups logical messages by (session_id, uuid) (canonical = earliest
+    timestamp), groups assistant fragments into turn items by (msg_id, req_id),
+    joins cost once, anchors a turn on its prose-bearing fragment, and exposes
+    every member fragment uuid for jump resolution. Cursor over (timestamp_utc,
+    id); ~500 items/page."""
+    limit = max(1, min(int(limit), 1000))
+    asm = _assemble_session(conn, session_id)
+    if asm is None:
+        return None
+    items = asm["items"]
+    logical = asm["logical"]
+    subagent_meta = asm["subagent_meta"]
+    header_cost = asm["header_cost"]
+
     # Cursor pagination over the item list (anchored to each item's canonical id).
     # A non-None `after` that matches no item's anchor (stale/deleted cursor)
     # yields an EMPTY page — never silently re-serves the head (M1).
@@ -741,6 +762,105 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
         "subagent_meta": subagent_meta,
         "page": {"next_after": next_after, "has_more": has_more},
     }
+
+
+_OUTLINE_LABEL_CAP = 120
+
+
+def _outline_label(text):
+    """First non-blank line, capped at _OUTLINE_LABEL_CAP chars ('' when none)."""
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if s:
+            return s[:_OUTLINE_LABEL_CAP]
+    return ""
+
+
+def _parse_outline_ts(ts):
+    if not ts:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def get_conversation_outline(conn, session_id):
+    """Full-session per-turn skeleton + aggregates (#177 S5, spec §1).
+
+    No pagination — every grouped turn, but only skeleton fields (no inputs,
+    no result bodies, no full prose). `ts` is NULLABLE (Codex F6); stats and
+    every consumer tolerate it. Stats derive from the SAME assembled items the
+    reader pages (Codex F8). Returns None for an unknown session.
+    """
+    asm = _assemble_session(conn, session_id)
+    if asm is None:
+        return None
+    items, logical = asm["items"], asm["logical"]
+    turns = []
+    turn_counts = {"total": 0, "human": 0, "assistant": 0, "tool_result": 0, "meta": 0}
+    tool_counts, models = {}, {}
+    error_count = 0
+    tokens = {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
+    for it in items:
+        kind = it["kind"]
+        turn_counts["total"] += 1
+        if kind in turn_counts:
+            turn_counts[kind] += 1
+        t = {"uuid": it["anchor"]["uuid"], "kind": kind, "ts": it["ts"],
+             "label": _outline_label(it.get("text", "")),
+             "member_uuids": list(it["member_uuids"]),
+             "subagent_key": it["subagent_key"], "parent_uuid": it["parent_uuid"],
+             "is_sidechain": it["is_sidechain"]}
+        tools, thinking = [], []
+        for b in it["blocks"]:
+            bk = b.get("kind")
+            if bk in ("tool_call", "tool_use"):
+                res = b.get("result")
+                err = bool(res and res.get("is_error"))
+                tools.append({"name": b.get("name"), "is_error": err})
+            elif bk == "tool_result":                  # orphan error channel (spec delta b)
+                tools.append({"name": None, "is_error": bool(b.get("is_error"))})
+            elif bk == "thinking":
+                ln = _outline_label(b.get("text", ""))
+                if ln:
+                    thinking.append(ln)
+        for tref in tools:
+            if tref["is_error"]:
+                error_count += 1
+            if tref["name"]:
+                tool_counts[tref["name"]] = tool_counts.get(tref["name"], 0) + 1
+        if tools:
+            t["tools"] = tools
+        if thinking:
+            t["thinking"] = thinking
+        if kind == "assistant":
+            if it.get("model"):
+                t["model"] = it["model"]
+                models[it["model"]] = models.get(it["model"], 0) + 1
+            tok = it.get("tokens")
+            if tok is not None:
+                t["tokens"] = tok
+                for k in tokens:
+                    tokens[k] += tok.get(k, 0)
+        if kind == "meta":
+            t["meta_kind"] = it.get("meta_kind")
+            t["skill_name"] = it.get("skill_name")
+            if not t["label"]:
+                t["label"] = _outline_label(it.get("skill_name") or "")
+        turns.append(t)
+    ts_vals = [r[2] for r in logical if r[2]]
+    d0 = _parse_outline_ts(ts_vals[0] if ts_vals else None)
+    d1 = _parse_outline_ts(ts_vals[-1] if ts_vals else None)
+    duration = int((d1 - d0).total_seconds()) if d0 and d1 else None
+    return {"session_id": session_id,
+            "subagent_meta": asm["subagent_meta"],
+            "stats": {"turns": turn_counts, "tool_counts": tool_counts,
+                      "error_count": error_count, "models": models,
+                      "duration_seconds": duration, "tokens": tokens,
+                      "cost_usd": asm["header_cost"]},
+            "turns": turns}
 
 
 _TASK_TRIO = ("TaskCreate", "TaskUpdate", "TaskList")

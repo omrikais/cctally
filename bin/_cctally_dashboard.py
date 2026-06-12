@@ -5348,6 +5348,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/conversation/") and path.endswith("/media"):
             # #177 S4: on-demand media bytes. Matched BEFORE the <id> reader.
             self._handle_get_conversation_media(path)
+        elif path.startswith("/api/conversation/") and path.endswith("/outline"):
+            # #177 S5: full-session outline skeleton + stats. Matched BEFORE
+            # the <id> reader catch-all (Codex F2 — same precedence as /payload).
+            self._handle_get_conversation_outline(path)
         elif path.startswith("/api/conversation/"):
             self._handle_get_conversation_detail(path)
         else:
@@ -7390,6 +7394,27 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._respond_json(410, {"error": "source no longer available"})
             return
         self._respond_json(200, payload)
+
+    def _handle_get_conversation_outline(self, path: str) -> None:
+        """``GET /api/conversation/<sid>/outline`` — full-session skeleton +
+        session stats (#177 S5). Same fail-closed privacy gate; unknown id → 404.
+        """
+        if not self._require_transcripts_allowed():
+            return
+        import urllib.parse as _u
+        session_id = _u.unquote(path[len("/api/conversation/"):-len("/outline")])
+        if not session_id:
+            self.send_error(404, "conversation not found")
+            return
+        ok, body = self._run_conversation_query(
+            lambda conn: self._conversation_query().get_conversation_outline(conn, session_id),
+            "/api/conversation/outline")
+        if not ok:
+            return
+        if body is None:
+            self.send_error(404, "conversation not found")
+            return
+        self._respond_json(200, body)
 
     _MEDIA_FETCH_SITE_ALLOWED = ("same-origin", "same-site", "none")
 
