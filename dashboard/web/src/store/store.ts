@@ -1,5 +1,5 @@
 import type { AlertEntry, Envelope, SessionRow } from '../types/envelope';
-import type { ConversationJump } from '../types/conversation';
+import type { ConversationJump, SearchKind } from '../types/conversation';
 import {
   applySessionFilter,
   computeSearchMatches,
@@ -266,6 +266,9 @@ export interface UIState {
   view: 'dashboard' | 'conversations';
   selectedConversationId: string | null;
   conversationSearch: string;
+  // #177 S6 — single-select kind facet for the rail search chips. Resets to
+  // 'all' whenever the needle is cleared (SET_CONVERSATION_SEARCH with '').
+  conversationSearchKind: SearchKind;
   conversationJump: ConversationJump | null;
   // #177 S5 — outline panel. `convOutlineOpen` is the only persisted bit of
   // conversation UI state (localStorage `cctally.conv.outlineOpen`, default
@@ -493,6 +496,7 @@ function loadInitial(): UIState {
     view: 'dashboard',
     selectedConversationId: null,
     conversationSearch: '',
+    conversationSearchKind: 'all',
     conversationJump: null,
     convOutlineOpen,
     convFocusMode: 'all',
@@ -604,6 +608,8 @@ export type Action =
   | { type: 'OPEN_CONVERSATION'; sessionId: string; jump?: ConversationJump }
   | { type: 'SELECT_CONVERSATION'; sessionId: string | null }
   | { type: 'SET_CONVERSATION_SEARCH'; text: string }
+  // #177 S6 — rail search kind facet (chips). Clearing the needle resets it.
+  | { type: 'SET_CONVERSATION_SEARCH_KIND'; kind: SearchKind }
   | { type: 'CLEAR_CONVERSATION_JUMP' }
   // #177 S5 — outline panel. TOGGLE_CONV_OUTLINE flips + persists the open
   // flag; SET_CONV_FOCUS_MODE sets the transient per-session focus mode (Task 4
@@ -752,7 +758,7 @@ export function dispatch(action: Action): void {
         view: action.view,
         ...DISMISSED_ON_VIEW_SWITCH,
         ...(action.view === 'dashboard'
-          ? { selectedConversationId: null, conversationJump: null, conversationSearch: '' }
+          ? { selectedConversationId: null, conversationJump: null, conversationSearch: '', conversationSearchKind: 'all' as const }
           : {}),
       };
       break;
@@ -800,7 +806,17 @@ export function dispatch(action: Action): void {
       };
       break;
     case 'SET_CONVERSATION_SEARCH':
-      state = { ...state, conversationSearch: action.text };
+      // #177 S6 — clearing the needle snaps the kind facet back to 'all' so
+      // re-opening search starts on the default facet (a non-empty edit leaves
+      // the active facet alone — the user keeps Tools/Thinking across keystrokes).
+      state = {
+        ...state,
+        conversationSearch: action.text,
+        ...(action.text === '' ? { conversationSearchKind: 'all' as const } : {}),
+      };
+      break;
+    case 'SET_CONVERSATION_SEARCH_KIND':
+      state = { ...state, conversationSearchKind: action.kind };
       break;
     case 'CLEAR_CONVERSATION_JUMP':
       state = { ...state, conversationJump: null };

@@ -224,6 +224,10 @@ export interface ConversationDetail {
   subagent_meta?: Record<string, SubagentMeta>;  // keyed by subagent_key (#166)
 }
 
+// #177 S6 — kind facet for the rail search chips + the find bar. Maps 1:1 to
+// the backend `kind` param (all | prompts | assistant | tools | thinking).
+export type SearchKind = 'all' | 'prompts' | 'assistant' | 'tools' | 'thinking';
+
 export interface SearchHit {
   session_id: string;
   uuid: string;
@@ -232,6 +236,10 @@ export interface SearchHit {
   ts: string;
   snippet: string;
   cost_usd: number;
+  // #177 S6 — non-prose match badges (sorted lowercase; server omits prose).
+  // Always present on the wire (defaults to []); optional here for back-compat
+  // with fixtures predating the field.
+  match_kinds?: ('tool' | 'thinking')[];
 }
 
 export interface ConversationSearchResult {
@@ -239,6 +247,11 @@ export interface ConversationSearchResult {
   mode: 'fts' | 'like';
   hits: SearchHit[];
   total: number;
+  // #177 S6 — additive. `kind` echoes the requested facet; `search_depth`
+  // is 'prose-only' while the one-time index split is still backfilling on
+  // this install (tools/thinking facets return empty there), else 'full'.
+  kind?: SearchKind;
+  search_depth?: 'prose-only' | 'full';
 }
 
 export interface ConversationJump {

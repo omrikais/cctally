@@ -107,6 +107,32 @@ describe('conversation view state', () => {
     expect(getState().conversationSearch).toBe('flock');
   });
 
+  // #177 S6 — kind facet for the rail chips.
+  it('conversationSearchKind defaults to all', () => {
+    expect(getState().conversationSearchKind).toBe('all');
+  });
+
+  it('SET_CONVERSATION_SEARCH_KIND updates the facet', () => {
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'tools' });
+    expect(getState().conversationSearchKind).toBe('tools');
+  });
+
+  it('clearing the search needle resets the kind to all', () => {
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'npm' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'thinking' });
+    expect(getState().conversationSearchKind).toBe('thinking');
+    // An empty-text SET_CONVERSATION_SEARCH (the clear path) snaps kind back.
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' });
+    expect(getState().conversationSearch).toBe('');
+    expect(getState().conversationSearchKind).toBe('all');
+  });
+
+  it('a non-empty SET_CONVERSATION_SEARCH leaves the kind untouched', () => {
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'assistant' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'rerun' });
+    expect(getState().conversationSearchKind).toBe('assistant');
+  });
+
   it('CLEAR_CONVERSATION_JUMP clears only the jump', () => {
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'a', jump: { session_id: 'a', uuid: 'x' } });
     dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });

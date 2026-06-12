@@ -6,7 +6,19 @@ import { useConversationSearch } from '../hooks/useConversationSearch';
 import { renderSnippet } from '../lib/snippet';
 import { railDateBucket } from './railDateBucket';
 import { fmt } from '../lib/fmt';
-import type { ConversationSummary, SearchHit } from '../types/conversation';
+import type { ConversationSummary, SearchHit, SearchKind } from '../types/conversation';
+
+// #177 S6 — kind chip facets. Order matches the Q7 mock (All · Prompts ·
+// Assistant · Tools · Thinking). `Tools`/`Thinking` query the split index
+// columns and disable while the one-time column split is still backfilling
+// (searchDepth === 'prose-only').
+const KIND_CHIPS: { kind: SearchKind; label: string; needsSplit: boolean }[] = [
+  { kind: 'all', label: 'All', needsSplit: false },
+  { kind: 'prompts', label: 'Prompts', needsSplit: false },
+  { kind: 'assistant', label: 'Assistant', needsSplit: false },
+  { kind: 'tools', label: 'Tools', needsSplit: true },
+  { kind: 'thinking', label: 'Thinking', needsSplit: true },
+];
 
 // Browse/search rail for the Conversations workspace (spec §4). When the
 // needle is empty we browse the recent-conversations list (useConversations);
@@ -16,6 +28,7 @@ import type { ConversationSummary, SearchHit } from '../types/conversation';
 // `conv-rail-search` class the view shell's '/' binding focuses.
 export function ConversationRail() {
   const search = useSyncExternalStore(subscribeStore, () => getState().conversationSearch);
+  const kind = useSyncExternalStore(subscribeStore, () => getState().conversationSearchKind);
   const selected = useSyncExternalStore(subscribeStore, () => getState().selectedConversationId);
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
@@ -44,7 +57,7 @@ export function ConversationRail() {
         />
       </div>
       {isSearching
-        ? <SearchList needle={search} ctx={ctx} />
+        ? <SearchList needle={search} kind={kind} ctx={ctx} />
         : <BrowseList selectedId={selected} ctx={ctx} />}
     </aside>
   );
@@ -101,22 +114,72 @@ function BrowseRow({ row, ctx, active }: { row: ConversationSummary; ctx: RailCt
   );
 }
 
-function SearchList({ needle, ctx }: { needle: string; ctx: RailCtx }) {
-  const { hits, mode, loading, error } = useConversationSearch(needle);
-  if (error) return <div className="conv-rail-list"><div className="conv-rail-empty">{error}</div></div>;
-  if (loading && hits.length === 0) return <div className="conv-rail-list"><div className="conv-rail-empty">Searching…</div></div>;
-  if (hits.length === 0) return <div className="conv-rail-list"><div className="conv-rail-empty">No matches.</div></div>;
+// #177 S6 — single-select kind chip row, shown only while a needle is active.
+// `Tools`/`Thinking` disable while the split index is still backfilling.
+function KindChips({ kind, proseOnly }: { kind: SearchKind; proseOnly: boolean }) {
+  return (
+    <div className="conv-rail-chips" role="radiogroup" aria-label="Search kind">
+      {KIND_CHIPS.map((c) => {
+        const disabled = c.needsSplit && proseOnly;
+        const checked = kind === c.kind;
+        return (
+          <button
+            key={c.kind}
+            type="button"
+            role="radio"
+            aria-checked={checked}
+            disabled={disabled}
+            title={disabled ? 'indexing…' : undefined}
+            className={`conv-rail-chip${checked ? ' is-on' : ''}`}
+            onClick={() => dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: c.kind })}
+          >
+            {c.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function SearchList({ needle, kind, ctx }: { needle: string; kind: SearchKind; ctx: RailCtx }) {
+  const { hits, mode, total, loading, loadingMore, searchDepth, error, loadMore } =
+    useConversationSearch(needle, kind);
+  const proseOnly = searchDepth === 'prose-only';
+  const remaining = total - hits.length;
+  // Count line: "No results" / "{total} results" / "{total} results · basic search".
+  const countText =
+    total === 0 ? 'No results' : `${total} results${mode === 'like' ? ' · basic search' : ''}`;
   return (
     <div className="conv-rail-list">
-      {mode === 'like' && <div className="conv-rail-hint">(basic search)</div>}
-      {hits.map((h, i) => (
-        <SearchRow key={`${h.session_id}-${h.uuid}-${i}`} hit={h} ctx={ctx} />
-      ))}
+      <KindChips kind={kind} proseOnly={proseOnly} />
+      {error
+        ? <div className="conv-rail-empty">{error}</div>
+        : loading && hits.length === 0
+          ? <div className="conv-rail-empty">Searching…</div>
+          : (
+            <>
+              <div className="conv-rail-count" aria-live="polite">{countText}</div>
+              {hits.map((h, i) => (
+                <SearchRow key={`${h.session_id}-${h.uuid}-${i}`} hit={h} ctx={ctx} />
+              ))}
+              {hits.length < total && (
+                <button
+                  type="button"
+                  className="conv-rail-more"
+                  disabled={loadingMore}
+                  onClick={() => loadMore()}
+                >
+                  Load {Math.min(50, remaining)} more ({remaining} remaining)
+                </button>
+              )}
+            </>
+          )}
     </div>
   );
 }
 
 function SearchRow({ hit, ctx }: { hit: SearchHit; ctx: RailCtx }) {
+  const badges = hit.match_kinds ?? [];
   return (
     <button
       type="button"
@@ -129,7 +192,16 @@ function SearchRow({ hit, ctx }: { hit: SearchHit; ctx: RailCtx }) {
         })
       }
     >
-      <div className="conv-rail-row-title">{hit.title}</div>
+      <div className="conv-rail-row-title">
+        <span className="conv-rail-row-title-text">{hit.title}</span>
+        {badges.length > 0 && (
+          <span className="conv-rail-kindbs">
+            {badges.map((b) => (
+              <span key={b} className="conv-rail-kindb">{b}</span>
+            ))}
+          </span>
+        )}
+      </div>
       <div className="conv-rail-row-meta">
         <span className="conv-rail-row-project">{hit.project_label || '—'}</span>
         <span className="conv-rail-row-when">{fmt.startedShort(hit.ts, ctx, { noSuffix: true })}</span>
