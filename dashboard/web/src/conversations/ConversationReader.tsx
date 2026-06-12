@@ -81,12 +81,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const [focusedIndex, setFocusedIndex] = useState(0);
   const focusedIndexRef = useRef(0);
   focusedIndexRef.current = focusedIndex;
-  // #177 S5 — the focus-mode remap keys off the PREVIOUS render's filtered list:
-  // when the mode changes, we resolve the formerly-focused node's uuid and find
-  // it (or the nearest following node) in the new list. `prevVisibleRef` is
-  // updated in a post-render effect AFTER the remap reads it, so the remap sees
-  // the list the user was actually looking at.
-  const prevVisibleRef = useRef<ReturnType<typeof applyFocusMode>>([]);
+  // #177 S5 — the focus-mode remap keys off the PREVIOUS render's RENDERED-NODE
+  // list (`nodes` = what the thread actually paints: filtered turns + hidden_run
+  // markers + time markers). `focusedIndex` indexes thread.children = nodes-space,
+  // so the remap must read its prev list AND compute its target in nodes-space
+  // too — a marker-less `visible` list would mis-resolve `prevNodesRef[cur]`
+  // (and the target) by the count of any markers that precede the cursor.
+  // `prevNodesRef` is updated in a post-render effect AFTER the remap reads it,
+  // so the remap sees the list the user was actually looking at.
+  const prevNodesRef = useRef<ReturnType<typeof insertTimeMarkers>>([]);
   const threadRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   // Stable mirrors so the `useMemo(() => [...], [])` keymap array never churns.
@@ -484,39 +487,54 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   }, [focusedIndex, visible]);
 
   // #177 S5 §5 (Codex F5) — focus-coherence remap. When the mode changes the
-  // rendered list reshuffles (turns vanish, hidden_run markers appear), so the
-  // raw index no longer points at the same turn. Resolve the formerly-focused
-  // node's uuid in the OLD list, then find that uuid in the NEW `visible`; if it
-  // was suppressed, land on the nearest FOLLOWING node by original order;
-  // failing that, clamp to the last index. Skips markers. Keyed on focusMode
-  // only — runs once per switch, reading prevVisibleRef (the pre-switch list).
+  // rendered list reshuffles (turns vanish, hidden_run markers appear, time
+  // markers recompute), so the raw index no longer points at the same turn.
+  // Everything here is RENDERED-NODE space (`nodes` / `prevNodesRef`) — the same
+  // space `focusedIndex` indexes thread.children in — so markers that precede the
+  // cursor never offset the resolution. Resolve the formerly-focused node's uuid
+  // in the OLD `nodes` list, then find that uuid in the NEW `nodes`; if it was
+  // suppressed, land on the nearest FOLLOWING turn by original order; failing
+  // that, clamp to the last index. Markers (time_marker + hidden_run) carry no
+  // turn uuid, so they're never targets and the nudge below skips them. Keyed on
+  // focusMode only — runs once per switch, reading prevNodesRef (the pre-switch
+  // rendered list).
   useEffect(() => {
-    const prev = prevVisibleRef.current;
+    const prev = prevNodesRef.current;
     const cur = focusedIndexRef.current;
     const prevNode = prev[cur];
     if (!prevNode) return;
-    const wantUuid = nodeUuid(prevNode);
-    // 1. Same uuid present in the new list?
-    let target = visible.findIndex((n) => nodeUuid(n) === wantUuid);
+    // Markers have no anchor uuid — `null` so they never match a node and never
+    // satisfy the nearest-following walk (a marker can never be a focus target).
+    const uuidOf = (n: (typeof nodes)[number]): string | null =>
+      n.kind === 'time_marker' ? null : nodeUuid(n);
+    const wantUuid = uuidOf(prevNode);
+    // 1. Same uuid present in the new list? (null wantUuid — the cursor was on a
+    //    marker, which can't happen via stepFocus — falls through to step 3.)
+    let target = wantUuid == null ? -1 : nodes.findIndex((n) => uuidOf(n) === wantUuid);
     // 2. Else the nearest FOLLOWING node by original order: walk the old list
     //    forward from the focused position, taking the first node whose uuid
     //    survives into the new list.
     if (target < 0) {
       for (let i = cur + 1; i < prev.length; i++) {
-        const u = nodeUuid(prev[i]);
-        const hit = visible.findIndex((n) => nodeUuid(n) === u);
+        const u = uuidOf(prev[i]);
+        if (u == null) continue;
+        const hit = nodes.findIndex((n) => uuidOf(n) === u);
         if (hit >= 0) { target = hit; break; }
       }
     }
     // 3. Else clamp to the last index.
-    if (target < 0) target = visible.length - 1;
+    if (target < 0) target = nodes.length - 1;
     // Never land on a marker — nudge forward then backward to the first real
-    // turn (a run can sit between two keepers, so search both ways).
-    const isMarker = (i: number) => visible[i]?.kind === 'hidden_run';
+    // turn (a hidden_run / time marker can sit between two keepers, so search
+    // both ways).
+    const isMarker = (i: number) => {
+      const n = nodes[i];
+      return n != null && (n.kind === 'time_marker' || n.kind === 'hidden_run');
+    };
     if (target >= 0 && isMarker(target)) {
       let t = target;
-      while (t < visible.length && isMarker(t)) t++;
-      if (t >= visible.length) { t = target; while (t >= 0 && isMarker(t)) t--; }
+      while (t < nodes.length && isMarker(t)) t++;
+      if (t >= nodes.length) { t = target; while (t >= 0 && isMarker(t)) t--; }
       target = t;
     }
     if (target < 0) target = 0;
@@ -524,12 +542,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusMode]);
 
-  // Post-render snapshot of the filtered list for the next remap. Declared AFTER
-  // the remap effect so a focus-mode switch lets the remap read the PRE-switch
-  // list before this overwrites it (React runs effects in declaration order).
+  // Post-render snapshot of the rendered-node list for the next remap. Declared
+  // AFTER the remap effect so a focus-mode switch lets the remap read the
+  // PRE-switch list before this overwrites it (React runs effects in declaration
+  // order).
   useEffect(() => {
-    prevVisibleRef.current = visible;
-  }, [visible]);
+    prevNodesRef.current = nodes;
+  }, [nodes]);
 
   // G3 bindings. A `useMemo(() => [...], [])`-stable array (identity never
   // churns) whose action closures read refs — so a cursor step or a pagination

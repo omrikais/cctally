@@ -931,6 +931,57 @@ describe('ConversationReader focus modes (#177 S5 §5)', () => {
     press('k');
     expect(thread.querySelector('.conv-item--focused')!.classList.contains('conv-hidden-run')).toBe(false);
   });
+
+  // Regression (cross-branch P2): the remap target must resolve in RENDERED-NODE
+  // space (`nodes` = what the thread actually renders, time markers AND
+  // hidden_run markers included), NOT the marker-less `visible` space. The
+  // focused cursor (`focusedIndex`) indexes thread.children = nodes-space, so
+  // both the prev-list it reads AND the target it computes must live in
+  // nodes-space too. When time markers precede the focused turn in the PRIOR
+  // render, the old visible-space `prevVisibleRef[focusedIndex]` reads the wrong
+  // slot (or undefined → the remap bails and leaves focusedIndex dangling past
+  // the new child count → focus blanks entirely).
+  it('remaps focus in rendered-node space when time markers precede the target', async () => {
+    // h1 @14:00 (human), a1 @14:20 (tool-only assistant → hidden in prompts),
+    // h2 @14:40 (human). ≥10-min gaps mean a time marker precedes BOTH a1 and h2.
+    //   ALL nodes:    [h1, marker, a1, marker, h2]            (h2 at index 4)
+    //   ALL visible:  [h1, a1, h2]                            (h2 at index 2)
+    //   PROMPTS nodes:[h1, hidden_run, marker(h1→h2 40min), h2] (h2 at index 3)
+    // The cursor on h2 is nodes-index 4; a visible-space prev list (length 3)
+    // has no [4], so the buggy remap bails and focus is lost on the switch.
+    const { thread, container } = await renderWithOutline(
+      [
+        makeItem({ uuid: 'h1', kind: 'human', text: 'hi', ts: '2026-06-12T14:00:00Z' } as never),
+        makeItem({ uuid: 'a1', kind: 'assistant', text: '', model: 'm', cost_usd: 0,
+          ts: '2026-06-12T14:20:00Z',
+          blocks: [{ kind: 'tool_call', name: 'Read', input_summary: '{}', preview: '/a',
+            tool_use_id: 't', result: { text: 'ok', truncated: false, is_error: false } }] } as never),
+        makeItem({ uuid: 'h2', kind: 'human', text: 'bye', ts: '2026-06-12T14:40:00Z' } as never),
+      ],
+      baseOutline([
+        oTurn({ uuid: 'h1', kind: 'human' }),
+        oTurn({ uuid: 'a1', kind: 'assistant' }),
+        oTurn({ uuid: 'h2', kind: 'human' }),
+      ]),
+    );
+    // ALL mode renders a time marker before a1 AND before h2.
+    await waitFor(() => expect(container.querySelectorAll('.conv-time-marker')).toHaveLength(2));
+    // Focus h2 (the later turn). stepFocus skips markers: h1→a1→(skip)→h2.
+    press('j'); // a1
+    press('j'); // h2 (marker skipped)
+    expect(thread.querySelector('.conv-item--focused')!.getAttribute('data-uuid')).toBe('h2');
+    // Switch to prompts: a1 collapses into a hidden_run; the 40-min h1→h2 gap
+    // inserts a time marker BEFORE h2. The remap must still land focus on h2 —
+    // resolved in nodes-space — never a marker, never blank.
+    act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' }); });
+    await waitFor(() => expect(thread.querySelector('.conv-hidden-run')).not.toBeNull());
+    const focused = thread.querySelector('.conv-item--focused');
+    expect(focused).not.toBeNull();
+    expect((focused as HTMLElement).dataset.convMarker).toBeUndefined();
+    expect(focused!.classList.contains('conv-time-marker')).toBe(false);
+    expect(focused!.classList.contains('conv-hidden-run')).toBe(false);
+    expect(focused!.getAttribute('data-uuid')).toBe('h2');
+  });
 });
 
 describe('ConversationReader jump-to-next keys (#177 S5 §4)', () => {
