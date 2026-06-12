@@ -5,6 +5,8 @@ import { useKeymap } from '../hooks/useKeymap';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { groupSidechains, type RenderNode } from './groupSidechains';
 import { isSystemMarker } from './systemMarkers';
+import { FindBar } from './FindBar';
+import { HighlightContext } from './HighlightContext';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
 import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon } from './ConvIcons';
@@ -49,6 +51,14 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // seeds jump-to-next.
   const focusMode = useSyncExternalStore(subscribeStore, () => getState().convFocusMode);
   const currentTurnUuid = useSyncExternalStore(subscribeStore, () => getState().convCurrentTurnUuid);
+  // #177 S6 — the floating in-conversation find bar. `convFindOpen` gates its
+  // render + the n/N step bindings. `findTerms` is the debounced needle split
+  // into highlight terms (null when the bar is closed → no prose marks).
+  const convFindOpen = useSyncExternalStore(subscribeStore, () => getState().convFindOpen);
+  const [findTerms, setFindTerms] = useState<string[] | null>(null);
+  // Live closure to the find bar's cursor stepper (n/N drive it while the bar
+  // is open + the input is blurred). FindBar assigns its `step` here each render.
+  const findStepRef = useRef<((delta: number) => void) | null>(null);
   const reduced = useReducedMotion();
   const sentinelRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -109,6 +119,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   focusModeRef.current = focusMode;
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
+  // #177 S6 — live mirror so the stable n/N keymap closures read the open flag
+  // without re-registering the keymap array.
+  const convFindOpenRef = useRef(convFindOpen);
+  convFindOpenRef.current = convFindOpen;
 
   // #175 F4 — live-tail scroll behavior. `atBottomRef` tracks whether the user
   // is parked at the bottom (updated on every scroll). `prevLenRef`/`prevHasMoreRef`
@@ -310,6 +324,14 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       if (cancelled) return;
       const el = itemRefs.current.get(jump.uuid);
       if (el) {
+        // #177 S6 — a find jump whose anchor matched in a tool/thinking block
+        // opens the target turn's collapsed disclosures BEFORE scrolling (the
+        // client can't know which disclosure holds the needle, so all of the
+        // turn's `<details>` open — bounded + predictable). Other jumps
+        // (search-hit click, outline, jump-to-next) leave expand_details unset.
+        if (jump.expand_details) {
+          el.querySelectorAll('details:not([open])').forEach((d) => { (d as HTMLDetailsElement).open = true; });
+        }
         // #184 — a jump centers the target (`block: 'center'`), but the
         // scroll-sync observer highlights the TOPMOST visible turn. So right
         // after a jump the OutlinePanel's aria-current may sit a turn or two
@@ -319,6 +341,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         // would fight the topmost-visible contract every other scroll honors.
         el.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'center' });
         el.classList.add('conv-item--jumped');
+        // #177 S6 — sync the keyboard cursor to the jumped element so j/k (and
+        // find's n/N) resume from the match. The jumped element is a direct
+        // thread child; find its index there (mirrors the outline-jump intent
+        // of landing focus on the target).
+        const thread = threadRef.current;
+        if (thread) {
+          const idx = Array.prototype.indexOf.call(thread.children, el);
+          if (idx >= 0) setFocusedIndex(idx);
+        }
         if (highlightTimerRef.current != null) window.clearTimeout(highlightTimerRef.current);
         highlightTimerRef.current = window.setTimeout(() => {
           el.classList.remove('conv-item--jumped');
@@ -672,6 +703,26 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const jumpNextRef = useRef(jumpNext);
   jumpNextRef.current = jumpNext;
 
+  // #177 S6 — the find bar reports its DEBOUNCED needle here; split into
+  // highlight terms (whitespace-split, empties dropped) for the prose marks.
+  // Stable identity so FindBar's onTermsChange effect doesn't re-fire per render.
+  const onFindTermsChange = useCallback((terms: string) => {
+    const split = terms.split(/\s+/).filter(Boolean);
+    setFindTerms(split.length ? split : null);
+  }, []);
+
+  // #177 S6 — close-restore: return keyboard focus to the thread so j/k resume.
+  const onFindClose = useCallback(() => {
+    setFindTerms(null);
+    threadRef.current?.focus?.();
+  }, []);
+
+  // #177 S6 — drop highlight terms whenever the bar closes (e.g. a session
+  // switch closes find via the store) so stale marks don't linger.
+  useEffect(() => {
+    if (!convFindOpen) setFindTerms(null);
+  }, [convFindOpen]);
+
   // `v` cycles the focus mode all → chat → prompts → errors → all.
   const cycleFocusMode = useCallback(() => {
     const order: FocusMode[] = ['all', 'chat', 'prompts', 'errors'];
@@ -704,6 +755,19 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         mk('p', () => jumpNextRef.current('plan', 1)),
         mk('P', () => jumpNextRef.current('plan', -1)),
         mk('v', () => cycleFocusMode()),
+        // #177 S6 — n/N step the find-bar matches, but ONLY while the bar is
+        // open (the input-blurred case; the focused input owns Enter/Shift+Enter
+        // itself). `guard` already excludes input-mode + open modals.
+        {
+          key: 'n', scope: 'global' as const, view: 'conversations' as const,
+          when: () => guard() && convFindOpenRef.current,
+          action: () => findStepRef.current?.(1),
+        },
+        {
+          key: 'N', scope: 'global' as const, view: 'conversations' as const,
+          when: () => guard() && convFindOpenRef.current,
+          action: () => findStepRef.current?.(-1),
+        },
       ];
     },
     // Actions are stable (refs-only), so the array is built once. The lint
@@ -787,7 +851,19 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           >☰ Outline</button>
         </div>
       </div>
+      {/* #177 S6 — the floating in-conversation find bar. Absolutely
+          positioned top-right inside the reader column (zero layout shift). The
+          stepRef wires its cursor to the reader's n/N bindings. */}
+      {convFindOpen && (
+        <FindBar
+          sessionId={sessionId}
+          onClose={onFindClose}
+          onTermsChange={onFindTermsChange}
+          stepRef={findStepRef}
+        />
+      )}
       <div className="conv-reader-body" ref={bodyRef} onScroll={onBodyScroll}>
+        <HighlightContext.Provider value={findTerms}>
         <TranscriptContext.Provider value={transcriptCtx}>
         <div className="conv-reader-thread" ref={threadRef}>
           {nodes.map((g, idx) => {
@@ -886,6 +962,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           })}
         </div>
         </TranscriptContext.Provider>
+        </HighlightContext.Provider>
         {hasMore && <div ref={sentinelRef} className="conv-load-sentinel">Loading more…</div>}
       </div>
       {/* #175 F4 — "↓ N new" pill. A child of .conv-reader (NOT the scrolling

@@ -257,6 +257,37 @@ export interface ConversationSearchResult {
 export interface ConversationJump {
   session_id: string;
   uuid: string;
+  // #177 S6 — when the matched anchor carried a tool/thinking match the find
+  // bar sets this so the reader opens the target turn's collapsed <details>
+  // disclosures before scrolling (the client can't know which disclosure holds
+  // the needle, so it opens them all — bounded + predictable). Absent on every
+  // other jump (search-hit click, outline jump, jump-to-next): the reader's
+  // jump effect only expands when this is truthy.
+  expand_details?: boolean;
+}
+
+// #177 S6 — one rendered-turn anchor for the in-conversation find bar.
+// `uuid` is the rendered item's anchor uuid (directly in the reader's
+// itemRefs — no member resolution needed); `match_kinds` aggregates the
+// non-prose match labels across the turn's matched member rows (sorted
+// lowercase; empty for a prose-only match).
+export interface FindAnchor {
+  uuid: string;
+  match_kinds: ('tool' | 'thinking')[];
+}
+
+// #177 S6 — GET /api/conversation/<id>/find response. Bound field-for-field
+// to find_in_conversation in bin/_lib_conversation_query.py. `anchors` are
+// document-ordered; `total` counts rendered-turn anchors PRE-cap (the list
+// caps at 500 with `anchors_truncated: true`). `search_depth` mirrors the
+// rail search interim signal (tools/thinking facets return empty anchors
+// while 'prose-only').
+export interface ConversationFindResult {
+  anchors: FindAnchor[];
+  total: number;
+  anchors_truncated: boolean;
+  mode: 'fts' | 'like';
+  search_depth: 'prose-only' | 'full';
 }
 
 // #178 on-demand "load full" route response, discriminated on `which` (spec

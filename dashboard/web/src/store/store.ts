@@ -277,6 +277,10 @@ export interface UIState {
   convOutlineOpen: boolean;
   convFocusMode: 'all' | 'chat' | 'prompts' | 'errors';
   convCurrentTurnUuid: string | null;
+  // #177 S6 — the floating in-conversation find bar (Cmd+F style). Transient:
+  // opened by '/' over an open reader, closed on Esc / its ✕ / a genuine
+  // session switch. Never persists.
+  convFindOpen: boolean;
   openModal: ModalKind | null;
   openSessionId: string | null;
   openBlockStartAt: string | null;
@@ -501,6 +505,7 @@ function loadInitial(): UIState {
     convOutlineOpen,
     convFocusMode: 'all',
     convCurrentTurnUuid: null,
+    convFindOpen: false,
     openModal: null,
     openSessionId: null,
     openBlockStartAt: null,
@@ -618,6 +623,9 @@ export type Action =
   | { type: 'TOGGLE_CONV_OUTLINE' }
   | { type: 'SET_CONV_FOCUS_MODE'; mode: UIState['convFocusMode'] }
   | { type: 'SET_CONV_CURRENT_TURN'; uuid: string | null }
+  // #177 S6 — the in-conversation find bar open flag.
+  | { type: 'OPEN_CONV_FIND' }
+  | { type: 'CLOSE_CONV_FIND' }
   | { type: 'SET_FILTER'; text: string }
   | { type: 'SET_SEARCH'; text: string }
   | { type: 'SET_SEARCH_MATCHES'; matches: number[]; index: number }
@@ -788,8 +796,12 @@ export function dispatch(action: Action): void {
         ...DISMISSED_ON_VIEW_SWITCH,
         selectedConversationId: action.sessionId,
         conversationJump: action.jump ?? null,
+        // #177 S6 — a GENUINE session switch closes the find bar (its anchor
+        // list is session-scoped + point-in-time, so it's stale for the new
+        // conversation). A same-session OPEN_CONVERSATION (an in-session find
+        // step dispatches one with a jump) leaves it open so the cursor lives.
         ...(switched
-          ? { convFocusMode: 'all' as const, convCurrentTurnUuid: null }
+          ? { convFocusMode: 'all' as const, convCurrentTurnUuid: null, convFindOpen: false }
           : {}),
       };
       break;
@@ -834,6 +846,12 @@ export function dispatch(action: Action): void {
     }
     case 'SET_CONV_FOCUS_MODE':
       state = { ...state, convFocusMode: action.mode };
+      break;
+    case 'OPEN_CONV_FIND':
+      state = { ...state, convFindOpen: true };
+      break;
+    case 'CLOSE_CONV_FIND':
+      state = { ...state, convFindOpen: false };
       break;
     case 'SET_CONV_CURRENT_TURN':
       if (state.convCurrentTurnUuid === action.uuid) break; // no-op: avoid a needless emit on each observer tick

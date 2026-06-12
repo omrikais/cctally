@@ -1268,3 +1268,87 @@ describe('ConversationReader scroll-sync producer (#177 S5 §3 / #184)', () => {
     expect(getState().convCurrentTurnUuid).toBe('h1');
   });
 });
+
+// #177 S6 — reader-level wiring of the in-conversation find bar: find →
+// jump → disclosure-expand. Parent-level integration (the modal-integration
+// precedent): a mocked /find response whose anchor matched in a tool block,
+// the target turn carrying a COLLAPSED <details>; opening find, typing, and
+// pressing Enter must (a) dispatch the jump with expand_details, (b) open the
+// turn's <details>, (c) flash it with conv-item--jumped.
+describe('ConversationReader in-conversation find', () => {
+  // A tool_call block renders a CLOSED <details className="conv-chip--tool">.
+  function detailWithTool() {
+    const assistant: ConversationItem = {
+      kind: 'assistant',
+      anchor: { session_id: 's', uuid: 'a1', id: 2 },
+      member_uuids: ['a1'],
+      ts: 't',
+      text: '',
+      blocks: [
+        {
+          kind: 'tool_call', name: 'Bash', input_summary: 'rg needle',
+          preview: 'rg needle', tool_use_id: 'tu1',
+          result: { text: 'found needle', truncated: false, is_error: false },
+        },
+      ],
+      model: 'claude-opus-4',
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+      cost_usd: 0.01,
+    } as ConversationItem;
+    return detail([makeItem({ uuid: 'h1', text: 'opening prompt' }), assistant]);
+  }
+
+  function installFindRoutedFetch(findBody: unknown) {
+    globalThis.fetch = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      const body = u.includes('/find') ? findBody : detailWithTool();
+      return { ok: true, status: 200, json: async () => body } as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  it('typing + Enter jumps to the matched turn, opens its collapsed details, and flashes it', async () => {
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    installFindRoutedFetch({
+      anchors: [{ uuid: 'a1', match_kinds: ['tool'] }],
+      total: 1, anchors_truncated: false, mode: 'fts', search_depth: 'full',
+    });
+    installGlobalKeydown();
+    // Land on the session so OPEN_CONVERSATION jumps are same-session (find stays open).
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="a1"]')).not.toBeNull());
+
+    // The matched turn's tool disclosure starts CLOSED.
+    const det = container.querySelector('[data-uuid="a1"] details.conv-chip--tool') as HTMLDetailsElement;
+    expect(det).not.toBeNull();
+    expect(det.open).toBe(false);
+
+    // Open the find bar (the '/' rebind dispatches this; here we drive the store
+    // directly to keep the test reader-scoped).
+    act(() => { dispatch({ type: 'OPEN_CONV_FIND' }); });
+    const input = await waitFor(() => {
+      const el = container.querySelector<HTMLInputElement>('.conv-findbar-input');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+
+    // Type a needle → debounced find fetch → one anchor.
+    fireEvent.change(input, { target: { value: 'needle' } });
+    await waitFor(() => expect(container.querySelector('.conv-findbar-count')!.textContent).toContain('1 / 1'));
+
+    // Enter steps to the (only) anchor and jumps with expand_details (tool match).
+    act(() => { fireEvent.keyDown(input, { key: 'Enter' }); });
+    expect(getState().conversationJump).toEqual({ session_id: 's', uuid: 'a1', expand_details: true });
+
+    // The jump effect opens the disclosure, scrolls, and flashes the turn.
+    await waitFor(() => expect((container.querySelector('[data-uuid="a1"] details.conv-chip--tool') as HTMLDetailsElement).open).toBe(true));
+    expect(scrollSpy).toHaveBeenCalled();
+    await waitFor(() => {
+      const target = container.querySelector('[data-uuid="a1"]')!;
+      expect(target.classList.contains('conv-item--jumped')).toBe(true);
+    });
+  });
+});

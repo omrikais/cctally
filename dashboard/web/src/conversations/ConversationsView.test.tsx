@@ -427,6 +427,62 @@ describe('Conversations workspace integration', () => {
     localStorage.removeItem('cctally.conv.outlineOpen');
   });
 
+  // #177 S6 — the '/' rebind matrix (F8). Reader open → opens find; no reader →
+  // focuses the rail search input; modal open → neither (guard suppresses it).
+  it('12: "/" opens the find bar when a reader is open', async () => {
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('.conv-reader-head')).not.toBeNull());
+
+    expect(getState().convFindOpen).toBe(false);
+    act(() => { fireEvent.keyDown(document, { key: '/' }); });
+    expect(getState().convFindOpen).toBe(true);
+    await waitFor(() => expect(document.querySelector('.conv-findbar')).not.toBeNull());
+  });
+
+  it('13: "/" with no conversation open focuses the rail search input (does NOT open find)', async () => {
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('.conv-rail-search-input')).not.toBeNull());
+
+    expect(getState().selectedConversationId).toBeNull();
+    act(() => { fireEvent.keyDown(document, { key: '/' }); });
+    expect(getState().convFindOpen).toBe(false);
+    expect(document.activeElement).toBe(document.querySelector('.conv-rail-search-input'));
+  });
+
+  it('14: "/" is inert while a modal is open (guard)', async () => {
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('.conv-reader-head')).not.toBeNull());
+    act(() => { dispatch({ type: 'OPEN_MODAL', kind: 'forecast' }); });
+
+    act(() => { fireEvent.keyDown(document, { key: '/' }); });
+    expect(getState().convFindOpen).toBe(false);
+  });
+
+  it('15: Esc in the find input closes find WITHOUT exiting the conversations view (no global Esc leak)', async () => {
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('.conv-reader-head')).not.toBeNull());
+
+    act(() => { fireEvent.keyDown(document, { key: '/' }); });
+    const input = await waitFor(() => {
+      const el = document.querySelector<HTMLInputElement>('.conv-findbar-input');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    // Esc on the FIND input must close find but keep us in the conversations view
+    // (the input stops propagation, so the view-level global Esc never fires).
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(getState().convFindOpen).toBe(false);
+    expect(getState().view).toBe('conversations');
+  });
+
   it('8: an SSE tick carrying transcriptsEnabled keeps the switcher; a tick omitting it hides it (SSE envelopes must carry the gate)', () => {
     // Bootstrap (the /api/data shape): switcher shown.
     updateSnapshot(baseEnvelope(true, '2026-05-13T10:00:00Z'));

@@ -88,8 +88,16 @@ export function ConversationsView() {
 const inView = () => !getState().openModal && getState().inputMode === null;
 const CONVERSATIONS_BINDINGS = [
   {
+    // #177 S6 (F8) — '/' is reader-aware. With an open reader it opens the
+    // floating in-conversation find bar; with no conversation selected it keeps
+    // its rail-focus behavior. The `inView` guard (no open modal + no active
+    // input mode) gates both, per the global-hotkeys-need-modal-guard rule.
     key: '/', scope: 'global' as const, view: 'conversations' as const, when: inView,
     action: () => {
+      if (getState().selectedConversationId) {
+        dispatch({ type: 'OPEN_CONV_FIND' });
+        return;
+      }
       const el = document.querySelector<HTMLInputElement>('.conv-rail-search input');
       el?.focus(); el?.select();
     },

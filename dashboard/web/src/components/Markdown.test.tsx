@@ -1,6 +1,7 @@
 import { render } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { Markdown } from './Markdown';
+import { HighlightContext } from '../conversations/HighlightContext';
 
 describe('Markdown', () => {
   it('renders gfm tables', () => {
@@ -41,5 +42,58 @@ describe('Markdown', () => {
     const { container } = render(<Markdown>{'```ts\nconst x = 1;\n```'}</Markdown>);
     expect(container.querySelector('.codeblock')).not.toBeNull();
     expect(container.querySelectorAll('pre').length).toBe(1); // no <pre><pre> nesting
+  });
+
+  // ---- #177 S6: find-term <mark> highlighting via HighlightContext ----
+
+  function renderWithTerms(terms: string[] | null, md: string) {
+    return render(
+      <HighlightContext.Provider value={terms}>
+        <Markdown>{md}</Markdown>
+      </HighlightContext.Provider>,
+    );
+  }
+
+  it('wraps matching terms in <mark> in prose', () => {
+    const { container } = renderWithTerms(['flock'], 'the flock serializes writers');
+    const marks = container.querySelectorAll('mark');
+    expect(marks).toHaveLength(1);
+    expect(marks[0].textContent).toBe('flock');
+  });
+
+  it('is case-insensitive', () => {
+    const { container } = renderWithTerms(['flock'], 'The FLOCK and the Flock');
+    const marks = Array.from(container.querySelectorAll('mark')).map((m) => m.textContent);
+    expect(marks).toEqual(['FLOCK', 'Flock']);
+  });
+
+  it('marks every term in a multi-term query', () => {
+    const { container } = renderWithTerms(['npm', 'build'], 'run npm build now');
+    const marks = Array.from(container.querySelectorAll('mark')).map((m) => m.textContent);
+    expect(marks).toContain('npm');
+    expect(marks).toContain('build');
+  });
+
+  it('does NOT mark terms inside a fenced code block', () => {
+    const { container } = renderWithTerms(['flock'], '```\nflock here\n```');
+    expect(container.querySelector('pre')).not.toBeNull();
+    expect(container.querySelector('mark')).toBeNull();
+  });
+
+  it('does NOT mark terms inside inline code', () => {
+    const { container } = renderWithTerms(['flock'], 'use the `flock` call');
+    expect(container.querySelector('code')).not.toBeNull();
+    expect(container.querySelector('mark')).toBeNull();
+  });
+
+  it('null context is a zero-overhead passthrough (no marks)', () => {
+    const { container } = renderWithTerms(null, 'the flock serializes writers');
+    expect(container.querySelector('mark')).toBeNull();
+    expect(container.textContent).toContain('the flock serializes writers');
+  });
+
+  it('empty term list is a passthrough (no marks)', () => {
+    const { container } = renderWithTerms([], 'the flock serializes writers');
+    expect(container.querySelector('mark')).toBeNull();
   });
 });

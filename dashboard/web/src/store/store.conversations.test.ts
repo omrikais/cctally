@@ -140,6 +140,38 @@ describe('conversation view state', () => {
     expect(getState().selectedConversationId).toBe('a');
   });
 
+  // #177 S6 — in-conversation find bar open flag.
+  it('convFindOpen defaults to false', () => {
+    expect(getState().convFindOpen).toBe(false);
+  });
+
+  it('OPEN_CONV_FIND / CLOSE_CONV_FIND toggle the flag', () => {
+    dispatch({ type: 'OPEN_CONV_FIND' });
+    expect(getState().convFindOpen).toBe(true);
+    dispatch({ type: 'CLOSE_CONV_FIND' });
+    expect(getState().convFindOpen).toBe(false);
+  });
+
+  it('a genuine session switch via OPEN_CONVERSATION closes an open find bar', () => {
+    _resetForTests();
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc' });
+    dispatch({ type: 'OPEN_CONV_FIND' });
+    expect(getState().convFindOpen).toBe(true);
+    // Switching to a DIFFERENT session closes find (its anchors are stale).
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'def' });
+    expect(getState().convFindOpen).toBe(false);
+  });
+
+  it('a same-session OPEN_CONVERSATION (in-session jump) leaves find open', () => {
+    _resetForTests();
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc' });
+    dispatch({ type: 'OPEN_CONV_FIND' });
+    // An in-session find step dispatches a same-session OPEN_CONVERSATION with a
+    // jump — find must stay open so the next/prev cursor survives.
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc', jump: { session_id: 'abc', uuid: 'u9' } });
+    expect(getState().convFindOpen).toBe(true);
+  });
+
   it('view state does not persist across loadInitial', () => {
     dispatch({ type: 'SET_VIEW', view: 'conversations' });
     _resetForTests();

@@ -5117,6 +5117,99 @@ mark.current {
   line-height: 1.4;
 }
 
+/* ---- #177 S6: floating in-conversation find bar ------------------- */
+/* A Cmd+F-style pill, absolutely positioned top-right INSIDE the reader column
+   (.conv-reader is position:relative). Zero layout shift; floats over the body.
+   Dark scheme per the Q6 mock. */
+.conv-findbar {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100% - 24px);
+  padding: 5px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--panel-bg-2);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+.conv-findbar-input {
+  width: 180px;
+  min-width: 90px;
+  box-sizing: border-box;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  padding: 4px 8px;
+}
+.conv-findbar-input::placeholder { color: var(--text-faint); }
+.conv-findbar-input:focus-visible { outline: none; border-color: var(--accent-blue); }
+.conv-findbar-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.conv-findbar-note { color: var(--text-faint); }
+.conv-findbar-kind {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent-blue);
+  border: 1px solid var(--border-soft);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+.conv-findbar-hint {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.conv-findbar-spin {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-soft);
+  border-top-color: var(--accent-blue);
+  animation: conv-findbar-spin 0.7s linear infinite;
+}
+@keyframes conv-findbar-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .conv-findbar-spin { animation: none; }
+}
+.conv-findbar-nav,
+.conv-findbar-close {
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+.conv-findbar-nav:hover:not(:disabled),
+.conv-findbar-close:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-findbar-nav:disabled { opacity: 0.4; cursor: default; }
+.conv-findbar-nav:focus-visible,
+.conv-findbar-close:focus-visible { outline: none; border-color: var(--accent-blue); }
+/* Narrow viewports: shrink the input so the pill still floats without overflow. */
+@media (max-width: 640px) {
+  .conv-findbar { gap: 4px; padding: 4px 5px; }
+  .conv-findbar-input { width: 110px; min-width: 70px; }
+}
+
 /* ---- Reader pane -------------------------------------------------- */
 .conv-reader {
   display: flex;
