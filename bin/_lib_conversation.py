@@ -29,6 +29,7 @@ _INPUT_ELISION = "…"       # sentinel for elided leaves / subtrees
 _WEB_SEARCH_LINK_CAP = 50
 _WEB_LINK_TITLE_CAP = 300
 _WEB_LINK_URL_CAP = 2000
+_WEB_FETCH_CODE_TEXT_CAP = 100   # HTTP reason phrases are short; generous bound
 _MEDIA_BLOCK_TYPES = ("image", "document")
 
 
@@ -230,7 +231,7 @@ def _blocks_and_text(content):
                     block["media"] = media
                 blocks.append(block)
                 aux_parts.append(clipped)
-            elif bt in ("image", "document"):
+            elif bt in _MEDIA_BLOCK_TYPES:
                 blocks.append({"kind": bt, **_media(b.get("source")),
                                "index": media_index[id(b)]})
             elif bt == "tool_reference":
@@ -410,7 +411,7 @@ def _attach_web_fetch(blocks, obj):
     meta = {"code": code}
     code_text = tur.get("codeText")
     if isinstance(code_text, str) and code_text:
-        meta["code_text"] = code_text[:100]
+        meta["code_text"] = code_text[:_WEB_FETCH_CODE_TEXT_CAP]
     results[0]["web_fetch"] = meta
 
 
