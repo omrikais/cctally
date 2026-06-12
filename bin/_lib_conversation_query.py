@@ -1192,17 +1192,30 @@ def locate_tool_payload(conn, session_id, tool_use_id, which):
 
 
 def _clip_payload_input(inp, ceiling):
-    """Clip each string leaf of a structured input to ``ceiling`` chars and report
-    whether anything was clipped — the input-side analogue of the result-side
-    ceiling. A degenerate multi-MB input leaf is bounded so the HTTP server /
-    browser is protected, while every real payload returns whole."""
+    """Clip a structured input so the returned dict serializes to ``ceiling`` chars
+    or fewer, and report whether anything was clipped — the input-side analogue of
+    the result-side ceiling. A degenerate multi-MB input (one giant leaf OR many
+    sub-ceiling leaves that sum past the ceiling) is bounded so the HTTP server /
+    browser is protected, while every real payload returns whole.
+
+    The guarantee is AGGREGATE, not merely per-leaf: a shared remaining-char budget
+    is threaded through the walk (mirroring ``_bound_input``'s total-size backstop) —
+    each string leaf is clipped against the running budget and the budget is
+    decremented as we go, so once it is exhausted later leaves clip to ''.
+    ``truncated`` is True iff any leaf was clipped (or the post-walk serialized size
+    still exceeds ``ceiling``, the structural-overhead backstop). Post-condition:
+    ``len(json.dumps(clipped, ensure_ascii=False)) <= ceiling`` always."""
     truncated = False
+    remaining = [ceiling]   # boxed so the nested walk can decrement it
 
     def walk(v):
         nonlocal truncated
-        if isinstance(v, str) and len(v) > ceiling:
-            truncated = True
-            return v[:ceiling]
+        if isinstance(v, str):
+            if len(v) > remaining[0]:
+                truncated = True
+                v = v[:remaining[0]]
+            remaining[0] -= len(v)
+            return v
         if isinstance(v, dict):
             return {k: walk(x) for k, x in v.items()}
         if isinstance(v, list):
@@ -1210,9 +1223,40 @@ def _clip_payload_input(inp, ceiling):
         return v
 
     clipped = walk(inp)
-    if len(_json.dumps(clipped, ensure_ascii=False)) > ceiling:
+    # Backstop: structural JSON overhead (braces/quotes/keys) can push a
+    # budget-exact payload a few chars past the ceiling. Hard-clip the largest
+    # remaining string leaf(s) until the whole dict serializes within the ceiling.
+    while len(_json.dumps(clipped, ensure_ascii=False)) > ceiling:
         truncated = True
+        if not _shrink_largest_leaf(clipped):
+            break   # no string leaf left to shrink (e.g. pure numeric/structural)
     return clipped, truncated
+
+
+def _shrink_largest_leaf(obj):
+    """Halve the longest string leaf reachable in ``obj`` (a dict/list/scalar),
+    in place, and return True if one was shrunk — the post-walk backstop for the
+    rare structural-overhead overshoot. A leaf already at length 1 is truncated to
+    ''. Returns False when no non-empty string leaf exists."""
+    best = {"len": 0, "container": None, "key": None}
+
+    def scan(v, container, key):
+        if isinstance(v, str):
+            if len(v) > best["len"]:
+                best.update(len=len(v), container=container, key=key)
+        elif isinstance(v, dict):
+            for k, x in v.items():
+                scan(x, v, k)
+        elif isinstance(v, list):
+            for i, x in enumerate(v):
+                scan(x, v, i)
+
+    scan(obj, None, None)
+    if best["container"] is None or best["len"] == 0:
+        return False
+    s = best["container"][best["key"]]
+    best["container"][best["key"]] = s[: len(s) // 2]
+    return True
 
 
 def read_full_payload(source_path, byte_offset, tool_use_id, which):
@@ -1258,6 +1302,11 @@ def read_full_payload(source_path, byte_offset, tool_use_id, which):
         if (isinstance(b, dict) and b.get("type") == "tool_result"
                 and b.get("tool_use_id") == tool_use_id):
             raw = _stringify(b.get("content"))
+            # The bound is PER-STREAM by design: `text` and the Bash `stderr`
+            # below are each clipped to _FULL_PAYLOAD_CEILING independently, so a
+            # result carrying both can serialize to ~2× the ceiling. That is
+            # intentional — they are distinct streams the DiffCard renders side by
+            # side, and each is individually bounded against the HTTP/browser DoS.
             resp = {"which": "result", "tool_use_id": tool_use_id,
                     "text": raw[:_FULL_PAYLOAD_CEILING], "full_length": len(raw),
                     "truncated": len(raw) > _FULL_PAYLOAD_CEILING,
@@ -1265,6 +1314,6 @@ def read_full_payload(source_path, byte_offset, tool_use_id, which):
             tur = obj.get("toolUseResult")
             if (isinstance(tur, dict) and isinstance(tur.get("stderr"), str)
                     and tur.get("stderr")):
-                resp["stderr"] = tur["stderr"][:_FULL_PAYLOAD_CEILING]
+                resp["stderr"] = tur["stderr"][:_FULL_PAYLOAD_CEILING]   # per-stream bound (see above)
             return resp
     return None

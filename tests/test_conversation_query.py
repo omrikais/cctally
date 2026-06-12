@@ -1773,3 +1773,40 @@ def test_read_full_payload_result_huge_hits_ceiling(tmp_path):
     assert got["full_length"] == len(big)
     assert len(got["text"]) == cq._FULL_PAYLOAD_CEILING
     assert got["truncated"] is True
+
+
+def test_read_full_payload_input_single_giant_leaf_hits_ceiling(tmp_path):
+    # A single string leaf larger than the ceiling: the returned input dict MUST
+    # serialize within _FULL_PAYLOAD_CEILING and truncated MUST be True.
+    big = "X" * (cq._FULL_PAYLOAD_CEILING + 5000)
+    line = _json.dumps({"message": {"content": [
+        {"type": "tool_use", "id": "toolu_e",
+         "input": {"file_path": "/f.py", "old_string": big, "new_string": "Y"}},
+    ]}}).encode() + b"\n"
+    p = tmp_path / "s.jsonl"
+    with open(p, "wb") as fh:
+        fh.write(line)
+    got = cq.read_full_payload(str(p), 0, "toolu_e", "input")
+    assert len(_json.dumps(got["input"], ensure_ascii=False)) <= cq._FULL_PAYLOAD_CEILING
+    assert got["truncated"] is True
+    # full_length describes the UN-capped input (so the UI can show "X of Y").
+    assert got["full_length"] > cq._FULL_PAYLOAD_CEILING
+
+
+def test_read_full_payload_input_many_sub_ceiling_leaves_aggregate(tmp_path):
+    # Many leaves that are EACH below the ceiling but TOGETHER serialize past it.
+    # This is the aggregate-guard case: a pure per-leaf clip (the pre-fix
+    # behavior) would leave every leaf un-clipped and the dict would serialize to
+    # ~2 MB while only flipping truncated=True (no actual shrink). The shared
+    # remaining-char budget must shrink it to <= the ceiling.
+    leaf = "Q" * (cq._FULL_PAYLOAD_CEILING // 2)   # 2 of these alone exceed the ceiling
+    line = _json.dumps({"message": {"content": [
+        {"type": "tool_use", "id": "toolu_m",
+         "input": {"a": leaf, "b": leaf, "c": leaf}},   # ~1.5 MB of leaves
+    ]}}).encode() + b"\n"
+    p = tmp_path / "m.jsonl"
+    with open(p, "wb") as fh:
+        fh.write(line)
+    got = cq.read_full_payload(str(p), 0, "toolu_m", "input")
+    assert len(_json.dumps(got["input"], ensure_ascii=False)) <= cq._FULL_PAYLOAD_CEILING
+    assert got["truncated"] is True
