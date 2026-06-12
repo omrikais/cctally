@@ -109,4 +109,41 @@ describe('BashCard', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(container.querySelector('.conv-term-out')?.textContent).toContain('FULL OUTPUT');
   });
+
+  it('load-full preserves the stderr split from the loaded payload', async () => {
+    // The truncated result carries discrete stderr in its full payload. After
+    // load-full, the red stderr block must persist AND the stdout block must NOT
+    // contain the stderr suffix — re-split against the LOADED stderr, not null.
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        which: 'result',
+        tool_use_id: 'b1',
+        text: 'OUT\nERRTAIL',
+        stderr: 'ERRTAIL',
+        full_length: 12345,
+        truncated: false,
+        is_error: true,
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const call = base({
+      stderr: 'partialerr',
+      result: { text: 'partial', truncated: true, is_error: true, full_length: 12345 },
+    });
+    const { container, getByRole } = renderCard(call);
+    const btn = getByRole('button', { name: /load full output/i });
+    await act(async () => {
+      fireEvent.click(btn);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // Red stderr block still renders the loaded stderr text.
+    const stderr = container.querySelector('.conv-term-stderr');
+    expect(stderr?.textContent).toContain('ERRTAIL');
+    // stdout block carries only the stdout portion, NOT the stderr suffix.
+    const out = container.querySelector('.conv-term-out');
+    expect(out?.textContent).toContain('OUT');
+    expect(out?.textContent).not.toContain('ERRTAIL');
+  });
 });

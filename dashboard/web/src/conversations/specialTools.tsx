@@ -25,7 +25,10 @@ function hasEditInput(c: Call): boolean {
   return !!i && typeof i.old_string === 'string' && typeof i.new_string === 'string';
 }
 function hasMultiEditInput(c: Call): boolean {
-  return Array.isArray((c.input as { edits?: unknown } | null | undefined)?.edits);
+  // Require a NON-EMPTY edits[] — a zero-edit MultiEdit would render a hollow
+  // card body, so fall through to the generic chip instead.
+  const edits = (c.input as { edits?: unknown } | null | undefined)?.edits;
+  return Array.isArray(edits) && edits.length > 0;
 }
 function hasWriteInput(c: Call): boolean {
   return typeof (c.input as { content?: unknown } | null | undefined)?.content === 'string';

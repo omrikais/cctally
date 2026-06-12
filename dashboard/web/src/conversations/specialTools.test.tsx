@@ -40,6 +40,9 @@ describe('specialToolRenderer dispatch (#177 S3)', () => {
     expect(specialToolRenderer(call({ name: 'Edit', input: null }))).toBeNull();
     expect(specialToolRenderer(call({ name: 'Edit', input: { old_string: 'a' } }))).toBeNull(); // no new_string
     expect(specialToolRenderer(call({ name: 'MultiEdit', input: { file_path: '/f' } }))).toBeNull(); // no edits[]
+    // An empty edits[] passes Array.isArray but yields a hollow card → fall
+    // through to the generic chip.
+    expect(specialToolRenderer(call({ name: 'MultiEdit', input: { file_path: '/f', edits: [] } }))).toBeNull();
     expect(specialToolRenderer(call({ name: 'Write', input: { file_path: '/f' } }))).toBeNull(); // no content
     expect(specialToolRenderer(call({ name: 'Bash', input: null }))).toBeNull(); // no command
   });

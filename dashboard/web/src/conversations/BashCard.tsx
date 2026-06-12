@@ -34,19 +34,24 @@ function splitStreams(text: string, stderr: string | null | undefined): { stdout
 // specialToolRenderer (Codex P1.2).
 export function BashCard({ call }: { call: Call }) {
   // The full output loaded on demand when result.truncated (#178); supersedes
-  // the bounded result.text for rendering.
-  const [fullText, setFullText] = useState<string | null>(null);
+  // the bounded result.text for rendering. The load-full result payload carries
+  // a discrete `stderr` field, so we capture it alongside `text` and re-split
+  // exactly like the un-truncated path — the red stderr block must survive a
+  // load-full (it's precisely when the user asked to see MORE).
+  const [full, setFull] = useState<{ text: string; stderr: string | null | undefined } | null>(null);
 
   const command = commandOf(call);
   const result = call.result;
   const isError = result?.is_error === true;
   const interrupted = call.interrupted === true;
 
-  const rawText = fullText ?? result?.text ?? '';
-  // When we've loaded the full payload, the bounded stderr suffix may no longer
-  // line up; keep the stderr split keyed on call.stderr only while showing the
-  // capped text. After load-full the full text is rendered whole.
-  const { stdout, stderr } = fullText == null ? splitStreams(rawText, call.stderr) : { stdout: rawText, stderr: null };
+  // After load-full, re-split the LOADED text against the LOADED stderr (same
+  // splitStreams contract as the bounded path); before, split the capped
+  // result.text against the block-level call.stderr.
+  const rawText = full?.text ?? result?.text ?? '';
+  const { stdout, stderr } = full == null
+    ? splitStreams(rawText, call.stderr)
+    : splitStreams(rawText, full.stderr);
 
   const badge = isError ? (
     <span className="conv-term-badge conv-term-badge--err">● error</span>
@@ -87,14 +92,16 @@ export function BashCard({ call }: { call: Call }) {
                 <AnsiText text={stderr} />
               </pre>
             )}
-            {result.truncated && fullText == null && (
+            {result.truncated && full == null && (
               <LoadFull
                 toolUseId={call.tool_use_id ?? ''}
                 which="result"
                 fullLength={result.full_length ?? null}
                 label="load full output"
                 onLoaded={(payload) => {
-                  if (payload.which === 'result') setFullText(payload.text);
+                  // Capture BOTH text and stderr so the post-load re-split can
+                  // restore the red stderr block (don't drop it to null).
+                  if (payload.which === 'result') setFull({ text: payload.text, stderr: payload.stderr });
                 }}
               />
             )}
