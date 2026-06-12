@@ -11,6 +11,7 @@ deduped session_entries row (idx_entries_dedup), via the shared pricing helper
 — never per physical fragment and never from cost_usd_raw (often NULL).
 """
 from __future__ import annotations
+import base64 as _base64
 import json as _json
 import os
 import re
@@ -24,6 +25,9 @@ from _lib_pricing import _calculate_entry_cost
 # content block the same way the parser does at ingest — reuse the parser's
 # _stringify so the full (un-capped) result text matches the cached/capped one.
 from _lib_conversation import _stringify
+# #177 S4: the media-route reader walks a content array with the SAME ordinal
+# generator the ingest placeholders used, so "media item N" addresses one item.
+from _lib_conversation import iter_media_items
 
 
 # Mirror of dashboard/web/src/conversations/systemMarkers.ts::MARKER_RE — anchored
@@ -489,6 +493,8 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     agent_link = {}     # tool_use id -> (agent_id, raw_meta)
     ask_link = {}       # tool_use id -> (answers, annotations)  (#177 S2)
     bash_link = {}      # tool_use id -> (stderr, interrupted)   (#177 S3)
+    web_search_link = {}  # tool_use id -> web_search payload    (#177 S4)
+    web_fetch_link = {}   # tool_use id -> web_fetch payload     (#177 S4)
     task_link = {}      # tool_use id -> {"task_id", "task_list"}  (Task* checklist)
     for it in items:
         for b in it["blocks"]:
@@ -510,6 +516,12 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                 bintr = b.pop("bash_interrupted", None)
                 if b.get("tool_use_id") is not None and (bstderr is not None or bintr):
                     bash_link[b["tool_use_id"]] = (bstderr, bool(bintr))
+                ws = b.pop("web_search", None)              # #177 S4
+                if ws is not None and b.get("tool_use_id") is not None:
+                    web_search_link[b["tool_use_id"]] = ws
+                wf = b.pop("web_fetch", None)               # #177 S4
+                if wf is not None and b.get("tool_use_id") is not None:
+                    web_fetch_link[b["tool_use_id"]] = wf
                 tid_ = b.pop("task_id", None)               # Task* checklist
                 tlist_ = b.pop("task_list", None)
                 if b.get("tool_use_id") is not None and (tid_ is not None or tlist_ is not None):
@@ -553,6 +565,9 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                                        "truncated": bool(res_block.get("truncated")),
                                        "full_length": res_block.get("full_length"),
                                        "is_error": bool(res_block.get("is_error"))}
+                res_media = res_block.get("media")    # #177 S4: public render-ready key
+                if res_media:
+                    use_block["result"]["media"] = res_media
             owner["member_uuids"].append(tr["anchor"]["uuid"])
             drop.add(id(tr))
         # else: leave tr standalone (orphan / multi-owner / mixed) — a folded
@@ -583,6 +598,14 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                             b["stderr"] = blink[0]
                         if blink[1]:
                             b["interrupted"] = True
+                    if b.get("name") == "WebSearch":         # #177 S4: name-keyed
+                        wslink = web_search_link.get(b["tool_use_id"])
+                        if wslink is not None:
+                            b["web_search"] = wslink
+                    if b.get("name") == "WebFetch":          # #177 S4: name-keyed
+                        wflink = web_fetch_link.get(b["tool_use_id"])
+                        if wflink is not None:
+                            b["web_fetch"] = wflink
 
     # ---- Phase 3b: fold the Task* op stream into per-run checklist snapshots ----
     _fold_task_runs(items, task_link)
@@ -1317,3 +1340,117 @@ def read_full_payload(source_path, byte_offset, tool_use_id, which):
                 resp["stderr"] = tur["stderr"][:_FULL_PAYLOAD_CEILING]   # per-stream bound (see above)
             return resp
     return None
+
+
+# ---------------------------------------------------------------------------
+# #177 S4: on-demand media kernel. The route re-reads the source JSONL line by
+# byte_offset (the #178 mechanism), decodes the base64 of the addressed media
+# ordinal, and serves the raw bytes — nothing is ever written to cache.db.
+# ---------------------------------------------------------------------------
+_MEDIA_LINE_CEILING = 64 * 1024 * 1024     # raw line read cap (pathological guard)
+_MEDIA_PAYLOAD_CEILING = 20 * 1024 * 1024  # decoded cap; enforced on ENCODED length
+# Response Content-Type is the matched constant — never an echoed transcript string.
+_MEDIA_TYPE_ALLOWLIST = {
+    "image/png": "image/png", "image/jpeg": "image/jpeg",
+    "image/gif": "image/gif", "image/webp": "image/webp",
+    "application/pdf": "application/pdf",
+}
+
+
+def locate_media(conn, session_id, *, tool_use_id=None, uuid=None, index=0):
+    """``(source_path, byte_offset)`` for the row whose stored placeholder
+    carries media ordinal ``index`` — tool_use_id mode reads tool_result
+    ``media[]``; uuid mode reads user-content image/document blocks. Mirrors
+    locate_tool_payload: instr() prefilter (never LIKE — ids contain ``_``),
+    candidates parsed + exact-matched, deterministic ORDER BY matching
+    get_conversation. ``None`` -> 404. Pre-reingest rows have no placeholder
+    and correctly 404 (the client renders the badge for them anyway)."""
+    if tool_use_id is not None:
+        rows = conn.execute(
+            "SELECT source_path, byte_offset, blocks_json FROM conversation_messages "
+            "WHERE session_id=? AND instr(blocks_json, ?) > 0 "
+            "ORDER BY timestamp_utc, id", (session_id, tool_use_id)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT source_path, byte_offset, blocks_json FROM conversation_messages "
+            "WHERE session_id=? AND uuid=? ORDER BY timestamp_utc, id",
+            (session_id, uuid)).fetchall()
+    for source_path, byte_offset, blocks_json in rows:
+        try:
+            blocks = _json.loads(blocks_json)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(blocks, list):
+            continue
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if tool_use_id is not None:
+                if (b.get("kind") == "tool_result"
+                        and b.get("tool_use_id") == tool_use_id):
+                    for m in b.get("media") or []:
+                        if isinstance(m, dict) and m.get("index") == index:
+                            return source_path, byte_offset
+            elif (b.get("kind") in ("image", "document")
+                    and b.get("index") == index):
+                return source_path, byte_offset
+    return None
+
+
+def read_media_bytes(source_path, byte_offset, *, tool_use_id=None, uuid=None,
+                     index=0):
+    """Re-read the source line and return ``("ok", media_type, raw_bytes)`` for
+    media ordinal ``index``, else ``("unsupported"|"too_large"|"gone", None,
+    None)`` (-> 404 / 413 / 410). The decoded cap is enforced as an
+    ENCODED-length precheck — never decode-then-measure (Codex F4); decode is
+    strict (validate=True; binascii.Error subclasses ValueError). The media
+    walk IS iter_media_items — the same generator the ingest placeholders used,
+    so ordinals cannot drift (spec §4.1 chokepoint)."""
+    try:
+        with open(source_path, "rb") as fh:
+            fh.seek(byte_offset)
+            line = fh.readline(_MEDIA_LINE_CEILING + 1)
+        if len(line) > _MEDIA_LINE_CEILING:
+            return ("too_large", None, None)
+        obj = _json.loads(line)
+    except (OSError, ValueError):
+        return ("gone", None, None)
+    if not isinstance(obj, dict):
+        return ("gone", None, None)
+    content = (obj.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return ("gone", None, None)
+    if tool_use_id is not None:
+        target = None
+        for b in content:
+            if (isinstance(b, dict) and b.get("type") == "tool_result"
+                    and b.get("tool_use_id") == tool_use_id):
+                target = b.get("content")
+                break
+        if target is None:
+            return ("gone", None, None)
+    else:
+        target = content
+    item = None
+    for idx, m in iter_media_items(target):
+        if idx == index:
+            item = m
+            break
+    if item is None:
+        return ("gone", None, None)
+    source = item.get("source")
+    if not isinstance(source, dict):
+        return ("gone", None, None)
+    media_type = _MEDIA_TYPE_ALLOWLIST.get(source.get("media_type"))
+    if media_type is None:
+        return ("unsupported", None, None)
+    data = source.get("data")
+    if not isinstance(data, str):
+        return ("gone", None, None)
+    if len(data) > _MEDIA_PAYLOAD_CEILING * 4 // 3:
+        return ("too_large", None, None)
+    try:
+        raw = _base64.b64decode(data, validate=True)
+    except ValueError:
+        return ("gone", None, None)
+    return ("ok", media_type, raw)

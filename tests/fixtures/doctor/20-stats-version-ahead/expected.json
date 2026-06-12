@@ -134,7 +134,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 8,
+                            "registry_size": 9,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -163,7 +163,8 @@
                                     "005_conversation_reingest_meta",
                                     "006_conversation_reingest_source_tool_use_id",
                                     "007_conversation_reingest_enrichment",
-                                    "008_session_entries_speed_backfill"
+                                    "008_session_entries_speed_backfill",
+                                    "009_conversation_media_reingest"
                                 ],
                                 "skipped": []
                             },
@@ -190,7 +191,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/20 applied",
+                    "summary": "0/21 applied",
                     "title": "Migrations"
                 },
                 {
@@ -275,13 +276,17 @@
                             [
                                 "cache.db",
                                 "008_session_entries_speed_backfill"
+                            ],
+                            [
+                                "cache.db",
+                                "009_conversation_media_reingest"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "20 pending",
+                    "summary": "21 pending",
                     "title": "Pending migrations"
                 }
             ],

@@ -60,7 +60,9 @@ def test_image_and_document_are_placeholders_no_base64():
     blocks = json.loads(list(lc.iter_message_rows(fh, "f"))[0].blocks_json)
     img, doc = blocks[0], blocks[1]
     assert img["kind"] == "image" and img["media_type"] == "image/png" and img["bytes"] == len("AAAABBBB")
+    assert img["index"] == 0                      # #177 S4: ordinal among media items
     assert doc["kind"] == "document" and doc["media_type"] == "application/pdf"
+    assert doc["index"] == 1
     assert "data" not in json.dumps(blocks) and "AAAABBBB" not in json.dumps(blocks)
 
 def test_summary_and_file_history_skipped():
@@ -724,3 +726,106 @@ def test_iter_message_rows_attaches_bash_streams_at_call_site():
     tr = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_result"][0]
     assert tr["bash_stderr"] == "boom"
     assert tr["bash_interrupted"] is True
+
+
+# ---- #177 S4: media placeholders + web captures ----
+
+def test_iter_media_items_ordinals_skip_non_media():
+    content = [{"type": "text", "text": "t"},
+               {"type": "image", "source": {"media_type": "image/png", "data": "AA=="}},
+               "junk", {"type": "tool_use"},
+               {"type": "document", "source": {"media_type": "application/pdf", "data": "BB=="}},
+               {"type": "image", "source": {"media_type": "image/jpeg", "data": "CC=="}}]
+    got = list(lc.iter_media_items(content))
+    assert [(i, m["type"]) for i, m in got] == [(0, "image"), (1, "document"), (2, "image")]
+    assert lc.iter_media_items("not a list") is not None  # generator; yields nothing
+    assert list(lc.iter_media_items("not a list")) == []
+
+
+def test_tool_result_media_placeholders_with_ordinals():
+    fh = _jsonl({"type": "user", "uuid": "u9", "sessionId": "s", "timestamp": "t",
+                 "message": {"role": "user", "content": [
+                     {"type": "tool_result", "tool_use_id": "tu1", "content": [
+                         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 100}},
+                         {"type": "text", "text": "took the screenshot"},
+                         {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "B" * 40}}]}]}})
+    b = json.loads(list(lc.iter_message_rows(fh, "f"))[0].blocks_json)[0]
+    assert b["kind"] == "tool_result" and b["text"] == "took the screenshot"
+    assert b["media"] == [
+        {"kind": "image", "media_type": "image/png", "bytes": 100, "index": 0},
+        {"kind": "document", "media_type": "application/pdf", "bytes": 40, "index": 1}]
+
+
+def test_tool_result_without_media_omits_key():
+    fh = _jsonl({"type": "user", "uuid": "u10", "sessionId": "s", "timestamp": "t",
+                 "message": {"role": "user", "content": [
+                     {"type": "tool_result", "tool_use_id": "tu1", "content": "plain"}]}})
+    b = json.loads(list(lc.iter_message_rows(fh, "f"))[0].blocks_json)[0]
+    assert "media" not in b
+
+
+def test_user_content_media_carry_index():
+    fh = _jsonl({"type": "user", "uuid": "u11", "sessionId": "s", "timestamp": "t",
+                 "message": {"role": "user", "content": [
+                     {"type": "text", "text": "see attached"},
+                     {"type": "image", "source": {"media_type": "image/png", "data": "AAAA"}},
+                     {"type": "document", "source": {"media_type": "application/pdf", "data": "BBBB"}}]}})
+    blocks = json.loads(list(lc.iter_message_rows(fh, "f"))[0].blocks_json)
+    assert blocks[1] == {"kind": "image", "media_type": "image/png", "bytes": 4, "index": 0}
+    assert blocks[2] == {"kind": "document", "media_type": "application/pdf", "bytes": 4, "index": 1}
+
+
+def _web_search_line(tur, content="results text"):
+    return {"type": "user", "uuid": "w1", "sessionId": "s", "timestamp": "t",
+            "toolUseResult": tur,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tw1", "content": content}]}}
+
+
+def test_web_search_capture_flattens_and_bounds():
+    tur = {"query": "q1", "results": [
+        {"content": [{"title": "T1", "url": "https://a.example/x"},
+                     {"notalink": True},
+                     {"title": "T2", "url": "https://b.example/y"}]},
+        "stray string",
+        {"content": [{"title": "T3" * 200, "url": "https://c.example/" + "z" * 3000}]}]}
+    b = json.loads(list(lc.iter_message_rows(_jsonl(_web_search_line(tur)), "f"))[0].blocks_json)[0]
+    ws = b["web_search"]
+    assert ws["query"] == "q1"
+    assert [l["title"] for l in ws["links"][:2]] == ["T1", "T2"]
+    assert len(ws["links"][2]["title"]) == lc._WEB_LINK_TITLE_CAP
+    assert len(ws["links"][2]["url"]) == lc._WEB_LINK_URL_CAP
+    assert "links_truncated" not in ws
+
+
+def test_web_search_capture_link_cap_sets_truncated():
+    links = [{"title": f"T{i}", "url": f"https://e.example/{i}"} for i in range(60)]
+    tur = {"query": "q", "results": [{"content": links}]}
+    b = json.loads(list(lc.iter_message_rows(_jsonl(_web_search_line(tur)), "f"))[0].blocks_json)[0]
+    assert len(b["web_search"]["links"]) == lc._WEB_SEARCH_LINK_CAP
+    assert b["web_search"]["links_truncated"] is True
+
+
+def test_web_search_no_stamp_on_shape_mismatch_or_multi_result():
+    # non-dict toolUseResult
+    line = _web_search_line("Error: nope")
+    b = json.loads(list(lc.iter_message_rows(_jsonl(line), "f"))[0].blocks_json)[0]
+    assert "web_search" not in b
+    # two tool_result blocks -> exactly-one guard refuses
+    line2 = {"type": "user", "uuid": "w2", "sessionId": "s", "timestamp": "t",
+             "toolUseResult": {"query": "q", "results": []},
+             "message": {"role": "user", "content": [
+                 {"type": "tool_result", "tool_use_id": "a", "content": "1"},
+                 {"type": "tool_result", "tool_use_id": "b", "content": "2"}]}}
+    blocks = json.loads(list(lc.iter_message_rows(_jsonl(line2), "f"))[0].blocks_json)
+    assert all("web_search" not in b for b in blocks)
+
+
+def test_web_fetch_capture_triple_and_mismatch():
+    line = _web_search_line({"bytes": 13218, "code": 200, "codeText": "OK", "result": "# md"})
+    b = json.loads(list(lc.iter_message_rows(_jsonl(line), "f"))[0].blocks_json)[0]
+    assert b["web_fetch"] == {"code": 200, "code_text": "OK"}
+    # missing codeText -> no stamp; bare string -> no stamp
+    for tur in ({"code": 200, "result": "x"}, "Error: Request failed"):
+        b2 = json.loads(list(lc.iter_message_rows(_jsonl(_web_search_line(tur)), "f"))[0].blocks_json)[0]
+        assert "web_fetch" not in b2

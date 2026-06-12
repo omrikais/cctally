@@ -1810,3 +1810,202 @@ def test_read_full_payload_input_many_sub_ceiling_leaves_aggregate(tmp_path):
     got = cq.read_full_payload(str(p), 0, "toolu_m", "input")
     assert len(_json.dumps(got["input"], ensure_ascii=False)) <= cq._FULL_PAYLOAD_CEILING
     assert got["truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# #177 S4: web_search / web_fetch Phase-1-pop / Phase-3 NAME-KEYED stamp, and
+# result.media ride-through. Mirrors the ask_answers / bash join exactly: the
+# parser stashed web_search/web_fetch on the tool_result block, Phase 1 pops
+# them, Phase 3 stamps the owning tool_call ONLY when the call's NAME matches
+# (WebSearch / WebFetch) so a shape-coincident toolUseResult on some other tool
+# never decorates the wrong card (Codex F3). `media` is a PUBLIC key and rides
+# the fold onto result.media (and survives on orphan blocks).
+# ---------------------------------------------------------------------------
+def test_web_search_folds_onto_websearch_call():
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "WebSearch", "input_summary": "{}",
+                 "input": {"query": "q"}, "input_truncated": False,
+                 "id": "tw", "preview": "q"}])
+    _seed_tool_result(c, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "x", "is_error": False,
+                 "tool_use_id": "tw",
+                 "web_search": {"query": "q",
+                                "links": [{"title": "T", "url": "https://e/x"}]}}])
+    detail = cq.get_conversation(c, "s1")
+    call = [b for it in detail["items"]
+            if it["kind"] == "assistant"
+            for b in it["blocks"] if b.get("kind") == "tool_call"][0]
+    assert call["web_search"] == {"query": "q",
+                                  "links": [{"title": "T", "url": "https://e/x"}]}
+    # the folded result dict must NOT carry the parser-private key:
+    assert call["result"] is not None and "web_search" not in call["result"]
+    assert "web_search" not in _json.dumps(call["result"])
+
+
+def test_web_fetch_folds_onto_webfetch_call():
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "WebFetch", "input_summary": "{}",
+                 "input": {"url": "https://e/x"}, "input_truncated": False,
+                 "id": "tf", "preview": "https://e/x"}])
+    _seed_tool_result(c, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "# md", "is_error": False,
+                 "tool_use_id": "tf",
+                 "web_fetch": {"code": 200, "code_text": "OK"}}])
+    call = [b for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"
+            for b in it["blocks"] if b.get("kind") == "tool_call"][0]
+    assert call["web_fetch"] == {"code": 200, "code_text": "OK"}
+
+
+def test_web_keys_never_stamp_on_other_tool_names():
+    # Same result-block keys, but the OWNING tool is not WebSearch/WebFetch ->
+    # the name-keyed Phase-3 join must refuse to decorate it (Codex F3).
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Grep", "input_summary": "{}",
+                 "input": {"pattern": "x"}, "input_truncated": False,
+                 "id": "tg", "preview": "x"}])
+    _seed_tool_result(c, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "x", "is_error": False,
+                 "tool_use_id": "tg",
+                 "web_search": {"query": "q", "links": []},
+                 "web_fetch": {"code": 200, "code_text": "OK"}}])
+    detail = cq.get_conversation(c, "s1")
+    call = [b for it in detail["items"]
+            if it["kind"] == "assistant"
+            for b in it["blocks"] if b.get("kind") == "tool_call"][0]
+    assert "web_search" not in call
+    assert "web_fetch" not in call
+    # and never leak anywhere in the emitted JSON either:
+    dumped = _json.dumps(detail)
+    assert "web_search" not in dumped and "web_fetch" not in dumped
+
+
+def test_orphan_result_drops_private_web_keys_but_keeps_media():
+    # A tool_result with NO owning assistant stays standalone. The parser-private
+    # web_search/web_fetch keys are popped in Phase 1 (never leak), but the PUBLIC
+    # `media` placeholder + tool_use_id survive so orphaned screenshots render.
+    c = _conn()
+    _seed_tool_result(c, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "x", "is_error": False,
+                 "tool_use_id": "nomatch",
+                 "web_search": {"query": "q", "links": []},
+                 "web_fetch": {"code": 200, "code_text": "OK"},
+                 "media": [{"kind": "image", "media_type": "image/png",
+                            "bytes": 4, "index": 0}]}])
+    out = cq.get_conversation(c, "s1")
+    orphan = [b for it in out["items"] for b in it["blocks"]
+              if b.get("kind") == "tool_result"][0]
+    assert "web_search" not in orphan and "web_fetch" not in orphan
+    assert orphan["tool_use_id"] == "nomatch"
+    assert orphan["media"] == [{"kind": "image", "media_type": "image/png",
+                                "bytes": 4, "index": 0}]
+    assert "web_search" not in _json.dumps(out) and "web_fetch" not in _json.dumps(out)
+
+
+def test_result_media_rides_fold():
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "mcp__x__screenshot",
+                 "input_summary": "{}", "input": {}, "input_truncated": False,
+                 "id": "ts", "preview": "screenshot"}])
+    media = [{"kind": "image", "media_type": "image/png", "bytes": 4, "index": 0}]
+    _seed_tool_result(c, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "took screenshot", "is_error": False,
+                 "tool_use_id": "ts", "media": media}])
+    call = [b for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"
+            for b in it["blocks"] if b.get("kind") == "tool_call"][0]
+    assert call["result"]["media"] == media
+
+
+# ---------------------------------------------------------------------------
+# #177 S4: locate_media / read_media_bytes kernel pair (mirrors
+# locate_tool_payload / read_full_payload). The media walk in read_media_bytes
+# IS iter_media_items — the SAME chokepoint the ingest placeholders use, so
+# ordinals cannot drift (spec §4.1).
+# ---------------------------------------------------------------------------
+import base64 as _b64test
+
+PNG_B64 = _b64test.b64encode(b"\x89PNG_fake_pixels").decode()
+
+
+def _media_line(tmp_path, content_blocks, name="m.jsonl"):
+    p = tmp_path / name
+    line = _json.dumps({"type": "user", "uuid": "u1", "sessionId": "s1",
+                        "timestamp": "t",
+                        "message": {"role": "user", "content": content_blocks}})
+    p.write_text(line + "\n")
+    return str(p)
+
+
+def test_read_media_bytes_roundtrip_tool_result(tmp_path):
+    src = _media_line(tmp_path, [
+        {"type": "tool_result", "tool_use_id": "tu1", "content": [
+            {"type": "image", "source": {"media_type": "image/png", "data": PNG_B64}}]}])
+    status, mt, raw = cq.read_media_bytes(src, 0, tool_use_id="tu1", index=0)
+    assert (status, mt, raw) == ("ok", "image/png", b"\x89PNG_fake_pixels")
+
+
+def test_read_media_bytes_uuid_mode_and_ordinal_agreement(tmp_path):
+    # one text + two media items at message level: index 1 must return the SECOND
+    src = _media_line(tmp_path, [
+        {"type": "text", "text": "x"},
+        {"type": "image", "source": {"media_type": "image/png", "data": PNG_B64}},
+        {"type": "document", "source": {"media_type": "application/pdf",
+                                        "data": _b64test.b64encode(b"%PDF-fake").decode()}}])
+    status, mt, raw = cq.read_media_bytes(src, 0, uuid="u1", index=1)
+    assert (status, mt) == ("ok", "application/pdf") and raw == b"%PDF-fake"
+
+
+def test_read_media_bytes_failures(tmp_path):
+    src = _media_line(tmp_path, [
+        {"type": "image", "source": {"media_type": "image/bmp", "data": PNG_B64}},   # not allowlisted
+        {"type": "image", "source": {"media_type": "image/png", "data": "%%%bad%%%"}}])  # invalid b64
+    assert cq.read_media_bytes(src, 0, uuid="u1", index=0)[0] == "unsupported"
+    assert cq.read_media_bytes(src, 0, uuid="u1", index=1)[0] == "gone"
+    assert cq.read_media_bytes(src, 0, uuid="u1", index=9)[0] == "gone"      # ordinal drift
+    assert cq.read_media_bytes(str(tmp_path / "nope"), 0, uuid="u1", index=0)[0] == "gone"
+
+
+def test_read_media_bytes_encoded_precheck_never_decodes(monkeypatch, tmp_path):
+    big = "A" * (cq._MEDIA_PAYLOAD_CEILING * 4 // 3 + 8)
+    src = _media_line(tmp_path, [{"type": "image",
+                                  "source": {"media_type": "image/png", "data": big}}])
+    called = []
+    monkeypatch.setattr(cq._base64, "b64decode",
+                        lambda *a, **k: called.append(1))
+    assert cq.read_media_bytes(src, 0, uuid="u1", index=0)[0] == "too_large"
+    assert not called          # precheck fired BEFORE any decode (Codex F4)
+
+
+def test_read_media_bytes_line_ceiling(monkeypatch, tmp_path):
+    # An over-cap raw line (here via a tiny test-local ceiling) -> too_large,
+    # before any parse/decode.
+    src = _media_line(tmp_path, [
+        {"type": "image", "source": {"media_type": "image/png", "data": PNG_B64}}])
+    monkeypatch.setattr(cq, "_MEDIA_LINE_CEILING", 8)
+    assert cq.read_media_bytes(src, 0, uuid="u1", index=0)[0] == "too_large"
+
+
+def test_locate_media_both_modes(tmp_path):
+    c = _conn()
+    # tool_result row with a media placeholder + a user-content image row.
+    _seed_tool_result(c, sid="s1", uuid="ur",
+        blocks=[{"kind": "tool_result", "text": "x", "is_error": False,
+                 "tool_use_id": "tu1",
+                 "media": [{"kind": "image", "media_type": "image/png",
+                            "bytes": 4, "index": 0}]}])
+    _msg(c, session_id="s1", uuid="u1", source_path="img.jsonl", byte_offset=7,
+         timestamp_utc="2026-06-01T00:00:03Z", entry_type="human", text="",
+         blocks_json=_json.dumps([{"kind": "image", "media_type": "image/png",
+                                   "bytes": 4, "index": 0}]))
+    # _seed_tool_result writes byte_offset=1, source_path="a.jsonl"
+    assert cq.locate_media(c, "s1", tool_use_id="tu1", index=0) == ("a.jsonl", 1)
+    assert cq.locate_media(c, "s1", uuid="u1", index=0) == ("img.jsonl", 7)
+    # misses
+    assert cq.locate_media(c, "s1", tool_use_id="tu1", index=9) is None
+    assert cq.locate_media(c, "s1", tool_use_id="nope", index=0) is None
+    assert cq.locate_media(c, "s1", uuid="nope", index=0) is None

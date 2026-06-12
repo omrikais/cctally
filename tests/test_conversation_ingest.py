@@ -997,3 +997,78 @@ def test_migration_007_reingest_lands_enrichment_on_stale_row(isolated):
     assert conn.execute(
         "SELECT 1 FROM cache_meta WHERE key='conversation_reingest_enrichment_pending'"
     ).fetchone() is None, "the enrichment reingest flag is dropped after consumption"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #177 Session 4: migration 009 flag-only media reingest. The flag must be
+# wired into EVERY reingest flag site (Codex F2 — a missed site either never
+# triggers the reingest or re-arms it forever), and the resumable reingest must
+# land the media placeholders + web captures on a stale pre-upgrade row.
+# ──────────────────────────────────────────────────────────────────────────
+
+def test_009_flag_in_reingest_flag_keys_and_sql_sites():
+    import inspect, _cctally_cache as cc
+    assert "conversation_media_reingest_pending" in cc._REINGEST_FLAG_KEYS
+    # The two SELECT/DELETE literal lists + the tuple + completion cleanup: the
+    # flag string must appear at least 4 times in the module source (Codex F2 —
+    # a missed site either never triggers the reingest or re-arms it forever).
+    src = inspect.getsource(cc)
+    assert src.count("conversation_media_reingest_pending") >= 4
+
+
+def _user_tool_result_image_line(uuid, tool_use_id, *, ts="2026-06-01T00:02:00Z"):
+    """A user JSONL line carrying a tool_result whose content array holds an
+    image item (the MCP-screenshot shape) plus a WebSearch toolUseResult so the
+    reingest lands both media[] and web_search."""
+    return json.dumps({
+        "type": "user", "uuid": uuid, "sessionId": "s1", "timestamp": ts,
+        "toolUseResult": {"query": "q1", "results": [
+            {"content": [{"title": "T1", "url": "https://e.example/x"}]}]},
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tool_use_id, "content": [
+                {"type": "image", "source": {"type": "base64",
+                                             "media_type": "image/png",
+                                             "data": "AAAA"}},
+                {"type": "text", "text": "screenshot"}]}]},
+    }) + "\n"
+
+
+def test_resumable_reingest_consumes_media_flag(isolated):
+    """009 is flag-only (sets conversation_media_reingest_pending); the resumable
+    reingest re-parses every JSONL through the current parser, so a stale
+    pre-upgrade row (no media[] / web_search) gains them, and the flag + cursor +
+    gen keys are cleared after consumption."""
+    ns, conn, projects, sync = isolated
+    (projects / "a.jsonl").write_text(_user_tool_result_image_line("u1", "tw1"))
+    sync()
+    # Simulate a PRE-S4 ingest: strip the media + web_search keys off blocks_json.
+    blocks = json.loads(conn.execute(
+        "SELECT blocks_json FROM conversation_messages WHERE uuid='u1'").fetchone()[0])
+    for b in blocks:
+        b.pop("media", None)
+        b.pop("web_search", None)
+    conn.execute("UPDATE conversation_messages SET blocks_json=? WHERE uuid='u1'",
+                 (json.dumps(blocks, separators=(",", ":")),))
+    conn.commit()
+    stale = json.loads(conn.execute(
+        "SELECT blocks_json FROM conversation_messages WHERE uuid='u1'").fetchone()[0])
+    assert all("media" not in b for b in stale)
+
+    # Run the real 009 handler (flag-only) then sync to consume it.
+    db._009_conversation_media_reingest(conn)
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='conversation_media_reingest_pending'"
+    ).fetchone() is not None
+    sync()
+
+    re_blocks = json.loads(conn.execute(
+        "SELECT blocks_json FROM conversation_messages WHERE uuid='u1'").fetchone()[0])
+    tr = [b for b in re_blocks if b["kind"] == "tool_result"][0]
+    assert tr["media"] == [{"kind": "image", "media_type": "image/png",
+                            "bytes": 4, "index": 0}], "media[] re-derived by the parser"
+    assert tr["web_search"]["query"] == "q1", "web_search capture re-derived"
+    for key in ("conversation_media_reingest_pending",
+                "conversation_reingest_cursor", "conversation_reingest_cursor_gen"):
+        assert conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?", (key,)
+        ).fetchone() is None, f"{key} dropped after consumption"

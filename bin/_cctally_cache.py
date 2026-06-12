@@ -638,12 +638,17 @@ def sync_cache(
             # input / full_length / stop_reason / attribution / search_aux); the
             # same offset-0 walk re-derives those through the enriched parser, so
             # drop that flag here too — MISSING this site re-arms the flag on
-            # every cache-sync --rebuild.
+            # every cache-sync --rebuild. #177 S4 migration 009 sets the DISTINCT
+            # conversation_media_reingest_pending flag (to land tool_result
+            # media[] placeholders + user-content media index + web_search/
+            # web_fetch captures); the same offset-0 walk re-derives them, so drop
+            # that flag here as well.
             conn.execute(
                 "DELETE FROM cache_meta WHERE key IN "
                 "('conversation_reingest_pending',"
                 " 'conversation_source_tool_use_reingest_pending',"
                 " 'conversation_reingest_enrichment_pending',"
+                " 'conversation_media_reingest_pending',"
                 " 'conversation_reingest_cursor',"
                 " 'conversation_reingest_cursor_gen')")
             conn.commit()
@@ -712,15 +717,20 @@ def sync_cache(
             # input_truncated, the raised result cap + full_length, stop_reason /
             # attribution_skill / attribution_plugin, and the search_aux FTS-aux
             # blob); the offset-0 re-parse through the enriched parser lands them
-            # all with zero new consumption code. We trigger the SAME clear +
-            # offset-0 backfill on ANY of these flags and clear them ALL atomically
-            # here under the held flock.
+            # all with zero new consumption code. #177 S4 migration 009 uses yet
+            # ANOTHER distinct flag ``conversation_media_reingest_pending`` to land
+            # the tool_result media[] placeholders + user-content media index +
+            # web_search/web_fetch captures; same offset-0 re-parse, same reason
+            # for a distinct flag. We trigger the SAME clear + offset-0 backfill on
+            # ANY of these flags and clear them ALL atomically here under the held
+            # flock.
             try:
                 _reingest = conn.execute(
                     "SELECT 1 FROM cache_meta WHERE key IN "
                     "('conversation_reingest_pending',"
                     " 'conversation_source_tool_use_reingest_pending',"
-                    " 'conversation_reingest_enrichment_pending')"
+                    " 'conversation_reingest_enrichment_pending',"
+                    " 'conversation_media_reingest_pending')"
                 ).fetchone() is not None
             except sqlite3.OperationalError:
                 _reingest = False
@@ -1163,6 +1173,7 @@ _REINGEST_FLAG_KEYS = (
     "conversation_reingest_pending",
     "conversation_source_tool_use_reingest_pending",
     "conversation_reingest_enrichment_pending",
+    "conversation_media_reingest_pending",   # #177 S4 (migration 009)
 )
 
 
@@ -1189,8 +1200,8 @@ def _resumable_reingest_conversation_messages(conn):
     fingerprint (the set of pending reingest flags) resets the cursor whenever the
     pending-flag set changes, so a newly-armed flag forces a fresh pass. The caller
     (``sync_cache``) already holds the cache.db flock; per-file commits bound only
-    the SQLite write transaction, not the flock. Clears the three flags + cursor +
-    gen atomically on completion."""
+    the SQLite write transaction, not the flock. Clears all _REINGEST_FLAG_KEYS +
+    cursor + gen atomically on completion."""
     # 1. Generation guard: reset the cursor if the live pending-flag set differs.
     set_flags = [k for k in _REINGEST_FLAG_KEYS
                  if conn.execute("SELECT 1 FROM cache_meta WHERE key=?", (k,)).fetchone()]
@@ -1243,6 +1254,7 @@ def _resumable_reingest_conversation_messages(conn):
         "('conversation_reingest_pending',"
         " 'conversation_source_tool_use_reingest_pending',"
         " 'conversation_reingest_enrichment_pending',"
+        " 'conversation_media_reingest_pending',"
         " 'conversation_reingest_cursor',"
         " 'conversation_reingest_cursor_gen')")
     conn.commit()

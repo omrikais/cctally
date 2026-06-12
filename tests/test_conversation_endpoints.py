@@ -562,3 +562,260 @@ def test_sse_update_envelope_carries_transcripts_enabled(tmp_path, monkeypatch):
         assert env["transcriptsEnabled"] is False
     finally:
         srv.shutdown()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #177 S4: the on-demand media route. Serves decoded image/PDF bytes by
+# re-reading the source JSONL (the #178 mechanism), behind the privacy gate +
+# a Fetch-Metadata cross-origin check. Re-uses the booted-handler harness.
+# ──────────────────────────────────────────────────────────────────────────
+import base64 as _b64
+
+PNG_BYTES = b"\x89PNG_fake_pixels"
+PNG_B64 = _b64.b64encode(PNG_BYTES).decode()
+PDF_BYTES = b"%PDF-fake"
+PDF_B64 = _b64.b64encode(PDF_BYTES).decode()
+
+
+def _get_media(port, path, *, host=None, sec_fetch_site=None):
+    """GET helper that returns ``(status, headers, body)`` so the media route's
+    exact response headers can be asserted. Optional Host (gate spoof) +
+    Sec-Fetch-Site (Fetch-Metadata oracle) headers."""
+    c = HTTPConnection("127.0.0.1", port, timeout=5)
+    c.putrequest("GET", path, skip_host=(host is not None))
+    if host is not None:
+        c.putheader("Host", host)
+    if sec_fetch_site is not None:
+        c.putheader("Sec-Fetch-Site", sec_fetch_site)
+    c.endheaders()
+    r = c.getresponse()
+    body = r.read()
+    status = r.status
+    headers = dict(r.getheaders())
+    c.close()
+    return status, headers, body
+
+
+def _seed_media_rows(ns, tmp_path):
+    """Seed conversation_messages rows for the media route, pointing
+    source_path/byte_offset at a REAL JSONL on disk so read_media_bytes can
+    re-read it. Two lines:
+
+      line 0 — a user tool_result whose content array holds a PNG image item
+               (the MCP-screenshot shape) addressed by tool_use_id=tu_img.
+      line 1 — a user-content document (PDF) addressed by uuid=ud.
+    Returns the JSONL path so a 410 test can delete it."""
+    p = tmp_path / "media.jsonl"
+    line0 = (json.dumps({"type": "user", "uuid": "ur", "sessionId": "sm",
+                         "timestamp": "t", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "tu_img", "content": [
+            {"type": "image", "source": {"type": "base64",
+                                         "media_type": "image/png",
+                                         "data": PNG_B64}}]}]}}) + "\n").encode()
+    line1 = (json.dumps({"type": "user", "uuid": "ud", "sessionId": "sm",
+                         "timestamp": "t", "message": {"role": "user", "content": [
+        {"type": "document", "source": {"type": "base64",
+                                        "media_type": "application/pdf",
+                                        "data": PDF_B64}}]}}) + "\n").encode()
+    with open(p, "wb") as fh:
+        fh.write(line0)
+        fh.write(line1)
+
+    cache = ns["open_cache_db"]()
+    cache.execute(
+        "INSERT OR IGNORE INTO conversation_messages "
+        "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+        " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,"
+        " is_sidechain) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("sm", "ur", None, str(p), 0, "2026-06-06T00:00:00Z", "tool_result", "",
+         json.dumps([{"kind": "tool_result", "text": "", "truncated": False,
+                      "full_length": 0, "is_error": False, "tool_use_id": "tu_img",
+                      "media": [{"kind": "image", "media_type": "image/png",
+                                 "bytes": len(PNG_B64), "index": 0}]}]),
+         None, None, None, None, None, 0))
+    cache.execute(
+        "INSERT OR IGNORE INTO conversation_messages "
+        "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+        " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,"
+        " is_sidechain) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("sm", "ud", None, str(p), len(line0), "2026-06-06T00:00:01Z", "human", "",
+         json.dumps([{"kind": "document", "media_type": "application/pdf",
+                      "bytes": len(PDF_B64), "index": 0}]),
+         None, None, None, None, None, 0))
+    cache.commit()
+    cache.close()
+    return p
+
+
+def test_media_route_serves_png(tmp_path, monkeypatch):
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        _seed_media_rows(ns, tmp_path)
+        status, headers, body = _get_media(
+            port, "/api/conversation/sm/media?tool_use_id=tu_img&index=0")
+        assert status == 200, (status, body)
+        assert body == PNG_BYTES
+        assert headers["Content-Type"] == "image/png"
+        assert headers["X-Content-Type-Options"] == "nosniff"
+        assert headers["Content-Security-Policy"] == "default-src 'none'"
+        assert headers["Cache-Control"] == "private, max-age=86400"
+        assert "Content-Disposition" not in headers
+    finally:
+        srv.shutdown()
+
+
+def test_media_route_pdf_disposition(tmp_path, monkeypatch):
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        _seed_media_rows(ns, tmp_path)
+        status, headers, body = _get_media(
+            port, "/api/conversation/sm/media?uuid=ud&index=0")
+        assert status == 200, (status, body)
+        assert body == PDF_BYTES
+        assert headers["Content-Type"] == "application/pdf"
+        assert headers["Content-Disposition"] == 'inline; filename="attachment-0.pdf"'
+        assert "Content-Security-Policy" not in headers   # no CSP sandbox for PDFs
+    finally:
+        srv.shutdown()
+
+
+def test_media_route_param_validation(tmp_path, monkeypatch):
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        _seed_media_rows(ns, tmp_path)
+        for path in (
+            "/api/conversation/sm/media?index=0",                       # no key
+            "/api/conversation/sm/media?tool_use_id=tu_img&uuid=ud&index=0",  # both keys
+            "/api/conversation/sm/media?tool_use_id=tu_img&index=-1",   # negative
+            "/api/conversation/sm/media?tool_use_id=tu_img&index=abc",  # non-int
+        ):
+            status, _, _ = _get_media(port, path)
+            assert status == 400, (path, status)
+    finally:
+        srv.shutdown()
+
+
+def test_media_route_404_unknown_and_unsupported(tmp_path, monkeypatch):
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        p = _seed_media_rows(ns, tmp_path)
+        # unknown tool_use_id -> 404
+        status, _, _ = _get_media(
+            port, "/api/conversation/sm/media?tool_use_id=nope&index=0")
+        assert status == 404
+        # placeholder exists but the source's media_type is not allowlisted -> 404.
+        bmp_line = (json.dumps({"type": "user", "uuid": "ub", "sessionId": "sm",
+                                "timestamp": "t", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tu_bmp", "content": [
+                {"type": "image", "source": {"media_type": "image/bmp",
+                                             "data": PNG_B64}}]}]}}) + "\n").encode()
+        with open(p, "ab") as fh:
+            off = p.stat().st_size
+            fh.write(bmp_line)
+        cache = ns["open_cache_db"]()
+        cache.execute(
+            "INSERT OR IGNORE INTO conversation_messages "
+            "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+            " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,"
+            " is_sidechain) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("sm", "ub", None, str(p), off, "2026-06-06T00:00:02Z", "tool_result", "",
+             json.dumps([{"kind": "tool_result", "text": "", "truncated": False,
+                          "full_length": 0, "is_error": False, "tool_use_id": "tu_bmp",
+                          "media": [{"kind": "image", "media_type": "image/bmp",
+                                     "bytes": len(PNG_B64), "index": 0}]}]),
+             None, None, None, None, None, 0))
+        cache.commit()
+        cache.close()
+        status, _, _ = _get_media(
+            port, "/api/conversation/sm/media?tool_use_id=tu_bmp&index=0")
+        assert status == 404
+    finally:
+        srv.shutdown()
+
+
+def test_media_route_410_gone(tmp_path, monkeypatch):
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        p = _seed_media_rows(ns, tmp_path)
+        p.unlink()                                  # delete the source JSONL
+        status, _, body = _get_media(
+            port, "/api/conversation/sm/media?tool_use_id=tu_img&index=0")
+        assert status == 410, (status, body)
+    finally:
+        srv.shutdown()
+
+
+def test_media_route_403_gate_and_cross_site(tmp_path, monkeypatch):
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        _seed_media_rows(ns, tmp_path)
+        # spoofed LAN Host + expose off -> 403 (gate reused verbatim).
+        status, _, _ = _get_media(
+            port, "/api/conversation/sm/media?tool_use_id=tu_img&index=0",
+            host="evil.example:8789")
+        assert status == 403
+        # cross-site Sec-Fetch-Site -> 403 (Codex F1 embed defense).
+        status, _, _ = _get_media(
+            port, "/api/conversation/sm/media?tool_use_id=tu_img&index=0",
+            sec_fetch_site="cross-site")
+        assert status == 403
+        # same-origin -> 200; absent header -> 200 (defense-in-depth, not primary).
+        status, _, body = _get_media(
+            port, "/api/conversation/sm/media?tool_use_id=tu_img&index=0",
+            sec_fetch_site="same-origin")
+        assert status == 200 and body == PNG_BYTES
+        status, _, body = _get_media(
+            port, "/api/conversation/sm/media?tool_use_id=tu_img&index=0")
+        assert status == 200 and body == PNG_BYTES
+    finally:
+        srv.shutdown()
+
+
+def test_media_route_413_too_large(tmp_path, monkeypatch):
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        # Force the loaded kernel module's payload ceiling tiny so a small
+        # base64 string trips the encoded-length precheck -> 413. The handler
+        # resolves the sibling via sys.modules["_lib_conversation_query"]; pin
+        # the same instance the route uses.
+        cq_mod = ns["_load_sibling"]("_lib_conversation_query")
+        monkeypatch.setattr(cq_mod, "_MEDIA_PAYLOAD_CEILING", 8)
+        p = tmp_path / "big.jsonl"
+        big = "A" * 100   # > 8 * 4/3 encoded-precheck
+        line = (json.dumps({"type": "user", "uuid": "ubig", "sessionId": "sm",
+                            "timestamp": "t", "message": {"role": "user", "content": [
+            {"type": "image", "source": {"media_type": "image/png",
+                                         "data": big}}]}}) + "\n").encode()
+        with open(p, "wb") as fh:
+            fh.write(line)
+        cache = ns["open_cache_db"]()
+        cache.execute(
+            "INSERT OR IGNORE INTO conversation_messages "
+            "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+            " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,"
+            " is_sidechain) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("sm", "ubig", None, str(p), 0, "2026-06-06T00:00:03Z", "human", "",
+             json.dumps([{"kind": "image", "media_type": "image/png",
+                          "bytes": len(big), "index": 0}]),
+             None, None, None, None, None, 0))
+        cache.commit()
+        cache.close()
+        status, _, body = _get_media(
+            port, "/api/conversation/sm/media?uuid=ubig&index=0")
+        assert status == 413, (status, body)
+    finally:
+        srv.shutdown()

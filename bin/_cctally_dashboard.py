@@ -5345,6 +5345,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # #178: on-demand load-full. Matched BEFORE the <id> reader
             # catch-all (same precedence as /api/conversation/search).
             self._handle_get_conversation_payload(path)
+        elif path.startswith("/api/conversation/") and path.endswith("/media"):
+            # #177 S4: on-demand media bytes. Matched BEFORE the <id> reader.
+            self._handle_get_conversation_media(path)
         elif path.startswith("/api/conversation/"):
             self._handle_get_conversation_detail(path)
         else:
@@ -7387,6 +7390,77 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._respond_json(410, {"error": "source no longer available"})
             return
         self._respond_json(200, payload)
+
+    _MEDIA_FETCH_SITE_ALLOWED = ("same-origin", "same-site", "none")
+
+    def _handle_get_conversation_media(self, path: str) -> None:
+        """``GET /api/conversation/<sid>/media?tool_use_id=<id>&index=N`` or
+        ``?uuid=<uuid>&index=N`` (#177 S4) — serves decoded image/PDF bytes by
+        re-reading the source JSONL line (the #178 mechanism). Nothing is ever
+        written to cache.db or disk; no outbound requests.
+
+        Gated FIRST by the transcript privacy predicate (fail-closed 403),
+        then by Fetch-Metadata: unlike the JSON routes, images embed
+        cross-origin (an <img src> on any website the user visits passes the
+        Host/loopback gate and leaks existence + dimensions via
+        onload/naturalWidth), so a PRESENT Sec-Fetch-Site header must be
+        same-origin/same-site/none; an absent header (curl, older browsers)
+        is allowed — defense-in-depth, not the primary gate (Codex F1).
+        Exactly one addressing key (tool_use_id XOR uuid) + a non-negative
+        integer index, else 400. Content-Type is the kernel's allowlist
+        constant; images get CSP default-src 'none'; PDFs get inline
+        Content-Disposition instead (a CSP sandbox would break native PDF
+        viewers)."""
+        if not self._require_transcripts_allowed():
+            return
+        sfs = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if sfs and sfs not in self._MEDIA_FETCH_SITE_ALLOWED:
+            self._respond_json(403, {"error": "cross-site media fetch not allowed"})
+            return
+        import urllib.parse as _u
+        session_id = _u.unquote(path[len("/api/conversation/"):-len("/media")])
+        q = _u.parse_qs(self.path.partition("?")[2])
+        tool_use_id = _qs_str(q, "tool_use_id", "")
+        uuid = _qs_str(q, "uuid", "")
+        index_raw = _qs_str(q, "index", "")
+        if (not session_id or bool(tool_use_id) == bool(uuid)
+                or not index_raw.isdigit()):
+            self._respond_json(400, {"error": "bad request"})
+            return
+        index = int(index_raw)
+        key = ({"tool_use_id": tool_use_id} if tool_use_id else {"uuid": uuid})
+        cq = self._conversation_query()
+        ok, loc = self._run_conversation_query(
+            lambda conn: cq.locate_media(conn, session_id, index=index, **key),
+            "/api/conversation/media")
+        if not ok:
+            return
+        if loc is None:
+            self._respond_json(404, {"error": "not found"})
+            return
+        status, media_type, raw = cq.read_media_bytes(
+            loc[0], loc[1], index=index, **key)
+        if status == "unsupported":
+            self._respond_json(404, {"error": "not found"})
+            return
+        if status == "too_large":
+            self._respond_json(413, {"error": "media too large"})
+            return
+        if status != "ok":
+            self._respond_json(410, {"error": "source no longer available"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", media_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "private, max-age=86400")
+        if media_type == "application/pdf":
+            self.send_header("Content-Disposition",
+                             f'inline; filename="attachment-{index}.pdf"')
+        else:
+            self.send_header("Content-Security-Policy", "default-src 'none'")
+        self.end_headers()
+        self.wfile.write(raw)
 
     def _handle_get_project_detail(self) -> None:
         """Return ProjectDetail JSON for ``GET /api/project/<key>?weeks=N``

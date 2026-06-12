@@ -3207,6 +3207,24 @@ def _008_session_entries_speed_backfill(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@cache_migration("009_conversation_media_reingest")
+def _009_conversation_media_reingest(conn: sqlite3.Connection) -> None:
+    """Flag-only re-ingest so the #177 S4 media/web enrichment — tool_result
+    ``media[]`` placeholders (iter_media_items ordinals), user-content media
+    ``index``, and the bounded ``web_search``/``web_fetch`` toolUseResult
+    captures — lands on existing history. Sets the DISTINCT
+    ``conversation_media_reingest_pending`` flag (NOT the shared
+    ``conversation_reingest_pending``, which also gates migration 005's
+    read-time human-fallback in the query kernel). Consumption rides the #179
+    RESUMABLE per-file reingest (_resumable_reingest_conversation_messages) —
+    the flag is wired into _REINGEST_FLAG_KEYS + both flag SELECTs + the two
+    cleanup DELETE lists in _cctally_cache.py (all five sites; missing one
+    either never triggers or re-arms forever). Central stamp via the
+    dispatcher (#140); a fresh install stamps it without running."""
+    _set_cache_meta(conn, "conversation_media_reingest_pending", "1")
+    conn.commit()
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")

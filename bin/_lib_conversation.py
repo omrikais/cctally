@@ -24,6 +24,13 @@ _INPUT_MAX_DEPTH = 12      # max nesting depth before subtree elision (Recursion
 _INPUT_KEY_CAP = 512       # max chars per dict key (else keys are stored verbatim, unbounded)
 _INPUT_ELISION = "…"       # sentinel for elided leaves / subtrees
 
+# #177 S4: WebSearch link-list capture bounds + the media item types whose
+# placeholders the ordinal chokepoint (iter_media_items) addresses.
+_WEB_SEARCH_LINK_CAP = 50
+_WEB_LINK_TITLE_CAP = 300
+_WEB_LINK_URL_CAP = 2000
+_MEDIA_BLOCK_TYPES = ("image", "document")
+
 
 @dataclass
 class MessageRow:
@@ -107,6 +114,8 @@ def _normalize(obj, t, offset):
         _attach_subagent_result(blocks, obj)   # #166: record-level toolUseResult
         _attach_ask_answers(blocks, obj)       # #177 S2: AskUserQuestion answers
         _attach_bash_streams(blocks, obj)      # #177 S3: Bash stderr/interrupted
+        _attach_web_search(blocks, obj)        # #177 S4: WebSearch link list
+        _attach_web_fetch(blocks, obj)         # #177 S4: WebFetch HTTP status
         _attach_task_meta(blocks, obj)         # task checklist identity
         # tool_result rows are stored but NOT indexed as prose (spec §2). A
         # user line that mixes a text block with a tool_result block must not
@@ -174,6 +183,10 @@ def _blocks_and_text(content):
         return (([{"kind": "text", "text": content}] if content else []), content, "")
     blocks, texts, aux_parts = [], [], []
     if isinstance(content, list):
+        # #177 S4: ordinal among media items at THIS list level, keyed by the
+        # object identity of each image/document item, so the placeholder writers
+        # below stamp the same ``index`` the media-route reader recomputes.
+        media_index = {id(item): idx for idx, item in iter_media_items(content)}
         for b in content:
             if not isinstance(b, dict):
                 continue
@@ -202,14 +215,24 @@ def _blocks_and_text(content):
             elif bt == "tool_result":
                 raw = _stringify(b.get("content"))
                 clipped = raw[:_TOOL_RESULT_CAP]
-                blocks.append({"kind": "tool_result", "text": clipped,
-                               "truncated": len(raw) > _TOOL_RESULT_CAP,
-                               "full_length": len(raw),
-                               "is_error": bool(b.get("is_error")),
-                               "tool_use_id": b.get("tool_use_id")})
+                block = {"kind": "tool_result", "text": clipped,
+                         "truncated": len(raw) > _TOOL_RESULT_CAP,
+                         "full_length": len(raw),
+                         "is_error": bool(b.get("is_error")),
+                         "tool_use_id": b.get("tool_use_id")}
+                # #177 S4: media placeholders for image/document items inside the
+                # tool_result content array (where every MCP screenshot lives) —
+                # ordinals from the shared iter_media_items chokepoint.
+                media = [{"kind": item.get("type"), **_media(item.get("source")),
+                          "index": idx}
+                         for idx, item in iter_media_items(b.get("content"))]
+                if media:                      # omitted when empty (additive)
+                    block["media"] = media
+                blocks.append(block)
                 aux_parts.append(clipped)
             elif bt in ("image", "document"):
-                blocks.append({"kind": bt, **_media(b.get("source"))})
+                blocks.append({"kind": bt, **_media(b.get("source")),
+                               "index": media_index[id(b)]})
             elif bt == "tool_reference":
                 blocks.append({"kind": "tool_reference", "name": b.get("name")})
     return (blocks, "\n".join(t for t in texts if t),
@@ -317,6 +340,78 @@ def _attach_bash_streams(blocks, obj):
         results[0]["bash_stderr"] = stderr[:_TOOL_RESULT_CAP]
     if bool(tur.get("interrupted")):
         results[0]["bash_interrupted"] = True
+
+
+def _attach_web_search(blocks, obj):
+    """Stash a WebSearch toolUseResult's structured link list onto its single
+    tool_result block (#177 S4). Self-identifying: fires only on the WebSearch
+    shape (string ``query`` + list ``results``); the query kernel additionally
+    joins NAME-KEYED (only onto name=='WebSearch'), so a shape-coincident
+    toolUseResult from another tool never decorates the wrong card (Codex F3).
+    Links flatten from results[].content[]; items lacking string title+url are
+    skipped; bounded (<=_WEB_SEARCH_LINK_CAP links, title/url char caps) with
+    ``links_truncated`` when links were dropped. Parser-private key
+    ``web_search`` is popped in the query layer's Phase 1 so it never leaks on
+    orphan blocks. Same exactly-one-result-block guard as
+    _attach_subagent_result."""
+    tur = obj.get("toolUseResult")
+    if not isinstance(tur, dict):
+        return
+    query = tur.get("query")
+    raw_results = tur.get("results")
+    if not isinstance(query, str) or not isinstance(raw_results, list):
+        return
+    results = [b for b in blocks if b.get("kind") == "tool_result"]
+    if len(results) != 1:
+        return
+    links, dropped = [], False
+    for r in raw_results:
+        content = r.get("content") if isinstance(r, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not (isinstance(item, dict) and isinstance(item.get("title"), str)
+                    and isinstance(item.get("url"), str)):
+                continue
+            if len(links) >= _WEB_SEARCH_LINK_CAP:
+                dropped = True
+                break
+            links.append({"title": item["title"][:_WEB_LINK_TITLE_CAP],
+                          "url": item["url"][:_WEB_LINK_URL_CAP]})
+        if dropped:
+            break
+    payload = {"query": query[:_WEB_LINK_TITLE_CAP], "links": links}
+    if dropped:
+        payload["links_truncated"] = True
+    results[0]["web_search"] = payload
+
+
+def _attach_web_fetch(blocks, obj):
+    """Stash a WebFetch toolUseResult's HTTP status onto its single tool_result
+    block (#177 S4). Self-identifying on the WebFetch triple — ``code`` +
+    ``codeText`` + ``result`` keys all present and ``code`` an int; the query
+    kernel additionally joins NAME-KEYED (only onto name=='WebFetch'). A bare
+    error-string toolUseResult never matches (the card then renders without a
+    status chip — the documented degrade). Only the status is stored (the
+    summary already IS result.text). Parser-private key ``web_fetch`` is popped
+    in Phase 1. Same exactly-one-result-block guard as
+    _attach_subagent_result."""
+    tur = obj.get("toolUseResult")
+    if not isinstance(tur, dict):
+        return
+    if "code" not in tur or "codeText" not in tur or "result" not in tur:
+        return
+    code = tur.get("code")
+    if not isinstance(code, int):
+        return
+    results = [b for b in blocks if b.get("kind") == "tool_result"]
+    if len(results) != 1:
+        return
+    meta = {"code": code}
+    code_text = tur.get("codeText")
+    if isinstance(code_text, str) and code_text:
+        meta["code_text"] = code_text[:100]
+    results[0]["web_fetch"] = meta
 
 
 # Subagent Task tools record toolUseResult=null and put the identity in the
@@ -513,3 +608,20 @@ def _media(source):
         return {"media_type": None, "bytes": 0}
     data = source.get("data") or ""
     return {"media_type": source.get("media_type"), "bytes": len(data)}
+
+
+def iter_media_items(content):
+    """Yield ``(index, item)`` for every image/document item in a content list,
+    in document order. ``index`` is the ordinal AMONG MEDIA ITEMS (not the list
+    position) — the stable address shared by the ingest placeholder writer here
+    and the media-route reader (read_media_bytes), so "media item N" can never
+    mean two different things (the _canonical_5h_window_key lesson applied to
+    media addressing — do NOT write a second walk). Non-list input and
+    non-dict / non-media entries are skipped without consuming an ordinal."""
+    if not isinstance(content, list):
+        return
+    idx = 0
+    for item in content:
+        if isinstance(item, dict) and item.get("type") in _MEDIA_BLOCK_TYPES:
+            yield idx, item
+            idx += 1
