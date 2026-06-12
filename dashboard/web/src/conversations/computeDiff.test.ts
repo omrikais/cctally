@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeDiff, computeWrite } from './computeDiff';
+import { computeDiff, computeWrite, computeMultiEdit } from './computeDiff';
 
 describe('computeDiff', () => {
   it('line diff with running numbers', () => {
@@ -59,5 +59,33 @@ describe('computeDiff', () => {
     // Only the first del/add pair gets word segments; the trailing del stays plain.
     expect(adds[0].segments).toBeDefined();
     expect(dels[1].segments).toBeUndefined();
+  });
+});
+
+describe('computeMultiEdit', () => {
+  it('produces one hunk per edit, in order, each its own DiffRow[]', () => {
+    const hunks = computeMultiEdit([
+      { old_string: 'a', new_string: 'b' },
+      { old_string: 'c\nc2\n', new_string: 'C\nc2\n' },
+    ]);
+    expect(hunks.length).toBe(2);
+    // First hunk: a → b (a del/add pair).
+    expect(hunks[0].map((r) => r.type)).toEqual(['del', 'add']);
+    // Second hunk: only the first line changed; second line is context.
+    expect(hunks[1].map((r) => r.type)).toEqual(['del', 'add', 'context']);
+  });
+
+  it('tolerates non-string edit leaves (defensive): missing strings → empty', () => {
+    const hunks = computeMultiEdit([
+      { old_string: 'x', new_string: 'y' },
+      { old_string: undefined, new_string: 'z' } as unknown as { old_string: string; new_string: string },
+    ]);
+    expect(hunks.length).toBe(2);
+    // Second hunk treats the missing old_string as '' → pure add.
+    expect(hunks[1].every((r) => r.type === 'add')).toBe(true);
+  });
+
+  it('non-array input yields no hunks', () => {
+    expect(computeMultiEdit(undefined as unknown as [])).toEqual([]);
   });
 });

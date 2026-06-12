@@ -88,3 +88,24 @@ export function computeWrite(content: string): DiffRow[] {
     text: line,
   }));
 }
+
+// One edit in a MultiEdit call. The wire input is Record<string, unknown>, so
+// callers may hand us missing/non-string leaves — coerce each side to '' so a
+// malformed edit degrades to a pure add/del rather than throwing.
+export interface MultiEditEntry {
+  old_string?: unknown;
+  new_string?: unknown;
+}
+
+// MultiEdit renders one independent hunk per edit, in order (spec §4.1). B1 did
+// not build this; rather than a synthetic combined diff (which loses the
+// per-edit boundary), we diff each edit's old/new in isolation so the card can
+// divider them as `edit k of n`. Non-array input → no hunks.
+export function computeMultiEdit(edits: MultiEditEntry[]): DiffRow[][] {
+  if (!Array.isArray(edits)) return [];
+  return edits.map((e) => {
+    const oldStr = typeof e?.old_string === 'string' ? e.old_string : '';
+    const newStr = typeof e?.new_string === 'string' ? e.new_string : '';
+    return computeDiff(oldStr, newStr);
+  });
+}
