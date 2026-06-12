@@ -5,6 +5,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Dashboard: the web dashboard no longer hangs on startup when you have a large conversation history. It now binds its HTTP port and serves the six cost/usage panels immediately, building the first heavy cache sync on a background thread and pushing the enriched conversation data over SSE once it completes — instead of blocking the bind behind a multi-minute (and, if interrupted, indefinite) first sync. `--no-sync` startup is byte-identical (#179).
+- Dashboard conversation reader: the one-time conversation-enrichment reingest (the #177 re-derivation that runs once over existing transcripts) is now resumable. It walks transcript files under a sorted-path cursor, re-enriching one file per atomic transaction, so a Ctrl-C or crash mid-reingest resumes where it left off on the next sync instead of restarting the full clear-and-backfill from scratch — which previously could hold the cache writer lock and hang. `cache-sync --rebuild` remains the clean one-shot recovery path (#179).
+
 ## [1.37.1] - 2026-06-11
 
 ### Fixed
