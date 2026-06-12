@@ -28,6 +28,24 @@ describe('useFullPayload', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('coalesces two synchronous load() calls into a single fetch', async () => {
+    // A user double-clicking the load-full affordance fires load() twice
+    // SYNCHRONOUSLY (no await between). The async `state.status` guard can't see
+    // the first call's 'loading' yet, so without a synchronous in-flight ref
+    // both calls would fire a fetch. The ref must collapse them to one.
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200, json: async () => ({ which: 'result', text: 'FULL' }) });
+    vi.stubGlobal('fetch', fetchMock);
+    const { result } = renderHook(() => useFullPayload('s1', 't1', 'result'));
+    await act(async () => {
+      // Two synchronous calls, both awaited together — the second must short-circuit.
+      await Promise.all([result.current.load(), result.current.load()]);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.current.status).toBe('done');
+  });
+
   it('builds the route URL with encoded session/tool ids and the which discriminator', async () => {
     const fetchMock = vi
       .fn()

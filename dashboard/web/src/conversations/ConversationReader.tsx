@@ -173,6 +173,9 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
     () => (detail ? deriveReaderTitle(detail) : ''),
     [detail],
   );
+  // Stable provider value so context consumers (the cards) don't re-render on
+  // every reader render from a fresh object identity.
+  const transcriptCtx = useMemo(() => ({ sessionId }), [sessionId]);
 
   // Lazy-load when the bottom sentinel scrolls into view.
   useEffect(() => {
@@ -461,7 +464,7 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
         </div>
       </div>
       <div className="conv-reader-body" ref={bodyRef} onScroll={onBodyScroll}>
-        <TranscriptContext.Provider value={{ sessionId }}>
+        <TranscriptContext.Provider value={transcriptCtx}>
         <div className="conv-reader-thread" ref={threadRef}>
           {groups.map((g, idx) => {
             if (g.kind === 'subagent') {

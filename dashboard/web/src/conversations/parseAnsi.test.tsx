@@ -28,4 +28,17 @@ describe('parseAnsi', () => {
   it('returns no spans for the empty string', () => {
     expect(parseAnsi('')).toEqual([]);
   });
+  it('strips an OSC sequence (BEL- and ST-terminated) and a bare ESC, leaving clean text', () => {
+    // OSC title-set, BEL-terminated: `\x1b]0;title\x07`.
+    expect(parseAnsi('a\x1b]0;title\x07b')).toEqual([{ text: 'ab', cls: null }]);
+    // OSC, ST-terminated (`\x1b\\`).
+    expect(parseAnsi('a\x1b]0;title\x1b\\b')).toEqual([{ text: 'ab', cls: null }]);
+    // A lone/truncated ESC must not leak a raw control byte.
+    expect(parseAnsi('a\x1bb')).toEqual([{ text: 'ab', cls: null }]);
+    // A truncated CSI at end-of-string (no final letter) — OTHER_ESC can't match
+    // it, so the lone-ESC pass strips the leftover `\x1b`, leaving the `[12;`.
+    expect(parseAnsi('a\x1b[12;')).toEqual([{ text: 'a[12;', cls: null }]);
+    // OSC + SGR color still tokenizes the color and drops the OSC.
+    expect(parseAnsi('\x1b]0;t\x07\x1b[31mred\x1b[0m')).toEqual([{ text: 'red', cls: 'ansi-red' }]);
+  });
 });

@@ -23,6 +23,14 @@ const SGR_FG: Record<number, string> = {
 
 const SGR = /\x1b\[([0-9;]*)m/g;
 const OTHER_ESC = /\x1b\[[0-9;]*[A-Za-z]/g;
+// Final cleanup pass for escapes the well-formed-CSI strip above leaves behind:
+// an OSC sequence (`\x1b]…` terminated by BEL `\x07` or ST `\x1b\\`, or
+// unterminated to end-of-string) and any lone/truncated `\x1b`. Without this a
+// bare ESC or an OSC title-set leaks a raw control byte that renders as a
+// replacement glyph. Order matters — OSC first so its leading ESC isn't eaten
+// by the lone-ESC rule.
+const OSC = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g;
+const LONE_ESC = /\x1b/g;
 
 // Split `input` into color-tagged spans. A `\x1b[…m` SGR marker either resets
 // (empty arg or code 0) or selects a foreground color; runs between markers
@@ -44,10 +52,14 @@ export function parseAnsi(input: string): AnsiSpan[] {
     last = SGR.lastIndex;
   }
   if (last < input.length) spans.push({ text: input.slice(last), cls });
-  // Strip any leftover non-SGR escapes from the visible text, then drop the
-  // spans that strip left empty.
+  // Strip any leftover escapes from the visible text — well-formed non-SGR CSI
+  // first, then OSC sequences and any lone/truncated `\x1b` — and drop the spans
+  // that strip left empty.
   return spans
-    .map((s) => ({ ...s, text: s.text.replace(OTHER_ESC, '') }))
+    .map((s) => ({
+      ...s,
+      text: s.text.replace(OTHER_ESC, '').replace(OSC, '').replace(LONE_ESC, ''),
+    }))
     .filter((s) => s.text.length > 0);
 }
 

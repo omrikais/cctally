@@ -192,7 +192,7 @@ export type FullPayload =
       text: string;
       full_length: number;
       truncated: boolean;
-      is_error?: boolean;
+      is_error: boolean; // read_full_payload ALWAYS emits this on the result branch
       stderr?: string | null;
     }
   | {

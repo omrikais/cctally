@@ -6,7 +6,7 @@
 // friendly message for the 410 source-gone case. No-ops when there's no open
 // session id (sessionId === null).
 
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import type { FullPayload } from '../types/conversation';
 
 type State =
@@ -21,9 +21,19 @@ export function useFullPayload(
   which: 'result' | 'input',
 ) {
   const [state, setState] = useState<State>({ status: 'idle' });
+  // Synchronous in-flight guard (mirrors useConversation's loadingMoreRef /
+  // pollingRef). `state.status` is async React state, so two SYNCHRONOUS load()
+  // calls — a user double-clicking the load-full affordance — would both still
+  // read status:'idle' and fire two fetches. The ref flips true BEFORE the
+  // setState({status:'loading'}) so the second synchronous call short-circuits.
+  // `doneRef` mirrors the once-done cache so a repeat load() after success is a
+  // no-op even before its setState commits.
+  const inFlightRef = useRef(false);
+  const doneRef = useRef(false);
   const load = useCallback(async () => {
-    // Already loaded / in flight, or nothing to address → nothing to do.
-    if (state.status === 'done' || state.status === 'loading' || !sessionId) return;
+    // Already loaded / in flight (sync ref), or nothing to address → nothing to do.
+    if (inFlightRef.current || doneRef.current || !sessionId) return;
+    inFlightRef.current = true;
     setState({ status: 'loading' });
     try {
       const url =
@@ -39,10 +49,13 @@ export function useFullPayload(
         });
         return;
       }
+      doneRef.current = true;
       setState({ status: 'done', data: (await r.json()) as FullPayload });
     } catch {
       setState({ status: 'error', error: 'network error' });
+    } finally {
+      inFlightRef.current = false;
     }
-  }, [sessionId, toolUseId, which, state.status]);
+  }, [sessionId, toolUseId, which]);
   return { ...state, load };
 }
