@@ -32,6 +32,12 @@ describe('fmt.gapDuration (#177 S5)', () => {
     expect(fmt.gapDuration(2520)).toBe('42 min');   // 42 min
     expect(fmt.gapDuration(600)).toBe('10 min');    // exactly the gap threshold
   });
+  it('promotes to hours once rounded minutes hit 60 (no "60 min")', () => {
+    // 3599s rounds to 60 min — must read "1 h", not "60 min".
+    expect(fmt.gapDuration(3599)).toBe('1 h');
+    // 3570s (59.5 min) also rounds to 60 min and must promote.
+    expect(fmt.gapDuration(3570)).toBe('1 h');
+  });
   it('renders >= 60 min as one-decimal hours, dropping a trailing .0', () => {
     expect(fmt.gapDuration(3600)).toBe('1 h');       // 1.0 -> "1"
     expect(fmt.gapDuration(7200)).toBe('2 h');       // 2.0 -> "2"

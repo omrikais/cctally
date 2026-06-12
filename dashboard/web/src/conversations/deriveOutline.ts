@@ -13,6 +13,14 @@ import type { OutlineTurn, SubagentMeta } from '../types/conversation';
 // child right after the resolved parent's entry; a defensive final sweep emits
 // any bucket the main walk never reached. Pure + deterministic.
 export interface OutlineEntry {
+  // entryId = RENDER IDENTITY: stable + unique per entry (React keys,
+  // aria-current highlighting in Task 3). uuid = JUMP ANCHOR: shared by a turn
+  // and all its thinking children (the scroll target). The two MUST stay
+  // distinct — a turn's entry and its depth-1 thinking children all carry the
+  // same uuid, so keying highlight on uuid would light up parent + children at
+  // once. Top-level entries use the uuid itself (`t.uuid`); subagent buckets
+  // use `sc:${k}` (already unique); thinking children use `${t.uuid}#think${i}`.
+  entryId: string;
   uuid: string;                       // jump target (anchor uuid / bucket root)
   type: 'human' | 'assistant' | 'subagent' | 'error' | 'meta';
   label: string;
@@ -63,7 +71,7 @@ export function deriveOutline(
     const b = buckets.get(k)!;
     const anyErr = b.some((t) => t.tools?.some((x) => x.is_error));
     out.push({
-      uuid: b[0].uuid, type: 'subagent',
+      entryId: `sc:${k}`, uuid: b[0].uuid, type: 'subagent',
       label: `subagent · ${subagentMeta?.[k]?.kind ?? 'agent'}`,
       depth, error: anyErr, plan: false, question: false,
       toolCount: b.reduce((n, t) => n + (t.tools?.length ?? 0), 0),
@@ -81,7 +89,7 @@ export function deriveOutline(
     const plan = (t.tools ?? []).some((x) => x.name != null && PLAN_TOOLS.has(x.name));
     const question = (t.tools ?? []).some((x) => x.name != null && QUESTION_TOOLS.has(x.name));
     const base = {
-      uuid: t.uuid, depth: 0 as const, error: err, plan, question,
+      entryId: t.uuid, uuid: t.uuid, depth: 0 as const, error: err, plan, question,
       toolCount: t.tools?.length ?? 0, turnIndex: indexOf.get(t.uuid) ?? 0,
     };
     if (t.kind === 'human') {
@@ -91,9 +99,15 @@ export function deriveOutline(
       if (hasContent || err || plan || question) {
         out.push({ ...base, type: err && t.label === '' ? 'error' : 'assistant',
                    label: t.label || (t.tools?.find((x) => x.is_error)?.name ?? 'tool error') });
+        let i = 0;
         for (const th of t.thinking ?? []) {
-          out.push({ ...base, type: 'assistant', label: th, depth: 1, error: false,
+          // entryId keeps the turn's uuid as jump anchor but disambiguates each
+          // thinking child by its index within the turn, so render identity is
+          // unique even though uuid is shared.
+          out.push({ ...base, entryId: `${t.uuid}#think${i}`, type: 'assistant',
+                     label: th, depth: 1, error: false,
                      plan: false, question: false, toolCount: 0 });
+          i += 1;
         }
       }
     } else if (t.kind === 'tool_result') {

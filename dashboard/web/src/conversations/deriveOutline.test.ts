@@ -33,6 +33,38 @@ describe('deriveOutline (#177 S5 §2 curation)', () => {
     ]);
     // Thinking children carry no error/glyph/tool noise.
     expect(out[1]).toMatchObject({ error: false, plan: false, question: false, toolCount: 0 });
+    // entryId = render identity (distinct per entry); uuid = jump anchor (shared
+    // by a turn + its thinking children). The parent's entryId is its uuid; each
+    // thinking child gets `${uuid}#think${i}` so aria-current/React keys never
+    // collide across the turn's entries (Task 3).
+    expect(out[0]).toMatchObject({ uuid: 'a1', entryId: 'a1' });
+    expect(out[1]).toMatchObject({ uuid: 'a1', entryId: 'a1#think0' });
+    expect(out[2]).toMatchObject({ uuid: 'a1', entryId: 'a1#think1' });
+    expect(out[1].entryId).not.toBe(out[0].entryId);
+    expect(out[2].entryId).not.toBe(out[1].entryId);
+  });
+
+  it('every entryId in a derived list is unique across a rich mixed fixture', () => {
+    const meta: Record<string, SubagentMeta> = {
+      sk1: { kind: 'explore' },
+      sk2: { kind: 'general-purpose' },
+    };
+    const out = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'dispatch', member_uuids: ['h1', 'pm'] }),
+      turn({ uuid: 'a1', kind: 'assistant', label: 'plan', thinking: ['t-a', 't-b', 't-c'] }),
+      // nested subagent under h1's member 'pm'
+      turn({ uuid: 's1', kind: 'assistant', label: 'sub a', subagent_key: 'sk2', parent_uuid: 'pm' }),
+      turn({ uuid: 'a2', kind: 'assistant', label: 'reply', thinking: ['t-d'] }),
+      // non-nested subagent bucket
+      turn({ uuid: 's2', kind: 'assistant', label: 'sub b', subagent_key: 'sk1', parent_uuid: 'unresolved' }),
+      turn({ uuid: 'h2', kind: 'human', label: 'next' }),
+      turn({ uuid: 'm1', kind: 'meta', label: '/commit', meta_kind: 'command' }),
+    ], meta);
+    const ids = out.map((e) => e.entryId);
+    expect(ids.length).toBeGreaterThan(0);
+    expect(new Set(ids).size).toBe(ids.length);
+    // Every entry carries a non-empty entryId.
+    expect(ids.every((id) => typeof id === 'string' && id.length > 0)).toBe(true);
   });
 
   it('pure tool-relay assistant (no prose, no thinking, no error, no plan/question) → NO entry', () => {

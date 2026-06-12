@@ -270,9 +270,13 @@ export const fmt = {
   },
   // #177 S5 — inter-turn gap label: "<60 min" as whole minutes, else
   // one-decimal hours with trailing ".0" dropped ("42 min" / "9.5 h" / "2 h").
+  // Round to minutes FIRST and promote at 60 — otherwise 3599s rounds to 60
+  // and renders "60 min" instead of "1 h" (the `seconds < 3600` cutoff fired
+  // before the rounding could carry).
   gapDuration(seconds: number | null | undefined): string {
     if (seconds == null || !isFinite(seconds) || seconds < 0) return '—';
-    if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
+    const mins = Math.round(seconds / 60);
+    if (mins < 60) return `${mins} min`;
     const h = (seconds / 3600).toFixed(1).replace(/\.0$/, '');
     return `${h} h`;
   },
