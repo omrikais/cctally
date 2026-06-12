@@ -5,7 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.40.0] - 2026-06-12
+### Added
+- Conversation viewer: search now reaches past prose into commands, file paths, error strings, and the assistant's thinking, with exact kind facets and a browser-style in-conversation find bar — the rail gains an `All · Prompts · Assistant · Tools · Thinking` chip row, a result count line, match badges (`tool`, `thinking`), and a `Load N more` button, while pressing `/` over an open conversation opens a floating find pill (`Enter`/`Shift+Enter` and `n`/`N` step matches, `Esc` closes, wrap-around, exact `k / N` counter, `<mark>` term highlighting in prose) backed by a new `GET /api/conversation/<id>/find` endpoint and a `kind` param on `/api/conversation/search`; the tool/thinking facets light up after a one-time, lossless search-index split (cache migration `010`) runs automatically under the cache lock on the next sync, reporting `search_depth: "prose-only"` (with the Tools/Thinking chips disabled and an `indexing…` hint) until it completes, and degrading to a basic substring scan on hosts without FTS5 (#177 S6).
 
 ### Added
 - Conversation viewer: a full-session navigation layer — a collapsible outline sidebar (toggle `o`) listing every turn as a landmark with nested thinking entries and scroll-sync highlighting, a stats overview (turn counts, duration, tokens, cost, models, tool histogram, and an error row that jumps to the first error), jump-to-next keys with no wrap-around (`e`/`E` errors, `u`/`U` prompts, `b`/`B` subagents, `p`/`P` plans/questions) mirrored by a clickable glyph cluster with counts, and focus modes (`v` cycles All → Chat → Prompts → Errors; hidden turns coalesce into a clickable `· N hidden ·` marker, and a jump whose target the mode would hide resets to All before landing) (#177 Session 5).

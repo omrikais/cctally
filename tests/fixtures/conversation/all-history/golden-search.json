@@ -2,6 +2,7 @@
   "hits": [
     {
       "cost_usd": 0.0175,
+      "match_kinds": [],
       "project_label": "proj",
       "session_id": "s1",
       "snippet": "the [token] limit window resets every five hours",
@@ -10,7 +11,9 @@
       "uuid": "a1b"
     }
   ],
+  "kind": "all",
   "mode": "fts",
   "query": "token",
+  "search_depth": "prose-only",
   "total": 1
 }
