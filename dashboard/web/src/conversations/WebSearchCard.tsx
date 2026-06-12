@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { ConversationBlock } from '../types/conversation';
 import { SearchIcon } from './ConvIcons';
 import { CopyButton } from './CopyButton';
-import { domainOf, isHttpUrl } from './WebFetchCard';
+import { domainOf, isHttpUrl } from './webUrl';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
 const INITIAL_LINKS = 10;

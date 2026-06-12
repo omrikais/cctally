@@ -5,6 +5,7 @@ import { GlobeIcon } from './ConvIcons';
 import { CopyButton } from './CopyButton';
 import { LoadFull } from './LoadFull';
 import { MediaFigure } from './MediaFigure';
+import { domainOf, isHttpUrl } from './webUrl';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
 
@@ -21,16 +22,6 @@ function urlOf(call: Call): string {
 function promptOf(call: Call): string {
   const p = (call.input as { prompt?: unknown } | null | undefined)?.prompt;
   return typeof p === 'string' ? p : '';
-}
-export function domainOf(url: string): string {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return '';
-  }
-}
-export function isHttpUrl(url: string): boolean {
-  return /^https?:\/\//i.test(url);
 }
 // Same content-length proxy as ExitPlanModeCard's planIsLong.
 function resultIsLong(text: string): boolean {

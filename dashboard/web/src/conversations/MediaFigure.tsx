@@ -65,7 +65,7 @@ export function MediaFigure({
         src={url}
         loading="lazy"
         decoding="async"
-        alt={`${context} image ${media.index} (${media.media_type ?? 'image'})`}
+        alt={`${context} image ${media.index + 1} (${media.media_type ?? 'image'})`}
         onError={() => setFailed(true)}
       />
       <figcaption className="conv-media-caption">

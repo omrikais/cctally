@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
-import { WebFetchCard, domainOf, isHttpUrl } from './WebFetchCard';
+import { WebFetchCard } from './WebFetchCard';
+import { domainOf, isHttpUrl } from './webUrl';
 import { TranscriptContext } from './TranscriptContext';
 import type { ConversationBlock } from '../types/conversation';
 

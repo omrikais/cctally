@@ -4,7 +4,7 @@ import type { ReactNode } from 'react';
 import {
   toolIcon, ThinkingIcon, FileSearchIcon, TerminalIcon, ToolGenericIcon, LinkIcon,
   SpinnerIcon, QuestionIcon, PlanIcon, GlobeIcon, SearchIcon, PlugIcon,
-  BrowserWindowIcon, ChromeIcon, CodexIcon, mcpServerIcon,
+  BrowserWindowIcon, ChromeIcon, CodexIcon, MonitorIcon, mcpServerIcon,
 } from './ConvIcons';
 
 function svgOf(el: ReactNode) {
@@ -67,6 +67,7 @@ describe('ConvIcons — Session 4 MCP + web glyphs', () => {
     expect(playwright.outerHTML).not.toBe(svgOf(<ToolGenericIcon />)!.outerHTML);
     expect(svgOf(toolIcon('mcp__claude-in-chrome__computer'))!.outerHTML).toBe(svgOf(<ChromeIcon />)!.outerHTML);
     expect(svgOf(toolIcon('mcp__codex__codex-reply'))!.outerHTML).toBe(svgOf(<CodexIcon />)!.outerHTML);
+    expect(svgOf(toolIcon('mcp__computer-use__screenshot'))!.outerHTML).toBe(svgOf(<MonitorIcon />)!.outerHTML);
   });
 
   it('an unknown MCP server falls back to the plug glyph (not the generic box)', () => {
@@ -87,6 +88,7 @@ describe('ConvIcons — Session 4 MCP + web glyphs', () => {
 
   it('mcpServerIcon dispatches each kind (generic → plug)', () => {
     expect(svgOf(mcpServerIcon('playwright'))!.outerHTML).toBe(svgOf(<BrowserWindowIcon />)!.outerHTML);
+    expect(svgOf(mcpServerIcon('computer'))!.outerHTML).toBe(svgOf(<MonitorIcon />)!.outerHTML);
     expect(svgOf(mcpServerIcon('generic'))!.outerHTML).toBe(svgOf(<PlugIcon />)!.outerHTML);
   });
 });
