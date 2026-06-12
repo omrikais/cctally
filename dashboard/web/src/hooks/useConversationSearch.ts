@@ -72,7 +72,11 @@ export function useConversationSearch(
 
   // Page-0 fetch, keyed on the settled needle + the kind facet. REPLACES hits.
   useEffect(() => {
-    if (!debouncedQ) { setFetching(false); return; }
+    // #177 S6 M2 — clear BOTH in-flight flags on the empty-needle early return.
+    // `loadingMore` was previously left set here: unreachable as a live bug
+    // (an empty needle unmounts SearchList, discarding this hook's state) but
+    // defensive symmetry with the `fetching` reset.
+    if (!debouncedQ) { setFetching(false); setLoadingMore(false); return; }
     const ctl = new AbortController();
     ctlRef.current = ctl;
     setFetching(true);

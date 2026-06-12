@@ -30,7 +30,7 @@ export function FindBar({
 }) {
   const [needle, setNeedle] = useState('');
   const [cursor, setCursor] = useState(0);
-  const { anchors, total, truncated, mode, loading } = useConversationFind(sessionId, needle);
+  const { anchors, total, truncated, mode, loading, error } = useConversationFind(sessionId, needle);
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Auto-focus on mount (the bar mounts on open).
@@ -42,7 +42,10 @@ export function FindBar({
   useEffect(() => { onTermsChange(debouncedNeedle); }, [debouncedNeedle, onTermsChange]);
 
   // Reset the cursor whenever the anchor LIST identity changes (a fresh fetch
-  // replaces it) so a new needle starts at the first match.
+  // replaces it) so a new needle starts at the first match. #177 S6 M7 — this
+  // keys on array IDENTITY, so EVERY refetch resets the cursor even when the
+  // results are byte-identical. That's intentional per spec ("re-running the
+  // query refreshes"): a refetch is a fresh query, so it restarts at match 1.
   useEffect(() => { setCursor(0); }, [anchors]);
 
   // Walk to a target index (wraps modulo length) and deep-link-jump there. The
@@ -106,6 +109,9 @@ export function FindBar({
         <span className="conv-findbar-kind">{current.match_kinds.join(' ')}</span>
       )}
       {mode === 'like' && <span className="conv-findbar-hint">basic search</span>}
+      {/* #177 S6 M4 — surface a real fetch failure so `0 / 0` isn't mistaken for
+          "zero matches". Reuses the `basic search` hint styling. */}
+      {error && <span className="conv-findbar-hint">find failed</span>}
       {loading && <span className="conv-findbar-spin" aria-hidden="true" />}
       <button
         type="button"

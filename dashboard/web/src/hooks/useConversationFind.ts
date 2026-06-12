@@ -62,6 +62,11 @@ export function useConversationFind(sessionId: string, needle: string): UseConve
       })
       .catch((e) => {
         if (isAbortError(e)) return;
+        // #177 S6 M5 — clear the prior result on a real failure so a failing
+        // refetch can't leave the bar navigating stale anchors. Without this,
+        // anchors/total/mode/truncated from the last successful query survive
+        // and the n/N cursor would still walk matches that may no longer hold.
+        setAnchors([]); setTotal(0); setTruncated(false); setMode(null);
         setError('Find failed.'); setFetching(false);
       });
     return () => ctl.abort();

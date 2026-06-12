@@ -2549,7 +2549,12 @@ def _conversation_fts_is_split(conn: sqlite3.Connection) -> bool:
 
 def _create_conversation_fts_aux_table(conn: sqlite3.Connection) -> None:
     """Create the #177 aux external-content FTS5 index over the ``search_aux``
-    blob. A standalone module-level seam (NOT inlined in ``_apply_cache_schema``)
+    blob. TEST/FIXTURE STANDUP ONLY — production code (``_apply_cache_schema``)
+    builds the post-#177-S6 SPLIT index directly; this legacy single-aux-column
+    shape is referenced solely by the migration-fixture builder + the swap tests
+    (the migration's by-name DROP list still legitimately uses the trigger-name
+    tuples, but never calls this helper). A standalone module-level seam (NOT
+    inlined in ``_apply_cache_schema``)
     so the all-or-nothing regression test can monkeypatch it to raise
     ``OperationalError`` AFTER the prose ``conversation_fts`` create succeeded —
     proving the shared try-envelope drops BOTH indexes + BOTH trigger sets and a
@@ -2650,9 +2655,11 @@ def _create_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
 def _create_conversation_fts_legacy_triggers(conn: sqlite3.Connection) -> None:
     """Create the LEGACY single-column prose + aux trigger sets over the
     pre-#177-S6 conversation_fts(text) + conversation_fts_aux(search_aux) pair.
-    Used only to stand up the legacy shape (the migration swap drops these by
-    name and creates the split set). The caller must have created both legacy
-    tables."""
+    TEST/FIXTURE STANDUP ONLY — referenced solely by the migration-fixture
+    builder + the swap tests to materialize the legacy shape the migration then
+    upgrades. Production never calls this (the swap drops these trigger sets BY
+    NAME via the ``_CONV_FTS_*_TRIGGER_NAMES`` tuples and recreates the split
+    set). The caller must have created both legacy tables."""
     for stmt in _CONV_FTS_LEGACY_TRIGGER_DDL:
         conn.execute(stmt)
     for stmt in _CONV_FTS_AUX_TRIGGER_DDL:

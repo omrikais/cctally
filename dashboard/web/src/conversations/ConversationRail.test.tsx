@@ -182,6 +182,42 @@ describe('ConversationRail', () => {
     expect(document.querySelector('.conv-rail-hint')).toBeNull();
   });
 
+  it('folds "· indexing…" into the count line when an active split-needing kind is prose-only', () => {
+    // #177 S6 M1 — Tools/Thinking selected while the split index is still
+    // backfilling (prose-only). The chip greys out but the hook still renders an
+    // empty/degraded list; the inline note explains it (the disabled chip's
+    // title="indexing…" is hover-only and keyboard-unreachable).
+    searchHits = [];
+    searchTotal = 0;
+    searchDepth = 'prose-only';
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'npm' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'tools' });
+    render(<ConversationRail />);
+    expect(document.querySelector('.conv-rail-count')!.textContent).toBe('No results · indexing…');
+  });
+
+  it('does NOT add "· indexing…" for a non-split kind under prose-only', () => {
+    // 'All'/'Prompts'/'Assistant' don't need the split index, so prose-only is a
+    // complete result for them — no indexing note.
+    searchHits = [hit({})];
+    searchTotal = 4;
+    searchDepth = 'prose-only';
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'npm' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'prompts' });
+    render(<ConversationRail />);
+    expect(document.querySelector('.conv-rail-count')!.textContent).toBe('4 results');
+  });
+
+  it('does NOT add "· indexing…" for a split kind once the index is full', () => {
+    searchHits = [hit({})];
+    searchTotal = 4;
+    searchDepth = 'full';
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'npm' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'thinking' });
+    render(<ConversationRail />);
+    expect(document.querySelector('.conv-rail-count')!.textContent).toBe('4 results');
+  });
+
   it('count line shows "No results" when total is 0', () => {
     searchHits = [];
     searchTotal = 0;

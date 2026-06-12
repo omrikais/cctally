@@ -146,9 +146,20 @@ function SearchList({ needle, kind, ctx }: { needle: string; kind: SearchKind; c
     useConversationSearch(needle, kind);
   const proseOnly = searchDepth === 'prose-only';
   const remaining = total - hits.length;
-  // Count line: "No results" / "{total} results" / "{total} results · basic search".
+  // #177 S6 M1 — when the active chip is a split-needing kind (Tools/Thinking)
+  // but the index is still backfilling (prose-only), the chip greys out yet the
+  // hook keeps fetching that kind and renders an empty/degraded list. The
+  // disabled chip's hover-only title="indexing…" is keyboard-unreachable, so
+  // fold a visible `· indexing…` note into the count line to explain the empty
+  // state inline.
+  const indexing =
+    proseOnly && (kind === 'tools' || kind === 'thinking');
+  // Count line: "No results" / "{total} results" / "{total} results · basic
+  // search" — plus a trailing "· indexing…" when the active kind needs the split
+  // index that's still building.
   const countText =
-    total === 0 ? 'No results' : `${total} results${mode === 'like' ? ' · basic search' : ''}`;
+    (total === 0 ? 'No results' : `${total} results${mode === 'like' ? ' · basic search' : ''}`) +
+    (indexing ? ' · indexing…' : '');
   return (
     <div className="conv-rail-list">
       <KindChips kind={kind} proseOnly={proseOnly} />

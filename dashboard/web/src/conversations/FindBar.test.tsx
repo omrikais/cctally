@@ -119,6 +119,20 @@ describe('FindBar', () => {
     expect(document.querySelector('.conv-findbar')!.textContent!.toLowerCase()).toContain('basic search');
   });
 
+  it('surfaces a "find failed" hint on a non-abort fetch failure (M4)', async () => {
+    // A 500 makes fetchJson throw HttpError → the hook's non-abort catch sets
+    // error. The bar must show the hint so 0 / 0 isn't read as "zero matches".
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { ok: false, status: 500, json: async () => ({}) } as Response,
+    );
+    render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} />);
+    const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
+    await typeNeedle(input, 'needle');
+    expect(document.querySelector('.conv-findbar')!.textContent!.toLowerCase()).toContain('find failed');
+    // Still 0 / 0, but now disambiguated by the hint.
+    expect(document.querySelector('.conv-findbar-count')!.textContent).toContain('0 / 0');
+  });
+
   it('reports the debounced needle up via onTermsChange (for prose marks)', async () => {
     mockFind({ anchors: [], total: 0 });
     const onTermsChange = vi.fn();

@@ -381,11 +381,14 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       // are disjoint by construction — nodeVisible decides which applies.
       const mode = focusModeRef.current;
       if (mode !== 'all') {
-        // Reuse jumpNext's EXACT hidden-target predicate: find the target's
-        // RenderNode in the unfiltered `groups` (by anchor uuid or any member
-        // uuid for a folded/sidechain target) and test nodeVisible under the
-        // mode. A node missing from `groups` here means the target paged in but
-        // its node isn't built yet — leave it to the (1) re-fire, don't reset.
+        // Apply jumpNext's hidden-target VISIBILITY test (nodeVisible under the
+        // mode) to the target's RenderNode in the unfiltered `groups` (found by
+        // anchor uuid or any member uuid for a folded/sidechain target). The
+        // node-absent case diverges DELIBERATELY from jumpNext: here a node
+        // missing from `groups` means the target paged in but its node isn't
+        // built yet, so we treat it as not-yet-paged and leave it to the (1)
+        // re-fire — we do NOT reset to `all`. jumpNext, walking a fixed
+        // snapshot, instead treats an unresolved node as hidden.
         const node = groupsRef.current.find((n) => nodeUuid(n) === jump.uuid
           || (n.kind === 'item' && n.item.member_uuids.includes(jump.uuid)));
         if (node != null && !nodeVisible(node, mode)) {
