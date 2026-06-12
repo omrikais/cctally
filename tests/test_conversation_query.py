@@ -2401,6 +2401,36 @@ def test_find_empty_query_returns_empty():
     assert out["anchors"] == [] and out["total"] == 0
 
 
+def test_find_empty_query_skips_session_assembly(monkeypatch):
+    """Opening the find bar (empty q) must NOT pay the full session assembly —
+    the existence probe short-circuits before _assemble_session runs."""
+    c = _conn()
+    _seed_find_session(c)
+    calls = []
+    monkeypatch.setattr(cq, "_assemble_session",
+                        lambda *a, **k: calls.append(1) or (_ for _ in ()).throw(
+                            AssertionError("assembly should be skipped")))
+    out = cq.find_in_conversation(c, "s1", "   ")
+    assert out is not None
+    assert out["anchors"] == [] and out["total"] == 0
+    assert calls == []
+    # A prose-only-blocked kind short-circuits the same way (still no assembly).
+    blocked = cq.find_in_conversation(c, "s1", "", kind="tools")
+    assert blocked["anchors"] == [] and calls == []
+
+
+def test_find_unknown_session_empty_query_returns_none(monkeypatch):
+    """Unknown session → None even for an empty query (the route's 404), and the
+    existence probe gets there WITHOUT assembling — precedence pinned."""
+    c = _conn()
+    _seed_find_session(c)
+    monkeypatch.setattr(cq, "_assemble_session",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("assembly should be skipped")))
+    assert cq.find_in_conversation(c, "nope", "   ") is None
+    assert cq.find_in_conversation(c, "nope", "needle") is None
+
+
 def test_find_kind_scoping_and_like_mode():
     c = _conn()
     if not db._fts5_available(c):

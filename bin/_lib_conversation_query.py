@@ -1526,18 +1526,26 @@ def find_in_conversation(conn, session_id, query, *, kind="all",
     prose-only depth + tools/thinking kinds → empty (the split index is pending)."""
     if kind not in _SEARCH_KINDS:
         raise ValueError(f"unknown kind: {kind}")
+    # Cheap existence probe (one indexed SELECT) BEFORE the full assembly, so an
+    # empty/prose-only-blocked query opening the find bar pays nothing — yet the
+    # unknown-session → None contract (the route's 404) is preserved, including
+    # for an empty query (assembly used to run first and gave the same answer).
+    if conn.execute(
+            "SELECT 1 FROM conversation_messages WHERE session_id=? LIMIT 1",
+            (session_id,)).fetchone() is None:
+        return None
     depth = _search_depth(conn)
     if fts_available is None:
         fts_available = not _fts_flag_unavailable(conn)
-    asm = _assemble_session(conn, session_id)
-    if asm is None:
-        return None
     q = (query or "").strip()
     base = {"total": 0, "anchors": [], "anchors_truncated": False,
             "search_depth": depth, "kind": kind,
             "mode": "fts" if fts_available else "like"}
     if not q or (depth == "prose-only" and kind in ("tools", "thinking")):
         return base
+    asm = _assemble_session(conn, session_id)
+    if asm is None:
+        return None
     mode, matched = _find_matched_rows(
         conn, session_id, q, kind, depth, fts_available)
     # matched: {uuid -> set of labels in {"prose", "tool", "thinking"}}
@@ -1572,36 +1580,34 @@ def _find_matched_rows(conn, session_id, q, kind, depth, fts_available):
     return "like", _find_matched_like(conn, session_id, q, kind, depth)
 
 
+def _find_kind_columns(kind, depth):
+    """The (column, label) probes the find match runs for this (kind, depth).
+    Prose-only depth has only the legacy prose column indexed, so the split
+    tool/thinking columns drop out (a prose-bearing kind keeps its prose probe;
+    tools/thinking yield nothing). Shared by _find_matched_fts / _find_matched_like
+    so the two paths can never disagree on which columns a kind probes."""
+    if depth == "prose-only":
+        return (("text", "prose"),) if kind in ("all", "prompts", "assistant") else ()
+    return _FIND_KIND_COLUMNS[kind]
+
+
 def _find_matched_fts(conn, session_id, q, kind, depth):
     fts_q = _fts_query(q, prefix_last=True)
+    # entry_type predicate + the prose-only legacy MATCH shape are loop-invariant
+    # — compute once. Legacy single-column FTS indexes prose only, so it MATCHes
+    # the bare term (no column filter); full mode wraps each column.
+    et = _KIND_ENTRY_TYPE.get(kind)
+    et_pred = " AND cm.entry_type = ?" if et is not None else ""
+    et_args = (et,) if et is not None else ()
+    legacy = depth == "prose-only"
     out = {}
-    if depth == "prose-only":
-        # Legacy single-column FTS indexes prose only; column filters / the
-        # tool/thinking columns don't exist on that table.
-        cols = (("text", "prose"),) if kind in ("all", "prompts", "assistant") \
-            else ()
-        for col, label in cols:
-            et = _KIND_ENTRY_TYPE.get(kind)
-            et_pred = " AND cm.entry_type = ?" if et is not None else ""
-            et_args = (et,) if et is not None else ()
-            rows = conn.execute(
-                "SELECT cm.uuid FROM conversation_fts "
-                "JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
-                f"WHERE conversation_fts MATCH ? AND cm.session_id = ?{et_pred}",
-                (fts_q, session_id, *et_args)).fetchall()
-            for (u,) in rows:
-                out.setdefault(u, set()).add(label)
-        return out
-    for col, label in _FIND_KIND_COLUMNS[kind]:
-        et = _KIND_ENTRY_TYPE.get(kind)
-        et_pred = " AND cm.entry_type = ?" if et is not None else ""
-        et_args = (et,) if et is not None else ()
-        col_expr = f"{{{col}}}: ({fts_q})"
+    for col, label in _find_kind_columns(kind, depth):
+        match_expr = fts_q if legacy else f"{{{col}}}: ({fts_q})"
         rows = conn.execute(
             "SELECT cm.uuid FROM conversation_fts "
             "JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
             f"WHERE conversation_fts MATCH ? AND cm.session_id = ?{et_pred}",
-            (col_expr, session_id, *et_args)).fetchall()
+            (match_expr, session_id, *et_args)).fetchall()
         for (u,) in rows:
             out.setdefault(u, set()).add(label)
     return out
@@ -1609,14 +1615,11 @@ def _find_matched_fts(conn, session_id, q, kind, depth):
 
 def _find_matched_like(conn, session_id, q, kind, depth):
     like = _like_pattern(q)
-    cols = (("text", "prose"),) if depth == "prose-only" and kind in (
-        "all", "prompts", "assistant") else (
-        () if depth == "prose-only" else _FIND_KIND_COLUMNS[kind])
+    et = _KIND_ENTRY_TYPE.get(kind)
+    et_pred = " AND entry_type = ?" if et is not None else ""
+    et_args = (et,) if et is not None else ()
     out = {}
-    for col, label in cols:
-        et = _KIND_ENTRY_TYPE.get(kind)
-        et_pred = " AND entry_type = ?" if et is not None else ""
-        et_args = (et,) if et is not None else ()
+    for col, label in _find_kind_columns(kind, depth):
         rows = conn.execute(
             f"SELECT uuid FROM conversation_messages "
             f"WHERE session_id = ? AND {col} LIKE ? ESCAPE '\\' "

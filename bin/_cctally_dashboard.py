@@ -7264,6 +7264,19 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         """Lazy-load the pure conversation query kernel (Plan 2, §3)."""
         return sys.modules["cctally"]._load_sibling("_lib_conversation_query")
 
+    def _parse_search_kind(self, q):
+        """Read + validate the ``kind`` facet shared by the conversation search
+        and find routes (#177 S6). Returns the kind on success, or ``None`` after
+        having ALREADY sent a 400 — callers just ``return`` on ``None``. Kept in
+        lockstep with the kernel's ``_SEARCH_KINDS`` via ``_CONV_SEARCH_KINDS``
+        (the kernel module is resolved lazily per-request, so the handler keeps a
+        literal tuple rather than reaching across that import edge for a nit)."""
+        kind = _qs_str(q, "kind", "all")
+        if kind not in _CONV_SEARCH_KINDS:
+            self._respond_json(400, {"error": f"unknown kind: {kind}"})
+            return None
+        return kind
+
     def _run_conversation_query(self, kernel_call, log_label):
         """Open cache.db, run ``kernel_call(conn)``, close — with the uniform
         500 envelopes the three conversation routes share (#151).
@@ -7359,9 +7372,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         query = _qs_str(q, "q", "")
         limit = _qs_int(q, "limit", 50)
         offset = _qs_int(q, "offset", 0)
-        kind = _qs_str(q, "kind", "all")
-        if kind not in _CONV_SEARCH_KINDS:
-            self._respond_json(400, {"error": f"unknown kind: {kind}"})
+        kind = self._parse_search_kind(q)
+        if kind is None:
             return
         ok, body = self._run_conversation_query(
             lambda conn: self._conversation_query().search_conversations(
@@ -7447,9 +7459,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             return
         q = _u.parse_qs(self.path.partition("?")[2])
         query = _qs_str(q, "q", "")
-        kind = _qs_str(q, "kind", "all")
-        if kind not in _CONV_SEARCH_KINDS:
-            self._respond_json(400, {"error": f"unknown kind: {kind}"})
+        kind = self._parse_search_kind(q)
+        if kind is None:
             return
         ok, body = self._run_conversation_query(
             lambda conn: self._conversation_query().find_in_conversation(
