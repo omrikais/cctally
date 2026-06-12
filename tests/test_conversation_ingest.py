@@ -1076,3 +1076,87 @@ def test_resumable_reingest_consumes_media_flag(isolated):
         assert conn.execute(
             "SELECT 1 FROM cache_meta WHERE key=?", (key,)
         ).fetchone() is None, f"{key} dropped after consumption"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #177 S6: migration 010 search-column split consumed by the REAL sync_cache
+# (flag-only handler -> flock-held backfill + legacy->split FTS swap).
+# ──────────────────────────────────────────────────────────────────────────
+
+def _to_legacy_shape(conn):
+    """Tear the fresh split shape down to the legacy prose+aux two-table shape
+    so a real sync can exercise the swap."""
+    db._drop_conversation_fts_triggers(conn)
+    conn.execute("DROP TABLE IF EXISTS conversation_fts")
+    conn.execute("DROP TABLE IF EXISTS conversation_fts_aux")
+    conn.execute("CREATE VIRTUAL TABLE conversation_fts "
+                 "USING fts5(text, content='conversation_messages', content_rowid='id')")
+    db._create_conversation_fts_aux_table(conn)
+    db._create_conversation_fts_legacy_triggers(conn)
+    conn.commit()
+
+
+def test_sync_consumes_search_split_flag_backfills_and_swaps(isolated):
+    """End-to-end: a legacy-shape cache with the migration-010 flag set is
+    swapped to the split shape by the next real sync_cache, the tool content is
+    backfilled into search_tool, and the flag + cursor clear."""
+    ns, conn, projects, sync = isolated
+    if not db._fts5_available(conn):
+        pytest.skip("sqlite build lacks FTS5")
+    (projects / "a.jsonl").write_text(_asst_tooluse_line("a1", "m1", "r1"))
+    sync()   # split-shape ingest of the tool row
+    # Model a pre-S6 install: revert to legacy FTS shape, blank the split
+    # columns, arm the migration-010 flag.
+    _to_legacy_shape(conn)
+    conn.execute("UPDATE conversation_messages SET search_tool='', search_thinking=''")
+    db._set_cache_meta(conn, "conversation_search_split_pending", "1")
+    conn.commit()
+    assert db._conversation_fts_is_split(conn) is False
+
+    sync()   # consumes the flag under the flock
+
+    assert db._conversation_fts_is_split(conn), "sync swapped to the split shape"
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='conversation_fts_aux'"
+    ).fetchone() is None
+    assert "enrichcmd" in conn.execute(
+        "SELECT search_tool FROM conversation_messages WHERE uuid='a1'"
+    ).fetchone()[0]
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='conversation_search_split_pending'"
+    ).fetchone() is None
+    assert conn.execute(
+        "SELECT rowid FROM conversation_fts "
+        "WHERE conversation_fts MATCH '{search_tool}: enrichcmd'"
+    ).fetchall() != []
+    conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('integrity-check')")
+
+
+def test_rebuild_swaps_legacy_shape_and_clears_split_flag(isolated):
+    """A `cache-sync --rebuild` on a legacy-shape DB with the migration-010 flag
+    swaps to the split shape (the walk repopulates the columns through the new
+    triggers) and clears the flag without a redundant backfill pass."""
+    ns, conn, projects, sync = isolated
+    if not db._fts5_available(conn):
+        pytest.skip("sqlite build lacks FTS5")
+    (projects / "a.jsonl").write_text(_asst_tooluse_line("a1", "m1", "r1"))
+    sync()
+    _to_legacy_shape(conn)
+    db._set_cache_meta(conn, "conversation_search_split_pending", "1")
+    conn.commit()
+    assert db._conversation_fts_is_split(conn) is False
+
+    sync(rebuild=True)
+
+    assert db._conversation_fts_is_split(conn), "rebuild swapped to the split shape"
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='conversation_search_split_pending'"
+    ).fetchone() is None
+    assert "enrichcmd" in conn.execute(
+        "SELECT search_tool FROM conversation_messages WHERE uuid='a1'"
+    ).fetchone()[0]
+    assert conn.execute(
+        "SELECT rowid FROM conversation_fts "
+        "WHERE conversation_fts MATCH '{search_tool}: enrichcmd'"
+    ).fetchall() != []
+    conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('integrity-check')")

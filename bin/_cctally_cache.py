@@ -656,6 +656,31 @@ def sync_cache(
                 " 'conversation_media_reingest_pending',"
                 " 'conversation_reingest_cursor',"
                 " 'conversation_reingest_cursor_gen')")
+            # #177 S6: a rebuild repopulates search_tool/search_thinking via the
+            # offset-0 walk (the parser derives them), so the migration-010
+            # backfill is redundant. But a LEGACY-shape DB still carries the old
+            # prose+aux FTS pair that the split triggers can't write — swap to the
+            # split shape NOW (the table is empty post-clear, so the walk below
+            # populates it through the new triggers), then drop the pending flag +
+            # cursor so the post-rebuild sync runs no redundant backfill/swap.
+            # MISSING this site re-arms the flag on every cache-sync --rebuild.
+            try:
+                _split_pending = conn.execute(
+                    "SELECT 1 FROM cache_meta "
+                    "WHERE key='conversation_search_split_pending'"
+                ).fetchone() is not None
+            except sqlite3.OperationalError:
+                _split_pending = False
+            if _split_pending:
+                _fts_off = conn.execute(
+                    "SELECT 1 FROM cache_meta WHERE key='fts5_unavailable'"
+                ).fetchone() is not None
+                if not _fts_off and not _cctally_db_sib._conversation_fts_is_split(conn):
+                    _cctally_db_sib._swap_conversation_fts_to_split(conn)
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key IN "
+                "('conversation_search_split_pending',"
+                " 'conversation_search_split_cursor')")
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Claude cached entries")
 
@@ -746,6 +771,14 @@ def sync_cache(
                 # three flags + cursor + gen atomically on completion. Never on the rebuild
                 # path (which already wipes + repopulates id-aware via the normal walk).
                 _resumable_reingest_conversation_messages(conn)
+
+            # #177 S6: consume the migration-010 search-column split under the
+            # SAME held flock, AFTER the reingest so any just-re-ingested rows
+            # already carry fresh search_tool/search_thinking before the backfill
+            # touches the tail. Cursor-resumable; the legacy triggers are blind to
+            # the search_tool/search_thinking UPDATEs (they fire on text only), so
+            # old search keeps working until the final swap.
+            _consume_search_split(conn)
 
         paths: list[pathlib.Path] = list(_iter_claude_jsonl_files())
         stats.files_total = len(paths)
@@ -1262,6 +1295,65 @@ def _resumable_reingest_conversation_messages(conn):
         " 'conversation_media_reingest_pending',"
         " 'conversation_reingest_cursor',"
         " 'conversation_reingest_cursor_gen')")
+    conn.commit()
+
+
+def _consume_search_split(conn) -> None:
+    """#177 S6: flock-held consumer for ``conversation_search_split_pending``
+    (set by cache migration 010). Cursor-resumable: backfills
+    search_tool/search_thinking from each row's ``blocks_json`` via the SHARED
+    ``_lib_conversation._derive_search_columns`` chokepoint (so the values are
+    byte-identical to live ingest), checkpointing
+    ``conversation_search_split_cursor`` per 500-row batch. These UPDATEs are
+    INVISIBLE to the LEGACY triggers (which fire on text/search_aux only), so the
+    old prose search keeps working untouched until the final swap (spec F5).
+
+    When the cursor completes, swap the legacy two-table FTS to the consolidated
+    split shape + rebuild (one short transaction), then delete the pending +
+    cursor meta keys. FTS5-unavailable (``fts5_unavailable`` set): the base-column
+    backfill still runs (it is FTS-independent), the vtable swap is SKIPPED, the
+    flag still clears, and the rebuild-on-availability recovery path
+    (_apply_cache_schema) lands the split shape later (spec F6). Interrupted at
+    any point ⇒ resumes from the cursor on the next locked sync; a fresh install
+    never sets the flag so this is a cheap no-op there."""
+    if conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='conversation_search_split_pending'"
+    ).fetchone() is None:
+        return
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key='conversation_search_split_cursor'"
+    ).fetchone()
+    last_id = int(row[0]) if row else 0
+    while True:
+        batch = conn.execute(
+            "SELECT id, blocks_json FROM conversation_messages "
+            "WHERE id > ? ORDER BY id LIMIT 500",
+            (last_id,)).fetchall()
+        if not batch:
+            break
+        ups = []
+        for rid, bj in batch:
+            try:
+                blocks = json.loads(bj) if bj else []
+            except (TypeError, ValueError):
+                blocks = []
+            st, sth = _lib_conversation._derive_search_columns(blocks)
+            ups.append((st, sth, rid))
+            last_id = rid
+        conn.executemany(
+            "UPDATE conversation_messages SET search_tool=?, search_thinking=? "
+            "WHERE id=?", ups)
+        _cctally_db_sib._set_cache_meta(
+            conn, "conversation_search_split_cursor", str(last_id))
+        conn.commit()
+    fts_off = conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='fts5_unavailable'"
+    ).fetchone() is not None
+    if not fts_off:
+        _cctally_db_sib._swap_conversation_fts_to_split(conn)
+    conn.execute(
+        "DELETE FROM cache_meta WHERE key IN "
+        "('conversation_search_split_pending','conversation_search_split_cursor')")
     conn.commit()
 
 

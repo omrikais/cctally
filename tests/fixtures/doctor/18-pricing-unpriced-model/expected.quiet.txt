@@ -8,7 +8,7 @@ Hooks
       → No hook has fired yet. Restart Claude Code.
 Auth
 Database
-  ⚠ Pending migrations       21 pending
+  ⚠ Pending migrations       22 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
   ⚠ Claude cache             1 entries; last sync 172800s ago (>24h)

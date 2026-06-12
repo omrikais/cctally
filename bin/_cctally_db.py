@@ -3308,6 +3308,50 @@ def _009_conversation_media_reingest(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@cache_migration("010_conversation_search_split")
+def _010_conversation_search_split(conn: sqlite3.Connection) -> None:
+    """Flag-only arm for the #177 S6 search-column split. Sets
+    ``conversation_search_split_pending``; sync_cache consumes it under the
+    cache.db.lock flock (cursor-resumable blocks_json backfill of
+    search_tool/search_thinking, then an atomic legacy->split FTS swap+rebuild —
+    see _cctally_cache._consume_search_split). The handler does NO data work so
+    the dispatcher's central stamp (#140) marks a genuinely-complete handler; a
+    fresh install stamps it WITHOUT running (its schema is already split via
+    _apply_cache_schema, so the consumer finds no flag and no-ops). Mirrors the
+    flag-only reingest pattern of 002/003/007/009."""
+    _set_cache_meta(conn, "conversation_search_split_pending", "1")
+    conn.commit()
+
+
+def _swap_conversation_fts_to_split(conn: sqlite3.Connection) -> None:
+    """Legacy two-table shape -> split multi-column shape, in one transaction.
+    Explicit DROPs of BOTH old tables + triggers (an ``IF NOT EXISTS`` create
+    would silently keep the old same-name single-column conversation_fts — spec
+    F9), then create the split DDL + new triggers and rebuild the index from the
+    base table. Runs under the caller's held cache.db.lock flock (the
+    _consume_search_split end-transaction)."""
+    _drop_conversation_fts_triggers(conn)
+    conn.execute("DROP TABLE IF EXISTS conversation_fts")
+    conn.execute("DROP TABLE IF EXISTS conversation_fts_aux")
+    conn.execute(_CONV_FTS_SPLIT_DDL)
+    _create_conversation_fts_triggers(conn)
+    conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('rebuild')")
+
+
+def conversation_search_depth(conn: sqlite3.Connection) -> str:
+    """'prose-only' while migration 010's backfill is pending, else 'full'.
+    Surfaced additively on the search/find responses so the client can degrade
+    the Tools/Thinking facets during the one-time index split. An
+    OperationalError (no cache_meta table yet) degrades to 'full'."""
+    try:
+        pending = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key='conversation_search_split_pending'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return "full"
+    return "prose-only" if pending else "full"
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")

@@ -1986,6 +1986,134 @@ def build_per_migration_009_conversation_media_reingest(
     _build_post(pre, post)
 
 
+def build_per_migration_010_conversation_search_split(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for cache migration
+    ``010_conversation_search_split`` (#177 S6).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — full production cache schema (via
+        ``_apply_cache_schema``) torn down to the LEGACY FTS shape (single-column
+        ``conversation_fts(text)`` + ``conversation_fts_aux`` + legacy triggers;
+        the ``search_tool``/``search_thinking`` base columns exist but are empty),
+        a ``schema_migrations`` table carrying 001-009 (an existing install at the
+        009 head) but NOT 010, and no ``conversation_search_split_pending`` flag —
+        the existing-install shape before the search-column split is armed.
+      * ``post.sqlite`` — same DB after running the production 010 handler. 010 is
+        flag-only: it sets ``cache_meta['conversation_search_split_pending']='1'``
+        (so sync_cache backfills search_tool/search_thinking from blocks_json then
+        swaps the legacy FTS to the split shape under the flock) and the dispatcher
+        central-stamps the 010 marker (#140).
+
+    Loaded by ``tests/test_cache_migration_010_per_migration_goldens.py``.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    # The 009-head prior chain stamped into pre.sqlite (an existing install that
+    # has every prior cache migration but not yet the #177 S6 search split).
+    _PRIOR_CHAIN = (
+        "001_dedup_highest_wins",
+        "002_conversation_messages_backfill",
+        "003_conversation_reingest_tool_ids",
+        "004_conversation_reingest_subagent_kind",
+        "005_conversation_reingest_meta",
+        "006_conversation_reingest_source_tool_use_id",
+        "007_conversation_reingest_enrichment",
+        "008_session_entries_speed_backfill",
+        "009_conversation_media_reingest",
+    )
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _to_legacy_shape(conn, db) -> None:
+        """Revert the fresh split FTS shape to the legacy prose+aux two-table
+        shape (so 010's backfill/swap has work to do). FTS5-less builds: no-op
+        (no vtable exists)."""
+        if not db._fts5_available(conn):
+            return
+        db._drop_conversation_fts_triggers(conn)
+        conn.execute("DROP TABLE IF EXISTS conversation_fts")
+        conn.execute("DROP TABLE IF EXISTS conversation_fts_aux")
+        conn.execute("CREATE VIRTUAL TABLE conversation_fts "
+                     "USING fts5(text, content='conversation_messages', "
+                     "content_rowid='id')")
+        db._create_conversation_fts_aux_table(conn)
+        db._create_conversation_fts_legacy_triggers(conn)
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _cctally, db = _load_cctally()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            _to_legacy_shape(conn, db)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in _PRIOR_CHAIN:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-06-13T12:00:00Z"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _cctally, db = _load_cctally()
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "010_conversation_search_split":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit(
+                "010_conversation_search_split not registered"
+            )
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Flag-only handler: sets the conversation_search_split_pending flag.
+            # Then stamp the marker centrally (the dispatcher owns the stamp per
+            # #140) with a PINNED timestamp so the committed golden is rebuild-
+            # deterministic.
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("010_conversation_search_split", "2026-06-13T12:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -2020,6 +2148,9 @@ def main() -> int:
     )
     build_per_migration_009_conversation_media_reingest(
         FIXTURES_ROOT / "per-migration" / "009_conversation_media_reingest"
+    )
+    build_per_migration_010_conversation_search_split(
+        FIXTURES_ROOT / "per-migration" / "010_conversation_search_split"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

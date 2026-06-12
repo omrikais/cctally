@@ -124,19 +124,19 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/cache.db",
-                        "registry_size": 9,
+                        "registry_size": 10,
                         "user_version": 99
                     },
                     "id": "db.cache.file",
                     "severity": "ok",
-                    "summary": "version 99 / 9 known",
+                    "summary": "version 99 / 10 known",
                     "title": "cache.db"
                 },
                 {
                     "details": {
                         "cache.db": {
                             "ahead": true,
-                            "registry_size": 9,
+                            "registry_size": 10,
                             "user_version": 99
                         },
                         "stats.db": {
@@ -148,7 +148,7 @@
                     "id": "db.version_ahead",
                     "remediation": "Auto-heals on next command, or run `cctally db recover --db cache`",
                     "severity": "warn",
-                    "summary": "cache.db ahead (v99 > known v9) \u2014 auto-heals",
+                    "summary": "cache.db ahead (v99 > known v10) \u2014 auto-heals",
                     "title": "Version ahead"
                 },
                 {
@@ -166,7 +166,8 @@
                                     "006_conversation_reingest_source_tool_use_id",
                                     "007_conversation_reingest_enrichment",
                                     "008_session_entries_speed_backfill",
-                                    "009_conversation_media_reingest"
+                                    "009_conversation_media_reingest",
+                                    "010_conversation_search_split"
                                 ],
                                 "skipped": []
                             },
@@ -193,7 +194,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/21 applied",
+                    "summary": "0/22 applied",
                     "title": "Migrations"
                 },
                 {
@@ -282,13 +283,17 @@
                             [
                                 "cache.db",
                                 "009_conversation_media_reingest"
+                            ],
+                            [
+                                "cache.db",
+                                "010_conversation_search_split"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "21 pending",
+                    "summary": "22 pending",
                     "title": "Pending migrations"
                 }
             ],

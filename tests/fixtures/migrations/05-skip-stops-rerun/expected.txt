@@ -15,7 +15,7 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 13 known
   ✗ 013_test_failure_injection                     FAILED last at <REDACTED>
                                                 See <HOME>/.local/share/cctally/logs/migration-errors.log
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 10 / 10 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 11 / 11 known
   ✓ 001_dedup_highest_wins                         applied <REDACTED>
   ✓ 002_conversation_messages_backfill             applied <REDACTED>
   ✓ 003_conversation_reingest_tool_ids             applied <REDACTED>
@@ -25,7 +25,8 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 10 / 10 known
   ✓ 007_conversation_reingest_enrichment           applied <REDACTED>
   ✓ 008_session_entries_speed_backfill             applied <REDACTED>
   ✓ 009_conversation_media_reingest                applied <REDACTED>
-  ✓ 010_test_cache_migration                       applied <REDACTED>
+  ✓ 010_conversation_search_split                  applied <REDACTED>
+  ✓ 011_test_cache_migration                       applied <REDACTED>
 ## stderr
 
 ## exit
