@@ -1651,3 +1651,125 @@ def test_task_fold_omits_snapshot_when_no_create_recognized():
              for b in it["blocks"] if b.get("kind") == "tool_call"]
     assert calls, "expected the Task* tool_calls to survive"
     assert all("task_snapshot" not in b for b in calls)
+
+
+# ---------------------------------------------------------------------------
+# #178: on-demand "load full" kernels. locate_tool_payload finds the JSONL line
+# holding a tool_use (which='input') or tool_result (which='result') by an
+# instr() prefilter (NOT LIKE — tool_use_ids contain '_', a LIKE wildcard) +
+# exact match; read_full_payload re-reads that raw line from disk and returns
+# the full un-capped input dict or result text + Bash stderr. The cache stores
+# only capped text, so the full body is always re-derived here (the #178 point).
+# ---------------------------------------------------------------------------
+def test_locate_tool_payload_uses_instr_not_like():
+    # tool_use_id contains '_' (a LIKE wildcard). instr() must match it
+    # literally and NOT match a near-miss id where '_' stood in for another char.
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a", msg_id="m1", req_id="r1",
+        source_path="/p.jsonl", byte_offset=10,
+        blocks=[{"kind": "tool_use", "name": "Edit", "input_summary": "{}",
+                 "input": {"file_path": "/f.py", "old_string": "a", "new_string": "b"},
+                 "input_truncated": False, "id": "toolu_abc", "preview": "/f.py"}])
+    assert cq.locate_tool_payload(c, "s1", "toolu_abc", "input") == ("/p.jsonl", 10)
+    # 'tooluXabc' would match 'toolu_abc' under LIKE (the '_' wildcard); instr
+    # is literal so it must NOT resolve.
+    assert cq.locate_tool_payload(c, "s1", "tooluXabc", "input") is None
+    # no tool_result row carries this id -> which='result' is None.
+    assert cq.locate_tool_payload(c, "s1", "toolu_abc", "result") is None
+
+
+def test_locate_tool_payload_finds_result_row():
+    c = _conn()
+    _seed_tool_result(c, sid="s1", uuid="u1", source_path="/r.jsonl",
+        blocks=[{"kind": "tool_result", "text": "out", "is_error": False,
+                 "tool_use_id": "toolu_res"}])
+    # _seed_tool_result hard-codes byte_offset=1.
+    assert cq.locate_tool_payload(c, "s1", "toolu_res", "result") == ("/r.jsonl", 1)
+    assert cq.locate_tool_payload(c, "s1", "toolu_res", "input") is None
+
+
+def test_locate_tool_payload_unknown_id_is_none():
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a", msg_id="m1", req_id="r1",
+        source_path="/p.jsonl", byte_offset=0,
+        blocks=[{"kind": "tool_use", "name": "Bash", "input_summary": "{}",
+                 "input": {"command": "ls"}, "input_truncated": False,
+                 "id": "toolu_b", "preview": "ls"}])
+    assert cq.locate_tool_payload(c, "s1", "toolu_missing", "input") is None
+
+
+def test_read_full_payload_input_beyond_leaf_cap(tmp_path):
+    # The full input dict is re-derived from the raw JSONL line, so the
+    # 8000-char _INPUT_LEAF_CAP that bounds the cached input never applies here.
+    line = _json.dumps({"message": {"content": [
+        {"type": "tool_use", "id": "toolu_e",
+         "input": {"file_path": "/f.py", "old_string": "X" * 9000, "new_string": "Y"}},
+    ]}}).encode() + b"\n"
+    p = tmp_path / "s.jsonl"
+    with open(p, "wb") as fh:
+        fh.write(line)
+    got = cq.read_full_payload(str(p), 0, "toolu_e", "input")
+    assert got["which"] == "input"
+    assert got["tool_use_id"] == "toolu_e"
+    assert got["input"]["old_string"] == "X" * 9000   # FULL, beyond the leaf cap
+    assert got["full_length"] > 9000
+    assert got["truncated"] is False
+
+
+def test_read_full_payload_result_with_bash_stderr(tmp_path):
+    line = _json.dumps({
+        "toolUseResult": {"stdout": "out\n", "stderr": "boom", "interrupted": False},
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_b",
+             "content": [{"type": "text", "text": "out\nboom"}], "is_error": True},
+        ]}}).encode() + b"\n"
+    p = tmp_path / "r.jsonl"
+    with open(p, "wb") as fh:
+        fh.write(line)
+    got = cq.read_full_payload(str(p), 0, "toolu_b", "result")
+    assert got["which"] == "result"
+    assert got["text"] == "out\nboom"
+    assert got["is_error"] is True
+    assert got["stderr"] == "boom"
+    assert got["truncated"] is False
+
+
+def test_read_full_payload_seeks_to_byte_offset(tmp_path):
+    # Two lines in one file; the second is the target. read_full_payload must
+    # seek the given byte_offset and read THAT line.
+    first = _json.dumps({"message": {"content": []}}).encode() + b"\n"
+    second = _json.dumps({"message": {"content": [
+        {"type": "tool_use", "id": "toolu_2", "input": {"k": "v"}}]}}).encode() + b"\n"
+    p = tmp_path / "multi.jsonl"
+    with open(p, "wb") as fh:
+        fh.write(first)
+        fh.write(second)
+    got = cq.read_full_payload(str(p), len(first), "toolu_2", "input")
+    assert got is not None and got["input"] == {"k": "v"}
+
+
+def test_read_full_payload_source_gone_returns_none(tmp_path):
+    assert cq.read_full_payload(str(tmp_path / "missing.jsonl"), 0, "x", "result") is None
+
+
+def test_read_full_payload_id_absent_in_line_returns_none(tmp_path):
+    line = _json.dumps({"message": {"content": [
+        {"type": "tool_use", "id": "toolu_other", "input": {}}]}}).encode() + b"\n"
+    p = tmp_path / "s.jsonl"
+    with open(p, "wb") as fh:
+        fh.write(line)
+    assert cq.read_full_payload(str(p), 0, "toolu_missing", "input") is None
+
+
+def test_read_full_payload_result_huge_hits_ceiling(tmp_path):
+    big = "z" * (cq._FULL_PAYLOAD_CEILING + 100)
+    line = _json.dumps({"message": {"content": [
+        {"type": "tool_result", "tool_use_id": "toolu_big",
+         "content": [{"type": "text", "text": big}]}]}}).encode() + b"\n"
+    p = tmp_path / "big.jsonl"
+    with open(p, "wb") as fh:
+        fh.write(line)
+    got = cq.read_full_payload(str(p), 0, "toolu_big", "result")
+    assert got["full_length"] == len(big)
+    assert len(got["text"]) == cq._FULL_PAYLOAD_CEILING
+    assert got["truncated"] is True

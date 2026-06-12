@@ -20,6 +20,10 @@ import sqlite3
 # mirror — imported by the dashboard's conversation endpoints at runtime.
 
 from _lib_pricing import _calculate_entry_cost
+# #178: the on-demand load-full re-read helper re-stringifies a raw tool_result
+# content block the same way the parser does at ingest — reuse the parser's
+# _stringify so the full (un-capped) result text matches the cached/capped one.
+from _lib_conversation import _stringify
 
 
 # Mirror of dashboard/web/src/conversations/systemMarkers.ts::MARKER_RE — anchored
@@ -1138,3 +1142,129 @@ def _manual_snippet(text, q, width=80):
     end = min(len(text), lo + len(q) + width // 2)
     s = text[start:end]
     return ("… " if start else "") + s + (" …" if end < len(text) else "")
+
+
+# ---------------------------------------------------------------------------
+# #178: on-demand "load full result/input" kernels. Back the dashboard's
+# /api/conversation/<sid>/payload route. The cache stores only CAPPED tool text
+# (result clipped to _TOOL_RESULT_CAP, input leaves clipped to _INPUT_LEAF_CAP),
+# so the full body is re-derived from the source JSONL line here — the cache at
+# rest never grows. Pure (sqlite3.Connection + filesystem); no clock/network.
+# ---------------------------------------------------------------------------
+_FULL_PAYLOAD_CEILING = 1_000_000   # serve up to ~1 MB; protects the HTTP server / browser
+
+
+def locate_tool_payload(conn, session_id, tool_use_id, which):
+    """``(source_path, byte_offset)`` for the JSONL line holding the tool_use
+    (``which='input'``) or tool_result (``which='result'``) carrying this
+    ``tool_use_id`` in this session, else ``None``.
+
+    The prefilter uses ``instr(blocks_json, ?) > 0`` — NOT ``LIKE`` (Codex P1.4):
+    tool_use_ids contain ``_`` (e.g. ``toolu_01SEQ…``), which ``LIKE`` treats as a
+    single-char wildcard, so a near-miss id would false-match. ``instr`` is a
+    literal substring test. It is also NOT a ``≤2 rows`` situation — the DB holds
+    duplicate physical rows for one logical message (``get_conversation`` dedups
+    by uuid) — so every candidate is parsed and EXACT-matched on the block id
+    (``tool_use.id`` for input / ``tool_result.tool_use_id`` for result), under the
+    same deterministic ``ORDER BY timestamp_utc, id`` as ``get_conversation``. The
+    SELECT runs here (not via ``get_conversation``) because that reader omits
+    ``byte_offset`` (Codex P2.5)."""
+    rows = conn.execute(
+        "SELECT source_path, byte_offset, blocks_json FROM conversation_messages "
+        "WHERE session_id=? AND instr(blocks_json, ?) > 0 "
+        "ORDER BY timestamp_utc, id", (session_id, tool_use_id)).fetchall()
+    for source_path, byte_offset, blocks_json in rows:
+        try:
+            blocks = _json.loads(blocks_json)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(blocks, list):
+            continue
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            k = b.get("kind")
+            if which == "input" and k == "tool_use" and b.get("id") == tool_use_id:
+                return source_path, byte_offset
+            if which == "result" and k == "tool_result" and b.get("tool_use_id") == tool_use_id:
+                return source_path, byte_offset
+    return None
+
+
+def _clip_payload_input(inp, ceiling):
+    """Clip each string leaf of a structured input to ``ceiling`` chars and report
+    whether anything was clipped — the input-side analogue of the result-side
+    ceiling. A degenerate multi-MB input leaf is bounded so the HTTP server /
+    browser is protected, while every real payload returns whole."""
+    truncated = False
+
+    def walk(v):
+        nonlocal truncated
+        if isinstance(v, str) and len(v) > ceiling:
+            truncated = True
+            return v[:ceiling]
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        return v
+
+    clipped = walk(inp)
+    if len(_json.dumps(clipped, ensure_ascii=False)) > ceiling:
+        truncated = True
+    return clipped, truncated
+
+
+def read_full_payload(source_path, byte_offset, tool_use_id, which):
+    """Re-read the raw JSONL line at ``(source_path, byte_offset)`` and return the
+    FULL (un-capped) payload for ``tool_use_id``:
+
+    - ``which='input'`` -> ``{"which":"input", "tool_use_id", "input", "full_length",
+      "truncated"}`` — the matching tool_use block's complete ``input`` dict, so the
+      DiffCard can pull old/new strings straight into computeDiff.
+    - ``which='result'`` -> ``{"which":"result", "tool_use_id", "text", "full_length",
+      "truncated", "is_error", [stderr]}`` — the full ``_stringify(content)`` plus,
+      for Bash, the full ``toolUseResult.stderr``.
+
+    ``None`` when the source is gone / the line is unparseable (rotated or deleted
+    JSONL — the documented 410 path) or the id is no longer present in that line.
+    ``full_length``/``truncated`` describe the payload against ``_FULL_PAYLOAD_CEILING``
+    — honoring #178's "un-capped" spirit for real payloads while bounding the
+    degenerate multi-MB case."""
+    try:
+        with open(source_path, "rb") as fh:
+            fh.seek(byte_offset)
+            line = fh.readline()
+        obj = _json.loads(line)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    content = (obj.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return None
+    if which == "input":
+        for b in content:
+            if (isinstance(b, dict) and b.get("type") == "tool_use"
+                    and b.get("id") == tool_use_id):
+                inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                full_length = len(_json.dumps(inp, ensure_ascii=False))
+                clipped, truncated = _clip_payload_input(inp, _FULL_PAYLOAD_CEILING)
+                return {"which": "input", "tool_use_id": tool_use_id,
+                        "input": clipped, "full_length": full_length,
+                        "truncated": truncated}
+        return None
+    for b in content:
+        if (isinstance(b, dict) and b.get("type") == "tool_result"
+                and b.get("tool_use_id") == tool_use_id):
+            raw = _stringify(b.get("content"))
+            resp = {"which": "result", "tool_use_id": tool_use_id,
+                    "text": raw[:_FULL_PAYLOAD_CEILING], "full_length": len(raw),
+                    "truncated": len(raw) > _FULL_PAYLOAD_CEILING,
+                    "is_error": bool(b.get("is_error"))}
+            tur = obj.get("toolUseResult")
+            if (isinstance(tur, dict) and isinstance(tur.get("stderr"), str)
+                    and tur.get("stderr")):
+                resp["stderr"] = tur["stderr"][:_FULL_PAYLOAD_CEILING]
+            return resp
+    return None
