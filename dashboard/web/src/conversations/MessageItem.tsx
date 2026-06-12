@@ -7,7 +7,7 @@ import { PermalinkButton } from './PermalinkButton';
 import { isSystemMarker } from './systemMarkers';
 import { modelChipClass } from '../lib/model';
 import { fmt } from '../lib/fmt';
-import { useDisplayTz } from '../hooks/useDisplayTz';
+import { useFmtCtx } from './TranscriptContext';
 import type { ConversationItem } from '../types/conversation';
 
 // First non-blank line of a meta body, trimmed + capped — the context pill's
@@ -48,11 +48,14 @@ function MessageItemImpl(
   // rule); `noSuffix` drops the per-row tz abbrev (the tooltip carries the full
   // precise timestamp). `ts` is nullable (Codex F6) — a null-ts item renders no
   // time span at all.
-  const display = useDisplayTz();
+  // #184 — read the display-tz FmtCtx from TranscriptContext (the reader computes
+  // it once and provides it), NOT a per-item useDisplayTz() subscription — the
+  // latter would re-render every memoized item on each SSE tick.
+  const fmtCtx = useFmtCtx();
   // fmt.timeHHmm returns the "—" sentinel for a null/unparseable ts; suppress the
   // eyebrow in that case (no real instant to show).
   const eyebrowTimeRaw = item.ts
-    ? fmt.timeHHmm(item.ts, { tz: display.resolvedTz, offsetLabel: display.offsetLabel }, { noSuffix: true })
+    ? fmt.timeHHmm(item.ts, fmtCtx, { noSuffix: true })
     : null;
   const eyebrowTime = eyebrowTimeRaw && eyebrowTimeRaw !== '—' ? eyebrowTimeRaw : null;
   const eyebrow = eyebrowTime ? (

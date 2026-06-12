@@ -63,4 +63,11 @@ describe('fmt.tokens (#177 S5)', () => {
     expect(fmt.tokens(4_100_000)).toBe('4.1M');
     expect(fmt.tokens(2_000_000)).toBe('2M');
   });
+  it('gates the unit on post-rounding magnitude at the k→M edge (#184)', () => {
+    // 999_949 one-decimal-rounds to 999.9k — still in the k band.
+    expect(fmt.tokens(999_949)).toBe('999.9k');
+    // 999_950 one-decimal-rounds to 1000.0k, which must promote to "1M"
+    // (not "1000k").
+    expect(fmt.tokens(999_950)).toBe('1M');
+  });
 });

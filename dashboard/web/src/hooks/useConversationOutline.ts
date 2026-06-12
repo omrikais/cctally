@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchJson, isAbortError } from '../lib/fetchJson';
+import { fetchJson } from '../lib/fetchJson';
 import { useSnapshot } from './useSnapshot';
 import type { ConversationOutline } from '../types/conversation';
 
@@ -31,8 +31,13 @@ export function useConversationOutline(sessionId: string | null) {
       if (sessionRef.current !== sid) return;   // session switched mid-fetch — drop
       outlineRef.current = body;
       setOutline(body); setError(null); setLoading(false);
-    } catch (e) {
-      if (isAbortError(e)) return;
+    } catch {
+      // Deliberate no-AbortController choice (#184): the single-in-flight guard
+      // (`fetchingRef`) already prevents overlapping requests, and the
+      // `sessionRef.current !== sid` check below drops any stale response a
+      // session switch left in flight — so there is no fetch to abort and no
+      // AbortError to special-case. A genuine fetch failure for the CURRENT
+      // session degrades to the inline error banner.
       if (sessionRef.current !== sid) return;
       setError("Couldn't load the outline."); setLoading(false);
     } finally {

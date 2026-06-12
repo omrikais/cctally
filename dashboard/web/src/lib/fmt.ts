@@ -282,11 +282,15 @@ export const fmt = {
   },
   // #177 S5 — token-count humanizer: <1000 raw, ≥1000 one-decimal k,
   // ≥1,000,000 one-decimal M (trailing ".0" dropped): 873 / 1.2k / 310k / 4.1M.
+  // Threshold edge (#184): gate the unit on the POST-rounding magnitude, not the
+  // raw value — 999_950 one-decimal-rounds to "1000.0k", which should promote to
+  // "1M" (and 999_949 → "999.9k" stays in the k band). Compute the k-string
+  // first; if the rounded k reaches 1000, fall through to the M band.
   tokens(v: number | null | undefined): string {
     if (v == null || !isFinite(v)) return '—';
     if (v < 1000) return String(Math.round(v));
     const fmt1 = (n: number) => n.toFixed(1).replace(/\.0$/, '');
-    if (v < 1_000_000) return `${fmt1(v / 1000)}k`;
+    if (v < 1_000_000 && Math.round(v / 100) / 10 < 1000) return `${fmt1(v / 1000)}k`;
     return `${fmt1(v / 1_000_000)}M`;
   },
   ddhh(v: number | null | undefined): string {

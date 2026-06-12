@@ -11,10 +11,10 @@ import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon } from './ConvIcons';
 import { TranscriptContext } from './TranscriptContext';
 import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFocusMode';
 import { insertTimeMarkers } from './insertTimeMarkers';
-import { nextTarget } from './outlineNavigation';
+import { buildOutlineTargets, nextTarget, type JumpKind } from './outlineNavigation';
 import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
-import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
+import type { ConversationItem, ConversationOutline } from '../types/conversation';
 
 // First non-blank line of the first MAIN-session, non-marker human message;
 // fallback project_label → session_id. Mirrors the kernel _session_titles_map
@@ -225,8 +225,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   );
   // Stable provider value so context consumers (the cards) don't re-render on
   // every reader render from a fresh object identity. focusMode rides along so
-  // the block walker can suppress chips under chat mode (#177 S5).
-  const transcriptCtx = useMemo(() => ({ sessionId, focusMode }), [sessionId, focusMode]);
+  // the block walker can suppress chips under chat mode (#177 S5). fmtCtx rides
+  // along too (#184) so MessageItem reads the display tz from context instead of
+  // a per-item useDisplayTz() subscription — the memoized items would otherwise
+  // re-render on every SSE tick. Keyed on fmtCtx (already memoized above), so the
+  // provider identity only changes when the resolved tz actually changes.
+  const transcriptCtx = useMemo(() => ({ sessionId, focusMode, fmtCtx }), [sessionId, focusMode, fmtCtx]);
 
   // Lazy-load when the bottom sentinel scrolls into view.
   useEffect(() => {
@@ -303,6 +307,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       if (cancelled) return;
       const el = itemRefs.current.get(jump.uuid);
       if (el) {
+        // #184 — a jump centers the target (`block: 'center'`), but the
+        // scroll-sync observer highlights the TOPMOST visible turn. So right
+        // after a jump the OutlinePanel's aria-current may sit a turn or two
+        // above the jumped target until the next scroll settles the observer.
+        // This divergence is intentional: centering is the better read for a
+        // deep-link landing, and forcing the highlight to the centered turn
+        // would fight the topmost-visible contract every other scroll honors.
         el.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'center' });
         el.classList.add('conv-item--jumped');
         if (highlightTimerRef.current != null) window.clearTimeout(highlightTimerRef.current);
@@ -579,36 +590,16 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // focus mode to `all` IF that mode would hide the target, then dispatches the
   // deep-link jump. A miss pulses the matching cluster button (reduced-motion:
   // no pulse). Stable closure: reads refs, so the keymap array never churns.
-  type JumpKind = 'error' | 'prompt' | 'subagent' | 'plan';
-  const PLAN_QUESTION = useMemo(() => new Set(['ExitPlanMode', 'AskUserQuestion']), []);
-  // Build the four target index lists over the outline skeleton. Memoized on
-  // `outline` so a paged tick doesn't rebuild them; jumpNext reads via a ref.
-  const targetLists = useMemo(() => {
-    const turns = outline?.turns ?? [];
-    const error: number[] = [];
-    const prompt: number[] = [];
-    const subagent: number[] = [];
-    const plan: number[] = [];
-    const seenSub = new Set<string>();
-    turns.forEach((t: OutlineTurn, i: number) => {
-      if (t.tools?.some((x) => x.is_error)) error.push(i);
-      if (t.kind === 'human') prompt.push(i);
-      if (t.subagent_key != null && !seenSub.has(t.subagent_key)) {
-        seenSub.add(t.subagent_key);
-        subagent.push(i); // FIRST turn index per distinct subagent_key
-      }
-      if (t.tools?.some((x) => x.name != null && PLAN_QUESTION.has(x.name))) plan.push(i);
-    });
-    return { error, prompt, subagent, plan };
-  }, [outline, PLAN_QUESTION]);
+  // #184 — build the four target index lists + the uuid→index map over the
+  // outline skeleton via the SHARED builder (outlineNavigation.ts), so the
+  // reader keys and the OutlinePanel cluster can never drift. Memoized on
+  // `outline` so a paged tick doesn't rebuild them; jumpNext reads via refs.
+  const { indexByUuid: turnIndexByUuid, ...targetLists } = useMemo(
+    () => buildOutlineTargets(outline?.turns ?? []),
+    [outline],
+  );
   const targetListsRef = useRef(targetLists);
   targetListsRef.current = targetLists;
-  // uuid → skeleton turn index, for cursor resolution. Memoized on outline.
-  const turnIndexByUuid = useMemo(() => {
-    const m = new Map<string, number>();
-    (outline?.turns ?? []).forEach((t: OutlineTurn, i: number) => m.set(t.uuid, i));
-    return m;
-  }, [outline]);
   const turnIndexByUuidRef = useRef(turnIndexByUuid);
   turnIndexByUuidRef.current = turnIndexByUuid;
 
@@ -740,8 +731,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         </div>
         <div className="conv-reader-controls">
           {/* #177 S5 §5 — focus-mode segmented control. A labeled radiogroup;
-              each button's aria-pressed reflects the active mode. Errors carries
-              a count badge from the outline stats when > 0. */}
+              each button's aria-checked reflects the active mode (the valid
+              selected-state attribute for role="radio" — #184 dropped the
+              invalid aria-pressed, which belongs to toggle buttons, not radios).
+              Errors carries a count badge from the outline stats when > 0. */}
           <div className="conv-focus-seg" role="radiogroup" aria-label="Focus mode">
             {(['all', 'chat', 'prompts', 'errors'] as const).map((m) => {
               const labels: Record<FocusMode, string> = { all: 'All', chat: 'Chat', prompts: 'Prompts', errors: 'Errors' };
@@ -753,7 +746,6 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
                   className={['conv-focus-seg-btn', focusMode === m ? 'conv-focus-seg-btn--on' : ''].filter(Boolean).join(' ')}
                   role="radio"
                   aria-checked={focusMode === m}
-                  aria-pressed={focusMode === m}
                   onClick={() => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: m })}
                 >
                   {labels[m]}

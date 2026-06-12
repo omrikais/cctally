@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { nextTarget, outlineTurnVisible } from './outlineNavigation';
+import { buildOutlineTargets, nextTarget, outlineTurnVisible } from './outlineNavigation';
 import type { OutlineTurn } from '../types/conversation';
 
 function turn(over: Partial<OutlineTurn>): OutlineTurn {
@@ -15,6 +15,66 @@ function turn(over: Partial<OutlineTurn>): OutlineTurn {
     ...over,
   };
 }
+
+// #184 — the lifted jump-target builder. Both ConversationReader and the
+// OutlinePanel JumpCluster now consume this single source of truth.
+describe('buildOutlineTargets', () => {
+  it('returns empty lists + an empty map for no turns', () => {
+    const t = buildOutlineTargets([]);
+    expect(t.error).toEqual([]);
+    expect(t.prompt).toEqual([]);
+    expect(t.subagent).toEqual([]);
+    expect(t.plan).toEqual([]);
+    expect(t.indexByUuid.size).toBe(0);
+  });
+
+  it('collects human-turn indices into `prompt`', () => {
+    const t = buildOutlineTargets([
+      turn({ uuid: 'a', kind: 'assistant' }),
+      turn({ uuid: 'h', kind: 'human' }),
+      turn({ uuid: 'h2', kind: 'human' }),
+    ]);
+    expect(t.prompt).toEqual([1, 2]);
+  });
+
+  it('collects is_error tool turns into `error`', () => {
+    const t = buildOutlineTargets([
+      turn({ uuid: 'a', tools: [{ name: 'Bash', is_error: false }] }),
+      turn({ uuid: 'b', tools: [{ name: 'Bash', is_error: true }] }),
+    ]);
+    expect(t.error).toEqual([1]);
+  });
+
+  it('records only the FIRST turn index per distinct subagent_key in `subagent`', () => {
+    const t = buildOutlineTargets([
+      turn({ uuid: 's1', subagent_key: 'A', is_sidechain: true }),
+      turn({ uuid: 's2', subagent_key: 'A', is_sidechain: true }),
+      turn({ uuid: 's3', subagent_key: 'B', is_sidechain: true }),
+      turn({ uuid: 'm', subagent_key: null }),
+    ]);
+    expect(t.subagent).toEqual([0, 2]); // first-A at 0, first-B at 2; null ignored
+  });
+
+  it('collects plan/question tool turns (ExitPlanMode / AskUserQuestion) into `plan`', () => {
+    const t = buildOutlineTargets([
+      turn({ uuid: 'a', tools: [{ name: 'Read', is_error: false }] }),
+      turn({ uuid: 'b', tools: [{ name: 'ExitPlanMode', is_error: false }] }),
+      turn({ uuid: 'c', tools: [{ name: 'AskUserQuestion', is_error: false }] }),
+    ]);
+    expect(t.plan).toEqual([1, 2]);
+  });
+
+  it('maps every turn uuid to its skeleton index', () => {
+    const t = buildOutlineTargets([
+      turn({ uuid: 'x' }),
+      turn({ uuid: 'y' }),
+      turn({ uuid: 'z' }),
+    ]);
+    expect(t.indexByUuid.get('x')).toBe(0);
+    expect(t.indexByUuid.get('y')).toBe(1);
+    expect(t.indexByUuid.get('z')).toBe(2);
+  });
+});
 
 describe('outlineTurnVisible', () => {
   it('all mode: every turn is visible', () => {

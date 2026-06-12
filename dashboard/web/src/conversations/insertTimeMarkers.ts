@@ -46,11 +46,16 @@ export function insertTimeMarkers(nodes: FilteredNode[], ctx: FmtCtx): TimedNode
       // never a marker, and a day-changed predicate on a backwards step would be
       // a false positive — guard the whole emit on a non-negative gap.
       if (gap >= 0 && (gap >= GAP_THRESHOLD_S || dayChanged)) {
+        // #184 — fold the output position into the React key. A non-monotonic
+        // transcript can repeat the SAME instant (resumed/merged sessions,
+        // out-of-order writes), so `tm-${iso}` alone could collide across two
+        // markers. `out.length` at push time is unique per emitted node, so the
+        // composite key stays stable AND collision-free.
         out.push({
           kind: 'time_marker',
           gapSeconds: gap >= GAP_THRESHOLD_S ? gap : null,
           dayLabel: dayChanged ? dayOf(d) : null,
-          key: `tm-${iso}`,
+          key: `tm-${out.length}-${iso}`,
         });
       }
     }

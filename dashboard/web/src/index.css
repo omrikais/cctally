@@ -4652,6 +4652,22 @@ mark.current {
 .conv-view--outline {
   grid-template-columns: minmax(280px, 340px) 1fr minmax(230px, 290px);
 }
+/* #184 — intermediate desktop breakpoint. Between the mobile cutover (640px,
+   where the outline rides as a slide-over sheet) and ~1100px, three columns
+   squeeze the reader toward its grid minimum. In that band revert
+   `.conv-view--outline` to the two-column template and drop the outline column
+   entirely — the store `convOutlineOpen` flag stays set (the toggle's pressed
+   state is preserved), the column simply doesn't render at this width. CSS-only:
+   JSDOM doesn't evaluate @media, so this is verified in the Playwright pass, not
+   a unit test. The mobile (<=640px) sheet behavior below is untouched. */
+@media (min-width: 641px) and (max-width: 1100px) {
+  .conv-view--outline {
+    grid-template-columns: minmax(280px, 340px) 1fr;
+  }
+  .conv-view--outline > .conv-outline {
+    display: none;
+  }
+}
 
 /* ---- Outline sidebar + stats overview (#177 S5 §3) ---------------- */
 .conv-outline {

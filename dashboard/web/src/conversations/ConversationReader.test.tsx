@@ -1144,3 +1144,76 @@ describe('ConversationReader time markers (#177 S5 §6)', () => {
     expect(markers[0].textContent).toContain('50 min later');
   });
 });
+
+// #184 — scroll-sync PRODUCER coverage. The reader registers an
+// IntersectionObserver over its rendered turns; on a change it dispatches the
+// topmost-visible turn's data-uuid to convCurrentTurnUuid. jsdom never lays out
+// and the default IO stub is a no-op, so this drives the producer directly: a
+// capturing stub records every observer callback, then the test invokes the one
+// the reader observed turns with — feeding synthetic intersecting entries whose
+// targets carry data-uuid + a mocked getBoundingClientRect top — and asserts the
+// store cursor becomes the topmost uuid.
+describe('ConversationReader scroll-sync producer (#177 S5 §3 / #184)', () => {
+  // A capturing IntersectionObserver: each instance records its callback and the
+  // elements it observed, so a test can replay the callback by hand.
+  type CapturedObs = { cb: IntersectionObserverCallback; targets: Element[] };
+  let observers: CapturedObs[] = [];
+  function installCapturingObserver() {
+    class Capturing {
+      cb: IntersectionObserverCallback;
+      targets: Element[] = [];
+      constructor(cb: IntersectionObserverCallback) {
+        this.cb = cb;
+        observers.push(this as unknown as CapturedObs);
+      }
+      observe(el: Element): void { this.targets.push(el); }
+      unobserve(): void {}
+      disconnect(): void {}
+      takeRecords(): IntersectionObserverEntry[] { return []; }
+    }
+    (globalThis as unknown as { IntersectionObserver: typeof Capturing }).IntersectionObserver = Capturing;
+  }
+
+  beforeEach(() => { observers = []; installCapturingObserver(); });
+
+  it('dispatches the topmost intersecting turn uuid to the store', async () => {
+    mockFetchOnce(detail([
+      makeItem({ uuid: 'h1', ts: '2026-06-12T14:00:00Z' } as never),
+      makeItem({ uuid: 'h2', ts: '2026-06-12T14:01:00Z' } as never),
+    ]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="h2"]')).not.toBeNull());
+
+    const elH1 = container.querySelector('[data-uuid="h1"]') as HTMLElement;
+    const elH2 = container.querySelector('[data-uuid="h2"]') as HTMLElement;
+    // h2 sits ABOVE h1 in viewport space (smaller top) — it must win.
+    vi.spyOn(elH1, 'getBoundingClientRect').mockReturnValue({ top: 200 } as DOMRect);
+    vi.spyOn(elH2, 'getBoundingClientRect').mockReturnValue({ top: 40 } as DOMRect);
+
+    // The scroll-sync observer is the one that observed the rendered turn
+    // elements (the lazy-load observer observes the sentinel, not these).
+    const obs = observers.find((o) => o.targets.includes(elH1) || o.targets.includes(elH2));
+    expect(obs).toBeDefined();
+
+    act(() => {
+      obs!.cb(
+        [
+          { target: elH1, isIntersecting: true } as unknown as IntersectionObserverEntry,
+          { target: elH2, isIntersecting: true } as unknown as IntersectionObserverEntry,
+        ],
+        obs as unknown as IntersectionObserver,
+      );
+    });
+    expect(getState().convCurrentTurnUuid).toBe('h2');
+
+    // When h2 scrolls out (no longer intersecting), the topmost falls back to h1.
+    act(() => {
+      obs!.cb(
+        [{ target: elH2, isIntersecting: false } as unknown as IntersectionObserverEntry],
+        obs as unknown as IntersectionObserver,
+      );
+    });
+    expect(getState().convCurrentTurnUuid).toBe('h1');
+  });
+});

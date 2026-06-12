@@ -38,6 +38,44 @@ export function outlineTurnVisible(turn: OutlineTurn, mode: FocusMode): boolean 
   return false;
 }
 
+// #184 — jump-target kinds the cluster + reader keys navigate. Sorted-ascending
+// index lists in outline-skeleton space, one per landmark family.
+export type JumpKind = 'error' | 'prompt' | 'subagent' | 'plan';
+
+// The tools whose presence marks a turn as a plan / question landmark.
+export const PLAN_QUESTION_TOOLS = new Set(['ExitPlanMode', 'AskUserQuestion']);
+
+// #184 — single source of truth for the jump-target machinery. The reader
+// (e/u/b/p keys) and the OutlinePanel glyph cluster both navigate the SAME four
+// landmark lists + the uuid→index map; this builder is the shared origin so the
+// two surfaces can never drift. Pure over the outline-skeleton turns:
+//   - error:    turns carrying any is_error tool result.
+//   - prompt:   human turns.
+//   - subagent: the FIRST turn index per distinct (non-null) subagent_key.
+//   - plan:     turns carrying an ExitPlanMode / AskUserQuestion tool.
+//   - indexByUuid: every turn's uuid → its skeleton index, for cursor resolution.
+export function buildOutlineTargets(
+  turns: OutlineTurn[],
+): { error: number[]; prompt: number[]; subagent: number[]; plan: number[]; indexByUuid: Map<string, number> } {
+  const error: number[] = [];
+  const prompt: number[] = [];
+  const subagent: number[] = [];
+  const plan: number[] = [];
+  const indexByUuid = new Map<string, number>();
+  const seenSub = new Set<string>();
+  turns.forEach((t, i) => {
+    indexByUuid.set(t.uuid, i);
+    if (t.tools?.some((x) => x.is_error)) error.push(i);
+    if (t.kind === 'human') prompt.push(i);
+    if (t.subagent_key != null && !seenSub.has(t.subagent_key)) {
+      seenSub.add(t.subagent_key);
+      subagent.push(i); // FIRST turn index per distinct subagent_key
+    }
+    if (t.tools?.some((x) => x.name != null && PLAN_QUESTION_TOOLS.has(x.name))) plan.push(i);
+  });
+  return { error, prompt, subagent, plan, indexByUuid };
+}
+
 // #177 S5 §4 — jump-to-next cursor math, shared by the reader's e/u/b/p keys and
 // the OutlinePanel glyph cluster. Pure: given a SORTED ascending list of target
 // turn indices (outline-skeleton space), the cursor's current turn index, and a

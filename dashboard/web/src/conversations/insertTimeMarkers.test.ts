@@ -5,7 +5,10 @@ import type { ConversationItem } from '../types/conversation';
 import type { FmtCtx } from '../lib/fmt';
 
 const UTC: FmtCtx = { tz: 'Etc/UTC', offsetLabel: 'UTC' };
-const NY: FmtCtx = { tz: 'America/New_York', offsetLabel: 'EST' };
+// #184 — June in New York is EDT (-04), not EST. `offsetLabel` is unused by
+// insertTimeMarkers (it keys only on `tz` for the calendar-day boundary), so the
+// label is cosmetic here; corrected to EDT to avoid a misleading fixture.
+const NY: FmtCtx = { tz: 'America/New_York', offsetLabel: 'EDT' };
 
 // A minimal `item` FilteredNode carrying a given ts.
 function itemNode(uuid: string, ts: string | null): FilteredNode {
@@ -153,5 +156,26 @@ describe('insertTimeMarkers', () => {
       UTC,
     );
     expect(markers(out)).toHaveLength(0);
+  });
+
+  it('keeps marker keys unique even when an out-of-order instant repeats (#184)', () => {
+    // A non-monotonic transcript: the same instant recurs after a forward jump.
+    // a (14:00) → b (14:42, +42m marker) → c (14:00 again, backwards: no marker)
+    // → d (14:42 again, +42m marker). The two emitted markers share the SAME iso
+    // ("…14:42:00Z"); folding the output position in keeps their keys distinct.
+    const out = insertTimeMarkers(
+      [
+        itemNode('a', '2026-06-12T14:00:00Z'),
+        itemNode('b', '2026-06-12T14:42:00Z'),
+        itemNode('c', '2026-06-12T14:00:00Z'),
+        itemNode('d', '2026-06-12T14:42:00Z'),
+      ],
+      UTC,
+    );
+    const keys = out
+      .filter((n): n is Extract<TimedNode, { kind: 'time_marker' }> => n.kind === 'time_marker')
+      .map((m) => m.key);
+    expect(keys).toHaveLength(2);
+    expect(new Set(keys).size).toBe(2); // unique despite the repeated instant
   });
 });

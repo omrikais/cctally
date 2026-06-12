@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'r
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { deriveOutline, type OutlineEntry } from './deriveOutline';
-import { nextTarget, outlineTurnVisible } from './outlineNavigation';
+import { buildOutlineTargets, nextTarget, outlineTurnVisible, type JumpKind } from './outlineNavigation';
 import type { FocusMode } from './applyFocusMode';
 import { fmt } from '../lib/fmt';
 import {
@@ -22,29 +22,10 @@ import type { ConversationOutline, OutlineStats, OutlineTurn } from '../types/co
 // rendered as `glyph + count`. Click = next, shift-click = previous. The cursor
 // resolves from `convCurrentTurnUuid` (the scroll-sync turn) → -1 ("before the
 // start") when absent. A miss pulses the button (reduced-motion: no pulse). The
-// reader's e/u/b/p keys share the same `nextTarget` math (outlineNavigation.ts);
-// this cluster carries `data-jump-kind` so the reader's key no-op can pulse the
-// matching button via the DOM.
-type JumpKind = 'error' | 'prompt' | 'subagent' | 'plan';
-const PLAN_QUESTION_TOOLS = new Set(['ExitPlanMode', 'AskUserQuestion']);
-
-function buildTargetLists(turns: OutlineTurn[]): Record<JumpKind, number[]> {
-  const error: number[] = [];
-  const prompt: number[] = [];
-  const subagent: number[] = [];
-  const plan: number[] = [];
-  const seenSub = new Set<string>();
-  turns.forEach((t, i) => {
-    if (t.tools?.some((x) => x.is_error)) error.push(i);
-    if (t.kind === 'human') prompt.push(i);
-    if (t.subagent_key != null && !seenSub.has(t.subagent_key)) {
-      seenSub.add(t.subagent_key);
-      subagent.push(i);
-    }
-    if (t.tools?.some((x) => x.name != null && PLAN_QUESTION_TOOLS.has(x.name))) plan.push(i);
-  });
-  return { error, prompt, subagent, plan };
-}
+// reader's e/u/b/p keys share the same `buildOutlineTargets` + `nextTarget` math
+// (outlineNavigation.ts — #184 lifted the duplicated builder there); this cluster
+// carries `data-jump-kind` so the reader's key no-op can pulse the matching
+// button via the DOM.
 
 function JumpCluster({
   sessionId,
@@ -60,12 +41,9 @@ function JumpCluster({
   focusMode: FocusMode;
 }) {
   const turns = outline.turns;
-  const lists = useMemo(() => buildTargetLists(turns), [turns]);
-  const indexByUuid = useMemo(() => {
-    const m = new Map<string, number>();
-    turns.forEach((t, i) => m.set(t.uuid, i));
-    return m;
-  }, [turns]);
+  // #184 — shared jump-target builder (lists + uuid→index map) so the panel
+  // cluster and the reader keys can never drift apart.
+  const { indexByUuid, ...lists } = useMemo(() => buildOutlineTargets(turns), [turns]);
 
   const jump = useCallback((kind: JumpKind, dir: 1 | -1, btn: HTMLElement) => {
     const cursor = currentUuid != null && indexByUuid.has(currentUuid) ? indexByUuid.get(currentUuid)! : -1;
@@ -226,6 +204,13 @@ export function OutlinePanel({
   sessionId: string;
   outline: ConversationOutline | null;
 }) {
+  // #184 — deliberate full-panel re-render per `convCurrentTurnUuid` tick. The
+  // reader keeps its own highlight imperative (a class toggle on the scrolled
+  // element) precisely to avoid re-rendering its heavy MessageItems on every
+  // scroll-sync tick; the panel makes the OPPOSITE trade and simply re-renders.
+  // Its rows are trivial (a glyph + a label string, no Markdown / cards), so the
+  // re-render cost is negligible, and a subscription-driven render is far simpler
+  // than mirroring the reader's imperative aria-current bookkeeping here.
   const currentUuid = useSyncExternalStore(
     subscribeStore,
     () => getState().convCurrentTurnUuid,

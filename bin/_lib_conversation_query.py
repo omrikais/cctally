@@ -16,6 +16,7 @@ import json as _json
 import os
 import re
 import sqlite3
+from datetime import datetime as _datetime
 
 # Public surface (Plan 2): shipped in the npm tarball + brew formula + public
 # mirror — imported by the dashboard's conversation endpoints at runtime.
@@ -780,8 +781,7 @@ def _parse_outline_ts(ts):
     if not ts:
         return None
     try:
-        from datetime import datetime
-        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return _datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
     except ValueError:
         return None
 

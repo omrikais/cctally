@@ -2,15 +2,25 @@ import { createRef } from 'react';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageItem } from './MessageItem';
+import { TranscriptContext } from './TranscriptContext';
+import type { FmtCtx } from '../lib/fmt';
 import type { ConversationItem } from '../types/conversation';
 
-// #177 S5 §6 — eyebrow times route through useDisplayTz. A mutable holder lets a
-// test flip the display tz (local vs utc FmtCtx) without re-mocking. Default is
-// Etc/UTC so the bulk of the existing tests render a deterministic clock.
-const displayTz = { tz: 'utc', resolvedTz: 'Etc/UTC', offsetLabel: 'UTC', offsetSeconds: 0, pinned: false };
-vi.mock('../hooks/useDisplayTz', () => ({
-  useDisplayTz: () => displayTz,
-}));
+// #184 — eyebrow times read the display-tz FmtCtx from TranscriptContext (the
+// reader provides it once; MessageItem no longer subscribes per-item via
+// useDisplayTz). A mutable holder lets a test flip the tz without re-rendering
+// the provider tree by hand. Default is Etc/UTC so the bulk of the existing
+// tests render a deterministic clock. The direct `render(<MessageItem .../>)`
+// calls below rely on the context DEFAULT (also Etc/UTC); only the tz-sensitive
+// cases wrap in the provider via `renderWithTz`.
+const fmtCtx: FmtCtx = { tz: 'Etc/UTC', offsetLabel: 'UTC' };
+function renderWithTz(item: ConversationItem) {
+  return render(
+    <TranscriptContext.Provider value={{ sessionId: 's', fmtCtx }}>
+      <MessageItem item={item} />
+    </TranscriptContext.Provider>,
+  );
+}
 
 const human: ConversationItem = {
   kind: 'human',
@@ -647,8 +657,8 @@ describe('MessageItem (#174 permalink on tool-result & system-marker chips)', ()
 // ---- #177 S5 §6 — eyebrow times + token footer --------------------------
 describe('MessageItem eyebrow time (#177 S5 §6)', () => {
   afterEach(() => {
-    displayTz.resolvedTz = 'Etc/UTC';
-    displayTz.offsetLabel = 'UTC';
+    fmtCtx.tz = 'Etc/UTC';
+    fmtCtx.offsetLabel = 'UTC';
   });
 
   const withTs = (over: Partial<ConversationItem> & { uuid: string; kind: ConversationItem['kind'] }): ConversationItem => {
@@ -706,11 +716,11 @@ describe('MessageItem eyebrow time (#177 S5 §6)', () => {
     expect(container.querySelector('.conv-item-time')).toBeNull();
   });
 
-  it('honors display.tz — the same instant renders a different wall clock under a non-UTC zone', () => {
+  it('honors the context fmtCtx tz — the same instant renders a different wall clock under a non-UTC zone', () => {
     // 14:02:31Z is 10:02 in America/New_York (EDT, -04 in June).
-    displayTz.resolvedTz = 'America/New_York';
-    displayTz.offsetLabel = 'EDT';
-    const { container } = render(<MessageItem item={withTs({ uuid: 'h3', kind: 'human' })} />);
+    fmtCtx.tz = 'America/New_York';
+    fmtCtx.offsetLabel = 'EDT';
+    const { container } = renderWithTz(withTs({ uuid: 'h3', kind: 'human' }));
     expect(container.querySelector('.conv-item-time')!.textContent).toBe('· 10:02');
   });
 });
