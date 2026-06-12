@@ -53,7 +53,13 @@ class MessageRow:
     stop_reason: "str | None" = None
     attribution_skill: "str | None" = None
     attribution_plugin: "str | None" = None
-    search_aux: str = ""
+    # #177 S6: split non-prose search columns, derived by _derive_search_columns
+    # on the FINAL post-augment blocks (see _normalize). ``search_aux`` is kept
+    # physically (legacy column) but NEVER assigned a non-empty value — the
+    # consolidated multi-column FTS reads search_tool/search_thinking instead.
+    search_tool: str = ""
+    search_thinking: str = ""
+    search_aux: str = ""   # documented-dead (#177 S6); always "" on new rows
 
 
 def iter_message_rows(fh, path_str):
@@ -107,7 +113,7 @@ def _normalize(obj, t, offset):
     msg = obj.get("message")
     if not isinstance(msg, dict):
         msg = {}
-    blocks, text, aux = _blocks_and_text(msg.get("content"))
+    blocks, text = _blocks_and_text(msg.get("content"))
     if t == "assistant":
         entry_type = ASSISTANT
     elif any(b["kind"] == "tool_result" for b in blocks):
@@ -140,6 +146,14 @@ def _normalize(obj, t, offset):
     else:
         entry_type = HUMAN
     is_asst = t == "assistant"
+    # #177 S6: derive the split search columns on the FINAL post-augment blocks
+    # (every _attach_* pass above has already merged bash_stderr / answers /
+    # annotations into the blocks). This is the SAME chokepoint the migration-010
+    # backfill runs on json.loads(blocks_json), so live ingest and backfill
+    # produce byte-identical values (the parity invariant). Computed immediately
+    # before json.dumps(blocks) so blocks_json and the columns agree by
+    # construction.
+    search_tool, search_thinking = _derive_search_columns(blocks)
     return MessageRow(
         byte_offset=offset,
         session_id=obj.get("sessionId"),
@@ -163,26 +177,27 @@ def _normalize(obj, t, offset):
         stop_reason=msg.get("stop_reason") if is_asst else None,
         attribution_skill=obj.get("attributionSkill"),
         attribution_plugin=obj.get("attributionPlugin"),
-        search_aux=aux,
+        search_tool=search_tool,
+        search_thinking=search_thinking,
+        # search_aux stays "" (documented-dead, #177 S6) — the consolidated
+        # multi-column FTS reads search_tool/search_thinking instead.
     )
 
 
 def _blocks_and_text(content):
-    """Return (normalized blocks list, indexed-prose string, search_aux string).
+    """Return (normalized blocks list, indexed-prose string).
 
     Prose (``text``) = joined ``text`` blocks only (thinking / tool_use /
-    tool_result excluded — those go to the prose FTS via the ``text`` column).
-    ``search_aux`` (#177) = the non-prose searchable content: bounded tool-input
-    string leaves, the (capped) tool_result ``text``, and the thinking text
-    capped at ``_TOOL_RESULT_CAP`` (code-review I2 — the FULL thinking still
-    lives in ``blocks_json`` for rendering; only this aux index entry is capped
-    so the second FTS index doesn't double the at-rest cost of large thinking) —
-    indexed by the parallel ``conversation_fts_aux`` so tool content stays
-    searchable without polluting prose FTS. Prose is deliberately excluded from
-    aux (it is already in ``text``)."""
+    tool_result excluded — those go to the split search columns via
+    ``_derive_search_columns``, which runs in ``_normalize`` on the FINAL
+    post-augment blocks). #177 S6 dropped the in-loop ``search_aux`` accumulation
+    that used to be the third return element: deriving the search columns here
+    (pre-augment) would miss bash_stderr / answers / annotations and break the
+    ingest==backfill parity invariant, so the derivation moved to the
+    post-augment chokepoint."""
     if isinstance(content, str):
-        return (([{"kind": "text", "text": content}] if content else []), content, "")
-    blocks, texts, aux_parts = [], [], []
+        return (([{"kind": "text", "text": content}] if content else []), content)
+    blocks, texts = [], []
     if isinstance(content, list):
         # #177 S4: ordinal among media items at THIS list level, keyed by the
         # object identity of each image/document item, so the placeholder writers
@@ -199,7 +214,6 @@ def _blocks_and_text(content):
             elif bt == "thinking":
                 think = b.get("thinking", "") or ""
                 blocks.append({"kind": "thinking", "text": think})  # FULL text for render
-                aux_parts.append(think[:_TOOL_RESULT_CAP])          # aux index capped (I2)
             elif bt == "tool_use":
                 bounded, input_trunc = _bound_input(b.get("input"))
                 block = {"kind": "tool_use", "name": b.get("name"),
@@ -211,7 +225,6 @@ def _blocks_and_text(content):
                 st = inp.get("subagent_type") if isinstance(inp, dict) else None
                 if isinstance(st, str) and st:        # #166: spawn kind (Agent/Task)
                     block["subagent_type"] = st
-                aux_parts.extend(_aux_strings(bounded))
                 blocks.append(block)
             elif bt == "tool_result":
                 raw = _stringify(b.get("content"))
@@ -230,14 +243,12 @@ def _blocks_and_text(content):
                 if media:                      # omitted when empty (additive)
                     block["media"] = media
                 blocks.append(block)
-                aux_parts.append(clipped)
             elif bt in _MEDIA_BLOCK_TYPES:
                 blocks.append({"kind": bt, **_media(b.get("source")),
                                "index": media_index[id(b)]})
             elif bt == "tool_reference":
                 blocks.append({"kind": "tool_reference", "name": b.get("name")})
-    return (blocks, "\n".join(t for t in texts if t),
-            "\n".join(a for a in aux_parts if a))
+    return (blocks, "\n".join(t for t in texts if t))
 
 
 _SUBAGENT_META_KEYS = (
@@ -558,8 +569,51 @@ def _bound_input(inp):
     return (bounded, state["truncated"])
 
 
+def _derive_search_columns(blocks):
+    """(search_tool, search_thinking) from the FINAL normalized blocks list.
+
+    MUST run post-augmentation (bash_stderr / answers / annotations already
+    merged into the blocks) so live ingest and the migration-010 backfill from
+    blocks_json produce byte-identical values (#177 S6 parity invariant — the
+    chokepoint runs in _normalize right before json.dumps(blocks), and the
+    backfill runs it on json.loads(blocks_json)). Caps are PER-BLOCK
+    (_TOOL_RESULT_CAP each), matching the old search_aux semantics — NOT a
+    whole-column total. Prose is excluded (already in the ``text`` column).
+
+    ``search_tool`` = bounded tool-input string leaves + clipped tool_result
+    ``text`` + ``bash_stderr`` + bounded AskUserQuestion answers/annotations
+    (real ingest stamps these as ``ask_answers``/``ask_annotations``; the raw
+    ``answers``/``annotations`` keys are also read for forward compatibility and
+    the synthetic-block unit tests). ``search_thinking`` = thinking text."""
+    tool_parts, think_parts = [], []
+    for b in blocks if isinstance(blocks, list) else []:
+        if not isinstance(b, dict):
+            continue
+        k = b.get("kind")
+        if k == "thinking":
+            t = b.get("text") or ""
+            if t:
+                think_parts.append(t[:_TOOL_RESULT_CAP])
+        elif k == "tool_use":
+            tool_parts.extend(
+                s[:_TOOL_RESULT_CAP] for s in _aux_strings(b.get("input")))
+        elif k == "tool_result":
+            t = b.get("text") or ""
+            if t:
+                tool_parts.append(t[:_TOOL_RESULT_CAP])
+            stderr = b.get("bash_stderr") or ""
+            if stderr:
+                tool_parts.append(stderr[:_TOOL_RESULT_CAP])
+            # answers/annotations: real ingest uses the ``ask_``-prefixed keys;
+            # the bare keys are read too (forward-compat + synthetic unit tests).
+            for key in ("ask_answers", "ask_annotations", "answers", "annotations"):
+                tool_parts.extend(
+                    s[:_TOOL_RESULT_CAP] for s in _aux_strings(b.get(key)))
+    return ("\n".join(tool_parts), "\n".join(think_parts))
+
+
 def _aux_strings(v):
-    """Yield string leaves from a bounded input value (for the search_aux blob)."""
+    """Yield string leaves from a bounded input value (for the search columns)."""
     if isinstance(v, str):
         if v:
             yield v

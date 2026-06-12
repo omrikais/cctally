@@ -2407,6 +2407,16 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "conversation_messages", "attribution_plugin", "TEXT")
     add_column_if_missing(
         conn, "conversation_messages", "search_aux", "TEXT NOT NULL DEFAULT ''")
+    # #177 S6: split the non-prose search index into two columns so kind facets
+    # (Tools / Thinking) are exact in SQL. ``search_aux`` above is documented-dead
+    # — the writer stops populating it (always ''); the consolidated multi-column
+    # conversation_fts(text, search_tool, search_thinking) indexes these instead.
+    # Idempotent column-adds (no marker, no version); migration 010 backfills the
+    # values onto existing history from blocks_json under the cache.db.lock flock.
+    add_column_if_missing(
+        conn, "conversation_messages", "search_tool", "TEXT NOT NULL DEFAULT ''")
+    add_column_if_missing(
+        conn, "conversation_messages", "search_thinking", "TEXT NOT NULL DEFAULT ''")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
         "ON session_files(session_id)"

@@ -196,7 +196,7 @@ def test_tool_use_block_keeps_id():
     from _lib_conversation import _blocks_and_text
     content = [{"type": "tool_use", "id": "toolu_abc", "name": "Read",
                 "input": {"file_path": "/x/y.py"}}]
-    blocks, text, aux = _blocks_and_text(content)
+    blocks, text = _blocks_and_text(content)
     assert blocks[0]["kind"] == "tool_use"
     assert blocks[0]["id"] == "toolu_abc"
 
@@ -205,17 +205,17 @@ def test_tool_result_block_keeps_tool_use_id():
     from _lib_conversation import _blocks_and_text
     content = [{"type": "tool_result", "tool_use_id": "toolu_abc",
                 "content": "ok"}]
-    blocks, text, aux = _blocks_and_text(content)
+    blocks, text = _blocks_and_text(content)
     assert blocks[0]["kind"] == "tool_result"
     assert blocks[0]["tool_use_id"] == "toolu_abc"
 
 
 def test_missing_ids_default_to_none_not_keyerror():
     from _lib_conversation import _blocks_and_text
-    blocks, _, _ = _blocks_and_text([{"type": "tool_use", "name": "Bash",
-                                      "input": {"command": "ls"}}])
+    blocks, _ = _blocks_and_text([{"type": "tool_use", "name": "Bash",
+                                  "input": {"command": "ls"}}])
     assert blocks[0]["id"] is None
-    blocks2, _, _ = _blocks_and_text([{"type": "tool_result", "content": "x"}])
+    blocks2, _ = _blocks_and_text([{"type": "tool_result", "content": "x"}])
     assert blocks2[0]["tool_use_id"] is None
 
 
@@ -253,8 +253,8 @@ def test_tool_preview_non_dict_input_is_empty():
 
 def test_tool_use_block_keeps_preview():
     from _lib_conversation import _blocks_and_text
-    blocks, _, _ = _blocks_and_text([{"type": "tool_use", "id": "t1", "name": "Read",
-                                      "input": {"file_path": "/a/b.py"}}])
+    blocks, _ = _blocks_and_text([{"type": "tool_use", "id": "t1", "name": "Read",
+                                  "input": {"file_path": "/a/b.py"}}])
     assert blocks[0]["preview"] == "/a/b.py"
 
 
@@ -485,35 +485,39 @@ def test_message_level_fields_land_on_row():
     assert row.attribution_skill == "superpowers:brainstorming"
     assert row.attribution_plugin == "superpowers"
 
-def test_search_aux_includes_tool_and_thinking_excludes_prose():
+def test_search_columns_include_tool_and_thinking_exclude_prose():
+    # #177 S6: the non-prose index split into search_tool (tool input/result) +
+    # search_thinking (thinking). The legacy search_aux column is documented-dead
+    # (always ''). Prose stays in text only.
     row = lc.parse_message_row(_asst_line([
         {"type": "text", "text": "PROSE_ONLY_TOKEN"},
         {"type": "thinking", "thinking": "THINK_TOKEN"},
         {"type": "tool_use", "name": "Bash", "id": "t3",
          "input": {"command": "CMD_TOKEN"}}]), 0)
-    assert "THINK_TOKEN" in row.search_aux
-    assert "CMD_TOKEN" in row.search_aux
-    assert "PROSE_ONLY_TOKEN" not in row.search_aux   # prose excluded
-    assert "PROSE_ONLY_TOKEN" in row.text             # prose still indexed via text
+    assert "THINK_TOKEN" in row.search_thinking
+    assert "CMD_TOKEN" in row.search_tool
+    assert "PROSE_ONLY_TOKEN" not in row.search_tool   # prose excluded
+    assert "PROSE_ONLY_TOKEN" not in row.search_thinking
+    assert "PROSE_ONLY_TOKEN" in row.text              # prose still indexed via text
+    assert row.search_aux == ""                        # documented-dead
 
-def test_search_aux_includes_tool_result_text():
+def test_search_tool_includes_tool_result_text():
     line = {"type": "user", "uuid": "u3", "sessionId": "s1",
             "message": {"content": [
                 {"type": "tool_result", "tool_use_id": "t1", "content": "RESULT_TOKEN"}]}}
     row = lc.parse_message_row(line, 0)
-    assert "RESULT_TOKEN" in row.search_aux
-    assert row.text == ""                             # tool_result zeroes prose, NOT aux
+    assert "RESULT_TOKEN" in row.search_tool
+    assert row.text == ""                              # tool_result zeroes prose, NOT search_tool
+    assert row.search_aux == ""
 
-def test_search_aux_caps_thinking_but_block_keeps_full():
-    # code-review I2: the aux index entry for a thinking block is capped at
-    # _TOOL_RESULT_CAP so the second FTS index doesn't double the at-rest cost of
-    # large thinking — but the blocks_json thinking block keeps the FULL text for
-    # rendering (Session 2+).
+def test_search_thinking_caps_thinking_but_block_keeps_full():
+    # The thinking search-column entry is capped at _TOOL_RESULT_CAP so the FTS
+    # index doesn't double the at-rest cost of large thinking — but the
+    # blocks_json thinking block keeps the FULL text for rendering.
     full = "T" * (lc._TOOL_RESULT_CAP + 500)
     row = lc.parse_message_row(_asst_line([{"type": "thinking", "thinking": full}]), 0)
-    # aux contribution of the thinking run is capped at _TOOL_RESULT_CAP. The
-    # block is the sole aux source here, so search_aux is exactly the capped run.
-    assert len(row.search_aux) == lc._TOOL_RESULT_CAP
+    # the thinking run is the sole search_thinking source here, capped to the cap.
+    assert len(row.search_thinking) == lc._TOOL_RESULT_CAP
     # the stored thinking block keeps the FULL text for rendering
     blocks = json.loads(row.blocks_json)
     think = [b for b in blocks if b["kind"] == "thinking"][0]
@@ -829,3 +833,84 @@ def test_web_fetch_capture_triple_and_mismatch():
     for tur in ({"code": 200, "result": "x"}, "Error: Request failed"):
         b2 = json.loads(list(lc.iter_message_rows(_jsonl(_web_search_line(tur)), "f"))[0].blocks_json)[0]
         assert "web_fetch" not in b2
+
+
+# === #177 S6: _derive_search_columns chokepoint (Task 1a) ===
+
+def test_derive_search_columns_splits_kinds():
+    blocks = [
+        {"kind": "text", "text": "prose stays out"},
+        {"kind": "thinking", "text": "let me reason"},
+        {"kind": "tool_use", "name": "Bash", "input": {"command": "npm run build"}},
+        {"kind": "tool_result", "text": "vite built ok", "bash_stderr": "warn: chunk big"},
+    ]
+    tool, think = lc._derive_search_columns(blocks)
+    assert "npm run build" in tool and "vite built ok" in tool and "warn: chunk big" in tool
+    assert think == "let me reason"
+    assert "prose stays out" not in tool and "prose stays out" not in think
+
+
+def test_derive_search_columns_caps_per_block_and_handles_answers():
+    big = "x" * (lc._TOOL_RESULT_CAP + 100)
+    blocks = [
+        {"kind": "thinking", "text": big},
+        {"kind": "thinking", "text": "second"},
+        {"kind": "tool_result", "text": "r", "answers": {"Q": "picked option B"}},
+    ]
+    tool, think = lc._derive_search_columns(blocks)
+    assert len(think.split("\n")[0]) == lc._TOOL_RESULT_CAP   # per-block cap, not whole-column
+    assert "second" in think
+    assert "picked option B" in tool
+
+
+def test_derive_search_columns_indexes_real_ask_answers_key():
+    # Real ingest stamps `ask_answers`/`ask_annotations` (not raw `answers`); the
+    # chokepoint must index those too so AskUserQuestion choices stay searchable.
+    blocks = [
+        {"kind": "tool_result", "text": "r",
+         "ask_answers": {"Q": "chose path A"},
+         "ask_annotations": {"note": "rationale text"}},
+    ]
+    tool, _ = lc._derive_search_columns(blocks)
+    assert "chose path A" in tool and "rationale text" in tool
+
+
+def test_derive_search_columns_empty_and_malformed():
+    assert lc._derive_search_columns([]) == ("", "")
+    assert lc._derive_search_columns([None, 42, {"kind": "text"}]) == ("", "")
+    assert lc._derive_search_columns("not a list") == ("", "")
+
+
+def test_ingest_search_columns_match_chokepoint_post_augment():
+    # Parity pin: row.search_tool/search_thinking equal _derive_search_columns on
+    # the FINAL post-augment blocks (blocks_json). A Bash tool_result carrying
+    # toolUseResult.stderr proves the derivation runs AFTER _attach_bash_streams
+    # (a pre-augment call site would drop the stderr and make this RED).
+    line = {"type": "user", "uuid": "u1", "sessionId": "s1", "timestamp": "t",
+            "toolUseResult": {"stdout": "out\n", "stderr": "stderr-needle",
+                              "interrupted": False},
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tb",
+                 "content": [{"type": "text", "text": "out\nstderr-needle"}],
+                 "is_error": True}]}}
+    row = list(lc.iter_message_rows(_jsonl(line), "f"))[0]
+    exp_tool, exp_think = lc._derive_search_columns(json.loads(row.blocks_json))
+    assert row.search_tool == exp_tool
+    assert row.search_thinking == exp_think
+    assert "stderr-needle" in row.search_tool   # post-augment: stderr indexed
+
+
+def test_ingest_thinking_and_tool_use_columns():
+    line = {"type": "assistant", "uuid": "a1", "sessionId": "s1",
+            "requestId": "r1", "timestamp": "t",
+            "message": {"role": "assistant", "id": "m1", "model": "opus",
+                        "content": [
+                            {"type": "thinking", "thinking": "ponder deeply"},
+                            {"type": "text", "text": "visible"},
+                            {"type": "tool_use", "name": "Bash",
+                             "input": {"command": "rg needle"}}]}}
+    row = list(lc.iter_message_rows(_jsonl(line), "f"))[0]
+    assert "rg needle" in row.search_tool
+    assert row.search_thinking == "ponder deeply"
+    assert row.text == "visible"
+    assert "visible" not in row.search_tool and "visible" not in row.search_thinking

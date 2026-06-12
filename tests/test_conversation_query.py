@@ -18,8 +18,10 @@ def _conn():
 
 def _msg(c, **kw):
     # The #177 enrichment columns (stop_reason / attribution_skill /
-    # attribution_plugin / search_aux) are TAIL-APPENDED, matching the
-    # production INSERT tuple. search_aux defaults to '' (the NOT NULL DEFAULT).
+    # attribution_plugin / search_tool / search_thinking / search_aux) are
+    # TAIL-APPENDED, matching the production INSERT tuple. #177 S6: search_tool /
+    # search_thinking carry the split non-prose index; search_aux is documented-
+    # dead and defaults to '' (the NOT NULL DEFAULT).
     cols = ("session_id", "uuid", "parent_uuid", "source_path", "byte_offset",
             "timestamp_utc", "entry_type", "text", "blocks_json", "model",
             "msg_id", "req_id", "cwd", "git_branch", "is_sidechain",
@@ -29,16 +31,20 @@ def _msg(c, **kw):
     row["blocks_json"] = kw.get("blocks_json", "[]")
     row["text"] = kw.get("text", "")
     row["is_sidechain"] = kw.get("is_sidechain", 0)
+    row["search_tool"] = kw.get("search_tool", "")
+    row["search_thinking"] = kw.get("search_thinking", "")
     row["search_aux"] = kw.get("search_aux", "")
     c.execute(
         "INSERT OR IGNORE INTO conversation_messages "
         "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
         " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,is_sidechain,"
-        " source_tool_use_id,stop_reason,attribution_skill,attribution_plugin,search_aux)"
+        " source_tool_use_id,stop_reason,attribution_skill,attribution_plugin,"
+        " search_tool,search_thinking,search_aux)"
         " VALUES(:session_id,:uuid,:parent_uuid,:source_path,:byte_offset,"
         ":timestamp_utc,:entry_type,:text,:blocks_json,:model,:msg_id,:req_id,"
         ":cwd,:git_branch,:is_sidechain,:source_tool_use_id,:stop_reason,"
-        ":attribution_skill,:attribution_plugin,:search_aux)", row)
+        ":attribution_skill,:attribution_plugin,"
+        ":search_tool,:search_thinking,:search_aux)", row)
 
 
 def _entry(c, *, source_path, line_offset, model, msg_id, req_id,
