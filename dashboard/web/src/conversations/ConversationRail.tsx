@@ -192,7 +192,10 @@ function SearchRow({ hit, ctx }: { hit: SearchHit; ctx: RailCtx }) {
         })
       }
     >
-      <div className="conv-rail-row-title">
+      {/* #177 S6 — title row is a flex line: the 2-line-clamped title TEXT as a
+          min-width:0 child, the badge group trailing and flex-shrink:0 OUTSIDE
+          the clamp box so a long title can never clip it off as a third line. */}
+      <div className="conv-rail-row-title conv-rail-row-title--hit">
         <span className="conv-rail-row-title-text">{hit.title}</span>
         {badges.length > 0 && (
           <span className="conv-rail-kindbs">

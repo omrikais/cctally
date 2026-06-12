@@ -5079,12 +5079,31 @@ mark.current {
   color: var(--text-faint);
   padding: 2px 6px 6px;
 }
-.conv-rail-row-title-text { display: block; }
+/* Search-hit title row: a flex line so the badge group rides top-right OUTSIDE
+   the clamp box. Without this, badges nested in the clamped title (-webkit-line-
+   clamp: 2; overflow: hidden) became the clipped third line on long titles and
+   silently vanished — exactly the tool/thinking hits where badges matter. */
+.conv-rail-row-title--hit {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  /* override the inherited -webkit-box clamp; the clamp now lives on the text. */
+  -webkit-line-clamp: none;
+  overflow: visible;
+}
+.conv-rail-row-title-text {
+  min-width: 0;        /* let the clamped text shrink instead of pushing badges off */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .conv-rail-kindbs {
+  flex-shrink: 0;      /* badges keep their width; never clipped by the title text */
   display: inline-flex;
   flex-wrap: wrap;
   gap: 4px;
-  margin-top: 4px;
+  margin-left: auto;   /* right-align in the title row (Q7 mock) */
 }
 .conv-rail-kindb {
   font-family: var(--font-mono);

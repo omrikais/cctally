@@ -206,6 +206,28 @@ describe('ConversationRail', () => {
     expect(rows[1].querySelectorAll('.conv-rail-kindb').length).toBe(0);
   });
 
+  it('keeps badges OUTSIDE the clamped title-text element so long titles cannot clip them', () => {
+    // Structural guard for the clamp-clipping fix: the title TEXT carries the
+    // 2-line `-webkit-line-clamp` (.conv-rail-row-title-text); the badge group
+    // must be a SIBLING of that clamped element, never a descendant — else a
+    // long title fills both clamp lines and clips the badge row as a phantom
+    // third line. JSDOM can't evaluate the clamp itself; we assert structure.
+    searchHits = [hit({ uuid: 'tool-hit', match_kinds: ['tool', 'thinking'] })];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'npm' });
+    render(<ConversationRail />);
+    const row = document.querySelector('.conv-rail-row--hit')!;
+    const clamped = row.querySelector('.conv-rail-row-title-text')!;
+    const badges = row.querySelector('.conv-rail-kindbs')!;
+    expect(clamped).toBeTruthy();
+    expect(badges).toBeTruthy();
+    // The badge group is NOT nested inside the clamped text element…
+    expect(clamped.contains(badges)).toBe(false);
+    // …and they share the title row as siblings.
+    expect(badges.parentElement).toBe(clamped.parentElement);
+    expect((badges.parentElement as HTMLElement).classList.contains('conv-rail-row-title')).toBe(true);
+  });
+
   // ---- #177 S6: load-more button ----
 
   it('shows a Load-more button with remaining math when hits < total', () => {
