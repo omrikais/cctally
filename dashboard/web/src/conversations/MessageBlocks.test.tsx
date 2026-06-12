@@ -8,7 +8,17 @@ import type { ConversationBlock } from '../types/conversation';
 // #177 S4: MediaFigure reads the session id from TranscriptContext; the media
 // mount-point tests render under a provider so figures become addressable.
 function withSession(node: React.ReactElement, sessionId = 's1') {
-  return render(<TranscriptContext.Provider value={{ sessionId }}>{node}</TranscriptContext.Provider>);
+  return render(
+    <TranscriptContext.Provider value={{ sessionId, focusMode: 'all' }}>{node}</TranscriptContext.Provider>,
+  );
+}
+
+// #177 S5: render the block walk under a chat-focus context to exercise the
+// tool/orphan-result suppression path.
+function withChat(node: React.ReactElement) {
+  return render(
+    <TranscriptContext.Provider value={{ sessionId: null, focusMode: 'chat' }}>{node}</TranscriptContext.Provider>,
+  );
 }
 
 const call = (
@@ -215,6 +225,35 @@ describe('MessageBlocks (single-block kinds)', () => {
     expect(span.textContent).toContain('WebFetch');
     expect(span.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
     expect(span.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
+  });
+});
+
+describe('MessageBlocks — chat focus mode block suppression (#177 S5)', () => {
+  it('chat mode renders prose but no tool-run chips; all mode renders both', () => {
+    const blocks: ConversationBlock[] = [
+      { kind: 'text', text: 'doing the thing' },
+      call({ name: 'Read', preview: '/a', tool_use_id: 't1' }),
+      call({ name: 'Bash', preview: 'ls', tool_use_id: 't2' }),
+    ];
+    const { container: chatC } = withChat(<MessageBlocks blocks={blocks} />);
+    expect(chatC.textContent).toContain('doing the thing');
+    expect(chatC.querySelector('.conv-chip--tool')).toBeNull();
+    expect(chatC.querySelector('.conv-toolrun-head')).toBeNull();
+
+    const { container: allC } = render(<MessageBlocks blocks={blocks} />);
+    expect(allC.querySelectorAll('.conv-chip--tool').length).toBe(2);
+  });
+
+  it('chat mode keeps thinking chips but drops orphan tool_result + tool_use chips', () => {
+    const blocks: ConversationBlock[] = [
+      { kind: 'thinking', text: 'hmm' },
+      { kind: 'tool_result', text: 'r', truncated: false, is_error: false },
+      { kind: 'tool_use', name: 'Bash', input_summary: 'ls' },
+    ];
+    const { container } = withChat(<MessageBlocks blocks={blocks} />);
+    expect(container.querySelector('.conv-chip--thinking')).not.toBeNull();
+    expect(container.querySelector('.conv-chip--result')).toBeNull();
+    expect(container.querySelector('.conv-chip--tool')).toBeNull();
   });
 });
 

@@ -3,14 +3,16 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { useConversation } from '../hooks/useConversation';
 import { useKeymap } from '../hooks/useKeymap';
 import { useReducedMotion } from '../hooks/useReducedMotion';
-import { groupSidechains } from './groupSidechains';
+import { groupSidechains, type RenderNode } from './groupSidechains';
 import { isSystemMarker } from './systemMarkers';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
 import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon } from './ConvIcons';
 import { TranscriptContext } from './TranscriptContext';
+import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFocusMode';
+import { nextTarget } from './outlineNavigation';
 import { fmt } from '../lib/fmt';
-import type { ConversationItem, ConversationOutline } from '../types/conversation';
+import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
 
 // First non-blank line of the first MAIN-session, non-marker human message;
 // fallback project_label → session_id. Mirrors the kernel _session_titles_map
@@ -36,10 +38,15 @@ function deriveReaderTitle(detail: { items: ConversationItem[]; project_label: s
 // toggle button can reflect open/closed state; Tasks 4/5 consume it further
 // (jump-to-next targets, token footer). The scroll-sync IntersectionObserver
 // below is independent of it (it observes the reader's own rendered turns).
-export function ConversationReader({ sessionId, mobileBack, outline: _outline }: { sessionId: string; mobileBack?: boolean; outline?: ConversationOutline | null }) {
+export function ConversationReader({ sessionId, mobileBack, outline }: { sessionId: string; mobileBack?: boolean; outline?: ConversationOutline | null }) {
   const { detail, loading, error, hasMore, loadMore, loadUntil } = useConversation(sessionId);
   const jump = useSyncExternalStore(subscribeStore, () => getState().conversationJump);
   const outlineOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineOpen);
+  // #177 S5 — the active focus mode (all/chat/prompts/errors) + scroll-sync
+  // cursor uuid. focusMode drives the `visible` pipeline below; the cursor uuid
+  // seeds jump-to-next.
+  const focusMode = useSyncExternalStore(subscribeStore, () => getState().convFocusMode);
+  const currentTurnUuid = useSyncExternalStore(subscribeStore, () => getState().convCurrentTurnUuid);
   const reduced = useReducedMotion();
   const sentinelRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -72,6 +79,12 @@ export function ConversationReader({ sessionId, mobileBack, outline: _outline }:
   const [focusedIndex, setFocusedIndex] = useState(0);
   const focusedIndexRef = useRef(0);
   focusedIndexRef.current = focusedIndex;
+  // #177 S5 — the focus-mode remap keys off the PREVIOUS render's filtered list:
+  // when the mode changes, we resolve the formerly-focused node's uuid and find
+  // it (or the nearest following node) in the new list. `prevVisibleRef` is
+  // updated in a post-render effect AFTER the remap reads it, so the remap sees
+  // the list the user was actually looking at.
+  const prevVisibleRef = useRef<ReturnType<typeof applyFocusMode>>([]);
   const threadRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   // Stable mirrors so the `useMemo(() => [...], [])` keymap array never churns.
@@ -81,6 +94,16 @@ export function ConversationReader({ sessionId, mobileBack, outline: _outline }:
   loadMoreRef.current = loadMore;
   const reducedRef = useRef(reduced);
   reducedRef.current = reduced;
+  // #177 S5 §4 — live mirrors for the stable jump-to-next key closures (the
+  // keymap array is built once; its actions read refs, never re-registering).
+  const outlineRef = useRef<ConversationOutline | null | undefined>(outline);
+  outlineRef.current = outline;
+  const currentTurnUuidRef = useRef<string | null>(currentTurnUuid);
+  currentTurnUuidRef.current = currentTurnUuid;
+  const focusModeRef = useRef<FocusMode>(focusMode);
+  focusModeRef.current = focusMode;
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
 
   // #175 F4 — live-tail scroll behavior. `atBottomRef` tracks whether the user
   // is parked at the bottom (updated on every scroll). `prevLenRef`/`prevHasMoreRef`
@@ -174,13 +197,24 @@ export function ConversationReader({ sessionId, mobileBack, outline: _outline }:
   }, []);
 
   const groups = useMemo(() => groupSidechains(detail?.items ?? []), [detail?.items]);
+  // #177 S5 §5 — focus-mode-filtered render list. `all` short-circuits to the
+  // SAME `groups` array identity (byte-identical render path); other modes drop
+  // suppressed nodes and coalesce them into `hidden_run` markers. EVERYTHING the
+  // reader renders + every effect that iterates the rendered thread children
+  // keys on `visible`, not `groups`.
+  const visible = useMemo(() => applyFocusMode(groups, focusMode), [groups, focusMode]);
+  // Live mirror of the unfiltered render-tree for the jump-to-next mode-hide
+  // check (find the target node in `groups`, test nodeVisible under the mode).
+  const groupsRef = useRef<RenderNode[]>(groups);
+  groupsRef.current = groups;
   const title = useMemo(
     () => (detail ? deriveReaderTitle(detail) : ''),
     [detail],
   );
   // Stable provider value so context consumers (the cards) don't re-render on
-  // every reader render from a fresh object identity.
-  const transcriptCtx = useMemo(() => ({ sessionId }), [sessionId]);
+  // every reader render from a fresh object identity. focusMode rides along so
+  // the block walker can suppress chips under chat mode (#177 S5).
+  const transcriptCtx = useMemo(() => ({ sessionId, focusMode }), [sessionId, focusMode]);
 
   // Lazy-load when the bottom sentinel scrolls into view.
   useEffect(() => {
@@ -231,9 +265,9 @@ export function ConversationReader({ sessionId, mobileBack, outline: _outline }:
       obs.observe(el);
     }
     return () => obs.disconnect();
-    // groups changes on every paged append / session switch — re-register so
-    // the observer tracks the freshly-rendered turns.
-  }, [groups]);
+    // `visible` changes on every paged append / session switch / focus-mode
+    // change — re-register so the observer tracks the freshly-rendered turns.
+  }, [visible]);
 
   // Jump-to-message: page until the target is loaded, then scroll+highlight.
   // Wait for the first page (`detail`) before attempting — otherwise the effect
@@ -410,17 +444,69 @@ export function ConversationReader({ sessionId, mobileBack, outline: _outline }:
   useEffect(() => { setFocusedIndex(0); }, [sessionId]);
 
   // Imperatively move the `conv-item--focused` class onto the cursor's child,
-  // off every other. Re-runs on a cursor step AND when the group list changes
-  // (paged appends grow `children`), so the ring tracks the right element.
-  // Imperative (not a render prop) so memoized MessageItems don't re-render.
+  // off every other. Re-runs on a cursor step AND when the rendered list changes
+  // (paged appends / focus-mode switch grow or shrink `children`), so the ring
+  // tracks the right element. Imperative (not a render prop) so memoized
+  // MessageItems don't re-render. hidden_run markers carry `data-conv-marker`;
+  // the focused class is never placed on one (stepFocus skips landing on them,
+  // and the remap effect resolves the cursor to a real turn after a switch).
   useEffect(() => {
     const thread = threadRef.current;
     if (!thread) return;
     const kids = thread.children;
     for (let i = 0; i < kids.length; i++) {
-      kids[i].classList.toggle('conv-item--focused', i === focusedIndex);
+      const isMarker = (kids[i] as HTMLElement).dataset.convMarker != null;
+      kids[i].classList.toggle('conv-item--focused', i === focusedIndex && !isMarker);
     }
-  }, [focusedIndex, groups]);
+  }, [focusedIndex, visible]);
+
+  // #177 S5 §5 (Codex F5) — focus-coherence remap. When the mode changes the
+  // rendered list reshuffles (turns vanish, hidden_run markers appear), so the
+  // raw index no longer points at the same turn. Resolve the formerly-focused
+  // node's uuid in the OLD list, then find that uuid in the NEW `visible`; if it
+  // was suppressed, land on the nearest FOLLOWING node by original order;
+  // failing that, clamp to the last index. Skips markers. Keyed on focusMode
+  // only — runs once per switch, reading prevVisibleRef (the pre-switch list).
+  useEffect(() => {
+    const prev = prevVisibleRef.current;
+    const cur = focusedIndexRef.current;
+    const prevNode = prev[cur];
+    if (!prevNode) return;
+    const wantUuid = nodeUuid(prevNode);
+    // 1. Same uuid present in the new list?
+    let target = visible.findIndex((n) => nodeUuid(n) === wantUuid);
+    // 2. Else the nearest FOLLOWING node by original order: walk the old list
+    //    forward from the focused position, taking the first node whose uuid
+    //    survives into the new list.
+    if (target < 0) {
+      for (let i = cur + 1; i < prev.length; i++) {
+        const u = nodeUuid(prev[i]);
+        const hit = visible.findIndex((n) => nodeUuid(n) === u);
+        if (hit >= 0) { target = hit; break; }
+      }
+    }
+    // 3. Else clamp to the last index.
+    if (target < 0) target = visible.length - 1;
+    // Never land on a marker — nudge forward then backward to the first real
+    // turn (a run can sit between two keepers, so search both ways).
+    const isMarker = (i: number) => visible[i]?.kind === 'hidden_run';
+    if (target >= 0 && isMarker(target)) {
+      let t = target;
+      while (t < visible.length && isMarker(t)) t++;
+      if (t >= visible.length) { t = target; while (t >= 0 && isMarker(t)) t--; }
+      target = t;
+    }
+    if (target < 0) target = 0;
+    setFocusedIndex(target);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusMode]);
+
+  // Post-render snapshot of the filtered list for the next remap. Declared AFTER
+  // the remap effect so a focus-mode switch lets the remap read the PRE-switch
+  // list before this overwrites it (React runs effects in declaration order).
+  useEffect(() => {
+    prevVisibleRef.current = visible;
+  }, [visible]);
 
   // G3 bindings. A `useMemo(() => [...], [])`-stable array (identity never
   // churns) whose action closures read refs — so a cursor step or a pagination
@@ -434,7 +520,18 @@ export function ConversationReader({ sessionId, mobileBack, outline: _outline }:
     const last = thread.children.length - 1;
     if (last < 0) return;
     const cur = focusedIndexRef.current;
-    const next = Math.max(0, Math.min(last, cur + delta));
+    const dir = delta >= 0 ? 1 : -1;
+    // Step at least one child, then keep walking PAST any `data-conv-marker`
+    // child (the hidden_run buttons) so the cursor never lands on a marker — a
+    // marker can never take keyboard focus (Codex F5). Stops at the edge.
+    let next = cur + delta;
+    while (next >= 0 && next <= last && (thread.children[next] as HTMLElement).dataset.convMarker != null) {
+      next += dir;
+    }
+    next = Math.max(0, Math.min(last, next));
+    // If clamping landed back on a marker (the run sits at an edge), there is no
+    // real turn that way — stay put.
+    if ((thread.children[next] as HTMLElement | undefined)?.dataset.convMarker != null) return;
     // At the last loaded group with more to come, kick a load; the cursor
     // advances on the next press once the new child has mounted.
     if (delta > 0 && cur === last && hasMoreRef.current) { void loadMoreRef.current(); return; }
@@ -462,6 +559,105 @@ export function ConversationReader({ sessionId, mobileBack, outline: _outline }:
     setFocusedIndex(0);
   }, []);
 
+  // #177 S5 §4 — jump-to-next. Targets derive from the reader's full-session
+  // `outline.turns` (Codex F4), NOT the paged-in detail. A jump-kind names which
+  // target list to walk; `jumpNext` resolves the cursor (the scroll-sync turn,
+  // else the focused child's data-uuid, else -1 = "before the start"), finds the
+  // next/previous target via the pure `nextTarget`, and — on a hit — resets the
+  // focus mode to `all` IF that mode would hide the target, then dispatches the
+  // deep-link jump. A miss pulses the matching cluster button (reduced-motion:
+  // no pulse). Stable closure: reads refs, so the keymap array never churns.
+  type JumpKind = 'error' | 'prompt' | 'subagent' | 'plan';
+  const PLAN_QUESTION = useMemo(() => new Set(['ExitPlanMode', 'AskUserQuestion']), []);
+  // Build the four target index lists over the outline skeleton. Memoized on
+  // `outline` so a paged tick doesn't rebuild them; jumpNext reads via a ref.
+  const targetLists = useMemo(() => {
+    const turns = outline?.turns ?? [];
+    const error: number[] = [];
+    const prompt: number[] = [];
+    const subagent: number[] = [];
+    const plan: number[] = [];
+    const seenSub = new Set<string>();
+    turns.forEach((t: OutlineTurn, i: number) => {
+      if (t.tools?.some((x) => x.is_error)) error.push(i);
+      if (t.kind === 'human') prompt.push(i);
+      if (t.subagent_key != null && !seenSub.has(t.subagent_key)) {
+        seenSub.add(t.subagent_key);
+        subagent.push(i); // FIRST turn index per distinct subagent_key
+      }
+      if (t.tools?.some((x) => x.name != null && PLAN_QUESTION.has(x.name))) plan.push(i);
+    });
+    return { error, prompt, subagent, plan };
+  }, [outline, PLAN_QUESTION]);
+  const targetListsRef = useRef(targetLists);
+  targetListsRef.current = targetLists;
+  // uuid → skeleton turn index, for cursor resolution. Memoized on outline.
+  const turnIndexByUuid = useMemo(() => {
+    const m = new Map<string, number>();
+    (outline?.turns ?? []).forEach((t: OutlineTurn, i: number) => m.set(t.uuid, i));
+    return m;
+  }, [outline]);
+  const turnIndexByUuidRef = useRef(turnIndexByUuid);
+  turnIndexByUuidRef.current = turnIndexByUuid;
+
+  // Transient 300ms pulse on the OutlinePanel cluster button for a kind. Skipped
+  // entirely under reduced motion (spec §5 / §7). Found via data-jump-kind in
+  // the DOM (the cluster lives in a sibling component).
+  const pulseClusterButton = useCallback((kind: JumpKind) => {
+    if (reducedRef.current) return;
+    const btn = document.querySelector<HTMLElement>(`[data-jump-kind="${kind}"]`);
+    if (!btn) return;
+    btn.classList.add('conv-pulse-disabled');
+    window.setTimeout(() => btn.classList.remove('conv-pulse-disabled'), 300);
+  }, []);
+
+  const jumpNext = useCallback((kind: JumpKind, dir: 1 | -1) => {
+    const turns = outlineRef.current?.turns ?? [];
+    if (turns.length === 0) return;
+    const list = targetListsRef.current[kind];
+    // Resolve the cursor in skeleton-index space. Prefer the scroll-sync turn;
+    // else the focused child's data-uuid; else -1 ("before the start") so a
+    // forward jump finds the first target.
+    const byUuid = turnIndexByUuidRef.current;
+    let cursor = -1;
+    const cu = currentTurnUuidRef.current;
+    if (cu != null && byUuid.has(cu)) {
+      cursor = byUuid.get(cu)!;
+    } else {
+      const focusedEl = threadRef.current?.children[focusedIndexRef.current] as HTMLElement | undefined;
+      const du = focusedEl?.getAttribute('data-uuid');
+      if (du != null && byUuid.has(du)) cursor = byUuid.get(du)!;
+    }
+    const targetIdx = nextTarget(list, cursor, dir);
+    if (targetIdx == null) { pulseClusterButton(kind); return; }
+    const turn = turns[targetIdx];
+    // Reset to `all` IF the current mode would hide the target. Precise check
+    // (spec §5): find the target's RenderNode in `groups`, test nodeVisible. A
+    // node missing from `groups` (not yet paged in) is treated as hidden → reset.
+    const mode = focusModeRef.current;
+    if (mode !== 'all') {
+      const node = groupsRef.current.find((n) => nodeUuid(n) === turn.uuid
+        || (n.kind === 'item' && n.item.member_uuids.includes(turn.uuid)));
+      const targetHidden = node == null || !nodeVisible(node, mode);
+      if (targetHidden) dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
+    }
+    dispatch({
+      type: 'OPEN_CONVERSATION',
+      sessionId: sessionIdRef.current,
+      jump: { session_id: sessionIdRef.current, uuid: turn.uuid },
+    });
+  }, [pulseClusterButton]);
+  const jumpNextRef = useRef(jumpNext);
+  jumpNextRef.current = jumpNext;
+
+  // `v` cycles the focus mode all → chat → prompts → errors → all.
+  const cycleFocusMode = useCallback(() => {
+    const order: FocusMode[] = ['all', 'chat', 'prompts', 'errors'];
+    const cur = focusModeRef.current;
+    const next = order[(order.indexOf(cur) + 1) % order.length];
+    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: next });
+  }, []);
+
   const keymapBindings = useMemo(
     () => {
       const guard = () => !getState().openModal && getState().inputMode === null;
@@ -474,6 +670,18 @@ export function ConversationReader({ sessionId, mobileBack, outline: _outline }:
         mk(']', () => sweepDetails(true)),
         mk('g', () => jumpToTop()),
         mk('o', () => dispatch({ type: 'TOGGLE_CONV_OUTLINE' })),
+        // Jump-to-next family. Uppercase (shift) = previous. KeyboardEvent.key
+        // delivers the uppercase char under shift, so each register as its own
+        // binding (Codex F4).
+        mk('e', () => jumpNextRef.current('error', 1)),
+        mk('E', () => jumpNextRef.current('error', -1)),
+        mk('u', () => jumpNextRef.current('prompt', 1)),
+        mk('U', () => jumpNextRef.current('prompt', -1)),
+        mk('b', () => jumpNextRef.current('subagent', 1)),
+        mk('B', () => jumpNextRef.current('subagent', -1)),
+        mk('p', () => jumpNextRef.current('plan', 1)),
+        mk('P', () => jumpNextRef.current('plan', -1)),
+        mk('v', () => cycleFocusMode()),
       ];
     },
     // Actions are stable (refs-only), so the array is built once. The lint
@@ -509,26 +717,79 @@ export function ConversationReader({ sessionId, mobileBack, outline: _outline }:
         {mobileBack && (
           <button type="button" className="conv-back" onClick={() => dispatch({ type: 'SELECT_CONVERSATION', sessionId: null })}>← Back</button>
         )}
-        {/* #177 S5 — outline toggle. Visible on desktop + mobile; aria-pressed
-            reflects the persisted open flag. On mobile it opens the slide-over
-            sheet (same store flag drives both layouts). */}
-        <button
-          type="button"
-          className="conv-outline-toggle"
-          aria-pressed={outlineOpen}
-          aria-label="Toggle session outline"
-          title="Toggle session outline (o)"
-          onClick={() => dispatch({ type: 'TOGGLE_CONV_OUTLINE' })}
-        >☰ Outline</button>
-        <div className="conv-reader-title">{title || detail.session_id}</div>
-        <div className="conv-reader-meta">
-          {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {detail.models.join(', ')}
+        {/* #177 S5 — flex row: title/meta block grows, controls right-align. The
+            Task-3 `float: right` on the outline toggle is dropped (a reviewer
+            flagged it as fragile); both controls reflow into the flex row. */}
+        <div className="conv-reader-headmain">
+          <div className="conv-reader-title">{title || detail.session_id}</div>
+          <div className="conv-reader-meta">
+            {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {detail.models.join(', ')}
+          </div>
+        </div>
+        <div className="conv-reader-controls">
+          {/* #177 S5 §5 — focus-mode segmented control. A labeled radiogroup;
+              each button's aria-pressed reflects the active mode. Errors carries
+              a count badge from the outline stats when > 0. */}
+          <div className="conv-focus-seg" role="radiogroup" aria-label="Focus mode">
+            {(['all', 'chat', 'prompts', 'errors'] as const).map((m) => {
+              const labels: Record<FocusMode, string> = { all: 'All', chat: 'Chat', prompts: 'Prompts', errors: 'Errors' };
+              const errCount = outline?.stats.error_count ?? 0;
+              return (
+                <button
+                  key={m}
+                  type="button"
+                  className={['conv-focus-seg-btn', focusMode === m ? 'conv-focus-seg-btn--on' : ''].filter(Boolean).join(' ')}
+                  role="radio"
+                  aria-checked={focusMode === m}
+                  aria-pressed={focusMode === m}
+                  onClick={() => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: m })}
+                >
+                  {labels[m]}
+                  {m === 'errors' && errCount > 0 && (
+                    <span className="conv-focus-seg-badge">{errCount}</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          {/* outline toggle. Visible on desktop + mobile; aria-pressed reflects
+              the persisted open flag. On mobile it opens the slide-over sheet. */}
+          <button
+            type="button"
+            className="conv-outline-toggle"
+            aria-pressed={outlineOpen}
+            aria-label="Toggle session outline"
+            title="Toggle session outline (o)"
+            onClick={() => dispatch({ type: 'TOGGLE_CONV_OUTLINE' })}
+          >☰ Outline</button>
         </div>
       </div>
       <div className="conv-reader-body" ref={bodyRef} onScroll={onBodyScroll}>
         <TranscriptContext.Provider value={transcriptCtx}>
         <div className="conv-reader-thread" ref={threadRef}>
-          {groups.map((g, idx) => {
+          {visible.map((g, idx) => {
+            // #177 S5 §5 — a coalesced run of focus-hidden nodes. Renders as a
+            // marker button (data-conv-marker: never keyboard-focusable, never
+            // gets conv-item--focused). Clicking it drops back to `all` and jumps
+            // to the first hidden node so the user can resume reading there.
+            if (g.kind === 'hidden_run') {
+              return (
+                <button
+                  key={`hr-${g.firstUuid}`}
+                  type="button"
+                  className="conv-hidden-run"
+                  data-conv-marker=""
+                  onClick={() => {
+                    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
+                    dispatch({
+                      type: 'OPEN_CONVERSATION',
+                      sessionId,
+                      jump: { session_id: sessionId, uuid: g.firstUuid },
+                    });
+                  }}
+                >· {g.count} hidden ·</button>
+              );
+            }
             if (g.kind === 'subagent') {
               // The thread's member_uuids (every fragment) decide jump-target
               // suppression so a folded/sidechain jump target is covered.

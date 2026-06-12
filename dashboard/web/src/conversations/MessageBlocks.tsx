@@ -14,6 +14,7 @@ import { specialToolRenderer } from './specialTools';
 import { TaskChecklistCard } from './TaskChecklistCard';
 import { parseMcpName } from './parseMcpName';
 import { MediaFigure } from './MediaFigure';
+import { useFocusMode } from './TranscriptContext';
 import type { ConversationBlock } from '../types/conversation';
 
 // #177 S4 (Q5-A): MCP chips show `action [server-pill]`; the full original
@@ -60,6 +61,10 @@ function isTaskChecklistRun(calls: ToolCall[]): boolean {
 // This single source of truth is used by both the assistant turn (which renders
 // its prose-from-text-blocks here, in order) and the human turn.
 export function MessageBlocks({ blocks, anchorUuid }: { blocks: ConversationBlock[]; anchorUuid?: string | null }) {
+  // #177 S5 — chat focus mode strips tool/orphan-result texture so a turn reads
+  // as prose-only conversation. text + thinking render unchanged; tool_call /
+  // tool_use runs and orphan tool_result chips are dropped from the walk.
+  const chat = useFocusMode() === 'chat';
   const out: ReactNode[] = [];
   let i = 0;
   let textRun: string[] = [];
@@ -85,7 +90,13 @@ export function MessageBlocks({ blocks, anchorUuid }: { blocks: ConversationBloc
         run.push(blocks[i] as Extract<ConversationBlock, { kind: 'tool_call' }>);
         i++;
       }
-      out.push(<ToolRun key={`r${out.length}`} calls={run} />);
+      if (!chat) out.push(<ToolRun key={`r${out.length}`} calls={run} />);
+      continue;
+    }
+    // chat mode suppresses the tool_use degradation chip + orphan tool_result
+    // chips (the rest — thinking / media / references — survive).
+    if (chat && (b.kind === 'tool_use' || b.kind === 'tool_result')) {
+      i++;
       continue;
     }
     out.push(<BlockChip key={`c${out.length}`} block={b} anchorUuid={anchorUuid} />);

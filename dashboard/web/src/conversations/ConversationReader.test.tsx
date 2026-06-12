@@ -9,7 +9,7 @@ import {
   _resetForTests as _resetKeymapForTests,
 } from '../store/keymap';
 import { installIntersectionObserverStub } from '../test-utils/intersectionObserver';
-import type { ConversationItem } from '../types/conversation';
+import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
 
 function makeItem(over: Partial<ConversationItem> & { uuid: string; kind?: ConversationItem['kind']; is_sidechain?: boolean }): ConversationItem {
   const { uuid, kind = 'human', is_sidechain = false, ...rest } = over;
@@ -807,5 +807,200 @@ describe('ConversationReader keyboard navigation (G3)', () => {
     fireEvent.click(btn);
     expect(getState().convOutlineOpen).toBe(!before);
     await waitFor(() => expect(btn.getAttribute('aria-pressed')).toBe(String(!before)));
+  });
+});
+
+// ---- #177 S5 §5 — focus modes + jump-to-next ------------------------------
+function oTurn(over: Partial<OutlineTurn> & { uuid: string; kind: OutlineTurn['kind'] }): OutlineTurn {
+  return {
+    ts: null, label: over.uuid, member_uuids: [over.uuid], subagent_key: null,
+    parent_uuid: null, is_sidechain: false, ...over,
+  };
+}
+
+describe('ConversationReader focus modes (#177 S5 §5)', () => {
+  async function renderWithOutline(items: ConversationItem[], outline: ConversationOutline) {
+    mockFetchOnce(detail(items));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const utils = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-thread')).not.toBeNull());
+    const thread = utils.container.querySelector('.conv-reader-thread') as HTMLElement;
+    return { ...utils, thread };
+  }
+  const press = (key: string) => fireEvent.keyDown(document, { key });
+
+  const baseOutline = (turns: OutlineTurn[], errorCount = 0): ConversationOutline => ({
+    session_id: 's',
+    stats: {
+      turns: { total: turns.length, human: 0, assistant: 0, tool_result: 0, meta: 0 },
+      tool_counts: {}, error_count: errorCount, models: {}, duration_seconds: null,
+      tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 }, cost_usd: 0,
+    },
+    turns,
+  });
+
+  it('the segmented control renders a labeled radiogroup with four modes + an error badge', async () => {
+    const { container } = await renderWithOutline(
+      [makeItem({ uuid: 'h1' })],
+      baseOutline([oTurn({ uuid: 'h1', kind: 'human' })], 3),
+    );
+    const seg = container.querySelector('[role="radiogroup"][aria-label="Focus mode"]')!;
+    expect(seg).not.toBeNull();
+    const radios = seg.querySelectorAll('[role="radio"]');
+    expect(radios).toHaveLength(4);
+    // All is active by default.
+    expect(seg.querySelector('[aria-checked="true"]')!.textContent).toContain('All');
+    // Errors carries the count badge.
+    expect(container.querySelector('.conv-focus-seg-badge')!.textContent).toBe('3');
+  });
+
+  it('v cycles the focus mode all → chat → prompts → errors → all', async () => {
+    await renderWithOutline([makeItem({ uuid: 'h1' })], baseOutline([oTurn({ uuid: 'h1', kind: 'human' })]));
+    expect(getState().convFocusMode).toBe('all');
+    press('v'); expect(getState().convFocusMode).toBe('chat');
+    press('v'); expect(getState().convFocusMode).toBe('prompts');
+    press('v'); expect(getState().convFocusMode).toBe('errors');
+    press('v'); expect(getState().convFocusMode).toBe('all');
+  });
+
+  it('prompts mode hides non-human turns behind a hidden-run marker', async () => {
+    const { container } = await renderWithOutline(
+      [
+        makeItem({ uuid: 'h1', kind: 'human', text: 'hi' }),
+        makeItem({ uuid: 'a1', kind: 'assistant', text: '', model: 'm', cost_usd: 0,
+          blocks: [{ kind: 'tool_call', name: 'Read', input_summary: '{}', preview: '/a',
+            tool_use_id: 't', result: { text: 'ok', truncated: false, is_error: false } }] } as never),
+        makeItem({ uuid: 'h2', kind: 'human', text: 'bye' }),
+      ],
+      baseOutline([
+        oTurn({ uuid: 'h1', kind: 'human' }),
+        oTurn({ uuid: 'a1', kind: 'assistant' }),
+        oTurn({ uuid: 'h2', kind: 'human' }),
+      ]),
+    );
+    act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' }); });
+    await waitFor(() => expect(container.querySelector('.conv-hidden-run')).not.toBeNull());
+    const marker = container.querySelector('.conv-hidden-run')!;
+    expect(marker.textContent).toContain('1 hidden');
+    // The marker carries data-conv-marker so j/k never land on it.
+    expect((marker as HTMLElement).dataset.convMarker).toBe('');
+  });
+
+  it('clicking a hidden-run marker resets to all and jumps to the first hidden turn', async () => {
+    const { container } = await renderWithOutline(
+      [
+        makeItem({ uuid: 'h1', kind: 'human', text: 'hi' }),
+        makeItem({ uuid: 'a1', kind: 'assistant', text: '', model: 'm', cost_usd: 0 } as never),
+      ],
+      baseOutline([oTurn({ uuid: 'h1', kind: 'human' }), oTurn({ uuid: 'a1', kind: 'assistant' })]),
+    );
+    act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' }); });
+    const marker = await waitFor(() => container.querySelector('.conv-hidden-run')!);
+    fireEvent.click(marker);
+    expect(getState().convFocusMode).toBe('all');
+    expect(getState().conversationJump).toEqual({ session_id: 's', uuid: 'a1' });
+  });
+
+  it('switching to a mode that hides the focused turn remaps focus to the nearest visible turn, and j/k skip the marker', async () => {
+    const { thread } = await renderWithOutline(
+      [
+        makeItem({ uuid: 'h1', kind: 'human', text: 'hi' }),
+        makeItem({ uuid: 'a1', kind: 'assistant', text: '', model: 'm', cost_usd: 0 } as never),
+        makeItem({ uuid: 'h2', kind: 'human', text: 'bye' }),
+      ],
+      baseOutline([
+        oTurn({ uuid: 'h1', kind: 'human' }),
+        oTurn({ uuid: 'a1', kind: 'assistant' }),
+        oTurn({ uuid: 'h2', kind: 'human' }),
+      ]),
+    );
+    // Focus the assistant turn (index 1).
+    press('j');
+    expect(thread.children[1]).toHaveClass('conv-item--focused');
+    // Switch to prompts: a1 is hidden (a hidden_run marker takes its slot). The
+    // remap must move focus onto a real, visible human turn — never the marker.
+    act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' }); });
+    await waitFor(() => expect(thread.querySelector('.conv-hidden-run')).not.toBeNull());
+    const focused = thread.querySelector('.conv-item--focused')!;
+    expect(focused.classList.contains('conv-hidden-run')).toBe(false);
+    expect(focused.getAttribute('data-uuid')).toMatch(/h[12]/);
+    // j/k still navigate and never settle on the marker.
+    press('j');
+    expect(thread.querySelector('.conv-item--focused')!.classList.contains('conv-hidden-run')).toBe(false);
+    press('k');
+    expect(thread.querySelector('.conv-item--focused')!.classList.contains('conv-hidden-run')).toBe(false);
+  });
+});
+
+describe('ConversationReader jump-to-next keys (#177 S5 §4)', () => {
+  async function renderWithOutline(items: ConversationItem[], outline: ConversationOutline) {
+    mockFetchOnce(detail(items));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const utils = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-thread')).not.toBeNull());
+    return utils;
+  }
+  const press = (key: string) => fireEvent.keyDown(document, { key });
+
+  const outline: ConversationOutline = {
+    session_id: 's',
+    stats: {
+      turns: { total: 4, human: 2, assistant: 2, tool_result: 0, meta: 0 },
+      tool_counts: {}, error_count: 1, models: {}, duration_seconds: null,
+      tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 }, cost_usd: 0,
+    },
+    turns: [
+      oTurn({ uuid: 'h1', kind: 'human' }),
+      oTurn({ uuid: 'a1', kind: 'assistant', tools: [{ name: 'Bash', is_error: true }] }),
+      oTurn({ uuid: 'h2', kind: 'human' }),
+      oTurn({ uuid: 'a2', kind: 'assistant', tools: [{ name: 'ExitPlanMode', is_error: false }] }),
+    ],
+  };
+  const items = [
+    makeItem({ uuid: 'h1', kind: 'human', text: 'hi' }),
+    makeItem({ uuid: 'a1', kind: 'assistant', text: 'oops', model: 'm', cost_usd: 0 } as never),
+    makeItem({ uuid: 'h2', kind: 'human', text: 'bye' }),
+    makeItem({ uuid: 'a2', kind: 'assistant', text: 'plan', model: 'm', cost_usd: 0 } as never),
+  ];
+
+  // The cursor resolves from convCurrentTurnUuid first, else the focused child's
+  // data-uuid (focus starts on the first turn h1, index 0), else -1. Tests pin
+  // the scroll-sync cursor where the jump origin matters.
+  it('e jumps to the next error turn (cursor before the start)', async () => {
+    await renderWithOutline(items, outline);
+    act(() => { dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h1' }); });
+    press('e'); // first error strictly after h1 (idx0) → a1 (idx1)
+    expect(getState().conversationJump).toEqual({ session_id: 's', uuid: 'a1' });
+  });
+
+  it('u jumps to the next prompt after the cursor', async () => {
+    await renderWithOutline(items, outline);
+    act(() => { dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h1' }); });
+    press('u'); // next human after h1 (idx0) → h2 (idx2)
+    expect(getState().conversationJump).toEqual({ session_id: 's', uuid: 'h2' });
+  });
+
+  it('U jumps to the previous prompt relative to the scroll-sync cursor', async () => {
+    await renderWithOutline(items, outline);
+    act(() => { dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h2' }); });
+    press('U'); // previous prompt before h2 (idx2) → h1 (idx0)
+    expect(getState().conversationJump).toEqual({ session_id: 's', uuid: 'h1' });
+  });
+
+  it('p jumps to the next plan/question turn', async () => {
+    await renderWithOutline(items, outline);
+    act(() => { dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h1' }); });
+    press('p');
+    expect(getState().conversationJump).toEqual({ session_id: 's', uuid: 'a2' });
+  });
+
+  it('a no-op jump (no target ahead) leaves the jump untouched', async () => {
+    await renderWithOutline(items, outline);
+    // Park the cursor past the only error (a1) so `e` forward finds nothing.
+    act(() => { dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'a2' }); });
+    press('e');
+    expect(getState().conversationJump).toBeNull();
   });
 });

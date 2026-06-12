@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { deriveOutline, type OutlineEntry } from './deriveOutline';
+import { nextTarget } from './outlineNavigation';
 import { fmt } from '../lib/fmt';
 import {
   ChatIcon,
@@ -13,7 +14,100 @@ import {
   ToolGenericIcon,
   WarningIcon,
 } from './ConvIcons';
-import type { ConversationOutline, OutlineStats } from '../types/conversation';
+import type { ConversationOutline, OutlineStats, OutlineTurn } from '../types/conversation';
+
+// #177 S5 §4 — the jump-to-next glyph cluster. Four buttons (error / prompt /
+// subagent / plan-or-question), each shown only when its target count > 0,
+// rendered as `glyph + count`. Click = next, shift-click = previous. The cursor
+// resolves from `convCurrentTurnUuid` (the scroll-sync turn) → -1 ("before the
+// start") when absent. A miss pulses the button (reduced-motion: no pulse). The
+// reader's e/u/b/p keys share the same `nextTarget` math (outlineNavigation.ts);
+// this cluster carries `data-jump-kind` so the reader's key no-op can pulse the
+// matching button via the DOM.
+type JumpKind = 'error' | 'prompt' | 'subagent' | 'plan';
+const PLAN_QUESTION_TOOLS = new Set(['ExitPlanMode', 'AskUserQuestion']);
+
+function buildTargetLists(turns: OutlineTurn[]): Record<JumpKind, number[]> {
+  const error: number[] = [];
+  const prompt: number[] = [];
+  const subagent: number[] = [];
+  const plan: number[] = [];
+  const seenSub = new Set<string>();
+  turns.forEach((t, i) => {
+    if (t.tools?.some((x) => x.is_error)) error.push(i);
+    if (t.kind === 'human') prompt.push(i);
+    if (t.subagent_key != null && !seenSub.has(t.subagent_key)) {
+      seenSub.add(t.subagent_key);
+      subagent.push(i);
+    }
+    if (t.tools?.some((x) => x.name != null && PLAN_QUESTION_TOOLS.has(x.name))) plan.push(i);
+  });
+  return { error, prompt, subagent, plan };
+}
+
+function JumpCluster({
+  sessionId,
+  outline,
+  currentUuid,
+  reduced,
+}: {
+  sessionId: string;
+  outline: ConversationOutline;
+  currentUuid: string | null;
+  reduced: boolean;
+}) {
+  const turns = outline.turns;
+  const lists = useMemo(() => buildTargetLists(turns), [turns]);
+  const indexByUuid = useMemo(() => {
+    const m = new Map<string, number>();
+    turns.forEach((t, i) => m.set(t.uuid, i));
+    return m;
+  }, [turns]);
+
+  const jump = useCallback((kind: JumpKind, dir: 1 | -1, btn: HTMLElement) => {
+    const cursor = currentUuid != null && indexByUuid.has(currentUuid) ? indexByUuid.get(currentUuid)! : -1;
+    const targetIdx = nextTarget(lists[kind], cursor, dir);
+    if (targetIdx == null) {
+      if (!reduced) {
+        btn.classList.add('conv-pulse-disabled');
+        window.setTimeout(() => btn.classList.remove('conv-pulse-disabled'), 300);
+      }
+      return;
+    }
+    const turn = turns[targetIdx];
+    // The reader applies the precise mode-reset-on-hidden check; a deep-link jump
+    // through OPEN_CONVERSATION already resets the focus mode to `all` in the
+    // store reducer, so a cluster jump never lands behind a focus filter.
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId, jump: { session_id: sessionId, uuid: turn.uuid } });
+  }, [lists, indexByUuid, currentUuid, turns, sessionId, reduced]);
+
+  const defs: { kind: JumpKind; glyph: string; label: string; key: string }[] = [
+    { kind: 'error', glyph: '✕', label: 'error', key: 'e' },
+    { kind: 'prompt', glyph: '⊕', label: 'prompt', key: 'u' },
+    { kind: 'subagent', glyph: '▸', label: 'subagent', key: 'b' },
+    { kind: 'plan', glyph: '⊞', label: 'plan / question', key: 'p' },
+  ];
+  const shown = defs.filter((d) => lists[d.kind].length > 0);
+  if (shown.length === 0) return null;
+  return (
+    <div className="conv-jump-cluster" role="group" aria-label="Jump to next landmark">
+      {shown.map((d) => (
+        <button
+          key={d.kind}
+          type="button"
+          className="conv-jump-cluster-btn"
+          data-jump-kind={d.kind}
+          title={`Next ${d.label} (${d.key}) · shift-click for previous`}
+          aria-label={`Next ${d.label}, ${lists[d.kind].length} total`}
+          onClick={(ev) => jump(d.kind, ev.shiftKey ? -1 : 1, ev.currentTarget)}
+        >
+          <span className="conv-jump-cluster-glyph" aria-hidden="true">{d.glyph}</span>
+          <span className="conv-jump-cluster-count">{lists[d.kind].length}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
 
 // #177 S5 §3 — the outline sidebar + stats overview. Renders as a third grid
 // column in `.conv-view` (a sibling of `.conv-rail`/`.conv-reader`, NOT nested
@@ -164,6 +258,12 @@ export function OutlinePanel({
         <div className="conv-outline-placeholder">Loading outline…</div>
       ) : (
         <>
+          <JumpCluster
+            sessionId={sessionId}
+            outline={outline}
+            currentUuid={currentUuid}
+            reduced={reduced}
+          />
           <OutlineStatsCard
             stats={outline.stats}
             onJumpFirstError={firstErrorUuid != null ? () => jumpTo(firstErrorUuid) : null}

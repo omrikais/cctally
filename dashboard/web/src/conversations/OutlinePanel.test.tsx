@@ -169,6 +169,53 @@ describe('OutlinePanel (#177 S5 §3)', () => {
     expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'a1' });
   });
 
+  it('renders the jump-to-next glyph cluster only for kinds with count > 0', () => {
+    const o = outline({
+      stats: stats({ error_count: 1 }),
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'oops', tools: [{ name: 'Bash', is_error: true }] }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const cluster = container.querySelector('.conv-jump-cluster')!;
+    expect(cluster).toBeTruthy();
+    // error (a1) + prompt (h1) present; no subagent / plan buttons.
+    expect(cluster.querySelector('[data-jump-kind="error"]')).toBeTruthy();
+    expect(cluster.querySelector('[data-jump-kind="prompt"]')).toBeTruthy();
+    expect(cluster.querySelector('[data-jump-kind="subagent"]')).toBeNull();
+    expect(cluster.querySelector('[data-jump-kind="plan"]')).toBeNull();
+    // count shown on the error button.
+    expect(cluster.querySelector('[data-jump-kind="error"] .conv-jump-cluster-count')!.textContent).toBe('1');
+  });
+
+  it('clicking a cluster button jumps to the next target; shift-click goes previous', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'one' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'work' }),
+        turn({ uuid: 'h2', kind: 'human', label: 'two' }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const promptBtn = container.querySelector<HTMLButtonElement>('[data-jump-kind="prompt"]')!;
+    // Cursor before the start → next prompt is h1.
+    fireEvent.click(promptBtn);
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h1' });
+    // Park cursor on h2; shift-click → previous prompt h1.
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h2' });
+    fireEvent.click(promptBtn, { shiftKey: true });
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h1' });
+  });
+
+  it('the cluster is absent when no jump targets exist', () => {
+    const o = outline({
+      turns: [turn({ uuid: 'a1', kind: 'assistant', label: 'plain' })],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    expect(container.querySelector('.conv-jump-cluster')).toBeNull();
+  });
+
   it('a · N tools annotation renders only when toolCount > 0', () => {
     const o = outline({
       turns: [

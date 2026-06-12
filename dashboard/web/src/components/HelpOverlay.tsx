@@ -54,6 +54,12 @@ function ConversationsKeyTable() {
         <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>move turns</td></tr>
         <tr><td><kbd>[</kbd> / <kbd>]</kbd></td><td>collapse / expand all</td></tr>
         <tr><td><kbd>g</kbd></td><td>jump to top</td></tr>
+        <tr><td><kbd>e</kbd> / <kbd>E</kbd></td><td>next / prev error</td></tr>
+        <tr><td><kbd>u</kbd> / <kbd>U</kbd></td><td>next / prev prompt</td></tr>
+        <tr><td><kbd>b</kbd> / <kbd>B</kbd></td><td>next / prev subagent</td></tr>
+        <tr><td><kbd>p</kbd> / <kbd>P</kbd></td><td>next / prev plan / question</td></tr>
+        <tr><td><kbd>o</kbd></td><td>toggle outline</td></tr>
+        <tr><td><kbd>v</kbd></td><td>cycle focus mode</td></tr>
         <tr><td><kbd>/</kbd></td><td>search conversations</td></tr>
         <tr><td><kbd>Esc</kbd></td><td>close</td></tr>
       </tbody>

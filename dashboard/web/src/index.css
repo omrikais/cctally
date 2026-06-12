@@ -4768,9 +4768,9 @@ mark.current {
   color: var(--text);
 }
 
-/* Reader-head outline toggle button. */
+/* Reader-head outline toggle button. Lives in the flex .conv-reader-controls
+   row now (#177 S5) — the Task-3 `float: right` is dropped. */
 .conv-outline-toggle {
-  float: right;
   appearance: none;
   border: 1px solid var(--border-soft);
   background: var(--panel-bg);
@@ -4780,12 +4780,112 @@ mark.current {
   padding: 4px 9px;
   border-radius: 5px;
   cursor: pointer;
-  margin-left: 8px;
 }
 .conv-outline-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
 .conv-outline-toggle[aria-pressed="true"] {
   color: var(--accent-blue);
   border-color: var(--accent-blue);
+}
+
+/* ---- Focus-mode segmented control (#177 S5 §5) -------------------- */
+.conv-focus-seg {
+  display: inline-flex;
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.conv-focus-seg-btn {
+  appearance: none;
+  border: none;
+  border-left: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 9px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.conv-focus-seg-btn:first-child { border-left: none; }
+.conv-focus-seg-btn:hover { color: var(--text); }
+.conv-focus-seg-btn--on {
+  background: var(--panel-bg-2);
+  color: var(--accent-blue);
+  font-weight: 700;
+}
+.conv-focus-seg-btn:focus-visible { outline: none; color: var(--text); box-shadow: inset 0 0 0 1px var(--accent-blue); }
+.conv-focus-seg-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--accent-red);
+  color: #fff;
+  font-size: 9.5px;
+  font-weight: 700;
+}
+
+/* ---- Hidden-run marker (#177 S5 §5) ------------------------------- */
+/* A "· N hidden ·" button between visible turns. data-conv-marker so the
+   keyboard cursor never lands on it. */
+.conv-hidden-run {
+  align-self: center;
+  appearance: none;
+  border: 1px dashed var(--border-soft);
+  background: transparent;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  padding: 2px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+.conv-hidden-run:hover { color: var(--text-dim); border-color: var(--accent-blue); }
+
+/* ---- Jump-to-next glyph cluster (#177 S5 §4) --------------------- */
+.conv-jump-cluster {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel-bg-2);
+}
+.conv-jump-cluster-btn {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.conv-jump-cluster-btn:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-jump-cluster-glyph { font-size: 12px; line-height: 1; }
+.conv-jump-cluster-count { color: var(--text-faint); }
+.conv-jump-cluster-btn[data-jump-kind="error"] .conv-jump-cluster-glyph { color: var(--accent-red); }
+.conv-jump-cluster-btn[data-jump-kind="subagent"] .conv-jump-cluster-glyph { color: var(--accent-magenta); }
+/* Transient no-op pulse (300ms; suppressed under reduced motion by the JS gate
+   AND this media query so a class accidentally left on never animates). */
+@keyframes conv-pulse-disabled {
+  0% { transform: translateX(0); }
+  25% { transform: translateX(-3px); }
+  50% { transform: translateX(3px); }
+  75% { transform: translateX(-2px); }
+  100% { transform: translateX(0); }
+}
+.conv-pulse-disabled { animation: conv-pulse-disabled 300ms ease-in-out; }
+@media (prefers-reduced-motion: reduce) {
+  .conv-pulse-disabled { animation: none; }
 }
 /* Mobile slide-over entrance; suppressed under prefers-reduced-motion. */
 @keyframes conv-outline-slide-in {
@@ -5007,7 +5107,25 @@ mark.current {
   padding: 12px 16px;
   border-bottom: 1px solid var(--border-soft);
   background: var(--panel-bg-2);
+  /* #177 S5 — flex row: title/meta block grows, controls right-align. Replaces
+     the Task-3 `float: right` on the outline toggle (a reviewer flagged the
+     float as fragile). flex-wrap keeps the controls from clipping at narrow
+     reader widths; align-items:flex-start so the back button + title top-align. */
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
 }
+.conv-reader-headmain { flex: 1 1 240px; min-width: 0; }
+.conv-reader-controls {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+/* The mobile back button is a full-width row above the title/controls. */
+.conv-reader-head .conv-back { flex: 1 0 100%; }
 /* reader header title in serif (matches the rail anchor) */
 .conv-reader-title {
   font-family: var(--font-prose);
