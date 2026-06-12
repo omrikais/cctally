@@ -42,18 +42,19 @@ describe('resultLang', () => {
 
 describe('fileLangForCall', () => {
   it('infers language from structured input.file_path', () => {
-    expect(fileLangForCall({ name: 'Edit', input: { file_path: '/a/b.py' } })).toBe('python');
-    expect(fileLangForCall({ name: 'MultiEdit', input: { file_path: '/x/y.tsx' } })).toBe('tsx');
-    expect(fileLangForCall({ name: 'Write', input: { file_path: '/c/d.css' } })).toBe('css');
+    expect(fileLangForCall({ input: { file_path: '/a/b.py' } })).toBe('python');
+    expect(fileLangForCall({ input: { file_path: '/x/y.tsx' } })).toBe('tsx');
+    expect(fileLangForCall({ input: { file_path: '/c/d.css' } })).toBe('css');
   });
   it('returns "" when there is no usable file_path', () => {
-    expect(fileLangForCall({ name: 'Edit', input: null })).toBe('');
-    expect(fileLangForCall({ name: 'Edit', input: {} })).toBe('');
+    expect(fileLangForCall({ input: null })).toBe('');
+    expect(fileLangForCall({ input: {} })).toBe('');
+    expect(fileLangForCall({})).toBe('');
     // Bash carries `command`, not `file_path` → plain.
-    expect(fileLangForCall({ name: 'Bash', input: { command: 'ls' } })).toBe('');
+    expect(fileLangForCall({ input: { command: 'ls' } })).toBe('');
     // Non-string file_path is ignored defensively.
-    expect(fileLangForCall({ name: 'Edit', input: { file_path: 123 } })).toBe('');
+    expect(fileLangForCall({ input: { file_path: 123 } })).toBe('');
     // Unknown extension degrades to plain.
-    expect(fileLangForCall({ name: 'Edit', input: { file_path: '/a/b.xyz' } })).toBe('');
+    expect(fileLangForCall({ input: { file_path: '/a/b.xyz' } })).toBe('');
   });
 });

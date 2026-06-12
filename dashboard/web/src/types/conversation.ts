@@ -88,6 +88,12 @@ export type ConversationBlock =
       result: { text: string; truncated: boolean; full_length?: number | null; is_error: boolean } | null;
       answers?: Record<string, string>;         // #177 S2 — {question: chosen label(s)}
       annotations?: Record<string, unknown>;    // #177 S2 — user notes keyed by question
+      // #177 S3 — Bash stream split, stamped at the BLOCK level (siblings of
+      // `answers`, NOT nested in `result`, which is null on unfolded calls). The
+      // query kernel's Phase-3 sweep sets `stderr` only when captured and
+      // `interrupted` only when true; both absent on non-Bash + legacy rows.
+      stderr?: string | null;                   // #177 S3 — Bash stderr
+      interrupted?: boolean;                    // #177 S3 — Bash Ctrl-C
       skill_body?: string;
       skill_name?: string | null;
       // Task* checklist: the running to-do list snapshot at this point in the
@@ -167,3 +173,32 @@ export interface ConversationJump {
   session_id: string;
   uuid: string;
 }
+
+// #178 on-demand "load full" route response, discriminated on `which` (spec
+// §4.4 / §4.6). Bound field-for-field to read_full_payload in
+// bin/_lib_conversation_query.py:
+//   which='result' → { which, tool_use_id, text, full_length, truncated,
+//                       is_error, [stderr] } — the full _stringify(content),
+//                       plus the full Bash stderr when present.
+//   which='input'  → { which, tool_use_id, input, full_length, truncated } —
+//                       the full structured input dict (so the DiffCard can pull
+//                       old_string/new_string straight into computeDiff).
+// `full_length`/`truncated` describe the serialized payload against the route's
+// 1 MB ceiling. All additive; consumers tolerate absence of optional keys.
+export type FullPayload =
+  | {
+      which: 'result';
+      tool_use_id: string;
+      text: string;
+      full_length: number;
+      truncated: boolean;
+      is_error?: boolean;
+      stderr?: string | null;
+    }
+  | {
+      which: 'input';
+      tool_use_id: string;
+      input: Record<string, unknown>;
+      full_length: number;
+      truncated: boolean;
+    };

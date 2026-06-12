@@ -8,6 +8,7 @@ import { isSystemMarker } from './systemMarkers';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
 import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon } from './ConvIcons';
+import { TranscriptContext } from './TranscriptContext';
 import { fmt } from '../lib/fmt';
 import type { ConversationItem } from '../types/conversation';
 
@@ -460,6 +461,7 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
         </div>
       </div>
       <div className="conv-reader-body" ref={bodyRef} onScroll={onBodyScroll}>
+        <TranscriptContext.Provider value={{ sessionId }}>
         <div className="conv-reader-thread" ref={threadRef}>
           {groups.map((g, idx) => {
             if (g.kind === 'subagent') {
@@ -519,6 +521,7 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
             );
           })}
         </div>
+        </TranscriptContext.Provider>
         {hasMore && <div ref={sentinelRef} className="conv-load-sentinel">Loading more…</div>}
       </div>
       {/* #175 F4 — "↓ N new" pill. A child of .conv-reader (NOT the scrolling
