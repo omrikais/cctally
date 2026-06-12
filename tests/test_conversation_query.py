@@ -1425,6 +1425,90 @@ def test_tool_call_without_ask_answers_has_no_answers_key():
 
 
 # ---------------------------------------------------------------------------
+# #177 S3: Bash stderr/interrupted Phase-1-pop / Phase-3-stamp onto tool_call.
+# Mirrors the ask_answers join: the parser stashed bash_stderr/bash_interrupted
+# on the tool_result block; Phase 1 pops them into bash_link keyed by
+# tool_use_id; Phase 3 stamps call.stderr/call.interrupted as siblings of
+# `result`. The split must survive even when the Phase-2 fold SKIPS the result
+# row (orphan / multi-owner / mixed) — exactly the class the pattern exists for.
+# ---------------------------------------------------------------------------
+def test_bash_streams_surface_on_tool_call():
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Bash", "input_summary": "{}",
+                 "input": {"command": "ls"}, "input_truncated": False,
+                 "id": "t1", "preview": "ls"}])
+    _seed_tool_result(c, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "out\nboom", "is_error": True,
+                 "tool_use_id": "t1",
+                 "bash_stderr": "boom", "bash_interrupted": True}])
+    call = [b for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"
+            for b in it["blocks"] if b.get("kind") == "tool_call"][0]
+    assert call["stderr"] == "boom"
+    assert call["interrupted"] is True
+
+
+def test_bash_streams_stamped_on_tool_call_even_when_fold_skipped():
+    # The tool_result row carries a NON-result block alongside the result block,
+    # so the Phase-2 fold SKIPS it (result stays standalone). The Phase-1-pop /
+    # Phase-3-stamp must still put stderr/interrupted on the matching tool_call —
+    # this is the whole reason for the pattern (the fold is the wrong carrier).
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Bash", "input_summary": "{}",
+                 "input": {"command": "x"}, "input_truncated": False,
+                 "id": "toolu_b", "preview": "x"}])
+    _seed_tool_result(c, sid="s1", uuid="r1",
+        blocks=[{"kind": "tool_result", "text": "out\nerr", "is_error": False,
+                 "tool_use_id": "toolu_b",
+                 "bash_stderr": "err", "bash_interrupted": True},
+                {"kind": "text", "text": "sibling block defeats the fold"}])
+    detail = cq.get_conversation(c, "s1")
+    call = [b for it in detail["items"]
+            if it["kind"] == "assistant"
+            for b in it["blocks"] if b.get("kind") == "tool_call"][0]
+    assert call["stderr"] == "err"
+    assert call["interrupted"] is True
+    # the result row did NOT fold (mixed row) — it stays standalone, and the
+    # request-only tool_call carries the stamp despite result being None.
+    assert call["result"] is None
+    assert any(it["kind"] == "tool_result" for it in detail["items"])
+    # private keys never leak into ANY emitted block:
+    dumped = _json.dumps(detail)
+    assert "bash_stderr" not in dumped
+    assert "bash_interrupted" not in dumped
+
+
+def test_bash_streams_never_leak_on_orphan_result():
+    # A tool_result whose tool_use_id matches NO request stays standalone; its
+    # internal bash_* keys must be stripped from public JSON (Phase-1 pop).
+    c = _conn()
+    _seed_tool_result(c, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "x", "is_error": False,
+                 "tool_use_id": "nomatch",
+                 "bash_stderr": "boom", "bash_interrupted": True}])
+    out = cq.get_conversation(c, "s1")
+    for it in out["items"]:
+        for b in it["blocks"]:
+            assert "bash_stderr" not in b
+            assert "bash_interrupted" not in b
+
+
+def test_tool_call_without_bash_streams_has_no_stderr_key():
+    c = _conn()
+    _seed_assistant(c, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}",
+                 "input": {"file_path": "/x"}, "input_truncated": False,
+                 "id": "t1", "preview": "/x"}])
+    call = [b for it in cq.get_conversation(c, "s1")["items"]
+            if it["kind"] == "assistant"
+            for b in it["blocks"] if b.get("kind") == "tool_call"][0]
+    assert "stderr" not in call
+    assert "interrupted" not in call
+
+
+# ---------------------------------------------------------------------------
 # Task* checklist fold (_fold_task_runs): the live to-do mechanism. State spans
 # the whole session, keyed on the explicit (never-reused) task id; the running
 # todos[] snapshot is stamped onto each Task* run's FIRST tool_call.

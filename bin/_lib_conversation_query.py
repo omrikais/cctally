@@ -484,6 +484,7 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     spawn_kind = {}     # tool_use id -> subagent_type
     agent_link = {}     # tool_use id -> (agent_id, raw_meta)
     ask_link = {}       # tool_use id -> (answers, annotations)  (#177 S2)
+    bash_link = {}      # tool_use id -> (stderr, interrupted)   (#177 S3)
     task_link = {}      # tool_use id -> {"task_id", "task_list"}  (Task* checklist)
     for it in items:
         for b in it["blocks"]:
@@ -501,6 +502,10 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                 anno = b.pop("ask_annotations", None)
                 if ans is not None and b.get("tool_use_id") is not None:
                     ask_link[b["tool_use_id"]] = (ans, anno)
+                bstderr = b.pop("bash_stderr", None)        # #177 S3
+                bintr = b.pop("bash_interrupted", None)
+                if b.get("tool_use_id") is not None and (bstderr is not None or bintr):
+                    bash_link[b["tool_use_id"]] = (bstderr, bool(bintr))
                 tid_ = b.pop("task_id", None)               # Task* checklist
                 tlist_ = b.pop("task_list", None)
                 if b.get("tool_use_id") is not None and (tid_ is not None or tlist_ is not None):
@@ -568,6 +573,12 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                         b["answers"] = link[0]
                         if link[1]:
                             b["annotations"] = link[1]
+                    blink = bash_link.get(b["tool_use_id"])  # #177 S3
+                    if blink is not None:
+                        if blink[0] is not None:
+                            b["stderr"] = blink[0]
+                        if blink[1]:
+                            b["interrupted"] = True
 
     # ---- Phase 3b: fold the Task* op stream into per-run checklist snapshots ----
     _fold_task_runs(items, task_link)
