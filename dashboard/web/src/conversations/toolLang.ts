@@ -31,3 +31,13 @@ export function resultLang(toolName: string | null, filePath: string): string {
   if (toolName === 'Read') return langFromExtension(filePath);
   return '';
 }
+
+// Language for a tool call inferred from its STRUCTURED `input.file_path` (#177
+// S3). More robust than parsing the `preview` string. Used by the DiffCard hunks
+// and the edit-family result sub-panel (spec §4.3); '' when there's no usable
+// file path. This is the path that broadens highlighting from Read to the edit
+// family — `resultLang` deliberately stays Read-scoped (no generic-path change).
+export function fileLangForCall(call: { input?: Record<string, unknown> | null }): string {
+  const fp = (call.input as { file_path?: unknown } | null | undefined)?.file_path;
+  return typeof fp === 'string' ? langFromExtension(fp) : '';
+}
