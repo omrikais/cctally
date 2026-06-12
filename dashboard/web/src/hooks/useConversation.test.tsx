@@ -211,8 +211,9 @@ describe('useConversation', () => {
     // the new sid, so an auto-fetching MediaFigure built /<newSid>/media?tool_use_id
     // =<oldId> → 404. A setState-in-render reset does NOT fix it (the first render
     // of the new session still returns the stale value); the fix DERIVES the
-    // exposed detail in the same render pass (only surface it when
-    // detail.session_id === sessionId).
+    // exposed detail in the same render pass (only surface it when the
+    // REQUESTED loadedSessionId === sessionId — keyed on the requested sid,
+    // not the body's self-reported session_id).
     //
     // We trace EVERY render the hook produces and assert no render that requested
     // s2 ever carried a detail belonging to s1. The new session's fetch is
