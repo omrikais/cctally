@@ -1083,38 +1083,74 @@ def _fts_flag_unavailable(conn) -> bool:
     return bool(row and row[0])
 
 
+def _search_depth(conn) -> str:
+    """'prose-only' while migration 010's column split is pending, else 'full'
+    (#177 S6). Mirrors ``_cctally_db.conversation_search_depth`` but reads the
+    flag inline (the kernel never imports the db sibling — same pattern as
+    ``_fts_flag_unavailable``). An OperationalError (no cache_meta) → 'full'."""
+    try:
+        pending = conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='conversation_search_split_pending'").fetchone()
+    except sqlite3.OperationalError:
+        return "full"
+    return "prose-only" if pending else "full"
+
+
 def search_conversations(conn, query, *, limit=50, offset=0,
-                         fts_available=None) -> dict:
+                         kind="all", fts_available=None) -> dict:
     """Cross-session search (spec §3.3). Uses FTS5 when available (bm25 rank +
     snippet); else a LIKE scan with a manual snippet. Hits deduped by
     (session_id, uuid); each carries the turn's cost. `fts_available` overrides
-    detection (test seam / explicit LIKE)."""
+    detection (test seam / explicit LIKE).
+
+    #177 S6: ``kind`` (one of ``_SEARCH_KINDS``) scopes the search to a column
+    family — ``all`` is unfiltered, ``prompts``/``assistant`` filter the prose
+    column + entry_type, ``tools``/``thinking`` filter the split index columns.
+    Every hit gains ``match_kinds`` (sorted ``['tool', 'thinking']`` badges;
+    prose never badges). The response carries additive ``kind`` + ``search_depth``
+    so the client can degrade the Tools/Thinking facets during the one-time
+    column split (``search_depth == 'prose-only'`` short-circuits those two
+    kinds to empty). An unknown ``kind`` raises ``ValueError`` (route → 400)."""
+    if kind not in _SEARCH_KINDS:
+        raise ValueError(f"unknown kind: {kind}")
     q = (query or "").strip()
     limit = max(1, min(int(limit), 200))
     offset = max(0, int(offset))
     if fts_available is None:
         fts_available = not _fts_flag_unavailable(conn)
-    if not q:
-        return {"query": q, "mode": "fts" if fts_available else "like",
-                "hits": [], "total": 0}
+    depth = _search_depth(conn)
+    mode = "fts" if fts_available else "like"
+    base = {"query": q, "mode": mode, "hits": [], "total": 0,
+            "kind": kind, "search_depth": depth}
+    # Prose-only interim: the split columns are not yet indexed, so tools /
+    # thinking can't match — short-circuit them to empty (spec §1 interim).
+    if not q or (depth == "prose-only" and kind in ("tools", "thinking")):
+        return base
     if fts_available:
         try:
-            return _search_fts(conn, q, limit, offset)
+            out = _search_fts(conn, q, limit, offset, kind, depth)
+            out.update(kind=kind, search_depth=depth)
+            return out
         except sqlite3.OperationalError:
             pass   # corrupt/missing FTS at query time → fall through to LIKE
-    return _search_like(conn, q, limit, offset)
+    out = _search_like(conn, q, limit, offset, kind, depth)
+    out.update(kind=kind, mode="like", search_depth=depth)
+    return out
 
 
-def _row_to_hit(uuid_, sid, ts, cwd, snippet, msg_id, req_id):
+def _row_to_hit(uuid_, sid, ts, cwd, snippet, msg_id, req_id, match_kinds=None):
     """Build one hit WITHOUT cost — cost is batched onto the FINAL page in
     _attach_costs (I1: no per-hit _turn_cost_map round-trip). The turn key rides
-    on the private `_turn_key` field until the batch maps it to `cost_usd`."""
+    on the private `_turn_key` field until the batch maps it to `cost_usd`.
+    #177 S6: ``match_kinds`` (sorted non-prose badges) is attached per hit."""
     return {
         "session_id": sid,
         "uuid": uuid_,
         "project_label": _project_label(cwd),
         "ts": ts,
         "snippet": snippet,
+        "match_kinds": match_kinds or [],
         "_turn_key": (msg_id, req_id) if msg_id is not None and req_id is not None
                      else None,
     }
@@ -1154,16 +1190,18 @@ def _like_pattern(q):
             + "%")
 
 
-def _fts_snippets(conn, fts_q, ids):
+def _fts_snippets(conn, fts_q, ids, col=0):
     """{rowid: snippet} for the page rowids ONLY (#149). snippet() needs an
     active MATCH, so it can't be deferred to an outer query over the page CTE;
     a second bounded MATCH restricted to the page rowids generates snippets for
-    at most one page of hits instead of every corpus match."""
+    at most one page of hits instead of every corpus match. #177 S6: ``col``
+    selects which FTS column the snippet is drawn from (0=text, 1=search_tool,
+    2=search_thinking) so a tool/thinking hit shows its matching content."""
     if not ids:
         return {}
     ph = ",".join("?" for _ in ids)
     rows = conn.execute(
-        "SELECT cm.id, snippet(conversation_fts, 0, '[', ']', ' … ', 12) "
+        f"SELECT cm.id, snippet(conversation_fts, {int(col)}, '[', ']', ' … ', 12) "
         "FROM conversation_fts "
         "JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
         f"WHERE conversation_fts MATCH ? AND cm.id IN ({ph})",
@@ -1186,10 +1224,54 @@ def _texts_for_ids(conn, ids):
     return {r[0]: r[1] for r in rows}
 
 
-def _search_fts(conn, q, limit, offset):
+# #177 S6: FTS-column index → badge label (col 0 = prose = no badge).
+_KIND_PROBE_COLUMNS = (("search_tool", "tool"), ("search_thinking", "thinking"))
+_SNIPPET_COL_PREFERENCE = (("tool", 1), ("thinking", 2))   # prose (0) is default
+
+
+def _match_kinds(conn, fts_q, rids_by_group):
+    """{group -> sorted [badges]} via marker-based column probes (spec F3).
+
+    A column "matched" iff a column-filtered sub-MATCH returns its rowid — NOT
+    iff snippet() is non-empty (snippet returns the column's unmarked text for
+    non-matching columns). Probes aggregate across ALL matched rowids of each
+    page group's ``(session_id, uuid)``, so a multi-row hit badges completely.
+    Prose (col 0) is never a badge. ``fts_q`` is the un-column-filtered term
+    expression (the per-column wrapping is applied here)."""
+    all_rids = sorted({r for rids in rids_by_group.values() for r in rids})
+    if not all_rids:
+        return {grp: [] for grp in rids_by_group}
+    ph = ",".join("?" for _ in all_rids)
+    hits_by_col = {}
+    for col, label in _KIND_PROBE_COLUMNS:
+        got = conn.execute(
+            "SELECT conversation_fts.rowid FROM conversation_fts "
+            f"WHERE conversation_fts MATCH ? AND conversation_fts.rowid IN ({ph})",
+            (f"{{{col}}}: ({fts_q})", *all_rids),
+        ).fetchall()
+        hits_by_col[label] = {r[0] for r in got}
+    return {grp: [lbl for (_c, lbl) in _KIND_PROBE_COLUMNS
+                  if set(rids) & hits_by_col[lbl]]
+            for grp, rids in rids_by_group.items()}
+
+
+def _search_fts(conn, q, limit, offset, kind, depth):
     # All of dedup + paging + total live in SQL (#149) so Python never holds
     # more than one page of hits/snippets, regardless of corpus match count.
-    fts_q = _fts_query(q)
+    #
+    # #177 S6: prose-only interim runs the LEGACY single-column shape (the split
+    # columns are not yet indexed) — no column filter, no badge/snippet probes
+    # against search_tool/search_thinking (those columns aren't in the legacy
+    # FTS table). Full mode applies the kind column filter + entry_type predicate
+    # and the marker-based badges.
+    legacy = depth == "prose-only"
+    fts_q = _fts_query(q, prefix_last=True)
+    # legacy single-column MATCH (prose), no column filter; full mode applies
+    # the kind column filter.
+    match_expr = fts_q if legacy else _kind_match_expr(kind, fts_q)
+    entry_type = _KIND_ENTRY_TYPE.get(kind)
+    et_pred = " AND cm.entry_type = ?" if entry_type is not None else ""
+    et_args = (entry_type,) if entry_type is not None else ()
     # Exact post-dedup logical total — counted in C with no snippet generation
     # and no Python row materialization.
     total = conn.execute(
@@ -1197,8 +1279,8 @@ def _search_fts(conn, q, limit, offset):
         "  SELECT DISTINCT cm.session_id, cm.uuid "
         "  FROM conversation_fts "
         "  JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
-        "  WHERE conversation_fts MATCH ?)",
-        (fts_q,),
+        f"  WHERE conversation_fts MATCH ?{et_pred})",
+        (match_expr, *et_args),
     ).fetchone()[0]
     # One row per logical (session_id, uuid): ROW_NUMBER()=1 keeps the SAME row
     # the old Python dedup kept as its FIRST occurrence (order: bm25, ts DESC,
@@ -1209,16 +1291,20 @@ def _search_fts(conn, q, limit, offset):
     # bm25 is materialized as a plain `rank` column in the inner `matched` CTE
     # before the window function runs: FTS5 auxiliary functions (bm25/snippet)
     # may only be used directly against the MATCH query, NOT inside a window
-    # ORDER BY ("unable to use function bm25 in the requested context").
+    # ORDER BY ("unable to use function bm25 in the requested context"). Weights
+    # (prose > tool > thinking) only apply to the multi-column (full) shape;
+    # the legacy single-column table takes the plain bm25.
+    bm25_expr = ("bm25(conversation_fts)" if legacy
+                 else "bm25(conversation_fts, 10.0, 3.0, 1.0)")
     page = conn.execute(
         "WITH matched AS ("
         "  SELECT cm.id AS rid, cm.session_id AS sid, cm.uuid AS uuid, "
         "         cm.timestamp_utc AS ts, cm.cwd AS cwd, "
         "         cm.msg_id AS mid, cm.req_id AS rqd, "
-        "         bm25(conversation_fts) AS rank "
+        f"         {bm25_expr} AS rank "
         "  FROM conversation_fts "
         "  JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
-        "  WHERE conversation_fts MATCH ?), "
+        f"  WHERE conversation_fts MATCH ?{et_pred}), "
         "ranked AS ("
         "  SELECT *, ROW_NUMBER() OVER ("
         "             PARTITION BY sid, uuid ORDER BY rank, ts DESC, rid DESC"
@@ -1226,26 +1312,101 @@ def _search_fts(conn, q, limit, offset):
         "  FROM matched) "
         "SELECT rid, sid, uuid, ts, cwd, mid, rqd FROM ranked WHERE rn = 1 "
         "ORDER BY rank, ts DESC, rid DESC LIMIT ? OFFSET ?",
-        (fts_q, limit, offset),
+        (match_expr, *et_args, limit, offset),
     ).fetchall()
-    snips = _fts_snippets(conn, fts_q, [r[0] for r in page])
-    hits = [_row_to_hit(uuid, sid, ts, cwd, snips.get(rid, ""), mid, rqd)
+    page_groups = {(sid, uuid): rid for (rid, sid, uuid, ts, cwd, mid, rqd) in page}
+    if legacy:
+        badges = {grp: [] for grp in page_groups}
+    else:
+        rids_by_group = _all_matched_rids_by_group(
+            conn, match_expr, et_pred, et_args, list(page_groups))
+        badges = _match_kinds(conn, fts_q, rids_by_group)
+    snips = _fts_snippets(conn, match_expr, [r[0] for r in page], col=0)
+    # For hits badged tool/thinking but with no prose match, draw the snippet
+    # from the matched column instead (prose → tool → thinking preference).
+    if not legacy:
+        snips = _prefer_snippet_columns(conn, fts_q, page, page_groups, badges, snips)
+    hits = [_row_to_hit(uuid, sid, ts, cwd, snips.get(rid, ""), mid, rqd,
+                        match_kinds=badges.get((sid, uuid), []))
             for (rid, sid, uuid, ts, cwd, mid, rqd) in page]
     return {"query": q, "mode": "fts",
             "hits": _attach_titles(conn, _attach_costs(conn, hits)),
             "total": total}
 
 
-def _search_like(conn, q, limit, offset):
+def _all_matched_rids_by_group(conn, match_expr, et_pred, et_args, groups):
+    """{(sid, uuid) -> [rids]} for the page groups: ALL matched physical rows of
+    each group (not just the rank-survivor), so badges aggregate completely."""
+    if not groups:
+        return {}
+    rids_by_group = {g: [] for g in groups}
+    rows = conn.execute(
+        "SELECT cm.id, cm.session_id, cm.uuid FROM conversation_fts "
+        "JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
+        f"WHERE conversation_fts MATCH ?{et_pred}",
+        (match_expr, *et_args),
+    ).fetchall()
+    for rid, sid, uuid in rows:
+        g = (sid, uuid)
+        if g in rids_by_group:
+            rids_by_group[g].append(rid)
+    return rids_by_group
+
+
+def _prefer_snippet_columns(conn, fts_q, page, page_groups, badges, snips):
+    """Replace a hit's prose snippet with its matched column's snippet when the
+    prose column did NOT match (prose → tool → thinking preference). Probes
+    which column matched the survivor rowid, then re-snippets that column."""
+    by_col = {}   # snippet column index -> [rids needing it]
+    for (rid, sid, uuid, ts, cwd, mid, rqd) in page:
+        grp = (sid, uuid)
+        kinds = badges.get(grp, [])
+        if not kinds:
+            continue   # prose hit (or unbadged) — keep col-0 snippet
+        # Does THIS survivor row match prose? If so keep col 0.
+        prose_hit = conn.execute(
+            "SELECT 1 FROM conversation_fts "
+            "WHERE conversation_fts MATCH ? AND conversation_fts.rowid = ?",
+            (f"{{text}}: ({fts_q})", rid)).fetchone()
+        if prose_hit:
+            continue
+        for label, col in _SNIPPET_COL_PREFERENCE:
+            if label in kinds:
+                by_col.setdefault(col, []).append(rid)
+                break
+    for col, rids in by_col.items():
+        col_fts = _kind_match_expr(
+            "tools" if col == 1 else "thinking", fts_q)
+        alt = _fts_snippets(conn, col_fts, rids, col=col)
+        snips.update(alt)
+    return snips
+
+
+def _search_like(conn, q, limit, offset, kind, depth):
     # SQL-bounded mirror of _search_fts for the no-FTS5 fallback (#149); the
     # COUNT + page each scan the table once (the degraded path already lacks an
-    # index for the substring match).
+    # index for the substring match). #177 S6: kind → column list (single-
+    # substring semantics preserved — a documented degraded divergence from FTS
+    # term-wise AND); badges from per-column LIKE probes on the page rows.
+    legacy = depth == "prose-only"
     like = _like_pattern(q)
+    if legacy:
+        cols = ["text"]
+    else:
+        cols = ({"prompts": ["text"], "assistant": ["text"],
+                 "tools": ["search_tool"], "thinking": ["search_thinking"]}
+                .get(kind, ["text", "search_tool", "search_thinking"]))
+    col_pred = "(" + " OR ".join(
+        f"{c} LIKE ? ESCAPE '\\' AND {c} != ''" for c in cols) + ")"
+    like_args = tuple(like for _ in cols)
+    entry_type = _KIND_ENTRY_TYPE.get(kind)
+    et_pred = " AND entry_type = ?" if entry_type is not None else ""
+    et_args = (entry_type,) if entry_type is not None else ()
     total = conn.execute(
         "SELECT COUNT(*) FROM ("
         "  SELECT DISTINCT session_id, uuid FROM conversation_messages "
-        "  WHERE text LIKE ? ESCAPE '\\' AND text != '')",
-        (like,),
+        f"  WHERE {col_pred}{et_pred})",
+        (*like_args, *et_args),
     ).fetchone()[0]
     page = conn.execute(
         "WITH ranked AS ("
@@ -1256,25 +1417,214 @@ def _search_like(conn, q, limit, offset):
         "           ORDER BY timestamp_utc DESC, id DESC"
         "         ) AS rn "
         "  FROM conversation_messages "
-        "  WHERE text LIKE ? ESCAPE '\\' AND text != '') "
+        f"  WHERE {col_pred}{et_pred}) "
         "SELECT rid, sid, uuid, ts, cwd, mid, rqd FROM ranked WHERE rn = 1 "
         "ORDER BY ts DESC, rid DESC LIMIT ? OFFSET ?",
-        (like, limit, offset),
+        (*like_args, *et_args, limit, offset),
     ).fetchall()
     texts = _texts_for_ids(conn, [r[0] for r in page])
+    if legacy:
+        badges = {(sid, uuid): [] for (rid, sid, uuid, *_r) in page}
+    else:
+        badges = _like_badges(conn, like, list(
+            {(sid, uuid) for (rid, sid, uuid, *_r) in page}))
     hits = [_row_to_hit(uuid, sid, ts, cwd,
-                        _manual_snippet(texts.get(rid, ""), q), mid, rqd)
+                        _manual_snippet(texts.get(rid, ""), q), mid, rqd,
+                        match_kinds=badges.get((sid, uuid), []))
             for (rid, sid, uuid, ts, cwd, mid, rqd) in page]
     return {"query": q, "mode": "like",
             "hits": _attach_titles(conn, _attach_costs(conn, hits)),
             "total": total}
 
 
-def _fts_query(q):
+def _like_badges(conn, like, groups):
+    """{(sid, uuid) -> sorted [badges]} via per-column LIKE probes across all
+    physical rows of each page group (LIKE degraded mode; spec F7)."""
+    if not groups:
+        return {}
+    out = {g: [] for g in groups}
+    ph = " OR ".join("(session_id=? AND uuid=?)" for _ in groups)
+    flat = [v for g in groups for v in g]
+    for col, label in _KIND_PROBE_COLUMNS:
+        rows = conn.execute(
+            f"SELECT DISTINCT session_id, uuid FROM conversation_messages "
+            f"WHERE {col} LIKE ? ESCAPE '\\' AND {col} != '' AND ({ph})",
+            (like, *flat)).fetchall()
+        for sid, uuid in rows:
+            if (sid, uuid) in out:
+                out[(sid, uuid)].append(label)
+    return {g: sorted(v) for g, v in out.items()}
+
+
+# #177 S6: kind facets. `all` is the unfiltered MATCH; `prompts`/`assistant`
+# filter the prose column AND the entry_type; `tools`/`thinking` filter the
+# split index columns. Validated in search_conversations / find_in_conversation
+# (an unknown kind raises ValueError → the route maps it to a 400).
+_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking")
+_KIND_COLUMN = {"prompts": "text", "assistant": "text",
+                "tools": "search_tool", "thinking": "search_thinking"}
+_KIND_ENTRY_TYPE = {"prompts": "human", "assistant": "assistant"}
+
+
+def _fts_query(q, prefix_last=False):
     """Quote each whitespace term as an FTS5 string literal so punctuation /
-    operators in user input can't error the MATCH or inject FTS syntax."""
+    operators in user input can't error the MATCH or inject FTS syntax. When
+    ``prefix_last`` is set, the final term gets a trailing ``*`` (valid FTS5
+    quoted-prefix syntax) so ``cache.d`` matches ``cache.db`` while typing — a
+    ``*`` INSIDE the quotes is a literal char, so the prefix marker lives
+    outside the closing quote (#177 S6)."""
     terms = [t for t in q.split() if t]
-    return " ".join('"' + t.replace('"', '""') + '"' for t in terms) or '""'
+    if not terms:
+        return '""'
+    quoted = ['"' + t.replace('"', '""') + '"' for t in terms]
+    if prefix_last:
+        quoted[-1] += "*"
+    return " ".join(quoted)
+
+
+def _kind_match_expr(kind, fts_q):
+    """Wrap the term expression in a column filter for the kind (#177 S6).
+    ``all`` stays unfiltered; ``prompts``/``assistant`` filter the prose column
+    (the entry_type split is a separate SQL predicate, applied by the caller)."""
+    col = _KIND_COLUMN.get(kind)
+    return f"{{{col}}}: ({fts_q})" if col else fts_q
+
+
+# ===========================================================================
+# #177 S6: in-conversation find — rendered-turn anchors (spec §2 find endpoint).
+# ===========================================================================
+
+_FIND_ANCHOR_CAP = 500
+
+# Which physical-row columns the find match probes per kind, and the badge label
+# each non-prose column contributes. ``text`` maps to the synthetic ``prose``
+# label so a prose-only match still anchors a turn but never badges.
+_FIND_KIND_COLUMNS = {
+    "all": (("text", "prose"), ("search_tool", "tool"),
+            ("search_thinking", "thinking")),
+    "prompts": (("text", "prose"),),
+    "assistant": (("text", "prose"),),
+    "tools": (("search_tool", "tool"),),
+    "thinking": (("search_thinking", "thinking"),),
+}
+
+
+def find_in_conversation(conn, session_id, query, *, kind="all",
+                         fts_available=None, cap=_FIND_ANCHOR_CAP):
+    """Document-ordered rendered-turn anchors for in-conversation find (#177 S6).
+
+    Anchor identity is rendered-turn identity (spec F1): the FTS/LIKE match for
+    the session yields physical-row uuids, then ``_assemble_session`` (the S5
+    outline precedent — 1:1 grouping parity by construction) maps each matched
+    row onto its rendered item via ``member_uuids``. Matched rows folding into
+    the same item (assistant fragments, owned tool results, skill bodies)
+    collapse to ONE anchor whose ``match_kinds`` aggregates across its matched
+    members; document order = assembly order (bm25 unused here). ``total`` counts
+    rendered-turn anchors PRE-cap; the list caps at ``cap`` with
+    ``anchors_truncated``. Returns None for an unknown session; an unknown
+    ``kind`` raises ValueError (route → 400). Empty/whitespace query → empty;
+    prose-only depth + tools/thinking kinds → empty (the split index is pending)."""
+    if kind not in _SEARCH_KINDS:
+        raise ValueError(f"unknown kind: {kind}")
+    depth = _search_depth(conn)
+    if fts_available is None:
+        fts_available = not _fts_flag_unavailable(conn)
+    asm = _assemble_session(conn, session_id)
+    if asm is None:
+        return None
+    q = (query or "").strip()
+    base = {"total": 0, "anchors": [], "anchors_truncated": False,
+            "search_depth": depth, "kind": kind,
+            "mode": "fts" if fts_available else "like"}
+    if not q or (depth == "prose-only" and kind in ("tools", "thinking")):
+        return base
+    mode, matched = _find_matched_rows(
+        conn, session_id, q, kind, depth, fts_available)
+    # matched: {uuid -> set of labels in {"prose", "tool", "thinking"}}
+    anchors = []
+    for it in asm["items"]:
+        hit_kinds = set()
+        hit = False
+        for mu in it["member_uuids"]:
+            labels = matched.get(mu)
+            if labels:
+                hit = True
+                hit_kinds |= labels
+        if hit:
+            anchors.append({
+                "uuid": it["anchor"]["uuid"],
+                "match_kinds": sorted(k for k in hit_kinds if k != "prose")})
+    total = len(anchors)
+    return {**base, "mode": mode, "total": total,
+            "anchors": anchors[:cap], "anchors_truncated": total > cap}
+
+
+def _find_matched_rows(conn, session_id, q, kind, depth, fts_available):
+    """({mode}, {uuid -> {labels}}) for one session. Runs a column-scoped MATCH
+    (or LIKE) per relevant column and tags each matched row's uuid with that
+    column's label. Prose-only depth uses the legacy single-column FTS (the
+    split columns aren't indexed yet) for prose-bearing kinds."""
+    if fts_available:
+        try:
+            return "fts", _find_matched_fts(conn, session_id, q, kind, depth)
+        except sqlite3.OperationalError:
+            pass   # corrupt/missing FTS → fall through to LIKE
+    return "like", _find_matched_like(conn, session_id, q, kind, depth)
+
+
+def _find_matched_fts(conn, session_id, q, kind, depth):
+    fts_q = _fts_query(q, prefix_last=True)
+    out = {}
+    if depth == "prose-only":
+        # Legacy single-column FTS indexes prose only; column filters / the
+        # tool/thinking columns don't exist on that table.
+        cols = (("text", "prose"),) if kind in ("all", "prompts", "assistant") \
+            else ()
+        for col, label in cols:
+            et = _KIND_ENTRY_TYPE.get(kind)
+            et_pred = " AND cm.entry_type = ?" if et is not None else ""
+            et_args = (et,) if et is not None else ()
+            rows = conn.execute(
+                "SELECT cm.uuid FROM conversation_fts "
+                "JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
+                f"WHERE conversation_fts MATCH ? AND cm.session_id = ?{et_pred}",
+                (fts_q, session_id, *et_args)).fetchall()
+            for (u,) in rows:
+                out.setdefault(u, set()).add(label)
+        return out
+    for col, label in _FIND_KIND_COLUMNS[kind]:
+        et = _KIND_ENTRY_TYPE.get(kind)
+        et_pred = " AND cm.entry_type = ?" if et is not None else ""
+        et_args = (et,) if et is not None else ()
+        col_expr = f"{{{col}}}: ({fts_q})"
+        rows = conn.execute(
+            "SELECT cm.uuid FROM conversation_fts "
+            "JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
+            f"WHERE conversation_fts MATCH ? AND cm.session_id = ?{et_pred}",
+            (col_expr, session_id, *et_args)).fetchall()
+        for (u,) in rows:
+            out.setdefault(u, set()).add(label)
+    return out
+
+
+def _find_matched_like(conn, session_id, q, kind, depth):
+    like = _like_pattern(q)
+    cols = (("text", "prose"),) if depth == "prose-only" and kind in (
+        "all", "prompts", "assistant") else (
+        () if depth == "prose-only" else _FIND_KIND_COLUMNS[kind])
+    out = {}
+    for col, label in cols:
+        et = _KIND_ENTRY_TYPE.get(kind)
+        et_pred = " AND entry_type = ?" if et is not None else ""
+        et_args = (et,) if et is not None else ()
+        rows = conn.execute(
+            f"SELECT uuid FROM conversation_messages "
+            f"WHERE session_id = ? AND {col} LIKE ? ESCAPE '\\' "
+            f"AND {col} != ''{et_pred}",
+            (session_id, like, *et_args)).fetchall()
+        for (u,) in rows:
+            out.setdefault(u, set()).add(label)
+    return out
 
 
 def _manual_snippet(text, q, width=80):

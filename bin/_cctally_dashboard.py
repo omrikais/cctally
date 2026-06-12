@@ -5218,6 +5218,12 @@ def _qs_str(q: dict, key: str, default: str | None) -> str | None:
     return vals[0] if vals else default
 
 
+# #177 S6: valid kind facets for the conversation search / find routes. Kept in
+# lockstep with ``_lib_conversation_query._SEARCH_KINDS`` (the kernel re-raises
+# ValueError on an unknown kind; the handlers reject with a 400 before the call).
+_CONV_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking")
+
+
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
     """Routes:
         GET /                       → dashboard.html
@@ -5352,6 +5358,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # #177 S5: full-session outline skeleton + stats. Matched BEFORE
             # the <id> reader catch-all (Codex F2 — same precedence as /payload).
             self._handle_get_conversation_outline(path)
+        elif path.startswith("/api/conversation/") and path.endswith("/find"):
+            # #177 S6: in-conversation find → rendered-turn anchors. Matched
+            # BEFORE the <id> reader catch-all (same precedence as /outline).
+            self._handle_get_conversation_find(path)
         elif path.startswith("/api/conversation/"):
             self._handle_get_conversation_detail(path)
         else:
@@ -7337,8 +7347,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         self._respond_json(200, body)
 
     def _handle_get_conversation_search(self) -> None:
-        """``GET /api/conversation/search?q=...`` — cross-session FTS/LIKE
-        search (spec §3.3). Matched BEFORE the ``<id>`` reader in ``do_GET``.
+        """``GET /api/conversation/search?q=...&kind=...`` — cross-session
+        FTS/LIKE search (spec §3.3). Matched BEFORE the ``<id>`` reader in
+        ``do_GET``. ``kind`` (#177 S6) is validated to ``_CONV_SEARCH_KINDS``
+        (else 400) before the kernel call.
         """
         if not self._require_transcripts_allowed():
             return
@@ -7347,9 +7359,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         query = _qs_str(q, "q", "")
         limit = _qs_int(q, "limit", 50)
         offset = _qs_int(q, "offset", 0)
+        kind = _qs_str(q, "kind", "all")
+        if kind not in _CONV_SEARCH_KINDS:
+            self._respond_json(400, {"error": f"unknown kind: {kind}"})
+            return
         ok, body = self._run_conversation_query(
             lambda conn: self._conversation_query().search_conversations(
-                conn, query, limit=limit, offset=offset),
+                conn, query, limit=limit, offset=offset, kind=kind),
             "/api/conversation/search")
         if not ok:
             return
@@ -7409,6 +7425,36 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         ok, body = self._run_conversation_query(
             lambda conn: self._conversation_query().get_conversation_outline(conn, session_id),
             "/api/conversation/outline")
+        if not ok:
+            return
+        if body is None:
+            self.send_error(404, "conversation not found")
+            return
+        self._respond_json(200, body)
+
+    def _handle_get_conversation_find(self, path: str) -> None:
+        """``GET /api/conversation/<sid>/find?q=...&kind=...`` — in-conversation
+        find → document-ordered rendered-turn anchors (#177 S6). Same fail-closed
+        privacy gate as the sibling routes; unknown id → 404; an invalid ``kind``
+        → 400. Matched BEFORE the ``<id>`` reader catch-all in ``do_GET``.
+        """
+        if not self._require_transcripts_allowed():
+            return
+        import urllib.parse as _u
+        session_id = _u.unquote(path[len("/api/conversation/"):-len("/find")])
+        if not session_id:
+            self.send_error(404, "conversation not found")
+            return
+        q = _u.parse_qs(self.path.partition("?")[2])
+        query = _qs_str(q, "q", "")
+        kind = _qs_str(q, "kind", "all")
+        if kind not in _CONV_SEARCH_KINDS:
+            self._respond_json(400, {"error": f"unknown kind: {kind}"})
+            return
+        ok, body = self._run_conversation_query(
+            lambda conn: self._conversation_query().find_in_conversation(
+                conn, session_id, query, kind=kind),
+            "/api/conversation/find")
         if not ok:
             return
         if body is None:

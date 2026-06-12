@@ -253,6 +253,63 @@ def test_conversation_outline_route(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def test_conversation_find_route(tmp_path, monkeypatch):
+    """``/api/conversation/<sid>/find`` (#177 S6): loopback 200 with the anchor
+    shape (``anchors``/``total``/``mode``/``search_depth``), 404 on an unknown
+    id, 403 under a LAN hostname Host (gate reused), and route-ordering proof
+    that ``/find`` dispatches to the find handler — NOT the detail catch-all
+    parsing ``s1/find`` as a session id."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+
+        # Happy path: s1's assistant turn matches the prose 'token'.
+        status, body = _get(port, "/api/conversation/s1/find?q=token")
+        assert status == 200, (status, body)
+        out = json.loads(body)
+        assert "anchors" in out and "total" in out and "mode" in out
+        assert out["search_depth"] == "full"
+        assert isinstance(out["anchors"], list) and out["total"] >= 1
+        # Precedence: find handler (has "anchors"), not the detail catch-all
+        # (which carries "items"/"page" and would 404 on "s1/find").
+        assert "items" not in out
+
+        # Unknown session → 404.
+        status, _ = _get(port, "/api/conversation/does-not-exist/find?q=token")
+        assert status == 404
+
+        # Invalid kind → 400.
+        status, body = _get(port, "/api/conversation/s1/find?q=token&kind=bogus")
+        assert status == 400, (status, body)
+        assert "error" in json.loads(body)
+
+        # Privacy gate reused verbatim: LAN hostname + expose=False → 403.
+        status, _ = _get(port, "/api/conversation/s1/find?q=token",
+                         host="machine.local:8789")
+        assert status == 403
+    finally:
+        srv.shutdown()
+
+
+def test_conversation_search_kind_param(tmp_path, monkeypatch):
+    """``/api/conversation/search?kind=...`` (#177 S6): a valid kind → 200 with
+    the additive ``kind``/``search_depth`` fields; an invalid kind → 400."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        status, body = _get(port, "/api/conversation/search?q=token&kind=tools")
+        assert status == 200, (status, body)
+        out = json.loads(body)
+        assert out["kind"] == "tools" and out["search_depth"] == "full"
+        status, body = _get(port, "/api/conversation/search?q=token&kind=bogus")
+        assert status == 400, (status, body)
+        assert "error" in json.loads(body)
+    finally:
+        srv.shutdown()
+
+
 def test_conversation_detail_pagination_threads_query(tmp_path, monkeypatch):
     """The reader's ``?after=``/``?limit=`` cursor must thread through the HTTP
     route. Regression: ``do_GET`` strips the query before dispatch, so the
@@ -298,6 +355,7 @@ class _ExplodingQuery:
     list_conversations = _boom
     get_conversation = _boom
     search_conversations = _boom
+    find_in_conversation = _boom
 
 
 def test_kernel_exception_returns_clean_500(tmp_path, monkeypatch):
@@ -321,7 +379,8 @@ def test_kernel_exception_returns_clean_500(tmp_path, monkeypatch):
         )
         for route in ("/api/conversations",
                       "/api/conversation/s1",
-                      "/api/conversation/search?q=token"):
+                      "/api/conversation/search?q=token",
+                      "/api/conversation/s1/find?q=token"):
             status, body = _get(port, route)
             assert status == 500, (route, status, body)
             payload = json.loads(body)

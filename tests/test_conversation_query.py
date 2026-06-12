@@ -645,16 +645,19 @@ def test_search_snippet_generation_bounded_to_page_fts(monkeypatch):
     if not db._fts5_available(c):
         import pytest; pytest.skip("sqlite build lacks FTS5")
     _seed_distinct_hits(c, 8, term="beta")
-    seen = {}
+    seen = {"max": 0}
     real = cq._fts_snippets
-    def spy(conn, fts_q, ids):
-        seen["ids"] = list(ids)
-        return real(conn, fts_q, ids)
+    def spy(conn, fts_q, ids, col=0):
+        # #177 S6: _fts_snippets may be called more than once per page (col-0
+        # prose pass + a tool/thinking preference pass); each call still covers
+        # AT MOST one page of rowids. Assert the per-call bound, not the count.
+        seen["max"] = max(seen["max"], len(list(ids)))
+        return real(conn, fts_q, ids, col=col)
     monkeypatch.setattr(cq, "_fts_snippets", spy)
     out = cq.search_conversations(c, "beta", limit=3, offset=0)
     assert out["mode"] == "fts"
     assert len(out["hits"]) == 3 and out["total"] == 8
-    assert len(seen["ids"]) == 3     # snippet batch covers only the page
+    assert seen["max"] <= 3     # each snippet batch bounded to the page
 
 
 # ---------------------------------------------------------------------------
@@ -2098,3 +2101,332 @@ def test_legacy_shape_left_alone_when_pending():
         "SELECT 1 FROM sqlite_master WHERE name='conversation_fts_aux'"
     ).fetchone() is not None
     assert db._conversation_fts_is_split(c) is False
+
+
+# ===========================================================================
+# #177 S6 Task 2 — search kernel: kinds, badges, prefix, find endpoint.
+# ===========================================================================
+import pytest as _pytest
+
+
+# --- 2a: _fts_query prefix + _kind_match_expr units ------------------------
+
+def test_fts_query_prefix_last_term():
+    assert cq._fts_query("npm ru", prefix_last=True) == '"npm" "ru"*'
+    assert cq._fts_query('say "hi', prefix_last=True) == '"say" """hi"*'
+    # a '*' inside the quotes is a literal char (FTS5 prefix-* lives OUTSIDE the
+    # closing quote), so a lone "lone*" term gets quoted then suffixed.
+    assert cq._fts_query("lone*", prefix_last=True) == '"lone*"*'
+    assert cq._fts_query("", prefix_last=True) == '""'
+    # default (no prefix) is byte-identical to the legacy builder.
+    assert cq._fts_query("npm ru") == '"npm" "ru"'
+
+
+def test_kind_match_expr():
+    assert cq._kind_match_expr("tools", '"a" "b"') == '{search_tool}: ("a" "b")'
+    assert cq._kind_match_expr("thinking", '"a"') == '{search_thinking}: ("a")'
+    assert cq._kind_match_expr("prompts", '"a"') == '{text}: ("a")'
+    assert cq._kind_match_expr("assistant", '"a"') == '{text}: ("a")'
+    assert cq._kind_match_expr("all", '"a"') == '"a"'
+
+
+# --- 2b: search_conversations kinds / badges / prefix / prose-only / LIKE --
+
+def _seed_kind_corpus(c):
+    """Three rows: prose-only (A), tool-only (B), thinking-only (C)."""
+    _msg(c, session_id="s1", uuid="A", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="deploy notes about npm releases", cwd="/home/u/proj")
+    _msg(c, session_id="s2", uuid="B", source_path="b.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-02T00:00:00Z", entry_type="assistant",
+         text="", model=_MODEL, msg_id="mB", req_id="rB",
+         search_tool="npm run build", cwd="/home/u/proj")
+    _msg(c, session_id="s3", uuid="C", source_path="c.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-03T00:00:00Z", entry_type="assistant",
+         text="", model=_MODEL, msg_id="mC", req_id="rC",
+         search_thinking="should I rerun npm", cwd="/home/u/proj")
+
+
+def test_search_kind_tools_finds_tool_content_and_badges():
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _seed_kind_corpus(c)
+    out = cq.search_conversations(c, "npm", kind="tools")
+    assert [h["uuid"] for h in out["hits"]] == ["B"]
+    assert out["total"] == 1
+    assert out["search_depth"] == "full" and out["kind"] == "tools"
+    out_all = cq.search_conversations(c, "npm", kind="all")
+    kinds = {h["uuid"]: h.get("match_kinds", []) for h in out_all["hits"]}
+    assert kinds["B"] == ["tool"]
+    assert kinds["C"] == ["thinking"]
+    assert kinds["A"] == []                       # prose never badges
+
+
+def test_search_badge_probe_is_marker_based_not_nonempty():
+    # A row matching ONLY in prose, but whose search_tool is non-empty (and would
+    # yield an unmarked snippet): match_kinds MUST stay empty (spec F3).
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _msg(c, session_id="s1", uuid="P", source_path="p.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="alpha beta gamma", search_tool="totally unrelated tool text",
+         cwd="/home/u/proj")
+    out = cq.search_conversations(c, "alpha", kind="all")
+    assert [h["uuid"] for h in out["hits"]] == ["P"]
+    assert out["hits"][0].get("match_kinds", []) == []
+
+
+def test_search_badges_aggregate_across_group_rows():
+    # Two physical rows, SAME (session_id, uuid): one matches in text, the other
+    # in search_tool. The single deduped hit badges across BOTH rows (F3).
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _msg(c, id=1, session_id="s1", uuid="G", source_path="g1.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="needle here", model=_MODEL, msg_id="mG", req_id="rG",
+         cwd="/home/u/proj")
+    _msg(c, id=2, session_id="s1", uuid="G", source_path="g2.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="", model=_MODEL, msg_id="mG", req_id="rG",
+         search_tool="needle in tool", cwd="/home/u/proj")
+    out = cq.search_conversations(c, "needle", kind="all")
+    assert len(out["hits"]) == 1
+    assert out["hits"][0]["uuid"] == "G"
+    assert out["hits"][0]["match_kinds"] == ["tool"]   # aggregated off the 2nd row
+
+
+def test_search_prompts_vs_assistant_entry_type_predicate():
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _msg(c, session_id="s1", uuid="H", source_path="h.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="shared marker word", cwd="/home/u/proj")
+    _msg(c, session_id="s1", uuid="AA", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="assistant",
+         text="shared marker word", model=_MODEL, msg_id="m1", req_id="r1",
+         cwd="/home/u/proj")
+    pr = cq.search_conversations(c, "marker", kind="prompts")
+    asst = cq.search_conversations(c, "marker", kind="assistant")
+    assert [h["uuid"] for h in pr["hits"]] == ["H"]
+    assert [h["uuid"] for h in asst["hits"]] == ["AA"]
+
+
+def test_search_kind_totals_exact_and_pages_disjoint():
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    n = 5
+    for i in range(n):
+        _msg(c, session_id=f"s{i}", uuid=f"u{i}", source_path=f"f{i}.jsonl",
+             byte_offset=0,
+             timestamp_utc=f"2026-06-01T00:00:{i:02d}Z", entry_type="assistant",
+             text="", model=_MODEL, msg_id=f"m{i}", req_id=f"r{i}",
+             search_tool=f"row {i} has the needle keyword", cwd="/home/u/proj")
+    p1 = cq.search_conversations(c, "needle", kind="tools", limit=2, offset=0)
+    p2 = cq.search_conversations(c, "needle", kind="tools", limit=2, offset=2)
+    p3 = cq.search_conversations(c, "needle", kind="tools", limit=2, offset=4)
+    assert p1["total"] == p2["total"] == p3["total"] == n
+    assert [len(p["hits"]) for p in (p1, p2, p3)] == [2, 2, 1]
+    keys = [(h["session_id"], h["uuid"]) for p in (p1, p2, p3) for h in p["hits"]]
+    assert len(set(keys)) == n
+
+
+def test_search_prefix_last_term_matches_while_typing():
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _msg(c, session_id="s1", uuid="K", source_path="k.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="", model=_MODEL, msg_id="mK", req_id="rK",
+         search_tool="cache.db.lock path", cwd="/home/u/proj")
+    out = cq.search_conversations(c, "cache.d", kind="tools")
+    assert [h["uuid"] for h in out["hits"]] == ["K"]
+
+
+def test_search_prose_only_mode_when_pending():
+    c = _legacy_conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    # legacy single-column FTS still indexes prose; seed a human + assistant row.
+    _msg(c, id=1, session_id="s1", uuid="H", source_path="h.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="needle prompt", cwd="/home/u/proj")
+    _msg(c, id=2, session_id="s1", uuid="AA", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="assistant",
+         text="needle reply", model=_MODEL, msg_id="m1", req_id="r1",
+         cwd="/home/u/proj")
+    # kind="all" works via the legacy prose table.
+    allout = cq.search_conversations(c, "needle", kind="all")
+    assert allout["search_depth"] == "prose-only"
+    assert {h["uuid"] for h in allout["hits"]} == {"H", "AA"}
+    # tools / thinking short-circuit to empty while prose-only.
+    for k in ("tools", "thinking"):
+        out = cq.search_conversations(c, "needle", kind=k)
+        assert out["hits"] == [] and out["total"] == 0
+        assert out["search_depth"] == "prose-only"
+    # prompts / assistant still filter by entry_type.
+    pr = cq.search_conversations(c, "needle", kind="prompts")
+    assert [h["uuid"] for h in pr["hits"]] == ["H"]
+    asst = cq.search_conversations(c, "needle", kind="assistant")
+    assert [h["uuid"] for h in asst["hits"]] == ["AA"]
+
+
+def test_search_invalid_kind_raises_value_error():
+    c = _conn()
+    with _pytest.raises(ValueError):
+        cq.search_conversations(c, "x", kind="bogus")
+
+
+def test_search_like_mode_kinds_and_badges():
+    c = _conn()
+    _seed_kind_corpus(c)
+    # tools kind in LIKE mode scans search_tool only.
+    out = cq.search_conversations(c, "npm", kind="tools", fts_available=False)
+    assert out["mode"] == "like"
+    assert [h["uuid"] for h in out["hits"]] == ["B"]
+    # all kind: badges via per-column LIKE probes.
+    out_all = cq.search_conversations(c, "npm", kind="all", fts_available=False)
+    kinds = {h["uuid"]: h.get("match_kinds", []) for h in out_all["hits"]}
+    assert kinds["B"] == ["tool"] and kinds["C"] == ["thinking"]
+    assert kinds["A"] == []
+
+
+def test_search_response_carries_kind_and_depth_on_empty():
+    c = _conn()
+    out = cq.search_conversations(c, "  ", kind="tools")
+    assert out["hits"] == [] and out["total"] == 0
+    assert out["kind"] == "tools" and out["search_depth"] == "full"
+
+
+# --- 2c: find_in_conversation ----------------------------------------------
+
+def _seed_find_session(c):
+    """An assistant turn (m1/r1) with prose 'reply' plus a folded tool_result
+    row whose search_tool carries 'needle', then a later human row matching
+    'needle' in prose. Mirrors a real tool-using transcript."""
+    # human kickoff
+    _msg(c, id=1, session_id="s1", uuid="hu", source_path="f.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="kick off", cwd="/home/u/proj")
+    # assistant turn with a tool_use
+    _msg(c, id=2, session_id="s1", uuid="as", source_path="f.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="reply prose", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([
+             {"kind": "text", "text": "reply prose"},
+             {"kind": "tool_use", "id": "tu1", "name": "Bash",
+              "input": {"command": "rg needle"}}]),
+         search_tool="rg needle", cwd="/home/u/proj")
+    # tool_result row owned by tu1 (folds into the assistant turn's anchor)
+    _msg(c, id=3, session_id="s1", uuid="tr", source_path="f.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-01T00:00:02Z", entry_type="tool_result",
+         text="found needle line", source_tool_use_id="tu1",
+         blocks_json=_json.dumps([
+             {"kind": "tool_result", "tool_use_id": "tu1",
+              "text": "found needle line"}]),
+         search_tool="found needle line", cwd="/home/u/proj")
+    # later human row matching 'needle' in prose
+    _msg(c, id=4, session_id="s1", uuid="h2", source_path="f.jsonl", byte_offset=3,
+         timestamp_utc="2026-06-01T00:00:03Z", entry_type="human",
+         text="recheck the needle", cwd="/home/u/proj")
+
+
+def test_find_returns_rendered_turn_anchors_in_document_order():
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _seed_find_session(c)
+    out = cq.find_in_conversation(c, "s1", "needle")
+    assert out is not None
+    # anchor 0 = the assistant turn (the tool_result folds into it; F1),
+    # badged 'tool'; anchor 1 = the later human prose turn (unbadged).
+    assert len(out["anchors"]) == 2
+    assert out["anchors"][0]["uuid"] == "as"
+    assert out["anchors"][0]["match_kinds"] == ["tool"]
+    assert out["anchors"][1]["uuid"] == "h2"
+    assert out["anchors"][1]["match_kinds"] == []
+    assert out["total"] == 2 and out["anchors_truncated"] is False
+    assert out["mode"] == "fts" and out["search_depth"] == "full"
+
+
+def test_find_collapses_multi_member_matches_to_one_anchor():
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    # two assistant fragments sharing (msg_id, req_id): u1 matches in text,
+    # u2 matches in search_thinking → ONE anchor, ["thinking"] (prose unbadged).
+    _msg(c, id=1, session_id="s1", uuid="u1", source_path="f.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="needle prose", model=_MODEL, msg_id="m1", req_id="r1",
+         cwd="/home/u/proj")
+    _msg(c, id=2, session_id="s1", uuid="u2", source_path="f.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="", model=_MODEL, msg_id="m1", req_id="r1",
+         search_thinking="needle thought", cwd="/home/u/proj")
+    out = cq.find_in_conversation(c, "s1", "needle")
+    assert len(out["anchors"]) == 1
+    assert out["anchors"][0]["uuid"] == "u1"        # prose fragment is the anchor
+    assert out["anchors"][0]["match_kinds"] == ["thinking"]
+    assert out["total"] == 1
+
+
+def test_find_cap_and_truncated_flag():
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    for i in range(12):
+        _msg(c, id=i + 1, session_id="s1", uuid=f"u{i}", source_path="f.jsonl",
+             byte_offset=i, timestamp_utc=f"2026-06-01T00:00:{i:02d}Z",
+             entry_type="human", text=f"needle {i}", cwd="/home/u/proj")
+    out = cq.find_in_conversation(c, "s1", "needle", cap=10)
+    assert len(out["anchors"]) == 10
+    assert out["anchors_truncated"] is True
+    assert out["total"] == 12
+
+
+def test_find_unknown_session_returns_none():
+    c = _conn()
+    assert cq.find_in_conversation(c, "nope", "x") is None
+
+
+def test_find_empty_query_returns_empty():
+    c = _conn()
+    _seed_find_session(c)
+    out = cq.find_in_conversation(c, "s1", "   ")
+    assert out is not None
+    assert out["anchors"] == [] and out["total"] == 0
+
+
+def test_find_kind_scoping_and_like_mode():
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _seed_find_session(c)
+    # kind="thinking" matches nothing here (no thinking column carries 'needle').
+    out = cq.find_in_conversation(c, "s1", "needle", kind="thinking")
+    assert out["anchors"] == []
+    # kind="tools" matches only the assistant-folded tool row → its anchor.
+    tools = cq.find_in_conversation(c, "s1", "needle", kind="tools")
+    assert [a["uuid"] for a in tools["anchors"]] == ["as"]
+    # LIKE mode returns the same anchors as FTS for a simple needle.
+    likeout = cq.find_in_conversation(c, "s1", "needle", fts_available=False)
+    assert [a["uuid"] for a in likeout["anchors"]] == ["as", "h2"]
+    assert likeout["mode"] == "like"
+
+
+def test_find_prose_only_mode_blocks_tool_thinking():
+    c = _legacy_conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _msg(c, id=1, session_id="s1", uuid="hu", source_path="f.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="needle prompt", cwd="/home/u/proj")
+    out = cq.find_in_conversation(c, "s1", "needle", kind="all")
+    assert out["search_depth"] == "prose-only"
+    assert [a["uuid"] for a in out["anchors"]] == ["hu"]
+    blocked = cq.find_in_conversation(c, "s1", "needle", kind="tools")
+    assert blocked["anchors"] == [] and blocked["total"] == 0
