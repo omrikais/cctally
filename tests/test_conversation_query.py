@@ -34,13 +34,16 @@ def _msg(c, **kw):
     row["search_tool"] = kw.get("search_tool", "")
     row["search_thinking"] = kw.get("search_thinking", "")
     row["search_aux"] = kw.get("search_aux", "")
+    row["id"] = kw.get("id")   # explicit rowid when a test pins it (else autoinc)
+    id_col = "id," if row["id"] is not None else ""
+    id_val = ":id," if row["id"] is not None else ""
     c.execute(
         "INSERT OR IGNORE INTO conversation_messages "
-        "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+        f"({id_col}session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
         " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,is_sidechain,"
         " source_tool_use_id,stop_reason,attribution_skill,attribution_plugin,"
         " search_tool,search_thinking,search_aux)"
-        " VALUES(:session_id,:uuid,:parent_uuid,:source_path,:byte_offset,"
+        f" VALUES({id_val}:session_id,:uuid,:parent_uuid,:source_path,:byte_offset,"
         ":timestamp_utc,:entry_type,:text,:blocks_json,:model,:msg_id,:req_id,"
         ":cwd,:git_branch,:is_sidechain,:source_tool_use_id,:stop_reason,"
         ":attribution_skill,:attribution_plugin,"
@@ -2015,3 +2018,83 @@ def test_locate_media_both_modes(tmp_path):
     assert cq.locate_media(c, "s1", tool_use_id="tu1", index=9) is None
     assert cq.locate_media(c, "s1", tool_use_id="nope", index=0) is None
     assert cq.locate_media(c, "s1", uuid="nope", index=0) is None
+
+
+# === #177 S6 Task 1b: split multi-column conversation FTS shape ===
+
+def _legacy_conn():
+    """Build an OLD-shape cache DB: single-column conversation_fts(text) + the
+    legacy conversation_fts_aux(search_aux) + legacy trigger sets + the
+    migration-010 pending flag set. Models a pre-S6 install whose sync-side swap
+    has not yet run. The base table still gains search_tool/search_thinking
+    (idempotent column-adds) so backfill UPDATEs target real columns."""
+    c = sqlite3.connect(":memory:")
+    db._apply_cache_schema(c)
+    if not db._fts5_available(c):
+        return c
+    # Tear the split shape down and rebuild the legacy two-table shape.
+    db._drop_conversation_fts_triggers(c)
+    c.execute("DROP TABLE IF EXISTS conversation_fts")
+    c.execute("DROP TABLE IF EXISTS conversation_fts_aux")
+    c.execute("CREATE VIRTUAL TABLE conversation_fts "
+              "USING fts5(text, content='conversation_messages', content_rowid='id')")
+    db._create_conversation_fts_aux_table(c)
+    db._create_conversation_fts_legacy_triggers(c)
+    db._set_cache_meta(c, "conversation_search_split_pending", "1")
+    c.commit()
+    return c
+
+
+def test_fresh_schema_has_split_fts():
+    c = _conn()
+    if not db._fts5_available(c):
+        import pytest; pytest.skip("sqlite build lacks FTS5")
+    cols = [r[1] for r in c.execute("PRAGMA table_info(conversation_fts)")]
+    assert cols == ["text", "search_tool", "search_thinking"]
+    assert c.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='conversation_fts_aux'"
+    ).fetchone() is None
+
+
+def test_split_triggers_index_all_three_columns():
+    c = _conn()
+    if not db._fts5_available(c):
+        import pytest; pytest.skip("sqlite build lacks FTS5")
+    _msg(c, id=1, session_id="s", uuid="u1", source_path="f", byte_offset=0,
+         entry_type="assistant", text="alpha",
+         search_tool="beta", search_thinking="gamma")
+    for col, needle in (("text", "alpha"), ("search_tool", "beta"),
+                        ("search_thinking", "gamma")):
+        got = c.execute(
+            "SELECT rowid FROM conversation_fts WHERE conversation_fts MATCH ?",
+            (f"{{{col}}}: {needle}",)).fetchall()
+        assert got == [(1,)], (col, got)
+
+
+def test_split_fts_rebuildable_external_content_column_names():
+    # External-content FTS5 binds columns BY NAME — a mismatch creates fine but
+    # breaks 'rebuild'. This pins the names match content-table columns.
+    c = _conn()
+    if not db._fts5_available(c):
+        import pytest; pytest.skip("sqlite build lacks FTS5")
+    _msg(c, id=1, session_id="s", uuid="u1", source_path="f", byte_offset=0,
+         entry_type="assistant", text="alpha",
+         search_tool="beta", search_thinking="gamma")
+    c.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('rebuild')")
+    c.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('integrity-check')")
+    assert c.execute(
+        "SELECT rowid FROM conversation_fts WHERE conversation_fts MATCH '{search_tool}: beta'"
+    ).fetchall() == [(1,)]
+
+
+def test_legacy_shape_left_alone_when_pending():
+    c = _legacy_conn()
+    if not db._fts5_available(c):
+        import pytest; pytest.skip("sqlite build lacks FTS5")
+    db._apply_cache_schema(c)   # re-apply must NOT swap the legacy shape
+    cols = [r[1] for r in c.execute("PRAGMA table_info(conversation_fts)")]
+    assert cols == ["text"]     # untouched until the sync-side swap
+    assert c.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='conversation_fts_aux'"
+    ).fetchone() is not None
+    assert db._conversation_fts_is_split(c) is False

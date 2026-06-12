@@ -2427,6 +2427,23 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     # would itself error), set a persisted flag, and let search fall back to
     # LIKE. Spec §1. Idempotent (IF NOT EXISTS).
     if _fts5_available(conn):
+        # #177 S6: if a LEGACY conversation_fts(text) shape is already present
+        # (a pre-S6 install whose migration-010 backfill/swap has not yet run),
+        # leave EVERYTHING untouched — the legacy table, the legacy aux table,
+        # and the legacy triggers. The sync-side swap (_swap_conversation_fts_to_
+        # split, under the cache.db.lock flock) owns the transition; re-applying
+        # the schema must NOT race it or partially mutate the shape. A fresh
+        # install (no conversation_fts) and an already-split shape both fall
+        # through to the create/recover path below.
+        legacy_present = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='conversation_fts'"
+            ).fetchone() is not None
+            and not _conversation_fts_is_split(conn))
+        if legacy_present:
+            conn.commit()
+            return
         try:
             # Recovery (spec §1/P2): if a PRIOR run marked FTS unavailable,
             # conversation_messages rows were ingested (by sync_cache / the
@@ -2435,43 +2452,34 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             # rows. Detect that BEFORE clearing the flag so we can rebuild the
             # external-content index from conversation_messages below. A fresh
             # install never sets the flag, so this stays False and no rebuild
-            # runs (the triggers index rows incrementally as they arrive).
+            # runs (the triggers index rows incrementally as they arrive). This
+            # is ALSO the FTS5-unavailable migration-010 recovery seam: the
+            # backfill ran the base-column UPDATEs but skipped the vtable DDL, so
+            # the first FTS-capable open lands the split shape + rebuilds here.
             recovering = conn.execute(
                 "SELECT 1 FROM cache_meta WHERE key='fts5_unavailable'"
             ).fetchone() is not None
-            conn.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS conversation_fts "
-                "USING fts5(text, content='conversation_messages', content_rowid='id')")
-            # #177: the aux external-content index is ALL-OR-NOTHING with the
-            # prose FTS under the SINGLE fts5_unavailable flag — created in this
-            # SAME try-envelope (via the _create_conversation_fts_aux_table seam,
-            # which tests monkeypatch to simulate an aux-create failure AFTER the
-            # prose create succeeded), so ANY OperationalError below drops BOTH
-            # tables + BOTH trigger sets (the except arm). A live aux trigger over
-            # a missing conversation_fts_aux would roll back the shared
-            # conversation_messages write transaction (which also carries cost
-            # ingest into session_entries). It is NOT given its own guarded block
-            # or its own flag.
-            _create_conversation_fts_aux_table(conn)
-            # Trigger DDL lives in ONE place (_CONV_FTS_TRIGGER_DDL +
-            # _CONV_FTS_AUX_TRIGGER_DDL) so this initial create and the #138
-            # storm-free full-clear (clear_conversation_messages, which drops +
-            # recreates BOTH trigger sets) can never drift.
+            # #177 S6: the single consolidated multi-column external-content
+            # table replaces the old prose + aux pair. Column names match the
+            # content table BY NAME (external-content rule).
+            conn.execute(_CONV_FTS_SPLIT_DDL)
+            # Trigger DDL lives in ONE place (_CONV_FTS_TRIGGER_DDL) so this
+            # initial create and the #138 storm-free full-clear
+            # (clear_conversation_messages, which drops + recreates the trigger
+            # set) can never drift.
             _create_conversation_fts_triggers(conn)
             if recovering:
-                # Repopulate the freshly-(re)created indexes from the base table
+                # Repopulate the freshly-(re)created index from the base table
                 # so pre-recovery history is searchable. Cheap no-op when
                 # conversation_messages is empty.
                 conn.execute(
                     "INSERT INTO conversation_fts(conversation_fts) VALUES('rebuild')")
-                conn.execute(
-                    "INSERT INTO conversation_fts_aux(conversation_fts_aux) VALUES('rebuild')")
             conn.execute("DELETE FROM cache_meta WHERE key='fts5_unavailable'")
         except sqlite3.OperationalError:
-            # partial create cleanup, then mark unavailable. _drop drops BOTH
-            # prose + aux trigger sets (#177), and we drop BOTH vtables, so a
-            # failed aux create can't leave a live aux trigger over a missing
-            # table.
+            # partial create cleanup, then mark unavailable. _drop drops the
+            # split trigger set (and any legacy aux trigger names, harmlessly),
+            # and we drop both possible vtables, so a failed create can't leave a
+            # live trigger over a missing table.
             _drop_conversation_fts_triggers(conn)
             try:
                 conn.execute("DROP TABLE IF EXISTS conversation_fts")
@@ -2517,6 +2525,28 @@ def _set_cache_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
+# #177 S6: the consolidated multi-column external-content FTS5 table that
+# replaces the old conversation_fts(text) + conversation_fts_aux(search_aux)
+# pair. The three column names MUST match the conversation_messages columns BY
+# NAME (external-content FTS5 resolves columns through the content table by
+# name): a mismatch creates fine but breaks 'rebuild' + iterdump
+# ("no such column"). Fresh installs create this directly; existing installs
+# swap to it under the cache.db.lock flock via _swap_conversation_fts_to_split.
+_CONV_FTS_SPLIT_DDL = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS conversation_fts USING fts5("
+    "text, search_tool, search_thinking, "
+    "content='conversation_messages', content_rowid='id')"
+)
+
+
+def _conversation_fts_is_split(conn: sqlite3.Connection) -> bool:
+    """True if conversation_fts is the #177 S6 multi-column shape (carries the
+    ``search_tool`` column), False for the legacy single-column ``text`` shape or
+    an absent table."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(conversation_fts)")]
+    return "search_tool" in cols
+
+
 def _create_conversation_fts_aux_table(conn: sqlite3.Connection) -> None:
     """Create the #177 aux external-content FTS5 index over the ``search_aux``
     blob. A standalone module-level seam (NOT inlined in ``_apply_cache_schema``)
@@ -2543,16 +2573,26 @@ def _create_conversation_fts_aux_table(conn: sqlite3.Connection) -> None:
 # the initial create in _apply_cache_schema and the #138 storm-free full-clear
 # in clear_conversation_messages (which drops + recreates them) can never drift.
 # conv_fts_ad / conv_fts_au use the external-content `'delete'` idiom.
+# #177 S6: three-column trigger set for the consolidated conversation_fts. Same
+# trigger names (conv_fts_ai/ad/au) as the legacy single-column set so the swap
+# reuses them; the AU trigger now fires AFTER UPDATE OF text, search_tool,
+# search_thinking (the backfill UPDATEs search_tool/search_thinking, which the
+# OLD text-only AU did NOT fire — that invisibility is load-bearing, see
+# _consume_search_split, but it applies only while the legacy triggers are still
+# installed; once swapped, these fire on all three columns).
 _CONV_FTS_TRIGGER_DDL = (
     "CREATE TRIGGER IF NOT EXISTS conv_fts_ai AFTER INSERT ON conversation_messages "
-    "BEGIN INSERT INTO conversation_fts(rowid, text) VALUES (new.id, new.text); END",
+    "BEGIN INSERT INTO conversation_fts(rowid, text, search_tool, search_thinking) "
+    "VALUES (new.id, new.text, new.search_tool, new.search_thinking); END",
     "CREATE TRIGGER IF NOT EXISTS conv_fts_ad AFTER DELETE ON conversation_messages "
-    "BEGIN INSERT INTO conversation_fts(conversation_fts, rowid, text) "
-    "VALUES('delete', old.id, old.text); END",
-    "CREATE TRIGGER IF NOT EXISTS conv_fts_au AFTER UPDATE OF text ON conversation_messages "
-    "BEGIN INSERT INTO conversation_fts(conversation_fts, rowid, text) "
-    "VALUES('delete', old.id, old.text); "
-    "INSERT INTO conversation_fts(rowid, text) VALUES (new.id, new.text); END",
+    "BEGIN INSERT INTO conversation_fts(conversation_fts, rowid, text, search_tool, search_thinking) "
+    "VALUES('delete', old.id, old.text, old.search_tool, old.search_thinking); END",
+    "CREATE TRIGGER IF NOT EXISTS conv_fts_au "
+    "AFTER UPDATE OF text, search_tool, search_thinking ON conversation_messages "
+    "BEGIN INSERT INTO conversation_fts(conversation_fts, rowid, text, search_tool, search_thinking) "
+    "VALUES('delete', old.id, old.text, old.search_tool, old.search_thinking); "
+    "INSERT INTO conversation_fts(rowid, text, search_tool, search_thinking) "
+    "VALUES (new.id, new.text, new.search_tool, new.search_thinking); END",
 )
 # Drop by name (the body is irrelevant to DROP TRIGGER); reverse order is
 # cosmetic — order doesn't matter for independent triggers.
@@ -2577,16 +2617,43 @@ _CONV_FTS_AUX_TRIGGER_DDL = (
 )
 _CONV_FTS_AUX_TRIGGER_NAMES = ("conv_fts_aux_au", "conv_fts_aux_ad", "conv_fts_aux_ai")
 
+# #177 S6: the LEGACY single-column prose trigger set, retained ONLY so a
+# pre-swap install (and the legacy-shape test fixture) can stand up the old
+# conversation_fts(text) shape. Fresh installs + the post-swap shape use the
+# three-column _CONV_FTS_TRIGGER_DDL above. Same trigger names, so the swap's
+# DROP-by-name (_CONV_FTS_TRIGGER_NAMES) covers either generation.
+_CONV_FTS_LEGACY_TRIGGER_DDL = (
+    "CREATE TRIGGER IF NOT EXISTS conv_fts_ai AFTER INSERT ON conversation_messages "
+    "BEGIN INSERT INTO conversation_fts(rowid, text) VALUES (new.id, new.text); END",
+    "CREATE TRIGGER IF NOT EXISTS conv_fts_ad AFTER DELETE ON conversation_messages "
+    "BEGIN INSERT INTO conversation_fts(conversation_fts, rowid, text) "
+    "VALUES('delete', old.id, old.text); END",
+    "CREATE TRIGGER IF NOT EXISTS conv_fts_au AFTER UPDATE OF text ON conversation_messages "
+    "BEGIN INSERT INTO conversation_fts(conversation_fts, rowid, text) "
+    "VALUES('delete', old.id, old.text); "
+    "INSERT INTO conversation_fts(rowid, text) VALUES (new.id, new.text); END",
+)
+
 
 def _create_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
-    """Create BOTH external-content FTS5 sync trigger sets — prose
-    (conversation_fts) + aux (conversation_fts_aux, #177) — idempotent (each is
-    ``IF NOT EXISTS``). Single source of truth for the trigger DDL, shared by
-    ``_apply_cache_schema`` and ``clear_conversation_messages`` (#138). The
-    caller must have already created both ``conversation_fts`` and
-    ``conversation_fts_aux``; one call site creates both sets so they can never
-    drift."""
+    """Create the #177 S6 split conversation_fts(text, search_tool,
+    search_thinking) sync trigger set — idempotent (each is ``IF NOT EXISTS``).
+    Single source of truth for the trigger DDL, shared by ``_apply_cache_schema``
+    and ``clear_conversation_messages`` (#138). The caller must have already
+    created ``conversation_fts`` in the split shape (the consolidated table
+    replaced the old prose+aux pair, so there is no separate aux trigger set to
+    create)."""
     for stmt in _CONV_FTS_TRIGGER_DDL:
+        conn.execute(stmt)
+
+
+def _create_conversation_fts_legacy_triggers(conn: sqlite3.Connection) -> None:
+    """Create the LEGACY single-column prose + aux trigger sets over the
+    pre-#177-S6 conversation_fts(text) + conversation_fts_aux(search_aux) pair.
+    Used only to stand up the legacy shape (the migration swap drops these by
+    name and creates the split set). The caller must have created both legacy
+    tables."""
+    for stmt in _CONV_FTS_LEGACY_TRIGGER_DDL:
         conn.execute(stmt)
     for stmt in _CONV_FTS_AUX_TRIGGER_DDL:
         conn.execute(stmt)
@@ -2649,10 +2716,16 @@ def clear_conversation_messages(conn: sqlite3.Connection) -> None:
     _drop_conversation_fts_triggers(conn)
     conn.execute("DELETE FROM conversation_messages")
     conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('delete-all')")
-    # #177: the aux index is created all-or-nothing with the prose FTS, so when
-    # fts_unavailable is False BOTH vtables exist — reset BOTH the same storm-free
-    # way (triggers already dropped above, so the base DELETE touched neither).
-    conn.execute("INSERT INTO conversation_fts_aux(conversation_fts_aux) VALUES('delete-all')")
+    # #177 S6: the consolidated split table is the only FTS vtable on a swapped /
+    # fresh DB. A pre-swap legacy install still carries conversation_fts_aux, so
+    # reset it the same storm-free way ONLY when it physically exists (the swap
+    # drops it; a fresh/split DB never had it). Triggers were dropped above, so
+    # the base DELETE touched neither index.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_fts_aux'"
+    ).fetchone() is not None:
+        conn.execute(
+            "INSERT INTO conversation_fts_aux(conversation_fts_aux) VALUES('delete-all')")
     _create_conversation_fts_triggers(conn)
 
 
