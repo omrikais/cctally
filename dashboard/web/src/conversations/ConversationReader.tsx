@@ -359,13 +359,40 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         setForcedOpenKey(null); // reset for the next jump (thread stays open via its latch)
         return;
       }
-      // No ref. Either the target just paged in (its MessageItem ref attaches on
-      // React's NEXT commit — the detail?.items.length re-fire handles that), OR
-      // it lives inside a COLLAPSED subagent thread (members are ref-less while
-      // closed). For the collapsed case, force the owning thread open: `open` is
-      // derived from forceOpen so it opens in the same commit, the member's ref
-      // attaches, and this effect re-fires on the forcedOpenKey dep to scroll via
-      // the branch above.
+      // No ref. Three reasons the target's element is absent:
+      //
+      //   (1) It just paged in (its MessageItem ref attaches on React's NEXT
+      //       commit — the detail?.items.length re-fire handles that).
+      //   (2) The current focus mode HIDES it — a non-`all` mode coalesces the
+      //       node into a `hidden_run` marker, so it renders no MessageItem and
+      //       never attaches a ref, regardless of any force-open. A find-jump
+      //       (the find bar dispatches OPEN_CONVERSATION {jump} straight through
+      //       this effect, bypassing jumpNext's reset) onto such a turn must
+      //       escape the filter the same way jump-to-next does (spec §4 / §5):
+      //       reset to `all`, then let the effect re-run and land the jump.
+      //   (3) It lives inside a COLLAPSED subagent thread (members are ref-less
+      //       while closed) but is otherwise mode-visible — force the owning
+      //       thread open so the member's ref attaches.
+      //
+      // (2) MUST be checked before (3): a mode-hidden node renders no thread at
+      // all, so force-opening can't help it; whereas a node inside a collapsed
+      // BUT mode-visible subagent (e.g. an erroring sidechain under Errors mode)
+      // passes nodeVisible and falls through to the force-open branch. The two
+      // are disjoint by construction — nodeVisible decides which applies.
+      const mode = focusModeRef.current;
+      if (mode !== 'all') {
+        // Reuse jumpNext's EXACT hidden-target predicate: find the target's
+        // RenderNode in the unfiltered `groups` (by anchor uuid or any member
+        // uuid for a folded/sidechain target) and test nodeVisible under the
+        // mode. A node missing from `groups` here means the target paged in but
+        // its node isn't built yet — leave it to the (1) re-fire, don't reset.
+        const node = groupsRef.current.find((n) => nodeUuid(n) === jump.uuid
+          || (n.kind === 'item' && n.item.member_uuids.includes(jump.uuid)));
+        if (node != null && !nodeVisible(node, mode)) {
+          dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
+          return; // re-run under `all`: the node renders, its ref attaches, scroll
+        }
+      }
       const targetItem = detail.items.find((it) => it.member_uuids.includes(jump.uuid));
       if (targetItem && targetItem.subagent_key != null) {
         if (forcedOpenKey !== targetItem.subagent_key) {
@@ -384,11 +411,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // hasMore stays in deps so the give-up clear fires on the edge where the final
     // page appends 0 items (items.length unchanged) but flips the cursor.
     // forcedOpenKey re-fires the effect once a force-opened thread has attached the
-    // target's ref. No infinite loop: loadUntil/fetchNext serialize via
-    // loadingMoreRef, hasMore transitions a bounded number of times, and the
-    // forcedOpenKey path either resolves (clears) or settles to a stable key.
+    // target's ref. focusMode re-fires it once the mode-hidden fallback resets to
+    // `all` — the hidden target's node renders + its ref attaches in that commit,
+    // and this re-fire scrolls via the branch above. No infinite loop:
+    // loadUntil/fetchNext serialize via loadingMoreRef, hasMore transitions a
+    // bounded number of times, the forcedOpenKey path either resolves (clears) or
+    // settles to a stable key, and the focusMode reset is one-way (non-`all` →
+    // `all`) so the mode-hidden branch can fire at most once per jump.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jump, sessionId, detail?.items.length, hasMore, forcedOpenKey]);
+  }, [jump, sessionId, detail?.items.length, hasMore, forcedOpenKey, focusMode]);
 
   // Cancel any pending highlight-removal timer on unmount only (NOT on every
   // jump-effect re-run — that would strip the flash the instant the successful

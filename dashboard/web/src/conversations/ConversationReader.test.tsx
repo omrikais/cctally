@@ -402,6 +402,47 @@ describe('ConversationReader', () => {
     expect(container.querySelector('[data-uuid="sa2"]')!.classList.contains('conv-item--jumped')).toBe(true);
     await waitFor(() => expect(getState().conversationJump).toBeNull());
   });
+
+  it('a find-jump to a focus-mode-hidden turn resets the mode to `all`, then lands the jump (spec §4)', async () => {
+    // Focus mode `prompts` keeps human turns and hides assistant turns. A find
+    // match on the hidden assistant turn 'a1' must escape the filter the same way
+    // jump-to-next does: reset to `all`, re-render, then scroll + flash. Without
+    // the jump-effect mode-reset the target never renders (it coalesces into a
+    // `hidden_run` marker, ref-less), so the jump silently no-ops and clears once
+    // pagination is exhausted (the regression this pins).
+    //
+    // NOTE: the OPEN_CONVERSATION reducer ONLY blanket-resets the focus mode on a
+    // GENUINE session switch (different sessionId). A same-session find-jump (this
+    // case) preserves the mode by design — the per-jump hidden check is the
+    // caller/effect's job — so the reset proven here can ONLY come from the jump
+    // effect's mode-hidden fallback. Hence we select the session FIRST, so the
+    // find-jump below is same-session and the reducer does not mask the fix.
+    mockFetchOnce(detail([
+      makeItem({ uuid: 'h1', kind: 'human', text: 'prompt one' }),
+      makeItem({ uuid: 'a1', kind: 'assistant', text: '', blocks: [] } as never),
+    ]));
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+
+    act(() => { dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' }); });
+    act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' }); });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="h1"]')).not.toBeNull());
+    // The assistant target is hidden behind a hidden_run marker in prompts mode.
+    expect(container.querySelector('[data-uuid="a1"]')).toBeNull();
+
+    // FindBar drives a same-session OPEN_CONVERSATION jump (expand_details set
+    // when the match was inside a tool/thinking block).
+    act(() => { dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'a1', expand_details: false } }); });
+
+    // The mode escapes back to `all` so the hidden assistant turn renders again.
+    await waitFor(() => expect(getState().convFocusMode).toBe('all'));
+    await waitFor(() => {
+      expect(container.querySelector('[data-uuid="a1"]')).not.toBeNull();
+    });
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    expect(container.querySelector('[data-uuid="a1"]')!.classList.contains('conv-item--jumped')).toBe(true);
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+  });
 });
 
 describe('ConversationReader live-tail scroll (#175 F4)', () => {
