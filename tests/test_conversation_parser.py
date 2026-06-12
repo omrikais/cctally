@@ -644,3 +644,83 @@ def test_attach_task_meta_string_shape_ignores_unrelated_text():
                "text": "Some unrelated tool output mentioning Task #7 mid-sentence"}]
     lc._attach_task_meta(blocks, {"toolUseResult": None})
     assert "task_id" not in blocks[0] and "task_list" not in blocks[0]
+
+
+# --- #177 S3: additive Bash stderr/interrupted capture --------------------
+# Self-identifying off the Bash-shaped toolUseResult ({stdout,stderr,...}); we
+# store only the DELTA over the merged result.text (stderr + interrupted), never
+# stdout (result.text already == stdout+stderr, so storing it would double the
+# payload). Parser-private keys bash_stderr/bash_interrupted are popped in the
+# query layer's Phase 1, so they never leak into emitted/orphan blocks.
+def test_attach_bash_streams_captures_stderr_only_not_interrupted():
+    blocks = [{"kind": "tool_result", "tool_use_id": "toolu_bash1",
+               "text": "out\nboom", "is_error": True}]
+    obj = {"toolUseResult": {"stdout": "out\n", "stderr": "boom",
+                             "interrupted": False}}
+    lc._attach_bash_streams(blocks, obj)
+    assert blocks[0]["bash_stderr"] == "boom"
+    assert "bash_interrupted" not in blocks[0]   # interrupted False -> not stamped
+
+
+def test_attach_bash_streams_captures_interrupted():
+    blocks = [{"kind": "tool_result", "tool_use_id": "toolu_bash2", "text": "x"}]
+    obj = {"toolUseResult": {"stdout": "x", "stderr": "", "interrupted": True}}
+    lc._attach_bash_streams(blocks, obj)
+    # empty stderr -> no bash_stderr; interrupted True -> stamped
+    assert "bash_stderr" not in blocks[0]
+    assert blocks[0]["bash_interrupted"] is True
+
+
+def test_attach_bash_streams_noop_on_non_bash_tooluseresult():
+    # An AskUserQuestion-shaped toolUseResult (no stdout/stderr keys) must NOT
+    # add any bash_* keys.
+    blocks = [{"kind": "tool_result", "tool_use_id": "t", "text": "x"}]
+    lc._attach_bash_streams(blocks, {"toolUseResult": {"answers": {"Q": "A"}}})
+    assert "bash_stderr" not in blocks[0] and "bash_interrupted" not in blocks[0]
+
+
+def test_attach_bash_streams_noop_on_empty_stderr_and_not_interrupted():
+    blocks = [{"kind": "tool_result", "tool_use_id": "t", "text": "x"}]
+    lc._attach_bash_streams(blocks, {"toolUseResult": {
+        "stdout": "x", "stderr": "", "interrupted": False}})
+    assert "bash_stderr" not in blocks[0] and "bash_interrupted" not in blocks[0]
+
+
+def test_attach_bash_streams_requires_single_result_block():
+    blocks = [{"kind": "tool_result", "tool_use_id": "a"},
+              {"kind": "tool_result", "tool_use_id": "b"}]
+    lc._attach_bash_streams(blocks, {"toolUseResult": {
+        "stdout": "o", "stderr": "boom"}})
+    assert all("bash_stderr" not in b for b in blocks)   # ambiguous -> no-op
+
+
+def test_attach_bash_streams_bounds_pathological_stderr():
+    big = "e" * (lc._TOOL_RESULT_CAP + 500)
+    blocks = [{"kind": "tool_result", "tool_use_id": "t"}]
+    lc._attach_bash_streams(blocks, {"toolUseResult": {
+        "stdout": "o", "stderr": big}})
+    assert len(blocks[0]["bash_stderr"]) == lc._TOOL_RESULT_CAP
+
+
+def test_attach_bash_streams_no_stdout_stored():
+    # We deliberately never store stdout (result.text already covers it).
+    blocks = [{"kind": "tool_result", "tool_use_id": "t", "text": "out\nboom"}]
+    lc._attach_bash_streams(blocks, {"toolUseResult": {
+        "stdout": "out\n", "stderr": "boom", "interrupted": False}})
+    assert "bash_stdout" not in blocks[0] and "stdout" not in blocks[0]
+
+
+def test_iter_message_rows_attaches_bash_streams_at_call_site():
+    # Full ingest path: the call site in _normalize's tool_result branch must
+    # fire _attach_bash_streams (mirrors test_tool_result_captures_agent_id_…).
+    fh = _jsonl({"type": "user", "uuid": "u1", "sessionId": "s1", "timestamp": "t",
+                 "toolUseResult": {"stdout": "out\n", "stderr": "boom",
+                                   "interrupted": True},
+                 "message": {"role": "user",
+                             "content": [{"type": "tool_result",
+                                          "content": "out\nboom",
+                                          "tool_use_id": "tu1", "is_error": True}]}})
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    tr = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_result"][0]
+    assert tr["bash_stderr"] == "boom"
+    assert tr["bash_interrupted"] is True

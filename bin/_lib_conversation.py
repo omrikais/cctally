@@ -106,6 +106,7 @@ def _normalize(obj, t, offset):
         entry_type = TOOL_RESULT
         _attach_subagent_result(blocks, obj)   # #166: record-level toolUseResult
         _attach_ask_answers(blocks, obj)       # #177 S2: AskUserQuestion answers
+        _attach_bash_streams(blocks, obj)      # #177 S3: Bash stderr/interrupted
         _attach_task_meta(blocks, obj)         # task checklist identity
         # tool_result rows are stored but NOT indexed as prose (spec §2). A
         # user line that mixes a text block with a tool_result block must not
@@ -287,6 +288,35 @@ def _attach_ask_answers(blocks, obj):
     if isinstance(anno, dict) and anno:
         bounded_anno, _ = _bound_input(anno)
         results[0]["ask_annotations"] = bounded_anno
+
+
+def _attach_bash_streams(blocks, obj):
+    """Stash a Bash tool_result's structured stderr + interrupted onto its single
+    tool_result block (#177 S3). Self-identifying: fires only when toolUseResult
+    is a dict carrying a ``stdout``/``stderr`` key — a shape distinctive to Bash —
+    so no cross-record tool-name lookup is needed (same posture as
+    _attach_ask_answers' ``answers`` gate). We do NOT store stdout: the existing
+    ``result.text`` already equals stdout+stderr (the merged Bash output), so
+    storing stdout would roughly double the at-rest payload; the stdout/stderr
+    split is derived client-side by stripping the stderr suffix.
+
+    Parser-private keys ``bash_stderr`` / ``bash_interrupted`` are popped in the
+    query layer's Phase 1 so they never leak into emitted/orphan blocks. stderr is
+    bounded with the same cap as result.text (_TOOL_RESULT_CAP). Empty stderr +
+    not-interrupted is a no-op (the common case — stderr is empty in ~99% of
+    results), keeping the additive contract: absent on every non-Bash result and
+    on old rows. Same exactly-one-result-block guard as _attach_subagent_result."""
+    tur = obj.get("toolUseResult")
+    if not isinstance(tur, dict) or ("stdout" not in tur and "stderr" not in tur):
+        return
+    results = [b for b in blocks if b.get("kind") == "tool_result"]
+    if len(results) != 1:
+        return
+    stderr = tur.get("stderr")
+    if isinstance(stderr, str) and stderr:
+        results[0]["bash_stderr"] = stderr[:_TOOL_RESULT_CAP]
+    if bool(tur.get("interrupted")):
+        results[0]["bash_interrupted"] = True
 
 
 # Subagent Task tools record toolUseResult=null and put the identity in the
