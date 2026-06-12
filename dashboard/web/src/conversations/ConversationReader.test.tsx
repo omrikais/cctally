@@ -778,4 +778,34 @@ describe('ConversationReader keyboard navigation (G3)', () => {
     expect(thread.children[0]).toHaveClass('conv-item--focused');
     expect(thread.children[1]).not.toHaveClass('conv-item--focused');
   });
+
+  // #177 S5 — the `o` key toggles the outline open flag; the toggle button in
+  // the reader head mirrors the flag via aria-pressed and dispatches the same.
+  it('o toggles the outline open flag', async () => {
+    await renderInConversations([makeItem({ uuid: 'h1' })]);
+    const before = getState().convOutlineOpen;
+    press('o');
+    expect(getState().convOutlineOpen).toBe(!before);
+    press('o');
+    expect(getState().convOutlineOpen).toBe(before);
+  });
+
+  it('o is inert while a modal is open (modal guard)', async () => {
+    await renderInConversations([makeItem({ uuid: 'h1' })]);
+    const before = getState().convOutlineOpen;
+    act(() => { dispatch({ type: 'OPEN_MODAL', kind: 'session' }); });
+    press('o');
+    expect(getState().convOutlineOpen).toBe(before); // unchanged
+  });
+
+  it('the reader-head outline toggle reflects + flips the open flag', async () => {
+    const { container } = await renderInConversations([makeItem({ uuid: 'h1' })]);
+    const btn = container.querySelector<HTMLButtonElement>('.conv-outline-toggle')!;
+    expect(btn).not.toBeNull();
+    const before = getState().convOutlineOpen;
+    expect(btn.getAttribute('aria-pressed')).toBe(String(before));
+    fireEvent.click(btn);
+    expect(getState().convOutlineOpen).toBe(!before);
+    await waitFor(() => expect(btn.getAttribute('aria-pressed')).toBe(String(!before)));
+  });
 });

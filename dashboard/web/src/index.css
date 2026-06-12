@@ -4646,6 +4646,155 @@ mark.current {
   overflow: hidden;
   margin-bottom: 16px;
 }
+/* #177 S5 §3 — when the outline panel is open, the two-column grid grows a
+   third column on the reader's right. Closed → back to two columns (the panel
+   is simply not rendered). */
+.conv-view--outline {
+  grid-template-columns: minmax(280px, 340px) 1fr minmax(230px, 290px);
+}
+
+/* ---- Outline sidebar + stats overview (#177 S5 §3) ---------------- */
+.conv-outline {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  overflow-y: auto;
+}
+.conv-outline-placeholder {
+  padding: 14px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-style: italic;
+}
+/* Stats card — "session at a glance" atop the list. */
+.conv-outline-stats {
+  flex: 0 0 auto;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel-bg-2);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.conv-outline-stats-row { margin-top: 4px; }
+.conv-outline-stats-row:first-child { margin-top: 0; }
+.conv-outline-stats-turns { color: var(--text); font-size: 12.5px; }
+.conv-outline-stats-strong { color: var(--text); font-weight: 700; }
+.conv-outline-stats-models,
+.conv-outline-stats-tools {
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* error row — a button styled as a stat line; reuses the danger accent. */
+.conv-outline-stats-errors {
+  display: block;
+  width: 100%;
+  text-align: left;
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--accent-red);
+  cursor: pointer;
+}
+.conv-outline-stats-errors:hover { text-decoration: underline; }
+.conv-outline-stats-errors:disabled { cursor: default; opacity: 0.7; text-decoration: none; }
+/* Navigable landmark list. */
+.conv-outline-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+}
+.conv-outline-list li { margin: 0; padding: 0; }
+.conv-outline-entry {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  text-align: left;
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  border-radius: 5px;
+  padding: 5px 7px;
+  cursor: pointer;
+}
+.conv-outline-entry:hover { background: var(--panel-bg-2); color: var(--text); }
+.conv-outline-entry:focus-visible { outline: none; border-color: var(--accent-blue); }
+.conv-outline-entry-glyph {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 15px; height: 15px;
+  color: var(--text-faint);
+}
+.conv-outline-entry-glyph .conv-ico { width: 15px; height: 15px; vertical-align: 0; }
+.conv-outline-entry-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conv-outline-entry-tools { flex: 0 0 auto; color: var(--text-faint); }
+.conv-outline-entry--human { font-weight: 600; color: var(--text); }
+.conv-outline-entry--subagent { color: var(--accent-magenta); }
+.conv-outline-entry--subagent .conv-outline-entry-glyph { color: var(--accent-magenta); }
+.conv-outline-entry--error,
+.conv-outline-entry--error .conv-outline-entry-glyph { color: var(--accent-red); }
+.conv-outline-entry--nested {
+  padding-left: 22px;
+  font-style: italic;
+  opacity: 0.75;
+}
+.conv-outline-entry[aria-current="true"] {
+  background: var(--panel-bg-2);
+  border-color: var(--accent-blue);
+  color: var(--text);
+}
+
+/* Reader-head outline toggle button. */
+.conv-outline-toggle {
+  float: right;
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+  margin-left: 8px;
+}
+.conv-outline-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-outline-toggle[aria-pressed="true"] {
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+/* Mobile slide-over entrance; suppressed under prefers-reduced-motion. */
+@keyframes conv-outline-slide-in {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .conv-outline-sheet { animation: none; }
+}
 
 /* ---- Rail (browse list + cross-session search) -------------------- */
 .conv-rail {
@@ -5887,6 +6036,36 @@ mark.current {
   #root .conv-reader-body {
     padding: 10px 12px;
     gap: 10px;
+  }
+  /* #177 S5 — below the mobile breakpoint the outline never renders as a
+     column; it slides in over the reader as a sheet with a dimming backdrop.
+     Re-prefixed with #root + each property respelled per the id-selector
+     specificity gotcha. */
+  #root .conv-outline-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    appearance: none;
+    border: none;
+    background: rgba(0, 0, 0, 0.5);
+    cursor: pointer;
+  }
+  #root .conv-outline-sheet {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 41;
+    width: min(86vw, 340px);
+    display: flex;
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
+    animation: conv-outline-slide-in 0.18s ease-out;
+  }
+  #root .conv-outline-sheet .conv-outline {
+    flex: 1 1 auto;
+    border-radius: 0;
+    border: none;
+    border-left: 1px solid var(--border-soft);
   }
   #root .conv-reader-thread {
     padding-left: 0;

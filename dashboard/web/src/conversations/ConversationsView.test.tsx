@@ -161,6 +161,36 @@ function detail() {
   };
 }
 
+// #177 S5 — outline endpoint fixture. Two turns (a human prompt + an assistant
+// reply) and a small stats block; cost matches detail() so parity holds.
+function outlinePayload() {
+  return {
+    session_id: 'sess-1',
+    stats: {
+      turns: { total: 2, human: 1, assistant: 1, tool_result: 0, meta: 0 },
+      tool_counts: { Read: 3, Bash: 1 },
+      error_count: 0,
+      models: { 'claude-opus-4': 1 },
+      duration_seconds: 300,
+      tokens: { input: 100, output: 50, cache_creation: 0, cache_read: 0 },
+      cost_usd: 1.25,
+    },
+    turns: [
+      {
+        uuid: 'h-uuid', kind: 'human', ts: '2026-05-13T09:05:00Z',
+        label: 'how does the lock work?', member_uuids: ['h-uuid'],
+        subagent_key: null, parent_uuid: null, is_sidechain: false,
+      },
+      {
+        uuid: 'a-uuid', kind: 'assistant', ts: '2026-05-13T09:10:00Z',
+        label: 'It uses an flock on cache.db.lock.', member_uuids: ['a-uuid'],
+        subagent_key: null, parent_uuid: null, is_sidechain: false,
+        model: 'claude-opus-4',
+      },
+    ],
+  };
+}
+
 // Route fetch by URL. Each route resolves a fresh Response so repeated
 // first-page loads (e.g. an SSE revalidate) don't exhaust a queue.
 function installRoutedFetch(): void {
@@ -169,6 +199,8 @@ function installRoutedFetch(): void {
     let body: unknown;
     if (u.includes('/api/conversation/search')) body = searchResult;
     else if (u.includes('/api/conversations')) body = conversationsPage;
+    // The /outline suffix MUST be matched before the catch-all detail route.
+    else if (u.includes('/outline')) body = outlinePayload();
     else if (u.includes('/api/conversation/')) body = detail();
     else body = {};
     return { ok: true, status: 200, json: async () => body } as Response;
@@ -331,6 +363,68 @@ describe('Conversations workspace integration', () => {
     fireEvent.click(back);
     expect(getState().selectedConversationId).toBeNull();
     await waitFor(() => expect(document.querySelector('.conv-rail')).not.toBeNull());
+  });
+
+  it('9: desktop outline column renders when open + selected, and the conv-view--outline modifier is applied', async () => {
+    localStorage.setItem('cctally.conv.outlineOpen', 'true');
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    render(<App />);
+
+    // The third grid column + the modifier class on the shell.
+    await waitFor(() => {
+      expect(document.querySelector('.conv-outline')).not.toBeNull();
+      expect(document.querySelector('.conv-view--outline')).not.toBeNull();
+    });
+    // Stats card surfaces the session-at-a-glance numbers.
+    await waitFor(() => {
+      const card = document.querySelector('.conv-outline-stats');
+      expect(card).not.toBeNull();
+      expect(card!.textContent).toContain('turns');
+    });
+    expect(screen.getByRole('navigation', { name: 'Session outline' })).not.toBeNull();
+    localStorage.removeItem('cctally.conv.outlineOpen');
+  });
+
+  it('10: the o key toggles the outline column off and back on', async () => {
+    localStorage.setItem('cctally.conv.outlineOpen', 'true');
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    render(<App />);
+
+    await waitFor(() => expect(document.querySelector('.conv-outline')).not.toBeNull());
+    // `o` toggles it closed.
+    act(() => { fireEvent.keyDown(document, { key: 'o' }); });
+    expect(getState().convOutlineOpen).toBe(false);
+    await waitFor(() => expect(document.querySelector('.conv-outline')).toBeNull());
+    expect(document.querySelector('.conv-view--outline')).toBeNull();
+    // `o` again toggles it back open.
+    act(() => { fireEvent.keyDown(document, { key: 'o' }); });
+    expect(getState().convOutlineOpen).toBe(true);
+    await waitFor(() => expect(document.querySelector('.conv-outline')).not.toBeNull());
+    localStorage.removeItem('cctally.conv.outlineOpen');
+  });
+
+  it('11: mobile renders the outline as a slide-over sheet (not a column) with a dismissing backdrop', async () => {
+    stubMobileMedia(true);
+    localStorage.setItem('cctally.conv.outlineOpen', 'true');
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    render(<App />);
+
+    // The sheet wrapper + backdrop appear; the panel rides inside the sheet.
+    await waitFor(() => {
+      expect(document.querySelector('.conv-outline-sheet')).not.toBeNull();
+      expect(document.querySelector('.conv-outline-sheet .conv-outline')).not.toBeNull();
+    });
+    const backdrop = document.querySelector<HTMLButtonElement>('.conv-outline-backdrop')!;
+    expect(backdrop).not.toBeNull();
+
+    // Clicking the backdrop dispatches TOGGLE → the sheet unmounts.
+    fireEvent.click(backdrop);
+    expect(getState().convOutlineOpen).toBe(false);
+    await waitFor(() => expect(document.querySelector('.conv-outline-sheet')).toBeNull());
+    localStorage.removeItem('cctally.conv.outlineOpen');
   });
 
   it('8: an SSE tick carrying transcriptsEnabled keeps the switcher; a tick omitting it hides it (SSE envelopes must carry the gate)', () => {

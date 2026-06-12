@@ -120,3 +120,79 @@ describe('conversation view state', () => {
     expect(getState().view).toBe('dashboard');
   });
 });
+
+// #177 S5 — outline panel store plumbing.
+describe('conversation outline / focus-mode state', () => {
+  it('convOutlineOpen defaults to true with no localStorage pref', () => {
+    localStorage.removeItem('cctally.conv.outlineOpen');
+    _resetForTests();
+    expect(getState().convOutlineOpen).toBe(true);
+  });
+
+  it('convOutlineOpen reads the persisted localStorage pref on init', () => {
+    localStorage.setItem('cctally.conv.outlineOpen', 'false');
+    _resetForTests();
+    expect(getState().convOutlineOpen).toBe(false);
+    localStorage.setItem('cctally.conv.outlineOpen', 'true');
+    _resetForTests();
+    expect(getState().convOutlineOpen).toBe(true);
+    localStorage.removeItem('cctally.conv.outlineOpen');
+  });
+
+  it('TOGGLE_CONV_OUTLINE flips the flag and persists it', () => {
+    localStorage.removeItem('cctally.conv.outlineOpen');
+    _resetForTests();
+    expect(getState().convOutlineOpen).toBe(true);
+    dispatch({ type: 'TOGGLE_CONV_OUTLINE' });
+    expect(getState().convOutlineOpen).toBe(false);
+    expect(localStorage.getItem('cctally.conv.outlineOpen')).toBe('false');
+    dispatch({ type: 'TOGGLE_CONV_OUTLINE' });
+    expect(getState().convOutlineOpen).toBe(true);
+    expect(localStorage.getItem('cctally.conv.outlineOpen')).toBe('true');
+    localStorage.removeItem('cctally.conv.outlineOpen');
+  });
+
+  it('convFocusMode defaults to "all" and SET_CONV_FOCUS_MODE sets it', () => {
+    _resetForTests();
+    expect(getState().convFocusMode).toBe('all');
+    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'errors' });
+    expect(getState().convFocusMode).toBe('errors');
+    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' });
+    expect(getState().convFocusMode).toBe('prompts');
+  });
+
+  it('convCurrentTurnUuid defaults to null and SET_CONV_CURRENT_TURN sets it', () => {
+    _resetForTests();
+    expect(getState().convCurrentTurnUuid).toBeNull();
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'u7' });
+    expect(getState().convCurrentTurnUuid).toBe('u7');
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: null });
+    expect(getState().convCurrentTurnUuid).toBeNull();
+  });
+
+  it('OPEN_CONVERSATION resets focus mode + current turn but NOT outlineOpen', () => {
+    localStorage.setItem('cctally.conv.outlineOpen', 'false');
+    _resetForTests();
+    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'errors' });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'u3' });
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc' });
+    const s = getState();
+    expect(s.convFocusMode).toBe('all');
+    expect(s.convCurrentTurnUuid).toBeNull();
+    expect(s.convOutlineOpen).toBe(false); // persisted pref untouched
+    localStorage.removeItem('cctally.conv.outlineOpen');
+  });
+
+  it('SELECT_CONVERSATION resets focus mode + current turn but NOT outlineOpen', () => {
+    _resetForTests();
+    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'chat' });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'u9' });
+    dispatch({ type: 'TOGGLE_CONV_OUTLINE' }); // → false
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 's5' });
+    const s = getState();
+    expect(s.convFocusMode).toBe('all');
+    expect(s.convCurrentTurnUuid).toBeNull();
+    expect(s.convOutlineOpen).toBe(false); // NOT reset by the switch
+    localStorage.removeItem('cctally.conv.outlineOpen');
+  });
+});

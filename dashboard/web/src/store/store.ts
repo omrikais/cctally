@@ -39,6 +39,10 @@ export type { SortOverride } from '../lib/tableSort';
 const PREFS_KEY = 'ccusage.dashboard.prefs';
 const FILTER_KEY = 'ccusage.dashboard.filter';
 const LEGACY_SORT_KEY = 'ccusage.dashboard.sort'; // retired — migrated on first load
+// #177 S5 — the conversation outline panel's open/closed state. New surface, so
+// it adopts the `cctally.*` namespace (NOT the legacy `ccusage.*` panel-prefs
+// blob). Read in loadInitial with try/catch, persisted on TOGGLE_CONV_OUTLINE.
+const CONV_OUTLINE_OPEN_KEY = 'cctally.conv.outlineOpen';
 
 export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'weekly' | 'monthly' | 'block' | 'daily' | 'alerts' | 'update' | 'projects' | 'cache-report';
 export type InputMode = null | 'filter' | 'search';
@@ -263,6 +267,13 @@ export interface UIState {
   selectedConversationId: string | null;
   conversationSearch: string;
   conversationJump: ConversationJump | null;
+  // #177 S5 — outline panel. `convOutlineOpen` is the only persisted bit of
+  // conversation UI state (localStorage `cctally.conv.outlineOpen`, default
+  // true on desktop); `convFocusMode` + `convCurrentTurnUuid` are transient
+  // per-session and reset on every conversation switch.
+  convOutlineOpen: boolean;
+  convFocusMode: 'all' | 'chat' | 'prompts' | 'errors';
+  convCurrentTurnUuid: string | null;
   openModal: ModalKind | null;
   openSessionId: string | null;
   openBlockStartAt: string | null;
@@ -466,12 +477,26 @@ function loadInitial(): UIState {
     // Brand-new user, no prefs, no legacy sort — schema is at CURRENT.
     prefs.panelOrderSchemaVersion = CURRENT_PANEL_ORDER_SCHEMA_VERSION;
   }
+  // #177 S5 — read the persisted outline-open pref; default true (desktop
+  // open). try/catch mirrors the prefs initializer above: a throwing or
+  // corrupt localStorage falls back to the default rather than crashing init.
+  let convOutlineOpen = true;
+  try {
+    const rawOutline = localStorage.getItem(CONV_OUTLINE_OPEN_KEY);
+    if (rawOutline === 'false') convOutlineOpen = false;
+    else if (rawOutline === 'true') convOutlineOpen = true;
+  } catch {
+    convOutlineOpen = true;
+  }
   return {
     snapshot: null,
     view: 'dashboard',
     selectedConversationId: null,
     conversationSearch: '',
     conversationJump: null,
+    convOutlineOpen,
+    convFocusMode: 'all',
+    convCurrentTurnUuid: null,
     openModal: null,
     openSessionId: null,
     openBlockStartAt: null,
@@ -580,6 +605,13 @@ export type Action =
   | { type: 'SELECT_CONVERSATION'; sessionId: string | null }
   | { type: 'SET_CONVERSATION_SEARCH'; text: string }
   | { type: 'CLEAR_CONVERSATION_JUMP' }
+  // #177 S5 — outline panel. TOGGLE_CONV_OUTLINE flips + persists the open
+  // flag; SET_CONV_FOCUS_MODE sets the transient per-session focus mode (Task 4
+  // consumer); SET_CONV_CURRENT_TURN is the scroll-sync cursor written by the
+  // reader's IntersectionObserver.
+  | { type: 'TOGGLE_CONV_OUTLINE' }
+  | { type: 'SET_CONV_FOCUS_MODE'; mode: UIState['convFocusMode'] }
+  | { type: 'SET_CONV_CURRENT_TURN'; uuid: string | null }
   | { type: 'SET_FILTER'; text: string }
   | { type: 'SET_SEARCH'; text: string }
   | { type: 'SET_SEARCH_MATCHES'; matches: number[]; index: number }
@@ -734,6 +766,11 @@ export function dispatch(action: Action): void {
         ...DISMISSED_ON_VIEW_SWITCH,
         selectedConversationId: action.sessionId,
         conversationJump: action.jump ?? null,
+        // #177 S5 — a conversation switch resets the transient outline state
+        // (focus mode + scroll-sync cursor); the persisted open flag is left
+        // alone so the panel stays open/closed across sessions.
+        convFocusMode: 'all',
+        convCurrentTurnUuid: null,
       };
       break;
     case 'SELECT_CONVERSATION':
@@ -741,6 +778,10 @@ export function dispatch(action: Action): void {
         ...state,
         selectedConversationId: action.sessionId,
         conversationJump: null,
+        // #177 S5 — same transient reset as OPEN_CONVERSATION (convOutlineOpen
+        // is NOT touched).
+        convFocusMode: 'all',
+        convCurrentTurnUuid: null,
       };
       break;
     case 'SET_CONVERSATION_SEARCH':
@@ -748,6 +789,24 @@ export function dispatch(action: Action): void {
       break;
     case 'CLEAR_CONVERSATION_JUMP':
       state = { ...state, conversationJump: null };
+      break;
+    case 'TOGGLE_CONV_OUTLINE': {
+      const next = !state.convOutlineOpen;
+      try {
+        localStorage.setItem(CONV_OUTLINE_OPEN_KEY, next ? 'true' : 'false');
+      } catch {
+        // localStorage unavailable (private mode / quota) — keep the in-memory
+        // toggle; the pref just won't survive a reload.
+      }
+      state = { ...state, convOutlineOpen: next };
+      break;
+    }
+    case 'SET_CONV_FOCUS_MODE':
+      state = { ...state, convFocusMode: action.mode };
+      break;
+    case 'SET_CONV_CURRENT_TURN':
+      if (state.convCurrentTurnUuid === action.uuid) break; // no-op: avoid a needless emit on each observer tick
+      state = { ...state, convCurrentTurnUuid: action.uuid };
       break;
     case 'SET_FILTER': {
       if (action.text) localStorage.setItem(FILTER_KEY, action.text);

@@ -10,7 +10,7 @@ import { SidechainGroup } from './SidechainGroup';
 import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon } from './ConvIcons';
 import { TranscriptContext } from './TranscriptContext';
 import { fmt } from '../lib/fmt';
-import type { ConversationItem } from '../types/conversation';
+import type { ConversationItem, ConversationOutline } from '../types/conversation';
 
 // First non-blank line of the first MAIN-session, non-marker human message;
 // fallback project_label → session_id. Mirrors the kernel _session_titles_map
@@ -32,9 +32,14 @@ function deriveReaderTitle(detail: { items: ConversationItem[]; project_label: s
 // transient highlight (reduced-motion aware), then clear the jump. Every
 // member uuid maps to its rendered element so a hit on any folded fragment
 // resolves.
-export function ConversationReader({ sessionId, mobileBack }: { sessionId: string; mobileBack?: boolean }) {
+// `outline` (#177 S5) is threaded from ConversationsView so the reader's head
+// toggle button can reflect open/closed state; Tasks 4/5 consume it further
+// (jump-to-next targets, token footer). The scroll-sync IntersectionObserver
+// below is independent of it (it observes the reader's own rendered turns).
+export function ConversationReader({ sessionId, mobileBack, outline: _outline }: { sessionId: string; mobileBack?: boolean; outline?: ConversationOutline | null }) {
   const { detail, loading, error, hasMore, loadMore, loadUntil } = useConversation(sessionId);
   const jump = useSyncExternalStore(subscribeStore, () => getState().conversationJump);
+  const outlineOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineOpen);
   const reduced = useReducedMotion();
   const sentinelRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -184,6 +189,51 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
     obs.observe(sentinelRef.current);
     return () => obs.disconnect();
   }, [hasMore, loadMore]);
+
+  // #177 S5 §3 — scroll-sync. A deduped IntersectionObserver over the reader's
+  // rendered turns writes the topmost-visible anchor uuid to the store, where
+  // the OutlinePanel reads it to highlight + auto-scroll the current entry.
+  // Codex F14: `itemRefs` maps EVERY member uuid to the SAME element, so we
+  // build the observe set from UNIQUE elements (one observe per node) and
+  // resolve each element's anchor uuid from its `data-uuid` attribute
+  // (MessageItem renders `data-uuid={item.anchor.uuid}`). On a change we pick
+  // the element with the smallest bounding-rect top among the currently
+  // intersecting ones and dispatch it. Re-registers when `groups` changes
+  // (paged appends grow the rendered set). No scroll listener — the observer's
+  // own batched callback is the throttle.
+  useEffect(() => {
+    const root = bodyRef.current;
+    if (!root || typeof IntersectionObserver === 'undefined') return;
+    const visible = new Set<Element>();
+    const obs = new IntersectionObserver(
+      (records) => {
+        for (const r of records) {
+          if (r.isIntersecting) visible.add(r.target);
+          else visible.delete(r.target);
+        }
+        let top: Element | null = null;
+        let topY = Infinity;
+        for (const el of visible) {
+          const y = el.getBoundingClientRect().top;
+          if (y < topY) { topY = y; top = el; }
+        }
+        const uuid = top?.getAttribute('data-uuid');
+        if (uuid) dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid });
+      },
+      { root, threshold: 0 },
+    );
+    // Dedup: itemRefs maps many uuids onto few elements. Observe each element
+    // once via a Set keyed on the element node identity.
+    const seen = new Set<Element>();
+    for (const el of itemRefs.current.values()) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      obs.observe(el);
+    }
+    return () => obs.disconnect();
+    // groups changes on every paged append / session switch — re-register so
+    // the observer tracks the freshly-rendered turns.
+  }, [groups]);
 
   // Jump-to-message: page until the target is loaded, then scroll+highlight.
   // Wait for the first page (`detail`) before attempting — otherwise the effect
@@ -423,6 +473,7 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
         mk('[', () => sweepDetails(false)),
         mk(']', () => sweepDetails(true)),
         mk('g', () => jumpToTop()),
+        mk('o', () => dispatch({ type: 'TOGGLE_CONV_OUTLINE' })),
       ];
     },
     // Actions are stable (refs-only), so the array is built once. The lint
@@ -458,6 +509,17 @@ export function ConversationReader({ sessionId, mobileBack }: { sessionId: strin
         {mobileBack && (
           <button type="button" className="conv-back" onClick={() => dispatch({ type: 'SELECT_CONVERSATION', sessionId: null })}>← Back</button>
         )}
+        {/* #177 S5 — outline toggle. Visible on desktop + mobile; aria-pressed
+            reflects the persisted open flag. On mobile it opens the slide-over
+            sheet (same store flag drives both layouts). */}
+        <button
+          type="button"
+          className="conv-outline-toggle"
+          aria-pressed={outlineOpen}
+          aria-label="Toggle session outline"
+          title="Toggle session outline (o)"
+          onClick={() => dispatch({ type: 'TOGGLE_CONV_OUTLINE' })}
+        >☰ Outline</button>
         <div className="conv-reader-title">{title || detail.session_id}</div>
         <div className="conv-reader-meta">
           {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {detail.models.join(', ')}
