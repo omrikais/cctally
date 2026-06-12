@@ -5347,6 +5347,193 @@ mark.current {
 .conv-code--hl .token.operator,
 .conv-code--hl .token.punctuation { color: var(--text-dim); }
 
+/* ---- Diff card (Edit / MultiEdit / Write — #177 S3, spec §4.1) ----- */
+/* Unified red/green word-diff. Header carries the file + a +N/−M stat; the
+   body is a stack of rows with a two-column relative-line-number gutter, a
+   ±/space sign column, and the content. Context lines get full refractor
+   syntax color (.conv-code--hl tokens above); changed lines get a row tint
+   plus brighter word-emphasis (.conv-diff-word), rendered as plain text. */
+.conv-diff-card .conv-diff-hdr {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+  font-size: 11.5px;
+}
+.conv-diff-base { font-weight: 700; color: var(--text); flex: 0 0 auto; }
+.conv-diff-dir {
+  color: var(--text-faint);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;          /* keep the meaningful tail of a long path visible */
+  text-align: left;
+}
+.conv-diff-stat { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.conv-diff-stat-add { color: var(--accent-green); }
+.conv-diff-stat-del { color: var(--accent-red); }
+.conv-diff-stat--write { color: var(--accent-green); }
+.conv-diff-tag {
+  flex: 0 0 auto;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.conv-diff-body {
+  position: relative;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border-soft);
+}
+.conv-diff-copy { position: absolute; top: 4px; right: 6px; z-index: 1; }
+.conv-diff-divider {
+  margin: 8px 0 4px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.conv-diff-divider:first-child { margin-top: 0; }
+.conv-diff-hunk {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  overflow-x: auto;
+}
+.conv-diff-row {
+  display: grid;
+  grid-template-columns: 3ch 3ch 1.5ch 1fr;
+  white-space: pre;
+  word-break: normal;
+  overflow-wrap: normal;
+}
+.conv-diff-gutter {
+  text-align: right;
+  padding-right: 6px;
+  color: var(--text-faint);
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+.conv-diff-sign { text-align: center; user-select: none; color: var(--text-faint); }
+.conv-diff-text { padding-right: 8px; }
+.conv-diff-row--context { color: var(--text-dim); }
+.conv-diff-row--add { background: rgba(61, 220, 132, 0.08); }
+.conv-diff-row--add .conv-diff-sign { color: var(--accent-green); }
+.conv-diff-row--del { background: rgba(239, 68, 68, 0.08); }
+.conv-diff-row--del .conv-diff-sign { color: var(--accent-red); }
+/* Intra-line word emphasis: a brighter tint on the changed segments only. */
+.conv-diff-row--add .conv-diff-word { background: rgba(61, 220, 132, 0.28); border-radius: 2px; }
+.conv-diff-row--del .conv-diff-word { background: rgba(239, 68, 68, 0.28); border-radius: 2px; }
+/* Result sub-panel beneath the diff (collapsed; the real cat -n numbers). */
+.conv-diff-result { margin-top: 8px; }
+
+/* ---- Bash terminal card (#177 S3, spec §4.2) ---------------------- */
+.conv-term-body {
+  position: relative;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.conv-term-copy { position: absolute; top: 4px; right: 6px; z-index: 1; }
+.conv-term-cmd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+}
+.conv-term-prompt { color: var(--accent-cyan); font-weight: 700; }
+.conv-term-out,
+.conv-term-stderr {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border-radius: 6px;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.conv-term-out { background: var(--bg); color: var(--text-dim); border: 1px solid var(--border-soft); }
+.conv-term-stderr {
+  background: rgba(239, 68, 68, 0.08);
+  color: var(--accent-red);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+}
+.conv-term-badge {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  font-family: var(--font-mono);
+}
+.conv-term-badge--err { color: var(--accent-red); }
+.conv-term-badge--int { color: var(--accent-amber); }
+
+/* ANSI SGR foreground spans (parseAnsi). Mapped onto the in-tree palette — no
+   new hexes — so the terminal stays native to the reader's colors. */
+.ansi-red { color: var(--accent-red); }
+.ansi-grn { color: var(--accent-green); }
+.ansi-yel { color: var(--accent-amber); }
+.ansi-blu { color: var(--accent-blue); }
+.ansi-mag { color: var(--accent-purple); }
+.ansi-cyn { color: var(--accent-cyan); }
+.ansi-wht { color: var(--text); }
+.ansi-blk { color: var(--text-faint); }
+.ansi-dim { color: var(--text-faint); }
+
+/* ---- Load-full affordance (#178, spec §4.4) ----------------------- */
+/* Shown only when a result/input was truncated. Idle button → spinner →
+   onLoaded (the affordance vanishes) / error note. */
+.conv-loadfull {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+}
+.conv-loadfull-btn {
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 3px 8px;
+  color: var(--accent-blue);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.conv-loadfull-btn:hover { border-color: var(--accent-blue); }
+.conv-loadfull-btn:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 1px; }
+.conv-loadfull-err { color: var(--accent-amber); }
+.conv-loadfull-spinner { display: inline-grid; place-items: center; color: var(--accent-blue); line-height: 0; }
+.conv-loadfull-spinner .conv-ico { animation: cctally-icon-spin 1.2s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  /* Reduced-motion: freeze the load-full spinner (parity with the reader's
+     other reduced-motion gates). */
+  .conv-loadfull-spinner .conv-ico { animation: none; }
+}
+
 /* ---- Copy affordances (G2) ---------------------------------------- */
 /* Compact icon-only copy button across code blocks, tool I/O, and message
    text. The icon (clipboard → check) carries the state via aria-label. */
