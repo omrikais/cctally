@@ -7438,29 +7438,47 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if loc is None:
             self._respond_json(404, {"error": "not found"})
             return
-        status, media_type, raw = cq.read_media_bytes(
-            loc[0], loc[1], index=index, **key)
-        if status == "unsupported":
-            self._respond_json(404, {"error": "not found"})
-            return
-        if status == "too_large":
-            self._respond_json(413, {"error": "media too large"})
-            return
-        if status != "ok":
-            self._respond_json(410, {"error": "source no longer available"})
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", media_type)
-        self.send_header("Content-Length", str(len(raw)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Cache-Control", "private, max-age=86400")
-        if media_type == "application/pdf":
-            self.send_header("Content-Disposition",
-                             f'inline; filename="attachment-{index}.pdf"')
-        else:
-            self.send_header("Content-Security-Policy", "default-src 'none'")
-        self.end_headers()
-        self.wfile.write(raw)
+        # Defensive envelope parity with the sibling byte-serving handlers
+        # (`_handle_get_doctor` / `_serve_static_file`): `locate_media` already
+        # runs inside the `_run_conversation_query` 500-envelope, but the
+        # `read_media_bytes` read + the byte emission did not. `read_media_bytes`
+        # is internally defensive (OSError/ValueError → `gone`), so this guards
+        # only an UNEXPECTED escape — but an unguarded one would kill the handler
+        # thread with no logged 500. `response_started` tracks the commit point:
+        # an exception BEFORE `send_response(200)` sends a clean logged 500; one
+        # AFTER (mid-`wfile.write`, headers already out) can't re-send a status,
+        # so it's logged only — never a silent thread death.
+        response_started = False
+        try:
+            status, media_type, raw = cq.read_media_bytes(
+                loc[0], loc[1], index=index, **key)
+            if status == "unsupported":
+                self._respond_json(404, {"error": "not found"})
+                return
+            if status == "too_large":
+                self._respond_json(413, {"error": "media too large"})
+                return
+            if status != "ok":
+                self._respond_json(410, {"error": "source no longer available"})
+                return
+            self.send_response(200)
+            response_started = True
+            self.send_header("Content-Type", media_type)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "private, max-age=86400")
+            if media_type == "application/pdf":
+                self.send_header("Content-Disposition",
+                                 f'inline; filename="attachment-{index}.pdf"')
+            else:
+                self.send_header("Content-Security-Policy", "default-src 'none'")
+            self.end_headers()
+            self.wfile.write(raw)
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("/api/conversation/media failed: %r", exc)
+            if not response_started:
+                self._respond_json(
+                    500, {"error": f"{type(exc).__name__}: {exc}"})
 
     def _handle_get_project_detail(self) -> None:
         """Return ProjectDetail JSON for ``GET /api/project/<key>?weeks=N``

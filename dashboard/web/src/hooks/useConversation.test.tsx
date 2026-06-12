@@ -203,6 +203,50 @@ describe('useConversation', () => {
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(2);
   });
 
+  it('never exposes the previous session\'s detail under the new sid on switch (#183 stale-media 404)', async () => {
+    // REGRESSION (cross-session stale-media 404, useConversation.ts derive guard):
+    // The fetch effect clears `detail` only in the POST-commit passive phase, so
+    // the render right after `sessionId` changes used to return the previous
+    // session's `detail` for one commit — while TranscriptContext already carried
+    // the new sid, so an auto-fetching MediaFigure built /<newSid>/media?tool_use_id
+    // =<oldId> → 404. A setState-in-render reset does NOT fix it (the first render
+    // of the new session still returns the stale value); the fix DERIVES the
+    // exposed detail in the same render pass (only surface it when
+    // detail.session_id === sessionId).
+    //
+    // We trace EVERY render the hook produces and assert no render that requested
+    // s2 ever carried a detail belonging to s1. The new session's fetch is
+    // deferred (never resolves) so ONLY a stale-detail leak — not fresh data —
+    // could populate detail under s2. RED without the guard: a render with
+    // {sid:'s2', detail:<s1>} appears.
+    const renders: Array<{ sid: string; detailSid: string | null }> = [];
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation((url: string) => {
+      if (url.includes('/api/conversation/s1')) {
+        return Promise.resolve({ ok: true, status: 200, json: async () => detail([it1], null) } as Response);
+      }
+      return new Promise(() => {}); // s2 page-1 never resolves
+    });
+    const { result, rerender } = renderHook(
+      ({ sid }) => {
+        const r = useConversation(sid);
+        renders.push({ sid, detailSid: r.detail?.session_id ?? null });
+        return r;
+      },
+      { initialProps: { sid: 's1' } },
+    );
+    await waitFor(() => expect(result.current.detail?.session_id).toBe('s'));
+
+    // Switch to s2. Across every render the hook produces for s2, detail must be
+    // null (loading) — never s1's detail. The fix's derive guard makes this hold
+    // in the SAME render pass, not one commit later.
+    act(() => { rerender({ sid: 's2' }); });
+    const s2Renders = renders.filter((r) => r.sid === 's2');
+    expect(s2Renders.length).toBeGreaterThan(0);
+    expect(s2Renders.every((r) => r.detailSid === null)).toBe(true);
+    expect(result.current.detail).toBeNull();
+    expect(result.current.loading).toBe(true);
+  });
+
   it('drops a stale cross-session page that resolves after the session changed', async () => {
     // REGRESSION (cross-session clobber guard, useConversation.ts ~L76):
     //   if (sessionRef.current !== sid) return false;

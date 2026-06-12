@@ -29,6 +29,12 @@ export function useConversation(sessionId: string | null): UseConversation {
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // #183 — the session id the current `detail` was loaded FOR. Set atomically
+  // with the page-1 `setDetail(body)` in the fetch `.then`. The render derives
+  // `detailMatches` from it (see below) so the previous session's `detail` is
+  // never exposed under a newer `sessionId` during the cross-session transient.
+  // State (not a ref) so the page-1 resolve re-renders with the match visible.
+  const [loadedSessionId, setLoadedSessionId] = useState<string | null>(null);
   const nextAfterRef = useRef<number | null>(null);
   const loadingMoreRef = useRef(false);
   const sessionRef = useRef<string | null>(null);
@@ -55,12 +61,13 @@ export function useConversation(sessionId: string | null): UseConversation {
 
   useEffect(() => {
     sessionRef.current = sessionId;
-    if (!sessionId) { setDetailSynced(null); setLoading(false); setError(null); nextAfterRef.current = null; return; }
+    if (!sessionId) { setDetailSynced(null); setLoadedSessionId(null); setLoading(false); setError(null); nextAfterRef.current = null; return; }
     setLoading(true); setError(null); setDetailSynced(null); nextAfterRef.current = null;
     const ctl = new AbortController();
     fetchJson<ConversationDetail>(`/api/conversation/${encodeURIComponent(sessionId)}?limit=${PAGE}`, ctl.signal)
       .then((body) => {
         setDetailSynced(body);
+        setLoadedSessionId(sessionId);   // #183 — stamp which session this detail is for
         nextAfterRef.current = body.page.next_after;
         setLoading(false);
       })
@@ -117,7 +124,33 @@ export function useConversation(sessionId: string | null): UseConversation {
     }
   }, [fetchNext]);
 
-  const hasMore = detail?.page?.next_after != null;
+  // #183 — derive (don't sync) the cross-session reset. The fetch effect clears
+  // `detail` only AFTER the commit (passive phase), so the render right after
+  // `sessionId` changes still returns the PREVIOUS session's `detail` for one
+  // commit — while TranscriptContext already carries the new sessionId. An
+  // auto-fetching MediaFigure then builds `/<newSid>/media?tool_use_id=<oldId>`
+  // and 404s (console-visible on every cross-session switch once a screenshot
+  // loaded). A `setState`-during-render reset does NOT fix it: it merely
+  // schedules a second render, but the FIRST render of the new session still
+  // returns the stale value. The robust fix DERIVES the exposed detail in the
+  // same render pass: only surface `detail` when it was loaded FOR the requested
+  // session (`loadedSessionId === sessionId`, stamped atomically with the
+  // page-1 `setDetail`); otherwise present as the loading state, so the reader
+  // falls into its existing "Loading conversation…" branch for the transient
+  // instead of painting stale items under the new context. `detailRef` /
+  // `sessionRef` (live-tail + pagination bookkeeping) are untouched — only the
+  // React-visible surface is gated.
+  const detailMatches = detail != null && loadedSessionId === sessionId;
+  const exposedDetail = detailMatches ? detail : null;
+  // While `detail` belongs to a stale session (the cross-session transient) and
+  // no error has surfaced for the new one, present as loading so the reader
+  // shows "Loading conversation…". `error` is passed through unchanged — gating
+  // it could swallow a real not-found for the CURRENT session (whose `detail`
+  // is also null, so `detailMatches` is false), and a stale error transient is
+  // text-only, not a media 404.
+  const exposedLoading = sessionId != null && !detailMatches && error == null ? true : loading;
+
+  const hasMore = exposedDetail?.page?.next_after != null;
   hasMoreRef.current = hasMore;
 
   // #175 F4 — tail-poll the open conversation. Runs ONLY while already fully
@@ -170,5 +203,5 @@ export function useConversation(sessionId: string | null): UseConversation {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [generatedAt]);
 
-  return { detail, loading, error, hasMore, loadMore, loadUntil };
+  return { detail: exposedDetail, loading: exposedLoading, error, hasMore, loadMore, loadUntil };
 }

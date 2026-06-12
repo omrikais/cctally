@@ -755,6 +755,37 @@ def test_media_route_410_gone(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def test_media_route_unexpected_read_error_500_envelope(tmp_path, monkeypatch):
+    # #183 — defensive-envelope parity with the sibling byte handlers. The kernel
+    # `read_media_bytes` is internally defensive (OSError/ValueError -> 410 gone),
+    # but an UNEXPECTED exception type used to escape the handler unguarded —
+    # killing the thread with no logged 500 because the response hadn't started.
+    # The handler now wraps the read + emission: a pre-emission failure returns a
+    # logged 500 envelope ({type}: {msg}), not a stack trace / dropped connection.
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        _seed_media_rows(ns, tmp_path)
+        # Pin the SAME kernel-module instance the route resolves and force its
+        # read to raise an unexpected error (not the caught OSError/ValueError).
+        cq_mod = ns["_load_sibling"]("_lib_conversation_query")
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("synthetic read failure")
+
+        monkeypatch.setattr(cq_mod, "read_media_bytes", _boom)
+        status, _, body = _get_media(
+            port, "/api/conversation/sm/media?tool_use_id=tu_img&index=0")
+        assert status == 500, (status, body)
+        # The logged-500 envelope carries the exception class + message, mirroring
+        # `_run_conversation_query` / `_handle_get_doctor`.
+        payload = json.loads(body)
+        assert "RuntimeError: synthetic read failure" in payload["error"]
+    finally:
+        srv.shutdown()
+
+
 def test_media_route_403_gate_and_cross_site(tmp_path, monkeypatch):
     ns = load_script()
     srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
