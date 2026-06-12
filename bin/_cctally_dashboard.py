@@ -5341,6 +5341,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_get_conversations()
         elif path == "/api/conversation/search":
             self._handle_get_conversation_search()
+        elif path.startswith("/api/conversation/") and path.endswith("/payload"):
+            # #178: on-demand load-full. Matched BEFORE the <id> reader
+            # catch-all (same precedence as /api/conversation/search).
+            self._handle_get_conversation_payload(path)
         elif path.startswith("/api/conversation/"):
             self._handle_get_conversation_detail(path)
         else:
@@ -7343,6 +7347,46 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if not ok:
             return
         self._respond_json(200, body)
+
+    def _handle_get_conversation_payload(self, path: str) -> None:
+        """``GET /api/conversation/<sid>/payload?tool_use_id=<id>&which=<result|input>``
+        — the #178 on-demand load-full route. Re-reads the source JSONL line so
+        a clipped result/input can be expanded without enlarging the cache.
+
+        Gated FIRST by the same loopback/Host transcript privacy predicate the
+        three other conversation routes use (fail-closed 403). ``locate_tool_payload``
+        runs against cache.db (via the shared 500-envelope scaffold); the actual
+        full body is re-read from disk by ``read_full_payload`` (no cache conn).
+        ``which`` is validated to ``result``/``input`` (else 400); a missing
+        tool_use_id is 400; an unknown id is 404; a gone/unparseable source line
+        is 410 (the documented consequence of storing only capped text).
+        """
+        if not self._require_transcripts_allowed():
+            return
+        import urllib.parse as _u
+        session_id = _u.unquote(
+            path[len("/api/conversation/"):-len("/payload")])
+        q = _u.parse_qs(self.path.partition("?")[2])
+        tool_use_id = _qs_str(q, "tool_use_id", "")
+        which = _qs_str(q, "which", "result")
+        if not session_id or which not in ("result", "input") or not tool_use_id:
+            self._respond_json(400, {"error": "bad request"})
+            return
+        cq = self._conversation_query()
+        ok, loc = self._run_conversation_query(
+            lambda conn: cq.locate_tool_payload(
+                conn, session_id, tool_use_id, which),
+            "/api/conversation/payload")
+        if not ok:
+            return
+        if loc is None:
+            self._respond_json(404, {"error": "not found"})
+            return
+        payload = cq.read_full_payload(loc[0], loc[1], tool_use_id, which)
+        if payload is None:
+            self._respond_json(410, {"error": "source no longer available"})
+            return
+        self._respond_json(200, payload)
 
     def _handle_get_project_detail(self) -> None:
         """Return ProjectDetail JSON for ``GET /api/project/<key>?weeks=N``

@@ -403,6 +403,136 @@ def _first_sse_update_envelope(port, *, host=None, timeout=5.0):
         s.close()
 
 
+def _seed_payload_rows(ns, tmp_path):
+    """Seed conversation_messages rows for the #178 payload route, pointing
+    source_path/byte_offset at REAL JSONL files on disk so read_full_payload can
+    re-read them. Returns (input_id, result_id). Two lines:
+
+      line 0 — an Edit tool_use with an old_string longer than the 8000-char
+               leaf cap, so the route proves it re-derives the FULL input.
+      line 1 — a Bash tool_result carrying toolUseResult.stderr, so the route
+               proves it serves the full result + stderr from disk.
+    """
+    p = tmp_path / "payload.jsonl"
+    line0 = (json.dumps({"message": {"content": [
+        {"type": "tool_use", "id": "toolu_e", "name": "Edit",
+         "input": {"file_path": "/f.py", "old_string": "X" * 9000,
+                   "new_string": "Y"}}]}}) + "\n").encode()
+    line1 = (json.dumps({
+        "toolUseResult": {"stdout": "out\n", "stderr": "boom", "interrupted": False},
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_b",
+             "content": [{"type": "text", "text": "out\nboom"}],
+             "is_error": True}]}}) + "\n").encode()
+    with open(p, "wb") as fh:
+        fh.write(line0)
+        fh.write(line1)
+
+    cache = ns["open_cache_db"]()
+    cache.execute(
+        "INSERT OR IGNORE INTO conversation_messages "
+        "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+        " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,"
+        " is_sidechain) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("sp", "pe", None, str(p), 0, "2026-06-04T00:00:00Z", "assistant", "",
+         json.dumps([{"kind": "tool_use", "name": "Edit", "input_summary": "{}",
+                      "input": {"file_path": "/f.py"}, "input_truncated": True,
+                      "id": "toolu_e", "preview": "/f.py"}]),
+         _MODEL, "mp", "rp", "/home/u/proj", "main", 0))
+    cache.execute(
+        "INSERT OR IGNORE INTO conversation_messages "
+        "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+        " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,"
+        " is_sidechain) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("sp", "pr", None, str(p), len(line0), "2026-06-04T00:00:01Z",
+         "tool_result", "",
+         json.dumps([{"kind": "tool_result", "text": "out\nboom",
+                      "truncated": False, "full_length": 8, "is_error": True,
+                      "tool_use_id": "toolu_b"}]),
+         None, None, None, None, None, 0))
+    cache.commit()
+    cache.close()
+    return "toolu_e", "toolu_b"
+
+
+def test_payload_route_input_result_and_gate(tmp_path, monkeypatch):
+    """The #178 ``/api/conversation/<sid>/payload`` route: loopback 200 with the
+    discriminated input/result shapes (full input beyond the leaf cap; full
+    result + Bash stderr from disk), 403 on a LAN hostname (gate reused), 400 on
+    a bad ``which``, and 404 on an unknown tool_use_id."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        _seed_payload_rows(ns, tmp_path)
+
+        # which=input -> full structured input dict, beyond the 8000 leaf cap.
+        status, body = _get(
+            port, "/api/conversation/sp/payload?tool_use_id=toolu_e&which=input")
+        assert status == 200, (status, body)
+        payload = json.loads(body)
+        assert payload["which"] == "input"
+        assert payload["input"]["old_string"] == "X" * 9000
+        assert payload["truncated"] is False
+
+        # which=result -> full result text + Bash stderr.
+        status, body = _get(
+            port, "/api/conversation/sp/payload?tool_use_id=toolu_b&which=result")
+        assert status == 200, (status, body)
+        payload = json.loads(body)
+        assert payload["which"] == "result"
+        assert payload["text"] == "out\nboom"
+        assert payload["is_error"] is True
+        assert payload["stderr"] == "boom"
+
+        # Privacy gate reused verbatim: LAN hostname + expose=False -> 403.
+        status, _ = _get(
+            port, "/api/conversation/sp/payload?tool_use_id=toolu_e&which=input",
+            host="machine.local:8789")
+        assert status == 403
+
+        # Bad which -> 400.
+        status, _ = _get(
+            port, "/api/conversation/sp/payload?tool_use_id=toolu_e&which=bogus")
+        assert status == 400
+
+        # Unknown tool_use_id -> 404.
+        status, _ = _get(
+            port, "/api/conversation/sp/payload?tool_use_id=nope&which=result")
+        assert status == 404
+    finally:
+        srv.shutdown()
+
+
+def test_payload_route_source_gone_returns_410(tmp_path, monkeypatch):
+    """A row whose source_path points at a missing/rotated JSONL -> 410 (the
+    documented consequence of storing only capped text)."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        cache = ns["open_cache_db"]()
+        gone = str(tmp_path / "rotated-away.jsonl")          # never created
+        cache.execute(
+            "INSERT OR IGNORE INTO conversation_messages "
+            "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+            " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,"
+            " is_sidechain) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("sg", "g1", None, gone, 0, "2026-06-05T00:00:00Z", "assistant", "",
+             json.dumps([{"kind": "tool_use", "name": "Bash", "input_summary": "{}",
+                          "input": {"command": "ls"}, "input_truncated": False,
+                          "id": "toolu_gone", "preview": "ls"}]),
+             _MODEL, "mg", "rg", None, None, 0))
+        cache.commit()
+        cache.close()
+        status, body = _get(
+            port, "/api/conversation/sg/payload?tool_use_id=toolu_gone&which=input")
+        assert status == 410, (status, body)
+        assert "error" in json.loads(body)
+    finally:
+        srv.shutdown()
+
+
 def test_sse_update_envelope_carries_transcripts_enabled(tmp_path, monkeypatch):
     """The SSE ``update`` envelope (``/api/events``) MUST carry
     ``transcriptsEnabled`` equal to the per-connection gate value — the same
