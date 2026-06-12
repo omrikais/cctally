@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.38.0] - 2026-06-12
+
 ### Added
 - Conversation viewer: Edit, MultiEdit, and Write now render as a unified red/green word-diff card — a `+N −M` stat header with the file's basename and dir, intra-line word-level highlighting on the changed text, per-language syntax coloring on the unchanged context lines, one hunk per edit for MultiEdit, and an all-added "wrote N lines" view for Write — with a collapsed `result · cat -n` sub-panel beneath carrying the real file line numbers, instead of a raw JSON tool chip (#177 S3).
 - Conversation viewer: Bash now renders as a terminal — a `$ <command>` prompt over the output, with `stderr` split into a red block, an `error`/`interrupted` status badge, and ANSI foreground colors honored — instead of an undifferentiated output blob; legacy transcripts captured before the stream split degrade to a merged terminal view (#177 S3).
