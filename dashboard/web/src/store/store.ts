@@ -756,23 +756,38 @@ export function dispatch(action: Action): void {
           : {}),
       };
       break;
-    case 'OPEN_CONVERSATION':
+    case 'OPEN_CONVERSATION': {
       // A direct workspace switch into the conversations view (bypasses
       // SET_VIEW), so it dismisses transient modals the same way (#158) before
       // applying the selection it carries.
+      //
+      // #177 S5 — focus-mode reset is GENUINE-SWITCH-ONLY. Every in-session
+      // jump (jump-to-next keys, outline-entry click, glyph cluster,
+      // hidden-run click) dispatches OPEN_CONVERSATION with the SAME
+      // sessionId. A blanket reset here would drop the user out of their
+      // active focus mode on every such jump (e.g. pressing `e` to walk to
+      // the next error while in Errors mode). Per spec §5 the reset-to-All
+      // belongs to the jump callers, who already run the precise
+      // per-jump hidden-target check (ConversationReader.jumpNext via
+      // nodeVisible; OutlinePanel via outlineTurnVisible; the hidden-run
+      // marker dispatches SET_CONV_FOCUS_MODE 'all' explicitly). So a
+      // same-session OPEN_CONVERSATION MUST preserve convFocusMode +
+      // convCurrentTurnUuid — the caller is the authority. Only a genuine
+      // session switch (different sessionId) resets the transient outline
+      // state; the persisted open flag is left alone in both cases.
+      const switched = action.sessionId !== state.selectedConversationId;
       state = {
         ...state,
         view: 'conversations',
         ...DISMISSED_ON_VIEW_SWITCH,
         selectedConversationId: action.sessionId,
         conversationJump: action.jump ?? null,
-        // #177 S5 — a conversation switch resets the transient outline state
-        // (focus mode + scroll-sync cursor); the persisted open flag is left
-        // alone so the panel stays open/closed across sessions.
-        convFocusMode: 'all',
-        convCurrentTurnUuid: null,
+        ...(switched
+          ? { convFocusMode: 'all' as const, convCurrentTurnUuid: null }
+          : {}),
       };
       break;
+    }
     case 'SELECT_CONVERSATION':
       state = {
         ...state,

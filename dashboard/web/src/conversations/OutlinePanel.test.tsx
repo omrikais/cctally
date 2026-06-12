@@ -149,6 +149,30 @@ describe('OutlinePanel (#177 S5 §3)', () => {
     expect(getState().selectedConversationId).toBe('s1');
   });
 
+  // #177 S5 §5 — the store reducer no longer blanket-resets focus mode on a
+  // same-session OPEN_CONVERSATION jump, so the panel itself must reset to
+  // `all` before a jump WHEN the current mode would hide the target (and only
+  // then). These cover the entry-click path.
+  it('entry click in a focus mode that HIDES the target resets to all before jumping', () => {
+    // In Prompts mode, an assistant entry is hidden → click must reset to all.
+    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' });
+    render(<OutlinePanel sessionId="s1" outline={outline()} />);
+    const btn = screen.getByRole('button', { name: /here is the plan/ });
+    fireEvent.click(btn);
+    expect(getState().convFocusMode).toBe('all');
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'a1' });
+  });
+
+  it('entry click on a target VISIBLE in the current mode does NOT reset the mode', () => {
+    // In Prompts mode, a human entry stays visible → no reset.
+    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' });
+    render(<OutlinePanel sessionId="s1" outline={outline()} />);
+    const btn = screen.getByRole('button', { name: /looks good/ });
+    fireEvent.click(btn);
+    expect(getState().convFocusMode).toBe('prompts');
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h2' });
+  });
+
   it('clicking the error stats row jumps to the first error entry', () => {
     const o = outline({
       stats: stats({ error_count: 2 }),

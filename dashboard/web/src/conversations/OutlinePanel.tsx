@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'r
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { deriveOutline, type OutlineEntry } from './deriveOutline';
-import { nextTarget } from './outlineNavigation';
+import { nextTarget, outlineTurnVisible } from './outlineNavigation';
+import type { FocusMode } from './applyFocusMode';
 import { fmt } from '../lib/fmt';
 import {
   ChatIcon,
@@ -50,11 +51,13 @@ function JumpCluster({
   outline,
   currentUuid,
   reduced,
+  focusMode,
 }: {
   sessionId: string;
   outline: ConversationOutline;
   currentUuid: string | null;
   reduced: boolean;
+  focusMode: FocusMode;
 }) {
   const turns = outline.turns;
   const lists = useMemo(() => buildTargetLists(turns), [turns]);
@@ -75,11 +78,17 @@ function JumpCluster({
       return;
     }
     const turn = turns[targetIdx];
-    // The reader applies the precise mode-reset-on-hidden check; a deep-link jump
-    // through OPEN_CONVERSATION already resets the focus mode to `all` in the
-    // store reducer, so a cluster jump never lands behind a focus filter.
+    // Reset to `all` IF the current focus mode would hide the target turn
+    // (spec §5: never a silent jump behind a focus filter). The store reducer
+    // no longer blanket-resets on same-session OPEN_CONVERSATION, so the
+    // per-jump check is the authority — mirror the reader's jumpNext, but over
+    // the OutlineTurn skeleton (the panel has no RenderNode) via the cheap
+    // outlineTurnVisible twin of nodeVisible.
+    if (focusMode !== 'all' && !outlineTurnVisible(turn, focusMode)) {
+      dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
+    }
     dispatch({ type: 'OPEN_CONVERSATION', sessionId, jump: { session_id: sessionId, uuid: turn.uuid } });
-  }, [lists, indexByUuid, currentUuid, turns, sessionId, reduced]);
+  }, [lists, indexByUuid, currentUuid, turns, sessionId, reduced, focusMode]);
 
   const defs: { kind: JumpKind; glyph: string; label: string; key: string }[] = [
     { kind: 'error', glyph: '✕', label: 'error', key: 'e' },
@@ -221,6 +230,7 @@ export function OutlinePanel({
     subscribeStore,
     () => getState().convCurrentTurnUuid,
   );
+  const focusMode = useSyncExternalStore(subscribeStore, () => getState().convFocusMode);
   const reduced = useReducedMotion();
 
   const entries = useMemo(
@@ -228,12 +238,29 @@ export function OutlinePanel({
     [outline],
   );
 
-  const jumpTo = (uuid: string) =>
+  // uuid → OutlineTurn, so a jump can test the target's visibility under the
+  // current focus mode before dispatching (spec §5).
+  const turnByUuid = useMemo(() => {
+    const m = new Map<string, OutlineTurn>();
+    (outline?.turns ?? []).forEach((t) => m.set(t.uuid, t));
+    return m;
+  }, [outline]);
+
+  // Reset to `all` IF the current focus mode would hide the target turn before
+  // jumping (spec §5: never a silent jump behind a focus filter). The store
+  // reducer no longer blanket-resets on same-session OPEN_CONVERSATION, so this
+  // per-jump check is the authority for entry clicks + the stats error row.
+  const jumpTo = (uuid: string) => {
+    const turn = turnByUuid.get(uuid);
+    if (turn && focusMode !== 'all' && !outlineTurnVisible(turn, focusMode)) {
+      dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
+    }
     dispatch({
       type: 'OPEN_CONVERSATION',
       sessionId,
       jump: { session_id: sessionId, uuid },
     });
+  };
 
   // First error entry's jump uuid (stats error row + future jump-to-next). Null
   // when the session has no error landmark, which disables the error row.
@@ -263,6 +290,7 @@ export function OutlinePanel({
             outline={outline}
             currentUuid={currentUuid}
             reduced={reduced}
+            focusMode={focusMode}
           />
           <OutlineStatsCard
             stats={outline.stats}

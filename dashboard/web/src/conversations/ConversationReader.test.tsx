@@ -1004,3 +1004,63 @@ describe('ConversationReader jump-to-next keys (#177 S5 §4)', () => {
     expect(getState().conversationJump).toBeNull();
   });
 });
+
+// #177 S5 §5 — the store reducer no longer blanket-resets focus mode on a
+// same-session OPEN_CONVERSATION, so jumpNext's precise nodeVisible check is
+// the sole authority for resetting to `all`. It must reset ONLY when the jump
+// target is hidden by the current mode (e.g. an error target in Prompts mode),
+// and leave the mode untouched when the target is already visible (e.g. an
+// error target in Errors mode). This is the behavior the blanket reset masked.
+describe('ConversationReader jump-to-next focus-mode reset (#177 S5 §5)', () => {
+  async function renderWithOutline(items: ConversationItem[], outline: ConversationOutline) {
+    mockFetchOnce(detail(items));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const utils = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-thread')).not.toBeNull());
+    return utils;
+  }
+  const press = (key: string) => fireEvent.keyDown(document, { key });
+
+  const errBlock = {
+    kind: 'tool_call', name: 'Bash', input_summary: '{}', preview: 'x',
+    tool_use_id: 'te', result: { text: 'boom', truncated: false, is_error: true },
+  };
+  const outline: ConversationOutline = {
+    session_id: 's',
+    stats: {
+      turns: { total: 3, human: 1, assistant: 2, tool_result: 0, meta: 0 },
+      tool_counts: {}, error_count: 1, models: {}, duration_seconds: null,
+      tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 }, cost_usd: 0,
+    },
+    turns: [
+      oTurn({ uuid: 'h1', kind: 'human' }),
+      oTurn({ uuid: 'a1', kind: 'assistant', tools: [{ name: 'Bash', is_error: true }] }),
+      oTurn({ uuid: 'h2', kind: 'human' }),
+    ],
+  };
+  const items = [
+    makeItem({ uuid: 'h1', kind: 'human', text: 'hi' }),
+    makeItem({ uuid: 'a1', kind: 'assistant', text: 'oops', model: 'm', cost_usd: 0,
+      blocks: [errBlock] } as never),
+    makeItem({ uuid: 'h2', kind: 'human', text: 'bye' }),
+  ];
+
+  it('Errors mode: e-jump to a VISIBLE error target does NOT reset the mode', async () => {
+    await renderWithOutline(items, outline);
+    act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'errors' }); });
+    act(() => { dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h1' }); });
+    press('e'); // → a1, which IS visible in errors mode → no reset
+    expect(getState().conversationJump).toEqual({ session_id: 's', uuid: 'a1' });
+    expect(getState().convFocusMode).toBe('errors');
+  });
+
+  it('Prompts mode: e-jump to an error target (hidden) DOES reset to all', async () => {
+    await renderWithOutline(items, outline);
+    act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' }); });
+    act(() => { dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h1' }); });
+    press('e'); // → a1, hidden in prompts mode → reset to all before jumping
+    expect(getState().conversationJump).toEqual({ session_id: 's', uuid: 'a1' });
+    expect(getState().convFocusMode).toBe('all');
+  });
+});

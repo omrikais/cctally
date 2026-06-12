@@ -195,4 +195,34 @@ describe('conversation outline / focus-mode state', () => {
     expect(s.convOutlineOpen).toBe(false); // NOT reset by the switch
     localStorage.removeItem('cctally.conv.outlineOpen');
   });
+
+  // #177 S5 §5 — the reset-to-All belongs to the jump callers (each runs the
+  // precise hidden-target check). A SAME-session OPEN_CONVERSATION (an
+  // in-session jump) MUST preserve the focus mode + scroll cursor; only a
+  // genuine session switch resets them.
+  it('same-session OPEN_CONVERSATION preserves convFocusMode + convCurrentTurnUuid', () => {
+    _resetForTests();
+    // Land on a session first (genuine switch from null → 'abc').
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc' });
+    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'errors' });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'u3' });
+    // Same-session jump (e.g. `e` to the next visible error) — must NOT reset.
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc', jump: { session_id: 'abc', uuid: 'u9' } });
+    const s = getState();
+    expect(s.convFocusMode).toBe('errors');
+    expect(s.convCurrentTurnUuid).toBe('u3');
+    expect(s.conversationJump).toEqual({ session_id: 'abc', uuid: 'u9' });
+  });
+
+  it('cross-session OPEN_CONVERSATION resets convFocusMode + convCurrentTurnUuid', () => {
+    _resetForTests();
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc' });
+    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'u3' });
+    // Switching to a DIFFERENT session resets the transient outline state.
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'def' });
+    const s = getState();
+    expect(s.convFocusMode).toBe('all');
+    expect(s.convCurrentTurnUuid).toBeNull();
+  });
 });
