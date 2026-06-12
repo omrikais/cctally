@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Conversation viewer: MCP tool calls now render an action-first chip — the readable action (e.g. `browser_take_screenshot`) leads, with a quiet pill for the friendly server name and a per-server icon (playwright, chrome, computer-use, codex each get a dedicated glyph; any other server gets a generic plug icon and its raw name), instead of the full namespaced `mcp__…` name on a generic box chip; the original name stays in the chip tooltip and expanded request panel (#177 S4).
+- Conversation viewer: WebFetch and WebSearch now render as semantic source cards instead of raw JSON tool chips — WebFetch shows the fetched domain, an HTTP status chip, labeled url/prompt fields, and the Markdown summary (clamped with a show-full reveal); WebSearch shows the quoted query, a result-count chip, and a clickable list of result titles and domains — with only `http`/`https` links made clickable and no outbound requests beyond a link you click yourself (#177 S4).
+- Conversation viewer: images now render inline — a lazy-loaded figure with an `open full size ↗` link and a size/type caption, including screenshots returned inside MCP tool results that were previously dropped at ingest — served on demand by a new privacy-gated `GET /api/conversation/<id>/media` route that re-reads the original session JSONL and decodes the bytes without ever copying pixel data into the cache; PDF documents get an upgraded badge with an `open ↗` link that opens the file in a new tab, and any load failure degrades gracefully back to a byte-count badge (#177 S4).
+- Conversation viewer: a one-time background reingest (cache migration 009) backfills the new MCP/web/media rendering onto your existing transcript history on the first `cache-sync` or dashboard sync after upgrade — resumable, lossless, and re-derivable; until it completes, older rows simply keep their pre-upgrade rendering, and `cache-sync --rebuild` forces it through in one pass (#177 S4).
+
 ## [1.38.1] - 2026-06-12
 
 ### Fixed
