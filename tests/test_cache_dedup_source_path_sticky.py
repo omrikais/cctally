@@ -10,7 +10,6 @@ silently migrate between project buckets on each dedup tiebreaker swap.
 """
 from __future__ import annotations
 
-import json
 import pathlib
 import sqlite3
 
@@ -39,7 +38,8 @@ def cache_db(tmp_path):
             cache_create_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens INTEGER NOT NULL DEFAULT 0,
             usage_extra_json TEXT,
-            cost_usd_raw REAL
+            cost_usd_raw REAL,
+            speed TEXT
         );
         CREATE UNIQUE INDEX idx_entries_dedup
             ON session_entries(msg_id, req_id)
@@ -56,8 +56,8 @@ INSERT INTO session_entries (
     source_path, line_offset, timestamp_utc, model,
     msg_id, req_id, input_tokens, output_tokens,
     cache_create_tokens, cache_read_tokens,
-    usage_extra_json, cost_usd_raw
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    usage_extra_json, speed, cost_usd_raw
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(msg_id, req_id)
 WHERE msg_id IS NOT NULL AND req_id IS NOT NULL
 DO UPDATE SET
@@ -68,6 +68,7 @@ DO UPDATE SET
     cache_create_tokens = excluded.cache_create_tokens,
     cache_read_tokens = excluded.cache_read_tokens,
     usage_extra_json = excluded.usage_extra_json,
+    speed = excluded.speed,
     cost_usd_raw = excluded.cost_usd_raw
 WHERE
     (excluded.input_tokens + excluded.output_tokens
@@ -75,14 +76,24 @@ WHERE
     >
     (session_entries.input_tokens + session_entries.output_tokens
      + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
+ OR (
+    (excluded.input_tokens + excluded.output_tokens
+     + excluded.cache_create_tokens + excluded.cache_read_tokens)
+    =
+    (session_entries.input_tokens + session_entries.output_tokens
+     + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
+    AND excluded.speed IS NOT NULL
+    AND session_entries.speed IS NULL
+ )
 """
 
 
 def _row(source_path, msg_id, req_id, out_tokens, *, line_offset=0):
+    # #181: speed materialized into its own column; usage_extra_json NULL.
     return (
         source_path, line_offset, "2026-05-22T17:04:00Z", "claude-opus-4-7",
         msg_id, req_id, 0, out_tokens, 0, 0,
-        json.dumps({}), None,
+        None, None, None,
     )
 
 

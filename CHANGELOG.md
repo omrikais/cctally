@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Dashboard: stop the steady-state one-core CPU peg on large caches. The background sync thread rebuilds the full snapshot every few seconds, and several panels read wide historical ranges that re-parsed the per-row `usage_extra_json` JSON blob on every tick — on a ~260K-entry cache a single rebuild cost roughly a core-second, so rebuilds ran back-to-back and one core stayed pinned. The only non-token field any reader consumes (`speed`, for the `<model>-fast` label) is now materialized into a real `session_entries.speed` column, so the hot cache read paths reconstruct usage with zero JSON parsing; a one-time cache migration backfills the column from the existing blobs, and new ingests write the column directly (the now-unused blob is written `NULL` and reclaimed on the next `cache-sync --rebuild`). Output is byte-identical everywhere `speed` matters; on a 250K-row synthetic cache the wide read dropped from ~1.6s to ~0.35s per call (#181).
+
 ## [1.38.0] - 2026-06-12
 
 ### Added

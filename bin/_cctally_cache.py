@@ -928,14 +928,12 @@ def sync_cache(
                             out = int(usage.get("output_tokens", 0) or 0)
                             cc = int(usage.get("cache_creation_input_tokens", 0) or 0)
                             cr = int(usage.get("cache_read_input_tokens", 0) or 0)
-                            extras = {
-                                k: v for k, v in usage.items()
-                                if k not in (
-                                    "input_tokens", "output_tokens",
-                                    "cache_creation_input_tokens",
-                                    "cache_read_input_tokens",
-                                )
-                            }
+                            # #181: `speed` is the ONLY non-token usage key any
+                            # consumer reads, so materialize just that scalar and
+                            # write NULL into usage_extra_json — no more
+                            # serializing the deeply-nested blob the read paths
+                            # used to json.loads per row.
+                            speed = usage.get("speed")
                             rows.append((
                                 path_str,
                                 offset,
@@ -944,7 +942,8 @@ def sync_cache(
                                 msg_id,
                                 req_id,
                                 inp, out, cc, cr,
-                                json.dumps(extras, sort_keys=True) if extras else None,
+                                None,    # usage_extra_json — bloat no longer written (#181)
+                                speed,   # materialized speed column
                                 entry.cost_usd,
                             ))
                         if mrow is not None:
@@ -1005,8 +1004,8 @@ def sync_cache(
                            (source_path, line_offset, timestamp_utc, model,
                             msg_id, req_id, input_tokens, output_tokens,
                             cache_create_tokens, cache_read_tokens,
-                            usage_extra_json, cost_usd_raw)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                            usage_extra_json, speed, cost_usd_raw)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(msg_id, req_id)
                            WHERE msg_id IS NOT NULL AND req_id IS NOT NULL
                            DO UPDATE SET
@@ -1017,6 +1016,7 @@ def sync_cache(
                                cache_create_tokens = excluded.cache_create_tokens,
                                cache_read_tokens = excluded.cache_read_tokens,
                                usage_extra_json = excluded.usage_extra_json,
+                               speed = excluded.speed,
                                cost_usd_raw = excluded.cost_usd_raw
                            WHERE
                                (excluded.input_tokens + excluded.output_tokens
@@ -1030,8 +1030,8 @@ def sync_cache(
                                =
                                (session_entries.input_tokens + session_entries.output_tokens
                                 + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
-                               AND json_extract(excluded.usage_extra_json, '$.speed') IS NOT NULL
-                               AND json_extract(session_entries.usage_extra_json, '$.speed') IS NULL
+                               AND excluded.speed IS NOT NULL
+                               AND session_entries.speed IS NULL
                             )""",
                         rows,
                     )
@@ -1266,7 +1266,7 @@ def iter_entries(
 
     sql = (
         "SELECT timestamp_utc, model, input_tokens, output_tokens, "
-        "cache_create_tokens, cache_read_tokens, usage_extra_json, "
+        "cache_create_tokens, cache_read_tokens, speed, "
         "cost_usd_raw, source_path "
         "FROM session_entries "
         "WHERE timestamp_utc >= ? AND timestamp_utc <= ?"
@@ -1292,12 +1292,12 @@ def iter_entries(
             "cache_creation_input_tokens": row[4],
             "cache_read_input_tokens":     row[5],
         }
-        if row[6]:
-            # Safe because sync_cache strips the four token keys from
-            # extras before storing them in usage_extra_json. If that
-            # write-side invariant ever changes, extras could shadow
-            # the int-normalized token columns.
-            usage.update(json.loads(row[6]))
+        # speed is the only non-token usage key any consumer reads (#181);
+        # materialized into its own column so this hot path never parses JSON.
+        # `is not None` (not truthiness) so an empty-string speed still surfaces,
+        # mirroring the SQL `json_extract(...) IS NOT NULL` parity.
+        if row[6] is not None:
+            usage["speed"] = row[6]
         entries.append(UsageEntry(
             timestamp=dt.datetime.fromisoformat(row[0]),
             model=row[1],
@@ -1430,7 +1430,7 @@ def get_claude_session_entries(
         "  se.cache_create_tokens, se.cache_read_tokens, "
         "  se.source_path, "
         "  sf.session_id, sf.project_path, "
-        "  se.cost_usd_raw, se.usage_extra_json "
+        "  se.cost_usd_raw, se.speed "
         "FROM session_entries se "
         "LEFT JOIN session_files sf ON sf.path = se.source_path "
         "WHERE se.timestamp_utc >= ? AND se.timestamp_utc <= ?"
@@ -1458,7 +1458,10 @@ def get_claude_session_entries(
             session_id=row[7],
             project_path=row[8],
             cost_usd=row[9],
-            usage_extra=(json.loads(row[10]) if row[10] else None),
+            # speed materialized into its own column (#181); reconstruct the
+            # {"speed": …} shape _usage_entry_from_joined already merges, with
+            # zero JSON parsing. `is not None` so an empty-string speed surfaces.
+            usage_extra=({"speed": row[10]} if row[10] is not None else None),
         )
         for row in rows
     ]

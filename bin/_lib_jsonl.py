@@ -85,8 +85,10 @@ def _should_replace(
     finalization row carries `speed`; streaming intermediates don't).
 
     The `usage.get("speed") is not None` check matches the SQL UPDATE WHERE
-    clause's `json_extract(..., '$.speed') IS NOT NULL` in `sync_cache`'s
-    INSERT … ON CONFLICT … DO UPDATE, keeping the direct-parse fallback and
+    clause's `excluded.speed IS NOT NULL` in `sync_cache`'s INSERT … ON
+    CONFLICT … DO UPDATE — `speed` is materialized into its own
+    `session_entries.speed` column (#181), so the tiebreak no longer
+    `json_extract`s the blob — keeping the direct-parse fallback and
     cache-ingest paths in lockstep on the rare-but-possible "explicit JSON
     null" payload.
     """

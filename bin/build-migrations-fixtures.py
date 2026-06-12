@@ -179,7 +179,8 @@ def build_03_failure(scenario_dir: Path) -> None:
             cache_create_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
             usage_extra_json    TEXT,
-            cost_usd_raw        REAL
+            cost_usd_raw        REAL,
+            speed               TEXT
         );
         """
         + CACHE_META_DDL
@@ -501,7 +502,8 @@ def build_per_migration_001_dedup_highest_wins(scenario_dir: Path) -> None:
                     cache_create_tokens INTEGER NOT NULL DEFAULT 0,
                     cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
                     usage_extra_json    TEXT,
-                    cost_usd_raw        REAL
+                    cost_usd_raw        REAL,
+                    speed               TEXT
                 );
                 CREATE INDEX idx_entries_timestamp
                     ON session_entries(timestamp_utc);
@@ -1067,7 +1069,8 @@ def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
                     cache_create_tokens INTEGER NOT NULL DEFAULT 0,
                     cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
                     usage_extra_json    TEXT,
-                    cost_usd_raw        REAL
+                    cost_usd_raw        REAL,
+                    speed               TEXT
                 );
                 """
                 + CACHE_META_DDL
@@ -1744,6 +1747,136 @@ def build_per_migration_007_conversation_reingest_enrichment(
     _build_post(pre, post)
 
 
+def build_per_migration_008_session_entries_speed_backfill(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for cache migration
+    ``008_session_entries_speed_backfill`` (#181).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — full production cache schema (via
+        ``_apply_cache_schema``, which ALTER-adds the ``speed`` column so it is
+        PRESENT but NULL on every legacy row), a ``schema_migrations`` table
+        carrying 001-007 (an existing install at the 007 head) but NOT 008, and
+        a single ``session_entries`` row whose ``usage_extra_json`` still holds
+        the legacy ``{"speed":"fast"}`` blob while its ``speed`` column is NULL —
+        the existing-install shape before the materialize-speed backfill.
+      * ``post.sqlite`` — same DB after running the production 008 handler. The
+        handler runs ONE C-side ``UPDATE … SET speed = json_extract(...)`` over
+        rows where ``speed IS NULL AND usage_extra_json IS NOT NULL``, so
+        post.sqlite carries ``speed='fast'`` with ``usage_extra_json``
+        UNCHANGED (the handler never NULLs/rewrites the blob or VACUUMs), plus
+        the 008 marker stamped (central dispatcher stamp, #140).
+
+    Loaded by ``tests/test_cache_migration_008_per_migration_goldens.py``.
+    Because the handler calls the cache handler ALONE (no schema-apply), the
+    ``speed`` column MUST already exist in pre.sqlite (else the backfill UPDATE
+    hits ``no such column: speed``); ``_apply_cache_schema`` guarantees that.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    # The 007-head prior chain stamped into pre.sqlite (an existing install that
+    # has every prior cache migration but not yet the #181 speed backfill).
+    _PRIOR_CHAIN = (
+        "001_dedup_highest_wins",
+        "002_conversation_messages_backfill",
+        "003_conversation_reingest_tool_ids",
+        "004_conversation_reingest_subagent_kind",
+        "005_conversation_reingest_meta",
+        "006_conversation_reingest_source_tool_use_id",
+        "007_conversation_reingest_enrichment",
+    )
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _cctally, db = _load_cctally()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in _PRIOR_CHAIN:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-06-12T12:00:00Z"),
+                )
+            # One legacy session_entries row: the speed column is NULL (the
+            # materialize-speed migration had not yet run), while the legacy
+            # usage_extra_json blob still carries {"speed":"fast"}. The explicit
+            # column list omits `speed` so it takes its NULL schema default.
+            conn.execute(
+                "INSERT INTO session_entries "
+                "(source_path, line_offset, timestamp_utc, model, "
+                " msg_id, req_id, input_tokens, output_tokens, "
+                " cache_create_tokens, cache_read_tokens, "
+                " usage_extra_json, cost_usd_raw) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("/fake/.claude/projects/-Users-u-proj/sess.jsonl", 0,
+                 "2026-04-15T15:00:00Z", "claude-haiku-4-5", "m1", "r1",
+                 200_000, 40_000, 0, 0, '{"speed": "fast"}', None),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _cctally, db = _load_cctally()
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "008_session_entries_speed_backfill":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit(
+                "008_session_entries_speed_backfill not registered"
+            )
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Backfill handler: one UPDATE … SET speed = json_extract(...) over
+            # rows where speed IS NULL AND usage_extra_json IS NOT NULL; the
+            # usage_extra_json blob is left UNCHANGED. Then stamp the marker
+            # centrally (the dispatcher owns the stamp per #140) with a PINNED
+            # timestamp so the committed golden is rebuild-deterministic.
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("008_session_entries_speed_backfill", "2026-06-12T12:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -1772,6 +1905,9 @@ def main() -> int:
     )
     build_per_migration_007_conversation_reingest_enrichment(
         FIXTURES_ROOT / "per-migration" / "007_conversation_reingest_enrichment"
+    )
+    build_per_migration_008_session_entries_speed_backfill(
+        FIXTURES_ROOT / "per-migration" / "008_session_entries_speed_backfill"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

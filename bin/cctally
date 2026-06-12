@@ -1614,13 +1614,14 @@ def _usage_entry_from_joined(je) -> "UsageEntry":
     and the per-token integers; this adapter is pure shape conversion
     with no cache re-read.
 
-    Non-token ``usage`` extras (``je.usage_extra``) — notably ``speed`` —
+    Non-token ``usage`` extras (``je.usage_extra``) — now just ``speed`` —
     are merged AFTER the four token keys, mirroring ``iter_entries``'
-    ``usage.update(json.loads(...))``. Without this, the project-axis
+    reconstruction of ``usage["speed"]`` from the materialized
+    ``session_entries.speed`` column (#181). Without this, the project-axis
     ``daily`` path (and the diff/report joined-entry consumers) would
     drop the fast-tier flag and render ``<model>`` where the normal path
-    renders ``<model>-fast``. The write-side strips the four token keys
-    from ``usage_extra_json`` so the merge never shadows the integers.
+    renders ``<model>-fast``. ``je.usage_extra`` is ``{"speed": …}`` or
+    ``None``, so the merge never shadows the token integers.
     """
     usage = {
         "input_tokens": je.input_tokens,

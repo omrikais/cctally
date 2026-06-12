@@ -71,7 +71,7 @@ def _seed_cache(db_path: pathlib.Path, *, unpriced: bool) -> None:
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_create_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-                usage_extra_json TEXT, cost_usd_raw REAL
+                usage_extra_json TEXT, cost_usd_raw REAL, speed TEXT
             )
             """
         )

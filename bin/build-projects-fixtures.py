@@ -105,7 +105,8 @@ def _open_with_full_schema(path: pathlib.Path) -> sqlite3.Connection:
             cache_create_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
             usage_extra_json    TEXT,
-            cost_usd_raw        REAL
+            cost_usd_raw        REAL,
+            speed               TEXT
         );
         CREATE INDEX idx_entries_timestamp
             ON session_entries(timestamp_utc);

@@ -539,7 +539,7 @@ def _emit_pricing_cache(db_path: pathlib.Path) -> None:
             output_tokens INTEGER NOT NULL DEFAULT 0,
             cache_create_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-            usage_extra_json TEXT, cost_usd_raw REAL
+            usage_extra_json TEXT, cost_usd_raw REAL, speed TEXT
         )
     """)
     as_of = os.environ.get("CCTALLY_AS_OF", "2026-05-13T14:22:31+00:00")

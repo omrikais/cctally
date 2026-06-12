@@ -53,7 +53,8 @@ def cache_db(tmp_path):
             cache_create_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens INTEGER NOT NULL DEFAULT 0,
             usage_extra_json TEXT,
-            cost_usd_raw REAL
+            cost_usd_raw REAL,
+            speed TEXT
         );
         CREATE UNIQUE INDEX idx_entries_dedup
             ON session_entries(msg_id, req_id)
@@ -73,8 +74,8 @@ INSERT INTO session_entries (
     source_path, line_offset, timestamp_utc, model,
     msg_id, req_id, input_tokens, output_tokens,
     cache_create_tokens, cache_read_tokens,
-    usage_extra_json, cost_usd_raw
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    usage_extra_json, speed, cost_usd_raw
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(msg_id, req_id)
 WHERE msg_id IS NOT NULL AND req_id IS NOT NULL
 DO UPDATE SET
@@ -85,6 +86,7 @@ DO UPDATE SET
     cache_create_tokens = excluded.cache_create_tokens,
     cache_read_tokens = excluded.cache_read_tokens,
     usage_extra_json = excluded.usage_extra_json,
+    speed = excluded.speed,
     cost_usd_raw = excluded.cost_usd_raw
 WHERE
     (excluded.input_tokens + excluded.output_tokens
@@ -98,18 +100,19 @@ WHERE
     =
     (session_entries.input_tokens + session_entries.output_tokens
      + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
-    AND json_extract(excluded.usage_extra_json, '$.speed') IS NOT NULL
-    AND json_extract(session_entries.usage_extra_json, '$.speed') IS NULL
+    AND excluded.speed IS NOT NULL
+    AND session_entries.speed IS NULL
  )
 """
 
 
 def _row(msg_id, req_id, out_tokens, *, speed=None, in_tokens=0, cc=0, cr=0):
-    extras = {} if speed is None else {"speed": speed}
+    # #181: speed is materialized into its own column; usage_extra_json is
+    # written NULL by production ingest. Mirror that here.
     return (
         "/tmp/fake.jsonl", 0, "2026-05-22T17:04:00Z", "claude-opus-4-7",
         msg_id, req_id, in_tokens, out_tokens, cc, cr,
-        json.dumps(extras), None,
+        None, speed, None,
     )
 
 
@@ -140,7 +143,7 @@ def test_speed_set_breaks_tie(cache_db):
     cache_db.execute(UPSERT_SQL, _row("m1", "r1", out_tokens=100))
     cache_db.execute(UPSERT_SQL, _row("m1", "r1", out_tokens=100, speed="standard"))
     rows = cache_db.execute(
-        "SELECT msg_id, output_tokens, json_extract(usage_extra_json, '$.speed') "
+        "SELECT msg_id, output_tokens, speed "
         "FROM session_entries"
     ).fetchall()
     assert rows == [("m1", 100, "standard")]

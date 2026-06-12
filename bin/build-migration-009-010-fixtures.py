@@ -63,7 +63,8 @@ CREATE TABLE session_entries (
     cache_create_tokens INTEGER,
     cache_read_tokens INTEGER,
     usage_extra_json TEXT,
-    cost_usd_raw REAL
+    cost_usd_raw REAL,
+    speed TEXT
 );
 CREATE TABLE cache_meta (
     key   TEXT PRIMARY KEY,

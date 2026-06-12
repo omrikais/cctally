@@ -644,22 +644,24 @@ def seed_session_entry(
     msg_id: Optional[str] = None,
     req_id: Optional[str] = None,
     usage_extra_json: Optional[str] = None,
+    speed: Optional[str] = None,
     cost_usd_raw: Optional[float] = None,
 ) -> None:
     """Insert a session_entries row. Matches production column list;
-    cost_usd_raw left NULL by default since costs are recomputed at
-    query time from CLAUDE_MODEL_PRICING."""
+    cost_usd_raw left NULL by default since costs are recomputed at query
+    time from CLAUDE_MODEL_PRICING. `speed` materializes the fast-tier flag
+    (#181); leave None for normal-tier rows."""
     conn.execute(
         """INSERT INTO session_entries
            (source_path, line_offset, timestamp_utc, model,
             msg_id, req_id,
             input_tokens, output_tokens, cache_create_tokens, cache_read_tokens,
-            usage_extra_json, cost_usd_raw)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            usage_extra_json, speed, cost_usd_raw)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (source_path, line_offset, timestamp_utc, model,
          msg_id, req_id,
          input_tokens, output_tokens, cache_create, cache_read,
-         usage_extra_json, cost_usd_raw),
+         usage_extra_json, speed, cost_usd_raw),
     )
 
 

@@ -2304,7 +2304,8 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             cache_create_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
             usage_extra_json    TEXT,
-            cost_usd_raw        REAL
+            cost_usd_raw        REAL,
+            speed               TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_entries_timestamp
             ON session_entries(timestamp_utc);
@@ -2384,6 +2385,14 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     # populated lazily in sync_cache() / _ensure_session_files_row().
     add_column_if_missing(conn, "session_files", "session_id", "TEXT")
     add_column_if_missing(conn, "session_files", "project_path", "TEXT")
+    # #181: materialize the only-ever-consumed extra `usage` key (`speed`) into
+    # a real session_entries column so the hot cache read paths (iter_entries /
+    # get_claude_session_entries) stop json.loads-ing the deeply-nested
+    # usage_extra_json blob per row — that per-tick parse was pegging a core in
+    # the dashboard. Idempotent column-add (no marker, no version), appended
+    # after cost_usd_raw to match the CREATE TABLE order; cache migration 008
+    # then backfills it from the legacy blob on existing rows.
+    add_column_if_missing(conn, "session_entries", "speed", "TEXT")
     # Existing-DB guard for the skill-content fold link (cctally-dev
     # skill-content-nesting): the message-level sourceToolUseID. Idempotent
     # column-add (no marker, no version); cache migration 006 then re-ingests
@@ -3171,6 +3180,33 @@ def _007_conversation_reingest_enrichment(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@cache_migration("008_session_entries_speed_backfill")
+def _008_session_entries_speed_backfill(conn: sqlite3.Connection) -> None:
+    """Backfill the materialized ``session_entries.speed`` column from the
+    legacy ``usage_extra_json`` blob (#181). ``speed`` is the ONLY non-token
+    ``usage`` key any consumer reads (``<model>-fast`` rendering in
+    _lib_aggregators + the _should_replace dedup tiebreak); materializing it
+    lets the hot read paths (iter_entries / get_claude_session_entries) stop
+    ``json.loads``-ing the deeply-nested blob per row — the per-tick dashboard
+    rebuild was pegging a core on a ~261K-row cache.
+
+    The column is added by _apply_cache_schema's add_column_if_missing (which
+    runs before this dispatcher), so it always exists here. This handler only
+    backfills existing rows; new ingests write the column directly and write
+    NULL to usage_extra_json. ``WHERE speed IS NULL`` self-guards re-runs.
+    We do NOT rewrite/NULL usage_extra_json on existing rows or VACUUM — the
+    stale blob has no reader and is reclaimed on the next cache-sync --rebuild.
+    json_extract returns NULL when '$.speed' is absent, so speed-less rows stay
+    NULL. Central stamp via the dispatcher (#140); a fresh install stamps it
+    without effect (empty table)."""
+    conn.execute(
+        "UPDATE session_entries "
+        "SET speed = json_extract(usage_extra_json, '$.speed') "
+        "WHERE speed IS NULL AND usage_extra_json IS NOT NULL"
+    )
+    conn.commit()
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")
@@ -3323,6 +3359,10 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
                         "cache_creation_input_tokens": cc,
                         "cache_read_input_tokens": cr,
                     }
+                    # #181: usage_extra_json is cost-irrelevant (cost is
+                    # token-only); parsed here only for pre-008 rows that may
+                    # still carry the legacy blob — NOT a speed reader, so the
+                    # write-side NULL going forward is safe.
                     if extras_json:
                         usage.update(json.loads(extras_json))
                     total += _calculate_entry_cost(
@@ -3637,6 +3677,10 @@ def _009_recompute_five_hour_blocks_dedup_fix(
                         "cache_creation_input_tokens": cc_t,
                         "cache_read_input_tokens": cr_t,
                     }
+                    # #181: usage_extra_json is cost-irrelevant (cost is
+                    # token-only); parsed here only for pre-008 rows that may
+                    # still carry the legacy blob — NOT a speed reader, so the
+                    # write-side NULL going forward is safe.
                     if extras_json:
                         usage.update(json.loads(extras_json))
                     cost = _calculate_entry_cost(
@@ -3909,6 +3953,10 @@ def _010_recompute_percent_milestones_dedup_fix(
                         "cache_creation_input_tokens": cc,
                         "cache_read_input_tokens": cr,
                     }
+                    # #181: usage_extra_json is cost-irrelevant (cost is
+                    # token-only); parsed here only for pre-008 rows that may
+                    # still carry the legacy blob — NOT a speed reader, so the
+                    # write-side NULL going forward is safe.
                     if extras_json:
                         usage.update(json.loads(extras_json))
                     cumulative += _calculate_entry_cost(
