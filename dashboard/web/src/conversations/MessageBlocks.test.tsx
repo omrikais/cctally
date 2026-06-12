@@ -2,7 +2,14 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageBlocks } from './MessageBlocks';
 import { AskUserQuestionCard } from './AskUserQuestionCard'; // ensure import resolves
+import { TranscriptContext } from './TranscriptContext';
 import type { ConversationBlock } from '../types/conversation';
+
+// #177 S4: MediaFigure reads the session id from TranscriptContext; the media
+// mount-point tests render under a provider so figures become addressable.
+function withSession(node: React.ReactElement, sessionId = 's1') {
+  return render(<TranscriptContext.Provider value={{ sessionId }}>{node}</TranscriptContext.Provider>);
+}
 
 const call = (
   over: Partial<Extract<ConversationBlock, { kind: 'tool_call' }>> = {},
@@ -481,5 +488,80 @@ describe('MessageBlocks — Task* checklist run collapses to one card', () => {
     expect(container.querySelector('.conv-todo')).toBeNull();
     expect(container.querySelector('.conv-toolrun-head')).toBeTruthy();
     expect(container.querySelectorAll('.conv-chip--tool').length).toBe(2);
+  });
+});
+
+describe('MessageBlocks — Session 4 MCP chip pill (Q5-A)', () => {
+  it('an MCP call splits action + server pill and tooltips the full name', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[call({
+        name: 'mcp__plugin_playwright_playwright__browser_click', preview: 'click #x',
+      })]} />,
+    );
+    const name = container.querySelector('.conv-chip-name')!;
+    expect(name.textContent).toBe('browser_click');
+    expect(name.getAttribute('title')).toBe('mcp__plugin_playwright_playwright__browser_click');
+    const pill = container.querySelector('.conv-chip-server')!;
+    expect(pill.textContent).toBe('playwright');
+  });
+
+  it('BYTE-IDENTICAL PIN: a non-Session-4 tool (Grep) has no server pill and the bare name', () => {
+    // Codex F8 narrowing: every tool WITHOUT a Session-4 special renderer must
+    // render byte-identically to today. Grep has no special card and no MCP
+    // prefix → no .conv-chip-server pill, and .conv-chip-name is exactly "Grep".
+    const { container } = render(<MessageBlocks blocks={[call({ name: 'Grep', preview: 'pat' })]} />);
+    expect(container.querySelector('.conv-chip-server')).toBeNull();
+    expect(container.querySelector('.conv-chip-name')!.textContent).toBe('Grep');
+  });
+});
+
+describe('MessageBlocks — Session 4 media mount points (Q7-A)', () => {
+  it('a tool_call whose result carries media renders a figure img with the tool_use_id URL', () => {
+    const { container } = withSession(
+      <MessageBlocks blocks={[call({
+        name: 'mcp__claude-in-chrome__browser_take_screenshot', tool_use_id: 'tu_shot',
+        result: { text: 'shot taken', truncated: false, is_error: false,
+          media: [{ kind: 'image', media_type: 'image/png', bytes: 200000, index: 0 }] },
+      })]} />,
+    );
+    // Open the disclosure so the result body (and the figure) mount.
+    (container.querySelector('details.conv-chip--tool') as HTMLDetailsElement).open = true;
+    const img = container.querySelector('figure.conv-media-figure img')!;
+    expect(img.getAttribute('src')).toBe('/api/conversation/s1/media?tool_use_id=tu_shot&index=0');
+  });
+
+  it('a user-content image block renders the uuid-mode img via the threaded anchor', () => {
+    const { container } = withSession(
+      <MessageBlocks
+        blocks={[{ kind: 'image', media_type: 'image/png', bytes: 170000, index: 0 }]}
+        anchorUuid="u7"
+      />,
+    );
+    expect(container.querySelector('img')!.getAttribute('src'))
+      .toBe('/api/conversation/s1/media?uuid=u7&index=0');
+  });
+
+  it('the same image block WITHOUT index degrades to the badge (no img)', () => {
+    const { container } = withSession(
+      <MessageBlocks
+        blocks={[{ kind: 'image', media_type: 'image/png', bytes: 170000 }]}
+        anchorUuid="u7"
+      />,
+    );
+    expect(container.querySelector('img')).toBeNull();
+    expect(container.querySelector('.conv-chip--media')!.textContent).toContain('image/png');
+  });
+
+  it('an orphan tool_result block with media + tool_use_id renders a figure', () => {
+    const { container } = withSession(
+      <MessageBlocks blocks={[{
+        kind: 'tool_result', text: 'orphaned', truncated: false, is_error: false,
+        tool_use_id: 'tu_orphan',
+        media: [{ kind: 'image', media_type: 'image/png', bytes: 90000, index: 0 }],
+      }]} />,
+    );
+    (container.querySelector('details.conv-chip--result') as HTMLDetailsElement).open = true;
+    const img = container.querySelector('figure.conv-media-figure img')!;
+    expect(img.getAttribute('src')).toBe('/api/conversation/s1/media?tool_use_id=tu_orphan&index=0');
   });
 });

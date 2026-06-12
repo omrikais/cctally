@@ -5210,6 +5210,17 @@ mark.current {
 .conv-chip--result .conv-chip-status,
 .conv-chip--tool .conv-chip-status { color: var(--accent-amber); }
 
+/* #177 S4: quiet MCP server pill on the chip header (Q5-A). */
+.conv-chip-server {
+  flex: none;
+  font-size: 10.5px;
+  padding: 1px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+}
+
 .conv-chip-body {
   padding: 8px 10px;
   border-top: 1px solid var(--border-soft);
@@ -5992,3 +6003,58 @@ mark.current {
 .conv-plan-more button:hover { background: rgba(192,132,252,.06); }
 .conv-plan-trunc { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint);
   padding: 6px 14px 10px; }
+
+/* #177 S4 (Q7-A): inline media figure + quiet caption row. */
+.conv-media-figure { margin: 8px 0; }
+.conv-media-figure img {
+  display: block;
+  max-width: 100%;
+  max-height: 340px;
+  object-fit: contain;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+}
+.conv-media-caption {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+.conv-media-caption a { margin-left: auto; }
+/* The unaddressable / source-gone degrade hint on the byte-count badge. */
+.conv-media-gone { color: var(--text-faint); }
+
+/* #177 S4 (Q6-A): web source cards. Status-chip colors reuse the
+   .conv-plan-badge--ok/--no rgba palette so success/error read consistently. */
+.conv-web { border-left: 2px solid var(--accent-cyan); }
+.conv-web-domain { color: var(--text); flex: 0 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-web-status {
+  flex: none;
+  margin-left: auto;
+  font-size: 10.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  letter-spacing: 0.04em;
+}
+.conv-web-status--ok { color: #eafff1; background: rgba(61,220,132,.16); border: 1px solid rgba(61,220,132,.5); }
+.conv-web-status--err { color: #ffe7e7; background: rgba(239,68,68,.14); border: 1px solid rgba(239,68,68,.5); }
+.conv-web-body { padding: 8px 12px; position: relative; }
+.conv-web-field { display: flex; gap: 8px; margin: 3px 0; font-size: 12px; }
+.conv-web-field .conv-web-key {
+  flex: none; width: 52px; text-transform: uppercase;
+  font-size: 10px; letter-spacing: 0.07em; color: var(--text-dim); padding-top: 2px;
+}
+.conv-web-field a { word-break: break-all; }
+.conv-web-md { font-size: 12px; }
+.conv-web-md--clamp { max-height: 320px; overflow: hidden; position: relative; }
+.conv-web-md--clamp::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0;
+  height: 60px; background: linear-gradient(180deg, transparent, var(--panel-bg)); }
+.conv-web-more { border-top: 1px solid var(--border-soft); margin-top: 6px; }
+.conv-web-more button { all: unset; cursor: pointer; width: 100%; text-align: center;
+  font-family: var(--font-mono); font-size: 11px; color: var(--accent-cyan); padding: 8px 0; }
+.conv-web-more button:hover { background: rgba(34,211,238,.06); }
+.conv-web-link { margin: 6px 0; }
+.conv-web-link-domain { display: block; font-size: 11.5px; color: var(--text-dim); }
+.conv-web-copy { position: absolute; top: 8px; right: 8px; }

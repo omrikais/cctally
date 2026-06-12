@@ -60,6 +60,18 @@ export interface ChecklistTodo {
   activeForm?: string;
 }
 
+// #177 S4 — media placeholder carried on tool_result blocks (result.media /
+// orphan block media) and, with `index`, on user-content image/document
+// blocks. `bytes` is the BASE64 length in the source JSONL (decoded ≈ ×3/4).
+// `index` is the ingest-stamped ordinal among media items (the media route's
+// address); absent on pre-reingest rows → the figure degrades to the badge.
+export interface MediaRef {
+  kind: 'image' | 'document';
+  media_type: string | null;
+  bytes: number;
+  index: number;
+}
+
 export type ConversationBlock =
   | { kind: 'text'; text: string }
   | { kind: 'thinking'; text: string }
@@ -85,7 +97,10 @@ export type ConversationBlock =
       input_truncated?: boolean;                // #177 S1
       preview: string;
       tool_use_id: string | null;
-      result: { text: string; truncated: boolean; full_length?: number | null; is_error: boolean } | null;
+      // #177 S4 — `media` (tool-result media placeholders, render-ready) folds
+      // into the result object on owned calls; absent when the result carried
+      // no image/document items (and on pre-009-reingest rows).
+      result: { text: string; truncated: boolean; full_length?: number | null; is_error: boolean; media?: MediaRef[] } | null;
       answers?: Record<string, string>;         // #177 S2 — {question: chosen label(s)}
       annotations?: Record<string, unknown>;    // #177 S2 — user notes keyed by question
       // #177 S3 — Bash stream split, stamped at the BLOCK level (siblings of
@@ -102,12 +117,21 @@ export type ConversationBlock =
       // runs and on legacy rows the fold never reached (consumers tolerate the
       // missing key and degrade to generic chips).
       task_snapshot?: ChecklistTodo[];
+      // #177 S4 — folded by the kernel's name-keyed Phase-3 join; absent on
+      // old rows (pre-009-reingest) and on every non-web tool. `code_text` is
+      // omitted at capture when the HTTP status text was empty.
+      web_search?: { query: string; links: { title: string; url: string }[]; links_truncated?: boolean };
+      web_fetch?: { code: number; code_text?: string };
     }
   // 'tool_result' BLOCK kind survives ONLY inside a standalone orphan
   // tool_result ITEM (a result the kernel could not fold into a request).
-  | { kind: 'tool_result'; text: string; truncated: boolean; is_error: boolean }
-  | { kind: 'image'; media_type: string | null; bytes: number }
-  | { kind: 'document'; media_type: string | null; bytes: number }
+  // #177 S4 — orphan results keep `tool_use_id` + `media` so their screenshots
+  // still render (the kernel surfaces media on the standalone result block).
+  | { kind: 'tool_result'; text: string; truncated: boolean; is_error: boolean; tool_use_id?: string | null; media?: MediaRef[] }
+  // #177 S4 — `index` is the ingest-stamped media ordinal (the uuid-mode route
+  // address); absent on pre-reingest rows → the figure degrades to the badge.
+  | { kind: 'image'; media_type: string | null; bytes: number; index?: number }
+  | { kind: 'document'; media_type: string | null; bytes: number; index?: number }
   | { kind: 'tool_reference'; name: string | null };
 
 export interface ConversationSummary {

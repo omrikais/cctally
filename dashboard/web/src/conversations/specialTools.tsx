@@ -5,6 +5,8 @@ import { TodoWriteCard } from './TodoWriteCard';
 import { ExitPlanModeCard } from './ExitPlanModeCard';
 import { DiffCard } from './DiffCard';
 import { BashCard } from './BashCard';
+import { WebFetchCard } from './WebFetchCard';
+import { WebSearchCard } from './WebSearchCard';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
 
@@ -36,6 +38,14 @@ function hasWriteInput(c: Call): boolean {
 function hasBashInput(c: Call): boolean {
   return typeof (c.input as { command?: unknown } | null | undefined)?.command === 'string';
 }
+// #177 S4 — web-card presence guards. Same Codex P1.2 rule: an absent/malformed
+// input returns null and falls through to the generic chip instead of vanishing.
+function hasWebFetchInput(c: Call): boolean {
+  return typeof (c.input as { url?: unknown } | null | undefined)?.url === 'string';
+}
+function hasWebSearchInput(c: Call): boolean {
+  return typeof (c.input as { query?: unknown } | null | undefined)?.query === 'string';
+}
 
 // Name-keyed dispatch to a dedicated renderer. Returns null when the tool has
 // no special card (→ the generic chip). This is the extension point Sessions
@@ -52,6 +62,10 @@ export function specialToolRenderer(call: Call): ReactElement | null {
     case 'multiedit': return hasMultiEditInput(call) ? <DiffCard call={call} /> : null;
     case 'write': return hasWriteInput(call) ? <DiffCard call={call} /> : null;
     case 'bash': return hasBashInput(call) ? <BashCard call={call} /> : null;
+    // #177 S4 — web tools (Q6-A). Guard runs here so absent input falls
+    // through to the generic chip instead of vanishing the tool.
+    case 'webfetch': return hasWebFetchInput(call) ? <WebFetchCard call={call} /> : null;
+    case 'websearch': return hasWebSearchInput(call) ? <WebSearchCard call={call} /> : null;
     default: return null;
   }
 }

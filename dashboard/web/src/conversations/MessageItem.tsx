@@ -52,7 +52,7 @@ function MessageItemImpl(
             <ResultIcon /> Tool result
             <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} className="conv-chip-permalink" />
           </summary>
-          <div className="conv-chip-body"><MessageBlocks blocks={item.blocks} /></div>
+          <div className="conv-chip-body"><MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} /></div>
         </details>
       </div>
     );
@@ -75,7 +75,7 @@ function MessageItemImpl(
         </div>
         {/* Document-order walk renders prose (from text blocks) + thinking +
             tool runs in order — no separate item.text render (#164). */}
-        <MessageBlocks blocks={item.blocks} />
+        <MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} />
         {item.text && (
           // Hover/focus-revealed action copying the turn's joined prose. Only
           // when there IS prose — a tool-only assistant turn renders none.
@@ -130,7 +130,7 @@ function MessageItemImpl(
             <pre className="conv-meta-body conv-meta-body--pre">{item.text}</pre>
           ) : (
             <div className="conv-meta-body">
-              <MessageBlocks blocks={item.blocks} />
+              <MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} />
               {mk === 'skill' && item.text && (
                 <div className="conv-item-actions">
                   <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
@@ -173,7 +173,7 @@ function MessageItemImpl(
       {item.text && <Markdown>{item.text}</Markdown>}
       {/* Joined prose renders above via item.text; pass only NON-text blocks to
           the walk so it doesn't double the human's prose. */}
-      <MessageBlocks blocks={item.blocks.filter((b) => b.kind !== 'text')} />
+      <MessageBlocks blocks={item.blocks.filter((b) => b.kind !== 'text')} anchorUuid={item.anchor.uuid} />
       {item.text && (
         <div className="conv-item-actions">
           <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />

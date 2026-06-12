@@ -1,4 +1,5 @@
 import type { ReactNode, SVGProps } from 'react';
+import { parseMcpName, type McpServerKind } from './parseMcpName';
 
 // Inline-SVG icon system for the conversation reader (C3 / H2). Each glyph is a
 // 24×24 stroke-only SVG inheriting the chip's per-kind accent through
@@ -241,16 +242,94 @@ export function PlanIcon() {
   );
 }
 
+// Browser window — the playwright server glyph (#177 S4).
+export function BrowserWindowIcon() {
+  return (
+    <Svg>
+      <rect x="2" y="4" width="20" height="16" rx="2" />
+      <path d="M2 9h20M5.5 6.5h.01M8.5 6.5h.01" />
+    </Svg>
+  );
+}
+
+// Chrome rings — the claude-in-chrome server glyph (#177 S4).
+export function ChromeIcon() {
+  return (
+    <Svg>
+      <circle cx="12" cy="12" r="9" />
+      <circle cx="12" cy="12" r="3.5" />
+      <path d="M12 8.5 19.5 7M8.9 13.8 4.6 19M15.1 13.8l4.3 5.2" />
+    </Svg>
+  );
+}
+
+// Monitor — the computer-use server glyph (#177 S4).
+export function MonitorIcon() {
+  return (
+    <Svg>
+      <rect x="3" y="4" width="18" height="12" rx="2" />
+      <path d="M9 20h6M12 16v4" />
+    </Svg>
+  );
+}
+
+// Prompt chevron — the codex server glyph (#177 S4).
+export function CodexIcon() {
+  return (
+    <Svg>
+      <path d="M4 17l6-5-6-5M12 19h8" />
+    </Svg>
+  );
+}
+
+// Plug — the generic MCP-server fallback glyph (#177 S4).
+export function PlugIcon() {
+  return (
+    <Svg>
+      <path d="M9 7V3M15 7V3" />
+      <path d="M6 7h12v4a6 6 0 0 1-12 0V7Z" />
+      <path d="M12 17v4" />
+    </Svg>
+  );
+}
+
+// Magnifier — WebSearch (GlobeIcon stays on WebFetch; #177 S4 spec §4.4).
+export function SearchIcon() {
+  return (
+    <Svg>
+      <circle cx="11" cy="11" r="7" />
+      <path d="M21 21l-4.3-4.3" />
+    </Svg>
+  );
+}
+
+// Per-MCP-server glyph (#177 S4).
+export function mcpServerIcon(kind: McpServerKind): ReactNode {
+  switch (kind) {
+    case 'playwright': return <BrowserWindowIcon />;
+    case 'chrome': return <ChromeIcon />;
+    case 'computer': return <MonitorIcon />;
+    case 'codex': return <CodexIcon />;
+    default: return <PlugIcon />;
+  }
+}
+
 // Per-tool glyph dispatcher: case-insensitive family match, generic box as the
 // never-blank fallback. Used by the tool chip + the tool_use degradation chip.
+// #177 S4: the MCP branch runs FIRST — an mcp__ name gets its per-server glyph;
+// WebSearch splits off the globe onto the magnifier (the globe stays on
+// WebFetch); non-MCP unknowns keep the generic box.
 export function toolIcon(name?: string | null): ReactNode {
+  const mcp = parseMcpName(name);       // #177 S4: per-server glyph
+  if (mcp) return mcpServerIcon(mcp.kind);
   const n = (name ?? '').toLowerCase();
   if (n === 'read' || n === 'grep' || n === 'glob' || n === 'ls') return <FileSearchIcon />;
   if (n === 'edit' || n === 'write' || n === 'notebookedit' || n === 'multiedit') return <PencilIcon />;
   if (n === 'bash') return <TerminalIcon />;
   if (n === 'task' || n === 'agent') return <SubagentIcon />;
   if (n === 'skill') return <SkillIcon />;
-  if (n === 'webfetch' || n === 'websearch') return <GlobeIcon />;
+  if (n === 'webfetch') return <GlobeIcon />;
+  if (n === 'websearch') return <SearchIcon />;
   if (n === 'askuserquestion') return <QuestionIcon />;
   if (n === 'exitplanmode') return <PlanIcon />;
   if (n === 'todowrite' || n === 'taskcreate') return <ChecklistIcon />;

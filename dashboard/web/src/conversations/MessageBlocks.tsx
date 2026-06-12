@@ -4,8 +4,6 @@ import {
   toolIcon,
   ThinkingIcon,
   ResultIcon,
-  ImageIcon,
-  DocumentIcon,
   ReferenceIcon,
 } from './ConvIcons';
 import { CopyButton } from './CopyButton';
@@ -14,7 +12,23 @@ import { LineNumberedCode } from './LineNumberedCode';
 import { resultLang } from './toolLang';
 import { specialToolRenderer } from './specialTools';
 import { TaskChecklistCard } from './TaskChecklistCard';
+import { parseMcpName } from './parseMcpName';
+import { MediaFigure } from './MediaFigure';
 import type { ConversationBlock } from '../types/conversation';
+
+// #177 S4 (Q5-A): MCP chips show `action [server-pill]`; the full original
+// name stays in the title tooltip + expanded request panel. Non-MCP names
+// render EXACTLY as before (byte-identical — pinned by test).
+function ChipName({ name }: { name: string | null | undefined }) {
+  const mcp = parseMcpName(name);
+  if (!mcp) return <span className="conv-chip-name">{name ?? 'tool'}</span>;
+  return (
+    <>
+      <span className="conv-chip-name" title={name ?? undefined}>{mcp.action}</span>
+      <span className="conv-chip-server">{mcp.serverLabel}</span>
+    </>
+  );
+}
 
 type ToolCall = Extract<ConversationBlock, { kind: 'tool_call' }>;
 
@@ -45,7 +59,7 @@ function isTaskChecklistRun(calls: ToolCall[]): boolean {
 // degradation) and `tool_result` (orphan item only) render as single chips too.
 // This single source of truth is used by both the assistant turn (which renders
 // its prose-from-text-blocks here, in order) and the human turn.
-export function MessageBlocks({ blocks }: { blocks: ConversationBlock[] }) {
+export function MessageBlocks({ blocks, anchorUuid }: { blocks: ConversationBlock[]; anchorUuid?: string | null }) {
   const out: ReactNode[] = [];
   let i = 0;
   let textRun: string[] = [];
@@ -74,7 +88,7 @@ export function MessageBlocks({ blocks }: { blocks: ConversationBlock[] }) {
       out.push(<ToolRun key={`r${out.length}`} calls={run} />);
       continue;
     }
-    out.push(<BlockChip key={`c${out.length}`} block={b} />);
+    out.push(<BlockChip key={`c${out.length}`} block={b} anchorUuid={anchorUuid} />);
     i++;
   }
   flushText();
@@ -134,7 +148,7 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
       <details className="conv-chip conv-chip--tool conv-chip--skill">
         <summary>
           <span className="conv-chev" aria-hidden="true" />
-          {toolIcon(call.name)} <span className="conv-chip-name">{call.name ?? 'tool'}</span>
+          {toolIcon(call.name)} <ChipName name={call.name} />
           <span className="conv-chip-preview">{call.preview}</span>
         </summary>
         <div className="conv-chip-body">
@@ -155,7 +169,7 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
     <details className="conv-chip conv-chip--tool">
       <summary>
         <span className="conv-chev" aria-hidden="true" />
-        {toolIcon(call.name)} <span className="conv-chip-name">{call.name ?? 'tool'}</span>
+        {toolIcon(call.name)} <ChipName name={call.name} />
         <span className="conv-chip-preview">{call.preview}</span>
         {status && <span className="conv-chip-status">{status}</span>}
       </summary>
@@ -173,6 +187,11 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
             </div>
             <CopyButton text={call.result.text} />
             <ToolResultBody result={call.result} name={call.name} preview={call.preview} />
+            {/* #177 S4 (Q7-A): tool-result screenshots render inline after the
+                text panel, in document order, addressed by this call's id. */}
+            {call.result.media?.map((m) => (
+              <MediaFigure key={m.index} media={m} toolUseId={call.tool_use_id} context={call.name ?? 'tool'} />
+            ))}
           </div>
         ) : (
           <div className="conv-tool-io">
@@ -193,7 +212,7 @@ function firstLine(s: string): string {
 
 // Single non-text, non-tool_call block: thinking chip, the tool_use degradation
 // fallback, an orphan tool_result chip, or an inline media/reference span.
-function BlockChip({ block }: { block: ConversationBlock }) {
+function BlockChip({ block, anchorUuid }: { block: ConversationBlock; anchorUuid?: string | null }) {
   switch (block.kind) {
     case 'thinking':
       return (
@@ -213,7 +232,7 @@ function BlockChip({ block }: { block: ConversationBlock }) {
         <details className="conv-chip conv-chip--tool">
           <summary>
             <span className="conv-chev" aria-hidden="true" />
-            {toolIcon(block.name)} <span className="conv-chip-name">{block.name ?? 'tool'}</span>
+            {toolIcon(block.name)} <ChipName name={block.name} />
           </summary>
           <div className="conv-chip-body conv-tool-io">
             <CopyButton text={block.input_summary} />
@@ -234,20 +253,25 @@ function BlockChip({ block }: { block: ConversationBlock }) {
           <div className="conv-chip-body conv-tool-io">
             <CopyButton text={block.text} />
             <pre className="conv-code">{block.text}</pre>
+            {/* #177 S4: orphaned tool-result screenshots still render — the
+                kernel keeps `media` + `tool_use_id` on the standalone block. */}
+            {block.media?.map((m) => (
+              <MediaFigure key={m.index} media={m} toolUseId={block.tool_use_id} context="tool result" />
+            ))}
           </div>
         </details>
       );
     case 'image':
-      return (
-        <span className="conv-chip conv-chip--media">
-          <ImageIcon /> {block.media_type ?? 'image'} · {block.bytes} B
-        </span>
-      );
     case 'document':
+      // #177 S4 (Q7-A): inline figure (image) / upgraded open-link badge
+      // (document) via the uuid-mode media route; degrades to the byte-count
+      // badge when unaddressable (pre-reingest rows / null anchor).
       return (
-        <span className="conv-chip conv-chip--media">
-          <DocumentIcon /> {block.media_type ?? 'document'} · {block.bytes} B
-        </span>
+        <MediaFigure
+          media={{ kind: block.kind, media_type: block.media_type, bytes: block.bytes, index: block.index ?? -1 }}
+          uuid={anchorUuid}
+          context="attached"
+        />
       );
     case 'tool_reference':
       return <span className="conv-chip conv-chip--ref"><ReferenceIcon /> {block.name ?? 'tool'}</span>;

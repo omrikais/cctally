@@ -60,4 +60,17 @@ describe('specialToolRenderer dispatch (#177 S3)', () => {
     // ExitPlanMode with empty plan still falls through (existing defensive guard).
     expect(specialToolRenderer(call({ name: 'ExitPlanMode', input: { plan: '' } }))).toBeNull();
   });
+
+  it('dispatches WebFetch/WebSearch only with their string input (Codex P1.2 guard)', () => {
+    expect(specialToolRenderer(call({ name: 'WebFetch', input: { url: 'https://x.com' } }))).toBeTruthy();
+    expect(specialToolRenderer(call({ name: 'WebSearch', input: { query: 'cats' } }))).toBeTruthy();
+    // Case-insensitive.
+    expect(specialToolRenderer(call({ name: 'webfetch', input: { url: 'https://x.com' } }))).toBeTruthy();
+    expect(specialToolRenderer(call({ name: 'websearch', input: { query: 'cats' } }))).toBeTruthy();
+    // Absent/malformed input → null (generic chip), guard runs before the card.
+    expect(specialToolRenderer(call({ name: 'WebFetch', input: null }))).toBeNull();
+    expect(specialToolRenderer(call({ name: 'WebFetch', input: { url: 42 } }))).toBeNull();
+    expect(specialToolRenderer(call({ name: 'WebSearch', input: null }))).toBeNull();
+    expect(specialToolRenderer(call({ name: 'WebSearch', input: { query: 42 } }))).toBeNull();
+  });
 });
