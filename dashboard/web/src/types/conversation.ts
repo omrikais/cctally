@@ -17,6 +17,10 @@ export type ConversationItem =
       subagent_key: string | null; // agent-file hash; null for the main session
       parent_uuid: string | null;  // raw parent uuid (for cross-file nesting)
       cost_usd: number; // the TURN's cost, counted ONCE (0.0 for null msg_id)
+      // #177 S1 backend / S5 client adoption (Codex F7) — per-turn token usage,
+      // stamped when the turn key has a session_entries row. Absent (NOT
+      // zero-filled) otherwise; the §6 footer reads it.
+      tokens?: TokenUsage;
     }
   | {
       // human or tool_result (also: assistant-with-null-msg_id, which carries model + cost_usd: 0)
@@ -51,6 +55,50 @@ export type ConversationItem =
       meta_kind: 'skill' | 'command' | 'context';
       skill_name: string | null;
     };
+
+// #177 S1 backend / S5 client adoption — per-turn token usage, stamped on
+// assistant turn items when the turn key has a session_entries row. Absent
+// (NOT zero-filled) otherwise. Shared by the detail item and the outline turn.
+export interface TokenUsage {
+  input: number;
+  output: number;
+  cache_creation: number;
+  cache_read: number;
+}
+
+// #177 S5 — GET /api/conversation/<id>/outline (spec §1). `ts` nullable (F6).
+export interface OutlineToolRef { name: string | null; is_error: boolean; }
+export interface OutlineTurn {
+  uuid: string;
+  kind: 'assistant' | 'human' | 'tool_result' | 'meta';
+  ts: string | null;
+  label: string;
+  member_uuids: string[];
+  subagent_key: string | null;
+  parent_uuid: string | null;
+  is_sidechain: boolean;
+  model?: string;
+  tokens?: TokenUsage;
+  tools?: OutlineToolRef[];
+  thinking?: string[];
+  meta_kind?: 'skill' | 'command' | 'context';
+  skill_name?: string | null;
+}
+export interface OutlineStats {
+  turns: { total: number; human: number; assistant: number; tool_result: number; meta: number };
+  tool_counts: Record<string, number>;
+  error_count: number;
+  models: Record<string, number>;
+  duration_seconds: number | null;
+  tokens: TokenUsage;
+  cost_usd: number;
+}
+export interface ConversationOutline {
+  session_id: string;
+  subagent_meta?: Record<string, SubagentMeta>;
+  stats: OutlineStats;
+  turns: OutlineTurn[];
+}
 
 // One row of a checklist card (TodoWrite legacy + the live Task* family). The
 // shared ChecklistCard renderer normalizes an unknown `status` to 'pending'.

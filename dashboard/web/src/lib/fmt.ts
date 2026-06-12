@@ -268,6 +268,23 @@ export const fmt = {
     const rem = total - m * 60;
     return rem ? `${m}m ${rem}s` : `${m}m`;
   },
+  // #177 S5 — inter-turn gap label: "<60 min" as whole minutes, else
+  // one-decimal hours with trailing ".0" dropped ("42 min" / "9.5 h" / "2 h").
+  gapDuration(seconds: number | null | undefined): string {
+    if (seconds == null || !isFinite(seconds) || seconds < 0) return '—';
+    if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
+    const h = (seconds / 3600).toFixed(1).replace(/\.0$/, '');
+    return `${h} h`;
+  },
+  // #177 S5 — token-count humanizer: <1000 raw, ≥1000 one-decimal k,
+  // ≥1,000,000 one-decimal M (trailing ".0" dropped): 873 / 1.2k / 310k / 4.1M.
+  tokens(v: number | null | undefined): string {
+    if (v == null || !isFinite(v)) return '—';
+    if (v < 1000) return String(Math.round(v));
+    const fmt1 = (n: number) => n.toFixed(1).replace(/\.0$/, '');
+    if (v < 1_000_000) return `${fmt1(v / 1000)}k`;
+    return `${fmt1(v / 1_000_000)}M`;
+  },
   ddhh(v: number | null | undefined): string {
     if (v == null) return '—';
     const d = (v / 86400) | 0;

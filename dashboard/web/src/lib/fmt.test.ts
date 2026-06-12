@@ -20,3 +20,41 @@ describe('fmt.durationMs', () => {
     expect(fmt.durationMs(undefined)).toBe('—');
   });
 });
+
+describe('fmt.gapDuration (#177 S5)', () => {
+  it('renders "—" for null/undefined/NaN/negative', () => {
+    expect(fmt.gapDuration(null)).toBe('—');
+    expect(fmt.gapDuration(undefined)).toBe('—');
+    expect(fmt.gapDuration(NaN)).toBe('—');
+    expect(fmt.gapDuration(-5)).toBe('—');
+  });
+  it('renders < 60 min as whole minutes', () => {
+    expect(fmt.gapDuration(2520)).toBe('42 min');   // 42 min
+    expect(fmt.gapDuration(600)).toBe('10 min');    // exactly the gap threshold
+  });
+  it('renders >= 60 min as one-decimal hours, dropping a trailing .0', () => {
+    expect(fmt.gapDuration(3600)).toBe('1 h');       // 1.0 -> "1"
+    expect(fmt.gapDuration(7200)).toBe('2 h');       // 2.0 -> "2"
+    expect(fmt.gapDuration(34200)).toBe('9.5 h');    // 9.5
+  });
+});
+
+describe('fmt.tokens (#177 S5)', () => {
+  it('renders "—" for null/undefined/NaN', () => {
+    expect(fmt.tokens(null)).toBe('—');
+    expect(fmt.tokens(undefined)).toBe('—');
+    expect(fmt.tokens(NaN)).toBe('—');
+  });
+  it('renders < 1000 as a raw integer', () => {
+    expect(fmt.tokens(873)).toBe('873');
+    expect(fmt.tokens(0)).toBe('0');
+  });
+  it('renders >= 1000 as one-decimal k (trailing .0 dropped)', () => {
+    expect(fmt.tokens(1200)).toBe('1.2k');
+    expect(fmt.tokens(310000)).toBe('310k');
+  });
+  it('renders >= 1_000_000 as one-decimal M (trailing .0 dropped)', () => {
+    expect(fmt.tokens(4_100_000)).toBe('4.1M');
+    expect(fmt.tokens(2_000_000)).toBe('2M');
+  });
+});
