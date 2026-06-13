@@ -163,6 +163,13 @@ official Claude Code UA from a non-Claude-Code process.
 To revert to the impersonation default, set `user_agent` back to `null` or
 remove the field.
 
+## Propagation model
+
+`refresh-usage` updates the underlying data **synchronously**: it writes `weekly_usage_snapshots`, advances the `hwm-7d` high-water mark, and busts the external statusline cache (`/tmp/claude-statusline-usage-cache.json`) before it returns. The live *views* catch up on their own cadences:
+
+- **Dashboard** — on a successful refresh, `refresh-usage` sends a best-effort `POST /api/sync?refresh=0` to a dashboard on `127.0.0.1:8789`, which re-reads the DB and broadcasts the new value over SSE **~instantly**. The nudge is fire-and-forget: if no dashboard is listening (or it runs on a non-default port), the call fails silently and that dashboard self-heals within its `--sync-interval` (default 5s). Exit codes, stdout, and stderr are unchanged whether or not a dashboard is running.
+- **Claude Code terminal status line** (the `5h X% · 7d Y%` chip) — repaints only when Claude Code next re-invokes `cctally statusline`, on **Claude Code's own cadence**. cctally cannot force Claude Code to re-render, so this surface may briefly lag the value `refresh-usage` printed.
+
 ## See also
 
 - [`hook-tick`](hook-tick.md) — automatic per-fire variant (no cache-bust)
