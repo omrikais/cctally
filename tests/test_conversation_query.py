@@ -780,6 +780,39 @@ def test_session_titles_basic_and_marker_skip():
     assert titles["s2"] == "the real prompt"            # marker skipped
     assert "s3" not in titles                           # sidechain-only → no title
 
+def test_session_titles_skips_unknown_command_family_tag():
+    # #186 belt-and-suspenders: an UNKNOWN command-family tag (not in
+    # _MARKER_TAGS) — e.g. a future `<local-command-future>` — must still be
+    # skipped for the title via the broader, title-only command-family predicate,
+    # falling through to the next real prompt. Strict `_is_system_marker` does
+    # NOT know the tag, so this proves the broader predicate is wired in.
+    c = _conn()
+    _msg(c, session_id="s", uuid="h0", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="<local-command-future>whatever</local-command-future>",
+         cwd="/home/u/proj")
+    _msg(c, session_id="s", uuid="h1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="human",
+         text="the real prompt", cwd="/home/u/proj")
+    titles = cq._session_titles_map(c, ["s"])
+    assert titles["s"] == "the real prompt"
+
+
+def test_looks_like_command_plumbing_predicate():
+    # The title-only liberal predicate: prefix shape (command-* / local-command-*),
+    # NOT the strict known-tag list. Whole-string only; mid-sentence quoting and
+    # plain prose are NOT plumbing.
+    P = cq._looks_like_command_plumbing
+    assert P("<command-name>clear</command-name>")                 # known tag
+    assert P("<local-command-future>x</local-command-future>")     # unknown family tag
+    assert P("<command-foo>a</command-foo><command-bar>b</command-bar>")  # concatenated
+    assert P("  <local-command-stdout>x</local-command-stdout>\n")  # whitespace-wrapped
+    assert not P("see <command-name>clear</command-name> here")    # mid-sentence
+    assert not P("the real prompt")                                # plain prose
+    assert not P("")                                               # empty
+    assert not P("<notcommand>x</notcommand>")                     # non-command tag
+
+
 def test_session_titles_truncation_with_ellipsis():
     c = _conn()
     long = "x" * 200

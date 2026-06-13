@@ -140,6 +140,28 @@ def _meta_classify(item, allow_human_fallback):
     return ("context", None, body)
 
 
+# #186 belt-and-suspenders, title-only: a deliberately-broader skip predicate
+# that drops a title candidate wrapped entirely in `command-*` / `local-command-*`
+# plumbing — a tag-name PREFIX shape, NOT the strict known-tag list. The \1
+# backref forces each close tag to match its open tag; the unrolled-lazy body is
+# linear-time (no ReDoS). Used ONLY in title selection, where being liberal is
+# safe: the worst case is the title falls back to the next line or the project
+# label — never hiding content (that fold-to-pill decision keeps strict
+# `_is_system_marker`, where a false positive WOULD hide real user text). A
+# future unrecognized `local-command-foo` tag thus degrades to "skip the title"
+# rather than "poison the title."
+_CMD_FAMILY_RE = re.compile(
+    r"\s*(?:<((?:local-)?command-[a-z-]+)>(?:(?!</\1>)[\s\S])*</\1>\s*)+"
+)
+
+
+def _looks_like_command_plumbing(text) -> bool:
+    """Title-only liberal skip: the whole text is one or more
+    command-*/local-command-* wrappers (prefix shape). `fullmatch` anchors the
+    whole string. See `_CMD_FAMILY_RE`."""
+    return bool(text) and _CMD_FAMILY_RE.fullmatch(text) is not None
+
+
 def _session_titles_map(conn, session_ids):
     """{sid: title} for the first non-marker, non-blank MAIN-session human line
     per session (read-time, no migration). Windowed to the earliest 12 human
@@ -176,7 +198,7 @@ def _session_titles_map(conn, session_ids):
     for sid, text in rows:
         if sid in titles:
             continue                 # already resolved to the first non-marker
-        if _is_system_marker(text):
+        if _is_system_marker(text) or _looks_like_command_plumbing(text):
             continue
         if skip_skill_titles and _first_nonblank_line(text).startswith(_SKILL_PREAMBLE):
             continue
