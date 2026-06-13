@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `refresh-usage` now repaints a locally-running dashboard instantly. After a successful force-refresh it sends a best-effort `POST /api/sync?refresh=0` (a new rebuild-only mode that skips the embedded OAuth re-fetch) to `127.0.0.1:8789`, so the dashboard reflects the new 7d/5h value within ~1s instead of waiting up to one `--sync-interval`. Fully best-effort: with no dashboard running, output and exit codes are unchanged (#180).
+
 ## [1.43.1] - 2026-06-13
 
 ### Fixed
