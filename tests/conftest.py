@@ -48,6 +48,72 @@ if _BIN_DIR not in sys.path:
     sys.path.insert(0, _BIN_DIR)
 
 
+# Captured at import under the developer's REAL HOME — before any test
+# monkeypatches HOME — so the guard below watches the ACTUAL prod log a leaking
+# test would pollute, not a per-test fake-HOME path. CCTALLY_DISABLE_DEV_AUTODETECT
+# (set above) means an un-redirected _cctally_core resolves APP_DIR to exactly
+# this prod layout, so this is the file at risk.
+_REAL_PROD_MIGRATION_LOG = (
+    pathlib.Path.home() / ".local" / "share" / "cctally" / "logs" / "migration-errors.log"
+)
+
+
+def _migration_log_identity():
+    """(mtime_ns, size) of the real prod migration-errors.log, or None if absent."""
+    try:
+        st = _REAL_PROD_MIGRATION_LOG.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _guard_real_prod_migration_log(tmp_path, monkeypatch):
+    """Isolate AND guard the migration-error log for every test (#190).
+
+    PREVENTION. Redirect ``_cctally_core.MIGRATION_ERROR_LOG_PATH`` to a per-test
+    tmp file so a migration log write that escapes a test's own path setup lands
+    in tmp, not the developer's real prod log. conftest forces
+    ``CCTALLY_DISABLE_DEV_AUTODETECT=1`` (above), so an un-redirected
+    ``_cctally_core`` otherwise resolves that path to the real
+    ``~/.local/share/cctally/logs/migration-errors.log``. ~38 migration tests run
+    the dispatcher without redirecting it; a fixture whose ``session_entries``
+    predates the ``speed`` column (e.g.
+    ``test_cache_001_actually_runs_on_pre_framework_upgrade``) makes cache
+    migration 008's ``UPDATE … speed`` fail ``no such column: speed``, and
+    ``_log_migration_error`` then writes that fake failure to the developer's
+    REAL prod log. The prod statusline renders it as a banner the prod binary
+    never clears (it fast-paths an already-applied DB). The sentinel helpers read
+    ``_cctally_core.MIGRATION_ERROR_LOG_PATH`` at CALL time, so this setattr is
+    honored even by modules already imported; tests that set their OWN log path
+    still win (their ``monkeypatch.setattr`` runs after this fixture).
+
+    DETECTION. A test that re-derives the path back to prod mid-run (e.g.
+    ``_init_paths_from_env()`` under the real HOME without re-redirecting) would
+    escape the setattr above, so ALSO snapshot the real prod log's identity and
+    assert it is untouched at teardown — naming any straggler. Run the suite
+    serially when bisecting; under pytest-xdist a sibling worker's legitimate
+    write could be misattributed.
+    """
+    import _cctally_core
+
+    monkeypatch.setattr(
+        _cctally_core, "MIGRATION_ERROR_LOG_PATH", tmp_path / "migration-errors.log"
+    )
+    before = _migration_log_identity()
+    yield
+    after = _migration_log_identity()
+    assert after == before, (
+        "this test wrote to the developer's REAL prod migration-errors.log "
+        f"({_REAL_PROD_MIGRATION_LOG}); a migration log write escaped path "
+        "isolation (the autouse redirect was overwritten mid-test — likely a "
+        "bare _init_paths_from_env() under the real HOME). Re-redirect "
+        "_cctally_core.MIGRATION_ERROR_LOG_PATH to a tmp path after any such "
+        "re-init — use the redirect_paths(ns, monkeypatch, tmp_path) helper. "
+        f"identity before={before} after={after}"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _restore_process_timezone():
     """Immunize the whole suite against cross-test timezone leaks.
