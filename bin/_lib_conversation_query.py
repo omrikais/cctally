@@ -34,6 +34,10 @@ from _lib_conversation import iter_media_items
 # here for back-compat so existing `from _lib_conversation_query import
 # _is_system_marker` importers (and the title-skip path below) keep resolving.
 from _lib_conversation import _MARKER_TAGS, _MARKER_RE, _is_system_marker
+# #186: read-time ANSI strip for rows already indexed with raw SGR (no forced
+# re-ingest). Scoped to prose/thinking/title/label — NEVER tool_result (Bash
+# AnsiText boundary). Shares the parser's regex so ingest and read-time agree.
+from _lib_conversation import _strip_ansi
 
 
 _TITLE_MAX = 120
@@ -44,7 +48,7 @@ def _title_from_text(text) -> str:
     trailing '…' ONLY when truncated (rstrip before the ellipsis). '' if none.
     Semantics IDENTICAL to the client deriveReaderTitle (#165 P2.5)."""
     for line in (text or "").split("\n"):
-        s = line.strip()
+        s = _strip_ansi(line).strip()   # #186: strip SGR from pre-fix dirty rows
         if s:
             return (s[:_TITLE_MAX].rstrip() + "…") if len(s) > _TITLE_MAX else s
     return ""
@@ -765,8 +769,17 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     # Stamp the session_id into each anchor (spec anchor is (session_id, uuid);
     # the dict literals are built session-agnostic, so fill it here where the
     # session id is known). NOT a no-op — the endpoint/clients rely on it.
+    # #186: ALSO strip ANSI from the displayed prose/thinking text of each page
+    # item before emit, so a pre-fix row already indexed with raw SGR renders
+    # clean (the read-time half of the no-forced-reingest contract). tool_result
+    # blocks are EXCLUDED — Bash AnsiText (#177 S3) renders their SGR colors.
     for it in page:
         it["anchor"]["session_id"] = session_id
+        if it.get("text"):
+            it["text"] = _strip_ansi(it["text"])
+        for b in it["blocks"]:
+            if b.get("kind") in ("text", "thinking") and b.get("text"):
+                b["text"] = _strip_ansi(b["text"])
 
     first = logical[0]
     last = logical[-1]
@@ -789,9 +802,10 @@ _OUTLINE_LABEL_CAP = 120
 
 
 def _outline_label(text):
-    """First non-blank line, capped at _OUTLINE_LABEL_CAP chars ('' when none)."""
+    """First non-blank line, capped at _OUTLINE_LABEL_CAP chars ('' when none).
+    Read-time ANSI strip (#186) so a pre-fix dirty row's label is clean."""
     for ln in (text or "").splitlines():
-        s = ln.strip()
+        s = _strip_ansi(ln).strip()
         if s:
             return s[:_OUTLINE_LABEL_CAP]
     return ""

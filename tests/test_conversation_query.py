@@ -1009,6 +1009,63 @@ def test_pre_fix_human_command_marker_reclassified_read_time():
     assert title == "the real first prompt"
 
 
+# #186 Task 1F: read-time ANSI stripping for rows already in the DB with raw
+# `\x1b` (pre-fix, ingested before the ingest-layer strip). No ANSI survives into
+# get_conversation prose / command <pre> body, get_conversation_outline labels,
+# or _session_titles_map titles — but a Bash tool_result's ANSI is PRESERVED
+# (the documented BashCard/AnsiText scope boundary).
+def test_read_time_strips_ansi_but_preserves_bash_tool_result():
+    c = _conn()
+    # a PRE-FIX dirty human prompt: raw ESC[1m in the stored text + blocks
+    dirty_title = "the \x1b[1mreal\x1b[22m first prompt"
+    _msg(c, session_id="s", uuid="h1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text=dirty_title, blocks_json=_meta_blocks(dirty_title), cwd="/home/u/proj")
+    # an assistant turn carrying dirty prose + a Bash tool_call whose folded
+    # tool_result text carries SGR (must be PRESERVED for AnsiText).
+    _msg(c, session_id="s", uuid="a1", source_path="/p/s.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="answer with \x1b[32mgreen\x1b[0m prose",
+         blocks_json=_json.dumps([
+             {"kind": "text", "text": "answer with \x1b[32mgreen\x1b[0m prose"},
+             {"kind": "thinking", "text": "ponder \x1b[1mhard\x1b[22m"},
+             {"kind": "tool_use", "name": "Bash", "id": "tu1",
+              "input_summary": '{"command":"ls"}', "preview": "ls"},
+         ]),
+         model=_MODEL, msg_id="m1", req_id="r1", cwd="/home/u/proj")
+    _msg(c, session_id="s", uuid="tr1", source_path="/p/s.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="tool_result", text="",
+         blocks_json=_json.dumps([
+             {"kind": "tool_result", "text": "out \x1b[31mERROR\x1b[0m line",
+              "truncated": False, "is_error": False, "tool_use_id": "tu1"}]),
+         cwd="/home/u/proj")
+    _entry(c, source_path="/p/s.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=100, out=50)
+
+    # title: no ANSI
+    title = cq._session_titles_map(c, ["s"])["s"]
+    assert "\x1b" not in title and "real" in title
+
+    # outline labels: no ANSI
+    outline = cq.get_conversation_outline(c, "s")
+    for t in outline["turns"]:
+        assert "\x1b" not in (t.get("label") or "")
+        for ln in (t.get("thinking") or []):
+            assert "\x1b" not in ln
+
+    # reader page: prose / thinking stripped, Bash tool_result PRESERVED
+    items = cq.get_conversation(c, "s")["items"]
+    for it in items:
+        assert "\x1b" not in (it.get("text") or "")
+        for b in it["blocks"]:
+            if b.get("kind") in ("text", "thinking"):
+                assert "\x1b" not in (b.get("text") or "")
+    # the Bash tool_result block text still carries its SGR (AnsiText boundary)
+    asst = next(it for it in items if it["kind"] == "assistant")
+    tool_call = next(b for b in asst["blocks"] if b.get("kind") == "tool_call")
+    assert "\x1b[31m" in tool_call["result"]["text"], "Bash tool_result ANSI preserved"
+
+
 def test_pre_fix_human_command_marker_with_media_stays_human():
     # the read-time all-text guard (Codex P1b): a human row mixing a marker text
     # block with a non-text (image) block must NOT reclassify — its user-authored
