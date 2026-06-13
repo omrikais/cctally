@@ -670,12 +670,15 @@ def _nudge_dashboard_repaint(port: int = 8789, timeout_seconds: float = 3.0) -> 
     the 204 lands and never leaves a broken-pipe log line in the dashboard's
     terminal. In the common case (lock free) it returns in single-digit ms.
     """
-    url = f"http://127.0.0.1:{port}/api/sync?refresh=0"
-    req = urllib.request.Request(
-        url, data=b"", method="POST",
-        headers={"Origin": f"http://127.0.0.1:{port}"},
-    )
+    # Whole body (incl. Request construction) inside the try so the
+    # "swallows EVERY error" contract holds structurally, not just because
+    # Request() happens to be total for the hardcoded loopback URL.
     try:
+        url = f"http://127.0.0.1:{port}/api/sync?refresh=0"
+        req = urllib.request.Request(
+            url, data=b"", method="POST",
+            headers={"Origin": f"http://127.0.0.1:{port}"},
+        )
         with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
             resp.read()
     except Exception:
