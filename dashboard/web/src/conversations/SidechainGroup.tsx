@@ -54,6 +54,7 @@ export function SidechainGroup({
   getItemRef,
   rootUuid,
   getCardRef,
+  onOpenChange,
   forceOpen = false,
   riseClassName = '',
   riseStyle,
@@ -75,6 +76,11 @@ export function SidechainGroup({
   // collapsed subagent outline click resolves the CARD and flashes it without a
   // force-open (Bug 1). No key collision with itemRefs; no open/close race.
   getCardRef?: (rootUuid: string) => (el: HTMLElement | null) => void;
+  // #188 S4/C1 — the reader lifts this thread's open-state so the live-append
+  // pill counts only VISIBLE appends (Bug 5). Fired from onToggle (user
+  // collapse/expand) and from the #160 forceOpen latch (true). Keyed by
+  // subagentKey — the same key the reader's openKeysRef/knownSubagentKeysRef use.
+  onOpenChange?: (subagentKey: string, open: boolean) => void;
   forceOpen?: boolean;
   // G1 §4b load-in: the reader's render-time classifier passes `conv-rise`
   // (+ a per-index animationDelay) for a first-appearance top-level thread,
@@ -89,7 +95,15 @@ export function SidechainGroup({
   // `open` change). `open` is already true via the derivation this same render,
   // so this causes no flicker and the member ref was already attached.
   useEffect(() => {
-    if (forceOpen) setUserOpen(true);
+    if (forceOpen) {
+      setUserOpen(true);
+      // #188 S4/C1 — a force-open makes this thread VISIBLE, so report it open;
+      // the reader then counts a subsequent append into it (Bug 5).
+      onOpenChange?.(subagentKey, true);
+    }
+    // onOpenChange is a stable reader callback; keep the dep list keyed on the
+    // force latch so this fires once per force (mirrors the userOpen latch).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [forceOpen]);
 
   const label = subagentSummaryLabel(items, subagentKey);
@@ -117,7 +131,13 @@ export function SidechainGroup({
       ].filter(Boolean).join(' ')}
       style={riseStyle}
       open={open}
-      onToggle={(e) => setUserOpen((e.currentTarget as HTMLDetailsElement).open)}
+      onToggle={(e) => {
+        const isOpen = (e.currentTarget as HTMLDetailsElement).open;
+        setUserOpen(isOpen);
+        // #188 S4/C1 — report the new open-state to the reader so the live-append
+        // pill counts an append into THIS thread only while it's expanded (Bug 5).
+        onOpenChange?.(subagentKey, isOpen);
+      }}
     >
       <summary className="conv-sidechain-head">
         <span className="conv-sidechain-glyph" aria-hidden="true"><SubagentIcon /></span>

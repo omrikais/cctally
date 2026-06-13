@@ -170,6 +170,22 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const prevHasMoreRef = useRef(false);
   const [newCount, setNewCount] = useState(0);
 
+  // #188 S4/C2 — count only VISIBLE live appends in the "↓ N new" pill (Bug 5).
+  // `openKeysRef` tracks which subagent threads are currently expanded (lifted
+  // from SidechainGroup via handleSubagentOpenChange); `knownSubagentKeysRef`
+  // records every subagent_key seen on a prior commit. A live-appended item is
+  // visible — and so counts — iff it's top-level, OR the first item of a
+  // brand-new subagent group (its card appears), OR an append into an
+  // already-EXPANDED known thread. An append into an existing COLLAPSED thread is
+  // below the fold → +0. Both refs reset on session switch and seed (without
+  // counting) during non-live pagination growth.
+  const openKeysRef = useRef<Set<string>>(new Set());
+  const knownSubagentKeysRef = useRef<Set<string>>(new Set());
+  const handleSubagentOpenChange = useCallback((key: string, open: boolean) => {
+    if (open) openKeysRef.current.add(key);
+    else openKeysRef.current.delete(key);
+  }, []);
+
   // #176 — floating "↑ Top of turn" button. Replaces the #175 sticky turn
   // header (which floated an opaque mask over the prose). `jumpTopVisible` gates
   // the button; `jumpTopTargetRef` holds the top-level block currently under the
@@ -223,19 +239,47 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // the stick happens before paint (no visible jump).
   useLayoutEffect(() => {
     const b = bodyRef.current;
-    const len = detail?.items.length ?? 0;
+    const items = detail?.items ?? [];
+    const len = items.length;
     const prevLen = prevLenRef.current;
     const added = len - prevLen;
     // Live append (not the final pagination page): already fully paged before
     // this growth, and not the very first page load (prevLen > 0).
     const live = added > 0 && prevHasMoreRef.current === false && prevLen > 0;
+    // #188 S4/C2 — classify each newly-appended item by VISIBILITY against the
+    // OLD known-set + open-set (Bug 5): top-level (+1); first item of a
+    // brand-new subagent group (+1, deduped per key per tick); append into an
+    // already-EXPANDED known thread (+1); append into an existing COLLAPSED
+    // known thread (+0, below the fold). Computed only on a live append; during
+    // non-live growth (first page / pagination) the tail just SEEDS the
+    // known-set below WITHOUT counting.
+    const tail = added > 0 ? items.slice(prevLen) : [];
+    let visibleAdded = 0;
+    if (live) {
+      const newThisTick = new Set<string>();
+      for (const it of tail) {
+        const k = it.subagent_key;
+        if (k == null) {
+          visibleAdded++;                              // top-level → always visible
+        } else if (!knownSubagentKeysRef.current.has(k)) {
+          // First item of a brand-new subagent group → its card appears once.
+          if (!newThisTick.has(k)) { visibleAdded++; newThisTick.add(k); }
+        } else if (openKeysRef.current.has(k)) {
+          visibleAdded++;                              // append into an expanded thread
+        }
+        // else: append into an existing collapsed thread → +0 (below the fold).
+      }
+    }
+    // Update the known-set from the tail (AFTER the visibility classification
+    // read the OLD set) — covers both live and non-live (seed) growth.
+    for (const it of tail) {
+      if (it.subagent_key != null) knownSubagentKeysRef.current.add(it.subagent_key);
+    }
     if (b && live) {
-      if (atBottomRef.current) {
+      if (atBottomRef.current && visibleAdded > 0) {
         b.scrollTo({ top: b.scrollHeight });           // instant stick to the newest turn
-      } else {
-        // Capture `added` in a local const — the ref is mutated below, so the
-        // functional updater must not read prevLenRef.current lazily.
-        setNewCount((n) => n + added);                 // preserve position, surface the pill
+      } else if (visibleAdded > 0) {
+        setNewCount((n) => n + visibleAdded);          // preserve position, surface the pill
       }
     }
     prevLenRef.current = len;
@@ -536,6 +580,14 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     atBottomRef.current = true;
     setJumpTopVisible(false);
     jumpTopTargetRef.current = null;
+    // #188 S4/C2 — the reused reader must not carry a prior conversation's
+    // subagent open/known sets across sessions (subagent_key is only an
+    // agent-file hash and can collide). Clearing both keeps the next session's
+    // first live append counted correctly: an append into a thread that was
+    // expanded in the OLD conversation but is collapsed in the new one must NOT
+    // count (Bug 5 + #188 B6's per-session reset rationale).
+    openKeysRef.current.clear();
+    knownSubagentKeysRef.current.clear();
   }, [sessionId]);
 
   // Load-in stagger bookkeeping. On a session change the reused reader must
@@ -1063,6 +1115,9 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
                   // <details> via data-uuid and keys it in cardRefs.
                   rootUuid={g.items[0].anchor.uuid}
                   getCardRef={getCardRef}
+                  // #188 S4/C2 — lift the thread's open-state so the "↓ N new"
+                  // pill counts only VISIBLE appends (Bug 5).
+                  onOpenChange={handleSubagentOpenChange}
                   forceOpen={detail.session_id === sessionId && g.subagentKey === forcedOpenKey}
                   riseClassName={riseClass}
                   riseStyle={riseStyle}
