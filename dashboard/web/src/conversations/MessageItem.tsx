@@ -17,6 +17,13 @@ function metaPreview(s: string): string {
   return t.length > 80 ? `${t.slice(0, 80).trimEnd()}…` : t;
 }
 
+// Pull the human <summary> line out of a <task|bash-notification> body for the
+// collapsed pill preview; falls back to the generic first-line metaPreview.
+function notificationSummary(s: string): string {
+  const m = s.match(/<summary>([\s\S]*?)<\/summary>/);
+  return m ? metaPreview(m[1]) : metaPreview(s);
+}
+
 // A single reader message. forwardRef exposes the container div so the
 // reader can scrollIntoView on a jump.
 //
@@ -152,6 +159,15 @@ function MessageItemImpl(
       ) : mk === 'command' ? (
         <>
           <SystemIcon /> <span className="conv-meta-label">System marker</span>
+        </>
+      ) : mk === 'compaction' ? (
+        <>
+          <SystemIcon /> <span className="conv-meta-label">Compacted earlier conversation</span>
+        </>
+      ) : mk === 'notification' ? (
+        <>
+          <SystemIcon /> <span className="conv-meta-label">Background task</span>
+          <span className="conv-meta-preview">{notificationSummary(item.text)}</span>
         </>
       ) : (
         <>

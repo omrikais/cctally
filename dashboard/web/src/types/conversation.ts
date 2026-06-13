@@ -57,7 +57,7 @@ export type ConversationItem =
       is_sidechain: boolean;
       subagent_key: string | null;
       parent_uuid: string | null;
-      meta_kind: 'skill' | 'command' | 'context';
+      meta_kind: 'skill' | 'command' | 'context' | 'compaction' | 'notification';
       skill_name: string | null;
     };
 
@@ -86,7 +86,7 @@ export interface OutlineTurn {
   tokens?: TokenUsage;
   tools?: OutlineToolRef[];
   thinking?: string[];
-  meta_kind?: 'skill' | 'command' | 'context';
+  meta_kind?: 'skill' | 'command' | 'context' | 'compaction' | 'notification';
   skill_name?: string | null;
 }
 export interface OutlineStats {

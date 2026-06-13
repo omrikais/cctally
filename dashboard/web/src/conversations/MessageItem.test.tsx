@@ -826,4 +826,38 @@ describe('MessageItem token footer (#177 S5 §6)', () => {
     const { container } = render(<MessageItem item={item} />);
     expect(container.querySelector('.conv-item-cost')).toBeNull();
   });
+
+  // #191 — harness-injected user lines must never render as a "You" turn.
+  it('renders a compaction meta row as "Compacted earlier conversation", never You', () => {
+    const item: ConversationItem = {
+      kind: 'meta',
+      anchor: { session_id: 's', uuid: 'c1', id: 1 },
+      member_uuids: ['c1'], ts: '2026-06-01T00:00:00Z',
+      text: 'This session is being continued from a previous conversation…',
+      blocks: [{ kind: 'text', text: 'This session is being continued from a previous conversation…' }],
+      is_sidechain: false, subagent_key: null, parent_uuid: null,
+      meta_kind: 'compaction', skill_name: null,
+    };
+    const { container } = render(<MessageItem item={item} />);
+    expect(container.querySelector('.conv-item--human')).toBeNull();
+    expect(container.querySelector('details.conv-meta--compaction')).not.toBeNull();
+    expect(container.textContent).toContain('Compacted earlier conversation');
+  });
+
+  it('renders a notification meta row as "Background task" with the summary', () => {
+    const body = '<task-notification>\n<summary>Run tests completed (exit code 0)</summary>\n</task-notification>';
+    const item: ConversationItem = {
+      kind: 'meta',
+      anchor: { session_id: 's', uuid: 'n1', id: 1 },
+      member_uuids: ['n1'], ts: '2026-06-01T00:00:00Z',
+      text: body, blocks: [{ kind: 'text', text: body }],
+      is_sidechain: false, subagent_key: null, parent_uuid: null,
+      meta_kind: 'notification', skill_name: null,
+    };
+    const { container } = render(<MessageItem item={item} />);
+    expect(container.querySelector('.conv-item--human')).toBeNull();
+    expect(container.querySelector('details.conv-meta--notification')).not.toBeNull();
+    expect(container.textContent).toContain('Background task');
+    expect(container.textContent).toContain('Run tests completed (exit code 0)');
+  });
 });
