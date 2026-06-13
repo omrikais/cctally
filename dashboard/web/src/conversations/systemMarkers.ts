@@ -11,11 +11,17 @@
 // system-marker metadata, only kind/text/blocks). The pill is always
 // expandable, so a false negative just shows the raw turn (safe); a false
 // positive could hide real user text (unsafe) — hence the strict anchoring.
-const MARKER_TAGS = [
+// MUST stay element-for-element identical (same order) to the server
+// _MARKER_TAGS in bin/_lib_conversation.py — enforced by markerParity.test.ts
+// (#186). local-command-stdout / -stderr were added in #186 so a slash-command
+// stdout echo is recognized as plumbing, not a "You" prompt.
+export const MARKER_TAGS = [
   'command-name',
   'command-message',
   'command-args',
   'local-command-caveat',
+  'local-command-stdout',
+  'local-command-stderr',
 ] as const;
 
 // ^\s* ... \s*$  -> anchored to the whole string (no leading/trailing prose).

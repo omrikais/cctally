@@ -12,6 +12,14 @@ describe('isSystemMarker', () => {
     expect(isSystemMarker('<local-command-caveat>note</local-command-caveat>')).toBe(true);
   });
 
+  // #186 — the two slash-command output carriers added to the marker tuple so a
+  // `<local-command-stdout>…</local-command-stdout>` echo (the title-poisoning
+  // line in #186) is recognized as plumbing, not a "You" prompt.
+  it('matches the #186 local-command output carriers', () => {
+    expect(isSystemMarker('<local-command-stdout>x</local-command-stdout>')).toBe(true);
+    expect(isSystemMarker('<local-command-stderr>err</local-command-stderr>')).toBe(true);
+  });
+
   it('matches several concatenated markers (whitespace between)', () => {
     const t = '<command-name>clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>';
     expect(isSystemMarker(t)).toBe(true);
