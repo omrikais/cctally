@@ -57,6 +57,15 @@ def _stub_cache_busted(monkeypatch, ns, state="busted"):
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_real_nudge(ns, monkeypatch):
+    """Default every test in this module to a no-op dashboard nudge so the
+    suite never fires a real loopback POST (which could hit a dashboard on
+    :8789) and never overwrites urlopen-capturing state. Nudge-specific
+    tests below override this with their own spy."""
+    monkeypatch.setitem(ns, "_nudge_dashboard_repaint", lambda *a, **k: None)
+
+
 def test_cmd_refresh_usage_success_writes_one_liner(ns, monkeypatch, capsys):
     api_response = {
         "seven_day": {"utilization": 13.0, "resets_at": "2026-05-02T12:00:00Z"},
@@ -245,3 +254,36 @@ def test_cmd_refresh_usage_passes_user_agent_through(ns, monkeypatch, capsys):
     rc = ns["cmd_refresh_usage"](_args())
     assert rc == 0
     assert captured["headers"].get("User-agent") == "claude-code/2.1.116"
+
+
+def test_cmd_refresh_usage_fires_nudge_once_on_ok(ns, monkeypatch):
+    """On a successful refresh, cmd_refresh_usage fires the dashboard nudge
+    exactly once."""
+    api_response = {
+        "seven_day": {"utilization": 21.0, "resets_at": "2026-05-02T12:00:00Z"},
+    }
+    calls = {"n": 0}
+    def _spy(*a, **k):
+        calls["n"] += 1
+    monkeypatch.setitem(ns, "_nudge_dashboard_repaint", _spy)
+    _stub_token(monkeypatch, ns)
+    _stub_fetch_ok(monkeypatch, ns, api_response)
+    _stub_record_ok(monkeypatch, ns)
+    _stub_cache_busted(monkeypatch, ns)
+
+    rc = ns["cmd_refresh_usage"](_args())
+    assert rc == 0
+    assert calls["n"] == 1
+
+
+def test_cmd_refresh_usage_no_nudge_when_no_token(ns, monkeypatch):
+    """A non-ok branch (no OAuth token → exit 2) must NOT fire the nudge."""
+    calls = {"n": 0}
+    def _spy(*a, **k):
+        calls["n"] += 1
+    monkeypatch.setitem(ns, "_nudge_dashboard_repaint", _spy)
+    monkeypatch.setitem(ns, "_resolve_oauth_token", lambda *a, **kw: None)
+
+    rc = ns["cmd_refresh_usage"](_args())
+    assert rc == 2
+    assert calls["n"] == 0

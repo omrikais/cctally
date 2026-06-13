@@ -714,6 +714,9 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
             color = c._forecast_color_enabled(color_mode, sys.stdout)
             now_epoch = int(dt.datetime.now(dt.timezone.utc).timestamp())
             print(_render_refresh_usage_text(payload, color=color, now_epoch=now_epoch))
+        # Best-effort: repaint a locally-running dashboard NOW (the value is
+        # already persisted). Fires in normal/--json/--quiet alike; only on ok.
+        c._nudge_dashboard_repaint()
         return 0
 
     if result.status == "rate_limited":
