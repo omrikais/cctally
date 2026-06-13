@@ -312,6 +312,22 @@ describe('ConversationReader', () => {
     );
   });
 
+  // #186 — belt-and-suspenders: the title skips ANY line wrapped entirely in a
+  // command-*/local-command-* family tag, even an UNKNOWN one not in MARKER_TAGS
+  // (the strict isSystemMarker would NOT skip `local-command-future`). The title
+  // then falls through to the next real prompt, never poisoned by future
+  // unrecognized plumbing.
+  it('header skips an unknown command-family plumbing line and uses the next real prompt', async () => {
+    mockFetchOnce(detail([
+      makeItem({ uuid: 'm1', text: '<local-command-future>x</local-command-future>' }),
+      makeItem({ uuid: 'h1', text: 'the real first prompt' }),
+    ]));
+    render(<ConversationReader sessionId="s" />);
+    await waitFor(() =>
+      expect(document.querySelector('.conv-reader-title')!.textContent).toBe('the real first prompt'),
+    );
+  });
+
   it('renders a styled selection-empty / loading state, not bare text', async () => {
     // First page never resolves → the loading state shows the styled .conv-state.
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise(() => {}));

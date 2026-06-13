@@ -18,12 +18,26 @@ import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import type { ConversationItem, ConversationOutline } from '../types/conversation';
 
+// #186 — belt-and-suspenders title-only skip predicate. Mirrors the server
+// `_CMD_FAMILY_RE` / `_looks_like_command_plumbing` (bin/_lib_conversation_query.py):
+// a deliberately BROADER match than `isSystemMarker` — it skips a candidate line
+// wrapped entirely in any `command-*` / `local-command-*` family tag (a tag-name
+// PREFIX shape), including future unrecognized tags not in MARKER_TAGS. Strict
+// `isSystemMarker` also drives the fold-to-pill decision (where a false positive
+// would hide real user text), so the liberal matching lives ONLY here in title
+// selection, where the worst case is the title falls back to the next line or
+// the project label — never hiding content. Anchored to the whole string (the
+// `^…$` + the unrolled-lazy body match the server `fullmatch`).
+const CMD_FAMILY_RE = /^\s*(?:<((?:local-)?command-[a-z-]+)>(?:(?!<\/\1>)[\s\S])*<\/\1>\s*)+$/;
+const looksLikeCommandPlumbing = (t: string): boolean => CMD_FAMILY_RE.test(t);
+
 // First non-blank line of the first MAIN-session, non-marker human message;
 // fallback project_label → session_id. Mirrors the kernel _session_titles_map
 // (#165 Q6). The opening human is always on page 1.
 function deriveReaderTitle(detail: { items: ConversationItem[]; project_label: string; session_id: string }): string {
   for (const it of detail.items) {
-    if (it.kind === 'human' && !it.is_sidechain && it.text.trim() && !isSystemMarker(it.text)) {
+    if (it.kind === 'human' && !it.is_sidechain && it.text.trim()
+        && !isSystemMarker(it.text) && !looksLikeCommandPlumbing(it.text)) {
       const line = it.text.split('\n').map((s) => s.trim()).find(Boolean);
       if (line) return line.length > 120 ? line.slice(0, 120).trimEnd() + '…' : line;
     }
