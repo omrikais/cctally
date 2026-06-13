@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.43.1] - 2026-06-13
+
 ### Fixed
 - Conversation viewer: harness-injected user-role lines — compaction summaries, background task/Bash completion notifications, remote-control "Message sent at …" stamps, and `!`-mode bash echoes — are no longer rendered as your own messages; they now show as labeled system/notification pills (compaction expandable), and a remote-control reply shows just your text. Already-recorded history is corrected at read time with no migration. (#191)
 
