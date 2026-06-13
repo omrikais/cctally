@@ -34,6 +34,11 @@ from _lib_conversation import iter_media_items
 # here for back-compat so existing `from _lib_conversation_query import
 # _is_system_marker` importers (and the title-skip path below) keep resolving.
 from _lib_conversation import _MARKER_TAGS, _MARKER_RE, _is_system_marker
+# #188: the slash-command-with-args promotion helper. Used at read time to
+# present a legacy/ingested command-marker row carrying a real <command-args>
+# prompt as a "You" turn (text=args, command_name badge). Re-exported for the
+# back-compat import surface + the consumer in _cctally_cache.py.
+from _lib_conversation import _extract_command_invocation
 # #186: read-time ANSI strip for rows already indexed with raw SGR (no forced
 # re-ingest). Scoped to prose/thinking/title/label — NEVER tool_result (Bash
 # AnsiText boundary). Shares the parser's regex so ingest and read-time agree.
@@ -646,6 +651,23 @@ def _assemble_session(conn, session_id):
     allow_human_fallback = _reingest_pending(conn)
     for it in items:
         if it["kind"] in ("meta", "human"):
+            # #188: a slash-command invocation carrying a real prompt in
+            # <command-args> is a USER turn. Promote it BEFORE _meta_classify so
+            # it never folds into a command-marker pill. Run on the BLOCK-joined
+            # text (NOT it["text"]: '' for a legacy META row, args post-migration
+            # — neither is the raw marker the command_name parses from). When it
+            # yields non-empty args, present kind='human', text=args, and attach
+            # the command_name badge (derived from the blocks). Idempotent: a
+            # migrated entry_type='human' row re-derives the same badge. /clear &
+            # empty-args/stdout markers yield None and fall through to
+            # _meta_classify's command/skill/context fold unchanged.
+            inv = _extract_command_invocation(
+                it.get("blocks"), _join_text_blocks(it.get("blocks")))
+            if inv is not None:
+                it["kind"] = "human"
+                it["text"] = inv["args"]
+                it["command_name"] = inv["name"] or None
+                continue
             cls = _meta_classify(it, allow_human_fallback)
             if cls is not None:
                 meta_kind, skill_name, body = cls

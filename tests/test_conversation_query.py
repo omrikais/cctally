@@ -1009,6 +1009,94 @@ def test_pre_fix_human_command_marker_reclassified_read_time():
     assert title == "the real first prompt"
 
 
+# #188 Task A3: a slash-command invocation carrying a real prompt in
+# <command-args> presents at READ TIME as a "You" turn (kind='human',
+# text=args), with a `command_name` field derived from the BLOCKS (not the
+# scalar text, which after migration holds args). This fixes display + outline +
+# reader-title for EXISTING cached META rows with NO rebuild. /clear (empty args)
+# stays a hidden command meta.
+def test_read_time_promotes_legacy_meta_command_with_args():
+    c = _conn()
+    raw = ("<command-message>review:review</command-message>"
+           "<command-name>/review</command-name>"
+           "<command-args>Review feat/x vs main.</command-args>")
+    # legacy shape: entry_type='meta', text='' (parser), raw wrapper in blocks
+    _msg(c, session_id="s", uuid="u1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="meta", text="",
+         blocks_json=_meta_blocks(raw))
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "human"
+    assert it["text"] == "Review feat/x vs main."
+    assert it["command_name"] == "/review"
+
+
+def test_read_time_post_migration_human_command_keeps_badge():
+    # idempotent with ingest/migration: a row already promoted to entry_type=
+    # 'human' with text=args still derives the command_name badge from its blocks
+    c = _conn()
+    raw = ("<command-name>/frontend-design</command-name>"
+           "<command-args>do the thing</command-args>")
+    _msg(c, session_id="s", uuid="u1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="do the thing", blocks_json=_meta_blocks(raw))
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "human"
+    assert it["text"] == "do the thing"
+    assert it["command_name"] == "/frontend-design"
+
+
+def test_read_time_empty_args_command_stays_meta():
+    c = _conn()
+    _msg(c, session_id="s", uuid="u1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="meta", text="",
+         blocks_json=_meta_blocks("<command-name>/clear</command-name>"
+                                  "<command-args></command-args>"))
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "meta" and it["meta_kind"] == "command"
+    # a non-promoted item carries no command_name (the badge is promotion-only)
+    assert "command_name" not in it or it.get("command_name") is None
+
+
+def test_read_time_plain_human_has_no_command_name():
+    c = _conn()
+    _msg(c, session_id="s", uuid="u1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="a normal prompt", blocks_json=_meta_blocks("a normal prompt"))
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "human"
+    assert it.get("command_name") is None
+
+
+def test_outline_includes_promoted_command_as_human():
+    c = _conn()
+    raw = ("<command-name>/frontend-design</command-name>"
+           "<command-args>Audit the reader UI.</command-args>")
+    _msg(c, session_id="s", uuid="u1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="meta", text="",
+         blocks_json=_meta_blocks(raw))
+    outline = cq.get_conversation_outline(c, "s")
+    t0 = outline["turns"][0]
+    assert t0["kind"] == "human"
+    assert t0["label"] == "Audit the reader UI."
+
+
+def test_reader_title_from_promoted_command_read_time():
+    # the in-conversation reader title (read-time) picks the promoted args even
+    # for a legacy META row, with no rebuild (the LIST title needs migration 011
+    # to flip entry_type — that split is intentional and covered separately).
+    c = _conn()
+    raw = ("<command-name>/frontend-design</command-name>"
+           "<command-args>Audit the reader UI and file issues.</command-args>")
+    _msg(c, session_id="s", uuid="u1", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="meta", text="",
+         blocks_json=_meta_blocks(raw))
+    items = cq.get_conversation(c, "s")["items"]
+    # the assembled first item presents as human with text=args — the client
+    # deriveReaderTitle picks it (it's no longer a marker).
+    assert items[0]["kind"] == "human"
+    assert items[0]["text"] == "Audit the reader UI and file issues."
+
+
 # #186 Task 1F: read-time ANSI stripping for rows already in the DB with raw
 # `\x1b` (pre-fix, ingested before the ingest-layer strip). No ANSI survives into
 # get_conversation prose / command <pre> body, get_conversation_outline labels,

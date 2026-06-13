@@ -821,7 +821,12 @@ def _run_pending_migrations(
                 "projected_milestones",
                 "codex_budget_milestones",
             ),
-            "cache.db": ("session_entries",),
+            # conversation_messages joins session_entries as a fresh-install
+            # signal (#188): a transcript-populated cache whose cost rows are
+            # absent must still be treated as non-fresh so a flag-only
+            # conversation migration's consumer actually runs (e.g. 011's
+            # command-args promotion) instead of being stamped without it.
+            "cache.db": ("session_entries", "conversation_messages"),
         }.get(db_label, ())
         for probe_table in probe_tables:
             # _probe_table_nonempty centralizes the "is there data here?"
@@ -3357,6 +3362,25 @@ def conversation_search_depth(conn: sqlite3.Connection) -> str:
     except sqlite3.OperationalError:
         return "full"
     return "prose-only" if pending else "full"
+
+
+@cache_migration("011_conversation_promote_command_args")
+def _011_conversation_promote_command_args(conn: sqlite3.Connection) -> None:
+    """Flag-only arm for #188 bug 4. Sets
+    ``conversation_promote_command_args_pending``; sync_cache consumes it under
+    the cache.db.lock flock (cursor-resumable: flip legacy ``entry_type='META'``
+    command-marker rows whose ``<command-args>`` carry a real user prompt to
+    ``entry_type='human'`` with ``text=args``, recomputing the split search
+    columns so the args enter the entry_type='human' list-title/prompts facet and
+    the FTS index — see _cctally_cache._consume_promote_command_args). The
+    handler does NO data work so the dispatcher's central stamp (#140) marks a
+    genuinely-complete handler; a fresh install stamps it WITHOUT running (its
+    rows are already promoted at ingest, so the consumer finds nothing to flip).
+    DISPLAY is already fixed read-time (no migration needed); the migration's
+    sole job is FTS-searchability + the list-title facet on legacy data. Mirrors
+    the flag-only pattern of 002/003/007/009/010."""
+    _set_cache_meta(conn, "conversation_promote_command_args_pending", "1")
+    conn.commit()
 
 
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===

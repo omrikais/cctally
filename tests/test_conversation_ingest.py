@@ -1219,6 +1219,77 @@ def test_plain_user_prose_stays_human_at_ingest():
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# #188 Task A2: a slash-command invocation carrying a real prompt in
+# <command-args> is a USER turn — promote it at ingest (entry_type='human',
+# text=args) BEFORE the empty-args/stdout system-marker fold. /clear and friends
+# (empty args) and stdout-only markers STAY meta (text='').
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_command_args_promoted_to_human_at_ingest():
+    from _lib_conversation import _normalize
+    raw = ("<command-message>frontend-design:frontend-design</command-message>"
+           "<command-name>/frontend-design</command-name>"
+           "<command-args>Audit the reader UI and file issues.</command-args>")
+    obj = {"type": "user", "uuid": "u1",
+           "message": {"content": [{"type": "text", "text": raw}]}}
+    row = _normalize(obj, "user", 0)
+    assert row.entry_type == "human"
+    assert row.text == "Audit the reader UI and file issues."
+    # the raw wrapper survives in blocks_json (badge derives command_name from it)
+    assert "<command-name>/frontend-design</command-name>" in row.blocks_json
+
+
+def test_command_args_str_content_promoted_to_human_at_ingest():
+    # the str-content carrier shape (content is a bare string) also promotes
+    from _lib_conversation import _normalize
+    raw = ("<command-name>/effort</command-name><command-args>max</command-args>")
+    obj = {"type": "user", "uuid": "u1b", "message": {"content": raw}}
+    row = _normalize(obj, "user", 0)
+    assert row.entry_type == "human" and row.text == "max"
+
+
+def test_empty_command_args_stays_meta_at_ingest():
+    from _lib_conversation import _normalize
+    raw = ("<command-name>/clear</command-name>"
+           "<command-message>clear</command-message><command-args></command-args>")
+    obj = {"type": "user", "uuid": "u2",
+           "message": {"content": [{"type": "text", "text": raw}]}}
+    row = _normalize(obj, "user", 0)
+    assert row.entry_type == "meta"
+    assert row.text == ""
+
+
+def test_command_args_with_attachment_stays_human_unpromoted_full_text():
+    # all-text guard: a marker text block PLUS an image is NOT a clean command
+    # invocation → it stays a plain human turn (not a promoted args turn).
+    from _lib_conversation import _normalize
+    raw = "<command-name>/x</command-name><command-args>hi</command-args>"
+    obj = {"type": "user", "uuid": "u3", "message": {"content": [
+        {"type": "text", "text": raw},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": "AA"}},
+    ]}}
+    row = _normalize(obj, "user", 0)
+    assert row.entry_type == "human"
+    # NOT collapsed to args — the full raw text rides through (the marker+image
+    # case is the documented non-promotion shape)
+    assert row.text == raw
+
+
+def test_command_args_promoted_text_is_fts_searchable():
+    # the promoted args become the searchable `text` column (title + FTS facet)
+    from _lib_conversation import _normalize
+    raw = ("<command-name>/review</command-name>"
+           "<command-args>Review the conversation reader code.</command-args>")
+    obj = {"type": "user", "uuid": "u4",
+           "message": {"content": [{"type": "text", "text": raw}]}}
+    row = _normalize(obj, "user", 0)
+    assert row.entry_type == "human"
+    assert "conversation reader" in row.text
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # #186 Task 1E: _strip_ansi helper + ingest-layer ANSI stripping. ANSI control
 # sequences (terminal SGR/CSI/OSC) are stripped from the str-content path, the
 # text-block txt, and thinking text in _blocks_and_text — so FTS indexes clean

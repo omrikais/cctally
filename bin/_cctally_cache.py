@@ -681,6 +681,16 @@ def sync_cache(
                 "DELETE FROM cache_meta WHERE key IN "
                 "('conversation_search_split_pending',"
                 " 'conversation_search_split_cursor')")
+            # #188 bug 4: a rebuild repopulates conversation_messages via the
+            # offset-0 walk through the parser, which now classifies a
+            # command-args invocation as entry_type='human' at INGEST (A2) — so
+            # the migration-011 backfill is redundant. Drop its flag + cursor so
+            # the post-rebuild sync runs no redundant promotion pass. MISSING
+            # this site re-arms the flag on every cache-sync --rebuild.
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key IN "
+                "('conversation_promote_command_args_pending',"
+                " 'conversation_promote_command_args_cursor')")
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Claude cached entries")
 
@@ -779,6 +789,15 @@ def sync_cache(
             # the search_tool/search_thinking UPDATEs (they fire on text only), so
             # old search keeps working until the final swap.
             _consume_search_split(conn)
+
+            # #188 bug 4: consume the migration-011 command-args promotion under
+            # the SAME held flock, AFTER the search split so a row flipped to
+            # entry_type='human' here keeps the fresh search_tool/search_thinking
+            # the split just wrote (the consumer recomputes them anyway, but
+            # ordering keeps the two passes independent + idempotent). Flips
+            # legacy META command rows carrying a real <command-args> prompt to
+            # HUMAN(text=args); the split-FTS UPDATE triggers re-index the args.
+            _consume_promote_command_args(conn)
 
         paths: list[pathlib.Path] = list(_iter_claude_jsonl_files())
         stats.files_total = len(paths)
@@ -1354,6 +1373,68 @@ def _consume_search_split(conn) -> None:
     conn.execute(
         "DELETE FROM cache_meta WHERE key IN "
         "('conversation_search_split_pending','conversation_search_split_cursor')")
+    conn.commit()
+
+
+def _consume_promote_command_args(conn) -> None:
+    """#188 bug 4: flock-held consumer for ``conversation_promote_command_args_pending``
+    (set by cache migration 011). Cursor-resumable walk of
+    ``conversation_messages WHERE entry_type='meta'``: a row whose ``blocks_json``
+    is a pure slash-command marker with a NON-EMPTY ``<command-args>`` is a real
+    user turn, so flip it to ``entry_type='human'`` with ``text=args`` and
+    recompute ``search_tool``/``search_thinking`` via the SHARED
+    ``_lib_conversation._derive_search_columns`` chokepoint (byte-identical to
+    live ingest). ``/clear`` and stdout-only markers (``_extract_command_invocation``
+    returns None) stay META untouched.
+
+    The split-FTS ``AFTER UPDATE OF text, search_tool, search_thinking`` triggers
+    keep the external-content index in sync, so we never hand-write FTS rows.
+    FTS5-unavailable (``fts5_unavailable`` set): no triggers exist, so the
+    base-column UPDATE alone is correct (the index lands later via the
+    rebuild-on-availability path). Checkpoints
+    ``conversation_promote_command_args_cursor`` per 500-row batch; clears both
+    keys when the cursor is exhausted. Interrupted ⇒ resumes from the cursor on
+    the next locked sync; a fresh install never sets the flag → cheap no-op."""
+    if conn.execute(
+        "SELECT 1 FROM cache_meta "
+        "WHERE key='conversation_promote_command_args_pending'"
+    ).fetchone() is None:
+        return
+    row = conn.execute(
+        "SELECT value FROM cache_meta "
+        "WHERE key='conversation_promote_command_args_cursor'").fetchone()
+    last_id = int(row[0]) if row else 0
+    while True:
+        batch = conn.execute(
+            "SELECT id, blocks_json FROM conversation_messages "
+            "WHERE id > ? AND entry_type='meta' ORDER BY id LIMIT 500",
+            (last_id,)).fetchall()
+        if not batch:
+            break
+        ups = []
+        for rid, bj in batch:
+            last_id = rid
+            try:
+                blocks = json.loads(bj) if bj else []
+            except (TypeError, ValueError):
+                blocks = []
+            inv = _lib_conversation._extract_command_invocation(
+                blocks, _lib_conversation._join_text_blocks(blocks))
+            if inv is None:
+                continue
+            st, sth = _lib_conversation._derive_search_columns(blocks)
+            ups.append((inv["args"], st, sth, rid))
+        if ups:
+            conn.executemany(
+                "UPDATE conversation_messages SET entry_type='human', text=?, "
+                "search_tool=?, search_thinking=? WHERE id=?", ups)
+        _cctally_db_sib._set_cache_meta(
+            conn, "conversation_promote_command_args_cursor", str(last_id))
+        conn.commit()
+    conn.execute(
+        "DELETE FROM cache_meta WHERE key IN "
+        "('conversation_promote_command_args_pending',"
+        " 'conversation_promote_command_args_cursor')")
     conn.commit()
 
 

@@ -41,6 +41,53 @@ def _is_system_marker(text) -> bool:
     return bool(text) and _MARKER_RE.fullmatch(text) is not None
 
 
+# #188: a slash-command invocation carries the user's real prompt inside
+# <command-args>. The <command-name>/<command-message> wrappers are plumbing.
+# Anchored mid-string is fine — _is_system_marker already proved the whole text
+# is ONLY markers before these run, so the first match is the lone occurrence.
+_CMD_NAME_RE = re.compile(r"<command-name>([\s\S]*?)</command-name>")
+_CMD_ARGS_RE = re.compile(r"<command-args>([\s\S]*?)</command-args>")
+
+
+def _join_text_blocks(blocks):
+    """'\\n'-join the text-block bodies of a normalized blocks list (mirrors
+    _blocks_and_text's prose join + the query kernel's _join_text_blocks). The
+    migration-011 consumer rebuilds the marker text from blocks_json to feed
+    _extract_command_invocation, so this lives in the parser kernel (the one
+    _cctally_cache already imports) to keep the two derivations identical."""
+    if not blocks:
+        return ""
+    return "\n".join(b.get("text", "") or ""
+                     for b in blocks if b.get("kind") == "text")
+
+
+def _extract_command_invocation(blocks, text):
+    """If a row is a pure slash-command marker whose <command-args> is non-empty
+    (after strip), return ``{"name": <command-name or "">, "args": <args>}``;
+    else ``None`` (#188 bug 4).
+
+    Block-aware: promotes ONLY when every block is text (mirrors the all-text
+    guard in ``_normalize`` / ``_meta_classify`` so a marker text block PLUS an
+    attachment — e.g. an image — is never promoted) AND ``text`` is a pure
+    command-marker block (``_is_system_marker``) AND ``<command-args>`` holds a
+    real prompt. ``/clear``, ``/exit``, ``/compact``, ``/model`` (empty args) and
+    stdout-only markers all return ``None`` so they stay hidden as system
+    markers. ``name`` is taken from ``<command-name>`` for the reader's command
+    badge; it is purely cosmetic (``""`` when the marker omits the name tag)."""
+    if not blocks or not all(b.get("kind") == "text" for b in blocks):
+        return None
+    if not _is_system_marker(text):
+        return None
+    am = _CMD_ARGS_RE.search(text)
+    if am is None:
+        return None
+    args = am.group(1).strip()
+    if not args:
+        return None
+    nm = _CMD_NAME_RE.search(text)
+    return {"name": (nm.group(1).strip() if nm else ""), "args": args}
+
+
 # #186: strip ANSI terminal control sequences from captured prose/thinking so a
 # slash-command stdout echo (which keeps its SGR styling, e.g. `\x1b[1mFable
 # 5\x1b[22m`) never leaks literal `^[[1m` control codes into a title, an outline
@@ -192,6 +239,20 @@ def _normalize(obj, t, offset):
         # tool_result block still folds as a result.
         entry_type = META
         text = ""
+    elif (blocks and all(b["kind"] == "text" for b in blocks)
+          and (_inv := _extract_command_invocation(blocks, text)) is not None):
+        # #188: a slash-command invocation carrying a real user prompt in
+        # <command-args> IS a user turn — the wrapper is plumbing but the args
+        # are what the user typed. Promote it (entry_type=HUMAN, text=args) so it
+        # enters FTS / title derivation / the entry_type='human' prompts facet.
+        # blocks_json is UNTOUCHED (still the raw <command-name>…), so the read
+        # path derives the command-name badge from the blocks. Ordered BEFORE the
+        # empty-args/stdout-only system-marker fold below — /clear, /exit,
+        # /compact and friends (empty args) fall through to META there. The
+        # all-text guard mirrors the marker fold so a marker+attachment row is
+        # never folded NOR promoted (it stays a plain HUMAN turn in the else).
+        entry_type = HUMAN
+        text = _inv["args"]
     elif blocks and all(b["kind"] == "text" for b in blocks) and _is_system_marker(text):
         # A slash-command echo carried as a plain user line (NOT isMeta): the
         # user did not type it. `<local-command-stdout>…</local-command-stdout>`
