@@ -649,6 +649,39 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
     return _RefreshUsageResult(status="ok", payload=payload, warnings=warnings)
 
 
+def _nudge_dashboard_repaint(port: int = 8789, timeout_seconds: float = 3.0) -> None:
+    """Best-effort: tell a locally-running dashboard to rebuild+broadcast NOW.
+
+    refresh-usage already persisted the new usage value; this only shortens
+    the dashboard's repaint latency from <=sync-interval to ~instant by
+    POSTing the rebuild-only /api/sync?refresh=0 path. Swallows EVERY error
+    (no dashboard listening, timeout, HTTP non-2xx) — never raises, never
+    prints, never changes cmd_refresh_usage's exit code.
+
+    Targets loopback 127.0.0.1 (reaches a local dashboard even when it bound
+    0.0.0.0) on the default port 8789. A dashboard on a non-default port (or
+    none) simply isn't nudged and self-heals within its --sync-interval.
+
+    CSRF: the dashboard's _check_origin_csrf requires Origin/Host authority
+    parity. urllib auto-sets Host from the URL; we set Origin to the
+    byte-identical authority so the POST is accepted (not 403). The timeout
+    is 3.0s — comfortably above the server's _DASHBOARD_SYNC_LOCK_TIMEOUT_
+    SECONDS (2.0s) bounded lock-wait — so the client stays connected until
+    the 204 lands and never leaves a broken-pipe log line in the dashboard's
+    terminal. In the common case (lock free) it returns in single-digit ms.
+    """
+    url = f"http://127.0.0.1:{port}/api/sync?refresh=0"
+    req = urllib.request.Request(
+        url, data=b"", method="POST",
+        headers={"Origin": f"http://127.0.0.1:{port}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            resp.read()
+    except Exception:
+        pass
+
+
 def cmd_refresh_usage(args: argparse.Namespace) -> int:
     """Force-fetch the OAuth usage API and persist via cmd_record_usage.
 

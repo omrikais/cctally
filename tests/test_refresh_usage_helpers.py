@@ -418,3 +418,19 @@ def test_fetch_uses_override_user_agent(monkeypatch):
 
     ns["_fetch_oauth_usage"](token="tok", timeout_seconds=2.0)
     assert captured["headers"].get("User-agent") == "cctally/0.1"
+
+
+def test_nudge_dashboard_repaint_swallows_no_listener(capsys):
+    """Best-effort contract: against a port with nothing listening, the
+    helper must NOT raise, must print nothing, and must return None."""
+    import socket
+    ns = load_script()
+    # Reserve a port then close it, so the connect is guaranteed refused.
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    closed_port = s.getsockname()[1]
+    s.close()
+    assert ns["_nudge_dashboard_repaint"](port=closed_port, timeout_seconds=0.5) is None
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""

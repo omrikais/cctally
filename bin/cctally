@@ -718,6 +718,7 @@ _bust_statusline_cache = _cctally_refresh._bust_statusline_cache
 _freshness_label = _cctally_refresh._freshness_label
 _cmd_refresh_usage_handle_rate_limit = _cctally_refresh._cmd_refresh_usage_handle_rate_limit
 _refresh_usage_inproc = _cctally_refresh._refresh_usage_inproc
+_nudge_dashboard_repaint = _cctally_refresh._nudge_dashboard_repaint
 cmd_refresh_usage = _cctally_refresh.cmd_refresh_usage
 _hook_tick_oauth_refresh = _cctally_refresh._hook_tick_oauth_refresh
 _hook_tick_make_mock_refresh = _cctally_refresh._hook_tick_make_mock_refresh
