@@ -163,13 +163,64 @@ def test_migration_consumer_noop_without_flag():
     assert row[0] == "meta"
 
 
+def _two_promotable_command_cache():
+    """A cache.db with TWO promotable command-marker META rows at explicit,
+    known ids (10 and 20) so a seeded mid-walk cursor lands strictly between
+    them. Both carry a real <command-args> prompt — only the cursor decides
+    which one the consumer reaches."""
+    conn = sqlite3.connect(":memory:")
+    db._apply_cache_schema(conn)
+    low = ("<command-name>/review</command-name>"
+           "<command-args>LOW id prompt below cursor.</command-args>")
+    high = ("<command-name>/effort</command-name>"
+            "<command-args>HIGH id prompt above cursor.</command-args>")
+    for rid, uuid, off, txt in ((10, "lo", 0, low), (20, "hi", 1, high)):
+        conn.execute(
+            "INSERT INTO conversation_messages "
+            "(id,session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,"
+            " text,blocks_json,is_sidechain) VALUES "
+            "(?,'s',?,'f',?,'t','meta','',?,0)",
+            (rid, uuid, off, json.dumps([{"kind": "text", "text": txt}])))
+    conn.commit()
+    return conn
+
+
 def test_migration_consumer_resumable_cursor():
-    # The consumer checkpoints a cursor; a re-run after partial progress is safe.
+    # Mid-walk resume: the consumer batches on `WHERE id > ? AND entry_type='meta'`
+    # with the cursor checkpointed per batch. Seed the cursor to a value strictly
+    # between the two promotable rows' ids (10 and 20) and arm the pending flag,
+    # then run the consumer ONCE. The id<=cursor row must stay META (already
+    # "consumed" by a prior interrupted pass); only the id>cursor row flips. This
+    # FAILS if the consumer ignores the cursor (it would promote BOTH).
+    conn = _two_promotable_command_cache()
+    db._set_cache_meta(conn, "conversation_promote_command_args_cursor", "15")
+    db._set_cache_meta(conn, "conversation_promote_command_args_pending", "1")
+    cache._consume_promote_command_args(conn)
+
+    # id=10 <= cursor 15 → skipped, stays META with empty text.
+    below = conn.execute(
+        "SELECT entry_type, text FROM conversation_messages WHERE id=10").fetchone()
+    assert below[0] == "meta" and below[1] == ""
+
+    # id=20 > cursor 15 → promoted to HUMAN with the args as text.
+    above = conn.execute(
+        "SELECT entry_type, text FROM conversation_messages WHERE id=20").fetchone()
+    assert above[0] == "human" and above[1] == "HIGH id prompt above cursor."
+
+    # Cursor exhausted → both keys cleared.
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key IN "
+        "('conversation_promote_command_args_pending',"
+        " 'conversation_promote_command_args_cursor')").fetchone() is None
+
+
+def test_migration_consumer_rerun_is_idempotent_noop():
+    # A re-run after a COMPLETE pass is a clean no-op: already-promoted rows are
+    # HUMAN (not META) so the WHERE entry_type='meta' batch skips them and the
+    # flag clears again. (Idempotency — distinct from the mid-walk resume above.)
     conn = _legacy_command_cache()
     db._set_cache_meta(conn, "conversation_promote_command_args_pending", "1")
     cache._consume_promote_command_args(conn)
-    # Re-arm + re-run: already-promoted rows are HUMAN (not META), so a second
-    # pass is a clean no-op and the flag clears again.
     db._set_cache_meta(conn, "conversation_promote_command_args_pending", "1")
     cache._consume_promote_command_args(conn)
     row = conn.execute(

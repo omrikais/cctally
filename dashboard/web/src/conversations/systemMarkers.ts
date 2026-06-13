@@ -46,10 +46,17 @@ export function isSystemMarker(text: string): boolean {
 // a pure command marker (isSystemMarker) whose <command-args> is non-empty after
 // strip ⇒ { name, args } (name from <command-name>, '' when omitted); else null.
 // Empty-args control commands (/clear, /exit, /compact, /model) and stdout-only
-// markers return null and stay hidden as system markers. The block-aware all-text
-// guard is the CALLER's (MessageItem applies blocks.every(text), mirroring the
-// Python caller) — same posture as isSystemMarker. Anchored mid-string is fine
-// because isSystemMarker already proved the whole text is ONLY markers.
+// markers return null and stay hidden as system markers.
+//
+// This twin has NO production caller — the reader promotes slash-command turns
+// from the server-supplied command_name/text, computed once at ingest by the
+// Python kernel; the client never re-derives the promote decision. It exists for
+// (a) cross-language parity testing against the Python helper (markerParity.test.ts),
+// so the two regex extractors can't silently drift, and (b) future client-side use.
+// Unlike the Python kernel it takes only `text` (no block-aware all-text guard):
+// a future caller wanting Python-faithful behavior must apply the all-text guard
+// itself (blocks.every(text)), same posture as isSystemMarker. Anchored mid-string
+// is fine because isSystemMarker already proved the whole text is ONLY markers.
 const CMD_NAME_RE = /<command-name>([\s\S]*?)<\/command-name>/;
 const CMD_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
 

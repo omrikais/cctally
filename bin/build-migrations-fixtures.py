@@ -40,6 +40,7 @@ Per-migration goldens (lazy-adopted; one pair per migration that ships them):
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -2114,6 +2115,142 @@ def build_per_migration_010_conversation_search_split(
     _build_post(pre, post)
 
 
+def build_per_migration_011_conversation_promote_command_args(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for cache migration
+    ``011_conversation_promote_command_args`` (#188 bug 4).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — full production cache schema (via ``_apply_cache_schema``)
+        with a ``schema_migrations`` table carrying cache migrations 001-010 (an
+        existing install at the 010 head) but NOT 011, and no
+        ``conversation_promote_command_args_pending`` flag — the existing-install
+        shape before the command-args promotion is armed. Seeds ONE legacy
+        ``entry_type='meta'`` conversation_messages row whose blocks_json is a
+        promotable slash-command marker (non-empty ``<command-args>``), so the
+        flock-held consumer has a real row to flip.
+      * ``post.sqlite`` — same DB after running the production 011 handler. 011 is
+        flag-only: it sets
+        ``cache_meta['conversation_promote_command_args_pending']='1'`` (so
+        sync_cache flips legacy meta command rows to entry_type='human' with
+        text=args + recomputes split search columns under the flock) and the
+        dispatcher central-stamps the 011 marker (#140). The flag-only handler
+        does NOT touch the seeded data row (the swap is sync-side).
+
+    Loaded by ``tests/test_cache_migration_011_per_migration_goldens.py``.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    # The 010-head prior chain stamped into pre.sqlite (an existing install that
+    # has every prior cache migration but not yet the #188 bug-4 promotion).
+    _PRIOR_CHAIN = (
+        "001_dedup_highest_wins",
+        "002_conversation_messages_backfill",
+        "003_conversation_reingest_tool_ids",
+        "004_conversation_reingest_subagent_kind",
+        "005_conversation_reingest_meta",
+        "006_conversation_reingest_source_tool_use_id",
+        "007_conversation_reingest_enrichment",
+        "008_session_entries_speed_backfill",
+        "009_conversation_media_reingest",
+        "010_conversation_search_split",
+    )
+
+    # A legacy META command row whose <command-args> carry a real user prompt —
+    # exactly the shape the consumer flips to entry_type='human' (text=args).
+    _LEGACY_MARKER = (
+        "<command-name>/review</command-name>"
+        "<command-args>Review feat/x vs main.</command-args>"
+    )
+    _LEGACY_BLOCKS = json.dumps([{"kind": "text", "text": _LEGACY_MARKER}])
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _cctally, db = _load_cctally()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in _PRIOR_CHAIN:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-06-13T12:00:00Z"),
+                )
+            # One legacy META command row the consumer will later promote
+            # (entry_type='meta', text='', blocks_json = the raw marker). The
+            # flag-only 011 handler leaves it untouched; the flock-held
+            # _consume_promote_command_args (sync-side) is what flips it.
+            conn.execute(
+                "INSERT INTO conversation_messages "
+                "(uuid, session_id, source_path, byte_offset, timestamp_utc, "
+                " entry_type, text, blocks_json) "
+                "VALUES (?, ?, ?, ?, ?, 'meta', '', ?)",
+                ("u1", "s1", "/x/agent-s1.jsonl", 0, "2026-06-13T00:00:00Z",
+                 _LEGACY_BLOCKS),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _cctally, db = _load_cctally()
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "011_conversation_promote_command_args":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit(
+                "011_conversation_promote_command_args not registered"
+            )
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Flag-only handler: sets conversation_promote_command_args_pending.
+            # Then stamp the marker centrally (the dispatcher owns the stamp per
+            # #140) with a PINNED timestamp so the committed golden is rebuild-
+            # deterministic.
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("011_conversation_promote_command_args", "2026-06-13T12:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -2151,6 +2288,10 @@ def main() -> int:
     )
     build_per_migration_010_conversation_search_split(
         FIXTURES_ROOT / "per-migration" / "010_conversation_search_split"
+    )
+    build_per_migration_011_conversation_promote_command_args(
+        FIXTURES_ROOT / "per-migration"
+        / "011_conversation_promote_command_args"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

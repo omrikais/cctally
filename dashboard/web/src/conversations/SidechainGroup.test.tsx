@@ -1,5 +1,5 @@
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { fireEvent, render, screen } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
 import { SidechainGroup, subagentSummaryLabel } from './SidechainGroup';
 import type { ConversationItem } from '../types/conversation';
 
@@ -212,6 +212,40 @@ describe('SidechainGroup', () => {
     expect(det.open).toBe(true);
     // Still registered when open — no key collision, no open/close toggle race.
     expect(cardRefs.get('root')).toBe(det);
+  });
+
+  // #188 S4/C1 — the reader lifts subagent open-state so it can count only
+  // VISIBLE live appends (Bug 5). onOpenChange fires with the subagent key + the
+  // new open state on a user toggle, and `true` when a #160 force-open latches.
+  it('fires onOpenChange(subagentKey, true/false) on a user toggle', () => {
+    const onOpenChange = vi.fn();
+    const items = [member('s1'), member('s2')];
+    const { container } = render(
+      <SidechainGroup subagentKey="k1" items={items} nested={false} onOpenChange={onOpenChange} />,
+    );
+    const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    // jsdom doesn't fire `toggle` from a property set; simulate the user opening
+    // the disclosure by setting `open` then dispatching the native `toggle`
+    // event the React onToggle handler binds to (a real browser <details> fires
+    // this on a summary click).
+    det.open = true;
+    fireEvent(det, new Event('toggle', { bubbles: false }));
+    expect(onOpenChange).toHaveBeenCalledWith('k1', true);
+    det.open = false;
+    fireEvent(det, new Event('toggle', { bubbles: false }));
+    expect(onOpenChange).toHaveBeenCalledWith('k1', false);
+  });
+
+  it('fires onOpenChange(subagentKey, true) when a force-open latches', () => {
+    const onOpenChange = vi.fn();
+    const items = [member('s1'), member('s2')];
+    const base = { subagentKey: 'k1', items, nested: false, onOpenChange };
+    const { rerender } = render(<SidechainGroup {...base} forceOpen={false} />);
+    expect(onOpenChange).not.toHaveBeenCalled();
+    // Force the thread open: the latch effect must report the key as open so the
+    // reader counts a subsequent append into THIS now-visible thread.
+    rerender(<SidechainGroup {...base} forceOpen={true} />);
+    expect(onOpenChange).toHaveBeenCalledWith('k1', true);
   });
 
   it('opens on forceOpen, registers member refs only while open, and latches open after the force drops', () => {

@@ -692,6 +692,141 @@ describe('ConversationReader live-tail scroll (#175 F4)', () => {
   });
 });
 
+describe('ConversationReader visible-only "↓ N new" count (#188 S4/C2, Bug 5)', () => {
+  // Render fully-paged, scroll UP (so live appends raise the pill rather than
+  // sticking to bottom), and return the body + container.
+  async function renderScrolledUp(items: ConversationItem[]) {
+    mockFetchOnce(detail(items, null));
+    const utils = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-body')).not.toBeNull());
+    await waitFor(() =>
+      expect(utils.container.querySelectorAll('.conv-reader-thread > *').length).toBeGreaterThan(0));
+    const body = utils.container.querySelector('.conv-reader-body') as HTMLElement;
+    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 }); // scrolled up
+    fireEvent.scroll(body);
+    return { ...utils, body };
+  }
+
+  // Append a live-tail delta of `items` (the tail response carries only the new
+  // turns; stays fully paged). Re-pins the scroll metrics first because a jsdom
+  // append doesn't recompute them, so the layout effect still reads "scrolled up".
+  async function appendLive(body: HTMLElement, items: ConversationItem[], tag: string) {
+    mockFetchOnce(detail(items, null));
+    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
+    fireEvent.scroll(body);
+    await act(async () => {
+      bumpSnapshot(tag);
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+  }
+
+  const sc = (uuid: string, key: string, over: Partial<ConversationItem> = {}) =>
+    makeItem({ uuid, is_sidechain: true, subagent_key: key, text: uuid, ...over } as never);
+
+  it('an append into a COLLAPSED known subagent thread does NOT bump the pill', async () => {
+    // Page 1: a top-level item + a (collapsed) subagent thread A (root sa1).
+    const { body, container } = await renderScrolledUp([
+      makeItem({ uuid: 'h1' }),
+      sc('sa1', 'A', { text: 'Audit A' }),
+    ]);
+    // The thread renders collapsed; its key 'A' is in the known-set, but it is
+    // NOT open.
+    const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    expect(det.open).toBe(false);
+
+    // A live append of a NEW member into the collapsed known thread A — nothing
+    // is visible below the fold, so the pill must stay hidden (Bug 5).
+    await appendLive(body, [sc('sa2', 'A')], 't-sa2');
+    expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
+  });
+
+  it('an append into an EXPANDED known subagent thread bumps the pill (+1)', async () => {
+    const { body, container } = await renderScrolledUp([
+      makeItem({ uuid: 'h1' }),
+      sc('sa1', 'A', { text: 'Audit A' }),
+    ]);
+    const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    // Expand the thread: the SidechainGroup's onToggle fires the reader's
+    // handleSubagentOpenChange so the key 'A' enters openKeysRef.
+    await act(async () => {
+      det.open = true;
+      fireEvent(det, new Event('toggle', { bubbles: false }));
+      await Promise.resolve();
+    });
+
+    // Now an append into the EXPANDED thread A IS visible → +1.
+    await appendLive(body, [sc('sa2', 'A')], 't-sa2');
+    const pill = await screen.findByRole('button', { name: /new/i });
+    expect(pill.textContent).toMatch(/1 new/);
+  });
+
+  it('a top-level live append bumps the pill (+1)', async () => {
+    const { body } = await renderScrolledUp([
+      makeItem({ uuid: 'h1' }),
+      sc('sa1', 'A', { text: 'Audit A' }),
+    ]);
+    await appendLive(body, [makeItem({ uuid: 'h2' })], 't-h2');
+    const pill = await screen.findByRole('button', { name: /new/i });
+    expect(pill.textContent).toMatch(/1 new/);
+  });
+
+  it('the FIRST item of a brand-new subagent group bumps the pill once (+1)', async () => {
+    const { body } = await renderScrolledUp([makeItem({ uuid: 'h1' })]);
+    // Two members of a NEW subagent thread B arrive in one tick. The group's
+    // FIRST item is visible (the card appears); the second is buried under the
+    // (collapsed-by-default) fold → net +1, deduped per key per tick.
+    await appendLive(body, [sc('sb1', 'B', { text: 'Audit B' }), sc('sb2', 'B')], 't-B');
+    const pill = await screen.findByRole('button', { name: /new/i });
+    expect(pill.textContent).toMatch(/1 new/);
+  });
+
+  it('a session switch resets the open/known subagent sets (collapsed append on B does not over-count)', async () => {
+    // Convo A: a known subagent thread A (collapsed).
+    const { container, rerender } = await renderScrolledUp([
+      makeItem({ uuid: 'h1' }),
+      sc('sa1', 'A', { text: 'Audit A' }),
+    ]);
+    // Expand A on convo A (puts 'A' in openKeysRef) so we can prove the reset:
+    // if openKeysRef survived the switch, a collapsed thread reusing key 'A' on
+    // convo B would wrongly count.
+    const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    await act(async () => {
+      det.open = true;
+      fireEvent(det, new Event('toggle', { bubbles: false }));
+      await Promise.resolve();
+    });
+
+    // Switch the reused reader to convo B (different session, B's page-1 detail
+    // carries a COLLAPSED subagent thread that happens to reuse key 'A').
+    mockFetchOnce({
+      session_id: 'B', project_label: 'projB', git_branch: 'main',
+      started_utc: '2026-01-01T00:00:00Z', last_activity_utc: '2026-01-01T02:00:00Z',
+      cost_usd: 2, models: ['claude-opus-4'],
+      items: [
+        { ...makeItem({ uuid: 'b1' }), anchor: { session_id: 'B', uuid: 'b1', id: 0 } },
+        { ...sc('ba1', 'A', { text: 'B Audit' }), anchor: { session_id: 'B', uuid: 'ba1', id: 1 } },
+      ],
+      page: { next_after: null, has_more: false },
+    });
+    await act(async () => {
+      rerender(<ConversationReader sessionId="B" />);
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="b1"]')).not.toBeNull());
+    const bodyB = container.querySelector('.conv-reader-body') as HTMLElement;
+    setScroll(bodyB, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
+    fireEvent.scroll(bodyB);
+
+    // A live append into the COLLAPSED thread 'A' on convo B. If the reset
+    // cleared openKeysRef (it must), this append is invisible → no pill. If the
+    // stale open-set survived, it would wrongly count (the regression this pins).
+    await appendLive(bodyB, [
+      { ...sc('ba2', 'A'), anchor: { session_id: 'B', uuid: 'ba2', id: 2 } } as ConversationItem,
+    ], 't-ba2');
+    expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
+  });
+});
+
 describe('ConversationReader floating "↑ Top of turn" button (#176)', () => {
   // jsdom never lays out, so getBoundingClientRect returns all-zeros. The
   // visibility decision keys on rects, so stub each element's rect by hand:
