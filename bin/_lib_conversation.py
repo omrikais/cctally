@@ -64,6 +64,7 @@ def _strip_ansi(text):
     run. Empty / None passes through unchanged. (#186)"""
     return _ANSI_RE.sub("", text) if text else text
 
+
 _TOOL_RESULT_CAP = 16000   # was 4000; full text always re-derivable from JSONL
 _INPUT_LEAF_CAP = 8000     # max chars per string leaf in a bounded tool input
 _INPUT_TOTAL_CAP = 32000   # honesty backstop on the serialized bounded input
