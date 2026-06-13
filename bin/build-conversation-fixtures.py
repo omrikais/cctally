@@ -188,6 +188,8 @@ def build(scenario: str) -> None:
     s4_cwd = "/home/u/proj"
     s5_file = "/fake/projects/proj/s5.jsonl"
     s5_cwd = "/home/u/proj"
+    s6_file = "/fake/projects/proj/s6.jsonl"
+    s6_cwd = "/home/u/proj"
 
     cache_conn = sqlite3.connect(cache_path)
     stats_conn = sqlite3.connect(stats_path)
@@ -211,6 +213,8 @@ def build(scenario: str) -> None:
                           project_path=s4_cwd)
         seed_session_file(cache_conn, path=s5_file, session_id="s5",
                           project_path=s5_cwd)
+        seed_session_file(cache_conn, path=s6_file, session_id="s6",
+                          project_path=s6_cwd)
 
         # --- session s1: human prompt + multi-fragment assistant turn --------
         # id=1: human prompt.
@@ -612,6 +616,41 @@ def build(scenario: str) -> None:
             model=MODEL, msg_id="m5", req_id="r5",
             input_tokens=1000, output_tokens=500,
             cost_usd_raw=0.99,
+        )
+
+        # --- session s6: the #186 command-marker + ANSI end-to-end golden.
+        # The FIRST user line is a slash-command stdout echo carrying terminal
+        # SGR styling, stored entry_type='human' to model a PRE-FIX row (ingested
+        # before the parser-level classification + ingest ANSI strip shipped). It
+        # exercises BOTH read-time defenses in one payload: the read-time
+        # _meta_classify reorder folds it to kind='meta'/meta_kind='command' (so
+        # it renders as a System-marker pill, not a "YOU" turn) AND the read-time
+        # ANSI strip removes the raw `\x1b[1m…\x1b[22m` from the folded command
+        # <pre> body. The SECOND user line is the real prompt — it wins the title
+        # (clean, no plumbing), proving the title de-poisoning end-to-end. ----
+        _insert_message(
+            cache_conn,
+            session_id="s6", uuid="s6m", parent_uuid=None,
+            source_path=s6_file, byte_offset=0,
+            timestamp_utc="2026-06-06T00:00:00Z",
+            entry_type="human",
+            text=("<local-command-stdout>Set model to "
+                  "\x1b[1mFable 5\x1b[22m</local-command-stdout>"),
+            blocks_json=json.dumps([{"kind": "text", "text": (
+                "<local-command-stdout>Set model to "
+                "\x1b[1mFable 5\x1b[22m</local-command-stdout>")}]),
+            cwd=s6_cwd, git_branch="main",
+        )
+        _insert_message(
+            cache_conn,
+            session_id="s6", uuid="s6h", parent_uuid="s6m",
+            source_path=s6_file, byte_offset=1,
+            timestamp_utc="2026-06-06T00:00:02Z",
+            entry_type="human",
+            text="complete Session 6 — Search depth from issue #177",
+            blocks_json=json.dumps([{"kind": "text", "text": (
+                "complete Session 6 — Search depth from issue #177")}]),
+            cwd=s6_cwd, git_branch="main",
         )
 
         # Empty stats.db stamped fully-migrated (dashboard-fixtures posture):

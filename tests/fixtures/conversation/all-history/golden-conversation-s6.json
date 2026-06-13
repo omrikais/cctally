@@ -1,0 +1,62 @@
+{
+  "cost_usd": 0.0,
+  "git_branch": "main",
+  "items": [
+    {
+      "anchor": {
+        "id": 25,
+        "session_id": "s6",
+        "uuid": "s6m"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "<local-command-stdout>Set model to Fable 5</local-command-stdout>"
+        }
+      ],
+      "is_sidechain": false,
+      "kind": "meta",
+      "member_uuids": [
+        "s6m"
+      ],
+      "meta_kind": "command",
+      "parent_uuid": null,
+      "skill_name": null,
+      "subagent_key": null,
+      "text": "<local-command-stdout>Set model to Fable 5</local-command-stdout>",
+      "ts": "2026-06-06T00:00:00Z"
+    },
+    {
+      "anchor": {
+        "id": 26,
+        "session_id": "s6",
+        "uuid": "s6h"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "complete Session 6 \u2014 Search depth from issue #177"
+        }
+      ],
+      "is_sidechain": false,
+      "kind": "human",
+      "member_uuids": [
+        "s6h"
+      ],
+      "parent_uuid": "s6m",
+      "subagent_key": null,
+      "text": "complete Session 6 \u2014 Search depth from issue #177",
+      "ts": "2026-06-06T00:00:02Z"
+    }
+  ],
+  "last_activity_utc": "2026-06-06T00:00:02Z",
+  "models": [],
+  "page": {
+    "has_more": false,
+    "next_after": null
+  },
+  "project_label": "proj",
+  "session_id": "s6",
+  "started_utc": "2026-06-06T00:00:00Z",
+  "subagent_meta": {}
+}

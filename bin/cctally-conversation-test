@@ -465,6 +465,55 @@ print("ok")
         fail "outline route (#177 S5): $outline_check (raw: $outline_raw)"
     fi
 
+    # --- 2e) Reader: #186 command-marker fold + read-time ANSI strip ------
+    # s6's FIRST user line is a PRE-FIX slash-command stdout echo carrying SGR
+    # styling (stored entry_type='human'). The reader must (a) fold it to
+    # kind='meta'/meta_kind='command' (System-marker pill, not a "YOU" turn),
+    # (b) strip the raw `\x1b` from the folded command <pre> body, and (c) the
+    # rail title must be the REAL second prompt, clean of plumbing + ANSI.
+    fetch_and_diff "GET /api/conversation/s6" "golden-conversation-s6.json" \
+        "$base/api/conversation/s6" "${LOOP[@]}"
+
+    local s6_raw s6_check rail_raw
+    s6_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s6")
+    rail_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversations")
+    s6_check=$(D="$s6_raw" RAIL="$rail_raw" python3 -c '
+import json, os, sys
+d = json.loads(os.environ["D"])
+rail = json.loads(os.environ["RAIL"])
+errs = []
+raw = os.environ["D"]
+if "\\u001b" in raw or "\x1b" in raw:
+    errs.append("raw ESC survived into the s6 reader payload")
+items = d.get("items") or []
+by = {it["anchor"]["uuid"]: it for it in items}
+echo = by.get("s6m")
+if echo is None:
+    errs.append("s6m item missing")
+else:
+    if echo.get("kind") != "meta" or echo.get("meta_kind") != "command":
+        errs.append("s6m not folded to meta/command: kind=%r meta_kind=%r"
+                    % (echo.get("kind"), echo.get("meta_kind")))
+    if "\x1b" in (echo.get("text") or ""):
+        errs.append("s6m command body still carries ESC: %r" % (echo.get("text"),))
+    if "Fable 5" not in (echo.get("text") or ""):
+        errs.append("s6m command body lost its text: %r" % (echo.get("text"),))
+real = by.get("s6h")
+if real is None or real.get("kind") != "human":
+    errs.append("s6h real prompt missing/not human: %r" % (real,))
+conv = next((c for c in rail.get("conversations", []) if c.get("session_id") == "s6"), None)
+if conv is None:
+    errs.append("s6 absent from rail")
+elif conv.get("title") != "complete Session 6 — Search depth from issue #177":
+    errs.append("s6 rail title not the clean real prompt: %r" % (conv.get("title"),))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+    if [ "$s6_check" != "ok" ]; then
+        fail "reader command-marker fold + ANSI strip (#186): $s6_check (raw: $s6_raw)"
+    fi
+
     # --- 3) Search: deduped across replay to ONE hit ---------------------
     # Byte-exact golden only when FTS5 is present (the golden is FTS-shaped);
     # the structural asserts below run unconditionally.
