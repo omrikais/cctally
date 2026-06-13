@@ -5459,8 +5459,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(503, "sync in progress")
             return
         try:
+            do_refresh = (
+                urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                .get("refresh", ["1"])[0] != "0"
+            )
             warnings: list = []
-            if not type(self).no_sync:
+            if do_refresh and not type(self).no_sync:
                 result = _refresh_usage_inproc()
                 if result.status != "ok":
                     warnings.append({"code": result.status})

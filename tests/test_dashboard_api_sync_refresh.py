@@ -277,3 +277,59 @@ def test_post_sync_lock_released_between_calls(monkeypatch, tmp_path):
         assert s1 == 204 and s2 == 204
     finally:
         srv.shutdown(); t.join(timeout=2)
+
+
+# ----------------------------------------------------------------------
+# Task 1 (#180): ?refresh=0 rebuild-only mode on POST /api/sync.
+# ----------------------------------------------------------------------
+def _post_sync_path(port, path="/api/sync"):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("POST", path, body="", headers={
+        "Origin": f"http://127.0.0.1:{port}",
+        "Host": f"127.0.0.1:{port}",
+    })
+    r = c.getresponse()
+    body = r.read().decode()
+    return r.status, body
+
+
+def test_post_sync_refresh_zero_skips_fetch_rebuild_only(monkeypatch, tmp_path):
+    """POST /api/sync?refresh=0 must NOT call _refresh_usage_inproc, but
+    must still rebuild + return 204 (rebuild-only repaint)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    rebuild_calls = _wire(ns)
+    invoked = {"n": 0}
+    def _spy(timeout_seconds=5.0):
+        invoked["n"] += 1
+        return ns["_RefreshUsageResult"](status="ok")
+    monkeypatch.setitem(ns, "_refresh_usage_inproc", _spy)
+    srv, t, port = _serve(ns)
+    try:
+        status, _ = _post_sync_path(port, "/api/sync?refresh=0")
+        assert status == 204
+        assert invoked["n"] == 0        # fetch skipped
+        assert rebuild_calls["n"] == 1  # rebuild still ran
+    finally:
+        srv.shutdown(); t.join(timeout=2)
+
+
+def test_post_sync_paramless_still_fetches(monkeypatch, tmp_path):
+    """Regression: a param-less POST /api/sync keeps fetching (refresh
+    defaults to '1'), so the SyncChip path is byte-identical to today."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    rebuild_calls = _wire(ns)
+    invoked = {"n": 0}
+    def _spy(timeout_seconds=5.0):
+        invoked["n"] += 1
+        return ns["_RefreshUsageResult"](status="ok")
+    monkeypatch.setitem(ns, "_refresh_usage_inproc", _spy)
+    srv, t, port = _serve(ns)
+    try:
+        status, _ = _post_sync_path(port, "/api/sync")
+        assert status == 204
+        assert invoked["n"] == 1        # fetch ran (default refresh=1)
+        assert rebuild_calls["n"] == 1
+    finally:
+        srv.shutdown(); t.join(timeout=2)
