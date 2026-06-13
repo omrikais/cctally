@@ -112,6 +112,64 @@ def _strip_ansi(text):
     return _ANSI_RE.sub("", text) if text else text
 
 
+# ---- #191: harness-injected user-line discriminators (shared with the query
+# kernel via re-export). All key on a SELF-IDENTIFYING body shape so the
+# read-time recovery half can rescue already-ingested `human` rows. ----
+
+# Compaction summary preamble. The ingest authority is the `isCompactSummary`
+# JSONL flag (see _normalize); this body match is the read-time meta_kind label
+# authority (and rescues the rare legacy sentinel-without-flag row).
+_COMPACT_SENTINEL = "This session is being continued from a previous conversation"
+
+
+def _is_compaction_body(text) -> bool:
+    """True iff `text` is a compaction-summary body."""
+    return bool(text) and text.lstrip().startswith(_COMPACT_SENTINEL)
+
+
+# Full open+close-tag wrapper (NOT a bare startswith — Codex P1a): a real prompt
+# that merely begins with the literal tag but isn't a well-formed closed block
+# stays human. Unrolled-lazy body = linear time; \1 backref forces the close tag
+# to match the open. A trailing harness line after the close tag is allowed.
+_NOTIFICATION_RE = re.compile(
+    r"\s*<(task|bash)-notification>(?:(?!</\1-notification>)[\s\S])*</\1-notification>")
+
+
+def _is_notification_body(text) -> bool:
+    """True iff `text` opens with a complete <task-notification>…</task-notification>
+    or <bash-notification>…</bash-notification> background-completion wrapper."""
+    return bool(text) and _NOTIFICATION_RE.match(text) is not None
+
+
+# `!`-mode local shell echoes. A DEDICATED detector, NOT a `_MARKER_TAGS` entry
+# (Codex P1b) — so a bash echo containing a literal <command-args> can never
+# reach the #188 `_extract_command_invocation` promotion path.
+_BASH_ECHO_RE = re.compile(
+    r"\s*<(bash-input|bash-stdout|bash-stderr)>(?:(?!</\1>)[\s\S])*</\1>")
+
+
+def _is_bash_echo_body(text) -> bool:
+    """True iff `text` opens with a complete <bash-input>/<bash-stdout>/
+    <bash-stderr> echo wrapper."""
+    return bool(text) and _BASH_ECHO_RE.match(text) is not None
+
+
+# Remote-control replies (sent from the Claude mobile/remote app) arrive as a
+# real user turn prefixed with a `Message sent at <ts> UTC.` system-reminder
+# stamp. NARROW (Codex / approved decision): only this exact leading shape is
+# stripped; no other <system-reminder> is touched.
+_REMOTE_CONTROL_RE = re.compile(
+    r"\A\s*<system-reminder>Message sent at [^<]*UTC\.</system-reminder>\s*")
+
+
+def _strip_remote_control_prefix(text):
+    """Remove a leading remote-control `Message sent at … UTC.` system-reminder
+    block, returning the real user reply. No-op when absent; None/'' pass through."""
+    if not text:
+        return text
+    return _REMOTE_CONTROL_RE.sub("", text, count=1)
+
+
 _TOOL_RESULT_CAP = 16000   # was 4000; full text always re-derivable from JSONL
 _INPUT_LEAF_CAP = 8000     # max chars per string leaf in a bounded tool input
 _INPUT_TOTAL_CAP = 32000   # honesty backstop on the serialized bounded input
@@ -239,6 +297,19 @@ def _normalize(obj, t, offset):
         # tool_result block still folds as a result.
         entry_type = META
         text = ""
+    elif obj.get("isCompactSummary"):
+        # #191: compaction summary injected as a user line — authoritative flag.
+        entry_type = META
+        text = ""
+    elif _is_notification_body(text):
+        # #191: <task-notification>/<bash-notification> background completion.
+        entry_type = META
+        text = ""
+    elif _is_bash_echo_body(text):
+        # #191: <bash-input>/<bash-stdout>/<bash-stderr> `!`-mode echo. Dedicated
+        # branch (NOT _MARKER_TAGS) so it can't reach the #188 promotion path.
+        entry_type = META
+        text = ""
     elif (blocks and all(b["kind"] == "text" for b in blocks)
           and (_inv := _extract_command_invocation(blocks, text)) is not None):
         # #188: a slash-command invocation carrying a real user prompt in
@@ -267,7 +338,10 @@ def _normalize(obj, t, offset):
         entry_type = META
         text = ""
     else:
+        # #191: a leading remote-control `Message sent at … UTC.` system-reminder
+        # stamp is stripped from the real user reply (narrow). No-op when absent.
         entry_type = HUMAN
+        text = _strip_remote_control_prefix(text)
     is_asst = t == "assistant"
     # #177 S6: derive the split search columns on the FINAL post-augment blocks
     # (every _attach_* pass above has already merged bash_stderr / answers /

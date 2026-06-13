@@ -914,3 +914,74 @@ def test_ingest_thinking_and_tool_use_columns():
     assert row.search_thinking == "ponder deeply"
     assert row.text == "visible"
     assert "visible" not in row.search_tool and "visible" not in row.search_thinking
+
+
+def test_compaction_summary_is_meta_not_human():
+    body = ("This session is being continued from a previous conversation that "
+            "ran out of context.\n\nSummary:\n1. ...")
+    fh = _jsonl({"type": "user", "uuid": "c1", "sessionId": "s", "timestamp": "t",
+                 "isCompactSummary": True, "isVisibleInTranscriptOnly": True,
+                 "message": {"role": "user", "content": body}})
+    r = list(lc.iter_message_rows(fh, "f"))[0]
+    assert r.entry_type == lc.META
+    assert r.text == ""                              # kept out of FTS / titles
+    assert "continued from a previous" in json.loads(r.blocks_json)[0]["text"]
+
+
+def test_task_notification_is_meta_not_human():
+    body = ("<task-notification>\n<task-id>behvnfnjj</task-id>\n<status>completed</status>\n"
+            "<summary>Background command \"Run tests\" completed (exit code 0)</summary>\n"
+            "</task-notification>\nRead the output file to retrieve the result: /tmp/x")
+    fh = _jsonl({"type": "user", "uuid": "n1", "sessionId": "s", "timestamp": "t",
+                 "origin": {"kind": "task-notification"}, "promptSource": "system",
+                 "message": {"role": "user", "content": body}})
+    r = list(lc.iter_message_rows(fh, "f"))[0]
+    assert r.entry_type == lc.META and r.text == ""
+
+
+def test_bash_notification_is_meta_not_human():
+    body = ("<bash-notification>\n<shell-id>b0b7c55</shell-id>\n<status>completed</status>\n"
+            "<summary>Background command \"Start dev server\" completed (exit code 0).</summary>\n"
+            "Read the output file to retrieve the output.\n</bash-notification>")
+    fh = _jsonl({"type": "user", "uuid": "n2", "sessionId": "s", "timestamp": "t",
+                 "message": {"role": "user", "content": body}})
+    r = list(lc.iter_message_rows(fh, "f"))[0]
+    assert r.entry_type == lc.META and r.text == ""
+
+
+def test_bash_input_echo_is_meta_not_human():
+    fh = _jsonl({"type": "user", "uuid": "b1", "sessionId": "s", "timestamp": "t",
+                 "message": {"role": "user", "content": "<bash-input>pwd</bash-input>"}})
+    r = list(lc.iter_message_rows(fh, "f"))[0]
+    assert r.entry_type == lc.META and r.text == ""
+
+
+def test_remote_control_prefix_stripped_but_stays_human():
+    body = "<system-reminder>Message sent at Sat 2026-06-13 10:47:42 UTC.</system-reminder>\nApproved."
+    fh = _jsonl({"type": "user", "uuid": "rc1", "sessionId": "s", "timestamp": "t",
+                 "promptSource": "queued",
+                 "message": {"role": "user", "content": body}})
+    r = list(lc.iter_message_rows(fh, "f"))[0]
+    assert r.entry_type == lc.HUMAN
+    assert r.text == "Approved."                     # the system-reminder stamp is gone
+
+
+def test_p1a_unclosed_task_notification_tag_stays_human():
+    # a real prompt that merely STARTS with the literal tag but is not a
+    # well-formed closed wrapper is NOT folded (Codex P1a)
+    fh = _jsonl({"type": "user", "uuid": "neg1", "sessionId": "s", "timestamp": "t",
+                 "message": {"role": "user",
+                             "content": "<task-notification> what does this tag even do?"}})
+    r = list(lc.iter_message_rows(fh, "f"))[0]
+    assert r.entry_type == lc.HUMAN
+
+
+def test_p1b_bash_echo_with_command_args_substring_not_promoted():
+    # Codex P1b regression: a bash echo containing a literal <command-args> must
+    # classify as META (the bash-echo branch), NOT be promoted to a HUMAN turn
+    # with text="x" by _extract_command_invocation.
+    fh = _jsonl({"type": "user", "uuid": "neg2", "sessionId": "s", "timestamp": "t",
+                 "message": {"role": "user",
+                             "content": "<bash-input>echo '<command-args>x</command-args>'</bash-input>"}})
+    r = list(lc.iter_message_rows(fh, "f"))[0]
+    assert r.entry_type == lc.META and r.text == ""
