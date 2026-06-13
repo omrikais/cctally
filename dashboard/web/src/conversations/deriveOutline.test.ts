@@ -15,160 +15,212 @@ function turn(over: Partial<OutlineTurn> & { uuid: string; kind: OutlineTurn['ki
   };
 }
 
-describe('deriveOutline (#177 S5 §2 curation)', () => {
-  it('human turn → landmark entry, label = turn label', () => {
-    const out = deriveOutline([turn({ uuid: 'h1', kind: 'human', label: 'fix the bug' })], undefined);
-    expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ uuid: 'h1', type: 'human', label: 'fix the bug', depth: 0, error: false });
+// #186 §3 — deriveOutline is a SECTION WALK (direction C: prompt spine +
+// curated landmarks). Each human prompt opens a depth-0 section; only curated
+// assistant landmarks (error / plan / question / Markdown-heading-led /
+// subagent) emit under it at depth 1; generic prose drops out; thinking
+// collapses to a per-prompt `thinkingCount` badge. The return shape is
+// `{ entries, sectionByUuid }`.
+describe('deriveOutline (#186 §3 section walk)', () => {
+  it('returns { entries, sectionByUuid }', () => {
+    const out = deriveOutline([turn({ uuid: 'h1', kind: 'human', label: 'go' })], undefined);
+    expect(Array.isArray(out.entries)).toBe(true);
+    expect(out.sectionByUuid instanceof Map).toBe(true);
   });
 
-  it('assistant with prose + thinking → entry plus a depth-1 child per thinking line', () => {
-    const out = deriveOutline([
-      turn({ uuid: 'a1', kind: 'assistant', label: 'here is the plan', thinking: ['weighing options', 'picking A'] }),
+  it('a human prompt becomes a depth-0 entry; thinkingCount defaults to 0', () => {
+    const { entries } = deriveOutline([turn({ uuid: 'h1', kind: 'human', label: 'fix the bug' })], undefined);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      uuid: 'h1', type: 'human', label: 'fix the bug', depth: 0, error: false, thinkingCount: 0,
+    });
+  });
+
+  it('a generic assistant turn after a prompt produces NO entry', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'do it' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: 'on it', tools: [{ name: 'Bash', is_error: false }] }),
     ], undefined);
-    expect(out.map((e) => [e.type, e.label, e.depth])).toEqual([
-      ['assistant', 'here is the plan', 0],
-      ['assistant', 'weighing options', 1],
-      ['assistant', 'picking A', 1],
-    ]);
-    // Thinking children carry no error/glyph/tool noise.
-    expect(out[1]).toMatchObject({ error: false, plan: false, question: false, toolCount: 0 });
-    // entryId = render identity (distinct per entry); uuid = jump anchor (shared
-    // by a turn + its thinking children). The parent's entryId is its uuid; each
-    // thinking child gets `${uuid}#think${i}` so aria-current/React keys never
-    // collide across the turn's entries (Task 3).
-    expect(out[0]).toMatchObject({ uuid: 'a1', entryId: 'a1' });
-    expect(out[1]).toMatchObject({ uuid: 'a1', entryId: 'a1#think0' });
-    expect(out[2]).toMatchObject({ uuid: 'a1', entryId: 'a1#think1' });
-    expect(out[1].entryId).not.toBe(out[0].entryId);
-    expect(out[2].entryId).not.toBe(out[1].entryId);
+    expect(entries.map((e) => [e.uuid, e.type])).toEqual([['h1', 'human']]);
   });
 
-  it('every entryId in a derived list is unique across a rich mixed fixture', () => {
-    const meta: Record<string, SubagentMeta> = {
-      sk1: { kind: 'explore' },
-      sk2: { kind: 'general-purpose' },
-    };
-    const out = deriveOutline([
-      turn({ uuid: 'h1', kind: 'human', label: 'dispatch', member_uuids: ['h1', 'pm'] }),
-      turn({ uuid: 'a1', kind: 'assistant', label: 'plan', thinking: ['t-a', 't-b', 't-c'] }),
-      // nested subagent under h1's member 'pm'
-      turn({ uuid: 's1', kind: 'assistant', label: 'sub a', subagent_key: 'sk2', parent_uuid: 'pm' }),
-      turn({ uuid: 'a2', kind: 'assistant', label: 'reply', thinking: ['t-d'] }),
-      // non-nested subagent bucket
-      turn({ uuid: 's2', kind: 'assistant', label: 'sub b', subagent_key: 'sk1', parent_uuid: 'unresolved' }),
-      turn({ uuid: 'h2', kind: 'human', label: 'next' }),
-      turn({ uuid: 'm1', kind: 'meta', label: '/commit', meta_kind: 'command' }),
-    ], meta);
-    const ids = out.map((e) => e.entryId);
-    expect(ids.length).toBeGreaterThan(0);
-    expect(new Set(ids).size).toBe(ids.length);
-    // Every entry carries a non-empty entryId.
-    expect(ids.every((id) => typeof id === 'string' && id.length > 0)).toBe(true);
-  });
-
-  it('pure tool-relay assistant (no prose, no thinking, no error, no plan/question) → NO entry', () => {
-    const out = deriveOutline([
-      turn({ uuid: 'a1', kind: 'assistant', label: '', tools: [{ name: 'Bash', is_error: false }, { name: 'Read', is_error: false }] }),
-    ], undefined);
-    expect(out).toHaveLength(0);
-  });
-
-  it('orphan tool_result with is_error → error entry', () => {
-    const out = deriveOutline([
-      turn({ uuid: 'tr1', kind: 'tool_result', tools: [{ name: null, is_error: true }] }),
-    ], undefined);
-    expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ uuid: 'tr1', type: 'error', label: 'tool error', error: true });
-  });
-
-  it('prose-less assistant whose tool errored → error entry labeled with the failing tool', () => {
-    const out = deriveOutline([
-      turn({ uuid: 'a1', kind: 'assistant', label: '', tools: [{ name: 'Bash', is_error: true }] }),
-    ], undefined);
-    expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ type: 'error', label: 'Bash', error: true });
-  });
-
-  it('ExitPlanMode in tools → plan flag on the entry', () => {
-    const out = deriveOutline([
+  it('ExitPlanMode → a depth-1 plan landmark under the section prompt', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'plan it' }),
       turn({ uuid: 'a1', kind: 'assistant', label: 'proposing', tools: [{ name: 'ExitPlanMode', is_error: false }] }),
     ], undefined);
-    expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ type: 'assistant', plan: true, question: false });
+    expect(entries.map((e) => [e.uuid, e.type, e.depth, e.plan])).toEqual([
+      ['h1', 'human', 0, false],
+      ['a1', 'plan', 1, true],
+    ]);
   });
 
-  it('AskUserQuestion in tools → question flag on the entry (even with no prose)', () => {
-    const out = deriveOutline([
+  it('AskUserQuestion → a depth-1 question landmark', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'ask me' }),
       turn({ uuid: 'a1', kind: 'assistant', label: '', tools: [{ name: 'AskUserQuestion', is_error: false }] }),
     ], undefined);
-    expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ type: 'assistant', question: true, plan: false });
+    expect(entries[1]).toMatchObject({ uuid: 'a1', type: 'question', depth: 1, question: true });
   });
 
-  it('meta command → landmark; meta skill/context → skipped', () => {
-    const out = deriveOutline([
-      turn({ uuid: 'm1', kind: 'meta', label: '/commit', meta_kind: 'command' }),
-      turn({ uuid: 'm2', kind: 'meta', label: '', meta_kind: 'skill', skill_name: 'review' }),
-      turn({ uuid: 'm3', kind: 'meta', label: 'ctx', meta_kind: 'context' }),
+  it('a Markdown-heading-led assistant turn → a depth-1 heading landmark, label = the heading verbatim', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'structure it' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: '## Section 1 — Backend' }),
     ], undefined);
-    expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ uuid: 'm1', type: 'meta', label: '/commit' });
+    expect(entries[1]).toMatchObject({ uuid: 'a1', type: 'heading', depth: 1, label: '## Section 1 — Backend' });
   });
 
-  it('non-nested subagent → one entry at the bucket root position, label from subagent_meta kind', () => {
-    const meta: Record<string, SubagentMeta> = { sk1: { kind: 'explore' } };
-    const out = deriveOutline([
+  it('a non-heading prose turn is NOT a heading landmark (regex needs # + space + non-space)', () => {
+    const { entries } = deriveOutline([
       turn({ uuid: 'h1', kind: 'human', label: 'go' }),
-      // sidechain bucket whose root parent_uuid resolves to NOTHING (no main member) -> non-nested.
-      turn({ uuid: 's1', kind: 'assistant', label: 'sub a', subagent_key: 'sk1', parent_uuid: 'unresolved' }),
-      turn({ uuid: 's2', kind: 'assistant', label: 'sub b', subagent_key: 'sk1', parent_uuid: 's1' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: '#nospace is not a heading' }),
+      turn({ uuid: 'a2', kind: 'assistant', label: 'plain prose' }),
+    ], undefined);
+    // Only the prompt; neither assistant qualifies.
+    expect(entries.map((e) => e.uuid)).toEqual(['h1']);
+  });
+
+  it('an assistant error turn → a depth-1 error landmark, error:true, label "tool error · <tool>"', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'run it' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: '', tools: [{ name: 'Bash', is_error: true }] }),
+    ], undefined);
+    expect(entries[1]).toMatchObject({ uuid: 'a1', type: 'error', depth: 1, error: true, label: 'tool error · Bash' });
+  });
+
+  it('an orphan tool_result error → a depth-1 error landmark labeled "tool error"', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+      turn({ uuid: 'tr1', kind: 'tool_result', tools: [{ name: null, is_error: true }] }),
+    ], undefined);
+    expect(entries[1]).toMatchObject({ uuid: 'tr1', type: 'error', depth: 1, error: true, label: 'tool error' });
+  });
+
+  it('type precedence: an errored heading-led turn keeps its heading label but takes error:true (error > heading)', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: '## Broken section', tools: [{ name: 'Bash', is_error: true }] }),
+    ], undefined);
+    // error wins the type/flag, label stays the heading.
+    expect(entries[1]).toMatchObject({ uuid: 'a1', type: 'error', error: true, label: '## Broken section' });
+  });
+
+  it('two thinking blocks across the section → prompt thinkingCount === 2, NO depth-1 thinking rows', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'think hard' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: 'first', thinking: ['weighing'] }),
+      turn({ uuid: 'a2', kind: 'assistant', label: 'second', thinking: ['picking'] }),
+    ], undefined);
+    // Only the prompt entry; both generic assistants drop out (no heading/error).
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ uuid: 'h1', thinkingCount: 2 });
+    expect(entries.some((e) => e.label === 'weighing' || e.label === 'picking')).toBe(false);
+  });
+
+  it('thinking accrues even from heading/error turns that DO emit a landmark', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: '## A heading', thinking: ['t1', 't2'] }),
+    ], undefined);
+    expect(entries[0]).toMatchObject({ uuid: 'h1', thinkingCount: 2 });
+    expect(entries[1]).toMatchObject({ uuid: 'a1', type: 'heading' });
+  });
+
+  it('a meta_kind:command turn produces NO entry', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+      turn({ uuid: 'm1', kind: 'meta', label: '/commit', meta_kind: 'command' }),
       turn({ uuid: 'h2', kind: 'human', label: 'next' }),
-    ], meta);
-    // Emitted at s1's document position (between h1 and h2): human, subagent, human.
-    expect(out.map((e) => [e.type, e.label, e.depth])).toEqual([
-      ['human', 'go', 0],
-      ['subagent', 'subagent · explore', 0],
-      ['human', 'next', 0],
-    ]);
-    const sub = out[1];
-    expect(sub).toMatchObject({ uuid: 's1', subagentKey: 'sk1', subagentKind: 'explore', turnIndex: 1 });
+    ], undefined);
+    expect(entries.map((e) => e.uuid)).toEqual(['h1', 'h2']);
   });
 
-  it('nested subagent → depth-1 child right after the resolved parent entry', () => {
-    const meta: Record<string, SubagentMeta> = { sk1: { kind: 'general-purpose' } };
-    const out = deriveOutline([
-      // Main human turn whose MEMBER uuid 'pm' the sidechain root nests under.
-      turn({ uuid: 'h1', kind: 'human', label: 'dispatch', member_uuids: ['h1', 'pm'] }),
-      turn({ uuid: 's1', kind: 'assistant', label: 'sub a', subagent_key: 'sk1', parent_uuid: 'pm' }),
-      turn({ uuid: 'h2', kind: 'human', label: 'after' }),
-    ], meta);
-    expect(out.map((e) => [e.type, e.depth])).toEqual([
-      ['human', 0],     // h1
-      ['subagent', 1],  // nested under h1
-      ['human', 0],     // h2
-    ]);
-    expect(out[1]).toMatchObject({ uuid: 's1', subagentKey: 'sk1', depth: 1 });
+  it('sectionByUuid maps a generic assistant turn member uuid → the section prompt uuid', () => {
+    const { sectionByUuid } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'prompt' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: 'generic reply', member_uuids: ['a1', 'a1b'] }),
+    ], undefined);
+    expect(sectionByUuid.get('a1')).toBe('h1');
+    expect(sectionByUuid.get('a1b')).toBe('h1'); // every member uuid, not just the anchor
+    expect(sectionByUuid.get('h1')).toBe('h1');  // the prompt maps to itself
   });
 
-  it('subagent error aggregation → entry gains error when any member tool errored', () => {
-    const out = deriveOutline([
+  it('sectionByUuid restarts at each new prompt', () => {
+    const { sectionByUuid } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'one' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: 'r1' }),
+      turn({ uuid: 'h2', kind: 'human', label: 'two' }),
+      turn({ uuid: 'a2', kind: 'assistant', label: 'r2' }),
+    ], undefined);
+    expect(sectionByUuid.get('a1')).toBe('h1');
+    expect(sectionByUuid.get('a2')).toBe('h2');
+    expect(sectionByUuid.get('h2')).toBe('h2');
+  });
+
+  it('a subagent bucket → exactly one subagent landmark at the bucket position; all member uuids in sectionByUuid', () => {
+    const meta: Record<string, SubagentMeta> = { sk1: { kind: 'explore' } };
+    const { entries, sectionByUuid } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'dispatch' }),
+      turn({ uuid: 's1', kind: 'assistant', label: 'sub a', subagent_key: 'sk1', parent_uuid: 'unresolved', member_uuids: ['s1', 's1b'] }),
+      turn({ uuid: 's2', kind: 'assistant', label: 'sub b', subagent_key: 'sk1', parent_uuid: 's1', member_uuids: ['s2'] }),
+    ], meta);
+    const subs = entries.filter((e) => e.type === 'subagent');
+    expect(subs).toHaveLength(1);
+    expect(subs[0]).toMatchObject({ subagentKey: 'sk1', subagentKind: 'explore', depth: 1, label: 'subagent · explore' });
+    // Every bucket member uuid maps to the enclosing section prompt.
+    expect(sectionByUuid.get('s1')).toBe('h1');
+    expect(sectionByUuid.get('s1b')).toBe('h1');
+    expect(sectionByUuid.get('s2')).toBe('h1');
+  });
+
+  it('a subagent bucket whose error any member carried → the landmark gets error:true', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'go' }),
       turn({ uuid: 's1', kind: 'assistant', label: 'sub', subagent_key: 'sk1', parent_uuid: 'x', tools: [{ name: 'Read', is_error: false }] }),
       turn({ uuid: 's2', kind: 'assistant', label: 'sub2', subagent_key: 'sk1', parent_uuid: 's1', tools: [{ name: 'Bash', is_error: true }] }),
     ], { sk1: { kind: 'agent' } });
-    expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ type: 'subagent', error: true, toolCount: 2 });
+    const sub = entries.find((e) => e.type === 'subagent')!;
+    expect(sub).toMatchObject({ error: true });
   });
 
-  it('turnIndex tracks skeleton position across mixed turns', () => {
-    const out = deriveOutline([
-      turn({ uuid: 'h1', kind: 'human', label: 'a' }),                                   // index 0
-      turn({ uuid: 'a1', kind: 'assistant', label: '', tools: [{ name: 'Bash', is_error: false }] }), // index 1 — skipped
-      turn({ uuid: 'a2', kind: 'assistant', label: 'reply' }),                            // index 2
+  it('a curated landmark BEFORE any human prompt emits at depth 0 and is in no section', () => {
+    const { entries, sectionByUuid } = deriveOutline([
+      // a heading-led assistant turn before the first prompt (rare; e.g. SessionStart skill).
+      turn({ uuid: 'a0', kind: 'assistant', label: '## Pre-prompt note' }),
+      turn({ uuid: 'h1', kind: 'human', label: 'the prompt' }),
     ], undefined);
-    expect(out.map((e) => [e.uuid, e.turnIndex])).toEqual([
-      ['h1', 0],
-      ['a2', 2],
-    ]);
+    const pre = entries.find((e) => e.uuid === 'a0')!;
+    expect(pre).toMatchObject({ type: 'heading', depth: 0 });
+    // not mapped to any section.
+    expect(sectionByUuid.has('a0')).toBe(false);
+    expect(sectionByUuid.get('h1')).toBe('h1');
+  });
+
+  it('a zero-human session yields no sections (sectionByUuid empty); landmarks emit at depth 0', () => {
+    const { entries, sectionByUuid } = deriveOutline([
+      turn({ uuid: 'a1', kind: 'assistant', label: '## heading-only' }),
+      turn({ uuid: 'a2', kind: 'assistant', label: 'generic prose' }),
+    ], undefined);
+    expect(sectionByUuid.size).toBe(0);
+    expect(entries.map((e) => [e.uuid, e.depth])).toEqual([['a1', 0]]);
+  });
+
+  it('entryId is unique across a rich mixed fixture', () => {
+    const meta: Record<string, SubagentMeta> = { sk1: { kind: 'explore' }, sk2: { kind: 'general-purpose' } };
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'dispatch', member_uuids: ['h1', 'pm'] }),
+      turn({ uuid: 'a1', kind: 'assistant', label: '## Plan', thinking: ['t-a', 't-b'] }),
+      turn({ uuid: 's1', kind: 'assistant', label: 'sub a', subagent_key: 'sk2', parent_uuid: 'pm' }),
+      turn({ uuid: 'a2', kind: 'assistant', label: 'reply' }),
+      turn({ uuid: 's2', kind: 'assistant', label: 'sub b', subagent_key: 'sk1', parent_uuid: 'unresolved' }),
+      turn({ uuid: 'h2', kind: 'human', label: 'next' }),
+      turn({ uuid: 'm1', kind: 'meta', label: '/commit', meta_kind: 'command' }),
+      turn({ uuid: 'e1', kind: 'assistant', label: '', tools: [{ name: 'Bash', is_error: true }] }),
+    ], meta);
+    const ids = entries.map((e) => e.entryId);
+    expect(ids.length).toBeGreaterThan(0);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.every((id) => typeof id === 'string' && id.length > 0)).toBe(true);
   });
 });
