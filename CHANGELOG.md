@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Conversation viewer: a slash command you typed with a real prompt in its arguments (e.g. `/frontend-design <your task>`) is no longer hidden as a "System marker" and dropped from the outline — its arguments now render as your "You" bubble with a small command badge, drive the conversation title, and are searchable; bare control commands (`/clear`, `/compact`, `/model`, the `local-command-*` echoes) and empty-argument invocations still fold into hidden system-marker pills. Recognized at ingest plus a read-time fallback that fixes already-recorded history, with a cache migration (`011`) that backfills the search index for past commands (#188).
+- Conversation viewer: clicking an outline entry now selects and highlights exactly that entry instead of one a turn or two above it, and the forward jump-to-next chips/keys (`u`/`e`/`b`/`p`) reliably advance to the next landmark instead of re-selecting the same one — the outline tracks an explicit selection you set by clicking or jumping, which takes precedence over the scroll position until you next scroll (#188, #187).
+- Conversation viewer: clicking a subagent in the outline now flashes its collapsed card in place and marks the subagent as the current selection, instead of silently force-expanding the thread, flashing a buried inner message, and highlighting the most-recent prompt above it (#188).
+- Conversation viewer: the floating "↓ N new" live-update pill no longer counts messages streamed into a collapsed subagent thread you have not expanded — it counts only turns that actually become visible (top-level messages, a newly appearing subagent card, or messages inside an expanded thread) (#188).
+
 ## [1.42.0] - 2026-06-13
 
 ### Fixed
