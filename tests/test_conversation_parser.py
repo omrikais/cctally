@@ -977,9 +977,13 @@ def test_p1a_unclosed_task_notification_tag_stays_human():
 
 
 def test_p1b_bash_echo_with_command_args_substring_not_promoted():
-    # Codex P1b regression: a bash echo containing a literal <command-args> must
-    # classify as META (the bash-echo branch), NOT be promoted to a HUMAN turn
-    # with text="x" by _extract_command_invocation.
+    # Codex P1b regression: keep bash echoes OUT of _MARKER_TAGS. A bash echo
+    # whose body merely CONTAINS a literal <command-args> substring must classify
+    # META via the dedicated bash-echo branch. (If bash-* were instead added to
+    # _MARKER_TAGS — the rejected approach — _is_system_marker would be True and
+    # _extract_command_invocation would find the inner <command-args> and
+    # mis-promote this to a HUMAN turn with text="x". The dedicated branch plus
+    # the unchanged _MARKER_TAGS is what prevents that.)
     fh = _jsonl({"type": "user", "uuid": "neg2", "sessionId": "s", "timestamp": "t",
                  "message": {"role": "user",
                              "content": "<bash-input>echo '<command-args>x</command-args>'</bash-input>"}})

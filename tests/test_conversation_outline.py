@@ -244,3 +244,21 @@ def test_outline_thousand_turn_session():
     detail = cq.get_conversation(c, "big", limit=1000)
     assert [t["uuid"] for t in outline["turns"]] == \
         [it["anchor"]["uuid"] for it in detail["items"]]
+
+
+def test_outline_counts_recovered_compaction_as_meta_not_human():
+    # #191: a stale-ingested compaction row (entry_type='human', text=the body)
+    # is recovered to kind='meta' in the shared _assemble_session pass, so the
+    # outline's stats.turns counts it as meta — NEVER human. (Spec Testing item;
+    # the behavior follows from the shared assembly, this pins it literally.)
+    c = _conn()
+    body = ("This session is being continued from a previous conversation that "
+            "ran out of context.")
+    _msg(c, session_id="s191", uuid="c1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text=body,
+         blocks_json=_json.dumps([{"kind": "text", "text": body}]))
+    out = cq.get_conversation_outline(c, "s191")
+    assert out["stats"]["turns"]["meta"] == 1
+    assert out["stats"]["turns"]["human"] == 0
+    assert out["turns"][0]["kind"] == "meta"
+    assert out["turns"][0]["meta_kind"] == "compaction"
