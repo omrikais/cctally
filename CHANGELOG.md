@@ -5,6 +5,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Conversation viewer: system and slash-command messages (`/clear`, `/model`, the `local-command-stdout`/`local-command-stderr` echoes, and the caveats) were being attributed to you as "You" turns, and the first such line became the whole conversation's title; they now fold into collapsed "System marker" pills and the title falls back to your real first prompt. Such rows are recognized at ingest (stored as meta and kept out of search and the prompts facet) with a read-time fallback that also cleans already-recorded history, plus a belt-and-suspenders title skip that degrades unknown `command-*`/`local-command-*` tags to "skip" rather than letting them poison the title (#186).
+- Conversation viewer: terminal ANSI escape codes (for example the bold `^[[1m…^[[22m` wrapping "Fable 5") no longer leak into titles, outline labels, or message and command body text — they are stripped at ingest (which also keeps the search index clean for new rows) and again at the render chokepoints (which cleans already-recorded history without a re-ingest), while Bash tool output keeps its intentional terminal colors (#186).
+
+### Changed
+- Conversation viewer: the outline rail is redesigned from a flat wall of ~200 truncated prose lines into a bold prompt spine (your prompts, each with a divider above it) with curated landmarks demoted beneath each prompt — section headings, plans, questions, errors (red), and subagent spawns (magenta) — where a turn's thinking blocks collapse to a single `🧠 ×N` badge on its prompt instead of doubling the list, session-start plumbing rows are gone, role glyphs are color-coded for at-a-glance scanning, and the scroll-sync highlight tracks the enclosing prompt (#186).
+- Conversation viewer: the outline header is merged into one "session at a glance" card — time, tokens, and cost become labeled stat tiles, models/tools/errors become labeled rows, the formerly cryptic unlabeled glyph jump-chips gain text labels and move into the card under a "Jump to" row, and the error count reconciles to one phrase ("14 errors in 13 turns") so the previously-disagreeing 13 and 14 no longer read as two competing numbers (#186).
+
 ## [1.41.0] - 2026-06-13
 
 ### Added
