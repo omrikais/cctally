@@ -34,7 +34,7 @@ const looksLikeCommandPlumbing = (t: string): boolean => CMD_FAMILY_RE.test(t);
 // First non-blank line of the first MAIN-session, non-marker human message;
 // fallback project_label → session_id. Mirrors the kernel _session_titles_map
 // (#165 Q6). The opening human is always on page 1.
-function deriveReaderTitle(detail: { items: ConversationItem[]; project_label: string; session_id: string }): string {
+export function deriveReaderTitle(detail: { items: ConversationItem[]; project_label: string; session_id: string }): string {
   for (const it of detail.items) {
     if (it.kind === 'human' && !it.is_sidechain && it.text.trim()
         && !isSystemMarker(it.text) && !looksLikeCommandPlumbing(it.text)) {

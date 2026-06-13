@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isSystemMarker } from './systemMarkers';
+import { extractCommandInvocation, isSystemMarker } from './systemMarkers';
 
 describe('isSystemMarker', () => {
   it('matches a single command-name marker', () => {
@@ -62,5 +62,65 @@ describe('isSystemMarker', () => {
     const elapsed = performance.now() - start;
     expect(result).toBe(false);
     expect(elapsed).toBeLessThan(100); // the prior lazy-quantifier regex hung here
+  });
+});
+
+// #188 — a slash-command invocation carrying a real prompt in <command-args> is
+// a user turn. extractCommandInvocation mirrors the Python kernel
+// _extract_command_invocation: pure marker + non-empty args ⇒ {name, args};
+// empty-args control commands and stdout-only markers ⇒ null. The block-aware
+// all-text guard is applied by the caller (MessageItem), mirroring the Python
+// caller's all-text check — the same posture as isSystemMarker.
+describe('extractCommandInvocation (#188)', () => {
+  it('extracts non-empty command args with the name', () => {
+    const raw =
+      '<command-message>frontend-design:frontend-design</command-message>' +
+      '<command-name>/frontend-design</command-name>' +
+      '<command-args>Audit the reader UI and file issues.</command-args>';
+    expect(extractCommandInvocation(raw)).toEqual({
+      name: '/frontend-design',
+      args: 'Audit the reader UI and file issues.',
+    });
+  });
+
+  it('extracts terse args', () => {
+    expect(
+      extractCommandInvocation('<command-name>/effort</command-name><command-args>max</command-args>'),
+    ).toEqual({ name: '/effort', args: 'max' });
+  });
+
+  it('returns null for empty args (/clear and friends)', () => {
+    expect(
+      extractCommandInvocation('<command-name>/clear</command-name><command-args></command-args>'),
+    ).toBeNull();
+  });
+
+  it('returns null for whitespace-only args', () => {
+    expect(
+      extractCommandInvocation('<command-name>/compact</command-name><command-args>  \n </command-args>'),
+    ).toBeNull();
+  });
+
+  it('returns null when there is no <command-args> tag', () => {
+    expect(
+      extractCommandInvocation('<command-name>/exit</command-name><command-message>exit</command-message>'),
+    ).toBeNull();
+  });
+
+  it('returns null for a stdout-only marker', () => {
+    expect(
+      extractCommandInvocation('<local-command-stdout>Set model to Fable 5</local-command-stdout>'),
+    ).toBeNull();
+  });
+
+  it('returns null for ordinary prose that merely quotes a tag', () => {
+    expect(extractCommandInvocation('see <command-args>x</command-args> mid sentence')).toBeNull();
+  });
+
+  it('returns an empty name when the marker omits <command-name>', () => {
+    expect(extractCommandInvocation('<command-args>just args</command-args>')).toEqual({
+      name: '',
+      args: 'just args',
+    });
   });
 });

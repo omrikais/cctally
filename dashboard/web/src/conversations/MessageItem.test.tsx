@@ -411,6 +411,59 @@ describe('MessageItem', () => {
     const matches = container.textContent!.match(/plain human question/g) ?? [];
     expect(matches).toHaveLength(1);
   });
+
+  // #188 — a promoted slash-command turn: kind='human', text=args,
+  // command_name set, blocks still hold the raw <command-*> plumbing (in a lone
+  // text block, which the human branch filters out of the MessageBlocks walk).
+  const promotedCommand: ConversationItem = {
+    kind: 'human',
+    anchor: { session_id: 's', uuid: 'pc1', id: 50 },
+    member_uuids: ['pc1'],
+    ts: 't',
+    text: 'do X',
+    command_name: '/frontend-design',
+    blocks: [
+      {
+        kind: 'text',
+        text:
+          '<command-name>/frontend-design</command-name>' +
+          '<command-args>do X</command-args>',
+      },
+    ],
+    is_sidechain: false,
+    subagent_key: null,
+    parent_uuid: null,
+  };
+
+  it('renders a promoted command as a You bubble with a badge, no raw plumbing', () => {
+    const { container } = render(<MessageItem item={promotedCommand} />);
+    // A normal human prose turn (NOT the system-marker pill, NOT a meta pill).
+    expect(container.querySelector('.conv-item--human')).not.toBeNull();
+    expect(container.querySelector('.conv-item--system')).toBeNull();
+    expect(container.textContent).toContain('You');
+    // The args render as prose.
+    expect(screen.getByText('do X')).toBeInTheDocument();
+    // The command name renders as a compact badge.
+    const badge = container.querySelector('.conv-cmd-badge')!;
+    expect(badge).not.toBeNull();
+    expect(badge.textContent).toContain('/frontend-design');
+    // The raw <command-*> plumbing must NOT leak into the rendered body.
+    expect(container.textContent).not.toContain('<command-name>');
+    expect(container.textContent).not.toContain('<command-args>');
+  });
+
+  it('renders no badge for a plain human turn (command_name absent)', () => {
+    const { container } = render(<MessageItem item={human} />);
+    expect(container.querySelector('.conv-cmd-badge')).toBeNull();
+  });
+
+  it('a promoted command turn still copies the args (not the plumbing)', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<MessageItem item={promotedCommand} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
+    expect(writeText).toHaveBeenCalledWith('do X');
+  });
 });
 
 describe('MessageItem (message-text copy, G2)', () => {

@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ConversationReader } from './ConversationReader';
+import { ConversationReader, deriveReaderTitle } from './ConversationReader';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
 import type { Envelope } from '../types/envelope';
 import {
@@ -1407,5 +1407,52 @@ describe('ConversationReader in-conversation find', () => {
       const target = container.querySelector('[data-uuid="a1"]')!;
       expect(target.classList.contains('conv-item--jumped')).toBe(true);
     });
+  });
+});
+
+// #188 — deriveReaderTitle picks a promoted slash-command turn. A promoted
+// command is kind='human' with text=args (NOT a marker), so the existing
+// first-real-human-line logic selects it; the title is the args, not the
+// project label.
+describe('deriveReaderTitle (#188 promoted command)', () => {
+  it('uses the args of a promoted slash-command first turn as the title', () => {
+    const title = deriveReaderTitle({
+      project_label: 'cctally-dev',
+      session_id: 's',
+      items: [
+        makeItem({
+          uuid: 'pc1',
+          kind: 'human',
+          text: 'Audit the reader UI and file issues.',
+          command_name: '/frontend-design',
+          blocks: [
+            {
+              kind: 'text',
+              text:
+                '<command-name>/frontend-design</command-name>' +
+                '<command-args>Audit the reader UI and file issues.</command-args>',
+            },
+          ],
+        } as never),
+      ],
+    });
+    expect(title).toBe('Audit the reader UI and file issues.');
+  });
+
+  it('still falls back to the project label when the first turn is a hidden /clear', () => {
+    const title = deriveReaderTitle({
+      project_label: 'cctally-dev',
+      session_id: 's',
+      items: [
+        makeItem({
+          uuid: 'm1',
+          kind: 'meta',
+          text: '<command-name>/clear</command-name><command-args></command-args>',
+          meta_kind: 'command',
+          skill_name: null,
+        } as never),
+      ],
+    });
+    expect(title).toBe('cctally-dev');
   });
 });

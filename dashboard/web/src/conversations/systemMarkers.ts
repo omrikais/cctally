@@ -39,3 +39,27 @@ export function isSystemMarker(text: string): boolean {
   if (!text) return false;
   return MARKER_RE.test(text);
 }
+
+// #188 — a slash-command invocation carries the user's real prompt in
+// <command-args>; the <command-name>/<command-message> wrappers are plumbing.
+// Mirrors the Python kernel _extract_command_invocation (bin/_lib_conversation.py):
+// a pure command marker (isSystemMarker) whose <command-args> is non-empty after
+// strip ⇒ { name, args } (name from <command-name>, '' when omitted); else null.
+// Empty-args control commands (/clear, /exit, /compact, /model) and stdout-only
+// markers return null and stay hidden as system markers. The block-aware all-text
+// guard is the CALLER's (MessageItem applies blocks.every(text), mirroring the
+// Python caller) — same posture as isSystemMarker. Anchored mid-string is fine
+// because isSystemMarker already proved the whole text is ONLY markers.
+const CMD_NAME_RE = /<command-name>([\s\S]*?)<\/command-name>/;
+const CMD_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
+
+export function extractCommandInvocation(
+  text: string,
+): { name: string; args: string } | null {
+  if (!isSystemMarker(text)) return null;
+  const am = CMD_ARGS_RE.exec(text);
+  const args = am ? am[1].trim() : '';
+  if (!args) return null;
+  const nm = CMD_NAME_RE.exec(text);
+  return { name: nm ? nm[1].trim() : '', args };
+}

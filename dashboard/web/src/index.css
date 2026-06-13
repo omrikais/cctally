@@ -5495,6 +5495,20 @@ mark.current {
 }
 .conv-item--assistant .conv-item-label { color: var(--accent-purple); }
 .conv-item--human .conv-item-label { color: var(--accent-blue); }
+/* #188 — slash-command badge on a promoted "You" turn (e.g. /frontend-design).
+   A compact monospace pill next to the "You" label; the prompt itself renders
+   as the turn's prose below. */
+.conv-cmd-badge {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 5px;
+  color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 30%, transparent);
+  white-space: nowrap;
+}
 .conv-item-cost {
   margin-top: 10px;
   padding-top: 8px;

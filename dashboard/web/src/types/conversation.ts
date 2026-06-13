@@ -35,6 +35,11 @@ export type ConversationItem =
       parent_uuid: string | null;
       model?: string | null; // present only on the null-msg_id assistant case
       cost_usd?: number; // present (0.0) only on the null-msg_id assistant case
+      // #188 — a slash-command invocation promoted to a "You" turn (text=args)
+      // carries the command name for a compact badge; the kernel derives it from
+      // the raw <command-name> block, NOT the scalar text (which holds the args).
+      // Absent/null on an ordinary human turn. Consumers tolerate the missing key.
+      command_name?: string | null;
     }
   | {
       // Injected harness content (isMeta) the user did NOT type — rendered as a

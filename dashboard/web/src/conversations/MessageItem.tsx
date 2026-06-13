@@ -206,10 +206,16 @@ function MessageItemImpl(
     );
   }
 
+  // #188 — a promoted slash-command turn carries `command_name`; show it as a
+  // compact badge next to "You". The args are item.text (rendered as prose
+  // below); the raw <command-*> plumbing lives only in the lone text block,
+  // which the non-text MessageBlocks walk below already filters out.
+  const commandName = 'command_name' in item ? item.command_name : null;
   return (
     <div ref={ref} className={cls('conv-item--human')} style={style} data-uuid={item.anchor.uuid}>
       <div className="conv-item-head">
         <span className="conv-item-label">You</span>
+        {commandName && <span className="conv-cmd-badge">{commandName}</span>}
         {eyebrow}
       </div>
       {item.text && <Markdown>{item.text}</Markdown>}
