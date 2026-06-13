@@ -29,25 +29,11 @@ from _lib_conversation import _stringify
 # #177 S4: the media-route reader walks a content array with the SAME ordinal
 # generator the ingest placeholders used, so "media item N" addresses one item.
 from _lib_conversation import iter_media_items
-
-
-# Mirror of dashboard/web/src/conversations/systemMarkers.ts::MARKER_RE — anchored
-# whole-string (fullmatch), unrolled-lazy body for linear time (no ReDoS), \1
-# backref forces each close tag to match its open tag. Used to SKIP slash-command
-# plumbing when deriving a conversation title (#165 Q2). MUST stay equivalent to
-# the TS predicate over ASCII whitespace (parity-tested); exotic Unicode/control
-# whitespace is an explicit non-goal. See docs/dashboard-gotchas.md.
-_MARKER_TAGS = ("command-name", "command-message", "command-args", "local-command-caveat")
-_MARKER_RE = re.compile(
-    r"\s*(?:<(" + "|".join(_MARKER_TAGS) + r")>(?:(?!</\1>)[\s\S])*</\1>\s*)+"
-)
-
-
-def _is_system_marker(text) -> bool:
-    """True iff `text` is ONLY concatenated command-marker wrappers (slash-command
-    plumbing) — the title-derivation skip predicate. `fullmatch` reproduces the TS
-    `^\\s*…\\s*$` anchor (no `$`-before-trailing-`\\n` foot-gun)."""
-    return bool(text) and _MARKER_RE.fullmatch(text) is not None
+# #186: the marker predicate moved DOWN to the parser layer (the parser now
+# classifies command-marker user rows as META at ingest). Re-export the names
+# here for back-compat so existing `from _lib_conversation_query import
+# _is_system_marker` importers (and the title-skip path below) keep resolving.
+from _lib_conversation import _MARKER_TAGS, _MARKER_RE, _is_system_marker
 
 
 _TITLE_MAX = 120

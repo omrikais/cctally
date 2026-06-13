@@ -736,6 +736,9 @@ def test_is_system_marker_parity():
     # positive: each single wrapper
     assert M("<command-name>clear</command-name>")
     assert M("<local-command-caveat>do not respond</local-command-caveat>")
+    # #186: the two new command-family tags (slash-command stdout/stderr echo)
+    assert M("<local-command-stdout>Set model to Fable 5</local-command-stdout>")
+    assert M("<local-command-stderr>boom</local-command-stderr>")
     # positive: concatenated wrappers (the /clear shape)
     assert M("<command-name>clear</command-name>"
              "<command-message>clear</command-message>"

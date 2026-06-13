@@ -16,6 +16,30 @@ ASSISTANT = "assistant"
 TOOL_RESULT = "tool_result"
 META = "meta"
 
+# Mirror of dashboard/web/src/conversations/systemMarkers.ts::MARKER_RE — anchored
+# whole-string (fullmatch), unrolled-lazy body for linear time (no ReDoS), \1
+# backref forces each close tag to match its open tag. Used to SKIP slash-command
+# plumbing when deriving a conversation title (#165 Q2) AND — at the parser layer
+# (#186) — to classify a slash-command echo carried as a plain user line as META
+# at ingest. MUST stay equivalent to the TS predicate over ASCII whitespace
+# (parity-tested); exotic Unicode/control whitespace is an explicit non-goal.
+# The query kernel re-exports these names for back-compat. See
+# docs/dashboard-gotchas.md.
+_MARKER_TAGS = ("command-name", "command-message", "command-args",
+                "local-command-caveat", "local-command-stdout",
+                "local-command-stderr")
+_MARKER_RE = re.compile(
+    r"\s*(?:<(" + "|".join(_MARKER_TAGS) + r")>(?:(?!</\1>)[\s\S])*</\1>\s*)+"
+)
+
+
+def _is_system_marker(text) -> bool:
+    """True iff `text` is ONLY concatenated command-marker wrappers (slash-command
+    plumbing) — the title-derivation skip predicate AND the parser-layer ingest
+    classifier (#186). `fullmatch` reproduces the TS `^\\s*…\\s*$` anchor (no
+    `$`-before-trailing-`\\n` foot-gun)."""
+    return bool(text) and _MARKER_RE.fullmatch(text) is not None
+
 _TOOL_RESULT_CAP = 16000   # was 4000; full text always re-derivable from JSONL
 _INPUT_LEAF_CAP = 8000     # max chars per string leaf in a bounded tool input
 _INPUT_TOTAL_CAP = 32000   # honesty backstop on the serialized bounded input
