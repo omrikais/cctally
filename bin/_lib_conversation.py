@@ -40,6 +40,30 @@ def _is_system_marker(text) -> bool:
     `$`-before-trailing-`\\n` foot-gun)."""
     return bool(text) and _MARKER_RE.fullmatch(text) is not None
 
+
+# #186: strip ANSI terminal control sequences from captured prose/thinking so a
+# slash-command stdout echo (which keeps its SGR styling, e.g. `\x1b[1mFable
+# 5\x1b[22m`) never leaks literal `^[[1m` control codes into a title, an outline
+# label, or body text — and so FTS indexes clean tokens (`Fable`, not
+# `1mFable`). Three alternatives: CSI (covers all SGR `…m`), OSC (BEL- or
+# ST-terminated, or unterminated), and a lone/truncated ESC. Ordinary `[`,
+# digits, `m` in prose are untouched — they match only as part of a real
+# `\x1b[`-led sequence. Conceptually mirrors the client `parseAnsi` cleanup.
+# Deliberately NOT applied in `_stringify` / tool_result text: `AnsiText` (#177
+# S3) renders Bash stdout/stderr SGR colors, so that path keeps raw ANSI.
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;:?]*[ -/]*[@-~]"           # CSI (covers all SGR …m)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC (BEL/ST terminated or unterminated)
+    r"|\x1b"                                # lone/truncated ESC
+)
+
+
+def _strip_ansi(text):
+    """Remove ANSI control sequences (terminal SGR/CSI/OSC). Ordinary '[',
+    digits, 'm' in prose are untouched — they match only inside a real \\x1b[
+    run. Empty / None passes through unchanged. (#186)"""
+    return _ANSI_RE.sub("", text) if text else text
+
 _TOOL_RESULT_CAP = 16000   # was 4000; full text always re-derivable from JSONL
 _INPUT_LEAF_CAP = 8000     # max chars per string leaf in a bounded tool input
 _INPUT_TOTAL_CAP = 32000   # honesty backstop on the serialized bounded input
@@ -233,6 +257,9 @@ def _blocks_and_text(content):
     ingest==backfill parity invariant, so the derivation moved to the
     post-augment chokepoint."""
     if isinstance(content, str):
+        # #186: strip ANSI on the str-content path (the slash-command-stdout
+        # carrier) so neither the indexed prose nor the rendered block leaks SGR.
+        content = _strip_ansi(content)
         return (([{"kind": "text", "text": content}] if content else []), content)
     blocks, texts = [], []
     if isinstance(content, list):
@@ -245,11 +272,11 @@ def _blocks_and_text(content):
                 continue
             bt = b.get("type")
             if bt == "text":
-                txt = b.get("text", "") or ""
+                txt = _strip_ansi(b.get("text", "") or "")   # #186: strip SGR
                 blocks.append({"kind": "text", "text": txt})
                 texts.append(txt)
             elif bt == "thinking":
-                think = b.get("thinking", "") or ""
+                think = _strip_ansi(b.get("thinking", "") or "")  # #186: strip SGR
                 blocks.append({"kind": "thinking", "text": think})  # FULL text for render
             elif bt == "tool_use":
                 bounded, input_trunc = _bound_input(b.get("input"))

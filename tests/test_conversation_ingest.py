@@ -1216,3 +1216,60 @@ def test_plain_user_prose_stays_human_at_ingest():
     row = _normalize(obj, "user", 0)
     assert row.entry_type == "human"
     assert "see <local-command-stdout>" in row.text
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #186 Task 1E: _strip_ansi helper + ingest-layer ANSI stripping. ANSI control
+# sequences (terminal SGR/CSI/OSC) are stripped from the str-content path, the
+# text-block txt, and thinking text in _blocks_and_text — so FTS indexes clean
+# tokens for new rows. _stringify is NOT stripped (Bash colors preserved).
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_blocks_and_text_strips_ansi_str_path():
+    from _lib_conversation import _blocks_and_text
+    blocks, text = _blocks_and_text("Set model to \x1b[1mFable 5\x1b[22m now")
+    assert "\x1b" not in text and "Fable 5" in text
+    assert all("\x1b" not in b.get("text", "") for b in blocks)
+
+
+def test_blocks_and_text_strips_ansi_text_block():
+    from _lib_conversation import _blocks_and_text
+    blocks, text = _blocks_and_text(
+        [{"type": "text", "text": "hello \x1b[31mred\x1b[0m world"}])
+    assert "\x1b" not in text and "red" in text
+    assert all("\x1b" not in b.get("text", "") for b in blocks)
+
+
+def test_blocks_and_text_strips_ansi_thinking():
+    from _lib_conversation import _blocks_and_text
+    blocks, _ = _blocks_and_text(
+        [{"type": "thinking", "thinking": "weigh \x1b[1moptions\x1b[22m"}])
+    think = [b for b in blocks if b["kind"] == "thinking"][0]
+    assert "\x1b" not in think["text"] and "options" in think["text"]
+
+
+def test_stringify_preserves_ansi_for_bash():
+    from _lib_conversation import _stringify
+    # Bash tool_result stringifier MUST preserve SGR for AnsiText colorization.
+    assert "\x1b[31m" in _stringify("\x1b[31mred\x1b[0m")
+    assert "\x1b[32m" in _stringify(
+        [{"type": "text", "text": "\x1b[32mgreen\x1b[0m"}])
+
+
+def test_strip_ansi_handles_osc_and_lone_esc():
+    from _lib_conversation import _strip_ansi
+    # OSC (BEL-terminated)
+    assert _strip_ansi("a\x1b]0;title\x07b") == "ab"
+    # OSC (ST-terminated)
+    assert _strip_ansi("a\x1b]0;title\x1b\\b") == "ab"
+    # lone / truncated ESC
+    assert _strip_ansi("a\x1bb") == "ab"
+    # SGR / CSI
+    assert _strip_ansi("a\x1b[1mb") == "ab"
+    assert _strip_ansi("\x1b[38;5;201mx\x1b[0m") == "x"
+    # ordinary '[', digits, 'm' in prose are untouched
+    assert _strip_ansi("array[0] has m items") == "array[0] has m items"
+    # empty / None passthrough
+    assert _strip_ansi("") == ""
+    assert _strip_ansi(None) is None
