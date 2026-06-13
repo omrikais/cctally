@@ -1160,3 +1160,59 @@ def test_rebuild_swaps_legacy_shape_and_clears_split_flag(isolated):
         "WHERE conversation_fts MATCH '{search_tool}: enrichcmd'"
     ).fetchall() != []
     conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('integrity-check')")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #186 Task 1B: parser-level command-marker classification at ingest. A
+# slash-command echo carried as a plain (non-isMeta) user line is classified
+# entry_type='meta', text='' at ingest — mirroring the isMeta convention so the
+# body stays out of FTS, title derivation, and the entry_type='human' prompts
+# facet. The all-text guard mirrors the tool_result block-shape gate so an
+# attachment-bearing row is never folded.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_command_marker_user_row_classified_meta_at_ingest():
+    from _lib_conversation import _normalize
+    obj = {"type": "user", "uuid": "u1",
+           "message": {"content": "<local-command-stdout>done</local-command-stdout>"}}
+    row = _normalize(obj, "user", 0)
+    assert row.entry_type == "meta"
+    assert row.text == ""               # kept out of FTS / title / prompts-facet
+    # the body survives in blocks_json for rendering (isMeta convention)
+    assert "<local-command-stdout>done</local-command-stdout>" in row.blocks_json
+
+
+def test_command_marker_row_with_media_block_stays_human():
+    # all-text guard: a marker text PLUS a non-text block must NOT fold
+    from _lib_conversation import _normalize
+    obj = {"type": "user", "uuid": "u2", "message": {"content": [
+        {"type": "text", "text": "<local-command-stdout>x</local-command-stdout>"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": "AA"}},
+    ]}}
+    row = _normalize(obj, "user", 0)
+    assert row.entry_type == "human"
+
+
+def test_command_marker_as_text_block_list_classified_meta():
+    # the all-text list shape (a single text block whose body is the marker) also
+    # folds to META — the common shape for a multi-block user content array.
+    from _lib_conversation import _normalize
+    obj = {"type": "user", "uuid": "u3", "message": {"content": [
+        {"type": "text",
+         "text": "<local-command-stderr>boom</local-command-stderr>"},
+    ]}}
+    row = _normalize(obj, "user", 0)
+    assert row.entry_type == "meta"
+    assert row.text == ""
+
+
+def test_plain_user_prose_stays_human_at_ingest():
+    # a real prompt that merely quotes a tag mid-sentence is NOT a marker
+    from _lib_conversation import _normalize
+    obj = {"type": "user", "uuid": "u4", "message": {
+        "content": "see <local-command-stdout>x</local-command-stdout> above"}}
+    row = _normalize(obj, "user", 0)
+    assert row.entry_type == "human"
+    assert "see <local-command-stdout>" in row.text

@@ -167,6 +167,19 @@ def _normalize(obj, t, offset):
         # tool_result block still folds as a result.
         entry_type = META
         text = ""
+    elif blocks and all(b["kind"] == "text" for b in blocks) and _is_system_marker(text):
+        # A slash-command echo carried as a plain user line (NOT isMeta): the
+        # user did not type it. `<local-command-stdout>…</local-command-stdout>`
+        # & friends arrive as ordinary user content, so without this branch they
+        # render as a "YOU" prompt and poison the conversation title (#186).
+        # Classify META + text="" exactly like the isMeta branch above so the
+        # body stays out of FTS, title derivation, and the entry_type='human'
+        # prompts facet; the body survives in blocks_json for rendering as a
+        # "System marker" pill. The all-text guard mirrors the tool_result
+        # block-shape gate (Codex P1b) so an attachment-bearing row — a marker
+        # text block PLUS an image — is never folded.
+        entry_type = META
+        text = ""
     else:
         entry_type = HUMAN
     is_asst = t == "assistant"
