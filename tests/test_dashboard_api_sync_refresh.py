@@ -333,3 +333,27 @@ def test_post_sync_paramless_still_fetches(monkeypatch, tmp_path):
         assert rebuild_calls["n"] == 1
     finally:
         srv.shutdown(); t.join(timeout=2)
+
+
+def test_nudge_helper_drives_rebuild_only_against_real_server(monkeypatch, tmp_path):
+    """End-to-end: the real _nudge_dashboard_repaint client helper POSTs
+    /api/sync?refresh=0 to a real handler — headers pass CSRF (not 403),
+    exactly one rebuild runs, and zero OAuth fetch fires."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    rebuild_calls = _wire(ns)
+    invoked = {"n": 0}
+    def _spy(timeout_seconds=5.0):
+        invoked["n"] += 1
+        return ns["_RefreshUsageResult"](status="ok")
+    monkeypatch.setitem(ns, "_refresh_usage_inproc", _spy)
+    srv, t, port = _serve(ns)
+    try:
+        # Real helper, real ephemeral port. urlopen returns only after the
+        # handler has finished run_sync_now_locked() and sent the 204, so
+        # rebuild_calls is already settled when this returns.
+        ns["_nudge_dashboard_repaint"](port=port, timeout_seconds=5.0)
+        assert rebuild_calls["n"] == 1   # rebuild-only repaint happened
+        assert invoked["n"] == 0         # zero OAuth fetch (refresh=0)
+    finally:
+        srv.shutdown(); t.join(timeout=2)
