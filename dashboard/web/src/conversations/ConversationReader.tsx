@@ -65,6 +65,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // seeds jump-to-next.
   const focusMode = useSyncExternalStore(subscribeStore, () => getState().convFocusMode);
   const currentTurnUuid = useSyncExternalStore(subscribeStore, () => getState().convCurrentTurnUuid);
+  // #188 B5 — the explicit-selection pin. The keyboard jump-to-next (e/u/b/p)
+  // resolves its cursor from `pinned ?? currentTurnUuid` so a repeat forward
+  // press steps strictly past where the last jump LANDED (closes #187), not past
+  // the scroll-sync topmost-visible turn (which sits above a centered target).
+  const convPinnedUuid = useSyncExternalStore(subscribeStore, () => getState().convPinnedUuid);
   // #177 S6 — the floating in-conversation find bar. `convFindOpen` gates its
   // render + the n/N step bindings. `findTerms` is the debounced needle split
   // into highlight terms (null when the bar is closed → no prose marks).
@@ -76,9 +81,19 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const reduced = useReducedMotion();
   const sentinelRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  // #188 S3/B6 — a SEPARATE map holding each subagent card's <details> element,
+  // keyed by the bucket-root uuid. Registered UNCONDITIONALLY (open and closed),
+  // so a collapsed-subagent outline jump resolves the CARD (itemRefs misses
+  // while closed) and flashes it without force-opening (Bug 1). Typed
+  // HTMLElement (a <details>) — distinct from itemRefs' HTMLDivElement so there
+  // is no key collision and no open/close toggle race.
+  const cardRefs = useRef<Map<string, HTMLElement>>(new Map());
   // Per-anchor-uuid memoized ref callbacks: a stable callback identity per item
   // so the memo'd MessageItems don't detach/re-attach on every paged append.
   const refCallbacks = useRef<Map<string, (el: HTMLDivElement | null) => void>>(new Map());
+  // #188 S3/B6 — stable per-rootUuid card-ref callbacks (mirrors refCallbacks),
+  // so the memoized SidechainGroups don't churn their <details> ref each render.
+  const cardRefCallbacks = useRef<Map<string, (el: HTMLElement | null) => void>>(new Map());
   // Tracks the pending highlight-removal timeout so it can be cancelled on
   // unmount (no classList.remove on a detached node, no leaked timer) and
   // superseded on a rapid re-jump (no two overlapping 2s timers racing).
@@ -129,6 +144,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   outlineRef.current = outline;
   const currentTurnUuidRef = useRef<string | null>(currentTurnUuid);
   currentTurnUuidRef.current = currentTurnUuid;
+  // #188 B5 — live mirror so the stable jump-to-next closure reads the pin
+  // without re-registering the keymap array.
+  const convPinnedUuidRef = useRef<string | null>(convPinnedUuid);
+  convPinnedUuidRef.current = convPinnedUuid;
   const focusModeRef = useRef<FocusMode>(focusMode);
   focusModeRef.current = focusMode;
   const sessionIdRef = useRef(sessionId);
@@ -195,6 +214,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const jumpToTurnTop = useCallback(() => {
     jumpTopTargetRef.current?.scrollIntoView({ block: 'start', behavior: reducedRef.current ? 'auto' : 'smooth' });
     setJumpTopVisible(false);
+    dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — explicit nav clears the pin
   }, []);
 
   // Stick-if-at-bottom on a live append; otherwise preserve position + count the
@@ -227,6 +247,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     if (!b) return;
     b.scrollTo({ top: b.scrollHeight, behavior: reducedRef.current ? 'auto' : 'smooth' });
     setNewCount(0);
+    dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — explicit nav clears the pin
   }, []);
 
   const groups = useMemo(() => groupSidechains(detail?.items ?? []), [detail?.items]);
@@ -303,17 +324,25 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       },
       { root, threshold: 0 },
     );
-    // Dedup: itemRefs maps many uuids onto few elements. Observe each element
-    // once via a Set keyed on the element node identity.
+    // Dedup: itemRefs maps many uuids onto few elements, and #188 cardRefs adds
+    // the collapsed-subagent <details> elements (so a collapsed subagent reports
+    // its bucket-root uuid during free scroll → its outline entry highlights).
+    // Observe each unique element once via a Set keyed on node identity.
     const seen = new Set<Element>();
     for (const el of itemRefs.current.values()) {
       if (seen.has(el)) continue;
       seen.add(el);
       obs.observe(el);
     }
+    for (const el of cardRefs.current.values()) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      obs.observe(el);
+    }
     return () => obs.disconnect();
     // `visible` changes on every paged append / session switch / focus-mode
-    // change — re-register so the observer tracks the freshly-rendered turns.
+    // change — re-register so the observer tracks the freshly-rendered turns
+    // AND cards (cardRefs is repopulated in the same commit that grows `visible`).
   }, [visible]);
 
   // Jump-to-message: page until the target is loaded, then scroll+highlight.
@@ -336,7 +365,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     void (async () => {
       await loadUntil(jump.uuid);
       if (cancelled) return;
-      const el = itemRefs.current.get(jump.uuid);
+      // #188 B7 — resolve the target element: an inner member ref (itemRefs)
+      // OR, for a collapsed subagent whose members are ref-less, the card's
+      // <details> element (cardRefs, keyed by the bucket-root uuid). So an
+      // outline subagent click flashes the CARD with no force-open; the
+      // force-open path below still handles a find-jump to a real INNER uuid
+      // (in neither map while the thread is closed).
+      const el = itemRefs.current.get(jump.uuid) ?? cardRefs.current.get(jump.uuid);
       if (el) {
         // #177 S6 — a find jump whose anchor matched in a tool/thinking block
         // opens the target turn's collapsed disclosures BEFORE scrolling (the
@@ -346,15 +381,17 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         if (jump.expand_details) {
           el.querySelectorAll('details:not([open])').forEach((d) => { (d as HTMLDetailsElement).open = true; });
         }
-        // #184 — a jump centers the target (`block: 'center'`), but the
-        // scroll-sync observer highlights the TOPMOST visible turn. So right
-        // after a jump the OutlinePanel's aria-current may sit a turn or two
-        // above the jumped target until the next scroll settles the observer.
-        // This divergence is intentional: centering is the better read for a
-        // deep-link landing, and forcing the highlight to the centered turn
-        // would fight the topmost-visible contract every other scroll honors.
+        // #188 B2 — the jump centers the target (`block: 'center'`); the
+        // scroll-sync observer still reports the TOPMOST visible turn (above
+        // the centered target), but the explicit pin set below now drives the
+        // outline's aria-current + the jump-to-next cursor, so the highlight
+        // lands on exactly the jumped target (not the turn above it). This
+        // replaces the #184 "intentional divergence".
         el.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'center' });
         el.classList.add('conv-item--jumped');
+        // #188 B2 — pin the landing so the outline selects EXACTLY this target
+        // and a repeat forward jump-to-next steps strictly past it (closes #187).
+        dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: jump.uuid });
         // #177 S6 — sync the keyboard cursor to the jumped element so j/k (and
         // find's n/N) resume from the match. The jumped element is a direct
         // thread child; find its index there (mirrors the outline-jump intent
@@ -445,9 +482,44 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     if (highlightTimerRef.current != null) window.clearTimeout(highlightTimerRef.current);
   }, []);
 
+  // #188 B3 — clear the explicit pin on user-initiated scrolling. Wheel +
+  // touchmove (passive — never preventDefault) and the scroll-navigation keys
+  // count as "the user took over"; the pin (an outline/find/jump selection)
+  // yields to free scrolling so aria-current resumes its scroll-sync behavior.
+  // Deliberately NOT wired to the generic onScroll/onBodyScroll: the jump's own
+  // smooth scrollIntoView fires `scroll`, and clearing the pin there would undo
+  // the pin the jump just set (the bug this guards). Only explicit input clears.
+  // Re-runs once `detail` resolves — the `.conv-reader-body` element only mounts
+  // after the first page loads (the loading/empty branches render a different
+  // node), so a `[]`-dep effect would capture a null bodyRef and never attach.
+  const bodyMounted = detail != null;
+  useEffect(() => {
+    const b = bodyRef.current;
+    if (!b) return;
+    const clear = () => dispatch({ type: 'CLEAR_CONV_PIN' });
+    const SCROLL_KEYS = new Set([
+      'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ',
+    ]);
+    const onKey = (e: KeyboardEvent) => { if (SCROLL_KEYS.has(e.key)) clear(); };
+    b.addEventListener('wheel', clear, { passive: true });
+    b.addEventListener('touchmove', clear, { passive: true });
+    b.addEventListener('keydown', onKey);
+    return () => {
+      b.removeEventListener('wheel', clear);
+      b.removeEventListener('touchmove', clear);
+      b.removeEventListener('keydown', onKey);
+    };
+  }, [bodyMounted]);
+
   // The reader is reused across session switches (ConversationsView mounts it at
   // a fixed position), so drop stale ref callbacks when the session changes.
-  useEffect(() => () => { refCallbacks.current.clear(); }, [sessionId]);
+  // #188 — also drop the card-ref callbacks + the resolved card map so the next
+  // conversation's subagent cards register fresh.
+  useEffect(() => () => {
+    refCallbacks.current.clear();
+    cardRefCallbacks.current.clear();
+    cardRefs.current.clear();
+  }, [sessionId]);
 
   // The reused reader must not carry a force-pin across sessions (subagent_key is
   // only an agent-file hash). Reset on every session change; no-op on first mount.
@@ -540,6 +612,23 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         }
       };
       cache.set(key, cb);
+    }
+    return cb;
+  }, []);
+
+  // #188 S3/B6 — a stable card-ref callback per bucket-root uuid: registers the
+  // SidechainGroup's <details> element in cardRefs (open AND closed). Memoized
+  // per rootUuid so the SidechainGroup's ref identity is stable across renders
+  // (no detach/reattach thrash on paged appends / re-renders).
+  const getCardRef = useCallback((rootUuid: string) => {
+    const cache = cardRefCallbacks.current;
+    let cb = cache.get(rootUuid);
+    if (!cb) {
+      cb = (el: HTMLElement | null) => {
+        if (el) cardRefs.current.set(rootUuid, el);
+        else cardRefs.current.delete(rootUuid);
+      };
+      cache.set(rootUuid, cb);
     }
     return cb;
   }, []);
@@ -657,6 +746,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // advances on the next press once the new child has mounted.
     if (delta > 0 && cur === last && hasMoreRef.current) { void loadMoreRef.current(); return; }
     if (next === cur) return;
+    dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — j/k focus-step is explicit nav
     setFocusedIndex(next);
     const target = thread.children[next] as HTMLElement | undefined;
     target?.scrollIntoView({ block: 'nearest', behavior: reducedRef.current ? 'auto' : 'smooth' });
@@ -678,6 +768,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     const body = bodyRef.current;
     body?.scrollTo({ top: 0, behavior: reducedRef.current ? 'auto' : 'smooth' });
     setFocusedIndex(0);
+    dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — the `g` key is explicit nav
   }, []);
 
   // #177 S5 §4 — jump-to-next. Targets derive from the reader's full-session
@@ -716,12 +807,14 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     const turns = outlineRef.current?.turns ?? [];
     if (turns.length === 0) return;
     const list = targetListsRef.current[kind];
-    // Resolve the cursor in skeleton-index space. Prefer the scroll-sync turn;
-    // else the focused child's data-uuid; else -1 ("before the start") so a
-    // forward jump finds the first target.
+    // Resolve the cursor in skeleton-index space. #188 B5 — prefer the explicit
+    // pin (where the last jump LANDED) over the scroll-sync turn (the topmost
+    // visible, which lags above a centered target); else the focused child's
+    // data-uuid; else -1 ("before the start") so a forward jump finds the first
+    // target.
     const byUuid = turnIndexByUuidRef.current;
     let cursor = -1;
-    const cu = currentTurnUuidRef.current;
+    const cu = convPinnedUuidRef.current ?? currentTurnUuidRef.current;
     if (cu != null && byUuid.has(cu)) {
       cursor = byUuid.get(cu)!;
     } else {
@@ -965,6 +1058,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
                   nested={g.nested}
                   meta={detail.subagent_meta?.[g.subagentKey]}
                   getItemRef={getItemRef}
+                  // #188 S3/B6 — the bucket-root uuid (the same value the
+                  // outline subagent entry jumps to). It tags the card's
+                  // <details> via data-uuid and keys it in cardRefs.
+                  rootUuid={g.items[0].anchor.uuid}
+                  getCardRef={getCardRef}
                   forceOpen={detail.session_id === sessionId && g.subagentKey === forcedOpenKey}
                   riseClassName={riseClass}
                   riseStyle={riseStyle}

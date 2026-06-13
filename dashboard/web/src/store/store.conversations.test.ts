@@ -284,3 +284,57 @@ describe('conversation outline / focus-mode state', () => {
     expect(s.convCurrentTurnUuid).toBeNull();
   });
 });
+
+// #188 S2 — the explicit-selection pin (real uuids only). Drives aria-current +
+// the jump-to-next cursor so an outline click selects EXACTLY the clicked entry
+// (Bug 2 ≡ #187), independent of the scroll-sync topmost-visible turn.
+describe('conversation pin state (#188 S2)', () => {
+  it('convPinnedUuid defaults to null', () => {
+    _resetForTests();
+    expect(getState().convPinnedUuid).toBeNull();
+  });
+
+  it('SET_CONV_PINNED_TURN sets and CLEAR_CONV_PIN clears the pin', () => {
+    _resetForTests();
+    dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'u9' });
+    expect(getState().convPinnedUuid).toBe('u9');
+    dispatch({ type: 'CLEAR_CONV_PIN' });
+    expect(getState().convPinnedUuid).toBeNull();
+  });
+
+  it('a genuine session switch via OPEN_CONVERSATION clears the pin', () => {
+    _resetForTests();
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'a' });
+    dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'u9' });
+    expect(getState().convPinnedUuid).toBe('u9');
+    // Different session → genuine switch → pin reset.
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'b' });
+    expect(getState().convPinnedUuid).toBeNull();
+  });
+
+  it('a same-session OPEN_CONVERSATION (in-session jump) preserves the pin', () => {
+    _resetForTests();
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'a' });
+    dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'u9' });
+    // A same-session jump (the pin-setting effect re-sets it after landing, so
+    // it must not be blanket-cleared here).
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'a', jump: { session_id: 'a', uuid: 'u5' } });
+    expect(getState().convPinnedUuid).toBe('u9');
+  });
+
+  it('SELECT_CONVERSATION clears the pin', () => {
+    _resetForTests();
+    dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'u9' });
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 's5' });
+    expect(getState().convPinnedUuid).toBeNull();
+  });
+
+  it('CLEAR_CONVERSATION_JUMP leaves the pin alone (pin is independent of the jump)', () => {
+    _resetForTests();
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'a', jump: { session_id: 'a', uuid: 'x' } });
+    dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'u9' });
+    dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
+    expect(getState().conversationJump).toBeNull();
+    expect(getState().convPinnedUuid).toBe('u9');
+  });
+});

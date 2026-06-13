@@ -277,6 +277,14 @@ export interface UIState {
   convOutlineOpen: boolean;
   convFocusMode: 'all' | 'chat' | 'prompts' | 'errors';
   convCurrentTurnUuid: string | null;
+  // #188 S2 — the EXPLICIT-selection pin (always a real uuid; the bucket-root
+  // uuid for a subagent). Set by the jump effect when a jump lands; cleared by
+  // explicit user navigation (wheel/touch/scroll-keys + j/k/g/jump-to-top). It
+  // takes precedence over `convCurrentTurnUuid` for aria-current + the
+  // jump-to-next cursor, so an outline click selects exactly what was clicked
+  // (Bug 2 ≡ #187) rather than the scroll-sync topmost-visible turn (which sits
+  // above a centered target). Transient: reset on a genuine session switch.
+  convPinnedUuid: string | null;
   // #177 S6 — the floating in-conversation find bar (Cmd+F style). Transient:
   // opened by '/' over an open reader, closed on Esc / its ✕ / a genuine
   // session switch. Never persists.
@@ -505,6 +513,7 @@ function loadInitial(): UIState {
     convOutlineOpen,
     convFocusMode: 'all',
     convCurrentTurnUuid: null,
+    convPinnedUuid: null,
     convFindOpen: false,
     openModal: null,
     openSessionId: null,
@@ -623,6 +632,12 @@ export type Action =
   | { type: 'TOGGLE_CONV_OUTLINE' }
   | { type: 'SET_CONV_FOCUS_MODE'; mode: UIState['convFocusMode'] }
   | { type: 'SET_CONV_CURRENT_TURN'; uuid: string | null }
+  // #188 S2 — the explicit-selection pin. SET_CONV_PINNED_TURN is dispatched by
+  // the reader's jump effect when a jump lands; CLEAR_CONV_PIN by explicit user
+  // navigation. The pin takes precedence over the scroll-sync cursor for
+  // aria-current + jump-to-next (closes #187).
+  | { type: 'SET_CONV_PINNED_TURN'; uuid: string }
+  | { type: 'CLEAR_CONV_PIN' }
   // #177 S6 — the in-conversation find bar open flag.
   | { type: 'OPEN_CONV_FIND' }
   | { type: 'CLOSE_CONV_FIND' }
@@ -800,8 +815,12 @@ export function dispatch(action: Action): void {
         // list is session-scoped + point-in-time, so it's stale for the new
         // conversation). A same-session OPEN_CONVERSATION (an in-session find
         // step dispatches one with a jump) leaves it open so the cursor lives.
+        // #188 S2 — a genuine session switch also drops the explicit pin (the
+        // bucket-root uuids it could hold are session-scoped). A same-session
+        // OPEN_CONVERSATION (an in-session jump) leaves it — the jump effect
+        // re-sets it after the jump lands.
         ...(switched
-          ? { convFocusMode: 'all' as const, convCurrentTurnUuid: null, convFindOpen: false }
+          ? { convFocusMode: 'all' as const, convCurrentTurnUuid: null, convPinnedUuid: null, convFindOpen: false }
           : {}),
       };
       break;
@@ -815,6 +834,8 @@ export function dispatch(action: Action): void {
         // is NOT touched).
         convFocusMode: 'all',
         convCurrentTurnUuid: null,
+        // #188 S2 — drop the explicit pin on a select too.
+        convPinnedUuid: null,
       };
       break;
     case 'SET_CONVERSATION_SEARCH':
@@ -856,6 +877,14 @@ export function dispatch(action: Action): void {
     case 'SET_CONV_CURRENT_TURN':
       if (state.convCurrentTurnUuid === action.uuid) break; // no-op: avoid a needless emit on each observer tick
       state = { ...state, convCurrentTurnUuid: action.uuid };
+      break;
+    case 'SET_CONV_PINNED_TURN':
+      if (state.convPinnedUuid === action.uuid) break; // no-op: avoid a needless emit
+      state = { ...state, convPinnedUuid: action.uuid };
+      break;
+    case 'CLEAR_CONV_PIN':
+      if (state.convPinnedUuid === null) break; // already clear — no emit
+      state = { ...state, convPinnedUuid: null };
       break;
     case 'SET_FILTER': {
       if (action.text) localStorage.setItem(FILTER_KEY, action.text);

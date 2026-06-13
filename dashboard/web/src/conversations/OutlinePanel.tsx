@@ -39,6 +39,7 @@ function JumpCluster({
   turns,
   lists,
   currentUuid,
+  pinned,
   reduced,
   focusMode,
 }: {
@@ -46,13 +47,19 @@ function JumpCluster({
   turns: OutlineTurn[];
   lists: JumpLists;
   currentUuid: string | null;
+  // #188 S2 — the explicit-selection pin. Drives the jump-to-next cursor in
+  // preference to the scroll-sync `currentUuid` so a repeat forward press steps
+  // strictly past where the previous jump LANDED, not past the topmost-visible
+  // turn (which sits above a centered target) — closes #187.
+  pinned: string | null;
   reduced: boolean;
   focusMode: FocusMode;
 }) {
   const { indexByUuid, ...targets } = lists;
 
   const jump = (kind: JumpKind, dir: 1 | -1, btn: HTMLElement) => {
-    const cursor = currentUuid != null && indexByUuid.has(currentUuid) ? indexByUuid.get(currentUuid)! : -1;
+    const cursorUuid = pinned ?? currentUuid;
+    const cursor = cursorUuid != null && indexByUuid.has(cursorUuid) ? indexByUuid.get(cursorUuid)! : -1;
     const targetIdx = nextTarget(targets[kind], cursor, dir);
     if (targetIdx == null) {
       if (!reduced) {
@@ -239,6 +246,10 @@ export function OutlinePanel({
     subscribeStore,
     () => getState().convCurrentTurnUuid,
   );
+  // #188 S2 — the explicit-selection pin. When set it drives aria-current
+  // (exact, no section fallback) + the jump-to-next cursor; null falls back to
+  // today's scroll-sync behavior.
+  const pinned = useSyncExternalStore(subscribeStore, () => getState().convPinnedUuid);
   const focusMode = useSyncExternalStore(subscribeStore, () => getState().convFocusMode);
   const reduced = useReducedMotion();
 
@@ -282,13 +293,17 @@ export function OutlinePanel({
   // when the topmost rendered element is a folded fragment or sidechain turn.
   const currentSection = currentUuid != null ? sectionByUuid.get(currentUuid) ?? null : null;
 
-  // Auto-scroll the aria-current entry into view in the panel.
+  // Auto-scroll the aria-current entry into view in the panel. Keyed on the
+  // effective selection (pin wins over the scroll-sync cursor) so a pin change —
+  // e.g. an outline click that pins exactly the clicked entry — re-scrolls the
+  // panel to it (#188 S2).
   const listRef = useRef<HTMLOListElement>(null);
+  const effectiveUuid = pinned ?? currentUuid;
   useEffect(() => {
-    if (currentUuid == null) return;
+    if (effectiveUuid == null) return;
     const el = listRef.current?.querySelector<HTMLElement>('[aria-current="true"]');
     el?.scrollIntoView({ block: 'nearest', behavior: reduced ? 'auto' : 'smooth' });
-  }, [currentUuid, reduced]);
+  }, [effectiveUuid, reduced]);
 
   return (
     <nav className="conv-outline" aria-label="Session outline">
@@ -303,16 +318,24 @@ export function OutlinePanel({
               turns={outline.turns}
               lists={lists}
               currentUuid={currentUuid}
+              pinned={pinned}
               reduced={reduced}
               focusMode={focusMode}
             />
           </div>
           <ol className="conv-outline-list" ref={listRef}>
             {entries.map((e) => {
+              // #188 S2 — the explicit pin wins: when set, aria-current is the
+              // EXACT pinned entry (no section fallback), so an outline click —
+              // including a subagent click, whose entry uuid is its bucket-root
+              // uuid — selects precisely what was clicked (Bugs 2/3). Without a
+              // pin, fall back to today's scroll-sync behavior (exact landmark
+              // match OR the spine prompt of the current section).
               const isCurrent =
-                currentUuid != null &&
-                // exact landmark match, OR the spine prompt of the current section.
-                (e.uuid === currentUuid || (e.type === 'human' && e.uuid === currentSection));
+                pinned != null
+                  ? e.uuid === pinned
+                  : currentUuid != null &&
+                    (e.uuid === currentUuid || (e.type === 'human' && e.uuid === currentSection));
               return (
                 <li key={e.entryId}>
                   <button

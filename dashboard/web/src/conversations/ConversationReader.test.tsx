@@ -419,6 +419,82 @@ describe('ConversationReader', () => {
     await waitFor(() => expect(getState().conversationJump).toBeNull());
   });
 
+  // #188 B2 — the jump effect pins where it landed. The pin drives the outline's
+  // aria-current + the jump-to-next cursor (closes #187).
+  it('sets convPinnedUuid to the jump uuid after a jump lands', async () => {
+    mockFetchOnce(detail([
+      makeItem({ uuid: 'h1' }),
+      makeItem({ uuid: 'target', member_uuids: ['target', 'targetFrag'] } as never),
+    ], null));
+    vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'targetFrag' } });
+    render(<ConversationReader sessionId="s" />);
+    // The pin records the landing uuid (the jump's uuid), not the scroll cursor.
+    await waitFor(() => expect(getState().convPinnedUuid).toBe('targetFrag'));
+  });
+
+  // #188 B1/B7 — an outline click on a COLLAPSED subagent jumps to the bucket-root
+  // uuid. The jump effect resolves the card via cardRefs (the inner members are
+  // ref-less while collapsed) and flashes the <details> CARD without force-opening
+  // it (Bug 1: previously this force-opened the thread + flashed an inner member).
+  it('a jump to a collapsed subagent bucket-root flashes the CARD without force-opening', async () => {
+    mockFetchOnce(detail([
+      makeItem({ uuid: 'h1' }),
+      makeItem({ uuid: 'sa1', is_sidechain: true, subagent_key: 'A', text: 'Audit A' } as never),
+      makeItem({ uuid: 'sa2', is_sidechain: true, subagent_key: 'A' } as never),
+    ]));
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+
+    // The outline subagent entry's jump anchor is the bucket-root uuid (sa1).
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'sa1' } });
+    const { container } = render(<ConversationReader sessionId="s" />);
+
+    // The card flashes — and the thread stays COLLAPSED (no force-open).
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    expect(det.getAttribute('data-uuid')).toBe('sa1');
+    expect(det.classList.contains('conv-item--jumped')).toBe(true);
+    expect(det.open).toBe(false); // NOT force-opened
+    // The pin lands on the bucket-root uuid so the outline subagent entry lights.
+    await waitFor(() => expect(getState().convPinnedUuid).toBe('sa1'));
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+  });
+
+  // #188 B3 — explicit user navigation clears the pin. A wheel gesture on the
+  // body drops it; a programmatic scroll (the jump's own smooth scroll routes
+  // through onBodyScroll) must NOT.
+  it('a wheel gesture on the reader body clears the pin; a plain scroll does not', async () => {
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })], null));
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('.conv-reader-body')).not.toBeNull());
+    const body = container.querySelector('.conv-reader-body') as HTMLElement;
+
+    act(() => { dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'h1' }); });
+    // A plain scroll (programmatic, e.g. the jump's smooth scroll) leaves the pin.
+    fireEvent.scroll(body);
+    expect(getState().convPinnedUuid).toBe('h1');
+    // An explicit wheel gesture clears it.
+    fireEvent.wheel(body);
+    expect(getState().convPinnedUuid).toBeNull();
+  });
+
+  it('a scroll-key keydown on the reader body clears the pin', async () => {
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })], null));
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('.conv-reader-body')).not.toBeNull());
+    const body = container.querySelector('.conv-reader-body') as HTMLElement;
+
+    for (const key of ['ArrowDown', 'PageUp', 'Home', 'End', ' ']) {
+      act(() => { dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'h1' }); });
+      fireEvent.keyDown(body, { key });
+      expect(getState().convPinnedUuid).toBeNull();
+    }
+    // A non-scroll key leaves the pin.
+    act(() => { dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'h1' }); });
+    fireEvent.keyDown(body, { key: 'x' });
+    expect(getState().convPinnedUuid).toBe('h1');
+  });
+
   it('a find-jump to a focus-mode-hidden turn resets the mode to `all`, then lands the jump (spec §4)', async () => {
     // Focus mode `prompts` keeps human turns and hides assistant turns. A find
     // match on the hidden assistant turn 'a1' must escape the filter the same way

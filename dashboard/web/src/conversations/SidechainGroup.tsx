@@ -52,6 +52,8 @@ export function SidechainGroup({
   nested,
   meta,
   getItemRef,
+  rootUuid,
+  getCardRef,
   forceOpen = false,
   riseClassName = '',
   riseStyle,
@@ -63,6 +65,16 @@ export function SidechainGroup({
   // reader. Absent on old transcripts → the card degrades to title-only.
   meta?: SubagentMeta;
   getItemRef?: (item: ConversationItem) => (el: HTMLDivElement | null) => void;
+  // #188 S3/B6 — the bucket-root uuid (= items[0].anchor.uuid, the same value
+  // the outline subagent entry jumps to). It tags the <details> via data-uuid
+  // and keys the card in the reader's cardRefs map.
+  rootUuid?: string;
+  // #188 S3/B6 — a stable ref-callback factory (per rootUuid) that registers the
+  // <details> element in the reader's cardRefs map. Registered UNCONDITIONALLY
+  // (open and closed), separate from getItemRef (inner-member refs), so a
+  // collapsed subagent outline click resolves the CARD and flashes it without a
+  // force-open (Bug 1). No key collision with itemRefs; no open/close race.
+  getCardRef?: (rootUuid: string) => (el: HTMLElement | null) => void;
   forceOpen?: boolean;
   // G1 §4b load-in: the reader's render-time classifier passes `conv-rise`
   // (+ a per-index animationDelay) for a first-appearance top-level thread,
@@ -88,6 +100,12 @@ export function SidechainGroup({
   const models = [...new Set(items.map((it) => ('model' in it ? it.model : null)).filter(Boolean))] as string[];
   return (
     <details
+      // #188 S3/B6 — data-uuid = the bucket-root uuid (the outline subagent
+      // entry's jump anchor); ref registers the card in cardRefs UNCONDITIONALLY
+      // (whether collapsed or open) so a collapsed outline click flashes THIS
+      // card, not an inner member.
+      data-uuid={rootUuid}
+      ref={rootUuid != null && getCardRef ? getCardRef(rootUuid) : undefined}
       className={[
         nested ? 'conv-sidechain conv-sidechain--nested' : 'conv-sidechain',
         // G1 §4a: while a #160 jump force-opens this thread, snap it open

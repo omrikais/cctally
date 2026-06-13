@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { OutlinePanel } from './OutlinePanel';
 import { _resetForTests, dispatch, getState } from '../store/store';
 import type {
@@ -292,6 +292,106 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
     });
     const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
     expect(container.querySelector('.conv-jump-cluster')).toBeNull();
+  });
+
+  // #188 S2 — the explicit-selection pin takes precedence over the scroll-sync
+  // cursor for aria-current. Pinning X marks exactly the X entry, NOT the X-1
+  // section prompt the topmost-visible cursor would otherwise highlight (Bug 2).
+  it('aria-current prefers the pin: pinning a landmark marks exactly that entry (no section fallback)', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'prompt' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: '## A heading' }),
+      ],
+    });
+    // The scroll-sync cursor sits on the section prompt (above the centered
+    // target) — today this would light h1. The pin overrides it to a1 exactly.
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h1' });
+    dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'a1' });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const current = container.querySelectorAll('[aria-current="true"]');
+    expect(current.length).toBe(1);
+    expect(current[0].textContent).toContain('A heading'); // exactly a1, not h1
+  });
+
+  it('aria-current with a pin does NOT also light the X-1 section prompt', () => {
+    // Two prompts; pin the SECOND. The first must not be aria-current even
+    // though the scroll cursor (topmost-visible) points at it.
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h1' });
+    dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'h2' });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={outline()} />);
+    const current = container.querySelectorAll('[aria-current="true"]');
+    expect(current.length).toBe(1);
+    expect(current[0].textContent).toContain('looks good'); // h2, not h1
+  });
+
+  // #188 Bug 3 — a subagent entry's uuid is its bucket-root uuid; pinning that
+  // root lights exactly the subagent entry (not the most-recent prompt).
+  it('pinning a subagent bucket-root uuid lights the subagent entry', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        // a subagent bucket whose root member is 'sa1'.
+        turn({ uuid: 'sa1', kind: 'human', label: 'task', subagent_key: 'k1', is_sidechain: true }),
+        turn({ uuid: 'sa2', kind: 'assistant', label: 'work', subagent_key: 'k1', is_sidechain: true }),
+      ],
+    });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h1' });
+    dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'sa1' });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const current = container.querySelectorAll('[aria-current="true"]');
+    expect(current.length).toBe(1);
+    expect(current[0].classList.contains('conv-outline-entry--subagent')).toBe(true);
+  });
+
+  it('without a pin, aria-current keeps the legacy exact-OR-section behavior', () => {
+    // Pin null → the section-prompt fallback still applies (regression guard).
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'prompt' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'generic', member_uuids: ['a1', 'a1b'] }),
+      ],
+    });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'a1b' });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const current = container.querySelectorAll('[aria-current="true"]');
+    expect(current.length).toBe(1);
+    expect(current[0].textContent).toContain('prompt'); // section prompt fallback
+  });
+
+  // #188 / #187 — the headline regression. Two consecutive FORWARD jump-to-next
+  // (prompt) clicks must land on two DISTINCT landmarks. Before the fix the
+  // cursor read `convCurrentTurnUuid` (the scroll-sync topmost-visible turn,
+  // which sits ABOVE the centered target), so the second forward click re-found
+  // the SAME prompt. With the pin driving the cursor, the second click reads the
+  // cursor at the landed index and steps strictly forward.
+  it('two consecutive forward prompt jumps land on DISTINCT landmarks (closes #187)', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'one' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'work' }),
+        turn({ uuid: 'h2', kind: 'human', label: 'two' }),
+        turn({ uuid: 'a2', kind: 'assistant', label: 'more work' }),
+        turn({ uuid: 'h3', kind: 'human', label: 'three' }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const promptBtn = container.querySelector<HTMLButtonElement>('[data-jump-kind="prompt"]')!;
+
+    // Model the bug precisely: a previous forward jump LANDED on h2 (centered),
+    // but the scroll-sync observer reports the topmost-VISIBLE turn h1 — the one
+    // ABOVE the centered target. The pin records the real landing (h2); the
+    // scroll cursor lags one prompt behind at h1.
+    act(() => {
+      dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'h2' });
+      dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h1' });
+    });
+
+    // Forward jump: the pin (h2) wins over the scroll cursor (h1), so the cursor
+    // resolves to h2's index and steps strictly forward to h3 — NOT back to h2.
+    // Pre-fix (cursor = currentUuid = h1) this re-found h2, the #187 symptom.
+    fireEvent.click(promptBtn);
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h3' });
   });
 
   it('drops the per-entry "· N tools" suffix (noise lives in the stats histogram)', () => {

@@ -174,6 +174,46 @@ describe('SidechainGroup', () => {
     expect(details).toHaveClass('conv-sidechain--force');
   });
 
+  // #188 S3/B6 — the collapsed-card DOM anchor. The <details> carries
+  // data-uuid={rootUuid} and registers itself in a separate cardRefs map via
+  // getCardRef, UNCONDITIONALLY (open and closed) — so an outline subagent click
+  // (jump to the bucket-root uuid) resolves the card while collapsed and flashes
+  // it, instead of force-opening + flashing an inner member (Bug 1).
+  it('puts data-uuid={rootUuid} on the <details> and registers it via getCardRef while collapsed', () => {
+    const cardRefs = new Map<string, HTMLElement>();
+    const getCardRef = (rootUuid: string) => (el: HTMLElement | null) => {
+      if (el) cardRefs.set(rootUuid, el);
+      else cardRefs.delete(rootUuid);
+    };
+    const items = [member('root', { kind: 'assistant', text: 'task' } as Partial<ConversationItem>), member('s2')];
+    const { container } = render(
+      <SidechainGroup subagentKey="k1" items={items} nested={false} rootUuid="root" getCardRef={getCardRef} />,
+    );
+    const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    expect(det.open).toBe(false);                 // collapsed
+    expect(det.getAttribute('data-uuid')).toBe('root');
+    // The card element registered while collapsed (the inner members did NOT —
+    // they stay ref-less until open).
+    expect(cardRefs.get('root')).toBe(det);
+  });
+
+  it('keeps the card registered after the thread is forced open (unconditional)', () => {
+    const cardRefs = new Map<string, HTMLElement>();
+    const getCardRef = (rootUuid: string) => (el: HTMLElement | null) => {
+      if (el) cardRefs.set(rootUuid, el);
+      else cardRefs.delete(rootUuid);
+    };
+    const items = [member('root'), member('s2')];
+    const base = { subagentKey: 'k1', items, nested: false, rootUuid: 'root', getCardRef };
+    const { container, rerender } = render(<SidechainGroup {...base} forceOpen={false} />);
+    const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    expect(cardRefs.get('root')).toBe(det);
+    rerender(<SidechainGroup {...base} forceOpen={true} />);
+    expect(det.open).toBe(true);
+    // Still registered when open — no key collision, no open/close toggle race.
+    expect(cardRefs.get('root')).toBe(det);
+  });
+
   it('opens on forceOpen, registers member refs only while open, and latches open after the force drops', () => {
     const refs = new Map<string, HTMLDivElement>();
     const getItemRef = (item: ConversationItem) => (el: HTMLDivElement | null) => {
