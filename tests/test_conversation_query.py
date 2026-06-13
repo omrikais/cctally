@@ -950,6 +950,49 @@ def test_get_conversation_meta_command_and_context():
     assert by_uuid["m2"]["meta_kind"] == "context" and by_uuid["m2"]["skill_name"] is None
 
 
+# #186: a PRE-FIX human row whose body is a command-marker echo (seeded directly
+# as entry_type='human', simulating a row ingested before the parser-level
+# classification shipped) must be reclassified read-time to meta/command so it
+# renders as a System-marker pill, drops from the rail, and never becomes the
+# title — the read-time fallback for already-indexed rows.
+def test_pre_fix_human_command_marker_reclassified_read_time():
+    c = _conn()
+    body = "<local-command-stdout>Set model to Fable 5</local-command-stdout>"
+    _msg(c, session_id="s", uuid="h0", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text=body,
+         blocks_json=_meta_blocks(body))
+    _msg(c, session_id="s", uuid="h1", source_path="/p/s.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="human",
+         text="the real first prompt", blocks_json=_meta_blocks("the real first prompt"))
+    items = cq.get_conversation(c, "s")["items"]
+    by_uuid = {it["anchor"]["uuid"]: it for it in items}
+    # the pre-fix human command echo folds to meta/command read-time
+    assert by_uuid["h0"]["kind"] == "meta"
+    assert by_uuid["h0"]["meta_kind"] == "command"
+    assert by_uuid["h0"]["skill_name"] is None
+    # the next REAL human prompt is untouched and wins the title
+    assert by_uuid["h1"]["kind"] == "human"
+    title = cq._session_titles_map(c, ["s"])["s"]
+    assert title == "the real first prompt"
+
+
+def test_pre_fix_human_command_marker_with_media_stays_human():
+    # the read-time all-text guard (Codex P1b): a human row mixing a marker text
+    # block with a non-text (image) block must NOT reclassify — its user-authored
+    # content is preserved.
+    c = _conn()
+    blocks = _json.dumps([
+        {"kind": "text", "text": "<local-command-stdout>x</local-command-stdout>"},
+        {"kind": "image", "media_type": "image/png", "bytes": 2, "index": 0},
+    ])
+    _msg(c, session_id="s", uuid="h0", source_path="/p/s.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="<local-command-stdout>x</local-command-stdout>", blocks_json=blocks)
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "human"
+    assert "meta_kind" not in it
+
+
 def _set_reingest_pending(c):
     c.execute("INSERT INTO cache_meta(key, value) VALUES('conversation_reingest_pending','1') "
               "ON CONFLICT(key) DO UPDATE SET value=excluded.value")

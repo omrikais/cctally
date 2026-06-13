@@ -112,19 +112,31 @@ def _meta_classify(item, allow_human_fallback):
       pre-reingest window — see _reingest_pending). After the reingest a 'human'
       row keeping the preamble is a real user prompt, so it stays a "You" turn
       rather than being hidden in a collapsed skill pill (Codex code-review P1).
-    - command/context: ONLY for a true 'meta' row (slash-command plumbing vs the
-      rest). A 'human' row that is not a skill body stays human — generic injected
-      context can't be recovered read-time without isMeta; it lands on the next
+    - command: a true 'meta' row ALWAYS, plus — the #186 read-time fallback — a
+      'human' row whose body is command plumbing AND whose blocks are all text.
+      The marker regex is self-identifying (no read-time-recovery hazard, unlike
+      generic injected context), so command recovery for a pre-fix human row is
+      ungated by ``allow_human_fallback``. The all-text guard mirrors the ingest
+      branch (Codex P1b) so an attachment-bearing row is never folded.
+    - context: ONLY for a true 'meta' row (the remaining injected-content case).
+      A non-skill, non-command 'human' row stays human — generic injected context
+      can't be recovered read-time without isMeta; it lands on the next
       sync-triggered reingest."""
     is_meta = item["kind"] == "meta"
     body = item.get("text") or _join_text_blocks(item.get("blocks"))
     first = _first_nonblank_line(body)
     if first.startswith(_SKILL_PREAMBLE) and (is_meta or allow_human_fallback):
         return ("skill", _skill_name_from_preamble(first), body)
+    # Command plumbing: self-identifying, so safe to recover for a pre-fix human
+    # row too — but only when ALL blocks are text (mirror the ingest all-text
+    # guard so an attachment-bearing row is never folded). Runs ABOVE the
+    # not-is_meta guard precisely so a stale entry_type='human' command echo
+    # reclassifies read-time (#186).
+    all_text = all(b.get("kind") == "text" for b in (item.get("blocks") or []))
+    if _is_system_marker(body) and (is_meta or all_text):
+        return ("command", None, body)
     if not is_meta:
         return None
-    if _is_system_marker(body):
-        return ("command", None, body)
     return ("context", None, body)
 
 
