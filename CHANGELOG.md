@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.42.0] - 2026-06-13
+
 ### Fixed
 - Conversation viewer: system and slash-command messages (`/clear`, `/model`, the `local-command-stdout`/`local-command-stderr` echoes, and the caveats) were being attributed to you as "You" turns, and the first such line became the whole conversation's title; they now fold into collapsed "System marker" pills and the title falls back to your real first prompt. Such rows are recognized at ingest (stored as meta and kept out of search and the prompts facet) with a read-time fallback that also cleans already-recorded history, plus a belt-and-suspenders title skip that degrades unknown `command-*`/`local-command-*` tags to "skip" rather than letting them poison the title (#186).
 - Conversation viewer: terminal ANSI escape codes (for example the bold `^[[1m…^[[22m` wrapping "Fable 5") no longer leak into titles, outline labels, or message and command body text — they are stripped at ingest (which also keeps the search index clean for new rows) and again at the render chokepoints (which cleans already-recorded history without a re-ingest), while Bash tool output keeps its intentional terminal colors (#186).
