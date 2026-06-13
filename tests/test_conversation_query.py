@@ -2684,3 +2684,88 @@ def test_find_prose_only_mode_blocks_tool_thinking():
     assert [a["uuid"] for a in out["anchors"]] == ["hu"]
     blocked = cq.find_in_conversation(c, "s1", "needle", kind="tools")
     assert blocked["anchors"] == [] and blocked["total"] == 0
+
+
+# ---- #191: read-time recovery of already-ingested injected user lines ----
+import json as _json191
+
+
+def test_stale_human_compaction_recovers_to_meta():
+    c = _conn()
+    body = "This session is being continued from a previous conversation that ran out of context."
+    # already-ingested shape: entry_type='human', text=the raw body
+    _msg(c, session_id="s", uuid="c1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text=body,
+         blocks_json=_json191.dumps([{"kind": "text", "text": body}]))
+    conv = cq.get_conversation(c, "s")
+    it = conv["items"][0]
+    assert it["kind"] == "meta" and it["meta_kind"] == "compaction"
+
+
+def test_stale_human_task_notification_recovers_to_meta():
+    c = _conn()
+    body = "<task-notification>\n<task-id>x</task-id>\n<summary>done</summary>\n</task-notification>"
+    _msg(c, session_id="s", uuid="n1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text=body,
+         blocks_json=_json191.dumps([{"kind": "text", "text": body}]))
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "meta" and it["meta_kind"] == "notification"
+
+
+def test_stale_human_bash_echo_recovers_to_command_meta():
+    c = _conn()
+    body = "<bash-input>pwd</bash-input>"
+    _msg(c, session_id="s", uuid="b1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text=body,
+         blocks_json=_json191.dumps([{"kind": "text", "text": body}]))
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "meta" and it["meta_kind"] == "command"
+
+
+def test_remote_control_text_stripped_at_read_time():
+    c = _conn()
+    body = "<system-reminder>Message sent at Sat 2026-06-13 10:47:42 UTC.</system-reminder>\nApproved."
+    _msg(c, session_id="s", uuid="rc1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text=body,
+         blocks_json=_json191.dumps([{"kind": "text", "text": body}]))
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "human"
+    assert it["text"] == "Approved."
+
+
+def test_title_skips_compaction_first_row_and_strips_remote_control():
+    c = _conn()
+    # session A: leads with a compaction summary -> title must NOT be the summary
+    comp = "This session is being continued from a previous conversation that ran out of context."
+    _msg(c, session_id="A", uuid="a1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text=comp,
+         blocks_json=_json191.dumps([{"kind": "text", "text": comp}]))
+    _msg(c, session_id="A", uuid="a2", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:01:00Z", entry_type="human", text="the real first prompt",
+         blocks_json=_json191.dumps([{"kind": "text", "text": "the real first prompt"}]))
+    # session B: leads with a remote-control reply -> title strips the stamp
+    rc = "<system-reminder>Message sent at Sat 2026-06-13 10:47:42 UTC.</system-reminder>\nMerge to main."
+    _msg(c, session_id="B", uuid="b1", source_path="b.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-02T00:00:00Z", entry_type="human", text=rc,
+         blocks_json=_json191.dumps([{"kind": "text", "text": rc}]))
+    titles = {cv["session_id"]: cv["title"] for cv in cq.list_conversations(c)["conversations"]}
+    assert titles["A"] == "the real first prompt"
+    assert titles["B"] == "Merge to main."
+
+
+def test_fresh_meta_compaction_excluded_from_prompts_search():
+    # P2a: a FRESH compaction row (entry_type='meta', text='') is not in the
+    # prose FTS / prompts facet. (Stale human rows are NOT asserted -- they heal
+    # on reingest.)
+    c = _conn()
+    body = "This session is being continued from a previous conversation that ran out of context."
+    _msg(c, session_id="s", uuid="c1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="meta", text="",
+         blocks_json=_json191.dumps([{"kind": "text", "text": body}]))
+    # P1c both-halves: a fresh META row (text='') still recovers its label from
+    # the body at read time.
+    it = cq.get_conversation(c, "s")["items"][0]
+    assert it["kind"] == "meta" and it["meta_kind"] == "compaction"
+    # P2a: and it is absent from the prose / prompts search facet.
+    res = cq.search_conversations(c, "continued from a previous", kind="prompts")
+    assert all("c1" not in (h.get("uuid") or "") for h in res.get("hits", []))

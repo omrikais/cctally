@@ -43,6 +43,12 @@ from _lib_conversation import _extract_command_invocation
 # re-ingest). Scoped to prose/thinking/title/label — NEVER tool_result (Bash
 # AnsiText boundary). Shares the parser's regex so ingest and read-time agree.
 from _lib_conversation import _strip_ansi
+# #191: harness-injected user-line discriminators — defined in the parser,
+# re-exported here so ingest and read-time recovery share one classification.
+from _lib_conversation import (
+    _is_compaction_body, _is_notification_body, _is_bash_echo_body,
+    _strip_remote_control_prefix,
+)
 
 
 _TITLE_MAX = 120
@@ -144,6 +150,12 @@ def _meta_classify(item, allow_human_fallback):
     all_text = all(b.get("kind") == "text" for b in (item.get("blocks") or []))
     if _is_system_marker(body) and (is_meta or all_text):
         return ("command", None, body)
+    if all_text and _is_compaction_body(body):
+        return ("compaction", None, body)        # #191
+    if all_text and _is_notification_body(body):
+        return ("notification", None, body)      # #191
+    if all_text and _is_bash_echo_body(body):
+        return ("command", None, body)           # #191 (#5 -> System-marker pill)
     if not is_meta:
         return None
     return ("context", None, body)
@@ -209,9 +221,12 @@ def _session_titles_map(conn, session_ids):
             continue                 # already resolved to the first non-marker
         if _is_system_marker(text) or _looks_like_command_plumbing(text):
             continue
+        if (_is_compaction_body(text) or _is_notification_body(text)
+                or _is_bash_echo_body(text)):     # #191: never a title
+            continue
         if skip_skill_titles and _first_nonblank_line(text).startswith(_SKILL_PREAMBLE):
             continue
-        t = _title_from_text(text)
+        t = _title_from_text(_strip_remote_control_prefix(text))   # #191: strip the stamp
         if t:
             titles[sid] = t
     return titles
@@ -675,6 +690,13 @@ def _assemble_session(conn, session_id):
                 it["meta_kind"] = meta_kind
                 it["skill_name"] = skill_name
                 it["text"] = body
+
+    # #191: strip a leading remote-control `Message sent at … UTC.` stamp from any
+    # turn that remains a genuine human reply. Shared assembly -> covers BOTH the
+    # reader and the outline. No-op on #188-promoted command turns (no stamp).
+    for it in items:
+        if it["kind"] == "human" and it.get("text"):
+            it["text"] = _strip_remote_control_prefix(it["text"])
 
     # ---- Phase 4b: fold a Skill-invoked skill body into its Skill tool chip ----
     # A Skill invocation's injected body (now meta_kind='skill') links to its
