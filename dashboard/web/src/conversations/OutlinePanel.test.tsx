@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { OutlinePanel } from './OutlinePanel';
 import { _resetForTests, dispatch, getState } from '../store/store';
 import type {
@@ -58,7 +58,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('OutlinePanel (#177 S5 §3)', () => {
+describe('OutlinePanel (#186 §4 header redesign)', () => {
   it('renders a <nav aria-label="Session outline"> wrapper', () => {
     render(<OutlinePanel sessionId="s1" outline={outline()} />);
     expect(screen.getByRole('navigation', { name: 'Session outline' })).toBeTruthy();
@@ -70,101 +70,170 @@ describe('OutlinePanel (#177 S5 §3)', () => {
     expect(container.querySelector('.conv-outline-list')).toBeNull();
   });
 
-  it('stats card shows turns / duration / tokens / cost', () => {
+  it('headline shows total turns + yours', () => {
     const { container } = render(<OutlinePanel sessionId="s1" outline={outline()} />);
     const card = container.querySelector('.conv-outline-stats')!;
-    expect(card).toBeTruthy();
-    expect(card.textContent).toContain('47'); // total turns
-    expect(card.textContent).toContain('9'); // yours
+    expect(card.textContent).toContain('47');
+    expect(card.textContent).toContain('9');
     expect(card.textContent).toContain('turns');
     expect(card.textContent).toContain('yours');
-    // duration via fmt.hhmm → "3h 25m"; cost via fmt.usd2 → "$4.20"
-    expect(card.textContent).toContain('3h 25m');
-    expect(card.textContent).toContain('$4.20');
-    // tokens via fmt.tokens: 1200+800+0+5000 = 7000 → "7k"
-    expect(card.textContent).toContain('7k');
   });
 
-  it('hides the error row when error_count is 0, shows it otherwise', () => {
-    const { container, rerender } = render(
+  it('renders three stat tiles (Time / Tokens / Cost) with values + uppercase labels', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={outline()} />);
+    const tiles = container.querySelectorAll('.conv-outline-stat-tile');
+    expect(tiles.length).toBe(3);
+    const text = container.querySelector('.conv-outline-stat-tiles')!.textContent ?? '';
+    // Time → fmt.hhmm → "3h 25m"; Cost → fmt.usd2 → "$4.20"; Tokens 7000 → "7k".
+    expect(text).toContain('3h 25m');
+    expect(text).toContain('7k');
+    expect(text).toContain('$4.20');
+    // Labels (case-insensitive — CSS uppercases; the DOM text is the source spelling).
+    expect(text.toLowerCase()).toContain('time');
+    expect(text.toLowerCase()).toContain('tokens');
+    expect(text.toLowerCase()).toContain('cost');
+  });
+
+  it('renders Models / Tools labeled distribution rows', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={outline()} />);
+    const kvs = container.querySelectorAll('.conv-outline-stat-kv');
+    const text = Array.from(kvs).map((k) => k.textContent).join('|');
+    expect(text.toLowerCase()).toContain('models');
+    expect(text.toLowerCase()).toContain('tools');
+    expect(text).toContain('claude-opus-4');
+    // Tools: top-3 by count + "+N more"; full list in title.
+    const toolsRow = Array.from(kvs).find((k) => /tools/i.test(k.textContent ?? ''))!;
+    expect(toolsRow.textContent).toContain('Read ×18');
+    expect(toolsRow.textContent).toContain('+2 more');
+    expect(toolsRow.textContent).not.toContain('Grep');
+    expect(toolsRow.getAttribute('title')).toContain('Grep ×4');
+  });
+
+  it('hides the Errors row when error_count is 0', () => {
+    const { container } = render(
       <OutlinePanel sessionId="s1" outline={outline({ stats: stats({ error_count: 0 }) })} />,
     );
-    expect(container.querySelector('.conv-outline-stats-errors')).toBeNull();
+    const kvs = Array.from(container.querySelectorAll('.conv-outline-stat-kv'));
+    expect(kvs.some((k) => /error/i.test(k.textContent ?? ''))).toBe(false);
+  });
 
-    rerender(
-      <OutlinePanel sessionId="s1" outline={outline({ stats: stats({ error_count: 3 }) })} />,
+  // #186 §4.3 — reconcile the two error numbers. error_count (server total, 14)
+  // appears with " in {errorTurns} turns" ONLY when the error-turn count (13)
+  // differs; a clean 1:1 session just says "5 errors".
+  it('reconciles "14 errors in 13 turns" when error_count exceeds the error-turn count', () => {
+    // 13 distinct turns carrying an error; server error_count = 14.
+    const errTurns: OutlineTurn[] = [];
+    for (let i = 0; i < 13; i++) {
+      errTurns.push(turn({ uuid: `e${i}`, kind: 'human', label: `p${i}` }));
+      errTurns.push(turn({ uuid: `a${i}`, kind: 'assistant', label: 'oops', tools: [{ name: 'Bash', is_error: true }] }));
+    }
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={outline({ stats: stats({ error_count: 14 }), turns: errTurns })} />,
     );
-    const errRow = container.querySelector('.conv-outline-stats-errors')!;
-    expect(errRow).toBeTruthy();
-    expect(errRow.textContent).toContain('3 errors');
+    const errRow = Array.from(container.querySelectorAll('.conv-outline-stat-kv'))
+      .find((k) => /error/i.test(k.textContent ?? ''))!;
+    const value = errRow.querySelector('.conv-outline-stat-kv-value')!.textContent ?? '';
+    expect(value).toMatch(/14 errors in 13 turns/);
   });
 
-  it('tool histogram shows the top-3 by count + "+N more" with full list in a title tooltip', () => {
-    const { container } = render(<OutlinePanel sessionId="s1" outline={outline()} />);
-    const hist = container.querySelector('.conv-outline-stats-tools')!;
-    expect(hist).toBeTruthy();
-    // top-3 by count: Read(18), Bash(12), Edit(7); 2 more (Grep, Write).
-    expect(hist.textContent).toContain('Read ×18');
-    expect(hist.textContent).toContain('Bash ×12');
-    expect(hist.textContent).toContain('Edit ×7');
-    expect(hist.textContent).toContain('+2 more');
-    expect(hist.textContent).not.toContain('Grep'); // demoted to the tooltip
-    // full list (all 5) lives in the title tooltip.
-    const title = hist.getAttribute('title')!;
-    expect(title).toContain('Read ×18');
-    expect(title).toContain('Grep ×4');
-    expect(title).toContain('Write ×2');
+  it('shows just "5 errors" (no "in N turns") when error_count equals the error-turn count', () => {
+    const errTurns: OutlineTurn[] = [];
+    for (let i = 0; i < 5; i++) {
+      errTurns.push(turn({ uuid: `a${i}`, kind: 'assistant', label: 'oops', tools: [{ name: 'Bash', is_error: true }] }));
+    }
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={outline({ stats: stats({ error_count: 5 }), turns: errTurns })} />,
+    );
+    const errRow = Array.from(container.querySelectorAll('.conv-outline-stat-kv'))
+      .find((k) => /error/i.test(k.textContent ?? ''))!;
+    // Assert against the VALUE span (not the row's concatenated textContent,
+    // where the "Errors" label runs straight into "5 errors").
+    const value = errRow.querySelector('.conv-outline-stat-kv-value')!.textContent ?? '';
+    expect(value).toMatch(/^5 errors$/);
+    expect(value).not.toMatch(/in .* turns/);
   });
 
-  it('renders one list entry per derived landmark with React-keyed identity', () => {
+  it('renders one list entry per derived landmark', () => {
     const { container } = render(<OutlinePanel sessionId="s1" outline={outline()} />);
     const entries = container.querySelectorAll('.conv-outline-entry');
-    expect(entries.length).toBe(3); // h1, a1, h2
+    // h1, h2 are prompts; a1 is generic prose → dropped. Two entries.
+    expect(entries.length).toBe(2);
     expect(entries[0].textContent).toContain('fix the bug');
-    expect(entries[1].textContent).toContain('here is the plan');
+    expect(entries[1].textContent).toContain('looks good');
   });
 
-  it('marks aria-current on the top-level entry whose uuid === convCurrentTurnUuid (not its thinking children)', () => {
+  it('renders a 🧠 ×N badge on a prompt row whose section has thinking', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'think' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'r', thinking: ['t1', 't2'] }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const badge = container.querySelector('.conv-outline-entry-thinking')!;
+    expect(badge).toBeTruthy();
+    expect(badge.textContent).toContain('2');
+  });
+
+  // #186 §3 scroll-sync — the cursor lands on a generic (non-landmark) turn's
+  // member uuid; the section prompt entry gets aria-current via sectionByUuid.
+  // Modal-level integration test (drives the panel, not a child unit).
+  it('aria-current lands on the section prompt when the cursor is a non-landmark member', () => {
     const o = outline({
       turns: [
         turn({ uuid: 'h1', kind: 'human', label: 'prompt' }),
-        turn({ uuid: 'a1', kind: 'assistant', label: 'reply', thinking: ['pondering'] }),
+        // generic assistant — produces NO entry — with a folded member 'a1b'.
+        turn({ uuid: 'a1', kind: 'assistant', label: 'generic', member_uuids: ['a1', 'a1b'] }),
+      ],
+    });
+    // Cursor on the folded member of the generic assistant turn.
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'a1b' });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const current = container.querySelectorAll('[aria-current="true"]');
+    expect(current.length).toBe(1);
+    expect(current[0].textContent).toContain('prompt'); // the section prompt
+  });
+
+  it('aria-current also lands on an exact landmark entry uuid match', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'prompt' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: '## A heading' }),
       ],
     });
     dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'a1' });
     const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
     const current = container.querySelectorAll('[aria-current="true"]');
-    // exactly one: the depth-0 assistant entry, NOT the depth-1 thinking child
-    // (which shares the same uuid).
-    expect(current.length).toBe(1);
-    expect(current[0].textContent).toContain('reply');
-    expect(current[0].classList.contains('conv-outline-entry--nested')).toBe(false);
+    // h1 (section of a1) AND a1 (exact landmark). Both legitimately current.
+    const texts = Array.from(current).map((c) => c.textContent);
+    expect(texts.some((t) => t?.includes('A heading'))).toBe(true);
   });
 
   it('clicking an entry dispatches OPEN_CONVERSATION with the jump anchor', () => {
     render(<OutlinePanel sessionId="s1" outline={outline()} />);
-    const btn = screen.getByRole('button', { name: /here is the plan/ });
+    const btn = screen.getByRole('button', { name: /looks good/ });
     fireEvent.click(btn);
-    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'a1' });
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h2' });
     expect(getState().selectedConversationId).toBe('s1');
   });
 
-  // #177 S5 §5 — the store reducer no longer blanket-resets focus mode on a
-  // same-session OPEN_CONVERSATION jump, so the panel itself must reset to
-  // `all` before a jump WHEN the current mode would hide the target (and only
-  // then). These cover the entry-click path.
   it('entry click in a focus mode that HIDES the target resets to all before jumping', () => {
-    // In Prompts mode, an assistant entry is hidden → click must reset to all.
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: '## heading section' }),
+      ],
+    });
     dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' });
-    render(<OutlinePanel sessionId="s1" outline={outline()} />);
-    const btn = screen.getByRole('button', { name: /here is the plan/ });
+    render(<OutlinePanel sessionId="s1" outline={o} />);
+    // The heading landmark (assistant turn) is hidden in Prompts mode → reset.
+    const btn = screen.getByRole('button', { name: /heading section/ });
     fireEvent.click(btn);
     expect(getState().convFocusMode).toBe('all');
     expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'a1' });
   });
 
   it('entry click on a target VISIBLE in the current mode does NOT reset the mode', () => {
-    // In Prompts mode, a human entry stays visible → no reset.
     dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' });
     render(<OutlinePanel sessionId="s1" outline={outline()} />);
     const btn = screen.getByRole('button', { name: /looks good/ });
@@ -173,27 +242,10 @@ describe('OutlinePanel (#177 S5 §3)', () => {
     expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h2' });
   });
 
-  it('clicking the error stats row jumps to the first error entry', () => {
-    const o = outline({
-      stats: stats({ error_count: 2 }),
-      turns: [
-        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
-        turn({
-          uuid: 'a1',
-          kind: 'assistant',
-          label: 'oops',
-          tools: [{ name: 'Bash', is_error: true }],
-        }),
-      ],
-    });
-    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
-    const errRow = container.querySelector<HTMLButtonElement>('.conv-outline-stats-errors')!;
-    fireEvent.click(errRow);
-    // a1 is the first entry carrying an error → jump anchors on it.
-    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'a1' });
-  });
-
-  it('renders the jump-to-next glyph cluster only for kinds with count > 0', () => {
+  // #186 §4.1 — the jump cluster is MERGED INTO the stats card (no longer a
+  // sibling above it) with visible text labels; the error chip reads
+  // "error turns"; data-jump-kind attributes are preserved.
+  it('renders the jump cluster INSIDE the stats card with labeled chips', () => {
     const o = outline({
       stats: stats({ error_count: 1 }),
       turns: [
@@ -202,18 +254,22 @@ describe('OutlinePanel (#177 S5 §3)', () => {
       ],
     });
     const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
-    const cluster = container.querySelector('.conv-jump-cluster')!;
-    expect(cluster).toBeTruthy();
-    // error (a1) + prompt (h1) present; no subagent / plan buttons.
-    expect(cluster.querySelector('[data-jump-kind="error"]')).toBeTruthy();
-    expect(cluster.querySelector('[data-jump-kind="prompt"]')).toBeTruthy();
-    expect(cluster.querySelector('[data-jump-kind="subagent"]')).toBeNull();
-    expect(cluster.querySelector('[data-jump-kind="plan"]')).toBeNull();
-    // count shown on the error button.
-    expect(cluster.querySelector('[data-jump-kind="error"] .conv-jump-cluster-count')!.textContent).toBe('1');
+    const card = container.querySelector('.conv-outline-stats')!;
+    const cluster = card.querySelector('.conv-jump-cluster')!;
+    expect(cluster).toBeTruthy(); // inside the card, not a sibling
+    // a "Jump to" label precedes the chips.
+    expect(card.textContent).toMatch(/jump to/i);
+    // chips present with data-jump-kind preserved.
+    const promptChip = cluster.querySelector('[data-jump-kind="prompt"]')!;
+    const errChip = cluster.querySelector('[data-jump-kind="error"]')!;
+    expect(promptChip).toBeTruthy();
+    expect(errChip).toBeTruthy();
+    // visible text labels.
+    expect(promptChip.textContent?.toLowerCase()).toContain('prompts');
+    expect(errChip.textContent?.toLowerCase()).toContain('error turns');
   });
 
-  it('clicking a cluster button jumps to the next target; shift-click goes previous', () => {
+  it('clicking a cluster chip jumps to the next target; shift-click goes previous', () => {
     const o = outline({
       turns: [
         turn({ uuid: 'h1', kind: 'human', label: 'one' }),
@@ -223,10 +279,8 @@ describe('OutlinePanel (#177 S5 §3)', () => {
     });
     const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
     const promptBtn = container.querySelector<HTMLButtonElement>('[data-jump-kind="prompt"]')!;
-    // Cursor before the start → next prompt is h1.
     fireEvent.click(promptBtn);
     expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h1' });
-    // Park cursor on h2; shift-click → previous prompt h1.
     dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h2' });
     fireEvent.click(promptBtn, { shiftKey: true });
     expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h1' });
@@ -240,26 +294,15 @@ describe('OutlinePanel (#177 S5 §3)', () => {
     expect(container.querySelector('.conv-jump-cluster')).toBeNull();
   });
 
-  it('a · N tools annotation renders only when toolCount > 0', () => {
+  it('drops the per-entry "· N tools" suffix (noise lives in the stats histogram)', () => {
     const o = outline({
       turns: [
-        turn({
-          uuid: 'a1',
-          kind: 'assistant',
-          label: 'work',
-          tools: [
-            { name: 'Read', is_error: false },
-            { name: 'Bash', is_error: false },
-          ],
-        }),
-        turn({ uuid: 'h1', kind: 'human', label: 'thanks' }),
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: '## heading', tools: [{ name: 'Read', is_error: false }, { name: 'Bash', is_error: false }] }),
       ],
     });
     const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
-    const entries = container.querySelectorAll('.conv-outline-entry');
-    const work = within(entries[0] as HTMLElement);
-    expect(work.getByText(/2 tools/)).toBeTruthy();
-    // the human turn has no tools annotation.
-    expect((entries[1] as HTMLElement).querySelector('.conv-outline-entry-tools')).toBeNull();
+    expect(container.querySelector('.conv-outline-entry-tools')).toBeNull();
+    expect(container.textContent).not.toMatch(/· 2 tools/);
   });
 });

@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -27,7 +28,9 @@ describe('marker-tag cross-language parity (#186)', () => {
     expect(m, 'could not locate _MARKER_TAGS tuple in _lib_conversation.py').not.toBeNull();
 
     // Pull every single- or double-quoted string literal out of the tuple body.
-    const serverTags = Array.from(m![1].matchAll(/["']([^"']+)["']/g)).map((g) => g[1]);
+    const serverTags = Array.from(m![1].matchAll(/["']([^"']+)["']/g)).map(
+      (g: RegExpMatchArray) => g[1],
+    );
 
     expect(serverTags.length).toBeGreaterThan(0);
     // Element-for-element, same order. (Array equality is order-sensitive.)

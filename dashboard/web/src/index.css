@@ -4686,7 +4686,8 @@ mark.current {
   font-size: 11.5px;
   font-style: italic;
 }
-/* Stats card — "session at a glance" atop the list. */
+/* "Session at a glance" card — #186 §4 Variant B. One block: headline + three
+   stat tiles + labeled distribution rows + the in-card "Jump to" chip row. */
 .conv-outline-stats {
   flex: 0 0 auto;
   padding: 12px 14px;
@@ -4696,34 +4697,78 @@ mark.current {
   font-size: 11.5px;
   color: var(--text-dim);
 }
-.conv-outline-stats-row { margin-top: 4px; }
-.conv-outline-stats-row:first-child { margin-top: 0; }
-.conv-outline-stats-turns { color: var(--text); font-size: 12.5px; }
+.conv-outline-stats-headline {
+  color: var(--text);
+  font-size: 12.5px;
+  margin-bottom: 10px;
+}
 .conv-outline-stats-strong { color: var(--text); font-weight: 700; }
-.conv-outline-stats-models,
-.conv-outline-stats-tools {
-  color: var(--text-faint);
+/* Three bounded stat tiles: value over uppercase label. */
+.conv-outline-stat-tiles {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.conv-outline-stat-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  background: var(--panel-bg);
+  min-width: 0;
+}
+.conv-outline-stat-tile-value {
+  color: var(--text);
+  font-weight: 700;
+  font-size: 13px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* error row — a button styled as a stat line; reuses the danger accent. */
-.conv-outline-stats-errors {
-  display: block;
-  width: 100%;
-  text-align: left;
-  appearance: none;
-  border: none;
-  background: transparent;
-  padding: 0;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  font-weight: 700;
-  color: var(--accent-red);
-  cursor: pointer;
+.conv-outline-stat-tile-label {
+  color: var(--text-faint);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
-.conv-outline-stats-errors:hover { text-decoration: underline; }
-.conv-outline-stats-errors:disabled { cursor: default; opacity: 0.7; text-decoration: none; }
+.conv-outline-stat-tile--tokens .conv-outline-stat-tile-value { color: var(--accent-blue); }
+.conv-outline-stat-tile--cost .conv-outline-stat-tile-value { color: var(--accent-green); }
+/* Labeled distribution rows: glyph · UPPERCASE-LABEL · value, per-category
+   glyph color. */
+.conv-outline-stat-kv {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin-top: 5px;
+}
+.conv-outline-stat-kv-glyph {
+  flex: 0 0 auto;
+  width: 15px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.conv-outline-stat-kv-label {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.conv-outline-stat-kv-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conv-outline-stat-kv--models .conv-outline-stat-kv-glyph { color: var(--accent-magenta); }
+.conv-outline-stat-kv--errors .conv-outline-stat-kv-glyph,
+.conv-outline-stat-kv--errors .conv-outline-stat-kv-value { color: var(--accent-red); }
 /* Navigable landmark list. */
 .conv-outline-list {
   flex: 1 1 auto;
@@ -4767,17 +4812,34 @@ mark.current {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.conv-outline-entry-tools { flex: 0 0 auto; color: var(--text-faint); }
-.conv-outline-entry--human { font-weight: 600; color: var(--text); }
+/* 🧠 ×N thinking badge — a quiet per-prompt count, right-aligned. */
+.conv-outline-entry-thinking {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+/* Prompt spine (#186 §3): depth-0 human rows are the bold full-contrast
+   spine, each with a hairline divider above it (except the first). */
+.conv-outline-entry--human { font-weight: 700; color: var(--text); }
+.conv-outline-list li:has(> .conv-outline-entry--human):not(:first-child) {
+  border-top: 1px solid var(--border-soft);
+  margin-top: 2px;
+  padding-top: 2px;
+}
+/* Per-type landmark glyph colors — replacing the near-invisible uniform faint
+   glyph column with at-a-glance role differentiation. Error wins (it also gets
+   the --error class). */
 .conv-outline-entry--subagent { color: var(--accent-magenta); }
 .conv-outline-entry--subagent .conv-outline-entry-glyph { color: var(--accent-magenta); }
+.conv-outline-entry--plan .conv-outline-entry-glyph { color: var(--accent-green); }
+.conv-outline-entry--question .conv-outline-entry-glyph { color: var(--accent-amber); }
+.conv-outline-entry--heading { color: var(--text); }
+.conv-outline-entry--heading .conv-outline-entry-glyph { color: var(--text-dim); }
 .conv-outline-entry--error,
 .conv-outline-entry--error .conv-outline-entry-glyph { color: var(--accent-red); }
-.conv-outline-entry--nested {
-  padding-left: 22px;
-  font-style: italic;
-  opacity: 0.75;
-}
+/* Landmark rows are indented + demoted under their prompt; no italic (the old
+   thinking-child italic is retired — thinking is now a badge). */
+.conv-outline-entry--nested { padding-left: 22px; }
 .conv-outline-entry[aria-current="true"] {
   background: var(--panel-bg-2);
   border-color: var(--accent-blue);
@@ -4862,14 +4924,25 @@ mark.current {
 }
 .conv-hidden-run:hover { color: var(--text-dim); border-color: var(--accent-blue); }
 
-/* ---- Jump-to-next glyph cluster (#177 S5 §4) --------------------- */
+/* ---- In-card "Jump to" chip row (#177 S5 §4 / #186 §4.1) ---------- */
+/* Now MERGED INTO the stats card (#186): a top-divider + "Jump to" label above
+   a wrapping row of labeled chips. */
+.conv-outline-jump {
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--border-soft);
+}
+.conv-outline-jump-label {
+  color: var(--text-faint);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
 .conv-jump-cluster {
-  flex: 0 0 auto;
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border-soft);
-  background: var(--panel-bg-2);
 }
 .conv-jump-cluster-btn {
   appearance: none;
@@ -4886,10 +4959,17 @@ mark.current {
   gap: 5px;
 }
 .conv-jump-cluster-btn:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-jump-cluster-btn:focus-visible { outline: none; border-color: var(--accent-blue); }
 .conv-jump-cluster-glyph { font-size: 12px; line-height: 1; }
-.conv-jump-cluster-count { color: var(--text-faint); }
+.conv-jump-cluster-text { color: inherit; }
+.conv-jump-cluster-count {
+  color: var(--text-faint);
+  font-weight: 700;
+}
 .conv-jump-cluster-btn[data-jump-kind="error"] .conv-jump-cluster-glyph { color: var(--accent-red); }
 .conv-jump-cluster-btn[data-jump-kind="subagent"] .conv-jump-cluster-glyph { color: var(--accent-magenta); }
+.conv-jump-cluster-btn[data-jump-kind="plan"] .conv-jump-cluster-glyph { color: var(--accent-green); }
+.conv-jump-cluster-btn[data-jump-kind="prompt"] .conv-jump-cluster-glyph { color: var(--accent-blue); }
 /* Transient no-op pulse (300ms; suppressed under reduced motion by the JS gate
    AND this media query so a class accidentally left on never animates). */
 @keyframes conv-pulse-disabled {
