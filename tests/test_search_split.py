@@ -233,3 +233,54 @@ def test_conversation_search_depth_prose_only_when_pending():
 def test_conversation_search_depth_full_on_operational_error():
     c = sqlite3.connect(":memory:")   # no cache_meta table at all
     assert db.conversation_search_depth(c) == "full"
+
+
+# === #186 Task 1G: command-marker rows excluded from the prompts facet ===
+#
+# A `<local-command-stdout>` echo ingested via the REAL parser is stored
+# entry_type='meta' (Task 1B), so a kind='prompts' search (entry_type='human'
+# filter) returns the real prompt but NEVER the command echo. GREEN after 1B;
+# asserted explicitly so a regression is caught.
+
+import io
+import _lib_conversation_query as cq
+
+
+def _ingest_line(c, obj, offset):
+    """Parse one JSONL object through the real parser and INSERT the row,
+    populating text + the split search columns exactly as sync_cache would.
+    ``offset`` keys UNIQUE(source_path, byte_offset) per row."""
+    line = json.dumps(obj) + "\n"
+    row = list(lc.iter_message_rows(io.StringIO(line), "/p/s.jsonl"))[0]
+    c.execute(
+        "INSERT INTO conversation_messages"
+        "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+        " entry_type,text,blocks_json,is_sidechain,search_tool,search_thinking) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("s1", row.uuid, row.parent_uuid, "/p/s.jsonl", offset,
+         "2026-06-01T00:00:00Z", row.entry_type, row.text, row.blocks_json,
+         row.is_sidechain, row.search_tool, row.search_thinking))
+    return row
+
+
+def test_command_marker_excluded_from_prompts_facet():
+    c = sqlite3.connect(":memory:")
+    db._apply_cache_schema(c)
+    if not db._fts5_available(c):
+        pytest.skip("sqlite build lacks FTS5")
+    # a command echo + a REAL prompt sharing the distinctive word "needle"
+    echo = _ingest_line(c, {
+        "type": "user", "uuid": "u-echo",
+        "message": {"content": "<local-command-stdout>needle output</local-command-stdout>"}}, 0)
+    prompt = _ingest_line(c, {
+        "type": "user", "uuid": "u-real",
+        "message": {"content": "find the needle in the haystack"}}, 1)
+    c.commit()
+    # the parser classified the echo as META (Task 1B), so its prose is NOT indexed
+    assert echo.entry_type == "meta" and echo.text == ""
+    assert prompt.entry_type == "human"
+
+    out = cq.search_conversations(c, "needle", kind="prompts")
+    uuids = {h["uuid"] for h in out["hits"]}
+    assert "u-real" in uuids, "the real prompt must match the prompts facet"
+    assert "u-echo" not in uuids, "the command echo is META — never a prompt hit"
