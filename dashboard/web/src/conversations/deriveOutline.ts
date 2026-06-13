@@ -88,6 +88,10 @@ export function deriveOutline(
   // The current section's prompt uuid (null before the first prompt). Landmarks
   // emit at depth 1 inside a section, depth 0 before the first prompt.
   let sectionUuid: string | null = null;
+  // Cursor to the current section's prompt entry, so thinking accrual is O(1)
+  // per turn instead of a linear `entries.find` (set when each prompt is pushed;
+  // null before the first prompt → pre-prompt thinking is not accrued).
+  let sectionPromptEntry: OutlineEntry | null = null;
   const depth = (): 0 | 1 => (sectionUuid != null ? 1 : 0);
 
   // Map a turn's member uuids → the current section prompt (only inside a
@@ -135,11 +139,12 @@ export function deriveOutline(
       sectionUuid = t.uuid;
       sectionByUuid.set(t.uuid, t.uuid);
       for (const u of t.member_uuids) sectionByUuid.set(u, t.uuid);
-      entries.push({
+      sectionPromptEntry = {
         entryId: t.uuid, uuid: t.uuid, type: 'human', label: t.label,
         depth: 0, error: false, plan: false, question: false,
         thinkingCount: 0, toolCount, turnIndex: indexOf.get(t.uuid) ?? 0,
-      });
+      };
+      entries.push(sectionPromptEntry);
       continue;
     }
 
@@ -152,10 +157,7 @@ export function deriveOutline(
 
     // assistant / tool_result: emit a landmark iff curated. Thinking always
     // accrues to the section prompt regardless of whether a landmark emits.
-    if (thinkN > 0 && sectionUuid != null) {
-      const promptEntry = entries.find((e) => e.uuid === sectionUuid && e.type === 'human');
-      if (promptEntry) promptEntry.thinkingCount += thinkN;
-    }
+    if (thinkN > 0 && sectionPromptEntry != null) sectionPromptEntry.thinkingCount += thinkN;
     mapMembers(t);
 
     // Resolve the landmark type by precedence: error > plan > question > heading.
