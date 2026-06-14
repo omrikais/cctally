@@ -25,6 +25,15 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HARNESS_BIN="$REPO_ROOT/bin/cctally"
 HARNESS_FIXTURES_DIR="$REPO_ROOT/tests/fixtures/migrations"
 
+# Regenerate goldens: CCTALLY_MIGRATIONS_REGENERATE=1 bin/cctally-migrations-test
+# Overwrites each scenario's expected.txt with the freshly-captured actual
+# output (still redacted + deterministic) instead of diffing. Use after a
+# registry change that legitimately shifts the baked migration count or the
+# dynamically-appended NNN_test_*_injection test-migration number. Diff the
+# result against a known-good baseline before committing — the ONLY allowed
+# deltas are the count bump and the new/renumbered migration lines.
+REGENERATE="${CCTALLY_MIGRATIONS_REGENERATE:-}"
+
 # Per-run scratch dir. Each scenario's HOME is $SCRATCH_DIR/<scenario>.
 SCRATCH_DIR="$(mktemp -d -t cctally-migrations-XXXXXX)"
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
@@ -165,6 +174,11 @@ scenario_assert_golden () {
     local scenario_dir="$1"
     local actual_text="$2"
     local actual_path="$scenario_dir/actual.txt"
+    if [ -n "$REGENERATE" ]; then
+        printf '%s\n' "$actual_text" > "$scenario_dir/expected.txt"
+        echo "REGEN: $(basename "$scenario_dir")"
+        return 0
+    fi
     printf '%s\n' "$actual_text" > "$actual_path"
     if ! diff -u "$scenario_dir/expected.txt" "$actual_path" >/dev/null 2>&1; then
         echo "FAIL: $(basename "$scenario_dir")"

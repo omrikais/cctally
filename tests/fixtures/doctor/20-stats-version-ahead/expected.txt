@@ -19,8 +19,8 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ✗ Version ahead            stats.db ahead (v99 > known v12)
       → Run `cctally db recover --db stats --yes` (or restore from backup)
-  ✓ Migrations               0/24 applied
-  ⚠ Pending migrations       24 pending
+  ✓ Migrations               0/25 applied
+  ⚠ Pending migrations       25 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
   ✓ Latest snapshot          2s ago

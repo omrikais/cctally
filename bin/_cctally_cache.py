@@ -714,6 +714,15 @@ def sync_cache(
                 "DELETE FROM cache_meta WHERE key IN "
                 "('conversation_promote_command_args_pending',"
                 " 'conversation_promote_command_args_cursor')")
+            # Browse-rail rollup: a rebuild re-derives conversation_messages from
+            # offset 0, so wipe the rollup here (in the same destructive txn,
+            # alongside clear_conversation_messages, so a crash-recovery read
+            # can't surface ghost rows) and arm the durable backfill flag. The
+            # post-walk recompute (after the per-file loop, still under the
+            # flock) consumes the flag and rebuilds the rollup from the freshly
+            # re-ingested messages, then drops it last (crash-safe).
+            conn.execute("DELETE FROM conversation_sessions")
+            _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Claude cached entries")
 
@@ -747,6 +756,12 @@ def sync_cache(
                     "DELETE FROM cache_meta "
                     "WHERE key='conversation_backfill_pending'"
                 )
+                # Browse-rail rollup: a #139 offset-0 backfill bulk-inserts
+                # history into conversation_messages, so arm the durable
+                # recompute flag (idempotent; covers a partial-migration state
+                # where the rollup is empty but messages just landed). The
+                # post-walk recompute rebuilds it and drops the flag last.
+                _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
                 conn.commit()
 
             # #193: consume the deferred ai-title backfill. Cache migration 012 is
@@ -825,6 +840,13 @@ def sync_cache(
                 # three flags + cursor + gen atomically on completion. Never on the rebuild
                 # path (which already wipes + repopulates id-aware via the normal walk).
                 _resumable_reingest_conversation_messages(conn)
+                # Browse-rail rollup: a #179 reingest DELETEs + re-inserts every
+                # file's conversation_messages rows (bumping autoincrement ids and
+                # potentially MIN/MAX), so arm the durable recompute flag
+                # (idempotent; covers a partial-migration state). The post-walk
+                # recompute rebuilds the rollup and drops the flag last.
+                _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
+                conn.commit()
 
             # #177 S6: consume the migration-010 search-column split under the
             # SAME held flock, AFTER the reingest so any just-re-ingested rows
@@ -975,6 +997,13 @@ def sync_cache(
             conn.execute(
                 "UPDATE session_files SET size_bytes = 0, last_byte_offset = 0"
             )
+            # Browse-rail rollup: truncation escalates to a full offset-0
+            # re-ingest of conversation_messages, so wipe the rollup here (in the
+            # same destructive txn, alongside clear_conversation_messages) and
+            # arm the durable backfill flag. The post-walk recompute rebuilds it
+            # from the re-ingested messages and drops the flag last (crash-safe).
+            conn.execute("DELETE FROM conversation_sessions")
+            _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
             conn.commit()
             stats.files_reset_truncated += len(truncated_paths)
             # Force every file to re-ingest from offset 0: clearing the
@@ -983,6 +1012,13 @@ def sync_cache(
             # truncated=False since we already wiped the table above —
             # avoids a redundant per-file DELETE that would be a no-op).
             existing = {}
+
+        # Browse-rail rollup: accumulate the session_ids whose
+        # conversation_messages this walk touched, so the post-walk recompute can
+        # scope its UPSERT to just those sessions (steady state). Pure Python —
+        # updated only AFTER each per-file conn.commit() below, never inside the
+        # zero-write-lock read/parse region, so it adds no DML there.
+        touched_sessions: set = set()
 
         for jp in paths:
             path_str = str(jp)
@@ -1193,6 +1229,11 @@ def sync_cache(
                 )
                 conn.commit()
                 stats.files_processed += 1
+                # Browse-rail rollup: record the session_ids this file just
+                # committed so the post-walk recompute can scope-UPSERT them.
+                # cr[0] is session_id per _conv_row_tuple's column order. Lands
+                # AFTER the commit (pure Python; no DML, no extra write lock).
+                touched_sessions.update(cr[0] for cr in conv_rows if cr[0] is not None)
             except sqlite3.DatabaseError as exc:
                 eprint(f"[cache] db error on {jp}: {exc}")
                 conn.rollback()
@@ -1204,6 +1245,30 @@ def sync_cache(
 
         if progress is not None:
             progress(stats)
+
+        # Browse-rail rollup maintenance (single post-walk recompute, under the
+        # still-held flock, after every per-file commit and before the
+        # walk-complete marker). Keyed on the DURABLE flag, not an in-memory
+        # bool: a crash between a destructive path's commit (rebuild /
+        # truncation / #139 backfill / #179 reingest, each of which armed the
+        # flag in its own committed txn) and this recompute leaves the flag set,
+        # so the next sync full-recomputes — never strands stale rollup rows
+        # (Codex gate BLOCKER 1). Flag set -> full GROUP BY over all sessions
+        # (rare, ~90ms), then drop the flag LAST (drop-it-last contract). Else ->
+        # scoped UPSERT over just the sessions this walk touched (steady state,
+        # ~1 session/tick). Both recomputes derive COUNT/MIN/MAX from the same
+        # rows the rail's old live aggregate read, so the rollup stays
+        # byte-identical to that aggregate.
+        if _conversation_sessions_backfill_pending(conn):
+            _recompute_conversation_sessions(conn)
+            conn.execute(
+                "DELETE FROM cache_meta "
+                "WHERE key='conversation_sessions_backfill_pending'"
+            )
+            conn.commit()
+        elif touched_sessions:
+            _recompute_conversation_sessions(conn, touched_sessions)
+            conn.commit()
 
         # Walk-complete sentinel write (cctally-dev#93, D5a). Still inside the
         # held fcntl lock, before the finally-unlock. Only when the entire walk
@@ -1414,6 +1479,87 @@ def _resumable_reingest_conversation_messages(conn):
         " 'conversation_reingest_cursor',"
         " 'conversation_reingest_cursor_gen')")
     conn.commit()
+
+
+# === Browse-rail rollup (conversation_sessions) maintenance =================
+# Keeps conversation_sessions — the four structural aggregates the old live
+# GROUP BY produced — in lockstep with conversation_messages so
+# GET /api/conversations renders a page without scanning the whole message
+# table. Maintained entirely inside sync_cache under the cache.db.lock flock:
+# the steady-state per-file loop is insert-only, so a scoped UPSERT over the
+# touched sessions suffices; the rare heavy/destructive paths (rebuild,
+# truncation-escalation, #139 backfill, #179 reingest) set the durable
+# ``conversation_sessions_backfill_pending`` cache_meta flag (migration 013
+# arms it too) which forces one full recompute, crash-safe across a
+# destructive-commit/recompute crash window. The CALLER owns the commit.
+
+# All non-null sessions, recomputed from conversation_messages. Shared by the
+# full and scoped recompute so both paths derive byte-identical aggregates.
+_CONV_SESSIONS_SELECT = (
+    "SELECT session_id, COUNT(*), MIN(timestamp_utc), MAX(timestamp_utc) "
+    "FROM conversation_messages WHERE session_id IS NOT NULL"
+)
+
+
+def _conversation_sessions_backfill_pending(conn) -> bool:
+    """True while the durable ``conversation_sessions_backfill_pending`` flag is
+    set — the signal that the rollup needs one full GROUP BY recompute (armed by
+    migration 013 and by every heavy/destructive conversation_messages path).
+    Tolerates a missing cache_meta table (path-less / schema-not-applied conn) by
+    degrading to False, like the sibling reingest/backfill predicates."""
+    try:
+        return conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='conversation_sessions_backfill_pending'"
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+
+
+def _recompute_conversation_sessions(conn, session_ids=None) -> None:
+    """Recompute the ``conversation_sessions`` browse-rail rollup from
+    ``conversation_messages``. The caller holds the cache.db.lock flock and owns
+    the commit (this helper never commits).
+
+    ``session_ids is None`` -> FULL: wipe the whole rollup and rebuild it from a
+    single GROUP BY over every non-null session — the rare, flag-gated path
+    (rebuild / truncation / backfill / reingest / migration-013 history).
+
+    ``session_ids={...}`` -> SCOPED: for each <=400-id chunk, DELETE those rows
+    then re-INSERT the GROUP BY restricted to the chunk — the steady-state path
+    keyed on the per-file loop's touched set. DELETE+INSERT (NOT
+    INSERT…SELECT…ON CONFLICT, which trips SQLite's upsert-on-SELECT parse
+    ambiguity) also correctly drops a session whose rows all vanished — though in
+    steady state conversation_messages only gains rows, so that branch is just
+    belt-and-suspenders. The chunking keeps the ``session_id IN (…)`` parameter
+    list well under SQLite's variable limit.
+
+    The recomputed COUNT/MIN/MAX are byte-identical to the rail's prior live
+    aggregate over the same rows — that is the load-bearing invariant
+    (assert_rollup_matches_live in the maintenance test pins it)."""
+    if session_ids is None:
+        conn.execute("DELETE FROM conversation_sessions")
+        conn.execute(
+            "INSERT INTO conversation_sessions "
+            "(session_id, msg_count, started_utc, last_activity_utc) "
+            + _CONV_SESSIONS_SELECT + " GROUP BY session_id"
+        )
+        return
+    ids = [s for s in session_ids if s is not None]
+    for i in range(0, len(ids), 400):
+        chunk = ids[i:i + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        conn.execute(
+            f"DELETE FROM conversation_sessions WHERE session_id IN ({placeholders})",
+            chunk,
+        )
+        conn.execute(
+            "INSERT INTO conversation_sessions "
+            "(session_id, msg_count, started_utc, last_activity_utc) "
+            + _CONV_SESSIONS_SELECT
+            + f" AND session_id IN ({placeholders}) GROUP BY session_id",
+            chunk,
+        )
 
 
 def _consume_search_split(conn) -> None:

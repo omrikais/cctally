@@ -2360,6 +2360,26 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             byte_offset INTEGER NOT NULL
         );
 
+        -- Browse-rail rollup (conversation_sessions). Materializes exactly the
+        -- four structural aggregates the rail's old live GROUP BY produced
+        -- (COUNT/MIN/MAX over conversation_messages per session_id) so
+        -- GET /api/conversations no longer scans the whole message table to
+        -- render a 50-row page. The explicit NOT NULL on the non-INTEGER PK
+        -- matters (SQLite's legacy NULL-in-PK bug); the rail keys on a concrete
+        -- session_id and the recompute's GROUP BY already filters nulls. The
+        -- index lets the only paginated ordering (recent) early-terminate at
+        -- LIMIT with no temp B-tree. Re-derivable like the rest of cache.db;
+        -- sync_cache keeps it honest (incremental UPSERT + flag-gated full
+        -- recompute) — migration 013 arms the one-time history backfill.
+        CREATE TABLE IF NOT EXISTS conversation_sessions (
+            session_id        TEXT NOT NULL PRIMARY KEY,
+            msg_count         INTEGER NOT NULL DEFAULT 0,
+            started_utc       TEXT,
+            last_activity_utc TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_conv_sessions_recent
+            ON conversation_sessions(last_activity_utc DESC, session_id DESC);
+
         CREATE TABLE IF NOT EXISTS codex_session_files (
             path             TEXT PRIMARY KEY,
             size_bytes       INTEGER NOT NULL,
@@ -3404,6 +3424,20 @@ def _012_create_conversation_ai_titles(conn: sqlite3.Connection) -> None:
     install stamps WITHOUT a populated history (its incremental walk fills the
     table as it ingests, and the consumed backfill no-ops). Mirrors 002/010/011."""
     _set_cache_meta(conn, "ai_titles_backfill_pending", "1")
+    conn.commit()
+
+
+@cache_migration("013_create_conversation_sessions")
+def _013_create_conversation_sessions(conn: sqlite3.Connection) -> None:
+    """Flag-only arm for the conversation_sessions browse-rail rollup. The table
+    is created by _apply_cache_schema (every open); this sets
+    conversation_sessions_backfill_pending so sync_cache does the one-time full
+    GROUP BY recompute under the cache.db.lock flock. No data work here — the
+    dispatcher's central stamp (#140) marks a complete handler; a fresh install
+    stamps WITHOUT running the handler, so the flag is NOT set there, which is
+    correct (empty messages -> empty rollup; the incremental UPSERT fills both in
+    lockstep). Mirrors 012."""
+    _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
     conn.commit()
 
 
