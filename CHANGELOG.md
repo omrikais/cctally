@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.1] - 2026-06-14
+
 ### Fixed
 - **Internal (test infra, no user-facing change): `bin/build-migrations-fixtures.py` now correctly stamps the 002/008 migration markers when regenerating their per-migration goldens.** Issue #140 moved the `schema_migrations` marker stamp out of the migration handlers and into the dispatcher's central `_stamp_applied`, but the 002 and 008 per-migration golden *builders* still assumed the handler self-stamped — `008_recompute_weekly_cost_snapshots_dedup_fix` stamped nothing and `002_conversation_messages_backfill` stamped via an `UPDATE` that silently matched zero rows — so a full builder regen wrote markerless `post.sqlite` files that broke `test_migration_002`/`008_per_migration_goldens` (the golden tests read the committed fixtures, so they never exercised the builder and never caught the drift; surfaced during #193). Both builders now apply the dispatcher's central stamp themselves with a pinned `applied_at_utc` (mirroring the handler tests), and the 008 builder runs the handler's eager cache-migration step against a throwaway copy instead of mutating the in-tree `pre-cache.sqlite`. The 008 goldens are regenerated to the new pinned stamp / clean pre-cache so the 008 scenario is now byte-idempotent on regen; the 002 marker already matched its committed value (its remaining whole-file churn vs HEAD is pre-existing `_apply_cache_schema` table drift, independent of this fix). A new `tests/test_build_migrations_fixtures_stamps_markers.py` exercises the builder directly (the coverage gap that let this ship). Nothing to do on upgrade (#194).
 
