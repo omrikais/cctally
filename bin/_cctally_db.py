@@ -2369,8 +2369,9 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         -- session_id and the recompute's GROUP BY already filters nulls. The
         -- index lets the only paginated ordering (recent) early-terminate at
         -- LIMIT with no temp B-tree. Re-derivable like the rest of cache.db;
-        -- sync_cache keeps it honest (incremental UPSERT + flag-gated full
-        -- recompute) — migration 013 arms the one-time history backfill.
+        -- sync_cache keeps it honest (scoped DELETE+INSERT re-derive +
+        -- flag-gated full recompute) — migration 013 arms the one-time
+        -- history backfill.
         CREATE TABLE IF NOT EXISTS conversation_sessions (
             session_id        TEXT NOT NULL PRIMARY KEY,
             msg_count         INTEGER NOT NULL DEFAULT 0,
@@ -3435,8 +3436,8 @@ def _013_create_conversation_sessions(conn: sqlite3.Connection) -> None:
     GROUP BY recompute under the cache.db.lock flock. No data work here — the
     dispatcher's central stamp (#140) marks a complete handler; a fresh install
     stamps WITHOUT running the handler, so the flag is NOT set there, which is
-    correct (empty messages -> empty rollup; the incremental UPSERT fills both in
-    lockstep). Mirrors 012."""
+    correct (empty messages -> empty rollup; the incremental DELETE+INSERT
+    re-derive fills both in lockstep). Mirrors 012."""
     _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
     conn.commit()
 

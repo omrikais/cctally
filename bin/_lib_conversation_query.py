@@ -357,6 +357,9 @@ def _session_latest_meta_map(conn, session_ids):
 # early-terminates at LIMIT with no temp B-tree; ``oldest`` scan-sorts the few
 # thousand rollup rows (microseconds). The live fallback re-expresses the SAME
 # orderings over conversation_messages aggregates via _SORTS_LIVE below.
+# When adding a sort key, add it to BOTH _SORTS and _SORTS_LIVE and exercise it
+# in test_conversation_rail_rollup_reconcile.py (its _dump asserts the test's
+# sort list covers exactly _SORTS.keys(), so a one-sided add fails loud).
 _SORTS = {
     "recent": "last_activity_utc DESC, session_id DESC",
     "oldest": "started_utc ASC, session_id ASC",

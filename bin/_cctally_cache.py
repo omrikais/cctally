@@ -1015,7 +1015,8 @@ def sync_cache(
 
         # Browse-rail rollup: accumulate the session_ids whose
         # conversation_messages this walk touched, so the post-walk recompute can
-        # scope its UPSERT to just those sessions (steady state). Pure Python —
+        # scope its DELETE+INSERT re-derive to just those sessions (steady
+        # state). Pure Python —
         # updated only AFTER each per-file conn.commit() below, never inside the
         # zero-write-lock read/parse region, so it adds no DML there.
         touched_sessions: set = set()
@@ -1230,8 +1231,9 @@ def sync_cache(
                 conn.commit()
                 stats.files_processed += 1
                 # Browse-rail rollup: record the session_ids this file just
-                # committed so the post-walk recompute can scope-UPSERT them.
-                # cr[0] is session_id per _conv_row_tuple's column order. Lands
+                # committed so the post-walk recompute can scope its DELETE+INSERT
+                # re-derive to them. cr[0] is session_id per _conv_row_tuple's
+                # column order. Lands
                 # AFTER the commit (pure Python; no DML, no extra write lock).
                 touched_sessions.update(cr[0] for cr in conv_rows if cr[0] is not None)
             except sqlite3.DatabaseError as exc:
@@ -1255,7 +1257,8 @@ def sync_cache(
         # so the next sync full-recomputes — never strands stale rollup rows
         # (Codex gate BLOCKER 1). Flag set -> full GROUP BY over all sessions
         # (rare, ~90ms), then drop the flag LAST (drop-it-last contract). Else ->
-        # scoped UPSERT over just the sessions this walk touched (steady state,
+        # scoped re-derive (DELETE+INSERT, not a SQL UPSERT) over just the
+        # sessions this walk touched (steady state,
         # ~1 session/tick). Both recomputes derive COUNT/MIN/MAX from the same
         # rows the rail's old live aggregate read, so the rollup stays
         # byte-identical to that aggregate.
@@ -1486,8 +1489,9 @@ def _resumable_reingest_conversation_messages(conn):
 # GROUP BY produced — in lockstep with conversation_messages so
 # GET /api/conversations renders a page without scanning the whole message
 # table. Maintained entirely inside sync_cache under the cache.db.lock flock:
-# the steady-state per-file loop is insert-only, so a scoped UPSERT over the
-# touched sessions suffices; the rare heavy/destructive paths (rebuild,
+# the steady-state per-file loop is insert-only, so a scoped re-derive
+# (DELETE+INSERT, not a SQL UPSERT) over the touched sessions suffices; the
+# rare heavy/destructive paths (rebuild,
 # truncation-escalation, #139 backfill, #179 reingest) set the durable
 # ``conversation_sessions_backfill_pending`` cache_meta flag (migration 013
 # arms it too) which forces one full recompute, crash-safe across a

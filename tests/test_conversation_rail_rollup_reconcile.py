@@ -33,6 +33,10 @@ from conftest import load_script, redirect_paths
 _MODEL = "claude-opus-4-8"
 
 # Both sorts × the four (limit, offset) combos from the Task-B baseline.
+# When adding a sort key, add it to BOTH _SORTS and _SORTS_LIVE in
+# _lib_conversation_query.py and exercise it here in
+# test_conversation_rail_rollup_reconcile.py. _dump() asserts this list covers
+# exactly cq._SORTS.keys(), so a key added to the module but not here fails loud.
 _COMBOS = [(50, 0), (5, 0), (5, 5), (2, 3)]
 _SORTS = ["recent", "oldest"]
 
@@ -129,6 +133,12 @@ def _cq(ns):
 def _dump(cq, conn):
     """All (sort, limit, offset) outputs as a JSON-canonical dict, so equality
     is the byte-identity the spec requires."""
+    # Desync guard: the hardcoded _SORTS must cover exactly the read path's sort
+    # keys, so a third sort added to cq._SORTS (and cq._SORTS_LIVE) but not
+    # exercised here fails loud instead of silently going unreconciled.
+    assert set(_SORTS) == set(cq._SORTS.keys()), (
+        f"_SORTS {_SORTS} out of sync with cq._SORTS {list(cq._SORTS.keys())}"
+    )
     out = {}
     for s in _SORTS:
         for (limit, offset) in _COMBOS:

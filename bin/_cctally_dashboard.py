@@ -269,7 +269,7 @@ class _QuietThreadingHTTPServer(ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def handle_error(self, request, client_address):  # noqa: D401
+    def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
         if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
             # Client hung up mid-response; benign on a local dashboard.

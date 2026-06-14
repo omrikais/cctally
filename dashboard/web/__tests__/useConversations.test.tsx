@@ -75,13 +75,36 @@ describe('useConversations — visibility gating', () => {
 
   beforeEach(() => {
     _resetForTests();
-    // Default: every /api/conversations fetch resolves with a single page.
-    fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify(mkPage(2)), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    );
+    // Default: every /api/conversations fetch resolves with a single page, but
+    // HONORS the AbortSignal — an aborted fetch rejects with an AbortError, like
+    // the real browser fetch. This is load-bearing for case (b): the hook's
+    // single-flight collapse works by aborting the prior controller, so a mock
+    // that resolved unconditionally would let BOTH burst fetches complete and
+    // make the "exactly one completes" assertion vacuous.
+    fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(
+      (_url: unknown, init?: { signal?: AbortSignal }) =>
+        new Promise<Response>((resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            reject(new DOMException('Aborted', 'AbortError'));
+            return;
+          }
+          signal?.addEventListener('abort', () => {
+            reject(new DOMException('Aborted', 'AbortError'));
+          });
+          // Resolve on a microtask so a same-tick abort (the burst's first
+          // fetch) loses to the abort listener before the body is produced.
+          queueMicrotask(() => {
+            if (signal?.aborted) return;
+            resolve(
+              new Response(JSON.stringify(mkPage(2)), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              }),
+            );
+          });
+        }),
+    ) as unknown as ReturnType<typeof vi.spyOn>;
     setVisibility('visible');
   });
 
@@ -107,7 +130,7 @@ describe('useConversations — visibility gating', () => {
     expect(railFetchCount(fetchSpy)).toBe(0);
   });
 
-  it('(b) issues exactly one completing fetch on the hidden→visible transition', async () => {
+  it('(b) collapses a refocus burst to exactly one completing fetch', async () => {
     // Mount while hidden so no mount fetch fires.
     setVisibility('hidden');
     const { rerender } = renderHook(() => useConversations());
@@ -115,30 +138,38 @@ describe('useConversations — visibility gating', () => {
     expect(railFetchCount(fetchSpy)).toBe(0);
     fetchSpy.mockClear();
 
-    // Flip to visible and dispatch the browser's visibilitychange event.
+    // Flip to visible, then issue a GENUINE refocus burst in ONE act: the
+    // visibilitychange listener AND a fresh SSE tick (new generated_at) BOTH
+    // call loadFirstPage. Two fetches get ISSUED; the hook's shared
+    // AbortController aborts the first so exactly one COMPLETES into setRows.
     setVisibility('visible');
-    act(() => { document.dispatchEvent(new Event('visibilitychange')); });
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      updateSnapshot(mkSnap('2026-06-14T10:00:01Z'));
+    });
     rerender();
 
-    // A burst may ISSUE several fetches; the shared AbortController aborts all
-    // but the last, so exactly one COMPLETES (resolves into setRows).
-    await waitFor(() => expect(railFetchCount(fetchSpy)).toBeGreaterThanOrEqual(1));
+    // The burst must ISSUE more than one fetch (otherwise there's nothing to
+    // collapse and the test would be vacuous).
+    await waitFor(() => expect(railFetchCount(fetchSpy)).toBeGreaterThanOrEqual(2));
+
+    // ... but exactly ONE survives the abort and resolves a body (the others
+    // reject with AbortError under the signal-honoring mock). That surviving
+    // count is the single-flight collapse the spec targets.
     let completed = 0;
     await act(async () => {
       await Promise.all(
         fetchSpy.mock.results.map(async (r: { value: unknown }) => {
           try {
             const resp = await (r.value as Promise<Response>);
-            // A fetch "completes" for our purposes when its body is consumed by
-            // the hook; here we just confirm at least one response resolved ok.
             if (resp.ok) completed += 1;
           } catch {
-            /* aborted */
+            /* aborted — did not complete */
           }
         }),
       );
     });
-    expect(completed).toBeGreaterThanOrEqual(1);
+    expect(completed).toBe(1);
   });
 
   it('(c) does not refetch page 1 on a render that leaves generated_at unchanged', async () => {
