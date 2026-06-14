@@ -263,6 +263,57 @@ def parse_message_row(obj, offset):
     return _normalize(obj, t, offset)
 
 
+class AiTitleRow:
+    """Pure per-line AI-title record (no I/O). Parallels MessageRow but for the
+    main-session ``{"type":"ai-title","aiTitle":...,"sessionId":...}`` lines that
+    parse_message_row drops (type not in user/assistant). #193."""
+    __slots__ = ("session_id", "ai_title", "byte_offset")
+
+    def __init__(self, session_id, ai_title, byte_offset):
+        self.session_id = session_id
+        self.ai_title = ai_title
+        self.byte_offset = byte_offset
+
+
+def parse_ai_title(obj, offset):
+    """Return an AiTitleRow when ``obj`` is an ai-title line with BOTH a non-empty
+    string sessionId and a non-empty string aiTitle, else None. Skips the null /
+    blank rewrites CC emits as the title evolves, and any malformed line. #193."""
+    if obj.get("type") != "ai-title":
+        return None
+    sid = obj.get("sessionId")
+    title = obj.get("aiTitle")
+    if not (isinstance(sid, str) and sid.strip()):
+        return None
+    if not (isinstance(title, str) and title.strip()):
+        return None
+    return AiTitleRow(sid, title, offset)
+
+
+def iter_ai_titles(fh, path_str):
+    """Yield AiTitleRow for each ai-title line from ``fh``'s current position.
+    Mirrors iter_message_rows: caller owns the open file handle; pure parse.
+    ``path_str`` is accepted for signature-parity (ai-title rows don't use it)."""
+    while True:
+        offset = fh.tell()
+        line = fh.readline()
+        if not line:
+            return
+        if not line.endswith("\n"):
+            fh.seek(offset)
+            return
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        row = parse_ai_title(obj, offset)
+        if row is not None:
+            yield row
+
+
 def _normalize(obj, t, offset):
     msg = obj.get("message")
     if not isinstance(msg, dict):

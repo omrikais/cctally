@@ -989,3 +989,32 @@ def test_p1b_bash_echo_with_command_args_substring_not_promoted():
                              "content": "<bash-input>echo '<command-args>x</command-args>'</bash-input>"}})
     r = list(lc.iter_message_rows(fh, "f"))[0]
     assert r.entry_type == lc.META and r.text == ""
+
+
+# ---------------------------------------------------------------------------
+# #193: ai-title parser (parse_ai_title + iter_ai_titles)
+# ---------------------------------------------------------------------------
+
+def test_parse_ai_title_accepts_nonempty():
+    row = lc.parse_ai_title({"type": "ai-title", "aiTitle": "My Title", "sessionId": "s1"}, 42)
+    assert row is not None
+    assert (row.session_id, row.ai_title, row.byte_offset) == ("s1", "My Title", 42)
+
+
+def test_parse_ai_title_rejects_null_blank_and_non_aititle():
+    assert lc.parse_ai_title({"type": "ai-title", "aiTitle": None, "sessionId": "s1"}, 0) is None
+    assert lc.parse_ai_title({"type": "ai-title", "aiTitle": "  ", "sessionId": "s1"}, 0) is None
+    assert lc.parse_ai_title({"type": "ai-title", "aiTitle": "T", "sessionId": ""}, 0) is None
+    assert lc.parse_ai_title({"type": "ai-title", "aiTitle": "T"}, 0) is None          # no sessionId
+    assert lc.parse_ai_title({"type": "assistant", "aiTitle": "T", "sessionId": "s"}, 0) is None
+
+
+def test_iter_ai_titles_yields_in_file_order():
+    fh = io.StringIO(
+        '{"type":"ai-title","aiTitle":"first","sessionId":"s1"}\n'
+        '{"type":"user","uuid":"u1","message":{"content":"hi"}}\n'
+        '{"type":"ai-title","aiTitle":null,"sessionId":"s1"}\n'
+        '{"type":"ai-title","aiTitle":"second","sessionId":"s1"}\n'
+    )
+    titles = [r.ai_title for r in lc.iter_ai_titles(fh, "s.jsonl")]
+    assert titles == ["first", "second"]   # null skipped; file order preserved
