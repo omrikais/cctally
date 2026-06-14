@@ -352,18 +352,70 @@ def _session_latest_meta_map(conn, session_ids):
     return meta
 
 
+# Rail sort keys, in the rollup table's STRUCTURAL columns (Task A). ``recent``
+# rides idx_conv_sessions_recent(last_activity_utc DESC, session_id DESC) and
+# early-terminates at LIMIT with no temp B-tree; ``oldest`` scan-sorts the few
+# thousand rollup rows (microseconds). The live fallback re-expresses the SAME
+# orderings over conversation_messages aggregates via _SORTS_LIVE below.
 _SORTS = {
+    "recent": "last_activity_utc DESC, session_id DESC",
+    "oldest": "started_utc ASC, session_id ASC",
+}
+
+# The matching ORDER BY for the live GROUP BY fallback: the rollup's
+# last_activity_utc IS MAX(timestamp_utc) and started_utc IS MIN(timestamp_utc),
+# so the two branches paginate in byte-identical order (the load-bearing
+# invariant). Keep this table in lockstep with _SORTS.
+_SORTS_LIVE = {
     "recent": "MAX(timestamp_utc) DESC, session_id DESC",
     "oldest": "MIN(timestamp_utc) ASC, session_id ASC",
 }
 
 
-def list_conversations(conn, *, sort="recent", limit=50, offset=0) -> dict:
-    """All-history per-session browse rows (spec §3.1). NOT 365-day bounded."""
-    order = _SORTS.get(sort, _SORTS["recent"])
-    limit = max(1, min(int(limit), 200))
-    offset = max(0, int(offset))
-    rows = conn.execute(
+def _rollup_authoritative(conn) -> bool:
+    """True when the conversation_sessions rollup is authoritative — i.e. the
+    durable ``conversation_sessions_backfill_pending`` flag is NOT set, so the
+    rollup has been fully recomputed and the fast read is safe.
+
+    Returns True (authoritative) when the flag is absent, including the case
+    where cache_meta does not exist at all (a path-less / schema-not-applied or
+    in-memory connection). This mirrors Task A's
+    _conversation_sessions_backfill_pending OperationalError degrade-to-False —
+    here that means "no pending flag" -> authoritative -> read the rollup. A
+    populated cache.db always has cache_meta, so this only affects bare conns."""
+    try:
+        pending = conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='conversation_sessions_backfill_pending'"
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        return True
+    return not pending
+
+
+def _list_session_rows_rollup(conn, order, limit, offset):
+    """FAST path: read the pre-aggregated rail rows straight from the
+    conversation_sessions rollup (spec §3). No GROUP BY, no temp B-tree for the
+    ``recent`` sort. Returns (session_id, msg_count, started, last_activity)
+    tuples — the same shape the live aggregate yields, so the downstream
+    assembly is identical. No WHERE is needed: the rollup is non-null by
+    construction (PK NOT NULL; the recompute's GROUP BY already drops NULLs)."""
+    return conn.execute(
+        "SELECT session_id, msg_count, "
+        "       started_utc AS started, last_activity_utc AS last_activity "
+        "FROM conversation_sessions "
+        "ORDER BY " + order + " LIMIT ? OFFSET ?",
+        (limit + 1, offset),
+    ).fetchall()
+
+
+def _list_session_rows_live(conn, order, limit, offset):
+    """RETAINED fallback (Codex gate BLOCKER 2): the original live GROUP BY over
+    conversation_messages, used while the rollup is not authoritative (the flag
+    is set — e.g. an existing install before its first sync, or permanently
+    under ``--no-sync``). Byte-identical output to the rollup branch by
+    construction; ``order`` here is the _SORTS_LIVE aggregate expression."""
+    return conn.execute(
         "SELECT session_id, COUNT(*) AS msg_count, "
         "       MIN(timestamp_utc) AS started, MAX(timestamp_utc) AS last_activity "
         "FROM conversation_messages "
@@ -372,6 +424,33 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0) -> dict:
         "ORDER BY " + order + " LIMIT ? OFFSET ?",
         (limit + 1, offset),
     ).fetchall()
+
+
+def list_conversations(conn, *, sort="recent", limit=50, offset=0) -> dict:
+    """All-history per-session browse rows (spec §3.1). NOT 365-day bounded.
+
+    Reads the conversation_sessions rollup (Task A) when it is authoritative —
+    i.e. the durable ``conversation_sessions_backfill_pending`` flag is clear —
+    which lets the ``recent`` sort early-terminate on idx_conv_sessions_recent
+    with no full-table aggregate. While the flag is set (an existing install
+    before its first sync consumes the backfill, or permanently under
+    ``--no-sync``), it falls back to the RETAINED live GROUP BY over
+    conversation_messages — correct, possibly slower, never an empty rail.
+
+    The two branches are byte-identical for every (sort, limit, offset): the
+    rollup recomputes the same COUNT/MIN/MAX over the same rows, and the
+    fallback IS the old aggregate (pinned by the reconcile test over both
+    branches). Staleness bound: at most one sync tick (~5s) if a session gains
+    messages on the exact tick the rail reads — cosmetic only, and the rail
+    revalidates every visible tick anyway."""
+    limit = max(1, min(int(limit), 200))
+    offset = max(0, int(offset))
+    if _rollup_authoritative(conn):
+        order = _SORTS.get(sort, _SORTS["recent"])
+        rows = _list_session_rows_rollup(conn, order, limit, offset)
+    else:
+        order = _SORTS_LIVE.get(sort, _SORTS_LIVE["recent"])
+        rows = _list_session_rows_live(conn, order, limit, offset)
     has_more = len(rows) > limit
     rows = rows[:limit]
     session_ids = [r[0] for r in rows]

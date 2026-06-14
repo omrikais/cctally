@@ -1,6 +1,7 @@
 import sqlite3, sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _cctally_db as db
+import _cctally_cache as cc
 import _lib_conversation_query as cq
 
 # A real model id from CLAUDE_MODEL_PRICING so token-derived cost is genuinely
@@ -14,6 +15,19 @@ def _conn():
     c = sqlite3.connect(":memory:")
     db._apply_cache_schema(c)
     return c
+
+
+def _list_conversations(c, **kw):
+    """list_conversations with the browse-rail rollup populated first, so these
+    direct-seed tests exercise the FAST rollup read path (the production read
+    when conversation_sessions is authoritative) rather than only the live
+    GROUP-BY fallback. In production sync_cache maintains the rollup; here we
+    direct-insert conversation_messages and never run sync_cache, so we recompute
+    it explicitly. No backfill flag is armed, so _rollup_authoritative is True
+    and list_conversations reads conversation_sessions (the production fast
+    path)."""
+    cc._recompute_conversation_sessions(c)
+    return cq.list_conversations(c, **kw)
 
 
 def _msg(c, **kw):
@@ -77,7 +91,7 @@ def test_list_conversations_groups_by_session_with_cost():
     _msg(c, session_id="s2", uuid="h2", source_path="b.jsonl", byte_offset=0,
          timestamp_utc="2026-06-02T00:00:00Z", entry_type="human", text="yo",
          cwd="/home/u/other")
-    out = cq.list_conversations(c, sort="recent", limit=50, offset=0)
+    out = _list_conversations(c, sort="recent", limit=50, offset=0)
     rows = out["conversations"]
     assert [r["session_id"] for r in rows] == ["s2", "s1"]          # recent first
     s1 = next(r for r in rows if r["session_id"] == "s1")
@@ -96,11 +110,11 @@ def test_list_conversations_pagination():
         _msg(c, session_id=f"s{i}", uuid=f"u{i}", source_path=f"{i}.jsonl",
              byte_offset=0, timestamp_utc=f"2026-06-0{i+1}T00:00:00Z",
              entry_type="human", text="x")
-    page = cq.list_conversations(c, sort="recent", limit=2, offset=0)
+    page = _list_conversations(c, sort="recent", limit=2, offset=0)
     assert len(page["conversations"]) == 2
     assert page["page"]["has_more"] is True
     assert page["page"]["next_offset"] == 2
-    last = cq.list_conversations(c, sort="recent", limit=2, offset=4)
+    last = _list_conversations(c, sort="recent", limit=2, offset=4)
     assert len(last["conversations"]) == 1
     assert last["page"]["has_more"] is False
 
@@ -834,7 +848,7 @@ def test_list_conversations_includes_title_with_fallback():
     _msg(c, session_id="s2", uuid="a2", source_path="b.jsonl", byte_offset=0,
          timestamp_utc="2026-06-02T00:00:00Z", entry_type="assistant",
          text="hi", model=_MODEL, msg_id="m2", req_id="r2", cwd="/home/u/other")
-    rows = cq.list_conversations(c)["conversations"]
+    rows = _list_conversations(c)["conversations"]
     s1 = next(r for r in rows if r["session_id"] == "s1")
     s2 = next(r for r in rows if r["session_id"] == "s2")
     assert s1["title"] == "design the rail title"
@@ -1230,7 +1244,7 @@ def test_meta_row_excluded_from_session_title():
     _msg(c, session_id="s", uuid="h1", source_path="/p/s.jsonl", byte_offset=1,
          timestamp_utc="t2", entry_type="human", text="Resolve the cache bug",
          blocks_json=_meta_blocks("Resolve the cache bug"))
-    title = cq.list_conversations(c)["conversations"][0]["title"]
+    title = _list_conversations(c)["conversations"][0]["title"]
     assert title == "Resolve the cache bug"
 
 
@@ -1246,7 +1260,7 @@ def test_pre_reingest_human_skill_body_skipped_as_title_while_pending():
     _msg(c, session_id="s", uuid="h1", source_path="/p/s.jsonl", byte_offset=1,
          timestamp_utc="t2", entry_type="human", text="Resolve the cache bug",
          blocks_json=_meta_blocks("Resolve the cache bug"))
-    title = cq.list_conversations(c)["conversations"][0]["title"]
+    title = _list_conversations(c)["conversations"][0]["title"]
     assert title == "Resolve the cache bug"
 
 
@@ -2748,7 +2762,7 @@ def test_title_skips_compaction_first_row_and_strips_remote_control():
     _msg(c, session_id="B", uuid="b1", source_path="b.jsonl", byte_offset=0,
          timestamp_utc="2026-06-02T00:00:00Z", entry_type="human", text=rc,
          blocks_json=_json191.dumps([{"kind": "text", "text": rc}]))
-    titles = {cv["session_id"]: cv["title"] for cv in cq.list_conversations(c)["conversations"]}
+    titles = {cv["session_id"]: cv["title"] for cv in _list_conversations(c)["conversations"]}
     assert titles["A"] == "the real first prompt"
     assert titles["B"] == "Merge to main."
 

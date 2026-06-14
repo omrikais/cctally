@@ -87,6 +87,13 @@ from _fixture_builders import (  # noqa: E402
     seed_session_file,
     stamp_all_stats_migrations_applied,
 )
+# The browse-rail rollup is populated by sync_cache in production, but this
+# builder direct-inserts conversation_messages and never calls sync_cache — so
+# we recompute the rollup here (full; flag stays clear) after seeding. Without
+# this the fixture's conversation_sessions table would be empty and the rail
+# read would exercise only the live-GROUP-BY fallback, never the fast rollup
+# path that the harness is meant to cover.
+from _cctally_cache import _recompute_conversation_sessions  # noqa: E402
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests/fixtures/conversation"
 
@@ -683,6 +690,14 @@ def build(scenario: str) -> None:
                 "(session_id, ai_title, source_path, byte_offset) VALUES (?,?,?,?)",
                 (_sid, _title, _src, _off),
             )
+
+        # Populate the browse-rail rollup from the seeded conversation_messages
+        # (full recompute; the backfill flag is NOT armed here, so the rail read
+        # treats this rollup as authoritative and exercises the FAST path). Runs
+        # BEFORE the commit/close so it persists; the create_cache_db atexit hook
+        # zeros the SQLite writer-version bytes AFTER this, keeping the committed
+        # fixture byte-stable.
+        _recompute_conversation_sessions(cache_conn)
 
         # Empty stats.db stamped fully-migrated (dashboard-fixtures posture):
         # the dashboard server opens it at boot even though the conversation

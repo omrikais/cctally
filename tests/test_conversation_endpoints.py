@@ -74,6 +74,13 @@ def _seed_cache(ns):
     _msg(session_id="s2", uuid="h2", source_path="b.jsonl", byte_offset=0,
          timestamp_utc="2026-06-02T00:00:00Z", entry_type="human",
          text="how do I budget my weekly usage", cwd="/home/u/other")
+    # Populate the browse-rail rollup from the seeded messages (full recompute;
+    # no backfill flag armed) so the booted handler's /api/conversations read
+    # exercises the FAST rollup path. sync_cache does this in production, but
+    # this test direct-seeds and never runs it. The bin/ dir is on sys.path by
+    # the time _boot calls _seed_cache, so the import resolves.
+    import _cctally_cache as _cc
+    _cc._recompute_conversation_sessions(cache)
     cache.commit()
     cache.close()
 
