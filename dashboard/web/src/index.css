@@ -6163,6 +6163,22 @@ mark.current {
 @media (prefers-reduced-motion: reduce) {
   .conv-item-actions { transition: none; }
 }
+/* #192 — a HUMAN bubble floats its copy/permalink actions into the bordered
+   box's top-right corner instead of reserving an always-present (but
+   opacity:0) flow row. A short one-line "You" prompt otherwise carried that
+   row's full height (~button + 6px margin) as visible dead space below its text
+   inside the box. Absolute positioning removes the reserved height so the
+   bubble wraps tightly to its prose; the buttons reveal on hover in the head
+   row's empty right side (never overlapping the prose, which starts below the
+   head). Scoped to --human: the assistant/meta variants keep the in-flow row —
+   their cost footer / disclosure chrome fills that space, so there's no gap to
+   reclaim and an absolute row would collide with the footer. */
+.conv-item--human .conv-item-actions {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  margin-top: 0;
+}
 
 /* Per-turn permalink on the tool-result / system-marker chip summary rows
    (#174): right-aligned, hover/focus/keyboard-cursor revealed — same gate as

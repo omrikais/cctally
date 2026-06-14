@@ -288,10 +288,24 @@ export function OutlinePanel({
     });
   };
 
+  // The set of uuids that are THEMSELVES outline entries (prompts + curated
+  // landmarks, including subagent bucket-root uuids). Used to suppress the
+  // section-prompt fallback below when the cursor already matches an exact entry.
+  const entryUuids = useMemo(() => new Set(entries.map((e) => e.uuid)), [entries]);
+
   // The section prompt uuid the scroll-sync cursor currently sits inside (via
-  // sectionByUuid). Used to highlight the always-meaningful spine prompt even
-  // when the topmost rendered element is a folded fragment or sidechain turn.
-  const currentSection = currentUuid != null ? sectionByUuid.get(currentUuid) ?? null : null;
+  // sectionByUuid). Used to highlight the always-meaningful spine prompt when the
+  // topmost rendered element is a folded fragment or sidechain turn that is NOT
+  // itself a landmark. #192 — gate on the cursor NOT being an entry: when it IS
+  // (a subagent / heading / plan landmark, e.g. a trailing subagent card that
+  // stays topmost-visible after a scroll), the exact-match clause already lights
+  // that entry, so resolving a section here would ALSO light the spine prompt —
+  // the user-reported double-mark. A non-entry cursor (generic prose / folded
+  // fragment / sidechain member) still resolves its section prompt as before.
+  const currentSection =
+    currentUuid != null && !entryUuids.has(currentUuid)
+      ? sectionByUuid.get(currentUuid) ?? null
+      : null;
 
   // Auto-scroll the aria-current entry into view in the panel. Keyed on the
   // effective selection (pin wins over the scroll-sync cursor) so a pin change —

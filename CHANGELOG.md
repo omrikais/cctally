@@ -5,6 +5,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Conversation viewer: a short single-line "You" prompt no longer shows an empty gap below its text — the per-message copy/permalink actions (previously an always-reserved but hidden-until-hover row that padded the bottom of the bordered box) now float into the bubble's top-right corner, so the box hugs its prose; assistant turns are unchanged (#192).
+- Conversation viewer: the outline no longer highlights two entries at once when you scroll onto a landmark inside a prompt's section — a subagent card, a section heading, or a plan/question (most visible when a subagent is the last outline entry) — it now marks only that exact landmark instead of also lighting the enclosing "You" prompt, while scrolling onto ordinary prose still highlights its section prompt as before (#192).
+
 ## [1.43.2] - 2026-06-13
 
 ### Added

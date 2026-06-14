@@ -194,7 +194,12 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
     expect(current[0].textContent).toContain('prompt'); // the section prompt
   });
 
-  it('aria-current also lands on an exact landmark entry uuid match', () => {
+  // #192 — when the scroll-sync cursor lands on a turn that IS ITSELF an outline
+  // entry (a landmark — heading / plan / subagent), aria-current marks ONLY that
+  // exact entry; the section-prompt fallback no longer ALSO lights the spine
+  // prompt. Previously both were marked (the user-reported double-mark): a single
+  // current item is the correct aria semantics and the intended behavior.
+  it('a landmark cursor marks ONLY the exact landmark entry (no section-prompt double-mark)', () => {
     const o = outline({
       turns: [
         turn({ uuid: 'h1', kind: 'human', label: 'prompt' }),
@@ -204,9 +209,32 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
     dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'a1' });
     const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
     const current = container.querySelectorAll('[aria-current="true"]');
-    // h1 (section of a1) AND a1 (exact landmark). Both legitimately current.
-    const texts = Array.from(current).map((c) => c.textContent);
-    expect(texts.some((t) => t?.includes('A heading'))).toBe(true);
+    expect(current.length).toBe(1);
+    expect(current[0].textContent).toContain('A heading'); // exactly a1, not the h1 prompt
+  });
+
+  // #192 — the headline bug: a subagent is the LAST outline element. After a
+  // click + free scroll the pin clears and the subagent card stays the
+  // topmost-visible turn, reporting its bucket-root uuid to scroll-sync. The
+  // subagent entry's uuid IS that bucket-root, so the exact match lights it —
+  // but the section-prompt fallback must NOT also light the trailing "You"
+  // prompt of its section. Exactly one aria-current, on the subagent.
+  it('a trailing subagent cursor marks ONLY the subagent, not the section prompt (free scroll, no pin)', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'last prompt' }),
+        // a subagent bucket whose root member is 'sa1' (the card's data-uuid).
+        turn({ uuid: 'sa1', kind: 'human', label: 'task', subagent_key: 'k1', is_sidechain: true }),
+        turn({ uuid: 'sa2', kind: 'assistant', label: 'work', subagent_key: 'k1', is_sidechain: true }),
+      ],
+    });
+    // Free scroll, no pin: the subagent card is the topmost-visible element and
+    // reports its bucket-root uuid 'sa1'.
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'sa1' });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const current = container.querySelectorAll('[aria-current="true"]');
+    expect(current.length).toBe(1);
+    expect(current[0].classList.contains('conv-outline-entry--subagent')).toBe(true);
   });
 
   it('clicking an entry dispatches OPEN_CONVERSATION with the jump anchor', () => {
