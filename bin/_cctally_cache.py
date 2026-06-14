@@ -224,19 +224,23 @@ def _conv_row_tuple(m, path_str):
 
 def _iter_sync_entries(fh, path_str):
     """Fused single-pass sync walker (#138). Yields
-    ``(byte_offset, cost_or_None, msgrow_or_None)`` for each JSONL line from
-    ``fh``'s current position that produces a cost entry and/or a conversation
-    message row.
+    ``(byte_offset, cost_or_None, msgrow_or_None, aititle_or_None)`` for each
+    JSONL line from ``fh``'s current position that produces a cost entry, a
+    conversation message row, and/or an ai-title record.
 
     Each line is read once (readline()+tell()) and ``json.loads``-parsed ONCE,
-    then classified by both pure per-line parsers:
+    then classified by the pure per-line parsers (#138 one-parse-per-line stays
+    intact — ``parse_ai_title`` runs on the SAME already-parsed ``obj``):
 
       * ``cost_or_None`` is ``(UsageEntry, msg_id, req_id)`` when the line is a
         billable assistant entry (``_lib_jsonl.parse_cost_entry``), else None.
       * ``msgrow_or_None`` is a ``MessageRow`` when the line is a user/assistant
         turn carrying a uuid (``_lib_conversation.parse_message_row``), else None.
+      * ``aititle_or_None`` is an ``AiTitleRow`` when the line is an ai-title
+        carrying a non-empty sessionId+aiTitle (#193), else None.
 
-    The two are independent — a normal assistant line yields both. This replaces
+    The three are independent — a normal assistant line yields the first two;
+    an ai-title line (a non-user/assistant type) yields only the third. This replaces
     the former cost walk + re-seek-and-walk over the identical byte span: with a
     single walk the "identical span" invariant is structural (one stop point),
     not a prose-enforced ``mrow.byte_offset >= final_offset`` runtime break. A
@@ -264,8 +268,9 @@ def _iter_sync_entries(fh, path_str):
             continue
         cost = _lib_jsonl.parse_cost_entry(obj, path_str)
         mrow = _lib_conversation.parse_message_row(obj, offset)
-        if cost is not None or mrow is not None:
-            yield offset, cost, mrow
+        ai = _lib_conversation.parse_ai_title(obj, offset)
+        if cost is not None or mrow is not None or ai is not None:
+            yield offset, cost, mrow, ai
 
 
 def _iter_claude_jsonl_files():
@@ -1020,6 +1025,7 @@ def sync_cache(
             # so a slow JSONL doesn't hold a SQLite lock.
             rows: list[tuple[Any, ...]] = []
             conv_rows: list[tuple[Any, ...]] = []
+            ai_rows: list[tuple[Any, ...]] = []   # #193: ai-title upserts
             final_offset = start_offset
             try:
                 with open(jp, "r", encoding="utf-8", errors="replace") as fh:
@@ -1031,7 +1037,7 @@ def sync_cache(
                     # walk over the identical span — the "identical span"
                     # invariant is now structural (a single stop point) rather
                     # than a prose-enforced ``>= final_offset`` runtime break.
-                    for offset, cost, mrow in _iter_sync_entries(fh, path_str):
+                    for offset, cost, mrow, ai in _iter_sync_entries(fh, path_str):
                         if cost is not None:
                             entry, msg_id, req_id = cost
                             usage = entry.usage
@@ -1059,6 +1065,11 @@ def sync_cache(
                             ))
                         if mrow is not None:
                             conv_rows.append(_conv_row_tuple(mrow, path_str))
+                        if ai is not None:
+                            # #193: accumulate ai-title upserts in file order; the
+                            # executemany below applies them after conv_rows.
+                            ai_rows.append((ai.session_id, ai.ai_title,
+                                            path_str, ai.byte_offset))
                     # ``final_offset`` is the single walk's stop — captured AFTER
                     # the loop drains (or rewinds a partial mid-write tail line).
                     # It is what session_files.last_byte_offset is written from,
@@ -1159,6 +1170,10 @@ def sync_cache(
                 # (parallel to the cost path's lifecycle).
                 if conv_rows:
                     conn.executemany(_CONV_INSERT_SQL, conv_rows)
+                # #193: ai-title upserts for this file, in file order (last wins).
+                # Committed atomically with the session_files cursor below.
+                if ai_rows:
+                    conn.executemany(_AI_TITLE_UPSERT_SQL, ai_rows)
                 # UPSERT preserves session_id / project_path columns populated
                 # by _ensure_session_files_row at the top of this loop. A plain
                 # INSERT OR REPLACE would wipe them on every changed-file sync.

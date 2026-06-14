@@ -281,9 +281,10 @@ def _conv_rows(conn):
 
 def test_iter_sync_entries_parses_each_line_once(monkeypatch):
     """#138 acceptance: the fused walker parses each JSONL line exactly once
-    (one json.loads per line), yielding a (offset, cost, msgrow) triple per
-    productive line. The pre-#138 design walked the delta byte range TWICE
-    (cost walk then conversation seek-and-walk), parsing every line twice."""
+    (one json.loads per line), yielding a (offset, cost, msgrow, aititle) tuple
+    per productive line. The pre-#138 design walked the delta byte range TWICE
+    (cost walk then conversation seek-and-walk), parsing every line twice. #193:
+    parse_ai_title runs on the SAME already-parsed obj — still one parse/line."""
     import io
     import _cctally_cache as cache
     body = (_asst_line("a1", "m1", "r1", "one")
@@ -303,17 +304,18 @@ def test_iter_sync_entries_parses_each_line_once(monkeypatch):
 
     assert calls["n"] == 3, f"one json.loads per line expected, got {calls['n']}"
     assert len(out) == 3
-    o0, c0, m0 = out[0]
-    o1, c1, m1 = out[1]
-    o2, c2, m2 = out[2]
+    o0, c0, m0, t0 = out[0]
+    o1, c1, m1, t1 = out[1]
+    o2, c2, m2, t2 = out[2]
     # assistant lines yield BOTH a cost tuple and a message row; user line is
-    # a message row only.
+    # a message row only. None of these are ai-title lines.
     assert c0 is not None and m0 is not None and m0.entry_type == "assistant"
     assert c1 is None and m1 is not None and m1.entry_type == "human"
     assert c2 is not None and m2 is not None
+    assert t0 is None and t1 is None and t2 is None
     # cost tuple shape is (UsageEntry, msg_id, req_id)
     assert c0[1] == "m1" and c0[2] == "r1"
-    # offsets are byte-accurate and strictly increasing; the triple's offset
+    # offsets are byte-accurate and strictly increasing; the tuple's offset
     # equals the message row's own byte_offset.
     assert o0 == 0 and o1 == m1.byte_offset and o2 == m2.byte_offset
     assert o0 < o1 < o2
@@ -1344,3 +1346,39 @@ def test_strip_ansi_handles_osc_and_lone_esc():
     # empty / None passthrough
     assert _strip_ansi("") == ""
     assert _strip_ansi(None) is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #193 Task 3: incremental fused-walk ai-title population (real sync_cache)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _ai_title_line(title, *, session_id="s1"):
+    return json.dumps({"type": "ai-title", "aiTitle": title,
+                       "sessionId": session_id}) + "\n"
+
+
+def test_sync_cache_populates_ai_titles_incrementally(isolated):
+    ns, conn, projects, sync = isolated
+    (projects / "sess.jsonl").write_text(
+        _user_line("u1", "hello")
+        + _ai_title_line("Generated Title", session_id="s1")
+    )
+    sync()
+    assert conn.execute(
+        "SELECT ai_title FROM conversation_ai_titles WHERE session_id='s1'"
+    ).fetchone()[0] == "Generated Title"
+
+
+def test_sync_cache_ai_title_last_non_null_wins_in_file(isolated):
+    ns, conn, projects, sync = isolated
+    (projects / "sess.jsonl").write_text(
+        _ai_title_line("First", session_id="s1")
+        + _user_line("u1", "hi")
+        + _ai_title_line(None, session_id="s1")   # null rewrite — dropped
+        + _ai_title_line("Second", session_id="s1")
+    )
+    sync()
+    assert conn.execute(
+        "SELECT ai_title FROM conversation_ai_titles WHERE session_id='s1'"
+    ).fetchone()[0] == "Second"
