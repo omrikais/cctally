@@ -1,27 +1,34 @@
-"""Regression guard for ``bin/build-migrations-fixtures.py`` (issue #194).
+"""Regression guards for the per-migration golden builders (issues #194, #197).
 
-The per-migration golden builders call the production migration handler
-directly (no copy-paste drift). Issue #140 moved the ``schema_migrations``
-marker stamp OUT of the handlers and into the dispatcher's central
-``_stamp_applied`` — so a builder that only calls ``handler(conn)`` no longer
-produces the marker. The 002 builder stamped via an ``UPDATE`` that silently
-matched zero rows post-#140; the 008 builder stamped nothing at all. A full
-``build-migrations-fixtures.py`` regen therefore wrote markerless ``post.sqlite``
-goldens, silently breaking ``test_migration_002`` / ``test_migration_008``
-per-migration goldens — but ONLY on a regen, because those tests read the
-COMMITTED fixtures and never exercise the builder.
+Two distinct drift classes both surface ONLY on a builder regen, because the
+per-migration golden tests read the COMMITTED fixtures and never exercise the
+builders:
 
-This guard exercises the builder itself: it rebuilds the 002 and 008 goldens
-into a throwaway dir and asserts
+#194 — marker presence. Issue #140 moved the ``schema_migrations`` marker stamp
+OUT of the handlers and into the dispatcher's central ``_stamp_applied``. A
+builder that only calls ``handler(conn)`` no longer produces the marker; a full
+regen wrote markerless ``post.sqlite`` goldens and silently broke
+``test_migration_002`` / ``test_migration_008``. The ``test_builder_*_carries_marker``
+tests below exercise the builder itself to catch that.
 
-  * ``post.sqlite`` carries the migration's marker (the dispatcher's stamp,
-    applied by the builder to mirror the handler tests), and
-  * the 008 ``pre-cache.sqlite`` sidecar stays a clean pre-008 state (only the
-    001 marker) — proving the builder runs the handler's eager cache-migration
-    step against a COPY, never mutating the in-tree fixture.
+#197 — byte idempotency. The conversation cache goldens build ``pre.sqlite`` via
+``_cctally_db._apply_cache_schema``, which always emits the CURRENT full cache
+schema — so as later migrations add tables / reshape the FTS5 index, the
+committed goldens silently fell behind, and a full regen rewrote them with a
+different on-disk schema. Combined with cache 001's wall-clock self-stamp (the
+#140 carve-out) and builder schema evolution (e.g. the #181 ``speed`` column),
+a full regen dirtied ~24 committed goldens that the maintainer then had to
+hand-revert. The ``test_*_byte_idempotent`` tests below rebuild every
+builder-produced golden into a throwaway dir and assert it is byte-identical to
+the committed fixture (after normalizing the volatile SQLite writer-version
+header bytes 96-99). They fail LOUDLY at the commit that introduces drift,
+instead of letting it accumulate.
 
-Without these guards, the same drift would recur the next time the central
-marker/stamp convention changes under a builder that bypasses the dispatcher.
+Coverage note: 005/006 per-migration goldens have NO builder script (frozen
+artifacts hand-built once; their tests only READ them) and are not in the
+``_apply_cache_schema`` drift class (tiny explicit stats schemas), so they are
+intentionally out of the byte-idempotency guard — there is nothing to rebuild
+them against.
 """
 from __future__ import annotations
 
@@ -35,21 +42,43 @@ import pytest
 
 BIN_DIR = Path(__file__).resolve().parent.parent / "bin"
 BUILDER_PATH = BIN_DIR / "build-migrations-fixtures.py"
+BUILDER_009_010_PATH = BIN_DIR / "build-migration-009-010-fixtures.py"
+PER_MIGRATION_ROOT = (
+    Path(__file__).resolve().parent
+    / "fixtures" / "migrations" / "per-migration"
+)
+
+# Bytes 96-99 of the SQLite header carry SQLITE_VERSION_NUMBER (the
+# library write-version). _fixture_builders' atexit hook zeros them in the
+# COMMITTED fixtures; a freshly-built file inside a running test has NOT yet
+# been through that hook, so we zero the field in-memory on both sides before
+# comparing (mirrors _fixture_builders.normalize_sqlite_writer_version without
+# mutating the in-tree committed fixture).
+_WRITER_VERSION_OFFSET = 96
+
+
+def _load_module(name: str, path: Path):
+    if str(BIN_DIR) not in sys.path:
+        sys.path.insert(0, str(BIN_DIR))
+    spec = ilu.spec_from_file_location(name, path)
+    mod = ilu.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 @pytest.fixture(scope="module")
 def builder_module():
     """Import ``bin/build-migrations-fixtures.py`` so its per-migration build
     functions can be called against a tmp scenario dir."""
-    if str(BIN_DIR) not in sys.path:
-        sys.path.insert(0, str(BIN_DIR))
-    spec = ilu.spec_from_file_location(
-        "build_migrations_fixtures", BUILDER_PATH
-    )
-    mod = ilu.module_from_spec(spec)
-    sys.modules["build_migrations_fixtures"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    return _load_module("build_migrations_fixtures", BUILDER_PATH)
+
+
+@pytest.fixture(scope="module")
+def builder_009_010_module():
+    """Import ``bin/build-migration-009-010-fixtures.py`` (the second
+    per-migration builder, for the 009/010 recompute stats goldens)."""
+    return _load_module("build_migration_009_010_fixtures", BUILDER_009_010_PATH)
 
 
 def _has_marker(db_path: Path, name: str) -> bool:
@@ -73,6 +102,85 @@ def _markers(db_path: Path) -> list[str]:
         ]
     finally:
         conn.close()
+
+
+def _normalized_bytes(path: Path) -> bytes:
+    """Read *path* and zero the SQLite writer-version header field (bytes
+    96-99) in-memory, so two DBs built by different SQLite library versions
+    compare equal on everything BUT that version stamp."""
+    raw = bytearray(path.read_bytes())
+    if len(raw) >= _WRITER_VERSION_OFFSET + 4:
+        raw[_WRITER_VERSION_OFFSET:_WRITER_VERSION_OFFSET + 4] = b"\x00\x00\x00\x00"
+    return bytes(raw)
+
+
+def _discover_per_migration_builders(mod) -> dict:
+    """Map ``<scenario-dir-name> -> build fn`` for every
+    ``build_per_migration_*`` callable in *mod*. Auto-discovery means a future
+    builder is byte-guarded the moment it lands (no test edit), and the
+    scenario name is derived from the function name (the two are kept identical
+    by convention)."""
+    out = {}
+    prefix = "build_per_migration_"
+    for attr in dir(mod):
+        if attr.startswith(prefix) and callable(getattr(mod, attr)):
+            out[attr[len(prefix):]] = getattr(mod, attr)
+    return out
+
+
+def _assert_dir_byte_idempotent(committed_dir: Path, rebuilt_dir: Path) -> None:
+    """Every committed ``*.sqlite`` in *committed_dir* must have a byte-identical
+    (writer-version-normalized) counterpart in *rebuilt_dir*."""
+    committed = sorted(committed_dir.glob("*.sqlite"))
+    assert committed, f"no committed *.sqlite in {committed_dir}"
+    for golden in committed:
+        rebuilt = rebuilt_dir / golden.name
+        assert rebuilt.exists(), (
+            f"builder did not produce {golden.name} for "
+            f"{committed_dir.name} (committed golden has no rebuilt counterpart)"
+        )
+        assert _normalized_bytes(rebuilt) == _normalized_bytes(golden), (
+            f"{committed_dir.name}/{golden.name} is NOT byte-idempotent — a "
+            f"full builder regen would dirty the committed golden. Run the "
+            f"builder and commit the refreshed fixture (issue #197)."
+        )
+
+
+# Scenario names are derived once at import via auto-discovery against the
+# real builder module, so parametrize IDs stay in lockstep with the builders.
+_BUILDERS = _discover_per_migration_builders(
+    _load_module("build_migrations_fixtures", BUILDER_PATH)
+)
+
+
+@pytest.mark.parametrize("scenario", sorted(_BUILDERS))
+def test_per_migration_golden_byte_idempotent(
+    builder_module, scenario, tmp_path
+):
+    """Each ``build-migrations-fixtures.py`` per-migration builder must rebuild
+    its committed goldens byte-for-byte (issue #197)."""
+    build_fn = getattr(builder_module, f"build_per_migration_{scenario}")
+    out_dir = tmp_path / scenario
+    build_fn(out_dir)
+    _assert_dir_byte_idempotent(PER_MIGRATION_ROOT / scenario, out_dir)
+
+
+@pytest.mark.parametrize(
+    "scenario,build_fn_name",
+    [
+        ("009_recompute_five_hour_blocks_dedup_fix", "build_009"),
+        ("010_recompute_percent_milestones_dedup_fix", "build_010"),
+    ],
+)
+def test_009_010_recompute_golden_byte_idempotent(
+    builder_009_010_module, scenario, build_fn_name, tmp_path, monkeypatch
+):
+    """The second builder (``build-migration-009-010-fixtures.py``) must also
+    rebuild its committed goldens byte-for-byte. It writes to a module-global
+    ``FIX_BASE``, so redirect that at a tmp dir and compare (issue #197)."""
+    monkeypatch.setattr(builder_009_010_module, "FIX_BASE", tmp_path)
+    getattr(builder_009_010_module, build_fn_name)()
+    _assert_dir_byte_idempotent(PER_MIGRATION_ROOT / scenario, tmp_path / scenario)
 
 
 def test_builder_002_post_carries_marker(builder_module, tmp_path):

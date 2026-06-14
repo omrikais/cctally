@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Internal (test infra, no user-facing change): the per-migration golden builders are now byte-idempotent, with a guard that enforces it.** The conversation cache goldens build `pre.sqlite` via `_apply_cache_schema`, which always emits the current full cache schema, so as later migrations added tables (`conversation_sessions` #013, `conversation_ai_titles` #012) or reshaped the FTS5 index (#010) the committed goldens silently fell behind — a full `bin/build-migrations-fixtures.py` regen rewrote ~24 fixtures at once that the maintainer then had to hand-revert (the broader cousin of #194, which fixed only the missing-marker case). Cache `001`'s wall-clock self-stamp (the #140 carve-out) is now overwritten with a pinned `applied_at_utc` in the builder (production handler untouched), removing the last source of regen non-determinism; all builder-produced goldens were refreshed to the current schema; and `tests/test_build_migrations_fixtures_stamps_markers.py` now rebuilds every per-migration golden (across both builder scripts) and asserts byte-equality with the committed fixture, so future schema drift fails loudly at the commit that introduces it instead of accumulating silently. Nothing to do on upgrade (#197).
+
 ## [1.44.1] - 2026-06-14
 
 ### Fixed

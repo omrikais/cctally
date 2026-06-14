@@ -459,10 +459,16 @@ def build_per_migration_001_dedup_highest_wins(scenario_dir: Path) -> None:
     Loaded by ``tests/test_migration_001_per_migration_goldens.py``.
     Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I4.
     """
-    # Note: post.sqlite's schema_migrations.applied_at_utc is a wall-clock
-    # now_utc_iso() stamped by the real migration handler, so a rebuild churns
-    # a few bytes there. The per-migration goldens test deliberately does NOT
-    # assert applied_at_utc — this is expected, not a phantom dirty fixture.
+    # Note: cache 001 is the #140 "lone carve-out" — its handler self-stamps the
+    # schema_migrations marker (atomic with the destructive wipe) using a
+    # wall-clock now_utc_iso(). Left as-is that made post.sqlite the ONLY
+    # non-deterministic per-migration golden (a rebuild churned the applied_at_utc
+    # bytes). Issue #197: _build_post overwrites that stamp with a PINNED value
+    # after the handler returns, so the committed golden is byte-idempotent like
+    # every other per-migration golden. The production carve-out is untouched —
+    # only the fixture's stamp is pinned. The per-migration goldens test does NOT
+    # assert applied_at_utc's value (only its presence).
+    TS_001_APPLIED_PIN = "2026-04-15T16:00:00Z"
     scenario_dir.mkdir(parents=True, exist_ok=True)
     pre = scenario_dir / "pre.sqlite"
     post = scenario_dir / "post.sqlite"
@@ -607,6 +613,18 @@ def build_per_migration_001_dedup_highest_wins(scenario_dir: Path) -> None:
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             handler(conn)
+            # #197: the handler self-stamped the 001 marker with a wall-clock
+            # now_utc_iso() (the #140 cache-001 carve-out). Overwrite it with a
+            # pinned value so the committed golden is byte-idempotent across
+            # rebuilds. Production behavior is unchanged — only this fixture's
+            # stamp is pinned; the per-migration test asserts the marker's
+            # PRESENCE, not its applied_at_utc value.
+            conn.execute(
+                "UPDATE schema_migrations SET applied_at_utc = ? "
+                "WHERE name = '001_dedup_highest_wins'",
+                (TS_001_APPLIED_PIN,),
+            )
+            conn.commit()
         finally:
             conn.close()
 
@@ -1410,10 +1428,13 @@ def build_per_migration_002_conversation_messages_backfill(
             # full rebuild produced a markerless post.sqlite and broke the test
             # (issue #194). The pinned applied_at_utc makes the stamp itself
             # deterministic and matches the value HEAD's committed 002 golden
-            # already carries, so a regen reproduces the marker exactly. (The 002
-            # golden's wider byte churn vs HEAD is pre-existing _apply_cache_schema
-            # drift — newer tables — independent of this marker fix and out of
-            # scope for #194.) _stamp_applied commits.
+            # already carries, so a regen reproduces the marker exactly. (The
+            # wider _apply_cache_schema schema drift — newer tables landing in
+            # this golden as later migrations add them — was out of scope for
+            # #194 and is resolved by #197: the committed goldens are refreshed
+            # to the current schema and a byte-idempotency guard
+            # [test_build_migrations_fixtures_stamps_markers.py] keeps them
+            # current.) _stamp_applied commits.
             db._stamp_applied(
                 conn, "002_conversation_messages_backfill",
                 "2026-04-30T12:00:00Z",
