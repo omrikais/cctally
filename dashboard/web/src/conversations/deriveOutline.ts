@@ -106,7 +106,9 @@ export function deriveOutline(
     const anyErr = b.some((t) => t.tools?.some((x) => x.is_error));
     entries.push({
       entryId: `sc:${k}`, uuid: b[0].uuid, type: 'subagent',
-      label: `subagent · ${subagentMeta?.[k]?.kind ?? 'agent'}`,
+      // #193 (Codex P2-4): mirror the thread header — prefer the spawning Task
+      // description, fall back to `subagent · <kind>` when none is plumbed.
+      label: subagentMeta?.[k]?.description ?? `subagent · ${subagentMeta?.[k]?.kind ?? 'agent'}`,
       depth: depth(), error: anyErr, plan: false, question: false, thinkingCount: 0,
       toolCount: b.reduce((n, t) => n + (t.tools?.length ?? 0), 0),
       subagentKey: k, subagentKind: subagentMeta?.[k]?.kind,

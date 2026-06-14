@@ -147,3 +147,25 @@ describe('BashCard', () => {
     expect(out?.textContent).not.toContain('ERRTAIL');
   });
 });
+
+describe('BashCard dimmed line (#193)', () => {
+  it('shows input.description when present', () => {
+    const { container } = renderCard(
+      base({ input: { command: 'ls -la', description: 'List files' }, preview: 'ls -la' }),
+    );
+    // The dimmed chip-preview slot carries the human description, not the command.
+    expect(container.querySelector('.conv-chip-preview')!.textContent).toBe('List files');
+    // The command still lives in the expanded `$ …` body.
+    expect(container.querySelector('.conv-term-cmd')!.textContent).toContain('ls -la');
+  });
+
+  it('falls back to preview (command) when description blank/absent', () => {
+    const blank = renderCard(
+      base({ input: { command: 'ls -la', description: '   ' }, preview: 'ls -la' }),
+    );
+    expect(blank.container.querySelector('.conv-chip-preview')!.textContent).toBe('ls -la');
+
+    const absent = renderCard(base({ input: { command: 'ls -la' }, preview: 'ls -la' }));
+    expect(absent.container.querySelector('.conv-chip-preview')!.textContent).toBe('ls -la');
+  });
+});

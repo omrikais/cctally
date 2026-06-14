@@ -145,7 +145,7 @@ export function SidechainGroup({
           <span className="conv-sidechain-kind">
             Subagent{meta?.kind ? <span className="conv-sidechain-kindname"> · {meta.kind}</span> : null}
           </span>
-          <span className="conv-sidechain-title">{label}</span>
+          <span className="conv-sidechain-title">{meta?.description || label}</span>
           {meta && (meta.total_tokens != null || meta.total_duration_ms != null
                     || meta.total_tool_use_count != null || meta.status != null) && (
             <span className="conv-sidechain-submeta">

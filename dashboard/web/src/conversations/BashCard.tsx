@@ -13,6 +13,17 @@ function commandOf(call: Call): string {
   return typeof c === 'string' ? c : '';
 }
 
+// #193: the Bash tool's own `input.description` (Claude Code writes a short
+// human gloss alongside the command). Trimmed-or-undefined (Codex P2-2): a
+// blank/whitespace description must fall through to the command preview, never
+// render an empty dimmed chip line. Old rows without stored input also fall
+// through (the `?.` chain yields undefined).
+function descriptionOf(call: Call): string | undefined {
+  const d = (call.input as { description?: unknown } | null | undefined)?.description;
+  const s = typeof d === 'string' ? d.trim() : '';
+  return s.length > 0 ? s : undefined;
+}
+
 // Split the merged result text into (stdout, stderr) when call.stderr is a
 // suffix of result.text — the empirical storage shape (result.text == stdout +
 // stderr, spec §2 / §4.2). When stderr is absent (legacy rows) or not a suffix
@@ -65,7 +76,7 @@ export function BashCard({ call }: { call: Call }) {
         <span className="conv-chev" aria-hidden="true" />
         <TerminalIcon />
         <span className="conv-chip-name">Bash</span>
-        <span className="conv-chip-preview">{call.preview}</span>
+        <span className="conv-chip-preview">{descriptionOf(call) ?? call.preview}</span>
         {badge}
       </summary>
       <div className="conv-term-body">

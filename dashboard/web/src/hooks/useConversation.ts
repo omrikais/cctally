@@ -182,6 +182,7 @@ export function useConversation(sessionId: string | null): UseConversation {
           ...prev,
           items: body.items.length ? [...prev.items, ...body.items] : prev.items,
           cost_usd: body.cost_usd, models: body.models,                // refresh whole-session header even on empty
+          title: body.title ?? prev.title,                            // #193 P1-4: a rewritten ai-title reaches the open reader
           git_branch: body.git_branch, project_label: body.project_label,
           subagent_meta: body.subagent_meta ?? prev.subagent_meta,
           page: prev.page,                                             // stays fully-paged (next_after === null)

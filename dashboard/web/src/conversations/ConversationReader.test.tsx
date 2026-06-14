@@ -328,6 +328,21 @@ describe('ConversationReader', () => {
     );
   });
 
+  it('#193: prefers detail.title over deriveReaderTitle', async () => {
+    // The server now derives a `title` (ai-title). It must win over the
+    // first-prompt heuristic even when a raw human prompt is present.
+    mockFetchOnce({
+      ...detail([
+        makeItem({ uuid: 'h1', text: 'raw prompt that deriveReaderTitle would pick' }),
+      ]),
+      title: 'Server AI Title',
+    });
+    render(<ConversationReader sessionId="s" />);
+    await waitFor(() =>
+      expect(document.querySelector('.conv-reader-title')!.textContent).toBe('Server AI Title'),
+    );
+  });
+
   it('renders a styled selection-empty / loading state, not bare text', async () => {
     // First page never resolves → the loading state shows the styled .conv-state.
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise(() => {}));

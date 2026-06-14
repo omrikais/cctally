@@ -316,7 +316,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const groupsRef = useRef<RenderNode[]>(groups);
   groupsRef.current = groups;
   const title = useMemo(
-    () => (detail ? deriveReaderTitle(detail) : ''),
+    // #193: prefer the server-derived title (ai-title -> first prompt -> label
+    // -> sid). deriveReaderTitle stays as the client-side fallback for older
+    // responses (or any future shape) that arrive without a `title`.
+    () => (detail ? (detail.title || deriveReaderTitle(detail)) : ''),
     [detail],
   );
   // Stable provider value so context consumers (the cards) don't re-render on

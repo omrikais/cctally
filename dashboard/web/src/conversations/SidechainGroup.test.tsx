@@ -276,3 +276,23 @@ describe('SidechainGroup', () => {
     expect(refs.get('s1')).toBeTruthy();
   });
 });
+
+describe('SidechainGroup header (#193)', () => {
+  it('shows meta.description as the title when present', () => {
+    const items = [member('u1', { kind: 'human', text: 'long raw prompt blob...' })];
+    render(<SidechainGroup subagentKey="abc" items={items} nested={false}
+      meta={{ kind: 'general-purpose', description: 'Code review Phase A' }} />);
+    expect(screen.getByText('Code review Phase A')).toBeTruthy();
+    // The first-prompt label must NOT win when a description is present.
+    expect(document.querySelector('.conv-sidechain-title')!.textContent).toBe('Code review Phase A');
+  });
+
+  it('falls back to the first-prompt label when no description', () => {
+    const items = [member('u1', { kind: 'human', text: 'Do the analysis' })];
+    render(<SidechainGroup subagentKey="abc" items={items} nested={false}
+      meta={{ kind: 'general-purpose' }} />);
+    // "Do the analysis" also appears in the rendered member body, so scope to
+    // the title span — the label fallback must still drive the header title.
+    expect(document.querySelector('.conv-sidechain-title')!.textContent).toBe('Do the analysis');
+  });
+});

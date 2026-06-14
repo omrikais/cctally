@@ -223,4 +223,25 @@ describe('deriveOutline (#186 §3 section walk)', () => {
     expect(new Set(ids).size).toBe(ids.length);
     expect(ids.every((id) => typeof id === 'string' && id.length > 0)).toBe(true);
   });
+
+  it('#193: subagent landmark label uses description, falls back to kind', () => {
+    // With a spawning Task description, the landmark mirrors the thread header.
+    const withDesc: Record<string, SubagentMeta> = {
+      abc: { kind: 'general-purpose', description: 'Implement #180' },
+    };
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'dispatch' }),
+      turn({ uuid: 's1', kind: 'assistant', label: 'raw prompt', subagent_key: 'abc', parent_uuid: 'x' }),
+    ], withDesc);
+    const sc = entries.find((e) => e.type === 'subagent');
+    expect(sc?.label).toBe('Implement #180');
+
+    // No description → the existing `subagent · <kind>` label.
+    const noDesc: Record<string, SubagentMeta> = { abc: { kind: 'general-purpose' } };
+    const { entries: e2 } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'dispatch' }),
+      turn({ uuid: 's1', kind: 'assistant', label: 'raw prompt', subagent_key: 'abc', parent_uuid: 'x' }),
+    ], noDesc);
+    expect(e2.find((e) => e.type === 'subagent')?.label).toBe('subagent · general-purpose');
+  });
 });

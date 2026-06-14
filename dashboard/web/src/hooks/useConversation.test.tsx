@@ -172,6 +172,21 @@ describe('useConversation', () => {
     expect(result.current.detail?.models).toEqual(['opus', 'sonnet']);
   });
 
+  it('#193: live tail updates a rewritten title (P1-4)', async () => {
+    // Page 1 carries the initial ai-title.
+    mockOnce(detail([it1, it2], null, { title: 'Old' }));
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    expect(result.current.detail?.title).toBe('Old');
+
+    // Empty tail (no new turns) but the ai-title was rewritten mid-session. The
+    // merge must propagate body.title so an OPEN reader's header re-titles.
+    mockOnce(detail([], null, { title: 'New' }));
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.detail?.title).toBe('New'));
+    expect(result.current.detail?.items).toHaveLength(2);
+  });
+
   it('surfaces a not-found error on 404 and leaves detail null', async () => {
     mockOnce({}, 404);
     const { result } = renderHook(() => useConversation('missing'));
