@@ -148,6 +148,12 @@ export type ConversationBlock =
       input_summary: string;
       input?: Record<string, unknown> | null;  // #177 S1 — bounded structured input
       input_truncated?: boolean;                // #177 S1
+      // #198 — true {add, del} stat computed from the FULL input at ingest, stamped
+      // ONLY on truncated edit-family calls (Write/Edit/MultiEdit). The DiffCard
+      // header prefers it while truncated-and-not-yet-loaded so the badge shows the
+      // document's real line count, not the post-clip count. Absent otherwise
+      // (non-truncated cards recount from their live jsdiff hunks; legacy rows).
+      edit_stat?: { add: number; del: number };
       preview: string;
       tool_use_id: string | null;
       // #177 S4 — `media` (tool-result media placeholders, render-ready) folds

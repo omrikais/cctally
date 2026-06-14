@@ -178,6 +178,12 @@ _INPUT_MAX_DEPTH = 12      # max nesting depth before subtree elision (Recursion
 _INPUT_KEY_CAP = 512       # max chars per dict key (else keys are stored verbatim, unbounded)
 _INPUT_ELISION = "…"       # sentinel for elided leaves / subtrees
 
+# #198: cap the O(n·m) LCS pass that stamps edit_stat from the FULL (unbounded)
+# input. Realistic truncated edits have a few hundred lines per side (n·m ~ 1e4–1e5);
+# this bound only excludes a pathological multi-thousand-line edit, in which case
+# edit_stat is omitted and the client falls back to its bounded recompute.
+_EDIT_STAT_LCS_CELL_BUDGET = 4_000_000
+
 # #177 S4: WebSearch link-list capture bounds + the media item types whose
 # placeholders the ordinal chokepoint (iter_media_items) addresses.
 _WEB_SEARCH_LINK_CAP = 50
@@ -470,6 +476,14 @@ def _blocks_and_text(content):
                          "input": bounded, "input_truncated": input_trunc,
                          "id": b.get("id"),
                          "preview": tool_preview(b.get("name"), b.get("input"))}
+                # #198: stamp the true edit-family stat from the FULL input ONLY when
+                # the bounded copy was clipped — the one case where the client can't
+                # recount the header from `block["input"]`. Additive; omitted
+                # otherwise (non-truncated cards recount from their live jsdiff hunks).
+                if input_trunc:
+                    edit_stat = _edit_stat_for(b.get("name"), b.get("input"))
+                    if edit_stat is not None:
+                        block["edit_stat"] = edit_stat
                 inp = b.get("input")
                 st = inp.get("subagent_type") if isinstance(inp, dict) else None
                 if isinstance(st, str) and st:        # #166: spawn kind (Agent/Task)
@@ -758,6 +772,117 @@ def _summarize(inp):
         return ""
     s = json.dumps(inp, separators=(",", ":"))
     return s[:200]
+
+
+# ---------------------------------------------------------------------------
+# #198: true edit-family stat, stamped at ingest from the FULL (un-bounded) input.
+#
+# DiffCard's header badge (`wrote N lines` for Write, `+A −D` for Edit/MultiEdit)
+# was computed client-side from `call.input`, which `_bound_input` clips to
+# _INPUT_LEAF_CAP per string leaf — so a large Write/Edit reported the post-clip
+# count, not the document's true total. We stamp the true {add, del} here (where
+# the full input is still in hand) on TRUNCATED edit-family calls only; the client
+# prefers it for the header solely while truncated-and-not-yet-loaded, so a
+# non-truncated card keeps header==body parity with its rendered jsdiff hunks.
+#
+# Parity with the client's jsdiff (dashboard/web/src/conversations/computeDiff.ts):
+# jsdiff `diffLines` is Myers-minimal, so added rows = |new_lines| − LCS and
+# removed = |old_lines| − LCS. The LCS *length* is unique, so a plain LCS pass
+# reproduces jsdiff's counts WITHOUT replicating its alignment. Line tokens carry
+# their trailing newline (jsdiff's tokenization), so a no-newline-at-eof line is a
+# distinct token from its newline-terminated twin — matching the rendered diff.
+# ---------------------------------------------------------------------------
+def _line_count(s):
+    """Number of lines in `s`, matching computeDiff.ts::splitLines length (split on
+    '\\n', drop the phantom blank from a trailing newline). Drives Write's
+    `wrote N lines`, which the client builds from `computeWrite(content).length`."""
+    if not s:
+        return 0
+    parts = s.split("\n")
+    if parts and parts[-1] == "":
+        parts.pop()
+    return len(parts)
+
+
+def _line_tokens(s):
+    """Tokenize `s` into jsdiff line tokens (each line keeps its trailing newline),
+    mirroring jsdiff's LineDiff.tokenize so the LCS below counts what `diffLines`
+    counts. `re.split(r"(\\n|\\r\\n)")` keeps separators; the trailing empty from a
+    final newline is dropped, then each separator is folded onto its line."""
+    if not s:
+        return []
+    parts = re.split(r"(\n|\r\n)", s)
+    if parts and parts[-1] == "":
+        parts.pop()
+    tokens = []
+    for i, p in enumerate(parts):
+        if i % 2:                  # captured separator → fold onto the preceding line
+            tokens[-1] += p
+        else:
+            tokens.append(p)
+    return tokens
+
+
+def _lcs_len(a, b):
+    """Length of the longest common subsequence of token lists `a`, `b` (rolling
+    1-D DP, O(len(a)·len(b)) time / O(min) space). The length is unique even when
+    the LCS itself is not, which is exactly why it reproduces jsdiff's add/del
+    counts."""
+    if not a or not b:
+        return 0
+    if len(b) > len(a):
+        a, b = b, a                # keep the inner row short
+    prev = [0] * (len(b) + 1)
+    for x in a:
+        diag = 0                   # prev[j-1] before this row overwrote it
+        for j in range(1, len(b) + 1):
+            cur = prev[j]
+            prev[j] = diag + 1 if x == b[j - 1] else (prev[j] if prev[j] >= prev[j - 1] else prev[j - 1])
+            diag = cur
+    return prev[len(b)]
+
+
+def _diff_stat(old, new):
+    """{"add", "del"} for a single old→new line diff, or None when the LCS would
+    exceed the cell budget. Non-string sides coerce to '' (mirroring
+    computeMultiEdit's leaf coercion)."""
+    ot = _line_tokens(old if isinstance(old, str) else "")
+    nt = _line_tokens(new if isinstance(new, str) else "")
+    if len(ot) * len(nt) > _EDIT_STAT_LCS_CELL_BUDGET:
+        return None
+    lcs = _lcs_len(ot, nt)
+    return {"add": len(nt) - lcs, "del": len(ot) - lcs}
+
+
+def _edit_stat_for(name, inp):
+    """True {"add", "del"} for an edit-family tool computed from its FULL input, or
+    None when not an edit-family tool / not computable / over the LCS budget. Write
+    is a pure line count (no prior content); Edit diffs old→new; MultiEdit sums per
+    edit. Mirrors computeWrite/computeDiff/computeMultiEdit COUNTS exactly."""
+    if not isinstance(inp, dict):
+        return None
+    nm = (name or "").lower()
+    if nm == "write":
+        content = inp.get("content")
+        if not isinstance(content, str):
+            return None
+        return {"add": _line_count(content), "del": 0}
+    if nm == "edit":
+        return _diff_stat(inp.get("old_string"), inp.get("new_string"))
+    if nm == "multiedit":
+        edits = inp.get("edits")
+        if not isinstance(edits, list):
+            return None
+        add = dele = 0
+        for e in edits:
+            e = e if isinstance(e, dict) else {}
+            st = _diff_stat(e.get("old_string"), e.get("new_string"))
+            if st is None:
+                return None        # one over-budget edit → omit the whole stamp
+            add += st["add"]
+            dele += st["del"]
+        return {"add": add, "del": dele}
+    return None
 
 
 def _bound_input(inp):

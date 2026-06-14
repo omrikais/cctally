@@ -594,6 +594,10 @@ def build(scenario: str) -> None:
                 '"{\\"file_path\\":\\"/home/u/proj/resolve.py\\"}", '
                 '"input": {"file_path": "/home/u/proj/resolve.py", '
                 '"old_string": "clipped-leaf…"}, "input_truncated": true, '
+                # #198: true {add, del} stamped at ingest from the FULL (un-clipped)
+                # input. Carried on the truncated Edit so the reader contract proves
+                # the field survives the tool_use -> tool_call fold to the client.
+                '"edit_stat": {"add": 412, "del": 87}, '
                 '"id": "toolu_s5", "preview": "/home/u/proj/resolve.py"}, '
                 '{"kind": "tool_use", "name": "Bash", "input_summary": '
                 '"{\\"command\\":\\"pytest -q\\"}", '

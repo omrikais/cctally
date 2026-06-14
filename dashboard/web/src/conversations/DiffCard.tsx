@@ -145,7 +145,21 @@ export function DiffCard({ call }: { call: Call }) {
     () => buildHunks(call, fullInput),
     [call, fullInput],
   );
-  const stat = useMemo(() => statOf(hunks), [hunks]);
+  // The live stat is counted from the rendered hunks (jsdiff). When the input was
+  // truncated AND the full input hasn't been loaded yet, those hunks reflect only
+  // the bounded leaves, so the badge would undercount (#198). In that one case
+  // prefer the ingest-stamped `edit_stat` (computed from the FULL input) — it
+  // matches jsdiff's counts exactly. Once the full input loads (fullInput set) we
+  // fall back to the live stat so header==body. Legacy rows lack edit_stat → live.
+  const liveStat = useMemo(() => statOf(hunks), [hunks]);
+  const stampedStat =
+    call.edit_stat &&
+    typeof call.edit_stat.add === 'number' &&
+    typeof call.edit_stat.del === 'number'
+      ? call.edit_stat
+      : null;
+  const stat =
+    call.input_truncated && !fullInput && stampedStat ? stampedStat : liveStat;
 
   const replaceAll = inp.replace_all === true;
   const editCount = kind === 'multiedit' ? hunks.length : 0;

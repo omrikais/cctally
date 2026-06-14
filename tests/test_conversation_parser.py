@@ -1018,3 +1018,99 @@ def test_iter_ai_titles_yields_in_file_order():
     )
     titles = [r.ai_title for r in lc.iter_ai_titles(fh, "s.jsonl")]
     assert titles == ["first", "second"]   # null skipped; file order preserved
+
+
+# --- #198: true edit-family stat stamped at ingest under truncation ----------
+# DiffCard's header badge (`wrote N lines` for Write, `+A −D` for Edit/MultiEdit)
+# was computed client-side from the BOUNDED input, so a >_INPUT_LEAF_CAP leaf made
+# it report the post-clip count. The parser now stamps `edit_stat` (computed from
+# the FULL input) on truncated edit-family tool_use blocks. Counts match jsdiff's
+# Myers-minimal diff exactly: add = |new_lines| − LCS, del = |old_lines| − LCS,
+# and the LCS *length* is unique (a plain LCS pass reproduces jsdiff's counts).
+
+def test_line_count_matches_frontend_splitLines():
+    # Mirror dashboard/web/src/conversations/computeDiff.ts::splitLines length.
+    assert lc._line_count("") == 0
+    assert lc._line_count("a") == 1
+    assert lc._line_count("a\n") == 1          # trailing newline drops the phantom blank
+    assert lc._line_count("a\nb") == 2
+    assert lc._line_count("a\nb\n") == 2
+    assert lc._line_count("\n") == 1           # a lone newline is one (blank) line
+    assert lc._line_count("a\r\nb") == 2       # CRLF still splits on \n
+
+
+def test_diff_stat_matches_jsdiff_counts():
+    assert lc._diff_stat("a\nb\nc", "a\nb\nc") == {"add": 0, "del": 0}
+    # one line changed: LCS = {a, c} = 2 → add 1, del 1.
+    assert lc._diff_stat("a\nb\nc", "a\nX\nc") == {"add": 1, "del": 1}
+    assert lc._diff_stat("", "a\nb") == {"add": 2, "del": 0}
+    assert lc._diff_stat("a\nb", "") == {"add": 0, "del": 2}
+    # no-newline-at-eof edge: jsdiff line tokens carry the trailing \n, so "a\n"
+    # and "a" are distinct tokens → 1 add + 1 del (NOT a no-op).
+    assert lc._diff_stat("a\n", "a") == {"add": 1, "del": 1}
+
+
+def _ingest_one_assistant(content_blocks):
+    fh = _jsonl({"type": "assistant", "uuid": "a1", "sessionId": "s1",
+                 "requestId": "r1", "timestamp": "t",
+                 "message": {"role": "assistant", "id": "m1", "model": "opus",
+                             "content": content_blocks}})
+    row = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    return json.loads(row.blocks_json)
+
+
+def test_write_truncated_stamps_full_line_count():
+    full = "\n".join("L%04d" % i + "x" * 40 for i in range(300))   # 300 lines, >8 KB
+    assert len(full) > lc._INPUT_LEAF_CAP
+    blocks = _ingest_one_assistant([
+        {"type": "tool_use", "name": "Write", "id": "t1",
+         "input": {"file_path": "/big.md", "content": full}}])
+    b = blocks[0]
+    assert b["input_truncated"] is True                 # leaf was clipped
+    assert len(b["input"]["content"]) == lc._INPUT_LEAF_CAP
+    # The bug: header would show the clipped line count; the fix stamps the true total.
+    assert b["edit_stat"] == {"add": 300, "del": 0}
+
+
+def test_edit_truncated_stamps_full_diff_stat():
+    new = "\n".join("N%04d" % i + "y" * 40 for i in range(250))    # 250 fresh lines, >8 KB
+    assert len(new) > lc._INPUT_LEAF_CAP
+    blocks = _ingest_one_assistant([
+        {"type": "tool_use", "name": "Edit", "id": "t2",
+         "input": {"file_path": "/x.py", "old_string": "a\nb\nc", "new_string": new}}])
+    b = blocks[0]
+    assert b["input_truncated"] is True
+    # disjoint line sets → LCS 0 → add = 250, del = 3.
+    assert b["edit_stat"] == {"add": 250, "del": 3}
+
+
+def test_multiedit_truncated_sums_full_per_edit_stats():
+    big_new = "\n".join("M%04d" % i + "z" * 20 for i in range(400))  # 400 fresh lines, >8 KB
+    assert len(big_new) > lc._INPUT_LEAF_CAP
+    blocks = _ingest_one_assistant([
+        {"type": "tool_use", "name": "MultiEdit", "id": "t3",
+         "input": {"file_path": "/x.py", "edits": [
+             {"old_string": "p\n", "new_string": "p\nq\n"},        # +1 / -0 (LCS keeps "p\n")
+             {"old_string": "u\nv\n", "new_string": big_new},      # +400 / -2 (disjoint)
+         ]}}])
+    b = blocks[0]
+    assert b["input_truncated"] is True
+    assert b["edit_stat"] == {"add": 401, "del": 2}
+
+
+def test_untruncated_edit_omits_edit_stat():
+    # Small input → not truncated → no stamp (client uses the live jsdiff hunks so
+    # header==body parity holds; the stamp exists ONLY where the body is partial).
+    blocks = _ingest_one_assistant([
+        {"type": "tool_use", "name": "Write", "id": "t4",
+         "input": {"file_path": "/s.txt", "content": "a\nb\nc"}}])
+    assert "edit_stat" not in blocks[0]
+
+
+def test_truncated_non_edit_tool_omits_edit_stat():
+    # A non-edit tool (Bash) with a >cap leaf is truncated but carries no edit_stat.
+    blocks = _ingest_one_assistant([
+        {"type": "tool_use", "name": "Bash", "id": "t5",
+         "input": {"command": "x" * (lc._INPUT_LEAF_CAP + 10)}}])
+    assert blocks[0]["input_truncated"] is True
+    assert "edit_stat" not in blocks[0]

@@ -29,6 +29,10 @@
       "attribution_skill": "superpowers:test-driven-development",
       "blocks": [
         {
+          "edit_stat": {
+            "add": 412,
+            "del": 87
+          },
           "input": {
             "file_path": "/home/u/proj/resolve.py",
             "old_string": "clipped-leaf\u2026"

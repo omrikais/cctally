@@ -420,6 +420,9 @@ else:
         errs.append("input did not survive to tool_call: %r" % (call.get("input"),))
     if call.get("input_truncated") is not True:
         errs.append("input_truncated wrong: %r" % (call.get("input_truncated"),))
+    # #198: the ingest-stamped true edit stat survives the tool_use -> tool_call fold.
+    if call.get("edit_stat") != {"add": 412, "del": 87}:
+        errs.append("edit_stat did not survive to tool_call: %r" % (call.get("edit_stat"),))
     res = call.get("result") or {}
     if res.get("full_length") != 48213:
         errs.append("result.full_length wrong/absent: %r" % (res.get("full_length"),))

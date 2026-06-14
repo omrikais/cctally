@@ -154,3 +154,90 @@ describe('DiffCard', () => {
     expect(container.querySelector('.conv-diff-card')).toBeTruthy();
   });
 });
+
+// #198 — the header badge must show the document's TRUE total when the input was
+// truncated, preferring the ingest-stamped edit_stat over the count derived from
+// the bounded (clipped) input. Once the full input loads, it falls back to the
+// live jsdiff recompute (header==body); legacy rows without edit_stat degrade to
+// the bounded count.
+describe('DiffCard truncated header stat (#198)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('Write: prefers stamped edit_stat over the bounded line count when truncated', () => {
+    const call = base({
+      name: 'Write',
+      input: { file_path: '/big.md', content: 'l1\nl2' }, // bounded → only 2 lines
+      input_truncated: true,
+      edit_stat: { add: 250, del: 0 }, // true total from the full content
+      result: null,
+    });
+    const { container } = renderCard(call);
+    expect(container.querySelector('.conv-diff-stat--write')?.textContent).toMatch(/wrote 250 lines/);
+    expect(container.textContent).not.toMatch(/wrote 2 lines/);
+  });
+
+  it('Edit: prefers stamped +A −D over the bounded diff when truncated', () => {
+    const call = base({
+      input: { file_path: '/x.ts', old_string: 'a', new_string: 'b' }, // bounded → +1 −1
+      input_truncated: true,
+      edit_stat: { add: 120, del: 40 },
+    });
+    const { container } = renderCard(call);
+    const hdr = container.querySelector('.conv-diff-stat')?.textContent ?? '';
+    expect(hdr).toMatch(/\+120/);
+    expect(hdr).toMatch(/−40|-40/);
+  });
+
+  it('does NOT use edit_stat when the input is not truncated (header==body parity)', () => {
+    const call = base({
+      name: 'Write',
+      input: { file_path: '/s.txt', content: 'l1\nl2' },
+      input_truncated: false,
+      edit_stat: { add: 999, del: 0 }, // present but must be ignored
+      result: null,
+    });
+    const { container } = renderCard(call);
+    expect(container.querySelector('.conv-diff-stat--write')?.textContent).toMatch(/wrote 2 lines/);
+    expect(container.textContent).not.toMatch(/999/);
+  });
+
+  it('legacy row (truncated, no edit_stat) falls back to the bounded count', () => {
+    const call = base({
+      name: 'Write',
+      input: { file_path: '/old.md', content: 'l1\nl2\nl3' },
+      input_truncated: true,
+      result: null,
+    });
+    const { container } = renderCard(call);
+    expect(container.querySelector('.conv-diff-stat--write')?.textContent).toMatch(/wrote 3 lines/);
+  });
+
+  it('after load-full, the header switches to the recomputed live stat', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        which: 'input',
+        tool_use_id: 'e1',
+        input: { file_path: '/a/cost.ts', old_string: 'return x', new_string: 'return x + 99' },
+        full_length: 9000,
+        truncated: false,
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    // Stamped numbers are deliberately wrong-looking so we can prove the switch.
+    const call = base({ input_summary: '{}', input_truncated: true, edit_stat: { add: 5, del: 5 } });
+    const { container, getByRole } = renderCard(call);
+    // Before load: stamped stat wins.
+    expect(container.querySelector('.conv-diff-stat')?.textContent).toMatch(/\+5/);
+    await act(async () => {
+      fireEvent.click(getByRole('button', { name: /load full/i }));
+    });
+    // After load: recomputed from the full input (return x → return x + 99 = +1 −1).
+    const hdr = container.querySelector('.conv-diff-stat')?.textContent ?? '';
+    expect(hdr).toMatch(/\+1/);
+    expect(hdr).not.toMatch(/\+5/);
+  });
+});
