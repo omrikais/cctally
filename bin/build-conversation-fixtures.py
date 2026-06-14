@@ -423,9 +423,15 @@ def build(scenario: str) -> None:
                 {"kind": "text", "text": "spawning two audits in parallel"},
                 {"kind": "tool_use", "name": "Task",
                  "input_summary": '{"description":"Audit module A","subagent_type":"Explore"}',
+                 # #193: the bounded input carries the spawning description, which
+                 # the query-time harvest copies into subagent_meta[aaaa1111].
+                 "input": {"description": "Audit module A", "subagent_type": "Explore",
+                           "prompt": "Audit module A thoroughly"},
                  "id": "toolu_a", "preview": "Audit module A", "subagent_type": "Explore"},
                 {"kind": "tool_use", "name": "Agent",
                  "input_summary": '{"description":"Audit module B","subagent_type":"code-reviewer"}',
+                 "input": {"description": "Audit module B", "subagent_type": "code-reviewer",
+                           "prompt": "Audit module B thoroughly"},
                  "id": "toolu_b", "preview": "Audit module B", "subagent_type": "code-reviewer"},
             ]),
             model=MODEL, msg_id="m3", req_id="r3",
@@ -572,12 +578,20 @@ def build(scenario: str) -> None:
             source_path=s5_file, byte_offset=1,
             timestamp_utc="2026-06-05T00:00:01Z",
             entry_type="assistant", text="patched the resolver",
+            # #193: the Bash tool_use carries input.description; the server passes
+            # it through on call.input (the client's BashCard renders it) and must
+            # NOT harvest it as a subagent description (no subagent_type here) — so
+            # s5's subagent_meta stays empty in the reader golden.
             blocks_json=(
                 '[{"kind": "tool_use", "name": "Edit", "input_summary": '
                 '"{\\"file_path\\":\\"/home/u/proj/resolve.py\\"}", '
                 '"input": {"file_path": "/home/u/proj/resolve.py", '
                 '"old_string": "clipped-leaf…"}, "input_truncated": true, '
                 '"id": "toolu_s5", "preview": "/home/u/proj/resolve.py"}, '
+                '{"kind": "tool_use", "name": "Bash", "input_summary": '
+                '"{\\"command\\":\\"pytest -q\\"}", '
+                '"input": {"command": "pytest -q", "description": "Run the test suite"}, '
+                '"id": "toolu_s5bash", "preview": "pytest -q"}, '
                 '{"kind": "text", "text": "patched the resolver"}]'
             ),
             model=MODEL, msg_id="m5", req_id="r5",
@@ -652,6 +666,23 @@ def build(scenario: str) -> None:
                 "complete Session 6 — Search depth from issue #177")}]),
             cwd=s6_cwd, git_branch="main",
         )
+
+        # --- #193: ai-title rows. s1 + s3 carry an AI-generated title (their
+        # rail/reader title flips from the first human prompt to the ai-title);
+        # s2/s4/s5/s6 deliberately carry NO ai-title, locking the first-prompt /
+        # marker-skip / project-label fallback path in the goldens. The trailing
+        # null + blank rewrites Claude Code emits are dropped at parse time
+        # (covered by the parser/ingest pytest), so only the surviving non-null
+        # title is stored here — last-non-null-write-wins.
+        for _sid, _title, _src, _off in (
+            ("s1", "Explain the weekly reset window", s1_file_a, 4),
+            ("s3", "Audit modules A, B, and C", s3_main, 1),
+        ):
+            cache_conn.execute(
+                "INSERT INTO conversation_ai_titles"
+                "(session_id, ai_title, source_path, byte_offset) VALUES (?,?,?,?)",
+                (_sid, _title, _src, _off),
+            )
 
         # Empty stats.db stamped fully-migrated (dashboard-fixtures posture):
         # the dashboard server opens it at boot even though the conversation

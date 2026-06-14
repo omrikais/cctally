@@ -127,5 +127,6 @@
   "project_label": "proj",
   "session_id": "s1",
   "started_utc": "2026-06-01T00:00:00Z",
-  "subagent_meta": {}
+  "subagent_meta": {},
+  "title": "Explain the weekly reset window"
 }

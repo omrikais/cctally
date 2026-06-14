@@ -31,6 +31,11 @@
           "text": "spawning two audits in parallel"
         },
         {
+          "input": {
+            "description": "Audit module A",
+            "prompt": "Audit module A thoroughly",
+            "subagent_type": "Explore"
+          },
           "input_summary": "{\"description\":\"Audit module A\",\"subagent_type\":\"Explore\"}",
           "kind": "tool_call",
           "name": "Task",
@@ -44,6 +49,11 @@
           "tool_use_id": "toolu_a"
         },
         {
+          "input": {
+            "description": "Audit module B",
+            "prompt": "Audit module B thoroughly",
+            "subagent_type": "code-reviewer"
+          },
           "input_summary": "{\"description\":\"Audit module B\",\"subagent_type\":\"code-reviewer\"}",
           "kind": "tool_call",
           "name": "Agent",
@@ -220,6 +230,7 @@
   "started_utc": "2026-06-03T00:00:00Z",
   "subagent_meta": {
     "aaaa1111": {
+      "description": "Audit module A",
       "kind": "Explore",
       "status": "completed",
       "total_duration_ms": 10668,
@@ -227,11 +238,13 @@
       "total_tool_use_count": 1
     },
     "bbbb2222": {
+      "description": "Audit module B",
       "kind": "code-reviewer",
       "status": "error",
       "total_duration_ms": 4200,
       "total_tokens": 5120,
       "total_tool_use_count": 0
     }
-  }
+  },
+  "title": "Audit modules A, B, and C"
 }

@@ -46,7 +46,7 @@
       "project_label": "proj",
       "session_id": "s3",
       "started_utc": "2026-06-03T00:00:00Z",
-      "title": "run the audits"
+      "title": "Audit modules A, B, and C"
     },
     {
       "cost_usd": 0.0,
@@ -70,7 +70,7 @@
       "project_label": "proj",
       "session_id": "s1",
       "started_utc": "2026-06-01T00:00:00Z",
-      "title": "how does the reset work"
+      "title": "Explain the weekly reset window"
     }
   ],
   "page": {

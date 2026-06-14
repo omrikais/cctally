@@ -14,6 +14,7 @@
       "output": 500
     },
     "tool_counts": {
+      "Bash": 1,
       "Edit": 1
     },
     "turns": {
@@ -59,6 +60,10 @@
         {
           "is_error": false,
           "name": "Edit"
+        },
+        {
+          "is_error": false,
+          "name": "Bash"
         }
       ],
       "ts": "2026-06-05T00:00:01Z",
