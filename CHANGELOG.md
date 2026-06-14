@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.43.3] - 2026-06-14
+
 ### Added
 - Conversation viewer: each conversation is now titled by Claude Code's AI-generated session title — in the sessions rail and as the reader header — instead of the first prompt, falling back in order to the first prompt, the project label, then the session id; a title that Claude rewrites mid-session updates an already-open reader live (#193).
 - Conversation viewer: a subagent thread is now titled by the description from the `Task` that spawned it, in both the thread-card header and the matching outline landmark (falling back to the subagent's first prompt), and a Bash tool call shows its own description on the dimmed chip line (falling back to the command, which always stays in the expanded `$ …` body); older transcripts and tool calls without a stored description keep their prior rendering (#193).
