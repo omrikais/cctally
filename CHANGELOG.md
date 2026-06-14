@@ -5,6 +5,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Conversation viewer: each conversation is now titled by Claude Code's AI-generated session title — in the sessions rail and as the reader header — instead of the first prompt, falling back in order to the first prompt, the project label, then the session id; a title that Claude rewrites mid-session updates an already-open reader live (#193).
+- Conversation viewer: a subagent thread is now titled by the description from the `Task` that spawned it, in both the thread-card header and the matching outline landmark (falling back to the subagent's first prompt), and a Bash tool call shows its own description on the dimmed chip line (falling back to the command, which always stays in the expanded `$ …` body); older transcripts and tool calls without a stored description keep their prior rendering (#193).
+
 ### Fixed
 - Conversation viewer: a short single-line "You" prompt no longer shows an empty gap below its text — the per-message copy/permalink actions (previously an always-reserved but hidden-until-hover row that padded the bottom of the bordered box) now float into the bubble's top-right corner, so the box hugs its prose; assistant turns are unchanged (#192).
 - Conversation viewer: the outline no longer highlights two entries at once when you scroll onto a landmark inside a prompt's section — a subagent card, a section heading, or a plan/question (most visible when a subagent is the last outline entry) — it now marks only that exact landmark instead of also lighting the enclosing "You" prompt, while scrolling onto ordinary prose still highlights its section prompt as before (#192).
