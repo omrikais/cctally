@@ -189,6 +189,18 @@ _CONV_INSERT_SQL = (
     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
+# #193: last non-null write wins (ai-title carries no timestamp; see spec S1). NO
+# byte_offset guard — it can't order a cross-file resumed session. Ordering is
+# made deterministic by ingest order: backfill_ai_titles walks files
+# mtime-ascending so the newest file's last title is written last; the
+# incremental fused walk appends only new bytes in file order.
+_AI_TITLE_UPSERT_SQL = (
+    "INSERT INTO conversation_ai_titles(session_id,ai_title,source_path,byte_offset) "
+    "VALUES(?,?,?,?) "
+    "ON CONFLICT(session_id) DO UPDATE SET "
+    "ai_title=excluded.ai_title, source_path=excluded.source_path, byte_offset=excluded.byte_offset"
+)
+
 
 def _conv_row_tuple(m, path_str):
     """Flatten a ``MessageRow`` into the ``_CONV_INSERT_SQL`` column order.
@@ -616,6 +628,12 @@ def sync_cache(
             # under the lock (#138) — NOT a bare DELETE that fires conv_fts_ad
             # per row.
             clear_conversation_messages(conn)
+            # #193: ai-titles share the message lifecycle on a rebuild — wipe the
+            # table (so a title for a since-deleted session can't linger) and the
+            # pending-backfill flag in lockstep. The per-file fused walk below
+            # repopulates from offset 0, satisfying any deferred backfill.
+            conn.execute("DELETE FROM conversation_ai_titles")
+            conn.execute("DELETE FROM cache_meta WHERE key='ai_titles_backfill_pending'")
             # Clear the walk-complete sentinel atomically with the wipe
             # (cctally-dev#93, D5/D2): a stale "complete" marker must never
             # survive a destructive rebuild. The end-of-loop write below
@@ -723,6 +741,27 @@ def sync_cache(
                 conn.execute(
                     "DELETE FROM cache_meta "
                     "WHERE key='conversation_backfill_pending'"
+                )
+                conn.commit()
+
+            # #193: consume the deferred ai-title backfill. Cache migration 012 is
+            # flag-only (sets ``ai_titles_backfill_pending``); the offset-0 walk
+            # over all history via backfill_ai_titles (mtime-ascending,
+            # last-write-wins) runs HERE under the held flock — same #139
+            # contract as the message backfill above. Touches ONLY
+            # conversation_ai_titles; the flag is dropped LAST so a crash mid-walk
+            # re-runs cleanly. Never on the rebuild path (which already cleared
+            # the flag + repopulates via the normal walk).
+            try:
+                _ai_pending = conn.execute(
+                    "SELECT 1 FROM cache_meta WHERE key='ai_titles_backfill_pending'"
+                ).fetchone() is not None
+            except sqlite3.OperationalError:
+                _ai_pending = False
+            if _ai_pending:
+                backfill_ai_titles(conn)
+                conn.execute(
+                    "DELETE FROM cache_meta WHERE key='ai_titles_backfill_pending'"
                 )
                 conn.commit()
 
@@ -905,6 +944,11 @@ def sync_cache(
             # triggers → truncate → 'delete-all' → recreate, so conv_fts_ad
             # never fires O(rows) inside the held lock.
             clear_conversation_messages(conn)
+            # #193: truncation escalates to a full offset-0 re-ingest, so wipe
+            # conversation_ai_titles too (parallel to the session_entries +
+            # conversation_messages full-reset). The per-file fused walk below
+            # repopulates it from offset 0.
+            conn.execute("DELETE FROM conversation_ai_titles")
             # Clear the walk-complete sentinel atomically with the truncation
             # full-reset (cctally-dev#93, D5/D2): the cache is being wiped, so
             # any "complete" marker is now stale. The end-of-loop write below
@@ -1224,6 +1268,40 @@ def backfill_conversation_messages(conn: sqlite3.Connection) -> int:
             if cur.rowcount and cur.rowcount > 0:
                 inserted += cur.rowcount
     return inserted
+
+
+def backfill_ai_titles(conn: sqlite3.Connection) -> int:
+    """One-time backfill of ``conversation_ai_titles`` for existing installs
+    (#193). Walks EVERY Claude JSONL from offset 0 via
+    ``_lib_conversation.iter_ai_titles`` and upserts.
+
+    Files are walked MTIME-ASCENDING so that, for a session whose ai-title spans
+    multiple files (a ``--resume``), the most-recently-modified file's last
+    non-null title is written last (last-write-wins; see _AI_TITLE_UPSERT_SQL).
+    Per-file commit; the caller (``sync_cache``, consuming the
+    ``ai_titles_backfill_pending`` flag) holds the ``cache.db.lock`` flock for the
+    duration. Touches ONLY ``conversation_ai_titles`` — the cost/message cursors
+    are untouched. Idempotent: a re-run rewrites the same current title (the
+    last-write-wins ordering is stable under the deterministic mtime walk).
+    Returns rows upserted."""
+    n = 0
+    files = sorted(_iter_claude_jsonl_files(), key=lambda p: p.stat().st_mtime)
+    for jp in files:
+        path_str = str(jp)
+        rows: list[tuple[Any, ...]] = []
+        try:
+            with open(jp, "r", encoding="utf-8", errors="replace") as fh:
+                for r in _lib_conversation.iter_ai_titles(fh, path_str):
+                    rows.append((r.session_id, r.ai_title, path_str, r.byte_offset))
+        except OSError as exc:
+            eprint(f"[ai-title-backfill] could not read {jp}: {exc}")
+            continue
+        for row in rows:
+            conn.execute(_AI_TITLE_UPSERT_SQL, row)
+            n += 1
+        if rows:
+            conn.commit()
+    return n
 
 
 _REINGEST_FLAG_KEYS = (

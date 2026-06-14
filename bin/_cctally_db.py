@@ -2349,6 +2349,17 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_conv_turnkey
             ON conversation_messages(msg_id, req_id);
 
+        -- #193: per-session AI-generated title, isolated from the six places
+        -- that iterate conversation_messages. The explicit NOT NULL on the
+        -- non-INTEGER PRIMARY KEY matters (SQLite's legacy NULL-in-PK bug);
+        -- _session_titles_map can only key on a concrete session_id.
+        CREATE TABLE IF NOT EXISTS conversation_ai_titles (
+            session_id  TEXT NOT NULL PRIMARY KEY,
+            ai_title    TEXT NOT NULL,
+            source_path TEXT,
+            byte_offset INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS codex_session_files (
             path             TEXT PRIMARY KEY,
             size_bytes       INTEGER NOT NULL,
@@ -3380,6 +3391,19 @@ def _011_conversation_promote_command_args(conn: sqlite3.Connection) -> None:
     sole job is FTS-searchability + the list-title facet on legacy data. Mirrors
     the flag-only pattern of 002/003/007/009/010."""
     _set_cache_meta(conn, "conversation_promote_command_args_pending", "1")
+    conn.commit()
+
+
+@cache_migration("012_create_conversation_ai_titles")
+def _012_create_conversation_ai_titles(conn: sqlite3.Connection) -> None:
+    """Flag-only arm for #193. The conversation_ai_titles table itself is created
+    by _apply_cache_schema (runs on every open, fresh + existing installs); this
+    migration sets ``ai_titles_backfill_pending`` so sync_cache walks all history
+    once via backfill_ai_titles under the cache.db.lock flock. No data work here
+    -> the dispatcher's central stamp (#140) marks a complete handler; a fresh
+    install stamps WITHOUT a populated history (its incremental walk fills the
+    table as it ingests, and the consumed backfill no-ops). Mirrors 002/010/011."""
+    _set_cache_meta(conn, "ai_titles_backfill_pending", "1")
     conn.commit()
 
 

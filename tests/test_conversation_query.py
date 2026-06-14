@@ -2769,3 +2769,20 @@ def test_fresh_meta_compaction_excluded_from_prompts_search():
     # P2a: and it is absent from the prose / prompts search facet.
     res = cq.search_conversations(c, "continued from a previous", kind="prompts")
     assert all("c1" not in (h.get("uuid") or "") for h in res.get("hits", []))
+
+
+# ---------------------------------------------------------------------------
+# #193 Task 2: conversation_ai_titles table + _AI_TITLE_UPSERT_SQL
+# ---------------------------------------------------------------------------
+
+def test_conversation_ai_titles_table_and_upsert():
+    c = _conn()  # cache.db conn with _apply_cache_schema already run
+    cols = {r[1] for r in c.execute("PRAGMA table_info(conversation_ai_titles)")}
+    assert cols == {"session_id", "ai_title", "source_path", "byte_offset"}
+    import _cctally_cache as cc
+    up = cc._AI_TITLE_UPSERT_SQL
+    c.execute(up, ("s1", "First", "/p/s1.jsonl", 10)); c.commit()
+    c.execute(up, ("s1", "Second", "/p/s1.jsonl", 50)); c.commit()  # later write wins
+    assert c.execute(
+        "SELECT ai_title FROM conversation_ai_titles WHERE session_id='s1'"
+    ).fetchone()[0] == "Second"
