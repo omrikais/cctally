@@ -1408,8 +1408,12 @@ def build_per_migration_002_conversation_messages_backfill(
             # tests/test_migration_002_per_migration_goldens.py. Before this, the
             # stamp was an UPDATE that silently matched zero rows post-#140, so a
             # full rebuild produced a markerless post.sqlite and broke the test
-            # (issue #194). A pinned applied_at_utc keeps the committed golden
-            # rebuild-deterministic (no wall-clock churn). _stamp_applied commits.
+            # (issue #194). The pinned applied_at_utc makes the stamp itself
+            # deterministic and matches the value HEAD's committed 002 golden
+            # already carries, so a regen reproduces the marker exactly. (The 002
+            # golden's wider byte churn vs HEAD is pre-existing _apply_cache_schema
+            # drift — newer tables — independent of this marker fix and out of
+            # scope for #194.) _stamp_applied commits.
             db._stamp_applied(
                 conn, "002_conversation_messages_backfill",
                 "2026-04-30T12:00:00Z",
