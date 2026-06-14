@@ -955,10 +955,12 @@ def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
     Loaded by ``tests/test_migration_008_per_migration_goldens.py``.
     Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3.
     """
-    # Note: post.sqlite's schema_migrations.applied_at_utc is a wall-clock
-    # now_utc_iso() stamped by the real migration handler, so a rebuild churns
-    # a few bytes there. The per-migration goldens test deliberately does NOT
-    # assert applied_at_utc — this is expected, not a phantom dirty fixture.
+    # Note: #140 moved the schema_migrations marker stamp out of the handler and
+    # into the dispatcher's central _stamp_applied. Builders bypass the
+    # dispatcher, so _build_post applies that stamp itself with a pinned
+    # applied_at_utc (TS_008_APPLIED) — the marker is present (the per-migration
+    # test asserts it) and the committed golden stays rebuild-deterministic
+    # (issue #194). The test deliberately does not assert applied_at_utc's value.
     scenario_dir.mkdir(parents=True, exist_ok=True)
     pre_stats = scenario_dir / "pre.sqlite"
     pre_cache = scenario_dir / "pre-cache.sqlite"
@@ -969,6 +971,11 @@ def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
     # deterministically.
     TS_001_APPLIED = "2026-05-22T00:00:00Z"
     TS_POST_001_INGEST = "2026-05-22T01:00:00Z"
+    # Pinned marker stamp for 008 (applied after the post-001 ingest). The
+    # dispatcher owns the central stamp post-#140; _build_post applies it
+    # explicitly with this fixed value so the committed golden carries the
+    # marker AND stays rebuild-deterministic (issue #194).
+    TS_008_APPLIED = "2026-05-22T02:00:00Z"
     RANGE_START = "2026-05-15T00:00:00+00:00"
     RANGE_END = "2026-05-22T00:00:00+00:00"
     ENTRY_TS = "2026-05-18T00:00:00Z"
@@ -1154,6 +1161,19 @@ def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         projects_dir.mkdir(parents=True, exist_ok=True)
         (projects_dir / "session1.jsonl").write_text("{}\n")
 
+        # The 008 handler eagerly opens cache.db for WRITE (cache 001's
+        # dispatcher runs via _eagerly_apply_cache_migrations before the gate
+        # check), so point CACHE_DB_PATH at a throwaway COPY — pointing it at the
+        # in-tree pre-cache.sqlite would mutate that committed fixture (it would
+        # gain every downstream cache marker plus wall-clock applied_at_utc
+        # stamps), dirtying it on every rebuild (issue #194). Mirrors the
+        # writable-copy pattern in
+        # tests/test_migration_008_per_migration_goldens.py.
+        work_cache = scenario_dir / "_work_cache.db"
+        if work_cache.exists():
+            work_cache.unlink()
+        shutil.copy(pre_cache_path, work_cache)
+
         handler = None
         for m in mod._STATS_MIGRATIONS:
             if m.name == "008_recompute_weekly_cost_snapshots_dedup_fix":
@@ -1164,12 +1184,25 @@ def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
                 "008_recompute_weekly_cost_snapshots_dedup_fix not registered"
             )
         try:
-            core.CACHE_DB_PATH = pre_cache_path
+            core.CACHE_DB_PATH = work_cache
             core.CLAUDE_PROJECTS_DIR = projects_dir
             conn = sqlite3.connect(dst)
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
                 handler(conn)
+                # #140: the handler no longer self-stamps its marker — the
+                # dispatcher owns the central stamp via _stamp_applied. Builders
+                # call the handler directly (bypassing the dispatcher), so apply
+                # that same stamp here, mirroring
+                # tests/test_migration_008_per_migration_goldens.py. Without it a
+                # full rebuild produced a markerless post.sqlite and broke the
+                # test (issue #194). The pinned applied_at_utc keeps the committed
+                # golden rebuild-deterministic. _stamp_applied commits.
+                mod._stamp_applied(
+                    conn,
+                    "008_recompute_weekly_cost_snapshots_dedup_fix",
+                    TS_008_APPLIED,
+                )
             finally:
                 conn.close()
         finally:
@@ -1179,6 +1212,12 @@ def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
             # byte-stable across runs (no stray sibling tree).
             import shutil as _sh
             _sh.rmtree(projects_dir, ignore_errors=True)
+            # Drop the throwaway cache copy (+ any WAL/SHM sidecars) so the
+            # committed fixture dir holds only pre/pre-cache/post .sqlite.
+            for _suffix in ("", "-wal", "-shm"):
+                _p = Path(str(work_cache) + _suffix)
+                if _p.exists():
+                    _p.unlink()
 
     _build_pre_stats(pre_stats)
     _build_pre_cache(pre_cache)
@@ -1361,15 +1400,20 @@ def build_per_migration_002_conversation_messages_backfill(
             # carries an EMPTY conversation_messages + the flag + the marker
             # (no CLAUDE_CONFIG_DIR / no JSONL needed by the handler anymore).
             handler(conn)
-            # Pin the marker timestamp so the committed golden is
-            # rebuild-deterministic — the handler self-stamps with wall-clock
-            # now_utc_iso(), which would otherwise churn a few bytes per rebuild.
-            conn.execute(
-                "UPDATE schema_migrations SET applied_at_utc = ? WHERE name = ?",
-                ("2026-04-30T12:00:00Z",
-                 "002_conversation_messages_backfill"),
+            # #140: the handler no longer self-stamps its schema_migrations
+            # marker — the dispatcher owns the central stamp via _stamp_applied,
+            # which it calls right after the handler returns cleanly. Fixture
+            # builders bypass the dispatcher (they invoke the handler directly),
+            # so we apply that same central stamp here, mirroring
+            # tests/test_migration_002_per_migration_goldens.py. Before this, the
+            # stamp was an UPDATE that silently matched zero rows post-#140, so a
+            # full rebuild produced a markerless post.sqlite and broke the test
+            # (issue #194). A pinned applied_at_utc keeps the committed golden
+            # rebuild-deterministic (no wall-clock churn). _stamp_applied commits.
+            db._stamp_applied(
+                conn, "002_conversation_messages_backfill",
+                "2026-04-30T12:00:00Z",
             )
-            conn.commit()
         finally:
             conn.close()
 
