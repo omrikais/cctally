@@ -82,7 +82,7 @@ describe('useConversations — visibility gating', () => {
     // that resolved unconditionally would let BOTH burst fetches complete and
     // make the "exactly one completes" assertion vacuous.
     fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(
-      (_url: unknown, init?: { signal?: AbortSignal }) =>
+      (_url: unknown, init?: RequestInit) =>
         new Promise<Response>((resolve, reject) => {
           const signal = init?.signal;
           if (signal?.aborted) {
