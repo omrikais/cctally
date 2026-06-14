@@ -196,6 +196,19 @@ def _session_titles_map(conn, session_ids):
     if not session_ids:
         return {}
     titles = {}
+    # #193: AI title wins when present. Query the dedicated table first; the
+    # existing first-prompt scan below fills only sessions WITHOUT one (its
+    # ``if sid in titles: continue`` guard skips ai-title sessions for free).
+    try:
+        ph0 = ",".join("?" for _ in session_ids)
+        for sid, at in conn.execute(
+            f"SELECT session_id, ai_title FROM conversation_ai_titles "
+            f"WHERE session_id IN ({ph0})", tuple(session_ids)
+        ).fetchall():
+            if at:
+                titles[sid] = at
+    except sqlite3.OperationalError:
+        pass  # table absent (pre-migration / :memory:) -> fall through to first-prompt
     # While 005's reingest is pending, a stale `human` row may actually be an
     # injected skill body (a SessionStart skill can even lead the transcript) —
     # skip those as title candidates so the rail never shows "Base directory for

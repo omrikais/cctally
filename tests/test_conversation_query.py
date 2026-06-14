@@ -2786,3 +2786,60 @@ def test_conversation_ai_titles_table_and_upsert():
     assert c.execute(
         "SELECT ai_title FROM conversation_ai_titles WHERE session_id='s1'"
     ).fetchone()[0] == "Second"
+
+
+# ---------------------------------------------------------------------------
+# #193 Task 4: _session_titles_map ai-title precedence + fallback chain
+# ---------------------------------------------------------------------------
+
+def test_session_titles_prefers_ai_title():
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="Do the thing")
+    c.execute("INSERT INTO conversation_ai_titles VALUES('s1','AI Title','/p',9)")
+    c.commit()
+    assert cq._session_titles_map(c, ["s1"]).get("s1") == "AI Title"
+
+
+def test_session_titles_falls_back_to_first_prompt():
+    c = _conn()
+    _msg(c, session_id="s2", uuid="h2", source_path="b.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="Do the thing")  # NO ai-title for s2
+    assert cq._session_titles_map(c, ["s2"]).get("s2") == "Do the thing"
+
+
+def test_session_titles_mixed_some_ai_some_fallback():
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="first prompt one")
+    _msg(c, session_id="s2", uuid="h2", source_path="b.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="first prompt two")
+    c.execute("INSERT INTO conversation_ai_titles VALUES('s1','AI One','/p',9)")
+    c.commit()
+    m = cq._session_titles_map(c, ["s1", "s2"])
+    assert m.get("s1") == "AI One"          # ai-title wins
+    assert m.get("s2") == "first prompt two"  # falls back
+
+
+def test_session_titles_table_absent_degrades_to_first_prompt():
+    # a :memory: conn WITHOUT the ai-titles table must not raise — degrades to
+    # the existing first-prompt scan (table-absent OperationalError swallowed).
+    c = sqlite3.connect(":memory:")
+    c.executescript(
+        "CREATE TABLE conversation_messages ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, uuid TEXT,"
+        " parent_uuid TEXT, source_path TEXT NOT NULL, byte_offset INTEGER NOT NULL,"
+        " timestamp_utc TEXT, entry_type TEXT NOT NULL, text TEXT NOT NULL DEFAULT '',"
+        " blocks_json TEXT NOT NULL DEFAULT '[]', model TEXT, msg_id TEXT, req_id TEXT,"
+        " cwd TEXT, git_branch TEXT, is_sidechain INTEGER NOT NULL DEFAULT 0,"
+        " source_tool_use_id TEXT, search_tool TEXT NOT NULL DEFAULT '',"
+        " search_thinking TEXT NOT NULL DEFAULT '', search_aux TEXT NOT NULL DEFAULT '');"
+    )
+    c.execute(
+        "INSERT INTO conversation_messages(session_id,source_path,byte_offset,"
+        " timestamp_utc,entry_type,text,is_sidechain) VALUES('s3','c.jsonl',0,"
+        " '2026-06-01T00:00:00Z','human','only prompt',0)")
+    c.commit()
+    assert cq._session_titles_map(c, ["s3"]).get("s3") == "only prompt"
