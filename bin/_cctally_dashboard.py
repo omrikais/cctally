@@ -251,6 +251,32 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """`ThreadingHTTPServer` that swallows client-disconnect tracebacks.
+
+    A backgrounded/closed/reloaded dashboard tab hangs up mid-response, so the
+    per-request thread's socket write raises one of the "peer went away"
+    exceptions, which `socketserver` routes through `handle_error`. On a local
+    dashboard that is expected and benign — dumping a socket-write stack trace
+    to the user's console for every such disconnect is pure noise (the original
+    report was repeated `BrokenPipeError` spam after hours idle). Everything
+    else still gets the full traceback via `super().handle_error`.
+
+    `daemon_threads = True` is folded in here (was an inline `srv.*` assignment):
+    SSE handler threads may block up to 15s on the keep-alive timeout — let them
+    die with the process.
+    """
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):  # noqa: D401
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            # Client hung up mid-response; benign on a local dashboard.
+            return
+        super().handle_error(request, client_address)
+
+
 def _cctally():
     """Resolve the current ``cctally`` module at call-time (spec §5.5)."""
     return sys.modules["cctally"]
@@ -8251,8 +8277,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     update_check_thread.start()
 
     # HTTP server on its own thread so the main thread can block on signal.
-    srv = ThreadingHTTPServer((args.host, args.port), DashboardHTTPHandler)
-    srv.daemon_threads = True  # SSE handler threads may block up to 15s on keep-alive timeout — let them die with the process.
+    # `_QuietThreadingHTTPServer` folds in `daemon_threads = True` and silences
+    # client-disconnect tracebacks (spec §5).
+    srv = _QuietThreadingHTTPServer((args.host, args.port), DashboardHTTPHandler)
 
     bind_host = args.host
     bind_port = srv.server_address[1]
