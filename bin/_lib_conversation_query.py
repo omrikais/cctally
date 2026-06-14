@@ -549,6 +549,7 @@ def _assemble_session(conn, session_id):
     # the top-level subagent_meta map (no undocumented block keys leak). Join is
     # spawn tool_use id <-> tool_result tool_use_id; agent_id == subagent_key.
     spawn_kind = {}     # tool_use id -> subagent_type
+    spawn_desc = {}     # tool_use id -> spawning Task description (#193)
     agent_link = {}     # tool_use id -> (agent_id, raw_meta)
     ask_link = {}       # tool_use id -> (answers, annotations)  (#177 S2)
     bash_link = {}      # tool_use id -> (stderr, interrupted)   (#177 S3)
@@ -562,6 +563,13 @@ def _assemble_session(conn, session_id):
                 st = b.pop("subagent_type", None)
                 if st and b.get("id") is not None:
                     spawn_kind[b["id"]] = st
+                    # #193: harvest the spawning Task description from the
+                    # already-stored bounded input. Guarded on subagent_type, so
+                    # a Bash `description` (no subagent_type) is NEVER picked up.
+                    _inp = b.get("input")
+                    _d = _inp.get("description") if isinstance(_inp, dict) else None
+                    if isinstance(_d, str) and _d.strip():
+                        spawn_desc[b["id"]] = _d
             elif k == "tool_result":
                 aid = b.pop("agent_id", None)
                 meta = b.pop("subagent_meta", None)
@@ -592,6 +600,8 @@ def _assemble_session(conn, session_id):
             continue                       # spawn with no (yet) result -> title-only
         _aid, _raw = _link
         _entry = {"kind": _kind}
+        if spawn_desc.get(_tuid):          # #193: spawning Task description
+            _entry["description"] = spawn_desc[_tuid]
         for _f in ("total_tokens", "total_duration_ms", "total_tool_use_count", "status"):
             if _raw.get(_f) is not None:
                 _entry[_f] = _raw[_f]
@@ -796,6 +806,13 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     subagent_meta = asm["subagent_meta"]
     header_cost = asm["header_cost"]
 
+    # #193: compute the reader header title ONCE so BOTH return sites (the early
+    # empty/stale-cursor return and the normal return) carry it. Same fallback
+    # chain the rail/search rows use: ai-title -> first human prompt -> project
+    # label -> session_id (matching the list's `titles.get(sid) or pl or sid`).
+    _pl = _project_label(_latest(logical, 10))
+    _title = _session_titles_map(conn, [session_id]).get(session_id) or _pl or session_id
+
     # Cursor pagination over the item list (anchored to each item's canonical id).
     # A non-None `after` that matches no item's anchor (stale/deleted cursor)
     # yields an EMPTY page — never silently re-serves the head (M1).
@@ -809,7 +826,8 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
         if start is None:
             return {
                 "session_id": session_id,
-                "project_label": _project_label(_latest(logical, 10)),
+                "title": _title,
+                "project_label": _pl,
                 "git_branch": _latest(logical, 11),
                 "started_utc": logical[0][2],
                 "last_activity_utc": logical[-1][2],
@@ -843,7 +861,8 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     models = sorted({r[6] for r in logical if r[6]})
     return {
         "session_id": session_id,
-        "project_label": _project_label(_latest(logical, 10)),
+        "title": _title,
+        "project_label": _pl,
         "git_branch": _latest(logical, 11),
         "started_utc": first[2],
         "last_activity_utc": last[2],

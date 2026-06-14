@@ -2843,3 +2843,116 @@ def test_session_titles_table_absent_degrades_to_first_prompt():
         " '2026-06-01T00:00:00Z','human','only prompt',0)")
     c.commit()
     assert cq._session_titles_map(c, ["s3"]).get("s3") == "only prompt"
+
+
+# ---------------------------------------------------------------------------
+# #193 Task 5: get_conversation returns `title` in BOTH return paths
+# ---------------------------------------------------------------------------
+
+def test_get_conversation_includes_title_ai():
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="Hello there", cwd="/home/u/proj")
+    c.execute("INSERT INTO conversation_ai_titles VALUES('s1','AI Title','/p',9)")
+    c.commit()
+    d = cq.get_conversation(c, "s1")
+    assert d["title"] == "AI Title"
+
+
+def test_get_conversation_title_falls_back_to_first_prompt():
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="Hello there", cwd="/home/u/proj")   # no ai-title
+    d = cq.get_conversation(c, "s1")
+    assert d["title"] == "Hello there"
+
+
+def test_get_conversation_title_on_empty_page():
+    # an after-cursor past the end -> the early empty-page return must still carry title
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="Hello there", cwd="/home/u/proj")
+    c.execute("INSERT INTO conversation_ai_titles VALUES('s1','AI Title','/p',9)")
+    c.commit()
+    d = cq.get_conversation(c, "s1", after="9999999")
+    assert d["items"] == []                # empty/stale-cursor page
+    assert d["title"] == "AI Title"        # title still stamped on the early return
+
+
+def test_get_conversation_title_label_then_sid_fallback():
+    # no ai-title AND no human first-prompt -> falls to project label, then sid.
+    c = _conn()
+    _msg(c, session_id="s9", uuid="a1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="only assistant", model=_MODEL, msg_id="m1", req_id="r1",
+         cwd="/home/u/proj")
+    d = cq.get_conversation(c, "s9")
+    assert d["title"] == "proj"            # project label (no human prompt, no ai-title)
+
+
+# ---------------------------------------------------------------------------
+# #193 Task 6: subagent description harvest into subagent_meta
+# ---------------------------------------------------------------------------
+
+def test_subagent_meta_carries_spawn_description():
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Task",
+                 "input": {"subagent_type": "general-purpose",
+                           "description": "Code review Phase A"},
+                 "id": "t1", "preview": "audit", "subagent_type": "general-purpose"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "done", "truncated": False,
+                 "is_error": False, "tool_use_id": "t1",
+                 "agent_id": "abc", "subagent_meta": {}}])
+    d = cq.get_conversation(conn, "s1")
+    meta = d["subagent_meta"]["abc"]
+    assert meta["kind"] == "general-purpose"
+    assert meta["description"] == "Code review Phase A"
+
+
+def test_subagent_meta_no_description_when_absent():
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Task",
+                 "input": {"subagent_type": "Explore"},   # no description
+                 "id": "t1", "preview": "audit", "subagent_type": "Explore"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "done", "truncated": False,
+                 "is_error": False, "tool_use_id": "t1",
+                 "agent_id": "abc", "subagent_meta": {}}])
+    d = cq.get_conversation(conn, "s1")
+    assert "description" not in d["subagent_meta"]["abc"]
+
+
+def test_subagent_meta_blank_description_dropped():
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Task",
+                 "input": {"subagent_type": "Explore", "description": "   "},
+                 "id": "t1", "preview": "audit", "subagent_type": "Explore"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "done", "truncated": False,
+                 "is_error": False, "tool_use_id": "t1",
+                 "agent_id": "abc", "subagent_meta": {}}])
+    d = cq.get_conversation(conn, "s1")
+    assert "description" not in d["subagent_meta"]["abc"]
+
+
+def test_bash_description_not_harvested_as_subagent():
+    # a Bash tool_use with input.description but NO subagent_type must not create
+    # or pollute any subagent_meta entry.
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Bash",
+                 "input": {"command": "ls -la", "description": "List files"},
+                 "id": "t1", "preview": "ls -la"}])   # NO subagent_type
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "out", "truncated": False,
+                 "is_error": False, "tool_use_id": "t1"}])
+    d = cq.get_conversation(conn, "s1")
+    # no subagent entry at all (no subagent_type), and certainly no description leak
+    assert d["subagent_meta"] == {}
