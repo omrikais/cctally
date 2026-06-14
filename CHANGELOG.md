@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.0] - 2026-06-14
+
 ### Changed
 - Conversation viewer: the dashboard conversation browse-rail is now served from a `conversation_sessions` rollup (a small per-session COUNT/MIN/MAX table maintained inside `sync_cache` under the cache lock, indexed for the recent ordering) instead of a full-table `GROUP BY` over every message on each page load, so the rail stays fast as your history grows and when a backgrounded tab refocuses after queuing SSE ticks; the rollup is re-derivable like the rest of `cache.db` (a one-time backfill arms automatically on the next sync via cache migration `013`, with a live `GROUP BY` fallback until it lands, so the rail's output is byte-identical either way), and the rail now pauses its per-tick page-1 refetch while the tab is hidden, firing exactly one refetch on the hidden→visible transition so a freshly-revealed reader is current without re-querying every five seconds while idle.
 
