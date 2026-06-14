@@ -1300,7 +1300,14 @@ def backfill_ai_titles(conn: sqlite3.Connection) -> int:
     last-write-wins ordering is stable under the deterministic mtime walk).
     Returns rows upserted."""
     n = 0
-    files = sorted(_iter_claude_jsonl_files(), key=lambda p: p.stat().st_mtime)
+
+    def _mtime(p):
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0  # vanished mid-walk; sorts first, the open() below skips it
+
+    files = sorted(_iter_claude_jsonl_files(), key=_mtime)
     for jp in files:
         path_str = str(jp)
         rows: list[tuple[Any, ...]] = []
@@ -1311,10 +1318,9 @@ def backfill_ai_titles(conn: sqlite3.Connection) -> int:
         except OSError as exc:
             eprint(f"[ai-title-backfill] could not read {jp}: {exc}")
             continue
-        for row in rows:
-            conn.execute(_AI_TITLE_UPSERT_SQL, row)
-            n += 1
         if rows:
+            conn.executemany(_AI_TITLE_UPSERT_SQL, rows)
+            n += len(rows)
             conn.commit()
     return n
 

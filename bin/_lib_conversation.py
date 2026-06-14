@@ -263,16 +263,14 @@ def parse_message_row(obj, offset):
     return _normalize(obj, t, offset)
 
 
+@dataclass
 class AiTitleRow:
     """Pure per-line AI-title record (no I/O). Parallels MessageRow but for the
     main-session ``{"type":"ai-title","aiTitle":...,"sessionId":...}`` lines that
     parse_message_row drops (type not in user/assistant). #193."""
-    __slots__ = ("session_id", "ai_title", "byte_offset")
-
-    def __init__(self, session_id, ai_title, byte_offset):
-        self.session_id = session_id
-        self.ai_title = ai_title
-        self.byte_offset = byte_offset
+    session_id: "str | None"
+    ai_title: str
+    byte_offset: int
 
 
 def parse_ai_title(obj, offset):

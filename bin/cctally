@@ -792,6 +792,7 @@ _progress_stderr = _cctally_cache._progress_stderr
 _ensure_session_files_row = _cctally_cache._ensure_session_files_row
 sync_cache = _cctally_cache.sync_cache
 backfill_conversation_messages = _cctally_cache.backfill_conversation_messages
+backfill_ai_titles = _cctally_cache.backfill_ai_titles
 iter_entries = _cctally_cache.iter_entries
 _collect_entries_direct = _cctally_cache._collect_entries_direct
 _JoinedClaudeEntry = _cctally_cache._JoinedClaudeEntry

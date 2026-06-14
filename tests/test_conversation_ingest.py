@@ -1382,3 +1382,60 @@ def test_sync_cache_ai_title_last_non_null_wins_in_file(isolated):
     assert conn.execute(
         "SELECT ai_title FROM conversation_ai_titles WHERE session_id='s1'"
     ).fetchone()[0] == "Second"
+
+
+def test_backfill_ai_titles_cross_file_mtime_ordering_wins(isolated):
+    """A session whose ai-title spans two JSONL files (a ``--resume``) must
+    resolve to the title from the MTIME-LATER file. ``backfill_ai_titles`` walks
+    files mtime-ascending and UPSERTs on ``session_id`` (last-write-wins), so the
+    newer file's title overwrites the older's.
+
+    Non-vacuity guard: the two filenames are chosen so STRING order
+    (``a.jsonl`` < ``z.jsonl``) is the OPPOSITE of mtime order — the LATER file
+    sorts FIRST alphabetically. An unsorted (or string-sorted) walk would write
+    the newer title first and the OLDER title last, picking the wrong winner;
+    only the mtime sort yields ``Newer``."""
+    ns, conn, projects, sync = isolated
+    backfill = ns["backfill_ai_titles"]
+    # a.jsonl sorts FIRST by name but carries the NEWER mtime + winning title;
+    # z.jsonl sorts LAST by name but is OLDER. mtime-ascending => z then a.
+    f_new = projects / "a.jsonl"
+    f_old = projects / "z.jsonl"
+    f_new.write_text(_ai_title_line("Newer", session_id="s1"))
+    f_old.write_text(_ai_title_line("Older", session_id="s1"))
+    import os
+    os.utime(f_old, (1_700_000_000, 1_700_000_000))   # older
+    os.utime(f_new, (1_700_000_100, 1_700_000_100))   # newer (wins)
+
+    n = backfill(conn)
+    assert n == 2, n   # both files upserted
+    assert conn.execute(
+        "SELECT ai_title FROM conversation_ai_titles WHERE session_id='s1'"
+    ).fetchone()[0] == "Newer"
+
+
+def test_backfill_ai_titles_rerun_does_not_regress(isolated):
+    """A second ``backfill_ai_titles`` over the same files reproduces the same
+    mtime-ascending walk and re-UPSERTs the identical winning title — the
+    resolved title is unchanged (idempotent / no regression)."""
+    ns, conn, projects, sync = isolated
+    backfill = ns["backfill_ai_titles"]
+    f_new = projects / "a.jsonl"
+    f_old = projects / "z.jsonl"
+    f_new.write_text(_ai_title_line("Newer", session_id="s1"))
+    f_old.write_text(_ai_title_line("Older", session_id="s1"))
+    import os
+    os.utime(f_old, (1_700_000_000, 1_700_000_000))
+    os.utime(f_new, (1_700_000_100, 1_700_000_100))
+
+    backfill(conn)
+    first = conn.execute(
+        "SELECT ai_title FROM conversation_ai_titles WHERE session_id='s1'"
+    ).fetchone()[0]
+    assert first == "Newer"
+
+    backfill(conn)   # re-run
+    second = conn.execute(
+        "SELECT ai_title FROM conversation_ai_titles WHERE session_id='s1'"
+    ).fetchone()[0]
+    assert second == first == "Newer", (first, second)
