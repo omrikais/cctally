@@ -210,6 +210,7 @@ export interface ConversationsPage {
 // given key → the card falls back to its title-only rendering.
 export interface SubagentMeta {
   kind: string;
+  description?: string;   // #193 — spawning Task description (server-harvested)
   total_tokens?: number;
   total_duration_ms?: number;
   total_tool_use_count?: number;
@@ -218,6 +219,7 @@ export interface SubagentMeta {
 
 export interface ConversationDetail {
   session_id: string;
+  title?: string;   // #193 — server-derived (ai-title -> first prompt -> label -> sid)
   project_label: string;
   git_branch: string | null;
   started_utc: string;
