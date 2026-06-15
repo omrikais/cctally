@@ -224,6 +224,94 @@ describe('deriveOutline (#186 §3 section walk)', () => {
     expect(ids.every((id) => typeof id === 'string' && id.length > 0)).toBe(true);
   });
 
+  // cache-failure-markers spec §4 — three placement cases + the opt-out gate.
+  // deriveOutline takes a third `markersEnabled` arg (default true); when on, a
+  // flagged turn either emits a standalone 'cache' landmark (generic prose),
+  // flags a coinciding landmark, or flags its subagent bucket row.
+  const cf = { tokens_recreated: 130000, prev_cached: 130000, est_wasted_usd: 0.7475 };
+
+  it('a generic flagged prose turn → a standalone cache landmark with cacheInfo', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+      // generic prose (no error/plan/heading) but flagged.
+      turn({ uuid: 'a1', kind: 'assistant', label: 'rebuilt the prefix', cache_failure: cf }),
+    ], undefined, true);
+    const cache = entries.find((e) => e.type === 'cache');
+    expect(cache).toBeTruthy();
+    expect(cache).toMatchObject({
+      uuid: 'a1', type: 'cache', depth: 1, cache: true,
+      cacheInfo: { tokens_recreated: 130000, est_wasted_usd: 0.7475 },
+    });
+    // The label carries the humanized tokens + ~$ wasted.
+    expect(cache!.label.toLowerCase()).toContain('cache rebuilt');
+    expect(cache!.label).toContain('130K');
+    expect(cache!.label).toContain('$0.75');
+    // No duplicate row for the same turn — exactly one entry at a1.
+    expect(entries.filter((e) => e.uuid === 'a1')).toHaveLength(1);
+  });
+
+  it('coincide: a flagged turn that is ALSO a plan → no second row, the plan entry gets cache:true', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'plan it' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: 'proposing', cache_failure: cf,
+             tools: [{ name: 'ExitPlanMode', is_error: false }] }),
+    ], undefined, true);
+    // The plan entry stays a plan (its glyph/label win); it just carries the flag.
+    const plan = entries.find((e) => e.uuid === 'a1')!;
+    expect(plan.type).toBe('plan');
+    expect(plan.cache).toBe(true);
+    expect(plan.cacheInfo).toMatchObject({ tokens_recreated: 130000, est_wasted_usd: 0.7475 });
+    // No separate standalone cache row for the same turn.
+    expect(entries.filter((e) => e.uuid === 'a1')).toHaveLength(1);
+    expect(entries.some((e) => e.type === 'cache')).toBe(false);
+  });
+
+  it('coincide: a flagged turn that is ALSO an error → error type kept, cache:true added', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'run it' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: '', cache_failure: cf,
+             tools: [{ name: 'Bash', is_error: true }] }),
+    ], undefined, true);
+    const e = entries.find((x) => x.uuid === 'a1')!;
+    expect(e.type).toBe('error');     // error still wins the type/glyph (red)
+    expect(e.cache).toBe(true);       // but the cache flag rides along
+  });
+
+  it('subagent: a flagged subagent turn → bucket row gets cache:true, no nested cache row', () => {
+    const meta = { sk1: { kind: 'explore' } };
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'dispatch' }),
+      turn({ uuid: 's1', kind: 'assistant', label: 'sub a', subagent_key: 'sk1', parent_uuid: 'x', member_uuids: ['s1'] }),
+      turn({ uuid: 's2', kind: 'assistant', label: 'rebuilt', subagent_key: 'sk1', parent_uuid: 's1', cache_failure: cf, member_uuids: ['s2'] }),
+    ], meta, true);
+    const bucket = entries.find((e) => e.type === 'subagent')!;
+    expect(bucket.cache).toBe(true);
+    expect(bucket.cacheInfo).toMatchObject({ tokens_recreated: 130000 });
+    // No standalone 'cache' row nested inside the bucket.
+    expect(entries.some((e) => e.type === 'cache')).toBe(false);
+  });
+
+  it('markersEnabled=false → zero cache curation (no rows, no flags, no cacheInfo)', () => {
+    const meta = { sk1: { kind: 'explore' } };
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: 'generic', cache_failure: cf }),
+      turn({ uuid: 'a2', kind: 'assistant', label: 'plan', cache_failure: cf, tools: [{ name: 'ExitPlanMode', is_error: false }] }),
+      turn({ uuid: 's1', kind: 'assistant', label: 'sub', subagent_key: 'sk1', parent_uuid: 'x', cache_failure: cf }),
+    ], meta, false);
+    expect(entries.some((e) => e.type === 'cache')).toBe(false);
+    expect(entries.some((e) => e.cache)).toBe(false);
+    expect(entries.every((e) => e.cacheInfo === undefined)).toBe(true);
+  });
+
+  it('default markersEnabled (omitted arg) curates cache landmarks (back-compat default ON)', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: 'rebuilt', cache_failure: cf }),
+    ], undefined);
+    expect(entries.some((e) => e.type === 'cache')).toBe(true);
+  });
+
   it('#193: subagent landmark label uses description, falls back to kind', () => {
     // With a spawning Task description, the landmark mirrors the thread header.
     const withDesc: Record<string, SubagentMeta> = {

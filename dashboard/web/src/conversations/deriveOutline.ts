@@ -1,4 +1,12 @@
-import type { OutlineTurn, SubagentMeta } from '../types/conversation';
+import type { CacheFailure, OutlineTurn, SubagentMeta } from '../types/conversation';
+import { fmt } from '../lib/fmt';
+
+// cache-failure-markers spec §4 — the standalone cache-landmark label:
+// "cache rebuilt · 130K · ~$0.75". Uppercase-K humanized tokens (fmt.compact)
+// to match the spec's outline phrasing; ~$ wasted via fmt.usd2.
+function cacheLabel(cf: CacheFailure): string {
+  return `cache rebuilt · ${fmt.compact(cf.tokens_recreated, { upper: true })} · ~${fmt.usd2(cf.est_wasted_usd)}`;
+}
 
 // #186 §3 — outline rail = direction C ("prompt spine + curated landmarks").
 // Pure curation over the server's per-turn skeleton. Curation policy lives HERE
@@ -42,12 +50,19 @@ export interface OutlineEntry {
   // entryId (already unique) and the bucket root uuid as the jump anchor.
   entryId: string;
   uuid: string;                       // jump target (anchor uuid / bucket root)
-  type: 'human' | 'heading' | 'subagent' | 'error' | 'plan' | 'question';
+  type: 'human' | 'heading' | 'subagent' | 'error' | 'plan' | 'question' | 'cache';
   label: string;
   depth: 0 | 1;                       // 0 = prompt / pre-prompt landmark; 1 = section landmark
   error: boolean;
   plan: boolean;                      // ExitPlanMode present
   question: boolean;                  // AskUserQuestion present
+  // cache-failure-markers spec §4 — set on ANY flagged row: a standalone
+  // 'cache' landmark, a coinciding landmark (plan/error/heading) that keeps its
+  // own type but takes the flag, or a subagent bucket whose thread carried a
+  // failure. Renders a trailing amber ⚡ suffix. `cacheInfo` carries the
+  // tokens/$ for the row label + the jump list; absent on unflagged rows.
+  cache?: boolean;
+  cacheInfo?: { tokens_recreated: number; est_wasted_usd: number };
   thinkingCount: number;              // prompt rows: total thinking blocks in the section; 0 otherwise
   toolCount: number;
   subagentKey?: string;
@@ -69,6 +84,10 @@ const HEADING_RE = /^#{1,6}\s+\S/;
 export function deriveOutline(
   turns: OutlineTurn[],
   subagentMeta: Record<string, SubagentMeta> | undefined,
+  // cache-failure-markers spec §4 — opt-out gate. Default true (opt-out): when
+  // off, cache curation is skipped ENTIRELY (no standalone rows, no flags, no
+  // suffixes) so the outline counts + navigation stay self-consistent.
+  markersEnabled = true,
 ): DerivedOutline {
   // 1. Bucket sidechains by subagent_key over the WHOLE list (mirror
   //    groupSidechains resolution; placement differs below).
@@ -104,12 +123,20 @@ export function deriveOutline(
   const emitBucket = (k: string) => {
     const b = buckets.get(k)!;
     const anyErr = b.some((t) => t.tools?.some((x) => x.is_error));
+    // cache-failure-markers spec §4 — a flagged subagent turn flags the BUCKET
+    // row (trailing ⚡) rather than nesting a row inside it (keeps the rail
+    // shallow). Use the FIRST flagged member's payload for the row's cacheInfo.
+    const cfMember = markersEnabled ? b.find((t) => t.cache_failure) : undefined;
     entries.push({
       entryId: `sc:${k}`, uuid: b[0].uuid, type: 'subagent',
       // #193 (Codex P2-4): mirror the thread header — prefer the spawning Task
       // description, fall back to `subagent · <kind>` when none is plumbed.
       label: subagentMeta?.[k]?.description ?? `subagent · ${subagentMeta?.[k]?.kind ?? 'agent'}`,
       depth: depth(), error: anyErr, plan: false, question: false, thinkingCount: 0,
+      cache: cfMember ? true : undefined,
+      cacheInfo: cfMember?.cache_failure
+        ? { tokens_recreated: cfMember.cache_failure.tokens_recreated, est_wasted_usd: cfMember.cache_failure.est_wasted_usd }
+        : undefined,
       toolCount: b.reduce((n, t) => n + (t.tools?.length ?? 0), 0),
       subagentKey: k, subagentKind: subagentMeta?.[k]?.kind,
       turnIndex: indexOf.get(b[0].uuid) ?? 0,
@@ -181,11 +208,35 @@ export function deriveOutline(
       type = 'heading';
       label = t.label;
     }
-    if (type == null) continue; // generic prose / pure tool relay → no row
+    // cache-failure-markers spec §4 — the per-turn flag (main-thread only;
+    // subagent members never reach here, they're handled by emitBucket above).
+    const cf = markersEnabled ? t.cache_failure : undefined;
+    const cacheInfo = cf
+      ? { tokens_recreated: cf.tokens_recreated, est_wasted_usd: cf.est_wasted_usd }
+      : undefined;
 
+    if (type == null) {
+      // Generic prose / pure tool relay → normally no row. But a FLAGGED generic
+      // turn emits a STANDALONE 'cache' landmark at its document position
+      // (spec §4 case 1). Unflagged generic turns still drop out.
+      if (cf) {
+        entries.push({
+          entryId: t.uuid, uuid: t.uuid, type: 'cache', label: cacheLabel(cf),
+          depth: depth(), error: false, plan: false, question: false,
+          cache: true, cacheInfo,
+          thinkingCount: 0, toolCount, turnIndex: indexOf.get(t.uuid) ?? 0,
+        });
+      }
+      continue;
+    }
+
+    // A flagged turn that ALSO coincides with a landmark (plan/error/heading)
+    // keeps its own type/glyph/label but takes the cache flag + cacheInfo
+    // (spec §4 case 2) — a trailing ⚡ suffix, mirroring the thinking suffix.
     entries.push({
       entryId: t.uuid, uuid: t.uuid, type, label,
       depth: depth(), error: err, plan, question,
+      cache: cf ? true : undefined, cacheInfo,
       thinkingCount: 0, toolCount, turnIndex: indexOf.get(t.uuid) ?? 0,
     });
   }
