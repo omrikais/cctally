@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.46.0] - 2026-06-15
+
 ### Added
 - Conversation viewer: the open reader now live-tails an active conversation in near-real time — new turns appear within about a second of the session's file changing (instead of waiting for the periodic 5-second dashboard tick) via a dedicated per-conversation SSE stream that watches only the open session's transcript; the live-tail is on by default and can be turned off with the new `dashboard.live_tail` config key (or the dashboard's Settings → "Conversation viewer" toggle), and `--no-sync` keeps it passive so frozen-data debugging is unaffected.
 
