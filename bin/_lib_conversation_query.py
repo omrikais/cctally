@@ -451,6 +451,20 @@ def _session_latest_meta_map(conn, session_ids):
     return meta
 
 
+def session_source_paths(conn, session_id):
+    """Distinct JSONL source files backing one session — the file-set the
+    live-tail watch loop polls (spec §2.3). Reads ``conversation_messages``,
+    the reader's own source of truth, NOT ``session_files`` (whose ``session_id``
+    is lazy / filename-fallback). Returns a list of path strings; empty for an
+    unknown or not-yet-ingested session.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT source_path FROM conversation_messages "
+        "WHERE session_id=? AND source_path IS NOT NULL",
+        (session_id,)).fetchall()
+    return [r[0] for r in rows]
+
+
 # Rail sort keys, in the rollup table's STRUCTURAL columns (Task A). ``recent``
 # rides idx_conv_sessions_recent(last_activity_utc DESC, session_id DESC) and
 # early-terminates at LIMIT with no temp B-tree; ``oldest`` scan-sorts the few
