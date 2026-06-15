@@ -118,9 +118,9 @@ function MessageItemImpl(
             <span
               className="conv-cache-chip"
               aria-label={`Prompt cache miss: ${cf.tokens_recreated.toLocaleString()} tokens re-created instead of read from cache, about ${fmt.usd2(cf.est_wasted_usd)} extra`}
-              title={`Cache rebuilt — ${fmt.tokens(cf.tokens_recreated)} re-created instead of read (~${fmt.usd2(cf.est_wasted_usd)} extra). Usually follows an idle gap past the cache TTL.`}
+              title={`Cache rebuilt — ${fmt.compact(cf.tokens_recreated, { upper: true })} re-created instead of read (~${fmt.usd2(cf.est_wasted_usd)} extra). Usually follows an idle gap past the cache TTL.`}
             >
-              <span aria-hidden="true">⚡</span> CACHE REBUILT · {fmt.tokens(cf.tokens_recreated)} · +{fmt.usd2(cf.est_wasted_usd)}
+              <span aria-hidden="true">⚡</span> CACHE REBUILT · {fmt.compact(cf.tokens_recreated, { upper: true })} · +{fmt.usd2(cf.est_wasted_usd)}
             </span>
           )}
           {eyebrow}

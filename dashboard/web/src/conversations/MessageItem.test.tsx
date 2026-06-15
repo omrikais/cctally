@@ -887,7 +887,7 @@ describe('MessageItem cache-failure chip (cache-failure-markers spec §3)', () =
     subagent_key: null,
     parent_uuid: null,
     cost_usd: 1.0,
-    // 130000 → fmt.tokens "130k"; 0.7475 → fmt.usd2 "$0.75".
+    // 130000 → fmt.compact upper "130K"; 0.7475 → fmt.usd2 "$0.75".
     cache_failure: { tokens_recreated: 130000, prev_cached: 130000, est_wasted_usd: 0.7475 },
   };
 
@@ -897,7 +897,7 @@ describe('MessageItem cache-failure chip (cache-failure-markers spec §3)', () =
     expect(chip).not.toBeNull();
     // The chip text carries the meaning (the ⚡ glyph is aria-hidden).
     expect(chip.textContent).toContain('CACHE REBUILT');
-    expect(chip.textContent).toContain('130k');
+    expect(chip.textContent).toContain('130K');
     expect(chip.textContent).toContain('+$0.75');
     // The glyph is aria-hidden so screen readers read the chip text, not "⚡".
     expect(chip.querySelector('[aria-hidden="true"]')).not.toBeNull();

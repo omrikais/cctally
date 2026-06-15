@@ -5534,7 +5534,7 @@ mark.current {
   font-weight: 600;
   padding: 1px 6px;
   border-radius: 5px;
-  color: #fbbf24;
+  color: var(--accent-amber);
   background: color-mix(in srgb, var(--accent-amber) 13%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent-amber) 32%, transparent);
   white-space: nowrap;
