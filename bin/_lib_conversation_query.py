@@ -285,6 +285,105 @@ def _entry_cost(model, inp, out, cc, cr, cost_usd_raw) -> float:
     return _calculate_entry_cost(model or "", usage, cost_usd=cost_usd_raw)
 
 
+# --- Cache-failure detection (spec §1) -------------------------------------
+# A prompt-cache "failure" is an assistant turn that re-creates the bulk of its
+# cached prefix instead of reading it: cache_read collapses while cache_creation
+# balloons, re-billing those tokens at the higher cache-WRITE rate. We flag only
+# clear mid-session prefix losses (the Conservative profile, ~1 per session).
+#
+# Thresholds (maintainer-tunable module constants, NOT user config). Rationale
+# from a scan of 58 recent sessions (spec Evidence): a 0.5 running-max-collapse
+# threshold sits in the wide empty gap between the worst healthy turn and the
+# mildest failure, and the recreated-fraction guard (0.75) sits in the matching
+# fraction gap (healthy max 0.723 < 0.75 <= failure min 0.759), both with margin.
+_CACHE_FAILURE_COLLAPSE_FRACTION = 0.5   # cache_read must fall to <= half the prior running-max
+_CACHE_FAILURE_RECREATE_FRACTION = 0.75  # >= 75% of THIS turn's context freshly created
+_CACHE_FAILURE_CACHE_FLOOR = 20_000      # prior cache must be meaningful to "lose"
+_CACHE_FAILURE_CREATE_FLOOR = 20_000     # the re-creation must be substantial / real cost
+
+
+def _cache_failure_wasted_usd(model, lost):
+    """Marginal extra paid by re-creating `lost` previously-cached tokens at the
+    cache-WRITE rate instead of reading them at the cache-READ rate. Reuses the
+    pricing chokepoint `_calculate_entry_cost` (zero on unknown models — the
+    helper emits its own one-shot stderr warning, never raises). NEVER summed into
+    any cost-snapshot / budget / reconciled figure — a display-only estimate."""
+    write = _calculate_entry_cost(model or "", {"cache_creation_input_tokens": lost})
+    read = _calculate_entry_cost(model or "", {"cache_read_input_tokens": lost})
+    return write - read
+
+
+def _stamp_cache_failures(items):
+    """Stamp ``item["cache_failure"]`` on each assistant turn that re-creates the
+    bulk of its cached prefix instead of reading it (spec §1). Mutates `items` in
+    place; healthy turns are left WITHOUT the key (absent, not zero — matching the
+    ``tokens?`` "absent, not zero" convention).
+
+    Walks items in DOCUMENT ORDER (the order `_assemble_session` produces),
+    maintaining a running-max of ``cache_read`` keyed by ``(subagent_key, model)``
+    — ``None`` subagent_key = main session. The key is per-thread AND per-model
+    because Anthropic prompt caches are model-specific: a model switch within a
+    thread legitimately starts a fresh cache (cr ~ 0) and must not read as a loss,
+    and the compound key makes that the first turn under its own key (no prior rm).
+    The per-key running-max is RESET when a context-compaction boundary is crossed
+    (a ``meta`` item whose ``meta_kind == "compaction"``), since compaction
+    legitimately invalidates the prefix and the post-compaction re-prime is not a
+    failure.
+
+    For each assistant item with a ``tokens`` dict — cc = tokens["cache_creation"],
+    cr = tokens["cache_read"], rm = the running-max for this key BEFORE this turn —
+    flag iff rm >= CACHE_FLOOR and cc >= CREATE_FLOOR and cr <= COLLAPSE_FRACTION*rm
+    and cc/(cc+cr) >= RECREATE_FRACTION. The fourth term keeps the rule aligned
+    with the Evidence: it requires that most of THIS turn's context was freshly
+    created, not merely that cache_read dipped. After the check, update
+    ``running_max[key] = max(rm, cr)`` (a failure's small cr never lowers the
+    high-water mark; the next healthy turn re-establishes it).
+
+    Payload (lost-prefix basis — NOT raw cc, which would over-count when the turn
+    also writes genuinely-new cacheable content that was never cached):
+        lost            = min(cc, max(0, rm - cr))
+        tokens_recreated = lost
+        prev_cached      = rm
+        est_wasted_usd   = write(lost) - read(lost)
+
+    Items lacking a ``tokens`` dict (no session_entries row, or non-assistant
+    items other than a compaction meta) are skipped and do NOT move the
+    running-max. Order-dependent by construction; run over document-ordered items.
+    """
+    running_max = {}   # (subagent_key, model) -> high-water cache_read
+    for it in items:
+        # Context-compaction boundary resets the per-key prefix high-water mark:
+        # the post-compaction re-prime is a legitimate fresh build, not a loss.
+        # Reset the whole map (compaction invalidates every thread's prefix in
+        # this session view; a per-key reset would need a thread tag the meta row
+        # does not reliably carry).
+        if it.get("kind") == "meta" and it.get("meta_kind") == "compaction":
+            running_max.clear()
+            continue
+        if it.get("kind") != "assistant":
+            continue
+        tok = it.get("tokens")
+        if not isinstance(tok, dict):
+            continue                      # no session_entries row -> skip, don't move max
+        cc = tok.get("cache_creation", 0) or 0
+        cr = tok.get("cache_read", 0) or 0
+        key = (it.get("subagent_key"), it.get("model"))
+        rm = running_max.get(key, 0)
+        total = cc + cr
+        if (rm >= _CACHE_FAILURE_CACHE_FLOOR
+                and cc >= _CACHE_FAILURE_CREATE_FLOOR
+                and cr <= _CACHE_FAILURE_COLLAPSE_FRACTION * rm
+                and total > 0
+                and cc / total >= _CACHE_FAILURE_RECREATE_FRACTION):
+            lost = min(cc, max(0, rm - cr))
+            it["cache_failure"] = {
+                "tokens_recreated": lost,
+                "prev_cached": rm,
+                "est_wasted_usd": _cache_failure_wasted_usd(it.get("model"), lost),
+            }
+        running_max[key] = max(rm, cr)
+
+
 def _session_cost_map(conn, session_ids):
     """{session_id: total_cost_usd} for the given sessions. Joins
     conversation_messages turn keys to the single deduped session_entries row
@@ -861,6 +960,12 @@ def _assemble_session(conn, session_id):
             del it["_req_id"]
             it.pop("_has_prose", None)
     header_cost = round(header_cost, 6)
+
+    # Stamp cache-failure markers (spec §1) AFTER tokens are on each item and
+    # while `items` is still document-ordered (the running-max walk is
+    # order-dependent). Healthy turns get no key (absent, not zero). Shared
+    # assembly -> the flag reaches BOTH the reader detail and the outline.
+    _stamp_cache_failures(items)
 
     # Strip the internal Phase-4b threading key from EVERY item (meta/human items
     # carry it too, not just assistant turns) so it never surfaces in the public

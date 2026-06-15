@@ -2970,3 +2970,189 @@ def test_bash_description_not_harvested_as_subagent():
     d = cq.get_conversation(conn, "s1")
     # no subagent entry at all (no subagent_type), and certainly no description leak
     assert d["subagent_meta"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Cache-failure detection kernel (_stamp_cache_failures). Pure-function units
+# over synthetic ordered item lists (the shape _assemble_session produces just
+# before the cache-failure stamp): each assistant item carries kind / subagent_key
+# / model and a `tokens` dict {input, output, cache_creation, cache_read}. The
+# rule (spec §1): per (subagent_key, model) key, with rm = running-max cache_read
+# BEFORE the turn — flag iff rm>=20_000 and cc>=20_000 and cr<=0.5*rm and
+# cc/(cc+cr)>=0.75; then running_max[key] = max(rm, cr). Reset a key at a
+# compaction boundary; skip items lacking a `tokens` dict.
+# ---------------------------------------------------------------------------
+def _aturn(cc, cr, *, sk=None, model="claude-opus-4-8"):
+    return {"kind": "assistant", "subagent_key": sk, "model": model,
+            "tokens": {"input": 2, "output": 100, "cache_creation": cc, "cache_read": cr}}
+
+
+def _compaction():
+    """A compaction-boundary meta item, as _assemble_session emits it (#191)."""
+    return {"kind": "meta", "subagent_key": None, "meta_kind": "compaction"}
+
+
+def test_cache_failure_flags_clear_mid_session_loss():
+    items = [_aturn(50_000, 0),        # first prime — must NOT flag (rm=0)
+             _aturn(1_000, 70_000),    # healthy
+             _aturn(222_890, 18_888)]  # collapse: rm=70k, cr<=0.5*rm, frac~0.92 -> FLAG
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" not in items[0]
+    assert "cache_failure" not in items[1]
+    cf = items[2]["cache_failure"]
+    assert cf["prev_cached"] == 70_000
+    assert cf["tokens_recreated"] == min(222_890, 70_000 - 18_888)  # lost-prefix basis
+    assert cf["est_wasted_usd"] > 0
+
+
+def test_first_prime_never_flags():
+    items = [_aturn(50_000, 0)]
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" not in items[0]
+
+
+def test_recreate_fraction_guard_rejects_low_fraction():
+    # rm=100k, cr=40k (<=0.5*rm) but cc=20k -> frac=20/60=0.33 < 0.75 -> NO flag.
+    # This is the non-vacuity guard test for the cc/(cc+cr)>=0.75 term: drop that
+    # term and this turn flags (running-max collapse alone trips).
+    items = [_aturn(1_000, 100_000), _aturn(20_000, 40_000)]
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" not in items[1]
+
+
+def test_healthy_turn_not_flagged():
+    # cr ~ rm (ratio ~1.0): the running-max never collapses -> not a failure.
+    items = [_aturn(1_000, 100_000), _aturn(2_000, 99_000)]
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" not in items[1]
+
+
+def test_collapse_boundary_cr_equals_half_rm_flags():
+    # cr == 0.5*rm is the inclusive `<=` edge. rm=100k, cr=50k, cc=200k ->
+    # frac=200/250=0.8 >= 0.75 -> FLAG (the boundary is on the failure side).
+    items = [_aturn(1_000, 100_000), _aturn(200_000, 50_000)]
+    cq._stamp_cache_failures(items)
+    assert items[1]["cache_failure"]["prev_cached"] == 100_000
+
+
+def test_collapse_boundary_just_above_half_rm_not_flagged():
+    # cr just over 0.5*rm fails the collapse predicate -> not flagged (proves the
+    # `<=` boundary is real, not a `<` that would also catch the equal case).
+    items = [_aturn(1_000, 100_000), _aturn(200_000, 50_001)]
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" not in items[1]
+
+
+def test_model_switch_not_flagged():
+    items = [_aturn(1_000, 100_000, model="claude-opus-4-8"),
+             _aturn(60_000, 0, model="claude-haiku-4-5")]  # new model = fresh cache key
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" not in items[1]
+
+
+def test_subagent_thread_independent():
+    items = [_aturn(1_000, 100_000, sk=None),
+             _aturn(5_000, 2_000, sk="agent-1")]  # subagent's own small cache, not a main drop
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" not in items[1]
+
+
+def test_genuine_subagent_failure_flags_on_its_own_thread():
+    # A subagent thread that primes a real cache then collapses flags on ITS key,
+    # independent of the main thread's running-max.
+    items = [_aturn(1_000, 100_000, sk=None),            # main healthy
+             _aturn(1_000, 80_000, sk="agent-1"),        # subagent prime
+             _aturn(120_000, 5_000, sk="agent-1")]       # subagent collapse -> FLAG
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" not in items[0]
+    assert "cache_failure" not in items[1]
+    assert items[2]["cache_failure"]["prev_cached"] == 80_000
+
+
+def test_floors_suppress_tiny_turns():
+    items = [_aturn(1_000, 10_000), _aturn(15_000, 0)]  # rm=10k<20k floor AND cc<20k floor
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" not in items[1]
+
+
+def test_create_floor_suppresses_small_recreation():
+    # rm is meaningful (100k), cr collapses to 0, BUT cc=15k < CREATE_FLOOR ->
+    # not a substantial enough re-creation -> not flagged.
+    items = [_aturn(1_000, 100_000), _aturn(15_000, 0)]
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" not in items[1]
+
+
+def test_total_loss_flags():
+    items = [_aturn(1_000, 130_000), _aturn(134_000, 0)]  # cr=0, rm high, frac=1.0
+    cq._stamp_cache_failures(items)
+    assert items[1]["cache_failure"]["prev_cached"] == 130_000
+
+
+def test_compaction_resets_running_max():
+    # A compaction boundary clears the key's running-max, so the legitimate
+    # post-compaction re-prime is NOT read as a loss.
+    items = [_aturn(1_000, 130_000),   # primes rm=130k on (None, opus)
+             _compaction(),            # compaction boundary -> reset
+             _aturn(134_000, 0)]       # re-prime after compaction: rm reset -> NO flag
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" not in items[2]
+
+
+def test_multiple_failures_each_flag():
+    items = [_aturn(1_000, 130_000),   # prime
+             _aturn(140_000, 5_000),   # failure 1
+             _aturn(2_000, 150_000),   # healthy re-prime (rm back up to 150k)
+             _aturn(160_000, 1_000)]   # failure 2
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" in items[1]
+    assert "cache_failure" in items[3]
+    assert items[1]["cache_failure"]["prev_cached"] == 130_000
+    assert items[3]["cache_failure"]["prev_cached"] == 150_000
+
+
+def test_failure_cr_does_not_lower_running_max():
+    # After a failure (small cr), the running-max must stay at the pre-failure
+    # high so a subsequent low-cr turn is still measured against the real prefix.
+    items = [_aturn(1_000, 130_000),   # rm=130k
+             _aturn(140_000, 5_000),   # failure; rm must STAY 130k (max(130k,5k))
+             _aturn(135_000, 0)]       # measured against 130k, not 5k -> FLAG
+    cq._stamp_cache_failures(items)
+    assert items[2]["cache_failure"]["prev_cached"] == 130_000
+
+
+def test_missing_tokens_skipped_and_does_not_move_max():
+    items = [_aturn(1_000, 100_000),
+             {"kind": "assistant", "subagent_key": None, "model": "claude-opus-4-8"},  # no tokens
+             _aturn(150_000, 5_000)]  # rm must still be 100k from item[0]
+    cq._stamp_cache_failures(items)
+    assert "cache_failure" not in items[1]
+    assert items[2]["cache_failure"]["prev_cached"] == 100_000
+
+
+def test_wasted_cost_is_write_minus_read_on_lost_prefix():
+    from _lib_pricing import _calculate_entry_cost
+    items = [_aturn(1_000, 130_000), _aturn(140_000, 0)]
+    cq._stamp_cache_failures(items)
+    cf = items[1]["cache_failure"]
+    lost = min(140_000, max(0, 130_000 - 0))   # 130_000
+    assert cf["tokens_recreated"] == lost
+    write = _calculate_entry_cost("claude-opus-4-8",
+                                  {"cache_creation_input_tokens": lost})
+    read = _calculate_entry_cost("claude-opus-4-8",
+                                 {"cache_read_input_tokens": lost})
+    assert abs(cf["est_wasted_usd"] - (write - read)) < 1e-12
+    assert cf["est_wasted_usd"] > 0
+
+
+def test_unknown_model_wasted_cost_zero(capsys):
+    # An unrecognized model resolves to $0 pricing on both legs, so the marginal
+    # waste is exactly 0. The one-shot `[cost] unknown model` stderr warning is
+    # expected (and captured here, not suppressed).
+    items = [_aturn(1_000, 130_000, model="totally-unknown-model"),
+             _aturn(140_000, 0, model="totally-unknown-model")]
+    cq._stamp_cache_failures(items)
+    cf = items[1]["cache_failure"]
+    assert cf["tokens_recreated"] == 130_000     # still flagged (token rule is price-free)
+    assert cf["est_wasted_usd"] == 0.0
+    capsys.readouterr()   # drain the expected one-shot warning
