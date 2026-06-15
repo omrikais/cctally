@@ -961,3 +961,125 @@ def test_group_entries_into_blocks_anchors_new_window_to_recorded(ns):
         f"NEW block start must be canonical bs; got {real_blocks[1].start_time!r}"
     )
     assert real_blocks[1].end_time == rs_new
+
+
+def test_load_recorded_five_hour_windows_collapses_straddle_via_stored_key(
+    ns, tmp_path, monkeypatch,
+):
+    """Issue #201: 1s reset jitter straddling a 10-min floor boundary
+    must NOT split one physical window into two overlapping blocks.
+
+    Reproduces the 2026-06-14 production state: Anthropic's
+    ``rate_limits.5h.resets_at`` oscillates by one second across the
+    ``:40`` boundary (``20:39:59`` ↔ ``20:40:00``), and the SAME jitter
+    hits the adjacent active window (``01:39:59`` ↔ ``01:40:00``). The
+    ``record-usage`` path already collapsed each window to a single
+    ``five_hour_window_key`` (via the anchored ``_canonical_5h_window_key``
+    reuse), so every supporting snapshot for window 1 stores key
+    ``20:40Z`` and every snapshot for window 2 stores key ``01:30Z``.
+
+    Pre-fix, the loader re-floored the raw ``five_hour_resets_at`` string
+    instead of trusting the stored key: ``20:39:59`` floored to ``20:30``
+    and ``20:40:00`` to ``20:40``, forking each window into two buckets.
+    The weighted scheduler then picked the phantom chain
+    ``{20:30(11) → 01:30(canonical)}`` over the real
+    ``{20:40(canonical) → 01:40(2)}`` by a single point, and the #116
+    force-restore added ``20:40`` back without evicting the ``20:30``
+    phantom — yielding the two overlapping 6:30/6:40 blocks.
+
+    The loader must bucket by the stored ``five_hour_window_key`` so both
+    phantoms vanish and only the two genuine, adjacent canonical anchors
+    survive.
+    """
+    share = tmp_path / ".local" / "share" / "cctally"
+    share.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(_cctally_core, "APP_DIR", share)
+    monkeypatch.setattr(_cctally_core, "DB_PATH", share / "stats.db")
+    monkeypatch.setattr(_cctally_core, "CACHE_DB_PATH", share / "cache.db")
+    monkeypatch.setattr(_cctally_core, "CACHE_LOCK_PATH", share / "cache.db.lock")
+    monkeypatch.setattr(_cctally_core, "CACHE_LOCK_CODEX_PATH", share / "cache.db.codex.lock")
+    monkeypatch.setattr(_cctally_core, "CONFIG_PATH", share / "config.json")
+    monkeypatch.setattr(_cctally_core, "LOG_DIR", share / "logs")
+
+    canon = ns["_canonical_5h_window_key"]
+    # Window 1: physical reset ~20:40Z; canonical (anchored) key = 20:40Z.
+    key_w1 = canon(int(dt.datetime(2026, 6, 14, 20, 40, tzinfo=dt.timezone.utc).timestamp()))
+    # Window 2 (active): physical reset ~01:39:59Z next day; key = 01:30Z.
+    key_w2 = canon(int(dt.datetime(2026, 6, 15, 1, 39, 59, tzinfo=dt.timezone.utc).timestamp()))
+
+    # (raw_resets_iso, stored_window_key, n_rows) — mirrors the prod weights:
+    # window 1 has 11 jitter-low + 10 jitter-high; window 2 has 2 + 2.
+    raw_groups = [
+        ("2026-06-14T20:39:59+00:00", key_w1, 11),
+        ("2026-06-14T20:40:00+00:00", key_w1, 10),
+        ("2026-06-15T01:39:59+00:00", key_w2, 2),
+        ("2026-06-15T01:40:00+00:00", key_w2, 2),
+    ]
+
+    open_db = ns["open_db"]
+    with open_db() as conn:
+        i = 0
+        for resets_at, wkey, n_rows in raw_groups:
+            for _ in range(n_rows):
+                conn.execute(
+                    "INSERT INTO weekly_usage_snapshots "
+                    "(captured_at_utc, week_start_date, week_end_date, "
+                    " weekly_percent, source, payload_json, "
+                    " five_hour_percent, five_hour_resets_at, "
+                    " five_hour_window_key) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"2026-06-14T15:{i // 60:02d}:{i % 60:02d}Z",
+                        "2026-06-08", "2026-06-15", 50.0, "test",
+                        "{}", 17.0, resets_at, wkey,
+                    ),
+                )
+                i += 1
+        # Canonical rollup rows — one per genuine window. Window 1 stores
+        # raw resets 20:40:00 (floor == key); window 2 stores 01:39:59
+        # (floor == key 01:30Z while raw resets sits at :39:59).
+        for wkey, resets_iso, bs_iso in (
+            (key_w1, "2026-06-14T20:40:00+00:00", "2026-06-14T15:40:00+00:00"),
+            (key_w2, "2026-06-15T01:39:59+00:00", "2026-06-14T20:39:59+00:00"),
+        ):
+            conn.execute(
+                "INSERT INTO five_hour_blocks "
+                "(five_hour_window_key, five_hour_resets_at, block_start_at, "
+                " first_observed_at_utc, last_observed_at_utc, "
+                " final_five_hour_percent, is_closed, "
+                " created_at_utc, last_updated_at_utc) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                (wkey, resets_iso, bs_iso, bs_iso, bs_iso, 17.0, bs_iso, bs_iso),
+            )
+        conn.commit()
+
+    load = ns["_load_recorded_five_hour_windows"]
+    range_start = dt.datetime(2026, 6, 14, 0, 0, tzinfo=dt.timezone.utc)
+    range_end = dt.datetime(2026, 6, 15, 12, 0, tzinfo=dt.timezone.utc)
+    selected, _overrides, canonical_intervals = load(range_start, range_end)
+
+    R_w1 = dt.datetime(2026, 6, 14, 20, 40, tzinfo=dt.timezone.utc)
+    R_w2 = dt.datetime(2026, 6, 15, 1, 30, tzinfo=dt.timezone.utc)
+    phantom_a = dt.datetime(2026, 6, 14, 20, 30, tzinfo=dt.timezone.utc)
+    phantom_b = dt.datetime(2026, 6, 15, 1, 40, tzinfo=dt.timezone.utc)
+
+    assert selected == [R_w1, R_w2], (
+        f"Straddle must collapse via stored window_key to the two genuine "
+        f"anchors; got {selected!r}"
+    )
+    assert phantom_a not in selected, "20:30 phantom must not survive"
+    assert phantom_b not in selected, "01:40 phantom must not survive"
+    # Canonical intervals keyed by the canonical window_key, carrying the
+    # exact (block_start_at, five_hour_resets_at) for the partitioner.
+    assert R_w1 in canonical_intervals and R_w2 in canonical_intervals, (
+        f"Both genuine anchors must carry canonical intervals; "
+        f"got {sorted(canonical_intervals)!r}"
+    )
+    bs_w1, rs_w1 = canonical_intervals[R_w1]
+    assert bs_w1 == dt.datetime(2026, 6, 14, 15, 40, tzinfo=dt.timezone.utc)
+    assert rs_w1 == dt.datetime(2026, 6, 14, 20, 40, tzinfo=dt.timezone.utc)
+    bs_w2, rs_w2 = canonical_intervals[R_w2]
+    assert bs_w2 == dt.datetime(2026, 6, 14, 20, 39, 59, tzinfo=dt.timezone.utc)
+    assert rs_w2 == dt.datetime(2026, 6, 15, 1, 39, 59, tzinfo=dt.timezone.utc)

@@ -307,7 +307,7 @@ def _load_recorded_five_hour_windows(
     try:
         with open_db() as conn:
             rows = conn.execute(
-                "SELECT five_hour_resets_at "
+                "SELECT five_hour_resets_at, five_hour_window_key "
                 "FROM weekly_usage_snapshots "
                 "WHERE five_hour_resets_at IS NOT NULL "
                 "  AND five_hour_resets_at >= ? "
@@ -326,7 +326,8 @@ def _load_recorded_five_hour_windows(
             canonical_rows: list[Any] = []
             try:
                 canonical_rows = conn.execute(
-                    "SELECT five_hour_resets_at, block_start_at "
+                    "SELECT five_hour_resets_at, block_start_at, "
+                    "       five_hour_window_key "
                     "FROM five_hour_blocks "
                     "WHERE five_hour_resets_at IS NOT NULL "
                     "  AND five_hour_resets_at >= ? "
@@ -378,9 +379,25 @@ def _load_recorded_five_hour_windows(
         # denied on parent dir) that propagate from open_db() before any
         # SQL runs. Either way, fall back to the heuristic anchor path.
         return [], {}, {}
+    # issue #201: identify each 5h window by its canonical, jitter-collapsed
+    # ``five_hour_window_key`` (the 10-min-floored epoch the record path
+    # already stored via the anchored ``_canonical_5h_window_key`` reuse)
+    # instead of re-flooring the raw ``five_hour_resets_at`` string. A
+    # 1-second reset jitter straddling a 10-minute floor boundary
+    # (``20:39:59`` vs ``20:40:00``) floors to two different buckets and
+    # would otherwise fork one physical window into two overlapping blocks
+    # — the exact split this column exists to prevent. Falls back to the
+    # pure floor for legacy rows whose key wasn't backfilled (``open_db``
+    # backfills NULL keys before this query runs, so this is defensive).
+    def _bucket_dt(window_key: Any, resets_dt: dt.datetime) -> dt.datetime:
+        if window_key is not None:
+            return dt.datetime.fromtimestamp(int(window_key), dt.timezone.utc)
+        return _c._floor_to_ten_minutes(resets_dt)
+
     counts: dict[dt.datetime, int] = {}
     for row in rows:
         raw = row["five_hour_resets_at"] if hasattr(row, "keys") else row[0]
+        wkey = row["five_hour_window_key"] if hasattr(row, "keys") else row[1]
         if raw is None:
             continue
         try:
@@ -391,7 +408,7 @@ def _load_recorded_five_hour_windows(
             d = d.replace(tzinfo=dt.timezone.utc)
         else:
             d = d.astimezone(dt.timezone.utc)
-        snapped = _c._floor_to_ten_minutes(d)
+        snapped = _bucket_dt(wkey, d)
         counts[snapped] = counts.get(snapped, 0) + 1
     # Overlay canonical rollup anchors at heavy weight. Same flooring
     # rule so a jittered raw value (e.g. 17:48Z) and its canonicalized
@@ -411,10 +428,16 @@ def _load_recorded_five_hour_windows(
     # truncated R keeps both blocks visible — without this fix the
     # earlier block's entries are silently rendered as a phantom
     # heuristic "~" row by `_group_entries_into_blocks`.
-    canonical_pairs: list[tuple[dt.datetime, dt.datetime]] = []
+    # issue #201: each triple is ``(wkey_dt, bs, rs)`` — ``wkey_dt`` is the
+    # canonical window_key (decoded to a UTC datetime) and is the SAME
+    # bucket identity used for the raw-snapshot counts above, so the heavy
+    # canonical overlay always lands in the same bucket as its supporting
+    # raw rows (never a jitter-split sibling bucket).
+    canonical_pairs: list[tuple[dt.datetime, dt.datetime, dt.datetime]] = []
     for row in canonical_rows:
         rs_raw = row["five_hour_resets_at"] if hasattr(row, "keys") else row[0]
         bs_raw = row["block_start_at"]      if hasattr(row, "keys") else row[1]
+        wkey   = row["five_hour_window_key"] if hasattr(row, "keys") else row[2]
         if rs_raw is None or bs_raw is None:
             continue
         try:
@@ -430,8 +453,8 @@ def _load_recorded_five_hour_windows(
             bs = bs.replace(tzinfo=dt.timezone.utc)
         else:
             bs = bs.astimezone(dt.timezone.utc)
-        canonical_pairs.append((bs, rs))
-    canonical_pairs.sort(key=lambda p: p[0])
+        canonical_pairs.append((_bucket_dt(wkey, rs), bs, rs))
+    canonical_pairs.sort(key=lambda p: p[1])
 
     # issue #76: canonical_intervals maps every floored R -> its EXACT
     # (block_start_at, five_hour_resets_at) — both UTC, rs un-floored
@@ -444,9 +467,8 @@ def _load_recorded_five_hour_windows(
     canonical_intervals: dict[
         dt.datetime, tuple[dt.datetime, dt.datetime]
     ] = {}
-    for bs, rs in canonical_pairs:
-        snapped = _c._floor_to_ten_minutes(rs)
-        canonical_intervals[snapped] = (bs, rs)
+    for wkey_dt, bs, rs in canonical_pairs:
+        canonical_intervals[wkey_dt] = (bs, rs)
 
     # Detect overlap-with-credit and replace the earlier R with a
     # credit-truncated anchor. The (anchor → real_block_start) map is
@@ -454,11 +476,12 @@ def _load_recorded_five_hour_windows(
     # real block_start_at on the display row (instead of the default
     # R - 5h, which would be hours earlier for a 2h-truncated block).
     block_start_overrides: dict[dt.datetime, dt.datetime] = {}
-    truncated_pairs: list[tuple[dt.datetime, dt.datetime]] = []
-    for i, (bs, rs) in enumerate(canonical_pairs):
+    truncated_pairs: list[tuple[dt.datetime, dt.datetime, dt.datetime]] = []
+    for i, (wkey_dt, bs, rs) in enumerate(canonical_pairs):
+        anchor_key = wkey_dt  # canonical window_key identity (issue #201)
         truncated_R = rs
         if i + 1 < len(canonical_pairs):
-            next_bs, _next_rs = canonical_pairs[i + 1]
+            _next_wk, next_bs, _next_rs = canonical_pairs[i + 1]
             if rs > next_bs:  # overlap with next block
                 # Look for a credit moment inside [next_bs, rs] — the
                 # part of the earlier block that overlaps the next.
@@ -471,24 +494,24 @@ def _load_recorded_five_hour_windows(
                         # drop one via its weight-tiebreaker.
                         if bs < cm_floored < rs:
                             truncated_R = cm_floored
+                            anchor_key = cm_floored
                             block_start_overrides[cm_floored] = bs
-                            # Rewrite canonical_intervals[snapped_orig]
-                            # to the truncated interval under the
-                            # truncated key. issue #76: the
-                            # partitioner reads canonical_intervals
-                            # for the exact bs/rs; the truncated entry
-                            # must reflect the credit-shifted upper
-                            # bound (cm_floored) AND the real bs (the
-                            # override) so partition + Phase 1.5
-                            # render the credit-shortened block
-                            # consistently.
-                            snapped_orig = _c._floor_to_ten_minutes(rs)
-                            canonical_intervals.pop(snapped_orig, None)
+                            # Rewrite canonical_intervals under the
+                            # truncated key. issue #76: the partitioner
+                            # reads canonical_intervals for the exact
+                            # bs/rs; the truncated entry must reflect the
+                            # credit-shifted upper bound (cm_floored) AND
+                            # the real bs (the override) so partition +
+                            # Phase 1.5 render the credit-shortened block
+                            # consistently. issue #201: the original
+                            # entry is keyed by the canonical window_key,
+                            # so pop under ``wkey_dt`` (not floor(rs)).
+                            canonical_intervals.pop(wkey_dt, None)
                             canonical_intervals[cm_floored] = (
                                 bs, cm_floored,
                             )
                             break
-        truncated_pairs.append((bs, truncated_R))
+        truncated_pairs.append((anchor_key, bs, truncated_R))
 
     # Truncated anchors are credit-adjusted and known-good; bypass the
     # `_select_non_overlapping_recorded_windows` weighted scheduler for
@@ -501,16 +524,16 @@ def _load_recorded_five_hour_windows(
     # input weight (so jittered same-bucket raw values still collapse)
     # but skip them when computing the overlap-safe subset.
     truncated_anchors: set[dt.datetime] = set()
-    for bs, rs in truncated_pairs:
-        snapped = _c._floor_to_ten_minutes(rs)
-        if rs != _c._floor_to_ten_minutes(rs):
-            if rs in block_start_overrides:
-                block_start_overrides[snapped] = block_start_overrides.pop(rs)
-        # Identify truncated anchors by membership in the override map
-        # (only credit-truncated entries land there).
-        if snapped in block_start_overrides:
-            truncated_anchors.add(snapped)
-        counts[snapped] = counts.get(snapped, 0) + _CANONICAL_WEIGHT_THRESHOLD
+    for anchor_key, _bs, _rs in truncated_pairs:
+        # ``anchor_key`` is already a floored canonical key — the window_key
+        # for an untruncated anchor (issue #201) or the credit-floored key
+        # for a truncated one — and the override map is keyed by it
+        # directly, so the legacy floor-relocation dance is no longer
+        # needed. Identify truncated anchors by membership in the override
+        # map (only credit-truncated entries land there).
+        if anchor_key in block_start_overrides:
+            truncated_anchors.add(anchor_key)
+        counts[anchor_key] = counts.get(anchor_key, 0) + _CANONICAL_WEIGHT_THRESHOLD
 
     non_truncated_items = [
         (a, w) for a, w in counts.items() if a not in truncated_anchors
