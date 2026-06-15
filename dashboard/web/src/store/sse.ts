@@ -61,6 +61,7 @@ export function startSSE(cb: SSECallbacks = {}): void {
         ingestAlerts(snap);
         ingestUpdate(snap);
         ingestDoctor(snap);
+        ingestDashboardPrefs(snap);
       }
       cb.onConnect?.();
     } catch (err) {
@@ -76,6 +77,7 @@ export function startSSE(cb: SSECallbacks = {}): void {
         ingestAlerts(snap);
         ingestUpdate(snap);
         ingestDoctor(snap);
+        ingestDashboardPrefs(snap);
       }
       if (disconnected) {
         disconnected = false;
@@ -171,6 +173,16 @@ function ingestDoctor(snap: Envelope): void {
   // the field is small and Python writes it via a typed dict. Cast
   // straight through the import type.
   dispatch({ type: 'SET_DOCTOR_AGGREGATE', doctor: snap.doctor });
+}
+
+// cache-failure-markers spec §5 — mirror the envelope's `dashboard_prefs`
+// block into the named store slice. Unlike ingestUpdate/ingestDoctor (which
+// no-op on an absent field to keep their last-known-good slice), we ALWAYS
+// dispatch — `dashboard_prefs ?? {}` — so an older Python that omits the field
+// (or a server flip to the default) resolves to the opt-out default (markers
+// ON) via `selectMarkersEnabled`, never a stale prior value.
+function ingestDashboardPrefs(snap: Envelope): void {
+  dispatch({ type: 'INGEST_DASHBOARD_PREFS', prefs: snap.dashboard_prefs ?? {} });
 }
 
 export function closeSSE(): void {

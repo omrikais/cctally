@@ -257,6 +257,19 @@ export interface AlertsConfig {
   command_configured?: boolean;
 }
 
+// cache-failure-markers spec §5 — the dashboard-scoped prefs mirror, a named
+// slice following the alertsConfig pattern (there is no generic settings-
+// selector convention; settings live as named slices). Replaced wholesale each
+// SSE tick by INGEST_DASHBOARD_PREFS (server is the source of truth). The store
+// keeps the raw nullable field; `selectMarkersEnabled` does the opt-out
+// defaulting so every consumer reads one source instead of re-deriving.
+export interface DashboardPrefs {
+  // Conversation-viewer cache-rebuild marker opt-out. Undefined when the field
+  // is absent on the wire (older server / first tick) — the selector treats
+  // absence as ON (opt-out, default true).
+  cache_failure_markers?: boolean;
+}
+
 export interface UIState {
   snapshot: Envelope | null;
   // Conversation viewer (spec §4). Top-level view mode + the small
@@ -338,6 +351,11 @@ export interface UIState {
   // without a separate GET /api/settings (T9 will wire the read).
   // Updated each tick alongside `alerts`.
   alertsConfig: AlertsConfig;
+  // cache-failure-markers spec §5 — snapshot-mirrored dashboard prefs (the
+  // `dashboard_prefs` envelope block). Replaced wholesale each tick by
+  // INGEST_DASHBOARD_PREFS; read via `selectMarkersEnabled`. Seeds before the
+  // first tick to `{}` so the selector defaults markers ON.
+  dashboardPrefs: DashboardPrefs;
   // FIFO queue of fresh alerts that arrived while a toast was already
   // showing (or co-arrived on the same tick as the currently-surfaced
   // one). Drained one entry at a time by HIDE_TOAST: when the dismissed
@@ -534,6 +552,8 @@ function loadInitial(): UIState {
     alerts: [],
     seenAlertIds: new Set<string>(),
     alertsConfig: defaultAlertsConfig(),
+    // Empty before the first tick → markers default ON (opt-out).
+    dashboardPrefs: {},
     alertToastQueue: [],
     dragPreviewOrder: null,
     update: defaultUpdateSlice(),
@@ -556,6 +576,16 @@ function emit(): void {
 }
 
 export function getState(): UIState { return state; }
+
+// cache-failure-markers spec §5 — the single defaulting path for the
+// conversation-viewer cache-rebuild marker opt-out. Reads the snapshot-mirrored
+// `dashboardPrefs` slice and treats an UNDEFINED `cache_failure_markers` as ON
+// (opt-out, default true): an older server / a first tick before bootstrap
+// reads as markers-on. MessageItem, OutlinePanel, and deriveOutline all read
+// THIS so none of them re-invents the defaulting.
+export function selectMarkersEnabled(s: UIState = state): boolean {
+  return s.dashboardPrefs.cache_failure_markers !== false;
+}
 
 export function subscribeStore(fn: () => void): () => void {
   subscribers.add(fn);
@@ -682,6 +712,12 @@ export type Action =
       alertsSettings: AlertsConfig;
       isFirstTick: boolean;
     }
+  // cache-failure-markers spec §5 — mirror the snapshot's `dashboard_prefs`
+  // block into the named slice each tick (the SSE handler dispatches this
+  // from ingestDashboardPrefs). Replaced wholesale: the server is the source
+  // of truth, so a flip in `dashboard.cache_failure_markers` (CLI or another
+  // tab's Save) takes effect on the next tick.
+  | { type: 'INGEST_DASHBOARD_PREFS'; prefs: DashboardPrefs }
   | { type: 'SET_TABLE_SORT'; table: 'trend' | 'sessions' | 'projects'; override: SortOverride | null }
   | { type: 'CLEAR_TABLE_SORTS' }
   // ---------- Update subcommand actions (spec §6) ----------
@@ -1120,6 +1156,11 @@ export function dispatch(action: Action): void {
       };
       break;
     }
+    case 'INGEST_DASHBOARD_PREFS':
+      // Wholesale replace (server is the source of truth) — same posture as
+      // alertsConfig under INGEST_SNAPSHOT_ALERTS.
+      state = { ...state, dashboardPrefs: action.prefs };
+      break;
     case 'SET_TABLE_SORT': {
       const key =
         action.table === 'trend'
