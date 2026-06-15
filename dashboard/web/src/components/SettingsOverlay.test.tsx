@@ -608,6 +608,137 @@ describe('<SettingsOverlay /> Codex budget toggles', () => {
   });
 });
 
+// cache-failure-markers spec §5 — the "Show cache-failure markers" checkbox.
+// Seeds from the SSE-mirrored `dashboard_prefs` slice (markers ON by default),
+// dirties independently, and travels in the SINGLE combined Save POST as
+// `dashboard: { cache_failure_markers }`. Re-seeds on SSE tick (the TZ/alerts
+// re-seed pattern). One modal, one Save — no split-save field drop.
+function seedDashboardPrefs(cache_failure_markers: boolean) {
+  act(() => {
+    dispatch({ type: 'INGEST_DASHBOARD_PREFS', prefs: { cache_failure_markers } });
+  });
+}
+
+describe('<SettingsOverlay /> cache-failure markers toggle', () => {
+  it('defaults the checkbox checked (markers ON) before any tick', () => {
+    render(<SettingsOverlay />);
+    openSettings();
+    const toggle = screen.getByRole('checkbox', {
+      name: /Show cache-failure markers/,
+    }) as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+  });
+
+  it('seeds the checkbox from dashboard_prefs (OFF when the server reports false)', () => {
+    render(<SettingsOverlay />);
+    seedDashboardPrefs(false);
+    openSettings();
+    const toggle = screen.getByRole('checkbox', {
+      name: /Show cache-failure markers/,
+    }) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+  });
+
+  it('POSTs dashboard.cache_failure_markers=false in the combined Save body when toggled off', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    // Server reports markers ON; the user opts out.
+    seedDashboardPrefs(true);
+    openSettings();
+
+    const toggle = screen.getByRole('checkbox', {
+      name: /Show cache-failure markers/,
+    }) as HTMLInputElement;
+    expect(toggle.checked).toBe(true); // seeded ON
+    fireEvent.click(toggle);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
+    expect(call).toBeTruthy();
+    const [, init] = call as [string, RequestInit];
+    expect(init.method).toBe('POST');
+    const parsed = JSON.parse(init.body as string) as {
+      dashboard?: { cache_failure_markers?: boolean };
+    };
+    // Binding assertion: the toggle travels in the `dashboard` block.
+    expect(parsed.dashboard?.cache_failure_markers).toBe(false);
+  });
+
+  it('POSTs cache_failure_markers=true when re-enabled from an OFF server state', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    seedDashboardPrefs(false);
+    openSettings();
+
+    const toggle = screen.getByRole('checkbox', {
+      name: /Show cache-failure markers/,
+    }) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
+    const [, init] = call as [string, RequestInit];
+    const parsed = JSON.parse(init.body as string) as {
+      dashboard?: { cache_failure_markers?: boolean };
+    };
+    expect(parsed.dashboard?.cache_failure_markers).toBe(true);
+  });
+
+  it('does NOT POST when the markers toggle is unchanged', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    seedDashboardPrefs(true);
+    openSettings();
+
+    // Touch nothing — the toggle matches the server, so Save makes no POST.
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    const settingsCall = fetchMock.mock.calls.find(
+      ([url]) => url === '/api/settings',
+    );
+    expect(settingsCall).toBeUndefined();
+  });
+
+  it('re-seeds the checkbox when a fresh dashboard_prefs tick arrives while open', () => {
+    render(<SettingsOverlay />);
+    seedDashboardPrefs(true);
+    openSettings();
+    const toggle = () =>
+      screen.getByRole('checkbox', { name: /Show cache-failure markers/ }) as HTMLInputElement;
+    expect(toggle().checked).toBe(true);
+    // A server flip (another tab's Save / CLI write) arrives via SSE.
+    seedDashboardPrefs(false);
+    expect(toggle().checked).toBe(false);
+  });
+});
+
 describe('<SettingsOverlay /> swallows `0` while open (#156)', () => {
   it('`0` does not reach the global 10th-panel opener while Settings is open', () => {
     const opener = vi.fn();

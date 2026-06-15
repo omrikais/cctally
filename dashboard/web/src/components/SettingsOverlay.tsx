@@ -2,6 +2,7 @@ import { useEffect, useState, useSyncExternalStore } from 'react';
 import {
   dispatch,
   getState,
+  selectMarkersEnabled,
   subscribeStore,
   SESSION_SORT_KEYS,
   type SessionSortKey,
@@ -139,6 +140,15 @@ export function SettingsOverlay() {
   const [notifier, setNotifier] = useState<NotifierKind>(
     alertsConfig.notifier ?? 'auto',
   );
+  // cache-failure-markers spec §5 — the conversation-viewer cache-rebuild
+  // marker opt-out. Seeds from the SSE-mirrored dashboard_prefs slice (markers
+  // ON by default), dirties independently, and travels in the combined Save
+  // POST as `dashboard: { cache_failure_markers }`. selectMarkersEnabled does
+  // the absent-field defaulting so the toggle never reads `undefined`.
+  const markersEnabledServer = useSyncExternalStore(subscribeStore, () =>
+    selectMarkersEnabled(getState()),
+  );
+  const [cacheMarkers, setCacheMarkers] = useState<boolean>(markersEnabledServer);
   const [testSubmitting, setTestSubmitting] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
   const [testAxis, setTestAxis] = useState<AlertAxis>('weekly');
@@ -177,6 +187,13 @@ export function SettingsOverlay() {
     alertsConfig.codex_projected_enabled,
     alertsConfig.notifier,
   ]);
+
+  // cache-failure-markers spec §5 — re-seed the markers toggle on each SSE tick
+  // (same pattern as the TZ/alerts re-seed above): a server flip (CLI write /
+  // another tab's Save) flows through dashboard_prefs and repaints the toggle.
+  useEffect(() => {
+    setCacheMarkers(markersEnabledServer);
+  }, [markersEnabledServer]);
 
   useKeymap([
     // Parity with main's settings.js#152: don't stack Settings under an
@@ -222,6 +239,7 @@ export function SettingsOverlay() {
       setCodexBudgetAlerts(alertsConfig.codex_budget_alerts_enabled ?? false);
       setCodexProjected(alertsConfig.codex_projected_enabled ?? false);
       setNotifier(alertsConfig.notifier ?? 'auto');
+      setCacheMarkers(markersEnabledServer);
       setTestError(null);
       setTestAxis('weekly');
     }
@@ -237,6 +255,7 @@ export function SettingsOverlay() {
     alertsConfig.codex_budget_alerts_enabled,
     alertsConfig.codex_projected_enabled,
     alertsConfig.notifier,
+    markersEnabledServer,
   ]);
 
   if (!open) return null;
@@ -265,6 +284,9 @@ export function SettingsOverlay() {
     codexBudgetAlerts !== (alertsConfig.codex_budget_alerts_enabled ?? false);
   const codexProjectedDirty =
     codexProjected !== (alertsConfig.codex_projected_enabled ?? false);
+  // cache-failure-markers spec §5 — dirty against the SSE-mirrored server value.
+  // Travels in its OWN `dashboard` block on the combined Save POST.
+  const cacheMarkersDirty = cacheMarkers !== markersEnabledServer;
   // Notifier (Phase B): dirty against the mirrored value (default 'auto').
   // `commandConfigured` gates the "Custom command" option — when the server
   // has no `command_template`, picking 'command' would dispatch nothing, so
@@ -329,6 +351,12 @@ export function SettingsOverlay() {
         ...((body.budget as Record<string, unknown> | undefined) ?? {}),
         codex: codexBlock,
       };
+    }
+    // cache-failure-markers spec §5 — the dashboard-scoped cache-rebuild marker
+    // opt-out rides its OWN `dashboard` block in the SAME combined POST (one
+    // round-trip, applied atomically server-side). Sent only when dirty.
+    if (cacheMarkersDirty) {
+      body.dashboard = { cache_failure_markers: cacheMarkers };
     }
     if (Object.keys(body).length > 0) {
       setTzSubmitting(true);
@@ -692,6 +720,29 @@ export function SettingsOverlay() {
                 <div className="modal-error">Test failed: {testError}</div>
               )}
             </div>
+          </fieldset>
+          {/*
+            cache-failure-markers spec §5 — the conversation-viewer cache-rebuild
+            marker opt-out. One checkbox, default checked (markers ON), dirtying
+            independently and committed in the single combined Save POST as
+            `dashboard: { cache_failure_markers }`.
+          */}
+          <fieldset className="settings-fs">
+            <legend>Conversation viewer</legend>
+            <label>
+              <input
+                type="checkbox"
+                name="cache-failure-markers"
+                checked={cacheMarkers}
+                onChange={(e) => setCacheMarkers(e.target.checked)}
+              />{' '}
+              Show cache-failure markers
+            </label>
+            <p className="settings-hint">
+              Marks assistant turns that re-created the bulk of their cached
+              prefix instead of reading it (a cost inefficiency, usually after an
+              idle gap past the cache TTL). On by default.
+            </p>
           </fieldset>
           <fieldset className="settings-fs">
             <legend>Sort default</legend>
