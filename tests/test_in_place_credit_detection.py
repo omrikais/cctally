@@ -1609,7 +1609,7 @@ def test_post_credit_alert_fires_independently(ns):
         conn.close()
 
 
-def test_self_heal_probe_scoped_to_active_segment(ns):
+def test_self_heal_probe_scoped_to_active_segment(ns, monkeypatch):
     """When the live record-usage path bails on dedup-no-insert, the
     self-heal probe re-checks whether a milestone is owed. With a
     credited week + pre-credit MAX=67 in segment 0, the post-credit
@@ -1621,6 +1621,16 @@ def test_self_heal_probe_scoped_to_active_segment(ns):
     week_start_date, week_end_date = _week_start_for(end_iso)
     week_start_at = week_start_date + "T05:00:00+00:00"
     effective = "2026-05-14T17:00:00+00:00"
+    # Pin "now" between the seeded snapshot (2026-05-14T18:00Z) and the
+    # week reset (end_iso, 2026-05-16T05:00Z). cmd_record_usage's #112
+    # plausibility guard reads now from _command_as_of() and rejects a
+    # --resets-at outside [now-30d, now+8d]; without a pin this test was a
+    # time-bomb that passed only while the real wall clock sat within 30d
+    # of the hardcoded May-2026 dates (it broke on the 2026-06-15 public
+    # Linux CI run — issue #200). A fixed AS_OF keeps the band check
+    # deterministic AND keeps the in-place credit branch (prior_end_dt >
+    # now) firing. Mirrors the CCTALLY_AS_OF pin used by sibling tests.
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-05-15T00:00:00Z")
 
     conn = ns["open_db"]()
     try:
