@@ -317,7 +317,7 @@ from _lib_subscription_weeks import _compute_subscription_weeks
 from _lib_blocks import _group_entries_into_blocks
 from _cctally_config import save_config, _load_config_unlocked
 from _cctally_db import _render_migration_error_banner
-from _cctally_cache import get_entries, open_cache_db
+from _cctally_cache import get_entries, open_cache_db, sync_cache
 
 
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
@@ -622,6 +622,12 @@ BLOCK_DURATION = sys.modules["cctally"].BLOCK_DURATION
 
 # === STATIC_DIR — dashboard static-asset root ==============================
 STATIC_DIR = pathlib.Path(__file__).resolve().parent.parent / "dashboard" / "static"
+
+# Conversation live-tail watch loop (spec §4.1). Single-file stat poll: cheap.
+_LIVE_TAIL_POLL_INTERVAL = 1.0      # seconds between stat polls of the open file(s)
+_LIVE_TAIL_DEBOUNCE = 0.25          # settle window after first detected growth
+_LIVE_TAIL_KEEPALIVE = 15.0         # idle keep-alive cadence (proxy guard)
+_LIVE_TAIL_FILE_RESET_EVERY = 10    # re-resolve the session file set every N cycles
 
 
 # === Dashboard bind validators (config + cmd_dashboard) ====================
@@ -5268,6 +5274,27 @@ def _qs_str(q: dict, key: str, default: str | None) -> str | None:
 _CONV_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking")
 
 
+def _cached_file_sigs(conn, paths):
+    """{path: (size_bytes, mtime_ns)} from session_files for the given paths —
+    the cache's own view of how far each file is ingested. Used to baseline the
+    live-tail watch so a file the cache hasn't caught up on reads as 'changed'
+    on cycle 1 (spec §2.4). Paths with no row are simply absent → treated as
+    changed."""
+    out = {}
+    if not paths:
+        return out
+    placeholders = ",".join("?" for _ in paths)
+    try:
+        rows = conn.execute(
+            f"SELECT path, size_bytes, mtime_ns FROM session_files "
+            f"WHERE path IN ({placeholders})", list(paths)).fetchall()
+    except sqlite3.OperationalError:
+        return out
+    for p, size, mtime in rows:
+        out[p] = (size, mtime)
+    return out
+
+
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
     """Routes:
         GET /                       → dashboard.html
@@ -5406,6 +5433,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # #177 S6: in-conversation find → rendered-turn anchors. Matched
             # BEFORE the <id> reader catch-all (same precedence as /outline).
             self._handle_get_conversation_find(path)
+        elif path.startswith("/api/conversation/") and path.endswith("/events"):
+            # Live-tail SSE for the open reader (spec §2). Matched BEFORE the
+            # <id> reader catch-all.
+            self._handle_get_conversation_events(path)
         elif path.startswith("/api/conversation/"):
             self._handle_get_conversation_detail(path)
         else:
@@ -7480,6 +7511,99 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(404, "conversation not found")
             return
         self._respond_json(200, body)
+
+    def _handle_get_conversation_events(self, path: str) -> None:
+        """``GET /api/conversation/<id>/events`` — per-conversation live-tail
+        SSE (spec §2). Fail-closed behind the same transcript privacy gate as
+        the other conversation routes. Watches only this session's file(s);
+        emits ``event: tail`` on growth, ``: keep-alive`` when idle. Passive
+        (no ingest, no emit) under ``--no-sync``."""
+        if not self._require_transcripts_allowed():
+            return
+        import time as _time
+        import urllib.parse as _u
+        watch = sys.modules["cctally"]._load_sibling("_lib_conversation_watch")
+        cq = self._conversation_query()
+        session_id = _u.unquote(path[len("/api/conversation/"):-len("/events")])
+        if not session_id:
+            self.send_error(404, "conversation not found")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        passive = bool(type(self).no_sync)
+
+        try:
+            conn = open_cache_db()
+        except (sqlite3.DatabaseError, OSError):
+            # Cache unavailable — degrade to keep-alive only; client backstop
+            # tick still surfaces turns. (Headers already sent; can't 500.)
+            passive = True
+            conn = None
+
+        def _resolve():
+            return cq.session_source_paths(conn, session_id) if conn else []
+
+        def _ingest(changed):
+            return sync_cache(conn, only_paths=set(changed))
+
+        try:
+            if passive:
+                # Frozen-data contract: no ingest, no emit. Keep-alive only.
+                while True:
+                    _time.sleep(_LIVE_TAIL_KEEPALIVE)
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+
+            files = _resolve()
+            # Best-effort connect ingest for immediacy, then baseline `seen`
+            # from the cache's own offsets (session_files) so any pre-connect
+            # growth the connect-ingest declined is still caught on cycle 1.
+            try:
+                if files:
+                    sync_cache(conn, only_paths=set(files))
+            except sqlite3.DatabaseError:
+                pass
+            seen = _cached_file_sigs(conn, files)
+
+            idle = 0.0
+            cycles = 0
+            while True:
+                _time.sleep(_LIVE_TAIL_POLL_INTERVAL)
+                cycles += 1
+                changed = watch.changed_paths(files, seen)
+                if changed:
+                    _time.sleep(_LIVE_TAIL_DEBOUNCE)
+                    new_seen, emitted = watch.watch_step(
+                        files, seen, ingest_fn=_ingest,
+                        committed_sig_fn=lambda p: _cached_file_sigs(conn, [p]).get(p))
+                    seen = new_seen
+                    if emitted:
+                        self.wfile.write(
+                            ("event: tail\ndata: "
+                             + json.dumps({"sessionId": session_id})
+                             + "\n\n").encode("utf-8"))
+                        self.wfile.flush()
+                        idle = 0.0
+                        continue
+                idle += _LIVE_TAIL_POLL_INTERVAL
+                if idle >= _LIVE_TAIL_KEEPALIVE:
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+                    idle = 0.0
+                if cycles % _LIVE_TAIL_FILE_RESET_EVERY == 0:
+                    files = _resolve()
+                    seen = {p: s for p, s in seen.items() if p in set(files)}
+        except (BrokenPipeError, ConnectionResetError):
+            pass            # client disconnect is normal
+        finally:
+            if conn is not None:
+                conn.close()
 
     def _handle_get_conversation_search(self) -> None:
         """``GET /api/conversation/search?q=...&kind=...`` — cross-session
