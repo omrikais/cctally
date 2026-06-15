@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import sys
 import pathlib
@@ -168,6 +169,34 @@ def test_only_paths_declines_on_pending_global_flag(isolated):
     assert conn.execute(
         "SELECT 1 FROM cache_meta WHERE key='conversation_reingest_pending'"
     ).fetchone() is not None
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root bypasses chmod-000 read perms")
+def test_only_paths_per_file_failure_is_not_targeted_clean(isolated):
+    # A path that survives the is_file() filter but fails to OPEN (here:
+    # chmod-000 so the read raises PermissionError) increments files_failed,
+    # so the targeted ingest is NOT targeted_clean — the watch loop must NOT
+    # advance `seen` for it.
+    ns, conn, projects = isolated
+    sync_cache = ns["sync_cache"]
+    a = projects / "a.jsonl"
+    a.write_text(_asst_line("a1", "m1", "r1", "A"))
+    os.chmod(a, 0o000)
+    try:
+        stats = sync_cache(conn, only_paths={str(a)})
+    finally:
+        os.chmod(a, 0o644)  # restore so the fixture teardown can clean up
+    assert stats.files_failed >= 1
+    assert stats.targeted_clean is False
+
+
+def test_only_paths_with_rebuild_raises_value_error(isolated):
+    ns, conn, projects = isolated
+    sync_cache = ns["sync_cache"]
+    a = projects / "a.jsonl"
+    a.write_text(_asst_line("a1", "m1", "r1", "A"))
+    with pytest.raises(ValueError):
+        sync_cache(conn, only_paths={str(a)}, rebuild=True)
 
 
 def test_only_paths_parity_with_full_sync_for_that_file(isolated, tmp_path, monkeypatch):

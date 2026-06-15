@@ -581,8 +581,9 @@ def _ensure_session_files_row(conn: sqlite3.Connection, source_path: str) -> Non
 # targeted (only_paths) ingest DECLINES when any is set and defers to the next
 # full background sync — inserting through a half-migrated FTS shape or skipping
 # a pending backfill would diverge from what a full sync produces (spec §
-# "Targeted ingest contract"). Enumerated against the consumption blocks in
-# sync_cache (bin/_cctally_cache.py:745-866).
+# "Targeted ingest contract"). Enumerated against the flag-consumption blocks
+# guarded by the `if not rebuild and not targeted:` branch in sync_cache (the
+# full-sync-only `_consume_*` calls); keep this tuple in sync with those.
 _TARGETED_DECLINE_FLAGS = (
     "conversation_backfill_pending",
     "ai_titles_backfill_pending",

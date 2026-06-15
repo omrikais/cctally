@@ -33,13 +33,18 @@ def changed_paths(files, seen, stat_fn=file_sig):
     return out
 
 
-def watch_step(files, seen, *, stat_fn=file_sig, ingest_fn):
+def watch_step(files, seen, *, stat_fn=file_sig, ingest_fn, committed_sig_fn=None):
     """One watch cycle. Returns (new_seen, emitted).
 
-    Detect changed files → if any, run `ingest_fn(changed)` (the targeted
-    sync_cache). Emit + advance `seen` ONLY on a clean ingest
-    (`stats.targeted_clean`); a contended/declined/failed ingest leaves `seen`
-    untouched so the next cycle retries (the 5s backstop is the floor)."""
+    Detect changed files → run ingest_fn(changed) (targeted sync_cache). Emit +
+    advance `seen` ONLY on a clean ingest (stats.targeted_clean). `seen` is
+    advanced to the COMMITTED cache cursor (committed_sig_fn) — NOT a fresh
+    filesystem re-stat — so a file that grew during the ingest is still seen as
+    changed next cycle (the cache cursor, in session_files, lags the new disk
+    size). committed_sig_fn defaults to stat_fn for pure unit tests with no cache.
+    A contended/declined/failed ingest leaves `seen` untouched so the next cycle
+    retries (the 5s backstop is the floor)."""
+    committed_sig_fn = committed_sig_fn or stat_fn
     changed = changed_paths(files, seen, stat_fn)
     if not changed:
         return seen, False
@@ -48,7 +53,7 @@ def watch_step(files, seen, *, stat_fn=file_sig, ingest_fn):
         return seen, False
     new_seen = dict(seen)
     for p in changed:
-        sig = stat_fn(p)
+        sig = committed_sig_fn(p)
         if sig is not None:
             new_seen[p] = sig
     return new_seen, True
