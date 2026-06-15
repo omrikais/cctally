@@ -3,6 +3,7 @@ import {
   dispatch,
   getState,
   selectMarkersEnabled,
+  selectLiveTailEnabled,
   subscribeStore,
   SESSION_SORT_KEYS,
   type SessionSortKey,
@@ -149,6 +150,15 @@ export function SettingsOverlay() {
     selectMarkersEnabled(getState()),
   );
   const [cacheMarkers, setCacheMarkers] = useState<boolean>(markersEnabledServer);
+  // live-tail spec §4.2 — the conversation-viewer live-tail opt-out. Same
+  // plumbing as cacheMarkers: seeds from the SSE-mirrored dashboard_prefs slice
+  // (live-tail ON by default), dirties independently, and travels in the SAME
+  // combined Save POST's `dashboard` block. selectLiveTailEnabled does the
+  // absent-field defaulting so the toggle never reads `undefined`.
+  const liveTailServer = useSyncExternalStore(subscribeStore, () =>
+    selectLiveTailEnabled(getState()),
+  );
+  const [liveTail, setLiveTail] = useState<boolean>(liveTailServer);
   const [testSubmitting, setTestSubmitting] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
   const [testAxis, setTestAxis] = useState<AlertAxis>('weekly');
@@ -194,6 +204,13 @@ export function SettingsOverlay() {
   useEffect(() => {
     setCacheMarkers(markersEnabledServer);
   }, [markersEnabledServer]);
+
+  // live-tail spec §4.2 — re-seed the live-tail toggle on each SSE tick (same
+  // pattern as the markers re-seed above): a server flip (CLI write / another
+  // tab's Save) flows through dashboard_prefs and repaints the toggle.
+  useEffect(() => {
+    setLiveTail(liveTailServer);
+  }, [liveTailServer]);
 
   useKeymap([
     // Parity with main's settings.js#152: don't stack Settings under an
@@ -287,6 +304,9 @@ export function SettingsOverlay() {
   // cache-failure-markers spec §5 — dirty against the SSE-mirrored server value.
   // Travels in its OWN `dashboard` block on the combined Save POST.
   const cacheMarkersDirty = cacheMarkers !== markersEnabledServer;
+  // live-tail spec §4.2 — dirty against the SSE-mirrored server value. Rides the
+  // SAME `dashboard` block as cacheMarkers (both leaves, one block).
+  const liveTailDirty = liveTail !== liveTailServer;
   // Notifier (Phase B): dirty against the mirrored value (default 'auto').
   // `commandConfigured` gates the "Custom command" option — when the server
   // has no `command_template`, picking 'command' would dispatch nothing, so
@@ -352,11 +372,15 @@ export function SettingsOverlay() {
         codex: codexBlock,
       };
     }
-    // cache-failure-markers spec §5 — the dashboard-scoped cache-rebuild marker
-    // opt-out rides its OWN `dashboard` block in the SAME combined POST (one
-    // round-trip, applied atomically server-side). Sent only when dirty.
-    if (cacheMarkersDirty) {
-      body.dashboard = { cache_failure_markers: cacheMarkers };
+    // cache-failure-markers spec §5 + live-tail spec §4.2 — the two
+    // dashboard-scoped opt-outs ride ONE shared `dashboard` block in the SAME
+    // combined POST (one round-trip, applied atomically server-side). Each leaf
+    // is sent only when its own toggle is dirty.
+    if (cacheMarkersDirty || liveTailDirty) {
+      body.dashboard = {
+        ...(cacheMarkersDirty ? { cache_failure_markers: cacheMarkers } : {}),
+        ...(liveTailDirty ? { live_tail: liveTail } : {}),
+      };
     }
     if (Object.keys(body).length > 0) {
       setTzSubmitting(true);
@@ -742,6 +766,19 @@ export function SettingsOverlay() {
               Marks assistant turns that re-created the bulk of their cached
               prefix instead of reading it (a cost inefficiency, usually after an
               idle gap past the cache TTL). On by default.
+            </p>
+            <label>
+              <input
+                type="checkbox"
+                name="live-tail"
+                checked={liveTail}
+                onChange={(e) => setLiveTail(e.target.checked)}
+              />{' '}
+              Live-tail new turns
+            </label>
+            <p className="settings-hint">
+              Fetch new turns the instant the session's file changes (instead of
+              waiting for the periodic refresh). On by default.
             </p>
           </fieldset>
           <fieldset className="settings-fs">

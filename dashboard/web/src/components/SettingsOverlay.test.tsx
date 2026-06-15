@@ -739,6 +739,174 @@ describe('<SettingsOverlay /> cache-failure markers toggle', () => {
   });
 });
 
+// live-tail spec §4.2 — the "Live-tail new turns" checkbox. Mirrors the
+// cache-failure-markers toggle exactly: seeds from the SSE-mirrored
+// dashboard_prefs slice (live-tail ON by default), dirties independently, and
+// travels in the SAME combined Save POST's `dashboard` block as
+// `dashboard: { live_tail }`. Re-seeds on SSE tick. One modal, one Save.
+function seedLiveTailPref(live_tail: boolean) {
+  act(() => {
+    dispatch({ type: 'INGEST_DASHBOARD_PREFS', prefs: { live_tail } });
+  });
+}
+
+describe('<SettingsOverlay /> live-tail toggle', () => {
+  it('defaults the checkbox checked (live-tail ON) before any tick', () => {
+    render(<SettingsOverlay />);
+    openSettings();
+    const toggle = screen.getByRole('checkbox', {
+      name: /Live-tail new turns/,
+    }) as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+  });
+
+  it('seeds the checkbox from dashboard_prefs (OFF when the server reports false)', () => {
+    render(<SettingsOverlay />);
+    seedLiveTailPref(false);
+    openSettings();
+    const toggle = screen.getByRole('checkbox', {
+      name: /Live-tail new turns/,
+    }) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+  });
+
+  it('POSTs dashboard.live_tail=false in the combined Save body when toggled off', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    // Server reports live-tail ON; the user opts out.
+    seedLiveTailPref(true);
+    openSettings();
+
+    const toggle = screen.getByRole('checkbox', {
+      name: /Live-tail new turns/,
+    }) as HTMLInputElement;
+    expect(toggle.checked).toBe(true); // seeded ON
+    fireEvent.click(toggle);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
+    expect(call).toBeTruthy();
+    const [, init] = call as [string, RequestInit];
+    expect(init.method).toBe('POST');
+    const parsed = JSON.parse(init.body as string) as {
+      dashboard?: { live_tail?: boolean };
+    };
+    // Binding assertion: the toggle travels in the `dashboard` block.
+    expect(parsed.dashboard?.live_tail).toBe(false);
+  });
+
+  it('POSTs live_tail=true when re-enabled from an OFF server state', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    seedLiveTailPref(false);
+    openSettings();
+
+    const toggle = screen.getByRole('checkbox', {
+      name: /Live-tail new turns/,
+    }) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
+    const [, init] = call as [string, RequestInit];
+    const parsed = JSON.parse(init.body as string) as {
+      dashboard?: { live_tail?: boolean };
+    };
+    expect(parsed.dashboard?.live_tail).toBe(true);
+  });
+
+  it('does NOT POST when the live-tail toggle is unchanged', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    seedLiveTailPref(true);
+    openSettings();
+
+    // Touch nothing — the toggle matches the server, so Save makes no POST.
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    const settingsCall = fetchMock.mock.calls.find(
+      ([url]) => url === '/api/settings',
+    );
+    expect(settingsCall).toBeUndefined();
+  });
+
+  it('carries both leaves in one dashboard block when both toggles are dirty', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    // Both server values ON; flip both off.
+    act(() => {
+      dispatch({
+        type: 'INGEST_DASHBOARD_PREFS',
+        prefs: { cache_failure_markers: true, live_tail: true },
+      });
+    });
+    openSettings();
+
+    fireEvent.click(
+      screen.getByRole('checkbox', { name: /Show cache-failure markers/ }),
+    );
+    fireEvent.click(screen.getByRole('checkbox', { name: /Live-tail new turns/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
+    const [, init] = call as [string, RequestInit];
+    const parsed = JSON.parse(init.body as string) as {
+      dashboard?: { cache_failure_markers?: boolean; live_tail?: boolean };
+    };
+    // Both leaves ride the SAME dashboard block in one combined POST.
+    expect(parsed.dashboard?.cache_failure_markers).toBe(false);
+    expect(parsed.dashboard?.live_tail).toBe(false);
+  });
+
+  it('re-seeds the checkbox when a fresh dashboard_prefs tick arrives while open', () => {
+    render(<SettingsOverlay />);
+    seedLiveTailPref(true);
+    openSettings();
+    const toggle = () =>
+      screen.getByRole('checkbox', { name: /Live-tail new turns/ }) as HTMLInputElement;
+    expect(toggle().checked).toBe(true);
+    // A server flip (another tab's Save / CLI write) arrives via SSE.
+    seedLiveTailPref(false);
+    expect(toggle().checked).toBe(false);
+  });
+});
+
 describe('<SettingsOverlay /> swallows `0` while open (#156)', () => {
   it('`0` does not reach the global 10th-panel opener while Settings is open', () => {
     const opener = vi.fn();

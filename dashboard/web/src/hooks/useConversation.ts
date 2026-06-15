@@ -216,6 +216,10 @@ export function useConversation(sessionId: string | null): UseConversation {
   const liveTailEnabled = useSyncExternalStore(subscribeStore, () => selectLiveTailEnabled(getState()));
   useEffect(() => {
     if (!sessionId || !transcriptsEnabled || !liveTailEnabled) return;
+    // EventSource is universal in real browsers but absent in some runtimes
+    // (JSDOM, SSR). Degrade silently to the generated_at backstop above when
+    // it's missing rather than throwing on mount.
+    if (typeof EventSource === 'undefined') return;
     const es = new EventSource(`/api/conversation/${encodeURIComponent(sessionId)}/events`);
     es.addEventListener('tail', () => { void pollTail(); });
     es.addEventListener('open', () => { void pollTail(); });  // (re)connect catch-up
