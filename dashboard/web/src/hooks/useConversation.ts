@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { fetchJson, HttpError, isAbortError } from '../lib/fetchJson';
 import { useSnapshot } from './useSnapshot';
+import { getState, selectLiveTailEnabled, subscribeStore } from '../store/store';
 import type { ConversationDetail } from '../types/conversation';
 
 // Paginated reader. We fetch page 1 on sessionId change and APPEND on
@@ -203,6 +204,25 @@ export function useConversation(sessionId: string | null): UseConversation {
     // generatedAt only — pollTail is stable (refs + setDetailSynced).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [generatedAt]);
+
+  // Live-tail (spec §3.1): a dedicated per-conversation EventSource that fires
+  // pollTail() the instant the server sees this session's JSONL grow — far
+  // faster than the 5s generated_at backstop above (which stays as the slow
+  // fallback). The same fully-paged / coalescing guards inside pollTail() apply,
+  // so this never races pagination or double-fetches. Gated on transcriptsEnabled
+  // (the reader isn't shown otherwise → avoids a 403 reconnect loop) and the
+  // dashboard.live_tail opt-out (selectLiveTailEnabled, absence = ON).
+  const transcriptsEnabled = env?.transcriptsEnabled ?? false;
+  const liveTailEnabled = useSyncExternalStore(subscribeStore, () => selectLiveTailEnabled(getState()));
+  useEffect(() => {
+    if (!sessionId || !transcriptsEnabled || !liveTailEnabled) return;
+    const es = new EventSource(`/api/conversation/${encodeURIComponent(sessionId)}/events`);
+    es.addEventListener('tail', () => { void pollTail(); });
+    es.addEventListener('open', () => { void pollTail(); });  // (re)connect catch-up
+    return () => es.close();
+    // pollTail is ref-stable (refs + setDetailSynced).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, transcriptsEnabled, liveTailEnabled]);
 
   return { detail: exposedDetail, loading: exposedLoading, error, hasMore, loadMore, loadUntil };
 }
