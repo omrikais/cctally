@@ -91,7 +91,11 @@ def test_http_dashboard_cache_failure_markers_round_trip(monkeypatch, tmp_path):
         )
         assert status == 200, body
         assert body is not None
-        assert body["dashboard"] == {"cache_failure_markers": False}
+        # The echo carries BOTH dashboard-writable leaves (live_tail rides the
+        # same block); only cache_failure_markers was sent here so live_tail
+        # echoes its default true.
+        assert body["dashboard"] == {
+            "cache_failure_markers": False, "live_tail": True}
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg.get("dashboard", {}).get("cache_failure_markers") is False
     finally:
@@ -109,7 +113,8 @@ def test_http_dashboard_cache_failure_markers_true_round_trip(monkeypatch, tmp_p
             {"dashboard": {"cache_failure_markers": True}},
         )
         assert status == 200, body
-        assert body["dashboard"] == {"cache_failure_markers": True}
+        assert body["dashboard"] == {
+            "cache_failure_markers": True, "live_tail": True}
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg.get("dashboard", {}).get("cache_failure_markers") is True
     finally:
@@ -221,7 +226,8 @@ def test_http_dashboard_combined_save_with_display(monkeypatch, tmp_path):
             },
         )
         assert status == 200, body
-        assert body["dashboard"] == {"cache_failure_markers": False}
+        assert body["dashboard"] == {
+            "cache_failure_markers": False, "live_tail": True}
         assert body["display"]["resolved_tz"] == "Etc/UTC"
     finally:
         srv.shutdown()
@@ -290,3 +296,118 @@ def test_envelope_dashboard_prefs_reflects_persisted_false(monkeypatch, tmp_path
     snap = ns["_empty_dashboard_snapshot"]()
     env = ns["snapshot_to_envelope"](snap, now_utc=now)
     assert env["dashboard_prefs"]["cache_failure_markers"] is False
+
+
+# ---------------------------------------------------------------------------
+# POST /api/settings — dashboard.live_tail round-trip (conversation live-tail)
+# ---------------------------------------------------------------------------
+def test_http_dashboard_live_tail_round_trip(monkeypatch, tmp_path):
+    """Valid bool returns 200 + the echoed dashboard block (both leaves) +
+    persists the live_tail leaf."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _wire_handlers(ns)
+    srv, t, port = _serve(ns)
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"dashboard": {"live_tail": False}},
+        )
+        assert status == 200, body
+        assert body["dashboard"] == {
+            "cache_failure_markers": True, "live_tail": False}
+        cfg = json.loads(ns["CONFIG_PATH"].read_text())
+        assert cfg.get("dashboard", {}).get("live_tail") is False
+    finally:
+        srv.shutdown()
+
+
+def test_http_dashboard_live_tail_non_bool_returns_400(monkeypatch, tmp_path):
+    """A string/int for live_tail → 400 with the field set; no partial write."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _wire_handlers(ns)
+    srv, t, port = _serve(ns)
+    try:
+        for bad in ("yes", 1, 0, "true"):
+            status, body = _post_json(
+                "127.0.0.1", port, "/api/settings",
+                {"dashboard": {"live_tail": bad}},
+            )
+            assert status == 400, (bad, body)
+            assert body is not None
+            assert body.get("field") == "dashboard.live_tail", (bad, body)
+        assert not ns["CONFIG_PATH"].exists() or "dashboard" not in json.loads(
+            ns["CONFIG_PATH"].read_text()
+        )
+    finally:
+        srv.shutdown()
+
+
+def test_http_dashboard_live_tail_preserves_markers_sibling(monkeypatch, tmp_path):
+    """Writing live_tail must NOT clobber a persisted cache_failure_markers."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _wire_handlers(ns)
+    ns["CONFIG_PATH"].write_text(json.dumps(
+        {"dashboard": {"cache_failure_markers": False}}
+    ))
+    srv, t, port = _serve(ns)
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"dashboard": {"live_tail": False}},
+        )
+        assert status == 200, body
+        cfg = json.loads(ns["CONFIG_PATH"].read_text())["dashboard"]
+        assert cfg["live_tail"] is False
+        assert cfg["cache_failure_markers"] is False    # sibling preserved
+    finally:
+        srv.shutdown()
+
+
+def test_http_dashboard_both_leaves_in_one_save(monkeypatch, tmp_path):
+    """Both dashboard-writable leaves ride one block in a single POST."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _wire_handlers(ns)
+    srv, t, port = _serve(ns)
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"dashboard": {"cache_failure_markers": False, "live_tail": False}},
+        )
+        assert status == 200, body
+        assert body["dashboard"] == {
+            "cache_failure_markers": False, "live_tail": False}
+        cfg = json.loads(ns["CONFIG_PATH"].read_text())["dashboard"]
+        assert cfg["cache_failure_markers"] is False
+        assert cfg["live_tail"] is False
+    finally:
+        srv.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# SSE envelope mirror — dashboard_prefs.live_tail
+# ---------------------------------------------------------------------------
+def test_envelope_dashboard_prefs_live_tail_default_true(monkeypatch, tmp_path):
+    """No config.json → the live_tail mirror defaults to true (opt-out)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    now = dt.datetime(2026, 6, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
+    snap = ns["_empty_dashboard_snapshot"]()
+    env = ns["snapshot_to_envelope"](snap, now_utc=now)
+    assert env["dashboard_prefs"]["live_tail"] is True
+
+
+def test_envelope_dashboard_prefs_live_tail_reflects_persisted_false(
+        monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    ns["CONFIG_PATH"].write_text(json.dumps(
+        {"dashboard": {"live_tail": False}}
+    ))
+    now = dt.datetime(2026, 6, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
+    snap = ns["_empty_dashboard_snapshot"]()
+    env = ns["snapshot_to_envelope"](snap, now_utc=now)
+    assert env["dashboard_prefs"]["live_tail"] is False

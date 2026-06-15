@@ -218,3 +218,16 @@ def test_only_paths_parity_with_full_sync_for_that_file(isolated, tmp_path, monk
     finally:
         conn2.close()
     assert targeted == full
+
+
+def test_live_tail_default_on(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    assert ns["_config_known_value"]({}, "dashboard.live_tail") is True
+
+
+def test_live_tail_set_false_then_read(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    cfg = {"dashboard": {"live_tail": False}}
+    assert ns["_config_known_value"](cfg, "dashboard.live_tail") is False

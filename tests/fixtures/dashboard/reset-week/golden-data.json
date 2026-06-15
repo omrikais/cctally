@@ -736,7 +736,8 @@
     "total_tokens": 12322000
   },
   "dashboard_prefs": {
-    "cache_failure_markers": true
+    "cache_failure_markers": true,
+    "live_tail": true
   },
   "display": {
     "offset_label": "UTC",

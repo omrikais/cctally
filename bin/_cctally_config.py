@@ -303,6 +303,7 @@ ALLOWED_CONFIG_KEYS = (
     "dashboard.bind",
     "dashboard.expose_transcripts",
     "dashboard.cache_failure_markers",
+    "dashboard.live_tail",
     "update.check.enabled",
     "update.check.ttl_hours",
     "statusline.visual_burn_rate",
@@ -495,6 +496,24 @@ def _config_known_value(config: dict, key: str) -> "object":
         # Only str spellings are normalizable; any other JSON scalar surfaces
         # the default (the shared normalizer's .strip() would AttributeError on
         # a bare int — uncaught by `except ValueError`).
+        if isinstance(stored, str):
+            try:
+                return c._normalize_alerts_enabled_value(stored)
+            except ValueError:
+                return True
+        return True
+    if key == "dashboard.live_tail":
+        # Boolean opt-OUT (spec §4.2). Default TRUE — absence is ON. A
+        # hand-edited junk value surfaces the True default. Mirrors
+        # dashboard.cache_failure_markers exactly.
+        block = config.get("dashboard") if isinstance(config, dict) else None
+        if not isinstance(block, dict):
+            block = {}
+        stored = block.get("live_tail")
+        if stored is None:
+            return True
+        if isinstance(stored, bool):
+            return stored
         if isinstance(stored, str):
             try:
                 return c._normalize_alerts_enabled_value(stored)
@@ -930,6 +949,40 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                 f"{'true' if canonical else 'false'}"
             )
         return 0
+    if key == "dashboard.live_tail":
+        # Mirror dashboard.cache_failure_markers exactly: validate the bool
+        # first, then read-modify-write under config_writer_lock with
+        # _load_config_unlocked (load_config under the lock self-deadlocks).
+        # Preserves sibling dashboard.bind / expose_transcripts /
+        # cache_failure_markers. Re-message the shared normalizer's ValueError
+        # with the actual key name.
+        try:
+            canonical = c._normalize_alerts_enabled_value(raw)
+        except ValueError:
+            print(
+                f"cctally: invalid boolean value for dashboard.live_tail: "
+                f"{raw!r} (expected true|false|yes|no|1|0|on|off)",
+                file=sys.stderr,
+            )
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing = config.get("dashboard")
+            if existing is not None and not isinstance(existing, dict):
+                print(
+                    "cctally: dashboard config error: dashboard must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            block = dict(existing or {})
+            block["live_tail"] = canonical
+            config["dashboard"] = block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(json.dumps({"dashboard": {"live_tail": canonical}}, indent=2))
+        else:
+            print(f"dashboard.live_tail={'true' if canonical else 'false'}")
+        return 0
     if key in (
         "statusline.visual_burn_rate",
         "statusline.cost_source",
@@ -1313,6 +1366,21 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
             block = config.get("dashboard")
             if isinstance(block, dict) and "cache_failure_markers" in block:
                 del block["cache_failure_markers"]
+                if not block:
+                    config.pop("dashboard", None)
+                save_config(config)
+            # idempotent: silent on missing key
+        return 0
+    if key == "dashboard.live_tail":
+        # Mirror the cache_failure_markers unset branch: drop only the
+        # live_tail leaf; if the dashboard block ends up empty, drop the parent
+        # too. Sibling dashboard.bind / expose_transcripts / cache_failure_markers
+        # survive. Unsetting restores the True (opt-out) default at read time.
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            block = config.get("dashboard")
+            if isinstance(block, dict) and "live_tail" in block:
+                del block["live_tail"]
                 if not block:
                     config.pop("dashboard", None)
                 save_config(config)

@@ -4927,8 +4927,10 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     _dash_cfg = _cfg_for_alerts.get("dashboard") if isinstance(
         _cfg_for_alerts.get("dashboard"), dict) else {}
     _cfm = _dash_cfg.get("cache_failure_markers", True)
+    _lt = _dash_cfg.get("live_tail", True)
     dashboard_prefs = {
         "cache_failure_markers": _cfm if isinstance(_cfm, bool) else True,
+        "live_tail": _lt if isinstance(_lt, bool) else True,
     }
 
     # Mirror update-state.json + update-suppress.json into the envelope
@@ -5910,7 +5912,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                          "field": f"dashboard.{leaf}"},
                     )
                     return
-                if leaf != "cache_failure_markers":
+                if leaf not in ("cache_failure_markers", "live_tail"):
                     self._respond_json(
                         400,
                         {"error": f"unknown dashboard settings key: {leaf}",
@@ -5918,18 +5920,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     )
                     return
             dashboard_validated = {}
-            if "cache_failure_markers" in dashboard_block:
-                if not isinstance(dashboard_block["cache_failure_markers"], bool):
-                    self._respond_json(
-                        400,
-                        {"error": ("dashboard.cache_failure_markers must be a "
-                                   "JSON boolean"),
-                         "field": "dashboard.cache_failure_markers"},
-                    )
-                    return
-                dashboard_validated["cache_failure_markers"] = (
-                    dashboard_block["cache_failure_markers"]
-                )
+            for _leaf in ("cache_failure_markers", "live_tail"):
+                if _leaf in dashboard_block:
+                    if not isinstance(dashboard_block[_leaf], bool):
+                        self._respond_json(
+                            400,
+                            {"error": f"dashboard.{_leaf} must be a JSON boolean",
+                             "field": f"dashboard.{_leaf}"},
+                        )
+                        return
+                    dashboard_validated[_leaf] = dashboard_block[_leaf]
 
         # Pre-validate update shape. Only `update.check.{enabled,ttl_hours}`
         # is settable today; any other key under `update` or `update.check`
@@ -6266,14 +6266,15 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 "anomaly_threshold_pp": stored_threshold,
             }
         if dashboard_validated is not None:
-            # Echo the persisted cache_failure_markers (the only dashboard-
-            # writable leaf) so the SettingsOverlay can repaint without a
+            # Echo the persisted dashboard-writable leaves (cache_failure_markers
+            # + live_tail) so the SettingsOverlay can repaint without a
             # follow-up GET. Default true (opt-out) when nothing is persisted.
             persisted_dash = merged.get("dashboard") or {}
             out["dashboard"] = {
                 "cache_failure_markers": bool(
                     persisted_dash.get("cache_failure_markers", True)
                 ),
+                "live_tail": bool(persisted_dash.get("live_tail", True)),
             }
         out["saved_at"] = (
             dt.datetime.now(dt.timezone.utc)
