@@ -262,3 +262,100 @@ def test_outline_counts_recovered_compaction_as_meta_not_human():
     assert out["stats"]["turns"]["human"] == 0
     assert out["turns"][0]["kind"] == "meta"
     assert out["turns"][0]["meta_kind"] == "compaction"
+
+
+# ---------------------------------------------------------------------------
+# Task 2: cache-failure flag copied onto OutlineTurn + stats.cache_failures
+# aggregate. A healthy prime turn + a collapse turn through the shared assembly.
+# ---------------------------------------------------------------------------
+def _seed_cache_failure(c, sid="cfo"):
+    # prime: healthy turn establishing a high running-max cache_read.
+    _msg(c, session_id=sid, uuid="a1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="primed", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([{"kind": "text", "text": "primed"}]))
+    _entry(c, source_path="a.jsonl", line_offset=0, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20, cc=1_000, cr=130_000)
+    # collapse: cache_read -> 0, cache_creation balloons -> a cache failure.
+    _msg(c, session_id=sid, uuid="a2", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="assistant",
+         text="rebuilt", model=_MODEL, msg_id="m2", req_id="r2",
+         blocks_json=_json.dumps([{"kind": "text", "text": "rebuilt"}]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m2", req_id="r2", inp=10, out=20, cc=134_000, cr=0)
+
+
+def test_outline_copies_cache_failure_onto_failing_turn():
+    c = _conn()
+    _seed_cache_failure(c)
+    out = cq.get_conversation_outline(c, "cfo")
+    by = {t["uuid"]: t for t in out["turns"]}
+    assert "cache_failure" not in by["a1"]            # healthy: absent (not zero)
+    cf = by["a2"]["cache_failure"]
+    assert cf["prev_cached"] == 130_000
+    assert cf["tokens_recreated"] == 130_000
+    assert cf["est_wasted_usd"] > 0
+
+
+def test_outline_stats_cache_failures_aggregate():
+    c = _conn()
+    _seed_cache_failure(c)
+    out = cq.get_conversation_outline(c, "cfo")
+    detail = cq.get_conversation(c, "cfo", limit=1000)
+    fail = next(it for it in detail["items"] if it["anchor"]["uuid"] == "a2")
+    cf = fail["cache_failure"]
+    agg = out["stats"]["cache_failures"]
+    assert agg["count"] == 1
+    assert agg["tokens_recreated"] == cf["tokens_recreated"]
+    assert abs(agg["est_wasted_usd"] - cf["est_wasted_usd"]) < 1e-12
+
+
+def test_outline_stats_cache_failures_absent_when_none():
+    # A clean session (no failures) must NOT carry a cache_failures aggregate at
+    # all (mirrors the per-turn "absent, not zero" convention; ~65% of sessions
+    # have zero, so a perpetual zero row would be clutter).
+    c = _conn()
+    _seed_rich(c)
+    out = cq.get_conversation_outline(c, "s5")
+    assert "cache_failures" not in out["stats"]
+
+
+def test_outline_stats_cache_failures_multiple():
+    # Two independent failures sum into the aggregate count + tokens + usd.
+    c = _conn()
+    # prime
+    _msg(c, session_id="m2f", uuid="a0", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="p", model=_MODEL, msg_id="m0", req_id="r0",
+         blocks_json=_json.dumps([{"kind": "text", "text": "p"}]))
+    _entry(c, source_path="a.jsonl", line_offset=0, model=_MODEL,
+           msg_id="m0", req_id="r0", inp=10, out=20, cc=1_000, cr=130_000)
+    # failure 1
+    _msg(c, session_id="m2f", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="assistant",
+         text="f1", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([{"kind": "text", "text": "f1"}]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20, cc=140_000, cr=5_000)
+    # healthy re-prime (rm back up to 150k)
+    _msg(c, session_id="m2f", uuid="a2", source_path="a.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-01T00:00:10Z", entry_type="assistant",
+         text="rp", model=_MODEL, msg_id="m2", req_id="r2",
+         blocks_json=_json.dumps([{"kind": "text", "text": "rp"}]))
+    _entry(c, source_path="a.jsonl", line_offset=2, model=_MODEL,
+           msg_id="m2", req_id="r2", inp=10, out=20, cc=2_000, cr=150_000)
+    # failure 2
+    _msg(c, session_id="m2f", uuid="a3", source_path="a.jsonl", byte_offset=3,
+         timestamp_utc="2026-06-01T00:00:15Z", entry_type="assistant",
+         text="f2", model=_MODEL, msg_id="m3", req_id="r3",
+         blocks_json=_json.dumps([{"kind": "text", "text": "f2"}]))
+    _entry(c, source_path="a.jsonl", line_offset=3, model=_MODEL,
+           msg_id="m3", req_id="r3", inp=10, out=20, cc=160_000, cr=1_000)
+    out = cq.get_conversation_outline(c, "m2f")
+    detail = cq.get_conversation(c, "m2f", limit=1000)
+    fails = [it["cache_failure"] for it in detail["items"] if "cache_failure" in it]
+    assert len(fails) == 2
+    agg = out["stats"]["cache_failures"]
+    assert agg["count"] == 2
+    assert agg["tokens_recreated"] == sum(f["tokens_recreated"] for f in fails)
+    assert abs(agg["est_wasted_usd"] - sum(f["est_wasted_usd"] for f in fails)) < 1e-12

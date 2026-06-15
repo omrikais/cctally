@@ -3156,3 +3156,34 @@ def test_unknown_model_wasted_cost_zero(capsys):
     assert cf["tokens_recreated"] == 130_000     # still flagged (token rule is price-free)
     assert cf["est_wasted_usd"] == 0.0
     capsys.readouterr()   # drain the expected one-shot warning
+
+
+def test_get_conversation_passes_cache_failure_through_on_failing_turn():
+    # Task 2: get_conversation items are a pass-through, so the cache_failure flag
+    # stamped by _assemble_session rides along on EXACTLY the failing turn. Seed a
+    # healthy prime turn (high cache_read) then a collapse turn through the REAL
+    # assembly path (conversation_messages + session_entries).
+    c = _conn()
+    # prime: healthy turn, big cache_read -> establishes running-max
+    _msg(c, session_id="cf1", uuid="a1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="primed", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([{"kind": "text", "text": "primed"}]))
+    _entry(c, source_path="a.jsonl", line_offset=0, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20, cc=1_000, cr=130_000)
+    # collapse: cache_read drops to 0, cache_creation balloons -> FAILURE
+    _msg(c, session_id="cf1", uuid="a2", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="assistant",
+         text="rebuilt", model=_MODEL, msg_id="m2", req_id="r2",
+         blocks_json=_json.dumps([{"kind": "text", "text": "rebuilt"}]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m2", req_id="r2", inp=10, out=20, cc=134_000, cr=0)
+    out = cq.get_conversation(c, "cf1", after=None, limit=500)
+    items = out["items"]
+    prime = next(it for it in items if it["anchor"]["uuid"] == "a1")
+    fail = next(it for it in items if it["anchor"]["uuid"] == "a2")
+    assert "cache_failure" not in prime            # healthy turn: absent (not zero)
+    cf = fail["cache_failure"]
+    assert cf["prev_cached"] == 130_000
+    assert cf["tokens_recreated"] == min(134_000, 130_000 - 0)
+    assert cf["est_wasted_usd"] > 0

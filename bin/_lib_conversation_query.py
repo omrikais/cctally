@@ -1100,6 +1100,12 @@ def get_conversation_outline(conn, session_id):
     tool_counts, models = {}, {}
     error_count = 0
     tokens = {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
+    # Cache-failure aggregate (spec §2): count + summed lost-prefix tokens +
+    # summed wasted-cost over the flagged turns. Emitted only when count > 0
+    # (the per-turn "absent, not zero" convention; ~65% of sessions have zero).
+    cf_count = 0
+    cf_tokens = 0
+    cf_wasted = 0.0
     for it in items:
         kind = it["kind"]
         turn_counts["total"] += 1
@@ -1141,6 +1147,15 @@ def get_conversation_outline(conn, session_id):
                 t["tokens"] = tok
                 for k in tokens:
                     tokens[k] += tok.get(k, 0)
+            # Copy the cache-failure marker onto the OutlineTurn exactly where
+            # tokens is copied (assistant-only, rides the same source row) and
+            # accumulate the session-level aggregate (spec §2).
+            cf = it.get("cache_failure")
+            if cf is not None:
+                t["cache_failure"] = cf
+                cf_count += 1
+                cf_tokens += cf.get("tokens_recreated", 0)
+                cf_wasted += cf.get("est_wasted_usd", 0.0)
         if kind == "meta":
             t["meta_kind"] = it.get("meta_kind")
             t["skill_name"] = it.get("skill_name")
@@ -1151,12 +1166,17 @@ def get_conversation_outline(conn, session_id):
     d0 = _parse_outline_ts(ts_vals[0] if ts_vals else None)
     d1 = _parse_outline_ts(ts_vals[-1] if ts_vals else None)
     duration = int((d1 - d0).total_seconds()) if d0 and d1 else None
+    stats = {"turns": turn_counts, "tool_counts": tool_counts,
+             "error_count": error_count, "models": models,
+             "duration_seconds": duration, "tokens": tokens,
+             "cost_usd": asm["header_cost"]}
+    if cf_count:
+        stats["cache_failures"] = {"count": cf_count,
+                                   "tokens_recreated": cf_tokens,
+                                   "est_wasted_usd": cf_wasted}
     return {"session_id": session_id,
             "subagent_meta": asm["subagent_meta"],
-            "stats": {"turns": turn_counts, "tool_counts": tool_counts,
-                      "error_count": error_count, "models": models,
-                      "duration_seconds": duration, "tokens": tokens,
-                      "cost_usd": asm["header_cost"]},
+            "stats": stats,
             "turns": turns}
 
 
