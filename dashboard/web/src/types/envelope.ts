@@ -70,7 +70,9 @@ export interface Envelope {
   // Additive optional, like alerts_settings — a Python without the feature
   // omits it entirely. `cache_failure_markers` is the conversation-viewer
   // cache-rebuild marker opt-out; ABSENCE is treated as ON (default true).
-  dashboard_prefs?: { cache_failure_markers?: boolean };
+  // `live_tail` is the conversation-viewer live-tail opt-out (live-tail spec
+  // §4.2); ABSENCE is likewise treated as ON (default true).
+  dashboard_prefs?: { cache_failure_markers?: boolean; live_tail?: boolean };
 }
 
 // Cache Report envelope (spec 2026-05-21).

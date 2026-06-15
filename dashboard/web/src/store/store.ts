@@ -268,6 +268,10 @@ export interface DashboardPrefs {
   // is absent on the wire (older server / first tick) — the selector treats
   // absence as ON (opt-out, default true).
   cache_failure_markers?: boolean;
+  // Conversation-viewer live-tail opt-out (live-tail spec §4.2). Undefined when
+  // absent on the wire — the selector treats absence as ON (opt-out, default
+  // true).
+  live_tail?: boolean;
 }
 
 export interface UIState {
@@ -585,6 +589,16 @@ export function getState(): UIState { return state; }
 // THIS so none of them re-invents the defaulting.
 export function selectMarkersEnabled(s: UIState = state): boolean {
   return s.dashboardPrefs.cache_failure_markers !== false;
+}
+
+// live-tail spec §4.2 — the single defaulting path for the conversation-viewer
+// live-tail opt-out. Reads the snapshot-mirrored `dashboardPrefs` slice and
+// treats an UNDEFINED `live_tail` as ON (opt-out, default true): an older
+// server / a first tick before bootstrap reads as live-tail-on. useConversation
+// reads THIS to decide whether to open the dedicated per-conversation
+// EventSource, so the defaulting lives in one place.
+export function selectLiveTailEnabled(s: UIState = state): boolean {
+  return s.dashboardPrefs.live_tail !== false;
 }
 
 export function subscribeStore(fn: () => void): () => void {
