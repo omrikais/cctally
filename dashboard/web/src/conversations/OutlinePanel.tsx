@@ -429,7 +429,7 @@ export function OutlinePanel({
                         className="conv-outline-entry-cache"
                         title={
                           e.cacheInfo
-                            ? `Cache rebuilt — ${fmt.tokens(e.cacheInfo.tokens_recreated)} re-created (~${fmt.usd2(e.cacheInfo.est_wasted_usd)} extra)`
+                            ? `Cache rebuilt — ${fmt.compact(e.cacheInfo.tokens_recreated, { upper: true })} re-created (~${fmt.usd2(e.cacheInfo.est_wasted_usd)} extra)`
                             : 'Cache rebuilt'
                         }
                       >
