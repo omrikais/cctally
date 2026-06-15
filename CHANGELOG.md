@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.0] - 2026-06-15
+
 ### Added
 - Conversation viewer: the dashboard now marks any assistant turn that suffered a **prompt-cache failure** — where Claude re-created the bulk of its cached prompt prefix instead of reading it (most often on the first turn after you send a new message — usually well inside the cache TTL, not just on long idle gaps), re-billing those tokens at the higher cache-write rate. The failing turn gets an amber `⚡ CACHE REBUILT · <tokens> · +$<wasted>` chip in its header, and the conversation outline gains a matching amber landmark, a `⚡` quick-jump button (`c` / `C` keys), and a "Cache" count in the at-a-glance stats card. Detection is conservative (per model + thread: `cache_read` collapses below half its running high-water mark **and** ≥75% of the turn's context is freshly re-created, with the unavoidable first cache prime, model switches, and context compaction all excluded), so a typical session shows about one marker. The markers are on by default and can be turned off via the new `dashboard.cache_failure_markers` config key (or the dashboard's Settings → "Conversation viewer" toggle). The wasted-cost figure is a display-only estimate recomputed per read — no new database tables and no migration.
 
