@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Internal (test infra, no user-facing change): the per-migration golden byte-idempotency guard (#197) now passes on the public Linux CI matrix.** That guard compared each rebuilt golden to the committed `.sqlite` byte-for-byte, normalizing only the 4-byte writer-version header — but SQLite's whole on-disk page layout (page allocation / freelist / B-tree balancing) is not portable across library versions, and FTS5 stores its inverted index as version-dependent binary segments, so the goldens (generated on the maintainer's macOS SQLite 3.53.2) byte-mismatched the public Linux CI's SQLite 3.45.1 even though their logical content is identical. v1.44.2 was the guard's first exposure to a non-macOS SQLite (the matrix only runs on tag push / weekly cron / dispatch), so it went red. The guard is now two-tier: STRICT byte-idempotency on the goldens' origin SQLite version (the maintainer's machine, the full #197 guarantee that a regen won't dirty the committed file), falling back to a version-portable SEMANTIC fingerprint — `user_version` / `application_id` plus the canonical SQL dump of every real table, taken from an in-memory copy with the FTS5 virtual tables dropped — on any other SQLite version. Still catches real builder/data drift (verified non-vacuous); nothing to do on upgrade (#199).
+
 ## [1.44.2] - 2026-06-14
 
 ### Fixed
