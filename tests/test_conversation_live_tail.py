@@ -64,3 +64,128 @@ def test_session_source_paths_returns_distinct_files():
 def test_session_source_paths_unknown_session_is_empty():
     c = _conn()
     assert cq.session_source_paths(c, "nope") == []
+
+
+from conftest import load_script, redirect_paths
+
+
+def _asst_line(uuid, msg_id, req_id, text, *, sid="s1",
+               ts="2026-06-01T00:00:00Z", model="claude-opus-4-8", out_tokens=5):
+    return json.dumps({
+        "type": "assistant", "uuid": uuid, "sessionId": sid,
+        "requestId": req_id, "timestamp": ts,
+        "message": {"role": "assistant", "id": msg_id, "model": model,
+                    "content": [{"type": "text", "text": text}],
+                    "usage": {"input_tokens": 10, "output_tokens": out_tokens,
+                              "cache_creation_input_tokens": 0,
+                              "cache_read_input_tokens": 0}},
+    }) + "\n"
+
+
+@pytest.fixture
+def isolated(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    projects.mkdir(parents=True, exist_ok=True)
+    conn = ns["open_cache_db"]()
+    yield ns, conn, projects
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _count(conn, path):
+    return conn.execute(
+        "SELECT COUNT(*) FROM conversation_messages WHERE source_path=?",
+        (str(path),)).fetchone()[0]
+
+
+def test_only_paths_ingests_only_the_named_file(isolated):
+    ns, conn, projects = isolated
+    sync_cache = ns["sync_cache"]
+    a = projects / "a.jsonl"
+    b = projects / "b.jsonl"
+    a.write_text(_asst_line("a1", "m1", "r1", "answer A"))
+    b.write_text(_asst_line("b1", "m2", "r2", "answer B", sid="s2"))
+    stats = sync_cache(conn, only_paths={str(a)})
+    assert stats.targeted_clean is True
+    assert _count(conn, a) == 1     # A ingested
+    assert _count(conn, b) == 0     # B untouched (no global walk)
+
+
+def test_only_paths_withholds_walk_complete_marker(isolated):
+    ns, conn, projects = isolated
+    sync_cache = ns["sync_cache"]
+    a = projects / "a.jsonl"
+    a.write_text(_asst_line("a1", "m1", "r1", "hi"))
+    sync_cache(conn, only_paths={str(a)})
+    marker = conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+    ).fetchone()
+    assert marker is None           # partial walk cannot vouch for the tree
+
+
+def test_only_paths_does_not_orphan_other_tracked_files(isolated):
+    ns, conn, projects = isolated
+    sync_cache = ns["sync_cache"]
+    a = projects / "a.jsonl"
+    b = projects / "b.jsonl"
+    a.write_text(_asst_line("a1", "m1", "r1", "A"))
+    b.write_text(_asst_line("b1", "m2", "r2", "B", sid="s2"))
+    sync_cache(conn, rebuild=True)             # full: both tracked
+    assert _count(conn, b) == 1
+    b.unlink()                                  # B gone from disk
+    sync_cache(conn, only_paths={str(a)})       # targeted on A only
+    assert _count(conn, b) == 1                 # B NOT pruned (no orphan scan)
+
+
+def test_only_paths_declines_on_shrink(isolated):
+    ns, conn, projects = isolated
+    sync_cache = ns["sync_cache"]
+    a = projects / "a.jsonl"
+    a.write_text(_asst_line("a1", "m1", "r1", "A") + _asst_line("a2", "m2", "r2", "AA"))
+    sync_cache(conn, rebuild=True)
+    a.write_text(_asst_line("a1", "m1", "r1", "A"))   # shrank
+    stats = sync_cache(conn, only_paths={str(a)})
+    assert stats.targeted_clean is False
+    assert stats.deferred_reason == "truncation"
+
+
+def test_only_paths_declines_on_pending_global_flag(isolated):
+    ns, conn, projects = isolated
+    sync_cache = ns["sync_cache"]
+    a = projects / "a.jsonl"
+    a.write_text(_asst_line("a1", "m1", "r1", "A"))
+    conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+                 "VALUES('conversation_reingest_pending','1')")
+    conn.commit()
+    stats = sync_cache(conn, only_paths={str(a)})
+    assert stats.targeted_clean is False
+    assert stats.deferred_reason == "pending_global_flags"
+    # flag NOT consumed (left for the backstop full sync)
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='conversation_reingest_pending'"
+    ).fetchone() is not None
+
+
+def test_only_paths_parity_with_full_sync_for_that_file(isolated, tmp_path, monkeypatch):
+    ns, conn, projects = isolated
+    sync_cache = ns["sync_cache"]
+    a = projects / "a.jsonl"
+    a.write_text(_asst_line("a1", "m1", "r1", "A") + _asst_line("a2", "m2", "r2", "AA"))
+    sync_cache(conn, only_paths={str(a)})
+    targeted = conn.execute(
+        "SELECT uuid, entry_type, text, msg_id, model FROM conversation_messages "
+        "WHERE source_path=? ORDER BY byte_offset", (str(a),)).fetchall()
+    # Fresh cache, full rebuild, same file → identical rows for A.
+    conn2 = ns["open_cache_db"]()
+    try:
+        sync_cache(conn2, rebuild=True)
+        full = conn2.execute(
+            "SELECT uuid, entry_type, text, msg_id, model FROM conversation_messages "
+            "WHERE source_path=? ORDER BY byte_offset", (str(a),)).fetchall()
+    finally:
+        conn2.close()
+    assert targeted == full

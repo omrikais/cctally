@@ -465,6 +465,20 @@ class IngestStats:
     # new inserts.
     rows_changed: int = 0
     lock_contended: bool = False
+    # Targeted (only_paths) live-tail fast-path fields. Default-clean so the
+    # only_paths=None callers (every existing caller) read targeted_clean=True
+    # and are otherwise unaffected.
+    files_failed: int = 0
+    deferred_reason: "str | None" = None
+
+    @property
+    def targeted_clean(self) -> bool:
+        """True ⇔ a targeted ingest fully applied: not contended, not deferred,
+        and no per-file failure. The watch loop emits + advances `seen` only
+        when this is True."""
+        return (not self.lock_contended
+                and self.deferred_reason is None
+                and self.files_failed == 0)
 
 
 def _progress_stderr(stats: IngestStats, *, force: bool = False) -> None:
@@ -563,11 +577,42 @@ def _ensure_session_files_row(conn: sqlite3.Connection, source_path: str) -> Non
     conn.commit()
 
 
+# Flags whose presence means the cache is mid-migration / mid-reingest. A
+# targeted (only_paths) ingest DECLINES when any is set and defers to the next
+# full background sync — inserting through a half-migrated FTS shape or skipping
+# a pending backfill would diverge from what a full sync produces (spec §
+# "Targeted ingest contract"). Enumerated against the consumption blocks in
+# sync_cache (bin/_cctally_cache.py:745-866).
+_TARGETED_DECLINE_FLAGS = (
+    "conversation_backfill_pending",
+    "ai_titles_backfill_pending",
+    "conversation_reingest_pending",
+    "conversation_source_tool_use_reingest_pending",
+    "conversation_reingest_enrichment_pending",
+    "conversation_media_reingest_pending",
+    "conversation_search_split_pending",
+    "conversation_promote_command_args_pending",
+    "conversation_sessions_backfill_pending",
+)
+
+
+def _targeted_has_pending_global_work(conn) -> bool:
+    placeholders = ",".join("?" for _ in _TARGETED_DECLINE_FLAGS)
+    try:
+        row = conn.execute(
+            f"SELECT 1 FROM cache_meta WHERE key IN ({placeholders}) LIMIT 1",
+            _TARGETED_DECLINE_FLAGS).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return row is not None
+
+
 def sync_cache(
     conn: sqlite3.Connection,
     *,
     progress: Callable[[IngestStats], None] | None = None,
     rebuild: bool = False,
+    only_paths: "set[str] | None" = None,
 ) -> IngestStats:
     """Read-through delta ingest. Acquires an exclusive fcntl.flock; if
     another process holds it, returns immediately with lock_contended=True
@@ -591,6 +636,14 @@ def sync_cache(
             eprint("[cache] sync already in progress; using existing cache")
             stats.lock_contended = True
             return stats
+
+        targeted = only_paths is not None
+        if targeted:
+            if rebuild:
+                raise ValueError("sync_cache: only_paths is incompatible with rebuild")
+            if _targeted_has_pending_global_work(conn):
+                stats.deferred_reason = "pending_global_flags"
+                return stats
 
         # Walk-complete sentinel gating (cctally-dev#93, D5b/D6b). Capture
         # whether cache 001 was already applied at the moment this sync
@@ -742,7 +795,7 @@ def sync_cache(
         # path, which already cleared the flag and repopulates via the normal
         # walk). A path-less/:memory: conn has no cache_meta only if the schema
         # was never applied; the try/except tolerates that.
-        if not rebuild:
+        if not rebuild and not targeted:
             try:
                 _pending = conn.execute(
                     "SELECT 1 FROM cache_meta "
@@ -865,7 +918,10 @@ def sync_cache(
             # HUMAN(text=args); the split-FTS UPDATE triggers re-index the args.
             _consume_promote_command_args(conn)
 
-        paths: list[pathlib.Path] = list(_iter_claude_jsonl_files())
+        if targeted:
+            paths = [pathlib.Path(p) for p in only_paths if pathlib.Path(p).is_file()]
+        else:
+            paths = list(_iter_claude_jsonl_files())
         stats.files_total = len(paths)
 
         # This SELECT does NOT open an implicit transaction (Python's
@@ -910,22 +966,29 @@ def sync_cache(
         # commit lands BEFORE the per-file read+parse loop, so no write
         # lock is held into that loop (same discipline as the truncation
         # escalation just below).
-        on_disk_paths = {str(jp) for jp in paths}
-        orphaned_tracked_paths = [
-            p for p, (size_bytes, _, _) in existing.items()
-            if size_bytes and p not in on_disk_paths
-        ]
-        if orphaned_tracked_paths:
-            eprint(
-                f"[cache] {len(orphaned_tracked_paths)} tracked file(s) no "
-                f"longer on disk; invalidating walk-complete marker "
-                f"(run `cache-sync --rebuild` to prune orphaned entries)"
-            )
-            conn.execute(
-                "DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'"
-            )
-            conn.commit()
-            walk_clean = False  # orphaned rows -> cache doesn't mirror disk (D5a)
+        # Targeted (only_paths) sync narrows `paths` to the requested file(s),
+        # so the orphan scan below — which infers "deleted from disk" from a
+        # tracked path's absence in `paths` — would mistake EVERY other tracked
+        # file for an orphan and nuke the walk-complete marker. Skip it entirely
+        # for targeted: the live-tail fast path never prunes orphans (the full
+        # background sync owns that).
+        if not targeted:
+            on_disk_paths = {str(jp) for jp in paths}
+            orphaned_tracked_paths = [
+                p for p, (size_bytes, _, _) in existing.items()
+                if size_bytes and p not in on_disk_paths
+            ]
+            if orphaned_tracked_paths:
+                eprint(
+                    f"[cache] {len(orphaned_tracked_paths)} tracked file(s) no "
+                    f"longer on disk; invalidating walk-complete marker "
+                    f"(run `cache-sync --rebuild` to prune orphaned entries)"
+                )
+                conn.execute(
+                    "DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+                )
+                conn.commit()
+                walk_clean = False  # orphaned rows -> cache doesn't mirror disk (D5a)
 
         # Pre-scan for any truncation among tracked files. Under the
         # ccusage-parity ON CONFLICT DO UPDATE, source_path is PINNED to
@@ -958,6 +1021,14 @@ def sync_cache(
                 truncated_paths.add(str(jp))
 
         if truncated_paths:
+            if targeted:
+                # The targeted fast path must NEVER trigger the global
+                # full-cache wipe-and-re-ingest escalation below — that would
+                # turn a 1s live-tail tick into a multi-minute rebuild and drop
+                # every other session's rows. Decline and defer to the next full
+                # background sync, which owns the truncation escalation.
+                stats.deferred_reason = "truncation"
+                return stats
             eprint(
                 f"[cache-sync] truncation detected on {len(truncated_paths)} "
                 f"file(s) — re-ingesting all files (safe under ccusage-parity "
@@ -1035,6 +1106,7 @@ def sync_cache(
             except OSError as exc:
                 eprint(f"[cache] stat failed for {jp}: {exc}")
                 walk_clean = False  # skipped a file without ingesting (D5a)
+                stats.files_failed += 1
                 continue
 
             size = st.st_size
@@ -1118,6 +1190,7 @@ def sync_cache(
             except OSError as exc:
                 eprint(f"[cache] could not read {jp}: {exc}")
                 walk_clean = False  # skipped a file without ingesting (D5a)
+                stats.files_failed += 1
                 continue
 
             # Python's sqlite3 module starts an implicit transaction on the
@@ -1240,6 +1313,7 @@ def sync_cache(
                 eprint(f"[cache] db error on {jp}: {exc}")
                 conn.rollback()
                 walk_clean = False  # rolled back this file without ingesting (D5a)
+                stats.files_failed += 1
                 continue
 
             if progress is not None:
@@ -1280,7 +1354,7 @@ def sync_cache(
         # completeness. A lock-contended sync returned early above and never
         # reaches here. Presence (not the timestamp) is the gate signal; the
         # value stores the completion instant for doctor/debugging.
-        if walk_clean and applied_at_start:
+        if walk_clean and applied_at_start and not targeted:
             conn.execute(
                 "INSERT INTO cache_meta(key, value) "
                 "VALUES('claude_ingest_walk_complete', ?) "
