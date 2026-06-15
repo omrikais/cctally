@@ -1332,6 +1332,9 @@
     "total_cost_usd": 122.91,
     "total_tokens": 23206000
   },
+  "dashboard_prefs": {
+    "cache_failure_markers": true
+  },
   "display": {
     "offset_label": "UTC",
     "offset_seconds": 0,

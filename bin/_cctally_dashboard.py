@@ -4912,6 +4912,18 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         "notifier":           _alerts_cfg.get("notifier", "auto"),
         "command_configured": _alerts_cfg.get("command_template") is not None,
     }
+    # Dashboard render-prefs mirror (cache-failure-markers opt-out, spec §5).
+    # Reuses the single `_cfg_for_alerts = load_config()` read above (no extra
+    # FS hit on the hot path). Default true — absence is treated as ON (opt-out,
+    # not opt-in); a hand-edited non-bool surfaces the default. The on/off toggle
+    # is honored entirely at client render time; the kernel + API always emit the
+    # marker data.
+    _dash_cfg = _cfg_for_alerts.get("dashboard") if isinstance(
+        _cfg_for_alerts.get("dashboard"), dict) else {}
+    _cfm = _dash_cfg.get("cache_failure_markers", True)
+    dashboard_prefs = {
+        "cache_failure_markers": _cfm if isinstance(_cfm, bool) else True,
+    }
 
     # Mirror update-state.json + update-suppress.json into the envelope
     # so the dashboard's amber "Update available" badge repaints from
@@ -5148,6 +5160,12 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # threshold-actions T5: see prelude above for rationale.
         "alerts":           alerts_array,
         "alerts_settings":  alerts_settings,
+
+        # Dashboard render-prefs mirror (cache-failure-markers opt-out, spec
+        # §5). Additive optional, like alerts_settings — envelope_version
+        # stays at 2. The client derives `markersEnabled` from this, defaulting
+        # to true when the field is undefined (older server / first tick).
+        "dashboard_prefs":  dashboard_prefs,
 
         # update-subcommand SSE mirror (see comment above the
         # `_load_update_state()` block). Shape matches GET
@@ -5685,7 +5703,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
         # Reject unknown top-level keys (forward-compat hygiene).
         allowed_top_keys = {
-            "display", "alerts", "update", "cache_report", "budget",
+            "display", "alerts", "update", "cache_report", "budget", "dashboard",
         }
         for k in payload.keys():
             if k not in allowed_top_keys:
@@ -5701,12 +5719,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             and "update" not in payload
             and "cache_report" not in payload
             and "budget" not in payload
+            and "dashboard" not in payload
         ):
             self._respond_json(
                 400,
                 {"error": (
                     "body must contain at least one of: "
-                    "display, alerts, update, cache_report, budget"
+                    "display, alerts, update, cache_report, budget, dashboard"
                 )},
             )
             return
@@ -5834,6 +5853,52 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     400, {"error": "budget must be an object"}
                 )
                 return
+
+        # Pre-validate the dashboard block (spec §5). Only
+        # ``cache_failure_markers`` is dashboard-writable — a JSON boolean
+        # (string/int rejected, mirroring the strict bool checks for
+        # ``alerts.enabled``). ``dashboard.bind`` / ``dashboard.expose_transcripts``
+        # are bind-time / privacy-gate settings, NOT live-mutable, so they are
+        # rejected explicitly here (rather than silently dropped). Outside the
+        # config_writer_lock so a 400 short-circuit doesn't take the lock.
+        dashboard_validated: "dict | None" = None
+        if "dashboard" in payload:
+            dashboard_block = payload["dashboard"]
+            if not isinstance(dashboard_block, dict):
+                self._respond_json(
+                    400,
+                    {"error": "dashboard must be an object", "field": "dashboard"},
+                )
+                return
+            for leaf in dashboard_block.keys():
+                if leaf in ("bind", "expose_transcripts"):
+                    self._respond_json(
+                        400,
+                        {"error": (f"dashboard.{leaf} is not settable via the "
+                                   "dashboard (bind-time / privacy-gate setting)"),
+                         "field": f"dashboard.{leaf}"},
+                    )
+                    return
+                if leaf != "cache_failure_markers":
+                    self._respond_json(
+                        400,
+                        {"error": f"unknown dashboard settings key: {leaf}",
+                         "field": f"dashboard.{leaf}"},
+                    )
+                    return
+            dashboard_validated = {}
+            if "cache_failure_markers" in dashboard_block:
+                if not isinstance(dashboard_block["cache_failure_markers"], bool):
+                    self._respond_json(
+                        400,
+                        {"error": ("dashboard.cache_failure_markers must be a "
+                                   "JSON boolean"),
+                         "field": "dashboard.cache_failure_markers"},
+                    )
+                    return
+                dashboard_validated["cache_failure_markers"] = (
+                    dashboard_block["cache_failure_markers"]
+                )
 
         # Pre-validate update shape. Only `update.check.{enabled,ttl_hours}`
         # is settable today; any other key under `update` or `update.check`
@@ -6061,6 +6126,23 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 merged_cr.update(cache_report_validated)
                 merged["cache_report"] = merged_cr
 
+            if dashboard_validated is not None:
+                # Same hand-edited-junk guard as the other blocks: a non-dict
+                # stored ``dashboard`` block should surface as a recoverable
+                # 400, not a 500. Partial-merge so the (bind-time, CLI-only)
+                # ``bind`` / ``expose_transcripts`` siblings are PRESERVED —
+                # cache_failure_markers writes must never clobber them.
+                existing_dash = merged.get("dashboard")
+                if existing_dash is not None and not isinstance(existing_dash, dict):
+                    self._respond_json(
+                        400, {"error": "dashboard must be an object",
+                              "field": "dashboard"}
+                    )
+                    return
+                merged_dash = dict(existing_dash or {})
+                merged_dash.update(dashboard_validated)
+                merged["dashboard"] = merged_dash
+
             save_config(merged)
 
         # Build the response: subset of touched blocks.
@@ -6151,6 +6233,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             stored_threshold = persisted_cr.get("anomaly_threshold_pp", 15)
             out["cache_report"] = {
                 "anomaly_threshold_pp": stored_threshold,
+            }
+        if dashboard_validated is not None:
+            # Echo the persisted cache_failure_markers (the only dashboard-
+            # writable leaf) so the SettingsOverlay can repaint without a
+            # follow-up GET. Default true (opt-out) when nothing is persisted.
+            persisted_dash = merged.get("dashboard") or {}
+            out["dashboard"] = {
+                "cache_failure_markers": bool(
+                    persisted_dash.get("cache_failure_markers", True)
+                ),
             }
         out["saved_at"] = (
             dt.datetime.now(dt.timezone.utc)

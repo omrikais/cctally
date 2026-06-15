@@ -561,6 +561,9 @@
     "total_cost_usd": 0.63,
     "total_tokens": 138000
   },
+  "dashboard_prefs": {
+    "cache_failure_markers": true
+  },
   "display": {
     "offset_label": "UTC",
     "offset_seconds": 0,
