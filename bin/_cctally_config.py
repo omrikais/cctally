@@ -302,6 +302,7 @@ ALLOWED_CONFIG_KEYS = (
     "alerts.command_template",
     "dashboard.bind",
     "dashboard.expose_transcripts",
+    "dashboard.cache_failure_markers",
     "update.check.enabled",
     "update.check.ttl_hours",
     "statusline.visual_burn_rate",
@@ -478,6 +479,28 @@ def _config_known_value(config: dict, key: str) -> "object":
             except ValueError:
                 return False
         return False
+    if key == "dashboard.cache_failure_markers":
+        # Boolean opt-OUT (spec §5). Default TRUE — absence is treated as ON
+        # (unlike dashboard.expose_transcripts, an opt-IN default of False).
+        # A hand-edited junk value surfaces the True default rather than
+        # crashing (mirrors dashboard.bind / expose_transcripts).
+        block = config.get("dashboard") if isinstance(config, dict) else None
+        if not isinstance(block, dict):
+            block = {}
+        stored = block.get("cache_failure_markers")
+        if stored is None:
+            return True
+        if isinstance(stored, bool):
+            return stored
+        # Only str spellings are normalizable; any other JSON scalar surfaces
+        # the default (the shared normalizer's .strip() would AttributeError on
+        # a bare int — uncaught by `except ValueError`).
+        if isinstance(stored, str):
+            try:
+                return c._normalize_alerts_enabled_value(stored)
+            except ValueError:
+                return True
+        return True
     if key in ("update.check.enabled", "update.check.ttl_hours"):
         # Defaults mirror `_is_update_check_due` (True / 24 hours).
         # Hand-edited junk surfaces as the default — matches dashboard.bind.
@@ -864,6 +887,49 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                 f"{'true' if canonical else 'false'}"
             )
         return 0
+    if key == "dashboard.cache_failure_markers":
+        # Same read-modify-write posture as dashboard.expose_transcripts:
+        # validate first, then write under config_writer_lock with
+        # _load_config_unlocked (load_config inside the writer-lock
+        # self-deadlocks — fcntl.flock is per-fd). Preserves sibling
+        # dashboard.bind / dashboard.expose_transcripts. Reuse the shared
+        # bool-normalizer; catch + re-message with the actual key name (it
+        # hardcodes "alerts.enabled" in its ValueError text).
+        try:
+            canonical = c._normalize_alerts_enabled_value(raw)
+        except ValueError:
+            print(
+                f"cctally: invalid boolean value for "
+                f"dashboard.cache_failure_markers: "
+                f"{raw!r} (expected true|false|yes|no|1|0|on|off)",
+                file=sys.stderr,
+            )
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing = config.get("dashboard")
+            if existing is not None and not isinstance(existing, dict):
+                print(
+                    "cctally: dashboard config error: dashboard must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            block = dict(existing or {})
+            block["cache_failure_markers"] = canonical
+            config["dashboard"] = block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(
+                json.dumps(
+                    {"dashboard": {"cache_failure_markers": canonical}}, indent=2
+                )
+            )
+        else:
+            print(
+                f"dashboard.cache_failure_markers="
+                f"{'true' if canonical else 'false'}"
+            )
+        return 0
     if key in (
         "statusline.visual_burn_rate",
         "statusline.cost_source",
@@ -1231,6 +1297,22 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
             block = config.get("dashboard")
             if isinstance(block, dict) and "expose_transcripts" in block:
                 del block["expose_transcripts"]
+                if not block:
+                    config.pop("dashboard", None)
+                save_config(config)
+            # idempotent: silent on missing key
+        return 0
+    if key == "dashboard.cache_failure_markers":
+        # Mirror the dashboard.expose_transcripts unset branch: drop only the
+        # cache_failure_markers leaf; if the dashboard block ends up empty, drop
+        # the parent too so config.json stays tidy. Sibling dashboard.bind /
+        # expose_transcripts survive. Unsetting restores the True (opt-out)
+        # default at read time.
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            block = config.get("dashboard")
+            if isinstance(block, dict) and "cache_failure_markers" in block:
+                del block["cache_failure_markers"]
                 if not block:
                     config.pop("dashboard", None)
                 save_config(config)
