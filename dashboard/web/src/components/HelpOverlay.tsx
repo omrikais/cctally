@@ -58,6 +58,7 @@ function ConversationsKeyTable() {
         <tr><td><kbd>u</kbd> / <kbd>U</kbd></td><td>next / prev prompt</td></tr>
         <tr><td><kbd>b</kbd> / <kbd>B</kbd></td><td>next / prev subagent</td></tr>
         <tr><td><kbd>p</kbd> / <kbd>P</kbd></td><td>next / prev plan / question</td></tr>
+        <tr><td><kbd>c</kbd> / <kbd>C</kbd></td><td>next / prev cache rebuild</td></tr>
         <tr><td><kbd>o</kbd></td><td>toggle outline</td></tr>
         <tr><td><kbd>v</kbd></td><td>cycle focus mode</td></tr>
         <tr><td><kbd>/</kbd></td><td>search conversations</td></tr>

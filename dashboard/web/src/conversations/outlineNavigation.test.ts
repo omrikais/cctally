@@ -74,6 +74,23 @@ describe('buildOutlineTargets', () => {
     expect(t.indexByUuid.get('y')).toBe(1);
     expect(t.indexByUuid.get('z')).toBe(2);
   });
+
+  // cache-failure-markers spec §4 — flagged turns collect into a `cache` list.
+  const cf = { tokens_recreated: 130000, prev_cached: 130000, est_wasted_usd: 0.75 };
+  it('collects flagged (cache_failure) turn indices into `cache`', () => {
+    const t = buildOutlineTargets([
+      turn({ uuid: 'a' }),
+      turn({ uuid: 'b', cache_failure: cf }),
+      turn({ uuid: 'c' }),
+      turn({ uuid: 'd', cache_failure: cf }),
+    ]);
+    expect(t.cache).toEqual([1, 3]);
+  });
+
+  it('cache list is empty when no turn is flagged', () => {
+    const t = buildOutlineTargets([turn({ uuid: 'a' }), turn({ uuid: 'b' })]);
+    expect(t.cache).toEqual([]);
+  });
 });
 
 describe('outlineTurnVisible', () => {

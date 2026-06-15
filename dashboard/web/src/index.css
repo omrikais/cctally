@@ -4769,6 +4769,9 @@ mark.current {
 .conv-outline-stat-kv--models .conv-outline-stat-kv-glyph { color: var(--accent-magenta); }
 .conv-outline-stat-kv--errors .conv-outline-stat-kv-glyph,
 .conv-outline-stat-kv--errors .conv-outline-stat-kv-value { color: var(--accent-red); }
+/* cache-failure-markers spec §4 — the "Cache" KV row glyph + value in amber. */
+.conv-outline-stat-kv--cache .conv-outline-stat-kv-glyph,
+.conv-outline-stat-kv--cache .conv-outline-stat-kv-value { color: var(--accent-amber); }
 /* Navigable landmark list. */
 .conv-outline-list {
   flex: 1 1 auto;
@@ -4837,6 +4840,13 @@ mark.current {
 .conv-outline-entry--heading .conv-outline-entry-glyph { color: var(--text-dim); }
 .conv-outline-entry--error,
 .conv-outline-entry--error .conv-outline-entry-glyph { color: var(--accent-red); }
+/* cache-failure-markers spec §4 — standalone cache landmark + the trailing ⚡
+   suffix on a coinciding row, both amber. The standalone row's leading glyph is
+   the inline ⚡ span (conv-outline-entry-cache-glyph). */
+.conv-outline-entry--cache .conv-outline-entry-glyph,
+.conv-outline-entry-cache-glyph,
+.conv-outline-entry-cache { color: var(--accent-amber); }
+.conv-outline-entry-cache { flex: 0 0 auto; font-size: 10.5px; }
 /* Landmark rows are indented + demoted under their prompt; no italic (the old
    thinking-child italic is retired — thinking is now a badge). */
 .conv-outline-entry--nested { padding-left: 22px; }
@@ -4970,6 +4980,8 @@ mark.current {
 .conv-jump-cluster-btn[data-jump-kind="subagent"] .conv-jump-cluster-glyph { color: var(--accent-magenta); }
 .conv-jump-cluster-btn[data-jump-kind="plan"] .conv-jump-cluster-glyph { color: var(--accent-green); }
 .conv-jump-cluster-btn[data-jump-kind="prompt"] .conv-jump-cluster-glyph { color: var(--accent-blue); }
+/* cache-failure-markers spec §4 — the ⚡ cache jump chip glyph in amber. */
+.conv-jump-cluster-btn[data-jump-kind="cache"] .conv-jump-cluster-glyph { color: var(--accent-amber); }
 /* Transient no-op pulse (300ms; suppressed under reduced motion by the JS gate
    AND this media query so a class accidentally left on never animates). */
 @keyframes conv-pulse-disabled {

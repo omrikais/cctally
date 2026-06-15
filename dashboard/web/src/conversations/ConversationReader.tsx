@@ -162,6 +162,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // without re-registering the keymap array.
   const convFindOpenRef = useRef(convFindOpen);
   convFindOpenRef.current = convFindOpen;
+  // cache-failure-markers spec §4 — live mirror so the stable `c`/`C` keymap
+  // closures no-op when the opt-out is off, without re-registering the array.
+  const markersEnabledRef = useRef(markersEnabled);
+  markersEnabledRef.current = markersEnabled;
 
   // #175 F4 — live-tail scroll behavior. `atBottomRef` tracks whether the user
   // is parked at the bottom (updated on every scroll). `prevLenRef`/`prevHasMoreRef`
@@ -962,6 +966,22 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         mk('B', () => jumpNextRef.current('subagent', -1)),
         mk('p', () => jumpNextRef.current('plan', 1)),
         mk('P', () => jumpNextRef.current('plan', -1)),
+        // cache-failure-markers spec §4 — `c`/`C` jump to next/prev cache
+        // rebuild. The `c` letter is collision-free here: main.tsx's `c`
+        // (Sessions collapse) is scope:'sessions' → view:'dashboard', and the
+        // keymap dispatcher gates by view, so the two never coexist. Guarded by
+        // the opt-out (no-op when markers are off, so the key does nothing once
+        // every cache surface is hidden) on TOP of the shared `guard`.
+        {
+          key: 'c', scope: 'global' as const, view: 'conversations' as const,
+          when: () => guard() && markersEnabledRef.current,
+          action: () => jumpNextRef.current('cache', 1),
+        },
+        {
+          key: 'C', scope: 'global' as const, view: 'conversations' as const,
+          when: () => guard() && markersEnabledRef.current,
+          action: () => jumpNextRef.current('cache', -1),
+        },
         mk('v', () => cycleFocusMode()),
         // #177 S6 — n/N step the find-bar matches, but ONLY while the bar is
         // open (the input-blurred case; the focused input owns Enter/Shift+Enter

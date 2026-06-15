@@ -422,6 +422,93 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
     expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h3' });
   });
 
+  // ---- cache-failure-markers spec §4 — stats row + jump chip + opt-out ----
+  const cf = { tokens_recreated: 130000, prev_cached: 130000, est_wasted_usd: 0.75 };
+
+  it('renders a "Cache" stats KV row only when cache_failures.count > 0', () => {
+    const { container } = render(
+      <OutlinePanel
+        sessionId="s1"
+        outline={outline({ stats: stats({ cache_failures: { count: 2, tokens_recreated: 205000, est_wasted_usd: 1.18 } }) })}
+      />,
+    );
+    const cacheRow = Array.from(container.querySelectorAll('.conv-outline-stat-kv'))
+      .find((k) => /cache/i.test(k.textContent ?? ''));
+    expect(cacheRow).toBeTruthy();
+    expect(cacheRow!.textContent).toContain('2'); // 2 rebuilds
+    expect(cacheRow!.classList.contains('conv-outline-stat-kv--cache')).toBe(true);
+  });
+
+  it('hides the "Cache" stats row when cache_failures is absent', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={outline()} />);
+    const cacheRow = Array.from(container.querySelectorAll('.conv-outline-stat-kv'))
+      .find((k) => /\bcache\b/i.test(k.textContent ?? ''));
+    expect(cacheRow).toBeFalsy();
+  });
+
+  it('renders the ⚡ cache jump chip when flagged turns exist', () => {
+    const o = outline({
+      stats: stats({ cache_failures: { count: 1, tokens_recreated: 130000, est_wasted_usd: 0.75 } }),
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'rebuilt', cache_failure: cf }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const cacheChip = container.querySelector('[data-jump-kind="cache"]');
+    expect(cacheChip).toBeTruthy();
+    expect(cacheChip!.textContent?.toLowerCase()).toContain('cache');
+  });
+
+  it('clicking the cache jump chip jumps to the flagged turn', () => {
+    const o = outline({
+      stats: stats({ cache_failures: { count: 1, tokens_recreated: 130000, est_wasted_usd: 0.75 } }),
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'rebuilt', cache_failure: cf }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const cacheChip = container.querySelector<HTMLButtonElement>('[data-jump-kind="cache"]')!;
+    fireEvent.click(cacheChip);
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'a1' });
+  });
+
+  it('renders a standalone cache landmark entry with the amber suffix glyph', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'rebuilt', cache_failure: cf }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const cacheEntry = container.querySelector('.conv-outline-entry--cache');
+    expect(cacheEntry).toBeTruthy();
+    expect(cacheEntry!.textContent?.toLowerCase()).toContain('cache rebuilt');
+  });
+
+  it('toggle OFF (dashboard_prefs) hides the cache stats row, jump chip, and landmark', () => {
+    dispatch({ type: 'INGEST_DASHBOARD_PREFS', prefs: { cache_failure_markers: false } });
+    const o = outline({
+      stats: stats({ cache_failures: { count: 1, tokens_recreated: 130000, est_wasted_usd: 0.75 } }),
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'rebuilt', cache_failure: cf }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    // No cache stats row.
+    expect(
+      Array.from(container.querySelectorAll('.conv-outline-stat-kv')).some((k) =>
+        /\bcache\b/i.test(k.textContent ?? ''),
+      ),
+    ).toBe(false);
+    // No cache jump chip.
+    expect(container.querySelector('[data-jump-kind="cache"]')).toBeNull();
+    // No standalone cache landmark.
+    expect(container.querySelector('.conv-outline-entry--cache')).toBeNull();
+  });
+
   it('drops the per-entry "· N tools" suffix (noise lives in the stats histogram)', () => {
     const o = outline({
       turns: [

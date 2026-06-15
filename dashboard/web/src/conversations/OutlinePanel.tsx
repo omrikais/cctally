@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
-import { dispatch, getState, subscribeStore } from '../store/store';
+import { dispatch, getState, selectMarkersEnabled, subscribeStore } from '../store/store';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { deriveOutline, type OutlineEntry } from './deriveOutline';
 import {
@@ -42,6 +42,7 @@ function JumpCluster({
   pinned,
   reduced,
   focusMode,
+  markersEnabled,
 }: {
   sessionId: string;
   turns: OutlineTurn[];
@@ -54,6 +55,9 @@ function JumpCluster({
   pinned: string | null;
   reduced: boolean;
   focusMode: FocusMode;
+  // cache-failure-markers spec §4 — when off, the ⚡ cache chip is suppressed
+  // even if flagged turns exist (the opt-out hides ALL marker surfaces).
+  markersEnabled: boolean;
 }) {
   const { indexByUuid, ...targets } = lists;
 
@@ -85,8 +89,14 @@ function JumpCluster({
     { kind: 'prompt', glyph: '⊕', label: 'prompts', aria: 'prompt', key: 'u' },
     { kind: 'subagent', glyph: '▸', label: 'subagents', aria: 'subagent', key: 'b' },
     { kind: 'plan', glyph: '⊞', label: 'plans', aria: 'plan / question', key: 'p' },
+    // cache-failure-markers spec §4 — amber ⚡ cache-rebuilds jump chip, `c` key.
+    { kind: 'cache', glyph: '⚡', label: 'cache rebuilds', aria: 'cache rebuild', key: 'c' },
   ];
-  const shown = defs.filter((d) => targets[d.kind].length > 0);
+  // A def is shown when it has targets AND (for cache) markers are on — the
+  // opt-out suppresses the chip even when flagged turns exist.
+  const shown = defs.filter(
+    (d) => targets[d.kind].length > 0 && (d.kind !== 'cache' || markersEnabled),
+  );
   if (shown.length === 0) return null;
   return (
     <div className="conv-outline-jump">
@@ -134,6 +144,11 @@ function entryGlyph(e: OutlineEntry) {
     case 'plan': return <PlanIcon />;
     case 'question': return <QuestionIcon />;
     case 'heading': return <ToolGenericIcon />;
+    // cache-failure-markers spec §4 — standalone cache landmark leads with an
+    // amber ⚡ (the .conv-outline-entry--cache rule paints it amber). Other
+    // types that merely COINCIDE keep their own leading glyph (error/plan win);
+    // the trailing ⚡ suffix below carries the cache flag on those rows.
+    case 'cache': return <span className="conv-outline-entry-cache-glyph">⚡</span>;
     default: return <ToolGenericIcon />;
   }
 }
@@ -147,9 +162,13 @@ function entryGlyph(e: OutlineEntry) {
 function OutlineStatsCard({
   stats,
   errorTurns,
+  markersEnabled,
 }: {
   stats: OutlineStats;
   errorTurns: number;
+  // cache-failure-markers spec §4 — the opt-out: when off, the "Cache" KV row
+  // is suppressed even when stats.cache_failures.count > 0.
+  markersEnabled: boolean;
 }) {
   const yours = stats.turns.human;
   const totalTokens =
@@ -228,6 +247,20 @@ function OutlineStatsCard({
           <span className="conv-outline-stat-kv-value">{errorPhrase}</span>
         </div>
       )}
+      {/* cache-failure-markers spec §4 — "Cache" KV row, rendered ONLY when
+          count > 0 (unlike the always-on Errors row) AND markers are on. ~65%
+          of sessions have zero rebuilds, so a perpetual "0 rebuilds" would be
+          exactly the clutter to avoid. */}
+      {markersEnabled && stats.cache_failures && stats.cache_failures.count > 0 && (
+        <div className="conv-outline-stat-kv conv-outline-stat-kv--cache">
+          <span className="conv-outline-stat-kv-glyph" aria-hidden="true">⚡</span>
+          <span className="conv-outline-stat-kv-label">Cache</span>
+          <span className="conv-outline-stat-kv-value">
+            {stats.cache_failures.count} {stats.cache_failures.count === 1 ? 'rebuild' : 'rebuilds'}
+            {' · ~'}{fmt.usd2(stats.cache_failures.est_wasted_usd)}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -251,12 +284,17 @@ export function OutlinePanel({
   // today's scroll-sync behavior.
   const pinned = useSyncExternalStore(subscribeStore, () => getState().convPinnedUuid);
   const focusMode = useSyncExternalStore(subscribeStore, () => getState().convFocusMode);
+  // cache-failure-markers spec §4 — the opt-out, threaded into deriveOutline
+  // (skips cache curation entirely when off) and into the stats row + jump chip.
+  const markersEnabled = useSyncExternalStore(subscribeStore, () =>
+    selectMarkersEnabled(getState()),
+  );
   const reduced = useReducedMotion();
 
   const { entries, sectionByUuid } = useMemo(
-    () => (outline ? deriveOutline(outline.turns, outline.subagent_meta)
+    () => (outline ? deriveOutline(outline.turns, outline.subagent_meta, markersEnabled)
                    : { entries: [], sectionByUuid: new Map<string, string>() }),
-    [outline],
+    [outline, markersEnabled],
   );
 
   // #186 §4.3 — lift the shared jump-target builder so the stats card's "N error
@@ -326,7 +364,7 @@ export function OutlinePanel({
       ) : (
         <>
           <div className="conv-outline-stats">
-            <OutlineStatsCard stats={outline.stats} errorTurns={lists.error.length} />
+            <OutlineStatsCard stats={outline.stats} errorTurns={lists.error.length} markersEnabled={markersEnabled} />
             <JumpCluster
               sessionId={sessionId}
               turns={outline.turns}
@@ -335,6 +373,7 @@ export function OutlinePanel({
               pinned={pinned}
               reduced={reduced}
               focusMode={focusMode}
+              markersEnabled={markersEnabled}
             />
           </div>
           <ol className="conv-outline-list" ref={listRef}>
@@ -359,6 +398,9 @@ export function OutlinePanel({
                       `conv-outline-entry--${e.type}`,
                       e.depth ? 'conv-outline-entry--nested' : '',
                       e.error ? 'conv-outline-entry--error' : '',
+                      // cache-failure-markers spec §4 — flagged rows (standalone
+                      // OR coinciding) take the cache modifier for the amber cue.
+                      e.cache ? 'conv-outline-entry--cache-flagged' : '',
                     ]
                       .filter(Boolean)
                       .join(' ')}
@@ -376,6 +418,22 @@ export function OutlinePanel({
                         title={`${e.thinkingCount} thinking ${e.thinkingCount === 1 ? 'block' : 'blocks'}`}
                       >
                         🧠 ×{e.thinkingCount}
+                      </span>
+                    )}
+                    {/* cache-failure-markers spec §4 — trailing amber ⚡ suffix on
+                        a row that COINCIDES with another landmark (its leading
+                        glyph stays its own type's). The standalone 'cache' entry
+                        already leads with ⚡, so skip the redundant suffix there. */}
+                    {e.cache && e.type !== 'cache' && (
+                      <span
+                        className="conv-outline-entry-cache"
+                        title={
+                          e.cacheInfo
+                            ? `Cache rebuilt — ${fmt.tokens(e.cacheInfo.tokens_recreated)} re-created (~${fmt.usd2(e.cacheInfo.est_wasted_usd)} extra)`
+                            : 'Cache rebuilt'
+                        }
+                      >
+                        ⚡
                       </span>
                     )}
                   </button>

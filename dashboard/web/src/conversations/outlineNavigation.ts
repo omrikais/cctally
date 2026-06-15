@@ -40,7 +40,8 @@ export function outlineTurnVisible(turn: OutlineTurn, mode: FocusMode): boolean 
 
 // #184 — jump-target kinds the cluster + reader keys navigate. Sorted-ascending
 // index lists in outline-skeleton space, one per landmark family.
-export type JumpKind = 'error' | 'prompt' | 'subagent' | 'plan';
+// cache-failure-markers spec §4 — 'cache' added: the flagged-turn jump family.
+export type JumpKind = 'error' | 'prompt' | 'subagent' | 'plan' | 'cache';
 
 // The tools whose presence marks a turn as a plan / question landmark.
 export const PLAN_QUESTION_TOOLS = new Set(['ExitPlanMode', 'AskUserQuestion']);
@@ -53,14 +54,19 @@ export const PLAN_QUESTION_TOOLS = new Set(['ExitPlanMode', 'AskUserQuestion']);
 //   - prompt:   human turns.
 //   - subagent: the FIRST turn index per distinct (non-null) subagent_key.
 //   - plan:     turns carrying an ExitPlanMode / AskUserQuestion tool.
+//   - cache:    turns carrying a cache_failure flag (spec §4). RAW list — the
+//               markersEnabled opt-out is applied by the consumers (the cluster
+//               filters the chip; the reader's `c` key no-ops) so the navigation
+//               and the gating stay self-consistent with deriveOutline.
 //   - indexByUuid: every turn's uuid → its skeleton index, for cursor resolution.
 export function buildOutlineTargets(
   turns: OutlineTurn[],
-): { error: number[]; prompt: number[]; subagent: number[]; plan: number[]; indexByUuid: Map<string, number> } {
+): { error: number[]; prompt: number[]; subagent: number[]; plan: number[]; cache: number[]; indexByUuid: Map<string, number> } {
   const error: number[] = [];
   const prompt: number[] = [];
   const subagent: number[] = [];
   const plan: number[] = [];
+  const cache: number[] = [];
   const indexByUuid = new Map<string, number>();
   const seenSub = new Set<string>();
   turns.forEach((t, i) => {
@@ -72,8 +78,9 @@ export function buildOutlineTargets(
       subagent.push(i); // FIRST turn index per distinct subagent_key
     }
     if (t.tools?.some((x) => x.name != null && PLAN_QUESTION_TOOLS.has(x.name))) plan.push(i);
+    if (t.cache_failure) cache.push(i);
   });
-  return { error, prompt, subagent, plan, indexByUuid };
+  return { error, prompt, subagent, plan, cache, indexByUuid };
 }
 
 // #177 S5 §4 — jump-to-next cursor math, shared by the reader's e/u/b/p keys and
