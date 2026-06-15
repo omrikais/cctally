@@ -1,6 +1,19 @@
 {
   "conversations": [
     {
+      "cost_usd": 2.02275,
+      "git_branch": "main",
+      "last_activity_utc": "2026-06-07T00:00:05Z",
+      "models": [
+        "claude-opus-4-8"
+      ],
+      "msg_count": 6,
+      "project_label": "proj",
+      "session_id": "s7",
+      "started_utc": "2026-06-07T00:00:00Z",
+      "title": "trace the cache rebuild"
+    },
+    {
       "cost_usd": 0.0,
       "git_branch": "main",
       "last_activity_utc": "2026-06-06T00:00:02Z",

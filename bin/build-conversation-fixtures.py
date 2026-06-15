@@ -42,6 +42,15 @@ load-bearing kernel invariants:
     ``cost == f(tokens)``). The turn also pins ``input``/``input_truncated`` on
     a tool_call, ``stop_reason``/``attribution_*`` on the item, and
     ``result.full_length`` on a truncated tool result.
+  * Session ``s7`` — the cache-failure-markers scenario: a first-prime turn
+    (cr=0, never flagged) + a healthy turn (cr~rm, establishes the running-max)
+    + one clear MAIN-thread failure (cache_read collapses to 0 while
+    cache_creation balloons) + one SUBAGENT-thread failure (its own
+    ``agent-*.jsonl`` file -> distinct ``subagent_key``, keyed independently so
+    the main thread's high running-max never false-flags it). The reader carries
+    ``cache_failure`` on exactly the two failing turns; the outline copies it +
+    accumulates a session-level ``stats.cache_failures`` aggregate. Recomputed
+    per read inside ``_assemble_session`` (no schema change, no migration).
 
 No ``seed_conversation_message`` helper exists in ``_fixture_builders`` — the
 ``conversation_messages`` rows are INSERTed directly here. The cache.db is
@@ -197,6 +206,11 @@ def build(scenario: str) -> None:
     s5_cwd = "/home/u/proj"
     s6_file = "/fake/projects/proj/s6.jsonl"
     s6_cwd = "/home/u/proj"
+    # s7 — the cache-failure-markers scenario: a first-prime + a healthy turn +
+    # one clear MAIN-thread failure + one SUBAGENT-thread failure (its own file).
+    s7_file = "/fake/projects/proj/s7.jsonl"
+    s7_agent = "/fake/projects/proj/agent-dddd4444.jsonl"
+    s7_cwd = "/home/u/proj"
 
     cache_conn = sqlite3.connect(cache_path)
     stats_conn = sqlite3.connect(stats_path)
@@ -222,6 +236,10 @@ def build(scenario: str) -> None:
                           project_path=s5_cwd)
         seed_session_file(cache_conn, path=s6_file, session_id="s6",
                           project_path=s6_cwd)
+        seed_session_file(cache_conn, path=s7_file, session_id="s7",
+                          project_path=s7_cwd)
+        seed_session_file(cache_conn, path=s7_agent, session_id="s7",
+                          project_path=s7_cwd)
 
         # --- session s1: human prompt + multi-fragment assistant turn --------
         # id=1: human prompt.
@@ -677,6 +695,111 @@ def build(scenario: str) -> None:
                 "complete Session 6 — Search depth from issue #177")}]),
             cwd=s6_cwd, git_branch="main",
         )
+
+        # --- session s7: the cache-failure-markers scenario (spec §1/§2). A
+        # first-prime turn + a healthy turn + one clear MAIN-thread failure +
+        # one SUBAGENT-thread failure (its own agent file). The detector
+        # recomputes per read inside _assemble_session; no schema change. Each
+        # assistant turn has ONE session_entries row carrying the cache columns
+        # that drive the running-max collapse rule. The big cache_create / read
+        # token counts come from the embedded claude-opus-4-8 pricing, so the
+        # est_wasted_usd estimate on each flagged turn is genuinely non-zero. ---
+        _insert_message(
+            cache_conn,
+            session_id="s7", uuid="s7h1", parent_uuid=None,
+            source_path=s7_file, byte_offset=0,
+            timestamp_utc="2026-06-07T00:00:00Z",
+            entry_type="human", text="trace the cache rebuild",
+            cwd=s7_cwd, git_branch="main",
+        )
+        # Turn 1 — FIRST PRIME (cr=0, rm=0). The unavoidable initial cache build:
+        # rm < CACHE_FLOOR -> NEVER flagged.
+        _insert_message(
+            cache_conn,
+            session_id="s7", uuid="s7a1", parent_uuid="s7h1",
+            source_path=s7_file, byte_offset=1,
+            timestamp_utc="2026-06-07T00:00:01Z",
+            entry_type="assistant", text="primed the context",
+            blocks_json='[{"kind": "text", "text": "primed the context"}]',
+            model=MODEL, msg_id="m7a", req_id="r7a",
+            cwd=s7_cwd, git_branch="main",
+        )
+        # Turn 2 — HEALTHY (cr ~ rm): cache_read tracks the running-max, so the
+        # running-max never collapses -> NOT flagged. Establishes rm=130000.
+        _insert_message(
+            cache_conn,
+            session_id="s7", uuid="s7a2", parent_uuid="s7a1",
+            source_path=s7_file, byte_offset=2,
+            timestamp_utc="2026-06-07T00:00:02Z",
+            entry_type="assistant", text="read from cache",
+            blocks_json='[{"kind": "text", "text": "read from cache"}]',
+            model=MODEL, msg_id="m7b", req_id="r7b",
+            cwd=s7_cwd, git_branch="main",
+        )
+        # Turn 3 — MAIN-THREAD FAILURE: cache_read collapses to 0 while
+        # cache_creation balloons (cc=134000 >= CREATE_FLOOR, cr=0 <= 0.5*rm,
+        # frac=1.0 >= RECREATE_FRACTION) -> FLAGGED. lost = min(134000, 130000-0)
+        # = 130000.
+        _insert_message(
+            cache_conn,
+            session_id="s7", uuid="s7a3", parent_uuid="s7a2",
+            source_path=s7_file, byte_offset=3,
+            timestamp_utc="2026-06-07T00:00:03Z",
+            entry_type="assistant", text="rebuilt the whole prefix",
+            blocks_json='[{"kind": "text", "text": "rebuilt the whole prefix"}]',
+            model=MODEL, msg_id="m7c", req_id="r7c",
+            cwd=s7_cwd, git_branch="main",
+        )
+        # Subagent thread (its own agent file -> subagent_key dddd4444). Prime +
+        # collapse, keyed independently of the main thread so the main thread's
+        # high running-max never false-flags the subagent and the subagent's own
+        # collapse flags on ITS key.
+        _insert_message(
+            cache_conn,
+            session_id="s7", uuid="s7g1", parent_uuid="s7a1",
+            source_path=s7_agent, byte_offset=0,
+            timestamp_utc="2026-06-07T00:00:04Z",
+            entry_type="assistant", text="subagent primed",
+            blocks_json='[{"kind": "text", "text": "subagent primed"}]',
+            model=MODEL, msg_id="m7d", req_id="r7d", is_sidechain=1,
+            cwd=s7_cwd, git_branch="main",
+        )
+        _insert_message(
+            cache_conn,
+            session_id="s7", uuid="s7g2", parent_uuid="s7g1",
+            source_path=s7_agent, byte_offset=1,
+            timestamp_utc="2026-06-07T00:00:05Z",
+            entry_type="assistant", text="subagent rebuilt",
+            blocks_json='[{"kind": "text", "text": "subagent rebuilt"}]',
+            model=MODEL, msg_id="m7e", req_id="r7e", is_sidechain=1,
+            cwd=s7_cwd, git_branch="main",
+        )
+        # session_entries carrying the cache columns that drive detection.
+        seed_session_entry(cache_conn, source_path=s7_file, line_offset=1,
+                           timestamp_utc="2026-06-07T00:00:01Z", model=MODEL,
+                           msg_id="m7a", req_id="r7a", input_tokens=10,
+                           output_tokens=20, cache_create=50000,
+                           cache_read=0)               # first prime
+        seed_session_entry(cache_conn, source_path=s7_file, line_offset=2,
+                           timestamp_utc="2026-06-07T00:00:02Z", model=MODEL,
+                           msg_id="m7b", req_id="r7b", input_tokens=10,
+                           output_tokens=20, cache_create=1000,
+                           cache_read=130000)          # healthy (rm=130000)
+        seed_session_entry(cache_conn, source_path=s7_file, line_offset=3,
+                           timestamp_utc="2026-06-07T00:00:03Z", model=MODEL,
+                           msg_id="m7c", req_id="r7c", input_tokens=10,
+                           output_tokens=20, cache_create=134000,
+                           cache_read=0)               # MAIN FAILURE
+        seed_session_entry(cache_conn, source_path=s7_agent, line_offset=0,
+                           timestamp_utc="2026-06-07T00:00:04Z", model=MODEL,
+                           msg_id="m7d", req_id="r7d", input_tokens=10,
+                           output_tokens=20, cache_create=1000,
+                           cache_read=80000)           # subagent prime (rm=80000)
+        seed_session_entry(cache_conn, source_path=s7_agent, line_offset=1,
+                           timestamp_utc="2026-06-07T00:00:05Z", model=MODEL,
+                           msg_id="m7e", req_id="r7e", input_tokens=10,
+                           output_tokens=20, cache_create=120000,
+                           cache_read=5000)            # SUBAGENT FAILURE
 
         # --- #193: ai-title rows. s1 + s3 carry an AI-generated title (their
         # rail/reader title flips from the first human prompt to the ai-title);

@@ -517,6 +517,81 @@ print("ok")
         fail "reader command-marker fold + ANSI strip (#186): $s6_check (raw: $s6_raw)"
     fi
 
+    # --- 2f) Reader + outline: cache-failure markers (spec §1/§2) ---------
+    # s7 seeds a first-prime turn + a healthy turn + one MAIN-thread failure +
+    # one SUBAGENT-thread failure. The kernel recomputes the flag per read inside
+    # _assemble_session, so the reader carries `cache_failure` on exactly the two
+    # failing turns and the outline carries the matching flag + a session-level
+    # stats.cache_failures aggregate. Byte-stable goldens lock both payloads; the
+    # structural asserts below pin the load-bearing fields independent of FTS5.
+    fetch_and_diff "GET /api/conversation/s7" "golden-conversation-s7.json" \
+        "$base/api/conversation/s7" "${LOOP[@]}"
+    fetch_and_diff "GET /api/conversation/s7/outline" "golden-conversation-s7-outline.json" \
+        "$base/api/conversation/s7/outline" "${LOOP[@]}"
+
+    local s7_raw s7_outline_raw s7_check
+    s7_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s7")
+    s7_outline_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s7/outline")
+    s7_check=$(D="$s7_raw" O="$s7_outline_raw" python3 -c '
+import json, os, sys
+d = json.loads(os.environ["D"])
+o = json.loads(os.environ["O"])
+errs = []
+by = {it["anchor"]["uuid"]: it for it in (d.get("items") or [])}
+# First prime + healthy turns are NOT flagged (absent, not zero).
+for clean in ("s7a1", "s7a2", "s7g1"):
+    if clean not in by:
+        errs.append("missing item %r" % (clean,))
+    elif "cache_failure" in by[clean]:
+        errs.append("%r should NOT carry cache_failure" % (clean,))
+# Main-thread failure on s7a3: lost = min(134000, 130000-0) = 130000.
+m = by.get("s7a3", {})
+mf = m.get("cache_failure")
+if mf is None:
+    errs.append("s7a3 missing cache_failure")
+else:
+    if mf.get("prev_cached") != 130000:
+        errs.append("s7a3 prev_cached=%r != 130000" % (mf.get("prev_cached"),))
+    if mf.get("tokens_recreated") != 130000:
+        errs.append("s7a3 tokens_recreated=%r != 130000" % (mf.get("tokens_recreated"),))
+    if not (mf.get("est_wasted_usd", 0.0) > 0):
+        errs.append("s7a3 est_wasted_usd not > 0: %r" % (mf.get("est_wasted_usd"),))
+# Subagent-thread failure on s7g2: keyed independently, lost=min(120000,80000-5000)=75000.
+g = by.get("s7g2", {})
+gf = g.get("cache_failure")
+if gf is None:
+    errs.append("s7g2 missing cache_failure")
+else:
+    if gf.get("prev_cached") != 80000:
+        errs.append("s7g2 prev_cached=%r != 80000" % (gf.get("prev_cached"),))
+    if gf.get("tokens_recreated") != 75000:
+        errs.append("s7g2 tokens_recreated=%r != 75000" % (gf.get("tokens_recreated"),))
+# Outline aggregate: exactly two failures, summed tokens + usd.
+agg = (o.get("stats") or {}).get("cache_failures")
+if agg is None:
+    errs.append("outline stats.cache_failures missing")
+else:
+    if agg.get("count") != 2:
+        errs.append("outline cache_failures.count=%r != 2" % (agg.get("count"),))
+    if agg.get("tokens_recreated") != 205000:   # 130000 + 75000
+        errs.append("outline cache_failures.tokens_recreated=%r != 205000"
+                    % (agg.get("tokens_recreated"),))
+    if not (agg.get("est_wasted_usd", 0.0) > 0):
+        errs.append("outline cache_failures.est_wasted_usd not > 0: %r"
+                    % (agg.get("est_wasted_usd"),))
+# Outline turns copy the flag onto the matching turns.
+ot = {t["uuid"]: t for t in (o.get("turns") or [])}
+for fid in ("s7a3", "s7g2"):
+    if "cache_failure" not in ot.get(fid, {}):
+        errs.append("outline turn %r missing cache_failure" % (fid,))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+    if [ "$s7_check" != "ok" ]; then
+        fail "cache-failure markers (spec §1/§2): $s7_check (raw: $s7_raw)"
+    fi
+
     # --- 3) Search: deduped across replay to ONE hit ---------------------
     # Byte-exact golden only when FTS5 is present (the golden is FTS-shaped);
     # the structural asserts below run unconditionally.

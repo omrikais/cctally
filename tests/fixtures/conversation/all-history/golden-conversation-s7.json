@@ -1,0 +1,196 @@
+{
+  "cost_usd": 2.02275,
+  "git_branch": "main",
+  "items": [
+    {
+      "anchor": {
+        "id": 27,
+        "session_id": "s7",
+        "uuid": "s7h1"
+      },
+      "blocks": [],
+      "is_sidechain": false,
+      "kind": "human",
+      "member_uuids": [
+        "s7h1"
+      ],
+      "parent_uuid": null,
+      "subagent_key": null,
+      "text": "trace the cache rebuild",
+      "ts": "2026-06-07T00:00:00Z"
+    },
+    {
+      "anchor": {
+        "id": 28,
+        "session_id": "s7",
+        "uuid": "s7a1"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "primed the context"
+        }
+      ],
+      "cost_usd": 0.31305,
+      "is_sidechain": false,
+      "kind": "assistant",
+      "member_uuids": [
+        "s7a1"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s7h1",
+      "subagent_key": null,
+      "text": "primed the context",
+      "tokens": {
+        "cache_creation": 50000,
+        "cache_read": 0,
+        "input": 10,
+        "output": 20
+      },
+      "ts": "2026-06-07T00:00:01Z"
+    },
+    {
+      "anchor": {
+        "id": 29,
+        "session_id": "s7",
+        "uuid": "s7a2"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "read from cache"
+        }
+      ],
+      "cost_usd": 0.0718,
+      "is_sidechain": false,
+      "kind": "assistant",
+      "member_uuids": [
+        "s7a2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s7a1",
+      "subagent_key": null,
+      "text": "read from cache",
+      "tokens": {
+        "cache_creation": 1000,
+        "cache_read": 130000,
+        "input": 10,
+        "output": 20
+      },
+      "ts": "2026-06-07T00:00:02Z"
+    },
+    {
+      "anchor": {
+        "id": 30,
+        "session_id": "s7",
+        "uuid": "s7a3"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "rebuilt the whole prefix"
+        }
+      ],
+      "cache_failure": {
+        "est_wasted_usd": 0.7475,
+        "prev_cached": 130000,
+        "tokens_recreated": 130000
+      },
+      "cost_usd": 0.83805,
+      "is_sidechain": false,
+      "kind": "assistant",
+      "member_uuids": [
+        "s7a3"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s7a2",
+      "subagent_key": null,
+      "text": "rebuilt the whole prefix",
+      "tokens": {
+        "cache_creation": 134000,
+        "cache_read": 0,
+        "input": 10,
+        "output": 20
+      },
+      "ts": "2026-06-07T00:00:03Z"
+    },
+    {
+      "anchor": {
+        "id": 31,
+        "session_id": "s7",
+        "uuid": "s7g1"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "subagent primed"
+        }
+      ],
+      "cost_usd": 0.0468,
+      "is_sidechain": true,
+      "kind": "assistant",
+      "member_uuids": [
+        "s7g1"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s7a1",
+      "subagent_key": "dddd4444",
+      "text": "subagent primed",
+      "tokens": {
+        "cache_creation": 1000,
+        "cache_read": 80000,
+        "input": 10,
+        "output": 20
+      },
+      "ts": "2026-06-07T00:00:04Z"
+    },
+    {
+      "anchor": {
+        "id": 32,
+        "session_id": "s7",
+        "uuid": "s7g2"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "subagent rebuilt"
+        }
+      ],
+      "cache_failure": {
+        "est_wasted_usd": 0.43125,
+        "prev_cached": 80000,
+        "tokens_recreated": 75000
+      },
+      "cost_usd": 0.75305,
+      "is_sidechain": true,
+      "kind": "assistant",
+      "member_uuids": [
+        "s7g2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s7g1",
+      "subagent_key": "dddd4444",
+      "text": "subagent rebuilt",
+      "tokens": {
+        "cache_creation": 120000,
+        "cache_read": 5000,
+        "input": 10,
+        "output": 20
+      },
+      "ts": "2026-06-07T00:00:05Z"
+    }
+  ],
+  "last_activity_utc": "2026-06-07T00:00:05Z",
+  "models": [
+    "claude-opus-4-8"
+  ],
+  "page": {
+    "has_more": false,
+    "next_after": null
+  },
+  "project_label": "proj",
+  "session_id": "s7",
+  "started_utc": "2026-06-07T00:00:00Z",
+  "subagent_meta": {},
+  "title": "trace the cache rebuild"
+}

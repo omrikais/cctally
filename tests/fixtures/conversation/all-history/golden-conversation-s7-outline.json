@@ -1,0 +1,150 @@
+{
+  "session_id": "s7",
+  "stats": {
+    "cache_failures": {
+      "count": 2,
+      "est_wasted_usd": 1.17875,
+      "tokens_recreated": 205000
+    },
+    "cost_usd": 2.02275,
+    "duration_seconds": 5,
+    "error_count": 0,
+    "models": {
+      "claude-opus-4-8": 5
+    },
+    "tokens": {
+      "cache_creation": 306000,
+      "cache_read": 215000,
+      "input": 50,
+      "output": 100
+    },
+    "tool_counts": {},
+    "turns": {
+      "assistant": 5,
+      "human": 1,
+      "meta": 0,
+      "tool_result": 0,
+      "total": 6
+    }
+  },
+  "subagent_meta": {},
+  "turns": [
+    {
+      "is_sidechain": false,
+      "kind": "human",
+      "label": "trace the cache rebuild",
+      "member_uuids": [
+        "s7h1"
+      ],
+      "parent_uuid": null,
+      "subagent_key": null,
+      "ts": "2026-06-07T00:00:00Z",
+      "uuid": "s7h1"
+    },
+    {
+      "is_sidechain": false,
+      "kind": "assistant",
+      "label": "primed the context",
+      "member_uuids": [
+        "s7a1"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s7h1",
+      "subagent_key": null,
+      "tokens": {
+        "cache_creation": 50000,
+        "cache_read": 0,
+        "input": 10,
+        "output": 20
+      },
+      "ts": "2026-06-07T00:00:01Z",
+      "uuid": "s7a1"
+    },
+    {
+      "is_sidechain": false,
+      "kind": "assistant",
+      "label": "read from cache",
+      "member_uuids": [
+        "s7a2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s7a1",
+      "subagent_key": null,
+      "tokens": {
+        "cache_creation": 1000,
+        "cache_read": 130000,
+        "input": 10,
+        "output": 20
+      },
+      "ts": "2026-06-07T00:00:02Z",
+      "uuid": "s7a2"
+    },
+    {
+      "cache_failure": {
+        "est_wasted_usd": 0.7475,
+        "prev_cached": 130000,
+        "tokens_recreated": 130000
+      },
+      "is_sidechain": false,
+      "kind": "assistant",
+      "label": "rebuilt the whole prefix",
+      "member_uuids": [
+        "s7a3"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s7a2",
+      "subagent_key": null,
+      "tokens": {
+        "cache_creation": 134000,
+        "cache_read": 0,
+        "input": 10,
+        "output": 20
+      },
+      "ts": "2026-06-07T00:00:03Z",
+      "uuid": "s7a3"
+    },
+    {
+      "is_sidechain": true,
+      "kind": "assistant",
+      "label": "subagent primed",
+      "member_uuids": [
+        "s7g1"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s7a1",
+      "subagent_key": "dddd4444",
+      "tokens": {
+        "cache_creation": 1000,
+        "cache_read": 80000,
+        "input": 10,
+        "output": 20
+      },
+      "ts": "2026-06-07T00:00:04Z",
+      "uuid": "s7g1"
+    },
+    {
+      "cache_failure": {
+        "est_wasted_usd": 0.43125,
+        "prev_cached": 80000,
+        "tokens_recreated": 75000
+      },
+      "is_sidechain": true,
+      "kind": "assistant",
+      "label": "subagent rebuilt",
+      "member_uuids": [
+        "s7g2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s7g1",
+      "subagent_key": "dddd4444",
+      "tokens": {
+        "cache_creation": 120000,
+        "cache_read": 5000,
+        "input": 10,
+        "output": 20
+      },
+      "ts": "2026-06-07T00:00:05Z",
+      "uuid": "s7g2"
+    }
+  ]
+}
