@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { dispatch, getState, subscribeStore } from '../store/store';
+import { dispatch, getState, selectMarkersEnabled, subscribeStore } from '../store/store';
 import { useConversation } from '../hooks/useConversation';
 import { useKeymap } from '../hooks/useKeymap';
 import { useReducedMotion } from '../hooks/useReducedMotion';
@@ -74,6 +74,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // render + the n/N step bindings. `findTerms` is the debounced needle split
   // into highlight terms (null when the bar is closed → no prose marks).
   const convFindOpen = useSyncExternalStore(subscribeStore, () => getState().convFindOpen);
+  // cache-failure-markers spec §3/§5 — the cache-rebuild marker opt-out, read
+  // ONCE here and provided down via TranscriptContext so the memoized
+  // MessageItems don't each subscribe. selectMarkersEnabled defaults true.
+  const markersEnabled = useSyncExternalStore(subscribeStore, () =>
+    selectMarkersEnabled(getState()),
+  );
   const [findTerms, setFindTerms] = useState<string[] | null>(null);
   // Live closure to the find bar's cursor stepper (n/N drive it while the bar
   // is open + the input is blurred). FindBar assigns its `step` here each render.
@@ -329,7 +335,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // a per-item useDisplayTz() subscription — the memoized items would otherwise
   // re-render on every SSE tick. Keyed on fmtCtx (already memoized above), so the
   // provider identity only changes when the resolved tz actually changes.
-  const transcriptCtx = useMemo(() => ({ sessionId, focusMode, fmtCtx }), [sessionId, focusMode, fmtCtx]);
+  // markersEnabled rides along too (cache-failure-markers spec §3) so MessageItem
+  // reads the opt-out from context (no per-item store subscription); the provider
+  // identity flips only when the opt-out actually changes.
+  const transcriptCtx = useMemo(
+    () => ({ sessionId, focusMode, fmtCtx, markersEnabled }),
+    [sessionId, focusMode, fmtCtx, markersEnabled],
+  );
 
   // Lazy-load when the bottom sentinel scrolls into view.
   useEffect(() => {

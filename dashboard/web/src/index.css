@@ -5484,6 +5484,9 @@ mark.current {
   align-items: baseline;
   gap: 10px;
   margin-bottom: 6px;
+  /* cache-failure-markers spec §3 — let the amber cache chip drop to a second
+     line on narrow viewports instead of overflowing the head row. */
+  flex-wrap: wrap;
 }
 .conv-item-label {
   font-family: var(--font-mono);
@@ -5509,6 +5512,24 @@ mark.current {
   border: 1px solid color-mix(in srgb, var(--accent-blue) 30%, transparent);
   white-space: nowrap;
 }
+/* cache-failure-markers spec §3 — amber "cache rebuilt" chip in an assistant
+   turn head, next to the model chip. Mirrors .conv-cmd-badge but in the
+   dashboard's "warn" hue (a cache rebuild is a cost inefficiency, not an
+   error). The ⚡ glyph is aria-hidden; the chip text carries the meaning. */
+.conv-cache-chip {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 5px;
+  color: #fbbf24;
+  background: color-mix(in srgb, var(--accent-amber) 13%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-amber) 32%, transparent);
+  white-space: nowrap;
+}
+/* cache-failure-markers spec §3 — subtle second cue: tint the per-turn cost
+   footer amber on a flagged turn (the `cache NNN` figure draws the eye). */
+.conv-item-cost.is-cache-failure { color: var(--accent-amber); }
 .conv-item-cost {
   margin-top: 10px;
   padding-top: 8px;

@@ -7,7 +7,7 @@ import { PermalinkButton } from './PermalinkButton';
 import { isSystemMarker } from './systemMarkers';
 import { modelChipClass } from '../lib/model';
 import { fmt } from '../lib/fmt';
-import { useFmtCtx } from './TranscriptContext';
+import { useFmtCtx, useMarkersEnabled } from './TranscriptContext';
 import type { ConversationItem } from '../types/conversation';
 
 // First non-blank line of a meta body, trimmed + capped — the context pill's
@@ -59,6 +59,9 @@ function MessageItemImpl(
   // it once and provides it), NOT a per-item useDisplayTz() subscription — the
   // latter would re-render every memoized item on each SSE tick.
   const fmtCtx = useFmtCtx();
+  // cache-failure-markers spec §3 — the opt-out, read once from the reader-
+  // provided context (NOT a per-item store subscription; keeps memo valid).
+  const markersEnabled = useMarkersEnabled();
   // fmt.timeHHmm returns the "—" sentinel for a null/unparseable ts; suppress the
   // eyebrow in that case (no real instant to show).
   const eyebrowTimeRaw = item.ts
@@ -97,6 +100,10 @@ function MessageItemImpl(
     // session_entries row (absent → cost-only footer, the established
     // graceful-degradation pattern). Narrowed off the assistant kind.
     const tok = 'tokens' in item ? item.tokens : undefined;
+    // cache-failure-markers spec §3 — the per-turn prompt-cache-failure marker.
+    // Present only on a flagged turn; the chip renders iff markers are on AND
+    // the turn is flagged. Pure prop derivation → memo stays valid.
+    const cf = 'cache_failure' in item ? item.cache_failure : undefined;
     return (
       <div ref={ref} className={cls('conv-item--assistant')} style={style} data-uuid={item.anchor.uuid}>
         <div className="conv-item-head">
@@ -104,6 +111,18 @@ function MessageItemImpl(
           {/* #175 F3: render the model through the shared .chip system (matching
               the rest of the dashboard). No chip — and no em dash — when null. */}
           {item.model && <span className={`chip ${modelChipClass(item.model)}`}>{item.model}</span>}
+          {/* cache-failure-markers spec §3 — amber "cache rebuilt" chip next to
+              the model chip. Gated on markersEnabled && the flag; the ⚡ glyph is
+              aria-hidden so the chip text + aria-label/title carry the meaning. */}
+          {markersEnabled && cf && (
+            <span
+              className="conv-cache-chip"
+              aria-label={`Prompt cache miss: ${cf.tokens_recreated.toLocaleString()} tokens re-created instead of read from cache, about ${fmt.usd2(cf.est_wasted_usd)} extra`}
+              title={`Cache rebuilt — ${fmt.tokens(cf.tokens_recreated)} re-created instead of read (~${fmt.usd2(cf.est_wasted_usd)} extra). Usually follows an idle gap past the cache TTL.`}
+            >
+              <span aria-hidden="true">⚡</span> CACHE REBUILT · {fmt.tokens(cf.tokens_recreated)} · +{fmt.usd2(cf.est_wasted_usd)}
+            </span>
+          )}
           {eyebrow}
         </div>
         {/* Document-order walk renders prose (from text blocks) + thinking +
@@ -126,7 +145,10 @@ function MessageItemImpl(
           // where 2-decimal formatting would read "$0.00" — 4 decimals keep
           // the real figure legible. Intentional bypass of the usd2 helper.
           <div
-            className="conv-item-cost"
+            // cache-failure-markers spec §3 — tint the footer's `cache NNN`
+            // figure amber on a flagged turn (only when markers are on, so the
+            // opt-out hides this cue too).
+            className={`conv-item-cost${markersEnabled && cf ? ' is-cache-failure' : ''}`}
             title={tok ? `input ${tok.input} · output ${tok.output} · cache create ${tok.cache_creation} · cache read ${tok.cache_read}` : undefined}
           >
             {hasCost && `$${(item.cost_usd as number).toFixed(4)}`}

@@ -31,14 +31,24 @@ export interface TranscriptCtxValue {
   // Display-tz formatting context. Optional for the same back-compat reason;
   // consumers fall back to DEFAULT_FMT_CTX (Etc/UTC) when absent.
   fmtCtx?: FmtCtx;
+  // cache-failure-markers spec §3 — the conversation-viewer cache-rebuild
+  // marker opt-out, provided ONCE by the reader from selectMarkersEnabled (so
+  // the memoized MessageItems don't each subscribe to the store and re-render
+  // every tick — same memo economics as fmtCtx). Optional + default true
+  // (opt-out): an absent provider value renders the chip.
+  markersEnabled?: boolean;
 }
 
 export const TranscriptContext = createContext<TranscriptCtxValue>({
   sessionId: null,
   focusMode: 'all',
   fmtCtx: DEFAULT_FMT_CTX,
+  markersEnabled: true,
 });
 
 export const useSessionId = () => useContext(TranscriptContext).sessionId;
 export const useFocusMode = (): FocusMode => useContext(TranscriptContext).focusMode ?? 'all';
 export const useFmtCtx = (): FmtCtx => useContext(TranscriptContext).fmtCtx ?? DEFAULT_FMT_CTX;
+// Default true (opt-out): a missing provider value reads as markers-on.
+export const useMarkersEnabled = (): boolean =>
+  useContext(TranscriptContext).markersEnabled ?? true;

@@ -22,6 +22,17 @@ function renderWithTz(item: ConversationItem) {
   );
 }
 
+// cache-failure-markers spec §3 — the chip's `markersEnabled` rides on
+// TranscriptContext (like focusMode/fmtCtx); the reader provides it from
+// selectMarkersEnabled. Default ON, so a bare render shows the chip.
+function renderWithMarkers(item: ConversationItem, markersEnabled: boolean) {
+  return render(
+    <TranscriptContext.Provider value={{ sessionId: 's', fmtCtx, markersEnabled }}>
+      <MessageItem item={item} />
+    </TranscriptContext.Provider>,
+  );
+}
+
 const human: ConversationItem = {
   kind: 'human',
   anchor: { session_id: 's', uuid: 'h1', id: 1 },
@@ -859,5 +870,60 @@ describe('MessageItem token footer (#177 S5 §6)', () => {
     expect(container.querySelector('details.conv-meta--notification')).not.toBeNull();
     expect(container.textContent).toContain('Background task');
     expect(container.textContent).toContain('Run tests completed (exit code 0)');
+  });
+});
+
+// ---- cache-failure-markers spec §3 — the reader header chip --------------
+describe('MessageItem cache-failure chip (cache-failure-markers spec §3)', () => {
+  const flagged: ConversationItem = {
+    kind: 'assistant',
+    anchor: { session_id: 's', uuid: 'cf1', id: 1 },
+    member_uuids: ['cf1'],
+    ts: '2026-06-12T14:02:31Z',
+    text: 'rebuilt the prefix',
+    blocks: [{ kind: 'text', text: 'rebuilt the prefix' }],
+    model: 'claude-opus-4-8',
+    is_sidechain: false,
+    subagent_key: null,
+    parent_uuid: null,
+    cost_usd: 1.0,
+    // 130000 → fmt.tokens "130k"; 0.7475 → fmt.usd2 "$0.75".
+    cache_failure: { tokens_recreated: 130000, prev_cached: 130000, est_wasted_usd: 0.7475 },
+  };
+
+  it('renders the amber chip with text + aria-label when flagged AND markers on', () => {
+    const { container } = renderWithMarkers(flagged, true);
+    const chip = container.querySelector('.conv-item-head .conv-cache-chip')!;
+    expect(chip).not.toBeNull();
+    // The chip text carries the meaning (the ⚡ glyph is aria-hidden).
+    expect(chip.textContent).toContain('CACHE REBUILT');
+    expect(chip.textContent).toContain('130k');
+    expect(chip.textContent).toContain('+$0.75');
+    // The glyph is aria-hidden so screen readers read the chip text, not "⚡".
+    expect(chip.querySelector('[aria-hidden="true"]')).not.toBeNull();
+    // The accessible label spells the full explanation.
+    const label = chip.getAttribute('aria-label') ?? '';
+    expect(label.toLowerCase()).toContain('cache');
+    expect(label).toContain('130,000'); // toLocaleString of tokens_recreated
+  });
+
+  it('renders the chip on a bare render (markers default ON)', () => {
+    // No provider override → the context default markersEnabled is true.
+    const { container } = render(<MessageItem item={flagged} />);
+    expect(container.querySelector('.conv-cache-chip')).not.toBeNull();
+  });
+
+  it('HIDES the chip when markers are toggled off', () => {
+    const { container } = renderWithMarkers(flagged, false);
+    expect(container.querySelector('.conv-cache-chip')).toBeNull();
+    // The turn still renders normally (just no marker).
+    expect(container.querySelector('.conv-item--assistant')).not.toBeNull();
+  });
+
+  it('renders NO chip on a healthy turn (no cache_failure)', () => {
+    const healthy: ConversationItem = { ...flagged, anchor: { session_id: 's', uuid: 'ok1', id: 2 } };
+    delete (healthy as { cache_failure?: unknown }).cache_failure;
+    const { container } = renderWithMarkers(healthy, true);
+    expect(container.querySelector('.conv-cache-chip')).toBeNull();
   });
 });
