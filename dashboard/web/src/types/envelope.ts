@@ -66,6 +66,11 @@ export interface Envelope {
   // at bin/_cctally_dashboard.py :: _cache_report_snapshot_to_dict
   // emits snake_case keys to mirror this interface field-for-field.
   cache_report?: CacheReportEnvelope | null;
+  // Dashboard-scoped preferences mirror (cache-failure-markers spec §5).
+  // Additive optional, like alerts_settings — a Python without the feature
+  // omits it entirely. `cache_failure_markers` is the conversation-viewer
+  // cache-rebuild marker opt-out; ABSENCE is treated as ON (default true).
+  dashboard_prefs?: { cache_failure_markers?: boolean };
 }
 
 // Cache Report envelope (spec 2026-05-21).

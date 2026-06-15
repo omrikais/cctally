@@ -3,6 +3,21 @@
 // bin/_cctally_dashboard.py. These mirror the three GET routes
 // (/api/conversations, /api/conversation/<id>, /api/conversation/search).
 
+// Prompt-cache-failure marker (cache-failure-markers spec §2). Stamped by the
+// kernel's `_stamp_cache_failures` onto an assistant turn that re-created the
+// bulk of its cached prefix instead of reading it. ABSENT on healthy turns
+// (matching the `tokens?` "absent, not zero" convention) — never zero-filled.
+//   tokens_recreated — the previously-cached prefix that had to be re-created:
+//                      `min(cc, max(0, rm - cr))` (NOT the raw cache_creation).
+//   prev_cached      — the running-max cache_read before this turn (rm).
+//   est_wasted_usd   — the marginal write-vs-read cost on the lost prefix
+//                      (display-only estimate; never summed into a cost figure).
+export interface CacheFailure {
+  tokens_recreated: number;
+  prev_cached: number;
+  est_wasted_usd: number;
+}
+
 export type ConversationItem =
   | {
       // assistant turn
@@ -21,6 +36,9 @@ export type ConversationItem =
       // stamped when the turn key has a session_entries row. Absent (NOT
       // zero-filled) otherwise; the §6 footer reads it.
       tokens?: TokenUsage;
+      // cache-failure-markers spec §2/§3 — present only on a flagged assistant
+      // turn; absent on healthy ones. The reader chip reads it.
+      cache_failure?: CacheFailure;
     }
   | {
       // human or tool_result (also: assistant-with-null-msg_id, which carries model + cost_usd: 0)
@@ -40,6 +58,11 @@ export type ConversationItem =
       // the raw <command-name> block, NOT the scalar text (which holds the args).
       // Absent/null on an ordinary human turn. Consumers tolerate the missing key.
       command_name?: string | null;
+      // cache-failure-markers spec §2 — declared on this arm too so
+      // `item.cache_failure` type-checks after a `kind === 'assistant'` narrow
+      // resolves to the null-msg_id assistant fallback. Absent on human /
+      // tool_result rows in practice.
+      cache_failure?: CacheFailure;
     }
   | {
       // Injected harness content (isMeta) the user did NOT type — rendered as a
@@ -88,6 +111,9 @@ export interface OutlineTurn {
   thinking?: string[];
   meta_kind?: 'skill' | 'command' | 'context' | 'compaction' | 'notification';
   skill_name?: string | null;
+  // cache-failure-markers spec §2/§4 — copied from the assembled item onto its
+  // OutlineTurn where `tokens` is copied. Present only on a flagged turn.
+  cache_failure?: CacheFailure;
 }
 export interface OutlineStats {
   turns: { total: number; human: number; assistant: number; tool_result: number; meta: number };
@@ -97,6 +123,10 @@ export interface OutlineStats {
   duration_seconds: number | null;
   tokens: TokenUsage;
   cost_usd: number;
+  // cache-failure-markers spec §2/§4 — session-level aggregate of the flagged
+  // turns. PRESENT ONLY when count > 0 (the stats "Cache" row renders only
+  // then); absent when no turn was flagged. `est_wasted_usd` is display-only.
+  cache_failures?: { count: number; tokens_recreated: number; est_wasted_usd: number };
 }
 export interface ConversationOutline {
   session_id: string;
