@@ -54,6 +54,7 @@
     "bin/_lib_changelog.py",
     "bin/_lib_conversation.py",
     "bin/_lib_conversation_query.py",
+    "bin/_lib_conversation_watch.py",
     "bin/_lib_diff_kernel.py",
     "bin/_lib_display_tz.py",
     "bin/_lib_doctor.py",
