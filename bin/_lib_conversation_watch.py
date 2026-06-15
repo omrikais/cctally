@@ -7,22 +7,28 @@ DB. The thin SSE/sleep/keep-alive driver lives in bin/_cctally_dashboard.py.
 
 
 def file_sig(path):
-    """(st_size, st_mtime_ns) for a path, or None if it can't be stat'd
-    (deleted / rotated). Pure-ish — the only I/O, isolated here so callers can
-    inject a fake in tests."""
+    """Size-only signature (st_size, an int) for a path, or None if it can't be
+    stat'd (deleted / rotated). Size-only by design: it must match sync_cache's
+    own size-only delta signal (Claude Code's JSONL sessions are strictly
+    append-only, so a size change is sufficient) — mtime jitter must NOT drive a
+    re-emit, since a size-unchanged ingest does not refresh session_files.mtime_ns
+    and a stale mtime would otherwise re-detect "changed" every cycle forever.
+    Pure-ish — the only I/O, isolated here so callers can inject a fake in
+    tests."""
     import os
     try:
         st = os.stat(path)
     except OSError:
         return None
-    return (st.st_size, st.st_mtime_ns)
+    return st.st_size
 
 
 def changed_paths(files, seen, stat_fn=file_sig):
-    """Paths whose current signature differs from `seen`. An unstatable path
-    (stat_fn → None) is skipped (dropped this cycle, re-resolved later); a path
-    absent from `seen` counts as changed (first observation / pre-connect
-    growth)."""
+    """Paths whose current size-only signature differs from `seen` (matches
+    sync_cache's size-only delta; mtime jitter must not drive a re-emit). An
+    unstatable path (stat_fn → None) is skipped (dropped this cycle, re-resolved
+    later); a path absent from `seen` counts as changed (first observation /
+    pre-connect growth)."""
     out = []
     for p in files:
         sig = stat_fn(p)
@@ -36,14 +42,16 @@ def changed_paths(files, seen, stat_fn=file_sig):
 def watch_step(files, seen, *, stat_fn=file_sig, ingest_fn, committed_sig_fn=None):
     """One watch cycle. Returns (new_seen, emitted).
 
-    Detect changed files → run ingest_fn(changed) (targeted sync_cache). Emit +
-    advance `seen` ONLY on a clean ingest (stats.targeted_clean). `seen` is
-    advanced to the COMMITTED cache cursor (committed_sig_fn) — NOT a fresh
-    filesystem re-stat — so a file that grew during the ingest is still seen as
-    changed next cycle (the cache cursor, in session_files, lags the new disk
-    size). committed_sig_fn defaults to stat_fn for pure unit tests with no cache.
-    A contended/declined/failed ingest leaves `seen` untouched so the next cycle
-    retries (the 5s backstop is the floor)."""
+    Detect changed files (by size-only signature — matches sync_cache's
+    size-only delta; mtime jitter must not drive a re-emit) → run
+    ingest_fn(changed) (targeted sync_cache). Emit + advance `seen` ONLY on a
+    clean ingest (stats.targeted_clean). `seen` is advanced to the COMMITTED
+    cache cursor (committed_sig_fn) — NOT a fresh filesystem re-stat — so a file
+    that grew during the ingest is still seen as changed next cycle (the cache
+    cursor, in session_files, lags the new disk size). committed_sig_fn defaults
+    to stat_fn for pure unit tests with no cache. A contended/declined/failed
+    ingest leaves `seen` untouched so the next cycle retries (the 5s backstop is
+    the floor)."""
     committed_sig_fn = committed_sig_fn or stat_fn
     changed = changed_paths(files, seen, stat_fn)
     if not changed:

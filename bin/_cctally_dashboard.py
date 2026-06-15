@@ -5277,23 +5277,26 @@ _CONV_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking")
 
 
 def _cached_file_sigs(conn, paths):
-    """{path: (size_bytes, mtime_ns)} from session_files for the given paths —
-    the cache's own view of how far each file is ingested. Used to baseline the
-    live-tail watch so a file the cache hasn't caught up on reads as 'changed'
-    on cycle 1 (spec §2.4). Paths with no row are simply absent → treated as
-    changed."""
+    """{path: size_bytes} from session_files for the given paths — the cache's
+    own view of how far each file is ingested. Size-only by design, matching the
+    watch kernel's size-only signature (`file_sig`) and sync_cache's size-only
+    delta signal: mtime is NOT consulted, because a size-unchanged ingest does
+    not refresh session_files.mtime_ns and a stale mtime would re-detect
+    'changed' every cycle forever. Used to baseline the live-tail watch so a file
+    the cache hasn't caught up on reads as 'changed' on cycle 1 (spec §2.4).
+    Paths with no row are simply absent → treated as changed."""
     out = {}
     if not paths:
         return out
     placeholders = ",".join("?" for _ in paths)
     try:
         rows = conn.execute(
-            f"SELECT path, size_bytes, mtime_ns FROM session_files "
+            f"SELECT path, size_bytes FROM session_files "
             f"WHERE path IN ({placeholders})", list(paths)).fetchall()
     except sqlite3.OperationalError:
         return out
-    for p, size, mtime in rows:
-        out[p] = (size, mtime)
+    for p, size in rows:
+        out[p] = size
     return out
 
 
