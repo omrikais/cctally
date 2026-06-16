@@ -432,3 +432,49 @@ def test_outline_cache_saved_usd_zero_without_cache_reads():
     stats = cq.get_conversation_outline(c, "nocache")["stats"]
     assert stats["cache_saved_usd"] == 0.0
     assert "cache_failures" not in stats         # unchanged absent-when-none contract
+
+
+def test_outline_rebuilds_null_ts_sorts_last_on_tie():
+    # Two failures with IDENTICAL wasted $ (same model + same lost=130k); the one
+    # whose turn has a NULL timestamp must sort LAST (the `ts is None` tiebreak).
+    #
+    # Ordering note: `_assemble_session` orders turns by `(timestamp_utc, id)`, and
+    # SQLite sorts NULL FIRST, so a null-ts turn is walked at the HEAD of the
+    # session — before any real-ts prime. The running-max cache-failure detector
+    # is therefore seeded with a null-ts prime (smaller id, also walked first) so
+    # the null-ts collapse `fb` is flagged; the real-ts prime + `fa` form an
+    # independent prime->collapse pair walked afterward. Both lose 130k -> tie.
+    c = _conn()
+    # null-ts prime (inserted first -> smallest id -> walked first), rm -> 130k
+    _msg(c, session_id="nt2", uuid="np", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc=None, entry_type="assistant",
+         text="np", model=_MODEL, msg_id="npm", req_id="npr",
+         blocks_json=_json.dumps([{"kind": "text", "text": "np"}]))
+    _entry(c, source_path="a.jsonl", line_offset=0, model=_MODEL,
+           msg_id="npm", req_id="npr", inp=10, out=20, cc=1_000, cr=130_000)
+    # failure B: ts NULL, lost = min(140k, 130k-0) = 130k
+    _msg(c, session_id="nt2", uuid="fb", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc=None, entry_type="assistant",
+         text="fb", model=_MODEL, msg_id="mb", req_id="rb",
+         blocks_json=_json.dumps([{"kind": "text", "text": "fb"}]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="mb", req_id="rb", inp=10, out=20, cc=140_000, cr=0)
+    # real-ts prime, rm -> 130k (independent prime->collapse pair)
+    _msg(c, session_id="nt2", uuid="p1", source_path="a.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="p", model=_MODEL, msg_id="pm1", req_id="pr1",
+         blocks_json=_json.dumps([{"kind": "text", "text": "p"}]))
+    _entry(c, source_path="a.jsonl", line_offset=2, model=_MODEL,
+           msg_id="pm1", req_id="pr1", inp=10, out=20, cc=1_000, cr=130_000)
+    # failure A: ts SET, lost = min(140k, 130k-0) = 130k (same wasted as B)
+    _msg(c, session_id="nt2", uuid="fa", source_path="a.jsonl", byte_offset=3,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="assistant",
+         text="fa", model=_MODEL, msg_id="ma", req_id="ra",
+         blocks_json=_json.dumps([{"kind": "text", "text": "fa"}]))
+    _entry(c, source_path="a.jsonl", line_offset=3, model=_MODEL,
+           msg_id="ma", req_id="ra", inp=10, out=20, cc=140_000, cr=0)
+    rb = cq.get_conversation_outline(c, "nt2")["stats"]["cache_failures"]["rebuilds"]
+    assert len(rb) == 2
+    assert rb[0]["est_wasted_usd"] == rb[1]["est_wasted_usd"]    # tie
+    assert rb[0]["uuid"] == "fa" and rb[0]["ts"] is not None     # ts-set first
+    assert rb[1]["uuid"] == "fb" and rb[1]["ts"] is None         # null-ts last

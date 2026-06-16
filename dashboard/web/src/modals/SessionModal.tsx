@@ -282,7 +282,10 @@ function SessionContent({ detail }: { detail: SessionDetail }) {
         ))}
       </div>
 
-      <CacheRebuildsSection sessionId={detail.session_id ?? null} />
+      <CacheRebuildsSection
+        key={detail.session_id ?? 'no-session'}
+        sessionId={detail.session_id ?? null}
+      />
 
       {!emptyModels ? (
         <>
