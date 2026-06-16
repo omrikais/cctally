@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Dashboard conversation viewer — Claude Code's new subagent transcript format:** restored correct rendering after Claude Code moved subagent transcripts to `subagents/agent-*.jsonl` with `Agent`-renamed spawns and null cross-file parent links. Background (async) subagent cards now show completion (✓) with token/duration/tool counts — derived from the subagent's own thread and marked with a `~` when Claude Code provided none; nested subagents render as recursive nested cards, each shown exactly once with the spawning tool chip merged in (a grandchild no longer renders as a detached title-only card plus a stray `Agent` chip); and a skill invoked inside a live-watched subagent now appears without a manual page refresh (the live-tail re-fetches a small overlap window and upserts folded-in content). All read-time over the existing cache — no migration, no re-ingest.
+
 ### Security
 - **Internal (build/test-time only, no user-facing change): bumped the dashboard's dev dependencies to clear three Dependabot advisories** — `vite` 8.0.10 → 8.0.16 (fixes a `server.fs.deny` bypass and an NTLMv2 hash disclosure, both Windows + dev-server only) and the test-only transitive `form-data` 4.0.5 → 4.0.6 (CRLF injection via unescaped multipart field names). None of these packages ship to installed users — the npm/brew artifacts carry only the Python CLI plus the pre-built `dashboard/static/` bundle, never `node_modules` — so there is no runtime exposure; the bundle was rebuilt against the new `vite` and all dashboard tests pass.
 
