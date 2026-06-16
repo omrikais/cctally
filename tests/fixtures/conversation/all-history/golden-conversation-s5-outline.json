@@ -1,6 +1,7 @@
 {
   "session_id": "s5",
   "stats": {
+    "cache_saved_usd": 0.0,
     "cost_usd": 0.99,
     "duration_seconds": 2,
     "error_count": 0,

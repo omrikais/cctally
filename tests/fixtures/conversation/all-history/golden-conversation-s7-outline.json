@@ -4,8 +4,25 @@
     "cache_failures": {
       "count": 2,
       "est_wasted_usd": 1.17875,
+      "rebuilds": [
+        {
+          "est_wasted_usd": 0.7475,
+          "subagent_key": null,
+          "tokens_recreated": 130000,
+          "ts": "2026-06-07T00:00:03Z",
+          "uuid": "s7a3"
+        },
+        {
+          "est_wasted_usd": 0.43125,
+          "subagent_key": "dddd4444",
+          "tokens_recreated": 75000,
+          "ts": "2026-06-07T00:00:05Z",
+          "uuid": "s7g2"
+        }
+      ],
       "tokens_recreated": 205000
     },
+    "cache_saved_usd": 0.9675,
     "cost_usd": 2.02275,
     "duration_seconds": 5,
     "error_count": 0,
