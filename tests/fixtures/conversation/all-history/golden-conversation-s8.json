@@ -1,0 +1,501 @@
+{
+  "cost_usd": 0.04675,
+  "git_branch": "main",
+  "items": [
+    {
+      "anchor": {
+        "id": 33,
+        "session_id": "s8",
+        "uuid": "s8h1"
+      },
+      "blocks": [],
+      "is_sidechain": false,
+      "kind": "human",
+      "member_uuids": [
+        "s8h1"
+      ],
+      "parent_uuid": null,
+      "subagent_key": null,
+      "text": "run the nested + async + truncated audits",
+      "ts": "2026-06-08T00:00:00Z"
+    },
+    {
+      "anchor": {
+        "id": 34,
+        "session_id": "s8",
+        "uuid": "s8a1"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "spawning four subagents"
+        },
+        {
+          "input": {
+            "description": "Sync audit",
+            "prompt": "Audit synchronously",
+            "subagent_type": "code-reviewer"
+          },
+          "input_summary": "{\"description\":\"Sync audit\",\"subagent_type\":\"code-reviewer\"}",
+          "kind": "tool_call",
+          "name": "Agent",
+          "preview": "Sync audit",
+          "result": {
+            "full_length": null,
+            "is_error": false,
+            "text": "sync audit done",
+            "truncated": false
+          },
+          "tool_use_id": "toolu_child"
+        },
+        {
+          "input": {
+            "description": "Background audit",
+            "prompt": "Audit in the background",
+            "subagent_type": "Explore"
+          },
+          "input_summary": "{\"description\":\"Background audit\",\"subagent_type\":\"Explore\"}",
+          "kind": "tool_call",
+          "name": "Agent",
+          "preview": "Background audit",
+          "result": {
+            "full_length": null,
+            "is_error": false,
+            "text": "Launched background agent a55c0003",
+            "truncated": false
+          },
+          "tool_use_id": "toolu_async"
+        },
+        {
+          "input": {
+            "description": "Clipped-usage audit",
+            "prompt": "Audit with a clipped usage tail",
+            "subagent_type": "grounding"
+          },
+          "input_summary": "{\"description\":\"Clipped-usage audit\",\"subagent_type\":\"grounding\"}",
+          "kind": "tool_call",
+          "name": "Agent",
+          "preview": "Clipped-usage audit",
+          "result": {
+            "full_length": null,
+            "is_error": false,
+            "text": "partial audit output before the usage tail was clipped\nagentId: b0c40004 (use SendMessage with to: 'b0c40004' to continue this agent)\n<usage>subagent_tokens: 740",
+            "truncated": true
+          },
+          "tool_use_id": "toolu_trunc1"
+        },
+        {
+          "input": {
+            "description": "Clipped-agentId audit",
+            "prompt": "Audit clipped before its agentId line",
+            "subagent_type": "grounding"
+          },
+          "input_summary": "{\"description\":\"Clipped-agentId audit\",\"subagent_type\":\"grounding\"}",
+          "kind": "tool_call",
+          "name": "Agent",
+          "preview": "Clipped-agentId audit",
+          "result": {
+            "full_length": null,
+            "is_error": false,
+            "text": "partial audit output that was clipped mid-stream before",
+            "truncated": true
+          },
+          "tool_use_id": "toolu_trunc2"
+        }
+      ],
+      "cost_usd": 0.00925,
+      "is_sidechain": false,
+      "kind": "assistant",
+      "member_uuids": [
+        "s8a1",
+        "tr_child",
+        "tr_async",
+        "tr_trunc1",
+        "tr_trunc2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s8h1",
+      "subagent_key": null,
+      "text": "spawning four subagents",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 600,
+        "output": 250
+      },
+      "ts": "2026-06-08T00:00:01Z"
+    },
+    {
+      "anchor": {
+        "id": 40,
+        "session_id": "s8",
+        "uuid": "ch_h"
+      },
+      "blocks": [],
+      "is_sidechain": true,
+      "kind": "human",
+      "member_uuids": [
+        "ch_h"
+      ],
+      "parent_uuid": null,
+      "subagent_key": "cc110001",
+      "text": "Sync audit",
+      "ts": "2026-06-08T00:00:06Z"
+    },
+    {
+      "anchor": {
+        "id": 41,
+        "session_id": "s8",
+        "uuid": "ch_a1"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "spawning a grounding grandchild"
+        },
+        {
+          "input": {
+            "description": "Ground claims",
+            "prompt": "Ground the doc claims against code",
+            "subagent_type": "grounding"
+          },
+          "input_summary": "{\"description\":\"Ground claims\",\"subagent_type\":\"grounding\"}",
+          "kind": "tool_call",
+          "name": "Agent",
+          "preview": "Ground claims",
+          "result": {
+            "full_length": null,
+            "is_error": false,
+            "text": "Grounded all six doc claims against the code; three needed edits.\nagentId: ace20002 (use SendMessage with to: 'ace20002' to continue this agent)\n<usage>subagent_tokens: 8400\ntool_uses: 5\nduration_ms: 9100</usage>",
+            "truncated": false
+          },
+          "tool_use_id": "toolu_gc"
+        }
+      ],
+      "cost_usd": 0.005,
+      "is_sidechain": true,
+      "kind": "assistant",
+      "member_uuids": [
+        "ch_a1",
+        "tr_gc"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "ch_h",
+      "subagent_key": "cc110001",
+      "text": "spawning a grounding grandchild",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 400,
+        "output": 120
+      },
+      "ts": "2026-06-08T00:00:07Z"
+    },
+    {
+      "anchor": {
+        "id": 43,
+        "session_id": "s8",
+        "uuid": "gc_h"
+      },
+      "blocks": [],
+      "is_sidechain": true,
+      "kind": "human",
+      "member_uuids": [
+        "gc_h"
+      ],
+      "parent_uuid": null,
+      "subagent_key": "ace20002",
+      "text": "Ground claims",
+      "ts": "2026-06-08T00:00:09Z"
+    },
+    {
+      "anchor": {
+        "id": 44,
+        "session_id": "s8",
+        "uuid": "gc_a1"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "three claims needed edits"
+        }
+      ],
+      "cost_usd": 0.00375,
+      "is_sidechain": true,
+      "kind": "assistant",
+      "member_uuids": [
+        "gc_a1"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "gc_h",
+      "subagent_key": "ace20002",
+      "text": "three claims needed edits",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 300,
+        "output": 90
+      },
+      "ts": "2026-06-08T00:00:10Z"
+    },
+    {
+      "anchor": {
+        "id": 45,
+        "session_id": "s8",
+        "uuid": "as_h"
+      },
+      "blocks": [],
+      "is_sidechain": true,
+      "kind": "human",
+      "member_uuids": [
+        "as_h"
+      ],
+      "parent_uuid": null,
+      "subagent_key": "a55c0003",
+      "text": "Background audit",
+      "ts": "2026-06-08T00:00:11Z"
+    },
+    {
+      "anchor": {
+        "id": 46,
+        "session_id": "s8",
+        "uuid": "as_a1"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "reading the module"
+        },
+        {
+          "input": {
+            "file_path": "/home/u/proj/mod.py"
+          },
+          "input_summary": "{\"file_path\":\"/home/u/proj/mod.py\"}",
+          "kind": "tool_call",
+          "name": "Read",
+          "preview": "/home/u/proj/mod.py",
+          "result": null,
+          "tool_use_id": "toolu_as_read"
+        }
+      ],
+      "cost_usd": 0.0125,
+      "is_sidechain": true,
+      "kind": "assistant",
+      "member_uuids": [
+        "as_a1"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "as_h",
+      "subagent_key": "a55c0003",
+      "text": "reading the module",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 1000,
+        "output": 300
+      },
+      "ts": "2026-06-08T00:00:12Z"
+    },
+    {
+      "anchor": {
+        "id": 47,
+        "session_id": "s8",
+        "uuid": "as_a2"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "background audit clean"
+        }
+      ],
+      "cost_usd": 0.009,
+      "is_sidechain": true,
+      "kind": "assistant",
+      "member_uuids": [
+        "as_a2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "as_a1",
+      "subagent_key": "a55c0003",
+      "text": "background audit clean",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 800,
+        "output": 200
+      },
+      "ts": "2026-06-08T00:00:15Z"
+    },
+    {
+      "anchor": {
+        "id": 39,
+        "session_id": "s8",
+        "uuid": "s8notif"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "<task-notification><task-id>a55c0003</task-id><tool-use-id>toolu_async</tool-use-id><status>completed</status><summary>Background audit finished</summary><result>module clean</result></task-notification>"
+        }
+      ],
+      "is_sidechain": false,
+      "kind": "meta",
+      "member_uuids": [
+        "s8notif"
+      ],
+      "meta_kind": "notification",
+      "parent_uuid": "s8a1",
+      "skill_name": null,
+      "subagent_key": null,
+      "text": "<task-notification><task-id>a55c0003</task-id><tool-use-id>toolu_async</tool-use-id><status>completed</status><summary>Background audit finished</summary><result>module clean</result></task-notification>",
+      "ts": "2026-06-08T00:00:18Z"
+    },
+    {
+      "anchor": {
+        "id": 48,
+        "session_id": "s8",
+        "uuid": "tr4_h"
+      },
+      "blocks": [],
+      "is_sidechain": true,
+      "kind": "human",
+      "member_uuids": [
+        "tr4_h"
+      ],
+      "parent_uuid": null,
+      "subagent_key": "b0c40004",
+      "text": "Clipped-usage audit",
+      "ts": "2026-06-08T00:00:30Z"
+    },
+    {
+      "anchor": {
+        "id": 49,
+        "session_id": "s8",
+        "uuid": "tr4_a1"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "grepping the tree"
+        },
+        {
+          "input": {
+            "pattern": "reset"
+          },
+          "input_summary": "{\"pattern\":\"reset\"}",
+          "kind": "tool_call",
+          "name": "Grep",
+          "preview": "reset",
+          "result": null,
+          "tool_use_id": "toolu_tr4_grep"
+        }
+      ],
+      "cost_usd": 0.005,
+      "is_sidechain": true,
+      "kind": "assistant",
+      "member_uuids": [
+        "tr4_a1"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "tr4_h",
+      "subagent_key": "b0c40004",
+      "text": "grepping the tree",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 500,
+        "output": 100
+      },
+      "ts": "2026-06-08T00:00:31Z"
+    },
+    {
+      "anchor": {
+        "id": 50,
+        "session_id": "s8",
+        "uuid": "tr4_a2"
+      },
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "clipped-usage audit clean"
+        }
+      ],
+      "cost_usd": 0.00225,
+      "is_sidechain": true,
+      "kind": "assistant",
+      "member_uuids": [
+        "tr4_a2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "tr4_a1",
+      "subagent_key": "b0c40004",
+      "text": "clipped-usage audit clean",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 200,
+        "output": 50
+      },
+      "ts": "2026-06-08T00:00:33Z"
+    }
+  ],
+  "last_activity_utc": "2026-06-08T00:00:33Z",
+  "models": [
+    "claude-opus-4-8"
+  ],
+  "page": {
+    "has_more": false,
+    "next_after": null
+  },
+  "project_label": "proj",
+  "session_id": "s8",
+  "started_utc": "2026-06-08T00:00:00Z",
+  "subagent_meta": {
+    "a55c0003": {
+      "description": "Background audit",
+      "kind": "Explore",
+      "parent_subagent_key": null,
+      "spawn_tool_use_id": "toolu_async",
+      "spawn_uuid": "s8a1",
+      "status": "completed",
+      "total_duration_ms": 4000,
+      "total_tokens": 2300,
+      "total_tool_use_count": 1,
+      "totals_derived": true
+    },
+    "ace20002": {
+      "description": "Ground claims",
+      "kind": "grounding",
+      "parent_subagent_key": "cc110001",
+      "spawn_tool_use_id": "toolu_gc",
+      "spawn_uuid": "ch_a1",
+      "status": "completed",
+      "total_duration_ms": 9100,
+      "total_tokens": 8400,
+      "total_tool_use_count": 5
+    },
+    "b0c40004": {
+      "description": "Clipped-usage audit",
+      "kind": "grounding",
+      "parent_subagent_key": null,
+      "spawn_tool_use_id": "toolu_trunc1",
+      "spawn_uuid": "s8a1",
+      "total_duration_ms": 3000,
+      "total_tokens": 850,
+      "total_tool_use_count": 1,
+      "totals_derived": true
+    },
+    "cc110001": {
+      "description": "Sync audit",
+      "kind": "code-reviewer",
+      "parent_subagent_key": null,
+      "spawn_tool_use_id": "toolu_child",
+      "spawn_uuid": "s8a1",
+      "status": "completed",
+      "total_duration_ms": 7000,
+      "total_tokens": 12000,
+      "total_tool_use_count": 3
+    }
+  },
+  "title": "run the nested + async + truncated audits"
+}

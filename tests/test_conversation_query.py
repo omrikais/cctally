@@ -924,10 +924,16 @@ def test_subagent_meta_empty_meta_kind_only():
                  "is_error": False, "tool_use_id": "t1",
                  "agent_id": "aaaa1111", "subagent_meta": {}}])
     out = cq.get_conversation(conn, "s1")
-    assert out["subagent_meta"] == {"aaaa1111": {"kind": "Explore"}}
+    # §4 1b adds parent linkage to EVERY linked spawn (additive): the holding
+    # item is the main turn a1 (subagent_key=None, anchor uuid a1), the spawn id
+    # is t1. No aaaa1111 thread bucket exists here, so 1c derives nothing.
+    assert out["subagent_meta"] == {"aaaa1111": {
+        "kind": "Explore", "parent_subagent_key": None,
+        "spawn_uuid": "a1", "spawn_tool_use_id": "t1"}}
     entry = out["subagent_meta"]["aaaa1111"]
     assert "total_tokens" not in entry and "total_duration_ms" not in entry
     assert "total_tool_use_count" not in entry and "status" not in entry
+    assert "totals_derived" not in entry
 
 
 def test_subagent_meta_happy_path_and_block_keys_stripped():
@@ -948,9 +954,14 @@ def test_subagent_meta_happy_path_and_block_keys_stripped():
                                    "total_tool_use_count": 1,
                                    "status": "completed"}}])
     out = cq.get_conversation(conn, "s1")
+    # §4 1b adds the parent-linkage fields (additive) to the authoritative-totals
+    # entry; status/totals stay authoritative (no totals_derived).
     assert out["subagent_meta"] == {"aaaa1111": {
         "kind": "Explore", "total_tokens": 23285, "total_duration_ms": 10668,
-        "total_tool_use_count": 1, "status": "completed"}}
+        "total_tool_use_count": 1, "status": "completed",
+        "parent_subagent_key": None, "spawn_uuid": "a1",
+        "spawn_tool_use_id": "t1"}}
+    assert "totals_derived" not in out["subagent_meta"]["aaaa1111"]
     # the spawn folded its result into a tool_call; NO parser-only keys leak on
     # any block of any item.
     items = out["items"]

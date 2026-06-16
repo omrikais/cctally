@@ -1,6 +1,19 @@
 {
   "conversations": [
     {
+      "cost_usd": 0.04675,
+      "git_branch": "main",
+      "last_activity_utc": "2026-06-08T00:00:33Z",
+      "models": [
+        "claude-opus-4-8"
+      ],
+      "msg_count": 18,
+      "project_label": "proj",
+      "session_id": "s8",
+      "started_utc": "2026-06-08T00:00:00Z",
+      "title": "run the nested + async + truncated audits"
+    },
+    {
       "cost_usd": 2.02275,
       "git_branch": "main",
       "last_activity_utc": "2026-06-07T00:00:05Z",

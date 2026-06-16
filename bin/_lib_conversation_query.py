@@ -272,6 +272,56 @@ def _subagent_key(source_path):
     return stem or None
 
 
+# §4 1a — nested (grandchild) subagent result parse. The new Claude Code format
+# emits a grandchild's spawn result as STRING content (no structured
+# `agent_id`/`subagent_meta`), with a trailing `agentId: <hash> (use SendMessage
+# …)` line and an OPTIONAL `<usage>` totals wrapper. Anchored on the literal
+# `<usage>` wrapper; tolerant of whitespace/newline variants (re.DOTALL).
+_NESTED_AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-f]+)")
+_NESTED_USAGE_RE = re.compile(
+    r"<usage>\s*subagent_tokens:\s*(\d+)\s*tool_uses:\s*(\d+)\s*duration_ms:\s*(\d+)\s*</usage>",
+    re.DOTALL,
+)
+
+
+def _parse_nested_agent_result(text):
+    """Nested (grandchild) subagent result: string-content, no structured
+    `agentId` (spec §4 1a). Parse `agentId` (+ OPTIONAL `<usage>` totals) out of
+    the result text. Returns (agent_id, meta) — meta is {} when `<usage>` is
+    absent/clipped past the 16 KB cap, populated with completed totals when
+    present. Returns None when no `agentId` is present (an ordinary result, or a
+    >16 KB clip past the `agentId:` line itself — degrades to a flat card, no
+    mis-link). Linking on `agentId` ALONE is sufficient (Codex P1-B)."""
+    if not text:
+        return None
+    m = _NESTED_AGENT_ID_RE.search(text)
+    if not m:
+        return None
+    meta = {}
+    u = _NESTED_USAGE_RE.search(text)
+    if u:
+        meta["total_tokens"] = int(u.group(1))
+        meta["total_tool_use_count"] = int(u.group(2))
+        meta["total_duration_ms"] = int(u.group(3))
+        meta["status"] = "completed"
+    return m.group(1), meta
+
+
+def _iso_ms(ts):
+    """Epoch milliseconds for an ISO-8601 timestamp string (tolerant of a
+    trailing 'Z'); None on parse failure. Used by §4 1c derived-duration."""
+    if not ts:
+        return None
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (ValueError, TypeError):
+        return None
+
+
 def _entry_cost(model, inp, out, cc, cr, cost_usd_raw) -> float:
     """Cost for one session_entries row via the shared pricing helper. Tokens →
     the helper's usage dict. cost_usd_raw is passed as the optional override the
@@ -758,6 +808,9 @@ def _assemble_session(conn, session_id):
     spawn_kind = {}     # tool_use id -> subagent_type
     spawn_desc = {}     # tool_use id -> spawning Task description (#193)
     agent_link = {}     # tool_use id -> (agent_id, raw_meta)
+    nested_candidates = []  # §4 1a: (tool_use_id, block) — string-content spawn
+                            # results with no structured agent_id, resolved after
+                            # spawn_kind is complete (text still present pre-fold)
     ask_link = {}       # tool_use id -> (answers, annotations)  (#177 S2)
     bash_link = {}      # tool_use id -> (stderr, interrupted)   (#177 S3)
     web_search_link = {}  # tool_use id -> web_search payload    (#177 S4)
@@ -782,6 +835,11 @@ def _assemble_session(conn, session_id):
                 meta = b.pop("subagent_meta", None)
                 if aid and b.get("tool_use_id") is not None:
                     agent_link[b["tool_use_id"]] = (aid, meta or {})
+                elif b.get("tool_use_id") is not None:
+                    # §4 1a candidate — a tool_result with no structured agentId.
+                    # Resolved AFTER spawn_kind is complete (text still present,
+                    # pre-Phase-2-fold). The block's `text` holds the result body.
+                    nested_candidates.append((b["tool_use_id"], b))
                 ans = b.pop("ask_answers", None)            # #177 S2
                 anno = b.pop("ask_annotations", None)
                 if ans is not None and b.get("tool_use_id") is not None:
@@ -800,6 +858,14 @@ def _assemble_session(conn, session_id):
                 tlist_ = b.pop("task_list", None)
                 if b.get("tool_use_id") is not None and (tid_ is not None or tlist_ is not None):
                     task_link[b["tool_use_id"]] = {"task_id": tid_, "task_list": tlist_}
+    # §4 1a — nested grandchild results: gate the text-parse on the owning
+    # tool_use being a spawn (in spawn_kind), so an ordinary tool result that
+    # merely mentions "agentId" never matches.
+    for _tuid, _block in nested_candidates:
+        if _tuid in spawn_kind and _tuid not in agent_link:
+            parsed = _parse_nested_agent_result(_block.get("text"))
+            if parsed is not None:
+                agent_link[_tuid] = parsed
     subagent_meta = {}
     for _tuid, _kind in spawn_kind.items():
         _link = agent_link.get(_tuid)
@@ -813,6 +879,24 @@ def _assemble_session(conn, session_id):
             if _raw.get(_f) is not None:
                 _entry[_f] = _raw[_f]
         subagent_meta[_aid] = _entry       # agent_id == subagent_key
+
+    # §4 1b — parent linkage: the item HOLDING each linked spawn is the child's
+    # parent thread + placement anchor. tooluse_index[spawn_id] = (item, block);
+    # the item's subagent_key/anchor.uuid were set at build time (available now,
+    # pre-Phase-3). Works for a main parent (subagent_key=None) AND a grandchild
+    # whose parent is a child subagent. spawn_tool_use_id is required because one
+    # assistant item can hold MORE than one spawn (Codex P1-C).
+    for _tuid, (_aid, _raw) in agent_link.items():
+        _entry = subagent_meta.get(_aid)
+        if _entry is None:
+            continue
+        _hit = tooluse_index.get(_tuid)
+        if _hit is None:
+            continue
+        _owner = _hit[0]
+        _entry["parent_subagent_key"] = _owner["subagent_key"]
+        _entry["spawn_uuid"] = _owner["anchor"]["uuid"]
+        _entry["spawn_tool_use_id"] = _tuid
 
     # ---- Phase 2: fold each tool_result item into its owning assistant item ----
     drop = set()                                 # id() of folded placeholder items
@@ -986,6 +1070,59 @@ def _assemble_session(conn, session_id):
             del it["_req_id"]
             it.pop("_has_prose", None)
     header_cost = round(header_cost, 6)
+
+    # §4 1c — async completion. A background subagent's launch result carries
+    # status:"async_launched" and NO totals; completion arrives as a separate
+    # <task-notification> meta row (text populated by Phase 4). Join it back, and
+    # derive any totals Claude Code never provided from the child's own thread.
+    _notif_status = {}                       # spawn tool_use_id -> status
+    for it in items:
+        if it["kind"] == "meta" and it.get("meta_kind") == "notification":
+            body = it.get("text") or ""
+            tu = re.search(r"<tool-use-id>([^<]+)</tool-use-id>", body)
+            stx = re.search(r"<status>([^<]+)</status>", body)
+            if tu and stx:
+                _notif_status[tu.group(1).strip()] = stx.group(1).strip()
+    for _tuid, _status in _notif_status.items():
+        _link = agent_link.get(_tuid)
+        if _link is not None and _link[0] in subagent_meta:
+            subagent_meta[_link[0]]["status"] = _status   # upgrades async_launched -> completed
+
+    # Derived totals: any child still missing a count gets it from its own
+    # subagent_key bucket. tool-count = tool_call/tool_use blocks; duration =
+    # (max_ts - min_ts) ms; tokens = sum of per-turn token totals (now stamped).
+    # Authoritative values always win; only missing keys are filled.
+    for _aid, _entry in subagent_meta.items():
+        if all(_entry.get(_f) is not None
+               for _f in ("total_tokens", "total_duration_ms", "total_tool_use_count")):
+            continue
+        _bucket = [it for it in items if it.get("subagent_key") == _aid]
+        if not _bucket:
+            continue
+        _derived = False
+        if _entry.get("total_tool_use_count") is None:
+            _entry["total_tool_use_count"] = sum(
+                1 for it in _bucket for b in it["blocks"]
+                if b.get("kind") in ("tool_call", "tool_use"))
+            _derived = True
+        if _entry.get("total_duration_ms") is None:
+            _ms = [m for m in (_iso_ms(it.get("ts")) for it in _bucket) if m is not None]
+            if len(_ms) >= 2:
+                _entry["total_duration_ms"] = max(_ms) - min(_ms)
+                _derived = True
+        if _entry.get("total_tokens") is None:
+            _tok, _any = 0, False
+            for it in _bucket:
+                t = it.get("tokens")
+                if t:
+                    _any = True
+                    _tok += (t.get("input", 0) + t.get("output", 0)
+                             + t.get("cache_creation", 0) + t.get("cache_read", 0))
+            if _any:
+                _entry["total_tokens"] = _tok
+                _derived = True
+        if _derived:
+            _entry["totals_derived"] = True
 
     # Stamp cache-failure markers (spec §1) AFTER tokens are on each item and
     # while `items` is still document-ordered (the running-max walk is

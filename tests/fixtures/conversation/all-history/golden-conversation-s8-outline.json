@@ -1,0 +1,327 @@
+{
+  "session_id": "s8",
+  "stats": {
+    "cache_saved_usd": 0.0,
+    "cost_usd": 0.04675,
+    "duration_seconds": 33,
+    "error_count": 0,
+    "models": {
+      "claude-opus-4-8": 7
+    },
+    "tokens": {
+      "cache_creation": 0,
+      "cache_read": 0,
+      "input": 3800,
+      "output": 1110
+    },
+    "tool_counts": {
+      "Agent": 5,
+      "Grep": 1,
+      "Read": 1
+    },
+    "turns": {
+      "assistant": 7,
+      "human": 5,
+      "meta": 1,
+      "tool_result": 0,
+      "total": 13
+    }
+  },
+  "subagent_meta": {
+    "a55c0003": {
+      "description": "Background audit",
+      "kind": "Explore",
+      "parent_subagent_key": null,
+      "spawn_tool_use_id": "toolu_async",
+      "spawn_uuid": "s8a1",
+      "status": "completed",
+      "total_duration_ms": 4000,
+      "total_tokens": 2300,
+      "total_tool_use_count": 1,
+      "totals_derived": true
+    },
+    "ace20002": {
+      "description": "Ground claims",
+      "kind": "grounding",
+      "parent_subagent_key": "cc110001",
+      "spawn_tool_use_id": "toolu_gc",
+      "spawn_uuid": "ch_a1",
+      "status": "completed",
+      "total_duration_ms": 9100,
+      "total_tokens": 8400,
+      "total_tool_use_count": 5
+    },
+    "b0c40004": {
+      "description": "Clipped-usage audit",
+      "kind": "grounding",
+      "parent_subagent_key": null,
+      "spawn_tool_use_id": "toolu_trunc1",
+      "spawn_uuid": "s8a1",
+      "total_duration_ms": 3000,
+      "total_tokens": 850,
+      "total_tool_use_count": 1,
+      "totals_derived": true
+    },
+    "cc110001": {
+      "description": "Sync audit",
+      "kind": "code-reviewer",
+      "parent_subagent_key": null,
+      "spawn_tool_use_id": "toolu_child",
+      "spawn_uuid": "s8a1",
+      "status": "completed",
+      "total_duration_ms": 7000,
+      "total_tokens": 12000,
+      "total_tool_use_count": 3
+    }
+  },
+  "turns": [
+    {
+      "is_sidechain": false,
+      "kind": "human",
+      "label": "run the nested + async + truncated audits",
+      "member_uuids": [
+        "s8h1"
+      ],
+      "parent_uuid": null,
+      "subagent_key": null,
+      "ts": "2026-06-08T00:00:00Z",
+      "uuid": "s8h1"
+    },
+    {
+      "is_sidechain": false,
+      "kind": "assistant",
+      "label": "spawning four subagents",
+      "member_uuids": [
+        "s8a1",
+        "tr_child",
+        "tr_async",
+        "tr_trunc1",
+        "tr_trunc2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "s8h1",
+      "subagent_key": null,
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 600,
+        "output": 250
+      },
+      "tools": [
+        {
+          "is_error": false,
+          "name": "Agent"
+        },
+        {
+          "is_error": false,
+          "name": "Agent"
+        },
+        {
+          "is_error": false,
+          "name": "Agent"
+        },
+        {
+          "is_error": false,
+          "name": "Agent"
+        }
+      ],
+      "ts": "2026-06-08T00:00:01Z",
+      "uuid": "s8a1"
+    },
+    {
+      "is_sidechain": true,
+      "kind": "human",
+      "label": "Sync audit",
+      "member_uuids": [
+        "ch_h"
+      ],
+      "parent_uuid": null,
+      "subagent_key": "cc110001",
+      "ts": "2026-06-08T00:00:06Z",
+      "uuid": "ch_h"
+    },
+    {
+      "is_sidechain": true,
+      "kind": "assistant",
+      "label": "spawning a grounding grandchild",
+      "member_uuids": [
+        "ch_a1",
+        "tr_gc"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "ch_h",
+      "subagent_key": "cc110001",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 400,
+        "output": 120
+      },
+      "tools": [
+        {
+          "is_error": false,
+          "name": "Agent"
+        }
+      ],
+      "ts": "2026-06-08T00:00:07Z",
+      "uuid": "ch_a1"
+    },
+    {
+      "is_sidechain": true,
+      "kind": "human",
+      "label": "Ground claims",
+      "member_uuids": [
+        "gc_h"
+      ],
+      "parent_uuid": null,
+      "subagent_key": "ace20002",
+      "ts": "2026-06-08T00:00:09Z",
+      "uuid": "gc_h"
+    },
+    {
+      "is_sidechain": true,
+      "kind": "assistant",
+      "label": "three claims needed edits",
+      "member_uuids": [
+        "gc_a1"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "gc_h",
+      "subagent_key": "ace20002",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 300,
+        "output": 90
+      },
+      "ts": "2026-06-08T00:00:10Z",
+      "uuid": "gc_a1"
+    },
+    {
+      "is_sidechain": true,
+      "kind": "human",
+      "label": "Background audit",
+      "member_uuids": [
+        "as_h"
+      ],
+      "parent_uuid": null,
+      "subagent_key": "a55c0003",
+      "ts": "2026-06-08T00:00:11Z",
+      "uuid": "as_h"
+    },
+    {
+      "is_sidechain": true,
+      "kind": "assistant",
+      "label": "reading the module",
+      "member_uuids": [
+        "as_a1"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "as_h",
+      "subagent_key": "a55c0003",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 1000,
+        "output": 300
+      },
+      "tools": [
+        {
+          "is_error": false,
+          "name": "Read"
+        }
+      ],
+      "ts": "2026-06-08T00:00:12Z",
+      "uuid": "as_a1"
+    },
+    {
+      "is_sidechain": true,
+      "kind": "assistant",
+      "label": "background audit clean",
+      "member_uuids": [
+        "as_a2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "as_a1",
+      "subagent_key": "a55c0003",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 800,
+        "output": 200
+      },
+      "ts": "2026-06-08T00:00:15Z",
+      "uuid": "as_a2"
+    },
+    {
+      "is_sidechain": false,
+      "kind": "meta",
+      "label": "<task-notification><task-id>a55c0003</task-id><tool-use-id>toolu_async</tool-use-id><status>completed</status><summary>B",
+      "member_uuids": [
+        "s8notif"
+      ],
+      "meta_kind": "notification",
+      "parent_uuid": "s8a1",
+      "skill_name": null,
+      "subagent_key": null,
+      "ts": "2026-06-08T00:00:18Z",
+      "uuid": "s8notif"
+    },
+    {
+      "is_sidechain": true,
+      "kind": "human",
+      "label": "Clipped-usage audit",
+      "member_uuids": [
+        "tr4_h"
+      ],
+      "parent_uuid": null,
+      "subagent_key": "b0c40004",
+      "ts": "2026-06-08T00:00:30Z",
+      "uuid": "tr4_h"
+    },
+    {
+      "is_sidechain": true,
+      "kind": "assistant",
+      "label": "grepping the tree",
+      "member_uuids": [
+        "tr4_a1"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "tr4_h",
+      "subagent_key": "b0c40004",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 500,
+        "output": 100
+      },
+      "tools": [
+        {
+          "is_error": false,
+          "name": "Grep"
+        }
+      ],
+      "ts": "2026-06-08T00:00:31Z",
+      "uuid": "tr4_a1"
+    },
+    {
+      "is_sidechain": true,
+      "kind": "assistant",
+      "label": "clipped-usage audit clean",
+      "member_uuids": [
+        "tr4_a2"
+      ],
+      "model": "claude-opus-4-8",
+      "parent_uuid": "tr4_a1",
+      "subagent_key": "b0c40004",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_read": 0,
+        "input": 200,
+        "output": 50
+      },
+      "ts": "2026-06-08T00:00:33Z",
+      "uuid": "tr4_a2"
+    }
+  ]
+}

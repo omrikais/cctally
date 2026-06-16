@@ -232,6 +232,9 @@
     "aaaa1111": {
       "description": "Audit module A",
       "kind": "Explore",
+      "parent_subagent_key": null,
+      "spawn_tool_use_id": "toolu_a",
+      "spawn_uuid": "s3a1",
       "status": "completed",
       "total_duration_ms": 10668,
       "total_tokens": 23285,
@@ -240,6 +243,9 @@
     "bbbb2222": {
       "description": "Audit module B",
       "kind": "code-reviewer",
+      "parent_subagent_key": null,
+      "spawn_tool_use_id": "toolu_b",
+      "spawn_uuid": "s3a1",
       "status": "error",
       "total_duration_ms": 4200,
       "total_tokens": 5120,

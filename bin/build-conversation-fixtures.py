@@ -211,6 +211,17 @@ def build(scenario: str) -> None:
     s7_file = "/fake/projects/proj/s7.jsonl"
     s7_agent = "/fake/projects/proj/agent-dddd4444.jsonl"
     s7_cwd = "/home/u/proj"
+    # s8 — the new subagent format (spec §4): a nested grandchild (string-content
+    # result with agentId+<usage>), an async subagent (launch result + a
+    # <task-notification>), and two truncated-result variants ((i) <usage>
+    # clipped -> links + derived totals; (ii) agentId clipped -> flat card). The
+    # main turn s8a1 holds FOUR spawns in one item (Codex P1-C two-spawn case).
+    s8_main = "/fake/projects/proj/s8.jsonl"
+    s8_agent_child = "/fake/projects/proj/agent-cc110001.jsonl"   # child subagent
+    s8_agent_gchild = "/fake/projects/proj/agent-ace20002.jsonl"  # grandchild
+    s8_agent_async = "/fake/projects/proj/agent-a55c0003.jsonl"   # background subagent
+    s8_agent_trunc = "/fake/projects/proj/agent-b0c40004.jsonl"   # truncated-(i) child
+    s8_cwd = "/home/u/proj"
 
     cache_conn = sqlite3.connect(cache_path)
     stats_conn = sqlite3.connect(stats_path)
@@ -240,6 +251,10 @@ def build(scenario: str) -> None:
                           project_path=s7_cwd)
         seed_session_file(cache_conn, path=s7_agent, session_id="s7",
                           project_path=s7_cwd)
+        for _p in (s8_main, s8_agent_child, s8_agent_gchild,
+                   s8_agent_async, s8_agent_trunc):
+            seed_session_file(cache_conn, path=_p, session_id="s8",
+                              project_path=s8_cwd)
 
         # --- session s1: human prompt + multi-fragment assistant turn --------
         # id=1: human prompt.
@@ -800,6 +815,301 @@ def build(scenario: str) -> None:
                            msg_id="m7e", req_id="r7e", input_tokens=10,
                            output_tokens=20, cache_create=120000,
                            cache_read=5000)            # SUBAGENT FAILURE
+
+        # --- session s8: the new subagent format (spec §4) -------------------
+        # The MAIN turn s8a1 holds FOUR spawn tool_uses in ONE item (Codex P1-C):
+        #   toolu_child  -> cc110001  (SYNC, structured result with full totals,
+        #                               itself the PARENT of a nested grandchild)
+        #   toolu_async  -> a55c0003  (ASYNC launch result, no totals; completes
+        #                               via a separate <task-notification>)
+        #   toolu_trunc1 -> b0c40004  (truncated-(i): agentId present, <usage>
+        #                               clipped -> links + derived totals)
+        #   toolu_trunc2 -> (clipped)  (truncated-(ii): agentId itself clipped ->
+        #                               NO link, NO subagent_meta, flat card)
+        _insert_message(
+            cache_conn,
+            session_id="s8", uuid="s8h1", parent_uuid=None,
+            source_path=s8_main, byte_offset=0,
+            timestamp_utc="2026-06-08T00:00:00Z",
+            entry_type="human", text="run the nested + async + truncated audits",
+            cwd=s8_cwd, git_branch="main",
+        )
+        _insert_message(
+            cache_conn,
+            session_id="s8", uuid="s8a1", parent_uuid="s8h1",
+            source_path=s8_main, byte_offset=1,
+            timestamp_utc="2026-06-08T00:00:01Z",
+            entry_type="assistant", text="spawning four subagents",
+            blocks_json=json.dumps([
+                {"kind": "text", "text": "spawning four subagents"},
+                {"kind": "tool_use", "name": "Agent",
+                 "input_summary": '{"description":"Sync audit","subagent_type":"code-reviewer"}',
+                 "input": {"description": "Sync audit", "subagent_type": "code-reviewer",
+                           "prompt": "Audit synchronously"},
+                 "id": "toolu_child", "preview": "Sync audit",
+                 "subagent_type": "code-reviewer"},
+                {"kind": "tool_use", "name": "Agent",
+                 "input_summary": '{"description":"Background audit","subagent_type":"Explore"}',
+                 "input": {"description": "Background audit", "subagent_type": "Explore",
+                           "prompt": "Audit in the background"},
+                 "id": "toolu_async", "preview": "Background audit",
+                 "subagent_type": "Explore"},
+                {"kind": "tool_use", "name": "Agent",
+                 "input_summary": '{"description":"Clipped-usage audit","subagent_type":"grounding"}',
+                 "input": {"description": "Clipped-usage audit", "subagent_type": "grounding",
+                           "prompt": "Audit with a clipped usage tail"},
+                 "id": "toolu_trunc1", "preview": "Clipped-usage audit",
+                 "subagent_type": "grounding"},
+                {"kind": "tool_use", "name": "Agent",
+                 "input_summary": '{"description":"Clipped-agentId audit","subagent_type":"grounding"}',
+                 "input": {"description": "Clipped-agentId audit", "subagent_type": "grounding",
+                           "prompt": "Audit clipped before its agentId line"},
+                 "id": "toolu_trunc2", "preview": "Clipped-agentId audit",
+                 "subagent_type": "grounding"},
+            ]),
+            model=MODEL, msg_id="m8", req_id="r8",
+            cwd=s8_cwd, git_branch="main",
+        )
+        # SYNC spawn result for toolu_child -> cc110001 (structured totals, the
+        # existing #166 path; unchanged regression). cc110001 is ALSO the parent
+        # of the nested grandchild below.
+        _insert_message(
+            cache_conn, session_id="s8", uuid="tr_child", parent_uuid="s8a1",
+            source_path=s8_main, byte_offset=2,
+            timestamp_utc="2026-06-08T00:00:02Z",
+            entry_type="tool_result",
+            blocks_json=json.dumps([{"kind": "tool_result", "text": "sync audit done",
+                "truncated": False, "is_error": False, "tool_use_id": "toolu_child",
+                "agent_id": "cc110001",
+                "subagent_meta": {"total_tokens": 12000, "total_duration_ms": 7000,
+                                  "total_tool_use_count": 3, "status": "completed"}}]),
+            cwd=s8_cwd, git_branch="main",
+        )
+        # ASYNC launch result for toolu_async -> a55c0003: status:"async_launched"
+        # and NO totals. Completion arrives below as a <task-notification>.
+        _insert_message(
+            cache_conn, session_id="s8", uuid="tr_async", parent_uuid="s8a1",
+            source_path=s8_main, byte_offset=3,
+            timestamp_utc="2026-06-08T00:00:03Z",
+            entry_type="tool_result",
+            blocks_json=json.dumps([{"kind": "tool_result",
+                "text": "Launched background agent a55c0003",
+                "truncated": False, "is_error": False, "tool_use_id": "toolu_async",
+                "agent_id": "a55c0003",
+                "subagent_meta": {"status": "async_launched"}}]),
+            cwd=s8_cwd, git_branch="main",
+        )
+        # Truncated-(i) result for toolu_trunc1 -> b0c40004: STRING-content (no
+        # structured agent_id/subagent_meta), agentId PRESENT but the <usage>
+        # wrapper CLIPPED past the 16 KB cap -> 1a links the child, 1c derives
+        # totals from the b0c40004 thread.
+        _insert_message(
+            cache_conn, session_id="s8", uuid="tr_trunc1", parent_uuid="s8a1",
+            source_path=s8_main, byte_offset=4,
+            timestamp_utc="2026-06-08T00:00:04Z",
+            entry_type="tool_result",
+            blocks_json=json.dumps([{"kind": "tool_result", "truncated": True,
+                "is_error": False, "tool_use_id": "toolu_trunc1",
+                "text": ("partial audit output before the usage tail was clipped\n"
+                         "agentId: b0c40004 (use SendMessage with to: 'b0c40004' "
+                         "to continue this agent)\n<usage>subagent_tokens: 740")}]),
+            cwd=s8_cwd, git_branch="main",
+        )
+        # Truncated-(ii) result for toolu_trunc2: STRING-content clipped BEFORE the
+        # agentId: line -> _parse_nested_agent_result returns None -> NO link, NO
+        # subagent_meta entry, the spawn degrades to a flat title-only card (no
+        # crash, no mis-link).
+        _insert_message(
+            cache_conn, session_id="s8", uuid="tr_trunc2", parent_uuid="s8a1",
+            source_path=s8_main, byte_offset=5,
+            timestamp_utc="2026-06-08T00:00:05Z",
+            entry_type="tool_result",
+            blocks_json=json.dumps([{"kind": "tool_result", "truncated": True,
+                "is_error": False, "tool_use_id": "toolu_trunc2",
+                "text": "partial audit output that was clipped mid-stream before"}]),
+            cwd=s8_cwd, git_branch="main",
+        )
+        # The <task-notification> completing the async subagent. A user line whose
+        # body is a <task-notification> wrapper -> Phase 4 classifies it
+        # meta_kind="notification"; its <tool-use-id> = the spawn id toolu_async,
+        # <status>completed</status>. 1c joins it back to a55c0003.
+        _notif_body = (
+            "<task-notification><task-id>a55c0003</task-id>"
+            "<tool-use-id>toolu_async</tool-use-id>"
+            "<status>completed</status>"
+            "<summary>Background audit finished</summary>"
+            "<result>module clean</result></task-notification>"
+        )
+        _insert_message(
+            cache_conn, session_id="s8", uuid="s8notif", parent_uuid="s8a1",
+            source_path=s8_main, byte_offset=6,
+            timestamp_utc="2026-06-08T00:00:18Z",
+            entry_type="human", text=_notif_body,
+            blocks_json=json.dumps([{"kind": "text", "text": _notif_body}]),
+            cwd=s8_cwd, git_branch="main",
+        )
+
+        # --- child subagent thread (agent-cc110001.jsonl) -------------------
+        # It itself SPAWNS a grandchild (toolu_gc). The grandchild's result is
+        # STRING-content (no structured agent_id) with agentId + a full <usage>.
+        _insert_message(
+            cache_conn, session_id="s8", uuid="ch_h", parent_uuid=None,
+            source_path=s8_agent_child, byte_offset=0,
+            timestamp_utc="2026-06-08T00:00:06Z",
+            entry_type="human", text="Sync audit", is_sidechain=1,
+        )
+        _insert_message(
+            cache_conn, session_id="s8", uuid="ch_a1", parent_uuid="ch_h",
+            source_path=s8_agent_child, byte_offset=1,
+            timestamp_utc="2026-06-08T00:00:07Z",
+            entry_type="assistant", text="spawning a grounding grandchild",
+            blocks_json=json.dumps([
+                {"kind": "text", "text": "spawning a grounding grandchild"},
+                {"kind": "tool_use", "name": "Agent",
+                 "input_summary": '{"description":"Ground claims","subagent_type":"grounding"}',
+                 "input": {"description": "Ground claims", "subagent_type": "grounding",
+                           "prompt": "Ground the doc claims against code"},
+                 "id": "toolu_gc", "preview": "Ground claims",
+                 "subagent_type": "grounding"},
+            ]),
+            model=MODEL, msg_id="m8ch", req_id="r8ch", is_sidechain=1,
+            cwd=s8_cwd, git_branch="main",
+        )
+        # The grandchild spawn result: STRING-content, no structured agent_id, a
+        # trailing agentId: line + a FULL <usage> totals wrapper (1a parses
+        # authoritative totals 8400/5/9100). Lives on the CHILD file, so its owner
+        # (ch_a1) has subagent_key=cc110001 -> grandchild's parent_subagent_key.
+        _gc_result = (
+            "Grounded all six doc claims against the code; three needed edits.\n"
+            "agentId: ace20002 (use SendMessage with to: 'ace20002' to "
+            "continue this agent)\n"
+            "<usage>subagent_tokens: 8400\ntool_uses: 5\nduration_ms: 9100</usage>"
+        )
+        _insert_message(
+            cache_conn, session_id="s8", uuid="tr_gc", parent_uuid="ch_a1",
+            source_path=s8_agent_child, byte_offset=2,
+            timestamp_utc="2026-06-08T00:00:08Z",
+            entry_type="tool_result",
+            blocks_json=json.dumps([{"kind": "tool_result", "text": _gc_result,
+                "truncated": False, "is_error": False, "tool_use_id": "toolu_gc"}]),
+            is_sidechain=1, cwd=s8_cwd, git_branch="main",
+        )
+
+        # --- grandchild thread (agent-ace20002.jsonl): >=1 assistant turn ---
+        _insert_message(
+            cache_conn, session_id="s8", uuid="gc_h", parent_uuid=None,
+            source_path=s8_agent_gchild, byte_offset=0,
+            timestamp_utc="2026-06-08T00:00:09Z",
+            entry_type="human", text="Ground claims", is_sidechain=1,
+        )
+        _insert_message(
+            cache_conn, session_id="s8", uuid="gc_a1", parent_uuid="gc_h",
+            source_path=s8_agent_gchild, byte_offset=1,
+            timestamp_utc="2026-06-08T00:00:10Z",
+            entry_type="assistant", text="three claims needed edits",
+            blocks_json='[{"kind": "text", "text": "three claims needed edits"}]',
+            model=MODEL, msg_id="m8gc", req_id="r8gc", is_sidechain=1,
+            cwd=s8_cwd, git_branch="main",
+        )
+
+        # --- async subagent thread (agent-a55c0003.jsonl): 2 turns w/ tokens --
+        # Provides the bucket 1c derives totals from (tokens stamped from
+        # session_entries; one tool_use -> tool_call for the tool-count). Span
+        # 11Z..15Z -> derived total_duration_ms covers the whole bucket (h@11Z).
+        _insert_message(
+            cache_conn, session_id="s8", uuid="as_h", parent_uuid=None,
+            source_path=s8_agent_async, byte_offset=0,
+            timestamp_utc="2026-06-08T00:00:11Z",
+            entry_type="human", text="Background audit", is_sidechain=1,
+        )
+        _insert_message(
+            cache_conn, session_id="s8", uuid="as_a1", parent_uuid="as_h",
+            source_path=s8_agent_async, byte_offset=1,
+            timestamp_utc="2026-06-08T00:00:12Z",
+            entry_type="assistant", text="reading the module",
+            blocks_json=json.dumps([
+                {"kind": "text", "text": "reading the module"},
+                {"kind": "tool_use", "name": "Read",
+                 "input_summary": '{"file_path":"/home/u/proj/mod.py"}',
+                 "input": {"file_path": "/home/u/proj/mod.py"},
+                 "id": "toolu_as_read", "preview": "/home/u/proj/mod.py"},
+            ]),
+            model=MODEL, msg_id="m8as1", req_id="r8as1", is_sidechain=1,
+            cwd=s8_cwd, git_branch="main",
+        )
+        _insert_message(
+            cache_conn, session_id="s8", uuid="as_a2", parent_uuid="as_a1",
+            source_path=s8_agent_async, byte_offset=2,
+            timestamp_utc="2026-06-08T00:00:15Z",
+            entry_type="assistant", text="background audit clean",
+            blocks_json='[{"kind": "text", "text": "background audit clean"}]',
+            model=MODEL, msg_id="m8as2", req_id="r8as2", is_sidechain=1,
+            cwd=s8_cwd, git_branch="main",
+        )
+        seed_session_entry(cache_conn, source_path=s8_agent_async, line_offset=1,
+                           timestamp_utc="2026-06-08T00:00:12Z", model=MODEL,
+                           msg_id="m8as1", req_id="r8as1",
+                           input_tokens=1000, output_tokens=300)
+        seed_session_entry(cache_conn, source_path=s8_agent_async, line_offset=2,
+                           timestamp_utc="2026-06-08T00:00:15Z", model=MODEL,
+                           msg_id="m8as2", req_id="r8as2",
+                           input_tokens=800, output_tokens=200)
+
+        # --- truncated-(i) child thread (agent-b0c40004.jsonl): 2 turns -------
+        # 1a links b0c40004 with NO totals (<usage> clipped); 1c derives them
+        # here. Span 31Z..33Z; one tool_use -> tool_call for the tool-count.
+        _insert_message(
+            cache_conn, session_id="s8", uuid="tr4_h", parent_uuid=None,
+            source_path=s8_agent_trunc, byte_offset=0,
+            timestamp_utc="2026-06-08T00:00:30Z",
+            entry_type="human", text="Clipped-usage audit", is_sidechain=1,
+        )
+        _insert_message(
+            cache_conn, session_id="s8", uuid="tr4_a1", parent_uuid="tr4_h",
+            source_path=s8_agent_trunc, byte_offset=1,
+            timestamp_utc="2026-06-08T00:00:31Z",
+            entry_type="assistant", text="grepping the tree",
+            blocks_json=json.dumps([
+                {"kind": "text", "text": "grepping the tree"},
+                {"kind": "tool_use", "name": "Grep",
+                 "input_summary": '{"pattern":"reset"}',
+                 "input": {"pattern": "reset"},
+                 "id": "toolu_tr4_grep", "preview": "reset"},
+            ]),
+            model=MODEL, msg_id="m8t41", req_id="r8t41", is_sidechain=1,
+            cwd=s8_cwd, git_branch="main",
+        )
+        _insert_message(
+            cache_conn, session_id="s8", uuid="tr4_a2", parent_uuid="tr4_a1",
+            source_path=s8_agent_trunc, byte_offset=2,
+            timestamp_utc="2026-06-08T00:00:33Z",
+            entry_type="assistant", text="clipped-usage audit clean",
+            blocks_json='[{"kind": "text", "text": "clipped-usage audit clean"}]',
+            model=MODEL, msg_id="m8t42", req_id="r8t42", is_sidechain=1,
+            cwd=s8_cwd, git_branch="main",
+        )
+        seed_session_entry(cache_conn, source_path=s8_agent_trunc, line_offset=1,
+                           timestamp_utc="2026-06-08T00:00:31Z", model=MODEL,
+                           msg_id="m8t41", req_id="r8t41",
+                           input_tokens=500, output_tokens=100)
+        seed_session_entry(cache_conn, source_path=s8_agent_trunc, line_offset=2,
+                           timestamp_utc="2026-06-08T00:00:33Z", model=MODEL,
+                           msg_id="m8t42", req_id="r8t42",
+                           input_tokens=200, output_tokens=50)
+        # session_entries for the main turn + the child/grandchild turns so the
+        # reader's header cost is non-zero (cost-once contract still holds).
+        seed_session_entry(cache_conn, source_path=s8_main, line_offset=1,
+                           timestamp_utc="2026-06-08T00:00:01Z", model=MODEL,
+                           msg_id="m8", req_id="r8",
+                           input_tokens=600, output_tokens=250)
+        seed_session_entry(cache_conn, source_path=s8_agent_child, line_offset=1,
+                           timestamp_utc="2026-06-08T00:00:07Z", model=MODEL,
+                           msg_id="m8ch", req_id="r8ch",
+                           input_tokens=400, output_tokens=120)
+        seed_session_entry(cache_conn, source_path=s8_agent_gchild, line_offset=1,
+                           timestamp_utc="2026-06-08T00:00:10Z", model=MODEL,
+                           msg_id="m8gc", req_id="r8gc",
+                           input_tokens=300, output_tokens=90)
 
         # --- #193: ai-title rows. s1 + s3 carry an AI-generated title (their
         # rail/reader title flips from the first human prompt to the ai-title);

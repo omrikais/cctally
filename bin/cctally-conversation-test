@@ -592,6 +592,148 @@ print("ok")
         fail "cache-failure markers (spec §1/§2): $s7_check (raw: $s7_raw)"
     fi
 
+    # --- 2g) Reader + outline: subagent viewer (spec §4 1a/1b/1c) ---------
+    # s8 exercises the new Claude Code subagent format:
+    #   * cc110001 — SYNC child (structured totals; regression — no totals_derived)
+    #   * ace20002 — nested GRANDCHILD (1a: string-content result parsed for
+    #     authoritative <usage> totals; 1b: parent_subagent_key == the child)
+    #   * a55c0003 — ASYNC child (1c: status flips async_launched -> completed via
+    #     the <task-notification> join; derived totals with totals_derived)
+    #   * b0c40004 — truncated-(i) (1a links via agentId; <usage> clipped -> 1c
+    #     derives totals with totals_derived)
+    #   * toolu_trunc2 — truncated-(ii) (agentId clipped -> NO subagent_meta entry,
+    #     no crash, the spawn stays a flat tool_call chip)
+    # subagent_meta is shared by get_conversation + the outline, so the byte
+    # goldens lock BOTH; the structural asserts pin the load-bearing fields.
+    fetch_and_diff "GET /api/conversation/s8" "golden-conversation-s8.json" \
+        "$base/api/conversation/s8" "${LOOP[@]}"
+    fetch_and_diff "GET /api/conversation/s8/outline" "golden-conversation-s8-outline.json" \
+        "$base/api/conversation/s8/outline" "${LOOP[@]}"
+
+    local s8_raw s8_outline_raw s8_check
+    s8_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s8")
+    s8_outline_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s8/outline")
+    s8_check=$(D="$s8_raw" O="$s8_outline_raw" python3 -c '
+import json, os, sys
+d = json.loads(os.environ["D"])
+o = json.loads(os.environ["O"])
+errs = []
+sm = d.get("subagent_meta") or {}
+
+# (1a + 1b) NESTED GRANDCHILD: parsed authoritative <usage> totals + parent
+# linkage pointing at the CHILD (cross-file: parent_subagent_key == the child
+# hash, spawn_uuid == the child item holding the spawn). NOT totals_derived
+# (the <usage> wrapper survived the clip, so totals are authoritative).
+gc = sm.get("ace20002")
+if gc is None:
+    errs.append("grandchild ace20002 missing from subagent_meta (1a parse failed)")
+else:
+    if gc.get("kind") != "grounding":
+        errs.append("grandchild kind != grounding: %r" % (gc.get("kind"),))
+    if gc.get("total_tokens") != 8400:
+        errs.append("grandchild total_tokens != 8400: %r" % (gc.get("total_tokens"),))
+    if gc.get("total_tool_use_count") != 5:
+        errs.append("grandchild total_tool_use_count != 5: %r" % (gc.get("total_tool_use_count"),))
+    if gc.get("total_duration_ms") != 9100:
+        errs.append("grandchild total_duration_ms != 9100: %r" % (gc.get("total_duration_ms"),))
+    if gc.get("status") != "completed":
+        errs.append("grandchild status != completed: %r" % (gc.get("status"),))
+    if gc.get("parent_subagent_key") != "cc110001":
+        errs.append("grandchild parent_subagent_key != cc110001 (the child): %r"
+                    % (gc.get("parent_subagent_key"),))
+    if gc.get("spawn_tool_use_id") != "toolu_gc":
+        errs.append("grandchild spawn_tool_use_id != toolu_gc: %r" % (gc.get("spawn_tool_use_id"),))
+    if gc.get("spawn_uuid") != "ch_a1":
+        errs.append("grandchild spawn_uuid != ch_a1 (holding item): %r" % (gc.get("spawn_uuid"),))
+    if gc.get("totals_derived"):
+        errs.append("grandchild wrongly marked totals_derived (parse was authoritative)")
+
+# (1c) ASYNC child: status flips async_launched -> completed via the
+# <task-notification> join; totals derived from its own thread + totals_derived.
+ac = sm.get("a55c0003")
+if ac is None:
+    errs.append("async a55c0003 missing from subagent_meta")
+else:
+    if ac.get("status") != "completed":
+        errs.append("async status did NOT flip to completed (1c notification join): %r"
+                    % (ac.get("status"),))
+    for f in ("total_tokens", "total_duration_ms", "total_tool_use_count"):
+        if ac.get(f) is None:
+            errs.append("async missing derived %s" % (f,))
+    if ac.get("totals_derived") is not True:
+        errs.append("async totals_derived != True: %r" % (ac.get("totals_derived"),))
+    if ac.get("parent_subagent_key") is not None:
+        errs.append("async parent_subagent_key != None (main): %r" % (ac.get("parent_subagent_key"),))
+    if ac.get("spawn_uuid") != "s8a1":
+        errs.append("async spawn_uuid != s8a1: %r" % (ac.get("spawn_uuid"),))
+    if ac.get("spawn_tool_use_id") != "toolu_async":
+        errs.append("async spawn_tool_use_id != toolu_async: %r" % (ac.get("spawn_tool_use_id"),))
+
+# SYNC child (regression): authoritative totals, NO totals_derived; 1b linkage.
+sc = sm.get("cc110001")
+if sc is None:
+    errs.append("sync child cc110001 missing from subagent_meta")
+else:
+    if sc.get("total_tokens") != 12000:
+        errs.append("sync child total_tokens != 12000: %r" % (sc.get("total_tokens"),))
+    if sc.get("status") != "completed":
+        errs.append("sync child status != completed: %r" % (sc.get("status"),))
+    if "totals_derived" in sc:
+        errs.append("sync child wrongly carries totals_derived (authoritative totals)")
+    if sc.get("spawn_tool_use_id") != "toolu_child":
+        errs.append("sync child spawn_tool_use_id != toolu_child: %r" % (sc.get("spawn_tool_use_id"),))
+    if sc.get("parent_subagent_key") is not None:
+        errs.append("sync child parent_subagent_key != None: %r" % (sc.get("parent_subagent_key"),))
+
+# (1a degrade) TRUNCATED-(i): agentId present, <usage> clipped -> links + derived.
+tr1 = sm.get("b0c40004")
+if tr1 is None:
+    errs.append("truncated-(i) b0c40004 missing (agentId-present clip should still link)")
+else:
+    if tr1.get("totals_derived") is not True:
+        errs.append("truncated-(i) totals_derived != True: %r" % (tr1.get("totals_derived"),))
+    for f in ("total_tokens", "total_duration_ms", "total_tool_use_count"):
+        if tr1.get(f) is None:
+            errs.append("truncated-(i) missing derived %s" % (f,))
+    if tr1.get("spawn_tool_use_id") != "toolu_trunc1":
+        errs.append("truncated-(i) spawn_tool_use_id != toolu_trunc1: %r" % (tr1.get("spawn_tool_use_id"),))
+
+# (1a degrade) TRUNCATED-(ii): agentId clipped -> NO subagent_meta entry (no
+# mis-link, no crash). No meta references toolu_trunc2; the spawn stays a flat
+# tool_call chip on s8a1 (NOT suppressed, since no nested card exists for it).
+if any(m.get("spawn_tool_use_id") == "toolu_trunc2" for m in sm.values()):
+    errs.append("truncated-(ii) toolu_trunc2 wrongly produced a subagent_meta entry")
+by = {it["anchor"]["uuid"]: it for it in (d.get("items") or [])}
+s8a1 = by.get("s8a1") or {}
+spawn_calls = {b.get("tool_use_id") for b in (s8a1.get("blocks") or [])
+               if b.get("kind") == "tool_call"}
+if "toolu_trunc2" not in spawn_calls:
+    errs.append("truncated-(ii) flat tool_call chip toolu_trunc2 missing from s8a1: %r"
+                % (sorted(spawn_calls),))
+if any(b.get("kind") == "tool_use" for b in (s8a1.get("blocks") or [])):
+    errs.append("a bare tool_use survived the sweep on s8a1")
+
+# No parser-only block keys (agent_id / subagent_meta) leak into any block.
+for it in (d.get("items") or []):
+    for b in it.get("blocks") or []:
+        for leak in ("agent_id", "subagent_meta"):
+            if leak in b:
+                errs.append("block-shape leak: %r on %r" % (leak, it["anchor"].get("uuid")))
+
+# The outline shares the SAME subagent_meta (no extra wiring) — every reader key
+# is present on the outline byte-for-byte.
+osm = o.get("subagent_meta") or {}
+if osm != sm:
+    errs.append("outline subagent_meta != reader subagent_meta (shared assembly broke)")
+
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+    if [ "$s8_check" != "ok" ]; then
+        fail "subagent viewer (spec §4 1a/1b/1c): $s8_check (raw: $s8_raw)"
+    fi
+
     # --- 3) Search: deduped across replay to ONE hit ---------------------
     # Byte-exact golden only when FTS5 is present (the golden is FTS-shaped);
     # the structural asserts below run unconditionally.

@@ -267,6 +267,12 @@ export interface SubagentMeta {
   total_duration_ms?: number;
   total_tool_use_count?: number;
   status?: string;
+  // §4 1b — cross-file parent linkage (read-time, no migration).
+  parent_subagent_key?: string | null;   // null = main session; a hash = parent subagent
+  spawn_uuid?: string | null;             // the parent-thread item to render this child after
+  spawn_tool_use_id?: string | null;      // exact spawn id (one item may hold several spawns)
+  // §4 1c — totals derived from the child's own thread (render a "~" affordance).
+  totals_derived?: boolean;
 }
 
 export interface ConversationDetail {
