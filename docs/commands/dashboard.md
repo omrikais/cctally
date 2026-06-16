@@ -309,6 +309,10 @@ The watch loop runs a targeted single-file cache ingest scoped to only the open 
 
 To opt out of the live-tail entirely, set `dashboard.live_tail` to `false` (via `cctally config set dashboard.live_tail false` or the dashboard Settings overlay). The reader then falls back to the 5-second snapshot tick for new turns. The default is `true` (absence is ON); see [`config.md`](config.md#allowed-keys).
 
+### Cache rebuilds in the session modal
+
+The Recent Sessions (session-detail) modal carries a **Cache rebuilds** section for the selected conversation, surfacing the same prompt-cache-failure signal the [conversation viewer](#conversation-viewer-endpoints-plan-2) detects per turn. It shows the count of cache-rebuild events, the total wasted USD they cost, the total tokens re-created, and a green session cache-value-saved figure (what the session's cached prefixes saved versus paying full input price, shown only when positive). Below the tiles a worst-first list (capped, with a "+N more" expander) gives one jump-link per rebuild — clicking one opens the conversation viewer scrolled to the message that triggered that rebuild. A session with no rebuilds shows a "No cache rebuilds ✓" zero-state instead of the list. The section respects the `dashboard.cache_failure_markers` opt-out (it disappears when the markers are turned off, the same toggle that hides the in-reader cache-rebuild chips), and it is absent entirely when transcripts are not accessible — for example on a LAN-bound dashboard without `dashboard.expose_transcripts`, where the gated outline data the section reads returns `403`.
+
 ## Shutdown
 
 `Ctrl-C` in the terminal where you launched the dashboard. The server
