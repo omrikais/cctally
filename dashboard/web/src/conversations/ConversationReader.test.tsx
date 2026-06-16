@@ -11,11 +11,23 @@ import {
 import { installIntersectionObserverStub } from '../test-utils/intersectionObserver';
 import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
 
+// §6 overlap-upsert keys the live-tail merge off `anchor.id`, so fixtures need
+// DISTINCT, STABLE ids (the real server's anchor.id is the cache rowid). A
+// per-uuid registry assigns a deterministic monotonic id so the SAME uuid always
+// maps to the SAME id (a tail re-return of an existing item replaces it in
+// place) while distinct uuids never collide. Reset per test in beforeEach.
+const _idByUuid = new Map<string, number>();
+let _nextItemId = 1;
+function _idFor(uuid: string): number {
+  let id = _idByUuid.get(uuid);
+  if (id === undefined) { id = _nextItemId++; _idByUuid.set(uuid, id); }
+  return id;
+}
 function makeItem(over: Partial<ConversationItem> & { uuid: string; kind?: ConversationItem['kind']; is_sidechain?: boolean }): ConversationItem {
   const { uuid, kind = 'human', is_sidechain = false, ...rest } = over;
   return {
     kind,
-    anchor: { session_id: 's', uuid, id: 0 },
+    anchor: { session_id: 's', uuid, id: _idFor(uuid) },
     member_uuids: [uuid],
     ts: 't',
     text: uuid,
@@ -74,6 +86,8 @@ beforeEach(() => {
   _resetKeymapForTests();
   globalThis.fetch = vi.fn();
   installIntersectionObserverStub();
+  _idByUuid.clear();
+  _nextItemId = 1;
 });
 afterEach(() => {
   uninstallGlobalKeydown();
@@ -619,9 +633,18 @@ describe('ConversationReader', () => {
 });
 
 describe('ConversationReader live-tail scroll (#175 F4)', () => {
+  // §6 overlap: the live-tail poll re-fetches the recent WINDOW from the cursor
+  // BEFORE it, so a real tail response re-returns the existing window + any new
+  // turns (the seed sets here are all ≤ TAIL_WINDOW=10, so the cursor is null and
+  // the whole accumulator is re-returned). `_liveWindow` tracks the running set
+  // so the append helpers mock a faithful overlap response (prior window + new),
+  // not the old strict-after-last delta.
+  let _liveWindow: ConversationItem[] = [];
+
   // Render a fully-paged conversation (next_after null), then drive a live tail
   // append by bumping the snapshot + queueing a tail fetch. Returns the body.
   async function renderFullyPaged(items: ConversationItem[]) {
+    _liveWindow = [...items];
     mockFetchOnce(detail(items, null));
     const utils = render(<ConversationReader sessionId="s" />);
     await waitFor(() => expect(utils.container.querySelector('.conv-reader-body')).not.toBeNull());
@@ -631,9 +654,11 @@ describe('ConversationReader live-tail scroll (#175 F4)', () => {
     return { ...utils, body };
   }
 
-  // Append one new turn via the live tail (the tail response stays fully paged).
+  // Append one new turn via the live tail. The overlap tail response re-returns
+  // the running window + the new turn (stays fully paged).
   async function appendLiveItem(newUuid: string) {
-    mockFetchOnce(detail([makeItem({ uuid: newUuid })], null));
+    _liveWindow = [..._liveWindow, makeItem({ uuid: newUuid })];
+    mockFetchOnce(detail(_liveWindow, null));
     await act(async () => {
       bumpSnapshot(`t-${newUuid}`);
       // let the tail poll fetch + setState flush
@@ -757,8 +782,9 @@ describe('ConversationReader live-tail scroll (#175 F4)', () => {
     await waitFor(() => expect(container.querySelector('[data-uuid="h2"]')).not.toBeNull());
     expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
 
-    // Now a live tail append — prevHasMore is false → pill.
-    mockFetchOnce(detail([makeItem({ uuid: 'live1' })], null));
+    // Now a live tail append — prevHasMore is false → pill. The §6 overlap tail
+    // response re-returns the window (h1 + h2) + the genuinely-new live1.
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' }), makeItem({ uuid: 'live1' })], null));
     // Re-pin the scroll metrics (jsdom append doesn't recompute them) so the
     // layout effect still reads "scrolled up".
     setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
@@ -774,9 +800,15 @@ describe('ConversationReader live-tail scroll (#175 F4)', () => {
 });
 
 describe('ConversationReader visible-only "↓ N new" count (#188 S4/C2, Bug 5)', () => {
+  // §6 overlap: like the scroll suite above, track the running window so the
+  // append helper mocks a faithful overlap response (prior window + new turns),
+  // not the old strict-after-last delta. A session switch reseeds the window.
+  let _liveWindow: ConversationItem[] = [];
+
   // Render fully-paged, scroll UP (so live appends raise the pill rather than
   // sticking to bottom), and return the body + container.
   async function renderScrolledUp(items: ConversationItem[]) {
+    _liveWindow = [...items];
     mockFetchOnce(detail(items, null));
     const utils = render(<ConversationReader sessionId="s" />);
     await waitFor(() => expect(utils.container.querySelector('.conv-reader-body')).not.toBeNull());
@@ -788,11 +820,13 @@ describe('ConversationReader visible-only "↓ N new" count (#188 S4/C2, Bug 5)'
     return { ...utils, body };
   }
 
-  // Append a live-tail delta of `items` (the tail response carries only the new
-  // turns; stays fully paged). Re-pins the scroll metrics first because a jsdom
-  // append doesn't recompute them, so the layout effect still reads "scrolled up".
+  // Append a live-tail delta of `items` via the §6 overlap poll: the tail
+  // response re-returns the running window + these new turns (stays fully paged).
+  // Re-pins the scroll metrics first because a jsdom append doesn't recompute
+  // them, so the layout effect still reads "scrolled up".
   async function appendLive(body: HTMLElement, items: ConversationItem[], tag: string) {
-    mockFetchOnce(detail(items, null));
+    _liveWindow = [..._liveWindow, ...items];
+    mockFetchOnce(detail(_liveWindow, null));
     setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
     fireEvent.scroll(body);
     await act(async () => {
@@ -878,15 +912,19 @@ describe('ConversationReader visible-only "↓ N new" count (#188 S4/C2, Bug 5)'
     });
 
     // Switch the reused reader to convo B (different session, B's page-1 detail
-    // carries a COLLAPSED subagent thread that happens to reuse key 'A').
+    // carries a COLLAPSED subagent thread that happens to reuse key 'A'). Reseed
+    // the §6 overlap window to B's items so the subsequent appendLive re-returns
+    // B's window (not the stale A window) + the new turn.
+    const bItems = [
+      { ...makeItem({ uuid: 'b1' }), anchor: { session_id: 'B', uuid: 'b1', id: 0 } },
+      { ...sc('ba1', 'A', { text: 'B Audit' }), anchor: { session_id: 'B', uuid: 'ba1', id: 1 } },
+    ] as ConversationItem[];
+    _liveWindow = [...bItems];
     mockFetchOnce({
       session_id: 'B', project_label: 'projB', git_branch: 'main',
       started_utc: '2026-01-01T00:00:00Z', last_activity_utc: '2026-01-01T02:00:00Z',
       cost_usd: 2, models: ['claude-opus-4'],
-      items: [
-        { ...makeItem({ uuid: 'b1' }), anchor: { session_id: 'B', uuid: 'b1', id: 0 } },
-        { ...sc('ba1', 'A', { text: 'B Audit' }), anchor: { session_id: 'B', uuid: 'ba1', id: 1 } },
-      ],
+      items: bItems,
       page: { next_after: null, has_more: false },
     });
     await act(async () => {

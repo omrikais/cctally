@@ -7594,6 +7594,20 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                              + "\n\n").encode("utf-8"))
                         self.wfile.flush()
                         idle = 0.0
+                        # §6 P2-H — a brand-new subagent file's FIRST content was
+                        # just ingested by this emitting cycle, so the session's
+                        # source-path set may have grown. Re-resolve it now (vs
+                        # waiting up to _LIVE_TAIL_FILE_RESET_EVERY cycles) so the
+                        # new thread (incl. a skill invoked inside it) live-tails
+                        # promptly. A new path seeds seen=None (cur lacks a row),
+                        # so changed_paths flags it next cycle → it ingests + emits.
+                        # setdefault never disturbs an existing cursor.
+                        new_files = _resolve()
+                        if set(new_files) != set(files):
+                            files = new_files
+                            cur = _cached_file_sigs(conn, files)
+                            for p in files:
+                                seen.setdefault(p, cur.get(p))
                         continue
                 idle += _LIVE_TAIL_POLL_INTERVAL
                 if idle >= _LIVE_TAIL_KEEPALIVE:

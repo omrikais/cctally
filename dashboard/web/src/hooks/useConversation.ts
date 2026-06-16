@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from '
 import { fetchJson, HttpError, isAbortError } from '../lib/fetchJson';
 import { useSnapshot } from './useSnapshot';
 import { getState, selectLiveTailEnabled, subscribeStore } from '../store/store';
-import type { ConversationDetail } from '../types/conversation';
+import type { ConversationDetail, ConversationItem } from '../types/conversation';
 
 // Paginated reader. We fetch page 1 on sessionId change and APPEND on
 // loadMore()/loadUntil(). Header fields (cost_usd, models, …) are
@@ -25,6 +25,15 @@ export interface UseConversation {
 }
 
 const PAGE = 500;
+// §6 (Bug 1) — the live-tail overlap window. Each tail tick re-fetches the last
+// TAIL_WINDOW local items (cursor = the item just BEFORE the window) so a later
+// fold/update into an already-delivered item reaches the live client (the strict
+// after-last append could only ever surface NEW turns, never an in-place
+// mutation the kernel folds into an earlier item). ≈10 covers the realistic fold
+// distance (a skill body lands a beat after its chip). A fold further back than
+// this is documented (vitest) and not picked up — widen here if it proves too
+// tight. Items OUTSIDE the window are never touched (earlier pages preserved).
+const TAIL_WINDOW = 10;
 
 export function useConversation(sessionId: string | null): UseConversation {
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
@@ -157,11 +166,26 @@ export function useConversation(sessionId: string | null): UseConversation {
   // #175 F4 — tail-poll the open conversation. Runs ONLY while already fully
   // paged (hasMore false), so the conversation stays fully-paged and the cursor
   // walks forward each tick. Drains a >PAGE burst within one tick (bounded loop
-  // until next_after is null or items empty), coalesces a tick that arrives
-  // mid-fetch (pendingTickRef replay after `finally`), and refreshes the
+  // until next_after is null or nothing new appended), coalesces a tick that
+  // arrives mid-fetch (pendingTickRef replay after `finally`), and refreshes the
   // whole-session header on EVERY response — including empty ones (no new turns,
   // but cost/models may have changed). Stored page.next_after stays null while
   // live-tailing so the reader never re-enters pagination.
+  //
+  // §6 (Bug 1) — OVERLAP UPSERT. The cursor is the item just BEFORE a small
+  // recent window (TAIL_WINDOW items back), NOT the strict last item, so the
+  // server's `after=` re-returns the window itself. We then MERGE the refreshed
+  // window into the accumulator by `anchor.id`:
+  //   • items OUTSIDE the window pass through untouched (earlier pages safe);
+  //   • an in-window item still returned is REPLACED in place (a fold/update the
+  //     kernel folded into an already-delivered item — e.g. a skill body folded
+  //     into its chip — which the old strict-append could never surface);
+  //   • an in-window item ABSENT from the refresh is DELETED (Codex P1-E:
+  //     Phase-4b drops a standalone body once folded, an orphan tool_result drops
+  //     once its tool_use pairs) — deletion is bounded to the window;
+  //   • a genuinely-new id (not previously held) is APPENDED in order.
+  // The merge runs against the SAME accumulator each drain iteration (we re-read
+  // detailRef.current?.items at the top of every pass), so a burst still drains.
   const pollTail = useCallback(async () => {
     if (pollingRef.current) { pendingTickRef.current = true; return; }  // coalesce a mid-fetch tick
     const sid = sessionRef.current;
@@ -169,26 +193,63 @@ export function useConversation(sessionId: string | null): UseConversation {
     pollingRef.current = true;
     try {
       for (let i = 0; i < 50; i++) {                                    // drain a >PAGE burst within one tick
-        const last = detailRef.current?.items.at(-1);
-        if (!last) break;
+        const items = detailRef.current?.items ?? [];
+        if (!items.length) break;
+        // The window = the last TAIL_WINDOW local items; the cursor is the item
+        // just BEFORE it (no `after` when the whole accumulator fits the window,
+        // so the server re-returns everything). Position-based split for
+        // robustness; id-based membership for the merge below.
+        const splitIdx = Math.max(0, items.length - TAIL_WINDOW);
+        const cursor = splitIdx > 0 ? items[splitIdx - 1].anchor.id : null;
         let body: ConversationDetail;
         try {
-          body = await fetchJson<ConversationDetail>(
-            `/api/conversation/${encodeURIComponent(sid)}?limit=${PAGE}&after=${last.anchor.id}`);
+          const q = `/api/conversation/${encodeURIComponent(sid)}?limit=${PAGE}`
+            + (cursor != null ? `&after=${cursor}` : '');
+          body = await fetchJson<ConversationDetail>(q);
         } catch {
           break;                                                        // transient blip — keep what we have
         }
         if (sessionRef.current !== sid) return;                         // session switched mid-fetch
+
+        const returned = body.items;
+        // Empty response carries NO fold information (a re-priced turn with no new
+        // items, or a stale/transient blip) — never let it delete the window.
+        // Preserve the accumulator unchanged and just refresh the whole-session
+        // header (#193 / #175 F4 empty-tail-header-refresh). The overlap window is
+        // always re-returned by a real `?after=<windowCursor>` response, so a
+        // legitimate fold/delete arrives non-empty.
+        let merged: ConversationItem[];
+        let appended = 0;
+        if (returned.length === 0) {
+          merged = items;
+        } else {
+          const byId = new Map(returned.map((r) => [r.anchor.id, r] as const));
+          const prevIds = new Set(items.map((it) => it.anchor.id));
+          const head = items.slice(0, splitIdx);                        // outside window — untouched
+          const windowItems = items.slice(splitIdx);                    // eligible for replace/delete
+          merged = [...head];
+          for (const it of windowItems) {
+            const fresh = byId.get(it.anchor.id);
+            if (fresh !== undefined) merged.push(fresh);                // replace in place (fold/update)
+            // else: folded away (Phase-4b drop / orphan pairing) → DELETE from window
+          }
+          for (const r of returned) {                                   // genuinely-new ids → append in order
+            if (!prevIds.has(r.anchor.id)) { merged.push(r); appended += 1; }
+          }
+        }
+
         setDetailSynced((prev) => (prev ? {
           ...prev,
-          items: body.items.length ? [...prev.items, ...body.items] : prev.items,
+          items: merged,
           cost_usd: body.cost_usd, models: body.models,                // refresh whole-session header even on empty
           title: body.title ?? prev.title,                            // #193 P1-4: a rewritten ai-title reaches the open reader
           git_branch: body.git_branch, project_label: body.project_label,
           subagent_meta: body.subagent_meta ?? prev.subagent_meta,
           page: prev.page,                                             // stays fully-paged (next_after === null)
         } : prev));
-        if (!body.items.length || body.page.next_after == null) break;  // empty (no new / stale cursor) or fully drained
+        // Stop the burst-drain once nothing new was appended (folds applied, no
+        // unseen turns) or the cursor is fully drained — never re-enter paging.
+        if (appended === 0 || body.page.next_after == null) break;
       }
     } finally {
       pollingRef.current = false;
