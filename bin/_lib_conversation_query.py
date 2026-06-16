@@ -313,6 +313,18 @@ def _cache_failure_wasted_usd(model, lost):
     return write - read
 
 
+def _cache_read_saved_usd(model, cache_read):
+    """Marginal USD the cache SAVED this turn: the `cache_read` prefix priced at
+    the full input rate minus its actual cache-READ rate. Display-only (same
+    caveat as `_cache_failure_wasted_usd`): NEVER summed into a cost-snapshot /
+    budget / reconciled figure. `input_tokens` and `cache_read_input_tokens` are
+    independent keys in the Claude `_calculate_entry_cost` (no subset
+    subtraction), so passing each alone yields the two rates cleanly."""
+    full = _calculate_entry_cost(model or "", {"input_tokens": cache_read})
+    read = _calculate_entry_cost(model or "", {"cache_read_input_tokens": cache_read})
+    return full - read
+
+
 def _stamp_cache_failures(items):
     """Stamp ``item["cache_failure"]`` on each assistant turn that re-creates the
     bulk of its cached prefix instead of reading it (spec §1). Mutates `items` in
@@ -1120,6 +1132,8 @@ def get_conversation_outline(conn, session_id):
     cf_count = 0
     cf_tokens = 0
     cf_wasted = 0.0
+    cf_rebuilds = []      # per-rebuild list (worst-first), spec §1
+    cache_saved = 0.0     # session cache-value-saved, spec §1
     for it in items:
         kind = it["kind"]
         turn_counts["total"] += 1
@@ -1161,6 +1175,9 @@ def get_conversation_outline(conn, session_id):
                 t["tokens"] = tok
                 for k in tokens:
                     tokens[k] += tok.get(k, 0)
+                cr_tokens = tok.get("cache_read", 0) or 0
+                if cr_tokens > 0:
+                    cache_saved += _cache_read_saved_usd(it.get("model"), cr_tokens)
             # Copy the cache-failure marker onto the OutlineTurn exactly where
             # tokens is copied (assistant-only, rides the same source row) and
             # accumulate the session-level aggregate (spec §2).
@@ -1170,6 +1187,13 @@ def get_conversation_outline(conn, session_id):
                 cf_count += 1
                 cf_tokens += cf.get("tokens_recreated", 0)
                 cf_wasted += cf.get("est_wasted_usd", 0.0)
+                cf_rebuilds.append({
+                    "uuid": t["uuid"],
+                    "subagent_key": t["subagent_key"],
+                    "ts": t["ts"],
+                    "tokens_recreated": cf.get("tokens_recreated", 0),
+                    "est_wasted_usd": cf.get("est_wasted_usd", 0.0),
+                })
         if kind == "meta":
             t["meta_kind"] = it.get("meta_kind")
             t["skill_name"] = it.get("skill_name")
@@ -1185,9 +1209,16 @@ def get_conversation_outline(conn, session_id):
              "duration_seconds": duration, "tokens": tokens,
              "cost_usd": asm["header_cost"]}
     if cf_count:
-        stats["cache_failures"] = {"count": cf_count,
-                                   "tokens_recreated": cf_tokens,
-                                   "est_wasted_usd": cf_wasted}
+        stats["cache_failures"] = {
+            "count": cf_count,
+            "tokens_recreated": cf_tokens,
+            "est_wasted_usd": cf_wasted,
+            "rebuilds": sorted(
+                cf_rebuilds,
+                key=lambda r: (-r["est_wasted_usd"], r["ts"] is None, r["ts"] or ""),
+            ),
+        }
+    stats["cache_saved_usd"] = cache_saved
     return {"session_id": session_id,
             "subagent_meta": asm["subagent_meta"],
             "stats": stats,

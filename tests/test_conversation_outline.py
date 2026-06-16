@@ -359,3 +359,76 @@ def test_outline_stats_cache_failures_multiple():
     assert agg["count"] == 2
     assert agg["tokens_recreated"] == sum(f["tokens_recreated"] for f in fails)
     assert abs(agg["est_wasted_usd"] - sum(f["est_wasted_usd"] for f in fails)) < 1e-12
+
+
+# ---------------------------------------------------------------------------
+# Session-modal cache-rebuilds (2026-06-16 spec): per-rebuild list + cache_saved
+# ---------------------------------------------------------------------------
+def test_outline_rebuilds_list_single():
+    c = _conn()
+    _seed_cache_failure(c)                      # one failure on turn "a2"
+    agg = cq.get_conversation_outline(c, "cfo")["stats"]["cache_failures"]
+    rb = agg["rebuilds"]
+    assert len(rb) == 1
+    r = rb[0]
+    assert r["uuid"] == "a2"                     # the flagged turn's anchor uuid
+    assert r["subagent_key"] is None             # main-session rebuild
+    assert r["ts"] == "2026-06-01T00:00:05Z"
+    assert r["tokens_recreated"] == 130_000
+    assert r["est_wasted_usd"] == agg["est_wasted_usd"]   # single -> equals total
+
+
+def test_outline_rebuilds_sorted_worst_first():
+    # Reuse the two-failure fixture: failure 1 (a1) loses 125k, failure 2 (a3)
+    # loses 149k -> a3 is the worse (higher wasted $) and must sort FIRST.
+    c = _conn()
+    _msg(c, session_id="m2f", uuid="a0", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="p", model=_MODEL, msg_id="m0", req_id="r0",
+         blocks_json=_json.dumps([{"kind": "text", "text": "p"}]))
+    _entry(c, source_path="a.jsonl", line_offset=0, model=_MODEL,
+           msg_id="m0", req_id="r0", inp=10, out=20, cc=1_000, cr=130_000)
+    _msg(c, session_id="m2f", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="assistant",
+         text="f1", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([{"kind": "text", "text": "f1"}]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20, cc=140_000, cr=5_000)
+    _msg(c, session_id="m2f", uuid="a2", source_path="a.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-01T00:00:10Z", entry_type="assistant",
+         text="rp", model=_MODEL, msg_id="m2", req_id="r2",
+         blocks_json=_json.dumps([{"kind": "text", "text": "rp"}]))
+    _entry(c, source_path="a.jsonl", line_offset=2, model=_MODEL,
+           msg_id="m2", req_id="r2", inp=10, out=20, cc=2_000, cr=150_000)
+    _msg(c, session_id="m2f", uuid="a3", source_path="a.jsonl", byte_offset=3,
+         timestamp_utc="2026-06-01T00:00:15Z", entry_type="assistant",
+         text="f2", model=_MODEL, msg_id="m3", req_id="r3",
+         blocks_json=_json.dumps([{"kind": "text", "text": "f2"}]))
+    _entry(c, source_path="a.jsonl", line_offset=3, model=_MODEL,
+           msg_id="m3", req_id="r3", inp=10, out=20, cc=160_000, cr=1_000)
+    rb = cq.get_conversation_outline(c, "m2f")["stats"]["cache_failures"]["rebuilds"]
+    assert [r["uuid"] for r in rb] == ["a3", "a1"]                  # worst-first
+    assert rb[0]["est_wasted_usd"] >= rb[1]["est_wasted_usd"]
+
+
+def test_outline_cache_saved_usd_present_and_positive():
+    c = _conn()
+    _seed_cache_failure(c)                      # a1 has cr=130_000
+    stats = cq.get_conversation_outline(c, "cfo")["stats"]
+    assert "cache_saved_usd" in stats
+    expected = cq._cache_read_saved_usd(_MODEL, 130_000)   # a2 has cr=0 -> no add
+    assert expected > 0
+    assert abs(stats["cache_saved_usd"] - expected) < 1e-12
+
+
+def test_outline_cache_saved_usd_zero_without_cache_reads():
+    c = _conn()
+    _msg(c, session_id="nocache", uuid="z1", source_path="z.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="x", model=_MODEL, msg_id="zm", req_id="zr",
+         blocks_json=_json.dumps([{"kind": "text", "text": "x"}]))
+    _entry(c, source_path="z.jsonl", line_offset=0, model=_MODEL,
+           msg_id="zm", req_id="zr", inp=10, out=20, cc=0, cr=0)
+    stats = cq.get_conversation_outline(c, "nocache")["stats"]
+    assert stats["cache_saved_usd"] == 0.0
+    assert "cache_failures" not in stats         # unchanged absent-when-none contract
