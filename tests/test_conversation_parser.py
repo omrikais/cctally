@@ -1114,3 +1114,60 @@ def test_truncated_non_edit_tool_omits_edit_stat():
          "input": {"command": "x" * (lc._INPUT_LEAF_CAP + 10)}}])
     assert blocks[0]["input_truncated"] is True
     assert "edit_stat" not in blocks[0]
+
+
+# --- queued-while-busy user prompts (attachment / queued_command) -------------
+# A message typed while the agent (main session OR a subagent) is still working
+# is QUEUED and persisted as an `attachment` row — never a `type:"user"` turn —
+# with the text in attachment.prompt. The parser promotes the user-typed ones
+# (commandMode=="prompt") to a synthetic HUMAN turn so the reader renders them.
+
+def _queued_command(prompt, command_mode="prompt", uuid="q1"):
+    return {"type": "attachment", "uuid": uuid, "parentUuid": "p0",
+            "isSidechain": False, "sessionId": "s1",
+            "timestamp": "2026-06-16T08:01:37.588Z", "cwd": "/x", "gitBranch": "main",
+            "attachment": {"type": "queued_command", "prompt": prompt,
+                           "commandMode": command_mode}}
+
+def test_queued_prompt_promoted_to_human():
+    fh = _jsonl(_queued_command("Don't run the Codex review. I'll do it this time."))
+    rows = list(lc.iter_message_rows(fh, "f.jsonl"))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.entry_type == lc.HUMAN
+    assert r.text == "Don't run the Codex review. I'll do it this time."
+    assert r.uuid == "q1" and r.session_id == "s1" and r.parent_uuid == "p0"
+    assert r.is_sidechain == 0
+    # The text lives in attachment.prompt, not message.content — the parser
+    # synthesizes the prose block so the reader renders the "YOU" turn.
+    blocks = json.loads(r.blocks_json)
+    assert blocks == [{"kind": "text",
+                       "text": "Don't run the Codex review. I'll do it this time."}]
+
+def test_queued_task_notification_dropped():
+    # commandMode=="task-notification" is harness-injected background plumbing,
+    # NOT user-typed — it stays dropped (the proof the prompt gate is non-vacuous:
+    # flip commandMode and the row vanishes).
+    notif = "<task-notification>\n<task-id>ac20b</task-id>\n<status>completed</status>\n</task-notification>"
+    fh = _jsonl(_queued_command(notif, command_mode="task-notification"))
+    assert list(lc.iter_message_rows(fh, "f.jsonl")) == []
+
+def test_queued_blank_prompt_dropped():
+    fh = _jsonl(_queued_command("   "))
+    assert list(lc.iter_message_rows(fh, "f.jsonl")) == []
+
+def test_non_queued_attachment_dropped():
+    # Other attachment subtypes (hook_success, task_reminder, file, …) are not
+    # user turns and must not be promoted.
+    fh = _jsonl({"type": "attachment", "uuid": "a1", "sessionId": "s1",
+                 "attachment": {"type": "hook_success", "content": "ok"}})
+    assert list(lc.iter_message_rows(fh, "f.jsonl")) == []
+
+def test_queued_slash_command_args_promoted():
+    # A queued prompt routes through the SAME _normalize as a typed turn, so a
+    # slash-command invocation in the queued text still promotes its args (#188).
+    fh = _jsonl(_queued_command(
+        "<command-name>/commit</command-name><command-args>ship it</command-args>"))
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    assert r.entry_type == lc.HUMAN
+    assert r.text == "ship it"

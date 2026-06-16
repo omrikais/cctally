@@ -263,10 +263,49 @@ def parse_message_row(obj, offset):
     populated by a separate second seek-and-walk over the same byte span."""
     t = obj.get("type")
     if t not in ("user", "assistant"):
-        return None
+        # A message typed while the agent (the main session OR a subagent) is
+        # still working is QUEUED and persisted as an ``attachment`` row, never a
+        # ``type:"user"`` turn — so the user/assistant gate above would drop it and
+        # it would never reach conversation_messages (the reader bug). Promote the
+        # user-typed ones here; everything else stays dropped.
+        return _queued_prompt_row(obj, t, offset)
     if not obj.get("uuid"):
         return None
     return _normalize(obj, t, offset)
+
+
+def _queued_prompt_row(obj, t, offset):
+    """A queued user prompt -> a synthetic HUMAN ``MessageRow``, else ``None``.
+
+    Claude Code persists a message typed while the agent is busy as
+    ``{"type":"attachment","attachment":{"type":"queued_command",
+    "commandMode":"prompt","prompt":<text>}}`` — carrying its OWN
+    uuid/parentUuid/timestamp, with the text in ``attachment.prompt`` rather than
+    ``message.content``. Only ``commandMode=="prompt"`` is promoted: a queued
+    ``task-notification`` (``commandMode=="task-notification"``) is harness-injected
+    background plumbing — the same ``<task-notification>`` content already
+    classifies META when it arrives as a regular line — not something the user
+    typed, so it stays dropped."""
+    if t != "attachment" or not obj.get("uuid"):
+        return None
+    att = obj.get("attachment")
+    if not isinstance(att, dict) or att.get("type") != "queued_command":
+        return None
+    if att.get("commandMode") != "prompt":
+        return None
+    prompt = att.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    # Route a synthesized user message through _normalize so the queued prompt
+    # gets the SAME classification a typed turn would (HUMAN, the #188
+    # slash-command-args promotion, system-marker / notification folding, the
+    # remote-control prefix strip, and the split search-column derivation). Every
+    # top-level field (uuid / parentUuid / sessionId / timestamp / cwd / gitBranch
+    # / isSidechain) rides along on the shallow copy; _normalize keys off the ``t``
+    # arg, never ``obj["type"]``, so the "attachment" type is inert here.
+    synth = dict(obj)
+    synth["message"] = {"role": "user", "content": prompt}
+    return _normalize(synth, "user", offset)
 
 
 @dataclass

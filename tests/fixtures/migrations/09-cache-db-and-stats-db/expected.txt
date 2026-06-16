@@ -14,7 +14,7 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 13 / 13 known
   ✓ 012_unify_budget_milestones_vendor             applied <REDACTED>
   ✓ 013_test_failure_injection                     applied <REDACTED>
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 14 / 14 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 15 / 15 known
   ✓ 001_dedup_highest_wins                         applied <REDACTED>
   ✓ 002_conversation_messages_backfill             applied <REDACTED>
   ✓ 003_conversation_reingest_tool_ids             applied <REDACTED>
@@ -28,7 +28,8 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 14 / 14 known
   ✓ 011_conversation_promote_command_args          applied <REDACTED>
   ✓ 012_create_conversation_ai_titles              applied <REDACTED>
   ✓ 013_create_conversation_sessions               applied <REDACTED>
-  ✓ 014_test_cache_migration                       applied <REDACTED>
+  ✓ 014_conversation_queued_prompt_reingest        applied <REDACTED>
+  ✓ 015_test_cache_migration                       applied <REDACTED>
 ## stderr
 
 ## exit
@@ -52,7 +53,7 @@ stats.db:
     013_test_failure_injection
   schema_migrations_skipped:
 cache.db:
-  user_version: 14
+  user_version: 15
   schema_migrations:
     001_dedup_highest_wins
     002_conversation_messages_backfill
@@ -67,7 +68,8 @@ cache.db:
     011_conversation_promote_command_args
     012_create_conversation_ai_titles
     013_create_conversation_sessions
-    014_test_cache_migration
+    014_conversation_queued_prompt_reingest
+    015_test_cache_migration
   schema_migrations_skipped:
 ## log
 <no migration-errors.log>

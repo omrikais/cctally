@@ -525,6 +525,50 @@ describe('ConversationReader', () => {
     await waitFor(() => expect(getState().conversationJump).toBeNull());
   });
 
+  // #204 — a jump to a nested subagent CARD root aligns the card HEAD to the top
+  // (`block: 'start'` on its <summary>), not center: a tall subagent card centered
+  // leaves its head far above the fold. The scroll target is the card's summary,
+  // and — because the jump force-opened the ancestor chain — it is re-aimed on the
+  // next frame (rAF) so a late ancestor reflow can't shift it off-position.
+  it('#204 aligns a nested subagent card head to the top (block:start), re-aimed after force-open', async () => {
+    mockFetchOnce({
+      ...detail([
+        makeItem({ uuid: 'm1', kind: 'human', text: 'Run the audit' }),
+        makeItem({ uuid: 'c1', is_sidechain: true, subagent_key: 'C', text: 'Sync audit' } as never),
+        makeItem({ uuid: 'g1', is_sidechain: true, subagent_key: 'G', text: 'Ground claims' } as never),
+      ]),
+      subagent_meta: {
+        C: { kind: 'code-reviewer', parent_subagent_key: null, spawn_uuid: 'm1', spawn_tool_use_id: 'tu_c' },
+        G: { kind: 'grounding', parent_subagent_key: 'C', spawn_uuid: 'c1', spawn_tool_use_id: 'tu_g' },
+      },
+    });
+    // Run rAF callbacks synchronously so the double-rAF re-aim fires
+    // deterministically within the act/waitFor window.
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame')
+      .mockImplementation((cb: FrameRequestCallback) => { cb(0); return 0; });
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'g1' } });
+    render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+
+    // Every scroll targets the g1 card's <summary> with block:'start' (the head),
+    // and there are at least two (initial + the force-open rAF re-aim).
+    const headCalls = scrollSpy.mock.instances
+      .map((inst, i) => ({ inst: inst as Element, opts: scrollSpy.mock.calls[i][0] as ScrollIntoViewOptions }))
+      .filter(({ inst }) =>
+        inst.tagName === 'SUMMARY'
+        && inst.closest('details.conv-sidechain')?.getAttribute('data-uuid') === 'g1');
+    expect(headCalls.length).toBeGreaterThanOrEqual(2);
+    expect(headCalls.every(({ opts }) => opts.block === 'start')).toBe(true);
+    // The LAST scroll overall is the g1 card head, top-aligned.
+    const lastInst = scrollSpy.mock.instances.at(-1) as Element;
+    expect(lastInst.tagName).toBe('SUMMARY');
+    expect(lastInst.closest('details.conv-sidechain')?.getAttribute('data-uuid')).toBe('g1');
+    expect((scrollSpy.mock.calls.at(-1)![0] as ScrollIntoViewOptions).block).toBe('start');
+    rafSpy.mockRestore();
+  });
+
   // §5 (Codex P1-C) — a resolved spawn's chip is suppressed (its nested subagent
   // card is canonical), but an UNLINKED spawn's chip still renders. The reader
   // builds the suppression set from subagent_meta.spawn_tool_use_id.

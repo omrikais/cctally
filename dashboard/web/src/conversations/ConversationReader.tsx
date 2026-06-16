@@ -510,7 +510,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       // outline subagent click flashes the CARD with no force-open; the
       // force-open path below still handles a find-jump to a real INNER uuid
       // (in neither map while the thread is closed).
-      const el = itemRefs.current.get(jump.uuid) ?? cardRefs.current.get(jump.uuid);
+      // #204 — cardRefs holds ONLY subagent bucket-root uuids. A jump whose uuid
+      // is a card root (outline subagent entry, or a collapsed-card flash) aligns
+      // the card HEAD to the top; a deep find-jump into an inner member (itemRefs
+      // hit, cardRefs miss) still centers. itemRefs takes precedence for `el` (the
+      // flash + keyboard-cursor target) so an open card flashes its first member.
+      const cardEl = cardRefs.current.get(jump.uuid);
+      const el = itemRefs.current.get(jump.uuid) ?? cardEl;
       if (el) {
         // #177 S6 — a find jump whose anchor matched in a tool/thinking block
         // opens the target turn's collapsed disclosures BEFORE scrolling (the
@@ -520,13 +526,32 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         if (jump.expand_details) {
           el.querySelectorAll('details:not([open])').forEach((d) => { (d as HTMLDetailsElement).open = true; });
         }
-        // #188 B2 — the jump centers the target (`block: 'center'`); the
-        // scroll-sync observer still reports the TOPMOST visible turn (above
-        // the centered target), but the explicit pin set below now drives the
-        // outline's aria-current + the jump-to-next cursor, so the highlight
-        // lands on exactly the jumped target (not the turn above it). This
-        // replaces the #184 "intentional divergence".
-        el.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'center' });
+        // #204 — a subagent CARD-root jump aligns the card HEAD to the top of the
+        // viewport (`block: 'start'` on the <summary>). Centering it (`block:
+        // 'center'`, the right default for a normal message/member target) puts a
+        // TALL subagent card's head far above the fold — a 20000px grandchild card
+        // centered leaves its head ~420px above the top (the #204 symptom). The
+        // landing is stable, so this is a target/alignment fix, not a timing one.
+        // A normal turn or a deep inner-member find-jump (cardEl undefined) keeps
+        // the #188 B2 centering: the explicit pin set below drives the outline's
+        // aria-current + the jump-to-next cursor onto exactly the jumped target.
+        const scrollTarget: Element = cardEl ? (cardEl.querySelector('summary') ?? cardEl) : el;
+        const scrollBlock: ScrollLogicalPosition = cardEl ? 'start' : 'center';
+        scrollTarget.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: scrollBlock });
+        // #204 — when this jump force-opened ancestor cards, re-aim on the next
+        // frame once their `::details-content` block-size commits, so a late
+        // reflow can't leave the target off-position. A double requestAnimationFrame
+        // guarantees a full layout+paint cycle elapsed; idempotent (same target +
+        // block). Guarded on isConnected so a session switch in the gap can't
+        // scroll a detached node; only runs when a force-open was involved.
+        if (forcedOpenKeys.size > 0 && typeof requestAnimationFrame === 'function') {
+          const t = scrollTarget;
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (t.isConnected) {
+              t.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: scrollBlock });
+            }
+          }));
+        }
         el.classList.add('conv-item--jumped');
         // #188 B2 — pin the landing so the outline selects EXACTLY this target
         // and a repeat forward jump-to-next steps strictly past it (closes #187).

@@ -3442,6 +3442,27 @@ def _013_create_conversation_sessions(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@cache_migration("014_conversation_queued_prompt_reingest")
+def _014_conversation_queued_prompt_reingest(conn: sqlite3.Connection) -> None:
+    """Flag-only re-ingest so a message typed while the agent was busy — QUEUED
+    and persisted as an ``attachment`` row (``attachment.type=="queued_command"``,
+    ``commandMode=="prompt"``) rather than a ``type:"user"`` turn — lands on
+    existing history. The parser (``_queued_prompt_row``) now promotes those to a
+    synthetic HUMAN turn at ingest, so the offset-0 re-parse re-derives them with
+    zero new consumption code. Sets the DISTINCT
+    ``conversation_queued_prompt_reingest_pending`` flag (NOT the shared
+    ``conversation_reingest_pending``, which also gates migration 005's read-time
+    human-fallback in the query kernel). Consumption rides the #179 RESUMABLE
+    per-file reingest (_resumable_reingest_conversation_messages) — the flag is
+    wired into _TARGETED_DECLINE_FLAGS + _REINGEST_FLAG_KEYS + both flag SELECTs +
+    the two cleanup DELETE lists in _cctally_cache.py (all five sites; missing one
+    either never triggers or re-arms forever). Central stamp via the dispatcher
+    (#140); a fresh install stamps it WITHOUT running (empty table -> the flag, if
+    ever set, is a harmless no-op). Mirrors 007/009."""
+    _set_cache_meta(conn, "conversation_queued_prompt_reingest_pending", "1")
+    conn.commit()
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")

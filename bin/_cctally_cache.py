@@ -594,6 +594,7 @@ _TARGETED_DECLINE_FLAGS = (
     "conversation_search_split_pending",
     "conversation_promote_command_args_pending",
     "conversation_sessions_backfill_pending",
+    "conversation_queued_prompt_reingest_pending",   # migration 014
 )
 
 
@@ -725,12 +726,19 @@ def sync_cache(
             # media[] placeholders + user-content media index + web_search/
             # web_fetch captures); the same offset-0 walk re-derives them, so drop
             # that flag here as well.
+            # Migration 014 sets the DISTINCT
+            # conversation_queued_prompt_reingest_pending flag (to land queued-
+            # while-busy user prompts persisted as queued_command attachments); the
+            # same offset-0 walk re-derives them through the current parser, so drop
+            # that flag here too — MISSING this site re-arms the flag on every
+            # cache-sync --rebuild.
             conn.execute(
                 "DELETE FROM cache_meta WHERE key IN "
                 "('conversation_reingest_pending',"
                 " 'conversation_source_tool_use_reingest_pending',"
                 " 'conversation_reingest_enrichment_pending',"
                 " 'conversation_media_reingest_pending',"
+                " 'conversation_queued_prompt_reingest_pending',"
                 " 'conversation_reingest_cursor',"
                 " 'conversation_reingest_cursor_gen')")
             # #177 S6: a rebuild repopulates search_tool/search_thinking via the
@@ -874,16 +882,20 @@ def sync_cache(
             # ANOTHER distinct flag ``conversation_media_reingest_pending`` to land
             # the tool_result media[] placeholders + user-content media index +
             # web_search/web_fetch captures; same offset-0 re-parse, same reason
-            # for a distinct flag. We trigger the SAME clear + offset-0 backfill on
-            # ANY of these flags and clear them ALL atomically here under the held
-            # flock.
+            # for a distinct flag. Migration 014 uses ANOTHER distinct flag
+            # ``conversation_queued_prompt_reingest_pending`` to land queued-while-
+            # busy user prompts (queued_command attachments the parser now promotes
+            # to HUMAN); same offset-0 re-parse, same distinct-flag reason. We
+            # trigger the SAME clear + offset-0 backfill on ANY of these flags and
+            # clear them ALL atomically here under the held flock.
             try:
                 _reingest = conn.execute(
                     "SELECT 1 FROM cache_meta WHERE key IN "
                     "('conversation_reingest_pending',"
                     " 'conversation_source_tool_use_reingest_pending',"
                     " 'conversation_reingest_enrichment_pending',"
-                    " 'conversation_media_reingest_pending')"
+                    " 'conversation_media_reingest_pending',"
+                    " 'conversation_queued_prompt_reingest_pending')"
                 ).fetchone() is not None
             except sqlite3.OperationalError:
                 _reingest = False
@@ -1473,6 +1485,7 @@ _REINGEST_FLAG_KEYS = (
     "conversation_source_tool_use_reingest_pending",
     "conversation_reingest_enrichment_pending",
     "conversation_media_reingest_pending",   # #177 S4 (migration 009)
+    "conversation_queued_prompt_reingest_pending",   # migration 014
 )
 
 
@@ -1554,6 +1567,7 @@ def _resumable_reingest_conversation_messages(conn):
         " 'conversation_source_tool_use_reingest_pending',"
         " 'conversation_reingest_enrichment_pending',"
         " 'conversation_media_reingest_pending',"
+        " 'conversation_queued_prompt_reingest_pending',"
         " 'conversation_reingest_cursor',"
         " 'conversation_reingest_cursor_gen')")
     conn.commit()
