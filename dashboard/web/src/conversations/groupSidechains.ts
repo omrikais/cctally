@@ -125,7 +125,14 @@ export function groupSidechains(
       else childKeysOf.set(p.parentKey, [k]);
     }
   }
-  const build = (k: string, depth: number): SubagentNode => {
+  // `stack` is the set of keys on the current recursion path. A
+  // parent_subagent_key cycle (A->B->A, a corrupt/self-referential transcript)
+  // would otherwise build a CYCLIC node graph that walkSubagents /
+  // flattenSubagents / the recursive render stack-overflow on. Skipping a child
+  // already on the stack keeps the constructed tree acyclic (matches the
+  // reader's ancestorKeys cycle guard). The first occurrence of each key still
+  // builds fully; only the back-edge that would close the cycle is dropped.
+  const build = (k: string, depth: number, stack: Set<string>): SubagentNode => {
     const existing = nodeOf.get(k);
     if (existing) return existing;
     const p = parentOf.get(k)!;
@@ -139,7 +146,11 @@ export function groupSidechains(
       children: [],
     };
     nodeOf.set(k, node);
-    node.children = (childKeysOf.get(k) ?? []).map((ck) => build(ck, depth + 1));
+    stack.add(k);
+    node.children = (childKeysOf.get(k) ?? [])
+      .filter((ck) => !stack.has(ck))
+      .map((ck) => build(ck, depth + 1, stack));
+    stack.delete(k);
     return node;
   };
 
@@ -161,10 +172,11 @@ export function groupSidechains(
   const out: RenderNode[] = [];
   const emitted = new Set<string>();
   const markEmitted = (k: string) => {
+    if (emitted.has(k)) return;   // also breaks a childKeysOf cycle (A->B->A)
     emitted.add(k);
     for (const ck of childKeysOf.get(k) ?? []) markEmitted(ck);
   };
-  const emitTop = (k: string) => { out.push(build(k, 0)); markEmitted(k); };
+  const emitTop = (k: string) => { out.push(build(k, 0, new Set<string>())); markEmitted(k); };
   for (const it of items) {
     if (it.subagent_key == null) {
       out.push({ kind: 'item', item: it });

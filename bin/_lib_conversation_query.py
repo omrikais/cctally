@@ -16,7 +16,7 @@ import json as _json
 import os
 import re
 import sqlite3
-from datetime import datetime as _datetime
+from datetime import datetime as _datetime, timezone as _timezone
 
 # Public surface (Plan 2): shipped in the npm tarball + brew formula + public
 # mirror — imported by the dashboard's conversation endpoints at runtime.
@@ -313,10 +313,9 @@ def _iso_ms(ts):
     if not ts:
         return None
     try:
-        from datetime import datetime, timezone
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        dt = _datetime.fromisoformat(ts.replace("Z", "+00:00"))
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=_timezone.utc)
         return int(dt.timestamp() * 1000)
     except (ValueError, TypeError):
         return None
@@ -1092,11 +1091,18 @@ def _assemble_session(conn, session_id):
     # subagent_key bucket. tool-count = tool_call/tool_use blocks; duration =
     # (max_ts - min_ts) ms; tokens = sum of per-turn token totals (now stamped).
     # Authoritative values always win; only missing keys are filled.
+    # Bucket items by subagent_key in ONE document-ordered pass so the loop
+    # below indexes in O(1) instead of re-walking all items per child.
+    _items_by_subagent_key: dict[str, list] = {}
+    for it in items:
+        _sk = it.get("subagent_key")
+        if _sk is not None:
+            _items_by_subagent_key.setdefault(_sk, []).append(it)
     for _aid, _entry in subagent_meta.items():
         if all(_entry.get(_f) is not None
                for _f in ("total_tokens", "total_duration_ms", "total_tool_use_count")):
             continue
-        _bucket = [it for it in items if it.get("subagent_key") == _aid]
+        _bucket = _items_by_subagent_key.get(_aid)
         if not _bucket:
             continue
         _derived = False

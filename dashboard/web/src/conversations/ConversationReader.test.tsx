@@ -915,6 +915,11 @@ describe('ConversationReader visible-only "↓ N new" count (#188 S4/C2, Bug 5)'
     // carries a COLLAPSED subagent thread that happens to reuse key 'A'). Reseed
     // the §6 overlap window to B's items so the subsequent appendLive re-returns
     // B's window (not the stale A window) + the new turn.
+    // NOTE: these B-items hard-code anchor.id (0/1) instead of going through the
+    // _idFor registry (the only place in this file the two id schemes coexist).
+    // Intentional — convo B is a separate session so its ids needn't align with
+    // the _idFor sequence. If you add B-items that must dedup against _idFor-keyed
+    // ones, route them through _idFor instead of literal ids.
     const bItems = [
       { ...makeItem({ uuid: 'b1' }), anchor: { session_id: 'B', uuid: 'b1', id: 0 } },
       { ...sc('ba1', 'A', { text: 'B Audit' }), anchor: { session_id: 'B', uuid: 'ba1', id: 1 } },

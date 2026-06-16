@@ -1,4 +1,4 @@
-import type { RenderNode } from './groupSidechains';
+import type { RenderNode, SubagentNode } from './groupSidechains';
 import type { ConversationItem, ConversationBlock } from '../types/conversation';
 
 // #177 S5 §5 — focus-mode filter over the reader's render-tree (RenderNode[]).
@@ -25,13 +25,23 @@ function itemHasProseOrThinking(it: ConversationItem): boolean {
   return it.text.trim() !== '' || it.blocks.some((b) => b.kind === 'thinking');
 }
 
+// True when this subagent OR any nested descendant has an erroring item. A
+// top-level subagent whose own body is error-free but whose grandchild errored
+// must stay visible in `errors` mode (the children render inside this node, so
+// hiding the ancestor would drop the only place the error shows). The render
+// tree is acyclic by construction (groupSidechains' build() cycle guard), so
+// the recursion terminates.
+function subagentHasError(n: SubagentNode): boolean {
+  return n.items.some(itemHasError) || n.children.some(subagentHasError);
+}
+
 // Whether a single render node survives a given (non-`all`) focus mode. Exported
 // so the jump-to-next logic can reuse the EXACT predicate when deciding whether
 // the current mode would hide a jump target (spec §5: reset to `all` only when
 // the target is hidden).
 export function nodeVisible(n: RenderNode, mode: FocusMode): boolean {
   if (mode === 'all') return true;
-  if (n.kind === 'subagent') return mode === 'errors' && n.items.some(itemHasError);
+  if (n.kind === 'subagent') return mode === 'errors' && subagentHasError(n);
   if (n.kind === 'tool_result_run') return mode === 'errors' && n.items.some(itemHasError);
   const it = n.item;
   if (mode === 'prompts') return it.kind === 'human';

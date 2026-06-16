@@ -173,6 +173,70 @@ describe('applyFocusMode — hidden-run coalescing', () => {
   });
 });
 
+describe('applyFocusMode — errors mode aggregates across NESTED subagent children (T2-5)', () => {
+  // A top-level subagent whose OWN body is error-free but whose nested grandchild
+  // errored must stay visible in `errors` mode (the grandchild renders inside the
+  // parent node, so hiding the ancestor would drop the only place the error
+  // shows). Before the recursion fix, nodeVisible only checked the node's own
+  // `items` — the parent was wrongly hidden.
+  const okChildItems = [
+    item({ uuid: 'gc-ok', is_sidechain: true, subagent_key: 'gc', blocks: [okToolBlock()] } as never),
+  ];
+  const errChildItems = [
+    item({ uuid: 'gc-err', is_sidechain: true, subagent_key: 'gc', blocks: [errBlock()] } as never),
+  ];
+  // Parent body is clean; only the nested grandchild errors.
+  const parentWithErroringGrandchild: RenderNode = {
+    kind: 'subagent',
+    subagentKey: 'p',
+    nested: false,
+    depth: 0,
+    spawnAnchorUuid: null,
+    items: [item({ uuid: 'p-ok', is_sidechain: true, subagent_key: 'p', blocks: [okToolBlock()] } as never)],
+    children: [
+      {
+        kind: 'subagent',
+        subagentKey: 'gc',
+        nested: true,
+        depth: 1,
+        spawnAnchorUuid: 'p-ok',
+        items: errChildItems,
+        children: [],
+      },
+    ],
+  };
+  // Fully clean nested tree (parent + child both error-free).
+  const allCleanNested: RenderNode = {
+    kind: 'subagent',
+    subagentKey: 'pc',
+    nested: false,
+    depth: 0,
+    spawnAnchorUuid: null,
+    items: [item({ uuid: 'pc-ok', is_sidechain: true, subagent_key: 'pc', blocks: [okToolBlock()] } as never)],
+    children: [
+      {
+        kind: 'subagent',
+        subagentKey: 'gcc',
+        nested: true,
+        depth: 1,
+        spawnAnchorUuid: 'pc-ok',
+        items: okChildItems,
+        children: [],
+      },
+    ],
+  };
+
+  it('keeps a parent subagent whose only error lives in a nested grandchild', () => {
+    // Non-vacuous: the parent body (p-ok) is error-free; pre-fix this node was
+    // hidden (kept === []). The recursion over children makes it visible.
+    expect(kept([parentWithErroringGrandchild], 'errors')).toEqual(['p-ok']);
+  });
+
+  it('still hides a fully clean nested subagent tree in errors mode', () => {
+    expect(kept([allCleanNested], 'errors')).toEqual([]);
+  });
+});
+
 describe('nodeUuid', () => {
   it('resolves the jump anchor for each node shape', () => {
     expect(nodeUuid(human)).toBe('h');

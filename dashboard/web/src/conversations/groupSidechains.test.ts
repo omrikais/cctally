@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { groupSidechains, flattenSubagents, type RenderNode, type SubagentNode } from './groupSidechains';
+import { groupSidechains, flattenSubagents, walkSubagents, type RenderNode, type SubagentNode } from './groupSidechains';
 import type { ConversationItem, SubagentMeta } from '../types/conversation';
 
 function mk(
@@ -290,5 +290,51 @@ describe('groupSidechains — recursive nesting (§5 kernel linkage)', () => {
     const out = groupSidechains(items, meta);
     // Parent BEFORE child (depth-first, tree order).
     expect(flattenSubagents(out).map((n) => n.subagentKey)).toEqual(['C', 'G']);
+  });
+
+  it('builds a FINITE acyclic tree when parent_subagent_key forms a cycle (A<->B)', () => {
+    // Corrupt/self-referential transcript: A.parent = B AND B.parent = A, both
+    // loaded. The unguarded build() produced a CYCLIC node graph (A.children=[B],
+    // B.children=[A]) that walkSubagents / flattenSubagents recursed forever on.
+    // The build() cycle guard must drop the back-edge so the tree is acyclic and
+    // every walk terminates. (Non-vacuous: without the guard, the two walks below
+    // never return — the test hangs / stack-overflows rather than asserting.)
+    const items = [
+      mk('a1', { subagentKey: 'A' }),
+      mk('b1', { subagentKey: 'B' }),
+    ];
+    const meta: Record<string, SubagentMeta> = {
+      A: smeta({ kind: 'agent', parent_subagent_key: 'B', spawn_uuid: 'b1', spawn_tool_use_id: 'tu_a' }),
+      B: smeta({ kind: 'agent', parent_subagent_key: 'A', spawn_uuid: 'a1', spawn_tool_use_id: 'tu_b' }),
+    };
+    // groupSidechains itself must return (the build + markEmitted cycle guards).
+    const out = groupSidechains(items, meta);
+
+    // flattenSubagents visits each node a bounded number of times and returns.
+    const flat = flattenSubagents(out);
+    // Both buckets surface exactly once each (no drop, no infinite duplication).
+    expect(flat.map((n) => n.subagentKey).sort()).toEqual(['A', 'B']);
+
+    // The constructed tree is acyclic: a manual stack-guarded DFS must find no
+    // node reachable from itself. Walking WITHOUT a guard (relying on the tree
+    // being acyclic) terminates — proving build() dropped the back-edge.
+    let visits = 0;
+    const seenOnPath = new Set<string>();
+    const assertAcyclic = (n: SubagentNode) => {
+      visits++;
+      expect(seenOnPath.has(n.subagentKey)).toBe(false); // no node is its own ancestor
+      seenOnPath.add(n.subagentKey);
+      for (const c of n.children) assertAcyclic(c);
+      seenOnPath.delete(n.subagentKey);
+    };
+    for (const n of out) if (n.kind === 'subagent') assertAcyclic(n);
+    // A cyclic graph would make `visits` unbounded; an acyclic 2-node tree visits
+    // at most 2 nodes total (one root + one child; the back-edge is dropped).
+    expect(visits).toBeLessThanOrEqual(2);
+
+    // walkSubagents (used by the reader's traversals) also terminates.
+    let walked = 0;
+    walkSubagents(out, () => { walked++; });
+    expect(walked).toBeLessThanOrEqual(2);
   });
 });
