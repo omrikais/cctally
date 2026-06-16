@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { SidechainGroup, subagentSummaryLabel } from './SidechainGroup';
+import type { SubagentNode } from './groupSidechains';
 import type { ConversationItem } from '../types/conversation';
 
 function member(uuid: string, over: Partial<ConversationItem> = {}): ConversationItem {
@@ -274,6 +275,96 @@ describe('SidechainGroup', () => {
     rerender(<SidechainGroup {...base} forceOpen={false} />);
     expect(det.open).toBe(true);
     expect(refs.get('s1')).toBeTruthy();
+  });
+});
+
+describe('SidechainGroup — recursive nesting (§5)', () => {
+  // A child node carrying ONE grandchild subagent in `children`, spawned after
+  // the child's `c1` member item (spawnAnchorUuid: 'c1'), depth 1.
+  const grandchild: SubagentNode = {
+    kind: 'subagent',
+    subagentKey: 'ace20002',
+    items: [member('g1', { kind: 'assistant', text: 'Ground claims', cost_usd: 0.2 } as Partial<ConversationItem>)],
+    nested: true,
+    depth: 1,
+    spawnAnchorUuid: 'c1',
+    children: [],
+  };
+
+  it('renders a nested grandchild card inside the (force-open) child body, indented by depth', () => {
+    const childItems = [member('c1', { kind: 'assistant', text: 'Sync audit', cost_usd: 0.3 } as Partial<ConversationItem>)];
+    const { container } = render(
+      <SidechainGroup
+        subagentKey="cc110001"
+        items={childItems}
+        nested={true}
+        meta={{ kind: 'code-reviewer', description: 'Sync audit' }}
+        forceOpen={true}                       // open so the body (and child) render
+        children={[grandchild]}
+        depth={0}
+        childCtx={{
+          subagentMeta: { ace20002: { kind: 'grounding', description: 'Ground claims', totals_derived: true,
+                                      total_tokens: 8400, total_tool_use_count: 5 } },
+          forcedOpenKeys: new Set(['ace20002']),  // force the grandchild open too
+        }}
+      />,
+    );
+    // Two sidechain cards: the parent + the nested grandchild.
+    const cards = container.querySelectorAll('details.conv-sidechain');
+    expect(cards).toHaveLength(2);
+    // The grandchild card carries the deeper nesting class and its own data-uuid.
+    const gc = container.querySelector('[data-uuid="g1"]') as HTMLElement;
+    expect(gc).not.toBeNull();
+    expect(gc.tagName.toLowerCase()).toBe('details');
+    expect(gc.classList.contains('conv-sidechain--nested')).toBe(true);
+    // The grandchild's kind + description surface from its own meta.
+    expect(gc.querySelector('.conv-sidechain-kindname')!.textContent).toContain('grounding');
+    expect(gc.querySelector('.conv-sidechain-title')!.textContent).toBe('Ground claims');
+  });
+
+  it('does NOT render nested children while the parent thread is collapsed', () => {
+    const childItems = [member('c1', { kind: 'assistant', text: 'Sync audit', cost_usd: 0.3 } as Partial<ConversationItem>)];
+    const { container } = render(
+      <SidechainGroup subagentKey="cc110001" items={childItems} nested={true}
+        forceOpen={false} children={[grandchild]} depth={0} childCtx={{}} />,
+    );
+    // Collapsed parent → exactly one card (no grandchild rendered yet).
+    expect(container.querySelectorAll('details.conv-sidechain')).toHaveLength(1);
+    expect(container.querySelector('[data-uuid="g1"]')).toBeNull();
+  });
+
+  it('renders the "~" derived-totals affordance when meta.totals_derived is true', () => {
+    const items = [member('r', { kind: 'assistant', text: 'Background audit', cost_usd: 0.1 } as Partial<ConversationItem>)];
+    render(<SidechainGroup subagentKey="a55c0003" items={items} nested={false}
+      meta={{ kind: 'Explore', total_tokens: 2300, total_duration_ms: 4000,
+              total_tool_use_count: 1, status: 'completed', totals_derived: true }} />);
+    const sub = document.querySelector('.conv-sidechain-submeta')!;
+    // The leading "~" marks the figures as derived (not authoritative).
+    expect(sub.querySelector('.conv-sidechain-derived')!.textContent).toBe('~');
+    expect(sub.textContent).toContain('2.3k tok');
+    expect(sub.querySelector('.conv-subagent-ok')).toBeTruthy(); // ✓ for async completion
+  });
+
+  it('omits the "~" affordance when totals are authoritative (no totals_derived)', () => {
+    const items = [member('r', { kind: 'assistant', text: 'Sync audit', cost_usd: 0.1 } as Partial<ConversationItem>)];
+    render(<SidechainGroup subagentKey="cc110001" items={items} nested={false}
+      meta={{ kind: 'code-reviewer', total_tokens: 12000, status: 'completed' }} />);
+    expect(document.querySelector('.conv-sidechain-submeta .conv-sidechain-derived')).toBeNull();
+  });
+
+  it('appends a child with no resolvable spawn anchor at the body end (never dropped)', () => {
+    const orphanChild: SubagentNode = {
+      kind: 'subagent', subagentKey: 'orphan9', items: [member('og1', { kind: 'assistant', text: 'Orphan child' } as Partial<ConversationItem>)],
+      nested: true, depth: 1, spawnAnchorUuid: 'NOT_A_MEMBER', children: [],
+    };
+    const childItems = [member('c1', { kind: 'assistant', text: 'Parent', cost_usd: 0 } as Partial<ConversationItem>)];
+    const { container } = render(
+      <SidechainGroup subagentKey="par" items={childItems} nested={false}
+        forceOpen={true} children={[orphanChild]} depth={0}
+        childCtx={{ forcedOpenKeys: new Set() }} />,
+    );
+    // The orphan child still renders (appended at the end), never dropped.
+    expect(container.querySelector('[data-uuid="og1"]')).not.toBeNull();
   });
 });
 

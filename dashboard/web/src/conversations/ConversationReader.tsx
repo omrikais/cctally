@@ -3,7 +3,7 @@ import { dispatch, getState, selectMarkersEnabled, subscribeStore } from '../sto
 import { useConversation } from '../hooks/useConversation';
 import { useKeymap } from '../hooks/useKeymap';
 import { useReducedMotion } from '../hooks/useReducedMotion';
-import { groupSidechains, type RenderNode } from './groupSidechains';
+import { groupSidechains, flattenSubagents, walkSubagents, type RenderNode } from './groupSidechains';
 import { isSystemMarker } from './systemMarkers';
 import { FindBar } from './FindBar';
 import { HighlightContext } from './HighlightContext';
@@ -16,7 +16,7 @@ import { insertTimeMarkers } from './insertTimeMarkers';
 import { buildOutlineTargets, nextTarget, type JumpKind } from './outlineNavigation';
 import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
-import type { ConversationItem, ConversationOutline } from '../types/conversation';
+import type { ConversationItem, ConversationOutline, SubagentMeta } from '../types/conversation';
 
 // #186 — belt-and-suspenders title-only skip predicate. Mirrors the server
 // `_CMD_FAMILY_RE` / `_looks_like_command_plumbing` (bin/_lib_conversation_query.py):
@@ -43,6 +43,54 @@ export function deriveReaderTitle(detail: { items: ConversationItem[]; project_l
     }
   }
   return detail.project_label || detail.session_id;
+}
+
+// §5 (Codex P1-D) — the ancestor chain of a subagent key: the key itself, then
+// its parent_subagent_key, up to the root (a null parent = the main session
+// stops the walk). A jump into a grandchild force-opens the grandchild AND its
+// parent card so the nested target's element actually renders. `seen` guards
+// against a malformed cycle in the linkage.
+function ancestorKeys(k: string, meta?: Record<string, SubagentMeta>): string[] {
+  const out: string[] = [];
+  let cur: string | null = k;
+  const seen = new Set<string>();
+  while (cur != null && !seen.has(cur)) {
+    seen.add(cur);
+    out.push(cur);
+    cur = meta?.[cur]?.parent_subagent_key ?? null;
+  }
+  return out;
+}
+
+// §5 — find the TOP-LEVEL RenderNode whose subtree contains the jump uuid, for
+// the focus-mode visibility test. An `item` node matches by anchor or member
+// uuid; a subagent node (top-level OR nested) matches if any of its OWN items'
+// member_uuids hold the uuid, in which case the TOP-LEVEL root ancestor node is
+// returned (a nested member's visibility is decided by its root ancestor). null
+// when the uuid isn't in any built node yet (not-yet-paged).
+function findTopLevelNodeFor(
+  groups: RenderNode[],
+  jumpUuid: string,
+  detail: { subagent_meta?: Record<string, SubagentMeta> } | null | undefined,
+): RenderNode | null {
+  // 1. A top-level item / tool_result_run match.
+  for (const n of groups) {
+    if (n.kind === 'item' && n.item.member_uuids.includes(jumpUuid)) return n;
+    if (n.kind === 'tool_result_run' && n.items.some((it) => it.member_uuids.includes(jumpUuid))) return n;
+  }
+  // 2. A subagent member (at any depth). Resolve the OWNING subagent key, then
+  //    its ROOT ancestor key, then the top-level node for that root.
+  let ownerKey: string | null = null;
+  for (const node of flattenSubagents(groups)) {
+    if (node.items.some((it) => it.member_uuids.includes(jumpUuid))) {
+      ownerKey = node.subagentKey;
+      break;
+    }
+  }
+  if (ownerKey == null) return null;
+  const chain = ancestorKeys(ownerKey, detail?.subagent_meta);
+  const rootKey = chain[chain.length - 1];
+  return groups.find((n) => n.kind === 'subagent' && n.subagentKey === rootKey) ?? null;
 }
 
 // Paginated transcript reader (spec §4). Lazy-loads the next page when a
@@ -104,11 +152,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // unmount (no classList.remove on a detached node, no leaked timer) and
   // superseded on a rapid re-jump (no two overlapping 2s timers racing).
   const highlightTimerRef = useRef<number | null>(null);
-  // The subagent_key of the thread being force-opened for the in-flight jump
-  // (#160). null when no force is active. Setting it opens that SidechainGroup in
-  // the same render (its `open` is derived), so the target member's ref attaches
-  // and the jump effect re-fires (forcedOpenKey dep) to scroll to it.
-  const [forcedOpenKey, setForcedOpenKey] = useState<string | null>(null);
+  // §5 (Codex P1-D) — the SET of subagent keys force-opened for the in-flight
+  // jump (#160). Empty when no force is active. On a jump into a subagent target
+  // this holds the target's WHOLE ancestor chain (grandchild + parent + …) so a
+  // nested target's element renders: each SidechainGroup's `forceOpen` is
+  // `forcedOpenKeys.has(node.subagentKey)`. Setting it opens those groups in the
+  // same render (their `open` is derived), so the target member's ref attaches
+  // and the jump effect re-fires (forcedOpenKeys dep) to scroll to it. Identity
+  // changes on each set (a fresh Set), which the jump effect deps on.
+  const [forcedOpenKeys, setForcedOpenKeys] = useState<Set<string>>(() => new Set());
   // G1 §4b load-in stagger. A Set of anchor uuids already painted at least
   // once (the `daily-fade-in` seen-Set precedent, index.css:2032): each
   // top-level group rises exactly once on first appearance, so paged appends
@@ -304,7 +356,26 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — explicit nav clears the pin
   }, []);
 
-  const groups = useMemo(() => groupSidechains(detail?.items ?? []), [detail?.items]);
+  // §5 — pass subagent_meta so the tree build prefers the kernel's read-time
+  // parent linkage (parent_subagent_key + spawn_uuid) for nesting, falling back
+  // to legacy root.parent_uuid on old transcripts.
+  const groups = useMemo(
+    () => groupSidechains(detail?.items ?? [], detail?.subagent_meta),
+    [detail?.items, detail?.subagent_meta],
+  );
+  // §5 (Codex P1-C) — the spawn-chip suppression set: every spawn `tool_use_id`
+  // the kernel linked to a subagent. A `tool_call` with this id is suppressed in
+  // favor of its nested card. tool_use_id granularity (one item can hold several
+  // spawns); an UNLINKED spawn (>16 KB clip) has no nested card and no entry
+  // here, so its chip still renders. Stable identity (memoized) keeps the
+  // memoized MessageItems' memo valid across ticks.
+  const suppressToolUseIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const m of Object.values(detail?.subagent_meta ?? {})) {
+      if (m.spawn_tool_use_id) s.add(m.spawn_tool_use_id);
+    }
+    return s;
+  }, [detail?.subagent_meta]);
   // #177 S5 §5 — focus-mode-filtered render list. `all` short-circuits to the
   // SAME `groups` array identity (byte-identical render path); other modes drop
   // suppressed nodes and coalesce them into `hidden_run` markers. EVERYTHING the
@@ -325,6 +396,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // check (find the target node in `groups`, test nodeVisible under the mode).
   const groupsRef = useRef<RenderNode[]>(groups);
   groupsRef.current = groups;
+  // §5 — live mirror of the subagent-meta map so the stable jumpNext closure can
+  // resolve a nested subagent target's root ancestor (findTopLevelNodeFor) for
+  // the visibility test without re-registering the keymap array.
+  const subagentMetaRef = useRef<Record<string, SubagentMeta> | undefined>(detail?.subagent_meta);
+  subagentMetaRef.current = detail?.subagent_meta;
   const title = useMemo(
     // #193: prefer the server-derived title (ai-title -> first prompt -> label
     // -> sid). deriveReaderTitle stays as the client-side fallback for older
@@ -412,15 +488,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // Wait for the first page (`detail`) before attempting — otherwise the effect
   // would fire while page 1 is still in flight (nextAfter unknown), page nowhere,
   // and clear the jump prematurely. It re-runs when detail?.items.length grows
-  // (a paged-in target's ref attaches on the next commit) and when forcedOpenKey
+  // (a paged-in target's ref attaches on the next commit) and when forcedOpenKeys
   // changes (a force-opened thread's member ref attaches in that commit).
   useEffect(() => {
     if (!jump || jump.session_id !== sessionId) {
       // Jump cleared, or it now points at another session — release any force-pin
       // so a thread we expanded for it isn't left pinned (the user regains
-      // collapse control). No loop: this re-fires on the forcedOpenKey dep,
-      // re-hits this guard with forcedOpenKey === null, and returns.
-      if (forcedOpenKey !== null) setForcedOpenKey(null);
+      // collapse control). No loop: this re-fires on the forcedOpenKeys dep,
+      // re-hits this guard with an empty set, and returns.
+      if (forcedOpenKeys.size > 0) setForcedOpenKeys(new Set());
       return;
     }
     if (!detail || detail.session_id !== sessionId) return; // cross-session transient: keep the pin
@@ -470,7 +546,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           highlightTimerRef.current = null;
         }, 2000);
         dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
-        setForcedOpenKey(null); // reset for the next jump (thread stays open via its latch)
+        setForcedOpenKeys(new Set()); // reset for the next jump (threads stay open via their latches)
         return;
       }
       // No ref. Three reasons the target's element is absent:
@@ -503,8 +579,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         // built yet, so we treat it as not-yet-paged and leave it to the (1)
         // re-fire — we do NOT reset to `all`. jumpNext, walking a fixed
         // snapshot, instead treats an unresolved node as hidden.
-        const node = groupsRef.current.find((n) => nodeUuid(n) === jump.uuid
-          || (n.kind === 'item' && n.item.member_uuids.includes(jump.uuid)));
+        // §5 — find the target's TOP-LEVEL RenderNode for the visibility test.
+        // A nested subagent member lives inside a parent node's `children`, so
+        // its visibility is decided by the top-level ROOT ancestor node — found
+        // via findTopLevelNodeFor.
+        const node = findTopLevelNodeFor(groupsRef.current, jump.uuid, detail);
         if (node != null && !nodeVisible(node, mode)) {
           dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
           return; // re-run under `all`: the node renders, its ref attaches, scroll
@@ -512,13 +591,22 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       }
       const targetItem = detail.items.find((it) => it.member_uuids.includes(jump.uuid));
       if (targetItem && targetItem.subagent_key != null) {
-        if (forcedOpenKey !== targetItem.subagent_key) {
-          setForcedOpenKey(targetItem.subagent_key);
-          return; // wait for the group to open + attach the ref, then re-fire
+        // §5 (Codex P1-D) — force-open the WHOLE ancestor chain (the target
+        // subagent + every parent up to the root) so a nested target's element
+        // renders. A jump into a grandchild opens the grandchild AND its parent.
+        const chain = ancestorKeys(targetItem.subagent_key, detail.subagent_meta);
+        const missing = chain.some((k) => !forcedOpenKeys.has(k));
+        if (missing) {
+          setForcedOpenKeys((prev) => {
+            const next = new Set(prev);
+            for (const k of chain) next.add(k);
+            return next;
+          });
+          return; // wait for the groups to open + attach the ref, then re-fire
         }
-        // Already forced open: the ref attaches in the forcedOpenKey commit (before
-        // this re-fire), so reaching here means it's genuinely absent — fall through
-        // to the exhaustion clear rather than spinning.
+        // Already forced open: the ref attaches in the forcedOpenKeys commit
+        // (before this re-fire), so reaching here means it's genuinely absent —
+        // fall through to the exhaustion clear rather than spinning.
       }
       if (!hasMore) {
         dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
@@ -527,16 +615,17 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     return () => { cancelled = true; };
     // hasMore stays in deps so the give-up clear fires on the edge where the final
     // page appends 0 items (items.length unchanged) but flips the cursor.
-    // forcedOpenKey re-fires the effect once a force-opened thread has attached the
+    // forcedOpenKeys re-fires the effect once a force-opened thread has attached the
     // target's ref. focusMode re-fires it once the mode-hidden fallback resets to
     // `all` — the hidden target's node renders + its ref attaches in that commit,
     // and this re-fire scrolls via the branch above. No infinite loop:
     // loadUntil/fetchNext serialize via loadingMoreRef, hasMore transitions a
-    // bounded number of times, the forcedOpenKey path either resolves (clears) or
-    // settles to a stable key, and the focusMode reset is one-way (non-`all` →
-    // `all`) so the mode-hidden branch can fire at most once per jump.
+    // bounded number of times, the forcedOpenKeys path either resolves (clears) or
+    // settles to a stable set (every chain key present), and the focusMode reset
+    // is one-way (non-`all` → `all`) so the mode-hidden branch can fire at most
+    // once per jump.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jump, sessionId, detail?.items.length, hasMore, forcedOpenKey, focusMode]);
+  }, [jump, sessionId, detail?.items.length, hasMore, forcedOpenKeys, focusMode]);
 
   // Cancel any pending highlight-removal timer on unmount only (NOT on every
   // jump-effect re-run — that would strip the flash the instant the successful
@@ -586,7 +675,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
 
   // The reused reader must not carry a force-pin across sessions (subagent_key is
   // only an agent-file hash). Reset on every session change; no-op on first mount.
-  useEffect(() => { setForcedOpenKey(null); }, [sessionId]);
+  useEffect(() => { setForcedOpenKeys(new Set()); }, [sessionId]);
 
   // #175 — the reused reader must not carry the live-tail pill/scroll state across
   // sessions. Clearing `newCount` drops a stale "↓ N new" pill the instant we switch
@@ -637,6 +726,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           : g.item.anchor.uuid;
       if (uuid) seenRef.current.add(uuid);
     }
+    // §5 — recurse into nested subagents too so a child/grandchild card's root
+    // uuid is marked seen (it never goes through the top-level rise classifier,
+    // but this keeps the seen set complete for any future first-appearance cue).
+    walkSubagents(groups, (n) => {
+      const u = n.items[0]?.anchor.uuid;
+      if (u) seenRef.current.add(u);
+    });
   }, [groups]);
 
   // Render-time rise classifier (G1 §4b). Returns `['conv-rise', {style}]` for a
@@ -703,6 +799,25 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     }
     return cb;
   }, []);
+
+  // §5 — the per-key machinery threaded to a SidechainGroup's recursive children
+  // (and to the top-level group's own members for suppression). Keeps every
+  // nesting level rendering with the SAME meta-lookup / force-open set / refs /
+  // open-state / suppression as a top-level subagent. getItemRef/getCardRef/
+  // onOpenChange are stable; the identity changes only when meta / the force set
+  // / the suppression set change (so memoized cards don't churn on unrelated
+  // re-renders).
+  const childCtx = useMemo(
+    () => ({
+      subagentMeta: detail?.subagent_meta,
+      forcedOpenKeys,
+      getItemRef,
+      getCardRef,
+      onOpenChange: handleSubagentOpenChange,
+      suppressToolUseIds,
+    }),
+    [detail?.subagent_meta, forcedOpenKeys, getItemRef, getCardRef, handleSubagentOpenChange, suppressToolUseIds],
+  );
 
   // Reset the focused-turn cursor to the top on a session switch (the reused
   // reader carries no cursor across conversations).
@@ -897,12 +1012,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     if (targetIdx == null) { pulseClusterButton(kind); return; }
     const turn = turns[targetIdx];
     // Reset to `all` IF the current mode would hide the target. Precise check
-    // (spec §5): find the target's RenderNode in `groups`, test nodeVisible. A
-    // node missing from `groups` (not yet paged in) is treated as hidden → reset.
+    // (spec §5): find the target's TOP-LEVEL RenderNode (recursing into nested
+    // subagents), test nodeVisible. A node missing from `groups` (not yet paged
+    // in) is treated as hidden → reset.
     const mode = focusModeRef.current;
     if (mode !== 'all') {
-      const node = groupsRef.current.find((n) => nodeUuid(n) === turn.uuid
-        || (n.kind === 'item' && n.item.member_uuids.includes(turn.uuid)));
+      const node = findTopLevelNodeFor(groupsRef.current, turn.uuid, { subagent_meta: subagentMetaRef.current });
       const targetHidden = node == null || !nodeVisible(node, mode);
       if (targetHidden) dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
     }
@@ -1153,9 +1268,16 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
                   // #188 S4/C2 — lift the thread's open-state so the "↓ N new"
                   // pill counts only VISIBLE appends (Bug 5).
                   onOpenChange={handleSubagentOpenChange}
-                  forceOpen={detail.session_id === sessionId && g.subagentKey === forcedOpenKey}
+                  // §5 (Codex P1-D) — force-open iff this key is in the ancestor
+                  // chain set (a jump into a nested target opens this parent too).
+                  forceOpen={detail.session_id === sessionId && forcedOpenKeys.has(g.subagentKey)}
                   riseClassName={riseClass}
                   riseStyle={riseStyle}
+                  // §5 — recursive nesting: the child subagent threads + this
+                  // node's depth + the per-key machinery for every nested level.
+                  children={g.children}
+                  depth={g.depth}
+                  childCtx={childCtx}
                 />
               );
             }
@@ -1179,7 +1301,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
                   </summary>
                   <div className="conv-toolresult-run-body">
                     {g.items.map((item) => (
-                      <MessageItem key={item.anchor.uuid} item={item} ref={getItemRef(item)} />
+                      <MessageItem key={item.anchor.uuid} item={item} ref={getItemRef(item)} suppressToolUseIds={suppressToolUseIds} />
                     ))}
                   </div>
                 </details>
@@ -1193,6 +1315,9 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
                 ref={getItemRef(g.item)}
                 className={riseClass}
                 style={riseStyle}
+                // §5 — suppress a spawn chip on a main-thread item (its nested
+                // subagent card is canonical).
+                suppressToolUseIds={suppressToolUseIds}
               />
             );
           })}

@@ -228,6 +228,61 @@ describe('MessageBlocks (single-block kinds)', () => {
   });
 });
 
+describe('MessageBlocks — spawn-chip suppression (§5 / Codex P1-C)', () => {
+  it('drops a tool_call whose tool_use_id is in suppressToolUseIds (its nested card is canonical)', () => {
+    const { container } = render(
+      <MessageBlocks
+        blocks={[call({ name: 'Agent', preview: 'Spawn child', tool_use_id: 'tu_spawn' })]}
+        suppressToolUseIds={new Set(['tu_spawn'])}
+      />,
+    );
+    // The spawn chip is fully suppressed — nothing renders for an item that held
+    // only the spawn.
+    expect(container.querySelector('.conv-chip--tool')).toBeNull();
+    expect(container.querySelector('.conv-blocks')).toBeNull();
+  });
+
+  it('renders a tool_call whose tool_use_id is NOT in the set (unlinked spawn / ordinary tool)', () => {
+    const { container } = render(
+      <MessageBlocks
+        blocks={[call({ name: 'Agent', preview: 'Spawn child', tool_use_id: 'tu_other' })]}
+        suppressToolUseIds={new Set(['tu_spawn'])}
+      />,
+    );
+    expect(container.querySelector('.conv-chip--tool')).not.toBeNull();
+    expect(screen.getByText('Spawn child')).toBeInTheDocument();
+  });
+
+  it('suppresses two distinct spawns in one item by their distinct tool_use_ids', () => {
+    // The s8 two-spawn-in-one-item case: an assistant item holds two spawns +
+    // one ordinary tool. Only the two spawn chips drop; the Read chip survives.
+    const { container } = render(
+      <MessageBlocks
+        blocks={[
+          call({ name: 'Agent', preview: 'child A', tool_use_id: 'tu_a' }),
+          call({ name: 'Agent', preview: 'child B', tool_use_id: 'tu_b' }),
+          call({ name: 'Read', preview: '/keep.txt', tool_use_id: 'tu_read' }),
+        ]}
+        suppressToolUseIds={new Set(['tu_a', 'tu_b'])}
+      />,
+    );
+    // Both spawn previews gone; the surviving Read chip renders (and is alone in
+    // its run, so no run head).
+    expect(screen.queryByText('child A')).toBeNull();
+    expect(screen.queryByText('child B')).toBeNull();
+    expect(screen.getByText('/keep.txt')).toBeInTheDocument();
+    expect(container.querySelectorAll('.conv-chip--tool')).toHaveLength(1);
+    expect(container.querySelector('.conv-toolrun-head')).toBeNull();
+  });
+
+  it('with no suppression set every tool_call renders (back-compat default)', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[call({ name: 'Agent', preview: 'spawn', tool_use_id: 'tu_a' })]} />,
+    );
+    expect(container.querySelector('.conv-chip--tool')).not.toBeNull();
+  });
+});
+
 describe('MessageBlocks — chat focus mode block suppression (#177 S5)', () => {
   it('chat mode renders prose but no tool-run chips; all mode renders both', () => {
     const blocks: ConversationBlock[] = [

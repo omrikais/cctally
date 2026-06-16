@@ -1,9 +1,9 @@
 import { render } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { deriveOutline } from './deriveOutline';
-import { groupSidechains, type RenderNode } from './groupSidechains';
+import { groupSidechains, flattenSubagents, type RenderNode } from './groupSidechains';
 import { SidechainGroup } from './SidechainGroup';
-import type { ConversationItem, OutlineTurn } from '../types/conversation';
+import type { ConversationItem, OutlineTurn, SubagentMeta } from '../types/conversation';
 
 // #188 S3/C3 (Codex P2) — lock the three-way coincidence the cardRefs design
 // depends on: the outline subagent entry's JUMP ANCHOR (deriveOutline bucket
@@ -96,5 +96,53 @@ describe('subagent anchor invariant (meta-first sidechain, #188 S3/C3)', () => {
     // The three-way coincidence.
     expect(groupRoot).toBe(outlineAnchor);
     expect(cardDataUuid).toBe(outlineAnchor);
+  });
+});
+
+// §5 (Codex P2-G) — the outline stays a single FLAT list of subagents, but a
+// NESTED subagent's anchor must still resolve. deriveOutline buckets by
+// subagent_key over the whole list (placement-agnostic), so the flat entry is
+// emitted regardless of nesting; and the recursive render tree must be
+// TRAVERSED (flattenSubagents) — not just its top level — for the nested
+// anchor's group to be found. This locks both halves so a nested-subagent
+// outline click resolves to a built card.
+describe('nested subagent anchor invariant (§5 recursive tree)', () => {
+  // main m1 -> child C -> grandchild G. The outline lists C and G as flat
+  // subagent entries; the render tree nests G inside C.children.
+  const OUTLINE_NESTED: OutlineTurn[] = [
+    { uuid: 'm1', kind: 'human', ts: null, label: 'run audit', member_uuids: ['m1'], subagent_key: null, parent_uuid: null, is_sidechain: false },
+    { uuid: 'c1', kind: 'assistant', ts: null, label: 'sync audit', member_uuids: ['c1'], subagent_key: 'C', parent_uuid: null, is_sidechain: true },
+    { uuid: 'g1', kind: 'assistant', ts: null, label: 'ground claims', member_uuids: ['g1'], subagent_key: 'G', parent_uuid: null, is_sidechain: true },
+  ];
+  const META: Record<string, SubagentMeta> = {
+    C: { kind: 'code-reviewer', parent_subagent_key: null, spawn_uuid: 'm1', spawn_tool_use_id: 'tu_c' },
+    G: { kind: 'grounding', parent_subagent_key: 'C', spawn_uuid: 'c1', spawn_tool_use_id: 'tu_g' },
+  };
+  const ITEMS_NESTED: ConversationItem[] = [
+    citem({ uuid: 'm1', kind: 'human', text: 'run audit' }),
+    citem({ uuid: 'c1', kind: 'assistant', text: 'sync audit', is_sidechain: true, subagent_key: 'C', model: 'm', cost_usd: 0.1 } as Partial<ConversationItem> as never),
+    citem({ uuid: 'g1', kind: 'assistant', text: 'ground claims', is_sidechain: true, subagent_key: 'G', model: 'm', cost_usd: 0.1 } as Partial<ConversationItem> as never),
+  ];
+
+  it('a NESTED grandchild outline entry resolves to its group via flattenSubagents (not just the top level)', () => {
+    // 1. The outline lists BOTH subagents flat (G is not dropped).
+    const { entries } = deriveOutline(OUTLINE_NESTED, META);
+    const subKeys = entries.filter((e) => e.type === 'subagent').map((e) => e.subagentKey).sort();
+    expect(subKeys).toEqual(['C', 'G']);
+    const gEntry = entries.find((e) => e.subagentKey === 'G')!;
+    const gAnchor = gEntry.uuid;       // jump anchor for the grandchild = its bucket root (g1)
+    expect(gAnchor).toBe('g1');
+
+    // 2. The render tree nests G inside C.children — a TOP-LEVEL find misses it.
+    const nodes: RenderNode[] = groupSidechains(ITEMS_NESTED, META);
+    const topLevel = nodes.find((n) => n.kind === 'subagent' && n.subagentKey === 'G');
+    expect(topLevel).toBeUndefined();   // NOT at top level
+
+    // 3. A TRAVERSING find (flattenSubagents) resolves it, and its first item
+    //    anchor coincides with the outline jump anchor.
+    const gNode = flattenSubagents(nodes).find((n) => n.subagentKey === 'G');
+    expect(gNode, 'flattenSubagents must reach the nested grandchild').toBeTruthy();
+    expect(gNode!.items[0].anchor.uuid).toBe(gAnchor);
+    expect(gNode!.depth).toBe(1);
   });
 });

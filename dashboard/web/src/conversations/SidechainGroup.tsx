@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { MessageItem } from './MessageItem';
 import { SubagentIcon } from './ConvIcons';
 import { fmt } from '../lib/fmt';
 import type { ConversationItem, SubagentMeta } from '../types/conversation';
+import type { SubagentNode } from './groupSidechains';
 
 const LABEL_MAX = 60;
 
@@ -34,9 +35,36 @@ export function subagentSummaryLabel(items: ConversationItem[], subagentKey: str
   return firstLine.length > LABEL_MAX ? `${firstLine.slice(0, LABEL_MAX).trimEnd()}…` : firstLine;
 }
 
+// §5 — per-child render context the reader threads down so a nested subagent
+// keeps the SAME machinery as a top-level one (meta lookup, force-open set, the
+// suppression set, the lifted open-state + card/item refs). Passed UNCHANGED to
+// every nesting level; a child `<SidechainGroup>` reads its own slice (its
+// key's meta, its key's force flag) from these maps. Absent at the top level
+// when the reader is rendered without children (the existing prop tests).
+export interface SidechainChildContext {
+  subagentMeta?: Record<string, SubagentMeta>;
+  // The full ancestor-chain force-open set (§5 / Codex P1-D). A node force-opens
+  // iff its key is in this set; passed down so a nested target opens too.
+  forcedOpenKeys?: Set<string>;
+  getItemRef?: (item: ConversationItem) => (el: HTMLDivElement | null) => void;
+  getCardRef?: (rootUuid: string) => (el: HTMLElement | null) => void;
+  onOpenChange?: (subagentKey: string, open: boolean) => void;
+  // §5 — the spawn-chip suppression set, threaded to every member's MessageItem
+  // so a grandchild's spawn chip (which lives in a CHILD thread item) is also
+  // suppressed in favor of its nested card.
+  suppressToolUseIds?: Set<string>;
+}
+
 // One subagent thread (one agent-*.jsonl file) as a disclosure (#155). Summary =
 // task-prompt line + message count + summed thread cost. `nested` adds an indent
 // class when the group hangs under a parent main item.
+//
+// §5 RECURSIVE NESTING — a subagent that itself spawned child subagents carries
+// `children` (SubagentNode[]). They render interleaved into the body, right
+// AFTER the member item whose anchor.uuid === child.spawnAnchorUuid (children
+// with a null anchor append at the body end), each as a nested <SidechainGroup>
+// indented one more `depth`. The `childCtx` maps thread the reader's per-key
+// machinery (meta / force-open / refs / open-state) to every nesting level.
 //
 // Jump-to-message support (#160): the reader force-opens the owning thread when a
 // jump targets a collapsed member. `open` is DERIVED (`userOpen || forceOpen`) so a
@@ -58,6 +86,9 @@ export function SidechainGroup({
   forceOpen = false,
   riseClassName = '',
   riseStyle,
+  children,
+  depth = 0,
+  childCtx,
 }: {
   subagentKey: string;
   items: ConversationItem[];
@@ -87,6 +118,13 @@ export function SidechainGroup({
   // or '' to suppress (already seen, or the active jump target).
   riseClassName?: string;
   riseStyle?: React.CSSProperties;
+  // §5 — child subagent threads spawned from inside THIS one. Rendered nested,
+  // interleaved at each child's spawnAnchorUuid. Absent/empty for a leaf thread.
+  children?: SubagentNode[];
+  // §5 — this node's nesting depth (0 = top-level). Children render at depth+1.
+  depth?: number;
+  // §5 — the reader-threaded per-key machinery for the recursive children.
+  childCtx?: SidechainChildContext;
 }) {
   const [userOpen, setUserOpen] = useState(false);
   const open = userOpen || forceOpen;
@@ -112,6 +150,45 @@ export function SidechainGroup({
   // phantom fields.
   const cost = items.reduce((acc, it) => acc + ('cost_usd' in it ? (it.cost_usd ?? 0) : 0), 0);
   const models = [...new Set(items.map((it) => ('model' in it ? it.model : null)).filter(Boolean))] as string[];
+
+  // §5 — bucket the recursive children by the parent-thread member they anchor
+  // after (child.spawnAnchorUuid). A child whose anchor is null (or whose anchor
+  // is not one of THIS thread's member items) appends at the body end so it is
+  // never dropped.
+  const kids = children ?? [];
+  const memberUuids = new Set(items.map((it) => it.anchor.uuid));
+  const childrenByAnchor = new Map<string, SubagentNode[]>();
+  const trailingChildren: SubagentNode[] = [];
+  for (const child of kids) {
+    const a = child.spawnAnchorUuid;
+    if (a != null && memberUuids.has(a)) {
+      const arr = childrenByAnchor.get(a);
+      if (arr) arr.push(child);
+      else childrenByAnchor.set(a, [child]);
+    } else {
+      trailingChildren.push(child);
+    }
+  }
+  // Render one nested child <SidechainGroup>, threading the reader's per-key
+  // machinery from childCtx (its own meta / force flag / refs / open-state).
+  const renderChild = (child: SubagentNode) => (
+    <SidechainGroup
+      key={`sc-${child.subagentKey}`}
+      subagentKey={child.subagentKey}
+      items={child.items}
+      nested={child.nested}
+      meta={childCtx?.subagentMeta?.[child.subagentKey]}
+      getItemRef={childCtx?.getItemRef}
+      rootUuid={child.items[0]?.anchor.uuid}
+      getCardRef={childCtx?.getCardRef}
+      onOpenChange={childCtx?.onOpenChange}
+      forceOpen={childCtx?.forcedOpenKeys?.has(child.subagentKey) ?? false}
+      children={child.children}
+      depth={child.depth}
+      childCtx={childCtx}
+    />
+  );
+
   return (
     <details
       // #188 S3/B6 — data-uuid = the bucket-root uuid (the outline subagent
@@ -122,6 +199,9 @@ export function SidechainGroup({
       ref={rootUuid != null && getCardRef ? getCardRef(rootUuid) : undefined}
       className={[
         nested ? 'conv-sidechain conv-sidechain--nested' : 'conv-sidechain',
+        // §5 — deeper than the first nesting level adds a depth-keyed indent
+        // class (depth 2+). depth 1 is the existing conv-sidechain--nested.
+        depth >= 2 ? `conv-sidechain--depth-${depth}` : '',
         // G1 §4a: while a #160 jump force-opens this thread, snap it open
         // instantly (CSS `transition: none`) so layout is final before
         // scrollIntoView lands. The class drops when the force releases, so
@@ -149,6 +229,10 @@ export function SidechainGroup({
           {meta && (meta.total_tokens != null || meta.total_duration_ms != null
                     || meta.total_tool_use_count != null || meta.status != null) && (
             <span className="conv-sidechain-submeta">
+              {/* §4 1c — derived totals get a leading "~" affordance: Claude Code
+                  provided none, so the figures were summed from the child's own
+                  thread (approximate, not authoritative). */}
+              {meta.totals_derived && <span className="conv-sidechain-derived" title="totals derived from the subagent's own thread">~</span>}
               {meta.total_tokens != null && <span>{fmt.compact(meta.total_tokens)} tok</span>}
               {meta.total_duration_ms != null && <span>{fmt.durationMs(meta.total_duration_ms)}</span>}
               {meta.total_tool_use_count != null && (
@@ -166,18 +250,33 @@ export function SidechainGroup({
         </span>
       </summary>
       <div className="conv-sidechain-body">
-        {items.map((item) => (
-          <MessageItem
-            key={item.anchor.uuid}
-            item={item}
-            // Relies on getItemRef returning a STABLE callback per item (the
-            // reader memoizes them in refCallbacks): the value is identical
-            // across renders while open, so React doesn't detach/reattach and
-            // MessageItem's memo isn't thrashed. Toggling open swaps it to/from
-            // undefined, which is the intended detach/attach.
-            ref={open && getItemRef ? getItemRef(item) : undefined}
-          />
-        ))}
+        {items.map((item) => {
+          // §5 — interleave each child subagent thread AFTER its spawn anchor
+          // item, recursively. Rendered only while THIS thread is open (its
+          // members are visible). No wrapper div (a Fragment) so the body's
+          // child structure / spine CSS is unchanged in the common leaf case.
+          const after = open ? childrenByAnchor.get(item.anchor.uuid) : undefined;
+          return (
+            <Fragment key={item.anchor.uuid}>
+              <MessageItem
+                item={item}
+                // Relies on getItemRef returning a STABLE callback per item (the
+                // reader memoizes them in refCallbacks): the value is identical
+                // across renders while open, so React doesn't detach/reattach and
+                // MessageItem's memo isn't thrashed. Toggling open swaps it to/from
+                // undefined, which is the intended detach/attach.
+                ref={open && getItemRef ? getItemRef(item) : undefined}
+                // §5 — suppress a spawn chip inside this thread (a child's spawn
+                // lives in THIS thread's items when THIS is the parent).
+                suppressToolUseIds={childCtx?.suppressToolUseIds}
+              />
+              {after?.map(renderChild)}
+            </Fragment>
+          );
+        })}
+        {/* §5 — children with no resolvable spawn anchor append at the body end
+            (never dropped). Also only while open. */}
+        {open && trailingChildren.map(renderChild)}
       </div>
     </details>
   );

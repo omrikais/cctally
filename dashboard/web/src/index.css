@@ -6373,6 +6373,9 @@ mark.current {
   color: var(--text-dim);
 }
 .conv-sidechain-submeta > span { margin-right: 9px; }
+/* §4 1c — the "~" prefix marking derived (non-authoritative) totals: Claude Code
+   provided no counts, so they were summed from the child's own thread. */
+.conv-sidechain-derived { margin-right: 2px; color: var(--text-dim); opacity: 0.85; }
 .conv-subagent-ok   { color: var(--accent-green); }
 .conv-subagent-err  { color: var(--accent-red, #f87171); }
 .conv-subagent-warn { color: var(--accent-amber, #fbbf24); }
@@ -6405,6 +6408,12 @@ mark.current {
 .conv-sidechain-body > .conv-item--human::before { background: var(--accent-blue); }
 .conv-sidechain-body > .conv-item--assistant::before { background: var(--accent-purple); }
 .conv-sidechain--nested { margin-left: 20px; }
+/* §5 — deeper recursive nesting (grandchild and below) keeps stepping the
+   indent so the tree depth reads at a glance. A nested card already lives inside
+   its parent's indented body, so this is an ADDITIONAL step per level. */
+.conv-sidechain--depth-2 { margin-left: 20px; }
+.conv-sidechain--depth-3 { margin-left: 28px; }
+.conv-sidechain--depth-4 { margin-left: 36px; }
 
 /* ---- Markdown prose ----------------------------------------------- */
 .md {

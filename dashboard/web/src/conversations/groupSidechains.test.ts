@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { groupSidechains, type RenderNode } from './groupSidechains';
-import type { ConversationItem } from '../types/conversation';
+import { groupSidechains, flattenSubagents, type RenderNode, type SubagentNode } from './groupSidechains';
+import type { ConversationItem, SubagentMeta } from '../types/conversation';
 
 function mk(
   uuid: string,
@@ -149,5 +149,146 @@ describe('collapseToolResultRuns (orphan tool_result runs)', () => {
     const run = nodes[1];
     if (run.kind !== 'tool_result_run') throw new Error('expected tool_result_run');
     expect(run.items.map((i) => i.anchor.uuid)).toEqual(['u1', 'u2']);
+  });
+});
+
+// §5 — recursive nesting tree from the kernel's read-time linkage. A subagent's
+// parent is resolved from subagent_meta[k].parent_subagent_key (+ spawn_uuid):
+// a parent that is another LOADED subagent nests inside that parent's `children`
+// at depth+1; a null/main parent nests at its spawn_uuid main anchor. Legacy
+// transcripts (no kernel linkage) fall back to root.parent_uuid. No bucket is
+// ever dropped.
+function smeta(over: Partial<SubagentMeta> & { kind: string }): SubagentMeta {
+  return { ...over };
+}
+
+describe('groupSidechains — recursive nesting (§5 kernel linkage)', () => {
+  it('nests a grandchild as a SubagentNode inside the child node.children at depth 1', () => {
+    // main turn m1 spawns child C (parent=main, anchor m1); child C spawns
+    // grandchild G (parent=C, anchor c1, a child-thread item).
+    const items = [
+      mk('m1'),
+      mk('c1', { subagentKey: 'C' }),
+      mk('g1', { subagentKey: 'G' }),
+    ];
+    const meta: Record<string, SubagentMeta> = {
+      C: smeta({ kind: 'code-reviewer', parent_subagent_key: null, spawn_uuid: 'm1', spawn_tool_use_id: 'tu_c' }),
+      G: smeta({ kind: 'grounding', parent_subagent_key: 'C', spawn_uuid: 'c1', spawn_tool_use_id: 'tu_g' }),
+    };
+    const out = groupSidechains(items, meta);
+    // Top level: the main item, then the child subagent node — NOT the grandchild.
+    expect(out.map((n) => n.kind)).toEqual(['item', 'subagent']);
+    const child = group(out[1]);
+    expect(child.subagentKey).toBe('C');
+    expect(child.depth).toBe(0);
+    expect(child.nested).toBe(true);          // nested under main m1
+    expect(child.spawnAnchorUuid).toBe('m1');
+    // The grandchild is a SubagentNode in the child's children, at depth 1.
+    expect(child.children.map((c) => c.subagentKey)).toEqual(['G']);
+    const gc = child.children[0];
+    expect(gc.kind).toBe('subagent');
+    expect(gc.depth).toBe(1);
+    expect(gc.nested).toBe(true);
+    expect(gc.spawnAnchorUuid).toBe('c1');     // placed after the child's c1 item
+    // The grandchild is NOT also a top-level node (each subagent shown once).
+    expect(flattenSubagents(out).map((n) => n.subagentKey).sort()).toEqual(['C', 'G']);
+    const topLevelKeys = out.filter((n) => n.kind === 'subagent').map((n) => (n as SubagentNode).subagentKey);
+    expect(topLevelKeys).toEqual(['C']);
+  });
+
+  it('places a direct child subagent right AFTER its spawn_uuid main anchor', () => {
+    // Two main turns; the child spawns from m2 (anchor m2), so it must emit
+    // after m2, NOT after m1 (its document-first position).
+    const items = [
+      mk('m1'),
+      mk('m2'),
+      mk('c1', { subagentKey: 'C' }),
+    ];
+    const meta: Record<string, SubagentMeta> = {
+      C: smeta({ kind: 'Explore', parent_subagent_key: null, spawn_uuid: 'm2', spawn_tool_use_id: 'tu_c' }),
+    };
+    const out = groupSidechains(items, meta);
+    expect(out.map((n) => n.kind)).toEqual(['item', 'item', 'subagent']);
+    const m1 = out[0];
+    const m2 = out[1];
+    if (m1.kind !== 'item' || m2.kind !== 'item') throw new Error('expected item nodes');
+    expect(m1.item.anchor.uuid).toBe('m1');
+    expect(m2.item.anchor.uuid).toBe('m2');
+    expect(group(out[2]).subagentKey).toBe('C');
+    expect(group(out[2]).spawnAnchorUuid).toBe('m2');
+  });
+
+  it('keeps a top orphan (unresolved parent) at top level, no drop', () => {
+    // parent_subagent_key references a key that is NOT loaded → top-level.
+    const items = [mk('h1'), mk('o1', { subagentKey: 'O' })];
+    const meta: Record<string, SubagentMeta> = {
+      O: smeta({ kind: 'agent', parent_subagent_key: 'MISSING', spawn_uuid: 'gone', spawn_tool_use_id: 'tu_o' }),
+    };
+    const out = groupSidechains(items, meta);
+    expect(out.map((n) => n.kind)).toEqual(['item', 'subagent']);
+    const o = group(out[1]);
+    expect(o.subagentKey).toBe('O');
+    expect(o.nested).toBe(false);
+    expect(o.depth).toBe(0);
+    expect(o.spawnAnchorUuid).toBeNull();
+  });
+
+  it('falls back to legacy parent_uuid nesting when no kernel linkage is present', () => {
+    // No subagent_meta entry for C (old transcript): nest via root.parent_uuid.
+    const items = [mk('m1'), mk('c1', { subagentKey: 'C', parentUuid: 'm1' }), mk('c2', { subagentKey: 'C' })];
+    const out = groupSidechains(items, {}); // empty meta -> legacy path
+    expect(out.map((n) => n.kind)).toEqual(['item', 'subagent']);
+    const c = group(out[1]);
+    expect(c.nested).toBe(true);
+    expect(c.spawnAnchorUuid).toBe('m1');
+    expect(c.items.map((i) => i.anchor.uuid)).toEqual(['c1', 'c2']);
+  });
+
+  it('never drops a bucket: a kernel-nested grandchild whose parent is absent surfaces top-level', () => {
+    // G's parent C is referenced but not loaded (paged out) → G stays top-level
+    // (no drop), since parentOf falls to `top` when the parent bucket is absent.
+    const items = [mk('h1'), mk('g1', { subagentKey: 'G' })];
+    const meta: Record<string, SubagentMeta> = {
+      G: smeta({ kind: 'grounding', parent_subagent_key: 'C', spawn_uuid: 'c1', spawn_tool_use_id: 'tu_g' }),
+    };
+    const out = groupSidechains(items, meta);
+    const subs = flattenSubagents(out);
+    expect(subs.map((n) => n.subagentKey)).toEqual(['G']);
+    expect(subs[0].nested).toBe(false); // surfaced at top level (parent missing)
+  });
+
+  it('suppresses two distinct spawns in one item via their distinct spawn_tool_use_id', () => {
+    // The s8 two-spawn topology: ONE main item holds two spawns -> two children,
+    // each carrying its own spawn_tool_use_id. groupSidechains nests both under
+    // the main anchor; the suppression set (built by the reader) covers BOTH ids.
+    const items = [
+      mk('m1'),
+      mk('a1', { subagentKey: 'A' }),
+      mk('b1', { subagentKey: 'B' }),
+    ];
+    const meta: Record<string, SubagentMeta> = {
+      A: smeta({ kind: 'Explore', parent_subagent_key: null, spawn_uuid: 'm1', spawn_tool_use_id: 'tu_a' }),
+      B: smeta({ kind: 'code-reviewer', parent_subagent_key: null, spawn_uuid: 'm1', spawn_tool_use_id: 'tu_b' }),
+    };
+    const out = groupSidechains(items, meta);
+    // main item, then BOTH children interleaved after m1 (document order A, B).
+    expect(out.map((n) => n.kind)).toEqual(['item', 'subagent', 'subagent']);
+    expect(out.filter((n) => n.kind === 'subagent').map((n) => (n as SubagentNode).subagentKey)).toEqual(['A', 'B']);
+    // The reader-side suppression set covers both distinct ids (modeled here).
+    const suppress = new Set(Object.values(meta).map((m) => m.spawn_tool_use_id).filter(Boolean) as string[]);
+    expect(suppress.has('tu_a')).toBe(true);
+    expect(suppress.has('tu_b')).toBe(true);
+    expect(suppress.size).toBe(2);
+  });
+
+  it('flattenSubagents / walkSubagents visit nested children depth-first', () => {
+    const items = [mk('m1'), mk('c1', { subagentKey: 'C' }), mk('g1', { subagentKey: 'G' })];
+    const meta: Record<string, SubagentMeta> = {
+      C: smeta({ kind: 'k', parent_subagent_key: null, spawn_uuid: 'm1', spawn_tool_use_id: 'tu_c' }),
+      G: smeta({ kind: 'k', parent_subagent_key: 'C', spawn_uuid: 'c1', spawn_tool_use_id: 'tu_g' }),
+    };
+    const out = groupSidechains(items, meta);
+    // Parent BEFORE child (depth-first, tree order).
+    expect(flattenSubagents(out).map((n) => n.subagentKey)).toEqual(['C', 'G']);
   });
 });

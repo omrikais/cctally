@@ -60,7 +60,17 @@ function isTaskChecklistRun(calls: ToolCall[]): boolean {
 // degradation) and `tool_result` (orphan item only) render as single chips too.
 // This single source of truth is used by both the assistant turn (which renders
 // its prose-from-text-blocks here, in order) and the human turn.
-export function MessageBlocks({ blocks, anchorUuid }: { blocks: ConversationBlock[]; anchorUuid?: string | null }) {
+export function MessageBlocks({ blocks, anchorUuid, suppressToolUseIds }: {
+  blocks: ConversationBlock[];
+  anchorUuid?: string | null;
+  // §5 (Codex P1-C) — the set of spawn `tool_use_id`s whose nested subagent card
+  // is the canonical representation. A `tool_call` block whose `tool_use_id` is
+  // in this set is dropped from the walk (its card renders the spawn). Granular
+  // by `tool_use_id`, NOT name/item, because one assistant item can hold several
+  // spawns; an unresolved spawn (no nested card, e.g. >16 KB clip) is NOT in the
+  // set so its chip still renders.
+  suppressToolUseIds?: Set<string>;
+}) {
   // #177 S5 — chat focus mode strips tool/orphan-result texture so a turn reads
   // as prose-only conversation. text + thinking render unchanged; tool_call /
   // tool_use runs and orphan tool_result chips are dropped from the walk.
@@ -87,10 +97,18 @@ export function MessageBlocks({ blocks, anchorUuid }: { blocks: ConversationBloc
     if (b.kind === 'tool_call') {
       const run: Extract<ConversationBlock, { kind: 'tool_call' }>[] = [];
       while (i < blocks.length && blocks[i].kind === 'tool_call') {
-        run.push(blocks[i] as Extract<ConversationBlock, { kind: 'tool_call' }>);
+        const tc = blocks[i] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+        // §5 — drop a spawn tool_call whose nested subagent card is canonical.
+        // tool_use_id granularity (one item can hold several spawns); a spawn
+        // not in the set (unresolved / clipped) still renders its chip.
+        if (!(tc.tool_use_id != null && suppressToolUseIds?.has(tc.tool_use_id))) {
+          run.push(tc);
+        }
         i++;
       }
-      if (!chat) out.push(<ToolRun key={`r${out.length}`} calls={run} />);
+      // After suppression a run can become empty (the item held ONLY spawns) —
+      // emit nothing in that case rather than an empty run head.
+      if (!chat && run.length) out.push(<ToolRun key={`r${out.length}`} calls={run} />);
       continue;
     }
     // chat mode suppresses the tool_use degradation chip + orphan tool_result

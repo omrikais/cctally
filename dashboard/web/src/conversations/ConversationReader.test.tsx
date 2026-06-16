@@ -475,6 +475,72 @@ describe('ConversationReader', () => {
     await waitFor(() => expect(getState().conversationJump).toBeNull());
   });
 
+  // §5 (Codex P1-D) — a jump into a GRANDCHILD subagent member force-opens the
+  // grandchild AND its parent card (the whole ancestor chain). The integration
+  // assertion catches broken reader→SidechainGroup wiring of the recursive tree
+  // + ancestor force-open, not just the child unit.
+  it('a jump into a nested grandchild force-opens the grandchild AND its parent card', async () => {
+    // Topology (s8-shaped): main m1 spawns child C (parent=null, anchor m1);
+    // child C spawns grandchild G (parent=C, anchor c1). The jump targets g1
+    // (a grandchild member), so BOTH C and G must open for g1's ref to attach.
+    mockFetchOnce({
+      ...detail([
+        makeItem({ uuid: 'm1', kind: 'human', text: 'Run the audit' }),
+        makeItem({ uuid: 'c1', is_sidechain: true, subagent_key: 'C', text: 'Sync audit' } as never),
+        makeItem({ uuid: 'g1', is_sidechain: true, subagent_key: 'G', text: 'Ground claims' } as never),
+      ]),
+      subagent_meta: {
+        C: { kind: 'code-reviewer', parent_subagent_key: null, spawn_uuid: 'm1', spawn_tool_use_id: 'tu_c' },
+        G: { kind: 'grounding', parent_subagent_key: 'C', spawn_uuid: 'c1', spawn_tool_use_id: 'tu_g' },
+      },
+    });
+    vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'g1' } });
+    const { container } = render(<ConversationReader sessionId="s" />);
+
+    // Both the parent (C, data-uuid c1) and the grandchild (G, data-uuid g1) cards open.
+    await waitFor(() => {
+      const parent = container.querySelector('details.conv-sidechain[data-uuid="c1"]') as HTMLDetailsElement | null;
+      expect(parent?.open).toBe(true);
+    });
+    const grandchild = container.querySelector('details.conv-sidechain[data-uuid="g1"]') as HTMLDetailsElement | null;
+    expect(grandchild?.open).toBe(true);
+    // The grandchild card is nested (rendered inside the parent's body).
+    expect(grandchild!.classList.contains('conv-sidechain--nested')).toBe(true);
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+  });
+
+  // §5 (Codex P1-C) — a resolved spawn's chip is suppressed (its nested subagent
+  // card is canonical), but an UNLINKED spawn's chip still renders. The reader
+  // builds the suppression set from subagent_meta.spawn_tool_use_id.
+  it('suppresses a resolved spawn chip on the main turn but keeps an unlinked one', async () => {
+    mockFetchOnce({
+      ...detail([
+        makeItem({
+          uuid: 'm1', kind: 'assistant', text: 'Spawning',
+          blocks: [
+            { kind: 'tool_call', name: 'Agent', input_summary: '{}', preview: 'linked spawn', tool_use_id: 'tu_c', result: null },
+            { kind: 'tool_call', name: 'Agent', input_summary: '{}', preview: 'unlinked spawn', tool_use_id: 'tu_clip', result: null },
+          ],
+        } as never),
+        makeItem({ uuid: 'c1', is_sidechain: true, subagent_key: 'C', text: 'child' } as never),
+      ]),
+      subagent_meta: {
+        // Only the linked spawn carries a spawn_tool_use_id (the kernel emits it
+        // only for linked spawns); the >16 KB-clipped one has no entry.
+        C: { kind: 'code-reviewer', parent_subagent_key: null, spawn_uuid: 'm1', spawn_tool_use_id: 'tu_c' },
+      },
+    });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="m1"]')).not.toBeNull());
+    // The linked spawn preview is gone (chip suppressed); the unlinked one stays.
+    expect(screen.queryByText('linked spawn')).toBeNull();
+    expect(screen.getByText('unlinked spawn')).toBeInTheDocument();
+    // The child subagent card renders (the canonical representation of the spawn).
+    expect(container.querySelector('details.conv-sidechain[data-uuid="c1"]')).not.toBeNull();
+  });
+
   // #188 B3 — explicit user navigation clears the pin. A wheel gesture on the
   // body drops it; a programmatic scroll (the jump's own smooth scroll routes
   // through onBodyScroll) must NOT.

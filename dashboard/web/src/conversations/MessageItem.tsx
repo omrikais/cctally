@@ -42,7 +42,16 @@ function notificationSummary(s: string): string {
 // A top-level tool_result item (empty prose) collapses into a single disclosure
 // wrapping its blocks. Memoized for long transcripts.
 function MessageItemImpl(
-  { item, className = '', style }: { item: ConversationItem; className?: string; style?: React.CSSProperties },
+  { item, className = '', style, suppressToolUseIds }: {
+    item: ConversationItem;
+    className?: string;
+    style?: React.CSSProperties;
+    // §5 — spawn tool_use_ids whose nested subagent card is canonical; forwarded
+    // to every MessageBlocks render so a spawn chip is suppressed wherever it
+    // sits (main item AND subagent-thread item — a grandchild's spawn lives in a
+    // child thread). A stable Set identity (reader-memoized) keeps the memo valid.
+    suppressToolUseIds?: Set<string>;
+  },
   ref: React.ForwardedRef<HTMLDivElement>,
 ) {
   // Optional extra class/style (e.g. the G1 load-in `conv-rise` + per-index
@@ -83,7 +92,7 @@ function MessageItemImpl(
             <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} className="conv-chip-permalink" />
             {eyebrow}
           </summary>
-          <div className="conv-chip-body"><MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} /></div>
+          <div className="conv-chip-body"><MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} /></div>
         </details>
       </div>
     );
@@ -127,7 +136,7 @@ function MessageItemImpl(
         </div>
         {/* Document-order walk renders prose (from text blocks) + thinking +
             tool runs in order — no separate item.text render (#164). */}
-        <MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} />
+        <MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} />
         {item.text && (
           // Hover/focus-revealed action copying the turn's joined prose. Only
           // when there IS prose — a tool-only assistant turn renders none.
@@ -209,7 +218,7 @@ function MessageItemImpl(
             <pre className="conv-meta-body conv-meta-body--pre">{item.text}</pre>
           ) : (
             <div className="conv-meta-body">
-              <MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} />
+              <MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} />
               {mk === 'skill' && item.text && (
                 <div className="conv-item-actions">
                   <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
@@ -259,7 +268,7 @@ function MessageItemImpl(
       {item.text && <Markdown>{item.text}</Markdown>}
       {/* Joined prose renders above via item.text; pass only NON-text blocks to
           the walk so it doesn't double the human's prose. */}
-      <MessageBlocks blocks={item.blocks.filter((b) => b.kind !== 'text')} anchorUuid={item.anchor.uuid} />
+      <MessageBlocks blocks={item.blocks.filter((b) => b.kind !== 'text')} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} />
       {item.text && (
         <div className="conv-item-actions">
           <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
@@ -271,7 +280,12 @@ function MessageItemImpl(
 }
 
 export const MessageItem = memo(
-  forwardRef<HTMLDivElement, { item: ConversationItem; className?: string; style?: React.CSSProperties }>(
+  forwardRef<HTMLDivElement, {
+    item: ConversationItem;
+    className?: string;
+    style?: React.CSSProperties;
+    suppressToolUseIds?: Set<string>;
+  }>(
     MessageItemImpl,
   ),
 );

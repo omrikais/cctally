@@ -72,12 +72,18 @@ const subagentOk: RenderNode = {
   kind: 'subagent',
   subagentKey: 'k1',
   nested: false,
+  depth: 0,
+  spawnAnchorUuid: null,
+  children: [],
   items: [item({ uuid: 'sa1', is_sidechain: true, subagent_key: 'k1', blocks: [okToolBlock()] } as never)],
 };
 const subagentErr: RenderNode = {
   kind: 'subagent',
   subagentKey: 'k2',
   nested: false,
+  depth: 0,
+  spawnAnchorUuid: null,
+  children: [],
   items: [item({ uuid: 'se1', is_sidechain: true, subagent_key: 'k2', blocks: [errBlock()] } as never)],
 };
 const trrOk: RenderNode = {

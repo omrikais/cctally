@@ -206,6 +206,25 @@ describe('deriveOutline (#186 §3 section walk)', () => {
     expect(entries.map((e) => [e.uuid, e.depth])).toEqual([['a1', 0]]);
   });
 
+  it('§5: a nested (grandchild) subagent still emits a FLAT outline entry (placement-agnostic)', () => {
+    // The reader nests G inside C's render node, but deriveOutline buckets over
+    // the whole list so BOTH C and G appear as flat depth-1 subagent landmarks
+    // (the outline is a flat jump index over the recursive reader).
+    const meta: Record<string, SubagentMeta> = {
+      C: { kind: 'code-reviewer', parent_subagent_key: null, spawn_uuid: 'm1', spawn_tool_use_id: 'tu_c' },
+      G: { kind: 'grounding', parent_subagent_key: 'C', spawn_uuid: 'c1', spawn_tool_use_id: 'tu_g' },
+    };
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'audit' }),
+      turn({ uuid: 'c1', kind: 'assistant', label: 'sync audit', subagent_key: 'C', parent_uuid: null }),
+      turn({ uuid: 'g1', kind: 'assistant', label: 'ground claims', subagent_key: 'G', parent_uuid: null }),
+    ], meta);
+    const subs = entries.filter((e) => e.type === 'subagent');
+    expect(subs.map((e) => e.subagentKey).sort()).toEqual(['C', 'G']);
+    // The grandchild entry's jump anchor is its own bucket root (g1).
+    expect(subs.find((e) => e.subagentKey === 'G')!.uuid).toBe('g1');
+  });
+
   it('entryId is unique across a rich mixed fixture', () => {
     const meta: Record<string, SubagentMeta> = { sk1: { kind: 'explore' }, sk2: { kind: 'general-purpose' } };
     const { entries } = deriveOutline([
