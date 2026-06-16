@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+- **Internal (build/test-time only, no user-facing change): bumped the dashboard's dev dependencies to clear three Dependabot advisories** — `vite` 8.0.10 → 8.0.16 (fixes a `server.fs.deny` bypass and an NTLMv2 hash disclosure, both Windows + dev-server only) and the test-only transitive `form-data` 4.0.5 → 4.0.6 (CRLF injection via unescaped multipart field names). None of these packages ship to installed users — the npm/brew artifacts carry only the Python CLI plus the pre-built `dashboard/static/` bundle, never `node_modules` — so there is no runtime exposure; the bundle was rebuilt against the new `vite` and all dashboard tests pass.
+
 ## [1.47.0] - 2026-06-16
 
 ### Added
