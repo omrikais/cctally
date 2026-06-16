@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.47.0] - 2026-06-16
+
 ### Added
 - **Dashboard:** the Recent Sessions modal now shows cache-rebuild events for the selected conversation — rebuild count, wasted $, tokens re-created, a session cache-value-saved figure, and a worst-first list of jump-links that open the conversation viewer at the message that triggered each rebuild (respects `dashboard.cache_failure_markers`).
 
