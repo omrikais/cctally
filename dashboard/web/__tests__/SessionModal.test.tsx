@@ -6,9 +6,18 @@ import fixture from './fixtures/envelope.json';
 import sessionFixture from './fixtures/session-detail.json';
 import type { Envelope } from '../src/types/envelope';
 
+// The modal's CacheRebuildsSection fires its OWN GET /api/conversation/<id>/
+// outline per tick (a sibling of the /api/session/<id> fetch). It is
+// suppressed when markers are off — so these tests flip markers OFF in
+// beforeEach to keep the fetch stream session-only, isolating the
+// session-detail fetch behavior these regressions assert on. (A dedicated
+// SessionModal.test.tsx under src/modals covers the section's own wiring.)
 describe('<SessionModal />', () => {
   beforeEach(() => {
     _resetForTests();
+    // Markers OFF → CacheRebuildsSection short-circuits (no outline fetch), so
+    // the fetch stream stays session-only for these session-detail tests.
+    dispatch({ type: 'INGEST_DASHBOARD_PREFS', prefs: { cache_failure_markers: false } });
     updateSnapshot(fixture as unknown as Envelope);
     vi.stubGlobal(
       'fetch',

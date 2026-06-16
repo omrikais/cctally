@@ -115,6 +115,14 @@ export interface OutlineTurn {
   // OutlineTurn where `tokens` is copied. Present only on a flagged turn.
   cache_failure?: CacheFailure;
 }
+// Session-modal cache-rebuilds (2026-06-16 spec §1) — one flagged rebuild turn.
+export interface CacheRebuild {
+  uuid: string;            // the flagged turn's anchor uuid (jump target)
+  subagent_key: string | null;  // null = main session; set = subagent thread
+  ts: string | null;       // rebuild turn timestamp (nullable, like OutlineTurn.ts)
+  tokens_recreated: number;
+  est_wasted_usd: number;  // display-only marginal cost
+}
 export interface OutlineStats {
   turns: { total: number; human: number; assistant: number; tool_result: number; meta: number };
   tool_counts: Record<string, number>;
@@ -126,7 +134,15 @@ export interface OutlineStats {
   // cache-failure-markers spec §2/§4 — session-level aggregate of the flagged
   // turns. PRESENT ONLY when count > 0 (the stats "Cache" row renders only
   // then); absent when no turn was flagged. `est_wasted_usd` is display-only.
-  cache_failures?: { count: number; tokens_recreated: number; est_wasted_usd: number };
+  cache_failures?: {
+    count: number;
+    tokens_recreated: number;
+    est_wasted_usd: number;
+    rebuilds: CacheRebuild[];   // worst-first (by est_wasted_usd desc)
+  };
+  // Session cache-value-saved (2026-06-16 spec §1): ALWAYS present (0.0 when no
+  // cache reads). Display-only — never a reconciled figure.
+  cache_saved_usd: number;
 }
 export interface ConversationOutline {
   session_id: string;

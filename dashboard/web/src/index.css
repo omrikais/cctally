@@ -798,6 +798,7 @@ body { padding: 16px; box-sizing: border-box; }
 .m-sec.sec-mod   { color: var(--accent-purple); }   /* Session models */
 .m-sec.sec-costm { color: var(--accent-magenta); }  /* Session cost-by-model */
 .m-sec.sec-src   { color: var(--accent-blue); }     /* Session source files */
+.m-sec.sec-rebuild { color: var(--accent-amber); }  /* Session cache rebuilds */
 .m-sec.sec-prog  { color: var(--accent-green); }    /* CW progress */
 .m-sec.sec-ms    { color: var(--accent-purple); }   /* CW milestones / Trend table */
 .m-sec.sec-range { color: var(--accent-amber); }    /* FC range */
@@ -1192,6 +1193,39 @@ body { padding: 16px; box-sizing: border-box; }
   margin-top: 6px; overflow: hidden;
 }
 .msess-tok-tile.cache-hit .bar .fill { height: 100%; background: var(--accent-green); }
+
+/* Session-modal cache-rebuilds (2026-06-16). Reuses the .msess-tok-tile
+   aesthetic; the tiles grid narrows to 3 columns (token grid is 5). Colors
+   reuse the file's accent tokens (amber for wasted/warn, green for the
+   healthy saved/zero-state, blue for the jump link). */
+.msess-tok-grid.msess-rebuild-tiles { grid-template-columns: repeat(3, 1fr); }
+.msess-tok-tile.rebuild-wasted .n { color: var(--accent-amber); }
+.msess-rebuild-none { padding: 6px 0; color: var(--accent-green); font-size: 13px; }
+.msess-rebuild-saved { margin-top: 8px; color: var(--accent-green); font-size: 13px; }
+.msess-rebuild-list { list-style: none; margin: 8px 0 0; padding: 0; }
+.msess-rebuild-list .rebuild-row { border-bottom: 1px solid var(--border-soft); }
+.msess-rebuild-list .rebuild-row:last-child { border-bottom: 0; }
+.rebuild-jump {
+  display: flex; gap: 10px; align-items: baseline; width: 100%;
+  background: none; border: 0; padding: 4px 0; cursor: pointer;
+  font: inherit; color: var(--text); text-align: left;
+  font-family: var(--font-mono); font-size: 12.5px;
+}
+.rebuild-jump:hover { background: rgba(255, 255, 255, 0.04); }
+.rebuild-jump .rb-cost { color: var(--accent-amber); min-width: 56px; }
+.rebuild-jump .rb-tok { color: var(--text-dim); }
+.rebuild-jump .rb-time { color: var(--text-dim); }
+.rebuild-jump .rb-sub {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-dim); border: 1px solid var(--border-soft);
+  border-radius: 8px; padding: 0 6px;
+}
+.rebuild-jump .rb-go { margin-left: auto; color: var(--accent-blue); }
+.msess-rebuild-more {
+  margin-top: 6px; background: none; border: 0; padding: 2px 0;
+  color: var(--accent-blue); cursor: pointer;
+  font: inherit; font-family: var(--font-mono); font-size: 12.5px;
+}
 
 /* Models chips — reuses panel .chip.opus|sonnet|haiku. Layout comes from
    the shared .m-chipstrip primitive. No per-modal rules needed. */

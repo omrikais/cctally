@@ -1,0 +1,50 @@
+// SessionModal integration — the modal renders CacheRebuildsSection and a Jump
+// drives OPEN_CONVERSATION cross-nav (parent-wiring guard; child unit lives in
+// CacheRebuildsSection.test.tsx).
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { SessionModal } from './SessionModal';
+import { _resetForTests, getState, dispatch } from '../store/store';
+
+const SESSION_DETAIL = {
+  session_id: 's1', started_utc: '2026-06-01T00:00:00Z',
+  last_activity_utc: '2026-06-01T01:00:00Z', duration_min: 60,
+  project_label: 'demo', project_path: '/demo', source_paths: [],
+  models: [], input_tokens: 1, output_tokens: 1,
+  cache_creation_tokens: 1, cache_read_tokens: 1, cache_hit_pct: 50,
+  cost_per_model: [], cost_total_usd: 1.0,
+};
+const OUTLINE = {
+  session_id: 's1',
+  stats: {
+    turns: { total: 0, human: 0, assistant: 0, tool_result: 0, meta: 0 },
+    tool_counts: {}, error_count: 0, models: {}, duration_seconds: null,
+    tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 },
+    cost_usd: 0, cache_saved_usd: 1.0,
+    cache_failures: { count: 1, tokens_recreated: 100000, est_wasted_usd: 0.1,
+      rebuilds: [{ uuid: 'u0', subagent_key: null, ts: '2026-06-01T00:30:00Z',
+                   tokens_recreated: 100000, est_wasted_usd: 0.1 }] },
+  },
+  turns: [],
+};
+
+beforeEach(() => {
+  _resetForTests();
+  dispatch({ type: 'OPEN_MODAL', kind: 'session', sessionId: 's1' });
+  global.fetch = vi.fn(async (url: string) => {
+    const body = String(url).includes('/outline') ? OUTLINE : SESSION_DETAIL;
+    return { ok: true, status: 200, json: async () => body } as Response;
+  }) as never;
+});
+afterEach(() => { vi.restoreAllMocks(); });
+
+describe('SessionModal cache-rebuilds wiring', () => {
+  it('renders the section and jumps to the rebuild turn', async () => {
+    render(<SessionModal />);
+    await waitFor(() => expect(screen.getByText('Cache rebuilds')).toBeTruthy());
+    fireEvent.click(await screen.findByRole('button', { name: /Jump/ }));
+    expect(getState().view).toBe('conversations');
+    expect(getState().selectedConversationId).toBe('s1');
+    expect(getState().conversationJump?.uuid).toBe('u0');
+  });
+});

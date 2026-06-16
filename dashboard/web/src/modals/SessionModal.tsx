@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { Modal } from './Modal';
+import { CacheRebuildsSection } from './CacheRebuildsSection';
 import { ShareIcon } from '../components/ShareIcon';
 import { modelChipClass } from '../lib/model';
 import type { SessionDetail } from '../types/envelope';
@@ -280,6 +281,8 @@ function SessionContent({ detail }: { detail: SessionDetail }) {
           </div>
         ))}
       </div>
+
+      <CacheRebuildsSection sessionId={detail.session_id ?? null} />
 
       {!emptyModels ? (
         <>

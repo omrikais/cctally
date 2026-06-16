@@ -32,6 +32,7 @@ function stats(over: Partial<OutlineStats> = {}): OutlineStats {
     duration_seconds: 3 * 3600 + 25 * 60, // 3h 25m
     tokens: { input: 1200, output: 800, cache_creation: 0, cache_read: 5000 },
     cost_usd: 4.2,
+    cache_saved_usd: 0,
     ...over,
   };
 }
@@ -429,7 +430,7 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
     const { container } = render(
       <OutlinePanel
         sessionId="s1"
-        outline={outline({ stats: stats({ cache_failures: { count: 2, tokens_recreated: 205000, est_wasted_usd: 1.18 } }) })}
+        outline={outline({ stats: stats({ cache_failures: { count: 2, tokens_recreated: 205000, est_wasted_usd: 1.18, rebuilds: [] } }) })}
       />,
     );
     const cacheRow = Array.from(container.querySelectorAll('.conv-outline-stat-kv'))
@@ -448,7 +449,7 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
 
   it('renders the ⚡ cache jump chip when flagged turns exist', () => {
     const o = outline({
-      stats: stats({ cache_failures: { count: 1, tokens_recreated: 130000, est_wasted_usd: 0.75 } }),
+      stats: stats({ cache_failures: { count: 1, tokens_recreated: 130000, est_wasted_usd: 0.75, rebuilds: [] } }),
       turns: [
         turn({ uuid: 'h1', kind: 'human', label: 'go' }),
         turn({ uuid: 'a1', kind: 'assistant', label: 'rebuilt', cache_failure: cf }),
@@ -462,7 +463,7 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
 
   it('clicking the cache jump chip jumps to the flagged turn', () => {
     const o = outline({
-      stats: stats({ cache_failures: { count: 1, tokens_recreated: 130000, est_wasted_usd: 0.75 } }),
+      stats: stats({ cache_failures: { count: 1, tokens_recreated: 130000, est_wasted_usd: 0.75, rebuilds: [] } }),
       turns: [
         turn({ uuid: 'h1', kind: 'human', label: 'go' }),
         turn({ uuid: 'a1', kind: 'assistant', label: 'rebuilt', cache_failure: cf }),
@@ -490,7 +491,7 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
   it('toggle OFF (dashboard_prefs) hides the cache stats row, jump chip, and landmark', () => {
     dispatch({ type: 'INGEST_DASHBOARD_PREFS', prefs: { cache_failure_markers: false } });
     const o = outline({
-      stats: stats({ cache_failures: { count: 1, tokens_recreated: 130000, est_wasted_usd: 0.75 } }),
+      stats: stats({ cache_failures: { count: 1, tokens_recreated: 130000, est_wasted_usd: 0.75, rebuilds: [] } }),
       turns: [
         turn({ uuid: 'h1', kind: 'human', label: 'go' }),
         turn({ uuid: 'a1', kind: 'assistant', label: 'rebuilt', cache_failure: cf }),

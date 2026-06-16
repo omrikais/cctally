@@ -1119,6 +1119,7 @@ describe('ConversationReader focus modes (#177 S5 §5)', () => {
       turns: { total: turns.length, human: 0, assistant: 0, tool_result: 0, meta: 0 },
       tool_counts: {}, error_count: errorCount, models: {}, duration_seconds: null,
       tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 }, cost_usd: 0,
+      cache_saved_usd: 0,
     },
     turns,
   });
@@ -1284,6 +1285,7 @@ describe('ConversationReader jump-to-next keys (#177 S5 §4)', () => {
       turns: { total: 4, human: 2, assistant: 2, tool_result: 0, meta: 0 },
       tool_counts: {}, error_count: 1, models: {}, duration_seconds: null,
       tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 }, cost_usd: 0,
+      cache_saved_usd: 0,
     },
     turns: [
       oTurn({ uuid: 'h1', kind: 'human' }),
@@ -1366,6 +1368,7 @@ describe('ConversationReader jump-to-next focus-mode reset (#177 S5 §5)', () =>
       turns: { total: 3, human: 1, assistant: 2, tool_result: 0, meta: 0 },
       tool_counts: {}, error_count: 1, models: {}, duration_seconds: null,
       tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 }, cost_usd: 0,
+      cache_saved_usd: 0,
     },
     turns: [
       oTurn({ uuid: 'h1', kind: 'human' }),
@@ -1444,6 +1447,7 @@ describe('ConversationReader time markers (#177 S5 §6)', () => {
         turns: { total: 3, human: 2, assistant: 1, tool_result: 0, meta: 0 },
         tool_counts: {}, error_count: 0, models: {}, duration_seconds: null,
         tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 }, cost_usd: 0,
+        cache_saved_usd: 0,
       },
       turns: [
         oTurn({ uuid: 'h1', kind: 'human' }),
