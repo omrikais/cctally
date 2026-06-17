@@ -5,8 +5,9 @@ import { useConversations } from '../hooks/useConversations';
 import { useConversationSearch } from '../hooks/useConversationSearch';
 import { renderSnippet } from '../lib/snippet';
 import { railDateBucket } from './railDateBucket';
+import { ConversationFiltersPopover } from './ConversationFiltersPopover';
 import { fmt } from '../lib/fmt';
-import type { ConversationSummary, SearchHit, SearchKind } from '../types/conversation';
+import type { ConversationFilters, ConversationSummary, SearchHit, SearchKind } from '../types/conversation';
 
 // #177 S6 — kind chip facets. Order matches the Q7 mock (All · Prompts ·
 // Assistant · Tools · Thinking). `Tools`/`Thinking` query the split index
@@ -20,6 +21,65 @@ const KIND_CHIPS: { kind: SearchKind; label: string; needsSplit: boolean }[] = [
   { kind: 'thinking', label: 'Thinking', needsSplit: true },
 ];
 
+// Human label for a stored datePreset KEY (the popover stores the key; the chip
+// shows the label). Falls back to the from→to range for a raw range (preset key
+// null).
+const DATE_PRESET_LABELS: Record<string, string> = {
+  'this-month': 'This month',
+  'last-month': 'Last month',
+  'last-7d': 'Last 7d',
+};
+
+// One active-filter chip: a label + the patch that removes that axis (filters
+// spec §4 — removable chips under the search box). `projects` produces one chip
+// PER selected project so each is individually removable.
+interface FilterChip { key: string; label: string; remove: () => void }
+
+function activeFilterChips(f: ConversationFilters): FilterChip[] {
+  const chips: FilterChip[] = [];
+  if (f.dateFrom || f.dateTo) {
+    const label = f.datePreset
+      ? DATE_PRESET_LABELS[f.datePreset] ?? f.datePreset
+      : f.dateFrom && f.dateTo
+        ? `${f.dateFrom} → ${f.dateTo}`
+        : f.dateFrom
+          ? `from ${f.dateFrom}`
+          : `to ${f.dateTo}`;
+    chips.push({
+      key: 'date', label,
+      remove: () => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { dateFrom: null, dateTo: null, datePreset: null } }),
+    });
+  }
+  for (const proj of f.projects) {
+    chips.push({
+      key: `proj:${proj}`, label: proj,
+      remove: () => dispatch({
+        type: 'SET_CONVERSATION_FILTERS',
+        patch: { projects: f.projects.filter((p) => p !== proj) },
+      }),
+    });
+  }
+  if (f.costMin != null) {
+    chips.push({
+      key: 'costMin', label: `≥$${f.costMin}`,
+      remove: () => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { costMin: null } }),
+    });
+  }
+  if (f.costMax != null) {
+    chips.push({
+      key: 'costMax', label: `≤$${f.costMax}`,
+      remove: () => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { costMax: null } }),
+    });
+  }
+  if (f.rebuildMin != null) {
+    chips.push({
+      key: 'rebuildMin', label: `≥${f.rebuildMin} ♻`,
+      remove: () => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { rebuildMin: null } }),
+    });
+  }
+  return chips;
+}
+
 // Browse/search rail for the Conversations workspace (spec §4). When the
 // needle is empty we browse the recent-conversations list (useConversations);
 // otherwise we run the debounced cross-session search (useConversationSearch).
@@ -30,31 +90,71 @@ export function ConversationRail() {
   const search = useSyncExternalStore(subscribeStore, () => getState().conversationSearch);
   const kind = useSyncExternalStore(subscribeStore, () => getState().conversationSearchKind);
   const selected = useSyncExternalStore(subscribeStore, () => getState().selectedConversationId);
+  const filtersOpen = useSyncExternalStore(subscribeStore, () => getState().convFiltersOpen);
+  const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const inputRef = useRef<HTMLInputElement>(null);
 
   const isSearching = search.trim() !== '';
+  const chips = activeFilterChips(filters);
 
   return (
     <aside className="conv-rail">
       <div className="conv-rail-search">
-        <input
-          ref={inputRef}
-          type="search"
-          className="conv-rail-search-input"
-          placeholder="search all conversations…"
-          value={search}
-          onChange={(e) => dispatch({ type: 'SET_CONVERSATION_SEARCH', text: e.target.value })}
-          onFocus={() => dispatch({ type: 'SET_INPUT_MODE', mode: 'search' })}
-          onBlur={() => dispatch({ type: 'SET_INPUT_MODE', mode: null })}
-          onKeyDown={(e) => {
-            if (e.key === 'Escape') {
-              dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' });
-              inputRef.current?.blur();
-            }
-          }}
-        />
+        <div className="conv-rail-search-bar">
+          <input
+            ref={inputRef}
+            type="search"
+            className="conv-rail-search-input"
+            placeholder="search all conversations…"
+            value={search}
+            onChange={(e) => dispatch({ type: 'SET_CONVERSATION_SEARCH', text: e.target.value })}
+            onFocus={() => dispatch({ type: 'SET_INPUT_MODE', mode: 'search' })}
+            onBlur={() => dispatch({ type: 'SET_INPUT_MODE', mode: null })}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' });
+                inputRef.current?.blur();
+              }
+            }}
+          />
+          {/* Filters apply to browse only; disabled (with a hint) while a needle
+              is active (filters spec §4 search-mode coexistence). */}
+          <button
+            type="button"
+            className={`conv-rail-filters-btn${filtersOpen ? ' is-on' : ''}`}
+            disabled={isSearching}
+            aria-expanded={filtersOpen}
+            title={isSearching ? 'Filters apply to browse' : 'Filter conversations'}
+            onClick={() => dispatch({ type: 'TOGGLE_CONV_FILTERS' })}
+          >
+            Filters ▾
+          </button>
+        </div>
+        {filtersOpen && !isSearching && <ConversationFiltersPopover />}
+        {!isSearching && chips.length > 0 && (
+          <div className="conv-rail-filters-active">
+            {chips.map((c) => (
+              <button
+                key={c.key}
+                type="button"
+                className="conv-rail-filters-activechip"
+                title={`Remove ${c.label}`}
+                onClick={c.remove}
+              >
+                {c.label}<span className="conv-rail-filters-x" aria-hidden="true">✕</span>
+              </button>
+            ))}
+            <button
+              type="button"
+              className="conv-rail-filters-clearall"
+              onClick={() => dispatch({ type: 'CLEAR_CONVERSATION_FILTERS' })}
+            >
+              Clear all
+            </button>
+          </div>
+        )}
       </div>
       {isSearching
         ? <SearchList needle={search} kind={kind} ctx={ctx} />
@@ -66,17 +166,26 @@ export function ConversationRail() {
 interface RailCtx { tz: string; offsetLabel: string }
 
 function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailCtx }) {
-  const { rows, loading, error, hasMore, loadMore } = useConversations();
-  if (error) return <div className="conv-rail-list"><div className="conv-rail-empty">{error}</div></div>;
-  if (loading && rows.length === 0) return <div className="conv-rail-list"><div className="conv-rail-empty">Loading…</div></div>;
-  if (rows.length === 0) return <div className="conv-rail-list"><div className="conv-rail-empty">No conversations.</div></div>;
+  const { rows, loading, error, hasMore, loadMore, filterDegraded } = useConversations();
+  // filters spec §1 dual-branch parity — a one-line muted note when the
+  // project/cost/rebuild axes couldn't apply (rollup non-authoritative). Rendered
+  // above the list so it shows even on a degraded empty result.
+  const degradedNote = filterDegraded
+    ? <div className="conv-rail-filters-degraded">Project/cost/rebuild filters apply once indexing finishes.</div>
+    : null;
+  if (error) return <div className="conv-rail-list">{degradedNote}<div className="conv-rail-empty">{error}</div></div>;
+  if (loading && rows.length === 0) return <div className="conv-rail-list">{degradedNote}<div className="conv-rail-empty">Loading…</div></div>;
+  if (rows.length === 0) return <div className="conv-rail-list">{degradedNote}<div className="conv-rail-empty">No conversations.</div></div>;
   // rows are date-desc; the bucket label changes monotonically as you scroll.
+  // Buckets group on last_activity_utc (filters spec §4 last-activity-everywhere
+  // / Codex P2 #6) so the grouping agrees with the recent sort + the date filter.
   let lastBucket: string | null = null;
   const now = Date.now();
   return (
     <div className="conv-rail-list">
+      {degradedNote}
       {rows.map((r) => {
-        const bucket = railDateBucket(r.started_utc, ctx.tz, now);
+        const bucket = railDateBucket(r.last_activity_utc, ctx.tz, now);
         const isNewBucket = bucket !== lastBucket;
         if (isNewBucket) lastBucket = bucket;
         return (
@@ -106,7 +215,7 @@ function BrowseRow({ row, ctx, active }: { row: ConversationSummary; ctx: RailCt
       <div className="conv-rail-row-meta">
         <span className="conv-rail-row-project">{row.project_label || '—'}</span>
         <span className="conv-rail-row-branch">{row.git_branch ?? '—'}</span>
-        <span className="conv-rail-row-when">{fmt.startedShort(row.started_utc, ctx, { noSuffix: true })}</span>
+        <span className="conv-rail-row-when">{fmt.startedShort(row.last_activity_utc, ctx, { noSuffix: true })}</span>
         <span className="conv-rail-row-cost">{fmt.usd2(row.cost_usd)}</span>
         <span className="conv-rail-row-msgs">{row.msg_count} msgs</span>
       </div>

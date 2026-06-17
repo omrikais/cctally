@@ -5241,6 +5241,190 @@ mark.current {
   line-height: 1.4;
 }
 
+/* ---- filters spec §4: browse-list filters (button, popover, chips) ---- */
+.conv-rail-search-bar {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+.conv-rail-search-bar .conv-rail-search-input { flex: 1 1 auto; }
+.conv-rail-filters-btn {
+  flex: 0 0 auto;
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg-2);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  padding: 0 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.conv-rail-filters-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent-blue); }
+.conv-rail-filters-btn:focus-visible { outline: none; border-color: var(--accent-blue); }
+.conv-rail-filters-btn.is-on { color: var(--bg); background: var(--accent-blue); border-color: var(--accent-blue); }
+.conv-rail-filters-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* Active-filter chips row under the search bar (content-sized, removable). */
+.conv-rail-filters-active {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 8px;
+}
+.conv-rail-filters-activechip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.conv-rail-filters-activechip:hover { border-color: var(--accent-blue); }
+.conv-rail-filters-activechip:focus-visible { outline: none; border-color: var(--accent-blue); }
+.conv-rail-filters-x { color: var(--text-faint); font-size: 9px; }
+.conv-rail-filters-activechip:hover .conv-rail-filters-x { color: var(--text); }
+.conv-rail-filters-clearall {
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+.conv-rail-filters-clearall:hover { color: var(--accent-blue); }
+
+/* Muted dual-branch-degraded note (project/cost/rebuild filters not yet live). */
+.conv-rail-filters-degraded {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.4;
+  padding: 6px 8px;
+}
+
+/* The popover: drops below the search bar inside the rail (no portal). */
+.conv-rail-filters {
+  margin-top: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-bg-2);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.conv-rail-filters-sec { display: flex; flex-direction: column; gap: 6px; }
+.conv-rail-filters-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.conv-rail-filters-chips { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.conv-rail-filters-chip {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.conv-rail-filters-chip:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-rail-filters-chip:focus-visible { outline: none; border-color: var(--accent-blue); }
+.conv-rail-filters-chip.is-on { color: var(--bg); background: var(--accent-blue); border-color: var(--accent-blue); }
+.conv-rail-filters-range { display: flex; gap: 8px; flex-wrap: wrap; }
+.conv-rail-filters-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  flex: 1 1 0;
+  min-width: 0;
+}
+.conv-rail-filters-field--inline {
+  flex-direction: row;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 4px;
+}
+.conv-rail-filters-field input {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 5px 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.conv-rail-filters-field--inline input { width: 64px; }
+.conv-rail-filters-field input:focus-visible { outline: none; border-color: var(--accent-blue); }
+.conv-rail-filters-projects {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+.conv-rail-filters-proj {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  padding: 2px 2px;
+}
+.conv-rail-filters-proj-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-rail-filters-proj-count { color: var(--text-faint); font-size: 10.5px; }
+.conv-rail-filters-empty { color: var(--text-faint); font-size: 11px; padding: 4px 2px; }
+.conv-rail-filters-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 10px;
+}
+.conv-rail-filters-clear,
+.conv-rail-filters-done {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  padding: 5px 14px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.conv-rail-filters-clear:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-rail-filters-done {
+  color: var(--bg);
+  background: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+.conv-rail-filters-done:hover { filter: brightness(1.08); }
+
 /* ---- #177 S6: floating in-conversation find bar ------------------- */
 /* A Cmd+F-style pill, absolutely positioned top-right INSIDE the reader column
    (.conv-reader is position:relative). Zero layout shift; floats over the body.

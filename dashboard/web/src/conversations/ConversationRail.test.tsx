@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationRail } from './ConversationRail';
 import { _resetForTests, dispatch, getState } from '../store/store';
@@ -16,13 +16,20 @@ let searchTotal = 0;
 let searchMode: 'fts' | 'like' = 'fts';
 let searchDepth: 'prose-only' | 'full' = 'full';
 let searchLoadingMore = false;
+let filterDegraded = false;
 const loadMoreSpy = vi.fn();
 
 vi.mock('../hooks/useConversations', () => ({
   useConversations: () => ({
     rows: browseRows, loading: false, error: null, hasMore: false,
-    loadMore: () => Promise.resolve(),
+    loadMore: () => Promise.resolve(), filterDegraded,
   }),
+}));
+// Stub the popover so the rail render doesn't reach useConversationFacets' live
+// fetch — the rail-integration tests assert the popover MOUNTS (and the real
+// store effects of the rail's own buttons/chips), not the popover internals.
+vi.mock('./ConversationFiltersPopover', () => ({
+  ConversationFiltersPopover: () => <div data-testid="filters-popover" />,
 }));
 vi.mock('../hooks/useConversationSearch', () => ({
   useConversationSearch: () => ({
@@ -73,6 +80,7 @@ beforeEach(() => {
   searchMode = 'fts';
   searchDepth = 'full';
   searchLoadingMore = false;
+  filterDegraded = false;
   loadMoreSpy.mockReset();
 });
 afterEach(() => {
@@ -82,10 +90,12 @@ afterEach(() => {
 
 describe('ConversationRail', () => {
   it('browse rows lead with the title and show date dividers', () => {
-    // Two rows in different date buckets (Today vs an older month), each titled.
+    // Two rows in different date buckets (recent vs an older month), each titled.
+    // Buckets group on last_activity_utc (filters spec §4 last-activity-everywhere),
+    // so the divider split is driven by last_activity, not started_utc.
     browseRows = [
-      summary({ session_id: 's1', title: 'design the rail', started_utc: '2026-06-09T01:00:00Z' }),
-      summary({ session_id: 's2', title: 'an older chat', started_utc: '2026-04-15T10:00:00Z' }),
+      summary({ session_id: 's1', title: 'design the rail', last_activity_utc: '2026-06-09T01:00:00Z' }),
+      summary({ session_id: 's2', title: 'an older chat', last_activity_utc: '2026-04-15T10:00:00Z' }),
     ];
     render(<ConversationRail />);
     expect(document.querySelector('.conv-rail-row-title')).toBeTruthy();
@@ -302,5 +312,78 @@ describe('ConversationRail', () => {
     dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'npm' });
     render(<ConversationRail />);
     expect((document.querySelector('.conv-rail-more') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // ---- filters spec §4: Filters button, popover, active-filter chips ----
+
+  it('shows a Filters button that toggles the popover', () => {
+    browseRows = [summary({ session_id: 'a' })];
+    render(<ConversationRail />);
+    expect(screen.queryByTestId('filters-popover')).toBeNull();
+    const btn = screen.getByRole('button', { name: /filters/i });
+    fireEvent.click(btn);
+    expect(getState().convFiltersOpen).toBe(true);
+    // Popover mounts once open (parent-integration: real store + child mount).
+    expect(screen.getByTestId('filters-popover')).toBeTruthy();
+  });
+
+  it('renders removable active-filter chips', () => {
+    browseRows = [summary({ session_id: 'a' })];
+    render(<ConversationRail />);
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { rebuildMin: 1 } }));
+    const chip = screen.getByText(/≥1/);
+    fireEvent.click(chip.closest('button')!);   // chip's ✕ removes it
+    expect(getState().conversationFilters.rebuildMin).toBeNull();
+  });
+
+  it('Clear all chip dispatches CLEAR_CONVERSATION_FILTERS', () => {
+    browseRows = [summary({ session_id: 'a' })];
+    render(<ConversationRail />);
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { rebuildMin: 2, projects: ['proj'] } }));
+    fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+    expect(getState().conversationFilters.projects).toEqual([]);
+    expect(getState().conversationFilters.rebuildMin).toBeNull();
+  });
+
+  it('renders a removable project chip per selected project', () => {
+    browseRows = [summary({ session_id: 'a' })];
+    render(<ConversationRail />);
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { projects: ['projA', 'projB'] } }));
+    const projChip = screen.getByText('projA').closest('button')!;
+    fireEvent.click(projChip);   // removing projA leaves projB
+    expect(getState().conversationFilters.projects).toEqual(['projB']);
+  });
+
+  it('disables Filters while searching and hides chips', () => {
+    render(<ConversationRail />);
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { rebuildMin: 1 } }));
+    // A chip is visible while browsing.
+    expect(screen.queryByText(/≥1/)).toBeTruthy();
+    act(() => dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'hello' }));
+    expect(screen.getByRole('button', { name: /filters/i })).toBeDisabled();
+    // Chips hide while searching.
+    expect(screen.queryByText(/≥1/)).toBeNull();
+  });
+
+  it('buckets browse rows by last activity, not start', () => {
+    // started_utc is February but last_activity_utc is April — the section header
+    // must reflect April (last activity), proving the grouping switched off
+    // started_utc (filters spec §4 last-activity-everywhere / Codex P2 #6).
+    browseRows = [summary({
+      session_id: 'a',
+      started_utc: '2026-02-01T00:00:00Z',
+      last_activity_utc: '2026-04-15T00:00:00Z',
+    })];
+    render(<ConversationRail />);
+    const sec = document.querySelector('.conv-rail-sec')!;
+    expect(sec.textContent).toMatch(/Apr|April|2026-04/i);
+    expect(sec.textContent).not.toMatch(/Feb|February/i);
+  });
+
+  it('surfaces a muted degraded note when filterDegraded is set', () => {
+    browseRows = [summary({ session_id: 'a' })];
+    filterDegraded = true;
+    render(<ConversationRail />);
+    expect(document.querySelector('.conv-rail-filters-degraded')).toBeTruthy();
   });
 });
