@@ -9,6 +9,7 @@ import {
   _resetForTests as _resetKeymapForTests,
 } from '../store/keymap';
 import { installIntersectionObserverStub } from '../test-utils/intersectionObserver';
+import { stubMobileMedia } from '../test-utils/mobileMedia';
 import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
 
 // §6 overlap-upsert keys the live-tail merge off `anchor.id`, so fixtures need
@@ -1315,6 +1316,46 @@ describe('ConversationReader keyboard navigation (G3)', () => {
     fireEvent.click(btn);
     expect(getState().convOutlineOpen).toBe(!before);
     await waitFor(() => expect(btn.getAttribute('aria-pressed')).toBe(String(!before)));
+  });
+});
+
+// #205 S1 — the ☰ outline toggle is viewport-aware: on mobile it flips the
+// ephemeral convOutlineMobileOpen flag (never the persisted desktop pref), on
+// desktop it flips the persisted convOutlineOpen. `aria-pressed` tracks the
+// EFFECTIVE state. The matchMedia stub must be installed BEFORE the reader
+// renders so useIsMobile's initial state reads it.
+describe('ConversationReader outline toggle is viewport-aware (#205 S1)', () => {
+  async function renderInConversations(items: ConversationItem[]) {
+    mockFetchOnce(detail(items));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-A' });
+    installGlobalKeydown();
+    const utils = render(<ConversationReader sessionId="sess-A" />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-outline-toggle')).not.toBeNull());
+    return utils;
+  }
+
+  it('desktop: ☰ toggles the persisted flag, mobile flag untouched', async () => {
+    stubMobileMedia(false);
+    _resetForTests();
+    const { container } = await renderInConversations([makeItem({ uuid: 'h1' })]);
+    const btn = container.querySelector<HTMLButtonElement>('.conv-outline-toggle')!;
+    expect(getState().convOutlineMobileOpen).toBe(false);
+    const before = getState().convOutlineOpen;
+    fireEvent.click(btn);
+    expect(getState().convOutlineOpen).toBe(!before);       // desktop flag flips
+    expect(getState().convOutlineMobileOpen).toBe(false);    // mobile flag untouched
+  });
+
+  it('mobile: ☰ toggles the ephemeral flag and never mutates the persisted pref', async () => {
+    stubMobileMedia(true);
+    _resetForTests();
+    localStorage.removeItem('cctally.conv.outlineOpen');
+    const { container } = await renderInConversations([makeItem({ uuid: 'h1' })]);
+    const btn = container.querySelector<HTMLButtonElement>('.conv-outline-toggle')!;
+    fireEvent.click(btn);
+    expect(getState().convOutlineMobileOpen).toBe(true);
+    expect(localStorage.getItem('cctally.conv.outlineOpen')).toBeNull();
+    await waitFor(() => expect(btn.getAttribute('aria-pressed')).toBe('true')); // reflects EFFECTIVE state
   });
 });
 

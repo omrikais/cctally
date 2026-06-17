@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, use
 import { dispatch, getState, selectMarkersEnabled, subscribeStore } from '../store/store';
 import { useConversation } from '../hooks/useConversation';
 import { useKeymap } from '../hooks/useKeymap';
+import { useIsMobile } from '../hooks/useIsMobile';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { groupSidechains, flattenSubagents, walkSubagents, type RenderNode } from './groupSidechains';
 import { isSystemMarker } from './systemMarkers';
@@ -108,6 +109,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const { detail, loading, error, hasMore, loadMore, loadUntil, loadToEnd } = useConversation(sessionId);
   const jump = useSyncExternalStore(subscribeStore, () => getState().conversationJump);
   const outlineOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineOpen);
+  // #205 S1 — the ephemeral mobile outline flag + the effective open-state. On
+  // mobile the ☰/`o` toggle and aria-pressed track convOutlineMobileOpen (never
+  // the persisted desktop pref); on desktop they track convOutlineOpen.
+  const outlineMobileOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineMobileOpen);
+  const isMobile = useIsMobile();
+  const effectiveOutlineOpen = isMobile ? outlineMobileOpen : outlineOpen;
   // #177 S5 — the active focus mode (all/chat/prompts/errors) + scroll-sync
   // cursor uuid. focusMode drives the `visible` pipeline below; the cursor uuid
   // seeds jump-to-next.
@@ -196,6 +203,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   loadMoreRef.current = loadMore;
   const reducedRef = useRef(reduced);
   reducedRef.current = reduced;
+  // #205 S1 — live mirror so the stable toggleOutline closure (shared by the ☰
+  // button + the `o` keymap binding) reads the current viewport without
+  // re-registering the useMemo([]) keymap array or capturing a stale value
+  // across a resize.
+  const isMobileRef = useRef(isMobile);
+  isMobileRef.current = isMobile;
   // #177 S5 §4 — live mirrors for the stable jump-to-next key closures (the
   // keymap array is built once; its actions read refs, never re-registering).
   const outlineRef = useRef<ConversationOutline | null | undefined>(outline);
@@ -1116,6 +1129,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: next });
   }, []);
 
+  // #205 S1 — one stable toggle for the ☰ button AND the `o` key. Reads the
+  // live isMobile mirror so the useMemo([]) keymap neither churns nor captures
+  // a stale viewport across a resize.
+  const toggleOutline = useCallback(() => {
+    dispatch({ type: isMobileRef.current ? 'TOGGLE_CONV_OUTLINE_MOBILE' : 'TOGGLE_CONV_OUTLINE' });
+  }, []);
+
   const keymapBindings = useMemo(
     () => {
       // §4/§5 (Codex P2 #7) — the named-key guard also excludes an open filter
@@ -1133,7 +1153,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         mk('[', () => sweepDetails(false)),
         mk(']', () => sweepDetails(true)),
         mk('g', () => jumpToTop()),
-        mk('o', () => dispatch({ type: 'TOGGLE_CONV_OUTLINE' })),
+        mk('o', () => toggleOutline()),
         // Jump-to-next family. Uppercase (shift) = previous. KeyboardEvent.key
         // delivers the uppercase char under shift, so each register as its own
         // binding (Codex F4).
@@ -1265,14 +1285,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
             >{jumpingLatest ? '… ' : ''}Latest ↓</button>
           )}
           {/* outline toggle. Visible on desktop + mobile; aria-pressed reflects
-              the persisted open flag. On mobile it opens the slide-over sheet. */}
+              the EFFECTIVE open flag (mobile sheet flag on mobile, persisted pref
+              on desktop). On mobile it opens the slide-over sheet (#205 S1). */}
           <button
             type="button"
             className="conv-outline-toggle"
-            aria-pressed={outlineOpen}
+            aria-pressed={effectiveOutlineOpen}
             aria-label="Toggle session outline"
             title="Toggle session outline (o)"
-            onClick={() => dispatch({ type: 'TOGGLE_CONV_OUTLINE' })}
+            onClick={toggleOutline}
           >☰ Outline</button>
         </div>
       </div>
