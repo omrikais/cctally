@@ -6788,7 +6788,10 @@ mark.current {
   #root .conv-outline-backdrop {
     position: fixed;
     inset: 0;
-    z-index: 40;
+    /* #205 S1 (F2) — above the sticky .topbar (z-index 50) so the sheet + its
+       ✕ close are pointer-reachable, not buried under the topbar (QA #205 S1);
+       still below the app modals (z-index 100+). */
+    z-index: 60;
     appearance: none;
     border: none;
     background: rgba(0, 0, 0, 0.5);
@@ -6799,7 +6802,8 @@ mark.current {
     top: 0;
     right: 0;
     bottom: 0;
-    z-index: 41;
+    /* #205 S1 (F2) — above the sticky .topbar (z-index 50); see backdrop note. */
+    z-index: 61;
     width: min(86vw, 340px);
     display: flex;
     /* #205 S1 (F2) — stack a fixed titled header over the scrolling panel. */
@@ -6819,12 +6823,12 @@ mark.current {
   #root .conv-reader-thread {
     padding-left: 0;
     gap: 10px;
-    /* #205 S1 (F1) — clamp the thread itself and let prose wrap; overflow-wrap
-       is inherited so it reaches message text. Code blocks use white-space:pre
-       and keep their own scroll boxes, unaffected. */
+    /* #205 S1 (F1) — clamp the thread so no child can inflate the body width.
+       Prose wrapping lives on .conv-item (below), NOT here: an inherited
+       overflow-wrap:anywhere on the whole thread shatters the subagent-card
+       header meta one-char-per-line at mobile widths (QA #205 S1). */
     min-width: 0;
     max-width: 100%;
-    overflow-wrap: anywhere;
   }
   /* #205 S1 (F1) — clamp ALL direct thread children (not only .conv-item:
      SidechainGroup/.conv-sidechain and .conv-toolresult-run are also direct
@@ -6844,6 +6848,11 @@ mark.current {
   #root .conv-item {
     padding: 8px 11px;
     border-radius: 7px;
+    /* #205 S1 (F1) — long prose tokens/URLs wrap instead of clipping. Scoped to
+       message items (incl. those nested inside subagent cards) so the sidechain
+       card HEADER meta is NOT broken one-char-per-line. Code blocks use
+       white-space:pre and keep their own scroll boxes, unaffected. */
+    overflow-wrap: anywhere;
   }
   #root .view-switcher {
     padding: 2px;
