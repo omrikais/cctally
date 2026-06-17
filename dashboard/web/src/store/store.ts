@@ -1,5 +1,6 @@
 import type { AlertEntry, Envelope, SessionRow } from '../types/envelope';
-import type { ConversationJump, SearchKind } from '../types/conversation';
+import type { ConversationFilters, ConversationJump, SearchKind } from '../types/conversation';
+import { EMPTY_FILTERS } from '../types/conversation';
 import {
   applySessionFilter,
   computeSearchMatches,
@@ -306,6 +307,14 @@ export interface UIState {
   // opened by '/' over an open reader, closed on Esc / its ✕ / a genuine
   // session switch. Never persists.
   convFindOpen: boolean;
+  // Browse-list filters (filters spec §4). `conversationFilters` is the active
+  // filter set threaded into the /api/conversations query string; `convFiltersOpen`
+  // is the Filters popover's open flag. Session-only (never persisted across reload)
+  // — a reload always lands unfiltered. `convFiltersOpen` is also a named-key guard:
+  // the reader's `End`/jump binding (Task 4) gates on it so typing in a filter input
+  // never fires reader navigation.
+  conversationFilters: ConversationFilters;
+  convFiltersOpen: boolean;
   openModal: ModalKind | null;
   openSessionId: string | null;
   openBlockStartAt: string | null;
@@ -537,6 +546,8 @@ function loadInitial(): UIState {
     convCurrentTurnUuid: null,
     convPinnedUuid: null,
     convFindOpen: false,
+    conversationFilters: EMPTY_FILTERS,
+    convFiltersOpen: false,
     openModal: null,
     openSessionId: null,
     openBlockStartAt: null,
@@ -685,6 +696,14 @@ export type Action =
   // #177 S6 — the in-conversation find bar open flag.
   | { type: 'OPEN_CONV_FIND' }
   | { type: 'CLOSE_CONV_FIND' }
+  // Browse-list filters (filters spec §4). SET merges a partial patch (live-apply
+  // of one axis at a time); CLEAR resets to EMPTY_FILTERS; TOGGLE flips the popover
+  // open flag; SET_CONV_FILTERS_OPEN sets it explicitly (the popover's "Done"
+  // closes it). All session-only — none persist to localStorage.
+  | { type: 'SET_CONVERSATION_FILTERS'; patch: Partial<ConversationFilters> }
+  | { type: 'CLEAR_CONVERSATION_FILTERS' }
+  | { type: 'TOGGLE_CONV_FILTERS' }
+  | { type: 'SET_CONV_FILTERS_OPEN'; open: boolean }
   | { type: 'SET_FILTER'; text: string }
   | { type: 'SET_SEARCH'; text: string }
   | { type: 'SET_SEARCH_MATCHES'; matches: number[]; index: number }
@@ -923,6 +942,18 @@ export function dispatch(action: Action): void {
       break;
     case 'CLOSE_CONV_FIND':
       state = { ...state, convFindOpen: false };
+      break;
+    case 'SET_CONVERSATION_FILTERS':
+      state = { ...state, conversationFilters: { ...state.conversationFilters, ...action.patch } };
+      break;
+    case 'CLEAR_CONVERSATION_FILTERS':
+      state = { ...state, conversationFilters: EMPTY_FILTERS };
+      break;
+    case 'TOGGLE_CONV_FILTERS':
+      state = { ...state, convFiltersOpen: !state.convFiltersOpen };
+      break;
+    case 'SET_CONV_FILTERS_OPEN':
+      state = { ...state, convFiltersOpen: action.open };
       break;
     case 'SET_CONV_CURRENT_TURN':
       if (state.convCurrentTurnUuid === action.uuid) break; // no-op: avoid a needless emit on each observer tick

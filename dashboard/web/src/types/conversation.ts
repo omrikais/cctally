@@ -253,7 +253,37 @@ export interface ConversationSummary {
 
 export interface ConversationsPage {
   conversations: ConversationSummary[];
-  page: { next_offset: number | null; has_more: boolean };
+  // `filter_degraded` (filters spec §1 dual-branch parity) is present ONLY when a
+  // project/cost/rebuild filter was requested but the rollup was non-authoritative
+  // (the live `GROUP BY` fallback can only filter by date). The rail surfaces it as
+  // a muted note; absent on the normal authoritative path.
+  page: { next_offset: number | null; has_more: boolean; filter_degraded?: boolean };
+}
+
+// Browse-list filters (filters spec §4). Session-only client state — never
+// persisted across reload. `datePreset` is a chip-LABEL only ('this-month' /
+// 'last-month' / 'last-7d' / 'YYYY-MM'); the concrete `dateFrom`/`dateTo`
+// 'YYYY-MM-DD' bounds drive the request. The server resolves naive bounds in
+// `display.tz` as a half-open [start_of_day, start_of_next_day) interval.
+export interface ConversationFilters {
+  dateFrom: string | null;   // 'YYYY-MM-DD'
+  dateTo: string | null;     // 'YYYY-MM-DD'
+  datePreset: string | null; // 'this-month' | 'last-month' | 'last-7d' | 'YYYY-MM' | null (chip label only)
+  projects: string[];
+  costMin: number | null;
+  costMax: number | null;
+  rebuildMin: number | null;
+}
+
+export const EMPTY_FILTERS: ConversationFilters = {
+  dateFrom: null, dateTo: null, datePreset: null,
+  projects: [], costMin: null, costMax: null, rebuildMin: null,
+};
+
+// GET /api/conversations/facets — sorted distinct project labels + per-label
+// conversation count, for the filter popover's project multi-select.
+export interface ConversationFacets {
+  projects: { project_label: string; count: number }[];
 }
 
 // #166: per-subagent kind + toolUseResult meta, keyed by subagent_key (the same
@@ -287,6 +317,12 @@ export interface ConversationDetail {
   items: ConversationItem[];
   page: { next_after: number | null; has_more: boolean };
   subagent_meta?: Record<string, SubagentMeta>;  // keyed by subagent_key (#166)
+  // jump-to-latest spec §3 — the conversation's final RENDERED turn (the last
+  // grouped/deduped item, not the last raw JSONL row). Constructed explicitly by
+  // the server with the request session_id (the assembled item's anchor carries a
+  // null session_id, Codex P2 #4). `null` only for a genuinely empty conversation
+  // (the Jump-to-latest control hides). Task 4 consumes it.
+  last_anchor?: { session_id: string; uuid: string; id: number } | null;
 }
 
 // #177 S6 — kind facet for the rail search chips + the find bar. Maps 1:1 to
