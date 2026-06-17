@@ -105,7 +105,7 @@ function findTopLevelNodeFor(
 // (jump-to-next targets, token footer). The scroll-sync IntersectionObserver
 // below is independent of it (it observes the reader's own rendered turns).
 export function ConversationReader({ sessionId, mobileBack, outline }: { sessionId: string; mobileBack?: boolean; outline?: ConversationOutline | null }) {
-  const { detail, loading, error, hasMore, loadMore, loadUntil } = useConversation(sessionId);
+  const { detail, loading, error, hasMore, loadMore, loadUntil, loadToEnd } = useConversation(sessionId);
   const jump = useSyncExternalStore(subscribeStore, () => getState().conversationJump);
   const outlineOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineOpen);
   // #177 S5 — the active focus mode (all/chat/prompts/errors) + scroll-sync
@@ -256,6 +256,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const [jumpTopVisible, setJumpTopVisible] = useState(false);
   const jumpTopTargetRef = useRef<HTMLElement | null>(null);
 
+  // jump-to-latest (spec §5) — the "Latest ↓" control's loading affordance. Set
+  // true while loadToEnd() drains every page (a long conversation can take a
+  // beat), so the button shows a spinner glyph + disables to prevent re-entry.
+  const [jumpingLatest, setJumpingLatest] = useState(false);
+
   const onBodyScroll = useCallback(() => {
     const b = bodyRef.current;
     if (!b) return;
@@ -355,6 +360,34 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     setNewCount(0);
     dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — explicit nav clears the pin
   }, []);
+
+  // jump-to-latest (spec §5) — page the conversation to its END (uncapped
+  // loadToEnd, unlike the 20-capped loadUntil) so the final turn is loaded, then
+  // dispatch the SAME OPEN_CONVERSATION jump the outline/find use. The existing
+  // jump effect runs loadUntil(last_anchor.uuid) (already satisfied), scrolls it
+  // into view, flashes + pins it, and parks atBottom so live appends stick.
+  // No-op when last_anchor is null (a genuinely empty conversation); the control
+  // is hidden in that case too. Construct the jump anchor explicitly from
+  // last_anchor's session_id + uuid (matching the jumpNext dispatch shape).
+  const jumpToLatest = useCallback(async () => {
+    const la = detail?.last_anchor;
+    if (!la) return;
+    setJumpingLatest(true);
+    try {
+      await loadToEnd();
+      dispatch({
+        type: 'OPEN_CONVERSATION',
+        sessionId: la.session_id,
+        jump: { session_id: la.session_id, uuid: la.uuid },
+      });
+    } finally {
+      setJumpingLatest(false);
+    }
+  }, [detail?.last_anchor, loadToEnd]);
+  // Live mirror so the stable `End` keymap closure calls the latest handler
+  // without re-registering the `[]`-dep keymap array (the jumpNextRef pattern).
+  const jumpToLatestRef = useRef(jumpToLatest);
+  jumpToLatestRef.current = jumpToLatest;
 
   // §5 — pass subagent_meta so the tree build prefers the kernel's read-time
   // parent linkage (parent_subagent_key + spawn_uuid) for nesting, falling back
@@ -1085,7 +1118,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
 
   const keymapBindings = useMemo(
     () => {
-      const guard = () => !getState().openModal && getState().inputMode === null;
+      // §4/§5 (Codex P2 #7) — the named-key guard also excludes an open filter
+      // popover. The input-focus suppression only swallows SINGLE-char keys, so
+      // `End` (a named key) would otherwise fire jump-to-latest while a cost
+      // input in the popover is focused. convFiltersOpen gates it (alongside the
+      // existing openModal/inputMode guards).
+      const guard = () => !getState().openModal && getState().inputMode === null
+                          && !getState().convFiltersOpen;
       const mk = (key: string, action: () => void) =>
         ({ key, scope: 'global' as const, view: 'conversations' as const, when: guard, action });
       return [
@@ -1123,6 +1162,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           action: () => jumpNextRef.current('cache', -1),
         },
         mk('v', () => cycleFocusMode()),
+        // jump-to-latest spec §5 — `End` runs the same handler as the "Latest ↓"
+        // control: page to the end, jump+flash the final turn. `guard` already
+        // excludes the open filter popover (Codex P2 #7) so it never fires while
+        // a filter input is focused. The handler no-ops when last_anchor is null.
+        mk('End', () => { void jumpToLatestRef.current(); }),
         // #177 S6 — n/N step the find-bar matches, but ONLY while the bar is
         // open (the input-blurred case; the focused input owns Enter/Shift+Enter
         // itself). `guard` already excludes input-mode + open modals.
@@ -1207,6 +1251,19 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
               );
             })}
           </div>
+          {/* jump-to-latest spec §5 — "Latest ↓" control. Hidden when
+              last_anchor is null (a genuinely empty conversation). Disabled with
+              a spinner glyph while loadToEnd() drains the pages. Bound to `End`. */}
+          {detail.last_anchor && (
+            <button
+              type="button"
+              className="conv-jump-latest"
+              aria-label="Jump to latest message"
+              title="Jump to latest (End)"
+              disabled={jumpingLatest}
+              onClick={() => { void jumpToLatest(); }}
+            >{jumpingLatest ? '… ' : ''}Latest ↓</button>
+          )}
           {/* outline toggle. Visible on desktop + mobile; aria-pressed reflects
               the persisted open flag. On mobile it opens the slide-over sheet. */}
           <button

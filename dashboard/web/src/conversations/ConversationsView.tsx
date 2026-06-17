@@ -85,7 +85,10 @@ export function ConversationsView() {
 // Module-scoped stable identity (useKeymap re-registers on array identity
 // change). View gating (#156) is declared via `view:'conversations'` and
 // enforced by the dispatcher; `when` carries only the transient guards.
-const inView = () => !getState().openModal && getState().inputMode === null;
+// §4/§5 — `inView` also excludes an open filter popover so '/' and Escape don't
+// fire while the popover (and its inputs) are focused, consistent with the
+// reader's named-key guard (convFiltersOpen, Codex P2 #7).
+const inView = () => !getState().openModal && getState().inputMode === null && !getState().convFiltersOpen;
 const CONVERSATIONS_BINDINGS = [
   {
     // #177 S6 (F8) — '/' is reader-aware. With an open reader it opens the

@@ -674,6 +674,78 @@ describe('ConversationReader', () => {
     expect(container.querySelector('[data-uuid="a1"]')!.classList.contains('conv-item--jumped')).toBe(true);
     await waitFor(() => expect(getState().conversationJump).toBeNull());
   });
+
+  // ── jump-to-latest control (spec §5) ──────────────────────────────────
+  // Parent-level integration (per the modal-level-integration-test lesson):
+  // exercise the REAL useConversation hook (loadToEnd paging) + the store jump
+  // pipeline, asserting the dispatched jump lands on last_anchor — not just that
+  // a child callback fired.
+
+  // detail head carrying a last_anchor (the conversation's final rendered turn).
+  function detailWithAnchor(items: ConversationItem[], next_after: number | null, lastUuid: string | null) {
+    const la = lastUuid == null
+      ? null
+      : { session_id: 's', uuid: lastUuid, id: _idFor(lastUuid) };
+    return { ...detail(items, next_after), last_anchor: la };
+  }
+
+  it('Jump to latest pages to the end then dispatches a jump to last_anchor (spec §5)', async () => {
+    // Page 1 holds h1 with MORE to come; last_anchor points at a turn that lands
+    // only on page 2. The control must loadToEnd (page in page 2) THEN jump to
+    // last_anchor.uuid — proving it reuses the existing flash/pin jump pipeline.
+    mockFetchOnce(detailWithAnchor([makeItem({ uuid: 'h1' })], 2, 'last-uuid'));
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="h1"]')).not.toBeNull());
+    // The control is present (last_anchor non-null).
+    const btn = screen.getByRole('button', { name: /jump to latest/i });
+
+    // Page 2 (the loadToEnd drain) carries the final turn; it exhausts the cursor.
+    mockFetchOnce(detail([makeItem({ uuid: 'last-uuid' })], null));
+    await act(async () => { fireEvent.click(btn); for (let i = 0; i < 8; i++) await Promise.resolve(); });
+
+    // loadToEnd paged in page 2 (a second fetch with the after= cursor ran).
+    await waitFor(() => expect(container.querySelector('[data-uuid="last-uuid"]')).not.toBeNull());
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some((c) => String(c[0]).includes('after='))).toBe(true);
+    // The jump landed on the final anchor: scrolled, flashed, then cleared.
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    expect(container.querySelector('[data-uuid="last-uuid"]')!.classList.contains('conv-item--jumped')).toBe(true);
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+    // The landing is pinned on the final anchor (drives the outline + jump-to-next).
+    expect(getState().convPinnedUuid).toBe('last-uuid');
+  });
+
+  it('hides the Jump to latest control when last_anchor is null (empty conversation)', async () => {
+    mockFetchOnce(detailWithAnchor([], null, null));
+    render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(document.querySelector('.conv-reader-body')).not.toBeNull());
+    expect(screen.queryByRole('button', { name: /jump to latest/i })).toBeNull();
+  });
+
+  it('End key triggers jump-to-latest but NOT while the filter popover is open (spec §4/§5 guard)', async () => {
+    // Single fully-paged page so the target is already loaded; the End key reuses
+    // the same handler as the button. The named `End` key is NOT covered by the
+    // single-char input-focus guard, so it must gate on convFiltersOpen.
+    mockFetchOnce(detailWithAnchor([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'last-uuid' })], null, 'last-uuid'));
+    vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="last-uuid"]')).not.toBeNull());
+
+    // Filter popover OPEN → End is a no-op (no jump dispatched).
+    act(() => { dispatch({ type: 'SET_CONV_FILTERS_OPEN', open: true }); });
+    await act(async () => { fireEvent.keyDown(document, { key: 'End' }); for (let i = 0; i < 4; i++) await Promise.resolve(); });
+    expect(getState().conversationJump).toBeNull();
+    expect(container.querySelector('[data-uuid="last-uuid"]')!.classList.contains('conv-item--jumped')).toBe(false);
+
+    // Filter popover CLOSED → End jumps to the final anchor (lands + flashes).
+    act(() => { dispatch({ type: 'SET_CONV_FILTERS_OPEN', open: false }); });
+    await act(async () => { fireEvent.keyDown(document, { key: 'End' }); for (let i = 0; i < 8; i++) await Promise.resolve(); });
+    await waitFor(() => expect(container.querySelector('[data-uuid="last-uuid"]')!.classList.contains('conv-item--jumped')).toBe(true));
+    expect(getState().convPinnedUuid).toBe('last-uuid');
+  });
 });
 
 describe('ConversationReader live-tail scroll (#175 F4)', () => {

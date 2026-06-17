@@ -4909,6 +4909,23 @@ mark.current {
   border-color: var(--accent-blue);
 }
 
+/* ---- Jump-to-latest control (spec §5) ---------------------------- */
+/* Mirrors .conv-outline-toggle chrome; sits beside it in .conv-reader-controls.
+   `disabled` dims it while loadToEnd() pages the conversation to the end. */
+.conv-jump-latest {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.conv-jump-latest:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-jump-latest:disabled { opacity: 0.6; cursor: progress; }
+
 /* ---- Focus-mode segmented control (#177 S5 §5) -------------------- */
 .conv-focus-seg {
   display: inline-flex;
