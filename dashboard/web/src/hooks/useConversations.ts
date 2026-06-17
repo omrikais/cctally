@@ -1,7 +1,25 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { fetchJson, isAbortError } from '../lib/fetchJson';
+import { getState, subscribeStore } from '../store/store';
 import { useSnapshot } from './useSnapshot';
-import type { ConversationSummary, ConversationsPage } from '../types/conversation';
+import type { ConversationFilters, ConversationSummary, ConversationsPage } from '../types/conversation';
+
+// Serialize the active filters into the /api/conversations query string (filters
+// spec §4 / §2). Each axis appends a parameterized predicate server-side; absent
+// axes are simply omitted. `projects` repeats (?projects=a&projects=b) so the
+// server reads the multi-select as an IN(...). Returns '' (NOT '&…') when no axis
+// is active so the base URL stays byte-identical to the unfiltered path.
+function filterParams(f: ConversationFilters): string {
+  const p = new URLSearchParams();
+  if (f.dateFrom) p.set('date_from', f.dateFrom);
+  if (f.dateTo) p.set('date_to', f.dateTo);
+  for (const proj of f.projects) p.append('projects', proj);
+  if (f.costMin != null) p.set('cost_min', String(f.costMin));
+  if (f.costMax != null) p.set('cost_max', String(f.costMax));
+  if (f.rebuildMin != null) p.set('rebuild_min', String(f.rebuildMin));
+  const s = p.toString();
+  return s ? `&${s}` : '';
+}
 
 // Browse-rail list. Offset-paginated, accumulating. Revalidates the
 // FIRST page on every SSE tick (the list shifts as new sessions ingest)
@@ -24,6 +42,10 @@ export interface UseConversations {
   error: string | null;
   hasMore: boolean;
   loadMore: () => Promise<void>;
+  // filters spec §1 dual-branch parity — true when a project/cost/rebuild filter
+  // was requested but the rollup was non-authoritative (the live fallback can only
+  // filter by date). The rail surfaces a muted note.
+  filterDegraded: boolean;
 }
 
 const PAGE = 50;
@@ -33,6 +55,13 @@ export function useConversations(): UseConversations {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [nextOffset, setNextOffset] = useState<number | null>(0);
+  const [filterDegraded, setFilterDegraded] = useState(false);
+  // Active browse filters from the store (filters spec §4). A `filtersRef` mirror
+  // lets the ref-stable loadFirstPage / loadMore read the LATEST filters without
+  // closing over them (which would churn the []-dep callbacks and the tick effect).
+  const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
   const env = useSnapshot();
   const generatedAt = env?.generated_at ?? '';
   const loadingMoreRef = useRef(false);
@@ -58,10 +87,11 @@ export function useConversations(): UseConversations {
     ctlRef.current?.abort();
     const ctl = new AbortController();
     ctlRef.current = ctl;
-    fetchJson<ConversationsPage>(`/api/conversations?sort=recent&limit=${PAGE}&offset=0`, ctl.signal)
+    fetchJson<ConversationsPage>(`/api/conversations?sort=recent&limit=${PAGE}&offset=0${filterParams(filtersRef.current)}`, ctl.signal)
       .then((body) => {
         setRows(body.conversations);
         setNextOffset(body.page.next_offset);
+        setFilterDegraded(body.page.filter_degraded === true);
         setError(null);
         setLoading(false);
       })
@@ -72,10 +102,34 @@ export function useConversations(): UseConversations {
       });
   }, []);
 
+  // Filter-change reset (filters spec §4): a filter change wipes the accumulated
+  // tail, rewinds the cursor to offset 0, and refetches page 1 with the new
+  // params. Keyed on a stable JSON key so a no-op SET (same values) doesn't
+  // refetch. The MOUNT run is skipped (mountFilterKeyRef) — the [generatedAt]
+  // mount/tick effect below already issues the initial page-1 load; double-firing
+  // here would re-fetch page 1 and, mid-paging, clobber the accumulated tail.
+  const filterKey = JSON.stringify(filters);
+  const mountFilterKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (mountFilterKeyRef.current === null) {
+      // First commit: the mount/tick effect owns the initial load.
+      mountFilterKeyRef.current = filterKey;
+      return;
+    }
+    if (mountFilterKeyRef.current === filterKey) return; // no-op SET (same values)
+    mountFilterKeyRef.current = filterKey;
+    setRows([]);
+    setNextOffset(0);
+    rowsLenRef.current = 0;
+    loadFirstPage();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterKey]);
+
   // First-page (re)load on mount + every SSE tick — but never while hidden.
   // Keyed on [generatedAt, loadFirstPage]; loadFirstPage is ref-stable so the
   // effect re-runs only when generatedAt changes (the SSE tick), never on a
-  // plain row update.
+  // plain row update. The tick reload reads filtersRef so it always carries the
+  // active filters (a tick must never repaint an UNfiltered page 1).
   useEffect(() => {
     if (typeof document !== 'undefined' && document.hidden) return;
     loadFirstPage();
@@ -98,9 +152,10 @@ export function useConversations(): UseConversations {
     if (nextOffset == null || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
     try {
-      const body = await fetchJson<ConversationsPage>(`/api/conversations?sort=recent&limit=${PAGE}&offset=${nextOffset}`);
+      const body = await fetchJson<ConversationsPage>(`/api/conversations?sort=recent&limit=${PAGE}&offset=${nextOffset}${filterParams(filtersRef.current)}`);
       setRows((prev) => [...prev, ...body.conversations]);
       setNextOffset(body.page.next_offset);
+      setFilterDegraded(body.page.filter_degraded === true);
     } catch {
       /* keep what we have; a transient blip shouldn't wipe the list */
     } finally {
@@ -108,5 +163,5 @@ export function useConversations(): UseConversations {
     }
   }, [nextOffset]);
 
-  return { rows, loading, error, hasMore: nextOffset != null, loadMore };
+  return { rows, loading, error, hasMore: nextOffset != null, loadMore, filterDegraded };
 }

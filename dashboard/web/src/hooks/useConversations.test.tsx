@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useConversations } from './useConversations';
+import { _resetForTests, dispatch } from '../store/store';
 
 // Mock the snapshot store so we can drive `generated_at` (the SSE-tick
 // signal the first-page effect keys on) deterministically between renders.
@@ -24,8 +25,8 @@ function mockFetchOnce(body: unknown, status = 200) {
   } as Response);
 }
 
-beforeEach(() => { globalThis.fetch = vi.fn(); mockGeneratedAt = 't0'; });
-afterEach(() => { vi.restoreAllMocks(); });
+beforeEach(() => { globalThis.fetch = vi.fn(); mockGeneratedAt = 't0'; _resetForTests(); });
+afterEach(() => { vi.restoreAllMocks(); _resetForTests(); });
 
 // A full first page (exactly PAGE=50 rows) with more to come. Generated
 // programmatically so the accumulated tail is unambiguously > PAGE.
@@ -101,5 +102,42 @@ describe('useConversations', () => {
     mockFetchOnce(fullPage('p3', null));
     await act(async () => { await result.current.loadMore(); });
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0]).toContain('offset=100');
+  });
+
+  it('threads active filters into the request URL', async () => {
+    mockFetchOnce(page1);
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+    mockFetchOnce(page1);
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { projects: ['projA'], costMin: 1 } }));
+    await waitFor(() => {
+      const urls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string);
+      expect(urls.some((u) => u.includes('projects=projA') && u.includes('cost_min=1'))).toBe(true);
+    });
+  });
+
+  it('resets to offset 0 when filters change', async () => {
+    mockFetchOnce(page1);
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+    const callsBefore = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+    mockFetchOnce({ conversations: [], page: { next_offset: null, has_more: false } });
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { rebuildMin: 2 } }));
+    // The reset effect fires a NEW page-1 fetch (offset 0) carrying the new param —
+    // asserting rebuild_min as well as offset=0 proves this is the post-change
+    // refetch (non-vacuous), not the mount fetch which is already offset=0.
+    await waitFor(() => {
+      const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+      expect(calls.length).toBeGreaterThan(callsBefore);
+      const last = calls.at(-1)![0] as string;
+      expect(last).toContain('offset=0');
+      expect(last).toContain('rebuild_min=2');
+    });
+  });
+
+  it('surfaces filter_degraded from the page body', async () => {
+    mockFetchOnce({ conversations: [], page: { next_offset: null, has_more: false, filter_degraded: true } });
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.filterDegraded).toBe(true));
   });
 });
