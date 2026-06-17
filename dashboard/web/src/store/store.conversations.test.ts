@@ -133,6 +133,28 @@ describe('conversation view state', () => {
     expect(getState().conversationSearchKind).toBe('assistant');
   });
 
+  // Cross-branch review fix: an active search needle unmounts the Filters
+  // popover ({filtersOpen && !isSearching && …}) but the reader hotkey guards
+  // (`End`/`j`/`k` + ConversationsView `inView`) gate on `convFiltersOpen`, so a
+  // left-true flag would silently dead the reader keys with no visible popover.
+  // A non-empty needle must clear `convFiltersOpen` so the popover-mount
+  // condition and both guards share one source of truth.
+  it('a non-empty SET_CONVERSATION_SEARCH clears an open Filters popover flag', () => {
+    dispatch({ type: 'SET_CONV_FILTERS_OPEN', open: true });
+    expect(getState().convFiltersOpen).toBe(true);
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    expect(getState().convFiltersOpen).toBe(false);
+  });
+
+  it('an empty SET_CONVERSATION_SEARCH does not force convFiltersOpen open', () => {
+    // The clear path (text === '') must NOT re-open the popover — clearing the
+    // needle returns to browse mode, but the popover stays closed until the user
+    // toggles it.
+    expect(getState().convFiltersOpen).toBe(false);
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' });
+    expect(getState().convFiltersOpen).toBe(false);
+  });
+
   it('CLEAR_CONVERSATION_JUMP clears only the jump', () => {
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'a', jump: { session_id: 'a', uuid: 'x' } });
     dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });

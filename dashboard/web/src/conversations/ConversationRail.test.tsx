@@ -400,4 +400,34 @@ describe('ConversationRail', () => {
     render(<ConversationRail />);
     expect(document.querySelector('.conv-rail-filters-degraded')).toBeTruthy();
   });
+
+  // ---- filters spec §4: distinct filtered-to-zero empty state ----
+
+  it('shows the generic empty copy when there are no conversations and no filters', () => {
+    // No rows, no active filters → the "nothing here at all" message, NOT the
+    // filtered-to-zero copy, and no Clear-filters button.
+    browseRows = [];
+    render(<ConversationRail />);
+    const empty = document.querySelector('.conv-rail-empty')!;
+    expect(empty).toBeTruthy();
+    expect(empty.textContent).toBe('No conversations.');
+    expect(screen.queryByRole('button', { name: /clear filters/i })).toBeNull();
+  });
+
+  it('shows the distinct filtered-to-zero copy + a working Clear-filters button', () => {
+    // No rows BUT a filter is active → the "no matches" copy plus a Clear-filters
+    // button that dispatches CLEAR_CONVERSATION_FILTERS (spec §4 Empty state).
+    browseRows = [];
+    render(<ConversationRail />);
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { rebuildMin: 3, projects: ['projA'] } }));
+    const empty = document.querySelector('.conv-rail-empty')!;
+    expect(empty.textContent).toContain('No conversations match these filters');
+    // The generic copy must NOT show in the filtered case.
+    expect(empty.textContent).not.toBe('No conversations.');
+    const clear = screen.getByRole('button', { name: /clear filters/i });
+    expect(clear).toBeTruthy();
+    fireEvent.click(clear);
+    expect(getState().conversationFilters.rebuildMin).toBeNull();
+    expect(getState().conversationFilters.projects).toEqual([]);
+  });
 });

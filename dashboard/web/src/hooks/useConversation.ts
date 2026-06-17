@@ -139,13 +139,31 @@ export function useConversation(sessionId: string | null): UseConversation {
     // Uncapped forward pager for the explicit "Jump to latest" action (spec §5,
     // Codex P1 #2). loadUntil caps at 20 pages; this drains ALL pages so the
     // final anchor is always reachable past the cap. Driven by an explicit user
-    // action with a loading state, so the unbounded loop is acceptable —
-    // forward-only, and fetchNext returns falsy the moment the cursor is null
-    // (page exhausted) OR a guard/error trips (after==null, session changed,
-    // overlapping load, or a failed fetch), so it cannot infinite-loop.
+    // action with a loading state, so the unbounded loop is acceptable.
+    //
+    // Cross-branch review fix — fetchNext returns false for TWO distinct reasons:
+    // a genuine exhaustion (cursor null, session changed, or a failed fetch) AND
+    // a transient overlapping-load early-return (loadingMoreRef set). Treating the
+    // latter as terminal let a jump-to-latest firing mid-load (an outline
+    // loadUntil / loadMore still settling) page nothing. So on a false return we
+    // disambiguate via the synchronous cursor mirror: if more pages remain
+    // (nextAfterRef non-null) for the SAME session, the false was the overlap
+    // guard — yield until the in-flight load settles (clears loadingMoreRef),
+    // then retry. Forward-only and the cursor strictly advances on every real
+    // page, so it cannot infinite-loop.
+    const sid = sessionRef.current;
     for (;;) {
       const more = await fetchNext();
-      if (!more) return;
+      if (more) continue;
+      // Genuine exhaustion / session-change / error → done.
+      if (nextAfterRef.current == null || sessionRef.current !== sid) return;
+      // Cursor still points past the loaded tail but fetchNext bailed: an
+      // overlapping load is in flight. Spin a microtask until it clears, then
+      // loop to fetch the next page ourselves.
+      while (loadingMoreRef.current && sessionRef.current === sid) {
+        await Promise.resolve();
+      }
+      if (sessionRef.current !== sid) return;
     }
   }, [fetchNext]);
 

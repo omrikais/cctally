@@ -398,6 +398,71 @@ def test_conversation_detail_pagination_threads_query(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def test_conversations_display_is_live_recompute_filter_is_stored(tmp_path, monkeypatch):
+    """Pin the shipped cost-source contract (Option B): the rail DISPLAYS a
+    live read-time recompute (``_session_cost_map`` from ``session_entries`` /
+    ``CLAUDE_MODEL_PRICING``, pricing-immediate), while the cost FILTER predicate
+    (``_rollup_where``) compares the STORED ``conversation_sessions.cost_usd``
+    rollup column. In steady state the two agree; they diverge only briefly after
+    a pricing edit (before the next ``sync_cache`` re-derive). This test forces a
+    divergence by skewing ONLY the stored column, then asserts display reads live
+    and the filter reads stored — so a future change can't silently flip the rail
+    back to reading the stored column (which would re-introduce the
+    filter==display coupling and lose pricing-immediacy)."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+
+        # Baseline: s1's displayed cost is the live recompute (1000 input + 500
+        # output @ claude-opus-4-8 → 0.0175), and the recompute also stamped the
+        # stored column to the same value.
+        status, body = _get(port, "/api/conversations")
+        assert status == 200, (status, body)
+        s1 = next(r for r in json.loads(body)["conversations"]
+                  if r["session_id"] == "s1")
+        live_cost = s1["cost_usd"]
+        assert abs(live_cost - 0.0175) < 1e-9, s1
+
+        # Deliberately skew ONLY the stored rollup column for s1 to a value far
+        # from the live recompute (999.0). The display path never reads this
+        # column; the filter path reads ONLY this column.
+        skewed = 999.0
+        cache = ns["open_cache_db"]()
+        cache.execute(
+            "UPDATE conversation_sessions SET cost_usd=? WHERE session_id=?",
+            (skewed, "s1"))
+        cache.commit()
+        cache.close()
+
+        # (a) DISPLAY still reads LIVE — the skewed stored 999.0 must NOT surface.
+        status, body = _get(port, "/api/conversations")
+        assert status == 200, (status, body)
+        s1 = next(r for r in json.loads(body)["conversations"]
+                  if r["session_id"] == "s1")
+        assert abs(s1["cost_usd"] - live_cost) < 1e-9, s1
+        assert s1["cost_usd"] != skewed, s1
+
+        # (b) FILTER reads the STORED (skewed) column. cost_min=500 admits s1
+        # (stored 999 >= 500) even though the LIVE 0.0175 would exclude it —
+        # proof the predicate compares the stored column, not the live value.
+        status, body = _get(port, "/api/conversations?cost_min=500")
+        assert status == 200, (status, body)
+        sids = {r["session_id"] for r in json.loads(body)["conversations"]}
+        assert "s1" in sids, sids
+
+        # And cost_max=1 EXCLUDES s1 (stored 999 > 1) though the LIVE 0.0175
+        # would include it — the complementary direction of the same proof. The
+        # displayed cost on any row that survives is still the live recompute.
+        status, body = _get(port, "/api/conversations?cost_max=1")
+        assert status == 200, (status, body)
+        rows = json.loads(body)["conversations"]
+        sids = {r["session_id"] for r in rows}
+        assert "s1" not in sids, sids
+    finally:
+        srv.shutdown()
+
+
 class _ExplodingQuery:
     """Stand-in conversation query kernel whose every method raises mid-query,
     modeling a `sqlite3.OperationalError` (lock past busy_timeout) /

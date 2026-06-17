@@ -35,6 +35,21 @@ const DATE_PRESET_LABELS: Record<string, string> = {
 // PER selected project so each is individually removable.
 interface FilterChip { key: string; label: string; remove: () => void }
 
+// True when any browse-filter axis is active (non-empty projects / non-null
+// date / cost / rebuild). Drives the distinct filtered-to-zero empty state
+// (spec §4 — "No conversations match these filters" + Clear filters), so a
+// genuinely empty install keeps the generic "No conversations." copy.
+function anyFilterActive(f: ConversationFilters): boolean {
+  return (
+    f.dateFrom != null ||
+    f.dateTo != null ||
+    f.projects.length > 0 ||
+    f.costMin != null ||
+    f.costMax != null ||
+    f.rebuildMin != null
+  );
+}
+
 function activeFilterChips(f: ConversationFilters): FilterChip[] {
   const chips: FilterChip[] = [];
   if (f.dateFrom || f.dateTo) {
@@ -168,6 +183,7 @@ interface RailCtx { tz: string; offsetLabel: string }
 
 function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailCtx }) {
   const { rows, loading, error, hasMore, loadMore, filterDegraded } = useConversations();
+  const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
   // filters spec §1 dual-branch parity — a one-line muted note when the
   // project/cost/rebuild axes couldn't apply (rollup non-authoritative). Rendered
   // above the list so it shows even on a degraded empty result.
@@ -176,7 +192,29 @@ function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailC
     : null;
   if (error) return <div className="conv-rail-list">{degradedNote}<div className="conv-rail-empty">{error}</div></div>;
   if (loading && rows.length === 0) return <div className="conv-rail-list">{degradedNote}<div className="conv-rail-empty">Loading…</div></div>;
-  if (rows.length === 0) return <div className="conv-rail-list">{degradedNote}<div className="conv-rail-empty">No conversations.</div></div>;
+  if (rows.length === 0) {
+    // spec §4 Empty state — filtered-to-zero is DISTINCT from no-conversations-
+    // at-all: the former offers a one-click escape (Clear filters) so the user
+    // isn't stranded behind an over-narrow filter set.
+    if (anyFilterActive(filters)) {
+      return (
+        <div className="conv-rail-list">
+          {degradedNote}
+          <div className="conv-rail-empty conv-rail-empty--filtered">
+            <div>No conversations match these filters.</div>
+            <button
+              type="button"
+              className="conv-rail-empty-clear"
+              onClick={() => dispatch({ type: 'CLEAR_CONVERSATION_FILTERS' })}
+            >
+              Clear filters
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return <div className="conv-rail-list">{degradedNote}<div className="conv-rail-empty">No conversations.</div></div>;
+  }
   // rows are date-desc; the bucket label changes monotonically as you scroll.
   // Buckets group on last_activity_utc (filters spec §4 last-activity-everywhere
   // / Codex P2 #6) so the grouping agrees with the recent sort + the date filter.

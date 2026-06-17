@@ -388,6 +388,53 @@ describe('useConversation', () => {
     expect(result.current.detail!.items.at(-1)!.anchor.id).toBe(26);
   });
 
+  it('loadToEnd waits out an overlapping in-flight load instead of bailing as exhausted', async () => {
+    // Cross-branch review fix: fetchNext returns false immediately when a load is
+    // already in flight (loadingMoreRef set). loadToEnd's loop treated that early
+    // false as terminal, so a jump-to-latest firing mid-load would page nothing
+    // and leave the final anchor unreachable. The fix distinguishes "no more
+    // pages" (cursor null) from "a load is already running" (cursor non-null +
+    // loadingMoreRef set): in the latter case loadToEnd awaits the in-flight
+    // settle and continues.
+    const page = (id: number, more: boolean) => {
+      const item = {
+        kind: 'human', anchor: { session_id: 'sess-race', uuid: `u${id}`, id },
+        member_uuids: [`u${id}`], ts: 't', text: `m${id}`, blocks: [], is_sidechain: false,
+      };
+      return detail([item], more ? id + 1 : null, { session_id: 'sess-race' });
+    };
+    mockOnce(page(1, true));                       // page 1 (effect-loaded)
+    const { result } = renderHook(() => useConversation('sess-race'));
+    await waitFor(() => expect(result.current.detail).not.toBeNull());
+
+    // Arm a controllable page 2 for the OVERLAPPING loadMore — it resolves only
+    // when we say so, so loadingMoreRef stays set across the loadToEnd kickoff.
+    let resolveInflight!: () => void;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise((res) => { resolveInflight = () => res({ ok: true, status: 200, json: async () => page(2, true) } as Response); }),
+    );
+    // Queue pages 3 and 4 (4 exhausts) for loadToEnd to drain after the overlap.
+    mockOnce(page(3, true));
+    mockOnce(page(4, false));
+
+    await act(async () => {
+      // Kick off the in-flight loadMore WITHOUT awaiting it — loadingMoreRef is set.
+      const inflight = result.current.loadMore();
+      // loadToEnd fires while loadMore is in flight (the jump-to-latest race).
+      const toEnd = result.current.loadToEnd();
+      // Release the in-flight load so loadToEnd's wait can proceed.
+      resolveInflight();
+      await inflight;
+      await toEnd;
+    });
+
+    // Despite the overlap, loadToEnd drained every page (2,3,4 appended to 1) and
+    // the cursor is fully exhausted — it did NOT conclude "exhausted" at page 1.
+    expect(result.current.detail!.items.length).toBe(4);
+    expect(result.current.detail!.items.at(-1)!.anchor.id).toBe(4);
+    expect(result.current.hasMore).toBe(false);
+  });
+
   it('never exposes the previous session\'s detail under the new sid on switch (#183 stale-media 404)', async () => {
     // REGRESSION (cross-session stale-media 404, useConversation.ts derive guard):
     // The fetch effect clears `detail` only in the POST-commit passive phase, so

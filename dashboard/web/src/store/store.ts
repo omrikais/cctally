@@ -911,10 +911,20 @@ export function dispatch(action: Action): void {
       // #177 S6 — clearing the needle snaps the kind facet back to 'all' so
       // re-opening search starts on the default facet (a non-empty edit leaves
       // the active facet alone — the user keeps Tools/Thinking across keystrokes).
+      // Cross-branch review fix — a non-empty needle also force-closes the
+      // Filters popover flag. The rail unmounts the popover while searching
+      // ({filtersOpen && !isSearching && …}), but the reader hotkey guards
+      // (`End`/`j`/`k` + ConversationsView `inView`) gate on `convFiltersOpen`,
+      // so a left-true flag would silently suppress reader keys with no visible
+      // popover. Clearing it keeps the popover-mount condition and both guards on
+      // one source of truth. The empty (clear) path leaves it untouched — it
+      // never re-opens the popover.
       state = {
         ...state,
         conversationSearch: action.text,
-        ...(action.text === '' ? { conversationSearchKind: 'all' as const } : {}),
+        ...(action.text === ''
+          ? { conversationSearchKind: 'all' as const }
+          : { convFiltersOpen: false }),
       };
       break;
     case 'SET_CONVERSATION_SEARCH_KIND':

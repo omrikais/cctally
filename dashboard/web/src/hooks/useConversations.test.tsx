@@ -116,6 +116,42 @@ describe('useConversations', () => {
     });
   });
 
+  it('an SSE tick revalidation carries the active filter params (reads filtersRef)', async () => {
+    // Cross-branch review coverage: the per-tick page-1 revalidation must NOT
+    // repaint an UNfiltered page 1 while a filter is active. The tick effect reads
+    // `filtersRef.current` (not a closed-over value) so a generated_at bump after
+    // a filter was set re-issues page 1 WITH the active params. Distinct from the
+    // "threads filters into the URL" test, which fires the reset effect on a
+    // filter CHANGE — here the filter is unchanged and only the SSE tick fires.
+    mockFetchOnce(page1);   // mount load (offset 0, unfiltered)
+    const { result, rerender } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+
+    // Set a filter; the reset effect fires a page-1 fetch carrying it.
+    mockFetchOnce(page1);
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { projects: ['projZ'], rebuildMin: 4 } }));
+    await waitFor(() => {
+      const urls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string);
+      expect(urls.some((u) => u.includes('projects=projZ') && u.includes('rebuild_min=4'))).toBe(true);
+    });
+    const callsBeforeTick = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    // Now an SSE tick (generated_at bump) with the filter UNCHANGED. rows stay at
+    // 1 (< PAGE) so the page-1 revalidation is NOT suppressed. The tick fetch must
+    // still carry the active filter params — proving it read filtersRef, not an
+    // unfiltered base URL.
+    mockFetchOnce(page1);
+    mockGeneratedAt = 't1';
+    await act(async () => { rerender(); await Promise.resolve(); });
+    await waitFor(() => {
+      expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(callsBeforeTick);
+    });
+    const tickUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0] as string;
+    expect(tickUrl).toContain('offset=0');          // a page-1 revalidation
+    expect(tickUrl).toContain('projects=projZ');     // …carrying the active filters
+    expect(tickUrl).toContain('rebuild_min=4');
+  });
+
   it('resets to offset 0 when filters change', async () => {
     mockFetchOnce(page1);
     const { result } = renderHook(() => useConversations());
