@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { _resetForTests, dispatch, getState } from './store';
 
 afterEach(() => _resetForTests());
@@ -358,5 +358,57 @@ describe('conversation pin state (#188 S2)', () => {
     dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
     expect(getState().conversationJump).toBeNull();
     expect(getState().convPinnedUuid).toBe('u9');
+  });
+});
+
+// #205 S1 — the EPHEMERAL mobile-outline open flag. Decoupled from the persisted
+// desktop convOutlineOpen so a fresh mobile conversation open never auto-buries
+// the transcript; reset to false on a genuine conversation switch.
+describe('#205 S1 — convOutlineMobileOpen (ephemeral mobile outline)', () => {
+  beforeEach(() => { _resetForTests(); });
+
+  it('defaults to false and is not read from localStorage', () => {
+    expect(getState().convOutlineMobileOpen).toBe(false);
+  });
+
+  it('TOGGLE_CONV_OUTLINE_MOBILE flips it without touching convOutlineOpen or localStorage', () => {
+    const persistedBefore = getState().convOutlineOpen;
+    localStorage.removeItem('cctally.conv.outlineOpen');
+    dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' });
+    expect(getState().convOutlineMobileOpen).toBe(true);
+    expect(getState().convOutlineOpen).toBe(persistedBefore);
+    expect(localStorage.getItem('cctally.conv.outlineOpen')).toBeNull();
+    dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' });
+    expect(getState().convOutlineMobileOpen).toBe(false);
+  });
+
+  it('CLOSE_CONV_OUTLINE_MOBILE forces it false (idempotent)', () => {
+    dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' });
+    expect(getState().convOutlineMobileOpen).toBe(true);
+    dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' });
+    expect(getState().convOutlineMobileOpen).toBe(false);
+    dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' });
+    expect(getState().convOutlineMobileOpen).toBe(false);
+  });
+
+  it('resets to false on a GENUINE switch via OPEN_CONVERSATION', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-A' });
+    dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' });
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-B' }); // different id
+    expect(getState().convOutlineMobileOpen).toBe(false);
+  });
+
+  it('PRESERVES it on a same-session OPEN_CONVERSATION (in-session jump)', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-A' });
+    dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' });
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-A', jump: { session_id: 'sess-A', uuid: 'u1' } });
+    expect(getState().convOutlineMobileOpen).toBe(true);
+  });
+
+  it('resets to false on SELECT_CONVERSATION to a different id (incl. Back → null)', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-A' });
+    dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' });
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: null });
+    expect(getState().convOutlineMobileOpen).toBe(false);
   });
 });

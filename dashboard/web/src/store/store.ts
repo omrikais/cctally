@@ -293,6 +293,11 @@ export interface UIState {
   // true on desktop); `convFocusMode` + `convCurrentTurnUuid` are transient
   // per-session and reset on every conversation switch.
   convOutlineOpen: boolean;
+  // #205 S1 — EPHEMERAL mobile outline-sheet open flag. NOT persisted (unlike
+  // convOutlineOpen): a fresh mobile conversation open must never auto-bury the
+  // transcript. Reset to false on a genuine conversation switch; toggled only
+  // by the reader's ☰ / `o` on mobile.
+  convOutlineMobileOpen: boolean;
   convFocusMode: 'all' | 'chat' | 'prompts' | 'errors';
   convCurrentTurnUuid: string | null;
   // #188 S2 — the EXPLICIT-selection pin (always a real uuid; the bucket-root
@@ -542,6 +547,7 @@ function loadInitial(): UIState {
     conversationSearchKind: 'all',
     conversationJump: null,
     convOutlineOpen,
+    convOutlineMobileOpen: false,
     convFocusMode: 'all',
     convCurrentTurnUuid: null,
     convPinnedUuid: null,
@@ -685,6 +691,10 @@ export type Action =
   // consumer); SET_CONV_CURRENT_TURN is the scroll-sync cursor written by the
   // reader's IntersectionObserver.
   | { type: 'TOGGLE_CONV_OUTLINE' }
+  // #205 S1 — the ☰ button + `o` key on mobile flip the ephemeral mobile flag
+  // (no persistence); the ✕ button + backdrop force it closed.
+  | { type: 'TOGGLE_CONV_OUTLINE_MOBILE' }
+  | { type: 'CLOSE_CONV_OUTLINE_MOBILE' }
   | { type: 'SET_CONV_FOCUS_MODE'; mode: UIState['convFocusMode'] }
   | { type: 'SET_CONV_CURRENT_TURN'; uuid: string | null }
   // #188 S2 — the explicit-selection pin. SET_CONV_PINNED_TURN is dispatched by
@@ -888,8 +898,11 @@ export function dispatch(action: Action): void {
         // bucket-root uuids it could hold are session-scoped). A same-session
         // OPEN_CONVERSATION (an in-session jump) leaves it — the jump effect
         // re-sets it after the jump lands.
+        // #205 S1 — a genuine switch also closes the ephemeral mobile outline
+        // sheet so the new conversation's transcript is never auto-buried; a
+        // same-session OPEN_CONVERSATION (in-session jump) leaves it open.
         ...(switched
-          ? { convFocusMode: 'all' as const, convCurrentTurnUuid: null, convPinnedUuid: null, convFindOpen: false }
+          ? { convFocusMode: 'all' as const, convCurrentTurnUuid: null, convPinnedUuid: null, convFindOpen: false, convOutlineMobileOpen: false }
           : {}),
       };
       break;
@@ -897,6 +910,10 @@ export function dispatch(action: Action): void {
     case 'SELECT_CONVERSATION':
       state = {
         ...state,
+        // #205 S1 — close the mobile outline sheet on a genuine conversation
+        // change (incl. Back → null); a same-id re-select leaves it. Read the
+        // PRIOR selectedConversationId (state, not action) before the overwrite.
+        ...(action.sessionId !== state.selectedConversationId ? { convOutlineMobileOpen: false } : {}),
         selectedConversationId: action.sessionId,
         conversationJump: null,
         // #177 S5 — same transient reset as OPEN_CONVERSATION (convOutlineOpen
@@ -944,6 +961,14 @@ export function dispatch(action: Action): void {
       state = { ...state, convOutlineOpen: next };
       break;
     }
+    case 'TOGGLE_CONV_OUTLINE_MOBILE':
+      // #205 S1 — flip the ephemeral mobile flag only; never touches the
+      // persisted desktop convOutlineOpen or localStorage.
+      state = { ...state, convOutlineMobileOpen: !state.convOutlineMobileOpen };
+      break;
+    case 'CLOSE_CONV_OUTLINE_MOBILE':
+      state = { ...state, convOutlineMobileOpen: false };
+      break;
     case 'SET_CONV_FOCUS_MODE':
       state = { ...state, convFocusMode: action.mode };
       break;
