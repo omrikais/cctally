@@ -141,6 +141,7 @@ export function ConversationRail() {
                 type="button"
                 className="conv-rail-filters-activechip"
                 title={`Remove ${c.label}`}
+                aria-label={`Remove ${c.label}`}
                 onClick={c.remove}
               >
                 {c.label}<span className="conv-rail-filters-x" aria-hidden="true">✕</span>

@@ -1,7 +1,18 @@
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationFiltersPopover } from './ConversationFiltersPopover';
-import { _resetForTests, dispatch, getState } from '../store/store';
+import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
+import type { Envelope } from '../types/envelope';
+
+// Minimal display-only envelope: the popover only reads the `display` block (via
+// useDisplayTz) for the date-preset tz, so the rest is irrelevant here.
+function displayEnvelope(resolvedTz: string, generatedAt = '2026-07-01T03:00:00Z'): Envelope {
+  return {
+    envelope_version: 2,
+    generated_at: generatedAt,
+    display: { tz: resolvedTz, resolved_tz: resolvedTz, offset_label: resolvedTz, offset_seconds: 0 },
+  } as unknown as Envelope;
+}
 
 // Stub the facets hook so the project multi-select renders from a fixture, not a
 // live fetch (mirrors the ConversationRail.test.tsx hook-stub convention).
@@ -51,6 +62,34 @@ describe('ConversationFiltersPopover', () => {
     expect(f.dateFrom!.endsWith('-01')).toBe(true);
   });
 
+  it('computes the date-preset month in display.tz, not raw UTC', () => {
+    // FINDING 4: at UTC 2026-07-01T03:00Z a user in America/Los_Angeles (UTC-7
+    // in July) is still on the wall-clock day 2026-06-30. A raw-UTC preset would
+    // pick JULY; the display-tz preset must pick JUNE so it matches the server's
+    // display-tz interpretation of the YYYY-MM-DD bounds.
+    vi.setSystemTime(new Date('2026-07-01T03:00:00Z'));
+    updateSnapshot(displayEnvelope('America/Los_Angeles'));
+    render(<ConversationFiltersPopover />);
+    fireEvent.click(screen.getByRole('button', { name: /this month/i }));
+    const f = getState().conversationFilters;
+    // June, not July.
+    expect(f.dateFrom).toBe('2026-06-01');
+    expect(f.dateTo).toBe('2026-06-30');
+  });
+
+  it('uses the UTC month when the resolved tz is Etc/UTC', () => {
+    // Same instant, default UTC tz → the preset IS July (the UTC wall clock has
+    // already rolled over). Proves the test above is non-vacuous (the tz, not a
+    // constant, drives the month).
+    vi.setSystemTime(new Date('2026-07-01T03:00:00Z'));
+    updateSnapshot(displayEnvelope('Etc/UTC'));
+    render(<ConversationFiltersPopover />);
+    fireEvent.click(screen.getByRole('button', { name: /this month/i }));
+    const f = getState().conversationFilters;
+    expect(f.dateFrom).toBe('2026-07-01');
+    expect(f.dateTo).toBe('2026-07-31');
+  });
+
   it('the Last 7d preset spans 7 days ending today', () => {
     render(<ConversationFiltersPopover />);
     fireEvent.click(screen.getByRole('button', { name: /last 7d/i }));
@@ -90,12 +129,65 @@ describe('ConversationFiltersPopover', () => {
     expect(getState().conversationFilters.costMin).toBe(7);
   });
 
+  it('keeps per-field debounce timers independent (editing Max does not drop a pending Min)', () => {
+    // FINDING 1 regression: a single shared debounce timer would have the
+    // costMax edit clear the costMin timer, dropping the Min dispatch — the Min
+    // input still DISPLAYS '5' but never reaches the store. Each numeric field
+    // must own its own timer so both dispatches survive the window.
+    render(<ConversationFiltersPopover />);
+    const minInput = screen.getByLabelText(/min cost/i) as HTMLInputElement;
+    const maxInput = screen.getByLabelText(/max cost/i) as HTMLInputElement;
+    // Edit Min, then Max WITHIN the 300ms window (well under it).
+    fireEvent.change(minInput, { target: { value: '5' } });
+    vi.advanceTimersByTime(100);
+    fireEvent.change(maxInput, { target: { value: '10' } });
+    // Neither applied yet (both still pending).
+    expect(getState().conversationFilters.costMin).toBeNull();
+    expect(getState().conversationFilters.costMax).toBeNull();
+    // Flush past both fields' debounce.
+    vi.advanceTimersByTime(350);
+    // BOTH must have reached the store — the Min timer wasn't cancelled by Max.
+    expect(getState().conversationFilters.costMin).toBe(5);
+    expect(getState().conversationFilters.costMax).toBe(10);
+    // The displayed Min value matches the applied filter (no silent display/store
+    // divergence).
+    expect(minInput.value).toBe('5');
+  });
+
+  it('keeps the rebuild-min timer independent of the cost timers', () => {
+    // A third numeric (rebuildMin) edited within the same window as a cost edit
+    // must also survive — proves the per-field keying covers all three axes.
+    render(<ConversationFiltersPopover />);
+    const maxInput = screen.getByLabelText(/max cost/i) as HTMLInputElement;
+    const rebuildInput = screen.getByLabelText(/min cache rebuilds/i) as HTMLInputElement;
+    fireEvent.change(maxInput, { target: { value: '8' } });
+    vi.advanceTimersByTime(50);
+    fireEvent.change(rebuildInput, { target: { value: '3' } });
+    vi.advanceTimersByTime(350);
+    expect(getState().conversationFilters.costMax).toBe(8);
+    expect(getState().conversationFilters.rebuildMin).toBe(3);
+  });
+
   it('sets inputMode on a numeric input focus and clears it on blur', () => {
     render(<ConversationFiltersPopover />);
     const input = screen.getByLabelText(/min cost/i);
     fireEvent.focus(input);
     expect(getState().inputMode).toBe('filter');
     fireEvent.blur(input);
+    expect(getState().inputMode).toBeNull();
+  });
+
+  it('resets inputMode on unmount (focused without a preceding blur)', () => {
+    // FINDING 3: the popover unmounts conditionally (convFiltersOpen && !isSearching).
+    // If it unmounts while a numeric input holds focus without firing blur,
+    // inputMode would stay 'filter' and suppress reader hotkeys until the next
+    // focus/blur. A defensive unmount cleanup must reset it to null.
+    const { unmount } = render(<ConversationFiltersPopover />);
+    const input = screen.getByLabelText(/min cost/i);
+    fireEvent.focus(input);
+    expect(getState().inputMode).toBe('filter');
+    // Unmount WITHOUT a blur (simulates the conditional unmount stealing focus).
+    unmount();
     expect(getState().inputMode).toBeNull();
   });
 

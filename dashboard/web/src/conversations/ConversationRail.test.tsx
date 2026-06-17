@@ -336,6 +336,20 @@ describe('ConversationRail', () => {
     expect(getState().conversationFilters.rebuildMin).toBeNull();
   });
 
+  it('gives the chip-remove button a "Remove …" accessible name', () => {
+    // FINDING 6: the ✕ is aria-hidden and the only "remove" cue was title=, which
+    // screen readers don't reliably announce. The button must carry an aria-label
+    // so its accessible name conveys the remove action — and it must remain the
+    // single clickable control that removes the axis.
+    browseRows = [summary({ session_id: 'a' })];
+    render(<ConversationRail />);
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { rebuildMin: 1 } }));
+    const removeBtn = screen.getByRole('button', { name: /remove .*≥1/i });
+    expect(removeBtn).toBeTruthy();
+    fireEvent.click(removeBtn);
+    expect(getState().conversationFilters.rebuildMin).toBeNull();
+  });
+
   it('Clear all chip dispatches CLEAR_CONVERSATION_FILTERS', () => {
     browseRows = [summary({ session_id: 'a' })];
     render(<ConversationRail />);

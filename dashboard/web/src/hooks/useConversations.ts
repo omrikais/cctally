@@ -75,6 +75,14 @@ export function useConversations(): UseConversations {
   // starting a new one, so a refocus burst (the visibilitychange listener +
   // the [generatedAt] tick effect) collapses to a single completing fetch.
   const ctlRef = useRef<AbortController | null>(null);
+  // Filter generation token, bumped on every filter change (the [filterKey]
+  // reset effect). loadMore captures it at start and bails out of its setRows /
+  // setNextOffset if it changed by the time the response resolves — otherwise an
+  // in-flight loadMore would append OLD-filter rows (with the OLD cursor) onto the
+  // list the reset effect just emptied (FINDING 2). ctlRef can't cover loadMore
+  // because loadMore deliberately omits the abort signal (a transient blip must
+  // not wipe the accumulated tail).
+  const filterGenRef = useRef(0);
 
   // Stable page-1 (re)load. Reads suppression state through refs so it is NOT
   // recreated on every render — that ref-stability is what keeps it from
@@ -118,6 +126,14 @@ export function useConversations(): UseConversations {
     }
     if (mountFilterKeyRef.current === filterKey) return; // no-op SET (same values)
     mountFilterKeyRef.current = filterKey;
+    // Invalidate any in-flight loadMore so its (old-filter) result can't append
+    // stale rows onto the list we're about to empty (FINDING 2). Also drop the
+    // loadingMore flag: a still-in-flight loadMore would otherwise make
+    // loadFirstPage()'s guard early-return and the fresh page-1 load would never
+    // fire. The superseded loadMore's generation check now no-ops its result, and
+    // its own finally re-clears the flag harmlessly.
+    filterGenRef.current += 1;
+    loadingMoreRef.current = false;
     setRows([]);
     setNextOffset(0);
     rowsLenRef.current = 0;
@@ -151,8 +167,13 @@ export function useConversations(): UseConversations {
   const loadMore = useCallback(async () => {
     if (nextOffset == null || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
+    // Snapshot the filter generation; if a filter change bumps it while this
+    // request is in flight, the response is stale (old filter / old cursor) and
+    // must be discarded — the reset effect already issued a fresh page-1 load.
+    const gen = filterGenRef.current;
     try {
       const body = await fetchJson<ConversationsPage>(`/api/conversations?sort=recent&limit=${PAGE}&offset=${nextOffset}${filterParams(filtersRef.current)}`);
+      if (filterGenRef.current !== gen) return; // filter changed mid-flight — drop stale rows
       setRows((prev) => [...prev, ...body.conversations]);
       setNextOffset(body.page.next_offset);
       setFilterDegraded(body.page.filter_degraded === true);

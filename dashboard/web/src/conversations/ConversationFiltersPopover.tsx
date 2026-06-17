@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useConversationFacets } from '../hooks/useConversationFacets';
+import { useDisplayTz } from '../hooks/useDisplayTz';
 import type { ConversationFilters } from '../types/conversation';
 
 // Browse-list filters popover (filters spec §4). Holds all four filter axes —
@@ -12,9 +13,8 @@ import type { ConversationFilters } from '../types/conversation';
 // suppressed while typing (Task 4's named-key End binding additionally gates on
 // convFiltersOpen). Renders only while convFiltersOpen (the rail owns that gate).
 
-// Format a Date's UTC Y/M/D as 'YYYY-MM-DD'. Month boundaries are computed
-// UTC-safe (Date.UTC) so a host TZ never shifts which calendar month a preset
-// lands on — the server resolves the day boundaries in display.tz.
+// Format a Date's UTC Y/M/D as 'YYYY-MM-DD'. Inputs are built from Date.UTC of a
+// wall-clock Y/M/D, so reading the UTC fields back out is a pure format step.
 function ymdUtc(d: Date): string {
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, '0');
@@ -22,35 +22,46 @@ function ymdUtc(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-interface DatePreset { key: string; label: string; bounds: () => { from: string; to: string } }
+// "Today" as wall-clock Y/M/D in the display tz (matching railDateBucket's
+// ymdInTz). The server resolves day boundaries in display.tz, so the preset
+// month must be derived from the display-tz calendar day — NOT raw UTC, which
+// for a user far behind UTC near a month boundary would land on the wrong month.
+// `tz` is the snapshot's resolved IANA zone (Etc/UTC fallback), so Intl handles
+// DST correctly.
+function todayInTz(tz: string): { y: number; m: number; d: number } {
+  const [y, m, d] = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date()).split('-').map(Number);
+  return { y, m, d };
+}
 
-// Preset boundary calculators (UTC-safe). `this-month`/`last-month` use the
-// Date.UTC(y, m+1, 0) "last day of month" idiom; `last-7d` is a 7-day window
-// ending today (inclusive).
+interface DatePreset { key: string; label: string; bounds: (tz: string) => { from: string; to: string } }
+
+// Preset boundary calculators. "Now" is the display-tz calendar day (todayInTz);
+// the Y/M/D is then projected through Date.UTC so the YYYY-MM-DD math
+// (month-roll, last-day-of-month, 7-day window) is host-TZ-independent.
+// `this-month`/`last-month` use the Date.UTC(y, m+1, 0) "last day of month"
+// idiom; `last-7d` is a 7-day window ending today (inclusive).
 const DATE_PRESETS: DatePreset[] = [
   {
     key: 'this-month', label: 'This month',
-    bounds: () => {
-      const now = new Date();
-      const y = now.getUTCFullYear();
-      const m = now.getUTCMonth();
-      return { from: ymdUtc(new Date(Date.UTC(y, m, 1))), to: ymdUtc(new Date(Date.UTC(y, m + 1, 0))) };
-    },
-  },
-  {
-    key: 'last-month', label: 'Last month',
-    bounds: () => {
-      const now = new Date();
-      const y = now.getUTCFullYear();
-      const m = now.getUTCMonth();
+    bounds: (tz) => {
+      const { y, m } = todayInTz(tz);
       return { from: ymdUtc(new Date(Date.UTC(y, m - 1, 1))), to: ymdUtc(new Date(Date.UTC(y, m, 0))) };
     },
   },
   {
+    key: 'last-month', label: 'Last month',
+    bounds: (tz) => {
+      const { y, m } = todayInTz(tz);
+      return { from: ymdUtc(new Date(Date.UTC(y, m - 2, 1))), to: ymdUtc(new Date(Date.UTC(y, m - 1, 0))) };
+    },
+  },
+  {
     key: 'last-7d', label: 'Last 7d',
-    bounds: () => {
-      const now = new Date();
-      const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    bounds: (tz) => {
+      const { y, m, d } = todayInTz(tz);
+      const today = new Date(Date.UTC(y, m - 1, d));
       const from = new Date(today.getTime() - 6 * 86_400_000);
       return { from: ymdUtc(from), to: ymdUtc(today) };
     },
@@ -68,6 +79,10 @@ function patch(p: Partial<ConversationFilters>): void {
 export function ConversationFiltersPopover() {
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
   const facets = useConversationFacets();
+  // Resolved display tz (concrete IANA zone, Etc/UTC fallback) drives which
+  // calendar month a date preset lands on, so it matches the server's display-tz
+  // interpretation of the YYYY-MM-DD bounds (FINDING 4).
+  const { resolvedTz } = useDisplayTz();
 
   // Local mirror of the debounced numeric/text inputs so typing feels instant
   // while the store update (and therefore the refetch) is debounced ~300ms. The
@@ -79,12 +94,20 @@ export function ConversationFiltersPopover() {
   useEffect(() => { setCostMaxStr(filters.costMax?.toString() ?? ''); }, [filters.costMax]);
   useEffect(() => { setRebuildStr(filters.rebuildMin?.toString() ?? ''); }, [filters.rebuildMin]);
 
-  // One shared debounce timer for the numeric inputs. Cleared on unmount.
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => { if (debounceRef.current) clearTimeout(debounceRef.current); }, []);
-  const debounced = (fn: () => void): void => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(fn, 300);
+  // Per-field debounce timers, keyed by axis ('costMin'|'costMax'|'rebuildMin').
+  // INDEPENDENT timers — a SINGLE shared timer would let editing a second numeric
+  // within the 300ms window cancel the first field's pending dispatch (the first
+  // input would still DISPLAY its value while the store never receives it). All
+  // pending timers are cleared on unmount.
+  const debounceRefs = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  useEffect(() => {
+    const timers = debounceRefs.current;
+    return () => { for (const k in timers) clearTimeout(timers[k]); };
+  }, []);
+  const debounced = (key: string, fn: () => void): void => {
+    const t = debounceRefs.current[key];
+    if (t) clearTimeout(t);
+    debounceRefs.current[key] = setTimeout(fn, 300);
   };
   // Parse a numeric input to a value | null (blank → null; NaN → leave unchanged
   // by returning the sentinel undefined, which the caller skips).
@@ -96,6 +119,12 @@ export function ConversationFiltersPopover() {
 
   const focusInput = (): void => dispatch({ type: 'SET_INPUT_MODE', mode: 'filter' });
   const blurInput = (): void => dispatch({ type: 'SET_INPUT_MODE', mode: null });
+
+  // Defensive unmount cleanup: the popover unmounts conditionally
+  // (convFiltersOpen && !isSearching). If it unmounts while a numeric input still
+  // holds focus without firing blur, inputMode would stay 'filter' and keep
+  // suppressing single-char reader hotkeys until the next focus/blur. Reset it.
+  useEffect(() => () => { dispatch({ type: 'SET_INPUT_MODE', mode: null }); }, []);
 
   const toggleProject = (label: string): void => {
     const next = filters.projects.includes(label)
@@ -115,7 +144,7 @@ export function ConversationFiltersPopover() {
               type="button"
               className={`conv-rail-filters-chip${filters.datePreset === p.key ? ' is-on' : ''}`}
               onClick={() => {
-                const b = p.bounds();
+                const b = p.bounds(resolvedTz);
                 patch({ dateFrom: b.from, dateTo: b.to, datePreset: p.key });
               }}
             >
@@ -200,7 +229,7 @@ export function ConversationFiltersPopover() {
               onChange={(e) => {
                 setCostMinStr(e.target.value);
                 const v = parseNum(e.target.value);
-                if (v !== undefined) debounced(() => patch({ costMin: v }));
+                if (v !== undefined) debounced('costMin', () => patch({ costMin: v }));
               }}
             />
           </label>
@@ -219,7 +248,7 @@ export function ConversationFiltersPopover() {
               onChange={(e) => {
                 setCostMaxStr(e.target.value);
                 const v = parseNum(e.target.value);
-                if (v !== undefined) debounced(() => patch({ costMax: v }));
+                if (v !== undefined) debounced('costMax', () => patch({ costMax: v }));
               }}
             />
           </label>
@@ -257,7 +286,7 @@ export function ConversationFiltersPopover() {
                 if (v !== undefined) {
                   // Whole-number threshold; floor a stray decimal.
                   const n = v === null ? null : Math.floor(v);
-                  debounced(() => patch({ rebuildMin: n }));
+                  debounced('rebuildMin', () => patch({ rebuildMin: n }));
                 }
               }}
             />

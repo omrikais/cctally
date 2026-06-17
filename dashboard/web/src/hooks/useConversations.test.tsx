@@ -135,6 +135,43 @@ describe('useConversations', () => {
     });
   });
 
+  it('ignores an in-flight loadMore result once the filter set has changed', async () => {
+    // FINDING 2 regression: if loadMore is in flight when the [filterKey] reset
+    // effect runs, the effect empties rows + resets the cursor, but the in-flight
+    // loadMore.then would still append the OLD-filter rows onto the emptied list
+    // with the OLD cursor — briefly showing wrong-filter rows. A generation token
+    // captured at loadMore start must make the stale response a no-op.
+    mockFetchOnce(page1);   // mount page-1 load (session 'a')
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+
+    // Arm loadMore with a fetch we control: it resolves only when we say so.
+    let resolveLoadMore!: (body: unknown) => void;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise((res) => { resolveLoadMore = (body) => res({ ok: true, status: 200, json: async () => body } as Response); }),
+    );
+    // Kick off loadMore (do NOT await — it's intentionally still in flight).
+    let loadMorePromise!: Promise<void>;
+    act(() => { loadMorePromise = result.current.loadMore(); });
+    await waitFor(() => expect(resolveLoadMore).toBeTypeOf('function'));
+
+    // Filter changes WHILE loadMore is in flight: the reset effect fires a fresh
+    // page-1 load. Queue that (post-change) response — the new-filter page.
+    mockFetchOnce({ conversations: [{ session_id: 'new', project_label: 'np', git_branch: null, started_utc: '2026-03-01T00:00:00Z', last_activity_utc: '2026-03-01T01:00:00Z', msg_count: 2, cost_usd: 0.5, models: ['opus'] }], page: { next_offset: 9, has_more: true } });
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { costMin: 99 } }));
+    await waitFor(() => expect(result.current.rows.map((r) => r.session_id)).toEqual(['new']));
+    expect(result.current.hasMore).toBe(true);
+
+    // Now resolve the STALE in-flight loadMore (page2 = session 'b', old filter).
+    await act(async () => { resolveLoadMore(page2); await loadMorePromise; });
+
+    // The stale page must NOT have been appended onto the new-filter list, and the
+    // cursor must remain the new-filter cursor (next_offset=9 from the reset load),
+    // NOT page2's null.
+    expect(result.current.rows.map((r) => r.session_id)).toEqual(['new']);
+    expect(result.current.hasMore).toBe(true);
+  });
+
   it('surfaces filter_degraded from the page body', async () => {
     mockFetchOnce({ conversations: [], page: { next_offset: null, has_more: false, filter_degraded: true } });
     const { result } = renderHook(() => useConversations());
