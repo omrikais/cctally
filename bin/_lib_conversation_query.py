@@ -445,6 +445,30 @@ def _stamp_cache_failures(items):
         running_max[key] = max(rm, cr)
 
 
+def session_cache_rebuild_count(conn, session_id) -> int:
+    """Per-session count of cache-rebuild (cache-failure) turns.
+
+    Single source of truth: assembles the session via the SAME pipeline the
+    reader/outline use and runs the SAME _stamp_cache_failures kernel, then
+    counts flagged items. /outline omits stats.cache_failures when the count is
+    0, so "no flagged items" -> 0 (byte-identical to outline). Stored on the
+    conversation_sessions rollup by _recompute_conversation_sessions; filtered
+    by list_conversations(rebuild_min=...).
+
+    _assemble_session already runs _stamp_cache_failures internally before
+    returning, so the items carry the flag on entry; re-running the kernel here
+    is an idempotent recompute (it only ADDS the key on a flagged turn, never
+    clears one, and the predicate is deterministic over the same items) that
+    keeps the helper correct even if assembly ever stops stamping.
+    """
+    asm = _assemble_session(conn, session_id)
+    if asm is None:
+        return 0
+    items = asm["items"]
+    _stamp_cache_failures(items)
+    return sum(1 for it in items if "cache_failure" in it)
+
+
 def _session_cost_map(conn, session_ids):
     """{session_id: total_cost_usd} for the given sessions. Joins
     conversation_messages turn keys to the single deduped session_entries row

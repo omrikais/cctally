@@ -74,6 +74,51 @@ def _seed_cache(ns):
     _msg(session_id="s2", uuid="h2", source_path="b.jsonl", byte_offset=0,
          timestamp_utc="2026-06-02T00:00:00Z", entry_type="human",
          text="how do I budget my weekly usage", cwd="/home/u/other")
+
+    # --- 1A: cache-rebuild fixtures (sess-clean, sess-rebuild) -------------
+    # Two sessions whose assistant turns drive _stamp_cache_failures. The
+    # kernel keys a running-max of cache_read on (subagent_key, model) and
+    # flags a turn iff rm >= _CACHE_FAILURE_CACHE_FLOOR (20_000) AND
+    # cc >= _CACHE_FAILURE_CREATE_FLOOR (20_000) AND cr <= 0.5*rm AND
+    # cc/(cc+cr) >= 0.75 (the REAL thresholds — the plan's illustrative
+    # 200/2000/4000 values are an order of magnitude too small to ever trip
+    # the 20_000 floors). Both sessions are main-session (non-agent
+    # source_path -> subagent_key None) and single-model so the key is
+    # constant across turns.
+
+    # sess-clean: no turn ever recreates -> ZERO flagged turns.
+    #   turn1 cr=0     cc=2000   -> rm=0,     no flag; running_max -> 0
+    #   turn2 cr=40000 cc=2000   -> rm=0,     no flag; running_max -> 40000
+    #   turn3 cr=40000 cc=2000   -> rm=40000 but cc=2000 < CREATE_FLOOR -> no flag
+    _clean_turns = [
+        ("cu1", "cm1", "cr1", 0, 2000),
+        ("cu2", "cm2", "cr2", 40000, 2000),
+        ("cu3", "cm3", "cr3", 40000, 2000),
+    ]
+    for i, (uuid, mid, rid, cr, cc) in enumerate(_clean_turns):
+        _msg(session_id="sess-clean", uuid=uuid, source_path="clean.jsonl",
+             byte_offset=i, timestamp_utc=f"2026-06-03T00:00:0{i}Z",
+             entry_type="assistant", text=f"clean turn {i}", model=_MODEL,
+             msg_id=mid, req_id=rid, cwd="/home/u/clean", git_branch="main")
+        _entry(source_path="clean.jsonl", line_offset=i, model=_MODEL,
+               msg_id=mid, req_id=rid, inp=500, out=200, cc=cc, cr=cr)
+
+    # sess-rebuild: turn2 recreates its prefix -> EXACTLY ONE flagged turn.
+    #   turn1 cr=40000 cc=5000   -> rm=0,     no flag; running_max -> 40000
+    #   turn2 cr=2000  cc=30000  -> rm=40000 (>=20000), cc=30000 (>=20000),
+    #          cr=2000 <= 0.5*40000=20000, cc/(cc+cr)=0.9375 >= 0.75 -> FLAG
+    _rebuild_turns = [
+        ("ru1", "rm1", "rr1", 40000, 5000),
+        ("ru2", "rm2", "rr2", 2000, 30000),
+    ]
+    for i, (uuid, mid, rid, cr, cc) in enumerate(_rebuild_turns):
+        _msg(session_id="sess-rebuild", uuid=uuid, source_path="rebuild.jsonl",
+             byte_offset=i, timestamp_utc=f"2026-06-04T00:00:0{i}Z",
+             entry_type="assistant", text=f"rebuild turn {i}", model=_MODEL,
+             msg_id=mid, req_id=rid, cwd="/home/u/rebuild", git_branch="main")
+        _entry(source_path="rebuild.jsonl", line_offset=i, model=_MODEL,
+               msg_id=mid, req_id=rid, inp=500, out=200, cc=cc, cr=cr)
+
     # Populate the browse-rail rollup from the seeded messages (full recompute;
     # no backfill flag armed) so the booted handler's /api/conversations read
     # exercises the FAST rollup path. sync_cache does this in production, but
@@ -184,7 +229,9 @@ def test_conversations_route_returns_rail(tmp_path, monkeypatch):
         payload = json.loads(body)
         assert "conversations" in payload and "page" in payload
         sids = [r["session_id"] for r in payload["conversations"]]
-        assert set(sids) == {"s1", "s2"}
+        # The seeder also stages sess-clean / sess-rebuild (the cache-rebuild
+        # fixtures, 1A); the rail returns every non-null session.
+        assert set(sids) == {"s1", "s2", "sess-clean", "sess-rebuild"}
         s1 = next(r for r in payload["conversations"]
                   if r["session_id"] == "s1")
         assert s1["project_label"] == "proj"
@@ -951,3 +998,43 @@ def test_media_route_413_too_large(tmp_path, monkeypatch):
         assert status == 413, (status, body)
     finally:
         srv.shutdown()
+
+
+# === 1A: per-session cache-rebuild count helper ============================
+
+def test_session_cache_rebuild_count_matches_outline(tmp_path, monkeypatch):
+    """session_cache_rebuild_count(conn, sid) is the single source of truth for
+    the rollup's cache_rebuild_count column: it must equal the count /outline
+    would report (which OMITS stats.cache_failures entirely when 0 — so absent
+    reads as 0). Proven over a clean session (0) and a rebuild session (1)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import pathlib as _pl
+    sys.path.insert(0, str(_pl.Path(ns["__file__"]).resolve().parent))
+    _seed_cache(ns)
+    import importlib
+    lq = importlib.import_module("_lib_conversation_query")
+    with ns["open_cache_db"]() as conn:
+        for sid in ("sess-clean", "sess-rebuild"):
+            count = lq.session_cache_rebuild_count(conn, sid)
+            outline = lq.get_conversation_outline(conn, sid)
+            cf = outline["stats"].get("cache_failures")
+            expected = cf["count"] if cf else 0
+            assert count == expected, f"{sid}: helper {count} != outline {expected}"
+        # Concrete expectations (guards against both reading 0 vacuously).
+        assert lq.session_cache_rebuild_count(conn, "sess-clean") == 0
+        assert lq.session_cache_rebuild_count(conn, "sess-rebuild") == 1
+
+
+def test_session_cache_rebuild_count_unknown_session(tmp_path, monkeypatch):
+    """An unknown session (no rows) assembles to None -> 0, never raises."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import pathlib as _pl
+    sys.path.insert(0, str(_pl.Path(ns["__file__"]).resolve().parent))
+    _seed_cache(ns)
+    import importlib
+    lq = importlib.import_module("_lib_conversation_query")
+    with ns["open_cache_db"]() as conn:
+        assert lq.session_cache_rebuild_count(conn, "does-not-exist") == 0
+
