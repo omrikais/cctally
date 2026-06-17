@@ -1103,3 +1103,197 @@ def test_recompute_fills_filter_columns(tmp_path, monkeypatch):
         ).fetchone()
         assert clean[0] == 0
 
+
+# === Task 2: browse-list filters + facets endpoint ========================
+#
+# The seeded rail (see _seed_cache) is the fixture for every server-side filter
+# test below. Its four sessions span the axes we filter on:
+#   s1            project 'proj',    cost ~0.0175, rebuilds 0, 2026-06-01
+#   s2            project 'other',   cost  0.0    , rebuilds 0, 2026-06-02
+#   sess-clean    project 'clean',   cost ~0.10  , rebuilds 0, 2026-06-03
+#   sess-rebuild  project 'rebuild', cost ~0.255 , rebuilds 1, 2026-06-04
+# (the plan's illustrative `projA`/`cost_min=1.0` are replaced with these real
+# seeded labels + thresholds so the assertions are non-vacuous.)
+
+
+def _get_json(srv, path):
+    """GET ``path`` from the booted server with a loopback Host header; return
+    ``(status, parsed_json)``. The shared driver for the Task-2 HTTP filter
+    tests (the same _boot harness the gate/rail tests use)."""
+    from http.client import HTTPConnection
+    c = HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+    c.request("GET", path, headers={"Host": "127.0.0.1"})
+    r = c.getresponse()
+    body = r.read()
+    c.close()
+    return r.status, json.loads(body)
+
+
+def test_facets_lists_projects_with_counts(tmp_path, monkeypatch):
+    """GET /api/conversations/facets returns sorted distinct project labels with
+    per-project conversation counts; empty/NULL labels are dropped."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, body = _get_json(srv, "/api/conversations/facets")
+        assert st == 200
+        names = {p["project_label"] for p in body["projects"]}
+        # Every seeded session has a non-empty cwd-derived label.
+        assert {"proj", "other", "clean", "rebuild"} <= names
+        assert all(p.get("count", 0) >= 1 for p in body["projects"])
+        # Sorted ascending by label (the kernel's ORDER BY).
+        labels = [p["project_label"] for p in body["projects"]]
+        assert labels == sorted(labels)
+    finally:
+        srv.shutdown()
+
+
+def test_filter_by_project(tmp_path, monkeypatch):
+    """?projects=proj returns ONLY the 'proj'-labelled session (s1)."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, body = _get_json(srv, "/api/conversations?projects=proj")
+        assert st == 200
+        assert {c["project_label"] for c in body["conversations"]} == {"proj"}
+        assert {c["session_id"] for c in body["conversations"]} == {"s1"}
+    finally:
+        srv.shutdown()
+
+
+def test_filter_by_project_multi_any(tmp_path, monkeypatch):
+    """Multi-value project filter is ANY-of: ?projects=proj&projects=clean
+    returns both labels' sessions and nothing else."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, body = _get_json(srv, "/api/conversations?projects=proj&projects=clean")
+        assert st == 200
+        assert {c["project_label"] for c in body["conversations"]} == {"proj", "clean"}
+    finally:
+        srv.shutdown()
+
+
+def test_filter_by_cost_and_rebuilds(tmp_path, monkeypatch):
+    """?cost_min=0.05&rebuild_min=1 keeps only sess-rebuild (cost ~0.255,
+    rebuilds 1). s1/s2 fall below the cost floor; sess-clean has 0 rebuilds."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, body = _get_json(srv, "/api/conversations?cost_min=0.05&rebuild_min=1")
+        assert st == 200
+        sids = {c["session_id"] for c in body["conversations"]}
+        assert sids == {"sess-rebuild"}, sids
+        assert all(c["cost_usd"] >= 0.05 for c in body["conversations"])
+    finally:
+        srv.shutdown()
+
+
+def test_filter_by_cost_max(tmp_path, monkeypatch):
+    """?cost_max=0.05 keeps only the cheap sessions (s1, s2), excluding the
+    pricier sess-clean / sess-rebuild."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, body = _get_json(srv, "/api/conversations?cost_max=0.05")
+        assert st == 200
+        sids = {c["session_id"] for c in body["conversations"]}
+        assert sids == {"s1", "s2"}, sids
+        assert all(c["cost_usd"] <= 0.05 for c in body["conversations"])
+    finally:
+        srv.shutdown()
+
+
+def test_filter_by_date_range(tmp_path, monkeypatch):
+    """?date_from / date_to bound on last_activity_utc (display-tz day
+    boundaries). 2026-06-02..2026-06-03 keeps s2 (06-02) and sess-clean
+    (06-03), drops s1 (06-01) and sess-rebuild (06-04)."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, body = _get_json(
+            srv, "/api/conversations?date_from=2026-06-02&date_to=2026-06-03")
+        assert st == 200
+        sids = {c["session_id"] for c in body["conversations"]}
+        assert sids == {"s2", "sess-clean"}, sids
+    finally:
+        srv.shutdown()
+
+
+def test_filter_pagination_correct(tmp_path, monkeypatch):
+    """Two filtered pages of limit=1 don't overlap (the predicate is applied in
+    SQL before LIMIT/OFFSET, so pagination is correct over the filtered set)."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        # cost_max=0.05 -> exactly {s1, s2}; page them one at a time.
+        st, p1 = _get_json(srv, "/api/conversations?cost_max=0.05&limit=1&offset=0")
+        st2, p2 = _get_json(srv, "/api/conversations?cost_max=0.05&limit=1&offset=1")
+        assert st == 200 and st2 == 200
+        assert len(p1["conversations"]) == 1 and len(p2["conversations"]) == 1
+        ids = [c["session_id"] for c in p1["conversations"] + p2["conversations"]]
+        assert len(ids) == len(set(ids))           # no overlap across pages
+        assert set(ids) == {"s1", "s2"}
+        assert p1["page"]["has_more"] is True       # more after the first page
+        assert p2["page"]["has_more"] is False      # the filtered set is exhausted
+    finally:
+        srv.shutdown()
+
+
+def test_filter_bad_cost_is_400(tmp_path, monkeypatch):
+    """A non-numeric cost is a hard 400 (the handler validates types before the
+    kernel; consistent with the other conversation endpoints)."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, body = _get_json(srv, "/api/conversations?cost_min=abc")
+        assert st == 400
+        assert "error" in body
+    finally:
+        srv.shutdown()
+
+
+def test_filter_bad_rebuild_is_400(tmp_path, monkeypatch):
+    """A non-integer rebuild threshold is a hard 400."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, body = _get_json(srv, "/api/conversations?rebuild_min=lots")
+        assert st == 400
+    finally:
+        srv.shutdown()
+
+
+def test_filter_bad_date_is_400(tmp_path, monkeypatch):
+    """A malformed date maps the date-helper ValueError to a 400."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, body = _get_json(srv, "/api/conversations?date_from=not-a-date")
+        assert st == 400
+    finally:
+        srv.shutdown()
+
+
+def test_filter_dual_branch_parity(tmp_path, monkeypatch):
+    """The DATE axis is the only filter expressible in BOTH list-query branches
+    (the rollup fast path AND the live GROUP BY fallback). For the same date
+    bound they must return byte-identical session-id order (the reconcile
+    invariant)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import pathlib as _pl
+    sys.path.insert(0, str(_pl.Path(ns["__file__"]).resolve().parent))
+    _seed_cache(ns)
+    import importlib
+    lq = importlib.import_module("_lib_conversation_query")
+    f = {"date_from": "2026-06-02T00:00:00Z", "date_to": None,
+         "projects": None, "cost_min": None, "cost_max": None, "rebuild_min": None}
+    with ns["open_cache_db"]() as conn:
+        roll = lq._list_session_rows_rollup(conn, lq._SORTS["recent"], 50, 0, f)
+        live = lq._list_session_rows_live(conn, lq._SORTS_LIVE["recent"], 50, 0, f)
+        assert [r[0] for r in roll] == [r[0] for r in live]
+        # Non-vacuous: the bound excludes s1 (06-01) but keeps the rest.
+        ids = [r[0] for r in roll]
+        assert "s1" not in ids and {"s2", "sess-clean", "sess-rebuild"} <= set(ids)
+

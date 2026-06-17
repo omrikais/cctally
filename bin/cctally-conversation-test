@@ -226,6 +226,62 @@ print("ok")
         fail "rail pagination: $page_check (raw: $page_raw)"
     fi
 
+    # --- 1b) Browse filters + facets (Task 2, spec §2) -------------------
+    # Project facet list (distinct project labels + per-project counts) drives
+    # the rail's project multi-select. It reads the rollup's stored
+    # project_label column directly (NOT gated on the authoritative flag), so it
+    # is byte-stable even under the harness's --no-sync posture; the golden
+    # locks {proj:7, other:1}.
+    fetch_and_diff "GET /api/conversations/facets" "golden-conversations-facets.json" \
+        "$base/api/conversations/facets" "${LOOP[@]}"
+
+    # Filtered list — the DATE axis (the one filter expressible in BOTH the
+    # rollup fast path AND the live GROUP BY fallback). The harness server runs
+    # --no-sync, so migration 015 arms the backfill-pending flag that never gets
+    # consumed -> the rail serves the LIVE branch; the date predicate still
+    # holds there (project/cost/rebuild would degrade — covered by the
+    # rollup-authoritative pytest server tests). ?date_from=2026-06-04 drops the
+    # three earliest sessions (s1/s2/s3, 06-01..06-03) and keeps s4..s8 — a
+    # non-vacuous bound. The byte-stable golden locks the filtered set + order.
+    fetch_and_diff "GET /api/conversations?date_from=2026-06-04" \
+        "golden-conversations-filtered-date.json" \
+        "$base/api/conversations?date_from=2026-06-04" "${LOOP[@]}"
+
+    # Filter validation: a non-numeric cost is a hard 400 (not a 200 with the
+    # filter silently ignored).
+    local bad_status
+    bad_status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${LOOP[@]}" \
+        "$base/api/conversations?cost_min=abc")
+    if [ "$bad_status" != "400" ]; then
+        fail "browse filter bad-cost: expected 400, got $bad_status"
+    fi
+
+    # Detail head exposes last_anchor (jump-to-latest target, spec §3): a
+    # non-null {session_id, uuid, id} pointing at the final rendered item.
+    local anchor_raw anchor_check
+    anchor_raw=$(curl -s --max-time 5 "${LOOP[@]}" "$base/api/conversation/s1")
+    anchor_check=$(printf '%s' "$anchor_raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+la = d.get("last_anchor")
+errs = []
+if not isinstance(la, dict):
+    errs.append("last_anchor missing or not an object: %r" % (la,))
+else:
+    if la.get("session_id") != "s1":
+        errs.append("last_anchor.session_id != s1: %r" % (la.get("session_id"),))
+    if not isinstance(la.get("uuid"), str) or not la.get("uuid"):
+        errs.append("last_anchor.uuid not a non-empty str: %r" % (la.get("uuid"),))
+    if not isinstance(la.get("id"), int):
+        errs.append("last_anchor.id not an int: %r" % (la.get("id"),))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+    if [ "$anchor_check" != "ok" ]; then
+        fail "detail last_anchor (spec §3): $anchor_check (raw: $anchor_raw)"
+    fi
+
     # --- 2) Reader: resume-merged, deduped, cost-once --------------------
     fetch_and_diff "GET /api/conversation/s1" "golden-conversation-s1.json" \
         "$base/api/conversation/s1" "${LOOP[@]}"

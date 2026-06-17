@@ -5276,6 +5276,13 @@ def _qs_str(q: dict, key: str, default: str | None) -> str | None:
 _CONV_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking")
 
 
+class _BadConversationFilter(Exception):
+    """Internal sentinel: a browse-filter query param failed validation. The
+    parse helper has ALREADY sent the 400 response when this is raised, so the
+    caller just unwinds and returns (the conversation routes all 400 on bad
+    input, consistent with the search ``kind`` facet). Module-private."""
+
+
 def _cached_file_sigs(conn, paths):
     """{path: size_bytes} from session_files for the given paths — the cache's
     own view of how far each file is ingested. Size-only by design, matching the
@@ -5419,6 +5426,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_share_history_get()
         elif path == "/api/doctor":
             self._handle_get_doctor()
+        elif path == "/api/conversations/facets":
+            self._handle_get_conversations_facets()
         elif path == "/api/conversations":
             self._handle_get_conversations()
         elif path == "/api/conversation/search":
@@ -7462,12 +7471,90 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             conn.close()
         return True, body
 
+    def _parse_conversation_filters(self, q):
+        """Parse the browse-list filter params (spec §2) from a ``parse_qs``
+        mapping. On any malformed value this sends a **400** and returns
+        ``None`` — the caller just ``return``s (the conversation routes all 400
+        on bad input). On success returns a dict of ``list_conversations``
+        kwargs: ``date_from``/``date_to`` (UTC-ISO bounds), ``projects``
+        (list[str] | None), ``cost_min``/``cost_max`` (float | None),
+        ``rebuild_min`` (int | None). Empty/blank params drop to ``None``.
+
+        Numeric axes validate strictly (a non-numeric cost / non-integer
+        rebuild threshold is a hard 400). Date bounds route through the pure
+        ``_lib_dashboard_dates.parse_filter_date_range`` helper, which resolves
+        naive date-only bounds in ``display.tz`` and raises ``ValueError`` (→
+        400) on a malformed date. Projects accept BOTH repeated
+        ``?projects=a&projects=b`` and a single comma-joined ``?projects=a,b``.
+        """
+        def _float(name):
+            v = _qs_str(q, name, "")
+            if v is None or v == "":
+                return None
+            try:
+                return float(v)
+            except ValueError:
+                self._respond_json(400, {"error": f"bad {name}: {v}"})
+                raise _BadConversationFilter
+
+        def _int(name):
+            v = _qs_str(q, name, "")
+            if v is None or v == "":
+                return None
+            try:
+                return int(v)
+            except ValueError:
+                self._respond_json(400, {"error": f"bad {name}: {v}"})
+                raise _BadConversationFilter
+
+        try:
+            cost_min = _float("cost_min")
+            cost_max = _float("cost_max")
+            rebuild_min = _int("rebuild_min")
+        except _BadConversationFilter:
+            return None  # 400 already sent
+
+        projects = [p for p in q.get("projects", []) if p] or None
+        # Single comma-joined value -> split (the client may send either form).
+        if projects and len(projects) == 1 and "," in projects[0]:
+            projects = [s for s in projects[0].split(",") if s] or None
+
+        date_from = _qs_str(q, "date_from", "") or None
+        date_to = _qs_str(q, "date_to", "") or None
+        if date_from or date_to:
+            from importlib import import_module
+            tz = _resolve_display_tz_obj(
+                _apply_display_tz_override(
+                    load_config(), type(self).display_tz_pref_override
+                )
+            ).key
+            try:
+                df, dtt = import_module(
+                    "_lib_dashboard_dates"
+                ).parse_filter_date_range(date_from, date_to, tz_name=tz)
+            except ValueError as exc:
+                self._respond_json(400, {"error": str(exc)})
+                return None
+        else:
+            df = dtt = None
+
+        return {
+            "date_from": df,
+            "date_to": dtt,
+            "projects": projects,
+            "cost_min": cost_min,
+            "cost_max": cost_max,
+            "rebuild_min": rebuild_min,
+        }
+
     def _handle_get_conversations(self) -> None:
         """``GET /api/conversations`` — the browse rail (spec §3.1).
 
         Gated first (loopback / Host allowlist). ``sort``/``limit``/``offset``
-        are read from the query string; the kernel clamps bounds. Cache-open
-        failures are 500s, never 5xx-with-stacktrace.
+        are read from the query string; the kernel clamps bounds. The browse
+        filters (date/project/cost/rebuild — spec §2) are parsed/validated here
+        (malformed → 400) and threaded into the kernel. Cache-open failures are
+        500s, never 5xx-with-stacktrace.
         """
         if not self._require_transcripts_allowed():
             return
@@ -7476,10 +7563,29 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         sort = _qs_str(q, "sort", "recent")
         limit = _qs_int(q, "limit", 50)
         offset = _qs_int(q, "offset", 0)
+        filters = self._parse_conversation_filters(q)
+        if filters is None:
+            return  # a 400 has already been sent
         ok, body = self._run_conversation_query(
             lambda conn: self._conversation_query().list_conversations(
-                conn, sort=sort, limit=limit, offset=offset),
+                conn, sort=sort, limit=limit, offset=offset, **filters),
             "/api/conversations")
+        if not ok:
+            return
+        self._respond_json(200, body)
+
+    def _handle_get_conversations_facets(self) -> None:
+        """``GET /api/conversations/facets`` — distinct project labels + their
+        conversation counts, for the browse filter's project multi-select (spec
+        §2). Behind the SAME loopback/Host privacy gate as the list route; a
+        cheap indexed GROUP BY over the rollup. The popover loads its options
+        once from here (deriving from a paginated page would be incomplete).
+        """
+        if not self._require_transcripts_allowed():
+            return
+        ok, body = self._run_conversation_query(
+            lambda conn: self._conversation_query().list_conversation_facets(conn),
+            "/api/conversations/facets")
         if not ok:
             return
         self._respond_json(200, body)

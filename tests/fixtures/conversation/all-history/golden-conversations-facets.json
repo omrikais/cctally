@@ -1,0 +1,12 @@
+{
+  "projects": [
+    {
+      "count": 1,
+      "project_label": "other"
+    },
+    {
+      "count": 7,
+      "project_label": "proj"
+    }
+  ]
+}

@@ -594,40 +594,125 @@ def _rollup_authoritative(conn) -> bool:
     return not pending
 
 
-def _list_session_rows_rollup(conn, order, limit, offset):
+# --- Browse-list filter predicates (spec §2) ------------------------------
+# The rail filters on four axes (date / project / cost / cache-rebuilds). All
+# four are STORED columns on the conversation_sessions rollup, so the rollup
+# fast path expresses every axis as a parameterized WHERE pushed BEFORE
+# LIMIT/OFFSET (pagination stays correct over the filtered set). The live
+# GROUP BY fallback has no cost/project/rebuild columns, so it expresses ONLY
+# the date axis (via HAVING over MAX(timestamp_utc)) — the rollup-only axes
+# degrade in that brief, self-correcting non-authoritative window (spec §1
+# dual-branch parity). The date predicate compares against the stored
+# last_activity_utc string, so the caller MUST pass UTC-ISO bounds in the same
+# format (...Z) — see bin/_lib_dashboard_dates.parse_filter_date_range.
+_FILTER_KEYS = ("date_from", "date_to", "projects",
+                "cost_min", "cost_max", "rebuild_min")
+# The rollup-only axes — the ones the live fallback cannot express. Used to set
+# the page's filter_degraded flag when one is requested under the live branch.
+_ROLLUP_ONLY_FILTER_KEYS = ("projects", "cost_min", "cost_max", "rebuild_min")
+
+
+def _empty_filters() -> dict:
+    """A no-op filter dict (every axis None) — the unfiltered default and the
+    shape the row-source helpers expect."""
+    return {k: None for k in _FILTER_KEYS}
+
+
+def _rollup_where(filters):
+    """(sql_fragment, params) for the ROLLUP branch — all four axes are stored
+    columns. Returns (" WHERE ...", [params]) or ("", []) when no axis is set.
+    Project IN-list naturally excludes empty/NULL project_label (neither the ''
+    no-cwd sentinel nor a NULL not-yet-filled row matches a real label)."""
+    clauses, params = [], []
+    if filters["date_from"] is not None:
+        clauses.append("last_activity_utc >= ?"); params.append(filters["date_from"])
+    if filters["date_to"] is not None:
+        clauses.append("last_activity_utc <= ?"); params.append(filters["date_to"])
+    if filters["projects"]:
+        ph = ",".join("?" for _ in filters["projects"])
+        clauses.append("project_label IN (%s)" % ph); params.extend(filters["projects"])
+    if filters["cost_min"] is not None:
+        clauses.append("cost_usd >= ?"); params.append(filters["cost_min"])
+    if filters["cost_max"] is not None:
+        clauses.append("cost_usd <= ?"); params.append(filters["cost_max"])
+    if filters["rebuild_min"] is not None:
+        clauses.append("cache_rebuild_count >= ?"); params.append(filters["rebuild_min"])
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+
+def _live_having(filters):
+    """(sql_fragment, params) for the LIVE fallback — only the DATE axis is
+    expressible (no cost/project/rebuild columns exist on the raw messages).
+    The rollup's last_activity_utc IS MAX(timestamp_utc), so the date predicate
+    is the same bound applied via HAVING over the aggregate."""
+    having, params = [], []
+    if filters["date_from"] is not None:
+        having.append("MAX(timestamp_utc) >= ?"); params.append(filters["date_from"])
+    if filters["date_to"] is not None:
+        having.append("MAX(timestamp_utc) <= ?"); params.append(filters["date_to"])
+    return (" HAVING " + " AND ".join(having)) if having else "", params
+
+
+def _list_session_rows_rollup(conn, order, limit, offset, filters=None):
     """FAST path: read the pre-aggregated rail rows straight from the
     conversation_sessions rollup (spec §3). No GROUP BY, no temp B-tree for the
     ``recent`` sort. Returns (session_id, msg_count, started, last_activity)
     tuples — the same shape the live aggregate yields, so the downstream
-    assembly is identical. No WHERE is needed: the rollup is non-null by
-    construction (PK NOT NULL; the recompute's GROUP BY already drops NULLs)."""
+    assembly is identical. The optional ``filters`` dict pushes the four-axis
+    browse predicate (date/project/cost/rebuild — all stored columns) into the
+    WHERE BEFORE LIMIT/OFFSET, so ``has_more``/``next_offset`` stay correct over
+    the filtered set."""
+    where, params = _rollup_where(filters or _empty_filters())
     return conn.execute(
         "SELECT session_id, msg_count, "
         "       started_utc AS started, last_activity_utc AS last_activity "
-        "FROM conversation_sessions "
-        "ORDER BY " + order + " LIMIT ? OFFSET ?",
-        (limit + 1, offset),
+        "FROM conversation_sessions"
+        + where +
+        " ORDER BY " + order + " LIMIT ? OFFSET ?",
+        (*params, limit + 1, offset),
     ).fetchall()
 
 
-def _list_session_rows_live(conn, order, limit, offset):
+def _list_session_rows_live(conn, order, limit, offset, filters=None):
     """RETAINED fallback (Codex gate BLOCKER 2): the original live GROUP BY over
     conversation_messages, used while the rollup is not authoritative (the flag
     is set — e.g. an existing install before its first sync, or permanently
     under ``--no-sync``). Byte-identical output to the rollup branch by
-    construction; ``order`` here is the _SORTS_LIVE aggregate expression."""
+    construction; ``order`` here is the _SORTS_LIVE aggregate expression. The
+    optional ``filters`` dict applies ONLY the date axis (via HAVING over
+    MAX(timestamp_utc)); the rollup-only axes (project/cost/rebuild) cannot be
+    expressed here and are dropped — the caller flags filter_degraded."""
+    having, hparams = _live_having(filters or _empty_filters())
     return conn.execute(
         "SELECT session_id, COUNT(*) AS msg_count, "
         "       MIN(timestamp_utc) AS started, MAX(timestamp_utc) AS last_activity "
         "FROM conversation_messages "
         "WHERE session_id IS NOT NULL "
-        "GROUP BY session_id "
-        "ORDER BY " + order + " LIMIT ? OFFSET ?",
-        (limit + 1, offset),
+        "GROUP BY session_id"
+        + having +
+        " ORDER BY " + order + " LIMIT ? OFFSET ?",
+        (*hparams, limit + 1, offset),
     ).fetchall()
 
 
-def list_conversations(conn, *, sort="recent", limit=50, offset=0) -> dict:
+def list_conversation_facets(conn) -> dict:
+    """Distinct projects (+ conversation counts) for the browse filter
+    multi-select (spec §2). Reads the rollup; cheap GROUP BY. Empty/NULL
+    project labels are dropped (a no-cwd session stores '' and a not-yet-filled
+    row stores NULL — neither is a real selectable project). Sorted ascending
+    by label so the popover renders a stable list. Returns
+    ``{"projects": [{"project_label": str, "count": int}, ...]}``."""
+    rows = conn.execute(
+        "SELECT project_label, COUNT(*) FROM conversation_sessions "
+        "WHERE project_label IS NOT NULL AND project_label != '' "
+        "GROUP BY project_label ORDER BY project_label"
+    ).fetchall()
+    return {"projects": [{"project_label": p, "count": n} for p, n in rows]}
+
+
+def list_conversations(conn, *, sort="recent", limit=50, offset=0,
+                       date_from=None, date_to=None, projects=None,
+                       cost_min=None, cost_max=None, rebuild_min=None) -> dict:
     """All-history per-session browse rows (spec §3.1). NOT 365-day bounded.
 
     Reads the conversation_sessions rollup (Task A) when it is authoritative —
@@ -646,12 +731,27 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0) -> dict:
     revalidates every visible tick anyway."""
     limit = max(1, min(int(limit), 200))
     offset = max(0, int(offset))
+    # Browse-list filters (spec §2). The rollup branch expresses all four axes
+    # as column predicates; the live fallback only the date axis, so when a
+    # rollup-only axis is requested under the live branch we flag the page
+    # filter_degraded (a brief, self-correcting non-authoritative window).
+    filters = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "projects": list(projects) if projects else None,
+        "cost_min": cost_min,
+        "cost_max": cost_max,
+        "rebuild_min": rebuild_min,
+    }
+    degraded = False
     if _rollup_authoritative(conn):
         order = _SORTS.get(sort, _SORTS["recent"])
-        rows = _list_session_rows_rollup(conn, order, limit, offset)
+        rows = _list_session_rows_rollup(conn, order, limit, offset, filters)
     else:
         order = _SORTS_LIVE.get(sort, _SORTS_LIVE["recent"])
-        rows = _list_session_rows_live(conn, order, limit, offset)
+        degraded = any(
+            filters[k] is not None for k in _ROLLUP_ONLY_FILTER_KEYS)
+        rows = _list_session_rows_live(conn, order, limit, offset, filters)
     has_more = len(rows) > limit
     rows = rows[:limit]
     session_ids = [r[0] for r in rows]
@@ -674,12 +774,17 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0) -> dict:
         }
         for (sid, msg_count, started, last_activity) in rows
     ]
+    page = {
+        "next_offset": offset + len(conversations) if has_more else None,
+        "has_more": has_more,
+    }
+    if degraded:
+        # The rail surfaces this: project/cost/rebuild filters apply once the
+        # rollup finishes indexing; only the date axis held this page.
+        page["filter_degraded"] = True
     return {
         "conversations": conversations,
-        "page": {
-            "next_offset": offset + len(conversations) if has_more else None,
-            "has_more": has_more,
-        },
+        "page": page,
     }
 
 
