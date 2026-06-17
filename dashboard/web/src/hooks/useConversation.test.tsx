@@ -363,6 +363,31 @@ describe('useConversation', () => {
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(2);
   });
 
+  it('loadToEnd pages past the 20-page loadUntil cap (jump-to-latest spec §5, Codex P1 #2)', async () => {
+    // A conversation whose pages exceed the old 20-cap: page 1 + 25 subsequent
+    // pages, each carrying ONE item. Every page but the last signals more
+    // (next_after != null); the last exhausts (null). loadUntil's hard cap of
+    // 20 iterations would stop at ~20 pages, leaving the final anchor
+    // unreachable — loadToEnd must drain ALL pages so the last item lands.
+    const page = (id: number, more: boolean) => {
+      const item = {
+        kind: 'human', anchor: { session_id: 'sess-long', uuid: `u${id}`, id },
+        member_uuids: [`u${id}`], ts: 't', text: `m${id}`, blocks: [], is_sidechain: false,
+      };
+      return detail([item], more ? id + 1 : null, { session_id: 'sess-long' });
+    };
+    mockOnce(page(1, true));                       // page 1 (effect-loaded)
+    const { result } = renderHook(() => useConversation('sess-long'));
+    await waitFor(() => expect(result.current.detail).not.toBeNull());
+    // Queue the 25 subsequent pages (ids 2..26); only the last (26) exhausts.
+    for (let id = 2; id <= 26; id++) mockOnce(page(id, id < 26));
+    await act(async () => { await result.current.loadToEnd(); });
+    // ALL 26 pages loaded (> the 20-page cap) and the cursor is fully drained.
+    expect(result.current.detail!.items.length).toBe(26);
+    expect(result.current.hasMore).toBe(false);
+    expect(result.current.detail!.items.at(-1)!.anchor.id).toBe(26);
+  });
+
   it('never exposes the previous session\'s detail under the new sid on switch (#183 stale-media 404)', async () => {
     // REGRESSION (cross-session stale-media 404, useConversation.ts derive guard):
     // The fetch effect clears `detail` only in the POST-commit passive phase, so

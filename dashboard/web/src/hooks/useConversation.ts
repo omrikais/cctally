@@ -22,6 +22,7 @@ export interface UseConversation {
   hasMore: boolean;
   loadMore: () => Promise<void>;
   loadUntil: (uuid: string) => Promise<void>;
+  loadToEnd: () => Promise<void>;
 }
 
 const PAGE = 500;
@@ -129,6 +130,20 @@ export function useConversation(sessionId: string | null): UseConversation {
     };
     for (let i = 0; i < 20; i++) {
       if (has()) return;
+      const more = await fetchNext();
+      if (!more) return;
+    }
+  }, [fetchNext]);
+
+  const loadToEnd = useCallback(async () => {
+    // Uncapped forward pager for the explicit "Jump to latest" action (spec §5,
+    // Codex P1 #2). loadUntil caps at 20 pages; this drains ALL pages so the
+    // final anchor is always reachable past the cap. Driven by an explicit user
+    // action with a loading state, so the unbounded loop is acceptable —
+    // forward-only, and fetchNext returns falsy the moment the cursor is null
+    // (page exhausted) OR a guard/error trips (after==null, session changed,
+    // overlapping load, or a failed fetch), so it cannot infinite-loop.
+    for (;;) {
       const more = await fetchNext();
       if (!more) return;
     }
@@ -289,5 +304,5 @@ export function useConversation(sessionId: string | null): UseConversation {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, transcriptsEnabled, liveTailEnabled]);
 
-  return { detail: exposedDetail, loading: exposedLoading, error, hasMore, loadMore, loadUntil };
+  return { detail: exposedDetail, loading: exposedLoading, error, hasMore, loadMore, loadUntil, loadToEnd };
 }
