@@ -1193,6 +1193,20 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
     _pl = _project_label(_latest(logical, 10))
     _title = _session_titles_map(conn, [session_id]).get(session_id) or _pl or session_id
 
+    # Jump-to-latest target (spec §3): the {session_id, uuid, id} of the
+    # conversation's FINAL rendered turn, sourced from the tail of the
+    # whole-session assembled item list (so it lands on a real grouped item, not
+    # a folded fragment). Codex P2 #4: assembled anchors carry session_id=None
+    # (only the returned PAGE's anchors are patched), so build it EXPLICITLY with
+    # the request session_id rather than copying items[-1]["anchor"] verbatim.
+    # None only for a genuinely empty conversation (an existing session always
+    # has >=1 item, so this stays non-None for any non-None return). Computed on
+    # the unsliced list so it is the SAME regardless of which page was requested.
+    last_anchor = None
+    if items:
+        _la = items[-1]["anchor"]
+        last_anchor = {"session_id": session_id, "uuid": _la["uuid"], "id": _la["id"]}
+
     # Cursor pagination over the item list (anchored to each item's canonical id).
     # A non-None `after` that matches no item's anchor (stale/deleted cursor)
     # yields an EMPTY page — never silently re-serves the head (M1).
@@ -1213,6 +1227,7 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
                 "last_activity_utc": logical[-1][2],
                 "cost_usd": header_cost,
                 "models": sorted({r[6] for r in logical if r[6]}),
+                "last_anchor": last_anchor,
                 "items": [],
                 "subagent_meta": subagent_meta,
                 "page": {"next_after": None, "has_more": False},
@@ -1248,6 +1263,7 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
         "last_activity_utc": last[2],
         "cost_usd": header_cost,
         "models": models,
+        "last_anchor": last_anchor,
         "items": page,
         "subagent_meta": subagent_meta,
         "page": {"next_after": next_after, "has_more": has_more},

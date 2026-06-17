@@ -1038,3 +1038,40 @@ def test_session_cache_rebuild_count_unknown_session(tmp_path, monkeypatch):
     with ns["open_cache_db"]() as conn:
         assert lq.session_cache_rebuild_count(conn, "does-not-exist") == 0
 
+# === 1B: last_anchor on the conversation detail head =======================
+
+def test_get_conversation_exposes_last_anchor(tmp_path, monkeypatch):
+    """get_conversation() head carries last_anchor = {session_id, uuid, id} of
+    the final RENDERED item, with the REAL session_id (assembled anchors carry
+    session_id None until the page patches them — Codex P2 #4)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import pathlib as _pl
+    sys.path.insert(0, str(_pl.Path(ns["__file__"]).resolve().parent))
+    _seed_cache(ns)
+    import importlib
+    lq = importlib.import_module("_lib_conversation_query")
+    with ns["open_cache_db"]() as conn:
+        detail = lq.get_conversation(conn, "sess-clean", after=None, limit=1)
+        la = detail["last_anchor"]
+        assert la is not None
+        assert la["session_id"] == "sess-clean"          # real id, not null
+        assert isinstance(la["uuid"], str) and la["uuid"]
+        assert isinstance(la["id"], int)
+        asm = lq._assemble_session(conn, "sess-clean")
+        assert la["uuid"] == asm["items"][-1]["anchor"]["uuid"]
+
+
+def test_get_conversation_unknown_session_returns_none(tmp_path, monkeypatch):
+    """An unknown session returns None (no head, hence no last_anchor) — the
+    empty/unknown case the jump-to-latest control no-ops on."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import pathlib as _pl
+    sys.path.insert(0, str(_pl.Path(ns["__file__"]).resolve().parent))
+    _seed_cache(ns)
+    import importlib
+    lq = importlib.import_module("_lib_conversation_query")
+    with ns["open_cache_db"]() as conn:
+        assert lq.get_conversation(conn, "does-not-exist") is None
+
