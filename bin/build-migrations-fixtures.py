@@ -2660,6 +2660,144 @@ def build_per_migration_014_conversation_queued_prompt_reingest(
     _build_post(pre, post)
 
 
+def build_per_migration_015_conversation_sessions_filter_columns(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for cache migration
+    ``015_conversation_sessions_filter_columns`` (browse-rail filter columns).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — full production cache schema (via ``_apply_cache_schema``)
+        with the ``conversation_sessions`` rollup TORN DOWN to its legacy
+        four-column shape (session_id/msg_count/started_utc/last_activity_utc —
+        WITHOUT the three filter columns ``_apply_cache_schema`` now emits), a
+        ``schema_migrations`` table carrying cache migrations 001-014 (an existing
+        install at the 014 head) but NOT 015, and no
+        ``conversation_sessions_backfill_pending`` flag — the existing-install
+        shape before the filter columns are added.
+      * ``post.sqlite`` — same DB after running the production 015 handler. 015
+        ALTER-adds ``project_label``/``cost_usd``/``cache_rebuild_count`` and sets
+        ``cache_meta['conversation_sessions_backfill_pending']='1'`` (so the next
+        sync_cache full recompute fills them) and the dispatcher central-stamps
+        the 015 marker (#140). The handler does no per-session backfill — the
+        heavy cache_rebuild_count derive rides the sync-side recompute (mirroring
+        013).
+
+    Loaded by ``tests/test_cache_migration_015_per_migration_goldens.py``.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    # The 014-head prior chain stamped into pre.sqlite (an existing install that
+    # has every prior cache migration but not yet the browse-rail filter columns).
+    _PRIOR_CHAIN = (
+        "001_dedup_highest_wins",
+        "002_conversation_messages_backfill",
+        "003_conversation_reingest_tool_ids",
+        "004_conversation_reingest_subagent_kind",
+        "005_conversation_reingest_meta",
+        "006_conversation_reingest_source_tool_use_id",
+        "007_conversation_reingest_enrichment",
+        "008_session_entries_speed_backfill",
+        "009_conversation_media_reingest",
+        "010_conversation_search_split",
+        "011_conversation_promote_command_args",
+        "012_create_conversation_ai_titles",
+        "013_create_conversation_sessions",
+        "014_conversation_queued_prompt_reingest",
+    )
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _to_legacy_conversation_sessions_shape(conn) -> None:
+        """Revert the fresh seven-column rollup to its legacy four-column shape
+        (so 015's ALTERs have columns to add). The index is recreated to match
+        the production DDL (its definition is unchanged across 015)."""
+        conn.execute("DROP TABLE IF EXISTS conversation_sessions")
+        conn.execute(
+            "CREATE TABLE conversation_sessions ("
+            "session_id        TEXT NOT NULL PRIMARY KEY, "
+            "msg_count         INTEGER NOT NULL DEFAULT 0, "
+            "started_utc       TEXT, "
+            "last_activity_utc TEXT)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conv_sessions_recent "
+            "ON conversation_sessions(last_activity_utc DESC, session_id DESC)"
+        )
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _cctally, db = _load_cctally()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            _to_legacy_conversation_sessions_shape(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in _PRIOR_CHAIN:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-06-14T12:00:00Z"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _cctally, db = _load_cctally()
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "015_conversation_sessions_filter_columns":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit(
+                "015_conversation_sessions_filter_columns not registered"
+            )
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # ALTER-adds the three filter columns + arms the backfill flag. Then
+            # stamp the marker centrally (#140) with a PINNED timestamp so the
+            # committed golden is rebuild-deterministic.
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("015_conversation_sessions_filter_columns",
+                 "2026-06-14T12:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -2713,6 +2851,10 @@ def main() -> int:
     build_per_migration_014_conversation_queued_prompt_reingest(
         FIXTURES_ROOT / "per-migration"
         / "014_conversation_queued_prompt_reingest"
+    )
+    build_per_migration_015_conversation_sessions_filter_columns(
+        FIXTURES_ROOT / "per-migration"
+        / "015_conversation_sessions_filter_columns"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

@@ -156,7 +156,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 14,
+                            "registry_size": 15,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -190,7 +190,8 @@
                                     "011_conversation_promote_command_args",
                                     "012_create_conversation_ai_titles",
                                     "013_create_conversation_sessions",
-                                    "014_conversation_queued_prompt_reingest"
+                                    "014_conversation_queued_prompt_reingest",
+                                    "015_conversation_sessions_filter_columns"
                                 ],
                                 "skipped": []
                             },
@@ -217,7 +218,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/26 applied",
+                    "summary": "0/27 applied",
                     "title": "Migrations"
                 },
                 {
@@ -326,13 +327,17 @@
                             [
                                 "cache.db",
                                 "014_conversation_queued_prompt_reingest"
+                            ],
+                            [
+                                "cache.db",
+                                "015_conversation_sessions_filter_columns"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "26 pending",
+                    "summary": "27 pending",
                     "title": "Pending migrations"
                 }
             ],

@@ -2360,11 +2360,18 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             byte_offset INTEGER NOT NULL
         );
 
-        -- Browse-rail rollup (conversation_sessions). Materializes exactly the
-        -- four structural aggregates the rail's old live GROUP BY produced
+        -- Browse-rail rollup (conversation_sessions). Materializes the four
+        -- structural aggregates the rail's old live GROUP BY produced
         -- (COUNT/MIN/MAX over conversation_messages per session_id) so
         -- GET /api/conversations no longer scans the whole message table to
-        -- render a 50-row page. The explicit NOT NULL on the non-INTEGER PK
+        -- render a 50-row page, PLUS three filter columns
+        -- (project_label/cost_usd/cache_rebuild_count, migration 015) so the
+        -- Browse list's date/project/cost/cache-rebuild filters are pure-SQL
+        -- predicates. The structural columns are recomputed by a COUNT/MIN/MAX
+        -- GROUP BY; the filter columns are filled per-session by
+        -- _fill_conversation_sessions_filter_columns in the same flock-held
+        -- recompute (cost via the query kernel's batch maps, cache_rebuild_count
+        -- via a per-session assemble). The explicit NOT NULL on the non-INTEGER PK
         -- matters (SQLite's legacy NULL-in-PK bug); the rail keys on a concrete
         -- session_id and the recompute's GROUP BY already filters nulls. The
         -- index lets the only paginated ordering (recent) early-terminate at
@@ -2373,10 +2380,13 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         -- flag-gated full recompute) — migration 013 arms the one-time
         -- history backfill.
         CREATE TABLE IF NOT EXISTS conversation_sessions (
-            session_id        TEXT NOT NULL PRIMARY KEY,
-            msg_count         INTEGER NOT NULL DEFAULT 0,
-            started_utc       TEXT,
-            last_activity_utc TEXT
+            session_id          TEXT NOT NULL PRIMARY KEY,
+            msg_count           INTEGER NOT NULL DEFAULT 0,
+            started_utc         TEXT,
+            last_activity_utc   TEXT,
+            project_label       TEXT,
+            cost_usd            REAL NOT NULL DEFAULT 0,
+            cache_rebuild_count INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_conv_sessions_recent
             ON conversation_sessions(last_activity_utc DESC, session_id DESC);
@@ -3460,6 +3470,35 @@ def _014_conversation_queued_prompt_reingest(conn: sqlite3.Connection) -> None:
     (#140); a fresh install stamps it WITHOUT running (empty table -> the flag, if
     ever set, is a harmless no-op). Mirrors 007/009."""
     _set_cache_meta(conn, "conversation_queued_prompt_reingest_pending", "1")
+    conn.commit()
+
+
+@cache_migration("015_conversation_sessions_filter_columns")
+def _015_conversation_sessions_filter_columns(conn: sqlite3.Connection) -> None:
+    """Add the browse-filter columns to the conversation_sessions rollup
+    (project_label, cost_usd, cache_rebuild_count) so the rail's date/project/
+    cost/cache-rebuild filters are pure-SQL predicates (spec §1). ALTERs are
+    idempotent (duplicate-column tolerated). Arms the SHARED
+    conversation_sessions_backfill_pending flag so the next sync_cache full
+    recompute fills the new columns via the augmented
+    _recompute_conversation_sessions — keeping the heavy per-session assemble
+    (cache_rebuild_count) off the migration's critical path, mirroring 013.
+    Central stamp via the dispatcher (#140); handler does NOT self-stamp.
+
+    A fresh install gets the three columns from _apply_cache_schema's CREATE
+    TABLE and stamps 015 WITHOUT running this handler — the ALTERs no-op there
+    (already present), and the empty rollup needs no backfill (the incremental
+    DELETE+INSERT re-derive fills all columns in lockstep). Mirrors 013."""
+    for ddl in (
+        "ALTER TABLE conversation_sessions ADD COLUMN project_label TEXT",
+        "ALTER TABLE conversation_sessions ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE conversation_sessions ADD COLUMN cache_rebuild_count INTEGER NOT NULL DEFAULT 0",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # idempotent: column already present
+    _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
     conn.commit()
 
 

@@ -1637,6 +1637,7 @@ def _recompute_conversation_sessions(conn, session_ids=None) -> None:
             "(session_id, msg_count, started_utc, last_activity_utc) "
             + _CONV_SESSIONS_SELECT + " GROUP BY session_id"
         )
+        _fill_conversation_sessions_filter_columns(conn, None)
         return
     ids = [s for s in session_ids if s is not None]
     for i in range(0, len(ids), 400):
@@ -1652,6 +1653,49 @@ def _recompute_conversation_sessions(conn, session_ids=None) -> None:
             + _CONV_SESSIONS_SELECT
             + f" AND session_id IN ({placeholders}) GROUP BY session_id",
             chunk,
+        )
+    _fill_conversation_sessions_filter_columns(conn, ids)
+
+
+def _fill_conversation_sessions_filter_columns(conn, session_ids):
+    """Fill the rollup's browse-FILTER columns (project_label / cost_usd /
+    cache_rebuild_count, migration 015) for the given sessions, or ALL when
+    ``session_ids is None``. The structural COUNT/MIN/MAX columns are filled by
+    the INSERT in _recompute_conversation_sessions; this is the second pass that
+    materializes the three filter axes so the rail's date/project/cost/rebuild
+    filters are pure-SQL predicates.
+
+    project_label + cost reuse the query kernel's batch maps (the SAME
+    _project_label / _session_cost_map the rail's per-page Python path used), so
+    a filtered/displayed value equals what the live rail produced. cost is
+    rounded to 6dp to match list_conversations' per-row rounding.
+    cache_rebuild_count is a per-session assemble via the query kernel's
+    single-source-of-truth helper (whole-session property — recompute, never
+    increment).
+
+    No-op when the columns are absent (a pre-migration-015 cache.db being
+    re-derived before its 015 ALTER lands), so an early/partial sync never
+    raises ``no such column``. The CALLER owns the commit (this never commits)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(conversation_sessions)")}
+    if "cache_rebuild_count" not in cols:
+        return
+    lq = _load_lib("_lib_conversation_query")
+    if session_ids is None:
+        ids = [r[0] for r in conn.execute(
+            "SELECT session_id FROM conversation_sessions")]
+    else:
+        ids = [s for s in session_ids if s is not None]
+    if not ids:
+        return
+    cost = lq._session_cost_map(conn, ids)
+    meta = lq._session_latest_meta_map(conn, ids)
+    for sid in ids:
+        proj = lq._project_label(meta.get(sid, (None, None))[0])
+        rebuilds = lq.session_cache_rebuild_count(conn, sid)
+        conn.execute(
+            "UPDATE conversation_sessions SET project_label=?, cost_usd=?, "
+            "cache_rebuild_count=? WHERE session_id=?",
+            (proj, round(cost.get(sid, 0.0), 6), rebuilds, sid),
         )
 
 

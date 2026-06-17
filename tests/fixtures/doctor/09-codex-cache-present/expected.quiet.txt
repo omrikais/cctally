@@ -12,7 +12,7 @@ Hooks
       → No hook has fired yet. Restart Claude Code.
 Auth
 Database
-  ⚠ Pending migrations       26 pending
+  ⚠ Pending migrations       27 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
 Pricing

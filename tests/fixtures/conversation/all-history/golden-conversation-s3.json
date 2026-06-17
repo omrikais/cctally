@@ -218,6 +218,11 @@
     }
   ],
   "last_activity_utc": "2026-06-03T00:00:09Z",
+  "last_anchor": {
+    "id": 17,
+    "session_id": "s3",
+    "uuid": "c2"
+  },
   "models": [
     "claude-opus-4-8"
   ],

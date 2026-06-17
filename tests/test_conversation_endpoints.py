@@ -1075,3 +1075,31 @@ def test_get_conversation_unknown_session_returns_none(tmp_path, monkeypatch):
     with ns["open_cache_db"]() as conn:
         assert lq.get_conversation(conn, "does-not-exist") is None
 
+# === 1C: _recompute_conversation_sessions fills the filter columns =========
+
+def test_recompute_fills_filter_columns(tmp_path, monkeypatch):
+    """The augmented full recompute fills project_label / cost_usd /
+    cache_rebuild_count on the rollup for every session."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import pathlib as _pl
+    sys.path.insert(0, str(_pl.Path(ns["__file__"]).resolve().parent))
+    _seed_cache(ns)
+    import importlib
+    cc = importlib.import_module("_cctally_cache")
+    with ns["open_cache_db"]() as conn:
+        cc._recompute_conversation_sessions(conn)  # full
+        row = conn.execute(
+            "SELECT project_label, cost_usd, cache_rebuild_count "
+            "FROM conversation_sessions WHERE session_id='sess-rebuild'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "rebuild"        # project_label = basename(cwd)
+        assert row[1] >= 0.0              # cost_usd
+        assert row[2] == 1               # cache_rebuild_count (one flagged turn)
+        clean = conn.execute(
+            "SELECT cache_rebuild_count FROM conversation_sessions "
+            "WHERE session_id='sess-clean'"
+        ).fetchone()
+        assert clean[0] == 0
+
