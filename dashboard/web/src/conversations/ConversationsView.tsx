@@ -17,6 +17,10 @@ import { ChatIcon } from './ConvIcons';
 export function ConversationsView() {
   const selected = useSyncExternalStore(subscribeStore, () => getState().selectedConversationId);
   const outlineOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineOpen);
+  // #205 S1 — the ephemeral mobile outline-sheet flag (default closed, not
+  // persisted). The mobile slide-over gates on this so it never auto-buries the
+  // transcript on open; the desktop column below keeps gating on convOutlineOpen.
+  const outlineMobileOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineMobileOpen);
   const env = useSnapshot();
   const isMobile = useIsMobile();
   // #177 S5 — full-session outline + stats for the selected conversation. The
@@ -38,9 +42,11 @@ export function ConversationsView() {
   }
 
   // Mobile: rail until a conversation is chosen, then reader (+ back). The
-  // outline rides as a slide-over SHEET (not a column) gated on the same store
-  // flag, opened via the reader-head toggle; a backdrop button dispatches
-  // TOGGLE to dismiss it (#177 S5 §3).
+  // outline rides as a slide-over SHEET (not a column) gated on the EPHEMERAL
+  // convOutlineMobileOpen flag (#205 S1 — default closed, so it never
+  // auto-buries the transcript), opened via the reader-head ☰ toggle. The sheet
+  // carries a titled header with a visible ✕; both the ✕ and the backdrop
+  // dispatch CLOSE_CONV_OUTLINE_MOBILE to dismiss it.
   if (isMobile) {
     return (
       <div className="conv-view conv-view--mobile">
@@ -48,15 +54,24 @@ export function ConversationsView() {
           ? <ConversationRail />
           : <>
               <ConversationReader sessionId={selected} outline={outline} mobileBack />
-              {outlineOpen && (
+              {outlineMobileOpen && (
                 <>
                   <button
                     type="button"
                     className="conv-outline-backdrop"
                     aria-label="Close outline"
-                    onClick={() => dispatch({ type: 'TOGGLE_CONV_OUTLINE' })}
+                    onClick={() => dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' })}
                   />
                   <div className="conv-outline-sheet">
+                    <div className="conv-outline-sheet-head">
+                      <span className="conv-outline-sheet-title">Outline</span>
+                      <button
+                        type="button"
+                        className="conv-outline-close"
+                        aria-label="Close outline"
+                        onClick={() => dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' })}
+                      >✕</button>
+                    </div>
                     <OutlinePanel sessionId={selected} outline={outline} />
                   </div>
                 </>

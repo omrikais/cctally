@@ -406,10 +406,14 @@ describe('Conversations workspace integration', () => {
   });
 
   it('11: mobile renders the outline as a slide-over sheet (not a column) with a dismissing backdrop', async () => {
+    // #205 S1 — the sheet now gates on the EPHEMERAL convOutlineMobileOpen flag
+    // (NOT the persisted desktop pref); the backdrop dispatches the mobile-close
+    // action. Open it via the flag, then verify the panel rides inside the sheet
+    // and the backdrop dismisses it.
     stubMobileMedia(true);
-    localStorage.setItem('cctally.conv.outlineOpen', 'true');
     updateSnapshot(baseEnvelope(true));
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    act(() => { dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' }); });
     render(<App />);
 
     // The sheet wrapper + backdrop appear; the panel rides inside the sheet.
@@ -420,11 +424,45 @@ describe('Conversations workspace integration', () => {
     const backdrop = document.querySelector<HTMLButtonElement>('.conv-outline-backdrop')!;
     expect(backdrop).not.toBeNull();
 
-    // Clicking the backdrop dispatches TOGGLE → the sheet unmounts.
+    // Clicking the backdrop dispatches CLOSE_CONV_OUTLINE_MOBILE → the sheet
+    // unmounts; the persisted desktop pref is untouched.
     fireEvent.click(backdrop);
-    expect(getState().convOutlineOpen).toBe(false);
+    expect(getState().convOutlineMobileOpen).toBe(false);
     await waitFor(() => expect(document.querySelector('.conv-outline-sheet')).toBeNull());
+  });
+
+  // #205 S1 — the mobile outline sheet defaults closed (never auto-buries the
+  // transcript) and opens only on the ephemeral flag, with a titled header + ✕.
+  it('16: mobile outline does NOT auto-open on conversation open even with persisted convOutlineOpen=true', () => {
+    stubMobileMedia(true);
+    localStorage.setItem('cctally.conv.outlineOpen', 'true');
+    _resetForTests();
+    updateSnapshot(baseEnvelope(true));
+    render(<App />);
+    act(() => { dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' }); });
+    // The persisted desktop pref is true, but the mobile sheet stays closed.
+    expect(getState().convOutlineMobileOpen).toBe(false);
+    expect(document.querySelector('.conv-outline-sheet')).toBeNull();
     localStorage.removeItem('cctally.conv.outlineOpen');
+  });
+
+  it('17: the mobile sheet opens via the store flag with a titled header + ✕, and ✕ closes it', async () => {
+    stubMobileMedia(true);
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    act(() => { dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' }); });
+    render(<App />);
+
+    await waitFor(() => expect(document.querySelector('.conv-outline-sheet')).not.toBeNull());
+    // The titled header label + the ✕ close button (disambiguated by class).
+    expect(document.querySelector('.conv-outline-sheet-title')!.textContent).toContain('Outline');
+    const closeBtn = document.querySelector<HTMLButtonElement>('.conv-outline-close')!;
+    expect(closeBtn).not.toBeNull();
+    expect(closeBtn.getAttribute('aria-label')).toBe('Close outline');
+
+    fireEvent.click(closeBtn);
+    expect(getState().convOutlineMobileOpen).toBe(false);
+    await waitFor(() => expect(document.querySelector('.conv-outline-sheet')).toBeNull());
   });
 
   // #177 S6 — the '/' rebind matrix (F8). Reader open → opens find; no reader →
