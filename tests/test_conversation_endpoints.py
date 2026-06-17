@@ -1297,3 +1297,171 @@ def test_filter_dual_branch_parity(tmp_path, monkeypatch):
         ids = [r[0] for r in roll]
         assert "s1" not in ids and {"s2", "sess-clean", "sess-rebuild"} <= set(ids)
 
+
+# === Finding 1: half-open precision-safe date bounds at day boundaries =====
+#
+# Stored last_activity_utc is raw JSONL-passthrough of MIXED precision — both
+# whole-second `...SSZ` and millisecond `...SS.mmmZ` occur in real data. A naive
+# whole-second lower bound + a `...23:59:59.999999Z` inclusive upper bound
+# mis-compare lexicographically at day boundaries (ASCII `Z` 0x5A > `.` 0x2E and
+# > digits, `.000Z` < `00Z`). The fix is a HALF-OPEN interval
+# [start_of_day(date_from), start_of_next_day(date_to)) with 6-digit-microsecond
+# `...SS.000000Z` bounds and a STRICT `<` upper. This regression seeds rows at
+# the exact day boundaries in every precision and asserts the inclusion set.
+_BOUNDARY_SESSIONS = {
+    # session_id: (last_activity_utc, expected_in_single_day_filter)
+    "bnd-mid-ms":   ("2026-06-04T00:00:00.000Z", True),   # midnight, ms precision
+    "bnd-last-ms":  ("2026-06-04T23:59:59.999Z", True),   # last ms of the day
+    "bnd-last-sec": ("2026-06-04T23:59:59Z",     True),   # whole-second last second
+    "bnd-prev-ms":  ("2026-06-03T23:59:59.999Z", False),  # previous day, last ms
+    "bnd-next-mid": ("2026-06-05T00:00:00.000Z", False),  # next-day midnight
+}
+
+
+def _seed_boundary_rows(ns):
+    """Seed one single-message session per boundary timestamp, recompute the
+    rollup, then pin each session's stored ``last_activity_utc`` to the exact
+    mixed-precision boundary value. The recompute derives MAX(timestamp_utc)
+    naturally; the explicit UPDATE guarantees the stored bytes are the precise
+    boundary string under test (recompute preserves the raw string, but the
+    UPDATE removes any ambiguity and still drives the real ``_rollup_where`` SQL
+    and the real live ``HAVING`` for that row)."""
+    cache = ns["open_cache_db"]()
+    for i, (sid, (ts, _)) in enumerate(_BOUNDARY_SESSIONS.items()):
+        cache.execute(
+            "INSERT OR IGNORE INTO conversation_messages "
+            "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+            " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,"
+            " is_sidechain) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (sid, f"bu{i}", None, f"bnd{i}.jsonl", 0, ts, "human",
+             "boundary probe", "[]", None, None, None,
+             "/home/u/bnd", "main", 0),
+        )
+    import _cctally_cache as _cc
+    _cc._recompute_conversation_sessions(cache)
+    # Pin the precise mixed-precision stored value for each boundary row.
+    for sid, (ts, _) in _BOUNDARY_SESSIONS.items():
+        cache.execute(
+            "UPDATE conversation_sessions SET last_activity_utc=?, started_utc=? "
+            "WHERE session_id=?", (ts, ts, sid))
+    cache.commit()
+    cache.close()
+
+
+def test_filter_date_boundary_inclusion_rollup(tmp_path, monkeypatch):
+    """Single-day filter ?date_from=2026-06-04&date_to=2026-06-04 over rows whose
+    stored last_activity_utc sits AT the day boundaries in mixed precision.
+
+    RED against the pre-fix helper: the whole-second lower bound dropped the
+    `.000Z` midnight row (`.000Z` < `00Z` lexically) and the `.999999Z`
+    inclusive upper bound dropped both the `.999Z` last-ms row (`.999Z` >
+    `.999999Z`) and the whole-second `23:59:59Z` row (`Z` > `.`). The half-open
+    fix keeps all three same-day rows and excludes the neighbours."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        # Pin the server's display tz to UTC so the day-boundary bounds are
+        # deterministic regardless of the dev machine's host-local fallback
+        # (the seeded rows are stored as ...Z and the assertion is UTC-day-keyed).
+        ns["DashboardHTTPHandler"].display_tz_pref_override = "utc"
+        _seed_boundary_rows(ns)
+        st, body = _get_json(
+            srv, "/api/conversations?date_from=2026-06-04&date_to=2026-06-04")
+        assert st == 200, (st, body)
+        got = {c["session_id"] for c in body["conversations"]
+               if c["session_id"].startswith("bnd-")}
+        expected = {sid for sid, (_, keep) in _BOUNDARY_SESSIONS.items() if keep}
+        assert got == expected, (got, expected)
+    finally:
+        srv.shutdown()
+
+
+def test_filter_date_boundary_inclusion_live_branch_parity(tmp_path, monkeypatch):
+    """The LIVE fallback's date-only HAVING (MAX(timestamp_utc) bounds) must
+    agree with the rollup branch on the SAME boundary inclusion set. Drives the
+    two kernel row-source helpers directly so both date predicates are
+    exercised over the identical mixed-precision boundary rows."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import pathlib as _pl
+    sys.path.insert(0, str(_pl.Path(ns["__file__"]).resolve().parent))
+    _seed_cache(ns)
+    _seed_boundary_rows(ns)
+    import importlib
+    m = importlib.import_module("_lib_dashboard_dates")
+    lq = importlib.import_module("_lib_conversation_query")
+    df, dtt = m.parse_filter_date_range("2026-06-04", "2026-06-04", tz_name="Etc/UTC")
+    f = {"date_from": df, "date_to": dtt, "projects": None,
+         "cost_min": None, "cost_max": None, "rebuild_min": None}
+    expected = {sid for sid, (_, keep) in _BOUNDARY_SESSIONS.items() if keep}
+    with ns["open_cache_db"]() as conn:
+        roll = lq._list_session_rows_rollup(conn, lq._SORTS["recent"], 200, 0, f)
+        live = lq._list_session_rows_live(conn, lq._SORTS_LIVE["recent"], 200, 0, f)
+        roll_bnd = {r[0] for r in roll if r[0].startswith("bnd-")}
+        live_bnd = {r[0] for r in live if r[0].startswith("bnd-")}
+        assert roll_bnd == expected, (roll_bnd, expected)
+        assert live_bnd == expected, (live_bnd, expected)
+
+
+# === Finding 2: filter_degraded positive case (live branch, rollup-only axis) =
+
+def _arm_backfill_pending(ns):
+    """Set the durable conversation_sessions_backfill_pending flag so
+    _rollup_authoritative(conn) returns False and list_conversations takes the
+    LIVE GROUP BY fallback (which cannot express the rollup-only axes)."""
+    cache = ns["open_cache_db"]()
+    cache.execute(
+        "INSERT OR REPLACE INTO cache_meta(key,value) "
+        "VALUES('conversation_sessions_backfill_pending','1')")
+    cache.commit()
+    cache.close()
+
+
+def test_filter_degraded_set_on_live_branch_rollup_only_axis(tmp_path, monkeypatch):
+    """Under the live branch a rollup-only axis (e.g. cost_min) is SILENTLY not
+    applied; the page must carry filter_degraded=True AND still include a session
+    that cost-filtering would otherwise drop (proving the silent degradation the
+    flag warns about)."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        _arm_backfill_pending(ns)
+        st, body = _get_json(srv, "/api/conversations?cost_min=0.05")
+        assert st == 200, (st, body)
+        assert body["page"].get("filter_degraded") is True, body["page"]
+        sids = {c["session_id"] for c in body["conversations"]}
+        # s1 (cost ~0.0175) is below the 0.05 floor; under a working cost filter
+        # it would be dropped — its presence proves the axis was NOT applied.
+        assert "s1" in sids, sids
+    finally:
+        srv.shutdown()
+
+
+def test_filter_degraded_absent_on_authoritative_cost_filter(tmp_path, monkeypatch):
+    """On the AUTHORITATIVE rollup path the same ?cost_min=0.05 applies cleanly:
+    no filter_degraded flag, and the cheap sessions are actually dropped."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, body = _get_json(srv, "/api/conversations?cost_min=0.05")
+        assert st == 200, (st, body)
+        assert not body["page"].get("filter_degraded"), body["page"]
+        sids = {c["session_id"] for c in body["conversations"]}
+        assert "s1" not in sids, sids   # below the floor -> actually dropped
+    finally:
+        srv.shutdown()
+
+
+def test_filter_degraded_absent_on_live_branch_date_only(tmp_path, monkeypatch):
+    """A date-ONLY filter under the live branch is fully expressible (HAVING over
+    MAX(timestamp_utc)), so it must NOT set filter_degraded."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        _arm_backfill_pending(ns)
+        st, body = _get_json(srv, "/api/conversations?date_from=2026-06-02")
+        assert st == 200, (st, body)
+        assert not body["page"].get("filter_degraded"), body["page"]
+    finally:
+        srv.shutdown()
+

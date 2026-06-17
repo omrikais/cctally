@@ -622,12 +622,19 @@ def _rollup_where(filters):
     """(sql_fragment, params) for the ROLLUP branch — all four axes are stored
     columns. Returns (" WHERE ...", [params]) or ("", []) when no axis is set.
     Project IN-list naturally excludes empty/NULL project_label (neither the ''
-    no-cwd sentinel nor a NULL not-yet-filled row matches a real label)."""
+    no-cwd sentinel nor a NULL not-yet-filled row matches a real label).
+
+    The date axis is HALF-OPEN: ``date_from`` is an inclusive start-of-day lower
+    bound (``>=``) and ``date_to`` is the EXCLUSIVE start-of-next-day upper bound
+    (``<``) emitted by ``_lib_dashboard_dates.parse_filter_date_range``. The
+    strict ``<`` is load-bearing: it makes the lex compare against the stored
+    mixed-precision ``last_activity_utc`` (whole-second AND millisecond ``...Z``)
+    chronologically correct at the day edge (review Finding 1)."""
     clauses, params = [], []
     if filters["date_from"] is not None:
         clauses.append("last_activity_utc >= ?"); params.append(filters["date_from"])
     if filters["date_to"] is not None:
-        clauses.append("last_activity_utc <= ?"); params.append(filters["date_to"])
+        clauses.append("last_activity_utc < ?"); params.append(filters["date_to"])
     if filters["projects"]:
         ph = ",".join("?" for _ in filters["projects"])
         clauses.append("project_label IN (%s)" % ph); params.extend(filters["projects"])
@@ -644,12 +651,15 @@ def _live_having(filters):
     """(sql_fragment, params) for the LIVE fallback — only the DATE axis is
     expressible (no cost/project/rebuild columns exist on the raw messages).
     The rollup's last_activity_utc IS MAX(timestamp_utc), so the date predicate
-    is the same bound applied via HAVING over the aggregate."""
+    is the same HALF-OPEN bound applied via HAVING over the aggregate: inclusive
+    ``>=`` lower, EXCLUSIVE strict-``<`` upper — kept byte-for-byte in lockstep
+    with ``_rollup_where``'s date axis so both branches agree at the day edge
+    over mixed-precision timestamps (review Finding 1)."""
     having, params = [], []
     if filters["date_from"] is not None:
         having.append("MAX(timestamp_utc) >= ?"); params.append(filters["date_from"])
     if filters["date_to"] is not None:
-        having.append("MAX(timestamp_utc) <= ?"); params.append(filters["date_to"])
+        having.append("MAX(timestamp_utc) < ?"); params.append(filters["date_to"])
     return (" HAVING " + " AND ".join(having)) if having else "", params
 
 
