@@ -7064,15 +7064,26 @@ mark.current {
 
   /* #205 S4 (F5) — corner copy buttons can't grow to a literal 44px without
      covering code/diff/terminal/web content; expand the HIT AREA invisibly
-     instead (mirrors the .chip.model-chip pattern). The absolute corner
-     variants already establish a containing block, so the ::before anchors to
-     the button in every placement. */
+     instead (mirrors the .chip.model-chip pattern). A centered 44×44 ::before
+     guarantees the floor regardless of the small glyph box. */
   #root .conv-copy-btn { position: relative; }
+  /* Preserve the tool-I/O corner pin — the unqualified `position: relative`
+     above would otherwise un-pin this absolute variant on mobile. The ::before
+     still anchors (an absolute element is a positioned ancestor for its own
+     pseudo). */
+  #root .conv-tool-io > .conv-copy-btn { position: absolute; }
   #root .conv-copy-btn::before {
     content: "";
     position: absolute;
-    inset: -11px;   /* ~24px glyph + 22px → ≥44px tappable */
+    top: 50%;
+    left: 50%;
+    width: 44px;
+    height: 44px;
+    transform: translate(-50%, -50%);
   }
+  /* The per-turn actions row places Permalink + Copy adjacent; widen the gap so
+     the two 44px hit zones don't overlap into an ambiguous tap target. */
+  #root .conv-item-actions { gap: 24px; }
 }
 
 /* ===== #177 S2 — decision & planning tool cards ===== */
