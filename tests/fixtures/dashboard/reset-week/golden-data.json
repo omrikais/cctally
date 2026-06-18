@@ -814,7 +814,7 @@
     "forecast_pct": 14.600000000000001,
     "forecast_verdict": "ok",
     "used_pct": 5.0,
-    "vs_last_week_delta": null,
+    "vs_last_week_delta": -0.39473684210526316,
     "week_label": "Apr 17\u2013Apr 20"
   },
   "last_sync_at": null,
